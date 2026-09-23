@@ -91,7 +91,7 @@ describe("Answers", () => {
 
   it("says the generated tokens are real when a constrained decode was asked", () => {
     const html = render([question("n", "number")], { n: { type: "number", number: 12, uncertainty: 1.4, digits: [] } }, undefined, 3);
-    expect(html).toContain("generates a digit per step");
+    expect(html).toContain("generate a digit per step");
   });
 
   it("leads a noul with the option that won, in the caller's own words, and reads the confidence under it", () => {
@@ -289,26 +289,95 @@ describe("Answers", () => {
     expect(html).toContain("not a bound");
   });
 
+  /** A head point as `/v1/decide` answers one (GitHub #260): a region, and no digits. */
+  const headPoint = (): Answer => ({
+    type: "point",
+    method: "head",
+    pixels: { x: 120, y: 64 },
+    normalized: { x: 300, y: 320 },
+    uncertainty: { x: 12.5, y: 25 },
+    region: { cells: 1, share: 0.29 },
+  });
+
   it("draws a head point, which carries no digit trace, without a trace section", () => {
     // GitHub #260: `/v1/decide` answers a point in one pass off the pointing
     // head by default, and that answer has a region instead of digits.
+    const html = render([question("p", "point")], { p: headPoint() }, { mode: "image", images: [image], text: "" });
+    expect(html).toContain('cx="120"');
+    expect(html).toContain(">120<");
+    expect(html).not.toContain("Digit trace");
+  });
+
+  it("names the method that answered a point, which the question need not have asked for", () => {
+    // The request may carry no `method` at all — the load's default decides —
+    // so the chip reads off the answer and not off the draft beside it.
+    const sent = question("p", "point");
+    expect(sent.method).toBeNull();
+    const head = render([sent], { p: headPoint() }, { mode: "image", images: [image], text: "" });
+    expect(head).toContain(">head</span>");
+    expect(head).toContain("no decode round ran");
+
+    const chain = render(
+      [sent],
+      {
+        p: {
+          type: "point",
+          method: "chain",
+          pixels: { x: 120, y: 64 },
+          normalized: { x: 300, y: 320 },
+          uncertainty: { x: 12.5, y: 25 },
+          digits: { x: [], y: [] },
+        },
+      },
+      { mode: "image", images: [image], text: "" },
+    );
+    expect(chain).toContain(">chain</span>");
+    expect(chain).toContain("one decode round per digit");
+  });
+
+  it("draws a head point's extent as the token cell it is, and reports the attention its region held", () => {
+    const html = render([question("p", "point")], { p: headPoint() }, { mode: "image", images: [image], text: "" });
+    // A rectangle of one cell centred on the point, not an ellipse: the extent
+    // is the map's resolution and the same on every answer, so drawing it as a
+    // spread that falls off from the centre would be a claim the answer does
+    // not make.
+    expect(html).not.toContain("<ellipse");
+    expect(html).toContain('width="12.5"');
+    expect(html).toContain('height="25"');
+    expect(html).toContain('x="113.75"');
+    expect(html).toContain('y="51.5"');
+    // The share is the figure that separates a strong answer from a weak one,
+    // and the cells it was taken over are beside it.
+    expect(html).toContain("0.290");
+    expect(html).toContain("over 1 cell<");
+    // The column is named for what it holds, and the note says what the
+    // rectangle means — not the chain's self-reported sigma.
+    expect(html).toContain(">cell px<");
+    expect(html).not.toContain("not a bound");
+    expect(html).toContain("where the label begins");
+  });
+
+  it("keeps the halo and the self-report for a chain point", () => {
     const html = render(
       [question("p", "point")],
       {
         p: {
           type: "point",
-          method: "head",
+          method: "chain",
           pixels: { x: 120, y: 64 },
           normalized: { x: 300, y: 320 },
-          uncertainty: { x: 12.5, y: 12.5 },
-          region: { cells: 1, share: 0.29 },
+          uncertainty: { x: 4.5, y: 6 },
+          digits: { x: [{ digit: 3, probability: 0.9 }], y: [{ digit: 3, probability: 0.9 }] },
         },
       },
       { mode: "image", images: [image], text: "" },
+      6,
     );
-    expect(html).toContain('cx="120"');
-    expect(html).toContain(">120<");
-    expect(html).not.toContain("Digit trace");
+    expect(html).toContain("<ellipse");
+    expect(html).toContain(">± px<");
+    expect(html).toContain("not a bound");
+    expect(html).toContain("Digit trace");
+    expect(html).not.toContain("attention");
   });
 
   it("draws a box and its per-edge uncertainty band", () => {
@@ -334,6 +403,127 @@ describe("Answers", () => {
     expect(html).toContain("grid grid-cols-2");
     expect(html).toContain('stroke="#fff"');
     expect(html).toContain('vector-effect="non-scaling-stroke"');
+  });
+
+  /** A head box as `/v1/decide` answers one (GitHub #263): the head set's extent. */
+  const headBox = (): Answer => ({
+    type: "box",
+    method: "head",
+    pixels: { x0: 10, y0: 20, x1: 110, y1: 120 },
+    normalized: { x0: 25, y0: 100, x1: 275, y1: 600 },
+    uncertainty: { x0: 6.25, y0: 12.5, x1: 6.25, y1: 12.5 },
+    region: { cells: 2, share: 0.41 },
+  });
+
+  it("names the method that answered a box, and draws its band as the resolution it is", () => {
+    // GitHub #263. A head box carries no digit trace and its per-edge figure
+    // is half an image token on every answer — the reading's resolution, not
+    // a spread — so the band is outlined rather than faded out, and the note
+    // must not call it a self-report.
+    const html = render([question("b", "box")], { b: headBox() }, { mode: "image", images: [image], text: "" });
+    expect(html).toContain(">head</span>");
+    expect(html).not.toContain("Digit trace");
+    expect(html).toContain("head set outlines");
+    expect(html).not.toContain("not a bound");
+    // The band is the nominal rect grown by each edge's own figure, and it is
+    // outlined the way a head point's cell is rather than faded out.
+    expect(html).toContain('width="112.5"');
+    expect(html).toContain('opacity="0.12"');
+    expect(html).toContain('stroke="var(--ember)"');
+    // The share the region held is the confidence to act on, beside the cells
+    // it was taken over.
+    expect(html).toContain("0.410");
+    expect(html).toContain("over 2 cells<");
+  });
+
+  it("keeps the chain's halo and self-report on a chain box", () => {
+    const html = render(
+      [question("b", "box")],
+      {
+        b: {
+          type: "box",
+          method: "chain",
+          pixels: { x0: 10, y0: 20, x1: 110, y1: 120 },
+          normalized: { x0: 25, y0: 100, x1: 275, y1: 600 },
+          uncertainty: { x0: 2, y0: 3, x1: 4, y1: 5 },
+          digits: { x0: [{ digit: 0, probability: 0.9 }], y0: [], x1: [], y1: [] },
+        },
+      },
+      { mode: "image", images: [image], text: "" },
+      12,
+    );
+    expect(html).toContain(">chain</span>");
+    expect(html).toContain(">± px<");
+    expect(html).toContain("not a bound");
+    expect(html).toContain("Digit trace");
+    // The chain's band is a spread and fades out: no outline on it.
+    expect(html).toContain('opacity="0.18"');
+    expect(html).not.toContain('stroke="var(--ember)"');
+  });
+
+  it("draws the extent a head set read around a point, and says the point is its centre", () => {
+    // GitHub #263: where the load has a head set, the point is the centre of
+    // the object the set outlined and `extent` is that outline. Dropping it
+    // would throw away the answer's own reading of how far the object goes —
+    // and the reading is a half token there, not the whole one the pointing
+    // head answers to alone.
+    const html = render(
+      [question("p", "point")],
+      {
+        p: {
+          type: "point",
+          method: "head",
+          pixels: { x: 120, y: 64 },
+          normalized: { x: 300, y: 320 },
+          // Half a token per axis: an anchored reading resolves its peak
+          // inside the cell, where the pointing head alone answers to one.
+          uncertainty: { x: 6.25, y: 12.5 },
+          region: { cells: 1, share: 0.29 },
+          extent: { x0: 80, y0: 40, x1: 170, y1: 96 },
+        },
+      },
+      { mode: "image", images: [image], text: "" },
+    );
+    expect(html).toContain('x="80"');
+    expect(html).toContain('width="90"');
+    expect(html).toContain('height="56"');
+    expect(html).toContain("stroke-dasharray");
+    expect(html).toContain("crosshair is its centre");
+    // And as text beside the table: every figure in a panel is on the page as
+    // a number, or the box the point came out of has to be measured off a
+    // drawing.
+    expect(html).toContain("x0 80  y0 40  x1 170  y1 96");
+    // The single head's caveat belongs to the answer that has no set, and
+    // this one does not.
+    expect(html).not.toContain("where the label begins");
+  });
+
+  it("reads a point's and a box's figures to three places, whatever wrote them", () => {
+    // The owner's call: a head answer's figure is a fraction of an image
+    // token, and at one place two readings a quarter of a cell apart printed
+    // as the same number. It is also what every share and confidence on this
+    // page already reads to.
+    const head = render([question("p", "point")], { p: headPoint() }, { mode: "image", images: [image], text: "" });
+    expect(head).toContain(">12.500<");
+    expect(head).toContain(">25.000<");
+    const box = render([question("b", "box")], { b: headBox() }, { mode: "image", images: [image], text: "" });
+    expect(box).toContain(">6.250<");
+    const chain = render(
+      [question("p", "point")],
+      {
+        p: {
+          type: "point",
+          method: "chain",
+          pixels: { x: 120, y: 64 },
+          normalized: { x: 300, y: 320 },
+          uncertainty: { x: 4.5, y: 6 },
+          digits: { x: [], y: [] },
+        },
+      },
+      { mode: "image", images: [image], text: "" },
+    );
+    expect(chain).toContain(">4.500<");
+    expect(chain).toContain(">6.000<");
   });
 
   it("says a point has no image to draw on rather than drawing nowhere", () => {

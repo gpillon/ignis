@@ -11,6 +11,11 @@ import {
   MAX_DIGITS,
   MIN_DIGITS,
   type Option,
+  DEFAULT_METHOD,
+  isSpatial,
+  SPATIAL_METHOD_BLURB,
+  SPATIAL_METHODS,
+  type SpatialMethod,
   PRIMITIVE_BLURB,
   PRIMITIVES,
   type Primitive,
@@ -132,6 +137,39 @@ export function QuestionCard({
             ? `Up to ${nines(question.digits)}.`
             : `The prompt declares a 0–${nines(question.digits)} scale on each axis.`}
         </DigitField>
+      )}
+
+      {/* Which way a `point` or a `box` is answered (GitHub #260, #263). The
+          empty value is not a missing choice: it is the default the endpoint
+          would pick, and the two primitives do not pick alike — a point
+          follows the load (head where it has a calibrated pointing head,
+          chain where it has none) and a box is the chain on every load. The
+          answer says which ran either way, so the default is left as an
+          absent field rather than guessed at here. */}
+      {isSpatial(question.kind) && (
+        <div className="mt-2 flex items-start gap-3">
+          <Labelled label="Answered by">
+            <select
+              value={question.method ?? ""}
+              onChange={(e) => set("method", e.target.value === "" ? null : (e.target.value as SpatialMethod))}
+              name={`${question.uid}-method`}
+              aria-label={`How this ${question.kind} is answered`}
+              className={`${fieldLook} w-[8.5rem] font-display text-[13px]`}
+            >
+              <option value="">{DEFAULT_METHOD[question.kind as "point" | "box"].label}</option>
+              {SPATIAL_METHODS.map((method) => (
+                <option key={method} value={method}>
+                  {method}
+                </option>
+              ))}
+            </select>
+          </Labelled>
+          <p className="pb-1 text-[12px] leading-snug text-ash">
+            {question.method === null
+              ? DEFAULT_METHOD[question.kind as "point" | "box"].blurb
+              : SPATIAL_METHOD_BLURB[question.kind as "point" | "box"][question.method]}
+          </p>
+        </div>
       )}
 
       {/* A scalar's field is a **ceiling**, so blank is its default and blank

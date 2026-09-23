@@ -308,6 +308,8 @@ export function PointGlyph({
   sigmaX,
   sigmaY,
   span,
+  cell = false,
+  extent,
 }: {
   x: number;
   y: number;
@@ -315,6 +317,27 @@ export function PointGlyph({
   sigmaY: number;
   /** The image's shorter side: what the crosshair is sized against. */
   span: number;
+  /**
+   * Draw the uncertainty as the **rectangle** it is rather than as a halo
+   * (GitHub #260).
+   *
+   * A head point's uncertainty is the reading's resolution — one image token,
+   * or half of one where a head set resolves a peak inside its cell (GitHub
+   * #264) — and an ellipse would draw that as a spread that falls off from
+   * the centre, which is a claim the answer does not make. A chain point's
+   * does fall off, and keeps the halo.
+   */
+  cell?: boolean;
+  /**
+   * The object's extent, `x0`/`y0`/`x1`/`y1` in image pixels (GitHub #263).
+   *
+   * A head point off a head set is the **centre** of a box the set outlined,
+   * and that box is the answer's own reading of how far the object goes: the
+   * crosshair alone would throw it away. It is drawn as an outline and not as
+   * a filled band, because the fill at the centre is the resolution cell and
+   * two fills over each other say neither.
+   */
+  extent?: Record<string, number>;
 }) {
   const arm = span * 0.09;
   const gap = span * 0.02;
@@ -326,7 +349,27 @@ export function PointGlyph({
   ].join(" ");
   return (
     <>
-      <ellipse cx={x} cy={y} rx={Math.max(sigmaX, 1)} ry={Math.max(sigmaY, 1)} fill="var(--ember)" opacity="0.22" />
+      {extent && (
+        <>
+          <rect {...extentRect(extent)} fill="none" stroke="#000" strokeWidth={3.5} opacity="0.7" vectorEffect="non-scaling-stroke" />
+          <rect {...extentRect(extent)} fill="none" stroke="var(--ember)" strokeWidth={1.5} strokeDasharray="6 4" vectorEffect="non-scaling-stroke" />
+        </>
+      )}
+      {cell ? (
+        <rect
+          x={x - Math.max(sigmaX, 1) / 2}
+          y={y - Math.max(sigmaY, 1) / 2}
+          width={Math.max(sigmaX, 1)}
+          height={Math.max(sigmaY, 1)}
+          fill="var(--ember)"
+          opacity="0.22"
+          stroke="var(--ember)"
+          strokeWidth={1}
+          vectorEffect="non-scaling-stroke"
+        />
+      ) : (
+        <ellipse cx={x} cy={y} rx={Math.max(sigmaX, 1)} ry={Math.max(sigmaY, 1)} fill="var(--ember)" opacity="0.22" />
+      )}
       <path d={cross} stroke="#000" strokeWidth={4.5} strokeLinecap="round" fill="none" opacity="0.7" vectorEffect="non-scaling-stroke" />
       <path d={cross} stroke="#fff" strokeWidth={2} strokeLinecap="round" fill="none" vectorEffect="non-scaling-stroke" />
       <circle cx={x} cy={y} r={gap} fill="none" stroke="#000" strokeWidth={3.5} opacity="0.7" vectorEffect="non-scaling-stroke" />
@@ -335,8 +378,27 @@ export function PointGlyph({
   );
 }
 
-/** A `box`, drawn the same way, with the band its per-edge uncertainty spans. */
-export function BoxGlyph({ pixels, sigma }: { pixels: Record<string, number>; sigma: Record<string, number> }) {
+/**
+ * The rectangle of `x0`/`y0`/`x1`/`y1`, in image pixels.
+ *
+ * Its own helper because two answers draw one: a `box`, and the extent a head
+ * point is the centre of.
+ */
+function extentRect(corners: Record<string, number>) {
+  const x0 = corners.x0 ?? 0;
+  const y0 = corners.y0 ?? 0;
+  return { x: x0, y: y0, width: Math.max(0, (corners.x1 ?? 0) - x0), height: Math.max(0, (corners.y1 ?? 0) - y0) };
+}
+
+/**
+ * A `box`, drawn the same way, with the band its per-edge uncertainty spans.
+ *
+ * `cell` says that band is the reading's **resolution** rather than a spread
+ * (GitHub #263): a head box is the head set's extent, and its per-edge figure
+ * is half an image token on every answer — so the band is outlined, the way a
+ * head point's cell is, instead of fading out like a self-reported sigma.
+ */
+export function BoxGlyph({ pixels, sigma, cell = false }: { pixels: Record<string, number>; sigma: Record<string, number>; cell?: boolean }) {
   const x0 = pixels.x0 ?? 0;
   const y0 = pixels.y0 ?? 0;
   const x1 = pixels.x1 ?? 0;
@@ -350,7 +412,14 @@ export function BoxGlyph({ pixels, sigma }: { pixels: Record<string, number>; si
   const rect = { x: x0, y: y0, width: Math.max(0, x1 - x0), height: Math.max(0, y1 - y0) };
   return (
     <>
-      <rect {...outer} fill="var(--ember)" opacity="0.18" />
+      <rect
+        {...outer}
+        fill="var(--ember)"
+        opacity={cell ? 0.12 : 0.18}
+        stroke={cell ? "var(--ember)" : "none"}
+        strokeWidth={cell ? 1 : 0}
+        vectorEffect="non-scaling-stroke"
+      />
       <rect {...rect} fill="none" stroke="#000" strokeWidth={4.5} opacity="0.7" vectorEffect="non-scaling-stroke" />
       <rect {...rect} fill="none" stroke="#fff" strokeWidth={2} vectorEffect="non-scaling-stroke" />
     </>

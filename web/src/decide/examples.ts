@@ -8,7 +8,7 @@
 // its own width, and a position on an image.
 
 import flame from "../brand/flame.webp";
-import { imageFromFile, type PromptImage } from "../conversation/images.ts";
+import { imageFromFile, imageMime, type PromptImage } from "../conversation/images.ts";
 import { jsonString } from "./json.ts";
 import { type Draft, newQuestion, type Option, type Primitive, type Question } from "./model.ts";
 
@@ -185,7 +185,10 @@ export const EXAMPLES: Example[] = [
 async function brandImage(): Promise<PromptImage> {
   const response = await fetch(flame);
   const blob = await response.blob();
-  const read = await imageFromFile(new File([blob], "ignis-flame.webp", { type: blob.type || "image/webp" }));
+  // The type the fetch reported is used only when it names an image: the
+  // embedded build served this asset as `application/octet-stream` until
+  // `playground.rs` grew a `webp` branch, and that is truthy (GitHub #256).
+  const read = await imageFromFile(new File([blob], "ignis-flame.webp", { type: imageMime(blob.type, "image/webp") }));
   if (!read.ok) throw new Error(read.error);
   return read.image;
 }

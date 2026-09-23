@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dataUriBytes, fitted, imageFromFile, MAX_EDGE } from "./images.ts";
+import { dataUriBytes, fitted, imageFromFile, imageMime, MAX_EDGE } from "./images.ts";
 
 describe("fitted", () => {
   it("leaves an image that already fits alone, rather than blowing it up", () => {
@@ -29,5 +29,23 @@ describe("imageFromFile", () => {
     const file = new File(["not a picture"], "notes.txt", { type: "text/plain" });
     const result = await imageFromFile(file);
     expect(result).toEqual({ ok: false, error: "notes.txt is not an image." });
+  });
+});
+
+describe("imageMime", () => {
+  it("keeps a type that names an image", () => {
+    expect(imageMime("image/webp", "image/png")).toBe("image/webp");
+    expect(imageMime("image/jpeg", "image/png")).toBe("image/jpeg");
+  });
+
+  it("falls back on a type that is truthy and still not an image (GitHub #256)", () => {
+    // What a server with no branch for the extension answers: truthy, so
+    // `blob.type || fallback` kept it and the picture was refused.
+    expect(imageMime("application/octet-stream", "image/webp")).toBe("image/webp");
+  });
+
+  it("falls back on nothing at all", () => {
+    expect(imageMime("", "image/webp")).toBe("image/webp");
+    expect(imageMime(undefined, "image/webp")).toBe("image/webp");
   });
 });

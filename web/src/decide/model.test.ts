@@ -330,3 +330,60 @@ describe("freeId", () => {
     expect(freeId([question("answer", "noul"), question("answer_2", "noul")], "answer")).toBe("answer_3");
   });
 });
+
+// How a point or a box is answered (GitHub #260, #263). Absent is not a
+// missing choice: it is the default the endpoint would pick, and the two do
+// not pick alike — a point follows the load (head where the artifact has a
+// calibrated pointing head, chain where it has none) and a box is the chain
+// on every load. Neither is resolvable from here, so neither is guessed at.
+describe("a spatial question's method", () => {
+  const withImage = (questions: Question[]) => draft(questions, { mode: "image", images: [image], text: "" });
+
+  it("sends nothing when none was chosen, and the name when one was", () => {
+    expect(requestBody(withImage([question("p", "point", "Where?")]))).not.toContain("method");
+    const asked = requestBody(withImage([question("p", "point", "Where?", { method: "chain" })]));
+    expect(asked).toContain('"method": "chain"');
+  });
+
+  it("is a box's too, and says so on the wire", () => {
+    // GitHub #263: a head box is the head set's extent, read in the same one
+    // pass, and it is an opt-in — so the field has to leave the tab.
+    expect(requestBody(withImage([question("b", "box", "Where?", { method: "head" })]))).toContain('"method": "head"');
+    // Absent is still absent: `chain` is what a box gets by default, but
+    // writing the name would pin a default the endpoint owns.
+    expect(requestBody(withImage([question("b", "box", "Where?")]))).not.toContain("method");
+  });
+
+  it("round-trips without doubling the field", () => {
+    const body = '{"state":"s","questions":{"p":{"type":"box","instructions":"Where?","digits":3,"method":"head"}}}';
+    const read = readRequest(body);
+    if (!read.ok) throw new Error(read.message);
+    expect(read.draft.questions[0].method).toBe("head");
+    expect(read.draft.questions[0].extras).toEqual([]);
+    expect(requestBody(read.draft).match(/"method"/g)).toHaveLength(1);
+  });
+
+  it("ignores a method left over on a primitive that has one way of being answered", () => {
+    // Choosing `head` on a point and then switching the type must not block
+    // the request: the field is simply not sent from there, where the
+    // endpoint would refuse it.
+    const scalar = draft([question("s", "scalar", "How hot?", { method: "head" })]);
+    expect(validate(scalar).filter((f) => f.code.startsWith("method"))).toEqual([]);
+    expect(requestBody(scalar)).not.toContain("method");
+    const noul = draft([question("n", "noul", "Well?", { method: "chain" })]);
+    expect(validate(noul).filter((f) => f.code.startsWith("method"))).toEqual([]);
+    expect(requestBody(noul)).not.toContain("method");
+  });
+
+  it("keeps a spelling neither method covers, and refuses it naming both", () => {
+    const read = readRequest('{"state":"s","questions":{"p":{"type":"point","instructions":"Where?","method":"attention"}}}');
+    if (!read.ok) throw new Error(read.message);
+    expect(read.draft.questions[0].method).toBeNull();
+    // The body still carries what was written, so the server still answers the
+    // 422 this fault is the mirror of.
+    expect(requestBody(read.draft)).toContain('"method": "attention"');
+    const faults = validate(read.draft);
+    expect(faults.map((f) => f.code)).toContain("method_unknown");
+    expect(faults.find((f) => f.code === "method_unknown")?.message).toContain('"head" and "chain"');
+  });
+});

@@ -334,7 +334,11 @@ formats, the host rule and the endpoint are one design and are not split.
   (the copy exists only for keys this request wrote).
 - **Recalibration tooling** beyond writing the procedure down: the harness
   that chose L39.h10 exists and is the tool.
-- **The Playground's Decide tab** showing `method` and the region.
+- **The Playground's Decide tab** showing `method` and the region (shipped
+  after this spec closed, beside #256's fix: the question offers the two
+  methods with the load's own as its default, and a head answer names the
+  method that ran, draws its extent as the token cell it is and reads its
+  region's share of the attention).
 - **A `method` label on the decision metrics** (ADR 0017).
 - **Several heads read together (X4)**: the mean of L39.h10, L43.h9,
   L35.h6 and L35.h16's maps is better than L39.h10 alone on every 1024 px

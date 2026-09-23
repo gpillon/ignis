@@ -24,10 +24,15 @@ export type Answer =
   // decimal point, the sign and the closing brace were steps of the run but
   // hold no place, so a trace shorter than `text` is right.
   | { type: "scalar"; value: number; text: string; uncertainty: number; digits: DigitDraw[] }
-  // A `point` says which method answered it (GitHub #260): a `head` point is
-  // read in one pass off the pointing head and carries no digit trace, only
-  // the `region` it was read from; a `chain` point, and every `box`, carries
-  // the trace.
+  // A `point` and a `box` say which method answered them (GitHub #260, #263).
+  // A `head` answer is read in one pass off the calibrated heads and carries
+  // no digit trace, only the `region` it was read from; a `chain` answer
+  // carries the trace. On a head answer `uncertainty` is the reading's
+  // **resolution** and not a spread: half an image token where a head set
+  // resolved a peak inside its cell (GitHub #264), one whole token where the
+  // pointing head answered alone. `extent` is the box the head set outlines
+  // around a head point — absent on every other answer, including a head
+  // point off the pointing head alone, which has no set to outline with.
   | {
       type: "point" | "box";
       method?: "head" | "chain";
@@ -35,6 +40,7 @@ export type Answer =
       normalized: Record<string, number>;
       uncertainty: Record<string, number>;
       region?: { cells: number; share: number };
+      extent?: Record<string, number>;
       digits?: Record<string, DigitDraw[]>;
     }
   | { type: "error"; code: string; message: string };
