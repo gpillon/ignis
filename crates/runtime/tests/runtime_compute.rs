@@ -2342,7 +2342,9 @@ fn a_head_sets_argmax_comes_back_one_key_per_head() {
     assert_eq!(around.len(), 12);
     assert_eq!(&around[..4], &[None, Some(1.0), None, Some(5.0)], "key 0 is the corner");
     assert_eq!(&around[4..8], &[Some(1.0), Some(3.0), None, Some(7.0)], "key 2 is the top row");
-    assert_eq!(&around[8..], &[Some(3.0), Some(5.0), None, Some(9.0)], "key 4 is the top right");
+    // Key 4 is column 4 of five: the top right corner, with nothing to its
+    // right and nothing above it.
+    assert_eq!(&around[8..], &[Some(3.0), None, None, Some(9.0)], "key 4 is the top right corner");
     let calls = leaf.calls.lock().unwrap();
     let asked = calls.attention_asked[0].as_ref().expect("the leaf was handed the readout");
     assert_eq!(asked.set.as_ref(), Some(&set), "with the set, heads and excluded keys alike");

@@ -15,6 +15,7 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 use ignis_core::decision::{AnswerAlphabet, LabelTokenizer};
+use ignis_core::pointing::{ALLOWANCE_FLAT, ALLOWANCE_PER_N};
 use ignis_core::mock::MockCompute;
 use ignis_core::types::TokenId;
 use ignis_core::{ConcreteScheduler, SchedulerConfig};
@@ -1930,18 +1931,31 @@ async fn a_point_with_no_method_is_read_off_the_head_set_in_one_pass() {
     let (row, col) = (peak / cols, peak % cols);
     assert!(col + 2 < cols && !named.excluded.iter().any(|&k| (peak..peak + 3).contains(&(k as usize))));
     let (cw, ch) = (f64::from(WIDTH) / cols as f64, f64::from(HEIGHT) / rows as f64);
+    // Spec 15, restated from the mock's published constants: the set's heads
+    // sit on three columns of one row, each leaning by
+    // `ATTENTION_SUB_CELL` inside its cell, and the span of three distinct
+    // cells is grown by the allowance at three.
+    let (dx, dy) = MockCompute::ATTENTION_SUB_CELL;
+    let allowance = ALLOWANCE_FLAT + ALLOWANCE_PER_N / 3.0;
+    let (x_lo, x_hi) = (col as f64 + 0.5 + dx - allowance, col as f64 + 2.5 + dx + allowance);
+    let (y_lo, y_hi) = (row as f64 + 0.5 + dy - allowance, row as f64 + 0.5 + dy + allowance);
     let extent = |corner: &str| answer["extent"][corner].as_i64().expect("an extent corner");
-    assert_eq!(extent("x0"), (col as f64 * cw).round() as i64, "{answer}");
-    assert_eq!(extent("x1"), ((col + 3) as f64 * cw).round() as i64, "{answer}");
-    assert_eq!(extent("y0"), (row as f64 * ch).round() as i64, "{answer}");
-    assert_eq!(extent("y1"), ((row + 1) as f64 * ch).round() as i64, "{answer}");
-    assert_eq!(answer["pixels"]["x"].as_i64(), Some(((col as f64 + 1.5) * cw).round() as i64), "{answer}");
-    assert_eq!(answer["pixels"]["y"].as_i64(), Some(((row as f64 + 0.5) * ch).round() as i64), "{answer}");
+    assert_eq!(extent("x0"), (x_lo * cw).round() as i64, "{answer}");
+    assert_eq!(extent("x1"), (x_hi * cw).round() as i64, "{answer}");
+    assert_eq!(extent("y0"), (y_lo * ch).round() as i64, "{answer}");
+    assert_eq!(extent("y1"), (y_hi * ch).round() as i64, "{answer}");
+    let (mid_x, mid_y) = ((x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0);
+    assert_eq!(answer["pixels"]["x"].as_i64(), Some((mid_x * cw).round() as i64), "{answer}");
+    assert_eq!(answer["pixels"]["y"].as_i64(), Some((mid_y * ch).round() as i64), "{answer}");
     let normalized = |fraction: f64| (fraction * 999.0).round() as u64;
-    assert_eq!(answer["normalized"]["x"].as_u64(), Some(normalized((col as f64 + 1.5) / cols as f64)));
-    assert_eq!(answer["normalized"]["y"].as_u64(), Some(normalized((row as f64 + 0.5) / rows as f64)));
+    assert_eq!(answer["normalized"]["x"].as_u64(), Some(normalized(mid_x / cols as f64)));
+    assert_eq!(answer["normalized"]["y"].as_u64(), Some(normalized(mid_y / rows as f64)));
+    // The reading resolves inside the cell, so it answers to half of one.
     let uncertainty = |axis: &str| answer["uncertainty"][axis].as_f64().expect("an uncertainty");
-    assert!((uncertainty("x") - cw).abs() < 1e-9 && (uncertainty("y") - ch).abs() < 1e-9, "{answer}");
+    assert!(
+        (uncertainty("x") - cw / 2.0).abs() < 1e-9 && (uncertainty("y") - ch / 2.0).abs() < 1e-9,
+        "{answer}"
+    );
     // The confidence is still the pointing head's own.
     assert_eq!(answer["region"]["cells"], 1, "{answer}");
     let gap = f64::from(MockCompute::ATTENTION_PEAK_SCORE - MockCompute::ATTENTION_BACKGROUND_SCORE);
@@ -2268,11 +2282,15 @@ async fn a_box_asking_for_the_head_is_the_extent_in_one_pass() {
     let peak = MockCompute::attention_peak(query.key_count);
     let (row, col) = (peak / cols, peak % cols);
     let (cw, ch) = (f64::from(WIDTH) / cols as f64, f64::from(HEIGHT) / rows as f64);
+    // The same extent the point is the centre of (spec 15), restated from
+    // the mock's published sub-cell lean and the allowance at three cells.
+    let (dx, dy) = MockCompute::ATTENTION_SUB_CELL;
+    let allowance = ALLOWANCE_FLAT + ALLOWANCE_PER_N / 3.0;
     let corners = [
-        ("x0", col as f64 * cw, WIDTH, cw),
-        ("y0", row as f64 * ch, HEIGHT, ch),
-        ("x1", (col + 3) as f64 * cw, WIDTH, cw),
-        ("y1", (row + 1) as f64 * ch, HEIGHT, ch),
+        ("x0", (col as f64 + 0.5 + dx - allowance) * cw, WIDTH, cw),
+        ("y0", (row as f64 + 0.5 + dy - allowance) * ch, HEIGHT, ch),
+        ("x1", (col as f64 + 2.5 + dx + allowance) * cw, WIDTH, cw),
+        ("y1", (row as f64 + 0.5 + dy + allowance) * ch, HEIGHT, ch),
     ];
     for (corner, at, side, cell) in corners {
         assert_eq!(answer["pixels"][corner].as_i64(), Some(at.round() as i64), "{corner}: {answer}");
@@ -2281,7 +2299,11 @@ async fn a_box_asking_for_the_head_is_the_extent_in_one_pass() {
             Some((at / f64::from(side) * 999.0).round() as u64),
             "{corner}: {answer}"
         );
-        assert!((answer["uncertainty"][corner].as_f64().unwrap() - cell).abs() < 1e-9, "{corner}: {answer}");
+        // Half a cell per edge: the reading resolves inside one.
+        assert!(
+            (answer["uncertainty"][corner].as_f64().unwrap() - cell / 2.0).abs() < 1e-9,
+            "{corner}: {answer}"
+        );
     }
     assert!(compute.decode_calls().is_empty(), "zero decode rounds ran");
     assert_eq!(response["usage"]["output_tokens"], 0, "{response}");
