@@ -1,0 +1,317 @@
+# 15 - the head box reads inside the cell
+
+GitHub: #264
+
+Spec 14 (#263, ADR 0039) made `point` a one-pass answer off the anchored
+head set and added a one-pass `box` behind `"method": "head"`. Its
+acceptance held on every floor, and its pre-registered rule left `box`'s
+default on the chain because of a single cell of the table: 1024 px buttons,
+where the head box clears IoU >= 0.5 on 102 of 240 against the chain's 190.
+
+`docs/findings/2026-09-23-the-head-box-is-quantised-to-the-cell.md` found
+why, and measured a reading that lifts it. This spec ships that reading.
+
+## Problem Statement
+
+Spec 14's reading puts every head at its image cell's **centre** and grows
+the kept cells' quantile span by **half a cell** on each side. Both halves
+of that are wrong, for different reasons, and they happen to cancel on
+everything except the one regime that matters most to a caller clicking a
+user interface:
+
+- **The box is quantised to the cell.** At 1024 px a cell is 32 px and an
+  E1 button is 1.44 cells tall (199 of 240 are under two cells). The
+  smallest box the rule can express in y is a whole cell and the usual one is
+  two, so the extent runs 1.78x the target in y against 1.22x in x. Cell
+  geometry alone caps the metric: snapping the *true* box to the grid scores
+  82.5%, and covering the cells the true box touches scores 52.5% — under the
+  chain before a single score is read.
+- **The half-cell growth is not what it looks like.** It is not a rounding
+  allowance, it is paying for the span under-covering the object, and how
+  much it under-covers varies by an order of magnitude: on synthetic scenes
+  the 96 heads tile the object (17-56 distinct cells, span ~ the object), on
+  a photograph they pile onto one distinctive part (6-13 distinct cells, span
+  ~ half the object). A constant overpays by a whole cell on buttons while
+  barely covering a screenshot.
+
+A caller therefore cannot ask for a one-pass `box` by default, and pays 25
+decode rounds for a bounding box on exactly the targets one-pass pointing is
+best at.
+
+## Solution
+
+Two changes to how the same prefill is read, and nothing else:
+
+1. **Sub-cell peak.** Each head's position is its cell's centre plus the
+   offset of the true peak inside that cell, recovered by **parabolic
+   interpolation** over the peak's score and its two in-line neighbours on
+   each axis — the standard sub-sample peak estimator, with no new tuned
+   constant. The seam grows by **four scores per head** (the peak's own score
+   is already the high half of spec 14's packed argmax).
+2. **An allowance that reads the evidence.** The kept cells' quantile span
+   (quantile **0.15**, keep radius **3**) is grown by
+   **`(0.05 + 4.5 / n) ` cells per side**, where `n` is the number of
+   **distinct cells** the kept heads occupy — what one part leaves
+   unobserved, shrinking as more parts are seen.
+
+Measured on the vision study's dumps, chosen on four sets and held out on
+eight (`.scratch/head-box-study/`): box IoU >= 0.5 goes **52.0% -> 81.3%**
+where chosen and **57.7% -> 86.0%** held out; 1024 px buttons go **37.1% ->
+81.2%** on a set never used to choose anything, above the chain's 79.2% on
+E1; `point` inside improves wherever it moves (95.4% -> 99.2% on the same
+set). The cost is four extra scores per head at the seam and one small
+gather launch per armed layer.
+
+## User Stories
+
+1. As an agent clicking small labelled buttons, I want a one-pass `box` that
+   frames the button as tightly as the chain's, so that I can stop paying 25
+   decode rounds for a bounding box.
+2. As an agent, I want `point` to keep landing inside the thing I named at
+   least as often as spec 14's point did, so that the better box costs me
+   nothing where pointing already worked.
+3. As an agent working on screenshots, I want the box to stay at least as
+   good as spec 14's on photographic targets, so that the gain on synthetic
+   scenes is not paid for out of my use case.
+4. As a caller, I want `point`'s `uncertainty` to stop claiming a whole cell
+   per axis when the reading now resolves inside one, so that the number
+   describes the answer I actually got.
+5. As a caller, I want the wire contract unchanged — the same `pixels`,
+   `normalized`, `extent`, `region` and `method` — so that a better box
+   changes no code on my side.
+6. As an operator, I want the added cost of the neighbour gather measured
+   inside the prefill at both grids, so that I know pointing stays a prefill
+   and not a budget.
+7. As an operator, I want a job that asks for no readout, and a job that asks
+   for the pointing head alone, to pay exactly what they pay today.
+8. As a maintainer, I want the neighbour scores held to the test-only
+   attention tap, like spec 14 holds the argmax, so that the device path is
+   checked against an independent oracle.
+9. As a maintainer, I want the reading rule to stay a pure host function with
+   golden cases generated by the Python reference, so that the Rust port is
+   held to the rule every number was measured with.
+10. As a maintainer, I want a peak on the image's border, or against an
+    excluded cell, to have a defined reading rather than an extrapolation, so
+    that an edge case cannot move a box off the object.
+11. As a maintainer, I want the mock backend to produce deterministic
+    neighbour scores, so that the whole path stays covered by CPU tests
+    (ADR 0006).
+12. As the owner, I want `box`'s default decided again by spec 14's own rule
+    — head at least chain on **every** pre-registered set — measured once on
+    fresh seeds, so that the default moves on data and not on a hope.
+13. As the owner, I want the chain's box and spec 14's reading reported
+    beside the new one on the same scenes, so that the gain is a number.
+
+## Implementation Decisions
+
+- **Vocabulary.** `CONTEXT.md` gains **sub-cell peak** (a head's position
+  inside its image cell, from the parabola over its peak and the peak's two
+  in-line neighbours) and **allowance** (what the span is grown by, a
+  function of the distinct cells the kept heads occupy). *Extent* and *head
+  set* keep their meaning; *Attention readout* is amended to say the outcome
+  carries the neighbours.
+
+- **The seam carries the peak's neighbours** — ADR 0040, extending ADR 0039.
+  A prefill job's readout is unchanged on the way in (span, pointing head,
+  head set, excluded positions). Its outcome carries, as today, the pointing
+  head's score row and one argmax key index per head of the set, and now
+  **four scores per head**: the keys at the argmax's left, right, up and down
+  **neighbours in the image grid**, in that order. A neighbour that does not
+  exist (the peak is on the grid's border) is reported as **absent**, not as
+  a sentinel score. At 4096 px that is 96 x 4 x 4 bytes = 1.5 KB on top of
+  spec 14's 768 bytes; the plan's readout reservation grows from 3 KB to
+  9 KB for the largest set (384 heads). `ignis_prefill_options` grows by
+  appended fields only (ADR 0016).
+
+- **The grid, not the span.** A neighbour is a neighbour *in the image's
+  row-major grid*: the left neighbour of a cell in column 0 does not exist,
+  and is never the previous row's last cell. The leaf is given the grid's
+  width so it can say so.
+
+- **Excluded cells are ordinary neighbours.** The fallback cells are excluded
+  from the *argmax* (spec 14) because a head parks there when it finds
+  nothing; their scores are still the attention's, and a peak next to one is
+  a peak next to a real score. They are read as neighbours. This is what every
+  number in the finding was measured with.
+
+- **One small gather launch per armed layer.** The fused per-layer kernel of
+  spec 14 is unchanged and still publishes the packed (score, index) per
+  head. A second launch, in the same layer scope and behind the same
+  synchronization, reads the 96 argmax indices and scores the (at most) four
+  neighbours of each: 384 dot products against rows the layer's plane still
+  holds. It is launched only when the layer has a head of the set, and never
+  for a job with no readout or with the pointing head alone.
+
+- **The sub-cell offset is the host's** — the leaf ships scores, the host
+  does the arithmetic, so the rule can change without a kernel change. Per
+  head and per axis, with `b` the peak's score and `a`, `c` its two
+  neighbours:
+
+  ```text
+  d = 0.5 * (a - c) / (a - 2b + c),  clamped to [-0.5, +0.5]
+  ```
+
+  and **`d = 0` when either neighbour is absent, or when the denominator is
+  not strictly positive** (a flat or non-concave triple is not a peak to
+  interpolate). The head's position is `(col + 0.5 + dx) * cell_w`,
+  `(row + 0.5 + dy) * cell_h`.
+
+- **The reading rule**, replacing spec 14's constants in
+  `ignis_core::pointing::read_anchored` and in
+  `tools/pointing-scenes/ensemble_score.py read_anchored`:
+
+  ```python
+  KEEP_RADIUS     = 3.0    # was 2.0
+  EXTENT_QUANTILE = 0.15   # was 0.1
+  ALLOWANCE_FLAT  = 0.05   # cells per side          (replaces the flat 0.5)
+  ALLOWANCE_PER_N = 4.5    # cells per side, over n
+
+  cells  = sub-cell positions of the set's heads
+  kept   = cells within KEEP_RADIUS * max(median distance to the anchor, one cell)
+  n      = number of distinct image cells the kept heads occupy
+  g      = ALLOWANCE_FLAT + ALLOWANCE_PER_N / n          # in cells, per side
+  span_x = quantile(kept.x, .85) - quantile(kept.x, .15)
+  x0, x1 = centre_x -+ (span_x / 2 + g * cell_w)          # same in y
+  extent = clamp((x0, y0, x1, y1), image) ; point = centre(extent)
+  ```
+
+  Quantiles keep NumPy's linear interpolation between order statistics, as
+  spec 14 ported it. The anchor point (spec 13's region rule on the pointing
+  head) is unchanged and still decides *which* object.
+
+- **`uncertainty` becomes the sub-cell resolution.** A head `point` has
+  carried one image cell per axis since spec 13 — the resolution of the
+  reading. The reading now resolves inside the cell, so a head `point` and a
+  head `box` report **half a cell** per axis (per edge for a box). This is a
+  documented change of a documented number, not a new field.
+
+- **Nothing else on the wire.** `pixels`, `normalized`, `extent`, `region`,
+  `method`, the refusals, the fan-out and the metrics are spec 14's.
+
+- **`box`'s default is decided again, by spec 14's rule.** `head` becomes the
+  default if and only if the head box's IoU >= 0.5 rate is at least the chain
+  box's on **every** one of the acceptance's four sets. Until that run says
+  so, `box` stays the chain and `head` stays opt-in; the point's default is
+  unchanged (it already reads the set).
+
+- **Documentation**: ADR 0040; `CONTEXT.md` as above; the OpenAPI document's
+  `uncertainty` description for head answers; `tools/pointing-scenes/README.md`
+  gains the new constants beside the recalibration procedure.
+
+## Testing Decisions
+
+A good test asserts what a caller or an operator can observe, and holds the
+device path to an **independent** oracle.
+
+- **The sub-cell rule (CPU, pure function).** Table cases: a symmetric triple
+  reads 0; a triple leaning left reads negative and one leaning right
+  positive; a flat triple reads 0; a non-concave triple (the "peak" below a
+  neighbour, which the argmax makes impossible but the host must survive)
+  reads 0; an absent neighbour reads 0 on that axis only; the clamp holds at
+  exactly +-0.5. Prior art: the region-rule tests beside `read_head_map`.
+
+- **The anchored reading (CPU, against the reference).** Golden cases
+  regenerated with `ensemble_score.py golden` from the same real dumps spec
+  14 used, now carrying the neighbour scores; the Rust rule reproduces the
+  Python one to float tolerance. Plus table cases: every head in one cell
+  (the allowance alone gives the box); heads split between the target and a
+  far distractor; an extent past the image edge; a non-square grid and image.
+
+- **The neighbour scores against the tap (GPU profile, `attn-tap`).** On the
+  committed 1024 px and 4096 px pointing fixtures under BF16 and hq-e8-2b:
+  for every head of the set, each neighbour score the leaf reports equals the
+  tap's host-side `q . k / 16` at that grid neighbour, and a head whose peak
+  sits on a border reports that neighbour absent. Prior art: the
+  leaf-against-tap test #260 and #263 added.
+
+- **The endpoint over the mock (CPU).** The mock peaks a head on a cell and
+  plants an asymmetric neighbourhood, so a default `point` answers off the
+  sub-cell centre with `extent`, after zero decode rounds; a head `box`
+  carries `method: "head"` and the new `uncertainty`; every spec 14 refusal
+  is unchanged. Prior art: the decide endpoint and fan-out tests over the
+  mock.
+
+- **Cost (GPU).** The reading chunk's GPU time with the gather against spec
+  14's reading, same prompt, paired and interleaved, through
+  `IGNIS_CHUNK_PROFILE`, at 1024 and 4096 px; and a job with no readout and a
+  job with the pointing head alone launch what they launch today.
+
+## Acceptance
+
+Closed against these, in one piece of work.
+
+1. **The leaf's neighbours are the attention's.** Under BF16 and hq-e8-2b, on
+   both pointing fixtures, every neighbour score equals the tap's (ties to
+   float accumulation excepted), a border peak reports the missing neighbour
+   absent, and spec 14's argmax and the pointing head's row are unchanged.
+2. **The host rule is the reference's.** `read_anchored` reproduces
+   `ensemble_score.py read_anchored` on the regenerated golden cases, and the
+   sub-cell and table cases pass on CPU.
+3. **`/v1/decide` over the mock** answers as Testing Decisions lists, with
+   every spec 14 refusal, method and fan-out behaviour unchanged.
+4. **Cost.** The gather adds at most **0.3 ms** of GPU time to the reading
+   chunk at 1024 px and at most **0.6 ms** at 4096 px, and nothing to a job
+   that asks for no readout or for the pointing head alone.
+5. **The pre-registered acceptance holds** — measured once, through
+   `/v1/decide`, served artifact, hq-e8-2b with the residual window, sets
+   never used before (fresh seeds reserved in
+   `tools/pointing-scenes/README.md`):
+
+   | set | command | head `box` IoU >= 0.5 | `point` inside |
+   |---|---|---|---|
+   | F1 buttons, 1024 px | `scenes.py --varied --seed 20260950` (240) | **>= 180** | **>= 225** |
+   | F2 buttons, 4096 px | `scenes.py --varied --side 4096 --seed 20260951` (240) | **>= 230** | **>= 230** |
+   | F3 rectangles, 1024 px | `rectangles.py --seed 20260952 --n 120` | **>= 108** | **>= 108** |
+   | F4 rectangles, 4096 px | `rectangles.py --side 4096 --seed 20260953 --n 60` | **>= 48** | **>= 54** |
+
+   F1's box floor is 75% — under the 81.2% held out on T1' by the slack of
+   six points every earlier floor used, and above the chain's 79.2% on E1
+   only if the measurement repeats, which is the point of measuring. F2, F3
+   and F4's box floors are spec 14's own measured rates (238/240, 111/120,
+   53/60) minus the same slack, so the new reading may not pay for F1 out of
+   them. The point floors are spec 14's.
+   Reported beside each, not asserted: the chain's `point` and `box`, spec
+   14's reading on the same scores (it is a host function of the same
+   readout, so both can be reported from one run), each method's median
+   distance from the target's centre and median IoU, and the owner's
+   screenshot questions if the clone has them.
+   **`box`'s default:** it becomes `head` if and only if the head box's
+   IoU >= 0.5 rate is at least the chain box's on **every** one of F1-F4.
+   Recorded as a finding with a README row, whichever way it goes.
+6. ADR 0040, `CONTEXT.md`, the OpenAPI document and
+   `tools/pointing-scenes/README.md` are updated, and the golden fixture is
+   regenerated by the tool that owns it.
+
+## Out of Scope
+
+- **Re-selecting the head set.** The 96 heads and the fallback cells are spec
+  14's, chosen on the same dumps; only the reading changes.
+- **The Playground's Decide tab** drawing the extent: still a follow-up after
+  `decide-ui-260-256` merges.
+- **Refusing on low `region.share`**, **multi-image states**, **a `method`
+  label on the decision metrics** (ADR 0017): spec 14's reasons stand.
+- **A size feature beyond the distinct-cell count.** The per-head attention
+  spread, the anchor's region size and a learned combination were all
+  measured and rejected in the finding; a better one needs annotated real
+  images, not another sweep of the same dumps.
+- **Dropping the chain's `point`.** The owner intends to; it is a separate
+  decision that waits on this acceptance and on the chain staying available
+  for callers who ask for it by name.
+
+## Further Notes
+
+- **Where the numbers come from.**
+  `docs/findings/2026-09-23-the-head-box-is-quantised-to-the-cell.md`, and
+  the sweeps behind it in `.scratch/head-box-study/` of the clone that ran
+  them. Four rules that did not work are recorded there so the next
+  recalibration does not pay for them again.
+- **Why the cross and not the 3x3.** A 3x3 neighbourhood scored no better
+  than the four in-line neighbours (82-89% against 85-89% on buttons), so the
+  seam carries four scores per head and not eight.
+- **Why the allowance is `1/n` and not a fitted curve.** It is a statement
+  about what is missing: with `n` distinct parts observed, the unobserved
+  remainder falls like `1/n`. Two constants, both measured, and they were
+  chosen on four sets and checked on eight.
+- **Recalibrating** for a new artifact is unchanged: the head set's procedure
+  in `tools/pointing-scenes/README.md`. The reading's constants are not
+  per-artifact and are not part of the calibration table.
