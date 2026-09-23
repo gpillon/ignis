@@ -1546,8 +1546,10 @@ pub enum Answer {
     /// follows from it:
     ///
     /// - **`head`** — one pass over the calibrated heads' attention.
-    ///   `uncertainty` is the maps' resolution, one image token per axis, and
-    ///   not a spread. `region` is the pointing head's: the cells its point
+    ///   `uncertainty` is the maps' resolution and not a spread: **half an
+    ///   image token** per axis on a load with a head set, whose reading
+    ///   resolves a peak inside its token (GitHub #264), and one whole token
+    ///   for the pointing head alone. `region` is the pointing head's: the cells its point
     ///   was read from and their `share` of its attention over the image —
     ///   the confidence to act on (it separates hits from misses on the
     ///   measured scenes, and a near-flat map, about 0.03, is nothing found),
@@ -1579,9 +1581,10 @@ pub enum Answer {
     ///
     /// - **`head`** — the head set's **extent**, read in one pass, in the
     ///   same pixels and on the same 0-`scale` normalization as the chain's.
-    ///   `uncertainty` is one image token per edge (a token's width for `x0`
-    ///   and `x1`, its height for `y0` and `y1`), `region` the pointing
-    ///   head's, and no `digits`.
+    ///   `uncertainty` is half an image token per edge (half a token's width
+    ///   for `x0` and `x1`, half its height for `y0` and `y1`) — the
+    ///   reading's resolution inside the token (GitHub #264) — `region` the
+    ///   pointing head's, and no `digits`.
     /// - **`chain`** — the digit chain, with its `digits` trace.
     #[serde(rename = "box")]
     Box {
@@ -1661,14 +1664,21 @@ pub fn head_answer_for(
         share: reading.share,
     });
     let asked_set = question.head.is_some_and(|calibration| calibration.set.is_some());
-    let anchored = match (&attention.set_argmax, asked_set) {
-        (Some(argmax), true) => {
-            match ignis_core::pointing::read_anchored(scores, argmax, grid.0, grid.1, width, height) {
+    let set = (
+        attention.set_argmax.as_deref(),
+        attention.set_peak.as_deref(),
+        attention.set_neighbours.as_deref(),
+    );
+    let anchored = match (set, asked_set) {
+        ((Some(argmax), Some(peak), Some(around)), true) => {
+            match ignis_core::pointing::read_anchored(
+                scores, argmax, peak, around, grid.0, grid.1, width, height,
+            ) {
                 Some(anchored) => Some(anchored),
                 None => return malformed(),
             }
         }
-        (None, false) => None,
+        ((None, None, None), false) => None,
         _ => return malformed(),
     };
     let on_scale = |value: f64, side: u32| {
@@ -1681,6 +1691,9 @@ pub fn head_answer_for(
     fn corners<T>(values: [T; 4]) -> BTreeMap<String, T> {
         ["x0", "y0", "x1", "y1"].into_iter().map(str::to_owned).zip(values).collect()
     }
+    // Spec 15: an anchored reading resolves a peak *inside* its cell, so it
+    // answers to half a cell; the pointing head alone still answers to one.
+    let (sub_w, sub_h) = (cell_w / 2.0, cell_h / 2.0);
     match (question.kind, anchored) {
         (QuestionKind::Box, Some(anchored)) => {
             let e = anchored.extent;
@@ -1698,7 +1711,7 @@ pub fn head_answer_for(
                     on_scale(e.x1, width),
                     on_scale(e.y1, height),
                 ]),
-                uncertainty: corners([cell_w, cell_h, cell_w, cell_h]),
+                uncertainty: corners([sub_w, sub_h, sub_w, sub_h]),
                 region,
                 digits: None,
             }
@@ -1711,7 +1724,7 @@ pub fn head_answer_for(
                 method: SpatialMethod::Head,
                 pixels: axes([("x", in_pixels(x, width)), ("y", in_pixels(y, height))]),
                 normalized: axes([("x", on_scale(x, width)), ("y", on_scale(y, height))]),
-                uncertainty: axes([("x", cell_w), ("y", cell_h)]),
+                uncertainty: axes([("x", sub_w), ("y", sub_h)]),
                 region,
                 extent: Some(corners([
                     in_pixels(e.x0, width),

@@ -277,6 +277,56 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
             }
         }
 
+        // ── the peaks and their neighbours against the tap's ─────────────
+        //
+        // Spec 15 (GitHub #264, ADR 0040): the gather launch scores the four
+        // keys around each argmax in the image grid, and says so with NaN
+        // where the grid has none. The tap is the oracle for both.
+        let peak = leaf.set_peak.as_deref().unwrap_or_else(|| panic!("{label}: no peak scores"));
+        let around =
+            leaf.set_neighbours.as_deref().unwrap_or_else(|| panic!("{label}: no neighbours"));
+        assert_eq!(peak.len(), set.heads.len(), "{label}: one peak score per head");
+        assert_eq!(around.len(), 4 * set.heads.len(), "{label}: four neighbours per head");
+        let mut absent = 0usize;
+        for (h, (head, &key)) in set.heads.iter().zip(argmax).enumerate() {
+            let oracle = tap_scores(*head);
+            let near = |a: f32, b: f32, what: &str| {
+                let diff = (a - b).abs() / b.abs().max(1.0);
+                assert!(
+                    diff <= SCORE_TOLERANCE,
+                    "{label}: {head} {what}: leaf {a}, tap {b} ({diff:.2e})"
+                );
+            };
+            near(peak[h], oracle[key as usize], "peak");
+            let (col, row) = (key % cols as u32, key / cols as u32);
+            let grid_rows = (count as u32).div_ceil(cols as u32);
+            let expected = [
+                (col > 0).then(|| key - 1),
+                (col + 1 < cols as u32).then(|| key + 1),
+                (row > 0).then(|| key - cols as u32),
+                (row + 1 < grid_rows).then(|| key + cols as u32),
+            ];
+            for (j, want) in expected.into_iter().enumerate() {
+                let got = around[4 * h + j];
+                match want.filter(|&k| (k as usize) < count) {
+                    Some(k) => near(
+                        got.unwrap_or_else(|| {
+                            panic!("{label}: {head} neighbour {j} of key {key} is on the grid")
+                        }),
+                        oracle[k as usize],
+                        "neighbour",
+                    ),
+                    None => {
+                        assert!(
+                            got.is_none(),
+                            "{label}: {head} peaks at {key} on a {rows}x{cols} grid:                              neighbour {j} is off it, the leaf read {got:?}"
+                        );
+                        absent += 1;
+                    }
+                }
+            }
+        }
+
         // ── the pointing head's row, written in the fused launch ─────────
         let leaf = leaf.scores;
         let oracle = tap_scores(HEAD);

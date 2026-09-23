@@ -273,6 +273,27 @@ impl StepLeaf for StubLeaf {
                 for (i, key) in read.set_argmax.iter_mut().enumerate() {
                     *key = 2 * i as u32;
                 }
+                // Spec 15: each peak's score, and the four around it. The
+                // grid's columns say which exist -- NaN is "off the grid".
+                let cols = read.query.set.as_ref().map_or(1, |set| set.grid_cols.max(1));
+                let rows = read.query.key_count.div_ceil(cols);
+                let peaks: Vec<u32> = read.set_argmax.clone();
+                for (i, peak) in read.set_peak.iter_mut().enumerate() {
+                    *peak = peaks[i] as f32 + 100.0;
+                }
+                for (i, key) in peaks.iter().enumerate() {
+                    let (col, row) = (key % cols, key / cols);
+                    let around = [
+                        (col > 0).then(|| key - 1),
+                        (col + 1 < cols).then(|| key + 1),
+                        (row > 0).then(|| key - cols),
+                        (row + 1 < rows).then(|| key + cols),
+                    ];
+                    for (j, neighbour) in around.into_iter().enumerate() {
+                        read.set_neighbours[4 * i + j] =
+                            neighbour.map_or(f32::NAN, |key| key as f32);
+                    }
+                }
                 read.read = true;
             }
         }
@@ -2298,6 +2319,7 @@ fn a_head_sets_argmax_comes_back_one_key_per_head() {
     let set = SetQuery {
         heads: Arc::from(vec![HEAD, PointingHead { gqa_ordinal: 15, query_head: 18 }, HEAD]),
         excluded: Arc::from(vec![0, 19]),
+        grid_cols: 5,
     };
     let job = PrefillJob {
         attention: Some(AttentionQuery {
@@ -2312,6 +2334,15 @@ fn a_head_sets_argmax_comes_back_one_key_per_head() {
     let attention = outcomes[0].attention.as_ref().expect("read");
     assert_eq!(attention.scores.len(), 20);
     assert_eq!(attention.set_argmax.as_deref(), Some(&[0, 2, 4][..]), "one key per head, in the set's order");
+    assert_eq!(attention.set_peak.as_deref(), Some(&[100.0, 102.0, 104.0][..]), "each peak's score");
+    // Spec 15: four neighbours per head, and a NaN from the leaf crosses as
+    // `None`. The span is 20 keys on a 5-column grid, so key 0 is the top
+    // left corner: no left neighbour and none above.
+    let around = attention.set_neighbours.as_deref().expect("four neighbours per head");
+    assert_eq!(around.len(), 12);
+    assert_eq!(&around[..4], &[None, Some(1.0), None, Some(5.0)], "key 0 is the corner");
+    assert_eq!(&around[4..8], &[Some(1.0), Some(3.0), None, Some(7.0)], "key 2 is the top row");
+    assert_eq!(&around[8..], &[Some(3.0), Some(5.0), None, Some(9.0)], "key 4 is the top right");
     let calls = leaf.calls.lock().unwrap();
     let asked = calls.attention_asked[0].as_ref().expect("the leaf was handed the readout");
     assert_eq!(asked.set.as_ref(), Some(&set), "with the set, heads and excluded keys alike");

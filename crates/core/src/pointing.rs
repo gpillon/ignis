@@ -1,7 +1,8 @@
 //! Pointing in one pass: the **attention readout**, the **pointing head** and
-//! the **head set** (specs `docs/specs/decide/13-point-by-attention-head.md`
-//! and `14-point-and-box-from-the-head-set.md`, GitHub #260 and #263, ADR 0038
-//! and ADR 0039).
+//! the **head set** (specs `docs/specs/decide/13-point-by-attention-head.md`,
+//! `14-point-and-box-from-the-head-set.md` and
+//! `15-the-head-box-reads-inside-the-cell.md`, GitHub #260, #263 and #264,
+//! ADR 0038, ADR 0039 and ADR 0040).
 //!
 //! One attention head of the served model, read at the position after the
 //! forced `{"x":`, names the object the question asked for; 96 heads of the
@@ -13,16 +14,18 @@
 //!   head of one GQA layer, dotted with the keys of one span of the prompt,
 //!   and optionally a head set read beside it. What comes back across the
 //!   `Compute` seam ([`AttentionScores`]) is one pre-softmax score per key of
-//!   that span for the pointing head, one key index per head of the set, and
-//!   nothing else — never a full attention row, never a logits row.
+//!   that span for the pointing head, one key index per head of the set with
+//!   the four scores around it, and nothing else — never a full attention
+//!   row, never a logits row.
 //! - **Which heads point** ([`calibration`]): constants chosen with labelled
 //!   scenes, keyed to the artifact's content hash. Unlike the answer
 //!   alphabet they cannot be computed at load, and like the alphabet they
 //!   are refused against any other load.
 //! - **How a map becomes a point** ([`read_head_map`]): TAG's region rule,
 //!   the one every number in the findings was measured with.
-//! - **How a map and a head set become a box** ([`read_anchored`]): spec
-//!   14's anchored reading, ported from `tools/pointing-scenes/ensemble_score.py`.
+//! - **How a map and a head set become a box** ([`read_anchored`]): the
+//!   anchored reading, ported from `tools/pointing-scenes/ensemble_score.py`
+//!   — spec 14's, reading inside the cell and with spec 15's allowance.
 
 use std::sync::Arc;
 
@@ -311,9 +314,11 @@ pub fn calibrated_artifacts() -> impl Iterator<Item = ArtifactHash> {
 ///
 /// With a [`SetQuery`] (spec 14, ADR 0039) the job also names a head set:
 /// every GQA layer holding one of its heads is read the same way, and one
-/// argmax key index per head comes back beside the pointing head's scores
-/// ([`AttentionScores`]). A read any armed layer cannot make leaves the
-/// whole readout unread — never a partial set.
+/// argmax key index per head comes back beside the pointing head's scores,
+/// with the four scores around it (spec 15, ADR 0040) — enough to read the
+/// peak's position *inside* its image cell ([`AttentionScores`]). A read any
+/// armed layer cannot make leaves the whole readout unread — never a partial
+/// set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionQuery {
     /// The layer and query head read.
@@ -339,6 +344,11 @@ pub struct SetQuery {
     /// [`MAX_EXCLUDED_KEYS`]. The pointing head's own scores still cover
     /// every key: its region rule reads the whole map.
     pub excluded: Arc<[u32]>,
+    /// The image grid's columns (spec 15, ADR 0040). The span is a
+    /// row-major grid, and the leaf walks it to find each peak's four
+    /// in-line neighbours: the left neighbour of a cell in column 0 does
+    /// not exist, and is never the previous row's last cell.
+    pub grid_cols: u32,
 }
 
 impl SetQuery {
@@ -347,6 +357,7 @@ impl SetQuery {
         Self {
             heads: Arc::from(set.heads),
             excluded: Arc::from(set.fallback_cells(rows, cols)),
+            grid_cols: cols,
         }
     }
 }
@@ -360,9 +371,10 @@ pub const MAX_SET_HEADS: usize = 16 * 24;
 pub const MAX_EXCLUDED_KEYS: usize = 32;
 
 /// What an [`AttentionQuery`] reads back across the `Compute` seam (ADR 0038,
-/// ADR 0039): the pointing head's scores, and one key index per head of the
-/// set when it named one. Nothing else crosses — at 4096 px that is 64 KB
-/// and 384 bytes, where every head's row would be 6.3 MB.
+/// ADR 0039, ADR 0040): the pointing head's scores, and one key index per
+/// head of the set with the four scores around it when it named one. Nothing
+/// else crosses — at 4096 px that is 64 KB, 384 bytes and 1.5 KB, where every
+/// head's row would be 6.3 MB.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionScores {
     /// The pointing head's `q · k / sqrt(head_dim)`, one per key of the
@@ -373,6 +385,19 @@ pub struct AttentionScores {
     /// excluded keys (the larger index on a tie). `None` when the query
     /// named no set.
     pub set_argmax: Option<Arc<[u32]>>,
+    /// Each head's score **at** its [`AttentionScores::set_argmax`] cell, in
+    /// the set's order (spec 15, ADR 0040). It costs the leaf nothing: it is
+    /// the high half of the packed value the argmax was reduced with.
+    pub set_peak: Option<Arc<[f32]>>,
+    /// Four scores per head of the set, in the set's order (spec 15,
+    /// ADR 0040): the argmax's **left, right, up and down** neighbours in
+    /// the image grid, in that order. `None` for a neighbour off the grid —
+    /// a peak on the image's border has no score beyond it. The excluded
+    /// keys are ordinary neighbours: a head may not *peak* on a fallback
+    /// cell, but the score there is still the attention's.
+    ///
+    /// `None` when the query named no set; otherwise `4 * heads` long.
+    pub set_neighbours: Option<Arc<[Option<f32>]>>,
 }
 
 impl AttentionScores {
@@ -381,6 +406,8 @@ impl AttentionScores {
         Self {
             scores: scores.into(),
             set_argmax: None,
+            set_peak: None,
+            set_neighbours: None,
         }
     }
 }
@@ -537,12 +564,40 @@ pub fn read_head_map(scores: &[f32], rows: usize, cols: usize) -> Option<HeadRea
 }
 
 /// How far from the pointing head's point a head set's cell is kept: this
-/// many times the median distance of the set's cells (spec 14).
-pub const KEEP_RADIUS: f64 = 2.0;
+/// many times the median distance of the set's cells (spec 15; spec 14 kept
+/// 2.0).
+pub const KEEP_RADIUS: f64 = 3.0;
 
-/// The extent is the [`EXTENT_QUANTILE`] to `1 - EXTENT_QUANTILE` span of
-/// the kept cells on each axis, grown half a cell (spec 14).
-pub const EXTENT_QUANTILE: f64 = 0.1;
+/// The extent spans the [`EXTENT_QUANTILE`] to `1 - EXTENT_QUANTILE`
+/// quantiles of the kept positions on each axis (spec 15; spec 14 used 0.1).
+pub const EXTENT_QUANTILE: f64 = 0.15;
+
+/// The **allowance** the span is grown by on each side, in cells:
+/// `ALLOWANCE_FLAT + ALLOWANCE_PER_N / n`, where `n` is the number of
+/// distinct image cells the kept heads occupy (spec 15).
+///
+/// The span is a *lower bound* on the object — it reaches only the parts the
+/// heads actually hit — and what one part leaves unobserved falls like
+/// `1 / n`: on a synthetic scene the set tiles the object (17-56 distinct
+/// cells, span ≈ the object), on a photograph it piles onto one distinctive
+/// part (6-13, span ≈ half of it). Spec 14 grew a flat half cell, which
+/// happened to pay for that on screenshots while overpaying by a whole cell
+/// on 1024 px buttons — the one cell of its acceptance the head box lost
+/// (`docs/findings/2026-09-23-the-head-box-is-quantised-to-the-cell.md`).
+pub const ALLOWANCE_FLAT: f64 = 0.05;
+
+/// The part of the [`ALLOWANCE_FLAT`] allowance that falls with the distinct
+/// cells the kept heads occupy (spec 15).
+pub const ALLOWANCE_PER_N: f64 = 4.5;
+
+/// The fewest distinct cells the allowance is evaluated at (spec 15).
+///
+/// Three is the fewest any of the 783 scenes behind the rule reached, so
+/// clamping here changes no measured answer; it stops a degenerate readout —
+/// every head on one cell — from extrapolating the allowance to 4.55 cells
+/// on evidence nothing was ever measured at. The rule is bounded to the
+/// range it was chosen on rather than trusted outside it.
+pub const ALLOWANCE_MIN_CELLS: usize = 3;
 
 /// A box in pixels of the submitted image: `(x0, y0)` its top-left corner,
 /// `(x1, y1)` its bottom-right.
@@ -570,8 +625,11 @@ pub struct AnchoredReading {
     pub anchor: HeadReading,
     /// The **extent**: the object's box, clamped to the image.
     pub extent: Extent,
-    /// How many of the set's cells the extent was spanned over.
+    /// How many of the set's heads the extent was spanned over.
     pub kept: usize,
+    /// How many **distinct** image cells those heads peak on — what the
+    /// allowance is read off (spec 15). Never zero when `kept` is not.
+    pub distinct_cells: usize,
 }
 
 impl AnchoredReading {
@@ -581,30 +639,60 @@ impl AnchoredReading {
     }
 }
 
-/// Read a head set anchored on the pointing head into a box and its centre
-/// (spec 14): `anchor_scores` is the pointing head's map over a `rows` by
-/// `cols` grid, row-major, `set_argmax` one cell per head of the set, and
-/// the image `width` by `height` pixels the grid covers.
+/// Where a head's peak sits **inside** its image cell, along one axis (spec
+/// 15): parabolic interpolation over the peak's score `b` and its two
+/// in-line neighbours `a` (before) and `c` (after) — the standard
+/// sub-sample peak estimator, in cells, clamped to `[-0.5, 0.5]`.
 ///
-/// The rule every number in spec 14 was measured with,
+/// Zero when either neighbour is off the grid (`None`), or when the triple
+/// is not a strict peak: a flat or non-concave triple has no sub-cell
+/// position to read, and extrapolating one would move the box off the
+/// object. The argmax makes `b < a` impossible for a head that peaked here,
+/// but the rule survives it rather than trusting it.
+pub fn sub_cell_offset(before: Option<f32>, peak: f32, after: Option<f32>) -> f64 {
+    let (Some(a), Some(c)) = (before, after) else {
+        return 0.0;
+    };
+    let (a, b, c) = (f64::from(a), f64::from(peak), f64::from(c));
+    let curvature = a - 2.0 * b + c;
+    if !(curvature < 0.0) {
+        return 0.0; // flat, non-concave, or not a number
+    }
+    (0.5 * (a - c) / curvature).clamp(-0.5, 0.5)
+}
+
+/// Read a head set anchored on the pointing head into a box and its centre:
+/// `anchor_scores` is the pointing head's map over a `rows` by `cols` grid,
+/// row-major, `set_argmax` one cell per head of the set, `set_peak` that
+/// head's score there, `set_neighbours` the four scores around it (left,
+/// right, up, down — [`AttentionScores::set_neighbours`]), and the image
+/// `width` by `height` pixels the grid covers.
+///
+/// The rule every number in spec 15 was measured with,
 /// `tools/pointing-scenes/ensemble_score.py read_anchored`, in the same
 /// arithmetic:
 ///
 /// 1. the anchor is [`read_head_map`]'s point, in pixels;
-/// 2. each head's cell centre is kept when its distance to the anchor is at
-///    most [`KEEP_RADIUS`] times the larger of the cells' median distance
-///    and one cell's longer side — so at least half of them always are;
+/// 2. each head sits at its cell's centre plus its [`sub_cell_offset`] on
+///    each axis, and is kept when its distance to the anchor is at most
+///    [`KEEP_RADIUS`] times the larger of the positions' median distance and
+///    one cell's longer side — so at least half of them always are;
 /// 3. the extent is the [`EXTENT_QUANTILE`] and `1 - EXTENT_QUANTILE`
-///    quantiles of the kept centres on each axis (NumPy's default linear
-///    interpolation at position `(n - 1) * q`), grown half a cell and
-///    clamped to the image; the point is its centre.
+///    quantiles of the kept positions on each axis (NumPy's default linear
+///    interpolation at position `(n - 1) * q`), grown by the allowance
+///    [`ALLOWANCE_FLAT`] `+` [`ALLOWANCE_PER_N`] `/ n` cells on each side —
+///    `n` the distinct cells the kept heads occupy, never under
+///    [`ALLOWANCE_MIN_CELLS`] — and clamped to the image; the point is its
+///    centre.
 ///
 /// `None` when the anchor's map does not read ([`read_head_map`]), the set
-/// is empty, or a cell is outside the grid: a set the leaf did not read
-/// whole is not a set.
+/// is empty, a cell is outside the grid, or the peaks and neighbours are not
+/// one and four per head: a set the leaf did not read whole is not a set.
 pub fn read_anchored(
     anchor_scores: &[f32],
     set_argmax: &[u32],
+    set_peak: &[f32],
+    set_neighbours: &[Option<f32>],
     rows: usize,
     cols: usize,
     width: u32,
@@ -614,36 +702,51 @@ pub fn read_anchored(
     if set_argmax.is_empty() || set_argmax.iter().any(|&cell| cell as usize >= rows * cols) {
         return None;
     }
+    if set_peak.len() != set_argmax.len() || set_neighbours.len() != 4 * set_argmax.len() {
+        return None;
+    }
     let (width, height) = (f64::from(width), f64::from(height));
     let (cw, ch) = (width / cols as f64, height / rows as f64);
     let (ax, ay) = (anchor.x * cw, anchor.y * ch);
-    let cells: Vec<(f64, f64)> = set_argmax
+    let positions: Vec<(f64, f64)> = set_argmax
         .iter()
-        .map(|&cell| {
+        .zip(set_peak)
+        .zip(set_neighbours.chunks_exact(4))
+        .map(|((&cell, &peak), around)| {
             let cell = cell as usize;
-            (((cell % cols) as f64 + 0.5) * cw, ((cell / cols) as f64 + 0.5) * ch)
+            let dx = sub_cell_offset(around[0], peak, around[1]);
+            let dy = sub_cell_offset(around[2], peak, around[3]);
+            (
+                ((cell % cols) as f64 + 0.5 + dx) * cw,
+                ((cell / cols) as f64 + 0.5 + dy) * ch,
+            )
         })
         .collect();
-    let distances: Vec<f64> = cells.iter().map(|&(x, y)| (x - ax).hypot(y - ay)).collect();
+    let distances: Vec<f64> = positions.iter().map(|&(x, y)| (x - ax).hypot(y - ay)).collect();
     let scale = median(&distances).max(cw.max(ch));
-    let (mut xs, mut ys): (Vec<f64>, Vec<f64>) = cells
-        .iter()
-        .zip(&distances)
-        .filter(|&(_, &d)| d <= KEEP_RADIUS * scale)
-        .map(|(&cell, _)| cell)
-        .unzip();
+    let kept: Vec<usize> = (0..positions.len())
+        .filter(|&i| distances[i] <= KEEP_RADIUS * scale)
+        .collect();
+    let mut distinct: Vec<u32> = kept.iter().map(|&i| set_argmax[i]).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let allowance =
+        ALLOWANCE_FLAT + ALLOWANCE_PER_N / distinct.len().max(ALLOWANCE_MIN_CELLS) as f64;
+    let (mut xs, mut ys): (Vec<f64>, Vec<f64>) = kept.iter().map(|&i| positions[i]).unzip();
     xs.sort_by(f64::total_cmp);
     ys.sort_by(f64::total_cmp);
+    let (gx, gy) = (allowance * cw, allowance * ch);
     let extent = Extent {
-        x0: (quantile(&xs, EXTENT_QUANTILE) - cw / 2.0).max(0.0),
-        y0: (quantile(&ys, EXTENT_QUANTILE) - ch / 2.0).max(0.0),
-        x1: (quantile(&xs, 1.0 - EXTENT_QUANTILE) + cw / 2.0).min(width),
-        y1: (quantile(&ys, 1.0 - EXTENT_QUANTILE) + ch / 2.0).min(height),
+        x0: (quantile(&xs, EXTENT_QUANTILE) - gx).max(0.0),
+        y0: (quantile(&ys, EXTENT_QUANTILE) - gy).max(0.0),
+        x1: (quantile(&xs, 1.0 - EXTENT_QUANTILE) + gx).min(width),
+        y1: (quantile(&ys, 1.0 - EXTENT_QUANTILE) + gy).min(height),
     };
     Some(AnchoredReading {
         anchor,
         extent,
         kept: xs.len(),
+        distinct_cells: distinct.len(),
     })
 }
 

@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 
 // The GQA layers a readout may arm: all of them.
 constexpr int kReadoutGqaLayers = kIgnisGqaLayerCount;
@@ -31,6 +32,17 @@ constexpr int kReadoutMaxSetHeads = kReadoutGqaLayers * kReadoutLayerHeads;
 // The most keys a set's argmax may skip (the fallback cells), carried as
 // launch arguments rather than memory.
 constexpr int kReadoutMaxExcluded = 32;
+
+// GitHub #264: the host's inverse of the fused kernel's order-preserving
+// float -> uint packing (`pack_score`), so the peak's own score can be read
+// off the packed argmax instead of copied again.
+inline float ignis_attention_unpack_score(std::uint32_t packed) {
+  const std::uint32_t bits = (packed & 0x80000000u) ? (packed & 0x7fffffffu) : ~packed;
+  float score = 0.0F;
+  static_assert(sizeof(score) == sizeof(bits), "a float is four bytes");
+  std::memcpy(&score, &bits, sizeof(score));
+  return score;
+}
 
 struct AttentionReadoutTarget {
   // The pointing head, when this layer holds it: its score row is written to
@@ -52,6 +64,12 @@ struct AttentionReadoutTarget {
   int32_t set_query_head[kReadoutLayerHeads] = {};
   int32_t set_slot[kReadoutLayerHeads] = {};
   unsigned long long *device_set_best = nullptr;
+  // GitHub #264: where this layer's heads' neighbour scores go -- four floats
+  // a head of the *whole* set, at `4 * set_slot[i]`, NaN for a neighbour off
+  // the image grid -- and that grid's columns, which say which exist. Both
+  // are needed whenever `set_heads` is nonzero.
+  float *device_set_neighbours = nullptr;
+  int32_t grid_cols = 0;
   // Span-relative keys no head of the set may peak on. The pointing head's
   // row still covers them.
   int32_t excluded_count = 0;

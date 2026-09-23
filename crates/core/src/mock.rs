@@ -369,6 +369,39 @@ impl MockCompute {
     /// See [`MockCompute::ATTENTION_PEAK_SCORE`].
     pub const ATTENTION_BACKGROUND_SCORE: f32 = -2.0;
 
+    /// The sub-cell offset every head of the mock's set reads (GitHub #264),
+    /// in cells. The neighbour scores below are deliberately lopsided, and
+    /// lopsided by the same amount for every head, so a test can say where
+    /// the extent lands without restating the parabola.
+    pub const ATTENTION_SUB_CELL: (f64, f64) = (0.25, -0.25);
+
+    /// The four scores around each head's peak (GitHub #264): the argmax's
+    /// left, right, up and down neighbours in the image grid, `None` where
+    /// the peak sits on the grid's border and there is no cell beyond it.
+    ///
+    /// One nat below the peak on one side and three on the other, which the
+    /// parabola reads as [`MockCompute::ATTENTION_SUB_CELL`].
+    pub fn attention_set_neighbours(argmax: &[u32], count: u32, cols: u32) -> Vec<Option<f32>> {
+        let (near, far) = (
+            Self::ATTENTION_PEAK_SCORE - 1.0,
+            Self::ATTENTION_PEAK_SCORE - 3.0,
+        );
+        let cols = cols.max(1);
+        let rows = count.div_ceil(cols);
+        argmax
+            .iter()
+            .flat_map(|&key| {
+                let (col, row) = (key % cols, key / cols);
+                [
+                    (col > 0).then_some(far),         // left
+                    (col + 1 < cols).then_some(near), // right
+                    (row > 0).then_some(near),        // up
+                    (row + 1 < rows).then_some(far),  // down
+                ]
+            })
+            .collect()
+    }
+
     /// Force `request` to stop after `n` generated tokens, regardless of
     /// its learned `max_tokens` (for driving streams of requests submitted
     /// without a token cap).
@@ -694,10 +727,16 @@ impl MockCompute {
     /// The deterministic attention readout (GitHub #260): one score per key,
     /// the peak at [`MockCompute::attention_peak`] — and, for a query naming
     /// a head set (GitHub #263), one key per head at
-    /// [`MockCompute::attention_set_argmax`].
+    /// [`MockCompute::attention_set_argmax`], each with the four scores
+    /// around it (GitHub #264, [`MockCompute::attention_set_neighbours`]).
     fn attention(query: &crate::pointing::AttentionQuery) -> crate::pointing::AttentionScores {
         let count = query.key_count;
         let peak = Self::attention_peak(count);
+        let set = query.set.as_ref().map(|set| {
+            let argmax = Self::attention_set_argmax(count, set.heads.len(), &set.excluded);
+            let neighbours = Self::attention_set_neighbours(&argmax, count, set.grid_cols);
+            (argmax, neighbours)
+        });
         crate::pointing::AttentionScores {
             scores: (0..count as usize)
                 .map(|key| match key == peak {
@@ -705,10 +744,11 @@ impl MockCompute {
                     false => Self::ATTENTION_BACKGROUND_SCORE,
                 })
                 .collect(),
-            set_argmax: query
-                .set
+            set_argmax: set.as_ref().map(|(argmax, _)| argmax.clone().into()),
+            set_peak: set
                 .as_ref()
-                .map(|set| Self::attention_set_argmax(count, set.heads.len(), &set.excluded).into()),
+                .map(|(argmax, _)| vec![Self::ATTENTION_PEAK_SCORE; argmax.len()].into()),
+            set_neighbours: set.map(|(_, neighbours)| neighbours.into()),
         }
     }
 

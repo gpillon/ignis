@@ -765,6 +765,11 @@ struct ArmedAttentionReadout {
   uint32_t excluded_count = 0;
   const int32_t *excluded = nullptr;
   int32_t *host_set_argmax = nullptr; // [set_count]
+  // GitHub #264 (ADR 0040): each head's score at its own argmax, and the four
+  // around it -- the image grid's columns say which of those exist.
+  uint32_t grid_cols = 0;
+  float *host_set_peak = nullptr;       // [set_count]
+  float *host_set_neighbours = nullptr; // [4 * set_count]
 };
 
 bool validate_span_multimodal(const ignis_model *model, int32_t route, const SpanMultimodal &span) {
@@ -974,6 +979,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     bool readout_read = false;
     ninfer::Tensor readout_scores;
     ninfer::DeviceSpan readout_set_best{};
+    ninfer::DeviceSpan readout_set_neighbours{};
     if (attention_readout != nullptr) {
       readout_scores = model->scratch->alloc(
           ninfer::DType::FP32, {static_cast<std::int32_t>(attention_readout->key_count), 1, 1, 1});
@@ -983,6 +989,20 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         err = cudaMemsetAsync(readout_set_best.data, 0, readout_set_best.bytes, model->stream);
         if (err != cudaSuccess) {
           set_error(std::string("ignis_program_prefill: cudaMemsetAsync(head set) failed: ") +
+                    cudaGetErrorString(err));
+          return -1;
+        }
+        // GitHub #264: four scores a head, written by each armed layer's
+        // gather. All-ones bytes are a quiet NaN, which is what "off the
+        // grid" reads as, so a slot no gather reached never looks like a
+        // score.
+        readout_set_neighbours = model->scratch->alloc_bytes(
+            static_cast<std::size_t>(attention_readout->set_count) * 4 * sizeof(float));
+        err = cudaMemsetAsync(readout_set_neighbours.data, 0xff, readout_set_neighbours.bytes,
+                              model->stream);
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_prefill: cudaMemsetAsync(head set neighbours) "
+                                "failed: ") +
                     cudaGetErrorString(err));
           return -1;
         }
@@ -996,6 +1016,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
           target.key_begin = attention_readout->key_begin;
           target.key_count = attention_readout->key_count;
           target.device_set_best = static_cast<unsigned long long *>(readout_set_best.data);
+          target.device_set_neighbours = static_cast<float *>(readout_set_neighbours.data);
+          target.grid_cols = static_cast<std::int32_t>(attention_readout->grid_cols);
           target.excluded_count = static_cast<std::int32_t>(attention_readout->excluded_count);
           for (uint32_t e = 0; e < attention_readout->excluded_count; ++e) {
             target.excluded[e] = attention_readout->excluded[e];
@@ -1125,6 +1147,12 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         err = cudaMemcpyAsync(host_set_best.data(), readout_set_best.data,
                               host_set_best.size() * sizeof(unsigned long long),
                               cudaMemcpyDeviceToHost, model->stream);
+        if (err == cudaSuccess) {
+          // GitHub #264: the four scores around each argmax, beside it.
+          err = cudaMemcpyAsync(attention_readout->host_set_neighbours,
+                                readout_set_neighbours.data, readout_set_neighbours.bytes,
+                                cudaMemcpyDeviceToHost, model->stream);
+        }
       }
       if (err != cudaSuccess) {
         set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(attention scores) failed: ") +
@@ -1170,6 +1198,11 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         readout_read = host_set_best[i] != 0;
         attention_readout->host_set_argmax[i] =
             static_cast<int32_t>(static_cast<std::uint32_t>(host_set_best[i] & 0xffffffffu));
+        // GitHub #264: the peak's own score is the packed value's high half,
+        // order-preserved on the way in and undone here -- it costs the leaf
+        // nothing to report.
+        attention_readout->host_set_peak[i] =
+            ignis_attention_unpack_score(static_cast<std::uint32_t>(host_set_best[i] >> 32));
       }
       *attention_readout->host_read = readout_read ? 1 : 0;
     }
@@ -1409,6 +1442,14 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
       set_ok = options->attention_set_gqa_ordinals != nullptr &&
                options->attention_set_query_heads != nullptr &&
                options->out_attention_set_argmax != nullptr &&
+               // GitHub #264: the peak and its neighbours ride with the set,
+               // and the image grid says which neighbours exist. A set
+               // without them would answer with no way to read inside a cell.
+               options->out_attention_set_peak != nullptr &&
+               options->out_attention_set_neighbours != nullptr &&
+               options->attention_grid_cols > 0 &&
+               static_cast<std::int64_t>(options->attention_grid_cols) <=
+                   options->attention_key_count &&
                (options->attention_excluded_count == 0 || options->attention_excluded != nullptr);
       std::vector<bool> seen(static_cast<std::size_t>(kReadoutGqaLayers) * kIgnisGqaQHeads, false);
       for (uint32_t i = 0; set_ok && i < options->attention_set_count; ++i) {
@@ -1439,9 +1480,11 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                 " cannot be armed on this load (the chunked route, GQA layers and query heads "
                 "the model has, each head once and at most " +
                 std::to_string(kReadoutMaxSetHeads) + " of them, at most " +
-                std::to_string(kReadoutMaxExcluded) + " excluded keys inside the span, and at most " +
+                std::to_string(kReadoutMaxExcluded) + " excluded keys inside the span, at most " +
                 std::to_string(capacity) +
-                " keys -- the vision envelope the load reserved scores for)");
+                " keys -- the vision envelope the load reserved scores for -- and, with a set, "
+                "its peak and neighbour buffers and an image grid of 1.." +
+                std::to_string(options->attention_key_count) + " columns)");
       return -1;
     }
     attention_readout.gqa_ordinal = options->attention_gqa_ordinal;
@@ -1456,6 +1499,9 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     attention_readout.excluded_count = options->attention_excluded_count;
     attention_readout.excluded = options->attention_excluded;
     attention_readout.host_set_argmax = options->out_attention_set_argmax;
+    attention_readout.grid_cols = options->attention_grid_cols;
+    attention_readout.host_set_peak = options->out_attention_set_peak;
+    attention_readout.host_set_neighbours = options->out_attention_set_neighbours;
     *attention_readout.host_read = 0;
   }
 

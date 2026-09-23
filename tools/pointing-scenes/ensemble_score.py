@@ -25,14 +25,22 @@ from pathlib import Path
 
 import numpy as np
 
-# spec 14's constants
+# spec 14's constants: choosing the set
 SELECT_MIN_LAYER = 31        # the query binds to the asked object from here on
 SELECT_MIN_SELECTIVITY = 0.8  # mass on the asked box / (asked + distractors)
 SELECT_MIN_MASS = 0.3         # mass on all the boxes together
 FALLBACK_SHARE = 0.05         # a cell >= 5% of all heads' peaks on blank priors
-KEEP_RADIUS = 2.0             # keep head cells within 2x the median distance to the anchor
-EXTENT_QUANTILE = 0.1         # the extent is the 10%-90% quantile span of the kept cells
 REGION_THRESHOLD = 0.5        # TAG's region rule, as crates/core/src/pointing.rs
+
+# spec 15's constants: reading it. Spec 14 kept 2.0 and 0.1 and grew a flat half
+# cell -- the one cell of its acceptance the head box lost.
+KEEP_RADIUS = 3.0            # keep head positions within 3x the median distance to the anchor
+EXTENT_QUANTILE = 0.15       # the extent spans the 15%-85% quantiles of the kept positions
+ALLOWANCE_FLAT = 0.05        # grown by (FLAT + PER_N / distinct cells) cells per side --
+ALLOWANCE_PER_N = 4.5        #   what one part leaves unobserved
+ALLOWANCE_MIN_CELLS = 3      # the fewest distinct cells any of the 783 scenes reached: the
+                             #   rule is bounded to the range it was chosen on, not trusted
+                             #   outside it (a no-op on every measured scene)
 
 
 def load(dump_json):
@@ -81,27 +89,65 @@ def tag(scores, rows, cols):
     return float((((region % cols) + 0.5) * w).sum() / w.sum()), float((((region // cols) + 0.5) * w).sum() / w.sum())
 
 
-def read_anchored(anchor_scores, head_argmax, rows, cols, width, height):
-    """Spec 14's reading rule.
+def sub_cell_offset(before, peak, after):
+    """Spec 15: where the peak sits inside its cell on one axis, in cells.
 
-    anchor_scores: the anchor head's scores over the image span (row-major grid).
-    head_argmax:   one image-cell index per head of the set -- each head's argmax
-                   over the span with the fallback cells excluded.
+    Parabolic interpolation over the peak's score and its two in-line neighbours
+    -- the standard sub-sample peak estimator. Zero when either neighbour is off
+    the grid (None) or the triple is not a strict peak: there is no sub-cell
+    position to read, and extrapolating one would move the box off the object.
+    """
+    if before is None or after is None:
+        return 0.0
+    a, b, c = float(before), float(peak), float(after)
+    curvature = a - 2 * b + c
+    if not curvature < 0.0:
+        return 0.0
+    return float(np.clip(0.5 * (a - c) / curvature, -0.5, 0.5))
+
+
+def neighbours(scores, cell, rows, cols):
+    """The four scores around `cell` in the row-major image grid: left, right,
+    up, down -- None where the cell sits on the grid's border. The fallback
+    cells are ordinary neighbours; a head may not peak on one, but the score
+    there is still the attention's."""
+    col, row = cell % cols, cell // cols
+    return [
+        float(scores[cell - 1]) if col > 0 else None,
+        float(scores[cell + 1]) if col + 1 < cols else None,
+        float(scores[cell - cols]) if row > 0 else None,
+        float(scores[cell + cols]) if row + 1 < rows else None,
+    ]
+
+
+def read_anchored(anchor_scores, head_argmax, head_peak, head_neighbours, rows, cols, width, height):
+    """Spec 15's reading rule (spec 14's, reading inside the cell).
+
+    anchor_scores:   the anchor head's scores over the image span (row-major grid).
+    head_argmax:     one image-cell index per head of the set -- each head's argmax
+                     over the span with the fallback cells excluded.
+    head_peak:       that head's score at its argmax.
+    head_neighbours: four scores per head (left, right, up, down; None off the grid).
     Returns (anchor point, point, extent) in pixels of the submitted image.
     """
     cw, ch = width / cols, height / rows
     ax, ay = tag(anchor_scores, rows, cols)
     anchor = np.array([ax * cw, ay * ch])
     idx = np.asarray(head_argmax)
-    cells = np.stack([(idx % cols + 0.5) * cw, (idx // cols + 0.5) * ch], 1)
+    dx = np.array([sub_cell_offset(n[0], p, n[1]) for p, n in zip(head_peak, head_neighbours)])
+    dy = np.array([sub_cell_offset(n[2], p, n[3]) for p, n in zip(head_peak, head_neighbours)])
+    cells = np.stack([(idx % cols + 0.5 + dx) * cw, (idx // cols + 0.5 + dy) * ch], 1)
     d = np.hypot(*(cells - anchor).T)
     scale = max(float(np.median(d)), max(cw, ch))
-    kept = cells[d <= KEEP_RADIUS * scale]
+    keep = d <= KEEP_RADIUS * scale
+    kept = cells[keep]
+    n = max(len(set(idx[keep].tolist())), ALLOWANCE_MIN_CELLS)
+    g = ALLOWANCE_FLAT + ALLOWANCE_PER_N / n
     q = EXTENT_QUANTILE
-    x0 = np.quantile(kept[:, 0], q) - cw / 2
-    y0 = np.quantile(kept[:, 1], q) - ch / 2
-    x1 = np.quantile(kept[:, 0], 1 - q) + cw / 2
-    y1 = np.quantile(kept[:, 1], 1 - q) + ch / 2
+    x0 = np.quantile(kept[:, 0], q) - g * cw
+    y0 = np.quantile(kept[:, 1], q) - g * ch
+    x1 = np.quantile(kept[:, 0], 1 - q) + g * cw
+    y1 = np.quantile(kept[:, 1], 1 - q) + g * ch
     extent = (max(0.0, x0), max(0.0, y0), min(float(width), x1), min(float(height), y1))
     point = ((extent[0] + extent[2]) / 2, (extent[1] + extent[3]) / 2)
     return tuple(anchor), point, extent
@@ -199,8 +245,12 @@ def score(args):
         sc = by_id[row["id"]]
         w, h = scene_size(sc, man["side"])
         cw, ch = w / cols, h / rows
-        argmax = [argmax_excluding(S[n, layers.index(l), q], excluded) for l, q in cfg["heads"]]
-        anchor, point, extent = read_anchored(S[n, layers.index(al), ah], argmax, rows, cols, w, h)
+        maps = [S[n, layers.index(l), q] for l, q in cfg["heads"]]
+        argmax = [argmax_excluding(m, excluded) for m in maps]
+        peak = [float(m[k]) for m, k in zip(maps, argmax)]
+        around = [neighbours(m, k, rows, cols) for m, k in zip(maps, argmax)]
+        anchor, point, extent = read_anchored(
+            S[n, layers.index(al), ah], argmax, peak, around, rows, cols, w, h)
         chain = (row["chain"][0] / 999 * w, row["chain"][1] / 999 * h)
         b = sc["blue_box"]
         inside = lambda p: b[0] <= p[0] <= b[2] and b[1] <= p[1] <= b[3]
@@ -239,11 +289,16 @@ def golden(args):
         w, h = scene_size(by_id[row["id"]], man["side"])
         al, ah = cfg["anchor"]
         anchor_scores = S[n, layers.index(al), ah]
-        argmax = [argmax_excluding(S[n, layers.index(l), q], excluded) for l, q in cfg["heads"]]
-        anchor, point, extent = read_anchored(anchor_scores, argmax, rows, cols, w, h)
+        maps = [S[n, layers.index(l), q] for l, q in cfg["heads"]]
+        argmax = [argmax_excluding(m, excluded) for m in maps]
+        peak = [float(m[k]) for m, k in zip(maps, argmax)]
+        around = [neighbours(m, k, rows, cols) for m, k in zip(maps, argmax)]
+        anchor, point, extent = read_anchored(
+            anchor_scores, argmax, peak, around, rows, cols, w, h)
         cases.append({"name": f"{meta['set']}/{row['id']}", "rows": rows, "cols": cols, "width": w, "height": h,
                       "excluded": sorted(excluded), "anchor_scores": [float(s) for s in anchor_scores],
-                      "set_argmax": argmax, "anchor": list(anchor), "point": list(point), "extent": list(extent)})
+                      "set_argmax": argmax, "set_peak": peak, "set_neighbours": around,
+                      "anchor": list(anchor), "point": list(point), "extent": list(extent)})
     Path(args.out).write_text(json.dumps({"source": "tools/pointing-scenes/ensemble_score.py golden",
                                           "heads": Path(args.heads).name, "cases": cases}))
     print(f"{len(cases)} golden cases -> {args.out}")

@@ -132,9 +132,10 @@ fn a_head_point_is_answered_at_the_end_of_prefill_and_never_decoded() {
     );
 }
 
-/// Spec 14: a head point naming a head set carries the set — heads and
-/// excluded keys — on its reading chunk, and finishes with one key index per
-/// head beside the pointing head's scores, in the set's order.
+/// Spec 14: a head point naming a head set carries the set — heads, excluded
+/// keys and the grid's columns (spec 15) — on its reading chunk, and
+/// finishes with one key index per head beside the pointing head's scores,
+/// in the set's order, each with the four scores around it.
 #[test]
 fn a_head_set_rides_the_reading_chunk_and_comes_back_one_key_per_head() {
     let compute = Arc::new(MockCompute::new());
@@ -142,6 +143,7 @@ fn a_head_set_rides_the_reading_chunk_and_comes_back_one_key_per_head() {
     let set = SetQuery {
         heads: Arc::from(vec![HEAD, PointingHead { gqa_ordinal: 7, query_head: 1 }, PointingHead { gqa_ordinal: 15, query_head: 18 }]),
         excluded: Arc::from(vec![0, 6, 15]),
+        grid_cols: 4,
     };
     let mut input = head_point(tokens(1, 40), 4, 16);
     input.decision = Some(DecisionRead::Attention(AttentionQuery {
@@ -164,6 +166,19 @@ fn a_head_set_rides_the_reading_chunk_and_comes_back_one_key_per_head() {
     // The mock's peak is key 5 and the set reads 5, 6 and 7 — 6 is excluded,
     // so the second head moves on to 7.
     assert_eq!(&*argmax, &[5, 7, 7]);
+    // Spec 15: the four scores around each peak, and the grid says which of
+    // them exist. On a 4x4 grid key 7 is the last column, so it has no
+    // neighbour to its right.
+    let peak = attention.set_peak.expect("a peak score per head");
+    let around = attention.set_neighbours.expect("four neighbours per head");
+    assert_eq!(peak.len(), 3);
+    assert_eq!(around.len(), 12);
+    assert_eq!(
+        &*around,
+        MockCompute::attention_set_neighbours(&argmax, 16, 4).as_slice(),
+    );
+    assert!(around[4 * 1 + 1].is_none(), "key 7 is in the last column: no right neighbour");
+    assert!(around[4 * 0 + 1].is_some(), "key 5 is not");
 }
 
 #[test]

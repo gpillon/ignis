@@ -621,11 +621,13 @@ When output names a domain concept, use the term as defined here.
 - **Attention readout** — reading attention heads' pre-softmax scores
   (`q · k / sqrt(head_dim)`) at a prefill's last position over one span of
   its keys — an image's placeholders — instead of the logits of answer
-  tokens (GitHub #260 and #263, ADR 0038 and ADR 0039). The third thing the
-  `Compute` seam carries, beside the **readout** and the **permitted set**:
-  the job names the span, the **pointing head** and optionally a **head
-  set**, and what comes back is one score per key for the pointing head and
-  one key index per head of the set — never a full attention row. The keys
+  tokens (GitHub #260, #263 and #264; ADR 0038, ADR 0039 and ADR 0040). The
+  third thing the `Compute` seam carries, beside the **readout** and the
+  **permitted set**: the job names the span, the image grid's columns, the
+  **pointing head** and optionally a **head set**, and what comes back is one
+  score per key for the pointing head and, per head of the set, its key index
+  with its own score there and the four around it (the **sub-cell peak**'s
+  evidence) — never a full attention row. The keys
   are the ones each armed layer's attention read, as it read them — the hq
   prompt route's codec-decoded and window-exact rows, or the BF16 pages — so
   a leaf that cannot read them on any armed layer fails the question rather
@@ -661,10 +663,25 @@ When output names a domain concept, use the term as defined here.
   there (on 32x32 also (0,1) and (6,31)). The **head set**'s argmax skips
   them; the **pointing head**'s map keeps them, and a map flat enough to fall
   back to one (`region.share` about 0.03) is nothing found.
-- **Extent** — the box the kept cells of a **head set** span: the cells within
-  twice the median distance of the **pointing head**'s point, their 10%-90%
-  quantiles on each axis grown half a cell, clamped to the image. A head
-  `point` is its centre and carries it as `extent`; a head `box` is it.
+- **Sub-cell peak** — where a **head set**'s head looks hardest *inside* its
+  image cell, not just which cell (GitHub #264, ADR 0040): parabolic
+  interpolation over its score at its peak and the two in-line neighbours on
+  each axis, in cells, zero when a neighbour is off the grid or the triple is
+  not a strict peak. It is what lets a box frame an object smaller than the
+  cell grid can express — a 1024 px button is 1.44 cells tall, and a box on
+  cell geometry cannot clear the digit chain at that size.
+- **Allowance** — what the **extent** grows the kept heads' span by on each
+  side: `0.05 + 4.5 / n` cells, `n` the distinct cells they peak on (never
+  under three, the fewest measured). The span is a *lower bound* on the
+  object — it reaches only the parts the heads hit — and what one part leaves
+  unobserved falls as more parts are seen: on synthetic scenes the set tiles
+  the object (17-56 distinct cells), on a photograph it piles onto one
+  distinctive part (6-13).
+- **Extent** — the box the kept heads of a **head set** span: the heads
+  within three times the median distance of the **pointing head**'s point, at
+  their **sub-cell peaks**, their 15%-85% quantiles on each axis grown by the
+  **allowance**, clamped to the image. A head `point` is its centre and
+  carries it as `extent`; a head `box` is it.
 
 ## Observability
 

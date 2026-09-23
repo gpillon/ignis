@@ -234,6 +234,25 @@ struct ignis_prefill_options {
   uint32_t attention_excluded_count;
   const int32_t *attention_excluded;
   int32_t *out_attention_set_argmax;
+  /* GitHub #264 (ADR 0040): with the set, head `i`'s score at its own argmax
+   * lands in `out_attention_set_peak[i]`, and the four scores around it in
+   * `out_attention_set_neighbours[4 * i + 0..4]` -- the argmax's left, right,
+   * up and down neighbours in the image grid, in that order, enough for the
+   * host to read the peak's position *inside* its image cell.
+   *
+   * `attention_grid_cols` is that grid's columns: the span is walked
+   * row-major, so the left neighbour of a key in column 0 does not exist and
+   * is never the previous row's last key. A neighbour off the grid is written
+   * as **NaN**, not as a sentinel score. The excluded keys are ordinary
+   * neighbours: a head may not peak on one, but the score there is still the
+   * attention's.
+   *
+   * Both are host arrays of `attention_set_count` and `4 *
+   * attention_set_count` floats. Needs the set; NULL with a set is refused,
+   * as is a zero `attention_grid_cols`. Appended fields only (ADR 0016). */
+  uint32_t attention_grid_cols;
+  float *out_attention_set_peak;
+  float *out_attention_set_neighbours;
 };
 
 /* The media encode step (GitHub #178): one media item's BF16 patch rows plus

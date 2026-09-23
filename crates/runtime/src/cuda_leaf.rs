@@ -424,11 +424,13 @@ impl StepLeaf for CudaLeaf {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
         let (readout, read) = match attention {
-            Some(AttentionRead { query, scores, set_argmax, read }) => (
+            Some(AttentionRead { query, scores, set_argmax, set_peak, set_neighbours, read }) => (
                 Some(step::AttentionReadout {
                     query,
                     scores: scores.as_mut_slice(),
                     set_argmax: set_argmax.as_mut_slice(),
+                    set_peak: set_peak.as_mut_slice(),
+                    set_neighbours: set_neighbours.as_mut_slice(),
                 }),
                 Some(read),
             ),

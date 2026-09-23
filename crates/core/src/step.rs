@@ -136,6 +136,13 @@ pub(crate) mod ffi {
         pub attention_excluded_count: u32,
         pub attention_excluded: *const i32,
         pub out_attention_set_argmax: *mut i32,
+        /// GitHub #264 (ADR 0040): with the set, head `i`'s own score at its
+        /// argmax, and the four scores around it — the argmax's left, right,
+        /// up and down neighbours in an image grid of `attention_grid_cols`
+        /// columns, `NaN` for one off the grid.
+        pub attention_grid_cols: u32,
+        pub out_attention_set_peak: *mut f32,
+        pub out_attention_set_neighbours: *mut f32,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -588,6 +595,9 @@ impl PrefillRoute {
             attention_excluded_count: 0,
             attention_excluded: std::ptr::null(),
             out_attention_set_argmax: std::ptr::null_mut(),
+            attention_grid_cols: 0,
+            out_attention_set_peak: std::ptr::null_mut(),
+            out_attention_set_neighbours: std::ptr::null_mut(),
         }
     }
 }
@@ -1253,6 +1263,11 @@ pub struct AttentionReadout<'a> {
     pub scores: &'a mut [f32],
     /// `query.set`'s heads' argmax key indices; empty when it names no set.
     pub set_argmax: &'a mut [u32],
+    /// Each head's score at its own argmax (GitHub #264); empty with no set.
+    pub set_peak: &'a mut [f32],
+    /// Four scores a head: the argmax's left, right, up and down neighbours
+    /// in the image grid, `NaN` for one off it (GitHub #264).
+    pub set_neighbours: &'a mut [f32],
 }
 
 /// A media item's columns placed over a span's placeholder rows.
@@ -1352,6 +1367,13 @@ pub fn prefill_program_multimodal(
                 readout.set_argmax.len()
             ));
         }
+        if readout.set_peak.len() != named || readout.set_neighbours.len() != 4 * named {
+            return Err(format!(
+                "prefill_program_multimodal: {} peak and {} neighbour slots for a head set of                  {named} heads",
+                readout.set_peak.len(),
+                readout.set_neighbours.len()
+            ));
+        }
         if let Some(set) = &readout.query.set {
             options.attention_set_count = set.heads.len() as u32;
             options.attention_set_gqa_ordinals = set_ordinals.as_ptr();
@@ -1359,6 +1381,9 @@ pub fn prefill_program_multimodal(
             options.attention_excluded_count = excluded.len() as u32;
             options.attention_excluded = if excluded.is_empty() { std::ptr::null() } else { excluded.as_ptr() };
             options.out_attention_set_argmax = set_out.as_mut_ptr();
+            options.attention_grid_cols = set.grid_cols;
+            options.out_attention_set_peak = readout.set_peak.as_mut_ptr();
+            options.out_attention_set_neighbours = readout.set_neighbours.as_mut_ptr();
         }
         attention_set = Some(readout.set_argmax);
     }

@@ -266,27 +266,48 @@ pub struct AttentionRead {
     /// One argmax key index per head of the query's set, in the set's
     /// order; empty when it names none.
     pub set_argmax: Vec<u32>,
-    /// Whether the leaf wrote `scores` and `set_argmax` from the keys every
-    /// armed layer's attention read.
+    /// Each head's score at its argmax, in the same order (GitHub #264).
+    pub set_peak: Vec<f32>,
+    /// Four scores per head, in the same order: the argmax's left, right, up
+    /// and down neighbours in the image grid (GitHub #264). The leaf writes
+    /// **NaN** for a neighbour off the grid, which [`AttentionRead::into_scores`]
+    /// turns into the `None` the host rule reads.
+    pub set_neighbours: Vec<f32>,
+    /// Whether the leaf wrote `scores`, `set_argmax` and the neighbours from
+    /// the keys every armed layer's attention read.
     pub read: bool,
 }
 
 impl AttentionRead {
-    /// An unread readout for `query`, its scores and argmax zeroed.
+    /// An unread readout for `query`, its scores, argmax and neighbours
+    /// zeroed.
     pub fn new(query: &ignis_core::pointing::AttentionQuery) -> Self {
+        let heads = query.set.as_ref().map_or(0, |set| set.heads.len());
         Self {
             scores: vec![0.0; query.key_count as usize],
-            set_argmax: vec![0; query.set.as_ref().map_or(0, |set| set.heads.len())],
+            set_argmax: vec![0; heads],
+            set_peak: vec![0.0; heads],
+            set_neighbours: vec![0.0; 4 * heads],
             query: query.clone(),
             read: false,
         }
     }
 
     /// What crosses the `Compute` seam once the leaf has read: the scores,
-    /// and the set's argmax when the query named a set.
+    /// and the set's argmax, peaks and neighbours when the query named a
+    /// set. A NaN neighbour is one off the grid — a peak on the image's
+    /// border has no score beyond it.
     pub fn into_scores(self) -> ignis_core::pointing::AttentionScores {
+        let named = self.query.set.is_some();
         ignis_core::pointing::AttentionScores {
-            set_argmax: self.query.set.is_some().then(|| self.set_argmax.into()),
+            set_argmax: named.then(|| self.set_argmax.into()),
+            set_peak: named.then(|| self.set_peak.into()),
+            set_neighbours: named.then(|| {
+                self.set_neighbours
+                    .into_iter()
+                    .map(|score| score.is_finite().then_some(score))
+                    .collect()
+            }),
             scores: self.scores.into(),
         }
     }

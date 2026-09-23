@@ -90,6 +90,107 @@ __device__ __forceinline__ unsigned long long pack_score(float score, std::uint3
   return (static_cast<unsigned long long>(u) << 32) | key;
 }
 
+// GitHub #264 (ADR 0040): one gather launch's arguments. The fused kernel
+// above has already reduced this layer's heads to their argmax; this reads the
+// four keys around each of them so the host can place the peak inside its
+// image cell.
+struct NeighbourGatherArgs {
+  const __nv_bfloat16 *query;
+  const __nv_bfloat16 *plane;
+  std::int64_t span;
+  const __nv_bfloat16 *k_pages;
+  const std::int32_t *block_table;
+  std::int64_t key_begin;
+  std::int64_t key_count;
+  std::int32_t grid_cols;
+  float scale;
+  std::int32_t group;
+  std::int32_t heads; // of the set, on this layer
+  std::int32_t query_head[kReadoutLayerHeads];
+  std::int32_t slot[kReadoutLayerHeads];
+  const unsigned long long *best; // the fused launch's packed (score, key)
+  float *neighbours;              // [4 * whole set], NaN off the grid
+};
+
+// One block per (head of this layer, neighbour): the block rotates its query
+// head into shared memory exactly as the fused kernel does, scores the one key
+// its neighbour sits on, and writes it. At most 24 heads x 4 -- 384 dot
+// products against rows the layer's plane still holds.
+template <bool kHq>
+__global__ void neighbour_gather_kernel(const NeighbourGatherArgs args) {
+  __shared__ float q[kHeadDim];
+  const int head = static_cast<int>(blockIdx.x);
+  const int which = static_cast<int>(blockIdx.y);
+  const int t = static_cast<int>(threadIdx.x);
+  const int slot = args.slot[head];
+  const std::uint32_t peak =
+      static_cast<std::uint32_t>(args.best[slot] & 0xffffffffu);
+  // The span is the image's grid, row-major: a neighbour off it has no score.
+  const std::int32_t cols = args.grid_cols;
+  const std::int64_t col = static_cast<std::int64_t>(peak) % cols;
+  const std::int64_t row = static_cast<std::int64_t>(peak) / cols;
+  const std::int64_t rows = (args.key_count + cols - 1) / cols;
+  std::int64_t key = -1;
+  switch (which) {
+    case 0: key = col > 0 ? static_cast<std::int64_t>(peak) - 1 : -1; break;
+    case 1: key = col + 1 < cols ? static_cast<std::int64_t>(peak) + 1 : -1; break;
+    case 2: key = row > 0 ? static_cast<std::int64_t>(peak) - cols : -1; break;
+    default: key = row + 1 < rows ? static_cast<std::int64_t>(peak) + cols : -1; break;
+  }
+  // The last grid row may be short: a key past the span is off the grid too.
+  if (key >= args.key_count) {
+    key = -1;
+  }
+  if (key < 0) {
+    if (t == 0) {
+      args.neighbours[4 * slot + which] = __builtin_nanf("");
+    }
+    return;
+  }
+  const int query_head = args.query_head[head];
+  const int kv_head = query_head / args.group;
+  float value = __bfloat162float(args.query[static_cast<std::int64_t>(query_head) * kHeadDim + t]);
+  if (kHq) {
+    // The codec's rotation, exactly as the fused kernel applies it.
+    q[t] = value * ninfer::ops::hq_engine_sign(t);
+    __syncthreads();
+    for (int len = 1; len < kHeadDim; len <<= 1) {
+      const float a = q[t];
+      const float b = q[t ^ len];
+      __syncthreads();
+      q[t] = (t & len) ? (b - a) : (a + b);
+      __syncthreads();
+    }
+    value = q[t] * (1.0F / 16.0F);
+    __syncthreads();
+  }
+  q[t] = value;
+  __syncthreads();
+  const std::int64_t position = args.key_begin + key;
+  const __nv_bfloat16 *krow =
+      kHq ? args.plane + (static_cast<std::int64_t>(kv_head) * args.span + position) * kHeadDim
+          : args.k_pages + ninfer::ops::paged_kv_element_offset<kHeadDim, kKvHeads>(
+                               args.block_table, kv_head, static_cast<std::int32_t>(position), 0);
+  float acc = q[t] * __bfloat162float(krow[t]);
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, offset);
+  }
+  __shared__ float warp_sum[kWarpsPerBlock];
+  const int warp = t / 32;
+  if (t % 32 == 0) {
+    warp_sum[warp] = acc;
+  }
+  __syncthreads();
+  if (t == 0) {
+    float total = 0.0F;
+    for (int w = 0; w < kWarpsPerBlock; ++w) {
+      total += warp_sum[w];
+    }
+    args.neighbours[4 * slot + which] = total * args.scale;
+  }
+}
+
 // One fused launch's arguments, by value: the heads armed on this layer and
 // the keys their argmax skips live in the launch, not in device memory.
 struct SetReadoutArgs {
@@ -249,7 +350,8 @@ int32_t ignis_attention_readout_run(const AttentionReadoutTarget &target,
                   target.excluded_count >= 0 && target.excluded_count <= kReadoutMaxExcluded &&
                   (writes_row || target.set_heads > 0) &&
                   (target.set_heads == 0 ||
-                   (q_heads / kv_heads <= kGroup && target.device_set_best != nullptr));
+                   (q_heads / kv_heads <= kGroup && target.device_set_best != nullptr &&
+                    target.device_set_neighbours != nullptr && target.grid_cols > 0));
   for (int32_t i = 0; geometry && i < target.set_heads; ++i) {
     geometry = target.set_query_head[i] >= 0 && target.set_query_head[i] < q_heads &&
                target.set_slot[i] >= 0;
@@ -329,6 +431,33 @@ int32_t ignis_attention_readout_run(const AttentionReadoutTarget &target,
       attention_set_readout_kernel<true><<<grid, kThreads, 0, stream>>>(args);
     } else {
       attention_set_readout_kernel<false><<<grid, kThreads, 0, stream>>>(args);
+    }
+    // GitHub #264: the four keys around each of this layer's argmaxes, in a
+    // second launch on the same stream -- the fused one above has to have
+    // finished reducing them before they can be read.
+    NeighbourGatherArgs gather{};
+    gather.query = args.query;
+    gather.plane = args.plane;
+    gather.span = args.span;
+    gather.k_pages = args.k_pages;
+    gather.block_table = args.block_table;
+    gather.key_begin = args.key_begin;
+    gather.key_count = args.key_count;
+    gather.grid_cols = target.grid_cols;
+    gather.scale = args.scale;
+    gather.group = args.group;
+    gather.heads = target.set_heads;
+    for (int32_t i = 0; i < target.set_heads; ++i) {
+      gather.query_head[i] = target.set_query_head[i];
+      gather.slot[i] = target.set_slot[i];
+    }
+    gather.best = target.device_set_best;
+    gather.neighbours = target.device_set_neighbours;
+    const dim3 gather_grid(static_cast<unsigned>(target.set_heads), 4);
+    if (hq) {
+      neighbour_gather_kernel<true><<<gather_grid, kThreads, 0, stream>>>(gather);
+    } else {
+      neighbour_gather_kernel<false><<<gather_grid, kThreads, 0, stream>>>(gather);
     }
   }
   const cudaError_t launched = cudaGetLastError();
