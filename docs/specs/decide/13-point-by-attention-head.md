@@ -337,8 +337,9 @@ formats, the host rule and the endpoint are one design and are not split.
 - **The Playground's Decide tab** showing `method` and the region (shipped
   after this spec closed, beside #256's fix: the question offers the two
   methods with the load's own as its default, and a head answer names the
-  method that ran, draws its extent as the token cell it is and reads its
-  region's share of the attention).
+  method that ran, draws the cell it resolves to as the rectangle it is and
+  reads its region's share of the attention — specs 14 and 15 carry what the
+  tab grew for the head set on top of that).
 - **A `method` label on the decision metrics** (ADR 0017).
 - **Several heads read together (X4)**: the mean of L39.h10, L43.h9,
   L35.h6 and L35.h16's maps is better than L39.h10 alone on every 1024 px
