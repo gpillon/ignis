@@ -492,7 +492,9 @@ describe("Answers", () => {
     // And as text beside the table: every figure in a panel is on the page as
     // a number, or the box the point came out of has to be measured off a
     // drawing.
-    expect(html).toContain("x0 80  y0 40  x1 170  y1 96");
+    for (const [corner, value] of [["x0", 80], ["y0", 40], ["x1", 170], ["y1", 96]] as const) {
+      expect(html).toContain(`>${corner}</span> ${value}<`);
+    }
     // The single head's caveat belongs to the answer that has no set, and
     // this one does not.
     expect(html).not.toContain("where the label begins");

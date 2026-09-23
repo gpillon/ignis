@@ -421,8 +421,14 @@ function Extent({ extent }: { extent: Record<string, number> }) {
       >
         extent
       </span>
-      <span className="min-w-0 font-display text-[13px] tabular-nums text-ink">
-        {CORNERS.map((corner) => `${corner} ${extent[corner] ?? "—"}`).join("  ")}
+      {/* One span per corner, not one string: HTML collapses the run of
+          spaces that separated them, so the four figures ran together. */}
+      <span className="flex min-w-0 flex-wrap gap-x-3 font-display text-[13px] tabular-nums text-ink">
+        {CORNERS.map((corner) => (
+          <span key={corner}>
+            <span className="text-ash">{corner}</span> {extent[corner] ?? "—"}
+          </span>
+        ))}
       </span>
     </div>
   );

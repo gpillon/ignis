@@ -303,11 +303,11 @@ Closed against these, in one piece of work.
 
 - **Re-selecting the head set.** The 96 heads and the fallback cells are spec
   14's, chosen on the same dumps; only the reading changes.
-- ~~**The Playground's Decide tab** drawing the extent.~~ Shipped with spec
-  14's entry, once `decide-ui-260-256` merged into this branch. The tab says
-  which of the two resolutions an answer carries — half an image token
-  wherever a head set answered, one whole token off the pointing head alone —
-  so the sub-cell reading is legible there and not only in this spec.
+- **The Playground's Decide tab** drawing the extent (shipped with spec 14's
+  entry, once `decide-ui-260-256` merged into this branch: the tab says which
+  of the two resolutions an answer carries — half an image token wherever a
+  head set answered, one whole token off the pointing head alone — so the
+  sub-cell reading is legible there and not only in this spec).
 - **Refusing on low `region.share`**, **multi-image states**, **a `method`
   label on the decision metrics** (ADR 0017): spec 14's reasons stand.
 - **A size feature beyond the distinct-cell count.** The per-head attention

@@ -416,14 +416,15 @@ design and are not split.
 
 ## Out of Scope
 
-- ~~**The Playground's Decide tab** drawing the extent and offering `method`
-  on `box`.~~ Shipped: `decide-ui-260-256` merged into this branch, and the
-  tab now offers both methods on both primitives — naming the two defaults
-  apart, because a `point`'s absent `method` follows the load and a `box`'s
-  follows `BOX_DEFAULT_METHOD` — draws a head point's extent as a dashed
-  outline with the crosshair at its centre and writes its corners beside the
-  table, and outlines a head box's per-edge band rather than fading it out,
-  since that figure is the reading's resolution and not a spread.
+- **The Playground's Decide tab** drawing the extent and offering `method` on
+  `box` (shipped after this spec closed, once `decide-ui-260-256` merged into
+  this branch: the tab offers both methods on both primitives and names the
+  two defaults apart, because a `point`'s absent `method` follows the load and
+  a `box`'s follows `BOX_DEFAULT_METHOD`; it draws a head point's extent as a
+  dashed outline with the crosshair at its centre and writes its corners
+  beside the table; and it outlines a head box's per-edge band rather than
+  fading it out, that figure being the reading's resolution and not a
+  spread).
 - **A learned combination of heads.** A ridge map over all 384 heads per cell
   has a real signal but, fitted on synthetic scenes, does not transfer to
   real screenshots (20 of 34 inside); it needs annotated real images first.
