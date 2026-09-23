@@ -469,7 +469,19 @@ describe("Answers", () => {
     // head answers to alone.
     const html = render(
       [question("p", "point")],
-      { p: { ...headPoint(), uncertainty: { x: 6.25, y: 12.5 }, extent: { x0: 80, y0: 40, x1: 170, y1: 96 } } },
+      {
+        p: {
+          type: "point",
+          method: "head",
+          pixels: { x: 120, y: 64 },
+          normalized: { x: 300, y: 320 },
+          // Half a token per axis: an anchored reading resolves its peak
+          // inside the cell, where the pointing head alone answers to one.
+          uncertainty: { x: 6.25, y: 12.5 },
+          region: { cells: 1, share: 0.29 },
+          extent: { x0: 80, y0: 40, x1: 170, y1: 96 },
+        },
+      },
       { mode: "image", images: [image], text: "" },
     );
     expect(html).toContain('x="80"');
@@ -477,6 +489,10 @@ describe("Answers", () => {
     expect(html).toContain('height="56"');
     expect(html).toContain("stroke-dasharray");
     expect(html).toContain("crosshair is its centre");
+    // And as text beside the table: every figure in a panel is on the page as
+    // a number, or the box the point came out of has to be measured off a
+    // drawing.
+    expect(html).toContain("x0 80  y0 40  x1 170  y1 96");
     // The single head's caveat belongs to the answer that has no set, and
     // this one does not.
     expect(html).not.toContain("where the label begins");

@@ -381,6 +381,7 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
             ))}
           </tbody>
         </table>
+        {extent && <Extent extent={extent} />}
         {answer.region && <Region region={answer.region} />}
         {digits && <details className="text-[12px] text-ash">
           <summary className="cursor-pointer font-display text-ink">Digit trace per axis</summary>
@@ -405,13 +406,41 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
 }
 
 /**
- * How concentrated the head's attention was (GitHub #260).
+ * The extent a head set read around a point (GitHub #263), as text.
+ *
+ * The outline on the picture says where it is and this says what it is: every
+ * figure in a panel has to be on the page as a number, or a reader who wants
+ * the box the point came out of has to measure it off a drawing.
+ */
+function Extent({ extent }: { extent: Record<string, number> }) {
+  return (
+    <div className="flex items-baseline gap-3">
+      <span
+        className="shrink-0 font-display text-[11px] text-ash"
+        title="The box the head set outlined around the object, in pixels of the submitted image. The point is its centre."
+      >
+        extent
+      </span>
+      <span className="min-w-0 font-display text-[13px] tabular-nums text-ink">
+        {CORNERS.map((corner) => `${corner} ${extent[corner] ?? "—"}`).join("  ")}
+      </span>
+    </div>
+  );
+}
+
+/** The corners an extent is written in, in the order the wire writes them. */
+const CORNERS = ["x0", "y0", "x1", "y1"] as const;
+
+/**
+ * How concentrated the heads' attention was (GitHub #260, #263).
  *
  * The share is the confidence to act on — a diffuse map is a weaker answer —
  * and it is not a calibrated probability, which is why it does not read as
  * one: the number is beside its bar and the cells it was taken over are
  * beside that, because a large share over many cells is not the same answer
- * as the same share over one.
+ * as the same share over one. It is the **pointing head's** on every answer,
+ * a box's included: the set's other heads outline what that head found, they
+ * do not vote on whether it found anything.
  */
 function Region({ region }: { region: { cells: number; share: number } }) {
   return (
@@ -423,7 +452,7 @@ function Region({ region }: { region: { cells: number; share: number } }) {
       <span className="font-display text-[13px] tabular-nums text-ink">{region.share.toFixed(3)}</span>
       <span
         className="min-w-0 truncate text-[12px] text-ash"
-        title="The share of the head's attention over the image that the cells the point was read from held. It separates hits from misses on the measured scenes; it is not a calibrated probability."
+        title="The share of the pointing head's attention over the image that the cells it read held. It separates hits from misses on the measured scenes; it is not a calibrated probability."
       >
         over {region.cells} cell{region.cells === 1 ? "" : "s"}
       </span>
