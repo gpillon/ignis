@@ -140,7 +140,9 @@ gather launch per armed layer.
   synchronization, reads the 96 argmax indices and scores the (at most) four
   neighbours of each: 384 dot products against rows the layer's plane still
   holds. It is launched only when the layer has a head of the set, and never
-  for a job with no readout or with the pointing head alone.
+  for a job with no readout or with the pointing head alone. Two launches a
+  layer instead of one is a real cost even when the work is not, which is why
+  acceptance 4 measures it rather than arguing it.
 
 - **The sub-cell offset is the host's** — the leaf ships scores, the host
   does the arithmetic, so the rule can change without a kernel change. Per
@@ -249,9 +251,14 @@ Closed against these, in one piece of work.
    sub-cell and table cases pass on CPU.
 3. **`/v1/decide` over the mock** answers as Testing Decisions lists, with
    every spec 14 refusal, method and fan-out behaviour unchanged.
-4. **Cost.** The gather adds at most **0.3 ms** of GPU time to the reading
-   chunk at 1024 px and at most **0.6 ms** at 4096 px, and nothing to a job
-   that asks for no readout or for the pointing head alone.
+4. **Cost.** There is no build with the fused launches and not the gather,
+   so what is measured is both together, against the pointing head alone: at
+   most **0.8 ms** of GPU time on the reading chunk at 1024 px and at most
+   **1.6 ms** at 4096 px — spec 14's bounds plus this spec's allowance for
+   the gather — with the gather's own cost reported as the difference from
+   spec 14's measurement on the same path (0.15 ms and 0.21 ms). A job that
+   asks for no readout, or for the pointing head alone, pays what it pays
+   today.
 5. **The pre-registered acceptance holds** — measured once, through
    `/v1/decide`, served artifact, hq-e8-2b with the residual window, sets
    never used before (fresh seeds reserved in
