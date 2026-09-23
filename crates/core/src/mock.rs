@@ -342,6 +342,25 @@ impl MockCompute {
         (count / 3) as usize
     }
 
+    /// Where the mock's head set peaks (GitHub #263): head `i` of the set on
+    /// the key `attention_peak(count) + i % 3` — the pointing head's peak
+    /// and the two keys after it — moved forward past any `excluded` key,
+    /// wrapping at the span's end. Public for the same reason as
+    /// [`MockCompute::attention_peak`]: a test says where the extent must
+    /// land without restating the mock.
+    pub fn attention_set_argmax(count: u32, heads: usize, excluded: &[u32]) -> Vec<u32> {
+        let peak = Self::attention_peak(count) as u32;
+        (0..heads as u32)
+            .map(|i| {
+                let mut key = (peak + i % 3) % count;
+                while excluded.contains(&key) {
+                    key = (key + 1) % count;
+                }
+                key
+            })
+            .collect()
+    }
+
     /// The pre-softmax score the mock gives the peak key, and every other
     /// key's: eight nats apart, so the map is as peaked as a real pointing
     /// head's (the region is one cell) without being a delta — its share is
@@ -421,8 +440,9 @@ impl Compute for MockCompute {
                 // score per key of the span, peaked at a documented key.
                 attention: job
                     .attention
+                    .as_ref()
                     .filter(|_| !g.attention_refusals.remove(&job.request))
-                    .map(|query| Self::attention(query.key_count)),
+                    .map(Self::attention),
             })
             .collect())
     }
@@ -672,15 +692,24 @@ impl MockCompute {
     }
 
     /// The deterministic attention readout (GitHub #260): one score per key,
-    /// the peak at [`MockCompute::attention_peak`].
-    fn attention(count: u32) -> std::sync::Arc<[f32]> {
+    /// the peak at [`MockCompute::attention_peak`] — and, for a query naming
+    /// a head set (GitHub #263), one key per head at
+    /// [`MockCompute::attention_set_argmax`].
+    fn attention(query: &crate::pointing::AttentionQuery) -> crate::pointing::AttentionScores {
+        let count = query.key_count;
         let peak = Self::attention_peak(count);
-        (0..count as usize)
-            .map(|key| match key == peak {
-                true => Self::ATTENTION_PEAK_SCORE,
-                false => Self::ATTENTION_BACKGROUND_SCORE,
-            })
-            .collect()
+        crate::pointing::AttentionScores {
+            scores: (0..count as usize)
+                .map(|key| match key == peak {
+                    true => Self::ATTENTION_PEAK_SCORE,
+                    false => Self::ATTENTION_BACKGROUND_SCORE,
+                })
+                .collect(),
+            set_argmax: query
+                .set
+                .as_ref()
+                .map(|set| Self::attention_set_argmax(count, set.heads.len(), &set.excluded).into()),
+        }
     }
 
     /// The mock's **constrained** draw (GitHub #242): a member of

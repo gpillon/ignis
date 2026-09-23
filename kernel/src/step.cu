@@ -38,6 +38,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <atomic>
@@ -756,6 +757,14 @@ struct ArmedAttentionReadout {
   int64_t key_count = 0;
   float *host_scores = nullptr; // [key_count]
   int32_t *host_read = nullptr; // 1 read, 0 not
+  // GitHub #263 (ADR 0039): the head set, parallel arrays of `set_count`
+  // heads, the keys their argmax skips, and where each head's key goes.
+  uint32_t set_count = 0;
+  const int32_t *set_gqa_ordinals = nullptr;
+  const int32_t *set_query_heads = nullptr;
+  uint32_t excluded_count = 0;
+  const int32_t *excluded = nullptr;
+  int32_t *host_set_argmax = nullptr; // [set_count]
 };
 
 bool validate_span_multimodal(const ignis_model *model, int32_t route, const SpanMultimodal &span) {
@@ -953,17 +962,57 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     // they outlive the layer that writes them and reach the copy below. Only
     // for the chunk that asks -- no allocation and no launch otherwise, and
     // the reservation for it is the prefill plan's (`plan_load_sizes`).
-    AttentionReadoutTarget readout_target;
+    //
+    // GitHub #263: one target per armed GQA layer -- the pointing head's, and
+    // every layer holding a head of the set -- each with its own read flag;
+    // the readout is read only when every armed layer read. The set's packed
+    // argmax lives beside the scores (8 bytes a head), zeroed once here,
+    // before the first armed layer raises it.
+    std::array<AttentionReadoutTarget, kReadoutGqaLayers> readout_targets{};
+    std::array<bool, kReadoutGqaLayers> readout_armed{};
+    std::array<bool, kReadoutGqaLayers> readout_layer_read{};
     bool readout_read = false;
     ninfer::Tensor readout_scores;
+    ninfer::DeviceSpan readout_set_best{};
     if (attention_readout != nullptr) {
       readout_scores = model->scratch->alloc(
           ninfer::DType::FP32, {static_cast<std::int32_t>(attention_readout->key_count), 1, 1, 1});
-      readout_target.query_head = attention_readout->query_head;
-      readout_target.key_begin = attention_readout->key_begin;
-      readout_target.key_count = attention_readout->key_count;
-      readout_target.device_scores = static_cast<float *>(readout_scores.data);
-      readout_target.read = &readout_read;
+      if (attention_readout->set_count > 0) {
+        readout_set_best = model->scratch->alloc_bytes(
+            static_cast<std::size_t>(attention_readout->set_count) * sizeof(unsigned long long));
+        err = cudaMemsetAsync(readout_set_best.data, 0, readout_set_best.bytes, model->stream);
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_prefill: cudaMemsetAsync(head set) failed: ") +
+                    cudaGetErrorString(err));
+          return -1;
+        }
+      }
+      const auto arm = [&](std::int32_t ordinal) -> AttentionReadoutTarget & {
+        const auto at = static_cast<std::size_t>(ordinal);
+        AttentionReadoutTarget &target = readout_targets[at];
+        if (!readout_armed[at]) {
+          readout_armed[at] = true;
+          target.query_head = -1;
+          target.key_begin = attention_readout->key_begin;
+          target.key_count = attention_readout->key_count;
+          target.device_set_best = static_cast<unsigned long long *>(readout_set_best.data);
+          target.excluded_count = static_cast<std::int32_t>(attention_readout->excluded_count);
+          for (uint32_t e = 0; e < attention_readout->excluded_count; ++e) {
+            target.excluded[e] = attention_readout->excluded[e];
+          }
+          target.read = &readout_layer_read[at];
+        }
+        return target;
+      };
+      AttentionReadoutTarget &pointing = arm(attention_readout->gqa_ordinal);
+      pointing.query_head = attention_readout->query_head;
+      pointing.device_scores = static_cast<float *>(readout_scores.data);
+      for (uint32_t i = 0; i < attention_readout->set_count; ++i) {
+        AttentionReadoutTarget &target = arm(attention_readout->set_gqa_ordinals[i]);
+        target.set_query_head[target.set_heads] = attention_readout->set_query_heads[i];
+        target.set_slot[target.set_heads] = static_cast<std::int32_t>(i);
+        ++target.set_heads;
+      }
     }
 
     uint64_t dispatches = 0;
@@ -971,12 +1020,11 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       profiler.record_layer_begin(layer, model->stream);
       const bool reads_attention =
           attention_readout != nullptr && model->layers[layer].kind == IGNIS_LAYER_GQA &&
-          static_cast<std::int32_t>(ignis_gqa_relative_layer(layer)) ==
-              attention_readout->gqa_ordinal;
+          readout_armed[ignis_gqa_relative_layer(layer)];
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
-          ? ignis_gqa_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
-                                     mode, rope_positions,
-                                     reads_attention ? &readout_target : nullptr)
+          ? ignis_gqa_layer_run_body(
+                model, pool, seq, layer, left.data, right.data, num_tokens, mode, rope_positions,
+                reads_attention ? &readout_targets[ignis_gqa_relative_layer(layer)] : nullptr)
           : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
                                      mode);
       if (rc != 0) {
@@ -1059,11 +1107,25 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 
     // GitHub #260: the scores the readout layer wrote, one float per key and
     // nothing else, copied out beside the logits row and confirmed by the
-    // same synchronization.
+    // same synchronization -- and (GitHub #263) the set's packed argmax, 8
+    // bytes a head, only when every armed layer read.
+    if (attention_readout != nullptr) {
+      readout_read = true;
+      for (std::size_t ordinal = 0; ordinal < readout_armed.size(); ++ordinal) {
+        readout_read = readout_read && (!readout_armed[ordinal] || readout_layer_read[ordinal]);
+      }
+    }
+    std::vector<unsigned long long> host_set_best;
     if (readout_read) {
       err = cudaMemcpyAsync(attention_readout->host_scores, readout_scores.data,
                             static_cast<std::size_t>(attention_readout->key_count) * sizeof(float),
                             cudaMemcpyDeviceToHost, model->stream);
+      if (err == cudaSuccess && attention_readout->set_count > 0) {
+        host_set_best.resize(attention_readout->set_count);
+        err = cudaMemcpyAsync(host_set_best.data(), readout_set_best.data,
+                              host_set_best.size() * sizeof(unsigned long long),
+                              cudaMemcpyDeviceToHost, model->stream);
+      }
       if (err != cudaSuccess) {
         set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(attention scores) failed: ") +
                   cudaGetErrorString(err));
@@ -1102,6 +1164,13 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       }
     }
     if (attention_readout != nullptr) {
+      // A zero slot is a head no key was scored for: the set is not whole,
+      // so none of it is reported read.
+      for (std::size_t i = 0; readout_read && i < host_set_best.size(); ++i) {
+        readout_read = host_set_best[i] != 0;
+        attention_readout->host_set_argmax[i] =
+            static_cast<int32_t>(static_cast<std::uint32_t>(host_set_best[i] & 0xffffffffu));
+      }
       *attention_readout->host_read = readout_read ? 1 : 0;
     }
     // Only advance every layer's position counter once the synchronize above
@@ -1301,29 +1370,77 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   ArmedAttentionReadout attention_readout;
   const bool arms_readout = options != nullptr && options->attention_gqa_ordinal >= 0 &&
                             options->out_attention_scores != nullptr;
+  // GitHub #263: a head set rides the readout; named without it, it is a
+  // caller that meant one and would silently get none.
+  if (!arms_readout && options != nullptr &&
+      (options->attention_set_count > 0 || options->attention_excluded_count > 0)) {
+    set_error("ignis_program_prefill: a head set or excluded keys without an attention readout "
+              "armed to read them beside");
+    return -1;
+  }
   if (arms_readout) {
     // The room `plan_load_sizes` (kernel/src/model.cu) reserved for the
     // scores: one F32 per token of the vision envelope, capped by the
     // context -- the same two terms, or a readout could outgrow its arena.
     const std::uint64_t capacity =
         std::min<std::uint64_t>(model->vision_max_tokens, model->max_context_tokens);
-    bool has_layer = false;
+    // The GQA ordinals this model has, for the readout's layer and every
+    // head of its set.
+    std::array<bool, kReadoutGqaLayers> gqa_ordinal{};
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
-      has_layer = has_layer || (model->layers[layer].kind == IGNIS_LAYER_GQA &&
-                                static_cast<std::int32_t>(ignis_gqa_relative_layer(layer)) ==
-                                    options->attention_gqa_ordinal);
+      const std::uint32_t ordinal = ignis_gqa_relative_layer(layer);
+      if (model->layers[layer].kind == IGNIS_LAYER_GQA && ordinal < gqa_ordinal.size()) {
+        gqa_ordinal[ordinal] = true;
+      }
+    }
+    const auto is_gqa_ordinal = [&](int32_t ordinal) {
+      return ordinal >= 0 && ordinal < kReadoutGqaLayers &&
+             gqa_ordinal[static_cast<std::size_t>(ordinal)];
+    };
+    const bool has_layer = is_gqa_ordinal(options->attention_gqa_ordinal);
+    // GitHub #263: a head set names heads the model has, each once, at most
+    // the reserved count, with its result buffer; its excluded keys sit
+    // inside the span, at most what a launch carries.
+    bool set_ok = options->attention_set_count <= static_cast<uint32_t>(kReadoutMaxSetHeads) &&
+                  options->attention_excluded_count <= static_cast<uint32_t>(kReadoutMaxExcluded) &&
+                  (options->attention_excluded_count == 0 ||
+                   (options->attention_set_count > 0 && options->attention_excluded != nullptr));
+    if (set_ok && options->attention_set_count > 0) {
+      set_ok = options->attention_set_gqa_ordinals != nullptr &&
+               options->attention_set_query_heads != nullptr &&
+               options->out_attention_set_argmax != nullptr &&
+               (options->attention_excluded_count == 0 || options->attention_excluded != nullptr);
+      std::vector<bool> seen(static_cast<std::size_t>(kReadoutGqaLayers) * kIgnisGqaQHeads, false);
+      for (uint32_t i = 0; set_ok && i < options->attention_set_count; ++i) {
+        const int32_t ordinal = options->attention_set_gqa_ordinals[i];
+        const int32_t head = options->attention_set_query_heads[i];
+        set_ok = is_gqa_ordinal(ordinal) && head >= 0 && head < kIgnisGqaQHeads;
+        if (set_ok) {
+          const std::size_t at = static_cast<std::size_t>(ordinal) * kIgnisGqaQHeads + head;
+          set_ok = !seen[at];
+          seen[at] = true;
+        }
+      }
+      for (uint32_t e = 0; set_ok && e < options->attention_excluded_count; ++e) {
+        set_ok = options->attention_excluded[e] >= 0 &&
+                 options->attention_excluded[e] < options->attention_key_count;
+      }
     }
     if (route != IGNIS_PREFILL_ROUTE_CHUNKED || options->out_attention_read == nullptr ||
         !has_layer || options->attention_query_head < 0 ||
         options->attention_query_head >= kIgnisGqaQHeads || options->attention_key_begin < 0 ||
         options->attention_key_count <= 0 ||
-        static_cast<std::uint64_t>(options->attention_key_count) > capacity) {
+        static_cast<std::uint64_t>(options->attention_key_count) > capacity || !set_ok) {
       set_error("ignis_program_prefill: an attention readout of GQA layer " +
                 std::to_string(options->attention_gqa_ordinal) + ", head " +
                 std::to_string(options->attention_query_head) + ", over " +
                 std::to_string(options->attention_key_count) +
-                " keys cannot be armed on this load (the chunked route, a GQA layer and query "
-                "head the model has, and at most " + std::to_string(capacity) +
+                " keys with a head set of " + std::to_string(options->attention_set_count) +
+                " cannot be armed on this load (the chunked route, GQA layers and query heads "
+                "the model has, each head once and at most " +
+                std::to_string(kReadoutMaxSetHeads) + " of them, at most " +
+                std::to_string(kReadoutMaxExcluded) + " excluded keys inside the span, and at most " +
+                std::to_string(capacity) +
                 " keys -- the vision envelope the load reserved scores for)");
       return -1;
     }
@@ -1333,6 +1450,12 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     attention_readout.key_count = options->attention_key_count;
     attention_readout.host_scores = options->out_attention_scores;
     attention_readout.host_read = options->out_attention_read;
+    attention_readout.set_count = options->attention_set_count;
+    attention_readout.set_gqa_ordinals = options->attention_set_gqa_ordinals;
+    attention_readout.set_query_heads = options->attention_set_query_heads;
+    attention_readout.excluded_count = options->attention_excluded_count;
+    attention_readout.excluded = options->attention_excluded;
+    attention_readout.host_set_argmax = options->out_attention_set_argmax;
     *attention_readout.host_read = 0;
   }
 

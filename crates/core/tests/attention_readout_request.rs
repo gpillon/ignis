@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use ignis_core::pointing::{ATTENTION_MIN_CHUNK_TOKENS, AttentionQuery, PointingHead};
+use ignis_core::pointing::{ATTENTION_MIN_CHUNK_TOKENS, AttentionQuery, AttentionScores, PointingHead, SetQuery};
 use ignis_core::scheduler::PrefillJob;
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent, TokenId};
 use ignis_core::{
@@ -43,6 +43,7 @@ fn head_point(prompt: Vec<TokenId>, begin: u32, count: u32) -> RequestInput {
             head: HEAD,
             key_begin: begin,
             key_count: count,
+            set: None,
         })),
         constrained: None,
     }
@@ -71,7 +72,7 @@ fn run_to_idle(sched: &mut ConcreteScheduler) -> Vec<SchedEvent> {
 }
 
 /// The `Done` event for `request`, as (tokens generated, reason, attention).
-fn finish(events: &[SchedEvent], request: RequestId) -> (u32, FinishReason, Option<Arc<[f32]>>) {
+fn finish(events: &[SchedEvent], request: RequestId) -> (u32, FinishReason, Option<AttentionScores>) {
     events
         .iter()
         .find_map(|e| match e {
@@ -113,7 +114,9 @@ fn a_head_point_is_answered_at_the_end_of_prefill_and_never_decoded() {
     let (generated, reason, attention) = finish(&events, id);
     assert_eq!(generated, 0, "a head point generates nothing");
     assert_eq!(reason, FinishReason::Stop, "it is answered, not cut short");
-    let scores = attention.expect("its answer is the attention readout");
+    let attention = attention.expect("its answer is the attention readout");
+    assert_eq!(attention.set_argmax, None, "it named no head set");
+    let scores = attention.scores;
     assert_eq!(scores.len(), 16, "one score per key of the span it named");
     assert_eq!(
         scores.iter().position(|&s| s == MockCompute::ATTENTION_PEAK_SCORE),
@@ -127,6 +130,40 @@ fn a_head_point_is_answered_at_the_end_of_prefill_and_never_decoded() {
         !events.iter().any(|e| matches!(e, SchedEvent::Token { request, .. } if *request == id)),
         "and it emitted no token"
     );
+}
+
+/// Spec 14: a head point naming a head set carries the set — heads and
+/// excluded keys — on its reading chunk, and finishes with one key index per
+/// head beside the pointing head's scores, in the set's order.
+#[test]
+fn a_head_set_rides_the_reading_chunk_and_comes_back_one_key_per_head() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+    let set = SetQuery {
+        heads: Arc::from(vec![HEAD, PointingHead { gqa_ordinal: 7, query_head: 1 }, PointingHead { gqa_ordinal: 15, query_head: 18 }]),
+        excluded: Arc::from(vec![0, 6, 15]),
+    };
+    let mut input = head_point(tokens(1, 40), 4, 16);
+    input.decision = Some(DecisionRead::Attention(AttentionQuery {
+        head: HEAD,
+        key_begin: 4,
+        key_count: 16,
+        set: Some(set.clone()),
+    }));
+    let id = sched.submit(input, RequestClass::Agent).expect("admitted");
+    let events = run_to_idle(&mut sched);
+
+    let asked = jobs_of(&compute, id).last().and_then(|job| job.attention.clone()).expect("the last chunk reads");
+    assert_eq!(asked.set.as_ref(), Some(&set), "the job names the set it was given");
+    let (generated, reason, attention) = finish(&events, id);
+    assert_eq!((generated, reason), (0, FinishReason::Stop));
+    let attention = attention.expect("answered");
+    assert_eq!(attention.scores.len(), 16);
+    let argmax = attention.set_argmax.expect("one key per head of the set");
+    assert_eq!(&*argmax, MockCompute::attention_set_argmax(16, 3, &set.excluded).as_slice());
+    // The mock's peak is key 5 and the set reads 5, 6 and 7 — 6 is excluded,
+    // so the second head moves on to 7.
+    assert_eq!(&*argmax, &[5, 7, 7]);
 }
 
 #[test]

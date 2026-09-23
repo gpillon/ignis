@@ -123,6 +123,19 @@ pub(crate) mod ffi {
         pub attention_key_count: i64,
         pub out_attention_scores: *mut f32,
         pub out_attention_read: *mut i32,
+        /// GitHub #263 (ADR 0039): the head set read beside the attention
+        /// readout, or none when `attention_set_count` is 0. Head `i` is
+        /// query head `attention_set_query_heads[i]` of GQA layer
+        /// `attention_set_gqa_ordinals[i]`; its argmax over the span minus
+        /// the `attention_excluded` span-relative keys lands in
+        /// `out_attention_set_argmax[i]`. Every armed layer must read, or
+        /// `*out_attention_read` is 0.
+        pub attention_set_count: u32,
+        pub attention_set_gqa_ordinals: *const i32,
+        pub attention_set_query_heads: *const i32,
+        pub attention_excluded_count: u32,
+        pub attention_excluded: *const i32,
+        pub out_attention_set_argmax: *mut i32,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -569,6 +582,12 @@ impl PrefillRoute {
             attention_key_count: 0,
             out_attention_scores: std::ptr::null_mut(),
             out_attention_read: std::ptr::null_mut(),
+            attention_set_count: 0,
+            attention_set_gqa_ordinals: std::ptr::null(),
+            attention_set_query_heads: std::ptr::null(),
+            attention_excluded_count: 0,
+            attention_excluded: std::ptr::null(),
+            out_attention_set_argmax: std::ptr::null_mut(),
         }
     }
 }
@@ -1228,10 +1247,12 @@ pub struct MultimodalPrefill<'a> {
 
 /// One **attention readout** a multimodal span asks for (GitHub #260, ADR
 /// 0038): what to read, and where the scores go — one slot per key of the
-/// query's span.
+/// query's span, and one per head of its head set (GitHub #263, ADR 0039).
 pub struct AttentionReadout<'a> {
-    pub query: crate::pointing::AttentionQuery,
+    pub query: &'a crate::pointing::AttentionQuery,
     pub scores: &'a mut [f32],
+    /// `query.set`'s heads' argmax key indices; empty when it names no set.
+    pub set_argmax: &'a mut [u32],
 }
 
 /// A media item's columns placed over a span's placeholder rows.
@@ -1291,6 +1312,14 @@ pub fn prefill_program_multimodal(
     };
     let mut probability = 0f32;
     let mut read = 0i32;
+    // GitHub #263: the head set's inputs and results, as the ABI's i32s.
+    // Built only for a readout that names one; everything else passes
+    // empty vectors, which allocate nothing.
+    let set = attention.as_ref().map(|readout| readout.query).and_then(|query| query.set.as_ref());
+    let set_ordinals: Vec<i32> = set.map_or_else(Vec::new, |set| set.heads.iter().map(|h| h.gqa_ordinal as i32).collect());
+    let set_heads: Vec<i32> = set.map_or_else(Vec::new, |set| set.heads.iter().map(|h| h.query_head as i32).collect());
+    let excluded: Vec<i32> = set.map_or_else(Vec::new, |set| set.excluded.iter().map(|&key| key as i32).collect());
+    let mut set_out = vec![-1i32; set_ordinals.len()];
     let mut options = ffi::IgnisPrefillOptions {
         mrope_positions: span.positions.as_ptr(),
         rope_delta: span.rope_delta,
@@ -1301,6 +1330,7 @@ pub fn prefill_program_multimodal(
         out_permitted_prob: &mut probability,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
+    let mut attention_set: Option<&mut [u32]> = None;
     if let Some(readout) = attention {
         if readout.scores.len() != readout.query.key_count as usize {
             return Err(format!(
@@ -1315,6 +1345,22 @@ pub fn prefill_program_multimodal(
         options.attention_key_count = i64::from(readout.query.key_count);
         options.out_attention_scores = readout.scores.as_mut_ptr();
         options.out_attention_read = &mut read;
+        let named = readout.query.set.as_ref().map_or(0, |set| set.heads.len());
+        if readout.set_argmax.len() != named {
+            return Err(format!(
+                "prefill_program_multimodal: {} argmax slots for a head set of {named} heads",
+                readout.set_argmax.len()
+            ));
+        }
+        if let Some(set) = &readout.query.set {
+            options.attention_set_count = set.heads.len() as u32;
+            options.attention_set_gqa_ordinals = set_ordinals.as_ptr();
+            options.attention_set_query_heads = set_heads.as_ptr();
+            options.attention_excluded_count = excluded.len() as u32;
+            options.attention_excluded = if excluded.is_empty() { std::ptr::null() } else { excluded.as_ptr() };
+            options.out_attention_set_argmax = set_out.as_mut_ptr();
+        }
+        attention_set = Some(readout.set_argmax);
     }
     let logits_ptr = match out_logits {
         Some(buf) => buf.as_mut_ptr(),
@@ -1335,6 +1381,11 @@ pub fn prefill_program_multimodal(
     };
     if rc != 0 {
         return Err(last_error());
+    }
+    if let Some(readout) = attention_set {
+        for (slot, &key) in readout.iter_mut().zip(&set_out) {
+            *slot = key as u32;
+        }
     }
     Ok((probability, read == 1))
 }

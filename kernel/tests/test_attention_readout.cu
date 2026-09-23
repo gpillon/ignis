@@ -25,6 +25,12 @@
 //                scoring the wrong keys: no prompt-route plane, keys past the
 //                history, keys past the plane's band -- and the one geometry
 //                it refuses outright.
+//   set          GitHub #263 (ADR 0039): the fused launch over a head set,
+//                on the plane and on the pages -- each head's argmax against
+//                the host's, an excluded key scoring above everything
+//                skipped, an exact tie won by the larger key, the pointing
+//                head's row equal to the single-head kernel's whether or not
+//                it is one of the set, and the guards.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE, so a missing or
 // busy GPU fails this test rather than skipping it.
@@ -42,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -327,6 +334,238 @@ void a_read_that_cannot_be_made_is_left_unread(std::mt19937 &rng) {
   check(got.rc != 0 && !got.read, "a head geometry it was not built for: refused");
 }
 
+// ── GitHub #263 (ADR 0039): the head set, in one fused launch ────────────
+
+// The heads of a set one layer holds, across all four KV heads and more than
+// one per KV head; 10 is the pointing head (KV head 1).
+const std::vector<int> kSetHeads = {0, 5, 10, 11, 13, 17, 23};
+
+struct SetRun {
+  int32_t rc = 0;
+  bool read = false;
+  std::vector<float> scores;             // the pointing head's row, if asked
+  std::vector<unsigned long long> best;  // packed, one per head of `heads`
+};
+
+// One fused launch: `heads` with slots 0.., the pointing head's row when
+// `row_head` >= 0, `excluded` span-relative.
+SetRun run_set(const Scene &scene, const std::vector<int> &heads, int row_head,
+               const std::vector<std::int32_t> &excluded, const ninfer::PagedKVBatchLayerView &cache,
+               bool hq_prompt_scratch, const void *workspace, std::int64_t span) {
+  Device<std::uint16_t> query(scene.query);
+  Device<float> scores(static_cast<std::size_t>(scene.key_count));
+  Device<unsigned long long> best(heads.size());
+  SetRun out;
+  AttentionReadoutTarget target;
+  target.query_head = row_head;
+  target.key_begin = scene.key_begin;
+  target.key_count = scene.key_count;
+  target.device_scores = row_head >= 0 ? scores.p : nullptr;
+  target.set_heads = static_cast<int32_t>(heads.size());
+  for (std::size_t i = 0; i < heads.size(); ++i) {
+    target.set_query_head[i] = heads[i];
+    target.set_slot[i] = static_cast<int32_t>(i);
+  }
+  target.device_set_best = best.p;
+  target.excluded_count = static_cast<int32_t>(excluded.size());
+  std::copy(excluded.begin(), excluded.end(), target.excluded);
+  target.read = &out.read;
+  const char *error = nullptr;
+  out.rc = ignis_attention_readout_run(target, query.p, kQHeads, kKvHeads, scene.tokens,
+                                       scene.visible, cache, hq_prompt_scratch, workspace, span,
+                                       kScale, nullptr, &error);
+  CUDA_FATAL(cudaDeviceSynchronize());
+  out.scores = scores.read();
+  out.best = best.read();
+  return out;
+}
+
+std::vector<double> query_of_head(const Scene &scene, int head) {
+  Scene one = scene;
+  one.query_head = head;
+  return query_of(one);
+}
+
+// A key row's value `d`, head `kv`, position `p`, as each layout stores it.
+using KeyAt = std::function<double(int kv, std::int64_t position, int d)>;
+
+// Each head's argmax over the span minus `excluded` against the host's
+// double-precision scores: the same key, or one whose score ties the
+// maximum to float accumulation -- and on an exact tie, the larger index.
+void check_set(const Scene &scene, const SetRun &got, const std::vector<int> &heads,
+               const std::vector<std::int32_t> &excluded, const KeyAt &key, bool hq,
+               const std::string &label) {
+  check(got.rc == 0 && got.read, label + ": the fused readout reads");
+  for (std::size_t i = 0; i < heads.size(); ++i) {
+    const std::vector<double> q0 = query_of_head(scene, heads[i]);
+    const std::vector<double> q = hq ? rotate(q0) : q0;
+    const int kv = heads[i] / (kQHeads / kKvHeads);
+    std::vector<double> want(static_cast<std::size_t>(scene.key_count));
+    double top = -1e300;
+    for (std::int64_t k = 0; k < scene.key_count; ++k) {
+      double dot = 0.0;
+      for (int d = 0; d < kHeadDim; ++d) {
+        dot += q[d] * key(kv, scene.key_begin + k, d);
+      }
+      want[static_cast<std::size_t>(k)] = dot * kScale;
+      if (std::find(excluded.begin(), excluded.end(), k) == excluded.end()) {
+        top = std::max(top, want[static_cast<std::size_t>(k)]);
+      }
+    }
+    const unsigned long long packed = got.best[i];
+    const auto index = static_cast<std::int64_t>(packed & 0xffffffffULL);
+    const bool scored = packed != 0 && index < scene.key_count;
+    check(scored, label + ": head " + std::to_string(heads[i]) + " published a key");
+    if (!scored) {
+      continue;
+    }
+    const bool not_excluded = std::find(excluded.begin(), excluded.end(), index) == excluded.end();
+    check(not_excluded, label + ": head " + std::to_string(heads[i]) + " landed on an excluded key " +
+                            std::to_string(index));
+    const double at = want[static_cast<std::size_t>(index)];
+    check(at >= top - 1e-4 * std::max(1.0, std::fabs(top)),
+          label + ": head " + std::to_string(heads[i]) + " peaks at key " + std::to_string(index) +
+              " scoring " + std::to_string(at) + ", the maximum is " + std::to_string(top));
+  }
+}
+
+// The set's keys, with three rows planted in every KV head: an excluded key
+// scoring far above everything (the argmax must skip it), and two identical
+// rows scoring above the rest (an exact tie, which the larger index wins).
+struct Planted {
+  std::int64_t excluded_key = 500;
+  std::int64_t tie_low = 200;
+  std::int64_t tie_high = 700;
+};
+
+void the_set_is_read_in_one_launch_off_the_plane(std::mt19937 &rng) {
+  std::printf("set/plane: hq keys, every head of the set\n");
+  const Scene scene = make_scene(rng);
+  const Planted planted;
+  const std::int64_t span = scene.visible;
+  std::normal_distribution<float> normal(0.0F, 1.0F);
+  std::vector<std::uint16_t> plane(static_cast<std::size_t>(kKvHeads) * span * kHeadDim);
+  for (auto &k : plane) {
+    k = to_bf16(normal(rng));
+  }
+  // Planted rows: along the sum of the KV head's rotated set queries, so every
+  // head of the group scores them high.
+  for (int kv = 0; kv < kKvHeads; ++kv) {
+    std::vector<double> direction(kHeadDim, 0.0);
+    for (const int h : kSetHeads) {
+      if (h / (kQHeads / kKvHeads) == kv) {
+        const std::vector<double> rq = rotate(query_of_head(scene, h));
+        for (int d = 0; d < kHeadDim; ++d) {
+          direction[d] += rq[d];
+        }
+      }
+    }
+    const auto plant = [&](std::int64_t k, double gain) {
+      const std::int64_t position = scene.key_begin + k;
+      for (int d = 0; d < kHeadDim; ++d) {
+        plane[(static_cast<std::size_t>(kv) * span + position) * kHeadDim + d] =
+            to_bf16(static_cast<float>(gain * direction[d]));
+      }
+    };
+    plant(planted.excluded_key, 8.0);
+    plant(planted.tie_low, 4.0);
+    plant(planted.tie_high, 4.0);
+  }
+  Device<std::uint16_t> workspace(plane);
+  ninfer::PagedKVBatchLayerView cache;
+  cache.dtype = ninfer::DType::U8;
+  const std::vector<std::int32_t> excluded = {0, static_cast<std::int32_t>(planted.excluded_key),
+                                              static_cast<std::int32_t>(scene.key_count - 1)};
+  const KeyAt key = [&](int kv, std::int64_t position, int d) {
+    return from_bf16(plane[(static_cast<std::size_t>(kv) * span + position) * kHeadDim + d]);
+  };
+
+  const SetRun got = run_set(scene, kSetHeads, scene.query_head, excluded, cache, true, workspace.p, span);
+  check_set(scene, got, kSetHeads, excluded, key, /*hq=*/true, "plane");
+  for (std::size_t i = 0; i < kSetHeads.size(); ++i) {
+    check((got.best[i] & 0xffffffffULL) == static_cast<unsigned long long>(planted.tie_high),
+          "plane: head " + std::to_string(kSetHeads[i]) +
+              " breaks the planted tie toward the larger key");
+  }
+  // The pointing head's row, written in the same pass, is the single-head
+  // kernel's -- the excluded key included.
+  const Run alone = run(scene, cache, /*hq_prompt_scratch=*/true, workspace.p, span);
+  double worst = 0.0;
+  for (std::size_t k = 0; k < alone.scores.size(); ++k) {
+    worst = std::max(worst, static_cast<double>(std::fabs(got.scores[k] - alone.scores[k])) /
+                                std::max(1.0, static_cast<double>(std::fabs(alone.scores[k]))));
+  }
+  std::printf("  pointing row against the single-head kernel: worst relative %.2e\n", worst);
+  check(worst < 1e-5, "plane: the pointing head's row is the single-head kernel's");
+}
+
+void the_set_is_read_in_one_launch_off_the_pages(std::mt19937 &rng) {
+  std::printf("set/pages: BF16 keys through a permuted block table\n");
+  const Scene scene = make_scene(rng);
+  const int pages = static_cast<int>((scene.visible + kPage - 1) / kPage);
+  std::vector<std::int32_t> table(pages);
+  for (int p = 0; p < pages; ++p) {
+    table[p] = pages - 1 - p;
+  }
+  std::normal_distribution<float> normal(0.0F, 1.0F);
+  std::vector<std::uint16_t> plane(static_cast<std::size_t>(pages) * kKvHeads * kPage * kHeadDim);
+  for (auto &k : plane) {
+    k = to_bf16(normal(rng));
+  }
+  const auto row_of = [&](int kv, std::int64_t position) {
+    return ((static_cast<std::size_t>(table[position / kPage]) * kKvHeads + kv) * kPage +
+            static_cast<std::size_t>(position % kPage)) *
+           kHeadDim;
+  };
+  Device<std::uint16_t> k_pages(plane);
+  Device<std::int32_t> block_table(table);
+  ninfer::PagedKVBatchLayerView cache;
+  cache.dtype = ninfer::DType::BF16;
+  cache.k_pages = ninfer::Tensor(k_pages.p, ninfer::DType::BF16, {kHeadDim, kKvHeads * kPage * pages, 1, 1});
+  cache.block_tables = ninfer::Tensor(block_table.p, ninfer::DType::I32, {pages, 1, 1, 1});
+  const std::vector<std::int32_t> excluded = {0, 1, 223, static_cast<std::int32_t>(scene.key_count - 1)};
+  const KeyAt key = [&](int kv, std::int64_t position, int d) {
+    return from_bf16(plane[row_of(kv, position) + d]);
+  };
+  // The pointing head outside the set: its row still comes back, and it
+  // takes no argmax slot.
+  const std::vector<int> heads = {0, 5, 13, 17, 23};
+  const SetRun got = run_set(scene, heads, scene.query_head, excluded, cache, false, nullptr, 0);
+  check_set(scene, got, heads, excluded, key, /*hq=*/false, "pages");
+  const Run alone = run(scene, cache, /*hq_prompt_scratch=*/false, nullptr, 0);
+  double worst = 0.0;
+  for (std::size_t k = 0; k < alone.scores.size(); ++k) {
+    worst = std::max(worst, static_cast<double>(std::fabs(got.scores[k] - alone.scores[k])) /
+                                std::max(1.0, static_cast<double>(std::fabs(alone.scores[k]))));
+  }
+  check(worst < 1e-5, "pages: the pointing head outside the set still gets its row");
+
+  // A layer that holds only heads of the set writes no row at all.
+  const SetRun set_only = run_set(scene, heads, -1, excluded, cache, false, nullptr, 0);
+  check_set(scene, set_only, heads, excluded, key, /*hq=*/false, "pages, no pointing head");
+}
+
+void a_set_that_cannot_be_read_is_left_unread(std::mt19937 &rng) {
+  std::printf("set/unread: the guards\n");
+  const Scene scene = make_scene(rng);
+  std::vector<std::uint16_t> plane(static_cast<std::size_t>(kKvHeads) * scene.visible * kHeadDim, to_bf16(1.0F));
+  Device<std::uint16_t> workspace(plane);
+  ninfer::PagedKVBatchLayerView hq;
+  hq.dtype = ninfer::DType::U8;
+  SetRun got = run_set(scene, kSetHeads, scene.query_head, {}, hq, /*hq_prompt_scratch=*/false,
+                       workspace.p, scene.visible);
+  check(got.rc == 0 && !got.read, "no prompt-route plane: the set is unread, not an error");
+  bool untouched = true;
+  for (const unsigned long long b : got.best) {
+    untouched = untouched && b == 0;
+  }
+  check(untouched, "and no head published anything");
+  got = run_set(scene, {0, 5, 5}, scene.query_head, {}, hq, true, workspace.p, scene.visible);
+  check(got.rc != 0 && !got.read, "a head named twice: refused");
+  got = run_set(scene, {0, 24}, scene.query_head, {}, hq, true, workspace.p, scene.visible);
+  check(got.rc != 0 && !got.read, "a query head the layer does not have: refused");
+}
+
 } // namespace
 
 int main() {
@@ -340,6 +579,9 @@ int main() {
   the_pages_are_read_through_the_block_table(rng);
   the_plane_is_read_in_the_codec_frame(rng);
   a_read_that_cannot_be_made_is_left_unread(rng);
+  the_set_is_read_in_one_launch_off_the_plane(rng);
+  the_set_is_read_in_one_launch_off_the_pages(rng);
+  a_set_that_cannot_be_read_is_left_unread(rng);
   if (g_failed > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failed);
     return EXIT_FAILURE;

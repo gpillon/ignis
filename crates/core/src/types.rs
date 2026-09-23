@@ -172,10 +172,10 @@ impl DecisionRead {
     }
 
     /// The attention query, for an attention readout.
-    pub fn attention(&self) -> Option<crate::pointing::AttentionQuery> {
+    pub fn attention(&self) -> Option<&crate::pointing::AttentionQuery> {
         match self {
             Self::Answers(_) => None,
-            Self::Attention(query) => Some(*query),
+            Self::Attention(query) => Some(query),
         }
     }
 }
@@ -189,7 +189,7 @@ impl RequestInput {
 
     /// The attention readout this request is a decision over, if it is one
     /// (GitHub #260).
-    pub fn attention(&self) -> Option<crate::pointing::AttentionQuery> {
+    pub fn attention(&self) -> Option<&crate::pointing::AttentionQuery> {
         self.decision.as_ref().and_then(DecisionRead::attention)
     }
 
@@ -597,10 +597,11 @@ pub enum SchedEvent {
         readout: Option<crate::decision::Readout>,
         /// The **attention readout** a head-point decision finished with
         /// (GitHub #260, ADR 0038): one pre-softmax score per key of the span
-        /// it named, in order, and `None` for every other request — and for
-        /// a head point whose leaf could not read the keys, which then
-        /// finishes with [`FinishReason::Error`].
-        attention: Option<std::sync::Arc<[f32]>>,
+        /// it named, in order, and one key index per head of its head set
+        /// when it named one (GitHub #263, ADR 0039) — `None` for every other
+        /// request, and for a head point whose leaf could not read the keys,
+        /// which then finishes with [`FinishReason::Error`].
+        attention: Option<crate::pointing::AttentionScores>,
         /// The **trace** a **constrained decode** finished with (GitHub #242, ADR
         /// 0034), and `None` for every other request: one
         /// [`crate::constrained::Draw`] per emitted token, in order, each with

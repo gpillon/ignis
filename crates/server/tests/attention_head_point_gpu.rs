@@ -255,6 +255,33 @@ struct Scene {
     instruction: Option<String>,
     #[serde(default)]
     kind: Option<String>,
+    /// A non-square scene's own size (GitHub #263): `study.size` as the
+    /// vision study's manifests write it, or `width` and `height`.
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    study: Option<serde_json::Value>,
+}
+
+impl Scene {
+    /// The scene's width and height in pixels: its own when the manifest
+    /// gives them, the set's square `side` otherwise. Every point is scored
+    /// in these — a screenshot is not square, and scaling both axes by one
+    /// side put the chain's `y` and the head's cells in the wrong place.
+    fn size(&self, side: u32) -> (f64, f64) {
+        let study = self
+            .study
+            .as_ref()
+            .and_then(|study| study.get("size"))
+            .and_then(|size| Some((size.get(0)?.as_u64()?, size.get(1)?.as_u64()?)));
+        match (study, self.width, self.height) {
+            (Some((w, h)), _, _) => (w as f64, h as f64),
+            (None, Some(w), Some(h)) => (f64::from(w), f64::from(h)),
+            _ => (f64::from(side), f64::from(side)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -469,13 +496,13 @@ fn constrained_pick(logits: &[f32], slots: &[u32]) -> (usize, f64) {
 /// were softmax weights over the whole row restricted to the image columns,
 /// which differ from these by one positive factor — and min-max
 /// normalization removes it, so the point is the same.
-fn region_point(scores: &[f32], gh: usize, gw: usize, side: f64) -> (f64, f64) {
+fn region_point(scores: &[f32], gh: usize, gw: usize, width: f64, height: f64) -> (f64, f64) {
     let top = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let weights: Vec<f64> = scores.iter().map(|&s| f64::from(s - top).exp()).collect();
     let centre = |k: usize| -> (f64, f64) {
         (
-            ((k % gw) as f64 + 0.5) * side / gw as f64,
-            ((k / gw) as f64 + 0.5) * side / gh as f64,
+            ((k % gw) as f64 + 0.5) * width / gw as f64,
+            ((k / gw) as f64 + 0.5) * height / gh as f64,
         )
     };
     let lo = weights.iter().copied().fold(f64::INFINITY, f64::min);
@@ -697,7 +724,6 @@ fn one_attention_head_points_in_the_engine() {
         .iter()
         .position(|&o| o as usize == HEAD_ORDINAL)
         .expect("the head's layer is always armed");
-    let side = f64::from(manifest.side);
 
     eprintln!(
         "attention head point: set {set_name} ({} scenes{}), render {}, KV {}, head L{}.h{}",
@@ -904,8 +930,11 @@ fn one_attention_head_points_in_the_engine() {
                     tokens.len()
                 ));
             }
+            // A prompt too short to have codec rows (every row exact: the
+            // residual window covers it) has nothing for this check to
+            // measure — which is not a capture that failed it (GitHub #263).
             let codec_median = median(&mut codec.clone()).unwrap_or(f64::NAN);
-            if !(CODEC_ROW_MIN_MEDIAN..=CODEC_ROW_MAX_MEDIAN).contains(&codec_median) {
+            if !codec.is_empty() && !(CODEC_ROW_MIN_MEDIAN..=CODEC_ROW_MAX_MEDIAN).contains(&codec_median) {
                 verify_failures.push(format!(
                     "{}: the decoded keys sit at median rel L2 {codec_median:.4} from the rotated \
                      pre-codec keys, outside the codec's band [{CODEC_ROW_MIN_MEDIAN}, \
@@ -953,7 +982,8 @@ fn one_attention_head_points_in_the_engine() {
             }
         }
         drop(capture);
-        let head_point = region_point(&head_scores, gh, gw, side);
+        let (width, height) = scene.size(manifest.side);
+        let head_point = region_point(&head_scores, gh, gw, width, height);
 
         // ── the chain, continuing from the same prefill ──────────────────
         let mut position = tokens.len() as u64;
@@ -981,10 +1011,11 @@ fn one_attention_head_points_in_the_engine() {
         drop(sequence);
         drop(embedding);
 
-        let chain_point = (x as f64 / SCALE * side, y as f64 / SCALE * side);
-        let distance = ((chain_point.0 - head_point.0).powi(2) + (chain_point.1 - head_point.1).powi(2))
-            .sqrt()
-            / side
+        let chain_point = (x as f64 / SCALE * width, y as f64 / SCALE * height);
+        // In 0-999 units of each axis, which is what the guard was drawn on.
+        let distance = (((chain_point.0 - head_point.0) / width).powi(2)
+            + ((chain_point.1 - head_point.1) / height).powi(2))
+        .sqrt()
             * SCALE;
         let guarded = if distance <= GUARD_DISTANCE { chain_point } else { head_point };
         let (head_in, chain_in, guard_in) = (

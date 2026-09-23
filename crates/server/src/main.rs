@@ -457,32 +457,24 @@ async fn main() {
         );
     }
 
-    // GitHub #260: how a `point` with no `method` will be answered, said once
-    // at load and before the first request. The head is keyed to the
-    // artifact's content hash, so a load nobody calibrated one for says
-    // "chain" here instead of being found out from its answers — and a load
-    // without `--vision` says neither, since it takes no image to point on.
-    match (server.pointing_head, server.media.is_some()) {
-        (_, false) => tracing::info!(
-            name: "ignis.decide.pointing_head",
-            point_method = "none",
-            artifact = %server.engine.artifact(),
-            "loaded without --vision: `point` has no image to answer on"
-        ),
-        (Some(head), true) => tracing::info!(
-            name: "ignis.decide.pointing_head",
-            point_method = "head",
-            head = %head,
-            artifact = %server.engine.artifact(),
-            "`point` answers in one pass off the calibrated pointing head"
-        ),
-        (None, true) => tracing::info!(
-            name: "ignis.decide.pointing_head",
-            point_method = "chain",
-            artifact = %server.engine.artifact(),
-            "no calibrated pointing head for this artifact: `point` answers with the digit chain"
-        ),
-    }
+    // GitHub #260, #263: how a `point` with no `method` will be answered, and
+    // whether a `box` can be asked for `head`, said once at load and before
+    // the first request. The heads are keyed to the artifact's content hash,
+    // so a load nobody calibrated says "chain" here instead of being found
+    // out from its answers — and a load without `--vision` says neither,
+    // since it takes no image to point on.
+    let methods = ignis_server::decide::load_methods(server.calibration, server.media.is_some());
+    tracing::info!(
+        name: "ignis.decide.pointing_head",
+        point_method = methods.point,
+        box_methods = methods.box_methods,
+        box_default = methods.box_default,
+        head = server.calibration.map(|calibration| calibration.head.to_string()),
+        set_heads = server.calibration.and_then(|calibration| calibration.set).map(|set| set.heads.len()),
+        artifact = %server.engine.artifact(),
+        "{}",
+        methods.summary
+    );
 
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the

@@ -437,36 +437,114 @@ pub struct Question {
     /// `choice` meant something by it.
     #[serde(default)]
     pub digits: Option<u32>,
-    /// How a `point` is answered (GitHub #260): `"head"` reads the loaded
-    /// artifact's calibrated **pointing head** in one pass — one prefill, no
-    /// decode round — and `"chain"` writes the digits one decode round at a
-    /// time. Absent, it is `head` when the load has a calibrated head and
-    /// `chain` otherwise; every point answer says which ran.
+    /// How a `point` or a `box` is answered (GitHub #260, #263): `"head"`
+    /// reads the loaded artifact's calibrated heads in one pass — one
+    /// prefill, no decode round — and `"chain"` writes the digits one decode
+    /// round at a time.
     ///
-    /// The chain stays for what it is still better at: a point precise to
-    /// less than one image token (the head's resolution is one token, 32 px
-    /// of an unresized image), and a per-digit trace. Refused on every other
-    /// type — a `box` cannot come out of the head, whose region is not a box
-    /// — and an unknown value is refused naming the two, never read as the
+    /// Absent, a `point` is `head` on a load calibrated for it and `chain`
+    /// otherwise, and a `box` is [`BOX_DEFAULT_METHOD`]; every point and box
+    /// answer says which ran. A head `point` is read off the **head set**
+    /// where the load has one — the object's centre, with its extent — and
+    /// off the pointing head alone where it has only that. A head `box` needs
+    /// the head set, and is refused without one rather than answered by the
+    /// chain the caller did not ask for.
+    ///
+    /// The chain stays for what it is still better at: a coordinate finer
+    /// than one image token (the heads' resolution is one token, 32 px of an
+    /// unresized image), and a per-digit trace. Refused on every other type,
+    /// and an unknown value is refused naming the two, never read as the
     /// default.
     #[serde(default)]
-    #[schema(value_type = Option<PointMethod>)]
+    #[schema(value_type = Option<SpatialMethod>)]
     pub method: Option<String>,
 }
 
-/// How a `point` is answered (GitHub #260, spec 13).
+/// How a `point` or a `box` is answered (GitHub #260, #263; specs 13 and 14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
-pub enum PointMethod {
-    /// One pass: the calibrated pointing head's attention over the image,
-    /// read at the forced `{"x":` and turned into a point on the host.
-    /// Coarse — one image token — and on labelled targets it marks where the
-    /// label begins, not the target's centre.
+pub enum SpatialMethod {
+    /// One pass: the calibrated heads' attention over the image, read at the
+    /// forced `{"x":` and turned into an answer on the host — the head set's
+    /// **extent** and its centre where the load has a head set, the pointing
+    /// head's own point where it has only that. Coarse: one image token.
     Head,
-    /// The digit chain: the forced `{"x":` and then the digits, one decode
+    /// The digit chain: the forced opening and then the digits, one decode
     /// round each, under a constrained decode (GitHub #242).
     Chain,
 }
+
+impl SpatialMethod {
+    /// The wire's spelling.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Chain => "chain",
+        }
+    }
+}
+
+/// What a load says, once, about how `/v1/decide` will answer `point` and
+/// `box` (GitHub #260, #263): the `ignis.decide.pointing_head` event's
+/// fields, decided here so that every branch is testable without a GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadMethods {
+    /// How a `point` with no `method` is answered: `head_set`, `head`,
+    /// `chain`, or `none` on a load that takes no image.
+    pub point: &'static str,
+    /// The `method`s a `box` accepts: `chain,head`, `chain`, or `none`.
+    pub box_methods: &'static str,
+    /// How a `box` with no `method` is answered.
+    pub box_default: &'static str,
+    /// The sentence the event says it with.
+    pub summary: &'static str,
+}
+
+/// [`LoadMethods`] for a load with `calibration`, with or without vision.
+pub fn load_methods(calibration: Option<ignis_core::pointing::Calibration>, vision: bool) -> LoadMethods {
+    let set = calibration.is_some_and(|calibration| calibration.set.is_some());
+    let box_default = match set {
+        true => BOX_DEFAULT_METHOD.label(),
+        false => SpatialMethod::Chain.label(),
+    };
+    match (vision, calibration, set) {
+        (false, _, _) => LoadMethods {
+            point: "none",
+            box_methods: "none",
+            box_default: "none",
+            summary: "loaded without --vision: `point` and `box` have no image to answer on",
+        },
+        (true, Some(_), true) => LoadMethods {
+            point: "head_set",
+            box_methods: "chain,head",
+            box_default,
+            summary: "`point` answers in one pass off the calibrated head set, anchored on the pointing head; `box` accepts `head`",
+        },
+        (true, Some(_), false) => LoadMethods {
+            point: "head",
+            box_methods: "chain",
+            box_default,
+            summary: "`point` answers in one pass off the calibrated pointing head; no head set, so `box` answers with the chain",
+        },
+        (true, None, _) => LoadMethods {
+            point: "chain",
+            box_methods: "chain",
+            box_default,
+            summary: "no calibrated pointing head for this artifact: `point` and `box` answer with the digit chain",
+        },
+    }
+}
+
+/// How a `box` with no `method` is answered (GitHub #263).
+///
+/// Spec 14 § Acceptance 6 decided it by a rule written before the
+/// measurement: `head` if and only if the head box's IoU >= 0.5 rate is at
+/// least the chain box's on every acceptance set. It was on three of four and
+/// not on 1024 px buttons (43% against 79%: a box spanned on 32 px cells
+/// frames a target under two tokens tall loosely), so the chain
+/// (`docs/findings/2026-09-23-the-head-set-holds-through-decide.md`). `head`
+/// stays the better box for anything larger and at 4096 px, for the asking.
+pub const BOX_DEFAULT_METHOD: SpatialMethod = SpatialMethod::Chain;
 
 /// A question's `criteria`, read in the order it was written.
 ///
@@ -711,25 +789,37 @@ pub struct PreparedQuestion {
     /// Digits per axis for a constrained question, or the **maximum** for a
     /// scalar.
     pub digits: u32,
-    /// The pointing head a `point` is answered from in one pass (GitHub
-    /// #260), or `None` for a point answered by the chain and for every
-    /// other primitive.
+    /// The heads a `point` or a `box` is answered from in one pass (GitHub
+    /// #260, #263) — the pointing head, and the head set where the load has
+    /// one (always, for a box) — or `None` for a question answered by the
+    /// chain and for every other primitive.
     ///
-    /// A head point keeps its `plan`: the prompt is the chain's byte for
-    /// byte — same system text, same forced `{"x":` — so head and chain
-    /// questions over one image share their prefix, and the head's query
-    /// sits inside the answer's scaffold where it was measured. Only the
-    /// schedule goes unused.
-    pub head: Option<ignis_core::pointing::PointingHead>,
+    /// A head question keeps its `plan`, and it is the **point's**: the
+    /// prompt is the chain point's byte for byte — same system text, same
+    /// forced `{"x":` — so head and chain questions over one image share
+    /// their prefix, and the heads' query sits inside the answer's scaffold
+    /// where every head number was measured. A head `box` is read in that
+    /// same pass. Only the schedule goes unused.
+    pub head: Option<ignis_core::pointing::Calibration>,
 }
 
 impl PreparedQuestion {
-    /// How this question is answered, if it is a `point`.
-    pub fn point_method(&self) -> Option<PointMethod> {
-        (self.kind == QuestionKind::Point).then_some(match self.head {
-            Some(_) => PointMethod::Head,
-            None => PointMethod::Chain,
+    /// How this question is answered, if it is a `point` or a `box`.
+    pub fn method(&self) -> Option<SpatialMethod> {
+        self.kind.is_spatial().then_some(match self.head {
+            Some(_) => SpatialMethod::Head,
+            None => SpatialMethod::Chain,
         })
+    }
+
+    /// The primitive whose prompt this question is put under: its own,
+    /// except a head `box` (GitHub #263), which is read in a point's pass —
+    /// the prompt the head set was chosen and measured on.
+    pub fn prompt_kind(&self) -> QuestionKind {
+        match (self.kind, self.head) {
+            (QuestionKind::Box, Some(_)) => QuestionKind::Point,
+            (kind, _) => kind,
+        }
     }
 }
 
@@ -753,15 +843,15 @@ const NOUL_DEFAULT: [(&str, &str); 2] = [("true", "Yes"), ("false", "No")];
 /// than this model can label is refused here rather than served with two
 /// options sharing a logit.
 ///
-/// `pointing` is the load's calibrated pointing head (GitHub #260), `None`
-/// on a load nobody calibrated one for: it is what a `point` with no
-/// `method` is answered from, and what a `point` asking for `head` is
-/// refused without.
+/// `pointing` is the load's calibration (GitHub #260, #263) — its pointing
+/// head, and its head set when it has one — `None` on a load nobody
+/// calibrated: it is what a `point` with no `method` is answered from, and
+/// what a `head` question is refused without.
 pub fn prepare(
     questions: &Ordered<Question>,
     alphabet: &AnswerAlphabet,
     encode: Encoder<'_>,
-    pointing: Option<ignis_core::pointing::PointingHead>,
+    pointing: Option<ignis_core::pointing::Calibration>,
 ) -> Result<Vec<PreparedQuestion>, Refusal> {
     if questions.is_empty() {
         return Err(Refusal::new("no_questions", "`questions` must carry at least one question"));
@@ -789,7 +879,7 @@ fn prepare_one(
     question: &Question,
     alphabet: &AnswerAlphabet,
     encode: Encoder<'_>,
-    pointing: Option<ignis_core::pointing::PointingHead>,
+    pointing: Option<ignis_core::pointing::Calibration>,
 ) -> Result<PreparedQuestion, Refusal> {
     if instructions_are_empty(&question.instructions) {
         return Err(Refusal::new(
@@ -797,11 +887,16 @@ fn prepare_one(
             format!("question {id:?} has empty `instructions`"),
         ));
     }
-    let head = point_head(id, question, pointing)?;
+    let head = head_reading(id, question, pointing)?;
     if question.kind == QuestionKind::Scalar {
         return prepare_scalar(id, question, encode);
     }
     if let Some(layout) = question.kind.layout() {
+        // GitHub #263: a head box is planned as the point it is read in.
+        let layout = match head {
+            Some(_) => crate::numbers::POINT_LAYOUT,
+            None => layout,
+        };
         return prepare_program(id, question, layout, encode)
             .map(|prepared| PreparedQuestion { head, ..prepared });
     }
@@ -857,39 +952,48 @@ fn prepare_one(
     })
 }
 
-/// Resolve a question's `method` (GitHub #260): the pointing head a `point`
-/// is answered from, `None` for a chain point and for every other primitive
-/// — or a refusal, before any prefill.
+/// Resolve a question's `method` (GitHub #260, #263): the calibration a
+/// `point` or a `box` is answered from, `None` for a chain answer and for
+/// every other primitive — or a refusal, before any prefill.
 ///
-/// Omitted, the measured-better method runs: the head when the load has a
-/// calibrated one, the chain otherwise. Asked for by name, the head is
-/// refused on a load without one rather than silently served by the chain
-/// the caller explicitly did not ask for.
-fn point_head(
+/// Omitted, the measured-better method runs: for a `point`, the heads when
+/// the load has a calibration and the chain otherwise; for a `box`,
+/// [`BOX_DEFAULT_METHOD`] where the load has a head set. Asked for by name,
+/// `head` is refused on a load that cannot answer it — a `point` needs a
+/// pointing head, a `box` a head set — rather than silently served by the
+/// chain the caller explicitly did not ask for.
+fn head_reading(
     id: &str,
     question: &Question,
-    pointing: Option<ignis_core::pointing::PointingHead>,
-) -> Result<Option<ignis_core::pointing::PointingHead>, Refusal> {
+    pointing: Option<ignis_core::pointing::Calibration>,
+) -> Result<Option<ignis_core::pointing::Calibration>, Refusal> {
+    let with_set = pointing.filter(|calibration| calibration.set.is_some());
     let Some(method) = question.method.as_deref() else {
-        return Ok(pointing.filter(|_| question.kind == QuestionKind::Point));
+        return Ok(match question.kind {
+            QuestionKind::Point => pointing,
+            QuestionKind::Box => with_set.filter(|_| BOX_DEFAULT_METHOD == SpatialMethod::Head),
+            _ => None,
+        });
     };
-    if question.kind != QuestionKind::Point {
-        let why = match question.kind {
-            QuestionKind::Box => {
-                "a box cannot come out of the pointing head (its region is not a box), so a box is always the chain's"
-            }
-            _ => "`method` chooses how a `point` is answered, and this primitive has one way",
-        };
+    if !question.kind.is_spatial() {
         return Err(Refusal::new(
             "method_unsupported",
             format!(
-                "question {id:?} is a {}: {why}",
+                "question {id:?} is a {}: `method` chooses how a `point` or a `box` is answered, and this primitive has one way",
                 question.kind.primitive().label()
             ),
         ));
     }
     match method {
         "chain" => Ok(None),
+        "head" if question.kind == QuestionKind::Box => with_set.map(Some).ok_or_else(|| {
+            Refusal::new(
+                "pointing_head_unavailable",
+                format!(
+                    "question {id:?} asks for a box with `\"method\": \"head\"`, and the loaded artifact has no calibrated head set to read a box off; ask for \"chain\", or omit `method` to be answered by the chain"
+                ),
+            )
+        }),
         "head" => pointing.map(Some).ok_or_else(|| {
             Refusal::new(
                 "pointing_head_unavailable",
@@ -1231,7 +1335,7 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
             ])
         }
     };
-    let instruction = question.kind.system_text(question.digits);
+    let instruction = question.prompt_kind().system_text(question.digits);
     match state {
         Evidence::Json(value) => {
             // One blank line between the instruction and the evidence: the
@@ -1438,22 +1542,50 @@ pub enum Answer {
     /// rescaling because per-axis normalization on a non-square image is the
     /// mistake everyone makes once.
     ///
-    /// `method` says which answered it (GitHub #260), and the rest follows
-    /// from it:
+    /// `method` says which answered it (GitHub #260, #263), and the rest
+    /// follows from it:
     ///
-    /// - **`head`** — one pass over the calibrated pointing head's attention.
-    ///   `uncertainty` is the map's resolution, one image token per axis, and
-    ///   not a spread. `region` is the cells the point was read from and
-    ///   their `share` of the head's attention over the image: the
-    ///   confidence to act on (it separates hits from misses on the measured
-    ///   scenes), not a calibrated probability. On labelled targets the point
-    ///   sits where the label **begins** (about 30% across a button), not at
-    ///   the target's centre; on unlabelled targets it is unmeasured. No
+    /// - **`head`** — one pass over the calibrated heads' attention.
+    ///   `uncertainty` is the maps' resolution, one image token per axis, and
+    ///   not a spread. `region` is the pointing head's: the cells its point
+    ///   was read from and their `share` of its attention over the image —
+    ///   the confidence to act on (it separates hits from misses on the
+    ///   measured scenes, and a near-flat map, about 0.03, is nothing found),
+    ///   not a calibrated probability. On a load with a **head set** the
+    ///   point is the centre of the object's **`extent`** — the box the set's
+    ///   heads outline around the pointing head's point — and `extent` is
+    ///   that box, `x0`, `y0`, `x1`, `y1` in pixels of the submitted image.
+    ///   On a load with the pointing head alone there is no `extent`, and the
+    ///   point sits on the part of the object that head reads — where a
+    ///   button's label begins, a large object's bottom-right corner. No
     ///   `digits`.
     /// - **`chain`** — the digit chain: `uncertainty` from the digits'
     ///   distributions, and `digits` the trace it came from.
     Point {
-        method: PointMethod,
+        method: SpatialMethod,
+        pixels: BTreeMap<String, i64>,
+        normalized: BTreeMap<String, u64>,
+        uncertainty: BTreeMap<String, f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<HeadRegion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extent: Option<BTreeMap<String, i64>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digits: Option<BTreeMap<String, Vec<crate::numbers::DigitDraw>>>,
+    },
+    /// A bounding box on the submitted image: [`Answer::Point`]'s shape over
+    /// `x0`, `y0`, `x1`, `y1`, with the `method` that produced it (GitHub
+    /// #263).
+    ///
+    /// - **`head`** — the head set's **extent**, read in one pass, in the
+    ///   same pixels and on the same 0-`scale` normalization as the chain's.
+    ///   `uncertainty` is one image token per edge (a token's width for `x0`
+    ///   and `x1`, its height for `y0` and `y1`), `region` the pointing
+    ///   head's, and no `digits`.
+    /// - **`chain`** — the digit chain, with its `digits` trace.
+    #[serde(rename = "box")]
+    Box {
+        method: SpatialMethod,
         pixels: BTreeMap<String, i64>,
         normalized: BTreeMap<String, u64>,
         uncertainty: BTreeMap<String, f64>,
@@ -1461,15 +1593,6 @@ pub enum Answer {
         region: Option<HeadRegion>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         digits: Option<BTreeMap<String, Vec<crate::numbers::DigitDraw>>>,
-    },
-    /// A bounding box on the submitted image: [`Answer::Point`]'s shape over
-    /// `x0`, `y0`, `x1`, `y1`.
-    #[serde(rename = "box")]
-    Box {
-        pixels: BTreeMap<String, i64>,
-        normalized: BTreeMap<String, u64>,
-        uncertainty: BTreeMap<String, f64>,
-        digits: BTreeMap<String, Vec<crate::numbers::DigitDraw>>,
     },
     /// This question alone failed at *runtime*, after the GPU was already
     /// spent on its siblings (spec 04).
@@ -1495,46 +1618,123 @@ pub struct HeadRegion {
     pub share: f64,
 }
 
-/// Shape a head point's **attention readout** into its answer (GitHub #260).
+/// Shape a head question's **attention readout** into its answer (GitHub
+/// #260, #263).
 ///
 /// `grid` is the image's merged token grid, `(rows, cols)`; `pixels` the
-/// submitted image's `(width, height)`. The point maps to each through its
-/// own side on each axis, which is the processor's own scale: it resizes the
-/// whole image onto the grid.
+/// submitted image's `(width, height)`. A point or a box maps to each through
+/// its own side on each axis, which is the processor's own scale: it resizes
+/// the whole image onto the grid.
+///
+/// With the head set's argmax beside the pointing head's scores, a `point`
+/// is the anchored reading's centre with its `extent`, and a `box` is the
+/// extent ([`ignis_core::pointing::read_anchored`]); without it, a `point` is
+/// the pointing head's own reading (spec 13). A question that was asked with
+/// a set and came back without one — or a box with none — is malformed, not
+/// answered by half the reading.
 pub fn head_answer_for(
     question: &PreparedQuestion,
-    scores: &[f32],
+    attention: &ignis_core::pointing::AttentionScores,
     grid: (usize, usize),
     pixels: (u32, u32),
 ) -> Answer {
-    let Some(reading) = ignis_core::pointing::read_head_map(scores, grid.0, grid.1) else {
-        return failed(
+    let scores = &attention.scores;
+    let malformed = || {
+        failed(
             "attention_malformed",
             format!(
-                "the pointing head's map carried {} scores for a {}x{} image grid, or a score that is not finite",
+                "the heads' readout carried {} scores for a {}x{} image grid, a score that is not finite, or a head set that is not the one asked for",
                 scores.len(),
                 grid.0,
                 grid.1
             ),
-        );
+        )
+    };
+    let Some(reading) = ignis_core::pointing::read_head_map(scores, grid.0, grid.1) else {
+        return malformed();
     };
     let (width, height) = pixels;
-    let (x, y) = reading.pixels(width, height);
     let (cell_w, cell_h) = reading.cell_pixels(width, height);
-    let (nx, ny) = reading.normalized(crate::numbers::scale(question.digits));
-    fn axes<T>(x: T, y: T) -> BTreeMap<String, T> {
-        BTreeMap::from([("x".to_owned(), x), ("y".to_owned(), y)])
+    let scale = crate::numbers::scale(question.digits);
+    let region = Some(HeadRegion {
+        cells: u32::try_from(reading.cells).unwrap_or(u32::MAX),
+        share: reading.share,
+    });
+    let asked_set = question.head.is_some_and(|calibration| calibration.set.is_some());
+    let anchored = match (&attention.set_argmax, asked_set) {
+        (Some(argmax), true) => {
+            match ignis_core::pointing::read_anchored(scores, argmax, grid.0, grid.1, width, height) {
+                Some(anchored) => Some(anchored),
+                None => return malformed(),
+            }
+        }
+        (None, false) => None,
+        _ => return malformed(),
+    };
+    let on_scale = |value: f64, side: u32| {
+        ((value / f64::from(side)) * scale as f64).round().clamp(0.0, scale as f64) as u64
+    };
+    let in_pixels = |value: f64, side: u32| value.round().clamp(0.0, f64::from(side)) as i64;
+    fn axes<T>(pairs: [(&str, T); 2]) -> BTreeMap<String, T> {
+        pairs.into_iter().map(|(axis, value)| (axis.to_owned(), value)).collect()
     }
-    Answer::Point {
-        method: PointMethod::Head,
-        pixels: axes(x.round() as i64, y.round() as i64),
-        normalized: axes(nx, ny),
-        uncertainty: axes(cell_w, cell_h),
-        region: Some(HeadRegion {
-            cells: u32::try_from(reading.cells).unwrap_or(u32::MAX),
-            share: reading.share,
-        }),
-        digits: None,
+    fn corners<T>(values: [T; 4]) -> BTreeMap<String, T> {
+        ["x0", "y0", "x1", "y1"].into_iter().map(str::to_owned).zip(values).collect()
+    }
+    match (question.kind, anchored) {
+        (QuestionKind::Box, Some(anchored)) => {
+            let e = anchored.extent;
+            Answer::Box {
+                method: SpatialMethod::Head,
+                pixels: corners([
+                    in_pixels(e.x0, width),
+                    in_pixels(e.y0, height),
+                    in_pixels(e.x1, width),
+                    in_pixels(e.y1, height),
+                ]),
+                normalized: corners([
+                    on_scale(e.x0, width),
+                    on_scale(e.y0, height),
+                    on_scale(e.x1, width),
+                    on_scale(e.y1, height),
+                ]),
+                uncertainty: corners([cell_w, cell_h, cell_w, cell_h]),
+                region,
+                digits: None,
+            }
+        }
+        (QuestionKind::Box, None) => malformed(),
+        (_, Some(anchored)) => {
+            let e = anchored.extent;
+            let (x, y) = anchored.point();
+            Answer::Point {
+                method: SpatialMethod::Head,
+                pixels: axes([("x", in_pixels(x, width)), ("y", in_pixels(y, height))]),
+                normalized: axes([("x", on_scale(x, width)), ("y", on_scale(y, height))]),
+                uncertainty: axes([("x", cell_w), ("y", cell_h)]),
+                region,
+                extent: Some(corners([
+                    in_pixels(e.x0, width),
+                    in_pixels(e.y0, height),
+                    in_pixels(e.x1, width),
+                    in_pixels(e.y1, height),
+                ])),
+                digits: None,
+            }
+        }
+        (_, None) => {
+            let (x, y) = reading.pixels(width, height);
+            let (nx, ny) = reading.normalized(scale);
+            Answer::Point {
+                method: SpatialMethod::Head,
+                pixels: axes([("x", x.round() as i64), ("y", y.round() as i64)]),
+                normalized: axes([("x", nx), ("y", ny)]),
+                uncertainty: axes([("x", cell_w), ("y", cell_h)]),
+                region,
+                extent: None,
+                digits: None,
+            }
+        }
     }
 }
 
@@ -1638,17 +1838,20 @@ pub fn constrained_answer_for(
     }
     match question.kind {
         QuestionKind::Box => Answer::Box {
-            pixels: in_pixels,
-            normalized,
-            uncertainty,
-            digits,
-        },
-        _ => Answer::Point {
-            method: PointMethod::Chain,
+            method: SpatialMethod::Chain,
             pixels: in_pixels,
             normalized,
             uncertainty,
             region: None,
+            digits: Some(digits),
+        },
+        _ => Answer::Point {
+            method: SpatialMethod::Chain,
+            pixels: in_pixels,
+            normalized,
+            uncertainty,
+            region: None,
+            extent: None,
             digits: Some(digits),
         },
     }
@@ -1772,7 +1975,9 @@ pub fn score_confidence(probabilities: &[f64]) -> f64 {
 
 Seven primitives. Read at one position: `noul` (yes/no, answered with the probability of yes), `choice` (one option from a declared set, with the distribution over all of them) and `score` (a probability-weighted value across ordered levels, which can land between them). Generated a digit at a time under a constrained decode: `number`, `point` and `box` -- the last two in the submitted image's own pixels -- and `scalar`, which closes its own object as soon as the number is complete, so `digits` is a ceiling the caller can leave out and the answer may have a decimal part.
 
-A `point` is answered **in one pass** by default (ADR 0038): the prefill that forces its `{\"x\":` reads the loaded artifact's calibrated pointing head over the image and the server turns that map into a point, with no decode round (`method: head`). Its `uncertainty` is one image token per axis, its `region.share` is the confidence to act on, and on a labelled target it sits where the label begins rather than at the target's centre. `\"method\": \"chain\"` asks for the digit chain instead -- finer than one token, with a per-digit trace -- and a load with no calibrated head answers every `point` by chain. Every point answer names its `method`.
+A `point` is answered **in one pass** by default (ADR 0038, ADR 0039): the prefill that forces its `{\"x\":` reads the loaded artifact's calibrated heads over the image and the server turns their maps into an answer, with no decode round (`method: head`). The pointing head names which object -- its `region.share` is the confidence to act on, and a near-flat map (about 0.03) is nothing found -- and the head set outlines it: the point is the centre of the object's `extent`, which the answer carries as `x0`, `y0`, `x1`, `y1` in pixels of the submitted image. Its `uncertainty` is one image token per axis. A load calibrated with the pointing head alone answers without `extent`, at the part of the object that head reads. `\"method\": \"chain\"` asks for the digit chain instead -- finer than one token, with a per-digit trace -- and a load with no calibrated head answers every `point` by chain.
+
+A `box` answers with the digit chain unless it asks for `\"method\": \"head\"`: the same extent, read in the same one pass, in the same pixels and 0-999 scale as the chain's, with one image token of `uncertainty` per edge and no `digits`. A load without a head set refuses a head `box`. Every point and box answer names its `method`.
 
 Every fault a caller can commit refuses the whole request with a 422 before the first submit: a caller never pays a prefill for nineteen good questions and a refusal on the twentieth. Only an engine fault lands per-answer, as an `error` answer beside its siblings.
 
@@ -1783,7 +1988,7 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
     responses(
         (status = 200, description = "One answer per question, under the ids the caller chose.", body = DecideResponse),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
-        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point`, `head` on a load with no calibrated pointing head). Nothing reached the engine.",
+        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set). Nothing reached the engine.",
             body = crate::api::ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted.", body = crate::api::ApiError),
     ),
@@ -1825,7 +2030,7 @@ async fn serve(
     // #242). A load with no real tokenizer answers `None` and the question
     // is refused, rather than forcing ids this server invented.
     let encode = |text: &str| server.template.encode_literal(text);
-    let prepared = prepare(&request.questions, &server.alphabet, &encode, server.pointing_head)?;
+    let prepared = prepare(&request.questions, &server.alphabet, &encode, server.calibration)?;
     let evidence = Evidence::read(&request.state);
     // An image `state` on a load that cannot take images is a refusal, not
     // an error in an answer slot: the request was never servable, and it is
@@ -1988,9 +2193,11 @@ fn generated(prepared: &[PreparedQuestion], answers: &BTreeMap<String, Answer>) 
                 let written = text.chars().count();
                 written + usize::from(written < plan.schedule.len())
             }),
-            // GitHub #260: a head point is answered by its prefill and
-            // generates nothing, however long the chain's schedule would be.
-            Some(Answer::Point { method: PointMethod::Head, .. }) => None,
+            // GitHub #260, #263: a head point or box is answered by its
+            // prefill and generates nothing, however long the chain's
+            // schedule would be.
+            Some(Answer::Point { method: SpatialMethod::Head, .. })
+            | Some(Answer::Box { method: SpatialMethod::Head, .. }) => None,
             _ => question.plan.as_ref().map(|plan| plan.schedule.len()),
         })
         .fold(0u32, |total, tokens| {
@@ -2102,13 +2309,13 @@ struct Rendered {
     model: String,
     prompt_tokens: u32,
     media: Option<crate::media::MediaStats>,
-    /// A head point's image grid, `(rows, cols)` of merged tokens (GitHub
+    /// A head question's image grid, `(rows, cols)` of merged tokens (GitHub
     /// #260), and `None` for every other question.
     grid: Option<(usize, usize)>,
     /// The answer a question already has without being submitted — a head
-    /// point with no image to point on, or one whose image is not a grid the
-    /// region rule can read (GitHub #260). `None` for every question the
-    /// engine is asked.
+    /// question with no image to read, or one whose image is not a grid the
+    /// heads' maps can be read over (GitHub #260). `None` for every question
+    /// the engine is asked.
     answered: Option<Answer>,
 }
 
@@ -2194,14 +2401,14 @@ async fn render(
             }
             match question.head {
                 None => input.constrained = Some(std::sync::Arc::new(schedule)),
-                // GitHub #260: a head point is the chain's prompt, forced
-                // opening and all, read at its last position instead of
-                // decoded from: a decision over the pointing head's
-                // attention across the image's placeholder span.
-                Some(head) => {
-                    // An image the head cannot point on is answered here, and
+                // GitHub #260, #263: a head question is the chain point's
+                // prompt, forced opening and all, read at its last position
+                // instead of decoded from: a decision over the calibrated
+                // heads' attention across the image's placeholder span.
+                Some(calibration) => {
+                    // An image the heads cannot read is answered here, and
                     // nothing is submitted for it.
-                    let (grid, answered) = match head_query(&input, head) {
+                    let (grid, answered) = match head_query(&input, calibration) {
                         Ok((query, grid)) => {
                             input.decision = Some(ignis_core::DecisionRead::Attention(query));
                             (Some(grid), None)
@@ -2216,19 +2423,22 @@ async fn render(
     Ok(Rendered { input, model, prompt_tokens, media, grid: None, answered: None })
 }
 
-/// The attention readout a head point asks for over `input`'s image, and
+/// The attention readout a head question asks for over `input`'s image, and
 /// that image's merged token grid `(rows, cols)` (GitHub #260) — or the
 /// answer it gets instead: `state_carries_no_image` when there is no image,
 /// the chain's own failure for the same state, and `image_not_a_grid` when
 /// the item's placeholders are not one frame's merged grid, row by row, which
-/// is the only map the region rule reads.
+/// is the only map the heads are read over.
+///
+/// With a head set (GitHub #263) the readout names it too, with that grid's
+/// fallback cells as the keys its argmax skips.
 ///
 /// The **first** image, as the chain's pixels are the first image's: a
 /// `point` answers about the submitted image, and a multi-image state is
 /// outside what either method was measured on.
 fn head_query(
     input: &ignis_core::types::RequestInput,
-    head: ignis_core::pointing::PointingHead,
+    calibration: ignis_core::pointing::Calibration,
 ) -> Result<(ignis_core::pointing::AttentionQuery, (usize, usize)), Answer> {
     let item = input
         .multimodal
@@ -2240,12 +2450,21 @@ fn head_query(
     let span = (u32::try_from(item.token_span.begin), u32::try_from(item.token_span.count));
     match span {
         (Ok(key_begin), Ok(key_count)) if item.grid.t == 1 && rows * cols == item.token_span.count => {
-            Ok((ignis_core::pointing::AttentionQuery { head, key_begin, key_count }, (rows, cols)))
+            let set = calibration
+                .set
+                .map(|set| ignis_core::pointing::SetQuery::for_grid(set, rows as u32, cols as u32));
+            let query = ignis_core::pointing::AttentionQuery {
+                head: calibration.head,
+                key_begin,
+                key_count,
+                set,
+            };
+            Ok((query, (rows, cols)))
         }
         _ => Err(failed(
             "image_not_a_grid",
             format!(
-                "the image's {} placeholders are not one frame's {rows}x{cols} merged grid, so the pointing head's map cannot be read over it",
+                "the image's {} placeholders are not one frame's {rows}x{cols} merged grid, so the heads' maps cannot be read over it",
                 item.token_span.count
             ),
         )),
@@ -2264,7 +2483,7 @@ async fn ask(
     mut ready: Rendered,
     class: ignis_core::types::RequestClass,
 ) -> Attempt {
-    // GitHub #260: a head point over a state with no image fails as the
+    // GitHub #260: a head question over a state with no image fails as the
     // chain's does, and costs nothing — there is no span to read.
     if let Some(answer) = ready.answered.take() {
         return Attempt::Answered(answer);
@@ -2286,20 +2505,22 @@ async fn ask(
     // The engine keeps working on a request whose caller has gone until it
     // is told otherwise, and a fan-out is twenty of them.
     let mut guard = crate::api::CancelOnDrop::new(server.engine.clone(), id);
-    // GitHub #260: a head point's completion carries the attention readout.
+    // GitHub #260, #263: a head question's completion carries the attention
+    // readout.
     if let (Some(_), Some(grid)) = (question.head, ready.grid) {
         let pixels = ready.media.and_then(|stats| stats.source_pixels);
         return Attempt::Answered(
             match crate::engine::collect_attention(&mut events, server.request_timeout).await {
-                Ok(Some(scores)) => {
+                Ok(Some(attention)) => {
                     guard.completed();
                     if let Some(metrics) = &server.metrics {
-                        // A `point` like the chain's (spec 13 leaves a
-                        // `method` label to ADR 0017), with no answer mass.
+                        // A `point` or a `box` like the chain's (specs 13 and
+                        // 14 leave a `method` label to ADR 0017), with no
+                        // answer mass.
                         metrics.record_decision(question.kind.primitive(), None);
                     }
                     match pixels {
-                        Some(pixels) => head_answer_for(question, &scores, grid, pixels),
+                        Some(pixels) => head_answer_for(question, &attention, grid, pixels),
                         None => no_image(),
                     }
                 }
@@ -2307,7 +2528,7 @@ async fn ask(
                     guard.completed();
                     failed(
                         "attention_unread",
-                        "the engine finished this question without the pointing head's attention over the image: the keys were not where the layer's attention materialized them, or the prefill itself failed".to_owned(),
+                        "the engine finished this question without the heads' attention over the image: the keys were not where an armed layer's attention materialized them, or the prefill itself failed".to_owned(),
                     )
                 }
                 Err(_) => failed(
@@ -2376,7 +2597,7 @@ enum Attempt {
 fn no_image() -> Answer {
     failed(
         "state_carries_no_image",
-        "a point is a position on an image, and this `state` carried none".to_owned(),
+        "a point or a box is a place on an image, and this `state` carried none".to_owned(),
     )
 }
 

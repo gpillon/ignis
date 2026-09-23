@@ -23,6 +23,7 @@
 #include "ignis_model.h"
 #include "ignis_step.h"
 
+#include "attention_readout.h"
 #include "layer_internal.h"
 #include "model_internal.h"
 
@@ -1144,7 +1145,13 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     // per key, and an image holds at most the envelope's tokens. Only a
     // vision load can be asked one (the span is an image's), so a text load
     // reserves nothing for it.
-    sizes.attention_readout = fp32_bytes(tokens);
+    //
+    // GitHub #263 (ADR 0039): and beside them the head set's results, one
+    // packed (score, key) per head, reserved for the largest set a readout
+    // may name -- under 4 KB.
+    sizes.attention_readout =
+        fp32_bytes(tokens) +
+        round_up_arena_align(static_cast<std::size_t>(kReadoutMaxSetHeads) * sizeof(unsigned long long));
     sizes.vision_workspace =
         ignis_vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
     sizes.media_embedding =

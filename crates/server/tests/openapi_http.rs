@@ -156,15 +156,16 @@ fn the_decision_endpoint_carries_its_question_kinds() {
     assert!(document["components"]["schemas"]["DecideResponse"].is_object());
 }
 
-/// GitHub #260 (ADR 0036): a `point`'s `method` and the head answer's
-/// fields are part of the contract, readable without the source.
+/// GitHub #260, #263 (ADR 0036): a `point`'s and a `box`'s `method`, the
+/// head answer's fields and the head set's `extent` are part of the
+/// contract, readable without the source.
 #[test]
-fn the_decision_endpoint_documents_how_a_point_is_answered() {
+fn the_decision_endpoint_documents_how_a_point_and_a_box_are_answered() {
     let document = document();
     let schemas = &document["components"]["schemas"];
-    let method = schemas["PointMethod"].to_string();
+    let method = schemas["SpatialMethod"].to_string();
     for value in ["head", "chain"] {
-        assert!(method.contains(value), "PointMethod must name {value}: {method}");
+        assert!(method.contains(value), "SpatialMethod must name {value}: {method}");
     }
     assert!(
         schemas["Question"]["properties"]["method"].is_object(),
@@ -172,9 +173,20 @@ fn the_decision_endpoint_documents_how_a_point_is_answered() {
         schemas["Question"]
     );
     let answer = schemas["Answer"].to_string();
-    for field in ["method", "region", "HeadRegion"] {
+    for field in ["method", "region", "HeadRegion", "extent"] {
         assert!(answer.contains(field), "the point answer documents `{field}`: {answer}");
     }
+    // The box variant carries `method` and the head box's `region` too.
+    let variants = schemas["Answer"]["oneOf"].as_array().expect("Answer is a tagged union");
+    let boxed = variants
+        .iter()
+        .find(|variant| variant.to_string().contains(r#""enum":["box"]"#))
+        .expect("a box variant");
+    for field in ["method", "region", "digits", "pixels"] {
+        assert!(boxed["properties"][field].is_object(), "the box answer documents `{field}`: {boxed}");
+    }
+    let required = boxed["required"].to_string();
+    assert!(!required.contains("digits"), "a head box has no digits: {required}");
     let region = schemas["HeadRegion"].to_string();
     for field in ["cells", "share"] {
         assert!(region.contains(field), "HeadRegion documents `{field}`: {region}");

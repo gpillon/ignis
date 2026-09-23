@@ -216,6 +216,24 @@ struct ignis_prefill_options {
   int64_t attention_key_count;
   float *out_attention_scores;
   int32_t *out_attention_read;
+  /* GitHub #263 (ADR 0039): the head set read beside the attention readout,
+   * or none when `attention_set_count` is 0 -- and then the readout arms its
+   * one layer and launches what it launched before. Head `i` is query head
+   * `attention_set_query_heads[i]` of GQA layer
+   * `attention_set_gqa_ordinals[i]` (at most 384 heads); each GQA layer
+   * holding one, and the readout's own, is armed and read the same way, in
+   * one fused launch per layer. Head `i`'s argmax key over the span, skipping
+   * the `attention_excluded_count` span-relative keys of
+   * `attention_excluded` (at most 32; the fallback cells), lands in
+   * `out_attention_set_argmax[i]` (host, span-relative, the larger index on a
+   * tie). `*out_attention_read` is 1 only when every armed layer read: a
+   * partial set is never reported. Needs the readout itself armed. */
+  uint32_t attention_set_count;
+  const int32_t *attention_set_gqa_ordinals;
+  const int32_t *attention_set_query_heads;
+  uint32_t attention_excluded_count;
+  const int32_t *attention_excluded;
+  int32_t *out_attention_set_argmax;
 };
 
 /* The media encode step (GitHub #178): one media item's BF16 patch rows plus

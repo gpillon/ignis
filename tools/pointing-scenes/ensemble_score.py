@@ -11,6 +11,9 @@ Needs NumPy.
   score   read every scene of a dump with the anchored ensemble, beside the anchor
           alone (the spec 13 point) and the chain the harness also ran:
           ensemble_score.py score <dump.json> <scene dir> --heads heads.json [--out per-scene.json]
+  golden  write golden cases for the host rule's port (crates/core/tests/anchored_reading.rs):
+          ensemble_score.py golden --heads heads.json --case <dump.json> <scene dir> <index> ...
+                                   --out anchored_reading.json
 
 `read_anchored` below is the reading rule spec 14 ships, and the reference its
 host implementation is held to.
@@ -218,9 +221,42 @@ def score(args):
         Path(args.out).write_text(json.dumps(per, indent=1))
 
 
+def golden(args):
+    """Golden cases for the host rule (crates/core/tests/anchored_reading.rs): per case the
+    anchor's scores, the set's argmax over the span minus the fallback cells, the grid and the
+    image size in; `read_anchored`'s anchor, point and extent out."""
+    cfg = json.loads(Path(args.heads).read_text())
+    cases = []
+    for dump, scene_dir, index in args.case:
+        meta, S = load(dump)
+        man = json.loads((Path(scene_dir) / "manifest.json").read_text())
+        by_id = {s["id"]: s for s in man["scenes"]}
+        rows, cols = meta["grid"]
+        layers = meta["layers"]
+        excluded = set(cfg["fallback_cells"].get(f"{rows}x{cols}", [])) | {0, rows * cols - 1}
+        n = int(index)
+        row = meta["rows"][n]
+        w, h = scene_size(by_id[row["id"]], man["side"])
+        al, ah = cfg["anchor"]
+        anchor_scores = S[n, layers.index(al), ah]
+        argmax = [argmax_excluding(S[n, layers.index(l), q], excluded) for l, q in cfg["heads"]]
+        anchor, point, extent = read_anchored(anchor_scores, argmax, rows, cols, w, h)
+        cases.append({"name": f"{meta['set']}/{row['id']}", "rows": rows, "cols": cols, "width": w, "height": h,
+                      "excluded": sorted(excluded), "anchor_scores": [float(s) for s in anchor_scores],
+                      "set_argmax": argmax, "anchor": list(anchor), "point": list(point), "extent": list(extent)})
+    Path(args.out).write_text(json.dumps({"source": "tools/pointing-scenes/ensemble_score.py golden",
+                                          "heads": Path(args.heads).name, "cases": cases}))
+    print(f"{len(cases)} golden cases -> {args.out}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("golden")
+    g.add_argument("--heads", required=True)
+    g.add_argument("--case", nargs=3, action="append", required=True, metavar=("DUMP", "SCENES", "INDEX"))
+    g.add_argument("--out", required=True)
+    g.set_defaults(fn=golden)
     s = sub.add_parser("select")
     s.add_argument("--distractors", nargs=2, required=True, metavar=("DUMP", "SCENES"))
     s.add_argument("--blanks", nargs=2, metavar=("DUMP", "SCENES"))

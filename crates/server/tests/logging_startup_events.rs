@@ -244,6 +244,9 @@ fn the_load_says_which_method_point_will_use() {
     let method = find(&records, "ignis.decide.pointing_head");
     assert_eq!(method["severity_text"], "INFO");
     assert_eq!(method["attributes"]["point_method"], "none", "{method}");
+    // GitHub #263: and whether a box can be asked for `head` — no image, no
+    // box either way.
+    assert_eq!(method["attributes"]["box_methods"], "none", "{method}");
     assert!(method["attributes"]["artifact"].as_str().is_some(), "{method}");
 }
 

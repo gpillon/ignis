@@ -3051,7 +3051,8 @@ impl Scheduler for ConcreteScheduler {
                     attention: r
                         .input
                         .attention()
-                        .filter(|_| start + take >= r.input.tokens.len() as u32),
+                        .filter(|_| start + take >= r.input.tokens.len() as u32)
+                        .cloned(),
                 }
             })
             .collect();

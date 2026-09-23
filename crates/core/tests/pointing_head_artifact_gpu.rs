@@ -9,6 +9,11 @@
 //! table were keyed loosely. The table is keyed by the full hash; this test
 //! is what notices the served artifact moving under it.
 //!
+//! Since spec 14 (GitHub #263) the table also carries the served artifact's
+//! **head set**, keyed the same way, and this test holds it too: a load that
+//! found its pointing head but not its set would quietly answer `point` with
+//! spec 13's reading and refuse every head `box`.
+//!
 //! It touches no GPU — the hash is of the container's declared structure —
 //! but it lives in the explicit GPU profile with the artifact it reads
 //! (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1` a missing artifact
@@ -18,7 +23,7 @@ use std::path::Path;
 
 use ignis_artifact::Reader;
 use ignis_core::gpu_profile;
-use ignis_core::pointing::{PointingHead, calibrated_artifacts, calibrated_head};
+use ignis_core::pointing::{PointingHead, calibrated_artifacts, calibrated_head, calibration};
 use ignis_core::ArtifactHash;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -55,6 +60,18 @@ fn the_served_artifact_has_a_calibrated_pointing_head() {
         },
         "the served artifact's head is the one the findings chose, L39.h10"
     );
+    let set = calibration(hash).and_then(|calibration| calibration.set).unwrap_or_else(|| {
+        panic!(
+            "the served artifact {ARTIFACT} (content hash {}) has a pointing head but no head set, \
+             so `/v1/decide` would answer `point` off the pointing head alone and refuse every \
+             head `box`. Recalibrate the set: tools/pointing-scenes/README.md, \"Recalibrating the \
+             head set\" (rectangles.py distractor and blank sets, the attention-head harness with \
+             every GQA layer armed, `ensemble_score.py select`, the set and its fallback cells into \
+             crates/core/src/pointing.rs beside the head, and spec 14's acceptance re-run).",
+            hex(hash.as_bytes())
+        )
+    });
+    assert_eq!(set.heads.len(), 96, "the served set is the 96 heads spec 14 records");
 }
 
 fn hex(bytes: &[u8; 32]) -> String {

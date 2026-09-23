@@ -568,7 +568,7 @@ pub async fn collect_readout(
 pub async fn collect_attention(
     rx: &mut EventStream,
     timeout: Duration,
-) -> Result<Option<Arc<[f32]>>, CollectError> {
+) -> Result<Option<ignis_core::pointing::AttentionScores>, CollectError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {

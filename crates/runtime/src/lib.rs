@@ -258,21 +258,36 @@ pub struct SpanMedia<'a, M> {
 /// question is failed above it rather than answered from anything else.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionRead {
-    /// What to read: the layer, the query head, the span of keys.
+    /// What to read: the layer, the query head, the span of keys, and the
+    /// head set when it names one (GitHub #263).
     pub query: ignis_core::pointing::AttentionQuery,
     /// One pre-softmax score per key of the span, in order.
     pub scores: Vec<f32>,
-    /// Whether the leaf wrote `scores` from the keys attention read.
+    /// One argmax key index per head of the query's set, in the set's
+    /// order; empty when it names none.
+    pub set_argmax: Vec<u32>,
+    /// Whether the leaf wrote `scores` and `set_argmax` from the keys every
+    /// armed layer's attention read.
     pub read: bool,
 }
 
 impl AttentionRead {
-    /// An unread readout for `query`, its scores zeroed.
-    pub fn new(query: ignis_core::pointing::AttentionQuery) -> Self {
+    /// An unread readout for `query`, its scores and argmax zeroed.
+    pub fn new(query: &ignis_core::pointing::AttentionQuery) -> Self {
         Self {
-            query,
             scores: vec![0.0; query.key_count as usize],
+            set_argmax: vec![0; query.set.as_ref().map_or(0, |set| set.heads.len())],
+            query: query.clone(),
             read: false,
+        }
+    }
+
+    /// What crosses the `Compute` seam once the leaf has read: the scores,
+    /// and the set's argmax when the query named a set.
+    pub fn into_scores(self) -> ignis_core::pointing::AttentionScores {
+        ignis_core::pointing::AttentionScores {
+            set_argmax: self.query.set.is_some().then(|| self.set_argmax.into()),
+            scores: self.scores.into(),
         }
     }
 }
@@ -1159,7 +1174,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     .map(|_| vec![0f32; self.model.leaf.vocab(self.model.handle()) as usize]);
                 // GitHub #260: the attention readout's score slots, likewise
                 // only for a job that asked — one f32 per key of its span.
-                let mut attention = job.attention.map(AttentionRead::new);
+                let mut attention = job.attention.as_ref().map(AttentionRead::new);
                 if attention.is_some() && job.multimodal.is_none() {
                     // hotpath-lint-allow: failure-only path (the batch returns `Err` on the next line), reviewed exception (GitHub #260).
                     tracing::error!(
@@ -1217,7 +1232,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 // itself stands, and the scheduler fails the question.
                 if let Some(read) = attention {
                     match read.read {
-                        true => outcomes[index].attention = Some(read.scores.into()),
+                        true => outcomes[index].attention = Some(read.into_scores()),
                         false => {
                             // hotpath-lint-allow: failure-only path (a head point the leaf could not read), reviewed exception (GitHub #260).
                             tracing::error!(

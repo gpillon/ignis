@@ -61,7 +61,7 @@ pub struct Request {
     /// (GitHub #260, ADR 0038), held the same way and for the same reason as
     /// [`Request::readout`]: from the chunk that read it to the completion
     /// that reports it.
-    pub attention: Option<std::sync::Arc<[f32]>>,
+    pub attention: Option<crate::pointing::AttentionScores>,
     /// The **trace** a **constrained decode** has built so far (GitHub #242): one draw
     /// per token it has emitted, in order, each with the probability it held
     /// inside its own step's permitted set.

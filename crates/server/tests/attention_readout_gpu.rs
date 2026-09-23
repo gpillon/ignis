@@ -1,5 +1,13 @@
-//! Spec 13 acceptance 1 (GitHub #260, ADR 0038): **the leaf's scores are the
-//! attention's.**
+//! Spec 13 acceptance 1 (GitHub #260, ADR 0038) and spec 14 acceptance 1
+//! (GitHub #263, ADR 0039): **the leaf's reads are the attention's.**
+//!
+//! Each head point here names the served calibration's **head set** too, as
+//! `/v1/decide` does: 96 heads over nine armed GQA layers, the tap armed on
+//! every one of them. For every head of the set the leaf's device argmax must
+//! be the argmax of the tap's host-side `q . k / 16` over the span minus the
+//! fallback cells — a different key only where the two scores tie to float
+//! accumulation — and the pointing head's row, now written in the fused
+//! launch, must still equal the tap's.
 //!
 //! The attention readout is production code: the scheduler asks for it on a
 //! head point's last chunk, `RuntimeCompute` hands it to the leaf, and the
@@ -36,7 +44,7 @@ use std::sync::Arc;
 
 use ignis_artifact::{ChatMessage, ChatRenderOptions, ContentPart, FrontendSet, MessageContent, Reader, Role};
 use ignis_core::attn_tap::{with_attn_tap, with_attn_tap_hq};
-use ignis_core::pointing::{AttentionQuery, PointingHead, read_head_map};
+use ignis_core::pointing::{AttentionQuery, PointingHead, SetQuery, calibrated_artifacts, calibration, read_head_map};
 use ignis_core::types::{DecodeParams, RequestClass, RequestInput, SchedEvent};
 use ignis_core::vision::Multimodal;
 use ignis_core::{ConcreteScheduler, DecisionRead, KvFormat, Scheduler, Vision, gpu_profile};
@@ -171,6 +179,12 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
         let (rows, cols) = ((item.grid.h / 2) as usize, (item.grid.w / 2) as usize);
         assert_eq!(rows * cols, count, "{label}: the span is the merged grid");
         let query_position = tokens.len() - 1;
+        let set = calibrated_artifacts()
+            .next()
+            .and_then(calibration)
+            .and_then(|calibration| calibration.set)
+            .expect("the served calibration has a head set");
+        let set_query = SetQuery::for_grid(set, rows as u32, cols as u32);
         let input = RequestInput {
             model: MODEL.into(),
             tokens: tokens.clone(),
@@ -183,6 +197,7 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
                 head: HEAD,
                 key_begin: begin as u32,
                 key_count: count as u32,
+                set: Some(set_query.clone()),
             })),
             constrained: None,
         };
@@ -203,7 +218,13 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
                 assert!(ticks < 10_000, "the head point never finished");
             }
         };
-        let ordinals = [HEAD.gqa_ordinal as i32];
+        // Every armed layer: the pointing head's and each holding a head of
+        // the set.
+        let mut ordinals: Vec<i32> = set.heads.iter().map(|head| head.gqa_ordinal as i32).collect();
+        ordinals.push(HEAD.gqa_ordinal as i32);
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        let layer_of = |ordinal: u32| ordinals.iter().position(|&o| o == ordinal as i32).expect("armed");
         let queries = [query_position as i64];
         let max_positions = tokens.len() as i64 + 8;
         let ((attention, reason), capture) = match hq {
@@ -214,18 +235,51 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
         let leaf = attention.unwrap_or_else(|| panic!("{label}: the leaf read no scores ({reason:?})"));
         assert_eq!(capture.queries_seen, vec![1], "{label}: the tap saw the query row");
         if hq {
-            assert_eq!(
-                capture.consumed_rows[0],
-                tokens.len() as i64,
-                "{label}: the tap captured the keys the prompt route consumed"
-            );
+            for layer in 0..ordinals.len() {
+                assert_eq!(
+                    capture.consumed_rows[layer],
+                    tokens.len() as i64,
+                    "{label}: the tap captured the keys the prompt route consumed at ordinal {}",
+                    ordinals[layer]
+                );
+            }
         }
 
         let positions: Vec<usize> = (begin..begin + count).collect();
-        let oracle = match hq {
-            true => capture.consumed_scores(0, 0, HEAD.query_head as usize, &positions),
-            false => capture.scores(0, 0, HEAD.query_head as usize, &positions),
+        let tap_scores = |head: PointingHead| match hq {
+            true => capture.consumed_scores(layer_of(head.gqa_ordinal), 0, head.query_head as usize, &positions),
+            false => capture.scores(layer_of(head.gqa_ordinal), 0, head.query_head as usize, &positions),
         };
+
+        // ── the set: every head's argmax against the tap's ───────────────
+        let argmax = leaf.set_argmax.as_deref().unwrap_or_else(|| panic!("{label}: no head set came back"));
+        assert_eq!(argmax.len(), set.heads.len(), "{label}: one key per head of the set");
+        let mut ties = 0usize;
+        for (head, &key) in set.heads.iter().zip(argmax) {
+            let oracle = tap_scores(*head);
+            let (best, top) = oracle
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| !set_query.excluded.contains(&(*k as u32)))
+                .fold((0usize, f32::NEG_INFINITY), |(bk, bs), (k, &s)| if s >= bs { (k, s) } else { (bk, bs) });
+            assert!(
+                !set_query.excluded.contains(&key),
+                "{label}: {head} landed on excluded key {key}"
+            );
+            if key as usize != best {
+                let gap = (top - oracle[key as usize]).abs() / top.abs().max(1.0);
+                assert!(
+                    gap <= SCORE_TOLERANCE,
+                    "{label}: {head} peaks at key {key} (tap score {}), the tap at key {best} ({top})",
+                    oracle[key as usize]
+                );
+                ties += 1;
+            }
+        }
+
+        // ── the pointing head's row, written in the fused launch ─────────
+        let leaf = leaf.scores;
+        let oracle = tap_scores(HEAD);
         assert_eq!(leaf.len(), oracle.len(), "{label}: one score per key of the span");
         let (mut worst, mut at) = (0f32, 0usize);
         for (k, (&a, &b)) in leaf.iter().zip(&oracle).enumerate() {
@@ -239,8 +293,16 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
         eprintln!(
             "attention readout [{kv_format:?}] {label}: {count} keys ({rows}x{cols}), worst diff \
              {worst:.2e} at key {at} (leaf {} tap {}); point leaf ({:.3}, {:.3}) tap ({:.3}, {:.3}) \
-             cells, share {:.3}",
-            leaf[at], oracle[at], from_leaf.x, from_leaf.y, from_tap.x, from_tap.y, from_leaf.share
+             cells, share {:.3}; {} set heads on {} layers, {ties} argmax ties",
+            leaf[at],
+            oracle[at],
+            from_leaf.x,
+            from_leaf.y,
+            from_tap.x,
+            from_tap.y,
+            from_leaf.share,
+            set.heads.len(),
+            ordinals.len()
         );
         assert!(
             worst <= SCORE_TOLERANCE,

@@ -3,7 +3,8 @@
 ## Status
 
 Accepted (2026-09-22, owner — spec `docs/specs/decide/13-point-by-attention-head.md`,
-GitHub #260). **Extends ADR 0034**, which made the answer-token readout the
+GitHub #260). **Extended by ADR 0039** (GitHub #263): the readout also names
+a head set, read on every layer it arms. **Extends ADR 0034**, which made the answer-token readout the
 one thing besides a token that crosses the `Compute` seam, and the permitted
 set the one thing a decode lane carries in. This is a third, and it is held
 to the same rule: the job names exactly what to read, and exactly that comes

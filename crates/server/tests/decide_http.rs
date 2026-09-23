@@ -1840,6 +1840,16 @@ fn calibrated_compute() -> Arc<MockCompute> {
     }))
 }
 
+/// `server` as a load calibrated with a pointing head and no head set — spec
+/// 13's calibration, which the table no longer holds for any artifact.
+fn pointing_head_only(mut server: Server) -> Server {
+    server.calibration = server.calibration.map(|calibration| ignis_core::pointing::Calibration {
+        set: None,
+        ..calibration
+    });
+    server
+}
+
 fn point_over_image(width: u32, height: u32, questions: &str) -> String {
     use support::media::{data_uri, png};
     format!(
@@ -1848,23 +1858,53 @@ fn point_over_image(width: u32, height: u32, questions: &str) -> String {
     )
 }
 
-/// Spec 13 acceptance 2, the default: no `method` on a calibrated load is a
-/// head point, in pixels of the submitted image, with one token cell of
-/// uncertainty and the region's share — after zero decode rounds.
+/// The mock's head set, read the way `/v1/decide` reads it: the job's last
+/// chunk, the query it named, the image's grid.
+struct HeadJob {
+    query: ignis_core::pointing::AttentionQuery,
+    rows: usize,
+    cols: usize,
+}
+
+fn head_job(compute: &MockCompute) -> HeadJob {
+    let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
+    let last = jobs.last().expect("the question was prefilled");
+    let query = last.attention.clone().expect("its last chunk asked for the attention readout");
+    let item = &last.multimodal.as_ref().expect("an image prompt").media[0];
+    assert_eq!(
+        (query.key_begin as usize, query.key_count as usize),
+        (item.token_span.begin, item.token_span.count),
+        "the readout names the image's placeholder span"
+    );
+    let (rows, cols) = ((item.grid.h / 2) as usize, (item.grid.w / 2) as usize);
+    HeadJob { query, rows, cols }
+}
+
+/// Spec 14 acceptance 3, the default: no `method` on a load calibrated with a
+/// head set is read off the set anchored on the pointing head — the point is
+/// the centre of the object's extent, and the answer carries the extent —
+/// after zero decode rounds.
+///
+/// The mock's set peaks on the pointing head's key and the two after it
+/// (`MockCompute::attention_set_argmax`), a third of each, so the kept cells
+/// are those three and the extent is exactly them: one row, three cells, its
+/// centre the middle one.
 #[tokio::test]
-async fn a_point_with_no_method_is_read_off_the_pointing_head_in_one_pass() {
+async fn a_point_with_no_method_is_read_off_the_head_set_in_one_pass() {
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 360;
     let compute = calibrated_compute();
     let server = seeing_server(compute.clone());
+    let calibration = server.calibration.expect("the server found its calibration by the artifact's hash");
     assert_eq!(
-        server.pointing_head,
-        Some(ignis_core::pointing::PointingHead {
+        calibration.head,
+        ignis_core::pointing::PointingHead {
             gqa_ordinal: 9,
             query_head: 10
-        }),
-        "the server found the head by the artifact's hash"
+        },
+        "the pointing head"
     );
+    let set = calibration.set.expect("and the head set beside it");
     let body = point_over_image(
         WIDTH,
         HEIGHT,
@@ -1877,10 +1917,68 @@ async fn a_point_with_no_method_is_read_off_the_pointing_head_in_one_pass() {
     assert_eq!(answer["method"], "head", "{response}");
     assert!(answer.get("digits").is_none(), "a head point has no digit trace: {answer}");
 
+    let HeadJob { query, rows, cols } = head_job(&compute);
+    assert_eq!((query.head.gqa_ordinal, query.head.query_head), (9, 10));
+    let named = query.set.as_ref().expect("the readout names the head set");
+    assert_eq!(&*named.heads, set.heads, "all of it, in its order");
+    assert_eq!(
+        &*named.excluded,
+        set.fallback_cells(rows as u32, cols as u32).as_slice(),
+        "with the grid's fallback cells excluded"
+    );
+    let peak = MockCompute::attention_peak(query.key_count);
+    let (row, col) = (peak / cols, peak % cols);
+    assert!(col + 2 < cols && !named.excluded.iter().any(|&k| (peak..peak + 3).contains(&(k as usize))));
+    let (cw, ch) = (f64::from(WIDTH) / cols as f64, f64::from(HEIGHT) / rows as f64);
+    let extent = |corner: &str| answer["extent"][corner].as_i64().expect("an extent corner");
+    assert_eq!(extent("x0"), (col as f64 * cw).round() as i64, "{answer}");
+    assert_eq!(extent("x1"), ((col + 3) as f64 * cw).round() as i64, "{answer}");
+    assert_eq!(extent("y0"), (row as f64 * ch).round() as i64, "{answer}");
+    assert_eq!(extent("y1"), ((row + 1) as f64 * ch).round() as i64, "{answer}");
+    assert_eq!(answer["pixels"]["x"].as_i64(), Some(((col as f64 + 1.5) * cw).round() as i64), "{answer}");
+    assert_eq!(answer["pixels"]["y"].as_i64(), Some(((row as f64 + 0.5) * ch).round() as i64), "{answer}");
+    let normalized = |fraction: f64| (fraction * 999.0).round() as u64;
+    assert_eq!(answer["normalized"]["x"].as_u64(), Some(normalized((col as f64 + 1.5) / cols as f64)));
+    assert_eq!(answer["normalized"]["y"].as_u64(), Some(normalized((row as f64 + 0.5) / rows as f64)));
+    let uncertainty = |axis: &str| answer["uncertainty"][axis].as_f64().expect("an uncertainty");
+    assert!((uncertainty("x") - cw).abs() < 1e-9 && (uncertainty("y") - ch).abs() < 1e-9, "{answer}");
+    // The confidence is still the pointing head's own.
+    assert_eq!(answer["region"]["cells"], 1, "{answer}");
+    let gap = f64::from(MockCompute::ATTENTION_PEAK_SCORE - MockCompute::ATTENTION_BACKGROUND_SCORE);
+    let share = 1.0 / (1.0 + (query.key_count as f64 - 1.0) * (-gap).exp());
+    assert!((answer["region"]["share"].as_f64().expect("a share") - share).abs() < 1e-9, "{answer}");
+
+    assert!(compute.decode_calls().is_empty(), "zero decode rounds ran");
+    assert_eq!(response["usage"]["output_tokens"], 0, "{response}");
+}
+
+/// Spec 13's reading, unchanged, on a load calibrated with a pointing head
+/// and no head set: the peak's own cell, one token cell of uncertainty and
+/// the region's share — and no `extent`, after zero decode rounds.
+#[tokio::test]
+async fn a_load_with_a_pointing_head_only_answers_without_an_extent() {
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 360;
+    let compute = calibrated_compute();
+    let server = pointing_head_only(seeing_server(compute.clone()));
+    let body = point_over_image(
+        WIDTH,
+        HEIGHT,
+        r#""where":{"type":"point","instructions":"click the blue button"}"#,
+    );
+    let (status, response) = decide(&server.app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["where"];
+    assert_eq!(answer["type"], "point", "{response}");
+    assert_eq!(answer["method"], "head", "{response}");
+    assert!(answer.get("digits").is_none(), "a head point has no digit trace: {answer}");
+    assert!(answer.get("extent").is_none(), "no head set, no extent: {answer}");
+
     // Where the mock's peak is, on the image's own grid.
     let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
     let last = jobs.last().expect("the question was prefilled");
-    let query = last.attention.expect("its last chunk asked for the attention readout");
+    let query = last.attention.clone().expect("its last chunk asked for the attention readout");
+    assert_eq!(query.set, None, "and the readout names no set");
     let item = &last.multimodal.as_ref().expect("an image prompt").media[0];
     assert_eq!(
         (query.key_begin as usize, query.key_count as usize),
@@ -1994,7 +2092,7 @@ async fn a_head_point_and_a_chain_point_put_the_same_prompt() {
 async fn a_load_without_a_calibrated_head_points_by_chain_and_refuses_head() {
     let compute = Arc::new(MockCompute::new());
     let server = seeing_server(compute.clone());
-    assert_eq!(server.pointing_head, None, "an unknown artifact has no head");
+    assert_eq!(server.calibration, None, "an unknown artifact has no head");
     let app = server.app();
 
     let body = point_over_image(640, 360, r#""where":{"type":"point","instructions":"the button"}"#);
@@ -2015,18 +2113,19 @@ async fn a_load_without_a_calibrated_head_points_by_chain_and_refuses_head() {
 }
 
 #[tokio::test]
-async fn a_method_on_a_box_or_a_readout_and_an_unknown_method_are_refused() {
+async fn a_method_on_a_readout_and_an_unknown_method_are_refused() {
     let compute = calibrated_compute();
     let app = seeing_server(compute.clone()).app();
     for (question, code) in [
-        (r#""f":{"type":"box","instructions":"the button","method":"head"}"#, "method_unsupported"),
-        (r#""f":{"type":"box","instructions":"the button","method":"chain"}"#, "method_unsupported"),
         (
             r#""f":{"type":"noul","instructions":"is there a button?","method":"head"}"#,
             "method_unsupported",
         ),
+        (r#""f":{"type":"number","instructions":"how many?","method":"chain"}"#, "method_unsupported"),
+        (r#""f":{"type":"scalar","instructions":"how wide?","method":"head"}"#, "method_unsupported"),
         (r#""f":{"type":"point","instructions":"the button","method":"Head"}"#, "method_unknown"),
         (r#""f":{"type":"point","instructions":"the button","method":"attention"}"#, "method_unknown"),
+        (r#""f":{"type":"box","instructions":"the button","method":"set"}"#, "method_unknown"),
     ] {
         let (status, response) = decide(&app, &point_over_image(64, 64, question)).await;
         assert_eq!(status, 422, "{question}: {response}");
@@ -2070,16 +2169,19 @@ async fn a_head_point_the_leaf_could_not_read_is_a_failed_question() {
     assert_eq!(response["answers"]["where"]["code"], "attention_unread", "{response}");
 }
 
-/// A fan-out mixing head points and readouts over one image answers every
-/// question, each by its own kind.
+/// A fan-out mixing head points, head boxes, chain boxes and readouts over
+/// one image answers every question, each by its own kind — and the image is
+/// prefilled once: every follower claims the first question's prefix.
 #[tokio::test]
-async fn a_fan_out_mixing_head_points_and_readouts_over_one_image_answers_all() {
+async fn a_fan_out_mixing_head_points_boxes_and_readouts_over_one_image_answers_all() {
     let compute = calibrated_compute();
     let body = point_over_image(
         640,
         360,
         r#""blue":{"type":"point","instructions":"the blue button"},
            "red":{"type":"point","instructions":"the red button"},
+           "frame":{"type":"box","instructions":"the blue button","method":"head"},
+           "outline":{"type":"box","instructions":"the red button"},
            "any":{"type":"noul","instructions":"is there a button?"},
            "which":{"type":"choice","instructions":"which colour dominates?",
                     "criteria":{"blue":"mostly blue","red":"mostly red"}},
@@ -2089,12 +2191,162 @@ async fn a_fan_out_mixing_head_points_and_readouts_over_one_image_answers_all() 
     assert_eq!(status, 200, "{response}");
     let answers = &response["answers"];
     assert_eq!(answers["blue"]["method"], "head", "{response}");
+    assert!(answers["blue"]["extent"].is_object(), "{response}");
     assert_eq!(answers["red"]["method"], "head", "{response}");
+    assert_eq!((&answers["frame"]["type"], &answers["frame"]["method"]), (&json!("box"), &json!("head")));
+    assert_eq!((&answers["outline"]["type"], &answers["outline"]["method"]), (&json!("box"), &json!("chain")));
     assert_eq!(answers["exact"]["method"], "chain", "{response}");
     assert_eq!(answers["any"]["type"], "noul", "{response}");
     assert_eq!(answers["which"]["type"], "choice", "{response}");
+    // The chain point's 3 + 5 + 3, and the chain box's four times 3 digits
+    // and three six-character `,"y0":` separators: 11 + 30.
     assert_eq!(
-        response["usage"]["output_tokens"], 11,
-        "only the chain point generated: {response}"
+        response["usage"]["output_tokens"], 41,
+        "only the chains generated: {response}"
     );
+}
+
+/// A head box is read in the head point's pass: over one image and one
+/// instruction the two put the same prompt, token for token and position for
+/// position, so a fan-out's head boxes share the image's prefix with its head
+/// points (user story 14).
+#[tokio::test]
+async fn a_head_box_and_a_head_point_put_the_same_prompt() {
+    let compute = calibrated_compute();
+    let body = point_over_image(
+        640,
+        360,
+        r#""point":{"type":"point","instructions":"the blue button"},
+           "box":{"type":"box","instructions":"the blue button","method":"head"}"#,
+    );
+    let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
+    let requests: std::collections::BTreeSet<u64> = jobs.iter().map(|job| job.request).collect();
+    assert_eq!(requests.len(), 2, "two questions, two requests");
+    let mine = |request: u64| jobs.iter().filter(move |job| job.request == request);
+    let prompt_len = |request: u64| {
+        mine(request).next().map_or(0, |job| job.start_position as usize)
+            + mine(request).map(|job| job.tokens.len()).sum::<usize>()
+    };
+    let tail = |request: u64| {
+        let tokens: Vec<u32> = mine(request).flat_map(|job| job.tokens.iter().copied()).collect();
+        tokens[tokens.len().saturating_sub(16)..].to_vec()
+    };
+    let positions = |request: u64| {
+        mine(request).find_map(|job| job.multimodal.clone()).expect("an image prompt").positions.clone()
+    };
+    let (first, second) = (*requests.first().unwrap(), *requests.last().unwrap());
+    assert_eq!(prompt_len(first), prompt_len(second), "the same number of prompt tokens");
+    assert_eq!(tail(first), tail(second), "the same tokens where both prefilled them");
+    assert_eq!(positions(first), positions(second), "and the same MRoPE positions throughout");
+}
+
+/// Spec 14 acceptance 3: a box asking for `head` is the head set's extent,
+/// read in the point's pass — the point's system text and forced `{"x":` —
+/// in the chain box's pixels and 0-999 scale, one token cell per edge, the
+/// pointing head's region and no digits, after zero decode rounds.
+#[tokio::test]
+async fn a_box_asking_for_the_head_is_the_extent_in_one_pass() {
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 360;
+    let compute = calibrated_compute();
+    let body = point_over_image(
+        WIDTH,
+        HEIGHT,
+        r#""frame":{"type":"box","instructions":"the blue button","method":"head"}"#,
+    );
+    let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["frame"];
+    assert_eq!((&answer["type"], &answer["method"]), (&json!("box"), &json!("head")), "{response}");
+    assert!(answer.get("digits").is_none(), "a head box has no digit trace: {answer}");
+    assert_eq!(answer["region"]["cells"], 1, "{answer}");
+
+    let HeadJob { query, rows, cols } = head_job(&compute);
+    assert!(query.set.is_some(), "a head box reads the set");
+    let peak = MockCompute::attention_peak(query.key_count);
+    let (row, col) = (peak / cols, peak % cols);
+    let (cw, ch) = (f64::from(WIDTH) / cols as f64, f64::from(HEIGHT) / rows as f64);
+    let corners = [
+        ("x0", col as f64 * cw, WIDTH, cw),
+        ("y0", row as f64 * ch, HEIGHT, ch),
+        ("x1", (col + 3) as f64 * cw, WIDTH, cw),
+        ("y1", (row + 1) as f64 * ch, HEIGHT, ch),
+    ];
+    for (corner, at, side, cell) in corners {
+        assert_eq!(answer["pixels"][corner].as_i64(), Some(at.round() as i64), "{corner}: {answer}");
+        assert_eq!(
+            answer["normalized"][corner].as_u64(),
+            Some((at / f64::from(side) * 999.0).round() as u64),
+            "{corner}: {answer}"
+        );
+        assert!((answer["uncertainty"][corner].as_f64().unwrap() - cell).abs() < 1e-9, "{corner}: {answer}");
+    }
+    assert!(compute.decode_calls().is_empty(), "zero decode rounds ran");
+    assert_eq!(response["usage"]["output_tokens"], 0, "{response}");
+    let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
+    let prompt: Vec<u32> = jobs.iter().flat_map(|job| job.tokens.iter().copied()).collect();
+    let opening: Vec<u32> = "{\"x\":".chars().map(|c| c as u32).collect();
+    assert!(prompt.ends_with(&opening), "read where the point is read, after the forced `{{\"x\":`");
+}
+
+/// The chain box, today's answer, now naming its method; and a box with no
+/// `method` is still the chain's (spec 14: the box's default moves only on
+/// the acceptance's rule).
+#[tokio::test]
+async fn a_box_by_default_or_asking_for_the_chain_is_answered_digit_by_digit() {
+    assert_eq!(ignis_server::decide::BOX_DEFAULT_METHOD, ignis_server::decide::SpatialMethod::Chain);
+    for method in ["", r#","method":"chain""#] {
+        let compute = calibrated_compute();
+        let body = point_over_image(
+            640,
+            360,
+            &format!(r#""frame":{{"type":"box","instructions":"the blue button"{method}}}"#),
+        );
+        let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+        assert_eq!(status, 200, "{response}");
+        let answer = &response["answers"]["frame"];
+        assert_eq!(answer["method"], "chain", "{method}: {response}");
+        assert_eq!(answer["digits"]["x0"].as_array().map(Vec::len), Some(3), "{answer}");
+        assert!(answer.get("region").is_none(), "{answer}");
+        assert!(!compute.decode_calls().is_empty(), "the chain decodes its digits");
+        assert!(compute.prefill_calls().iter().flatten().all(|job| job.attention.is_none()));
+    }
+}
+
+/// A head box needs the head set: refused before any prefill on a load with a
+/// pointing head only, and on a load with no calibration at all.
+#[tokio::test]
+async fn a_head_box_on_a_load_without_a_head_set_is_refused_before_any_prefill() {
+    let head_only = pointing_head_only(seeing_server(calibrated_compute()));
+    let uncalibrated = seeing_server(Arc::new(MockCompute::new()));
+    for server in [head_only, uncalibrated] {
+        let app = server.app();
+        let body = point_over_image(
+            640,
+            360,
+            r#""frame":{"type":"box","instructions":"the button","method":"head"}"#,
+        );
+        let (status, response) = decide(&app, &body).await;
+        assert_eq!(status, 422, "{response}");
+        assert_eq!(response["error"]["code"], "pointing_head_unavailable", "{response}");
+        // And the chain is still there for the asking.
+        let body = point_over_image(640, 360, r#""frame":{"type":"box","instructions":"the button"}"#);
+        let (status, response) = decide(&app, &body).await;
+        assert_eq!((status, &response["answers"]["frame"]["method"]), (200, &json!("chain")), "{response}");
+    }
+}
+
+/// No image: the same per-answer failure the chain gives, for a head box as
+/// for a head point, and nothing submitted.
+#[tokio::test]
+async fn a_head_box_over_a_text_state_is_the_chains_error_and_costs_nothing() {
+    let compute = calibrated_compute();
+    let body = r#"{"state":"a paragraph of text",
+        "questions":{"frame":{"type":"box","instructions":"the button","method":"head"}}}"#;
+    let (status, response) = decide(&app(compute.clone()), body).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["answers"]["frame"]["code"], "state_carries_no_image", "{response}");
+    assert!(compute.prefill_calls().is_empty(), "no span to read, so nothing was submitted");
 }

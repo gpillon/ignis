@@ -9,7 +9,7 @@ use ignis_core::{
 use ignis_core::checkpoint::ReuseSource;
 use ignis_core::scheduler::CheckpointClaim;
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
-use ignis_core::pointing::{AttentionQuery, PointingHead};
+use ignis_core::pointing::{AttentionQuery, PointingHead, SetQuery};
 use ignis_runtime::{
     AttentionRead, DecodeLane, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats,
     StepLeaf,
@@ -261,14 +261,17 @@ impl StepLeaf for StubLeaf {
     ) -> Result<f32, i32> {
         {
             let mut calls = self.calls.lock().unwrap();
-            calls.attention_asked.push(attention.as_ref().map(|read| read.query));
+            calls.attention_asked.push(attention.as_ref().map(|read| read.query.clone()));
             // A deterministic map the test can predict: each key scores its
-            // own absolute position.
+            // own absolute position, and head `i` of a set peaks on key `2i`.
             if let Some(read) = attention
                 && !calls.attention_unreadable
             {
                 for (k, score) in read.scores.iter_mut().enumerate() {
                     *score = (read.query.key_begin + k as u32) as f32;
+                }
+                for (i, key) in read.set_argmax.iter_mut().enumerate() {
+                    *key = 2 * i as u32;
                 }
                 read.read = true;
             }
@@ -2249,6 +2252,7 @@ fn attention_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) -
             head: HEAD,
             key_begin: 10,
             key_count: 20,
+            set: None,
         }),
         ..multimodal_job(request, prompt, start, len)
     }
@@ -2263,8 +2267,9 @@ fn an_attention_readout_comes_back_as_one_score_per_key_of_its_span() {
         .expect("a batch with a head point succeeds");
 
     assert_eq!(outcomes[0].attention, None, "the job that asked for none gets none");
-    let scores = outcomes[1].attention.as_deref().expect("the head point's scores come back");
-    assert_eq!(scores, (10..30).map(|k| k as f32).collect::<Vec<_>>().as_slice());
+    let attention = outcomes[1].attention.as_ref().expect("the head point's scores come back");
+    assert_eq!(&*attention.scores, (10..30).map(|k| k as f32).collect::<Vec<_>>().as_slice());
+    assert_eq!(attention.set_argmax, None, "it named no head set");
     assert_eq!(outcomes[1].readout, None, "and no logits readout rides with it");
     let calls = leaf.calls.lock().unwrap();
     assert_eq!(
@@ -2274,12 +2279,42 @@ fn an_attention_readout_comes_back_as_one_score_per_key_of_its_span() {
             Some(AttentionQuery {
                 head: HEAD,
                 key_begin: 10,
-                key_count: 20
+                key_count: 20,
+                set: None,
             })
         ],
         "only the job that asked hands the leaf a readout"
     );
     assert_eq!(calls.prefill_logit_buffers, [None, None], "a head point asks for no logits row");
+}
+
+/// Spec 14: a readout naming a head set hands the leaf the set whole, one
+/// argmax slot per head, and exactly those indices cross back beside the
+/// pointing head's scores.
+#[test]
+fn a_head_sets_argmax_comes_back_one_key_per_head() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let prompt = multimodal(40, vec![image(10, 20)]);
+    let set = SetQuery {
+        heads: Arc::from(vec![HEAD, PointingHead { gqa_ordinal: 15, query_head: 18 }, HEAD]),
+        excluded: Arc::from(vec![0, 19]),
+    };
+    let job = PrefillJob {
+        attention: Some(AttentionQuery {
+            head: HEAD,
+            key_begin: 10,
+            key_count: 20,
+            set: Some(set.clone()),
+        }),
+        ..multimodal_job(1, &prompt, 0, 40)
+    };
+    let outcomes = compute.prefill_step(&[job]).expect("a head set reads");
+    let attention = outcomes[0].attention.as_ref().expect("read");
+    assert_eq!(attention.scores.len(), 20);
+    assert_eq!(attention.set_argmax.as_deref(), Some(&[0, 2, 4][..]), "one key per head, in the set's order");
+    let calls = leaf.calls.lock().unwrap();
+    let asked = calls.attention_asked[0].as_ref().expect("the leaf was handed the readout");
+    assert_eq!(asked.set.as_ref(), Some(&set), "with the set, heads and excluded keys alike");
 }
 
 /// Spec 13 acceptance 4, the host's half: a span that asks for no attention
@@ -2318,6 +2353,7 @@ fn an_attention_readout_without_an_image_fails_loudly() {
             head: HEAD,
             key_begin: 0,
             key_count: 2,
+            set: None,
         }),
         ..prefill(1, None)
     };

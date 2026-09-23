@@ -266,15 +266,17 @@ pub struct PrefillOutcome {
     pub readout: Option<Readout>,
     /// The **attention readout** this job asked for (GitHub #260, ADR 0038):
     /// one `q · k / sqrt(head_dim)` per key of its
-    /// [`PrefillJob::attention`] span, in order, before any softmax.
+    /// [`PrefillJob::attention`] span, in order, before any softmax — and,
+    /// when the job named a head set (GitHub #263, ADR 0039), one argmax key
+    /// index per head of it.
     ///
     /// `None` when the job asked for none — and when it asked and the leaf
-    /// could not read the keys the layer's attention read (a route that
+    /// could not read the keys an armed layer's attention read (a route that
     /// materialized none, a span outside the band it materialized). The
     /// scheduler then ends the request with [`crate::types::FinishReason::Error`]:
     /// a head point the leaf could not read is a failed question, never a
-    /// point read off some other copy of the keys.
-    pub attention: Option<std::sync::Arc<[f32]>>,
+    /// point read off some other copy of the keys, and never a partial set.
+    pub attention: Option<crate::pointing::AttentionScores>,
 }
 
 impl PrefillOutcome {

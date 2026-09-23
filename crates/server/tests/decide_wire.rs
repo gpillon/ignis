@@ -911,6 +911,59 @@ fn each_primitive_forces_the_json_shape_its_prompt_declared() {
     }
 }
 
+/// GitHub #263: a head `box` is read in a point's pass — the point's system
+/// text and forced `{"x":`, the prompt the head set was chosen and measured
+/// on — while a chain box keeps the box's own.
+#[test]
+fn a_head_box_is_put_under_the_points_prompt_and_a_chain_box_under_its_own() {
+    let calibration = ignis_core::pointing::calibrated_artifacts()
+        .next()
+        .and_then(ignis_core::pointing::calibration)
+        .expect("the served artifact is calibrated");
+    let body = |method: &str| {
+        format!(
+            r#"{{"state":"s","questions":{{"q":{{"type":"box","instructions":"the button","method":"{method}"}}}}}}"#
+        )
+    };
+    let head = prepare(&parse(&body("head")).questions, &alphabet(), &encoder, Some(calibration))
+        .expect("a head box prepares on a load with a head set");
+    let chain = prepare(&parse(&body("chain")).questions, &alphabet(), &encoder, Some(calibration))
+        .expect("a chain box prepares");
+    let system = |question: &PreparedQuestion| {
+        messages_for(&Evidence::Json(OrderedValue::from_json(&json!("s"))), question)[0].content.text()
+    };
+    assert_eq!(head[0].kind, QuestionKind::Box);
+    assert_eq!(head[0].prompt_kind(), QuestionKind::Point);
+    assert!(system(&head[0]).starts_with(&ignis_server::numbers::point_system(3)), "{}", system(&head[0]));
+    assert_eq!(head[0].plan.as_ref().expect("a plan").prefix, encoder("{\"x\":").unwrap());
+    assert_eq!(chain[0].prompt_kind(), QuestionKind::Box);
+    assert!(system(&chain[0]).starts_with(&ignis_server::numbers::box_system(3)), "{}", system(&chain[0]));
+    assert_eq!(chain[0].plan.as_ref().expect("a plan").prefix, encoder("{\"x0\":").unwrap());
+}
+
+/// GitHub #263: what a load says about `point` and `box`, for every kind of
+/// calibration — the branches `main.rs` logs and no CPU test can load.
+#[test]
+fn a_load_says_how_point_and_box_will_be_answered() {
+    use ignis_server::decide::load_methods;
+    let served = ignis_core::pointing::calibrated_artifacts()
+        .next()
+        .and_then(ignis_core::pointing::calibration)
+        .expect("the served artifact is calibrated");
+    let head_only = ignis_core::pointing::Calibration { set: None, ..served };
+    let said = |calibration, vision| {
+        let m = load_methods(calibration, vision);
+        (m.point, m.box_methods, m.box_default)
+    };
+    let default = ignis_server::decide::BOX_DEFAULT_METHOD.label();
+    assert_eq!(said(Some(served), true), ("head_set", "chain,head", default));
+    assert_eq!(said(Some(head_only), true), ("head", "chain", "chain"));
+    assert_eq!(said(None, true), ("chain", "chain", "chain"));
+    for calibration in [Some(served), Some(head_only), None] {
+        assert_eq!(said(calibration, false), ("none", "none", "none"), "no vision, no image to answer on");
+    }
+}
+
 // ── the scalar (GitHub #255, spec 10) ────────────────────────────────────
 
 fn scalar_body(extra: &str) -> String {

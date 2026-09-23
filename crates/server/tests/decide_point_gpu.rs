@@ -41,6 +41,14 @@
 //! failure signature a caller can see: at most one miss in three, and never a
 //! miss the head was sure of.
 //!
+//! **GitHub #263 moved it again.** On the served artifact the default is now
+//! the head set anchored on the pointing head: the point is the centre of the
+//! object's `extent`, which the answer carries. The same bar holds, and the
+//! extent is checked to hold the point it is the centre of. A fourth test
+//! asks each scene for a `box` with `"method": "head"` — the same extent, in
+//! one pass — and holds its shape; its IoU with the button is printed, not
+//! asserted (spec 14 reports buttons and floors large objects).
+//!
 //! Explicit GPU profile (ADR 0006, GitHub #38).
 
 #![cfg(feature = "cuda")]
@@ -269,6 +277,15 @@ async fn every_scene_lands_inside_its_button(shape: EngineShape, label: &str, me
         if answer["method"] == "head" {
             let cell = answer["uncertainty"]["x"].as_f64().expect("an uncertainty");
             assert!(cell > 0.0, "[{label}] {}: one token cell, in pixels: {answer}", scene.id);
+            // GitHub #263: the served artifact has a head set, so the point
+            // is its extent's centre.
+            let corner = |c: &str| answer["extent"][c].as_i64().unwrap_or_else(|| panic!("{c}: {answer}"));
+            let (x0, y0, x1, y1) = (corner("x0"), corner("y0"), corner("x1"), corner("y1"));
+            assert!(
+                x0 <= x && x <= x1 && y0 <= y && y <= y1 && ((x0 + x1) / 2 - x).abs() <= 1,
+                "[{label}] {}: ({x},{y}) is the centre of its extent {answer}",
+                scene.id
+            );
             let share = answer["region"]["share"].as_f64().expect("a region share");
             if !inside {
                 head_misses.push((scene.id.clone(), share));
@@ -349,6 +366,55 @@ async fn a_point_lands_inside_the_blue_button_on_every_scene() {
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn a_point_with_no_method_is_read_off_the_head_inside_the_button() {
     every_scene_lands_inside_its_button(vision_shape(), "head", None).await;
+}
+
+/// GitHub #263: a `box` asking for `head` on every scene — the head set's
+/// extent through the whole stack in one pass: no decode round, no digits,
+/// four corners in the submitted image's pixels in order, one token cell of
+/// uncertainty per edge. Its IoU with the button is printed for the record.
+#[tokio::test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn a_box_asking_for_the_head_frames_each_scene_in_one_pass() {
+    let dir = fixture_dir();
+    let Ok(manifest_text) = std::fs::read_to_string(dir.join("manifest.json")) else {
+        if gpu_profile::skip_or_fail(&format!("the pointing fixture is absent: {}", dir.display())) {
+            return;
+        }
+        unreachable!("skip_or_fail panics under the profile");
+    };
+    let manifest: Manifest =
+        serde_json::from_str(&manifest_text).unwrap_or_else(|e| panic!("parse the manifest: {e}"));
+    let Some(h) = harness(vision_shape()) else { return };
+    for scene in &manifest.scenes {
+        let bytes = std::fs::read(dir.join(&scene.image)).unwrap_or_else(|e| panic!("{}: {e}", scene.id));
+        let body = format!(
+            r#"{{"state":[{{"type":"image_url","image_url":{{"url":"{}"}}}}],"model":"{MODEL}",
+                "questions":{{"frame":{{"type":"box","instructions":"{INSTRUCTION}","method":"head"}}}}}}"#,
+            data_uri(&bytes)
+        );
+        let (status, response) = decide(h.app(), body).await;
+        assert_eq!(status, 200, "{response}");
+        let answer = &response["answers"]["frame"];
+        assert_eq!((answer["type"].as_str(), answer["method"].as_str()), (Some("box"), Some("head")), "{response}");
+        assert_eq!(response["usage"]["output_tokens"], 0, "a head box generates nothing: {response}");
+        assert!(answer.get("digits").is_none(), "{answer}");
+        let corner = |c: &str| answer["pixels"][c].as_i64().unwrap_or_else(|| panic!("{c}: {answer}"));
+        let got = [corner("x0"), corner("y0"), corner("x1"), corner("y1")];
+        let side = i64::from(manifest.side);
+        assert!(
+            0 <= got[0] && got[0] < got[2] && got[2] <= side && 0 <= got[1] && got[1] < got[3] && got[3] <= side,
+            "{}: the corners are in order and on the image: {answer}",
+            scene.id
+        );
+        for edge in ["x0", "y0", "x1", "y1"] {
+            assert!(answer["uncertainty"][edge].as_f64().is_some_and(|u| u > 0.0), "{edge}: {answer}");
+        }
+        let b = scene.blue_box;
+        let inter = (got[2].min(b[2]) - got[0].max(b[0])).max(0) * (got[3].min(b[3]) - got[1].max(b[1])).max(0);
+        let area = |r: [i64; 4]| (r[2] - r[0]) * (r[3] - r[1]);
+        let iou = inter as f64 / (area(got) + area(b) - inter) as f64;
+        eprintln!("ignis decide head box {}: {got:?} vs button {b:?}, IoU {iou:.2}", scene.id);
+    }
 }
 
 /// The same, on a **drafter** load — the only shape that exercises

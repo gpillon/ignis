@@ -395,6 +395,10 @@
    1,
    223,
    1023
+  ],
+  "128x128": [
+   0,
+   16383
   ]
  },
  "fallback_default": "the first and the last image cell on any grid not listed",
@@ -407,5 +411,5 @@
  },
  "artifact_content_hash": "4bdc7b1303172952cf50ad0bb3748dd9c32d2fae30da8b09d8450e83b6542513",
  "spec": "docs/specs/decide/14-point-and-box-from-the-head-set.md",
- "fallback_cells_note": "32x32: cells (0,0), (0,1), (6,31), (31,31) as row-major indices"
+ "fallback_cells_note": "32x32: cells (0,0), (0,1), (6,31), (31,31) as row-major indices. 128x128: measured 2026-09-23 on rectangles.py --blank --side 4096 --seed 20260944 (BF16, served render): no cell beyond the first and the last reaches the 5% rule ((0,0) takes 16% of all heads' peaks, (1,0) and (127,127) 2.4% each; the last cell is excluded on every grid regardless), so nothing more is excluded there"
 }
