@@ -142,9 +142,30 @@ describe("QuestionCard", () => {
     // What each one is for, once it has been chosen.
     expect(card(ask("point", { method: "head" }))).toContain("no decode round");
     expect(card(ask("point", { method: "chain" }))).toContain("one decode round per digit");
-    // Not a box's: the head's region is not a box, and the endpoint refuses it.
-    expect(card(ask("box"))).not.toContain("Answered by");
+    // A readout has one way of being answered, and the endpoint refuses the
+    // field on it.
     expect(card(ask("number"))).not.toContain("Answered by");
+    expect(card(ask("noul"))).not.toContain("Answered by");
+  });
+
+  it("offers a box the same two methods, and a default that is the endpoint's and not the load's", () => {
+    // GitHub #263: a box answers with the chain on **every** load — the head
+    // box was measured no better on a small button — so the empty value here
+    // is not "whatever this load serves" the way a point's is, and saying so
+    // would tell the reader a box is load-dependent when it is not.
+    const html = card(ask("box"));
+    expect(html).toContain("Answered by");
+    expect(html).toContain("the endpoint&#x27;s</option>");
+    expect(html).toContain('<option value="head">head</option>');
+    expect(html).toContain('<option value="chain">chain</option>');
+    expect(html).toContain("The chain, on every load");
+    expect(html).not.toContain("this load&#x27;s own");
+    // Its head reads the set's extent, and it is refused where there is no
+    // set rather than quietly answered by the chain.
+    const head = card(ask("box", { method: "head" }));
+    expect(head).toContain("head set&#x27;s extent");
+    expect(head).toContain("refuses it");
+    expect(card(ask("box", { method: "chain" }))).toContain("four edges");
   });
 
   it("shows a question's own faults on the question", () => {

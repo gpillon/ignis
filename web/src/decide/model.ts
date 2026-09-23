@@ -39,19 +39,55 @@ export const PRIMITIVE_BLURB: Record<Primitive, string> = {
 };
 
 /**
- * How a `point` is answered (GitHub #260), and `null` for "whichever the load
- * serves" — which is `head` when the loaded artifact has a calibrated pointing
- * head and `chain` when it has none. The tab cannot know which of those a load
- * is, so the default is sent as an absent field rather than guessed at here,
- * and the answer says which ran.
+ * How a `point` or a `box` is answered (GitHub #260, #263) — `decide.rs`'s
+ * `SpatialMethod` — and `null` for "whichever the load serves".
+ *
+ * The two primitives do not default alike, which is why the tab never guesses
+ * the absent value: a `point` is `head` on a load with a calibrated pointing
+ * head and `chain` on one without, and a `box` is `chain` on every load
+ * (`BOX_DEFAULT_METHOD`), because the head box was not better than the chain
+ * on a small button. So `head` is a `box`'s opt-in, and the answer says which
+ * ran either way.
  */
-export const POINT_METHODS = ["head", "chain"] as const;
-export type PointMethod = (typeof POINT_METHODS)[number];
+export const SPATIAL_METHODS = ["head", "chain"] as const;
+export type SpatialMethod = (typeof SPATIAL_METHODS)[number];
 
-/** What each method is for, in the tab's own words. */
-export const POINT_METHOD_BLURB: Record<PointMethod, string> = {
-  head: "One pass: the calibrated pointing head's attention over the image, with no decode round. Coarse — one image token — and on a labelled target it marks where the label begins, not its centre.",
-  chain: "The digit chain: one decode round per digit. Finer than one image token, and it carries a per-digit trace.",
+/**
+ * What each method is for, in the tab's own words, and per primitive: the
+ * same name does a different thing on each. A head `point` reads a position
+ * off the heads; a head `box` reads the set's extent, and is the answer you
+ * have to ask for.
+ */
+export const SPATIAL_METHOD_BLURB: Record<"point" | "box", Record<SpatialMethod, string>> = {
+  point: {
+    head: "One pass: the calibrated heads' attention over the image, with no decode round. Where the load has a head set the point is the centre of the object the set outlines; with the pointing head alone it is coarser — one image token — and on a labelled target it marks where the label begins, not the centre.",
+    chain: "The digit chain: one decode round per digit. Finer than one image token, and it carries a per-digit trace.",
+  },
+  box: {
+    head: "One pass: the head set's extent around the pointing head's point, with no decode round, in the same pixels and on the same scale as the chain's. A load with no calibrated head set refuses it rather than answering by the chain.",
+    chain: "The digit chain: one decode round per digit, four edges' worth, and it carries a per-digit trace. This is what a box answers with unless it asks for the head.",
+  },
+};
+
+/**
+ * What an absent `method` means, per primitive — the empty choice's own label
+ * and the sentence under it.
+ *
+ * A `point`'s default is the **load's**, which this tab cannot resolve; a
+ * `box`'s is the endpoint's, and is `chain` whatever the load is. Naming them
+ * the same way would say a box is load-dependent when it is not.
+ */
+export const DEFAULT_METHOD: Record<"point" | "box", { label: string; blurb: string }> = {
+  point: {
+    label: "this load's own",
+    blurb:
+      "The head where the loaded artifact has a calibrated pointing head, and the chain where it has none. Asking for head on a load that has none is refused rather than answered by the chain.",
+  },
+  box: {
+    label: "the endpoint's",
+    blurb:
+      "The chain, on every load: the head box was measured no better than it on a small button, so the head is a box's opt-in. Asking for head on a load with no calibrated head set is refused rather than answered by the chain.",
+  },
 };
 
 /**
@@ -116,13 +152,14 @@ export type Question = {
   levels: string[];
   /** `number`, `point`, `box`: the width of the field, or the scale of the axes. */
   digits: number;
-  /**
-   * `point`: which method answers it, and `null` for the load's own default.
-   * Sent only on a `point` — `decide.rs` refuses `method` on every other
-   * primitive, a `box` most pointedly of all, because the head's region is
-   * not a box.
+   /**
+   * `point`, `box`: which method answers it, and `null` for the default the
+   * endpoint would pick. Sent only from those two — `decide.rs` refuses
+   * `method` on every other primitive, which reads one position and has one
+   * way of reading it — and kept on the question regardless, so switching a
+   * question's type and switching back does not lose the choice.
    */
-  method: PointMethod | null;
+  method: SpatialMethod | null;
   /**
    * `scalar`: at most this many digits, and `null` for the server's own
    * default of `DEFAULT_CEILING`. A ceiling and not a width — the run closes
@@ -286,11 +323,11 @@ export function validate(draft: Draft): Fault[] {
 }
 
 /**
- * `method` on a question that has one way of being answered.
+ * A `method` spelling neither name covers.
  *
- * The builder only offers the control on a `point`, so what this catches is a
- * body written in the JSON editor — where a `method` on a `box` is the
- * mistake worth naming, because it reads as if the head could draw one.
+ * A known `method` on a primitive other than `point` is not a fault: it is
+ * kept on the question, so a trip through another type and back does not lose
+ * it, and ignored there — `requestBody` sends it only from a point.
  */
 function methodFaults(question: Question, name: string): Fault[] {
   const faults: Fault[] = [];
@@ -301,20 +338,6 @@ function methodFaults(question: Question, name: string): Fault[] {
     faults.push({
       code: "method_unknown",
       message: `${name} asks for the method ${JSON.stringify(asText(unknown.value))}; the accepted values are "head" and "chain".`,
-      uid: question.uid,
-    });
-  }
-  if (question.method !== null && question.kind !== "point") {
-    const why =
-      question.kind === "box"
-        ? "a box cannot come out of the pointing head — its region is not a box — so a box is always the chain's"
-        : "`method` chooses how a point is answered, and this primitive has one way";
-    // Where to clear it is part of the fault: only a point's card carries the
-    // control, so a method that reached a box did so through the JSON editor
-    // and that is the one place it can be taken off again.
-    faults.push({
-      code: "method_unsupported",
-      message: `${name} is a ${question.kind}: ${why}. Remove \`method\` in the JSON view.`,
       uid: question.uid,
     });
   }
@@ -448,10 +471,10 @@ function questionNode(question: Question): JsonNode {
   const criteria = criteriaNode(question);
   if (criteria) entries.push({ key: "criteria", value: criteria });
   if (hasFixedWidth(question.kind)) entries.push({ key: "digits", value: { kind: "number", value: question.digits } });
-  // A `point` alone carries `method`, and only when one was chosen: absent is
-  // what the server reads as "whichever this load serves", and no value says
-  // that.
-  if (question.kind === "point" && question.method !== null) {
+  // A `point` and a `box` carry `method`, and only when one was chosen:
+  // absent is what the server reads as "the default for this primitive on
+  // this load", and no value says that.
+  if (isSpatial(question.kind) && question.method !== null) {
     entries.push({ key: "method", value: jsonString(question.method) });
   }
   // A scalar's ceiling is omitted when it has none: absent is what the server
@@ -582,8 +605,8 @@ function readQuestion(id: string, node: JsonNode): ReadQuestion {
   // dropped: the server refuses it naming the two it accepts, and a body that
   // round-trips through this editor has to still earn that refusal.
   const method = at("method");
-  if (method?.kind === "string" && (POINT_METHODS as readonly string[]).includes(method.value)) {
-    question.method = method.value as PointMethod;
+  if (method?.kind === "string" && (SPATIAL_METHODS as readonly string[]).includes(method.value)) {
+    question.method = method.value as SpatialMethod;
   } else if (method) {
     question.extras = [{ key: "method", value: method }];
   }

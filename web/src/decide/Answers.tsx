@@ -52,8 +52,8 @@ function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
       </p>
       <p className="mt-1.5 text-[12px] leading-snug text-ash">
         {anyGenerated
-          ? "A number, a box and a point answered by the digit chain generate a digit per step, and a scalar generates until its number is complete, so those tokens are real. The readouts beside them generated none, and neither did a point read off the pointing head."
-          : "Nothing was generated: out of a single prefill of the evidence, every answer was read from the logits of one position — or, for a point off the pointing head, from that head's attention over the image."}
+          ? "A number, and a point or a box answered by the digit chain, generate a digit per step, and a scalar generates until its number is complete, so those tokens are real. The readouts beside them generated none, and neither did a point or a box read off the calibrated heads."
+          : "Nothing was generated: out of a single prefill of the evidence, every answer was read from the logits of one position — or, for a point or a box off the calibrated heads, from their attention over the image."}
       </p>
     </div>
   );
@@ -61,7 +61,7 @@ function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
 
 /** What each method did, for the chip that names it. */
 const METHOD_TITLE: Record<"head" | "chain", string> = {
-  head: "Read in one pass off the calibrated pointing head's attention over the image — no decode round ran",
+  head: "Read in one pass off the calibrated heads' attention over the image — no decode round ran",
   chain: "Written one digit at a time under a constrained decode — one decode round per digit",
 };
 
@@ -79,10 +79,10 @@ function AnswerPanel({ question, answer, draft }: { question: Question; answer: 
             {question.id}
           </span>
           <span className="cut bg-surface px-2 py-0.5 [--cut-size:5px]">{question.kind}</span>
-          {/* Which method actually answered (GitHub #260) — the answer's fact
-              and not the question's, because a point sent with no `method`
-              is answered by whichever the load serves. */}
-          {answer?.type === "point" && answer.method && (
+          {/* Which method actually answered (GitHub #260, #263) — the answer's
+              fact and not the question's, because a point or a box sent with
+              no `method` is answered by whichever default applies. */}
+          {(answer?.type === "point" || answer?.type === "box") && answer.method && (
             <span className="cut bg-surface px-2 py-0.5 text-ember [--cut-size:5px]" title={METHOD_TITLE[answer.method]}>
               {answer.method}
             </span>
@@ -268,24 +268,61 @@ function sigma(value: number): string {
 }
 
 /**
+ * Decimal places on a point's or a box's per-axis figure.
+ *
+ * Three, whatever the method wrote there, by the owner's call: a head
+ * answer's figure is a fraction of an image token and a chain's is a
+ * self-reported sigma, and at one place a reading a quarter of a cell finer
+ * than another printed as the same number. It is also what `region.share` and
+ * every confidence on this page already read to, so the panel has one
+ * precision rather than two.
+ */
+const SPATIAL_DECIMALS = 3;
+
+/**
+ * What the drawing means, for a head answer — which is not one sentence.
+ *
+ * The three readings differ in what they can claim: the head set outlines an
+ * object, so its point has an extent and its box *is* that extent; the
+ * pointing head alone has no set to outline with, and its point sits on the
+ * part of the object that head reads.
+ */
+function headNote(kind: "point" | "box", extent: boolean): string {
+  if (kind === "box") {
+    return "The box is the extent the head set outlines around the pointing head's point, and the band around it is what the reading resolves — half an image token per edge, the same on every answer — not a spread. Ask for the chain on a target under two image tokens tall, where it was measured the better box.";
+  }
+  if (extent) {
+    return "The dashed outline is the extent the head set read around the object, and the crosshair is its centre. The solid rectangle is what the reading resolves — half an image token per axis, the same on every answer — not a spread. Ask for the chain when you need finer than that.";
+  }
+  return "The rectangle is one image token — what the pointing head's map can resolve, the same on every answer — and not a spread. This load has no head set, so there is no extent and the point sits on the part of the object that head reads: on a labelled target, where the label begins rather than its centre. Ask for the chain when you need finer than a token.";
+}
+
+/**
  * A point or a box: the picture and its figures side by side, because they are
  * one answer read two ways — the drawing says where, the table says how
  * precisely.
  *
- * A head point (GitHub #260) is the same answer with a different second
- * reading: its extent is the map's **resolution**, one image token, the same
- * on every answer — not a spread that falls off from the centre — and what
- * varies between a strong answer and a weak one is the share of the head's
- * attention the region held. So the extent draws as the rectangle it is, the
- * column that reports it is named for what it is, and the share reads
+ * A head answer (GitHub #260, #263) is the same answer with a different
+ * second reading: its per-axis figure is the reading's **resolution**, the
+ * same on every answer — not a spread that falls off from the centre — and
+ * what varies between a strong answer and a weak one is the share of the
+ * heads' attention the region held. So the figure draws as the rectangle it
+ * is, the column that reports it is named for what it is, and the share reads
  * underneath the way a confidence does.
  */
 function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point" | "box" }>; draft: Draft }) {
   const image = evidenceImage(draft.evidence);
   const axes = AXES[answer.type];
-  // A head point is read in one pass and has no digit trace.
+  // A head answer is read in one pass and has no digit trace.
   const digits = answer.digits;
-  const head = answer.type === "point" && answer.method === "head";
+  const head = answer.method === "head";
+  // The box the head set outlined around the point, where there was a set to
+  // outline with: a head point off the pointing head alone carries none.
+  const extent = answer.type === "point" ? answer.extent : undefined;
+  // An anchored reading resolves a peak *inside* its cell (GitHub #264), so
+  // it answers to half a token; the pointing head alone answers to a whole
+  // one. A head box is always the set's, so it is always the half.
+  const subCell = head && (answer.type === "box" || extent !== undefined);
   return (
     <div className="grid items-start gap-5 sm:grid-cols-2">
       <div className="flex justify-center">
@@ -300,9 +337,10 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
                   sigmaY={answer.uncertainty.y ?? 0}
                   span={Math.min(natural.width, natural.height)}
                   cell={head}
+                  extent={extent}
                 />
               ) : (
-                <BoxGlyph pixels={answer.pixels} sigma={answer.uncertainty} />
+                <BoxGlyph pixels={answer.pixels} sigma={answer.uncertainty} cell={head} />
               )
             }
           </ImageMark>
@@ -317,7 +355,16 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
             <tr className="font-display text-[11px] text-ash">
               <th className="w-10 text-left font-medium">axis</th>
               <th className="text-right font-medium">pixels</th>
-              <th className="text-right font-medium" title={head ? "One image token on this axis: the map's resolution" : "The model's own uncertainty on this axis"}>
+              <th
+                className="text-right font-medium"
+                title={
+                  head
+                    ? subCell
+                      ? "What the reading resolves on this axis: half an image token, because the head set resolves its peak inside the cell"
+                      : "What the reading resolves on this axis: one whole image token, the pointing head's own map"
+                    : "The model's own uncertainty on this axis"
+                }
+              >
                 {head ? "cell px" : "± px"}
               </th>
               <th className="text-right font-medium">on the 0–scale</th>
@@ -328,7 +375,7 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
               <tr key={axis} className="border-t border-line/60">
                 <td className="py-1 font-display text-ash">{axis}</td>
                 <td className="py-1 text-right text-ink">{answer.pixels[axis] ?? "—"}</td>
-                <td className="py-1 text-right text-ash">{(answer.uncertainty[axis] ?? 0).toFixed(1)}</td>
+                <td className="py-1 text-right text-ash">{(answer.uncertainty[axis] ?? 0).toFixed(SPATIAL_DECIMALS)}</td>
                 <td className="py-1 text-right text-ash">{answer.normalized[axis] ?? "—"}</td>
               </tr>
             ))}
@@ -351,9 +398,7 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
       </div>
 
       <p className="text-[12px] leading-snug text-ash sm:col-span-2">
-        {head
-          ? "The rectangle is one image token — what the head's map can resolve, the same on every answer — and not a spread. On a labelled target the point marks where the label begins rather than its centre; on an unlabelled one that is unmeasured. Ask for the chain when you need finer than a token."
-          : "The halo is the model's own uncertainty on each axis, in pixels. It is a self-report, not a bound."}
+        {head ? headNote(answer.type, extent !== undefined) : "The halo is the model's own uncertainty on each axis, in pixels. It is a self-report, not a bound."}
       </p>
     </div>
   );

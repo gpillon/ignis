@@ -405,6 +405,111 @@ describe("Answers", () => {
     expect(html).toContain('vector-effect="non-scaling-stroke"');
   });
 
+  /** A head box as `/v1/decide` answers one (GitHub #263): the head set's extent. */
+  const headBox = (): Answer => ({
+    type: "box",
+    method: "head",
+    pixels: { x0: 10, y0: 20, x1: 110, y1: 120 },
+    normalized: { x0: 25, y0: 100, x1: 275, y1: 600 },
+    uncertainty: { x0: 6.25, y0: 12.5, x1: 6.25, y1: 12.5 },
+    region: { cells: 2, share: 0.41 },
+  });
+
+  it("names the method that answered a box, and draws its band as the resolution it is", () => {
+    // GitHub #263. A head box carries no digit trace and its per-edge figure
+    // is half an image token on every answer — the reading's resolution, not
+    // a spread — so the band is outlined rather than faded out, and the note
+    // must not call it a self-report.
+    const html = render([question("b", "box")], { b: headBox() }, { mode: "image", images: [image], text: "" });
+    expect(html).toContain(">head</span>");
+    expect(html).not.toContain("Digit trace");
+    expect(html).toContain("head set outlines");
+    expect(html).not.toContain("not a bound");
+    // The band is the nominal rect grown by each edge's own figure, and it is
+    // outlined the way a head point's cell is rather than faded out.
+    expect(html).toContain('width="112.5"');
+    expect(html).toContain('opacity="0.12"');
+    expect(html).toContain('stroke="var(--ember)"');
+    // The share the region held is the confidence to act on, beside the cells
+    // it was taken over.
+    expect(html).toContain("0.410");
+    expect(html).toContain("over 2 cells<");
+  });
+
+  it("keeps the chain's halo and self-report on a chain box", () => {
+    const html = render(
+      [question("b", "box")],
+      {
+        b: {
+          type: "box",
+          method: "chain",
+          pixels: { x0: 10, y0: 20, x1: 110, y1: 120 },
+          normalized: { x0: 25, y0: 100, x1: 275, y1: 600 },
+          uncertainty: { x0: 2, y0: 3, x1: 4, y1: 5 },
+          digits: { x0: [{ digit: 0, probability: 0.9 }], y0: [], x1: [], y1: [] },
+        },
+      },
+      { mode: "image", images: [image], text: "" },
+      12,
+    );
+    expect(html).toContain(">chain</span>");
+    expect(html).toContain(">± px<");
+    expect(html).toContain("not a bound");
+    expect(html).toContain("Digit trace");
+    // The chain's band is a spread and fades out: no outline on it.
+    expect(html).toContain('opacity="0.18"');
+    expect(html).not.toContain('stroke="var(--ember)"');
+  });
+
+  it("draws the extent a head set read around a point, and says the point is its centre", () => {
+    // GitHub #263: where the load has a head set, the point is the centre of
+    // the object the set outlined and `extent` is that outline. Dropping it
+    // would throw away the answer's own reading of how far the object goes —
+    // and the reading is a half token there, not the whole one the pointing
+    // head answers to alone.
+    const html = render(
+      [question("p", "point")],
+      { p: { ...headPoint(), uncertainty: { x: 6.25, y: 12.5 }, extent: { x0: 80, y0: 40, x1: 170, y1: 96 } } },
+      { mode: "image", images: [image], text: "" },
+    );
+    expect(html).toContain('x="80"');
+    expect(html).toContain('width="90"');
+    expect(html).toContain('height="56"');
+    expect(html).toContain("stroke-dasharray");
+    expect(html).toContain("crosshair is its centre");
+    // The single head's caveat belongs to the answer that has no set, and
+    // this one does not.
+    expect(html).not.toContain("where the label begins");
+  });
+
+  it("reads a point's and a box's figures to three places, whatever wrote them", () => {
+    // The owner's call: a head answer's figure is a fraction of an image
+    // token, and at one place two readings a quarter of a cell apart printed
+    // as the same number. It is also what every share and confidence on this
+    // page already reads to.
+    const head = render([question("p", "point")], { p: headPoint() }, { mode: "image", images: [image], text: "" });
+    expect(head).toContain(">12.500<");
+    expect(head).toContain(">25.000<");
+    const box = render([question("b", "box")], { b: headBox() }, { mode: "image", images: [image], text: "" });
+    expect(box).toContain(">6.250<");
+    const chain = render(
+      [question("p", "point")],
+      {
+        p: {
+          type: "point",
+          method: "chain",
+          pixels: { x: 120, y: 64 },
+          normalized: { x: 300, y: 320 },
+          uncertainty: { x: 4.5, y: 6 },
+          digits: { x: [], y: [] },
+        },
+      },
+      { mode: "image", images: [image], text: "" },
+    );
+    expect(chain).toContain(">4.500<");
+    expect(chain).toContain(">6.000<");
+  });
+
   it("says a point has no image to draw on rather than drawing nowhere", () => {
     const html = render([question("p", "point")], {
       p: { type: "point", pixels: { x: 1, y: 1 }, normalized: { x: 1, y: 1 }, uncertainty: { x: 0, y: 0 }, digits: {} },
