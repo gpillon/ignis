@@ -37,15 +37,32 @@
 //! never told a tool call happened when the call did not actually
 //! complete.
 //!
-//! **Argument typing.** Each `<parameter>` body is raw text; the value is
-//! `serde_json`-parsed so a model that writes `42`, `true`, `["a","b"]` or
-//! `{"x":1}` round-trips as that JSON type, and anything that fails to
-//! parse as JSON (ordinary prose, a bare path) falls back to a JSON string
-//! containing exactly that text. A single leading and single trailing
-//! newline immediately inside the `<parameter=...>` / `</parameter>` tags
-//! is trimmed (the template's own formatting whitespace); interior
-//! newlines — deliberately preserved by the system prompt's "can span
-//! multiple lines" contract — are not touched.
+//! **Argument typing follows the tool's schema.** Each `<parameter>` body is
+//! raw text, and the dialect carries no type of its own, so the type comes
+//! from the request's `tools` ([`ToolSchemas`]): a parameter the schema
+//! declares a `string` is that exact text even when it reads as JSON — a
+//! `write_file` whose content is `123` or `{"a":1}` gets that text, not a
+//! number or an object — and a declared `integer`, `number`, `boolean`,
+//! `null`, `object` or `array` is parsed as that type, falling back to the
+//! text when it does not parse (the same rule as vLLM's and SGLang's
+//! `qwen3_coder` parsers). A parameter the schema does not describe (no
+//! schemas, an unknown function, an undeclared or untyped parameter) keeps
+//! the schema-free rule: valid JSON round-trips as its own type, anything
+//! else is a string. A single leading and single trailing newline
+//! immediately inside the `<parameter=...>` / `</parameter>` tags is
+//! trimmed (the template's own formatting whitespace); interior newlines —
+//! deliberately preserved by the system prompt's "can span multiple lines"
+//! contract — are not touched.
+//!
+//! **An unclosed parameter ends where the next one starts.** The model
+//! sometimes omits a `</parameter>`, most often on the last parameter
+//! before `</function>`. Such a value runs to the next `<parameter=` or to
+//! the end of the function body, whichever comes first, instead of being
+//! dropped (the `qwen3_coder` parsers' same boundary rule).
+
+use std::collections::HashMap;
+
+use serde_json::Value as JsonValue;
 
 const OPEN_TAG: &str = "<tool_call>";
 const CLOSE_TAG: &str = "</tool_call>";
@@ -85,12 +102,98 @@ enum State {
     Buffering,
 }
 
+/// The JSON types a request's `tools` declare for each function's
+/// parameters — what [`ToolCallScanner`] types an argument by. Built once
+/// per request from the validated `tools` array; an empty set (the
+/// default) types every argument by the schema-free rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolSchemas {
+    /// function name → parameter name → the declared type names
+    /// (`"string"`, `"integer"`, ...). An empty list is an untyped
+    /// parameter.
+    functions: HashMap<String, HashMap<String, Vec<String>>>,
+}
+
+impl ToolSchemas {
+    /// Reads `tools[].function.{name, parameters.properties}`. Entries
+    /// without a name or without `properties` contribute nothing; a
+    /// property's types come from its `type` (a name or a list of names),
+    /// else from its `anyOf` / `oneOf` members' `type`, else from its
+    /// `enum` values' JSON kinds.
+    pub fn from_tools(tools: &[JsonValue]) -> Self {
+        let mut functions = HashMap::new();
+        for tool in tools {
+            let Some(function) = tool.get("function") else { continue };
+            let Some(name) = function.get("name").and_then(JsonValue::as_str) else { continue };
+            let Some(properties) = function
+                .get("parameters")
+                .and_then(|p| p.get("properties"))
+                .and_then(JsonValue::as_object)
+            else {
+                continue;
+            };
+            let params = properties
+                .iter()
+                .map(|(param, schema)| (param.clone(), declared_types(schema)))
+                .collect();
+            functions.insert(name.to_string(), params);
+        }
+        Self { functions }
+    }
+
+    fn param_types(&self, function: &str, param: &str) -> &[String] {
+        self.functions
+            .get(function)
+            .and_then(|params| params.get(param))
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+/// A property schema's declared type names (see [`ToolSchemas::from_tools`]).
+fn declared_types(schema: &JsonValue) -> Vec<String> {
+    fn names(ty: &JsonValue) -> Vec<String> {
+        match ty {
+            JsonValue::String(s) => vec![s.clone()],
+            JsonValue::Array(list) => list.iter().filter_map(JsonValue::as_str).map(str::to_string).collect(),
+            _ => Vec::new(),
+        }
+    }
+    if let Some(ty) = schema.get("type") {
+        return names(ty);
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(members) = schema.get(key).and_then(JsonValue::as_array) {
+            return members.iter().filter_map(|m| m.get("type")).flat_map(names).collect();
+        }
+    }
+    if let Some(values) = schema.get("enum").and_then(JsonValue::as_array) {
+        let mut kinds: Vec<String> = values.iter().map(|v| json_kind(v).to_string()).collect();
+        kinds.dedup();
+        return kinds;
+    }
+    Vec::new()
+}
+
+/// The JSON Schema type name of a JSON value.
+fn json_kind(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
 /// Scans a request's whole content-channel text for tool-call blocks,
 /// across as many `feed` calls as the text arrives in.
 pub struct ToolCallScanner {
     state: State,
     hold: String,
     next_index: usize,
+    schemas: ToolSchemas,
 }
 
 impl Default for ToolCallScanner {
@@ -100,11 +203,19 @@ impl Default for ToolCallScanner {
 }
 
 impl ToolCallScanner {
+    /// A scanner with no schemas: every argument is typed by the
+    /// schema-free rule.
     pub fn new() -> Self {
+        Self::with_schemas(ToolSchemas::default())
+    }
+
+    /// A scanner that types each argument by the request's `tools`.
+    pub fn with_schemas(schemas: ToolSchemas) -> Self {
         Self {
             state: State::Scanning,
             hold: String::new(),
             next_index: 0,
+            schemas,
         }
     }
 
@@ -152,7 +263,7 @@ impl ToolCallScanner {
                     };
                     let body: String = self.hold.drain(..idx + CLOSE_TAG.len()).collect();
                     let inner = &body[..body.len() - CLOSE_TAG.len()];
-                    if let Some((name, arguments)) = parse_function_block(inner) {
+                    if let Some((name, arguments)) = parse_function_block(inner, &self.schemas) {
                         let index = self.next_index;
                         self.next_index += 1;
                         out.push(ToolEvent::Call(ToolCall {
@@ -207,9 +318,10 @@ fn tag_prefix_holdback(text: &str, tag: &str) -> usize {
 
 /// Parses `<function=NAME>...<parameter=P>VALUE</parameter>...</function>`
 /// (the text between `<tool_call>` and `</tool_call>`, both already
-/// stripped) into `(name, json_arguments)`. Returns `None` if the block
-/// does not open with `<function=` or never closes with `</function>`.
-fn parse_function_block(inner: &str) -> Option<(String, String)> {
+/// stripped) into `(name, json_arguments)`, typing each argument by
+/// `schemas`. Returns `None` if the block does not open with `<function=`
+/// or never closes with `</function>`.
+fn parse_function_block(inner: &str, schemas: &ToolSchemas) -> Option<(String, String)> {
     let after_prefix = inner.trim_start().strip_prefix(FUNCTION_PREFIX)?;
     let name_end = after_prefix.find('>')?;
     let name = after_prefix[..name_end].to_string();
@@ -224,13 +336,20 @@ fn parse_function_block(inner: &str) -> Option<(String, String)> {
         };
         let param_name = after[..name_end].to_string();
         let after_name = &after[name_end + 1..];
-        let Some(value_end) = after_name.find(PARAMETER_CLOSE) else {
-            break; // an unclosed parameter: stop, keep what we have
+        // The value ends at its `</parameter>`, or — when the model left it
+        // unclosed — at the next `<parameter=` or the end of the body.
+        let close = after_name.find(PARAMETER_CLOSE);
+        let next = after_name.find(PARAMETER_PREFIX);
+        let (value_end, resume) = match (close, next) {
+            (Some(c), Some(n)) if n < c => (n, n),
+            (Some(c), _) => (c, c + PARAMETER_CLOSE.len()),
+            (None, Some(n)) => (n, n),
+            (None, None) => (after_name.len(), after_name.len()),
         };
-        let raw_value = &after_name[..value_end];
-        let value = trim_one_newline(raw_value);
-        args.insert(param_name, parse_argument_value(value));
-        rest = &after_name[value_end + PARAMETER_CLOSE.len()..];
+        let value = trim_one_newline(&after_name[..value_end]);
+        let types = schemas.param_types(&name, &param_name);
+        args.insert(param_name, parse_argument_value(value, types));
+        rest = &after_name[resume..];
     }
     let arguments = serde_json::to_string(&serde_json::Value::Object(args))
         .expect("a Map<String, Value> always serializes");
@@ -245,11 +364,49 @@ fn trim_one_newline(value: &str) -> &str {
     value.strip_suffix('\n').unwrap_or(value)
 }
 
-/// A parameter's JSON type: valid JSON (a number, bool, array, object, or
-/// an explicitly quoted string) round-trips as that type; anything else —
-/// ordinary text — becomes a JSON string of exactly that text.
-fn parse_argument_value(value: &str) -> serde_json::Value {
-    serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.to_string()))
+/// A parameter's JSON value, given the schema's declared `types` for it.
+///
+/// - No declared type: valid JSON (a number, bool, array, object, or an
+///   explicitly quoted string) round-trips as that type; anything else —
+///   ordinary text — becomes a JSON string of exactly that text.
+/// - `null` declared and the text is `null`: JSON null.
+/// - `string` declared: the text, whatever it looks like.
+/// - Otherwise the first declared type the text parses as (an `integer`
+///   must be integral, a `boolean` is `true`/`false` in any case, an
+///   `object`/`array` must be JSON of that kind), else the text as a
+///   string — a value never disappears because it disagrees with its
+///   schema.
+fn parse_argument_value(value: &str, types: &[String]) -> JsonValue {
+    let text = || JsonValue::String(value.to_string());
+    if types.is_empty() {
+        return serde_json::from_str(value).unwrap_or_else(|_| text());
+    }
+    let declares = |name: &str| types.iter().any(|t| t == name);
+    let trimmed = value.trim();
+    if declares("null") && trimmed == "null" {
+        return JsonValue::Null;
+    }
+    if declares("string") {
+        return text();
+    }
+    for ty in types {
+        let parsed = match ty.as_str() {
+            "integer" => trimmed.parse::<i64>().ok().map(JsonValue::from),
+            "number" => serde_json::from_str::<JsonValue>(trimmed).ok().filter(JsonValue::is_number),
+            "boolean" => match trimmed.to_ascii_lowercase().as_str() {
+                "true" => Some(JsonValue::Bool(true)),
+                "false" => Some(JsonValue::Bool(false)),
+                _ => None,
+            },
+            "object" => serde_json::from_str::<JsonValue>(trimmed).ok().filter(JsonValue::is_object),
+            "array" => serde_json::from_str::<JsonValue>(trimmed).ok().filter(JsonValue::is_array),
+            _ => None,
+        };
+        if let Some(parsed) = parsed {
+            return parsed;
+        }
+    }
+    text()
 }
 
 #[cfg(test)]
@@ -448,5 +605,154 @@ mod tests {
         assert_eq!(content(&streamed), content(&batched));
         assert_eq!(calls(&streamed).len(), calls(&batched).len());
         assert_eq!(calls(&streamed)[0].arguments, calls(&batched)[0].arguments);
+    }
+
+    // ── schema-typed arguments and unclosed parameters ───────────────────
+
+    fn run_with(tools: serde_json::Value, chunks: &[&str]) -> Vec<ToolEvent> {
+        let tools: Vec<JsonValue> = serde_json::from_value(tools).unwrap();
+        let mut scanner = ToolCallScanner::with_schemas(ToolSchemas::from_tools(&tools));
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(scanner.feed(chunk));
+        }
+        events.extend(scanner.finish());
+        events
+    }
+
+    fn write_file_tool() -> serde_json::Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "line": {"type": "integer"},
+                        "ratio": {"type": "number"},
+                        "force": {"type": "boolean"},
+                        "tags": {"type": "array"},
+                        "meta": {"type": "object"},
+                        "note": {"type": ["string", "null"]},
+                        "limit": {"type": ["integer", "null"]},
+                        "mode": {"enum": ["a", "b"]},
+                        "either": {"anyOf": [{"type": "integer"}, {"type": "boolean"}]},
+                        "free": {}
+                    }
+                }
+            }
+        }])
+    }
+
+    fn one_param(param: &str, value: &str) -> String {
+        format!("<tool_call>\n<function=write_file>\n<parameter={param}>\n{value}\n</parameter>\n</function>\n</tool_call>")
+    }
+
+    fn typed(param: &str, value: &str) -> serde_json::Value {
+        let events = run_with(write_file_tool(), &[&one_param(param, value)]);
+        args(calls(&events)[0])[param].clone()
+    }
+
+    #[test]
+    fn a_declared_string_keeps_json_looking_text_as_text() {
+        assert_eq!(typed("content", "123"), serde_json::json!("123"));
+        assert_eq!(typed("content", "{\"a\":1}"), serde_json::json!("{\"a\":1}"));
+        assert_eq!(typed("content", "true"), serde_json::json!("true"));
+        assert_eq!(typed("content", "[1, 2]"), serde_json::json!("[1, 2]"));
+        assert_eq!(typed("content", "\"quoted\""), serde_json::json!("\"quoted\""));
+        assert_eq!(typed("content", "null"), serde_json::json!("null"));
+    }
+
+    #[test]
+    fn declared_scalar_types_are_parsed_as_that_type() {
+        assert_eq!(typed("line", "42"), serde_json::json!(42));
+        assert_eq!(typed("ratio", "0.5"), serde_json::json!(0.5));
+        assert_eq!(typed("ratio", "3"), serde_json::json!(3));
+        assert_eq!(typed("force", "true"), serde_json::json!(true));
+        assert_eq!(typed("force", "False"), serde_json::json!(false));
+        assert_eq!(typed("tags", "[\"a\",\"b\"]"), serde_json::json!(["a", "b"]));
+        assert_eq!(typed("meta", "{\"k\": 1}"), serde_json::json!({"k": 1}));
+    }
+
+    #[test]
+    fn a_value_that_disagrees_with_its_schema_is_kept_as_text() {
+        assert_eq!(typed("line", "4.5"), serde_json::json!("4.5"));
+        assert_eq!(typed("line", "forty"), serde_json::json!("forty"));
+        assert_eq!(typed("force", "yes"), serde_json::json!("yes"));
+        assert_eq!(typed("tags", "{\"not\": \"an array\"}"), serde_json::json!("{\"not\": \"an array\"}"));
+        assert_eq!(typed("meta", "[1]"), serde_json::json!("[1]"));
+    }
+
+    #[test]
+    fn a_nullable_type_reads_null_and_otherwise_its_other_type() {
+        assert_eq!(typed("note", "null"), serde_json::Value::Null);
+        assert_eq!(typed("note", "42"), serde_json::json!("42"));
+        assert_eq!(typed("limit", "null"), serde_json::Value::Null);
+        assert_eq!(typed("limit", "7"), serde_json::json!(7));
+    }
+
+    #[test]
+    fn enum_and_any_of_members_supply_the_types() {
+        assert_eq!(typed("mode", "a"), serde_json::json!("a"));
+        assert_eq!(typed("either", "7"), serde_json::json!(7));
+        assert_eq!(typed("either", "true"), serde_json::json!(true));
+    }
+
+    #[test]
+    fn an_untyped_or_undeclared_parameter_keeps_the_schema_free_rule() {
+        assert_eq!(typed("free", "42"), serde_json::json!(42));
+        assert_eq!(typed("undeclared", "{\"x\":1}"), serde_json::json!({"x": 1}));
+        assert_eq!(typed("undeclared", "plain text"), serde_json::json!("plain text"));
+        // A function the tools do not name at all.
+        let events = run_with(
+            write_file_tool(),
+            &["<tool_call>\n<function=other>\n<parameter=content>\n123\n</parameter>\n</function>\n</tool_call>"],
+        );
+        assert_eq!(args(calls(&events)[0])["content"], serde_json::json!(123));
+    }
+
+    #[test]
+    fn schemas_ignore_tools_without_a_name_or_properties() {
+        let tools: Vec<JsonValue> = serde_json::from_value(serde_json::json!([
+            {"type": "function", "function": {"parameters": {"properties": {"x": {"type": "string"}}}}},
+            {"type": "function", "function": {"name": "f"}},
+            {"type": "function", "function": {"name": "g", "parameters": {"type": "object"}}}
+        ]))
+        .unwrap();
+        assert_eq!(ToolSchemas::from_tools(&tools), ToolSchemas::default());
+    }
+
+    #[test]
+    fn an_unclosed_last_parameter_runs_to_the_end_of_the_function() {
+        let events = run(&[
+            "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nline one\nline two\n</function>\n</tool_call>",
+        ]);
+        assert_eq!(
+            args(calls(&events)[0]),
+            serde_json::json!({"path": "a.txt", "content": "line one\nline two"})
+        );
+    }
+
+    #[test]
+    fn an_unclosed_parameter_ends_where_the_next_one_starts() {
+        let events = run(&[
+            "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n<parameter=content>\nhello\n</parameter>\n</function>\n</tool_call>",
+        ]);
+        assert_eq!(
+            args(calls(&events)[0]),
+            serde_json::json!({"path": "a.txt", "content": "hello"})
+        );
+    }
+
+    #[test]
+    fn an_unclosed_parameter_split_across_chunks_still_parses() {
+        let events = run(&[
+            "<tool_call>\n<function=f>\n<param",
+            "eter=x>\n1\n</funct",
+            "ion>\n</tool_call>",
+        ]);
+        assert_eq!(args(calls(&events)[0]), serde_json::json!({"x": 1}));
     }
 }

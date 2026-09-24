@@ -51,7 +51,7 @@ use crate::template::{
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
 };
-use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent};
+use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
 
 /// The request body limit of a `--vision` load, in bytes (the reference's
 /// `--max-request-mib` default). It is this size because it is the media
@@ -715,14 +715,16 @@ fn split_reasoning(
 /// channel's text is fed through a fresh [`ToolCallScanner`] so the
 /// non-streaming path parses tool calls with exactly the same rules as the
 /// streaming path (a call left open by a truncated generation is dropped,
-/// never returned half-written — acceptance criterion 3).
+/// never returned half-written — acceptance criterion 3). Arguments are
+/// typed by the request's `tools` (`schemas`).
 fn split_reasoning_and_tools(
     template: &dyn TemplateProvider,
     tokens: &[ignis_core::TokenId],
     thinking: &ThinkingOptions,
+    schemas: ToolSchemas,
 ) -> (Option<String>, String, Vec<ScannedToolCall>) {
     let (reasoning, content_text) = split_reasoning(template, tokens, thinking);
-    let mut scanner = ToolCallScanner::new();
+    let mut scanner = ToolCallScanner::with_schemas(schemas);
     let mut events = scanner.feed(&content_text);
     events.extend(scanner.finish());
     let mut content = String::new();
@@ -1076,6 +1078,7 @@ async fn chat_completions(
         Ok(x) => x,
         Err(message) => return bad_request(&message),
     };
+    let schemas = ToolSchemas::from_tools(&tools);
     let (input, model, prompt_tokens, media) =
         match prepare_request(&server, model, &req.messages, params, &thinking, &tools).await {
             Ok(prepared) => prepared,
@@ -1105,6 +1108,7 @@ async fn chat_completions(
             created,
             model,
             OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
+            schemas,
             prompt_tokens,
             include_usage,
         ))
@@ -1116,7 +1120,7 @@ async fn chat_completions(
         Ok((_, FinishReason::Error)) => engine_error_response(),
         Ok((tokens, reason)) => {
             let (reasoning_content, content, tool_calls) =
-                split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking);
+                split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking, schemas);
             let completion_tokens = tokens.len() as u32;
             let finish_reason = resolve_finish_reason(reason, !tool_calls.is_empty(), false);
             report_if_all_reasoning_no_content(
@@ -1383,6 +1387,7 @@ impl ChunkStream {
         created: u64,
         model: String,
         decoder: OutputDecoder,
+        schemas: ToolSchemas,
         prompt_tokens: u32,
         include_usage: bool,
     ) -> Self {
@@ -1393,7 +1398,7 @@ impl ChunkStream {
             created,
             model,
             decoder,
-            tool_scanner: ToolCallScanner::new(),
+            tool_scanner: ToolCallScanner::with_schemas(schemas),
             prompt_tokens,
             include_usage,
             pending: VecDeque::new(),

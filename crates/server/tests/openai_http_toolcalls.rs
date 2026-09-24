@@ -364,3 +364,76 @@ async fn a_streamed_call_truncated_by_max_tokens_is_dropped_not_half_written() {
     assert_eq!(finish_reason.as_deref(), Some("length"));
     assert!(!body.contains("<tool_call"), "raw XML leaked: {body}");
 }
+
+// ── schema-typed arguments ───────────────────────────────────────────────
+
+/// A `write_file` call whose content reads as JSON: with the request's
+/// `tools` declaring `content` a string, the argument is that text on both
+/// paths — not the number the schema-free rule would make of it.
+fn json_looking_content_decode_map(id: u64) -> HashMap<TokenId, &'static str> {
+    let mock = MockCompute::new();
+    let mut map = HashMap::new();
+    map.insert(
+        mock.token_for(id, 0),
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.json\n</parameter>\n<parameter=content>\n123\n</parameter>\n<parameter=line>\n7\n</function>\n</tool_call>",
+    );
+    map
+}
+
+fn write_file_tools() -> serde_json::Value {
+    serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "line": {"type": "integer"}
+                }
+            }
+        }
+    }])
+}
+
+#[tokio::test]
+async fn non_streaming_types_arguments_by_the_request_tools() {
+    let h = harness_with(RecordingTemplateProvider::permissive(json_looking_content_decode_map(0)));
+    let req = serde_json::json!({
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tools": write_file_tools(),
+        "max_tokens": 1,
+        "enable_thinking": false
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let calls = v["choices"][0]["message"]["tool_calls"].as_array().expect("tool_calls present");
+    let args: serde_json::Value =
+        serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args, serde_json::json!({"path": "a.json", "content": "123", "line": 7}));
+}
+
+#[tokio::test]
+async fn streaming_types_arguments_by_the_request_tools() {
+    let h = harness_with(RecordingTemplateProvider::permissive(json_looking_content_decode_map(0)));
+    let req = serde_json::json!({
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tools": write_file_tools(),
+        "max_tokens": 1,
+        "enable_thinking": false,
+        "stream": true
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "{body}");
+    let deltas: Vec<serde_json::Value> = sse_chunks(&body)
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"].get("tool_calls").and_then(|v| v.as_array()).cloned())
+        .flatten()
+        .collect();
+    assert_eq!(deltas.len(), 1);
+    let args: serde_json::Value =
+        serde_json::from_str(deltas[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args, serde_json::json!({"path": "a.json", "content": "123", "line": 7}));
+}
