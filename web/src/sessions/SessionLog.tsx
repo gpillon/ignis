@@ -46,7 +46,7 @@ export function SessionLog({ rows, open, onToggle }: { rows: LogRow[]; open: boo
               <table className="w-full border-collapse font-display text-[13px] tabular-nums">
                 <thead className="sticky top-0 bg-ground text-ash">
                   <tr className="border-b border-line">
-                    {["#", "Time", "Lane tag", "Thinking"].map((h) => (
+                    {["#", "Time", "Lane tag", "Thinking", "Budget"].map((h) => (
                       <Th key={h}>{h}</Th>
                     ))}
                     {numeric.map((h) => (
@@ -71,6 +71,9 @@ export function SessionLog({ rows, open, onToggle }: { rows: LogRow[]; open: boo
                         )}
                       </td>
                       <td className="px-3 py-1.5">{EFFORT_LABELS[row.reasoningEffort]}</td>
+                      <td className="px-3 py-1.5 whitespace-nowrap">
+                        <BudgetCell row={row} />
+                      </td>
                       {row.figures ? (
                         <FigureCells figures={row.figures} />
                       ) : (
@@ -87,6 +90,29 @@ export function SessionLog({ rows, open, onToggle }: { rows: LogRow[]; open: boo
         </div>
       </div>
     </section>
+  );
+}
+
+/**
+ * The thinking budget a request sent, and where the budget closed its
+ * reasoning when it did. Thinking off and the `max` effort send none and
+ * cannot have one; any other effort that sent none ran on the server's default.
+ */
+function BudgetCell({ row }: { row: LogRow }) {
+  const forcedAt = row.figures?.thinkingForcedAt;
+  const sent =
+    row.reasoningEffort === "none" || row.reasoningEffort === "max"
+      ? "—"
+      : row.thinkingBudget === undefined
+        ? "default"
+        : row.thinkingBudget === 0
+          ? "off"
+          : String(row.thinkingBudget);
+  return (
+    <>
+      {sent}
+      {forcedAt !== undefined && <span className="text-ember"> · reached {forcedAt}</span>}
+    </>
   );
 }
 
