@@ -138,7 +138,7 @@ always-current table; this one is a copy.
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--enable-thinking <bool>` | `IGNIS_ENABLE_THINKING` | `true` | The server-wide default for `enable_thinking`. |
-| `--reasoning-effort <value>` | `IGNIS_REASONING_EFFORT` | template default | The server-wide default `reasoning_effort`. |
+| `--reasoning-effort <value>` | `IGNIS_REASONING_EFFORT` | template default | The server-wide default `reasoning_effort`. An effort the template does not take is rounded up to one it does (Qwen3.8: `high` and `max` are `xhigh`, `minimal` is `low`), the same as a per-request one. |
 | `--system-message-policy <p>` | `IGNIS_SYSTEM_MESSAGE_POLICY` | `merge` | `merge`: a leading run of system messages joins the system prompt, a later one is its own block in place. `strict`: a system message that is not first is a 400. |
 | `--developer-message-policy <p>` | `IGNIS_DEVELOPER_MESSAGE_POLICY` | `inplace` | One of `inplace`, `into-system`, `after-system`, `one-after-system`, `reject`. A leading developer message is the system prompt except under `reject`. |
 

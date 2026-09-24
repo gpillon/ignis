@@ -246,9 +246,11 @@ async fn an_unknown_reasoning_effort_is_a_400_listing_accepted_values() {
 
 #[tokio::test]
 async fn an_effort_the_template_cannot_honour_is_a_400_with_a_distinct_code() {
+    // A template that takes no effort at all: any other set rounds the
+    // effort to one it takes (the next test).
     let caps = ThinkingCapabilities {
         can_disable: true,
-        supported_efforts: [ReasoningEffort::Low].into_iter().collect(),
+        supported_efforts: Default::default(),
     };
     let h = harness_with(RecordingTemplateProvider::new(caps, HashMap::new()));
     let req = serde_json::json!({
@@ -261,6 +263,29 @@ async fn an_effort_the_template_cannot_honour_is_a_400_with_a_distinct_code() {
     // A capability error is distinguishable from a plain validation error
     // (the wire contract's machine-readable `code`).
     assert_eq!(v["error"]["code"], "reasoning_effort_unsupported");
+}
+
+#[tokio::test]
+async fn a_high_effort_reaches_a_qwen38_template_as_xhigh() {
+    // Qwen3.8's template raises on anything but low/medium/xhigh, and coding
+    // agents send the OpenAI vocabulary's `high`.
+    let caps = ThinkingCapabilities {
+        can_disable: true,
+        supported_efforts: [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::Xhigh]
+            .into_iter()
+            .collect(),
+    };
+    let h = harness_with(RecordingTemplateProvider::new(caps, HashMap::new()));
+    let req = serde_json::json!({
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 1,
+        "reasoning_effort": "high"
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "{body}");
+    let options = h.template.captured_options();
+    assert!(options[0].enable_thinking);
+    assert_eq!(options[0].reasoning_effort, Some(ReasoningEffort::Xhigh));
 }
 
 #[tokio::test]

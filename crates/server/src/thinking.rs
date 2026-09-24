@@ -148,20 +148,49 @@ pub fn resolve(
             "the loaded template cannot disable thinking".to_owned(),
         ));
     }
-    if let Some(effort) = resolved_effort {
-        if !capabilities.supports(effort) {
-            return Err(ThinkingError::Capability(format!(
-                "the loaded template does not support reasoning_effort \"{}\"",
+    let honoured_effort = match resolved_effort {
+        Some(effort) => Some(honoured_effort(effort, capabilities).ok_or_else(|| {
+            ThinkingError::Capability(format!(
+                "the loaded template does not support reasoning_effort \"{}\" (it takes no effort at all)",
                 effort.as_str()
-            )));
-        }
-    }
+            ))
+        })?),
+        None => None,
+    };
 
     Ok(ThinkingOptions {
         enable_thinking: resolved_enable,
-        reasoning_effort: resolved_effort,
+        reasoning_effort: honoured_effort,
         preserve_thinking: preserve.unwrap_or(false),
     })
+}
+
+/// The effort the loaded template actually receives for a requested one:
+/// the effort itself when the template takes it, else the **nearest effort
+/// above it** the template takes, else the nearest below.
+///
+/// Clients speak the OpenAI vocabulary (`low`/`medium`/`high`), and Qwen3.8's
+/// template raises on anything but `low`/`medium`/`xhigh`; a coding agent that
+/// sends its default `high` must get thinking, not a 400. Rounding up means a
+/// client never gets less effort than it asked for: `high` and `max` are
+/// `xhigh`, `minimal` is `low`. `None` only when the template takes no effort
+/// at all.
+pub fn honoured_effort(
+    effort: ReasoningEffort,
+    capabilities: &ThinkingCapabilities,
+) -> Option<ReasoningEffort> {
+    if capabilities.supports(effort) {
+        return Some(effort);
+    }
+    let supported = capabilities
+        .supported_efforts
+        .iter()
+        .copied()
+        .filter(|e| *e != ReasoningEffort::None);
+    supported
+        .clone()
+        .find(|e| *e > effort)
+        .or_else(|| supported.filter(|e| *e < effort).max())
 }
 
 #[derive(Debug, Default)]
@@ -288,7 +317,7 @@ pub fn validate_defaults(
     }
     if defaults.enable_thinking {
         if let Some(effort) = defaults.reasoning_effort {
-            if !capabilities.supports(effort) {
+            if honoured_effort(effort, capabilities).is_none() {
                 return Err(format!(
                     "the loaded template does not support IGNIS_REASONING_EFFORT={}",
                     effort.as_str()
@@ -493,10 +522,10 @@ mod tests {
     }
 
     #[test]
-    fn an_effort_the_template_cannot_honour_is_a_capability_error() {
+    fn an_effort_on_a_template_that_takes_none_is_a_capability_error() {
         let caps = ThinkingCapabilities {
             can_disable: true,
-            supported_efforts: [ReasoningEffort::Low].into_iter().collect(),
+            supported_efforts: Default::default(),
         };
         let err = resolve(
             fields(None, Some(&json!("high")), None, None),
@@ -505,6 +534,63 @@ mod tests {
         )
         .expect_err("must reject");
         assert!(matches!(err, ThinkingError::Capability(_)));
+    }
+
+    /// What Qwen3.8's template takes: `low`, `medium`, `xhigh`.
+    fn qwen38() -> ThinkingCapabilities {
+        ThinkingCapabilities {
+            can_disable: true,
+            supported_efforts: [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::Xhigh]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_effort_the_template_does_not_take_rounds_up_to_the_next_it_does() {
+        for (asked, honoured) in [
+            ("minimal", ReasoningEffort::Low),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::Xhigh),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("max", ReasoningEffort::Xhigh),
+        ] {
+            let opts = resolve(
+                fields(None, Some(&json!(asked)), None, None),
+                &ThinkingDefaults::default(),
+                &qwen38(),
+            )
+            .unwrap_or_else(|e| panic!("{asked}: {e:?}"));
+            assert!(opts.enable_thinking, "{asked}");
+            assert_eq!(opts.reasoning_effort, Some(honoured), "{asked}");
+        }
+    }
+
+    #[test]
+    fn an_effort_above_every_one_the_template_takes_rounds_down() {
+        let caps = ThinkingCapabilities {
+            can_disable: true,
+            supported_efforts: [ReasoningEffort::Low].into_iter().collect(),
+        };
+        let opts = resolve(
+            fields(None, Some(&json!("high")), None, None),
+            &ThinkingDefaults::default(),
+            &caps,
+        )
+        .expect("resolve");
+        assert_eq!(opts.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn a_server_default_effort_is_rounded_like_a_requested_one() {
+        let defaults = ThinkingDefaults {
+            enable_thinking: true,
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        assert!(validate_defaults(&defaults, &qwen38()).is_ok());
+        let opts = resolve(fields(None, None, None, None), &defaults, &qwen38()).expect("resolve");
+        assert_eq!(opts.reasoning_effort, Some(ReasoningEffort::Xhigh));
     }
 
     #[test]
@@ -581,7 +667,7 @@ mod tests {
     fn validate_defaults_rejects_a_default_the_template_cannot_honour() {
         let caps = ThinkingCapabilities {
             can_disable: true,
-            supported_efforts: [ReasoningEffort::Low].into_iter().collect(),
+            supported_efforts: Default::default(),
         };
         let bad = ThinkingDefaults {
             enable_thinking: true,
@@ -592,6 +678,6 @@ mod tests {
             enable_thinking: true,
             reasoning_effort: Some(ReasoningEffort::Low),
         };
-        assert!(validate_defaults(&ok, &caps).is_ok());
+        assert!(validate_defaults(&ok, &qwen38()).is_ok());
     }
 }

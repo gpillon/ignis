@@ -98,10 +98,14 @@ against ninfer works against ignis unchanged.
     the model's most careful reasoning, matching the template's default.
 12. As an API client, I want `reasoning_effort: "none"` to disable thinking
     entirely, so that I can express the whole control through one field.
-13. As an API client, I want to send an effort the loaded template cannot
-    honour (`minimal`, `high`, `max`) and receive a 400 that says the template
-    does not support it, so that I can distinguish "you typed something
-    invalid" from "this model cannot do that".
+13. As an API client, I want to send an effort the loaded template does not
+    take (`minimal`, `high`, `max`) and get the nearest effort it does take,
+    rounded up (`high` and `max` are `xhigh`, `minimal` is `low`), so that a
+    coding agent sending the OpenAI vocabulary's `high` gets thinking and not a
+    400. Only a template that takes no effort at all answers a 400 that says
+    the template does not support it. (Amended 2026-09-24: this was a 400 for
+    every effort outside the template's set, which refused the default of
+    every OpenAI-vocabulary client.)
 14. As an API client, I want a `reasoning_effort` outside the protocol
     vocabulary entirely to be rejected with a 400 listing the accepted values,
     so that I can correct a typo without reading the source.
@@ -266,7 +270,7 @@ then resolved against the probed capability set:
 | --- | --- |
 | `none` | thinking disabled; a template that cannot disable thinking is a capability error |
 | `low`, `medium`, `xhigh` | thinking enabled, effort passed to the template |
-| `minimal`, `high`, `max` | capability error: not supported by the loaded template |
+| `minimal`, `high`, `max` | thinking enabled, the nearest effort the template takes, rounded up: `minimal` is `low`, `high` and `max` are `xhigh`; the nearest below when none is above; a capability error only when the template takes no effort at all |
 | anything else | validation error listing the accepted values |
 
 A `reasoning_effort` that implies a different thinking state than an explicit
