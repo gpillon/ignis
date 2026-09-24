@@ -66,6 +66,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
     __shared__ std::int32_t physical_pages_s[PageIds];
     __shared__ std::int8_t signs_s[KvSource::rotated ? kGqaHeadDim : 1];
+    // hq (ignis, GitHub #268): a tile's code and meta rows, staged by cp.async one
+    // tile ahead into two buffers of [K codes | V codes | K meta | V meta]. The 32
+    // rows of a tile share one page, so each part is one contiguous run.
+    constexpr int kHqStageCodes = Bc * kHqRowBudgetBytes;
+    constexpr int kHqStageMeta  = Bc * kHqMetaBytes;
+    constexpr int kHqStageBytes = 2 * (kHqStageCodes + kHqStageMeta);
+    __shared__ __align__(16) std::uint8_t hq_stage_s[KvSource::hq ? 2 * kHqStageBytes : 16];
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
 
@@ -258,6 +265,33 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         __syncthreads();
     }
 
+    // hq: stage tile kb's code/meta rows into buffer kb & 1 (one commit group per
+    // call on every thread). Issued after the fused append's barrier, so the rows
+    // it just encoded are the ones staged.
+    auto hq_stage_tile = [&](int kb) {
+        if constexpr (KvSource::hq) {
+            const int k0   = first_tile + kb * Bc;
+            const int page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+            const std::int64_t codes_off = paged_kv_element_offset<kHqCodePlaneExtent, Geometry::KVHeads>(
+                page, kv_head, k0 & kPagedKVPageMask, 0);
+            const std::int64_t meta_off = paged_kv_element_offset<kHqMetaPlaneExtent, Geometry::KVHeads>(
+                page, kv_head, k0 & kPagedKVPageMask, 0);
+            std::uint8_t* stage = hq_stage_s + (kb & 1) * kHqStageBytes;
+            for (int chunk = tid; chunk < kHqStageBytes / 16; chunk += Threads) {
+                const int b = chunk * 16;
+                const std::uint8_t* src =
+                    b < kHqStageCodes      ? kv.codes_k + codes_off + b
+                    : b < 2 * kHqStageCodes ? kv.codes_v + codes_off + (b - kHqStageCodes)
+                    : b < 2 * kHqStageCodes + kHqStageMeta
+                        ? kv.meta_k + meta_off + (b - 2 * kHqStageCodes)
+                        : kv.meta_v + meta_off + (b - 2 * kHqStageCodes - kHqStageMeta);
+                ninfer::ops::cp_async<16, Cache::cg>(stage + b, src);
+            }
+            ninfer::ops::cp_commit();
+        }
+    };
+    hq_stage_tile(0);
+
     for (int idx = tid; idx < Br * D; idx += Threads) {
         const int row = idx / D;
         const int d   = idx - row * D;
@@ -313,6 +347,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
                     smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
     }
+    if constexpr (KvSource::hq) { ninfer::ops::cp_wait<0>(); }  // tile 0's staged rows
     __syncthreads();
     int physical_page = physical_pages_s[0];
     float acc[PVNt][4];
@@ -326,6 +361,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
         if constexpr (KvSource::hq) {
+            // The next tile's rows land while this one decodes and multiplies; its
+            // buffer was last read by tile kb - 1, before that tile's barrier.
+            if (kb + 1 < key_blocks) { hq_stage_tile(kb + 1); }
+            const std::uint8_t* stage = hq_stage_s + (kb & 1) * kHqStageBytes;
             // Tile source: group-decode the K/V rows straight into the swizzled
             // tile positions. Under the XOR swizzle each lattice word's 8
             // outputs stay contiguous, so the decoder only remaps the word base
@@ -359,11 +398,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                                       load_vec<int4>(side + lane8 * 32 + j * 8));
                         }
                     } else {
-                        hq_decode_row_group(
-                            hq_row_codes<Geometry>(role_v ? kv.codes_v : kv.codes_k, block_table,
-                                                  kv_head, key),
-                            hq_row_meta<Geometry>(role_v ? kv.meta_v : kv.meta_k, block_table,
-                                                 kv_head, key),
+                        hq_decode_row_group_fast(
+                            stage + (role_v ? kHqStageCodes : 0) + key_l * kHqRowBudgetBytes,
+                            stage + 2 * kHqStageCodes + (role_v ? kHqStageMeta : 0) +
+                                key_l * kHqMetaBytes,
                             row_dst, lane8, key_l & 7, hq_dither_row_seed(kv_head, key, role_v));
                     }
                 } else {
@@ -536,6 +574,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                          vf[0], vf[1]);
             }
         }
+        if constexpr (KvSource::hq) { ninfer::ops::cp_wait<0>(); }  // tile kb + 1's staged rows
         __syncthreads();
     }
 

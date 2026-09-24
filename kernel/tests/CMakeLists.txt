@@ -335,6 +335,16 @@ target_compile_definitions(ignis_hq_codec_kv_rows_test PRIVATE
 target_link_libraries(ignis_hq_codec_kv_rows_test PRIVATE ignis_vendor)
 add_test(NAME ignis_hq_codec_kv_rows_test COMMAND ignis_hq_codec_kv_rows_test)
 
+# GitHub #268 (spec runtime/09): OURS -- the hq-e8-2b verify attention kernel
+# timed alone at the engine's real launch, over code planes encoded from the
+# same committed fixture rows, plus a hash of its partials so two builds can
+# be compared bit for bit. A timing is a finding, not a pass/fail, so this is
+# a tool and deliberately NOT registered with CTest.
+add_executable(ignis_hq_verify_bench bench_hq_verify_attention.cu)
+target_compile_definitions(ignis_hq_verify_bench PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_link_libraries(ignis_hq_verify_bench PRIVATE ignis_vendor)
+
 # P4-04 (GitHub #122): OURS, not vendored -- the KV append path under both
 # storage formats. It builds two sequence pools differing only in
 # `ignis_seq_pool_spec::kv_format`, appends the same real fixture rows to a

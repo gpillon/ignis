@@ -974,4 +974,238 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
     }
 }
 
+// ---- 8-lane cooperative row decode, throughput form -------------------------
+//
+// ignis, ADR 0031 (GitHub #268): hq_decode_row_group<true>'s values from fewer
+// instructions and more independent work, for the verify attention kernel
+// whose round cost is this decode
+// (docs/findings/2026-09-24-hq-attention-at-long-context.md). Per row the
+// arguments, the contract (16-byte aligned `out` and `symbols`) and the
+// symbol staging slots are hq_decode_row_group's; only a k = 0 row takes a
+// new path, every other row (never written, k > kHqMaxRiceK, general k) is
+// hq_decode_row_group<true>.
+//   - The eight lanes decode R rows at once, every step interleaved across
+//     them, so a lane carries 2R independent dependency chains.
+//   - A lane walks its window as its two 32-bit stream words, one terminator
+//     of each per step: 32-bit clz and a clamped funnel shift in place of
+//     64-bit shifts, and a step count bounded by the fullest word rather than
+//     the fullest window.
+//   - Unstrip without branches or a running sum: 2*unzigzag(z) = z ^ -(z & 1),
+//     y = 2*s + c = z ^ -(z & 1) ^ c (2*s is even), and the parity of the sum
+//     of s is bit 1 of the xor of the first seven y.
+//   - The dither and scale are the reference's own expression per element,
+//     so every value takes the same roundings.
+// Leading zeros of a word known to be non-zero, in one instruction (clz's
+// own lowering adds a subtract). On zero it returns -1, which shifts by 0.
+__device__ __forceinline__ int hq_clz_nonzero(std::uint32_t v) {
+    std::uint32_t r;
+    asm("bfind.shiftamt.u32 %0, %1;" : "=r"(r) : "r"(v));
+    return static_cast<int>(r);
+}
+
+struct HqGroupRow {
+    const std::uint8_t* codes;
+    const std::uint8_t* meta;
+    __nv_bfloat16* out;
+    int xor_chunk;
+    std::uint64_t dither_seed;
+    std::uint16_t* symbols;  // null: staged in `out`
+};
+
+template <int R>
+__device__ __forceinline__ void hq_decode_rows_group_fast(const HqGroupRow (&rows)[R], int lane) {
+    const int warp_lane  = static_cast<int>(threadIdx.x & 31u);
+    const int gbase      = warp_lane & ~7;
+    const unsigned gmask = 0xFFu << gbase;
+
+    std::uint32_t mw0[R];
+    bool fast[R];
+    std::uint16_t* symbols[R];
+    std::uint32_t x0[R], x1[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        mw0[r] = *reinterpret_cast<const std::uint32_t*>(rows[r].meta);
+        const std::uint32_t mw1 = *reinterpret_cast<const std::uint32_t*>(rows[r].meta + 4);
+        const unsigned used_bits = ((mw0[r] >> 24) & 0xFFu) | ((mw1 & 0x3u) << 8);
+        const std::uint32_t k    = (mw0[r] >> 16) & 0xFu;
+        fast[r]    = used_bits != 0 && k == 0;
+        symbols[r] = rows[r].symbols != nullptr ? rows[r].symbols
+                                                : reinterpret_cast<std::uint16_t*>(rows[r].out);
+        if (used_bits == 0 || k > kHqMaxRiceK) {
+            // Never-written row (zeroed metadata): decodes to exact zeros.
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                *reinterpret_cast<uint4*>(rows[r].out +
+                                          hq_swz_element((lane + 8 * i) * 8, rows[r].xor_chunk)) =
+                    make_uint4(0u, 0u, 0u, 0u);
+            }
+        } else if (k != 0) {
+            hq_decode_row_group<true>(rows[r].codes, rows[r].meta, rows[r].out, lane,
+                                      rows[r].xor_chunk, rows[r].dither_seed, rows[r].symbols);
+        }
+        // Lane L's window is stream words 2L (x0, the earlier 32 bits) and 2L+1 (x1);
+        // a row off this path has no terminators here.
+        uint2 xw = make_uint2(0u, 0u);
+        if (fast[r]) { xw = *reinterpret_cast<const uint2*>(rows[r].codes + 8 * lane); }
+        x0[r] = xw.x;
+        x1[r] = xw.y;
+    }
+
+    int c0[R], c[R], inc[R], run[R], az[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        c0[r]  = __popc(x0[r]);
+        c[r]   = c0[r] + __popc(x1[r]);
+        inc[r] = c[r];
+        // Zeros since the last terminator before this window: the reference's
+        // segmented scan of (trailing zeros, all-zero) over the windows.
+        run[r] = x1[r] != 0u ? __ffs(x1[r]) - 1 : (x0[r] != 0u ? 31 + __ffs(x0[r]) : 64);
+        az[r]  = (x0[r] | x1[r]) == 0u ? 1 : 0;
+    }
+#pragma unroll
+    for (int delta = 1; delta < 8; delta <<= 1) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int left = __shfl_up_sync(gmask, inc[r], delta, 8);
+            const int lrun = __shfl_up_sync(gmask, run[r], delta, 8);
+            const int laz  = __shfl_up_sync(gmask, az[r], delta, 8);
+            if (lane >= delta) { inc[r] += left; }
+            if (lane >= delta && az[r] != 0) {
+                run[r] += lrun;
+                az[r] &= laz;
+            }
+        }
+    }
+
+    // Symbol i of a row sits at element slot i ^ (xor_chunk << 3), as in the
+    // reference. Chain 2r + j walks row r's word j; its first symbol also
+    // counts the zeros before the word (x1's: x0's trailing zeros, or the
+    // carry plus all of x0), under the unary guard. Symbols from index
+    // kHqHeadDim on are not stored.
+    int idx_total[R], i0[R], i1[R], e0[R], e1[R], swz[R];
+    std::uint32_t v0[R], v1[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        idx_total[r]   = __shfl_sync(gmask, inc[r], gbase + 7);
+        int carry      = __shfl_up_sync(gmask, run[r], 1, 8);
+        if (lane == 0) { carry = 0; }
+        const int base = inc[r] - c[r];
+        swz[r] = rows[r].xor_chunk << 3;
+        i0[r]  = base;
+        i1[r]  = base + c0[r];
+        e0[r]  = min(base + c0[r], kHqHeadDim);
+        e1[r]  = min(base + c[r], kHqHeadDim);
+        v0[r]  = x0[r];
+        v1[r]  = x1[r];
+        const int lead1 = x0[r] != 0u ? __ffs(x0[r]) - 1 : carry + 32;
+        if (i0[r] < e0[r]) {
+            const int p = hq_clz_nonzero(v0[r]);
+            int z       = carry + p;
+            if (z >= static_cast<int>(kHqUnaryGuard)) { z = 0; }
+            symbols[r][i0[r] ^ swz[r]] = static_cast<std::uint16_t>(z);
+            v0[r] = __funnelshift_lc(0u, v0[r], p + 1);
+            ++i0[r];
+        }
+        if (i1[r] < e1[r]) {
+            const int p = hq_clz_nonzero(v1[r]);
+            int z       = lead1 + p;
+            if (z >= static_cast<int>(kHqUnaryGuard)) { z = 0; }
+            symbols[r][i1[r] ^ swz[r]] = static_cast<std::uint16_t>(z);
+            v1[r] = __funnelshift_lc(0u, v1[r], p + 1);
+            ++i1[r];
+        }
+    }
+    // Steady state: every chain steps each iteration (a spent word only shifts
+    // zeros) and only the store is conditional, so the 2R chains issue
+    // interleaved instead of as branches.
+    int steps = 0;
+#pragma unroll
+    for (int r = 0; r < R; ++r) { steps = max(steps, max(e0[r] - i0[r], e1[r] - i1[r])); }
+#pragma unroll 1
+    for (int step = 0; step < steps; ++step) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int p0 = hq_clz_nonzero(v0[r]);
+            const int p1 = hq_clz_nonzero(v1[r]);
+            if (i0[r] < e0[r]) { symbols[r][i0[r] ^ swz[r]] = static_cast<std::uint16_t>(p0); }
+            if (i1[r] < e1[r]) { symbols[r][i1[r] ^ swz[r]] = static_cast<std::uint16_t>(p1); }
+            v0[r] = __funnelshift_lc(0u, v0[r], p0 + 1);
+            v1[r] = __funnelshift_lc(0u, v1[r], p1 + 1);
+            ++i0[r];
+            ++i1[r];
+        }
+    }
+
+    // Defensive tail, as in the reference: symbols past the last terminator are zero.
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (fast[r] && idx_total[r] < kHqHeadDim && lane == 0) {
+#pragma unroll 1
+            for (int t = idx_total[r]; t < kHqHeadDim; ++t) {
+                symbols[r][hq_swz_element(t, rows[r].xor_chunk)] = 0;
+            }
+        }
+    }
+    __syncwarp(gmask);
+
+    float norm[R], inv_scale[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const std::uint32_t escalation = (mw0[r] >> 20) & 0x3u;
+        __half h;
+        *reinterpret_cast<std::uint16_t*>(&h) = static_cast<std::uint16_t>(mw0[r] & 0xFFFFu);
+        norm[r]      = __half2float(h);
+        inv_scale[r] = static_cast<float>(1u << escalation) /
+                       (kHqAlpha * sqrtf(static_cast<float>(kHqHeadDim)));
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (!fast[r]) { continue; }
+            const int word     = lane + 8 * i;
+            const int wb       = hq_swz_element(word * 8, rows[r].xor_chunk);
+            const uint4 staged = *reinterpret_cast<const uint4*>(symbols[r] + wb);
+            const std::uint32_t pairs[4] = {staged.x, staged.y, staged.z, staged.w};
+            std::uint32_t z[8];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                z[2 * j]     = pairs[j] & 0xFFFFu;
+                z[2 * j + 1] = pairs[j] >> 16;
+            }
+            const std::uint32_t coset = z[7] & 1u;
+            int y[8];
+            std::uint32_t parity = 0u;
+#pragma unroll
+            for (int j = 0; j < 7; ++j) {
+                const std::uint32_t yj = z[j] ^ (0u - (z[j] & 1u)) ^ coset;
+                parity ^= yj;
+                y[j] = static_cast<int>(yj);
+            }
+            const std::uint32_t t2 = (z[7] >> 1) ^ (0u - ((z[7] >> 1) & 1u));  // 2*unzigzag(z7 >> 1)
+            y[7] = static_cast<int>(((t2 ^ ((parity >> 1) & 1u)) << 1) ^ coset);
+            const std::uint64_t wseed = hq_dither_word_seed(rows[r].dither_seed, word);
+            uint4 packed;
+            auto* values = reinterpret_cast<__nv_bfloat16*>(&packed);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                values[j] = __float2bfloat16((static_cast<float>(y[j]) + hq_dither(wseed, j)) *
+                                             norm[r] * inv_scale[r]);
+            }
+            *reinterpret_cast<uint4*>(rows[r].out + wb) = packed;
+        }
+    }
+}
+
+// One row: hq_decode_row_group<true>'s signature.
+__device__ __forceinline__ void hq_decode_row_group_fast(const std::uint8_t* codes,
+                                                         const std::uint8_t* meta,
+                                                         __nv_bfloat16* out, int lane,
+                                                         int xor_chunk,
+                                                         std::uint64_t dither_seed,
+                                                         std::uint16_t* symbols = nullptr) {
+    const HqGroupRow rows[1] = {{codes, meta, out, xor_chunk, dither_seed, symbols}};
+    hq_decode_rows_group_fast<1>(rows, lane);
+}
+
 } // namespace ninfer::ops
