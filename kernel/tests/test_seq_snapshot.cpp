@@ -159,7 +159,6 @@ void give_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint64_t tokens,
               static_cast<std::size_t>(pool.vocab) * sizeof(std::int32_t), ++salt);
   if (pool.has_dflash2()) {
     fill_lane(*pool.dflash2_window, seq.slot, ++salt);
-    fill_lane(*pool.dflash2_checkpoint, seq.slot, ++salt);
     seq.dflash2_position = tokens;
   }
   // GitHub #257: an hq pool's residual window -- every layer's side planes
@@ -901,11 +900,12 @@ void report_transfer_cost(std::uint32_t context_tokens, const char *label, bool 
 
 // ---- 6. the drafter's sections (P5-03, GitHub #152) -------------------------
 
-// The DFlash2 window and its rewrite checkpoint are two CLONE sections of a
-// pool built with the drafter. This is the G3 caveat's "re-earn the
-// snapshot-point permission by test": the sections are listed with their
-// sizes, the blob carries the slot's lanes, a whole sequence round-trips with
-// them byte-identical, and a blob from the other kind of pool is refused
+// The DFlash2 window is one CLONE section of a pool built with the drafter,
+// and the only one: the reference's rewrite checkpoint of that window is not
+// carried, because nothing in ignis ever read it. This is the G3 caveat's
+// "re-earn the snapshot-point permission by test": the section is listed with
+// its size, the blob carries the slot's lane, a whole sequence round-trips
+// with it byte-identical, and a blob from the other kind of pool is refused
 // both ways with the target untouched.
 void check_drafter_sections() {
   const std::uint64_t lane_bytes = static_cast<std::uint64_t>(kIgnisDflash2Layers) *
@@ -976,45 +976,40 @@ void check_drafter_sections() {
   ignis_seq *drafter_seq = nullptr;
   expect_rc(ignis_seq_alloc(plain, 128, &plain_seq), 0, "drafter: plain alloc");
   expect_rc(ignis_seq_alloc(drafter, 128, &drafter_seq), 0, "drafter: drafter alloc");
-  expect(all_zero(lane_image_of(*drafter->dflash2_window, drafter_seq->slot)) &&
-             all_zero(lane_image_of(*drafter->dflash2_checkpoint, drafter_seq->slot)),
-         "drafter: a fresh sequence's window and checkpoint are zero");
+  expect(all_zero(lane_image_of(*drafter->dflash2_window, drafter_seq->slot)),
+         "drafter: a fresh sequence's window is zero");
   give_history(*plain, *plain_seq, 100, 0x61u);
   give_history(*drafter, *drafter_seq, 100, 0x61u);
-  const std::vector<unsigned char> window     = lane_image_of(*drafter->dflash2_window, drafter_seq->slot);
-  const std::vector<unsigned char> checkpoint = lane_image_of(*drafter->dflash2_checkpoint, drafter_seq->slot);
-  expect(window != checkpoint, "drafter: the window and the checkpoint hold different bytes");
+  const std::vector<unsigned char> window = lane_image_of(*drafter->dflash2_window, drafter_seq->slot);
 
-  // The table lists the two sections, in blob order, with their sizes.
+  // The table lists the one section, in blob order, with its size.
   const std::uint32_t pages                     = ignis_seq_snapshot_page_count(*drafter_seq);
   const std::vector<ignis_seq_section> sections = ignis_seq_section_table(*drafter, pages);
   expect(ignis_seq_section_table(*plain, pages).size() == kIgnisSeqSectionCount,
          "drafter: a plain pool lists no drafter section");
+  expect(kIgnisSeqDflash2SectionCount == 1, "drafter: the drafter's one section is its window");
   expect(sections.size() == kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount,
-         "drafter: a drafter pool lists both drafter sections");
-  const std::int32_t want_kind[] = {IGNIS_SEQ_SECTION_KV_PAGES,       IGNIS_SEQ_SECTION_GDN_CONV,
-                                    IGNIS_SEQ_SECTION_GDN_RECURRENT,  IGNIS_SEQ_SECTION_PENALTY_COUNTS,
-                                    IGNIS_SEQ_SECTION_DFLASH_WINDOW,  IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT,
-                                    IGNIS_SEQ_SECTION_PROGRESS};
-  for (std::size_t i = 0; i < sections.size() && i < 7; ++i) {
+         "drafter: a drafter pool lists exactly one drafter section");
+  const std::int32_t want_kind[] = {IGNIS_SEQ_SECTION_KV_PAGES,      IGNIS_SEQ_SECTION_GDN_CONV,
+                                    IGNIS_SEQ_SECTION_GDN_RECURRENT, IGNIS_SEQ_SECTION_PENALTY_COUNTS,
+                                    IGNIS_SEQ_SECTION_DFLASH_WINDOW, IGNIS_SEQ_SECTION_PROGRESS};
+  for (std::size_t i = 0; i < sections.size() && i < 6; ++i) {
     expect(sections[i].kind == want_kind[i], "drafter: section kind in blob order");
   }
-  if (sections.size() == 7) {
-    expect(sections[4].transfer == IGNIS_SEQ_SECTION_CLONE &&
-               sections[5].transfer == IGNIS_SEQ_SECTION_CLONE,
-           "drafter: both drafter sections are cloned per sequence");
-    expect(sections[4].bytes == lane_bytes && sections[5].bytes == lane_bytes,
-           "drafter: each drafter section is one lane");
+  if (sections.size() == 6) {
+    expect(sections[4].transfer == IGNIS_SEQ_SECTION_CLONE,
+           "drafter: the drafter section is cloned per sequence");
+    expect(sections[4].bytes == lane_bytes, "drafter: the drafter section is one lane");
   }
 
-  // The snapshot grows by exactly the two lanes.
+  // The snapshot grows by exactly the one lane.
   std::uint64_t plain_bytes   = 0;
   std::uint64_t drafter_bytes = 0;
   expect_rc(ignis_seq_snapshot_size(plain, plain_seq, &plain_bytes), 0, "drafter: plain size");
   expect_rc(ignis_seq_snapshot_size(drafter, drafter_seq, &drafter_bytes), 0,
             "drafter: drafter size");
-  expect(drafter_bytes - plain_bytes == 2 * lane_bytes,
-         "drafter: ignis_seq_snapshot_size grows by exactly 2 x the window's bytes");
+  expect(drafter_bytes - plain_bytes == lane_bytes,
+         "drafter: ignis_seq_snapshot_size grows by exactly the window's bytes");
   std::printf("snapshot size with the drafter: %llu B, without: %llu B (+%llu B)\n",
               static_cast<unsigned long long>(drafter_bytes),
               static_cast<unsigned long long>(plain_bytes),
@@ -1022,13 +1017,11 @@ void check_drafter_sections() {
 
   // The blob carries the slot's lanes and the drafter frontier.
   const std::vector<unsigned char> blob = snapshot_of(*drafter, *drafter_seq, "drafter: snapshot");
-  if (sections.size() == 7 && blob.size() == drafter_bytes) {
+  if (sections.size() == 6 && blob.size() == drafter_bytes) {
     expect(std::memcmp(blob.data() + sections[4].offset, window.data(), window.size()) == 0,
            "drafter: the window section is the slot's window lane");
-    expect(std::memcmp(blob.data() + sections[5].offset, checkpoint.data(), checkpoint.size()) == 0,
-           "drafter: the checkpoint section is the slot's checkpoint lane");
     ignis_seq_progress_image progress{};
-    std::memcpy(&progress, blob.data() + sections[6].offset, sizeof(progress));
+    std::memcpy(&progress, blob.data() + sections[5].offset, sizeof(progress));
     expect(progress.dflash2_position == 100, "drafter: the progress image carries the drafter frontier");
   }
 
@@ -1047,8 +1040,6 @@ void check_drafter_sections() {
          "drafter: a restore drops the target's carried anchor taps");
   expect(lane_image_of(*drafter->dflash2_window, target->slot) == window,
          "drafter: the restored window is byte-identical");
-  expect(lane_image_of(*drafter->dflash2_checkpoint, target->slot) == checkpoint,
-         "drafter: the restored checkpoint is byte-identical");
   expect(target->dflash2_position == 100, "drafter: the restored drafter frontier");
   expect(snapshot_of(*drafter, *target, "drafter: re-snapshot") == blob,
          "drafter: the restored sequence snapshots to the same bytes");
@@ -1103,7 +1094,7 @@ int main() {
   // 128 tokens is the "short sequence" the spec prices at the snapshot's
   // floor (the GDN slot plus the conv taps and the penalty-count row);
   // 40,960 is the engine's own default context, where KV dominates. Each
-  // again with the DFlash2 drafter's window and checkpoint (spec 05: +80 MiB).
+  // again with the DFlash2 drafter's window (spec 05: +40 MiB).
   report_transfer_cost(128, "short", false);
   report_transfer_cost(40960, "full-context", false);
   report_transfer_cost(128, "short", true);

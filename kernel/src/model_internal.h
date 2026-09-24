@@ -428,9 +428,9 @@ struct ignis_model {
 
   // P5-02 (GitHub #150): speculation, chosen at load. Under
   // IGNIS_SPECULATIVE_DFLASH2, `dflash2` is bound and the prefill scratch
-  // carries the drafter's context append. The drafter's window and its
-  // rewrite checkpoint are per-sequence state, so they live in the sequence
-  // pool, one lane per slot (P5-03, GitHub #152, `ignis_seq_pool`); a pool
+  // carries the drafter's context append. The drafter's window is
+  // per-sequence state, so it lives in the sequence pool, one lane per slot
+  // (P5-03, GitHub #152, `ignis_seq_pool`); a pool
   // built without the same backend is refused by the program entry points.
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;

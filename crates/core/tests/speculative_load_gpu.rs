@@ -1,7 +1,7 @@
 //! GPU test for speculation as a load option (P5-02, GitHub #150): a load
 //! with `--spec dflash2` reports the drafter's VRAM — its weights, its
-//! prefill scratch, and (P5-03, GitHub #152) the per-slot window and
-//! checkpoint its pool carries — in `ignis_program_stats`, and a load
+//! prefill scratch, and (P5-03, GitHub #152) the per-slot window its pool
+//! carries — in `ignis_program_stats`, and a load
 //! without it reports today's figure.
 //!
 //! One upload of the drafter-bearing plan serves both loads: the text scope
@@ -108,15 +108,15 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
     assert_eq!(spec_bound, plain_bound + 66, "every dflash2 object crosses the ABI");
     assert_eq!(verify_bound, plain_bound, "a verify-only load binds no drafter object");
     assert!(verify_vram > plain_vram, "a draft window reserves the verify substrate");
-    assert_eq!(spec.window_pool_bytes(1), 80 * 1024 * 1024);
+    assert_eq!(spec.window_pool_bytes(1), 40 * 1024 * 1024);
     assert_eq!(
         spec_vram - verify_vram,
         drafter_weight_bytes
             + spec.window_pool_bytes(1)
             + spec.prefill_scratch_bytes(128)
             + spec.round_scratch_bytes(),
-        "the drafter adds its weights, one slot's 80 MiB of window and checkpoint, its \
-         prefill scratch at a 128-token chunk and its verify round's taps and scratch, nothing else"
+        "the drafter adds its weights, one slot's 40 MiB window, its prefill scratch at a \
+         128-token chunk and its verify round's taps and scratch, nothing else"
     );
 
     let _ = artifact.release_arena(&mut device);

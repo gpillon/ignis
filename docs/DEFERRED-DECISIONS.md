@@ -276,6 +276,11 @@ re-prefill on the restore path and on every device-side prefix clone.
 | host tier | +80 MiB per resident snapshot against the 2 GiB default (`--kv-host-pool-bytes`; the machine has 64 GB) | nothing |
 | VRAM | identical: 8 lanes × 80 MiB = 640 MiB for the drafter's own window either way | identical |
 
+*Since 2026-09-24 (snapshot format 5) the 80 MiB is 40 MiB:* the rewrite
+checkpoint half was never read and was retired (spec runtime/05,
+**Sections**), so a carried snapshot adds 40 MiB and the lanes 320 MiB. The
+decision below still stands, at half the price.
+
 Today's 2 GiB default holds ~5 snapshots at 24K, 1 at 98K, 0 at 196K; with
 the drafter carried, ~4 at 24K. The default budget is the actual limit on how
 many sequences the tier holds, not the drafter's share of a blob.

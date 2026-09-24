@@ -14,8 +14,8 @@
 //! `ignis_seq_restore`: every byte of every section is distinct from its
 //! neighbours and from the other pattern, which a copy that dropped, shifted
 //! or aliased any region cannot reproduce. And once on a real DFlash2 load,
-//! whose sequence has prefilled and drafted, so the drafter's window and
-//! checkpoint hold what the drafter wrote.
+//! whose sequence has prefilled and drafted, so the drafter's window holds
+//! what the drafter wrote.
 //!
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
 //! GPU is a skip; under the profile it is a hard failure.
@@ -38,8 +38,8 @@ use ignis_core::{KvFormat, RetainedSlots, Speculation, SpeculativeBackend};
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
 /// The mutable-state sections a retained slot carries: GDN conv, GDN
-/// recurrent, penalty counts, the drafter's window and its checkpoint.
-const STATE_SECTIONS: [i32; 5] = [1, 2, 3, 5, 6];
+/// recurrent, penalty counts and the drafter's window.
+const STATE_SECTIONS: [i32; 4] = [1, 2, 3, 5];
 const LANES: u32 = 2;
 const RETAINED: u32 = 2;
 
@@ -109,7 +109,12 @@ fn retained_slots_reserve_one_lane_state_each_and_are_never_a_lane() {
 
     let without = SeqPool::plan(&cfg, &budget(0), backend).unwrap_or_else(|e| panic!("plan: {e}"));
     let with = SeqPool::plan(&cfg, &budget(RETAINED), backend).unwrap_or_else(|e| panic!("plan: {e}"));
-    assert!(with.slot_state_bytes > 80 * 1024 * 1024, "a slot carries the drafter's 80 MiB");
+    // At the 27B geometry: the GDN recurrent state (48 layers x 48 heads x
+    // 128 x 128 FP32, 150,994,944 B), its conv taps (48 x 10,240 x 3 BF16,
+    // 2,949,120 B), the penalty counts (248,320 x I32, 993,280 B) and the
+    // drafter's window (40 MiB) -- and no second drafter lane for the rewrite
+    // checkpoint, which took this to 238,823,424 B until it was retired.
+    assert_eq!(with.slot_state_bytes, 196_880_384, "one slot's state at the 27B geometry");
     assert_eq!(without.slot_state_bytes, with.slot_state_bytes);
     assert_eq!(without.retained_state_bytes, 0);
     assert_eq!(with.retained_state_bytes, u64::from(RETAINED) * with.slot_state_bytes);
@@ -150,7 +155,7 @@ fn retained_slots_reserve_one_lane_state_each_and_are_never_a_lane() {
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn a_lane_state_copied_into_a_retained_slot_and_back_is_bit_exact() {
     let Some(_device) = cuda_device_or_skip() else { return };
-    assert_eq!(snapshot_format_version(), 4, "support/snapshot_blob.rs reads format 4");
+    assert_eq!(snapshot_format_version(), 5, "support/snapshot_blob.rs reads format 5");
     let cfg = ModelConfig::qwen38_27b();
     let pool = SeqPool::create_with_speculation(&cfg, &budget(RETAINED), Some(SpeculativeBackend::Dflash2))
         .unwrap_or_else(|e| panic!("create: {e}"));
@@ -207,7 +212,7 @@ fn a_drafting_sequence_state_comes_back_from_a_retained_slot_bit_exact_on_a_dfla
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return;
     }
-    assert_eq!(snapshot_format_version(), 4, "support/snapshot_blob.rs reads format 4");
+    assert_eq!(snapshot_format_version(), 5, "support/snapshot_blob.rs reads format 5");
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let prompt: Vec<i32> = frontend
@@ -275,7 +280,7 @@ fn a_drafting_sequence_state_comes_back_from_a_retained_slot_bit_exact_on_a_dfla
         rounds(&mut seq, 2);
 
         let drafted = state_of(&seq);
-        // The GDN state and the drafter's window and checkpoint hold what the
+        // The GDN state and the drafter's window hold what the
         // load wrote. The penalty counts are left out: greedy rounds with no
         // penalty keep them at zero, and the pattern test above carries them.
         for (&kind, section) in STATE_SECTIONS.iter().zip(&drafted) {

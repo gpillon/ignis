@@ -195,8 +195,8 @@ When output names a domain concept, use the term as defined here.
   `ignis_seq_alloc` like every other slot section.
 - **State section** — one part of what a sequence is made of: its KV pages, its
   GDN slot, its conv taps, its position and last token, its penalty-count row,
-  on a pool built with DFlash2 its **drafter window** and checkpoint, and on an
-  hq-e8-2b pool its **residual window**.
+  on a pool built with DFlash2 its **drafter window**, and on an hq-e8-2b pool
+  its **residual window**.
   Each is either shareable read-only (KV pages) or must be cloned per sequence
   (everything mutable). The table of them lives inside the leaf, and adding one
   is the act that re-earns the **snapshot point** permission rather than
@@ -435,14 +435,15 @@ When output names a domain concept, use the term as defined here.
   (`--draft-tokens`, 1..7), fixed for the life of a load. Not to be confused
   with the drafter's own 2048-token sliding **drafter window**.
 - **Drafter window** — a sequence's DFlash2 context: every drafter layer's
-  BF16 K and V for the last 2048 positions (40 MiB), plus its rewrite
-  checkpoint (40 MiB more). Per-sequence state in the sequence pool, one lane
-  per slot, and two **state sections** of a pool built with the drafter. A
-  prefill fills it from the **feature taps** of its span's last 2048 positions,
-  and each **verify round** appends its **committed run**'s taps; a lane at
-  **extent** 0 leaves it untouched. The checkpoint is the window as the latest
-  prefill left it; nothing reads it yet (the reference restores it when a turn
-  rewrites text past its chat template's rewrite boundary).
+  BF16 K and V for the last 2048 positions (40 MiB). Per-sequence state in the
+  sequence pool, one lane per slot, and one **state section** of a pool built
+  with the drafter. A prefill fills it from the **feature taps** of its span's
+  last 2048 positions, and each **verify round** appends its **committed
+  run**'s taps; a lane at **extent** 0 leaves it untouched. The reference also
+  keeps a rewrite checkpoint of it, restored when a turn rewrites text past its
+  chat template's rewrite boundary; ignis never read one and retired it
+  (snapshot format 5), because a **prompt checkpoint** taken at the opener
+  already carries the window as it stood there.
 - **Feature taps** — the target's hidden states at layers 5, 19, 33, 47 and 61,
   concatenated and projected into the drafter's context. Taken by a prefill
   chunk and by the verify traversal; scoped to that chunk or round: never

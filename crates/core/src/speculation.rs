@@ -133,8 +133,10 @@ impl Speculation {
 
     /// The device bytes the drafter's per-sequence state takes in a pool of
     /// `slot_count` slots: BF16, layers × window × KV heads × head width ×
-    /// (K + V) per slot — 40 MiB — twice with the rewrite checkpoint.
-    /// Independent of the draft window. The state lives in the sequence pool
+    /// (K + V) per slot — 40 MiB. The window only: the reference also keeps a
+    /// rewrite checkpoint of it, which ignis carried for every slot and never
+    /// read, so it is not reserved. Independent of the draft window. The
+    /// state lives in the sequence pool
     /// (P5-03, GitHub #152), one lane per slot, because snapshot, restore and
     /// prefix clone carry it with the rest of a sequence. Zero for
     /// [`SpeculativeBackend::VerifyOnly`], which binds no drafter.
@@ -149,8 +151,7 @@ impl Speculation {
                     * DFLASH2_HEAD_DIM
                     * 2
                     * bf16;
-                let with_checkpoint = 2 * per_slot;
-                u64::from(slot_count) * with_checkpoint
+                u64::from(slot_count) * per_slot
             }
         }
     }
@@ -286,12 +287,14 @@ mod tests {
     }
 
     #[test]
-    fn the_dflash2_window_pool_is_80_mib_per_slot() {
-        // Spec 05: 40 MiB per sequence, x2 with the checkpoint, 640 MiB for
-        // the server's eight slots.
+    fn the_dflash2_window_pool_is_40_mib_per_slot() {
+        // Spec 05: 5 layers x 2048 tokens x 8 KV heads x 128 x (K + V) in
+        // BF16 is 40 MiB per sequence, 320 MiB for the server's eight lanes.
+        // The window alone: the rewrite checkpoint that once doubled it was
+        // never read, and is gone.
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        assert_eq!(spec.window_pool_bytes(1), 80 * 1024 * 1024);
-        assert_eq!(spec.window_pool_bytes(crate::N_DECODE_LANES as u32), 8 * 80 * 1024 * 1024);
+        assert_eq!(spec.window_pool_bytes(1), 40 * 1024 * 1024);
+        assert_eq!(spec.window_pool_bytes(crate::N_DECODE_LANES as u32), 8 * 40 * 1024 * 1024);
         let narrow = Speculation::new(SpeculativeBackend::Dflash2, 1).unwrap();
         assert_eq!(narrow.window_pool_bytes(8), spec.window_pool_bytes(8), "the window does not size the pool");
     }

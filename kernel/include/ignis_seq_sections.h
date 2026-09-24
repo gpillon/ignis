@@ -53,8 +53,11 @@
  * there, so it is refused rather than restored at a delta it never recorded.
  * 4 (GitHub #257): an hq-e8-2b pool's residual-window section. A version-3
  * hq blob carries no exact rows and no ring words, and a sequence restored
- * from one would read whatever its slot's previous occupant left there. */
-inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 4;
+ * from one would read whatever its slot's previous occupant left there.
+ * 5: the drafter's checkpoint section is gone. It held the reference's
+ * rewrite checkpoint of the window, which nothing in ignis ever read; a
+ * version-4 drafter blob lists one section more than this leaf's table. */
+inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 5;
 
 /* 'IGNISSNP' little-endian: the first thing a restore checks, so a foreign
  * buffer is refused before any of its fields are believed. */
@@ -96,8 +99,11 @@ enum ignis_seq_section_kind {
    * built with the drafter, and placed before the progress section in blob
    * order. Mutable: the drafter rewrites it every round. */
   IGNIS_SEQ_SECTION_DFLASH_WINDOW = 5,
-  /* That window's rewrite checkpoint, in the same layout. */
-  IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT = 6,
+  /* 6 was the window's rewrite checkpoint, retired in format 5 (the
+   * reference restores it when a later turn rewrites text past its chat
+   * template's boundary; ignis claims a checkpoint image taken at the
+   * opener instead, which carries the window as it stood there). The value
+   * is not reused, so an old kind never names a new section. */
   /* The hq-e8-2b residual window of this slot (GitHub #257, spec
    * runtime/06): every GQA layer's exact K side plane, then every layer's V
    * side plane (`ignis_seq_pool::hq_residual_plane_bytes` each, sink rows
@@ -135,12 +141,12 @@ struct ignis_seq_section {
 };
 
 /* How many rows `ignis_seq_section_table` returns: every pool's sections,
- * plus the drafter's two on a pool built with it, plus the residual window's
- * one on an hq-e8-2b pool (GitHub #257). Named so a caller can
+ * plus the drafter's window on a pool built with it, plus the residual
+ * window's one on an hq-e8-2b pool (GitHub #257). Named so a caller can
  * reserve for it and a test can assert against it, and so that adding a
  * section is one edit in one place rather than a literal to chase. */
 inline constexpr std::size_t kIgnisSeqSectionCount = 5;
-inline constexpr std::size_t kIgnisSeqDflash2SectionCount = 2;
+inline constexpr std::size_t kIgnisSeqDflash2SectionCount = 1;
 inline constexpr std::size_t kIgnisSeqHqResidualSectionCount = 1;
 
 inline std::size_t ignis_seq_section_count(const ignis_seq_pool &pool) {
@@ -444,15 +450,14 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
        pool.gdn_pool.recurrent_host_image_bytes());
   push(IGNIS_SEQ_SECTION_PENALTY_COUNTS, IGNIS_SEQ_SECTION_CLONE,
        static_cast<std::uint64_t>(pool.vocab) * sizeof(std::int32_t));
-  // P5-03 (GitHub #152): the drafter's window and its rewrite checkpoint.
-  // CLONE, not SHAREABLE: unlike KV pages the window is rewritten in place
-  // every round, so a claimant writes it from its first step. Consistent
-  // with the sections above at the same completed chunk boundary, because
-  // the prefill chunk that writes it synchronizes once for both (and
-  // advances `dflash2_position` with the rest of the progress scalars).
+  // P5-03 (GitHub #152): the drafter's window. CLONE, not SHAREABLE: unlike
+  // KV pages the window is rewritten in place every round, so a claimant
+  // writes it from its first step. Consistent with the sections above at the
+  // same completed chunk boundary, because the prefill chunk that writes it
+  // synchronizes once for both (and advances `dflash2_position` with the
+  // rest of the progress scalars).
   if (pool.has_dflash2()) {
     push(IGNIS_SEQ_SECTION_DFLASH_WINDOW, IGNIS_SEQ_SECTION_CLONE, pool.dflash2_lane_bytes());
-    push(IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT, IGNIS_SEQ_SECTION_CLONE, pool.dflash2_lane_bytes());
   }
   // GitHub #257: the hq residual window. Consistent with the sections above
   // at a completed chunk boundary for the same reason the KV pages are: the
@@ -469,10 +474,10 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
          "ignis_seq_section_count has drifted from the table above");
 
   // The payload starts after room for every section this leaf knows, not
-  // only the ones this pool lists: two more records would otherwise push the
+  // only the ones this pool lists: more records would otherwise push the
   // first payload across an alignment boundary, and a drafter pool's blob
-  // would outgrow a plain one's by more than its two lanes (P5-03, GitHub
-  // #152). The unused records' bytes are zeroed like any other gap.
+  // would outgrow a plain one's by more than its lane (P5-03, GitHub #152).
+  // The unused records' bytes are zeroed like any other gap.
   std::uint64_t cursor = ignis_seq_align_up(
       sizeof(ignis_seq_snapshot_header) + (kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount +
                                            kIgnisSeqHqResidualSectionCount) *
@@ -514,8 +519,6 @@ inline const char *ignis_seq_section_name(std::int32_t kind) {
     return "progress";
   case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
     return "dflash_window";
-  case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
-    return "dflash_checkpoint";
   case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
     return "hq_residual";
   default:

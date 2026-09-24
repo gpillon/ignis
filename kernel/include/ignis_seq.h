@@ -173,10 +173,9 @@ struct ignis_seq_pool_spec {
   /* One of enum ignis_speculative_backend (ignis_model.h; 0 = none). Under
    * IGNIS_SPECULATIVE_DFLASH2 every slot also owns the DFlash2 drafter's
    * per-sequence state (P5-03, GitHub #152): its sliding BF16 K/V window
-   * (5 layers x 2048 x 8 KV heads x 128 x K+V = 40 MiB) and that window's
-   * rewrite checkpoint (40 MiB more), zeroed at ignis_seq_alloc. Both are
-   * state sections like the GDN slot, so snapshot, restore and the prefix
-   * clone carry them, and a blob taken on a pool with the drafter is
+   * (5 layers x 2048 x 8 KV heads x 128 x K+V = 40 MiB), zeroed at
+   * ignis_seq_alloc. It is a state section like the GDN slot, so snapshot,
+   * restore and the prefix clone carry it, and a blob taken on a pool with the drafter is
    * refused by one without it and vice versa. IGNIS_SPECULATIVE_VERIFY_ONLY
    * (P5-04, GitHub #153) owns no per-slot state and adds no section. Must
    * match the speculative backend of the model the pool's sequences are
@@ -184,7 +183,7 @@ struct ignis_seq_pool_spec {
   int32_t speculative_backend;
   /* Retained slots beside the lanes (GitHub #211, ADR 0030): places for one
    * mutable-state image each -- a lane's own state, GDN conv and recurrent
-   * state, penalty counts, under DFLASH2 the drafter's window and checkpoint,
+   * state, penalty counts, under DFLASH2 the drafter's window,
    * and under hq-e8-2b the residual window (GitHub #257) -- with no KV
    * block-table row. `ignis_seq_alloc` never hands
    * one to a sequence; `ignis_seq_retained_store` / `_load` move a lane's
@@ -217,8 +216,7 @@ struct ignis_seq_pool_stats {
    * (GitHub #210). */
   uint64_t kv_arena_bytes;
   /* Every lane's mutable state on the device: the GDN state arena, the
-   * penalty counts and, under DFLASH2, the drafter's window and checkpoint
-   * (GitHub #210) -- the retained slots' share of those arenas excluded. */
+   * penalty counts and, under DFLASH2, the drafter's window (GitHub #210) -- the retained slots' share of those arenas excluded. */
   uint64_t lane_state_bytes;
   /* The retained slots (GitHub #211): how many, what one slot's state
    * occupies, and `retained_slot_count * slot_state_bytes`. */
@@ -269,7 +267,7 @@ struct ignis_seq_stats {
 };
 
 /* Build the two device-resident pools from `spec` (and, under a speculative
- * backend, the drafter's window and checkpoint for every slot). Returns 0
+ * backend, the drafter's window for every slot). Returns 0
  * and a handle in `*out_pool` on success. Returns -1 (see
  * ignis_seq_last_error) on a null argument, a non-positive geometry field,
  * or an unknown speculative backend. */
@@ -530,8 +528,8 @@ int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
  *     prefix, which is what keeps the pages alive after every live request
  *     has gone.
  *   - the **mutable sections** at the opener -- the GDN recurrent state, the
- *     conv taps, the penalty-count row, the drafter's window and checkpoint
- *     on a DFlash2 pool -- in a retained slot of their own (GitHub #215). The
+ *     conv taps, the penalty-count row, the drafter's window on a DFlash2
+ *     pool -- in a retained slot of their own (GitHub #215). The
  *     prefix's own image stands at the page boundary, which is up to 63
  *     tokens short.
  *   - a copy of the **partial tail page**: the physical page the opener ends
@@ -643,7 +641,7 @@ int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *pool,
  *
  * A retained slot is a lane's mutable state without a lane: the same
  * sections a prefix clone carries (GDN conv and recurrent state, penalty
- * counts, the drafter's window and checkpoint), at a slot index past every
+ * counts, the drafter's window), at a slot index past every
  * lane's, reserved when the pool is built. The progress scalars and the KV
  * pages are not part of it. Which retained slot is free is the caller's
  * bookkeeping (`ignis_core::RetainedSlotLedger`); a prefix publish and a

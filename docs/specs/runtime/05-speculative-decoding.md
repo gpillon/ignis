@@ -51,7 +51,8 @@ primitives. Nothing above them exists.
 **The drafter consumes hidden states, not tokens.** DFlash2 is fed the
 target's hidden states at layers 5, 19, 33, 47 and 61, concatenated and
 projected (`dflash2/feature_projection [5120, 25600]`), into a 2048-token
-sliding BF16 KV window of its own, with a rewrite checkpoint of that window.
+sliding BF16 KV window of its own (the reference also keeps a rewrite
+checkpoint of that window; ignis retired it, see **Sections** below).
 So the target's prefill must export those features, the drafter has its own
 per-sequence state, and "rebuild the drafter on restore" would mean a
 64-layer target pass over 2048 tokens. That fact decided the state question
@@ -94,9 +95,9 @@ the first stop before KV commit and fold. A sequence therefore never holds
 state past its emitted text, and prefix publish after a turn stays correct
 without the Rust side reaching into the leaf.
 
-**The drafter's state is carried, not rebuilt (ADR 0024).** Two new sections
-in the leaf's table — the drafter's window and its checkpoint, clone
-semantics — plus the drafter frontier in the progress image. Snapshot,
+**The drafter's state is carried, not rebuilt (ADR 0024).** A new section in
+the leaf's table — the drafter's window, clone semantics (a second one for its
+rewrite checkpoint was retired 2026-09-24) — plus the drafter frontier in the progress image. Snapshot,
 restore and device clone carry them through the machinery G4 built; the blob
 version bumps. The chunk-boundary snapshot-point permission is re-earned for
 them by the round-trip test, per the G3 caveat.
@@ -121,7 +122,7 @@ measured and not built (`DEFERRED-DECISIONS.md`, G5 item 1).
 5. As the engine owner, I want greedy speculation to produce exactly the tokens the spec-off engine produces, so that one equivalence test is the correctness oracle for verify, accept, rollback and fold together.
 6. As the engine owner, I want the accepted prefix cut at the first stop on the device, so that no sequence state ever runs ahead of the text a request emitted.
 7. As the engine owner, I want the target prefill to export the drafter's feature taps for its window only, so that the drafter's TTFT cost is bounded by 2048 tokens and not by the prompt.
-8. As the engine owner, I want the drafter's window and checkpoint to be sections in the leaf's table, so that snapshot, restore and clone carry them or refuse the blob, never silently drop them.
+8. As the engine owner, I want the drafter's window to be a section in the leaf's table, so that snapshot, restore and clone carry it or refuse the blob, never silently drop it.
 9. As the engine owner, I want the drafter sections' snapshot-point permission re-earned by a test, so that the G3 caveat is honoured as an act.
 10. As the engine owner, I want graphs captured per exact batch width at the load's window, so that a narrow round never pays a wide round's GDN slot traffic.
 11. As the engine owner, I want a lane whose budget or context is shorter than the window to run at its own extent inside the round, so that the last tokens of a request do not need a second decode path.
@@ -155,8 +156,7 @@ through its options. Loading DFlash2 binds the 66 `dflash2/*` objects of the
 v2 artifact (`docs/maintainer/qwen3.8-27b-artifact.md` in the reference tree
 names them; the binder's inventory today leaves them unconsumed by design),
 allocates the drafter's per-lane window pool (BF16, 5 layers × 2048 × 8 KV
-heads × 128 × K+V = 40 MiB per lane, ×2 with the checkpoint: 640 MiB for
-eight lanes) and captures the eight verify graphs. Without the option, none of
+heads × 128 × K+V = 40 MiB per lane: 320 MiB for eight lanes) and captures the eight verify graphs. Without the option, none of
 that happens and the binder's text scope is unchanged.
 
 **The verify round.** Per lane: column 0 is the anchor (the pending
@@ -196,14 +196,24 @@ hidden states at layers 5, 19, 33, 47 and 61 into chunk-scoped scratch with
 no lane dimension (the reference's `prefill_features` / `pending_features`).
 They are never persisted and never a section.
 
-**Sections (ADR 0024).** `IGNIS_SEQ_SECTION_DFLASH_WINDOW` and
-`IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT`, both `CLONE`; the drafter frontier
-joins the progress image. The blob format version bumps; a blob from a load
-without the drafter is refused by a load with it and vice versa, by the same
-header check G4 built. The snapshot floor grows from 149 MiB to 229 MiB; the
-default host budget (`--kv-host-pool-bytes`, 2 GiB) is not changed by this
-phase, and raising it is an operator decision the numbers in
-`DEFERRED-DECISIONS.md` inform.
+**Sections (ADR 0024).** `IGNIS_SEQ_SECTION_DFLASH_WINDOW`, `CLONE`; the
+drafter frontier joins the progress image. The blob format version bumps; a
+blob from a load without the drafter is refused by a load with it and vice
+versa, by the same header check G4 built. The snapshot floor grows from
+149 MiB to 189 MiB; the default host budget (`--kv-host-pool-bytes`, 2 GiB) is
+not changed by this phase, and raising it is an operator decision the numbers
+in `DEFERRED-DECISIONS.md` inform.
+
+*Departure, 2026-09-24 (blob format 5).* Until then a second section,
+`IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT`, carried the reference's rewrite
+checkpoint of the window, and every prefill copied the window into it and
+synchronized. Nothing read it: the reference restores that checkpoint when a
+later turn rewrites text past its chat template's boundary, and ignis instead
+claims a prompt checkpoint captured at the opener (ADR 0029), whose image
+already carries the window as it stood there. It cost a 40 MiB lane in every
+lane and retained slot (640 MiB at eight of each), a copy and a synchronize
+per prefill, and 40 MiB per KV-RAM spill. Its kind, 6, is retired and never
+reused.
 
 **The Rust seam.** `DecodeOutcome::Token(TokenId)` becomes a run:
 `DecodeOutcome::Tokens(run)` with `run.len() >= 1`, plus

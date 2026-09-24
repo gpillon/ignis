@@ -316,8 +316,8 @@ that event rather than computed from a flag.
 Speculation is a load option too (GitHub #150): `--spec dflash2
 --draft-tokens N` (N in 1..7, both flags or neither) binds the drafter's 66
 `dflash2/*` objects and grows the prefill scratch by the drafter's context
-append; its sequence pool carries the drafter window and checkpoint per slot
-(80 MiB each slot, GitHub #152); `ignis.model.loaded` records it as
+append; its sequence pool carries the drafter window per slot (40 MiB each
+slot, GitHub #152); `ignis.model.loaded` records it as
 `speculation`. Absent, the load, its plan and its VRAM report are exactly what
 they were before the option existed. `crates/core/tests/speculative_load_gpu.rs`
 pins the VRAM delta; `crates/core/tests/dflash2_window_gpu.rs` checks a
@@ -337,9 +337,9 @@ it the model loops on chat markers and the verify and decode tilings part by
 several logits on text no request emits. It prints acceptance
 per round and the mean committed tokens per full-window round against the
 reference's 3.4–5.75 band — read that line from the profile's output; a mean
-below the band is a finding to file, not a test failure. Since #155 a prefill
-leaves the rewrite checkpoint equal to the window, which `dflash2_window_gpu.rs`
-asserts. `crates/runtime/tests/cuda_leaf_dflash2_gpu.rs` drives the same
+below the band is a finding to file, not a test failure. The drafter's rewrite
+checkpoint is retired (blob format 5): `dflash2_window_gpu.rs` asserts a
+snapshot no longer lists it. `crates/runtime/tests/cuda_leaf_dflash2_gpu.rs` drives the same
 drafter end to end through `RuntimeCompute`: the leaf passes no drafts, and
 every round's speculative counters match the lane's extent and committed run.
 

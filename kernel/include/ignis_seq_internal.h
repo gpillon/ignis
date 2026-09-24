@@ -165,18 +165,18 @@ struct ignis_seq_pool {
   // P5-03 (GitHub #152): the DFlash2 drafter's per-sequence state, present
   // only when the pool was built with IGNIS_SPECULATIVE_DFLASH2. One cyclic
   // lane per slot -- the lane index IS the slot, as it is for the GDN pool --
-  // in the window the drafter attends over and in its rewrite checkpoint.
-  // Both are carved from `dflash2_arena`; all three stay null without the
-  // drafter, so a plain pool costs nothing and lists no drafter section.
+  // in the window the drafter attends over, carved from `dflash2_arena`. Both
+  // stay null without the drafter, so a plain pool costs nothing and lists no
+  // drafter section. The reference also keeps a rewrite checkpoint of the
+  // window; ignis never read one, so no slot carries it.
   std::int32_t speculative_backend = 0;
   std::unique_ptr<ninfer::DeviceArena> dflash2_arena;
   std::unique_ptr<ninfer::CyclicKVCache> dflash2_window;
-  std::unique_ptr<ninfer::CyclicKVCache> dflash2_checkpoint;
 
   bool has_dflash2() const { return dflash2_window != nullptr; }
 
-  // Bytes one slot's lane of the window occupies (the checkpoint's is the
-  // same): every layer's K and V over the whole ring. 0 without the drafter.
+  // Bytes one slot's lane of the window occupies: every layer's K and V over
+  // the whole ring. 0 without the drafter.
   std::uint64_t dflash2_lane_bytes() const {
     return has_dflash2() ? static_cast<std::uint64_t>(dflash2_window->lane_host_bytes()) : 0;
   }

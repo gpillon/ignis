@@ -143,7 +143,6 @@ void dirty_state(ignis_seq_pool &pool, ignis_seq &seq, std::uint32_t own_pages,
   }
   if (pool.has_dflash2()) {
     fill_lane(*pool.dflash2_window, seq.slot, ++salt);
-    fill_lane(*pool.dflash2_checkpoint, seq.slot, ++salt);
     seq.dflash2_position = seq.position;
   }
   // GitHub #257: an hq pool's residual window -- every layer's side planes

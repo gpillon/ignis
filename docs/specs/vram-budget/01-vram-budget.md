@@ -190,7 +190,8 @@ derived budget is `free − headroom`.
    media embedding + sampling + decode-graph scratch + verify round +
    drafter round;
 3. every lane's state: `N_DECODE_LANES` × the sequence-pool slot size,
-   GDN + conv + penalty counts + drafter window and checkpoint;
+   GDN + conv + penalty counts + drafter window (its rewrite checkpoint was
+   retired 2026-09-24, spec runtime/05);
 4. retained slots (slices 4–5; until then, the current checkpoint budget as one line);
 5. KV pool = the rest, or `--kv-pool-bytes` when given.
 

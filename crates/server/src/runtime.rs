@@ -632,7 +632,7 @@ mod tests {
         let reserved = ignis_runtime::ReservedBytes {
             workspace: 1 << 30,
             lane_state: 1 << 30,
-            retained_slots: u64::from(crate::config::DEFAULT_RETAINED_SLOTS) * 238_823_424,
+            retained_slots: u64::from(crate::config::DEFAULT_RETAINED_SLOTS) * 196_880_384,
             ..Default::default()
         };
         let page_bytes = ignis_core::KvFormat::HqE8_2b.page_bytes(ignis_core::KvGeometry::qwen38_27b());

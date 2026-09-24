@@ -82,7 +82,7 @@ pub(crate) mod ffi {
         pub vocab: u32,
         /// `enum ignis_speculative_backend` (P5-03, GitHub #152): 0 for a
         /// pool without a drafter; under DFlash2 every slot also owns the
-        /// drafter's window and its checkpoint (80 MiB).
+        /// drafter's window (40 MiB).
         pub speculative_backend: i32,
         /// Retained slots past the lanes (GitHub #211).
         pub retained_slot_count: u32,
@@ -554,7 +554,7 @@ impl SeqPool {
 
     /// [`SeqPool::create`] for a load with speculation (P5-03, GitHub #152):
     /// with `Some`, every slot also owns that backend's per-sequence drafter
-    /// state — for DFlash2 its window and rewrite checkpoint — which
+    /// state — for DFlash2 its window — which
     /// snapshot, restore and prefix clone carry like the GDN slot. The
     /// backend must be the one the model was loaded with; the leaf refuses a
     /// prefill or decode that pairs them otherwise.
@@ -682,7 +682,7 @@ impl SeqPool {
     }
 
     /// Copy `seq`'s mutable state — GDN conv and recurrent state, penalty
-    /// counts, the drafter's window and checkpoint — into retained slot
+    /// counts, the drafter's window — into retained slot
     /// `slot`, device to device (GitHub #211). `seq` is read, never changed;
     /// its progress and KV pages are not part of a retained slot.
     ///

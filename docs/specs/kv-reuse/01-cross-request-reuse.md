@@ -85,8 +85,8 @@ this today (verified 2026-09-15):
   it is tokenized separately and must be an exact token prefix, otherwise no
   checkpoint is taken.
 - **What is captured**, into a device image:
-  - the mutable sections: GDN slot, conv taps, drafter window and checkpoint
-    on a DFlash2 load;
+  - the mutable sections: GDN slot, conv taps, drafter window on a DFlash2
+    load (its rewrite checkpoint was retired 2026-09-24, spec runtime/05);
   - the penalty-count row — zero at that point, because nothing has been
     sampled yet; verify, and assert it;
   - position and last token;

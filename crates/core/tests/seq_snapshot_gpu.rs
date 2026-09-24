@@ -337,7 +337,7 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
     // Even at that delta the first dozen greedy tokens agree with delta 0's;
     // the tail after the restore is long enough to part company.
     const MULTIMODAL_TAIL: usize = 34;
-    assert_eq!(snapshot_format_version(), 4, "this leg reads the version-4 blob layout");
+    assert_eq!(snapshot_format_version(), 5, "this leg reads the version-5 blob layout");
     let long_prompt: Vec<i32> = frontend
         .tokenizer()
         .encode(
@@ -482,7 +482,7 @@ fn an_hq_sequence_restored_into_another_slot_continues_to_the_same_tokens() {
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
-    assert_eq!(snapshot_format_version(), 4, "this test reads the version-4 blob layout");
+    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
 
     let mut source = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("alloc source: {e}"));
     let source_slot = source.stats().slot;

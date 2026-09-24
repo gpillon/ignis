@@ -21,7 +21,7 @@
 //!
 //! The window is read out of a snapshot blob of the prefilled sequence, so
 //! the test also reads what snapshot carries. That blob layout is leaf
-//! internal (ADR 0024) and is spelled out below for version 4 only: a format
+//! internal (ADR 0024) and is spelled out below for version 5 only: a format
 //! change fails the version assertion rather than misreading bytes.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
@@ -48,7 +48,8 @@ use ignis_core::step::prefill_program;
 use ignis_core::{KvFormat, Speculation, SpeculativeBackend};
 
 use snapshot_blob::{
-    read_u64, section, PROGRESS_DRAFTER_FRONTIER, SECTION_DFLASH_CHECKPOINT, SECTION_DFLASH_WINDOW, SECTION_PROGRESS,
+    find_section, read_u64, section, PROGRESS_DRAFTER_FRONTIER, SECTION_DFLASH_WINDOW, SECTION_PROGRESS,
+    SECTION_RETIRED_DFLASH_CHECKPOINT,
 };
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -179,14 +180,12 @@ fn check_window(
     let plane = HEAD_DIM * WINDOW * KV_HEADS * 2;
     let (window_at, window_bytes) = section(&blob, SECTION_DFLASH_WINDOW);
     assert_eq!(window_bytes, DRAFTER_LAYERS * 2 * plane, "{label}: the window section is one lane");
-    let (checkpoint_at, checkpoint_bytes) = section(&blob, SECTION_DFLASH_CHECKPOINT);
-    // P5-05 (GitHub #155): a prefill leaves the rewrite checkpoint equal to
-    // the window it just wrote -- and the window is not the zeros
-    // `ignis_seq_alloc` left, so this is not two untouched sections agreeing.
-    assert_eq!(checkpoint_bytes, window_bytes, "{label}: the checkpoint section is one lane");
-    assert!(
-        blob[checkpoint_at..checkpoint_at + checkpoint_bytes] == blob[window_at..window_at + window_bytes],
-        "{label}: the rewrite checkpoint does not hold the window the prefill left"
+    // The reference's rewrite checkpoint of the window is not carried: ignis
+    // never read it, and it cost a lane of every slot and a copy per prefill.
+    assert_eq!(
+        find_section(&blob, SECTION_RETIRED_DFLASH_CHECKPOINT),
+        None,
+        "{label}: the snapshot carries the retired rewrite checkpoint"
     );
     assert!(
         blob[window_at..window_at + window_bytes].iter().any(|&b| b != 0),
@@ -364,7 +363,7 @@ fn the_drafter_window_holds_the_projected_context_of_the_prompt() {
     let long = repeated(&sentence, LONG_PROMPT_TOKENS);
     assert!(short.len() > PREFILL_CHUNK as usize && short.len() < WINDOW, "{}", short.len());
     assert!(long.len() > WINDOW && long.len() <= MAX_CONTEXT as usize, "{}", long.len());
-    assert_eq!(snapshot_format_version(), 4, "this test reads the version-4 blob layout");
+    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
 
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));

@@ -1539,25 +1539,12 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   if (multimodal.positions != nullptr) {
     seq->rope_delta = multimodal.rope_delta;
   }
-  // P5-05 (GitHub #155): the rewrite checkpoint is the window as the latest
-  // prefill span leaves it. The reference saves it during prefill, at its chat
-  // template's rewrite boundary, and restores it when a later turn rewrites
-  // the text past that boundary; ignis has no such reuse path, so nothing
-  // reads it yet. It is kept beside the window it was taken from, so a
-  // snapshot, restore or clone never carries one that belongs to other text.
-  if (pool->has_dflash2()) {
-    try {
-      pool->dflash2_checkpoint->copy_lane_from(*pool->dflash2_window, seq->slot, model->stream);
-      const cudaError_t err = cudaStreamSynchronize(model->stream);
-      if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("cudaStreamSynchronize failed: ") +
-                                 cudaGetErrorString(err));
-      }
-    } catch (const std::exception &e) {
-      set_error(std::string("ignis_program_prefill: rewrite checkpoint copy failed: ") + e.what());
-      return -1;
-    }
-  }
+  // No rewrite checkpoint of the drafter window is taken here. The reference
+  // saves one at its chat template's rewrite boundary and restores it when a
+  // later turn rewrites the text past that boundary; ignis claims a prompt
+  // checkpoint taken at the opener instead (ADR 0029), whose image carries
+  // the window as it stood there. The copy it once made here, and the
+  // synchronize after it, were read by nothing.
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - began).count());

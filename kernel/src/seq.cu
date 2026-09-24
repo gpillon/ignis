@@ -109,24 +109,22 @@ bool known_kv_format(int32_t kv_format) {
   return kv_format == IGNIS_KV_FORMAT_BF16 || kv_format == IGNIS_KV_FORMAT_HQ_E8_2B;
 }
 
-// Zero `slot`'s lane of the drafter window and of its checkpoint (P5-03,
-// GitHub #152), so a re-allocated slot never attends over another request's
-// context. A no-op on a pool without the drafter.
+// Zero `slot`'s lane of the drafter window (P5-03, GitHub #152), so a
+// re-allocated slot never attends over another request's context. A no-op on
+// a pool without the drafter.
 void zero_dflash2_lane(ignis_seq_pool &pool, std::int32_t slot) {
   if (!pool.has_dflash2()) {
     return;
   }
-  for (const ninfer::CyclicKVCache *cache : {pool.dflash2_window.get(),
-                                             pool.dflash2_checkpoint.get()}) {
-    for (std::uint32_t layer = 0; layer < cache->layer_count(); ++layer) {
-      const ninfer::CyclicKVCacheLayerView view = cache->layer_view(layer);
-      for (const ninfer::Tensor *plane : {&view.k, &view.v}) {
-        const ninfer::Tensor lane = plane->slice(3, slot, 1);
-        const cudaError_t err     = cudaMemset(lane.data, 0, lane.bytes());
-        if (err != cudaSuccess) {
-          throw std::runtime_error(std::string("cudaMemset(dflash2 window lane) failed: ") +
-                                   cudaGetErrorString(err));
-        }
+  const ninfer::CyclicKVCache &cache = *pool.dflash2_window;
+  for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+    const ninfer::CyclicKVCacheLayerView view = cache.layer_view(layer);
+    for (const ninfer::Tensor *plane : {&view.k, &view.v}) {
+      const ninfer::Tensor lane = plane->slice(3, slot, 1);
+      const cudaError_t err     = cudaMemset(lane.data, 0, lane.bytes());
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemset(dflash2 window lane) failed: ") +
+                                 cudaGetErrorString(err));
       }
     }
   }
@@ -275,9 +273,6 @@ bool pack_slot_section_to_host(const ignis_seq_pool &pool, std::int32_t slot,
     return true;
   case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
     pool.dflash2_window->copy_lane_to_host(slot, at, nullptr);
-    return true;
-  case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
-    pool.dflash2_checkpoint->copy_lane_to_host(slot, at, nullptr);
     return true;
   case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
     ignis_seq_copy_hq_residual(pool, slot, at, cudaMemcpyDeviceToHost);
@@ -569,7 +564,6 @@ struct PoolLayout {
   std::size_t sampling_counts_bytes = 0;
   bool dflash2 = false;
   ninfer::CyclicKVCacheLayout dflash2_window_layout;
-  ninfer::CyclicKVCacheLayout dflash2_checkpoint_layout;
   std::size_t dflash2_bytes = 0;
   /* One slot's share of the GDN arena, the penalty counts and the drafter
    * arena (GitHub #211). */
@@ -634,17 +628,15 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   out.sampling_counts_bytes = static_cast<std::size_t>(state_slots) *
                               static_cast<std::size_t>(spec.vocab) * sizeof(std::int32_t);
 
-  // P5-03 (GitHub #152): the drafter's window and its rewrite checkpoint,
-  // one cyclic lane per slot, planned by the vendored cache itself so the
-  // lane layout the drafter's kernels address is the one sized here.
+  // P5-03 (GitHub #152): the drafter's window, one cyclic lane per slot,
+  // planned by the vendored cache itself so the lane layout the drafter's
+  // kernels address is the one sized here. The window only: the reference's
+  // rewrite checkpoint of it was a second lane nothing here read.
   if (spec.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
     ninfer::LayoutBuilder dflash2_builder;
     const auto lanes = static_cast<std::int32_t>(state_slots);
     out.dflash2 = true;
     out.dflash2_window_layout = ninfer::plan_cyclic_kv_cache(
-        dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
-        kIgnisDflash2HeadDim, lanes);
-    out.dflash2_checkpoint_layout = ninfer::plan_cyclic_kv_cache(
         dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
         kIgnisDflash2HeadDim, lanes);
     out.dflash2_bytes = dflash2_builder.finish(256);
@@ -653,8 +645,7 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
                          per_slot_bytes(out.gdn_layout.recurrent, state_slots) +
                          static_cast<std::uint64_t>(spec.vocab) * sizeof(std::int32_t);
   if (out.dflash2) {
-    out.slot_state_bytes += cyclic_lane_bytes(out.dflash2_window_layout) +
-                            cyclic_lane_bytes(out.dflash2_checkpoint_layout);
+    out.slot_state_bytes += cyclic_lane_bytes(out.dflash2_window_layout);
   }
   // GitHub #257 (spec runtime/06): the hq residual window, for every state
   // slot. Reserved here, at load, like every other line of the plan (ADR
@@ -757,8 +748,6 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
                                        pool->dflash2_arena->capacity()};
       pool->dflash2_window =
           std::make_unique<ninfer::CyclicKVCache>(backing, layout.dflash2_window_layout);
-      pool->dflash2_checkpoint =
-          std::make_unique<ninfer::CyclicKVCache>(backing, layout.dflash2_checkpoint_layout);
     }
     // Named on every pool, VERIFY_ONLY included (P5-04, GitHub #153): that
     // backend owns no per-slot state, but the program entry points still pair
@@ -1120,9 +1109,6 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
       case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
         pool->dflash2_window->copy_lane_from_host(at, seq->slot, nullptr);
         break;
-      case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
-        pool->dflash2_checkpoint->copy_lane_from_host(at, seq->slot, nullptr);
-        break;
       case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
         // GitHub #257: the blob's own rows and bits over the target slot's,
         // whatever sequence held that slot before (the reference's
@@ -1221,11 +1207,8 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
       copy(pool.token_counts_for(dst), pool.token_counts_for(src),
            static_cast<std::size_t>(section.bytes), what);
       break;
-    case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
-    case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT: {
-      const ninfer::CyclicKVCache &cache = section.kind == IGNIS_SEQ_SECTION_DFLASH_WINDOW
-                                               ? *pool.dflash2_window
-                                               : *pool.dflash2_checkpoint;
+    case IGNIS_SEQ_SECTION_DFLASH_WINDOW: {
+      const ninfer::CyclicKVCache &cache = *pool.dflash2_window;
       for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
         const ninfer::CyclicKVCacheLayerView view = cache.layer_view(layer);
         for (const ninfer::Tensor *plane : {&view.k, &view.v}) {

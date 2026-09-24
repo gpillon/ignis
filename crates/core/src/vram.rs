@@ -71,7 +71,7 @@ pub struct VramLines {
     /// The drafter's round buffers (0 without the DFlash2 drafter).
     pub drafter_round: u64,
     /// Every lane's mutable state in the sequence pool: GDN recurrent and
-    /// conv state, penalty counts, the drafter's window and checkpoint.
+    /// conv state, penalty counts, the drafter's window.
     pub lane_state: u64,
     /// The sequence pool's retained slots (GitHub #211, #215): a lane's state
     /// each, reserved at load beside the lanes, holding every retained prompt

@@ -279,10 +279,10 @@ int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors, 
  * `dflash2/*` tensors must be among `tensors` -- without the option they are
  * extra bound tensors like any other -- and the prefill scratch grows by the
  * drafter's context append over a chunk (the feature taps and their
- * projection). The drafter's window and checkpoint are per-sequence state,
- * so they live in the sequence pool (`ignis_seq_pool_spec::speculative_backend`,
- * P5-03, GitHub #152), which must be built with the same backend; both are
- * reported by `ignis_program_stats`.
+ * projection). The drafter's window is per-sequence state, so it lives in
+ * the sequence pool (`ignis_seq_pool_spec::speculative_backend`, P5-03,
+ * GitHub #152), which must be built with the same backend; both are reported
+ * by `ignis_program_stats`.
  *
  * Returns 0 and a handle in `*out_model` on success. Returns -1 (no model
  * produced; see ignis_model_last_error) on a null argument, a duplicate
