@@ -270,7 +270,7 @@ then resolved against the probed capability set:
 | --- | --- |
 | `none` | thinking disabled; a template that cannot disable thinking is a capability error |
 | `low`, `medium`, `xhigh` | thinking enabled, effort passed to the template |
-| `minimal`, `high`, `max` | thinking enabled, the nearest effort the template takes, rounded up: `minimal` is `low`, `high` and `max` are `xhigh`; the nearest below when none is above; a capability error only when the template takes no effort at all |
+| `minimal`, `high`, `max` | thinking enabled, the nearest effort the template takes, rounded up: `minimal` is `low`, `high` and `max` are `xhigh`; the nearest below when none is above; a capability error only when the template takes no effort at all. `max` also drops the server's default thinking budget (spec server/08; an explicit `thinking_budget` still wins) |
 | anything else | validation error listing the accepted values |
 
 A `reasoning_effort` that implies a different thinking state than an explicit

@@ -40,9 +40,15 @@ closed says so on the reply and in the request log row.
 13. As a Playground user, I want invalid input (0 typed as a number, negatives, text) rejected in the field, so that I never send a request the server refuses with a 400.
 14. As a Playground developer, I want the mock server (`dev:mock`) to accept and echo the field, so that UI work does not need the GPU.
 15. As a Playground user on a server without budget support, I want the control to still work harmlessly (the field ignored), so that the Playground works against older servers.
+16. As a Playground user, I want a `max` choice in the reasoning-effort selector, so that I can ask for unbounded thinking in one click.
+17. As a Playground user, I want the budget control to show that `max` means "no budget" unless I type a number, so that I understand which of the two wins.
 
 ## Implementation Decisions
 
+- **Effort selector.** It gains `max` after `xhigh`. Per server/08, `max` renders as
+  `xhigh` and drops the server's default budget. An explicit number in the budget
+  control still wins, so with `max` selected the budget control's *server default*
+  choice reads as "none (max)".
 - **Settings.** A new setting holds one of: *server default* (the field is omitted),
   *off* (`thinking_budget: 0`, per server/08), or a positive token count.
   - The default is *server default*.
@@ -68,6 +74,9 @@ closed says so on the reply and in the request log row.
   - thinking off → absent;
   - Agents tool sub-request carries the same value (prior art
     `web/src/tools/agents/agents.test.ts`).
+- **Effort `max`:** the request carries `reasoning_effort: "max"`. The budget field is
+  sent only when the user typed a number or chose off. The panel shows the
+  "none (max)" hint.
 - **Settings panel test** (prior art `SettingsPanel.test.tsx`): presets, typed value,
   validation, disabled when effort is `none`, the `max_tokens` warning.
 - **Reply rendering test:** the marker appears only when the response's forced field is
