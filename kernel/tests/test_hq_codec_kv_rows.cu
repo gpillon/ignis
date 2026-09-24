@@ -307,7 +307,8 @@ __global__ void group_decode_rows_kernel(const std::uint8_t* codes, const std::u
 //   - symbols staged in the output row itself, and the row written in the XOR
 //     swizzle the verify kernel gives key row r of a tile (xor_chunk = r & 7),
 //     by the reference group decode and by the fast one;
-//   - symbols staged on chip, linear rows (the prompt scratch decoder's call).
+//   - symbols staged on chip, linear rows (the shape of the prompt scratch
+//     decoder's call, which keeps the reference group decode).
 // Seeds are passed per row, so the same kernel serves every corpus below.
 __global__ void fast_decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
                                         const std::uint64_t* seeds,

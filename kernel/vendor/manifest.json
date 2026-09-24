@@ -505,8 +505,8 @@
       "sha256": "9076eb3e89a5d13fae19d16345c58231efa59f5834d05b6967187570d47c7637",
       "patch": {
         "diff": "patches/src/ops/kernel/gqa_attention_prefill_hq.cuh.diff",
-        "sha256": "29e533aded37d1970adef02f8c3b41be3f7d55ab53c58b7be875e9b2659a1bb3",
-        "reason": "ADR 0031: cometkim feat/1m-context (2026-09-10). The hq-e8-2b prompt scratch decoder stages its temporary Rice symbols in shared memory instead of the output row in device memory, and moves each lattice word as one 16-byte vector; the default call (every other caller) is unchanged. Bit-exact. Fork, same artifact: prefill +16.2% at 262,144 populated tokens. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md. Then ADR 0031, GitHub #268: the scratch decode calls hq_decode_row_group_fast (same values, ignis_hq_codec_kv_rows_test). docs/findings/2026-09-24-hq-verify-decode-cost.md."
+        "sha256": "3c470e365006883017b6d14189cdc664f67b9ceb55a97ec4039fc3c560d2eb95",
+        "reason": "ADR 0031: cometkim feat/1m-context (2026-09-10). The hq-e8-2b prompt scratch decoder stages its temporary Rice symbols in shared memory instead of the output row in device memory, and moves each lattice word as one 16-byte vector; the default call (every other caller) is unchanged. Bit-exact. Fork, same artifact: prefill +16.2% at 262,144 populated tokens. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
       }
     },
     {
