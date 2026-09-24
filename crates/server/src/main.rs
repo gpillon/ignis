@@ -64,7 +64,7 @@
 //!   default apply". An unknown value, or one the loaded template does not
 //!   support, refuses to start.
 //! - `IGNIS_THINKING_BUDGET` / `--thinking-budget` — the server-wide
-//!   thinking budget, in reasoning tokens (default 8192, `off` for none;
+//!   thinking budget, in reasoning tokens (default 6144, `off` for none;
 //!   spec server/08). Configured with a tokenizer that yields no thinking
 //!   close, it refuses to start.
 //! - `IGNIS_REQUEST_TIMEOUT` / `--request-timeout` — how long a

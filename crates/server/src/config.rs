@@ -27,10 +27,11 @@ pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 /// The server-wide thinking budget a request that sets none runs under, in
 /// reasoning tokens (spec server/08): what makes the template's default
 /// `xhigh` answer a coding agent's turn instead of reasoning past its
-/// `max_tokens`. Measured, not guessed —
-/// `docs/findings/2026-09-24-reasoning-effort-on-coding-tasks.md`.
+/// `max_tokens`. Measured, not guessed: at `xhigh` it passed 26 of 32
+/// coding runs against 8,192's 23 at a sixth less median wall time
+/// (`docs/findings/2026-09-24-thinking-budget-default.md`).
 /// `--thinking-budget off` turns it off.
-pub const DEFAULT_THINKING_BUDGET: u32 = 8192;
+pub const DEFAULT_THINKING_BUDGET: u32 = 6144;
 
 /// The default non-streaming completion timeout, in seconds (GitHub #95) —
 /// unchanged from the value `Server::new` hardcoded before this flag
@@ -1367,7 +1368,7 @@ mod tests {
         // nothing of the extension still gets an answer at `xhigh`.
         let config = expect_config(resolve(&[], no_env).expect("resolve"));
         assert_eq!(config.thinking_budget, Some(DEFAULT_THINKING_BUDGET));
-        assert_eq!(DEFAULT_THINKING_BUDGET, 8192);
+        assert_eq!(DEFAULT_THINKING_BUDGET, 6144);
         // An empty env var is an unset one, as for the other defaults.
         let config = expect_config(resolve(&[], env_map(&[("IGNIS_THINKING_BUDGET", "")])).expect("resolve"));
         assert_eq!(config.thinking_budget, Some(DEFAULT_THINKING_BUDGET));

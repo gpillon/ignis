@@ -301,7 +301,7 @@ a default and makes `0` the opt-out:
 
 | Value | Meaning |
 | --- | --- |
-| absent or `null` | the server default: `--thinking-budget` / `IGNIS_THINKING_BUDGET`, shipped at 8192; `off` = no default |
+| absent or `null` | the server default: `--thinking-budget` / `IGNIS_THINKING_BUDGET`, shipped at 6144; `off` = no default |
 | a positive whole number | that budget, in reasoning tokens, upward or downward of the default |
 | `0` | no budget for this request (a 400 before server/08) |
 | anything else | 400, `error.param = "thinking_budget"` |

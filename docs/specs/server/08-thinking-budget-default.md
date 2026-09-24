@@ -182,6 +182,12 @@ The server ships with a measured thinking budget on by default:
 
 Where the build departs from, or pins down, the text above:
 
+- **The shipped default is 6,144, not 8,192.** The acceptance measurement
+  ran xhigh at {off, 6K, 8K, 12K}, and 6K had the best pass rate at no worse
+  median wall time than 8K: 26/32 at 58.5 s against 23/32 at 70.7 s. 12K
+  passed 14/16 but at 85.8 s, which the rule rules out
+  (`docs/findings/2026-09-24-thinking-budget-default.md`).
+
 - **Answer room without `max_tokens`.** The scheduler clamps against the
   request's generation cap: `max_tokens`, or, when a request sets none, what
   the context leaves after its prompt. A long prompt near `--max-context`
