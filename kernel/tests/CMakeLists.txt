@@ -416,6 +416,15 @@ target_link_libraries(ignis_kernel_model_load_vision_options_test
 add_test(NAME ignis_kernel_model_load_vision_options_test
          COMMAND ignis_kernel_model_load_vision_options_test)
 
+# OURS -- the vision encoder's workspace size, pinned against the serving
+# load's own plan figure. Host-only layout arithmetic; it reaches into
+# `kernel/src` for `model_internal.h`, like the RoPE scaling test.
+add_executable(ignis_kernel_vision_workspace_test test_vision_workspace.cpp)
+target_include_directories(ignis_kernel_vision_workspace_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_vision_workspace_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_vision_workspace_test COMMAND ignis_kernel_vision_workspace_test)
+
 # P4-05 (GitHub #123): OURS, not vendored -- the hq attention routes against
 # ignis's own BF16 route on identical keys and values (ADR 0022's in-house
 # acceptance for a lossy format). The same q/k/v/gate/positions go through A1

@@ -73,7 +73,11 @@ struct VisionWorkspaceLayout {
 };
 
 // Region for region and scope for scope the reference's
-// `build_workspace_layout`.
+// `build_workspace_layout`, with one departure: the BF16 patches get a scope
+// of their own. The reference keeps them live for the whole encode, but the
+// patch embedding is their only reader, so every block after it may reuse
+// their bytes -- 1,536 BF16 per patch, 402,653,184 bytes at a 32,768-token
+// item, on the encode's one stream.
 VisionWorkspaceLayout build_workspace_layout(std::int32_t patches, std::int32_t tokens,
                                              std::int32_t segments) {
   using ninfer::DType;
@@ -87,7 +91,10 @@ VisionWorkspaceLayout build_workspace_layout(std::int32_t patches, std::int32_t 
   out.pos_indices = add(DType::I32, {4, patches}, "vision position indices");
   out.pos_weights = add(DType::FP32, {4, patches}, "vision position weights");
   out.x = add(DType::BF16, {kVisionHidden, patches}, "vision residual");
-  out.patch_bf16 = add(DType::BF16, {kVisionPatchDim, patches}, "vision BF16 patches");
+  {
+    auto patch_scope = builder.scope();
+    out.patch_bf16 = add(DType::BF16, {kVisionPatchDim, patches}, "vision BF16 patches");
+  }
   {
     auto attention_scope = builder.scope();
     out.attended = add(DType::BF16, {kVisionHidden, patches}, "vision attended");
