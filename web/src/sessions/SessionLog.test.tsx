@@ -50,8 +50,9 @@ describe("SessionLog and the thinking budget", () => {
   });
 
   it("flags a request whose reasoning the budget closed, with where it closed", () => {
-    expect(budget(row({ thinkingBudget: 16384, figures: figures(14884) }))).toBe("16384 · reached 14884");
-    expect(budget(row({ figures: figures(8192) }))).toBe("default · reached 8192");
+    // 16384 under max_tokens 16384 is clamped to leave the 2048-token answer room.
+    expect(budget(row({ thinkingBudget: 16384, figures: figures(14336) }))).toBe("16384 · reached 14336");
+    expect(budget(row({ figures: figures(6144) }))).toBe("default · reached 6144");
   });
 
   it("keeps the budget on a row that failed, whose figures never came", () => {
