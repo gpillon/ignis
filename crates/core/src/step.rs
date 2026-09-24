@@ -143,6 +143,9 @@ pub(crate) mod ffi {
         pub attention_grid_cols: u32,
         pub out_attention_set_peak: *mut f32,
         pub out_attention_set_neighbours: *mut f32,
+        /// The measurement readout: every position's BF16 logits, host,
+        /// `[num_tokens][vocab]` ([`super::prefill_program_span_logits`]).
+        pub out_span_logits: *mut u16,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -598,6 +601,7 @@ impl PrefillRoute {
             attention_grid_cols: 0,
             out_attention_set_peak: std::ptr::null_mut(),
             out_attention_set_neighbours: std::ptr::null_mut(),
+            out_span_logits: std::ptr::null_mut(),
         }
     }
 }
@@ -746,6 +750,51 @@ pub fn prefill_program_with_policy(
             &GREEDY,
             &options,
             logits_ptr,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// [`prefill_program`], also reading the BF16 logits of **every** position
+/// of the span into `out_span_logits` (row-major `[token_ids.len()][vocab]`,
+/// row `i` the distribution after `token_ids[i]`), for measuring the
+/// engine's distribution against a reference one (the KLD against the BF16
+/// checkpoint, 2026-09-24). Chunked route, engine default policy -- the
+/// numerics a served prompt gets. No serving path calls it.
+pub fn prefill_program_span_logits(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    out_span_logits: &mut [u16],
+) -> Result<(), String> {
+    let vocab = crate::compute::ModelConfig::qwen38_27b().vocab as usize;
+    if out_span_logits.len() != token_ids.len() * vocab {
+        return Err(format!(
+            "prefill_program_span_logits: {} logits for {} tokens of {vocab} columns",
+            out_span_logits.len(),
+            token_ids.len()
+        ));
+    }
+    let options = ffi::IgnisPrefillOptions {
+        out_span_logits: out_span_logits.as_mut_ptr(),
+        ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
+    };
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &GREEDY,
+            &options,
+            std::ptr::null_mut(),
         )
     };
     if rc != 0 {

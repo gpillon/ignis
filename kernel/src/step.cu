@@ -837,7 +837,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                           const ignis_sampling_params &sampling, int32_t *out_token_id,
                           float *out_logits, LinearPolicyMode mode,
                           const SpanMultimodal &multimodal, float *permitted_prob_out,
-                          const ArmedAttentionReadout *attention_readout) {
+                          const ArmedAttentionReadout *attention_readout,
+                          std::uint16_t *span_logits_out) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -1092,6 +1093,39 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     // `left` and `right` were swapped once per layer, so after an even
     // layer count the final residual is back in `left`.
     ninfer::Tensor final_residual = left;
+    // The measurement readout (`ignis_prefill_options::out_span_logits`):
+    // the head over every column of the chunk, 32 columns at a time, each
+    // block copied out before the next reuses its buffers (stream order).
+    if (span_logits_out != nullptr) {
+      constexpr std::int32_t kSpanBlock = 32;
+      ninfer::DeviceArena::Scope span_scope = model->scratch->scope();
+      const ninfer::Tensor norm_weight(const_cast<void *>(model->final_norm.qdata),
+                                       ninfer::DType::BF16, {hidden, 1, 1, 1});
+      ninfer::Tensor block_norm = model->scratch->alloc(ninfer::DType::BF16, {hidden, kSpanBlock, 1, 1});
+      ninfer::Tensor block_logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, kSpanBlock, 1, 1});
+      for (std::int32_t c0 = 0; c0 < T; c0 += kSpanBlock) {
+        const std::int32_t cols = std::min<std::int32_t>(kSpanBlock, T - c0);
+        auto *block_hidden = static_cast<std::uint8_t *>(final_residual.data) +
+                             static_cast<std::size_t>(c0) * static_cast<std::size_t>(hidden) *
+                                 sizeof(uint16_t);
+        const ninfer::Tensor columns(static_cast<void *>(block_hidden), ninfer::DType::BF16,
+                                     {hidden, cols, 1, 1});
+        ninfer::Tensor normalized(block_norm.data, ninfer::DType::BF16, {hidden, cols, 1, 1});
+        ninfer::Tensor logits(block_logits.data, ninfer::DType::BF16, {vocab, cols, 1, 1});
+        ninfer::ops::rmsnorm(columns, norm_weight, model->rms_norm_eps, /*unit_offset=*/true,
+                             normalized, model->stream);
+        ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
+        err = cudaMemcpyAsync(span_logits_out + static_cast<std::size_t>(c0) * static_cast<std::size_t>(vocab),
+                              logits.data,
+                              static_cast<std::size_t>(cols) * static_cast<std::size_t>(vocab) * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost, model->stream);
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(span logits) failed: ") +
+                    cudaGetErrorString(err));
+          return -1;
+        }
+      }
+    }
     std::vector<std::uint16_t> host_logits_bits;
     if (compute_output) {
       auto *last_token_hidden = static_cast<std::uint8_t *>(final_residual.data) +
@@ -1254,7 +1288,8 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                                     const ignis_sampling_params &sampling, float *out_logits,
                                     LinearPolicyMode mode, const SpanMultimodal &multimodal,
                                     float *permitted_prob,
-                                    const ArmedAttentionReadout *attention_readout) {
+                                    const ArmedAttentionReadout *attention_readout,
+                                    std::uint16_t *span_logits) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens);
@@ -1267,7 +1302,10 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, tap_from,
                           is_last_chunk, sampling, &successor, slot_logits, mode, multimodal,
                           is_last_chunk ? permitted_prob : nullptr,
-                          is_last_chunk ? attention_readout : nullptr) != 0) {
+                          is_last_chunk ? attention_readout : nullptr,
+                          span_logits == nullptr
+                              ? nullptr
+                              : span_logits + offset * static_cast<uint64_t>(model->vocab)) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -1393,6 +1431,11 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     multimodal.first_column = options->media_first_column;
   }
   if (!validate_span_multimodal(model, route, multimodal)) {
+    return -1;
+  }
+  std::uint16_t *span_logits = options != nullptr ? options->out_span_logits : nullptr;
+  if (span_logits != nullptr && route != IGNIS_PREFILL_ROUTE_CHUNKED) {
+    set_error("ignis_program_prefill: out_span_logits needs the chunked route");
     return -1;
   }
   // GitHub #260 (ADR 0038): the attention readout. A negative ordinal or a
@@ -1532,7 +1575,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   } else {
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
                                      out_logits, mode, multimodal, permitted_prob,
-                                     arms_readout ? &attention_readout : nullptr);
+                                     arms_readout ? &attention_readout : nullptr, span_logits);
   }
   if (rc != 0) {
     return rc;

@@ -45,3 +45,8 @@ kv-capture = []
 # production build; the only production-side trace is the disarmed flag
 # check in `run_gqa_layer`.
 attn-tap = []
+# The KLD measurement's engine side (2026-09-24): every position's logits
+# for a set of token windows, via `step::prefill_program_span_logits`.
+[[example]]
+name = "span_logits"
+required-features = ["cuda"]

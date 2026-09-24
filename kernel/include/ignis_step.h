@@ -253,6 +253,15 @@ struct ignis_prefill_options {
   uint32_t attention_grid_cols;
   float *out_attention_set_peak;
   float *out_attention_set_neighbours;
+  /* A measurement readout (2026-09-24, the KLD against the BF16 checkpoint):
+   * when non-NULL, the BF16 logits of **every** position of the span, host,
+   * row-major `[num_tokens][vocab]` -- row `i` is the distribution of the
+   * token after `token_ids[i]`, from the same final norm and output head the
+   * last position's successor is drawn from, over the chunk's final residual.
+   * Chunked route only; the per-token route refuses it. No serving path sets
+   * it: a NULL costs nothing, and a set one adds the head over every column
+   * in 32-column blocks inside the chunk's own scratch. */
+  uint16_t *out_span_logits;
 };
 
 /* The media encode step (GitHub #178): one media item's BF16 patch rows plus
