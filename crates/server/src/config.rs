@@ -24,6 +24,15 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8000";
 /// Prometheus exporter uses — its own listener, never the API's.
 pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 
+/// The server-wide thinking budget a request that sets none runs under, in
+/// reasoning tokens (spec server/08): what makes the template's default
+/// `xhigh` answer a coding agent's turn instead of reasoning past its
+/// `max_tokens`. Measured, not guessed: at `xhigh` it passed 26 of 32
+/// coding runs against 8,192's 23 at a sixth less median wall time
+/// (`docs/findings/2026-09-24-thinking-budget-default.md`).
+/// `--thinking-budget off` turns it off.
+pub const DEFAULT_THINKING_BUDGET: u32 = 6144;
+
 /// The default non-streaming completion timeout, in seconds (GitHub #95) —
 /// unchanged from the value `Server::new` hardcoded before this flag
 /// existed.
@@ -96,8 +105,9 @@ pub struct Config {
     pub enable_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The server-wide thinking budget (`--thinking-budget` /
-    /// `IGNIS_THINKING_BUDGET`): the reasoning tokens a request may spend
-    /// before the model's close is forced. `None` = no budget.
+    /// `IGNIS_THINKING_BUDGET`, default [`DEFAULT_THINKING_BUDGET`]): the
+    /// reasoning tokens a request may spend before the model's close is
+    /// forced. `None` = no budget (`off`).
     pub thinking_budget: Option<u32>,
     /// The prefill chunk width, in tokens (a nonzero multiple of
     /// [`PREFILL_CHUNK_ALIGNMENT`]).
@@ -439,11 +449,10 @@ pub fn resolve(
         .unwrap_or_default();
     let reasoning_effort =
         thinking::parse_default_reasoning_effort(&reasoning_effort_raw).map_err(ConfigError)?;
-    let thinking_budget_raw = thinking_budget
-        .or_else(|| env("IGNIS_THINKING_BUDGET"))
-        .unwrap_or_default();
-    let thinking_budget =
-        thinking::parse_default_thinking_budget(&thinking_budget_raw).map_err(ConfigError)?;
+    let thinking_budget = match non_empty(thinking_budget.or_else(|| env("IGNIS_THINKING_BUDGET"))) {
+        None => Some(DEFAULT_THINKING_BUDGET),
+        Some(raw) => thinking::parse_default_thinking_budget(&raw).map_err(ConfigError)?,
+    };
 
     // The engine-shape values (GitHub #87): resolved and validated here,
     // before `main` opens the artifact or touches the loader — an
@@ -1163,7 +1172,7 @@ fn help_text() -> String {
          \x20       --model-download-path <dir> env: IGNIS_MODEL_DOWNLOAD_PATH (default: {DEFAULT_MODEL_DOWNLOAD_PATH}; where a fetched model lands, and where one fetched earlier is found)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
-         \x20       --thinking-budget <n>     env: IGNIS_THINKING_BUDGET  (default: unset — no budget; reasoning tokens before the close is forced)\n\
+         \x20       --thinking-budget <n|off> env: IGNIS_THINKING_BUDGET  (default: {DEFAULT_THINKING_BUDGET}; reasoning tokens before the model's close is forced, off = no budget; a request's thinking_budget overrides it, 0 = none)\n\
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
@@ -1351,6 +1360,50 @@ mod tests {
             .expect_err("must reject");
         let env_err = thinking::parse_default_enable_thinking("nope").unwrap_err();
         assert_eq!(flag_err.0, env_err);
+    }
+
+    #[test]
+    fn the_thinking_budget_ships_on_and_off_turns_it_off() {
+        // Spec server/08: a measured default, so that a client that knows
+        // nothing of the extension still gets an answer at `xhigh`.
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.thinking_budget, Some(DEFAULT_THINKING_BUDGET));
+        assert_eq!(DEFAULT_THINKING_BUDGET, 6144);
+        // An empty env var is an unset one, as for the other defaults.
+        let config = expect_config(resolve(&[], env_map(&[("IGNIS_THINKING_BUDGET", "")])).expect("resolve"));
+        assert_eq!(config.thinking_budget, Some(DEFAULT_THINKING_BUDGET));
+        // `off`, by flag or by env: no default budget at all.
+        let config = expect_config(resolve(&args(&["--thinking-budget", "off"]), no_env).expect("resolve"));
+        assert_eq!(config.thinking_budget, None);
+        let config = expect_config(resolve(&[], env_map(&[("IGNIS_THINKING_BUDGET", "off")])).expect("resolve"));
+        assert_eq!(config.thinking_budget, None);
+        // A number, and the flag over the env var.
+        let env = env_map(&[("IGNIS_THINKING_BUDGET", "off")]);
+        let config = expect_config(resolve(&args(&["--thinking-budget", "12288"]), env).expect("resolve"));
+        assert_eq!(config.thinking_budget, Some(12288));
+        let config = expect_config(resolve(&[], env_map(&[("IGNIS_THINKING_BUDGET", "6144")])).expect("resolve"));
+        assert_eq!(config.thinking_budget, Some(6144));
+    }
+
+    #[test]
+    fn a_thinking_budget_that_is_neither_a_count_nor_off_refuses_the_start() {
+        for bad in ["0", "-1", "lots", "8k", "OFF "] {
+            let err = resolve(&args(&["--thinking-budget", bad]), no_env).expect_err(bad);
+            assert!(err.0.contains("off"), "{bad}: the message names the way to say none: {}", err.0);
+            // The flag and the env var share one message.
+            assert_eq!(err.0, thinking::parse_default_thinking_budget(bad).unwrap_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_help_names_the_thinking_budget_default_and_off() {
+        let ConfigOutcome::Help(help) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
+            panic!("--help is help");
+        };
+        let line = help.lines().find(|l| l.contains("--thinking-budget")).expect("a help line");
+        assert!(line.contains("IGNIS_THINKING_BUDGET"), "{line}");
+        assert!(line.contains(&format!("default: {DEFAULT_THINKING_BUDGET}")), "{line}");
+        assert!(line.contains("off"), "{line}");
     }
 
     #[test]

@@ -42,7 +42,7 @@ use ignis_core::{
 
 use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
-use crate::engine::{Engine, EventStream, collect_tokens};
+use crate::engine::{Completion, Engine, EventStream, RequestNotes, collect_completion};
 use crate::media::{has_media, MediaRejection, MediaStats};
 use crate::template::{
     check_content_parts, check_roles, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
@@ -589,21 +589,32 @@ fn resolve_thinking(
     })
 }
 
-/// The request's thinking budget (2026-09-24) on its decode parameters, or
-/// the 400 for a malformed one. Set only on a generation that starts inside
-/// the reasoning block: with thinking off there is no block to close.
+/// The request's thinking budget (spec server/08) on its decode parameters,
+/// and whether `max` dropped one — or the 400 for a malformed one. Set only
+/// on a generation that starts inside the reasoning block: with thinking off
+/// there is no block to close, and nothing for `max` to have dropped.
+///
+/// `effort` is the request's raw `reasoning_effort`: `max` is decided from
+/// it (else from the server default), not from `thinking`, which carries
+/// the effort the template takes.
 fn with_thinking_budget(
     server: &Server,
     params: DecodeParams,
     value: Option<&JsonValue>,
+    effort: Option<&JsonValue>,
     thinking: &ThinkingOptions,
-) -> Result<DecodeParams, Response> {
-    let budget = thinking::resolve_thinking_budget(value, server.default_thinking_budget)
-        .map_err(|message| bad_request(&message))?;
-    Ok(DecodeParams {
-        thinking_budget: budget.filter(|_| server.template.decoder_starts_in_reasoning(thinking)),
-        ..params
-    })
+) -> Result<(DecodeParams, bool), Response> {
+    let max = thinking::runs_at_max(effort, server.default_reasoning_effort);
+    let resolved = thinking::resolve_thinking_budget(value, server.default_thinking_budget, max)
+        .map_err(|message| bad_request_param(&message, "thinking_budget"))?;
+    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(thinking);
+    Ok((
+        DecodeParams {
+            thinking_budget: resolved.budget.filter(|_| starts_in_reasoning),
+            ..params
+        },
+        resolved.dropped_by_max && starts_in_reasoning,
+    ))
 }
 
 /// The two `tool_choice` values this template has a lever for (GitHub
@@ -834,6 +845,18 @@ fn error_response(
     code: &str,
     message: impl Into<String>,
 ) -> Response {
+    error_response_naming(status, type_, code, message, None)
+}
+
+/// [`error_response`], naming the one request field at fault in
+/// `error.param` when there is one.
+fn error_response_naming(
+    status: StatusCode,
+    type_: &str,
+    code: &str,
+    message: impl Into<String>,
+    param: Option<&str>,
+) -> Response {
     (
         status,
         Json(ApiError {
@@ -841,13 +864,25 @@ fn error_response(
                 message: message.into(),
                 r#type: type_.into(),
                 code: code.into(),
+                param: param.map(str::to_owned),
             },
         }),
     )
         .into_response()
 }
 
-/// The `504` body for a request `collect_tokens` gave up on: names the
+/// A 400 naming the one request field at fault in `error.param`.
+fn bad_request_param(message: &str, param: &str) -> Response {
+    error_response_naming(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "invalid_request_error",
+        message,
+        Some(param),
+    )
+}
+
+/// The `504` body for a request `collect_completion` gave up on: names the
 /// timeout that fired (GitHub #95) so an operator reading the error knows
 /// what to raise with `--request-timeout`/`IGNIS_REQUEST_TIMEOUT`, rather
 /// than suspecting a wedged engine when a healthy one just needed longer.
@@ -1092,8 +1127,14 @@ async fn chat_completions(
         Ok(t) => t,
         Err(response) => return response,
     };
-    let params = match with_thinking_budget(&server, params, req.thinking_budget.as_ref(), &thinking) {
-        Ok(params) => params,
+    let (params, budget_dropped) = match with_thinking_budget(
+        &server,
+        params,
+        req.thinking_budget.as_ref(),
+        req.reasoning_effort.as_ref(),
+        &thinking,
+    ) {
+        Ok(resolved) => resolved,
         Err(response) => return response,
     };
     let tools = match resolve_tools(req.tools, req.tool_choice) {
@@ -1110,7 +1151,8 @@ async fn chat_completions(
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
-    let (request_id, mut stream) = match server.engine.submit_with_media(input, class, media).await {
+    let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped };
+    let (request_id, mut stream) = match server.engine.submit_with_notes(input, class, notes).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -1142,9 +1184,9 @@ async fn chat_completions(
     }
     // Non-streaming: collect the request's tokens to its completion (a
     // timeout guards a wedged engine from hanging the client).
-    match collect_tokens(&mut stream, server.request_timeout).await {
-        Ok((_, FinishReason::Error)) => engine_error_response(),
-        Ok((tokens, reason)) => {
+    match collect_completion(&mut stream, server.request_timeout).await {
+        Ok(Completion { reason: FinishReason::Error, .. }) => engine_error_response(),
+        Ok(Completion { tokens, reason, thinking: budget }) => {
             let (reasoning_content, content, tool_calls) =
                 split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking, schemas);
             let completion_tokens = tokens.len() as u32;
@@ -1175,6 +1217,7 @@ async fn chat_completions(
                         tool_calls,
                     },
                     finish_reason,
+                    thinking_budget_forced_at: budget.and_then(|b| b.forced_at),
                 }],
                 usage: Usage {
                     prompt_tokens,
@@ -1209,6 +1252,11 @@ struct CompletionChoice {
     index: u8,
     message: AssistantMessage,
     finish_reason: &'static str,
+    /// An ignis extension (spec server/08): the reasoning tokens emitted when
+    /// the thinking budget forced the model's close. Absent — not `null` —
+    /// when the close was not forced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget_forced_at: Option<u32>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1285,6 +1333,10 @@ struct ChunkChoice {
     index: u8,
     delta: Delta,
     finish_reason: Option<&'static str>,
+    /// See the matching field on `CompletionChoice`: only ever on the chunk
+    /// that carries `finish_reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget_forced_at: Option<u32>,
 }
 
 /// The token delta. An empty `content`, absent `reasoning_content` and
@@ -1473,6 +1525,12 @@ impl ChunkStream {
 
     /// One chunk (a decoded delta or the final `finish_reason` chunk).
     fn chunk(&self, delta: Delta, finish_reason: Option<&'static str>) -> Event {
+        self.chunk_with(delta, finish_reason, None)
+    }
+
+    /// [`ChunkStream::chunk`], carrying a forced close's reasoning-token
+    /// count — which only the finish chunk does.
+    fn chunk_with(&self, delta: Delta, finish_reason: Option<&'static str>, thinking_budget_forced_at: Option<u32>) -> Event {
         let chunk = Chunk {
             id: self.id.clone(),
             object: "chat.completion.chunk",
@@ -1482,6 +1540,7 @@ impl ChunkStream {
                 index: 0,
                 delta,
                 finish_reason,
+                thinking_budget_forced_at,
             }],
             usage: None,
         };
@@ -1586,7 +1645,7 @@ impl Stream for ChunkStream {
                     // and the tool-call scanner held back, then the
                     // finish-reason chunk, then (opt-in) the usage chunk —
                     // all queued ahead of `[DONE]`.
-                    SchedEvent::Done { reason, tokens, .. } => {
+                    SchedEvent::Done { reason, tokens, thinking, .. } => {
                         this.cancel.completed();
                         for delta in this.decoder.finish() {
                             this.queue_decoder_delta(delta);
@@ -1606,8 +1665,9 @@ impl Stream for ChunkStream {
                             this.emitted_reasoning && !this.emitted_content_or_call,
                             finish_reason,
                         );
+                        let forced_at = thinking.and_then(|b| b.forced_at);
                         this.pending
-                            .push_back(this.chunk(Delta::default(), Some(finish_reason)));
+                            .push_back(this.chunk_with(Delta::default(), Some(finish_reason), forced_at));
                         if this.include_usage {
                             this.pending.push_back(this.usage_chunk(tokens));
                         }
@@ -1727,8 +1787,14 @@ async fn responses_api(
         seed: req.seed.unwrap_or(0),
         ..DecodeParams::default()
     };
-    let params = match with_thinking_budget(&server, params, req.thinking_budget.as_ref(), &thinking) {
-        Ok(params) => params,
+    let (params, budget_dropped) = match with_thinking_budget(
+        &server,
+        params,
+        req.thinking_budget.as_ref(),
+        req.reasoning_effort.as_ref(),
+        &thinking,
+    ) {
+        Ok(resolved) => resolved,
         Err(response) => return response,
     };
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
@@ -1751,15 +1817,16 @@ async fn responses_api(
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
-    let (id, mut stream) = match server.engine.submit_with_media(input, class, media).await {
+    let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped };
+    let (id, mut stream) = match server.engine.submit_with_notes(input, class, notes).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
     // GitHub #81 / ADR 0012: see the matching comment in `chat_completions`.
     tracing::Span::current().record("request_id", id);
-    match collect_tokens(&mut stream, server.request_timeout).await {
-        Ok((_, FinishReason::Error)) => engine_error_response(),
-        Ok((tokens, _reason)) => {
+    match collect_completion(&mut stream, server.request_timeout).await {
+        Ok(Completion { reason: FinishReason::Error, .. }) => engine_error_response(),
+        Ok(Completion { tokens, thinking: budget, .. }) => {
             // The responses API's v1 shape carries no `finish_reason`
             // field (only `status: "completed"`); the stop reason is not
             // surfaced here.
@@ -1786,6 +1853,7 @@ async fn responses_api(
                     }],
                 }],
                 status: "completed",
+                thinking_budget_forced_at: budget.and_then(|b| b.forced_at),
                 usage: ResponsesUsage {
                     input_tokens: prompt_tokens,
                     output_tokens,
@@ -1812,6 +1880,10 @@ struct Responses {
     model: String,
     output: Vec<ResponseMessage>,
     status: &'static str,
+    /// See the matching field on `CompletionChoice`; top-level here, where
+    /// this shape keeps its per-response state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget_forced_at: Option<u32>,
     usage: ResponsesUsage,
 }
 
@@ -1855,6 +1927,10 @@ pub(crate) struct ErrorBody {
     message: String,
     r#type: String,
     code: String,
+    /// The request field at fault, when one field is (OpenAI's `param`).
+    /// Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param: Option<String>,
 }
 
 #[cfg(test)]
@@ -1878,6 +1954,7 @@ mod tests {
                     tool_calls: None,
                 },
                 finish_reason: None,
+                thinking_budget_forced_at: None,
             }],
             usage: None,
         };
@@ -1903,11 +1980,14 @@ mod tests {
                 index: 0,
                 delta: Delta::default(),
                 finish_reason: Some("stop"),
+                thinking_budget_forced_at: None,
             }],
             usage: None,
         };
         let json = serde_json::to_value(&c).expect("chunk serializes");
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        // No forced close: the ignis extension is absent, not `null`.
+        assert!(json["choices"][0].get("thinking_budget_forced_at").is_none());
         // An empty delta serializes to `{}` (the content key is omitted).
         assert_eq!(json["choices"][0]["delta"], serde_json::json!({}));
     }
@@ -2064,12 +2144,15 @@ mod tests {
                 message: "nope".into(),
                 r#type: "invalid_request_error".into(),
                 code: "invalid_request_error".into(),
+                param: None,
             },
         };
         let json = serde_json::to_value(&body).expect("error serializes");
         assert_eq!(json["error"]["message"], "nope");
         assert_eq!(json["error"]["type"], "invalid_request_error");
         assert_eq!(json["error"]["code"], "invalid_request_error");
+        // No field at fault, no `param` key at all.
+        assert!(json["error"].get("param").is_none(), "{json}");
     }
 
     #[test]

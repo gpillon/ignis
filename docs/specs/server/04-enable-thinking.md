@@ -296,10 +296,29 @@ checksum.
 
 `thinking_budget` is an ignis extension on `/v1/chat/completions` and
 `/v1/responses`: the most tokens a request may emit with its reasoning block
-still open. It is a whole number of at least 1. `null` or absent takes the
-server default (`--thinking-budget` / `IGNIS_THINKING_BUDGET`, unset = no
-budget), and anything else is a 400 naming the field. It applies only to a
-generation that starts inside the block: with thinking off it is inert.
+still open. Amended 2026-09-24 by spec server/08 (GitHub #265), which ships
+a default and makes `0` the opt-out:
+
+| Value | Meaning |
+| --- | --- |
+| absent or `null` | the server default: `--thinking-budget` / `IGNIS_THINKING_BUDGET`, shipped at 6144; `off` = no default |
+| a positive whole number | that budget, in reasoning tokens, upward or downward of the default |
+| `0` | no budget for this request (a 400 before server/08) |
+| anything else | 400, `error.param = "thinking_budget"` |
+
+It applies only to a generation that starts inside the block: with thinking
+off it is inert. With `reasoning_effort: "max"` (the request's, else the
+server's) there is no budget at all, and a valid `thinking_budget` on the
+request is ignored rather than refused.
+
+The budget always leaves the answer room: the scheduler runs a request under
+`min(budget, generation − 2048)`, where `generation` is `max_tokens`, or,
+when the request sets none, what the context leaves after the prompt. No room
+above the 2,048-token reserve means no budget. A forced close is reported as
+`thinking_budget_forced_at` (the reasoning tokens emitted when it began) on
+the choice, on the streaming finish chunk, and on the `/v1/responses` object,
+and is absent otherwise. Server/08 has the request-log attributes and the
+Prometheus counter.
 
 Once a request's budget is spent with the block open, the scheduler forces the
 model card's close, one token per round:
@@ -321,7 +340,8 @@ Three consequences:
   constrained decode's.
 
 A tokenizer that splits `</think>` makes every budget inert, with one warning
-at load. Measured: `docs/findings/2026-09-24-reasoning-effort-on-coding-tasks.md`.
+at load; with a default budget configured it refuses the start instead
+(server/08). Measured: `docs/findings/2026-09-24-reasoning-effort-on-coding-tasks.md`.
 
 ### Response separation — the split rule
 

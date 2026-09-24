@@ -329,29 +329,101 @@ pub fn thinking_close(
     ignis_core::thinking_budget::ThinkingClose::new(encode(THINKING_CLOSE_TEXT)?, think_end)
 }
 
-/// A request's `thinking_budget`: absent or `null` falls back to the server
-/// default; otherwise a whole number of tokens, at least 1.
-pub fn resolve_thinking_budget(value: Option<&JsonValue>, default: Option<u32>) -> Result<Option<u32>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(default),
-        Some(JsonValue::Number(n)) => n
-            .as_u64()
-            .filter(|&n| n >= 1)
-            .and_then(|n| u32::try_from(n).ok())
-            .map(Some)
-            .ok_or_else(|| format!("`thinking_budget` must be a whole number of tokens from 1 to {}, got {n}", u32::MAX)),
-        Some(other) => Err(format!("`thinking_budget` must be a whole number of tokens, got {other}")),
+/// A request's thinking budget as the server resolved it (spec server/08),
+/// before the scheduler's answer-room clamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudget {
+    /// The budget, in reasoning tokens; `None` = no budget.
+    pub budget: Option<u32>,
+    /// `reasoning_effort: "max"` discarded a budget — the request's own, or
+    /// the server default — that would otherwise have applied. The request
+    /// log says so, or a request that set a budget and was not forced would
+    /// have no explanation.
+    pub dropped_by_max: bool,
+}
+
+/// A request's `thinking_budget`, resolved against the server default.
+/// First match wins:
+///
+/// 1. the request runs at `max` effort → no budget, whatever was asked;
+/// 2. an explicit `thinking_budget` → that, and `0` = no budget;
+/// 3. absent or `null` → the server default.
+///
+/// The field is validated before any of that: a value that is not a whole
+/// number of tokens is the client's mistake even under `max`.
+pub fn resolve_thinking_budget(
+    value: Option<&JsonValue>,
+    default: Option<u32>,
+    max: bool,
+) -> Result<RequestBudget, String> {
+    let requested = match value {
+        None | Some(JsonValue::Null) => None,
+        Some(JsonValue::Number(n)) => Some(n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| {
+            format!("`thinking_budget` must be a whole number of tokens from 0 (none) to {}, got {n}", u32::MAX)
+        })?),
+        Some(other) => {
+            return Err(format!("`thinking_budget` must be a whole number of tokens, 0 for none, got {other}"))
+        }
+    };
+    if max {
+        return Ok(RequestBudget {
+            budget: None,
+            dropped_by_max: requested.is_some() || default.is_some(),
+        });
+    }
+    Ok(RequestBudget {
+        budget: match requested {
+            Some(0) => None,
+            Some(budget) => Some(budget),
+            None => default,
+        },
+        dropped_by_max: false,
+    })
+}
+
+/// Whether a request runs at `max` effort: its own `reasoning_effort`, else
+/// the server's `--reasoning-effort`. Read off the raw field because the
+/// resolved [`ThinkingOptions`] carries the effort the *template* takes, and
+/// Qwen3.8's rounds `max` to `xhigh`. Called after [`resolve`] accepted the
+/// field, so an unparsable one never reaches here.
+pub fn runs_at_max(requested: Option<&JsonValue>, default: Option<ReasoningEffort>) -> bool {
+    match optional_effort(requested) {
+        Ok(Some(effort)) => effort == ReasoningEffort::Max,
+        Ok(None) => default == Some(ReasoningEffort::Max),
+        Err(_) => false,
     }
 }
 
-/// Parse `IGNIS_THINKING_BUDGET` / `--thinking-budget` (empty = no budget).
+/// Parse a set `IGNIS_THINKING_BUDGET` / `--thinking-budget`: a whole number
+/// of tokens, or `off` for no default budget. Unset is the caller's to
+/// resolve (the shipped default). `0` is refused rather than read as `off`:
+/// the one way to say "none" at startup is the word.
 pub fn parse_default_thinking_budget(value: &str) -> Result<Option<u32>, String> {
-    if value.is_empty() {
+    if value == "off" {
         return Ok(None);
     }
     match value.parse::<u32>() {
         Ok(n) if n >= 1 => Ok(Some(n)),
-        _ => Err(format!("IGNIS_THINKING_BUDGET must be a whole number of tokens, at least 1, got {value:?}")),
+        _ => Err(format!(
+            "IGNIS_THINKING_BUDGET must be a whole number of tokens, at least 1, or `off` for no budget, got {value:?}"
+        )),
+    }
+}
+
+/// Refuse a start whose default budget could never be applied: the loaded
+/// tokenizer yields no close sequence (`close` is why), so every request
+/// would run unbudgeted while the operator believes otherwise. Without a
+/// default the start goes on, and a per-request budget stays inert.
+pub fn check_default_budget_close(
+    default_budget: Option<u32>,
+    close: &Result<ignis_core::thinking_budget::ThinkingClose, String>,
+) -> Result<(), String> {
+    match (default_budget, close) {
+        (Some(budget), Err(why)) => Err(format!(
+            "--thinking-budget {budget} is set, but the loaded tokenizer yields no thinking close ({why}); \
+             pass --thinking-budget off (IGNIS_THINKING_BUDGET=off) to start without a budget"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -719,15 +791,51 @@ mod tests {
     }
 
     #[test]
-    fn a_thinking_budget_is_a_positive_whole_number_or_the_default() {
-        assert_eq!(resolve_thinking_budget(None, Some(8)), Ok(Some(8)));
-        assert_eq!(resolve_thinking_budget(Some(&json!(null)), None), Ok(None));
-        assert_eq!(resolve_thinking_budget(Some(&json!(4096)), Some(8)), Ok(Some(4096)));
-        for bad in [json!(0), json!(-1), json!(1.5), json!("64"), json!(true)] {
-            let err = resolve_thinking_budget(Some(&bad), None).unwrap_err();
-            assert!(err.contains("thinking_budget"), "{bad}: {err}");
+    fn a_thinking_budget_is_a_whole_number_zero_for_none_or_the_default() {
+        let budget = |value: Option<JsonValue>, default, max| {
+            resolve_thinking_budget(value.as_ref(), default, max)
+        };
+        let plain = |budget| Ok(RequestBudget { budget, dropped_by_max: false });
+        assert_eq!(budget(None, Some(8), false), plain(Some(8)));
+        assert_eq!(budget(Some(json!(null)), None, false), plain(None));
+        assert_eq!(budget(Some(json!(4096)), Some(8), false), plain(Some(4096)));
+        assert_eq!(budget(Some(json!(0)), Some(8), false), plain(None));
+        for bad in [json!(-1), json!(1.5), json!("64"), json!(true), json!(4_294_967_296u64)] {
+            for max in [false, true] {
+                let err = budget(Some(bad.clone()), None, max).unwrap_err();
+                assert!(err.contains("thinking_budget"), "{bad}: {err}");
+            }
         }
-        assert_eq!(parse_default_thinking_budget(""), Ok(None));
+    }
+
+    #[test]
+    fn max_drops_every_budget_and_says_so_only_when_there_was_one() {
+        let dropped = |value: Option<JsonValue>, default| {
+            resolve_thinking_budget(value.as_ref(), default, true).map(|b| (b.budget, b.dropped_by_max))
+        };
+        assert_eq!(dropped(Some(json!(64)), None), Ok((None, true)));
+        assert_eq!(dropped(Some(json!(0)), None), Ok((None, true)));
+        assert_eq!(dropped(None, Some(8192)), Ok((None, true)));
+        assert_eq!(dropped(None, None), Ok((None, false)));
+    }
+
+    #[test]
+    fn a_default_budget_the_tokenizer_cannot_close_refuses_the_start() {
+        let unavailable: Result<ignis_core::thinking_budget::ThinkingClose, String> =
+            Err("`</think>` is 3 tokens, not one".to_owned());
+        let err = check_default_budget_close(Some(8192), &unavailable).unwrap_err();
+        assert!(err.contains("--thinking-budget") && err.contains("off"), "{err}");
+        assert!(err.contains("3 tokens"), "the tokenizer's own reason: {err}");
+        // No default: a per-request budget stays inert, and the start goes on.
+        assert_eq!(check_default_budget_close(None, &unavailable), Ok(()));
+        // A close to force: nothing to refuse.
+        let close = ignis_core::thinking_budget::ThinkingClose::new(vec![1, 2], 2);
+        assert_eq!(check_default_budget_close(Some(8192), &close), Ok(()));
+    }
+
+    #[test]
+    fn the_server_default_parses() {
+        assert_eq!(parse_default_thinking_budget("off"), Ok(None));
         assert_eq!(parse_default_thinking_budget("12000"), Ok(Some(12000)));
         assert!(parse_default_thinking_budget("0").is_err());
     }

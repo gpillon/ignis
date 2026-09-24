@@ -626,6 +626,13 @@ pub enum SchedEvent {
         /// engine cut short; the tokens are still the `SchedEvent::Token`s
         /// that preceded it, and this says how far it got.
         drawn: Option<Vec<crate::constrained::Draw>>,
+        /// What the request's **thinking budget** did (spec server/08): the
+        /// budget it ran under and, when the close was forced, how many
+        /// tokens it had emitted by then. `None` when no budget was in
+        /// effect — none asked for, no room above the answer reserve, or a
+        /// scheduler without a close sequence — so a report never says
+        /// "not forced" about a budget that could not have been.
+        thinking: Option<crate::thinking_budget::BudgetOutcome>,
     },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for

@@ -6,7 +6,8 @@
 - Last verified: 2026-09-24
 - Scope: server / `reasoning_effort` resolution (spec `server/04`), thinking cost, DFlash2 acceptance under sampling
 - Related: [spec server/04](../specs/server/04-enable-thinking.md) (amended the same day:
-  an effort the template does not take rounds up), [copy drafting on agent traces](2026-09-24-copy-drafting-on-agent-traces.md)
+  an effort the template does not take rounds up), [thinking budget default](2026-09-24-thinking-budget-default.md)
+  (the budget's shipped value, measured on more seeds), [copy drafting on agent traces](2026-09-24-copy-drafting-on-agent-traces.md)
   (thinking is 73.5% of real agent output), `.scratch/sota-research-2026-09-24/SINTESI.md`
 - Superseded by: none
 
@@ -95,6 +96,10 @@ and costs 4–5× the latency. It also risks a turn with no answer when the clie
   unbudgeted `xhigh`'s wall time. `medium` stays ~3.5× faster. Which pair is the
   default is the owner's call. Both are measured-better than today's unset default:
   `xhigh` with no budget.
+- Since #265 the server ships a budget by default: 6,144, chosen on 32 runs per value,
+  where this session's 15/16 at 8K pooled to 79%
+  ([thinking budget default](2026-09-24-thinking-budget-default.md)). The effort
+  default is unchanged.
 - Thinking is 73.5% of real agent output (copy-drafting finding). Cutting it is a
   bigger throughput lever than any drafter change measured so far.
 

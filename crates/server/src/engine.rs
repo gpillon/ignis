@@ -61,9 +61,11 @@ enum Command {
     Submit {
         input: RequestInput,
         class: RequestClass,
-        /// The request's media acquisition summary (GitHub #179), carried
-        /// with the submission so it reaches telemetry before `Admitted`.
-        media: Option<MediaStats>,
+        /// What the request log says about the request beyond its input
+        /// (media, GitHub #179; a dropped thinking budget, spec server/08),
+        /// carried with the submission so it reaches telemetry before
+        /// `Admitted`.
+        notes: RequestNotes,
         reply: oneshot::Sender<Result<(RequestId, EventStream), SubmitError>>,
     },
     /// Abort an in-flight request (its HTTP client disconnected). No
@@ -85,7 +87,7 @@ enum Command {
 /// [`Engine::install_metrics`] to reach the already-running consumer without
 /// ever sharing a lock with the model thread.
 enum TelemetryFact {
-    Submitted(RequestId, u32, RequestClass, Option<MediaStats>),
+    Submitted(RequestId, u32, RequestClass, RequestNotes),
     Routed(SchedEvent),
     /// One step happened, and this is what the scheduler held when it ended
     /// (GitHub #216, ADR 0030). The payload is read on the model thread, from
@@ -95,6 +97,19 @@ enum TelemetryFact {
     Cancelled(RequestId),
     SetStats(Arc<dyn IntervalStatsProvider>),
     SetMetrics(Arc<Metrics>),
+}
+
+/// What the request log reports about a request that its [`RequestInput`]
+/// does not carry: facts the HTTP handler holds and the scheduler never
+/// needs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestNotes {
+    /// What acquiring the request's media cost (GitHub #179); `None` for a
+    /// request without media.
+    pub media: Option<MediaStats>,
+    /// `reasoning_effort: "max"` dropped a thinking budget that would
+    /// otherwise have applied (spec server/08).
+    pub thinking_budget_dropped: bool,
 }
 
 /// The server-side engine: a cheap, cloneable handle onto the model thread
@@ -262,9 +277,21 @@ impl Engine {
         class: RequestClass,
         media: Option<MediaStats>,
     ) -> Result<(RequestId, EventStream), SubmitError> {
+        self.submit_with_notes(input, class, RequestNotes { media, ..RequestNotes::default() })
+            .await
+    }
+
+    /// [`Engine::submit`] with what the request log says about the request
+    /// beyond its input.
+    pub async fn submit_with_notes(
+        &self,
+        input: RequestInput,
+        class: RequestClass,
+        notes: RequestNotes,
+    ) -> Result<(RequestId, EventStream), SubmitError> {
         let (reply, reply_rx) = oneshot::channel();
         self.commands
-            .send(Command::Submit { input, class, media, reply })
+            .send(Command::Submit { input, class, notes, reply })
             .expect("the model thread outlives every Engine handle");
         reply_rx
             .await
@@ -336,7 +363,7 @@ fn handle_command(
     facts: &UnboundedSender<TelemetryFact>,
 ) {
     match command {
-        Command::Submit { input, class, media, reply } => {
+        Command::Submit { input, class, notes, reply } => {
             // P3-06: the request log's `prompt_tokens` field is read here,
             // before `input` moves into `submit` — the scheduler's own
             // `Request` is not reachable from the telemetry consumer.
@@ -344,7 +371,7 @@ fn handle_command(
             let result = scheduler.submit(input, class).map(|id| {
                 let (route, stream) = unbounded_channel();
                 streams.insert(id, route);
-                let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens, class, media));
+                let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens, class, notes));
                 (id, stream)
             });
             // A dropped receiver (the caller gave up) is not an error here.
@@ -420,10 +447,13 @@ async fn telemetry_task(
 ) {
     while let Some(fact) = facts.recv().await {
         match fact {
-            TelemetryFact::Submitted(id, prompt_tokens, class, media) => {
+            TelemetryFact::Submitted(id, prompt_tokens, class, notes) => {
                 telemetry.note_submit(id, prompt_tokens, class);
-                if let Some(media) = media {
+                if let Some(media) = notes.media {
                     telemetry.note_media(id, media);
+                }
+                if notes.thinking_budget_dropped {
+                    telemetry.note_thinking_budget_dropped(id);
                 }
             }
             TelemetryFact::Routed(event) => match event {
@@ -456,7 +486,8 @@ async fn telemetry_task(
                     // reason as the readout.
                     attention: _,
                     drawn: _,
-                } => telemetry.on_done(request, tokens, reason, spec),
+                    thinking,
+                } => telemetry.on_done(request, tokens, reason, spec, thinking),
                 SchedEvent::PrefillChunk {
                     request,
                     prefilled_tokens,
@@ -511,13 +542,31 @@ pub async fn collect_tokens(
     rx: &mut EventStream,
     timeout: Duration,
 ) -> Result<(Vec<TokenId>, FinishReason), CollectError> {
+    collect_completion(rx, timeout).await.map(|c| (c.tokens, c.reason))
+}
+
+/// A request's whole completion, as [`collect_completion`] gathers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// The generated tokens, in order.
+    pub tokens: Vec<TokenId>,
+    /// Why generation stopped.
+    pub reason: FinishReason,
+    /// What the request's thinking budget did (spec server/08) — `None`
+    /// when none was in effect.
+    pub thinking: Option<ignis_core::thinking_budget::BudgetOutcome>,
+}
+
+/// [`collect_tokens`], keeping what the finish event said beyond the reason:
+/// what the request's thinking budget did, which the response reports.
+pub async fn collect_completion(rx: &mut EventStream, timeout: Duration) -> Result<Completion, CollectError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut tokens = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(event)) => match event {
                 SchedEvent::Token { token, .. } => tokens.push(token),
-                SchedEvent::Done { reason, .. } => return Ok((tokens, reason)),
+                SchedEvent::Done { reason, thinking, .. } => return Ok(Completion { tokens, reason, thinking }),
                 // Other events for this request (admissions, evictions,
                 // restorations) do not change the generated-token list —
                 // keep draining.
@@ -783,6 +832,7 @@ mod tests {
                     reason: FinishReason::Stop,
                     spec: None,
                     attention: None,
+                    thinking: None,
                 },
             ]
         }
@@ -855,6 +905,7 @@ mod tests {
                     reason: FinishReason::Stop,
                     spec: None,
                     attention: None,
+                    thinking: None,
                 },
             ]
         }
@@ -996,8 +1047,8 @@ mod tests {
     /// A fact as the model thread sent it, in comparable form.
     fn describe_fact(fact: &TelemetryFact) -> String {
         match fact {
-            TelemetryFact::Submitted(id, prompt_tokens, class, media) => {
-                format!("submitted {id} {prompt_tokens} {class:?} {media:?}")
+            TelemetryFact::Submitted(id, prompt_tokens, class, notes) => {
+                format!("submitted {id} {prompt_tokens} {class:?} {notes:?}")
             }
             TelemetryFact::Routed(event) => format!("routed {event:?}"),
             // The occupancy rides along, so the flag-off/flag-on comparison

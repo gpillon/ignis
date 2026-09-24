@@ -46,7 +46,12 @@ three more `type` values — `number`, `point` and `box` — which are counted
 like any other question and observe **no** answer mass, so the histogram is
 readout-only and its `_count` sits below the counter's sum by exactly the
 number of programs served. That asymmetry is stated below the table too, for
-the same reason.
+the same reason. Amended 2026-09-24 (#265, spec server/08): one counter,
+`ignis_thinking_forced_closes_total`, the completed requests whose reasoning
+block the thinking budget closed. It is projected by the telemetry consumer
+from the finish event the scheduler already emits, so the model thread does
+no new work, and it takes the decision family's exception: absent until the
+first forced close.
 
 ## Context
 
@@ -209,6 +214,7 @@ The initial stable metric contract is:
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
 | `ignis_decisions_total` | counter | `type=noul\|choice\|score\|scalar\|number\|point\|box` | Questions answered, by typed primitive (#241, #242, ADR 0034). **Absent until the first one** — see below |
 | `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
+| `ignis_thinking_forced_closes_total` | counter | none | Completed requests whose reasoning block the thinking budget closed (#265, spec server/08). The request log's `thinking_forced` says which. **Absent until the first one** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
 reserved lines (eleven, twelve since #257 added `hq_residual_window`), the budget, the KV pool's pages and page bytes, the
@@ -216,9 +222,10 @@ pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
 capacity and use, and the retained-slot skips. Every one is bytes, pages or
 slots; no percentage is exported.
 
-**The decision family is the one thing here that is absent when it is zero
-(#241).** Every other series is exported from the first scrape, zeros
-included, because a zero is a reading. A decision's are not exported until a
+**The decision family is absent when it is zero (#241)**, and so is the
+forced-close counter (#265), for the same reason: a load whose traffic never
+reaches its thinking budget is a normal one. Every other series is exported
+from the first scrape, zeros included, because a zero is a reading. A decision's are not exported until a
 decision has been served, and that is this ADR's other rule — *only
 authoritative values are exported* — applied to a route most loads never
 call: three permanently-zero series and an eleven-bucket histogram on every

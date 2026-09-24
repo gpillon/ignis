@@ -37,6 +37,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
+use ignis_core::thinking_budget::BudgetOutcome;
 use ignis_core::{
     FinishReason, LaneId, Occupancy, RequestClass, RequestId, RetainedSkip, SpecCounters,
 };
@@ -188,6 +189,10 @@ struct RequestTelemetry {
     /// nothing at all, exactly as it does for `spec.*` on a load with no
     /// drafter.
     reuse: Option<(ReuseSource, u32, u64)>,
+    /// `reasoning_effort: "max"` dropped a thinking budget this request
+    /// would otherwise have run under (spec server/08), read off the
+    /// submission since the scheduler never sees it.
+    thinking_budget_dropped: bool,
 }
 
 /// The server's telemetry: tracks per-request state and emits the interval +
@@ -276,6 +281,15 @@ impl Telemetry {
     pub fn note_media(&mut self, id: RequestId, media: MediaStats) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.media = Some(media);
+        }
+    }
+
+    /// `max` dropped a submitted request's thinking budget (spec server/08):
+    /// its `done` line says so, or a request that set a budget and was never
+    /// forced would carry no explanation.
+    pub fn note_thinking_budget_dropped(&mut self, id: RequestId) {
+        if let Some(rt) = self.requests.get_mut(&id) {
+            rt.thinking_budget_dropped = true;
         }
     }
 
@@ -382,15 +396,17 @@ impl Telemetry {
 
     /// A request completed (`n` = its total tokens, `reason` why it
     /// stopped): emit the `done` line — carrying `n`, `reason`, the decode
-    /// phase's per-lane inter-token-latency summary (P3-06) and its
-    /// speculative counters when it ran any rounds (P5-06, GitHub #154) —
-    /// and drop the request from the in-flight set.
+    /// phase's per-lane inter-token-latency summary (P3-06), its
+    /// speculative counters when it ran any rounds (P5-06, GitHub #154) and
+    /// what its thinking budget did when it had one (spec server/08) — and
+    /// drop the request from the in-flight set.
     pub fn on_done(
         &mut self,
         id: RequestId,
         n: u32,
         reason: FinishReason,
         spec: Option<SpecCounters>,
+        thinking: Option<BudgetOutcome>,
     ) {
         if let Some(metrics) = &self.metrics {
             match self.recently_cancelled.iter().position(|&c| c == id) {
@@ -398,12 +414,17 @@ impl Telemetry {
                 Some(i) => {
                     self.recently_cancelled.remove(i);
                 }
-                None => metrics.record_completed(n),
+                None => {
+                    metrics.record_completed(n);
+                    if thinking.is_some_and(|t| t.forced_at.is_some()) {
+                        metrics.record_thinking_forced_close();
+                    }
+                }
             }
         }
         let rt = self.requests.remove(&id);
         let known = rt.is_some();
-        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse) = match rt {
+        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse, budget_dropped) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
                 rt.lane,
@@ -412,6 +433,7 @@ impl Telemetry {
                 rt.itl_max_ms,
                 rt.class,
                 rt.reuse,
+                rt.thinking_budget_dropped,
             ),
             None => (
                 self.clock.now_ms(),
@@ -421,6 +443,7 @@ impl Telemetry {
                 0,
                 RequestClass::default(),
                 None,
+                false,
             ),
         };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
@@ -449,6 +472,7 @@ impl Telemetry {
             class,
             spec,
             reuse,
+            ThinkingReport { outcome: thinking, dropped_by_max: budget_dropped },
         );
     }
 
@@ -810,6 +834,7 @@ impl Telemetry {
         class: RequestClass,
         spec: Option<SpecCounters>,
         reuse: Option<(ReuseSource, u32, u64)>,
+        thinking: ThinkingReport,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
@@ -839,9 +864,26 @@ impl Telemetry {
             reuse_source = reuse.map(|(source, _, _)| source.as_str()),
             reused_prompt_tokens = reuse.map(|(_, tokens, _)| tokens),
             restore_ms = reuse.map(|(_, _, micros)| micros as f64 / 1000.0),
+            // Spec server/08. Absent on a request with no budget, the same
+            // way: `thinking_forced: false` is said only about a budget that
+            // could have been forced.
+            thinking_budget = thinking.outcome.map(|t| t.budget),
+            thinking_forced = thinking.outcome.map(|t| t.forced_at.is_some()),
+            thinking_forced_at = thinking.outcome.and_then(|t| t.forced_at),
+            thinking_budget_dropped = thinking.dropped_by_max.then_some("max"),
             "request done"
         );
     }
+}
+
+/// What a request's `done` line says about its thinking budget (spec
+/// server/08).
+#[derive(Debug, Clone, Copy)]
+struct ThinkingReport {
+    /// What the scheduler reported the budget did; `None` with no budget.
+    outcome: Option<BudgetOutcome>,
+    /// `max` dropped a budget at the handler.
+    dropped_by_max: bool,
 }
 
 /// Tokens per second for `n` tokens over `ms` milliseconds (0.0 for a
@@ -959,7 +1001,7 @@ mod tests {
         assert!(busy.contains("\nignis_kv_pool_used_pages 64\n"), "{busy}");
         assert!(busy.contains("\nignis_kv_ram_arena_bytes{state=\"used\"} 1073741824\n"), "{busy}");
 
-        telemetry.on_done(1, 3, FinishReason::Stop, None);
+        telemetry.on_done(1, 3, FinishReason::Stop, None, None);
         telemetry.emit_interval(Occupancy {
             kv_used_pages: 0,
             kv_pool_pages: 256,
@@ -1002,7 +1044,7 @@ mod tests {
             for _ in 0..3 {
                 returned.push(telemetry.emit_interval(Occupancy::default()));
             }
-            telemetry.on_done(1, 3, FinishReason::Stop, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None);
             returned.push(telemetry.emit_interval(Occupancy::default()));
         });
         let intervals = intervals(&events);
@@ -1043,7 +1085,7 @@ mod tests {
             telemetry.on_admitted(7, 2);
             telemetry.on_token(7); // first token → ttft
             telemetry.on_token(7); // subsequent tokens are not re-emitted
-            telemetry.on_done(7, 4, FinishReason::Stop, None);
+            telemetry.on_done(7, 4, FinishReason::Stop, None, None);
         });
 
         let event_names: Vec<&str> = events.iter().map(|e| e["event_name"].as_str().unwrap()).collect();
@@ -1085,6 +1127,7 @@ mod tests {
                 12,
                 FinishReason::Stop,
                 Some(SpecCounters::round(7, 7) + SpecCounters::round(7, 2) + SpecCounters::round(7, 0)),
+                None,
             );
         });
 
@@ -1205,7 +1248,7 @@ mod tests {
         let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
-            telemetry.on_done(1, 3, FinishReason::Stop, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None);
         });
         let done = events.last().unwrap();
         // FixedClock(0): a zero elapsed span → `duration_ms` and `tok_s` are 0.
@@ -1233,7 +1276,7 @@ mod tests {
             }));
         let events = capture_events(|| {
             telemetry.note_submit(1, 5, RequestClass::Interactive); // read #1 → 100 ms
-            telemetry.on_done(1, 5, FinishReason::Length, None); // read #2 → 200 ms, so ms = 100
+            telemetry.on_done(1, 5, FinishReason::Length, None, None); // read #2 → 200 ms, so ms = 100
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["duration_ms"], 100, "200 - 100 = 100 ms elapsed");
@@ -1391,7 +1434,7 @@ mod tests {
             telemetry.on_token(1); // ttft — no ITL sample yet
             telemetry.on_token(1); // 1st gap: 10ms
             telemetry.on_token(1); // 2nd gap: 10ms
-            telemetry.on_done(1, 3, FinishReason::Stop, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None);
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["itl_samples"], 2);
@@ -1434,7 +1477,7 @@ mod tests {
             telemetry.on_prefill_chunk(2, 32_768, 0); // the wide chunk lands
             telemetry.on_token(1); // t=220, 2nd gap: 200ms — the stall
             telemetry.on_admitted(2, 1); // t=230, prefiller starts decoding
-            telemetry.on_done(1, 3, FinishReason::Stop, None); // t=220 (clock re-read), lane 0 finishes
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None); // t=220 (clock re-read), lane 0 finishes
         });
 
         // Request 2's `admitted` line shows the wide cold-prefill chunk
@@ -1486,7 +1529,7 @@ mod tests {
         has("ignis_requests_completed_total 0");
 
         telemetry.on_token(2);
-        telemetry.on_done(2, 5, FinishReason::Stop, None);
+        telemetry.on_done(2, 5, FinishReason::Stop, None, None);
         telemetry.emit_interval(Occupancy::default());
         has("ignis_requests_completed_total 1");
         has("ignis_generated_tokens_total 5");
@@ -1516,7 +1559,7 @@ mod tests {
         has("ignis_decoded_tokens_total 3");
         has("ignis_generated_tokens_total 0");
 
-        telemetry.on_done(1, 3, FinishReason::Stop, None);
+        telemetry.on_done(1, 3, FinishReason::Stop, None, None);
         has("ignis_decoded_tokens_total 3");
         has("ignis_generated_tokens_total 3");
 
@@ -1563,10 +1606,10 @@ mod tests {
         telemetry.note_submit(1, 3, RequestClass::Interactive);
         telemetry.on_admitted(1, 0);
         telemetry.on_cancelled(1);
-        telemetry.on_done(1, 4, FinishReason::Stop, None);
+        telemetry.on_done(1, 4, FinishReason::Stop, None, None);
         // A `Done` for a request that was never cancelled still counts.
         telemetry.note_submit(2, 3, RequestClass::Interactive);
-        telemetry.on_done(2, 3, FinishReason::Length, None);
+        telemetry.on_done(2, 3, FinishReason::Length, None, None);
 
         let text = metrics.render();
         for line in [
@@ -1601,7 +1644,7 @@ mod tests {
         telemetry.on_evicted(1, 450);
         telemetry.on_token(1);
         telemetry.on_token(1);
-        telemetry.on_done(1, 2, FinishReason::Stop, None);
+        telemetry.on_done(1, 2, FinishReason::Stop, None, None);
 
         let text = metrics.render();
         for line in [
@@ -1679,8 +1722,8 @@ mod tests {
         telemetry.with_metrics(Arc::clone(&metrics));
         telemetry.note_submit(1, 3, RequestClass::Interactive);
         telemetry.on_cancelled(1);
-        telemetry.on_done(1, 4, FinishReason::Stop, None);
-        telemetry.on_done(99, 4, FinishReason::Stop, None);
+        telemetry.on_done(1, 4, FinishReason::Stop, None, None);
+        telemetry.on_done(99, 4, FinishReason::Stop, None, None);
 
         let text = metrics.render();
         assert!(text.contains("\nignis_request_duration_seconds_count 0\n"), "{text}");

@@ -63,6 +63,10 @@
 //!   default `reasoning_effort`; unset means "let the template's own
 //!   default apply". An unknown value, or one the loaded template does not
 //!   support, refuses to start.
+//! - `IGNIS_THINKING_BUDGET` / `--thinking-budget` — the server-wide
+//!   thinking budget, in reasoning tokens (default 6144, `off` for none;
+//!   spec server/08). Configured with a tokenizer that yields no thinking
+//!   close, it refuses to start.
 //! - `IGNIS_REQUEST_TIMEOUT` / `--request-timeout` — how long a
 //!   non-streaming completion waits before the handler gives up with a
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
@@ -141,6 +145,7 @@ fn cuda_scheduler(
     frontend: &ignis_artifact::FrontendSet,
     shape: ignis_server::runtime::EngineShape,
     vision_item_bound: Option<u64>,
+    thinking_close: Option<std::sync::Arc<ignis_core::thinking_budget::ThinkingClose>>,
     logging_handle: &ignis_logging::LoggingHandle,
 ) -> (Box<dyn Scheduler>, ignis_server::metrics::LoadReservations) {
     let eos = match frontend.eos_token_id() {
@@ -164,18 +169,6 @@ fn cuda_scheduler(
             None => vision,
         }),
         ..shape
-    };
-    // The thinking budget's forced close (2026-09-24), in this model's own
-    // tokens. A tokenizer that splits `</think>` leaves every budget inert,
-    // which is said once here rather than discovered per request.
-    let thinking_close = match ignis_server::thinking::thinking_close(|text| {
-        frontend.tokenizer().encode(text).map_err(|e| e.to_string())
-    }) {
-        Ok(close) => Some(std::sync::Arc::new(close)),
-        Err(error) => {
-            tracing::warn!(name: "ignis.model.thinking_close_unavailable", %error, "thinking budgets are inert");
-            None
-        }
     };
     match ignis_server::runtime::cuda_scheduler_with_thinking_close(artifact_path, model.into(), eos, shape, thinking_close) {
         Ok((scheduler, reserved)) => {
@@ -425,6 +418,30 @@ async fn main() {
             }
         };
 
+        // The thinking budget's forced close (2026-09-24), in this model's
+        // own tokens. A tokenizer that splits `</think>` leaves every budget
+        // inert: with a default budget configured that is a refused start
+        // (spec server/08), since the operator would believe one is active;
+        // without one it is said once here rather than discovered per
+        // request.
+        let thinking_close = thinking::thinking_close(|text| {
+            frontend.tokenizer().encode(text).map_err(|e| e.to_string())
+        });
+        if let Err(err) = thinking::check_default_budget_close(default_thinking_budget, &thinking_close) {
+            tracing::error!(name: "ignis.config.thinking_budget_inert", error = %err, "refusing to start");
+            exit_after_flush(&logging_handle, 1);
+        }
+        let thinking_close = match thinking_close {
+            Ok(close) => Some(Arc::new(close)),
+            Err(error) => {
+                tracing::warn!(name: "ignis.model.thinking_close_unavailable", %error, "thinking budgets are inert");
+                None
+            }
+        };
+        // Only the GPU backend forces the close; the mock never reasons.
+        #[cfg(not(feature = "cuda"))]
+        let _ = thinking_close;
+
         // GitHub #179: a `--vision` load prepares images with the artifact's
         // processor and acquires them before admission. A tokenizer whose
         // placeholder ids are not the model contract's is a refused start.
@@ -442,8 +459,15 @@ async fn main() {
         #[cfg(feature = "cuda")]
         let scheduler = {
             let item_bound = processor.as_ref().map(|p| p.options().max_item_tokens());
-            let (scheduler, reserved) =
-                cuda_scheduler(artifact_path, &model, &frontend, engine_shape, item_bound, &logging_handle);
+            let (scheduler, reserved) = cuda_scheduler(
+                artifact_path,
+                &model,
+                &frontend,
+                engine_shape,
+                item_bound,
+                thinking_close,
+                &logging_handle,
+            );
             // GitHub #216: what the plan reserved leaves the load here, so
             // the exposition can name it. The placeholder path below builds
             // no plan and leaves this `None`.

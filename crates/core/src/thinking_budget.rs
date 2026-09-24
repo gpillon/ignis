@@ -28,6 +28,37 @@ use std::sync::Arc;
 use crate::constrained::PermittedSet;
 use crate::types::TokenId;
 
+/// The tokens of a request's generation a budget always leaves for the
+/// answer (spec server/08): a close forced so late that the answer after it
+/// is cut by `max_tokens` is a turn with no answer all the same.
+///
+/// Measured (#265, `docs/findings/2026-09-24-thinking-budget-default.md`):
+/// the longest answer after a close on the coding sweep was ~1,650 tokens,
+/// and the reserve also holds the close itself (~25 tokens) and a
+/// speculative round's overshoot past the budget (up to its width). 2,048
+/// covers them with a quarter to spare.
+pub const ANSWER_RESERVE: u32 = 2048;
+
+/// The budget a request actually runs under: what it asked for, clamped so
+/// that [`ANSWER_RESERVE`] tokens of its `generation` (the tokens it may
+/// generate at all) stay for the answer. `None` when there is no room above
+/// the reserve — no budget, rather than a close forced at the first token.
+pub fn effective(budget: Option<u32>, generation: u32) -> Option<u32> {
+    let room = generation.checked_sub(ANSWER_RESERVE).filter(|&room| room > 0)?;
+    budget.map(|budget| budget.min(room))
+}
+
+/// What a request's thinking budget did, reported once on its finish event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetOutcome {
+    /// The budget it ran under ([`effective`]).
+    pub budget: u32,
+    /// The tokens it had emitted when the forced close began — `None` when
+    /// the close was not forced (the model closed its block itself, or never
+    /// reached the budget).
+    pub forced_at: Option<u32>,
+}
+
 /// The model's own way to close a reasoning block: the tokens forced, in
 /// order, once a budget is spent. `think_end` is the block's closing
 /// marker and must appear in `tokens`; whatever follows it (the line break
@@ -118,6 +149,12 @@ impl BudgetState {
     /// the block open).
     pub fn forced(&self) -> bool {
         self.forced_from.is_some()
+    }
+
+    /// The tokens emitted before the close's first forced token, when the
+    /// close was forced.
+    pub fn forced_at(&self) -> Option<u32> {
+        self.forced_from
     }
 }
 

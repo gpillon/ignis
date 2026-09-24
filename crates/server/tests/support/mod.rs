@@ -76,3 +76,35 @@ impl<T: TemplateProvider> TemplateProvider for SharedTemplate<T> {
         self.0.decoder_starts_in_reasoning(options)
     }
 }
+
+/// The placeholder template standing in for a thinking-aware one (spec
+/// server/08): everything is the placeholder's, except that a generation
+/// with thinking on starts inside the reasoning block, as a real template's
+/// does. That is what makes a thinking budget apply at all; the placeholder
+/// itself never starts there.
+pub struct ReasoningTemplate;
+
+impl TemplateProvider for ReasoningTemplate {
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[serde_json::Value],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        ignis_server::template::SimpleTemplateProvider.apply_chat_template(messages, options, tools)
+    }
+
+    fn render_tokens(&self, tokens: &[TokenId]) -> String {
+        ignis_server::template::SimpleTemplateProvider.render_tokens(tokens)
+    }
+
+    fn thinking_capabilities(&self) -> ThinkingCapabilities {
+        ignis_server::template::SimpleTemplateProvider.thinking_capabilities()
+    }
+
+    fn token_decoder(&self) -> Box<dyn TokenDecoder> {
+        ignis_server::template::SimpleTemplateProvider.token_decoder()
+    }
+    // `decoder_starts_in_reasoning` left at the trait default
+    // (`thinking.enable_thinking`), which is the point of this type.
+}

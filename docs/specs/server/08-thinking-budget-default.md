@@ -177,3 +177,43 @@ The server ships with a measured thinking budget on by default:
 - The forced rounds run the whole batch non-speculatively for as many rounds as the
   close has tokens (~25). The 8-lane throughput cost of that is expected to be noise.
   The acceptance run should confirm it on the replayed session.
+
+## As built (2026-09-24, GitHub #265)
+
+Where the build departs from, or pins down, the text above:
+
+- **The shipped default is 6,144, not 8,192.** The acceptance measurement
+  ran xhigh at {off, 6K, 8K, 12K}, and 6K had the best pass rate at no worse
+  median wall time than 8K: 26/32 at 58.5 s against 23/32 at 70.7 s. 12K
+  passed 14/16 but at 85.8 s, which the rule rules out
+  (`docs/findings/2026-09-24-thinking-budget-default.md`).
+
+- **Answer room without `max_tokens`.** The scheduler clamps against the
+  request's generation cap: `max_tokens`, or, when a request sets none, what
+  the context leaves after its prompt. A long prompt near `--max-context`
+  would otherwise reason into the context limit, with no answer, the failure
+  this spec exists to remove.
+- **The reserve is 2,048 tokens, not ~1,500**
+  (`ignis_core::thinking_budget::ANSWER_RESERVE`). On the acceptance sweep
+  one answer after a forced close ran ~1,650 tokens, and the reserve also
+  holds the close itself (~25 tokens) and a speculative round's overshoot
+  past the budget.
+- **Startup values.** `--thinking-budget` takes a whole number or `off`. `0`
+  is refused at startup (the message names `off`): only the request field
+  uses `0` for none. An empty `IGNIS_THINKING_BUDGET` is unset, which means
+  the shipped default.
+- **Startup refusal scope.** A start refuses only when a tokenizer was
+  loaded and yields no close (`ignis.config.thinking_budget_inert`). The
+  placeholder start, with no artifact, has no tokenizer and runs the mock.
+  It starts with the default budget inert.
+- **The request log.** `thinking_budget` and `thinking_forced` are present
+  exactly when a budget was in effect, so a request with none carries
+  neither. `thinking_forced_at` appears only when the close was forced, and
+  `thinking_budget_dropped="max"` only when `max` discarded a budget.
+- **The counter** is `ignis_thinking_forced_closes_total` (ADR 0017's table).
+- **A malformed `thinking_budget`** is a 400 with `error.param =
+  "thinking_budget"`, the envelope's first use of OpenAI's `param` field.
+  The field is absent on every other error.
+- **`max` is decided from the raw `reasoning_effort`**, the request's or else
+  the server's. The resolved template effort cannot carry it, because
+  Qwen3.8 rounds `max` to `xhigh`.
