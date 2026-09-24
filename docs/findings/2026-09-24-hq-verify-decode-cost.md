@@ -240,12 +240,15 @@ Following ADR 0031, the prompt route keeps the reference decode (`359d3b4`).
   order must stay the reference's to remain bit-exact (a split-K QK is not).
 - The prompt route's scratch decode gains nothing from the decoder alone: it is
   not register-starved, so the instruction savings are hidden there.
-- **Option 3 (a decoded tier): not built; owner decision.** An exact tier must
+- **Option 3 (a decoded tier): open, more work needed (owner decision,
+  2026-09-25).** Not built. An exact tier must
   hold the decode's own BF16 rows, 65,536 B per token (7.1x hq-e8-2b). An int8
   lattice-coordinate variant is 32,768 B per token and skips only ~40% of the
   decode. A full tier at 8 x 30K is 15.7 GB, which does not fit beside the
-  model. A 2 GB tier costs ~31% of the KV pool for ~-8% attention. So it is not
-  worth building for the 8-subagent coding case.
+  model. A naive 2 GB tier costs ~31% of the KV pool for ~-8% attention. What
+  it needs before it can be judged: a design for a smaller or partial tier
+  (e.g. hot recent pages only, or the int8 variant), its eviction rule and its
+  VRAM plan line, measured after the occupancy step below.
 
 ## Limits and unknowns
 
@@ -266,7 +269,9 @@ Following ADR 0031, the prompt route keeps the reference decode (`359d3b4`).
 
 ## Follow-ups
 
-- Option 3: the recommendation is not to build it (owner decision).
-- If attention at 8 lanes needs another step, the next measured candidate is a
-  kernel with more warps per SM (output-split accumulators or decode warps
-  without them), under ADR 0031 option (b) with this kernel as the oracle.
+- More work needed (owner decision, 2026-09-25), in this order:
+  1. the occupancy step: a kernel with more warps per SM (output-split
+     accumulators or decode warps without them), under ADR 0031 option (b) with
+     this kernel as the oracle;
+  2. option 3, a smaller or partial decoded tier (see Implications), designed
+     with its eviction rule and VRAM plan line and measured on top of step 1.
