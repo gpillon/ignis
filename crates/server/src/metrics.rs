@@ -352,6 +352,10 @@ pub struct Metrics {
     /// until one of them moves — see [`Metrics::render`].
     decisions: [AtomicU64; Primitive::ALL.len()],
     answer_mass: Ratio,
+    /// Requests whose reasoning block the thinking budget closed (spec
+    /// server/08). Absent from the exposition until the first one, like the
+    /// decision family.
+    thinking_forced_closes: AtomicU64,
 }
 
 /// One retained-state family: a count per residency tier and per kind of
@@ -404,6 +408,7 @@ impl Metrics {
             duration: Histogram::new(&DURATION_BOUNDS_MS),
             decisions: Default::default(),
             answer_mass: Ratio::new(&ANSWER_MASS_BOUNDS),
+            thinking_forced_closes: AtomicU64::new(0),
         }
     }
 
@@ -446,6 +451,12 @@ impl Metrics {
         // `ALL` lists the primitives in declaration order, so a primitive's
         // discriminant is its slot.
         self.decisions[primitive as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A completed request's thinking budget forced the model's close (spec
+    /// server/08).
+    pub(crate) fn record_thinking_forced_close(&self) {
+        self.thinking_forced_closes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A submission was rejected, for `reason`.
@@ -794,6 +805,20 @@ impl Metrics {
                 "Share of the next-token distribution held by a decision's declared options.",
             );
         }
+        // Spec server/08: absent until the thinking budget has forced a
+        // close, for the decision family's reason — a load whose traffic
+        // never reaches its budget is a normal one, and says nothing by
+        // exporting a zero.
+        let forced = read(&self.thinking_forced_closes);
+        if forced > 0 {
+            declare(
+                &mut out,
+                "ignis_thinking_forced_closes_total",
+                "counter",
+                "Completed requests whose reasoning block the thinking budget closed.",
+            );
+            let _ = writeln!(out, "ignis_thinking_forced_closes_total {forced}");
+        }
         out
     }
 }
@@ -861,6 +886,19 @@ mod tests {
             &served.render(),
             &[("ignis_decisions_total", "counter"), ("ignis_decision_answer_mass", "histogram")],
         );
+        // And the forced-close counter (spec server/08), on the same terms.
+        let forced = Metrics::new();
+        forced.record_thinking_forced_close();
+        declared_once(&forced.render(), &[("ignis_thinking_forced_closes_total", "counter")]);
+    }
+
+    #[test]
+    fn the_forced_close_counter_is_absent_until_a_close_is_forced() {
+        let metrics = Metrics::new();
+        assert!(!metrics.render().contains("ignis_thinking_forced_closes_total"));
+        metrics.record_thinking_forced_close();
+        metrics.record_thinking_forced_close();
+        assert_eq!(value(&metrics.render(), "ignis_thinking_forced_closes_total", ""), "2");
     }
 
     /// Every metric in the base contract, plus `also`, declared once with

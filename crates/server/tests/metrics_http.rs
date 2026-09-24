@@ -22,6 +22,9 @@ use ignis_server::playground::Assets;
 use ignis_server::template::SimpleTemplateProvider;
 use tower::ServiceExt;
 
+#[path = "support/mod.rs"]
+mod support;
+
 const MODEL: &str = "test-model";
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const KEY: &str = "sk-metrics";
@@ -675,4 +678,63 @@ async fn labels_stay_within_the_bounded_sets() {
             assert!(values.contains(&value.as_str()), "{name}{{{key}={value}}}");
         }
     }
+}
+
+// ── the thinking budget (spec server/08) ────────────────────────────────────
+
+/// A thinking chat completion with room for a budget above the answer
+/// reserve, asking for `budget`.
+async fn think(app: &axum::Router, budget: u32) {
+    let body = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": ignis_core::thinking_budget::ANSWER_RESERVE + 20_000,
+        "thinking_budget": budget
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_text(response).await;
+}
+
+#[tokio::test]
+async fn the_forced_close_counter_appears_with_the_first_forced_close() {
+    let compute = Arc::new(MockCompute::new());
+    for id in 0..4 {
+        compute.stop_after(id, 12);
+    }
+    let close = ignis_core::thinking_budget::ThinkingClose::new(vec![900, 901, 999, 902], 999).unwrap();
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            max_sequence_tokens: 65_536,
+            thinking_close: Some(Arc::new(close)),
+            ..SchedulerConfig::default()
+        },
+        compute,
+    );
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(support::ReasoningTemplate)).with_metrics();
+    let (api, metrics) = apps(server);
+    const COUNTER: &str = "ignis_thinking_forced_closes_total";
+
+    // Absent on a load that has forced nothing, like the decision family:
+    // a request that ran with no budget changes nothing.
+    assert!(!scrape(&metrics).await.contains(COUNTER));
+    think(&api, 0).await;
+    let text = scrape_until(&metrics, |t| value(t, "ignis_requests_completed_total", None) == 1).await;
+    assert!(!text.contains(COUNTER), "{text}");
+
+    // Budget 3: spent, and the close forced.
+    think(&api, 3).await;
+    let text = scrape_until(&metrics, |t| value(t, "ignis_requests_completed_total", None) == 2).await;
+    assert_eq!(value(&text, COUNTER, None), 1, "{text}");
+    assert!(text.contains(&format!("# TYPE {COUNTER} counter")), "{text}");
+    think(&api, 3).await;
+    let text = scrape_until(&metrics, |t| value(t, "ignis_requests_completed_total", None) == 3).await;
+    assert_eq!(value(&text, COUNTER, None), 2, "{text}");
 }

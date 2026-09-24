@@ -20,6 +20,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use tower::ServiceExt;
 
+use ignis_core::thinking_budget::{ThinkingClose, ANSWER_RESERVE};
 use ignis_core::{mock::MockCompute, ConcreteScheduler, SchedulerConfig, TokenId};
 use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
@@ -121,10 +122,29 @@ fn harness_with(template: RecordingTemplateProvider) -> Harness {
 }
 
 fn harness_with_budget(template: RecordingTemplateProvider, default_budget: Option<u32>) -> Harness {
+    harness_from(template, Setup { default_budget, ..Setup::default() })
+}
+
+/// What a harness's server is started with, beyond its template.
+#[derive(Default)]
+struct Setup {
+    /// `--thinking-budget`.
+    default_budget: Option<u32>,
+    /// `--reasoning-effort`.
+    default_effort: Option<ReasoningEffort>,
+    /// The close the scheduler forces once a budget is spent; `None` leaves
+    /// every budget inert, as a tokenizer that splits `</think>` does.
+    close: Option<ThinkingClose>,
+}
+
+fn harness_from(template: RecordingTemplateProvider, setup: Setup) -> Harness {
     let compute = Arc::new(MockCompute::new());
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
+            // Room for a budget above the answer reserve (spec server/08).
+            max_sequence_tokens: 65_536,
+            thinking_close: setup.close.map(Arc::new),
             ..SchedulerConfig::default()
         },
         compute.clone(),
@@ -138,11 +158,22 @@ fn harness_with_budget(template: RecordingTemplateProvider, default_budget: Opti
         Box::new(SharedTemplate(Arc::clone(&template))),
     )
     .with_request_timeout(Duration::from_secs(5))
-    .with_thinking_budget(default_budget);
+    .with_thinking_defaults(true, setup.default_effort)
+    .with_thinking_budget(setup.default_budget);
     Harness {
         app: server.app(),
         template,
         compute,
+    }
+}
+
+/// Qwen3.8's efforts: `max` is not among them.
+fn qwen38() -> ThinkingCapabilities {
+    ThinkingCapabilities {
+        can_disable: true,
+        supported_efforts: [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::Xhigh]
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -305,38 +336,323 @@ async fn a_high_effort_reaches_a_qwen38_template_as_xhigh() {
     assert_eq!(options[0].reasoning_effort, Some(ReasoningEffort::Xhigh));
 }
 
+// ── the thinking budget (spec server/08) ─────────────────────────────────
+
+/// A generation with room for any budget these tests name above the answer
+/// reserve. The mock stops each request after a few tokens: the budget a
+/// round carries is the point, not how far the request runs.
+const ROOM: u32 = 20_000;
+const MAX_TOKENS: u32 = ANSWER_RESERVE + ROOM;
+
+/// A harness whose requests stop after three tokens.
+fn budget_harness(template: RecordingTemplateProvider, setup: Setup) -> Harness {
+    let h = harness_from(template, setup);
+    for id in 0..64 {
+        h.compute.stop_after(id, 3);
+    }
+    h
+}
+
+/// POST `extra` over a one-message request to `path` and return the budget
+/// its decode rounds carried — every round of one request carries the same.
+async fn budget_of(h: &Harness, path: &str, extra: serde_json::Value) -> Option<u32> {
+    let before = budgets(h).len();
+    let mut req = match path {
+        "/v1/responses" => serde_json::json!({ "input": "hi", "max_output_tokens": MAX_TOKENS }),
+        _ => serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": MAX_TOKENS
+        }),
+    };
+    req.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    let (status, response) = call(&h.app, "POST", path, Some(req)).await;
+    assert_eq!(status, 200, "{extra}: {response}");
+    let seen = budgets(h)[before..].to_vec();
+    assert!(!seen.is_empty() && seen.iter().all(|&b| b == seen[0]), "{extra}: {seen:?}");
+    seen[0]
+}
+
 #[tokio::test]
-async fn a_thinking_budget_reaches_the_decode_rounds_only_while_thinking() {
-    let h = harness_with_budget(RecordingTemplateProvider::permissive(HashMap::new()), Some(9000));
-    for (body, want) in [
+async fn the_server_default_applies_and_a_request_overrides_it_or_opts_out() {
+    let h = budget_harness(
+        RecordingTemplateProvider::permissive(HashMap::new()),
+        Setup { default_budget: Some(8192), ..Setup::default() },
+    );
+    for (extra, want) in [
+        // Absent or null: the server's `--thinking-budget`.
+        (serde_json::json!({}), Some(8192)),
+        (serde_json::json!({ "thinking_budget": null }), Some(8192)),
+        // A number wins, downward or upward: the server does not cap it.
         (serde_json::json!({ "thinking_budget": 64 }), Some(64)),
-        // Absent: the server's `--thinking-budget`.
-        (serde_json::json!({}), Some(9000)),
+        (serde_json::json!({ "thinking_budget": 12288 }), Some(12288)),
+        // 0: no budget for this request.
+        (serde_json::json!({ "thinking_budget": 0 }), None),
         // Thinking off: no block to close, whatever was asked.
         (serde_json::json!({ "thinking_budget": 64, "enable_thinking": false }), None),
+        (serde_json::json!({ "reasoning_effort": "none" }), None),
     ] {
-        let before = budgets(&h).len();
-        let mut req = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 2 });
-        req.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
-        let (status, response) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
-        assert_eq!(status, 200, "{response}");
-        let seen = &budgets(&h)[before..];
-        assert!(!seen.is_empty() && seen.iter().all(|&b| b == want), "{body}: {seen:?}");
+        assert_eq!(budget_of(&h, "/v1/chat/completions", extra.clone()).await, want, "{extra}");
     }
+    // The responses API resolves the same field the same way.
+    assert_eq!(budget_of(&h, "/v1/responses", serde_json::json!({})).await, Some(8192));
+    assert_eq!(budget_of(&h, "/v1/responses", serde_json::json!({ "thinking_budget": 0 })).await, None);
+}
+
+#[tokio::test]
+async fn without_a_server_default_only_a_request_sets_a_budget() {
+    let h = budget_harness(RecordingTemplateProvider::permissive(HashMap::new()), Setup::default());
+    assert_eq!(budget_of(&h, "/v1/chat/completions", serde_json::json!({})).await, None);
+    assert_eq!(
+        budget_of(&h, "/v1/chat/completions", serde_json::json!({ "thinking_budget": 64 })).await,
+        Some(64)
+    );
 }
 
 #[tokio::test]
 async fn a_malformed_thinking_budget_is_a_400_naming_the_field() {
     let h = harness_with(RecordingTemplateProvider::permissive(HashMap::new()));
-    for bad in [serde_json::json!(0), serde_json::json!(-5), serde_json::json!("64")] {
-        let req = serde_json::json!({
-            "messages": [{ "role": "user", "content": "hi" }],
-            "thinking_budget": bad
-        });
-        let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
-        assert_eq!(status, 400, "{bad}: {body}");
-        assert!(body.contains("thinking_budget"), "{body}");
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for bad in [
+            serde_json::json!(-5),
+            serde_json::json!(1.5),
+            serde_json::json!("64"),
+            serde_json::json!(true),
+            serde_json::json!({ "tokens": 64 }),
+            serde_json::json!(4_294_967_296u64),
+        ] {
+            let req = match path {
+                "/v1/responses" => serde_json::json!({ "input": "hi", "thinking_budget": bad }),
+                _ => serde_json::json!({
+                    "messages": [{ "role": "user", "content": "hi" }],
+                    "thinking_budget": bad
+                }),
+            };
+            let (status, body) = call(&h.app, "POST", path, Some(req)).await;
+            assert_eq!(status, 400, "{path} {bad}: {body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["error"]["param"], "thinking_budget", "{path} {bad}: {body}");
+            assert!(v["error"]["message"].as_str().unwrap().contains("thinking_budget"), "{body}");
+        }
     }
+}
+
+#[tokio::test]
+async fn max_renders_as_xhigh_and_runs_without_any_budget() {
+    let h = budget_harness(
+        RecordingTemplateProvider::new(qwen38(), HashMap::new()),
+        Setup { default_budget: Some(8192), ..Setup::default() },
+    );
+    for extra in [
+        serde_json::json!({ "reasoning_effort": "max" }),
+        // A budget riding the same request — a client default, a stale
+        // setting — is ignored rather than refused or honoured.
+        serde_json::json!({ "reasoning_effort": "max", "thinking_budget": 64 }),
+        serde_json::json!({ "reasoning_effort": "max", "thinking_budget": 0 }),
+    ] {
+        assert_eq!(budget_of(&h, "/v1/chat/completions", extra.clone()).await, None, "{extra}");
+    }
+    // Every one of them reached the template as the most Qwen3.8 takes.
+    let options = h.template.captured_options();
+    assert_eq!(options.len(), 3);
+    assert!(options.iter().all(|o| o.enable_thinking && o.reasoning_effort == Some(ReasoningEffort::Xhigh)));
+
+    // Ignored is not unvalidated: a budget that is not a budget is still the
+    // client's mistake.
+    let req = serde_json::json!({
+        "messages": [{ "role": "user", "content": "hi" }],
+        "reasoning_effort": "max",
+        "thinking_budget": "lots"
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn a_server_default_of_max_drops_the_budget_unless_the_request_asks_another_effort() {
+    let h = budget_harness(
+        RecordingTemplateProvider::new(qwen38(), HashMap::new()),
+        Setup {
+            default_budget: Some(8192),
+            default_effort: Some(ReasoningEffort::Max),
+            ..Setup::default()
+        },
+    );
+    for (extra, want) in [
+        (serde_json::json!({}), None),
+        (serde_json::json!({ "thinking_budget": 64 }), None),
+        (serde_json::json!({ "enable_thinking": true }), None),
+        // Another effort on the request is the resolved one, and gets the
+        // budget rules.
+        (serde_json::json!({ "reasoning_effort": "xhigh" }), Some(8192)),
+        (serde_json::json!({ "reasoning_effort": "high" }), Some(8192)),
+        (serde_json::json!({ "reasoning_effort": "medium", "thinking_budget": 64 }), Some(64)),
+    ] {
+        assert_eq!(budget_of(&h, "/v1/chat/completions", extra.clone()).await, want, "{extra}");
+    }
+}
+
+#[tokio::test]
+async fn the_budget_leaves_the_answer_room_inside_max_tokens() {
+    let h = budget_harness(
+        RecordingTemplateProvider::permissive(HashMap::new()),
+        Setup { default_budget: Some(8192), ..Setup::default() },
+    );
+    for (extra, want) in [
+        // 1,000 tokens above the reserve: the default is clamped to them.
+        (serde_json::json!({ "max_tokens": ANSWER_RESERVE + 1000 }), Some(1000)),
+        // A request's own budget is clamped the same way, and one that fits
+        // is untouched.
+        (serde_json::json!({ "max_tokens": ANSWER_RESERVE + 1000, "thinking_budget": 4096 }), Some(1000)),
+        (serde_json::json!({ "max_tokens": ANSWER_RESERVE + 1000, "thinking_budget": 64 }), Some(64)),
+        // No room above the reserve: no budget, not a close at token 0.
+        (serde_json::json!({ "max_tokens": ANSWER_RESERVE }), None),
+        (serde_json::json!({ "max_tokens": 16 }), None),
+    ] {
+        assert_eq!(budget_of(&h, "/v1/chat/completions", extra.clone()).await, want, "{extra}");
+    }
+    assert_eq!(
+        budget_of(&h, "/v1/responses", serde_json::json!({ "max_output_tokens": ANSWER_RESERVE + 1000 })).await,
+        Some(1000)
+    );
+}
+
+// ── forced-close visibility (spec server/08, the #265/#266 contract) ─────
+
+const THINK_END: TokenId = 999;
+/// The close the harness's scheduler forces: its end marker decodes as
+/// `</think>`, so the response splits after it like the real one.
+const CLOSE: [TokenId; 4] = [900, 901, THINK_END, 902];
+
+fn close_decode_map() -> HashMap<TokenId, &'static str> {
+    HashMap::from([
+        (900, "\n\nConsidering the limited time"),
+        (901, " by the user, now."),
+        (THINK_END, "</think>"),
+        (902, "\n\n"),
+    ])
+}
+
+/// A harness whose scheduler forces [`CLOSE`] once a budget is spent, and
+/// whose requests stop after twelve tokens: a budget of 3 is spent, the
+/// close forced over the next rounds, and a few answer tokens follow.
+fn forcing_harness(close: ThinkingClose) -> Harness {
+    let h = harness_from(
+        RecordingTemplateProvider::permissive(close_decode_map()),
+        Setup { close: Some(close), ..Setup::default() },
+    );
+    for id in 0..16 {
+        h.compute.stop_after(id, 12);
+    }
+    h
+}
+
+fn the_close() -> ThinkingClose {
+    ThinkingClose::new(CLOSE.to_vec(), THINK_END).unwrap()
+}
+
+/// The single-token sets the decode rounds carried, in order.
+fn forced_sets(h: &Harness) -> Vec<TokenId> {
+    h.compute
+        .decode_calls()
+        .iter()
+        .flatten()
+        .filter_map(|job| job.permitted.as_ref().map(|set| set[0]))
+        .collect()
+}
+
+fn chat_request(extra: serde_json::Value) -> serde_json::Value {
+    let mut req = serde_json::json!({
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": MAX_TOKENS
+    });
+    req.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    req
+}
+
+#[tokio::test]
+async fn a_forced_close_is_reported_on_the_choice_with_the_reasoning_tokens_before_it() {
+    let h = forcing_harness(the_close());
+    let (status, body) =
+        call(&h.app, "POST", "/v1/chat/completions", Some(chat_request(serde_json::json!({ "thinking_budget": 3 })))).await;
+    assert_eq!(status, 200, "{body}");
+    // The rounds carried the close, one token each.
+    assert_eq!(forced_sets(&h), CLOSE.to_vec());
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let choice = &v["choices"][0];
+    // Budget 3: the round that found three emitted let the token it had
+    // already drawn through, so the close began after four.
+    assert_eq!(choice["thinking_budget_forced_at"], 4, "{body}");
+    // The model answered after the close it was handed.
+    // Twelve tokens: four free, the four of the close, four more — each an
+    // id the harness's decoder does not know, so a `?`.
+    assert_eq!(choice["message"]["content"], "????", "{body}");
+    assert!(choice["message"]["reasoning_content"].as_str().unwrap().ends_with("by the user, now."), "{body}");
+}
+
+#[tokio::test]
+async fn an_unforced_response_carries_no_forced_field_at_all() {
+    // No budget: nothing to force.
+    let h = forcing_harness(the_close());
+    let (status, body) =
+        call(&h.app, "POST", "/v1/chat/completions", Some(chat_request(serde_json::json!({ "thinking_budget": 0 })))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(forced_sets(&h).is_empty());
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["choices"][0].get("thinking_budget_forced_at").is_none(), "absent, not null: {body}");
+
+    // A model that closes its block itself, before its budget: never forced.
+    let natural_end = MockCompute::new().token_for(0, 1);
+    let h = forcing_harness(ThinkingClose::new(vec![900, 901, natural_end, 902], natural_end).unwrap());
+    let (status, body) =
+        call(&h.app, "POST", "/v1/chat/completions", Some(chat_request(serde_json::json!({ "thinking_budget": 3 })))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(forced_sets(&h).is_empty());
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["choices"][0].get("thinking_budget_forced_at").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn streaming_reports_a_forced_close_on_the_finish_chunk_only() {
+    let h = forcing_harness(the_close());
+    let req = chat_request(serde_json::json!({
+        "thinking_budget": 3,
+        "stream": true,
+        "stream_options": { "include_usage": true }
+    }));
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "{body}");
+    let chunks: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:").map(|s| s.trim().to_string()))
+        .filter(|l| l != "[DONE]")
+        .map(|l| serde_json::from_str(&l).unwrap())
+        .collect();
+    let finish: Vec<&serde_json::Value> =
+        chunks.iter().filter(|c| !c["choices"][0]["finish_reason"].is_null()).collect();
+    assert_eq!(finish.len(), 1, "{body}");
+    assert_eq!(finish[0]["choices"][0]["thinking_budget_forced_at"], 4, "{body}");
+    let elsewhere = chunks
+        .iter()
+        .filter(|c| c["choices"][0]["finish_reason"].is_null())
+        .filter(|c| c.to_string().contains("thinking_budget_forced_at"))
+        .count();
+    assert_eq!(elsewhere, 0, "only the finish chunk carries it: {body}");
+}
+
+#[tokio::test]
+async fn the_responses_api_reports_a_forced_close_on_the_response_object() {
+    let h = forcing_harness(the_close());
+    let req = serde_json::json!({ "input": "hi", "max_output_tokens": MAX_TOKENS, "thinking_budget": 3 });
+    let (status, body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["thinking_budget_forced_at"], 4, "{body}");
+
+    let req = serde_json::json!({ "input": "hi", "max_output_tokens": MAX_TOKENS, "thinking_budget": 0 });
+    let (status, body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.get("thinking_budget_forced_at").is_none(), "{body}");
 }
 
 #[tokio::test]

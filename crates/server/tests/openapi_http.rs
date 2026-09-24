@@ -145,6 +145,19 @@ fn the_streaming_half_is_documented_as_its_own_content_type() {
 }
 
 #[test]
+fn a_forced_thinking_close_is_documented_as_an_optional_field_of_each_response_shape() {
+    // Spec server/08: the field is absent when the close was not forced, so
+    // a generated client must not require it.
+    let document = document();
+    for schema in ["CompletionChoice", "ChunkChoice", "Responses"] {
+        let schema = &document["components"]["schemas"][schema];
+        assert!(schema["properties"]["thinking_budget_forced_at"].is_object(), "{schema}");
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&serde_json::json!("thinking_budget_forced_at")), "{schema}");
+    }
+}
+
+#[test]
 fn the_decision_endpoint_carries_its_question_kinds() {
     // `/v1/decide` is the one endpoint no external documentation covers,
     // so a path entry alone would not be worth much.

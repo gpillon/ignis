@@ -1788,6 +1788,21 @@ impl ConcreteScheduler {
             true => Some(std::mem::take(&mut self.requests[idx].drawn)),
             false => None,
         };
+        // Spec server/08: reported only where the round loop could have
+        // forced it — a close sequence to force, a budget, and not a
+        // constrained decode, whose own schedule owns every draw.
+        let thinking = {
+            let r = &self.requests[idx];
+            self.config
+                .thinking_close
+                .as_ref()
+                .filter(|_| !r.input.is_constrained())
+                .and(r.input.params.thinking_budget)
+                .map(|budget| crate::thinking_budget::BudgetOutcome {
+                    budget,
+                    forced_at: r.thinking.forced_at(),
+                })
+        };
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
@@ -1797,6 +1812,7 @@ impl ConcreteScheduler {
             readout,
             attention,
             drawn,
+            thinking,
         });
     }
 
@@ -2357,6 +2373,12 @@ impl Scheduler for ConcreteScheduler {
         // failing at the leaf on every advance.
         let prompt_tokens = input.tokens.len() as u64;
         let effective_max = generation_budget(&self.config, &input);
+        // Spec server/08: a thinking budget always leaves the answer room
+        // inside what the request may generate. Clamped once here, where
+        // that number is known, so every round — and the finish event that
+        // reports the budget — reads the one the request actually runs under.
+        input.params.thinking_budget =
+            crate::thinking_budget::effective(input.params.thinking_budget, effective_max);
         let reserved_tokens = prompt_tokens + u64::from(effective_max);
         let limit = self.config.max_sequence_tokens;
         if prompt_tokens >= u64::from(limit) || reserved_tokens > u64::from(limit) {
