@@ -345,6 +345,18 @@ target_compile_definitions(ignis_hq_verify_bench PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
 target_link_libraries(ignis_hq_verify_bench PRIVATE ignis_vendor)
 
+# GitHub #268: OURS -- ADR 0031's oracle for the patched hq verify kernel. The
+# throughput route (staged code rows, the throughput group decoder, split
+# K/V phases) against the reference route of the same kernel
+# (IgnisThroughput = false), on caches encoded from the committed fixture:
+# every partial byte and every cache byte the fused append writes must match.
+# Same no-SKIP_RETURN_CODE rule as every other GPU test here (ADR 0006).
+add_executable(ignis_kernel_hq_verify_exact_test test_hq_verify_exact.cu)
+target_compile_definitions(ignis_kernel_hq_verify_exact_test PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_link_libraries(ignis_kernel_hq_verify_exact_test PRIVATE ignis_vendor)
+add_test(NAME ignis_kernel_hq_verify_exact_test COMMAND ignis_kernel_hq_verify_exact_test)
+
 # P4-04 (GitHub #122): OURS, not vendored -- the KV append path under both
 # storage formats. It builds two sequence pools differing only in
 # `ignis_seq_pool_spec::kv_format`, appends the same real fixture rows to a

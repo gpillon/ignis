@@ -210,7 +210,7 @@ __global__ void gqa_attention_prefill_hq_scratch_kernel(
             store_vec(dst + lane8 * 32 + j * 8, load_vec<int4>(side + lane8 * 32 + j * 8));
         }
     } else {
-        hq_decode_row_group<true>(
+        hq_decode_row_group_fast(
             hq_row_codes<Geometry>(role_v ? codes_v : codes_k, table, head, pos),
             hq_row_meta<Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst, lane8, 0,
             hq_dither_row_seed(head, pos, role_v), symbols + (threadIdx.x / 8) * kHqHeadDim);

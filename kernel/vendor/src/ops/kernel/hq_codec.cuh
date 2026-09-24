@@ -1010,13 +1010,17 @@ struct HqGroupRow {
     int xor_chunk;
     std::uint64_t dither_seed;
     std::uint16_t* symbols;  // null: staged in `out`
+    bool active = true;      // false: this group has no row here (reads and writes nothing)
 };
 
-template <int R>
+// Converged: the caller guarantees all 32 lanes of the warp make the call
+// together (inactive rows included), so the group exchanges run on the full
+// warp without the divergence checks an 8-lane mask costs.
+template <int R, bool Converged = false>
 __device__ __forceinline__ void hq_decode_rows_group_fast(const HqGroupRow (&rows)[R], int lane) {
     const int warp_lane  = static_cast<int>(threadIdx.x & 31u);
     const int gbase      = warp_lane & ~7;
-    const unsigned gmask = 0xFFu << gbase;
+    const unsigned gmask = Converged ? 0xFFFFFFFFu : 0xFFu << gbase;
 
     std::uint32_t mw0[R];
     bool fast[R];
@@ -1024,14 +1028,18 @@ __device__ __forceinline__ void hq_decode_rows_group_fast(const HqGroupRow (&row
     std::uint32_t x0[R], x1[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        mw0[r] = *reinterpret_cast<const std::uint32_t*>(rows[r].meta);
-        const std::uint32_t mw1 = *reinterpret_cast<const std::uint32_t*>(rows[r].meta + 4);
+        mw0[r]                   = 0u;
+        std::uint32_t mw1        = 0u;
+        if (rows[r].active) {
+            mw0[r] = *reinterpret_cast<const std::uint32_t*>(rows[r].meta);
+            mw1    = *reinterpret_cast<const std::uint32_t*>(rows[r].meta + 4);
+        }
         const unsigned used_bits = ((mw0[r] >> 24) & 0xFFu) | ((mw1 & 0x3u) << 8);
         const std::uint32_t k    = (mw0[r] >> 16) & 0xFu;
-        fast[r]    = used_bits != 0 && k == 0;
+        fast[r]    = rows[r].active && used_bits != 0 && k == 0;
         symbols[r] = rows[r].symbols != nullptr ? rows[r].symbols
                                                 : reinterpret_cast<std::uint16_t*>(rows[r].out);
-        if (used_bits == 0 || k > kHqMaxRiceK) {
+        if (rows[r].active && (used_bits == 0 || k > kHqMaxRiceK)) {
             // Never-written row (zeroed metadata): decodes to exact zeros.
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -1039,7 +1047,7 @@ __device__ __forceinline__ void hq_decode_rows_group_fast(const HqGroupRow (&row
                                           hq_swz_element((lane + 8 * i) * 8, rows[r].xor_chunk)) =
                     make_uint4(0u, 0u, 0u, 0u);
             }
-        } else if (k != 0) {
+        } else if (rows[r].active && k != 0) {
             hq_decode_row_group<true>(rows[r].codes, rows[r].meta, rows[r].out, lane,
                                       rows[r].xor_chunk, rows[r].dither_seed, rows[r].symbols);
         }
@@ -1167,30 +1175,44 @@ __device__ __forceinline__ void hq_decode_rows_group_fast(const HqGroupRow (&row
             const int wb       = hq_swz_element(word * 8, rows[r].xor_chunk);
             const uint4 staged = *reinterpret_cast<const uint4*>(symbols[r] + wb);
             const std::uint32_t pairs[4] = {staged.x, staged.y, staged.z, staged.w};
-            std::uint32_t z[8];
+            // Two coordinates per staged word, one per 16-bit half: a k = 0
+            // symbol is below kHqUnaryGuard, so every y fits a signed half.
+            const std::uint32_t coset  = (pairs[3] >> 16) & 1u;  // z7 & 1
+            const std::uint32_t coset2 = coset * 0x00010001u;
+            std::uint32_t y2[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                z[2 * j]     = pairs[j] & 0xFFFFu;
-                z[2 * j + 1] = pairs[j] >> 16;
+                y2[j] = pairs[j] ^ ((pairs[j] & 0x00010001u) * 0xFFFFu) ^ coset2;
             }
-            const std::uint32_t coset = z[7] & 1u;
+            const std::uint32_t x = y2[0] ^ y2[1] ^ y2[2] ^ (y2[3] & 0xFFFFu);  // y0..y6
+            const std::uint32_t parity = ((x >> 1) ^ (x >> 17)) & 1u;
+            const std::uint32_t u  = pairs[3] >> 17;           // z7 >> 1
+            const std::uint32_t t2 = u ^ (0u - (u & 1u));       // 2*unzigzag(z7 >> 1)
             int y[8];
-            std::uint32_t parity = 0u;
 #pragma unroll
-            for (int j = 0; j < 7; ++j) {
-                const std::uint32_t yj = z[j] ^ (0u - (z[j] & 1u)) ^ coset;
-                parity ^= yj;
-                y[j] = static_cast<int>(yj);
+            for (int j = 0; j < 4; ++j) {
+                y[2 * j]     = static_cast<std::int16_t>(y2[j] & 0xFFFFu);
+                y[2 * j + 1] = static_cast<std::int16_t>(y2[j] >> 16);
             }
-            const std::uint32_t t2 = (z[7] >> 1) ^ (0u - ((z[7] >> 1) & 1u));  // 2*unzigzag(z7 >> 1)
-            y[7] = static_cast<int>(((t2 ^ ((parity >> 1) & 1u)) << 1) ^ coset);
+            y[7] = static_cast<int>(((t2 ^ parity) << 1) ^ coset);
+            // The dither's byte as the float 2^23 + b (its bits are 0x4B0000bb),
+            // folded into the reference's single rounding of b/255 - 0.5:
+            // (2^23 + b) * c - (2^23 * c + 0.5) is b * c - 0.5 exactly, and
+            // 2^23 * c + 0.5 is itself exact.
             const std::uint64_t wseed = hq_dither_word_seed(rows[r].dither_seed, word);
+            const std::uint32_t wlo = static_cast<std::uint32_t>(wseed);
+            const std::uint32_t whi = static_cast<std::uint32_t>(wseed >> 32);
+            constexpr float kInv255 = 1.0f / 255.0f;
+            constexpr float kFold   = 8388608.0f * kInv255 + 0.5f;
             uint4 packed;
             auto* values = reinterpret_cast<__nv_bfloat16*>(&packed);
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                values[j] = __float2bfloat16((static_cast<float>(y[j]) + hq_dither(wseed, j)) *
-                                             norm[r] * inv_scale[r]);
+                const float magic = __uint_as_float(
+                    __byte_perm(j < 4 ? wlo : whi, 0x4B000000u, 0x7540u | static_cast<unsigned>(j & 3)));
+                const float dither = __fmaf_rn(magic, kInv255, -kFold);
+                values[j] = __float2bfloat16((static_cast<float>(y[j]) + dither) * norm[r] *
+                                             inv_scale[r]);
             }
             *reinterpret_cast<uint4*>(rows[r].out + wb) = packed;
         }
