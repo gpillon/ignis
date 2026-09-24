@@ -169,9 +169,10 @@ __global__ void fill_q_kernel(__nv_bfloat16* q, long long n) {
 // The verify kernel's tile decode alone (--decode-only): same grid, same split
 // ranges, same 32-key tiles decoded into a swizzled K/V tile from code rows
 // staged one tile ahead by cp.async, the same shared-memory footprint (two
-// blocks per SM), no MMA. R = 0 is the reference group decode; R >= 1 the
-// throughput decoder with each 8-lane group decoding R rows at once.
-template <int R>
+// blocks per SM), no MMA. Fast = false is the reference group decode, true
+// the throughput decoder called as the kernel calls it (every warp at once,
+// groups past the split inactive).
+template <bool Fast>
 __launch_bounds__(128, 2) __global__ void decode_only_kernel(GqaTcKVHq kv,
                                                              const std::int32_t* block_tables,
                                                              int table_stride, int window,
@@ -179,7 +180,6 @@ __launch_bounds__(128, 2) __global__ void decode_only_kernel(GqaTcKVHq kv,
     constexpr int Bc = 32, D = kGqaHeadDim, Threads = 128;
     constexpr int kCodes = Bc * kHqRowBudgetBytes, kMeta = Bc * kHqMetaBytes;
     constexpr int kStage = 2 * (kCodes + kMeta);
-    constexpr int kRows  = R == 0 ? 1 : R;
     __shared__ __align__(16) __nv_bfloat16 qkv_s[2 * Bc * D];
     __shared__ __align__(16) std::uint8_t stage_s[2 * kStage];
     __shared__ __align__(16) __nv_bfloat16 pad_s[Threads * 16];  // the kernel's P tile + ids
@@ -220,27 +220,20 @@ __launch_bounds__(128, 2) __global__ void decode_only_kernel(GqaTcKVHq kv,
         const std::uint8_t* stage = stage_s + (kb & 1) * kStage;
         const int group = tid >> 3, lane8 = tid & 7;
 #pragma unroll 1
-        for (int wave = 0; wave < 2 * Bc / (16 * kRows); ++wave) {
-            HqGroupRow rows[kRows];
-            bool live = true;
-#pragma unroll
-            for (int r = 0; r < kRows; ++r) {
-                const int row     = (wave * 16 + group) * kRows + r;
-                const bool role_v = row >= Bc;
-                const int key_l   = row & (Bc - 1);
-                const int key     = k0 + key_l;
-                live = live && key < split_end;
-                rows[r] = HqGroupRow{stage + (role_v ? kCodes : 0) + key_l * kHqRowBudgetBytes,
-                                     stage + 2 * kCodes + (role_v ? kMeta : 0) + key_l * kHqMetaBytes,
-                                     qkv_s + (role_v ? Bc * D : 0) + key_l * D, key_l & 7,
-                                     hq_dither_row_seed(kv_head, key, role_v), nullptr};
-            }
-            if (!live) { continue; }
-            if constexpr (R == 0) {
-                hq_decode_row_group(rows[0].codes, rows[0].meta, rows[0].out, lane8,
-                                    rows[0].xor_chunk, rows[0].dither_seed);
-            } else {
-                hq_decode_rows_group_fast<R>(rows, lane8);
+        for (int wave = 0; wave < 2 * Bc / 16; ++wave) {
+            const int row     = wave * 16 + group;
+            const bool role_v = row >= Bc;
+            const int key_l   = row & (Bc - 1);
+            const int key     = k0 + key_l;
+            const std::uint8_t* codes = stage + (role_v ? kCodes : 0) + key_l * kHqRowBudgetBytes;
+            const std::uint8_t* meta  = stage + 2 * kCodes + (role_v ? kMeta : 0) + key_l * kHqMetaBytes;
+            __nv_bfloat16* out        = qkv_s + (role_v ? Bc * D : 0) + key_l * D;
+            if constexpr (Fast) {
+                hq_decode_row_group_fast(codes, meta, out, lane8, key_l & 7,
+                                         hq_dither_row_seed(kv_head, key, role_v), key < split_end);
+            } else if (key < split_end) {
+                hq_decode_row_group(codes, meta, out, lane8, key_l & 7,
+                                    hq_dither_row_seed(kv_head, key, role_v));
             }
         }
         ninfer::ops::cp_wait<0>();
@@ -391,20 +384,14 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMalloc(&d_sink, 4));
         float lo = 0.0f, hi = 0.0f;
         const float ref_us = time_launches([&]() {
-            decode_only_kernel<0><<<grid, 128>>>(kv, d_table, pages_per_lane, ctx, d_sink);
+            decode_only_kernel<false><<<grid, 128>>>(kv, d_table, pages_per_lane, ctx, d_sink);
         }, lo, hi);
-        const float r1_us = time_launches([&]() {
-            decode_only_kernel<1><<<grid, 128>>>(kv, d_table, pages_per_lane, ctx, d_sink);
-        }, lo, hi);
-        const float r2_us = time_launches([&]() {
-            decode_only_kernel<2><<<grid, 128>>>(kv, d_table, pages_per_lane, ctx, d_sink);
-        }, lo, hi);
-        const float r4_us = time_launches([&]() {
-            decode_only_kernel<4><<<grid, 128>>>(kv, d_table, pages_per_lane, ctx, d_sink);
+        const float fast_us = time_launches([&]() {
+            decode_only_kernel<true><<<grid, 128>>>(kv, d_table, pages_per_lane, ctx, d_sink);
         }, lo, hi);
         std::printf("hq tile decode alone: lanes %d ctx %d: reference group decode %.1f us; "
-                    "throughput decode, rows per group 1: %.1f us, 2: %.1f us, 4: %.1f us\n",
-                    lanes, ctx, ref_us, r1_us, r2_us, r4_us);
+                    "throughput decode %.1f us\n",
+                    lanes, ctx, ref_us, fast_us);
         return 0;
     }
 

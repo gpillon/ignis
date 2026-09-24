@@ -23,8 +23,11 @@ void gqa_small_t_partial_hq(const Tensor& q, CacheInput input, const Tensor& pos
                             std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                             Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-    // Static shared memory only (~36.6 KB: qkv tile 32 KB + P 4 KB + page ids +
-    // RHT signs); no dynamic-smem opt-in attribute is needed.
+    // Static shared memory only, no dynamic-smem opt-in attribute needed:
+    // ~47 KB on the 27B throughput route (ignis, GitHub #268: q rows 24 KB + one
+    // K/V tile 16 KB + P 4 KB + one role's staged code rows 2.25 KB + page ids +
+    // RHT signs), ~36.6 KB on the reference layout (qkv tile 32 KB + P 4 KB +
+    // page ids + RHT signs).
     // TokenTile=8: the hq route's single runtime-width instantiation covers every
     // decode/verify width 1..8, so a width-8 block verify (draft 7 + bonus) is one
     // pass; GroupSize 6 (27B: 48 rows) and 8 (35B: 64 rows = Br) both fit the row tile.
