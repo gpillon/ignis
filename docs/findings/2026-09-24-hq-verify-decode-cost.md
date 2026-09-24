@@ -237,35 +237,12 @@ Following ADR 0031, the prompt route keeps the reference decode (`359d3b4`).
   order must stay the reference's to remain bit-exact (a split-K QK is not).
 - The prompt route's scratch decode gains nothing from the decoder alone: it is
   not register-starved, so the instruction savings are hidden there.
-- **Option 3 design note (owner decision; not built).** A decoded tier keeps
-  the history's decoded rows across rounds, so each round decodes only rows
-  that are not yet tiered.
-  - *What it must hold to stay exact.* The decode's own BF16 output, in the
-    rotated frame: 512 B per row, **65,536 B per token** over the 16 GQA layers,
-    4 KV heads and 2 roles. That is the same as the BF16 KV format and 7.1x
-    hq-e8-2b's 9,216 B.
-  - *Cheaper exact variant.* An int8 lattice-coordinate tier (256 B per row,
-    **32,768 B/token**, 3.6x hq, with a fallback for |y| > 127) skips only the
-    Rice walk and unstrip, ~40% of the decode; dither and scale still run every
-    round.
-  - *Not exact.* An FP8 E4M3 tier is the same size but changes the numerics:
-    it is FP8 KV under another name, out of scope here.
-  - *Eviction.* Rows are write-once: rollback only touches the newest rows,
-    which the residual ring already serves exact. So the tier holds each
-    lane's oldest rows, from the sink up to `window - 512`, and a lane over
-    budget keeps its oldest `T` rows. A lane's tier is released with its slot.
-  - *VRAM plan line.* `hq_decoded_tier = tier_tokens_total x 65,536 B` (or
-    `x 32,768 B`), charged against the KV pool (ADR 0022 / ADR 0030 capacity
-    math).
-  - *Capacity at 8 lanes.* A full BF16 tier at 8 x 30K is **15.7 GB**, which
-    does not fit next to the model. The KV pool at `make config` is ~735K
-    tokens = ~6.8 GB. A 2 GB BF16 tier covers 4K tokens per lane (13% of a 30K
-    history) and costs ~230K pool tokens (31% of the pool) for ~-8% attention.
-    At one lane x 64K, a full 4.2 GB tier removes the decode (the verify
-    kernel ~-60%) but costs ~460K pool tokens (63%).
-  - *Recommendation.* Not worth building for the 8-subagent coding case. It
-    could pay only for one very long lane with spare pool, which the owner
-    would have to value above KV capacity.
+- **Option 3 (a decoded tier): not built; owner decision.** An exact tier must
+  hold the decode's own BF16 rows, 65,536 B per token (7.1x hq-e8-2b). An int8
+  lattice-coordinate variant is 32,768 B per token and skips only ~40% of the
+  decode. A full tier at 8 x 30K is 15.7 GB, which does not fit beside the
+  model. A 2 GB tier costs ~31% of the KV pool for ~-8% attention. So it is not
+  worth building for the 8-subagent coding case.
 
 ## Limits and unknowns
 
@@ -286,8 +263,7 @@ Following ADR 0031, the prompt route keeps the reference decode (`359d3b4`).
 
 ## Follow-ups
 
-- The owner decides option 3 from the note above. The recommendation is not to
-  build it.
+- Option 3: the recommendation is not to build it (owner decision).
 - If attention at 8 lanes needs another step, the next measured candidate is a
   kernel with more warps per SM (output-split accumulators or decode warps
   without them), under ADR 0031 option (b) with this kernel as the oracle.
