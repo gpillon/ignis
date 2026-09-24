@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { Plugin } from "vite";
+import { completionBody, finishFields, mockThinking, readMockBudget } from "./mockChat.ts";
 import { mockDecide } from "./mockDecide.ts";
 import { createMetricsSim } from "./mockMetrics.ts";
 
@@ -10,7 +11,14 @@ import { createMetricsSim } from "./mockMetrics.ts";
 // Chat: honours the thinking controls (no reasoning for `reasoning_effort`
 // "none" or `enable_thinking` false) and stops on a
 // client disconnect; a last user message containing "/error" gets ignis's
-// 503 "engine full" error instead of a stream.
+// 503 "engine full" error instead of a stream. `stream: false` gets the
+// whole reply as one `chat.completion`.
+//
+// Thinking budget (mockChat.ts): `thinking_budget` is read as ignis reads it
+// (a bad value is a 400 naming the field, 0 is none, `max` has none) and
+// echoed at the end of the reasoning. "/budget" in a prompt thinks past the
+// budget and reports the forced close, `thinking_budget_forced_at`, on the
+// finishing choice.
 //
 // Agents: with the `agent` tool declared, a prompt containing "/agents"
 // streams three agent calls (finish "tool_calls"); a request whose last
@@ -69,6 +77,14 @@ export function mockIgnis(): Plugin {
         const body = await readJson(req);
         const messages = (body.messages as { role: string; content: string }[] | undefined) ?? [];
         const last = messages.filter((m) => m.role === "user").at(-1)?.content ?? "";
+        // ignis refuses a bad budget while it reads the request, before it asks the engine for a lane.
+        const budget = readMockBudget(body);
+        if (!budget.ok) {
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: budget.error }));
+          return;
+        }
         if (last.includes("/error")) {
           res.statusCode = 503;
           res.setHeader("Content-Type", "application/json");
@@ -80,13 +96,11 @@ export function mockIgnis(): Plugin {
           return;
         }
 
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
         const id = `chatcmpl-mock-${Date.now()}`;
-        const chunk = (delta: object, finish: string | null = null) =>
-          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
-        const thinkingOff = body.reasoning_effort === "none" || body.enable_thinking === false;
-        const reasoning = thinkingOff ? [] : ["Thinking ", "about ", "it."];
+        const chunk = (delta: object, finish: string | null = null, extra: object = {}) =>
+          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta, finish_reason: finish, ...extra }] })}\n\n`;
+        const thinkingOff = !budget.thinking;
+        const { reasoning, forcedAt } = mockThinking(budget, last);
         const tools = (body.tools as { function?: { name?: string } }[] | undefined) ?? [];
         const offersAgents = tools.some((t) => t.function?.name === "agent");
         const offersWeb = tools.some((t) => t.function?.name === "web_search");
@@ -170,14 +184,24 @@ export function mockIgnis(): Plugin {
           ];
         }
         const completion = reasoning.length + content.length + calls.length;
+        const usage = { prompt_tokens: 12 * messages.length, completion_tokens: completion, total_tokens: 12 * messages.length + completion };
+        const identified = calls.map((c, index) => ({ ...c, id: `call_${Date.now()}_${index}` }));
+        if (body.stream === false) {
+          res.setHeader("Content-Type", "application/json");
+          const timer = setTimeout(() => res.end(JSON.stringify(completionBody({ id, reasoning, content, calls: identified, forcedAt, usage }))), 300);
+          req.on("close", () => clearTimeout(timer));
+          return;
+        }
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
         const pieces = [
           ...reasoning.map((t) => chunk({ reasoning_content: t })),
           ...content.map((t) => chunk({ content: t })),
-          ...calls.map((c, index) =>
-            chunk({ tool_calls: [{ index, id: `call_${Date.now()}_${index}`, type: "function", function: { name: c.tool, arguments: JSON.stringify(c.args) } }] }),
+          ...identified.map((c, index) =>
+            chunk({ tool_calls: [{ index, id: c.id, type: "function", function: { name: c.tool, arguments: JSON.stringify(c.args) } }] }),
           ),
-          chunk({}, calls.length ? "tool_calls" : "stop"),
-          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage: { prompt_tokens: 12 * messages.length, completion_tokens: completion, total_tokens: 12 * messages.length + completion } })}\n\n`,
+          chunk({}, calls.length ? "tool_calls" : "stop", finishFields(forcedAt)),
+          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage })}\n\n`,
           "data: [DONE]\n\n",
         ];
         let i = 0;
