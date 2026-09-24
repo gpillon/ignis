@@ -301,34 +301,36 @@ __global__ void group_decode_rows_kernel(const std::uint8_t* codes, const std::u
 }
 
 // GitHub #268: the verify attention kernel's throughput decoder
-// (hq_decode_row_group_fast), the fourth way. Each row is decoded the way its
-// call sites use it, next to the reference 8-lane decoder at the same
-// placement:
-//   - symbols staged in the output row itself, and the row written in the XOR
-//     swizzle the verify kernel gives key row r of a tile (xor_chunk = r & 7),
-//     by the reference group decode and by the fast one;
-//   - symbols staged on chip, linear rows (the shape of the prompt scratch
-//     decoder's call, which keeps the reference group decode).
-// Seeds are passed per row, so the same kernel serves every corpus below.
+// (hq_decode_row_group_fast), the fourth way, called exactly as the kernel
+// calls it: every lane of every warp together, each 8-lane group decoding its
+// row in place with the symbols staged in the output row itself, into the XOR
+// swizzle the kernel gives key row r of a tile (xor_chunk = r & 7), and groups
+// without a row taking part inactive. The reference group decode writes the
+// same placement next to it. With `inactive_mod` > 0, every row r with
+// r % inactive_mod == inactive_mod - 1 is inactive as well, and its output row
+// must keep the sentinel the host filled it with. Seeds are passed per row,
+// so the same kernel serves every corpus below.
 __global__ void fast_decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
                                         const std::uint64_t* seeds,
                                         __nv_bfloat16* reference_swizzled,
-                                        __nv_bfloat16* fast_swizzled,
-                                        __nv_bfloat16* fast_on_chip, int n_rows) {
-    __shared__ __align__(16) std::uint16_t symbols[(kGroupDecodeThreads / 8) * kHqHeadDim];
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = tid >> 3;
-    if (row >= n_rows) { return; }
+                                        __nv_bfloat16* fast_swizzled, int n_rows,
+                                        int inactive_mod) {
+    const int tid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row   = tid >> 3;
     const int lane8 = tid & 7;
-    const std::uint8_t* row_codes = codes + static_cast<std::size_t>(row) * kHqRowBudgetBytes;
-    const std::uint8_t* row_meta  = meta + static_cast<std::size_t>(row) * kHqMetaBytes;
-    const std::size_t out_row     = static_cast<std::size_t>(row) * kHqHeadDim;
-    hq_decode_row_group<true>(row_codes, row_meta, reference_swizzled + out_row, lane8, row & 7,
-                              seeds[row]);
-    hq_decode_row_group_fast(row_codes, row_meta, fast_swizzled + out_row, lane8, row & 7,
-                             seeds[row]);
-    hq_decode_row_group_fast(row_codes, row_meta, fast_on_chip + out_row, lane8, 0, seeds[row],
-                             symbols + (threadIdx.x / 8) * kHqHeadDim);
+    const bool real = row < n_rows;
+    const int at    = real ? row : 0;
+    const std::uint8_t* row_codes = codes + static_cast<std::size_t>(at) * kHqRowBudgetBytes;
+    const std::uint8_t* row_meta  = meta + static_cast<std::size_t>(at) * kHqMetaBytes;
+    const std::size_t out_row     = static_cast<std::size_t>(at) * kHqHeadDim;
+    if (real) {
+        hq_decode_row_group<true>(row_codes, row_meta, reference_swizzled + out_row, lane8,
+                                  row & 7, seeds[row]);
+    }
+    const bool active =
+        real && (inactive_mod == 0 || row % inactive_mod != inactive_mod - 1);
+    hq_decode_row_group_fast(row_codes, row_meta, fast_swizzled + out_row, lane8, at & 7,
+                             real ? seeds[row] : 0ull, active);
 }
 
 __global__ void fixture_seeds_kernel(std::uint64_t* seeds, int n_rows, int role_count,
@@ -357,50 +359,57 @@ __global__ void thread_decode_seeded_kernel(const std::uint8_t* codes, const std
 }
 
 // Differing elements between the fast decoder and each reference, over n rows
-// already on device. `thread_rows` (host, linear) is the per-thread decode, or
-// null where that decoder is not a reference (rows the engine never writes,
-// whose streams the per-thread reader bounds by their used bits).
+// already on device, in two launches: every row active, then every third row
+// inactive over a sentinel-filled output. `thread_rows` (host, linear) is the
+// per-thread decode, or null where that decoder is not a reference (rows the
+// engine never writes, whose streams the per-thread reader bounds by their
+// used bits).
 struct FastDecodeDiffs {
     std::size_t elements = 0;
-    std::size_t swizzled_vs_group = 0;   // fast vs reference group decode, same placement
-    std::size_t on_chip_vs_group  = 0;   // fast on-chip linear vs reference, un-swizzled
-    std::size_t swizzled_vs_thread = 0;  // fast swizzled vs the per-thread decode
-    std::size_t on_chip_vs_thread  = 0;
+    std::size_t vs_group = 0;          // all rows active: fast vs the group decode, same placement
+    std::size_t vs_thread = 0;         // all rows active: fast vs the per-thread decode
+    std::size_t masked_vs_group = 0;   // every third row inactive: the active rows vs the group decode
+    std::size_t inactive_touched = 0;  // elements of inactive rows that lost the sentinel
 };
 
 FastDecodeDiffs fast_decode_diffs(const std::uint8_t* d_codes, const std::uint8_t* d_meta,
                                   const std::uint64_t* d_seeds, int n_rows,
                                   const std::vector<std::uint16_t>* thread_rows) {
+    constexpr int kInactiveMod = 3;
     const std::size_t n_elems = static_cast<std::size_t>(n_rows) * kHqHeadDim;
-    __nv_bfloat16 *d_reference, *d_fast, *d_on_chip;
+    __nv_bfloat16 *d_reference, *d_fast;
     CUDA_CHECK(cudaMalloc(&d_reference, n_elems * 2));
     CUDA_CHECK(cudaMalloc(&d_fast, n_elems * 2));
-    CUDA_CHECK(cudaMalloc(&d_on_chip, n_elems * 2));
     const long long threads = static_cast<long long>(n_rows) * 8;
-    fast_decode_rows_kernel<<<static_cast<int>((threads + kGroupDecodeThreads - 1) /
-                                               kGroupDecodeThreads),
-                              kGroupDecodeThreads>>>(d_codes, d_meta, d_seeds, d_reference,
-                                                     d_fast, d_on_chip, n_rows);
+    const int blocks = static_cast<int>((threads + kGroupDecodeThreads - 1) / kGroupDecodeThreads);
+    std::vector<std::uint16_t> reference(n_elems), fast(n_elems), masked(n_elems);
+    fast_decode_rows_kernel<<<blocks, kGroupDecodeThreads>>>(d_codes, d_meta, d_seeds, d_reference,
+                                                              d_fast, n_rows, 0);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    std::vector<std::uint16_t> reference(n_elems), fast(n_elems), on_chip(n_elems);
     CUDA_CHECK(cudaMemcpy(reference.data(), d_reference, n_elems * 2, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(fast.data(), d_fast, n_elems * 2, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(on_chip.data(), d_on_chip, n_elems * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemset(d_fast, 0xFF, n_elems * 2));
+    fast_decode_rows_kernel<<<blocks, kGroupDecodeThreads>>>(d_codes, d_meta, d_seeds, d_reference,
+                                                              d_fast, n_rows, kInactiveMod);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(masked.data(), d_fast, n_elems * 2, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(d_reference));
     CUDA_CHECK(cudaFree(d_fast));
-    CUDA_CHECK(cudaFree(d_on_chip));
     FastDecodeDiffs d;
     d.elements = n_elems;
     for (int r = 0; r < n_rows; ++r) {
         const std::size_t row = static_cast<std::size_t>(r) * kHqHeadDim;
+        const bool inactive   = r % kInactiveMod == kInactiveMod - 1;
         for (int e = 0; e < kHqHeadDim; ++e) {
             const std::size_t at = row + static_cast<std::size_t>(e ^ ((r & 7) << 3));
-            d.swizzled_vs_group += fast[at] != reference[at] ? 1 : 0;
-            d.on_chip_vs_group += on_chip[row + e] != reference[at] ? 1 : 0;
-            if (thread_rows != nullptr) {
-                d.swizzled_vs_thread += fast[at] != (*thread_rows)[row + e] ? 1 : 0;
-                d.on_chip_vs_thread += on_chip[row + e] != (*thread_rows)[row + e] ? 1 : 0;
+            d.vs_group += fast[at] != reference[at] ? 1 : 0;
+            if (thread_rows != nullptr) { d.vs_thread += fast[at] != (*thread_rows)[row + e] ? 1 : 0; }
+            if (inactive) {
+                d.inactive_touched += masked[at] != 0xFFFFu ? 1 : 0;
+            } else {
+                d.masked_vs_group += masked[at] != reference[at] ? 1 : 0;
             }
         }
     }
@@ -408,19 +417,17 @@ FastDecodeDiffs fast_decode_diffs(const std::uint8_t* d_codes, const std::uint8_
 }
 
 void check_fast_decode(const FastDecodeDiffs& d, const char* corpus, bool with_thread) {
-    std::printf("fast group decode on %s: %zu elements; differing vs the group decode %zu "
-                "(swizzled, symbols in the row) / %zu (on chip)",
-                corpus, d.elements, d.swizzled_vs_group, d.on_chip_vs_group);
-    if (with_thread) {
-        std::printf("; vs the per-thread decode %zu / %zu", d.swizzled_vs_thread,
-                    d.on_chip_vs_thread);
-    }
-    std::printf("\n");
-    check(d.swizzled_vs_group == 0 && d.on_chip_vs_group == 0,
+    std::printf("fast group decode (the verify kernel's call) on %s: %zu elements; differing vs "
+                "the group decode %zu",
+                corpus, d.elements, d.vs_group);
+    if (with_thread) { std::printf(", vs the per-thread decode %zu", d.vs_thread); }
+    std::printf("; with every third row inactive: %zu differing, %zu inactive elements written\n",
+                d.masked_vs_group, d.inactive_touched);
+    check(d.vs_group == 0 && d.masked_vs_group == 0,
           "the fast group decode disagrees with hq_decode_row_group");
+    check(d.inactive_touched == 0, "the fast group decode wrote an inactive row");
     if (with_thread) {
-        check(d.swizzled_vs_thread == 0 && d.on_chip_vs_thread == 0,
-              "the fast group decode disagrees with hq_decode_row_thread");
+        check(d.vs_thread == 0, "the fast group decode disagrees with hq_decode_row_thread");
     }
 }
 

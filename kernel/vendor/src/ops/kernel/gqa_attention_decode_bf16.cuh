@@ -19,12 +19,13 @@
 // the round's new K/V rows into the code planes (per-warp encoder scratch
 // aliases the qkv tile, unused before q staging).
 //
-// ignis (ADR 0031, GitHub #268): the hq route's throughput form is the default
-// (IgnisThroughput): each tile's code rows are staged one step ahead by
-// cp.async, decoded by hq_decode_rows_group_fast, and at <= 48 query rows the
-// q rows stay in shared memory while K and V take turns in one tile. Bit-exact
-// against the reference form (IgnisThroughput = false, the whole reference hq
-// route): kernel/tests/test_hq_verify_exact.cu.
+// ignis (ADR 0031, GitHub #268): at <= 48 query rows (27B at width 8) the hq
+// route's throughput form is the default (IgnisThroughput): the q rows stay in
+// shared memory while K and V take turns in one tile, each role's code rows
+// are staged one step ahead by cp.async, and every warp decodes them together
+// with hq_decode_row_group_fast. Bit-exact against the reference form
+// (IgnisThroughput = false, the whole reference hq route):
+// kernel/tests/test_hq_verify_exact.cu. Wider geometries run the reference form.
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -68,15 +69,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     // ignis (GitHub #268): with the hq source and at most 48 query rows (27B at
     // width 8), the q rows stay in shared memory and K and V take turns in one
     // tile, so no q fragments are held in registers across the key loop; the
-    // tile decode gets those registers instead. Wider geometries keep the
-    // reference's layout (two tiles, q fragments in registers).
-    // IgnisThroughput = false keeps the reference's hq route whole (rows decoded
-    // by hq_decode_row_group straight from the code planes, no staging, the
-    // reference's layout): the oracle test_hq_verify_exact.cu compares against.
-    constexpr bool kFast        = KvSource::hq && IgnisThroughput;
+    // tile decode gets those registers instead. Wider geometries, and
+    // IgnisThroughput = false, run the reference's hq route whole (two tiles, q
+    // fragments in registers, rows decoded by hq_decode_row_group straight from
+    // the code planes): the oracle test_hq_verify_exact.cu compares against.
     constexpr int kQRows        = Geometry::GroupSize * TokenTile;
-    constexpr bool kSplit       = kFast && kQRows <= 48;
-    constexpr int QkvRows       = kSplit ? (kQRows + Bc > Br ? kQRows + Bc : Br) : 2 * Bc;
+    constexpr bool kFast        = KvSource::hq && IgnisThroughput && kQRows <= 48;
+    constexpr int QkvRows       = kFast ? (kQRows + Bc > Br ? kQRows + Bc : Br) : 2 * Bc;
 
     static_assert(QkvRows >= Br);
 
@@ -84,18 +83,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
     __shared__ std::int32_t physical_pages_s[PageIds];
     __shared__ std::int8_t signs_s[KvSource::rotated ? kGqaHeadDim : 1];
-    // hq (ignis, GitHub #268): a tile's code and meta rows, staged by cp.async one
-    // tile ahead into two buffers of [K codes | V codes | K meta | V meta]. The 32
-    // rows of a tile share one page, so each part is one contiguous run.
+    // Throughput form (ignis, GitHub #268): one role of one tile, [codes | meta],
+    // staged by cp.async one phase ahead. The 32 rows of a tile share one page,
+    // so each part is one contiguous run.
     constexpr int kHqStageCodes = Bc * kHqRowBudgetBytes;
     constexpr int kHqStageMeta  = Bc * kHqMetaBytes;
-    constexpr int kHqStageBytes = 2 * (kHqStageCodes + kHqStageMeta);
-    // Split phases stage one role of one tile at a time: [codes | meta].
-    constexpr int kHqStageAlloc =
-        !kFast ? 16 : kSplit ? kHqStageCodes + kHqStageMeta : 2 * kHqStageBytes;
-    __shared__ __align__(16) std::uint8_t hq_stage_s[kHqStageAlloc];
-    __nv_bfloat16* k_s = kSplit ? qkv_s + kQRows * D : qkv_s;
-    __nv_bfloat16* v_s = kSplit ? k_s : qkv_s + Bc * D;
+    __shared__ __align__(16) std::uint8_t hq_stage_s[kFast ? kHqStageCodes + kHqStageMeta : 16];
+    __nv_bfloat16* k_s = kFast ? qkv_s + kQRows * D : qkv_s;
+    __nv_bfloat16* v_s = kFast ? k_s : qkv_s + Bc * D;
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -286,34 +281,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         __syncthreads();
     }
 
-    // hq: stage tile kb's code/meta rows into buffer kb & 1 (one commit group per
-    // call on every thread). Issued after the fused append's barrier, so the rows
-    // it just encoded are the ones staged.
-    auto hq_stage_tile = [&](int kb) {
-        if constexpr (kFast && !kSplit) {
-            const int k0   = first_tile + kb * Bc;
-            const int page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-            const std::int64_t codes_off = paged_kv_element_offset<kHqCodePlaneExtent, Geometry::KVHeads>(
-                page, kv_head, k0 & kPagedKVPageMask, 0);
-            const std::int64_t meta_off = paged_kv_element_offset<kHqMetaPlaneExtent, Geometry::KVHeads>(
-                page, kv_head, k0 & kPagedKVPageMask, 0);
-            std::uint8_t* stage = hq_stage_s + (kb & 1) * kHqStageBytes;
-            for (int chunk = tid; chunk < kHqStageBytes / 16; chunk += Threads) {
-                const int b = chunk * 16;
-                const std::uint8_t* src =
-                    b < kHqStageCodes      ? kv.codes_k + codes_off + b
-                    : b < 2 * kHqStageCodes ? kv.codes_v + codes_off + (b - kHqStageCodes)
-                    : b < 2 * kHqStageCodes + kHqStageMeta
-                        ? kv.meta_k + meta_off + (b - 2 * kHqStageCodes)
-                        : kv.meta_v + meta_off + (b - 2 * kHqStageCodes - kHqStageMeta);
-                ninfer::ops::cp_async<16, Cache::cg>(stage + b, src);
-            }
-            ninfer::ops::cp_commit();
-        }
-    };
-    // Split phases: tile kb's rows of one role into the single stage buffer.
+    // Throughput form: tile kb's rows of one role into the stage buffer (one
+    // commit group per call on every thread). Issued after the fused append's
+    // barrier, so the rows it just encoded are the ones staged.
     auto hq_stage_role = [&](int kb, bool role_v) {
-        if constexpr (kSplit) {
+        if constexpr (kFast) {
             const int k0   = first_tile + kb * Bc;
             const int page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
             const std::uint8_t* codes =
@@ -332,15 +304,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             ninfer::ops::cp_commit();
         }
     };
-    if constexpr (kSplit) {
-        hq_stage_role(0, false);
-    } else {
-        hq_stage_tile(0);
-    }
+    hq_stage_role(0, false);
 
     if constexpr (kFast) {
         // The same q rows, eight elements (one swizzle chunk) per move.
-        for (int chunk = tid; chunk < (kSplit ? kQRows : Br) * (D / 8); chunk += Threads) {
+        for (int chunk = tid; chunk < kQRows * (D / 8); chunk += Threads) {
             const int row = chunk / (D / 8);
             const int d   = (chunk - row * (D / 8)) * 8;
             int q_head    = 0;
@@ -402,7 +370,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
 
     unsigned af_q[QKKs][4];
-    if constexpr (!kSplit) {
+    if constexpr (!kFast) {
 #pragma unroll
         for (int k = 0; k < QKKs; ++k) {
             const int arow = warp_row0 + a_rowoff;
@@ -414,7 +382,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     // Split mode: a warp whose 16 rows lie past the q rows has no query (27B:
     // warp 3) and skips the MMA work; the reference's layout computes it on
     // zero rows, whose outputs are never stored.
-    const bool mma_warp = !kSplit || warp_row0 < kQRows;
+    const bool mma_warp = !kFast || warp_row0 < kQRows;
     if constexpr (kFast) { ninfer::ops::cp_wait<0>(); }  // tile 0's staged rows
     __syncthreads();
     int physical_page = physical_pages_s[0];
@@ -488,28 +456,19 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                     // Every thread of the block runs the same slot count, so the
                     // whole warp reaches this call together; groups without a
                     // codec row take part inactive.
-                    const int codes_at = kSplit ? 0 : (role_v ? kHqStageCodes : 0);
-                    const int meta_at =
-                        kSplit ? kHqStageCodes : 2 * kHqStageCodes + (role_v ? kHqStageMeta : 0);
-                    const HqGroupRow rows[1] = {{stage + codes_at + key_l * kHqRowBudgetBytes,
-                                                 stage + meta_at + key_l * kHqMetaBytes, row_dst,
-                                                 key_l & 7, hq_dither_row_seed(kv_head, key, role_v),
-                                                 nullptr, codec_row}};
-                    hq_decode_rows_group_fast<1, true>(rows, lane8);
+                    hq_decode_row_group_fast(stage + key_l * kHqRowBudgetBytes,
+                                             stage + kHqStageCodes + key_l * kHqMetaBytes, row_dst,
+                                             lane8, key_l & 7,
+                                             hq_dither_row_seed(kv_head, key, role_v), codec_row);
                 }
             }
             __syncthreads();
           }
         };
-        if constexpr (kSplit) {
+        if constexpr (kFast) {
             // K first: decode, then stage this tile's V rows behind the QK work.
             hq_decode_roles(hq_stage_s, 0, 1);
             hq_stage_role(kb, true);
-        } else if constexpr (kFast) {
-            // The next tile's rows land while this one decodes and multiplies; its
-            // buffer was last read by tile kb - 1, before that tile's barrier.
-            if (kb + 1 < key_blocks) { hq_stage_tile(kb + 1); }
-            hq_decode_roles(hq_stage_s + (kb & 1) * kHqStageBytes, 0, 2);
         } else if constexpr (KvSource::hq) {
             hq_decode_roles(nullptr, 0, 2);
         } else {
@@ -560,7 +519,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
         if (mma_warp) {
         float score[QKNt][4];
-        if constexpr (kSplit) {
+        if constexpr (kFast) {
             // Same products in the same order per score as below: k ascending.
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
@@ -687,7 +646,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         __syncwarp();
         }  // mma_warp: QK + softmax
 
-        if constexpr (kSplit) {
+        if constexpr (kFast) {
             // V into the tile K just left, then stage the next tile's K rows
             // behind the PV work.
             ninfer::ops::cp_wait<0>();

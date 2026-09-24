@@ -159,8 +159,10 @@ tokens; texts compared lane by lane):
 - The exactness proof is the kernel oracle below.
 
 **Exactness.**
-- `ignis_hq_codec_kv_rows_test`, the fourth decode way, 0 elements differing
-  across four corpora:
+- `ignis_hq_codec_kv_rows_test`, the fourth decode way, called as the kernel
+  calls it (the whole warp at once, symbols staged in the row, and a second
+  launch with every third group inactive, whose rows must stay untouched):
+  0 elements differing across four corpora:
   - all 8,192 real rows: 2,097,152 elements, against the group decode (swizzled,
     symbols in the row) and against the per-thread decode;
   - 64 escalated heavy-tailed rows;
@@ -169,9 +171,9 @@ tokens; texts compared lane by lane):
     terminator, no terminator at all, and the terminal fallback.
 - `ignis_kernel_hq_verify_exact_test` (new CTest) runs the kernel's throughput
   route against its reference route (`IgnisThroughput = false`, the whole
-  reference hq route) over 8 shapes:
+  reference hq route) over 11 shapes:
   - widths 1-8, masked columns, a column offset, permuted table rows;
-  - 40 to 70,000 keys;
+  - 40 to 70,000 keys, split capacities (grid.y) of 4, 23, 40 and 85;
   - the residual window with cleared ring slots;
   - the fused append.
 

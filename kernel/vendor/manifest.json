@@ -472,8 +472,8 @@
       "sha256": "50917d11e7e30b4afcac8b946962a78f8e29b56b31ec5a1feba01bfc7ae2db94",
       "patch": {
         "diff": "patches/src/ops/kernel/gqa_attention_decode_bf16.cuh.diff",
-        "sha256": "202d65daf782487602faa9bd8efb616d771d3488966cc7afce90238c9d90d698",
-        "reason": "ADR 0031, GitHub #268: the hq-e8-2b verify route of the small-T kernel measured 6.2 us per GQA layer per 1K keys per lane against a 0.96 us MMA floor (docs/findings/2026-09-24-hq-attention-at-long-context.md), and Nsight Compute at 8 lanes x 30K put 80% of its instructions in the tile decode at 35% issue, latency-bound at 8 warps per SM with the q fragments and accumulators holding 192 of 255 registers. The throughput form (IgnisThroughput, default): each tile's code rows staged one step ahead by cp.async, hq_decode_rows_group_fast called by every warp at once, and at <= 48 query rows (27B at width 8) q kept in shared memory while K and V take turns in one tile, with paired fragment loads; IgnisThroughput = false is the reference hq route, unchanged. Bit-exact against it: ignis_kernel_hq_verify_exact_test (8 shapes: widths 1-8, masks, offsets, permuted table rows, residual window with cleared ring slots, the fused append, every partial and cache byte). Kernel alone: 8 lanes x 30K 1679 -> 890 us, 1 lane x 59K 368 -> 201 us. docs/findings/2026-09-24-hq-verify-decode-cost.md."
+        "sha256": "11935bce0fa433fb5a47316b63d5e77054491253b7ad9d36d5f6883520cbba1e",
+        "reason": "ADR 0031, GitHub #268: the hq-e8-2b verify route of the small-T kernel measured 6.2 us per GQA layer per 1K keys per lane against a 0.96 us MMA floor (docs/findings/2026-09-24-hq-attention-at-long-context.md), and Nsight Compute at 8 lanes x 30K put 80% of its instructions in the tile decode at 35% issue, latency-bound at 8 warps per SM with the q fragments and accumulators holding 192 of 255 registers. The throughput form (IgnisThroughput, default) at <= 48 query rows (27B at width 8; wider geometries run the reference form): q kept in shared memory while K and V take turns in one tile, each role's code rows staged one phase ahead by cp.async, hq_decode_row_group_fast called by every warp at once, paired fragment loads; IgnisThroughput = false is the reference hq route, unchanged. Bit-exact against it: ignis_kernel_hq_verify_exact_test (11 shapes: widths 1-8, masks, offsets, permuted table rows, residual window with cleared ring slots, the fused append, split capacities 4/23/40/85; every partial and cache byte). Kernel alone: 8 lanes x 30K 1679 -> 890 us, 1 lane x 59K 368 -> 201 us. docs/findings/2026-09-24-hq-verify-decode-cost.md."
       }
     },
     {
@@ -518,8 +518,8 @@
       "sha256": "bf75965478c764367af55406315af3f82538db965aa1f5d8c83a7bd602760e4a",
       "patch": {
         "diff": "patches/src/ops/kernel/hq_codec.cuh.diff",
-        "sha256": "28922664ba3978ad5958255676c68cf3e167f202a887980c47e78f1fc26e3518",
-        "reason": "ADR 0031: cometkim feat/1m-context (2026-09-10). The hq-e8-2b prompt scratch decoder stages its temporary Rice symbols in shared memory instead of the output row in device memory, and moves each lattice word as one 16-byte vector; the default call (every other caller) is unchanged. Bit-exact. Fork, same artifact: prefill +16.2% at 262,144 populated tokens. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md. Then ADR 0031, GitHub #268: hq_decode_rows_group_fast, the 8-lane group decode in throughput form (each lane's two 32-bit stream words walked as two branch-free terminator chains, unstrip by bit identities, the dither byte folded into the reference's one rounding, R rows per group optional); every row off the k = 0 path is hq_decode_row_group<true>. Opened by Nsight Compute on the verify kernel at 8 lanes x 30K keys: the 64-bit unary walk was 44% of 1.16e9 instructions at 35% issue. Bit-exact: ignis_hq_codec_kv_rows_test (real, escalated and never-written rows) and ignis_kernel_hq_verify_exact_test. docs/findings/2026-09-24-hq-verify-decode-cost.md."
+        "sha256": "92dbfa9d7abc8d2b6b38320a64db2eedbe15a3a374fe7850e99ded09f451c062",
+        "reason": "ADR 0031: cometkim feat/1m-context (2026-09-10). The hq-e8-2b prompt scratch decoder stages its temporary Rice symbols in shared memory instead of the output row in device memory, and moves each lattice word as one 16-byte vector; the default call (every other caller) is unchanged. Bit-exact. Fork, same artifact: prefill +16.2% at 262,144 populated tokens. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md. Then ADR 0031, GitHub #268: hq_decode_row_group_fast, the 8-lane group decode in throughput form for the verify kernel's throughput route, called by every lane of the warp at once with inactive groups (each lane's two 32-bit stream words walked as two branch-free terminator chains, unstrip by bit identities, the dither byte folded into the reference's one rounding); every row off the k = 0 path is hq_decode_row_group<true>. Opened by Nsight Compute on the verify kernel at 8 lanes x 30K keys: the 64-bit unary walk was 44% of 1.16e9 instructions at 35% issue. Bit-exact: ignis_hq_codec_kv_rows_test calls it as the kernel does (real, escalated and never-written rows, with and without inactive groups) and ignis_kernel_hq_verify_exact_test. docs/findings/2026-09-24-hq-verify-decode-cost.md."
       }
     },
     {
@@ -685,7 +685,12 @@
     },
     {
       "path": "src/ops/launcher/gqa_attention_decode_hq_routes.cuh",
-      "sha256": "b96a717e0d52b7a9a27c51b19b12408a1b0db282c1b7606fc856e254adc9b0bb"
+      "sha256": "b96a717e0d52b7a9a27c51b19b12408a1b0db282c1b7606fc856e254adc9b0bb",
+      "patch": {
+        "diff": "patches/src/ops/launcher/gqa_attention_decode_hq_routes.cuh.diff",
+        "sha256": "69b6a9e3c3f2185752c9c5de25d1d3c92ddb76425a3bdf6dd8ee964190e6fec6",
+        "reason": "ADR 0031, GitHub #268: comment only. The launch site's shared-memory note names the 27B throughput route's ~47 KB static layout next to the reference layout's ~36.6 KB; no code change."
+      }
     },
     {
       "path": "src/ops/launcher/gqa_attention_decode_i8.cu",

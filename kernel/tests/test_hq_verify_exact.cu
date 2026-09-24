@@ -11,16 +11,17 @@
 //   IgnisThroughput = false  the reference's route: two K/V tiles, q fragments
 //                            in registers, each row group-decoded straight
 //                            from the code planes (hq_decode_row_group);
-//   IgnisThroughput = true   the engine's route: code rows staged one step
-//                            ahead by cp.async, the throughput group decoder,
-//                            and at <= 48 query rows q in shared memory with K
-//                            and V taking turns in one tile.
+//   IgnisThroughput = true   the engine's route at 27B's 48 query rows: q in
+//                            shared memory with K and V taking turns in one
+//                            tile, each role's code rows staged one phase
+//                            ahead by cp.async, the throughput group decoder.
 //
 // Both run on identical inputs -- the same paged cache encoded from the
 // committed real K/V rows under their true dither seeds, the same q, the same
 // positions -- over the shapes the verify round uses and the ones it may: one
 // and several lanes, widths 1..8, masked columns, a column offset, a permuted
 // table-row map, short windows (key-split units) and long ones (tile splits),
+// split capacities (grid.y) of 4, 23, 40 and 85,
 // the residual window on and off with cleared ring slots, and the fused append
 // (GqaAppendInput) as well as a pre-filled cache (GqaCachedInput). Every byte
 // of the partials must match, and with the append so must every byte the
@@ -177,6 +178,7 @@ struct Case {
     bool permute_tables;       // lane b reads table row B-1-b
     bool residual;
     bool append;
+    int splits = kSplits;      // the launch's split capacity (grid.y); serving uses 4..85
 };
 
 template <typename CacheInput, bool Throughput>
@@ -184,7 +186,7 @@ void launch(const Case& c, const __nv_bfloat16* q, CacheInput input, const std::
             GqaTcKVHq kv, const std::int32_t* tables, const std::int32_t* valid,
             const std::int32_t* table_rows, int table_stride, __nv_bfloat16* acc, float* m,
             float* l) {
-    const dim3 grid(kHeads, kSplits, static_cast<unsigned>(c.windows.size()));
+    const dim3 grid(kHeads, c.splits, static_cast<unsigned>(c.windows.size()));
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, kTokenTile, 4, true, true, CacheInput,
                                                  GqaTcKVHq, Throughput>
         <<<grid, kGqaHqDecodeThreads>>>(q, input, pos, kv, tables, valid, table_rows, table_stride,
@@ -311,8 +313,8 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
     // The partials hold one block of every split for every lane; untouched
     // bytes keep a sentinel, so a split one route writes and the other skips
     // shows up as a difference.
-    const std::size_t acc_bytes  = static_cast<std::size_t>(lanes) * kSplits * c.tokens * Geometry::QHeads * kGqaHeadDim * 2;
-    const std::size_t stat_bytes = static_cast<std::size_t>(lanes) * kSplits * c.tokens * Geometry::QHeads * 4;
+    const std::size_t acc_bytes  = static_cast<std::size_t>(lanes) * c.splits * c.tokens * Geometry::QHeads * kGqaHeadDim * 2;
+    const std::size_t stat_bytes = static_cast<std::size_t>(lanes) * c.splits * c.tokens * Geometry::QHeads * 4;
     __nv_bfloat16* d_acc;
     float *d_m, *d_l;
     CUDA_CHECK(cudaMalloc(&d_acc, acc_bytes));
@@ -437,6 +439,11 @@ int main() {
         {"2 lanes, offset columns 4..11 of 12", {9000, 600}, 8, 12, 4, {}, false, true, false},
         {"8 lanes, 3000 keys, width 8, masked, append", {3000, 3100, 2900, 3050, 3000, 2990, 3010, 3070},
          8, 8, 0, {8, 8, 8, 7, 8, 8, 5, 8}, false, true, true},
+        // Fewer splits than the 85 of the serving envelope's capacity: long
+        // per-split tile loops, and the capacity clamping the active count.
+        {"2 lanes, 20000/17000 keys, 4 splits, residual", {20000, 17000}, 8, 8, 0, {}, false, true, false, 4},
+        {"3 lanes, mixed, masked, append, 23 splits", {5000, 1200, 33}, 8, 8, 0, {8, 6, 3}, true, true, true, 23},
+        {"1 lane, 70000 keys, width 8, append, 40 splits", {70000}, 8, 8, 0, {}, false, true, true, 40},
     };
     for (const Case& c : cases) { run_case(c, rows, d_rows); }
     CUDA_CHECK(cudaFree(d_rows));
