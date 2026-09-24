@@ -21,6 +21,11 @@
 //     decode rewrite changed no bit.
 //
 //   ignis_hq_verify_bench --lanes 8 --ctx 30720 [--iters 20] [--residual] [--decode-only]
+//                         [--reference]
+//
+// --reference launches the kernel's reference hq route (IgnisThroughput =
+// false: main's code path) instead of the throughput route, a same-binary A/B
+// that prints the same hash.
 //
 // --decode-only times the kernel's tile decode alone (decode_only_kernel),
 // once with the reference group decode and once with the throughput decoder.
@@ -250,7 +255,7 @@ __launch_bounds__(128, 2) __global__ void decode_only_kernel(GqaTcKVHq kv,
 
 int main(int argc, char** argv) {
     int lanes = 1, ctx = 30720, iters = 20;
-    bool residual = false, decode_only = false;
+    bool residual = false, decode_only = false, reference = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--lanes" && i + 1 < argc) { lanes = std::atoi(argv[++i]); }
@@ -258,8 +263,9 @@ int main(int argc, char** argv) {
         else if (a == "--iters" && i + 1 < argc) { iters = std::atoi(argv[++i]); }
         else if (a == "--residual") { residual = true; }
         else if (a == "--decode-only") { decode_only = true; }
+        else if (a == "--reference") { reference = true; }
         else {
-            std::fprintf(stderr, "usage: %s --lanes N --ctx KEYS [--iters N] [--residual] [--decode-only]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --lanes N --ctx KEYS [--iters N] [--residual] [--decode-only] [--reference]\n", argv[0]);
             return 2;
         }
     }
@@ -342,10 +348,19 @@ int main(int argc, char** argv) {
     const dim3 grid(Geometry::KVHeads, kSplits, lanes);
     const float scale = 1.0f / 16.0f;
     auto launch = [&]() {
-        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 8, 4, true, true, GqaCachedInput,
-                                                     GqaTcKVHq><<<grid, kGqaHqDecodeThreads>>>(
-            d_q, GqaCachedInput{}, d_pos, kv, d_table, nullptr, d_table_rows, pages_per_lane,
-            kTokens, kTokens, 0, 262144, scale, d_acc, d_m, d_l);
+        if (reference) {
+            gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 8, 4, true, true, GqaCachedInput,
+                                                         GqaTcKVHq, false>
+                <<<grid, kGqaHqDecodeThreads>>>(d_q, GqaCachedInput{}, d_pos, kv, d_table, nullptr,
+                                                d_table_rows, pages_per_lane, kTokens, kTokens, 0,
+                                                262144, scale, d_acc, d_m, d_l);
+        } else {
+            gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 8, 4, true, true, GqaCachedInput,
+                                                         GqaTcKVHq>
+                <<<grid, kGqaHqDecodeThreads>>>(d_q, GqaCachedInput{}, d_pos, kv, d_table, nullptr,
+                                                d_table_rows, pages_per_lane, kTokens, kTokens, 0,
+                                                262144, scale, d_acc, d_m, d_l);
+        }
     };
 
     cudaEvent_t e0, e1;
@@ -405,10 +420,11 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(host.data(), d_l, host.size(), cudaMemcpyDeviceToHost));
     h = fnv1a64(host.data(), host.size(), h);
 
-    std::printf("hq verify attention: lanes %d ctx %d residual %s: median %.1f us (min %.1f, max "
-                "%.1f, %d launches) = %.3f us per layer per 1K keys per lane; partials fnv1a64 "
-                "%016llx\n",
-                lanes, ctx, residual ? "on" : "off", median_us, lo, hi, iters, median_us / (lanes * (ctx / 1024.0f)),
+    std::printf("hq verify attention (%s route): lanes %d ctx %d residual %s: median %.1f us (min "
+                "%.1f, max %.1f, %d launches) = %.3f us per layer per 1K keys per lane; partials "
+                "fnv1a64 %016llx\n",
+                reference ? "reference" : "throughput", lanes, ctx, residual ? "on" : "off",
+                median_us, lo, hi, iters, median_us / (lanes * (ctx / 1024.0f)),
                 static_cast<unsigned long long>(h));
     return 0;
 }
