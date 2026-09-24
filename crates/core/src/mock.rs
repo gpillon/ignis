@@ -577,9 +577,13 @@ impl Compute for MockCompute {
                     *rounds += 1;
                     *rounds - 1
                 };
-                let length = match g.run_lengths.len() {
-                    0 => 1,
-                    n => g.run_lengths[round % n],
+                // A free lane handed a set mid-run (the thinking budget's
+                // forced close): the leaf runs it as a plain round — one
+                // token, the free draw it already holds — and the set's draw
+                // is what the *next* round returns, the same lag as above.
+                let length = match (&job.permitted, g.run_lengths.len()) {
+                    (Some(_), _) | (None, 0) => 1,
+                    (None, n) => g.run_lengths[round % n],
                 };
                 // An explicit stop_after overrides the learned limit; an
                 // unlearned request (no prefill seen) is treated as
@@ -606,6 +610,12 @@ impl Compute for MockCompute {
                         break;
                     }
                     run.push(Self::mix(self.seed, job.request, seed, step));
+                }
+                if let Some(permitted) = &job.permitted {
+                    if committed > 0 && finish.is_none() {
+                        let next = Self::draw(self.seed, &mut g, job.request, permitted);
+                        g.pending.insert(job.request, next);
+                    }
                 }
                 if committed == 0 {
                     // Without `eos_after` the mock has no real EOS token —

@@ -70,6 +70,9 @@ pub struct Server {
     pub default_enable_thinking: bool,
     /// The server-wide `reasoning_effort` default (`IGNIS_REASONING_EFFORT`).
     pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// The server-wide thinking budget (`--thinking-budget`, 2026-09-24) a
+    /// request's unset `thinking_budget` falls back to. `None` = no budget.
+    pub default_thinking_budget: Option<u32>,
     /// The Playground's asset table when `--ui` is on (GitHub #163, ADR
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
     pub playground: Option<playground::Assets>,
@@ -114,6 +117,7 @@ impl Server {
             request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
             default_enable_thinking: true,
             default_reasoning_effort: None,
+            default_thinking_budget: None,
             playground: None,
             metrics: None,
             api_key: None,
@@ -156,6 +160,12 @@ impl Server {
     ) -> Self {
         self.default_enable_thinking = enable_thinking;
         self.default_reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Set the server-wide thinking budget (`--thinking-budget`).
+    pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
+        self.default_thinking_budget = budget;
         self
     }
 

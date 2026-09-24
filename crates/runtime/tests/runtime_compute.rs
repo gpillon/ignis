@@ -599,6 +599,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
         frequency_penalty: -0.4,
         seed: 9,
         ignore_eos: false,
+        thinking_budget: None,
     };
     let right = DecodeParams {
         max_tokens: Some(4),
@@ -609,6 +610,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
         frequency_penalty: 0.6,
         seed: 11,
         ignore_eos: false,
+        thinking_budget: None,
     };
     compute
         .prefill_step(&[
@@ -934,6 +936,7 @@ fn adapter_can_keep_a_measurement_lane_alive_past_eos() {
         lane: 0,
         params: DecodeParams {
             ignore_eos: true,
+            thinking_budget: None,
             ..DecodeParams::default()
         },
         remaining_tokens: 8,
@@ -1564,6 +1567,7 @@ fn the_leaf_is_handed_each_lanes_budget_and_stop_ids() {
     };
     let past_eos = DecodeParams {
         ignore_eos: true,
+        thinking_budget: None,
         ..DecodeParams::default()
     };
     compute

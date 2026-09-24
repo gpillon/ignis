@@ -95,6 +95,10 @@ pub struct Config {
     pub model_download_path: PathBuf,
     pub enable_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The server-wide thinking budget (`--thinking-budget` /
+    /// `IGNIS_THINKING_BUDGET`): the reasoning tokens a request may spend
+    /// before the model's close is forced. `None` = no budget.
+    pub thinking_budget: Option<u32>,
     /// The prefill chunk width, in tokens (a nonzero multiple of
     /// [`PREFILL_CHUNK_ALIGNMENT`]).
     pub prefill_chunk: u32,
@@ -325,6 +329,7 @@ pub fn resolve(
     let mut artifact = None;
     let mut enable_thinking = None;
     let mut reasoning_effort = None;
+    let mut thinking_budget = None;
     let mut prefill_chunk = None;
     let mut max_context = None;
     let mut kv_format = None;
@@ -366,6 +371,7 @@ pub fn resolve(
             "--artifact" | "-a" => artifact = Some(take_value(args, &mut i, flag)?),
             "--enable-thinking" => enable_thinking = Some(take_value(args, &mut i, flag)?),
             "--reasoning-effort" => reasoning_effort = Some(take_value(args, &mut i, flag)?),
+            "--thinking-budget" => thinking_budget = Some(take_value(args, &mut i, flag)?),
             "--prefill-chunk" => prefill_chunk = Some(take_value(args, &mut i, flag)?),
             "--max-context" => max_context = Some(take_value(args, &mut i, flag)?),
             "--kv-format" => kv_format = Some(take_value(args, &mut i, flag)?),
@@ -433,6 +439,11 @@ pub fn resolve(
         .unwrap_or_default();
     let reasoning_effort =
         thinking::parse_default_reasoning_effort(&reasoning_effort_raw).map_err(ConfigError)?;
+    let thinking_budget_raw = thinking_budget
+        .or_else(|| env("IGNIS_THINKING_BUDGET"))
+        .unwrap_or_default();
+    let thinking_budget =
+        thinking::parse_default_thinking_budget(&thinking_budget_raw).map_err(ConfigError)?;
 
     // The engine-shape values (GitHub #87): resolved and validated here,
     // before `main` opens the artifact or touches the loader — an
@@ -527,6 +538,7 @@ pub fn resolve(
         ),
         enable_thinking,
         reasoning_effort,
+        thinking_budget,
         prefill_chunk,
         max_context,
         kv_format,
@@ -1151,6 +1163,7 @@ fn help_text() -> String {
          \x20       --model-download-path <dir> env: IGNIS_MODEL_DOWNLOAD_PATH (default: {DEFAULT_MODEL_DOWNLOAD_PATH}; where a fetched model lands, and where one fetched earlier is found)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
+         \x20       --thinking-budget <n>     env: IGNIS_THINKING_BUDGET  (default: unset — no budget; reasoning tokens before the close is forced)\n\
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\

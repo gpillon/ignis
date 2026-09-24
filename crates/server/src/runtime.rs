@@ -254,6 +254,20 @@ pub fn cuda_scheduler(
     eos: TokenId,
     shape: EngineShape,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
+    cuda_scheduler_with_thinking_close(artifact_path, model_id, eos, shape, None)
+}
+
+/// [`cuda_scheduler`], with the model's close sequence the thinking budget
+/// forces (2026-09-24, `ignis_core::thinking_budget`); `None` leaves every
+/// budget inert.
+#[cfg(feature = "cuda")]
+pub fn cuda_scheduler_with_thinking_close(
+    artifact_path: &std::path::Path,
+    model_id: String,
+    eos: TokenId,
+    shape: EngineShape,
+    thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
+) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
     use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
     use ignis_runtime::{CudaLeaf, KV_PAGE_TOKENS};
 
@@ -371,7 +385,10 @@ pub fn cuda_scheduler(
     }
 
     let sched = scheduler(
-        scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages),
+        SchedulerConfig {
+            thinking_close,
+            ..scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages)
+        },
         model,
         eos,
     );

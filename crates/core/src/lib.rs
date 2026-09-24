@@ -61,6 +61,7 @@ pub mod scheduler;
 #[cfg(feature = "cuda")]
 pub mod seq;
 pub mod speculation;
+pub mod thinking_budget;
 #[cfg(feature = "cuda")]
 pub mod step;
 pub mod types;

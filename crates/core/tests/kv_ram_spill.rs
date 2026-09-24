@@ -465,6 +465,7 @@ fn a_spill_never_displaces_a_higher_ranked_entry_until_it_has_sat_idle_past_the_
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             retained_interactive_ttl: Duration::from_secs(300),
+            thinking_close: None,
             ..tight(1)
         },
         compute.clone(),

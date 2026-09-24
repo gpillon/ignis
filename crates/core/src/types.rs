@@ -316,6 +316,12 @@ pub struct DecodeParams {
     /// Keep decoding when the model emits its EOS token. This is reserved
     /// for bounded measurement streams that are cancelled by their window.
     pub ignore_eos: bool,
+    /// The **thinking budget** (2026-09-24, [`crate::thinking_budget`]):
+    /// the most tokens this request may emit with its reasoning block still
+    /// open before the scheduler forces the model's own close. `None` never
+    /// forces. Only meaningful for a generation that starts inside the block,
+    /// and inert on a scheduler configured without a close sequence.
+    pub thinking_budget: Option<u32>,
 }
 
 impl Default for DecodeParams {
@@ -329,6 +335,7 @@ impl Default for DecodeParams {
             frequency_penalty: 0.0,
             seed: 0,
             ignore_eos: false,
+            thinking_budget: None,
         }
     }
 }

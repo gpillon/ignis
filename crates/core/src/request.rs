@@ -72,6 +72,9 @@ pub struct Request {
     /// leaves on [`crate::types::SchedEvent::Done`], beside the readout a
     /// decision leaves on. Empty on every request that is not a constrained decode.
     pub drawn: Vec<crate::constrained::Draw>,
+    /// Progress against the request's thinking budget
+    /// ([`crate::types::DecodeParams::thinking_budget`]).
+    pub thinking: crate::thinking_budget::BudgetState,
     /// The resources this request reserves while it holds a lane (core-05:
     /// the admission state machine's KV reservation, charged at deal and
     /// released at completion — the pool never over-allocates).
@@ -209,6 +212,7 @@ impl Request {
             readout: None,
             attention: None,
             drawn: Vec::new(),
+            thinking: crate::thinking_budget::BudgetState::default(),
             resources,
             remaining_work,
             backfill_epoch: 0,

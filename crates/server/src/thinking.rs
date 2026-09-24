@@ -302,6 +302,59 @@ pub fn parse_default_reasoning_effort(value: &str) -> Result<Option<ReasoningEff
     })
 }
 
+// ---------------------------------------------------------------------------
+// The thinking budget (2026-09-24, `ignis_core::thinking_budget`)
+// ---------------------------------------------------------------------------
+
+/// What the scheduler forces once a request's thinking budget is spent: the
+/// hand-off sentence Qwen's model card closes a budgeted block with, then the
+/// block's end marker and the line break before the answer. It opens with a
+/// line break so that the one token of it a natural close can still pick up
+/// (the leaf's one-round lag) is whitespace.
+pub const THINKING_CLOSE_TEXT: &str = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n";
+
+/// The reasoning block's end marker.
+pub const THINK_END_TEXT: &str = "</think>";
+
+/// The loaded model's close sequence, tokenized with its own tokenizer.
+/// Refused when `</think>` is not one token: then no budget can find where
+/// a block ends.
+pub fn thinking_close(
+    encode: impl Fn(&str) -> Result<Vec<u32>, String>,
+) -> Result<ignis_core::thinking_budget::ThinkingClose, String> {
+    let end = encode(THINK_END_TEXT)?;
+    let [think_end] = end[..] else {
+        return Err(format!("`{THINK_END_TEXT}` is {} tokens, not one", end.len()));
+    };
+    ignis_core::thinking_budget::ThinkingClose::new(encode(THINKING_CLOSE_TEXT)?, think_end)
+}
+
+/// A request's `thinking_budget`: absent or `null` falls back to the server
+/// default; otherwise a whole number of tokens, at least 1.
+pub fn resolve_thinking_budget(value: Option<&JsonValue>, default: Option<u32>) -> Result<Option<u32>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(default),
+        Some(JsonValue::Number(n)) => n
+            .as_u64()
+            .filter(|&n| n >= 1)
+            .and_then(|n| u32::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| format!("`thinking_budget` must be a whole number of tokens from 1 to {}, got {n}", u32::MAX)),
+        Some(other) => Err(format!("`thinking_budget` must be a whole number of tokens, got {other}")),
+    }
+}
+
+/// Parse `IGNIS_THINKING_BUDGET` / `--thinking-budget` (empty = no budget).
+pub fn parse_default_thinking_budget(value: &str) -> Result<Option<u32>, String> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    match value.parse::<u32>() {
+        Ok(n) if n >= 1 => Ok(Some(n)),
+        _ => Err(format!("IGNIS_THINKING_BUDGET must be a whole number of tokens, at least 1, got {value:?}")),
+    }
+}
+
 /// Refuse a default the loaded template cannot honour (a model swap must
 /// not silently change behaviour — the operator finds out at startup, not
 /// on the first request).
@@ -645,6 +698,38 @@ mod tests {
         )
         .expect("resolve");
         assert!(opts.preserve_thinking);
+    }
+
+    #[test]
+    fn the_close_is_tokenized_with_its_end_marker_as_one_token() {
+        // A toy encoder: one token per whitespace-separated piece, with the
+        // end marker its own piece.
+        let encode = |text: &str| -> Result<Vec<u32>, String> {
+            Ok(text
+                .replace("</think>", " </think> ")
+                .split_whitespace()
+                .map(|piece| if piece == "</think>" { 7 } else { piece.len() as u32 + 100 })
+                .collect())
+        };
+        let close = thinking_close(encode).expect("close");
+        assert_eq!(close.think_end(), 7);
+        assert_eq!(close.tokens().iter().filter(|&&t| t == 7).count(), 1);
+        let split = |_: &str| -> Result<Vec<u32>, String> { Ok(vec![1, 2]) };
+        assert!(thinking_close(split).unwrap_err().contains("not one"));
+    }
+
+    #[test]
+    fn a_thinking_budget_is_a_positive_whole_number_or_the_default() {
+        assert_eq!(resolve_thinking_budget(None, Some(8)), Ok(Some(8)));
+        assert_eq!(resolve_thinking_budget(Some(&json!(null)), None), Ok(None));
+        assert_eq!(resolve_thinking_budget(Some(&json!(4096)), Some(8)), Ok(Some(4096)));
+        for bad in [json!(0), json!(-1), json!(1.5), json!("64"), json!(true)] {
+            let err = resolve_thinking_budget(Some(&bad), None).unwrap_err();
+            assert!(err.contains("thinking_budget"), "{bad}: {err}");
+        }
+        assert_eq!(parse_default_thinking_budget(""), Ok(None));
+        assert_eq!(parse_default_thinking_budget("12000"), Ok(Some(12000)));
+        assert!(parse_default_thinking_budget("0").is_err());
     }
 
     #[test]

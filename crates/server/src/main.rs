@@ -165,7 +165,19 @@ fn cuda_scheduler(
         }),
         ..shape
     };
-    match ignis_server::runtime::cuda_scheduler(artifact_path, model.into(), eos, shape) {
+    // The thinking budget's forced close (2026-09-24), in this model's own
+    // tokens. A tokenizer that splits `</think>` leaves every budget inert,
+    // which is said once here rather than discovered per request.
+    let thinking_close = match ignis_server::thinking::thinking_close(|text| {
+        frontend.tokenizer().encode(text).map_err(|e| e.to_string())
+    }) {
+        Ok(close) => Some(std::sync::Arc::new(close)),
+        Err(error) => {
+            tracing::warn!(name: "ignis.model.thinking_close_unavailable", %error, "thinking budgets are inert");
+            None
+        }
+    };
+    match ignis_server::runtime::cuda_scheduler_with_thinking_close(artifact_path, model.into(), eos, shape, thinking_close) {
         Ok((scheduler, reserved)) => {
             tracing::info!(
                 name: "ignis.model.loaded",
@@ -253,6 +265,7 @@ async fn main() {
         model_download_path,
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
+        thinking_budget: default_thinking_budget,
         prefill_chunk: _,
         max_context,
         kv_format: _,
@@ -510,7 +523,9 @@ async fn main() {
         tracing::error!(name: "ignis.config.thinking_invalid", error = %err, "refusing to start");
         exit_after_flush(&logging_handle, 1);
     }
-    let server = server.with_thinking_defaults(default_enable_thinking, default_reasoning_effort);
+    let server = server
+        .with_thinking_defaults(default_enable_thinking, default_reasoning_effort)
+        .with_thinking_budget(default_thinking_budget);
 
     // The Playground (GitHub #163, ADR 0026): whatever this binary embedded
     // — the frontend build, or nothing, which serves the fallback page.

@@ -72,6 +72,7 @@ fn small_pool() -> SchedulerConfig {
         prompt_reuse: true,
         retained_slots: 16,
         retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
+        thinking_close: None,
     }
 }
 
@@ -437,6 +438,7 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             prompt_reuse: true,
             retained_slots: 16,
             retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
+            thinking_close: None,
         },
         compute.clone(),
     );

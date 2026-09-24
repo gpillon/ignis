@@ -292,6 +292,37 @@ default the model cannot honour is a refused start with a descriptive message,
 matching how the server already treats a missing EOS token or an unclean
 checksum.
 
+### Thinking budget (added 2026-09-24)
+
+`thinking_budget` is an ignis extension on `/v1/chat/completions` and
+`/v1/responses`: the most tokens a request may emit with its reasoning block
+still open. It is a whole number of at least 1. `null` or absent takes the
+server default (`--thinking-budget` / `IGNIS_THINKING_BUDGET`, unset = no
+budget), and anything else is a 400 naming the field. It applies only to a
+generation that starts inside the block: with thinking off it is inert.
+
+Once a request's budget is spent with the block open, the scheduler forces the
+model card's close, one token per round:
+
+```text
+\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n
+```
+
+It is tokenized once at load with the artifact's tokenizer, and it uses the
+constrained decode's single-token permitted sets (`ignis_core::thinking_budget`).
+Three consequences:
+
+- The leaf's one-round lag lets one freely drawn token through past the budget.
+  A speculative round can overshoot it by up to its width.
+- A request that closes its block by itself is never forced. One that closes it
+  inside the lag stops being forced, after at most the close's first token (a
+  line break).
+- The forced rounds are plain, non-speculative rounds for the whole batch, like a
+  constrained decode's.
+
+A tokenizer that splits `</think>` makes every budget inert, with one warning
+at load. Measured: `docs/findings/2026-09-24-reasoning-effort-on-coding-tasks.md`.
+
 ### Response separation — the split rule
 
 Reasoning is the text between the last `<think>` and the first `</think>`, with

@@ -517,6 +517,7 @@ impl SamplingRequestFields {
             // preserves the complete signed OpenAI seed domain bit-for-bit.
             seed: signed_integer("seed must be a signed 64-bit integer", self.seed, 0)? as u64,
             ignore_eos,
+            thinking_budget: None,
         })
     }
 }
@@ -585,6 +586,23 @@ fn resolve_thinking(
             "reasoning_effort_unsupported",
             message,
         ),
+    })
+}
+
+/// The request's thinking budget (2026-09-24) on its decode parameters, or
+/// the 400 for a malformed one. Set only on a generation that starts inside
+/// the reasoning block: with thinking off there is no block to close.
+fn with_thinking_budget(
+    server: &Server,
+    params: DecodeParams,
+    value: Option<&JsonValue>,
+    thinking: &ThinkingOptions,
+) -> Result<DecodeParams, Response> {
+    let budget = thinking::resolve_thinking_budget(value, server.default_thinking_budget)
+        .map_err(|message| bad_request(&message))?;
+    Ok(DecodeParams {
+        thinking_budget: budget.filter(|_| server.template.decoder_starts_in_reasoning(thinking)),
+        ..params
     })
 }
 
@@ -990,6 +1008,10 @@ struct ChatCompletionsRequest {
     reasoning_effort: Option<JsonValue>,
     preserve_thinking: Option<JsonValue>,
     chat_template_kwargs: Option<JsonValue>,
+    /// An ignis extension (2026-09-24): the reasoning tokens this request
+    /// may spend before the model's own close is forced. A whole number, at
+    /// least 1; absent or `null` takes the server's `--thinking-budget`.
+    thinking_budget: Option<JsonValue>,
     /// The tool definitions (GitHub #132) — opaque JSON, validated
     /// shallowly and passed to the template as-is (`resolve_tools`).
     tools: Option<Vec<JsonValue>>,
@@ -1022,7 +1044,7 @@ struct StreamOptions {
     tag = "chat",
     operation_id = "chat_completions",
     summary = "A chat completion, streaming or not",
-    description = "The OpenAI chat-completions contract, plus what ignis adds to it: `top_k`, `ignore_eos`, the thinking controls (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs`), and the `class` lane tag the scheduler admits under.
+    description = "The OpenAI chat-completions contract, plus what ignis adds to it: `top_k`, `ignore_eos`, the thinking controls (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs`, `thinking_budget`), and the `class` lane tag the scheduler admits under.
 
 `stream: false` answers one JSON body. `stream: true` answers `text/event-stream`: one `data:` line per chunk in the `chat.completion.chunk` shape, a final chunk carrying `finish_reason` and an empty `delta`, then a literal `data: [DONE]` line. With `stream_options.include_usage: true` a usage-only chunk (empty `choices`) precedes it.
 
@@ -1068,6 +1090,10 @@ async fn chat_completions(
         },
     ) {
         Ok(t) => t,
+        Err(response) => return response,
+    };
+    let params = match with_thinking_budget(&server, params, req.thinking_budget.as_ref(), &thinking) {
+        Ok(params) => params,
         Err(response) => return response,
     };
     let tools = match resolve_tools(req.tools, req.tool_choice) {
@@ -1618,6 +1644,8 @@ struct ResponsesRequest {
     reasoning_effort: Option<JsonValue>,
     preserve_thinking: Option<JsonValue>,
     chat_template_kwargs: Option<JsonValue>,
+    /// See the matching field on `ChatCompletionsRequest`.
+    thinking_budget: Option<JsonValue>,
     /// An ignis extension, not an OpenAI parameter (GitHub #120) — see the
     /// matching field on `ChatCompletionsRequest`.
     class: Option<JsonValue>,
@@ -1693,6 +1721,16 @@ async fn responses_api(
         Ok(t) => t,
         Err(response) => return response,
     };
+    let params = DecodeParams {
+        max_tokens: req.max_output_tokens,
+        temperature: req.temperature.unwrap_or(0.0),
+        seed: req.seed.unwrap_or(0),
+        ..DecodeParams::default()
+    };
+    let params = match with_thinking_budget(&server, params, req.thinking_budget.as_ref(), &thinking) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
         Ok(x) => x,
         Err(message) => return bad_request(&message),
@@ -1701,12 +1739,7 @@ async fn responses_api(
         &server,
         model,
         &messages,
-        DecodeParams {
-            max_tokens: req.max_output_tokens,
-            temperature: req.temperature.unwrap_or(0.0),
-            seed: req.seed.unwrap_or(0),
-            ..DecodeParams::default()
-        },
+        params,
         &thinking,
         // The responses API carries no `tools` field (GitHub #132: only
         // `/v1/chat/completions` gets tool-calling support, matching the

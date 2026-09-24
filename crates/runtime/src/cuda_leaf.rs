@@ -1227,6 +1227,7 @@ mod tests {
             // scheduler's own stop-condition switch, so `sampling_params`
             // below must not carry it into `step::SamplingParams`.
             ignore_eos: false,
+            thinking_budget: None,
         });
 
         assert_eq!(

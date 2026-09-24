@@ -113,16 +113,21 @@ impl TokenDecoder for RecordingTokenDecoder {
 struct Harness {
     app: axum::Router,
     template: Arc<RecordingTemplateProvider>,
+    compute: Arc<MockCompute>,
 }
 
 fn harness_with(template: RecordingTemplateProvider) -> Harness {
+    harness_with_budget(template, None)
+}
+
+fn harness_with_budget(template: RecordingTemplateProvider, default_budget: Option<u32>) -> Harness {
     let compute = Arc::new(MockCompute::new());
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
             ..SchedulerConfig::default()
         },
-        compute,
+        compute.clone(),
     );
     let template = Arc::new(template);
     // `Server::new` takes ownership of a boxed provider; the harness keeps
@@ -132,11 +137,23 @@ fn harness_with(template: RecordingTemplateProvider) -> Harness {
         Engine::new(Box::new(scheduler)),
         Box::new(SharedTemplate(Arc::clone(&template))),
     )
-    .with_request_timeout(Duration::from_secs(5));
+    .with_request_timeout(Duration::from_secs(5))
+    .with_thinking_budget(default_budget);
     Harness {
         app: server.app(),
         template,
+        compute,
     }
+}
+
+/// The thinking budget every decode round of the harness's requests carried.
+fn budgets(h: &Harness) -> Vec<Option<u32>> {
+    h.compute
+        .decode_calls()
+        .iter()
+        .flatten()
+        .map(|job| job.params.thinking_budget)
+        .collect()
 }
 
 async fn call(
@@ -286,6 +303,40 @@ async fn a_high_effort_reaches_a_qwen38_template_as_xhigh() {
     let options = h.template.captured_options();
     assert!(options[0].enable_thinking);
     assert_eq!(options[0].reasoning_effort, Some(ReasoningEffort::Xhigh));
+}
+
+#[tokio::test]
+async fn a_thinking_budget_reaches_the_decode_rounds_only_while_thinking() {
+    let h = harness_with_budget(RecordingTemplateProvider::permissive(HashMap::new()), Some(9000));
+    for (body, want) in [
+        (serde_json::json!({ "thinking_budget": 64 }), Some(64)),
+        // Absent: the server's `--thinking-budget`.
+        (serde_json::json!({}), Some(9000)),
+        // Thinking off: no block to close, whatever was asked.
+        (serde_json::json!({ "thinking_budget": 64, "enable_thinking": false }), None),
+    ] {
+        let before = budgets(&h).len();
+        let mut req = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 2 });
+        req.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+        let (status, response) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+        assert_eq!(status, 200, "{response}");
+        let seen = &budgets(&h)[before..];
+        assert!(!seen.is_empty() && seen.iter().all(|&b| b == want), "{body}: {seen:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_thinking_budget_is_a_400_naming_the_field() {
+    let h = harness_with(RecordingTemplateProvider::permissive(HashMap::new()));
+    for bad in [serde_json::json!(0), serde_json::json!(-5), serde_json::json!("64")] {
+        let req = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "thinking_budget": bad
+        });
+        let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+        assert_eq!(status, 400, "{bad}: {body}");
+        assert!(body.contains("thinking_budget"), "{body}");
+    }
 }
 
 #[tokio::test]

@@ -219,6 +219,10 @@ pub struct SchedulerConfig {
     /// an Agent's would, so conversations nobody is coming back to cannot
     /// hold KV-RAM against every subagent.
     pub retained_interactive_ttl: Duration,
+    /// The loaded model's way to close a reasoning block, which a request's
+    /// thinking budget forces once spent (2026-09-24,
+    /// [`crate::thinking_budget`]). `None` makes every budget inert.
+    pub thinking_close: Option<Arc<crate::thinking_budget::ThinkingClose>>,
 }
 
 /// The wall clock the scheduler reads (GitHub #190): `Instant::now` in
@@ -380,6 +384,7 @@ impl Default for SchedulerConfig {
             prompt_reuse: true,
             retained_slots: N_DECODE_LANES as u32,
             retained_interactive_ttl: DEFAULT_RETAINED_INTERACTIVE_TTL,
+            thinking_close: None,
         }
     }
 }
@@ -3474,9 +3479,25 @@ impl Scheduler for ConcreteScheduler {
             .filter(|&i| self.requests[i].remaining_work > 0)
             .collect();
         if !to_decode.is_empty() {
+            // The thinking budget's forced close (2026-09-24): a set only
+            // for a request past its budget with its block still open. A
+            // constrained decode's own schedule wins; the server never
+            // sets both.
+            let forced: Vec<Option<crate::constrained::PermittedSet>> = to_decode
+                .iter()
+                .map(|&i| {
+                    let close = self.config.thinking_close.as_deref()?;
+                    let r = &mut self.requests[i];
+                    if r.input.constrained.is_some() {
+                        return None;
+                    }
+                    r.thinking.permitted(r.input.params.thinking_budget, close, r.tokens)
+                })
+                .collect();
             let jobs: Vec<DecodeJob> = to_decode
                 .iter()
-                .map(|&i| DecodeJob {
+                .zip(forced)
+                .map(|(&i, forced)| DecodeJob {
                     request: self.requests[i].id,
                     lane: self.requests[i].lane.expect("running requests hold a lane"),
                     params: self.requests[i].input.params,
@@ -3487,9 +3508,12 @@ impl Scheduler for ConcreteScheduler {
                     // tokens draws step `n + 1` here. The last round asks for
                     // a step past the end and gets `None`: its draw is
                     // discarded with the sequence.
-                    permitted: self.requests[i].input.constrained.as_ref().and_then(|schedule| {
-                        schedule.step(self.requests[i].tokens as usize + 1)
-                    }),
+                    permitted: self.requests[i]
+                        .input
+                        .constrained
+                        .as_ref()
+                        .and_then(|schedule| schedule.step(self.requests[i].tokens as usize + 1))
+                        .or(forced),
                 })
                 .collect();
             match self.compute.decode_step(&jobs) {
@@ -3546,6 +3570,10 @@ impl Scheduler for ConcreteScheduler {
                                 self.requests[i]
                                     .drawn
                                     .push(crate::constrained::Draw { token, probability });
+                            }
+                            if let Some(close) = self.config.thinking_close.as_deref() {
+                                let index = self.requests[i].tokens;
+                                self.requests[i].thinking.commit(close, index, token);
                             }
                             self.requests[i].tokens += 1;
                             // Service-work decay (core-05): one quantum per

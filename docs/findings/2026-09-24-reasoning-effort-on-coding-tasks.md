@@ -1,4 +1,4 @@
-# At `xhigh`, Qwen3.8 thinks twice as long as at `medium` and half its coding answers never arrive inside 16K tokens
+# At `xhigh`, Qwen3.8 thinks twice as long as at `medium` and half its coding answers never arrive inside 16K tokens; an 8K thinking budget takes it to 15 of 16
 
 - Kind: experiment
 - Status: current
@@ -43,6 +43,17 @@ wall time, and does the extra thinking buy correct answers?
 | `medium` | 13/16 | 2 | 13/14 | 2,998 | 5,166 | 21.4 s | 4.41 |
 | `xhigh` | **8/16** | **7** | 8/9 | 11,138 | 9,350 | 125.4 s | **3.03** |
 
+**With a thinking budget** (`thinking_budget: 8192`, the scheduler forcing the model
+card's close; same seeds, same server build otherwise; `results/sweep_budget8k*.json`):
+
+| effort | pass | budget forced | hit the 16K cap | median tokens | median wall |
+|---|---:|---:|---:|---:|---:|
+| `xhigh` + 8K budget | **15/16** | 8 (all 8 pass) | 0 | 7,201 | 69.8 s |
+| `medium` + 8K budget | 13/16 | 3 | 0 | 2,998 | 20.0 s |
+
+The runs the budget did not touch are the unbudgeted runs token for token: same seeds,
+the same failure (`lru` seed 1).
+
 **The capped runs are not loops.** Every one is still reasoning at 16K tokens,
 with 0.81–1.0 unique lines in its last 6,000 characters. It enumerates edge cases
 against tests that do not exist ("Potential problem: If hidden test expects
@@ -61,7 +72,11 @@ against tests that do not exist ("Potential problem: If hidden test expects
 `low`/`medium` and 3.0 at `xhigh`, against 5.43 greedy on the quick-wins coding
 prompts. `xhigh` is both longer and slower per token.
 
-**Inference.** For a coding agent, `xhigh` buys no correctness on tasks of this size
+**Observed.** A forced close does not cost the answer. All eight `xhigh` runs that
+reached 8K tokens of reasoning answered correctly once the block was closed for them.
+Seven of those eight were the runs that never answered without the budget.
+
+**Inference.** Unbudgeted, `xhigh` buys no correctness on tasks of this size
 and costs 4–5× the latency. It also risks a turn with no answer when the client caps
 `max_tokens`. That is the template's default, and it is what `high` now resolves to.
 
@@ -71,11 +86,15 @@ and costs 4–5× the latency. It also risks a turn with no answer when the clie
   template's `xhigh`. This is a server-default decision (`IGNIS_REASONING_EFFORT` /
   `--reasoning-effort`, today unset, so `xhigh`). It is **not changed** by this
   finding and waits for the owner.
-- A thinking budget would recover the capped runs: each had a correct plan long
-  before 16K. The Qwen way closes the block with a forced `</think>`. The constrained
-  decode's permitted-set schedule (`crates/core/src/constrained.rs`) already forces
-  single tokens, so a budget can be a schedule of singletons armed at N reasoning
-  tokens. That was not built here.
+- A thinking budget recovers the capped runs, and is built:
+  - `thinking_budget` on the request, `--thinking-budget` / `IGNIS_THINKING_BUDGET`
+    as the server default;
+  - spec `server/04` §"Thinking budget", `crates/core/src/thinking_budget.rs`.
+
+  `xhigh` + 8K budget gave the best pass rate measured (15/16) at about half
+  unbudgeted `xhigh`'s wall time. `medium` stays ~3.5× faster. Which pair is the
+  default is the owner's call. Both are measured-better than today's unset default:
+  `xhigh` with no budget.
 - Thinking is 73.5% of real agent output (copy-drafting finding). Cutting it is a
   bigger throughput lever than any drafter change measured so far.
 
