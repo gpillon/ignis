@@ -241,7 +241,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
 - `thinking_budget` is an **Ignis extension**: the reasoning tokens this
   request may spend before its close is forced. Absent takes
   `--thinking-budget`, `0` means no budget, and `reasoning_effort: "max"`
-  ignores it and runs with no budget. The budget always leaves 1,500 tokens of
+  ignores it and runs with no budget. The budget always leaves 2,048 tokens of
   `max_tokens` for the answer. A forced close is reported as
   `thinking_budget_forced_at` on the choice (on the finish chunk when
   streaming; top-level on `/v1/responses`): the reasoning tokens emitted when

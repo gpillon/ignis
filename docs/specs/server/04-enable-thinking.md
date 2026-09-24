@@ -312,9 +312,9 @@ server's) there is no budget at all, and a valid `thinking_budget` on the
 request is ignored rather than refused.
 
 The budget always leaves the answer room: the scheduler runs a request under
-`min(budget, generation − 1500)`, where `generation` is `max_tokens`, or,
+`min(budget, generation − 2048)`, where `generation` is `max_tokens`, or,
 when the request sets none, what the context leaves after the prompt. No room
-above the 1,500-token reserve means no budget. A forced close is reported as
+above the 2,048-token reserve means no budget. A forced close is reported as
 `thinking_budget_forced_at` (the reasoning tokens emitted when it began) on
 the choice, on the streaming finish chunk, and on the `/v1/responses` object,
 and is absent otherwise. Server/08 has the request-log attributes and the

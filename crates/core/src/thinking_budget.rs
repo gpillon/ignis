@@ -32,10 +32,12 @@ use crate::types::TokenId;
 /// answer (spec server/08): a close forced so late that the answer after it
 /// is cut by `max_tokens` is a turn with no answer all the same.
 ///
-/// Sized from the 2026-09-24 coding sweep, whose longest answer was 4,664
-/// characters, ~1,300 tokens
-/// (`docs/findings/2026-09-24-reasoning-effort-on-coding-tasks.md`).
-pub const ANSWER_RESERVE: u32 = 1500;
+/// Measured (#265, `docs/findings/2026-09-24-thinking-budget-default.md`):
+/// the longest answer after a close on the coding sweep was ~1,650 tokens,
+/// and the reserve also holds the close itself (~25 tokens) and a
+/// speculative round's overshoot past the budget (up to its width). 2,048
+/// covers them with a quarter to spare.
+pub const ANSWER_RESERVE: u32 = 2048;
 
 /// The budget a request actually runs under: what it asked for, clamped so
 /// that [`ANSWER_RESERVE`] tokens of its `generation` (the tokens it may
