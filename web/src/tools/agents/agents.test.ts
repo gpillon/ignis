@@ -23,6 +23,7 @@ const settings: Settings = {
   topP: 0.95,
   maxTokens: 100,
   reasoningEffort: "xhigh",
+  thinkingBudget: null,
   laneTag: "interactive",
 };
 
@@ -286,5 +287,53 @@ describe("agents with tools", () => {
     const [byDefault] = await keepCalling();
     expect(calls).toBe(MAX_AGENT_TOOL_ROUNDS + 1);
     expect(byDefault).toMatchObject({ status: "failed", error: expect.stringMatching(/at most 16 times/) });
+  });
+});
+
+describe("agents and the thinking budget", () => {
+  const webTools: ToolExtras = { ignisPrompt: WEB_IGNIS_PROMPT, tools: [WEB_SEARCH_TOOL] };
+  const doneWeb: typeof runWeb = async (tasks, o) =>
+    tasks.map((t) => {
+      const run: WebRun = { ...t, status: "done", results: [] };
+      o.onUpdate(run);
+      return run;
+    });
+
+  /** The bodies of every request two agents make, the second request of each after one web search. */
+  async function bodiesFor(budgeted: Settings) {
+    const bodies: ChatRequest[] = [];
+    const stream = async (o: StreamOptions): Promise<StreamResult> => {
+      const body = o.body as ChatRequest;
+      bodies.push(body);
+      if (body.messages.at(-1)?.role === "user") {
+        o.onEvent({ kind: "tool_call", call: { id: `w${bodies.length}`, name: "web_search", arguments: '{"query":"q"}' } });
+      }
+      return { ok: true, timeline: timeline() };
+    };
+    await runAgents([task(1), task(2)], {
+      settings: budgeted,
+      tools: webTools,
+      signal: new AbortController().signal,
+      onUpdate: () => {},
+      stream,
+      runWeb: doneWeb,
+    });
+    return bodies;
+  }
+
+  it("sends the turn's budget on every request of every agent, its tool rounds included", async () => {
+    const bodies = await bodiesFor({ ...settings, thinkingBudget: 4096 });
+    expect(bodies).toHaveLength(4);
+    expect(bodies.map((b) => b.thinking_budget)).toEqual([4096, 4096, 4096, 4096]);
+  });
+
+  it("sends 0 when the turn has no budget, and nothing on the server default", async () => {
+    expect((await bodiesFor({ ...settings, thinkingBudget: 0 })).map((b) => b.thinking_budget)).toEqual([0, 0, 0, 0]);
+    expect((await bodiesFor({ ...settings, thinkingBudget: null })).every((b) => !("thinking_budget" in b))).toBe(true);
+  });
+
+  it("sends an agent no budget under the max effort, as the turn itself", async () => {
+    const bodies = await bodiesFor({ ...settings, reasoningEffort: "max", thinkingBudget: 4096 });
+    expect(bodies.every((b) => b.reasoning_effort === "max" && !("thinking_budget" in b))).toBe(true);
   });
 });

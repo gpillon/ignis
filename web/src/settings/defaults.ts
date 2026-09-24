@@ -9,7 +9,9 @@ export const DEFAULT_SETTINGS: PlaygroundSettings = {
   topP: 0.95,
   maxTokens: 16384,
   reasoningEffort: "xhigh",
+  // The server's own default: the Playground sends no budget until one is picked.
+  thinkingBudget: null,
   laneTag: "interactive",
 };
 
-export const EFFORT_LABELS: Record<ReasoningEffort, string> = { none: "Off", low: "Low", medium: "Medium", xhigh: "X-high" };
+export const EFFORT_LABELS: Record<ReasoningEffort, string> = { none: "Off", low: "Low", medium: "Medium", xhigh: "X-high", max: "Max" };

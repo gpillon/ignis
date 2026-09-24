@@ -68,6 +68,7 @@ const settings: Settings = {
   topP: 0.9,
   maxTokens: 512,
   reasoningEffort: "xhigh",
+  thinkingBudget: null,
   laneTag: "agent",
 };
 
@@ -198,5 +199,32 @@ describe("buildChatRequest", () => {
   it("leaves max_tokens out when unset, so the engine's own cap applies", () => {
     const body = buildChatRequest({ ...settings, maxTokens: null }, [{ role: "user", content: "hi" }]);
     expect("max_tokens" in body).toBe(false);
+  });
+});
+
+describe("buildChatRequest and the thinking budget", () => {
+  const hi = [{ role: "user" as const, content: "hi" }];
+
+  it("leaves thinking_budget out on the server default, so the operator's --thinking-budget applies", () => {
+    expect("thinking_budget" in buildChatRequest({ ...settings, thinkingBudget: null }, hi)).toBe(false);
+  });
+
+  it("sends 0 for no budget, and a token count as that count", () => {
+    expect(buildChatRequest({ ...settings, thinkingBudget: 0 }, hi).thinking_budget).toBe(0);
+    expect(buildChatRequest({ ...settings, thinkingBudget: 4096 }, hi).thinking_budget).toBe(4096);
+  });
+
+  it("sends no budget with thinking off, whatever the setting holds", () => {
+    const body = buildChatRequest({ ...settings, reasoningEffort: "none", thinkingBudget: 4096 }, hi);
+    expect(body.reasoning_effort).toBe("none");
+    expect("thinking_budget" in body).toBe(false);
+  });
+
+  it("sends the max effort without any thinking_budget, a number or 0, since max ignores both", () => {
+    for (const thinkingBudget of [null, 0, 2048]) {
+      const body = buildChatRequest({ ...settings, reasoningEffort: "max", thinkingBudget }, hi);
+      expect(body.reasoning_effort).toBe("max");
+      expect("thinking_budget" in body).toBe(false);
+    }
   });
 });
