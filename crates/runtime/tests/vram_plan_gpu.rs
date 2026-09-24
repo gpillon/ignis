@@ -159,16 +159,32 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
     assert_eq!(text.media_embedding, 0);
     assert!(with_vision.media_embedding > 0, "the media embedding keeps its own reservation");
 
-    // A short context caps the envelope below the prefill scratch: vision
-    // then grows the arena by the attention readout alone (GitHub #260) —
-    // one f32 per envelope token, the envelope capped by the context — and
-    // the head set's results beside it (GitHub #263): 8 bytes for each of
-    // the 384 heads a set may name.
+    // Where the prefill scratch is the larger, vision grows the arena by the
+    // attention readout alone (GitHub #260) -- one f32 per token of an item
+    // -- and the head set's buffers beside it: for each of the 384 heads a
+    // set may name, its packed result (8 bytes, GitHub #263) and its four
+    // neighbour scores (16 bytes, GitHub #264).
+    const HEAD_SET_BYTES: u64 = 16 * 24 * (8 + 16);
+
+    // The serving load's item bound: this artifact's processor lets no item
+    // through past 16,384 merged tokens, and the encoder holds one at a
+    // time. Sized for that, the encoder falls below the prefill scratch --
+    // where the unbounded envelope reserved 2,219,837,184 B.
+    const ITEM_BOUND: u32 = 16_384;
+    let bounded = reserved(1024, MAX_CONTEXT, Some(vision.with_item_max_tokens(ITEM_BOUND)));
+    assert_eq!(
+        bounded.workspace,
+        text.workspace + u64::from(ITEM_BOUND) * 4 + HEAD_SET_BYTES,
+        "an item-bounded encoder fits the prefill scratch"
+    );
+    assert_eq!(bounded.media_embedding, with_vision.media_embedding, "the pool keeps the envelope's floor");
+
+    // A short context caps the envelope, and with it the item, below the
+    // prefill scratch the same way.
     const SHORT_CONTEXT: u32 = 2048;
-    const HEAD_SET_RESULTS: u64 = 16 * 24 * 8;
     assert_eq!(
         reserved(1024, SHORT_CONTEXT, Some(vision)).workspace,
-        reserved(1024, SHORT_CONTEXT, None).workspace + u64::from(SHORT_CONTEXT) * 4 + HEAD_SET_RESULTS,
+        reserved(1024, SHORT_CONTEXT, None).workspace + u64::from(SHORT_CONTEXT) * 4 + HEAD_SET_BYTES,
         "the prefill scratch already fits the encoder, and a head point's readout beside it"
     );
 }

@@ -8,12 +8,12 @@
 // 0010 vendored one, called in the reference's order
 // (`impl/runtime/vision_context_impl.h`, `VisionContext::encode`).
 //
-// Everything runs out of the reservations `ignis_model_load` made for the
-// envelope: the load's scratch arena for the intermediates, the output
-// transient for the result. No allocation happens here. GitHub #212: that
-// arena is the one prefill steps use, sized for the larger of the two; an
-// encode runs between prefill steps, never inside one, so the two never
-// hold it at once.
+// Everything runs out of the reservations `ignis_model_load` made: the load's
+// scratch arena, sized for one item of the load's item bound, for the
+// intermediates, and the embedding pool for the result. No allocation
+// happens here. GitHub #212: that arena is the one prefill steps use, sized
+// for the larger of the two; an encode runs between prefill steps, never
+// inside one, so the two never hold it at once.
 
 #include "ignis_step.h"
 
@@ -296,10 +296,13 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     return -1;
   }
   const std::uint64_t tokens = t * h * w / kVisionMergeUnit;
-  const std::uint64_t envelope = std::min(model->vision_max_tokens, model->max_context_tokens);
-  if (tokens > envelope) {
+  // The workspace holds one item of the load's item bound (never above the
+  // envelope), so that is the bound an item is checked against.
+  const std::uint64_t item_bound =
+      std::min(model->vision_item_max_tokens, model->max_context_tokens);
+  if (tokens > item_bound) {
     set_error("ignis_media_encode: an item of " + std::to_string(tokens) +
-              " merged tokens exceeds the load's vision envelope of " + std::to_string(envelope));
+              " merged tokens exceeds the load's vision item bound of " + std::to_string(item_bound));
     return -1;
   }
   if (t > static_cast<std::uint64_t>(std::min<std::uint64_t>(tokens, kVisionMaxSegments))) {
@@ -324,7 +327,7 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     const std::int32_t want = pool.pages_for(embedding->columns);
     embedding->pages = pool.take(want, embedding.get());
     if (embedding->pages.empty() && want > 0) {
-      // The envelope check above already refused an item the pool could
+      // The item bound check above already refused an item the pool could
       // never hold, so this is only "not right now": the caller releases
       // something and calls again.
       set_error("ignis_media_encode: an item of " + std::to_string(tokens) +

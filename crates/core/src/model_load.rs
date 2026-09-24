@@ -103,6 +103,8 @@ pub(crate) mod ffi {
         pub rope_scaling_temperature: f32,
         pub rope_scaling_beta_fast: f32,
         pub rope_scaling_beta_slow: f32,
+        /// The most merged tokens one vision item may hold; 0 = the envelope.
+        pub vision_item_max_tokens: u32,
     }
 
     /// 1:1 with `struct ignis_model_reservations` (GitHub #210): every
@@ -319,6 +321,7 @@ fn load_options(
             rope_scaling_temperature: rope_scaling.temperature(),
             rope_scaling_beta_fast: rope_scaling.beta_fast(),
             rope_scaling_beta_slow: rope_scaling.beta_slow(),
+            vision_item_max_tokens: vision.map_or(0, |v| v.item_max_tokens()),
         }
     })
 }
@@ -867,14 +870,30 @@ mod tests {
     }
 
     #[test]
+    fn a_vision_item_bound_crosses_beside_the_envelope() {
+        let bounded = Vision::new(32_768).unwrap().with_item_max_tokens(16_384);
+        let options = load_options(None, Some(bounded), RopeScaling::NONE).expect("options");
+        assert_eq!(options.vision_max_tokens, 32_768, "the envelope is still the request's");
+        assert_eq!(options.vision_item_max_tokens, 16_384);
+        // No bound named: 0, which the leaf reads as "the envelope".
+        let unbounded = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE)
+            .expect("options");
+        assert_eq!(unbounded.vision_item_max_tokens, 0);
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        let text = load_options(Some(spec), None, RopeScaling::NONE).expect("options");
+        assert_eq!(text.vision_item_max_tokens, 0, "no vision, no item bound");
+    }
+
+    #[test]
     fn the_options_mirror_is_the_leaf_structs_size() {
         // uint32 size, int32 backend, uint32 draft_tokens, uint32
         // vision_max_tokens, (GitHub #243) uint64 pool bytes — which the four
-        // uint32s above align for free — and (GitHub #227) four float rope
-        // scalars.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 40);
-        // uint64 x 3.
-        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 24);
+        // uint32s above align for free — (GitHub #227) four float rope
+        // scalars, and the uint32 vision item bound, padded to the struct's
+        // 8-byte alignment.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 48);
+        // uint64 x 3, then (GitHub #210) the six uint64 reservation lines.
+        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 72);
     }
 
     #[test]

@@ -347,8 +347,12 @@ Vision is a load option too (GitHub #177): `--vision` (with
 `--vision-max-tokens N`, default 32,768 merged tokens) binds the 333 `vision/*`
 objects in their stored Q4/Q5/Q6/W8/BF16 formats and reserves, inside
 `ignis_model_load` and so before the sequence pool is built, the encoder
-workspace and one item's `[5120, V]` output transient for
-`V = min(max_context, N)`. The encoder workspace is not an arena of its own
+workspace for one item of `min(item bound, V)` and the embedding pool floored
+at one `[5120, V]` item for `V = min(max_context, N)`. The item bound is the
+processor's (`ProcessorOptions::max_item_tokens`, 16,384 for this artifact),
+which the server hands to the load as `vision_item_max_tokens`;
+`kernel/tests/test_vision_workspace.cpp` pins the encoder's workspace for a
+32,768-token item. The encoder workspace is not an arena of its own
 (GitHub #212): the prefill scratch is sized for the larger of the two, and
 the VRAM plan shows it as one `workspace` line. `ignis.runtime.kv_pool`
 reports what vision adds — the output transient plus the scratch's growth —

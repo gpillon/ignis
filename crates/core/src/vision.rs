@@ -3,9 +3,9 @@
 //!
 //! Like speculation, vision is engine residency, chosen at load and frozen for
 //! the life of that load: with a [`Vision`], the `vision/*` objects are bound
-//! in their stored formats and the leaf reserves the encoder workspace (inside
-//! the prefill scratch, GitHub #212) and one item's output transient for the
-//! envelope, before the sequence pool exists.
+//! in their stored formats and the leaf reserves the encoder workspace for one
+//! item (inside the prefill scratch, GitHub #212) and the embedding pool for
+//! the envelope, before the sequence pool exists.
 //! `None` is today's engine — nothing vision-related is bound or allocated.
 //!
 //! GitHub #178 adds what a multimodal request carries through the scheduler
@@ -65,6 +65,9 @@ pub const DEFAULT_EMBEDDING_POOL_BYTES: u64 = 0;
 pub struct Vision {
     max_tokens: u32,
     pool_bytes: u64,
+    /// The most merged tokens one item may hold; 0 = none named, which the
+    /// leaf reads as the envelope.
+    item_max_tokens: u32,
 }
 
 /// A vision envelope outside `1..=VISION_MAX_TOKENS_LIMIT`.
@@ -88,6 +91,7 @@ impl Default for Vision {
         Self {
             max_tokens: DEFAULT_VISION_MAX_TOKENS,
             pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
+            item_max_tokens: 0,
         }
     }
 }
@@ -102,6 +106,7 @@ impl Vision {
         Ok(Self {
             max_tokens,
             pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
+            item_max_tokens: 0,
         })
     }
 
@@ -116,6 +121,21 @@ impl Vision {
     /// number, which is what the VRAM plan carries.
     pub fn with_pool_bytes(self, pool_bytes: u64) -> Self {
         Self { pool_bytes, ..self }
+    }
+
+    /// The same envelope with one item bounded at `item_max_tokens` merged
+    /// tokens — the processor's own bound
+    /// (`ProcessorOptions::max_item_tokens`), which it refuses any item past.
+    /// The encoder only ever holds one item, so the leaf sizes its workspace
+    /// for one of these rather than for the whole envelope; the embedding
+    /// pool, which holds a request's items, keeps the envelope's floor.
+    pub fn with_item_max_tokens(self, item_max_tokens: u32) -> Self {
+        Self { item_max_tokens, ..self }
+    }
+
+    /// The item bound the load option carries; 0 when none was named.
+    pub fn item_max_tokens(&self) -> u32 {
+        self.item_max_tokens
     }
 
     /// The configured envelope, in merged vision tokens.
@@ -687,6 +707,17 @@ mod tests {
         let big = Vision::default().with_pool_bytes(335_544_320 + 1);
         assert_eq!(big.pool_bytes(262_144), 335_544_320 + EMBEDDING_PAGE_BYTES);
         assert_eq!(big.pool_pages(262_144), 257);
+    }
+
+    #[test]
+    fn an_item_bound_sizes_the_encoder_and_leaves_the_pool_alone() {
+        assert_eq!(Vision::default().item_max_tokens(), 0, "no bound named: the leaf reads the envelope");
+        let bounded = Vision::default().with_item_max_tokens(16_384);
+        assert_eq!(bounded.item_max_tokens(), 16_384);
+        assert_eq!(bounded.max_tokens(), 32_768, "the request's envelope does not move");
+        // The pool holds a request's items, so its floor stays one
+        // envelope-wide item whatever one item may be.
+        assert_eq!(bounded.pool_bytes(262_144), Vision::default().pool_bytes(262_144));
     }
 
     #[test]

@@ -847,6 +847,10 @@ struct LoadOptions {
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   uint32_t vision_max_tokens = 0;
+  // The most merged tokens one item may hold, already resolved against the
+  // envelope by `validate_and_bind` (never above it; the envelope itself
+  // when the caller named no bound). 0 without vision.
+  uint32_t vision_item_max_tokens = 0;
   // GitHub #243: the embedding pool's bytes, already floored at the
   // envelope's own output by `validate_and_bind`.
   uint64_t vision_embedding_pool_bytes = 0;
@@ -932,6 +936,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   uint32_t vision_max_tokens = 0;
+  uint32_t vision_item_max_tokens = 0;
   uint64_t vision_embedding_pool_request = 0;
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
@@ -943,6 +948,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     speculative_backend = options->speculative_backend;
     draft_tokens = options->draft_tokens;
     vision_max_tokens = options->vision_max_tokens;
+    vision_item_max_tokens = options->vision_item_max_tokens;
     vision_embedding_pool_request = options->vision_embedding_pool_bytes;
     rope_scaling.factor = options->rope_scaling_factor;
     rope_scaling.temperature = options->rope_scaling_temperature;
@@ -967,6 +973,13 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   if (vision_max_tokens == 0 && vision_embedding_pool_request != 0) {
     set_error("ignis_model_load: vision_embedding_pool_bytes " +
               std::to_string(vision_embedding_pool_request) + " needs vision_max_tokens");
+    return nullptr;
+  }
+  // The same contradiction for the item bound: it bounds items of an
+  // envelope, and without one there are none.
+  if (vision_max_tokens == 0 && vision_item_max_tokens != 0) {
+    set_error("ignis_model_load: vision_item_max_tokens " + std::to_string(vision_item_max_tokens) +
+              " needs vision_max_tokens");
     return nullptr;
   }
   if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
@@ -998,6 +1011,11 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.speculative_backend = speculative_backend;
   out.draft_tokens = draft_tokens;
   out.vision_max_tokens = vision_max_tokens;
+  // An item never holds more than its request may: no bound, or one past
+  // the envelope, is the envelope.
+  out.vision_item_max_tokens = vision_item_max_tokens == 0
+                                   ? vision_max_tokens
+                                   : std::min(vision_item_max_tokens, vision_max_tokens);
   out.vision_embedding_pool_bytes = vision_embedding_pool_request;
   out.rope_scaling = rope_scaling;
 
@@ -1135,25 +1153,33 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
         dflash2_prefill_scratch_bytes(topology, static_cast<std::int32_t>(prefill_chunk_tokens));
   }
 
-  // GitHub #177: the encoder workspace for the envelope's merged tokens
-  // (capped by the context), and GitHub #243 the embedding pool.
+  // GitHub #177: the encoder workspace for one item's merged tokens, and
+  // GitHub #243 the embedding pool for the envelope's -- both capped by the
+  // context. The encoder only ever holds one item, and an item is bounded by
+  // the load's item bound, never past the envelope.
   if (options.vision_max_tokens > 0) {
     const auto tokens =
         static_cast<std::int32_t>(std::min(options.vision_max_tokens, max_context_tokens));
+    const auto item_tokens =
+        static_cast<std::int32_t>(std::min(options.vision_item_max_tokens, max_context_tokens));
     // GitHub #260 (ADR 0038): a head point's attention readout scores one
     // image's placeholder span from the prefill chunk's own scope -- one F32
-    // per key, and an image holds at most the envelope's tokens. Only a
-    // vision load can be asked one (the span is an image's), so a text load
+    // per key, and an image holds at most one item's tokens. Only a vision
+    // load can be asked one (the span is an image's), so a text load
     // reserves nothing for it.
     //
     // GitHub #263 (ADR 0039): and beside them the head set's results, one
     // packed (score, key) per head, reserved for the largest set a readout
-    // may name -- under 4 KB.
+    // may name -- under 4 KB -- and (GitHub #264) the four neighbour scores
+    // per head that ride with it, 6 KB more. `step.cu` takes all three from
+    // this arena; the neighbours went unreserved until the encoder stopped
+    // sizing the arena past the prefill scratch, which had hidden them.
     sizes.attention_readout =
-        fp32_bytes(tokens) +
-        round_up_arena_align(static_cast<std::size_t>(kReadoutMaxSetHeads) * sizeof(unsigned long long));
+        fp32_bytes(item_tokens) +
+        round_up_arena_align(static_cast<std::size_t>(kReadoutMaxSetHeads) * sizeof(unsigned long long)) +
+        round_up_arena_align(static_cast<std::size_t>(kReadoutMaxSetHeads) * 4 * sizeof(float));
     sizes.vision_workspace =
-        ignis_vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
+        ignis_vision_workspace_bytes(item_tokens, std::min(item_tokens, kVisionMaxSegments));
     sizes.media_embedding =
         vision_embedding_pool_bytes(g.hidden, tokens, options.vision_embedding_pool_bytes);
   }
@@ -1328,6 +1354,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // of the two sized it.
   const std::size_t scratch_bytes = sizes.workspace();
   const auto vision_tokens = std::min(vision_max_tokens, max_context_tokens);
+  const auto vision_item_tokens = std::min(load.vision_item_max_tokens, max_context_tokens);
   const bool encoder_sized = sizes.vision_workspace > sizes.prefill_scratch;
 
   std::size_t free_bytes = 0;
@@ -1335,13 +1362,14 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   const cudaError_t mem_err = cudaMemGetInfo(&free_bytes, &total_bytes);
   if (mem_err == cudaSuccess && scratch_bytes > free_bytes) {
     const std::string sized_by =
-        encoder_sized ? "the vision encoder's workspace for a " + std::to_string(vision_tokens) +
-                            "-token envelope"
+        encoder_sized ? "the vision encoder's workspace for a " + std::to_string(vision_item_tokens) +
+                            "-token item"
                       : "a " + std::to_string(prefill_chunk_tokens) + "-token prefill chunk";
     set_error("ignis_model_load: " + sized_by + " needs a " + std::to_string(scratch_bytes) +
               "-byte scratch reservation, but only " + std::to_string(free_bytes) +
               " bytes are free -- " +
-              (encoder_sized ? "lower --vision-max-tokens" : "pick a smaller prefill chunk width"));
+              (encoder_sized ? "lower --vision-max-tokens below the item bound"
+                             : "pick a smaller prefill chunk width"));
     cudaStreamDestroy(model->stream);
     model->stream = nullptr;
     return -1;
@@ -1364,6 +1392,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // that does not fit the free memory fails the load naming it.
   if (vision_max_tokens > 0) {
     model->vision_max_tokens = vision_max_tokens;
+    model->vision_item_max_tokens = load.vision_item_max_tokens;
     try {
       const std::size_t output_bytes = sizes.media_embedding;
       std::size_t vision_free = 0;

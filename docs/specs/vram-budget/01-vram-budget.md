@@ -387,6 +387,33 @@ Term: **retained slot**. Builds on slice 4's pool slots and counter.
   with less free memory than the scratch, and since #210 the plan refuses
   that start first.
 
+**Sharpened 2026-09-24: the encoder is sized for one item, not a request.**
+
+- The envelope bounds a request, but media encode holds one item at a time,
+  and the processor already bounds an item at its `longest_edge` over the
+  32 x 32 pixels of a merged token: 16,384 tokens for this artifact's
+  4096 x 4096 bound, half the default envelope. The server now hands that
+  bound to the load (`vision_item_max_tokens` in `ignis_model_load_options`,
+  `Vision::with_item_max_tokens`). The workspace and a head readout's scores
+  are sized for one item of `min(bound, envelope, context)`. The embedding
+  pool keeps the envelope's floor. The processor refuses an item past the
+  bound (`max_item_tokens`), which covers the one case `smart_resize` can
+  round past its pixel bound, and `ignis_media_encode` checks the same bound.
+- The BF16 patch plane gets its own layout scope. The patch embedding is
+  its only reader, so the blocks reuse its bytes. That is 402,653,184 B at a
+  32,768-token item: `test_vision_workspace` pins 1,817,184,000 B against
+  the 2,219,837,184 B above.
+- Together at `make start` defaults: vision's workspace falls below the
+  prefill scratch. The `workspace` line goes from 2,219,837,184 B to the
+  prefill scratch plus a 16,384-token readout and the head set's buffers
+  (1,481,977,088 B), 737,860,096 B less, and `vram_plan_gpu` pins it. No
+  image is refused that was accepted before, because no image ever came out
+  of the processor past 16,384 tokens.
+- That exposed a gap the encoder's excess had hidden. `step.cu` takes a head
+  set's neighbour scores (GitHub #264, 16 B a head) from the same arena, and
+  the plan never reserved them. It does now: 384 heads x (8 + 16) B beside
+  the readout.
+
 ### Slice 7 — KV-RAM as one pinned arena
 
 - **One arena for the tier.** Use the vendored `HostPinnedArena`

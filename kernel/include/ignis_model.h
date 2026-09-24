@@ -141,9 +141,9 @@ struct ignis_model_load_options {
   uint32_t draft_tokens;
   /* The vision envelope in merged vision tokens per request (GitHub #177);
    * 0 = no vision. Nonzero binds every `vision/*` tensor and reserves, at
-   * load, the encoder workspace for V = min(max_context_tokens,
-   * vision_max_tokens) and the embedding pool below -- before the caller
-   * builds its sequence pool. The workspace is not an arena of
+   * load, the encoder workspace for one item (of `vision_item_max_tokens`
+   * below, never past V = min(max_context_tokens, vision_max_tokens)) and
+   * the embedding pool below -- before the caller builds its sequence pool. The workspace is not an arena of
    * its own (GitHub #212): the load's scratch arena is sized for the larger
    * of a prefill chunk's scratch and the encoder's workspace, and media
    * encode runs out of it between prefill steps. At most
@@ -181,6 +181,15 @@ struct ignis_model_load_options {
   float rope_scaling_temperature;
   float rope_scaling_beta_fast;
   float rope_scaling_beta_slow;
+  /* The most merged vision tokens one media item can hold; 0 = the envelope.
+   * The envelope bounds a request, but the encoder only ever holds one item,
+   * and the caller's processor caps an item below that (`smart_resize` to
+   * its `longest_edge`: 16,384 tokens for a 4096x4096 bound, half the default
+   * envelope). The encoder workspace and a head readout's scores are sized
+   * for one item of min(this, envelope, max_context_tokens); the embedding
+   * pool keeps the envelope's floor, and `ignis_media_encode` refuses an
+   * item past the bound. Nonzero needs `vision_max_tokens`. */
+  uint32_t vision_item_max_tokens;
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many

@@ -439,8 +439,10 @@ struct ignis_model {
   // GitHub #177: the vision tower, bound in its stored formats when the load
   // names a vision envelope (`vision_max_tokens > 0`), and one item's output
   // transient, sized once for the envelope. The encoder's workspace is
-  // `scratch` above, grown to fit it (GitHub #212).
+  // `scratch` above, grown to fit one item of `vision_item_max_tokens`
+  // (GitHub #212) -- the load's item bound, never above the envelope.
   uint32_t vision_max_tokens = 0;
+  uint32_t vision_item_max_tokens = 0;
   VisionWeights vision{};
   // GitHub #243: the embedding pool, carved into fixed-width column pages.
   // Where the reference (and GitHub #178 after it) keeps one output

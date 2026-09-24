@@ -140,6 +140,7 @@ fn cuda_scheduler(
     model: &str,
     frontend: &ignis_artifact::FrontendSet,
     shape: ignis_server::runtime::EngineShape,
+    vision_item_bound: Option<u64>,
     logging_handle: &ignis_logging::LoggingHandle,
 ) -> (Box<dyn Scheduler>, ignis_server::metrics::LoadReservations) {
     let eos = match frontend.eos_token_id() {
@@ -152,6 +153,17 @@ fn cuda_scheduler(
             );
             exit_after_flush(logging_handle, 1);
         }
+    };
+    // The encoder holds one item at a time, and the processor bounds an item
+    // below the envelope (`ProcessorOptions::max_item_tokens`): the load
+    // sizes the encoder's workspace for that.
+    let shape = ignis_server::runtime::EngineShape {
+        vision: shape.vision.map(|vision| match vision_item_bound {
+            // Never above the processor's request budget, the u32 envelope.
+            Some(bound) => vision.with_item_max_tokens(u32::try_from(bound).expect("an item bound is at most the envelope")),
+            None => vision,
+        }),
+        ..shape
     };
     match ignis_server::runtime::cuda_scheduler(artifact_path, model.into(), eos, shape) {
         Ok((scheduler, reserved)) => {
@@ -168,7 +180,7 @@ fn cuda_scheduler(
                 ),
                 vision = %shape.vision.map_or_else(
                     || "off".to_owned(),
-                    |v| format!("max_tokens={}", v.max_tokens())
+                    |v| format!("max_tokens={} item_max_tokens={}", v.max_tokens(), v.item_max_tokens())
                 ),
                 "model loaded on the GPU"
             );
@@ -395,10 +407,25 @@ async fn main() {
             }
         };
 
+        // GitHub #179: a `--vision` load prepares images with the artifact's
+        // processor and acquires them before admission. A tokenizer whose
+        // placeholder ids are not the model contract's is a refused start.
+        // Built before the load, which sizes the encoder for the processor's
+        // item bound.
+        let processor = match vision.map(|v| ignis_server::media::load_processor(&frontend, v, max_context)) {
+            None => None,
+            Some(Ok(processor)) => Some(processor),
+            Some(Err(err)) => {
+                tracing::error!(name: "ignis.vision.processor_invalid", error = %err, "refusing to start");
+                exit_after_flush(&logging_handle, 1);
+            }
+        };
+
         #[cfg(feature = "cuda")]
         let scheduler = {
+            let item_bound = processor.as_ref().map(|p| p.options().max_item_tokens());
             let (scheduler, reserved) =
-                cuda_scheduler(artifact_path, &model, &frontend, engine_shape, &logging_handle);
+                cuda_scheduler(artifact_path, &model, &frontend, engine_shape, item_bound, &logging_handle);
             // GitHub #216: what the plan reserved leaves the load here, so
             // the exposition can name it. The placeholder path below builds
             // no plan and leaves this `None`.
@@ -414,17 +441,6 @@ async fn main() {
             mock_scheduler(&model)
         };
 
-        // GitHub #179: a `--vision` load prepares images with the artifact's
-        // processor and acquires them before admission. A tokenizer whose
-        // placeholder ids are not the model contract's is a refused start.
-        let processor = match vision.map(|v| ignis_server::media::load_processor(&frontend, v, max_context)) {
-            None => None,
-            Some(Ok(processor)) => Some(processor),
-            Some(Err(err)) => {
-                tracing::error!(name: "ignis.vision.processor_invalid", error = %err, "refusing to start");
-                exit_after_flush(&logging_handle, 1);
-            }
-        };
         let engine = Engine::with_clock(scheduler, Arc::new(SystemClock));
         let provider = ignis_server::artifact_template::ArtifactTemplateProvider::new(frontend);
         match processor {

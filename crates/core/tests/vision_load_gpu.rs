@@ -24,7 +24,9 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b_with_options;
 use ignis_core::RopeScaling;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
-use ignis_core::step::program_stats;
+use ignis_artifact::vision::{Grid, PATCH_FEATURES};
+use ignis_core::step::{encode_media, program_stats};
+use ignis_core::vision::vision_item_control;
 use ignis_core::{KvFormat, Vision, VISION_OBJECTS};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -143,6 +145,62 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
         vision_weight_bytes as f64 / (1024.0 * 1024.0)
     );
     assert!(default_reserved > vision_reserved, "the envelope sizes the reservation");
+
+    // The item bound: this artifact's processor lets no item through past
+    // 16,384 merged tokens (a 4096 x 4096 `longest_edge`), and the encoder
+    // holds one item at a time. Bounded there, the default envelope grows the
+    // shared scratch exactly as an envelope of 16,384 would, while its pool
+    // stays the default envelope's -- the reservation is that growth plus
+    // the pool.
+    const ITEM_BOUND: u32 = 16_384;
+    let bounded = vision.with_item_max_tokens(ITEM_BOUND);
+    let small = Vision::new(ITEM_BOUND).unwrap();
+    let (_, _, bounded_reserved) = load(&handles, SERVING_CONTEXT, Some(bounded));
+    let (_, _, small_reserved) = load(&handles, SERVING_CONTEXT, Some(small));
+    assert_eq!(
+        bounded_reserved - bounded.pool_bytes(SERVING_CONTEXT),
+        small_reserved - small.pool_bytes(SERVING_CONTEXT),
+        "an item bound grows the scratch like an envelope that small"
+    );
+    assert_eq!(bounded.pool_bytes(SERVING_CONTEXT), vision.pool_bytes(SERVING_CONTEXT));
+    assert!(bounded_reserved < default_reserved, "the item bound shrinks the reservation");
+    println!(
+        "vision reservation with a {ITEM_BOUND}-token item bound: {bounded_reserved} bytes ({:.1} MiB)",
+        bounded_reserved as f64 / (1024.0 * 1024.0)
+    );
+
+    // The encode side of the same bound: the workspace holds one item of it,
+    // so an item at the bound encodes and one past it -- still inside the
+    // envelope -- is refused by name rather than overrunning the arena. The
+    // processor never lets such an item through; the leaf does not rely on
+    // that.
+    {
+        const TINY_BOUND: u32 = 64;
+        let model = load_qwen38_27b_with_options(
+            &reader,
+            &artifact,
+            &handles,
+            128,
+            SMALL_CONTEXT,
+            KvFormat::Bf16,
+            None,
+            Some(Vision::new(SMALL_CONTEXT).unwrap().with_item_max_tokens(TINY_BOUND)),
+            RopeScaling::NONE,
+        )
+        .unwrap_or_else(|e| panic!("ignis_model_load (item bound {TINY_BOUND}): {e}"));
+        let encode = |grid: Grid| {
+            let patches = vec![0u16; grid.raw_patches() as usize * PATCH_FEATURES];
+            encode_media(&model, grid, &patches, &vision_item_control(grid)).map(drop)
+        };
+        // 16 x 16 patches merge to 64 tokens: at the bound.
+        encode(Grid { t: 1, h: 16, w: 16 }).unwrap_or_else(|(rc, e)| panic!("an item at the bound: {rc} {e}"));
+        // 16 x 32 merge to 128: past it, inside the 1,024-token envelope.
+        let Err((rc, message)) = encode(Grid { t: 1, h: 16, w: 32 }) else {
+            panic!("an item past the item bound encoded");
+        };
+        assert_eq!(rc, -1, "{message}");
+        assert!(message.contains("item bound of 64"), "{message}");
+    }
 
     let _ = artifact.release_arena(&mut device);
 }

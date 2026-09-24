@@ -171,6 +171,16 @@ pub struct ProcessorOptions {
 }
 
 impl ProcessorOptions {
+    /// The most merged tokens one item can come out at: the pixel bound over
+    /// a merged token's 32 x 32 pixels, never above the request budget.
+    /// [`VisionProcessor::prepare_media`] refuses an item past it, so it holds
+    /// for every item this processor lets through — which is what lets a
+    /// load size the encoder for one item of it rather than for a whole
+    /// request.
+    pub fn max_item_tokens(&self) -> u64 {
+        (self.max_pixels / (FACTOR * FACTOR) as u64).min(self.max_vision_tokens)
+    }
+
     /// The reference's limits with the pixel bounds read from the artifact's
     /// `preprocessor_config.json` (`size.shortest_edge` / `size.longest_edge`
     /// are pixel counts for this processor, not edge lengths).
@@ -224,6 +234,9 @@ pub enum Budget {
     DecodedPixels,
     RawPatches,
     VisionTokens,
+    /// Merged vision tokens in one image: the item bound
+    /// ([`ProcessorOptions::max_item_tokens`]) the load sizes the encoder for.
+    ItemVisionTokens,
 }
 
 impl Budget {
@@ -235,6 +248,7 @@ impl Budget {
             Self::DecodedPixels => "decoded pixels",
             Self::RawPatches => "vision raw patches",
             Self::VisionTokens => "vision tokens",
+            Self::ItemVisionTokens => "vision tokens in one image",
         }
     }
 }
@@ -388,6 +402,12 @@ impl VisionProcessor {
         let grid = Grid { t: 1, h: size.height / PATCH as u32, w: size.width / PATCH as u32 };
         check_budget(Budget::RawPatches, options.max_raw_patches, grid.raw_patches())?;
         check_budget(Budget::VisionTokens, options.max_vision_tokens, grid.vision_tokens())?;
+        // Then the item bound, which only the pixel bound can make tighter:
+        // `smart_resize` can land past it -- an upscale to the floor rounds
+        // up, and a side it clamps to one merge factor can push the area over
+        // -- when the bounds are small or sit close. Neither happens at this
+        // artifact's 65,536 / 16,777,216-pixel bounds.
+        check_budget(Budget::ItemVisionTokens, options.max_item_tokens(), grid.vision_tokens())?;
         let resized = resize::resize_bicubic(image, size);
         Ok(PreparedMedia {
             grid,
@@ -530,6 +550,32 @@ mod tests {
     }
 
     #[test]
+    fn an_item_is_bounded_by_the_pixel_bound_and_by_the_request_budget() {
+        // 1 << 20 pixels is 1,024 merged tokens of 32 x 32, under the
+        // 16,384-token request budget of `options()`...
+        assert_eq!(options().max_item_tokens(), 1024);
+        // ...and a request budget below the pixel bound is the tighter one.
+        assert_eq!(ProcessorOptions { max_vision_tokens: 100, ..options() }.max_item_tokens(), 100);
+    }
+
+    #[test]
+    fn an_item_past_the_item_bound_is_refused_before_it_reaches_the_encoder() {
+        // The bound the load sizes the encoder by has to hold for every item
+        // the processor lets through, including the one `smart_resize` can
+        // round past its pixel bound: scaling a 60 x 100 image up to a
+        // 65,536-pixel floor lands on 224 x 352, 77 tokens, above a
+        // 65,536-pixel (64-token) ceiling.
+        let tight = ProcessorOptions { min_pixels: 65_536, max_pixels: 65_536, ..options() };
+        assert_eq!(tight.max_item_tokens(), 64);
+        let (_, processor) = processor(tight);
+        let error = processor.prepare_media(0, &png(100, 60)).unwrap_err();
+        assert_eq!(
+            error,
+            ProcessorError::BudgetExceeded { budget: Budget::ItemVisionTokens, limit: 64, requested: 77 }
+        );
+    }
+
+    #[test]
     fn a_tokenizer_with_the_wrong_pad_id_is_refused_at_construction() {
         let error = VisionProcessor::new(&tokenizer(7, VIDEO_PAD_ID), options()).unwrap_err();
         assert_eq!(error, ProcessorError::PadTokenMismatch { token: IMAGE_PAD, expected: IMAGE_PAD_ID, actual: vec![7] });
@@ -641,6 +687,9 @@ mod tests {
         let options = ProcessorOptions::from_preprocessor_config(config).unwrap();
         assert_eq!((options.min_pixels, options.max_pixels), (65_536, 16_777_216));
         assert_eq!(options.max_vision_tokens, MAX_VISION_TOKENS);
+        // A 4096 x 4096 pixel bound is 128 x 128 merged tokens: half the
+        // request budget, and the most any one item can come out at.
+        assert_eq!(options.max_item_tokens(), 16_384);
         let other = br#"{"size": {"longest_edge": 100, "shortest_edge": 10}, "patch_size": 14,
                          "temporal_patch_size": 2, "merge_size": 2}"#;
         assert!(matches!(ProcessorOptions::from_preprocessor_config(other), Err(ProcessorError::InvalidConfig(_))));

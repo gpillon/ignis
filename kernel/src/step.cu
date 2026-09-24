@@ -1413,10 +1413,11 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   }
   if (arms_readout) {
     // The room `plan_load_sizes` (kernel/src/model.cu) reserved for the
-    // scores: one F32 per token of the vision envelope, capped by the
-    // context -- the same two terms, or a readout could outgrow its arena.
+    // scores: one F32 per token of one vision item at the load's item bound,
+    // capped by the context -- the same two terms, or a readout could outgrow
+    // its arena. A readout scores one image's span, and no image is wider.
     const std::uint64_t capacity =
-        std::min<std::uint64_t>(model->vision_max_tokens, model->max_context_tokens);
+        std::min<std::uint64_t>(model->vision_item_max_tokens, model->max_context_tokens);
     // The GQA ordinals this model has, for the readout's layer and every
     // head of its set.
     std::array<bool, kReadoutGqaLayers> gqa_ordinal{};
@@ -1482,7 +1483,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                 std::to_string(kReadoutMaxSetHeads) + " of them, at most " +
                 std::to_string(kReadoutMaxExcluded) + " excluded keys inside the span, at most " +
                 std::to_string(capacity) +
-                " keys -- the vision envelope the load reserved scores for -- and, with a set, "
+                " keys -- the one vision item the load reserved scores for -- and, with a set, "
                 "its peak and neighbour buffers and an image grid of 1.." +
                 std::to_string(options->attention_key_count) + " columns)");
       return -1;

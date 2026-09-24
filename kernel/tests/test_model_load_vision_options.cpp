@@ -10,6 +10,11 @@
 // 3. GitHub #195: the envelope and a speculative backend are independent
 //    options -- a load asking for both reaches the binding and asks for both
 //    scopes, where #178 refused it outright.
+// 4. The item bound: `vision_item_max_tokens` sizes the encoder's workspace
+//    for one item of that many merged tokens (never past the envelope) and
+//    leaves the embedding pool at the envelope's floor; without an envelope
+//    it is refused. Planned through `ignis_model_plan_reservations`, which
+//    binds and sizes but never reaches the device.
 //
 // Host-only by construction, the same way as
 // test_model_load_speculative_options.cpp: a topology with no decoder layers
@@ -145,6 +150,33 @@ ignis_model_load_options vision(uint32_t max_tokens) {
   return options;
 }
 
+// Plans `named` under `options` at a serving-sized context, so the envelope
+// is never capped by it. Every arm here must succeed: a plan binds but never
+// touches the device.
+ignis_model_reservations plan(const std::vector<Named> &named, const ignis_model_load_options &options) {
+  const ignis_topology topology = no_layer_topology();
+  std::vector<ignis_bound_tensor> tensors;
+  for (const Named &n : named) {
+    tensors.push_back(descriptor(n));
+  }
+  ignis_model_reservations out{};
+  const int32_t rc = ignis_model_plan_reservations(tensors.data(), named.size(), &topology,
+                                                   /*prefill_chunk_tokens=*/128,
+                                                   /*max_context_tokens=*/262144,
+                                                   IGNIS_KV_FORMAT_BF16, &options, &out);
+  if (rc != 0) {
+    std::fprintf(stderr, "FATAL: this plan must succeed: %s\n", ignis_model_last_error());
+    std::exit(EXIT_FAILURE);
+  }
+  return out;
+}
+
+ignis_model_load_options vision_items(uint32_t max_tokens, uint32_t item_max_tokens) {
+  ignis_model_load_options options = vision(max_tokens);
+  options.vision_item_max_tokens = item_max_tokens;
+  return options;
+}
+
 bool contains(const std::string &haystack, const std::string &needle) {
   return haystack.find(needle) != std::string::npos;
 }
@@ -230,6 +262,40 @@ int main() {
     const std::string m = load_error(text, &both);
     check(contains(m, "missing bound tensor: vision/patch_embedding"),
           "vision with the verify-only backend still asks for the tower: " + m);
+  }
+
+  // --- 4. the item bound ------------------------------------------------------
+  // The envelope caps a request's vision tokens, but the encoder only ever
+  // holds one item, and the processor's `smart_resize` caps an item at its
+  // `longest_edge` over 32 x 32 pixels a token (16,384 for this artifact) --
+  // half the default envelope. With `vision_item_max_tokens` the encoder's
+  // workspace is sized for one item of that bound, exactly as a load whose
+  // whole envelope were that small, while the embedding pool keeps the
+  // envelope's floor: what an item costs to encode is not what a request may
+  // hold.
+  {
+    const std::vector<Named> both = concat(text, tower);
+    const ignis_model_reservations envelope = plan(both, vision(32768));
+    const ignis_model_reservations small = plan(both, vision(16384));
+    const ignis_model_reservations bounded = plan(both, vision_items(32768, 16384));
+    check(bounded.workspace_bytes == small.workspace_bytes,
+          "an item bound sizes the workspace like an envelope that small");
+    check(bounded.workspace_bytes < envelope.workspace_bytes,
+          "an item bound below the envelope shrinks the workspace");
+    check(bounded.media_embedding_bytes == envelope.media_embedding_bytes,
+          "an item bound leaves the embedding pool at the envelope's floor");
+
+    check(plan(both, vision_items(32768, 0)).workspace_bytes == envelope.workspace_bytes,
+          "no item bound is the envelope");
+    const ignis_model_reservations wide = plan(both, vision(8192));
+    check(plan(both, vision_items(8192, 16384)).workspace_bytes == wide.workspace_bytes,
+          "an item bound past the envelope is the envelope");
+  }
+  {
+    const ignis_model_load_options stray = vision_items(0, 16384);
+    const std::string m = load_error(text, &stray);
+    check(contains(m, "vision_item_max_tokens"),
+          "an item bound without a vision envelope is refused by name: " + m);
   }
 
   if (g_failed != 0) {
