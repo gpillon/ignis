@@ -34,6 +34,19 @@ describe("parseChunk", () => {
     expect(parseChunk(chunk({}, "length"))).toEqual([{ kind: "finish", reason: "length" }]);
   });
 
+  it("reads a forced close of the reasoning off the finish chunk's choice, and nothing when it is absent", () => {
+    const forced = JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop", thinking_budget_forced_at: 4096 }] });
+    expect(parseChunk(forced)).toStrictEqual([{ kind: "finish", reason: "stop", thinkingForcedAt: 4096 }]);
+    expect(parseChunk(chunk({}, "stop"))).toStrictEqual([{ kind: "finish", reason: "stop" }]);
+  });
+
+  it("ignores a forced-close field that is not a whole token count", () => {
+    for (const value of [null, false, "4096", -1, 1.5]) {
+      const data = JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop", thinking_budget_forced_at: value }] });
+      expect(parseChunk(data)).toStrictEqual([{ kind: "finish", reason: "stop" }]);
+    }
+  });
+
   it("reads usage from the trailing usage chunk", () => {
     const data = JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } });
     expect(parseChunk(data)).toEqual([{ kind: "usage", usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } }]);

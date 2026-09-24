@@ -14,6 +14,7 @@ const settings: Settings = {
   topP: 0.95,
   maxTokens: 100,
   reasoningEffort: "xhigh",
+  thinkingBudget: null,
   laneTag: "interactive",
 };
 
@@ -92,6 +93,17 @@ describe("run_js", () => {
     );
     expect(blocked.run).toMatchObject({ status: "blocked", result: "Not run: the safety check blocked the code. It reaches the network." });
     expect(blocked.run.output).toBeUndefined();
+  });
+
+  it("reviews without thinking, so the session's thinking budget never rides the check", async () => {
+    const bodies: ChatRequest[] = [];
+    await runOne(
+      "run_js",
+      { code: "1 + 1" },
+      { settings: { ...settings, thinkingBudget: 4096 }, jsSafetyCheck: true, stream: reviewer('{"verdict":"safe","reason":"ok"}', bodies) },
+    );
+    expect(bodies[0].reasoning_effort).toBe("none");
+    expect("thinking_budget" in bodies[0]).toBe(false);
   });
 
   it("reads anything but a clear safe verdict as unsafe", () => {

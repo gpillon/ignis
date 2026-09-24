@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import type { ModelState } from "../api/model.ts";
-import { buildChatRequest, conversationTurns, type Exchange, type Settings, type ToolExtras } from "../api/request.ts";
+import { buildChatRequest, conversationTurns, type Exchange, type Settings, thinkingBudgetOf, type ToolExtras } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
 import type { PromptImage } from "../conversation/images.ts";
@@ -246,7 +246,13 @@ export function useConversation({
     const figures = result.ok ? computeFigures(result.timeline) : null;
     const error = result.ok ? undefined : result.message;
     change((m) => ({ ...m, streaming: false, figures: figures ?? undefined, error }));
-    logRow(sessionId, { laneTag: request.class, reasoningEffort: request.reasoning_effort, figures, error });
+    logRow(sessionId, {
+      laneTag: request.class,
+      reasoningEffort: request.reasoning_effort,
+      thinkingBudget: request.thinking_budget,
+      figures,
+      error,
+    });
     return reply;
   }
 
@@ -346,7 +352,13 @@ export function useConversation({
     // A row per request an agent made; a run that failed adds one for its error.
     for (const run of runs) {
       if (!tasks.some((t) => t.callId === run.callId)) continue;
-      const row = { laneTag: "agent" as const, reasoningEffort: requestSettings.reasoningEffort, agent: run.name };
+      const row = {
+        laneTag: "agent" as const,
+        reasoningEffort: requestSettings.reasoningEffort,
+        // What agentRequest sent: the turn's own budget.
+        thinkingBudget: thinkingBudgetOf(requestSettings),
+        agent: run.name,
+      };
       for (const figures of run.rounds ?? []) logRow(sessionId, { ...row, figures });
       if (run.error) logRow(sessionId, { ...row, figures: null, error: run.error });
     }

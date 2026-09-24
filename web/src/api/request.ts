@@ -15,9 +15,11 @@ export type LaneTag = "interactive" | "agent";
 /**
  * The efforts the loaded Qwen 3.8 template accepts (`high` is refused).
  * `none` turns thinking off, so the request never also sends
- * `enable_thinking` — ignis rejects the two when they disagree.
+ * `enable_thinking` — ignis rejects the two when they disagree. `max` is
+ * ignis's own (spec server/08): the template renders it as `xhigh`, and it
+ * thinks with no budget at all, ignoring any `thinking_budget`.
  */
-export const REASONING_EFFORTS = ["none", "low", "medium", "xhigh"] as const;
+export const REASONING_EFFORTS = ["none", "low", "medium", "xhigh", "max"] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 export type Settings = {
@@ -28,6 +30,13 @@ export type Settings = {
   /** `null` leaves the cap to the engine. */
   maxTokens: number | null;
   reasoningEffort: ReasoningEffort;
+  /**
+   * How many tokens a reply may reason before ignis closes its thinking
+   * (spec server/08): `null` leaves it to the server's `--thinking-budget`,
+   * `0` is no budget, a count is that cap. It is kept through an effort that
+   * cannot use it (`none`, `max`), and sent again once one can.
+   */
+  thinkingBudget: number | null;
   laneTag: LaneTag;
 };
 
@@ -80,6 +89,7 @@ export type ChatRequest = {
   top_p: number;
   max_tokens?: number;
   reasoning_effort: ReasoningEffort;
+  thinking_budget?: number;
   class: LaneTag;
 };
 
@@ -147,11 +157,22 @@ function wireMessages(turn: Turn): WireMessage[] {
   return turn.dateTime ? [{ role: "developer", content: turn.dateTime }, message] : [message];
 }
 
+/**
+ * The `thinking_budget` a request with these settings sends, or `undefined`
+ * for none: thinking off has no reasoning to cap, `max` ignores a budget, and
+ * the server default is the field left out.
+ */
+export function thinkingBudgetOf(settings: Pick<Settings, "reasoningEffort" | "thinkingBudget">): number | undefined {
+  if (settings.reasoningEffort === "none" || settings.reasoningEffort === "max") return undefined;
+  return settings.thinkingBudget ?? undefined;
+}
+
 /** What the enabled tools add to a request: their prompt, ahead of the owner's, and their definitions. */
 export type ToolExtras = { ignisPrompt?: string; tools?: ToolDefinition[] };
 
 export function buildChatRequest(settings: Settings, turns: Turn[], extras: ToolExtras = {}): ChatRequest {
   const system = [extras.ignisPrompt ?? "", settings.systemPrompt].filter((part) => part.trim() !== "").join("\n\n");
+  const thinkingBudget = thinkingBudgetOf(settings);
   return {
     model: settings.model,
     messages: [...(system ? [{ role: "system" as const, content: system }] : []), ...turns.flatMap(wireMessages)],
@@ -162,6 +183,7 @@ export function buildChatRequest(settings: Settings, turns: Turn[], extras: Tool
     top_p: settings.topP,
     ...(settings.maxTokens !== null ? { max_tokens: settings.maxTokens } : {}),
     reasoning_effort: settings.reasoningEffort,
+    ...(thinkingBudget !== undefined ? { thinking_budget: thinkingBudget } : {}),
     class: settings.laneTag,
   };
 }

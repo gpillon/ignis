@@ -15,6 +15,8 @@ export type Timeline = {
   endedAt?: number;
   usage?: Usage;
   finishReason?: string;
+  /** The reasoning tokens emitted when the thinking budget forced the block closed; absent when it closed on its own. */
+  thinkingForcedAt?: number;
   /** The owner stopped the stream before it ended. */
   stopped: boolean;
 };
@@ -26,6 +28,8 @@ export type Figures = {
   promptTokens: number | null;
   completionTokens: number | null;
   finishReason: string | null;
+  /** Where the thinking budget closed the reasoning, in reasoning tokens; absent when the reply closed it itself. */
+  thinkingForcedAt?: number;
   /** Stopped before the end: no usage, so no token counts or rate. */
   partial: boolean;
 };
@@ -44,6 +48,7 @@ export function computeFigures(t: Timeline): Figures {
     promptTokens: t.usage?.prompt_tokens ?? null,
     completionTokens: completion,
     finishReason: t.finishReason ?? null,
+    ...(t.thinkingForcedAt !== undefined ? { thinkingForcedAt: t.thinkingForcedAt } : {}),
     partial: t.stopped,
   };
 }

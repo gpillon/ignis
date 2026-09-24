@@ -14,5 +14,5 @@
     "skipLibCheck": true,
     "types": ["node", "vite/client"]
   },
-  "include": ["src", "vite.config.ts", "mock.ts", "mockDecide.ts", "mockMetrics.ts"]
+  "include": ["src", "vite.config.ts", "mock.ts", "mockChat.ts", "mockDecide.ts", "mockMetrics.ts"]
 }

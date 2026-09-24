@@ -59,6 +59,8 @@ export type LogRow = {
   at: string;
   laneTag: LaneTag;
   reasoningEffort: ReasoningEffort;
+  /** The `thinking_budget` the request sent; absent when it sent none. Whether the budget closed it is on the figures. */
+  thinkingBudget?: number;
   figures: Figures | null;
   error?: string;
   /** The agent's name, on a row an agent's request made. */

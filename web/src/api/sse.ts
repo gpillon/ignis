@@ -12,7 +12,12 @@ export type ChunkEvent =
   | { kind: "reasoning"; text: string }
   | { kind: "content"; text: string }
   | { kind: "tool_call"; call: ToolCall }
-  | { kind: "finish"; reason: string }
+  /**
+   * The reply ended. `thinkingForcedAt` is ignis's forced-close extension
+   * (spec server/08): the reasoning tokens emitted when the thinking budget
+   * closed the block. It is absent when the reply closed it itself.
+   */
+  | { kind: "finish"; reason: string; thinkingForcedAt?: number }
   | { kind: "usage"; usage: Usage }
   | { kind: "done" };
 
@@ -46,6 +51,8 @@ type WireChunk = {
       tool_calls?: { id?: string; function?: { name?: string; arguments?: string } }[];
     };
     finish_reason?: string | null;
+    /** On the chunk carrying `finish_reason`, and only when the thinking budget forced the close. */
+    thinking_budget_forced_at?: unknown;
   }[];
   usage?: Usage | null;
 };
@@ -68,7 +75,11 @@ export function parseChunk(data: string): ChunkEvent[] {
         events.push({ kind: "tool_call", call: { id: call.id, name: call.function.name, arguments: call.function.arguments ?? "{}" } });
       }
     }
-    if (choice.finish_reason) events.push({ kind: "finish", reason: choice.finish_reason });
+    if (choice.finish_reason) {
+      const forcedAt = choice.thinking_budget_forced_at;
+      const forced = typeof forcedAt === "number" && Number.isInteger(forcedAt) && forcedAt >= 0;
+      events.push({ kind: "finish", reason: choice.finish_reason, ...(forced ? { thinkingForcedAt: forcedAt } : {}) });
+    }
   }
   if (chunk.usage) events.push({ kind: "usage", usage: chunk.usage });
   return events;

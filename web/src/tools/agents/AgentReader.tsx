@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useLayoutEffect, useRef } from "react";
+import { BudgetReached } from "../../metrics/BudgetReached.tsx";
 import { Markdown } from "../../ui/Markdown.tsx";
 import { isAtBottom } from "../../ui/scroll.ts";
 import { LocalStrip } from "../local/LocalStrip.tsx";
@@ -12,6 +13,8 @@ export function AgentReader(props: { run: AgentRun; markdown: boolean; figures: 
   const { run, onClose } = props;
   const now = useNow(run.status === "running");
   const thinking = run.status === "running" && !run.content;
+  // The reasoning runs across every request the agent made: the latest one the budget closed, if any.
+  const forcedAt = run.rounds?.filter((round) => round.thinkingForcedAt !== undefined).at(-1)?.thinkingForcedAt;
   // Like the conversation: new text pulls the view down only while the
   // reader is at the bottom. An agent still writing is followed from the
   // start; a finished one opens at its prompt.
@@ -83,6 +86,7 @@ export function AgentReader(props: { run: AgentRun; markdown: boolean; figures: 
           <details className="reasoning" open={thinking}>
             <summary className="cursor-pointer select-none font-display text-[13px] font-medium text-ash hover:text-ink">
               {thinking ? "Thinking…" : "Reasoning"}
+              {forcedAt !== undefined && <BudgetReached at={forcedAt} />}
             </summary>
             <pre className="mt-2 border-l-2 border-line pl-3 whitespace-pre-wrap break-words font-sans text-[13px] leading-normal text-ash">
               {run.reasoning}

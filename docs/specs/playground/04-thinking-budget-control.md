@@ -95,3 +95,38 @@ closed says so on the reply and in the request log row.
   server without them, the control's number presets still work; "off" and the marker
   do not.
 - The Playground's brand tokens and component conventions (`web/src/brand`, `web/src/ui`) apply.
+
+## As built (2026-09-24)
+
+- **Storage.** The setting is `thinkingBudget` in the request settings: `null` is
+  the server default, `0` is Off, a count is a count. "The same storage rules" as
+  the other settings means in memory, shared by every session, reset on a reload:
+  the Playground stores no request setting in the browser (only the switches in
+  `storedFlag.ts`). Story 8 therefore holds within the page, not across a reload,
+  and story 9 does not arise, since settings are not per session. Storing request
+  settings across reloads would be a change for all of them, not for this one.
+- **The wire** is the one #265 implements for server/08. The forced flag is the
+  integer `thinking_budget_forced_at`: the reasoning tokens emitted when the forced
+  close began. It sits on the choice that carries `finish_reason`, the final chunk
+  of a stream, and is absent (not null) when the close was not forced, so "true" in
+  the Testing Decisions reads as "present".
+- **The box** takes whole counts from 1 to 4294967295, the server's own bounds
+  (`resolve_thinking_budget` is a `u32`). It refuses 0 (Off says it), negatives,
+  fractions and text, with a reason, and the setting keeps its last valid value.
+  The presets are 2048, 4096, 8192 and 16384.
+- **Thinking off and `max`** disable the control and check no option at all, rather
+  than showing the kept choice greyed out, so the UI never shows a budget the
+  request will not send. `max` reads "no budget (max)" and thinking off reads
+  "thinking off". The setting is untouched, so the next effort shows it and sends
+  it again.
+- **The `max_tokens` warning** covers a typed or preset count only. The server
+  default's value is not known to the Playground, so Default is never flagged.
+- **Beyond the spec:** the Agents reader marks an agent's reasoning when the budget
+  closed any of its requests. The mock also answers `stream: false`, which the
+  Playground itself never sends.
+- **Log row.** The Budget column shows the count sent, "off" for 0, "default" when
+  nothing was sent under a thinking effort, and "—" for thinking off and `max`. When
+  forced it appends "reached N", with N the count ignis reported, which shows the
+  answer-room clamp when that cut the budget.
+- **Mock.** "/budget" in a prompt makes `dev:mock` reason past the budget and
+  report the forced close. The logic is in `web/mockChat.ts`.
