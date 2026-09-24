@@ -41,14 +41,14 @@ closed says so on the reply and in the request log row.
 14. As a Playground developer, I want the mock server (`dev:mock`) to accept and echo the field, so that UI work does not need the GPU.
 15. As a Playground user on a server without budget support, I want the control to still work harmlessly (the field ignored), so that the Playground works against older servers.
 16. As a Playground user, I want a `max` choice in the reasoning-effort selector, so that I can ask for unbounded thinking in one click.
-17. As a Playground user, I want the budget control to show that `max` means "no budget" unless I type a number, so that I understand which of the two wins.
+17. As a Playground user, I want the budget control disabled and marked "no budget (max)" while `max` is selected, so that the UI never suggests a budget that the server will ignore.
 
 ## Implementation Decisions
 
 - **Effort selector.** It gains `max` after `xhigh`. Per server/08, `max` renders as
-  `xhigh` and drops the server's default budget. An explicit number in the budget
-  control still wins, so with `max` selected the budget control's *server default*
-  choice reads as "none (max)".
+  `xhigh` and runs with no thinking budget, and ignores any `thinking_budget`. With
+  `max` selected the budget control is disabled and reads "no budget (max)". The
+  user's budget choice is kept and applies again when another effort is picked.
 - **Settings.** A new setting holds one of: *server default* (the field is omitted),
   *off* (`thinking_budget: 0`, per server/08), or a positive token count.
   - The default is *server default*.
@@ -74,9 +74,9 @@ closed says so on the reply and in the request log row.
   - thinking off → absent;
   - Agents tool sub-request carries the same value (prior art
     `web/src/tools/agents/agents.test.ts`).
-- **Effort `max`:** the request carries `reasoning_effort: "max"`. The budget field is
-  sent only when the user typed a number or chose off. The panel shows the
-  "none (max)" hint.
+- **Effort `max`:** the request carries `reasoning_effort: "max"` and no
+  `thinking_budget` field. The panel disables the budget control with the
+  "no budget (max)" hint, and restores the user's choice when the effort changes back.
 - **Settings panel test** (prior art `SettingsPanel.test.tsx`): presets, typed value,
   validation, disabled when effort is `none`, the `max_tokens` warning.
 - **Reply rendering test:** the marker appears only when the response's forced field is

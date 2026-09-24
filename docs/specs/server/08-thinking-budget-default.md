@@ -55,8 +55,8 @@ The server ships with a measured thinking budget on by default:
 19. As a maintainer, I want the budget to keep forcing through the constrained-decode seam only, so that no new leaf entry point or second forcing mechanism exists.
 20. As a maintainer, I want the default to live in the server's configuration next to the thinking defaults, so that there is one place thinking policy is set.
 21. As an API client that only knows `reasoning_effort`, I want `reasoning_effort: "max"` to mean "reason as long as you need", so that I can ask for unbounded thinking without knowing the ignis budget field.
-22. As an API client, I want an explicit `thinking_budget` to win over `max`, so that the most specific instruction in my request is the one honoured.
-23. As an operator, I want `--reasoning-effort max` to turn the default budget off for every request that does not set its own, so that one flag gives the whole server unbounded thinking.
+22. As a user who picks `max`, I want exactly that: no budget of any kind, even if a `thinking_budget` also rides the request (a client default, a stale setting), so that `max` always means the most thinking the model can do.
+23. As an operator, I want `--reasoning-effort max` to turn the budget off for every request that does not ask for another effort, so that one flag gives the whole server unbounded thinking.
 
 ## Implementation Decisions
 
@@ -100,20 +100,25 @@ The server ships with a measured thinking budget on by default:
 - **Effort stays as resolved by server/04:** `high` → `xhigh`, unset → the template
   default `xhigh`. The budget is what makes `xhigh` safe; the effort default is not
   changed by this spec.
-- **`max` is `xhigh` without the default budget.**
+- **`max` is `xhigh` with no budget, ever.** The owner's call: a human who asks for
+  `max` wants the maximum.
   - `reasoning_effort: "max"` renders the template at `xhigh`, the most Qwen3.8 takes,
     as server/04's rounding already does.
-  - It also suppresses the **server's default** budget for that request.
+  - The request runs with **no thinking budget at all**. That covers the server
+    default and any `thinking_budget` on the same request, which is **ignored**: not a
+    400, and not honoured. `max_tokens` is the only bound.
+  - The request log records that the budget was dropped because of `max`, so an
+    operator can see why a request set a budget and was not forced.
   - Resolution, first match wins:
-    1. an explicit `thinking_budget` on the request (a number, or `0` = off) is honoured
-       whatever the effort, so the explicit number beats `max`;
-    2. an effort of `max` means no budget;
-    3. otherwise the server default applies.
-  - The same holds for the server's own default effort: `--reasoning-effort max` with
-    `--thinking-budget 8192` means no budget unless a request sets one.
-  - `max` + `thinking_budget` is **not** a conflict, never a 400. Spec server/04's
-    rounding table is amended: `max` renders as `xhigh` and disables the default
-    budget.
+    1. the resolved effort is `max` → no budget;
+    2. an explicit `thinking_budget` (a number, or `0` = off) → that;
+    3. otherwise the server default.
+  - The resolved effort is the request's own, else the server's `--reasoning-effort`.
+    So `--reasoning-effort max` with `--thinking-budget 8192` means no budget for
+    every request that does not ask for another effort. A request that asks for
+    `xhigh` or lower gets the budget rules above.
+  - Spec server/04's rounding table is amended: `max` renders as `xhigh` and runs
+    without a thinking budget.
   - A template whose vocabulary includes `max` natively receives `max` itself, and
     the budget rule is the same.
 - **Seam:** unchanged. The scheduler forces the close through the permitted-set path
@@ -129,9 +134,9 @@ The server ships with a measured thinking budget on by default:
   (prior art: `a_thinking_budget_reaches_the_decode_rounds_only_while_thinking`).
   Cover:
   - default applied / overridden / `0` opt-out / thinking off inert / malformed 400;
-  - `max` without a budget → no budget, and the template receives `xhigh`;
-  - `max` + an explicit number → that number;
-  - server default effort `max` → no budget unless the request sets one;
+  - `max` → no budget, and the template receives `xhigh`;
+  - `max` + an explicit number, or `0` → still no budget (ignored, 200, logged);
+  - server default effort `max` → no budget; a request asking `xhigh` gets the default budget;
   - the answer-room clamp against `max_tokens`;
   - the forced flag present exactly when the mock's decode rounds carried the close.
 - **Config:** `config.rs` unit tests for the flag/env default, `off`, and the startup
