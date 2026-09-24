@@ -64,8 +64,13 @@ __global__ __launch_bounds__(
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Nvfp4LinearSwiGluTmaSharedStorage<Schedule>*>(shared_bytes);
-    const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
-    const int pair_begin  = static_cast<int>(blockIdx.x) * kPairN;
+    static_assert(nvfp4_tma_scale_slots_are_safe<Schedule>,
+                  "the activation-scale buffer needs two slots and at most three stages");
+    int block_x = 0;
+    int block_y = 0;
+    nvfp4_tma_raster_blocks(block_x, block_y);
+    const int token_begin = block_y * Schedule::kBlockM;
+    const int pair_begin  = block_x * kPairN;
 
     if (threadIdx.x == 0) {
 #pragma unroll
@@ -94,12 +99,19 @@ __global__ __launch_bounds__(
                 const int stage                 = k_tile % Schedule::kStages;
                 const std::uint32_t empty_phase = 1U ^ ((k_tile / Schedule::kStages) & 1U);
                 nvfp4_mbarrier_wait(&shared.empty[stage], empty_phase);
+                constexpr std::uint32_t kScaleBytes =
+                    Schedule::kBlockM * Schedule::kScaleWordsPerRow * 4;
                 constexpr std::uint32_t kTransactionBytes =
                     Schedule::kBlockM * Schedule::kCodeRowBytes +
-                    Schedule::kBlockN * Schedule::kCodeRowBytes +
-                    Schedule::kBlockM * Schedule::kScaleWordsPerRow * 4 +
+                    Schedule::kBlockN * Schedule::kCodeRowBytes + kScaleBytes +
                     2 * Schedule::kBlockN * Schedule::kK64PerStage * 4;
-                nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage], kTransactionBytes);
+                // TMA's innermost box cannot be narrower than 16 bytes and 16 bytes of
+                // activation scales cover two K tiles, so the box is fetched on the even tile
+                // only and the odd tile expects that many bytes fewer.
+                const bool load_scales = (k_tile & 1) == 0;
+                nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage],
+                                                load_scales ? kTransactionBytes
+                                                            : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
                 nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes,
@@ -111,8 +123,11 @@ __global__ __launch_bounds__(
                 nvfp4_tma_load_2d(tensors.b_codes[stage] + kPairN * Schedule::kCodeRowBytes,
                                   &descriptor_block->b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptor_block->a_scales,
-                                  (k_tile / 2) * 16, token_begin, &shared.full[stage]);
+                if (load_scales) {
+                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
+                                      &descriptor_block->a_scales, (k_tile / 2) * 16, token_begin,
+                                      &shared.full[stage]);
+                }
 
                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +
                                             k_tile * Schedule::kK64PerStage) *
@@ -175,8 +190,9 @@ __global__ __launch_bounds__(
                             a_fragments[mma_m][3], smem_addr(address));
                 const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
                 a_scales[mma_m] =
-                    tensors.a_scale4[stage][scale_row * Schedule::kScaleWordsPerRow +
-                                            (k_tile & 1) * Schedule::kK64PerStage + local_k64];
+                    tensors.a_scale4[(k_tile / 2) & 1][scale_row * Schedule::kScaleWordsPerRow +
+                                                       (k_tile & 1) * Schedule::kK64PerStage +
+                                                       local_k64];
             }
 
 #pragma unroll

@@ -272,6 +272,34 @@ __global__ void decode_kv_rows_kernel(const std::uint8_t* codes, const std::uint
                          hq_dither_row_seed(id.kv_head, id.position, id.role == 1));
 }
 
+// The prompt scratch decoder's two spellings of the 8-lane group decode:
+// symbols staged into the output row itself (every caller but one), and
+// symbols staged in shared memory with each lattice word moved as one vector
+// (the prompt scratch kernel, gqa_attention_prefill_hq.cuh). Same threads per
+// block as that kernel, eight lanes per row.
+constexpr int kGroupDecodeThreads = 256;
+
+__global__ void group_decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
+                                         __nv_bfloat16* staged_in_row,
+                                         __nv_bfloat16* staged_on_chip, int n_rows,
+                                         int role_count, int kv_heads, int rows_per_block,
+                                         int first_position) {
+    __shared__ __align__(16) std::uint16_t symbols[(kGroupDecodeThreads / 8) * kHqHeadDim];
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = tid >> 3;
+    if (row >= n_rows) { return; }
+    const int lane8 = tid & 7;
+    const RowId id  = decompose_row(row, role_count, kv_heads, rows_per_block, first_position);
+    const std::uint64_t seed = hq_dither_row_seed(id.kv_head, id.position, id.role == 1);
+    const std::uint8_t* row_codes = codes + static_cast<std::size_t>(row) * kHqRowBudgetBytes;
+    const std::uint8_t* row_meta  = meta + static_cast<std::size_t>(row) * kHqMetaBytes;
+    hq_decode_row_group(row_codes, row_meta,
+                        staged_in_row + static_cast<std::size_t>(row) * kHqHeadDim, lane8, 0, seed);
+    hq_decode_row_group<true>(row_codes, row_meta,
+                              staged_on_chip + static_cast<std::size_t>(row) * kHqHeadDim, lane8, 0,
+                              seed, symbols + (threadIdx.x / 8) * kHqHeadDim);
+}
+
 // Un-rotate a decoded (rotated-frame) row back to the original frame, the
 // same inverse transform a real consumer applies once per output row
 // (hq_codec.cuh's own docs) -- reuses the vendored hq_ifwht256_sign exactly,
@@ -424,6 +452,45 @@ int main() {
                                                         n_rows, role_count, kv_heads,
                                                         rows_per_block, first_position);
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // ---- the prompt scratch decoder's on-chip staging is bit-exact ---------
+    // Upstream's fork (cometkim feat/1m-context, 2026-09-10) moved the group
+    // decode's temporary symbols out of the output row; that is only a port if
+    // every real row decodes to the same bits both ways and to the per-thread
+    // reference decode above.
+    {
+        __nv_bfloat16* d_in_row;
+        __nv_bfloat16* d_on_chip;
+        CUDA_CHECK(cudaMalloc(&d_in_row, fx.rows.size() * 2));
+        CUDA_CHECK(cudaMalloc(&d_on_chip, fx.rows.size() * 2));
+        const long long group_threads = static_cast<long long>(n_rows) * 8;
+        group_decode_rows_kernel<<<static_cast<int>((group_threads + kGroupDecodeThreads - 1) /
+                                                    kGroupDecodeThreads),
+                                   kGroupDecodeThreads>>>(d_codes, d_meta, d_in_row, d_on_chip,
+                                                          n_rows, role_count, kv_heads,
+                                                          rows_per_block, first_position);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<std::uint16_t> thread_rows(fx.rows.size());
+        std::vector<std::uint16_t> in_row(fx.rows.size());
+        std::vector<std::uint16_t> on_chip(fx.rows.size());
+        CUDA_CHECK(cudaMemcpy(thread_rows.data(), d_decoded_rotated, thread_rows.size() * 2,
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(in_row.data(), d_in_row, in_row.size() * 2, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(
+            cudaMemcpy(on_chip.data(), d_on_chip, on_chip.size() * 2, cudaMemcpyDeviceToHost));
+        std::size_t differ_in_row = 0, differ_thread = 0;
+        for (std::size_t i = 0; i < on_chip.size(); ++i) {
+            differ_in_row += on_chip[i] != in_row[i] ? 1 : 0;
+            differ_thread += on_chip[i] != thread_rows[i] ? 1 : 0;
+        }
+        std::printf("group decode, symbols on chip vs in the row: %zu of %zu elements differ; "
+                    "vs the per-thread decode: %zu\n",
+                    differ_in_row, on_chip.size(), differ_thread);
+        check(differ_in_row == 0, "on-chip symbol staging changes a decoded bit");
+        check(differ_thread == 0, "on-chip group decode disagrees with hq_decode_row_thread");
+        CUDA_CHECK(cudaFree(d_in_row));
+        CUDA_CHECK(cudaFree(d_on_chip));
+    }
 
     __nv_bfloat16* d_reconstructed;
     CUDA_CHECK(cudaMalloc(&d_reconstructed, fx.rows.size() * 2));

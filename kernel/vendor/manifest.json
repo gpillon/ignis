@@ -497,7 +497,12 @@
     },
     {
       "path": "src/ops/kernel/gqa_attention_prefill_hq.cuh",
-      "sha256": "9076eb3e89a5d13fae19d16345c58231efa59f5834d05b6967187570d47c7637"
+      "sha256": "9076eb3e89a5d13fae19d16345c58231efa59f5834d05b6967187570d47c7637",
+      "patch": {
+        "diff": "patches/src/ops/kernel/gqa_attention_prefill_hq.cuh.diff",
+        "sha256": "3c470e365006883017b6d14189cdc664f67b9ceb55a97ec4039fc3c560d2eb95",
+        "reason": "ADR 0031: cometkim feat/1m-context (2026-09-10). The hq-e8-2b prompt scratch decoder stages its temporary Rice symbols in shared memory instead of the output row in device memory, and moves each lattice word as one 16-byte vector; the default call (every other caller) is unchanged. Bit-exact. Fork, same artifact: prefill +16.2% at 262,144 populated tokens. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+      }
     },
     {
       "path": "src/ops/kernel/gqa_attention_prefill_i8.cuh",
@@ -505,7 +510,12 @@
     },
     {
       "path": "src/ops/kernel/hq_codec.cuh",
-      "sha256": "bf75965478c764367af55406315af3f82538db965aa1f5d8c83a7bd602760e4a"
+      "sha256": "bf75965478c764367af55406315af3f82538db965aa1f5d8c83a7bd602760e4a",
+      "patch": {
+        "diff": "patches/src/ops/kernel/hq_codec.cuh.diff",
+        "sha256": "d41e881419d69c3c3413197ec4e518cad08c1004e1e2c4169385bea7e1422ff5",
+        "reason": "ADR 0031: cometkim feat/1m-context (2026-09-10). The hq-e8-2b prompt scratch decoder stages its temporary Rice symbols in shared memory instead of the output row in device memory, and moves each lattice word as one 16-byte vector; the default call (every other caller) is unchanged. Bit-exact. Fork, same artifact: prefill +16.2% at 262,144 populated tokens. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+      }
     },
     {
       "path": "src/ops/kernel/kv_cache_append_prefix.cuh",
@@ -541,7 +551,12 @@
     },
     {
       "path": "src/ops/kernel/rmsnorm.cuh",
-      "sha256": "dcb07eaebec28134e0a7afb70a782f9cec2c7264f74d2e00bb29214472aba38d"
+      "sha256": "dcb07eaebec28134e0a7afb70a782f9cec2c7264f74d2e00bb29214472aba38d",
+      "patch": {
+        "diff": "patches/src/ops/kernel/rmsnorm.cuh.diff",
+        "sha256": "d2efc2716136fb89d1e6192a9bfaa424126a7f8fa759fadc629c8eca4f739832",
+        "reason": "ADR 0031: upstream 9954867a (PR #150), hand-merged onto the fork's PDL launches. RMSNorm issues its weight (and gate) loads in the same pass as x, so the two trips to memory overlap across the reduction; the gated epilogue keeps the un-prefetched kernel past 170 blocks. Same values, same summation order. Upstream: decode +1.5..2.6%. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+      }
     },
     {
       "path": "src/ops/kernel/rope.cuh",
@@ -766,7 +781,12 @@
     },
     {
       "path": "src/ops/launcher/rmsnorm.cu",
-      "sha256": "3ddb73f8ff3a887770f70125eab864b06ad6936c8d0772c3f13a40f09163bed0"
+      "sha256": "3ddb73f8ff3a887770f70125eab864b06ad6936c8d0772c3f13a40f09163bed0",
+      "patch": {
+        "diff": "patches/src/ops/launcher/rmsnorm.cu.diff",
+        "sha256": "4d764b8e746d2e9a0e168f339d473a59b1bb022bab2ea4704c7c99f980e44055",
+        "reason": "ADR 0031: upstream 9954867a (PR #150), hand-merged onto the fork's PDL launches. RMSNorm issues its weight (and gate) loads in the same pass as x, so the two trips to memory overlap across the reduction; the gated epilogue keeps the un-prefetched kernel past 170 blocks. Same values, same summation order. Upstream: decode +1.5..2.6%. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+      }
     },
     {
       "path": "src/ops/launcher/rmsnorm.h",
@@ -962,7 +982,12 @@
     },
     {
       "path": "src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh",
-      "sha256": "24e6a6be6b2f56c7a6be942d954f00326cbef9c8df58047cfe614ef1bbebca1f"
+      "sha256": "24e6a6be6b2f56c7a6be942d954f00326cbef9c8df58047cfe614ef1bbebca1f",
+      "patch": {
+        "diff": "patches/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh.diff",
+        "sha256": "946850f7e40fc2cee5e895e1d6d8b4c01d986ff37585f527fe7d0861bfea3df1",
+        "reason": "ADR 0031: upstream ee9d5192 (PR #204), hand-merged onto the fork's Windows TMA descriptor and mbarrier spellings. The W4A4 TMA CTAs are rasterised token-fastest so the CTAs sharing a weight tile run together, and each activation-scale box is fetched once per pair of K tiles into a two-slot buffer; stage counts are limited to 2 or 3, where the slot reuse is safe (upstream allows >= 2). Output bit-identical. Upstream: operator x1.09-1.20, prefill +7.7..9.3%. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+      }
     },
     {
       "path": "src/ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h",
@@ -1266,7 +1291,12 @@
     },
     {
       "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp",
-      "sha256": "0f3a3694334c71c0b918c2c7def395ce0bac7eabe827494f4ba33d7683d4a439"
+      "sha256": "0f3a3694334c71c0b918c2c7def395ce0bac7eabe827494f4ba33d7683d4a439",
+      "patch": {
+        "diff": "patches/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp.diff",
+        "sha256": "a7ce934c91c87bce2376f905cf20c4c81c28f061e11cd6eb2619dc23377d3468",
+        "reason": "ADR 0031: upstream 1c8f8acc + 0f0899c9. The fused NVFP4 W4A4 SwiGLU was registered through T=48 only, so every batch-wide verify round of 7-8 lanes (T=56/64) materialized the 34816xT gate/up rows and read them back on all 64 layers. It now stays fused through T=128 (M64N128 to 64, M96N128 to 96, M128N128 to 128); the fork's M16N256 keeps T<=16. Upstream: operator 150.5 -> 74.7 us. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+      }
     },
     {
       "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h",
@@ -1278,7 +1308,12 @@
     },
     {
       "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu",
-      "sha256": "c9e75a41f31176cc98f7ea04d246592a1e88222777622a3dc062e601709eafce"
+      "sha256": "c9e75a41f31176cc98f7ea04d246592a1e88222777622a3dc062e601709eafce",
+      "patch": {
+        "diff": "patches/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu.diff",
+        "sha256": "af0871346d341446f463ad4d538e9576427bf63cf88c27174a4f151726363c84",
+        "reason": "ADR 0031: upstream 1c8f8acc + 0f0899c9. The fused NVFP4 W4A4 SwiGLU was registered through T=48 only, so every batch-wide verify round of 7-8 lanes (T=56/64) materialized the 34816xT gate/up rows and read them back on all 64 layers. It now stays fused through T=128 (M64N128 to 64, M96N128 to 96, M128N128 to 128); the fork's M16N256 keeps T<=16. Upstream: operator 150.5 -> 74.7 us. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+      }
     },
     {
       "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu",
@@ -1286,7 +1321,12 @@
     },
     {
       "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh",
-      "sha256": "a5ec67c5fa20727112e11cc850d02be4399daa03e28ddd54b8d7a02ece209156"
+      "sha256": "a5ec67c5fa20727112e11cc850d02be4399daa03e28ddd54b8d7a02ece209156",
+      "patch": {
+        "diff": "patches/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh.diff",
+        "sha256": "8e67a329b0eb96504b383f73210d7288d57c0ab728c9d571002cecbd045898e7",
+        "reason": "ADR 0031: upstream ee9d5192 (PR #204), hand-merged onto the fork's Windows TMA descriptor and mbarrier spellings. The W4A4 TMA CTAs are rasterised token-fastest so the CTAs sharing a weight tile run together, and each activation-scale box is fetched once per pair of K tiles into a two-slot buffer; stage counts are limited to 2 or 3, where the slot reuse is safe (upstream allows >= 2). Output bit-identical. Upstream: operator x1.09-1.20, prefill +7.7..9.3%. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+      }
     },
     {
       "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h",
@@ -1478,7 +1518,12 @@
     },
     {
       "path": "tests/ops/linear_swiglu/test_nvfp4.cpp",
-      "sha256": "7ba75d771b7f0514e4e227ef90c4732789e7325f15c5381cc9a0c99a609b114e"
+      "sha256": "7ba75d771b7f0514e4e227ef90c4732789e7325f15c5381cc9a0c99a609b114e",
+      "patch": {
+        "diff": "patches/tests/ops/linear_swiglu/test_nvfp4.cpp.diff",
+        "sha256": "897f450df5e5ff90415ee979bcf30fe1af86076b2a07f58d52976bf26e29b81f",
+        "reason": "ADR 0031: upstream 1c8f8acc + 0f0899c9. The fused NVFP4 W4A4 SwiGLU was registered through T=48 only, so every batch-wide verify round of 7-8 lanes (T=56/64) materialized the 34816xT gate/up rows and read them back on all 64 layers. It now stays fused through T=128 (M64N128 to 64, M96N128 to 96, M128N128 to 128); the fork's M16N256 keeps T<=16. Upstream: operator 150.5 -> 74.7 us. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md. (the A4 cases cover every new schedule boundary)"
+      }
     },
     {
       "path": "tests/ops/norm_test_common.h",
@@ -1613,7 +1658,12 @@
     },
     {
       "path": "tests/ops/test_rmsnorm.cpp",
-      "sha256": "6ad3623590aa12b08d19c0b73cad6e81cfed5719e0abd296842364011d88b16a"
+      "sha256": "6ad3623590aa12b08d19c0b73cad6e81cfed5719e0abd296842364011d88b16a",
+      "patch": {
+        "diff": "patches/tests/ops/test_rmsnorm.cpp.diff",
+        "sha256": "1cf2d39d725387f31cd8e17b860827d5e3b06ab43eb1a9ce41903350c1096f97",
+        "reason": "ADR 0031: upstream 9954867a (PR #150), hand-merged onto the fork's PDL launches. RMSNorm issues its weight (and gate) loads in the same pass as x, so the two trips to memory overlap across the reduction; the gated epilogue keeps the un-prefetched kernel past 170 blocks. Same values, same summation order. Upstream: decode +1.5..2.6%. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md. (adds upstream's [5120,1024] case)"
+      }
     },
     {
       "path": "tests/ops/test_rope.cpp",
