@@ -112,6 +112,30 @@ export IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
 The artifact carries a grafted DFlash2 drafter module, which `--spec dflash2`
 loads for speculative decoding and which costs no VRAM when speculation is off.
 
+### The uncensored variant
+
+[`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer)
+is the same image with the
+[huihui-ai abliteration](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated)
+applied. It is the same container: 1,255 of the 1,325 objects are
+byte-identical to the default image, and only the 70 matrices the abliteration
+changed are re-encoded. **It does not refuse**, so put the guardrails in the
+tool layer.
+
+The server never fetches it on its own. Download it next to the default image
+and point at it:
+
+```
+hf download gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer --local-dir models
+ignis-server --artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
+make dev UNCENSORED=1   # the same, from a checkout
+```
+
+The model id stays `qwen3.8-27b` unless `--model` names another one. The
+pointing heads and the DFlash2 drafter load unchanged. They were fitted to the
+default weights, and the target still verifies every draft, so the drafter
+can only change the acceptance rate.
+
 ---
 
 ## Configuration
@@ -488,7 +512,9 @@ Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
 With `CUDA=1` the server starts in the gate configuration: the full
 `MAX_CONTEXT=262144`, `KV_FORMAT=hq-e8-2b`, `SPEC=dflash2` with
 `DRAFT_TOKENS=7`, `KV_HOST_POOL_BYTES=8G`, `REQUEST_TIMEOUT=1800`. `SPEC=` turns
-speculation off. `VISION=1` loads the tower; `ROPE_SCALING=yarn:4` rescales the
+speculation off. `VISION=1` loads the tower; `UNCENSORED=1` loads
+[the uncensored variant](#the-uncensored-variant) in place of the default
+image; `ROPE_SCALING=yarn:4` rescales the
 envelope; `METRICS=1` starts the metrics listener; `API_KEY=` and `EXPOSE=` set
 the access flags; `ARGS='…'` passes anything verbatim.
 

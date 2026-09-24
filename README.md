@@ -219,6 +219,7 @@ directory the server fetches one and verifies it. The Playground is then at
 make doctor          # toolchain, rust target, artifact, web deps
 make dev             # build web + kernel + GPU server, then run it
 make dev VISION=1    # the same, with the vision tower loaded for image input
+make dev UNCENSORED=1  # the same, on the uncensored (abliterated) weights
 make mock            # the same with no GPU, no kernel, no artifact
 ```
 

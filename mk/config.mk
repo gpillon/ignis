@@ -23,7 +23,17 @@ METRICS ?= 0
 METRICS_BIND ?=
 
 # The .ninfer container (used with CUDA=1 only). See README "Models".
-ARTIFACT ?= ./models/qwen3_8_27b_nvfp4full-v2.ninfer
+# UNCENSORED=1 takes the huihui-abliterated twin of the default image from the
+# same directory instead: the same container with the 70 matrices the
+# abliteration changed re-encoded, and no refusals. The server never fetches
+# it; docs/user "The uncensored variant" says where it lives. A named ARTIFACT
+# wins over both.
+UNCENSORED ?=
+ifeq ($(UNCENSORED),1)
+  ARTIFACT ?= ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
+else
+  ARTIFACT ?= ./models/qwen3_8_27b_nvfp4full-v2.ninfer
+endif
 
 # Server settings. Empty = the server's own default.
 BIND ?= 127.0.0.1:8000

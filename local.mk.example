@@ -10,6 +10,9 @@
 # The artifact somewhere else:
 # ARTIFACT := F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer
 
+# The uncensored (huihui-abliterated) image from the same models directory:
+# UNCENSORED := 1
+
 # Another port (ninfer on 8000, say):
 # BIND := 127.0.0.1:8001
 

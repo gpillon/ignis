@@ -80,6 +80,8 @@ SERVER_STAMP := $(BIN_DIR)/ignis-server.backend
 BUILT_BACKEND = $(strip $(if $(wildcard $(SERVER_STAMP)),$(file < $(SERVER_STAMP))))
 
 SERVER_URL := http://$(BIND)
+# Where the UNCENSORED=1 image is published (fetched by hand, never by the server).
+UNCENSORED_REPO := gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer
 # The server's own default when METRICS_BIND is empty (DEFAULT_METRICS_BIND).
 METRICS_URL := http://$(or $(METRICS_BIND),127.0.0.1:9464)
 SERVER_PID := $(RUNTIME_DIR)/ignis-server.pid
@@ -172,6 +174,7 @@ config: ## Print the resolved knobs and paths
 	@echo "UI              $(UI)"
 	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(Prometheus: $(METRICS_URL)/metrics; Playground: /ui/metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(off))"
 	@echo "ARTIFACT        $(ARTIFACT)"
+	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image),off)"
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),rest of the VRAM budget) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD))) rope=$(or $(ROPE_SCALING),none)"
 	@echo "VISION (CUDA=1) $(if $(filter 1,$(VISION)),on  max_tokens=$(or $(VISION_MAX_TOKENS),(server default)),off  (image parts are refused with vision_disabled))"
 	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1G))) retained_slots=$(or $(RETAINED_SLOTS),(server default: one per lane))"
@@ -344,7 +347,7 @@ $(SERVER_BIN): $(SERVER_INPUTS)
 
 .PHONY: _require-artifact
 _require-artifact:
-	@[ -f "$(ARTIFACT)" ] || { echo "error: artifact not found: $(ARTIFACT)"; echo "  fix: ARTIFACT=<path.ninfer>, or CUDA=0 for the CPU mock"; exit 1; }
+	@[ -f "$(ARTIFACT)" ] || { echo "error: artifact not found: $(ARTIFACT)"; echo "  fix: ARTIFACT=<path.ninfer>, or CUDA=0 for the CPU mock"; $(if $(filter 1,$(UNCENSORED)),echo "  fetch: hf download $(UNCENSORED_REPO) --local-dir models";) exit 1; }
 
 # ---------------------------------------------------------------------------
 ##@ Web (Playground)
