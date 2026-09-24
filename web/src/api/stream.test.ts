@@ -81,6 +81,25 @@ describe("streamChat", () => {
     expect(t.endedAt).toBeGreaterThanOrEqual(t.lastTokenAt!);
   });
 
+  it("records where the thinking budget forced the reasoning closed, and nothing for a reply that closed it itself", async () => {
+    const forced = `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop", thinking_budget_forced_at: 2048 }] })}\n\n`;
+    const budgeted = await streamChat({
+      body: {},
+      fetch: fakeFetch([sse({ reasoning_content: "hm" }) + sse({ content: "Hi" }) + forced + "data: [DONE]\n\n"]),
+      now: ticking(),
+      onEvent: () => {},
+    });
+    expect(budgeted.timeline).toMatchObject({ finishReason: "stop", thinkingForcedAt: 2048 });
+
+    const free = await streamChat({
+      body: {},
+      fetch: fakeFetch([sse({ content: "Hi" }) + sse({}, "stop") + "data: [DONE]\n\n"]),
+      now: ticking(),
+      onEvent: () => {},
+    });
+    expect("thinkingForcedAt" in free.timeline).toBe(false);
+  });
+
   it("reassembles a UTF-8 character split across two body reads", async () => {
     const bytes = new TextEncoder().encode(sse({ content: "caffè" }) + sse({}, "stop") + "data: [DONE]\n\n");
     const cut = bytes.indexOf(0xc3) + 1; // inside the two-byte "è"

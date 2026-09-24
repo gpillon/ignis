@@ -63,6 +63,7 @@ async function sendChat(options: StreamOptions): Promise<StreamResult> {
             timeline.lastTokenAt = at;
           } else if (event.kind === "finish") {
             timeline.finishReason = event.reason;
+            if (event.thinkingForcedAt !== undefined) timeline.thinkingForcedAt = event.thinkingForcedAt;
           } else if (event.kind === "usage") {
             timeline.usage = event.usage;
           } else if (event.kind === "done") {

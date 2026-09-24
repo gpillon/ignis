@@ -1,4 +1,5 @@
 import { useLayoutEffect, useRef, useState } from "react";
+import { BudgetReached } from "../metrics/BudgetReached.tsx";
 import { Readout } from "../metrics/Readout.tsx";
 import type { Message } from "../sessions/sessions.ts";
 import { AgentStrip } from "../tools/agents/AgentStrip.tsx";
@@ -41,6 +42,7 @@ export function Reply(props: {
         <details className="reasoning" open={thinking}>
           <summary className="cursor-pointer select-none font-display text-[13px] font-medium text-ash hover:text-ink">
             {thinking ? "Thinking…" : "Reasoning"}
+            {m.figures?.thinkingForcedAt !== undefined && <BudgetReached at={m.figures.thinkingForcedAt} />}
           </summary>
           <pre
             ref={reasoningView}

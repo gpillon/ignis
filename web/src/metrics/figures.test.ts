@@ -79,6 +79,12 @@ describe("computeFigures", () => {
     });
   });
 
+  it("keeps where the thinking budget forced the reasoning closed, and leaves it out when it did not", () => {
+    const base = { sentAt: 0, firstTokenAt: 10, lastTokenAt: 50, endedAt: 60, usage, finishReason: "stop", stopped: false };
+    expect(computeFigures({ ...base, thinkingForcedAt: 2048 }).thinkingForcedAt).toBe(2048);
+    expect("thinkingForcedAt" in computeFigures(base)).toBe(false);
+  });
+
   it("has no TTFT when no token ever arrived", () => {
     const figures = computeFigures({ sentAt: 0, endedAt: 30, stopped: false });
     expect(figures.ttftMs).toBeNull();
