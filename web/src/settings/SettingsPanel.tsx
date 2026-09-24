@@ -10,6 +10,7 @@ import { Slider } from "../ui/Slider.tsx";
 import { Switch } from "../ui/Switch.tsx";
 import { EFFORT_LABELS, type PlaygroundSettings } from "./defaults.ts";
 import { SystemPromptField } from "./SystemPromptField.tsx";
+import { ThinkingBudgetField } from "./ThinkingBudgetField.tsx";
 
 type Tab = "general" | "tools";
 
@@ -86,13 +87,21 @@ function GeneralSettings(props: {
         ignis={ignisPrompt(props.tools, { notes, attachments: props.attachments })}
       />
 
-      <Segmented
-        legend="Thinking"
-        name="effort"
-        value={settings.reasoningEffort}
-        options={REASONING_EFFORTS.map((effort) => ({ value: effort, label: EFFORT_LABELS[effort] }))}
-        onChange={(v) => set("reasoningEffort", v)}
-      />
+      <div className="flex flex-col gap-4">
+        <Segmented
+          legend="Thinking"
+          name="effort"
+          value={settings.reasoningEffort}
+          options={REASONING_EFFORTS.map((effort) => ({ value: effort, label: EFFORT_LABELS[effort] }))}
+          onChange={(v) => set("reasoningEffort", v)}
+        />
+        <ThinkingBudgetField
+          budget={settings.thinkingBudget}
+          effort={settings.reasoningEffort}
+          maxTokens={settings.maxTokens}
+          onChange={(v) => set("thinkingBudget", v)}
+        />
+      </div>
 
       <div className="flex flex-col gap-4">
         <Slider label="Temperature" name="temperature" min={0} max={2} step={0.05} value={settings.temperature} onChange={(v) => set("temperature", v)} />
