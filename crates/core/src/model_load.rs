@@ -29,7 +29,7 @@ use ignis_artifact::{
 use crate::compute::{LayerKind, ModelConfig};
 use crate::kv_format::KvFormat;
 use crate::rope_scaling::RopeScaling;
-use crate::speculation::{SpeculativeBackend, Speculation};
+use crate::speculation::{ProposalHead, SpeculativeBackend, Speculation};
 use crate::vision::Vision;
 
 pub(crate) mod ffi {
@@ -281,7 +281,10 @@ fn is_weight_only_nvfp4(name: &str) -> bool {
 /// scopes.
 pub fn draft_module(speculation: Option<Speculation>) -> Option<DraftModule> {
     speculation.and_then(|s| match s.backend() {
-        SpeculativeBackend::Dflash2 => Some(DraftModule::Dflash2),
+        SpeculativeBackend::Dflash2 => Some(match s.proposal_head() {
+            ProposalHead::Full => DraftModule::Dflash2,
+            ProposalHead::Shortlist => DraftModule::Dflash2ShortlistHead,
+        }),
         // The verify substrate binds no drafter (P5-04, GitHub #153): the
         // text scope alone.
         SpeculativeBackend::VerifyOnly => None,
@@ -810,6 +813,13 @@ mod tests {
         assert_eq!(draft_module(None), None);
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
         assert_eq!(draft_module(Some(spec)), Some(DraftModule::Dflash2));
+        let shortlist = spec.with_proposal_head(ProposalHead::Shortlist);
+        assert_eq!(draft_module(Some(shortlist)), Some(DraftModule::Dflash2ShortlistHead));
+        // The verify substrate binds no drafter, so no head either.
+        let verify_only = Speculation::new(SpeculativeBackend::VerifyOnly, 7)
+            .unwrap()
+            .with_proposal_head(ProposalHead::Shortlist);
+        assert_eq!(draft_module(Some(verify_only)), None);
     }
 
     #[test]

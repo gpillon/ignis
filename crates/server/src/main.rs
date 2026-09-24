@@ -176,7 +176,12 @@ fn cuda_scheduler(
                 kv_format = shape.kv_format.as_str(),
                 speculation = %shape.speculation.map_or_else(
                     || "off".to_owned(),
-                    |s| format!("{} draft_tokens={}", s.backend().as_str(), s.draft_tokens())
+                    |s| format!(
+                        "{} draft_tokens={} draft_head={}",
+                        s.backend().as_str(),
+                        s.draft_tokens(),
+                        s.proposal_head().as_str()
+                    )
                 ),
                 vision = %shape.vision.map_or_else(
                     || "off".to_owned(),

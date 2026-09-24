@@ -101,11 +101,53 @@ impl SpeculativeBackend {
     }
 }
 
-/// A validated speculation option: a backend and its draft window.
+/// The head the drafter scores its draft columns with.
+///
+/// The artifact carries two: the target's own output head (W8, all 248,320
+/// rows, 1.27 GB streamed per round) and a shortlist proposal head
+/// (`text/draft_head`, Q4 over the 131,072 most frequent tokens, 356 MB, with
+/// `text/draft_head_token_ids` mapping its rows back to token ids). The verify
+/// round always scores with the full head, so what a round accepts is still
+/// the target's choice: a token outside the shortlist is still produced, it
+/// is just never drafted. The text moves only where every verify round's
+/// does -- at a near tie, since different drafts group positions into
+/// different rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProposalHead {
+    /// The target's output head (the only one before the shortlist existed).
+    #[default]
+    Full,
+    /// The artifact's Q4 shortlist head: bound beside the full head, so it
+    /// costs its 356 MB of device memory.
+    Shortlist,
+}
+
+impl ProposalHead {
+    /// Parse the operator's spelling (`--draft-head`), naming the accepted
+    /// values on a refusal.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "full" => Ok(Self::Full),
+            "shortlist" => Ok(Self::Shortlist),
+            other => Err(format!("unknown draft head `{other}` (expected full or shortlist)")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Shortlist => "shortlist",
+        }
+    }
+}
+
+/// A validated speculation option: a backend, its draft window and the
+/// drafter's proposal head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Speculation {
     backend: SpeculativeBackend,
     draft_tokens: u32,
+    proposal_head: ProposalHead,
 }
 
 impl Speculation {
@@ -120,7 +162,17 @@ impl Speculation {
         Ok(Self {
             backend,
             draft_tokens,
+            proposal_head: ProposalHead::Full,
         })
+    }
+
+    /// The same option with the drafter scoring through `proposal_head`.
+    pub fn with_proposal_head(self, proposal_head: ProposalHead) -> Self {
+        Self { proposal_head, ..self }
+    }
+
+    pub fn proposal_head(&self) -> ProposalHead {
+        self.proposal_head
     }
 
     pub fn backend(&self) -> SpeculativeBackend {

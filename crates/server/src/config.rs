@@ -69,7 +69,7 @@ pub use ignis_core::{KvFormat, VramMode};
 /// `--vram-headroom-bytes`' default: what a derived VRAM budget leaves to the
 /// desktop and every other process on the card (GitHub #210).
 pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
-pub use ignis_core::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
+pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, Speculation, SpeculativeBackend};
 
 pub use ignis_core::{MAX_YARN_FACTOR, RopeScaling};
 pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision};
@@ -342,6 +342,7 @@ pub fn resolve(
     let mut request_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
+    let mut draft_head = None;
     let mut vision = false;
     let mut vision_max_tokens = None;
     let mut vision_embedding_pool_mib = None;
@@ -388,6 +389,7 @@ pub fn resolve(
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
+            "--draft-head" => draft_head = Some(take_value(args, &mut i, flag)?),
             "--rope-scaling" => rope_scaling = Some(take_value(args, &mut i, flag)?),
             "--vision" => vision = true,
             "--vision-max-tokens" => vision_max_tokens = Some(take_value(args, &mut i, flag)?),
@@ -472,7 +474,7 @@ pub fn resolve(
         )?,
     };
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
-    let speculation = resolve_speculation(spec, draft_tokens, &env)?;
+    let speculation = resolve_speculation(spec, draft_tokens, draft_head, &env)?;
     let vision = resolve_vision(vision, vision_max_tokens, vision_embedding_pool_mib, &env)?;
     let rope_scaling = resolve_rope_scaling(rope_scaling, &env)?;
     // GitHub #195 lifted #178's refusal of the two together: the drafter
@@ -751,15 +753,24 @@ fn resolve_media(
 /// has nothing to size, so naming one alone is refused rather than ignored.
 /// With `--spec`, the window is required — there is no default window to
 /// guess — and anything outside `1..MAX_DRAFT_TOKENS` is refused naming the
-/// range.
+/// range. `--draft-head` / `IGNIS_DRAFT_HEAD` picks the drafter's proposal
+/// head (`full` by default); like the window, it has nothing to choose
+/// without `--spec`.
 fn resolve_speculation(
     spec: Option<String>,
     draft_tokens: Option<String>,
+    draft_head: Option<String>,
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Speculation>, ConfigError> {
     let spec = non_empty(spec.or_else(|| env("IGNIS_SPEC")));
     let draft_tokens = non_empty(draft_tokens.or_else(|| env("IGNIS_DRAFT_TOKENS")));
+    let draft_head = non_empty(draft_head.or_else(|| env("IGNIS_DRAFT_HEAD")));
     let Some(spec) = spec else {
+        if let Some(raw) = draft_head {
+            return Err(ConfigError(format!(
+                "`--draft-head {raw}` requires `--spec` (speculation is off without it)"
+            )));
+        }
         return match draft_tokens {
             Some(raw) => Err(ConfigError(format!(
                 "`--draft-tokens {raw}` requires `--spec` (speculation is off without it)"
@@ -769,6 +780,10 @@ fn resolve_speculation(
     };
     let backend =
         SpeculativeBackend::parse(&spec).map_err(|e| ConfigError(format!("`--spec`: {e}")))?;
+    let proposal_head = draft_head
+        .map(|raw| ProposalHead::parse(&raw).map_err(|e| ConfigError(format!("`--draft-head`: {e}"))))
+        .transpose()?
+        .unwrap_or_default();
     let Some(raw) = draft_tokens else {
         return Err(ConfigError(format!(
             "`--spec {}` requires `--draft-tokens N` (N in 1..{MAX_DRAFT_TOKENS})",
@@ -778,7 +793,9 @@ fn resolve_speculation(
     let out_of_range =
         || ConfigError(format!("`--draft-tokens` must be in 1..{MAX_DRAFT_TOKENS}, got `{raw}`"));
     let n = raw.trim().parse::<u32>().map_err(|_| out_of_range())?;
-    Speculation::new(backend, n).map(Some).map_err(|_| out_of_range())
+    Speculation::new(backend, n)
+        .map(|s| Some(s.with_proposal_head(proposal_head)))
+        .map_err(|_| out_of_range())
 }
 
 /// Parse a `u32` count for `flag`, naming the flag, `unit`, and the
@@ -1150,6 +1167,7 @@ fn help_text() -> String {
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
+         \x20       --draft-head <head>       env: IGNIS_DRAFT_HEAD     (default: full; needs --spec; full = the drafter proposes with the target's output head, shortlist = with the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM)\n\
          \x20       --rope-scaling <spec>     env: IGNIS_ROPE_SCALING   (default: none; `yarn:F[,t=..][,bf=..][,bs=..]` rescales the checkpoint's trained 262144-position envelope, F in (1, {MAX_YARN_FACTOR}])\n\
          \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
          \x20       --vision-max-tokens <n>   env: IGNIS_VISION_MAX_TOKENS (default: {DEFAULT_VISION_MAX_TOKENS} with --vision; merged vision tokens per request, 1..={VISION_MAX_TOKENS_LIMIT})\n\
@@ -1994,6 +2012,36 @@ mod tests {
     fn a_draft_window_without_spec_is_refused_rather_than_ignored() {
         let err = resolve(&args(&["--draft-tokens", "7"]), no_env).expect_err("no backend");
         assert!(err.0.contains("--spec"), "{}", err.0);
+    }
+
+    #[test]
+    fn the_draft_head_defaults_to_full_and_takes_shortlist_by_flag_or_env() {
+        let a = args(&["--spec", "dflash2", "--draft-tokens", "7"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(config.speculation.map(|s| s.proposal_head()), Some(ProposalHead::Full));
+
+        let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--draft-head", "shortlist"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(config.speculation.map(|s| s.proposal_head()), Some(ProposalHead::Shortlist));
+        assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(7));
+
+        let env = env_map(&[
+            ("IGNIS_SPEC", "dflash2"),
+            ("IGNIS_DRAFT_TOKENS", "7"),
+            ("IGNIS_DRAFT_HEAD", "shortlist"),
+        ]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.speculation.map(|s| s.proposal_head()), Some(ProposalHead::Shortlist));
+    }
+
+    #[test]
+    fn a_draft_head_without_spec_or_with_an_unknown_name_is_refused() {
+        let err = resolve(&args(&["--draft-head", "shortlist"]), no_env).expect_err("no backend");
+        assert!(err.0.contains("--draft-head") && err.0.contains("--spec"), "{}", err.0);
+
+        let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--draft-head", "tiny"]);
+        let err = resolve(&a, no_env).expect_err("unknown head");
+        assert!(err.0.contains("--draft-head") && err.0.contains("tiny"), "{}", err.0);
     }
 
     #[test]

@@ -435,6 +435,14 @@ struct ignis_model {
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   Dflash2Weights dflash2{};
+  // The drafter's shortlist proposal head (`text/draft_head`, Q4 over the
+  // 131,072 most frequent tokens) and the token id each of its rows stands
+  // for (`text/draft_head_token_ids`), bound when the load hands both over;
+  // `proposal_token_ids` is null otherwise and the drafter scores its draft
+  // columns with `output_head`. Only what is drafted changes: the verify
+  // round always scores with the full head.
+  ninfer::Weight proposal_head{};
+  const std::int32_t *proposal_token_ids = nullptr;
 
   // GitHub #177: the vision tower, bound in its stored formats when the load
   // names a vision envelope (`vision_max_tokens > 0`), and one item's output

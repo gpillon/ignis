@@ -260,6 +260,24 @@ fn real_nvfp4full_dflash2_plan_extends_the_text_plan() {
         .filter(|n| n.starts_with("dflash2/"))
         .collect();
     assert_eq!(drafter_names, every_dflash2, "every dflash2/* object, and nothing else");
+
+    // The shortlist proposal head: the same drafter plan, then the two
+    // out-of-scope text objects, in the container's stored formats.
+    let (shortlist_plan, shortlist_handles) =
+        bind_model_scope_27b(&reader, Some(DraftModule::Dflash2ShortlistHead))
+            .expect("bind with the shortlist head");
+    assert_eq!(shortlist_plan.object_count, plan.object_count + 2);
+    assert_eq!(&shortlist_handles[..handles.len()], handles.as_slice());
+    assert_eq!(
+        &shortlist_plan.device_objects[..plan.device_objects.len()],
+        plan.device_objects.as_slice(),
+        "every drafter placement keeps its offset"
+    );
+    let head_names: Vec<&str> = shortlist_plan.device_objects[plan.device_objects.len()..]
+        .iter()
+        .map(|p| reader.objects()[p.handle.index].name())
+        .collect();
+    assert_eq!(head_names, OUT_OF_SCOPE_TEXT_NAMES);
 }
 
 /// The vision tower's table (`inventory::vision_scope_27b`, GitHub #177)

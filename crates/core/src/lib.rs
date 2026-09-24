@@ -103,7 +103,7 @@ pub use rope_scaling::{
     DEFAULT_YARN_BETA_FAST, DEFAULT_YARN_BETA_SLOW, DEFAULT_YARN_TEMPERATURE,
     MAX_YARN_FACTOR, RopeScaling, RopeScalingError,
 };
-pub use speculation::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
+pub use speculation::{MAX_DRAFT_TOKENS, ProposalHead, Speculation, SpeculativeBackend};
 pub use vision::{
     DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,
     VisionEnvelopeOutOfRange,

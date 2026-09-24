@@ -208,6 +208,8 @@ class ModelBinder {
     return true;
   }
 
+  bool has(const std::string &name) const { return index_.find(name) != index_.end(); }
+
   bool require_no_extras() const {
     for (uint64_t i = 0; i < used_.size(); ++i) {
       if (!used_[i]) {
@@ -308,6 +310,9 @@ constexpr int64_t kDflash2HeadDim = 128;
 constexpr int64_t kDflash2ConvTaps = 2;
 constexpr int64_t kDflash2ConvProjRows = 1280; // 320 groups x 2 taps x 2
 constexpr int64_t kDflash2SelectorRank = 256;
+// The shortlist proposal head's rows (`text/draft_head`): the 131,072 most
+// frequent tokens, each mapped back by `text/draft_head_token_ids`.
+constexpr int64_t kProposalHeadRows = 131072;
 constexpr int64_t kDflash2WindowTokens = 2048;
 
 bool bind_dflash2_layer(ModelBinder &binder, const std::string &prefix, const Geometry &g,
@@ -1053,6 +1058,19 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // that hands them over anyway fails on `require_no_extras` below.
   if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 && !bind_dflash2(binder, g, model->dflash2)) {
     return nullptr;
+  }
+  // The shortlist proposal head is the caller's choice (the artifact always
+  // carries it): bound when either half is handed over, so a load that sends
+  // one without the other fails naming the missing one, and one without a
+  // drafter fails on `require_no_extras`.
+  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 &&
+      (binder.has("text/draft_head") || binder.has("text/draft_head_token_ids"))) {
+    ninfer::Weight token_ids{};
+    if (!binder.bind("text/draft_head", {kProposalHeadRows, g.hidden}, model->proposal_head) ||
+        !binder.bind("text/draft_head_token_ids", {kProposalHeadRows}, token_ids)) {
+      return nullptr;
+    }
+    model->proposal_token_ids = static_cast<const std::int32_t *>(token_ids.qdata);
   }
   // GitHub #177: likewise the `vision/*` tensors, only with an envelope.
   if (vision_max_tokens > 0 && !bind_vision(binder, g, model->vision)) {

@@ -57,7 +57,7 @@ use ignis_core::step::{
     capture_decode_graphs, decode_program_batch_sampled, decode_program_verify_runs, prefill_program_sampled,
     program_stats, SamplingParams, VerifyLane, LaneVerifyRun,
 };
-use ignis_core::{KvFormat, Speculation, SpeculativeBackend};
+use ignis_core::{KvFormat, ProposalHead, Speculation, SpeculativeBackend};
 
 use near_tie::assert_equivalent;
 use snapshot_blob::{hq_ring_words, section, read_u64, PROGRESS_DRAFTER_FRONTIER, SECTION_DFLASH_WINDOW, SECTION_PROGRESS};
@@ -586,6 +586,89 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
 /// Two lanes carry prompts longer than the ring, so their slots have wrapped
 /// and a cleared bit is one an older key inside the window named -- the case
 /// the clear exists for; the two canaries have not wrapped.
+/// The shortlist proposal head (`--draft-head shortlist`): the drafter scores
+/// its draft columns with the artifact's Q4 head over the 131,072 most
+/// frequent tokens and maps its rows back to token ids before the selector.
+/// The verify round still scores with the full head, so the text is still
+/// the spec-off text up to the near ties every verify round already has; the
+/// drafts still land, and the graph replay is the eager run bit for bit.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_shortlist_head_drafts_and_the_text_stays_the_spec_off_text() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let encode = |text: &str| -> Vec<i32> {
+        frontend
+            .tokenizer()
+            .encode(text)
+            .unwrap_or_else(|e| panic!("tokenize: {e}"))
+            .into_iter()
+            .map(|id| i32::try_from(id).expect("token id fits i32"))
+            .collect()
+    };
+    let stop_ids: Vec<i32> = ["<|im_end|>", "<|endoftext|>"].iter().flat_map(|marker| encode(marker)).collect();
+    let canaries: Vec<Vec<i32>> = CANARY_PROMPTS
+        .iter()
+        .map(|prompt| encode(&format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")))
+        .collect();
+
+    let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2ShortlistHead))
+        .unwrap_or_else(|e| panic!("bind with the shortlist head: {e}"));
+    let text_len = text_scope_27b().len();
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2 + shortlist head: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    const WIDTH: usize = 4;
+    let off = {
+        let model = load_qwen38_27b(&reader, &artifact, &handles[..text_len], MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16)
+            .unwrap_or_else(|e| panic!("model load (spec-off): {e}"));
+        let pool = pool_for(None, WIDTH as u32);
+        spec_off(&model, &pool, &canaries[..WIDTH], &stop_ids, TOTAL)
+    };
+    let load_shortlist = || {
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW)
+            .unwrap()
+            .with_proposal_head(ProposalHead::Shortlist);
+        load_qwen38_27b_with_speculation(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16, Some(spec))
+            .unwrap_or_else(|e| panic!("model load (dflash2, shortlist head): {e}"))
+    };
+
+    let eager = {
+        let model = load_shortlist();
+        let pool = drafter_pool(WIDTH as u32);
+        spec_on(&model, &pool, &canaries[..WIDTH], &stop_ids, TOTAL, false)
+    };
+    let model = load_shortlist();
+    let pool = drafter_pool(WIDTH as u32);
+    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    assert!(capture.is_ready(WIDTH as u32), "no decode graph at width {WIDTH}");
+    let run = spec_on(&model, &pool, &canaries[..WIDTH], &stop_ids, TOTAL, true);
+    assert_eq!(eager, run, "the shortlist head's graph replay diverged from eager");
+    let probe = || drafter_pool(1);
+    assert_equivalent(&model, &probe, MAX_CONTEXT, &canaries[..WIDTH], &off, &run.emitted, "shortlist head");
+    let accepted = report_acceptance("shortlist head", &run);
+    assert!(accepted > 0, "no draft from the shortlist head ever landed");
+}
+
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft() {

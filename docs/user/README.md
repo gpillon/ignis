@@ -153,6 +153,7 @@ always-current table; this one is a copy.
 | `--kv-host-pool-bytes <bytes>` | `IGNIS_KV_HOST_POOL_BYTES` | `2G` | The KV-RAM host tier. Page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle — and the figure Windows reports as shared GPU memory. `0` disables the host tier. (`make` sets `8G`.) |
 | `--spec <backend>` | `IGNIS_SPEC` | unset | Speculative decoding backend: `dflash2`, or unset for none. |
 | `--draft-tokens <n>` | `IGNIS_DRAFT_TOKENS` | — | Required with `--spec`; 1..7. |
+| `--draft-head <head>` | `IGNIS_DRAFT_HEAD` | `full` | Needs `--spec`. The head the drafter proposes with: `full` (the target's output head) or `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM). What a round accepts is still the target's choice, so the text changes only at near ties; measured on coding prompts `shortlist` accepts 7% fewer tokens per round and is slower overall ([finding](../findings/2026-09-24-upstream-quick-wins-ab.md)). (`make` knob `DRAFT_HEAD`.) |
 | `--rope-scaling <spec>` | `IGNIS_ROPE_SCALING` | none | `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]` rescales the checkpoint's trained 262,144-position envelope. `F` in (1, 64]. |
 
 ### VRAM budget and retained state

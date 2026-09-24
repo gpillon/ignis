@@ -18,6 +18,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/swa.h"
 
 #include <cuda_runtime.h>
@@ -250,10 +251,17 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32
   ninfer::ops::rmsnorm(packed, bf16_tensor(weights.final_norm, {hidden, 1, 1, 1}), kDflash2RmsEps,
                        /*unit_offset=*/false, proposal_hidden, stream);
 
-  // The target's head over the draft columns, their top-k, and the selector
-  // lattice over those candidates, walked into the round's drafts.
-  ninfer::Tensor logits = arena.alloc(ninfer::DType::BF16, {vocab, draft_columns, 1, 1});
-  ninfer::ops::linear(proposal_hidden, model->output_head, logits, stream);
+  // The proposal head over the draft columns, their top-k, and the selector
+  // lattice over those candidates, walked into the round's drafts. The head
+  // is the target's own unless the load bound the shortlist one, whose rows
+  // are the most frequent tokens: its top-k are row indices, mapped back to
+  // token ids before the selector reads them, so everything past this point
+  // sees token ids either way.
+  const bool shortlist = model->proposal_token_ids != nullptr;
+  const ninfer::Weight &head = shortlist ? model->proposal_head : model->output_head;
+  const std::int32_t head_rows = shortlist ? head.n : vocab;
+  ninfer::Tensor logits = arena.alloc(ninfer::DType::BF16, {head_rows, draft_columns, 1, 1});
+  ninfer::ops::linear(proposal_hidden, head, logits, stream);
   ninfer::Tensor candidate_ids    = arena.alloc(ninfer::DType::I32, {top_k, draft_columns, 1, 1});
   ninfer::Tensor candidate_values = arena.alloc(ninfer::DType::BF16, {top_k, draft_columns, 1, 1});
   // Ours rather than the vendored op (kernel/include/ignis_dflash2_topk.h): the
@@ -261,11 +269,16 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32
   // decode round selecting 16 rows of 248,046. Same contract and the same
   // answer bit-for-bit; a shape it does not specialize it forwards.
   const std::size_t topk_workspace_bytes =
-      ignis_dflash2_topk_workspace_bytes(vocab, draft_columns, top_k);
+      ignis_dflash2_topk_workspace_bytes(head_rows, draft_columns, top_k);
   const ninfer::DeviceSpan topk_workspace =
       arena.alloc_bytes(std::max<std::size_t>(topk_workspace_bytes, 1));
   ignis_dflash2_topk(logits, top_k, candidate_ids, candidate_values, topk_workspace.data,
                      topk_workspace.bytes, stream);
+  if (shortlist) {
+    // The op takes one contiguous vector: every candidate of every column.
+    ninfer::Tensor flat_ids = candidate_ids.view({top_k * draft_columns});
+    ninfer::ops::proposal_remap_token_ids(flat_ids, model->proposal_token_ids, head_rows, stream);
+  }
   const ninfer::Tensor candidates = candidate_ids.view({top_k, k, batch});
   ninfer::Tensor unary = arena.alloc(ninfer::DType::FP32, {top_k, k, batch, 1});
   ninfer::ops::cast_bf16_to_fp32(candidate_values.view({top_k, k, batch}), unary, stream);

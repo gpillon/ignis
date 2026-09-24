@@ -60,6 +60,9 @@ PREFILL_CHUNK ?= 1024
 REQUEST_TIMEOUT ?= 1800
 SPEC ?= dflash2
 DRAFT_TOKENS ?= 7
+# The drafter's proposal head (--draft-head): empty = the server's default
+# (full), shortlist = the artifact's Q4 head over the most frequent tokens.
+DRAFT_HEAD ?=
 KV_POOL_BYTES ?=
 # The VRAM budget (GitHub #210, ADR 0030). Empty = the server's default: the
 # memory free at start minus a 1G headroom. VRAM_HEADROOM derives it with

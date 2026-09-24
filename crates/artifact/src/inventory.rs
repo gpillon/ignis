@@ -216,6 +216,10 @@ pub enum DraftModule {
     /// The 66 `dflash2/*` objects (the reference's
     /// `docs/maintainer/qwen3.8-27b-artifact.md` §15).
     Dflash2,
+    /// [`DraftModule::Dflash2`] plus the shortlist proposal head its drafter
+    /// scores with instead of the target's output head: `text/draft_head` and
+    /// `text/draft_head_token_ids` ([`draft_head_scope_27b`]).
+    Dflash2ShortlistHead,
 }
 
 /// The drafter's layer count (§15.1: five sliding-attention layers).
@@ -267,6 +271,21 @@ pub fn dflash2_scope_27b() -> Vec<InventoryEntry> {
     entries
 }
 
+const SH_DRAFT_HEAD: [u64; 2] = [131072, 5120]; // the shortlist rows x hidden
+const SH_DRAFT_HEAD_IDS: [u64; 1] = [131072]; // one token id per shortlist row
+
+/// The shortlist proposal head, in the artifact's directory order: the Q4
+/// row-split head over the 131,072 most frequent tokens and the token id each
+/// of its rows stands for. They are the [`OUT_OF_SCOPE_TEXT_NAMES`] pair: out
+/// of the text scope, which never reads them, and bound only with
+/// [`DraftModule::Dflash2ShortlistHead`].
+pub fn draft_head_scope_27b() -> Vec<InventoryEntry> {
+    vec![
+        mk("text/draft_head", NumericFormat::Q4G64F16S, StorageLayout::RowSplitK128V1, &SH_DRAFT_HEAD),
+        mk("text/draft_head_token_ids", NumericFormat::I32, StorageLayout::ContiguousLeV1, &SH_DRAFT_HEAD_IDS),
+    ]
+}
+
 /// Every object a load binds: the text scope, then the drafter module when
 /// one is selected. The text entries are [`text_scope_27b`] unchanged and
 /// first, so a drafter-bearing plan places every text tensor at the offset a
@@ -276,6 +295,10 @@ pub fn model_scope_27b(draft: Option<DraftModule>) -> Vec<InventoryEntry> {
     match draft {
         None => {}
         Some(DraftModule::Dflash2) => entries.extend(dflash2_scope_27b()),
+        Some(DraftModule::Dflash2ShortlistHead) => {
+            entries.extend(dflash2_scope_27b());
+            entries.extend(draft_head_scope_27b());
+        }
     }
     entries
 }
@@ -592,6 +615,23 @@ mod tests {
         assert_eq!(scope.len(), text.len() + 66);
         assert_eq!(&scope[..text.len()], text.as_slice(), "text entries unchanged and first");
         assert_eq!(&scope[text.len()..], dflash2_scope_27b().as_slice());
+    }
+
+    #[test]
+    fn the_shortlist_head_module_is_the_drafter_then_the_out_of_scope_head_pair() {
+        let with_drafter = model_scope_27b(Some(DraftModule::Dflash2));
+        let scope = model_scope_27b(Some(DraftModule::Dflash2ShortlistHead));
+        assert_eq!(scope.len(), with_drafter.len() + 2);
+        assert_eq!(&scope[..with_drafter.len()], with_drafter.as_slice(), "no placement moves");
+        let head = &scope[with_drafter.len()..];
+        let names: Vec<&str> = head.iter().map(|e| e.name).collect();
+        assert_eq!(names, OUT_OF_SCOPE_TEXT_NAMES, "exactly the pair the text scope leaves out");
+        for e in head {
+            tensor_encoded_size(e.layout, e.format, e.shape)
+                .unwrap_or_else(|err| panic!("{} fails the geometry check: {err}", e.name));
+        }
+        assert_eq!(head[0].shape, &[131072, 5120]);
+        assert_eq!(head[1].shape, &[131072]);
     }
 
     #[test]
