@@ -43,8 +43,9 @@ the spec's option 3 (a decoded tier that costs VRAM)?
     768 greedy tokens, `ignore_eos`. Round time is
     `itl_ms_mean x itl_samples / spec.rounds` per request.
   - `nsys profile --cuda-graph-trace=node` cells at `--max-context 65536`.
-- Raw data and drivers are in the worktree's `.scratch/live/`, `.scratch/ncu/`
-  and `.scratch/tools/`. Captures were deleted after reduction.
+- Raw data and drivers are in the main checkout's untracked
+  `.scratch/hq-verify-decode-268/` (`live/`, `ncu/`, `tools/`). Captures were
+  deleted after reduction.
 
 **Nsight Compute, main, 8 lanes x 30K (one launch, 3.2 ms at ncu's clocks):**
 
