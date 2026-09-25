@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-artifact"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "gif",
  "ignis-core",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-bench"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "futures-core",
@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ignis-artifact",
  "serde_json",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-logging"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-runtime"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ignis-artifact",
  "ignis-core",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "arc-swap",
  "axum",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-vendor"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ignis-logging",
  "serde",
