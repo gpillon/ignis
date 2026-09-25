@@ -1774,9 +1774,10 @@ impl ConcreteScheduler {
             tracing::info_span!("ignis.completion", request_id = self.requests[idx].id).entered();
         let spec = self.requests[idx].spec;
         // GitHub #238: a decision's whole answer, moved out rather than
-        // cloned — the released request stays in `self.requests` until it is
-        // reaped, and an answer left behind on it would be a second copy of
-        // the only thing this event exists to carry.
+        // cloned — the released request stays in `self.requests` until the
+        // next advance reaps it (GitHub #269), and an answer left behind on
+        // it would be a second copy of the only thing this event exists to
+        // carry.
         let readout = self.requests[idx].readout.take();
         // GitHub #260: an attention readout's scores, moved out likewise.
         let attention = self.requests[idx].attention.take();
@@ -1842,12 +1843,14 @@ impl ConcreteScheduler {
     }
 
     /// The request's lifecycle state (test / telemetry observability).
-    /// `None` when `request` is unknown.
+    /// `None` when `request` is unknown. An issued id no longer held was
+    /// reaped (GitHub #269), and only a finished request is.
     pub fn request_state(&self, request: RequestId) -> Option<RequestState> {
-        self.requests
-            .iter()
-            .find(|r| r.id == request)
-            .map(|r| r.state)
+        match self.requests.iter().find(|r| r.id == request) {
+            Some(r) => Some(r.state),
+            None if request < self.next_id => Some(RequestState::Done),
+            None => None,
+        }
     }
 
     /// The request's prefill progress (P3-01, ADR 0018): prompt tokens
@@ -2506,6 +2509,11 @@ impl Scheduler for ConcreteScheduler {
         // core-06: advance the scheduling tick (the LRU `use_tick` for
         // retained-lane victim selection).
         self.tick += 1;
+
+        // GitHub #269: requests the previous advance finished leave here,
+        // `input` and all — an image request's patch payload included. Kept
+        // until now so a caller can still read what that advance finished.
+        self.requests.retain(|r| r.state != RequestState::Done);
 
         // P3-01 / ADR 0018 — cancel is abort, not suspend: release every
         // request marked by `cancel()` since the last `advance()`, before

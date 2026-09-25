@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use ignis_core::types::{DecodeParams, RequestClass, RequestInput, SchedEvent};
+use ignis_core::types::{DecodeParams, RequestClass, RequestInput, RequestState, SchedEvent};
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
@@ -307,4 +307,33 @@ fn an_evicted_multimodal_request_is_snapshotted_and_restored_not_reprefilled() {
     );
     let done = rest.iter().filter(|e| matches!(e, SchedEvent::Done { .. })).count();
     assert_eq!(done, 9, "{rest:?}");
+}
+
+/// GitHub #269 — a finished request does not keep its image. The scheduler
+/// used to hold every request it ever served, `input` and all, so each image
+/// request left its patch payload behind for the life of the process.
+#[test]
+fn a_finished_request_lets_go_of_its_image() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
+    let input = multimodal_input(40, vec![image(5, 10)], 2);
+    let multimodal = Arc::clone(input.multimodal.as_ref().unwrap());
+    let id = sched.submit(input, RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(events.iter().any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == id)));
+
+    // Reaped at the next advance.
+    sched.advance();
+    // The mock keeps every job it was handed; those are its copies, not the
+    // scheduler's.
+    let recorded = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|job| job.multimodal.as_ref().is_some_and(|m| Arc::ptr_eq(m, &multimodal)))
+        .count();
+    assert_eq!(Arc::strong_count(&multimodal), 1 + recorded, "the scheduler still holds the request's image");
+    // A reaped request still reads as finished; an id never issued, as unknown.
+    assert_eq!(sched.request_state(id), Some(RequestState::Done));
+    assert_eq!(sched.request_state(id + 1), None);
 }
