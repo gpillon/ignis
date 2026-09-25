@@ -14,4 +14,4 @@ export const DEFAULT_SETTINGS: PlaygroundSettings = {
   laneTag: "interactive",
 };
 
-export const EFFORT_LABELS: Record<ReasoningEffort, string> = { none: "Off", low: "Low", medium: "Medium", xhigh: "X-high", max: "Max" };
+export const EFFORT_LABELS: Record<ReasoningEffort, string> = { none: "Off", low: "Low", medium: "Medium", xhigh: "Xhigh", max: "Max" };
