@@ -252,9 +252,31 @@ When output names a domain concept, use the term as defined here.
   the assistant message differently from how it was generated.
 - **Retained prefix** — a **shared prefix** kept alive with no claimant, so a
   later, non-concurrent request (the next subagent of a burst) claims it as if
-  it were a sibling. Its boundary is a structural point of the rendered prompt
-  (the end of the system and tools block, floored to whole KV pages), not the
+  it were a sibling. It ends at a **reuse boundary** — for a chat, the end of
+  the system and tools block, floored to whole KV pages — never at the
   publishing request's whole prompt head.
+- **Reuse boundary** — a prompt position where a request's state is kept for
+  a later request to resume from, predicted before prefill because a hybrid
+  can only resume where it captured (ADR 0029). A request carries an ordered
+  list of them, each a whole number of KV pages, never inside a **media
+  item**, each costing a **retained slot**. Sources: the end of the system
+  block, a **fan-out head**, an **observed fork**, a **reuse marker**.
+  _Avoid_: breakpoint, cache point (a **prompt checkpoint** is something
+  else).
+- **Fan-out head** — the **reuse boundary** at the longest common prefix of a
+  decision fan-out's rendered questions, computed before the first is
+  submitted. Kept only until that fan-out ends. Questions of different kinds
+  do not share their system text, so they have none.
+- **Observed fork** — a **reuse boundary** at the end of the longest run of
+  leading content parts that a recent decision `state` also began with, keyed
+  by the **match key** there. The second request that repeats a run keeps
+  it; the third and later resume from it.
+- **Reuse marker** — `cache_control: {"type": "ephemeral"}` on a decision
+  `state`'s content part: the caller's **reuse boundary** at the end of that
+  part. It chooses where state is kept, never what a request may claim —
+  matching stays by content. A request carrying one gets no **observed
+  fork**.
+  _Avoid_: cache breakpoint.
 - **Lineage** — one conversation's chain of **prompt checkpoints**, and the
   only name a conversation has. The clients send no session id, so what ties
   turn N+1's checkpoint to turn N's is the link that does exist: turn N+1

@@ -234,3 +234,48 @@ What building Tier 1 decided that the Decision left open.
   exactly at another request's opener. It costs one re-prefilled token in that
   rare case. Lifting it means carrying `rope_delta` with the reused state
   (#201).
+
+## Amendment (2026-09-26) — reuse boundaries (#270)
+
+The Decision publishes a retained prefix at one structural point, the end of
+the system-and-tools block. A `/v1/decide` state given as content parts
+never reaches that point: it stays in the user turn, so a static text head
+before a changing image, and a fan-out's whole state, are re-prefilled every
+time. #270 measured it (324 ms per request for a text state the JSON path
+serves in 70 ms). The considered option "a learned (observed-LCP)
+retained-prefix boundary … to revisit only if measurement shows shared heads
+extending past the system block" is that measurement.
+
+**A request carries an ordered list of reuse boundaries, not one.** Each is
+published as a shared prefix (the first plainly, the rest chained, #187),
+one retained slot each, and is retained either until the device needs the
+room (as above) or until the **fan-out** that owns it ends. The system block
+is the first source. `/v1/decide` adds three: a fan-out's **computed common
+prefix** (its rendered questions are all known before the first is
+submitted), an **observed fork** (the end of the longest run of leading
+content parts a recent request also began with — the second occurrence
+publishes, the third claims), and a **reuse marker** (`cache_control:
+{"type": "ephemeral"}` on a content part; a request carrying one gets no
+observed-fork boundary). Spec: `docs/specs/decide/16-reuse-boundaries.md`.
+
+What does not change, and why it is consistent with the Decision:
+
+- **Matching is still by content.** A marker or a fork decides where state is
+  *kept*, never what a request may *claim*: a claim is still the longest
+  retained state whose match key is a prefix of the prompt. "There is no API
+  field for it" stays true of matching; the marker is an API field for
+  placement only.
+- **The prompt the model reads is unchanged.** The alternative — moving the
+  state's leading text into the system block — was rejected: it changes
+  measured decision prompts (ADR 0034), can never hold an image, and misses
+  whenever changing text precedes the first image.
+- **Retained state is still the first victim.** A fan-out's head is the one
+  departure from "free until the room is needed": it is given up when its
+  fan-out ends, because no later request is expected to send that state
+  again, and eight slots are too few to keep a head per decision.
+
+Considered and rejected: a "first text part" convention (unpublished
+anywhere, and it spends a slot whenever the first part is the one that
+changes); client markers with same-step producer/consumer scheduling (vLLM
+RFC #55697 — the scheduling half would make a decision a live publisher,
+which #238 rules out).
