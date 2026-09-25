@@ -64,10 +64,10 @@ const checked = (region: string) => radios(region).filter((r) => r.checked).map(
 const box = (region: string) => /<input([^>]*name="thinking-budget"[^>]*)\/>/.exec(region)?.[1] ?? "";
 
 describe("SettingsPanel: the thinking budget", () => {
-  it("offers max after X-high among the efforts, and the budget right after them", () => {
+  it("offers max after Xhigh among the efforts, and the budget right after them", () => {
     const html = panel();
     const efforts = radios(html.slice(0, html.indexOf("Thinking budget"))).map((r) => r.label);
-    expect(efforts.slice(-2)).toEqual(["X-high", "Max"]);
+    expect(efforts.slice(-2)).toEqual(["Xhigh", "Max"]);
     expect(html.indexOf("Thinking budget")).toBeLessThan(html.indexOf("Temperature"));
   });
 
