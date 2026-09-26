@@ -544,6 +544,15 @@ In the repo:
 - `docs/findings/2026-09-26-decision-classes-beyond-the-seven.md` (the
   prior art behind spec 18), and spec 17 (layout L1).
 
+The literature pass (`docs/findings/2026-09-27-span-from-attention-literature.md`,
+§ 10) checked the list below and corrects it: ICR's lexical bias is read from
+the question's own tokens, not from a position after it, so point 4 of § Why
+a second study contradicts nothing; ICR calibrates by subtraction, and no
+attention-relevance paper uses the log-ratio lift; Kobayashi's norm includes
+`W_O`; this model's output gate is a 256-vector per head, not a scalar; an
+induction head's +1 is one token, not one line; TAG is "Tuning-free
+Attention-driven Grounding".
+
 Outside (verify each in the literature pass; these are starting points):
 - ICR, attention-based in-context reranking: arXiv 2410.02642 (content-free
   "N/A" calibration, lexical bias).
