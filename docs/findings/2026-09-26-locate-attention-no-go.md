@@ -165,10 +165,11 @@ route, and spec 18's pre-registered rule says no-go.
 
 ## Follow-ups
 
-- If `locate` is revisited: dump the scores over the instruction's tokens as
-  well (the harness's span is one parameter), to confirm or kill the
-  mechanism above before designing anything; the candidate fixes (an
-  instruction that paraphrases its own rare words, a layout that masks the
-  instruction's copy) each need fresh sets and a new pre-registration.
+- The study continues as a research spec,
+  [spec 19](../specs/decide/19-a-span-read-from-attention.md): spans in an
+  unsegmented text instead of lines, combined heads, the keys' values, the
+  lexical paradox (starting from the full row, instruction tokens included,
+  to confirm or kill the mechanism above) and the part heads, with set D kept
+  for judging a revived line-level reading.
 - A `found` flag stays out of scope: at an AUC of 0.62-0.69 the confidence would
   not mean much.

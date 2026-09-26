@@ -14,7 +14,9 @@
 >
 > So phase B (#275) does not go ahead, and **the labelled `choice` is the
 > way to locate today** (`docs/user/README.md`, "Finding a line or an
-> item"). Rules 3 and 4 were computed and are reported in the finding, not
+> item"). The study continues in spec 19 (`19-a-span-read-from-attention.md`):
+> spans instead of lines, combined heads, values, the lexical paradox and
+> the part heads; its track L may bring phase B back, judged on set D. Rules 3 and 4 were computed and are reported in the finding, not
 > written here: nothing will run against them. The sets, the harness and the
 > scorer stay in `tools/locate-sets/` and
 > `crates/server/tests/attention_head_locate_gpu.rs`; set D is unspent.
