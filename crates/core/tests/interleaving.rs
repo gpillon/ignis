@@ -26,6 +26,7 @@ fn input(tokens: &[u32], max_tokens: u32) -> RequestInput {
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         model: "qwen3.8-27b".into(),
         tokens: tokens.to_vec(),
         params: DecodeParams {
@@ -148,6 +149,7 @@ fn only_the_final_prefill_chunk_receives_stochastic_sampling_params() {
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
+                reuse_boundaries: Vec::new(),
                 model: "qwen3.8-27b".into(),
                 tokens: (1..=10).collect(),
                 params: sampling,

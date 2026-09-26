@@ -206,6 +206,7 @@ impl Loaded {
             opener_tokens: opener,
             user_turn_tokens: None,
             system_block_tokens: Some(block),
+            reuse_boundaries: Vec::new(),
             constrained: None,
         }
     }
@@ -253,6 +254,7 @@ fn whole_pool(loaded: &Loaded) -> RequestInput {
     prompt.truncate((MAX_CONTEXT - 16) as usize);
     RequestInput {
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         ..loaded.request(prompt, None, 0, 8)
     }
 }
@@ -345,6 +347,7 @@ pub fn a_retained_prefix_claimant_evicted_mid_decode_continues_exactly(loaded: &
     );
     let intruder = RequestInput {
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         ..loaded.request(loaded.tokens("Count from one to five."), None, 0, 8)
     };
 

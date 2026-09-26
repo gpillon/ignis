@@ -830,6 +830,7 @@ mod tests {
                     opener_tokens: None,
                     user_turn_tokens: None,
                     system_block_tokens: None,
+                    reuse_boundaries: Vec::new(),
                     model: "stub".into(),
                     tokens: vec![1],
                     params: DecodeParams {

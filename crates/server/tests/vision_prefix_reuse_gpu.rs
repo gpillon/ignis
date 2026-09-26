@@ -106,6 +106,7 @@ fn request(provider: &ArtifactTemplateProvider, processor: &ignis_artifact::visi
         opener_tokens: rendered.opener_tokens,
         user_turn_tokens: rendered.user_turn_tokens,
         system_block_tokens: rendered.system_block_tokens,
+        reuse_boundaries: Vec::new(),
     }
 }
 

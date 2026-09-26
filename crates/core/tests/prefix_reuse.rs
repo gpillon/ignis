@@ -32,6 +32,7 @@ fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         model: model.into(),
         tokens: prompt,
         params: DecodeParams {

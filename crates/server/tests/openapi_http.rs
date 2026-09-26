@@ -208,6 +208,19 @@ fn the_decision_endpoint_documents_how_a_point_and_a_box_are_answered() {
     assert!(description.contains("one pass") && description.contains("chain"), "{description}");
 }
 
+/// GitHub #270: a `state` part's reuse marker and the two refusals it can
+/// earn are part of the contract, readable without the source.
+#[test]
+fn the_decision_endpoint_documents_the_reuse_marker_and_its_refusals() {
+    let document = document();
+    let state = document["components"]["schemas"]["DecideRequest"]["properties"]["state"].to_string();
+    assert!(state.contains("cache_control") && state.contains("ephemeral"), "{state}");
+    let refused = document["paths"]["/v1/decide"]["post"]["responses"]["422"]["description"].to_string();
+    for code in ["malformed_reuse_marker", "too_many_reuse_markers"] {
+        assert!(refused.contains(code), "the 422 names `{code}`: {refused}");
+    }
+}
+
 // ── the routes ───────────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -364,6 +364,15 @@ pub struct DecideRequest {
     /// parts are ours; Jev's `state` is `string | object | array`, which
     /// makes this a superset rather than a clone.
     ///
+    /// A content part may carry `"cache_control": {"type": "ephemeral"}`, a
+    /// **reuse marker** (GitHub #270): the server keeps the state up to the
+    /// end of that part, so a later request whose state begins the same way
+    /// resumes after it instead of prefilling it again. It changes no byte of
+    /// the prompt and never what a request may reuse — reuse is matched by
+    /// content — only where state is kept. At most four per `state`; one
+    /// marker makes the request explicit-only, and the server then keeps no
+    /// part end it would otherwise have found repeated across requests.
+    ///
     /// [`OrderedValue`] and not `JsonValue`, because an object's key order is
     /// part of what the model reads and `serde_json::Map` would sort it away.
     /// That order is a real property of this endpoint and one JSON Schema
@@ -1284,13 +1293,18 @@ fn score_options(id: &str, criteria: Option<&Criteria>) -> Result<Vec<PreparedOp
 /// N times. Spec 04 asked for "evidence first"; what it needed was "evidence
 /// in the block".
 ///
-/// **An image `state` does not follow it, and spec 04's acceptance 2 is
-/// unmet.** The parts stay in the user turn — image first, then the
-/// decision's JSON without an `evidence` field, the shape
-/// `classify_vision_readout_gpu.rs` measured — so a fan-out over an image
-/// shares nothing and re-encodes it per question.
+/// **An image `state` does not follow it.** The parts stay in the user turn —
+/// image first, then the decision's JSON without an `evidence` field, the
+/// shape `classify_vision_readout_gpu.rs` measured. What shares such a state
+/// is not its place in the prompt but the **reuse boundaries** GitHub #270
+/// cuts inside the user turn without moving a byte: a fan-out's head, an
+/// observed fork, a caller's reuse marker (`place_reuse_boundaries`, spec
+/// 16). They are cut from where each part ends, and each floors to a whole
+/// KV page walked out of any image (GitHub #193), so a head reaches past an
+/// image only when the text shared after it crosses the next page boundary.
 ///
-/// Why, precisely, because an earlier version of this comment got it wrong:
+/// Why the parts are not moved into the system block instead, because an
+/// earlier version of this comment got it wrong:
 /// `check_content_parts` does refuse media in a system message (GitHub
 /// #175), but it is called only from the chat and responses routes and
 /// **never on this path** (`api.rs::prepare_request` does not call it), so
@@ -1353,6 +1367,7 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
                 kind: Some("text".to_owned()),
                 text: Some(ask),
                 url: None,
+                cache_control: None,
             });
             vec![
                 ChatMessage::text("system", instruction),
@@ -2001,7 +2016,7 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
     responses(
         (status = 200, description = "One answer per question, under the ids the caller chose.", body = DecideResponse),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
-        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set). Nothing reached the engine.",
+        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`). Nothing reached the engine.",
             body = crate::api::ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted.", body = crate::api::ApiError),
     ),
@@ -2045,6 +2060,7 @@ async fn serve(
     let encode = |text: &str| server.template.encode_literal(text);
     let prepared = prepare(&request.questions, &server.alphabet, &encode, server.calibration)?;
     let evidence = Evidence::read(&request.state);
+    let markers = reuse_markers(&evidence)?;
     // An image `state` on a load that cannot take images is a refusal, not
     // an error in an answer slot: the request was never servable, and it is
     // the caller's to fix.
@@ -2084,9 +2100,21 @@ async fn serve(
     // instruction policy and — for an image — the media acquisition and
     // the placeholder expansion.
     let mut rendered = Vec::with_capacity(prepared.len());
+    // GitHub #270: a parts `state`'s reuse boundaries are cut where its parts
+    // end, and each end costs a tokenization of everything before it. Only
+    // the first question under each system text needs them: the rest share
+    // its prompt up to the end of the state, so they claim the fan-out's head,
+    // which covers every one of those ends, and their run ends are its keys.
+    let mut systems = std::collections::BTreeSet::new();
     for question in &prepared {
-        rendered.push(render(server, &evidence, question, model.clone()).await?);
+        let first_of_kind = systems.insert(question.prompt_kind().system_text(question.digits));
+        let part_ends = first_of_kind && matches!(evidence, Evidence::Parts(_));
+        rendered.push(render(server, &evidence, question, model.clone(), part_ends).await?);
     }
+    // GitHub #270: where each question's state is kept for a later one. Held
+    // until the handler is done, answered or dropped, so a fan-out's head
+    // never outlives the fan-out.
+    let _fan_out = place_reuse_boundaries(server, &evidence, &markers, &mut rendered);
 
     let input_tokens = rendered
         .iter()
@@ -2101,8 +2129,9 @@ async fn serve(
     // prefix between them, and every one of them prefills the whole state —
     // for an image, N x 16K tokens. The first question prefills it once and
     // leaves a **retained prefix** behind (`messages_for` says why it is
-    // retained and not shared); the followers claim it and prefill only
-    // their own tail.
+    // retained and not shared) — the system block for a JSON state, the
+    // fan-out's head for any state (GitHub #270) — and the followers claim
+    // it and prefill only their own tail.
     //
     // After that there is nothing left to serialize, so the followers run
     // together, [`FAN_OUT_WIDTH`] of them at a time.
@@ -2325,6 +2354,10 @@ struct Rendered {
     /// A head question's image grid, `(rows, cols)` of merged tokens (GitHub
     /// #260), and `None` for every other question.
     grid: Option<(usize, usize)>,
+    /// Where each of the `state`'s content parts ends in the prompt, in tokens
+    /// (GitHub #270). Empty for a JSON `state`, whose evidence is in the
+    /// system block, and for a question that did not ask.
+    part_ends: Vec<Option<u32>>,
     /// The answer a question already has without being submitted — a head
     /// question with no image to read, or one whose image is not a grid the
     /// heads' maps can be read over (GitHub #260). `None` for every question
@@ -2335,11 +2368,15 @@ struct Rendered {
 /// Build one question's prompt. Refuses the whole request on failure: a
 /// prompt that cannot be rendered, or one longer than the engine's context,
 /// is the caller's mistake and every sibling shares it.
+///
+/// `part_ends` asks the render where the `state`'s parts end (GitHub #270),
+/// which only a question whose reuse boundaries are cut from them needs.
 async fn render(
     server: &crate::Server,
     evidence: &Evidence,
     question: &PreparedQuestion,
     model: Option<String>,
+    part_ends: bool,
 ) -> Result<Rendered, Refusal> {
     let messages = messages_for(evidence, question);
     let thinking = crate::thinking::ThinkingOptions {
@@ -2347,8 +2384,8 @@ async fn render(
         ..crate::thinking::ThinkingOptions::default()
     };
     let params = ignis_core::types::DecodeParams::default();
-    let (mut input, model, mut prompt_tokens, media) =
-        crate::api::prepare_decision_request(server, model, &messages, params, &thinking)
+    let crate::api::PreparedRequest { mut input, model, mut prompt_tokens, media, part_ends } =
+        crate::api::prepare_decision_request(server, model, &messages, params, &thinking, part_ends)
             .await
             .map_err(|(code, message)| {
                 Refusal::new(code, format!("question {:?}: {message}", question.id))
@@ -2428,12 +2465,156 @@ async fn render(
                         }
                         Err(answer) => (None, Some(answer)),
                     };
-                    return Ok(Rendered { input, model, prompt_tokens, media, grid, answered });
+                    return Ok(Rendered { input, model, prompt_tokens, media, grid, part_ends, answered });
                 }
             }
         }
     }
-    Ok(Rendered { input, model, prompt_tokens, media, grid: None, answered: None })
+    Ok(Rendered { input, model, prompt_tokens, media, grid: None, part_ends, answered: None })
+}
+
+/// The most **reuse markers** one `state` may carry (GitHub #270): the hosted
+/// APIs' own limit, and each costs a retained slot and a chunk split.
+pub const MAX_REUSE_MARKERS: usize = 4;
+
+/// The `state` parts carrying a **reuse marker** (GitHub #270), by index —
+/// or the refusal of a malformed one, or of more than [`MAX_REUSE_MARKERS`].
+///
+/// Exactly `{"type": "ephemeral"}`, the shape Alibaba Model Studio and
+/// Anthropic use. Retention here is by eviction, not by time, so a `ttl` is a
+/// promise this server would not keep, and is refused rather than dropped. A
+/// JSON `state` has no parts and so no markers: a `cache_control` key inside
+/// evidence is evidence.
+fn reuse_markers(evidence: &Evidence) -> Result<Vec<usize>, Refusal> {
+    let Evidence::Parts(parts) = evidence else {
+        return Ok(Vec::new());
+    };
+    let ephemeral = json!({"type": "ephemeral"});
+    let mut marked = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        match &part.cache_control {
+            None => {}
+            Some(marker) if *marker == ephemeral => marked.push(index),
+            Some(marker) => {
+                return Err(Refusal::new(
+                    "malformed_reuse_marker",
+                    format!(
+                        "`state` part {index} carries `cache_control: {marker}`; the only reuse marker is `{ephemeral}`, and it is kept until the device needs the room, never for a time"
+                    ),
+                ));
+            }
+        }
+    }
+    if marked.len() > MAX_REUSE_MARKERS {
+        return Err(Refusal::new(
+            "too_many_reuse_markers",
+            format!(
+                "`state` carries {} reuse markers, and at most {MAX_REUSE_MARKERS} are kept: each costs a retained slot",
+                marked.len()
+            ),
+        ));
+    }
+    Ok(marked)
+}
+
+/// Give every rendered question the **reuse boundaries** its `state` earns
+/// (GitHub #270, spec 16), and return what ends the fan-out's head, if it has
+/// one.
+///
+/// For a `state` of content parts, the caller's **reuse markers** — or, when
+/// there are none, an **observed fork**. Then, for a fan-out of two or more,
+/// the **fan-out head**, on its sequenced first question only: the followers
+/// claim it rather than publish it.
+///
+/// None of it changes a byte of any prompt, and none of it decides what a
+/// question may claim — only where state is kept.
+fn place_reuse_boundaries(
+    server: &crate::Server,
+    evidence: &Evidence,
+    markers: &[usize],
+    rendered: &mut [Rendered],
+) -> Option<FanOutEnd> {
+    use ignis_core::types::ReuseBoundary;
+    if let Evidence::Parts(parts) = evidence {
+        if markers.is_empty() {
+            observe_forks(server, parts.len(), rendered);
+        } else {
+            for ready in rendered.iter_mut() {
+                let ends = markers.iter().filter_map(|&part| ready.part_ends.get(part).copied().flatten());
+                ready.input.reuse_boundaries.extend(ends.map(ReuseBoundary::retained));
+            }
+        }
+    }
+    // Only questions the engine is asked: one answered here is never
+    // prefilled, so it neither publishes a head nor claims one.
+    let asked: Vec<usize> = (0..rendered.len()).filter(|&i| rendered[i].answered.is_none()).collect();
+    if asked.len() < 2 || asked[0] != 0 {
+        return None;
+    }
+    let prompts: Vec<&ignis_core::types::RequestInput> = asked.iter().map(|&i| &rendered[i].input).collect();
+    let head = crate::reuse::common_head(&prompts);
+    if head == 0 {
+        return None;
+    }
+    let owner = server.next_fan_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    rendered[0].input.reuse_boundaries.push(ReuseBoundary::fan_out(head, owner));
+    Some(FanOutEnd { engine: server.engine.clone(), owner })
+}
+
+/// The **observed fork** (GitHub #270): each question whose `state` begins
+/// with a run of parts a recent request's also began with gets a retained
+/// boundary at the end of the longest such run. Then every run end of this
+/// request enters the history — after all its questions have read it, so the
+/// first request over a `state` publishes no fork, whatever its width.
+///
+/// A run end is where `parts[0..=i]` ends, keyed by the whole prompt up to
+/// there: the same parts under another question kind's instruction are
+/// another run.
+fn observe_forks(server: &crate::Server, state_parts: usize, rendered: &mut [Rendered]) {
+    use ignis_core::types::ReuseBoundary;
+    let runs: Vec<Vec<crate::reuse::RunEnd>> = rendered
+        .iter()
+        .map(|ready| {
+            if ready.answered.is_some() {
+                return Vec::new();
+            }
+            // A run end at or below the system block adds nothing: the block
+            // is kept there already.
+            let block = ready.input.system_block_tokens.unwrap_or(0);
+            let ends: Vec<u32> = ready
+                .part_ends
+                .iter()
+                .take(state_parts)
+                .flatten()
+                .copied()
+                .filter(|&end| end > block)
+                .collect();
+            crate::reuse::run_ends(&ready.input, &ends)
+        })
+        .collect();
+    let mut history = server.fork_history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (ready, runs) in rendered.iter_mut().zip(&runs) {
+        if let Some(at) = history.longest_seen(runs) {
+            ready.input.reuse_boundaries.push(ReuseBoundary::retained(at));
+        }
+    }
+    for runs in &runs {
+        history.record(runs);
+    }
+}
+
+/// Tells the engine a fan-out is over when dropped (GitHub #270): its head
+/// goes whether every question was answered, one failed, or the client left
+/// and the handler's future with it.
+struct FanOutEnd {
+    engine: crate::engine::Engine,
+    owner: ignis_core::types::FanOutId,
+}
+
+impl Drop for FanOutEnd {
+    fn drop(&mut self) {
+        self.engine.end_fan_out(self.owner);
+    }
 }
 
 /// The attention readout a head question asks for over `input`'s image, and

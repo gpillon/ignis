@@ -46,6 +46,7 @@ fn submit(sched: &mut ConcreteScheduler, budget: Option<u32>, max_tokens: u32) -
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
+                reuse_boundaries: Vec::new(),
                 model: "m".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams {

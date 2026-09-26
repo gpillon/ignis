@@ -49,6 +49,7 @@ fn decision(prompt: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         opener_tokens: Some(opener),
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         decision: Some(DecisionRead::Answers(Arc::from(ANSWERS.to_vec()))),
         constrained: None,
     }
@@ -62,6 +63,7 @@ fn decision(prompt: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
 fn decision_over_evidence(prompt: Vec<TokenId>, evidence: u32) -> RequestInput {
     RequestInput {
         system_block_tokens: Some(evidence),
+        reuse_boundaries: Vec::new(),
         ..decision(prompt, None)
     }
 }

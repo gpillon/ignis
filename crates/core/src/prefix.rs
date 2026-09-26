@@ -37,7 +37,7 @@ use std::time::Instant;
 
 use crate::gdn::GdnState;
 use crate::identity::{MatchKey, PromptContent, PromptKeys};
-use crate::types::{RequestClass, RequestId};
+use crate::types::{BoundaryLifetime, FanOutId, RequestClass, RequestId};
 
 /// An opaque handle to a cached prefix entry (a claimant's reference to a
 /// shared prefix).
@@ -58,6 +58,10 @@ pub struct Retention {
     pub class: RequestClass,
     /// When it was retained or last claimed, in wall time.
     pub used_at: Instant,
+    /// How long it is kept (GitHub #270): until the device needs the room, or
+    /// until the fan-out that owns it ends. A **fan-out head** never goes to
+    /// KV-RAM: nobody is expected to send that state once its fan-out is over.
+    pub lifetime: BoundaryLifetime,
 }
 
 /// A retained prefix whose materialized blob is in KV-RAM (GitHub #190): what
@@ -485,6 +489,16 @@ impl PrefixCache {
             .collect()
     }
 
+    /// The retained prefixes fan-out `owner` keeps (GitHub #270): the heads
+    /// whose retention goes when it ends, whoever else still stands on them.
+    pub fn fan_out_heads(&self, owner: FanOutId) -> Vec<PrefixId> {
+        self.entries
+            .iter()
+            .filter(|e| e.retained.is_some_and(|r| r.lifetime == BoundaryLifetime::FanOut(owner)))
+            .map(|e| e.id)
+            .collect()
+    }
+
     /// The least recently used reclaimable retained prefix — the first-victim
     /// path's choice among them (GitHub #188), or `None` when nothing can be
     /// given up.
@@ -742,6 +756,7 @@ mod tests {
             at,
             class: RequestClass::Agent,
             used_at: Instant::now(),
+            lifetime: BoundaryLifetime::Retained,
         }
     }
 

@@ -249,6 +249,21 @@ async fn cors_headers(req: Request, next: Next) -> Response {
     res
 }
 
+/// A request ready to submit, and what preparing it learned beside it.
+pub(crate) struct PreparedRequest {
+    pub input: RequestInput,
+    /// The model the request resolved to.
+    pub model: String,
+    /// The prompt-token count (the usage figures).
+    pub prompt_tokens: u32,
+    /// What acquiring the request's media cost, for its events; `None`
+    /// without media.
+    pub media: Option<MediaStats>,
+    /// Where each content part of the last message ends, in tokens (GitHub
+    /// #270, [`RenderedPrompt::part_ends`]); empty unless asked for.
+    pub part_ends: Vec<Option<u32>>,
+}
+
 /// The request's model, the templated prompt tokens, and the prompt-token
 /// count (the usage figures) — one shared build path for both completion
 /// endpoints.
@@ -259,14 +274,18 @@ fn build_request(
     params: DecodeParams,
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
-) -> Result<(RequestInput, String, u32), TemplateRejection> {
+    part_ends: bool,
+) -> Result<PreparedRequest, TemplateRejection> {
     // `model` is the model the request names; `None` (or a blank) falls
     // back to the loaded model. A model the engine does not load is
     // rejected at submit with a 404 (OpenAI's `model_not_found`).
     // The template seam: the artifact's frontend object set (artifact-02)
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
-    let rendered = server.template.apply_chat_template(messages, thinking, tools)?;
+    let rendered = match part_ends {
+        true => server.template.apply_chat_template_with_part_ends(messages, thinking, tools)?,
+        false => server.template.apply_chat_template(messages, thinking, tools)?,
+    };
     request_input(server, model, rendered, params, None)
 }
 
@@ -277,7 +296,7 @@ fn request_input(
     rendered: RenderedPrompt,
     params: DecodeParams,
     multimodal: Option<ignis_core::vision::Multimodal>,
-) -> Result<(RequestInput, String, u32), TemplateRejection> {
+) -> Result<PreparedRequest, TemplateRejection> {
     let model = model
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| server.engine.model_id());
@@ -301,9 +320,10 @@ fn request_input(
         opener_tokens: rendered.opener_tokens,
         user_turn_tokens: rendered.user_turn_tokens,
         system_block_tokens: rendered.system_block_tokens,
+        reuse_boundaries: Vec::new(),
         constrained: None,
 };
-    Ok((input, model, prompt_tokens))
+    Ok(PreparedRequest { input, model, prompt_tokens, media: None, part_ends: rendered.part_ends })
 }
 
 /// [`build_request`] for any conversation: one carrying image parts on a
@@ -320,23 +340,38 @@ async fn prepare_request(
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
 ) -> Result<(RequestInput, String, u32, Option<MediaStats>), Response> {
+    let prepared = prepare_input(server, model, messages, params, thinking, tools, false).await?;
+    Ok((prepared.input, prepared.model, prepared.prompt_tokens, prepared.media))
+}
+
+/// [`prepare_request`], reporting the last message's part ends too when
+/// `part_ends` asks for them (GitHub #270).
+async fn prepare_input(
+    server: &Server,
+    model: Option<String>,
+    messages: &[ChatMessage],
+    params: DecodeParams,
+    thinking: &ThinkingOptions,
+    tools: &[JsonValue],
+    part_ends: bool,
+) -> Result<PreparedRequest, Response> {
     // GitHub #209: instruction messages are placed under the server's
     // policies before any template sees the conversation, on both paths.
     let messages = &server.instruction_policy.normalize(messages).map_err(template_rejection)?;
     let Some(acquirer) = server.media.as_ref().filter(|_| has_media(messages)) else {
-        let (input, model, prompt_tokens) =
-            build_request(server, model, messages, params, thinking, tools).map_err(template_rejection)?;
-        return Ok((input, model, prompt_tokens, None));
+        return build_request(server, model, messages, params, thinking, tools, part_ends)
+            .map_err(template_rejection);
     };
     let deadline = std::time::Instant::now() + server.request_timeout;
     let acquired = acquirer.acquire(messages, deadline).await.map_err(media_rejection)?;
-    let (rendered, multimodal) = server
-        .template
-        .prepare_multimodal(messages, thinking, tools, acquired.media)
-        .map_err(content_rejection)?;
-    let (input, model, prompt_tokens) =
+    let prepared = match part_ends {
+        true => server.template.prepare_multimodal_with_part_ends(messages, thinking, tools, acquired.media),
+        false => server.template.prepare_multimodal(messages, thinking, tools, acquired.media),
+    };
+    let (rendered, multimodal) = prepared.map_err(content_rejection)?;
+    let prepared =
         request_input(server, model, rendered, params, Some(multimodal)).map_err(template_rejection)?;
-    Ok((input, model, prompt_tokens, Some(acquired.stats)))
+    Ok(PreparedRequest { media: Some(acquired.stats), ..prepared })
 }
 
 /// [`prepare_request`] for one question of a decision (GitHub #239): no
@@ -347,14 +382,19 @@ async fn prepare_request(
 /// acquisition and the same multimodal render as a chat turn — an image is
 /// evidence here exactly as it is there. The error is a rendered response,
 /// ready to stand in a question's slot.
+///
+/// With `part_ends`, the render reports where each content part of the last
+/// message ends (GitHub #270) — the decision's `state` parts — which is what
+/// its reuse boundaries are cut from.
 pub(crate) async fn prepare_decision_request(
     server: &Server,
     model: Option<String>,
     messages: &[ChatMessage],
     params: DecodeParams,
     thinking: &ThinkingOptions,
-) -> Result<(RequestInput, String, u32, Option<MediaStats>), (&'static str, String)> {
-    prepare_request(server, model, messages, params, thinking, &[])
+    part_ends: bool,
+) -> Result<PreparedRequest, (&'static str, String)> {
+    prepare_input(server, model, messages, params, thinking, &[], part_ends)
         .await
         .map_err(|response| {
             // The shared path answers with a rendered `Response`, which is

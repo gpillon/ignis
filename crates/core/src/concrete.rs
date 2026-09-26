@@ -142,8 +142,9 @@ use crate::scheduler::{
     RetainedAt, Scheduler, SharedPrefixClaim,
 };
 use crate::types::{
-    BackfillClass, ComputeError, DecisionRead, DecodeParams, EngineMode, FinishReason, LaneId,
-    N_DECODE_LANES, RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SubmitError,
+    BackfillClass, BoundaryLifetime, ComputeError, DecisionRead, DecodeParams, EngineMode,
+    FanOutId, FinishReason, LaneId, N_DECODE_LANES, RequestClass, RequestId, RequestInput,
+    RequestState, SchedEvent, SubmitError,
 };
 
 /// Knobs for the concrete scheduler (v1 defaults; the KV-RAM host tier
@@ -1009,6 +1010,17 @@ impl ConcreteScheduler {
         else {
             return;
         };
+        // GitHub #270: a fan-out's head is a bet on that fan-out's own
+        // questions, so a copy in KV-RAM would outlive every request that
+        // could use it.
+        if retention.lifetime != BoundaryLifetime::Retained {
+            events.push(SchedEvent::RetainedState {
+                operation: RetainedStateOperation::Discard,
+                source: ReuseSource::Device,
+                kind: RetainedKind::Prefix,
+            });
+            return;
+        }
         if let Some(copy) = self.prefix.spilled_copy_of(entry) {
             self.host
                 .refresh_retained(RetainedBlob::Prefix(copy), retention.used_at);
@@ -1146,6 +1158,8 @@ impl ConcreteScheduler {
             at: self.tick,
             class: spilled.class,
             used_at: now,
+            // Only a retained prefix spills; a fan-out's head never does.
+            lifetime: BoundaryLifetime::Retained,
         };
         self.prefix.retain_published(entry, retention);
         // `register` counted a registrant; nobody is one.
@@ -1842,6 +1856,37 @@ impl ConcreteScheduler {
         }
     }
 
+    /// Fan-out `owner` has ended (GitHub #270): give up every head it keeps.
+    ///
+    /// Each head's retention goes, and with it the head's retained slot and
+    /// its own pages as soon as nothing live stands on it — a follower still
+    /// finishing keeps it until it does, as any claimant keeps any prefix. It
+    /// goes nowhere else: a head is a bet on the questions of one fan-out,
+    /// and nobody sends that state again, so spilling it to KV-RAM would copy
+    /// it for no one.
+    ///
+    /// A question still waiting to publish one of `owner`'s heads — the
+    /// client left while the first question was queued — publishes none.
+    ///
+    /// Returns the retained-slot report when the count moved: nothing else may
+    /// step the scheduler after this, and a gauge left where the fan-out put
+    /// it would read as a leak.
+    pub fn end_fan_out(&mut self, owner: FanOutId) -> Vec<SchedEvent> {
+        for r in &mut self.requests {
+            r.input
+                .reuse_boundaries
+                .retain(|b| b.lifetime != BoundaryLifetime::FanOut(owner));
+        }
+        for head in self.prefix.fan_out_heads(owner) {
+            if self.prefix.unretain(head) {
+                self.release_prefix_claim(Some(head));
+            }
+        }
+        let mut events = Vec::new();
+        self.report_retained_slots(&mut events);
+        events
+    }
+
     /// The request's lifecycle state (test / telemetry observability).
     /// `None` when `request` is unknown. An issued id no longer held was
     /// reaped (GitHub #269), and only a finished request is.
@@ -2494,6 +2539,7 @@ impl Scheduler for ConcreteScheduler {
         // does, so that off really is the engine that existed before.
         if !self.config.prompt_reuse {
             request.input.system_block_tokens = None;
+            request.input.reuse_boundaries.clear();
         }
         self.requests.push(request);
         Ok(id)
@@ -2501,6 +2547,10 @@ impl Scheduler for ConcreteScheduler {
 
     fn cancel(&mut self, request: RequestId) -> bool {
         ConcreteScheduler::cancel(self, request)
+    }
+
+    fn end_fan_out(&mut self, owner: FanOutId) -> Vec<SchedEvent> {
+        ConcreteScheduler::end_fan_out(self, owner)
     }
 
     fn advance(&mut self) -> Vec<SchedEvent> {
@@ -3236,33 +3286,31 @@ impl Scheduler for ConcreteScheduler {
                                     r.resources.kv_pages =
                                         r.resources.kv_pages.saturating_sub(pages);
                                     // GitHub #188 (ADR 0029): a prefix
-                                    // published at or below the system block
-                                    // boundary is **retained** — it does not
-                                    // drop when its last live claimant goes,
-                                    // so the next subagent of the burst claims
-                                    // it although its sibling finished. Asked
-                                    // of the request rather than re-derived,
-                                    // so the head that was published and the
-                                    // head that is retained cannot disagree.
+                                    // published at a **reuse boundary** is
+                                    // **retained** — it does not drop when its
+                                    // last live claimant goes, so the next
+                                    // subagent of the burst claims it although
+                                    // its sibling finished. Asked of the
+                                    // request rather than re-derived, so the
+                                    // head that was published and the head
+                                    // that is retained cannot disagree.
                                     //
-                                    // `<=`, not `==`: a prompt shorter than
-                                    // its own block publishes the whole pages
-                                    // it has, which is a prefix *of* the block
-                                    // and reusable by the same burst. What
-                                    // must never be retained is a head reaching
-                                    // *past* the block, since that is the
-                                    // request's own conversation and no
+                                    // GitHub #270: the system block is one
+                                    // such boundary among several, and a
+                                    // fan-out's head is kept only until its
+                                    // fan-out ends. What must never be
+                                    // retained is the generation opener's
+                                    // page, which is no boundary at all: it is
+                                    // the request's own conversation and no
                                     // sibling shares it.
-                                    let block = self.requests[i]
-                                        .retained_prefix_point(self.config.kv_page_tokens);
-                                    if self.config.prompt_reuse
-                                        && block > 0
-                                        && published <= block
-                                    {
+                                    let lifetime = self.requests[i]
+                                        .boundary_lifetime(published, self.config.kv_page_tokens);
+                                    if let Some(lifetime) = lifetime.filter(|_| self.config.prompt_reuse) {
                                         let retention = Retention {
                                             at: self.tick,
                                             class: self.requests[i].class,
                                             used_at: self.now(),
+                                            lifetime,
                                         };
                                         let took = self.prefix.retain_published(entry, retention);
                                         // `retain_published` refuses an entry

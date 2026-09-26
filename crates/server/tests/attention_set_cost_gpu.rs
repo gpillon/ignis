@@ -185,6 +185,7 @@ fn the_set_costs_under(test: &str, image: &str, instruction: &str, bound_ms: f64
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         decision: Some(match shape {
             Shape::NoReadout => DecisionRead::Answers(Arc::from(vec![tokens[tokens.len() - 1]])),
             Shape::PointingHead | Shape::HeadSet => DecisionRead::Attention(AttentionQuery {

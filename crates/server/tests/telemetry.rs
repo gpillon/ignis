@@ -56,6 +56,7 @@ fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         model: "test-model".into(),
         tokens,
         params: DecodeParams {
