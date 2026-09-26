@@ -38,6 +38,7 @@ fn input(tokens: &[u32], max: u32) -> RequestInput {
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         model: "qwen3.8-27b".into(),
         tokens: tokens.to_vec(),
         params: DecodeParams {
@@ -356,6 +357,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
+                reuse_boundaries: Vec::new(),
                 model: "qwen3.8-27b".into(),
                 tokens: full_prompt,
                 params: DecodeParams::default(),
@@ -378,6 +380,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
+                reuse_boundaries: Vec::new(),
                 model: "qwen3.8-27b".into(),
                 tokens: (0..10).collect(),
                 params: DecodeParams::default(),

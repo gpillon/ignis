@@ -134,6 +134,13 @@ pub struct ContentPart {
     /// An `image_url` / `video_url` part's `url`, when it is a string
     /// inside the object OpenAI's wire shape nests it in.
     pub url: Option<String>,
+    /// The part's `cache_control`, as sent, when it is present and not
+    /// `null` (GitHub #270): a **reuse marker** on a `/v1/decide` `state`
+    /// part, which `crate::decide` checks is exactly `{"type": "ephemeral"}`.
+    /// Kept raw so a malformed one can be refused rather than read as absent.
+    /// Read, never written back: no chat template sees it, and the chat and
+    /// Responses routes neither honour nor refuse it.
+    pub cache_control: Option<JsonValue>,
 }
 
 impl From<ContentPart> for JsonValue {
@@ -210,6 +217,7 @@ impl From<JsonValue> for ContentPart {
             text: string(value.get("text")),
             kind,
             url,
+            cache_control: value.get("cache_control").filter(|marker| !marker.is_null()).cloned(),
         }
     }
 }
@@ -429,6 +437,22 @@ pub struct RenderedPrompt {
     /// disagrees about would hand a later request KV pages for history it does
     /// not have.
     pub system_block_tokens: Option<u32>,
+    /// How many leading tokens end each content part of the **last message**,
+    /// in order, but its last part (GitHub #270) — what a `/v1/decide`
+    /// state's **reuse boundaries** are cut from: a reuse marker's part end,
+    /// and every run end an observed fork is keyed at. The last part ends
+    /// where the message does, which is no place to cut — the generation
+    /// opener follows it — and each end costs a tokenization of everything
+    /// before it.
+    ///
+    /// Reported only when asked for
+    /// ([`TemplateProvider::apply_chat_template_with_part_ends`]), and empty
+    /// otherwise or when the last message is not content parts. An entry is
+    /// `None` where the end cannot be said exactly — the head does not
+    /// tokenize to an exact token prefix of the whole prompt — and then no
+    /// boundary is cut there, for the reason none is at an unsure system
+    /// block.
+    pub part_ends: Vec<Option<u32>>,
 }
 
 impl From<Vec<TokenId>> for RenderedPrompt {
@@ -441,6 +465,7 @@ impl From<Vec<TokenId>> for RenderedPrompt {
             opener_tokens: None,
             user_turn_tokens: None,
             system_block_tokens: None,
+            part_ends: Vec::new(),
         }
     }
 }
@@ -470,6 +495,22 @@ pub trait TemplateProvider: Send + Sync {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection>;
+
+    /// [`TemplateProvider::apply_chat_template`], also reporting where each
+    /// content part of the last message ends ([`RenderedPrompt::part_ends`],
+    /// GitHub #270). A separate method because only a decision asks, and the
+    /// answer costs a render and a tokenization per part.
+    ///
+    /// The default reports none, which fails closed: a provider that cannot
+    /// say where a part ends cuts no boundary there.
+    fn apply_chat_template_with_part_ends(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        self.apply_chat_template(messages, options, tools)
+    }
 
     /// The **answer alphabet** this provider's tokenizer can name (GitHub
     /// #237, #239): the labels `/v1/decide` gives a decision's options.
@@ -568,6 +609,21 @@ pub trait TemplateProvider: Send + Sync {
             message: "this server's chat template cannot render images".to_owned(),
         })
     }
+
+    /// [`TemplateProvider::prepare_multimodal`], also reporting where each
+    /// content part of the last message ends, counted over the **expanded**
+    /// tokens ([`RenderedPrompt::part_ends`], GitHub #270). The default
+    /// reports none, as [`TemplateProvider::apply_chat_template_with_part_ends`]'s
+    /// does.
+    fn prepare_multimodal_with_part_ends(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
+        self.prepare_multimodal(messages, options, tools, media)
+    }
 }
 
 /// A prepared prompt's refusal as a content rejection: the processor's own
@@ -608,7 +664,7 @@ impl TemplateProvider for SimpleTemplateProvider {
             .flat_map(|m| {
                 let text = m.content.text();
                 text.split_whitespace()
-                    .map(|word| fnv1a32(format!("{}:{}", m.role, word).as_bytes()))
+                    .map(|word| simple_token(&m.role, word))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<TokenId>>()
@@ -643,6 +699,37 @@ impl TemplateProvider for SimpleTemplateProvider {
         false
     }
 
+    /// The words of each content part of the last message, counted as it
+    /// renders them: the whole conversation's words up to that part's end. No
+    /// head can disagree with the prompt about a word, but the check is the
+    /// real provider's anyway, so a double built on this one fails closed the
+    /// same way.
+    fn apply_chat_template_with_part_ends(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        let mut rendered = self.apply_chat_template(messages, options, tools)?;
+        if let Some((last, before)) = messages.split_last()
+            && let MessageContent::Parts(parts) = &last.content
+        {
+            let head: usize = before.iter().map(|m| m.content.text().split_whitespace().count()).sum();
+            rendered.part_ends = (1..parts.len())
+                .map(|n| {
+                    let words: Vec<TokenId> = template_text_parts(&parts[..n])
+                        .concat()
+                        .split_whitespace()
+                        .map(|word| simple_token(&last.role, word))
+                        .collect();
+                    let exact = rendered.tokens.get(head..).is_some_and(|tail| tail.starts_with(&words));
+                    exact.then(|| (head + words.len()) as u32)
+                })
+                .collect();
+        }
+        Ok(rendered)
+    }
+
     /// The placeholder's words, with each image part replaced by its
     /// merged-grid run of `<|image_pad|>` ids, laid out by the processor's
     /// own position rules.
@@ -653,14 +740,42 @@ impl TemplateProvider for SimpleTemplateProvider {
         _tools: &[JsonValue],
         media: Vec<PreparedMedia>,
     ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
+        let (rendered, multimodal) = self.expand(messages, media)?;
+        // No chat markers, so no boundaries — as on its text path.
+        Ok((RenderedPrompt { part_ends: Vec::new(), ..rendered }, multimodal))
+    }
+
+    /// [`Self::prepare_multimodal`], each part's end counted as it is laid
+    /// out, an image's run included.
+    fn prepare_multimodal_with_part_ends(
+        &self,
+        messages: &[ChatMessage],
+        _options: &ThinkingOptions,
+        _tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
+        self.expand(messages, media)
+    }
+}
+
+impl SimpleTemplateProvider {
+    /// The multimodal render: every message's words and every image's run,
+    /// and where each part of the last message ended.
+    fn expand(
+        &self,
+        messages: &[ChatMessage],
+        media: Vec<PreparedMedia>,
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         let mut tokens = Vec::new();
+        let mut part_ends = Vec::new();
         let mut images = media.iter();
-        for message in messages {
-            let word = |word: &str| fnv1a32(format!("{}:{}", message.role, word).as_bytes());
+        for (index, message) in messages.iter().enumerate() {
+            let last = index + 1 == messages.len();
+            let word = |word: &str| simple_token(&message.role, word);
             match &message.content {
                 MessageContent::Text(text) => tokens.extend(text.split_whitespace().map(word)),
                 MessageContent::Parts(parts) => {
-                    for part in parts {
+                    for (at, part) in parts.iter().enumerate() {
                         match (part.kind.as_deref(), &part.text) {
                             (Some("image_url"), _) => {
                                 let image = images.next().ok_or_else(|| {
@@ -673,6 +788,9 @@ impl TemplateProvider for SimpleTemplateProvider {
                             }
                             (_, Some(text)) => tokens.extend(text.split_whitespace().map(word)),
                             _ => {}
+                        }
+                        if last && at + 1 < parts.len() {
+                            part_ends.push(Some(tokens.len() as u32));
                         }
                     }
                 }
@@ -696,9 +814,15 @@ impl TemplateProvider for SimpleTemplateProvider {
                 content_digest: m.content_digest,
             })
             .collect();
-        // No chat markers, so no boundaries — as on its text path.
-        Ok((tokens.into(), Multimodal { positions, rope_delta, media }))
+        let rendered = RenderedPrompt { part_ends, ..tokens.into() };
+        Ok((rendered, Multimodal { positions, rope_delta, media }))
     }
+}
+
+/// The placeholder's token for `word` said by `role`: the FNV-1a 32-bit hash
+/// of `"{role}:{word}"`.
+fn simple_token(role: &str, word: &str) -> TokenId {
+    fnv1a32(format!("{role}:{word}").as_bytes())
 }
 
 /// The placeholder's incremental decoder: the same decimal-id, space-joined

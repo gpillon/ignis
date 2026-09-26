@@ -54,11 +54,12 @@ fn acquirer(limits: ProcessorOptions, policy: MediaPolicy) -> MediaAcquirer {
 
 /// One user message: a text part, then one image part per URL.
 fn messages(urls: &[&str]) -> Vec<ChatMessage> {
-    let mut parts = vec![ContentPart { kind: Some("text".to_owned()), text: Some("look".to_owned()), url: None }];
+    let mut parts = vec![ContentPart { kind: Some("text".to_owned()), text: Some("look".to_owned()), url: None, cache_control: None }];
     parts.extend(urls.iter().map(|url| ContentPart {
         kind: Some("image_url".to_owned()),
         text: None,
         url: Some((*url).to_owned()),
+        cache_control: None,
     }));
     let mut message = ChatMessage::text("user", "");
     message.content = MessageContent::Parts(parts);

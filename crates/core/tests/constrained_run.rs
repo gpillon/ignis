@@ -259,6 +259,7 @@ mod scheduler {
             opener_tokens: None,
             user_turn_tokens: None,
             system_block_tokens: None,
+            reuse_boundaries: Vec::new(),
             decision: None,
             constrained: Some(Arc::new(Schedule::new(steps).expect("a legal program"))),
         }
@@ -463,6 +464,7 @@ mod terminator {
             opener_tokens: None,
             user_turn_tokens: None,
             system_block_tokens: None,
+            reuse_boundaries: Vec::new(),
             decision: None,
             constrained: Some(Arc::new(schedule)),
         }

@@ -43,6 +43,7 @@ fn input(prompt: Vec<u32>, opener: Option<u32>, max: u32) -> RequestInput {
         opener_tokens: opener,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         constrained: None,
     }
 }
@@ -105,6 +106,7 @@ fn next_turn_at(start: u32) -> RequestInput {
 fn with_block(request: RequestInput) -> RequestInput {
     RequestInput {
         system_block_tokens: Some(BLOCK),
+        reuse_boundaries: Vec::new(),
         ..request
     }
 }
@@ -668,6 +670,7 @@ const BIG_BLOCK: u32 = 1088;
 fn subagent(question: u32) -> RequestInput {
     RequestInput {
         system_block_tokens: Some(BIG_BLOCK),
+        reuse_boundaries: Vec::new(),
         ..input([tokens(1, BIG_BLOCK), tokens(question, 40)].concat(), None, 4)
     }
 }
@@ -754,6 +757,7 @@ fn a_block_short_of_the_restore_floor_stays_in_kv_ram() {
     let mut sched = ConcreteScheduler::with_config(tight(8), compute.clone());
     let small = |question| RequestInput {
         system_block_tokens: Some(BLOCK),
+        reuse_boundaries: Vec::new(),
         ..input([tokens(1, BLOCK), tokens(question, 40)].concat(), None, 4)
     };
     let first = sched.submit(small(10_000), RequestClass::Agent).unwrap();

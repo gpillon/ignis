@@ -39,6 +39,7 @@ fn head_point(prompt: Vec<TokenId>, begin: u32, count: u32) -> RequestInput {
         opener_tokens: Some(opener),
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         decision: Some(DecisionRead::Attention(AttentionQuery {
             head: HEAD,
             key_begin: begin,
@@ -305,6 +306,7 @@ fn a_head_point_claims_no_prefix_that_would_leave_it_a_narrow_last_chunk() {
     let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
     let over_evidence = |prompt| RequestInput {
         system_block_tokens: Some(72),
+        reuse_boundaries: Vec::new(),
         ..head_point(prompt, 2, 30)
     };
     sched

@@ -629,6 +629,18 @@ pub trait Scheduler: Send {
     /// Returns `false` when the request is unknown or already complete.
     fn cancel(&mut self, request: RequestId) -> bool;
 
+    /// A `/v1/decide` fan-out has ended (GitHub #270): every question
+    /// answered or failed, or its caller gone. The **fan-out head** it kept
+    /// is given up; nothing else is. Returns what that changed, for the
+    /// caller to route like a step's events.
+    ///
+    /// The default keeps nothing, so it gives up nothing: a scheduler with no
+    /// reuse boundaries has no fan-out head to hold.
+    fn end_fan_out(&mut self, owner: crate::types::FanOutId) -> Vec<SchedEvent> {
+        let _ = owner;
+        Vec::new()
+    }
+
     /// Advance the engine by one scheduling step:
     /// - run **batched prefill** for queued requests (grouped into one GPU
     ///   batch to saturate the GPU and cut burst TTFT),

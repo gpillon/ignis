@@ -199,7 +199,7 @@ fn instruction_block(messages: &[&ChatMessage]) -> ChatMessage {
         [] => MessageContent::Text(String::new()),
         [only] => MessageContent::Text(only.clone()),
         [.., last] => {
-            let part = |text: String| ContentPart { kind: Some("text".to_owned()), text: Some(text), url: None };
+            let part = |text: String| ContentPart { kind: Some("text".to_owned()), text: Some(text), url: None, cache_control: None };
             let mut parts: Vec<ContentPart> = texts[..texts.len() - 1].iter().map(|t| part(format!("{t}\n"))).collect();
             parts.push(part(last.clone()));
             MessageContent::Parts(parts)

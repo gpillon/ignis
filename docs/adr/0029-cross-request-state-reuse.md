@@ -279,3 +279,45 @@ anywhere, and it spends a slot whenever the first part is the one that
 changes); client markers with same-step producer/consumer scheduling (vLLM
 RFC #55697 — the scheduling half would make a decision a live publisher,
 which #238 rules out).
+
+**As built** (2026-09-26), where the spec left a choice:
+
+- **The list lives beside the block, not instead of it.**
+  `RequestInput::reuse_boundaries` carries the server's predictions as exact
+  token prefixes; `Request::reuse_boundaries` joins them with the system
+  block, floors, walks out of media, caps at the publish reach and merges.
+  The registration asks it the lifetime of the head it just published, so the
+  generation opener's page — which is no reuse boundary — is still the only
+  head that dies with its claimants.
+- **#187's gate stays on the structural heads.** A resumed request without an
+  opener still publishes neither its system block nor its opener's page, but it
+  does publish the boundaries the server predicted for it: each is a
+  prediction somebody made, which is what the gate asks a chained head to
+  prove.
+- **A fan-out's head never goes to KV-RAM.** When the device gives one up
+  early it is discarded, and when its fan-out ends its retention is released
+  like any first-victim give-up. The scheduler also strips an ended fan-out's
+  boundary from a question still waiting to publish it, so a client that left
+  mid-fan-out leaves nothing behind. The end reaches the scheduler as its own
+  command (`Scheduler::end_fan_out`) and reports the slot gauge at once — an
+  idle engine may not step again.
+- **The part ends come from the renderer.** A decision asks the template for
+  where each content part of its user turn ends
+  (`TemplateProvider::apply_chat_template_with_part_ends`); the artifact
+  provider renders the conversation cut after each part and keeps the offset
+  only where the whole prompt has the same bytes up to it and it tokenizes to
+  an exact prefix. Each end costs a tokenization of the head, so only the
+  first question under each system text asks (the others share the state and
+  claim the fan-out's head, which covers every end), no end is reported for
+  the message's last part, and chat requests never ask.
+- **`cache_control: null` is no marker.** It is what a client that serializes
+  an absent field sends; it asks for nothing, so it is neither honoured nor
+  refused.
+- **An image's end is rarely a boundary.** A boundary at the end of an image
+  part floors into the image's placeholders unless its page boundary happens
+  to fall after them, and #193 walks it back to before the image. A fork or a
+  marker after a picture therefore usually keeps the text before it; a
+  fan-out's head keeps the picture only when the question text its questions
+  share reaches the next page boundary. Measured live in
+  `docs/findings/2026-09-26-decide-reuse-boundaries-live.md`: that, and each
+  follower's own per-question cost, is why spec 16's `E <= 2 x D` does not hold.

@@ -91,6 +91,7 @@ fn input(prompt: Vec<u32>, block: Option<u32>, opener: Option<u32>, max: u32) ->
         opener_tokens: opener,
         user_turn_tokens: None,
         system_block_tokens: block,
+        reuse_boundaries: Vec::new(),
         constrained: None,
     }
 }

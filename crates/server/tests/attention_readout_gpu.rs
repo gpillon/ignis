@@ -193,6 +193,7 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
             opener_tokens: None,
             user_turn_tokens: None,
             system_block_tokens: None,
+            reuse_boundaries: Vec::new(),
             decision: Some(DecisionRead::Attention(AttentionQuery {
                 head: HEAD,
                 key_begin: begin as u32,

@@ -20,8 +20,8 @@ use crate::admission::AdmissionResources;
 use crate::gdn::GdnState;
 use crate::prefix::PrefixId;
 use crate::types::{
-    BackfillClass, LaneId, RequestClass, RequestId, RequestInput, RequestState, SpecCounters,
-    TokenId,
+    BackfillClass, BoundaryLifetime, LaneId, RequestClass, RequestId, RequestInput, RequestState,
+    ReuseBoundary, SpecCounters, TokenId,
 };
 
 /// A request in flight in the engine: its lifecycle state, its class (for
@@ -316,6 +316,12 @@ impl Request {
     /// sibling of a burst would pay a chunk split for a chained prefix nobody
     /// is going to claim — no subagent's prompt extends its sibling's.
     ///
+    /// GitHub #270 adds the boundaries the server predicted
+    /// ([`RequestInput::reuse_boundaries`]) to the walk, and the gate does not
+    /// apply to them: each is a prediction that a later request resumes there,
+    /// which is what the gate asks a chained head to prove. The block and the
+    /// opener's page keep it.
+    ///
     /// One function so that the chunk decomposition (where to cut) and the
     /// registration (when to publish) cannot disagree about it.
     pub fn publish_point(&self, page_tokens: u32) -> u32 {
@@ -325,26 +331,70 @@ impl Request {
             .shared_pages
             .saturating_mul(page_tokens)
             .max(self.standalone_tokens);
-        // Ascending, and it has to be: "the first boundary past what I already
-        // share" is only the next one if they are in prompt order. They always
-        // are — the system block ends before the last generation opener, and
-        // flooring to pages is monotone.
-        let boundaries = [self.retained_prefix_point(page_tokens), self.publish_tokens];
-        for at in boundaries {
-            // Already published, or covered by the entry this request claimed.
-            if at <= shared {
-                continue;
-            }
-            // A chained publish has to earn its chunk split — and so does a
-            // head published over history restored from a materialized blob
-            // (GitHub #190), which is a resumed request's publish too.
-            let resumed = self.prefix_entry.is_some() || self.standalone_tokens > 0;
-            if resumed && self.input.opener_tokens.is_none() {
-                continue;
-            }
-            return at;
-        }
-        0
+        // A chained publish has to earn its chunk split — and so does a head
+        // published over history restored from a materialized blob (GitHub
+        // #190), which is a resumed request's publish too.
+        let resumed = self.prefix_entry.is_some() || self.standalone_tokens > 0;
+        let gated = resumed && self.input.opener_tokens.is_none();
+        let structural = [self.retained_prefix_point(page_tokens), self.publish_tokens];
+        // The next boundary is the lowest one past what the request shares:
+        // the prefill reaches it first.
+        self.predicted_boundaries(page_tokens)
+            .map(|boundary| boundary.tokens)
+            .chain(structural.into_iter().filter(|_| !gated))
+            .filter(|&at| at > shared)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Every **reuse boundary** this request publishes a shared prefix at
+    /// (GitHub #270, ADR 0029 as amended), ascending: the system block's
+    /// ([`Request::retained_prefix_point`], kept until the device needs the
+    /// room) and every one the server predicted, each floored as the block
+    /// is ([`Request::predicted_boundaries`]). Two that land on one position
+    /// are one boundary with the longer lifetime — one cut, one slot.
+    ///
+    /// A property of the prompt, not of what the request holds, for the reason
+    /// [`Request::retained_prefix_point`] is one: the registration asks it what
+    /// the head it just published is kept for.
+    pub fn reuse_boundaries(&self, page_tokens: u32) -> Vec<ReuseBoundary> {
+        let block = ReuseBoundary::retained(self.retained_prefix_point(page_tokens));
+        let mut out: Vec<ReuseBoundary> = std::iter::once(block)
+            .chain(self.predicted_boundaries(page_tokens))
+            .filter(|boundary| boundary.tokens > 0)
+            .collect();
+        // By position, the longest-lived first among equals, which is the one
+        // `dedup` keeps.
+        out.sort_unstable_by(|a, b| a.tokens.cmp(&b.tokens).then(b.lifetime.cmp(&a.lifetime)));
+        out.dedup_by_key(|boundary| boundary.tokens);
+        out
+    }
+
+    /// The boundaries the server predicted, where they are actually cut: each
+    /// capped at the publish reach (GitHub #238), floored to whole KV pages and
+    /// walked back out of any media item it lands inside (GitHub #193) — the
+    /// system block's own treatment. One that lands on 0 is none.
+    fn predicted_boundaries(&self, page_tokens: u32) -> impl Iterator<Item = ReuseBoundary> + '_ {
+        let reach = u32::try_from(self.input.publish_reach()).unwrap_or(u32::MAX);
+        self.input
+            .reuse_boundaries
+            .iter()
+            .map(move |b| ReuseBoundary {
+                tokens: self.input.prefix_floor(b.tokens.min(reach), page_tokens),
+                ..*b
+            })
+            .filter(|boundary| boundary.tokens > 0)
+    }
+
+    /// How long the shared prefix this request published at `published` is
+    /// kept: the lifetime of its reuse boundary there, or `None` for a head
+    /// that is none — the generation opener's page, which lives only as long
+    /// as something live stands on it.
+    pub fn boundary_lifetime(&self, published: u32, page_tokens: u32) -> Option<BoundaryLifetime> {
+        self.reuse_boundaries(page_tokens)
+            .into_iter()
+            .find(|boundary| boundary.tokens == published)
+            .map(|boundary| boundary.lifetime)
     }
 
     /// The **retained-prefix boundary** (GitHub #188, ADR 0029): the end of
@@ -697,6 +747,7 @@ mod tests {
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
+                reuse_boundaries: Vec::new(),
             },
             AdmissionResources::default(),
             4,

@@ -915,6 +915,7 @@ mod tests {
             kind: Some(kind.to_owned()),
             url: url.map(str::to_owned),
             text: text.map(str::to_owned),
+            cache_control: None,
         };
         let message = |role: &str, content| ChatMessage {
             role: role.to_owned(),

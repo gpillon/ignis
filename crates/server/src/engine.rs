@@ -73,6 +73,11 @@ enum Command {
     Cancel {
         request: RequestId,
     },
+    /// A `/v1/decide` fan-out ended (GitHub #270): give up its head. No reply
+    /// channel, for the reason `Cancel` has none.
+    EndFanOut {
+        owner: ignis_core::types::FanOutId,
+    },
 }
 
 /// A message on the telemetry consumer's inbox. The model thread only ever
@@ -307,6 +312,13 @@ impl Engine {
         // thread, whose loop stays unchanged (ADR 0017).
         let _ = self.facts.send(TelemetryFact::Cancelled(request));
     }
+
+    /// Tell the model thread fan-out `owner` has ended (GitHub #270), so the
+    /// **fan-out head** it kept goes. Fire-and-forget, so a handler's `Drop`
+    /// can call it when the client leaves mid-fan-out.
+    pub fn end_fan_out(&self, owner: ignis_core::types::FanOutId) {
+        let _ = self.commands.send(Command::EndFanOut { owner });
+    }
 }
 
 /// The model thread's loop (GitHub #69): drains every queued command
@@ -381,6 +393,12 @@ fn handle_command(
             if scheduler.cancel(request) {
                 streams.remove(&request);
             }
+        }
+        // Routed like a step's events: the retained-slot gauge has to move
+        // now, and an idle engine may not step again for a long time.
+        Command::EndFanOut { owner } => {
+            let events = scheduler.end_fan_out(owner);
+            route_events(&events, streams, facts);
         }
     }
 }
@@ -693,6 +711,7 @@ mod tests {
             opener_tokens: None,
             user_turn_tokens: None,
             system_block_tokens: None,
+            reuse_boundaries: Vec::new(),
             model: model.into(),
             tokens,
             params: DecodeParams {

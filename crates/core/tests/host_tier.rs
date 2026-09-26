@@ -32,6 +32,7 @@ fn input(max: u32) -> RequestInput {
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         model: "qwen3.8-27b".into(),
         tokens: vec![1, 2, 3, 4],
         params: DecodeParams {
@@ -280,6 +281,7 @@ fn a_burst_on_one_prefix_overflows_through_materialized_snapshots_without_repref
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         model: "qwen3.8-27b".into(),
         tokens,
         params: DecodeParams {
@@ -394,6 +396,7 @@ fn a_request_holding_a_shared_prefix_is_evicted_with_its_prefix_materialized() {
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
         model: "qwen3.8-27b".into(),
         tokens,
         params: DecodeParams {
@@ -496,6 +499,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                     opener_tokens: None,
                     user_turn_tokens: None,
                     system_block_tokens: None,
+                    reuse_boundaries: Vec::new(),
                     model: "qwen3.8-27b".into(),
                     tokens: (1..=16).collect(),
                     params: DecodeParams {
@@ -520,6 +524,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
+                reuse_boundaries: Vec::new(),
                 model: "qwen3.8-27b".into(),
                 tokens: (1000..1004).collect(),
                 params: DecodeParams {
@@ -542,6 +547,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
+                reuse_boundaries: Vec::new(),
                 model: "qwen3.8-27b".into(),
                 tokens: (2000..2004).collect(),
                 params: DecodeParams {

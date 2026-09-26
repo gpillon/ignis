@@ -127,6 +127,144 @@ impl ArtifactTemplateProvider {
         tokens.starts_with(&head).then(|| head.len() as u32)
     }
 
+    /// The byte offset in `rendered` where each content part of `messages`'
+    /// last message but its last one ends ([`RenderedPrompt::part_ends`]), or
+    /// `None` where that cannot be said exactly (GitHub #270) — empty when
+    /// the last message is not content parts.
+    ///
+    /// Asked of the template rather than re-derived: the conversation is
+    /// rendered again with the last message cut after each part, and that
+    /// render's content ends where its user turn closes, just before
+    /// `<|im_end|>\n<|im_start|>assistant\n`. The offset counts only when the
+    /// whole prompt has exactly those bytes up to there. How the template
+    /// joins parts, where it puts an image's placeholder and what it trims are
+    /// then the template's business, and a render that does not close its last
+    /// turn that way reports nothing rather than a guess.
+    fn part_end_offsets(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        rendered: &str,
+    ) -> Vec<Option<usize>> {
+        let Some(MessageContent::Parts(parts)) = messages.last().map(|m| &m.content) else {
+            return Vec::new();
+        };
+        let closing = format!("{}{}", ChatTemplate::BLOCK_CLOSER, ChatTemplate::GENERATION_OPENER);
+        (1..parts.len())
+            .map(|n| {
+                let mut cut = messages.to_vec();
+                cut.last_mut()?.content = MessageContent::Parts(parts[..n].to_vec());
+                let head = self.render(&cut, options, tools).ok()?;
+                let opener = ChatTemplate::generation_opener_offset(&head)?;
+                let end = opener.checked_sub(closing.len())?;
+                let exact = head.get(end..opener) == Some(closing.as_str())
+                    && rendered.get(..end).is_some_and(|prompt| head.get(..end) == Some(prompt));
+                exact.then_some(end)
+            })
+            .collect()
+    }
+
+    /// [`TemplateProvider::apply_chat_template`], and the last message's part
+    /// ends when `part_ends` asks for them.
+    fn render_prompt(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        part_ends: bool,
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        Self::validate_roles(messages)?;
+        let prompt = match self.render(messages, options, tools) {
+            Ok(prompt) => prompt,
+            Err(err) => return Err(TemplateRejection { code: "render_failed", message: err }),
+        };
+        let tokens = match self.set.tokenizer().encode(&prompt) {
+            Ok(ids) => ids,
+            Err(err) => return Err(TemplateRejection { code: "render_failed", message: err.to_string() }),
+        };
+        let opener_tokens = self.opener_tokens(&prompt, &tokens);
+        let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
+        let system_block_tokens = self.system_block_tokens(messages, &prompt, &tokens);
+        let part_ends = match part_ends {
+            true => self
+                .part_end_offsets(messages, options, tools, &prompt)
+                .into_iter()
+                .map(|at| at.and_then(|at| self.exact_token_prefix(&prompt, at, &tokens)))
+                .collect(),
+            false => Vec::new(),
+        };
+        Ok(RenderedPrompt {
+            tokens,
+            opener_tokens,
+            user_turn_tokens,
+            system_block_tokens,
+            part_ends,
+        })
+    }
+
+    /// [`TemplateProvider::prepare_multimodal`], and the last message's part
+    /// ends when `part_ends` asks for them, carried across the placeholder
+    /// expansion with the other boundaries.
+    fn prepare_prompt(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+        part_ends: bool,
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
+        let Some(processor) = &self.vision else {
+            return Err(ContentRejection {
+                code: "vision_disabled",
+                message: "vision is disabled for this server".to_owned(),
+            });
+        };
+        Self::validate_roles(messages).map_err(|rejection| ContentRejection {
+            code: rejection.code,
+            message: rejection.message,
+        })?;
+        let rendered = self.render(messages, options, tools).map_err(|err| ContentRejection {
+            code: "render_failed",
+            message: format!("chat template render failed: {err}"),
+        })?;
+        // GitHub #193: the boundaries cross-request reuse is cut at, carried
+        // across the placeholder expansion by the processor, which checks each
+        // for an exact token prefix of the expanded prompt the way
+        // `exact_token_prefix` does for a text one.
+        let user_query = ChatTemplate::last_user_query_offset(&rendered);
+        let offsets = [
+            ChatTemplate::generation_opener_offset(&rendered),
+            retained_prefix_offset(messages, &rendered),
+            user_query,
+        ];
+        // GitHub #270: and a decision's part ends after them.
+        let parts = match part_ends {
+            true => self.part_end_offsets(messages, options, tools, &rendered),
+            false => Vec::new(),
+        };
+        let boundaries: Vec<usize> = offsets.iter().chain(&parts).flatten().copied().collect();
+        let mut prompt = processor
+            .prepare_prompt(self.set.tokenizer(), &rendered, media, &boundaries)
+            .map_err(processor_rejection)?;
+        let mut frontiers = std::mem::take(&mut prompt.frontiers).into_iter();
+        let [opener_tokens, system_block_tokens, user_turn_tokens] =
+            offsets.map(|offset| offset.and_then(|_| frontiers.next().flatten()));
+        let part_ends = parts.iter().map(|at| at.and_then(|_| frontiers.next().flatten())).collect();
+        let (tokens, multimodal) = Multimodal::from_prepared(prompt);
+        let rendered = RenderedPrompt {
+            tokens,
+            opener_tokens,
+            // The processor refuses an empty head, as `exact_token_prefix`
+            // does; the user turn alone accepts one (`Self::user_turn_tokens`):
+            // a conversation opening on the user's message has its query at 0.
+            user_turn_tokens: user_turn_tokens.or(user_query.filter(|&at| at == 0).map(|_| 0)),
+            system_block_tokens,
+            part_ends,
+        };
+        Ok((rendered, multimodal))
+    }
+
     /// The prompt text [`TemplateProvider::apply_chat_template`] tokenizes for
     /// `messages`, or the refusal it would answer with — what a test pins the
     /// rendering by (GitHub #209).
@@ -241,24 +379,16 @@ impl TemplateProvider for ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
-        Self::validate_roles(messages)?;
-        let prompt = match self.render(messages, options, tools) {
-            Ok(prompt) => prompt,
-            Err(err) => return Err(TemplateRejection { code: "render_failed", message: err }),
-        };
-        let tokens = match self.set.tokenizer().encode(&prompt) {
-            Ok(ids) => ids,
-            Err(err) => return Err(TemplateRejection { code: "render_failed", message: err.to_string() }),
-        };
-        let opener_tokens = self.opener_tokens(&prompt, &tokens);
-        let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
-        let system_block_tokens = self.system_block_tokens(messages, &prompt, &tokens);
-        Ok(RenderedPrompt {
-            tokens,
-            opener_tokens,
-            user_turn_tokens,
-            system_block_tokens,
-        })
+        self.render_prompt(messages, options, tools, false)
+    }
+
+    fn apply_chat_template_with_part_ends(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        self.render_prompt(messages, options, tools, true)
     }
 
     fn answer_alphabet(&self) -> ignis_core::decision::AnswerAlphabet {
@@ -308,48 +438,17 @@ impl TemplateProvider for ArtifactTemplateProvider {
         tools: &[JsonValue],
         media: Vec<PreparedMedia>,
     ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
-        let Some(processor) = &self.vision else {
-            return Err(ContentRejection {
-                code: "vision_disabled",
-                message: "vision is disabled for this server".to_owned(),
-            });
-        };
-        Self::validate_roles(messages).map_err(|rejection| ContentRejection {
-            code: rejection.code,
-            message: rejection.message,
-        })?;
-        let rendered = self.render(messages, options, tools).map_err(|err| ContentRejection {
-            code: "render_failed",
-            message: format!("chat template render failed: {err}"),
-        })?;
-        // GitHub #193: the boundaries cross-request reuse is cut at, carried
-        // across the placeholder expansion by the processor, which checks each
-        // for an exact token prefix of the expanded prompt the way
-        // `exact_token_prefix` does for a text one.
-        let user_query = ChatTemplate::last_user_query_offset(&rendered);
-        let offsets = [
-            ChatTemplate::generation_opener_offset(&rendered),
-            retained_prefix_offset(messages, &rendered),
-            user_query,
-        ];
-        let boundaries: Vec<usize> = offsets.iter().flatten().copied().collect();
-        let mut prompt = processor
-            .prepare_prompt(self.set.tokenizer(), &rendered, media, &boundaries)
-            .map_err(processor_rejection)?;
-        let mut frontiers = std::mem::take(&mut prompt.frontiers).into_iter();
-        let [opener_tokens, system_block_tokens, user_turn_tokens] =
-            offsets.map(|offset| offset.and_then(|_| frontiers.next().flatten()));
-        let (tokens, multimodal) = Multimodal::from_prepared(prompt);
-        let rendered = RenderedPrompt {
-            tokens,
-            opener_tokens,
-            // The processor refuses an empty head, as `exact_token_prefix`
-            // does; the user turn alone accepts one (`Self::user_turn_tokens`):
-            // a conversation opening on the user's message has its query at 0.
-            user_turn_tokens: user_turn_tokens.or(user_query.filter(|&at| at == 0).map(|_| 0)),
-            system_block_tokens,
-        };
-        Ok((rendered, multimodal))
+        self.prepare_prompt(messages, options, tools, media, false)
+    }
+
+    fn prepare_multimodal_with_part_ends(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
+        self.prepare_prompt(messages, options, tools, media, true)
     }
 }
 
@@ -528,6 +627,7 @@ mod tests {
             kind: Some(kind.to_owned()),
             text: text.map(str::to_owned),
             url: url.map(str::to_owned),
+            cache_control: None,
         };
         let content = MessageContent::Parts(vec![
             part("text", Some("a"), None),

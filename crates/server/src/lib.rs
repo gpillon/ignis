@@ -34,6 +34,7 @@ pub mod metrics;
 pub mod playground;
 pub mod numbers;
 pub mod openapi;
+pub mod reuse;
 pub mod runtime;
 pub mod scalar;
 pub mod telemetry;
@@ -103,6 +104,13 @@ pub struct Server {
     /// head set beside it where one was chosen — or `None` on a load nobody
     /// calibrated, and then `point` and `box` answer with the digit chain.
     pub calibration: Option<ignis_core::pointing::Calibration>,
+    /// The match keys of recent `/v1/decide` parts states at their run ends
+    /// (GitHub #270): what an **observed fork** is found in. Shared by every
+    /// clone of the server, as the engine is.
+    pub fork_history: std::sync::Arc<std::sync::Mutex<reuse::ForkHistory>>,
+    /// The next `/v1/decide` fan-out's name (GitHub #270): what its head is
+    /// kept under, and given up by.
+    pub next_fan_out: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Server {
@@ -123,6 +131,8 @@ impl Server {
             api_key: None,
             media: None,
             instruction_policy: instruction::InstructionPolicy::default(),
+            fork_history: std::sync::Arc::default(),
+            next_fan_out: std::sync::Arc::default(),
         }
     }
 

@@ -110,6 +110,18 @@ pub struct RequestInput {
     /// published there, rather than a prefix published at a point the
     /// tokenizer disagrees about.
     pub system_block_tokens: Option<u32>,
+    /// The **reuse boundaries** this request carries beside the system block
+    /// (GitHub #270, ADR 0029 as amended): more prompt positions where its
+    /// prefill is cut and the shared prefix ending there is published, each
+    /// with how long it is kept.
+    ///
+    /// The server predicts them — a decision fan-out's head, an observed fork,
+    /// a caller's reuse marker — and each is an **exact** token prefix of the
+    /// prompt, not yet floored: the scheduler floors it to whole KV pages,
+    /// walks it out of any media item, caps it at the publish reach and merges
+    /// it with the others ([`crate::request::Request::reuse_boundaries`]).
+    /// Empty for every request nobody predicted anything for.
+    pub reuse_boundaries: Vec<ReuseBoundary>,
     /// What this request is a **decision** over (GitHub #238, ADR 0034): the
     /// **answer tokens** whose logits it reads, or — a `point` answered in
     /// one pass (GitHub #260, ADR 0038) — the one attention head it reads
@@ -145,6 +157,49 @@ pub struct RequestInput {
     /// They are the two halves of ADR 0034, and a request is one or the
     /// other.
     pub constrained: Option<std::sync::Arc<crate::constrained::Schedule>>,
+}
+
+/// Names one `/v1/decide` fan-out (GitHub #270): the owner of a **fan-out
+/// head**, minted by the server and told to the scheduler again when the
+/// fan-out ends ([`crate::scheduler::Scheduler::end_fan_out`]).
+pub type FanOutId = u64;
+
+/// How long the shared prefix published at a **reuse boundary** is kept once
+/// nothing live stands on it (GitHub #270).
+///
+/// Ordered by how long that is: where two boundaries floor to one position,
+/// the longer lifetime wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BoundaryLifetime {
+    /// Kept until its fan-out ends — the one departure from "free until the
+    /// room is needed" (ADR 0029): nobody is expected to send that state
+    /// again, and a slot per decision is more than the device has.
+    FanOut(FanOutId),
+    /// Kept until the device needs the room: a **retained prefix** (#188).
+    Retained,
+}
+
+/// A prompt position a request's state is kept at for a later request to
+/// resume from, and how long (GitHub #270, `CONTEXT.md`'s **reuse boundary**).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReuseBoundary {
+    /// Leading prompt tokens: an exact token prefix of the prompt, before any
+    /// flooring.
+    pub tokens: u32,
+    pub lifetime: BoundaryLifetime,
+}
+
+impl ReuseBoundary {
+    /// A boundary kept until the device needs the room: an observed fork's or
+    /// a reuse marker's.
+    pub fn retained(tokens: u32) -> Self {
+        Self { tokens, lifetime: BoundaryLifetime::Retained }
+    }
+
+    /// A fan-out's head, kept until fan-out `owner` ends.
+    pub fn fan_out(tokens: u32, owner: FanOutId) -> Self {
+        Self { tokens, lifetime: BoundaryLifetime::FanOut(owner) }
+    }
 }
 
 /// What a **decision** reads at its prompt's last position — the two
