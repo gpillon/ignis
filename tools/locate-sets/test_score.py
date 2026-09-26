@@ -105,6 +105,30 @@ class ScoreTest(unittest.TestCase):
             # Every present confidence above every absent one.
             self.assertEqual(report["auc_present_absent"], 1.0)
 
+    def test_the_vote_counts_each_heads_winner(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, _ = write_dump(d, "V", 12, 5)
+            rows = score.load(path, cache=False)[1]
+            for r in (r for r in rows if not r["absent"]):
+                s = score.reading(r, ("vote", [GOOD, 0, 1]), "s1", True)
+                self.assertIn(score.winner(s), r["targets"])
+
+    def test_a_vote_tie_goes_to_the_segment_of_the_best_ranked_head(self):
+        # Five heads over four segments (the third owns no key), no baseline
+        # needed: heads 0 and 4 name segment 1, heads 1 and 2 segment 3,
+        # head 3 segment 0. Two votes each for 1 and 3; head 0 ranks first.
+        shares = np.zeros((score.N_HEADS, 4), dtype=np.float32)
+        for h, seg in ((0, 1), (1, 3), (2, 3), (3, 0), (4, 1)):
+            shares[h, seg] = 1.0
+        row = {"keys": [[0, 1], [2, 3], None, [4, 5]],
+               "feat": {"s2": (shares, None), "s2-na": (np.zeros_like(shares), None)}}
+        s = score.reading(row, ("vote", [0, 1, 2, 3, 4]), "s2", True)
+        self.assertEqual(score.winner(s), 1)
+        self.assertEqual(score.winner(score.reading(row, ("vote", [1, 0, 2, 3, 4]), "s2", True)), 3)
+        self.assertTrue(np.isneginf(s[2]))
+        # the confidence is the winner's share of the votes
+        self.assertAlmostEqual(score.confidence(s, True), 2 / 5, places=4)
+
     def test_a_floor_is_the_hits_less_three_percent_of_the_questions(self):
         # C's prose: 55 of 67 -> a floor of 52.99, so 53 clear it and 52 do not.
         floor = score.floor_of(55, 67)

@@ -159,8 +159,10 @@ def owning(row):
 
 def reading(row, method, scaffold, baseline):
     """Per-segment scores of one reading (method = ("r1", h) | ("r2", heads)
-    | ("r3", heads)), before normalisation."""
+    | ("r3", heads) | ("vote", heads)), before normalisation."""
     kind, heads = method
+    if kind == "vote":
+        return vote_reading(row, heads, scaffold, baseline)
 
     def one(variant):
         shares, argseg = row["feat"][variant]
@@ -179,6 +181,29 @@ def reading(row, method, scaffold, baseline):
         s = s - one(scaffold + "-na")
     s = np.where(owning(row), s, -np.inf)
     return s
+
+
+def vote_reading(row, heads, scaffold, baseline):
+    """Spec 19's head vote (phase 0, GitHub #276): each head of `heads`, best
+    first, names its R1 winner -- the segment with its largest share, less
+    the -na prefill's share with a baseline -- and a segment scores the votes
+    it gets. A tie goes to the tied segment named by the best-ranked head: a
+    voted segment's score is its votes less a millionth of its best voter's
+    rank, too little to outweigh a whole vote. The confidence is then the
+    winner's share of the votes."""
+    shares = row["feat"][scaffold][0].astype(np.float64)
+    if baseline:
+        shares = shares - row["feat"][scaffold + "-na"][0]
+    own = owning(row)
+    s = np.where(own[None, :], shares[heads], -np.inf)
+    votes = np.zeros(shares.shape[1])
+    best = np.zeros(shares.shape[1])
+    for rank, w in enumerate(s.argmax(axis=1)):
+        if votes[w] == 0:
+            best[w] = rank
+        votes[w] += 1.0
+    votes = np.where(votes > 0, votes - 1e-6 * best, 0.0)
+    return np.where(own, votes, -np.inf)
 
 
 def winner(s):
