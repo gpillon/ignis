@@ -14,7 +14,10 @@ use ignis_server::decide::OrderedValue;
 #[path = "support/locate.rs"]
 mod locate;
 
-use locate::{Scaffold, Segment, Unit, chunks, evidence, key_span, map_segments, owners, segment_keys, user_text};
+use locate::{
+    Region, SPAN_KIND, Scaffold, Segment, Unit, chunks, evidence, key_bytes, key_span, map_segments, owners, regions,
+    segment_keys, span_user_text, user_text,
+};
 
 fn state(json: &str) -> OrderedValue {
     serde_json::from_str(json).expect("a JSON state")
@@ -215,4 +218,48 @@ fn every_line_of_a_served_render_owns_its_own_tokens() {
     }
     // The two identical lines are two places.
     assert_ne!(keys[0], keys[1]);
+}
+
+#[test]
+fn a_span_questions_user_turn_is_the_span_kind_text_then_the_instruction() {
+    assert_eq!(
+        span_user_text("Which job?"),
+        format!("{SPAN_KIND}\n\n{{\"instruction\":\"Which job?\"}}")
+    );
+}
+
+#[test]
+fn every_prompt_token_is_labelled_by_where_its_first_byte_sits() {
+    // One token per byte: a character-level tokenization makes every
+    // boundary visible.
+    let ev = evidence(&state(r#""ab\ncd""#)).expect("segmented");
+    let user = "K.\n\n{\"instruction\":\"go\"}".to_owned();
+    let rendered = format!("<s>{}</s><u>{user}</u>", ev.system);
+    let offsets: Vec<(usize, usize)> = (0..rendered.len()).map(|i| (i, i + 1)).collect();
+    let runs = regions(&rendered, &offsets, &ev, "K.", &user).expect("regions");
+    let label = |byte: usize| runs.iter().find(|(r, _)| r.contains(&byte)).expect("covered").1;
+    let ev_at = rendered.find(&ev.system).expect("evidence");
+    let us = rendered.find(&user).expect("user");
+    assert_eq!(label(0), Region::Template);
+    assert_eq!(label(ev_at), Region::Evidence);
+    assert_eq!(label(ev_at + ev.system.len() - 1), Region::Evidence);
+    assert_eq!(label(ev_at + ev.system.len()), Region::Template);
+    assert_eq!(label(us), Region::Kind);
+    assert_eq!(label(us + 2), Region::Template, "the blank line after the kind text");
+    let go = us + user.find("go").expect("instruction");
+    assert_eq!((label(go), label(go + 1)), (Region::Instruction, Region::Instruction));
+    assert_eq!(label(go + 2), Region::Template, "the closing quote");
+    // runs are contiguous and cover every token
+    assert_eq!(runs.first().expect("a run").0.start, 0);
+    assert!(runs.windows(2).all(|w| w[0].0.end == w[1].0.start));
+    assert_eq!(runs.last().expect("a run").0.end, offsets.len());
+}
+
+#[test]
+fn a_keys_bytes_are_relative_to_the_evidence() {
+    let ev = evidence(&state(r#""ab\ncd""#)).expect("segmented");
+    let rendered = format!("xyz{}", ev.system);
+    let offsets: Vec<(usize, usize)> = (0..rendered.len()).map(|i| (i, i + 1)).collect();
+    let bytes = key_bytes(&rendered, &offsets, &ev, &(3..6)).expect("key bytes");
+    assert_eq!(bytes, vec![[0, 1], [1, 2], [2, 3]]);
 }
