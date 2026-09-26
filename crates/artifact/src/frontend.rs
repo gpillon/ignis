@@ -346,6 +346,24 @@ impl Tokenizer {
         Ok(output.get_ids().to_vec())
     }
 
+    /// Encode text to token ids, each with the `(start, end)` **byte** range
+    /// of `text` it came from (GitHub #274): what says which part of a
+    /// rendered prompt a token belongs to, since two identical lines are two
+    /// places and no search of the text can tell them apart.
+    ///
+    /// The ranges are the `tokenizers` crate's own, in bytes of the input
+    /// before normalization. For the served artifact's byte-level BPE with
+    /// `trim_offsets: false` they tile the text exactly, except where one
+    /// UTF-8 character is split across tokens: every such token reports the
+    /// whole character.
+    pub fn encode_with_offsets(&self, text: &str) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
+        let output = self
+            .inner
+            .encode(text, false)
+            .map_err(|e| fail(format!("tokenize: {e}")))?;
+        Ok((output.get_ids().to_vec(), output.get_offsets().to_vec()))
+    }
+
     /// Decode token ids to text.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.inner
@@ -1186,6 +1204,19 @@ mod tests {
             err.to_string().contains("video_preprocessor_config.json"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn tokenizer_offsets_are_byte_ranges_of_the_input() {
+        let tokenizer = Tokenizer::from_bytes(FIXTURE_TOKENIZER_JSON.as_bytes()).expect("parse");
+        // Two spaces before "brown": an offset is where the token's bytes
+        // are, not where a word count would put them.
+        let text = "the quick  brown fox";
+        let (ids, offsets) = tokenizer.encode_with_offsets(text).expect("encode");
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        assert_eq!(offsets, vec![(0, 3), (4, 9), (11, 16), (17, 20)]);
+        let spelled: Vec<&str> = offsets.iter().map(|&(a, b)| &text[a..b]).collect();
+        assert_eq!(spelled, ["the", "quick", "brown", "fox"]);
     }
 
     #[test]
