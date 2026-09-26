@@ -14,7 +14,7 @@ use ignis_server::decide::OrderedValue;
 #[path = "support/locate.rs"]
 mod locate;
 
-use locate::{Scaffold, Segment, Unit, chunks, evidence, key_span, owners, segment_keys, user_text};
+use locate::{Scaffold, Segment, Unit, chunks, evidence, key_span, map_segments, owners, segment_keys, user_text};
 
 fn state(json: &str) -> OrderedValue {
     serde_json::from_str(json).expect("a JSON state")
@@ -197,28 +197,19 @@ fn every_line_of_a_served_render_owns_its_own_tokens() {
     let (ids, offsets) = tokenizer.encode_with_offsets(&rendered).expect("encode");
     assert_eq!(ids, served, "the served prompt is the rendered text's tokenization");
 
-    assert_eq!(rendered.matches(&evidence.system).count(), 1, "the evidence appears once");
-    let base = rendered.find(&evidence.system).expect("the evidence is rendered");
-    let shifted: Vec<Segment> = evidence
-        .segments
-        .iter()
-        .map(|s| Segment { bytes: s.bytes.start + base..s.bytes.end + base, owns: s.owns })
-        .collect();
-    let owned = owners(&offsets, &shifted);
-    let span = key_span(&owned).expect("the evidence owns keys");
-    let keys = segment_keys(&owned, &span, shifted.len());
-    for (index, (segment, keys)) in shifted.iter().zip(&keys).enumerate() {
+    let (span, keys) = map_segments(&rendered, &offsets, &evidence).expect("the evidence maps to keys");
+    for (index, (segment, keys)) in evidence.segments.iter().zip(&keys).enumerate() {
         match keys {
             None => assert!(!segment.owns, "segment {index} owns content and no token"),
             Some(range) => {
                 assert!(segment.owns, "segment {index} owns no content and got tokens");
                 let tokens = &ids[span.start + range.start..span.start + range.end];
                 let text = tokenizer.decode(tokens).expect("decode");
-                let wanted = &rendered[segment.bytes.clone()];
-                assert!(
-                    text.contains(wanted) || wanted.contains(text.trim_start_matches("\\n")),
-                    "segment {index}: its tokens spell {text:?}, the segment is {wanted:?}"
-                );
+                // A line's first token may carry the `\n` escape before it,
+                // which belongs to no segment; the rest is the line exactly.
+                let spelled = text.strip_prefix("\\n").unwrap_or(&text);
+                let wanted = &evidence.system[segment.bytes.clone()];
+                assert_eq!(spelled, wanted, "segment {index}: its tokens spell {text:?}");
             }
         }
     }

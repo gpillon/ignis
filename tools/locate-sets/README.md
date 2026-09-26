@@ -16,6 +16,7 @@ not a new study, the way `tools/pointing-scenes/` is for `point`.
 | `score.py` | Scores the harness's dumps: R1, R2 and R3, each with and without the content-free baseline, per scaffold; `dev` cross-validates on A+B and applies rule 1, `check` judges the choice on C and applies rules 2-4. Needs NumPy. |
 | `labelled.py` | The labelled `choice` route (Jev's line search) through a running server's `/v1/decide`, for rule 2's comparison, with a `noul` over the unlabelled state timed beside it. Measured, never shipped. |
 | `test_score.py` | The scorer on a synthetic dump whose answer is known (`python tools/locate-sets/test_score.py`). |
+| `test_sets.py` | The generators' promises — the split holds on every question, one in six absent, a seed writes the same set — and the labelled route's state (`python tools/locate-sets/test_sets.py`; no download). |
 
 The harness is `crates/server/tests/attention_head_locate_gpu.rs`; the prompt
 and segment map it measures with are the pure functions of
@@ -51,6 +52,17 @@ and segment map it measures with are the pure functions of
 
 A set used to choose something is spent for judging it. A and B choose; C
 judges once; D is phase B's.
+
+The prose questions depend on the HotpotQA file's row order as well as the
+seed: A-D were drawn from the Hugging Face copy, sha256 `c20b638c…4e972f7c6`
+(in full in `prose.py`).
+
+Phase A ran on 2026-09-26 with A, B and C and ended in a **no-go**: rule 1
+chose R1 (L39.h12) on the copy scaffold with the baseline, and on C it read
+73.3% of the questions the labelled route answers at 91.3%
+(`docs/findings/2026-09-26-locate-attention-no-go.md`). A, B and C are spent;
+D was never run and is free for a fresh study, which is what any follow-up
+would be.
 
 ## Running phase A
 

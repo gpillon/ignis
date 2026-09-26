@@ -11,7 +11,6 @@ better. The feature arithmetic is held to a hand-computed case.
 
 import json
 import os
-import random
 import tempfile
 import unittest
 
@@ -105,8 +104,16 @@ class ScoreTest(unittest.TestCase):
             self.assertEqual(report["top1"]["pct"], 100.0)
             # Every present confidence above every absent one.
             self.assertEqual(report["auc_present_absent"], 1.0)
-            floors = report["rule4"]["logs"]
-            self.assertEqual(floors["at_least"], math_ceil(floors["hits"] - 0.03 * floors["n"]))
+
+    def test_a_floor_is_the_hits_less_three_percent_of_the_questions(self):
+        # C's prose: 55 of 67 -> a floor of 52.99, so 53 clear it and 52 do not.
+        floor = score.floor_of(55, 67)
+        self.assertAlmostEqual(floor["floor"], 52.99)
+        self.assertEqual(floor["at_least"], 53)
+        # 80 questions leave a slack of 2.4: 60 hits need 58.
+        self.assertEqual(score.floor_of(60, 80)["at_least"], 58)
+        # A whole-number floor is its own bar.
+        self.assertEqual(score.floor_of(50, 100)["at_least"], 47)
 
     def test_rule_1_takes_r3_only_past_its_margin(self):
         cv = {
@@ -118,11 +125,5 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual(score.rule1(cv)[0][0], "R3 s2")
 
 
-def math_ceil(x):
-    import math
-    return math.ceil(x - 1e-9)
-
-
 if __name__ == "__main__":
-    random.seed(0)
     unittest.main()

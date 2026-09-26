@@ -10,8 +10,8 @@ than trusted to the banks, so a bank entry that leaks a word is caught when a
 set is written, not after it was measured.
 
 "Word" is deliberately crude: lowercase runs of letters and digits, compared
-by their first five characters, so `timed` and `timeout` are one word and a
-paraphrase cannot pass by changing a suffix. The frame words every question
+by their first five characters, so `rejected` and `rejection` are one word
+and a paraphrase cannot pass by changing a suffix. The frame words every question
 of a family uses ("which line reports ...") are not content.
 """
 

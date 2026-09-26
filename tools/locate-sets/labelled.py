@@ -108,7 +108,7 @@ def main():
               f"{len(mapping):4} labels -> {picked} {'hit' if r['hit'] else '   '} targets {q['targets']} "
               f"({choice_ms:.0f} ms, noul {noul_ms:.0f} ms)", flush=True)
     present = [r for r in results if not r["absent"]]
-    out = {"set": manifest.get("seed"), "url": args.url, "asked": len(results),
+    out = {"seed": manifest.get("seed"), "url": args.url, "asked": len(results),
            "hits": sum(r["hit"] for r in present), "present": len(present), "questions": results}
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1)

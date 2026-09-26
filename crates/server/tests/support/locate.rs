@@ -239,6 +239,31 @@ pub fn segment_keys(owners: &[Option<u32>], span: &Range<usize>, segments: usize
     keys
 }
 
+/// Where the evidence's segments landed in one rendered prompt: the key span
+/// and each segment's keys within it (`segment_keys`), from the render's
+/// text and its tokens' byte offsets. The evidence must appear in the render
+/// exactly once — the system message is written into it verbatim.
+pub fn map_segments(
+    rendered: &str,
+    offsets: &[(usize, usize)],
+    evidence: &Evidence,
+) -> Result<(Range<usize>, Vec<Option<Range<usize>>>), String> {
+    let found = rendered.matches(&evidence.system).count();
+    if found != 1 {
+        return Err(format!("the evidence appears {found} times in the render, not once"));
+    }
+    let base = rendered.find(&evidence.system).expect("counted above");
+    let shifted: Vec<Segment> = evidence
+        .segments
+        .iter()
+        .map(|s| Segment { bytes: s.bytes.start + base..s.bytes.end + base, owns: s.owns })
+        .collect();
+    let owned = owners(offsets, &shifted);
+    let span = key_span(&owned).ok_or("no token of the render belongs to a segment")?;
+    let keys = segment_keys(&owned, &span, shifted.len());
+    Ok((span, keys))
+}
+
 /// The chunks a prompt is prefilled in, as `ConcreteScheduler` cuts a
 /// decision's text prompt with an attention readout (`chunk_take`): at most
 /// `chunk` tokens each, the last one kept at least `tail` wide so that the

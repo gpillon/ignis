@@ -1,5 +1,28 @@
 # 18 - locate: a place in the text evidence, read from attention
 
+> **NOT IMPLEMENTED — phase A's go/no-go fired negative.** Phase A ran on
+> 2026-09-26 (`docs/findings/2026-09-26-locate-attention-no-go.md`). Rule 1
+> chose R1 on the copy scaffold `{"quote":"` with the content-free baseline
+> (head L39.h12, 70.4% top-1 in cross-validation on A+B). On set C it read
+> 118 of the 161 questions the labelled route can answer (73.3%) against the
+> labelled `choice`'s 147 (91.3%): 18 points behind, where rule 2 allows 5.
+> The paraphrase half passed — 71/78 against the labels' 68/78, the reading
+> ahead — and the whole gap is the lexical half: the reading misses 36 of the
+> 83 comparable lexical questions (43%), and across all of C, 31 of its 34
+> lexical misses on logs and records land more than two segments from the
+> target.
+>
+> So phase B (#275) does not go ahead, and **the labelled `choice` is the
+> way to locate today** (`docs/user/README.md`, "Finding a line or an
+> item"). Rules 3 and 4 were computed and are reported in the finding, not
+> written here: nothing will run against them. The sets, the harness and the
+> scorer stay in `tools/locate-sets/` and
+> `crates/server/tests/attention_head_locate_gpu.rs`; set D is unspent.
+>
+> The rest of this document is kept as written, rules included: a study whose
+> prediction was checked is worth more than one edited to agree with the
+> outcome.
+
 GitHub: #274 (phase A), #275 (phase B)
 
 `point` answers "where in the image?" in one pass by reading where the

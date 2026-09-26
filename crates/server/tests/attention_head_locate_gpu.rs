@@ -51,10 +51,12 @@
 //! `IGNIS_LOCATE_SET=<dir with manifest.json>` (required),
 //! `IGNIS_LOCATE_OUT=<dir>` for the dump (default: the OS temp dir),
 //! `IGNIS_LOCATE_LIMIT=<n>` for a smoke run, and `IGNIS_LOCATE_RESUME=1` to
-//! continue a dump a crash cut short. The dump is `<set>-<kv>.bin` — f16
-//! little-endian, per question and per variant in the order above,
-//! `[GQA layer 0..16][query head 0..24][span key]` — rows in `<set>-<kv>.jsonl`
-//! as each question finishes, and `<set>-<kv>.json` with the rest at the end.
+//! continue a dump a crash cut short (its rows carry their self-check
+//! failures, so a resumed run still fails on the part before the crash). The
+//! dump is `<set>-<kv>.bin` — f16 little-endian, per question and per variant
+//! in the order above, `[GQA layer 0..16][query head 0..24][span key]` — rows
+//! in `<set>-<kv>.jsonl` as each question finishes, and `<set>-<kv>.json` with
+//! the rest at the end; a non-default chunk appends `-chunk<N>` to the stem.
 //!
 //! Nothing is asserted about where the heads point: phase A's rules are
 //! applied by the scorer, on sets chosen for it. What is asserted is that the
@@ -88,7 +90,7 @@ use ignis_server::template::{ChatMessage, TemplateProvider};
 use ignis_server::thinking::ThinkingOptions;
 use serde::Deserialize;
 
-use locate::{CONTENT_FREE, Scaffold, Segment, chunks, evidence, key_span, owners, segment_keys, user_text};
+use locate::{CONTENT_FREE, Scaffold, chunks, evidence, map_segments, user_text};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 /// The longest set state, a 1,000-line log, renders about 18K tokens.
@@ -428,6 +430,11 @@ fn attention_over_a_text_state_is_dumped_for_calibration() {
         let end = done.last().map_or(0, |row| row["end"].as_u64().expect("end") * 2);
         let bin = std::fs::OpenOptions::new().write(true).open(&bin_path).expect("open the bin");
         bin.set_len(end).expect("truncate the bin to its last whole question");
+        // A dump continues only the questions it was cut on, in order.
+        for (row, question) in done.iter().zip(&questions) {
+            assert_eq!(row["id"], question.id.as_str(), "resume: the dump is not this set's, in this order");
+        }
+        assert!(done.len() <= questions.len(), "resume: the dump holds more questions than this run asks");
         eprintln!("resume: {} questions already dumped", done.len());
     } else {
         std::fs::write(&bin_path, []).expect("create the bin");
@@ -442,8 +449,47 @@ fn attention_over_a_text_state_is_dumped_for_calibration() {
         questions.len(),
         kv_mode.name()
     );
+    // The render, from the endpoint's machinery, checked at its end and held
+    // to the provider's own tokenization: its text, token ids and offsets.
+    let render = |id: &str, ev: &locate::Evidence, scaffold: Scaffold, instruction: &str| {
+        let messages = [
+            ChatMessage::text("system", ev.system.clone()),
+            ChatMessage::text("user", user_text(scaffold, ev.unit, instruction)),
+        ];
+        let rendered = provider
+            .render_text(&messages, &thinking, &[])
+            .unwrap_or_else(|e| panic!("{id}: render: {e:?}"));
+        assert!(!rendered.contains("Reasoning effort"), "{id}: a reasoning paragraph");
+        assert!(
+            rendered.ends_with(SERVED_TAIL),
+            "{id}: the render must end with a closed, empty think block; it ends with {:?}",
+            &rendered[rendered.len().saturating_sub(60)..]
+        );
+        let served = provider
+            .apply_chat_template(&messages, &thinking, &[])
+            .unwrap_or_else(|e| panic!("{id}: tokens: {e:?}"))
+            .tokens;
+        let (ids, offsets) = tokenizer.encode_with_offsets(&rendered).unwrap_or_else(|e| panic!("{id}: encode: {e}"));
+        assert_eq!(ids, served, "{id}: the prompt is not the provider's tokenization");
+        (rendered, ids, offsets)
+    };
+
+    // The first render of each (scaffold, unit), for phase B's prompt pinning,
+    // and every self-check failure: both carried over what a resume skips.
     let mut renders = serde_json::Map::new();
     let mut verify_failures: Vec<String> = Vec::new();
+    for (row, question) in done.iter().zip(&questions) {
+        let ev = evidence(&question.state).unwrap_or_else(|e| panic!("{}: {e}", question.id));
+        for scaffold in Scaffold::ALL {
+            let key = format!("{}-{}", scaffold.name(), ev.unit.name());
+            if !renders.contains_key(&key) {
+                let (rendered, _, _) = render(&question.id, &ev, scaffold, &question.instruction);
+                renders.insert(key, serde_json::Value::String(rendered));
+            }
+        }
+        let failures = row["verify_failures"].as_array().into_iter().flatten();
+        verify_failures.extend(failures.map(|f| f.as_str().expect("a failure").to_owned()));
+    }
     let (mut l39_hits, mut l39_present) = ([0usize; 2], 0usize);
     let started = Instant::now();
 
@@ -454,47 +500,18 @@ fn attention_over_a_text_state_is_dumped_for_calibration() {
         let mut segment_map: Option<(std::ops::Range<usize>, Vec<Option<std::ops::Range<usize>>>)> = None;
         let mut variants = serde_json::Map::new();
         let mut l39 = serde_json::Map::new();
+        let mut question_failures: Vec<String> = Vec::new();
 
         for (scaffold, content_free) in VARIANTS {
             let name = variant_name(scaffold, content_free);
             let instruction = if content_free { CONTENT_FREE } else { question.instruction.as_str() };
-            let messages = [
-                ChatMessage::text("system", ev.system.clone()),
-                ChatMessage::text("user", user_text(scaffold, ev.unit, instruction)),
-            ];
-            // ── the render, from the endpoint's machinery ────────────────
-            let rendered = provider
-                .render_text(&messages, &thinking, &[])
-                .unwrap_or_else(|e| panic!("{}: render: {e:?}", question.id));
-            assert!(!rendered.contains("Reasoning effort"), "{}: a reasoning paragraph", question.id);
-            assert!(
-                rendered.ends_with(SERVED_TAIL),
-                "{}: the render must end with a closed, empty think block; it ends with {:?}",
-                question.id,
-                &rendered[rendered.len().saturating_sub(60)..]
-            );
-            let served = provider
-                .apply_chat_template(&messages, &thinking, &[])
-                .unwrap_or_else(|e| panic!("{}: tokens: {e:?}", question.id))
-                .tokens;
-            let (ids, offsets) = tokenizer
-                .encode_with_offsets(&rendered)
-                .unwrap_or_else(|e| panic!("{}: encode: {e}", question.id));
-            assert_eq!(ids, served, "{}: the prompt is not the provider's tokenization", question.id);
+            let (rendered, ids, offsets) = render(&question.id, &ev, scaffold, instruction);
             let render_key = format!("{}-{}", scaffold.name(), ev.unit.name());
             renders.entry(render_key).or_insert_with(|| serde_json::Value::String(rendered.clone()));
 
             // ── the segment map, the same for all four ───────────────────
-            assert_eq!(rendered.matches(&ev.system).count(), 1, "{}: the evidence appears once", question.id);
-            let base = rendered.find(&ev.system).expect("the evidence is rendered");
-            let shifted: Vec<Segment> = ev
-                .segments
-                .iter()
-                .map(|s| Segment { bytes: s.bytes.start + base..s.bytes.end + base, owns: s.owns })
-                .collect();
-            let owned = owners(&offsets, &shifted);
-            let span = key_span(&owned).expect("the evidence owns keys");
-            let keys = segment_keys(&owned, &span, shifted.len());
+            let (span, keys) =
+                map_segments(&rendered, &offsets, &ev).unwrap_or_else(|e| panic!("{}: {e}", question.id));
             match &segment_map {
                 None => segment_map = Some((span.clone(), keys.clone())),
                 Some(first) => assert!(
@@ -558,7 +575,7 @@ fn attention_over_a_text_state_is_dumped_for_calibration() {
                 });
                 let mut layers = Vec::new();
                 for (failures, stats) in checked {
-                    verify_failures.extend(failures.into_iter().map(|f| format!("{} {name}: {f}", question.id)));
+                    question_failures.extend(failures.into_iter().map(|f| format!("{} {name}: {f}", question.id)));
                     layers.push(stats);
                 }
                 hq = serde_json::json!({"query_chunk_start": query_chunk_start, "layers": layers});
@@ -628,9 +645,11 @@ fn attention_over_a_text_state_is_dumped_for_calibration() {
             "keys": keys.iter().map(|k| k.as_ref().map(|r| [r.start, r.end])).collect::<Vec<_>>(),
             "variants": variants,
             "l39_h10": l39,
+            "verify_failures": question_failures,
             "end": written,
         });
         writeln!(rows_file, "{row}").expect("write a row");
+        verify_failures.extend(question_failures);
         rows_file.flush().expect("flush the rows");
         bin.flush().expect("flush the scores");
     }

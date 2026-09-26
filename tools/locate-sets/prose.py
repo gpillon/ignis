@@ -12,6 +12,12 @@ URL is tried first; when it does not answer (it timed out on 2026-09-26), the
 same 7,405 questions are read from the Hugging Face copy of the dataset
 (`hotpotqa/hotpot_qa`, config `distractor`, split `validation`).
 
+A set's prose questions depend on the file's **row order** as well as the
+seed. Sets A-D were drawn from the Hugging Face copy, sha256
+`c20b638ca82b21d04fe12e14ff417ad05153d4d215a65de54497fca4e972f7c6`; a draw from
+the official file reproduces them only if its rows come in the same order,
+which could not be checked while that URL was down.
+
 The split is **classified**, not constructed: a question is lexical when it
 shares a rare word (one no other line has) with a gold sentence, and
 paraphrase otherwise -- it may share common words with its gold sentences,

@@ -360,6 +360,40 @@ in the response can show (the **answer mass**, charted on the metrics listener):
 **Decide** tab builds these requests and shows the full distribution behind each
 answer.
 
+### Finding a line or an item
+
+To ask *which* line of a log, element of a list or sentence of a text answers an
+instruction, label the segments and ask a `choice` over the labels (Jev's "line
+search"). A `locate` that reads the answer from attention without labels was
+measured and did not ship: it lost to this recipe by 18 points
+([finding](../findings/2026-09-26-locate-attention-no-go.md)).
+
+- Prefix every non-empty line of a string `state` with its label and `: `, or
+  turn an array into an object from label to element, in order.
+- Declare the `choice`'s options under the same labels, in the same order, each
+  with no description (`null`).
+- Use the endpoint's own label order: `A`-`Z`, `a`-`z`, `0`-`9`, then the
+  uppercase bigrams this tokenizer reads as one token (`AA`, `AB`, … — not
+  `BQ`, which is two). The endpoint shows the model each option under the label
+  at its position in that order, so options named with it put the same label in
+  the state and in the answer.
+- At most 256 segments, the endpoint's option ceiling.
+
+```bash
+curl http://127.0.0.1:8000/v1/decide \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"A: 09:21 INFO gateway: GET /v1/orders 200\nB: 09:21 ERROR billing: provider returned 503\nC: 09:22 INFO auth: user 61 signed in",
+       "questions":{"cause":{"type":"choice",
+                             "instructions":"Which line says the card processor was unavailable?",
+                             "criteria":{"A":null,"B":null,"C":null}}}}'
+```
+
+The answer's `choice` is the label. Measured over logs, JSON record arrays and
+HotpotQA paragraphs of up to 256 segments, it names the right one 91% of the
+time. The labels are part of the state, so such a question shares no prefix with
+questions asked over the unlabelled state, and on a log they add about 60% to
+the prompt.
+
 ---
 
 ## The Playground

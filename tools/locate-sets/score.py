@@ -332,6 +332,13 @@ def auc(pos, neg):
     return float((greater + 0.5 * ties) / (len(pos) * len(neg)))
 
 
+def floor_of(hits, n):
+    """Rule 4's floor for a family: its check-set hits less a slack of 3% of
+    its question count, and the fewest hits that clear it."""
+    slack = FLOOR_SLACK * n
+    return {"slack": slack, "floor": hits - slack, "at_least": math.ceil(hits - slack - 1e-9)}
+
+
 def pct(h, n):
     return 100.0 * h / n if n else float("nan")
 
@@ -387,9 +394,7 @@ def check(choice, rows, labelled):
     for f in ("logs", "records", "prose"):
         sub = [p for p in present if p["family"] == f and p["span"] <= max_keys]
         h = sum(p["hit"] for p in sub)
-        slack = FLOOR_SLACK * len(sub)
-        floors[f] = {"n": len(sub), "hits": h, "slack": slack, "floor": h - slack,
-                     "at_least": math.ceil(h - slack - 1e-9)}
+        floors[f] = {"n": len(sub), "hits": h, **floor_of(h, len(sub))}
 
     report = {
         "choice": choice,
