@@ -1,14 +1,15 @@
 # 19 - where in the text: a span read from attention (research)
 
 > **RESEARCH.** No server behaviour changes. The outcome is a recommendation:
-> write a `locate` spec for spans, revive spec 18's line-level phase B, build
-> the hybrid of track H, or none of them. Written 2026-09-27, after spec 18
-> phase A's no-go.
+> write a `locate` spec for spans or for profiles, revive spec 18's
+> line-level phase B, build the hybrid of track H, or none of them. Written
+> 2026-09-27, after spec 18 phase A's no-go.
 >
 > **Read this first if you are the agent picking this up.** § Why a second
-> study says what is known; § Questions and § Plan say what to do; § For the
-> researcher is the map — where every tool, dump and number is, how to run
-> them, and the traps already paid for.
+> study says what is known; § The frame is the idea that organises the rest;
+> § Questions and § Plan say what to do; § For the researcher is the map —
+> where every tool, dump and number is, how to run them, and the traps
+> already paid for.
 
 GitHub: #276
 
@@ -65,6 +66,94 @@ baseline subtracted, read 73.3% of set C against the labelled `choice`'s
    labelled route's top-1. A second, small question over the shortlist could
    decide what one head could not (track H).
 
+## The frame: a profile over the input
+
+*The owner's idea, 2026-09-27.* Put the state's tokens on the x axis. Any
+signal one prefill produces for each token is an ordinate `y = f(x)`: a
+**profile** of the input. Every reading so far is one choice of `f` and one
+way of reading it — spec 18's R1 is one head's attention weight at the
+scaffold's last token, summed per line and read at its maximum; spec 14's
+anchored set is where many heads' profiles peak. So the study has two
+organising questions:
+
+1. **Which ordinates are worth reading** — heads, combinations of heads,
+   values, gates, the lift over the content-free baseline, profiles read
+   from other query positions; and
+2. **what a profile's shape says** — its peaks, their heights and widths —
+   so that `locate`'s answer can be the profile's peaks with their values.
+
+### Candidate ordinates
+
+- `α_h(x)`: one head's attention weight from a query position (384 profiles
+  per query position).
+- **Lift**: `log α_h^q(x) − log α_h^{N/A}(x)`, what the question adds to what
+  the head does with no question at all (sinks, first lines, position). Spec
+  18 subtracted shares per line; a token-level log-ratio is a different
+  quantity (contextual calibration's move, Zhao et al. 2021).
+- **Value- and gate-weighted**: `α_h(x) · ||v_h(x)||`, and
+  `g_h · α_h(x) · ||W_O v_h(x)||` with the head's output gate `g_h` at the
+  query.
+- **Combinations**: `w · A(x)` with per-head weights learned on development
+  sets (AT2); a per-position classifier over the 384-vector of head values at
+  `x` (nonlinear); anchored sets (spec 14).
+- **Role curves**: a *start* (initiator) curve, an *end* (terminator) curve,
+  an *inside* curve — the way extractive QA models read a span's edges from
+  start and end scores and take the best `i ≤ j` (BERT's span decoding,
+  Devlin et al. 2019). L39.h10 under the index scaffold is the first
+  terminator candidate; initiators are to be found.
+- **Query-position variants**: the scaffold's last token, the instruction's
+  tokens (ICR), the teacher-forced quote's tokens.
+- **The KV alone**, with the limit below.
+
+### What the KV can and cannot say
+
+Under layout L1 the state comes before the question, and the model is
+causal: every key and value of the state is computed before the question
+exists, so they are **the same for every question over that state** — which
+is exactly why the prefix can be shared. The KV carries what the text is
+(which tokens are salient, what each would contribute if attended), not what
+this question wants. The question reaches the state only through queries at
+later positions — the attention above — and through what later layers do
+with what those queries read.
+
+So a KV-only ordinate is a **prior** over the state: useful as a weight or a
+normaliser (`||v||`; a salience profile shared by every question), or made
+question-specific by a query. The instruction-before-state render of Q4 is
+the one layout in which the state's KV depends on the question; measuring
+there says how much question-conditioned KV would add, at the cost of the
+shared prefix.
+
+### What makes an ordinate interesting
+
+Measured on development sets only:
+
+1. **Localisation**: its peaks sit on gold spans — per question, the
+   position-level AUROC and average precision of `y(x)` for "x inside a gold
+   span", before any peak picking.
+2. **Separation**: peak height separates present from absent questions, and
+   gold peaks from other peaks.
+3. **Length invariance**: a height means the same at 1K and at 16K tokens
+   (softmax mass shrinks as 1/N; lift and calibrated heights may not).
+4. **Complementarity**: a second ordinate adds to the first (initiator with
+   terminator; a lexical-robust one with a paraphrase-robust one).
+5. **Cost**: what would cross the seam. One head's per-key scores already
+   do (ADR 0038); many heads combined on the device is spec 18's R3-style
+   kernel change.
+
+### The answer this would give
+
+`locate` would return peaks, not a segment: for each chosen ordinate, the
+local maxima above a threshold, each with its position (a span, from
+initiator and terminator curves or from the peak's width) and a height in
+[0, 1] calibrated on development sets as the probability that the peak sits
+on a gold span. A caller then reads several answers (every peak above a
+threshold), none (no peak above it: absent), or a ranking (by height), and
+several ordinates give several such vectors — start, end, relevance. In one
+prefill that would answer three shapes spec 18 kept out of scope, and which
+`docs/findings/2026-09-26-decision-classes-beyond-the-seven.md` lists among
+the classes `/v1/decide` lacks: several spans (`multi`), a ranking (`rank`)
+and "not there" (a `found` flag).
+
 ## Questions
 
 - **Q1 — span.** Over an unsegmented text, does the attention at one position
@@ -82,15 +171,20 @@ baseline subtracted, read 73.3% of set C against the labelled `choice`'s
   scaffold, the sinks, the first lines, against a paraphrase? Does reading
   from the instruction's own tokens (ICR's direction), or placing the
   instruction before the state, change it?
-- **Q5 — part heads.** Which heads have a stable offset from the target (the
-  token before it, its first token, its last, the boundary after it), are
-  they induction-like, and do a start head and an end head together give
-  the span — a box in one dimension?
+- **Q5 — initiators and terminators.** Which heads, or combinations, have a
+  stable offset from the target — the token before it, its first token, its
+  last, the boundary after it? Is L39.h10 a terminator, and where are the
+  initiators? Are they induction-like? Do an initiator and a terminator
+  together give the span — a box in one dimension?
 - **Q6 — the hybrid (track H).** Attention proposes the top k segments;
   a `choice` whose options *carry those segments' text* (the state is not
   relabelled, so the prefix stays shared) picks one. Does it reach the
   labelled route's accuracy at a fraction of its prompt, and past 256
   segments?
+- **Q7 — profiles and peaks (track P).** Which ordinates of § The frame
+  localise, separate and hold across lengths, and does reading a profile's
+  peaks with calibrated heights answer several-span, ranked and absent
+  questions in one prefill?
 
 ## Plan
 
@@ -103,8 +197,11 @@ Cheap, and it decides what phase 1 dumps.
    answer-span extraction from attention; value- and gate-aware attention
    attribution; learned head combinations for attribution; attention sinks
    and position bias in long contexts; copy/induction heads and offsets;
-   any report of repeated query words *hurting* attention-based retrieval.
-   Record what each measured, on which model, in a finding.
+   heads that mark the start or the end of a copied span; token-level
+   relevance profiles read as peaks (attribution curves, peak picking,
+   calibrated heights, several answers or none); any report of repeated query
+   words *hurting* attention-based retrieval. Record what each measured, on
+   which model, in a finding.
 1. **Q5 at line level.** Per head and scaffold, the distribution of (winner
    segment − target) on A+B; heads with a stable non-zero offset; R1 with a
    per-head offset calibrated in cross-validation. At token level, where in
@@ -120,6 +217,17 @@ Cheap, and it decides what phase 1 dumps.
 4. **Q4, what can already be seen.** On A+B's lexical misses, where the
    winner falls (early lines, other ERROR lines, the question's own words in
    other lines) and whether the content-free baseline moved it.
+5. **Span-aligned averages (Q5, Q7).** For every head and scaffold, the mean
+   profile aligned on the target's first token and on its last token (−16 to
+   +16 tokens), raw and lift — an event-related average. A head whose average
+   peaks at the start is an initiator candidate; one that peaks just after
+   the end, a terminator (L39.h10 under the index scaffold is the
+   hypothesis). Combinations follow from the same table.
+6. **Ordinate quality at token level (Q7).** Per question, the position-level
+   AUROC and average precision of each head's `α` and lift profile for "key
+   inside the target line", averaged by split and by length: the first table
+   of ordinates, before any peak is picked. The dumps hold both profiles
+   (`s1`/`s2` and their `-na`) over every key of the span.
 
 ### Phase 1 — the instruments (GPU)
 
@@ -146,7 +254,10 @@ Cheap, and it decides what phase 1 dumps.
      4.4 MB, reachable 2026-09-27): an article's paragraphs as one text, the
      answer's character spans gold, unanswerable questions as absent;
    - HotpotQA distractor dev, extractive answers only (the answer string
-     inside a gold sentence).
+     inside a gold sentence);
+   - for Q7, questions with **several or no** gold spans: HotpotQA's
+     supporting facts (two or more per question), and logs asked "which
+     lines report …" with zero to three matching lines.
 
    Roles: two development sets (E1, E2) and one check set (E3), fresh seeds
    recorded in `tools/locate-sets/README.md`.
@@ -174,6 +285,13 @@ Cheap, and it decides what phase 1 dumps.
 - **Q6**: the hybrid on E1+E2 through a live server — pass 1 the attention
   shortlist (from the dumps), pass 2 a `choice` over the k segments' text
   as options over the *unlabelled* state.
+- **Q7, profiles**: the ordinates ranked by the criteria of § The frame; for
+  the best few, a peak reading (smoothing, peak picking, a minimum
+  separation, a threshold) and heights calibrated as P(peak on a gold span),
+  all chosen on E1+E2; measured as peak precision and recall against the
+  gold spans, top-peak hit, the absent AUC, and a ranking metric (NDCG)
+  where a question has several golds. Initiator and terminator curves read
+  together as spans.
 
 ### Phase 3 — one pre-registered check per track
 
@@ -191,6 +309,11 @@ here, to be confirmed by the owner before the run:
 - **Track H (hybrid).** Judged on D the same way as track L, with its cost
   (two prefills of one shared state against the labelled route's one of a
   labelled state) reported beside it.
+- **Track P (profiles).** Its rule is proposed at the end of phase 2, from
+  what the development sets show — there is no honest bar to write for
+  several-span recall or absent detection before any profile is measured —
+  and confirmed by the owner before E3 runs. The comparator for several
+  spans is the generation route asked for all of them.
 
 A track whose answer is already clear on the development sets stops there:
 no check is run to confirm what they have settled.
@@ -212,8 +335,9 @@ no check is run to confirm what they have settled.
   capture are test-only, as spec 18's were.
 - Training beyond per-head weights: no fine-tuning, no added module (the
   GUI-Actor shape).
-- Several spans as one answer, and spans that cross segments a caller would
-  call separate (two log lines).
+- *Shipping* several spans as one answer: the study measures multi-peak
+  profiles, a later spec would ship them. Spans that cross segments a caller
+  would call separate (two log lines) stay out.
 
 ## For the researcher
 
@@ -271,6 +395,12 @@ no check is run to confirm what they have settled.
   72.9% (≤ 4.6K), 67.5% (≤ 17.9K).
 - Confidence AUC present/absent: 0.69 over C, 0.62 on the labelled route's
   188 questions, against its 0.82.
+- L39.h10 as R1 on C's present questions, per family, hit / next line /
+  elsewhere: under the index scaffold logs 1 / 56 / 10, records 38 / 7 / 22,
+  prose 31 / 4 / 32; under the copy scaffold logs 35 / 5 / 27, records
+  13 / 1 / 53, prose 53 / 1 / 13. What a head reads depends on the query
+  position as much as on the head: a profile is a (head, query position)
+  pair.
 - Cost: labelled `choice` median 273 ms / 1,840 prompt tokens against a
   `noul` over the plain state 223 ms / 1,396; logs 4,519 vs 2,834 tokens.
   The baseline's own prefill: 55 tokens once the state's prefix is shared.
@@ -393,5 +523,11 @@ Outside (verify each in the literature pass; these are starting points):
   arXiv 2309.17453.
 - Liu et al., "Lost in the Middle: How Language Models Use Long Contexts":
   arXiv 2307.03172.
+- Devlin et al., BERT (NAACL 2019): arXiv 1810.04805 — span decoding from
+  start and end scores, the shape of initiator and terminator curves.
+- Zhao et al., "Calibrate Before Use" (ICML 2021): arXiv 2102.09690 — the
+  content-free input as a calibration, the lift's origin.
+- Abnar and Zuidema, "Quantifying Attention Flow in Transformers" (ACL 2020):
+  arXiv 2005.00928 — attention across layers rather than per head.
 - SQuAD 2.0 (Rajpurkar, Jia, Liang, 2018), CC BY-SA 4.0; HotpotQA (Yang et
   al., 2018), CC BY-SA 4.0.
