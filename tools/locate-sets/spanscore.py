@@ -42,6 +42,7 @@ import numpy as np
 
 import profiles
 import score
+from common import rare_shared, stem
 
 H = score.N_HEADS
 REGIONS = ("evidence", "kind", "instruction", "template", "scaffold")
@@ -125,7 +126,40 @@ def region_labels(row, total, which="q"):
     return labels
 
 
-def question_stats(raw, row, question):
+def instruction_rare_positions(row, question, tokenizer):
+    """The prompt positions of the instruction's tokens that carry a word it
+    shares with its gold segment and with no other segment (a lexical
+    question's rare word, `common.rare_shared`), or None when the question
+    has none or the instruction's tokens cannot be matched to its region.
+    The instruction is tokenized as the render writes it, inside
+    `{"instruction":"…"}`, and its tokens are held to the region's count."""
+    if tokenizer is None or not question["spans"]:
+        return None
+    texts = profiles.segment_texts(question["state"])
+    gold = {s["segment"] for s in question["spans"]}
+    others = [t for j, t in enumerate(texts) if j not in gold]
+    rare = set()
+    for g in gold:
+        rare |= rare_shared(question["instruction"], texts[g], others)
+    if not rare:
+        return None
+    region = next((a, b) for a, b, name in row["regions"] if name == "instruction")
+    wrapper = '{"instruction":' + json.dumps(question["instruction"], ensure_ascii=False, separators=(",", ":")) + "}"
+    enc = tokenizer.encode(wrapper, add_special_tokens=False)
+    base = len('{"instruction":"')
+    inside = [i for i, (a, b) in enumerate(enc.offsets) if a >= base and a < len(wrapper) - 2]
+    if len(inside) != region[1] - region[0]:
+        return None
+    escaped = wrapper[base:len(wrapper) - 2]
+    positions = []
+    for m in profiles.WORD_SPAN.finditer(escaped.lower()):
+        if stem(m.group()) in rare:
+            a, b = base + m.start(), base + m.end()
+            positions += [region[0] + k for k, i in enumerate(inside) if enc.offsets[i][0] < b and enc.offsets[i][1] > a]
+    return sorted(set(positions)) or None
+
+
+def question_stats(raw, row, question, tokenizer=None):
     s0, S = row["span"]
     T, Tn = row["q"]["keys"], row["q-na"]["keys"]
     q = block(raw, row["q"]["scores_offset"], H, T)
@@ -139,6 +173,13 @@ def question_stats(raw, row, question):
         "gold_first": np.array([e[0] for e in each if len(e)], dtype=np.int32),
         "gold_last": np.array([e[-1] for e in each if len(e)], dtype=np.int32),
     }
+    # each head's five best segments by the lift of its shares (line level)
+    shares_q, _ = score.features(qs, row["keys"])
+    shares_na, _ = score.features(nas, row["keys"])
+    own = np.array([k is not None for k in row["keys"]])
+    seg_lift = np.where(own[None, :], shares_q.astype(np.float64) - shares_na, -np.inf)
+    out["seg_top"] = np.argsort(-seg_lift, axis=1, kind="stable")[:, :5].astype(np.int32)
+    out["gold_segments"] = np.array(sorted({s["segment"] for s in question["spans"]}), dtype=np.int32)
     if gold.any() and not gold.all():
         auc, ap = profiles.auroc_ap(np.concatenate([qs, lift]), gold)
         out["auc"], out["ap"] = auc.reshape(2, H).astype(np.float32), ap.reshape(2, H).astype(np.float32)
@@ -149,6 +190,13 @@ def question_stats(raw, row, question):
     gl = np.zeros(T, dtype=np.int32)
     gl[s0:s0 + S][gold] = 1
     out["mass_gold"] = softmax_mass(q, gl, 2)[:, 1]
+    # H1: the scaffold's mass on the instruction's copy of the rare word
+    rare = instruction_rare_positions(row, question, tokenizer)
+    if rare:
+        rl = np.zeros(T, dtype=np.int32)
+        rl[rare] = 1
+        out["mass_rare_instruction"] = softmax_mass(q, rl, 2)[:, 1]
+        out["rare_instruction_tokens"] = len(rare)
     # the instruction's own queries (ICR's direction): mass on the state,
     # and their argmax key inside the span
     W = row["q"]["weight_keys"]
@@ -165,7 +213,7 @@ def question_stats(raw, row, question):
     return out
 
 
-def extract(dump_path, manifest_path, out_dir, limit=None):
+def extract(dump_path, manifest_path, out_dir, limit=None, tokenizer_path=None):
     meta = read_json(dump_path)
     base = os.path.dirname(dump_path)
     with open(os.path.join(base, meta["rows_file"]), encoding="utf-8") as f:
@@ -173,9 +221,13 @@ def extract(dump_path, manifest_path, out_dir, limit=None):
     questions = {q["id"]: q for q in read_json(manifest_path)["questions"]}
     raw = np.memmap(os.path.join(base, meta["bin_file"]), dtype="<f2", mode="r")
     rows = rows[:limit] if limit else rows
+    tokenizer = None
+    if tokenizer_path:
+        from tokenizers import Tokenizer
+        tokenizer = Tokenizer.from_file(tokenizer_path)
     stats = []
     for i, row in enumerate(rows):
-        stats.append(question_stats(raw, row, questions[row["id"]]))
+        stats.append(question_stats(raw, row, questions[row["id"]], tokenizer))
         if (i + 1) % 25 == 0:
             print(f"{meta['set']}: {i + 1}/{len(rows)}", flush=True)
     os.makedirs(out_dir, exist_ok=True)
@@ -450,6 +502,9 @@ def regions_table(rows, heads):
         gold = float(np.mean([r["x"]["mass_gold"][heads].mean() for r in sub]))
         out[split] = {"q": dict(zip(REGIONS, np.round(mq, 4).tolist())),
                       "na": dict(zip(REGIONS, np.round(mn, 4).tolist())), "gold": round(gold, 4), "n": len(sub)}
+        rare = [r["x"]["mass_rare_instruction"][heads].mean() for r in sub if "mass_rare_instruction" in r["x"]]
+        if rare:
+            out[split]["rare_instruction"] = {"n": len(rare), "mass": round(float(np.mean(rare)), 4)}
     return out
 
 
@@ -489,6 +544,61 @@ def forced_table(rows):
     return out
 
 
+MULTI = ("logmulti", "hotfacts")
+MULTI_KS = (8, 16, 32)
+MULTI_BARS = (0.1, 0.2, 0.3, 0.4, 0.5)
+
+
+def line_hits(rows):
+    """[Q, H]: each head's best segment (by share lift) is a gold segment."""
+    return np.stack([np.isin(r["x"]["seg_top"][:, 0], r["x"]["gold_segments"]) for r in rows])
+
+
+def multi_answer(r, heads, bar):
+    """The segments named by at least `bar` of the heads' best segments:
+    several, one, or none."""
+    votes = r["x"]["seg_top"][heads, 0]
+    vals, counts = np.unique(votes, return_counts=True)
+    return set(vals[counts >= bar * len(heads)].tolist())
+
+
+def set_scores(pred, gold):
+    tp = len(pred & gold)
+    precision = tp / len(pred) if pred else (1.0 if not gold else 0.0)
+    recall = tp / len(gold) if gold else (1.0 if not pred else 0.0)
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return precision, recall, f1, pred == gold
+
+
+def multi_table(rows):
+    """Several golds or none (Q7): the heads with the most line hits on the
+    training folds' single-gold questions of every family vote their best
+    segment, and every segment with at least `bar` of the votes is an
+    answer. K and the bar are chosen by CV on the several-gold families'
+    set F1; the empty answer is how an absent question is read."""
+    multi = [r for r in rows if r["family"] in MULTI]
+    single = [r for r in rows if r["family"] not in MULTI and not r["absent"] and len(r["x"]["gold_segments"])]
+    out = {}
+    for k in MULTI_KS:
+        for bar in MULTI_BARS:
+            f1s, exact, empty_right, by = [], [], [], {}
+            for fold in range(score.FOLDS):
+                train = [r for r in single if score.fold_of(r) != fold]
+                heads = np.argsort(-line_hits(train).sum(axis=0), kind="stable")[:k]
+                for r in (r for r in multi if score.fold_of(r) == fold):
+                    gold = set(r["x"]["gold_segments"].tolist())
+                    p, rc, f1, ex = set_scores(multi_answer(r, heads, bar), gold)
+                    f1s.append(f1)
+                    exact.append(ex)
+                    if not gold:
+                        empty_right.append(ex)
+                    by.setdefault(r["family"], []).append(f1)
+            out[f"K={k} bar={bar}"] = {"f1": 100 * float(np.mean(f1s)), "exact": 100 * float(np.mean(exact)),
+                                       "absent_right": 100 * float(np.mean(empty_right)) if empty_right else None,
+                                       "by": {f: 100 * float(np.mean(v)) for f, v in sorted(by.items())}}
+    return out
+
+
 def report(set_paths, dumps, manifests, generations, out_path):
     rows = load_all(set_paths, dumps, manifests, generations or None)
     print(f"{len(rows)} questions, {sum(not r['absent'] for r in rows)} present", flush=True)
@@ -505,6 +615,7 @@ def report(set_paths, dumps, manifests, generations, out_path):
                       "table": regions_table(rows, vote_heads),
                       "all_heads": regions_table(rows, list(range(H)))}
     rep["forced"] = forced_table(rows)
+    rep["multi"] = multi_table(rows)
     write_json(out_path, rep)
     return rep
 
@@ -517,6 +628,7 @@ def main():
     e.add_argument("--manifest", required=True)
     e.add_argument("--out", required=True)
     e.add_argument("--limit", type=int)
+    e.add_argument("--tokenizer", help="the artifact's tokenizer.json, to find the instruction's rare-word tokens")
     r = sub.add_parser("report")
     r.add_argument("--sets", nargs="+", required=True)
     r.add_argument("--dumps", nargs="+", required=True)
@@ -525,7 +637,7 @@ def main():
     r.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.cmd == "extract":
-        extract(args.dump, args.manifest, args.out, args.limit)
+        extract(args.dump, args.manifest, args.out, args.limit, args.tokenizer)
     else:
         report(args.sets, args.dumps, args.manifests, args.generation, args.out)
 

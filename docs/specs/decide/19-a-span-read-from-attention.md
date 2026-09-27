@@ -302,6 +302,11 @@ here, to be confirmed by the owner before the run:
   E3 the chosen span reading's token hit is within 5 points of the
   generation route's, and its span F1 within 10, at one prefill (plus the
   baseline's, if chosen) against the generation's decode rounds.
+  *Stopped on the development sets, 2026-09-27*
+  (`docs/findings/2026-09-27-attention-names-the-line-not-the-words.md`):
+  the best one-prefill reading's token hit is 56.3% in nested CV on E1+E2
+  against the generation route's 85.2%, its span F1 22 against 74 — 29 and
+  52 points from the bar. By the rule below, E3 is not run.
 - **Track L (lines, revived).** If a phase 0 or phase 2 reading beats spec
   18's rule-1 choice on A+B's CV, it is judged once on set D against the
   labelled `choice` with spec 18's rule 2 verbatim (within 5 points overall,
@@ -345,12 +350,16 @@ here, to be confirmed by the owner before the run:
   (two prefills of one shared state against the labelled route's one of a
   labelled state) reported beside it. *After phase 0:* the vote reaches the
   labelled route's level on A+B by itself, so track H runs only if track L
-  is a no-go (the vote's top-3 recall on A+B is 98.5% in CV, the hybrid's ceiling).
+  is a no-go (the vote's top-3 recall on A+B is 98.5% in CV, the
+  hybrid's ceiling).
 - **Track P (profiles).** Its rule is proposed at the end of phase 2, from
   what the development sets show — there is no honest bar to write for
   several-span recall or absent detection before any profile is measured —
   and confirmed by the owner before E3 runs. The comparator for several
-  spans is the generation route asked for all of them.
+  spans is the generation route asked for all of them. *Stopped on the
+  development sets, 2026-09-27* (same finding): the vote's peaks give a set
+  F1 of 53 on several-span questions and read at most 35% of the absent
+  ones as empty, where the generation route is exact; no rule was proposed.
 
 A track whose answer is already clear on the development sets stops there:
 no check is run to confirm what they have settled.

@@ -183,6 +183,18 @@ class SpanScoreTest(unittest.TestCase):
         forced = spanscore.forced_table(self.rows)
         self.assertEqual(forced["last"]["after_last"][0], (score.head_name(END), 1.0))
 
+    def test_a_set_answer_is_scored_against_the_gold_set(self):
+        self.assertEqual(spanscore.set_scores({1, 2}, {2, 3})[:3], (0.5, 0.5, 0.5))
+        self.assertEqual(spanscore.set_scores(set(), set()), (1.0, 1.0, 1.0, True))
+        self.assertEqual(spanscore.set_scores({4}, set())[3], False)
+        row = {"x": {"seg_top": np.array([[3, 0], [3, 1], [5, 0], [7, 0]])}}
+        self.assertEqual(spanscore.multi_answer(row, np.array([0, 1, 2, 3]), 0.5), {3})
+        self.assertEqual(spanscore.multi_answer(row, np.array([0, 1, 2, 3]), 0.25), {3, 5, 7})
+
+    def test_the_line_level_winner_of_the_inside_heads_is_the_gold_segment(self):
+        hits = spanscore.line_hits([r for r in self.rows if not r["absent"]])
+        self.assertTrue(all(hits[:, h].all() for h in INSIDES))
+
     def test_a_forced_query_is_named_by_its_place_in_the_quote(self):
         self.assertEqual([spanscore.forced_label(p, 4) for p in (0, 1, 2, 4)], ["scaffold", "first", "middle", "last"])
         self.assertEqual([spanscore.forced_label(p, 1) for p in (0, 1)], ["scaffold", "last"])
