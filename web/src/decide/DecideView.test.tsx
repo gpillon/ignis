@@ -45,6 +45,18 @@ describe("DecideView", () => {
     expect(listitem.questions.map((q) => q.within)).toEqual(["/tickets", "/tickets", "/notes"]);
   });
 
+  it("asks the Three Laws as choices whose every option argues its case", async () => {
+    const laws = await EXAMPLES.find((e) => e.id === "laws")!.build();
+    expect(laws.questions).toHaveLength(8);
+    for (const q of laws.questions) {
+      expect(q.kind, q.id).toBe("choice");
+      // A bare key would be an action with no reason, which is the half of
+      // the dilemma the example exists to put in front of the model.
+      for (const option of q.options) expect(option.description, `${q.id}.${option.key}`).toMatch(/: /);
+    }
+    expect(laws.evidence.mode === "text" && laws.evidence.text).toContain("in this order of precedence");
+  });
+
   it("holds Decide back until there is something to decide", () => {
     const html = renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />);
     expect(html).toMatch(/<button[^>]*disabled[^>]*>Decide<\/button>/);
