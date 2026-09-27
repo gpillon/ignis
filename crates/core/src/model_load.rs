@@ -105,6 +105,10 @@ pub(crate) mod ffi {
         pub rope_scaling_beta_slow: f32,
         /// The most merged tokens one vision item may hold; 0 = the envelope.
         pub vision_item_max_tokens: u32,
+        /// GitHub #275 (ADR 0041): the most keys of a text span an attention
+        /// readout reads, and so the room the load reserves for one; 0 =
+        /// none.
+        pub attention_text_max_keys: u32,
     }
 
     /// 1:1 with `struct ignis_model_reservations` (GitHub #210): every
@@ -301,15 +305,27 @@ pub fn model_scope(speculation: Option<Speculation>, vision: Option<Vision>) -> 
     }
 }
 
+/// The keys of a text span a load of `reader`'s artifact reserves an
+/// attention readout's room for (GitHub #275, ADR 0041): the `locate`
+/// calibration's measured ceiling when the artifact has one, and none
+/// otherwise — a load nobody calibrated for `locate` never reads a text
+/// span, so it reserves nothing for one.
+pub fn text_readout_keys(reader: &Reader) -> u32 {
+    crate::locate::calibration(crate::identity::ArtifactHash::from_bytes(reader.content_hash()))
+        .map_or(0, |calibration| calibration.max_keys)
+}
+
 /// The options struct a load crosses the ABI with: `None` (a NULL pointer,
-/// ADR 0016's production defaults) when the load selects neither speculation
-/// nor vision, so such a load is exactly what it was before either existed.
+/// ADR 0016's production defaults) when the load selects none of
+/// speculation, vision, a scaled rotary table or a text readout's room, so
+/// such a load is exactly what it was before any of them existed.
 fn load_options(
     speculation: Option<Speculation>,
     vision: Option<Vision>,
     rope_scaling: RopeScaling,
+    text_keys: u32,
 ) -> Option<ffi::IgnisModelLoadOptions> {
-    (speculation.is_some() || vision.is_some() || rope_scaling.is_yarn()).then(|| {
+    (speculation.is_some() || vision.is_some() || rope_scaling.is_yarn() || text_keys > 0).then(|| {
         ffi::IgnisModelLoadOptions {
             size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
             // IGNIS_SPECULATIVE_NONE
@@ -325,6 +341,7 @@ fn load_options(
             rope_scaling_beta_fast: rope_scaling.beta_fast(),
             rope_scaling_beta_slow: rope_scaling.beta_slow(),
             vision_item_max_tokens: vision.map_or(0, |v| v.item_max_tokens()),
+            attention_text_max_keys: text_keys,
         }
     })
 }
@@ -646,7 +663,7 @@ pub fn load_qwen38_27b_with_options(
     )?;
     let mut layer_kinds_buf = Vec::new();
     let topology = qwen38_27b_topology(&mut layer_kinds_buf);
-    let options = load_options(speculation, vision, rope_scaling);
+    let options = load_options(speculation, vision, rope_scaling, text_readout_keys(reader));
 
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
@@ -697,7 +714,7 @@ pub fn plan_qwen38_27b_reservations(
     )?;
     let mut layer_kinds_buf = Vec::new();
     let topology = qwen38_27b_topology(&mut layer_kinds_buf);
-    let options = load_options(speculation, vision, rope_scaling);
+    let options = load_options(speculation, vision, rope_scaling, text_readout_keys(reader));
 
     let mut reservations = IgnisModelReservations::default();
     let rc = unsafe {
@@ -837,26 +854,37 @@ mod tests {
     #[test]
     fn a_load_with_neither_option_crosses_a_null_options_pointer() {
         assert_eq!(
-            load_options(None, None, RopeScaling::NONE),
+            load_options(None, None, RopeScaling::NONE, 0),
             None,
             "today's load, byte for byte"
         );
         // GitHub #227: `none` and an explicit factor of 1 are the same
         // no-op, and neither is worth an options struct.
-        assert_eq!(load_options(None, None, RopeScaling::parse("yarn:1").unwrap()), None);
+        assert_eq!(load_options(None, None, RopeScaling::parse("yarn:1").unwrap(), 0), None);
+    }
+
+    /// GitHub #275: an artifact calibrated for `locate` reserves the text
+    /// readout's room, and that alone is worth an options struct.
+    #[test]
+    fn a_text_readouts_room_crosses_the_options_struct() {
+        let options = load_options(None, None, RopeScaling::NONE, 4_554).expect("options");
+        assert_eq!(options.attention_text_max_keys, 4_554);
+        assert_eq!(options.vision_max_tokens, 0);
+        let vision = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 4_554).expect("options");
+        assert_eq!((vision.vision_max_tokens, vision.attention_text_max_keys), (8192, 4_554));
     }
 
     #[test]
     fn a_vision_only_load_crosses_the_envelope_with_no_speculation() {
         let options =
-            load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE).expect("options");
+            load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0).expect("options");
         assert_eq!(options.size as usize, std::mem::size_of::<ffi::IgnisModelLoadOptions>());
         assert_eq!(options.speculative_backend, 0);
         assert_eq!(options.draft_tokens, 0);
         assert_eq!(options.vision_max_tokens, 8192);
 
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        let without_vision = load_options(Some(spec), None, RopeScaling::NONE).expect("options");
+        let without_vision = load_options(Some(spec), None, RopeScaling::NONE, 0).expect("options");
         assert_eq!(without_vision.vision_max_tokens, 0);
         assert_eq!(without_vision.draft_tokens, 7);
         // Every load sends the rope scalars; with no scaling they are the
@@ -870,7 +898,7 @@ mod tests {
         // and a YaRN-only load would have crossed a NULL pointer -- serving
         // the linear table while the operator asked for a scaled one.
         let scaling = RopeScaling::parse("yarn:4,t=0.25,bf=16,bs=2").unwrap();
-        let options = load_options(None, None, scaling).expect("options");
+        let options = load_options(None, None, scaling, 0).expect("options");
         assert_eq!(options.speculative_backend, 0);
         assert_eq!(options.vision_max_tokens, 0);
         assert_eq!(options.rope_scaling_factor, 4.0);
@@ -882,15 +910,15 @@ mod tests {
     #[test]
     fn a_vision_item_bound_crosses_beside_the_envelope() {
         let bounded = Vision::new(32_768).unwrap().with_item_max_tokens(16_384);
-        let options = load_options(None, Some(bounded), RopeScaling::NONE).expect("options");
+        let options = load_options(None, Some(bounded), RopeScaling::NONE, 0).expect("options");
         assert_eq!(options.vision_max_tokens, 32_768, "the envelope is still the request's");
         assert_eq!(options.vision_item_max_tokens, 16_384);
         // No bound named: 0, which the leaf reads as "the envelope".
-        let unbounded = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE)
+        let unbounded = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0)
             .expect("options");
         assert_eq!(unbounded.vision_item_max_tokens, 0);
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        let text = load_options(Some(spec), None, RopeScaling::NONE).expect("options");
+        let text = load_options(Some(spec), None, RopeScaling::NONE, 0).expect("options");
         assert_eq!(text.vision_item_max_tokens, 0, "no vision, no item bound");
     }
 
@@ -899,8 +927,8 @@ mod tests {
         // uint32 size, int32 backend, uint32 draft_tokens, uint32
         // vision_max_tokens, (GitHub #243) uint64 pool bytes — which the four
         // uint32s above align for free — (GitHub #227) four float rope
-        // scalars, and the uint32 vision item bound, padded to the struct's
-        // 8-byte alignment.
+        // scalars, the uint32 vision item bound and (GitHub #275) the uint32
+        // text readout's keys, which fill what was the struct's padding.
         assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 48);
         // uint64 x 3, then (GitHub #210) the six uint64 reservation lines.
         assert_eq!(std::mem::size_of::<IgnisModelStats>(), 72);

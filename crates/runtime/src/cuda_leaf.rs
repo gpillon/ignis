@@ -377,6 +377,23 @@ fn leaf_error(context: &str, message: String) -> i32 {
     -1
 }
 
+/// An [`AttentionRead`]'s buffers as the step ABI's readout, and the flag
+/// the leaf's answer goes into.
+fn step_readout(read: &mut AttentionRead) -> (step::AttentionReadout<'_>, &mut bool) {
+    let AttentionRead { query, scores, set_argmax, set_peak, set_neighbours, set_rows, read } = read;
+    (
+        step::AttentionReadout {
+            query,
+            scores: scores.as_mut_slice(),
+            set_argmax: set_argmax.as_mut_slice(),
+            set_peak: set_peak.as_mut_slice(),
+            set_neighbours: set_neighbours.as_mut_slice(),
+            set_rows: set_rows.as_mut_slice(),
+        },
+        read,
+    )
+}
+
 impl StepLeaf for CudaLeaf {
     type Model = CudaModel;
     type Sequence = Seq<'static>;
@@ -424,16 +441,10 @@ impl StepLeaf for CudaLeaf {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
         let (readout, read) = match attention {
-            Some(AttentionRead { query, scores, set_argmax, set_peak, set_neighbours, read }) => (
-                Some(step::AttentionReadout {
-                    query,
-                    scores: scores.as_mut_slice(),
-                    set_argmax: set_argmax.as_mut_slice(),
-                    set_peak: set_peak.as_mut_slice(),
-                    set_neighbours: set_neighbours.as_mut_slice(),
-                }),
-                Some(read),
-            ),
+            Some(read) => {
+                let (readout, read) = step_readout(read);
+                (Some(readout), Some(read))
+            }
             None => (None, None),
         };
         let (probability, was_read) = step::prefill_program_multimodal(
@@ -769,8 +780,31 @@ impl StepLeaf for CudaLeaf {
         params: DecodeParams,
         permitted: &[TokenId],
         out_logits: Option<&mut [f32]>,
+        attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        // GitHub #275 (ADR 0041): a text span with an attention readout — a
+        // `locate`'s last chunk — arms it on the chunked route, as an
+        // image's span does. Every other chunk takes the paths below,
+        // untouched.
+        if let Some(attention) = attention {
+            let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
+            let (readout, read) = step_readout(attention);
+            let (probability, was_read) = step::prefill_program_attention(
+                &model.model,
+                &model.pool,
+                sequence,
+                &token_ids,
+                u64::from(start_position),
+                sampling_params(params),
+                &permitted_ids,
+                out_logits,
+                readout,
+            )
+            .map_err(|e| leaf_error("prefill", e))?;
+            *read = was_read;
+            return Ok(probability);
+        }
         // The unconstrained path is left exactly as it was — every request
         // this engine serves takes it, and a constrained prefill is a
         // different options struct, not a flag on this one.

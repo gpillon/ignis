@@ -54,7 +54,8 @@ and segment map it measures with are the pure functions of
 | A | `generate.py --seed 20261010 --out .scratch/locate/A` | development |
 | B | `generate.py --seed 20261011 --out .scratch/locate/B --exclude .scratch/locate/A` | development |
 | C | `generate.py --seed 20261012 --out .scratch/locate/C --exclude .scratch/locate/A .scratch/locate/B` | check: go/no-go, reading confirmation, length ceiling, floors |
-| D | `generate.py --seed 20261013 --out .scratch/locate/D --exclude .scratch/locate/A .scratch/locate/B .scratch/locate/C` | phase B's acceptance — used once, not yet used |
+| D | `generate.py --seed 20261013 --out .scratch/locate/D --exclude .scratch/locate/A .scratch/locate/B .scratch/locate/C` | spent by spec 19's track L check (2026-09-27) |
+| F | `generate.py --seed 20261014 --out .scratch/locate/F --exclude .scratch/locate/A .scratch/locate/B .scratch/locate/C .scratch/locate/D` | phase B's acceptance through `/v1/decide` (`served.py`), registered in spec 18 before it was generated |
 
 A set used to choose something is spent for judging it. A and B choose; C
 judges once; D is phase B's.

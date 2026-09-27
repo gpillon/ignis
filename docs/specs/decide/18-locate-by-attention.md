@@ -12,6 +12,19 @@
 > values from D: `LOCATE_MAX_KEYS` = 4,554; floors logs ≥ 41/43, records ≥
 > 43/45, prose ≥ 58/67. Where the text below says "the head" or R1, phase B
 > reads the vote. The banner that follows is phase A's record, kept.
+>
+> **Phase B's acceptance (8), registered 2026-09-27 before its set was
+> generated.** Set D is spent, so the check runs on a fresh set **F**:
+> `generate.py --seed 20261014 --exclude A B C D` (240 questions, 80 per
+> family), asked once through `/v1/decide` — one `locate` per request,
+> `tools/locate-sets/served.py ask` — on the served artifact under
+> `make start`'s defaults (hq-e8-2b with the residual window). **Pass** if
+> each family's top-1, on its present questions a `locate` serves (the
+> endpoint refuses a target past `LOCATE_MAX_KEYS` with `locate_too_long`,
+> and those are not counted), is at or above D's floor **rate**: logs 41/43,
+> records 43/45, prose 58/67 (`served.py judge`). Reported beside it, not
+> asserted: top-3, the present/absent AUC of `confidence`, the refusals, and
+> the wall time against the labelled route (`labelled.py`) on F.
 
 > **NOT IMPLEMENTED — phase A's go/no-go fired negative.** Phase A ran on
 > 2026-09-26 (`docs/findings/2026-09-26-locate-attention-no-go.md`). Rule 1

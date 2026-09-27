@@ -1,4 +1,5 @@
-// The attention readout (GitHub #260, ADR 0038) -- OURS, not vendored
+// The attention readout (GitHub #260, ADR 0038; rows GitHub #275, ADR 0041)
+// -- OURS, not vendored
 // (kernel/src/attention_readout.h).
 //
 // One query head's pre-softmax scores over a span of keys, from the two
@@ -31,6 +32,10 @@
 //                skipped, an exact tie won by the larger key, the pointing
 //                head's row equal to the single-head kernel's whether or not
 //                it is one of the set, and the guards.
+//   rows         GitHub #275 (ADR 0041): a set read in whole rows over a text
+//                span, with no grid -- every head's row against the host's, on
+//                the plane and on the pages, and a set with nowhere to put
+//                what it reads refused.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE, so a missing or
 // busy GPU fails this test rather than skipping it.
@@ -610,6 +615,143 @@ void a_set_that_cannot_be_read_is_left_unread(std::mt19937 &rng) {
   check(got.rc != 0 && !got.read, "a query head the layer does not have: refused");
 }
 
+// GitHub #275 (ADR 0041): a set read in whole rows over a text span. No grid
+// and no neighbour buffer: the fused launch writes every score it forms at
+// its head's slot, and publishes each argmax as before.
+struct RowsRun {
+  int32_t rc = 0;
+  bool read = false;
+  std::vector<float> rows;              // [heads][key_count]
+  std::vector<unsigned long long> best; // packed, one per head
+};
+
+RowsRun run_rows(const Scene &scene, const std::vector<int> &heads,
+                 const ninfer::PagedKVBatchLayerView &cache, bool hq_prompt_scratch,
+                 const void *workspace, std::int64_t span) {
+  Device<std::uint16_t> query(scene.query);
+  Device<unsigned long long> best(heads.size());
+  Device<float> rows(heads.size() * static_cast<std::size_t>(scene.key_count));
+  RowsRun out;
+  AttentionReadoutTarget target;
+  target.query_head = -1;
+  target.key_begin = scene.key_begin;
+  target.key_count = scene.key_count;
+  target.set_heads = static_cast<int32_t>(heads.size());
+  for (std::size_t i = 0; i < heads.size(); ++i) {
+    target.set_query_head[i] = heads[i];
+    target.set_slot[i] = static_cast<int32_t>(i);
+  }
+  target.device_set_best = best.p;
+  target.device_set_rows = rows.p;
+  target.read = &out.read;
+  const char *error = nullptr;
+  out.rc = ignis_attention_readout_run(target, query.p, kQHeads, kKvHeads, scene.tokens,
+                                       scene.visible, cache, hq_prompt_scratch, workspace, span,
+                                       kScale, nullptr, &error);
+  CUDA_FATAL(cudaDeviceSynchronize());
+  out.rows = rows.read();
+  out.best = best.read();
+  return out;
+}
+
+// Every head's row against the host's double-precision scores, and its
+// argmax still published.
+void check_rows(const Scene &scene, const RowsRun &got, const std::vector<int> &heads,
+                const KeyAt &key, bool hq, const std::string &label) {
+  check(got.rc == 0 && got.read, label + ": the rows are read");
+  const auto count = static_cast<std::size_t>(scene.key_count);
+  for (std::size_t i = 0; i < heads.size(); ++i) {
+    const std::vector<double> q0 = query_of_head(scene, heads[i]);
+    const std::vector<double> q = hq ? rotate(q0) : q0;
+    const int kv = heads[i] / (kQHeads / kKvHeads);
+    std::vector<double> want(count);
+    for (std::size_t k = 0; k < count; ++k) {
+      double dot = 0.0;
+      for (int d = 0; d < kHeadDim; ++d) {
+        dot += q[d] * key(kv, scene.key_begin + static_cast<std::int64_t>(k), d);
+      }
+      want[k] = dot * kScale;
+    }
+    const std::vector<float> row(got.rows.begin() + static_cast<std::ptrdiff_t>(i * count),
+                                 got.rows.begin() + static_cast<std::ptrdiff_t>((i + 1) * count));
+    const double worst = worst_relative(row, want);
+    check(worst < 1e-4, label + ": head " + std::to_string(heads[i]) + "'s row, worst relative " +
+                            std::to_string(worst));
+    check(got.best[i] != 0, label + ": head " + std::to_string(heads[i]) + " published its argmax");
+  }
+}
+
+void the_set_is_read_in_rows_over_a_text_span(std::mt19937 &rng) {
+  std::printf("rows: every head's whole row, off the plane and the pages\n");
+  const Scene scene = make_scene(rng);
+  std::normal_distribution<float> normal(0.0F, 1.0F);
+
+  const std::int64_t span = scene.visible;
+  std::vector<std::uint16_t> plane(static_cast<std::size_t>(kKvHeads) * span * kHeadDim);
+  for (auto &k : plane) {
+    k = to_bf16(normal(rng));
+  }
+  Device<std::uint16_t> workspace(plane);
+  ninfer::PagedKVBatchLayerView hq;
+  hq.dtype = ninfer::DType::U8;
+  const KeyAt plane_key = [&](int kv, std::int64_t position, int d) {
+    return from_bf16(plane[(static_cast<std::size_t>(kv) * span + position) * kHeadDim + d]);
+  };
+  check_rows(scene, run_rows(scene, kSetHeads, hq, true, workspace.p, span), kSetHeads, plane_key,
+             /*hq=*/true, "rows/plane");
+
+  const int pages = static_cast<int>((scene.visible + kPage - 1) / kPage);
+  std::vector<std::int32_t> table(pages);
+  for (int p = 0; p < pages; ++p) {
+    table[p] = (p * 7) % pages;
+  }
+  std::vector<std::uint16_t> paged(static_cast<std::size_t>(pages) * kKvHeads * kPage * kHeadDim);
+  for (auto &k : paged) {
+    k = to_bf16(normal(rng));
+  }
+  const auto row_of = [&](int kv, std::int64_t position) {
+    return ((static_cast<std::size_t>(table[position / kPage]) * kKvHeads + kv) * kPage +
+            static_cast<std::size_t>(position % kPage)) *
+           kHeadDim;
+  };
+  Device<std::uint16_t> k_pages(paged);
+  Device<std::int32_t> block_table(table);
+  ninfer::PagedKVBatchLayerView bf16;
+  bf16.dtype = ninfer::DType::BF16;
+  bf16.k_pages = ninfer::Tensor(k_pages.p, ninfer::DType::BF16, {kHeadDim, kKvHeads * kPage * pages, 1, 1});
+  bf16.block_tables = ninfer::Tensor(block_table.p, ninfer::DType::I32, {pages, 1, 1, 1});
+  const KeyAt page_key = [&](int kv, std::int64_t position, int d) {
+    return from_bf16(paged[row_of(kv, position) + d]);
+  };
+  const std::vector<int> heads = {0, 5, 13, 17, 23};
+  check_rows(scene, run_rows(scene, heads, bf16, false, nullptr, 0), heads, page_key, /*hq=*/false,
+             "rows/pages");
+
+  // A set with neither rows nor a grid has nowhere to put what it reads.
+  RowsRun nowhere;
+  {
+    Device<std::uint16_t> query(scene.query);
+    Device<unsigned long long> best(heads.size());
+    AttentionReadoutTarget target;
+    target.query_head = -1;
+    target.key_begin = scene.key_begin;
+    target.key_count = scene.key_count;
+    target.set_heads = static_cast<int32_t>(heads.size());
+    for (std::size_t i = 0; i < heads.size(); ++i) {
+      target.set_query_head[i] = heads[i];
+      target.set_slot[i] = static_cast<int32_t>(i);
+    }
+    target.device_set_best = best.p;
+    target.read = &nowhere.read;
+    const char *error = nullptr;
+    nowhere.rc = ignis_attention_readout_run(target, query.p, kQHeads, kKvHeads, scene.tokens,
+                                             scene.visible, bf16, false, nullptr, 0, kScale, nullptr,
+                                             &error);
+    CUDA_FATAL(cudaDeviceSynchronize());
+  }
+  check(nowhere.rc != 0 && !nowhere.read, "a set with neither rows nor a grid: refused");
+}
+
 } // namespace
 
 int main() {
@@ -626,6 +768,7 @@ int main() {
   the_set_is_read_in_one_launch_off_the_plane(rng);
   the_set_is_read_in_one_launch_off_the_pages(rng);
   a_set_that_cannot_be_read_is_left_unread(rng);
+  the_set_is_read_in_rows_over_a_text_span(rng);
   if (g_failed > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failed);
     return EXIT_FAILURE;

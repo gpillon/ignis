@@ -100,6 +100,19 @@ impl TemplateProvider for DecidingTemplate {
         Ok(rendered)
     }
 
+    /// The placeholder's text and word offsets (GitHub #275), which is what
+    /// a `locate` maps its segments by.
+    fn apply_chat_template_with_text(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        let mut rendered = SimpleTemplateProvider.apply_chat_template_with_text(messages, options, tools)?;
+        rendered.system_block_tokens = system_block_of(messages);
+        Ok(rendered)
+    }
+
     fn answer_alphabet(&self) -> AnswerAlphabet {
         AnswerAlphabet::from_tokenizer(&WideTokenizer::new())
     }
@@ -1923,13 +1936,13 @@ async fn a_point_with_no_method_is_read_off_the_head_set_in_one_pass() {
     let named = query.set.as_ref().expect("the readout names the head set");
     assert_eq!(&*named.heads, set.heads, "all of it, in its order");
     assert_eq!(
-        &*named.excluded,
+        named.excluded(),
         set.fallback_cells(rows as u32, cols as u32).as_slice(),
         "with the grid's fallback cells excluded"
     );
     let peak = MockCompute::attention_peak(query.key_count);
     let (row, col) = (peak / cols, peak % cols);
-    assert!(col + 2 < cols && !named.excluded.iter().any(|&k| (peak..peak + 3).contains(&(k as usize))));
+    assert!(col + 2 < cols && !named.excluded().iter().any(|&k| (peak..peak + 3).contains(&(k as usize))));
     let (cw, ch) = (f64::from(WIDTH) / cols as f64, f64::from(HEIGHT) / rows as f64);
     // Spec 15, restated from the mock's published constants: the set's heads
     // sit on three columns of one row, each leaning by
@@ -2371,4 +2384,204 @@ async fn a_head_box_over_a_text_state_is_the_chains_error_and_costs_nothing() {
     assert_eq!(status, 200, "{response}");
     assert_eq!(response["answers"]["frame"]["code"], "state_carries_no_image", "{response}");
     assert!(compute.prefill_calls().is_empty(), "no span to read, so nothing was submitted");
+}
+
+// ── locate (GitHub #275, spec 18 phase B) ────────────────────────────────
+
+/// Six items of three words each. The placeholder template's tokens are the
+/// words of what it renders, so the system message `{"evidence":["x a y",
+/// "x b y",…]}` is thirteen tokens — `{"evidence":["x`, `a`, `y","x`, `b`,
+/// `y","x`, … `f`, `y"]}` — item 0 owning the first three (`y","x` holds one
+/// byte of each item and goes to the earlier) and every other item two. The
+/// key span is all thirteen, and the mock's heads peak a third of the way
+/// in: key 4, `y","x`, which is item 1's.
+const LOCATE_STATE: &str = r#"["x a y","x b y","x c y","x d y","x e y","x f y"]"#;
+
+fn decide_body(state: &str, questions: &str) -> String {
+    format!(r#"{{"state":{state},"questions":{{{questions}}}}}"#)
+}
+
+/// The requests that asked the leaf for an attention readout, each with the
+/// query its reading chunk named, in the order they were prefilled.
+fn attention_jobs(compute: &MockCompute) -> Vec<(u64, ignis_core::pointing::AttentionQuery)> {
+    compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .filter_map(|job| job.attention.clone().map(|query| (job.request, query)))
+        .collect()
+}
+
+/// Spec 18 acceptance 4: a `locate` is read off the calibrated heads' vote in
+/// one prefill of the question and one of its content-free baseline — its
+/// answer the voted segment, its value the caller's own, its ranking the
+/// voted segments — after zero decode rounds.
+#[tokio::test]
+async fn a_locate_is_answered_at_the_segment_the_heads_vote_for() {
+    let compute = calibrated_compute();
+    let server = server(compute.clone());
+    let calibration = server.locate.expect("the served artifact is calibrated for locate");
+    let body = decide_body(LOCATE_STATE, r#""which":{"type":"locate","instructions":"which item names the letter b"}"#);
+    let (status, response) = decide(&server.app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(
+        response["answers"]["which"],
+        json!({"type": "locate", "segment": 1, "value": "x b y", "confidence": 1.0,
+               "ranking": [{"segment": 1, "share": 1.0}]}),
+        "{response}"
+    );
+
+    let jobs = attention_jobs(&compute);
+    assert_eq!(jobs.len(), 2, "the question and its content-free baseline: {jobs:?}");
+    for (_, query) in &jobs {
+        assert_eq!((query.key_begin, query.key_count), (0, 13), "the state's key span");
+        assert_eq!(query.head, calibration.heads[0], "the best-ranked head reads the row");
+        let set = query.set.as_ref().expect("the vote's heads");
+        assert_eq!(&*set.heads, calibration.heads, "all of them, in their order");
+        assert_eq!(set.read, ignis_core::pointing::SetRead::Rows);
+    }
+    assert!(compute.decode_calls().is_empty(), "zero decode rounds ran");
+    assert_eq!(response["usage"]["output_tokens"], 0, "{response}");
+}
+
+/// Spec 18 acceptance 4: every fault a caller can commit with a `locate`
+/// refuses the whole request with its own 422, before any prefill.
+#[tokio::test]
+async fn every_locate_refusal_comes_before_any_prefill() {
+    let many_lines = (0..5000).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\\n");
+    let long_state = format!("\"{many_lines}\"");
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("criteria", decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"b","criteria":{"a":"b"}}"#), "criteria_unsupported"),
+        ("digits", decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"b","digits":3}"#), "digits_unsupported"),
+        ("method", decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"b","method":"head"}"#), "method_unsupported"),
+        ("within on a noul", decide_body(LOCATE_STATE, r#""q":{"type":"noul","instructions":"b","within":"/0"}"#), "within_unsupported"),
+        ("parts", r#"{"state":[{"type":"text","text":"a\nb"}],"questions":{"q":{"type":"locate","instructions":"b"}}}"#.to_owned(), "locate_needs_json_state"),
+        ("malformed pointer", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","instructions":"b","within":"log"}"#), "locate_within_malformed"),
+        ("missing target", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","instructions":"b","within":"/logs"}"#), "locate_within_not_found"),
+        ("ambiguous target", decide_body(r#"{"log":"a b\nc d","log":"e"}"#, r#""q":{"type":"locate","instructions":"b","within":"/log"}"#), "locate_within_ambiguous"),
+        ("an object", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","instructions":"b"}"#), "locate_target_unsegmentable"),
+        ("one line", decide_body(r#""just one line of text""#, r#""q":{"type":"locate","instructions":"b"}"#), "locate_too_few_segments"),
+        ("past the ceiling", decide_body(&long_state, r#""q":{"type":"locate","instructions":"b"}"#), "locate_too_long"),
+    ];
+    for (what, body, code) in cases {
+        let compute = calibrated_compute();
+        let (status, response) = decide(&app(compute.clone()), &body).await;
+        assert_eq!(status, 422, "{what}: {response}");
+        assert_eq!(response["error"]["code"], code, "{what}: {response}");
+        assert!(compute.prefill_calls().is_empty(), "{what}: refused before any prefill");
+    }
+    // A sibling's fault refuses the `locate` beside it too: all or nothing.
+    let compute = calibrated_compute();
+    let body = decide_body(
+        LOCATE_STATE,
+        r#""q":{"type":"locate","instructions":"which item names b"},"bad":{"type":"choice","instructions":"x"}"#,
+    );
+    let (status, _) = decide(&app(compute.clone()), &body).await;
+    assert_eq!(status, 422);
+    assert!(compute.prefill_calls().is_empty());
+}
+
+/// Spec 18 user story 11: a load nobody calibrated `locate` for refuses it
+/// before any prefill, naming why, rather than reading heads chosen for
+/// another model.
+#[tokio::test]
+async fn a_locate_on_an_uncalibrated_load_is_refused() {
+    let compute = Arc::new(MockCompute::new());
+    let server = server(compute.clone());
+    assert!(server.locate.is_none(), "the mock's default artifact is nobody's");
+    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"which item names b"}"#);
+    let (status, response) = decide(&server.app(), &body).await;
+    assert_eq!(status, 422, "{response}");
+    assert_eq!(response["error"]["code"], "locate_uncalibrated", "{response}");
+    assert!(compute.prefill_calls().is_empty());
+}
+
+/// Spec 18 acceptance 4: a fan-out mixing `locate`, `choice` and `noul` over
+/// one state answers every question, and the content-free baseline is one
+/// prefill per target — two `locate`s over the same `within` share one.
+#[tokio::test]
+async fn a_fan_out_mixing_locates_and_readouts_answers_all_with_one_baseline_per_target() {
+    let compute = calibrated_compute();
+    let state = r#"{"items":["x a y","x b y","x c y","x d y","x e y","x f y"],"notes":"n one m\nn two m\nn three m"}"#;
+    let body = decide_body(
+        state,
+        r#""b":{"type":"locate","instructions":"which item names the letter b","within":"/items"},
+           "again":{"type":"locate","instructions":"the item after a","within":"/items"},
+           "note":{"type":"locate","instructions":"which note says two","within":"/notes"},
+           "any":{"type":"noul","instructions":"is there a letter?"},
+           "which":{"type":"choice","instructions":"which vowel?","criteria":{"a":null,"e":null}}"#,
+    );
+    let (status, response) = decide(&app(compute.clone()), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answers = &response["answers"];
+    for id in ["b", "again", "note"] {
+        assert_eq!(answers[id]["type"], "locate", "{id}: {response}");
+    }
+    assert_eq!(answers["any"]["type"], "noul", "{response}");
+    assert_eq!(answers["which"]["type"], "choice", "{response}");
+    let reads = attention_jobs(&compute);
+    assert_eq!(reads.len(), 5, "three questions and two baselines: {reads:?}");
+    let spans: std::collections::BTreeSet<(u32, u32)> =
+        reads.iter().map(|(_, query)| (query.key_begin, query.key_count)).collect();
+    assert_eq!(spans.len(), 2, "two targets, each read over its own span: {spans:?}");
+    assert!(compute.decode_calls().is_empty(), "nothing generated");
+}
+
+/// A `locate` whose baseline the leaf could not read fails as its own
+/// question, and says which prefill it was — never a vote read against
+/// nothing.
+#[tokio::test]
+async fn a_locate_whose_baseline_was_not_read_is_a_failed_question() {
+    let compute = calibrated_compute();
+    // Request 0 is the question, asked first; request 1 its baseline.
+    compute.refuse_attention(1);
+    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"which item names b"}"#);
+    let (status, response) = decide(&app(compute.clone()), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["q"];
+    assert_eq!(answer["type"], "error", "{response}");
+    assert_eq!(answer["code"], "attention_unread", "{response}");
+    assert!(answer["message"].as_str().is_some_and(|m| m.starts_with("its content-free baseline")), "{response}");
+}
+
+/// Spec 18 user story 6: a segment's value is the caller's own — an element
+/// that is an object comes back with its keys in the order they were
+/// written, not sorted.
+#[tokio::test]
+async fn a_locates_value_keeps_the_callers_key_order() {
+    let compute = calibrated_compute();
+    let state = r#"[{"z":"x a y","a":1},{"z":"x b y","a":2},{"z":"x c y","a":3},{"z":"x d y","a":4}]"#;
+    let body = decide_body(state, r#""q":{"type":"locate","instructions":"which record names b"}"#);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/decide")
+        .header("content-type", "application/json")
+        .body(Body::from(body.into_bytes()))
+        .unwrap();
+    let response = app(compute).oneshot(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    let answer: JsonValue = serde_json::from_str(&text).unwrap();
+    let segment = answer["answers"]["q"]["segment"].as_u64().expect("a segment") as usize;
+    let written = [
+        r#"{"z":"x a y","a":1}"#,
+        r#"{"z":"x b y","a":2}"#,
+        r#"{"z":"x c y","a":3}"#,
+        r#"{"z":"x d y","a":4}"#,
+    ];
+    assert!(text.contains(&format!("\"value\":{}", written[segment])), "the value as written: {text}");
+}
+
+/// Spec 18: `ignis_decisions_total{type="locate"}` counts a served `locate`
+/// once — its baseline is not a decision — and observes no answer mass.
+#[tokio::test]
+async fn a_served_locate_is_counted_once_and_observes_no_answer_mass() {
+    let server = server(calibrated_compute()).with_metrics();
+    let metrics = server.metrics_app().expect("--metrics is on");
+    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"which item names b"}"#);
+    let (status, response) = decide(&server.app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let after = scrape(&metrics).await;
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"locate\""), "1");
+    assert!(!after.contains("ignis_decision_answer_mass_count 1"), "{after}");
 }

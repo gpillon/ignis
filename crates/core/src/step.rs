@@ -146,6 +146,10 @@ pub(crate) mod ffi {
         /// The measurement readout: every position's BF16 logits, host,
         /// `[num_tokens][vocab]` ([`super::prefill_program_span_logits`]).
         pub out_span_logits: *mut u16,
+        /// GitHub #275 (ADR 0041): with the set, every head's whole row,
+        /// host, `[attention_set_count][attention_key_count]`, or null. With
+        /// rows the grid's columns may be 0 and the neighbours null.
+        pub out_attention_set_rows: *mut f32,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -602,6 +606,7 @@ impl PrefillRoute {
             out_attention_set_peak: std::ptr::null_mut(),
             out_attention_set_neighbours: std::ptr::null_mut(),
             out_span_logits: std::ptr::null_mut(),
+            out_attention_set_rows: std::ptr::null_mut(),
         }
     }
 }
@@ -1304,9 +1309,11 @@ pub struct MultimodalPrefill<'a> {
     pub media: Option<SpanMediaColumns<'a>>,
 }
 
-/// One **attention readout** a multimodal span asks for (GitHub #260, ADR
-/// 0038): what to read, and where the scores go — one slot per key of the
-/// query's span, and one per head of its head set (GitHub #263, ADR 0039).
+/// One **attention readout** a span asks for (GitHub #260, ADR 0038): what
+/// to read, and where the scores go — one slot per key of the query's span,
+/// and one per head of its head set (GitHub #263, ADR 0039), with the four
+/// neighbours of an image's set (GitHub #264) or the rows of a set read in
+/// rows (GitHub #275, ADR 0041).
 pub struct AttentionReadout<'a> {
     pub query: &'a crate::pointing::AttentionQuery,
     pub scores: &'a mut [f32],
@@ -1315,8 +1322,12 @@ pub struct AttentionReadout<'a> {
     /// Each head's score at its own argmax (GitHub #264); empty with no set.
     pub set_peak: &'a mut [f32],
     /// Four scores a head: the argmax's left, right, up and down neighbours
-    /// in the image grid, `NaN` for one off it (GitHub #264).
+    /// in the image grid, `NaN` for one off it (GitHub #264). Empty for a
+    /// set read in rows.
     pub set_neighbours: &'a mut [f32],
+    /// Every head's row, `[heads][key_count]` (GitHub #275); empty unless the
+    /// set is read in rows.
+    pub set_rows: &'a mut [f32],
 }
 
 /// A media item's columns placed over a span's placeholder rows.
@@ -1357,48 +1368,113 @@ pub fn prefill_program_multimodal(
     out_logits: Option<&mut [f32]>,
     attention: Option<AttentionReadout<'_>>,
 ) -> Result<(f32, bool), String> {
-    let params = permitted_params("prefill_program_multimodal", sampling, permitted)?;
-    if span.positions.len() != 3 * token_ids.len() {
-        return Err(format!(
-            "prefill_program_multimodal: {} positions for {} tokens",
-            span.positions.len(),
-            token_ids.len()
-        ));
-    }
-    let (media, scatter, count, first_column) = match span.media {
-        Some(columns) => (
-            columns.embedding.handle as *const ffi::IgnisMediaEmbedding,
-            columns.scatter_indices.as_ptr(),
-            columns.scatter_indices.len() as u32,
-            columns.first_column,
-        ),
-        None => (std::ptr::null(), std::ptr::null(), 0, 0),
-    };
+    prefill_program_reading(
+        "prefill_program_multimodal",
+        model,
+        pool,
+        sequence,
+        token_ids,
+        start_position,
+        sampling,
+        permitted,
+        Some(span),
+        out_logits,
+        attention,
+    )
+}
+
+/// [`prefill_program_permitted`] over a **text** span with an attention
+/// readout (GitHub #275, ADR 0041): a `locate` reads a text state's keys the
+/// way a head `point` reads an image's ([`prefill_program_multimodal`]),
+/// on the chunked route. `permitted` empty is an ordinary prefill.
+///
+/// Returns the permitted draw's probability (0 with no set) and whether the
+/// leaf could read the keys the readout names.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_program_attention(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    sampling: SamplingParams,
+    permitted: &[i32],
+    out_logits: Option<&mut [f32]>,
+    attention: AttentionReadout<'_>,
+) -> Result<(f32, bool), String> {
+    prefill_program_reading(
+        "prefill_program_attention",
+        model,
+        pool,
+        sequence,
+        token_ids,
+        start_position,
+        sampling,
+        permitted,
+        None,
+        out_logits,
+        Some(attention),
+    )
+}
+
+/// The one prefill both readout entry points share: a text span (`span`
+/// `None`) or a multimodal one, with the attention readout armed from
+/// `attention` when it names one.
+#[allow(clippy::too_many_arguments)]
+fn prefill_program_reading(
+    what: &str,
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    sampling: SamplingParams,
+    permitted: &[i32],
+    span: Option<MultimodalPrefill<'_>>,
+    out_logits: Option<&mut [f32]>,
+    attention: Option<AttentionReadout<'_>>,
+) -> Result<(f32, bool), String> {
+    use crate::pointing::SetRead;
+    let params = permitted_params(what, sampling, permitted)?;
     let mut probability = 0f32;
     let mut read = 0i32;
+    let mut options = ffi::IgnisPrefillOptions {
+        out_permitted_prob: &mut probability,
+        ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
+    };
+    if let Some(span) = span {
+        if span.positions.len() != 3 * token_ids.len() {
+            return Err(format!("{what}: {} positions for {} tokens", span.positions.len(), token_ids.len()));
+        }
+        let (media, scatter, count, first_column) = match span.media {
+            Some(columns) => (
+                columns.embedding.handle as *const ffi::IgnisMediaEmbedding,
+                columns.scatter_indices.as_ptr(),
+                columns.scatter_indices.len() as u32,
+                columns.first_column,
+            ),
+            None => (std::ptr::null(), std::ptr::null(), 0, 0),
+        };
+        options.mrope_positions = span.positions.as_ptr();
+        options.rope_delta = span.rope_delta;
+        options.media_column_count = count;
+        options.media = media;
+        options.media_scatter_indices = scatter;
+        options.media_first_column = first_column;
+    }
     // GitHub #263: the head set's inputs and results, as the ABI's i32s.
     // Built only for a readout that names one; everything else passes
     // empty vectors, which allocate nothing.
     let set = attention.as_ref().map(|readout| readout.query).and_then(|query| query.set.as_ref());
     let set_ordinals: Vec<i32> = set.map_or_else(Vec::new, |set| set.heads.iter().map(|h| h.gqa_ordinal as i32).collect());
     let set_heads: Vec<i32> = set.map_or_else(Vec::new, |set| set.heads.iter().map(|h| h.query_head as i32).collect());
-    let excluded: Vec<i32> = set.map_or_else(Vec::new, |set| set.excluded.iter().map(|&key| key as i32).collect());
+    let excluded: Vec<i32> = set.map_or_else(Vec::new, |set| set.excluded().iter().map(|&key| key as i32).collect());
     let mut set_out = vec![-1i32; set_ordinals.len()];
-    let mut options = ffi::IgnisPrefillOptions {
-        mrope_positions: span.positions.as_ptr(),
-        rope_delta: span.rope_delta,
-        media_column_count: count,
-        media,
-        media_scatter_indices: scatter,
-        media_first_column: first_column,
-        out_permitted_prob: &mut probability,
-        ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
-    };
     let mut attention_set: Option<&mut [u32]> = None;
     if let Some(readout) = attention {
         if readout.scores.len() != readout.query.key_count as usize {
             return Err(format!(
-                "prefill_program_multimodal: {} score slots for an attention readout of {} keys",
+                "{what}: {} score slots for an attention readout of {} keys",
                 readout.scores.len(),
                 readout.query.key_count
             ));
@@ -1410,17 +1486,22 @@ pub fn prefill_program_multimodal(
         options.out_attention_scores = readout.scores.as_mut_ptr();
         options.out_attention_read = &mut read;
         let named = readout.query.set.as_ref().map_or(0, |set| set.heads.len());
-        if readout.set_argmax.len() != named {
+        let (neighbours, rows) = match readout.query.set.as_ref().map(|set| &set.read) {
+            Some(SetRead::Rows) => (0, named * readout.query.key_count as usize),
+            _ => (4 * named, 0),
+        };
+        if readout.set_argmax.len() != named
+            || readout.set_peak.len() != named
+            || readout.set_neighbours.len() != neighbours
+            || readout.set_rows.len() != rows
+        {
             return Err(format!(
-                "prefill_program_multimodal: {} argmax slots for a head set of {named} heads",
-                readout.set_argmax.len()
-            ));
-        }
-        if readout.set_peak.len() != named || readout.set_neighbours.len() != 4 * named {
-            return Err(format!(
-                "prefill_program_multimodal: {} peak and {} neighbour slots for a head set of                  {named} heads",
+                "{what}: {} argmax, {} peak, {} neighbour and {} row slots for a head set of {named} heads, which \
+                 needs {named}, {named}, {neighbours} and {rows}",
+                readout.set_argmax.len(),
                 readout.set_peak.len(),
-                readout.set_neighbours.len()
+                readout.set_neighbours.len(),
+                readout.set_rows.len()
             ));
         }
         if let Some(set) = &readout.query.set {
@@ -1430,9 +1511,16 @@ pub fn prefill_program_multimodal(
             options.attention_excluded_count = excluded.len() as u32;
             options.attention_excluded = if excluded.is_empty() { std::ptr::null() } else { excluded.as_ptr() };
             options.out_attention_set_argmax = set_out.as_mut_ptr();
-            options.attention_grid_cols = set.grid_cols;
             options.out_attention_set_peak = readout.set_peak.as_mut_ptr();
-            options.out_attention_set_neighbours = readout.set_neighbours.as_mut_ptr();
+            match &set.read {
+                SetRead::Peaks { grid_cols, .. } => {
+                    options.attention_grid_cols = *grid_cols;
+                    options.out_attention_set_neighbours = readout.set_neighbours.as_mut_ptr();
+                }
+                // GitHub #275: a text span is no grid — no columns, no
+                // neighbours — and every head's row comes back instead.
+                SetRead::Rows => options.out_attention_set_rows = readout.set_rows.as_mut_ptr(),
+            }
         }
         attention_set = Some(readout.set_argmax);
     }

@@ -48,6 +48,7 @@ pub mod hq_ring;
 pub mod identity;
 pub mod kv;
 pub mod kv_format;
+pub mod locate;
 pub mod mock;
 #[cfg(feature = "cuda")]
 pub mod model_load;

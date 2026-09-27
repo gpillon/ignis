@@ -250,6 +250,17 @@ fn the_load_says_which_method_point_will_use() {
     assert!(method["attributes"]["artifact"].as_str().is_some(), "{method}");
 }
 
+/// GitHub #275: the load says whether `locate` can be answered before the
+/// first request. A load with no artifact has nobody's heads, so it cannot.
+#[test]
+fn the_load_says_whether_locate_is_available() {
+    let records = run_until(&[], &[], &["ignis.process.started"]);
+    let locate = find(&records, "ignis.decide.locate");
+    assert_eq!(locate["severity_text"], "INFO");
+    assert_eq!(locate["attributes"]["available"], false, "{locate}");
+    assert!(locate["attributes"]["artifact"].as_str().is_some(), "{locate}");
+}
+
 #[test]
 fn no_artifact_emits_placeholder_template_then_process_started() {
     let records = run_until(&[], &[], &["ignis.process.started"]);

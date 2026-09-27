@@ -453,6 +453,20 @@ pub struct RenderedPrompt {
     /// boundary is cut there, for the reason none is at an unsure system
     /// block.
     pub part_ends: Vec<Option<u32>>,
+    /// The text the tokens spell and each token's byte range in it (GitHub
+    /// #275): what a `locate` maps its state's segments onto keys by.
+    /// Reported only when asked for
+    /// ([`TemplateProvider::apply_chat_template_with_text`]), and `None`
+    /// otherwise.
+    pub text: Option<PromptText>,
+}
+
+/// A rendered prompt's text and where each of its tokens sits in it (GitHub
+/// #275): token `i` spells `text[offsets[i].0..offsets[i].1]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptText {
+    pub text: String,
+    pub offsets: Vec<(usize, usize)>,
 }
 
 impl From<Vec<TokenId>> for RenderedPrompt {
@@ -466,6 +480,7 @@ impl From<Vec<TokenId>> for RenderedPrompt {
             user_turn_tokens: None,
             system_block_tokens: None,
             part_ends: Vec::new(),
+            text: None,
         }
     }
 }
@@ -504,6 +519,23 @@ pub trait TemplateProvider: Send + Sync {
     /// The default reports none, which fails closed: a provider that cannot
     /// say where a part ends cuts no boundary there.
     fn apply_chat_template_with_part_ends(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        self.apply_chat_template(messages, options, tools)
+    }
+
+    /// [`TemplateProvider::apply_chat_template`], also reporting the rendered
+    /// text and each token's byte range in it ([`RenderedPrompt::text`],
+    /// GitHub #275). A separate method because only a `locate` asks: it maps
+    /// the byte ranges its state's segments were written at onto the keys
+    /// its heads are read over, and nothing is re-found by searching tokens.
+    ///
+    /// The default reports none, which fails closed: a `locate` over a
+    /// provider that cannot say where its tokens sit is refused.
+    fn apply_chat_template_with_text(
         &self,
         messages: &[ChatMessage],
         options: &ThinkingOptions,
@@ -697,6 +729,36 @@ impl TemplateProvider for SimpleTemplateProvider {
         // options (see the trait doc for why this must not default to
         // `thinking.enable_thinking` here).
         false
+    }
+
+    /// Its text is every message's text, one line each, and each token is
+    /// the byte range of the word it hashed — which is what a `locate` over
+    /// this provider maps its segments by.
+    fn apply_chat_template_with_text(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        let mut rendered = self.apply_chat_template(messages, options, tools)?;
+        let mut text = String::new();
+        let mut offsets = Vec::with_capacity(rendered.tokens.len());
+        for (index, message) in messages.iter().enumerate() {
+            if index > 0 {
+                text.push('\n');
+            }
+            let start = text.len();
+            let content = message.content.text();
+            text.push_str(&content);
+            let mut at = 0;
+            for word in content.split_whitespace() {
+                let found = at + content[at..].find(word).expect("a word of the text is in the text");
+                offsets.push((start + found, start + found + word.len()));
+                at = found + word.len();
+            }
+        }
+        rendered.text = Some(PromptText { text, offsets });
+        Ok(rendered)
     }
 
     /// The words of each content part of the last message, counted as it

@@ -60,7 +60,7 @@ impl std::fmt::Display for PointingHead {
 /// re-quantization that kept every name, format and offset would match it.
 /// That is the proxy the whole engine keys retained state on, and it is the
 /// right strength here too — a *different* artifact cannot match.
-const SERVED_NVFP4_27B: [u8; 32] = [
+pub(crate) const SERVED_NVFP4_27B: [u8; 32] = [
     0x4b, 0xdc, 0x7b, 0x13, 0x03, 0x17, 0x29, 0x52, 0xcf, 0x50, 0xad, 0x0b, 0xb3, 0x74, 0x8d, 0xd9,
     0xc3, 0x2d, 0x2f, 0xae, 0x30, 0xda, 0x8b, 0x09, 0xd8, 0x45, 0x0e, 0x83, 0xb6, 0x54, 0x25, 0x13,
 ];
@@ -119,7 +119,7 @@ impl HeadSet {
 /// `L<layer>.h<head>`, which is how the head set was recorded. A layer that
 /// is not a GQA layer (`4k + 3`) fails the build rather than rounding to a
 /// neighbour.
-const fn layer_head(layer: u32, head: u32) -> PointingHead {
+pub(crate) const fn layer_head(layer: u32, head: u32) -> PointingHead {
     assert!(layer % 4 == 3, "the 27B's GQA layers are 3, 7, ..., 63");
     PointingHead {
         gqa_ordinal: (layer - 3) / 4,
@@ -316,7 +316,8 @@ pub fn calibrated_artifacts() -> impl Iterator<Item = ArtifactHash> {
 /// every GQA layer holding one of its heads is read the same way, and one
 /// argmax key index per head comes back beside the pointing head's scores,
 /// with the four scores around it (spec 15, ADR 0040) — enough to read the
-/// peak's position *inside* its image cell ([`AttentionScores`]). A read any
+/// peak's position *inside* its image cell ([`AttentionScores`]) — or, over
+/// a text span (GitHub #275, ADR 0041), every head's whole row. A read any
 /// armed layer cannot make leaves the whole readout unread — never a partial
 /// set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,19 +337,36 @@ pub struct AttentionQuery {
 /// The head set half of an [`AttentionQuery`] (spec 14, ADR 0039).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetQuery {
-    /// The heads, at most [`MAX_SET_HEADS`]; one key index per head comes
-    /// back, in this order.
+    /// The heads, at most [`MAX_SET_HEADS`] — at most [`MAX_ROW_HEADS`] read
+    /// in rows; whatever comes back per head comes back in this order.
     pub heads: Arc<[PointingHead]>,
-    /// Span-relative key indices no head's argmax may land on — the
-    /// **fallback cells** ([`HeadSet::fallback_cells`]), at most
-    /// [`MAX_EXCLUDED_KEYS`]. The pointing head's own scores still cover
-    /// every key: its region rule reads the whole map.
-    pub excluded: Arc<[u32]>,
-    /// The image grid's columns (spec 15, ADR 0040). The span is a
-    /// row-major grid, and the leaf walks it to find each peak's four
-    /// in-line neighbours: the left neighbour of a cell in column 0 does
-    /// not exist, and is never the previous row's last cell.
-    pub grid_cols: u32,
+    /// What is read of each head.
+    pub read: SetRead,
+}
+
+/// What a [`SetQuery`] reads of each of its heads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetRead {
+    /// An image's head set (spec 14 and 15, ADR 0039 and 0040): each head's
+    /// argmax key, its score there and the four scores around it in the
+    /// image grid.
+    Peaks {
+        /// Span-relative key indices no head's argmax may land on — the
+        /// **fallback cells** ([`HeadSet::fallback_cells`]), at most
+        /// [`MAX_EXCLUDED_KEYS`]. The pointing head's own scores still cover
+        /// every key: its region rule reads the whole map.
+        excluded: Arc<[u32]>,
+        /// The image grid's columns (spec 15, ADR 0040). The span is a
+        /// row-major grid, and the leaf walks it to find each peak's four
+        /// in-line neighbours: the left neighbour of a cell in column 0 does
+        /// not exist, and is never the previous row's last cell.
+        grid_cols: u32,
+    },
+    /// A text span's head vote (GitHub #275, ADR 0041): every head's whole
+    /// row, one pre-softmax score per key. A text span is no grid, and the
+    /// vote reads each head's softmax mass per segment, which one key a
+    /// head cannot say.
+    Rows,
 }
 
 impl SetQuery {
@@ -356,8 +374,27 @@ impl SetQuery {
     pub fn for_grid(set: &HeadSet, rows: u32, cols: u32) -> Self {
         Self {
             heads: Arc::from(set.heads),
-            excluded: Arc::from(set.fallback_cells(rows, cols)),
-            grid_cols: cols,
+            read: SetRead::Peaks {
+                excluded: Arc::from(set.fallback_cells(rows, cols)),
+                grid_cols: cols,
+            },
+        }
+    }
+
+    /// The query for `heads` read in whole rows (GitHub #275).
+    pub fn rows(heads: impl Into<Arc<[PointingHead]>>) -> Self {
+        Self {
+            heads: heads.into(),
+            read: SetRead::Rows,
+        }
+    }
+
+    /// The keys no head's argmax may land on: an image set's fallback cells,
+    /// and none for rows.
+    pub fn excluded(&self) -> &[u32] {
+        match &self.read {
+            SetRead::Peaks { excluded, .. } => excluded,
+            SetRead::Rows => &[],
         }
     }
 }
@@ -366,15 +403,22 @@ impl SetQuery {
 /// layer (16 x 24). What the leaf reserves its per-head results for.
 pub const MAX_SET_HEADS: usize = 16 * 24;
 
+/// The most heads a readout may bring **whole rows** back for (GitHub #275,
+/// ADR 0041): a `locate`'s vote reads every key of every head, where a
+/// `point`'s set reads one key a head. The served vote has 32 heads, and the
+/// load reserves the rows' room for this many.
+pub const MAX_ROW_HEADS: usize = 32;
+
 /// The most keys a [`SetQuery`] may exclude. The leaf carries them as
 /// launch arguments, not memory; the served calibration excludes four.
 pub const MAX_EXCLUDED_KEYS: usize = 32;
 
 /// What an [`AttentionQuery`] reads back across the `Compute` seam (ADR 0038,
-/// ADR 0039, ADR 0040): the pointing head's scores, and one key index per
-/// head of the set with the four scores around it when it named one. Nothing
-/// else crosses — at 4096 px that is 64 KB, 384 bytes and 1.5 KB, where every
-/// head's row would be 6.3 MB.
+/// ADR 0039, ADR 0040, ADR 0041): the pointing head's scores, and one key
+/// index per head of the set with the four scores around it when it named an
+/// image's set — at 4096 px that is 64 KB, 384 bytes and 1.5 KB, where every
+/// head's row would be 6.3 MB — or every head's row when it named a text
+/// span's: 32 heads over 4,554 keys, 583 KB. Nothing else crosses.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionScores {
     /// The pointing head's `q · k / sqrt(head_dim)`, one per key of the
@@ -396,8 +440,14 @@ pub struct AttentionScores {
     /// keys are ordinary neighbours: a head may not *peak* on a fallback
     /// cell, but the score there is still the attention's.
     ///
-    /// `None` when the query named no set; otherwise `4 * heads` long.
+    /// `None` when the query named no set, or one read in rows; otherwise
+    /// `4 * heads` long.
     pub set_neighbours: Option<Arc<[Option<f32>]>>,
+    /// Every head's row (GitHub #275, ADR 0041), row-major `[heads][span]`
+    /// in the set's order: the same pre-softmax scores the pointing head's
+    /// row carries, for each head. `None` unless the query read its set in
+    /// [`SetRead::Rows`].
+    pub set_rows: Option<Arc<[f32]>>,
 }
 
 impl AttentionScores {
@@ -408,6 +458,7 @@ impl AttentionScores {
             set_argmax: None,
             set_peak: None,
             set_neighbours: None,
+            set_rows: None,
         }
     }
 }
@@ -846,6 +897,6 @@ mod tests {
         }
         let query = SetQuery::for_grid(set, 32, 32);
         assert_eq!(query.heads.len(), 96);
-        assert_eq!(&*query.excluded, &[0, 1, 223, 1023]);
+        assert_eq!(query.excluded(), &[0, 1, 223, 1023]);
     }
 }

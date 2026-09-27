@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use ignis_core::pointing::{ATTENTION_MIN_CHUNK_TOKENS, AttentionQuery, AttentionScores, PointingHead, SetQuery};
+use ignis_core::pointing::{ATTENTION_MIN_CHUNK_TOKENS, AttentionQuery, AttentionScores, PointingHead, SetQuery, SetRead};
 use ignis_core::scheduler::PrefillJob;
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent, TokenId};
 use ignis_core::{
@@ -143,8 +143,10 @@ fn a_head_set_rides_the_reading_chunk_and_comes_back_one_key_per_head() {
     let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
     let set = SetQuery {
         heads: Arc::from(vec![HEAD, PointingHead { gqa_ordinal: 7, query_head: 1 }, PointingHead { gqa_ordinal: 15, query_head: 18 }]),
-        excluded: Arc::from(vec![0, 6, 15]),
-        grid_cols: 4,
+        read: SetRead::Peaks {
+            excluded: Arc::from(vec![0, 6, 15]),
+            grid_cols: 4,
+        },
     };
     let mut input = head_point(tokens(1, 40), 4, 16);
     input.decision = Some(DecisionRead::Attention(AttentionQuery {
@@ -163,7 +165,7 @@ fn a_head_set_rides_the_reading_chunk_and_comes_back_one_key_per_head() {
     let attention = attention.expect("answered");
     assert_eq!(attention.scores.len(), 16);
     let argmax = attention.set_argmax.expect("one key per head of the set");
-    assert_eq!(&*argmax, MockCompute::attention_set_argmax(16, 3, &set.excluded).as_slice());
+    assert_eq!(&*argmax, MockCompute::attention_set_argmax(16, 3, &[0, 6, 15]).as_slice());
     // The mock's peak is key 5 and the set reads 5, 6 and 7 — 6 is excluded,
     // so the second head moves on to 7.
     assert_eq!(&*argmax, &[5, 7, 7]);
@@ -180,6 +182,73 @@ fn a_head_set_rides_the_reading_chunk_and_comes_back_one_key_per_head() {
     );
     assert!(around[4 * 1 + 1].is_none(), "key 7 is in the last column: no right neighbour");
     assert!(around[4 * 0 + 1].is_some(), "key 5 is not");
+    assert_eq!(attention.set_rows, None, "an image set brings back no rows");
+}
+
+/// GitHub #275 (ADR 0041): a `locate` over a **text** state names its head
+/// set to be read in whole rows. The job carries no image, is still a
+/// readout-class decision — answered on its last chunk, never decoded — and
+/// comes back with one score per key of the span for every head of the
+/// set, in the set's order, beside the pointing head's own row.
+#[test]
+fn a_text_readout_brings_every_heads_row_back_whole() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+    let heads = vec![HEAD, PointingHead { gqa_ordinal: 11, query_head: 20 }, PointingHead { gqa_ordinal: 14, query_head: 16 }];
+    let mut input = head_point(tokens(1, 40), 4, 16);
+    input.decision = Some(DecisionRead::Attention(AttentionQuery {
+        head: HEAD,
+        key_begin: 4,
+        key_count: 16,
+        set: Some(SetQuery::rows(heads.clone())),
+    }));
+    assert!(input.multimodal.is_none(), "a text state");
+    let id = sched.submit(input, RequestClass::Agent).expect("admitted");
+    let events = run_to_idle(&mut sched);
+
+    let asked = jobs_of(&compute, id).last().and_then(|job| job.attention.clone()).expect("the last chunk reads");
+    let set = asked.set.expect("the job names the set");
+    assert_eq!(&*set.heads, heads.as_slice());
+    assert_eq!(set.read, SetRead::Rows);
+    let (generated, reason, attention) = finish(&events, id);
+    assert_eq!((generated, reason), (0, FinishReason::Stop));
+    let attention = attention.expect("answered");
+    let rows = attention.set_rows.expect("every head's row");
+    assert_eq!(rows.len(), 3 * 16, "heads x span");
+    let peak = MockCompute::attention_peak(16);
+    for (head, row) in rows.chunks_exact(16).enumerate() {
+        let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(row.iter().position(|&s| s == top), Some(peak), "head {head} peaks where the mock says");
+    }
+    assert_eq!(attention.set_neighbours, None, "a text span is no grid: no neighbours");
+    assert!(compute.decode_calls().iter().flatten().all(|job| job.request != id));
+}
+
+/// The mock's rows sharpen with the prompt: the same span read at the end of
+/// a longer prompt peaks higher. That is what lets a test's question — whose
+/// instruction is longer than its content-free twin's `N/A` — lift its
+/// peak's segment above the baseline, as a real question does.
+#[test]
+fn the_mocks_rows_sharpen_with_the_prompt() {
+    let rows_after = |prompt_len: u32| {
+        let compute = Arc::new(MockCompute::new());
+        let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+        let mut input = head_point(tokens(1, prompt_len), 4, 16);
+        input.decision = Some(DecisionRead::Attention(AttentionQuery {
+            head: HEAD,
+            key_begin: 4,
+            key_count: 16,
+            set: Some(SetQuery::rows(vec![HEAD])),
+        }));
+        let id = sched.submit(input, RequestClass::Agent).expect("admitted");
+        let events = run_to_idle(&mut sched);
+        let attention = finish(&events, id).2.expect("answered");
+        attention.set_rows.expect("rows").to_vec()
+    };
+    let (short, long) = (rows_after(30), rows_after(40));
+    let peak = MockCompute::attention_peak(16);
+    assert!(long[peak] > short[peak], "{} after 40 tokens, {} after 30", long[peak], short[peak]);
+    assert_eq!(long[peak + 1], short[peak + 1], "the background stays where it is");
 }
 
 #[test]

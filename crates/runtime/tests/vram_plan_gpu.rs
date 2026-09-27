@@ -153,18 +153,32 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
     assert!(narrow_text.workspace < text.workspace, "the chunk width sizes a text load's scratch");
     assert!(with_vision.workspace > text.workspace, "the encoder's workspace is the larger here");
     assert_eq!(with_vision.workspace, narrow_with_vision.workspace, "one arena, sized by the encoder alone");
-    // A text load reserves what it did before #212: the `prefill_scratch`
-    // line the plan logged at these options on 2026-09-17.
-    assert_eq!(text.workspace, 1_481_902_336);
+    // For each of the 384 heads a set may name, its packed result (8 bytes,
+    // GitHub #263) and its four neighbour scores (16 bytes, GitHub #264).
+    const HEAD_SET_BYTES: u64 = 16 * 24 * (8 + 16);
+    // GitHub #275 (ADR 0041): the served artifact is calibrated for `locate`,
+    // so every load of it -- text or vision -- reserves a text readout's
+    // room over `LOCATE_MAX_KEYS`: one f32 per key (rounded to the arena's
+    // 256-byte alignment), the head set's buffers, and 32 whole rows.
+    let text_keys = u64::from(ignis_core::locate::calibration(ignis_core::ArtifactHash::from_bytes(reader.content_hash()))
+        .expect("the served artifact is calibrated for locate")
+        .max_keys);
+    let aligned = |bytes: u64| bytes.div_ceil(256) * 256;
+    let text_scores = aligned(text_keys * 4);
+    let text_room = text_scores + HEAD_SET_BYTES + aligned(32 * text_keys * 4);
+    assert_eq!(text_room, 610_560, "4,554 keys: 18,432 B of scores, 9,216 of set results, 582,912 of rows");
+
+    // A text load reserves what it did before #212 -- the `prefill_scratch`
+    // line the plan logged at these options on 2026-09-17 -- and the text
+    // readout's room beside it.
+    assert_eq!(text.workspace, 1_481_902_336 + text_room);
     assert_eq!(text.media_embedding, 0);
     assert!(with_vision.media_embedding > 0, "the media embedding keeps its own reservation");
 
     // Where the prefill scratch is the larger, vision grows the arena by the
-    // attention readout alone (GitHub #260) -- one f32 per token of an item
-    // -- and the head set's buffers beside it: for each of the 384 heads a
-    // set may name, its packed result (8 bytes, GitHub #263) and its four
-    // neighbour scores (16 bytes, GitHub #264).
-    const HEAD_SET_BYTES: u64 = 16 * 24 * (8 + 16);
+    // attention readout alone (GitHub #260) -- one f32 per token of an item,
+    // less the text scores it shares the room with: one readout reads at a
+    // time, and the head set's buffers are the text room's already.
 
     // The serving load's item bound: this artifact's processor lets no item
     // through past 16,384 merged tokens, and the encoder holds one at a
@@ -174,17 +188,18 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
     let bounded = reserved(1024, MAX_CONTEXT, Some(vision.with_item_max_tokens(ITEM_BOUND)));
     assert_eq!(
         bounded.workspace,
-        text.workspace + u64::from(ITEM_BOUND) * 4 + HEAD_SET_BYTES,
+        text.workspace + u64::from(ITEM_BOUND) * 4 - text_scores,
         "an item-bounded encoder fits the prefill scratch"
     );
     assert_eq!(bounded.media_embedding, with_vision.media_embedding, "the pool keeps the envelope's floor");
 
     // A short context caps the envelope, and with it the item, below the
-    // prefill scratch the same way.
+    // prefill scratch the same way -- and caps the text span too, to the
+    // same 2,048 keys, so a head point's readout is the text room already.
     const SHORT_CONTEXT: u32 = 2048;
     assert_eq!(
         reserved(1024, SHORT_CONTEXT, Some(vision)).workspace,
-        reserved(1024, SHORT_CONTEXT, None).workspace + u64::from(SHORT_CONTEXT) * 4 + HEAD_SET_BYTES,
-        "the prefill scratch already fits the encoder, and a head point's readout beside it"
+        reserved(1024, SHORT_CONTEXT, None).workspace,
+        "the prefill scratch already fits the encoder, and the text room a head point's readout"
     );
 }

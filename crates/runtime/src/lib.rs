@@ -246,9 +246,9 @@ pub struct SpanMedia<'a, M> {
     pub scatter_indices: &'a [i32],
 }
 
-/// One **attention readout** a multimodal prefill span is asked for (GitHub
-/// #260, ADR 0038): what to read in, the scores out, and whether the leaf
-/// could read them.
+/// One **attention readout** a prefill span is asked for (GitHub #260, ADR
+/// 0038) — an image's, or since GitHub #275 (ADR 0041) a text state's: what
+/// to read in, the scores out, and whether the leaf could read them.
 ///
 /// Allocated by [`RuntimeCompute`] only for a job that asked, with one score
 /// slot per key of the query's span; every other span passes `None` and pays
@@ -271,43 +271,58 @@ pub struct AttentionRead {
     /// Four scores per head, in the same order: the argmax's left, right, up
     /// and down neighbours in the image grid (GitHub #264). The leaf writes
     /// **NaN** for a neighbour off the grid, which [`AttentionRead::into_scores`]
-    /// turns into the `None` the host rule reads.
+    /// turns into the `None` the host rule reads. Empty for a set read in
+    /// rows: a text span is no grid.
     pub set_neighbours: Vec<f32>,
-    /// Whether the leaf wrote `scores`, `set_argmax` and the neighbours from
-    /// the keys every armed layer's attention read.
+    /// Every head's row, `[heads][key_count]` in the set's order, for a set
+    /// read in rows (GitHub #275, ADR 0041); empty otherwise.
+    pub set_rows: Vec<f32>,
+    /// Whether the leaf wrote `scores`, `set_argmax` and the neighbours or
+    /// rows from the keys every armed layer's attention read.
     pub read: bool,
 }
 
 impl AttentionRead {
-    /// An unread readout for `query`, its scores, argmax and neighbours
-    /// zeroed.
+    /// An unread readout for `query`, its scores, argmax and neighbours or
+    /// rows zeroed.
     pub fn new(query: &ignis_core::pointing::AttentionQuery) -> Self {
-        let heads = query.set.as_ref().map_or(0, |set| set.heads.len());
+        use ignis_core::pointing::SetRead;
+        let (heads, rows) = match query.set.as_ref() {
+            None => (0, false),
+            Some(set) => (set.heads.len(), set.read == SetRead::Rows),
+        };
+        let count = query.key_count as usize;
         Self {
-            scores: vec![0.0; query.key_count as usize],
+            scores: vec![0.0; count],
             set_argmax: vec![0; heads],
             set_peak: vec![0.0; heads],
-            set_neighbours: vec![0.0; 4 * heads],
+            set_neighbours: vec![0.0; if rows { 0 } else { 4 * heads }],
+            set_rows: vec![0.0; if rows { heads * count } else { 0 }],
             query: query.clone(),
             read: false,
         }
     }
 
     /// What crosses the `Compute` seam once the leaf has read: the scores,
-    /// and the set's argmax, peaks and neighbours when the query named a
-    /// set. A NaN neighbour is one off the grid — a peak on the image's
-    /// border has no score beyond it.
+    /// and the set's argmax and peaks when the query named a set, with the
+    /// neighbours of an image's set or the rows of a set read in rows. A NaN
+    /// neighbour is one off the grid — a peak on the image's border has no
+    /// score beyond it.
     pub fn into_scores(self) -> ignis_core::pointing::AttentionScores {
-        let named = self.query.set.is_some();
+        use ignis_core::pointing::SetRead;
+        let read = self.query.set.as_ref().map(|set| set.read.clone());
+        let peaks = matches!(read, Some(SetRead::Peaks { .. }));
+        let rows = read == Some(SetRead::Rows);
         ignis_core::pointing::AttentionScores {
-            set_argmax: named.then(|| self.set_argmax.into()),
-            set_peak: named.then(|| self.set_peak.into()),
-            set_neighbours: named.then(|| {
+            set_argmax: read.is_some().then(|| self.set_argmax.into()),
+            set_peak: read.is_some().then(|| self.set_peak.into()),
+            set_neighbours: peaks.then(|| {
                 self.set_neighbours
                     .into_iter()
                     .map(|score| score.is_finite().then_some(score))
                     .collect()
             }),
+            set_rows: rows.then(|| self.set_rows.into()),
             scores: self.scores.into(),
         }
     }
@@ -491,6 +506,13 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// (GitHub #242) — the successor the first decode round returns — and
     /// the call reports its probability within that set. Empty is an
     /// ordinary prefill and reports 0.
+    ///
+    /// `attention` is the **attention readout** (GitHub #260) over a text
+    /// span (GitHub #275, ADR 0041): a `locate` reads a text state's keys
+    /// exactly as a head `point` reads an image's. Read at the span's last
+    /// position; see [`AttentionRead`] for what the leaf owes it. `None`
+    /// asks for none and costs nothing.
+    #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
         model: &Self::Model,
@@ -500,6 +522,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         params: DecodeParams,
         permitted: &[TokenId],
         out_logits: Option<&mut [f32]>,
+        attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32>;
     /// Encode one media item's patch rows into a device-resident embedding
     /// (the media encode step, GitHub #178). A leaf without vision refuses.
@@ -517,10 +540,9 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// be an image, and a readout wired only to the text path would return
     /// nothing at all for one rather than failing (GitHub #237).
     ///
-    /// `attention` is the **attention readout** (GitHub #260), on this path
-    /// only: the span it reads is an image's, so the text path has nothing
-    /// to carry. Read at the span's last position; see [`AttentionRead`]
-    /// for what the leaf owes it.
+    /// `attention` is the **attention readout** (GitHub #260), read at the
+    /// span's last position; see [`AttentionRead`] for what the leaf owes
+    /// it. The text path carries one too (GitHub #275).
     #[allow(clippy::too_many_arguments)]
     fn prefill_multimodal(
         &self,
@@ -1194,18 +1216,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     .as_ref()
                     .map(|_| vec![0f32; self.model.leaf.vocab(self.model.handle()) as usize]);
                 // GitHub #260: the attention readout's score slots, likewise
-                // only for a job that asked — one f32 per key of its span.
+                // only for a job that asked — one f32 per key of its span,
+                // and (GitHub #275) a row per head of a set read in rows. A
+                // text job reads one as an image job does.
                 let mut attention = job.attention.as_ref().map(AttentionRead::new);
-                if attention.is_some() && job.multimodal.is_none() {
-                    // hotpath-lint-allow: failure-only path (the batch returns `Err` on the next line), reviewed exception (GitHub #260).
-                    tracing::error!(
-                        name: "ignis.runtime.attention_without_image",
-                        request_id = job.request,
-                        start_position = job.start_position,
-                        "an attention readout job carries no multimodal span to read"
-                    );
-                    unwind!(RuntimeError::Leaf(ignis_core::scheduler::ATTENTION_WITHOUT_IMAGE).into());
-                }
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -1222,6 +1236,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             // passes an empty slice and allocates nothing.
                             job.permitted.as_deref().unwrap_or(&[]),
                             logits.as_deref_mut(),
+                            attention.as_mut(),
                         )
                         .map(|probability| (0, probability)),
                     Some(multimodal) => self.prefill_multimodal_job(

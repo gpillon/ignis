@@ -114,11 +114,12 @@ pub enum Primitive {
     Number,
     Point,
     Box,
+    Locate,
 }
 
 impl Primitive {
     /// Every primitive, in the order their series are rendered.
-    pub const ALL: [Primitive; 7] = [
+    pub const ALL: [Primitive; 8] = [
         Self::Noul,
         Self::Choice,
         Self::Score,
@@ -126,6 +127,7 @@ impl Primitive {
         Self::Number,
         Self::Point,
         Self::Box,
+        Self::Locate,
     ];
 
     /// Whether this primitive's answer has an **answer mass** to observe
@@ -155,6 +157,7 @@ impl Primitive {
             Self::Number => "number",
             Self::Point => "point",
             Self::Box => "box",
+            Self::Locate => "locate",
         }
     }
 }

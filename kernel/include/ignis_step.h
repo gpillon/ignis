@@ -262,7 +262,24 @@ struct ignis_prefill_options {
    * it: a NULL costs nothing, and a set one adds the head over every column
    * in 32-column blocks inside the chunk's own scratch. */
   uint16_t *out_span_logits;
+  /* GitHub #275 (ADR 0041): with the set, **every head's whole row** --
+   * head `i`'s `q . k / sqrt(head_dim)` against each key of the span, before
+   * any softmax, at `out_attention_set_rows[i * attention_key_count + k]`
+   * (host, `attention_set_count * attention_key_count` floats) -- or NULL for
+   * none. What a `locate` over a text state reads: its vote needs each head's
+   * softmax mass per segment, which one key a head cannot say. At most
+   * IGNIS_ATTENTION_MAX_ROW_HEADS heads, over at most the load's
+   * `attention_text_max_keys` keys. With rows, `attention_grid_cols` may be
+   * 0 and `out_attention_set_neighbours` NULL: a text span is no grid, and
+   * then no neighbour is gathered. The set's argmax and peaks are still
+   * written, and still say the set was read whole. Appended (ADR 0016). */
+  float *out_attention_set_rows;
 };
+
+/* The most heads a readout may bring whole rows back for (GitHub #275): the
+ * load reserves the rows' room for this many over `attention_text_max_keys`
+ * keys. */
+#define IGNIS_ATTENTION_MAX_ROW_HEADS 32
 
 /* The media encode step (GitHub #178): one media item's BF16 patch rows plus
  * its grid and host-computed encoder control, in; an opaque, leaf-owned,

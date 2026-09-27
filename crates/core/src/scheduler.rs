@@ -166,8 +166,9 @@ pub struct PrefillJob {
     /// allocation and no device work — not that the field is free to name.
     pub permitted: Option<crate::constrained::PermittedSet>,
     /// The **attention readout** this chunk asks for (GitHub #260, ADR 0038),
-    /// if this is a head-point decision's last chunk: one query head of one
-    /// GQA layer, at the chunk's last position, over the keys of one span.
+    /// if this is a head-point or `locate` decision's last chunk: one query
+    /// head of one GQA layer — and the heads of a set — at the chunk's last
+    /// position, over the keys of one span.
     ///
     /// The third thing this seam carries, beside [`PrefillJob::readout`] and
     /// [`PrefillJob::permitted`], set on the same chunk for the same reason —
@@ -175,9 +176,10 @@ pub struct PrefillJob {
     /// readout: the job names what to read, [`PrefillOutcome::attention`]
     /// carries back one score per key of the span and nothing else.
     ///
-    /// Only a multimodal job may carry one (the span is an image's), and the
-    /// chunk carries at least [`crate::pointing::ATTENTION_MIN_CHUNK_TOKENS`]
-    /// tokens, which [`crate::types::RequestInput::prefill_tail`] keeps.
+    /// The span is an image's for a head point, and a text state's for a
+    /// `locate` (GitHub #275, ADR 0041). The chunk carries at least
+    /// [`crate::pointing::ATTENTION_MIN_CHUNK_TOKENS`] tokens, which
+    /// [`crate::types::RequestInput::prefill_tail`] keeps.
     /// `None` on every other job, and such a job costs nothing for it: no
     /// allocation, and no device work the leaf would not have done anyway.
     pub attention: Option<crate::pointing::AttentionQuery>,
@@ -398,16 +400,6 @@ pub const NO_HOST_ROOM: i32 = -6;
 /// [`FinishReason::Error`], which is the right end for a request that can
 /// never be served. GitHub #238 owes the trim that keeps it from arising.
 pub const READOUT_WITHOUT_TOKENS: i32 = -1001;
-
-/// The code a backend fails a batch with when a job asks for an
-/// **attention readout** without a multimodal span (GitHub #260): the span
-/// it reads is an image's, and the leaf's text path has no way to carry one.
-///
-/// Incoherent in the same way as [`READOUT_WITHOUT_TOKENS`], and numbered
-/// beside it: the server never renders such a job (a head point over a state
-/// with no image is refused before it is submitted), so meeting one is a bug
-/// upstream, failed loudly rather than answered.
-pub const ATTENTION_WITHOUT_IMAGE: i32 = -1002;
 
 /// The compute seam the scheduler drives for actual token generation.
 ///

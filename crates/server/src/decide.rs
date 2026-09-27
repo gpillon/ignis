@@ -13,6 +13,12 @@
 //! they do not have is an **answer mass**, which is why the histogram beside
 //! that counter is readout-only (ADR 0017).
 //!
+//! GitHub #275 adds `locate`: which **segment** of a text `state` — a line,
+//! an array element — the instruction names, read from a vote of calibrated
+//! attention heads in one prefill and one content-free baseline, with
+//! nothing written into the state and nothing generated ([`crate::locate`],
+//! `ignis_core::locate`, ADR 0041).
+//!
 //! The wire shape is TypeSafe's Jev (`POST /v1/systemone`) copied rather
 //! than invented, so an unmodified Jev client reaches this by changing the
 //! URL. Their vocabulary — `noul`, `criteria`, `instructions` — is therefore
@@ -247,6 +253,35 @@ impl OrderedValue {
     }
 }
 
+/// Written back **in order** (GitHub #275): a `locate` answers with the
+/// segment exactly as the caller sent it, and an element that is an object
+/// would otherwise come back with its keys sorted by `serde_json::Map`.
+impl Serialize for OrderedValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Bool(flag) => serializer.serialize_bool(*flag),
+            Self::Number(number) => number.serialize(serializer),
+            Self::String(text) => serializer.serialize_str(text),
+            Self::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            Self::Object(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
 /// A JSON string literal, escaped the way `serde_json` escapes one.
 fn quoted(text: &str) -> String {
     serde_json::to_string(text).expect("a string always serializes")
@@ -467,6 +502,13 @@ pub struct Question {
     #[serde(default)]
     #[schema(value_type = Option<SpatialMethod>)]
     pub method: Option<String>,
+    /// The part of the `state` a `locate` searches (GitHub #275): an RFC 6901
+    /// JSON Pointer, the whole state when absent. It must name a string —
+    /// whose segments are its lines, split on `\n` exactly — or a non-empty
+    /// array — whose segments are its elements. The whole state is still
+    /// written into the prompt. Refused on every other type.
+    #[serde(default)]
+    pub within: Option<String>,
 }
 
 /// How a `point` or a `box` is answered (GitHub #260, #263; specs 13 and 14).
@@ -507,6 +549,15 @@ pub struct LoadMethods {
     pub box_default: &'static str,
     /// The sentence the event says it with.
     pub summary: &'static str,
+}
+
+/// What the `ignis.decide.locate` event says at load (GitHub #275): whether
+/// a `locate` will be answered, and why not when it will not.
+pub fn locate_summary(calibration: Option<ignis_core::locate::LocateCalibration>) -> &'static str {
+    match calibration {
+        Some(_) => "`locate` answers in one pass off the calibrated head vote, over text states up to its measured length",
+        None => "no calibrated `locate` heads for this artifact: `/v1/decide` refuses a `locate`",
+    }
 }
 
 /// [`LoadMethods`] for a load with `calibration`, with or without vision.
@@ -649,8 +700,9 @@ impl<'de> Deserialize<'de> for Criteria {
     }
 }
 
-/// The seven primitives: Jev's three, which read one position, and the four
-/// that **generate** (GitHub #242, #255).
+/// The eight primitives: Jev's three, which read one position, the four that
+/// **generate** (GitHub #242, #255), and `locate`, which reads attention
+/// (GitHub #275).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum QuestionKind {
@@ -672,6 +724,10 @@ pub enum QuestionKind {
     /// Four numbers: a bounding box on the submitted image.
     #[serde(rename = "box")]
     Box,
+    /// The segment of a text `state` the instruction names — a line of a
+    /// string or an element of an array, `within` a JSON Pointer — read from
+    /// the calibrated heads' attention in one prefill (GitHub #275).
+    Locate,
 }
 
 impl QuestionKind {
@@ -690,6 +746,7 @@ impl QuestionKind {
             Self::Scalar => crate::metrics::Primitive::Scalar,
             Self::Point => crate::metrics::Primitive::Point,
             Self::Box => crate::metrics::Primitive::Box,
+            Self::Locate => crate::metrics::Primitive::Locate,
         }
     }
 
@@ -700,7 +757,7 @@ impl QuestionKind {
             // A scalar generates, but not over axes: its plan is
             // `crate::scalar`'s, so it has no layout here and
             // `is_constrained` cannot be `layout().is_some()` any more.
-            Self::Noul | Self::Choice | Self::Score | Self::Scalar => None,
+            Self::Noul | Self::Choice | Self::Score | Self::Scalar | Self::Locate => None,
             Self::Number => Some(crate::numbers::NUMBER_LAYOUT),
             Self::Point => Some(crate::numbers::POINT_LAYOUT),
             Self::Box => Some(crate::numbers::BOX_LAYOUT),
@@ -739,6 +796,10 @@ impl QuestionKind {
             Self::Point => crate::numbers::point_system(digits),
             Self::Box => crate::numbers::box_system(digits),
             Self::Noul | Self::Choice | Self::Score => DIRECT_SYSTEM.to_owned(),
+            // Layout L1 (spec 17): a `locate`'s system message is the
+            // evidence alone, and its kind text leads the user turn
+            // (`crate::locate::user_text`).
+            Self::Locate => String::new(),
         }
     }
 }
@@ -810,6 +871,9 @@ pub struct PreparedQuestion {
     /// where every head number was measured. A head `box` is read in that
     /// same pass. Only the schedule goes unused.
     pub head: Option<ignis_core::pointing::Calibration>,
+    /// The JSON Pointer a `locate` searches (GitHub #275) — empty for the
+    /// whole state — and `None` for every other primitive.
+    pub within: Option<String>,
 }
 
 impl PreparedQuestion {
@@ -897,6 +961,18 @@ fn prepare_one(
         ));
     }
     let head = head_reading(id, question, pointing)?;
+    if question.within.is_some() && question.kind != QuestionKind::Locate {
+        return Err(Refusal::new(
+            "within_unsupported",
+            format!(
+                "question {id:?} is a {}: `within` names the part of the state a `locate` searches",
+                question.kind.primitive().label()
+            ),
+        ));
+    }
+    if question.kind == QuestionKind::Locate {
+        return prepare_locate(id, question);
+    }
     if question.kind == QuestionKind::Scalar {
         return prepare_scalar(id, question, encode);
     }
@@ -922,12 +998,13 @@ fn prepare_one(
         QuestionKind::Noul => noul_options(id, question.criteria.as_ref())?,
         QuestionKind::Choice => choice_options(id, question.criteria.as_ref())?,
         QuestionKind::Score => score_options(id, question.criteria.as_ref())?,
-        // Unreachable: `prepare_one` returns above for the scalar and for
-        // every kind with a layout, which is exactly these four.
+        // Unreachable: `prepare_one` returns above for `locate`, the scalar
+        // and every kind with a layout, which is exactly these five.
         QuestionKind::Scalar
         | QuestionKind::Number
         | QuestionKind::Point
-        | QuestionKind::Box => Vec::new(),
+        | QuestionKind::Box
+        | QuestionKind::Locate => Vec::new(),
     };
     if options.len() > MAX_OPTIONS {
         return Err(Refusal::new(
@@ -958,6 +1035,39 @@ fn prepare_one(
         scalar: None,
         digits: 0,
         head: None,
+        within: None,
+    })
+}
+
+/// Validate a `locate` question (GitHub #275): it declares no options and
+/// generates no digits, so `criteria` and `digits` are refused rather than
+/// ignored, as `method` already is. Where it searches, and whether this load
+/// can answer it at all, are the state's and the load's to say, before any
+/// prefill ([`serve`]).
+fn prepare_locate(id: &str, question: &Question) -> Result<PreparedQuestion, Refusal> {
+    if question.criteria.is_some() {
+        return Err(Refusal::new(
+            "criteria_unsupported",
+            format!("question {id:?} is a locate: its options are the state's own segments, so `criteria` cannot be honoured"),
+        ));
+    }
+    if question.digits.is_some() {
+        return Err(Refusal::new(
+            "digits_unsupported",
+            format!("question {id:?} is a locate and generates nothing, so `digits` cannot be honoured"),
+        ));
+    }
+    Ok(PreparedQuestion {
+        id: id.to_owned(),
+        kind: question.kind,
+        instructions: question.instructions.clone(),
+        options: Vec::new(),
+        answers: Vec::new(),
+        plan: None,
+        scalar: None,
+        digits: 0,
+        head: None,
+        within: Some(question.within.clone().unwrap_or_default()),
     })
 }
 
@@ -1067,6 +1177,7 @@ fn prepare_scalar(
         scalar: Some(std::sync::Arc::new(plan)),
         digits,
         head: None,
+        within: None,
     })
 }
 
@@ -1118,6 +1229,7 @@ fn prepare_program(
         scalar: None,
         digits,
         head: None,
+        within: None,
     })
 }
 
@@ -1501,7 +1613,7 @@ pub struct Usage {
 }
 
 /// One question's answer, or the error that stands in its place.
-#[derive(Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
     /// A yes/no answer: the probability of the true option, 0 (no) to 1
@@ -1612,6 +1724,29 @@ pub enum Answer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         digits: Option<BTreeMap<String, Vec<crate::numbers::DigitDraw>>>,
     },
+    /// The segment of the `state` the instruction names (GitHub #275): its
+    /// index — the 0-based line of `split("\n")` for a string, the element's
+    /// index for an array — and `value`, the segment exactly as the caller
+    /// sent it.
+    ///
+    /// Read in one prefill from a vote of the calibrated heads: each head
+    /// names the segment the question lifts its attention onto most, over a
+    /// content-free twin of the same prompt, and the most-voted segment is
+    /// the answer. `confidence` is the winner's share of the votes and
+    /// `ranking` the voted segments by votes, at most five, each with its
+    /// share. **How much the heads agree, not a calibrated probability**: on
+    /// set D the vote read 94.2% of the questions a labelled `choice` could
+    /// answer, and its confidence separated them from questions whose answer
+    /// was absent at an AUC of 0.73
+    /// (`docs/findings/2026-09-27-locate-by-head-vote-go.md`). There is no
+    /// "not found": an absent answer still names a segment.
+    Locate {
+        segment: usize,
+        #[schema(value_type = serde_json::Value)]
+        value: OrderedValue,
+        confidence: f64,
+        ranking: Vec<LocateRank>,
+    },
     /// This question alone failed at *runtime*, after the GPU was already
     /// spent on its siblings (spec 04).
     ///
@@ -1623,6 +1758,14 @@ pub enum Answer {
     /// siblings' answers are already paid for, and discarding them to
     /// report one fault helps nobody.
     Error { code: String, message: String },
+}
+
+/// One segment of a `locate`'s ranking (GitHub #275): its index and its share
+/// of the heads' votes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct LocateRank {
+    pub segment: usize,
+    pub share: f64,
 }
 
 /// The region a head point was read from (GitHub #260).
@@ -1913,6 +2056,12 @@ pub fn answer_for(question: &PreparedQuestion, readout: &Readout) -> Answer {
             "not_a_readout",
             "this question generates its answer and reads no position".to_owned(),
         ),
+        // A `locate` is read off attention (`locate_answer_for`); reaching
+        // here is a wrong route, answered rather than panicked on.
+        QuestionKind::Locate => failed(
+            "not_a_readout",
+            "this question reads attention, not an answer position".to_owned(),
+        ),
         QuestionKind::Score => Answer::Score {
             score: expected_level(&probabilities),
             legend: question
@@ -2001,7 +2150,9 @@ pub fn score_confidence(probabilities: &[f64]) -> f64 {
     summary = "A typed decision, read rather than generated",
     description = "Evaluates `state` against typed `questions` and answers each one from the model's own readout at a single position (ADR 0034): the decision is read out of the forward pass, not generated, so `usage.output_tokens` is 0 for the readout kinds.
 
-Seven primitives. Read at one position: `noul` (yes/no, answered with the probability of yes), `choice` (one option from a declared set, with the distribution over all of them) and `score` (a probability-weighted value across ordered levels, which can land between them). Generated a digit at a time under a constrained decode: `number`, `point` and `box` -- the last two in the submitted image's own pixels -- and `scalar`, which closes its own object as soon as the number is complete, so `digits` is a ceiling the caller can leave out and the answer may have a decimal part.
+Eight primitives. Read at one position: `noul` (yes/no, answered with the probability of yes), `choice` (one option from a declared set, with the distribution over all of them) and `score` (a probability-weighted value across ordered levels, which can land between them). Generated a digit at a time under a constrained decode: `number`, `point` and `box` -- the last two in the submitted image's own pixels -- and `scalar`, which closes its own object as soon as the number is complete, so `digits` is a ceiling the caller can leave out and the answer may have a decimal part. Read from attention: `locate`.
+
+A `locate` (ADR 0041) names the **segment** of a JSON `state` the instruction asks for -- a line of a string, split on `\\n`, or an element of an array, `within` an optional JSON Pointer -- without writing anything into the state and without generating: one prefill reads a vote of the loaded artifact's calibrated attention heads at a forced `{\"quote\":\"`, and a second, content-free prefill of the same state with the instruction `N/A` (one per `within`, shared by every `locate` over it, counted in `usage.input_tokens`) is subtracted. The answer is the segment's index, its `value` as the caller sent it, a `ranking` of the voted segments and a `confidence` -- the winner's share of the votes, not a calibrated probability. A target longer than the span the vote was measured on is refused (`locate_too_long`), as is a `locate` on a load calibrated for none (`locate_uncalibrated`).
 
 A `point` is answered **in one pass** by default (ADR 0038, ADR 0039): the prefill that forces its `{\"x\":` reads the loaded artifact's calibrated heads over the image and the server turns their maps into an answer, with no decode round (`method: head`). The pointing head names which object -- its `region.share` is the confidence to act on, and a near-flat map (about 0.03) is nothing found -- and the head set outlines it: the point is the centre of the object's `extent`, which the answer carries as `x0`, `y0`, `x1`, `y1` in pixels of the submitted image. Its `uncertainty` is one image token per axis. A load calibrated with the pointing head alone answers without `extent`, at the part of the object that head reads. `\"method\": \"chain\"` asks for the digit chain instead -- finer than one token, with a per-digit trace -- and a load with no calibrated head answers every `point` by chain.
 
@@ -2016,7 +2167,7 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
     responses(
         (status = 200, description = "One answer per question, under the ids the caller chose.", body = DecideResponse),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
-        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`). Nothing reached the engine.",
+        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), or it is longer than the vote was measured on (`locate_too_long`); `criteria`, `digits` and `method` on a `locate`, and `within` on anything else, are refused too. Nothing reached the engine.",
             body = crate::api::ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted.", body = crate::api::ApiError),
     ),
@@ -2095,11 +2246,39 @@ async fn serve(
         ));
     }
 
+    // GitHub #275: a `locate` reads the segments of a JSON state, and only on
+    // a load calibrated for it. Both are the request's to know before any
+    // prefill, whatever else it asks.
+    let locates = prepared.iter().any(|question| question.kind == QuestionKind::Locate);
+    let locate = match (locates, server.locate) {
+        (false, _) => None,
+        (true, None) => {
+            return Err(Refusal::new(
+                "locate_uncalibrated",
+                format!(
+                    "the loaded artifact ({}) has no calibrated `locate` heads, and a `locate` is never answered by heads chosen for another model",
+                    server.engine.artifact()
+                ),
+            ));
+        }
+        (true, Some(calibration)) => Some(calibration),
+    };
+    if locates && matches!(evidence, Evidence::Parts(_)) {
+        return Err(Refusal::new(
+            "locate_needs_json_state",
+            "a `locate` reads the lines of a string or the elements of an array, and this `state` is content parts; send the text as a JSON string or array",
+        ));
+    }
+
     // Render every question first. This is the last thing that can refuse
     // the whole request, and it is all CPU: the chat template, the
     // instruction policy and — for an image — the media acquisition and
     // the placeholder expansion.
     let mut rendered = Vec::with_capacity(prepared.len());
+    let mut plans: Vec<Option<LocatePlan>> = Vec::with_capacity(prepared.len());
+    // GitHub #275: one content-free baseline per `locate` target, shared by
+    // every `locate` over it — rendered with the questions, asked after them.
+    let mut baselines: Vec<Baseline> = Vec::new();
     // GitHub #270: a parts `state`'s reuse boundaries are cut where its parts
     // end, and each end costs a tokenization of everything before it. Only
     // the first question under each system text needs them: the rest share
@@ -2107,10 +2286,23 @@ async fn serve(
     // which covers every one of those ends, and their run ends are its keys.
     let mut systems = std::collections::BTreeSet::new();
     for question in &prepared {
-        let first_of_kind = systems.insert(question.prompt_kind().system_text(question.digits));
-        let part_ends = first_of_kind && matches!(evidence, Evidence::Parts(_));
-        rendered.push(render(server, &evidence, question, model.clone(), part_ends).await?);
+        match (locate, &evidence) {
+            (Some(calibration), Evidence::Json(state)) if question.kind == QuestionKind::Locate => {
+                let (ready, plan) =
+                    render_locate(server, state, question, model.clone(), calibration, &mut baselines).await?;
+                rendered.push(ready);
+                plans.push(Some(plan));
+            }
+            _ => {
+                let first_of_kind = systems.insert(question.prompt_kind().system_text(question.digits));
+                let part_ends = first_of_kind && matches!(evidence, Evidence::Parts(_));
+                rendered.push(render(server, &evidence, question, model.clone(), part_ends).await?);
+                plans.push(None);
+            }
+        }
     }
+    let asked_questions = rendered.len();
+    rendered.extend(baselines.into_iter().map(|baseline| baseline.ready));
     // GitHub #270: where each question's state is kept for a later one. Held
     // until the handler is done, answered or dropped, so a fan-out's head
     // never outlives the fan-out.
@@ -2134,19 +2326,24 @@ async fn serve(
     // it and prefill only their own tail.
     //
     // After that there is nothing left to serialize, so the followers run
-    // together, [`FAN_OUT_WIDTH`] of them at a time.
-    let mut questions = prepared.iter().zip(rendered);
-    let mut answers = BTreeMap::new();
-    if let Some((question, ready)) = questions.next() {
+    // together, [`FAN_OUT_WIDTH`] of them at a time. A `locate`'s baseline
+    // (GitHub #275) is one more follower: it claims the state like any
+    // sibling, and is answered with the questions that read it.
+    let collect = |slot: usize| match prepared.get(slot) {
+        Some(question) if question.kind != QuestionKind::Locate => Collect::Answer(question),
+        _ => Collect::Rows,
+    };
+    let mut replies: Vec<Option<Reply>> = (0..rendered.len()).map(|_| None).collect();
+    let mut queue = rendered.into_iter().enumerate();
+    if let Some((slot, ready)) = queue.next() {
         // A first question the engine has no room for leaves the fan-out
         // with no prefix to share, but it is still one question's failure
         // and not the request's — the same slot an engine-full follower
         // gets, and the same one the sequential loop before #240 gave it.
-        let answer = match ask(server, question, ready, class).await {
-            Attempt::Answered(answer) => answer,
-            Attempt::Full(_) => engine_full(),
-        };
-        answers.insert(question.id.clone(), answer);
+        replies[slot] = Some(match ask(server, collect(slot), ready, class).await {
+            Attempt::Answered(reply) => reply,
+            Attempt::Full(_) => Reply::engine_full(collect(slot)),
+        });
     }
 
     // The followers, in waves, with whatever the engine turned away put
@@ -2160,31 +2357,66 @@ async fn serve(
     // instead — a wave that answers even one question makes room for them.
     // A wave where *nothing* got in is an engine with no room at all, and
     // that is reported rather than spun on.
-    let mut pending: std::collections::VecDeque<_> = questions.collect();
+    let mut pending: std::collections::VecDeque<_> = queue.collect();
     while !pending.is_empty() {
         let wave: Vec<_> = (0..FAN_OUT_WIDTH.min(pending.len()))
             .filter_map(|_| pending.pop_front())
             .collect();
-        let asked: Vec<&PreparedQuestion> = wave.iter().map(|(question, _)| *question).collect();
+        let slots: Vec<usize> = wave.iter().map(|(slot, _)| *slot).collect();
         let run = wave
             .into_iter()
-            .map(|(question, ready)| ask(server, question, ready, class))
+            .map(|(slot, ready)| ask(server, collect(slot), ready, class))
             .collect();
         let mut answered_one = false;
-        for (question, attempt) in asked.into_iter().zip(concurrently(run).await) {
+        for (slot, attempt) in slots.into_iter().zip(concurrently(run).await) {
             match attempt {
-                Attempt::Answered(answer) => {
-                    answers.insert(question.id.clone(), answer);
+                Attempt::Answered(reply) => {
+                    replies[slot] = Some(reply);
                     answered_one = true;
                 }
-                Attempt::Full(ready) => pending.push_back((question, ready)),
+                Attempt::Full(ready) => pending.push_back((slot, ready)),
             }
         }
         if !answered_one {
-            for (question, _) in pending.drain(..) {
-                answers.insert(question.id.clone(), engine_full());
+            for (slot, _) in pending.drain(..) {
+                replies[slot] = Some(Reply::engine_full(collect(slot)));
             }
         }
+    }
+
+    // Every question's answer: its own reply, or — for a `locate` — its rows
+    // read against its baseline's (GitHub #275).
+    let mut answers = BTreeMap::new();
+    for (slot, question) in prepared.iter().enumerate() {
+        let reply = replies[slot].take().expect("every question was asked");
+        let answer = match (reply, &plans[slot], locate) {
+            (Reply::Answer(answer), _, _) => answer,
+            (Reply::Rows(asked), Some(plan), Some(calibration)) => {
+                let baseline = match replies.get(asked_questions + plan.baseline) {
+                    Some(Some(Reply::Rows(rows))) => rows.clone(),
+                    _ => Err(failed("not_completed", "this `locate`'s content-free baseline was never asked".to_owned())),
+                };
+                let answer = match (asked, baseline) {
+                    (Ok(asked), Ok(baseline)) => {
+                        locate_answer_for(&plan.keys, &plan.values, calibration.heads.len(), &asked, &baseline)
+                    }
+                    (Err(failure), _) => failure,
+                    (Ok(_), Err(Answer::Error { code, message })) => Answer::Error {
+                        code,
+                        message: format!("its content-free baseline: {message}"),
+                    },
+                    (Ok(_), Err(other)) => other,
+                };
+                if let (Answer::Locate { .. }, Some(metrics)) = (&answer, &server.metrics) {
+                    // Counted like a head point: a decision with no answer
+                    // mass (ADR 0017). Its baseline is not a decision.
+                    metrics.record_decision(question.kind.primitive(), None);
+                }
+                answer
+            }
+            (Reply::Rows(_), _, _) => failed("not_a_readout", "this question read attention it has no plan for".to_owned()),
+        };
+        answers.insert(question.id.clone(), answer);
     }
     log_decision(&prepared, &answers, class, input_tokens, started);
     let output_tokens = generated(&prepared, &answers);
@@ -2384,8 +2616,12 @@ async fn render(
         ..crate::thinking::ThinkingOptions::default()
     };
     let params = ignis_core::types::DecodeParams::default();
-    let crate::api::PreparedRequest { mut input, model, mut prompt_tokens, media, part_ends } =
-        crate::api::prepare_decision_request(server, model, &messages, params, &thinking, part_ends)
+    let structure = match part_ends {
+        true => crate::api::Structure::PartEnds,
+        false => crate::api::Structure::Tokens,
+    };
+    let crate::api::PreparedRequest { mut input, model, mut prompt_tokens, media, part_ends, .. } =
+        crate::api::prepare_decision_request(server, model, &messages, params, &thinking, structure)
             .await
             .map_err(|(code, message)| {
                 Refusal::new(code, format!("question {:?}: {message}", question.id))
@@ -2665,6 +2901,228 @@ fn head_query(
     }
 }
 
+/// What a `locate` is answered from once its rows are back (GitHub #275):
+/// each segment's keys over the span the heads read, each segment's value,
+/// and which baseline is its content-free twin.
+struct LocatePlan {
+    keys: Vec<Option<std::ops::Range<usize>>>,
+    values: Vec<OrderedValue>,
+    baseline: usize,
+}
+
+/// A `locate` target's **content-free** prefill (GitHub #275): the same
+/// state, kind text and scaffold with the instruction `N/A`, rendered once
+/// per `within` and read by every `locate` over it. What the heads do with
+/// the state when nothing is asked, which the vote subtracts.
+struct Baseline {
+    within: String,
+    span: std::ops::Range<usize>,
+    keys: Vec<Option<std::ops::Range<usize>>>,
+    ready: Rendered,
+}
+
+/// One `locate` prompt, rendered as the vote was calibrated.
+struct LocatePrompt {
+    ready: Rendered,
+    span: std::ops::Range<usize>,
+    keys: Vec<Option<std::ops::Range<usize>>>,
+    values: Vec<OrderedValue>,
+}
+
+/// Render a `locate` and, the first time its target is met, the target's
+/// content-free baseline (GitHub #275). A question whose keys are not its
+/// baseline's — the two prompts share every byte up to the instruction, so
+/// they never should — is answered here with that error and not submitted.
+async fn render_locate(
+    server: &crate::Server,
+    state: &OrderedValue,
+    question: &PreparedQuestion,
+    model: Option<String>,
+    calibration: ignis_core::locate::LocateCalibration,
+    baselines: &mut Vec<Baseline>,
+) -> Result<(Rendered, LocatePlan), Refusal> {
+    let within = question.within.as_deref().unwrap_or("");
+    let mut prompt =
+        locate_prompt(server, state, within, &question.instructions, &question.id, model.clone(), calibration).await?;
+    let baseline = match baselines.iter().position(|baseline| baseline.within == within) {
+        Some(index) => index,
+        None => {
+            let content_free = OrderedValue::String(crate::locate::CONTENT_FREE.to_owned());
+            let twin = locate_prompt(server, state, within, &content_free, &question.id, model, calibration).await?;
+            baselines.push(Baseline { within: within.to_owned(), span: twin.span, keys: twin.keys, ready: twin.ready });
+            baselines.len() - 1
+        }
+    };
+    let twin = &baselines[baseline];
+    if (&twin.span, &twin.keys) != (&prompt.span, &prompt.keys) {
+        prompt.ready.answered = Some(failed(
+            "locate_baseline_misaligned",
+            "the content-free baseline's prompt maps the state onto other keys than this question's, so the two cannot be read against each other".to_owned(),
+        ));
+    }
+    Ok((prompt.ready, LocatePlan { keys: prompt.keys, values: prompt.values, baseline }))
+}
+
+/// One `locate` prompt over `state` with `instruction`, as the vote was
+/// calibrated (spec 18, GitHub #275): layout L1 — the evidence alone in the
+/// system message, the kind text and the instruction in the user turn — the
+/// copy scaffold forced, and the readout naming the vote's heads, in whole
+/// rows, over the state's key span.
+///
+/// Everything a caller could have got wrong is refused here, before any
+/// prefill: a `within` that names no segmentable target, fewer than two
+/// segments that own a key, a span past the ceiling the vote was measured
+/// to hold at, a prompt past the context.
+async fn locate_prompt(
+    server: &crate::Server,
+    state: &OrderedValue,
+    within: &str,
+    instruction: &OrderedValue,
+    id: &str,
+    model: Option<String>,
+    calibration: ignis_core::locate::LocateCalibration,
+) -> Result<LocatePrompt, Refusal> {
+    use crate::locate::TargetError;
+    let target = crate::locate::evidence_within(state, within).map_err(|error| {
+        let code = match error {
+            TargetError::Malformed(_) => "locate_within_malformed",
+            TargetError::NotFound(_) => "locate_within_not_found",
+            TargetError::Ambiguous(_) => "locate_within_ambiguous",
+            TargetError::Unsegmentable { .. } => "locate_target_unsegmentable",
+        };
+        Refusal::new(code, format!("question {id:?}: {error}"))
+    })?;
+    let messages = vec![
+        ChatMessage::text("system", target.system.clone()),
+        ChatMessage::text("user", crate::locate::user_text(target.unit, instruction)),
+    ];
+    let thinking = crate::thinking::ThinkingOptions {
+        enable_thinking: false,
+        ..crate::thinking::ThinkingOptions::default()
+    };
+    let params = ignis_core::types::DecodeParams::default();
+    let crate::api::PreparedRequest { mut input, model, mut prompt_tokens, media, text, .. } =
+        crate::api::prepare_decision_request(server, model, &messages, params, &thinking, crate::api::Structure::Text)
+            .await
+            .map_err(|(code, message)| Refusal::new(code, format!("question {id:?}: {message}")))?;
+    let unsupported = || {
+        Refusal::new(
+            "locate_unsupported",
+            format!("question {id:?}: this load's template cannot say where its tokens sit, so the state's segments cannot be mapped onto keys"),
+        )
+    };
+    let text = text.filter(|text| text.offsets.len() == input.tokens.len()).ok_or_else(unsupported)?;
+    let opening = server.template.encode_literal(crate::locate::COPY_OPENING).ok_or_else(unsupported)?;
+    let (span, keys) = crate::locate::map_segments(&text.text, &text.offsets, &target)
+        .map_err(|message| Refusal::new("render_failed", format!("question {id:?}: {message}")))?;
+    let owning = keys.iter().flatten().count();
+    if owning < 2 {
+        return Err(Refusal::new(
+            "locate_too_few_segments",
+            format!(
+                "question {id:?}: {owning} of the target's {} segments own a token of the prompt, and a `locate` chooses between at least two",
+                keys.len()
+            ),
+        ));
+    }
+    if span.len() > calibration.max_keys as usize {
+        return Err(Refusal::new(
+            "locate_too_long",
+            format!(
+                "question {id:?}: the target spans {} tokens, past the {} a `locate` was measured to hold at on this artifact",
+                span.len(),
+                calibration.max_keys
+            ),
+        ));
+    }
+    prompt_tokens = prompt_tokens.saturating_add(opening.len() as u32);
+    if prompt_tokens > server.engine.max_model_len() {
+        return Err(Refusal::new(
+            "context_exceeded",
+            format!(
+                "question {id:?} renders {prompt_tokens} prompt tokens with its forced scaffold, past this engine's {} context",
+                server.engine.max_model_len()
+            ),
+        ));
+    }
+    // The scaffold the heads are read at, forced as text the model appears
+    // to have written; the readout sits at its last token.
+    input.tokens.extend_from_slice(&opening);
+    input.decision = Some(ignis_core::DecisionRead::Attention(ignis_core::pointing::AttentionQuery {
+        head: calibration.heads[0],
+        key_begin: span.start as u32,
+        key_count: span.len() as u32,
+        set: Some(ignis_core::pointing::SetQuery::rows(calibration.heads)),
+    }));
+    Ok(LocatePrompt {
+        ready: Rendered { input, model, prompt_tokens, media, grid: None, part_ends: Vec::new(), answered: None },
+        span,
+        keys,
+        values: target.values,
+    })
+}
+
+/// Shape a `locate`'s rows, and its content-free baseline's, into its answer
+/// (GitHub #275): the head vote ([`ignis_core::locate::read_vote`]) over each
+/// segment's `keys`, with the winner's `value` as the caller sent it. Rows
+/// that did not come back whole — either prefill's — are the question's
+/// failure, never a segment.
+pub fn locate_answer_for(
+    keys: &[Option<std::ops::Range<usize>>],
+    values: &[OrderedValue],
+    heads: usize,
+    question: &ignis_core::pointing::AttentionScores,
+    baseline: &ignis_core::pointing::AttentionScores,
+) -> Answer {
+    let reading = match (question.set_rows.as_deref(), baseline.set_rows.as_deref()) {
+        (Some(asked), Some(content_free)) => ignis_core::locate::read_vote(asked, content_free, heads, keys),
+        _ => None,
+    };
+    match reading {
+        Some(reading) if reading.winner < values.len() => Answer::Locate {
+            segment: reading.winner,
+            value: values[reading.winner].clone(),
+            confidence: reading.confidence,
+            ranking: reading
+                .ranking
+                .into_iter()
+                .map(|(segment, share)| LocateRank { segment, share })
+                .collect(),
+        },
+        _ => failed(
+            "attention_malformed",
+            format!(
+                "the heads' rows were not {heads} whole rows over the state's key span in both the question's prefill and its content-free baseline's"
+            ),
+        ),
+    }
+}
+
+/// How one asked prompt's completion is collected (GitHub #275): into its
+/// question's answer, or — for a `locate` and its content-free baseline —
+/// into the heads' rows, which only the two together answer.
+#[derive(Clone, Copy)]
+enum Collect<'a> {
+    Answer(&'a PreparedQuestion),
+    Rows,
+}
+
+/// What one asked prompt came back with.
+enum Reply {
+    Answer(Answer),
+    Rows(Result<ignis_core::pointing::AttentionScores, Answer>),
+}
+
+impl Reply {
+    /// The reply of a prompt the engine had no room for.
+    fn engine_full(collect: Collect<'_>) -> Self {
+        match collect {
+            Collect::Answer(_) => Self::Answer(engine_full()),
+            Collect::Rows => Self::Rows(Err(engine_full())),
+        }
+    }
+}
+
 /// Put one rendered question to the model and shape its answer.
 ///
 /// A failure here is per-question by design (spec 04): the engine already
@@ -2673,14 +3131,14 @@ fn head_query(
 /// could have got wrong was refused before any of this ran.
 async fn ask(
     server: &crate::Server,
-    question: &PreparedQuestion,
+    collect: Collect<'_>,
     mut ready: Rendered,
     class: ignis_core::types::RequestClass,
 ) -> Attempt {
     // GitHub #260: a head question over a state with no image fails as the
     // chain's does, and costs nothing — there is no span to read.
     if let Some(answer) = ready.answered.take() {
-        return Attempt::Answered(answer);
+        return Attempt::Answered(Reply::Answer(answer));
     }
     // Cloned because `submit_with_media` consumes what it takes and a
     // `Full` has to be retriable: a prompt's worth of token ids beside a
@@ -2694,16 +3152,48 @@ async fn ask(
         // Not an answer. The engine is saying "not now", and a fan-out's
         // own siblings are the likeliest reason.
         Err(ignis_core::SubmitError::Full) => return Attempt::Full(ready),
-        Err(error) => return Attempt::Answered(failed("submit_failed", format!("{error:?}"))),
+        Err(error) => {
+            let failure = failed("submit_failed", format!("{error:?}"));
+            return Attempt::Answered(match collect {
+                Collect::Answer(_) => Reply::Answer(failure),
+                Collect::Rows => Reply::Rows(Err(failure)),
+            });
+        }
     };
     // The engine keeps working on a request whose caller has gone until it
     // is told otherwise, and a fan-out is twenty of them.
     let mut guard = crate::api::CancelOnDrop::new(server.engine.clone(), id);
+    // GitHub #275: a `locate`'s completion, or its baseline's, carries the
+    // heads' rows, which are an answer only beside the other's.
+    let question = match collect {
+        Collect::Answer(question) => question,
+        Collect::Rows => {
+            return Attempt::Answered(Reply::Rows(
+                match crate::engine::collect_attention(&mut events, server.request_timeout).await {
+                    Ok(Some(attention)) => {
+                        guard.completed();
+                        Ok(attention)
+                    }
+                    Ok(None) => {
+                        guard.completed();
+                        Err(failed(
+                            "attention_unread",
+                            "the engine finished this `locate` without the heads' rows over the state: the keys were not where an armed layer's attention materialized them, or the prefill itself failed".to_owned(),
+                        ))
+                    }
+                    Err(_) => Err(failed(
+                        "not_completed",
+                        "the engine did not answer this question in time".to_owned(),
+                    )),
+                },
+            ));
+        }
+    };
     // GitHub #260, #263: a head question's completion carries the attention
     // readout.
     if let (Some(_), Some(grid)) = (question.head, ready.grid) {
         let pixels = ready.media.and_then(|stats| stats.source_pixels);
-        return Attempt::Answered(
+        return Attempt::Answered(Reply::Answer(
             match crate::engine::collect_attention(&mut events, server.request_timeout).await {
                 Ok(Some(attention)) => {
                     guard.completed();
@@ -2730,14 +3220,14 @@ async fn ask(
                     "the engine did not answer this question in time".to_owned(),
                 ),
             },
-        );
+        ));
     }
     // GitHub #242: a run's completion carries a trace, not a readout,
     // so `collect_readout` would report every one of them as never
     // completed.
     if question.kind.is_constrained() {
         let pixels = ready.media.and_then(|stats| stats.source_pixels);
-        return Attempt::Answered(
+        return Attempt::Answered(Reply::Answer(
             match crate::engine::collect_draws(&mut events, server.request_timeout).await {
                 Ok(drawn) => {
                     guard.completed();
@@ -2755,9 +3245,9 @@ async fn ask(
                     "the engine did not answer this question in time".to_owned(),
                 ),
             },
-        );
+        ));
     }
-    Attempt::Answered(
+    Attempt::Answered(Reply::Answer(
         match crate::engine::collect_readout(&mut events, server.request_timeout).await {
             Ok(readout) => {
                 guard.completed();
@@ -2776,13 +3266,13 @@ async fn ask(
                 "the engine did not answer this question in time".to_owned(),
             ),
         },
-    )
+    ))
 }
 
-/// What one attempt at a question produced: an answer, or the unsubmitted
+/// What one attempt at a question produced: its reply, or the unsubmitted
 /// question back because the engine had no room for it.
 enum Attempt {
-    Answered(Answer),
+    Answered(Reply),
     Full(Rendered),
 }
 

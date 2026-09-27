@@ -173,16 +173,20 @@ impl ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
         part_ends: bool,
+        text: bool,
     ) -> Result<RenderedPrompt, TemplateRejection> {
         Self::validate_roles(messages)?;
         let prompt = match self.render(messages, options, tools) {
             Ok(prompt) => prompt,
             Err(err) => return Err(TemplateRejection { code: "render_failed", message: err }),
         };
-        let tokens = match self.set.tokenizer().encode(&prompt) {
-            Ok(ids) => ids,
-            Err(err) => return Err(TemplateRejection { code: "render_failed", message: err.to_string() }),
-        };
+        // GitHub #275: with the text asked for, the tokens and their byte
+        // offsets come from one tokenization, so they cannot disagree.
+        let (tokens, offsets) = match text {
+            true => self.set.tokenizer().encode_with_offsets(&prompt).map(|(ids, offsets)| (ids, Some(offsets))),
+            false => self.set.tokenizer().encode(&prompt).map(|ids| (ids, None)),
+        }
+        .map_err(|err| TemplateRejection { code: "render_failed", message: err.to_string() })?;
         let opener_tokens = self.opener_tokens(&prompt, &tokens);
         let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
         let system_block_tokens = self.system_block_tokens(messages, &prompt, &tokens);
@@ -200,6 +204,7 @@ impl ArtifactTemplateProvider {
             user_turn_tokens,
             system_block_tokens,
             part_ends,
+            text: offsets.map(|offsets| crate::template::PromptText { text: prompt, offsets }),
         })
     }
 
@@ -261,6 +266,7 @@ impl ArtifactTemplateProvider {
             user_turn_tokens: user_turn_tokens.or(user_query.filter(|&at| at == 0).map(|_| 0)),
             system_block_tokens,
             part_ends,
+            text: None,
         };
         Ok((rendered, multimodal))
     }
@@ -379,7 +385,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
-        self.render_prompt(messages, options, tools, false)
+        self.render_prompt(messages, options, tools, false, false)
     }
 
     fn apply_chat_template_with_part_ends(
@@ -388,7 +394,16 @@ impl TemplateProvider for ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
-        self.render_prompt(messages, options, tools, true)
+        self.render_prompt(messages, options, tools, true, false)
+    }
+
+    fn apply_chat_template_with_text(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        self.render_prompt(messages, options, tools, false, true)
     }
 
     fn answer_alphabet(&self) -> ignis_core::decision::AnswerAlphabet {

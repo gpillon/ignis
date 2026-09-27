@@ -10,6 +10,9 @@
 // 3. GitHub #195: the envelope and a speculative backend are independent
 //    options -- a load asking for both reaches the binding and asks for both
 //    scopes, where #178 refused it outright.
+// 5. GitHub #275: `attention_text_max_keys` reserves a text readout's room
+//    -- its scores, the set's results and 32 whole rows -- with or without
+//    vision.
 // 4. The item bound: `vision_item_max_tokens` sizes the encoder's workspace
 //    for one item of that many merged tokens (never past the envelope) and
 //    leaves the embedding pool at the envelope's floor; without an envelope
@@ -27,6 +30,7 @@
 
 #include "ignis_model.h"
 #include "ignis_seq.h"
+#include "ignis_step.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -296,6 +300,40 @@ int main() {
     const std::string m = load_error(text, &stray);
     check(contains(m, "vision_item_max_tokens"),
           "an item bound without a vision envelope is refused by name: " + m);
+  }
+
+  // --- 5. the text readout's room (GitHub #275, ADR 0041) ------------------
+  // A load told that a readout may read a text span of N keys reserves, in
+  // the one scratch arena, one score per key, the head set's results for the
+  // largest set a readout names, and IGNIS_ATTENTION_MAX_ROW_HEADS whole rows
+  // -- vision or not, and nothing without it.
+  {
+    const auto align = [](std::size_t bytes) { return (bytes + 255) & ~static_cast<std::size_t>(255); };
+    const auto room = [&](std::size_t keys) {
+      return align(keys * 4) + align(384 * 8) + align(384 * 4 * 4) +
+             align(static_cast<std::size_t>(IGNIS_ATTENTION_MAX_ROW_HEADS) * keys * 4);
+    };
+    ignis_model_load_options none{};
+    none.size = sizeof(none);
+    ignis_model_load_options text_room = none;
+    text_room.attention_text_max_keys = 4554;
+    const ignis_model_reservations without = plan(text, none);
+    const ignis_model_reservations with = plan(text, text_room);
+    check(with.workspace_bytes == without.workspace_bytes + room(4554),
+          "a text readout's room is its scores, the set's results and 32 rows: " +
+              std::to_string(with.workspace_bytes - without.workspace_bytes) + " bytes against " +
+              std::to_string(room(4554)));
+    check(with.media_embedding_bytes == 0, "and no vision for it");
+
+    // With vision the two readouts share the room: an item's span wider
+    // than the text span needs only its extra scores.
+    const std::vector<Named> both = concat(text, tower);
+    ignis_model_load_options seeing = vision_items(32768, 16384);
+    const ignis_model_reservations image_only = plan(both, seeing);
+    seeing.attention_text_max_keys = 4554;
+    const ignis_model_reservations image_and_text = plan(both, seeing);
+    check(image_and_text.workspace_bytes >= image_only.workspace_bytes,
+          "a text room never shrinks a vision load's arena");
   }
 
   if (g_failed != 0) {
