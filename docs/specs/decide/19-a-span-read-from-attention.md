@@ -302,18 +302,70 @@ here, to be confirmed by the owner before the run:
   E3 the chosen span reading's token hit is within 5 points of the
   generation route's, and its span F1 within 10, at one prefill (plus the
   baseline's, if chosen) against the generation's decode rounds.
+  *Stopped on the development sets, 2026-09-27*
+  (`docs/findings/2026-09-27-attention-names-the-line-not-the-words.md`):
+  the best one-prefill reading's token hit is 56.3% in nested CV on E1+E2
+  against the generation route's 85.2%, its span F1 22 against 74 — 29 and
+  52 points from the bar. By the rule below, E3 is not run.
 - **Track L (lines, revived).** If a phase 0 or phase 2 reading beats spec
   18's rule-1 choice on A+B's CV, it is judged once on set D against the
   labelled `choice` with spec 18's rule 2 verbatim (within 5 points overall,
   10 on the paraphrase half). A go reopens #275 (spec 18 phase B).
+  **Registered 2026-09-27, after phase 0 and before C or D was read with
+  it** (`docs/findings/2026-09-27-a-head-vote-finds-the-line.md`). Phase 0
+  found such a reading, the **head vote**:
+  - *The reading.* The copy scaffold (`s2`) and its content-free prefill
+    (`s2-na`). Each of K heads names its R1 winner — the segment with its
+    largest share of the head's softmax over the span, less the `-na`
+    prefill's share of the same segment — and the answer is the segment
+    with the most votes; a tie goes to the tied segment named by the
+    best-ranked head. The confidence is the winner's share of the votes.
+    `tools/locate-sets/score.py` reading `vote`.
+  - *The heads*, K = 32, best first, fitted on all of A+B by the procedure
+    below (`.scratch/locate/phase0/vote-choice.json`): L39.h12, L47.h20,
+    L59.h16, L55.h17, L59.h17, L59.h7, L59.h6, L55.h0, L59.h8, L59.h10,
+    L63.h5, L39.h15, L59.h2, L55.h21, L39.h23, L55.h9, L39.h10, L63.h0,
+    L35.h16, L55.h14, L51.h6, L47.h17, L51.h12, L59.h12, L55.h18, L47.h15,
+    L43.h13, L59.h9, L63.h1, L59.h14, L47.h18, L43.h9.
+  - *The procedure.* The heads are the K with the most training hits as R1
+    (score.py's order); scaffold, baseline and K ∈ {1, 3, 5, 8, 16, 32} are
+    the configuration with the most cross-validated hits, ties to fewer
+    heads, then no baseline, then S1. On A+B: plain 5-fold CV 368/402 =
+    91.5%; the whole procedure under nested CV 362/402 = 90.0%; K = 5, 8 and
+    16 within three questions of K = 32. Spec 18's rule-1 choice: 70.4%.
+  - *The rule, spec 18's rule 2 verbatim.* **Go** if on D the vote's top-1
+    is within 5 points of the labelled `choice`'s overall, and within 10 on
+    the paraphrase half, on D's present questions with at most 256 segments.
+    Rules 3 and 4 (the length ceiling and the per-family floors) are
+    computed as spec 18 computes them, for phase B.
+  - *What a go does.* It reopens #275 with the vote as the reading in place
+    of R1 — a head set on the seam, as ADR 0039 did for `box` — and its
+    floors and ceiling from D. A no-go ends track L; the finding records it.
+  - **Result, 2026-09-27: go**
+    (`docs/findings/2026-09-27-locate-by-head-vote-go.md`). On D the vote
+    read 146 of 155 against the labelled `choice`'s 142 (94.2 against
+    91.6%), and 73 of 78 paraphrases against 69 (93.6 against 88.5%);
+    `LOCATE_MAX_KEYS` 4,554; floors logs 41/43, records 43/45, prose 58/67.
+    #275 reopens with the vote as its reading.
+  - *Not binding, reported beside it:* the conditional logit over every
+    head's per-segment lift, both scaffolds (four prefills), 93.3% in nested
+    CV on A+B; and C, read with the frozen vote as a replication only —
+    C chose nothing here, but its failures were read in spec 18, so it
+    cannot judge.
 - **Track H (hybrid).** Judged on D the same way as track L, with its cost
   (two prefills of one shared state against the labelled route's one of a
-  labelled state) reported beside it.
+  labelled state) reported beside it. *After phase 0:* the vote reaches the
+  labelled route's level on A+B by itself, so track H runs only if track L
+  is a no-go (the vote's top-3 recall on A+B is 98.5% in CV, the
+  hybrid's ceiling).
 - **Track P (profiles).** Its rule is proposed at the end of phase 2, from
   what the development sets show — there is no honest bar to write for
   several-span recall or absent detection before any profile is measured —
   and confirmed by the owner before E3 runs. The comparator for several
-  spans is the generation route asked for all of them.
+  spans is the generation route asked for all of them. *Stopped on the
+  development sets, 2026-09-27* (same finding): the vote's peaks give a set
+  F1 of 53 on several-span questions and read at most 35% of the absent
+  ones as empty, where the generation route is exact; no rule was proposed.
 
 A track whose answer is already clear on the development sets stops there:
 no check is run to confirm what they have settled.
@@ -506,6 +558,15 @@ In the repo:
   `docs/findings/2026-09-21-qwen-vl-grounding-primary-sources.md`.
 - `docs/findings/2026-09-26-decision-classes-beyond-the-seven.md` (the
   prior art behind spec 18), and spec 17 (layout L1).
+
+The literature pass (`docs/findings/2026-09-27-span-from-attention-literature.md`,
+§ 10) checked the list below and corrects it: ICR's lexical bias is read from
+the question's own tokens, not from a position after it, so point 4 of § Why
+a second study contradicts nothing; ICR calibrates by subtraction, and no
+attention-relevance paper uses the log-ratio lift; Kobayashi's norm includes
+`W_O`; this model's output gate is a 256-vector per head, not a scalar; an
+induction head's +1 is one token, not one line; TAG is "Tuning-free
+Attention-driven Grounding".
 
 Outside (verify each in the literature pass; these are starting points):
 - ICR, attention-based in-context reranking: arXiv 2410.02642 (content-free

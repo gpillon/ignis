@@ -68,22 +68,24 @@
 
 #[path = "support/locate.rs"]
 mod locate;
+#[path = "support/locate_tap.rs"]
+mod locate_tap;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ignis_artifact::{CudaDevice, FrontendSet, ModelScope, Reader, bind_model_scope_27b_with, materialize};
-use ignis_core::attn_tap::{AttnTapCapture, GQA_LAYERS, KV_HEADS, Q_HEADS, with_attn_tap, with_attn_tap_hq};
+use ignis_core::attn_tap::{GQA_LAYERS, KV_HEADS, Q_HEADS, with_attn_tap, with_attn_tap_hq};
 use ignis_core::compute::ModelConfig;
 use ignis_core::decision::AnswerAlphabet;
 use ignis_core::gpu_profile;
-use ignis_core::hq_ring::{PromptSource, prompt_source, ring_before_chunk};
+use ignis_core::hq_ring::ring_before_chunk;
 use ignis_core::model_load::load_qwen38_27b_with_options;
 use ignis_core::pointing::ATTENTION_MIN_CHUNK_TOKENS;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step;
-use ignis_core::{KvFormat, RopeScaling};
+use ignis_core::RopeScaling;
 use ignis_server::artifact_template::ArtifactTemplateProvider;
 use ignis_server::decide::OrderedValue;
 use ignis_server::template::{ChatMessage, TemplateProvider};
@@ -91,6 +93,7 @@ use ignis_server::thinking::ThinkingOptions;
 use serde::Deserialize;
 
 use locate::{CONTENT_FREE, Scaffold, chunks, evidence, map_segments, user_text};
+use locate_tap::{KvMode, check_layer, f16_bytes, head_scores};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 /// The longest set state, a 1,000-line log, renders about 18K tokens.
@@ -102,13 +105,6 @@ const SERVED_TAIL: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 /// the scorer and printed here as a live signal.
 const POINTING_ORDINAL: usize = 9;
 const POINTING_Q: usize = 10;
-
-/// The consumed capture's self-check bounds, as `attention_head_point_gpu.rs`
-/// sets them: an exact row sits near 0.002-0.004 relative L2 from the rotated
-/// pre-codec key, the codec's rows at a median ~0.37.
-const EXACT_ROW_REL_ERR: f64 = 0.1;
-const CODEC_ROW_MIN_MEDIAN: f64 = 0.2;
-const CODEC_ROW_MAX_MEDIAN: f64 = 0.6;
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -132,36 +128,6 @@ struct Question {
     distractors: Vec<usize>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum KvMode {
-    Bf16,
-    HqConsumed,
-}
-
-impl KvMode {
-    fn from_env() -> Self {
-        match std::env::var("IGNIS_LOCATE_KV").as_deref() {
-            Err(_) | Ok("hq") => Self::HqConsumed,
-            Ok("bf16") => Self::Bf16,
-            Ok(other) => panic!("IGNIS_LOCATE_KV must be hq or bf16, not {other:?}"),
-        }
-    }
-
-    fn format(self) -> KvFormat {
-        match self {
-            Self::Bf16 => KvFormat::Bf16,
-            Self::HqConsumed => KvFormat::HqE8_2b,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Bf16 => "bf16",
-            Self::HqConsumed => "hq",
-        }
-    }
-}
-
 /// The four prefills of one question, in dump order.
 const VARIANTS: [(Scaffold, bool); 4] = [
     (Scaffold::Index, false),
@@ -175,140 +141,6 @@ fn variant_name(scaffold: Scaffold, content_free: bool) -> String {
         false => scaffold.name().to_owned(),
         true => format!("{}-na", scaffold.name()),
     }
-}
-
-fn median(values: &mut [f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-    Some(values[values.len() / 2])
-}
-
-/// f32 to IEEE half, round to nearest even (as `attention_head_point_gpu.rs`
-/// writes its dump).
-fn f32_to_f16(value: f32) -> u16 {
-    let x = value.to_bits();
-    let sign = ((x >> 16) & 0x8000) as u16;
-    let exp = ((x >> 23) & 0xff) as i32;
-    let mant = x & 0x007f_ffff;
-    if exp == 0xff {
-        return sign | 0x7c00 | (if mant != 0 { 0x0200 } else { 0 });
-    }
-    let e = exp - 127 + 15;
-    if e >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if e <= 0 {
-        if e < -10 {
-            return sign;
-        }
-        let m = mant | 0x0080_0000;
-        let shift = (14 - e) as u32;
-        let half = m >> shift;
-        let rem = m & ((1u32 << shift) - 1);
-        let halfway = 1u32 << (shift - 1);
-        let rounded = if rem > halfway || (rem == halfway && half & 1 == 1) { half + 1 } else { half };
-        return sign | rounded as u16;
-    }
-    let half = ((e as u32) << 10) | (mant >> 13);
-    let rem = mant & 0x1fff;
-    let rounded = if rem > 0x1000 || (rem == 0x1000 && half & 1 == 1) { half + 1 } else { half };
-    sign | rounded as u16
-}
-
-/// The consumed capture's self-check on one armed layer and one KV head:
-/// every prompt row classified by the hq route's rule and compared with the
-/// rotated pre-codec key (`attention_head_point_gpu.rs`'s check, per layer).
-/// The failures, and the layer's row counts by class.
-fn check_layer(
-    capture: &AttnTapCapture,
-    layer: usize,
-    kv_head: usize,
-    total: usize,
-    query_chunk_start: usize,
-    ring: &ignis_core::hq_ring::HqRing,
-) -> (Vec<String>, serde_json::Value) {
-    let mut failures = Vec::new();
-    let consumed = capture.consumed_rows[layer] as usize;
-    if consumed != total {
-        failures.push(format!("layer {layer} consumed {consumed} rows, expected {total} (not captured?)"));
-        return (failures, serde_json::Value::Null);
-    }
-    let captured_start = capture.consumed_chunk_start[layer];
-    if captured_start != query_chunk_start as i64 {
-        failures.push(format!(
-            "layer {layer}: the capture's chunk starts at {captured_start}, the prompt's chunking puts \
-             the query's chunk at {query_chunk_start}"
-        ));
-    }
-    let (mut exact, mut codec) = (Vec::new(), Vec::new());
-    let mut off_rule = 0usize;
-    for position in 0..total {
-        let err = f64::from(capture.consumed_key_rel_err(layer, position, kv_head));
-        match prompt_source(position as u64, query_chunk_start as u64, ring) {
-            PromptSource::Fresh | PromptSource::Sink | PromptSource::Ring => {
-                off_rule += usize::from(err >= EXACT_ROW_REL_ERR);
-                exact.push(err);
-            }
-            // The reference's order, never ignis's: off the rule whatever it
-            // measures.
-            PromptSource::Clobbered { .. } => off_rule += 1,
-            PromptSource::Codec => {
-                off_rule += usize::from(err < EXACT_ROW_REL_ERR);
-                codec.push(err);
-            }
-        }
-    }
-    if off_rule > 0 {
-        failures.push(format!(
-            "layer {layer}, KV head {kv_head}: {off_rule} of {total} rows are not what the hq prompt \
-             route's rule says (exact where it keeps a row, decoded where it does not)"
-        ));
-    }
-    // A prompt the residual window covers has no codec row, which is nothing
-    // for the band to check rather than a capture that failed it.
-    let codec_median = median(&mut codec.clone());
-    if let Some(m) = codec_median {
-        if !(CODEC_ROW_MIN_MEDIAN..=CODEC_ROW_MAX_MEDIAN).contains(&m) {
-            failures.push(format!(
-                "layer {layer}, KV head {kv_head}: the decoded keys sit at median rel L2 {m:.4}, outside \
-                 the codec's band [{CODEC_ROW_MIN_MEDIAN}, {CODEC_ROW_MAX_MEDIAN}]"
-            ));
-        }
-    }
-    let stats = serde_json::json!({
-        "exact": exact.len(),
-        "codec": codec.len(),
-        "exact_median": median(&mut exact),
-        "codec_median": codec_median,
-    });
-    (failures, stats)
-}
-
-/// Every armed head's scores over `span`, `[layer][q_head][key]`, one thread
-/// per layer.
-fn span_scores(capture: &AttnTapCapture, kv_mode: KvMode, span: &std::ops::Range<usize>) -> Vec<Vec<f32>> {
-    let positions: Vec<usize> = span.clone().collect();
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..capture.ordinals.len())
-            .map(|layer| {
-                let positions = &positions;
-                scope.spawn(move || {
-                    let mut out = Vec::with_capacity(Q_HEADS * positions.len());
-                    for q_head in 0..Q_HEADS {
-                        let scores = match kv_mode {
-                            KvMode::HqConsumed => capture.consumed_scores(layer, 0, q_head, positions),
-                            KvMode::Bf16 => capture.scores(layer, 0, q_head, positions),
-                        };
-                        out.extend(scores);
-                    }
-                    out
-                })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().expect("a scoring thread")).collect()
-    })
 }
 
 /// The segment that holds the most softmax mass of one head, over the span:
@@ -582,15 +414,10 @@ fn attention_over_a_text_state_is_dumped_for_calibration() {
             }
 
             // ── every head's scores over the span, into the dump ─────────
-            let scores = span_scores(&capture, kv_mode, &span);
+            let positions: Vec<usize> = span.clone().collect();
+            let scores = head_scores(&capture, kv_mode, 0, &positions);
             drop(capture);
-            let mut bytes = Vec::with_capacity(GQA_LAYERS * Q_HEADS * span.len() * 2);
-            for layer in &scores {
-                assert!(layer.iter().all(|s| s.is_finite()), "{}: a non-finite score", question.id);
-                for &s in layer {
-                    bytes.extend_from_slice(&f32_to_f16(s).to_le_bytes());
-                }
-            }
+            let bytes = f16_bytes(&scores, &question.id);
             bin.write_all(&bytes).expect("write the scores");
             let offset = written;
             written += (bytes.len() / 2) as u64;

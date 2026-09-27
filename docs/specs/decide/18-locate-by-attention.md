@@ -1,5 +1,18 @@
 # 18 - locate: a place in the text evidence, read from attention
 
+> **PHASE B REVIVED by spec 19's track L (2026-09-27), with another
+> reading.** A vote of 32 heads, each naming its R1 winner on the copy
+> scaffold less the content-free prefill, found on the development sets by
+> spec 19's phase 0 and registered there before set D was read, passed this
+> spec's rule 2 on D: 146 of 155 against the labelled `choice`'s 142 (94.2
+> against 91.6%), paraphrases 73 against 69 of 78
+> (`docs/findings/2026-09-27-locate-by-head-vote-go.md`). Phase B (#275)
+> goes ahead with **that vote as the reading** in place of rule 1's R1 — the
+> heads in spec 19 § Phase 3, track L — and with rule 3's and rule 4's
+> values from D: `LOCATE_MAX_KEYS` = 4,554; floors logs ≥ 41/43, records ≥
+> 43/45, prose ≥ 58/67. Where the text below says "the head" or R1, phase B
+> reads the vote. The banner that follows is phase A's record, kept.
+
 > **NOT IMPLEMENTED — phase A's go/no-go fired negative.** Phase A ran on
 > 2026-09-26 (`docs/findings/2026-09-26-locate-attention-no-go.md`). Rule 1
 > chose R1 on the copy scaffold `{"quote":"` with the content-free baseline
