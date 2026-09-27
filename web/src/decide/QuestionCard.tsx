@@ -12,7 +12,9 @@ import {
   MIN_DIGITS,
   type Option,
   DEFAULT_METHOD,
+  type Evidence,
   isSpatial,
+  locateTarget,
   SPATIAL_METHOD_BLURB,
   SPATIAL_METHODS,
   type SpatialMethod,
@@ -31,6 +33,7 @@ import {
 
 export function QuestionCard({
   question,
+  evidence,
   faults,
   first,
   last,
@@ -39,6 +42,8 @@ export function QuestionCard({
   onMove,
 }: {
   question: Question;
+  /** What the question is asked over: a `locate` shows the segments its target cuts into. */
+  evidence: Evidence;
   faults: Fault[];
   first: boolean;
   last: boolean;
@@ -189,6 +194,10 @@ export function QuestionCard({
           it empty when you do not know the magnitude and it asks for {DEFAULT_CEILING}; {MAX_CEILING} is the most you can ask for,
           which is where an f64 stops.
         </DigitField>
+      )}
+
+      {question.kind === "locate" && (
+        <WithinField value={question.within} evidence={evidence} name={`${question.uid}-within`} onChange={(within) => set("within", within)} />
       )}
 
       <label className="mt-3 flex items-baseline gap-2">
@@ -372,6 +381,45 @@ function DigitField({
       <p className="pb-2 text-[12px] leading-snug text-ash">{children}</p>
     </div>
   );
+}
+
+/**
+ * Where a `locate` searches, and what it will choose between there.
+ *
+ * The count is the answer to "did I point at the right thing": a pointer at
+ * an object key holding a log says how many lines it cut, and a mistyped one
+ * says nothing here — its refusal reads with the question's other faults
+ * below, in the words the server would use.
+ */
+function WithinField({ value, evidence, name, onChange }: { value: string; evidence: Evidence; name: string; onChange: (within: string) => void }) {
+  const cut = locateTarget(evidence, value);
+  return (
+    <div className="mt-2 flex items-end gap-3">
+      <Labelled label="Search within">
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          name={name}
+          aria-label="Search within (a JSON Pointer)"
+          title="An RFC 6901 JSON Pointer into the evidence, like /log or /tickets. Empty searches the whole evidence."
+          placeholder="the whole evidence"
+          spellCheck={false}
+          className={`${fieldLook} w-[11rem] font-mono text-[13px]`}
+        />
+      </Labelled>
+      <p className="pb-2 text-[12px] leading-snug text-ash">
+        {cut?.ok ? segmentCount(cut.target.unit, cut.target.owns) : "A JSON Pointer to a string, whose lines it chooses between, or to a list, whose elements it does."}
+      </p>
+    </div>
+  );
+}
+
+/** "12 lines to choose between", and how many of them are blank and cannot be chosen. */
+function segmentCount(unit: "line" | "item", owns: boolean[]): string {
+  const blank = owns.filter((own) => !own).length;
+  const plural = owns.length === 1 ? unit : `${unit}s`;
+  const rest = blank === 0 ? "" : ` — ${blank} of them blank, which it never names`;
+  return `${owns.length} ${plural} to choose between, numbered from 0${rest}. It always names one: there is no "not found".`;
 }
 
 /** The widest number a field that wide can hold, which is what a reader wants to see. */

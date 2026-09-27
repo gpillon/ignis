@@ -22,9 +22,10 @@ import {
   saysNothing,
   writeOrdered,
 } from "./json.ts";
+import { type Cut, cutTarget } from "./locate.ts";
 
-/** The seven primitives `decide.rs` serves. */
-export const PRIMITIVES = ["noul", "choice", "score", "number", "scalar", "point", "box"] as const;
+/** The eight primitives `decide.rs` serves. */
+export const PRIMITIVES = ["noul", "choice", "score", "number", "scalar", "point", "box", "locate"] as const;
 export type Primitive = (typeof PRIMITIVES)[number];
 
 /** What each primitive answers with, in the tab's own words. */
@@ -36,6 +37,7 @@ export const PRIMITIVE_BLURB: Record<Primitive, string> = {
   scalar: "A number that ends when it is complete — it may be fractional or negative, and you need not say how wide.",
   point: "A position on the image, in its own pixels.",
   box: "A rectangle on the image, in its own pixels.",
+  locate: "Which line of a text, or element of a list, the instruction names — read off the heads' attention, with nothing written into the evidence.",
 };
 
 /**
@@ -168,6 +170,13 @@ export type Question = {
    * magnitude.
    */
   ceiling: number | null;
+  /**
+   * `locate`: the JSON Pointer to the part of the evidence it searches, and
+   * `""` for the whole of it — the server's absent field, so an empty one is
+   * not sent. Kept on the question whatever its type, like `method`, and sent
+   * only from a `locate`: `decide.rs` refuses `within` on every other type.
+   */
+  within: string;
   /** Fields the JSON editor carried that the builder does not edit; re-emitted as they were. */
   extras: JsonEntry[];
 };
@@ -227,6 +236,7 @@ export function newQuestion(kind: Primitive, id: string): Question {
     digits: DEFAULT_DIGITS,
     method: null,
     ceiling: null,
+    within: "",
     extras: [],
   };
 }
@@ -311,6 +321,7 @@ export function validate(draft: Draft): Fault[] {
     if (question.kind === "score") faults.push(...scoreFaults(question, name));
     if (hasFixedWidth(question.kind)) faults.push(...digitFaults(question, name));
     if (question.kind === "scalar") faults.push(...ceilingFaults(question, name));
+    if (question.kind === "locate") faults.push(...locateFaults(draft.evidence, question, name));
     if (isSpatial(question.kind) && !hasImage(draft.evidence)) {
       faults.push({
         code: "state_carries_no_image",
@@ -414,6 +425,39 @@ function ceilingFaults(question: Question, name: string): Fault[] {
   ];
 }
 
+/**
+ * A `locate`'s own refusals, reported before the send: the target it names
+ * has to exist, be a string or a non-empty array, and hold two segments with
+ * text in them. A JSON evidence that does not parse is already a fault of its
+ * own, and cutting it would only say the same thing twice.
+ */
+function locateFaults(evidence: Evidence, question: Question, name: string): Fault[] {
+  const cut = locateTarget(evidence, question.within);
+  if (cut === null || cut.ok) return [];
+  return [{ code: cut.code, message: `${name}: ${cut.message}`, uid: question.uid }];
+}
+
+/**
+ * The target a `locate` would read in this evidence, cut into its segments —
+ * or the refusal, or `null` when the evidence is JSON that does not parse.
+ *
+ * Text evidence is a JSON string on the wire, so its segments are its lines.
+ * Image evidence is content parts, which a `locate` refuses whatever `within`
+ * says.
+ */
+export function locateTarget(evidence: Evidence, within: string): Cut | null {
+  if (evidence.mode === "image") {
+    return {
+      ok: false,
+      code: "locate_needs_json_state",
+      message: "a locate reads the lines of a text or the elements of a JSON array, and this evidence is an image. Switch the evidence to Text or JSON.",
+    };
+  }
+  if (evidence.mode === "text") return cutTarget(jsonString(evidence.text), within);
+  const parsed = parseOrdered(evidence.text.trim() || "null");
+  return parsed.ok ? cutTarget(parsed.node, within) : null;
+}
+
 export const hasImage = (evidence: Evidence) => evidence.mode === "image" && evidence.images.length > 0;
 
 /** The image a `point` or `box` answers against — the first one, as the prompt carries it. */
@@ -482,6 +526,11 @@ function questionNode(question: Question): JsonNode {
   // says it.
   if (question.kind === "scalar" && question.ceiling !== null) {
     entries.push({ key: "digits", value: { kind: "number", value: question.ceiling } });
+  }
+  // The whole evidence is what an absent `within` searches, and no pointer
+  // needs writing to say it.
+  if (question.kind === "locate" && question.within !== "") {
+    entries.push({ key: "within", value: jsonString(question.within) });
   }
   return jsonObject([...entries, ...question.extras]);
 }
@@ -610,6 +659,11 @@ function readQuestion(id: string, node: JsonNode): ReadQuestion {
   } else if (method) {
     question.extras = [{ key: "method", value: method }];
   }
+  // A pointer that is not a string is kept as written, for the server to
+  // refuse, as a `method` neither name covers is.
+  const within = at("within");
+  if (within?.kind === "string") question.within = within.value;
+  else if (within) question.extras = [...question.extras, { key: "within", value: within }];
   const criteria = at("criteria") ?? at("options");
   if (criteria) applyCriteria(question, criteria);
   // Anything else the caller wrote stays on the question and goes back out as
@@ -620,7 +674,7 @@ function readQuestion(id: string, node: JsonNode): ReadQuestion {
 
 /** `decide.rs`'s serde aliases: their names and ours are the same field. */
 const ALIASES: Record<string, Primitive | undefined> = { boolean: "noul" };
-const READ_KEYS = ["type", "instructions", "question", "criteria", "options", "digits", "method"];
+const READ_KEYS = ["type", "instructions", "question", "criteria", "options", "digits", "method", "within"];
 
 function applyCriteria(question: Question, criteria: JsonNode) {
   if (question.kind === "score" && criteria.kind === "array") {

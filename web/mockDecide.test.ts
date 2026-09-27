@@ -123,6 +123,38 @@ describe("mockDecide", () => {
     expect(send({ state: "s", questions: {} }).status).toBe(422);
   });
 
+  it("answers a locate with a segment that owns a key, in whole votes of the heads, and generates nothing", () => {
+    const state = { log: "a start\n\nb middle\nc end", tickets: [{ id: 1 }, { id: 2 }, { id: 3 }] };
+    const { status, body } = send({
+      state,
+      questions: {
+        line: { type: "locate", instructions: "Which line?", within: "/log" },
+        item: { type: "locate", instructions: "Which ticket?", within: "/tickets" },
+      },
+    });
+    expect(status).toBe(200);
+    const line = body.answers.line as { segment: number; value: unknown; confidence: number; ranking: { segment: number; share: number }[] };
+    // The blank line is segment 1, and a locate never names it.
+    expect([0, 2, 3]).toContain(line.segment);
+    expect(line.value).toBe(state.log.split("\n")[line.segment]);
+    expect(line.confidence).toBe(line.ranking[0].share);
+    expect(line.ranking.length).toBeLessThanOrEqual(5);
+    for (const { share } of line.ranking) expect(Number.isInteger(share * 32)).toBe(true);
+    const shares = line.ranking.map((r) => r.share);
+    expect(shares).toEqual([...shares].sort((a, b) => b - a));
+    const item = body.answers.item as { segment: number; value: unknown };
+    expect(item.value).toEqual(state.tickets[item.segment]);
+    expect(body.usage.output_tokens).toBe(0);
+  });
+
+  it("refuses a locate over content parts, and a within that names nothing, the whole request", () => {
+    const parts = [{ type: "text", text: "a\nb" }];
+    expect(send({ state: parts, questions: { l: { type: "locate", instructions: "Which?" } } }).status).toBe(422);
+    const missing = send({ state: { log: "a\nb" }, questions: { l: { type: "locate", instructions: "Which?", within: "/logs" } } });
+    expect(missing.status).toBe(422);
+    expect(JSON.stringify(missing.body)).toContain("locate_within_not_found");
+  });
+
   it("answers the same question the same way twice", () => {
     const request = { state: "s", questions: { a: { type: "noul", instructions: "Urgent?" } } };
     expect(send(request).body.answers).toEqual(send(request).body.answers);

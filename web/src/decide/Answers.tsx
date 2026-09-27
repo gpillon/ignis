@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { asText } from "./json.ts";
 import { Bar, BoxGlyph, DigitTrace, DistributionRow, ImageMark, NoulMark, PointGlyph, ScoreMark } from "./marks.tsx";
-import { DEFAULT_CEILING, type Draft, evidenceImage, type Question } from "./model.ts";
+import { DEFAULT_CEILING, type Draft, evidenceImage, locateTarget, type Question } from "./model.ts";
 import { type Answer, AXES, levelOrder, type Run } from "./request.ts";
 
 // What came back (GitHub #247), read in the order the request declared.
@@ -25,7 +25,7 @@ export function Answers({ draft, run }: { draft: Draft; run: Run }) {
       {/* The receipt, under what it paid for: what the request cost, what the
           answers cannot say, and the bytes they came back as. */}
       <footer className="flex flex-col gap-3 border-t border-line pt-4">
-        <Cost run={run} anyGenerated={anyGenerated} />
+        <Cost run={run} anyGenerated={anyGenerated} located={draft.questions.some((q) => q.kind === "locate")} />
         <AnswerMassNote />
         <Raw run={run} />
       </footer>
@@ -34,7 +34,7 @@ export function Answers({ draft, run }: { draft: Draft; run: Run }) {
 }
 
 /** The wire cost, and what it says about which primitives were asked. */
-function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
+function Cost({ run, anyGenerated, located }: { run: Run; anyGenerated: boolean; located: boolean }) {
   const { input_tokens, output_tokens } = run.response.usage;
   return (
     <div>
@@ -52,8 +52,12 @@ function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
       </p>
       <p className="mt-1.5 text-[12px] leading-snug text-ash">
         {anyGenerated
-          ? "A number, and a point or a box answered by the digit chain, generate a digit per step, and a scalar generates until its number is complete, so those tokens are real. The readouts beside them generated none, and neither did a point or a box read off the calibrated heads."
-          : "Nothing was generated: out of a single prefill of the evidence, every answer was read from the logits of one position — or, for a point or a box off the calibrated heads, from their attention over the image."}
+          ? "A number, and a point or a box answered by the digit chain, generate a digit per step, and a scalar generates until its number is complete, so those tokens are real. The readouts beside them generated none, and neither did a point or a box read off the calibrated heads, or a locate."
+          : "Nothing was generated: out of a single prefill of the evidence, every answer was read from the logits of one position — or, for a point or a box off the calibrated heads and for a locate, from their attention."}
+        {/* A locate's baseline is real prefill the caller pays for, and the
+            one input the figure above holds that no question asked. */}
+        {located &&
+          " A locate also pays one short prefill more per target: the same evidence asked “N/A”, the content-free baseline its vote subtracts. The prompt tokens count it."}
       </p>
     </div>
   );
@@ -117,6 +121,8 @@ function Body({ question, answer, draft }: { question: Question; answer: Answer;
     case "point":
     case "box":
       return <SpatialBody answer={answer} draft={draft} />;
+    case "locate":
+      return <LocateBody question={question} answer={answer} draft={draft} />;
     default:
       return null;
   }
@@ -465,6 +471,91 @@ function Region({ region }: { region: { cells: number; share: number } }) {
     </div>
   );
 }
+
+/** Segments either side of a `locate`'s winner that the context shows. */
+const CONTEXT = 2;
+
+/**
+ * A `locate`: the segment it named, where that sits in the target, and how
+ * the heads' votes fell.
+ *
+ * The answer carries indices and the winner's own text, nothing more, so the
+ * rest is read off the **sent** draft's target, cut the way the server cut it
+ * (`locate.ts`). The context is there because a line of a log is rarely
+ * judged alone — the reader wants the lines around it — and the ranking
+ * because a close second is the one thing the confidence cannot show.
+ */
+function LocateBody({ question, answer, draft }: { question: Question; answer: Extract<Answer, { type: "locate" }>; draft: Draft }) {
+  const cut = locateTarget(draft.evidence, question.within);
+  const target = cut?.ok ? cut.target : null;
+  const unit = target?.unit ?? (typeof answer.value === "string" ? "line" : "item");
+  const text = (segment: number): string | undefined => target?.segments[segment];
+  const shares = new Map(answer.ranking.map((rank) => [rank.segment, rank.share]));
+  const from = Math.max(0, answer.segment - CONTEXT);
+  const to = Math.min((target?.segments.length ?? 0) - 1, answer.segment + CONTEXT);
+  const context = target ? Array.from({ length: to - from + 1 }, (_, i) => from + i) : [];
+  return (
+    <div>
+      <p className="font-display text-[13px] text-ash">
+        {unit} <span className="tabular-nums text-ink">{answer.segment}</span>
+        {target && <span> of {target.segments.length}</span>}
+        {question.within !== "" && <span className="ml-2 font-mono text-[12px]">in {question.within}</span>}
+      </p>
+      <p className="mt-1 break-words font-mono text-[17px] font-semibold leading-snug text-ember">{segmentText(answer.value)}</p>
+
+      {context.length > 0 && (
+        <ol className="mt-3 border border-line bg-ground py-1 font-mono text-[12px] leading-relaxed" aria-label={`The ${unit}s around it`}>
+          {from > 0 && <li className="px-2 text-ash/70">⋯</li>}
+          {context.map((segment) => (
+            <li
+              key={segment}
+              className={`flex gap-2 border-l-2 px-2 ${segment === answer.segment ? "border-l-ember bg-surface text-ink" : "border-l-transparent text-ash"}`}
+            >
+              <span className="w-8 shrink-0 text-right tabular-nums text-ash/80">{segment}</span>
+              <span className="min-w-0 flex-1 truncate" title={text(segment)}>
+                {text(segment) || " "}
+              </span>
+              {shares.has(segment) && <span className="shrink-0 tabular-nums">{(shares.get(segment) ?? 0).toFixed(3)}</span>}
+            </li>
+          ))}
+          {target && to < target.segments.length - 1 && <li className="px-2 text-ash/70">⋯</li>}
+        </ol>
+      )}
+
+      <p className={`mt-3 font-display text-[11px] text-ash`}>How the heads voted</p>
+      <ol className="mt-1">
+        {answer.ranking.map((rank) => {
+          const winner = rank.segment === answer.segment;
+          return (
+            <li key={rank.segment} className="grid grid-cols-[2.5rem_minmax(0,1fr)_3.5rem_3.2rem] items-center gap-x-3 py-1">
+              <span className={`text-right font-display text-[13px] tabular-nums ${winner ? "font-semibold text-ink" : "text-ash"}`}>
+                {winner && <span className="mr-1.5 inline-block size-1.5 bg-ember align-middle" aria-hidden />}
+                {rank.segment}
+              </span>
+              <span className={`truncate font-mono text-[12px] ${winner ? "text-ink" : "text-ash"}`} title={text(rank.segment)}>
+                {text(rank.segment) ?? (winner ? segmentText(answer.value) : "")}
+              </span>
+              <Bar value={rank.share} dim={!winner} />
+              <span className="text-right font-display text-[13px] tabular-nums text-ink">{rank.share.toFixed(3)}</span>
+            </li>
+          );
+        })}
+      </ol>
+      <Confidence
+        value={answer.confidence}
+        note="the winner's share of the heads' votes"
+        detail={
+          "How much the calibrated heads agree, not a probability. Served on a fresh set it named the right segment 93.6% of the time, " +
+          "with a median 0.625 on those and 0.375 on the misses — and 0.375 when the answer was not in the evidence at all: " +
+          "a locate always names a segment, and a low share is the only sign that nothing matched."
+        }
+      />
+    </div>
+  );
+}
+
+/** A segment as it reads: a line as itself, an array element as its JSON. */
+const segmentText = (value: unknown): string => (typeof value === "string" ? value : JSON.stringify(value));
 
 /**
  * The confidence row. `note` is what fits on the line; `detail` is what a

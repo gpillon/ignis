@@ -4,16 +4,20 @@ import { DecideView } from "./DecideView.tsx";
 import { EvidenceEditor } from "./EvidenceEditor.tsx";
 import { EXAMPLES } from "./examples.ts";
 import { jsonString } from "./json.ts";
-import { EMPTY_DRAFT, EMPTY_SPARE, newQuestion, type Primitive, type Question, validate } from "./model.ts";
+import { EMPTY_DRAFT, EMPTY_SPARE, type Evidence, newQuestion, type Primitive, type Question, validate } from "./model.ts";
 import { isClipped, QuestionCard } from "./QuestionCard.tsx";
 import { createDecision } from "./sessions.ts";
 import { Sessions } from "./Sessions.tsx";
 
 // The bench (GitHub #247): the opening screen, and one card per primitive.
 
-const card = (question: Question, faults = validate({ evidence: { mode: "text", text: "e" }, questions: [question], extras: [] })) =>
+const card = (
+  question: Question,
+  evidence: Evidence = { mode: "text", text: "e" },
+  faults = validate({ evidence, questions: [question], extras: [] }),
+) =>
   renderToStaticMarkup(
-    <QuestionCard question={question} faults={faults} first last onChange={() => {}} onRemove={() => {}} onMove={() => {}} />,
+    <QuestionCard question={question} evidence={evidence} faults={faults} first last onChange={() => {}} onRemove={() => {}} onMove={() => {}} />,
   );
 
 const ask = (kind: Primitive, extra: Partial<Question> = {}): Question => ({
@@ -32,6 +36,15 @@ describe("DecideView", () => {
     }
   });
 
+  it("ships every text and JSON example sendable as it loads, the locates' pointers included", async () => {
+    // The image example fetches its picture, which is the browser's to do.
+    for (const example of EXAMPLES.filter((e) => e.id !== "onimage")) {
+      expect(validate(await example.build()), example.id).toEqual([]);
+    }
+    const listitem = await EXAMPLES.find((e) => e.id === "listitem")!.build();
+    expect(listitem.questions.map((q) => q.within)).toEqual(["/tickets", "/tickets", "/notes"]);
+  });
+
   it("holds Decide back until there is something to decide", () => {
     const html = renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />);
     expect(html).toMatch(/<button[^>]*disabled[^>]*>Decide<\/button>/);
@@ -44,7 +57,7 @@ describe("DecideView", () => {
 
   it("offers every primitive as a starting point", () => {
     const html = renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />);
-    for (const kind of ["noul", "choice", "score", "number", "scalar", "point", "box"]) expect(html, kind).toContain(`>${kind}</button>`);
+    for (const kind of ["noul", "choice", "score", "number", "scalar", "point", "box", "locate"]) expect(html, kind).toContain(`>${kind}</button>`);
   });
 
   it("gives every form field an id or a name, as the browser asks", () => {
@@ -55,6 +68,7 @@ describe("DecideView", () => {
       card(ask("score", { levels: ["Low", "High"] })) +
       card(ask("number")) +
       card(ask("scalar")) +
+      card(ask("locate")) +
       renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "text", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />) +
       renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />) +
       renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "image", images: [], text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />);
@@ -172,6 +186,25 @@ describe("QuestionCard", () => {
     const html = card(ask("choice", { options: [] }));
     expect(html).toContain("declares no options");
     expect(html).toContain("border-l-warn");
+  });
+
+  it("offers a locate a place to search within and says what it will choose between there", () => {
+    const log: Evidence = { mode: "text", text: "a\n\nb\nc" };
+    const html = card(ask("locate"), log);
+    expect(html).toContain('placeholder="the whole evidence"');
+    // Four lines, one of them blank: the blank one keeps its number and is
+    // never named.
+    expect(html).toContain("4 lines to choose between, numbered from 0");
+    expect(html).toContain("1 of them blank");
+    expect(card(ask("noul"), log)).not.toContain("Search within");
+  });
+
+  it("counts the items of the list a locate points into, and reports a pointer that names nothing", () => {
+    const state: Evidence = { mode: "json", text: '{"tickets": [{"id": 1}, {"id": 2}, {"id": 3}]}' };
+    expect(card(ask("locate", { within: "/tickets" }), state)).toContain("3 items to choose between");
+    const missing = card(ask("locate", { within: "/ticket" }), state);
+    expect(missing).toContain("names nothing in the evidence");
+    expect(missing).toContain("border-l-warn");
   });
 
   it("shows a JSON instruction as JSON and offers to turn it into text", () => {

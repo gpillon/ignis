@@ -1,4 +1,5 @@
 import { type JsonNode, parseOrdered, writeOrdered } from "./src/decide/json.ts";
+import { cutTarget, type Target } from "./src/decide/locate.ts";
 
 // A fake `/v1/decide` for `npm run dev:mock` (GitHub #247): enough of the real
 // answer shapes to build the Decide tab against without the shared GPU.
@@ -108,6 +109,49 @@ function stateImage(state: JsonNode | undefined): { width: number; height: numbe
     if (inner?.kind === "string") return jpegSize(inner.value);
   }
   return null;
+}
+
+/** An OpenAI content-parts list, which is the one `state` a `locate` refuses. */
+const isParts = (state: JsonNode): boolean =>
+  state.kind === "array" && state.items.length > 0 && state.items.every((part) => entry(part, "type") !== undefined);
+
+const refuse = (code: string, message: string) => ({ status: 422, body: { error: { type: "invalid_request_error", code, message } } });
+
+/** The heads a served `locate` votes with: every share is a whole number of their votes. */
+const VOTERS = 32;
+
+/**
+ * A `locate` over `target`: the calibrated vote, faked. Every head votes for
+ * one segment that owns a token — a blank line is never named — most of them
+ * for one winner, the rest spread over a few runners-up, so the ranking and
+ * the context both have something to show.
+ */
+function locateAnswer(seed: string, target: Target) {
+  const owning = target.owns.flatMap((own, index) => (own ? [index] : []));
+  const votes = new Map<number, number>();
+  const winner = owning[Math.floor(hashed(seed, 607) * owning.length)];
+  votes.set(winner, 12 + Math.floor(hashed(seed, 613) * 16));
+  for (let head = [...votes.values()][0]; head < VOTERS; head++) {
+    const pick = owning[Math.floor(hashed(seed, 700 + head) * owning.length)];
+    votes.set(pick, (votes.get(pick) ?? 0) + 1);
+  }
+  // Most votes first. The server breaks a tie toward the best-ranked head,
+  // which the mock has none of, so it breaks one toward the earlier segment.
+  const ranking = [...votes.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+    .slice(0, 5)
+    .map(([segment, count]) => ({ segment, share: count / VOTERS }));
+  const top = ranking[0].segment;
+  const text = target.segments[top];
+  return {
+    type: "locate",
+    segment: top,
+    // A line as a string, an element as itself: the segment's JSON text is
+    // what the cut kept of an element.
+    value: target.unit === "line" ? text : JSON.parse(text),
+    confidence: ranking[0].share,
+    ranking,
+  };
 }
 
 /** The mock's answer to one request body, or the refusal it stands in for. */
@@ -243,6 +287,19 @@ export function mockDecide(raw: string): { status: number; body: unknown } {
         generated += digits;
       }
       answers[id] = { type: kind, pixels, normalized, uncertainty, digits: trace };
+      continue;
+    }
+    if (kind === "locate") {
+      // Everything a caller can get wrong about a locate refuses the whole
+      // request before the first prefill, as it does on the server.
+      if (!state || isParts(state)) {
+        return refuse("locate_needs_json_state", "a `locate` reads the lines of a string or the elements of an array, and this `state` is content parts");
+      }
+      const within = entry(question, "within");
+      const cut = cutTarget(state, within?.kind === "string" ? within.value : "");
+      if (!cut.ok) return refuse(cut.code, cut.message);
+      answers[id] = locateAnswer(seed, cut.target);
+      // A locate generates nothing; its baseline is prefill, not output.
       continue;
     }
     answers[id] = { type: "error", code: "unknown_type", message: `the mock does not answer a ${kind}` };

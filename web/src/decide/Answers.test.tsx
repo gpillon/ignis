@@ -550,6 +550,63 @@ describe("Answers", () => {
     expect(html).toContain("The other answers stand");
   });
 
+  describe("a locate", () => {
+    const log = ["l0 boot", "l1 ok", "l2 ok", "l3 pg: FATAL too many clients", "l4 ok", "l5 ok", "l6 ok", "l7 done"].join("\n");
+    const answer: Answer = {
+      type: "locate",
+      segment: 3,
+      value: "l3 pg: FATAL too many clients",
+      confidence: 0.625,
+      ranking: [
+        { segment: 3, share: 0.625 },
+        { segment: 7, share: 0.25 },
+        { segment: 0, share: 0.125 },
+      ],
+    };
+
+    it("names the segment it found, as the caller sent it, and where it sits", () => {
+      const html = render([question("where", "locate")], { where: answer }, { mode: "text", text: log });
+      expect(html).toContain("l3 pg: FATAL too many clients");
+      expect(html).toMatch(/line <span[^>]*>3<\/span><span> of 8<\/span>/);
+    });
+
+    it("shows the lines either side of it, and elides the rest", () => {
+      const html = render([question("where", "locate")], { where: answer }, { mode: "text", text: log });
+      const context = html.slice(html.indexOf('aria-label="The lines around it"'), html.indexOf("How the heads voted"));
+      for (const line of ["l1 ok", "l2 ok", "l4 ok", "l5 ok"]) expect(context, line).toContain(line);
+      expect(context).not.toContain("l0 boot");
+      expect(context).not.toContain("l7 done");
+      expect(context.match(/⋯/g)).toHaveLength(2);
+    });
+
+    it("lists the voted segments by share with their text, and reads the confidence as agreement, not probability", () => {
+      const html = render([question("where", "locate")], { where: answer }, { mode: "text", text: log });
+      const votes = html.slice(html.indexOf("How the heads voted"));
+      expect(order(votes, ["l3 pg", "l7 done", "l0 boot"])).toEqual(["l3 pg", "l7 done", "l0 boot"]);
+      expect(votes).toContain("0.250");
+      expect(html).toContain("the winner&#x27;s share of the heads&#x27; votes");
+      expect(html).toContain("not a probability");
+    });
+
+    it("reads an element of a list it searched within, and says where it searched", () => {
+      const evidence: Evidence = { mode: "json", text: '{"tickets": [{"id": 1}, {"id": 2}, {"id": 3}]}' };
+      const html = render(
+        [question("t", "locate", { within: "/tickets" })],
+        { t: { type: "locate", segment: 1, value: { id: 2 }, confidence: 0.5, ranking: [{ segment: 1, share: 0.5 }, { segment: 2, share: 0.5 }] } },
+        evidence,
+      );
+      expect(html).toContain("item <span");
+      expect(html).toContain("in /tickets");
+      expect(html).toContain("{&quot;id&quot;:2}");
+    });
+
+    it("counts the content-free baseline among the prompt tokens it paid for", () => {
+      const html = render([question("where", "locate")], { where: answer }, { mode: "text", text: log });
+      expect(html).toContain("one short prefill more per target");
+      expect(render([question("a", "noul")], { a: { type: "noul", noul: 0.5 } })).not.toContain("one short prefill more");
+    });
+  });
+
   it("says once that the answer mass is not in the body, and points at the Monitor", () => {
     const html = render([question("a", "noul")], { a: { type: "noul", noul: 0.5 } });
     expect(html).toContain("answer mass");

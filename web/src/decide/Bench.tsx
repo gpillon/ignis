@@ -171,6 +171,7 @@ function Builder({
           <QuestionCard
             key={question.uid}
             question={question}
+            evidence={draft.evidence}
             faults={faults.filter((f) => f.uid === question.uid)}
             first={index === 0}
             last={index === draft.questions.length - 1}

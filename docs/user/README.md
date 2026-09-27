@@ -402,6 +402,10 @@ curl http://127.0.0.1:8000/v1/decide \
   artifact) is refused with `locate_too_long`, and a load whose artifact nobody
   calibrated refuses every `locate` (`locate_uncalibrated`); the load says which
   at start (`ignis.decide.locate`). Content-parts states are refused too.
+- The Playground's **Decide** tab asks one (GitHub #277): it counts the
+  segments `within` cuts before you send, shows the lines around the answer
+  and how the heads voted, and ships two examples — a line of a log and an
+  element of a JSON list.
 
 Past that length, or on such a load, label the segments and ask a `choice`
 over the labels (Jev's "line search"):

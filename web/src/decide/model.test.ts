@@ -387,3 +387,57 @@ describe("a spatial question's method", () => {
     expect(faults.find((f) => f.code === "method_unknown")?.message).toContain('"head" and "chain"');
   });
 });
+
+// A `locate` (GitHub #277, #275): it declares no options and generates
+// nothing, so it sends none of the fields the others carry — `decide.rs`
+// refuses `criteria`, `digits` and `method` on one — and it owns `within`,
+// which it refuses on everything else.
+describe("a locate", () => {
+  const log: Evidence = { mode: "text", text: "09:14 INFO up\n09:15 ERROR down\n09:16 INFO up" };
+  const state: Evidence = { mode: "json", text: '{"account": "a", "tickets": ["one", "two"], "notes": "x\\ny"}' };
+
+  it("sends its type and instructions and nothing else when it searches the whole evidence", () => {
+    const body = requestBody(draft([question("where", "locate", "Which line failed?")], log));
+    const sent = JSON.parse(body).questions.where;
+    expect(sent).toEqual({ type: "locate", instructions: "Which line failed?" });
+  });
+
+  it("sends within when it names a part, and never from another type", () => {
+    const pointed = requestBody(draft([question("t", "locate", "Which ticket?", { within: "/tickets" })], state));
+    expect(JSON.parse(pointed).questions.t.within).toBe("/tickets");
+    // Switching a locate to a noul keeps the pointer on the question, for the
+    // switch back, and leaves it off the wire, where it would be refused.
+    const switched = requestBody(draft([question("t", "noul", "Any ticket?", { within: "/tickets" })], state));
+    expect(switched).not.toContain("within");
+  });
+
+  it("round-trips within without doubling it", () => {
+    const read = readRequest('{"state":{"log":"a\\nb"},"questions":{"l":{"type":"locate","instructions":"Which?","within":"/log"}}}');
+    if (!read.ok) throw new Error(read.message);
+    expect(read.draft.questions[0].kind).toBe("locate");
+    expect(read.draft.questions[0].within).toBe("/log");
+    expect(read.draft.questions[0].extras).toEqual([]);
+    expect(requestBody(read.draft).match(/"within"/g)).toHaveLength(1);
+  });
+
+  it("is sendable over text evidence, whose lines it reads, and over a JSON part it points at", () => {
+    expect(codes(draft([question("l", "locate", "Which?")], log))).toEqual([]);
+    expect(codes(draft([question("l", "locate", "Which?", { within: "/notes" })], state))).toEqual([]);
+  });
+
+  it("reports the refusals the endpoint would answer, on the question", () => {
+    const image: Evidence = { mode: "image", images: [{ name: "a.jpg", url: "data:,", width: 1, height: 1 }], text: "" };
+    expect(codes(draft([question("l", "locate", "Which?")], image))).toEqual(["locate_needs_json_state"]);
+    expect(codes(draft([question("l", "locate", "Which?", { within: "tickets" })], state))).toEqual(["locate_within_malformed"]);
+    expect(codes(draft([question("l", "locate", "Which?", { within: "/ticket" })], state))).toEqual(["locate_within_not_found"]);
+    expect(codes(draft([question("l", "locate", "Which?", { within: "/account" })], state))).toEqual(["locate_too_few_segments"]);
+    expect(codes(draft([question("l", "locate", "Which?")], state))).toEqual(["locate_target_unsegmentable"]);
+    const fault = validate(draft([question("l", "locate", "Which?", { within: "/ticket" })], state))[0];
+    expect(fault.uid).toBeDefined();
+    expect(fault.message).toContain('Question "l"');
+  });
+
+  it("says nothing more about JSON evidence that does not parse than that it does not", () => {
+    expect(codes(draft([question("l", "locate", "Which?")], { mode: "json", text: "{" }))).toEqual(["invalid_state_json"]);
+  });
+});

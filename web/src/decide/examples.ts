@@ -5,7 +5,8 @@
 // Three of them are Jev's own documented requests over Jev's own state, so a
 // reader who knows that API recognises the tab immediately; the rest show what
 // this server adds — a JSON evidence, a generated number, a number that decides
-// its own width, and a position on an image.
+// its own width, a line of a log or an element of a list found without writing
+// labels into it (GitHub #277), and a position on an image.
 
 import flame from "../brand/flame.webp";
 import { imageFromFile, imageMime, type PromptImage } from "../conversation/images.ts";
@@ -44,6 +45,47 @@ const ORDER = `{
   "shipping": { "country": "IT", "method": "standard" },
   "note": "Please deliver before the 20th, it is a gift."
 }`;
+
+// A log whose interesting lines do not say what the questions ask in the
+// questions' words: a `locate` that only matched strings would miss them, and
+// the served vote was held to paraphrase for exactly that reason.
+const INCIDENT = [
+  "09:14:02 INFO  gateway   GET /v1/orders 200 41ms",
+  "09:14:07 INFO  auth      user 6121 signed in from 93.44.18.7",
+  "09:14:31 WARN  billing   retrying charge ch_88x1 (attempt 2 of 5)",
+  "09:15:02 INFO  deploy    rollout of api v2.41.0 started (3 replicas)",
+  "09:15:40 ERROR orders    pg: FATAL sorry, too many clients already",
+  "09:15:41 ERROR orders    POST /v1/orders 500 12ms",
+  "",
+  "09:16:03 INFO  deploy    replica api-2 healthy, api-1 draining",
+  "09:16:44 WARN  gateway   p99 latency 2140ms over the 800ms budget",
+  "09:17:10 INFO  deploy    rollout of api v2.41.0 complete",
+  "09:17:12 INFO  billing   charge ch_88x1 succeeded",
+  "09:18:00 INFO  cron      nightly export skipped: not scheduled",
+].join("\n");
+
+// An object, so `within` has something to point into: a list of records for
+// one locate and a multi-line string for another, over the same state.
+const TICKETS = JSON.stringify(
+  {
+    account: "acme-eu",
+    tickets: [
+      { id: 311, from: "ops@acme.eu", subject: "Export button greyed out on the reports page" },
+      { id: 312, from: "lina@acme.eu", subject: "We were billed for March twice, same amount" },
+      { id: 313, from: "marco@acme.eu", subject: "The 2FA code never arrives, locked out since Monday" },
+      { id: 314, from: "ops@acme.eu", subject: "Can we raise the webhook timeout to 30s?" },
+      { id: 315, from: "finance@acme.eu", subject: "Please send the VAT invoice for Q3" },
+    ],
+    notes: [
+      "2026-09-02 onboarding call, 14 seats",
+      "2026-09-10 asked about SSO, sent the docs",
+      "2026-09-18 renewal owner changed to finance@acme.eu",
+      "2026-09-24 threatened to cancel over the outage",
+    ].join("\n"),
+  },
+  null,
+  2,
+);
 
 export const EXAMPLES: Example[] = [
   {
@@ -154,6 +196,41 @@ export const EXAMPLES: Example[] = [
         // Beside them, the same evidence read into a declared field: the
         // receipt is where the two spends can be compared.
         question("invoices", "number", "How many invoices were processed?", { digits: 3 }),
+      ],
+    }),
+  },
+  {
+    id: "logline",
+    name: "Find the line in a log",
+    shows: "A locate names one line of the evidence off the attention of calibrated heads — nothing generated, nothing written into the log.",
+    build: async () => ({
+      evidence: { mode: "text", text: INCIDENT },
+      extras: [],
+      questions: [
+        // Neither question shares a word with its line: "turning away new
+        // connections" is "too many clients", "finish rolling out" is
+        // "rollout … complete".
+        question("db_refused", "locate", "Which line shows the database turning away new connections?"),
+        question("deploy_done", "locate", "When did the new version finish rolling out?"),
+        // A readout over the same evidence, in the same request: a locate
+        // keeps its state under its own prompt layout, and the two are
+        // answered side by side all the same.
+        question("customer_hit", "noul", "Did any customer request fail?"),
+      ],
+    }),
+  },
+  {
+    id: "listitem",
+    name: "Pick one from a list",
+    shows: "Search within part of a JSON state — the elements of a list, or the lines of a string — while the whole state stays in the prompt.",
+    build: async () => ({
+      evidence: { mode: "json", text: TICKETS },
+      extras: [],
+      questions: [
+        question("double_charge", "locate", "Which ticket is about a duplicate payment?", { within: "/tickets" }),
+        question("locked_out", "locate", "Which ticket is from someone who cannot get into their account?", { within: "/tickets" }),
+        // The same state, a different target: a string's lines this time.
+        question("churn_signal", "locate", "Which note says the customer might leave?", { within: "/notes" }),
       ],
     }),
   },

@@ -43,7 +43,16 @@ export type Answer =
       extent?: Record<string, number>;
       digits?: Record<string, DigitDraw[]>;
     }
+  // A `locate` names a segment of the target by its index from 0 (GitHub
+  // #275), and `value` is that segment as the caller sent it: a line as a
+  // string, an array element as itself. `confidence` is the winner's share of
+  // the heads' votes and `ranking` the voted segments by share, at most five —
+  // how much the heads agree, not a probability, and there is no "not found".
+  | { type: "locate"; segment: number; value: unknown; confidence: number; ranking: LocateRank[] }
   | { type: "error"; code: string; message: string };
+
+/** One voted segment of a `locate`: its index, and its share of the votes. */
+export type LocateRank = { segment: number; share: number };
 
 export type DecideResponse = {
   model: string;
