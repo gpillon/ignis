@@ -210,7 +210,7 @@ fn the_leaf_reads_a_text_span_as_the_tap_sees_it(kv_format: KvFormat) {
 
     let states = [
         ("log-60", log(60, 0), "Which line reports the slowest billing request?"),
-        ("log-190", log(190, 1), "Which line says the gateway request r_1500 failed?"),
+        ("log-198", log(198, 1), "Which line says the gateway request r_1500 failed?"),
         ("records-40", records(40), "Which employee works from Kyoto and joined in 2015?"),
     ];
     for (label, state, instruction) in &states {

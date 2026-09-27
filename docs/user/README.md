@@ -388,7 +388,9 @@ curl http://127.0.0.1:8000/v1/decide \
   sent it.
 - `confidence` is how much the heads agree — the winner's share of their votes —
   not a probability, and a `locate` always names a segment: there is no "not
-  found". `ranking` is the voted segments, at most five.
+  found". Measured, it was a median 0.625 on right answers and 0.375 on wrong
+  ones — and 0.375 when the answer was not in the state at all. `ranking` is
+  the voted segments, at most five.
 - Measured on a fresh set of logs, JSON record arrays and HotpotQA paragraphs,
   it named the right one on 93.6% of the questions, three more than a `choice`
   over labelled segments on the same questions, in less wall time

@@ -22,7 +22,7 @@
 use std::fmt;
 use std::ops::Range;
 
-use crate::decide::OrderedValue;
+use crate::decide::{OrderedValue, quoted};
 
 /// What a segment is called: a string's lines, an array's items.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +102,18 @@ pub enum TargetError {
     Ambiguous(String),
     /// A target that is not a string or a non-empty array, with what it is.
     Unsegmentable { pointer: String, found: &'static str },
+}
+
+impl TargetError {
+    /// The code `/v1/decide` refuses the request with.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "locate_within_malformed",
+            Self::NotFound(_) => "locate_within_not_found",
+            Self::Ambiguous(_) => "locate_within_ambiguous",
+            Self::Unsegmentable { .. } => "locate_target_unsegmentable",
+        }
+    }
 }
 
 impl fmt::Display for TargetError {
@@ -188,11 +200,6 @@ fn unescape(raw: &str) -> Option<String> {
         }
     }
     Some(out)
-}
-
-/// A JSON string literal, escaped as `OrderedValue` escapes one.
-fn quoted(text: &str) -> String {
-    serde_json::to_string(text).expect("a string always serializes")
 }
 
 /// What a value is, for a refusal.

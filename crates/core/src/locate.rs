@@ -124,8 +124,11 @@ pub fn calibrated_artifacts() -> impl Iterator<Item = ArtifactHash> {
 ///
 /// In the reference's arithmetic: `exp(s - max s)` in f64, each segment's
 /// mass as a difference of the running sum at its two ends, divided by the
-/// total, and **stored as an f32** — the precision `score.py` kept them in,
-/// and so the one every vote in the findings was cast with.
+/// total, and **stored as an f32** — the precision `score.py` kept them in.
+/// The calibration read the harness's f16 dumps where the served path reads
+/// the leaf's f32 rows, so a near-tie can vote differently from the dump; the
+/// served acceptance measured the path as it serves
+/// (`docs/findings/2026-09-27-locate-through-decide.md`).
 pub fn segment_shares(scores: &[f32], keys: &[Option<Range<usize>>]) -> Vec<Option<f32>> {
     let top = scores.iter().fold(f64::NEG_INFINITY, |a, &s| a.max(f64::from(s)));
     let mut running = Vec::with_capacity(scores.len() + 1);

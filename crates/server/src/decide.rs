@@ -283,7 +283,7 @@ impl Serialize for OrderedValue {
 }
 
 /// A JSON string literal, escaped the way `serde_json` escapes one.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     serde_json::to_string(text).expect("a string always serializes")
 }
 
@@ -1734,12 +1734,12 @@ pub enum Answer {
     /// content-free twin of the same prompt, and the most-voted segment is
     /// the answer. `confidence` is the winner's share of the votes and
     /// `ranking` the voted segments by votes, at most five, each with its
-    /// share. **How much the heads agree, not a calibrated probability**: on
-    /// set D the vote read 94.2% of the questions a labelled `choice` could
-    /// answer, and its confidence separated them from questions whose answer
-    /// was absent at an AUC of 0.73
-    /// (`docs/findings/2026-09-27-locate-by-head-vote-go.md`). There is no
-    /// "not found": an absent answer still names a segment.
+    /// share. **How much the heads agree, not a calibrated probability**:
+    /// served on a fresh set it read 93.6% of the questions right, with a
+    /// median confidence of 0.625 on those and 0.375 on the misses — and
+    /// 0.375 on questions whose answer was absent, which it separates at an
+    /// AUC of 0.79 (`docs/findings/2026-09-27-locate-through-decide.md`).
+    /// There is no "not found": an absent answer still names a segment.
     Locate {
         segment: usize,
         #[schema(value_type = serde_json::Value)]
@@ -2167,7 +2167,7 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
     responses(
         (status = 200, description = "One answer per question, under the ids the caller chose.", body = DecideResponse),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
-        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), or it is longer than the vote was measured on (`locate_too_long`); `criteria`, `digits` and `method` on a `locate`, and `within` on anything else, are refused too. Nothing reached the engine.",
+        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), or it is longer than the vote was measured on (`locate_too_long`), or the loaded template cannot say where its tokens sit (`locate_unsupported`); `criteria`, `digits` and `method` on a `locate`, and `within` on anything else, are refused too. Nothing reached the engine.",
             body = crate::api::ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted.", body = crate::api::ApiError),
     ),
@@ -2329,20 +2329,28 @@ async fn serve(
     // together, [`FAN_OUT_WIDTH`] of them at a time. A `locate`'s baseline
     // (GitHub #275) is one more follower: it claims the state like any
     // sibling, and is answered with the questions that read it.
+    //
+    // A `locate` keeps its state under another layout (L1, spec 17) than
+    // the other kinds, so one behind a `noul` would find nothing to claim.
+    // The first `locate` therefore goes alone too, right after the first
+    // question, and leads its own kind (GitHub #275).
     let collect = |slot: usize| match prepared.get(slot) {
         Some(question) if question.kind != QuestionKind::Locate => Collect::Answer(question),
         _ => Collect::Rows,
     };
+    let first_locate = prepared.iter().position(|question| question.kind == QuestionKind::Locate);
+    let leads = |slot: usize| slot == 0 || Some(slot) == first_locate;
     let mut replies: Vec<Option<Reply>> = (0..rendered.len()).map(|_| None).collect();
-    let mut queue = rendered.into_iter().enumerate();
-    if let Some((slot, ready)) = queue.next() {
-        // A first question the engine has no room for leaves the fan-out
-        // with no prefix to share, but it is still one question's failure
-        // and not the request's — the same slot an engine-full follower
-        // gets, and the same one the sequential loop before #240 gave it.
+    let (leaders, followers): (Vec<_>, Vec<_>) =
+        rendered.into_iter().enumerate().partition(|(slot, _)| leads(*slot));
+    for (slot, ready) in leaders {
+        // A leader the engine has no room for leaves the fan-out with no
+        // prefix to share, but it is still one question's failure and not
+        // the request's — the same slot an engine-full follower gets, and
+        // the same one the sequential loop before #240 gave it.
         replies[slot] = Some(match ask(server, collect(slot), ready, class).await {
             Attempt::Answered(reply) => reply,
-            Attempt::Full(_) => Reply::engine_full(collect(slot)),
+            Attempt::Full(_) => Reply::failed(collect(slot), engine_full()),
         });
     }
 
@@ -2357,7 +2365,7 @@ async fn serve(
     // instead — a wave that answers even one question makes room for them.
     // A wave where *nothing* got in is an engine with no room at all, and
     // that is reported rather than spun on.
-    let mut pending: std::collections::VecDeque<_> = queue.collect();
+    let mut pending: std::collections::VecDeque<_> = followers.into();
     while !pending.is_empty() {
         let wave: Vec<_> = (0..FAN_OUT_WIDTH.min(pending.len()))
             .filter_map(|_| pending.pop_front())
@@ -2379,7 +2387,7 @@ async fn serve(
         }
         if !answered_one {
             for (slot, _) in pending.drain(..) {
-                replies[slot] = Some(Reply::engine_full(collect(slot)));
+                replies[slot] = Some(Reply::failed(collect(slot), engine_full()));
             }
         }
     }
@@ -2982,16 +2990,8 @@ async fn locate_prompt(
     model: Option<String>,
     calibration: ignis_core::locate::LocateCalibration,
 ) -> Result<LocatePrompt, Refusal> {
-    use crate::locate::TargetError;
-    let target = crate::locate::evidence_within(state, within).map_err(|error| {
-        let code = match error {
-            TargetError::Malformed(_) => "locate_within_malformed",
-            TargetError::NotFound(_) => "locate_within_not_found",
-            TargetError::Ambiguous(_) => "locate_within_ambiguous",
-            TargetError::Unsegmentable { .. } => "locate_target_unsegmentable",
-        };
-        Refusal::new(code, format!("question {id:?}: {error}"))
-    })?;
+    let target = crate::locate::evidence_within(state, within)
+        .map_err(|error| Refusal::new(error.code(), format!("question {id:?}: {error}")))?;
     let messages = vec![
         ChatMessage::text("system", target.system.clone()),
         ChatMessage::text("user", crate::locate::user_text(target.unit, instruction)),
@@ -3114,11 +3114,12 @@ enum Reply {
 }
 
 impl Reply {
-    /// The reply of a prompt the engine had no room for.
-    fn engine_full(collect: Collect<'_>) -> Self {
+    /// The reply of a prompt that failed before it read anything, `failure`
+    /// in the slot its collection would have filled.
+    fn failed(collect: Collect<'_>, failure: Answer) -> Self {
         match collect {
-            Collect::Answer(_) => Self::Answer(engine_full()),
-            Collect::Rows => Self::Rows(Err(engine_full())),
+            Collect::Answer(_) => Self::Answer(failure),
+            Collect::Rows => Self::Rows(Err(failure)),
         }
     }
 }
@@ -3153,11 +3154,7 @@ async fn ask(
         // own siblings are the likeliest reason.
         Err(ignis_core::SubmitError::Full) => return Attempt::Full(ready),
         Err(error) => {
-            let failure = failed("submit_failed", format!("{error:?}"));
-            return Attempt::Answered(match collect {
-                Collect::Answer(_) => Reply::Answer(failure),
-                Collect::Rows => Reply::Rows(Err(failure)),
-            });
+            return Attempt::Answered(Reply::failed(collect, failed("submit_failed", format!("{error:?}"))));
         }
     };
     // The engine keeps working on a request whose caller has gone until it

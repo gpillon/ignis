@@ -256,7 +256,7 @@ the never-evicted tokens (GitHub #194).
 
 `crates/server/tests/attention_readout_text_gpu.rs` (`cuda`, `attn-tap`)
 holds the leaf's rows of the served vote's 32 heads to the attention tap over
-text spans of up to 4,344 keys, under BF16 and hq-e8-2b, for a question and
+text spans of up to 4,526 keys, under BF16 and hq-e8-2b, for a question and
 for its content-free twin claiming the question's retained state.
 `kernel/tests/test_attention_readout.cu` has the rows arm,
 `test_model_load_vision_options.cpp` the text room, and

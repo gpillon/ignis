@@ -103,6 +103,17 @@ shipped method.
   retained state like any sibling. `usage.input_tokens` counts both.
 - `ignis_decisions_total` gains `type="locate"`, counted once per question
   and never for its baseline, with no answer mass (ADR 0017).
+- `ignis_model_load_options` gains `attention_text_max_keys` without growing:
+  the `uint32_t` lands in what was the struct's tail padding, so its size
+  stays 48 bytes and ADR 0016's "one recognized size" cannot tell the two
+  layouts apart. Accepted because the ABI has one consumer, built with the
+  leaf from the same header; a caller compiled against the old header would
+  hand over its padding as the key count. The next field appended to this
+  struct bumps its size, as ADR 0016 has it.
+- The calibration table holds the heads and the ceiling only: the copy
+  scaffold and the baseline are the served reading's, not calibrated values.
+  A recalibration whose procedure chose another scaffold or no baseline
+  would be a new reading, and a new spec, not a new table row.
 - A new artifact needs its vote recalibrated: spec 19 phase 0's procedure on
   fresh development sets (`tools/locate-sets/README.md`), then spec 18's
   acceptance on a fresh set through `/v1/decide`.

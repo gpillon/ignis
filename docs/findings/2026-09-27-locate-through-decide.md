@@ -89,3 +89,15 @@ guesses, every target longer than the ceiling it was measured to.
   records are synthetic.
 - Wall times are medians on an otherwise idle server with DFlash2 loaded;
   the labelled route ran after the `locate` run, on the same load.
+- A three-question smoke run (`logs-000` to `logs-002`, `served.py ask
+  --limit 3`) checked the endpoint answered before the full run; nothing was
+  chosen or changed from it.
+- The calibration read f16 scores from the harness's dumps; the served path
+  reads the leaf's f32 rows, so a near-tie can vote differently than the dump
+  would have. This set measured the served path as it is.
+
+## Follow-ups
+
+- #275's remaining bookkeeping (close, push) is the owner's.
+- A `found` flag, a `locate` in the Playground's Decide tab and `multi`
+  over segments stay out of scope (spec 18 § Out of Scope).

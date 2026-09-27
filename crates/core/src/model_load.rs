@@ -928,7 +928,8 @@ mod tests {
         // vision_max_tokens, (GitHub #243) uint64 pool bytes — which the four
         // uint32s above align for free — (GitHub #227) four float rope
         // scalars, the uint32 vision item bound and (GitHub #275) the uint32
-        // text readout's keys, which fill what was the struct's padding.
+        // text readout's keys, which fill what was the struct's padding --
+        // so the size did not move (ADR 0041 records why that is accepted).
         assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 48);
         // uint64 x 3, then (GitHub #210) the six uint64 reservation lines.
         assert_eq!(std::mem::size_of::<IgnisModelStats>(), 72);

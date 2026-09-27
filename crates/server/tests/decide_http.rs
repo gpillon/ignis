@@ -2585,3 +2585,70 @@ async fn a_served_locate_is_counted_once_and_observes_no_answer_mass() {
     assert_eq!(sample(&after, "ignis_decisions_total", "type=\"locate\""), "1");
     assert!(!after.contains("ignis_decision_answer_mass_count 1"), "{after}");
 }
+
+/// Spec 18: "sharing among `locate` questions over one state works from the
+/// start" — whatever question the caller wrote first. A `locate`'s layout
+/// (L1) keeps the state where a readout's (L0) does not, so a `locate`
+/// behind a `noul` leads its own kind: it goes alone after the first
+/// question, and the other `locate` and the baseline claim what it keeps.
+#[tokio::test]
+async fn a_locate_behind_a_readout_still_shares_its_state() {
+    const ITEMS: usize = 80;
+    let items: Vec<String> = (0..ITEMS).map(|i| format!("\"x w{i} y\"")).collect();
+    let body = decide_body(
+        &format!("[{}]", items.join(",")),
+        r#""any":{"type":"noul","instructions":"is there a letter?"},
+           "one":{"type":"locate","instructions":"which item names w7"},
+           "two":{"type":"locate","instructions":"which item names w70"}"#,
+    );
+    let compute = calibrated_compute();
+    let (status, response) = decide(&app(compute.clone()), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let totals = prefilled(&compute);
+    let mut located: Vec<u64> = attention_jobs(&compute).into_iter().map(|(request, _)| request).collect();
+    located.sort_unstable();
+    located.dedup();
+    assert_eq!(located.len(), 3, "two locates and one baseline: {located:?}");
+    let state_words = 2 * ITEMS as u32;
+    assert!(totals[&located[0]] > state_words, "the first locate prefills the state: {totals:?}");
+    for request in &located[1..] {
+        assert!(
+            totals[request] < state_words,
+            "request {request} prefilled {} tokens — it did not claim the state the first locate kept: {totals:?}",
+            totals[request]
+        );
+    }
+}
+
+/// A load whose template cannot say where its tokens sit — the placeholder
+/// provider has no tokenizer to force the scaffold with — refuses a
+/// `locate` before any prefill rather than guess its keys.
+#[tokio::test]
+async fn a_locate_on_a_template_with_no_tokenizer_is_refused() {
+    let compute = calibrated_compute();
+    let server = Server::new(Engine::new(Box::new(scheduler_over(compute.clone()))), Box::new(SimpleTemplateProvider));
+    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"which item names b"}"#);
+    let (status, response) = decide(&server.app(), &body).await;
+    assert_eq!(status, 422, "{response}");
+    assert_eq!(response["error"]["code"], "locate_unsupported", "{response}");
+    assert!(compute.prefill_calls().is_empty());
+}
+
+/// Rows the leaf did not bring back whole — too few, or none from the
+/// baseline — are the question's failure, never a segment.
+#[test]
+fn a_locate_whose_rows_are_not_whole_is_malformed() {
+    use ignis_core::pointing::AttentionScores;
+    let keys = vec![Some(0..2), Some(2..4)];
+    let values = vec![ignis_server::decide::OrderedValue::String("a".into()); 2];
+    let whole = AttentionScores { set_rows: Some(vec![0.0f32; 2 * 4].into()), ..AttentionScores::pointing(vec![0.0; 4]) };
+    let short = AttentionScores { set_rows: Some(vec![0.0f32; 7].into()), ..AttentionScores::pointing(vec![0.0; 4]) };
+    let none = AttentionScores::pointing(vec![0.0; 4]);
+    for (what, asked, baseline) in [("short rows", &short, &whole), ("no baseline rows", &whole, &none)] {
+        let answer = ignis_server::decide::locate_answer_for(&keys, &values, 2, asked, baseline);
+        let answer = serde_json::to_value(&answer).expect("serializes");
+        assert_eq!(answer["code"], "attention_malformed", "{what}: {answer}");
+    }
+    let answer = ignis_server::decide::locate_answer_for(&keys, &values, 2, &whole, &whole);
+    assert_eq!(serde_json::to_value(&answer).expect("serializes")["type"], "locate");
+}

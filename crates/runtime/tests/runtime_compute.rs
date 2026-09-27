@@ -2422,6 +2422,18 @@ fn a_text_job_with_an_attention_readout_is_served() {
     assert!(calls.multimodal_spans.is_empty(), "and it took the text path");
 }
 
+/// GitHub #275, spec 18 acceptance 7: a text span that asks for no readout
+/// is handed no buffer at all — the text path's every other chunk pays
+/// nothing for the readout it gained.
+#[test]
+fn a_text_span_that_asks_for_no_attention_readout_is_handed_nothing() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    compute.prefill_step(&[prefill(1, None)]).unwrap();
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.attention_asked, [None]);
+    assert!(calls.multimodal_spans.is_empty(), "the text path");
+}
+
 /// GitHub #275: a set read in rows hands the leaf a row per head and brings
 /// every one back whole, in the set's order — and no neighbours, since a
 /// text span is no grid.
