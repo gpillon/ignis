@@ -126,7 +126,7 @@ Spec 19 reads the same dumps again (`docs/findings/2026-09-27-a-head-vote-finds-
 |---|---|
 | A, B | development: every choice |
 | C | replication only (spent by spec 18; read with the frozen vote after its registration) |
-| D | track L's check, once |
+| D | track L's check, once: **go**, 146/155 against the labels' 142 (`docs/findings/2026-09-27-locate-by-head-vote-go.md`) |
 
 ## Spec 19: spans (phase 1)
 

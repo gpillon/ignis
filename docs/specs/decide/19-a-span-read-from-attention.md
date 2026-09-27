@@ -341,6 +341,12 @@ here, to be confirmed by the owner before the run:
   - *What a go does.* It reopens #275 with the vote as the reading in place
     of R1 — a head set on the seam, as ADR 0039 did for `box` — and its
     floors and ceiling from D. A no-go ends track L; the finding records it.
+  - **Result, 2026-09-27: go**
+    (`docs/findings/2026-09-27-locate-by-head-vote-go.md`). On D the vote
+    read 146 of 155 against the labelled `choice`'s 142 (94.2 against
+    91.6%), and 73 of 78 paraphrases against 69 (93.6 against 88.5%);
+    `LOCATE_MAX_KEYS` 4,554; floors logs 41/43, records 43/45, prose 58/67.
+    #275 reopens with the vote as its reading.
   - *Not binding, reported beside it:* the conditional logit over every
     head's per-segment lift, both scaffolds (four prefills), 93.3% in nested
     CV on A+B; and C, read with the frozen vote as a replication only —
