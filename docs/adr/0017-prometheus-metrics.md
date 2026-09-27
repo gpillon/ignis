@@ -51,7 +51,11 @@ the same reason. Amended 2026-09-24 (#265, spec server/08): one counter,
 block the thinking budget closed. It is projected by the telemetry consumer
 from the finish event the scheduler already emits, so the model thread does
 no new work, and it takes the decision family's exception: absent until the
-first forced close.
+first forced close. Amended 2026-09-27 (#275): `type="locate"` joins
+`ignis_decisions_total`'s label set. A `locate` is read off attention, not an
+answer position, so like `point` and `box` it observes **no** answer mass; it
+is counted once per question, and its content-free baseline prefill is not a
+decision and is not counted.
 
 ## Context
 
@@ -212,7 +216,7 @@ The initial stable metric contract is:
 | `ignis_decoded_tokens_total` | counter | none | Tokens generated so far, counted as each one is emitted |
 | `ignis_request_ttft_seconds` | histogram | none | Submission-to-first-token latency |
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
-| `ignis_decisions_total` | counter | `type=noul\|choice\|score\|scalar\|number\|point\|box` | Questions answered, by typed primitive (#241, #242, ADR 0034). **Absent until the first one** — see below |
+| `ignis_decisions_total` | counter | `type=noul\|choice\|score\|scalar\|number\|point\|box\|locate` | Questions answered, by typed primitive (#241, #242, #275, ADR 0034). **Absent until the first one** — see below |
 | `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
 | `ignis_thinking_forced_closes_total` | counter | none | Completed requests whose reasoning block the thinking budget closed (#265, spec server/08). The request log's `thinking_forced` says which. **Absent until the first one** |
 

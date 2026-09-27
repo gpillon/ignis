@@ -4,7 +4,9 @@
 
 Accepted (2026-09-23, owner — spec `docs/specs/decide/14-point-and-box-from-the-head-set.md`,
 GitHub #263). **Extends ADR 0038**, whose title and first decision say "one
-attention head". Everything ADR 0038 decided for that head holds for every
+attention head". **Extended by ADR 0041** (GitHub #275): a set may be read in
+whole rows over a text span, where one key a head cannot give a segment's
+mass. Everything ADR 0038 decided for that head holds for every
 head this one adds: the job names exactly what to read, exactly that comes
 back, the keys are the ones attention read, and a read the leaf cannot make
 is a failed question.

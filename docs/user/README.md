@@ -363,10 +363,46 @@ answer.
 ### Finding a line or an item
 
 To ask *which* line of a log, element of a list or sentence of a text answers an
-instruction, label the segments and ask a `choice` over the labels (Jev's "line
-search"). A `locate` that reads the answer from attention without labels was
-measured and did not ship: it lost to this recipe by 18 points
-([finding](../findings/2026-09-26-locate-attention-no-go.md)).
+instruction, ask a `locate` (GitHub #275). It reads the answer from the
+attention of calibrated heads in one prefill, with nothing written into the
+state and nothing generated:
+
+```bash
+curl http://127.0.0.1:8000/v1/decide \
+  -H 'Content-Type: application/json' \
+  -d '{"state":{"service":"billing","log":"09:21 INFO gateway: GET /v1/orders 200\n09:21 ERROR billing: provider returned 503\n09:22 INFO auth: user 61 signed in"},
+       "questions":{"cause":{"type":"locate",
+                             "instructions":"Which line says the card processor was unavailable?",
+                             "within":"/log"}}}'
+```
+
+```json
+{"type": "locate", "segment": 1, "value": "09:21 ERROR billing: provider returned 503",
+ "confidence": 0.84375, "ranking": [{"segment": 1, "share": 0.84375}, {"segment": 0, "share": 0.09375}]}
+```
+
+- The target is the `state`, or the part `within` names (a JSON Pointer): a
+  string, whose segments are its lines split on `\n` exactly, or a non-empty
+  array, whose segments are its elements. `segment` numbers them from 0, the
+  way `split("\n")` or the array index would, and `value` is the segment as you
+  sent it.
+- `confidence` is how much the heads agree — the winner's share of their votes —
+  not a probability, and a `locate` always names a segment: there is no "not
+  found". `ranking` is the voted segments, at most five.
+- Measured on a fresh set of logs, JSON record arrays and HotpotQA paragraphs,
+  it named the right one on 93.6% of the questions, three more than a `choice`
+  over labelled segments on the same questions, in less wall time
+  ([finding](../findings/2026-09-27-locate-through-decide.md)). It shares the
+  state's prefix with other `locate`s over it, and costs one more short prefill
+  per target: the same prompt with the instruction `N/A`, which the reading
+  subtracts.
+- A target longer than the span it was measured on (4,554 tokens on the served
+  artifact) is refused with `locate_too_long`, and a load whose artifact nobody
+  calibrated refuses every `locate` (`locate_uncalibrated`); the load says which
+  at start (`ignis.decide.locate`). Content-parts states are refused too.
+
+Past that length, or on such a load, label the segments and ask a `choice`
+over the labels (Jev's "line search"):
 
 - Prefix every non-empty line of a string `state` with its label and `: `, or
   turn an array into an object from label to element, in order.

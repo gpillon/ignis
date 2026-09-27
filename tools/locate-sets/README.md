@@ -22,6 +22,8 @@ not a new study, the way `tools/pointing-scenes/` is for `point`.
 | `test_score.py` | The scorer on a synthetic dump whose answer is known (`python tools/locate-sets/test_score.py`). |
 | `test_spans.py`, `test_generation.py`, `test_spanscore.py` | The span sets' promises (no download), the generation route's parsing and search, and the span scorer on a synthetic dump with planted heads. |
 | `test_profiles.py` | Phase 0's tables on a synthetic dump with planted heads -- an initiator, a terminator, a prior, an inside head (`python tools/locate-sets/test_profiles.py`). |
+| `served.py` | Spec 18 phase B's acceptance (GitHub #275): `ask` puts a set's questions to a running server as `locate`s through `/v1/decide`, one per request; `judge` applies the registered rule -- each family's top-1 at or above D's floor rate, on the present questions a `locate` serves -- and reports top-3, the confidence AUC, the refusals past `LOCATE_MAX_KEYS` and the wall time. |
+| `test_served.py` | The judge on rows whose verdict is known (`python tools/locate-sets/test_served.py`). |
 | `test_sets.py` | The generators' promises — the split holds on every question, one in six absent, a seed writes the same set — and the labelled route's state (`python tools/locate-sets/test_sets.py`; no download). |
 
 The harness is `crates/server/tests/attention_head_locate_gpu.rs`; the prompt
@@ -128,6 +130,7 @@ Spec 19 reads the same dumps again (`docs/findings/2026-09-27-a-head-vote-finds-
 | A, B | development: every choice |
 | C | replication only (spent by spec 18; read with the frozen vote after its registration) |
 | D | track L's check, once: **go**, 146/155 against the labels' 142 (`docs/findings/2026-09-27-locate-by-head-vote-go.md`) |
+| F | spec 18 phase B's acceptance through `/v1/decide`, once (`docs/findings/2026-09-27-locate-through-decide.md`) |
 
 ## Spec 19: spans (phase 1)
 
@@ -164,9 +167,29 @@ paraphrase half is the weaker one. SQuAD 2.0 dev is sha256
      --manifests <E1/manifest.json> <E2/manifest.json> --generation <E1-generation.json> <E2-generation.json> --out spans.json
    ```
 
+## Phase B: serving the vote, and its acceptance
+
+`/v1/decide` answers `locate` with the vote (`ignis_core::locate`, held to
+`score.py` by the golden cases `score.py golden` writes into
+`crates/core/tests/fixtures/locate_vote.json`), over the render
+`crates/server/src/locate.rs` writes -- the one the harness measures with,
+and the one `crates/server/tests/decide_locate_prompt.rs` pins to set D's
+recorded renders. Its acceptance, registered in spec 18 before set F existed:
+
+```text
+python tools/locate-sets/generate.py --seed 20261014 --out .scratch/locate/F --exclude <A> <B> <C> <D>
+make start
+python tools/locate-sets/served.py ask --set .scratch/locate/F --out F-served.json
+python tools/locate-sets/labelled.py --set .scratch/locate/F --alphabet <D-hq.json> --out F-labelled.json
+python tools/locate-sets/served.py judge --served F-served.json --labelled F-labelled.json --out F-acceptance.json
+make stop
+```
+
 ## Recalibrating for a new artifact
 
-Phase A again, with fresh seeds and the same rules:
+The served reading is the head vote (spec 19's track L), so a new artifact
+repeats its procedure -- phase A's sets and harness, spec 19 phase 0's
+choice -- and then phase B's acceptance:
 
 1. **Sets.** Generate new development, check and acceptance sets like A-D
    with seeds nobody has used, each excluding the ones before it.
@@ -174,13 +197,19 @@ Phase A again, with fresh seeds and the same rules:
    artifact, with the served render and the consumed hq keys (the defaults).
    A capture that fails its self-check is not a measurement: the test fails
    after writing the dump.
-3. **Choose** with `score.py dev` on the development dumps. The reading,
-   scaffold and baseline may come out differently for another model; the
-   rules decide, not the previous answer.
-4. **Judge** with `labelled.py` and `score.py check` on the check set, and
-   write the new `LOCATE_MAX_KEYS` and floors down before the acceptance set
-   runs.
-5. **Record** the heads (or set) and the choice as a new row of the
-   calibration table keyed to the artifact's content hash (spec 18,
-   "Calibration is a constant keyed to the artifact"), and the result as a
-   finding.
+3. **Choose** the vote on the development dumps: `profiles.py extract` and
+   `report --parts votes` for the heads by training hits, and the
+   configuration -- scaffold, baseline, K in {1, 3, 5, 8, 16, 32} -- by
+   cross-validated hits (spec 19, track L's procedure), written as a
+   `vote-choice.json`. The configuration may come out differently for
+   another model; the procedure decides, not the previous answer. The
+   served endpoint reads the copy scaffold with the baseline: a choice
+   outside that is a new reading, and a new spec.
+4. **Judge** with `labelled.py` and `score.py check --choice vote-choice.json`
+   on the check set, and write the new `LOCATE_MAX_KEYS` and floors down
+   before the acceptance set runs.
+5. **Record** the heads, in their order, and `LOCATE_MAX_KEYS` as a new row
+   of `crates/core/src/locate.rs`'s table keyed to the artifact's content
+   hash; regenerate the golden cases (`score.py golden`) if the reading's
+   arithmetic moved; run `served.py` on a fresh acceptance set; and record
+   the result as a finding.
