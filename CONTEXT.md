@@ -60,9 +60,9 @@ When output names a domain concept, use the term as defined here.
   operator names it) or derived (the memory free at start minus the **VRAM
   headroom**). Every device reservation is carved from it at load, and serving
   allocates nothing on the device beyond it. A budget that cannot hold the
-  minimum — weights, workspaces, every lane, every **retained slot**, and one
-  sequence at the maximum context with a KV page per retained slot beside
-  it — refuses the start.
+  minimum — weights, workspaces, every lane, every device **retained slot**,
+  and one sequence at the maximum context with a KV page per retained slot of
+  either kind beside it — refuses the start.
 - **VRAM headroom** — the device memory a derived **VRAM budget** leaves to
   everything else on the card: the desktop and other processes.
 - **VRAM oversubscription** — holding more device memory than the card has
@@ -301,8 +301,13 @@ When output names a domain concept, use the term as defined here.
   a **shared prefix** (retained, chained or still claimed) or of a **prompt
   checkpoint**, the same size as a **lane**'s own state (under hq-e8-2b that
   includes its **residual window**, which the VRAM plan counts on a line of its
-  own). There is one per lane
-  unless the operator says otherwise. When none is free, the lowest-ranked
+  own). Two kinds: a **device** retained slot sits in the device state arenas
+  beside the lanes and is copied device to device; a **host** retained slot
+  sits in one pinned host block reserved at load and costs a PCIe copy per
+  capture and per claim, but no VRAM. By default there is none of the first
+  and two per lane of the second; a free device slot is always taken before a
+  host one. The KV pages of what a slot holds stay in the device pool either
+  way. When none is free, the lowest-ranked
   **retained state** gives its slot up; when nothing can, the publish or
   capture is skipped and the request runs without leaving reuse behind.
   _Avoid_: retained pool (a ledger of bytes, not a place).
