@@ -123,6 +123,16 @@ FOLD_INPUTS = {
         json.dumps({"id": 4, "name": "Dee", "tags": ["a", "b"], "ok": True, "n": None}, ensure_ascii=False),
     ],
     "string elements": ["apple pie", "apple tart", "banana split", "cherry"],
+    "a bracket that holds a time is no label": [
+        "[Sun Dec 04 04:47:44 2005] [notice] workerEnv.init() ok /etc/httpd/conf/workers2.properties",
+        "[Sun Dec 04 04:47:45 2005] [notice] workerEnv.init() ok /etc/httpd/conf/workers2.properties",
+        "[Sun Dec 04 04:51:08 2005] [error] mod_jk child workerEnv in error state 6",
+        "[Mon Dec 05 10:12:01 2005] [error] mod_jk child workerEnv in error state 7",
+        "[10.30 16:49:06] chrome.exe - proxy.cse.cuhk.edu.hk:5070 open through proxy proxy.cse.cuhk.edu.hk:5070 HTTPS",
+        "[10.30 16:49:07] chrome.exe - proxy.cse.cuhk.edu.hk:5070 open through proxy proxy.cse.cuhk.edu.hk:5070 HTTPS",
+        "[svc-a] a real label keeps its line 12",
+        "[svc-a] a real label keeps its line 13",
+    ],
     "one line": ["just one line with 12 values"],
     "one template": ["tick 1", "tick 2", "tick 3", "tick 3"],
 }

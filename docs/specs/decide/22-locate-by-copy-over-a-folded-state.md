@@ -373,8 +373,11 @@ as its text, anything else as its **spaced JSON** — Python's
 `json.dumps(element, ensure_ascii=False)`: `", "` and `": "` separators,
 keys in the order sent); empty segments are left out. The map (template, row)
 → original segments; the answer is the first. Kept as measured, and
-documented: a bracket-opened line is read as a source label; level 1 drops
-every time; folding removes lines' order and neighbours.
+documented: a bracket-opened line is read as a source label — unless the
+bracket holds a time, which is then the line's timestamp (corrected
+2026-09-28 after R3's first run: Apache's `[Sun Dec 04 04:47:44 2005]` and
+Proxifier's `[10.30 16:49:06]` put every line in a template of its own); level
+1 drops every time; folding removes lines' order and neighbours.
 
 ### The heads and their readings
 

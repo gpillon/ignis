@@ -457,7 +457,8 @@ several sentences a two-part answer needs.
   answer is the first of them.
 - **Folding removes order and neighbours.** Level 1 drops every time, a
   line's neighbours are not read, and a bracket-opened line (`[svc-a] …`) is
-  read as a source label. A question that needs context across lines, or
+  read as a source label — unless the bracket holds a time
+  (`[Sun Dec 04 04:47:44 2005] …`), which is then the line's timestamp. A question that needs context across lines, or
   names a line by its time alone, is better asked with `compression: "none"`.
 - **Windows.** A text the heads read that is longer than 200,000 tokens is cut
   at segment boundaries — at paragraph breaks where there are any — and each

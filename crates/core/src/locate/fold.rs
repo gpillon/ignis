@@ -24,8 +24,8 @@
 //!   the lines it stands for.
 //!
 //! Kept as measured, and documented for callers: a bracket-opened line is
-//! read as a source label; level 1 drops every time; folding removes lines'
-//! order and neighbours.
+//! read as a source label unless the bracket holds a time; level 1 drops
+//! every time; folding removes lines' order and neighbours.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -87,11 +87,15 @@ fn tokens(text: &str) -> Vec<String> {
     TOKEN.find_iter(text).map(|m| m.as_str().to_owned()).collect()
 }
 
-/// The line's label and the rest of it.
+/// The line's label and the rest of it. A bracket-opened prefix is the
+/// line's source label (`[svc-a]`) — unless it holds a time: then it is the
+/// line's timestamp (`[Sun Dec 04 04:47:44 2005]`, `[10.30 16:49:06]`), and
+/// a label read from it would put every line in a template of its own
+/// (GitHub #278, found on set R3's first run).
 fn split_label(line: &str) -> (&str, &str) {
     match LABEL.find(line) {
-        Some(m) => (m.as_str(), &line[m.end()..]),
-        None => ("", line),
+        Some(m) if !TIME.is_match(m.as_str()) => (m.as_str(), &line[m.end()..]),
+        _ => ("", line),
     }
 }
 

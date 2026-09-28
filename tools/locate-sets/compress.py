@@ -32,8 +32,15 @@ LABEL = re.compile(r"^\[[^\]]*\]")
 
 
 def split_label(line):
+    """A bracket-opened prefix is the line's source label (`[svc-a]`) —
+    unless it holds a time: then it is the line's timestamp
+    (`[Sun Dec 04 04:47:44 2005]`, `[10.30 16:49:06]`), and a label read
+    from it would put every line in a template of its own (spec 22,
+    GitHub #278, found on R3's first run)."""
     m = LABEL.match(line)
-    return (m.group(0), line[m.end():]) if m else ("", line)
+    if m and not TIME.search(m.group(0)):
+        return m.group(0), line[m.end():]
+    return "", line
 
 
 def stamp_of(line):

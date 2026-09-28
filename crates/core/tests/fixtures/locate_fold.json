@@ -1402,6 +1402,152 @@
    ]
   },
   {
+   "name": "a bracket that holds a time is no label",
+   "lines": [
+    "[Sun Dec 04 04:47:44 2005] [notice] workerEnv.init() ok /etc/httpd/conf/workers2.properties",
+    "[Sun Dec 04 04:47:45 2005] [notice] workerEnv.init() ok /etc/httpd/conf/workers2.properties",
+    "[Sun Dec 04 04:51:08 2005] [error] mod_jk child workerEnv in error state 6",
+    "[Mon Dec 05 10:12:01 2005] [error] mod_jk child workerEnv in error state 7",
+    "[10.30 16:49:06] chrome.exe - proxy.cse.cuhk.edu.hk:5070 open through proxy proxy.cse.cuhk.edu.hk:5070 HTTPS",
+    "[10.30 16:49:07] chrome.exe - proxy.cse.cuhk.edu.hk:5070 open through proxy proxy.cse.cuhk.edu.hk:5070 HTTPS",
+    "[svc-a] a real label keeps its line 12",
+    "[svc-a] a real label keeps its line 13"
+   ],
+   "clusters": [
+    {
+     "label": "",
+     "template": [
+      "[Sun",
+      "Dec",
+      "<v>",
+      "<v>",
+      "[notice]",
+      "workerEnv.init()",
+      "ok",
+      "/etc/httpd/conf/workers2.properties"
+     ],
+     "members": [
+      0,
+      1
+     ]
+    },
+    {
+     "label": "",
+     "template": [
+      "<*>",
+      "Dec",
+      "<v>",
+      "<v>",
+      "[error]",
+      "mod_jk",
+      "child",
+      "workerEnv",
+      "in",
+      "error",
+      "state",
+      "<v>"
+     ],
+     "members": [
+      2,
+      3
+     ]
+    },
+    {
+     "label": "",
+     "template": [
+      "<v>",
+      "]",
+      "chrome.exe",
+      "-",
+      "proxy.cse.cuhk.edu.hk:5070",
+      "open",
+      "through",
+      "proxy",
+      "proxy.cse.cuhk.edu.hk:5070",
+      "HTTPS"
+     ],
+     "members": [
+      4,
+      5
+     ]
+    },
+    {
+     "label": "[svc-a]",
+     "template": [
+      "a",
+      "real",
+      "label",
+      "keeps",
+      "its",
+      "line",
+      "<v>"
+     ],
+     "members": [
+      6,
+      7
+     ]
+    }
+   ],
+   "level1": [
+    "[Sun Dec 04 2005] [notice] workerEnv.init() ok /etc/httpd/conf/workers2.properties (x2)",
+    "{[Sun|[Mon} Dec {04|05} 2005] [error] mod_jk child workerEnv in error state {6|7} (x2)",
+    "[10.30 ] chrome.exe - proxy.cse.cuhk.edu.hk:5070 open through proxy proxy.cse.cuhk.edu.hk:5070 HTTPS (x2)",
+    "[svc-a] a real label keeps its line {12|13} (x2)"
+   ],
+   "level2": [
+    {
+     "texts": [
+      "04 | 2005] @ 04:47:44 (x2)"
+     ],
+     "members": [
+      [
+       0,
+       1
+      ]
+     ]
+    },
+    {
+     "texts": [
+      "Su | 4 | 2005] | 6 @ 04:51:08",
+      "Mo | 5 | 2005] | 7 @ 10:12:01"
+     ],
+     "members": [
+      [
+       2
+      ],
+      [
+       3
+      ]
+     ]
+    },
+    {
+     "texts": [
+      "[10.30 @ 16:49:06 (x2)"
+     ],
+     "members": [
+      [
+       4,
+       5
+      ]
+     ]
+    },
+    {
+     "texts": [
+      "2",
+      "3"
+     ],
+     "members": [
+      [
+       6
+      ],
+      [
+       7
+      ]
+     ]
+    }
+   ]
+  },
+  {
    "name": "one line",
    "lines": [
     "just one line with 12 values"
