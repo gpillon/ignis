@@ -6,6 +6,11 @@ Proposed (2026-09-28, revised twice the same day — spec
 `docs/specs/decide/22-locate-by-copy-over-a-folded-state.md`, GitHub #278).
 Accepted when spec 22's acceptance holds, with its numbers written here.
 **Extends ADR 0041**, whose head vote becomes one of two methods, unchanged.
+**Partial acceptance, 2026-09-28**
+(`docs/findings/2026-09-28-locate-shortlist-acceptance-partial.md`): every
+rule judged on the runs made holds but rule 9 (`auto` misread one Apache
+window; the fold's rule is corrected since); the rest of the runs are a
+verification still to make, and this ADR stays Proposed until then.
 The file keeps the name of its first version, whose decision (a constrained
 copy by default) this revision replaces before anything was built; the copy
 is a future study (#279).
