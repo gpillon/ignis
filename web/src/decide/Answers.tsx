@@ -1,7 +1,17 @@
 import { useState } from "react";
 import { asText } from "./json.ts";
 import { Bar, BoxGlyph, DigitTrace, DistributionRow, ImageMark, NoulMark, PointGlyph, ScoreMark } from "./marks.tsx";
-import { DEFAULT_CEILING, type Draft, evidenceImage, locateTarget, type Question } from "./model.ts";
+import { FOUND_THRESHOLD, type Target } from "./locate.ts";
+import {
+  type Compression,
+  DEFAULT_CEILING,
+  type Draft,
+  evidenceImage,
+  type LocateMethod,
+  locateTarget,
+  type Question,
+  type ResolvedKind,
+} from "./model.ts";
 import { type Answer, AXES, levelOrder, type Run } from "./request.ts";
 
 // What came back (GitHub #247), read in the order the request declared.
@@ -53,11 +63,11 @@ function Cost({ run, anyGenerated, located }: { run: Run; anyGenerated: boolean;
       <p className="mt-1.5 text-[12px] leading-snug text-ash">
         {anyGenerated
           ? "A number, and a point or a box answered by the digit chain, generate a digit per step, and a scalar generates until its number is complete, so those tokens are real. The readouts beside them generated none, and neither did a point or a box read off the calibrated heads, or a locate."
-          : "Nothing was generated: out of a single prefill of the evidence, every answer was read from the logits of one position — or, for a point or a box off the calibrated heads and for a locate, from their attention."}
-        {/* A locate's baseline is real prefill the caller pays for, and the
-            one input the figure above holds that no question asked. */}
+          : "Nothing was generated: out of a single prefill of the evidence, every answer was read from the logits of one position — or, for a point or a box off the calibrated heads, from their attention, and for a locate from the heads' attention and then a labelled choice's logits."}
+        {/* A locate's baselines and steps are real prefill the caller pays
+            for, and inputs the figure above holds that no question asked. */}
         {located &&
-          " A locate also pays one short prefill more per target: the same evidence asked “N/A”, the content-free baseline its vote subtracts. The prompt tokens count it."}
+          " A locate pays for more prefills than its question: each window its heads read, with that window's content-free twin — the same text asked “N/A”, the baseline the heads' reading subtracts — and on the shortlist a fold's levels and every choice it asks. The prompt tokens count them all."}
       </p>
     </div>
   );
@@ -472,36 +482,211 @@ function Region({ region }: { region: { cells: number; share: number } }) {
   );
 }
 
-/** Segments either side of a `locate`'s winner that the context shows. */
+/** Segments either side of a `locate`'s pick that the context shows. */
 const CONTEXT = 2;
 
+type Located = Extract<Answer, { type: "locate" }>;
+
+/** What each resolved kind, method and compression did, for the chip that names it (GitHub #278). */
+const KIND_TITLE: Record<ResolvedKind, string> = {
+  log: "Read as a log: the end heads read each line where it ends",
+  prose: "Read as prose: the sum heads read every key of a sentence, and the choice saw each candidate inside its paragraph",
+  records: "Read as records: an array of JSON objects, each shown to the choice as one line of JSON",
+};
+const LOCATE_METHOD_TITLE: Record<LocateMethod, string> = {
+  shortlist: "The calibrated heads narrowed the text to a few candidates and a labelled choice picked among them — nothing generated",
+  vote: "The head vote: one prefill, and the calibrated heads' votes over the whole target",
+};
+const COMPRESSION_TITLE: Record<Compression, string> = {
+  template_fold: "Folded into templates and their values first, so nothing near the text's length was prefilled",
+  none: "Read as it is, window by window",
+};
+
 /**
- * A `locate`: the segment it named, where that sits in the target, and how
- * the heads' votes fell.
+ * A `locate`: whether the text answers, the segment it named and where that
+ * sits in the target, every segment it points at, and how its candidates
+ * ranked.
  *
- * The answer carries indices and the winner's own text, nothing more, so the
+ * The answer carries indices and the pointers' own text, nothing more, so the
  * rest is read off the **sent** draft's target, cut the way the server cut it
  * (`locate.ts`). The context is there because a line of a log is rarely
  * judged alone — the reader wants the lines around it — and the ranking
  * because a close second is the one thing the confidence cannot show.
+ *
+ * Below a `found` of 0.5 (GitHub #278) there is no segment to show: the
+ * answer says "not found" and the ranking is still listed, because the best
+ * guess is still the caller's to take.
  */
-function LocateBody({ question, answer, draft }: { question: Question; answer: Extract<Answer, { type: "locate" }>; draft: Draft }) {
+function LocateBody({ question, answer, draft }: { question: Question; answer: Located; draft: Draft }) {
   const cut = locateTarget(draft.evidence, question.within);
   const target = cut?.ok ? cut.target : null;
   const unit = target?.unit ?? (typeof answer.value === "string" ? "line" : "item");
-  const text = (segment: number): string | undefined => target?.segments[segment];
+  const pick = answer.segment;
+  const vote = answer.method === "vote";
+  // A pointer carries its segment's value, so a row reads even when the
+  // target is no longer on the page.
+  const pointed = new Map(answer.pointers.map((pointer) => [pointer.segment, segmentText(pointer.value)]));
+  const text = (segment: number): string | undefined => target?.segments[segment] ?? pointed.get(segment);
   const shares = new Map(answer.ranking.map((rank) => [rank.segment, rank.share]));
-  const from = Math.max(0, answer.segment - CONTEXT);
-  const to = Math.min((target?.segments.length ?? 0) - 1, answer.segment + CONTEXT);
-  const context = target ? Array.from({ length: to - from + 1 }, (_, i) => from + i) : [];
   return (
     <div>
+      <Route question={question} answer={answer} />
+      {answer.found === undefined ? (
+        <p className="mt-2 text-[12px] leading-snug text-ash">This route carries no found: it names {unit === "line" ? "a line" : "an item"} whatever the text holds.</p>
+      ) : (
+        <Found value={answer.found} />
+      )}
+
+      <div className="mt-3">
+        {pick === null ? (
+          <NotFound unit={unit} />
+        ) : (
+          <Pick question={question} pick={pick} value={answer.value} unit={unit} target={target} shares={shares} />
+        )}
+      </div>
+
+      {answer.pointers.length > 0 && (
+        <>
+          <p className="mt-3 font-display text-[11px] text-ash">
+            {vote ? "Pointers — a vote points at its winner alone" : "Pointers — every candidate at 0.05 or more, the pick first"}
+          </p>
+          <ol className="mt-1">
+            {answer.pointers.map((pointer) => (
+              <SegmentRow key={pointer.segment} segment={pointer.segment} text={segmentText(pointer.value)} share={pointer.share} picked={pointer.segment === pick} />
+            ))}
+          </ol>
+        </>
+      )}
+
+      <p className="mt-3 font-display text-[11px] text-ash">{vote ? "How the heads voted" : "How the choice ranked its candidates"}</p>
+      <ol className="mt-1">
+        {answer.ranking.map((rank) => (
+          <SegmentRow key={rank.segment} segment={rank.segment} text={text(rank.segment) ?? ""} share={rank.share} picked={rank.segment === pick} />
+        ))}
+      </ol>
+      {answer.confidence !== null &&
+        (vote ? (
+          <Confidence
+            value={answer.confidence}
+            note="the winner's share of the heads' votes"
+            detail={
+              "How much the calibrated heads agree, not a probability. Served on a fresh set it named the right segment 93.6% of the time, " +
+              "with a median 0.625 on those and 0.375 on the misses — and 0.375 when the answer was not in the evidence at all: " +
+              "a vote always names a segment, and a low share is the only sign that nothing matched."
+            }
+          />
+        ) : (
+          <Confidence
+            value={answer.confidence}
+            note="the pick's share of the choice"
+            detail={
+              "The labelled choice's probability of the pick among the candidates the heads kept — under a fold, times the probability " +
+              "of the template its first choice picked. Not a calibrated probability: it says how sure the choice was, not how often it is right."
+            }
+          />
+        ))}
+    </div>
+  );
+}
+
+/**
+ * What answered a `locate` (GitHub #278): the kind its text resolved to, the
+ * method and the compression. The answer's facts and not the question's — a
+ * question that named none of them is answered by the defaults — and each one
+ * the question left to the endpoint says so beside it, so a default nobody
+ * wrote is visible.
+ */
+function Route({ question, answer }: { question: Question; answer: Located }) {
+  const parts = [
+    { name: "kind", value: answer.kind, title: KIND_TITLE[answer.kind], left: question.textKind === null ? "told by auto" : null },
+    { name: "method", value: answer.method, title: LOCATE_METHOD_TITLE[answer.method], left: question.locateMethod === null ? "default" : null },
+    {
+      name: "compression",
+      value: answer.compression,
+      title: COMPRESSION_TITLE[answer.compression],
+      left: question.compression === null ? "default" : null,
+    },
+  ];
+  return (
+    <p className="flex flex-wrap items-baseline gap-x-4 gap-y-1.5 font-display text-[11px] text-ash" aria-label="What answered it">
+      {parts.map((part) => (
+        <span key={part.name} className="flex items-baseline gap-1.5" title={part.title}>
+          {part.name}
+          <span className="cut bg-surface px-2 py-0.5 text-[12px] text-ember [--cut-size:5px]">{part.value}</span>
+          {part.left && <span className="text-ash/80">{part.left}</span>}
+        </span>
+      ))}
+    </p>
+  );
+}
+
+/**
+ * Whether the text answers at all (GitHub #278), on the three routes that
+ * measured it. The same row as a confidence, because it reads the same way:
+ * a figure, its bar, and what the figure means at this value.
+ */
+function Found({ value }: { value: number }) {
+  return (
+    <div className="mt-2 flex items-center gap-3">
+      <span className="font-display text-[11px] text-ash">found</span>
+      <span className="w-14 shrink-0">
+        <Bar value={value} dim />
+      </span>
+      <span className="font-display text-[13px] tabular-nums text-ink">{value.toFixed(3)}</span>
+      <span
+        className="min-w-0 truncate text-[12px] text-ash"
+        title={
+          "The last choice asked again, in the same request, with one more option — nothing in the evidence answers — and for a folded log a yes/no beside it: " +
+          "1 − p(none), averaged with p(yes) on a log. Not a calibrated probability. Below 0.5 the answer names nothing and points at nothing, and the ranking still lists what it weighed."
+        }
+      >
+        {value >= FOUND_THRESHOLD ? "0.5 or more: the text answers, by this route's reading" : "under 0.5: nothing in the text answers, by this route's reading"}
+      </span>
+    </div>
+  );
+}
+
+/** "Not found": no segment, no pointer, and the ranking below still the caller's to read. */
+function NotFound({ unit }: { unit: "line" | "item" }) {
+  return (
+    <>
+      <p className="font-display text-[28px] font-semibold leading-none text-ember">Not found</p>
+      <p className="mt-2 text-[12px] leading-snug text-ash">
+        No {unit} answers the instruction, by this route's reading, so the answer names none and points at none. The candidates it
+        weighed are still ranked below — the first is its best guess, to take knowingly.
+      </p>
+    </>
+  );
+}
+
+/** The segment a `locate` named, as the caller sent it, and the segments either side of it in the target. */
+function Pick({
+  question,
+  pick,
+  value,
+  unit,
+  target,
+  shares,
+}: {
+  question: Question;
+  pick: number;
+  value: unknown;
+  unit: "line" | "item";
+  target: Target | null;
+  shares: Map<number, number>;
+}) {
+  const text = (segment: number): string | undefined => target?.segments[segment];
+  const from = Math.max(0, pick - CONTEXT);
+  const to = Math.min((target?.segments.length ?? 0) - 1, pick + CONTEXT);
+  const context = target ? Array.from({ length: to - from + 1 }, (_, i) => from + i) : [];
+  return (
+    <>
       <p className="font-display text-[13px] text-ash">
-        {unit} <span className="tabular-nums text-ink">{answer.segment}</span>
+        {unit} <span className="tabular-nums text-ink">{pick}</span>
         {target && <span> of {target.segments.length}</span>}
         {question.within !== "" && <span className="ml-2 font-mono text-[12px]">in {question.within}</span>}
       </p>
-      <p className="mt-1 break-words font-mono text-[17px] font-semibold leading-snug text-ember">{segmentText(answer.value)}</p>
+      <p className="mt-1 break-words font-mono text-[17px] font-semibold leading-snug text-ember">{segmentText(value)}</p>
 
       {context.length > 0 && (
         <ol className="mt-3 border border-line bg-ground py-1 font-mono text-[12px] leading-relaxed" aria-label={`The ${unit}s around it`}>
@@ -509,7 +694,7 @@ function LocateBody({ question, answer, draft }: { question: Question; answer: E
           {context.map((segment) => (
             <li
               key={segment}
-              className={`flex gap-2 border-l-2 px-2 ${segment === answer.segment ? "border-l-ember bg-surface text-ink" : "border-l-transparent text-ash"}`}
+              className={`flex gap-2 border-l-2 px-2 ${segment === pick ? "border-l-ember bg-surface text-ink" : "border-l-transparent text-ash"}`}
             >
               <span className="w-8 shrink-0 text-right tabular-nums text-ash/80">{segment}</span>
               <span className="min-w-0 flex-1 truncate" title={text(segment)}>
@@ -521,36 +706,24 @@ function LocateBody({ question, answer, draft }: { question: Question; answer: E
           {target && to < target.segments.length - 1 && <li className="px-2 text-ash/70">⋯</li>}
         </ol>
       )}
+    </>
+  );
+}
 
-      <p className={`mt-3 font-display text-[11px] text-ash`}>How the heads voted</p>
-      <ol className="mt-1">
-        {answer.ranking.map((rank) => {
-          const winner = rank.segment === answer.segment;
-          return (
-            <li key={rank.segment} className="grid grid-cols-[2.5rem_minmax(0,1fr)_3.5rem_3.2rem] items-center gap-x-3 py-1">
-              <span className={`text-right font-display text-[13px] tabular-nums ${winner ? "font-semibold text-ink" : "text-ash"}`}>
-                {winner && <span className="mr-1.5 inline-block size-1.5 bg-ember align-middle" aria-hidden />}
-                {rank.segment}
-              </span>
-              <span className={`truncate font-mono text-[12px] ${winner ? "text-ink" : "text-ash"}`} title={text(rank.segment)}>
-                {text(rank.segment) ?? (winner ? segmentText(answer.value) : "")}
-              </span>
-              <Bar value={rank.share} dim={!winner} />
-              <span className="text-right font-display text-[13px] tabular-nums text-ink">{rank.share.toFixed(3)}</span>
-            </li>
-          );
-        })}
-      </ol>
-      <Confidence
-        value={answer.confidence}
-        note="the winner's share of the heads' votes"
-        detail={
-          "How much the calibrated heads agree, not a probability. Served on a fresh set it named the right segment 93.6% of the time, " +
-          "with a median 0.625 on those and 0.375 on the misses — and 0.375 when the answer was not in the evidence at all: " +
-          "a locate always names a segment, and a low share is the only sign that nothing matched."
-        }
-      />
-    </div>
+/** One segment in a pointer or a ranking list: its index, its text, its share, and whether it is the pick. */
+function SegmentRow({ segment, text, share, picked }: { segment: number; text: string; share: number; picked: boolean }) {
+  return (
+    <li className="grid grid-cols-[2.5rem_minmax(0,1fr)_3.5rem_3.2rem] items-center gap-x-3 py-1">
+      <span className={`text-right font-display text-[13px] tabular-nums ${picked ? "font-semibold text-ink" : "text-ash"}`}>
+        {picked && <span className="mr-1.5 inline-block size-1.5 bg-ember align-middle" aria-hidden />}
+        {segment}
+      </span>
+      <span className={`truncate font-mono text-[12px] ${picked ? "text-ink" : "text-ash"}`} title={text}>
+        {text}
+      </span>
+      <Bar value={share} dim={!picked} />
+      <span className="text-right font-display text-[13px] tabular-nums text-ink">{share.toFixed(3)}</span>
+    </li>
   );
 }
 

@@ -552,8 +552,13 @@ describe("Answers", () => {
 
   describe("a locate", () => {
     const log = ["l0 boot", "l1 ok", "l2 ok", "l3 pg: FATAL too many clients", "l4 ok", "l5 ok", "l6 ok", "l7 done"].join("\n");
+    // The vote, as GitHub #278 answers it: the kind the target resolved to,
+    // no `found`, and its winner as the one pointer.
     const answer: Answer = {
       type: "locate",
+      kind: "log",
+      method: "vote",
+      compression: "none",
       segment: 3,
       value: "l3 pg: FATAL too many clients",
       confidence: 0.625,
@@ -562,6 +567,7 @@ describe("Answers", () => {
         { segment: 7, share: 0.25 },
         { segment: 0, share: 0.125 },
       ],
+      pointers: [{ segment: 3, value: "l3 pg: FATAL too many clients", share: 0.625 }],
     };
 
     it("names the segment it found, as the caller sent it, and where it sits", () => {
@@ -592,7 +598,20 @@ describe("Answers", () => {
       const evidence: Evidence = { mode: "json", text: '{"tickets": [{"id": 1}, {"id": 2}, {"id": 3}]}' };
       const html = render(
         [question("t", "locate", { within: "/tickets" })],
-        { t: { type: "locate", segment: 1, value: { id: 2 }, confidence: 0.5, ranking: [{ segment: 1, share: 0.5 }, { segment: 2, share: 0.5 }] } },
+        {
+          t: {
+            type: "locate",
+            kind: "records",
+            method: "shortlist",
+            compression: "none",
+            found: 0.9,
+            segment: 1,
+            value: { id: 2 },
+            confidence: 0.5,
+            ranking: [{ segment: 1, share: 0.5 }, { segment: 2, share: 0.5 }],
+            pointers: [{ segment: 1, value: { id: 2 }, share: 0.5 }, { segment: 2, value: { id: 3 }, share: 0.5 }],
+          },
+        },
         evidence,
       );
       expect(html).toContain("item <span");
@@ -600,10 +619,112 @@ describe("Answers", () => {
       expect(html).toContain("{&quot;id&quot;:2}");
     });
 
-    it("counts the content-free baseline among the prompt tokens it paid for", () => {
+    it("counts the content-free twins and the shortlist's steps among the prompt tokens it paid for", () => {
       const html = render([question("where", "locate")], { where: answer }, { mode: "text", text: log });
-      expect(html).toContain("one short prefill more per target");
-      expect(render([question("a", "noul")], { a: { type: "noul", noul: 0.5 } })).not.toContain("one short prefill more");
+      expect(html).toContain("A locate pays for more prefills than its question");
+      expect(html).toContain("content-free twin");
+      expect(render([question("a", "noul")], { a: { type: "noul", noul: 0.5 } })).not.toContain("more prefills than its question");
+    });
+
+    // GitHub #278, spec 22: the shortlist names its route, says whether the
+    // text answers at all, and points at every candidate the choice gave
+    // 0.05 or more.
+    const shortlist: Extract<Answer, { type: "locate" }> = {
+      type: "locate",
+      kind: "log",
+      method: "shortlist",
+      compression: "template_fold",
+      found: 0.97,
+      segment: 3,
+      value: "l3 pg: FATAL too many clients",
+      confidence: 0.61,
+      ranking: [
+        { segment: 3, share: 0.61 },
+        { segment: 5, share: 0.21 },
+        { segment: 4, share: 0.07 },
+        { segment: 6, share: 0.06 },
+        { segment: 1, share: 0.051 },
+      ],
+      // Six pointers against a ranking of five: `pointers` is every
+      // candidate at 0.05 or more, and the ranking stops at five.
+      pointers: [
+        { segment: 3, value: "l3 pg: FATAL too many clients", share: 0.61 },
+        { segment: 5, value: "l5 ok", share: 0.21 },
+        { segment: 4, value: "l4 ok", share: 0.07 },
+        { segment: 6, value: "l6 ok", share: 0.06 },
+        { segment: 1, value: "l1 ok", share: 0.051 },
+        { segment: 7, value: "l7 done", share: 0.05 },
+      ],
+    };
+
+    it("names the route that answered it, and which parts of it the question left to the endpoint", () => {
+      const defaults = render([question("where", "locate")], { where: shortlist }, { mode: "text", text: log });
+      const route = defaults.slice(defaults.indexOf('aria-label="What answered it"'), defaults.indexOf("found</span>"));
+      for (const value of [">log<", ">shortlist<", ">template_fold<"]) expect(route, value).toContain(value);
+      expect(route).toContain("told by auto");
+      expect(route.match(/>default</g)).toHaveLength(2);
+      // Named on the question, it is the question's and says nothing more.
+      const named = render(
+        [question("where", "locate", { textKind: "log", locateMethod: null, compression: "template_fold" })],
+        { where: shortlist },
+        { mode: "text", text: log },
+      );
+      expect(named).not.toContain("told by auto");
+      expect(named.match(/>default</g)).toHaveLength(1);
+    });
+
+    it("shows found with its figure, and every pointer with its share — past the five the ranking lists", () => {
+      const html = render([question("where", "locate")], { where: shortlist }, { mode: "text", text: log });
+      expect(html).toContain("0.970");
+      expect(html).toContain("0.5 or more: the text answers");
+      const pointers = html.slice(html.indexOf("Pointers"), html.indexOf("How the choice ranked its candidates"));
+      expect(order(pointers, ["l3 pg", "l5 ok", "l4 ok", "l6 ok", "l1 ok", "l7 done"])).toEqual(["l3 pg", "l5 ok", "l4 ok", "l6 ok", "l1 ok", "l7 done"]);
+      for (const share of ["0.610", "0.210", "0.070", "0.060", "0.051", "0.050"]) expect(pointers, share).toContain(share);
+      // The ranking is the choice's, not the heads' votes, and so is the
+      // confidence under it.
+      expect(html).not.toContain("How the heads voted");
+      expect(html).toContain("the pick&#x27;s share of the choice");
+      expect(html).not.toContain("the winner&#x27;s share of the heads&#x27; votes");
+    });
+
+    it("says not found under 0.5, names and points at nothing, and still lists the ranking", () => {
+      const absent: Answer = {
+        ...shortlist,
+        found: 0.31,
+        segment: null,
+        value: null,
+        confidence: null,
+        pointers: [],
+      };
+      const html = render([question("where", "locate")], { where: absent }, { mode: "text", text: log });
+      expect(html).toContain(">Not found</p>");
+      expect(html).toContain("0.310");
+      expect(html).toContain("under 0.5: nothing in the text answers");
+      // Nothing is named: no segment line, no context, no pointers, no confidence.
+      expect(html).not.toMatch(/line <span[^>]*>\d+<\/span>/);
+      expect(html).not.toContain("The lines around it");
+      expect(html).not.toContain("Pointers");
+      expect(html).not.toContain(">confidence<");
+      // The candidates are still there, as text, for the caller's own threshold.
+      const ranking = html.slice(html.indexOf("How the choice ranked its candidates"));
+      expect(order(ranking, ["l3 pg", "l5 ok", "l4 ok"])).toEqual(["l3 pg", "l5 ok", "l4 ok"]);
+      expect(ranking).toContain("0.610");
+    });
+
+    it("says so when its route carries no found, and names a segment all the same", () => {
+      const unmeasured: Answer = { ...shortlist, compression: "none", found: undefined };
+      const html = render([question("where", "locate", { compression: "none" })], { where: unmeasured }, { mode: "text", text: log });
+      expect(html).toContain("This route carries no found");
+      expect(html).not.toContain("found</span>");
+      expect(html).toMatch(/line <span[^>]*>3<\/span>/);
+    });
+
+    it("reads a pointer's text off the answer when the target is no longer on the page", () => {
+      // The evidence was edited away from a text: the cut is gone, but the
+      // pointers carry their values.
+      const html = render([question("where", "locate")], { where: shortlist }, { mode: "image", images: [], text: "" });
+      const ranking = html.slice(html.indexOf("How the choice ranked its candidates"));
+      expect(ranking).toContain("l5 ok");
     });
   });
 

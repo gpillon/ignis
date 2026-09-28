@@ -123,27 +123,34 @@ describe("mockDecide", () => {
     expect(send({ state: "s", questions: {} }).status).toBe(422);
   });
 
-  it("answers a locate with a segment that owns a key, in whole votes of the heads, and generates nothing", () => {
+  it("answers a vote with a segment that owns a key, in whole votes of the heads, and generates nothing", () => {
+    // The vote is pinned by name (spec 22): the shortlist is the default now.
     const state = { log: "a start\n\nb middle\nc end", tickets: [{ id: 1 }, { id: 2 }, { id: 3 }] };
     const { status, body } = send({
       state,
       questions: {
-        line: { type: "locate", instructions: "Which line?", within: "/log" },
-        item: { type: "locate", instructions: "Which ticket?", within: "/tickets" },
+        line: { type: "locate", instructions: "Which line?", within: "/log", method: "vote" },
+        item: { type: "locate", instructions: "Which ticket?", within: "/tickets", method: "vote" },
       },
     });
     expect(status).toBe(200);
-    const line = body.answers.line as { segment: number; value: unknown; confidence: number; ranking: { segment: number; share: number }[] };
+    const line = body.answers.line as unknown as Located;
     // The blank line is segment 1, and a locate never names it.
     expect([0, 2, 3]).toContain(line.segment);
-    expect(line.value).toBe(state.log.split("\n")[line.segment]);
+    expect(line.value).toBe(state.log.split("\n")[line.segment!]);
     expect(line.confidence).toBe(line.ranking[0].share);
     expect(line.ranking.length).toBeLessThanOrEqual(5);
     for (const { share } of line.ranking) expect(Number.isInteger(share * 32)).toBe(true);
     const shares = line.ranking.map((r) => r.share);
     expect(shares).toEqual([...shares].sort((a, b) => b - a));
-    const item = body.answers.item as { segment: number; value: unknown };
-    expect(item.value).toEqual(state.tickets[item.segment]);
+    // GitHub #278: it names what answered it, reads as it is, carries no
+    // `found`, and points at its winner alone.
+    expect(line).toMatchObject({ method: "vote", compression: "none" });
+    expect(line).not.toHaveProperty("found");
+    expect(line.pointers).toEqual([{ segment: line.segment, value: line.value, share: line.confidence }]);
+    const item = body.answers.item as unknown as Located;
+    expect(item.kind).toBe("records");
+    expect(item.value).toEqual(state.tickets[item.segment!]);
     expect(body.usage.output_tokens).toBe(0);
   });
 
@@ -158,6 +165,221 @@ describe("mockDecide", () => {
   it("answers the same question the same way twice", () => {
     const request = { state: "s", questions: { a: { type: "noul", instructions: "Urgent?" } } };
     expect(send(request).body.answers).toEqual(send(request).body.answers);
+  });
+});
+
+/** A `locate` answer as the mock writes it (GitHub #278). */
+type Located = {
+  type: "locate";
+  kind: string;
+  method: string;
+  compression: string;
+  found?: number;
+  segment: number | null;
+  value: unknown;
+  confidence: number | null;
+  ranking: { segment: number; share: number }[];
+  pointers: { segment: number; value: unknown; share: number }[];
+};
+
+// A locate's route (GitHub #278, spec 22): every combination the server
+// serves answers with its shape, `found` on the three measured routes alone,
+// "not found" among them; every one it refuses is refused.
+describe("mockDecide's locate routes", () => {
+  const LOG = [
+    "09:14:02 INFO  gateway GET /v1/orders 200 41ms",
+    "09:14:07 INFO  auth    user 6121 signed in",
+    "09:15:40 ERROR orders  pg: FATAL sorry, too many clients already",
+    "",
+    "09:15:41 ERROR orders  POST /v1/orders 500 12ms",
+    "09:16:03 INFO  deploy  replica api-2 healthy",
+    "09:17:10 INFO  deploy  rollout of api v2.41.0 complete",
+  ].join("\n");
+  const PROSE = [
+    "# The kiln",
+    "A kiln is a thermally insulated chamber used for firing clay.",
+    "Its temperature is raised slowly over many hours.",
+    "",
+    "# The glaze",
+    "Glaze is a layer of glass fused to a ceramic body.",
+    "It melts only when the kiln is hot enough.",
+  ].join("\n");
+  const TICKETS = [
+    { id: 311, subject: "Export button greyed out" },
+    { id: 312, subject: "Billed twice for March" },
+    { id: 313, subject: "2FA code never arrives" },
+  ];
+  const state = { log: LOG, prose: PROSE, tickets: TICKETS, notes: ["first note", "second note", "third note"] };
+
+  const ask = (question: Record<string, unknown>, id = "q") => {
+    const { status, body } = send({ state, questions: { [id]: { type: "locate", instructions: "Which one?", ...question } } });
+    return { status, answer: body.answers?.[id] as unknown as Located, error: (body as unknown as { error?: { code: string; message: string } }).error };
+  };
+
+  /** What every answer holds whatever its route: a ranking best first, and pointers at 0.05 or more with their values. */
+  const wellFormed = (answer: Located, values: unknown[]) => {
+    expect(answer.type).toBe("locate");
+    expect(answer.ranking.length).toBeGreaterThan(0);
+    expect(answer.ranking.length).toBeLessThanOrEqual(5);
+    const shares = answer.ranking.map((r) => r.share);
+    expect(shares).toEqual([...shares].sort((a, b) => b - a));
+    if (answer.segment === null) {
+      expect(answer.value).toBeNull();
+      expect(answer.confidence).toBeNull();
+      expect(answer.pointers).toEqual([]);
+      return;
+    }
+    expect(answer.value).toEqual(values[answer.segment]);
+    expect(answer.ranking[0]).toEqual({ segment: answer.segment, share: answer.confidence });
+    expect(answer.pointers[0]).toEqual({ segment: answer.segment, value: answer.value, share: answer.confidence });
+    for (const pointer of answer.pointers.slice(1)) expect(pointer.share).toBeGreaterThanOrEqual(0.05);
+    for (const pointer of answer.pointers) expect(pointer.value).toEqual(values[pointer.segment]);
+  };
+
+  const logLines = LOG.split("\n");
+  const proseLines = PROSE.split("\n");
+
+  it("answers with no fields by the defaults, and names each of them", () => {
+    const log = ask({ within: "/log" }).answer;
+    expect(log).toMatchObject({ kind: "log", method: "shortlist", compression: "template_fold" });
+    wellFormed(log, logLines);
+    const prose = ask({ within: "/prose" }).answer;
+    expect(prose).toMatchObject({ kind: "prose", method: "shortlist", compression: "none" });
+    wellFormed(prose, proseLines);
+    const records = ask({ within: "/tickets" }).answer;
+    expect(records).toMatchObject({ kind: "records", method: "shortlist", compression: "none" });
+    wellFormed(records, TICKETS);
+  });
+
+  it("never names a blank line, nor a prose title", () => {
+    for (const instructions of ["One?", "Two?", "Three?", "Four?", "Five?"]) {
+      const log = ask({ within: "/log", instructions, compression: "none" }).answer;
+      expect(log.ranking.map((r) => r.segment), instructions).not.toContain(3);
+      const prose = ask({ within: "/prose", instructions }).answer;
+      for (const { segment } of prose.ranking) expect(proseLines[segment], instructions).not.toMatch(/^# |^$/);
+    }
+  });
+
+  it("carries found on the three measured routes and on no other", () => {
+    const routes: [Record<string, unknown>, unknown[], boolean][] = [
+      [{ within: "/log", kind: "log", compression: "template_fold" }, logLines, true],
+      [{ within: "/prose", kind: "prose", compression: "none" }, proseLines, true],
+      [{ within: "/tickets", kind: "records", compression: "none" }, TICKETS, true],
+      [{ within: "/log", kind: "log", compression: "none" }, logLines, false],
+      [{ within: "/tickets", kind: "records", compression: "template_fold" }, TICKETS, false],
+      [{ within: "/log", method: "vote" }, logLines, false],
+      [{ within: "/prose", method: "vote", compression: "none" }, proseLines, false],
+      [{ within: "/tickets", method: "vote" }, TICKETS, false],
+    ];
+    for (const [question, values, finds] of routes) {
+      const { status, answer } = ask(question);
+      const route = JSON.stringify(question);
+      expect(status, route).toBe(200);
+      expect(answer.found !== undefined, route).toBe(finds);
+      wellFormed(answer, values);
+      // A route without `found` always names a segment.
+      if (!finds) expect(answer.segment, route).not.toBeNull();
+    }
+  });
+
+  it("answers not found under 0.5 on a measured route — no segment, no pointer, the ranking kept", () => {
+    for (const within of ["/log", "/prose", "/tickets"]) {
+      const { answer } = ask({ within, instructions: "Which one says the moon landed? /absent" });
+      expect(answer.found, within).toBeLessThan(0.5);
+      expect(answer.segment, within).toBeNull();
+      expect(answer.value, within).toBeNull();
+      expect(answer.confidence, within).toBeNull();
+      expect(answer.pointers, within).toEqual([]);
+      expect(answer.ranking.length, within).toBeGreaterThan(0);
+    }
+    // And names one all the same where the route has no `found` to say so.
+    expect(ask({ within: "/log", compression: "none", instructions: "/absent" }).answer.segment).not.toBeNull();
+    expect(ask({ within: "/log", method: "vote", instructions: "/absent" }).answer.segment).not.toBeNull();
+  });
+
+  it("answers found at 0.5 or more with the pick, and comes back not found for some questions by the seed alone", () => {
+    const answers = Array.from({ length: 40 }, (_, i) => ask({ within: "/log", instructions: `Question ${i}?` }).answer);
+    const found = answers.filter((a) => (a.found ?? 0) >= 0.5);
+    const absent = answers.filter((a) => (a.found ?? 1) < 0.5);
+    expect(found.length).toBeGreaterThan(0);
+    expect(absent.length).toBeGreaterThan(0);
+    for (const answer of found) {
+      expect(answer.segment).not.toBeNull();
+      wellFormed(answer, logLines);
+    }
+    for (const answer of absent) expect(answer.segment).toBeNull();
+    // Some of them point at more than one segment, and a fold scales every
+    // share by its first level's pick, so none reaches 1.
+    expect(found.some((a) => a.pointers.length > 1)).toBe(true);
+  });
+
+  it("tells auto's kind: records by shape, a log from prose by the lines' shapes — and never answers auto", () => {
+    expect(ask({ within: "/tickets" }).answer.kind).toBe("records");
+    expect(ask({ within: "/log" }).answer.kind).toBe("log");
+    expect(ask({ within: "/prose" }).answer.kind).toBe("prose");
+    // An array of strings is not a records array: its elements' text decides.
+    const notes = ask({ within: "/notes" }).answer;
+    expect(notes.kind).not.toBe("records");
+    wellFormed(notes, state.notes);
+    expect(ask({ within: "/log", kind: "auto" }).answer.kind).toBe("log");
+  });
+
+  it("answers an element of an array of strings as the string itself", () => {
+    const answer = ask({ within: "/notes", method: "vote" }).answer;
+    expect(state.notes).toContain(answer.value);
+    expect(answer.pointers[0].value).toBe(answer.value);
+  });
+
+  it("refuses an unknown value naming the accepted ones", () => {
+    const method = ask({ within: "/log", method: "head" });
+    expect(method.status).toBe(422);
+    expect(method.error).toMatchObject({ code: "method_unknown" });
+    expect(method.error?.message).toContain('"shortlist" and "vote"');
+    const kind = ask({ within: "/log", kind: "table" });
+    expect(kind.error).toMatchObject({ code: "kind_unknown" });
+    expect(kind.error?.message).toContain('"auto", "log", "prose" and "records"');
+    const compression = ask({ within: "/log", compression: "zip" });
+    expect(compression.error).toMatchObject({ code: "compression_unknown" });
+    expect(compression.error?.message).toContain('"template_fold" and "none"');
+  });
+
+  it("refuses a fold under a vote, a fold of prose named or told, and names the question", () => {
+    for (const question of [
+      { within: "/log", method: "vote", compression: "template_fold" },
+      { within: "/log", kind: "prose", compression: "template_fold" },
+      { within: "/prose", compression: "template_fold" },
+    ]) {
+      const { status, error } = ask(question);
+      expect(status, JSON.stringify(question)).toBe(422);
+      expect(error?.code, JSON.stringify(question)).toBe("compression_unsupported");
+      expect(error?.message).toContain('question "q"');
+    }
+    // A vote left to its kind's compression is served: a vote reads as it is.
+    expect(ask({ within: "/log", method: "vote" }).status).toBe(200);
+  });
+
+  it("refuses a kind the target contradicts, both ways", () => {
+    expect(ask({ within: "/log", kind: "records" }).error).toMatchObject({ code: "kind_mismatch" });
+    expect(ask({ within: "/notes", kind: "records" }).error).toMatchObject({ code: "kind_mismatch" });
+    for (const kind of ["log", "prose"]) {
+      const { error } = ask({ within: "/tickets", kind });
+      expect(error, kind).toMatchObject({ code: "kind_mismatch" });
+      expect(error?.message).toContain('kind "records" with compression "template_fold"');
+    }
+  });
+
+  it("refuses kind and compression on every other type", () => {
+    const kind = send({ state: "s", questions: { a: { type: "noul", instructions: "Urgent?", kind: "log" } } });
+    expect(kind.status).toBe(422);
+    expect(JSON.stringify(kind.body)).toContain("kind_unsupported");
+    const compression = send({ state: "s", questions: { a: { type: "choice", instructions: "Which?", compression: "none" } } });
+    expect(JSON.stringify(compression.body)).toContain("compression_unsupported");
+  });
+
+  it("answers every route the same way twice", () => {
+    for (const question of [{ within: "/log" }, { within: "/prose" }, { within: "/tickets", method: "vote" }]) {
+      expect(ask(question).answer, JSON.stringify(question)).toEqual(ask(question).answer);
+    }
   });
 });
 

@@ -211,6 +211,50 @@ describe("QuestionCard", () => {
     expect(card(ask("noul"), log)).not.toContain("Search within");
   });
 
+  it("offers a locate its kind, method and compression, each defaulting to the endpoint's", () => {
+    // GitHub #278, in the shape of a point's method: the empty choice is the
+    // default and sends no field. `auto` and the `shortlist` are the
+    // defaults' own names, so they are the empty choice and not offered
+    // twice; a compression's default follows the kind, and says so.
+    const html = card(ask("locate"), { mode: "text", text: "a\nb" });
+    expect(html).toContain("Text kind");
+    expect(html).toMatch(/<select[^>]*name="[^"]+-kind"[^>]*><option value="" selected="">auto<\/option><option value="log">log<\/option><option value="prose">prose<\/option><option value="records">records<\/option><\/select>/);
+    expect(html).toMatch(/<select[^>]*name="[^"]+-method"[^>]*><option value="" selected="">shortlist<\/option><option value="vote">vote<\/option><\/select>/);
+    expect(html).toMatch(
+      /<select[^>]*name="[^"]+-compression"[^>]*><option value="" selected="">the kind&#x27;s own<\/option><option value="template_fold">template_fold<\/option><option value="none">none<\/option><\/select>/,
+    );
+    // What each default does, beside it.
+    expect(html).toContain("Told for you");
+    expect(html).toContain("The default: the calibrated heads narrow");
+    expect(html).toContain("a log is folded into templates, prose and records are read as they are");
+    // None of them on a question that is not a locate.
+    for (const kind of ["noul", "point"] as const) expect(card(ask(kind)), kind).not.toContain("Text kind");
+  });
+
+  it("shows the choice it was given, and what that choice does", () => {
+    const html = card(ask("locate", { textKind: "prose", locateMethod: "vote", compression: "none" }), { mode: "text", text: "a\nb" });
+    expect(html).toContain('<option value="prose" selected="">prose</option>');
+    expect(html).toContain('<option value="vote" selected="">vote</option>');
+    expect(html).toContain('<option value="none" selected="">none</option>');
+    expect(html).toContain("Sentences of a document");
+    expect(html).toContain("The head vote served before");
+    expect(html).toContain("Read the text as it is");
+  });
+
+  it("says auto reads an array of JSON objects as records, which its shape alone decides", () => {
+    const state: Evidence = { mode: "json", text: '{"tickets": [{"id": 1}, {"id": 2}]}' };
+    expect(card(ask("locate", { within: "/tickets" }), state)).toContain("auto reads it as records");
+    expect(card(ask("locate"), { mode: "text", text: "a\nb" })).not.toContain("auto reads it as records");
+  });
+
+  it("reports a route the endpoint would refuse on the card", () => {
+    const fold = card(ask("locate", { locateMethod: "vote", compression: "template_fold" }), { mode: "text", text: "a\nb" });
+    expect(fold).toContain("asks for a vote over a fold");
+    expect(fold).toContain("border-l-warn");
+    const state: Evidence = { mode: "json", text: '{"tickets": [{"id": 1}, {"id": 2}]}' };
+    expect(card(ask("locate", { within: "/tickets", textKind: "log" }), state)).toContain("which is read as records");
+  });
+
   it("counts the items of the list a locate points into, and reports a pointer that names nothing", () => {
     const state: Evidence = { mode: "json", text: '{"tickets": [{"id": 1}, {"id": 2}, {"id": 3}]}' };
     expect(card(ask("locate", { within: "/tickets" }), state)).toContain("3 items to choose between");

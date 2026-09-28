@@ -23,12 +23,29 @@ export type Target = {
   segments: string[];
   /** Whether each segment owns a token: an empty or all-whitespace one keeps its index and owns none. */
   owns: boolean[];
+  /**
+   * Whether the target is a **records array** (GitHub #278, spec 22 § `auto`):
+   * two or more elements, every one a JSON object, and not every one an
+   * object with a string `type` — the shape content parts have.
+   * `crate::locate::is_records_array`. `auto` reads such a target as
+   * `records`, and a `kind` that contradicts it is refused.
+   */
+  records: boolean;
 };
 
 export type Cut = { ok: true; target: Target } | { ok: false; code: string; message: string };
 
 /** The fewest key-owning segments a `locate` is served with. */
 export const MIN_SEGMENTS = 2;
+
+/**
+ * `ignis_core::locate::FOUND_THRESHOLD` (GitHub #278): below it an answer's
+ * `found` names no segment. The rule the research measured, not a calibration.
+ */
+export const FOUND_THRESHOLD = 0.5;
+
+/** `POINTER_SHARE`: every candidate the choice gave at least this much is a pointer. */
+export const POINTER_SHARE = 0.05;
 
 /**
  * `state` cut at `within`, or the refusal the endpoint would answer.
@@ -43,13 +60,14 @@ export function cutTarget(state: JsonNode, within: string): Cut {
   const target = resolved.node;
   if (target.kind === "string") {
     const lines = target.value.split("\n");
-    return counted({ unit: "line", segments: lines, owns: lines.map((line) => line.trim() !== "") });
+    return counted({ unit: "line", segments: lines, owns: lines.map((line) => line.trim() !== ""), records: false });
   }
   if (target.kind === "array" && target.items.length > 0) {
     return counted({
       unit: "item",
       segments: target.items.map((item) => (item.kind === "string" ? item.value : writeOrdered(item, 0))),
       owns: target.items.map((item) => item.kind !== "string" || item.value.trim() !== ""),
+      records: isRecords(target.items),
     });
   }
   return {
@@ -69,13 +87,22 @@ function counted(target: Target): Cut {
   };
 }
 
+/** `is_records_array`: every element an object, at least two, and not all of them shaped like content parts. */
+function isRecords(items: JsonNode[]): boolean {
+  const objects = items.length >= 2 && items.every((item) => item.kind === "object");
+  const partsShaped = items.every(
+    (item) => item.kind === "object" && item.entries.some((entry) => entry.key === "type" && entry.value.kind === "string"),
+  );
+  return objects && !partsShaped;
+}
+
 /** How a pointer reads in a message: the root has no spelling of its own. */
 const where = (within: string) => (within === "" ? "(the whole state)" : JSON.stringify(within));
 
-type Resolved = { ok: true; node: JsonNode } | { ok: false; code: string; message: string };
+export type Resolved = { ok: true; node: JsonNode } | { ok: false; code: string; message: string };
 
 /** RFC 6901, refusing a key written twice rather than choosing a copy — `resolve` in `locate.rs`. */
-function resolve(state: JsonNode, pointer: string): Resolved {
+export function resolve(state: JsonNode, pointer: string): Resolved {
   if (pointer === "") return { ok: true, node: state };
   const malformed: Resolved = {
     ok: false,

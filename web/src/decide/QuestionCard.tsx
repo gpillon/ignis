@@ -3,6 +3,16 @@ import { caption, field, fieldLook } from "../ui/classes.ts";
 import { IconClose, IconPlus, IconTrash } from "../ui/icons.tsx";
 import { asText, jsonString, writeOrdered } from "./json.ts";
 import {
+  chooseRoute,
+  COMPRESSION_BLURB,
+  COMPRESSIONS,
+  DEFAULT_COMPRESSION,
+  LOCATE_KIND_BLURB,
+  LOCATE_KINDS,
+  LOCATE_METHOD_BLURB,
+  LOCATE_METHODS,
+  type LocateMethod,
+  type ResolvedKind,
   emptyOption,
   type Fault,
   DEFAULT_CEILING,
@@ -199,6 +209,13 @@ export function QuestionCard({
       {question.kind === "locate" && (
         <WithinField value={question.within} evidence={evidence} name={`${question.uid}-within`} onChange={(within) => set("within", within)} />
       )}
+
+      {/* A locate's route (GitHub #278): three selectors in the shape of a
+          point's method, each empty choice the endpoint's default and sent as
+          no field. The answer names all three, defaults included, so none is
+          resolved here — except that a records array is one by its shape
+          alone, which the kind's sentence says. */}
+      {question.kind === "locate" && <LocateRoute question={question} evidence={evidence} onChange={onChange} />}
 
       <label className="mt-3 flex items-baseline gap-2">
         <span className={`${caption} shrink-0`}>Answer name</span>
@@ -419,7 +436,108 @@ function segmentCount(unit: "line" | "item", owns: boolean[]): string {
   const blank = owns.filter((own) => !own).length;
   const plural = owns.length === 1 ? unit : `${unit}s`;
   const rest = blank === 0 ? "" : ` — ${blank} of them blank, which it never names`;
-  return `${owns.length} ${plural} to choose between, numbered from 0${rest}. It always names one: there is no "not found".`;
+  return `${owns.length} ${plural} to choose between, numbered from 0${rest}.`;
+}
+
+/** The kinds a question can name, `auto` being the empty choice. */
+const NAMED_KINDS = LOCATE_KINDS.filter((kind): kind is ResolvedKind => kind !== "auto");
+/** The methods a question can name, the `shortlist` being the empty choice. */
+const NAMED_METHODS = LOCATE_METHODS.filter((method): method is Exclude<LocateMethod, "shortlist"> => method !== "shortlist");
+
+/**
+ * The kind, the method and the compression of a `locate` (GitHub #278).
+ *
+ * The sentence beside each says what the current choice does. `auto`'s says
+ * what it will tell where the tab can know it: an array of JSON objects is a
+ * records array by its shape alone, and a log against prose is the fold's to
+ * say, which the server runs.
+ */
+function LocateRoute({ question, evidence, onChange }: { question: Question; evidence: Evidence; onChange: (next: Question) => void }) {
+  const cut = locateTarget(evidence, question.within);
+  const records = cut?.ok === true && cut.target.records;
+  return (
+    <>
+      <RouteField
+        label="Text kind"
+        aria="The kind of text this locate reads"
+        name={`${question.uid}-kind`}
+        value={question.textKind}
+        empty="auto"
+        values={NAMED_KINDS}
+        onChange={(textKind) => onChange(chooseRoute(question, "textKind", textKind))}
+      >
+        {question.textKind === null
+          ? `${LOCATE_KIND_BLURB.auto}${records ? " This target is an array of JSON objects: auto reads it as records." : ""}`
+          : LOCATE_KIND_BLURB[question.textKind]}
+      </RouteField>
+      <RouteField
+        label="Answered by"
+        aria="How this locate is answered"
+        name={`${question.uid}-method`}
+        value={question.locateMethod}
+        empty="shortlist"
+        values={NAMED_METHODS}
+        onChange={(locateMethod) => onChange(chooseRoute(question, "locateMethod", locateMethod))}
+      >
+        {LOCATE_METHOD_BLURB[question.locateMethod ?? "shortlist"]}
+      </RouteField>
+      <RouteField
+        label="Compression"
+        aria="What this locate's text is read as"
+        name={`${question.uid}-compression`}
+        value={question.compression}
+        empty={DEFAULT_COMPRESSION.label}
+        values={COMPRESSIONS}
+        onChange={(compression) => onChange(chooseRoute(question, "compression", compression))}
+      >
+        {question.compression === null ? DEFAULT_COMPRESSION.blurb : COMPRESSION_BLURB[question.compression]}
+      </RouteField>
+    </>
+  );
+}
+
+/** One selector of a locate's route: the empty choice first, then the values it can name. */
+function RouteField<T extends string>({
+  label,
+  aria,
+  name,
+  value,
+  empty,
+  values,
+  onChange,
+  children,
+}: {
+  label: string;
+  aria: string;
+  name: string;
+  value: T | null;
+  /** What the empty choice is called: the default's own name, or what the default follows. */
+  empty: string;
+  values: readonly T[];
+  onChange: (value: T | null) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="mt-2 flex items-start gap-3">
+      <Labelled label={label}>
+        <select
+          value={value ?? ""}
+          onChange={(e) => onChange(e.target.value === "" ? null : (e.target.value as T))}
+          name={name}
+          aria-label={aria}
+          className={`${fieldLook} w-[8.5rem] font-display text-[13px]`}
+        >
+          <option value="">{empty}</option>
+          {values.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      </Labelled>
+      <p className="pb-1 text-[12px] leading-snug text-ash">{children}</p>
+    </div>
+  );
 }
 
 /** The widest number a field that wide can hold, which is what a reader wants to see. */

@@ -32,7 +32,9 @@ import { createMetricsSim } from "./mockMetrics.ts";
 //
 // Decide: /v1/decide answers every primitive from a hash of the question
 // (mockDecide.ts); "/error" in a question's instructions fails that question
-// alone, "/full" in the evidence refuses the whole request.
+// alone, "/full" in the evidence refuses the whole request, and "/absent" in
+// a locate's instructions answers it "not found" where its route carries
+// `found`.
 //
 // Ask: with `ask_user` declared, a prompt containing "/ask" asks which team.
 // Local: "/js", "/plan", "/file" and "/html" call run_js, update_plan and create_file.

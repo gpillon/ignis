@@ -21,7 +21,10 @@ const codeOf = (state: string, within: string) => {
 describe("cutTarget", () => {
   it("cuts a string into its lines on \\n exactly, keeping a \\r in its line", () => {
     const cut = cutTarget(jsonString("first\r\nsecond\nthird"), "");
-    expect(cut).toEqual({ ok: true, target: { unit: "line", segments: ["first\r", "second", "third"], owns: [true, true, true] } });
+    expect(cut).toEqual({
+      ok: true,
+      target: { unit: "line", segments: ["first\r", "second", "third"], owns: [true, true, true], records: false },
+    });
   });
 
   it("keeps a blank line's index and gives it no key", () => {
@@ -34,8 +37,26 @@ describe("cutTarget", () => {
     const cut = cutTarget(json('[{"id": 1, "b": [2]}, " ", "x", 3]'), "");
     expect(cut).toEqual({
       ok: true,
-      target: { unit: "item", segments: ['{"id":1,"b":[2]}', " ", "x", "3"], owns: [true, false, true, true] },
+      target: { unit: "item", segments: ['{"id":1,"b":[2]}', " ", "x", "3"], owns: [true, false, true, true], records: false },
     });
+  });
+
+  it("calls an array of two or more objects a records array, unless every one is shaped like a content part", () => {
+    // GitHub #278, spec 22 § `auto`: `is_records_array`, which is what `auto`
+    // reads as `records` and what a named kind is checked against.
+    const records = (state: string) => {
+      const cut = cutTarget(json(state), "");
+      return cut.ok && cut.target.records;
+    };
+    expect(records('[{"id": 1}, {"id": 2}]')).toBe(true);
+    // One object with a string `type` does not make it parts; all of them do.
+    expect(records('[{"type": "a", "id": 1}, {"id": 2}]')).toBe(true);
+    expect(records('[{"type": "a"}, {"type": "b"}]')).toBe(false);
+    // A `type` that is not a string is a field like any other.
+    expect(records('[{"type": 1}, {"type": 2}]')).toBe(true);
+    expect(records('[{"id": 1}, "x"]')).toBe(false);
+    expect(records('["x", "y"]')).toBe(false);
+    expect(records('"a\\nb"')).toBe(false);
   });
 
   it("follows a pointer through objects and arrays, unescaping ~1 and ~0", () => {

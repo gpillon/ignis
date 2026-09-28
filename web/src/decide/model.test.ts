@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { jsonString, parseOrdered } from "./json.ts";
 import {
+  chooseRoute,
   type Draft,
   EMPTY_DRAFT,
   EMPTY_SPARE,
@@ -242,6 +243,8 @@ describe("readRequest", () => {
       question("e", "scalar", "How many hours?", { ceiling: 4 }),
       question("f", "point", "Where?"),
       question("g", "box", "Bound it."),
+      question("h", "locate", "Which line?"),
+      question("i", "locate", "Which line?", { within: "/log", textKind: "log", locateMethod: "vote", compression: "none" }),
     ]);
     const read = readRequest(requestBody(original));
     if (!read.ok) throw new Error(read.message);
@@ -439,5 +442,134 @@ describe("a locate", () => {
 
   it("says nothing more about JSON evidence that does not parse than that it does not", () => {
     expect(codes(draft([question("l", "locate", "Which?")], { mode: "json", text: "{" }))).toEqual(["invalid_state_json"]);
+  });
+});
+
+// A locate's route (GitHub #278, spec 22): `kind`, `method` and
+// `compression`, three enums each absent by default — absent is `auto`, the
+// `shortlist`, and the compression the resolved kind reads best with.
+describe("a locate's route", () => {
+  const log: Evidence = { mode: "text", text: "09:14 INFO up\n09:15 ERROR down\n09:16 INFO up" };
+  const records: Evidence = { mode: "json", text: '{"tickets": [{"id": 1}, {"id": 2}], "notes": "a\\nb"}' };
+  const sent = (q: Question, evidence: Evidence = log) => JSON.parse(requestBody(draft([q], evidence))).questions[q.id];
+
+  it("sends no field for a default", () => {
+    expect(sent(question("l", "locate", "Which?"))).toEqual({ type: "locate", instructions: "Which?" });
+  });
+
+  it("sends each field that was chosen, by its wire name", () => {
+    expect(sent(question("l", "locate", "Which?", { textKind: "log" }))).toEqual({ type: "locate", instructions: "Which?", kind: "log" });
+    expect(sent(question("l", "locate", "Which?", { locateMethod: "vote" }))).toEqual({ type: "locate", instructions: "Which?", method: "vote" });
+    expect(sent(question("l", "locate", "Which?", { compression: "none" }))).toEqual({ type: "locate", instructions: "Which?", compression: "none" });
+    expect(sent(question("t", "locate", "Which?", { within: "/tickets", textKind: "records", compression: "template_fold" }), records)).toEqual({
+      type: "locate",
+      instructions: "Which?",
+      within: "/tickets",
+      kind: "records",
+      compression: "template_fold",
+    });
+  });
+
+  it("keeps the route on a question switched to another type, and sends none of it from there", () => {
+    const route = { textKind: "prose", locateMethod: "vote", compression: "none" } as const;
+    expect(sent(question("n", "noul", "Well?", route))).toEqual({ type: "noul", instructions: "Well?" });
+    // A point's own method goes out; the locate's does not ride along.
+    const image: Evidence = { mode: "image", images: [{ name: "a.jpg", url: "data:,", width: 1, height: 1 }], text: "" };
+    const point = sent(question("p", "point", "Where?", { ...route, method: "head" }), image);
+    expect(point.method).toBe("head");
+    expect(point).not.toHaveProperty("kind");
+    expect(point).not.toHaveProperty("compression");
+    expect(validate(draft([question("n", "noul", "Well?", route)], log))).toEqual([]);
+  });
+
+  it("round-trips the route without doubling a field", () => {
+    const body = '{"state":"a\\nb","questions":{"l":{"type":"locate","instructions":"Which?","kind":"prose","method":"vote","compression":"none"}}}';
+    const read = readRequest(body);
+    if (!read.ok) throw new Error(read.message);
+    expect(read.draft.questions[0]).toMatchObject({ textKind: "prose", locateMethod: "vote", compression: "none", extras: [] });
+    const out = requestBody(read.draft);
+    for (const key of ["kind", "method", "compression"]) expect(out.match(new RegExp(`"${key}"`, "g")), key).toHaveLength(1);
+  });
+
+  it("reads auto and shortlist as the empty choice, which the endpoint reads as the same request", () => {
+    const read = readRequest('{"state":"a\\nb","questions":{"l":{"type":"locate","instructions":"Which?","kind":"auto","method":"shortlist"}}}');
+    if (!read.ok) throw new Error(read.message);
+    expect(read.draft.questions[0]).toMatchObject({ textKind: null, locateMethod: null, extras: [] });
+    expect(JSON.parse(requestBody(read.draft)).questions.l).toEqual({ type: "locate", instructions: "Which?" });
+  });
+
+  it("keeps a method the type does not name, and refuses it naming the type's own", () => {
+    // A point's `head` on a locate is not read as a point's and left off the
+    // wire: the endpoint refuses it naming the shortlist and the vote.
+    const head = readRequest('{"state":"a\\nb","questions":{"l":{"type":"locate","instructions":"Which?","method":"head"}}}');
+    if (!head.ok) throw new Error(head.message);
+    expect(head.draft.questions[0].method).toBeNull();
+    expect(requestBody(head.draft)).toContain('"method": "head"');
+    expect(validate(head.draft).find((f) => f.code === "method_unknown")?.message).toContain('"shortlist" and "vote"');
+    // And a locate's `vote` on a point is the point's to refuse.
+    const vote = readRequest('{"state":"s","questions":{"p":{"type":"point","instructions":"Where?","method":"vote"}}}');
+    if (!vote.ok) throw new Error(vote.message);
+    expect(vote.draft.questions[0].locateMethod).toBeNull();
+    expect(requestBody(vote.draft)).toContain('"method": "vote"');
+    expect(validate(vote.draft).find((f) => f.code === "method_unknown")?.message).toContain('"head" and "chain"');
+  });
+
+  it("replaces a kept spelling with the value chosen for it, rather than sending both", () => {
+    const read = readRequest('{"state":"a\\nb","questions":{"l":{"type":"locate","instructions":"Which?","method":"head","kind":"table","mine":1}}}');
+    if (!read.ok) throw new Error(read.message);
+    let chosen = chooseRoute(read.draft.questions[0], "locateMethod", "vote");
+    chosen = chooseRoute(chosen, "textKind", null);
+    const body = requestBody({ ...read.draft, questions: [chosen] });
+    expect(body.match(/"method"/g)).toHaveLength(1);
+    expect(body).toContain('"method": "vote"');
+    expect(body).not.toContain('"kind"');
+    // A field the route does not own stays where it was.
+    expect(body).toContain('"mine": 1');
+    expect(validate({ ...read.draft, questions: [chosen] })).toEqual([]);
+  });
+
+  it("keeps a kind or a compression no value covers, and refuses it — unknown on a locate, unsupported elsewhere", () => {
+    const unknown = readRequest('{"state":"a\\nb","questions":{"l":{"type":"locate","instructions":"Which?","kind":"table","compression":"zip"}}}');
+    if (!unknown.ok) throw new Error(unknown.message);
+    expect(requestBody(unknown.draft)).toContain('"kind": "table"');
+    expect(requestBody(unknown.draft)).toContain('"compression": "zip"');
+    const faults = validate(unknown.draft);
+    expect(faults.map((f) => f.code)).toEqual(["kind_unknown", "compression_unknown"]);
+    expect(faults[0].message).toContain('"auto", "log", "prose" and "records"');
+    expect(faults[1].message).toContain('"template_fold" and "none"');
+    const noul = readRequest('{"state":"s","questions":{"n":{"type":"noul","instructions":"Well?","kind":"table","compression":"zip"}}}');
+    if (!noul.ok) throw new Error(noul.message);
+    expect(validate(noul.draft).map((f) => f.code)).toEqual(["kind_unsupported", "compression_unsupported"]);
+  });
+
+  it("refuses a fold under a vote and a fold of prose, and serves every other combination", () => {
+    expect(codes(draft([question("l", "locate", "Which?", { locateMethod: "vote", compression: "template_fold" })], log))).toEqual([
+      "compression_unsupported",
+    ]);
+    expect(codes(draft([question("l", "locate", "Which?", { textKind: "prose", compression: "template_fold" })], log))).toEqual([
+      "compression_unsupported",
+    ]);
+    for (const textKind of [null, "log", "prose"] as const) {
+      for (const locateMethod of [null, "vote"] as const) {
+        for (const compression of [null, "template_fold", "none"] as const) {
+          if (compression === "template_fold" && (locateMethod === "vote" || textKind === "prose")) continue;
+          const combination = `${textKind}/${locateMethod}/${compression}`;
+          expect(codes(draft([question("l", "locate", "Which?", { textKind, locateMethod, compression })], log)), combination).toEqual([]);
+        }
+      }
+    }
+    // A records array folds: that is the log route over its records, opt-in.
+    expect(codes(draft([question("t", "locate", "Which?", { within: "/tickets", textKind: "records", compression: "template_fold" })], records))).toEqual([]);
+  });
+
+  it("refuses a kind the target contradicts, both ways", () => {
+    expect(codes(draft([question("l", "locate", "Which?", { textKind: "records" })], log))).toEqual(["kind_mismatch"]);
+    expect(codes(draft([question("l", "locate", "Which?", { within: "/notes", textKind: "records" })], records))).toEqual(["kind_mismatch"]);
+    for (const textKind of ["log", "prose"] as const) {
+      const faults = validate(draft([question("t", "locate", "Which?", { within: "/tickets", textKind })], records));
+      expect(faults.map((f) => f.code), textKind).toEqual(["kind_mismatch"]);
+      expect(faults[0].message).toContain('kind "records" with compression "template_fold"');
+    }
+    expect(codes(draft([question("t", "locate", "Which?", { within: "/tickets", textKind: "records" })], records))).toEqual([]);
   });
 });
