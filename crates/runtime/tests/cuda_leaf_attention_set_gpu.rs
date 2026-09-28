@@ -157,7 +157,7 @@ fn a_head_set_no_armed_layer_can_read_comes_back_unread_and_a_readable_one_whole
                 assert_eq!(scores.scores.len(), count as usize);
                 let argmax = scores.set_argmax.as_ref().expect("the set comes back");
                 assert_eq!(argmax.len(), set.heads.len(), "one key per head of the set");
-                assert!(argmax.iter().all(|&k| k < count && !set.excluded.contains(&k)), "{argmax:?}");
+                assert!(argmax.iter().all(|&k| k < count && !set.excluded().contains(&k)), "{argmax:?}");
             }
             _ => assert!(
                 read.is_none(),

@@ -1,5 +1,6 @@
 // The attention readout (GitHub #260, ADR 0038; the head set GitHub #263,
-// ADR 0039). See attention_readout.h.
+// ADR 0039; its rows over a text span GitHub #275, ADR 0041). See
+// attention_readout.h.
 //
 // One warp per key: eight coordinates per lane against a query held in shared
 // memory, reduced across the warp, scaled once. The query is rotated into the
@@ -208,6 +209,7 @@ struct SetReadoutArgs {
   std::int32_t slot[kReadoutLayerHeads + 1]; // into `best`; -1 for a pointing head outside the set
   std::int32_t row_head;                     // whose scores go to `scores`; -1 none
   float *scores;
+  float *rows; // GitHub #275: [whole set][key_count] by slot, or null
   unsigned long long *best;
   std::int32_t excluded_count;
   std::int32_t excluded[kReadoutMaxExcluded];
@@ -308,6 +310,11 @@ __global__ void attention_set_readout_kernel(const SetReadoutArgs args) {
           if (m == mine_row) {
             args.scores[k] = score;
           }
+          // GitHub #275: a set read in rows keeps every score it forms, at
+          // its head's slot of the whole set.
+          if (args.rows != nullptr && mine_slot[m] >= 0) {
+            args.rows[static_cast<std::int64_t>(mine_slot[m]) * args.key_count + k] = score;
+          }
           if (!excluded && mine_slot[m] >= 0) {
             const unsigned long long packed = pack_score(score, static_cast<std::uint32_t>(k));
             best[m] = packed > best[m] ? packed : best[m];
@@ -351,7 +358,8 @@ int32_t ignis_attention_readout_run(const AttentionReadoutTarget &target,
                   (writes_row || target.set_heads > 0) &&
                   (target.set_heads == 0 ||
                    (q_heads / kv_heads <= kGroup && target.device_set_best != nullptr &&
-                    target.device_set_neighbours != nullptr && target.grid_cols > 0));
+                    ((target.device_set_neighbours != nullptr && target.grid_cols > 0) ||
+                     target.device_set_rows != nullptr)));
   for (int32_t i = 0; geometry && i < target.set_heads; ++i) {
     geometry = target.set_query_head[i] >= 0 && target.set_query_head[i] < q_heads &&
                target.set_slot[i] >= 0;
@@ -421,6 +429,7 @@ int32_t ignis_attention_readout_run(const AttentionReadoutTarget &target,
     }
     args.row_head = writes_row ? target.query_head : -1;
     args.scores = target.device_scores;
+    args.rows = target.device_set_rows;
     args.best = target.device_set_best;
     args.excluded_count = target.excluded_count;
     for (int32_t e = 0; e < target.excluded_count; ++e) {
@@ -434,7 +443,17 @@ int32_t ignis_attention_readout_run(const AttentionReadoutTarget &target,
     }
     // GitHub #264: the four keys around each of this layer's argmaxes, in a
     // second launch on the same stream -- the fused one above has to have
-    // finished reducing them before they can be read.
+    // finished reducing them before they can be read. A set read in rows
+    // over a text span (#275) has no grid, and names nowhere to put them.
+    if (target.device_set_neighbours == nullptr) {
+      const cudaError_t launched = cudaGetLastError();
+      if (launched != cudaSuccess) {
+        *error = cudaGetErrorString(launched);
+        return -1;
+      }
+      *target.read = true;
+      return 0;
+    }
     NeighbourGatherArgs gather{};
     gather.query = args.query;
     gather.plane = args.plane;

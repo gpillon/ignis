@@ -160,7 +160,13 @@ fn the_user_turn_is_the_kind_text_then_the_instruction() {
     assert_eq!(Scaffold::Index.opening(Unit::Line), "{\"line\":");
     assert_eq!(Scaffold::Index.opening(Unit::Item), "{\"item\":");
     assert_eq!(Scaffold::Quote.opening(Unit::Item), "{\"quote\":\"");
-    assert!(Scaffold::Index.kind_text(Unit::Item).contains("{\"item\": <its number>}"));
+    // The index scaffold's words, whole: the harness measures with them, and
+    // set D's `s1` dumps were read under exactly these bytes.
+    assert_eq!(
+        Scaffold::Index.kind_text(Unit::Item),
+        "Find the one item of the evidence that the instruction asks for. The evidence's items are \
+         numbered from 0. Answer with only a JSON object {\"item\": <its number>}."
+    );
 }
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -262,4 +268,73 @@ fn a_keys_bytes_are_relative_to_the_evidence() {
     let offsets: Vec<(usize, usize)> = (0..rendered.len()).map(|i| (i, i + 1)).collect();
     let bytes = key_bytes(&rendered, &offsets, &ev, &(3..6)).expect("key bytes");
     assert_eq!(bytes, vec![[0, 1], [1, 2], [2, 3]]);
+}
+
+// ── phase B: the served segmentation (GitHub #275) ───────────────────────
+
+use ignis_server::locate::{TargetError, evidence_within};
+
+/// `within` names the part of the state to search (RFC 6901): the whole
+/// state is still written — its bytes are the endpoint's, whatever is
+/// searched — and the segments are the target's, where the target sits.
+#[test]
+fn within_names_the_part_of_the_state_whose_segments_are_read() {
+    let cases: &[(&str, &str, Unit, &[&str])] = &[
+        (r#"{"meta":{"id":1},"log":"a\nb"}"#, "/log", Unit::Line, &["a", "b"]),
+        (r#"{"runs":[{"out":"x\ny"},{"out":"z"}]}"#, "/runs/0/out", Unit::Line, &["x", "y"]),
+        (r#"{"items":[{"k":1},"two"]}"#, "/items", Unit::Item, &[r#"{"k":1}"#, "two"]),
+        // `~1` is a `/` in a key and `~0` a `~`.
+        (r#"{"a/b":{"m~n":"p\nq"}}"#, "/a~1b/m~0n", Unit::Line, &["p", "q"]),
+        // The empty pointer is the whole state; `/` is the key "".
+        (r#""r\ns""#, "", Unit::Line, &["r", "s"]),
+        (r#"{"":["u","v"]}"#, "/", Unit::Item, &["u", "v"]),
+    ];
+    for &(json, pointer, unit, spelled) in cases {
+        let ev = evidence_within(&state(json), pointer).unwrap_or_else(|e| panic!("{json} {pointer}: {e}"));
+        assert_eq!(ev.system, format!("{{\"evidence\":{}}}", state(json).to_text()), "{json}: the whole state");
+        assert_eq!(ev.unit, unit, "{json} {pointer}");
+        let got: Vec<&str> = ev.segments.iter().map(|s| &ev.system[s.bytes.clone()]).collect();
+        assert_eq!(got, spelled, "{json} {pointer}");
+    }
+}
+
+/// Each segment's value is what the caller sent: a line as a string, an
+/// element as its JSON.
+#[test]
+fn a_segments_value_is_the_callers_own() {
+    let ev = evidence_within(&state(r#"{"log":"a \"q\"\n\nb"}"#), "/log").expect("segmented");
+    assert_eq!(ev.values, vec![
+        OrderedValue::String("a \"q\"".to_owned()),
+        OrderedValue::String(String::new()),
+        OrderedValue::String("b".to_owned()),
+    ]);
+    let ev = evidence_within(&state(r#"[{"z":1,"a":[2]},3]"#), "").expect("segmented");
+    assert_eq!(ev.values[0].to_text(), r#"{"z":1,"a":[2]}"#);
+    assert_eq!(ev.values[1].to_text(), "3");
+}
+
+/// A pointer that is not one, that names nothing, that names a key written
+/// twice, or that names something with no segments is refused by name.
+#[test]
+fn a_target_that_cannot_be_read_says_why() {
+    let doc = r#"{"log":"a\nb","meta":{"id":1},"runs":[1,2],"empty":[],"n":7,"twice":"x","twice":"y"}"#;
+    let cases: &[(&str, fn(&TargetError) -> bool)] = &[
+        ("log", |e| matches!(e, TargetError::Malformed(_))),
+        ("/log~2", |e| matches!(e, TargetError::Malformed(_))),
+        ("/missing", |e| matches!(e, TargetError::NotFound(_))),
+        ("/runs/2", |e| matches!(e, TargetError::NotFound(_))),
+        ("/runs/-", |e| matches!(e, TargetError::NotFound(_))),
+        ("/runs/01", |e| matches!(e, TargetError::NotFound(_))),
+        ("/log/0", |e| matches!(e, TargetError::NotFound(_))),
+        ("/twice", |e| matches!(e, TargetError::Ambiguous(_))),
+        ("/meta", |e| matches!(e, TargetError::Unsegmentable { found: "an object", .. })),
+        ("/empty", |e| matches!(e, TargetError::Unsegmentable { found: "an empty array", .. })),
+        ("/n", |e| matches!(e, TargetError::Unsegmentable { found: "a number", .. })),
+        ("", |e| matches!(e, TargetError::Unsegmentable { found: "an object", .. })),
+    ];
+    for &(pointer, expected) in cases {
+        let error = evidence_within(&state(doc), pointer).expect_err(pointer);
+        assert!(expected(&error), "{pointer:?}: {error:?}");
+        assert!(error.to_string().contains(&format!("{pointer:?}")), "{pointer:?}: the message names it: {error}");
+    }
 }

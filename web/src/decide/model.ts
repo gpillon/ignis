@@ -22,9 +22,10 @@ import {
   saysNothing,
   writeOrdered,
 } from "./json.ts";
+import { type Cut, cutTarget } from "./locate.ts";
 
-/** The seven primitives `decide.rs` serves. */
-export const PRIMITIVES = ["noul", "choice", "score", "number", "scalar", "point", "box"] as const;
+/** The eight primitives `decide.rs` serves. */
+export const PRIMITIVES = ["noul", "choice", "score", "number", "scalar", "point", "box", "locate"] as const;
 export type Primitive = (typeof PRIMITIVES)[number];
 
 /** What each primitive answers with, in the tab's own words. */
@@ -36,6 +37,7 @@ export const PRIMITIVE_BLURB: Record<Primitive, string> = {
   scalar: "A number that ends when it is complete — it may be fractional or negative, and you need not say how wide.",
   point: "A position on the image, in its own pixels.",
   box: "A rectangle on the image, in its own pixels.",
+  locate: "Which line of a text, sentence of a document or element of a list answers the instruction — the calibrated heads narrow it to a few candidates and a labelled choice picks one, with nothing generated or written into the evidence.",
 };
 
 /**
@@ -88,6 +90,56 @@ export const DEFAULT_METHOD: Record<"point" | "box", { label: string; blurb: str
     blurb:
       "The chain, on every load: the head box was measured no better than it on a small button, so the head is a box's opt-in. Asking for head on a load with no calibrated head set is refused rather than answered by the chain.",
   },
+};
+
+/**
+ * A `locate`'s route (GitHub #278, spec 22): which reading its text gets
+ * (`kind`), how it is answered (`method`) and what its text is read as
+ * (`compression`) — three enums on the wire, each optional.
+ *
+ * `null` on the question is the endpoint's default, sent as no field at all,
+ * and it is the empty choice of the selector, as a point's `method` is. For
+ * `kind` and `method` that default has a name of its own — `auto`,
+ * `shortlist` — so the empty choice is labelled with it and the name is not
+ * offered a second time: `prepare_locate` reads the name and the absence in
+ * one arm, so they are one request. `compression` has no fixed default — it
+ * follows the kind the text resolves to — so its empty choice says that, and
+ * both values are offered.
+ */
+export const LOCATE_KINDS = ["auto", "log", "prose", "records"] as const;
+export type LocateKind = (typeof LOCATE_KINDS)[number];
+/** A kind an answer can name: the one `auto` told, never `auto` itself. */
+export type ResolvedKind = Exclude<LocateKind, "auto">;
+export const LOCATE_METHODS = ["shortlist", "vote"] as const;
+export type LocateMethod = (typeof LOCATE_METHODS)[number];
+export const COMPRESSIONS = ["template_fold", "none"] as const;
+export type Compression = (typeof COMPRESSIONS)[number];
+
+/** What each kind reads, in the tab's own words; `auto`'s is the empty choice's. */
+export const LOCATE_KIND_BLURB: Record<LocateKind, string> = {
+  auto: "Told for you, and named in the answer: records for an array of two or more JSON objects; otherwise the text is folded, and it is a log when at least half of its first 2,000 non-blank segments share a template, prose when fewer do.",
+  log: "Lines of a log: the end heads read each line where it ends, and the log is folded into templates first unless you say otherwise, so a million tokens answer in seconds. Refused on an array of JSON objects, which is read as records.",
+  prose: "Sentences of a document: the sum heads read every key of a sentence, the choice sees each candidate inside its paragraph, and a two-part answer comes back as several pointers. Never folded; refused on an array of JSON objects.",
+  records: "The elements of an array of JSON objects, each shown to the choice as one line of JSON. Refused on any other target.",
+};
+
+/** What each method does; `shortlist`'s is the empty choice's. */
+export const LOCATE_METHOD_BLURB: Record<LocateMethod, string> = {
+  shortlist:
+    "The default: the calibrated heads narrow the text to a few candidates and a labelled choice picks among them, with nothing generated. The shares are that choice's probabilities, and on the three measured routes it also says whether anything answers at all.",
+  vote: "The head vote served before: one prefill over the whole target, at most 4,554 tokens on the served artifact, and the shares are the heads' votes. It always names a segment, carries no found, and reads the text as it is, so a fold is refused under it.",
+};
+
+/** What each compression does, and what the empty choice leaves it to. */
+export const COMPRESSION_BLURB: Record<Compression, string> = {
+  template_fold:
+    "Fold first: templates and their values, so nothing near the text's length is prefilled. A log's default; a records array folds too — faster, less often right, and with no found. A fold drops the lines' order, their neighbours and every time, and it is refused on prose and under a vote.",
+  none: "Read the text as it is, in windows of 200,000 tokens past that, keeping the context across lines that a fold removes. The first question pays each window's prefill; a log read this way carries no found.",
+};
+
+export const DEFAULT_COMPRESSION = {
+  label: "the kind's own",
+  blurb: "Whatever the kind reads best with: a log is folded into templates, prose and records are read as they are. A vote reads every text as it is.",
 };
 
 /**
@@ -168,6 +220,29 @@ export type Question = {
    * magnitude.
    */
   ceiling: number | null;
+  /**
+   * `locate`: the JSON Pointer to the part of the evidence it searches, and
+   * `""` for the whole of it — the server's absent field, so an empty one is
+   * not sent. Kept on the question whatever its type, like `method`, and sent
+   * only from a `locate`: `decide.rs` refuses `within` on every other type.
+   */
+  within: string;
+  /**
+   * `locate` (GitHub #278): the kind of text it reads, and `null` for `auto`.
+   * Not `kind`, which is the primitive: the server's own field is `text_kind`,
+   * renamed `kind` on the wire. Kept whatever the type, like `within`, and
+   * sent only from a `locate`: `decide.rs` refuses `kind` on every other one.
+   */
+  textKind: ResolvedKind | null;
+  /**
+   * `locate`: `vote`, and `null` for the endpoint's `shortlist`. It is the
+   * wire's `method`, and a field apart from a point's all the same — the key
+   * names another vocabulary there — as a scalar's ceiling is a field apart
+   * from a number's width.
+   */
+  locateMethod: Exclude<LocateMethod, "shortlist"> | null;
+  /** `locate`: `template_fold` or `none`, and `null` for the one its kind reads best with. */
+  compression: Compression | null;
   /** Fields the JSON editor carried that the builder does not edit; re-emitted as they were. */
   extras: JsonEntry[];
 };
@@ -227,11 +302,28 @@ export function newQuestion(kind: Primitive, id: string): Question {
     digits: DEFAULT_DIGITS,
     method: null,
     ceiling: null,
+    within: "",
+    textKind: null,
+    locateMethod: null,
+    compression: null,
     extras: [],
   };
 }
 
 export const emptyOption = (): Option => ({ key: "", description: "" });
+
+/** The wire key each of a locate's route fields is sent under. */
+const ROUTE_KEY = { textKind: "kind", locateMethod: "method", compression: "compression" } as const;
+
+/**
+ * `question` with one of a locate's route fields chosen (GitHub #278), and
+ * whatever the JSON editor kept under the same wire key dropped: a value no
+ * name covered is replaced by the one chosen, not sent beside it as a second
+ * `method`.
+ */
+export function chooseRoute<K extends keyof typeof ROUTE_KEY>(question: Question, field: K, value: Question[K]): Question {
+  return { ...question, [field]: value, extras: question.extras.filter((entry) => entry.key !== ROUTE_KEY[field]) };
+}
 
 /** An id nothing in `questions` is using yet: `answer`, then `answer_2`, … */
 export function freeId(questions: Question[], stem: string): string {
@@ -307,10 +399,12 @@ export function validate(draft: Draft): Fault[] {
     }
 
     faults.push(...methodFaults(question, name));
+    faults.push(...routeFieldFaults(question, name));
     if (question.kind === "choice") faults.push(...choiceFaults(question, name));
     if (question.kind === "score") faults.push(...scoreFaults(question, name));
     if (hasFixedWidth(question.kind)) faults.push(...digitFaults(question, name));
     if (question.kind === "scalar") faults.push(...ceilingFaults(question, name));
+    if (question.kind === "locate") faults.push(...locateFaults(draft.evidence, question, name));
     if (isSpatial(question.kind) && !hasImage(draft.evidence)) {
       faults.push({
         code: "state_carries_no_image",
@@ -323,23 +417,67 @@ export function validate(draft: Draft): Fault[] {
 }
 
 /**
- * A `method` spelling neither name covers.
+ * A `method` spelling the question's own type does not name.
  *
- * A known `method` on a primitive other than `point` is not a fault: it is
+ * A known `method` on a primitive that does not take it is not a fault: it is
  * kept on the question, so a trip through another type and back does not lose
- * it, and ignored there — `requestBody` sends it only from a point.
+ * it, and ignored there — `requestBody` sends a point's only from a point or
+ * a box, and a locate's only from a locate.
  */
 function methodFaults(question: Question, name: string): Fault[] {
   const faults: Fault[] = [];
-  // Only `readQuestion` can put a `method` here, and only one the two names
-  // do not cover.
+  // Only `readQuestion` can put a `method` here, and only one the question's
+  // type does not name: a locate's are `shortlist` and `vote` (GitHub #278),
+  // everything else's `head` and `chain`.
   const unknown = question.extras.find((entry) => entry.key === "method");
   if (unknown) {
+    const accepted = question.kind === "locate" ? '"shortlist" and "vote"' : '"head" and "chain"';
     faults.push({
       code: "method_unknown",
-      message: `${name} asks for the method ${JSON.stringify(asText(unknown.value))}; the accepted values are "head" and "chain".`,
+      message: `${name} asks for the method ${JSON.stringify(asText(unknown.value))}; the accepted values are ${accepted}.`,
       uid: question.uid,
     });
+  }
+  return faults;
+}
+
+/**
+ * A `kind` or a `compression` no value covers (GitHub #278), which only
+ * `readQuestion` can put here, kept as written so the body still earns the
+ * server's refusal: an unknown value on a `locate`, and the field itself on
+ * every other type — `decide.rs` never ignores a field a caller wrote.
+ */
+function routeFieldFaults(question: Question, name: string): Fault[] {
+  const locate = question.kind === "locate";
+  const faults: Fault[] = [];
+  for (const { key, value } of question.extras) {
+    const written = JSON.stringify(asText(value));
+    if (key === "kind") {
+      faults.push(
+        locate
+          ? {
+              code: "kind_unknown",
+              message: `${name} asks for the kind ${written}; the accepted values are "auto", "log", "prose" and "records".`,
+              uid: question.uid,
+            }
+          : { code: "kind_unsupported", message: `${name} is a ${question.kind}: \`kind\` names the reading a locate's text gets.`, uid: question.uid },
+      );
+    }
+    if (key === "compression") {
+      faults.push(
+        locate
+          ? {
+              code: "compression_unknown",
+              message: `${name} asks for the compression ${written}; the accepted values are "template_fold" and "none".`,
+              uid: question.uid,
+            }
+          : {
+              code: "compression_unsupported",
+              message: `${name} is a ${question.kind}: \`compression\` names what a locate's text is read as.`,
+              uid: question.uid,
+            },
+      );
+    }
   }
   return faults;
 }
@@ -414,6 +552,65 @@ function ceilingFaults(question: Question, name: string): Fault[] {
   ];
 }
 
+/**
+ * A `locate`'s own refusals, reported before the send: the target it names
+ * has to exist, be a string or a non-empty array, and hold two segments with
+ * text in them. A JSON evidence that does not parse is already a fault of its
+ * own, and cutting it would only say the same thing twice.
+ *
+ * And its route's (GitHub #278): the two combinations that never apply — a
+ * fold under a vote, a fold of prose — and a named kind the target
+ * contradicts. One refusal stays the server's: a fold of a text `auto` tells
+ * is prose, which only the fold itself can say.
+ */
+function locateFaults(evidence: Evidence, question: Question, name: string): Fault[] {
+  const faults: Fault[] = [];
+  const fault = (code: string, message: string) => faults.push({ code, message: `${name} ${message}`, uid: question.uid });
+  if (question.compression === "template_fold" && question.locateMethod === "vote") {
+    fault(
+      "compression_unsupported",
+      'asks for a vote over a fold: the vote reads the text as it is — over a fold it read 28 of 58 real-log questions — so "template_fold" is refused with "vote". Ask for the shortlist, or for "none".',
+    );
+  }
+  if (question.compression === "template_fold" && question.textKind === "prose") {
+    fault("compression_unsupported", 'asks to fold prose, which does not fold into templates. Ask for "none", or leave the compression to the kind.');
+  }
+  const cut = locateTarget(evidence, question.within);
+  if (cut === null) return faults;
+  if (!cut.ok) return [...faults, { code: cut.code, message: `${name}: ${cut.message}`, uid: question.uid }];
+  if (question.textKind === "records" && !cut.target.records) {
+    fault("kind_mismatch", 'names kind "records", and its target is not an array of two or more JSON objects. Ask for "log" or "prose", or leave it to auto.');
+  }
+  if ((question.textKind === "log" || question.textKind === "prose") && cut.target.records) {
+    fault(
+      "kind_mismatch",
+      `names kind "${question.textKind}", and its target is an array of JSON objects, which is read as records. To fold it, ask for kind "records" with compression "template_fold".`,
+    );
+  }
+  return faults;
+}
+
+/**
+ * The target a `locate` would read in this evidence, cut into its segments —
+ * or the refusal, or `null` when the evidence is JSON that does not parse.
+ *
+ * Text evidence is a JSON string on the wire, so its segments are its lines.
+ * Image evidence is content parts, which a `locate` refuses whatever `within`
+ * says.
+ */
+export function locateTarget(evidence: Evidence, within: string): Cut | null {
+  if (evidence.mode === "image") {
+    return {
+      ok: false,
+      code: "locate_needs_json_state",
+      message: "a locate reads the lines of a text or the elements of a JSON array, and this evidence is an image. Switch the evidence to Text or JSON.",
+    };
+  }
+  if (evidence.mode === "text") return cutTarget(jsonString(evidence.text), within);
+  const parsed = parseOrdered(evidence.text.trim() || "null");
+  return parsed.ok ? cutTarget(parsed.node, within) : null;
+}
+
 export const hasImage = (evidence: Evidence) => evidence.mode === "image" && evidence.images.length > 0;
 
 /** The image a `point` or `box` answers against — the first one, as the prompt carries it. */
@@ -482,6 +679,20 @@ function questionNode(question: Question): JsonNode {
   // says it.
   if (question.kind === "scalar" && question.ceiling !== null) {
     entries.push({ key: "digits", value: { kind: "number", value: question.ceiling } });
+  }
+  // The whole evidence is what an absent `within` searches, and no pointer
+  // needs writing to say it.
+  if (question.kind === "locate" && question.within !== "") {
+    entries.push({ key: "within", value: jsonString(question.within) });
+  }
+  // A locate's route (GitHub #278), each field only when one was chosen:
+  // absent is `auto`, the `shortlist`, and the compression the kind the text
+  // resolves to reads best with — none of which a value written here could
+  // say without pinning a default the endpoint owns.
+  if (question.kind === "locate") {
+    if (question.textKind !== null) entries.push({ key: "kind", value: jsonString(question.textKind) });
+    if (question.locateMethod !== null) entries.push({ key: "method", value: jsonString(question.locateMethod) });
+    if (question.compression !== null) entries.push({ key: "compression", value: jsonString(question.compression) });
   }
   return jsonObject([...entries, ...question.extras]);
 }
@@ -601,15 +812,39 @@ function readQuestion(id: string, node: JsonNode): ReadQuestion {
     if (kind === "scalar") question.ceiling = digits.value;
     else question.digits = digits.value;
   }
-  // A spelling neither method covers is kept as it was written rather than
-  // dropped: the server refuses it naming the two it accepts, and a body that
-  // round-trips through this editor has to still earn that refusal.
+  // A spelling the question's type does not name is kept as it was written
+  // rather than dropped: the server refuses it naming the two it accepts, and
+  // a body that round-trips through this editor has to still earn that
+  // refusal. Which two depends on the type (GitHub #278): a locate's
+  // `shortlist` and `vote`, everything else's `head` and `chain` — so a
+  // `head` on a locate is kept, not read as a point's and left off the wire.
   const method = at("method");
-  if (method?.kind === "string" && (SPATIAL_METHODS as readonly string[]).includes(method.value)) {
-    question.method = method.value as SpatialMethod;
+  if (method?.kind === "string" && kind === "locate" && isOneOf(LOCATE_METHODS, method.value)) {
+    // `shortlist` is the empty choice: the server reads it and an absent
+    // field alike.
+    question.locateMethod = method.value === "shortlist" ? null : method.value;
+  } else if (method?.kind === "string" && kind !== "locate" && isOneOf(SPATIAL_METHODS, method.value)) {
+    question.method = method.value;
   } else if (method) {
     question.extras = [{ key: "method", value: method }];
   }
+  // A pointer that is not a string is kept as written, for the server to
+  // refuse, as a `method` neither name covers is.
+  const within = at("within");
+  if (within?.kind === "string") question.within = within.value;
+  else if (within) question.extras = [...question.extras, { key: "within", value: within }];
+  // A locate's `kind` and `compression` (GitHub #278) are read whatever the
+  // type, as `within` is, and a value neither covers is kept as written.
+  // `auto` is the empty choice, as `shortlist` is.
+  const textKind = at("kind");
+  if (textKind?.kind === "string" && isOneOf(LOCATE_KINDS, textKind.value)) {
+    question.textKind = textKind.value === "auto" ? null : textKind.value;
+  } else if (textKind) {
+    question.extras = [...question.extras, { key: "kind", value: textKind }];
+  }
+  const compression = at("compression");
+  if (compression?.kind === "string" && isOneOf(COMPRESSIONS, compression.value)) question.compression = compression.value;
+  else if (compression) question.extras = [...question.extras, { key: "compression", value: compression }];
   const criteria = at("criteria") ?? at("options");
   if (criteria) applyCriteria(question, criteria);
   // Anything else the caller wrote stays on the question and goes back out as
@@ -620,7 +855,10 @@ function readQuestion(id: string, node: JsonNode): ReadQuestion {
 
 /** `decide.rs`'s serde aliases: their names and ours are the same field. */
 const ALIASES: Record<string, Primitive | undefined> = { boolean: "noul" };
-const READ_KEYS = ["type", "instructions", "question", "criteria", "options", "digits", "method"];
+const READ_KEYS = ["type", "instructions", "question", "criteria", "options", "digits", "method", "within", "kind", "compression"];
+
+/** Whether `value` is one of `values`, narrowing it to their type. */
+const isOneOf = <T extends string>(values: readonly T[], value: string): value is T => (values as readonly string[]).includes(value);
 
 function applyCriteria(question: Question, criteria: JsonNode) {
   if (question.kind === "score" && criteria.kind === "array") {

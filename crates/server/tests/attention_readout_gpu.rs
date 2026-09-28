@@ -261,10 +261,10 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
             let (best, top) = oracle
                 .iter()
                 .enumerate()
-                .filter(|(k, _)| !set_query.excluded.contains(&(*k as u32)))
+                .filter(|(k, _)| !set_query.excluded().contains(&(*k as u32)))
                 .fold((0usize, f32::NEG_INFINITY), |(bk, bs), (k, &s)| if s >= bs { (k, s) } else { (bk, bs) });
             assert!(
-                !set_query.excluded.contains(&key),
+                !set_query.excluded().contains(&key),
                 "{label}: {head} landed on excluded key {key}"
             );
             if key as usize != best {

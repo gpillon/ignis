@@ -475,7 +475,7 @@ impl Compute for MockCompute {
                     .attention
                     .as_ref()
                     .filter(|_| !g.attention_refusals.remove(&job.request))
-                    .map(Self::attention),
+                    .map(|query| Self::attention(query, job.start_position + job.tokens.len() as u32)),
             })
             .collect())
     }
@@ -734,32 +734,61 @@ impl MockCompute {
         }
     }
 
+    /// Every head's row of a set read in rows (GitHub #275), `[heads]
+    /// [count]`: the background everywhere and one peak at
+    /// [`MockCompute::attention_peak`], standing `ln(1 + prompt_tokens)`
+    /// nats above it — so the rows **sharpen with the prompt** they are read
+    /// at the end of. A question whose instruction is longer than its
+    /// content-free twin's `N/A` therefore lifts its peak's segment above
+    /// the baseline, as a real question does, and every head votes for it.
+    pub fn attention_rows(count: u32, heads: usize, prompt_tokens: u32) -> Vec<f32> {
+        let peak = Self::attention_peak(count);
+        let top = Self::ATTENTION_BACKGROUND_SCORE + (1.0 + prompt_tokens as f32).ln();
+        let row: Vec<f32> = (0..count as usize)
+            .map(|key| match key == peak {
+                true => top,
+                false => Self::ATTENTION_BACKGROUND_SCORE,
+            })
+            .collect();
+        (0..heads).flat_map(|_| row.iter().copied()).collect()
+    }
+
     /// The deterministic attention readout (GitHub #260): one score per key,
     /// the peak at [`MockCompute::attention_peak`] — and, for a query naming
-    /// a head set (GitHub #263), one key per head at
+    /// an image's head set (GitHub #263), one key per head at
     /// [`MockCompute::attention_set_argmax`], each with the four scores
-    /// around it (GitHub #264, [`MockCompute::attention_set_neighbours`]).
-    fn attention(query: &crate::pointing::AttentionQuery) -> crate::pointing::AttentionScores {
+    /// around it (GitHub #264, [`MockCompute::attention_set_neighbours`]); for
+    /// a set read in rows (GitHub #275), every head's row
+    /// ([`MockCompute::attention_rows`], read at the end of a
+    /// `prompt_tokens`-long prompt) with its argmax and peak.
+    fn attention(query: &crate::pointing::AttentionQuery, prompt_tokens: u32) -> crate::pointing::AttentionScores {
+        use crate::pointing::SetRead;
         let count = query.key_count;
         let peak = Self::attention_peak(count);
-        let set = query.set.as_ref().map(|set| {
-            let argmax = Self::attention_set_argmax(count, set.heads.len(), &set.excluded);
-            let neighbours = Self::attention_set_neighbours(&argmax, count, set.grid_cols);
-            (argmax, neighbours)
-        });
-        crate::pointing::AttentionScores {
-            scores: (0..count as usize)
+        let mut scores = crate::pointing::AttentionScores::pointing(
+            (0..count as usize)
                 .map(|key| match key == peak {
                     true => Self::ATTENTION_PEAK_SCORE,
                     false => Self::ATTENTION_BACKGROUND_SCORE,
                 })
-                .collect(),
-            set_argmax: set.as_ref().map(|(argmax, _)| argmax.clone().into()),
-            set_peak: set
-                .as_ref()
-                .map(|(argmax, _)| vec![Self::ATTENTION_PEAK_SCORE; argmax.len()].into()),
-            set_neighbours: set.map(|(_, neighbours)| neighbours.into()),
+                .collect::<Vec<f32>>(),
+        );
+        match query.set.as_ref().map(|set| (set.heads.len(), &set.read)) {
+            None => {}
+            Some((heads, SetRead::Peaks { excluded, grid_cols })) => {
+                let argmax = Self::attention_set_argmax(count, heads, excluded);
+                scores.set_neighbours = Some(Self::attention_set_neighbours(&argmax, count, *grid_cols).into());
+                scores.set_peak = Some(vec![Self::ATTENTION_PEAK_SCORE; heads].into());
+                scores.set_argmax = Some(argmax.into());
+            }
+            Some((heads, SetRead::Rows)) => {
+                let rows = Self::attention_rows(count, heads, prompt_tokens);
+                scores.set_argmax = Some(vec![peak as u32; heads].into());
+                scores.set_peak = Some(vec![rows[peak]; heads].into());
+                scores.set_rows = Some(rows.into());
+            }
         }
+        scores
     }
 
     /// The mock's **constrained** draw (GitHub #242): a member of

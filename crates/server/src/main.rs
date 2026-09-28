@@ -534,6 +534,28 @@ async fn main() {
         methods.summary
     );
 
+    // GitHub #275: whether a `locate` can be answered, said once at load.
+    // Its heads are keyed to the artifact's content hash like the pointing
+    // head's, so a load nobody calibrated says so here rather than in every
+    // refusal after it.
+    // GitHub #278: and which heads each reading uses, and the window a
+    // long text is read in.
+    let names = |heads: &[ignis_core::pointing::PointingHead]| {
+        heads.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+    };
+    tracing::info!(
+        name: "ignis.decide.locate",
+        available = server.locate.is_some(),
+        heads = server.locate.map(|calibration| calibration.heads.len()),
+        max_keys = server.locate.map(|calibration| calibration.max_keys),
+        sum_heads = server.locate.map(|calibration| names(calibration.heads)),
+        end_heads = server.locate.map(|calibration| names(calibration.end_heads)),
+        window_keys = server.locate.map(|calibration| calibration.window_keys),
+        artifact = %server.engine.artifact(),
+        "{}",
+        ignis_server::decide::locate_summary(server.locate)
+    );
+
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the
     // server already treats a missing EOS token or an unclean checksum.

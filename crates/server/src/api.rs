@@ -262,6 +262,9 @@ pub(crate) struct PreparedRequest {
     /// Where each content part of the last message ends, in tokens (GitHub
     /// #270, [`RenderedPrompt::part_ends`]); empty unless asked for.
     pub part_ends: Vec<Option<u32>>,
+    /// The rendered text and each token's byte range in it (GitHub #275,
+    /// [`RenderedPrompt::text`]); `None` unless asked for.
+    pub text: Option<crate::template::PromptText>,
 }
 
 /// The request's model, the templated prompt tokens, and the prompt-token
@@ -274,7 +277,7 @@ fn build_request(
     params: DecodeParams,
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
-    part_ends: bool,
+    structure: Structure,
 ) -> Result<PreparedRequest, TemplateRejection> {
     // `model` is the model the request names; `None` (or a blank) falls
     // back to the loaded model. A model the engine does not load is
@@ -282,9 +285,10 @@ fn build_request(
     // The template seam: the artifact's frontend object set (artifact-02)
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
-    let rendered = match part_ends {
-        true => server.template.apply_chat_template_with_part_ends(messages, thinking, tools)?,
-        false => server.template.apply_chat_template(messages, thinking, tools)?,
+    let rendered = match structure {
+        Structure::PartEnds => server.template.apply_chat_template_with_part_ends(messages, thinking, tools)?,
+        Structure::Text => server.template.apply_chat_template_with_text(messages, thinking, tools)?,
+        Structure::Tokens => server.template.apply_chat_template(messages, thinking, tools)?,
     };
     request_input(server, model, rendered, params, None)
 }
@@ -301,6 +305,7 @@ fn request_input(
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| server.engine.model_id());
     let prompt_tokens = rendered.tokens.len() as u32;
+    let text = rendered.text;
     if prompt_tokens == 0 {
         return Err(TemplateRejection {
             code: "render_failed",
@@ -323,7 +328,17 @@ fn request_input(
         reuse_boundaries: Vec::new(),
         constrained: None,
 };
-    Ok(PreparedRequest { input, model, prompt_tokens, media: None, part_ends: rendered.part_ends })
+    Ok(PreparedRequest { input, model, prompt_tokens, media: None, part_ends: rendered.part_ends, text })
+}
+
+/// What a render reports beside its tokens: nothing more, where each part of
+/// the last message ends (GitHub #270), or the text and each token's place
+/// in it (GitHub #275).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Structure {
+    Tokens,
+    PartEnds,
+    Text,
 }
 
 /// [`build_request`] for any conversation: one carrying image parts on a
@@ -340,12 +355,12 @@ async fn prepare_request(
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
 ) -> Result<(RequestInput, String, u32, Option<MediaStats>), Response> {
-    let prepared = prepare_input(server, model, messages, params, thinking, tools, false).await?;
+    let prepared = prepare_input(server, model, messages, params, thinking, tools, Structure::Tokens).await?;
     Ok((prepared.input, prepared.model, prepared.prompt_tokens, prepared.media))
 }
 
-/// [`prepare_request`], reporting the last message's part ends too when
-/// `part_ends` asks for them (GitHub #270).
+/// [`prepare_request`], reporting the last message's part ends (GitHub #270)
+/// or the rendered text (GitHub #275) too when `structure` asks for them.
 async fn prepare_input(
     server: &Server,
     model: Option<String>,
@@ -353,20 +368,22 @@ async fn prepare_input(
     params: DecodeParams,
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
-    part_ends: bool,
+    structure: Structure,
 ) -> Result<PreparedRequest, Response> {
     // GitHub #209: instruction messages are placed under the server's
     // policies before any template sees the conversation, on both paths.
     let messages = &server.instruction_policy.normalize(messages).map_err(template_rejection)?;
     let Some(acquirer) = server.media.as_ref().filter(|_| has_media(messages)) else {
-        return build_request(server, model, messages, params, thinking, tools, part_ends)
+        return build_request(server, model, messages, params, thinking, tools, structure)
             .map_err(template_rejection);
     };
     let deadline = std::time::Instant::now() + server.request_timeout;
     let acquired = acquirer.acquire(messages, deadline).await.map_err(media_rejection)?;
-    let prepared = match part_ends {
-        true => server.template.prepare_multimodal_with_part_ends(messages, thinking, tools, acquired.media),
-        false => server.template.prepare_multimodal(messages, thinking, tools, acquired.media),
+    // A media prompt reports no text: a `locate` refuses a parts `state`
+    // before it renders one.
+    let prepared = match structure {
+        Structure::PartEnds => server.template.prepare_multimodal_with_part_ends(messages, thinking, tools, acquired.media),
+        Structure::Tokens | Structure::Text => server.template.prepare_multimodal(messages, thinking, tools, acquired.media),
     };
     let (rendered, multimodal) = prepared.map_err(content_rejection)?;
     let prepared =
@@ -383,18 +400,20 @@ async fn prepare_input(
 /// evidence here exactly as it is there. The error is a rendered response,
 /// ready to stand in a question's slot.
 ///
-/// With `part_ends`, the render reports where each content part of the last
-/// message ends (GitHub #270) — the decision's `state` parts — which is what
-/// its reuse boundaries are cut from.
+/// With [`Structure::PartEnds`], the render reports where each content part
+/// of the last message ends (GitHub #270) — the decision's `state` parts —
+/// which is what its reuse boundaries are cut from; with
+/// [`Structure::Text`], the rendered text and each token's place in it,
+/// which is what a `locate` maps its segments by (GitHub #275).
 pub(crate) async fn prepare_decision_request(
     server: &Server,
     model: Option<String>,
     messages: &[ChatMessage],
     params: DecodeParams,
     thinking: &ThinkingOptions,
-    part_ends: bool,
+    structure: Structure,
 ) -> Result<PreparedRequest, (&'static str, String)> {
-    prepare_input(server, model, messages, params, thinking, &[], part_ends)
+    prepare_input(server, model, messages, params, thinking, &[], structure)
         .await
         .map_err(|response| {
             // The shared path answers with a rendered `Response`, which is

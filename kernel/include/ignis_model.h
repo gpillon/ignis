@@ -190,6 +190,13 @@ struct ignis_model_load_options {
    * pool keeps the envelope's floor, and `ignis_media_encode` refuses an
    * item past the bound. Nonzero needs `vision_max_tokens`. */
   uint32_t vision_item_max_tokens;
+  /* GitHub #275 (ADR 0041): the most keys of a **text** span an attention
+   * readout may read, and so the room a load reserves for one -- one score
+   * per key, and IGNIS_ATTENTION_MAX_ROW_HEADS whole rows -- at load, whether
+   * or not the load has vision (ADR 0030). 0 = none: a readout then reads at
+   * most one vision item's span, as before. The caller passes the ceiling
+   * its calibration measured (`LOCATE_MAX_KEYS`); capped by the context. */
+  uint32_t attention_text_max_keys;
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many

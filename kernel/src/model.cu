@@ -862,6 +862,8 @@ struct LoadOptions {
   // GitHub #227: the text rotary table's scaling; the default is no scaling,
   // the linear table.
   ignis::RopeScaling rope_scaling{};
+  // GitHub #275: the most keys of a text span an attention readout reads.
+  uint32_t attention_text_max_keys = 0;
 };
 
 // GitHub #243: one embedding pool page, in bytes -- the width every side of
@@ -943,6 +945,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   uint32_t vision_max_tokens = 0;
   uint32_t vision_item_max_tokens = 0;
   uint64_t vision_embedding_pool_request = 0;
+  uint32_t attention_text_max_keys = 0;
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
@@ -959,6 +962,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     rope_scaling.temperature = options->rope_scaling_temperature;
     rope_scaling.beta_fast = options->rope_scaling_beta_fast;
     rope_scaling.beta_slow = options->rope_scaling_beta_slow;
+    attention_text_max_keys = options->attention_text_max_keys;
   }
   // GitHub #227: a scaling that cannot build a table is refused by name --
   // the alternative is a load that silently rotates at a different one.
@@ -1023,6 +1027,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
                                    : std::min(vision_item_max_tokens, vision_max_tokens);
   out.vision_embedding_pool_bytes = vision_embedding_pool_request;
   out.rope_scaling = rope_scaling;
+  out.attention_text_max_keys = std::min(attention_text_max_keys, max_context_tokens);
 
   ModelBinder binder(tensors, count);
   if (!binder.build_index(count)) {
@@ -1107,10 +1112,18 @@ void check_dflash2_round_workspace(const ignis_model &model, const Geometry &g,
 // reports it, run. Throws on a sizing failure.
 struct LoadSizes {
   std::size_t prefill_scratch = 0;
-  // GitHub #260 (ADR 0038): the attention readout's scores, which a prefill
-  // chunk takes from the same arena beside `prefill_scratch`. Kept apart from
-  // it because only a vision load has any: what vision adds to the arena is
-  // counted as vision's (`vision_reserved_bytes`), readout included.
+  // GitHub #275 (ADR 0041): the attention readout's room for a text span --
+  // its scores, the set's results and IGNIS_ATTENTION_MAX_ROW_HEADS whole
+  // rows over the load's `attention_text_max_keys` -- which a prefill chunk
+  // takes from the same arena beside `prefill_scratch`. A text load's own,
+  // so counted with the prefill scratch rather than as vision's.
+  std::size_t text_readout = 0;
+  // GitHub #260 (ADR 0038): what a vision load's readout needs beyond the
+  // text room: the scores of one item's span, and the set's results when
+  // there is no text room to share them with. Kept apart from the prefill
+  // scratch because only a vision load has it: what vision adds to the
+  // arena is counted as vision's (`vision_reserved_bytes`), readout
+  // included.
   std::size_t attention_readout = 0;
   std::size_t vision_workspace = 0;
   std::size_t media_embedding = 0;
@@ -1126,7 +1139,7 @@ struct LoadSizes {
   // are never live at once -- ninfer sizes its single workspace the same
   // way.
   std::size_t workspace() const {
-    return std::max(prefill_scratch + attention_readout, vision_workspace);
+    return std::max(prefill_scratch + text_readout + attention_readout, vision_workspace);
   }
 
   ignis_model_reservations reservations() const {
@@ -1154,6 +1167,22 @@ struct LoadSizes {
     return out;
   }
 };
+
+// The attention readout's room in a prefill chunk's arena (GitHub #260,
+// #263, #264, #275): one F32 score per key of a span of `score_keys`, one
+// packed (score, key) and four neighbour scores per head of the largest set
+// a readout may name, and -- over a text span of `row_keys` -- every head's
+// row for the most heads a readout reads in rows. `step.cu` takes all of it
+// from this arena. None without a span to read.
+std::size_t attention_readout_bytes(std::int32_t score_keys, std::int32_t row_keys) {
+  if (score_keys <= 0) {
+    return 0;
+  }
+  return fp32_bytes(score_keys) +
+         round_up_arena_align(static_cast<std::size_t>(kReadoutMaxSetHeads) * sizeof(unsigned long long)) +
+         round_up_arena_align(static_cast<std::size_t>(kReadoutMaxSetHeads) * 4 * sizeof(float)) +
+         (row_keys > 0 ? fp32_bytes(static_cast<std::int64_t>(kReadoutMaxRowHeads) * row_keys) : 0);
+}
 
 LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topology,
                           uint32_t prefill_chunk_tokens, uint32_t max_context_tokens,
@@ -1192,15 +1221,24 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     // per head that ride with it, 6 KB more. `step.cu` takes all three from
     // this arena; the neighbours went unreserved until the encoder stopped
     // sizing the arena past the prefill scratch, which had hidden them.
-    sizes.attention_readout =
-        fp32_bytes(item_tokens) +
-        round_up_arena_align(static_cast<std::size_t>(kReadoutMaxSetHeads) * sizeof(unsigned long long)) +
-        round_up_arena_align(static_cast<std::size_t>(kReadoutMaxSetHeads) * 4 * sizeof(float));
+    //
+    // GitHub #275: beyond the text room, if the load has one -- the two
+    // readouts never run at once, so the item's scores need only what the
+    // text scores do not already hold.
+    const auto text_keys = static_cast<std::int32_t>(options.attention_text_max_keys);
+    sizes.attention_readout = attention_readout_bytes(std::max(item_tokens, text_keys), text_keys) -
+                              attention_readout_bytes(text_keys, text_keys);
     sizes.vision_workspace =
         ignis_vision_workspace_bytes(item_tokens, std::min(item_tokens, kVisionMaxSegments));
     sizes.media_embedding =
         vision_embedding_pool_bytes(g.hidden, tokens, options.vision_embedding_pool_bytes);
   }
+
+  // GitHub #275 (ADR 0041): a `locate`'s readout over a text span, reserved
+  // at load whether or not the load has vision (ADR 0030) -- a text load's
+  // own, so counted with the prefill scratch.
+  sizes.text_readout = attention_readout_bytes(static_cast<std::int32_t>(options.attention_text_max_keys),
+                                               static_cast<std::int32_t>(options.attention_text_max_keys));
 
   // P3-03 (GitHub #99): device sampling's workspace and its decode logits.
   const auto vocab = static_cast<std::int32_t>(g.vocab);
@@ -1395,7 +1433,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
 
   try {
     model->scratch = std::make_unique<ninfer::DeviceArena>(scratch_bytes);
-    model->prefill_scratch_bytes = sizes.prefill_scratch;
+    model->prefill_scratch_bytes = sizes.prefill_scratch + sizes.text_readout;
+    model->attention_text_max_keys = load.attention_text_max_keys;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: scratch arena allocation failed: ") + e.what());
     cudaStreamDestroy(model->stream);

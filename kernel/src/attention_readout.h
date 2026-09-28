@@ -16,6 +16,7 @@
 #include "core/paged_kv_cache.h"
 #include "ignis_gqa_workspace.h"
 #include "ignis_seq_internal.h"
+#include "ignis_step.h"
 
 #include <cuda_runtime.h>
 
@@ -32,6 +33,9 @@ constexpr int kReadoutMaxSetHeads = kReadoutGqaLayers * kReadoutLayerHeads;
 // The most keys a set's argmax may skip (the fallback cells), carried as
 // launch arguments rather than memory.
 constexpr int kReadoutMaxExcluded = 32;
+// GitHub #275 (ADR 0041): the most heads a readout brings whole rows back
+// for -- the room a load reserves beside the text score room.
+constexpr int kReadoutMaxRowHeads = IGNIS_ATTENTION_MAX_ROW_HEADS;
 
 // GitHub #264: the host's inverse of the fused kernel's order-preserving
 // float -> uint packing (`pack_score`), so the peak's own score can be read
@@ -70,6 +74,11 @@ struct AttentionReadoutTarget {
   // are needed whenever `set_heads` is nonzero.
   float *device_set_neighbours = nullptr;
   int32_t grid_cols = 0;
+  // GitHub #275 (ADR 0041): where this layer's heads' whole rows go -- head
+  // `set_slot[i]` of the whole set at `set_slot[i] * key_count` -- for a set
+  // read in rows over a text span, or null. With rows the neighbours may be
+  // null, and then no neighbour is gathered: a text span is no grid.
+  float *device_set_rows = nullptr;
   // Span-relative keys no head of the set may peak on. The pointing head's
   // row still covers them.
   int32_t excluded_count = 0;
@@ -101,7 +110,8 @@ struct AttentionReadoutTarget {
 // the four KV heads, each block rotating the armed query heads of its KV head
 // once, each warp scoring one key row against all of them (the row is read
 // once per layer, not once per head), each block publishing one `atomicMax`
-// per head.
+// per head -- and, with rows (#275), writing every score it forms. The
+// neighbour gather follows only when the target has somewhere to put them.
 //
 // Returns 0 and sets `*target.read` when it launched the scores; returns 0
 // with `*target.read` untouched when the keys were not there to read; a

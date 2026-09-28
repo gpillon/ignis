@@ -1,4 +1,6 @@
 import { type JsonNode, parseOrdered, writeOrdered } from "./src/decide/json.ts";
+import { cutTarget, FOUND_THRESHOLD, POINTER_SHARE, resolve, type Target } from "./src/decide/locate.ts";
+import { type Compression, COMPRESSIONS, LOCATE_KINDS, LOCATE_METHODS, type LocateMethod, type ResolvedKind } from "./src/decide/model.ts";
 
 // A fake `/v1/decide` for `npm run dev:mock` (GitHub #247): enough of the real
 // answer shapes to build the Decide tab against without the shared GPU.
@@ -12,7 +14,8 @@ import { type JsonNode, parseOrdered, writeOrdered } from "./src/decide/json.ts"
 // and two questions never look the same. A question whose instructions contain
 // "/error" answers with a per-question error instead, which is how the panel's
 // error row is exercised; "/full" refuses the whole request the way an engine
-// at capacity does.
+// at capacity does; "/absent" answers a `locate` "not found" on the routes
+// that carry `found`.
 
 type Digit = { digit: number; probability: number };
 
@@ -110,6 +113,235 @@ function stateImage(state: JsonNode | undefined): { width: number; height: numbe
   return null;
 }
 
+/** An OpenAI content-parts list, which is the one `state` a `locate` refuses. */
+const isParts = (state: JsonNode): boolean =>
+  state.kind === "array" && state.items.length > 0 && state.items.every((part) => entry(part, "type") !== undefined);
+
+const refuse = (code: string, message: string) => ({ status: 422, body: { error: { type: "invalid_request_error", code, message } } });
+
+/** The heads a served `locate` votes with: every share is a whole number of their votes. */
+const VOTERS = 32;
+/** `RANKING_LEN`: the most segments a `locate`'s ranking lists. */
+const RANKING_LEN = 5;
+/** The candidates the heads keep for a shortlist's last choice (spec 22). */
+const SHORTLIST = 16;
+/** `AUTO_SEGMENTS`: how many non-blank segments `auto` reads. */
+const AUTO_SEGMENTS = 2000;
+
+/** Whether `value` is one of `values`, narrowing it to their type. */
+const isOneOf = <T extends string>(values: readonly T[], value: string): value is T => (values as readonly string[]).includes(value);
+
+/** What a `locate` asked for, validated as `prepare_locate` does: `null` is `auto`, and the compression its kind's own. */
+type Ask = { kind: ResolvedKind | null; method: LocateMethod; compression: Compression | null };
+
+type Refusal = { ok: false; code: string; message: string };
+
+/**
+ * A `locate`'s `method`, `kind` and `compression` (GitHub #278), refused in
+ * the server's order and words: an unknown value naming the accepted ones,
+ * then the two combinations that never apply — a fold under a vote, a fold of
+ * prose named as such.
+ */
+function locateAsk(id: string, question: JsonNode): { ok: true; ask: Ask } | Refusal {
+  const q = JSON.stringify(id);
+  const named = (key: string): string | null => {
+    const node = entry(question, key);
+    return node === undefined ? null : text(node);
+  };
+  const method = named("method") ?? "shortlist";
+  if (!isOneOf(LOCATE_METHODS, method)) {
+    return {
+      ok: false,
+      code: "method_unknown",
+      message: `question ${q} asks for method ${JSON.stringify(method)}; a locate's accepted values are "shortlist" and "vote"`,
+    };
+  }
+  const kind = named("kind") ?? "auto";
+  if (!isOneOf(LOCATE_KINDS, kind)) {
+    return {
+      ok: false,
+      code: "kind_unknown",
+      message: `question ${q} asks for kind ${JSON.stringify(kind)}; the accepted values are "auto", "log", "prose" and "records"`,
+    };
+  }
+  const compression = named("compression");
+  if (compression !== null && !isOneOf(COMPRESSIONS, compression)) {
+    return {
+      ok: false,
+      code: "compression_unknown",
+      message: `question ${q} asks for compression ${JSON.stringify(compression)}; the accepted values are "template_fold" and "none"`,
+    };
+  }
+  if (compression === "template_fold" && method === "vote") {
+    return {
+      ok: false,
+      code: "compression_unsupported",
+      message: `question ${q}: the vote reads the text as it is — over a fold it read 28 of 58 real-log questions — so "template_fold" is refused with "vote"; ask for "shortlist", or for "none"`,
+    };
+  }
+  if (compression === "template_fold" && kind === "prose") {
+    return {
+      ok: false,
+      code: "compression_unsupported",
+      message: `question ${q}: prose does not fold into templates, so "template_fold" is refused with "prose"; ask for "none", or omit \`compression\``,
+    };
+  }
+  return { ok: true, ask: { kind: kind === "auto" ? null : kind, method, compression } };
+}
+
+/**
+ * The kind a target resolves to and the compression it gets, as
+ * `resolve_locate` says them: `auto` told, a named kind the target
+ * contradicts refused, and a fold of what `auto` told is prose refused.
+ */
+function resolveLocate(id: string, ask: Ask, target: Target): { ok: true; kind: ResolvedKind; compression: Compression } | Refusal {
+  const q = JSON.stringify(id);
+  if (ask.kind === "records" && !target.records) {
+    return {
+      ok: false,
+      code: "kind_mismatch",
+      message: `question ${q} names kind "records", and its target is not an array of two or more JSON objects; ask for "log" or "prose", or omit \`kind\``,
+    };
+  }
+  if ((ask.kind === "log" || ask.kind === "prose") && target.records) {
+    return {
+      ok: false,
+      code: "kind_mismatch",
+      message: `question ${q} names kind "${ask.kind}", and its target is an array of JSON objects, which is read as records; to fold it, ask for kind "records" with compression "template_fold"`,
+    };
+  }
+  const kind = ask.kind ?? autoKind(target);
+  const compression = ask.compression ?? (kind === "log" ? "template_fold" : "none");
+  if (kind === "prose" && compression === "template_fold") {
+    return {
+      ok: false,
+      code: "compression_unsupported",
+      message: `question ${q}: its target reads as prose, which does not fold into templates, so "template_fold" is refused; ask for "none", or omit \`compression\``,
+    };
+  }
+  return { ok: true, kind, compression };
+}
+
+/**
+ * `auto`, approximated. A records array is told exactly, by its shape. The
+ * rest the server tells by folding the first 2,000 non-blank segments into
+ * templates and saying `log` when at least half of them fall in templates of
+ * two or more; the mock has no fold, so it calls two segments one template
+ * when their first two words match with every digit masked — near enough that
+ * a timestamped log reads as a log and prose as prose, and no more than that.
+ */
+function autoKind(target: Target): ResolvedKind {
+  if (target.records) return "records";
+  const shapes = target.segments
+    .filter((_, index) => target.owns[index])
+    .slice(0, AUTO_SEGMENTS)
+    .map((segment) => segment.trim().split(/\s+/).slice(0, 2).join(" ").replace(/\d+/g, "0"));
+  const counts = new Map<string, number>();
+  for (const shape of shapes) counts.set(shape, (counts.get(shape) ?? 0) + 1);
+  const templated = shapes.filter((shape) => (counts.get(shape) ?? 0) >= 2).length;
+  return templated >= shapes.length / 2 ? "log" : "prose";
+}
+
+/**
+ * Every segment as the caller sent it: a line as a string, an element as
+ * itself. An element is read off the state and not off the cut, which keeps
+ * a string element's raw text — `JSON.parse` of that is not the element.
+ */
+function segmentValues(state: JsonNode, within: string, target: Target): unknown[] {
+  if (target.unit === "line") return target.segments;
+  const resolved = resolve(state, within);
+  const items = resolved.ok && resolved.node.kind === "array" ? resolved.node.items : [];
+  return items.map((item) => JSON.parse(writeOrdered(item, 0)) as unknown);
+}
+
+/**
+ * A `vote` over `target`: the calibrated vote, faked. Every head votes for
+ * one segment that owns a token — a blank line is never named — most of them
+ * for one winner, the rest spread over a few runners-up, so the ranking and
+ * the context both have something to show. It names the kind the target
+ * resolved to, reads as it is whatever the kind, and points at its winner
+ * alone (GitHub #278).
+ */
+function voteAnswer(seed: string, target: Target, values: unknown[], kind: ResolvedKind) {
+  const owning = target.owns.flatMap((own, index) => (own ? [index] : []));
+  const votes = new Map<number, number>();
+  const winner = owning[Math.floor(hashed(seed, 607) * owning.length)];
+  votes.set(winner, 12 + Math.floor(hashed(seed, 613) * 16));
+  for (let head = [...votes.values()][0]; head < VOTERS; head++) {
+    const pick = owning[Math.floor(hashed(seed, 700 + head) * owning.length)];
+    votes.set(pick, (votes.get(pick) ?? 0) + 1);
+  }
+  // Most votes first. The server breaks a tie toward the best-ranked head,
+  // which the mock has none of, so it breaks one toward the earlier segment.
+  const ranking = [...votes.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+    .slice(0, RANKING_LEN)
+    .map(([segment, count]) => ({ segment, share: count / VOTERS }));
+  const top = ranking[0].segment;
+  return {
+    type: "locate",
+    kind,
+    method: "vote",
+    compression: "none",
+    segment: top,
+    value: values[top],
+    confidence: ranking[0].share,
+    ranking,
+    pointers: [{ segment: top, value: values[top], share: ranking[0].share }],
+  };
+}
+
+/**
+ * A `shortlist` over `target` (GitHub #278), faked. The heads' candidates are
+ * up to sixteen segments that own a token — never a blank one, and in prose
+ * never a `# ` title — drawn by the seed and kept in document order; the
+ * labelled choice's probabilities over them have one clear pick and a thin
+ * tail, so a question points at one segment or at several. Under a fold every
+ * share is scaled by a first level's pick, as the server's are.
+ *
+ * `found` is on the three measured routes only — `log` + `template_fold`,
+ * `prose` + `none`, `records` + `none`. A fifth of those questions come back
+ * not found by the seed alone, and every one whose instructions say
+ * "/absent" does: no segment, no pointer, and the ranking kept.
+ */
+function shortlistAnswer(seed: string, target: Target, values: unknown[], kind: ResolvedKind, compression: Compression, absent: boolean) {
+  const owning = target.owns.flatMap((own, index) => (own ? [index] : []));
+  const readable = kind === "prose" ? owning.filter((index) => !target.segments[index].startsWith("# ")) : owning;
+  const candidates = [...(readable.length > 0 ? readable : owning)]
+    .sort((a, b) => hashed(seed, 1000 + a) - hashed(seed, 1000 + b))
+    .slice(0, SHORTLIST)
+    .sort((a, b) => a - b);
+  const weights = distribute(seed, candidates.length);
+  const scale = compression === "template_fold" ? 0.7 + hashed(seed, 809) * 0.3 : 1;
+  const share = (at: number) => Number((weights[at] * scale).toFixed(4));
+  // By probability, the earlier candidate first on a tie, as the server orders them.
+  const order = candidates.map((_, at) => at).sort((a, b) => weights[b] - weights[a] || a - b);
+  const measured = (kind === "log" && compression === "template_fold") || (kind !== "log" && compression === "none");
+  const found = !measured
+    ? undefined
+    : absent || hashed(seed, 881) < 0.2
+      ? Number((0.05 + hashed(seed, 883) * 0.4).toFixed(4))
+      : Number((0.55 + hashed(seed, 887) * 0.44).toFixed(4));
+  const named = found === undefined || found >= FOUND_THRESHOLD;
+  const pick = candidates[order[0]];
+  return {
+    type: "locate",
+    kind,
+    method: "shortlist",
+    compression,
+    ...(found === undefined ? {} : { found }),
+    segment: named ? pick : null,
+    value: named ? values[pick] : null,
+    confidence: named ? share(order[0]) : null,
+    ranking: order.slice(0, RANKING_LEN).map((at) => ({ segment: candidates[at], share: share(at) })),
+    pointers: named
+      ? order
+          .filter((at, rank) => rank === 0 || share(at) >= POINTER_SHARE)
+          .map((at) => ({ segment: candidates[at], value: values[candidates[at]], share: share(at) }))
+      : [],
+  };
+}
+
 /** The mock's answer to one request body, or the refusal it stands in for. */
 export function mockDecide(raw: string): { status: number; body: unknown } {
   const parsed = parseOrdered(raw || "null");
@@ -137,6 +369,14 @@ export function mockDecide(raw: string): { status: number; body: unknown } {
     const kind = text(entry(question, "type"));
     const instructions = text(entry(question, "instructions"));
     const seed = `${id}|${kind}|${instructions}`;
+    // GitHub #278: a locate's `kind` and `compression` on anything else are
+    // refused, never ignored.
+    if (kind !== "locate" && entry(question, "kind") !== undefined) {
+      return refuse("kind_unsupported", `question ${JSON.stringify(id)} is a ${kind}: \`kind\` names the reading a \`locate\`'s text gets`);
+    }
+    if (kind !== "locate" && entry(question, "compression") !== undefined) {
+      return refuse("compression_unsupported", `question ${JSON.stringify(id)} is a ${kind}: \`compression\` names what a \`locate\`'s text is read as`);
+    }
     if (instructions.includes("/error")) {
       answers[id] = { type: "error", code: "engine_full", message: "the engine refused this question's admission" };
       continue;
@@ -243,6 +483,30 @@ export function mockDecide(raw: string): { status: number; body: unknown } {
         generated += digits;
       }
       answers[id] = { type: kind, pixels, normalized, uncertainty, digits: trace };
+      continue;
+    }
+    if (kind === "locate") {
+      // Everything a caller can get wrong about a locate refuses the whole
+      // request before the first prefill, as it does on the server: its
+      // route's own fields first, then the state, then the kind the target
+      // resolves to.
+      const asked = locateAsk(id, question);
+      if (!asked.ok) return refuse(asked.code, asked.message);
+      if (!state || isParts(state)) {
+        return refuse("locate_needs_json_state", "a `locate` reads the lines of a string or the elements of an array, and this `state` is content parts");
+      }
+      const withinNode = entry(question, "within");
+      const within = withinNode?.kind === "string" ? withinNode.value : "";
+      const cut = cutTarget(state, within);
+      if (!cut.ok) return refuse(cut.code, cut.message);
+      const route = resolveLocate(id, asked.ask, cut.target);
+      if (!route.ok) return refuse(route.code, route.message);
+      const values = segmentValues(state, within, cut.target);
+      answers[id] =
+        asked.ask.method === "vote"
+          ? voteAnswer(seed, cut.target, values, route.kind)
+          : shortlistAnswer(seed, cut.target, values, route.kind, route.compression, instructions.includes("/absent"));
+      // A locate generates nothing; its baselines and choices are prefill, not output.
       continue;
     }
     answers[id] = { type: "error", code: "unknown_type", message: `the mock does not answer a ${kind}` };

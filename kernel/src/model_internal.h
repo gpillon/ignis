@@ -451,6 +451,10 @@ struct ignis_model {
   // (GitHub #212) -- the load's item bound, never above the envelope.
   uint32_t vision_max_tokens = 0;
   uint32_t vision_item_max_tokens = 0;
+  // GitHub #275 (ADR 0041): the most keys of a text span an attention
+  // readout reads -- the load's `attention_text_max_keys`, capped by the
+  // context -- and so the room `scratch` holds for its scores and rows.
+  uint32_t attention_text_max_keys = 0;
   VisionWeights vision{};
   // GitHub #243: the embedding pool, carved into fixed-width column pages.
   // Where the reference (and GitHub #178 after it) keeps one output

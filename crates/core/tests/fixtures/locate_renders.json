@@ -1,0 +1,370 @@
+{
+ "source": "tools/locate-sets/golden22.py",
+ "labels": [
+  "A",
+  "B",
+  "C",
+  "D",
+  "E",
+  "F",
+  "G",
+  "H",
+  "I",
+  "J",
+  "K",
+  "L",
+  "M",
+  "N",
+  "O",
+  "P",
+  "Q",
+  "R",
+  "S",
+  "T",
+  "U",
+  "V",
+  "W",
+  "X",
+  "Y",
+  "Z",
+  "a",
+  "b",
+  "c",
+  "d",
+  "e",
+  "f",
+  "g",
+  "h",
+  "i",
+  "j",
+  "k",
+  "l",
+  "m",
+  "n",
+  "o",
+  "p",
+  "q",
+  "r",
+  "s",
+  "t",
+  "u",
+  "v",
+  "w",
+  "x",
+  "y",
+  "z"
+ ],
+ "renders": [
+  {
+   "name": "one candidate",
+   "kind": "prose",
+   "lines": [
+    "# Alpha",
+    "Alpha one.",
+    "Alpha two.",
+    "Alpha three.",
+    "",
+    "# Beta",
+    "Beta one.",
+    "Beta two.",
+    "",
+    "# Gamma",
+    "Gamma one.",
+    "",
+    "Loose line without a title."
+   ],
+   "candidates": [
+    2
+   ],
+   "text": "   # Alpha\n   Alpha one.\nA: Alpha two.\n   Alpha three.",
+   "labels": {
+    "A": 2
+   }
+  },
+  {
+   "name": "two in one paragraph",
+   "kind": "prose",
+   "lines": [
+    "# Alpha",
+    "Alpha one.",
+    "Alpha two.",
+    "Alpha three.",
+    "",
+    "# Beta",
+    "Beta one.",
+    "Beta two.",
+    "",
+    "# Gamma",
+    "Gamma one.",
+    "",
+    "Loose line without a title."
+   ],
+   "candidates": [
+    1,
+    3
+   ],
+   "text": "   # Alpha\nA: Alpha one.\n   Alpha two.\nB: Alpha three.",
+   "labels": {
+    "A": 1,
+    "B": 3
+   }
+  },
+  {
+   "name": "across paragraphs",
+   "kind": "prose",
+   "lines": [
+    "# Alpha",
+    "Alpha one.",
+    "Alpha two.",
+    "Alpha three.",
+    "",
+    "# Beta",
+    "Beta one.",
+    "Beta two.",
+    "",
+    "# Gamma",
+    "Gamma one.",
+    "",
+    "Loose line without a title."
+   ],
+   "candidates": [
+    7,
+    10,
+    2
+   ],
+   "text": "   # Alpha\n   Alpha one.\nA: Alpha two.\n   Alpha three.\n\n   # Beta\n   Beta one.\nB: Beta two.\n\n   # Gamma\nC: Gamma one.",
+   "labels": {
+    "A": 2,
+    "B": 7,
+    "C": 10
+   }
+  },
+  {
+   "name": "a title-less paragraph",
+   "kind": "prose",
+   "lines": [
+    "# Alpha",
+    "Alpha one.",
+    "Alpha two.",
+    "Alpha three.",
+    "",
+    "# Beta",
+    "Beta one.",
+    "Beta two.",
+    "",
+    "# Gamma",
+    "Gamma one.",
+    "",
+    "Loose line without a title."
+   ],
+   "candidates": [
+    12,
+    6
+   ],
+   "text": "   # Beta\nA: Beta one.\n   Beta two.\n\nB: Loose line without a title.",
+   "labels": {
+    "A": 6,
+    "B": 12
+   }
+  },
+  {
+   "name": "labelled lines",
+   "kind": "labelled",
+   "lines": [
+    "first line",
+    "second: with a colon",
+    "  indented",
+    "ünïcödé"
+   ],
+   "text": "A: first line\nB: second: with a colon\nC:   indented\nD: ünïcödé"
+  },
+  {
+   "name": "a fold's level 1",
+   "kind": "level1",
+   "lines": [
+    "2026-09-28T10:00:00Z pod-0 ready in 0ms",
+    "2026-09-28T10:00:01Z pod-1 failed with exit code 1 after restart",
+    "2026-09-28T10:00:02Z evicted pod-2 from node for memory pressure",
+    "2026-09-28T10:00:03Z scaled app web to 3 replicas now please",
+    "2026-09-28T10:00:04Z [cron] job backup-0 finished",
+    "2026-09-28T10:00:05Z certificate for host1.example.org renews on day 5",
+    "2026-09-28T10:00:06Z pod-2 ready in 6ms",
+    "2026-09-28T10:00:07Z pod-3 failed with exit code 7 after restart",
+    "2026-09-28T10:00:08Z evicted pod-0 from node for memory pressure",
+    "2026-09-28T10:00:09Z scaled app web to 9 replicas now please",
+    "2026-09-28T10:00:10Z [cron] job backup-2 finished",
+    "2026-09-28T10:00:11Z certificate for host3.example.org renews on day 11",
+    "2026-09-28T10:00:12Z pod-0 ready in 12ms",
+    "2026-09-28T10:00:13Z pod-1 failed with exit code 13 after restart",
+    "2026-09-28T10:00:14Z evicted pod-2 from node for memory pressure",
+    "2026-09-28T10:00:15Z scaled app web to 15 replicas now please",
+    "2026-09-28T10:00:16Z [cron] job backup-0 finished",
+    "2026-09-28T10:00:17Z certificate for host1.example.org renews on day 17",
+    "2026-09-28T10:00:18Z pod-2 ready in 18ms",
+    "2026-09-28T10:00:19Z pod-3 failed with exit code 19 after restart",
+    "2026-09-28T10:00:20Z evicted pod-0 from node for memory pressure",
+    "2026-09-28T10:00:21Z scaled app web to 21 replicas now please",
+    "2026-09-28T10:00:22Z [cron] job backup-2 finished",
+    "2026-09-28T10:00:23Z certificate for host3.example.org renews on day 23",
+    "2026-09-28T10:01:00Z pod-9 ready in 9ms",
+    "2026-09-28T10:01:01Z pod-9 ready in 9ms"
+   ],
+   "kept": [
+    0,
+    2,
+    3
+   ],
+   "text": "A: {pod-0|pod-2|pod-9} ready in {0ms|6ms|12ms|18ms|9ms} (x6)\nB: evicted {pod-2|pod-0} from node for memory pressure (x4)\nC: scaled app web to {3|9|15|21} replicas now please (x4)"
+  },
+  {
+   "name": "a fold's last choice",
+   "kind": "raw_final",
+   "lines": [
+    "2026-09-28T10:00:00Z pod-0 ready in 0ms",
+    "2026-09-28T10:00:01Z pod-1 failed with exit code 1 after restart",
+    "2026-09-28T10:00:02Z evicted pod-2 from node for memory pressure",
+    "2026-09-28T10:00:03Z scaled app web to 3 replicas now please",
+    "2026-09-28T10:00:04Z [cron] job backup-0 finished",
+    "2026-09-28T10:00:05Z certificate for host1.example.org renews on day 5",
+    "2026-09-28T10:00:06Z pod-2 ready in 6ms",
+    "2026-09-28T10:00:07Z pod-3 failed with exit code 7 after restart",
+    "2026-09-28T10:00:08Z evicted pod-0 from node for memory pressure",
+    "2026-09-28T10:00:09Z scaled app web to 9 replicas now please",
+    "2026-09-28T10:00:10Z [cron] job backup-2 finished",
+    "2026-09-28T10:00:11Z certificate for host3.example.org renews on day 11",
+    "2026-09-28T10:00:12Z pod-0 ready in 12ms",
+    "2026-09-28T10:00:13Z pod-1 failed with exit code 13 after restart",
+    "2026-09-28T10:00:14Z evicted pod-2 from node for memory pressure",
+    "2026-09-28T10:00:15Z scaled app web to 15 replicas now please",
+    "2026-09-28T10:00:16Z [cron] job backup-0 finished",
+    "2026-09-28T10:00:17Z certificate for host1.example.org renews on day 17",
+    "2026-09-28T10:00:18Z pod-2 ready in 18ms",
+    "2026-09-28T10:00:19Z pod-3 failed with exit code 19 after restart",
+    "2026-09-28T10:00:20Z evicted pod-0 from node for memory pressure",
+    "2026-09-28T10:00:21Z scaled app web to 21 replicas now please",
+    "2026-09-28T10:00:22Z [cron] job backup-2 finished",
+    "2026-09-28T10:00:23Z certificate for host3.example.org renews on day 23",
+    "2026-09-28T10:01:00Z pod-9 ready in 9ms",
+    "2026-09-28T10:01:01Z pod-9 ready in 9ms"
+   ],
+   "cluster": 0,
+   "rows": [
+    4,
+    0,
+    1
+   ],
+   "raw": [
+    0,
+    6,
+    24
+   ],
+   "text": "A: 2026-09-28T10:00:00Z pod-0 ready in 0ms\nB: 2026-09-28T10:00:06Z pod-2 ready in 6ms\nC: 2026-09-28T10:01:00Z pod-9 ready in 9ms"
+  }
+ ],
+ "spaced_json": [
+  {
+   "json": "{\"id\": 1, \"name\": \"Ada\", \"city\": \"Paris\"}",
+   "spaced": "{\"id\": 1, \"name\": \"Ada\", \"city\": \"Paris\"}"
+  },
+  {
+   "json": "{\"z\": 1, \"a\": 2, \"m\": {\"y\": [1, 2, {\"k\": \"v\"}], \"b\": null}}",
+   "spaced": "{\"z\": 1, \"a\": 2, \"m\": {\"y\": [1, 2, {\"k\": \"v\"}], \"b\": null}}"
+  },
+  {
+   "json": "{\"text\": \"line\\nbreak\\ttab \\\"quote\\\" back\\\\slash \\u0001 \\u007f \\u2028 ünï 名\"}",
+   "spaced": "{\"text\": \"line\\nbreak\\ttab \\\"quote\\\" back\\\\slash \\u0001    ünï 名\"}"
+  },
+  {
+   "json": "{\"ok\": true, \"no\": false, \"none\": null, \"neg\": -3, \"dec\": 1.5, \"zero\": 0, \"e\": [], \"o\": {}}",
+   "spaced": "{\"ok\": true, \"no\": false, \"none\": null, \"neg\": -3, \"dec\": 1.5, \"zero\": 0, \"e\": [], \"o\": {}}"
+  },
+  {
+   "json": "[\"a\", 1, [2, 3], {\"x\": \"y\"}]",
+   "spaced": "[\"a\", 1, [2, 3], {\"x\": \"y\"}]"
+  },
+  {
+   "json": "\"a plain string\"",
+   "spaced": "\"a plain string\""
+  },
+  {
+   "json": "12",
+   "spaced": "12"
+  },
+  {
+   "json": "{\"price\": 149.0, \"qty\": 2, \"ratio\": -0.25}",
+   "spaced": "{\"price\": 149.0, \"qty\": 2, \"ratio\": -0.25}"
+  }
+ ],
+ "records": {
+  "records": [
+   "{\"id\": 7, \"name\": \"Ada Silva\", \"city\": \"Porto\"}",
+   "{\"id\": 8, \"name\": \"Bo\", \"tags\": [\"x\", \"y\"], \"ok\": true}",
+   "{\"id\": 9, \"note\": \"quote \\\" and ünï\"}",
+   "{\"id\": 10, \"nested\": {\"a\": null}}"
+  ],
+  "candidates": [
+   3,
+   0,
+   2
+  ],
+  "text": "A: {\"id\": 7, \"name\": \"Ada Silva\", \"city\": \"Porto\"}\nB: {\"id\": 9, \"note\": \"quote \\\" and ünï\"}\nC: {\"id\": 10, \"nested\": {\"a\": null}}"
+ },
+ "found": [
+  {
+   "route": "log",
+   "p_none": 0.1,
+   "p_yes": 0.9,
+   "found": 0.9,
+   "found_is": true
+  },
+  {
+   "route": "log",
+   "p_none": 0.6,
+   "p_yes": 0.35,
+   "found": 0.375,
+   "found_is": false
+  },
+  {
+   "route": "log",
+   "p_none": 0.5,
+   "p_yes": 0.5,
+   "found": 0.5,
+   "found_is": true
+  },
+  {
+   "route": "log",
+   "p_none": 0.2,
+   "p_yes": 0.1,
+   "found": 0.45,
+   "found_is": false
+  },
+  {
+   "route": "prose",
+   "p_none": 0.49,
+   "p_yes": null,
+   "found": 0.51,
+   "found_is": true
+  },
+  {
+   "route": "prose",
+   "p_none": 0.51,
+   "p_yes": null,
+   "found": 0.49,
+   "found_is": false
+  },
+  {
+   "route": "records",
+   "p_none": 0.0,
+   "p_yes": null,
+   "found": 1.0,
+   "found_is": true
+  },
+  {
+   "route": "records",
+   "p_none": 1.0,
+   "p_yes": null,
+   "found": 0.0,
+   "found_is": false
+  }
+ ]
+}

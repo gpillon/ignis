@@ -74,6 +74,35 @@ fn the_served_artifact_has_a_calibrated_pointing_head() {
     assert_eq!(set.heads.len(), 96, "the served set is the 96 heads spec 14 records");
 }
 
+/// GitHub #275 (spec 18 acceptance 5): the `locate` vote is keyed the same
+/// way, and a served artifact without one would have `/v1/decide` refuse
+/// every `locate` — or, keyed loosely, vote with heads chosen for another
+/// model.
+#[test]
+#[ignore = "needs the served artifact on disk; run via scripts/gpu-profile.ps1 (ADR 0006)"]
+fn the_served_artifact_has_a_calibrated_locate_vote() {
+    if !Path::new(ARTIFACT).exists() {
+        gpu_profile::skip_or_fail(&format!("artifact not found at {ARTIFACT}"));
+        return;
+    }
+    let reader = Reader::open(Path::new(ARTIFACT)).expect("the served artifact opens");
+    let hash = ArtifactHash::from_bytes(reader.content_hash());
+    let known: Vec<String> = ignis_core::locate::calibrated_artifacts().map(|h| hex(h.as_bytes())).collect();
+    let vote = ignis_core::locate::calibration(hash).unwrap_or_else(|| {
+        panic!(
+            "the served artifact {ARTIFACT} (content hash {}) has no calibrated `locate` vote, so \
+             `/v1/decide` refuses every `locate`. The table knows {known:?}. Recalibrate before \
+             shipping this artifact: tools/locate-sets/README.md, \"Recalibrating for a new \
+             artifact\" (fresh development sets, crates/server/tests/attention_head_locate_gpu.rs \
+             over them, spec 19 phase 0's procedure in score.py, the heads and LOCATE_MAX_KEYS into \
+             crates/core/src/locate.rs, and spec 18's acceptance re-run on a fresh set).",
+            hex(hash.as_bytes())
+        )
+    });
+    assert_eq!(vote.heads.len(), 32, "the served vote is the 32 heads spec 19 registered");
+    assert_eq!(vote.max_keys, 4_554, "and set D's length ceiling");
+}
+
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

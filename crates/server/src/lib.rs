@@ -28,6 +28,7 @@ pub mod download;
 pub mod engine;
 pub mod expose;
 pub mod instruction;
+pub mod locate;
 pub mod loader;
 pub mod media;
 pub mod metrics;
@@ -104,6 +105,10 @@ pub struct Server {
     /// head set beside it where one was chosen — or `None` on a load nobody
     /// calibrated, and then `point` and `box` answer with the digit chain.
     pub calibration: Option<ignis_core::pointing::Calibration>,
+    /// The heads `/v1/decide` votes with to answer a `locate` (GitHub #275),
+    /// looked up once by the loaded artifact's content hash as `calibration`
+    /// is — or `None` on a load nobody calibrated, which refuses a `locate`.
+    pub locate: Option<ignis_core::locate::LocateCalibration>,
     /// The match keys of recent `/v1/decide` parts states at their run ends
     /// (GitHub #270): what an **observed fork** is found in. Shared by every
     /// clone of the server, as the engine is.
@@ -119,6 +124,7 @@ impl Server {
         let template: std::sync::Arc<dyn TemplateProvider> = std::sync::Arc::from(template);
         Self {
             calibration: ignis_core::pointing::calibration(engine.artifact()),
+            locate: ignis_core::locate::calibration(engine.artifact()),
             engine,
             alphabet: std::sync::Arc::new(template.answer_alphabet()),
             template,

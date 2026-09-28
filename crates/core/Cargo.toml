@@ -12,6 +12,10 @@ ignis-artifact = { path = "../artifact" }
 # here decides how spans are rendered or where they go — that stays
 # `ignis-logging`'s job (this crate has no dependency on it).
 tracing = { workspace = true }
+# `locate`'s template fold (GitHub #278): the reference's patterns
+# (`tools/locate-sets/compress.py`), with Python's leftmost-first semantics.
+# Already in the lock through `tracing-subscriber`.
+regex = "1"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

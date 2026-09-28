@@ -9,7 +9,7 @@ use ignis_core::{
 use ignis_core::checkpoint::ReuseSource;
 use ignis_core::scheduler::CheckpointClaim;
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
-use ignis_core::pointing::{AttentionQuery, PointingHead, SetQuery};
+use ignis_core::pointing::{AttentionQuery, PointingHead, SetQuery, SetRead};
 use ignis_runtime::{
     AttentionRead, DecodeLane, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats,
     StepLeaf,
@@ -259,44 +259,6 @@ impl StepLeaf for StubLeaf {
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
-        {
-            let mut calls = self.calls.lock().unwrap();
-            calls.attention_asked.push(attention.as_ref().map(|read| read.query.clone()));
-            // A deterministic map the test can predict: each key scores its
-            // own absolute position, and head `i` of a set peaks on key `2i`.
-            if let Some(read) = attention
-                && !calls.attention_unreadable
-            {
-                for (k, score) in read.scores.iter_mut().enumerate() {
-                    *score = (read.query.key_begin + k as u32) as f32;
-                }
-                for (i, key) in read.set_argmax.iter_mut().enumerate() {
-                    *key = 2 * i as u32;
-                }
-                // Spec 15: each peak's score, and the four around it. The
-                // grid's columns say which exist -- NaN is "off the grid".
-                let cols = read.query.set.as_ref().map_or(1, |set| set.grid_cols.max(1));
-                let rows = read.query.key_count.div_ceil(cols);
-                let peaks: Vec<u32> = read.set_argmax.clone();
-                for (i, peak) in read.set_peak.iter_mut().enumerate() {
-                    *peak = peaks[i] as f32 + 100.0;
-                }
-                for (i, key) in peaks.iter().enumerate() {
-                    let (col, row) = (key % cols, key / cols);
-                    let around = [
-                        (col > 0).then(|| key - 1),
-                        (col + 1 < cols).then(|| key + 1),
-                        (row > 0).then(|| key - cols),
-                        (row + 1 < rows).then(|| key + cols),
-                    ];
-                    for (j, neighbour) in around.into_iter().enumerate() {
-                        read.set_neighbours[4 * i + j] =
-                            neighbour.map_or(f32::NAN, |key| key as f32);
-                    }
-                }
-                read.read = true;
-            }
-        }
         self.calls.lock().unwrap().multimodal_spans.push(SpanCall {
             start: start_position,
             positions: span.positions.to_vec(),
@@ -305,7 +267,7 @@ impl StepLeaf for StubLeaf {
                 .media
                 .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
         });
-        self.prefill(model, sequence, tokens, start_position, params, permitted, out_logits)
+        self.prefill(model, sequence, tokens, start_position, params, permitted, out_logits, attention)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -468,7 +430,55 @@ impl StepLeaf for StubLeaf {
         params: DecodeParams,
         permitted: &[u32],
         out_logits: Option<&mut [f32]>,
+        attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
+        {
+            let mut calls = self.calls.lock().unwrap();
+            calls.attention_asked.push(attention.as_ref().map(|read| read.query.clone()));
+            // A deterministic map the test can predict: each key scores its
+            // own absolute position, and head `i` of a set peaks on key `2i`.
+            if let Some(read) = attention
+                && !calls.attention_unreadable
+            {
+                for (k, score) in read.scores.iter_mut().enumerate() {
+                    *score = (read.query.key_begin + k as u32) as f32;
+                }
+                for (i, key) in read.set_argmax.iter_mut().enumerate() {
+                    *key = 2 * i as u32;
+                }
+                // Spec 15: each peak's score, and the four around it. The
+                // grid's columns say which exist -- NaN is "off the grid".
+                let cols = match read.query.set.as_ref().map(|set| &set.read) {
+                    Some(SetRead::Peaks { grid_cols, .. }) => (*grid_cols).max(1),
+                    _ => 1,
+                };
+                let rows = read.query.key_count.div_ceil(cols);
+                let peaks: Vec<u32> = read.set_argmax.clone();
+                for (i, peak) in read.set_peak.iter_mut().enumerate() {
+                    *peak = peaks[i] as f32 + 100.0;
+                }
+                for (i, key) in peaks.iter().enumerate().take(read.set_neighbours.len() / 4) {
+                    let (col, row) = (key % cols, key / cols);
+                    let around = [
+                        (col > 0).then(|| key - 1),
+                        (col + 1 < cols).then(|| key + 1),
+                        (row > 0).then(|| key - cols),
+                        (row + 1 < rows).then(|| key + cols),
+                    ];
+                    for (j, neighbour) in around.into_iter().enumerate() {
+                        read.set_neighbours[4 * i + j] =
+                            neighbour.map_or(f32::NAN, |key| key as f32);
+                    }
+                }
+                // GitHub #275: a set read in rows -- head `i`'s row scores
+                // key `k` as `1000 i + k`, absolute.
+                let count = read.query.key_count as usize;
+                for (at, score) in read.set_rows.iter_mut().enumerate() {
+                    *score = (1000 * (at / count) + read.query.key_begin as usize + at % count) as f32;
+                }
+                read.read = true;
+            }
+        }
         let call = {
             let mut calls = self.calls.lock().unwrap();
             calls.prefill_positions.push(start_position);
@@ -2329,8 +2339,10 @@ fn a_head_sets_argmax_comes_back_one_key_per_head() {
     let prompt = multimodal(40, vec![image(10, 20)]);
     let set = SetQuery {
         heads: Arc::from(vec![HEAD, PointingHead { gqa_ordinal: 15, query_head: 18 }, HEAD]),
-        excluded: Arc::from(vec![0, 19]),
-        grid_cols: 5,
+        read: SetRead::Peaks {
+            excluded: Arc::from(vec![0, 19]),
+            grid_cols: 5,
+        },
     };
     let job = PrefillJob {
         attention: Some(AttentionQuery {
@@ -2386,29 +2398,64 @@ fn an_attention_readout_the_leaf_could_not_read_crosses_nothing() {
     assert_eq!(compute.live_sequences(), 1, "the prefilled sequence is kept");
 }
 
-/// The span an attention readout reads is an image's, so a job without a
-/// multimodal span asking for one is incoherent — the server never renders
-/// one — and the batch fails with its own code rather than answering.
+/// GitHub #275 (ADR 0041): a text span carries the readout too — a
+/// `locate` over a text state reads it — so a job with no multimodal span
+/// asking for one is served on the text path, not refused.
 #[test]
-fn an_attention_readout_without_an_image_fails_loudly() {
+fn a_text_job_with_an_attention_readout_is_served() {
     let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let query = AttentionQuery {
+        head: HEAD,
+        key_begin: 0,
+        key_count: 2,
+        set: None,
+    };
+    let job = PrefillJob {
+        attention: Some(query.clone()),
+        ..prefill(1, None)
+    };
+    let outcomes = compute.prefill_step(&[job]).expect("served");
+    let attention = outcomes[0].attention.as_ref().expect("the scores come back");
+    assert_eq!(&*attention.scores, &[0.0, 1.0]);
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.attention_asked, [Some(query)], "the text path hands the leaf the readout");
+    assert!(calls.multimodal_spans.is_empty(), "and it took the text path");
+}
+
+/// GitHub #275, spec 18 acceptance 7: a text span that asks for no readout
+/// is handed no buffer at all — the text path's every other chunk pays
+/// nothing for the readout it gained.
+#[test]
+fn a_text_span_that_asks_for_no_attention_readout_is_handed_nothing() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    compute.prefill_step(&[prefill(1, None)]).unwrap();
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.attention_asked, [None]);
+    assert!(calls.multimodal_spans.is_empty(), "the text path");
+}
+
+/// GitHub #275: a set read in rows hands the leaf a row per head and brings
+/// every one back whole, in the set's order — and no neighbours, since a
+/// text span is no grid.
+#[test]
+fn a_head_set_read_in_rows_comes_back_whole() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let other = PointingHead { gqa_ordinal: 15, query_head: 18 };
     let job = PrefillJob {
         attention: Some(AttentionQuery {
             head: HEAD,
-            key_begin: 0,
-            key_count: 2,
-            set: None,
+            key_begin: 1,
+            key_count: 3,
+            set: Some(SetQuery::rows(vec![HEAD, other])),
         }),
         ..prefill(1, None)
     };
-    let error = compute.prefill_step(&[job]).expect_err("refused");
-    assert!(
-        matches!(
-            error,
-            ComputeError::Kernel(code) if code == ignis_core::scheduler::ATTENTION_WITHOUT_IMAGE
-        ),
-        "{error}"
-    );
-    assert_eq!(compute.live_sequences(), 0);
-    assert!(leaf.calls.lock().unwrap().prefill_positions.is_empty(), "the leaf was never called");
+    let outcomes = compute.prefill_step(&[job]).expect("served");
+    let attention = outcomes[0].attention.as_ref().expect("read");
+    // The stub's row for head `i` scores key `k` as `1000 i + k`, absolute.
+    assert_eq!(attention.set_rows.as_deref(), Some(&[1.0, 2.0, 3.0, 1001.0, 1002.0, 1003.0][..]));
+    assert_eq!(attention.set_argmax.as_deref(), Some(&[0, 2][..]), "the argmax rides every set");
+    assert_eq!(attention.set_neighbours, None);
+    let asked = leaf.calls.lock().unwrap().attention_asked[0].clone().expect("asked");
+    assert_eq!(asked.set.map(|set| set.read), Some(SetRead::Rows));
 }

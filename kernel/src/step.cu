@@ -769,7 +769,9 @@ struct ArmedAttentionReadout {
   // around it -- the image grid's columns say which of those exist.
   uint32_t grid_cols = 0;
   float *host_set_peak = nullptr;       // [set_count]
-  float *host_set_neighbours = nullptr; // [4 * set_count]
+  float *host_set_neighbours = nullptr; // [4 * set_count], or null with rows
+  // GitHub #275 (ADR 0041): every head's whole row over a text span, or null.
+  float *host_set_rows = nullptr; // [set_count * key_count]
 };
 
 bool validate_span_multimodal(const ignis_model *model, int32_t route, const SpanMultimodal &span) {
@@ -981,6 +983,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     ninfer::Tensor readout_scores;
     ninfer::DeviceSpan readout_set_best{};
     ninfer::DeviceSpan readout_set_neighbours{};
+    ninfer::DeviceSpan readout_set_rows{};
     if (attention_readout != nullptr) {
       readout_scores = model->scratch->alloc(
           ninfer::DType::FP32, {static_cast<std::int32_t>(attention_readout->key_count), 1, 1, 1});
@@ -996,16 +999,27 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         // GitHub #264: four scores a head, written by each armed layer's
         // gather. All-ones bytes are a quiet NaN, which is what "off the
         // grid" reads as, so a slot no gather reached never looks like a
-        // score.
-        readout_set_neighbours = model->scratch->alloc_bytes(
-            static_cast<std::size_t>(attention_readout->set_count) * 4 * sizeof(float));
-        err = cudaMemsetAsync(readout_set_neighbours.data, 0xff, readout_set_neighbours.bytes,
-                              model->stream);
-        if (err != cudaSuccess) {
-          set_error(std::string("ignis_program_prefill: cudaMemsetAsync(head set neighbours) "
-                                "failed: ") +
-                    cudaGetErrorString(err));
-          return -1;
+        // score. A set read in rows over a text span (#275) has no grid and
+        // may ask for none.
+        if (attention_readout->host_set_neighbours != nullptr) {
+          readout_set_neighbours = model->scratch->alloc_bytes(
+              static_cast<std::size_t>(attention_readout->set_count) * 4 * sizeof(float));
+          err = cudaMemsetAsync(readout_set_neighbours.data, 0xff, readout_set_neighbours.bytes,
+                                model->stream);
+          if (err != cudaSuccess) {
+            set_error(std::string("ignis_program_prefill: cudaMemsetAsync(head set neighbours) "
+                                  "failed: ") +
+                      cudaGetErrorString(err));
+            return -1;
+          }
+        }
+        // GitHub #275 (ADR 0041): every head's row, one float per key, from
+        // the room the load reserved beside the text score room. Every slot
+        // is written by the fused launch of the head's layer, so no fill.
+        if (attention_readout->host_set_rows != nullptr) {
+          readout_set_rows = model->scratch->alloc_bytes(
+              static_cast<std::size_t>(attention_readout->set_count) *
+              static_cast<std::size_t>(attention_readout->key_count) * sizeof(float));
         }
       }
       const auto arm = [&](std::int32_t ordinal) -> AttentionReadoutTarget & {
@@ -1018,6 +1032,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
           target.key_count = attention_readout->key_count;
           target.device_set_best = static_cast<unsigned long long *>(readout_set_best.data);
           target.device_set_neighbours = static_cast<float *>(readout_set_neighbours.data);
+          target.device_set_rows = static_cast<float *>(readout_set_rows.data);
           target.grid_cols = static_cast<std::int32_t>(attention_readout->grid_cols);
           target.excluded_count = static_cast<std::int32_t>(attention_readout->excluded_count);
           for (uint32_t e = 0; e < attention_readout->excluded_count; ++e) {
@@ -1181,11 +1196,16 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         err = cudaMemcpyAsync(host_set_best.data(), readout_set_best.data,
                               host_set_best.size() * sizeof(unsigned long long),
                               cudaMemcpyDeviceToHost, model->stream);
-        if (err == cudaSuccess) {
+        if (err == cudaSuccess && attention_readout->host_set_neighbours != nullptr) {
           // GitHub #264: the four scores around each argmax, beside it.
           err = cudaMemcpyAsync(attention_readout->host_set_neighbours,
                                 readout_set_neighbours.data, readout_set_neighbours.bytes,
                                 cudaMemcpyDeviceToHost, model->stream);
+        }
+        if (err == cudaSuccess && attention_readout->host_set_rows != nullptr) {
+          // GitHub #275: every head's row, behind the same synchronization.
+          err = cudaMemcpyAsync(attention_readout->host_set_rows, readout_set_rows.data,
+                                readout_set_rows.bytes, cudaMemcpyDeviceToHost, model->stream);
         }
       }
       if (err != cudaSuccess) {
@@ -1457,10 +1477,14 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   if (arms_readout) {
     // The room `plan_load_sizes` (kernel/src/model.cu) reserved for the
     // scores: one F32 per token of one vision item at the load's item bound,
-    // capped by the context -- the same two terms, or a readout could outgrow
-    // its arena. A readout scores one image's span, and no image is wider.
-    const std::uint64_t capacity =
-        std::min<std::uint64_t>(model->vision_item_max_tokens, model->max_context_tokens);
+    // or (GitHub #275) per key of the text span the load was told a readout
+    // reads, whichever is wider, capped by the context -- the same terms, or
+    // a readout could outgrow its arena.
+    const std::uint64_t text_keys =
+        std::min<std::uint64_t>(model->attention_text_max_keys, model->max_context_tokens);
+    const std::uint64_t capacity = std::max<std::uint64_t>(
+        std::min<std::uint64_t>(model->vision_item_max_tokens, model->max_context_tokens),
+        text_keys);
     // The GQA ordinals this model has, for the readout's layer and every
     // head of its set.
     std::array<bool, kReadoutGqaLayers> gqa_ordinal{};
@@ -1482,18 +1506,28 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                   options->attention_excluded_count <= static_cast<uint32_t>(kReadoutMaxExcluded) &&
                   (options->attention_excluded_count == 0 ||
                    (options->attention_set_count > 0 && options->attention_excluded != nullptr));
+    // GitHub #275: rows are a set's, at most the heads the load reserved
+    // rows for, over at most the text span it reserved them over.
+    const bool rows = options->out_attention_set_rows != nullptr;
+    set_ok = set_ok &&
+             (!rows || (options->attention_set_count > 0 &&
+                        options->attention_set_count <= static_cast<uint32_t>(kReadoutMaxRowHeads) &&
+                        static_cast<std::uint64_t>(options->attention_key_count) <= text_keys));
     if (set_ok && options->attention_set_count > 0) {
       set_ok = options->attention_set_gqa_ordinals != nullptr &&
                options->attention_set_query_heads != nullptr &&
                options->out_attention_set_argmax != nullptr &&
                // GitHub #264: the peak and its neighbours ride with the set,
                // and the image grid says which neighbours exist. A set
-               // without them would answer with no way to read inside a cell.
+               // without them would answer with no way to read inside a cell
+               // -- unless it reads rows (#275): a text span is no grid.
                options->out_attention_set_peak != nullptr &&
-               options->out_attention_set_neighbours != nullptr &&
-               options->attention_grid_cols > 0 &&
-               static_cast<std::int64_t>(options->attention_grid_cols) <=
-                   options->attention_key_count &&
+               ((options->out_attention_set_neighbours != nullptr &&
+                 options->attention_grid_cols > 0 &&
+                 static_cast<std::int64_t>(options->attention_grid_cols) <=
+                     options->attention_key_count) ||
+                (rows && options->out_attention_set_neighbours == nullptr &&
+                 options->attention_grid_cols == 0)) &&
                (options->attention_excluded_count == 0 || options->attention_excluded != nullptr);
       std::vector<bool> seen(static_cast<std::size_t>(kReadoutGqaLayers) * kIgnisGqaQHeads, false);
       for (uint32_t i = 0; set_ok && i < options->attention_set_count; ++i) {
@@ -1521,14 +1555,17 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                 std::to_string(options->attention_query_head) + ", over " +
                 std::to_string(options->attention_key_count) +
                 " keys with a head set of " + std::to_string(options->attention_set_count) +
+                (rows ? " read in rows" : "") +
                 " cannot be armed on this load (the chunked route, GQA layers and query heads "
                 "the model has, each head once and at most " +
                 std::to_string(kReadoutMaxSetHeads) + " of them, at most " +
                 std::to_string(kReadoutMaxExcluded) + " excluded keys inside the span, at most " +
                 std::to_string(capacity) +
-                " keys -- the one vision item the load reserved scores for -- and, with a set, "
-                "its peak and neighbour buffers and an image grid of 1.." +
-                std::to_string(options->attention_key_count) + " columns)");
+                " keys -- the vision item or text span the load reserved scores for -- and, with "
+                "a set, its peak and neighbour buffers and an image grid of 1.." +
+                std::to_string(options->attention_key_count) +
+                " columns, or its rows: at most " + std::to_string(kReadoutMaxRowHeads) +
+                " heads over at most " + std::to_string(text_keys) + " keys)");
       return -1;
     }
     attention_readout.gqa_ordinal = options->attention_gqa_ordinal;
@@ -1546,6 +1583,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     attention_readout.grid_cols = options->attention_grid_cols;
     attention_readout.host_set_peak = options->out_attention_set_peak;
     attention_readout.host_set_neighbours = options->out_attention_set_neighbours;
+    attention_readout.host_set_rows = options->out_attention_set_rows;
     *attention_readout.host_read = 0;
   }
 

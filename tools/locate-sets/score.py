@@ -458,6 +458,134 @@ def check(choice, rows, labelled):
 
 
 # ---------------------------------------------------------------------------
+# Golden cases for the served reading (GitHub #275)
+# ---------------------------------------------------------------------------
+
+def f16_hex(block):
+    """`block`'s scores as f16 little-endian bytes, hex: what the Rust port
+    reads back exactly (every f16 is exact in f32)."""
+    return np.ascontiguousarray(block, dtype="<f2").tobytes().hex()
+
+
+def vote_case(name, heads, keys, q, na):
+    """One golden case of the head vote: `q` and `na` are the vote's heads'
+    [K, span] scores (best first) at the copy scaffold and at its content-free
+    prefill, `keys` each segment's [a, b) or None. Out: the segment each head
+    votes for, the votes, the winner, its share of the votes, and the ranking
+    -- the voted segments by votes, ties to the best-ranked voter, at most
+    five -- all from `features` and `vote_reading`, the arithmetic every
+    number in the findings was measured with."""
+    q, na = np.asarray(q, dtype="<f2"), np.asarray(na, dtype="<f2")
+    K = q.shape[0]
+    row = {"keys": keys, "feat": {"s2": features(q, keys), "s2-na": features(na, keys)}}
+    s = vote_reading(row, list(range(K)), "s2", True)
+    diff = row["feat"]["s2"][0].astype(np.float64) - row["feat"]["s2-na"][0]
+    own = owning(row)
+    voted = [int(v) for v in np.where(own[None, :], diff, -np.inf).argmax(axis=1)]
+    votes = [int(v) for v in np.bincount(voted, minlength=len(keys))]
+    order = [int(j) for j in np.argsort(-np.where(np.isfinite(s), s, -1e30), kind="stable")]
+    ranking = [[j, votes[j] / K] for j in order if votes[j] > 0][:5]
+    w = winner(s)
+    return {"name": name, "heads": heads, "span": int(q.shape[1]),
+            "keys": [None if k is None else [int(k[0]), int(k[1])] for k in keys],
+            "q": f16_hex(q), "na": f16_hex(na), "voted": voted, "votes": votes, "winner": w,
+            "confidence": votes[w] / K, "reference_confidence": confidence(s, True), "ranking": ranking}
+
+
+def synthetic_cases(seed):
+    """Small cases on the rule's edges, planted on f16 noise: a clear
+    majority, a two-way tie the best-ranked voter breaks, a flat row, a
+    baseline sharper than the question (every difference negative), mass on
+    the separators alone, and segments that own no key."""
+    rng = np.random.default_rng(seed)
+    cases = []
+
+    def layout(widths, gaps=1, empty=()):
+        keys, at = [], 0
+        for j, width in enumerate(widths):
+            if j in empty:
+                keys.append(None)
+                continue
+            keys.append([at, at + width])
+            at += width + gaps
+        return keys, at - gaps
+
+    def noise(k, span):
+        return rng.normal(0, 1, size=(k, span))
+
+    def plant(block, head, key_range, lift):
+        a, b = key_range
+        block[head, a:b] += lift
+
+    heads5 = ["L39.h12", "L47.h20", "L59.h16", "L55.h17", "L59.h17"]
+    keys, span = layout([3, 4, 2, 5, 3, 4, 2, 3])
+    q, na = noise(5, span), noise(5, span)
+    for h in (0, 1, 2):
+        plant(q, h, keys[3], 9.0)
+    cases.append(vote_case("synthetic/majority", heads5, keys, q, na))
+
+    keys, span = layout([4, 4, 4, 4, 4, 4])
+    q, na = noise(5, span), noise(5, span)
+    for h, j in ((0, 4), (3, 4), (1, 1), (2, 1), (4, 2)):
+        plant(q, h, keys[j], 10.0)
+    cases.append(vote_case("synthetic/tie-to-the-best-ranked-voter", heads5, keys, q, na))
+
+    keys, span = layout([2, 6, 3, 1, 4])
+    q, na = noise(3, span), noise(3, span)
+    q[1, :] = 0.5
+    na[1, :] = 0.5
+    cases.append(vote_case("synthetic/flat-row", heads5[:3], keys, q, na))
+
+    keys, span = layout([3, 3, 3, 3, 3])
+    q, na = noise(3, span), noise(3, span)
+    for h in range(3):
+        plant(q, h, keys[2], 4.0)
+        plant(na, h, keys[2], 7.0)
+    cases.append(vote_case("synthetic/baseline-sharper-than-the-question", heads5[:3], keys, q, na))
+
+    keys, span = layout([2, 2, 2, 2], gaps=3)
+    q, na = noise(3, span), noise(3, span)
+    separators = [k for k in range(span) if not any(r and r[0] <= k < r[1] for r in keys)]
+    q[:, separators] += 12.0
+    cases.append(vote_case("synthetic/mass-on-the-separators", heads5[:3], keys, q, na))
+
+    keys, span = layout([3, 0, 4, 2, 0, 3], empty=(1, 4))
+    q, na = noise(5, span), noise(5, span)
+    for h in range(5):
+        plant(q, h, keys[5], 6.0 + h)
+    cases.append(vote_case("synthetic/segments-that-own-no-key", heads5, keys, q, na))
+    return cases
+
+
+def golden(args):
+    """Golden cases for the served vote (`crates/core/tests/locate_reading.rs`):
+    real questions of a dump, read with the registered heads, and the
+    synthetic edges."""
+    choice = read_json(args.choice)["choice"]
+    heads, names = choice["method"]["heads"], choice["method"]["names"]
+    meta = read_json(args.dump)
+    base = os.path.dirname(args.dump)
+    with open(os.path.join(base, meta["rows_file"]), encoding="utf-8") as f:
+        rows = {r["id"]: r for r in (json.loads(line) for line in f)}
+    raw = np.memmap(os.path.join(base, meta["bin_file"]), dtype="<f2", mode="r")
+    cases = []
+    for qid in args.ids:
+        row = rows[qid]
+        span = row["span"][1]
+
+        def block(variant):
+            off = row["variants"][variant]["offset"]
+            return np.asarray(raw[off:off + N_HEADS * span]).reshape(N_HEADS, span)[heads]
+
+        keys = [None if k is None else tuple(k) for k in row["keys"]]
+        cases.append(vote_case(f"{meta['set']}/{qid}", names, keys, block("s2"), block("s2-na")))
+    cases += synthetic_cases(args.seed)
+    with open(args.out, "w", encoding="utf-8", newline="") as f:
+        json.dump({"source": "tools/locate-sets/score.py golden", "choice": choice["config"], "cases": cases}, f)
+    print(f"{len(cases)} golden cases -> {args.out}")
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -470,7 +598,17 @@ def main():
     c.add_argument("--dumps", nargs="+", required=True)
     c.add_argument("--labelled", help="labelled.py's results on the same set")
     c.add_argument("--out", required=True)
+    g = sub.add_parser("golden", help="golden cases of the head vote for the served port")
+    g.add_argument("--choice", required=True, help="the vote's choice file (vote-choice.json)")
+    g.add_argument("--dump", required=True, help="a harness dump's .json")
+    g.add_argument("--ids", nargs="+", required=True, help="the dump's questions to write")
+    g.add_argument("--seed", type=int, default=20261027, help="the synthetic cases' noise")
+    g.add_argument("--out", required=True)
     args = ap.parse_args()
+
+    if args.cmd == "golden":
+        golden(args)
+        return
 
     if args.cmd == "dev":
         rows = []

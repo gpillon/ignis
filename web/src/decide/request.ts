@@ -5,6 +5,7 @@
 
 import { authHeaders, keyRequired } from "../api/auth.ts";
 import { apiErrorMessage } from "../api/errors.ts";
+import type { Compression, LocateMethod, ResolvedKind } from "./model.ts";
 
 export const DECIDE_PATH = "/v1/decide";
 
@@ -43,7 +44,38 @@ export type Answer =
       extent?: Record<string, number>;
       digits?: Record<string, DigitDraw[]>;
     }
+  // A `locate` names a segment of the target by its index from 0 (GitHub
+  // #275), and `value` is that segment as the caller sent it: a line as a
+  // string, an array element as itself. `kind`, `method` and `compression`
+  // name what produced it (GitHub #278), defaults included — `kind` is the
+  // one `auto` told, never `auto`.
+  //
+  // Under the `shortlist` the shares are a labelled choice's probabilities —
+  // under a fold, times the first level's pick — and `found` (on the three
+  // measured routes only) says whether the text answers at all: below 0.5
+  // `segment`, `value` and `confidence` are `null`, `pointers` is empty, and
+  // `ranking` still lists the candidates. Under the `vote` the shares are the
+  // heads' votes, there is no `found`, and `pointers` holds the winner alone.
+  // Neither is a calibrated probability.
+  | {
+      type: "locate";
+      kind: ResolvedKind;
+      method: LocateMethod;
+      compression: Compression;
+      found?: number;
+      segment: number | null;
+      value: unknown;
+      confidence: number | null;
+      ranking: LocateRank[];
+      pointers: LocatePointer[];
+    }
   | { type: "error"; code: string; message: string };
+
+/** One ranked segment of a `locate`: its index, and its share — of the choice, or of the heads' votes. */
+export type LocateRank = { segment: number; share: number };
+
+/** A segment a `locate` points at (GitHub #278): every candidate at `POINTER_SHARE` or more, the pick among them. */
+export type LocatePointer = { segment: number; value: unknown; share: number };
 
 export type DecideResponse = {
   model: string;

@@ -643,20 +643,21 @@ When output names a domain concept, use the term as defined here.
   means nothing.
 - **Attention readout** — reading attention heads' pre-softmax scores
   (`q · k / sqrt(head_dim)`) at a prefill's last position over one span of
-  its keys — an image's placeholders — instead of the logits of answer
-  tokens (GitHub #260, #263 and #264; ADR 0038, ADR 0039 and ADR 0040). The
-  third thing the `Compute` seam carries, beside the **readout** and the
-  **permitted set**: the job names the span, the image grid's columns, the
-  **pointing head** and optionally a **head set**, and what comes back is one
-  score per key for the pointing head and, per head of the set, its key index
-  with its own score there and the four around it (the **sub-cell peak**'s
-  evidence) — never a full attention row. The keys
+  its keys — an image's placeholders, or a text state's tokens — instead of
+  the logits of answer tokens (GitHub #260, #263, #264 and #275; ADR 0038,
+  ADR 0039, ADR 0040 and ADR 0041). The third thing the `Compute` seam
+  carries, beside the **readout** and the **permitted set**: the job names
+  the span, the **pointing head** and optionally a **head set**, and what
+  comes back is one score per key for the pointing head and, per head of the
+  set, either its key index with its own score there and the four around it
+  in the image grid (the **sub-cell peak**'s evidence) or, over a text span,
+  its whole row — the **head vote**'s evidence. The keys
   are the ones each armed layer's attention read, as it read them — the hq
-  prompt route's codec-decoded and window-exact rows, or the BF16 pages — so
-  a leaf that cannot read them on any armed layer fails the question rather
-  than scoring some other copy or answering with part of the set. A `point`
-  or a head `box` answered this way is a **decision**: one prefill, no
-  decode round, no lane.
+  prompt route's codec-decoded and window-exact rows, or the BF16 pages, also
+  when an earlier request wrote them — so a leaf that cannot read them on any
+  armed layer fails the question rather than scoring some other copy or
+  answering with part of the set. A `point`, a head `box` or a **locate**
+  answered this way is a **decision**: one prefill, no decode round, no lane.
 - **Pointing head** — the attention head that names *which* object a `point`
   or a head `box` is about: L39.h10 (GQA ordinal 9, query head 10) on the
   served 27B, read at the position after the forced `{"x":`. It reads a fixed
@@ -700,6 +701,93 @@ When output names a domain concept, use the term as defined here.
   unobserved falls as more parts are seen: on synthetic scenes the set tiles
   the object (17-56 distinct cells), on a photograph it piles onto one
   distinctive part (6-13).
+- **Locate** — the `/v1/decide` primitive that names the **segment** of a text
+  `state` an instruction asks for (GitHub #275, #278; specs 18 and 22; ADR 0041,
+  ADR 0042), with nothing written into the state and nothing generated. Two
+  methods: the **shortlist** (the default) and the **head vote**. It has a
+  `kind` (`auto`, `log`, `prose`, `records`) and a `compression`
+  (`template_fold`, `none`), and its answer names the resolved three, the
+  segment's index and value as the caller sent it, a ranking, **pointers**
+  and — on the measured routes — **found**. Its reading prompt is layout L1 —
+  the evidence alone in the system message — at the copy scaffold
+  `{"quote":"`. Refused on a load nobody calibrated it for; the vote also past
+  the span it was measured on (`LOCATE_MAX_KEYS`, 4,554 keys on the served
+  27B).
+- **Shortlist** — a **locate**'s default method (GitHub #278, ADR 0042): the
+  calibrated heads narrow the text to a few candidates — 5 templates at a
+  fold's **level 1**, 16 rows at its **level 2**, 16 lines, sentences or
+  records otherwise — and a labelled `choice` over them decides, with no
+  token generated. The heads narrow a very long text; the `choice` resolves
+  near-duplicates, which it does well among a handful and badly among
+  hundreds.
+- **End reading** — a **shortlist**'s reading of logs and records: a
+  segment scored by where it closes — its last key, its separator and the
+  next segment's first key — each head's lift over the **content-free
+  baseline** standardized over the window's segments and summed over the
+  **end heads**. At length a line is marked at its end, not its start.
+- **Sum reading** — a **shortlist**'s reading of prose: a segment scored by
+  all its keys, as the **head vote** does, standardized and summed over the
+  **sum heads** rather than voted.
+- **End heads** / **sum heads** — the two head sets of a `locate`
+  calibration (spec 22): the end heads, 32 heads of GQA layers 35 to 55 with
+  the best single-head top-1 at a line's closing keys on development sets
+  (spec 23); the sum heads, the **head vote**'s 32. Keyed to the artifact's
+  content hash with `LOCATE_WINDOW_KEYS`.
+- **Template fold** — a `locate`'s `template_fold` compression (spec 22):
+  a log's lines grouped Drain-style into templates — same source label, same
+  token count, tokens agreeing on half the positions, times removed and
+  obvious variables masked — so a long log is read as a short text first.
+  Reversible: every **level-2** row maps back to the lines it stands for.
+  Removes the lines' order and neighbours, and every time from level 1.
+- **Level 1** — a **template fold**'s first text: one line per template, its
+  variable slots showing their distinct values while they fit 600 characters,
+  and `(xN)`.
+- **Level 2** — one template's lines as their values only, values first and
+  the line's time last, exact repeats one row with `(xN)`. The **shortlist**
+  ranks rows by their values and shows the last `choice` each row's first
+  original line, because whether a line answers cannot be read from its
+  values alone.
+- **Window** — a stretch of at most `LOCATE_WINDOW_KEYS` (200,000 on the
+  served 27B) keys of a text the heads read, cut at segment boundaries — at an
+  empty segment where one is in reach (a paragraph break), else before the
+  segment that would not fit — and read as its own prefill with its own
+  **content-free baseline**; windows' scores are standardized and merged. A
+  text's length is then bounded by the request, not the context.
+- **Pointer** — every candidate of a `locate`'s last `choice` at a share of
+  0.05 or more, the pick always first: one answer, or the several segments a
+  two-part answer needs.
+- **Records array** — a JSON array of two or more elements, every one an
+  object, and not the content-parts shape (every element with a string
+  `type`): what `auto` reads as `records`, without a statistic.
+- **Found** — whether a `locate`'s text answers at all (spec 22 § Not found):
+  the last `choice` asked again with a "none" option, and for a folded log a
+  yes/no; `1 - p(none)`, averaged with `p(yes)` for a log. Below 0.5 the
+  answer names no segment and keeps its ranking. Carried only by the measured
+  routes (`log` + `template_fold`, `prose` + `none`, `records` + `none`), and
+  never a calibrated probability.
+- **Segment** — one place a **locate** can answer with: a line of a string
+  state, split on `\n` exactly (a `\r` stays part of its line), or an element
+  of an array, `within` an optional JSON Pointer. Numbered the way the caller
+  would number them — the 0-based index of `split("\n")`, the array index.
+  Its keys are the prompt tokens holding most of its bytes, found from the
+  byte range recorded as the state was written, never by searching the text:
+  two identical lines are two segments. An empty or all-whitespace one keeps
+  its index and owns no key.
+- **Head vote** — how a **locate** is read (spec 19's track L, GitHub #276):
+  each of 32 heads of GQA layers 35 to 63 names the **segment** whose share
+  of its softmax over the span the question raised most above the
+  **content-free baseline**'s, and the most-voted segment wins, a tie to the
+  segment the best-ranked head named. A **calibrated constant keyed to the
+  artifact's content hash**, like the **pointing head**: the heads with the
+  most training hits on development sets, never computed at load. The vote's
+  **confidence** is how much the heads agree, not a calibrated probability.
+- **Content-free baseline** — the same prompt with the instruction replaced
+  by `N/A` (ICR's, QRHead's and contextual calibration's "N/A"): what the
+  heads do with the state and the scaffold when nothing is asked — sinks,
+  first lines, position — which the **head vote** subtracts before a head
+  votes. One per **locate** target in a request, shared by every `locate`
+  over it; it claims the state's prefix like any sibling, and costs input
+  tokens but is no **decision** of its own.
 - **Extent** — the box the kept heads of a **head set** span: the heads
   within three times the median distance of the **pointing head**'s point, at
   their **sub-cell peaks**, their 15%-85% quantiles on each axis grown by the
