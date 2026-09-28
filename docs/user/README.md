@@ -428,7 +428,12 @@ state that is not an array of objects, or `log`/`prose` on one
 (`kind_unsupported`, `compression_unsupported`); one segment longer than a
 window (`locate_segment_too_long`); a load whose artifact nobody calibrated
 (`locate_uncalibrated` — the load says which at start, `ignis.decide.locate`,
-naming its heads and window). Content-parts states are refused too.
+naming its heads and window); a fold's level-1 text past the context
+(`context_exceeded`). Content-parts states are refused too. A step rendered
+from an earlier step's answer — a fold's level 2, every `choice` — is known
+only after the first prefill, so a fault there (say a `choice` over sixteen
+lines too long for the context) is that question's `error` answer with its
+code, beside its siblings' answers, not a 422.
 
 **`found`** — on `log` + `template_fold`, `prose` + `none` and `records` +
 `none` — says whether the text answers at all. The last `choice` is asked
@@ -460,7 +465,7 @@ several sentences a two-part answer needs.
   window's prefix is kept while the questions over it run, so a second
   question over the same text costs its own short prefills, not the text's.
 - **Every prefill is billed**: `usage.input_tokens` counts windows, their
-  content-free twins, a fold's levels and every `choice`; `output_tokens` is 0.
+  content-free baselines, a fold's levels and every `choice`; `output_tokens` is 0.
 - The Playground's **Decide** tab asks one (GitHub #277, #278): it counts the
   segments `within` cuts before you send, offers the kind, method and
   compression, and shows the answer's pointers and `found`.

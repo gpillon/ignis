@@ -62,3 +62,14 @@ pub fn in_paragraphs<S: AsRef<str>, L: AsRef<str>>(lines: &[S], candidates: &[us
     }
     (out.join("\n").trim_end_matches('\n').to_owned(), named)
 }
+
+/// What a fold's last `choice` shows (spec 22 § The labelled `choice`,
+/// `zd_notfound.py --raw-final`): each kept level-2 row's **first original
+/// line**, in document order — lines identical but for their time answer
+/// with the first of them. `members` is the template's rows, each the lines
+/// it stands for; `rows` the rows kept.
+pub fn rows_first_lines(members: &[Vec<usize>], rows: &[usize]) -> Vec<usize> {
+    let mut firsts: Vec<usize> = rows.iter().map(|&row| members[row][0]).collect();
+    firsts.sort_unstable();
+    firsts
+}

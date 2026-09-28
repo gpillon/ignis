@@ -65,6 +65,21 @@ fn spaced_json_is_pythons_json_dumps() {
         let value: OrderedValue = serde_json::from_str(text).expect("a value");
         assert_eq!(spaced_json(&value), case["spaced"].as_str().expect("spaced"), "{text}");
     }
+    // A record array's last `choice` (`zd_records.py ask`): the candidates
+    // in array order, each as its spaced JSON, labelled.
+    let case = &golden["records"];
+    let records: Vec<OrderedValue> = case["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .map(|text| serde_json::from_str(text.as_str().expect("a record's JSON")).expect("a record"))
+        .collect();
+    let mut candidates: Vec<usize> =
+        case["candidates"].as_array().expect("candidates").iter().map(|c| c.as_u64().expect("index") as usize).collect();
+    candidates.sort_unstable();
+    let lines: Vec<String> = candidates.iter().map(|&i| spaced_json(&records[i])).collect();
+    let labels: Vec<String> = golden["labels"].as_array().expect("labels").iter().map(|l| l.as_str().unwrap().to_owned()).collect();
+    assert_eq!(ignis_core::locate::render::labelled(&lines, &labels), case["text"].as_str().expect("text"));
     // Segments as text: a string's lines, an array's strings as they are and
     // everything else spaced.
     let array: OrderedValue = serde_json::from_str(r#"["a b",{"k":[1,2]},3]"#).unwrap();

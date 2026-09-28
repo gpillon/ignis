@@ -402,8 +402,46 @@ def render_cases():
                       "labels": {k: v for k, v in labels.items()}})
     labelled = ["first line", "second: with a colon", "  indented", "ünïcödé"]
     cases.append({"name": "labelled lines", "kind": "labelled", "lines": labelled,
-                  "text": "\n".join(f"{label}: {line}" for label, line in zip(LABELS, labelled))})
+                  "text": ask_state(labelled)})
+    # A fold's level 1: the kept templates' level-1 lines, in their order
+    # (`zd_logpipe.py`: `[f.level1[i] for i in sorted(cand)]`).
+    shapes = ["pod-{p} ready in {i}ms", "pod-{p} failed with exit code {i} after restart",
+              "evicted pod-{p} from node for memory pressure", "scaled app web to {i} replicas now please",
+              "[cron] job backup-{p} finished", "certificate for host{p}.example.org renews on day {i}"]
+    log = [f"2026-09-28T10:00:{i:02d}Z " + shapes[i % 6].format(p=i % 4, i=i) for i in range(24)]
+    log += ["2026-09-28T10:01:00Z pod-9 ready in 9ms", "2026-09-28T10:01:01Z pod-9 ready in 9ms"]
+    f = C.fold(log, C.SIM, values=True)
+    kept = [0, 2, 3] if len(f.clusters) > 3 else list(range(len(f.clusters)))
+    cases.append({"name": "a fold's level 1", "kind": "level1", "lines": log, "kept": kept,
+                  "text": ask_state([f.level1[i] for i in sorted(kept)])})
+    # A fold's last `choice` over the kept rows' original lines
+    # (`zd_notfound.py --raw-final`: `sorted(members[i][0] for i in rows)`).
+    ci = 0
+    texts, members = C.level2(f, ci)
+    rows = [len(texts) - 1, 0, 1] if len(texts) > 2 else list(range(len(texts)))
+    raw = sorted(members[i][0] for i in rows)
+    cases.append({"name": "a fold's last choice", "kind": "raw_final", "lines": log, "cluster": ci, "rows": rows,
+                  "raw": raw, "text": ask_state([log[i] for i in raw])})
     return cases
+
+
+def ask_state(lines):
+    """The state `zd_notfound.ask` (and `zd_records.ask` through it) sends:
+    each candidate as `label: line`, one per line."""
+    return "\n".join(f"{label}: {line}" for label, line in zip(LABELS, lines))
+
+
+def records_render_case():
+    """`zd_records.py ask`: the candidates in array order as spaced JSON,
+    labelled (`ask_lines(url, [line(q["state"][i]) for i in cand], ...)`)."""
+    from zd_records import line
+    records = [{"id": 7, "name": "Ada Silva", "city": "Porto"}, {"id": 8, "name": "Bo", "tags": ["x", "y"], "ok": True},
+               {"id": 9, "note": "quote \" and ünï"}, {"id": 10, "nested": {"a": None}}]
+    cand = [3, 0, 2]
+    # Each record as its JSON text: a reader of the fixture must see the keys
+    # in the order they were written.
+    return {"records": [json.dumps(r, ensure_ascii=False) for r in records], "candidates": cand,
+            "text": ask_state([line(records[i]) for i in sorted(cand)])}
 
 
 SPACED = [
@@ -500,7 +538,7 @@ def main():
                                    "merges": merge_cases(args.seed + 2)})
     spaced = [{"json": text, "spaced": json.dumps(json.loads(text), ensure_ascii=False)} for text in SPACED]
     write("locate_renders.json", {"labels": LABELS, "renders": render_cases(), "spaced_json": spaced,
-                                  "found": found_cases()})
+                                  "records": records_render_case(), "found": found_cases()})
     write("locate_auto.json", {"segments": 2000, "threshold": 0.5, "cases": auto_cases(args.seed + 3)})
 
 

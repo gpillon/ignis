@@ -611,33 +611,30 @@ impl From<ignis_core::locate::Compression> for LocateCompression {
     }
 }
 
-impl LocateKind {
-    /// The wire's spelling, and `ignis_locates_total`'s.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Log => "log",
-            Self::Prose => "prose",
-            Self::Records => "records",
+impl From<LocateKind> for ignis_core::locate::Kind {
+    fn from(kind: LocateKind) -> Self {
+        match kind {
+            LocateKind::Log => Self::Log,
+            LocateKind::Prose => Self::Prose,
+            LocateKind::Records => Self::Records,
         }
     }
 }
 
-impl LocateMethod {
-    /// The wire's spelling, and `ignis_locates_total`'s.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Shortlist => "shortlist",
-            Self::Vote => "vote",
+impl From<LocateMethod> for ignis_core::locate::Method {
+    fn from(method: LocateMethod) -> Self {
+        match method {
+            LocateMethod::Shortlist => Self::Shortlist,
+            LocateMethod::Vote => Self::Vote,
         }
     }
 }
 
-impl LocateCompression {
-    /// The wire's spelling, and `ignis_locates_total`'s.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::TemplateFold => "template_fold",
-            Self::None => "none",
+impl From<LocateCompression> for ignis_core::locate::Compression {
+    fn from(compression: LocateCompression) -> Self {
+        match compression {
+            LocateCompression::TemplateFold => Self::TemplateFold,
+            LocateCompression::None => Self::None,
         }
     }
 }
@@ -2389,7 +2386,7 @@ pub fn score_confidence(probabilities: &[f64]) -> f64 {
 
 Eight primitives. Read at one position: `noul` (yes/no, answered with the probability of yes), `choice` (one option from a declared set, with the distribution over all of them) and `score` (a probability-weighted value across ordered levels, which can land between them). Generated a digit at a time under a constrained decode: `number`, `point` and `box` -- the last two in the submitted image's own pixels -- and `scalar`, which closes its own object as soon as the number is complete, so `digits` is a ceiling the caller can leave out and the answer may have a decimal part. Read from attention: `locate`.
 
-A `locate` names the **segment** of a JSON `state` the instruction asks for -- a line of a string, split on `\\n`, or an element of an array, `within` an optional JSON Pointer -- without writing anything into the state and without generating. By default (`method: shortlist`, ADR 0042) the loaded artifact's calibrated attention heads narrow the text to a few candidates and a labelled `choice` decides among them, and the text may be far longer than the context: prose and record arrays are read in windows of at most 200,000 keys, each with a content-free twin. `kind` names the reading -- `auto` (default: `records` for an array of JSON objects, else `log` when the fold of its first 2,000 segments with content puts at least half of them in shared templates, else `prose`), `log`, `prose` or `records` -- and `compression` whether a log is folded into templates first (`template_fold`, the default for `log`: no long prefill) or read as it is (`none`, the default for prose and records). `method: vote` is the head vote of ADR 0041, unchanged, over at most the span it was measured on (`locate_too_long`). The answer names the resolved `kind`, `method` and `compression`; the segment's index into the state as sent, its `value`, a `confidence` and a `ranking` (the `choice`'s probabilities -- not calibrated), and `pointers`: every candidate at a share of 0.05 or more, the pick first. `found` (on `log` + `template_fold`, `prose` + `none`, `records` + `none`) says whether the text answers at all: below 0.5 the answer names no segment and keeps its ranking. Every prefill -- windows, twins, a fold's levels, the `choice`s -- is counted in `usage.input_tokens`.
+A `locate` names the **segment** of a JSON `state` the instruction asks for -- a line of a string, split on `\\n`, or an element of an array, `within` an optional JSON Pointer -- without writing anything into the state and without generating. By default (`method: shortlist`, ADR 0042) the loaded artifact's calibrated attention heads narrow the text to a few candidates and a labelled `choice` decides among them, and the text may be far longer than the context: prose and record arrays are read in windows of at most 200,000 keys, each with a content-free baseline. `kind` names the reading -- `auto` (default: `records` for an array of JSON objects, else `log` when the fold of its first 2,000 segments with content puts at least half of them in shared templates, else `prose`), `log`, `prose` or `records` -- and `compression` whether a log is folded into templates first (`template_fold`, the default for `log`: no long prefill) or read as it is (`none`, the default for prose and records). `method: vote` is the head vote of ADR 0041, unchanged, over at most the span it was measured on (`locate_too_long`). The answer names the resolved `kind`, `method` and `compression`; the segment's index into the state as sent, its `value`, a `confidence` and a `ranking` (the `choice`'s probabilities -- not calibrated), and `pointers`: every candidate at a share of 0.05 or more, the pick first. `found` (on `log` + `template_fold`, `prose` + `none`, `records` + `none`) says whether the text answers at all: below 0.5 the answer names no segment and keeps its ranking. Every prefill -- windows, their content-free baselines, a fold's levels, the `choice`s -- is counted in `usage.input_tokens`.
 
 A `point` is answered **in one pass** by default (ADR 0038, ADR 0039): the prefill that forces its `{\"x\":` reads the loaded artifact's calibrated heads over the image and the server turns their maps into an answer, with no decode round (`method: head`). The pointing head names which object -- its `region.share` is the confidence to act on, and a near-flat map (about 0.03) is nothing found -- and the head set outlines it: the point is the centre of the object's `extent`, which the answer carries as `x0`, `y0`, `x1`, `y1` in pixels of the submitted image. Its `uncertainty` is one image token per axis. A load calibrated with the pointing head alone answers without `extent`, at the part of the object that head reads. `\"method\": \"chain\"` asks for the digit chain instead -- finer than one token, with a per-digit trace -- and a load with no calibrated head answers every `point` by chain.
 
@@ -2404,7 +2401,7 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
     responses(
         (status = 200, description = "One answer per question, under the ids the caller chose.", body = DecideResponse),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
-        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), a vote's target is longer than the vote was measured on (`locate_too_long`), a single segment is longer than a window (`locate_segment_too_long`), or the loaded template cannot say where its tokens sit (`locate_unsupported`); a `kind`, `method` or `compression` a locate does not know (`kind_unknown`, `method_unknown`, `compression_unknown`), a fold under `vote` or of prose (`compression_unsupported`), `kind: records` on a state that is not an array of JSON objects or `log`/`prose` on one (`kind_mismatch`); `criteria` and `digits` on a `locate`, and `within`, `kind` and `compression` on anything else (`kind_unsupported`, `compression_unsupported`), are refused too. Nothing reached the engine.",
+        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), a vote's target is longer than the vote was measured on (`locate_too_long`), a single segment is longer than a window (`locate_segment_too_long`), or the loaded template cannot say where its tokens sit (`locate_unsupported`); a `kind`, `method` or `compression` a locate does not know (`kind_unknown`, `method_unknown`, `compression_unknown`), a fold under `vote` or of prose (`compression_unsupported`), `kind: records` on a state that is not an array of JSON objects or `log`/`prose` on one (`kind_mismatch`); `criteria` and `digits` on a `locate`, and `within`, `kind` and `compression` on anything else (`kind_unsupported`, `compression_unsupported`), are refused too, as is a fold's level-1 text past the context (`context_exceeded`). Nothing reached the engine. (A shortlist step rendered from an earlier step's answer -- a fold's level 2, every `choice` -- can only fault after a prefill, and then answers its own question with an `error`.)",
             body = crate::api::ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted.", body = crate::api::ApiError),
     ),
@@ -2512,11 +2509,20 @@ async fn serve(
     // refused — before anything is rendered.
     let mut resolved_kinds: Vec<Option<(ignis_core::locate::Kind, ignis_core::locate::Compression)>> =
         Vec::with_capacity(prepared.len());
+    // `auto` is told once per target (spec 22 § `auto`), and its host time
+    // goes on the request log beside the question that paid it.
+    let mut told: BTreeMap<String, ignis_core::locate::Kind> = BTreeMap::new();
+    let mut auto_ms: Vec<Option<f64>> = Vec::with_capacity(prepared.len());
     for question in &prepared {
-        resolved_kinds.push(match (&evidence, question.locate) {
-            (Evidence::Json(state), Some(ask)) => Some(resolve_locate(state, question, ask)?),
-            _ => None,
-        });
+        let (resolved, spent) = match (&evidence, question.locate) {
+            (Evidence::Json(state), Some(ask)) => {
+                let (resolved, spent) = resolve_locate(state, question, ask, &mut told)?;
+                (Some(resolved), spent)
+            }
+            _ => (None, None),
+        };
+        resolved_kinds.push(resolved);
+        auto_ms.push(spent);
     }
 
     // Render every question first. This is the last thing that can refuse
@@ -2530,8 +2536,8 @@ async fn serve(
     // later steps is rendered from an earlier one's answer.
     let mut main: Vec<(usize, Rendered)> = Vec::with_capacity(prepared.len());
     let mut plans: Vec<Option<LocatePlan>> = Vec::with_capacity(prepared.len());
-    let mut shortlists: Vec<shortlist::Question> = Vec::new();
-    let mut readings = shortlist::Readings::default();
+    let mut shortlists: Vec<shortlist::Planned> = Vec::new();
+    let mut shared = shortlist::Shared::default();
     // GitHub #275: one content-free baseline per `locate` target, shared by
     // every `locate` over it — rendered with the questions, asked after them.
     let mut baselines: Vec<Baseline> = Vec::new();
@@ -2560,7 +2566,7 @@ async fn serve(
                         compression,
                         calibration,
                         model.clone(),
-                        &mut readings,
+                        &mut shared,
                     )
                     .await?;
                     shortlists.push(planned);
@@ -2627,10 +2633,7 @@ async fn serve(
         // prefix to share, but it is still one question's failure and not
         // the request's — the same slot an engine-full follower gets, and
         // the same one the sequential loop before #240 gave it.
-        replies[slot] = Some(match ask(server, collect(slot), ready, class).await {
-            Attempt::Answered(reply) => reply,
-            Attempt::Full(_) => Reply::failed(collect(slot), engine_full()),
-        });
+        replies[slot] = Some(alone(server, collect(slot), ready, class).await);
     }
     // The followers, in waves ([`in_waves`]).
     let followers = followers.into_iter().map(|(slot, ready)| (slot, ready, collect(slot))).collect();
@@ -2646,7 +2649,7 @@ async fn serve(
         (None, true) => None,
     };
     if let (Some(calibration), false) = (locate, shortlists.is_empty()) {
-        let (answered, spent) = shortlist::answer_all(server, shortlists, readings, calibration, model.clone(), class).await;
+        let (answered, spent) = shortlist::answer_all(server, shortlists, shared, calibration, model.clone(), class).await;
         input_tokens = input_tokens.saturating_add(spent);
         for (slot, answer, summary) in answered {
             shortlisted.insert(slot, (answer, summary));
@@ -2658,7 +2661,7 @@ async fn serve(
     let mut answers = BTreeMap::new();
     for (slot, question) in prepared.iter().enumerate() {
         if let Some((answer, summary)) = shortlisted.remove(&slot) {
-            record_locate(server, question, &answer, Some(&summary));
+            record_locate(server, question, &answer, Some(&summary), auto_ms[slot]);
             answers.insert(question.id.clone(), answer);
             continue;
         }
@@ -2686,7 +2689,7 @@ async fn serve(
                     },
                     (Ok(_), Err(other)) => other,
                 };
-                record_locate(server, question, &answer, None);
+                record_locate(server, question, &answer, None, auto_ms[slot]);
                 answer
             }
             (Reply::Rows(_), _, _) => failed("not_a_readout", "this question read attention it has no plan for".to_owned()),
@@ -2724,15 +2727,26 @@ fn resolve_locate(
     state: &OrderedValue,
     question: &PreparedQuestion,
     ask: LocateAsk,
-) -> Result<(ignis_core::locate::Kind, ignis_core::locate::Compression), Refusal> {
+    told: &mut BTreeMap<String, ignis_core::locate::Kind>,
+) -> Result<((ignis_core::locate::Kind, ignis_core::locate::Compression), Option<f64>), Refusal> {
     use ignis_core::locate::{Compression, Kind};
     let id = question.id.as_str();
     let within = question.within.as_deref().unwrap_or("");
     let target = crate::locate::segmentable_target(state, within)
         .map_err(|error| Refusal::new(error.code(), format!("question {id:?}: {error}")))?;
     let records = crate::locate::is_records_array(target);
+    let mut spent = None;
     let kind = match ask.kind {
-        None => crate::locate::auto_kind(target).0,
+        None => match told.get(within) {
+            Some(&kind) => kind,
+            None => {
+                let started = std::time::Instant::now();
+                let kind = crate::locate::auto_kind(target).0;
+                spent = Some(started.elapsed().as_secs_f64() * 1e3);
+                told.insert(within.to_owned(), kind);
+                kind
+            }
+        },
         Some(Kind::Records) if !records => {
             return Err(Refusal::new(
                 "kind_mismatch",
@@ -2757,7 +2771,7 @@ fn resolve_locate(
             format!("question {id:?}: its target reads as prose, which does not fold into templates, so \"template_fold\" is refused; ask for \"none\", or omit `compression`"),
         ));
     }
-    Ok((kind, compression))
+    Ok(((kind, compression), spent))
 }
 
 /// Count and log one answered `locate` (GitHub #275, #278): a decision with
@@ -2768,6 +2782,7 @@ fn record_locate(
     question: &PreparedQuestion,
     answer: &Answer,
     summary: Option<&shortlist::Summary>,
+    auto_ms: Option<f64>,
 ) {
     let found_of = |found: Option<f64>| match found {
         None => crate::metrics::LocateFound::Unmeasured,
@@ -2776,11 +2791,14 @@ fn record_locate(
     };
     match answer {
         Answer::Locate { kind, method, compression, found, segment, .. } => {
+            let kind = ignis_core::locate::Kind::from(*kind);
+            let method = ignis_core::locate::Method::from(*method);
+            let compression = ignis_core::locate::Compression::from(*compression);
             if let Some(metrics) = &server.metrics {
                 // Counted like a head point: a decision with no answer mass
                 // (ADR 0017). Its baseline and its steps are not decisions.
                 metrics.record_decision(question.kind.primitive(), None);
-                metrics.record_locate(kind.label(), method.label(), compression.label(), found_of(*found));
+                metrics.record_locate(kind, method, compression, found_of(*found));
             }
             tracing::info!(
                 name: "ignis.decide.located",
@@ -2790,14 +2808,16 @@ fn record_locate(
                 compression = compression.label(),
                 found = *found,
                 segment = *segment,
-                p_none = summary.and_then(|s| s.p_none),
-                p_yes = summary.and_then(|s| s.p_yes),
-                windows = summary.map(|s| s.windows),
-                templates = summary.and_then(|s| s.templates),
-                template = summary.and_then(|s| s.template),
-                rows = summary.and_then(|s| s.rows),
-                candidates = summary.map(|s| candidates_text(&s.candidates)).unwrap_or_default(),
+                p_none = summary.and_then(|s| s.stats.p_none),
+                p_yes = summary.and_then(|s| s.stats.p_yes),
+                windows = summary.map(|s| s.stats.windows),
+                templates = summary.and_then(|s| s.stats.templates),
+                template = summary.and_then(|s| s.stats.template),
+                rows = summary.and_then(|s| s.stats.rows),
+                candidates = summary.map(|s| candidates_text(&s.stats.candidates)).unwrap_or_default(),
                 input_tokens = summary.map(|s| s.tokens),
+                plan_ms = summary.map(|s| s.stats.plan_ms),
+                auto_ms,
                 "locate answered"
             );
         }
@@ -3287,7 +3307,7 @@ fn head_query(
 
 /// What a `locate` is answered from once its rows are back (GitHub #275):
 /// each segment's keys over the span the heads read, each segment's value,
-/// and which baseline is its content-free twin.
+/// and which baseline is its content-free baseline.
 struct LocatePlan {
     kind: ignis_core::locate::Kind,
     keys: Vec<Option<std::ops::Range<usize>>>,
@@ -3527,7 +3547,7 @@ pub fn locate_answer_for(
 enum Collect<'a> {
     Answer(&'a PreparedQuestion),
     /// GitHub #278: a readout a `locate`'s shortlist asks on its way to its
-    /// answer — a labelled `choice`, its "none" twin, its yes/no. Shaped as
+    /// answer — a labelled `choice`, its "none" variant, its yes/no. Shaped as
     /// any readout, and never counted as a decision of its own: the caller
     /// asked one `locate`.
     Step(&'a PreparedQuestion),
@@ -3753,13 +3773,23 @@ async fn led<'a>(
         return Vec::new();
     }
     let (slot, ready, collect) = items.remove(0);
-    let first = match ask(server, collect, ready, class).await {
-        Attempt::Answered(reply) => reply,
-        Attempt::Full(_) => Reply::failed(collect, engine_full()),
-    };
-    let mut out = vec![(slot, first)];
+    let mut out = vec![(slot, alone(server, collect, ready, class).await)];
     out.extend(in_waves(server, items, class).await);
     out
+}
+
+/// Ask one prompt alone: its reply, or — when the engine had no room for it —
+/// its failure in the slot its collection would have filled.
+async fn alone(
+    server: &crate::Server,
+    collect: Collect<'_>,
+    ready: Rendered,
+    class: ignis_core::types::RequestClass,
+) -> Reply {
+    match ask(server, collect, ready, class).await {
+        Attempt::Answered(reply) => reply,
+        Attempt::Full(_) => Reply::failed(collect, engine_full()),
+    }
 }
 
 /// What one attempt at a question produced: its reply, or the unsubmitted

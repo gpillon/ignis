@@ -177,6 +177,88 @@
     "ünïcödé"
    ],
    "text": "A: first line\nB: second: with a colon\nC:   indented\nD: ünïcödé"
+  },
+  {
+   "name": "a fold's level 1",
+   "kind": "level1",
+   "lines": [
+    "2026-09-28T10:00:00Z pod-0 ready in 0ms",
+    "2026-09-28T10:00:01Z pod-1 failed with exit code 1 after restart",
+    "2026-09-28T10:00:02Z evicted pod-2 from node for memory pressure",
+    "2026-09-28T10:00:03Z scaled app web to 3 replicas now please",
+    "2026-09-28T10:00:04Z [cron] job backup-0 finished",
+    "2026-09-28T10:00:05Z certificate for host1.example.org renews on day 5",
+    "2026-09-28T10:00:06Z pod-2 ready in 6ms",
+    "2026-09-28T10:00:07Z pod-3 failed with exit code 7 after restart",
+    "2026-09-28T10:00:08Z evicted pod-0 from node for memory pressure",
+    "2026-09-28T10:00:09Z scaled app web to 9 replicas now please",
+    "2026-09-28T10:00:10Z [cron] job backup-2 finished",
+    "2026-09-28T10:00:11Z certificate for host3.example.org renews on day 11",
+    "2026-09-28T10:00:12Z pod-0 ready in 12ms",
+    "2026-09-28T10:00:13Z pod-1 failed with exit code 13 after restart",
+    "2026-09-28T10:00:14Z evicted pod-2 from node for memory pressure",
+    "2026-09-28T10:00:15Z scaled app web to 15 replicas now please",
+    "2026-09-28T10:00:16Z [cron] job backup-0 finished",
+    "2026-09-28T10:00:17Z certificate for host1.example.org renews on day 17",
+    "2026-09-28T10:00:18Z pod-2 ready in 18ms",
+    "2026-09-28T10:00:19Z pod-3 failed with exit code 19 after restart",
+    "2026-09-28T10:00:20Z evicted pod-0 from node for memory pressure",
+    "2026-09-28T10:00:21Z scaled app web to 21 replicas now please",
+    "2026-09-28T10:00:22Z [cron] job backup-2 finished",
+    "2026-09-28T10:00:23Z certificate for host3.example.org renews on day 23",
+    "2026-09-28T10:01:00Z pod-9 ready in 9ms",
+    "2026-09-28T10:01:01Z pod-9 ready in 9ms"
+   ],
+   "kept": [
+    0,
+    2,
+    3
+   ],
+   "text": "A: {pod-0|pod-2|pod-9} ready in {0ms|6ms|12ms|18ms|9ms} (x6)\nB: evicted {pod-2|pod-0} from node for memory pressure (x4)\nC: scaled app web to {3|9|15|21} replicas now please (x4)"
+  },
+  {
+   "name": "a fold's last choice",
+   "kind": "raw_final",
+   "lines": [
+    "2026-09-28T10:00:00Z pod-0 ready in 0ms",
+    "2026-09-28T10:00:01Z pod-1 failed with exit code 1 after restart",
+    "2026-09-28T10:00:02Z evicted pod-2 from node for memory pressure",
+    "2026-09-28T10:00:03Z scaled app web to 3 replicas now please",
+    "2026-09-28T10:00:04Z [cron] job backup-0 finished",
+    "2026-09-28T10:00:05Z certificate for host1.example.org renews on day 5",
+    "2026-09-28T10:00:06Z pod-2 ready in 6ms",
+    "2026-09-28T10:00:07Z pod-3 failed with exit code 7 after restart",
+    "2026-09-28T10:00:08Z evicted pod-0 from node for memory pressure",
+    "2026-09-28T10:00:09Z scaled app web to 9 replicas now please",
+    "2026-09-28T10:00:10Z [cron] job backup-2 finished",
+    "2026-09-28T10:00:11Z certificate for host3.example.org renews on day 11",
+    "2026-09-28T10:00:12Z pod-0 ready in 12ms",
+    "2026-09-28T10:00:13Z pod-1 failed with exit code 13 after restart",
+    "2026-09-28T10:00:14Z evicted pod-2 from node for memory pressure",
+    "2026-09-28T10:00:15Z scaled app web to 15 replicas now please",
+    "2026-09-28T10:00:16Z [cron] job backup-0 finished",
+    "2026-09-28T10:00:17Z certificate for host1.example.org renews on day 17",
+    "2026-09-28T10:00:18Z pod-2 ready in 18ms",
+    "2026-09-28T10:00:19Z pod-3 failed with exit code 19 after restart",
+    "2026-09-28T10:00:20Z evicted pod-0 from node for memory pressure",
+    "2026-09-28T10:00:21Z scaled app web to 21 replicas now please",
+    "2026-09-28T10:00:22Z [cron] job backup-2 finished",
+    "2026-09-28T10:00:23Z certificate for host3.example.org renews on day 23",
+    "2026-09-28T10:01:00Z pod-9 ready in 9ms",
+    "2026-09-28T10:01:01Z pod-9 ready in 9ms"
+   ],
+   "cluster": 0,
+   "rows": [
+    4,
+    0,
+    1
+   ],
+   "raw": [
+    0,
+    6,
+    24
+   ],
+   "text": "A: 2026-09-28T10:00:00Z pod-0 ready in 0ms\nB: 2026-09-28T10:00:06Z pod-2 ready in 6ms\nC: 2026-09-28T10:01:00Z pod-9 ready in 9ms"
   }
  ],
  "spaced_json": [
@@ -213,6 +295,20 @@
    "spaced": "{\"price\": 149.0, \"qty\": 2, \"ratio\": -0.25}"
   }
  ],
+ "records": {
+  "records": [
+   "{\"id\": 7, \"name\": \"Ada Silva\", \"city\": \"Porto\"}",
+   "{\"id\": 8, \"name\": \"Bo\", \"tags\": [\"x\", \"y\"], \"ok\": true}",
+   "{\"id\": 9, \"note\": \"quote \\\" and ünï\"}",
+   "{\"id\": 10, \"nested\": {\"a\": null}}"
+  ],
+  "candidates": [
+   3,
+   0,
+   2
+  ],
+  "text": "A: {\"id\": 7, \"name\": \"Ada Silva\", \"city\": \"Porto\"}\nB: {\"id\": 9, \"note\": \"quote \\\" and ünï\"}\nC: {\"id\": 10, \"nested\": {\"a\": null}}"
+ },
  "found": [
   {
    "route": "log",

@@ -115,7 +115,7 @@ fn rows_that_are_not_whole_read_nothing() {
     let keys = vec![Some(0..2), Some(3..4)];
     let rows = vec![0.0f32; 8];
     assert!(window_scores(&rows, &rows, 2, &keys, Reading::End).is_some());
-    assert!(window_scores(&rows, &rows[..6], 2, &keys, Reading::End).is_none(), "the twin disagrees");
+    assert!(window_scores(&rows, &rows[..6], 2, &keys, Reading::End).is_none(), "the baseline disagrees");
     assert!(window_scores(&rows, &rows, 0, &keys, Reading::End).is_none(), "no heads");
     assert!(window_scores(&rows, &rows, 3, &keys, Reading::Sum).is_none(), "not heads by one span");
     assert!(window_scores(&rows, &rows, 2, &[Some(0..5)], Reading::Sum).is_none(), "past the span");

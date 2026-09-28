@@ -13,8 +13,8 @@
 //! run's (spec 22 § The acceptance run).
 //!
 //! The long array is ~6,000 records, past the 200,000-key window: two
-//! windows, each prefilled once with its twin (about a minute each), the
-//! question claiming what each twin kept.
+//! windows, each prefilled once with its baseline (about a minute each), the
+//! question claiming what each baseline kept.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38):
 //! `cargo test -p ignis-server --features cuda --test locate_shortlist_gpu -- --ignored --nocapture`.
@@ -235,7 +235,7 @@ async fn a_record_array_past_one_window_is_answered_in_the_original() {
     println!("  present: {}", response["answers"]["present"]);
     println!("  absent: {}", response["answers"]["absent"]);
     let input = response["usage"]["input_tokens"].as_u64().expect("usage");
-    assert!(input > 400_000, "two windows and their twins, each past 100K tokens: {input}");
+    assert!(input > 400_000, "two windows and their baselines, each past 100K tokens: {input}");
     judge("present", &response["answers"]["present"], Some(4_321));
     assert_eq!(response["answers"]["present"]["value"]["city"], "Reykjavik");
     judge("absent", &response["answers"]["absent"], None);

@@ -303,19 +303,7 @@ fn write(value: &OrderedValue, path: &[usize], out: &mut String, target: &mut Op
 /// target `within` names (the whole state when it is empty).
 pub fn evidence_within(state: &OrderedValue, within: &str) -> Result<Evidence, TargetError> {
     let path = resolve(state, within)?;
-    let mut target = state;
-    for &step in &path {
-        target = match target {
-            OrderedValue::Object(entries) => &entries[step].1,
-            OrderedValue::Array(items) => &items[step],
-            _ => unreachable!("`resolve` walks objects and arrays only"),
-        };
-    }
-    let segmentable = matches!(target, OrderedValue::String(_))
-        || matches!(target, OrderedValue::Array(items) if !items.is_empty());
-    if !segmentable {
-        return Err(TargetError::Unsegmentable { pointer: within.to_owned(), found: kind_of(target) });
-    }
+    segmentable_target(state, within)?;
     let mut system = String::from("{\"evidence\":");
     let mut found = None;
     write(state, &path, &mut system, &mut found);
@@ -524,17 +512,20 @@ pub fn segment_texts(target: &OrderedValue) -> Vec<String> {
     }
 }
 
-/// Whether a segment has **content**: what owns keys in a `locate`'s render
-/// ([`Segment::owns`]) — a string that is not blank, or any other element.
-pub fn has_content(target: &OrderedValue, index: usize) -> bool {
+/// Whether each segment of `target` has **content**: what owns keys in a
+/// `locate`'s render ([`Segment::owns`]) — a line or string element that is
+/// not blank, or any other element. One pass: a long log is read once.
+pub fn content_flags(target: &OrderedValue) -> Vec<bool> {
     match target {
-        OrderedValue::String(text) => text.split('\n').nth(index).is_some_and(|line| !line.trim().is_empty()),
-        OrderedValue::Array(items) => match items.get(index) {
-            Some(OrderedValue::String(text)) => !text.trim().is_empty(),
-            Some(_) => true,
-            None => false,
-        },
-        _ => false,
+        OrderedValue::String(text) => text.split('\n').map(|line| !line.trim().is_empty()).collect(),
+        OrderedValue::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                OrderedValue::String(text) => !text.trim().is_empty(),
+                _ => true,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -549,8 +540,12 @@ pub fn auto_kind(target: &OrderedValue) -> (ignis_core::locate::Kind, Option<f64
         return (Kind::Records, None);
     }
     let texts = segment_texts(target);
-    let content: Vec<&String> =
-        texts.iter().enumerate().filter(|&(index, _)| has_content(target, index)).map(|(_, text)| text).take(AUTO_SEGMENTS).collect();
+    let content: Vec<&String> = texts
+        .iter()
+        .zip(content_flags(target))
+        .filter_map(|(text, content)| content.then_some(text))
+        .take(AUTO_SEGMENTS)
+        .collect();
     let share = ignis_core::locate::fold::fold(&content).templated_share();
     let kind = if share >= AUTO_LOG_SHARE { Kind::Log } else { Kind::Prose };
     (kind, Some(share))

@@ -94,7 +94,9 @@ def run(args):
         if q["id"] in done:
             continue
         instruction = q["instruction"]
-        body = {"state": state, "questions": {"q": dict({"type": "locate", "instructions": instruction}, **fields)}}
+        # Asked under its own id: the server's request log names it, and the
+        # judge reads what the log says beside the answer.
+        body = {"state": state, "questions": {q["id"]: dict({"type": "locate", "instructions": instruction}, **fields)}}
         status, payload, ms = post(args.url, body, args.timeout)
         row = {"id": q["id"], "status": status, "ms": ms, "first_of_state": first, "state": key[:16],
                "targets": q.get("targets", []), "absent": q.get("absent", False)}
@@ -102,7 +104,7 @@ def run(args):
             if k in q:
                 row[k] = q[k]
         if status == 200:
-            row["answer"] = payload["answers"]["q"]
+            row["answer"] = payload["answers"][q["id"]]
             row["input_tokens"] = payload["usage"]["input_tokens"]
         else:
             row["code"] = payload.get("error", {}).get("code")

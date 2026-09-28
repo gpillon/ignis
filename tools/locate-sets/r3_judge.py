@@ -124,10 +124,79 @@ def by(rows, key, fn):
     return {k: rate(sum(fn(r) for r in v), len(v)) for k, v in sorted(groups.items())}
 
 
+def located(paths):
+    """Every `ignis.decide.located` line of the server's JSON logs, by the
+    question id the runner asked it under (the last one wins on a rerun)."""
+    out = {}
+    for path in paths:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "ignis.decide.located" not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                a = event.get("attributes") or {}
+                if a.get("question"):
+                    out[a["question"]] = a
+    return out
+
+
+def target_template(lines, target):
+    """The template a fold of the window's non-blank lines puts the target
+    in, as the served fold numbers them (first seen)."""
+    import compress as C
+    content = [i for i, line in enumerate(lines) if line.strip()]
+    folded = C.fold([lines[i] for i in content], C.SIM, values=True)
+    at = content.index(target)
+    return next(n for n, c in enumerate(folded.clusters) if at in c.members)
+
+
+def from_log(args, r3, p3, j3):
+    """What spec 22 reports beside the rules that only the request log holds:
+    level-1 accuracy, shortlist recall, windows read, and the host time of the
+    plan (the fold included) and of `auto`."""
+    log = located(args.log)
+    rep = {"log_lines": len(log)}
+    windows = json.load(open(args.r3_manifest, encoding="utf-8"))["windows"] if args.r3_manifest else {}
+
+    def last(a):
+        lists = (a.get("candidates") or "").split(";")
+        return [int(x) for x in lists[-1].split(",") if x] if lists and lists[-1] else []
+
+    for name, rows in (("R3", [r for r in r3 if r.get("variant") == "present"]), ("P3", p3),
+                       ("J3", [r for r in j3 if not r["absent"]])):
+        seen = [(r, log[r["id"]]) for r in rows if r["id"] in log]
+        if not seen:
+            continue
+        recall = sum(any(t in last(a) for t in r["targets"]) for r, a in seen)
+        rep[f"{name} shortlist recall"] = rate(recall, len(seen))
+        rep[f"{name} windows read"] = {str(k): v for k, v in sorted(
+            {w: sum(1 for _, a in seen if a.get("windows") == w) for w in {a.get("windows") for _, a in seen}}.items(),
+            key=lambda kv: str(kv[0]))}
+        plans = sorted(a["plan_ms"] for _, a in seen if a.get("plan_ms") is not None)
+        if plans:
+            rep[f"{name} plan host ms"] = {"median": round(statistics.median(plans), 1), "max": round(plans[-1], 1)}
+        autos = sorted(a["auto_ms"] for _, a in seen if a.get("auto_ms") is not None)
+        if autos:
+            rep[f"{name} auto host ms"] = {"median": round(statistics.median(autos), 1), "max": round(autos[-1], 1)}
+        if name == "R3" and windows:
+            level1 = [(r, a) for r, a in seen if a.get("template") is not None]
+            hits = sum(a["template"] == target_template(windows[r["window"]], r["targets"][0]) for r, a in level1)
+            rep["R3 level-1 accuracy"] = rate(hits, len(level1))
+            longest = max(level1, key=lambda ra: ra[0].get("tier", 0), default=None)
+            if longest:
+                rep["R3 longest window's plan host ms"] = longest[1].get("plan_ms")
+    return rep
+
+
 def main():
     ap = argparse.ArgumentParser()
     for name in ("r3", "r3-choice", "p3", "p3abs", "p3-manifest", "j3", "f-vote", "f-defaults", "f-recorded", "out"):
         ap.add_argument(f"--{name}", required=True)
+    ap.add_argument("--r3-manifest", help="R3's manifest, for the level-1 accuracy the log is read against")
+    ap.add_argument("--log", nargs="*", default=[], help="the server's JSON request logs of the runs")
     args = ap.parse_args()
     out = {"rules": {}, "reported": {}}
     rules = out["rules"]
@@ -208,13 +277,17 @@ def main():
         "J3 -> records": j3,
         "F records -> records": [r for r in f_def if r.get("family") == "records"],
     }
-    wrong = {}
+    wrong, failed = {}, {}
     for name, rows in kinds.items():
         want = name.split("-> ")[1]
-        miss = [r["id"] for r in rows if (r.get("answer") or {}).get("kind") != want]
+        # A question that failed says nothing of `auto`: counted apart.
+        answered = [r for r in rows if (r.get("answer") or {}).get("type") == "locate"]
+        miss = [r["id"] for r in answered if r["answer"].get("kind") != want]
         if miss:
             wrong[name] = miss[:20] + ([f"+{len(miss) - 20}"] if len(miss) > 20 else [])
-    rules["9 auto"] = {"wrong": wrong, "pass_": not wrong}
+        if len(answered) < len(rows):
+            failed[name] = [r["id"] for r in rows if r not in answered][:20]
+    rules["9 auto"] = {"wrong": wrong, "not_answered": failed, "pass_": not wrong}
 
     recorded = {r["id"]: r for r in f_rec}
     vote = {r["id"]: r for r in f_vote}
@@ -281,6 +354,9 @@ def main():
     f_absent = [r for r in f_def if r["absent"]]
     rep["F absent flagged by family (defaults)"] = by(f_absent, "family", flagged)
     rep["F right by family (defaults, all present)"] = by([r for r in f_def if not r["absent"]], "family", right)
+
+    if args.log:
+        rep.update(from_log(args, r3, p3, j3))
 
     out["all_pass"] = all(rule["pass_"] for rule in rules.values())
     with open(args.out, "w", encoding="utf-8") as f:

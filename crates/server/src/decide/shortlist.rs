@@ -32,7 +32,7 @@
 //! A heads reading is the vote's render and readout ([`super::render_reading`])
 //! over a **window**: the whole state when the target fits one, else the
 //! window's segments alone, as their own state. Each window is read with
-//! its content-free twin, shared by every question over it; the twin goes
+//! its content-free baseline, shared by every question over it; the baseline goes
 //! first and every question over the window claims the prefix it keeps.
 
 use std::collections::{BTreeMap, HashMap};
@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use ignis_core::locate::fold::{Fold, fold};
 use ignis_core::locate::reading::{Merge, Reading, cut_windows, merge, shortlist, window_scores};
-use ignis_core::locate::render::{in_paragraphs, labelled};
+use ignis_core::locate::render::{in_paragraphs, labelled, rows_first_lines};
 use ignis_core::locate::{
     Compression, FOUND_QUESTION, FOUND_THRESHOLD, Kind, LocateCalibration, NONE_LINE, NONE_SENTENCE, POINTER_SHARE,
     RANKING_LEN, SHORTLIST_LEN, SHORTLIST_TEMPLATES, found_by_none, found_log,
@@ -60,7 +60,7 @@ use super::{
 const WINDOW_MARGIN: u32 = 256;
 
 /// A text the heads read, cut into windows (spec 22 § Windows), each with
-/// its content-free twin — shared by every question that reads it.
+/// its content-free baseline — shared by every question that reads it.
 struct Text {
     reading: Reading,
     merge: Merge,
@@ -78,14 +78,14 @@ struct Window {
     within: String,
     span: Range<usize>,
     keys: Vec<Option<Range<usize>>>,
-    /// The twin's prompt until it is asked, then its rows.
-    twin: Option<Rendered>,
+    /// The baseline's prompt until it is asked, then its rows.
+    baseline: Option<Rendered>,
     rows: Option<Result<AttentionScores, Answer>>,
 }
 
 /// Every text this request's shortlists read, and every fold, once.
 #[derive(Default)]
-pub(super) struct Readings {
+pub(super) struct Shared {
     texts: Vec<Text>,
     by_key: HashMap<String, usize>,
     folds: HashMap<String, Arc<Folded>>,
@@ -101,7 +101,7 @@ struct Folded {
 }
 
 /// One shortlist `locate`, from its plan to its answer.
-pub(super) struct Question {
+pub(super) struct Planned {
     pub(super) slot: usize,
     id: String,
     instruction: OrderedValue,
@@ -111,7 +111,7 @@ pub(super) struct Question {
     /// The target's segments as the caller sent them, and as text.
     values: Vec<OrderedValue>,
     texts: Vec<String>,
-    route: Route,
+    steps: Steps,
     /// The text read before anything is answered — the target, or a fold's
     /// level 1 — and this question's prompt per window of it, until asked.
     first: Option<usize>,
@@ -126,24 +126,31 @@ pub(super) struct Question {
     stats: Stats,
 }
 
-enum Route {
+enum Steps {
     Folded(Arc<Folded>),
     Read,
 }
 
 /// What the request log says of one shortlist (spec 22 § Observability).
 #[derive(Default)]
-struct Stats {
-    windows: usize,
-    templates: Option<usize>,
-    template: Option<usize>,
-    rows: Option<usize>,
-    candidates: Vec<Vec<usize>>,
-    p_none: Option<f64>,
-    p_yes: Option<f64>,
+pub(super) struct Stats {
+    /// Windows read, over every text the question's readings read.
+    pub(super) windows: usize,
+    /// A fold's templates, the one its level-1 `choice` picked, and that
+    /// template's level-2 rows.
+    pub(super) templates: Option<usize>,
+    pub(super) template: Option<usize>,
+    pub(super) rows: Option<usize>,
+    /// Each `choice`'s candidates: a fold's templates, then segments.
+    pub(super) candidates: Vec<Vec<usize>>,
+    pub(super) p_none: Option<f64>,
+    pub(super) p_yes: Option<f64>,
+    /// The plan's host time — the fold, when this question made it, and
+    /// every render asked before the first prefill — in milliseconds.
+    pub(super) plan_ms: f64,
 }
 
-impl Question {
+impl Planned {
     fn reading(&self) -> Reading {
         match self.kind {
             Kind::Prose => Reading::Sum,
@@ -180,7 +187,7 @@ fn one_line(text: &str) -> String {
     text.replace('\n', " ")
 }
 
-/// The content-free instruction a twin is read with.
+/// The content-free instruction a baseline is read with.
 fn content_free() -> OrderedValue {
     OrderedValue::String(crate::locate::CONTENT_FREE.to_owned())
 }
@@ -198,8 +205,9 @@ pub(super) async fn plan(
     compression: Compression,
     calibration: LocateCalibration,
     model: Option<String>,
-    readings: &mut Readings,
-) -> Result<Question, Refusal> {
+    shared: &mut Shared,
+) -> Result<Planned, Refusal> {
+    let started = std::time::Instant::now();
     let id = question.id.as_str();
     let within = question.within.clone().unwrap_or_default();
     // A last `choice` names up to sixteen candidates and "none".
@@ -221,7 +229,7 @@ pub(super) async fn plan(
         _ => Vec::new(),
     };
     let texts = crate::locate::segment_texts(target);
-    let mut planned = Question {
+    let mut planned = Planned {
         slot,
         id: id.to_owned(),
         instruction: question.instructions.clone(),
@@ -230,7 +238,7 @@ pub(super) async fn plan(
         compression,
         values,
         texts,
-        route: Route::Read,
+        steps: Steps::Read,
         first: None,
         prompts: Vec::new(),
         second: None,
@@ -241,15 +249,15 @@ pub(super) async fn plan(
     };
     match compression {
         Compression::TemplateFold => {
-            let folded = match readings.folds.get(&within) {
+            let folded = match shared.folds.get(&within) {
                 Some(folded) => folded.clone(),
                 None => {
-                    let segment: Vec<usize> =
-                        (0..planned.texts.len()).filter(|&i| crate::locate::has_content(target, i)).collect();
+                    let content = crate::locate::content_flags(target);
+                    let segment: Vec<usize> = (0..planned.texts.len()).filter(|&i| content[i]).collect();
                     too_few_segments(id, &segment.iter().map(|&i| Some(i..i + 1)).collect::<Vec<_>>(), 2)?;
                     let lines: Vec<String> = segment.iter().map(|&i| planned.texts[i].clone()).collect();
                     let folded = Arc::new(Folded { fold: fold(&lines), lines, segment });
-                    readings.folds.insert(within.clone(), folded.clone());
+                    shared.folds.insert(within.clone(), folded.clone());
                     folded
                 }
             };
@@ -257,57 +265,67 @@ pub(super) async fn plan(
             if folded.fold.clusters.len() > SHORTLIST_TEMPLATES {
                 let lines: Vec<String> = folded.fold.level1.iter().map(|line| one_line(line)).collect();
                 let key = format!("level1\u{0}{within}");
-                let text = open_level(server, readings, key, &lines, calibration, model.clone(), id).await?;
-                planned.prompts = prompts_for(server, &readings.texts[text], &planned.instruction, calibration, model, id).await?;
+                let text = open_level(server, shared, key, &lines, true, calibration, model.clone(), id).await?;
+                planned.prompts = prompts_for(server, &shared.texts[text], &planned.instruction, calibration, model, id).await?;
                 planned.first = Some(text);
             }
-            planned.route = Route::Folded(folded);
+            planned.steps = Steps::Folded(folded);
         }
         Compression::None => {
             let key = format!("read\u{0}{within}\u{0}{}", kind.label());
-            let text = match readings.by_key.get(&key) {
+            let text = match shared.by_key.get(&key) {
                 Some(&text) => text,
                 None => {
                     let reading = planned.reading();
                     let opened =
-                        open_text(server, state, &within, reading, planned.merge(), 2, calibration, model.clone(), id).await?;
-                    readings.texts.push(opened);
-                    readings.by_key.insert(key, readings.texts.len() - 1);
-                    readings.texts.len() - 1
+                        open_text(server, state, &within, reading, planned.merge(), 2, false, calibration, model.clone(), id)
+                            .await?;
+                    shared.texts.push(opened);
+                    shared.by_key.insert(key, shared.texts.len() - 1);
+                    shared.texts.len() - 1
                 }
             };
-            planned.prompts = prompts_for(server, &readings.texts[text], &planned.instruction, calibration, model, id).await?;
+            planned.prompts = prompts_for(server, &shared.texts[text], &planned.instruction, calibration, model, id).await?;
             planned.first = Some(text);
         }
     }
+    planned.stats.plan_ms = started.elapsed().as_secs_f64() * 1e3;
     Ok(planned)
 }
 
 /// A fold's level-1 or level-2 text, opened once per key: its lines as one
-/// string state, read by the end heads.
+/// string state, read by the end heads. Level 1 is refused past the context
+/// (spec 22 § Refusals); a level-2 text past a window is windowed.
+#[allow(clippy::too_many_arguments)]
 async fn open_level(
     server: &crate::Server,
-    readings: &mut Readings,
+    shared: &mut Shared,
     key: String,
     lines: &[String],
+    within_the_context: bool,
     calibration: LocateCalibration,
     model: Option<String>,
     id: &str,
 ) -> Result<usize, Refusal> {
-    if let Some(&text) = readings.by_key.get(&key) {
+    if let Some(&text) = shared.by_key.get(&key) {
         return Ok(text);
     }
     let state = OrderedValue::String(lines.join("\n"));
-    let opened = open_text(server, &state, "", Reading::End, Merge::Records, 1, calibration, model, id).await?;
-    readings.texts.push(opened);
-    readings.by_key.insert(key, readings.texts.len() - 1);
-    Ok(readings.texts.len() - 1)
+    let opened =
+        open_text(server, &state, "", Reading::End, Merge::Records, 1, within_the_context, calibration, model, id).await?;
+    shared.texts.push(opened);
+    shared.by_key.insert(key, shared.texts.len() - 1);
+    Ok(shared.texts.len() - 1)
 }
 
-/// Open a text the heads read (spec 22 § Windows): its content-free twin over
-/// the whole target, and — when that spans more than `LOCATE_WINDOW_KEYS` —
-/// the target cut into windows at segment boundaries, each rendered alone
-/// with its own twin.
+/// Open a text the heads read (spec 22 § Windows): its content-free baseline
+/// over the whole target, and — when that spans more than one window — the
+/// target cut into windows at segment boundaries, each rendered alone with
+/// its own baseline. A window is `LOCATE_WINDOW_KEYS` at most, and less on a
+/// load whose context would not hold that many keys with the prompt around
+/// them: the text's length is bounded by the request, not the context.
+/// `within_the_context` refuses a text whose whole render is past the
+/// context instead of windowing it.
 #[allow(clippy::too_many_arguments)]
 async fn open_text(
     server: &crate::Server,
@@ -316,6 +334,7 @@ async fn open_text(
     reading: Reading,
     merge_rule: Merge,
     least: usize,
+    within_the_context: bool,
     calibration: LocateCalibration,
     model: Option<String>,
     id: &str,
@@ -323,18 +342,23 @@ async fn open_text(
     let heads = calibration.heads_for(reading);
     let whole = render_reading(server, state, within, &content_free(), id, model.clone(), heads).await?;
     too_few_segments(id, &whole.keys, least)?;
+    if within_the_context {
+        within_context(server, id, &whole)?;
+    }
     let segments = whole.keys.len();
-    let window_keys = calibration.window_keys as usize;
-    if whole.span.len() <= window_keys {
+    let around = (whole.ready.prompt_tokens as usize).saturating_sub(whole.span.len());
+    let window = (calibration.window_keys as usize).min((server.engine.max_model_len() as usize).saturating_sub(around));
+    if whole.span.len() <= window {
         within_context(server, id, &whole)?;
         let LocatePrompt { ready, span, keys, .. } = whole;
-        let window = Window { first: 0, state: state.clone(), within: within.to_owned(), span, keys, twin: Some(ready), rows: None };
+        let window = Window { first: 0, state: state.clone(), within: within.to_owned(), span, keys, baseline: Some(ready), rows: None };
         return Ok(Text { reading, merge: merge_rule, heads: heads.len(), segments, windows: vec![window] });
     }
     // Each segment's keys in the whole render, its separator included: what
     // a window of it will cost.
     let mut costs = vec![0u64; segments];
     let mut next = whole.span.len();
+    let owned: Vec<bool> = whole.keys.iter().map(Option::is_some).collect();
     for (index, keys) in whole.keys.iter().enumerate().rev() {
         if let Some(keys) = keys {
             costs[index] = (next - keys.start) as u64;
@@ -349,45 +373,51 @@ async fn open_text(
         OrderedValue::Array(items) => items.iter().map(|item| item.as_str() == Some("")).collect(),
         _ => vec![false; segments],
     };
-    let margin = WINDOW_MARGIN.min(calibration.window_keys / 8);
-    let budget = u64::from(calibration.window_keys - margin);
+    let margin = WINDOW_MARGIN.min(window as u32 / 8) as usize;
+    let budget = (window - margin) as u64;
+    let lines: Vec<&str> = match target {
+        OrderedValue::String(text) => text.split('\n').collect(),
+        _ => Vec::new(),
+    };
     let mut windows = Vec::new();
     for range in cut_windows(&costs, &empty, budget) {
         // A run of empty segments reads nothing.
-        if !range.clone().any(|i| crate::locate::has_content(target, i)) {
+        if !owned[range.clone()].iter().any(|&owns| owns) {
             continue;
         }
         let window_state = match target {
-            OrderedValue::String(text) => {
-                OrderedValue::String(text.split('\n').skip(range.start).take(range.len()).collect::<Vec<_>>().join("\n"))
-            }
+            OrderedValue::String(_) => OrderedValue::String(lines[range.clone()].join("\n")),
             OrderedValue::Array(items) => OrderedValue::Array(items[range.clone()].to_vec()),
             _ => unreachable!("a segmented target is a string or an array"),
         };
-        let twin = render_reading(server, &window_state, "", &content_free(), id, model.clone(), heads).await?;
-        if twin.span.len() > window_keys {
+        let baseline = render_reading(server, &window_state, "", &content_free(), id, model.clone(), heads).await?;
+        if baseline.span.len() > window {
+            // A window holds one segment past the budget only when that
+            // segment alone is: nothing smaller can be cut from it.
             return Err(Refusal::new(
                 "locate_segment_too_long",
                 format!(
-                    "question {id:?}: segments {}..{} of the target span {} keys read alone, past the {} a `locate` reads in one window; a single segment that long cannot be read",
-                    range.start,
-                    range.end,
-                    twin.span.len(),
-                    window_keys
+                    "question {id:?}: {} of the target span {} keys, past the {} a `locate` reads in one window, so it cannot be read",
+                    match range.len() {
+                        1 => format!("segment {}", range.start),
+                        _ => format!("segments {}..{}", range.start, range.end),
+                    },
+                    baseline.span.len(),
+                    window
                 ),
             ));
         }
-        within_context(server, id, &twin)?;
-        debug_assert_eq!(twin.keys.len(), range.len());
-        let LocatePrompt { ready, span, keys, .. } = twin;
-        windows.push(Window { first: range.start, state: window_state, within: String::new(), span, keys, twin: Some(ready), rows: None });
+        within_context(server, id, &baseline)?;
+        debug_assert_eq!(baseline.keys.len(), range.len());
+        let LocatePrompt { ready, span, keys, .. } = baseline;
+        windows.push(Window { first: range.start, state: window_state, within: String::new(), span, keys, baseline: Some(ready), rows: None });
     }
     Ok(Text { reading, merge: merge_rule, heads: heads.len(), segments, windows })
 }
 
 /// A question's reading prompt over every window of `text`, each checked
-/// against its window's twin: the two share every byte up to the
-/// instruction, so a question whose keys are not its twin's is answered
+/// against its window's baseline: the two share every byte up to the
+/// instruction, so a question whose keys are not its baseline's is answered
 /// with that error and never submitted.
 async fn prompts_for(
     server: &crate::Server,
@@ -405,7 +435,7 @@ async fn prompts_for(
         if (&prompt.span, &prompt.keys) != (&window.span, &window.keys) {
             prompt.ready.answered = Some(failed(
                 "locate_baseline_misaligned",
-                "the content-free twin's prompt maps the text onto other keys than this question's, so the two cannot be read against each other".to_owned(),
+                "the content-free baseline's prompt maps the text onto other keys than this question's, so the two cannot be read against each other".to_owned(),
             ));
         }
         prompts.push(Some(prompt.ready));
@@ -413,27 +443,27 @@ async fn prompts_for(
     Ok(prompts)
 }
 
-/// Put a text's windows to the engine, window by window: each window's twin
+/// Put a text's windows to the engine, window by window: each window's baseline
 /// (if not read yet) leading, then the prompt each question in `prompts`
-/// holds for it, which claim the prefix the twin kept. Every question's rows
+/// holds for it, which claim the prefix the baseline kept. Every question's rows
 /// land in its own map, by (text, window); the prompt tokens spent are
 /// returned.
 async fn read_windows(
     server: &crate::Server,
-    readings: &mut Readings,
+    shared: &mut Shared,
     text: usize,
-    questions: &mut [Question],
+    questions: &mut [Planned],
     mut prompts: Vec<(usize, Vec<Option<Rendered>>)>,
     class: ignis_core::types::RequestClass,
 ) -> u32 {
     let mut spent = 0u32;
-    let windows = readings.texts[text].windows.len();
+    let windows = shared.texts[text].windows.len();
     for w in 0..windows {
-        // Slot 0 is the twin, slot 1 + i the i-th question's prompt.
+        // Slot 0 is the baseline, slot 1 + i the i-th question's prompt.
         let mut items = Vec::new();
-        if let Some(twin) = readings.texts[text].windows[w].twin.take() {
-            spent = spent.saturating_add(twin.prompt_tokens);
-            items.push((0usize, twin, Collect::Rows));
+        if let Some(baseline) = shared.texts[text].windows[w].baseline.take() {
+            spent = spent.saturating_add(baseline.prompt_tokens);
+            items.push((0usize, baseline, Collect::Rows));
         }
         for (i, (who, per_window)) in prompts.iter_mut().enumerate() {
             if let Some(ready) = per_window.get_mut(w).and_then(Option::take) {
@@ -445,7 +475,7 @@ async fn read_windows(
         for (slot, reply) in led(server, items, class).await {
             let rows = rows_of(reply);
             match slot {
-                0 => readings.texts[text].windows[w].rows = Some(rows),
+                0 => shared.texts[text].windows[w].rows = Some(rows),
                 i => {
                     questions[prompts[i - 1].0].rows.insert((text, w), rows);
                 }
@@ -464,7 +494,7 @@ fn rows_of(reply: Reply) -> Result<AttentionScores, Answer> {
 }
 
 /// A question's merged reading of `text`: every window's rows read against
-/// its twin's ([`window_scores`]), merged ([`merge`]); `None` for a segment
+/// its baseline's ([`window_scores`]), merged ([`merge`]); `None` for a segment
 /// no window read. Or the failure of the first window that did not read.
 fn scores_of(
     text: &Text,
@@ -479,15 +509,15 @@ fn scores_of(
             Some(Err(failure)) => return Err(failure.clone()),
             None => return Err(failed("not_completed", "a window of this `locate`'s text was never read".to_owned())),
         };
-        let twin = match &window.rows {
-            Some(Ok(twin)) => twin,
+        let baseline = match &window.rows {
+            Some(Ok(baseline)) => baseline,
             Some(Err(Answer::Error { code, message })) => {
-                return Err(Answer::Error { code: code.clone(), message: format!("its content-free twin: {message}") });
+                return Err(Answer::Error { code: code.clone(), message: format!("its content-free baseline: {message}") });
             }
             Some(Err(other)) => return Err(other.clone()),
-            None => return Err(failed("not_completed", "this `locate`'s content-free twin was never read".to_owned())),
+            None => return Err(failed("not_completed", "this `locate`'s content-free baseline was never read".to_owned())),
         };
-        let read = match (asked.set_rows.as_deref(), twin.set_rows.as_deref()) {
+        let read = match (asked.set_rows.as_deref(), baseline.set_rows.as_deref()) {
             (Some(q), Some(na)) => window_scores(q, na, text.heads, &window.keys, text.reading),
             _ => None,
         };
@@ -495,7 +525,7 @@ fn scores_of(
             return Err(failed(
                 "attention_malformed",
                 format!(
-                    "the heads' rows were not {} whole rows over a window's key span in both this question's prefill and its content-free twin's",
+                    "the heads' rows were not {} whole rows over a window's key span in both this question's prefill and its content-free baseline's",
                     text.heads
                 ),
             ));
@@ -588,7 +618,7 @@ fn pick(probabilities: &[f64]) -> usize {
 }
 
 /// One labelled request's prompts, ready: the plain `choice`, and — on a
-/// route with `found` — its "none" twin and, for a folded log, the yes/no.
+/// route with `found` — its "none" variant and, for a folded log, the yes/no.
 struct Last {
     labels: Vec<String>,
     /// Each label's segment of the target.
@@ -603,8 +633,8 @@ struct Last {
 /// request log says of it, and the prompt tokens every step spent.
 pub(super) async fn answer_all(
     server: &crate::Server,
-    mut questions: Vec<Question>,
-    mut readings: Readings,
+    mut questions: Vec<Planned>,
+    mut shared: Shared,
     calibration: LocateCalibration,
     model: Option<String>,
     class: ignis_core::types::RequestClass,
@@ -620,7 +650,7 @@ pub(super) async fn answer_all(
         }
     }
     for (text, prompts) in by_text {
-        spent = spent.saturating_add(read_windows(server, &mut readings, text, &mut questions, prompts, class).await);
+        spent = spent.saturating_add(read_windows(server, &mut shared, text, &mut questions, prompts, class).await);
     }
 
     // 2. A fold's level 1: the heads' first five templates, or all of them,
@@ -629,14 +659,14 @@ pub(super) async fn answer_all(
     let mut template = vec![0usize; count];
     let mut asked: Vec<(usize, Vec<usize>, PreparedQuestion, Rendered)> = Vec::new();
     for (index, question) in questions.iter_mut().enumerate() {
-        let Route::Folded(folded) = &question.route else {
+        let Steps::Folded(folded) = &question.steps else {
             continue;
         };
         let folded = folded.clone();
         let kept: Vec<usize> = match question.first {
-            Some(text) => match shortlisted(&readings, text, &question.rows, SHORTLIST_TEMPLATES) {
+            Some(text) => match shortlisted(&shared, text, &question.rows, SHORTLIST_TEMPLATES) {
                 Ok(kept) => {
-                    question.stats.windows += readings.texts[text].windows.len();
+                    question.stats.windows += shared.texts[text].windows.len();
                     kept
                 }
                 Err(failure) => {
@@ -696,7 +726,7 @@ pub(super) async fn answer_all(
     let mut members: Vec<Vec<Vec<usize>>> = vec![Vec::new(); count];
     let mut second: BTreeMap<usize, Vec<(usize, Vec<Option<Rendered>>)>> = BTreeMap::new();
     for (index, question) in questions.iter_mut().enumerate() {
-        let Route::Folded(folded) = &question.route else {
+        let Steps::Folded(folded) = &question.steps else {
             continue;
         };
         if question.failure.is_some() {
@@ -710,9 +740,10 @@ pub(super) async fn answer_all(
         if rows.texts.len() > SHORTLIST_LEN {
             let lines: Vec<String> = rows.texts.iter().map(|line| one_line(line)).collect();
             let key = format!("level2\u{0}{}\u{0}{chosen}", question.within);
-            let opened = open_level(server, &mut readings, key, &lines, calibration, model.clone(), &question.id).await;
+            let opened =
+                open_level(server, &mut shared, key, &lines, false, calibration, model.clone(), &question.id).await;
             let prompts = match opened {
-                Ok(text) => prompts_for(server, &readings.texts[text], &question.instruction, calibration, model.clone(), &question.id)
+                Ok(text) => prompts_for(server, &shared.texts[text], &question.instruction, calibration, model.clone(), &question.id)
                     .await
                     .map(|prompts| (text, prompts)),
                 Err(refusal) => Err(refusal),
@@ -730,15 +761,15 @@ pub(super) async fn answer_all(
         members[index] = rows.members;
     }
     for (text, prompts) in second {
-        spent = spent.saturating_add(read_windows(server, &mut readings, text, &mut questions, prompts, class).await);
+        spent = spent.saturating_add(read_windows(server, &mut shared, text, &mut questions, prompts, class).await);
     }
     for (index, question) in questions.iter_mut().enumerate() {
         let Some(text) = question.second.filter(|_| question.failure.is_none()) else {
             continue;
         };
-        match shortlisted(&readings, text, &question.rows, SHORTLIST_LEN) {
+        match shortlisted(&shared, text, &question.rows, SHORTLIST_LEN) {
             Ok(kept) => {
-                question.stats.windows += readings.texts[text].windows.len();
+                question.stats.windows += shared.texts[text].windows.len();
                 kept_rows[index] = kept;
             }
             Err(failure) => question.fail(failure),
@@ -746,14 +777,14 @@ pub(super) async fn answer_all(
     }
 
     // 4. The last request: the plain `choice` over the candidates, with its
-    //    "none" twin and the yes/no where the route carries `found`.
+    //    "none" variant and the yes/no where the route carries `found`.
     let mut lasts: Vec<Option<Last>> = Vec::with_capacity(count);
     for (index, question) in questions.iter_mut().enumerate() {
         if question.failure.is_some() {
             lasts.push(None);
             continue;
         }
-        match last_request(server, question, &readings, &kept_rows[index], &members[index], model.clone()).await {
+        match last_request(server, question, &shared, &kept_rows[index], &members[index], model.clone()).await {
             Ok(last) => {
                 for ready in &last.prompts {
                     spent = spent.saturating_add(ready.prompt_tokens);
@@ -768,7 +799,7 @@ pub(super) async fn answer_all(
         }
     }
     // Every question's plain `choice` first — each keeps its candidates'
-    // text — then its "none" twin and its yes/no, which claim it.
+    // text — then its "none" variant and its yes/no, which claim it.
     let mut leaders = Vec::new();
     let mut followers = Vec::new();
     for (index, last) in lasts.iter_mut().enumerate() {
@@ -803,13 +834,7 @@ pub(super) async fn answer_all(
         let summary = Summary {
             kind: question.kind,
             compression: question.compression,
-            windows: question.stats.windows,
-            templates: question.stats.templates,
-            template: question.stats.template,
-            rows: question.stats.rows,
-            candidates: std::mem::take(&mut question.stats.candidates),
-            p_none: question.stats.p_none,
-            p_yes: question.stats.p_yes,
+            stats: std::mem::take(&mut question.stats),
             tokens: question.tokens,
         };
         out.push((question.slot, answer, summary));
@@ -817,7 +842,7 @@ pub(super) async fn answer_all(
     (out, spent)
 }
 
-/// The most steps a last request asks: the plain `choice`, its "none" twin
+/// The most steps a last request asks: the plain `choice`, its "none" variant
 /// and the yes/no.
 const STEPS: usize = 3;
 
@@ -834,23 +859,22 @@ fn answer_of(reply: Reply) -> Answer {
 /// asked over them.
 async fn last_request(
     server: &crate::Server,
-    question: &mut Question,
-    readings: &Readings,
+    question: &mut Planned,
+    shared: &Shared,
     kept_rows: &[usize],
     members: &[Vec<usize>],
     model: Option<String>,
 ) -> Result<Last, Answer> {
-    let segments: Vec<usize> = match &question.route {
-        // Each kept row's first line, as the caller sent it.
-        Route::Folded(folded) => {
-            let mut firsts: Vec<usize> = kept_rows.iter().map(|&row| folded.segment[members[row][0]]).collect();
-            firsts.sort_unstable();
-            firsts
+    let segments: Vec<usize> = match &question.steps {
+        // Each kept row's first line, as the caller sent it (the map from
+        // folded lines to segments keeps their order).
+        Steps::Folded(folded) => {
+            rows_first_lines(members, kept_rows).into_iter().map(|line| folded.segment[line]).collect()
         }
-        Route::Read => {
+        Steps::Read => {
             let text = question.first.expect("a read route reads its target");
-            let (scores, owned) = scores_of(&readings.texts[text], text, &question.rows)?;
-            question.stats.windows += readings.texts[text].windows.len();
+            let (scores, owned) = scores_of(&shared.texts[text], text, &question.rows)?;
+            question.stats.windows += shared.texts[text].windows.len();
             let prose = question.kind == Kind::Prose;
             let candidate: Vec<bool> =
                 (0..scores.len()).map(|i| owned[i] && !(prose && question.texts[i].starts_with("# "))).collect();
@@ -860,8 +884,8 @@ async fn last_request(
     question.stats.candidates.push(segments.clone());
     let labels: Vec<String> =
         server.alphabet.take(segments.len()).expect("checked at plan").iter().map(|answer| answer.label.clone()).collect();
-    let (text, segments) = match (question.kind, &question.route) {
-        (Kind::Prose, Route::Read) => in_paragraphs(&question.texts, &segments, &labels),
+    let (text, segments) = match (question.kind, &question.steps) {
+        (Kind::Prose, Steps::Read) => in_paragraphs(&question.texts, &segments, &labels),
         _ => {
             let lines: Vec<String> = segments.iter().map(|&s| one_line(&question.texts[s])).collect();
             (labelled(&lines, &labels), segments)
@@ -889,12 +913,12 @@ async fn last_request(
 /// The first `k` candidates of a question's merged reading of text
 /// `index` (every segment a window read and owning keys), in document order.
 fn shortlisted(
-    readings: &Readings,
+    shared: &Shared,
     index: usize,
     rows: &HashMap<(usize, usize), Result<AttentionScores, Answer>>,
     k: usize,
 ) -> Result<Vec<usize>, Answer> {
-    let (scores, owned) = scores_of(&readings.texts[index], index, rows)?;
+    let (scores, owned) = scores_of(&shared.texts[index], index, rows)?;
     Ok(shortlist(&scores, &owned, k))
 }
 
@@ -902,14 +926,8 @@ fn shortlisted(
 pub(super) struct Summary {
     pub(super) kind: Kind,
     pub(super) compression: Compression,
-    pub(super) windows: usize,
-    pub(super) templates: Option<usize>,
-    pub(super) template: Option<usize>,
-    pub(super) rows: Option<usize>,
-    pub(super) candidates: Vec<Vec<usize>>,
-    pub(super) p_none: Option<f64>,
-    pub(super) p_yes: Option<f64>,
-    /// Prompt tokens this question's own steps spent (its twins aside).
+    pub(super) stats: Stats,
+    /// Prompt tokens this question's own steps spent (its baselines aside).
     pub(super) tokens: u32,
 }
 
@@ -919,7 +937,7 @@ pub(super) struct Summary {
 /// the route carries it. Below [`FOUND_THRESHOLD`] nothing is named and the
 /// ranking stays.
 fn assemble(
-    question: &mut Question,
+    question: &mut Planned,
     last: &Last,
     replies: &HashMap<(usize, usize), Answer>,
     index: usize,
@@ -996,8 +1014,8 @@ fn assemble(
 mod tests {
     use super::*;
 
-    fn question(kind: Kind, compression: Compression, values: &[&str]) -> Question {
-        Question {
+    fn question(kind: Kind, compression: Compression, values: &[&str]) -> Planned {
+        Planned {
             slot: 0,
             id: "q".to_owned(),
             instruction: OrderedValue::String("which".to_owned()),
@@ -1006,7 +1024,7 @@ mod tests {
             compression,
             values: values.iter().map(|v| OrderedValue::String((*v).to_owned())).collect(),
             texts: values.iter().map(|v| (*v).to_owned()).collect(),
-            route: Route::Read,
+            steps: Steps::Read,
             first: None,
             prompts: Vec::new(),
             second: None,
@@ -1032,7 +1050,7 @@ mod tests {
 
     /// Spec 22 § The wire: the pick first, every share on the scale of the
     /// fold's level-1 pick, pointers at 0.05 and up, `found` from the "none"
-    /// twin and the yes/no.
+    /// baseline and the yes/no.
     #[test]
     fn a_found_answer_names_its_pick_its_ranking_and_its_pointers() {
         let mut q = question(Kind::Log, Compression::TemplateFold, &["a", "b", "c", "d"]);

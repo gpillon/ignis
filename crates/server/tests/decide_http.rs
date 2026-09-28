@@ -2852,7 +2852,7 @@ async fn every_shortlist_refusal_comes_before_any_prefill() {
 }
 
 /// Spec 22 § Windows: a text longer than one window is read window by
-/// window — each its own prefill and its own twin — and answered with an
+/// window — each its own prefill and its own baseline — and answered with an
 /// index into the state as sent. Prose is cut at its paragraph breaks,
 /// records at record boundaries.
 #[tokio::test]
@@ -2876,8 +2876,8 @@ async fn a_target_longer_than_a_window_is_read_in_windows_and_answered_in_the_or
         assert_eq!(answer["kind"], kind, "{response}");
         check_answer(answer, &segments);
         let reads = attention_jobs(&compute);
-        assert!(reads.len() >= 6, "{kind}: at least three windows, each with its twin: {reads:?}");
-        assert_eq!(reads.len() % 2, 0, "{kind}: a twin per window: {reads:?}");
+        assert!(reads.len() >= 6, "{kind}: at least three windows, each with its baseline: {reads:?}");
+        assert_eq!(reads.len() % 2, 0, "{kind}: a baseline per window: {reads:?}");
         for (_, query) in &reads {
             assert!(query.key_count <= 60, "{kind}: a window reads at most its keys: {query:?}");
         }
@@ -2887,7 +2887,7 @@ async fn a_target_longer_than_a_window_is_read_in_windows_and_answered_in_the_or
 /// Spec 22 § The labelled `choice`: a fold's level 2 is read after its level
 /// 1 is answered — the end heads over the templates, the `choice` among
 /// five, the end heads over the chosen template's rows — and the last
-/// request asks the plain `choice`, its "none" twin and the yes/no.
+/// request asks the plain `choice`, its "none" variant and the yes/no.
 #[tokio::test]
 async fn a_folds_level_two_is_read_after_its_level_one_and_the_last_request_asks_three() {
     // Seven templates of twenty rows: past five templates and sixteen rows.
@@ -2920,7 +2920,7 @@ async fn a_folds_level_two_is_read_after_its_level_one_and_the_last_request_asks
 }
 
 /// Spec 22 § Not found: the last request of prose and of records asks the
-/// plain `choice` and its "none" twin; a log read without a fold asks the
+/// plain `choice` and its "none" variant; a log read without a fold asks the
 /// plain `choice` alone, and answers without `found`.
 #[tokio::test]
 async fn the_last_request_asks_what_its_route_measured() {
@@ -2936,18 +2936,18 @@ async fn the_last_request_asks_what_its_route_measured() {
         assert_eq!(status, 200, "{response}");
         let readouts = readout_jobs(&compute);
         assert_eq!(readouts.len(), asked.iter().filter(|a| **a).count(), "{fields}: {readouts:?}");
-        // The "none" twin names one answer more than the plain `choice`.
+        // The "none" variant names one answer more than the plain `choice`.
         if asked[1] {
             assert_eq!(readouts[1].1, readouts[0].1 + 1, "{fields}: {readouts:?}");
         }
     }
 }
 
-/// Spec 22 § Fan-out: the fold is computed once and a fold's level-1 twin
+/// Spec 22 § Fan-out: the fold is computed once and a fold's level-1 baseline
 /// read once for every question over the log; each question's own reading
-/// claims the text the twin kept.
+/// claims the text the baseline kept.
 #[tokio::test]
-async fn questions_over_one_log_share_its_fold_and_its_level_one_twin() {
+async fn questions_over_one_log_share_its_fold_and_its_level_one_baseline() {
     let log = log_lines(7, 3);
     let compute = calibrated_compute();
     let body = decide_body(
@@ -2958,14 +2958,14 @@ async fn questions_over_one_log_share_its_fold_and_its_level_one_twin() {
     let (status, response) = decide(&app(compute.clone()), &body).await;
     assert_eq!(status, 200, "{response}");
     let reads = attention_jobs(&compute);
-    // Level 1: one twin and two questions over the same span; no level 2 —
+    // Level 1: one baseline and two questions over the same span; no level 2 —
     // three rows per template.
     assert_eq!(reads.len(), 3, "{reads:?}");
     assert!(reads.iter().all(|(_, query)| query.key_count == reads[0].1.key_count), "{reads:?}");
     let totals = prefilled(&compute);
     let (first, rest) = (reads[0].0, &reads[1..]);
     for (request, _) in rest {
-        assert!(totals[request] < totals[&first], "request {request} claimed the twin's text: {totals:?}");
+        assert!(totals[request] < totals[&first], "request {request} claimed the baseline's text: {totals:?}");
     }
 }
 
@@ -3044,4 +3044,29 @@ async fn a_shortlist_is_counted_once_as_a_locate_and_by_its_route() {
         "1",
         "{after}"
     );
+}
+
+/// Spec 22 § Not found, over the mock: an answer whose `found` is below 0.5
+/// names no segment, no value, no confidence and no pointer, and keeps its
+/// ranking. The mock's readouts are deterministic noise, so a fixed fan-out
+/// of questions holds some answered and some not found; every one is checked.
+#[tokio::test]
+async fn a_not_found_answer_names_nothing_and_keeps_its_ranking() {
+    let compute = calibrated_compute();
+    let questions: Vec<String> = (0..12)
+        .map(|n| format!(r#""q{n}":{{"type":"locate","instructions":"which line number {n} failed","kind":"prose"}}"#))
+        .collect();
+    let body = decide_body(&text_state(&prose_lines(3)), &questions.join(","));
+    let (status, response) = decide(&app(compute), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answers: Vec<&JsonValue> = (0..12).map(|n| &response["answers"][format!("q{n}")]).collect();
+    let missing: Vec<&&JsonValue> = answers.iter().filter(|a| a["found"].as_f64().is_some_and(|f| f < 0.5)).collect();
+    assert!(!missing.is_empty(), "the fixed fan-out holds a not-found answer: {response}");
+    for answer in missing {
+        assert_eq!(answer["segment"], JsonValue::Null, "{answer}");
+        assert_eq!(answer["value"], JsonValue::Null, "{answer}");
+        assert_eq!(answer["confidence"], JsonValue::Null, "{answer}");
+        assert_eq!(answer["pointers"], json!([]), "{answer}");
+        assert!(!answer["ranking"].as_array().unwrap().is_empty(), "the ranking is kept: {answer}");
+    }
 }

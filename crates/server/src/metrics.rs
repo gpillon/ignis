@@ -162,6 +162,8 @@ impl Primitive {
     }
 }
 
+use ignis_core::locate::{Compression, Kind, Method};
+
 /// Whether a served `locate` found its answer (GitHub #278):
 /// `ignis_locates_total`'s `found` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,19 +189,25 @@ impl LocateFound {
 /// Every `ignis_locates_total` series that can move (GitHub #278, spec 22):
 /// the routes the endpoint serves — a fold of prose and a fold under the
 /// vote are refused — each with the `found` values it can report.
-const LOCATE_SERIES: [(&str, &str, &str, LocateFound); 11] = [
-    ("log", "shortlist", "template_fold", LocateFound::True),
-    ("log", "shortlist", "template_fold", LocateFound::False),
-    ("log", "shortlist", "none", LocateFound::Unmeasured),
-    ("prose", "shortlist", "none", LocateFound::True),
-    ("prose", "shortlist", "none", LocateFound::False),
-    ("records", "shortlist", "none", LocateFound::True),
-    ("records", "shortlist", "none", LocateFound::False),
-    ("records", "shortlist", "template_fold", LocateFound::Unmeasured),
-    ("log", "vote", "none", LocateFound::Unmeasured),
-    ("prose", "vote", "none", LocateFound::Unmeasured),
-    ("records", "vote", "none", LocateFound::Unmeasured),
-];
+const LOCATE_SERIES: [(Kind, Method, Compression, LocateFound); 11] = {
+    use Compression::{None as Whole, TemplateFold as Fold};
+    use Kind::{Log, Prose, Records};
+    use LocateFound::{False, True, Unmeasured};
+    use Method::{Shortlist, Vote};
+    [
+        (Log, Shortlist, Fold, True),
+        (Log, Shortlist, Fold, False),
+        (Log, Shortlist, Whole, Unmeasured),
+        (Prose, Shortlist, Whole, True),
+        (Prose, Shortlist, Whole, False),
+        (Records, Shortlist, Whole, True),
+        (Records, Shortlist, Whole, False),
+        (Records, Shortlist, Fold, Unmeasured),
+        (Log, Vote, Whole, Unmeasured),
+        (Prose, Vote, Whole, Unmeasured),
+        (Records, Vote, Whole, Unmeasured),
+    ]
+};
 
 /// `ignis_decision_answer_mass`' bucket boundaries (ADR 0017 as amended by
 /// #241), in millionths.
@@ -463,11 +471,11 @@ impl Metrics {
     /// answer. Counted beside `ignis_decisions_total{type="locate"}`, which
     /// still counts it once as a decision. A combination the endpoint never
     /// serves is not counted — it has no series.
-    pub fn record_locate(&self, kind: &str, method: &str, compression: &str, found: LocateFound) {
+    pub fn record_locate(&self, kind: Kind, method: Method, compression: Compression, found: LocateFound) {
         let at = LOCATE_SERIES
             .iter()
-            .position(|&(k, m, c, f)| (k, m, c, f) == (kind, method, compression, found));
-        debug_assert!(at.is_some(), "{kind} {method} {compression} {found:?} is a route the endpoint serves");
+            .position(|&series| series == (kind, method, compression, found));
+        debug_assert!(at.is_some(), "{kind:?} {method:?} {compression:?} {found:?} is a route the endpoint serves");
         if let Some(at) = at {
             self.locates[at].fetch_add(1, Ordering::Relaxed);
         }
@@ -878,7 +886,10 @@ impl Metrics {
             for ((kind, method, compression, found), series) in LOCATE_SERIES.iter().zip(&self.locates) {
                 let _ = writeln!(
                     out,
-                    "ignis_locates_total{{kind=\"{kind}\",method=\"{method}\",compression=\"{compression}\",found=\"{}\"}} {}",
+                    "ignis_locates_total{{kind=\"{}\",method=\"{}\",compression=\"{}\",found=\"{}\"}} {}",
+                    kind.label(),
+                    method.label(),
+                    compression.label(),
                     found.label(),
                     read(series)
                 );
@@ -967,7 +978,7 @@ mod tests {
         );
         // And the locate family (GitHub #278), on the same terms.
         let located = Metrics::new();
-        located.record_locate("prose", "shortlist", "none", LocateFound::False);
+        located.record_locate(Kind::Prose, Method::Shortlist, Compression::None, LocateFound::False);
         declared_once(&located.render(), &[("ignis_locates_total", "counter")]);
         // And the forced-close counter (spec server/08), on the same terms.
         let forced = Metrics::new();
@@ -982,9 +993,9 @@ mod tests {
     fn the_locate_counter_is_absent_until_a_locate_and_counts_by_route() {
         let metrics = Metrics::new();
         assert!(!metrics.render().contains("ignis_locates_total"));
-        metrics.record_locate("log", "shortlist", "template_fold", LocateFound::True);
-        metrics.record_locate("log", "shortlist", "template_fold", LocateFound::True);
-        metrics.record_locate("records", "vote", "none", LocateFound::Unmeasured);
+        metrics.record_locate(Kind::Log, Method::Shortlist, Compression::TemplateFold, LocateFound::True);
+        metrics.record_locate(Kind::Log, Method::Shortlist, Compression::TemplateFold, LocateFound::True);
+        metrics.record_locate(Kind::Records, Method::Vote, Compression::None, LocateFound::Unmeasured);
         let text = metrics.render();
         let series: Vec<&str> = text.lines().filter(|line| line.starts_with("ignis_locates_total{")).collect();
         assert_eq!(series.len(), LOCATE_SERIES.len(), "{text}");

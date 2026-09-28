@@ -2,7 +2,7 @@
 //! **shortlist** they keep (spec 22, GitHub #278, ADR 0042).
 //!
 //! A reading is a **lift**, as the vote's: each head's attention row at the
-//! copy scaffold, less the content-free twin's, **standardized over the
+//! copy scaffold, less the content-free baseline's, **standardized over the
 //! window's segments** and summed over the heads. Two readings:
 //!
 //! - the **end reading** (logs, records) scores a segment by where it
@@ -77,7 +77,7 @@ fn features(row: &[f32], keys: &[Option<Range<usize>>], reading: Reading) -> Vec
 }
 
 /// One window's reading (`zsum(lift).sum(heads)`): per segment, each head's
-/// lift of the question over the content-free twin, standardized over the
+/// lift of the question over the content-free baseline, standardized over the
 /// window's segments that own keys, summed over the heads — and
 /// [`UNOWNED_HEAD_SCORE`] per head for a segment that owns none.
 ///
