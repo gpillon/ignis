@@ -61,6 +61,8 @@ describe("MonitorView", () => {
     expect(html).toContain("KV pool");
     // The prefix miss series is zero by construction, and says so.
     expect(html).toContain("not measured");
+    // GitHub #281: of the 10 slots, 8 on the host in 1.73 GiB pinned, 2 in VRAM.
+    expect(html).toContain("8 on the host (1.73 GiB pinned), 2 in VRAM");
     // 12 + 5 + 1 skips, beside the slots rather than in a corner of their own.
     expect(html).toContain("publishes and captures found no room since start");
     expect(html).toContain("A prefix found no slot to publish into");

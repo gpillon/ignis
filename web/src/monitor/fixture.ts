@@ -110,6 +110,12 @@ ignis_kv_ram_arena_bytes{state="used"} 2147483648
 # TYPE ignis_retained_slots gauge
 ignis_retained_slots{state="capacity"} 10
 ignis_retained_slots{state="in_use"} 7
+# HELP ignis_retained_host_slots Of the retained slots, those whose images live in the pinned host block.
+# TYPE ignis_retained_host_slots gauge
+ignis_retained_host_slots 8
+# HELP ignis_retained_host_bytes The pinned host block holding the host retained slots' images.
+# TYPE ignis_retained_host_bytes gauge
+ignis_retained_host_bytes 1860257792
 # HELP ignis_requests_rejected_total Rejected submissions by fixed reason.
 # TYPE ignis_requests_rejected_total counter
 ignis_requests_rejected_total{reason="full"} 6
