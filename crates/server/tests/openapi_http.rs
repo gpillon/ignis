@@ -239,6 +239,60 @@ fn the_decision_endpoint_documents_how_a_locate_is_answered() {
     assert!(description.contains("locate") && description.contains("content-free"), "{description}");
 }
 
+/// GitHub #278 (spec 22): a `locate`'s `kind`, `method` and `compression`,
+/// its answer's `found` and `pointers`, and the refusals they can earn are
+/// part of the contract, readable without the source.
+#[test]
+fn the_decision_endpoint_documents_the_shortlist() {
+    let document = document();
+    let schemas = &document["components"]["schemas"];
+    for field in ["kind", "compression", "method"] {
+        assert!(schemas["Question"]["properties"][field].is_object(), "a question documents `{field}`: {}", schemas["Question"]);
+    }
+    for (schema, values) in [
+        ("LocateKindField", &["auto", "log", "prose", "records"][..]),
+        ("QuestionMethod", &["head", "chain", "shortlist", "vote"][..]),
+        ("LocateCompression", &["template_fold", "none"][..]),
+        ("LocateKind", &["log", "prose", "records"][..]),
+        ("LocateMethod", &["shortlist", "vote"][..]),
+    ] {
+        let text = schemas[schema].to_string();
+        for value in values {
+            assert!(text.contains(value), "{schema} names {value}: {text}");
+        }
+    }
+    assert!(!schemas["LocateKind"]["enum"].to_string().contains("auto"), "an answer never says auto: {}", schemas["LocateKind"]);
+    let variants = schemas["Answer"]["oneOf"].as_array().expect("Answer is a tagged union");
+    let located = variants
+        .iter()
+        .find(|variant| variant.to_string().contains(r#""enum":["locate"]"#))
+        .expect("a locate variant");
+    for field in ["kind", "method", "compression", "found", "pointers", "segment", "value", "confidence", "ranking"] {
+        assert!(located["properties"][field].is_object(), "the locate answer documents `{field}`: {located}");
+    }
+    assert!(!located["required"].to_string().contains("found"), "found rides three routes only: {located}");
+    let pointer = schemas["LocatePointer"].to_string();
+    for field in ["segment", "value", "share"] {
+        assert!(pointer.contains(field), "LocatePointer documents `{field}`: {pointer}");
+    }
+    let refused = document["paths"]["/v1/decide"]["post"]["responses"]["422"]["description"].to_string();
+    for code in [
+        "kind_unknown",
+        "kind_unsupported",
+        "kind_mismatch",
+        "method_unknown",
+        "compression_unknown",
+        "compression_unsupported",
+        "locate_segment_too_long",
+    ] {
+        assert!(refused.contains(code), "the 422 names `{code}`: {refused}");
+    }
+    let description = document["paths"]["/v1/decide"]["post"]["description"].to_string();
+    for words in ["shortlist", "template_fold", "found", "pointers", "200,000"] {
+        assert!(description.contains(words), "the description says `{words}`: {description}");
+    }
+}
+
 /// GitHub #270: a `state` part's reuse marker and the two refusals it can
 /// earn are part of the contract, readable without the source.
 #[test]
