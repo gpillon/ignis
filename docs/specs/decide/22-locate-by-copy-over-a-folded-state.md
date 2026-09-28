@@ -14,6 +14,53 @@
 > R3's, P3's and J3's manifest hashes are recorded in this banner. A failed
 > rule is reported as failed and the defaults do not ship until the owner
 > decides; this spec does not pre-decide a fallback.
+>
+> **Sets registered 2026-09-28, before any route was asked on them** (the
+> builders and the judge: commits da56f5c and e9e317e — `r3set.py`,
+> `accept22.py`, `r3_judge.py`; `prosehay.py`, `zd_prose_nf.py` and
+> `zd_records.py` unchanged). Manifest sha256:
+>
+> - **R3** `19ee6376a81567ec4c9b4955e762800d9fb3cc46118d1b1cc3f6a71897edc9a2`
+>   (`r3set.py build`: windows `bd66600822c15069f0672cfef47294fdb2f5b42ff828d41aa97138597f39e7a9`,
+>   questions `126fbc57f3880c30af15d52191a7aa7e8fc1716eb165f8264c97e419d991bc1b`):
+>   a capture of the owner's cluster on 2026-09-28, 12:45-12:46Z,
+>   `--since=6h --timestamps`, 147 running pods, read only (287,001 lines
+>   merged); the full LogHub logs, Zenodo record 8196385. 42 windows (10
+>   cluster, 32 LogHub), 127 targets drawn; **120 present** questions (39
+>   cluster, 81 LogHub), 120 target-removed and 42 authored absent; 16
+>   windows at 100K tokens hold a present question. **Shortfalls the
+>   sources forced:** three windows drew no target (HPC 100K, Zookeeper 100K
+>   and 200K: every line repeats another but for numbers) and 7 drawn
+>   targets were dropped because no question can single them out (each
+>   shares every content word with another line: c0050k-0:381,
+>   h-hadoop-100k:158, h-mac-100k:315, h-mac-200k:121,
+>   h-proxifier-100k:1613, h-proxifier-200k:598, h-windows-100k:220).
+>   **Two departures from § Set R3, decided before any run:** a LogHub
+>   system's stream is the first 8 MB of its log with every line of its 2k
+>   sample removed — so "sharing no line with that system's 2k sample" holds
+>   by removal, and a LogHub window is the log less those lines (0 to 6,006
+>   per system with the blank ones, most about 2,000), not always a
+>   contiguous stretch; and past
+>   100K tokens a window's targets are drawn from 400 sampled eligible
+>   lines, `r2set.py`'s sibling count being quadratic in the window
+>   (`z23_r4.py` sampled 120 for R4).
+> - **P3** `34eea67ae01f7607834eed451c97927c85f3c2d8f0e90d4265d7d8f90ad1d721`
+>   (108 present questions over 18 windows; E1-E3 excluded with A-F, P and
+>   P2), and its absent set
+>   `e249c30a553b7420b02bf07fc2ddfeecd2a159c0ec76319cceeea27b92136cff`
+>   (72 gold-removed, 12 from another 200K window).
+> - **J3** `a8f7d66f3beda649c7e00cf5c82c7abef712c8d3dfece56428b1e2186d956481`
+>   (9 arrays, 90 present and 18 absent questions).
+>
+> **What the implementation decided before the runs** (and the acceptance
+> therefore judges): a window is `LOCATE_WINDOW_KEYS` less a margin of an
+> eighth, at most 256 keys, and less still on a load whose context would not
+> hold it (P3's 200K windows, ~200,100 tokens, read as two); one segment
+> longer than a window is refused (`locate_segment_too_long`, § Refusals); a
+> fold's level-1 text past the context is refused and a level-2 text past a
+> window is windowed; a step rendered from an earlier step's answer (a
+> fold's level 2, every `choice`) that faults answers its question with an
+> error rather than a 422, since it runs after a prefill.
 
 GitHub: #278. ADR: [0042](../../adr/0042-locate-copies-over-a-folded-state.md) (Proposed, revised).
 Later: a constrained copy (`method: "copy"`) is a future study, #279.
@@ -259,6 +306,7 @@ value as the caller sent it.
   | `kind_mismatch` | `kind: "records"` on a state that is not a records array (§ `auto`), or `kind: "log"` / `"prose"` on one (a records array is read as records; the fold of it is `records` + `template_fold`) |
   | `locate_uncalibrated` | the load has no `locate` calibration — for either method: both read heads |
   | `locate_too_long` | `vote` only, as today: the target past `LOCATE_MAX_KEYS` |
+  | `locate_segment_too_long` | one segment longer than a window: nothing smaller can be cut from it |
   | `context_exceeded` | a level-1 text, a level-2 text or a `choice` prompt past the context (a fold's level-2 text past `LOCATE_WINDOW_KEYS` is windowed, not refused) |
   | `locate_too_few_segments` | fewer than two segments with content (unchanged) |
   | `locate_unsupported` | the loaded template cannot say where its tokens sit (unchanged) |
