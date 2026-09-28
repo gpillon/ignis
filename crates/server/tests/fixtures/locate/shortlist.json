@@ -1,0 +1,44 @@
+{
+  "source": "hand-written for GitHub #278 (spec 22 acceptance 5): synthetic states, never a cluster line",
+  "states": {
+    "prose": [
+      "# The Brennan Bridge",
+      "The Brennan Bridge crosses the Tarrow river two miles north of Kilnagh.",
+      "Its engineer, Maud Ferris, designed the three stone arches after a flood took the ferry.",
+      "The bridge opened to traffic in 1937 and was widened in 1968.",
+      "",
+      "# The Kilnagh orchard",
+      "The orchard behind the old mill grows eleven kinds of apple.",
+      "Its oldest tree is a russet planted by the miller's daughter.",
+      "Every October the village presses the fallen fruit into cider.",
+      "",
+      "# The observatory on Carn Hill",
+      "A small observatory stands on the summit of Carn Hill.",
+      "Its brass telescope was bought second-hand from a college in Dublin.",
+      "On clear winter nights the volunteers open the dome to visitors.",
+      "",
+      "# The Tarrow ferry",
+      "Before the bridge, a flat-bottomed ferry carried carts across the river.",
+      "The ferryman charged a penny a wheel and nothing for a walker.",
+      "The last crossing was made in the spring of 1936.",
+      "",
+      "# The weaving school",
+      "The weaving school was founded by three sisters in an empty granary.",
+      "Its looms were built by a carpenter from the next valley.",
+      "The school still sells blankets dyed with heather and lichen.",
+      "",
+      "# The river festival",
+      "Each July the town holds a festival of boats on the Tarrow.",
+      "Children race wooden boats they carved themselves.",
+      "The winner rings the bell on the bridge at sunset."
+    ]
+  },
+  "questions": [
+    {"id": "log-present", "state": "log", "instruction": "Which payment of user u42 was declined?", "target": "declined"},
+    {"id": "log-absent", "state": "log", "instruction": "Which line says the disk on node db-7 is full?", "target": null},
+    {"id": "records-present", "state": "records", "instruction": "Which employee works from Reykjavik?", "target": "Reykjavik"},
+    {"id": "records-absent", "state": "records", "instruction": "Which employee works from Ulaanbaatar?", "target": null},
+    {"id": "prose-present", "state": "prose", "instruction": "In which year did the Brennan Bridge open to traffic?", "target": "opened to traffic in 1937"},
+    {"id": "prose-absent", "state": "prose", "instruction": "How many people live in the town of Ardmere?", "target": null}
+  ]
+}

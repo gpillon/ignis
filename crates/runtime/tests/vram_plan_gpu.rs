@@ -187,11 +187,15 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
     // where the unbounded envelope reserved 2,219,837,184 B.
     const ITEM_BOUND: u32 = 16_384;
     let bounded = reserved(1024, MAX_CONTEXT, Some(vision.with_item_max_tokens(ITEM_BOUND)));
+    // GitHub #278: the text room's scores, sized for the shortlist's
+    // 200,000-key window, already hold an item's 16,384 — so the bounded
+    // encoder adds nothing at all beside them.
     assert_eq!(
         bounded.workspace,
-        text.workspace + u64::from(ITEM_BOUND) * 4 - text_scores,
+        text.workspace + (u64::from(ITEM_BOUND) * 4).saturating_sub(text_scores),
         "an item-bounded encoder fits the prefill scratch"
     );
+    assert_eq!(bounded.workspace, text.workspace, "the item's scores fit the text room's");
     assert_eq!(bounded.media_embedding, with_vision.media_embedding, "the pool keeps the envelope's floor");
 
     // A short context caps the envelope, and with it the item, below the
