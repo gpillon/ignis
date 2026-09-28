@@ -88,7 +88,7 @@ Three fields on a `locate` question, all enums, all optional:
 
 | | `kind: log` | `kind: prose` | `kind: records` |
 |---|---|---|---|
-| **`shortlist` + `template_fold`** | (default) fold; the **end heads** read the templates and keep 5; a labelled `choice` picks one; its rows (values): the end heads keep 16 (all when ≤ 16); a last labelled `choice` over **those rows' original lines** picks the line; `found` | refused: prose does not fold | opt-in: the `log` route over the records as spaced-JSON lines (52/60 against 58/60, no long prefill); no `found` |
+| **`shortlist` + `template_fold`** | (default) fold; the **end heads** read the templates and keep 5; a labelled `choice` picks one; its rows (values): the end heads keep 16 (all when ≤ 16); a last labelled `choice` over **those rows' original lines** picks the line; `found` | refused: prose does not fold | opt-in: the `log` route over the records as spaced-JSON lines, its last `choice` over the original lines as for a log (measured 52/60 with the older last step over the rows' values, against 58/60; no long prefill); no `found` |
 | **`shortlist` + `none`** | the end heads read the whole target in windows and keep 16 lines; a labelled `choice`; no `found` | (default) the **sum heads** read the target in windows and keep 16 sentences; a labelled `choice` over them *in their paragraphs*; pointers at p ≥ 0.05; `found` | (default) the **end heads** read the array in windows and keep 16 records; a labelled `choice` over them as spaced-JSON lines; `found` |
 | **`vote` + `none`** | today's `locate`, byte for byte, whatever the kind; no `found` | the same | the same |
 | **`vote` + `template_fold`** | refused (read 28 of R2's 58) | refused | refused |
@@ -408,8 +408,8 @@ for `prose` + `none` and `records` + `none`; not found below **0.5**. Neither
 rule is calibrated: they are the rules the third round measured (the log one
 chosen after seeing R4, the acceptance below judges it fresh). A route
 without a measured rule answers without `found`: `log` + `none`, `records` +
-`template_fold` (its "none" was measured over the rows' values: 35 of 60
-present kept), and the vote.
+`template_fold` (its "none" was measured only over the rows' values, 35 of
+60 present kept, never over its original lines), and the vote.
 
 ### Fan-out, reuse and cost
 
@@ -419,8 +419,10 @@ present kept), and the vote.
   target; a window's prefill is shared by every question over it — the
   scheduler submits a window's questions together, windows in order, so a
   window's prefix is retained while its questions run.
-- Measured cost: a folded `log` question a median 0.8-2.6 s (5 s at ~1M
-  tokens) with no long prefill; a `prose` or `records` question pays each
+- Measured cost: a folded `log` question a median 0.8-2.6 s in spec 23's
+  runs (5 s at ~1M tokens), and 0.7-1.4 s with the last request over the
+  original lines (p90 up to 4.2 s, 14 s at ~1M; R, R2, R4), with no long
+  prefill; a `prose` or `records` question pays each
   window's prefill once (45-68 s per 200K-token window) and then 1-4 s of head
   reading per window and ~0.3-0.5 s for the last request (`plain`, `none` and
   `found?` share its prefix). A folded record array (`records` +
@@ -544,11 +546,13 @@ absent question is **flagged** when `found` < 0.5.
    the fold included — is **at most 3.0 s**.
 4. **Prose.** On P3's windows up to 200K tokens the defaults are right on
    **at least 85%** of the present questions, and over all of P3's present
-   questions the paragraph-level pointer F1 averages **at least 0.75**. (The
-   1M group is reported, not asserted: spec 23 found it the weak point.)
+   questions the paragraph-level pointer F1 averages **at least 0.75** (a
+   present question answered "not found" has no pointers: F1 0). (The 1M
+   group is reported, not asserted: spec 23 found it the weak point.)
 5. **Records.** The defaults are right on **at least 90%** of J3's present
-   questions (explored: 58/60, 29/30), and on at least 85% of its 10,000-record
-   arrays' (explored: 29/30).
+   questions (explored, counting `found`: 57/60 and 28/30; the pick alone
+   58/60 and 29/30), and on at least 85% of its 10,000-record arrays'
+   (explored: 28/30).
 6. **Not found, logs.** Of R3's present questions whose pick is its target,
    **at least 95%** keep `found` ≥ 0.5 (explored: 101/101, 21/21); **at
    least 60%** of the target-removed questions (explored: 41/58, 20/23) and
@@ -694,6 +698,9 @@ submitted — and holds the host arithmetic to the Python that measured it.
   good (101 vs 100 of R and R2's 108). In prose the paragraphs already carry
   that context, and checking a sentence alone was worse (a HotpotQA sentence
   often answers only with the other paragraph).
+- **Rule 11 judges routes never measured on short states**: the `records`
+  route and `found` on set F's 20-300-record arrays, short logs and short
+  prose are unmeasured there (set F is kept unread as the guard).
 - **Why enums and not booleans**: a third reading, compression or kind is a
   new value, echoed in the answer, never a flag contradicting another.
 - **What changes from the routes the research measured**, and is therefore

@@ -109,7 +109,7 @@ segments a JSON state).
 
 | pipeline | lexical (30) | paraphrase (30) | latency |
 |---|---|---|---|
-| **records: end heads' first 16 (array order, compact JSON, labelled) → `choice`** | **30** | **28** | first question: the prefill (8 s at 55K, 45-48 s at 195K); then 1.0-3.3 s + 0.3 s |
+| **records: end heads' first 16 (array order, spaced JSON, labelled) → `choice`** | **30** | **28** | first question: the prefill (8 s at 55K, 45-48 s at 195K); then 1.0-3.3 s + 0.3 s |
 | the same from the served heads' sum reading | 30 | 27 | |
 | the `log` pipeline over the records as JSON lines (what `auto` does today) | 28 | 24 | median 1.3-1.7 s, no long prefill |
 
@@ -161,7 +161,7 @@ pipeline, and a record array is told by its shape alone.
 - **`kind: records`** is supported: a JSON array of objects (told
   structurally, not by the fold); no compression; the **end heads, end
   reading** over the array in windows of ≤200K tokens cut at record
-  boundaries; the first 16 in array order as compact JSON lines; a labelled
+  boundaries; the first 16 in array order as spaced-JSON lines; a labelled
   `choice`. The same shape as `prose` with the log's reading.
 - **Not found, one design for every kind**: the last `choice` of each
   pipeline gains an option "none" and a yes/no (`found`) in the same request,

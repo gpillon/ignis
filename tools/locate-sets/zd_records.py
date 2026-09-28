@@ -12,10 +12,10 @@ paraphrase one for a value no record holds).
 **native array** (segments = records, the product's own segmentation),
 reduced to key features. `rank`: sum / end / both readings, per head set.
 
-`ask`: over a ranking's first 16 records (array order, compact JSON, labelled)
+`ask`: over a ranking's first 16 records (array order, spaced JSON — `json.dumps` with its default separators — labelled)
 the plain `choice`, the `choice` with a "none" option and a yes/no, as
 `zd_notfound.py` asks them. `logpipe`: the `log` pipeline over the records as
-compact JSON lines (what `auto` sends records to), same three questions.
+spaced JSON lines (what `auto` sent records to), same three questions.
 
     python zd_records.py build --out J
     python zd_records.py heads --set J --heads served.json endheads.json --out Jw
