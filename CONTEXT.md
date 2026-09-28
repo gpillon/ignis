@@ -702,15 +702,69 @@ When output names a domain concept, use the term as defined here.
   the object (17-56 distinct cells), on a photograph it piles onto one
   distinctive part (6-13).
 - **Locate** — the `/v1/decide` primitive that names the **segment** of a text
-  `state` an instruction asks for (GitHub #275, spec 18, ADR 0041): read from
-  the **head vote** at the copy scaffold `{"quote":"`, in one prefill of the
-  question and one of its **content-free baseline**, with nothing written into
-  the state and nothing generated. Its prompt is layout L1 — the evidence
-  alone in the system message — and its answer is the segment's index, its
-  value as the caller sent it, a ranking of the voted segments and the
-  winner's share of the votes. Refused on a load nobody calibrated it for,
-  and past the span the vote was measured on (`LOCATE_MAX_KEYS`, 4,554 keys
-  on the served 27B).
+  `state` an instruction asks for (GitHub #275, #278; specs 18 and 22; ADR 0041,
+  ADR 0042), with nothing written into the state and nothing generated. Two
+  methods: the **shortlist** (the default) and the **head vote**. It has a
+  `kind` (`auto`, `log`, `prose`, `records`) and a `compression`
+  (`template_fold`, `none`), and its answer names the resolved three, the
+  segment's index and value as the caller sent it, a ranking, **pointers**
+  and — on the measured routes — **found**. Its reading prompt is layout L1 —
+  the evidence alone in the system message — at the copy scaffold
+  `{"quote":"`. Refused on a load nobody calibrated it for; the vote also past
+  the span it was measured on (`LOCATE_MAX_KEYS`, 4,554 keys on the served
+  27B).
+- **Shortlist** — a **locate**'s default method (GitHub #278, ADR 0042): the
+  calibrated heads narrow the text to a few candidates — 5 templates at a
+  fold's **level 1**, 16 rows at its **level 2**, 16 lines, sentences or
+  records otherwise — and a labelled `choice` over them decides, with no
+  token generated. The heads narrow a very long text; the `choice` resolves
+  near-duplicates, which it does well among a handful and badly among
+  hundreds.
+- **End reading** — a **shortlist**'s reading of logs and records: a
+  segment scored by where it closes — its last key, its separator and the
+  next segment's first key — each head's lift over the **content-free
+  baseline** standardized over the window's segments and summed over the
+  **end heads**. At length a line is marked at its end, not its start.
+- **Sum reading** — a **shortlist**'s reading of prose: a segment scored by
+  all its keys, as the **head vote** does, standardized and summed over the
+  **sum heads** rather than voted.
+- **End heads** / **sum heads** — the two head sets of a `locate`
+  calibration (spec 22): the end heads, 32 heads of GQA layers 35 to 55 with
+  the best single-head top-1 at a line's closing keys on development sets
+  (spec 23); the sum heads, the **head vote**'s 32. Keyed to the artifact's
+  content hash with `LOCATE_WINDOW_KEYS`.
+- **Template fold** — a `locate`'s `template_fold` compression (spec 22):
+  a log's lines grouped Drain-style into templates — same source label, same
+  token count, tokens agreeing on half the positions, times removed and
+  obvious variables masked — so a long log is read as a short text first.
+  Reversible: every **level-2** row maps back to the lines it stands for.
+  Removes the lines' order and neighbours, and every time from level 1.
+- **Level 1** — a **template fold**'s first text: one line per template, its
+  variable slots showing their distinct values while they fit 600 characters,
+  and `(xN)`.
+- **Level 2** — one template's lines as their values only, values first and
+  the line's time last, exact repeats one row with `(xN)`. The **shortlist**
+  ranks rows by their values and shows the last `choice` each row's first
+  original line, because whether a line answers cannot be read from its
+  values alone.
+- **Window** — a stretch of at most `LOCATE_WINDOW_KEYS` (200,000 on the
+  served 27B) keys of a text the heads read, cut at segment boundaries — at an
+  empty segment where one is in reach (a paragraph break), else before the
+  segment that would not fit — and read as its own prefill with its own
+  **content-free baseline**; windows' scores are standardized and merged. A
+  text's length is then bounded by the request, not the context.
+- **Pointer** — every candidate of a `locate`'s last `choice` at a share of
+  0.05 or more, the pick always first: one answer, or the several segments a
+  two-part answer needs.
+- **Records array** — a JSON array of two or more elements, every one an
+  object, and not the content-parts shape (every element with a string
+  `type`): what `auto` reads as `records`, without a statistic.
+- **Found** — whether a `locate`'s text answers at all (spec 22 § Not found):
+  the last `choice` asked again with a "none" option, and for a folded log a
+  yes/no; `1 - p(none)`, averaged with `p(yes)` for a log. Below 0.5 the
+  answer names no segment and keeps its ranking. Carried only by the measured
+  routes (`log` + `template_fold`, `prose` + `none`, `records` + `none`), and
+  never a calibrated probability.
 - **Segment** — one place a **locate** can answer with: a line of a string
   state, split on `\n` exactly (a `\r` stays part of its line), or an element
   of an array, `within` an optional JSON Pointer. Numbered the way the caller

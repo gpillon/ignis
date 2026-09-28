@@ -55,7 +55,16 @@ first forced close. Amended 2026-09-27 (#275): `type="locate"` joins
 `ignis_decisions_total`'s label set. A `locate` is read off attention, not an
 answer position, so like `point` and `box` it observes **no** answer mass; it
 is counted once per question, and its content-free baseline prefill is not a
-decision and is not counted.
+decision and is not counted. Amended 2026-09-28 (#278, spec 22):
+`ignis_locates_total{kind, method, compression, found}` counts each answered
+`locate` by the kind it resolved to (`log|prose|records`), its method
+(`shortlist|vote`), its compression (`template_fold|none`) and whether it
+found an answer (`true|false`, or `unmeasured` on a route with no `found`
+rule). Only the eleven combinations the endpoint serves have a series, and the
+family takes the decision family's exception: absent until the first `locate`.
+A shortlist's labelled `choice`s and yes/no are steps of its one `locate`,
+not decisions: they move neither `ignis_decisions_total{type="choice"}` nor
+the answer-mass histogram. No answer mass, as for every `locate`.
 
 ## Context
 
@@ -218,6 +227,7 @@ The initial stable metric contract is:
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
 | `ignis_decisions_total` | counter | `type=noul\|choice\|score\|scalar\|number\|point\|box\|locate` | Questions answered, by typed primitive (#241, #242, #275, ADR 0034). **Absent until the first one** — see below |
 | `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
+| `ignis_locates_total` | counter | `kind=log\|prose\|records`, `method=shortlist\|vote`, `compression=template_fold\|none`, `found=true\|false\|unmeasured` | `locate`s answered, by the route that answered them and whether it found an answer (#278, spec 22). Only the served combinations have a series. **Absent until the first one** |
 | `ignis_thinking_forced_closes_total` | counter | none | Completed requests whose reasoning block the thinking budget closed (#265, spec server/08). The request log's `thinking_forced` says which. **Absent until the first one** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's

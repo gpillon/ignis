@@ -418,7 +418,9 @@ pub const MAX_EXCLUDED_KEYS: usize = 32;
 /// index per head of the set with the four scores around it when it named an
 /// image's set — at 4096 px that is 64 KB, 384 bytes and 1.5 KB, where every
 /// head's row would be 6.3 MB — or every head's row when it named a text
-/// span's: 32 heads over 4,554 keys, 583 KB. Nothing else crosses.
+/// span's: 32 heads over the vote's 4,554 keys, 583 KB, and over a
+/// shortlist's window of up to 200,000 keys (GitHub #278), 25.6 MB. Nothing
+/// else crosses.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionScores {
     /// The pointing head's `q · k / sqrt(head_dim)`, one per key of the

@@ -3,7 +3,13 @@
 ## Status
 
 Accepted (2026-09-27, owner — spec `docs/specs/decide/18-locate-by-attention.md`
-phase B, read as spec 19's track L registered it, GitHub #275). **Extends
+phase B, read as spec 19's track L registered it, GitHub #275). **The vote is
+no longer `locate`'s default** since ADR 0042 (GitHub #278): it is served
+unchanged as `method: "vote"`, and the readout decided here reads the
+shortlist's end and sum heads too, over windows of up to
+`LOCATE_WINDOW_KEYS` (200,000 keys on the served 27B), so the room reserved
+at load is sized for that window: 26,409,216 bytes where the vote's 4,554
+keys took 610,560. **Extends
 ADR 0038 and ADR 0039**, whose readout was an image's: everything both
 decided holds for a text span — the job names exactly what to read, exactly
 that comes back, the keys are the ones attention read, and a read the leaf
