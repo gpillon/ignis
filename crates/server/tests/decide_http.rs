@@ -2421,13 +2421,15 @@ async fn a_locate_is_answered_at_the_segment_the_heads_vote_for() {
     let compute = calibrated_compute();
     let server = server(compute.clone());
     let calibration = server.locate.expect("the served artifact is calibrated for locate");
-    let body = decide_body(LOCATE_STATE, r#""which":{"type":"locate","instructions":"which item names the letter b"}"#);
+    let body = decide_body(LOCATE_STATE, r#""which":{"type":"locate","method":"vote","compression":"none","instructions":"which item names the letter b"}"#);
     let (status, response) = decide(&server.app(), &body).await;
     assert_eq!(status, 200, "{response}");
     assert_eq!(
         response["answers"]["which"],
-        json!({"type": "locate", "segment": 1, "value": "x b y", "confidence": 1.0,
-               "ranking": [{"segment": 1, "share": 1.0}]}),
+        json!({"type": "locate", "kind": "log", "method": "vote", "compression": "none",
+               "segment": 1, "value": "x b y", "confidence": 1.0,
+               "ranking": [{"segment": 1, "share": 1.0}],
+               "pointers": [{"segment": 1, "value": "x b y", "share": 1.0}]}),
         "{response}"
     );
 
@@ -2451,17 +2453,17 @@ async fn every_locate_refusal_comes_before_any_prefill() {
     let many_lines = (0..5000).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\\n");
     let long_state = format!("\"{many_lines}\"");
     let cases: Vec<(&str, String, &str)> = vec![
-        ("criteria", decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"b","criteria":{"a":"b"}}"#), "criteria_unsupported"),
-        ("digits", decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"b","digits":3}"#), "digits_unsupported"),
-        ("method", decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"b","method":"head"}"#), "method_unsupported"),
+        ("criteria", decide_body(LOCATE_STATE, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"b","criteria":{"a":"b"}}"#), "criteria_unsupported"),
+        ("digits", decide_body(LOCATE_STATE, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"b","digits":3}"#), "digits_unsupported"),
+        ("method", decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"b","method":"head"}"#), "method_unknown"),
         ("within on a noul", decide_body(LOCATE_STATE, r#""q":{"type":"noul","instructions":"b","within":"/0"}"#), "within_unsupported"),
-        ("parts", r#"{"state":[{"type":"text","text":"a\nb"}],"questions":{"q":{"type":"locate","instructions":"b"}}}"#.to_owned(), "locate_needs_json_state"),
-        ("malformed pointer", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","instructions":"b","within":"log"}"#), "locate_within_malformed"),
-        ("missing target", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","instructions":"b","within":"/logs"}"#), "locate_within_not_found"),
-        ("ambiguous target", decide_body(r#"{"log":"a b\nc d","log":"e"}"#, r#""q":{"type":"locate","instructions":"b","within":"/log"}"#), "locate_within_ambiguous"),
-        ("an object", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","instructions":"b"}"#), "locate_target_unsegmentable"),
-        ("one line", decide_body(r#""just one line of text""#, r#""q":{"type":"locate","instructions":"b"}"#), "locate_too_few_segments"),
-        ("past the ceiling", decide_body(&long_state, r#""q":{"type":"locate","instructions":"b"}"#), "locate_too_long"),
+        ("parts", r#"{"state":[{"type":"text","text":"a\nb"}],"questions":{"q":{"type":"locate","method":"vote","compression":"none","instructions":"b"}}}"#.to_owned(), "locate_needs_json_state"),
+        ("malformed pointer", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"b","within":"log"}"#), "locate_within_malformed"),
+        ("missing target", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"b","within":"/logs"}"#), "locate_within_not_found"),
+        ("ambiguous target", decide_body(r#"{"log":"a b\nc d","log":"e"}"#, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"b","within":"/log"}"#), "locate_within_ambiguous"),
+        ("an object", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"b"}"#), "locate_target_unsegmentable"),
+        ("one line", decide_body(r#""just one line of text""#, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"b"}"#), "locate_too_few_segments"),
+        ("past the ceiling", decide_body(&long_state, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"b"}"#), "locate_too_long"),
     ];
     for (what, body, code) in cases {
         let compute = calibrated_compute();
@@ -2474,7 +2476,7 @@ async fn every_locate_refusal_comes_before_any_prefill() {
     let compute = calibrated_compute();
     let body = decide_body(
         LOCATE_STATE,
-        r#""q":{"type":"locate","instructions":"which item names b"},"bad":{"type":"choice","instructions":"x"}"#,
+        r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"which item names b"},"bad":{"type":"choice","instructions":"x"}"#,
     );
     let (status, _) = decide(&app(compute.clone()), &body).await;
     assert_eq!(status, 422);
@@ -2489,7 +2491,7 @@ async fn a_locate_on_an_uncalibrated_load_is_refused() {
     let compute = Arc::new(MockCompute::new());
     let server = server(compute.clone());
     assert!(server.locate.is_none(), "the mock's default artifact is nobody's");
-    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"which item names b"}"#);
+    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"which item names b"}"#);
     let (status, response) = decide(&server.app(), &body).await;
     assert_eq!(status, 422, "{response}");
     assert_eq!(response["error"]["code"], "locate_uncalibrated", "{response}");
@@ -2505,9 +2507,9 @@ async fn a_fan_out_mixing_locates_and_readouts_answers_all_with_one_baseline_per
     let state = r#"{"items":["x a y","x b y","x c y","x d y","x e y","x f y"],"notes":"n one m\nn two m\nn three m"}"#;
     let body = decide_body(
         state,
-        r#""b":{"type":"locate","instructions":"which item names the letter b","within":"/items"},
-           "again":{"type":"locate","instructions":"the item after a","within":"/items"},
-           "note":{"type":"locate","instructions":"which note says two","within":"/notes"},
+        r#""b":{"type":"locate","method":"vote","compression":"none","instructions":"which item names the letter b","within":"/items"},
+           "again":{"type":"locate","method":"vote","compression":"none","instructions":"the item after a","within":"/items"},
+           "note":{"type":"locate","method":"vote","compression":"none","instructions":"which note says two","within":"/notes"},
            "any":{"type":"noul","instructions":"is there a letter?"},
            "which":{"type":"choice","instructions":"which vowel?","criteria":{"a":null,"e":null}}"#,
     );
@@ -2535,7 +2537,7 @@ async fn a_locate_whose_baseline_was_not_read_is_a_failed_question() {
     let compute = calibrated_compute();
     // Request 0 is the question, asked first; request 1 its baseline.
     compute.refuse_attention(1);
-    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"which item names b"}"#);
+    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"which item names b"}"#);
     let (status, response) = decide(&app(compute.clone()), &body).await;
     assert_eq!(status, 200, "{response}");
     let answer = &response["answers"]["q"];
@@ -2551,7 +2553,7 @@ async fn a_locate_whose_baseline_was_not_read_is_a_failed_question() {
 async fn a_locates_value_keeps_the_callers_key_order() {
     let compute = calibrated_compute();
     let state = r#"[{"z":"x a y","a":1},{"z":"x b y","a":2},{"z":"x c y","a":3},{"z":"x d y","a":4}]"#;
-    let body = decide_body(state, r#""q":{"type":"locate","instructions":"which record names b"}"#);
+    let body = decide_body(state, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"which record names b"}"#);
     let request = Request::builder()
         .method("POST")
         .uri("/v1/decide")
@@ -2578,7 +2580,7 @@ async fn a_locates_value_keeps_the_callers_key_order() {
 async fn a_served_locate_is_counted_once_and_observes_no_answer_mass() {
     let server = server(calibrated_compute()).with_metrics();
     let metrics = server.metrics_app().expect("--metrics is on");
-    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"which item names b"}"#);
+    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"which item names b"}"#);
     let (status, response) = decide(&server.app(), &body).await;
     assert_eq!(status, 200, "{response}");
     let after = scrape(&metrics).await;
@@ -2598,8 +2600,8 @@ async fn a_locate_behind_a_readout_still_shares_its_state() {
     let body = decide_body(
         &format!("[{}]", items.join(",")),
         r#""any":{"type":"noul","instructions":"is there a letter?"},
-           "one":{"type":"locate","instructions":"which item names w7"},
-           "two":{"type":"locate","instructions":"which item names w70"}"#,
+           "one":{"type":"locate","method":"vote","compression":"none","instructions":"which item names w7"},
+           "two":{"type":"locate","method":"vote","compression":"none","instructions":"which item names w70"}"#,
     );
     let compute = calibrated_compute();
     let (status, response) = decide(&app(compute.clone()), &body).await;
@@ -2627,7 +2629,7 @@ async fn a_locate_behind_a_readout_still_shares_its_state() {
 async fn a_locate_on_a_template_with_no_tokenizer_is_refused() {
     let compute = calibrated_compute();
     let server = Server::new(Engine::new(Box::new(scheduler_over(compute.clone()))), Box::new(SimpleTemplateProvider));
-    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","instructions":"which item names b"}"#);
+    let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"which item names b"}"#);
     let (status, response) = decide(&server.app(), &body).await;
     assert_eq!(status, 422, "{response}");
     assert_eq!(response["error"]["code"], "locate_unsupported", "{response}");
@@ -2645,10 +2647,401 @@ fn a_locate_whose_rows_are_not_whole_is_malformed() {
     let short = AttentionScores { set_rows: Some(vec![0.0f32; 7].into()), ..AttentionScores::pointing(vec![0.0; 4]) };
     let none = AttentionScores::pointing(vec![0.0; 4]);
     for (what, asked, baseline) in [("short rows", &short, &whole), ("no baseline rows", &whole, &none)] {
-        let answer = ignis_server::decide::locate_answer_for(&keys, &values, 2, asked, baseline);
+        let answer = ignis_server::decide::locate_answer_for(ignis_core::locate::Kind::Log, &keys, &values, 2, asked, baseline);
         let answer = serde_json::to_value(&answer).expect("serializes");
         assert_eq!(answer["code"], "attention_malformed", "{what}: {answer}");
     }
-    let answer = ignis_server::decide::locate_answer_for(&keys, &values, 2, &whole, &whole);
+    let answer = ignis_server::decide::locate_answer_for(ignis_core::locate::Kind::Log, &keys, &values, 2, &whole, &whole);
     assert_eq!(serde_json::to_value(&answer).expect("serializes")["type"], "locate");
+}
+
+// ── locate: the shortlist (GitHub #278, spec 22) ─────────────────────────
+//
+// The mock's heads peak a third of the way into every span and its readouts
+// are deterministic noise, so these hold what the route does — which
+// prefills it asks, in which order, over which texts, and the answer's shape
+// and indices — not which line is right. Whether the heads and the `choice`
+// find the line is the GPU acceptance's.
+
+/// A log of `kinds` kinds of line, each `rows` times over with its own
+/// values: `kinds` templates, each of `rows` level-2 rows.
+fn log_lines(kinds: usize, rows: usize) -> Vec<String> {
+    let verbs = ["started", "stopped", "ready", "failed", "retried", "evicted", "scaled", "pulled", "synced", "drained"];
+    let mut lines = Vec::new();
+    for r in 0..rows {
+        for (k, verb) in verbs.iter().enumerate().take(kinds) {
+            lines.push(format!("2026-09-28T10:{:02}:{:02}Z pod-{r}{k} {verb} node{k} zone{k}", r % 60, k));
+        }
+    }
+    lines
+}
+
+/// `lines` as a JSON string state.
+fn text_state(lines: &[String]) -> String {
+    serde_json::to_string(&lines.join("\n")).unwrap()
+}
+
+/// Paragraphs with a title each, a blank line between them: sentences of
+/// different lengths and words, which fold into no shared template.
+fn prose_lines(paragraphs: usize) -> Vec<String> {
+    const WORDS: [&str; 16] = [
+        "river", "stone", "light", "garden", "winter", "music", "letter", "window", "harbour", "forest", "silver",
+        "morning", "shadow", "voice", "paper", "market",
+    ];
+    let mut lines = Vec::new();
+    for p in 0..paragraphs {
+        if p > 0 {
+            lines.push(String::new());
+        }
+        lines.push(format!("# {} {}", WORDS[p % 16], WORDS[(p * 7 + 3) % 16]));
+        for s in 0..3 {
+            let length = 3 + (p * 5 + s * 3) % 9;
+            let words: Vec<&str> = (0..length).map(|w| WORDS[(p * 11 + s * 5 + w * 3 + w * w) % 16]).collect();
+            lines.push(format!("{} thing{p}x{s}.", words.join(" ")));
+        }
+    }
+    lines
+}
+
+/// An array of `n` records, their values words apart: the placeholder
+/// template's tokens are words, so a record owns the words of its values.
+fn records_state(n: usize) -> String {
+    let records: Vec<String> = (0..n)
+        .map(|i| format!(r#"{{"id":{i},"name":"worker number {i}","city":"lives in city {} today"}}"#, i % 7))
+        .collect();
+    format!("[{}]", records.join(","))
+}
+
+/// The readout jobs — a `choice`, a `noul` — with how many answer tokens
+/// each named, in the order they were prefilled.
+fn readout_jobs(compute: &MockCompute) -> Vec<(u64, usize)> {
+    compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .filter_map(|job| job.readout.as_ref().map(|answers| (job.request, answers.len())))
+        .collect()
+}
+
+/// The segment a present answer names, checked against the state: an index
+/// into the target as sent, its value that segment, its pick the first
+/// pointer; or, under 0.5, nothing named and the ranking kept.
+fn check_answer(answer: &JsonValue, segments: &[JsonValue]) {
+    let ranking = answer["ranking"].as_array().expect("a ranking");
+    assert!(!ranking.is_empty(), "{answer}");
+    for rank in ranking {
+        assert!((rank["segment"].as_u64().unwrap() as usize) < segments.len(), "{answer}");
+    }
+    match answer["found"].as_f64() {
+        Some(found) if found < 0.5 => {
+            assert_eq!(answer["segment"], JsonValue::Null, "{answer}");
+            assert_eq!(answer["pointers"], json!([]), "{answer}");
+        }
+        _ => {
+            let segment = answer["segment"].as_u64().expect("a segment") as usize;
+            assert_eq!(answer["value"], segments[segment], "{answer}");
+            assert_eq!(answer["pointers"][0]["segment"], segment, "{answer}");
+            assert_eq!(answer["ranking"][0]["segment"], segment, "{answer}");
+            assert_eq!(answer["confidence"], answer["ranking"][0]["share"], "{answer}");
+        }
+    }
+}
+
+fn lines_json(lines: &[String]) -> Vec<JsonValue> {
+    lines.iter().map(|line| json!(line)).collect()
+}
+
+/// Spec 22 acceptance 3: a `locate` with no fields is a shortlist of the kind
+/// `auto` tells — a log folded, prose and records read as they are — named in
+/// its answer, with `found`, after zero decode rounds.
+#[tokio::test]
+async fn a_locate_with_no_fields_is_a_shortlist_of_the_kind_auto_tells() {
+    let log = log_lines(3, 4);
+    let prose = prose_lines(4);
+    let records: JsonValue = serde_json::from_str(&records_state(6)).unwrap();
+    let cases: Vec<(String, &str, &str, Vec<JsonValue>)> = vec![
+        (text_state(&log), "log", "template_fold", lines_json(&log)),
+        (text_state(&prose), "prose", "none", lines_json(&prose)),
+        (records.to_string(), "records", "none", records.as_array().unwrap().clone()),
+    ];
+    for (state, kind, compression, segments) in cases {
+        let compute = calibrated_compute();
+        let body = decide_body(&state, r#""q":{"type":"locate","instructions":"which one failed on node1"}"#);
+        let (status, response) = decide(&app(compute.clone()), &body).await;
+        assert_eq!(status, 200, "{kind}: {response}");
+        let answer = &response["answers"]["q"];
+        assert_eq!(answer["type"], "locate", "{kind}: {response}");
+        assert_eq!(answer["kind"], kind, "{response}");
+        assert_eq!(answer["method"], "shortlist", "{response}");
+        assert_eq!(answer["compression"], compression, "{response}");
+        assert!(answer["found"].is_f64(), "a default route carries found: {response}");
+        check_answer(answer, &segments);
+        assert!(compute.decode_calls().is_empty(), "{kind}: nothing generated");
+        assert_eq!(response["usage"]["output_tokens"], 0);
+    }
+}
+
+/// Spec 22 § The wire: every combination the endpoint serves answers with
+/// what produced it, and `found` rides exactly the three measured routes.
+#[tokio::test]
+async fn every_combination_answers_and_found_rides_the_measured_routes() {
+    let log = text_state(&log_lines(3, 3));
+    let prose = text_state(&prose_lines(3));
+    let records = records_state(5);
+    let cases = [
+        (&log, r#""kind":"log""#, "log", "shortlist", "template_fold", true),
+        (&log, r#""kind":"log","compression":"none""#, "log", "shortlist", "none", false),
+        (&log, r#""method":"vote","compression":"none""#, "log", "vote", "none", false),
+        (&prose, r#""kind":"prose""#, "prose", "shortlist", "none", true),
+        (&prose, r#""method":"vote""#, "prose", "vote", "none", false),
+        (&records, r#""kind":"records""#, "records", "shortlist", "none", true),
+        (&records, r#""compression":"template_fold""#, "records", "shortlist", "template_fold", false),
+        (&records, r#""method":"vote""#, "records", "vote", "none", false),
+    ];
+    for (state, fields, kind, method, compression, finds) in cases {
+        let compute = calibrated_compute();
+        let body = decide_body(state, &format!(r#""q":{{"type":"locate","instructions":"which one",{fields}}}"#));
+        let (status, response) = decide(&app(compute.clone()), &body).await;
+        assert_eq!(status, 200, "{fields}: {response}");
+        let answer = &response["answers"]["q"];
+        assert_eq!((answer["kind"].as_str(), answer["method"].as_str(), answer["compression"].as_str()),
+            (Some(kind), Some(method), Some(compression)), "{fields}: {response}");
+        assert_eq!(answer.get("found").is_some(), finds, "{fields}: {response}");
+        if !finds {
+            assert!(answer["segment"].is_u64(), "a route without found always names a segment: {response}");
+        }
+        assert!(!answer["pointers"].as_array().unwrap().is_empty() || finds, "{fields}: {response}");
+    }
+}
+
+/// Spec 22 § Refusals: every fault is a 422 before any prefill — unknown
+/// values naming the accepted ones, a field on the wrong type, the
+/// combinations that never apply, a kind the state contradicts both ways.
+#[tokio::test]
+async fn every_shortlist_refusal_comes_before_any_prefill() {
+    let log = text_state(&log_lines(3, 3));
+    let prose = text_state(&prose_lines(3));
+    let records = records_state(4);
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("unknown kind", decide_body(&log, r#""q":{"type":"locate","instructions":"b","kind":"csv"}"#), "kind_unknown"),
+        ("unknown method", decide_body(&log, r#""q":{"type":"locate","instructions":"b","method":"copy"}"#), "method_unknown"),
+        ("unknown compression", decide_body(&log, r#""q":{"type":"locate","instructions":"b","compression":"zip"}"#), "compression_unknown"),
+        ("kind on a noul", decide_body(&log, r#""q":{"type":"noul","instructions":"b","kind":"log"}"#), "kind_unsupported"),
+        ("compression on a choice", decide_body(&log, r#""q":{"type":"choice","instructions":"b","criteria":{"a":null},"compression":"none"}"#), "compression_unsupported"),
+        ("shortlist on a point", decide_body(&log, r#""q":{"type":"point","instructions":"b","method":"shortlist"}"#), "method_unknown"),
+        ("a fold under the vote", decide_body(&log, r#""q":{"type":"locate","instructions":"b","method":"vote","compression":"template_fold"}"#), "compression_unsupported"),
+        ("a fold of named prose", decide_body(&prose, r#""q":{"type":"locate","instructions":"b","kind":"prose","compression":"template_fold"}"#), "compression_unsupported"),
+        ("a fold of what auto reads as prose", decide_body(&prose, r#""q":{"type":"locate","instructions":"b","compression":"template_fold"}"#), "compression_unsupported"),
+        ("records named on text", decide_body(&log, r#""q":{"type":"locate","instructions":"b","kind":"records"}"#), "kind_mismatch"),
+        ("log named on records", decide_body(&records, r#""q":{"type":"locate","instructions":"b","kind":"log"}"#), "kind_mismatch"),
+        ("prose named on records", decide_body(&records, r#""q":{"type":"locate","instructions":"b","kind":"prose"}"#), "kind_mismatch"),
+        ("one line", decide_body(r#""just one line of text""#, r#""q":{"type":"locate","instructions":"b"}"#), "locate_too_few_segments"),
+        ("an object", decide_body(r#"{"log":"a b\nc d"}"#, r#""q":{"type":"locate","instructions":"b"}"#), "locate_target_unsegmentable"),
+    ];
+    for (what, body, code) in cases {
+        let compute = calibrated_compute();
+        let (status, response) = decide(&app(compute.clone()), &body).await;
+        assert_eq!(status, 422, "{what}: {response}");
+        assert_eq!(response["error"]["code"], code, "{what}: {response}");
+        assert!(compute.prefill_calls().is_empty(), "{what}: refused before any prefill");
+    }
+    // A load nobody calibrated refuses the shortlist too: it reads heads.
+    let compute = Arc::new(MockCompute::new());
+    let (status, response) = decide(&app(compute.clone()), &decide_body(&log, r#""q":{"type":"locate","instructions":"b"}"#)).await;
+    assert_eq!((status, response["error"]["code"].as_str()), (422, Some("locate_uncalibrated")), "{response}");
+}
+
+/// Spec 22 § Windows: a text longer than one window is read window by
+/// window — each its own prefill and its own twin — and answered with an
+/// index into the state as sent. Prose is cut at its paragraph breaks,
+/// records at record boundaries.
+#[tokio::test]
+async fn a_target_longer_than_a_window_is_read_in_windows_and_answered_in_the_original() {
+    let prose = prose_lines(12);
+    let records: JsonValue = serde_json::from_str(&records_state(40)).unwrap();
+    let cases: Vec<(String, Vec<JsonValue>, &str)> = vec![
+        (text_state(&prose), lines_json(&prose), "prose"),
+        (records.to_string(), records.as_array().unwrap().clone(), "records"),
+    ];
+    for (state, segments, kind) in cases {
+        let compute = calibrated_compute();
+        let mut server = server(compute.clone());
+        let calibration = server.locate.expect("calibrated");
+        // A window of 60 keys: the placeholder template's tokens are words.
+        server.locate = Some(ignis_core::locate::LocateCalibration { window_keys: 60, ..calibration });
+        let body = decide_body(&state, r#""q":{"type":"locate","instructions":"which says thing3x1"}"#);
+        let (status, response) = decide(&server.app(), &body).await;
+        assert_eq!(status, 200, "{kind}: {response}");
+        let answer = &response["answers"]["q"];
+        assert_eq!(answer["kind"], kind, "{response}");
+        check_answer(answer, &segments);
+        let reads = attention_jobs(&compute);
+        assert!(reads.len() >= 6, "{kind}: at least three windows, each with its twin: {reads:?}");
+        assert_eq!(reads.len() % 2, 0, "{kind}: a twin per window: {reads:?}");
+        for (_, query) in &reads {
+            assert!(query.key_count <= 60, "{kind}: a window reads at most its keys: {query:?}");
+        }
+    }
+}
+
+/// Spec 22 § The labelled `choice`: a fold's level 2 is read after its level
+/// 1 is answered — the end heads over the templates, the `choice` among
+/// five, the end heads over the chosen template's rows — and the last
+/// request asks the plain `choice`, its "none" twin and the yes/no.
+#[tokio::test]
+async fn a_folds_level_two_is_read_after_its_level_one_and_the_last_request_asks_three() {
+    // Seven templates of twenty rows: past five templates and sixteen rows.
+    let log = log_lines(7, 20);
+    let compute = calibrated_compute();
+    let body = decide_body(&text_state(&log), r#""q":{"type":"locate","instructions":"which pod failed on node3"}"#);
+    let (status, response) = decide(&app(compute.clone()), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["q"];
+    assert_eq!((answer["kind"].as_str(), answer["compression"].as_str()), (Some("log"), Some("template_fold")));
+    check_answer(answer, &lines_json(&log));
+
+    // In prefill order: two readings (level 1), one `choice` of five, two
+    // readings (level 2), then the last request: sixteen labels, sixteen and
+    // "none", and a yes/no.
+    let mut order: Vec<String> = Vec::new();
+    for job in compute.prefill_calls().into_iter().flatten() {
+        match (&job.attention, &job.readout) {
+            (Some(_), _) => order.push("rows".to_owned()),
+            (None, Some(answers)) => order.push(format!("readout{}", answers.len())),
+            (None, None) => {}
+        }
+    }
+    order.dedup_by(|a, b| a == b && a != "rows");
+    assert_eq!(
+        order,
+        ["rows", "rows", "readout5", "rows", "rows", "readout16", "readout17", "readout2"],
+        "{order:?}"
+    );
+}
+
+/// Spec 22 § Not found: the last request of prose and of records asks the
+/// plain `choice` and its "none" twin; a log read without a fold asks the
+/// plain `choice` alone, and answers without `found`.
+#[tokio::test]
+async fn the_last_request_asks_what_its_route_measured() {
+    let cases = [
+        (text_state(&prose_lines(2)), r#""kind":"prose""#, vec![true, true, false]),
+        (records_state(5), r#""kind":"records""#, vec![true, true, false]),
+        (text_state(&log_lines(2, 2)), r#""kind":"log","compression":"none""#, vec![true, false, false]),
+    ];
+    for (state, fields, asked) in cases {
+        let compute = calibrated_compute();
+        let body = decide_body(&state, &format!(r#""q":{{"type":"locate","instructions":"which",{fields}}}"#));
+        let (status, response) = decide(&app(compute.clone()), &body).await;
+        assert_eq!(status, 200, "{response}");
+        let readouts = readout_jobs(&compute);
+        assert_eq!(readouts.len(), asked.iter().filter(|a| **a).count(), "{fields}: {readouts:?}");
+        // The "none" twin names one answer more than the plain `choice`.
+        if asked[1] {
+            assert_eq!(readouts[1].1, readouts[0].1 + 1, "{fields}: {readouts:?}");
+        }
+    }
+}
+
+/// Spec 22 § Fan-out: the fold is computed once and a fold's level-1 twin
+/// read once for every question over the log; each question's own reading
+/// claims the text the twin kept.
+#[tokio::test]
+async fn questions_over_one_log_share_its_fold_and_its_level_one_twin() {
+    let log = log_lines(7, 3);
+    let compute = calibrated_compute();
+    let body = decide_body(
+        &text_state(&log),
+        r#""one":{"type":"locate","instructions":"which pod failed"},
+           "two":{"type":"locate","instructions":"which pod was evicted"}"#,
+    );
+    let (status, response) = decide(&app(compute.clone()), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let reads = attention_jobs(&compute);
+    // Level 1: one twin and two questions over the same span; no level 2 —
+    // three rows per template.
+    assert_eq!(reads.len(), 3, "{reads:?}");
+    assert!(reads.iter().all(|(_, query)| query.key_count == reads[0].1.key_count), "{reads:?}");
+    let totals = prefilled(&compute);
+    let (first, rest) = (reads[0].0, &reads[1..]);
+    for (request, _) in rest {
+        assert!(totals[request] < totals[&first], "request {request} claimed the twin's text: {totals:?}");
+    }
+}
+
+/// Spec 22 § Fan-out: a request mixing kinds, methods and other primitives
+/// over one state answers every question.
+#[tokio::test]
+async fn a_fan_out_of_kinds_methods_and_readouts_answers_every_question() {
+    let state = format!(
+        r#"{{"log":{},"people":{},"doc":{}}}"#,
+        text_state(&log_lines(3, 3)),
+        records_state(5),
+        text_state(&prose_lines(3))
+    );
+    let body = decide_body(
+        &state,
+        r#""l":{"type":"locate","instructions":"which failed","within":"/log"},
+           "v":{"type":"locate","instructions":"which failed","within":"/log","method":"vote"},
+           "r":{"type":"locate","instructions":"who lives in city3","within":"/people"},
+           "p":{"type":"locate","instructions":"what does paragraph 1 say","within":"/doc"},
+           "any":{"type":"noul","instructions":"is anything failing?"},
+           "which":{"type":"choice","instructions":"which part","criteria":{"log":null,"doc":null}}"#,
+    );
+    let compute = calibrated_compute();
+    let (status, response) = decide(&app(compute.clone()), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answers = &response["answers"];
+    for (id, kind, method) in [("l", "log", "shortlist"), ("v", "log", "vote"), ("r", "records", "shortlist"), ("p", "prose", "shortlist")] {
+        assert_eq!(answers[id]["type"], "locate", "{id}: {response}");
+        assert_eq!((answers[id]["kind"].as_str(), answers[id]["method"].as_str()), (Some(kind), Some(method)), "{id}: {response}");
+    }
+    assert_eq!(answers["any"]["type"], "noul", "{response}");
+    assert_eq!(answers["which"]["type"], "choice", "{response}");
+    assert!(compute.decode_calls().is_empty());
+    // Every prefill is counted: the whole prompts, over what each claimed.
+    let prefilled: u32 = prefilled(&compute).values().sum();
+    assert!(response["usage"]["input_tokens"].as_u64().unwrap() >= u64::from(prefilled), "{response}");
+}
+
+/// Spec 22 user story 17: lines identical but for their time are one row,
+/// and the row answers with the first of them.
+#[tokio::test]
+async fn lines_identical_but_for_their_time_answer_with_the_first() {
+    let mut lines = vec![String::new(), "   ".to_owned()];
+    lines.extend((0..12).map(|i| format!("2026-09-28T10:00:{i:02}Z heartbeat ok")));
+    let compute = calibrated_compute();
+    let body = decide_body(&text_state(&lines), r#""q":{"type":"locate","instructions":"the heartbeat","kind":"log"}"#);
+    let (status, response) = decide(&app(compute.clone()), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["q"];
+    assert_eq!(answer["ranking"], json!([{"segment": 2, "share": answer["ranking"][0]["share"]}]), "{response}");
+    assert!(attention_jobs(&compute).is_empty(), "one template, one row: the heads read nothing");
+}
+
+/// Spec 22 § Observability: a shortlist is one decision of type `locate` —
+/// its `choice`s and yes/no are steps, not decisions — and one series of
+/// `ignis_locates_total` by its route and whether it found an answer.
+#[tokio::test]
+async fn a_shortlist_is_counted_once_as_a_locate_and_by_its_route() {
+    let server = server(calibrated_compute()).with_metrics();
+    let metrics = server.metrics_app().expect("--metrics is on");
+    let before = scrape(&metrics).await;
+    assert!(!before.contains("ignis_locates_total"), "absent until the first locate");
+    let body = decide_body(&text_state(&log_lines(3, 3)), r#""q":{"type":"locate","instructions":"which failed"}"#);
+    let (status, response) = decide(&server.app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let after = scrape(&metrics).await;
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"locate\""), "1");
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"choice\""), "0", "the steps are no decisions");
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"noul\""), "0", "the steps are no decisions");
+    let found = match response["answers"]["q"]["found"].as_f64() {
+        Some(found) if found >= 0.5 => "true",
+        _ => "false",
+    };
+    assert_eq!(
+        sample(&after, "ignis_locates_total", &format!(r#"kind="log",method="shortlist",compression="template_fold",found="{found}""#)),
+        "1",
+        "{after}"
+    );
 }

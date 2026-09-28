@@ -419,3 +419,139 @@ pub fn map_segments(
     let keys = segment_keys(&owned, &span, shifted.len()).ok_or("a segment's tokens are not contiguous")?;
     Ok((span, keys))
 }
+
+// ---------------------------------------------------------------------------
+// The shortlist's view of a target (spec 22, GitHub #278)
+// ---------------------------------------------------------------------------
+
+/// The value `within` names in `state` (the whole state when it is empty),
+/// refused as [`evidence_within`] refuses it.
+pub fn target_within<'a>(state: &'a OrderedValue, within: &str) -> Result<&'a OrderedValue, TargetError> {
+    let mut target = state;
+    for step in resolve(state, within)? {
+        target = match target {
+            OrderedValue::Object(entries) => &entries[step].1,
+            OrderedValue::Array(items) => &items[step],
+            _ => unreachable!("`resolve` walks objects and arrays only"),
+        };
+    }
+    Ok(target)
+}
+
+/// [`target_within`], refused as [`evidence_within`] refuses a target that
+/// is not a string or a non-empty array.
+pub fn segmentable_target<'a>(state: &'a OrderedValue, within: &str) -> Result<&'a OrderedValue, TargetError> {
+    let target = target_within(state, within)?;
+    let segmentable = matches!(target, OrderedValue::String(_))
+        || matches!(target, OrderedValue::Array(items) if !items.is_empty());
+    match segmentable {
+        true => Ok(target),
+        false => Err(TargetError::Unsegmentable { pointer: within.to_owned(), found: kind_of(target) }),
+    }
+}
+
+/// Whether `target` is a **records array** (spec 22 § `auto`): a JSON array
+/// of at least two elements, every one an object, and not the shape
+/// `Evidence::read` reads as content parts (every element an object with a
+/// string `type`).
+pub fn is_records_array(target: &OrderedValue) -> bool {
+    let OrderedValue::Array(items) = target else {
+        return false;
+    };
+    let objects = items.len() >= 2 && items.iter().all(|item| matches!(item, OrderedValue::Object(_)));
+    let parts_shaped = items.iter().all(|item| match item {
+        OrderedValue::Object(entries) => entries.iter().any(|(key, value)| key == "type" && value.as_str().is_some()),
+        _ => false,
+    });
+    objects && !parts_shaped
+}
+
+/// A value as Python's `json.dumps(value, ensure_ascii=False)` writes it:
+/// `", "` between items, `": "` after a key, keys in the order sent, and a
+/// string's escapes as the endpoint writes them — the **spaced JSON** a
+/// record is folded and shown as (spec 22).
+///
+/// Numbers are written as the endpoint writes them; a float Python would
+/// spell with an exponent (`1e+16`, `1e-05`) is spelled `serde_json`'s way.
+pub fn spaced_json(value: &OrderedValue) -> String {
+    let mut out = String::new();
+    write_spaced(value, &mut out);
+    out
+}
+
+fn write_spaced(value: &OrderedValue, out: &mut String) {
+    match value {
+        OrderedValue::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_spaced(item, out);
+            }
+            out.push(']');
+        }
+        OrderedValue::Object(entries) => {
+            out.push('{');
+            for (index, (key, item)) in entries.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&quoted(key));
+                out.push_str(": ");
+                write_spaced(item, out);
+            }
+            out.push('}');
+        }
+        other => other.write(out),
+    }
+}
+
+/// Each segment of `target` as text: a string's lines, an array's string
+/// elements as their text and every other element as its [`spaced_json`].
+/// What the fold folds and a labelled `choice` shows.
+pub fn segment_texts(target: &OrderedValue) -> Vec<String> {
+    match target {
+        OrderedValue::String(text) => text.split('\n').map(str::to_owned).collect(),
+        OrderedValue::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                OrderedValue::String(text) => text.clone(),
+                other => spaced_json(other),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a segment has **content**: what owns keys in a `locate`'s render
+/// ([`Segment::owns`]) — a string that is not blank, or any other element.
+pub fn has_content(target: &OrderedValue, index: usize) -> bool {
+    match target {
+        OrderedValue::String(text) => text.split('\n').nth(index).is_some_and(|line| !line.trim().is_empty()),
+        OrderedValue::Array(items) => match items.get(index) {
+            Some(OrderedValue::String(text)) => !text.trim().is_empty(),
+            Some(_) => true,
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// `auto` (spec 22 § `auto`): `records` for a records array, else the fold
+/// of the target's first [`ignis_core::locate::AUTO_SEGMENTS`] segments with
+/// content — `log` when at least [`ignis_core::locate::AUTO_LOG_SHARE`] of
+/// them fall in templates of two or more, `prose` otherwise — with the
+/// share it read (`None` for a records array).
+pub fn auto_kind(target: &OrderedValue) -> (ignis_core::locate::Kind, Option<f64>) {
+    use ignis_core::locate::{AUTO_LOG_SHARE, AUTO_SEGMENTS, Kind};
+    if is_records_array(target) {
+        return (Kind::Records, None);
+    }
+    let texts = segment_texts(target);
+    let content: Vec<&String> =
+        texts.iter().enumerate().filter(|&(index, _)| has_content(target, index)).map(|(_, text)| text).take(AUTO_SEGMENTS).collect();
+    let share = ignis_core::locate::fold::fold(&content).templated_share();
+    let kind = if share >= AUTO_LOG_SHARE { Kind::Log } else { Kind::Prose };
+    (kind, Some(share))
+}

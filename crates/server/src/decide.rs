@@ -60,6 +60,8 @@ use ignis_core::types::TokenId;
 
 use crate::template::{ChatMessage, ContentPart, MessageContent};
 
+mod shortlist;
+
 /// SemIf's `DIRECT_SYSTEM`, verbatim (`src/semif_phase1/core.py`).
 ///
 /// Verbatim because every number the endpoint rests on was measured with
@@ -499,8 +501,13 @@ pub struct Question {
     /// unresized image), and a per-digit trace. Refused on every other type,
     /// and an unknown value is refused naming the two, never read as the
     /// default.
+    ///
+    /// On a `locate` (GitHub #278, spec 22): `"shortlist"` (the default) — the
+    /// calibrated heads narrow the text to a few candidates and a labelled
+    /// `choice` decides among them — or `"vote"`, the head vote of GitHub
+    /// #275, unchanged.
     #[serde(default)]
-    #[schema(value_type = Option<SpatialMethod>)]
+    #[schema(value_type = Option<QuestionMethod>)]
     pub method: Option<String>,
     /// The part of the `state` a `locate` searches (GitHub #275): an RFC 6901
     /// JSON Pointer, the whole state when absent. It must name a string —
@@ -509,6 +516,140 @@ pub struct Question {
     /// written into the prompt. Refused on every other type.
     #[serde(default)]
     pub within: Option<String>,
+    /// Which reading a `locate`'s text gets (GitHub #278, spec 22): `"auto"`
+    /// (the default) — `records` for an array of JSON objects, else `log`
+    /// when the fold of its first 2,000 segments with content puts at least
+    /// half of them in shared templates, `prose` otherwise — or `"log"`,
+    /// `"prose"`, `"records"` by name. Refused on every other type.
+    #[serde(default, rename = "kind")]
+    #[schema(value_type = Option<LocateKindField>)]
+    pub text_kind: Option<String>,
+    /// What a `locate`'s text is read as (GitHub #278, spec 22):
+    /// `"template_fold"` — a log folded into templates and their values
+    /// first, no long prefill — or `"none"`. Absent, a log is folded and
+    /// prose and records are not. A fold of prose, and a fold under
+    /// `"vote"`, are refused. Refused on every other type.
+    #[serde(default)]
+    #[schema(value_type = Option<LocateCompression>)]
+    pub compression: Option<String>,
+}
+
+/// The `method` values a question may name: a `point`'s or a `box`'s
+/// (`head`, `chain`), or a `locate`'s (`shortlist`, `vote`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionMethod {
+    Head,
+    Chain,
+    Shortlist,
+    Vote,
+}
+
+/// A `locate`'s `kind` as a caller may send it (GitHub #278).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LocateKindField {
+    Auto,
+    Log,
+    Prose,
+    Records,
+}
+
+/// The reading a `locate`'s text got (GitHub #278): the kind a caller named,
+/// or the one `auto` told. `auto` never appears in an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LocateKind {
+    Log,
+    Prose,
+    Records,
+}
+
+/// How a `locate` was answered (GitHub #278).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LocateMethod {
+    /// The heads narrow, a labelled `choice` decides (ADR 0042).
+    Shortlist,
+    /// The head vote (ADR 0041).
+    Vote,
+}
+
+/// What a `locate`'s text was read as (GitHub #278).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateCompression {
+    TemplateFold,
+    None,
+}
+
+impl From<ignis_core::locate::Kind> for LocateKind {
+    fn from(kind: ignis_core::locate::Kind) -> Self {
+        match kind {
+            ignis_core::locate::Kind::Log => Self::Log,
+            ignis_core::locate::Kind::Prose => Self::Prose,
+            ignis_core::locate::Kind::Records => Self::Records,
+        }
+    }
+}
+
+impl From<ignis_core::locate::Method> for LocateMethod {
+    fn from(method: ignis_core::locate::Method) -> Self {
+        match method {
+            ignis_core::locate::Method::Shortlist => Self::Shortlist,
+            ignis_core::locate::Method::Vote => Self::Vote,
+        }
+    }
+}
+
+impl From<ignis_core::locate::Compression> for LocateCompression {
+    fn from(compression: ignis_core::locate::Compression) -> Self {
+        match compression {
+            ignis_core::locate::Compression::TemplateFold => Self::TemplateFold,
+            ignis_core::locate::Compression::None => Self::None,
+        }
+    }
+}
+
+impl LocateKind {
+    /// The wire's spelling, and `ignis_locates_total`'s.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Prose => "prose",
+            Self::Records => "records",
+        }
+    }
+}
+
+impl LocateMethod {
+    /// The wire's spelling, and `ignis_locates_total`'s.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shortlist => "shortlist",
+            Self::Vote => "vote",
+        }
+    }
+}
+
+impl LocateCompression {
+    /// The wire's spelling, and `ignis_locates_total`'s.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TemplateFold => "template_fold",
+            Self::None => "none",
+        }
+    }
+}
+
+/// What a `locate` asked for (GitHub #278), validated: the kind it named
+/// (`None` for `auto`), its method, and the compression it named (`None`
+/// for its kind's default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocateAsk {
+    pub kind: Option<ignis_core::locate::Kind>,
+    pub method: ignis_core::locate::Method,
+    pub compression: Option<ignis_core::locate::Compression>,
 }
 
 /// How a `point` or a `box` is answered (GitHub #260, #263; specs 13 and 14).
@@ -874,6 +1015,9 @@ pub struct PreparedQuestion {
     /// The JSON Pointer a `locate` searches (GitHub #275) — empty for the
     /// whole state — and `None` for every other primitive.
     pub within: Option<String>,
+    /// A `locate`'s kind, method and compression (GitHub #278), and `None`
+    /// for every other primitive.
+    pub locate: Option<LocateAsk>,
 }
 
 impl PreparedQuestion {
@@ -960,18 +1104,29 @@ fn prepare_one(
             format!("question {id:?} has empty `instructions`"),
         ));
     }
-    let head = head_reading(id, question, pointing)?;
-    if question.within.is_some() && question.kind != QuestionKind::Locate {
-        return Err(Refusal::new(
-            "within_unsupported",
-            format!(
-                "question {id:?} is a {}: `within` names the part of the state a `locate` searches",
-                question.kind.primitive().label()
-            ),
-        ));
-    }
     if question.kind == QuestionKind::Locate {
         return prepare_locate(id, question);
+    }
+    let head = head_reading(id, question, pointing)?;
+    let primitive = question.kind.primitive().label();
+    if question.within.is_some() {
+        return Err(Refusal::new(
+            "within_unsupported",
+            format!("question {id:?} is a {primitive}: `within` names the part of the state a `locate` searches"),
+        ));
+    }
+    // GitHub #278: a field a caller wrote is never ignored.
+    if question.text_kind.is_some() {
+        return Err(Refusal::new(
+            "kind_unsupported",
+            format!("question {id:?} is a {primitive}: `kind` names the reading a `locate`'s text gets"),
+        ));
+    }
+    if question.compression.is_some() {
+        return Err(Refusal::new(
+            "compression_unsupported",
+            format!("question {id:?} is a {primitive}: `compression` names what a `locate`'s text is read as"),
+        ));
     }
     if question.kind == QuestionKind::Scalar {
         return prepare_scalar(id, question, encode);
@@ -1036,15 +1191,22 @@ fn prepare_one(
         digits: 0,
         head: None,
         within: None,
+        locate: None,
     })
 }
 
 /// Validate a `locate` question (GitHub #275): it declares no options and
 /// generates no digits, so `criteria` and `digits` are refused rather than
-/// ignored, as `method` already is. Where it searches, and whether this load
-/// can answer it at all, are the state's and the load's to say, before any
-/// prefill ([`serve`]).
+/// ignored. Where it searches, and whether this load can answer it at all,
+/// are the state's and the load's to say, before any prefill ([`serve`]).
+///
+/// GitHub #278 (spec 22): its `method`, `kind` and `compression`, each an
+/// enum whose unknown value is refused naming the accepted ones, and the two
+/// combinations that never apply — a fold under `vote` (measured 28 of R2's
+/// 58) and a fold of prose (prose does not fold) — refused by name. Whether
+/// a kind contradicts the state is the state's to say ([`serve`]).
 fn prepare_locate(id: &str, question: &Question) -> Result<PreparedQuestion, Refusal> {
+    use ignis_core::locate::{Compression, Kind, Method};
     if question.criteria.is_some() {
         return Err(Refusal::new(
             "criteria_unsupported",
@@ -1057,6 +1219,53 @@ fn prepare_locate(id: &str, question: &Question) -> Result<PreparedQuestion, Ref
             format!("question {id:?} is a locate and generates nothing, so `digits` cannot be honoured"),
         ));
     }
+    let method = match question.method.as_deref() {
+        None | Some("shortlist") => Method::Shortlist,
+        Some("vote") => Method::Vote,
+        Some(other) => {
+            return Err(Refusal::new(
+                "method_unknown",
+                format!("question {id:?} asks for method {other:?}; a locate's accepted values are \"shortlist\" and \"vote\""),
+            ));
+        }
+    };
+    let kind = match question.text_kind.as_deref() {
+        None | Some("auto") => None,
+        Some("log") => Some(Kind::Log),
+        Some("prose") => Some(Kind::Prose),
+        Some("records") => Some(Kind::Records),
+        Some(other) => {
+            return Err(Refusal::new(
+                "kind_unknown",
+                format!("question {id:?} asks for kind {other:?}; the accepted values are \"auto\", \"log\", \"prose\" and \"records\""),
+            ));
+        }
+    };
+    let compression = match question.compression.as_deref() {
+        None => None,
+        Some("template_fold") => Some(Compression::TemplateFold),
+        Some("none") => Some(Compression::None),
+        Some(other) => {
+            return Err(Refusal::new(
+                "compression_unknown",
+                format!("question {id:?} asks for compression {other:?}; the accepted values are \"template_fold\" and \"none\""),
+            ));
+        }
+    };
+    if compression == Some(Compression::TemplateFold) {
+        if method == Method::Vote {
+            return Err(Refusal::new(
+                "compression_unsupported",
+                format!("question {id:?}: the vote reads the text as it is — over a fold it read 28 of 58 real-log questions — so \"template_fold\" is refused with \"vote\"; ask for \"shortlist\", or for \"none\""),
+            ));
+        }
+        if kind == Some(Kind::Prose) {
+            return Err(Refusal::new(
+                "compression_unsupported",
+                format!("question {id:?}: prose does not fold into templates, so \"template_fold\" is refused with \"prose\"; ask for \"none\", or omit `compression`"),
+            ));
+        }
+    }
     Ok(PreparedQuestion {
         id: id.to_owned(),
         kind: question.kind,
@@ -1068,6 +1277,7 @@ fn prepare_locate(id: &str, question: &Question) -> Result<PreparedQuestion, Ref
         digits: 0,
         head: None,
         within: Some(question.within.clone().unwrap_or_default()),
+        locate: Some(LocateAsk { kind, method, compression }),
     })
 }
 
@@ -1098,7 +1308,7 @@ fn head_reading(
         return Err(Refusal::new(
             "method_unsupported",
             format!(
-                "question {id:?} is a {}: `method` chooses how a `point` or a `box` is answered, and this primitive has one way",
+                "question {id:?} is a {}: `method` chooses how a `point`, a `box` or a `locate` is answered, and this primitive has one way",
                 question.kind.primitive().label()
             ),
         ));
@@ -1178,6 +1388,7 @@ fn prepare_scalar(
         digits,
         head: None,
         within: None,
+        locate: None,
     })
 }
 
@@ -1230,6 +1441,7 @@ fn prepare_program(
         digits,
         head: None,
         within: None,
+        locate: None,
     })
 }
 
@@ -1724,28 +1936,43 @@ pub enum Answer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         digits: Option<BTreeMap<String, Vec<crate::numbers::DigitDraw>>>,
     },
-    /// The segment of the `state` the instruction names (GitHub #275): its
-    /// index — the 0-based line of `split("\n")` for a string, the element's
-    /// index for an array — and `value`, the segment exactly as the caller
-    /// sent it.
+    /// The segment of the `state` the instruction names (GitHub #275, #278):
+    /// its index — the 0-based line of `split("\n")` for a string, the
+    /// element's index for an array, always into the state as sent, whatever
+    /// was folded or windowed — and `value`, the segment exactly as the
+    /// caller sent it. `kind`, `method` and `compression` name what produced
+    /// it, defaults included.
     ///
-    /// Read in one prefill from a vote of the calibrated heads: each head
-    /// names the segment the question lifts its attention onto most, over a
-    /// content-free twin of the same prompt, and the most-voted segment is
-    /// the answer. `confidence` is the winner's share of the votes and
-    /// `ranking` the voted segments by votes, at most five, each with its
-    /// share. **How much the heads agree, not a calibrated probability**:
-    /// served on a fresh set it read 93.6% of the questions right, with a
-    /// median confidence of 0.625 on those and 0.375 on the misses — and
-    /// 0.375 on questions whose answer was absent, which it separates at an
-    /// AUC of 0.79 (`docs/findings/2026-09-27-locate-through-decide.md`).
-    /// There is no "not found": an absent answer still names a segment.
+    /// **`shortlist`** (the default, ADR 0042): the calibrated heads narrow
+    /// the text to a few candidates and a labelled `choice` decides among
+    /// them. `confidence` is that `choice`'s probability of the pick — times
+    /// the pick's probability at a fold's first level — and `ranking` its
+    /// candidates by probability, at most five, on the same scale, the pick
+    /// first. `pointers` is every candidate whose share is at least 0.05,
+    /// best first, the pick always among them: one answer or several.
+    /// `found` (on `log` + `template_fold`, `prose` + `none` and `records` +
+    /// `none`) says whether the text answers at all: below 0.5 `segment`,
+    /// `value` and `confidence` are `null`, `pointers` is empty, and
+    /// `ranking` still lists the candidates. Neither is a calibrated
+    /// probability.
+    ///
+    /// **`vote`** (ADR 0041): read in one prefill from a vote of the
+    /// calibrated heads; `confidence` is the winner's share of the votes and
+    /// `ranking` the voted segments by votes, at most five — how much the
+    /// heads agree (`docs/findings/2026-09-27-locate-through-decide.md`).
+    /// No `found`; `pointers` holds the winner alone.
     Locate {
-        segment: usize,
+        kind: LocateKind,
+        method: LocateMethod,
+        compression: LocateCompression,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        found: Option<f64>,
+        segment: Option<usize>,
         #[schema(value_type = serde_json::Value)]
-        value: OrderedValue,
-        confidence: f64,
+        value: Option<OrderedValue>,
+        confidence: Option<f64>,
         ranking: Vec<LocateRank>,
+        pointers: Vec<LocatePointer>,
     },
     /// This question alone failed at *runtime*, after the GPU was already
     /// spent on its siblings (spec 04).
@@ -1761,10 +1988,20 @@ pub enum Answer {
 }
 
 /// One segment of a `locate`'s ranking (GitHub #275): its index and its share
-/// of the heads' votes.
+/// — of the heads' votes, or of the labelled `choice` (GitHub #278).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct LocateRank {
     pub segment: usize,
+    pub share: f64,
+}
+
+/// A segment a `locate` points at (GitHub #278): its index, its value as the
+/// caller sent it, and its share.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct LocatePointer {
+    pub segment: usize,
+    #[schema(value_type = serde_json::Value)]
+    pub value: OrderedValue,
     pub share: f64,
 }
 
@@ -2270,12 +2507,31 @@ async fn serve(
         ));
     }
 
+    // GitHub #278: each `locate`'s target, the kind it resolves to and the
+    // compression that kind gets — and a kind that contradicts the state
+    // refused — before anything is rendered.
+    let mut resolved_kinds: Vec<Option<(ignis_core::locate::Kind, ignis_core::locate::Compression)>> =
+        Vec::with_capacity(prepared.len());
+    for question in &prepared {
+        resolved_kinds.push(match (&evidence, question.locate) {
+            (Evidence::Json(state), Some(ask)) => Some(resolve_locate(state, question, ask)?),
+            _ => None,
+        });
+    }
+
     // Render every question first. This is the last thing that can refuse
     // the whole request, and it is all CPU: the chat template, the
     // instruction policy and — for an image — the media acquisition and
     // the placeholder expansion.
-    let mut rendered = Vec::with_capacity(prepared.len());
+    //
+    // GitHub #278: a `shortlist` locate is planned here — its target, its
+    // fold, every reading it is asked before it has read anything — and
+    // answered after the others ([`shortlist::answer_all`]): each of its
+    // later steps is rendered from an earlier one's answer.
+    let mut main: Vec<(usize, Rendered)> = Vec::with_capacity(prepared.len());
     let mut plans: Vec<Option<LocatePlan>> = Vec::with_capacity(prepared.len());
+    let mut shortlists: Vec<shortlist::Question> = Vec::new();
+    let mut readings = shortlist::Readings::default();
     // GitHub #275: one content-free baseline per `locate` target, shared by
     // every `locate` over it — rendered with the questions, asked after them.
     let mut baselines: Vec<Baseline> = Vec::new();
@@ -2285,33 +2541,52 @@ async fn serve(
     // its prompt up to the end of the state, so they claim the fan-out's head,
     // which covers every one of those ends, and their run ends are its keys.
     let mut systems = std::collections::BTreeSet::new();
-    for question in &prepared {
-        match (locate, &evidence) {
-            (Some(calibration), Evidence::Json(state)) if question.kind == QuestionKind::Locate => {
-                let (ready, plan) =
-                    render_locate(server, state, question, model.clone(), calibration, &mut baselines).await?;
-                rendered.push(ready);
-                plans.push(Some(plan));
-            }
+    for (slot, question) in prepared.iter().enumerate() {
+        match (locate, &evidence, resolved_kinds[slot], question.locate) {
+            (Some(calibration), Evidence::Json(state), Some((kind, compression)), Some(ask)) => match ask.method {
+                ignis_core::locate::Method::Vote => {
+                    let (ready, plan) =
+                        render_locate(server, state, question, model.clone(), calibration, kind, &mut baselines).await?;
+                    main.push((slot, ready));
+                    plans.push(Some(plan));
+                }
+                ignis_core::locate::Method::Shortlist => {
+                    let planned = shortlist::plan(
+                        server,
+                        state,
+                        question,
+                        slot,
+                        kind,
+                        compression,
+                        calibration,
+                        model.clone(),
+                        &mut readings,
+                    )
+                    .await?;
+                    shortlists.push(planned);
+                    plans.push(None);
+                }
+            },
             _ => {
                 let first_of_kind = systems.insert(question.prompt_kind().system_text(question.digits));
                 let part_ends = first_of_kind && matches!(evidence, Evidence::Parts(_));
-                rendered.push(render(server, &evidence, question, model.clone(), part_ends).await?);
+                main.push((slot, render(server, &evidence, question, model.clone(), part_ends).await?));
                 plans.push(None);
             }
         }
     }
-    let asked_questions = rendered.len();
-    rendered.extend(baselines.into_iter().map(|baseline| baseline.ready));
+    let asked_questions = prepared.len();
+    main.extend(baselines.into_iter().enumerate().map(|(b, baseline)| (asked_questions + b, baseline.ready)));
+    let (main_slots, mut main_rendered): (Vec<usize>, Vec<Rendered>) = main.into_iter().unzip();
     // GitHub #270: where each question's state is kept for a later one. Held
     // until the handler is done, answered or dropped, so a fan-out's head
     // never outlives the fan-out.
-    let _fan_out = place_reuse_boundaries(server, &evidence, &markers, &mut rendered);
+    let _fan_out = place_reuse_boundaries(server, &evidence, &markers, &mut main_rendered);
 
-    let input_tokens = rendered
+    let mut input_tokens = main_rendered
         .iter()
         .fold(0u32, |total, ready| total.saturating_add(ready.prompt_tokens));
-    let resolved = rendered.first().map(|ready| ready.model.clone());
+    let resolved = main_rendered.first().map(|ready| ready.model.clone());
 
     // The fan-out (GitHub #240). **One question goes first, alone**, and the
     // rest go together once it is answered.
@@ -2338,11 +2613,15 @@ async fn serve(
         Some(question) if question.kind != QuestionKind::Locate => Collect::Answer(question),
         _ => Collect::Rows,
     };
-    let first_locate = prepared.iter().position(|question| question.kind == QuestionKind::Locate);
-    let leads = |slot: usize| slot == 0 || Some(slot) == first_locate;
-    let mut replies: Vec<Option<Reply>> = (0..rendered.len()).map(|_| None).collect();
+    let first_asked = main_slots.first().copied();
+    let first_vote = main_slots
+        .iter()
+        .copied()
+        .find(|&slot| prepared.get(slot).is_some_and(|question| question.kind == QuestionKind::Locate));
+    let leads = |slot: usize| Some(slot) == first_asked || Some(slot) == first_vote;
+    let mut replies: Vec<Option<Reply>> = (0..asked_questions + main_slots.len()).map(|_| None).collect();
     let (leaders, followers): (Vec<_>, Vec<_>) =
-        rendered.into_iter().enumerate().partition(|(slot, _)| leads(*slot));
+        main_slots.into_iter().zip(main_rendered).partition(|(slot, _)| leads(*slot));
     for (slot, ready) in leaders {
         // A leader the engine has no room for leaves the fan-out with no
         // prefix to share, but it is still one question's failure and not
@@ -2353,49 +2632,36 @@ async fn serve(
             Attempt::Full(_) => Reply::failed(collect(slot), engine_full()),
         });
     }
+    // The followers, in waves ([`in_waves`]).
+    let followers = followers.into_iter().map(|(slot, ready)| (slot, ready, collect(slot))).collect();
+    for (slot, reply) in in_waves(server, followers, class).await {
+        replies[slot] = Some(reply);
+    }
 
-    // The followers, in waves, with whatever the engine turned away put
-    // back for the next one.
-    //
-    // A wave is `FAN_OUT_WIDTH` wide *because* the engine admits about that
-    // many, but it is not the only client: two of its lanes may already be
-    // somebody else's, and then two of this wave's questions come back
-    // `Full`. Answering those with an error would be a failure the
-    // one-at-a-time loop before #240 never produced, so they are re-queued
-    // instead — a wave that answers even one question makes room for them.
-    // A wave where *nothing* got in is an engine with no room at all, and
-    // that is reported rather than spun on.
-    let mut pending: std::collections::VecDeque<_> = followers.into();
-    while !pending.is_empty() {
-        let wave: Vec<_> = (0..FAN_OUT_WIDTH.min(pending.len()))
-            .filter_map(|_| pending.pop_front())
-            .collect();
-        let slots: Vec<usize> = wave.iter().map(|(slot, _)| *slot).collect();
-        let run = wave
-            .into_iter()
-            .map(|(slot, ready)| ask(server, collect(slot), ready, class))
-            .collect();
-        let mut answered_one = false;
-        for (slot, attempt) in slots.into_iter().zip(concurrently(run).await) {
-            match attempt {
-                Attempt::Answered(reply) => {
-                    replies[slot] = Some(reply);
-                    answered_one = true;
-                }
-                Attempt::Full(ready) => pending.push_back((slot, ready)),
-            }
-        }
-        if !answered_one {
-            for (slot, _) in pending.drain(..) {
-                replies[slot] = Some(Reply::failed(collect(slot), engine_full()));
-            }
+    // GitHub #278: every shortlist, step by step.
+    let mut shortlisted: BTreeMap<usize, (Answer, shortlist::Summary)> = BTreeMap::new();
+    let resolved = match (resolved, shortlists.is_empty()) {
+        (Some(resolved), _) => Some(resolved),
+        (None, false) => Some(model.clone().filter(|named| !named.is_empty()).unwrap_or_else(|| server.engine.model_id())),
+        (None, true) => None,
+    };
+    if let (Some(calibration), false) = (locate, shortlists.is_empty()) {
+        let (answered, spent) = shortlist::answer_all(server, shortlists, readings, calibration, model.clone(), class).await;
+        input_tokens = input_tokens.saturating_add(spent);
+        for (slot, answer, summary) in answered {
+            shortlisted.insert(slot, (answer, summary));
         }
     }
 
     // Every question's answer: its own reply, or — for a `locate` — its rows
-    // read against its baseline's (GitHub #275).
+    // read against its baseline's (GitHub #275), or its shortlist's (#278).
     let mut answers = BTreeMap::new();
     for (slot, question) in prepared.iter().enumerate() {
+        if let Some((answer, summary)) = shortlisted.remove(&slot) {
+            record_locate(server, question, &answer, Some(&summary));
+            answers.insert(question.id.clone(), answer);
+            continue;
+        }
         let reply = replies[slot].take().expect("every question was asked");
         let answer = match (reply, &plans[slot], locate) {
             (Reply::Answer(answer), _, _) => answer,
@@ -2405,9 +2671,14 @@ async fn serve(
                     _ => Err(failed("not_completed", "this `locate`'s content-free baseline was never asked".to_owned())),
                 };
                 let answer = match (asked, baseline) {
-                    (Ok(asked), Ok(baseline)) => {
-                        locate_answer_for(&plan.keys, &plan.values, calibration.heads.len(), &asked, &baseline)
-                    }
+                    (Ok(asked), Ok(baseline)) => locate_answer_for(
+                        plan.kind,
+                        &plan.keys,
+                        &plan.values,
+                        calibration.heads.len(),
+                        &asked,
+                        &baseline,
+                    ),
                     (Err(failure), _) => failure,
                     (Ok(_), Err(Answer::Error { code, message })) => Answer::Error {
                         code,
@@ -2415,11 +2686,7 @@ async fn serve(
                     },
                     (Ok(_), Err(other)) => other,
                 };
-                if let (Answer::Locate { .. }, Some(metrics)) = (&answer, &server.metrics) {
-                    // Counted like a head point: a decision with no answer
-                    // mass (ADR 0017). Its baseline is not a decision.
-                    metrics.record_decision(question.kind.primitive(), None);
-                }
+                record_locate(server, question, &answer, None);
                 answer
             }
             (Reply::Rows(_), _, _) => failed("not_a_readout", "this question read attention it has no plan for".to_owned()),
@@ -2447,6 +2714,115 @@ async fn serve(
             output_tokens,
         },
     })
+}
+
+/// A `locate`'s target, the kind it resolves to and its compression (GitHub
+/// #278, spec 22): `auto` told by the target's shape and its fold, a named
+/// kind that contradicts the state refused (`kind_mismatch`), and a fold of
+/// what `auto` told is prose refused — all before any prefill.
+fn resolve_locate(
+    state: &OrderedValue,
+    question: &PreparedQuestion,
+    ask: LocateAsk,
+) -> Result<(ignis_core::locate::Kind, ignis_core::locate::Compression), Refusal> {
+    use ignis_core::locate::{Compression, Kind};
+    let id = question.id.as_str();
+    let within = question.within.as_deref().unwrap_or("");
+    let target = crate::locate::segmentable_target(state, within)
+        .map_err(|error| Refusal::new(error.code(), format!("question {id:?}: {error}")))?;
+    let records = crate::locate::is_records_array(target);
+    let kind = match ask.kind {
+        None => crate::locate::auto_kind(target).0,
+        Some(Kind::Records) if !records => {
+            return Err(Refusal::new(
+                "kind_mismatch",
+                format!("question {id:?} names kind \"records\", and its target is not an array of two or more JSON objects; ask for \"log\" or \"prose\", or omit `kind`"),
+            ));
+        }
+        Some(kind @ (Kind::Log | Kind::Prose)) if records => {
+            return Err(Refusal::new(
+                "kind_mismatch",
+                format!(
+                    "question {id:?} names kind {:?}, and its target is an array of JSON objects, which is read as records; to fold it, ask for kind \"records\" with compression \"template_fold\"",
+                    kind.label()
+                ),
+            ));
+        }
+        Some(kind) => kind,
+    };
+    let compression = ask.compression.unwrap_or(kind.default_compression());
+    if (kind, compression) == (Kind::Prose, Compression::TemplateFold) {
+        return Err(Refusal::new(
+            "compression_unsupported",
+            format!("question {id:?}: its target reads as prose, which does not fold into templates, so \"template_fold\" is refused; ask for \"none\", or omit `compression`"),
+        ));
+    }
+    Ok((kind, compression))
+}
+
+/// Count and log one answered `locate` (GitHub #275, #278): a decision with
+/// no answer mass (ADR 0017), a series of `ignis_locates_total`, and a line
+/// of the request log with what produced it.
+fn record_locate(
+    server: &crate::Server,
+    question: &PreparedQuestion,
+    answer: &Answer,
+    summary: Option<&shortlist::Summary>,
+) {
+    let found_of = |found: Option<f64>| match found {
+        None => crate::metrics::LocateFound::Unmeasured,
+        Some(found) if found >= ignis_core::locate::FOUND_THRESHOLD => crate::metrics::LocateFound::True,
+        Some(_) => crate::metrics::LocateFound::False,
+    };
+    match answer {
+        Answer::Locate { kind, method, compression, found, segment, .. } => {
+            if let Some(metrics) = &server.metrics {
+                // Counted like a head point: a decision with no answer mass
+                // (ADR 0017). Its baseline and its steps are not decisions.
+                metrics.record_decision(question.kind.primitive(), None);
+                metrics.record_locate(kind.label(), method.label(), compression.label(), found_of(*found));
+            }
+            tracing::info!(
+                name: "ignis.decide.located",
+                question = question.id.as_str(),
+                kind = kind.label(),
+                method = method.label(),
+                compression = compression.label(),
+                found = *found,
+                segment = *segment,
+                p_none = summary.and_then(|s| s.p_none),
+                p_yes = summary.and_then(|s| s.p_yes),
+                windows = summary.map(|s| s.windows),
+                templates = summary.and_then(|s| s.templates),
+                template = summary.and_then(|s| s.template),
+                rows = summary.and_then(|s| s.rows),
+                candidates = summary.map(|s| candidates_text(&s.candidates)).unwrap_or_default(),
+                input_tokens = summary.map(|s| s.tokens),
+                "locate answered"
+            );
+        }
+        Answer::Error { code, .. } => {
+            tracing::info!(
+                name: "ignis.decide.located",
+                question = question.id.as_str(),
+                kind = summary.map(|s| s.kind.label()),
+                compression = summary.map(|s| s.compression.label()),
+                error = code.as_str(),
+                "locate failed"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Each `choice`'s candidates, as the request log carries them: segments or
+/// templates comma-separated, one `choice` after another `;`-separated.
+fn candidates_text(candidates: &[Vec<usize>]) -> String {
+    candidates
+        .iter()
+        .map(|list| list.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 /// The tokens this request's **constrained decodes** generated (GitHub #242): each
@@ -2913,6 +3289,7 @@ fn head_query(
 /// each segment's keys over the span the heads read, each segment's value,
 /// and which baseline is its content-free twin.
 struct LocatePlan {
+    kind: ignis_core::locate::Kind,
     keys: Vec<Option<std::ops::Range<usize>>>,
     values: Vec<OrderedValue>,
     baseline: usize,
@@ -2947,6 +3324,7 @@ async fn render_locate(
     question: &PreparedQuestion,
     model: Option<String>,
     calibration: ignis_core::locate::LocateCalibration,
+    kind: ignis_core::locate::Kind,
     baselines: &mut Vec<Baseline>,
 ) -> Result<(Rendered, LocatePlan), Refusal> {
     let within = question.within.as_deref().unwrap_or("");
@@ -2968,7 +3346,7 @@ async fn render_locate(
             "the content-free baseline's prompt maps the state onto other keys than this question's, so the two cannot be read against each other".to_owned(),
         ));
     }
-    Ok((prompt.ready, LocatePlan { keys: prompt.keys, values: prompt.values, baseline }))
+    Ok((prompt.ready, LocatePlan { kind, keys: prompt.keys, values: prompt.values, baseline }))
 }
 
 /// One `locate` prompt over `state` with `instruction`, as the vote was
@@ -2989,6 +3367,66 @@ async fn locate_prompt(
     id: &str,
     model: Option<String>,
     calibration: ignis_core::locate::LocateCalibration,
+) -> Result<LocatePrompt, Refusal> {
+    let prompt = render_reading(server, state, within, instruction, id, model, calibration.heads).await?;
+    too_few_segments(id, &prompt.keys, 2)?;
+    if prompt.span.len() > calibration.max_keys as usize {
+        return Err(Refusal::new(
+            "locate_too_long",
+            format!(
+                "question {id:?}: the target spans {} tokens, past the {} a `locate` was measured to hold at on this artifact",
+                prompt.span.len(),
+                calibration.max_keys
+            ),
+        ));
+    }
+    within_context(server, id, &prompt)?;
+    Ok(prompt)
+}
+
+/// Refuse a reading with fewer than `least` segments that own a key: a
+/// `locate` chooses between at least two.
+fn too_few_segments(id: &str, keys: &[Option<std::ops::Range<usize>>], least: usize) -> Result<(), Refusal> {
+    let owning = keys.iter().flatten().count();
+    match owning < least {
+        true => Err(Refusal::new(
+            "locate_too_few_segments",
+            format!(
+                "question {id:?}: {owning} of the target's {} segments own a token of the prompt, and a `locate` chooses between at least two",
+                keys.len()
+            ),
+        )),
+        false => Ok(()),
+    }
+}
+
+/// Refuse a reading prompt past the engine's context.
+fn within_context(server: &crate::Server, id: &str, prompt: &LocatePrompt) -> Result<(), Refusal> {
+    match prompt.ready.prompt_tokens > server.engine.max_model_len() {
+        true => Err(Refusal::new(
+            "context_exceeded",
+            format!(
+                "question {id:?} renders {} prompt tokens with its forced scaffold, past this engine's {} context",
+                prompt.ready.prompt_tokens,
+                server.engine.max_model_len()
+            ),
+        )),
+        false => Ok(()),
+    }
+}
+
+/// A **reading** prompt (GitHub #275, #278): the vote's render — layout L1,
+/// the copy scaffold forced — with the readout naming `heads` in whole rows
+/// over `within`'s key span, and nothing bounded yet: the vote bounds it by
+/// its measured ceiling ([`locate_prompt`]), the shortlist by its window.
+async fn render_reading(
+    server: &crate::Server,
+    state: &OrderedValue,
+    within: &str,
+    instruction: &OrderedValue,
+    id: &str,
+    model: Option<String>,
+    heads: &'static [ignis_core::pointing::PointingHead],
 ) -> Result<LocatePrompt, Refusal> {
     let target = crate::locate::evidence_within(state, within)
         .map_err(|error| Refusal::new(error.code(), format!("question {id:?}: {error}")))?;
@@ -3015,44 +3453,15 @@ async fn locate_prompt(
     let opening = server.template.encode_literal(crate::locate::COPY_OPENING).ok_or_else(unsupported)?;
     let (span, keys) = crate::locate::map_segments(&text.text, &text.offsets, &target)
         .map_err(|message| Refusal::new("render_failed", format!("question {id:?}: {message}")))?;
-    let owning = keys.iter().flatten().count();
-    if owning < 2 {
-        return Err(Refusal::new(
-            "locate_too_few_segments",
-            format!(
-                "question {id:?}: {owning} of the target's {} segments own a token of the prompt, and a `locate` chooses between at least two",
-                keys.len()
-            ),
-        ));
-    }
-    if span.len() > calibration.max_keys as usize {
-        return Err(Refusal::new(
-            "locate_too_long",
-            format!(
-                "question {id:?}: the target spans {} tokens, past the {} a `locate` was measured to hold at on this artifact",
-                span.len(),
-                calibration.max_keys
-            ),
-        ));
-    }
     prompt_tokens = prompt_tokens.saturating_add(opening.len() as u32);
-    if prompt_tokens > server.engine.max_model_len() {
-        return Err(Refusal::new(
-            "context_exceeded",
-            format!(
-                "question {id:?} renders {prompt_tokens} prompt tokens with its forced scaffold, past this engine's {} context",
-                server.engine.max_model_len()
-            ),
-        ));
-    }
     // The scaffold the heads are read at, forced as text the model appears
     // to have written; the readout sits at its last token.
     input.tokens.extend_from_slice(&opening);
     input.decision = Some(ignis_core::DecisionRead::Attention(ignis_core::pointing::AttentionQuery {
-        head: calibration.heads[0],
+        head: heads[0],
         key_begin: span.start as u32,
         key_count: span.len() as u32,
-        set: Some(ignis_core::pointing::SetQuery::rows(calibration.heads)),
+        set: Some(ignis_core::pointing::SetQuery::rows(heads)),
     }));
     Ok(LocatePrompt {
         ready: Rendered { input, model, prompt_tokens, media, grid: None, part_ends: Vec::new(), answered: None },
@@ -3067,7 +3476,11 @@ async fn locate_prompt(
 /// segment's `keys`, with the winner's `value` as the caller sent it. Rows
 /// that did not come back whole — either prefill's — are the question's
 /// failure, never a segment.
+///
+/// GitHub #278: the answer names the `kind` the target resolved to (unused
+/// by the vote), `vote` and `none`, and points at the winner alone.
 pub fn locate_answer_for(
+    kind: ignis_core::locate::Kind,
     keys: &[Option<std::ops::Range<usize>>],
     values: &[OrderedValue],
     heads: usize,
@@ -3080,9 +3493,18 @@ pub fn locate_answer_for(
     };
     match reading {
         Some(reading) if reading.winner < values.len() => Answer::Locate {
-            segment: reading.winner,
-            value: values[reading.winner].clone(),
-            confidence: reading.confidence,
+            kind: kind.into(),
+            method: LocateMethod::Vote,
+            compression: LocateCompression::None,
+            found: None,
+            segment: Some(reading.winner),
+            value: Some(values[reading.winner].clone()),
+            confidence: Some(reading.confidence),
+            pointers: vec![LocatePointer {
+                segment: reading.winner,
+                value: values[reading.winner].clone(),
+                share: reading.confidence,
+            }],
             ranking: reading
                 .ranking
                 .into_iter()
@@ -3104,6 +3526,11 @@ pub fn locate_answer_for(
 #[derive(Clone, Copy)]
 enum Collect<'a> {
     Answer(&'a PreparedQuestion),
+    /// GitHub #278: a readout a `locate`'s shortlist asks on its way to its
+    /// answer — a labelled `choice`, its "none" twin, its yes/no. Shaped as
+    /// any readout, and never counted as a decision of its own: the caller
+    /// asked one `locate`.
+    Step(&'a PreparedQuestion),
     Rows,
 }
 
@@ -3118,7 +3545,7 @@ impl Reply {
     /// in the slot its collection would have filled.
     fn failed(collect: Collect<'_>, failure: Answer) -> Self {
         match collect {
-            Collect::Answer(_) => Self::Answer(failure),
+            Collect::Answer(_) | Collect::Step(_) => Self::Answer(failure),
             Collect::Rows => Self::Rows(Err(failure)),
         }
     }
@@ -3162,8 +3589,11 @@ async fn ask(
     let mut guard = crate::api::CancelOnDrop::new(server.engine.clone(), id);
     // GitHub #275: a `locate`'s completion, or its baseline's, carries the
     // heads' rows, which are an answer only beside the other's.
+    // GitHub #278: a shortlist's step is a readout the caller did not ask
+    // for, and is counted with the `locate` it answers, not beside it.
+    let counted = matches!(collect, Collect::Answer(_));
     let question = match collect {
-        Collect::Answer(question) => question,
+        Collect::Answer(question) | Collect::Step(question) => question,
         Collect::Rows => {
             return Attempt::Answered(Reply::Rows(
                 match crate::engine::collect_attention(&mut events, server.request_timeout).await {
@@ -3253,7 +3683,7 @@ async fn ask(
                 // keeps no trace of how much of the distribution it stood
                 // on — a `choice` of 0.03 answer mass and one of 0.999 are
                 // the same JSON.
-                if let Some(metrics) = &server.metrics {
+                if let (Some(metrics), true) = (&server.metrics, counted) {
                     metrics.record_decision(question.kind.primitive(), Some(readout.answer_mass()));
                 }
                 answer_for(question, &readout)
@@ -3264,6 +3694,72 @@ async fn ask(
             ),
         },
     ))
+}
+
+/// Put `items` to the engine together, [`FAN_OUT_WIDTH`] at a time, with
+/// whatever the engine turned away put back for the next wave.
+///
+/// A wave is `FAN_OUT_WIDTH` wide *because* the engine admits about that
+/// many, but it is not the only client: two of its lanes may already be
+/// somebody else's, and then two of this wave's questions come back
+/// `Full`. Answering those with an error would be a failure the
+/// one-at-a-time loop before #240 never produced, so they are re-queued
+/// instead — a wave that answers even one question makes room for them. A
+/// wave where *nothing* got in is an engine with no room at all, and that is
+/// reported rather than spun on.
+async fn in_waves<'a>(
+    server: &crate::Server,
+    items: Vec<(usize, Rendered, Collect<'a>)>,
+    class: ignis_core::types::RequestClass,
+) -> Vec<(usize, Reply)> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut pending: std::collections::VecDeque<_> = items.into();
+    while !pending.is_empty() {
+        let wave: Vec<_> = (0..FAN_OUT_WIDTH.min(pending.len()))
+            .filter_map(|_| pending.pop_front())
+            .collect();
+        let asked: Vec<(usize, Collect<'a>)> = wave.iter().map(|(slot, _, collect)| (*slot, *collect)).collect();
+        let run = wave
+            .into_iter()
+            .map(|(_, ready, collect)| ask(server, collect, ready, class))
+            .collect();
+        let mut answered_one = false;
+        for ((slot, collect), attempt) in asked.into_iter().zip(concurrently(run).await) {
+            match attempt {
+                Attempt::Answered(reply) => {
+                    out.push((slot, reply));
+                    answered_one = true;
+                }
+                Attempt::Full(ready) => pending.push_back((slot, ready, collect)),
+            }
+        }
+        if !answered_one {
+            for (slot, _, collect) in pending.drain(..) {
+                out.push((slot, Reply::failed(collect, engine_full())));
+            }
+        }
+    }
+    out
+}
+
+/// The first of `items` alone, then the rest [`in_waves`] (GitHub #278): the
+/// first leaves the prefix they share retained, and they claim it.
+async fn led<'a>(
+    server: &crate::Server,
+    mut items: Vec<(usize, Rendered, Collect<'a>)>,
+    class: ignis_core::types::RequestClass,
+) -> Vec<(usize, Reply)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let (slot, ready, collect) = items.remove(0);
+    let first = match ask(server, collect, ready, class).await {
+        Attempt::Answered(reply) => reply,
+        Attempt::Full(_) => Reply::failed(collect, engine_full()),
+    };
+    let mut out = vec![(slot, first)];
+    out.extend(in_waves(server, items, class).await);
+    out
 }
 
 /// What one attempt at a question produced: its reply, or the unsubmitted

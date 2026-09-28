@@ -85,7 +85,7 @@ async fn the_served_locate_prompt_is_the_one_the_vote_was_calibrated_on() {
         // this build, and a record's key order is part of the prompt.
         let state = case["state"].as_str().expect("the state's JSON text");
         let body = format!(
-            r#"{{"state":{state},"questions":{{"q":{{"type":"locate","instructions":{}}}}}}}"#,
+            r#"{{"state":{state},"questions":{{"q":{{"type":"locate","method":"vote","compression":"none","instructions":{}}}}}}}"#,
             json!(instruction)
         );
         let request = Request::builder()
