@@ -86,6 +86,9 @@ pub(crate) mod ffi {
         pub speculative_backend: i32,
         /// Retained slots past the lanes (GitHub #211).
         pub retained_slot_count: u32,
+        /// PROTOTYPE (branch retained-slots-ab): nonzero keeps the retained
+        /// images in one pinned host block instead of the device arenas.
+        pub retained_on_host: u32,
     }
 
     /// 1:1 with `struct ignis_seq_pool_stats`.
@@ -511,7 +514,16 @@ fn pool_spec(
         vocab: cfg.vocab as u32,
         speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
         retained_slot_count: budget.retained_slot_count,
+        retained_on_host: u32::from(retained_on_host(|name| std::env::var(name).ok())),
     }
+}
+
+/// PROTOTYPE (branch retained-slots-ab): `IGNIS_RETAINED_ON_HOST` set to
+/// anything but empty or `0` keeps the retained slots' images in a pinned
+/// host block (`ignis_seq_pool_spec::retained_on_host`). An environment
+/// switch rather than a flag while the layout is an experiment.
+fn retained_on_host(env: impl Fn(&str) -> Option<String>) -> bool {
+    env("IGNIS_RETAINED_ON_HOST").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// The geometry a [`SeqPool`] is built from — everything
@@ -1433,3 +1445,18 @@ unsafe impl Send for PinnedBuffer {}
 // `SeqPool`'s documented single-thread-driver contract above) but never
 // shared by reference across threads, so only `Send` is asserted.
 unsafe impl Send for Seq<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::retained_on_host;
+
+    #[test]
+    fn retained_on_host_is_on_only_for_a_nonzero_value() {
+        let env = |value: Option<&'static str>| move |_: &str| value.map(str::to_string);
+        assert!(!retained_on_host(env(None)));
+        assert!(!retained_on_host(env(Some(""))));
+        assert!(!retained_on_host(env(Some("0"))));
+        assert!(retained_on_host(env(Some("1"))));
+        assert!(retained_on_host(env(Some("yes"))));
+    }
+}

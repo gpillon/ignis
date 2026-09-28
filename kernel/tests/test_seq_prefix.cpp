@@ -63,6 +63,11 @@ namespace {
 
 int failures = 0;
 
+// PROTOTYPE (branch retained-slots-ab): the second pass of main() builds
+// every pool with its retained images in the pinned host block
+// (`ignis_seq_pool_spec::retained_on_host`) and runs the same checks.
+bool g_retained_on_host = false;
+
 void expect(bool ok, const char *label) {
   if (!ok) {
     std::fprintf(stderr, "FAIL: %s\n", label);
@@ -201,6 +206,40 @@ std::vector<unsigned char> mutable_image_of(const ignis_seq_pool &pool, std::int
   return image;
 }
 
+// PROTOTYPE: one CLONE section's payload out of retained slot `retained`'s
+// host image.
+std::vector<unsigned char> host_section_of(const ignis_seq_pool &pool, std::uint32_t retained,
+                                           std::int32_t kind) {
+  const unsigned char *image = pool.retained_host_image(ignis_seq_retained_pool_slot(pool, retained));
+  for (const ignis_seq_section &section : ignis_seq_prefix_clone_layout(pool)) {
+    if (section.kind == kind) {
+      return {image + section.offset, image + section.offset + section.bytes};
+    }
+  }
+  return {};
+}
+
+// Retained slot `retained`'s mutable image as `mutable_image_of` lays a
+// lane's out, wherever the pool keeps it.
+std::vector<unsigned char> retained_mutable_image_of(const ignis_seq_pool &pool,
+                                                     std::uint32_t retained) {
+  if (!pool.retained_on_host) {
+    return mutable_image_of(pool, ignis_seq_retained_pool_slot(pool, retained));
+  }
+  std::vector<unsigned char> image;
+  for (const std::int32_t kind : {IGNIS_SEQ_SECTION_GDN_CONV, IGNIS_SEQ_SECTION_GDN_RECURRENT,
+                                  IGNIS_SEQ_SECTION_PENALTY_COUNTS}) {
+    const std::vector<unsigned char> bytes = host_section_of(pool, retained, kind);
+    image.insert(image.end(), bytes.begin(), bytes.end());
+  }
+  return image;
+}
+
+std::vector<unsigned char> retained_hq_window_of(const ignis_seq_pool &pool, std::uint32_t retained) {
+  return pool.retained_on_host ? host_section_of(pool, retained, IGNIS_SEQ_SECTION_HQ_RESIDUAL)
+                               : hq_window_of(pool, ignis_seq_retained_pool_slot(pool, retained));
+}
+
 // Every plane's bytes for one physical page -- the KV history itself, used to
 // show that a shared page is never zeroed or rewritten by a claim.
 std::vector<unsigned char> page_image_of(const ignis_seq_pool &pool, std::int32_t page_id) {
@@ -246,6 +285,7 @@ ignis_seq_pool_spec small_spec() {
   spec.gdn_head_dim        = 4;
   spec.vocab               = 32;
   spec.retained_slot_count = 4;
+  spec.retained_on_host    = g_retained_on_host ? 1u : 0u;
   return spec;
 }
 
@@ -275,6 +315,7 @@ ignis_seq_pool_spec qwen38_27b_spec(std::uint32_t context_tokens, std::uint32_t 
   spec.gdn_head_dim        = 128;
   spec.vocab               = 248320;
   spec.retained_slot_count = 1;
+  spec.retained_on_host    = g_retained_on_host ? 1u : 0u;
   return spec;
 }
 
@@ -456,7 +497,7 @@ void check_a_claimant_receives_the_hq_window() {
   ignis_seq_prefix *prefix = nullptr;
   expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 1, &prefix), 0,
             "hq window clone: publish");
-  expect(hq_window_of(*pool, ignis_seq_retained_pool_slot(*pool, 1)) == at_boundary,
+  expect(retained_hq_window_of(*pool, 1) == at_boundary,
          "hq window clone: the prefix's retained slot holds the publisher's window");
 
   // The publisher appends past the prefix: its ring moves on.
@@ -816,7 +857,7 @@ void check_the_image_lives_in_a_retained_slot() {
   // The image is the publisher's state, in the retained slot it was named.
   const std::vector<unsigned char> at_boundary = mutable_image_of(*pool, first->slot);
   expect_rc(ignis_seq_prefix_publish(pool, first, kPrefix, 3, &prefix), 0, "slot: publish");
-  expect(mutable_image_of(*pool, ignis_seq_retained_pool_slot(*pool, 3)) == at_boundary,
+  expect(retained_mutable_image_of(*pool, 3) == at_boundary,
          "slot: the image is the publisher's state, held in retained slot 3");
 
   // A second publish may not write over it, nor may a plain store.
@@ -826,7 +867,7 @@ void check_the_image_lives_in_a_retained_slot() {
   expect(other == nullptr && second->prefix == nullptr, "slot: and changes nothing");
   expect_rc(ignis_seq_retained_store(pool, second, 3), -1,
             "slot: a store into a held slot is refused");
-  expect(mutable_image_of(*pool, ignis_seq_retained_pool_slot(*pool, 3)) == at_boundary,
+  expect(retained_mutable_image_of(*pool, 3) == at_boundary,
          "slot: the held image is untouched");
 
   // The pages outlive the handle; the image does not.
@@ -903,7 +944,8 @@ void report_clone_cost() {
                   static_cast<double>(
                       ninfer::paged_kv_host_image_bytes(pool->kv_pool, 1)) /
                   (1024.0 * 1024.0));
-  std::printf("  cloned state      : %.2f MiB device to device\n", mib);
+  std::printf("  cloned state      : %.2f MiB %s to device\n", mib,
+              pool->retained_on_host ? "host" : "device");
   std::printf("  clone             : %.3f ms (mean of %d)\n", mean_micros / 1000.0, kReps);
   std::printf("  effective         : %.1f GB/s\n",
               static_cast<double>(published.clone_image_bytes) / (mean_micros * 1e-6) / 1e9);
@@ -920,11 +962,46 @@ void report_clone_cost() {
   // round-trip", checked rather than asserted in a comment.
   const double one_pcie_crossing_micros =
       static_cast<double>(published.clone_image_bytes) / 12e9 * 1e6;
-  expect(mean_micros < one_pcie_crossing_micros / 3.0,
+  // PROTOTYPE: a host-resident image crosses PCIe by design, so only the
+  // device layout is held to it.
+  expect(pool->retained_on_host || mean_micros < one_pcie_crossing_micros / 3.0,
          "cost: the clone is far too fast to have crossed PCIe");
   ignis_seq_release(pool, publisher);
   ignis_seq_prefix_release(pool, prefix);
   ignis_seq_pool_free(pool);
+}
+
+// PROTOTYPE: with the images on the host the device arenas hold the lanes
+// alone -- the same bytes as a pool with no retained slot -- and the pinned
+// block holds one packed clone image per retained slot.
+void check_host_retained_layout() {
+  ignis_seq_pool_spec host = small_hq_spec();
+  host.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
+  host.retained_on_host    = 1;
+  ignis_seq_pool_spec none = host;
+  none.retained_slot_count = 0;
+  none.retained_on_host    = 0;
+  ignis_seq_pool *with_host = nullptr;
+  ignis_seq_pool *without   = nullptr;
+  expect_rc(ignis_seq_pool_create(&host, &with_host), 0, "host layout: pool create");
+  expect_rc(ignis_seq_pool_create(&none, &without), 0, "host layout: bare pool create");
+  struct ignis_seq_pool_stats h{}, n{};
+  expect_rc(ignis_seq_pool_stats(with_host, &h), 0, "host layout: stats");
+  expect_rc(ignis_seq_pool_stats(without, &n), 0, "host layout: bare stats");
+  expect(h.retained_state_bytes == 0, "host layout: no retained state on the device");
+  expect(h.lane_state_bytes == n.lane_state_bytes, "host layout: the lanes' state is unchanged");
+  expect(h.hq_residual_bytes == n.hq_residual_bytes,
+         "host layout: the residual window is the lanes' alone");
+  struct ignis_seq_pool_plan plan{};
+  expect_rc(ignis_seq_pool_plan(&host, &plan), 0, "host layout: plan");
+  expect(plan.retained_state_bytes == h.retained_state_bytes &&
+             plan.lane_state_bytes == h.lane_state_bytes && plan.hq_residual_bytes == h.hq_residual_bytes,
+         "host layout: the plan is what the pool holds");
+  expect(with_host->retained_host.bytes == host.retained_slot_count * with_host->retained_host_stride &&
+             with_host->retained_host_stride >= with_host->retained_image_bytes(),
+         "host layout: one packed image per retained slot in the pinned block");
+  ignis_seq_pool_free(with_host);
+  ignis_seq_pool_free(without);
 }
 
 } // namespace
@@ -1021,15 +1098,7 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2, bool hq 
   ignis_seq_pool_free(pool);
 }
 
-int main() {
-  int device_count            = 0;
-  const cudaError_t available = cudaGetDeviceCount(&device_count);
-  if (cuda_unavailable(available) || device_count == 0) {
-    // ADR 0006: a missing GPU is a failure here, never a skip.
-    std::fprintf(stderr, "FAIL: no CUDA device (%s)\n", cudaGetErrorString(available));
-    return 1;
-  }
-
+void run_all() {
   check_publish_shares_pages_and_charges_once();
   check_a_claimant_receives_the_mutable_state();
   check_a_claimant_receives_the_drafter_window();
@@ -1042,6 +1111,24 @@ int main() {
   check_refusals();
   check_the_image_lives_in_a_retained_slot();
   report_clone_cost();
+}
+
+int main() {
+  int device_count            = 0;
+  const cudaError_t available = cudaGetDeviceCount(&device_count);
+  if (cuda_unavailable(available) || device_count == 0) {
+    // ADR 0006: a missing GPU is a failure here, never a skip.
+    std::fprintf(stderr, "FAIL: no CUDA device (%s)\n", cudaGetErrorString(available));
+    return 1;
+  }
+
+  run_all();
+  // PROTOTYPE (branch retained-slots-ab): every check again with the
+  // retained images in the pinned host block.
+  g_retained_on_host = true;
+  std::printf("-- retained images on the host --\n");
+  check_host_retained_layout();
+  run_all();
 
   if (failures != 0) {
     std::cerr << failures << " prefix reuse check(s) failed\n";

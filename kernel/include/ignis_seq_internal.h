@@ -144,6 +144,29 @@ struct ignis_seq_pool {
    * lanes (GitHub #211), and what one slot's state occupies. */
   std::uint32_t retained_slot_count = 0;
   std::uint64_t slot_state_bytes = 0;
+  /* PROTOTYPE (`ignis_seq_pool_spec::retained_on_host`): the retained slots'
+   * images live in `retained_host`, one pinned block of
+   * `retained_slot_count * retained_host_stride` bytes, each image laid out
+   * as `ignis_seq_prefix_clone_layout` packs it -- and the device arenas
+   * above hold the lanes alone. */
+  bool retained_on_host = false;
+  std::uint64_t retained_host_stride = 0;
+  struct pinned_block {
+    void *p = nullptr;
+    std::uint64_t bytes = 0;
+    pinned_block() = default;
+    pinned_block(const pinned_block &) = delete;
+    pinned_block &operator=(const pinned_block &) = delete;
+    ~pinned_block();
+  } retained_host;
+  /* Pool slot `slot` is a retained slot whose image is in `retained_host`. */
+  bool is_host_retained(std::int32_t slot) const {
+    return retained_on_host && slot >= kv_pool.table_row_count();
+  }
+  unsigned char *retained_host_image(std::int32_t slot) const {
+    return static_cast<unsigned char *>(retained_host.p) +
+           static_cast<std::uint64_t>(slot - kv_pool.table_row_count()) * retained_host_stride;
+  }
   /* Which retained slots hold a published prefix's or a captured checkpoint's
    * image (GitHub #215), one flag per slot. The caller decides which slot a
    * publish or a capture takes (`ignis_core::RetainedSlotLedger`); this is the

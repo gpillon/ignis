@@ -189,6 +189,15 @@ struct ignis_seq_pool_spec {
    * one to a sequence; `ignis_seq_retained_store` / `_load` move a lane's
    * state in and out. 0 reserves none. */
   uint32_t retained_slot_count;
+  /* PROTOTYPE (branch retained-slots-ab): nonzero keeps every retained
+   * slot's image in one pinned host block reserved at pool create --
+   * `retained_slot_count` images laid out as `ignis_seq_prefix_clone_layout`
+   * packs them -- instead of in the device state arenas beside the lanes.
+   * The device arenas then hold the lanes alone; a capture copies a lane's
+   * state to the host and a claim copies it back, over PCIe and
+   * synchronized. KV pages are untouched: a retained object's pages stay in
+   * the device pool either way. 0 is the device layout. */
+  uint32_t retained_on_host;
 };
 
 struct ignis_seq_pool_stats {

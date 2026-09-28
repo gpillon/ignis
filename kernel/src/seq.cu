@@ -44,6 +44,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 // `ignis_seq_internal.h` restates the codec's per-row byte budgets so that
 // header stays free of the codec's CUDA includes. This translation unit has
 // both, so it is where the restatement is checked: VENDOR.md's `verify`
@@ -401,6 +403,10 @@ void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_s
   std::memcpy(base + sizeof(header), sections.data(), sections.size() * sizeof(ignis_seq_section));
   ignis_seq_zero_blob_gaps(base, sections, header.total_bytes);
   const std::int32_t slot = ignis_seq_retained_pool_slot(pool, retained_slot);
+  // PROTOTYPE: a host-resident image is already the blob's bytes, section by
+  // section; it is copied, not packed off the device.
+  const std::vector<ignis_seq_section> image_layout =
+      pool.is_host_retained(slot) ? ignis_seq_prefix_clone_layout(pool) : std::vector<ignis_seq_section>{};
   for (const ignis_seq_section &section : sections) {
     unsigned char *at = base + section.offset;
     switch (section.kind) {
@@ -411,6 +417,22 @@ void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_s
       std::memcpy(at, &progress, sizeof(progress));
       break;
     default:
+      if (pool.is_host_retained(slot)) {
+        const ignis_seq_section *placed = nullptr;
+        for (const ignis_seq_section &candidate : image_layout) {
+          if (candidate.kind == section.kind) {
+            placed = &candidate;
+          }
+        }
+        if (placed == nullptr || placed->bytes != section.bytes) {
+          throw std::logic_error(std::string("state section ") +
+                                 ignis_seq_section_name(section.kind) +
+                                 " is not in the host image as the blob lays it out");
+        }
+        std::memcpy(at, pool.retained_host_image(slot) + placed->offset,
+                    static_cast<std::size_t>(section.bytes));
+        break;
+      }
       // Every other section is device-resident state, held in the retained
       // slot exactly as a lane holds it.
       if (!pack_slot_section_to_host(pool, slot, section, sections, base)) {
@@ -576,8 +598,16 @@ struct PoolLayout {
 
 // Every slot the state arenas hold: the lanes, then the retained slots past
 // them (GitHub #211). The KV block tables hold the lanes' rows only.
+// PROTOTYPE: with `retained_on_host` the retained images live in a pinned
+// host block and the device arenas hold the lanes alone.
 std::uint32_t state_slot_count(const struct ignis_seq_pool_spec &spec) {
-  return spec.slot_count + spec.retained_slot_count;
+  return spec.slot_count + (spec.retained_on_host != 0 ? 0 : spec.retained_slot_count);
+}
+
+// The retained slots' share of the device state arenas.
+std::uint64_t device_retained_bytes(const struct ignis_seq_pool_spec &spec,
+                                    std::uint64_t slot_state_bytes) {
+  return spec.retained_on_host != 0 ? 0 : spec.retained_slot_count * slot_state_bytes;
 }
 
 std::uint64_t per_slot_bytes(const std::vector<ninfer::LayoutRegion> &regions,
@@ -668,7 +698,7 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
 std::uint64_t lane_state_bytes_of(const PoolLayout &layout,
                                   const struct ignis_seq_pool_spec &spec) {
   return layout.gdn_bytes + layout.sampling_counts_bytes + layout.dflash2_bytes -
-         spec.retained_slot_count * layout.slot_state_bytes;
+         device_retained_bytes(spec, layout.slot_state_bytes);
 }
 
 // One slot's share of every region in `regions`.
@@ -709,7 +739,7 @@ extern "C" int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
     out->kv_bytes = layout.kv_bytes;
     out->lane_state_bytes = lane_state_bytes_of(layout, *spec);
     out->slot_state_bytes = layout.slot_state_bytes;
-    out->retained_state_bytes = spec->retained_slot_count * layout.slot_state_bytes;
+    out->retained_state_bytes = device_retained_bytes(*spec, layout.slot_state_bytes);
     out->hq_residual_bytes = layout.hq_residual_bytes;
     return 0;
   } catch (const std::exception &e) {
@@ -775,6 +805,28 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
       }
     }
 
+    // PROTOTYPE: the retained images' pinned host block, reserved whole here
+    // like every other reservation of the pool (ADR 0030), one packed clone
+    // image per retained slot.
+    pool->retained_on_host = spec->retained_on_host != 0;
+    if (pool->retained_on_host && spec->retained_slot_count != 0) {
+      const std::vector<ignis_seq_section> image = ignis_seq_prefix_clone_layout(*pool);
+      std::uint64_t stride = 0;
+      for (const ignis_seq_section &section : image) {
+        stride = std::max<std::uint64_t>(stride, section.offset + section.bytes);
+      }
+      pool->retained_host_stride = ignis_seq_align_up(stride, kIgnisSeqSectionAlign);
+      const std::uint64_t bytes = pool->retained_host_stride * spec->retained_slot_count;
+      const cudaError_t err =
+          cudaHostAlloc(&pool->retained_host.p, static_cast<std::size_t>(bytes), cudaHostAllocDefault);
+      if (err != cudaSuccess) {
+        pool->retained_host.p = nullptr;
+        throw std::runtime_error("cudaHostAlloc of the retained slots' " + std::to_string(bytes) +
+                                 "-byte host block failed: " + cudaGetErrorString(err));
+      }
+      pool->retained_host.bytes = bytes;
+    }
+
     pool->free_slots.reserve(spec->slot_count);
     for (std::uint32_t i = 0; i < spec->slot_count; ++i) {
       pool->free_slots.push_back(static_cast<std::int32_t>(i));
@@ -815,7 +867,9 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
   out_stats->kv_arena_bytes = pool->kv_arena.capacity();
   out_stats->retained_slot_count  = pool->retained_slot_count;
   out_stats->slot_state_bytes     = pool->slot_state_bytes;
-  out_stats->retained_state_bytes = pool->retained_slot_count * pool->slot_state_bytes;
+  // PROTOTYPE: host-resident retained images hold no device bytes.
+  out_stats->retained_state_bytes =
+      pool->retained_on_host ? 0 : pool->retained_slot_count * pool->slot_state_bytes;
   out_stats->lane_state_bytes = pool->gdn_arena.capacity() + pool->sampling_counts.bytes +
                                 (pool->has_dflash2() ? pool->dflash2_arena->capacity() : 0) -
                                 out_stats->retained_state_bytes;
@@ -825,6 +879,12 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
 
 extern "C" void ignis_seq_pool_free(struct ignis_seq_pool *pool) {
   delete pool;
+}
+
+ignis_seq_pool::pinned_block::~pinned_block() {
+  if (p != nullptr) {
+    cudaFreeHost(p);
+  }
 }
 
 extern "C" int32_t ignis_seq_alloc(struct ignis_seq_pool *pool, uint32_t context_tokens,
@@ -1153,7 +1213,71 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
 // device-to-device move of a sequence's mutable state: a prefix publish and a
 // checkpoint capture copy a lane into a retained slot, and a claim copies it
 // back.
+namespace {
+
+// PROTOTYPE: a lane's state into a host-resident retained image, laid out as
+// `ignis_seq_prefix_clone_layout` packs it -- the snapshot's own per-section
+// packers, so the image's bytes are the blob's.
+void copy_lane_to_host_image(const ignis_seq_pool &pool, std::int32_t lane, unsigned char *image) {
+  const std::vector<ignis_seq_section> layout = ignis_seq_prefix_clone_layout(pool);
+  for (const ignis_seq_section &section : layout) {
+    if (!pack_slot_section_to_host(pool, lane, section, layout, image)) {
+      throw std::logic_error(std::string("state section ") + ignis_seq_section_name(section.kind) +
+                             " has no lane-to-host implementation");
+    }
+  }
+}
+
+// PROTOTYPE: the reverse -- the restore's per-section unpackers.
+void copy_host_image_to_lane(ignis_seq_pool &pool, const unsigned char *image, std::int32_t lane) {
+  const std::vector<ignis_seq_section> layout = ignis_seq_prefix_clone_layout(pool);
+  const std::uint64_t recurrent_at = ignis_seq_section_offset(layout, IGNIS_SEQ_SECTION_GDN_RECURRENT);
+  for (const ignis_seq_section &section : layout) {
+    const unsigned char *at = image + section.offset;
+    switch (section.kind) {
+    case IGNIS_SEQ_SECTION_GDN_CONV:
+      pool.gdn_pool.unpack_slot_from_host(lane, at, image + recurrent_at, nullptr);
+      break;
+    case IGNIS_SEQ_SECTION_GDN_RECURRENT:
+      break;
+    case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
+      checked_memcpy_async(pool.token_counts_for(lane), at, static_cast<std::size_t>(section.bytes),
+                           cudaMemcpyHostToDevice, "penalty counts");
+      break;
+    case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+      pool.dflash2_window->copy_lane_from_host(at, lane, nullptr);
+      break;
+    case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
+      ignis_seq_copy_hq_residual(pool, lane, const_cast<unsigned char *>(at), cudaMemcpyHostToDevice);
+      break;
+    default:
+      throw std::logic_error(std::string("state section ") + ignis_seq_section_name(section.kind) +
+                             " has no host-to-lane implementation");
+    }
+  }
+}
+
+} // namespace
+
 void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int32_t dst) {
+  // PROTOTYPE: a host-resident retained slot crosses PCIe, synchronized like
+  // the device copy below.
+  if (pool.is_host_retained(src) || pool.is_host_retained(dst)) {
+    if (pool.is_host_retained(src) && pool.is_host_retained(dst)) {
+      throw std::logic_error("a retained image is never copied onto another");
+    }
+    if (pool.is_host_retained(dst)) {
+      copy_lane_to_host_image(pool, src, pool.retained_host_image(dst));
+    } else {
+      copy_host_image_to_lane(pool, pool.retained_host_image(src), dst);
+    }
+    const cudaError_t err = cudaStreamSynchronize(nullptr);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaStreamSynchronize after a host slot copy failed: ") +
+                               cudaGetErrorString(err));
+    }
+    return;
+  }
   const auto copy = [](void *to, const void *from, std::size_t bytes, const char *what) {
     const cudaError_t err = cudaMemcpyAsync(to, from, bytes, cudaMemcpyDeviceToDevice, nullptr);
     if (err != cudaSuccess) {
