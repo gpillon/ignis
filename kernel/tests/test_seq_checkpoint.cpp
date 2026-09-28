@@ -56,6 +56,11 @@ namespace {
 
 int failures = 0;
 
+// GitHub #281: the second pass of main() builds every pool with its
+// retained slots on the host (`ignis_seq_pool_spec::retained_host_slot_count`)
+// instead of the device, and runs the same checks.
+bool g_host_slots = false;
+
 void expect(bool ok, const char *label) {
   if (!ok) {
     std::fprintf(stderr, "FAIL: %s\n", label);
@@ -229,6 +234,10 @@ ignis_seq_pool_spec small_spec(int32_t kv_format = IGNIS_KV_FORMAT_BF16) {
   spec.gdn_head_dim        = 4;
   spec.vocab               = 32;
   spec.retained_slot_count = 4;
+  if (g_host_slots) {
+    spec.retained_host_slot_count = spec.retained_slot_count;
+    spec.retained_slot_count      = 0;
+  }
   return spec;
 }
 
@@ -703,7 +712,8 @@ void check_refusals() {
   // GitHub #215: a slot out of range, or one the prefix under it holds.
   struct ignis_seq_pool_stats before_slots{};
   expect_rc(ignis_seq_pool_stats(pool, &before_slots), 0, "refuse: pool stats before slots");
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, spec.retained_slot_count, &out),
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener,
+                                         spec.retained_slot_count + spec.retained_host_slot_count, &out),
             -1, "refuse: a retained slot past the pool's");
   expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kPrefixSlot, &out), -1,
             "refuse: the retained slot the prefix's image is in");
@@ -725,18 +735,7 @@ void check_refusals() {
   ignis_seq_pool_free(pool);
 }
 
-} // namespace
-
-int main() {
-  int device_count      = 0;
-  const cudaError_t err = cudaGetDeviceCount(&device_count);
-  if (err != cudaSuccess || device_count == 0) {
-    std::fprintf(stderr,
-                 "FAIL: no usable CUDA device (%s). ADR 0006: a GPU test fails here, it does "
-                 "not skip.\n",
-                 cuda_unavailable(err) ? cudaGetErrorString(err) : "device count is zero");
-    return 1;
-  }
+void run_all() {
   check_capture_perturbs_nothing();
   check_a_page_aligned_opener_takes_no_page();
   // Both KV formats: BF16 is the oracle (ADR 0022), hq-e8-2b is what the
@@ -751,6 +750,25 @@ int main() {
   check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(false);
   check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(true);
   check_refusals();
+}
+
+} // namespace
+
+int main() {
+  int device_count      = 0;
+  const cudaError_t err = cudaGetDeviceCount(&device_count);
+  if (err != cudaSuccess || device_count == 0) {
+    std::fprintf(stderr,
+                 "FAIL: no usable CUDA device (%s). ADR 0006: a GPU test fails here, it does "
+                 "not skip.\n",
+                 cuda_unavailable(err) ? cudaGetErrorString(err) : "device count is zero");
+    return 1;
+  }
+  run_all();
+  // GitHub #281: every check again with the retained slots on the host --
+  // a checkpoint captured into one, claimed from one and spilled from one.
+  g_host_slots = true;
+  run_all();
   if (failures != 0) {
     std::fprintf(stderr, "%d checkpoint check(s) failed\n", failures);
     return 1;

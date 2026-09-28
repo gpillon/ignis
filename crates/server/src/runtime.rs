@@ -677,12 +677,15 @@ mod tests {
         );
     }
 
-    /// The host slots of a default load: 16 images of 232,532,224 bytes (the
-    /// 27B geometry's packed clone image under hq-e8-2b and DFlash2).
-    const DEFAULT_HOST_SLOTS: RetainedSlotsPlan = RetainedSlotsPlan {
-        device_slots: 0,
-        host_slots: 16,
-        host_bytes: 16 * 232_532_224,
+    /// One retained image at the serving shape (hq-e8-2b, DFlash2), as the
+    /// host block packs it.
+    const HOST_IMAGE_BYTES: u64 = 232_532_224;
+    /// A default load's retained slots: none in VRAM, the host ones in their
+    /// pinned block.
+    const DEFAULT_RETAINED: RetainedSlotsPlan = RetainedSlotsPlan {
+        device_slots: crate::config::DEFAULT_RETAINED_DEVICE_SLOTS,
+        host_slots: crate::config::DEFAULT_RETAINED_HOST_SLOTS,
+        host_bytes: crate::config::DEFAULT_RETAINED_HOST_SLOTS as u64 * HOST_IMAGE_BYTES,
     };
 
     fn captured_vram_plan(plan: &ignis_core::VramPlan) -> Vec<serde_json::Value> {
@@ -690,7 +693,7 @@ mod tests {
         let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
         let subscriber =
             tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_HOST_SLOTS));
+        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_RETAINED));
         sink.lines()
             .iter()
             .map(|line| serde_json::from_str(line).expect("valid json"))
@@ -753,9 +756,9 @@ mod tests {
         assert_eq!(field("oversubscribed"), false);
         // GitHub #281: the retained slots of both kinds, and the host block
         // that is none of the VRAM lines above.
-        assert_eq!(field("retained_device_slots"), 0);
-        assert_eq!(field("retained_host_slots"), 16);
-        assert_eq!(field("retained_host_bytes"), 16u64 * 232_532_224);
+        assert_eq!(field("retained_device_slots"), DEFAULT_RETAINED.device_slots);
+        assert_eq!(field("retained_host_slots"), DEFAULT_RETAINED.host_slots);
+        assert_eq!(field("retained_host_bytes"), DEFAULT_RETAINED.host_bytes);
     }
 
     #[test]

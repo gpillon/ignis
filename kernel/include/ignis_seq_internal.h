@@ -159,18 +159,19 @@ struct ignis_seq_pool {
     pinned_block &operator=(const pinned_block &) = delete;
     ~pinned_block();
   } retained_host;
+  /* The pool slot index of the first host retained slot: past every lane and
+   * every device retained slot. */
+  std::int32_t first_host_retained_slot() const {
+    return kv_pool.table_row_count() + static_cast<std::int32_t>(retained_device_slot_count);
+  }
   /* Pool slot `slot` is a host retained slot, its image in `retained_host`. */
   bool is_host_retained(std::int32_t slot) const {
-    const std::int32_t first_host =
-        kv_pool.table_row_count() + static_cast<std::int32_t>(retained_device_slot_count);
-    return slot >= first_host &&
+    return slot >= first_host_retained_slot() &&
            slot < kv_pool.table_row_count() + static_cast<std::int32_t>(retained_slot_count);
   }
   unsigned char *retained_host_image(std::int32_t slot) const {
-    const std::int32_t first_host =
-        kv_pool.table_row_count() + static_cast<std::int32_t>(retained_device_slot_count);
     return static_cast<unsigned char *>(retained_host.p) +
-           static_cast<std::uint64_t>(slot - first_host) * retained_host_stride;
+           static_cast<std::uint64_t>(slot - first_host_retained_slot()) * retained_host_stride;
   }
   /* Which retained slots hold a published prefix's or a captured checkpoint's
    * image (GitHub #215), one flag per slot. The caller decides which slot a
@@ -413,8 +414,9 @@ inline std::string ignis_seq_retained_slot_refusal(const ignis_seq_pool &pool,
 }
 
 /* Copy every mutable state section of pool slot `src` over pool slot `dst`,
- * device to device, and synchronize: a lane into a retained slot, a retained
- * slot into a lane. Walks the CLONE sections of the state-section table, so a
+ * and synchronize: a lane into a retained slot, a retained slot into a lane --
+ * device to device, or across PCIe when the retained slot is a host one
+ * (GitHub #281). Walks the CLONE sections of the state-section table, so a
  * section added there without a case here throws rather than being silently
  * left behind (ADR 0024's "carried by all or by none"). Defined in
  * kernel/src/seq.cu. */

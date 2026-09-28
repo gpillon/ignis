@@ -227,14 +227,16 @@ struct ignis_seq_pool_stats {
   /* Every lane's mutable state on the device: the GDN state arena, the
    * penalty counts and, under DFLASH2, the drafter's window (GitHub #210) -- the retained slots' share of those arenas excluded. */
   uint64_t lane_state_bytes;
-  /* The retained slots (GitHub #211): how many, what one slot's state
-   * occupies, and `retained_slot_count * slot_state_bytes`. */
+  /* The device retained slots (GitHub #211): how many, what one slot's state
+   * occupies, and `retained_slot_count * slot_state_bytes`. The host ones
+   * (GitHub #281) are counted below, apart. */
   uint32_t retained_slot_count;
   uint64_t slot_state_bytes;
   uint64_t retained_state_bytes;
   /* The hq-e8-2b residual window (GitHub #257, spec runtime/06): the exact
    * sink and recent-ring K/V rows and the ring's validity words of every
-   * slot, lanes and retained slots alike -- its own plan line, in none of the
+   * slot, lanes and device retained slots alike (a host slot's window rides in
+   * its image) -- its own plan line, in none of the
    * lines above (`slot_state_bytes` leaves it out, so nothing counts it
    * twice). 0 on a BF16 pool. */
   uint64_t hq_residual_bytes;
@@ -490,7 +492,8 @@ int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct ignis_seq *
 /* Allocate a sequence that claims `prefix`: its first `prefix_tokens` pages
  * are the prefix's own physical pages (shared, not copied, not zeroed), the
  * rest is a fresh zeroed reservation of its own, and its mutable state is a
- * device-to-device clone of the prefix's.
+ * clone of the prefix's -- device to device, or from the host block when the
+ * prefix's image is in a host retained slot (GitHub #281).
  *
  * The returned sequence stands exactly where the publisher stood: same
  * frontier, same pending token, same GDN state, same penalty counts. It
@@ -611,8 +614,9 @@ int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, struct ignis_s
 
 /* Allocate a sequence that claims `checkpoint`: the whole pages below the
  * opener are the shared prefix's own physical pages, the rest is a fresh
- * zeroed reservation, the mutable state is a device-to-device clone of the
- * checkpoint's image, and the partial page the opener ends inside is copied
+ * zeroed reservation, the mutable state is a clone of the checkpoint's image
+ * (device to device, or from the host block for a host retained slot, GitHub
+ * #281), and the partial page the opener ends inside is copied
  * into the first page the new sequence owns.
  *
  * The returned sequence stands exactly where the capturing one stood at its
@@ -664,15 +668,16 @@ int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *pool,
  * bookkeeping (`ignis_core::RetainedSlotLedger`); a prefix publish and a
  * checkpoint capture put their images in the slot they are named (GitHub
  * #215), and the leaf only refuses to write over one still held. These two
- * calls only move state. Both are device-to-device and return with the
- * copies complete.
+ * calls only move state. Both return with the copies complete: device to
+ * device for a device retained slot, over PCIe for a host one (GitHub #281).
  */
 
 /* Copy `seq`'s mutable state into retained slot `retained_slot` (0-based,
- * below the pool's `retained_slot_count`), overwriting what it held. `seq` is
+ * below `retained_slot_count + retained_host_slot_count` of the pool's spec),
+ * overwriting what it held. `seq` is
  * read, never changed. Returns 0; -1 on a null argument, a sequence that is
  * not `pool`'s, a retained slot out of range or holding a prefix's or a
- * checkpoint's image, or a failed device copy; IGNIS_SEQ_ERR_NOT_AT_BOUNDARY
+ * checkpoint's image, or a failed copy; IGNIS_SEQ_ERR_NOT_AT_BOUNDARY
  * when `seq` is mid-chunk. */
 int32_t ignis_seq_retained_store(struct ignis_seq_pool *pool, const struct ignis_seq *seq,
                                  uint32_t retained_slot);

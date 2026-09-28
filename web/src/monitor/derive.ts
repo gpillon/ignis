@@ -106,7 +106,7 @@ export type Memory = {
    * block and its bytes, and the rest, in VRAM. Null where the scrape does
    * not carry the host gauges -- a server from before them.
    */
-  retainedHost: { slots: number | null; bytes: number | null; deviceSlots: number | null };
+  slotHomes: { hostSlots: number | null; hostBytes: number | null; deviceSlots: number | null };
   skips: Tally & { byReason: Record<SlotSkipReason, Tally> };
   retained: Record<RetainedFamily, Record<RetainedTier, Record<RetainedKind, Tally>>>;
 };
@@ -375,9 +375,9 @@ export function deriveMemory(points: Point[], since: number): Memory {
     pagesInUse: meter(mem.kvPoolUsedPages, mem.kvPoolPages, (s) => s.memory.kvPoolUsedPages),
     arenaInUse: meter(mem.kvRamArena.used, mem.kvRamArena.capacity, (s) => s.memory.kvRamArena.used),
     slotsInUse: meter(mem.retainedSlots.inUse, mem.retainedSlots.capacity, (s) => s.memory.retainedSlots.inUse),
-    retainedHost: {
-      slots: mem.retainedHost.slots,
-      bytes: mem.retainedHost.bytes,
+    slotHomes: {
+      hostSlots: mem.retainedHost.slots,
+      hostBytes: mem.retainedHost.bytes,
       deviceSlots:
         mem.retainedHost.slots !== null && mem.retainedSlots.capacity !== null ? mem.retainedSlots.capacity - mem.retainedHost.slots : null,
     },

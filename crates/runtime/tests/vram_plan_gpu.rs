@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::gpu_profile;
-use ignis_core::{KvFormat, KvGeometry, Speculation, SpeculativeBackend, Vision, model_load};
+use ignis_core::{KvFormat, KvGeometry, N_DECODE_LANES, Speculation, SpeculativeBackend, Vision, model_load};
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, ReservedBytes};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -84,7 +84,7 @@ fn the_planned_reservations_are_what_the_load_holds() {
     assert_eq!(planned.retained_host_bytes, 3 * HOST_IMAGE_BYTES, "one packed image per host slot");
     assert_eq!(
         planned.reserved.hq_residual_window,
-        (8 + 2) * HQ_WINDOW_BYTES,
+        (N_DECODE_LANES as u64 + 2) * HQ_WINDOW_BYTES,
         "the residual window is the lanes' and the device slots', never a host slot's"
     );
 
@@ -150,8 +150,16 @@ fn the_default_retained_slots_are_on_the_host() {
         .plan_reservations(&reader, &plan, &handles)
         .unwrap_or_else(|e| panic!("plan the reservations: {e}"));
     assert_eq!(planned.reserved.retained_slots, 0, "no retained slot in VRAM by default");
-    assert_eq!(planned.reserved.hq_residual_window, 8 * HQ_WINDOW_BYTES, "the lanes' window alone");
-    assert_eq!(planned.retained_host_bytes, 16 * HOST_IMAGE_BYTES, "two host slots per lane");
+    assert_eq!(
+        planned.reserved.hq_residual_window,
+        N_DECODE_LANES as u64 * HQ_WINDOW_BYTES,
+        "the lanes' window alone"
+    );
+    assert_eq!(
+        planned.retained_host_bytes,
+        u64::from(ignis_runtime::DEFAULT_RETAINED_HOST_SLOTS) * HOST_IMAGE_BYTES,
+        "the default host slots, one packed image each"
+    );
 }
 
 /// GitHub #212: the prefill scratch and the vision encoder's workspace are one

@@ -154,6 +154,8 @@ again. They add no serving work of any kind.
 | `ignis_kv_page_bytes` | gauge | none | one page's bytes |
 | `ignis_kv_ram_arena_bytes` | gauge | `state="capacity"` | `--kv-host-pool-bytes`, pinned whole at start |
 | `ignis_retained_slots` | gauge | `state="capacity"` | the retained slots the scheduler hands out (#216) |
+| `ignis_retained_host_slots` | gauge | none | of those, the host ones (#281) |
+| `ignis_retained_host_bytes` | gauge | none | the pinned host block holding their images (#281) |
 
 A load that refuses to start exports nothing: there is no process to scrape.
 
@@ -361,9 +363,11 @@ checkpoint hits). Meanwhile the eight slots and their residual window held
   kind.
 - **The cost moves to PCIe.** A capture into a host slot and a claim from
   one copy ~222 MiB each way, synchronized: ~15–19 ms per request, never per
-  token. Measured on the same swarm, sixteen host slots beat today's eight
-  device slots (68.8 s against 79.7 s on the long-context run) with 44% more
-  KV (679K tokens against 478K).
+  token. On the shipped build, sixteen host slots against eight device slots
+  were level on wall time and tok/s on both swarm loads, with 42% more KV
+  (677K tokens against 475K) and a higher later-turn TTFT median on the long
+  load. See the finding
+  [Retained slots on the host](../findings/2026-09-28-retained-slots-on-the-host.md).
 - **Two load-time gauges** join §Observability's constants, both without a
   label: `ignis_retained_host_slots` (of `ignis_retained_slots{state="capacity"}`,
   the host ones) and `ignis_retained_host_bytes` (their pinned block).

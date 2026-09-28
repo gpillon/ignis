@@ -819,9 +819,9 @@ function MeterRow({
  * block, then the device ones when there are any. Nothing from a scrape
  * without the host gauges.
  */
-function slotHomes(home: Memory["retainedHost"]): string | undefined {
-  if (home.slots === null) return undefined;
-  const host = home.slots > 0 ? `${formatCount(home.slots)} on the host (${formatBytes(home.bytes)} pinned)` : null;
+function slotHomes(home: Memory["slotHomes"]): string | undefined {
+  if (home.hostSlots === null) return undefined;
+  const host = home.hostSlots > 0 ? `${formatCount(home.hostSlots)} on the host (${formatBytes(home.hostBytes)} pinned)` : null;
   const device = home.deviceSlots !== null && home.deviceSlots > 0 ? `${formatCount(home.deviceSlots)} in VRAM` : null;
   return [host, device].filter((part) => part !== null).join(", ") || undefined;
 }
@@ -853,7 +853,7 @@ function OccupancyCard({ memory, win }: { memory: Memory; win: string }) {
           format={formatCount}
           unit="slots"
           color="var(--series-4)"
-          aside={memory.slotsInUse.capacity === 0 ? "this load hands out none" : slotHomes(memory.retainedHost)}
+          aside={memory.slotsInUse.capacity === 0 ? "this load hands out none" : slotHomes(memory.slotHomes)}
         >
           <Sparkline values={memory.slotsInUse.series} color="var(--series-4)" height={30} />
           <div className="border-l-2 border-line pl-3">

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # A/B a server configuration under the agent-swarm load (scripts/agent-swarm.py).
 #
-#   scripts/swarm-ab.sh "RETAINED_SLOTS=8" "RETAINED_SLOTS=2"
+#   scripts/swarm-ab.sh "RETAINED_DEVICE=8 RETAINED_HOST=0" ""
 #   SWARM_ARGS="--agents 8 --turns 10" scripts/swarm-ab.sh "" "KV_HOST_POOL_BYTES=16G"
+#
+# A knob make does not know is passed through and ignored, so a mistyped or
+# removed one runs the defaults: check each leg's config.txt.
 #
 # Each argument is one leg: the make knobs that leg starts the server with,
 # on top of the defaults below. Per leg: `make start` (the last build of this

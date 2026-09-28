@@ -284,6 +284,45 @@ bool pack_slot_section_to_host(const ignis_seq_pool &pool, std::int32_t slot,
   }
 }
 
+// The reverse of pack_slot_section_to_host: section `section` of a blob at
+// `base`, laid out by `sections`, into pool slot `slot`. False for a section
+// this does not read -- KV pages and progress, which the caller reads for
+// itself.
+//
+// Shared by a restore (a blob into a lane) and a claim from a host retained
+// slot (its image into a lane, GitHub #281), so the two cannot read a
+// section differently.
+bool unpack_slot_section_from_host(ignis_seq_pool &pool, std::int32_t slot,
+                                   const ignis_seq_section &section,
+                                   const std::vector<ignis_seq_section> &sections,
+                                   const unsigned char *base) {
+  const unsigned char *at = base + section.offset;
+  switch (section.kind) {
+  case IGNIS_SEQ_SECTION_GDN_CONV:
+    // Packed together with the recurrent section (see pack_slot_section_to_host).
+    pool.gdn_pool.unpack_slot_from_host(
+        slot, at, base + ignis_seq_section_offset(sections, IGNIS_SEQ_SECTION_GDN_RECURRENT), nullptr);
+    return true;
+  case IGNIS_SEQ_SECTION_GDN_RECURRENT:
+    return true;
+  case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
+    checked_memcpy_async(pool.token_counts_for(slot), at, static_cast<std::size_t>(section.bytes),
+                         cudaMemcpyHostToDevice, "penalty counts");
+    return true;
+  case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+    pool.dflash2_window->copy_lane_from_host(at, slot, nullptr);
+    return true;
+  case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
+    // GitHub #257: the blob's own rows and bits over the target slot's,
+    // whatever sequence held that slot before (the reference's
+    // program_impl.h:1126 records the bug a restore without this is).
+    ignis_seq_copy_hq_residual(pool, slot, const_cast<unsigned char *>(at), cudaMemcpyHostToDevice);
+    return true;
+  default:
+    return false;
+  }
+}
+
 } // namespace
 
 // Not in the anonymous namespace: kernel/src/seq_checkpoint.cu materializes
@@ -801,9 +840,9 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     // a pool with a model of the same backend, one rule for every backend.
     pool->speculative_backend = spec->speculative_backend;
     // GitHub #281: the device retained slots first, the host ones after.
-    pool->retained_slot_count        = spec->retained_slot_count + spec->retained_host_slot_count;
+    pool->retained_slot_count = spec->retained_slot_count + spec->retained_host_slot_count;
     pool->retained_device_slot_count = spec->retained_slot_count;
-    pool->slot_state_bytes           = layout.slot_state_bytes;
+    pool->slot_state_bytes    = layout.slot_state_bytes;
     pool->retained_held.assign(pool->retained_slot_count, false);
 
     if (layout.hq_residual_bytes != 0) {
@@ -1167,7 +1206,6 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
       return IGNIS_SEQ_ERR_BAD_SNAPSHOT;
     }
 
-    const std::uint64_t recurrent_at = ignis_seq_section_offset(records, IGNIS_SEQ_SECTION_GDN_RECURRENT);
     ignis_seq_progress_image image{};
     for (const ignis_seq_section &section : records) {
       const unsigned char *at = base + section.offset;
@@ -1177,34 +1215,16 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
                                                      header.kv_page_count, header.kv_page_count,
                                                      nullptr);
         break;
-      case IGNIS_SEQ_SECTION_GDN_CONV:
-        // Packed together with the recurrent section (see ignis_seq_snapshot).
-        pool->gdn_pool.unpack_slot_from_host(seq->slot, at, base + recurrent_at, nullptr);
-        break;
-      case IGNIS_SEQ_SECTION_GDN_RECURRENT:
-        break;
-      case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
-        checked_memcpy_async(pool->token_counts_for(seq->slot), at,
-                             static_cast<std::size_t>(section.bytes), cudaMemcpyHostToDevice,
-                             "penalty counts");
-        break;
-      case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
-        pool->dflash2_window->copy_lane_from_host(at, seq->slot, nullptr);
-        break;
-      case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
-        // GitHub #257: the blob's own rows and bits over the target slot's,
-        // whatever sequence held that slot before (the reference's
-        // program_impl.h:1126 records the bug a restore without this is).
-        ignis_seq_copy_hq_residual(*pool, seq->slot, const_cast<unsigned char *>(at),
-                                   cudaMemcpyHostToDevice);
-        break;
       case IGNIS_SEQ_SECTION_PROGRESS:
         std::memcpy(&image, at, sizeof(image));
         break;
       default:
-        throw std::logic_error(std::string("state section ") +
-                               ignis_seq_section_name(section.kind) +
-                               " has no restore implementation");
+        if (!unpack_slot_section_from_host(*pool, seq->slot, section, records, base)) {
+          throw std::logic_error(std::string("state section ") +
+                                 ignis_seq_section_name(section.kind) +
+                                 " has no restore implementation");
+        }
+        break;
       }
     }
 
@@ -1250,29 +1270,11 @@ void copy_lane_to_host_image(const ignis_seq_pool &pool, std::int32_t lane, unsi
   }
 }
 
-// The reverse -- the restore's per-section unpackers.
+// The reverse -- the restore's own per-section unpacker.
 void copy_host_image_to_lane(ignis_seq_pool &pool, const unsigned char *image, std::int32_t lane) {
   const std::vector<ignis_seq_section> layout = ignis_seq_prefix_clone_layout(pool);
-  const std::uint64_t recurrent_at = ignis_seq_section_offset(layout, IGNIS_SEQ_SECTION_GDN_RECURRENT);
   for (const ignis_seq_section &section : layout) {
-    const unsigned char *at = image + section.offset;
-    switch (section.kind) {
-    case IGNIS_SEQ_SECTION_GDN_CONV:
-      pool.gdn_pool.unpack_slot_from_host(lane, at, image + recurrent_at, nullptr);
-      break;
-    case IGNIS_SEQ_SECTION_GDN_RECURRENT:
-      break;
-    case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
-      checked_memcpy_async(pool.token_counts_for(lane), at, static_cast<std::size_t>(section.bytes),
-                           cudaMemcpyHostToDevice, "penalty counts");
-      break;
-    case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
-      pool.dflash2_window->copy_lane_from_host(at, lane, nullptr);
-      break;
-    case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
-      ignis_seq_copy_hq_residual(pool, lane, const_cast<unsigned char *>(at), cudaMemcpyHostToDevice);
-      break;
-    default:
+    if (!unpack_slot_section_from_host(pool, lane, section, layout, image)) {
       throw std::logic_error(std::string("state section ") + ignis_seq_section_name(section.kind) +
                              " has no host-to-lane implementation");
     }

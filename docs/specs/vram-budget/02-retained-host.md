@@ -2,8 +2,9 @@
 
 GitHub: #281. ADRs: 0030 (amended by this feature), 0029 (the retained state
 the slots hold), 0024 (the section packers the host copies reuse).
-Evidence: the prototype on branch `retained-slots-ab` and its A/B runs
-(`.scratch/swarm-ab/` in that worktree), driven by `scripts/agent-swarm.py`
+Evidence: the finding
+[Retained slots on the host](../../findings/2026-09-28-retained-slots-on-the-host.md),
+from the prototype and feature A/B runs driven by `scripts/agent-swarm.py`
 and `scripts/swarm-ab.sh`.
 
 ## Problem Statement
@@ -98,9 +99,9 @@ refuses the start with a message naming the two new flags.
 ## Implementation Decisions
 
 - **Kernel ABI.** `ignis_seq_pool_spec` keeps `retained_slot_count` as the
-  device count and gains `retained_host_slot_count`; `ignis_seq_pool_plan`
-  and `ignis_seq_pool_stats` gain `retained_host_slot_count` and
-  `retained_host_bytes`. Every move of retained state already goes through
+  device count and gains `retained_host_slot_count`; `ignis_seq_pool_stats`
+  gains `retained_host_slot_count` and `retained_host_bytes`, and
+  `ignis_seq_pool_plan` gains `retained_host_bytes` (the count is the spec's). Every move of retained state already goes through
   `ignis_seq_copy_slot_state` and `ignis_seq_write_materialized_blob`, so
   those two are the only functions that learn about the host block.
 - **Rust.** `SeqPoolBudget` carries both counts; `CudaLeafConfig` splits
