@@ -235,6 +235,7 @@ fn attention_over_a_text_state_is_dumped_for_calibration() {
             max_context_tokens: MAX_CONTEXT,
             slot_count: 1,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("seq pool create: {e}"));

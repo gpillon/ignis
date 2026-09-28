@@ -702,6 +702,7 @@ fn one_attention_head_points_in_the_engine() {
             max_context_tokens: MAX_CONTEXT,
             slot_count: 1,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("seq pool create: {e}"));

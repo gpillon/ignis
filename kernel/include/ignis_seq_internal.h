@@ -139,17 +139,17 @@ struct ignis_seq_pool {
   /* Lane slots only, `0..slot_count`: the retained slots past them are never
    * listed here (GitHub #211). */
   std::vector<std::int32_t> free_slots;
-  /* Retained slots, at slot indices `slot_count..slot_count +
-   * retained_slot_count` of the GDN pool, the penalty counts and the drafter
-   * lanes (GitHub #211), and what one slot's state occupies. */
+  /* Retained slots, device and host together (GitHub #211, #281), and what
+   * one slot's state occupies. The first `retained_device_slot_count` sit at
+   * slot indices `slot_count..slot_count + retained_device_slot_count` of the
+   * GDN pool, the penalty counts, the drafter lanes and the hq residual
+   * window; the rest are host slots, whose images live in `retained_host`. */
   std::uint32_t retained_slot_count = 0;
+  std::uint32_t retained_device_slot_count = 0;
   std::uint64_t slot_state_bytes = 0;
-  /* PROTOTYPE (`ignis_seq_pool_spec::retained_on_host`): the retained slots'
-   * images live in `retained_host`, one pinned block of
-   * `retained_slot_count * retained_host_stride` bytes, each image laid out
-   * as `ignis_seq_prefix_clone_layout` packs it -- and the device arenas
-   * above hold the lanes alone. */
-  bool retained_on_host = false;
+  /* The host slots' pinned block (GitHub #281): one image per host slot,
+   * `retained_host_stride` bytes apart, each laid out as
+   * `ignis_seq_prefix_clone_layout` packs it. Reserved at pool create. */
   std::uint64_t retained_host_stride = 0;
   struct pinned_block {
     void *p = nullptr;
@@ -159,13 +159,18 @@ struct ignis_seq_pool {
     pinned_block &operator=(const pinned_block &) = delete;
     ~pinned_block();
   } retained_host;
-  /* Pool slot `slot` is a retained slot whose image is in `retained_host`. */
+  /* Pool slot `slot` is a host retained slot, its image in `retained_host`. */
   bool is_host_retained(std::int32_t slot) const {
-    return retained_on_host && slot >= kv_pool.table_row_count();
+    const std::int32_t first_host =
+        kv_pool.table_row_count() + static_cast<std::int32_t>(retained_device_slot_count);
+    return slot >= first_host &&
+           slot < kv_pool.table_row_count() + static_cast<std::int32_t>(retained_slot_count);
   }
   unsigned char *retained_host_image(std::int32_t slot) const {
+    const std::int32_t first_host =
+        kv_pool.table_row_count() + static_cast<std::int32_t>(retained_device_slot_count);
     return static_cast<unsigned char *>(retained_host.p) +
-           static_cast<std::uint64_t>(slot - kv_pool.table_row_count()) * retained_host_stride;
+           static_cast<std::uint64_t>(slot - first_host) * retained_host_stride;
   }
   /* Which retained slots hold a published prefix's or a captured checkpoint's
    * image (GitHub #215), one flag per slot. The caller decides which slot a

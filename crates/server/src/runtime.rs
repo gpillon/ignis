@@ -45,9 +45,11 @@ pub struct EngineShape {
     pub host_pool_bytes: u64,
     /// Cross-request state reuse (`--prompt-reuse`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
-    /// The retained slots the load reserves (`--retained-slots`, GitHub #215,
-    /// ADR 0030): 0 with prompt reuse off.
-    pub retained_slots: u32,
+    /// The retained slots the load reserves (GitHub #215, #281, ADR 0030):
+    /// in VRAM (`--retained-device`) and in the pinned host block
+    /// (`--retained-host`), both 0 with prompt reuse off unless named.
+    pub retained_device_slots: u32,
+    pub retained_host_slots: u32,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority (`--retained-interactive-ttl`, GitHub #190).
     pub retained_interactive_ttl: std::time::Duration,
@@ -78,7 +80,8 @@ impl Default for EngineShape {
             },
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
-            retained_slots: crate::config::DEFAULT_RETAINED_SLOTS,
+            retained_device_slots: crate::config::DEFAULT_RETAINED_DEVICE_SLOTS,
+            retained_host_slots: crate::config::DEFAULT_RETAINED_HOST_SLOTS,
             retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
             speculation: None,
             vision: None,
@@ -97,7 +100,8 @@ impl From<&crate::config::Config> for EngineShape {
             vram: config.vram,
             host_pool_bytes: config.host_pool_bytes,
             prompt_reuse: config.prompt_reuse,
-            retained_slots: config.retained_slots,
+            retained_device_slots: config.retained_device_slots,
+            retained_host_slots: config.retained_host_slots,
             retained_interactive_ttl: std::time::Duration::from_secs(u64::from(
                 config.retained_interactive_ttl_secs,
             )),
@@ -105,6 +109,14 @@ impl From<&crate::config::Config> for EngineShape {
             vision: config.vision,
             rope_scaling: config.rope_scaling,
         }
+    }
+}
+
+impl EngineShape {
+    /// Every retained slot the load reserves, device and host together: the
+    /// one pool the scheduler hands out (GitHub #281).
+    pub fn retained_slots(&self) -> u32 {
+        self.retained_device_slots + self.retained_host_slots
     }
 }
 
@@ -124,8 +136,9 @@ fn scheduler_config_for_shape(
         serving_chunk_tokens: shape.prefill_chunk,
         prompt_reuse: shape.prompt_reuse,
         // GitHub #215: the same count the leaf's pool reserved, so every slot
-        // the scheduler hands out is one the pool holds.
-        retained_slots: shape.retained_slots,
+        // the scheduler hands out is one the pool holds -- both kinds, the
+        // device ones at the low indices it hands out first (GitHub #281).
+        retained_slots: shape.retained_slots(),
         retained_interactive_ttl: shape.retained_interactive_ttl,
         ..SchedulerConfig::default()
     }
@@ -154,12 +167,23 @@ pub fn vram_lines(
     }
 }
 
+/// A load's retained slots beside its VRAM plan (GitHub #281): how many of
+/// each kind, and the pinned host block the host ones live in -- host
+/// memory, which is why it rides the plan's event rather than a plan line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedSlotsPlan {
+    pub device_slots: u32,
+    pub host_slots: u32,
+    pub host_bytes: u64,
+}
+
 /// The startup report of the VRAM plan (GitHub #210): one
 /// `ignis.runtime.vram_plan` event with every line in bytes, the mode, what
-/// was free, the headroom or the budget, and whether the plan oversubscribes
-/// -- then one `ignis.runtime.vram_oversubscribed` warning per reason the
-/// start proceeds anyway.
-pub fn log_vram_plan(plan: &ignis_core::VramPlan) {
+/// was free, the headroom or the budget, whether the plan oversubscribes and
+/// the retained slots of both kinds (GitHub #281) -- then one
+/// `ignis.runtime.vram_oversubscribed` warning per reason the start proceeds
+/// anyway.
+pub fn log_vram_plan(plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan) {
     let lines = plan.lines;
     macro_rules! vram_plan_event {
         ($($mode_field:ident = $mode_value:expr),*) => {
@@ -187,6 +211,9 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan) {
                 total_bytes = plan.total_bytes,
                 allocated_at_load_bytes = plan.total_bytes,
                 oversubscribed = plan.oversubscribed,
+                retained_device_slots = retained.device_slots,
+                retained_host_slots = retained.host_slots,
+                retained_host_bytes = retained.host_bytes,
                 "vram plan"
             )
         };
@@ -230,7 +257,8 @@ fn leaf_config_for_shape(shape: EngineShape, kv_pool_bytes: u64) -> ignis_runtim
         speculation: shape.speculation,
         vision: shape.vision,
         rope_scaling: shape.rope_scaling,
-        retained_slots: shape.retained_slots,
+        retained_device_slots: shape.retained_device_slots,
+        retained_host_slots: shape.retained_host_slots,
         ..ignis_runtime::CudaLeafConfig::default()
     }
 }
@@ -299,7 +327,8 @@ pub fn cuda_scheduler_with_thinking_close(
         kv_format: shape.kv_format,
         kv_geometry: geometry,
         max_context_tokens: shape.max_context,
-        retained_slots: shape.retained_slots,
+        // Every retained slot keeps one tail page, whichever kind it is.
+        retained_slots: shape.retained_slots(),
         kv_pool_bytes: shape.kv_pool_bytes,
         // GitHub #243: only so a refusal names the knob the operator set.
         embedding_pool_named: shape
@@ -311,7 +340,14 @@ pub fn cuda_scheduler_with_thinking_close(
         can_page: cfg!(windows),
     })
     .map_err(|e| e.to_string())?;
-    log_vram_plan(&vram);
+    log_vram_plan(
+        &vram,
+        RetainedSlotsPlan {
+            device_slots: shape.retained_device_slots,
+            host_slots: shape.retained_host_slots,
+            host_bytes: reservations.retained_host_bytes,
+        },
+    );
 
     let artifact = materialize(&reader, &plan, &mut device, None)
         .map_err(|e| format!("materialize weights: {e}"))?;
@@ -396,8 +432,8 @@ pub fn cuda_scheduler_with_thinking_close(
     // function built, read once and dropped. What it reserved outlives it
     // now, so an operator can read it off `/metrics` instead of off the one
     // log line the load wrote. The retained slot count is the scheduler's
-    // own, not the flag's: prompt reuse off hands out none whatever
-    // `--retained-slots` said.
+    // own, not the flags': prompt reuse off hands out none whatever
+    // `--retained-device` and `--retained-host` said.
     let reserved = crate::metrics::LoadReservations {
         lines: vram.lines,
         budget_bytes: vram.budget_bytes,
@@ -405,6 +441,8 @@ pub fn cuda_scheduler_with_thinking_close(
         kv_page_bytes: stats.kv_page_bytes,
         kv_ram_arena_bytes: shape.host_pool_bytes,
         retained_slots: sched.retained_slot_count(),
+        retained_host_slots: shape.retained_host_slots,
+        retained_host_bytes: reservations.retained_host_bytes,
     };
     Ok((sched, reserved))
 }
@@ -448,8 +486,8 @@ mod tests {
 
         // Every serving knob at once: the bind address, the timeout, the UI,
         // the metrics listener, the API key, the prefill chunk, the context,
-        // both pool budgets, the VRAM budget, `--prompt-reuse` and
-        // `--retained-slots`. The KV pool is the one that makes this a rule
+        // both pool budgets, the VRAM budget, `--prompt-reuse` and the
+        // retained slots. The KV pool is the one that makes this a rule
         // rather than a nicety: unset, it is the rest of a budget derived from
         // the VRAM free at start, so it differs from one start of the same
         // server to the next, and an identity that moved with it would refuse
@@ -469,7 +507,8 @@ mod tests {
             },
             host_pool_bytes: base.host_pool_bytes * 2,
             prompt_reuse: !base.prompt_reuse,
-            retained_slots: 3,
+            retained_device_slots: 3,
+            retained_host_slots: 1,
             ..base.clone()
         };
         assert_ne!(base, elsewhere, "the two configs really do differ");
@@ -551,7 +590,8 @@ mod tests {
             vram: EngineShape::default().vram,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: true,
-            retained_slots: 5,
+            retained_device_slots: 2,
+            retained_host_slots: 3,
             retained_interactive_ttl: std::time::Duration::from_secs(60),
             speculation: None,
             vision: None,
@@ -562,7 +602,8 @@ mod tests {
 
         assert_eq!(config.serving_chunk_tokens, 512);
         // GitHub #186: the reuse knobs reach the scheduler too -- and the
-        // retained slots as the count the leaf's pool reserves (GitHub #215).
+        // retained slots as the count the leaf's pool reserves (GitHub #215),
+        // both kinds in one pool (GitHub #281).
         assert!(config.prompt_reuse);
         assert_eq!(config.retained_slots, 5);
         // GitHub #190: and so does the Interactive TTL.
@@ -588,13 +629,16 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn the_leaf_reserves_the_retained_slots_the_scheduler_hands_out() {
-        // GitHub #215: one count, from one flag, reaches both -- a slot the
-        // scheduler names is one the pool holds.
+        // GitHub #215, #281: the leaf reserves each kind and the scheduler
+        // hands out all of them -- a slot the scheduler names is one the
+        // pool holds.
         let shape = EngineShape {
-            retained_slots: 5,
+            retained_device_slots: 2,
+            retained_host_slots: 3,
             ..EngineShape::default()
         };
-        assert_eq!(leaf_config_for_shape(shape, 1 << 30).retained_slots, 5);
+        let leaf = leaf_config_for_shape(shape, 1 << 30);
+        assert_eq!((leaf.retained_device_slots, leaf.retained_host_slots), (2, 3));
         assert_eq!(scheduler_config_for_shape("m".into(), shape, 64, 1024).retained_slots, 5);
     }
 
@@ -633,12 +677,20 @@ mod tests {
         );
     }
 
+    /// The host slots of a default load: 16 images of 232,532,224 bytes (the
+    /// 27B geometry's packed clone image under hq-e8-2b and DFlash2).
+    const DEFAULT_HOST_SLOTS: RetainedSlotsPlan = RetainedSlotsPlan {
+        device_slots: 0,
+        host_slots: 16,
+        host_bytes: 16 * 232_532_224,
+    };
+
     fn captured_vram_plan(plan: &ignis_core::VramPlan) -> Vec<serde_json::Value> {
         use tracing_subscriber::layer::SubscriberExt;
         let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
         let subscriber =
             tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan));
+        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_HOST_SLOTS));
         sink.lines()
             .iter()
             .map(|line| serde_json::from_str(line).expect("valid json"))
@@ -649,7 +701,7 @@ mod tests {
         let reserved = ignis_runtime::ReservedBytes {
             workspace: 1 << 30,
             lane_state: 1 << 30,
-            retained_slots: u64::from(crate::config::DEFAULT_RETAINED_SLOTS) * 196_880_384,
+            retained_slots: u64::from(crate::config::DEFAULT_RETAINED_DEVICE_SLOTS) * 196_880_384,
             ..Default::default()
         };
         let page_bytes = ignis_core::KvFormat::HqE8_2b.page_bytes(ignis_core::KvGeometry::qwen38_27b());
@@ -661,7 +713,7 @@ mod tests {
             kv_format: ignis_core::KvFormat::HqE8_2b,
             kv_geometry: ignis_core::KvGeometry::qwen38_27b(),
             max_context_tokens: 262_144,
-            retained_slots: crate::config::DEFAULT_RETAINED_SLOTS,
+            retained_slots: EngineShape::default().retained_slots(),
             kv_pool_bytes: None,
             embedding_pool_named: false,
             kv_arena_bytes: &arena,
@@ -699,6 +751,11 @@ mod tests {
             "what Task Manager shows right after load: every line, the retained slots included"
         );
         assert_eq!(field("oversubscribed"), false);
+        // GitHub #281: the retained slots of both kinds, and the host block
+        // that is none of the VRAM lines above.
+        assert_eq!(field("retained_device_slots"), 0);
+        assert_eq!(field("retained_host_slots"), 16);
+        assert_eq!(field("retained_host_bytes"), 16u64 * 232_532_224);
     }
 
     #[test]

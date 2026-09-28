@@ -189,15 +189,15 @@ struct ignis_seq_pool_spec {
    * one to a sequence; `ignis_seq_retained_store` / `_load` move a lane's
    * state in and out. 0 reserves none. */
   uint32_t retained_slot_count;
-  /* PROTOTYPE (branch retained-slots-ab): nonzero keeps every retained
-   * slot's image in one pinned host block reserved at pool create --
-   * `retained_slot_count` images laid out as `ignis_seq_prefix_clone_layout`
-   * packs them -- instead of in the device state arenas beside the lanes.
-   * The device arenas then hold the lanes alone; a capture copies a lane's
-   * state to the host and a claim copies it back, over PCIe and
-   * synchronized. KV pages are untouched: a retained object's pages stay in
-   * the device pool either way. 0 is the device layout. */
-  uint32_t retained_on_host;
+  /* Retained slots on the host (GitHub #281, ADR 0030): the same images,
+   * kept in one pinned host block reserved at pool create -- one packed
+   * clone image (`ignis_seq_prefix_clone_layout`) per slot -- instead of the
+   * device state arenas. They follow the device slots: retained slot `r` is
+   * a device slot for `r < retained_slot_count` and a host slot up to
+   * `retained_slot_count + retained_host_slot_count`. A capture into one and
+   * a claim from one cross PCIe, synchronized; the object's KV pages stay in
+   * the device pool either way. 0 reserves none. */
+  uint32_t retained_host_slot_count;
 };
 
 struct ignis_seq_pool_stats {
@@ -238,6 +238,11 @@ struct ignis_seq_pool_stats {
    * lines above (`slot_state_bytes` leaves it out, so nothing counts it
    * twice). 0 on a BF16 pool. */
   uint64_t hq_residual_bytes;
+  /* The host retained slots (GitHub #281): how many, and the pinned host
+   * block holding their images -- host memory, in none of the device lines
+   * above. */
+  uint32_t retained_host_slot_count;
+  uint64_t retained_host_bytes;
 };
 
 /* What a pool built from a spec occupies, planned without building it
@@ -254,6 +259,9 @@ struct ignis_seq_pool_plan {
   /* = ignis_seq_pool_stats::hq_residual_bytes of the built pool (GitHub
    * #257). */
   uint64_t hq_residual_bytes;
+  /* = ignis_seq_pool_stats::retained_host_bytes of the built pool (GitHub
+   * #281): pinned host memory, not device. */
+  uint64_t retained_host_bytes;
 };
 
 struct ignis_seq_stats {

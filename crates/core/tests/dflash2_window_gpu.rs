@@ -405,6 +405,7 @@ fn the_drafter_window_holds_the_projected_context_of_the_prompt() {
         max_context_tokens: MAX_CONTEXT,
         slot_count: 2,
         retained_slot_count: 0,
+        retained_host_slot_count: 0,
     };
 
     // The drafter's weights and its per-sequence window come as a pair: a

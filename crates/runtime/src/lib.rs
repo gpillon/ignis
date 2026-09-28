@@ -45,6 +45,17 @@ pub const PREFILL_CHUNK_ALIGNMENT: u32 = 128;
 /// `02-real-prefill.md`, user story 22).
 pub const DEFAULT_MAX_CONTEXT: u32 = 32_768 + 8_192;
 
+/// Retained slots in VRAM by default (`--retained-device`, GitHub #281):
+/// none -- the images live on the host unless a card has VRAM to spare.
+/// Here, beside the other load defaults, so `ignis_server::config` and
+/// [`CudaLeafConfig::default`] read one number.
+pub const DEFAULT_RETAINED_DEVICE_SLOTS: u32 = 0;
+
+/// Retained slots in the pinned host block by default (`--retained-host`,
+/// GitHub #281): two per decode lane -- a chain link and a checkpoint for
+/// each conversation a lane serves.
+pub const DEFAULT_RETAINED_HOST_SLOTS: u32 = 2 * ignis_core::N_DECODE_LANES as u32;
+
 /// The paged-KV pool's auto byte budget for a configured `max_context`
 /// under `format` (P4-04, GitHub #122): [`ignis_core::DEFAULT_KV_POOL_BYTES`]
 /// (4 GiB), raised if one configured context would not fit inside it.

@@ -108,6 +108,7 @@ fn drafter_pool(slot_count: u32) -> SeqPool {
             max_context_tokens: MAX_CONTEXT,
             slot_count,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
         Some(SpeculativeBackend::Dflash2),
     )

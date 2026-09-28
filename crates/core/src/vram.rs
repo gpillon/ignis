@@ -73,9 +73,11 @@ pub struct VramLines {
     /// Every lane's mutable state in the sequence pool: GDN recurrent and
     /// conv state, penalty counts, the drafter's window.
     pub lane_state: u64,
-    /// The sequence pool's retained slots (GitHub #211, #215): a lane's state
-    /// each, reserved at load beside the lanes, holding every retained prompt
-    /// checkpoint's and shared prefix's image.
+    /// The sequence pool's device retained slots (GitHub #211, #215,
+    /// `--retained-device`): a lane's state each, reserved at load beside the
+    /// lanes, holding retained prompt checkpoints' and shared prefixes'
+    /// images. The host slots (`--retained-host`, GitHub #281) live in
+    /// pinned host memory and are no line of this plan.
     pub retained_slots: u64,
     /// The hq-e8-2b residual window (GitHub #257, spec runtime/06): every
     /// slot's exact sink and recent-ring K/V rows and its ring validity
@@ -130,11 +132,12 @@ pub struct VramRequest<'a> {
     pub kv_geometry: KvGeometry,
     /// `--max-context`: the plan must hold one sequence this long.
     pub max_context_tokens: u32,
-    /// `--retained-slots` (GitHub #215). The KV pool must also hold one page
-    /// per slot: a prompt checkpoint keeps the page its opener ends inside,
-    /// and a request claiming it cannot take that page back while it stands
-    /// on the checkpoint — so a lone `--max-context` sequence has to fit
-    /// beside every one.
+    /// Every retained slot, `--retained-device` and `--retained-host`
+    /// together (GitHub #215, #281). The KV pool must also hold one page per
+    /// slot, whichever kind: a prompt checkpoint keeps the page its opener
+    /// ends inside, and a request claiming it cannot take that page back
+    /// while it stands on the checkpoint — so a lone `--max-context` sequence
+    /// has to fit beside every one.
     pub retained_slots: u32,
     /// `--kv-pool-bytes`, when the operator named it: the pool's payload
     /// budget, as [`plan_kv_pool`] reads it. `None` gives the pool the rest.
@@ -226,7 +229,7 @@ impl std::fmt::Display for VramPlanError {
                     "the VRAM plan needs {needed_bytes} bytes for the weights, workspaces, lanes, \
                      retained state and {} KV, {} bytes more than the {budget_bytes}-byte VRAM \
                      budget; shrink it with a smaller --max-context (now {max_context_tokens}), \
-                     without --vision, with fewer --retained-slots, or with ",
+                     without --vision, with fewer --retained-device, or with ",
                     if kv_pool_named {
                         "the --kv-pool-bytes"
                     } else {
@@ -519,7 +522,7 @@ mod tests {
         assert_eq!(needed_bytes, lines().total() + arena(min_pages));
         let message = err.to_string();
         assert!(message.contains(&(5 * page_bytes()).to_string()), "{message}");
-        for knob in ["--max-context", "--vision", "--retained-slots", "--vram-headroom-bytes"] {
+        for knob in ["--max-context", "--vision", "--retained-device", "--vram-headroom-bytes"] {
             assert!(message.contains(knob), "{knob} missing: {message}");
         }
     }

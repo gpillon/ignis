@@ -84,11 +84,11 @@ pub(crate) mod ffi {
         /// pool without a drafter; under DFlash2 every slot also owns the
         /// drafter's window (40 MiB).
         pub speculative_backend: i32,
-        /// Retained slots past the lanes (GitHub #211).
+        /// Device retained slots past the lanes (GitHub #211).
         pub retained_slot_count: u32,
-        /// PROTOTYPE (branch retained-slots-ab): nonzero keeps the retained
-        /// images in one pinned host block instead of the device arenas.
-        pub retained_on_host: u32,
+        /// Host retained slots after them (GitHub #281): their images in one
+        /// pinned host block reserved at pool create.
+        pub retained_host_slot_count: u32,
     }
 
     /// 1:1 with `struct ignis_seq_pool_stats`.
@@ -123,6 +123,10 @@ pub(crate) mod ffi {
         /// The hq-e8-2b residual window of every slot (GitHub #257): its own
         /// plan line, in none of the three above. 0 on a BF16 pool.
         pub hq_residual_bytes: u64,
+        /// The host retained slots (GitHub #281): how many, and their pinned
+        /// block -- host memory, in none of the device lines above.
+        pub retained_host_slot_count: u32,
+        pub retained_host_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_seq_pool_plan` (GitHub #210): what a pool
@@ -137,6 +141,8 @@ pub(crate) mod ffi {
         pub retained_state_bytes: u64,
         /// The hq-e8-2b residual window of every slot (GitHub #257).
         pub hq_residual_bytes: u64,
+        /// The host retained slots' pinned block (GitHub #281).
+        pub retained_host_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_alloc_count` (GitHub #211).
@@ -514,16 +520,8 @@ fn pool_spec(
         vocab: cfg.vocab as u32,
         speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
         retained_slot_count: budget.retained_slot_count,
-        retained_on_host: u32::from(retained_on_host(|name| std::env::var(name).ok())),
+        retained_host_slot_count: budget.retained_host_slot_count,
     }
-}
-
-/// PROTOTYPE (branch retained-slots-ab): `IGNIS_RETAINED_ON_HOST` set to
-/// anything but empty or `0` keeps the retained slots' images in a pinned
-/// host block (`ignis_seq_pool_spec::retained_on_host`). An environment
-/// switch rather than a flag while the layout is an experiment.
-fn retained_on_host(env: impl Fn(&str) -> Option<String>) -> bool {
-    env("IGNIS_RETAINED_ON_HOST").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// The geometry a [`SeqPool`] is built from — everything
@@ -542,9 +540,12 @@ pub struct SeqPoolBudget {
     pub max_context_tokens: u32,
     /// Max concurrent sequences (KV block-table rows == GDN lane slots).
     pub slot_count: u32,
-    /// Retained slots past the lanes (GitHub #211): a lane's mutable state
-    /// each, no KV block-table row, never handed to a sequence.
+    /// Device retained slots past the lanes (GitHub #211): a lane's mutable
+    /// state each, no KV block-table row, never handed to a sequence.
     pub retained_slot_count: u32,
+    /// Host retained slots after them (GitHub #281): the same images, in
+    /// one pinned host block reserved at load.
+    pub retained_host_slot_count: u32,
 }
 
 /// A device-resident pool of sequence state (paged KV pages + GDN slots).
@@ -1445,18 +1446,3 @@ unsafe impl Send for PinnedBuffer {}
 // `SeqPool`'s documented single-thread-driver contract above) but never
 // shared by reference across threads, so only `Send` is asserted.
 unsafe impl Send for Seq<'_> {}
-
-#[cfg(test)]
-mod tests {
-    use super::retained_on_host;
-
-    #[test]
-    fn retained_on_host_is_on_only_for_a_nonzero_value() {
-        let env = |value: Option<&'static str>| move |_: &str| value.map(str::to_string);
-        assert!(!retained_on_host(env(None)));
-        assert!(!retained_on_host(env(Some(""))));
-        assert!(!retained_on_host(env(Some("0"))));
-        assert!(retained_on_host(env(Some("1"))));
-        assert!(retained_on_host(env(Some("yes"))));
-    }
-}

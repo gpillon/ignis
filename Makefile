@@ -93,7 +93,8 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(PREFILL_CHUNK),--prefill-chunk $(PREFILL_CHUNK)) \
   $(if $(KV_POOL_BYTES),--kv-pool-bytes $(KV_POOL_BYTES))   $(if $(VRAM_HEADROOM),--vram-headroom-bytes $(VRAM_HEADROOM))   $(if $(VRAM_BUDGET),--vram-budget-bytes $(VRAM_BUDGET))   $(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)),--allow-vram-oversubscription) \
   $(if $(KV_HOST_POOL_BYTES),--kv-host-pool-bytes $(KV_HOST_POOL_BYTES)) \
-  $(if $(RETAINED_SLOTS),--retained-slots $(RETAINED_SLOTS)) \
+  $(if $(RETAINED_DEVICE),--retained-device $(RETAINED_DEVICE)) \
+  $(if $(RETAINED_HOST),--retained-host $(RETAINED_HOST)) \
   $(if $(filter 1,$(VISION)),--vision $(if $(VISION_MAX_TOKENS),--vision-max-tokens $(VISION_MAX_TOKENS))) \
   $(if $(ROPE_SCALING),--rope-scaling $(ROPE_SCALING)) \
   $(if $(REQUEST_TIMEOUT),--request-timeout $(REQUEST_TIMEOUT)) \
@@ -177,7 +178,7 @@ config: ## Print the resolved knobs and paths
 	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image),off)"
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),rest of the VRAM budget) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD))) rope=$(or $(ROPE_SCALING),none)"
 	@echo "VISION (CUDA=1) $(if $(filter 1,$(VISION)),on  max_tokens=$(or $(VISION_MAX_TOKENS),(server default)),off  (image parts are refused with vision_disabled))"
-	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1G))) retained_slots=$(or $(RETAINED_SLOTS),(server default: one per lane))"
+	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1G))) retained_device=$(or $(RETAINED_DEVICE),(server default: 0)) retained_host=$(or $(RETAINED_HOST),(server default: two per lane))"
 	@echo "MODEL           $(or $(MODEL),(server default))"
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"

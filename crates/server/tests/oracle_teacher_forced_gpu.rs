@@ -162,6 +162,7 @@ fn teacher_forced_canary_agreement_meets_the_g1_floor() {
                 max_context_tokens: MAX_CONTEXT,
                 slot_count: 1,
                 retained_slot_count: 0,
+                retained_host_slot_count: 0,
             },
         )
         .unwrap_or_else(|e| panic!("{}: seq pool create: {e}", canary.id));

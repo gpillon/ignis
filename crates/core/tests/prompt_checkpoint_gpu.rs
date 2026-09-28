@@ -263,6 +263,7 @@ fn turns_against_the_split_control(
             // turn N's prefix and checkpoint, turn N+1's chained link and
             // checkpoint, and the two the equivalence run takes.
             retained_slot_count: 6,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

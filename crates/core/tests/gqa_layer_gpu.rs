@@ -239,6 +239,7 @@ fn gqa_layers_match_f64_reference() {
             max_context_tokens: MAX_CONTEXT_TOKENS,
             slot_count: 2,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -284,6 +285,7 @@ fn gqa_layers_match_f64_reference() {
             max_context_tokens: MAX_CONTEXT_TOKENS,
             slot_count: 1,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("hq seq pool create: {e}"));

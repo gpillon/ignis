@@ -90,6 +90,7 @@ fn pool_for(backend: Option<SpeculativeBackend>, slot_count: u32) -> SeqPool {
             max_context_tokens: MAX_CONTEXT,
             slot_count,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
         backend,
     )
@@ -748,6 +749,7 @@ fn hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft() {
                 max_context_tokens: CONTEXT,
                 slot_count: width as u32,
                 retained_slot_count: 0,
+                retained_host_slot_count: 0,
             },
             Some(SpeculativeBackend::Dflash2),
         )

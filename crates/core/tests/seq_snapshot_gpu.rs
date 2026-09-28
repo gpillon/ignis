@@ -179,6 +179,7 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
             max_context_tokens: MAX_CONTEXT,
             slot_count: 2,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -479,6 +480,7 @@ fn an_hq_sequence_restored_into_another_slot_continues_to_the_same_tokens() {
             max_context_tokens: CONTEXT,
             slot_count: 2,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

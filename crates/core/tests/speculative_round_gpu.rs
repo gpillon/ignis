@@ -116,6 +116,7 @@ fn pool_for(kv_format: KvFormat, slot_count: u32, backend: Option<SpeculativeBac
             slot_count,
             // One retained slot, for the prefix a test publishes (GitHub #215).
             retained_slot_count: 1,
+            retained_host_slot_count: 0,
         },
         backend,
     )
