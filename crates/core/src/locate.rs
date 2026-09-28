@@ -1,17 +1,25 @@
-//! `locate` in one pass: the **head vote** (spec
-//! `docs/specs/decide/18-locate-by-attention.md` phase B, read as spec 19's
-//! track L registered it — `19-a-span-read-from-attention.md` § Phase 3;
-//! GitHub #275, ADR 0041).
+//! `locate`: which **segment** of a text state — a line of a string, an
+//! element of an array — an instruction names.
 //!
-//! A `locate` asks which **segment** of a text state — a line of a string,
-//! an element of an array — an instruction names. The model already knows
-//! before it writes anything: at the copy scaffold `{"quote":"`, a few dozen
-//! heads of the later GQA layers look at the segment it is about to copy.
-//! No one of them is reliable, but they fail on different questions, and a
-//! majority of them finds the segment as often as a `choice` over labelled
-//! segments does (`docs/findings/2026-09-27-locate-by-head-vote-go.md`).
+//! Two methods (ADR 0041, ADR 0042):
 //!
-//! What lives here is the host's whole part of it:
+//! - **the head vote** (spec `docs/specs/decide/18-locate-by-attention.md`
+//!   phase B read as spec 19's track L registered it — GitHub #275, ADR
+//!   0041), up to the length it was measured at;
+//! - **the shortlist** (spec `docs/specs/decide/22-locate-by-copy-over-a-folded-state.md`,
+//!   GitHub #278, ADR 0042): attention heads narrow a very long text to a few
+//!   candidates ([`reading`]) — after [`fold`]ing a log into templates, window
+//!   by window for prose and record arrays — and a labelled `choice` decides
+//!   among them ([`render`]), with no token generated; the same `choice` says
+//!   when **nothing** answers ([`found_log`], [`found_by_none`]).
+//!
+//! **The vote.** The model already knows before it writes anything: at the
+//! copy scaffold `{"quote":"`, a few dozen heads of the later GQA layers look
+//! at the segment it is about to copy. No one of them is reliable, but they
+//! fail on different questions, and a majority of them finds the segment as
+//! often as a `choice` over labelled segments does
+//! (`docs/findings/2026-09-27-locate-by-head-vote-go.md`). What lives here is
+//! the host's whole part of it:
 //!
 //! - **How rows become shares** ([`segment_shares`]): one head's softmax over
 //!   the span, summed per segment.
@@ -23,6 +31,10 @@
 //! `vote_reading`) and held to it by golden cases it writes
 //! (`crates/core/tests/locate_reading.rs`).
 
+pub mod fold;
+pub mod reading;
+pub mod render;
+
 use std::ops::Range;
 
 use crate::identity::ArtifactHash;
@@ -31,12 +43,118 @@ use crate::pointing::{PointingHead, layer_head};
 /// How many segments a `locate`'s ranking names at most.
 pub const RANKING_LEN: usize = 5;
 
-/// What one artifact is calibrated with for `locate`: the heads that vote,
-/// best first, and the longest span the vote was measured to hold at.
+/// Which reading a `locate`'s text gets (spec 22 § Solution): the kind a
+/// caller names, or the one `auto` tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Log,
+    Prose,
+    Records,
+}
+
+/// How a `locate` is answered (spec 22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// The heads narrow the text to a few candidates, a labelled `choice`
+    /// decides (ADR 0042).
+    Shortlist,
+    /// The head vote, as served before (ADR 0041).
+    Vote,
+}
+
+/// What a `locate`'s text is read as (spec 22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    /// Folded into templates and their values first ([`fold`]).
+    TemplateFold,
+    /// Read as it is.
+    None,
+}
+
+impl Kind {
+    /// The wire's spelling.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Prose => "prose",
+            Self::Records => "records",
+        }
+    }
+
+    /// The compression a `locate` of this kind gets when it names none: a
+    /// log is folded, prose and records are read as they are.
+    pub fn default_compression(self) -> Compression {
+        match self {
+            Self::Log => Compression::TemplateFold,
+            Self::Prose | Self::Records => Compression::None,
+        }
+    }
+}
+
+impl Method {
+    /// The wire's spelling.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shortlist => "shortlist",
+            Self::Vote => "vote",
+        }
+    }
+}
+
+impl Compression {
+    /// The wire's spelling.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TemplateFold => "template_fold",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Templates a fold's level 1 keeps for its labelled `choice`.
+pub const SHORTLIST_TEMPLATES: usize = 5;
+/// Candidates every other shortlist keeps: a fold's level-2 rows, or lines,
+/// sentences or records read without a fold.
+pub const SHORTLIST_LEN: usize = 16;
+/// The share a candidate of the last `choice` needs to be a **pointer** —
+/// chosen on spec 23's prose development split and frozen there.
+pub const POINTER_SHARE: f64 = 0.05;
+/// `found` below this names no segment (spec 22 § Not found). Not a
+/// calibrated probability: the rule the third research round measured.
+pub const FOUND_THRESHOLD: f64 = 0.5;
+/// Segments with content `auto` folds to tell a log from prose.
+pub const AUTO_SEGMENTS: usize = 2_000;
+/// The share of those in shared templates at which `auto` says `log`.
+pub const AUTO_LOG_SHARE: f64 = 0.5;
+
+/// The option a log's or a record array's last `choice` adds for "not
+/// found".
+pub const NONE_LINE: &str = "No line of the evidence answers the criterion";
+/// The option prose's last `choice` adds for "not found".
+pub const NONE_SENTENCE: &str = "No sentence of the evidence answers the criterion";
+/// The yes/no a log's last request adds, before the instruction as sent.
+pub const FOUND_QUESTION: &str = "Is there a line in the evidence that answers this question: ";
+
+/// `found` for a folded log (spec 22 § Not found): the "none" option's
+/// probability `p_none` and the yes/no's `p_yes`, averaged as
+/// `(1 - p_none + p_yes) / 2`.
+pub fn found_log(p_none: f64, p_yes: f64) -> f64 {
+    (1.0 - p_none + p_yes) / 2.0
+}
+
+/// `found` for prose and records: `1 - p_none`.
+pub fn found_by_none(p_none: f64) -> f64 {
+    1.0 - p_none
+}
+
+/// What one artifact is calibrated with for `locate`: the heads each method
+/// reads, best first, the longest span the vote was measured to hold at, and
+/// the window the shortlist's readings are cut into.
 ///
 /// The rest of the reading is fixed, not calibrated: the copy scaffold
-/// `{"quote":"`, the content-free prefill subtracted, one vote per head. Spec
-/// 19 phase 0 chose those on the development sets for every configuration it
+/// `{"quote":"`, the content-free prefill subtracted, one vote per head (the
+/// vote) or each head's lift standardized and summed (the shortlist). Spec 19
+/// phase 0 chose those on the development sets for every configuration it
 /// tried, and a recalibration repeats its procedure
 /// (`tools/locate-sets/README.md`) to choose the heads and measure the
 /// ceiling again.
@@ -44,12 +162,32 @@ pub const RANKING_LEN: usize = 5;
 pub struct LocateCalibration {
     /// The heads that vote, in the order they were ranked when chosen — the
     /// order a tie is broken in, and the order the leaf's rows come back in.
+    /// Also the **sum heads**: the shortlist's reading of prose (spec 22).
     pub heads: &'static [PointingHead],
-    /// `LOCATE_MAX_KEYS`: the most keys of state a `locate` reads. Spec 18's
-    /// rule 3 — the longest measured length whose top-1 stays within five
-    /// points of the shortest's — on the set that judged the vote. A longer
-    /// span is refused before any prefill, never answered unmeasured.
+    /// The **end heads** (spec 22): the shortlist's reading of logs and
+    /// records, at each segment's closing keys, in the order they were
+    /// ranked when chosen.
+    pub end_heads: &'static [PointingHead],
+    /// `LOCATE_MAX_KEYS`: the most keys of state the **vote** reads. Spec
+    /// 18's rule 3 — the longest measured length whose top-1 stays within
+    /// five points of the shortest's — on the set that judged the vote. A
+    /// longer span is refused before any prefill, never answered unmeasured.
     pub max_keys: u32,
+    /// `LOCATE_WINDOW_KEYS` (spec 22): the most keys of text one of the
+    /// shortlist's readings reads in one prefill. A longer text is read in
+    /// windows of at most this many; the rows' room reserved at load is
+    /// sized for it.
+    pub window_keys: u32,
+}
+
+impl LocateCalibration {
+    /// The heads `reading` is read with: the sum heads or the end heads.
+    pub fn heads_for(&self, reading: reading::Reading) -> &'static [PointingHead] {
+        match reading {
+            reading::Reading::Sum => self.heads,
+            reading::Reading::End => self.end_heads,
+        }
+    }
 }
 
 /// The served NVFP4 27B's vote: the 32 heads with the most training hits as
@@ -57,6 +195,13 @@ pub struct LocateCalibration {
 /// (`.scratch/locate/phase0/vote-choice.json`, recorded in spec 19 § Phase
 /// 3, track L before set D was read), and set D's ceiling
 /// (`docs/findings/2026-09-27-locate-by-head-vote-go.md`).
+///
+/// Its end heads are spec 23's (`.scratch/locate/zd/endheads.json`): the 32
+/// with the best single-head top-1 on sets A+B at a line's last key, the
+/// next line's first key or the separator
+/// (`docs/findings/2026-09-28-zero-decode-locate-exploration.md`); its
+/// window is the length spec 23 and the records round read one prefill at
+/// (`docs/findings/2026-09-28-zero-decode-locate-very-long-logs-and-prose.md`).
 const SERVED_NVFP4_27B_VOTE: LocateCalibration = LocateCalibration {
     heads: &[
         layer_head(39, 12),
@@ -92,7 +237,42 @@ const SERVED_NVFP4_27B_VOTE: LocateCalibration = LocateCalibration {
         layer_head(47, 18),
         layer_head(43, 9),
     ],
+    end_heads: &[
+        layer_head(47, 20),
+        layer_head(47, 4),
+        layer_head(51, 4),
+        layer_head(47, 17),
+        layer_head(47, 1),
+        layer_head(51, 12),
+        layer_head(51, 23),
+        layer_head(47, 5),
+        layer_head(47, 3),
+        layer_head(47, 15),
+        layer_head(39, 15),
+        layer_head(47, 9),
+        layer_head(47, 13),
+        layer_head(51, 16),
+        layer_head(39, 0),
+        layer_head(39, 12),
+        layer_head(43, 22),
+        layer_head(43, 20),
+        layer_head(47, 2),
+        layer_head(39, 23),
+        layer_head(55, 13),
+        layer_head(43, 9),
+        layer_head(43, 18),
+        layer_head(51, 17),
+        layer_head(55, 23),
+        layer_head(43, 7),
+        layer_head(51, 2),
+        layer_head(55, 20),
+        layer_head(47, 23),
+        layer_head(35, 18),
+        layer_head(43, 8),
+        layer_head(43, 14),
+    ],
     max_keys: 4_554,
+    window_keys: 200_000,
 };
 
 /// The calibration table: artifact content hash → the vote that locates.
@@ -258,6 +438,34 @@ mod tests {
         assert!(calibration.heads.len() <= crate::pointing::MAX_ROW_HEADS);
         // Spec 18's rule 3 on set D (`docs/findings/2026-09-27-locate-by-head-vote-go.md`).
         assert_eq!(calibration.max_keys, 4_554);
+    }
+
+    /// Spec 22 § The heads and their readings: the end heads in rank order
+    /// (spec 23's `endheads.json`), the sum heads the vote's, a 200,000-key
+    /// window — and at most the rows the leaf reads at once.
+    #[test]
+    fn the_served_artifact_reads_the_shortlist_with_spec_22s_heads() {
+        const END_HEADS: [&str; 32] = [
+            "L47.h20", "L47.h4", "L51.h4", "L47.h17", "L47.h1", "L51.h12", "L51.h23", "L47.h5", "L47.h3", "L47.h15",
+            "L39.h15", "L47.h9", "L47.h13", "L51.h16", "L39.h0", "L39.h12", "L43.h22", "L43.h20", "L47.h2", "L39.h23",
+            "L55.h13", "L43.h9", "L43.h18", "L51.h17", "L55.h23", "L43.h7", "L51.h2", "L55.h20", "L47.h23", "L35.h18",
+            "L43.h8", "L43.h14",
+        ];
+        let calibration = calibration(served()).expect("the served artifact is calibrated for locate");
+        let names: Vec<String> = calibration.end_heads.iter().map(ToString::to_string).collect();
+        assert_eq!(names, END_HEADS);
+        assert_eq!(calibration.heads_for(reading::Reading::End), calibration.end_heads);
+        assert_eq!(calibration.heads_for(reading::Reading::Sum), calibration.heads);
+        assert!(calibration.end_heads.len() <= crate::pointing::MAX_ROW_HEADS);
+        assert_eq!(calibration.window_keys, 200_000);
+    }
+
+    /// Spec 22 § The wire: a kind names its default compression.
+    #[test]
+    fn a_log_is_folded_by_default_and_prose_and_records_are_not() {
+        assert_eq!(Kind::Log.default_compression(), Compression::TemplateFold);
+        assert_eq!(Kind::Prose.default_compression(), Compression::None);
+        assert_eq!(Kind::Records.default_compression(), Compression::None);
     }
 
     /// Keyed by the whole hash: heads chosen for one model are never read on

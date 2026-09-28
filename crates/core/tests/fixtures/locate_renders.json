@@ -1,0 +1,274 @@
+{
+ "source": "tools/locate-sets/golden22.py",
+ "labels": [
+  "A",
+  "B",
+  "C",
+  "D",
+  "E",
+  "F",
+  "G",
+  "H",
+  "I",
+  "J",
+  "K",
+  "L",
+  "M",
+  "N",
+  "O",
+  "P",
+  "Q",
+  "R",
+  "S",
+  "T",
+  "U",
+  "V",
+  "W",
+  "X",
+  "Y",
+  "Z",
+  "a",
+  "b",
+  "c",
+  "d",
+  "e",
+  "f",
+  "g",
+  "h",
+  "i",
+  "j",
+  "k",
+  "l",
+  "m",
+  "n",
+  "o",
+  "p",
+  "q",
+  "r",
+  "s",
+  "t",
+  "u",
+  "v",
+  "w",
+  "x",
+  "y",
+  "z"
+ ],
+ "renders": [
+  {
+   "name": "one candidate",
+   "kind": "prose",
+   "lines": [
+    "# Alpha",
+    "Alpha one.",
+    "Alpha two.",
+    "Alpha three.",
+    "",
+    "# Beta",
+    "Beta one.",
+    "Beta two.",
+    "",
+    "# Gamma",
+    "Gamma one.",
+    "",
+    "Loose line without a title."
+   ],
+   "candidates": [
+    2
+   ],
+   "text": "   # Alpha\n   Alpha one.\nA: Alpha two.\n   Alpha three.",
+   "labels": {
+    "A": 2
+   }
+  },
+  {
+   "name": "two in one paragraph",
+   "kind": "prose",
+   "lines": [
+    "# Alpha",
+    "Alpha one.",
+    "Alpha two.",
+    "Alpha three.",
+    "",
+    "# Beta",
+    "Beta one.",
+    "Beta two.",
+    "",
+    "# Gamma",
+    "Gamma one.",
+    "",
+    "Loose line without a title."
+   ],
+   "candidates": [
+    1,
+    3
+   ],
+   "text": "   # Alpha\nA: Alpha one.\n   Alpha two.\nB: Alpha three.",
+   "labels": {
+    "A": 1,
+    "B": 3
+   }
+  },
+  {
+   "name": "across paragraphs",
+   "kind": "prose",
+   "lines": [
+    "# Alpha",
+    "Alpha one.",
+    "Alpha two.",
+    "Alpha three.",
+    "",
+    "# Beta",
+    "Beta one.",
+    "Beta two.",
+    "",
+    "# Gamma",
+    "Gamma one.",
+    "",
+    "Loose line without a title."
+   ],
+   "candidates": [
+    7,
+    10,
+    2
+   ],
+   "text": "   # Alpha\n   Alpha one.\nA: Alpha two.\n   Alpha three.\n\n   # Beta\n   Beta one.\nB: Beta two.\n\n   # Gamma\nC: Gamma one.",
+   "labels": {
+    "A": 2,
+    "B": 7,
+    "C": 10
+   }
+  },
+  {
+   "name": "a title-less paragraph",
+   "kind": "prose",
+   "lines": [
+    "# Alpha",
+    "Alpha one.",
+    "Alpha two.",
+    "Alpha three.",
+    "",
+    "# Beta",
+    "Beta one.",
+    "Beta two.",
+    "",
+    "# Gamma",
+    "Gamma one.",
+    "",
+    "Loose line without a title."
+   ],
+   "candidates": [
+    12,
+    6
+   ],
+   "text": "   # Beta\nA: Beta one.\n   Beta two.\n\nB: Loose line without a title.",
+   "labels": {
+    "A": 6,
+    "B": 12
+   }
+  },
+  {
+   "name": "labelled lines",
+   "kind": "labelled",
+   "lines": [
+    "first line",
+    "second: with a colon",
+    "  indented",
+    "ünïcödé"
+   ],
+   "text": "A: first line\nB: second: with a colon\nC:   indented\nD: ünïcödé"
+  }
+ ],
+ "spaced_json": [
+  {
+   "json": "{\"id\": 1, \"name\": \"Ada\", \"city\": \"Paris\"}",
+   "spaced": "{\"id\": 1, \"name\": \"Ada\", \"city\": \"Paris\"}"
+  },
+  {
+   "json": "{\"z\": 1, \"a\": 2, \"m\": {\"y\": [1, 2, {\"k\": \"v\"}], \"b\": null}}",
+   "spaced": "{\"z\": 1, \"a\": 2, \"m\": {\"y\": [1, 2, {\"k\": \"v\"}], \"b\": null}}"
+  },
+  {
+   "json": "{\"text\": \"line\\nbreak\\ttab \\\"quote\\\" back\\\\slash \\u0001 \\u007f \\u2028 ünï 名\"}",
+   "spaced": "{\"text\": \"line\\nbreak\\ttab \\\"quote\\\" back\\\\slash \\u0001    ünï 名\"}"
+  },
+  {
+   "json": "{\"ok\": true, \"no\": false, \"none\": null, \"neg\": -3, \"dec\": 1.5, \"zero\": 0, \"e\": [], \"o\": {}}",
+   "spaced": "{\"ok\": true, \"no\": false, \"none\": null, \"neg\": -3, \"dec\": 1.5, \"zero\": 0, \"e\": [], \"o\": {}}"
+  },
+  {
+   "json": "[\"a\", 1, [2, 3], {\"x\": \"y\"}]",
+   "spaced": "[\"a\", 1, [2, 3], {\"x\": \"y\"}]"
+  },
+  {
+   "json": "\"a plain string\"",
+   "spaced": "\"a plain string\""
+  },
+  {
+   "json": "12",
+   "spaced": "12"
+  },
+  {
+   "json": "{\"price\": 149.0, \"qty\": 2, \"ratio\": -0.25}",
+   "spaced": "{\"price\": 149.0, \"qty\": 2, \"ratio\": -0.25}"
+  }
+ ],
+ "found": [
+  {
+   "route": "log",
+   "p_none": 0.1,
+   "p_yes": 0.9,
+   "found": 0.9,
+   "found_is": true
+  },
+  {
+   "route": "log",
+   "p_none": 0.6,
+   "p_yes": 0.35,
+   "found": 0.375,
+   "found_is": false
+  },
+  {
+   "route": "log",
+   "p_none": 0.5,
+   "p_yes": 0.5,
+   "found": 0.5,
+   "found_is": true
+  },
+  {
+   "route": "log",
+   "p_none": 0.2,
+   "p_yes": 0.1,
+   "found": 0.45,
+   "found_is": false
+  },
+  {
+   "route": "prose",
+   "p_none": 0.49,
+   "p_yes": null,
+   "found": 0.51,
+   "found_is": true
+  },
+  {
+   "route": "prose",
+   "p_none": 0.51,
+   "p_yes": null,
+   "found": 0.49,
+   "found_is": false
+  },
+  {
+   "route": "records",
+   "p_none": 0.0,
+   "p_yes": null,
+   "found": 1.0,
+   "found_is": true
+  },
+  {
+   "route": "records",
+   "p_none": 1.0,
+   "p_yes": null,
+   "found": 0.0,
+   "found_is": false
+  }
+ ]
+}

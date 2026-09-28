@@ -306,13 +306,14 @@ pub fn model_scope(speculation: Option<Speculation>, vision: Option<Vision>) -> 
 }
 
 /// The keys of a text span a load of `reader`'s artifact reserves an
-/// attention readout's room for (GitHub #275, ADR 0041): the `locate`
-/// calibration's measured ceiling when the artifact has one, and none
-/// otherwise — a load nobody calibrated for `locate` never reads a text
-/// span, so it reserves nothing for one.
+/// attention readout's room for (GitHub #275, ADR 0041; GitHub #278, ADR
+/// 0042): the widest span a `locate` reads in one prefill — the shortlist's
+/// window, which is past the vote's measured ceiling — when the artifact is
+/// calibrated for `locate`, and none otherwise: a load nobody calibrated for
+/// `locate` never reads a text span, so it reserves nothing for one.
 pub fn text_readout_keys(reader: &Reader) -> u32 {
     crate::locate::calibration(crate::identity::ArtifactHash::from_bytes(reader.content_hash()))
-        .map_or(0, |calibration| calibration.max_keys)
+        .map_or(0, |calibration| calibration.window_keys.max(calibration.max_keys))
 }
 
 /// The options struct a load crosses the ABI with: `None` (a NULL pointer,

@@ -156,17 +156,18 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
     // For each of the 384 heads a set may name, its packed result (8 bytes,
     // GitHub #263) and its four neighbour scores (16 bytes, GitHub #264).
     const HEAD_SET_BYTES: u64 = 16 * 24 * (8 + 16);
-    // GitHub #275 (ADR 0041): the served artifact is calibrated for `locate`,
-    // so every load of it -- text or vision -- reserves a text readout's
-    // room over `LOCATE_MAX_KEYS`: one f32 per key (rounded to the arena's
+    // GitHub #275 (ADR 0041), #278 (ADR 0042): the served artifact is
+    // calibrated for `locate`, so every load of it -- text or vision --
+    // reserves a text readout's room over `LOCATE_WINDOW_KEYS`, the widest
+    // span one reading reads: one f32 per key (rounded to the arena's
     // 256-byte alignment), the head set's buffers, and 32 whole rows.
     let text_keys = u64::from(ignis_core::locate::calibration(ignis_core::ArtifactHash::from_bytes(reader.content_hash()))
         .expect("the served artifact is calibrated for locate")
-        .max_keys);
+        .window_keys);
     let aligned = |bytes: u64| bytes.div_ceil(256) * 256;
     let text_scores = aligned(text_keys * 4);
     let text_room = text_scores + HEAD_SET_BYTES + aligned(32 * text_keys * 4);
-    assert_eq!(text_room, 610_560, "4,554 keys: 18,432 B of scores, 9,216 of set results, 582,912 of rows");
+    assert_eq!(text_room, 26_409_216, "200,000 keys: 800,000 B of scores, 9,216 of set results, 25,600,000 of rows");
 
     // A text load reserves what it did before #212 -- the `prefill_scratch`
     // line the plan logged at these options on 2026-09-17 -- and the text
