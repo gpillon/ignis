@@ -24,14 +24,22 @@ import compress as C
 
 
 def post(url, body, timeout=1800):
-    request = urllib.request.Request(url + "/v1/decide", data=json.dumps(body).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"})
-    started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            status, payload = response.status, json.load(response)
-    except urllib.error.HTTPError as error:
-        status, payload = error.code, json.load(error)
+    """One `/v1/decide` request; an answer turned away with `engine_full`
+    (another client holds every lane) is asked again, up to six times."""
+    for attempt in range(6):
+        request = urllib.request.Request(url + "/v1/decide", data=json.dumps(body).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+        started = time.perf_counter()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status, payload = response.status, json.load(response)
+        except urllib.error.HTTPError as error:
+            status, payload = error.code, json.load(error)
+        full = any(isinstance(a, dict) and a.get("code") == "engine_full"
+                   for a in (payload.get("answers") or {}).values())
+        if not full:
+            break
+        time.sleep(5 * (attempt + 1))
     return status, payload, (time.perf_counter() - started) * 1e3
 
 
@@ -75,12 +83,52 @@ def generate(url, lines, instruction):
             "content": content[:400]}
 
 
+ALPHABET = json.load(open("F:/ai/opencode/inference/.scratch/locate/dumps/C-hq.json", encoding="utf-8"))["alphabet"]
+MAX_OPTIONS = 256
+
+
+def choice_once(url, lines, instruction):
+    """One labelled `choice` over at most 256 lines (spec 18's route)."""
+    labels = ALPHABET[:len(lines)]
+    state = "\n".join(f"{label}: {line}" for label, line in zip(labels, lines))
+    body = {"state": state, "questions": {"q": {"type": "choice", "instructions": instruction,
+                                                "criteria": {label: None for label in labels}}}}
+    status, payload, ms = post(url, body)
+    a = payload.get("answers", {}).get("q", {}) if status == 200 else {}
+    if a.get("type") != "choice":
+        return {"status": status, "error": payload.get("error") or a, "ms": ms}
+    ranking = sorted(((labels.index(k), p) for k, p in a["probabilities"].items()), key=lambda x: -x[1])
+    return {"status": status, "segment": labels.index(a["choice"]), "confidence": a["confidence"],
+            "ranking": [{"segment": s, "share": p} for s, p in ranking], "ms": ms}
+
+
+def choice(url, lines, instruction):
+    """A labelled `choice`; past 256 lines, one per chunk of 256 and a final
+    one over the chunks' winners (still no token generated)."""
+    if len(lines) <= MAX_OPTIONS:
+        return choice_once(url, lines, instruction)
+    winners, ms = [], 0.0
+    for start in range(0, len(lines), MAX_OPTIONS):
+        one = choice_once(url, lines[start:start + MAX_OPTIONS], instruction)
+        ms += one["ms"]
+        if "segment" in one:
+            winners.append(start + one["segment"])
+    final = choice_once(url, [lines[w] for w in winners], instruction)
+    if "segment" not in final:
+        return dict(final, ms=ms + final["ms"])
+    return {"status": 200, "segment": winners[final["segment"]], "confidence": final["confidence"],
+            "ranking": [{"segment": winners[e["segment"]], "share": e["share"]} for e in final["ranking"]],
+            "ms": ms + final["ms"], "chunks": len(winners), "winners": winners}
+
+
 def locate(url, lines, instruction):
     if len(lines) < 2:
         return {"segment": 0, "ranking": [{"segment": 0, "share": 1.0}], "ms": 0.0, "status": 200}
     if ROUTE == "generate":
         return generate(url, lines, instruction)
-    body = {"state": "\n".join(lines), "questions": {"q": {"type": "locate", "instructions": instruction}}}
+    if ROUTE == "choice":
+        return choice(url, lines, instruction)
+    body ={"state": "\n".join(lines), "questions": {"q": {"type": "locate", "instructions": instruction}}}
     status, payload, ms = post(url, body)
     if status != 200 or payload["answers"]["q"].get("type") != "locate":
         return {"status": status, "error": payload.get("error") or payload["answers"]["q"], "ms": ms}
@@ -97,7 +145,9 @@ def main():
     ap.add_argument("--sim", type=float, default=C.SIM)
     ap.add_argument("--values", action="store_true", help="level 1 shows each slot's distinct values")
     ap.add_argument("--top", type=int, default=1, help="level 2 over the union of the first `top` level-1 clusters")
-    ap.add_argument("--route", choices=("vote", "generate"), default="vote")
+    ap.add_argument("--route", choices=("vote", "generate", "choice"), default="vote")
+    ap.add_argument("--tournament", action="store_true",
+                    help="with --top: level 2 inside each top cluster, then one pass over the winners")
     args = ap.parse_args()
     global ROUTE
     ROUTE = args.route
@@ -111,6 +161,31 @@ def main():
             folds[key] = C.fold(lines, args.sim, values=args.values)
         f = folds[key]
         one = locate(args.url, f.level1, q["instruction"])
+        if args.tournament and "segment" in one:
+            # each of the level-1 ranking's first `top` clusters picks its own
+            # row at level 2; a last pass chooses among those rows' original
+            # lines
+            chosen = [e["segment"] for e in one["ranking"][:args.top]]
+            finalists, ms = [], one.get("ms", 0)
+            for ci in chosen:
+                t2, m2 = C.level2(f, ci)
+                two = locate(args.url, t2, q["instruction"])
+                ms += two.get("ms", 0)
+                if "segment" in two:
+                    finalists.append(m2[two["segment"]])
+            last = locate(args.url, [lines[m[0]] for m in finalists], q["instruction"])
+            ms += last.get("ms", 0)
+            answer = finalists[last["segment"]] if "segment" in last else None
+            tc = next((i for i, c in enumerate(f.clusters) if q["targets"] and q["targets"][0] in c.members), None)
+            row = {"id": q["id"], "absent": q["absent"], "segments": q["segments"], "targets": q["targets"],
+                   "split": q.get("split"), "clusters": len(f.clusters), "level1": one, "target_cluster": tc,
+                   "level1_hit": tc in chosen, "finalists": finalists, "answer_lines": answer, "ms": ms,
+                   "finalist_hit": any(q["targets"] and q["targets"][0] in m for m in finalists),
+                   "hit": bool(answer and q["targets"] and q["targets"][0] in answer)}
+            rows.append(row)
+            print(f"  {q['id']} {'absent ' if q['absent'] else 'present'} L1 top{args.top} {row['level1_hit']} "
+                  f"finalists {row['finalist_hit']} -> {'HIT' if row['hit'] else 'miss'} | {ms:.0f} ms", flush=True)
+            continue
         if args.top > 1 and "segment" in one:
             # level 2 over the union of the level-1 ranking's first `top`
             # clusters: each row tagged with its cluster's template head

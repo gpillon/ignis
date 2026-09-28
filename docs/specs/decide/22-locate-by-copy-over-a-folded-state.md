@@ -1,686 +1,556 @@
-# 22 - locate by copy, over a folded state
+# 22 - locate over very long texts: heads narrow, a labelled choice decides
 
-> **Registered 2026-09-28, before set R3 exists.** The acceptance rules
-> below (§ The acceptance run) and set R3's seed are fixed here and are not
-> edited once R3's manifest hash is recorded in this banner. A failed rule
-> is reported as failed and the defaults do not ship until the owner
-> decides; this spec does not pre-decide a fallback.
+> **Registered 2026-09-28; revised 2026-09-28, before sets R3 and P3
+> exist.** The first version made a constrained **copy** the default; the
+> research that followed (spec 23 and its findings) measured a route that
+> writes no token at all at least as well, and the owner chose it — this
+> revision replaces the default, adds `kind`, and re-registers the
+> acceptance below. The acceptance rules (§ The acceptance run) and the
+> sets' seeds are fixed here and are not edited once R3's and P3's manifest
+> hashes are recorded in this banner. A failed rule is reported as failed and
+> the defaults do not ship until the owner decides; this spec does not
+> pre-decide a fallback.
 
-GitHub: #278. ADR: [0042](../../adr/0042-locate-copies-over-a-folded-state.md) (Proposed).
+GitHub: #278. ADR: [0042](../../adr/0042-locate-copies-over-a-folded-state.md) (Proposed, revised).
 
 `locate` (spec 18, ADR 0041) names the **segment** of a text `state` an
-instruction asks for, today by one prefill's **head vote**. That vote is
-measured to 4,554 keys and, on real logs, finds the right *kind* of line but
-not the instance among its near-duplicates. This spec ships what the
-research on long real logs found (specs 20 and 21 and their findings): the
-model **copies** the line under a constraint to the state's own lines, and
-by default reads a **folded** state — near-duplicate lines folded into their
-templates — first the template, then the instance, then unfolded to the
-original line. The caller chooses both, as two enums on the question:
-`method` (`copy`, the default, or `vote`) and `compression`
-(`template_fold`, the default, or `none`).
+instruction asks for, today by one prefill's **head vote**, measured to 4,554
+keys. The texts a `locate` is for are much longer — logs of hundreds of
+thousands of lines, documents past the context — and there the vote finds the
+right *kind* of line and loses the instance. This spec ships what the
+research on very long logs and prose found (specs 20, 21 and 23 and their
+findings): **attention heads narrow the text to a few candidates and a
+labelled `choice` decides among them**, with no token generated. Logs are
+first **folded** into templates and their values; prose is read by the heads
+**window by window**; the kind of text is told by the fold itself. The caller
+can choose everything by name, as three enums on the question: `kind`
+(`auto`, `log`, `prose`), `method` (`shortlist`, `vote`) and `compression`
+(`template_fold`, `none`).
 
 One ticket, whose acceptance is numbered at the end.
 
 ## Problem Statement
 
-A caller with a real log wants the one line that answers an instruction —
-the failed write, the refused login, the pod that restarted — and the logs
-this is for are 16K to 200K tokens long.
+A caller with a very long text wants the place that answers an instruction:
+in a log, the one line — the failed write, the refused login, the pod that
+restarted; in prose, the one or several passages that answer a question. The
+texts are 16K tokens to past a million.
 
 - **The served vote refuses past 4,554 keys** (`locate_too_long`), and
-  lifting the ceiling does not help: on real logs it read 28 of 50 over
-  4K-200K on set R and **20 of 58 (34.5%)** on the fresh set R2, falling
-  with length ([locate at length](../../findings/2026-09-27-locate-at-length.md),
+  lifting the ceiling does not help on real logs: 28 of 50 on set R, **20 of
+  58 (34.5%)** on R2, falling with length
+  ([locate at length](../../findings/2026-09-27-locate-at-length.md),
   [real logs](../../findings/2026-09-28-locating-a-line-in-real-logs.md)).
-- **Its misses are near-duplicates.** At the copy scaffold the heads name
-  the kind of line — the same exporter's other write failure, the same
-  socket error of another session — and the miss rate climbs with the
-  number of lines of the target's template (81% with six or more siblings
-  on R2). Half of the attention row stays on the state at every length, so
-  each line's share falls as the log grows; the heads that read the instance
-  on more than half of R's questions fall from 51 of 384 at 4K tokens to one
-  at 200K ([the instance is read while
-  copying](../../findings/2026-09-27-the-instance-is-read-while-copying.md)).
-- **Generating the line works and costs too much.** Having the model write
-  the line out on the whole log read 86.2% of R2 and 92% of R, but the first
-  question pays the whole log's prefill (a median 47 s on R2, 139 s at 200K
-  tokens on R), and the answer is free text matched back to a line by string
-  search — the parser `/v1/decide` exists to remove.
-- **The caller cannot choose.** `method` is refused on a `locate` today, and
-  there is one reading.
+- **Its misses are near-duplicates, and its reading, not its heads, is the
+  weak link.** The vote sums each head's attention over a line's keys. At
+  length the line is marked at its **end** (its last token, the separator,
+  the next line's first token): read there, by 32 heads chosen for it on
+  short sets, one pass finds 72-74% of real-log lines against the vote's
+  34.5-56%; a line's first key is where no head reads it
+  ([zero-decode locate on real logs](../../findings/2026-09-28-zero-decode-locate-exploration.md)).
+- **One pass still loses the instance among many near-duplicates** (6 of 16
+  targets with six or more siblings); a second, short pass over the heads'
+  first candidates resolves them.
+- **Generating the line works and costs too much**: 86.2% of R2 on the whole
+  log, but the first question pays the whole log's prefill (47-139 s) and
+  the answer is free text matched back to a line.
+- **Prose is not logs.** It does not fold (the fold groups 4-8% of its
+  lines), its answers often span several sentences in several paragraphs,
+  and it is read best by the heads' sum over a sentence, not its end.
+- **Nothing past the context is answered**, and the caller cannot choose a
+  reading or a compression, nor get more than one segment back.
 
 ## Solution
 
-Two fields on a `locate` question, both enums, both optional:
+Three fields on a `locate` question, all enums, all optional:
 
-| | `compression: "template_fold"` (default) | `compression: "none"` |
+- **`kind`**: `"auto"` (default), `"log"` or `"prose"` — which reading the
+  text gets. `auto` folds the target's first 2,000 segments with content and
+  says `log` when at least half of them fall in templates of two or more,
+  `prose` otherwise (logs measured 0.96-0.98, prose 0.04-0.07 on every fresh
+  window; spec 23's HA).
+- **`method`**: `"shortlist"` (default) or `"vote"`.
+- **`compression`**: `"template_fold"` or `"none"`; its default follows the
+  kind — `template_fold` for a log, `none` for prose.
+
+| | `kind: log` | `kind: prose` |
 |---|---|---|
-| **`method: "copy"`** (default) | fold the target; copy a template line of level 1, then an instance row of level 2; unfold to the original segment | copy a segment of the whole state |
-| **`method: "vote"`** | the head vote over level 1, then over level 2; unfold | today's `locate`, byte for byte |
+| **`shortlist` + `template_fold`** (log default) | fold; the **end heads** read the templates and keep 5; a labelled `choice` picks one; its rows: the end heads keep 16 (all when ≤ 16); a labelled `choice` picks the row; unfold | refused: prose does not fold |
+| **`shortlist` + `none`** | the end heads read the whole target in windows and keep 16 lines; a labelled `choice` picks one | (prose default) the **sum heads** read the target in windows and keep 16 sentences; a labelled `choice` over them *in their paragraphs*; every candidate at p ≥ 0.05 is a pointer |
+| **`vote` + `none`** | today's `locate`, byte for byte, whatever the kind | the same |
+| **`vote` + `template_fold`** | refused (read 28 of R2's 58) | refused |
 
-- **`template_fold`** folds the target's lines, Drain-style, into
-  **templates**: lines of one source label and one token count whose tokens
-  agree on at least half their positions share a template, and every
-  position where they differ becomes a slot. **Level 1** is one line per
-  template, each slot showing its distinct values (`{v1|v2|...}`) and the
-  count `(xN)`; **level 2** is the chosen template's lines as their values
-  alone, values first and time last, exact repeats folded; a map takes a
-  level-2 row back to the original segments. Level 1 is a median 7.4x
-  shorter than the log (1.3x-51x). It is `tools/locate-sets/compress.py`'s
-  fold, the one R2 measured, and nothing else.
-- **`copy`** forces the vote's own scaffold `{"quote":"` and then decodes
-  **only continuations of the candidate segments' text**, one constrained
-  token at a time, and stops as soon as what it has written belongs to one
-  segment's text alone — a median 26 tokens on real logs, where the whole
-  line is 90. The written prefix *is* the answer: no string is matched.
-- **`vote`** is kept, unchanged under `none`, and reads each level of a fold
-  under `template_fold`. `LOCATE_MAX_KEYS` limits the text the vote actually
-  reads, so a long log whose level-1 text fits can be voted.
+- **`template_fold`** is `tools/locate-sets/compress.py`'s fold, as the first
+  version of this spec described it: templates Drain-style, **level 1** one
+  line per template with its slots' distinct values and `(xN)`, **level 2**
+  the chosen template's lines as their values, values first and time last; a
+  map back to the original segments. A 100K-token log folds to a median
+  ~10K-token level 1; a 1M-token log to 25-34K.
+- **The heads' reading** is a lift, as the vote's: each head's attention row
+  at the scaffold, less the content-free twin's, **standardized over the
+  candidates** and summed over the heads. The **end reading** (logs) scores a
+  line by its last key, its separator and the next line's first key; the
+  **sum reading** (prose) by all its keys. Candidates are kept in document
+  order.
+- **The labelled `choice`** is the endpoint's own `choice` over the
+  candidates, each prefixed with its answer label; for prose each candidate
+  is shown inside its paragraph (the paragraph's other lines unlabelled, as
+  context). It generates nothing: it reads the labels' logits, as every
+  `choice` does.
+- **Windows.** A text the heads read that is longer than the calibrated
+  window (`LOCATE_WINDOW_KEYS`, 200,000 keys on the served 27B) is cut into
+  windows at segment boundaries — at an empty segment when one is within the
+  window, as prose's paragraph breaks — each read as its own prefill with its
+  own twin; scores are standardized within a window and merged. The text's
+  raw length is then bounded by the request, not the context.
 
-On R2 the folded route read **55 of 58 (94.8%)** against 50 for generating on
-the whole log, 28 for folded + vote and 20 for the served vote, answering in
-a median 1.3 s (p90 3.9 s) instead of a long prefill. Every answer is still
-an index into the **original** state, with the segment's value as the caller
-sent it.
+Measured (the numbers are spec 23's and its findings'):
+
+| logs, top-1 | R (50) | R2 (58) | ~1M-token logs (41) | **R4, fresh (23)** |
+|---|---|---|---|---|
+| `shortlist` + `template_fold` | 45 | 55 | 36 | **21 (91.3%)** |
+| labelled `choice` alone over the fold | 42 | 53 | 33 | 16 |
+| the heads alone at both levels | 30 | 29 | 17 | — |
+| served vote | 28 | 20 | — | — |
+| median wall time of the first row | 0.8 s | 1.3 s | 5.0 s | 2.6 s |
+
+| prose (HotpotQA gold sentences in a haystack) | ≤200K | 1M |
+|---|---|---|
+| a gold sentence in the sum heads' first 16 | 100% | 100% |
+| the `choice`'s pick is a gold sentence (fresh P2) | 91.7% | 58% (7/12; 10/12 by paragraph) |
+| paragraph pointer F1 (fresh P2, all) | 0.77 | |
+
+Every answer is an index into the **original** state, with the segment's
+value as the caller sent it.
 
 ## User Stories
 
-1. As an agent reading a 100K-token service log, I want to ask which line
-   is the failed write and get its index in about a second, so that finding
-   a line does not cost the log's whole prefill.
+1. As an agent reading a 100K-token service log, I want to ask which line is
+   the failed write and get its index in about a second, so that finding a
+   line does not cost the log's whole prefill.
 2. As that agent, I want the answer to be the instance I described — this
    session's socket error, not another's — so that I act on the right line
    among its near-duplicates.
-3. As a caller, I want the default to be the method that measured best on
-   real logs, so that I do not have to know the research to get the good
-   answer.
-4. As a caller, I want to choose the reading (`copy` or `vote`) and the
-   compression (`template_fold` or `none`) by name, so that I can trade
-   accuracy, latency and context for my case.
-5. As a caller, I want both choices to be enums that name what they do, so
-   that a third method or compression later is a new value, not a new flag
-   that contradicts an old one.
-6. As a caller, I want an unknown `method` or `compression` refused with the
-   accepted values named, so that a typo never runs the default silently.
-7. As a caller, I want `compression` refused on every other question type,
-   so that a field I wrote is never ignored.
-8. As a caller, I want `head`/`chain` refused on a `locate` and `copy`/`vote`
-   refused on a `point` or `box`, so that each primitive's methods stay its
-   own.
-9. As a caller, I want the answer to name the `method` and `compression`
-   that produced it, as a `point` names its method, so that a default I did
-   not write is visible in what I got.
-10. As a caller, I want `segment` to index the state I sent — the line of
-    `split("\n")`, the array element — whatever was folded, so that I map
-    the answer back without the server's help.
-11. As a caller, I want to know which line I get when several lines are the
-    same (identical, or identical but for their time), so that a repeated
+3. As an agent with a million-token log, I want a `locate` to answer at all,
+   so that the context is not the limit.
+4. As an agent reading a long document, I want every passage that answers my
+   question — one or several — so that a two-part answer is not cut to one.
+5. As a caller, I want the default to be the route that measured best for my
+   kind of text, and the kind told for me when I do not say it, so that I
+   do not have to know the research to get the good answer.
+6. As a caller, I want to name the kind, the method and the compression, so
+   that I can trade accuracy, latency and context for my case.
+7. As a caller, I want all three to be enums that name what they do, so that
+   a new reading or compression later is a new value, not a contradicting
+   flag.
+8. As a caller, I want an unknown value refused with the accepted values
+   named, so that a typo never runs the default silently.
+9. As a caller, I want a combination that was measured bad or does not apply
+   (`vote` with a fold, a fold of prose) refused by name, so that I never get
+   an unmeasured answer.
+10. As a caller, I want `kind` and `compression` refused on every other
+    question type, so that a field I wrote is never ignored.
+11. As a caller, I want the answer to name the kind, method and compression
+    that produced it, so that a default I did not write is visible.
+12. As a caller, I want `segment` to index the state I sent, whatever was
+    folded or windowed, so that I map the answer back without the server.
+13. As a caller, I want `pointers` — every candidate the `choice` gave at
+    least 5% — so that I can take one answer or several.
+14. As a caller, I want to know which line I get when several are the same
+    text (identical, or identical but for their time), so that a repeated
     event gives a predictable answer: the first.
-12. As a caller, I want `confidence` documented as what it is for each
-    method — for a copy, the probability of the path it wrote among the
-    candidates' continuations; for a vote, the heads' agreement — and never
-    as a calibrated probability, so that I set my own thresholds knowingly.
-13. As a caller asking a `vote`, I want the ceiling to apply to the text the
-    vote reads, so that a long log folds to a level-1 text that fits and can
-    still be voted.
-14. As a caller, I want `copy` to be bounded by the context and not by the
-    vote's ceiling, so that `copy` with `none` answers any state that fits.
-15. As a caller with a state longer than the context, I want a folded
-    `locate` to answer when its level texts fit, so that the log's raw
-    length is not the limit.
-16. As a caller on a load nobody calibrated heads for, I want `copy` to work
-    and `vote` to be refused by name, so that the default does not depend on
-    a calibration.
-17. As a caller asking several `locate`s over one state, I want the fold
-    computed once and the level-1 prompt shared, so that the second question
-    costs a question, not a fold and a prefill.
-18. As a caller mixing `locate` with `noul` or `choice` over one state, I
-    want every answer back in one request, so that a folded question is just
-    another question of the fan-out.
-19. As a caller with an array of JSON records, I want `template_fold` to fold
-    records of one shape into a template and find the record by its values,
-    so that a list of thousands of tickets works like a log.
-20. As a caller whose question needs context across lines ("the error right
-    after the deploy") or names only a time, I want the documentation to say
-    that folding removes that and `compression: "none"` keeps it, so that I
-    choose knowingly.
-21. As a Playground user, I want the Decide tab to offer the method and the
-    compression beside a `locate`, starting on the endpoint's defaults, so
-    that I can compare them on my own evidence.
-22. As an operator, I want to count `locate`s by method and compression, so
-    that I can see the mix a load serves and what it costs.
-23. As an operator, I want the request log to say, per folded `locate`, how
-    many level-1 lines it read, how many rows the chosen template had and how
-    many tokens each copy drew, so that a slow or wrong answer is
-    attributable.
-24. As an operator, I want a load to say at start that `copy` is available
-    and whether `vote` is, so that I know before the first request.
-25. As a maintainer, I want `template_fold` to be a pure host function held to
-    golden cases written by the Python reference that R2 measured, so that
-    the served fold is the measured fold.
-26. As a maintainer, I want the copy's constraint to be a pure host
-    structure with table-driven tests, and the mock to report its draws and
-    honour a wide set, so that the endpoint is covered without a GPU
-    (ADR 0006).
-27. As a maintainer, I want the leaf's new behaviour — the draw reported in
-    the call that makes it, a set wider than 32 — held to an independent
-    oracle on the GPU, so that a constraint silently dropped cannot pass.
-28. As a maintainer, I want nothing to change for a request that is not a
-    copy: the 32-id permitted path, `number`, `scalar` and the thinking
-    close bit for bit, and no allocation or launch for a round without a
-    copy lane.
-29. As the owner, I want the defaults judged once on a fresh real-log set
-    with rules written here before the set exists, and the vote's behaviour
-    on set F held unchanged, so that the new default is not tuned to its own
-    test.
-30. As the owner, I want the short states the vote was accepted on (set F's
-    logs, records and prose) guarded, so that the default that wins on long
-    logs does not quietly lose on short ones.
+15. As a caller, I want `confidence` documented as what it is — the
+    `choice`'s probability of its pick, the product over a fold's two levels
+    — and never as a calibrated probability, so that I set thresholds
+    knowingly.
+16. As a caller asking several `locate`s over one state, I want the fold
+    computed once and every prefill a later question can share claimed, so
+    that the second question costs a question.
+17. As a caller mixing `locate` with `noul` or `choice` over one state, I
+    want every answer back in one request.
+18. As a caller whose question needs context across lines, or names a line by
+    its time alone, I want the documentation to say that folding removes
+    that and `compression: "none"` keeps it.
+19. As a Playground user, I want the Decide tab to offer the kind, method and
+    compression beside a `locate` and show every pointer, so that I can
+    compare them on my own evidence.
+20. As an operator, I want to count `locate`s by kind, method and
+    compression, and to see per question how many windows, templates, rows
+    and candidates it read, so that a slow or wrong answer is attributable.
+21. As a maintainer, I want the fold, the readings, the windowing, the merge,
+    the candidate render and the `auto` rule to be pure host functions held
+    to golden cases the Python reference writes, so that the served route is
+    the measured route.
+22. As a maintainer, I want the vote and every non-`locate` request unchanged
+    bit for bit.
+23. As the owner, I want the defaults judged once on fresh real logs and
+    fresh prose with rules written here before the sets exist, and the vote
+    and short states guarded, so that the new default is not tuned to its
+    own test.
 
 ## Implementation Decisions
 
 ### The wire
 
-- **`method`** on a `locate`: `"copy"` (default) or `"vote"`. The field
+- **`kind`** on a `locate`: `"auto"` (default), `"log"`, `"prose"`. Unknown:
+  `kind_unknown`, naming the three. On any other type: `kind_unsupported`.
+- **`method`** on a `locate`: `"shortlist"` (default) or `"vote"`. The field
   exists for `point` and `box` (`head`, `chain`); spec 18's refusal of it on
-  a `locate` is lifted.
-  - An unknown value on a `locate` is `method_unknown`, naming `copy` and
-    `vote`; `head` and `chain` are unknown values there. `copy` and `vote`
-    on a `point` or `box` are `method_unknown` naming `head` and `chain`.
-  - On every other type `method` stays `method_unsupported`, its message now
-    naming the three primitives that have one.
-- **`compression`** on a `locate`: `"template_fold"` (default) or `"none"`.
-  An unknown value is `compression_unknown`, naming both; `compression` on
-  any other type is `compression_unsupported`.
-- **All four combinations are valid.** Absent fields take the defaults and
-  are never read as another value.
-- **Refusals, all before any prefill** (a 422, nothing reaches the engine),
-  except where marked:
+  a `locate` is lifted. An unknown value on a `locate` is `method_unknown`
+  naming `shortlist` and `vote`; `shortlist` and `vote` on a `point` or `box`
+  are `method_unknown` naming theirs; on every other type `method` stays
+  `method_unsupported`.
+- **`compression`** on a `locate`: `"template_fold"` or `"none"`, default by
+  the resolved kind (`log` → `template_fold`, `prose` → `none`). Unknown:
+  `compression_unknown`; on any other type: `compression_unsupported`.
+- **Refusals, all before any prefill** (a 422, nothing reaches the engine):
 
   | code | when |
   |---|---|
-  | `locate_uncalibrated` | `method: "vote"` on a load with no `locate` calibration (a `copy` is served on every load) |
-  | `locate_too_long` | `vote` + `none`: the target past `LOCATE_MAX_KEYS`, as today. `vote` + `template_fold`: the level-1 text past it. **At runtime**, as that question's `Answer::Error`: the chosen template's level-2 text past it, which cannot be known before level 1 answers |
-  | `context_exceeded` | `copy`: the prompt plus the copy's budget (its longest candidate's tokens and one) past the context; for level 2, at runtime, as the question's `Answer::Error` |
-  | `locate_too_few_segments` | fewer than two segments with content, every method (unchanged) |
-  | `locate_unsupported` | the loaded template cannot say where its tokens sit — the vote's alone, which reads keys; a `copy` needs only the tokenizer |
+  | `compression_unsupported` | `template_fold` with `kind: "prose"` (prose does not fold) or with `method: "vote"` (measured 28 of R2's 58) |
+  | `locate_uncalibrated` | the load has no `locate` calibration — for either method: both read heads |
+  | `locate_too_long` | `vote` only, as today: the target past `LOCATE_MAX_KEYS` |
+  | `context_exceeded` | a level-1 text, a level-2 text or a `choice` prompt past the context (a fold's level-2 text past `LOCATE_WINDOW_KEYS` is windowed, not refused) |
+  | `locate_too_few_segments` | fewer than two segments with content (unchanged) |
+  | `locate_unsupported` | the loaded template cannot say where its tokens sit (unchanged) |
 
-  `within`, `locate_needs_json_state` and the target refusals are
-  unchanged.
-- **The answer** keeps `Answer::Locate`'s shape and gains two fields:
+- **The answer** keeps `Answer::Locate`'s shape and gains four fields:
 
   ```json
-  {"type": "locate", "method": "copy", "compression": "template_fold",
+  {"type": "locate", "kind": "log", "method": "shortlist", "compression": "template_fold",
    "segment": 1482, "value": "…the line as sent…", "confidence": 0.91,
-   "ranking": [{"segment": 1482, "share": 0.91}]}
+   "ranking": [{"segment": 1482, "share": 0.91}, {"segment": 1480, "share": 0.05}],
+   "pointers": [{"segment": 1482, "value": "…", "share": 0.91},
+                {"segment": 1480, "value": "…", "share": 0.05}]}
   ```
 
-  - `segment` indexes the **original** target; `value` is that segment as
-    the caller sent it.
-  - **Several segments with one text.** A copy cannot tell identical
-    segments apart, and a level-2 row folds lines identical but for their
-    time. Either way the answer is **the first** of them (the lowest index),
-    and the documentation says so. `vote` + `none` is unchanged: it may name
-    any of them.
-  - **`copy`**: `ranking` is one entry, the answer, with `share` equal to
-    `confidence`. `confidence` is the product of the copy's **draws** — each
-    the probability of the token within its own permitted set, exactly 1 for
-    a set of one — so the probability, restricted at every step to the
-    candidates' continuations, of the path the greedy decode wrote. Under
-    `template_fold` it is the product over both levels. It is **not a
-    calibrated probability**, and there is no "not found".
-  - **`vote`**: `none` is today's (the winner's share of the votes, the top
-    five). Under `template_fold`, `confidence` is the product of the levels'
-    confidences, and `ranking` is the last level read's, each row or template
-    named by its first original segment and each share multiplied by the
-    earlier level's confidence — so, as for every `locate`, the first entry
-    is the answer and its share is `confidence`.
-  - A level with one row (or a fold with one template) is not asked; it
-    counts as 1.
-- **`usage`**: `input_tokens` counts every prefill (both levels, the vote's
-  content-free twins); `output_tokens` counts the copy's draws (0 for a
-  vote, as today).
-- **Thinking** is refused as for every decision; the copy is greedy.
+  - `kind` is the resolved kind (`auto` never appears).
+  - `segment`, `value` and `confidence` are the pick: the last `choice`'s
+    most probable candidate. Under a fold, `confidence` is the product of the
+    two levels' pick probabilities.
+  - `ranking` is the last `choice`'s candidates by probability (at most
+    five), each share multiplied by the earlier level's pick probability, so
+    the first entry is the answer and its share is `confidence`.
+  - `pointers` is every candidate of the last `choice` whose share is at
+    least **0.05**, best first — always at least the pick. The threshold is
+    the one chosen on P's dev split (spec 23 froze it).
+  - **Several segments with one text** (a fold's row of lines identical but
+    for their time): the first. `vote` + `none` is unchanged.
+  - `vote` + `none`: today's answer plus `kind` (resolved, unused),
+    `method`, `compression`, and `pointers` holding the winner alone.
+- **`usage`**: `input_tokens` counts every prefill (windows, twins, levels,
+  `choice`s); `output_tokens` is 0: nothing is generated.
+- **Thinking** is refused as for every decision.
+
+### `auto`
+
+A pure host function: fold (`template_fold`, below) the target's first 2,000
+segments with content, and say `log` when the segments in templates of two or
+more are at least half of them. Computed once per target per request.
+Arrays of records fold as spaced JSON (below) and are mostly `log` (median
+share 0.94), not always (18 of 160 short record arrays read as prose); the
+documentation says so.
 
 ### `template_fold`
 
-- **The reference is `tools/locate-sets/compress.py`** (`fold` with
-  `values=True`, `summarize`, `level2`, `_common_affixes`) at the settings
-  R2 was judged with: `SIM` = 0.5; the `TIME`, `VARIABLE`, `LABEL` and
-  `TOKEN` patterns as written there; a slot's distinct values all shown when
-  they fit a 600-character budget, else the first 6, each cut to 24
-  characters, and `|+N` for the rest; `(xN)` on a template of N lines;
-  level-2 rows values-first — each slot's common prefix and suffix cut, the
-  values joined by `" | "`, the line's first time last (`" @ time"`), rows
-  with equal values folded with `(xN)`.
-- **A pure host function in `ignis_core`**, beside `ignis_core::locate`,
-  ported and held to golden cases (§ Testing Decisions). Its arithmetic is
-  Python's: lengths, cuts and affixes in **code points**, not bytes; `\d`,
-  `\S` and `\b` with Unicode classes; clusters in first-seen order.
-- **What it folds.** The target's segments that have content — empty and
-  all-whitespace segments are left out, as they own no key for the vote, and
-  are never an answer.
-  - A string's lines, as sent (a `\r` stays; the fold's tokens ignore it).
-  - An array's elements: a **string** element as its text; any other
-    element as its JSON **with a space after each `,` and `:` outside
-    strings** (Python's `json.dumps(element, ensure_ascii=False)`), keys in
-    the order sent, numbers as the caller wrote them (the golden cases use
-    integers and plain decimals, which both spell alike). *Not* the compact JSON
-    the vote renders: the fold compares whitespace tokens, and a compact
-    record is one token, so records would never fold.
-- **Kept as measured, and documented as limits**, not repaired here:
-  - a line that opens with a bracket is read as a source label (the
-    cluster's `[pod]` prefix), so lines that open with a bracketed time do
-    not fold — they are located as if unfolded;
-  - level 1 drops every time, so a question that names a line by its time
-    alone can only be answered at level 2;
-  - folding removes the order and neighbours of lines, so a question that
-    needs context across lines should ask `none`.
-- **The map** takes (template, level-2 row) to the original segments, in
-  order; the answer is the first.
-- **Computed once per target per request** — per (`state`, `within`) — on
-  the host before any prefill, and shared by every `template_fold` question
-  over that target. It is deterministic, so a later request over the same
-  state recomputes the same texts and claims their retained prefix.
+Unchanged from the first version of this spec: `tools/locate-sets/compress.py`'s
+`fold` with `values=True`, `summarize`, `level2` and `_common_affixes` at the
+settings R2 was judged with (`SIM` 0.5, the `TIME`, `VARIABLE`, `LABEL` and
+`TOKEN` patterns, a slot's values within a 600-character budget, else the
+first 6 cut to 24 characters and `|+N`, `(xN)`, level-2 rows values-first with
+their first time last), ported as a **pure host function in `ignis_core`**
+with Python's arithmetic (code points, Unicode classes, first-seen cluster
+order). It folds a string's lines as sent and an array's elements (a string
+as its text, anything else as its JSON with a space after each `,` and `:`
+outside strings); empty segments are left out. The map (template, row) →
+original segments; the answer is the first. Kept as measured, and
+documented: a bracket-opened line is read as a source label; level 1 drops
+every time; folding removes lines' order and neighbours.
 
-### The prompts of a folded question
+### The heads and their readings
 
-- Each level is asked as a `locate` over a **derived state**: the caller's
-  `state` with its target replaced by the level's text — its rows joined by
-  `\n`, one string — so the rest of a `within` state stays as the caller
-  sent it. With no `within` (the case R2 measured) the evidence is the
-  level's text alone.
-- The kind text is the `line` kind text for both levels, whatever the
-  original target was: the folded text is lines.
-- Otherwise it is the `locate` render as it is: layout L1, the instruction
-  as sent, the scaffold `{"quote":"`.
-- **Two stages.** Level 1 is asked over the level-1 text. Its answer names
-  a template; level 2 is asked over that template's rows; the row's first
-  original segment is the answer. A fold with one template skips level 1; a
-  template with one row skips level 2. A folded question is two internal
-  requests in sequence; its second is submitted when its first answers,
-  while the request's other questions run.
+- **The calibration** (`ignis_core::locate::LocateCalibration`) gains, per
+  artifact: the **end heads** (the `log` reading), the **sum heads** (the
+  `prose` reading) and **`LOCATE_WINDOW_KEYS`**. On the served NVFP4 27B:
+  - end heads, in rank order (spec 23's `endheads.json`, chosen on sets A+B
+    by single-head top-1 at a line's last key, next first key or separator):
+    L47.h20, L47.h4, L51.h4, L47.h17, L47.h1, L51.h12, L51.h23, L47.h5,
+    L47.h3, L47.h15, L39.h15, L47.h9, L47.h13, L51.h16, L39.h0, L39.h12,
+    L43.h22, L43.h20, L47.h2, L39.h23, L55.h13, L43.h9, L43.h18, L51.h17,
+    L55.h23, L43.h7, L51.h2, L55.h20, L47.h23, L35.h18, L43.h8, L43.h14;
+  - sum heads: the vote's 32, as calibrated (ADR 0041);
+  - `LOCATE_WINDOW_KEYS` 200,000 (spec 23 read prose in windows of at most
+    210,000 tokens, logs' level texts to ~100,000 keys).
+  `max_keys` (4,554) stays the vote's ceiling alone.
+- **A reading is one prefill per window and its content-free twin** (the
+  vote's render: layout L1, the kind text, the instruction, the forced
+  `{"quote":"`; the twin's instruction `N/A`), the readout returning the 32
+  heads' rows over the window's span (ADR 0041's rows readout). The rows'
+  room is reserved at load for 32 heads x `LOCATE_WINDOW_KEYS` (25.6 MB of
+  f32 on the served 27B; ADR 0030), and stated in the VRAM plan.
+- **The host reading**, pure and held to golden cases from the Python
+  reference (`tools/locate-sets/zd_offline.py`'s `zsum`, `zd_cache.py`'s
+  `key_features`, `zd_windows.py`'s `sub_windows`, `zd_prose.py`'s merge):
+  each head's softmax over the window's span; per segment the question's
+  mass less the twin's at the segment's keys (sum), or at its last key, the
+  keys between it and the next segment and the next segment's first key
+  (end); each head's lifts standardized over the window's segments and
+  summed over heads; windows' scores standardized and concatenated; empty
+  segments and, for prose, lines that open with `# ` (titles) never
+  candidates.
+- **The shortlist** is the first K segments by that score, shown in document
+  order: K = 5 templates at a fold's level 1, K = 16 rows at level 2 (all
+  when ≤ 16), K = 16 lines or sentences without a fold.
 
-### The copy
+### The labelled `choice`
 
-- **The prompt is the vote's question prompt, byte for byte**: layout L1,
-  the kind text, the instruction, the forced `{"quote":"`. No content-free
-  twin. A `copy` and a `vote` over one target therefore share their whole
-  prompt, and the prompt-pinning test covers both.
-- **Each candidate's copy text** is the segment as the evidence renders it,
-  which is what the model has to copy:
-  - a line (and every row of a folded level): its JSON-escaped text,
-    without the separators;
-  - an array element that is a string: its JSON-escaped content, without
-    its quotes;
-  - any other element: its JSON as the evidence renders it.
+- The endpoint's `choice`, as served, over the candidates labelled with its
+  answer alphabet (spec 18's labelled route): a derived state holding the
+  candidates as `label: text` lines, the instruction as sent, one option per
+  label. No new primitive and no new render.
+- **Prose candidates are shown in their paragraphs**: for each candidate,
+  its paragraph (the segments between the empty segments around it), in
+  document order, the candidates labelled and the paragraph's other lines
+  indented and unlabelled — `zd_prose.py`'s `render`, held to golden cases.
+- The `choice`'s probabilities are the candidates' shares.
 
-  Each is tokenized **alone** with the loaded tokenizer (no special tokens)
-  — the tokens the model would write after the scaffold's opening quote.
-- **The copy tree** — a prefix tree over the candidates' copy tokens, each
-  node knowing the segments whose tokens pass through it — is a pure host
-  structure beside `ignis_core::constrained`.
-  - The **permitted set** at a node is its children's tokens, plus the
-    **terminators** where some candidate's tokens end at that node and
-    others continue. The terminators are the loaded tokenizer's single
-    tokens that spell `"` or `"}` (whichever it has), computed at load like
-    the answer alphabet.
-  - **The run settles** when every segment through the node it has reached
-    has the same copy text — at once when one segment is left, which on
-    real logs is a median 26 tokens (p90 46) into a line of 90. The answer
-    is the lowest-index segment there.
-  - A drawn **terminator** settles on the lowest-index segment whose copy
-    text ends at that node. A text that is a proper prefix of another is
-    reached this way.
-  - A copy never ends on EOS (EOS is not in the tree) and never runs past
-    the tree's depth plus one draw.
-- **It is a constrained decode**, like a `number` (ADR 0034, GitHub #242):
-  greedy, one lane, plain rounds on a speculative load (a verify round
-  refuses a permitted set), the first draw made by the prefill, no residency
-  after. Its reservation is the prompt plus its budget, the longest
-  candidate's tokens and one.
+### Fan-out, reuse and cost
 
-### What the seam and the leaf need that #242 did not
-
-#242's schedule is a function of the step index alone, at most 32 ids per
-step, and a round **returns the token the previous call drew**. A copy's
-next set depends on the token just drawn, and at its root it can be wider
-than 32. Three changes, and nothing else moves:
-
-1. **A constrained decode has two shapes**: #242's `Schedule`, or a
-   **copy** (the copy tree). A request carries one of them or a decision
-   read, never two. The scheduler asks a copy for the set of the draw each
-   job makes, from the draws reported so far; when the reported draw
-   settles the run, the next round carries no set, commits that draw and
-   finishes the request (`stop`) — the schedule's last-round rule.
-2. **The leaf reports the draw a call makes, in that call**: an appended
-   output on `ignis_prefill_options` and `ignis_decode_options` (ADR 0016:
-   a field append and a size bump), filled for the lanes and jobs that ask;
-   `PrefillOutcome` and `DecodeOutcome` carry it across the `Compute` seam.
-   What a round **commits** is unchanged — still the previous call's draw —
-   so the lag stays where #242 documented it; only the host learns the draw
-   one call earlier, one more token per copy lane in what the call returns.
-   A call where no lane or job asks for it returns nothing new and waits for
-   nothing new.
-3. **A copy's permitted set may be as wide as the vocabulary**, and is
-   honoured, never refused or truncated for its width: a per-lane
-   **vocabulary bitmask** (one bit per id, 31,040 bytes on the 27B)
-   appended to `ignis_sampling_params` beside the 32-id row. The mask kernel
-   tests the bit; the restricted probability is the softmax over the mask's
-   members. Its staging — one mask per decode lane
-   (`IGNIS_DECODE_MAX_BATCH`) and per prefill job that can carry a set — is
-   reserved at load (ADR 0030) and stated in the VRAM plan.
-
-The 32-id path — `number`, `scalar`, the thinking close — is unchanged bit
-for bit, and a round or prefill with no copy lane allocates and launches
-nothing new. `MockCompute` reports its draws in the call that makes them and
-honours a set of any width.
-
-### The vote, and what `LOCATE_MAX_KEYS` limits
-
-- `vote` + `none` is today's `locate`: the same render, the same content-free
-  twin, the same heads, the same answer.
-- `vote` + `template_fold` asks the vote at each level, each with its own
-  content-free twin over that level's derived state.
-- **`LOCATE_MAX_KEYS` limits the text the vote reads**: the target under
-  `none`, each level's text under `template_fold`. The calibration table,
-  the score room reserved at load and the ceiling (4,554 keys on the served
-  27B) are unchanged. A `copy` is bounded by the context and never by it.
-
-### Fan-out, reuse and loads
-
-- A request mixing methods, compressions and other primitives over one state
-  answers every question. `copy` and `vote` with one compression share their
-  prompt up to the scaffold; `template_fold` questions over one target share
-  its level-1 prompt; a `template_fold` prompt holds no state and so shares
-  nothing with the other kinds over it (they keep sharing with each other).
-- **Every load serves `copy`.** `vote` needs the load's `locate` calibration
-  (ADR 0041), as today. The `ignis.decide.locate` event says both.
+- A request mixing kinds, methods and other primitives over one state
+  answers every question. The fold is computed once per target; a fold's
+  level-1 prefill (and its twin) is shared by every question over that
+  target; a window's prefill is shared by every question over it — the
+  scheduler submits a window's questions together, windows in order, so a
+  window's prefix is retained while its questions run.
+- Measured cost: a folded `log` question a median 0.8-2.6 s (5 s at ~1M
+  tokens) with no long prefill; a `prose` question pays each window's
+  prefill once (68 s per 200K-token window) and then ~4 s of head reading
+  per window and ~0.5 s of `choice`. The documentation states both.
 
 ### Observability and documentation
 
-- **Metrics** (ADR 0017): `ignis_decisions_total{type="locate"}` still
-  counts one per question, whatever its stages. A new counter
-  `ignis_locates_total{method="copy|vote",compression="template_fold|none"}`
-  counts `locate` questions by what answered them — recorded by the handler,
-  absent until the first `locate`, all four series exported once present
-  (the decision family's exception). No answer mass (a copy is generated, a
-  vote is read off attention). A copy's draws count wherever a `number`'s
-  do. ADR 0017 is amended.
-- **The request log**: a `locate`'s line names its method and compression,
-  and for a fold the level-1 lines, the chosen template's rows, and the
-  draws per level.
-- **OpenAPI** (ADR 0036): `method` documented per primitive (`head`, `chain`
-  for `point` and `box`; `copy`, `vote` for `locate`), `compression`, the
-  answer's two new fields, the new refusals and the changed defaults.
-- **`docs/user/README.md`**, "Finding a line or an item": the defaults, the
-  four combinations with what each costs and measured, the answer's
-  `method`/`compression`, the first-of-identical rule, what `confidence`
-  means per method, the vote's ceiling and calibration, and the fold's
-  limits (cross-line context, time-only questions, bracket-opened lines).
-  The labelled-`choice` recipe stays as the route for a question the fold
-  cannot serve and a vote-only load cannot reach.
-- **`CONTEXT.md`**: *Copy* (the method), *Copy tree*, *Template fold*,
-  *Level 1* and *Level 2*; *Locate*, *Constrained decode*, *Permitted set*
-  (a copy's may be wider than 32), *Draw* (reported in the call that makes
-  it) amended.
+- **Metrics** (ADR 0017): `ignis_decisions_total{type="locate"}` still counts
+  one per question. A new counter
+  `ignis_locates_total{kind="log|prose",method="shortlist|vote",compression="template_fold|none"}`,
+  absent until the first `locate`. No answer mass. ADR 0017 is amended.
+- **The request log**: per `locate` its resolved kind, method, compression,
+  windows read, and for a fold the level-1 templates, the chosen template's
+  rows and the candidates of each `choice`.
+- **The load event** `ignis.decide.locate` names the calibration's heads and
+  window.
+- **OpenAPI** (ADR 0036): the three fields, the answer's new fields, the
+  refusals, the defaults.
+- **`docs/user/README.md`**, "Finding a line or an item": the kinds and
+  `auto`, the defaults, the combinations with what each costs and measured,
+  `pointers`, the first-of-identical rule, what `confidence` means, windows,
+  the fold's limits, prose's first-read cost, and that there is no "not
+  found" yet.
+- **`CONTEXT.md`**: *Shortlist*, *End reading*, *Sum reading*, *End heads*,
+  *Template fold*, *Level 1*, *Level 2*, *Window*, *Pointer*; *Locate*
+  amended.
 - **ADR 0042** accepted with the acceptance's numbers; ADR 0041's status
-  names it (the vote is one of two methods).
-- **The Playground's Decide tab** (#277, `web/src/decide/`): a `locate`
-  card gets two selectors, method and compression, in the shape of the
-  point/box selector (#260) — the default choice sends no field and says
-  the endpoint will use `copy` / `template_fold`; each named value is sent.
-  The answer panel names the method and compression that answered; for a
-  copy it shows the confidence and no vote. The dev mock answers all four.
+  names it.
+- **The Playground's Decide tab** (#277): a `locate` card gets three
+  selectors (kind, method, compression) in the shape of the point/box
+  selector — the default choice sends no field; the answer panel names the
+  resolved kind, method and compression and lists every pointer with its
+  share. The dev mock answers each combination.
 
-## The acceptance run (registered before set R3 exists)
+## The acceptance run (registered before sets R3 and P3 exist)
 
-### Set R3
+### Set R3 (logs)
 
-A fresh real-log set nobody has asked, built by rule before any route runs
-on it — r2set.py's rules, on new sources. Seed **20261050**.
+As registered in the first version, seed **20261050**: a fresh capture of
+the owner's cluster (`kubectl logs --since=6h --timestamps`, read only,
+after every earlier capture, merged by `prodset.py timeline`) cut into 2
+windows per tier of 16K / 50K / 100K / 200K tokens and 2 of ~1M, 4 targets
+per window; the **full** LogHub logs (not the 2k samples), one window of 100K
+tokens per system and, where the log holds it, one of 200K, sharing no line
+with that system's 2k sample, 3 targets per window. Targets by r2set.py's
+sibling rule, drawn round-robin over the bins 0, 1-5, 6-50, > 50; questions
+written after reading the windows and before any answer, checked by
+`r2set.py build`'s rules; a target no question can single out is dropped, not
+replaced. At least 80 present questions and 12 windows at 100K tokens; a
+shortfall the sources force is recorded before any run. Never committed; its
+manifest sha256 enters this banner.
 
-- **Cluster**: a new capture of the owner's cluster, taken after R2's —
-  `kubectl logs --since=6h --timestamps` of its running pods, read only,
-  merged by time with `prodset.py timeline` — cut into 2 windows per tier of
-  16K / 50K / 100K / 200K tokens, 4 targets per window. **Never committed**;
-  only its manifest hash enters the repository.
-- **LogHub**: the **full** logs LogHub publishes (downloaded into
-  `.scratch/`, never committed) — not the 2k samples, which R2 used whole.
-  Per system, one window of 100K tokens and, where the log holds it, one of
-  200K, cut at seeded offsets and sharing no line with that system's 2k
-  sample; 3 targets per window.
-- **Targets by rule**: a line's siblings are the lines whose word sets,
-  times, numbers, ids and hashes removed, have a Jaccard of at least 0.5 with
-  it; lines with an exact twin after that removal are excluded; targets are
-  drawn round-robin over the sibling bins 0, 1-5, 6-50, > 50.
-- **Questions** written for the drawn targets after reading the windows and
-  before any answer, checked by `r2set.py build`'s rules (lexical, combo,
-  paraphrase only for targets without siblings); a target no question can
-  single out is dropped, not replaced, with its reason recorded; at least 10
-  absent questions (the target removed).
-- **Size**: at least 80 present questions and at least 12 windows at 100K
-  tokens. A shortfall the sources force is recorded before any run, and the
-  rules apply as written to what exists.
-- The builder (`r3set.py`, or r2set.py with a source for the full logs) and
-  the judge (`r3_judge.py`) are committed, and R3's manifest sha256 written
-  into this spec's banner, **before any route is asked on R3**. R, R2, L,
-  L2 and sets A-D may be used to debug; R3 is asked once.
+### Set P3 (prose)
+
+`tools/locate-sets/prosehay.py --seed 20261110`, excluding every HotpotQA
+question of sets A-F, P and P2; tiers 16K / 64K / 128K / 200K (four windows
+each) and 1M (two windows); six questions per window. Its manifest sha256
+enters this banner.
+
+The builders and the judge (`r3_judge.py`) are committed, and both hashes
+written here, **before any route is asked on either set**.
 
 ### The runs
 
-On the served artifact under `make start`'s defaults (hq-e8-2b with the
-residual window, chunk 1,024, DFlash2 loaded), one `locate` per request
-through `/v1/decide` (`served.py ask` with `--method` and `--compression`):
+On the served artifact under `make start`'s defaults, one `locate` per
+request through `/v1/decide`:
 
-1. **R3, `copy` + `template_fold`**, first, on a freshly started server — its
-   first question per window meets no retained state.
-2. **R3, `copy` + `none`.**
-3. **R3, `vote` + `template_fold`** (reported).
-4. **Set F, `vote` + `none`**, named explicitly.
-5. **Set F, `copy` + `template_fold`.**
+1. **R3, no fields** (the defaults: `auto`, `shortlist`, `template_fold` for
+   the logs), first, on a freshly started server.
+2. **R3, `choice` alone over the fold** (`folded_locate.py --route choice
+   --values`, the reported comparison).
+3. **P3, no fields** (`auto`, `shortlist`, `none` for prose).
+4. **Set F, `method: "vote"`, `compression: "none"`**, named explicitly.
+5. **Set F, no fields.**
 
 ### The rules
 
-1. **Top-1.** `copy` + `template_fold` names the target on **at least 90%**
-   of R3's present questions.
-2. **Non-inferiority.** `copy` + `template_fold`'s top-1 on R3's present
-   questions is **at least `copy` + `none`'s minus 5 points**.
-3. **Latency.** Over R3's 100K-token windows, the **median wall time of each
-   window's first question** under `copy` + `template_fold` — the client's
-   request time, the fold included — is **at most 3.0 s**.
-4. **The vote unchanged.** On set F, `vote` + `none` serves and refuses the
+1. **Logs.** The defaults name the target on **at least 85%** of R3's present
+   questions.
+2. **Logs, the heads' part.** The defaults' top-1 on R3 is **at least** the
+   labelled `choice` alone over the same fold (run 2).
+3. **Latency.** Over R3's 100K-token windows the median wall time of each
+   window's first question under the defaults — the client's request time,
+   the fold included — is **at most 3.0 s**.
+4. **Prose.** On P3's windows up to 200K tokens the pick is a gold sentence
+   on **at least 85%** of questions, and over all of P3 the paragraph-level
+   pointer F1 averages **at least 0.75**. (The 1M group is reported, not
+   asserted: spec 23 found it the weak point, and the research continues.)
+5. **`auto`.** The defaults resolve every R3 window to `log` and every P3
+   window to `prose`.
+6. **The vote unchanged.** On set F, `vote` + `none` serves and refuses the
    same questions as the recorded run (`.scratch/locate/F-served.json` in
-   the main checkout, [finding](../../findings/2026-09-27-locate-through-decide.md)): the same
-   `locate_too_long` refusals, and the same segment on every served question
-   whose recorded winner led the next by more than one vote; where it led by
-   one vote or tied, one of those two segments.
-5. **Short states.** On set F's present questions the vote serves, `copy` +
-   `template_fold`'s top-1 per family is at least the recorded vote's minus
-   5 points: **logs ≥ 39/43, records ≥ 44/46, prose ≥ 56/67**.
+   the main checkout,
+   [finding](../../findings/2026-09-27-locate-through-decide.md)): the same
+   `locate_too_long` refusals, the same segment on every served question
+   whose recorded winner led the next by more than one vote, one of the two
+   where it led by one or tied.
+7. **Short states.** On set F's present questions the vote serves, the
+   defaults' top-1 per family is at least the recorded vote's minus 5 points:
+   **logs ≥ 39/43, records ≥ 44/46, prose ≥ 56/67**.
 
 ### Reported, not asserted
 
-`vote` + `template_fold` on R3; `copy` + `none` on F; `copy` +
-`template_fold` on F's 45 present questions past the vote's ceiling; by
-source and tier: top-1, level-1 accuracy (whether the answer's template
-holds the target, from the reference fold), draws per level against the
-target's unique-prefix length, level-1 compression, prompt tokens and wall
-time (median, p90) of every route; the present/absent AUC of each method's
-`confidence`; the fold's host time on the longest window. All of it goes in
-a finding with a README row, and ADR 0042's numbers come from it.
+P3's 1M group; by source, tier and sibling bin: top-1, level-1 accuracy,
+shortlist recall (a target among the candidates), windows and prompt tokens,
+wall time (median, p90); sentence-level pointer F1; `confidence` beside a
+correct and a wrong pick; the fold's and `auto`'s host time on the longest
+window. All of it goes in a finding with a README row, and ADR 0042's
+numbers come from it.
 
 ## Testing Decisions
 
 A good test asserts what a caller or an operator can observe — the segment,
-the method that answered, the refusals, the rounds run — and holds the
-device path to an **independent** oracle.
+the pointers, the resolved enums, the refusals, the prefills submitted — and
+holds the host arithmetic to the Python that measured it.
 
-- **`template_fold` (CPU, pure), against golden cases.** `compress.py` gains
-  a `golden` subcommand that writes, for a fixed list of inputs, the input
-  lines, the level-1 rows, each template's members and each template's
-  level-2 rows with their segments, into
-  `crates/core/tests/fixtures/template_fold/`. The Rust fold reproduces them
-  exactly. The inputs are synthetic — `logs.py` and `records.py` output at
-  fixed seeds, and hand-written edge cases — and never a LogHub or cluster
-  line: labels, times in every `TIME` shape, masked variables, the `SIM`
-  boundary, a slot past the 600-character budget (`|+N`), a value past 24
-  code points, non-ASCII text and digits, one-value slots, exact repeats and
-  repeats differing only in time, affixes cut to nothing, empty and
-  whitespace lines, `\r\n`, a bracket-opened line, records of two shapes
-  rendered as spaced JSON, string elements.
-- **The copy tree (CPU, pure), table-driven**: permitted sets at the root
-  and below; settling at the first prefix one text owns; identical texts
-  settling on the lowest index; a text that is a proper prefix of another,
-  reached by a terminator; texts that share characters but not tokens;
-  copy texts of a line, a string element and an object element, escapes
-  included; whitespace segments left out; a node wider than 32; the budget;
-  the confidence's product.
-- **The scheduler (CPU)**: a copy request's prefill carries the root set;
-  every round's set is the one the reported draws lead to; the run finishes
-  one round after the settling draw, never on EOS; a batch mixing a copy
-  lane with a free lane, a `number` and a thinking close leaves their jobs
-  as they were; a copy on a speculative load runs plain rounds.
-- **The endpoint over the mock (CPU, `/v1/decide`)**:
-  - no fields answer `method: "copy"`, `compression: "template_fold"`; each
-    of the four combinations answers with the shape above;
-  - whatever the mock draws, the answer is the one segment the draws lead
-    to, and the rounds are the draws to settle plus one; forced steps report
-    1; identical lines answer the first;
-  - every refusal in the wire section, before any prefill, and the two
-    runtime ones as that question's `Answer::Error` while its siblings
-    answer;
-  - `vote` refused on an uncalibrated load while `copy` is served there;
-    `vote` + `none` refused past the ceiling where `vote` + `template_fold`
-    is served because its level-1 text fits;
-  - a fan-out of all four combinations, a `noul` and a `choice` over one
-    state; the fold computed once per target, and a second `template_fold`
-    question claiming the first's level-1 prefix;
-  - `usage`, the request log's fields, `ignis_locates_total`, the OpenAPI
-    document's new fields and values.
-- **The vote is pinned.** Today's `locate` tests ask for `method: "vote"`,
-  `compression: "none"` by name and pass unchanged, and the prompt-pinning
-  test (`decide_locate_prompt.rs`) holds that render byte-identical.
-- **The leaf (GPU profile), against the readout as oracle**, under BF16 and
-  hq-e8-2b:
-  - the draw a prefill or a round reports is the token the next round
-    commits, on every lane of a batch mixing a copy lane with free and
-    32-id lanes;
-  - a set of 1,000 ids and one of the whole vocabulary but one are honoured:
-    every draw is a member;
-  - the greedy draw equals the argmax of a readout (ADR 0034) over the same
-    ids at the same position, and its reported probability equals that
-    readout's softmax over them, to float accumulation;
-  - `permitted_decode_gpu.rs` (the 32-id path) passes unchanged; the VRAM
-    plan's test states the new bytes.
-- **End to end (GPU profile)**: on a committed synthetic fixture of logs
-  with near-duplicate lines and records of one shape, `copy` +
-  `template_fold` and `copy` + `none` through `/v1/decide` name every
-  question's target, each level's draws at most its unique prefix plus one.
-- **The Playground** (vitest): the two selectors, their defaults sending no
-  field, the named values sent, the answer's method and compression shown,
-  a copy's panel without a vote; the dev mock's four answers.
+- **Golden cases (CPU, pure)** written by the reference into
+  `crates/core/tests/fixtures/`: `compress.py golden` for `template_fold`
+  (the first version's list: labels, times in every `TIME` shape, masked
+  variables, the `SIM` boundary, the 600-character budget, long values,
+  non-ASCII, repeats, affixes, empty and whitespace lines, `\r\n`, a
+  bracket-opened line, records as spaced JSON, string elements); a new
+  `golden` for the readings (rows and twins in, per-segment sum and end
+  lifts, standardized scores, windows cut and merged, the shortlist) and for
+  `auto` and the prose render. Synthetic inputs only, never a cluster line.
+- **The endpoint over the mock (CPU, `/v1/decide`)**: no fields answer with
+  the resolved kind and the shortlist; each valid combination answers with
+  the shape above; every refusal before any prefill; a target longer than a
+  window read as several windows and answered with an index into the
+  original; a fold's level 2 asked only after level 1; the fan-out of kinds,
+  methods, a `noul` and a `choice` over one state; the fold and the level-1
+  prefill shared; `pointers` at the threshold; `usage`, the log fields,
+  `ignis_locates_total`, the OpenAPI document.
+- **The vote is pinned**: today's `locate` tests ask for `method: "vote"`,
+  `compression: "none"` by name and pass unchanged; the prompt-pinning test
+  (`decide_locate_prompt.rs`) holds that render, which the shortlist's
+  readings reuse.
+- **End to end (GPU profile)**: on a committed synthetic fixture — logs with
+  near-duplicate lines and records of one shape, and prose paragraphs with a
+  title each — the defaults through `/v1/decide` name every question's
+  target, and a fixture longer than one window is answered.
+- **The Playground** (vitest): the three selectors, defaults sending no
+  field, the pointers shown; the dev mock's answers.
 
 ## Acceptance
 
-1. **The fold is the measured fold.** `template_fold` is a pure host
-   function that reproduces every golden case `compress.py golden` writes.
-2. **The copy tree** passes its table-driven CPU tests.
-3. **The seam carries a copy.** The scheduler's CPU tests pass; the mock
-   reports its draws and honours a set of any width.
-4. **The leaf** reports each draw in the call that makes it and honours a
-   set as wide as the vocabulary, held to the readout under both KV formats;
-   the 32-id path is unchanged and a call with no copy lane allocates and
-   launches nothing new; the masks' reservation is in the VRAM plan.
-5. **`/v1/decide` over the mock** passes § Testing Decisions' endpoint list:
-   the defaults, the four combinations, every refusal, the fan-out, `usage`,
-   the log, the metric.
-6. **The vote is unchanged** under `vote` + `none`: today's tests pass
-   asking for it by name, and the prompt-pinning test holds its render.
-7. **End to end on the GPU**, the fixture's targets are named by `copy`
-   under both compressions.
-8. **Documented**: OpenAPI, the user README's "Finding a line or an item",
-   `CONTEXT.md`, ADR 0017's amendment and ADR 0041's status; the load event
-   names both methods; the Playground's selectors and answer panel with
-   their tests.
-9. **Set R3 is registered** before any route is asked on it: the builder and
-   the judge committed, the manifest hash written into this spec's banner,
-   the questions checked.
-10. **The acceptance holds**: rules 1-5 of § The acceptance run, each judged
-    once, recorded as a finding with a README row; ADR 0042 accepted with
-    its numbers. A failed rule is reported as failed and the owner decides.
-11. `cargo test` passes workspace-wide, and the web tests pass.
+1. **The host functions are the measured ones**: `template_fold`, the
+   readings, the windows and merge, `auto` and the prose render reproduce
+   every golden case their Python reference writes.
+2. **The calibration** carries the end heads, the sum heads and
+   `LOCATE_WINDOW_KEYS` for the served 27B; the rows' room is reserved at
+   load and in the VRAM plan.
+3. **`/v1/decide` over the mock** passes § Testing Decisions' endpoint list.
+4. **The vote is unchanged** under `vote` + `none`: today's tests pass asking
+   for it by name, and the prompt-pinning test holds its render.
+5. **End to end on the GPU** the fixtures' targets are named by the defaults,
+   including one past a window.
+6. **Documented**: OpenAPI, the user README's "Finding a line or an item",
+   `CONTEXT.md`, ADR 0017's amendment and ADR 0041's status; the load event;
+   the Playground's selectors and pointers with their tests.
+7. **Sets R3 and P3 are registered** before any route is asked on them: the
+   builders and the judge committed, both manifest hashes in this banner.
+8. **The acceptance holds**: rules 1-7 of § The acceptance run, each judged
+   once, recorded as a finding with a README row; ADR 0042 accepted with its
+   numbers. A failed rule is reported as failed and the owner decides.
+9. `cargo test` passes workspace-wide, and the web tests pass.
 
 ## Out of Scope
 
-- **A `found` flag or abstention.** A sibling `noul` separated absent
-  questions at an AUC of 0.93 on R and 0.79 on R2, over 10 absent questions
-  each: not yet a flag. `confidence` is reported beside present and absent
-  questions for that later work.
-- **Several lines as one answer**, and spans finer than a segment.
-- **Questions that need context across lines** under `template_fold` —
-  folding removes the order by design; `none` keeps it.
-- **Other compressions** — a better label rule, semantic clustering, another
-  budget: each is a new `compression` value with its own measurement.
-  `template_fold`'s parameters are not tuned here.
-- **Lifting `LOCATE_MAX_KEYS`** — real logs put the vote's ceiling where set
-  D did.
-- **The end-marker reading** of spec 20 (a small gain for the vote at its
-  ceiling).
-- **A ranking for `copy`** beyond its answer (a beam over the tree), and a
-  copy that samples.
-- **Writing forced runs as prompt** (jump-forward decoding: a node with one
-  child needs no decision, only a token): a latency optimisation, not
-  needed for rule 3.
+- **`method: "copy"`** — the first version's default, a decode constrained to
+  the candidates' text: a later value of `method`. The route it would
+  constrain (free generation over the fold) read 55 of R2's 58, as the
+  shortlist does, and it needs leaf changes this ticket no longer does (the
+  draw reported in the call that makes it, a vocabulary-wide permitted set).
+- **"Not found"** — an answer that says no segment answers (a `none` label in
+  the `choice`, or a threshold on its confidence): research first.
+- **A kind for JSON records** — `auto` reads them as logs mostly; their own
+  reading is research first.
+- **Prose at ~1M tokens**, the registered weak point (spec 23's HP1) —
+  paragraphs as the unit, paragraphs then sentences, fewer candidates:
+  research first.
+- **The second hop** for prose (the heads read again with the first pointer
+  in the instruction: +6 points of pointer F1 on P and P2): exploratory.
+- **Reducing the rows on the device** (per-segment sums in the leaf instead
+  of rows to the host) — a latency and memory optimisation.
+- **Lifting `LOCATE_MAX_KEYS`** for the vote.
 - **Content-parts states**, as for every `locate`.
 - **The research branch's experiment hooks** (`IGNIS_LOCATE_MAX_KEYS_EXPERIMENT`,
-  the row dumps, the control file): they stay on `locate-long-context` and
-  are never merged. Nothing here needs them.
+  the row dumps, the control file, `cut_tail`, `answers`): they stay on
+  `locate-long-context` and are never merged.
 
 ## Further Notes
 
-- **Why enums and not booleans.** `fold: true` and `copy: true` would be two
-  flags whose four combinations are an accident of their spelling, and a
-  third method or compression would be a third flag contradicting them. An
-  enum names what runs, is echoed in the answer and extends by a value.
-- **What changes from the route R2 measured**, and is therefore what the
-  acceptance judges:
-  - R2's copy was **free generation** through `/v1/chat/completions`, its
-    quote matched to a line by exact, contained or word-overlap search —
-    at level 1 the model often wrote one value of a `{a|b|c}` slot. The
-    served copy is **constrained** to the rows' text and stops at the first
-    prefix one row owns.
-  - The scaffold is **forced** as `{"quote":"`, the vote's, where the free
-    route wrote its own opening; the prompt is otherwise the same L1 render
-    and kind text.
-  - Arrays fold as spaced JSON; R2 held logs only.
-- **The mechanism is the measured one.** The heads settle on the instance
-  where the written prefix stops matching every other line (rho 0.59 on R2,
-  spec 21's H4b), which is exactly where the copy tree stops the run.
-- **Prior art.** A decode constrained to a prefix tree of a closed set's
-  tokenized names is GENRE's (De Cao et al., *Autoregressive Entity
-  Retrieval*, arXiv 2010.00904); the fold is Drain-style template mining
-  (He et al., *Drain*, ICWS 2017); LogHub is Zhu et al.'s collection
-  (arXiv 2008.06448).
-- **Cost expected.** A folded question is the fold (host, milliseconds), a
-  level-1 prefill of a median ~10K tokens for a 100K-token log, a handful of
-  constrained rounds, and a short level-2 prefill and rounds. A copy holds a
-  decode lane for those rounds, which a vote never did.
+- **Why the heads and not the copy.** Both resolve the instance; the
+  shortlist does it with no token written, no decode lane and no leaf change,
+  by using the heads where they are strong (narrowing a very long text to a
+  handful of candidates) and a `choice` where it is strong (deciding among a
+  handful). The owner preferred the heads, measured-better or equal being
+  the condition (spec 23).
+- **Why enums and not booleans**: a third reading, compression or kind is a
+  new value, echoed in the answer, never a flag contradicting another.
+- **What changes from the routes spec 23 measured**, and is therefore what
+  the acceptance judges: the readings are ported from Python to the host;
+  the `choice` over a fold's level 1 is asked over the first 5 templates
+  only; the window is 200,000 keys (spec 23 used 210,000 tokens); the
+  prose render is the reference's.
+- **Prior art**: labelled selection over a shortlist is the retrieve-then-read
+  shape of attention re-rankers (ICR, QRHead) with a single-token reader; the
+  fold is Drain-style template mining (He et al., ICWS 2017); the literature
+  pass is [the literature](../../findings/2026-09-28-zero-decode-locate-literature.md).
 
 ## References
 
 - Findings: [locate at length](../../findings/2026-09-27-locate-at-length.md),
   [the instance is read while copying](../../findings/2026-09-27-the-instance-is-read-while-copying.md),
   [locating a line in real logs](../../findings/2026-09-28-locating-a-line-in-real-logs.md),
+  [zero-decode locate on real logs](../../findings/2026-09-28-zero-decode-locate-exploration.md),
+  [zero-decode locate for very long logs and prose](../../findings/2026-09-28-zero-decode-locate-very-long-logs-and-prose.md),
+  [the literature](../../findings/2026-09-28-zero-decode-locate-literature.md),
   [locate through `/v1/decide`](../../findings/2026-09-27-locate-through-decide.md).
-- Specs 18 (the `locate` wire, layout L1, set F), 19 (the vote), 20 and 21
-  (the research this ships), 06 and 10 (the constrained decode, `number`,
-  `scalar`), 04 (fan-out), 17 (layout L1).
-- ADR 0034 (readout and constrained decode), 0041 (the vote), 0016
-  (appended ABI fields), 0030 (memory reserved at load), 0017 (metrics),
-  0036 (OpenAPI), 0006 (CPU tests without a GPU), 0042 (this spec's
-  decision).
-- Tools: `tools/locate-sets/compress.py` and `folded_locate.py` (the fold
-  and the route R2 measured), `r2set.py` and `r2_judge.py` (R2's builder and
-  judge), `served.py` (set F's), `prodset.py` (the cluster capture).
+- Specs 18 (the `locate` wire, set F), 19 (the vote), 20, 21 and 23 (the
+  research this ships), 04 (fan-out), 17 (layout L1).
+- ADR 0041 (the vote, the rows readout), 0017 (metrics), 0030 (memory
+  reserved at load), 0036 (OpenAPI), 0006 (CPU tests without a GPU), 0042
+  (this spec's decision).
+- Tools: `tools/locate-sets/compress.py` (the fold), `zd_logpipe.py` (the
+  `log` route, configuration `heads-end5+choice / L2 choice-end`),
+  `zd_windows.py` and `zd_prose.py multi` (the `prose` route),
+  `zd_offline.py` and `zd_cache.py` (the readings), `folded_locate.py`
+  (`--route choice`), `prosehay.py`, `r2set.py`, `z23_r4.py` and
+  `z23_judge.py` (the builders and the judge the acceptance's follow),
+  `served.py` (set F's).

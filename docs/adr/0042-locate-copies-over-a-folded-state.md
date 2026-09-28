@@ -1,125 +1,123 @@
-# ADR 0042 — a locate copies its answer, over a folded state by default
+# ADR 0042 — a locate narrows by attention heads and decides by a labelled choice, by kind of text
 
 ## Status
 
-Proposed (2026-09-28 — spec `docs/specs/decide/22-locate-by-copy-over-a-folded-state.md`,
-GitHub #278). Accepted when spec 22's acceptance holds, with its numbers
-written here. **Extends ADR 0041**, whose head vote becomes one of two
-methods, unchanged, and **ADR 0034**, whose constrained decode gains a second
-shape.
+Proposed (2026-09-28, revised the same day — spec
+`docs/specs/decide/22-locate-by-copy-over-a-folded-state.md`, GitHub #278).
+Accepted when spec 22's acceptance holds, with its numbers written here.
+**Extends ADR 0041**, whose head vote becomes one of two methods, unchanged.
+The file keeps the name of its first version, whose decision (a constrained
+copy by default) this revision replaces before anything was built.
 
 Sources: `docs/findings/2026-09-27-locate-at-length.md`,
-`docs/findings/2026-09-27-the-instance-is-read-while-copying.md` and
-`docs/findings/2026-09-28-locating-a-line-in-real-logs.md` (specs 20 and 21).
+`docs/findings/2026-09-27-the-instance-is-read-while-copying.md`,
+`docs/findings/2026-09-28-locating-a-line-in-real-logs.md` (specs 20, 21),
+`docs/findings/2026-09-28-zero-decode-locate-exploration.md` and
+`docs/findings/2026-09-28-zero-decode-locate-very-long-logs-and-prose.md`
+(spec 23).
 
 ## Context
 
-ADR 0041 serves `locate` as a vote of 32 attention heads at the copy
-scaffold `{"quote":"`, one prefill, measured to 4,554 keys. The logs a
-`locate` is for are 16K to 200K tokens, and on them the vote fails for a
-reason length does not explain alone: it finds the right *kind* of line and
-loses the instance among its near-duplicates — 28 of 50 on set R, 20 of 58
-(34.5%) on the fresh set R2, 81% misses on targets with six or more
-siblings. The instance is resolved while the line is **copied**: the heads
-settle on the target where its written prefix stops matching every other
-line (a median 26 tokens; rho 0.59 on R2). Generating the line on the whole
-log reads 86.2% of R2 but pays that log's prefill (median 47 s, 139 s at
-200K tokens) and matches free text back to a line.
+ADR 0041 serves `locate` as a vote of 32 heads at the copy scaffold, one
+prefill, measured to 4,554 keys. The texts a `locate` is for are logs and
+documents of hundreds of thousands to millions of tokens. On real logs the
+vote finds the right *kind* of line and loses the instance among its
+near-duplicates (20 of 58 on R2). The research after it found:
 
-The owner's idea closes the cost: fold near-duplicate lines into templates,
-find the template, then the instance among its values, and unfold. On R2
-that route, copying at each level, read 55 of 58 (94.8%) in a median 1.3 s;
-folded + vote read 28.
+- the vote's **reading** is the weak link at length: a line is marked at its
+  end (last token, separator, next line's first token), and 32 heads chosen
+  for that on short sets find 72-74% of real-log lines in one pass;
+- one pass still loses the instance among many near-duplicates, and a
+  labelled `choice` over the heads' first 16 candidates resolves them
+  (55-57 of R2's 58, no token written);
+- folding the log into templates first removes the long prefill: the heads
+  keep 5 templates and 16 rows, a `choice` decides at each level — 21 of 23
+  on a fresh cluster capture of 100K to 1M tokens, registered (spec 23), in a
+  median 2.6 s;
+- prose does not fold, is read best by the heads' sum over a sentence, holds
+  a gold sentence among the first 16 up to 1M tokens read window by window,
+  and often answers with several sentences; the `choice`'s probabilities give
+  them.
+
+A constrained copy (this ADR's first version) resolves the instance too — the
+free-generation route it would constrain read 55 of R2's 58 over the fold —
+but needs a decode lane per question and leaf changes (the draw reported in
+the call, a vocabulary-wide permitted set) that the heads-and-choice route
+does not.
 
 ## Decision
 
-- **`locate` has a `method` and a `compression`, and both are enums**:
-  `method` is `copy` or `vote`, `compression` is `template_fold` or `none`.
-  All four combinations are served. A new way to read or to compress is a
-  new value with its own measurement; an unknown value is refused naming the
-  accepted ones, never read as the default. `compression` is refused on
-  every other primitive; `method` keeps each primitive's own values.
-- **The defaults are `copy` and `template_fold`**, the measured-better route
-  on real logs. The answer names the method and the compression that
-  produced it, as a `point` names its method.
-- **The vote is kept**, unchanged under `none` and read at each level under
-  `template_fold`, on the loads calibrated for it. **`LOCATE_MAX_KEYS`
-  limits the text the vote reads** — the target, or each level's text — and
-  stays 4,554 keys on the served 27B. A `copy` is bounded by the context
-  alone and is served on every load.
-- **A copy is a constrained decode whose permitted sets follow its draws.**
-  The candidates' rendered text, tokenized alone, forms a prefix tree; each
-  draw is restricted to the children of the node reached, and the run stops
-  when the written prefix belongs to one text — which is the answer, with no
-  string matched. Where several segments share that text, the first is the
-  answer.
-- **The leaf reports the draw a call makes, in that call** (an appended
-  output on the prefill and decode options, ADR 0016). What a round commits
-  is unchanged — the previous call's draw — so ADR 0034's one-round lag
-  stays; the host learns the draw one call earlier, which is what a set
-  that depends on it needs.
-- **A copy's permitted set may be as wide as the vocabulary**: a per-lane
-  vocabulary bitmask beside the 32-id row, honoured at any width and never
-  refused or truncated for it, its staging reserved at load (ADR 0030). The
-  32-id path is unchanged bit for bit, and a call with no copy lane
-  allocates and launches nothing new.
-- **`template_fold` is the first compression**: `tools/locate-sets/compress.py`'s
-  fold at the settings R2 judged, ported as a pure host function and held to
-  golden cases the reference writes. It is reversible through its map
-  (template, row) → original segments, runs before any prefill, once per
-  target per request, and changes nothing in the caller's state: each level
-  is asked over the state with its target replaced by that level's text.
+- **`locate` has a `kind`, a `method` and a `compression`, all enums.**
+  `kind` is `auto` (default), `log` or `prose`; `method` is `shortlist`
+  (default) or `vote`; `compression` is `template_fold` or `none`, its default
+  following the kind (`log` → `template_fold`, `prose` → `none`). A new way to
+  read, compress or tell the kind is a new value with its own measurement; an
+  unknown value, and a combination measured bad or not applying (`vote` with
+  a fold, a fold of prose), is refused by name.
+- **`shortlist`: the heads narrow, a labelled `choice` decides; nothing is
+  generated.** The heads' rows at the scaffold, less a content-free twin's,
+  standardized and summed, rank the candidates; the first few (5 templates,
+  16 rows or sentences) go to the endpoint's own labelled `choice`. For a log
+  the **end heads** read each line's closing keys; for prose the **sum heads**
+  (the vote's) read each sentence's keys, and the candidates are shown in
+  their paragraphs.
+- **Long texts are read in windows** of at most `LOCATE_WINDOW_KEYS` (200,000
+  keys on the served 27B), cut at segment boundaries, each with its twin,
+  scores standardized per window and merged. The context stops being the
+  limit of a `locate`.
+- **`auto` is the fold's own statistic**: a target whose first 2,000
+  segments fall at least half in shared templates is a log.
+- **The answer names the resolved kind, method and compression**, and gains
+  `pointers` — every final candidate the `choice` gave at least 0.05 — so a
+  question answered in several places gets several segments.
+- **The vote is kept** unchanged under `vote` + `none`, bounded by
+  `LOCATE_MAX_KEYS`. The calibration table gains the end heads, the sum heads
+  and the window per artifact; both methods need it.
+- **`template_fold`** is `tools/locate-sets/compress.py`'s fold, ported as a
+  pure host function and held to golden cases, reversible through its map,
+  computed once per target per request. The readings, windows, `auto` and the
+  prose render are likewise pure host functions held to the Python that
+  measured them.
 
 ## Considered options
 
-**Booleans** (`fold: true`, `copy: true`). Two flags whose four combinations
-are an accident of their spelling, and a third method or compression would
-be a third flag contradicting them. Rejected.
+**The constrained copy as default** (this ADR's first version). Equal on the
+measured sets; costs a decode lane per question and leaf and ABI changes. Kept
+as a later `method` value.
 
-**Keep the vote as the default and lift its ceiling.** Real logs put its
-ceiling where set D did (spec 20), and folding does not rescue it: folded +
-vote read 28 of R2's 58.
+**Booleans** (`fold: true`, `copy: true`). Rejected: combinations by accident
+of spelling, and no room for a third value.
 
-**Generate freely and match the quote to a line** — the route R2 measured.
-It works (86.2% on the whole log, 94.8% folded), but the match is a parser
-of free text (exact, contained, then word overlap), and the model writes the
-whole line (median 90 tokens) where 26 identify it. The constrained copy is
-the same mechanism without the parser and stops at the prefix that decides.
+**The vote with a better reading only** (the end heads' end reading, one
+pass). 72-74% on real logs — better than 34.5-56%, not enough among many
+near-duplicates (6 of 16 with six or more siblings).
 
-**Score every candidate by teacher forcing.** Exact, but one forced pass per
-candidate — thousands of lines, or hundreds of templates.
+**The labelled `choice` alone** over the fold or the whole log. It degrades
+with the number of candidates (80-88% over 64 near-duplicates or 256 raw
+lines; 16 of R4's 23 over the fold): it is a short-list reader.
 
-**A readout at each branch of the tree**: one decision per branch, each a
-request that claims the previous one's state. No leaf change, but a
-retained-state claim per branch, where a decode round per token costs a few
-milliseconds.
+**Generate the line.** 86.2% of R2 on the whole log, at its whole prefill,
+and free text matched back to a line.
 
-**Walk the tree on the device.** The lag would not matter, but the tree, its
-walk and its stop rule would move into the kernel. Rejected while the host
-can compute the next set from a reported draw.
-
-**Raise the 32-id cap instead of a mask.** A copy's root can hold hundreds
-of distinct first tokens, the mask kernel's linear scan grows with the set,
-and any cap is one a real question can reach and be refused at.
+**One head reading over the whole text, no windows.** Bounded by the context
+(262K tokens) and slower per key past ~200K; windows read a 1M-token text
+with the same heads.
 
 ## Consequences
 
-- A caller who sent a `locate` with no `method` got the vote and now gets a
-  copy over a folded state; the answer's `method` and `compression` say so,
-  and the vote remains one field away.
-- A copy holds a decode lane for its rounds (a median of tens), which a vote
-  never did; a folded question is two internal requests in sequence.
-- A load with no `locate` calibration now answers the default `locate`, and
-  refuses only `vote`.
-- A `template_fold` prompt holds no state, so it shares no prefix with the
-  other primitives over that state; `template_fold` questions over one
-  target share their level-1 prompt.
-- Folding removes the order of lines and every time from level 1: a question
-  that needs context across lines, or names a line by its time alone, is
-  better asked with `none`. Lines identical but for their time answer with
-  the first of them.
-- `ignis_locates_total{method, compression}` joins the metrics contract
-  (ADR 0017); `ignis_decisions_total{type="locate"}` still counts one per
-  question.
-- `CONTEXT.md`'s *Permitted set* ("at most 32") and *Draw* change with this
-  ADR.
+- A caller who sent a `locate` with no fields got the vote and now gets the
+  shortlist of the kind `auto` resolves; the answer says so, and the vote
+  remains one field away.
+- A `locate` generates nothing and holds no decode lane; a folded question is
+  a few short prefills in sequence (level 1, its `choice`, level 2, its
+  `choice`), and prose pays each window's prefill once per state.
+- A load with no `locate` calibration refuses both methods.
+- The rows' room reserved at load grows from 32 x 4,554 keys to 32 x 200,000
+  (25.6 MB on the served 27B).
+- Folding removes lines' order and every time from level 1: a question that
+  needs context across lines, or names a line by its time alone, is better
+  asked with `none`.
+- There is no "not found", no kind for JSON records, and prose at ~1M tokens
+  is the registered weak point: each is research before it is a value.
+- `ignis_locates_total{kind, method, compression}` joins the metrics contract
+  (ADR 0017).
