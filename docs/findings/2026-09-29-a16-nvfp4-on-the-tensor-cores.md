@@ -48,7 +48,10 @@ the E2M1 code rows and the 512-byte blockscale tile. Once per K step, one
 thread per (row, 16-element group) decodes the tile into a swizzled BF16 tile
 in shared memory. An E2M1 code times its E4M3 scale has at most 6 significant
 bits (2 x 4), so each decoded element is exact in BF16. The per-tensor
-`1 / weight_scale_divisor` is applied in FP32 in the epilogue.
+`1 / weight_scale_divisor` is applied in FP32 in the epilogue. The scale
+addressing restates the codec's `nvfp4_scale_offset` in 32-bit arithmetic.
+Calling the 64-bit helper instead, hoisted out of the K loop or not, measured
+3.5-4% slower on the latency-bound K loop.
 
 **Correctness.** `ignis_kernel_nvfp4_a16_mma_test` runs through the vendored
 linear harness: an FP64 oracle over the dequantised weight, and the vendored
