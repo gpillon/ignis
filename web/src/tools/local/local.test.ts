@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ChatRequest, Settings } from "../../api/request.ts";
+import { type ChatRequest, chatRequestOf, type Settings } from "../../api/request.ts";
 import type { StreamOptions, StreamResult } from "../../api/stream.ts";
 import type { Timeline } from "../../metrics/figures.ts";
 import { type Attachment, readPiece, uniqueName } from "./attachments.ts";
@@ -29,7 +29,7 @@ const inlineWorker: WorkerFactory = (onMessage) => {
 
 const reviewer = (reply: string, bodies: ChatRequest[] = []) =>
   async (o: StreamOptions): Promise<StreamResult> => {
-    bodies.push(o.body as ChatRequest);
+    bodies.push(chatRequestOf(o.request));
     o.onEvent({ kind: "content", text: reply });
     return { ok: true, timeline };
   };

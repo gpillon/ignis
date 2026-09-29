@@ -53,6 +53,15 @@ describe("conversationTurns", () => {
     ]);
   });
 
+  it("keeps a reply's reasoning, for the transports that send it back", () => {
+    expect(conversationTurns([user("a"), { ...reply("b"), reasoning: "hm" }, user("c"), { ...reply("d"), reasoning: "" }])).toEqual([
+      { role: "user", content: "a" },
+      { role: "assistant", content: "b", reasoning: "hm" },
+      { role: "user", content: "c" },
+      { role: "assistant", content: "d" },
+    ]);
+  });
+
   it("drops a reply stopped before its first token, and keeps one stopped part-way", () => {
     expect(conversationTurns([user("a"), reply(""), user("b"), reply("half")])).toEqual([
       { role: "user", content: "b" },
@@ -164,6 +173,16 @@ describe("buildChatRequest", () => {
     const before = buildChatRequest(settings, turns.slice(0, 2)).messages;
     const after = buildChatRequest(settings, turns).messages;
     expect(after.slice(0, before.length)).toEqual(before);
+  });
+
+  it("never sends a turn's reasoning back", () => {
+    const call = { id: "call_0", name: "agent", arguments: "{}" };
+    const turns = [
+      { role: "user" as const, content: "a" },
+      { role: "assistant" as const, content: "b", toolCalls: [call] },
+    ];
+    const reasoned = [turns[0], { ...turns[1], reasoning: "hm" }];
+    expect(buildChatRequest(settings, reasoned)).toEqual(buildChatRequest(settings, turns));
   });
 
   it("sends a turn without images as a plain string, so it tokenizes as it always did", () => {

@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { getAuth, saveKey } from "./auth.ts";
 import type { ChunkEvent } from "./sse.ts";
 import { HTTP1_STREAM_BUDGET } from "./connections.ts";
-import { streamChat } from "./stream.ts";
+import { streamChatCompletions } from "./stream.ts";
 
-describe("streamChat and the API key", () => {
+describe("streamChatCompletions and the API key", () => {
   it("sends the saved key and turns a 401 into the key prompt", async () => {
     saveKey("sk-test");
     let sent: HeadersInit | undefined;
@@ -12,7 +12,7 @@ describe("streamChat and the API key", () => {
       sent = init?.headers;
       return new Response('{"error":{"message":"incorrect API key provided"}}', { status: 401 });
     }) as typeof fetch;
-    const result = await streamChat({ body: {}, fetch: refusing, now: ticking(), onEvent: () => {} });
+    const result = await streamChatCompletions({ body: {}, fetch: refusing, now: ticking(), onEvent: () => {} });
     expect(sent).toMatchObject({ Authorization: "Bearer sk-test" });
     expect(result).toMatchObject({ ok: false, message: "401: incorrect API key provided" });
     expect(getAuth()).toMatchObject({ needsKey: true, rejected: true });
@@ -43,12 +43,12 @@ function ticking() {
   return () => (t += 10);
 }
 
-describe("streamChat with tool calls", () => {
+describe("streamChatCompletions with tool calls", () => {
   it("passes a tool call on and times it as output", async () => {
     const events: ChunkEvent[] = [];
     const call = { index: 0, id: "call_0", type: "function", function: { name: "agent", arguments: '{"prompt":"x"}' } };
     const body = sse({ tool_calls: [call] }) + sse({}, "tool_calls") + "data: [DONE]\n\n";
-    const result = await streamChat({ body: {}, fetch: fakeFetch([body]), now: ticking(), onEvent: (e) => events.push(e) });
+    const result = await streamChatCompletions({ body: {}, fetch: fakeFetch([body]), now: ticking(), onEvent: (e) => events.push(e) });
     expect(result.ok).toBe(true);
     expect(events[0]).toEqual({ kind: "tool_call", call: { id: "call_0", name: "agent", arguments: '{"prompt":"x"}' } });
     expect(result.timeline.firstTokenAt).toBeDefined();
@@ -56,7 +56,7 @@ describe("streamChat with tool calls", () => {
   });
 });
 
-describe("streamChat", () => {
+describe("streamChatCompletions", () => {
   it("delivers the events in order and records the request's timeline", async () => {
     const events: ChunkEvent[] = [];
     const whole =
@@ -68,7 +68,7 @@ describe("streamChat", () => {
     // Split mid-event, so the parser has to carry state across reads.
     const parts = [whole.slice(0, 17), whole.slice(17, 90), whole.slice(90)];
 
-    const result = await streamChat({ body: {}, fetch: fakeFetch(parts), now: ticking(), onEvent: (e) => events.push(e) });
+    const result = await streamChatCompletions({ body: {}, fetch: fakeFetch(parts), now: ticking(), onEvent: (e) => events.push(e) });
 
     expect(events.map((e) => e.kind)).toEqual(["reasoning", "content", "finish", "usage", "done"]);
     expect(result.ok).toBe(true);
@@ -83,7 +83,7 @@ describe("streamChat", () => {
 
   it("records where the thinking budget forced the reasoning closed, and nothing for a reply that closed it itself", async () => {
     const forced = `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop", thinking_budget_forced_at: 2048 }] })}\n\n`;
-    const budgeted = await streamChat({
+    const budgeted = await streamChatCompletions({
       body: {},
       fetch: fakeFetch([sse({ reasoning_content: "hm" }) + sse({ content: "Hi" }) + forced + "data: [DONE]\n\n"]),
       now: ticking(),
@@ -91,7 +91,7 @@ describe("streamChat", () => {
     });
     expect(budgeted.timeline).toMatchObject({ finishReason: "stop", thinkingForcedAt: 2048 });
 
-    const free = await streamChat({
+    const free = await streamChatCompletions({
       body: {},
       fetch: fakeFetch([sse({ content: "Hi" }) + sse({}, "stop") + "data: [DONE]\n\n"]),
       now: ticking(),
@@ -114,12 +114,12 @@ describe("streamChat", () => {
         }),
       )) as typeof fetch;
     const texts: string[] = [];
-    await streamChat({ body: {}, fetch: splitFetch, now: ticking(), onEvent: (e) => e.kind === "content" && texts.push(e.text) });
+    await streamChatCompletions({ body: {}, fetch: splitFetch, now: ticking(), onEvent: (e) => e.kind === "content" && texts.push(e.text) });
     expect(texts).toEqual(["caffè"]);
   });
 
   it("reports a stream the engine ended without a finish reason as failed", async () => {
-    const result = await streamChat({
+    const result = await streamChatCompletions({
       body: {},
       fetch: fakeFetch([sse({ content: "Hi" }), "data: [DONE]\n\n"]),
       now: ticking(),
@@ -131,7 +131,7 @@ describe("streamChat", () => {
 
   it("returns the API error without streaming", async () => {
     const body = JSON.stringify({ error: { message: "messages must be non-empty", type: "invalid_request_error", code: null } });
-    const result = await streamChat({ body: {}, fetch: fakeFetch([body], 400), now: ticking(), onEvent: () => {} });
+    const result = await streamChatCompletions({ body: {}, fetch: fakeFetch([body], 400), now: ticking(), onEvent: () => {} });
     expect(result).toMatchObject({ ok: false, message: "400: messages must be non-empty" });
   });
 
@@ -147,7 +147,7 @@ describe("streamChat", () => {
       return new Response(body, { status: 200 });
     }) as typeof fetch;
 
-    const result = await streamChat({
+    const result = await streamChatCompletions({
       body: {},
       signal: controller.signal,
       fetch: abortingFetch,
@@ -164,7 +164,7 @@ describe("streamChat", () => {
   });
 });
 
-describe("streamChat and the page's connections", () => {
+describe("streamChatCompletions and the page's connections", () => {
   it("waits for a connection before it starts the clock, so the queue is not read as latency", async () => {
     // One more stream than the page can hold (GitHub #220).
     const wanted = HTTP1_STREAM_BUDGET + 1;
@@ -184,7 +184,7 @@ describe("streamChat and the page's connections", () => {
 
     const started: number[] = [];
     const runs = Array.from({ length: wanted }, (_, i) =>
-      streamChat({
+      streamChatCompletions({
         body: {},
         fetch: holding,
         now: () => ++clock,

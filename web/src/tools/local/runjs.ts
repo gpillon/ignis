@@ -1,4 +1,4 @@
-import { buildChatRequest, type Settings } from "../../api/request.ts";
+import type { ConversationRequest, Settings } from "../../api/request.ts";
 import { streamChat } from "../../api/stream.ts";
 import { computeFigures, type Figures } from "../../metrics/figures.ts";
 
@@ -168,8 +168,8 @@ export async function checkJs(
 ): Promise<JsCheck & { figures: Figures | null; error?: string }> {
   const stream = options.stream ?? streamChat;
   const sleep = options.sleep ?? abortableSleep;
-  const body = buildChatRequest(
-    {
+  const request: ConversationRequest = {
+    settings: {
       ...options.settings,
       systemPrompt: JS_CHECK_SYSTEM_PROMPT,
       laneTag: "agent",
@@ -178,12 +178,12 @@ export async function checkJs(
       topP: 1,
       maxTokens: 300,
     },
-    [{ role: "user", content: `Review this code:\n\n\`\`\`js\n${code}\n\`\`\`` }],
-  );
+    turns: [{ role: "user", content: `Review this code:\n\n\`\`\`js\n${code}\n\`\`\`` }],
+  };
   for (let attempt = 0; ; attempt++) {
     let content = "";
     const result = await stream({
-      body,
+      request,
       signal: options.signal,
       onEvent: (event) => {
         if (event.kind === "content") content += event.text;

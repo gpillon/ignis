@@ -3,6 +3,11 @@
 // thinking effort and the ignis lane tag extension `class`. With tools on,
 // it also declares them, and the system message is the ignis prompt (what
 // the tools add, read-only) followed by the owner's own.
+//
+// The page asks for a reply with a `ConversationRequest` — the settings, the
+// turns and the tools — and the transport that carries it writes it on its
+// own wire: this chat request over HTTP, a `response.create` on the socket
+// (`responses.ts`, GitHub #283).
 
 import type { PromptImage } from "../conversation/images.ts";
 import type { ToolCall } from "./sse.ts";
@@ -49,6 +54,12 @@ export type Turn = {
   toolCalls?: ToolCall[];
   toolCallId?: string;
   /**
+   * What an assistant turn reasoned before it answered. The chat request
+   * never resends it; the socket does (`responses.ts`), since the continuation
+   * ignis keeps for a stream holds it and the full history has to match.
+   */
+  reasoning?: string;
+  /**
    * What the date and time tool wrote for the moment this turn was sent, when
    * it updates every prompt: a developer message goes in ahead of the turn.
    * Each turn keeps the one it was sent with, so a later request repeats them
@@ -57,6 +68,9 @@ export type Turn = {
    */
   dateTime?: string;
 };
+
+/** What the page asks a transport for: one reply to `turns`, with these settings and tools. */
+export type ConversationRequest = { settings: Settings; turns: Turn[]; extras?: ToolExtras };
 
 /** An OpenAI function tool, as `tools[]` declares it. */
 export type ToolDefinition = {
@@ -100,8 +114,8 @@ export type Exchange = Turn & { failed: boolean };
  * What of the conversation goes back to the engine: every exchange except
  * the ones that produced nothing — a prompt whose reply failed or came back
  * empty is dropped together with that reply, so the history never holds two
- * user turns in a row. A reply stopped part-way keeps the text it got.
- * Reasoning is never resent.
+ * user turns in a row. A reply stopped part-way keeps the text it got, and
+ * a reply keeps its reasoning for the transports that resend it.
  */
 export function conversationTurns(entries: Exchange[]): Turn[] {
   const turns: Turn[] = [];
@@ -121,6 +135,7 @@ export function conversationTurns(entries: Exchange[]): Turn[] {
       ...(entry.images?.length ? { images: entry.images } : {}),
       ...(entry.toolCalls?.length ? { toolCalls: entry.toolCalls } : {}),
       ...(entry.toolCallId ? { toolCallId: entry.toolCallId } : {}),
+      ...(entry.reasoning ? { reasoning: entry.reasoning } : {}),
       ...(entry.dateTime ? { dateTime: entry.dateTime } : {}),
     });
   }
@@ -138,7 +153,7 @@ function wireContent(turn: Turn): string | ContentPart[] {
   return turn.content === "" ? images : [...images, { type: "text", text: turn.content }];
 }
 
-/** A turn on the wire, behind the developer message carrying its moment when it has one. */
+/** A turn on the wire, behind the developer message carrying its moment when it has one. Reasoning is never resent. */
 function wireMessages(turn: Turn): WireMessage[] {
   const message: WireMessage = {
     role: turn.role,
@@ -170,8 +185,18 @@ export function thinkingBudgetOf(settings: Pick<Settings, "reasoningEffort" | "t
 /** What the enabled tools add to a request: their prompt, ahead of the owner's, and their definitions. */
 export type ToolExtras = { ignisPrompt?: string; tools?: ToolDefinition[] };
 
+/** The chat request that carries `request` over HTTP. */
+export function chatRequestOf(request: ConversationRequest): ChatRequest {
+  return buildChatRequest(request.settings, request.turns, request.extras);
+}
+
+/** The system prompt a request sends: the ignis prompt, then the owner's; empty when both are blank. */
+export function systemPromptOf(settings: Settings, extras: ToolExtras = {}): string {
+  return [extras.ignisPrompt ?? "", settings.systemPrompt].filter((part) => part.trim() !== "").join("\n\n");
+}
+
 export function buildChatRequest(settings: Settings, turns: Turn[], extras: ToolExtras = {}): ChatRequest {
-  const system = [extras.ignisPrompt ?? "", settings.systemPrompt].filter((part) => part.trim() !== "").join("\n\n");
+  const system = systemPromptOf(settings, extras);
   const thinkingBudget = thinkingBudgetOf(settings);
   return {
     model: settings.model,

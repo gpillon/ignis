@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Timeline } from "../../metrics/figures.ts";
-import type { ChatRequest, Settings, ToolExtras } from "../../api/request.ts";
+import { type ChatRequest, chatRequestOf, type Settings, type ToolExtras } from "../../api/request.ts";
 import type { StreamOptions, StreamResult } from "../../api/stream.ts";
 import { runWeb, WEB_FETCH_TOOL, WEB_IGNIS_PROMPT, WEB_SEARCH_TOOL, type WebRun } from "../web/web.ts";
 import {
@@ -70,7 +70,7 @@ describe("parseAgentCall", () => {
 
 describe("agentRequest", () => {
   it("sends only the task, with the agent system prompt, on the agent lane, without tools", () => {
-    const body = agentRequest(settings, [{ role: "user", content: "do it" }]);
+    const body = chatRequestOf(agentRequest(settings, [{ role: "user", content: "do it" }]));
     expect(body.messages).toEqual([
       { role: "system", content: AGENT_SYSTEM_PROMPT },
       { role: "user", content: "do it" },
@@ -110,12 +110,12 @@ describe("runAgents", () => {
     let peak = 0;
     const bodies: ChatRequest[] = [];
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
-      bodies.push(o.body as ChatRequest);
+      bodies.push(chatRequestOf(o.request));
       live++;
       peak = Math.max(peak, live);
       await new Promise((r) => setTimeout(r, 5));
       o.onEvent({ kind: "reasoning", text: "hm" });
-      o.onEvent({ kind: "content", text: `answer to ${(o.body as ChatRequest).messages[1].content}` });
+      o.onEvent({ kind: "content", text: `answer to ${chatRequestOf(o.request).messages[1].content}` });
       live--;
       return { ok: true, timeline: timeline() };
     };
@@ -195,7 +195,7 @@ describe("agents with tools", () => {
   it("sends the tools with their prompt, runs the calls and streams again until the agent answers", async () => {
     const bodies: ChatRequest[] = [];
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
-      bodies.push(o.body as ChatRequest);
+      bodies.push(chatRequestOf(o.request));
       if (bodies.length === 1) {
         o.onEvent({ kind: "reasoning", text: "search first" });
         o.onEvent(callEvent("web_search", { query: "ignis" }));
@@ -235,11 +235,48 @@ describe("agents with tools", () => {
     ]);
   });
 
+  it("runs each agent on a stream of its own, and sends back each round's own reasoning (GitHub #283)", async () => {
+    const seen: StreamOptions[] = [];
+    const stream = async (o: StreamOptions): Promise<StreamResult> => {
+      seen.push(o);
+      if (o.request.turns.length === 1) {
+        o.onEvent({ kind: "reasoning", text: `search ${o.streamId}` });
+        o.onEvent(callEvent("web_search", { query: "ignis" }));
+      } else o.onEvent({ kind: "content", text: "final" });
+      return { ok: true, timeline: timeline() };
+    };
+    const runs = await runAgents([task(1), task(2)], {
+      settings,
+      tools: webTools,
+      streamId: "session-3",
+      signal: new AbortController().signal,
+      onUpdate: () => {},
+      stream,
+      runWeb: doneWeb,
+    });
+    expect(runs.map((r) => r.status)).toEqual(["done", "done"]);
+    expect(new Set(seen.map((o) => o.streamId))).toEqual(new Set(["session-3.agent-call_1", "session-3.agent-call_2"]));
+    const second = seen.find((o) => o.streamId === "session-3.agent-call_1" && o.request.turns.length > 1);
+    expect(second?.request.turns[1]).toMatchObject({ role: "assistant", reasoning: "search session-3.agent-call_1" });
+  });
+
+  it("shows an agent the engine queued as waiting, and running once admitted", async () => {
+    const statuses: string[] = [];
+    const stream = async (o: StreamOptions): Promise<StreamResult> => {
+      o.onQueued?.();
+      o.onStart?.();
+      o.onEvent({ kind: "content", text: "ok" });
+      return { ok: true, timeline: timeline() };
+    };
+    await runAgents([task(1)], { settings, signal: new AbortController().signal, onUpdate: (run) => statuses.push(run.status), stream });
+    expect(statuses).toEqual(["queued", "running", "running", "running", "done"]);
+  });
+
   it("answers an agent's call to agent as an unknown tool, without running it", async () => {
     const bodies: ChatRequest[] = [];
     tasksSeen.length = 0;
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
-      bodies.push(o.body as ChatRequest);
+      bodies.push(chatRequestOf(o.request));
       if (bodies.length === 1) o.onEvent(callEvent("agent", { name: "x", prompt: "y" }));
       else o.onEvent({ kind: "content", text: "ok" });
       return { ok: true, timeline: timeline() };
@@ -303,7 +340,7 @@ describe("agents and the thinking budget", () => {
   async function bodiesFor(budgeted: Settings) {
     const bodies: ChatRequest[] = [];
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
-      const body = o.body as ChatRequest;
+      const body = chatRequestOf(o.request);
       bodies.push(body);
       if (body.messages.at(-1)?.role === "user") {
         o.onEvent({ kind: "tool_call", call: { id: `w${bodies.length}`, name: "web_search", arguments: '{"query":"q"}' } });

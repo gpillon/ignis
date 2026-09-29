@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import type { ModelState } from "../api/model.ts";
-import { buildChatRequest, conversationTurns, type Exchange, type Settings, thinkingBudgetOf, type ToolExtras } from "../api/request.ts";
+import { conversationTurns, type Exchange, type Settings, thinkingBudgetOf, type ToolExtras } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
 import type { PromptImage } from "../conversation/images.ts";
@@ -37,9 +37,11 @@ import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/w
 // A session streams one reply at a time — its history is a line, and two
 // replies writing into it would fork it. Whether *other* sessions may stream
 // meanwhile is the caller's choice (`parallel`): off, the page runs one turn
-// and every Send waits for it; on, each session runs its own. Either way the
-// browser's stream budget (GitHub #220) queues what the connection cannot
-// carry, so parallel sessions share the same five streams on localhost.
+// and every Send waits for it; on, each session runs its own. On the socket
+// (GitHub #283) each session is a stream of its own, and each of its agents
+// too; over HTTP the browser's stream budget (GitHub #220) queues what the
+// connection cannot carry, so parallel sessions share the same five streams
+// on localhost.
 
 /**
  * A turn may start in `sessionId`: nothing streams there, and — unless
@@ -49,10 +51,14 @@ export function canStartTurn(streaming: ReadonlySet<number>, sessionId: number, 
   return parallel ? !streaming.has(sessionId) : streaming.size === 0;
 }
 
+/** A session's stream on the socket: its turns continue one another there. */
+const sessionStream = (sessionId: number) => `session-${sessionId}`;
+
 const exchangeOf = (m: Message): Exchange => ({
   role: m.role,
   content: m.content,
   images: m.images,
+  reasoning: m.reasoning,
   failed: m.error !== undefined,
   toolCalls: m.toolCalls,
   toolCallId: m.toolCallId,
@@ -226,7 +232,7 @@ export function useConversation({
     extras: ToolExtras,
     signal: AbortSignal,
   ): Promise<Message> {
-    const request = buildChatRequest(requestSettings, conversationTurns(conversation.map(exchangeOf)), extras);
+    const turns = conversationTurns(conversation.map(exchangeOf));
     let reply: Message = { id: newId(), role: "assistant", content: "", reasoning: "", streaming: true };
     setList((l) => ({ ...l, sessions: addMessages(l.sessions, sessionId, [reply]) }));
     const change = (f: (m: Message) => Message) => {
@@ -235,8 +241,13 @@ export function useConversation({
       setList((l) => ({ ...l, sessions: updateMessage(l.sessions, sessionId, next.id, () => next) }));
     };
     const result = await streamChat({
-      body: request,
+      request: { settings: requestSettings, turns, extras },
+      streamId: sessionStream(sessionId),
       signal,
+      onQueued: () => change((m) => ({ ...m, queued: true })),
+      onStart: () => {
+        if (reply.queued) change((m) => ({ ...m, queued: false }));
+      },
       onEvent: (event) => {
         if (event.kind === "reasoning") change((m) => ({ ...m, reasoning: m.reasoning + event.text }));
         if (event.kind === "content") change((m) => ({ ...m, content: m.content + event.text }));
@@ -245,11 +256,11 @@ export function useConversation({
     });
     const figures = result.ok ? computeFigures(result.timeline) : null;
     const error = result.ok ? undefined : result.message;
-    change((m) => ({ ...m, streaming: false, figures: figures ?? undefined, error }));
+    change((m) => ({ ...m, streaming: false, queued: false, figures: figures ?? undefined, error }));
     logRow(sessionId, {
-      laneTag: request.class,
-      reasoningEffort: request.reasoning_effort,
-      thinkingBudget: request.thinking_budget,
+      laneTag: requestSettings.laneTag,
+      reasoningEffort: requestSettings.reasoningEffort,
+      thinkingBudget: thinkingBudgetOf(requestSettings),
       figures,
       error,
     });
@@ -325,6 +336,7 @@ export function useConversation({
     await Promise.all([
       runAgents(tasks, {
         settings: requestSettings,
+        streamId: sessionStream(sessionId),
         tools: agentTools,
         tavilyKey: getTavilyKey(),
         local,
