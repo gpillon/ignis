@@ -682,3 +682,42 @@ async fn a_warm_up_with_no_retained_slot_free_still_completes() {
     assert_eq!(warmed["type"], "response.completed");
     assert_eq!(cached, 0, "nothing was kept, and the turn still ran");
 }
+
+/// A queued response keeps the id `response.created` gave it for its whole
+/// life — queued, admitted, streamed, ended — and that id is the one a
+/// continuation names.
+#[tokio::test]
+async fn a_queued_response_keeps_one_id_from_created_to_its_end_and_continues_by_it() {
+    let live = live(server(&Script::new(HashMap::new()), hog_config(1), plain())).await;
+    let mut socket = socket(&live).await;
+    send(&mut socket, create(&hog(), Some("hog"))).await;
+    let hog_id = next_of(&mut socket, Some("hog"), "response.in_progress").await["response"]["id"].clone();
+    let mut queued = short("wait");
+    queued["max_output_tokens"] = json!(3);
+    send(&mut socket, create(&queued, Some("main"))).await;
+    let created = next_of(&mut socket, Some("main"), "response.created").await;
+    assert_eq!(created["response"]["status"], "queued");
+    let id = created["response"]["id"].as_str().unwrap().to_owned();
+    next_of(&mut socket, Some("main"), "response.queued").await;
+    send(&mut socket, json!({ "type": "response.cancel", "response_id": hog_id })).await;
+
+    let events = stream_until_terminal(&mut socket, Some("main")).await;
+    assert!(events.iter().any(|e| e["type"] == "response.in_progress"), "it was admitted: {events:?}");
+    assert!(events.iter().any(|e| e["type"] == "response.output_text.delta"), "and streamed: {events:?}");
+    let suffix = id.strip_prefix("resp_").unwrap();
+    for event in &events {
+        if let Some(response) = event.get("response") {
+            assert_eq!(response["id"], id.as_str(), "{event}");
+        }
+        if let Some(item_id) = event.get("item_id").and_then(JsonValue::as_str) {
+            assert!(item_id.ends_with(suffix), "item ids share the response's suffix: {event}");
+        }
+    }
+
+    let mut next = short("and then?");
+    next["previous_response_id"] = json!(id);
+    send(&mut socket, create(&next, Some("main"))).await;
+    let continued = stream_until_terminal(&mut socket, Some("main")).await.pop().unwrap();
+    assert_eq!(continued["type"], "response.incomplete", "{continued}");
+    assert_eq!(continued["response"]["previous_response_id"], id.as_str());
+}
