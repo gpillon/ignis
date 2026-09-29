@@ -23,12 +23,20 @@
 // NVFP4-only). GitHub #177 adds the Q4/Q5/Q6 row-split arms the vision tower
 // is stored in. FP8 is in the reference's registry but never used by this
 // model's artifact, so it stays unsupported here.
+//
+// 2026-09-29: an NVFP4 A16Only call wide enough goes to our own tensor-core
+// route (kernel/include/ignis_nvfp4_a16_mma.h) instead of the vendored GEMV
+// slices; every other NVFP4 call is still the vendored dispatch's
+// (docs/findings/2026-09-29-a16-nvfp4-on-the-tensor-cores.md).
 
 #include "ninfer/ops/linear.h"
+
+#include "ignis_nvfp4_a16_mma.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -103,6 +111,14 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
     case QType::NVFP4:
+        // A wide A16 call goes to the tensor cores instead of the vendored GEMV family's
+        // 32-column slices (kernel/include/ignis_nvfp4_a16_mma.h). AllowA4 keeps the vendored
+        // resolver, which picks W4A4 for the backbone at these widths.
+        if (policy == LinearPolicy::A16Only && ignis_nvfp4_a16_mma_applies(w.n, w.k, x.ne[1])) {
+            (void)detail::validate_nvfp4_weight(w, "nvfp4 linear");
+            ignis_nvfp4_a16_mma(x, w, out, stream);
+            return;
+        }
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::BF16_CTRL:
