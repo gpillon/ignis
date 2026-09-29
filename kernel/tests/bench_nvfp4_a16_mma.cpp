@@ -116,16 +116,18 @@ void bench_shape(std::int32_t n, std::int32_t k, const std::vector<std::int32_t>
         const double mma_us =
             median_us(iters, stream, [&] { ignis_nvfp4_a16_mma(x, weight, mma, stream); });
 
-        std::vector<std::uint16_t> a(static_cast<std::size_t>(n) * t);
-        std::vector<std::uint16_t> b(a.size());
-        CUDA_OK(cudaMemcpy(a.data(), gemv_out, a.size() * 2, cudaMemcpyDeviceToHost));
-        CUDA_OK(cudaMemcpy(b.data(), mma_out, b.size() * 2, cudaMemcpyDeviceToHost));
+        std::vector<std::uint16_t> gemv_host(static_cast<std::size_t>(n) * t);
+        std::vector<std::uint16_t> mma_host(gemv_host.size());
+        CUDA_OK(cudaMemcpy(gemv_host.data(), gemv_out, gemv_host.size() * 2,
+                           cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(mma_host.data(), mma_out, mma_host.size() * 2,
+                           cudaMemcpyDeviceToHost));
         double max_diff = 0.0;
         double max_abs  = 0.0;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            max_diff = std::max(max_diff, std::fabs(static_cast<double>(bf16_to_float(a[i])) -
-                                                    bf16_to_float(b[i])));
-            max_abs  = std::max(max_abs, std::fabs(static_cast<double>(bf16_to_float(a[i]))));
+        for (std::size_t i = 0; i < gemv_host.size(); ++i) {
+            const double gemv = bf16_to_float(gemv_host[i]);
+            max_diff          = std::max(max_diff, std::fabs(gemv - bf16_to_float(mma_host[i])));
+            max_abs           = std::max(max_abs, std::fabs(gemv));
         }
         const double flops = 2.0 * n * k * t;
         std::printf("[%5d,%5d] T=%5d  gemv %9.1f us %6.1f TF/s   mma %8.1f us %6.1f TF/s   "

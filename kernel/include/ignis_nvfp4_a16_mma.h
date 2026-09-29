@@ -13,12 +13,15 @@
  * 21% of prefill device time
  * (docs/findings/2026-09-29-gpu-resources-prefill-vs-decode.md).
  *
- * This route keeps the A16 numerics -- BF16 activations, the NVFP4 weight
- * decoded as it is stored, FP32 accumulation -- and moves the product onto
- * BF16 tensor-core MMA. The weight tile is decoded into shared memory as
- * BF16: an E2M1 code times its E4M3 group scale has at most five significant
- * bits and fits BF16's range, so the decoded element is exact; the per-tensor
- * `1 / weight_scale_divisor` is applied once, in FP32, in the epilogue.
+ * This route keeps the A16 compute profile -- BF16 activations, the NVFP4
+ * weight decoded as it is stored, FP32 accumulation -- and moves the product
+ * onto BF16 tensor-core MMA. The weight tile is decoded into shared memory as
+ * BF16: an E2M1 code (2 significant bits) times its E4M3 group scale
+ * (4 significant bits) has at most six and fits BF16's range, so the decoded
+ * element is exact; the per-tensor `1 / weight_scale_divisor` is applied
+ * once, in FP32, in the epilogue. It is held to the same Linear criterion as
+ * the GEMVs, not to their bits: the accumulation order differs, so a sum
+ * that rounds can round to a different BF16.
  *
  * It lives in `kernel/include` for the reason `ignis_dflash2_topk.h` does:
  * the leaf's own CTest has to drive the function the engine ships.
@@ -45,9 +48,13 @@
 bool ignis_nvfp4_a16_mma_applies(std::int32_t output_rows, std::int32_t input_rows,
                                  std::int32_t tokens);
 
-/* `out[N, T] = W[N, K] * x[K, T]` for an NVFP4 `W`, A16 compute. The caller
- * has validated the Linear semantics and the weight; `x` and `out` are
- * contiguous BF16. Throws for a shape `ignis_nvfp4_a16_mma_applies` rejects. */
+/* `out[N, T] = W[N, K] * x[K, T]` for an NVFP4 `W`, A16 compute. It checks
+ * only the shape rule: the Linear semantics (contiguous, 16-byte-aligned BF16
+ * `x` and `out`, matching extents) and the weight's NVFP4 layout are
+ * `ops::linear`'s to validate, and this entry point assumes them. It is
+ * public so the leaf's CTest can hold `ops::linear` to it bit for bit; the
+ * engine reaches it only through `ops::linear`. Throws for a shape
+ * `ignis_nvfp4_a16_mma_applies` rejects. */
 void ignis_nvfp4_a16_mma(const ninfer::Tensor &x, const ninfer::Weight &w, ninfer::Tensor &out,
                          cudaStream_t stream);
 

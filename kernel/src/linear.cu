@@ -23,6 +23,11 @@
 // NVFP4-only). GitHub #177 adds the Q4/Q5/Q6 row-split arms the vision tower
 // is stored in. FP8 is in the reference's registry but never used by this
 // model's artifact, so it stays unsupported here.
+//
+// 2026-09-29: an NVFP4 A16Only call wide enough goes to our own tensor-core
+// route (kernel/include/ignis_nvfp4_a16_mma.h) instead of the vendored GEMV
+// slices; every other NVFP4 call is still the vendored dispatch's
+// (docs/findings/2026-09-29-a16-nvfp4-on-the-tensor-cores.md).
 
 #include "ninfer/ops/linear.h"
 

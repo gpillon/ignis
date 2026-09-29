@@ -132,8 +132,8 @@ single-lane TTFT on long prompts, is recoverable. Not measured.
     A16 (only the accumulation order changes). It costs VRAM: ~262 MB for the
     fc, plus 63 MB per drafter layer for the qkv.
   - A new A16 big-T NVFP4 kernel: dequantise weights into shared memory, then a
-    BF16 MMA. Same numerics, no VRAM cost, but it is new vendored-kernel work
-    (ADR 0037, "vendored kernels not sacred").
+    BF16 MMA. The same A16 contract, no VRAM cost, but it is a kernel of our
+    own beside a vendored route (ADR 0031).
   - Register W4A4 instances for the two geometries. That changes the numerics
     the drafter sees, so dflash2 acceptance has to be re-measured.
 - Because the vendored ops copy the reference's design, ninfer probably pays

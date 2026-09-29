@@ -1,6 +1,6 @@
 // ignis kernel leaf: A16 NVFP4 linear on BF16 tensor-core MMA, ours (see
-// kernel/include/ignis_nvfp4_a16_mma.h for why it exists and what numerics
-// it keeps).
+// kernel/include/ignis_nvfp4_a16_mma.h for why it exists and which
+// numerical contract it keeps).
 //
 //   out[N, T] = W[N, K] * x[K, T]
 //
@@ -129,6 +129,13 @@ __global__ __launch_bounds__(kThreads) void nvfp4_a16_mma_kernel(
   const int tile_n = static_cast<int>(blockIdx.x) - tile_m * tiles_n;
   const int m0 = tile_m * kBlockRows;
   const int n0 = tile_n * kBlockCols;
+  // The scale addressing below restates `nvfp4_scale_offset`
+  // (ops/linear/nvfp4/nvfp4_codec.cuh, the one definition of the blockscale
+  // layout) in 32-bit form: tile (m_tile, k_tile) starts at
+  // (m_tile * K/64 + k_tile) * 512, and inside it (row, group) sits at
+  // (row % 32) * 16 + (row / 32) * 4 + group. Calling the 64-bit helper
+  // instead measured 3.5-4% slower (the K loop is latency-bound), hoisted or
+  // not; the CTest's full comparison covers every row of a scale tile.
   const int scale_tile_m = m0 / kScaleTileRows;
   const int row_in_scale_tile0 = m0 - scale_tile_m * kScaleTileRows;
 

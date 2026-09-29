@@ -46,8 +46,8 @@ The kernel is a BF16 m16n8k16 MMA GEMM: 64x128x64 CTA tile, 8 warps, a
 2-stage cp.async ring. Each ring slot holds the weight exactly as it is stored:
 the E2M1 code rows and the 512-byte blockscale tile. Once per K step, one
 thread per (row, 16-element group) decodes the tile into a swizzled BF16 tile
-in shared memory. An E2M1 code times its E4M3 scale has at most 5 significant
-bits, so each decoded element is exact in BF16. The per-tensor
+in shared memory. An E2M1 code times its E4M3 scale has at most 6 significant
+bits (2 x 4), so each decoded element is exact in BF16. The per-tensor
 `1 / weight_scale_divisor` is applied in FP32 in the epilogue.
 
 **Correctness.** `ignis_kernel_nvfp4_a16_mma_test` runs through the vendored
@@ -58,11 +58,24 @@ A16 criterion (one BF16 unit roundoff, relative L2). It covers:
 - a full comparison of every output element on [256, 5120] and [1280, 5120] at
   T = 128, 129, 200, 256 and 300;
 - the six other registered geometries, sampled;
-- the route selection at its thresholds.
+- the route selection at its thresholds;
+- which kernel `ops::linear` actually ran, bit for bit. Either side of each
+  threshold its output must equal the MMA route's own output, or the vendored
+  GEMVs'. The route must also differ from the GEMVs somewhere, or the arm
+  could not tell them apart.
+
+Building that last arm showed something worth knowing. With the harness's
+weights and unit-normal activations, every FP32 partial sum at K = 5,120 is
+exact, so the MMA route and the GEMVs agree **bit for bit** on
+[6144, 5120] and [1280, 5120]. The arm therefore uses activations spread over
+2^-12..2^12, where 1,280-22,400 outputs per case differ. The earlier arms
+alone would still have passed with the route deleted, because the GEMVs meet
+the same criterion.
 
 A mutation that scales the epilogue by 1.01 fails it. With the route's first
 threshold (33 columns), the same mutation also failed the vendored
-`test_nvfp4_a16`. The full kernel CTest suite passes: 67/67, as does
+`test_nvfp4_a16`. Disabling the route in `ops::linear` fails the dispatch
+arm on all three cases above the threshold. The full kernel CTest suite passes: 67/67, as does
 `cargo test --workspace` (1,916 passed).
 
 **Per call** (`ignis_nvfp4_a16_mma_bench`, median of 50, same weight and
@@ -136,6 +149,9 @@ At one lane, greedy output is byte-identical and decode speed unchanged. At
 eight lanes, a round of 8 generations is 3-5% faster, and 15 of 16 outputs
 match main.
 
+The route keeps the A16 contract, not the GEMVs' bits: where a sum rounds,
+the different accumulation order can round it to a different BF16.
+
 **Inferred.** The TTFT gain is smaller than the ~18% of device time removed:
 end-to-end time also includes host time between requests and the gaps between
 kernels inside a chunk, which the route does not touch. Output is identical
@@ -172,4 +188,4 @@ Acceptance itself was not counted.
 ## Follow-ups
 
 - Lower the latency floor (split-K, or a pipelined decode), then lower the
-  thresholds.
+  thresholds. No ticket yet: the owner decides whether to open one.
