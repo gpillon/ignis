@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Timeline } from "../../metrics/figures.ts";
-import { type ChatRequest, chatRequestOf, type Settings, type ToolExtras } from "../../api/request.ts";
+import { buildChatRequest, type ChatRequest, type ConversationRequest, type Settings, type ToolExtras } from "../../api/request.ts";
 import type { StreamOptions, StreamResult } from "../../api/stream.ts";
 import { runWeb, WEB_FETCH_TOOL, WEB_IGNIS_PROMPT, WEB_SEARCH_TOOL, type WebRun } from "../web/web.ts";
 import {
@@ -15,6 +15,9 @@ import {
   runAgents,
   toolResult,
 } from "./agents.ts";
+
+/** The chat body a request goes out as over HTTP. */
+const chatBody = ({ settings, turns, extras }: ConversationRequest) => buildChatRequest(settings, turns, extras);
 
 const settings: Settings = {
   model: "m",
@@ -70,7 +73,7 @@ describe("parseAgentCall", () => {
 
 describe("agentRequest", () => {
   it("sends only the task, with the agent system prompt, on the agent lane, without tools", () => {
-    const body = chatRequestOf(agentRequest(settings, [{ role: "user", content: "do it" }]));
+    const body = chatBody(agentRequest(settings, [{ role: "user", content: "do it" }]));
     expect(body.messages).toEqual([
       { role: "system", content: AGENT_SYSTEM_PROMPT },
       { role: "user", content: "do it" },
@@ -110,12 +113,12 @@ describe("runAgents", () => {
     let peak = 0;
     const bodies: ChatRequest[] = [];
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
-      bodies.push(chatRequestOf(o.request));
+      bodies.push(chatBody(o.request));
       live++;
       peak = Math.max(peak, live);
       await new Promise((r) => setTimeout(r, 5));
       o.onEvent({ kind: "reasoning", text: "hm" });
-      o.onEvent({ kind: "content", text: `answer to ${chatRequestOf(o.request).messages[1].content}` });
+      o.onEvent({ kind: "content", text: `answer to ${chatBody(o.request).messages[1].content}` });
       live--;
       return { ok: true, timeline: timeline() };
     };
@@ -195,7 +198,7 @@ describe("agents with tools", () => {
   it("sends the tools with their prompt, runs the calls and streams again until the agent answers", async () => {
     const bodies: ChatRequest[] = [];
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
-      bodies.push(chatRequestOf(o.request));
+      bodies.push(chatBody(o.request));
       if (bodies.length === 1) {
         o.onEvent({ kind: "reasoning", text: "search first" });
         o.onEvent(callEvent("web_search", { query: "ignis" }));
@@ -276,7 +279,7 @@ describe("agents with tools", () => {
     const bodies: ChatRequest[] = [];
     tasksSeen.length = 0;
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
-      bodies.push(chatRequestOf(o.request));
+      bodies.push(chatBody(o.request));
       if (bodies.length === 1) o.onEvent(callEvent("agent", { name: "x", prompt: "y" }));
       else o.onEvent({ kind: "content", text: "ok" });
       return { ok: true, timeline: timeline() };
@@ -340,7 +343,7 @@ describe("agents and the thinking budget", () => {
   async function bodiesFor(budgeted: Settings) {
     const bodies: ChatRequest[] = [];
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
-      const body = chatRequestOf(o.request);
+      const body = chatBody(o.request);
       bodies.push(body);
       if (body.messages.at(-1)?.role === "user") {
         o.onEvent({ kind: "tool_call", call: { id: `w${bodies.length}`, name: "web_search", arguments: '{"query":"q"}' } });

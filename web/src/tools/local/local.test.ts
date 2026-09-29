@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { type ChatRequest, chatRequestOf, type Settings } from "../../api/request.ts";
+import { buildChatRequest, type ChatRequest, type ConversationRequest, type Settings } from "../../api/request.ts";
 import type { StreamOptions, StreamResult } from "../../api/stream.ts";
 import type { Timeline } from "../../metrics/figures.ts";
 import { type Attachment, readPiece, uniqueName } from "./attachments.ts";
 import { type LocalContext, type LocalRun, memoryPrompt, runLocalCalls } from "./local.ts";
 import { createMemoryStore } from "./memory.ts";
 import { JS_CHECK_SYSTEM_PROMPT, parseVerdict, runJs, type WorkerFactory, workerMain, type WorkerScope } from "./runjs.ts";
+
+/** The chat body a request goes out as over HTTP. */
+const chatBody = ({ settings, turns, extras }: ConversationRequest) => buildChatRequest(settings, turns, extras);
 
 const settings: Settings = {
   model: "m",
@@ -29,7 +32,7 @@ const inlineWorker: WorkerFactory = (onMessage) => {
 
 const reviewer = (reply: string, bodies: ChatRequest[] = []) =>
   async (o: StreamOptions): Promise<StreamResult> => {
-    bodies.push(chatRequestOf(o.request));
+    bodies.push(chatBody(o.request));
     o.onEvent({ kind: "content", text: reply });
     return { ok: true, timeline };
   };

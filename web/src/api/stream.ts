@@ -2,7 +2,7 @@ import { authHeaders, keyRequired } from "./auth.ts";
 import { withStreamPermit } from "./connections.ts";
 import { apiErrorMessage } from "./errors.ts";
 import { recordEvent, type Timeline } from "../metrics/figures.ts";
-import { CHAT_PATH, chatRequestOf, type ConversationRequest } from "./request.ts";
+import { buildChatRequest, CHAT_PATH, type ConversationRequest } from "./request.ts";
 import { createResponsesSocket, type ResponsesSocket } from "./socket.ts";
 import { type ChunkEvent, createSseParser, parseChunk } from "./sse.ts";
 import { activeTransport, fallBackToHttp } from "./transport.ts";
@@ -53,7 +53,7 @@ export function createStreamChat(socket: ResponsesSocket) {
       fallBackToHttp();
     }
     const { request, streamId: _stream, onQueued: _queued, ...http } = options;
-    return streamChatCompletions({ ...http, body: chatRequestOf(request) });
+    return streamChatCompletions({ ...http, body: buildChatRequest(request.settings, request.turns, request.extras) });
   };
 }
 

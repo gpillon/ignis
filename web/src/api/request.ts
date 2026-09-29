@@ -185,11 +185,6 @@ export function thinkingBudgetOf(settings: Pick<Settings, "reasoningEffort" | "t
 /** What the enabled tools add to a request: their prompt, ahead of the owner's, and their definitions. */
 export type ToolExtras = { ignisPrompt?: string; tools?: ToolDefinition[] };
 
-/** The chat request that carries `request` over HTTP. */
-export function chatRequestOf(request: ConversationRequest): ChatRequest {
-  return buildChatRequest(request.settings, request.turns, request.extras);
-}
-
 /** The system prompt a request sends: the ignis prompt, then the owner's; empty when both are blank. */
 export function systemPromptOf(settings: Settings, extras: ToolExtras = {}): string {
   return [extras.ignisPrompt ?? "", settings.systemPrompt].filter((part) => part.trim() !== "").join("\n\n");

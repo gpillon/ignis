@@ -51,8 +51,8 @@ export function canStartTurn(streaming: ReadonlySet<number>, sessionId: number, 
   return parallel ? !streaming.has(sessionId) : streaming.size === 0;
 }
 
-/** A session's stream on the socket: its turns continue one another there. */
-const sessionStream = (sessionId: number) => `session-${sessionId}`;
+/** A session's stream on the socket: its turns continue one another there, and its agents' streams are named under it. */
+export const sessionStream = (sessionId: number) => `session-${sessionId}`;
 
 const exchangeOf = (m: Message): Exchange => ({
   role: m.role,
