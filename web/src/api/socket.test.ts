@@ -80,7 +80,16 @@ function reply(stream: string, id: string, { reasoning = "", text = "", calls = 
     ]),
     {
       type: "response.completed",
-      response: { id, status: "completed", output: [...(text ? [{ type: "message" }] : []), ...fc], usage },
+      response: {
+        id,
+        status: "completed",
+        output: [
+          ...(reasoning ? [{ type: "reasoning", content: [{ type: "reasoning_text", text: reasoning }] }] : []),
+          ...(text ? [{ type: "message", content: [{ type: "output_text", text }] }] : []),
+          ...fc,
+        ],
+        usage,
+      },
     },
   ].map((event) => ({ ...event, stream_id: stream }));
 }
@@ -360,7 +369,11 @@ describe("queued replies", () => {
     socket.emit({ type: "response.queued", stream_id: "s", response: { id: "resp_q0", status: "queued" } });
     socket.emit({ type: "response.in_progress", stream_id: "s", response: { id: "resp_12", status: "in_progress" } });
     socket.emit({ type: "response.output_text.delta", stream_id: "s", delta: "b" });
-    socket.emit({ type: "response.completed", stream_id: "s", response: { id: "resp_12", status: "completed", output: [{ type: "message" }], usage } });
+    socket.emit({
+      type: "response.completed",
+      stream_id: "s",
+      response: { id: "resp_12", status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "b" }] }], usage },
+    });
     await first.result;
 
     const controller = new AbortController();
@@ -464,6 +477,32 @@ describe("continuation", () => {
       previous_response_id: "resp_1",
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "c" }] }],
     });
+  });
+
+  it("continues from the output as ignis holds it: text after a call is not the page's one message, so it all goes", async () => {
+    const h = harness();
+    const first = h.start([user("a")], { streamId: "s" });
+    await tick();
+    h.sockets[0].accept();
+    await tick();
+    const socket = h.sockets[0];
+    const call = { type: "function_call", call_id: "c", name: "read_file", arguments: "{}" };
+    const output = [{ type: "message", content: [{ type: "output_text", text: "x" }] }, call, { type: "message", content: [{ type: "output_text", text: "y" }] }];
+    for (const event of [
+      { type: "response.created", response: { id: "r1", status: "in_progress" } },
+      { type: "response.in_progress", response: { id: "r1", status: "in_progress" } },
+      { type: "response.output_text.delta", delta: "x" },
+      { type: "response.output_item.done", item: call },
+      { type: "response.output_text.delta", delta: "y" },
+      { type: "response.completed", response: { id: "r1", status: "completed", output, usage } },
+    ])
+      socket.emit({ ...event, stream_id: "s" });
+    await first.result;
+    const toolCalls = [{ id: "c", name: "read_file", arguments: "{}" }];
+    h.start([user("a"), { role: "assistant", content: "xy", toolCalls }, { role: "tool", content: "file", toolCallId: "c" }], { streamId: "s" });
+    await tick();
+    expect(socket.creates().at(-1)).not.toHaveProperty("previous_response_id");
+    expect(socket.creates().at(-1)?.input).toHaveLength(4);
   });
 
   it("sends the whole history after an edit, a regenerate and a fork", async () => {

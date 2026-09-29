@@ -1,5 +1,5 @@
 import { type ConversationRequest, type ReasoningEffort, systemPromptOf, thinkingBudgetOf, type Turn } from "./request.ts";
-import type { ChunkEvent, ToolCall } from "./sse.ts";
+import type { ChunkEvent } from "./sse.ts";
 
 // The Playground's request as a Responses `response.create`, and the
 // Responses events back as the chunk events the turn loop already reads
@@ -70,9 +70,21 @@ export function responseItems(turns: Turn[]): InputItem[] {
   return turns.flatMap(turnItems);
 }
 
-/** What a reply added to its stream, as the page would resend it: the same items its assistant turn becomes. */
-export function replyItems(reply: { reasoning: string; content: string; toolCalls: ToolCall[] }): InputItem[] {
-  return turnItems({ role: "assistant", ...reply });
+/**
+ * What a response added to its stream, as ignis keeps it to continue from:
+ * its output items in their order, in the shape the page sends them. A reply
+ * with one message is exactly the items its turn becomes; one whose text
+ * continues after a call is not (the transcript joins the text into one
+ * turn), so the next request carries the whole history rather than continue.
+ */
+export function outputItems(response: ResponseObject): InputItem[] {
+  return (response.output ?? []).flatMap((item): InputItem[] => {
+    const texts = (item.content ?? []).map((part) => ({ text: part.text ?? "" }));
+    if (item.type === "reasoning") return [{ type: "reasoning", content: texts.map(({ text }) => ({ type: "reasoning_text", text })), summary: [] }];
+    if (item.type === "message") return [{ type: "message", role: "assistant", content: texts.map(({ text }) => ({ type: "output_text", text })) }];
+    if (item.type === "function_call") return [{ type: "function_call", call_id: item.call_id ?? "", name: item.name ?? "", arguments: item.arguments ?? "" }];
+    return [];
+  });
 }
 
 /**
@@ -109,11 +121,14 @@ export function buildResponseCreate(
   };
 }
 
+/** An item of a response's output: only what the page reads of it. */
+export type OutputItem = { type: string; content?: { type?: string; text?: string }[]; call_id?: string; name?: string; arguments?: string };
+
 /** The response object the lifecycle events carry: only what the page reads of it. */
 export type ResponseObject = {
   id: string;
   status?: string;
-  output?: { type: string }[];
+  output?: OutputItem[];
   usage?: { input_tokens: number; output_tokens: number; total_tokens: number } | null;
   incomplete_details?: { reason?: string } | null;
   error?: { code?: string | null; message?: string } | null;

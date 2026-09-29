@@ -1,8 +1,7 @@
 import { authHeaders, getAuth, keyRequired } from "./auth.ts";
 import { apiErrorMessage } from "./errors.ts";
 import { recordEvent, type Timeline } from "../metrics/figures.ts";
-import { buildResponseCreate, type InputItem, parseResponseEvent, replyItems, responseItems, type ServerEvent, TOKEN_EVENTS } from "./responses.ts";
-import type { ToolCall } from "./sse.ts";
+import { buildResponseCreate, type InputItem, outputItems, parseResponseEvent, responseItems, type ServerEvent, TOKEN_EVENTS } from "./responses.ts";
 import type { StreamOptions, StreamResult } from "./stream.ts";
 
 // The Playground's conversation on the Responses WebSocket (GitHub #283,
@@ -207,7 +206,6 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
       let responseId: string | undefined;
       let stopped = false;
       let done = false;
-      const reply = { reasoning: "", content: "", toolCalls: [] as ToolCall[] };
       const cancel = (id: string) => connection.socket?.send(JSON.stringify({ type: "response.cancel", response_id: id }));
       const finish = (outcome: Outcome) => {
         if (done) return;
@@ -248,9 +246,6 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
           }
           for (const chunk of parseResponseEvent(event)) {
             recordEvent(timeline, chunk, at);
-            if (chunk.kind === "reasoning") reply.reasoning += chunk.text;
-            if (chunk.kind === "content") reply.content += chunk.text;
-            if (chunk.kind === "tool_call") reply.toolCalls.push(chunk.call);
             options.onEvent(chunk);
           }
         }
@@ -269,7 +264,7 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
           return end({ kind: "failed", message: error?.code ? `${error.code}: ${message}` : message });
         }
         if (event.type === "response.completed" && event.response) {
-          return end({ kind: "completed", id: responseId ?? event.response.id, output: replyItems(reply) });
+          return end({ kind: "completed", id: responseId ?? event.response.id, output: outputItems(event.response) });
         }
         if (event.type === "response.incomplete") {
           return end(event.response?.status === "cancelled" ? { kind: "stopped" } : { kind: "ended" });

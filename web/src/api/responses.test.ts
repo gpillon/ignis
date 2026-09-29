@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Settings, Turn } from "./request.ts";
-import { buildResponseCreate, parseResponseEvent, replyItems, responseItems, type ServerEvent } from "./responses.ts";
+import { buildResponseCreate, outputItems, parseResponseEvent, responseItems, type ServerEvent } from "./responses.ts";
 import { createSseParser, parseChunk } from "./sse.ts";
 
 const settings: Settings = {
@@ -88,10 +88,23 @@ describe("responseItems", () => {
     ]);
   });
 
-  it("rebuilds a reply as the same items its turn becomes in the next request", () => {
-    const reply = { reasoning: "hm", content: "", toolCalls: [{ id: "c", name: "web_search", arguments: "{}" }] };
-    expect(replyItems(reply)).toEqual(responseItems([{ role: "assistant", ...reply }]));
-    expect(replyItems(reply).map((item) => item.type)).toEqual(["reasoning", "function_call"]);
+  it("takes a reply's output as the items its turn becomes in the next request, when it has one message", () => {
+    const output = [
+      { type: "reasoning", id: "rs_0", summary: [], content: [{ type: "reasoning_text", text: "hm" }] },
+      { type: "message", id: "msg_0", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Let me look.", annotations: [] }] },
+      { type: "function_call", id: "fc_0", call_id: "c", name: "web_search", arguments: "{}", status: "completed" },
+    ];
+    const turn = { role: "assistant" as const, content: "Let me look.", reasoning: "hm", toolCalls: [{ id: "c", name: "web_search", arguments: "{}" }] };
+    expect(outputItems({ id: "r", output })).toEqual(responseItems([turn]));
+  });
+
+  it("keeps the output's own order when text follows a call, as ignis holds it", () => {
+    const output = [
+      { type: "message", content: [{ type: "output_text", text: "Reading it. " }] },
+      { type: "function_call", call_id: "c", name: "read_file", arguments: "{}" },
+      { type: "message", content: [{ type: "output_text", text: "Then this." }] },
+    ];
+    expect(outputItems({ id: "r", output }).map((item) => item.type)).toEqual(["message", "function_call", "message"]);
   });
 });
 
@@ -136,6 +149,21 @@ describe("parseResponseEvent", () => {
       usageChunk +
       "data: [DONE]\n\n";
     expect(events.flatMap(parseResponseEvent)).toEqual(chatEvents(chat));
+  });
+
+  it("joins the text of several message items into the one reply the chat stream would give", () => {
+    const call = { type: "function_call", call_id: "c", name: "read_file", arguments: "{}" };
+    const events: ServerEvent[] = [
+      { type: "response.output_text.delta", delta: "Reading it. " },
+      { type: "response.output_item.done", item: { type: "message" } },
+      { type: "response.output_item.done", item: call },
+      { type: "response.output_item.added", item: { type: "message" } },
+      { type: "response.output_text.delta", delta: "Then this." },
+      { type: "response.completed", response: { id: "r", status: "completed", output: [{ type: "message" }, call, { type: "message" }], usage } },
+    ];
+    const content = events.flatMap(parseResponseEvent).flatMap((e) => (e.kind === "content" ? [e.text] : []));
+    expect(content.join("")).toBe("Reading it. Then this.");
+    expect(events.flatMap(parseResponseEvent).find((e) => e.kind === "finish")).toEqual({ kind: "finish", reason: "tool_calls" });
   });
 
   it("ends a completed reply with stop, and a reply cut at max_output_tokens with length", () => {

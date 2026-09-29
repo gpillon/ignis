@@ -100,12 +100,15 @@ describe.skipIf(files.length === 0)("the server's golden transcripts", () => {
   it.each(files)("%s: a reply is its deltas, and no token comes before the engine admits it", (name) => {
     for (const reply of repliesOf(read(name))) {
       expect(reply.tokenBeforeAdmission).toBe(false);
-      for (const item of reply.items) {
-        if (item.type === "message") expect(item.content?.[0]?.text).toBe(reply.deltas["response.output_text.delta"]);
-        if (item.type === "reasoning") expect(item.content?.[0]?.text).toBe(reply.deltas["response.reasoning_text.delta"]);
-      }
-      const calls = reply.items.filter((item) => item.type === "function_call");
-      if (calls.length > 0) expect(calls.map((c) => c.arguments).join("")).toBe(reply.deltas["response.function_call_arguments.delta"]);
+      // A response may hold several items of a kind (text resumed after a call): together they are its deltas.
+      const joined = (type: string, text: (item: Item) => string | undefined) => {
+        const items = reply.items.filter((item) => item.type === type);
+        return items.length > 0 ? items.map((item) => text(item) ?? "").join("") : undefined;
+      };
+      const texts = (item: Item) => item.content?.map((part) => part.text ?? "").join("");
+      expect(joined("message", texts)).toBe(reply.deltas["response.output_text.delta"]);
+      expect(joined("reasoning", texts)).toBe(reply.deltas["response.reasoning_text.delta"]);
+      expect(joined("function_call", (item) => item.arguments)).toBe(reply.deltas["response.function_call_arguments.delta"]);
     }
   });
 });
