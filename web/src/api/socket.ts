@@ -266,6 +266,7 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
         }
       });
 
+      if (options.signal?.aborted) return end({ kind: "stopped" });
       options.signal?.addEventListener("abort", stop, { once: true });
       connection.socket?.send(JSON.stringify(body));
       timeline.sentAt = now();

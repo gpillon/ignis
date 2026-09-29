@@ -452,6 +452,23 @@ describe("continuation", () => {
     expect(h.sockets[0].creates()).toHaveLength(3);
   });
 
+  it("sends no retry for a request stopped while ignis answered previous_response_not_found", async () => {
+    const h = await answered();
+    const controller = new AbortController();
+    const { result } = h.start([...history, user("c")], { streamId: "session", signal: controller.signal });
+    await tick();
+    h.sockets[0].emit({
+      type: "error",
+      stream_id: "session",
+      status: 400,
+      error: { type: "invalid_request_error", code: "previous_response_not_found", message: "Previous response not found", param: "previous_response_id" },
+    });
+    controller.abort();
+    expect(await result).toMatchObject({ ok: true, timeline: { stopped: true } });
+    await tick();
+    expect(h.sockets[0].creates()).toHaveLength(2);
+  });
+
   it("sends the whole history after the socket reconnects, or after a reply that did not complete", async () => {
     const h = await answered();
     h.sockets[0].drop();

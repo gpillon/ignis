@@ -11,7 +11,7 @@ export type Transport = "websocket" | "http";
 
 const STORAGE_KEY = "ignis.transport";
 
-/** `make web-mock` serves no socket: there the page starts on HTTP, and falling back says nothing. */
+/** `make web-mock` serves no socket: there the page talks HTTP whatever the setting says, and falling back says nothing. */
 const MOCK = import.meta.env.MODE === "mock";
 
 export type TransportState = {
@@ -33,7 +33,7 @@ function readStored(): Transport {
   } catch {
     // No storage: the default.
   }
-  return MOCK ? "http" : "websocket";
+  return "websocket";
 }
 
 function update(next: TransportState) {
@@ -56,7 +56,7 @@ export function useTransport(): TransportState {
 
 /** The wire the next request goes over. */
 export function activeTransport(): Transport {
-  return state.choice === "websocket" && !state.fellBack ? "websocket" : "http";
+  return state.choice === "websocket" && !state.fellBack && !MOCK ? "websocket" : "http";
 }
 
 /** The owner's pick, remembered by this browser. Picking WebSocket tries the socket again. */
@@ -72,7 +72,7 @@ export function chooseTransport(choice: Transport) {
 /** The socket could not be opened and ignis is there: HTTP from now on, and a notice the first time. */
 export function fallBackToHttp() {
   if (state.fellBack) return;
-  update({ ...state, fellBack: true, notice: !MOCK });
+  update({ ...state, fellBack: true, notice: true });
 }
 
 export function dismissTransportNotice() {
