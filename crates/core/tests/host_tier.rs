@@ -167,6 +167,56 @@ fn evict_frees_a_blocked_head_and_restore_skips_reprefill() {
     assert!(sched.is_idle());
 }
 
+/// A request cancelled while it sits evicted in the host tier leaves nothing
+/// behind there: its snapshot leaves the tier and its pinned blob is freed.
+/// The cancel used to release the request and leave the snapshot, so the next
+/// restore pass found a snapshot with no request and panicked the model thread
+/// ("a host-tier snapshot always maps to a request") — reachable from any
+/// client that goes away under KV pressure (an SSE disconnect, a closed
+/// Responses socket, `response.cancel`).
+#[test]
+fn a_request_cancelled_while_evicted_leaves_no_snapshot_behind() {
+    let compute = Arc::new(MockCompute::with_host_arena(64));
+    let cfg = SchedulerConfig {
+        model: "qwen3.8-27b".into(),
+        max_in_flight: 16,
+        max_prefill_batch: 8,
+        host_capacity_bytes: 64,
+        ..SchedulerConfig::default()
+    };
+    let mut sched = ConcreteScheduler::with_config(cfg, compute.clone());
+    for _ in 0..8 {
+        sched.submit(input(8), RequestClass::Agent).unwrap();
+    }
+    sched.advance();
+    let head = sched.submit(input(8), RequestClass::Agent).unwrap();
+    let evicted = ids_of(&sched.advance(), |e| matches!(e, SchedEvent::Evicted { .. }));
+    let victim = *evicted.first().expect("the blocked head evicts a lane");
+    assert!(sched.host_tier().contains(victim));
+
+    assert!(sched.cancel(victim));
+    let mut events = Vec::new();
+    for _ in 0..1000 {
+        if sched.is_idle() {
+            break;
+        }
+        events.extend(sched.advance());
+    }
+
+    assert!(sched.is_idle(), "the scheduler drains");
+    assert!(!sched.host_tier().contains(victim), "the cancelled request's snapshot left the tier");
+    assert_eq!(sched.host_tier().used_bytes(), 0);
+    assert_eq!(compute.host_arena_used(), 0, "its pinned blob was freed");
+    assert!(
+        !events.iter().any(|e| matches!(e,
+            SchedEvent::Restored { request, .. } | SchedEvent::Done { request, .. } if *request == victim)),
+        "a cancelled request is never restored nor completed"
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == head)));
+}
+
 /// Scenario 2 — under N=8 + overflow load the evictions are **bounded**:
 /// with a small host-RAM budget the tier evicts its lowest-value (probation
 /// LRU) snapshot to make room, so it never exceeds `capacity_bytes`; the

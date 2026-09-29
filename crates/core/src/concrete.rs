@@ -1737,6 +1737,12 @@ impl ConcreteScheduler {
         };
         self.requests[idx].abort();
         self.compute.release(request_id);
+        // A request cancelled while evicted takes its snapshot out of the
+        // host tier and frees its pinned blob: left there, the next restore
+        // pass would find a snapshot with no request behind it.
+        if self.host.discard_request(request_id).is_some() {
+            self.compute.discard_snapshot(request_id);
+        }
         self.release_kv_ram_claim(idx, false);
         if let Some(lane) = lane {
             self.free_lanes.push(lane);
