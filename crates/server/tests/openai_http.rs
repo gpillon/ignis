@@ -5,7 +5,7 @@
 //! Covers the three v1 endpoints + their error paths:
 //! - `GET /v1/models` — the loaded model.
 //! - `POST /v1/chat/completions` — non-streaming + streaming (SSE).
-//! - `POST /v1/responses` — the OpenAI responses API (non-streaming).
+//! - `POST /v1/responses` — the OpenAI responses API (`responses_http.rs` pins its events).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -452,29 +452,22 @@ async fn chat_completions_streaming_emits_chunks_then_done() {
         .filter(|l| l.as_str() != "[DONE]")
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    // 3 token chunks + 1 final finish-reason chunk. No `stream_options` was
-    // sent, so no trailing usage chunk (OpenAI only sends it opt-in).
-    assert_eq!(chunks.len(), 4, "3 tokens + final chunk: {body}");
-    // The 3 token chunks carry the mock's exact token ids (request 0). The
-    // incremental decoder (GitHub #68) reproduces the whole-list render's
-    // space-joined shape by construction: the first chunk is bare, every
-    // later one carries its leading separator space.
-    let expected_tokens = mock_tokens(0, 3);
-    for (i, chunk) in chunks.iter().take(3).enumerate() {
-        let expected = if i == 0 {
-            expected_tokens[i].to_string()
-        } else {
-            format!(" {}", expected_tokens[i])
-        };
-        assert_eq!(chunk["choices"][0]["delta"]["content"], expected);
-    }
+    // Up to 3 token chunks — tokens the reader finds already waiting go out
+    // as one (GitHub #282 follow-up) — then 1 final finish-reason chunk. No
+    // `stream_options` was sent, so no trailing usage chunk (OpenAI only
+    // sends it opt-in).
+    let deltas = chunks.iter().take_while(|c| c["choices"][0]["finish_reason"].is_null()).count();
+    assert!((1..=3).contains(&deltas), "{body}");
+    assert_eq!(chunks.len(), deltas + 1, "the token chunks + final chunk: {body}");
     // The final chunk: finish_reason set, empty delta. The mock has no
     // real EOS, so hitting `max_tokens` reports `length` (GitHub #61).
-    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "length");
+    assert_eq!(chunks[deltas]["choices"][0]["finish_reason"], "length");
     // The token sequence, re-rendered, matches the built-in template —
     // plain concatenation now that each delta carries its own separator
-    // (story 24: streaming and non-streaming agree by construction).
-    let streamed_content: String = chunks.iter().take(3)
+    // (story 24: streaming and non-streaming agree by construction), and
+    // the mock's exact token ids (request 0).
+    let expected_tokens = mock_tokens(0, 3);
+    let streamed_content: String = chunks.iter().take(deltas)
         .map(|c| c["choices"][0]["delta"]["content"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(streamed_content, rendered(&expected_tokens));
@@ -503,17 +496,21 @@ async fn chat_completions_streaming_with_include_usage_appends_a_usage_chunk() {
         .filter(|l| l.as_str() != "[DONE]")
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    // 3 token chunks + 1 final finish-reason chunk + 1 trailing usage chunk.
-    assert_eq!(chunks.len(), 5, "3 tokens + final chunk + usage chunk: {body}");
-    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "length");
+    // Up to 3 token chunks (see the test above) + 1 final finish-reason
+    // chunk + 1 trailing usage chunk.
+    let deltas = chunks.iter().take_while(|c| c["choices"][0]["finish_reason"].is_null()).count();
+    assert!((1..=3).contains(&deltas), "{body}");
+    assert_eq!(chunks.len(), deltas + 2, "the token chunks + final chunk + usage chunk: {body}");
+    assert_eq!(chunks[deltas]["choices"][0]["finish_reason"], "length");
     // The trailing usage chunk: empty choices, populated usage — sent
     // right before `[DONE]` (OpenAI's summary chunk, opt-in via
     // `stream_options.include_usage`).
-    assert_eq!(chunks[4]["choices"], serde_json::json!([]));
-    assert_eq!(chunks[4]["usage"]["completion_tokens"], 3);
+    let usage = &chunks[deltas + 1];
+    assert_eq!(usage["choices"], serde_json::json!([]));
+    assert_eq!(usage["usage"]["completion_tokens"], 3);
     assert_eq!(
-        chunks[4]["usage"]["total_tokens"],
-        chunks[4]["usage"]["prompt_tokens"].as_u64().unwrap() + 3
+        usage["usage"]["total_tokens"],
+        usage["usage"]["prompt_tokens"].as_u64().unwrap() + 3
     );
 }
 
@@ -608,7 +605,10 @@ async fn responses_api_string_input_returns_the_openai_shape() {
     assert_eq!(status, 200, "responses should be 200: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["object"], "response");
-    assert_eq!(v["status"], "completed");
+    // GitHub #282: the mock stops only at `max_output_tokens`, which is an
+    // `incomplete` response.
+    assert_eq!(v["status"], "incomplete");
+    assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
     assert_eq!(v["output"][0]["type"], "message");
     assert_eq!(v["output"][0]["role"], "assistant");
     assert_eq!(v["output"][0]["content"][0]["type"], "output_text");
@@ -759,16 +759,21 @@ async fn responses_api_refuses_an_unknown_role_with_its_message_index() {
     assert!(body["error"]["message"].as_str().unwrap().contains("index 1"));
 }
 
+/// GitHub #282: `stream: true` is served, as the Responses events
+/// (`responses_http.rs` pins the sequence).
 #[tokio::test]
-async fn a_streaming_responses_request_is_a_400() {
+async fn a_streaming_responses_request_is_served_as_events() {
     let h = harness();
     let req = serde_json::json!({
         "model": MODEL,
         "input": "hi",
+        "max_output_tokens": 1,
         "stream": true
     });
-    let (status, _body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
-    assert_eq!(status, 400, "streaming responses are unsupported in v1: 400");
+    let (status, body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.starts_with("event: response.created"), "{body}");
+    assert!(body.contains("event: response.incomplete"), "{body}");
 }
 
 // ── concurrency (GitHub #69: the isolated model thread) ─────────────────

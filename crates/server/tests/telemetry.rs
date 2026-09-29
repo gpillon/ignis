@@ -64,6 +64,7 @@ fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
     }
 }
 

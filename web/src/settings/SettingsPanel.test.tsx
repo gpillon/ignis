@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { activeTransport, chooseTransport, fallBackToHttp } from "../api/transport.ts";
 import { NO_TOOLS, type ToolsState } from "../tools/index.ts";
 import { DEFAULT_SETTINGS, type PlaygroundSettings } from "./defaults.ts";
 import { SettingsPanel, ToolsSetting } from "./SettingsPanel.tsx";
@@ -143,5 +144,41 @@ describe("readBudgetInput", () => {
 
   it("says nothing of an empty box", () => {
     expect(readBudgetInput("  ")).toEqual({ ok: false, error: null });
+  });
+});
+
+// The wire the conversation goes over (GitHub #283): WebSocket by default,
+// HTTP when picked, and a word when the page fell back to HTTP on its own.
+
+describe("SettingsPanel: the transport", () => {
+  afterEach(() => chooseTransport("websocket"));
+
+  /** The transport control's part of the panel. */
+  const transportRegion = (html: string) => html.slice(html.indexOf("Transport"), html.indexOf("Markdown in replies"));
+
+  it("sits in General and starts on the WebSocket", () => {
+    const region = transportRegion(panel());
+    expect(radios(region).map((r) => r.label)).toEqual(["WebSocket", "HTTP"]);
+    expect(checked(region)).toEqual(["WebSocket"]);
+  });
+
+  it("forces HTTP when picked", () => {
+    chooseTransport("http");
+    expect(checked(transportRegion(panel()))).toEqual(["HTTP"]);
+    expect(activeTransport()).toBe("http");
+  });
+
+  it("says when the page fell back to HTTP by itself, and tries the socket again once WebSocket is picked", () => {
+    fallBackToHttp();
+    const fellBack = transportRegion(panel());
+    // The control shows the wire in use, so WebSocket is there to pick again.
+    expect(checked(fellBack)).toEqual(["HTTP"]);
+    expect(fellBack).toContain("did not open the WebSocket");
+    expect(fellBack).toContain("Pick WebSocket to try it again");
+    expect(fellBack).not.toContain("reloads");
+    expect(activeTransport()).toBe("http");
+    chooseTransport("websocket");
+    expect(activeTransport()).toBe("websocket");
+    expect(transportRegion(panel())).not.toContain("did not open the WebSocket");
   });
 });

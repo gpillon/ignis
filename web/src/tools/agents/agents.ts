@@ -1,5 +1,5 @@
 import { computeFigures, type Figures } from "../../metrics/figures.ts";
-import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition, type ToolExtras, type Turn } from "../../api/request.ts";
+import type { ConversationRequest, Settings, ToolDefinition, ToolExtras, Turn } from "../../api/request.ts";
 import type { ToolCall } from "../../api/sse.ts";
 import { streamChat } from "../../api/stream.ts";
 import { type UnknownCall, unknownCall, unknownToolError } from "../errors.ts";
@@ -123,13 +123,13 @@ export function parseAgentCall(
 }
 
 /** An agent's request: its own system prompt and turns, its tools if any, on an agent lane. */
-export function agentRequest(settings: Settings, turns: Turn[], extras: ToolExtras = {}): ChatRequest {
+export function agentRequest(settings: Settings, turns: Turn[], extras: ToolExtras = {}): ConversationRequest {
   const withTools = (extras.tools?.length ?? 0) > 0;
-  return buildChatRequest(
-    { ...settings, systemPrompt: withTools ? AGENT_TOOLS_SYSTEM_PROMPT : AGENT_SYSTEM_PROMPT, laneTag: "agent" },
+  return {
+    settings: { ...settings, systemPrompt: withTools ? AGENT_TOOLS_SYSTEM_PROMPT : AGENT_SYSTEM_PROMPT, laneTag: "agent" },
     turns,
-    withTools ? extras : {},
-  );
+    extras: withTools ? extras : {},
+  };
 }
 
 /** The tool result the model receives for a finished run. */
@@ -173,6 +173,11 @@ export type RunAgentsOptions = {
   limit?: number;
   /** How many replies in a row an agent may call tools in; the session's tool rounds. */
   maxRounds?: number;
+  /**
+   * Names each agent's stream on the socket: this, then the agent's call.
+   * The caller passes its own stream, so agents of different sessions never share one.
+   */
+  streamId?: string;
   /** A full engine is retried, not failed: agents wait for a lane. */
   retryDelayMs?: number;
   maxRetries?: number;
@@ -214,18 +219,24 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
         return null;
       }
       const calls: ToolCall[] = [];
+      // This request's own reasoning, which its turn carries back; the run shows it after the earlier ones'.
+      let reasoning = "";
       // A later request's reasoning is set apart from the earlier ones'.
       let separator = before ? "\n\n" : "";
       const result = await stream({
-        body: agentRequest(options.settings, turns, tools),
+        request: agentRequest(options.settings, turns, tools),
+        streamId: `${options.streamId ?? "agents"}.agent-${task.callId}`,
         signal,
         now,
-        // An agent whose stream is waiting for a connection (GitHub #220) is
-        // still queued: it turns running when its request actually goes out.
+        // An agent whose stream is waiting for a connection (GitHub #220), or
+        // for a lane in a full engine, is still queued: it turns running when
+        // its request actually starts.
         onStart: () => set(task.callId, { status: "running", reasoning: before, content: "", ...(round === 0 ? { startedAt: now() } : {}) }),
+        onQueued: () => set(task.callId, { status: "queued" }),
         onEvent: (event) => {
           const run = get(task.callId);
           if (event.kind === "reasoning") {
+            reasoning += event.text;
             set(task.callId, { reasoning: run.reasoning + separator + event.text });
             separator = "";
           }
@@ -238,7 +249,7 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
         await sleep(retryDelayMs, signal);
         continue;
       }
-      return { result, calls };
+      return { result, calls, reasoning };
     }
   }
 
@@ -294,7 +305,7 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
     for (let round = 0; ; round++) {
       const answer = await request(task, turns, round);
       if (!answer) return;
-      const { result, calls } = answer;
+      const { result, calls, reasoning } = answer;
       if (!result.ok) return set(task.callId, { status: "failed", error: result.message });
       const figures = computeFigures(result.timeline);
       set(task.callId, { figures, rounds: [...(get(task.callId).rounds ?? []), figures] });
@@ -310,7 +321,7 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
       const results = await runCalls(task.callId, calls);
       turns = [
         ...turns,
-        { role: "assistant", content, toolCalls: calls },
+        { role: "assistant", content, ...(reasoning ? { reasoning } : {}), toolCalls: calls },
         ...calls.map((call): Turn => ({ role: "tool", content: results.get(call.id) ?? "", toolCallId: call.id })),
       ];
     }

@@ -65,6 +65,14 @@ family takes the decision family's exception: absent until the first `locate`.
 A shortlist's labelled `choice`s and yes/no are steps of its one `locate`,
 not decisions: they move neither `ignis_decisions_total{type="choice"}` nor
 the answer-mass histogram. No answer mass, as for every `locate`.
+Amended 2026-09-29 (#282, spec responses-api/01): two unlabelled gauges for
+the Responses API's WebSocket mode, `ignis_responses_sockets` (open sockets)
+and `ignis_responses_queued_requests` (socket requests waiting in the
+server-wide admission queue), set by the server as sockets open and close and
+as requests join and leave the queue. A socket request the engine finds full
+is queued, not rejected, so it does not move `ignis_requests_rejected_total`;
+one refused for good (unknown model, context, size) does, as on HTTP. Both
+are exported at zero like every other gauge.
 
 ## Context
 
@@ -229,6 +237,8 @@ The initial stable metric contract is:
 | `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
 | `ignis_locates_total` | counter | `kind=log\|prose\|records`, `method=shortlist\|vote`, `compression=template_fold\|none`, `found=true\|false\|unmeasured` | `locate`s answered, by the route that answered them and whether it found an answer (#278, spec 22). Only the served combinations have a series. **Absent until the first one** |
 | `ignis_thinking_forced_closes_total` | counter | none | Completed requests whose reasoning block the thinking budget closed (#265, spec server/08). The request log's `thinking_forced` says which. **Absent until the first one** |
+| `ignis_responses_sockets` | gauge | none | Open Responses API WebSocket connections (#282) |
+| `ignis_responses_queued_requests` | gauge | none | Responses WebSocket requests waiting in the server-wide **socket admission queue**; a request the engine found full is counted here rather than in `ignis_requests_rejected_total` (#282) |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
 reserved lines (eleven, twelve since #257 added `hq_residual_window`), the budget, the KV pool's pages and page bytes, the

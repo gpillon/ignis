@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { Figures } from "../metrics/figures.ts";
 import type { Message } from "../sessions/sessions.ts";
 import { Reply } from "./Reply.tsx";
+import { sameTurnProps } from "./TurnActions.tsx";
 
 // A reply whose reasoning the thinking budget closed says so on its
 // reasoning block (spec playground/04); one that closed it itself does not.
@@ -57,5 +58,45 @@ describe("Reply and the thinking budget", () => {
 
   it("carries no marker while the reply streams, before it has any figures", () => {
     expect(render(reply({ streaming: true, content: "", figures: undefined }))).not.toContain("Budget reached");
+  });
+});
+
+// A reply the engine queued says so while it waits, and its figures keep the
+// wait apart from TTFT (GitHub #283).
+
+describe("Reply and the engine's queue", () => {
+  it("says the reply is queued while it waits for a lane", () => {
+    expect(render(reply({ streaming: true, queued: true, content: "", reasoning: "", figures: undefined }))).toContain("Queued: the engine is full");
+    expect(render(reply({ streaming: true, content: "", reasoning: "", figures: undefined }))).not.toContain("Queued");
+  });
+
+  it("shows the queue time beside TTFT once the reply is done, and nothing for a reply admitted at once", () => {
+    const html = render(reply({ figures: { ...figures, queueMs: 1200 } }));
+    expect(html).toMatch(/Queued<\/dt><dd[^>]*>1.20 s<\/dd>/);
+    expect(html.indexOf("Queued")).toBeLessThan(html.indexOf("TTFT"));
+    expect(render(reply())).not.toContain("Queued");
+  });
+});
+
+// While a reply streams, a frame renders that reply alone: every finished
+// turn keeps its props, handlers aside (GitHub #283).
+
+describe("sameTurnProps", () => {
+  const props = (change: Partial<{ message: Message; canRerun: boolean; last: boolean }> = {}) => ({
+    message: change.message ?? finished,
+    last: change.last ?? false,
+    actions: { canRerun: change.canRerun ?? true, onSave: () => {}, onFork: () => {} },
+    onRegenerate: () => {},
+  });
+  const finished = reply();
+
+  it("leaves a finished turn alone when only its handlers are new", () => {
+    expect(sameTurnProps(props(), props())).toBe(true);
+  });
+
+  it("renders a turn again when its message, its place or whether it may rerun changed", () => {
+    expect(sameTurnProps(props(), props({ message: { ...finished, content: "more" } }))).toBe(false);
+    expect(sameTurnProps(props(), props({ last: true }))).toBe(false);
+    expect(sameTurnProps(props(), props({ canRerun: false }))).toBe(false);
   });
 });

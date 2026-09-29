@@ -7,8 +7,9 @@
 //! - `POST /v1/chat/completions` — chat completions, streaming (SSE) and
 //!   non-streaming; routes into the core scheduler and streams tokens back
 //!   as they are generated.
-//! - `POST /v1/responses` — the OpenAI responses API (non-streaming in v1;
-//!   a `stream: true` request is rejected with a 400).
+//! - `POST /v1/responses` — the OpenAI Responses API, streaming (SSE) and
+//!   not, and `GET /v1/responses`, its WebSocket mode (`crate::responses`,
+//!   GitHub #282).
 //!
 //! Error shape: OpenAI's `{"error": {message, type, code}}` body with the
 //! matching status (400 bad request, 404 unknown model, 413 oversized
@@ -42,7 +43,7 @@ use ignis_core::{
 
 use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
-use crate::engine::{Completion, Engine, EventStream, RequestNotes, collect_completion};
+use crate::engine::{Completion, Engine, EventStream, RequestNotes, collect_completion, drain_tokens};
 use crate::media::{has_media, MediaRejection, MediaStats};
 use crate::template::{
     check_content_parts, check_roles, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
@@ -142,7 +143,9 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
     OpenApiRouter::with_openapi(crate::openapi::ApiDoc::openapi())
         .routes(routes!(list_models))
         .routes(routes!(chat_completions))
-        .routes(routes!(responses_api))
+        // GitHub #282: the Responses API, and its WebSocket mode as the
+        // `get` of the same path.
+        .routes(routes!(crate::responses::create_response, crate::responses::socket::connect))
         // GitHub #239 — the decision endpoint, and the Jev name for it so an
         // unmodified Jev client reaches this server by changing the URL.
         // The alias is a `route`, not a `routes!`: it is the same handler
@@ -172,7 +175,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 
 /// The HTTP-ingress root span's shape: `request_id` is declared `Empty` —
 /// unknown at ingress — and recorded once the request is admitted into the
-/// scheduler (see `chat_completions`/`responses_api`). A request that never
+/// scheduler (see `chat_completions`/`create_response`). A request that never
 /// reaches submission (a 400 before it, a CORS preflight, `GET
 /// /v1/models`) simply never records it, so its span (and anything logged
 /// under it) carries no `trace_id` — there is no request to correlate yet,
@@ -195,6 +198,12 @@ impl<B> MakeSpan<B> for RootSpanMaker {
 /// as `Authorization: Bearer <key>` with OpenAI's `401 invalid_api_key`.
 /// A CORS preflight passes untouched: browsers never attach credentials to
 /// one, so gating it would break every cross-origin client.
+///
+/// A WebSocket upgrade may present it instead as a `Sec-WebSocket-Protocol`
+/// entry `openai-insecure-api-key.<key>` (GitHub #282): a page cannot set a
+/// header on a WebSocket, and this is OpenAI's Realtime convention for it.
+/// The entry is read here and never selected back to the client
+/// (`crate::responses::socket`).
 async fn require_api_key(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let Some(key) = &server.api_key else {
         return next.run(req).await;
@@ -207,7 +216,8 @@ async fn require_api_key(State(server): State<Arc<Server>>, req: Request, next: 
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
+        .map(str::trim)
+        .or_else(|| crate::responses::socket::subprotocol_key(req.headers()));
     if presented.is_some_and(|p| key.matches(p)) {
         return next.run(req).await;
     }
@@ -327,6 +337,7 @@ fn request_input(
         system_block_tokens: rendered.system_block_tokens,
         reuse_boundaries: Vec::new(),
         constrained: None,
+        warm_up: false,
 };
     Ok(PreparedRequest { input, model, prompt_tokens, media: None, part_ends: rendered.part_ends, text })
 }
@@ -347,7 +358,7 @@ pub(crate) enum Structure {
 /// disconnect) stops that work before anything is submitted — then its
 /// placeholders expanded, so `prompt_tokens` counts the image tokens. The
 /// fourth value is the acquisition summary the request's events carry.
-async fn prepare_request(
+pub(crate) async fn prepare_request(
     server: &Server,
     model: Option<String>,
     messages: &[ChatMessage],
@@ -486,7 +497,7 @@ fn resolve_class(
 /// `class` field ([`resolve_class`]) into the class to submit under. The one
 /// path both completion endpoints share, so the two-entry-point resolution
 /// lives in a single place rather than being repeated per handler.
-fn resolve_model_and_class(
+pub(crate) fn resolve_model_and_class(
     model: Option<String>,
     class: Option<JsonValue>,
 ) -> Result<(Option<String>, RequestClass), String> {
@@ -499,7 +510,7 @@ fn resolve_model_and_class(
 /// the wire boundary so type, integer-width, and narrowing failures all use
 /// the same OpenAI-shaped sampling error instead of Axum's generic rejection.
 #[derive(Clone, Default, Deserialize, ToSchema)]
-struct SamplingRequestFields {
+pub(crate) struct SamplingRequestFields {
     temperature: Option<JsonValue>,
     top_p: Option<JsonValue>,
     /// An ignis extension, not an OpenAI Chat Completions parameter.
@@ -515,7 +526,7 @@ impl SamplingRequestFields {
     /// what keeps such a request bounded: with neither an EOS nor a cap,
     /// a non-streaming request has nothing left to stop it, and only the
     /// streaming path cancels on client disconnect.
-    fn resolve(self, max_tokens: Option<u32>, ignore_eos: bool) -> Result<DecodeParams, String> {
+    pub(crate) fn resolve(self, max_tokens: Option<u32>, ignore_eos: bool) -> Result<DecodeParams, String> {
         let temperature = bounded_f32(
             "temperature",
             number("temperature", self.temperature, 0.0)?,
@@ -591,6 +602,26 @@ fn number(name: &str, value: Option<JsonValue>, default: f64) -> Result<f64, Str
     }
 }
 
+/// An optional boolean field: absent or `null` is `None`, anything but a
+/// boolean is refused.
+pub(crate) fn optional_bool(value: Option<&JsonValue>, name: &str) -> Result<Option<bool>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{name} must be a boolean")),
+    }
+}
+
+/// An optional string field: absent or `null` is `None`, anything but a
+/// string is refused.
+pub(crate) fn optional_str<'a>(value: Option<&'a JsonValue>, name: &str) -> Result<Option<&'a str>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("{name} must be a string")),
+    }
+}
+
 fn signed_integer(message: &str, value: Option<JsonValue>, default: i64) -> Result<i64, String> {
     match value {
         None => Ok(default),
@@ -616,7 +647,7 @@ fn bounded_f32(name: &str, value: f64, min: f64, max: f64) -> Result<f32, String
     }
 }
 
-fn invalid_sampling_parameter(message: impl Into<String>) -> Response {
+pub(crate) fn invalid_sampling_parameter(message: impl Into<String>) -> Response {
     error_response(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
@@ -628,7 +659,7 @@ fn invalid_sampling_parameter(message: impl Into<String>) -> Response {
 /// Resolve one request's thinking controls, or the OpenAI-shaped 400 to
 /// return instead. Validation errors and capability errors carry different
 /// `code`s (the client's mistake vs. the loaded model's limitation).
-fn resolve_thinking(
+pub(crate) fn resolve_thinking(
     server: &Server,
     fields: ThinkingRequestFields<'_>,
 ) -> Result<ThinkingOptions, Response> {
@@ -656,7 +687,7 @@ fn resolve_thinking(
 /// `effort` is the request's raw `reasoning_effort`: `max` is decided from
 /// it (else from the server default), not from `thinking`, which carries
 /// the effort the template takes.
-fn with_thinking_budget(
+pub(crate) fn with_thinking_budget(
     server: &Server,
     params: DecodeParams,
     value: Option<&JsonValue>,
@@ -722,7 +753,7 @@ fn parse_tool_choice(tool_choice: Option<JsonValue>) -> Result<ToolChoice, Respo
 /// reference fills in ([`normalize_tool`]). [`ToolChoice::None`] discards
 /// the validated tools — the template never sees them, so the model is
 /// never told tools exist.
-fn resolve_tools(
+pub(crate) fn resolve_tools(
     tools: Option<Vec<JsonValue>>,
     tool_choice: Option<JsonValue>,
 ) -> Result<Vec<JsonValue>, Response> {
@@ -831,7 +862,7 @@ fn split_reasoning_and_tools(
 /// 503 engine full). With metrics on, the rejection is counted here, on the
 /// HTTP side, once the submit call has returned its error (ADR 0017): the
 /// model thread sends no fact for it.
-fn submit_error(server: &Server, err: SubmitError) -> Response {
+pub(crate) fn submit_error(server: &Server, err: SubmitError) -> Response {
     if let Some(metrics) = &server.metrics {
         metrics.record_rejected(crate::metrics::Rejection::of(&err));
     }
@@ -866,7 +897,7 @@ fn submit_error(server: &Server, err: SubmitError) -> Response {
 }
 
 /// A 400 with the OpenAI error body.
-fn bad_request(message: &str) -> Response {
+pub(crate) fn bad_request(message: &str) -> Response {
     error_response(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
@@ -877,7 +908,7 @@ fn bad_request(message: &str) -> Response {
 
 /// The 400 for refused content parts (GitHub #175): the rejection's own
 /// code, raised before the request reaches the engine.
-fn content_rejection(rejection: ContentRejection) -> Response {
+pub(crate) fn content_rejection(rejection: ContentRejection) -> Response {
     error_response(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
@@ -888,7 +919,7 @@ fn content_rejection(rejection: ContentRejection) -> Response {
 
 /// The 400 for a text-template/tokenizer/role refusal, before any request is
 /// admitted to the engine (GitHub #208).
-fn template_rejection(rejection: TemplateRejection) -> Response {
+pub(crate) fn template_rejection(rejection: TemplateRejection) -> Response {
     error_response(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
@@ -898,7 +929,7 @@ fn template_rejection(rejection: TemplateRejection) -> Response {
 }
 
 /// The OpenAI error body (`{"error": {message, type, code}}`).
-fn error_response(
+pub(crate) fn error_response(
     status: StatusCode,
     type_: &str,
     code: &str,
@@ -909,7 +940,7 @@ fn error_response(
 
 /// [`error_response`], naming the one request field at fault in
 /// `error.param` when there is one.
-fn error_response_naming(
+pub(crate) fn error_response_naming(
     status: StatusCode,
     type_: &str,
     code: &str,
@@ -931,7 +962,7 @@ fn error_response_naming(
 }
 
 /// A 400 naming the one request field at fault in `error.param`.
-fn bad_request_param(message: &str, param: &str) -> Response {
+pub(crate) fn bad_request_param(message: &str, param: &str) -> Response {
     error_response_naming(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
@@ -945,7 +976,7 @@ fn bad_request_param(message: &str, param: &str) -> Response {
 /// timeout that fired (GitHub #95) so an operator reading the error knows
 /// what to raise with `--request-timeout`/`IGNIS_REQUEST_TIMEOUT`, rather
 /// than suspecting a wedged engine when a healthy one just needed longer.
-fn request_timeout_message(timeout: std::time::Duration) -> String {
+pub(crate) fn request_timeout_message(timeout: std::time::Duration) -> String {
     format!(
         "the request did not complete within the server's {}s timeout (the engine may be wedged) — raise it with --request-timeout/IGNIS_REQUEST_TIMEOUT",
         timeout.as_secs()
@@ -1006,7 +1037,7 @@ pub(crate) fn resolve_finish_reason(
 /// its own way — a whole-string check non-streaming, incremental flags
 /// while streaming — since neither has the other's representation of the
 /// generation to reuse).
-fn report_if_all_reasoning_no_content(id: &str, all_reasoning: bool, finish_reason: &'static str) {
+pub(crate) fn report_if_all_reasoning_no_content(id: &str, all_reasoning: bool, finish_reason: &'static str) {
     if all_reasoning {
         tracing::warn!(
             id,
@@ -1018,7 +1049,7 @@ fn report_if_all_reasoning_no_content(id: &str, all_reasoning: bool, finish_reas
 }
 
 /// The Unix epoch seconds (OpenAI's `created` / `created_at` fields).
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1476,6 +1507,9 @@ struct ChunkStream {
     pending: VecDeque<Event>,
     /// The `[DONE]` marker has been emitted (exactly once, at the end).
     done_sent: bool,
+    /// The event that ended the last run of tokens: taken before the stream
+    /// is polled again, so the order holds.
+    held: Option<SchedEvent>,
     /// At least one non-empty `Reasoning` delta was ever queued (GitHub
     /// #70 via #121 acceptance criterion 5).
     emitted_reasoning: bool,
@@ -1540,6 +1574,7 @@ impl ChunkStream {
             include_usage,
             pending: VecDeque::new(),
             done_sent: false,
+            held: None,
             emitted_reasoning: false,
             emitted_content_or_call: false,
         }
@@ -1678,7 +1713,11 @@ impl Stream for ChunkStream {
             if let Some(event) = this.pending.pop_front() {
                 return Poll::Ready(Some(Ok(event)));
             }
-            match this.stream.poll_recv(cx) {
+            let polled = match this.held.take() {
+                Some(event) => Poll::Ready(Some(event)),
+                None => this.stream.poll_recv(cx),
+            };
+            match polled {
                 Poll::Ready(None) => {
                     // Stream closed (the request completed and the engine
                     // removed its route — or the engine stopped): the
@@ -1692,11 +1731,16 @@ impl Stream for ChunkStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(event)) => match event {
                     SchedEvent::Token { token, .. } => {
-                        // The incremental decoder: zero, one, or two deltas
-                        // for this token (GitHub #68). Zero means the
-                        // decoder is holding back — loop to poll the next
-                        // scheduler event rather than returning nothing.
-                        for delta in this.decoder.push(&[token]) {
+                        // This token and every one already waiting behind
+                        // it, as one run: a round's tokens make one chunk
+                        // per channel, not one each, and nothing waits for
+                        // tokens still to come. The incremental decoder
+                        // (GitHub #68) may give nothing yet — holding back a
+                        // `</think>` prefix or a partial character — and
+                        // then the loop polls on rather than returning.
+                        let mut run = vec![token];
+                        this.held = drain_tokens(&mut this.stream, &mut run);
+                        for delta in this.decoder.push_run(&run) {
                             this.queue_decoder_delta(delta);
                         }
                     }
@@ -1739,237 +1783,6 @@ impl Stream for ChunkStream {
             }
         }
     }
-}
-
-// ── POST /v1/responses ────────────────────────────────────────────────────
-
-/// A responses-API request (OpenAI wire shape). `input` is a plain string
-/// (a single user turn) or a list of messages.
-#[derive(Deserialize, ToSchema)]
-struct ResponsesRequest {
-    input: ResponsesInput,
-    model: Option<String>,
-    /// The responses API's name for the completion's token cap.
-    max_output_tokens: Option<u32>,
-    temperature: Option<f32>,
-    seed: Option<u64>,
-    /// `true` is rejected in v1 (the responses API is non-streaming; a
-    // streaming response is a later ticket).
-    #[serde(default)]
-    stream: bool,
-    /// The thinking controls (GitHub #68) — same wire contract as chat
-    /// completions, resolved through the same `thinking::resolve` path.
-    enable_thinking: Option<JsonValue>,
-    reasoning_effort: Option<JsonValue>,
-    preserve_thinking: Option<JsonValue>,
-    chat_template_kwargs: Option<JsonValue>,
-    /// See the matching field on `ChatCompletionsRequest`.
-    thinking_budget: Option<JsonValue>,
-    /// An ignis extension, not an OpenAI parameter (GitHub #120) — see the
-    /// matching field on `ChatCompletionsRequest`.
-    class: Option<JsonValue>,
-}
-
-/// The responses API's `input` (a string or a message list).
-#[derive(Deserialize, ToSchema)]
-#[serde(untagged)]
-enum ResponsesInput {
-    /// A plain string — treated as a single user turn.
-    Text(String),
-    /// A list of messages (role + content).
-    Messages(Vec<ChatMessage>),
-}
-
-/// `POST /v1/responses` — the OpenAI responses API (non-streaming in v1).
-///
-/// The request routes into the core scheduler exactly like a chat
-/// completion (the same submit / event-stream path); the response is the
-/// responses API's `output`-message shape with the generated text in an
-/// `output_text` content part.
-#[utoipa::path(
-    post,
-    path = "/v1/responses",
-    tag = "responses",
-    operation_id = "responses",
-    summary = "A response, the responses-API shape",
-    description = "The same engine path as a chat completion, under the responses API's names: `input` (a string or a message list) instead of `messages`, `max_output_tokens` instead of `max_tokens`, and an `output` of messages carrying `output_text` content parts.
-
-Non-streaming in v1: `stream: true` is refused with a 400 rather than answered partially.",
-    request_body = ResponsesRequest,
-    responses(
-        (status = 200, description = "The response.", body = Responses),
-        (status = 400, description = "The request is malformed, or asked for `stream: true`, which this endpoint does not serve in v1.", body = ApiError),
-        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
-        (status = 404, description = "The request named a model this server has not loaded.", body = ApiError),
-        (status = 413, description = "The prompt is longer than this server's `--max-context`.", body = ApiError),
-        (status = 503, description = "The engine is at capacity and the request was not admitted.", body = ApiError),
-        (status = 504, description = "The engine did not finish the request within `--request-timeout`.", body = ApiError),
-    ),
-)]
-async fn responses_api(
-    State(server): State<Arc<Server>>,
-    Json(req): Json<ResponsesRequest>,
-) -> Response {
-    if req.stream {
-        return bad_request("streaming responses are not supported in v1 (non-streaming only)");
-    }
-    // `input` → messages: a string is a single user turn; a message list is
-    // used as-is (an empty list is a 400).
-    let messages = match req.input {
-        ResponsesInput::Text(text) => vec![ChatMessage::text("user", text)],
-        ResponsesInput::Messages(m) => m,
-    };
-    if messages.is_empty() {
-        return bad_request("input must not be empty");
-    }
-    if let Err(rejection) = check_roles(&messages) {
-        return template_rejection(rejection);
-    }
-    if let Err(rejection) = check_content_parts(&messages, server.media.is_some()) {
-        return content_rejection(rejection);
-    }
-    let thinking = match resolve_thinking(
-        &server,
-        ThinkingRequestFields {
-            enable_thinking: req.enable_thinking.as_ref(),
-            reasoning_effort: req.reasoning_effort.as_ref(),
-            preserve_thinking: req.preserve_thinking.as_ref(),
-            chat_template_kwargs: req.chat_template_kwargs.as_ref(),
-        },
-    ) {
-        Ok(t) => t,
-        Err(response) => return response,
-    };
-    let params = DecodeParams {
-        max_tokens: req.max_output_tokens,
-        temperature: req.temperature.unwrap_or(0.0),
-        seed: req.seed.unwrap_or(0),
-        ..DecodeParams::default()
-    };
-    let (params, budget_dropped) = match with_thinking_budget(
-        &server,
-        params,
-        req.thinking_budget.as_ref(),
-        req.reasoning_effort.as_ref(),
-        &thinking,
-    ) {
-        Ok(resolved) => resolved,
-        Err(response) => return response,
-    };
-    let (model, class) = match resolve_model_and_class(req.model, req.class) {
-        Ok(x) => x,
-        Err(message) => return bad_request(&message),
-    };
-    let prepared = prepare_request(
-        &server,
-        model,
-        &messages,
-        params,
-        &thinking,
-        // The responses API carries no `tools` field (GitHub #132: only
-        // `/v1/chat/completions` gets tool-calling support, matching the
-        // scope this endpoint already keeps for reasoning/tool_calls).
-        &[],
-    )
-    .await;
-    let (input, model, prompt_tokens, media) = match prepared {
-        Ok(prepared) => prepared,
-        Err(response) => return response,
-    };
-    let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped };
-    let (id, mut stream) = match server.engine.submit_with_notes(input, class, notes).await {
-        Ok(x) => x,
-        Err(err) => return submit_error(&server, err),
-    };
-    // GitHub #81 / ADR 0012: see the matching comment in `chat_completions`.
-    tracing::Span::current().record("request_id", id);
-    match collect_completion(&mut stream, server.request_timeout).await {
-        Ok(Completion { reason: FinishReason::Error, .. }) => engine_error_response(),
-        Ok(Completion { tokens, thinking: budget, .. }) => {
-            // The responses API's v1 shape carries no `finish_reason`
-            // field (only `status: "completed"`); the stop reason is not
-            // surfaced here.
-            // GitHub #68: `text` is the content channel only — the
-            // reasoning trace is discarded (this endpoint has no field to
-            // carry it, and leaking it into `text` is the bug being fixed).
-            let (_reasoning_content, text) =
-                split_reasoning(server.template.as_ref(), &tokens, &thinking);
-            let output_tokens = tokens.len() as u32;
-            Json(Responses {
-                id: format!("resp_{id}"),
-                object: "response",
-                created_at: now(),
-                model,
-                output: vec![ResponseMessage {
-                    r#type: "message",
-                    id: format!("msg_{id}"),
-                    role: "assistant",
-                    status: "completed",
-                    content: vec![ResponseContent {
-                        r#type: "output_text",
-                        text,
-                        annotations: Vec::new(),
-                    }],
-                }],
-                status: "completed",
-                thinking_budget_forced_at: budget.and_then(|b| b.forced_at),
-                usage: ResponsesUsage {
-                    input_tokens: prompt_tokens,
-                    output_tokens,
-                    total_tokens: prompt_tokens.saturating_add(output_tokens),
-                },
-            })
-            .into_response()
-        }
-        Err(_) => error_response(
-            StatusCode::GATEWAY_TIMEOUT,
-            "request_timeout",
-            "request_timeout",
-            request_timeout_message(server.request_timeout),
-        ),
-    }
-}
-
-/// The non-streaming responses response (the OpenAI responses API shape).
-#[derive(Serialize, ToSchema)]
-struct Responses {
-    id: String,
-    object: &'static str,
-    created_at: u64,
-    model: String,
-    output: Vec<ResponseMessage>,
-    status: &'static str,
-    /// See the matching field on `CompletionChoice`; top-level here, where
-    /// this shape keeps its per-response state.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking_budget_forced_at: Option<u32>,
-    usage: ResponsesUsage,
-}
-
-#[derive(Serialize, ToSchema)]
-struct ResponseMessage {
-    r#type: &'static str,
-    id: String,
-    role: &'static str,
-    status: &'static str,
-    content: Vec<ResponseContent>,
-}
-
-#[derive(Serialize, ToSchema)]
-struct ResponseContent {
-    r#type: &'static str,
-    text: String,
-    /// Always empty: this server annotates nothing (the field is the
-    /// responses API's, kept so the shape matches).
-    #[schema(value_type = Vec<Object>)]
-    annotations: Vec<()>,
-}
-
-#[derive(Serialize, ToSchema)]
-struct ResponsesUsage {
-    input_tokens: u32,
-    output_tokens: u32,
-    total_tokens: u32,
 }
 
 // ── the error envelope ───────────────────────────────────────────────────
@@ -2072,6 +1885,72 @@ mod tests {
         assert_eq!(json["usage"]["prompt_tokens"], 58);
         assert_eq!(json["usage"]["completion_tokens"], 1500);
         assert_eq!(json["usage"]["total_tokens"], 1558);
+    }
+
+    /// Token `n` reads as `WORDS[n]`.
+    struct Words;
+
+    const WORDS: &[&str] = &["one ", "two ", "three ", "four"];
+
+    impl crate::decoder::TokenDecoder for Words {
+        fn push(&mut self, token: ignis_core::TokenId) -> String {
+            WORDS[token as usize].to_owned()
+        }
+        fn finish(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    /// A round's tokens already waiting when the stream is polled are one
+    /// chunk, not one per token; the finish chunk and `[DONE]` still follow.
+    #[tokio::test]
+    async fn a_round_of_tokens_already_waiting_is_one_chat_chunk() {
+        let scheduler = ignis_core::ConcreteScheduler::with_config(
+            ignis_core::SchedulerConfig { model: "m".into(), ..ignis_core::SchedulerConfig::default() },
+            Arc::new(ignis_core::MockCompute::new()),
+        );
+        let engine = Engine::new(Box::new(scheduler));
+        let (route, stream) = tokio::sync::mpsc::unbounded_channel();
+        for token in 0..4 {
+            route.send(SchedEvent::Token { request: 9, token }).unwrap();
+        }
+        route
+            .send(SchedEvent::Done {
+                request: 9,
+                tokens: 4,
+                reason: FinishReason::Stop,
+                spec: None,
+                readout: None,
+                attention: None,
+                drawn: None,
+                thinking: None,
+            })
+            .unwrap();
+        drop(route);
+        let chunks = ChunkStream::new(
+            stream,
+            CancelOnDrop::new(engine, 9),
+            "chatcmpl-9".into(),
+            0,
+            "m".into(),
+            OutputDecoder::new(Box::new(Words), false),
+            ToolSchemas::from_tools(&[]),
+            1,
+            false,
+        );
+        let body = Sse::new(chunks).into_response().into_body();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let data: Vec<&str> = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
+        assert_eq!(data.len(), 3, "one content chunk, the finish chunk, [DONE]: {data:?}");
+        let first: JsonValue = serde_json::from_str(data[0]).unwrap();
+        assert_eq!(first["choices"][0]["delta"]["content"], "one two three four");
+        let finish: JsonValue = serde_json::from_str(data[1]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert_eq!(data[2], "[DONE]");
     }
 
     // ── GitHub #120: tagged lanes (the `class` extension + "@<lane>") ────
@@ -2187,16 +2066,6 @@ mod tests {
     }
 
     #[test]
-    fn a_responses_request_parses_the_class_extension_field() {
-        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
-            "input": "hi",
-            "class": "agent",
-        }))
-        .expect("class parses as a responses field");
-        assert_eq!(req.class, Some(serde_json::json!("agent")));
-    }
-
-    #[test]
     fn the_error_body_is_the_openai_shape() {
         let body = ApiError {
             error: ErrorBody {
@@ -2212,31 +2081,6 @@ mod tests {
         assert_eq!(json["error"]["code"], "invalid_request_error");
         // No field at fault, no `param` key at all.
         assert!(json["error"].get("param").is_none(), "{json}");
-    }
-
-    #[test]
-    fn a_responses_input_parses_as_a_string_or_a_message_list() {
-        // `input: "hi"` → a single user turn.
-        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
-            "input": "hi"
-        }))
-        .expect("string input parses");
-        match req.input {
-            ResponsesInput::Text(s) => assert_eq!(s, "hi"),
-            _ => panic!("a string input must parse as Text"),
-        }
-        // `input: [...]` → a message list.
-        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({ "input": [
-                { "role": "user", "content": "hi" }
-            ] }))
-        .expect("message input parses");
-        match req.input {
-            ResponsesInput::Messages(m) => {
-                assert_eq!(m.len(), 1);
-                assert_eq!(m[0].role, "user");
-            }
-            _ => panic!("a message-list input must parse as Messages"),
-        }
     }
 
     // ── GitHub #121: tool-call and finish-reason hardening ──────────────

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { memo, useLayoutEffect, useRef, useState } from "react";
 import { BudgetReached } from "../metrics/BudgetReached.tsx";
 import { Readout } from "../metrics/Readout.tsx";
 import type { Message } from "../sessions/sessions.ts";
@@ -11,9 +11,12 @@ import { IconFork, IconPencil, IconRegenerate } from "../ui/icons.tsx";
 import { Markdown } from "../ui/Markdown.tsx";
 import { isAtBottom } from "../ui/scroll.ts";
 import { MessageEditor } from "./MessageEditor.tsx";
-import { ActionButton, ActionRow, EditedMark, RERUN_BLOCKED, type TurnActions } from "./TurnActions.tsx";
+import { ActionButton, ActionRow, EditedMark, RERUN_BLOCKED, sameTurnProps, type TurnActions } from "./TurnActions.tsx";
 
-export function Reply(props: {
+/** A reply of the transcript; one that did not change is not rendered again. */
+export const Reply = memo(ReplyTurn, sameTurnProps);
+
+function ReplyTurn(props: {
   message: Message;
   markdown: boolean;
   last: boolean;
@@ -51,6 +54,11 @@ export function Reply(props: {
             {m.reasoning}
           </pre>
         </details>
+      )}
+      {m.streaming && m.queued && (
+        <p className="font-display text-[13px] font-medium text-ash" role="status">
+          Queued: the engine is full, and this reply waits for a lane.
+        </p>
       )}
       {editing ? (
         <MessageEditor

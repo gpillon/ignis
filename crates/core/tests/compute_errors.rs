@@ -66,6 +66,7 @@ fn failed_prefill_leaves_the_request_retryable() {
                 tokens: vec![1, 2],
                 params: Default::default(),
                 constrained: None,
+                warm_up: false,
             },
             ignis_core::types::RequestClass::Agent,
         )
@@ -144,6 +145,7 @@ fn a_prefill_that_keeps_failing_ends_its_request_with_an_error() {
                 tokens: vec![1, 2],
                 params: Default::default(),
                 constrained: None,
+                warm_up: false,
             },
             ignis_core::types::RequestClass::Agent,
         )
@@ -210,6 +212,7 @@ fn failed_decode_ends_the_request_and_releases_its_lane() {
                 tokens: vec![1, 2],
                 params: Default::default(),
                 constrained: None,
+                warm_up: false,
             },
             ignis_core::types::RequestClass::Agent,
         )
@@ -227,6 +230,7 @@ fn failed_decode_ends_the_request_and_releases_its_lane() {
                 tokens: vec![3, 4],
                 params: Default::default(),
                 constrained: None,
+                warm_up: false,
             },
             ignis_core::types::RequestClass::Agent,
         )

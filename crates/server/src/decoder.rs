@@ -52,6 +52,20 @@ pub trait TokenDecoder: Send {
     fn finish(&mut self) -> String;
 }
 
+/// `deltas` with each run of adjacent same-channel deltas joined into one: the
+/// same text in the same channels, in fewer pieces. A reasoning delta and a
+/// content delta are never joined.
+pub fn join(deltas: Vec<Delta>) -> Vec<Delta> {
+    let mut joined: Vec<Delta> = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        match joined.last_mut() {
+            Some(last) if last.channel == delta.channel => last.text.push_str(&delta.text),
+            _ => joined.push(delta),
+        }
+    }
+    joined
+}
+
 /// The channel-splitting decoder: wraps a [`TokenDecoder`] and emits
 /// `(channel, text)` deltas, switching from `Reasoning` to `Content` exactly
 /// once, at the `</think>` marker.
@@ -124,6 +138,21 @@ impl OutputDecoder {
             }
         }
         deltas
+    }
+
+    /// Feed a run of tokens that arrived together — a round's, or whatever
+    /// a slow reader found waiting: exactly the text [`OutputDecoder::push`]
+    /// gives token by token, with adjacent deltas of one channel joined
+    /// ([`join`]), so a run is one delta per channel it touched.
+    pub fn push_run(&mut self, tokens: &[TokenId]) -> Vec<Delta> {
+        join(self.push(tokens))
+    }
+
+    /// The channel the next pushed token's text lands in (GitHub #282): what
+    /// a response counts that token towards. Read *before* the push, so the
+    /// token that carries `</think>` is still counted as reasoning.
+    pub fn channel(&self) -> Channel {
+        self.channel
     }
 
     /// Flush the token decoder and this decoder's own held-back text.

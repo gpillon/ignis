@@ -740,6 +740,7 @@ mod tests {
             RequestInput {
                 decision: None,
                 constrained: None,
+                warm_up: false,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),

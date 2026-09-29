@@ -1,10 +1,13 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { Message } from "../sessions/sessions.ts";
 import { IconFork, IconPencil } from "../ui/icons.tsx";
 import { MessageEditor } from "./MessageEditor.tsx";
-import { ActionButton, ActionRow, EditedMark, RERUN_BLOCKED, type TurnActions } from "./TurnActions.tsx";
+import { ActionButton, ActionRow, EditedMark, RERUN_BLOCKED, sameTurnProps, type TurnActions } from "./TurnActions.tsx";
 
-export function UserTurn({ message: m, actions, onResend }: { message: Message; actions: TurnActions; onResend: (text: string) => void }) {
+/** A prompt of the transcript; one that did not change is not rendered again. */
+export const UserTurn = memo(Prompt, sameTurnProps);
+
+function Prompt({ message: m, actions, onResend }: { message: Message; actions: TurnActions; onResend: (text: string) => void }) {
   const [editing, setEditing] = useState(false);
   if (editing) {
     return (

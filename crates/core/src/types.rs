@@ -157,6 +157,13 @@ pub struct RequestInput {
     /// They are the two halves of ADR 0034, and a request is one or the
     /// other.
     pub constrained: Option<std::sync::Arc<crate::constrained::Schedule>>,
+    /// Whether this request is a **warm-up** (GitHub #282, the Responses
+    /// WebSocket mode's `generate: false`): like a decision it ends where its
+    /// prefill ends and generates nothing; unlike one it reads nothing out,
+    /// and it publishes the retained state an ordinary request of the same
+    /// prompt would — the retained prefix at the system block, the prompt
+    /// checkpoint at the generation opener — for the turn that follows it.
+    pub warm_up: bool,
 }
 
 /// Names one `/v1/decide` fan-out (GitHub #270): the owner of a **fan-out
@@ -240,6 +247,12 @@ impl RequestInput {
     /// answer out at the end of prefill and generates nothing.
     pub fn is_decision(&self) -> bool {
         self.decision.is_some()
+    }
+
+    /// Whether this request ends where its prefill ends: a decision, or a
+    /// warm-up (GitHub #282). Either generates nothing.
+    pub fn ends_at_prefill(&self) -> bool {
+        self.is_decision() || self.warm_up
     }
 
     /// The attention readout this request is a decision over, if it is one

@@ -616,6 +616,20 @@ pub trait Scheduler: Send {
         class: RequestClass,
     ) -> Result<RequestId, SubmitError>;
 
+    /// Whether [`Scheduler::submit`] would refuse `input` for good — an
+    /// unknown model, a request past the context, one the pool can never
+    /// hold — whatever else is in flight (GitHub #282). `None` when only
+    /// room could keep it out: what a caller that queues on
+    /// [`SubmitError::Full`] asks before it queues, since `submit` answers
+    /// `Full` first and would hide a permanent refusal behind it.
+    ///
+    /// The default refuses nothing, so a scheduler without one queues
+    /// everything its `submit` calls full.
+    fn refusal(&self, input: &RequestInput) -> Option<SubmitError> {
+        let _ = input;
+        None
+    }
+
     /// Abort an in-flight request. The scheduler must stop dealing it work
     /// and release its resources no later than the next [`Scheduler::advance`].
     /// Returns `false` when the request is unknown or already complete.

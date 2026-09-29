@@ -326,7 +326,7 @@ fn lands_on(start: u32, take: u32, point: u32) -> bool {
 /// whole length, because the reservation is made at submit and which round
 /// closes the shape is not known then.
 fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
-    if input.is_decision() {
+    if input.ends_at_prefill() {
         return 0;
     }
     if let Some(schedule) = &input.constrained {
@@ -1737,6 +1737,12 @@ impl ConcreteScheduler {
         };
         self.requests[idx].abort();
         self.compute.release(request_id);
+        // A request cancelled while evicted takes its snapshot out of the
+        // host tier and frees its pinned blob: left there, the next restore
+        // pass would find a snapshot with no request behind it.
+        if self.host.discard_request(request_id).is_some() {
+            self.compute.discard_snapshot(request_id);
+        }
         self.release_kv_ram_claim(idx, false);
         if let Some(lane) = lane {
             self.free_lanes.push(lane);
@@ -2393,7 +2399,51 @@ impl ConcreteScheduler {
     }
 }
 
+impl ConcreteScheduler {
+    /// The KV pages `input` reserves, or why it can never be admitted: past
+    /// the context, or larger than the pool even alone.
+    fn reservation(&self, input: &RequestInput) -> Result<u32, SubmitError> {
+        // GitHub #166: the leaf reserves at most `max_sequence_tokens` (its
+        // `max_context`) for one sequence, whatever the pool holds. A prompt
+        // that already fills the limit, or a prompt + `max_tokens` that
+        // overruns it, can never be allocated — refused here rather than
+        // failing at the leaf on every advance.
+        let prompt_tokens = input.tokens.len() as u64;
+        let reserved_tokens = prompt_tokens + u64::from(generation_budget(&self.config, input));
+        let limit = self.config.max_sequence_tokens;
+        if prompt_tokens >= u64::from(limit) || reserved_tokens > u64::from(limit) {
+            return Err(SubmitError::ContextExceeded {
+                requested: reserved_tokens,
+                limit,
+            });
+        }
+        // core-05: compute the request's KV reservation (prompt + the
+        // effective token budget, in pages) and reject requests that can
+        // never fit — even alone (they would block the queue forever).
+        let kv_pages = reserved_tokens.div_ceil(self.config.kv_page_tokens as u64) as u32;
+        let resources = AdmissionResources {
+            lanes: 1,
+            kv_pages,
+            backend_pages: 0,
+            resident_slots: 1,
+        };
+        if !admission_resources_fit(&resources, &self.capacity) {
+            return Err(SubmitError::Oversized);
+        }
+        Ok(kv_pages)
+    }
+}
+
 impl Scheduler for ConcreteScheduler {
+    fn refusal(&self, input: &RequestInput) -> Option<SubmitError> {
+        if input.model != self.config.model {
+            return Some(SubmitError::UnknownModel(input.model.clone()));
+        }
+        // A constrained decode's budget is its schedule (see `submit`);
+        // `generation_budget` already reads it that way.
+        self.reservation(input).err()
+    }
+
     fn submit(
         &mut self,
         mut input: RequestInput,
@@ -2416,12 +2466,6 @@ impl Scheduler for ConcreteScheduler {
         if self.in_flight() >= self.config.max_in_flight {
             return Err(SubmitError::Full);
         }
-        // GitHub #166: the leaf reserves at most `max_sequence_tokens` (its
-        // `max_context`) for one sequence, whatever the pool holds. A prompt
-        // that already fills the limit, or a prompt + `max_tokens` that
-        // overruns it, can never be allocated — refused here rather than
-        // failing at the leaf on every advance.
-        let prompt_tokens = input.tokens.len() as u64;
         let effective_max = generation_budget(&self.config, &input);
         // Spec server/08: a thinking budget always leaves the answer room
         // inside what the request may generate. Clamped once here, where
@@ -2429,27 +2473,12 @@ impl Scheduler for ConcreteScheduler {
         // reports the budget — reads the one the request actually runs under.
         input.params.thinking_budget =
             crate::thinking_budget::effective(input.params.thinking_budget, effective_max);
-        let reserved_tokens = prompt_tokens + u64::from(effective_max);
-        let limit = self.config.max_sequence_tokens;
-        if prompt_tokens >= u64::from(limit) || reserved_tokens > u64::from(limit) {
-            return Err(SubmitError::ContextExceeded {
-                requested: reserved_tokens,
-                limit,
-            });
-        }
-        // core-05: compute the request's KV reservation (prompt + the
-        // effective token budget, in pages) and reject requests that can
-        // never fit — even alone (they would block the queue forever).
-        let kv_pages = reserved_tokens.div_ceil(self.config.kv_page_tokens as u64) as u32;
         let resources = AdmissionResources {
             lanes: 1,
-            kv_pages,
+            kv_pages: self.reservation(&input)?,
             backend_pages: 0,
             resident_slots: 1,
         };
-        if !admission_resources_fit(&resources, &self.capacity) {
-            return Err(SubmitError::Oversized);
-        }
         let id = self.next_id;
         self.next_id += 1;
         // P4-10 (GitHub #126): the shareable head of this prompt, decided
@@ -3476,6 +3505,10 @@ impl Scheduler for ConcreteScheduler {
         //
         // `FinishReason::Stop` because the decision is *answered* — nothing
         // was cut short. Its `tokens` is 0, honestly: it generated nothing.
+        //
+        // GitHub #282: a **warm-up** ends here too, for the same reasons, and
+        // always with `Stop` — its whole purpose, the state its prefill left
+        // behind, was published by the chunks that landed it.
         let decided: Vec<usize> = self
             .requests
             .iter()
@@ -3483,11 +3516,15 @@ impl Scheduler for ConcreteScheduler {
             .filter(|&(_, r)| {
                 r.state == RequestState::Prefilling
                     && r.prefill_complete()
-                    && r.input.is_decision()
+                    && r.input.ends_at_prefill()
             })
             .map(|(i, _)| i)
             .collect();
         for idx in decided {
+            if self.requests[idx].input.warm_up {
+                self.mark_done(idx, &mut events, FinishReason::Stop);
+                continue;
+            }
             // A decision that finished its prefill with no readout should be
             // impossible: its last chunk always carries at least one token
             // (`RequestInput::reuse_reach`) and always asks for one, and a

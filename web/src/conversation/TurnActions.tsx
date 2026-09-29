@@ -9,6 +9,20 @@ export type TurnActions = {
 
 export const RERUN_BLOCKED = "Wait for the current reply to end";
 
+/**
+ * Whether a turn would render as it did: every prop the same, the handlers
+ * aside — the transcript's always reach the page's current ones — and of the
+ * actions only whether a rerun is allowed. While a reply streams, this is
+ * what keeps every finished turn out of each frame's render (GitHub #283).
+ */
+export function sameTurnProps<P extends { actions: TurnActions }>(prev: P, next: P): boolean {
+  const keys = Object.keys(next) as (keyof P)[];
+  if (keys.length !== Object.keys(prev).length) return false;
+  return keys.every((key) =>
+    key === "actions" ? prev.actions.canRerun === next.actions.canRerun : typeof next[key] === "function" || prev[key] === next[key],
+  );
+}
+
 /** A turn's actions: shown on hover or focus on wide screens, always on the last reply and on touch widths. */
 export function ActionRow({ children, className = "", pinned = false }: { children: ReactNode; className?: string; pinned?: boolean }) {
   return (

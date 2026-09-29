@@ -183,6 +183,25 @@ async fn a_responses_image_request_is_submitted_expanded_and_counted_in_usage() 
     assert_expanded(&h.submitted);
 }
 
+/// GitHub #282: the Responses shape of the same message — `input_text`, and
+/// `input_image` with its flat `image_url` string — is the same request.
+#[tokio::test]
+async fn a_responses_input_image_item_is_the_same_image_request() {
+    let h = vision();
+    let body = json!({"model": MODEL, "max_output_tokens": 4, "input": [{
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "what is this"},
+            {"type": "input_image", "image_url": data_uri(&png(64, 64)), "detail": "auto"},
+        ],
+    }]});
+    let (status, body) = send(&h.app, "/v1/responses", body).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["usage"]["input_tokens"], 7, "{body}");
+    assert_expanded(&h.submitted);
+}
+
 #[tokio::test]
 async fn a_text_request_on_a_vision_load_carries_no_multimodal_part() {
     let h = vision();

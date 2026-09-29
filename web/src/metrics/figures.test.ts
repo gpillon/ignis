@@ -90,4 +90,12 @@ describe("computeFigures", () => {
     expect(figures.ttftMs).toBeNull();
     expect(figures.durationMs).toBe(30);
   });
+
+  it("shows the engine's queue as queue time and keeps it out of TTFT (GitHub #283)", () => {
+    const base = { sentAt: 0, firstTokenAt: 1300, lastTokenAt: 1500, endedAt: 1510, usage, finishReason: "stop", stopped: false };
+    const queued = computeFigures({ ...base, queuedAt: 5, admittedAt: 1205 });
+    expect(queued).toMatchObject({ ttftMs: 100, queueMs: 1200, durationMs: 1510 });
+    expect("queueMs" in computeFigures({ ...base, admittedAt: 5 })).toBe(false);
+    expect(computeFigures({ ...base, admittedAt: 5 }).ttftMs).toBe(1300);
+  });
 });

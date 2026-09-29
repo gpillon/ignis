@@ -28,6 +28,7 @@ fn input(model: &str, tokens: &[u32], max_tokens: Option<u32>) -> RequestInput {
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
     }
 }
 

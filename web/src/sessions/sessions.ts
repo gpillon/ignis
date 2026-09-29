@@ -27,6 +27,8 @@ export type Message = {
   images?: PromptImage[];
   reasoning: string;
   streaming: boolean;
+  /** The engine was full when this reply was sent: it waits for a lane before its first token. */
+  queued?: boolean;
   figures?: Figures;
   error?: string;
   /** Changed by hand after it was sent or generated; its figures measure the original. */

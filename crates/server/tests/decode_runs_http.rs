@@ -53,8 +53,19 @@ fn sse_chunks(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The content deltas of `chunks` (everything before the finish chunk) and
+/// what they spell. Tokens a reader finds already waiting go out as one delta
+/// (GitHub #282 follow-up), so how many deltas a run makes depends on how
+/// fast the reader was; what they spell does not.
+fn content(chunks: &[serde_json::Value]) -> (usize, String) {
+    let deltas: Vec<&serde_json::Value> =
+        chunks.iter().take_while(|c| c["choices"][0]["finish_reason"].is_null()).collect();
+    let text = deltas.iter().map(|c| c["choices"][0]["delta"]["content"].as_str().unwrap()).collect();
+    (deltas.len(), text)
+}
+
 #[tokio::test]
-async fn a_streaming_completion_over_runs_emits_one_delta_per_committed_token_in_order() {
+async fn a_streaming_completion_over_runs_streams_every_committed_token_in_order() {
     // k = 7: rounds commit 1, 8, 3 and then 1 of a run of 5, cut by the cap.
     let compute = Arc::new(MockCompute::with_runs(&[1, 8, 3, 5]));
     let app = app(compute.clone());
@@ -72,21 +83,14 @@ async fn a_streaming_completion_over_runs_emits_one_delta_per_committed_token_in
     assert_eq!(status, 200, "{body}");
 
     let chunks = sse_chunks(&body);
-    // 13 token deltas + the finish-reason chunk + the usage chunk.
-    assert_eq!(chunks.len(), 15, "{body}");
-
+    // Up to 13 token deltas + the finish-reason chunk + the usage chunk.
+    let (deltas, streamed) = content(&chunks);
+    assert!((1..=13).contains(&deltas), "{body}");
+    assert_eq!(chunks.len(), deltas + 2, "{body}");
     let expected: Vec<u32> = (0..13).map(|step| compute.token_for(0, step)).collect();
-    for (i, chunk) in chunks.iter().take(13).enumerate() {
-        let text = if i == 0 {
-            expected[i].to_string()
-        } else {
-            format!(" {}", expected[i])
-        };
-        assert_eq!(chunk["choices"][0]["delta"]["content"], text, "delta {i}: {body}");
-        assert!(chunk["choices"][0]["finish_reason"].is_null());
-    }
-    assert_eq!(chunks[13]["choices"][0]["finish_reason"], "length");
-    assert_eq!(chunks[14]["usage"]["completion_tokens"], 13, "usage counts committed tokens");
+    assert_eq!(streamed, SimpleTemplateProvider.render_tokens(&expected), "every token, in order");
+    assert_eq!(chunks[deltas]["choices"][0]["finish_reason"], "length");
+    assert_eq!(chunks[deltas + 1]["usage"]["completion_tokens"], 13, "usage counts committed tokens");
     assert_eq!(compute.decode_calls().len(), 4, "four rounds carried thirteen tokens");
 }
 
@@ -135,14 +139,10 @@ async fn a_run_cut_at_eos_streams_the_tokens_before_it_and_finishes_with_stop() 
     assert_eq!(status, 200, "{body}");
 
     let chunks = sse_chunks(&body);
-    assert_eq!(chunks.len(), 8, "6 token deltas + finish + usage: {body}");
-    let streamed: String = chunks
-        .iter()
-        .take(6)
-        .map(|c| c["choices"][0]["delta"]["content"].as_str().unwrap().to_string())
-        .collect();
+    let (deltas, streamed) = content(&chunks);
+    assert_eq!(chunks.len(), deltas + 2, "the token deltas + finish + usage: {body}");
     let expected: Vec<u32> = (0..6).map(|step| compute.token_for(0, step)).collect();
     assert_eq!(streamed, SimpleTemplateProvider.render_tokens(&expected));
-    assert_eq!(chunks[6]["choices"][0]["finish_reason"], "stop");
-    assert_eq!(chunks[7]["usage"]["completion_tokens"], 6);
+    assert_eq!(chunks[deltas]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(chunks[deltas + 1]["usage"]["completion_tokens"], 6);
 }
