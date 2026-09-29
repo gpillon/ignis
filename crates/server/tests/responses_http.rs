@@ -97,12 +97,12 @@ async fn a_streamed_response_is_the_standard_event_sequence() {
             "response.output_item.added",
             "response.content_part.added",
             "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
             "response.output_item.added",
             "response.function_call_arguments.delta",
             "response.function_call_arguments.done",
-            "response.output_item.done",
-            "response.output_text.done",
-            "response.content_part.done",
             "response.output_item.done",
             "response.completed",
         ]
@@ -117,13 +117,15 @@ async fn a_streamed_response_is_the_standard_event_sequence() {
     assert_eq!(event(8)["item"]["type"], "message");
     assert_eq!(event(10)["delta"], "Reading it. ");
     assert_eq!(event(10)["output_index"], 1);
-    assert_eq!(event(11)["item"]["type"], "function_call");
-    assert_eq!(event(11)["output_index"], 2);
-    assert_eq!(event(13)["name"], "read_file");
-    assert_eq!(event(13)["arguments"], r#"{"path":"a.txt"}"#);
-    assert_eq!(event(14)["item"]["call_id"], "call_0_0");
-    assert_eq!(event(14)["item"]["id"], "fc_0_0");
-    assert_eq!(event(17)["item"]["status"], "completed");
+    // The message is done before the call is added: items follow one another.
+    assert_eq!(event(13)["item"]["type"], "message");
+    assert_eq!(event(13)["item"]["status"], "completed");
+    assert_eq!(event(14)["item"]["type"], "function_call");
+    assert_eq!(event(14)["output_index"], 2);
+    assert_eq!(event(16)["name"], "read_file");
+    assert_eq!(event(16)["arguments"], r#"{"path":"a.txt"}"#);
+    assert_eq!(event(17)["item"]["call_id"], "call_0_0");
+    assert_eq!(event(17)["item"]["id"], "fc_0_0");
     let done = &event(18)["response"];
     assert_eq!(done["status"], "completed");
     let types: Vec<&str> = done["output"].as_array().unwrap().iter().map(|i| i["type"].as_str().unwrap()).collect();
@@ -152,6 +154,50 @@ async fn the_non_streaming_body_is_the_terminal_events_response() {
     assert_eq!(body, terminal);
     assert_eq!(body["object"], "response");
     assert_eq!(body["tools"][0]["name"], "read_file", "tools echo in the shape they were sent");
+}
+
+/// Text after a call is a new message item, added after the call is done;
+/// continuing from that output renders the one assistant turn chat
+/// completions would.
+#[tokio::test]
+async fn text_after_a_call_opens_a_new_message_item() {
+    let mock = MockCompute::new();
+    let script = Script::new(HashMap::from([
+        (mock.token_for(0, 0), "before "),
+        (mock.token_for(0, 1), "<tool_call>\n<function=a>\n</function>\n</tool_call>"),
+        (mock.token_for(0, 2), " after"),
+    ]));
+    let compute = Arc::new(MockCompute::new());
+    compute.eos_after(0, 3);
+    let app = server(&script, SchedulerConfig::default(), compute).app();
+    let body = json!({ "model": MODEL, "input": "go", "max_output_tokens": 8, "enable_thinking": false, "stream": true });
+    let (status, _, streamed) = post(&app, "/v1/responses", body).await;
+    assert_eq!(status, 200, "{streamed}");
+    let events = sse_events(&streamed);
+    let items: Vec<(String, String)> = events
+        .iter()
+        .filter(|(name, _)| name.starts_with("response.output_item."))
+        .map(|(name, e)| (name.trim_start_matches("response.output_item.").to_owned(), e["item"]["id"].as_str().unwrap().to_owned()))
+        .collect();
+    let pairs = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+    assert_eq!(
+        items,
+        pairs(&[("added", "msg_0"), ("done", "msg_0"), ("added", "fc_0_0"), ("done", "fc_0_0"), ("added", "msg_0_1"), ("done", "msg_0_1")])
+    );
+    let output = events.last().unwrap().1["response"]["output"].clone();
+
+    let mut conversation = vec![json!({ "role": "user", "content": "go" })];
+    conversation.extend(output.as_array().unwrap().iter().cloned());
+    let (chat, responses, _) = render_both(
+        json!({ "model": MODEL, "max_tokens": 1, "messages": [
+            { "role": "user", "content": "go" },
+            { "role": "assistant", "content": "before  after",
+              "tool_calls": [{ "id": "call_0_0", "type": "function", "function": { "name": "a", "arguments": "{}" } }] }
+        ] }),
+        json!({ "model": MODEL, "max_output_tokens": 1, "input": conversation }),
+    )
+    .await;
+    assert_eq!(responses, chat);
 }
 
 // ── acceptance 3: the same prompt as chat completions ────────────────────

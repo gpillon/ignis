@@ -602,6 +602,26 @@ fn number(name: &str, value: Option<JsonValue>, default: f64) -> Result<f64, Str
     }
 }
 
+/// An optional boolean field: absent or `null` is `None`, anything but a
+/// boolean is refused.
+pub(crate) fn optional_bool(value: Option<&JsonValue>, name: &str) -> Result<Option<bool>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{name} must be a boolean")),
+    }
+}
+
+/// An optional string field: absent or `null` is `None`, anything but a
+/// string is refused.
+pub(crate) fn optional_str<'a>(value: Option<&'a JsonValue>, name: &str) -> Result<Option<&'a str>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("{name} must be a string")),
+    }
+}
+
 fn signed_integer(message: &str, value: Option<JsonValue>, default: i64) -> Result<i64, String> {
     match value {
         None => Ok(default),

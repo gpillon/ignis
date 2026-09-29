@@ -45,7 +45,7 @@ use tracing::Instrument;
 use crate::api::{self, ApiError, CancelOnDrop};
 use crate::responses::events::{Ending, ResponseEvents};
 use crate::responses::input::{self, CreateResponse, Prepared};
-use crate::responses::queue::Admission;
+use crate::responses::queue::{Admission, Hub};
 use crate::responses::{created_at, drive, Driven};
 use crate::Server;
 
@@ -220,7 +220,9 @@ impl Connection {
     }
 
     async fn run(mut self) {
-        self.server.responses.socket(true);
+        // Counted until this future is dropped, however it ends: a closed
+        // socket, or a task aborted or panicking.
+        let _open = OpenSocket::new(Arc::clone(&self.server.responses));
         loop {
             tokio::select! {
                 frame = self.socket.recv() => match frame {
@@ -254,7 +256,6 @@ impl Connection {
         for active in self.active.values() {
             active.task.abort();
         }
-        self.server.responses.socket(false);
     }
 
     /// Queue a frame for the writer, behind the frames already queued.
@@ -290,10 +291,10 @@ impl Connection {
     /// `response.create`: checked and resolved now, started when its stream
     /// and a place are free.
     fn create(&mut self, event: Map<String, JsonValue>) {
-        let stream: StreamKey = match event.get("stream_id") {
-            None | Some(JsonValue::Null) => None,
-            Some(JsonValue::String(id)) if valid_stream_id(id) => Some(id.clone()),
-            Some(_) => {
+        let stream: StreamKey = match api::optional_str(event.get("stream_id"), "stream_id") {
+            Ok(None) => None,
+            Ok(Some(id)) if valid_stream_id(id) => Some(id.to_owned()),
+            _ => {
                 return self.send(coded_error(
                     400,
                     "invalid_stream_id",
@@ -313,53 +314,66 @@ impl Connection {
                 &stream,
             ));
         }
-        self.streams.entry(stream.clone()).or_default();
-        let body: CreateResponse = match serde_json::from_value(JsonValue::Object(event)) {
-            Ok(body) => body,
-            Err(e) => {
-                return self.send(error_event("invalid_request_error", &format!("response.create: {e}"), None, &stream))
+        // The parent this request names, read even when the rest of the body
+        // is not: a refused same-stream continuation evicts it.
+        let named_parent = event.get("previous_response_id").and_then(JsonValue::as_str).map(str::to_owned);
+        match self.accept(event, &stream) {
+            Ok(job) => {
+                // Only an accepted request takes a name of the 32.
+                self.streams.entry(stream).or_default();
+                self.waiting.push_back(job);
+                self.pump();
             }
-        };
-        let warm_up = match &body.generate {
-            None | Some(JsonValue::Null) => false,
-            Some(JsonValue::Bool(generate)) => !generate,
-            Some(_) => {
-                return self.send(error_event("invalid_request_error", "generate must be a boolean", Some("generate"), &stream))
+            Err(refusal) => {
+                if let Some(parent) = named_parent {
+                    self.evict(&stream, &parent);
+                }
+                self.send(refusal);
             }
-        };
+        }
+    }
+
+    /// A `response.create`'s body, checked, with the conversation it
+    /// continues — or the `error` event refusing it.
+    fn accept(&self, event: Map<String, JsonValue>, stream: &StreamKey) -> Result<Job, JsonValue> {
+        let body: CreateResponse = serde_json::from_value(JsonValue::Object(event))
+            .map_err(|e| error_event("invalid_request_error", &format!("response.create: {e}"), None, stream))?;
+        let warm_up = api::optional_bool(body.generate.as_ref(), "generate")
+            .map_err(|message| error_event("invalid_request_error", &message, Some("generate"), stream))?
+            .is_some_and(|generate| !generate);
+        let previous = api::optional_str(body.previous_response_id.as_ref(), "previous_response_id")
+            .map_err(|message| error_event("invalid_request_error", &message, Some("previous_response_id"), stream))?;
         // Resolved at receipt, and the history copied: a parent superseded
         // while this request waits is still the one it named.
-        let (history, parent) = match &body.previous_response_id {
-            None | Some(JsonValue::Null) => (Vec::new(), None),
-            Some(JsonValue::String(id)) => {
+        let (history, parent) = match previous {
+            None => (Vec::new(), None),
+            Some(id) => {
                 let found = self
                     .streams
                     .iter()
-                    .find_map(|(key, state)| state.latest.as_ref().filter(|c| &c.id == id).map(|c| (key, c)));
-                match found {
-                    Some((key, cached)) => (cached.items.clone(), Some(Parent { id: id.clone(), stream: key.clone() })),
-                    None => {
-                        return self.send(coded_error(
+                    .find_map(|(key, state)| state.latest.as_ref().filter(|c| c.id == id).map(|c| (key, c)))
+                    .ok_or_else(|| {
+                        coded_error(
                             400,
                             "previous_response_not_found",
                             &format!("Previous response with id '{id}' not found."),
                             Some("previous_response_id"),
-                            &stream,
-                        ))
-                    }
-                }
-            }
-            Some(_) => {
-                return self.send(error_event(
-                    "invalid_request_error",
-                    "previous_response_id must be a string",
-                    Some("previous_response_id"),
-                    &stream,
-                ))
+                            stream,
+                        )
+                    })?;
+                (found.1.items.clone(), Some(Parent { id: id.to_owned(), stream: found.0.clone() }))
             }
         };
-        self.waiting.push_back(Job { stream, body, history, parent, warm_up });
-        self.pump();
+        Ok(Job { stream: stream.clone(), body, history, parent, warm_up })
+    }
+
+    /// A same-stream continuation of `parent` failed: `stream` forgets it.
+    fn evict(&mut self, stream: &StreamKey, parent: &str) {
+        if let Some(state) = self.streams.get_mut(stream) {
+            if state.latest.as_ref().is_some_and(|c| c.id == parent) {
+                state.latest = None;
+            }
+        }
     }
 
     /// Start every waiting request whose stream is free, in arrival order,
@@ -407,9 +421,7 @@ impl Connection {
             // named; a fork that failed leaves its source alone.
             Outcome::Failed => {
                 if let Some(parent) = active.parent.filter(|p| p.stream == active.stream) {
-                    if state.latest.as_ref().is_some_and(|c| c.id == parent.id) {
-                        state.latest = None;
-                    }
+                    self.evict(&active.stream, &parent.id);
                 }
             }
         }
@@ -419,21 +431,10 @@ impl Connection {
     /// `response.cancel`: the named response, or without a name the default
     /// stream's, running or queued.
     fn cancel(&mut self, event: &Map<String, JsonValue>) {
-        let target = match event.get("response_id") {
-            Some(JsonValue::String(id)) => {
-                self.active.values_mut().find(|a| a.response_id.as_deref() == Some(id.as_str()))
-            }
-            None | Some(JsonValue::Null) => {
-                self.active.values_mut().find(|a| a.stream.is_none() && a.response_id.is_some())
-            }
-            Some(_) => {
-                return self.send(error_event(
-                    "invalid_request_error",
-                    "response_id must be a string",
-                    Some("response_id"),
-                    &None,
-                ))
-            }
+        let target = match api::optional_str(event.get("response_id"), "response_id") {
+            Ok(Some(id)) => self.active.values_mut().find(|a| a.response_id.as_deref() == Some(id)),
+            Ok(None) => self.active.values_mut().find(|a| a.stream.is_none() && a.response_id.is_some()),
+            Err(message) => return self.send(error_event("invalid_request_error", &message, Some("response_id"), &None)),
         };
         match target.and_then(|active| active.cancel.take()) {
             Some(cancel) => {
@@ -448,6 +449,23 @@ impl Connection {
                 self.send(coded_error(400, "response_not_found", &message, Some("response_id"), &None))
             }
         }
+    }
+}
+
+/// One open socket in the `ignis_responses_sockets` gauge, for as long as it
+/// lives.
+struct OpenSocket(Arc<Hub>);
+
+impl OpenSocket {
+    fn new(hub: Arc<Hub>) -> Self {
+        hub.socket(true);
+        Self(hub)
+    }
+}
+
+impl Drop for OpenSocket {
+    fn drop(&mut self) {
+        self.0.socket(false);
     }
 }
 

@@ -15,14 +15,13 @@
 //! terminal event's `response`. So the three transports cannot disagree on a
 //! payload.
 //!
-//! **Output items**, in generation order: a `reasoning` item when the
-//! thinking channel produced text, a `message` item when the content channel
-//! did, and one `function_call` item per scanned tool call. The reasoning
-//! item closes as soon as the content channel produces anything. The message
-//! item stays open until the response ends, so text the model writes after a
-//! tool call still lands in the one message, as it lands in the one
-//! `content` of a chat completion; a function call found meanwhile is added,
-//! and done, at the next output index.
+//! **Output items**, in generation order and one after another — each
+//! added, filled and done before the next is added: a `reasoning` item when
+//! the thinking channel produced text, a `message` item when the content
+//! channel did, and one `function_call` item per scanned tool call. The
+//! reasoning item closes as soon as the content channel produces anything; a
+//! call closes the message before it, and text the model writes after a call
+//! opens a new message item.
 
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
@@ -119,9 +118,8 @@ pub(crate) struct OutputTokensDetails {
     pub reasoning_tokens: u32,
 }
 
-/// One output item, as the terminal response carries it (documentation of
-/// the shapes this module writes; the items themselves are built as JSON).
-#[allow(dead_code)]
+/// One output item, as its events and the response carry it: the one type
+/// every item on the wire is serialized from.
 #[derive(Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum OutputItem {
@@ -131,30 +129,45 @@ pub(crate) enum OutputItem {
         id: String,
         #[schema(value_type = Vec<Object>)]
         summary: Vec<JsonValue>,
-        #[schema(value_type = Vec<Object>)]
-        content: Vec<JsonValue>,
+        content: Vec<Part>,
     },
     /// The content channel: one `output_text` part.
     Message {
         id: String,
-        status: String,
-        role: String,
-        #[schema(value_type = Vec<Object>)]
-        content: Vec<JsonValue>,
+        status: &'static str,
+        role: &'static str,
+        content: Vec<Part>,
     },
     /// One tool call, `arguments` a JSON-encoded object.
     FunctionCall {
         id: String,
+        status: &'static str,
         call_id: String,
         name: String,
         arguments: String,
-        status: String,
     },
 }
 
-/// An output item still receiving content: where it sits and what it holds.
+/// A content part of an output item.
+#[derive(Clone, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum Part {
+    ReasoningText {
+        text: String,
+    },
+    OutputText {
+        text: String,
+        /// Always empty: this server annotates nothing.
+        #[schema(value_type = Vec<Object>)]
+        annotations: Vec<JsonValue>,
+    },
+}
+
+/// An output item still receiving content: where it sits, its id, and what
+/// it holds.
 struct OpenItem {
     index: usize,
+    id: String,
     text: String,
 }
 
@@ -172,15 +185,18 @@ pub(crate) enum Ending {
 /// Responses events that event makes available, in order.
 pub(crate) struct ResponseEvents {
     response: ResponseObject,
-    /// What the item ids are derived from: `rs_<suffix>`, `msg_<suffix>`,
-    /// `fc_<suffix>_<n>`, and `call_<suffix>_<n>` for a call's `call_id`, so
-    /// no two responses in one conversation reuse a `call_id`.
+    /// What the item ids are derived from: `rs_<suffix>`, `msg_<suffix>`
+    /// (`msg_<suffix>_<n>` for text after a call), `fc_<suffix>_<n>`, and
+    /// `call_<suffix>_<n>` for a call's `call_id`, so no two responses in one
+    /// conversation reuse a `call_id`.
     suffix: String,
     decoder: OutputDecoder,
     scanner: ToolCallScanner,
     sequence: u64,
     reasoning: Option<OpenItem>,
     message: Option<OpenItem>,
+    /// Message items opened so far.
+    messages: usize,
     prompt_tokens: u32,
     cached_tokens: u32,
     output_tokens: u32,
@@ -207,6 +223,7 @@ impl ResponseEvents {
             sequence: 0,
             reasoning: None,
             message: None,
+            messages: 0,
             prompt_tokens,
             cached_tokens: 0,
             output_tokens: 0,
@@ -333,10 +350,10 @@ impl ResponseEvents {
                 self.open_reasoning(out);
                 let item = self.reasoning.as_mut().expect("just opened");
                 item.text.push_str(&delta.text);
-                let (index, item_id) = (item.index, format!("rs_{}", self.suffix));
+                let (index, id) = (item.index, item.id.clone());
                 out.push(self.event(json!({
                     "type": "response.reasoning_text.delta",
-                    "item_id": item_id,
+                    "item_id": id,
                     "output_index": index,
                     "content_index": 0,
                     "delta": delta.text,
@@ -350,7 +367,9 @@ impl ResponseEvents {
         }
     }
 
-    /// One tool-call scanner event: message text, or a whole call.
+    /// One tool-call scanner event: message text, or a whole call. Items
+    /// follow one another: a call closes the message before it, and text
+    /// after a call opens a new one.
     fn scanned(&mut self, event: ToolEvent, out: &mut Vec<JsonValue>) {
         self.close_reasoning(out);
         match event {
@@ -358,37 +377,59 @@ impl ResponseEvents {
                 self.open_message(out);
                 let item = self.message.as_mut().expect("just opened");
                 item.text.push_str(&text);
-                let (index, item_id) = (item.index, format!("msg_{}", self.suffix));
+                let (index, id) = (item.index, item.id.clone());
                 out.push(self.event(json!({
                     "type": "response.output_text.delta",
-                    "item_id": item_id,
+                    "item_id": id,
                     "output_index": index,
                     "content_index": 0,
                     "delta": text,
                     "logprobs": [],
                 })));
             }
-            ToolEvent::Call(call) => self.function_call(call, out),
+            ToolEvent::Call(call) => {
+                self.close_message("completed", out);
+                self.function_call(call, out);
+            }
         }
+    }
+
+    /// Add `item` at the next output index (`response.output_item.added`).
+    fn add(&mut self, item: OutputItem, out: &mut Vec<JsonValue>) -> usize {
+        let index = self.response.output.len();
+        let item = serde_json::to_value(item).expect("an item serializes");
+        self.response.output.push(item.clone());
+        out.push(self.event(json!({ "type": "response.output_item.added", "output_index": index, "item": item })));
+        index
+    }
+
+    /// The item at `index` is final (`response.output_item.done`).
+    fn done(&mut self, index: usize, item: OutputItem, out: &mut Vec<JsonValue>) {
+        let item = serde_json::to_value(item).expect("an item serializes");
+        self.response.output[index] = item.clone();
+        out.push(self.event(json!({ "type": "response.output_item.done", "output_index": index, "item": item })));
+    }
+
+    /// A content part's `added` or `done` event.
+    fn part_event(&mut self, kind: &str, item: &OpenItem, part: Part) -> JsonValue {
+        self.event(json!({
+            "type": kind,
+            "item_id": item.id,
+            "output_index": item.index,
+            "content_index": 0,
+            "part": part,
+        }))
     }
 
     fn open_reasoning(&mut self, out: &mut Vec<JsonValue>) {
         if self.reasoning.is_some() {
             return;
         }
-        let index = self.response.output.len();
-        let item = json!({ "id": format!("rs_{}", self.suffix), "type": "reasoning", "summary": [], "content": [] });
-        self.response.output.push(item.clone());
-        self.reasoning = Some(OpenItem { index, text: String::new() });
-        out.push(self.event(json!({ "type": "response.output_item.added", "output_index": index, "item": item })));
-        let item_id = format!("rs_{}", self.suffix);
-        out.push(self.event(json!({
-            "type": "response.content_part.added",
-            "item_id": item_id,
-            "output_index": index,
-            "content_index": 0,
-            "part": { "type": "reasoning_text", "text": "" },
-        })));
+        let id = format!("rs_{}", self.suffix);
+        let index = self.add(OutputItem::Reasoning { id: id.clone(), summary: Vec::new(), content: Vec::new() }, out);
+        let item = OpenItem { index, id, text: String::new() };
+        out.push(self.part_event("response.content_part.added", &item, Part::ReasoningText { text: String::new() }));
+        self.reasoning = Some(item);
     }
 
     /// Close the reasoning item: its text is final once the content channel
@@ -396,128 +437,88 @@ impl ResponseEvents {
     fn close_reasoning(&mut self, out: &mut Vec<JsonValue>) {
         // Taken: a second close is a no-op, and nothing reopens it, since the
         // decoder leaves the reasoning channel once and for good.
-        let Some(OpenItem { index, text }) = self.reasoning.take() else {
+        let Some(item) = self.reasoning.take() else {
             return;
         };
-        let item_id = format!("rs_{}", self.suffix);
-        let part = json!({ "type": "reasoning_text", "text": text });
+        let part = Part::ReasoningText { text: item.text.clone() };
         out.push(self.event(json!({
             "type": "response.reasoning_text.done",
-            "item_id": item_id,
-            "output_index": index,
+            "item_id": item.id,
+            "output_index": item.index,
             "content_index": 0,
-            "text": text,
+            "text": item.text,
         })));
-        out.push(self.event(json!({
-            "type": "response.content_part.done",
-            "item_id": item_id,
-            "output_index": index,
-            "content_index": 0,
-            "part": part,
-        })));
-        let item = json!({ "id": item_id, "type": "reasoning", "summary": [], "content": [part] });
-        self.response.output[index] = item.clone();
-        out.push(self.event(json!({ "type": "response.output_item.done", "output_index": index, "item": item })));
+        out.push(self.part_event("response.content_part.done", &item, part.clone()));
+        let done = OutputItem::Reasoning { id: item.id, summary: Vec::new(), content: vec![part] };
+        self.done(item.index, done, out);
     }
 
     fn open_message(&mut self, out: &mut Vec<JsonValue>) {
         if self.message.is_some() {
             return;
         }
-        let index = self.response.output.len();
-        let item_id = format!("msg_{}", self.suffix);
-        let item = json!({
-            "id": item_id,
-            "type": "message",
-            "status": "in_progress",
-            "role": "assistant",
-            "content": [],
-        });
-        self.response.output.push(item.clone());
-        self.message = Some(OpenItem { index, text: String::new() });
-        out.push(self.event(json!({ "type": "response.output_item.added", "output_index": index, "item": item })));
-        out.push(self.event(json!({
-            "type": "response.content_part.added",
-            "item_id": item_id,
-            "output_index": index,
-            "content_index": 0,
-            "part": { "type": "output_text", "text": "", "annotations": [] },
-        })));
+        // `msg_<suffix>`, and `msg_<suffix>_<n>` for text after the n-th call.
+        let id = match self.messages {
+            0 => format!("msg_{}", self.suffix),
+            n => format!("msg_{}_{n}", self.suffix),
+        };
+        self.messages += 1;
+        let added = OutputItem::Message { id: id.clone(), status: "in_progress", role: "assistant", content: Vec::new() };
+        let index = self.add(added, out);
+        let item = OpenItem { index, id, text: String::new() };
+        let part = Part::OutputText { text: String::new(), annotations: Vec::new() };
+        out.push(self.part_event("response.content_part.added", &item, part));
+        self.message = Some(item);
     }
 
     /// Close the message item with `status`.
-    fn close_message(&mut self, status: &str, out: &mut Vec<JsonValue>) {
-        let Some(OpenItem { index, text }) = self.message.take() else {
+    fn close_message(&mut self, status: &'static str, out: &mut Vec<JsonValue>) {
+        let Some(item) = self.message.take() else {
             return;
         };
-        let item_id = format!("msg_{}", self.suffix);
-        let part = json!({ "type": "output_text", "text": text, "annotations": [] });
+        let part = Part::OutputText { text: item.text.clone(), annotations: Vec::new() };
         out.push(self.event(json!({
             "type": "response.output_text.done",
-            "item_id": item_id,
-            "output_index": index,
+            "item_id": item.id,
+            "output_index": item.index,
             "content_index": 0,
-            "text": text,
+            "text": item.text,
             "logprobs": [],
         })));
-        out.push(self.event(json!({
-            "type": "response.content_part.done",
-            "item_id": item_id,
-            "output_index": index,
-            "content_index": 0,
-            "part": part,
-        })));
-        let item = json!({
-            "id": item_id,
-            "type": "message",
-            "status": status,
-            "role": "assistant",
-            "content": [part],
-        });
-        self.response.output[index] = item.clone();
-        out.push(self.event(json!({ "type": "response.output_item.done", "output_index": index, "item": item })));
+        out.push(self.part_event("response.content_part.done", &item, part.clone()));
+        let done = OutputItem::Message { id: item.id, status, role: "assistant", content: vec![part] };
+        self.done(item.index, done, out);
     }
 
     /// One whole tool call: its item is added, its arguments streamed in one
     /// delta (the call is parsed out of a closed block, so it is whole by the
     /// time it is known), and it is done.
     fn function_call(&mut self, call: ToolCall, out: &mut Vec<JsonValue>) {
-        let index = self.response.output.len();
-        let item_id = format!("fc_{}_{}", self.suffix, call.index);
+        let id = format!("fc_{}_{}", self.suffix, call.index);
         let call_id = format!("call_{}_{}", self.suffix, call.index);
-        let added = json!({
-            "id": item_id,
-            "type": "function_call",
-            "status": "in_progress",
-            "call_id": call_id,
-            "name": call.name,
-            "arguments": "",
-        });
-        self.response.output.push(added.clone());
-        out.push(self.event(json!({ "type": "response.output_item.added", "output_index": index, "item": added })));
+        let added = OutputItem::FunctionCall {
+            id: id.clone(),
+            status: "in_progress",
+            call_id: call_id.clone(),
+            name: call.name.clone(),
+            arguments: String::new(),
+        };
+        let index = self.add(added, out);
         out.push(self.event(json!({
             "type": "response.function_call_arguments.delta",
-            "item_id": item_id,
+            "item_id": id,
             "output_index": index,
             "delta": call.arguments,
         })));
         out.push(self.event(json!({
             "type": "response.function_call_arguments.done",
-            "item_id": item_id,
+            "item_id": id,
             "output_index": index,
             "name": call.name,
             "arguments": call.arguments,
         })));
-        let item = json!({
-            "id": item_id,
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call_id,
-            "name": call.name,
-            "arguments": call.arguments,
-        });
-        self.response.output[index] = item.clone();
-        out.push(self.event(json!({ "type": "response.output_item.done", "output_index": index, "item": item })));
+        let done = OutputItem::FunctionCall { id, status: "completed", call_id, name: call.name, arguments: call.arguments };
+        self.done(index, done, out);
     }
 
     /// End the response: everything still held back — the decoder's tail and

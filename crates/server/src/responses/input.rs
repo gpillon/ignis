@@ -176,11 +176,9 @@ pub(crate) async fn prepare(
     if req.background.as_ref().is_some_and(|b| b == &JsonValue::Bool(true)) {
         return Err(api::bad_request_param("background responses are not supported", "background"));
     }
-    let instructions = match &req.instructions {
-        None | Some(JsonValue::Null) => None,
-        Some(JsonValue::String(s)) => Some(s.clone()),
-        Some(_) => return Err(api::bad_request_param("instructions must be a string", "instructions")),
-    };
+    let instructions = api::optional_str(req.instructions.as_ref(), "instructions")
+        .map_err(|message| api::bad_request_param(&message, "instructions"))?
+        .map(str::to_owned);
     let tools = chat_tools(req.tools.as_deref().unwrap_or_default())?;
     let tools = api::resolve_tools(Some(tools), req.tool_choice.clone())?;
 
@@ -312,9 +310,10 @@ fn input_items(input: Option<JsonValue>) -> Result<Vec<JsonValue>, Response> {
 /// `function_call`s, in whatever order a client lists them — become one
 /// assistant message, as the turn is one message on chat completions:
 /// reasoning as its `reasoning_content`, text as its `content`, calls as its
-/// `tool_calls`. A turn ends at any other item, and a second `reasoning` or
-/// a second assistant `message` starts the next one, since a response has at
-/// most one of each. `function_call_output` is a tool message.
+/// `tool_calls`. A turn ends at any other item, and a second `reasoning`
+/// starts the next one, as does a second assistant `message` — unless a call
+/// came between them, which is how a response lists text written after a
+/// call. `function_call_output` is a tool message.
 pub(crate) fn messages(items: &[JsonValue]) -> Result<Vec<ChatMessage>, Response> {
     let mut messages = Vec::new();
     let mut turn: Option<Turn> = None;
@@ -332,6 +331,14 @@ pub(crate) fn messages(items: &[JsonValue]) -> Result<Vec<ChatMessage>, Response
             "message" if object.get("role").and_then(JsonValue::as_str) == Some("assistant") => {
                 let message = chat_message(item, index)?;
                 let current = turn.get_or_insert_with(Turn::default);
+                // Text the model wrote after a call is a second message item
+                // of the same response, and the same turn's `content` on chat
+                // completions: joined, as that content joins it.
+                if current.has_message && current.message.tool_calls.is_some() {
+                    let joined = current.message.content.text() + &message.content.text();
+                    current.message.content = MessageContent::Text(joined);
+                    continue;
+                }
                 if current.has_message {
                     messages.push(turn.take().expect("open").message);
                 }

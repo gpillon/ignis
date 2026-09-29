@@ -68,6 +68,12 @@ enum Command {
         notes: RequestNotes,
         reply: oneshot::Sender<Result<(RequestId, EventStream), SubmitError>>,
     },
+    /// Whether the scheduler would refuse a request for good, whatever is
+    /// in flight (GitHub #282, [`Scheduler::refusal`]).
+    Refusal {
+        input: RequestInput,
+        reply: oneshot::Sender<Option<SubmitError>>,
+    },
     /// Abort an in-flight request (its HTTP client disconnected). No
     /// reply channel: the caller is a `Drop` impl with nothing to await.
     Cancel {
@@ -310,6 +316,18 @@ impl Engine {
             .expect("the model thread replies to every submit before it can exit")
     }
 
+    /// Whether the scheduler would refuse `input` for good — unknown model,
+    /// past the context, larger than the pool — whatever is in flight
+    /// (GitHub #282): what a submission that met [`SubmitError::Full`] asks
+    /// before it waits, since the scheduler answers `Full` first.
+    pub async fn refusal(&self, input: RequestInput) -> Option<SubmitError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Refusal { input, reply })
+            .expect("the model thread outlives every Engine handle");
+        reply_rx.await.expect("the model thread replies to every question before it can exit")
+    }
+
     /// Ask the model thread to abort an in-flight request. This is
     /// fire-and-forget so an HTTP response body's `Drop` can call it.
     pub fn cancel(&self, request: RequestId) {
@@ -406,6 +424,9 @@ fn handle_command(
             });
             // A dropped receiver (the caller gave up) is not an error here.
             let _ = reply.send(result);
+        }
+        Command::Refusal { input, reply } => {
+            let _ = reply.send(scheduler.refusal(&input));
         }
         Command::Cancel { request } => {
             if scheduler.cancel(request) {

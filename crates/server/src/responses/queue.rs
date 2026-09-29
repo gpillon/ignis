@@ -93,6 +93,11 @@ pub(crate) enum Admission {
 
 impl AdmissionQueue {
     /// Submit `input`, or queue it when the engine is full.
+    ///
+    /// A request the engine would refuse for good is refused here, before it
+    /// queues: the scheduler answers `Full` ahead of every other refusal, and
+    /// a request that waits behind others is not submitted at all, so either
+    /// way only asking says whether it could ever be admitted.
     pub(crate) async fn submit(
         self: &Arc<Self>,
         engine: &Engine,
@@ -107,7 +112,10 @@ impl AdmissionQueue {
                 Err(refused) => return Admission::Refused(refused),
             }
         }
-        Admission::Queued(self.join())
+        match engine.refusal(input.clone()).await {
+            Some(refused) => Admission::Refused(refused),
+            None => Admission::Queued(self.join()),
+        }
     }
 
     /// Wait for `ticket`'s turn and the engine's room, then submit. The

@@ -65,6 +65,14 @@ family takes the decision family's exception: absent until the first `locate`.
 A shortlist's labelled `choice`s and yes/no are steps of its one `locate`,
 not decisions: they move neither `ignis_decisions_total{type="choice"}` nor
 the answer-mass histogram. No answer mass, as for every `locate`.
+Amended 2026-09-29 (#282, spec responses-api/01): two unlabelled gauges for
+the Responses API's WebSocket mode, `ignis_responses_sockets` (open sockets)
+and `ignis_responses_queued_requests` (socket requests waiting in the
+server-wide admission queue), set by the server as sockets open and close and
+as requests join and leave the queue. A socket request the engine finds full
+is queued, not rejected, so it does not move `ignis_requests_rejected_total`;
+one refused for good (unknown model, context, size) does, as on HTTP. Both
+are exported at zero like every other gauge.
 
 ## Context
 

@@ -93,7 +93,9 @@ pub(crate) fn created_at(server: &Server) -> u64 {
 }
 
 /// One event of a streamed response (`text/event-stream`: an `event:` line
-/// naming `type`, then a `data:` line carrying the whole event).
+/// naming `type`, then a `data:` line carrying the whole event). Documents
+/// the events rather than building them; a test holds it to the golden
+/// transcripts (ADR 0036).
 #[allow(dead_code)]
 #[derive(Serialize, ToSchema)]
 struct ResponseStreamEvent {
@@ -140,10 +142,9 @@ pub(crate) async fn create_response(
     if let Some(refusal) = input::http_refusal(&req) {
         return refusal;
     }
-    let stream = match &req.stream {
-        None | Some(JsonValue::Null) => false,
-        Some(JsonValue::Bool(stream)) => *stream,
-        Some(_) => return api::bad_request_param("stream must be a boolean", "stream"),
+    let stream = match api::optional_bool(req.stream.as_ref(), "stream") {
+        Ok(stream) => stream.unwrap_or(false),
+        Err(message) => return api::bad_request_param(&message, "stream"),
     };
     let prepared = match input::prepare(&server, req, Vec::new(), false).await {
         Ok(prepared) => prepared,
@@ -243,5 +244,59 @@ impl Stream for EventSse {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utoipa::PartialSchema;
+
+    /// A schema's property names and its required ones.
+    fn fields<T: PartialSchema>() -> (Vec<String>, Vec<String>) {
+        let schema = serde_json::to_value(T::schema()).expect("a schema serializes");
+        let names = |key: &str| -> Vec<String> {
+            match &schema[key] {
+                JsonValue::Object(map) => map.keys().cloned().collect(),
+                JsonValue::Array(list) => list.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
+                _ => Vec::new(),
+            }
+        };
+        (names("properties"), names("required"))
+    }
+
+    /// ADR 0036: the documented event shape is the one the socket sends. Every
+    /// event of the golden transcripts carries what [`ResponseStreamEvent`]
+    /// requires, and every `response` in them is exactly a
+    /// [`ResponseObject`] — each documented field, and no other. (Output
+    /// items need no check: they are serialized from `OutputItem` itself.)
+    #[test]
+    fn the_golden_transcripts_match_the_documented_event_shapes() {
+        let (_, required) = fields::<ResponseStreamEvent>();
+        let (object_fields, object_required) = fields::<ResponseObject>();
+        assert!(required.contains(&"sequence_number".to_owned()), "{required:?}");
+        assert!(object_required.contains(&"output".to_owned()), "{object_required:?}");
+        let transcripts = [
+            include_str!("../../tests/fixtures/responses/named_stream_function_call.jsonl"),
+            include_str!("../../tests/fixtures/responses/queued_then_cancelled.jsonl"),
+        ];
+        let mut responses = 0;
+        for line in transcripts.iter().flat_map(|t| t.lines()) {
+            let event: JsonValue = serde_json::from_str(line).expect("one JSON event per line");
+            for field in &required {
+                assert!(event.get(field).is_some(), "no `{field}` in {line}");
+            }
+            if let Some(response) = event.get("response") {
+                responses += 1;
+                let keys: Vec<&String> = response.as_object().expect("an object").keys().collect();
+                for key in &keys {
+                    assert!(object_fields.contains(key), "`{key}` is not a documented response field: {line}");
+                }
+                for field in &object_required {
+                    assert!(response.get(field).is_some(), "no `{field}` in {line}");
+                }
+            }
+        }
+        assert!(responses >= 5, "the transcripts carry lifecycle events");
     }
 }

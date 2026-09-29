@@ -400,8 +400,17 @@ async fn stream_ids_are_checked_and_limited_to_32_names() {
         assert_eq!(refused["error"]["code"], "invalid_stream_id", "{bad}");
         assert_eq!(refused["error"]["param"], "stream_id");
     }
-    // Each name is taken by a request refused before it runs, which still
-    // counts: 32 names, and the 33rd is refused.
+    // A create whose body is refused on receipt takes no name.
+    for n in 0..3 {
+        let mut malformed = create(&short("hi"), Some(&format!("m{n}")));
+        malformed["max_output_tokens"] = json!("many");
+        send(&mut socket, malformed).await;
+        let refused = next_event(&mut socket).await;
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["stream_id"], format!("m{n}"));
+    }
+    // Each name is taken by a request accepted and then refused before it
+    // runs, which still counts: 32 names, and the 33rd is refused.
     let mut hosted = short("hi");
     hosted["tools"] = json!([{ "type": "file_search" }]);
     for n in 0..32 {
@@ -541,6 +550,17 @@ async fn a_failed_same_stream_continuation_evicts_its_parent_and_a_failed_fork_d
     send(&mut socket, create(&continuing(&parent), Some("s3"))).await;
     let fork = stream_until_terminal(&mut socket, Some("s3")).await.pop().unwrap();
     assert_eq!(fork["type"], "response.incomplete", "a fork onto a new stream: {fork}");
+
+    // A same-stream continuation refused on receipt, before its parent was
+    // even resolved, evicts it too.
+    send(&mut socket, create(&short("one"), Some("s5"))).await;
+    let parent5 = stream_until_terminal(&mut socket, Some("s5")).await.pop().unwrap()["response"]["id"].clone();
+    let mut malformed = continuing(&parent5);
+    malformed["generate"] = json!("yes");
+    send(&mut socket, create(&malformed, Some("s5"))).await;
+    assert_eq!(next_event(&mut socket).await["error"]["param"], "generate");
+    send(&mut socket, create(&continuing(&parent5), Some("s5"))).await;
+    assert_eq!(next_event(&mut socket).await["error"]["code"], "previous_response_not_found");
 
     // A same-stream continuation fails: its parent is evicted.
     send(&mut socket, create(&short("one"), Some("s4"))).await;
@@ -720,4 +740,36 @@ async fn a_queued_response_keeps_one_id_from_created_to_its_end_and_continues_by
     let continued = stream_until_terminal(&mut socket, Some("main")).await.pop().unwrap();
     assert_eq!(continued["type"], "response.incomplete", "{continued}");
     assert_eq!(continued["response"]["previous_response_id"], id.as_str());
+}
+
+/// Only "full" queues: a request the engine can never admit is an `error`
+/// event at once, whether the engine is merely full or others already wait.
+#[tokio::test]
+async fn a_request_the_engine_can_never_admit_is_refused_at_once_not_queued() {
+    let live = live(server(&Script::silent(), hog_config(1), plain())).await;
+    let mut socket = socket(&live).await;
+    send(&mut socket, create(&hog(), Some("h"))).await;
+    next_of(&mut socket, Some("h"), "response.in_progress").await;
+    let mut too_long = short("long");
+    too_long["max_output_tokens"] = json!(8 << 20);
+    let mut elsewhere = short("model");
+    elsewhere["model"] = json!("another-model");
+
+    // The engine is full and nobody waits yet.
+    send(&mut socket, create(&too_long, Some("a"))).await;
+    let refused = next_of(&mut socket, Some("a"), "error").await;
+    assert_eq!(refused["error"]["code"], "context_length_exceeded", "{refused}");
+
+    // Someone waits: the refusals still come at once.
+    send(&mut socket, create(&short("wait"), Some("b"))).await;
+    next_of(&mut socket, Some("b"), "response.queued").await;
+    send(&mut socket, create(&too_long, Some("c"))).await;
+    let refused = next_event(&mut socket).await;
+    assert_eq!((refused["type"].as_str(), refused["stream_id"].as_str()), (Some("error"), Some("c")), "{refused}");
+    assert_eq!(refused["error"]["code"], "context_length_exceeded");
+    send(&mut socket, create(&elsewhere, Some("d"))).await;
+    let refused = next_event(&mut socket).await;
+    assert_eq!((refused["type"].as_str(), refused["stream_id"].as_str()), (Some("error"), Some("d")), "{refused}");
+    assert_eq!(refused["status"], 404);
+    assert_eq!(refused["error"]["code"], "model_not_found");
 }
