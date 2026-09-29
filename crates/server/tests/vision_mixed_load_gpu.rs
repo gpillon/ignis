@@ -143,7 +143,8 @@ fn harness() -> Option<Harness> {
         kv_format: KvFormat::HqE8_2b,
         kv_pool_bytes: Some(one_context_pool_bytes()),
         prompt_reuse: true,
-        retained_slots: RETAINED_SLOTS,
+        retained_device_slots: RETAINED_SLOTS,
+        retained_host_slots: 0,
         speculation: Some(Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7")),
         vision: Some(vision),
         ..EngineShape::default()

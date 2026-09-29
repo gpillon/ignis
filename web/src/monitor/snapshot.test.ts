@@ -50,6 +50,8 @@ describe("readSnapshot", () => {
     expect(memory.kvPoolUsedPages).toBe(1536);
     expect(memory.kvRamArena).toEqual({ capacity: 8_589_934_592, used: 2_147_483_648 });
     expect(memory.retainedSlots).toEqual({ capacity: 10, inUse: 7 });
+    // GitHub #281: of the ten, eight on the host, in their pinned block.
+    expect(memory.retainedHost).toEqual({ slots: 8, bytes: 1_860_257_792 });
     expect(memory.slotSkips).toEqual({ publish_skipped_no_slot: 12, capture_skipped_no_slot: 5, capture_skipped_no_page: 1 });
   });
 

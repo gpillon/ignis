@@ -66,10 +66,13 @@ pub struct CudaLeafConfig {
     pub slot_count: u32,
     /// Retained slots the sequence pool holds past the lanes (GitHub #211,
     /// #215): a lane's mutable state each, reserved at load, where every
-    /// published prefix's and captured checkpoint's image lives. The server's
-    /// `--retained-slots`; 0 reserves none, and then nothing can be published
-    /// or captured.
-    pub retained_slots: u32,
+    /// published prefix's and captured checkpoint's image lives. Device ones
+    /// (`--retained-device`) sit in the state arenas and host ones
+    /// (`--retained-host`, GitHub #281) in one pinned host block; the device
+    /// ones take the low indices. Both 0 reserves none, and then nothing can
+    /// be published or captured.
+    pub retained_device_slots: u32,
+    pub retained_host_slots: u32,
     /// The prefill chunk width, in tokens: how wide a span the program's
     /// prefill scratch must serve (`--prefill-chunk`, GitHub #87). A
     /// nonzero multiple of 128, validated by the server's config module
@@ -122,8 +125,9 @@ impl Default for CudaLeafConfig {
                 crate::DEFAULT_MAX_CONTEXT,
             ),
             slot_count: N_DECODE_LANES as u32,
-            // `--retained-slots`' own default: a slot per lane.
-            retained_slots: N_DECODE_LANES as u32,
+            // The server's own defaults (GitHub #281).
+            retained_device_slots: crate::DEFAULT_RETAINED_DEVICE_SLOTS,
+            retained_host_slots: crate::DEFAULT_RETAINED_HOST_SLOTS,
             prefill_chunk_tokens: crate::DEFAULT_PREFILL_CHUNK,
             speculation: None,
             vision: None,
@@ -234,7 +238,7 @@ impl CudaLeafConfig {
     /// decides what a KV page *is*, and `speculation`, whose presence and
     /// draft window decide whether the sequence pool carries the drafter's
     /// per-slot sections. The other six — `max_context_tokens`,
-    /// `kv_pool_bytes`, `slot_count`, `retained_slots`,
+    /// `kv_pool_bytes`, `slot_count`, the retained slots,
     /// `prefill_chunk_tokens` and `vision` —
     /// decide how much work fits and how fast it goes, never what the bytes
     /// of a sequence mean, so state produced under one value must still be
@@ -281,6 +285,7 @@ impl CudaLeafConfig {
                 pool.hq_residual_bytes,
                 0,
             ),
+            retained_host_bytes: pool.retained_host_bytes,
         })
     }
 
@@ -304,7 +309,8 @@ impl CudaLeafConfig {
             kv_page_group_count: pages,
             max_context_tokens: self.max_context_tokens,
             slot_count: self.slot_count,
-            retained_slot_count: self.retained_slots,
+            retained_slot_count: self.retained_device_slots,
+            retained_host_slot_count: self.retained_host_slots,
         }
     }
 }
@@ -337,6 +343,9 @@ fn reserved_bytes(
 pub struct PlannedReservations {
     /// Every line but the KV pool's, which the VRAM plan sizes from the rest.
     pub reserved: ReservedBytes,
+    /// The host retained slots' pinned block (GitHub #281): host memory,
+    /// beside the VRAM plan rather than one of its lines.
+    pub retained_host_bytes: u64,
 }
 
 /// The leaf's model handle: the loaded weights plus the sequence-state

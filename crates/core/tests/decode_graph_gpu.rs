@@ -62,6 +62,7 @@ fn new_pool(kv_format: KvFormat, slot_count: u32) -> Result<SeqPool, String> {
             max_context_tokens: MAX_CONTEXT,
             slot_count,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
     )
 }

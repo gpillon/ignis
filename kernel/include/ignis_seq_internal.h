@@ -139,11 +139,40 @@ struct ignis_seq_pool {
   /* Lane slots only, `0..slot_count`: the retained slots past them are never
    * listed here (GitHub #211). */
   std::vector<std::int32_t> free_slots;
-  /* Retained slots, at slot indices `slot_count..slot_count +
-   * retained_slot_count` of the GDN pool, the penalty counts and the drafter
-   * lanes (GitHub #211), and what one slot's state occupies. */
+  /* Retained slots, device and host together (GitHub #211, #281), and what
+   * one slot's state occupies. The first `retained_device_slot_count` sit at
+   * slot indices `slot_count..slot_count + retained_device_slot_count` of the
+   * GDN pool, the penalty counts, the drafter lanes and the hq residual
+   * window; the rest are host slots, whose images live in `retained_host`. */
   std::uint32_t retained_slot_count = 0;
+  std::uint32_t retained_device_slot_count = 0;
   std::uint64_t slot_state_bytes = 0;
+  /* The host slots' pinned block (GitHub #281): one image per host slot,
+   * `retained_host_stride` bytes apart, each laid out as
+   * `ignis_seq_prefix_clone_layout` packs it. Reserved at pool create. */
+  std::uint64_t retained_host_stride = 0;
+  struct pinned_block {
+    void *p = nullptr;
+    std::uint64_t bytes = 0;
+    pinned_block() = default;
+    pinned_block(const pinned_block &) = delete;
+    pinned_block &operator=(const pinned_block &) = delete;
+    ~pinned_block();
+  } retained_host;
+  /* The pool slot index of the first host retained slot: past every lane and
+   * every device retained slot. */
+  std::int32_t first_host_retained_slot() const {
+    return kv_pool.table_row_count() + static_cast<std::int32_t>(retained_device_slot_count);
+  }
+  /* Pool slot `slot` is a host retained slot, its image in `retained_host`. */
+  bool is_host_retained(std::int32_t slot) const {
+    return slot >= first_host_retained_slot() &&
+           slot < kv_pool.table_row_count() + static_cast<std::int32_t>(retained_slot_count);
+  }
+  unsigned char *retained_host_image(std::int32_t slot) const {
+    return static_cast<unsigned char *>(retained_host.p) +
+           static_cast<std::uint64_t>(slot - first_host_retained_slot()) * retained_host_stride;
+  }
   /* Which retained slots hold a published prefix's or a captured checkpoint's
    * image (GitHub #215), one flag per slot. The caller decides which slot a
    * publish or a capture takes (`ignis_core::RetainedSlotLedger`); this is the
@@ -385,8 +414,9 @@ inline std::string ignis_seq_retained_slot_refusal(const ignis_seq_pool &pool,
 }
 
 /* Copy every mutable state section of pool slot `src` over pool slot `dst`,
- * device to device, and synchronize: a lane into a retained slot, a retained
- * slot into a lane. Walks the CLONE sections of the state-section table, so a
+ * and synchronize: a lane into a retained slot, a retained slot into a lane --
+ * device to device, or across PCIe when the retained slot is a host one
+ * (GitHub #281). Walks the CLONE sections of the state-section table, so a
  * section added there without a case here throws rather than being silently
  * left behind (ADR 0024's "carried by all or by none"). Defined in
  * kernel/src/seq.cu. */

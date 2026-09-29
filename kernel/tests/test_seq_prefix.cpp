@@ -63,6 +63,20 @@ namespace {
 
 int failures = 0;
 
+// GitHub #281: the second pass of main() builds every pool with its
+// retained slots on the host (`ignis_seq_pool_spec::retained_host_slot_count`)
+// instead of the device, and runs the same checks.
+bool g_host_slots = false;
+
+// The spec's retained slots as host slots on the second pass.
+ignis_seq_pool_spec with_slot_kind(ignis_seq_pool_spec spec) {
+  if (g_host_slots) {
+    spec.retained_host_slot_count = spec.retained_slot_count;
+    spec.retained_slot_count      = 0;
+  }
+  return spec;
+}
+
 void expect(bool ok, const char *label) {
   if (!ok) {
     std::fprintf(stderr, "FAIL: %s\n", label);
@@ -201,6 +215,44 @@ std::vector<unsigned char> mutable_image_of(const ignis_seq_pool &pool, std::int
   return image;
 }
 
+// One CLONE section's payload out of host retained slot `retained`'s image
+// (GitHub #281).
+std::vector<unsigned char> host_section_of(const ignis_seq_pool &pool, std::uint32_t retained,
+                                           std::int32_t kind) {
+  const unsigned char *image = pool.retained_host_image(ignis_seq_retained_pool_slot(pool, retained));
+  for (const ignis_seq_section &section : ignis_seq_prefix_clone_layout(pool)) {
+    if (section.kind == kind) {
+      return {image + section.offset, image + section.offset + section.bytes};
+    }
+  }
+  return {};
+}
+
+bool is_host_slot(const ignis_seq_pool &pool, std::uint32_t retained) {
+  return pool.is_host_retained(ignis_seq_retained_pool_slot(pool, retained));
+}
+
+// Retained slot `retained`'s mutable image as `mutable_image_of` lays a
+// lane's out, wherever the pool keeps it.
+std::vector<unsigned char> retained_mutable_image_of(const ignis_seq_pool &pool,
+                                                     std::uint32_t retained) {
+  if (!is_host_slot(pool, retained)) {
+    return mutable_image_of(pool, ignis_seq_retained_pool_slot(pool, retained));
+  }
+  std::vector<unsigned char> image;
+  for (const std::int32_t kind : {IGNIS_SEQ_SECTION_GDN_CONV, IGNIS_SEQ_SECTION_GDN_RECURRENT,
+                                  IGNIS_SEQ_SECTION_PENALTY_COUNTS}) {
+    const std::vector<unsigned char> bytes = host_section_of(pool, retained, kind);
+    image.insert(image.end(), bytes.begin(), bytes.end());
+  }
+  return image;
+}
+
+std::vector<unsigned char> retained_hq_window_of(const ignis_seq_pool &pool, std::uint32_t retained) {
+  return is_host_slot(pool, retained) ? host_section_of(pool, retained, IGNIS_SEQ_SECTION_HQ_RESIDUAL)
+                               : hq_window_of(pool, ignis_seq_retained_pool_slot(pool, retained));
+}
+
 // Every plane's bytes for one physical page -- the KV history itself, used to
 // show that a shared page is never zeroed or rewritten by a claim.
 std::vector<unsigned char> page_image_of(const ignis_seq_pool &pool, std::int32_t page_id) {
@@ -246,7 +298,7 @@ ignis_seq_pool_spec small_spec() {
   spec.gdn_head_dim        = 4;
   spec.vocab               = 32;
   spec.retained_slot_count = 4;
-  return spec;
+  return with_slot_kind(spec);
 }
 
 // The same pool under hq-e8-2b (GitHub #257): the codec's 256-wide rows, so
@@ -275,7 +327,7 @@ ignis_seq_pool_spec qwen38_27b_spec(std::uint32_t context_tokens, std::uint32_t 
   spec.gdn_head_dim        = 128;
   spec.vocab               = 248320;
   spec.retained_slot_count = 1;
-  return spec;
+  return with_slot_kind(spec);
 }
 
 constexpr std::uint32_t kPageTokens = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
@@ -456,7 +508,7 @@ void check_a_claimant_receives_the_hq_window() {
   ignis_seq_prefix *prefix = nullptr;
   expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 1, &prefix), 0,
             "hq window clone: publish");
-  expect(hq_window_of(*pool, ignis_seq_retained_pool_slot(*pool, 1)) == at_boundary,
+  expect(retained_hq_window_of(*pool, 1) == at_boundary,
          "hq window clone: the prefix's retained slot holds the publisher's window");
 
   // The publisher appends past the prefix: its ring moves on.
@@ -809,14 +861,16 @@ void check_the_image_lives_in_a_retained_slot() {
   give_history(*pool, *second, kPrefix, 0xA2u);
 
   ignis_seq_prefix *prefix = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, first, kPrefix, spec.retained_slot_count, &prefix), -1,
+  expect_rc(ignis_seq_prefix_publish(pool, first, kPrefix,
+                                     spec.retained_slot_count + spec.retained_host_slot_count, &prefix),
+            -1,
             "slot: a retained slot past the pool's is refused");
   expect(prefix == nullptr && first->prefix == nullptr, "slot: and nothing was published");
 
   // The image is the publisher's state, in the retained slot it was named.
   const std::vector<unsigned char> at_boundary = mutable_image_of(*pool, first->slot);
   expect_rc(ignis_seq_prefix_publish(pool, first, kPrefix, 3, &prefix), 0, "slot: publish");
-  expect(mutable_image_of(*pool, ignis_seq_retained_pool_slot(*pool, 3)) == at_boundary,
+  expect(retained_mutable_image_of(*pool, 3) == at_boundary,
          "slot: the image is the publisher's state, held in retained slot 3");
 
   // A second publish may not write over it, nor may a plain store.
@@ -826,7 +880,7 @@ void check_the_image_lives_in_a_retained_slot() {
   expect(other == nullptr && second->prefix == nullptr, "slot: and changes nothing");
   expect_rc(ignis_seq_retained_store(pool, second, 3), -1,
             "slot: a store into a held slot is refused");
-  expect(mutable_image_of(*pool, ignis_seq_retained_pool_slot(*pool, 3)) == at_boundary,
+  expect(retained_mutable_image_of(*pool, 3) == at_boundary,
          "slot: the held image is untouched");
 
   // The pages outlive the handle; the image does not.
@@ -903,7 +957,8 @@ void report_clone_cost() {
                   static_cast<double>(
                       ninfer::paged_kv_host_image_bytes(pool->kv_pool, 1)) /
                   (1024.0 * 1024.0));
-  std::printf("  cloned state      : %.2f MiB device to device\n", mib);
+  std::printf("  cloned state      : %.2f MiB %s to device\n", mib,
+              is_host_slot(*pool, 0) ? "host" : "device");
   std::printf("  clone             : %.3f ms (mean of %d)\n", mean_micros / 1000.0, kReps);
   std::printf("  effective         : %.1f GB/s\n",
               static_cast<double>(published.clone_image_bytes) / (mean_micros * 1e-6) / 1e9);
@@ -920,10 +975,125 @@ void report_clone_cost() {
   // round-trip", checked rather than asserted in a comment.
   const double one_pcie_crossing_micros =
       static_cast<double>(published.clone_image_bytes) / 12e9 * 1e6;
-  expect(mean_micros < one_pcie_crossing_micros / 3.0,
+  // GitHub #281: a host slot's image crosses PCIe by design, so only a
+  // device slot is held to it.
+  expect(is_host_slot(*pool, 0) || mean_micros < one_pcie_crossing_micros / 3.0,
          "cost: the clone is far too fast to have crossed PCIe");
   ignis_seq_release(pool, publisher);
   ignis_seq_prefix_release(pool, prefix);
+  ignis_seq_pool_free(pool);
+}
+
+// GitHub #281: with the retained slots on the host the device arenas hold
+// the lanes alone -- the same bytes as a pool with no retained slot -- and
+// the pinned block holds one packed clone image per host slot.
+void check_host_retained_layout() {
+  ignis_seq_pool_spec host      = small_hq_spec();
+  host.speculative_backend      = IGNIS_SPECULATIVE_DFLASH2;
+  host.retained_slot_count      = 0;
+  host.retained_host_slot_count = 4;
+  ignis_seq_pool_spec none      = host;
+  none.retained_host_slot_count = 0;
+  ignis_seq_pool *with_host = nullptr;
+  ignis_seq_pool *without   = nullptr;
+  expect_rc(ignis_seq_pool_create(&host, &with_host), 0, "host layout: pool create");
+  expect_rc(ignis_seq_pool_create(&none, &without), 0, "host layout: bare pool create");
+  struct ignis_seq_pool_stats h{}, n{};
+  expect_rc(ignis_seq_pool_stats(with_host, &h), 0, "host layout: stats");
+  expect_rc(ignis_seq_pool_stats(without, &n), 0, "host layout: bare stats");
+  expect(h.retained_slot_count == 0 && h.retained_state_bytes == 0,
+         "host layout: no retained slot on the device");
+  expect(h.lane_state_bytes == n.lane_state_bytes, "host layout: the lanes' state is unchanged");
+  expect(h.hq_residual_bytes == n.hq_residual_bytes,
+         "host layout: the residual window is the lanes' alone");
+  expect(h.retained_host_slot_count == 4, "host layout: four host slots");
+  expect(h.retained_host_bytes == 4 * with_host->retained_host_stride &&
+             with_host->retained_host_stride >= with_host->retained_image_bytes(),
+         "host layout: one packed image per host slot in the pinned block");
+  expect(n.retained_host_slot_count == 0 && n.retained_host_bytes == 0,
+         "host layout: a pool without host slots holds no block");
+  struct ignis_seq_pool_plan plan{};
+  expect_rc(ignis_seq_pool_plan(&host, &plan), 0, "host layout: plan");
+  expect(plan.retained_state_bytes == h.retained_state_bytes &&
+             plan.lane_state_bytes == h.lane_state_bytes &&
+             plan.hq_residual_bytes == h.hq_residual_bytes &&
+             plan.retained_host_bytes == h.retained_host_bytes,
+         "host layout: the plan is what the pool holds");
+  ignis_seq_pool_free(with_host);
+  ignis_seq_pool_free(without);
+}
+
+// GitHub #281: a pool holding both kinds keeps the device slots first and
+// the host slots after them, and a claimant of either gets the publisher's
+// state at its boundary -- GDN, penalty counts, drafter window, hq window.
+void check_a_mixed_pool_keeps_each_kind() {
+  ignis_seq_pool_spec spec      = small_hq_spec();
+  spec.speculative_backend      = IGNIS_SPECULATIVE_DFLASH2;
+  spec.retained_slot_count      = 2;
+  spec.retained_host_slot_count = 2;
+  ignis_seq_pool *pool          = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "mixed: pool create");
+  struct ignis_seq_pool_stats stats{};
+  expect_rc(ignis_seq_pool_stats(pool, &stats), 0, "mixed: stats");
+  expect(stats.retained_slot_count == 2 && stats.retained_host_slot_count == 2,
+         "mixed: two device slots and two host slots");
+  expect(!is_host_slot(*pool, 0) && !is_host_slot(*pool, 1) && is_host_slot(*pool, 2) &&
+             is_host_slot(*pool, 3),
+         "mixed: the device slots come first");
+
+  ignis_seq *on_device = nullptr;
+  ignis_seq *on_host   = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &on_device), 0, "mixed: alloc first publisher");
+  expect_rc(ignis_seq_alloc(pool, kContext, &on_host), 0, "mixed: alloc second publisher");
+  give_history(*pool, *on_device, kPrefix, 0x91u);
+  give_history(*pool, *on_host, kPrefix, 0x92u);
+  fill_lane(*pool->dflash2_window, on_device->slot, 0x93u);
+  fill_lane(*pool->dflash2_window, on_host->slot, 0x94u);
+  struct image {
+    std::vector<unsigned char> state, hq, window;
+  };
+  const auto image_of = [&](const ignis_seq &seq) {
+    return image{mutable_image_of(*pool, seq.slot), hq_window_of(*pool, seq.slot),
+                 lane_image_of(*pool->dflash2_window, seq.slot)};
+  };
+  const image device_image = image_of(*on_device);
+  const image host_image   = image_of(*on_host);
+
+  ignis_seq_prefix *device_prefix = nullptr;
+  ignis_seq_prefix *host_prefix   = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, on_device, kPrefix, 1, &device_prefix), 0,
+            "mixed: publish into device slot 1");
+  expect_rc(ignis_seq_prefix_publish(pool, on_host, kPrefix, 3, &host_prefix), 0,
+            "mixed: publish into host slot 3");
+  expect(retained_mutable_image_of(*pool, 1) == device_image.state &&
+             retained_mutable_image_of(*pool, 3) == host_image.state,
+         "mixed: each image sits in the slot it was named");
+  expect(retained_hq_window_of(*pool, 3) == host_image.hq, "mixed: the host image holds the hq window");
+
+  // Both publishers move on; the claimants must not see it.
+  give_history(*pool, *on_device, kPrefix, 0xA5u);
+  give_history(*pool, *on_host, kPrefix, 0xA6u);
+  ignis_seq *from_device = nullptr;
+  ignis_seq *from_host   = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, device_prefix, &from_device), 0,
+            "mixed: claim the device slot");
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, host_prefix, &from_host), 0,
+            "mixed: claim the host slot");
+  const image got_device = image_of(*from_device);
+  const image got_host   = image_of(*from_host);
+  expect(got_device.state == device_image.state && got_device.hq == device_image.hq &&
+             got_device.window == device_image.window,
+         "mixed: a device slot's claimant is its publisher at the boundary");
+  expect(got_host.state == host_image.state && got_host.hq == host_image.hq &&
+             got_host.window == host_image.window,
+         "mixed: a host slot's claimant is its publisher at the boundary");
+
+  ignis_seq_release(pool, from_device);
+  ignis_seq_release(pool, from_host);
+  ignis_seq_release(pool, on_device);
+  ignis_seq_release(pool, on_host);
+  ignis_seq_prefix_release(pool, device_prefix);
+  ignis_seq_prefix_release(pool, host_prefix);
   ignis_seq_pool_free(pool);
 }
 
@@ -1021,15 +1191,7 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2, bool hq 
   ignis_seq_pool_free(pool);
 }
 
-int main() {
-  int device_count            = 0;
-  const cudaError_t available = cudaGetDeviceCount(&device_count);
-  if (cuda_unavailable(available) || device_count == 0) {
-    // ADR 0006: a missing GPU is a failure here, never a skip.
-    std::fprintf(stderr, "FAIL: no CUDA device (%s)\n", cudaGetErrorString(available));
-    return 1;
-  }
-
+void run_all() {
   check_publish_shares_pages_and_charges_once();
   check_a_claimant_receives_the_mutable_state();
   check_a_claimant_receives_the_drafter_window();
@@ -1042,6 +1204,26 @@ int main() {
   check_refusals();
   check_the_image_lives_in_a_retained_slot();
   report_clone_cost();
+}
+
+int main() {
+  int device_count            = 0;
+  const cudaError_t available = cudaGetDeviceCount(&device_count);
+  if (cuda_unavailable(available) || device_count == 0) {
+    // ADR 0006: a missing GPU is a failure here, never a skip.
+    std::fprintf(stderr, "FAIL: no CUDA device (%s)\n", cudaGetErrorString(available));
+    return 1;
+  }
+
+  run_all();
+  // GitHub #281: every check again with the retained slots on the host,
+  // then a pool holding both kinds.
+  g_host_slots = true;
+  std::printf("-- retained slots on the host --\n");
+  check_host_retained_layout();
+  run_all();
+  g_host_slots = false;
+  check_a_mixed_pool_keeps_each_kind();
 
   if (failures != 0) {
     std::cerr << failures << " prefix reuse check(s) failed\n";

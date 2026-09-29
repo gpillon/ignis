@@ -149,6 +149,7 @@ fn a_claimant_decodes_what_a_sibling_that_prefilled_the_prefix_decodes() {
             slot_count: 4,
             // GitHub #215: the prefix's image goes into a retained slot.
             retained_slot_count: 1,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -336,6 +337,7 @@ fn publishing_is_refused_unless_the_sequence_stands_on_the_prefix() {
             max_context_tokens: MAX_CONTEXT,
             slot_count: 2,
             retained_slot_count: 1,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

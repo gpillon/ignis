@@ -63,6 +63,7 @@ fn budget(retained_slot_count: u32) -> SeqPoolBudget {
         max_context_tokens: 128,
         slot_count: LANES,
         retained_slot_count,
+        retained_host_slot_count: 0,
     }
 }
 
@@ -257,6 +258,7 @@ fn a_drafting_sequence_state_comes_back_from_a_retained_slot_bit_exact_on_a_dfla
                 max_context_tokens: MAX_CONTEXT,
                 slot_count: 1,
                 retained_slot_count: 1,
+                retained_host_slot_count: 0,
             },
             Some(SpeculativeBackend::Dflash2),
         )

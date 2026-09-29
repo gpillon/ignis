@@ -269,6 +269,7 @@ fn gdn_layer_matches_f64_reference() {
         max_context_tokens: MAX_CONTEXT_TOKENS,
         slot_count: 2,
         retained_slot_count: 0,
+        retained_host_slot_count: 0,
     };
     let pool = SeqPool::create(&cfg, &budget)
         .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

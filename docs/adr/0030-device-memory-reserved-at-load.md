@@ -26,6 +26,9 @@ readings this section had left to the source column — the retained slots'
 capacity, what the KV pool's occupancy counts, and what the KV-RAM arena's
 use covers — and to record that `SchedEvent::StateReused` widens beside
 `SchedEvent::RetainedState`. Each is marked below.
+**Amended 2026-09-29 by spec vram-budget/02** (GitHub #281): retained slots
+come in two kinds, and the default ones live in pinned host memory — see the
+amendment at the end.
 
 ## Context
 
@@ -151,6 +154,8 @@ again. They add no serving work of any kind.
 | `ignis_kv_page_bytes` | gauge | none | one page's bytes |
 | `ignis_kv_ram_arena_bytes` | gauge | `state="capacity"` | `--kv-host-pool-bytes`, pinned whole at start |
 | `ignis_retained_slots` | gauge | `state="capacity"` | the retained slots the scheduler hands out (#216) |
+| `ignis_retained_host_slots` | gauge | none | of those, the host ones (#281) |
+| `ignis_retained_host_bytes` | gauge | none | the pinned host block holding their images (#281) |
 
 A load that refuses to start exports nothing: there is no process to scrape.
 
@@ -328,3 +333,47 @@ unexported.
   proof that the inference path is unchanged.
 - **`kv_used_pct` stops being a placeholder**, so the interval line's
   documented caveat about it narrows to `prefilling` alone.
+
+## Amendment (2026-09-29) — retained slots on the host (GitHub #281)
+
+Spec: `docs/specs/vram-budget/02-retained-host.md`.
+
+Measured with an 8-agent swarm, the device slots did little of the reuse:
+eight agents need about seventeen slots, so a conversation's image was
+spilled to KV-RAM before its next turn and came back from there (51 of 52
+checkpoint hits). Meanwhile the eight slots and their residual window held
+1.74 GiB — about 200K tokens of hq KV.
+
+- **Two kinds of retained slot.** `--retained-device <n>` (default 0) keeps
+  images in the device state arenas, as this ADR built them;
+  `--retained-host <n>` (default `2 x N_DECODE_LANES`) keeps them in one
+  pinned host block of `n` packed clone images, reserved at load. The
+  device slots take the low indices and the scheduler hands out the lowest
+  free one, so a device slot is always used first. `--retained-slots` is
+  removed and refuses the start, naming both.
+- **"Serving allocates nothing" still holds.** The host block is one
+  `cudaHostAlloc` at pool create; a failed one refuses the start. Like the
+  KV-RAM arena, Windows counts it as the process's shared GPU memory, so
+  that figure grows by the block at load and stays fixed.
+- **The plan.** The `retained_slots` line is the device slots' alone, and
+  `hq_residual_window` counts the lanes and the device slots. The host block
+  is RAM, not a plan line: `ignis.runtime.vram_plan` carries it as
+  `retained_host_bytes`, beside `retained_device_slots` and
+  `retained_host_slots`. The KV floor keeps one tail page per slot of either
+  kind.
+- **The cost moves to PCIe.** A capture into a host slot and a claim from
+  one copy ~222 MiB each way, synchronized: ~15–19 ms per request, never per
+  token. On the shipped build, sixteen host slots against eight device slots
+  were level on wall time and tok/s on both swarm loads, with 42% more KV
+  (677K tokens against 475K) and a higher later-turn TTFT median on the long
+  load. See the finding
+  [Retained slots on the host](../findings/2026-09-28-retained-slots-on-the-host.md).
+- **Two load-time gauges** join §Observability's constants, both without a
+  label: `ignis_retained_host_slots` (of `ignis_retained_slots{state="capacity"}`,
+  the host ones) and `ignis_retained_host_bytes` (their pinned block).
+- **The metrics' `tier="device"` keeps meaning the slot tier**, whichever
+  kind of slot holds the image; KV-RAM is the other tier. Splitting the label
+  by slot kind is not done here.
+- **Supersedes** this ADR's "The count is `--retained-slots`, default
+  `N_DECODE_LANES`" and the consequence that retained slots are
+  sequence-pool slots: the device ones still are, the host ones are not.

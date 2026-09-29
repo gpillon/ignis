@@ -144,7 +144,8 @@ fn the_set_costs_under(test: &str, image: &str, instruction: &str, bound_ms: f64
     let shape = EngineShape {
         vision: Some(Vision::default()),
         prompt_reuse: false,
-        retained_slots: 0,
+        retained_device_slots: 0,
+        retained_host_slots: 0,
         ..EngineShape::default()
     };
     let mut scheduler: ConcreteScheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {

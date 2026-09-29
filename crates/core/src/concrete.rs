@@ -204,10 +204,11 @@ pub struct SchedulerConfig {
     /// bench measures a cold engine and a correctness oracle prefills every
     /// prompt it is given.
     pub prompt_reuse: bool,
-    /// The load's **retained slots** (GitHub #215, ADR 0030; the operator's
-    /// `--retained-slots`): how many images of mutable state retained state
-    /// may hold on the device, prompt checkpoints and shared prefixes alike —
-    /// the pool's `retained_slot_count` in production. Every publish and every
+    /// The load's **retained slots** (GitHub #215, #281, ADR 0030; the
+    /// operator's `--retained-device` and `--retained-host` together): how
+    /// many images of mutable state retained state may hold, prompt
+    /// checkpoints and shared prefixes alike -- the pool's device slots
+    /// first, then its host slots, in production. Every publish and every
     /// capture takes one; when none is free, retained state gives one up, and
     /// when nothing can, the publish or capture is skipped. With
     /// `prompt_reuse` off only live siblings' heads take one (the server
@@ -379,9 +380,10 @@ impl Default for SchedulerConfig {
             // byte flag rather than this default.
             host_capacity_bytes: (N_DECODE_LANES * (8192 / 16)) as u64,
             serving_chunk_tokens: DEFAULT_SERVING_CHUNK_TOKENS,
-            // GitHub #186: on by default (ADR 0029), with `--retained-slots`'
-            // own default (GitHub #215): a slot per lane. A test that wants
-            // exhaustion asks for it by setting fewer here.
+            // GitHub #186: on by default (ADR 0029), with a slot per lane -- a
+            // fixed test default, not the server's (`--retained-device` and
+            // `--retained-host`, GitHub #281). A test that wants exhaustion
+            // asks for it by setting fewer here.
             prompt_reuse: true,
             retained_slots: N_DECODE_LANES as u32,
             retained_interactive_ttl: DEFAULT_RETAINED_INTERACTIVE_TTL,

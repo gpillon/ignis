@@ -153,9 +153,10 @@ inline std::vector<ignis_seq_section> ignis_seq_prefix_clone_layout(const ignis_
  * progress scalars into `progress` (GitHub #215).
  *
  * One function for a prefix publish and a checkpoint capture, so the two
- * cannot drift apart about what a sequence is made of. Device to device and
- * synchronized: nothing crosses PCIe (ADR 0024), and nothing is allocated --
- * the slot was reserved at load (ADR 0030). The caller has checked the slot
+ * cannot drift apart about what a sequence is made of. Synchronized, and
+ * nothing is allocated -- the slot was reserved at load (ADR 0030): device to
+ * device for a device retained slot (ADR 0024), over PCIe into the pinned
+ * block for a host one (GitHub #281). The caller has checked the slot
  * with `ignis_seq_retained_slot_refusal`. */
 inline void ignis_seq_capture_state(ignis_seq_pool &pool, const ignis_seq &seq,
                                     std::uint32_t retained_slot,

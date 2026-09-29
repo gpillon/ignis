@@ -609,6 +609,9 @@ async fn labels_stay_within_the_bounded_sets() {
         "ignis_kv_page_bytes",
         "ignis_kv_pool_used_pages",
         "ignis_kv_ram_arena_bytes",
+        // GitHub #281: the host retained slots and their pinned block.
+        "ignis_retained_host_slots",
+        "ignis_retained_host_bytes",
         "ignis_requests_rejected_total",
         "ignis_request_ttft_seconds_bucket",
         "ignis_request_ttft_seconds_sum",

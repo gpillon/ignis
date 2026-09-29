@@ -14,11 +14,19 @@ use std::sync::Arc;
 
 use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::gpu_profile;
-use ignis_core::{KvFormat, KvGeometry, Speculation, SpeculativeBackend, Vision, model_load};
+use ignis_core::{KvFormat, KvGeometry, N_DECODE_LANES, Speculation, SpeculativeBackend, Vision, model_load};
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, ReservedBytes};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 262_144;
+
+/// One retained image at the serving shape (hq-e8-2b, DFlash2), as the host
+/// block packs it: 196,880,384 bytes of slot state and the hq residual
+/// window's 35,651,648 rounded up to the packed image's 256-byte section
+/// alignment (35,651,840).
+const HOST_IMAGE_BYTES: u64 = 232_532_224;
+/// One slot's hq residual window.
+const HQ_WINDOW_BYTES: u64 = 35_651_648;
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
@@ -44,8 +52,10 @@ fn the_planned_reservations_are_what_the_load_holds() {
         kv_pool_bytes: u64::from(pages) * page_bytes,
         speculation: Some(speculation),
         vision: Some(vision),
-        // GitHub #211: retained slots are a line of their own.
-        retained_slots: 2,
+        // GitHub #211: device retained slots are a line of their own; the
+        // host ones (GitHub #281) are host memory beside the plan.
+        retained_device_slots: 2,
+        retained_host_slots: 3,
         ..CudaLeafConfig::default()
     };
     // Planned before any device memory exists, as the server does.
@@ -70,6 +80,12 @@ fn the_planned_reservations_are_what_the_load_holds() {
     assert!(
         kv_arena > u64::from(pages) * page_bytes,
         "the KV arena carries its block tables beside the pages"
+    );
+    assert_eq!(planned.retained_host_bytes, 3 * HOST_IMAGE_BYTES, "one packed image per host slot");
+    assert_eq!(
+        planned.reserved.hq_residual_window,
+        (N_DECODE_LANES as u64 + 2) * HQ_WINDOW_BYTES,
+        "the residual window is the lanes' and the device slots', never a host slot's"
     );
 
     let mut device = match CudaDevice::create(0) {
@@ -106,6 +122,43 @@ fn the_planned_reservations_are_what_the_load_holds() {
             ..planned.reserved
         },
         "the load holds what its plan laid out"
+    );
+}
+
+/// GitHub #281: a load at the server's defaults keeps no retained slot in
+/// VRAM -- the `retained_slots` line is 0 and the residual window is the
+/// lanes' alone -- and sixteen in the pinned host block. Asked of the leaf's
+/// plan only, so nothing here touches the device.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_default_retained_slots_are_on_the_host() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
+    let scope = model_load::model_scope(Some(speculation), None);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
+    let config = CudaLeafConfig {
+        max_context_tokens: MAX_CONTEXT,
+        kv_format: KvFormat::HqE8_2b,
+        speculation: Some(speculation),
+        ..CudaLeafConfig::default()
+    };
+    let planned = config
+        .plan_reservations(&reader, &plan, &handles)
+        .unwrap_or_else(|e| panic!("plan the reservations: {e}"));
+    assert_eq!(planned.reserved.retained_slots, 0, "no retained slot in VRAM by default");
+    assert_eq!(
+        planned.reserved.hq_residual_window,
+        N_DECODE_LANES as u64 * HQ_WINDOW_BYTES,
+        "the lanes' window alone"
+    );
+    assert_eq!(
+        planned.retained_host_bytes,
+        u64::from(ignis_runtime::DEFAULT_RETAINED_HOST_SLOTS) * HOST_IMAGE_BYTES,
+        "the default host slots, one packed image each"
     );
 }
 

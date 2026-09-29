@@ -77,6 +77,8 @@ export type Memory = {
   kvPoolUsedPages: number | null;
   kvRamArena: { capacity: number | null; used: number | null };
   retainedSlots: { capacity: number | null; inUse: number | null };
+  /** Of the retained slots, those in the pinned host block, and the block (GitHub #281). */
+  retainedHost: { slots: number | null; bytes: number | null };
   slotSkips: Record<SlotSkipReason, number | null>;
 };
 
@@ -118,6 +120,12 @@ const COUNTERS = {
   prefixReusedTokens: "ignis_prefix_reused_tokens_total",
 } as const;
 
+/** The host retained slots and their pinned block (GitHub #281): no label, read once at load. */
+const RETAINED_HOST = {
+  slots: "ignis_retained_host_slots",
+  bytes: "ignis_retained_host_bytes",
+} as const;
+
 /** The memory gauges that carry no label. */
 const MEMORY_GAUGES = {
   budgetBytes: "ignis_vram_budget_bytes",
@@ -144,6 +152,7 @@ const KNOWN = new Set<string>([
   "ignis_retained_slot_skips_total",
   ...Object.values(COUNTERS),
   ...Object.values(MEMORY_GAUGES),
+  ...Object.values(RETAINED_HOST),
   ...Object.values(RETAINED_FAMILIES),
 ]);
 
@@ -173,6 +182,7 @@ export function emptySnapshot(): Snapshot {
       kvPoolUsedPages: null,
       kvRamArena: { capacity: null, used: null },
       retainedSlots: { capacity: null, inUse: null },
+      retainedHost: { slots: null, bytes: null },
       slotSkips: Object.fromEntries(SLOT_SKIP_REASONS.map((reason) => [reason, null])) as Record<SlotSkipReason, number | null>,
     },
     ttft: null,
@@ -211,6 +221,7 @@ export function readSnapshot({ families }: Exposition): Snapshot {
     capacity: valueOf("ignis_retained_slots", ["state", "capacity"]),
     inUse: valueOf("ignis_retained_slots", ["state", "in_use"]),
   };
+  mem.retainedHost = { slots: valueOf(RETAINED_HOST.slots), bytes: valueOf(RETAINED_HOST.bytes) };
   for (const reason of SLOT_SKIP_REASONS) mem.slotSkips[reason] = valueOf("ignis_retained_slot_skips_total", ["reason", reason]);
 
   snap.ttft = readHistogram(samples("ignis_request_ttft_seconds"), "ignis_request_ttft_seconds");

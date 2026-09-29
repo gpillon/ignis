@@ -22,6 +22,9 @@ const KV_POOL_PAGES = 4_032;
 const KV_PAGE_TOKENS = 256;
 const KV_RAM_ARENA_BYTES = 8 * 1024 ** 3;
 const RETAINED_SLOTS = 10;
+/** Of those, the ones in the pinned host block (GitHub #281), and one packed image's bytes. */
+const RETAINED_HOST_SLOTS = 8;
+const RETAINED_HOST_IMAGE_BYTES = 232_532_224;
 /** One retained image's KV-RAM bytes once it has been spilled. */
 const RETAINED_BLOB_BYTES = 228 * 1024 ** 2;
 const VRAM_LINES: [string, number][] = [
@@ -294,6 +297,10 @@ export function createMetricsSim(start = Date.now()) {
       out.push(`ignis_kv_ram_arena_bytes{state="capacity"} ${KV_RAM_ARENA_BYTES}`, `ignis_kv_ram_arena_bytes{state="used"} ${slots.spilled * RETAINED_BLOB_BYTES}`);
       declare("ignis_retained_slots", "gauge", "Retained slots this load hands out, and how many hold an image.");
       out.push(`ignis_retained_slots{state="capacity"} ${RETAINED_SLOTS}`, `ignis_retained_slots{state="in_use"} ${slots.inUse}`);
+      declare("ignis_retained_host_slots", "gauge", "Of the retained slots, those whose images live in the pinned host block.");
+      out.push(`ignis_retained_host_slots ${RETAINED_HOST_SLOTS}`);
+      declare("ignis_retained_host_bytes", "gauge", "The pinned host block holding the host retained slots' images.");
+      out.push(`ignis_retained_host_bytes ${RETAINED_HOST_SLOTS * RETAINED_HOST_IMAGE_BYTES}`);
       declare("ignis_requests_rejected_total", "counter", "Rejected submissions by fixed reason.");
       for (const [reason, value] of Object.entries(rejected)) out.push(`ignis_requests_rejected_total{reason="${reason}"} ${value}`);
       ttft.render(out, "ignis_request_ttft_seconds", "Submission-to-first-token latency.");

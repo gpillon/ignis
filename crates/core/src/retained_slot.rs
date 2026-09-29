@@ -47,7 +47,9 @@ impl std::error::Error for NotTaken {}
 /// The free list of a pool's retained slots.
 #[derive(Debug, Clone)]
 pub struct RetainedSlots {
-    /// Free indices, handed out from the back, lowest index first.
+    /// Free indices, kept in descending order and handed out from the back:
+    /// the lowest free index always goes first, so a device retained slot is
+    /// taken before a host one (GitHub #281).
     free: Vec<u32>,
     taken: Vec<bool>,
 }
@@ -86,7 +88,8 @@ impl RetainedSlots {
         match self.taken.get_mut(index as usize) {
             Some(taken) if *taken => {
                 *taken = false;
-                self.free.push(index);
+                let at = self.free.partition_point(|&free| free > index);
+                self.free.insert(at, index);
                 Ok(())
             }
             _ => Err(NotTaken { index }),
@@ -274,6 +277,29 @@ mod tests {
         let err = slots.give_back(out_of_range).expect_err("index 2 of a 2-slot pool");
         assert_eq!(err, NotTaken { index: 2 });
         assert!(err.to_string().contains("retained slot 2"), "{err}");
+    }
+
+    /// GitHub #281: the device retained slots are the low indices and the
+    /// host ones follow, so the lowest free index is always the fastest free
+    /// slot -- whatever order slots came back in.
+    #[test]
+    fn take_hands_out_the_lowest_free_index() {
+        let mut slots = RetainedSlots::new(4);
+        let mut taken: Vec<RetainedSlot> = (0..4).map(|_| slots.take().unwrap()).collect();
+        assert_eq!(taken.iter().map(RetainedSlot::index).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        let three = taken.pop().unwrap();
+        let two = taken.pop().unwrap();
+        let one = taken.pop().unwrap();
+        let zero = taken.pop().unwrap();
+        slots.give_back(one).expect("taken");
+        slots.give_back(three).expect("taken");
+        assert_eq!(slots.take().map(|s| s.index()), Some(1), "1 before 3, though 3 came back last");
+        slots.give_back(two).expect("taken");
+        slots.give_back(zero).expect("taken");
+        assert_eq!(slots.take().map(|s| s.index()), Some(0));
+        assert_eq!(slots.take().map(|s| s.index()), Some(2));
+        assert_eq!(slots.take().map(|s| s.index()), Some(3));
+        assert_eq!(slots.take(), None);
     }
 
     #[test]

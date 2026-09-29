@@ -82,10 +82,14 @@ KV_POOL_BYTES ?=
 VRAM_HEADROOM ?=
 VRAM_BUDGET ?=
 ALLOW_VRAM_OVERSUBSCRIPTION ?=
-# Retained slots (--retained-slots, GitHub #215, ADR 0030): the images of
-# retained prompt checkpoints and shared prefixes, reserved at load. Empty =
-# the server's default, one per decode lane.
-RETAINED_SLOTS ?=
+# Retained slots (GitHub #215, #281, ADR 0030): the images of retained prompt
+# checkpoints and shared prefixes, reserved at load. RETAINED_DEVICE
+# (--retained-device) keeps them in VRAM, handed out first; RETAINED_HOST
+# (--retained-host) in one pinned host block, a PCIe copy per capture and
+# per claim. Empty = the server's defaults: none in VRAM, two per decode lane
+# on the host. A card with VRAM to spare: RETAINED_DEVICE=16 RETAINED_HOST=0.
+RETAINED_DEVICE ?=
+RETAINED_HOST ?=
 # Vision (--vision, GitHub #179): a load that takes image parts. Without it
 # every `image_url` part is refused with `vision_disabled`, whatever the
 # artifact holds. VISION_MAX_TOKENS caps one request's vision tokens

@@ -46,8 +46,13 @@ pub struct LoadReservations {
     /// `--kv-host-pool-bytes`, pinned whole at start.
     pub kv_ram_arena_bytes: u64,
     /// The retained slots this load hands out — the effective count, which
-    /// is 0 with prompt reuse off and no explicit `--retained-slots`.
+    /// is 0 with prompt reuse off and neither `--retained-device` nor
+    /// `--retained-host` named.
     pub retained_slots: u32,
+    /// Of those, the host ones (GitHub #281), and their pinned block: host
+    /// memory, beside the plan's lines rather than one of them.
+    pub retained_host_slots: u32,
+    pub retained_host_bytes: u64,
 }
 
 /// The exposition's content type: Prometheus text format 0.0.4.
@@ -385,6 +390,10 @@ pub struct Metrics {
     /// The retained slots held right now, and the count this load hands out.
     retained_slots_in_use: AtomicU64,
     retained_slots_capacity: AtomicU64,
+    /// Of the retained slots, the host ones and their pinned block (GitHub
+    /// #281): written once at load.
+    retained_host_slots: AtomicU64,
+    retained_host_bytes: AtomicU64,
     /// The load's reservations (GitHub #216): the plan's lines in
     /// `VramLines::entries()` order, then the shapes they bound. Written once
     /// at load, and zero on a load that built no plan.
@@ -450,6 +459,8 @@ impl Metrics {
             retained_slot_skips: Default::default(),
             retained_slots_in_use: AtomicU64::new(0),
             retained_slots_capacity: AtomicU64::new(0),
+            retained_host_slots: AtomicU64::new(0),
+            retained_host_bytes: AtomicU64::new(0),
             vram_reserved: Default::default(),
             vram_budget_bytes: AtomicU64::new(0),
             kv_pool_pages: AtomicU64::new(0),
@@ -613,6 +624,8 @@ impl Metrics {
         self.kv_page_bytes.store(reserved.kv_page_bytes, Ordering::Relaxed);
         self.kv_ram_arena_capacity_bytes.store(reserved.kv_ram_arena_bytes, Ordering::Relaxed);
         self.retained_slots_capacity.store(u64::from(reserved.retained_slots), Ordering::Relaxed);
+        self.retained_host_slots.store(u64::from(reserved.retained_host_slots), Ordering::Relaxed);
+        self.retained_host_bytes.store(reserved.retained_host_bytes, Ordering::Relaxed);
     }
 
     /// A request's first token came `ms` after its submission.
@@ -805,6 +818,16 @@ impl Metrics {
                 "ignis_kv_pool_used_pages",
                 "KV pool pages reserved by running requests and retained state.",
                 &self.kv_pool_used_pages,
+            ),
+            (
+                "ignis_retained_host_slots",
+                "Of the retained slots, those whose images live in the pinned host block.",
+                &self.retained_host_slots,
+            ),
+            (
+                "ignis_retained_host_bytes",
+                "The pinned host block holding the host retained slots' images.",
+                &self.retained_host_bytes,
             ),
         ];
         for (name, help, series) in plain_gauges {
@@ -1043,6 +1066,8 @@ mod tests {
             ("ignis_kv_pool_used_pages", "gauge"),
             ("ignis_kv_ram_arena_bytes", "gauge"),
             ("ignis_retained_slots", "gauge"),
+            ("ignis_retained_host_slots", "gauge"),
+            ("ignis_retained_host_bytes", "gauge"),
             ("ignis_requests_rejected_total", "counter"),
             ("ignis_request_ttft_seconds", "histogram"),
             ("ignis_request_duration_seconds", "histogram"),
@@ -1267,6 +1292,8 @@ mod tests {
             kv_page_bytes: 1_048_576,
             kv_ram_arena_bytes: 8 << 30,
             retained_slots: 9,
+            retained_host_slots: 7,
+            retained_host_bytes: 7 * 232_532_224,
         });
 
         let text = metrics.render();
@@ -1289,6 +1316,10 @@ mod tests {
         assert_eq!(value(&text, "ignis_kv_page_bytes", ""), "1048576");
         assert_eq!(value(&text, "ignis_kv_ram_arena_bytes", "state=\"capacity\""), "8589934592");
         assert_eq!(value(&text, "ignis_retained_slots", "state=\"capacity\""), "9");
+        // GitHub #281: of the nine, the host ones and their pinned block --
+        // host memory, beside the VRAM lines rather than one of them.
+        assert_eq!(value(&text, "ignis_retained_host_slots", ""), "7");
+        assert_eq!(value(&text, "ignis_retained_host_bytes", ""), "1627725568");
         // Nothing is occupied until a step reports occupancy.
         assert_eq!(value(&text, "ignis_kv_pool_used_pages", ""), "0");
         assert_eq!(value(&text, "ignis_kv_ram_arena_bytes", "state=\"used\""), "0");

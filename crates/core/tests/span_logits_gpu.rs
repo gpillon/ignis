@@ -105,6 +105,7 @@ fn every_row_of_the_span_logits_is_that_prefix_prompts_last_position() {
             max_context_tokens: MAX_CONTEXT,
             slot_count: 1,
             retained_slot_count: 0,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("pool: {e}"));

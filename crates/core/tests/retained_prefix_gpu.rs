@@ -229,6 +229,7 @@ fn claim_and_compare(
             slot_count: 4,
             // GitHub #215: the block's image goes into a retained slot.
             retained_slot_count: 1,
+            retained_host_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
