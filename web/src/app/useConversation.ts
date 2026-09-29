@@ -5,6 +5,7 @@ import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
 import type { PromptImage } from "../conversation/images.ts";
 import { computeFigures } from "../metrics/figures.ts";
+import { createFrameBatch, type FrameBatch } from "./frameBatch.ts";
 import {
   addAttachments,
   addLogRow,
@@ -82,7 +83,17 @@ export function useConversation({
   // a restarted count would hand out ids still on screen (duplicate keys).
   const ids = useRef(2);
   const newId = () => ids.current++;
-  const [list, setList] = useState<SessionList>(() => ({ sessions: [createSession(1)], activeId: 1 }));
+  const [list, commitList] = useState<SessionList>(() => ({ sessions: [createSession(1)], activeId: 1 }));
+  // What streams in — text, reasoning, calls, the tools as they run — waits
+  // for the next frame and lands as one update for every session
+  // (`frameBatch.ts`); any other change lands at once, after what waited.
+  const frames = useRef<FrameBatch<SessionList> | null>(null);
+  frames.current ??= createFrameBatch(commitList);
+  const setList = (update: (l: SessionList) => SessionList) => {
+    frames.current?.flush();
+    commitList(update);
+  };
+  const setSoon = (key: string, update: (l: SessionList) => SessionList) => frames.current?.set(key, update);
   // The sessions a reply is streaming into, for the render.
   const [streaming, setStreaming] = useState<ReadonlySet<number>>(() => new Set());
   // The same, as the turns themselves see it: a ref settles two Sends in one
@@ -235,10 +246,14 @@ export function useConversation({
     const turns = conversationTurns(conversation.map(exchangeOf));
     let reply: Message = { id: newId(), role: "assistant", content: "", reasoning: "", streaming: true };
     setList((l) => ({ ...l, sessions: addMessages(l.sessions, sessionId, [reply]) }));
-    const change = (f: (m: Message) => Message) => {
+    // The reply as it streams waits for the frame; its end lands at once, so a
+    // turn never waits on a frame and the next request sees the whole text.
+    const change = (f: (m: Message) => Message, now = false) => {
       reply = f(reply);
       const next = reply;
-      setList((l) => ({ ...l, sessions: updateMessage(l.sessions, sessionId, next.id, () => next) }));
+      const update = (l: SessionList) => ({ ...l, sessions: updateMessage(l.sessions, sessionId, next.id, () => next) });
+      if (now) setList(update);
+      else setSoon(`${sessionId}:${next.id}`, update);
     };
     const result = await streamChat({
       request: { settings: requestSettings, turns, extras },
@@ -256,7 +271,7 @@ export function useConversation({
     });
     const figures = result.ok ? computeFigures(result.timeline) : null;
     const error = result.ok ? undefined : result.message;
-    change((m) => ({ ...m, streaming: false, queued: false, figures: figures ?? undefined, error }));
+    change((m) => ({ ...m, streaming: false, queued: false, figures: figures ?? undefined, error }), true);
     logRow(sessionId, {
       laneTag: requestSettings.laneTag,
       reasoningEffort: requestSettings.reasoningEffort,
@@ -298,7 +313,7 @@ export function useConversation({
       const web = webRuns;
       const asked = questions;
       const localNow = localRuns;
-      setList((l) => ({
+      setSoon(`${sessionId}:${reply.id}:tools`, (l) => ({
         ...l,
         sessions: updateMessage(l.sessions, sessionId, reply.id, (m) => ({
           ...m,

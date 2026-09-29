@@ -29,6 +29,11 @@ export function Transcript(props: {
 }) {
   const { session: active, following, openAgent } = props;
   const transcript = useRef<HTMLDivElement>(null);
+  // A turn that did not change is not rendered again (`Reply`, `UserTurn`), so
+  // it keeps the handlers of an earlier render: they reach the page's current
+  // ones through here, never a stale closure.
+  const latest = useRef(props);
+  latest.current = props;
 
   useLayoutEffect(() => {
     const el = transcript.current;
@@ -50,13 +55,13 @@ export function Transcript(props: {
             if (m.role === "tool") return null;
             const actions: TurnActions = {
               canRerun: props.canRerun,
-              onSave: (text) => props.onSave(m.id, text),
-              onFork: () => props.onFork(m.id),
+              onSave: (text) => latest.current.onSave(m.id, text),
+              onFork: () => latest.current.onFork(m.id),
             };
             // Keyed by session too: a fork shares message ids with its source.
             const key = `${active.id}:${m.id}`;
             return m.role === "user" ? (
-              <UserTurn key={key} message={m} actions={actions} onResend={(text) => props.onRerun(m.id, text)} />
+              <UserTurn key={key} message={m} actions={actions} onResend={(text) => latest.current.onRerun(m.id, text)} />
             ) : (
               <Reply
                 key={key}
@@ -64,10 +69,10 @@ export function Transcript(props: {
                 markdown={props.markdown}
                 last={i === active.messages.length - 1}
                 actions={actions}
-                onRegenerate={() => props.onRerun(m.id, null)}
+                onRegenerate={() => latest.current.onRerun(m.id, null)}
                 openCallId={openAgent?.messageId === m.id ? openAgent.callId : null}
-                onOpenAgent={(callId) => props.onOpenAgent({ messageId: m.id, callId })}
-                onAnswer={(callId, text) => props.onAnswer(m.id, callId, text)}
+                onOpenAgent={(callId) => latest.current.onOpenAgent({ messageId: m.id, callId })}
+                onAnswer={(callId, text) => latest.current.onAnswer(m.id, callId, text)}
               />
             );
           })}

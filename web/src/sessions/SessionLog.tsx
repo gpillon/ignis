@@ -1,11 +1,18 @@
-import type { ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 import { describeFigures, type Figures } from "../metrics/figures.ts";
 import { EFFORT_LABELS } from "../settings/defaults.ts";
 import { IconChevron } from "../ui/icons.tsx";
 import type { LogRow } from "./sessions.ts";
 
-/** The session's log at the foot of the page: one row per request, collapsible. */
-export function SessionLog({ rows, open, onToggle }: { rows: LogRow[]; open: boolean; onToggle: () => void }) {
+/**
+ * The session's log at the foot of the page: one row per request,
+ * collapsible. A frame of streaming text leaves the log as it was, so it is
+ * not rendered again for one (GitHub #283); the toggle is the same whichever
+ * render handed it over.
+ */
+export const SessionLog = memo(Log, (prev, next) => prev.rows === next.rows && prev.open === next.open);
+
+function Log({ rows, open, onToggle }: { rows: LogRow[]; open: boolean; onToggle: () => void }) {
   const numeric = ["TTFT", "Decode", "Total", "Prompt", "Completion", "Finish"];
   const replies = rows.filter((row) => row.agent === undefined);
   const agentRows = rows.length - replies.length;
