@@ -5,7 +5,8 @@
 //! - `POST /v1/chat/completions` — chat completions, streaming (SSE) and
 //!   non-streaming; requests route into the core scheduler and tokens
 //!   stream back as they are generated.
-//! - `POST /v1/responses` — the OpenAI responses API (non-streaming in v1).
+//! - `POST /v1/responses` — the OpenAI Responses API, streaming or not, and
+//!   `GET /v1/responses`, its WebSocket mode (GitHub #282).
 //!
 //! Architecture: the server owns the core [`Scheduler`] behind an
 //! [`Engine`] — a dedicated model thread owning the scheduler exclusively,
@@ -35,6 +36,7 @@ pub mod metrics;
 pub mod playground;
 pub mod numbers;
 pub mod openapi;
+pub mod responses;
 pub mod reuse;
 pub mod runtime;
 pub mod scalar;
@@ -116,6 +118,12 @@ pub struct Server {
     /// The next `/v1/decide` fan-out's name (GitHub #270): what its head is
     /// kept under, and given up by.
     pub next_fan_out: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// What every Responses WebSocket shares (GitHub #282): the server-wide
+    /// admission queue and the open-socket count.
+    pub responses: std::sync::Arc<responses::Hub>,
+    /// The wall clock a response's `created_at` is read from (a fixed clock
+    /// keeps a test's events byte-for-byte reproducible).
+    pub wall_clock: std::sync::Arc<dyn telemetry::TelemetryClock>,
 }
 
 impl Server {
@@ -139,6 +147,8 @@ impl Server {
             instruction_policy: instruction::InstructionPolicy::default(),
             fork_history: std::sync::Arc::default(),
             next_fan_out: std::sync::Arc::default(),
+            responses: std::sync::Arc::default(),
+            wall_clock: std::sync::Arc::new(telemetry::SystemClock),
         }
     }
 
@@ -201,7 +211,14 @@ impl Server {
     pub fn with_metrics(mut self) -> Self {
         let metrics = std::sync::Arc::new(metrics::Metrics::new());
         self.engine.install_metrics(std::sync::Arc::clone(&metrics));
+        self.responses.install_metrics(std::sync::Arc::clone(&metrics));
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Read a response's `created_at` from `clock` instead of the wall.
+    pub fn with_wall_clock(mut self, clock: std::sync::Arc<dyn telemetry::TelemetryClock>) -> Self {
+        self.wall_clock = clock;
         self
     }
 

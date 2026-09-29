@@ -5,7 +5,7 @@
 //! Covers the three v1 endpoints + their error paths:
 //! - `GET /v1/models` — the loaded model.
 //! - `POST /v1/chat/completions` — non-streaming + streaming (SSE).
-//! - `POST /v1/responses` — the OpenAI responses API (non-streaming).
+//! - `POST /v1/responses` — the OpenAI responses API (`responses_http.rs` pins its events).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -608,7 +608,10 @@ async fn responses_api_string_input_returns_the_openai_shape() {
     assert_eq!(status, 200, "responses should be 200: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["object"], "response");
-    assert_eq!(v["status"], "completed");
+    // GitHub #282: the mock stops only at `max_output_tokens`, which is an
+    // `incomplete` response.
+    assert_eq!(v["status"], "incomplete");
+    assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
     assert_eq!(v["output"][0]["type"], "message");
     assert_eq!(v["output"][0]["role"], "assistant");
     assert_eq!(v["output"][0]["content"][0]["type"], "output_text");
@@ -759,16 +762,21 @@ async fn responses_api_refuses_an_unknown_role_with_its_message_index() {
     assert!(body["error"]["message"].as_str().unwrap().contains("index 1"));
 }
 
+/// GitHub #282: `stream: true` is served, as the Responses events
+/// (`responses_http.rs` pins the sequence).
 #[tokio::test]
-async fn a_streaming_responses_request_is_a_400() {
+async fn a_streaming_responses_request_is_served_as_events() {
     let h = harness();
     let req = serde_json::json!({
         "model": MODEL,
         "input": "hi",
+        "max_output_tokens": 1,
         "stream": true
     });
-    let (status, _body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
-    assert_eq!(status, 400, "streaming responses are unsupported in v1: 400");
+    let (status, body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.starts_with("event: response.created"), "{body}");
+    assert!(body.contains("event: response.incomplete"), "{body}");
 }
 
 // ── concurrency (GitHub #69: the isolated model thread) ─────────────────

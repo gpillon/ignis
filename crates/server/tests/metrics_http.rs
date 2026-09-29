@@ -612,6 +612,9 @@ async fn labels_stay_within_the_bounded_sets() {
         // GitHub #281: the host retained slots and their pinned block.
         "ignis_retained_host_slots",
         "ignis_retained_host_bytes",
+        // GitHub #282: the Responses sockets and their admission queue.
+        "ignis_responses_sockets",
+        "ignis_responses_queued_requests",
         "ignis_requests_rejected_total",
         "ignis_request_ttft_seconds_bucket",
         "ignis_request_ttft_seconds_sum",

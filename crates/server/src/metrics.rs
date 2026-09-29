@@ -418,6 +418,10 @@ pub struct Metrics {
     /// Per [`LOCATE_SERIES`] (GitHub #278). Absent from the exposition until
     /// the first `locate`, like the decision family.
     locates: [AtomicU64; LOCATE_SERIES.len()],
+    /// Open Responses API WebSockets, and their requests waiting in the
+    /// server-wide admission queue (GitHub #282).
+    responses_sockets: AtomicU64,
+    responses_queued: AtomicU64,
 }
 
 /// One retained-state family: a count per residency tier and per kind of
@@ -474,6 +478,8 @@ impl Metrics {
             answer_mass: Ratio::new(&ANSWER_MASS_BOUNDS),
             thinking_forced_closes: AtomicU64::new(0),
             locates: Default::default(),
+            responses_sockets: AtomicU64::new(0),
+            responses_queued: AtomicU64::new(0),
         }
     }
 
@@ -661,6 +667,16 @@ impl Metrics {
         self.cancelled.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The Responses WebSockets open now (GitHub #282).
+    pub(crate) fn set_responses_sockets(&self, open: u64) {
+        self.responses_sockets.store(open, Ordering::Relaxed);
+    }
+
+    /// The socket requests waiting in the admission queue now (GitHub #282).
+    pub(crate) fn set_responses_queued(&self, queued: u64) {
+        self.responses_queued.store(queued, Ordering::Relaxed);
+    }
+
     /// The scheduler's current request counts by observable state.
     pub(crate) fn set_scheduler_requests(&self, waiting: u32, running: u32) {
         self.waiting.store(u64::from(waiting), Ordering::Relaxed);
@@ -828,6 +844,16 @@ impl Metrics {
                 "ignis_retained_host_bytes",
                 "The pinned host block holding the host retained slots' images.",
                 &self.retained_host_bytes,
+            ),
+            (
+                "ignis_responses_sockets",
+                "Open Responses API WebSocket connections.",
+                &self.responses_sockets,
+            ),
+            (
+                "ignis_responses_queued_requests",
+                "Responses WebSocket requests waiting in the server-wide admission queue.",
+                &self.responses_queued,
             ),
         ];
         for (name, help, series) in plain_gauges {
@@ -1068,6 +1094,8 @@ mod tests {
             ("ignis_retained_slots", "gauge"),
             ("ignis_retained_host_slots", "gauge"),
             ("ignis_retained_host_bytes", "gauge"),
+            ("ignis_responses_sockets", "gauge"),
+            ("ignis_responses_queued_requests", "gauge"),
             ("ignis_requests_rejected_total", "counter"),
             ("ignis_request_ttft_seconds", "histogram"),
             ("ignis_request_duration_seconds", "histogram"),

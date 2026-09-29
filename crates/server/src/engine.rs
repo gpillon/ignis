@@ -35,7 +35,7 @@ use ignis_core::{
     SubmitError, TokenId,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::media::MediaStats;
 use crate::metrics::Metrics;
@@ -135,6 +135,10 @@ pub struct Engine {
     /// consumer after each tick (design §"telemetry: computed off the model
     /// thread, published wait-free").
     counters: Arc<ArcSwap<IntervalCounters>>,
+    /// Moves every time a request leaves the scheduler — finished or
+    /// cancelled — which is when a submission that found the engine full
+    /// may be admitted (GitHub #282, the socket admission queue).
+    freed: watch::Receiver<u64>,
 }
 
 impl Clone for Engine {
@@ -146,6 +150,7 @@ impl Clone for Engine {
             commands: self.commands.clone(),
             facts: self.facts.clone(),
             counters: Arc::clone(&self.counters),
+            freed: self.freed.clone(),
         }
     }
 }
@@ -187,13 +192,14 @@ impl Engine {
         let (command_tx, command_rx) = std_mpsc::channel();
         let (facts_tx, facts_rx) = unbounded_channel();
         let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
+        let (freed_tx, freed) = watch::channel(0);
 
         // The model thread: a single, dedicated OS thread that owns the
         // Scheduler + route table exclusively for the server's whole life.
         let facts_tx_for_thread = facts_tx.clone();
         let driver = std::thread::Builder::new()
             .name("ignis-model".into())
-            .spawn(move || model_thread_loop(scheduler, command_rx, facts_tx_for_thread))
+            .spawn(move || model_thread_loop(scheduler, command_rx, facts_tx_for_thread, freed_tx))
             .expect("spawning the model thread must not fail");
 
         // The telemetry consumer: an async task that owns `Telemetry` and
@@ -209,6 +215,7 @@ impl Engine {
                 commands: command_tx,
                 facts: facts_tx,
                 counters,
+                freed,
             },
             driver,
         )
@@ -313,6 +320,15 @@ impl Engine {
         let _ = self.facts.send(TelemetryFact::Cancelled(request));
     }
 
+    /// A receiver that changes every time a request leaves the scheduler,
+    /// finished or cancelled (GitHub #282): what a submission that met
+    /// [`SubmitError::Full`] waits on before it tries again. Mark the current
+    /// value seen *before* the attempt, so a request that leaves between the
+    /// refusal and the wait is not missed.
+    pub fn freed(&self) -> watch::Receiver<u64> {
+        self.freed.clone()
+    }
+
     /// Tell the model thread fan-out `owner` has ended (GitHub #270), so the
     /// **fan-out head** it kept goes. Fire-and-forget, so a handler's `Drop`
     /// can call it when the client leaves mid-fan-out.
@@ -330,12 +346,13 @@ fn model_thread_loop(
     mut scheduler: Box<dyn Scheduler>,
     commands: std_mpsc::Receiver<Command>,
     facts: UnboundedSender<TelemetryFact>,
+    freed: watch::Sender<u64>,
 ) {
     let mut streams: HashMap<RequestId, EventRoute> = HashMap::new();
     loop {
         loop {
             match commands.try_recv() {
-                Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts),
+                Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
                 Err(std_mpsc::TryRecvError::Empty) => break,
                 // Every Engine handle was dropped: clean shutdown (no
                 // in-flight request is silently dropped — the process is
@@ -345,7 +362,7 @@ fn model_thread_loop(
         }
         if !scheduler.is_idle() {
             let events = scheduler.advance();
-            route_events(&events, &mut streams, &facts);
+            route_events(&events, &mut streams, &facts, &freed);
             // Read after the step, not before: the step that releases the
             // last request's pages is the last one there is, so a reading
             // taken before it would leave the release unreported until a
@@ -361,7 +378,7 @@ fn model_thread_loop(
         // that would poll on a timer for no reason (an idle server costs
         // ~no CPU either way, but this is the tighter of the two).
         match commands.recv() {
-            Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts),
+            Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
             Err(_) => return,
         }
     }
@@ -373,6 +390,7 @@ fn handle_command(
     scheduler: &mut dyn Scheduler,
     streams: &mut HashMap<RequestId, EventRoute>,
     facts: &UnboundedSender<TelemetryFact>,
+    freed: &watch::Sender<u64>,
 ) {
     match command {
         Command::Submit { input, class, notes, reply } => {
@@ -392,13 +410,14 @@ fn handle_command(
         Command::Cancel { request } => {
             if scheduler.cancel(request) {
                 streams.remove(&request);
+                free(freed);
             }
         }
         // Routed like a step's events: the retained-slot gauge has to move
         // now, and an idle engine may not step again for a long time.
         Command::EndFanOut { owner } => {
             let events = scheduler.end_fan_out(owner);
-            route_events(&events, streams, facts);
+            route_events(&events, streams, facts, freed);
         }
     }
 }
@@ -409,6 +428,7 @@ fn route_events(
     events: &[SchedEvent],
     streams: &mut HashMap<RequestId, EventRoute>,
     facts: &UnboundedSender<TelemetryFact>,
+    freed: &watch::Sender<u64>,
 ) {
     for event in events {
         // Every event names the request it belongs to — except `Protected`
@@ -426,10 +446,17 @@ fn route_events(
                 // Completion: close the stream (the dropped sender ends the
                 // receiver — the `Done` itself was just delivered).
                 streams.remove(&request);
+                free(freed);
             }
         }
         let _ = facts.send(TelemetryFact::Routed(event.clone()));
     }
+}
+
+/// Tell whoever waits on [`Engine::freed`] that a request left the scheduler.
+/// Never blocks, and a server with nobody waiting pays one counter bump.
+fn free(freed: &watch::Sender<u64>) {
+    freed.send_modify(|n| *n = n.wrapping_add(1));
 }
 
 /// The request an event belongs to, or `None` for `Protected` (an
@@ -1104,8 +1131,9 @@ mod tests {
         let (thread_tx, mut thread_rx) = unbounded_channel();
         let (consumer_tx, consumer_rx) = unbounded_channel();
         let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
+        let (freed_tx, freed) = watch::channel(0);
         let driver = std::thread::spawn(move || {
-            model_thread_loop(Box::new(scheduler), command_rx, thread_tx)
+            model_thread_loop(Box::new(scheduler), command_rx, thread_tx, freed_tx)
         });
         let consumer = tokio::spawn(telemetry_task(
             Telemetry::new(Arc::new(crate::telemetry::FixedClock::new(0))),
@@ -1119,6 +1147,7 @@ mod tests {
             facts: consumer_tx.clone(),
             counters,
             artifact: ignis_core::ArtifactHash::UNKNOWN,
+            freed,
         };
         let recorder = tokio::spawn(async move {
             let mut ticks = Vec::new();
@@ -1167,8 +1196,9 @@ mod tests {
         let (thread_tx, mut thread_rx) = unbounded_channel();
         let (consumer_tx, consumer_rx) = unbounded_channel();
         let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
+        let (freed_tx, freed) = watch::channel(0);
         let driver = std::thread::spawn(move || {
-            model_thread_loop(Box::new(scheduler), command_rx, thread_tx)
+            model_thread_loop(Box::new(scheduler), command_rx, thread_tx, freed_tx)
         });
         let clock = Arc::new(crate::telemetry::FixedClock::new(0));
         let consumer = tokio::spawn(telemetry_task(
@@ -1183,6 +1213,7 @@ mod tests {
             facts: consumer_tx.clone(),
             counters,
             artifact: ignis_core::ArtifactHash::UNKNOWN,
+            freed,
         };
         // With metrics on, a scraper renders the projection for as long as
         // the workload runs (GitHub #90): scraping must not change the facts
@@ -1299,7 +1330,7 @@ mod tests {
         let (facts_tx, _facts_rx) = unbounded_channel();
         let (done_tx, done_rx) = std_mpsc::channel();
         std::thread::spawn(move || {
-            model_thread_loop(Box::new(scheduler), command_rx, facts_tx);
+            model_thread_loop(Box::new(scheduler), command_rx, facts_tx, watch::channel(0).0);
             // Reached only once `model_thread_loop` returns.
             let _ = done_tx.send(());
         });

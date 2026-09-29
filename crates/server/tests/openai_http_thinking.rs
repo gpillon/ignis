@@ -823,6 +823,8 @@ async fn streaming_carries_reasoning_then_content_deltas_in_order() {
     }
 }
 
+/// GitHub #282: the thinking channel is the response's `reasoning` item,
+/// never part of the message's text.
 #[tokio::test]
 async fn responses_api_text_carries_only_the_content_channel() {
     let h = harness_with(RecordingTemplateProvider::permissive(thinking_decode_map(0)));
@@ -833,9 +835,11 @@ async fn responses_api_text_carries_only_the_content_channel() {
     let (status, body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let text = v["output"][0]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(v["output"][0]["type"], "reasoning", "{body}");
+    assert_eq!(v["output"][0]["content"][0]["text"], "reasoning", "{body}");
+    assert_eq!(v["output"][1]["type"], "message", "{body}");
+    let text = v["output"][1]["content"][0]["text"].as_str().unwrap();
     assert_eq!(text, "answer", "text must be the content channel only");
-    assert!(!body.contains("reasoning"), "no reasoning field on this endpoint: {body}");
 }
 
 // ── multi-turn reasoning (stories 27-29) ────────────────────────────────

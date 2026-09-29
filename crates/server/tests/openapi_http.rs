@@ -84,6 +84,8 @@ fn the_document_lists_exactly_the_v1_surface() {
         "get /v1/models",
         "post /v1/chat/completions",
         "post /v1/responses",
+        // GitHub #282: the Responses API's WebSocket mode, deliberately.
+        "get /v1/responses",
         "post /v1/decide",
     ]
     .into_iter()
@@ -149,7 +151,7 @@ fn a_forced_thinking_close_is_documented_as_an_optional_field_of_each_response_s
     // Spec server/08: the field is absent when the close was not forced, so
     // a generated client must not require it.
     let document = document();
-    for schema in ["CompletionChoice", "ChunkChoice", "Responses"] {
+    for schema in ["CompletionChoice", "ChunkChoice", "ResponseObject"] {
         let schema = &document["components"]["schemas"][schema];
         assert!(schema["properties"]["thinking_budget_forced_at"].is_object(), "{schema}");
         let required = schema["required"].as_array().cloned().unwrap_or_default();

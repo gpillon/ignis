@@ -126,6 +126,13 @@ impl OutputDecoder {
         deltas
     }
 
+    /// The channel the next pushed token's text lands in (GitHub #282): what
+    /// a response counts that token towards. Read *before* the push, so the
+    /// token that carries `</think>` is still counted as reasoning.
+    pub fn channel(&self) -> Channel {
+        self.channel
+    }
+
     /// Flush the token decoder and this decoder's own held-back text.
     pub fn finish(&mut self) -> Vec<Delta> {
         let mut deltas = Vec::new();
