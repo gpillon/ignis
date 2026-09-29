@@ -599,6 +599,24 @@ async fn telemetry_task(
     }
 }
 
+/// Take every [`SchedEvent::Token`] already waiting on `rx` onto `run`,
+/// without waiting for one that is not there yet, and hand back the first
+/// event that is not a token (the caller handles it next, so order holds).
+///
+/// What lets a streaming reader send a round's tokens — or whatever piled up
+/// while its client was slow — as one delta instead of one per token, at no
+/// added latency: nothing is ever held back for tokens still to come.
+/// Telemetry is untouched: it counts every token on its own channel.
+pub fn drain_tokens(rx: &mut EventStream, run: &mut Vec<TokenId>) -> Option<SchedEvent> {
+    loop {
+        match rx.try_recv() {
+            Ok(SchedEvent::Token { token, .. }) => run.push(token),
+            Ok(other) => return Some(other),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Drive a submitted request's stream to completion: collect the generated
 /// tokens until the request's [`SchedEvent::Done`] (or its stream closes),
 /// returning them alongside why the request stopped (the OpenAI
@@ -1046,6 +1064,23 @@ mod tests {
         }
         assert!(saw_token, "the batch's Token must be routed after a Protected");
         assert!(saw_done, "the batch's Done must be routed after a Protected");
+    }
+
+    #[test]
+    fn draining_takes_the_waiting_tokens_and_stops_at_the_first_other_event() {
+        let (route, mut rx) = unbounded_channel();
+        for token in [7, 8, 9] {
+            route.send(SchedEvent::Token { request: 1, token }).unwrap();
+        }
+        route.send(SchedEvent::Requeued { request: 1 }).unwrap();
+        route.send(SchedEvent::Token { request: 1, token: 10 }).unwrap();
+        let mut run = vec![6];
+        let held = drain_tokens(&mut rx, &mut run);
+        assert_eq!(run, [6, 7, 8, 9]);
+        assert!(matches!(held, Some(SchedEvent::Requeued { .. })), "{held:?}");
+        let mut next = Vec::new();
+        assert!(drain_tokens(&mut rx, &mut next).is_none(), "nothing waits behind the last token");
+        assert_eq!(next, [10]);
     }
 
     // ── the primary seam: the isolated model thread (GitHub #69) ──────────

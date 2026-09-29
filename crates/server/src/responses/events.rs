@@ -27,7 +27,7 @@ use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use utoipa::ToSchema;
 
-use ignis_core::{FinishReason, SchedEvent};
+use ignis_core::{FinishReason, SchedEvent, TokenId};
 
 use crate::decoder::{Channel, Delta, OutputDecoder};
 use crate::toolcall::{ToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
@@ -269,15 +269,7 @@ impl ResponseEvents {
     pub(crate) fn on_event(&mut self, event: SchedEvent) -> Vec<JsonValue> {
         let mut out = Vec::new();
         match event {
-            SchedEvent::Token { token, .. } => {
-                self.output_tokens += 1;
-                if self.decoder.channel() == Channel::Reasoning {
-                    self.reasoning_tokens += 1;
-                }
-                for delta in self.decoder.push(&[token]) {
-                    self.route(delta, &mut out);
-                }
-            }
+            SchedEvent::Token { token, .. } => return self.on_tokens(&[token]),
             // The tokens this request did not prefill because it resumed
             // from retained state (a prompt checkpoint), or stood on a shared
             // prefix (retained or a live sibling's). A request claims one or
@@ -305,6 +297,26 @@ impl ResponseEvents {
                 self.finish(ending, &mut out);
             }
             _ => {}
+        }
+        out
+    }
+
+    /// The events a run of tokens that arrived together makes available:
+    /// one delta per channel the run touched, never one per token
+    /// ([`crate::decoder::join`]). Each token is still counted on the
+    /// channel it was generated on.
+    pub(crate) fn on_tokens(&mut self, tokens: &[TokenId]) -> Vec<JsonValue> {
+        let mut deltas = Vec::new();
+        for &token in tokens {
+            self.output_tokens += 1;
+            if self.decoder.channel() == Channel::Reasoning {
+                self.reasoning_tokens += 1;
+            }
+            deltas.extend(self.decoder.push(&[token]));
+        }
+        let mut out = Vec::new();
+        for delta in crate::decoder::join(deltas) {
+            self.route(delta, &mut out);
         }
         out
     }
@@ -565,5 +577,152 @@ impl ResponseEvents {
             Ending::Failed => "response.failed",
         };
         self.lifecycle(kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::TokenDecoder;
+    use crate::responses::{drive, Driven};
+
+    /// Token `n` is `TEXTS[n]`.
+    struct Texts(&'static [&'static str]);
+
+    impl TokenDecoder for Texts {
+        fn push(&mut self, token: TokenId) -> String {
+            self.0[token as usize].to_owned()
+        }
+        fn finish(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    fn events(texts: &'static [&'static str], thinking: bool) -> ResponseEvents {
+        let response = ResponseObject {
+            id: "resp_0".into(),
+            object: "response",
+            created_at: 0,
+            status: "in_progress",
+            background: false,
+            error: None,
+            incomplete_details: None,
+            instructions: None,
+            max_output_tokens: None,
+            model: "m".into(),
+            output: Vec::new(),
+            parallel_tool_calls: true,
+            previous_response_id: None,
+            reasoning: JsonValue::Null,
+            store: true,
+            temperature: 0.0,
+            text: JsonValue::Null,
+            tool_choice: json!("auto"),
+            tools: Vec::new(),
+            top_p: 1.0,
+            truncation: "disabled",
+            usage: None,
+            metadata: json!({}),
+            thinking_budget_forced_at: None,
+        };
+        let decoder = OutputDecoder::new(Box::new(Texts(texts)), thinking);
+        ResponseEvents::new(response, "0".into(), decoder, ToolSchemas::from_tools(&[]), 1)
+    }
+
+    fn done(tokens: u32) -> SchedEvent {
+        SchedEvent::Done {
+            request: 0,
+            tokens,
+            reason: FinishReason::Stop,
+            spec: None,
+            readout: None,
+            attention: None,
+            drawn: None,
+            thinking: None,
+        }
+    }
+
+    /// Every event for `tokens`, pushed one at a time or as one run.
+    fn produced(texts: &'static [&'static str], thinking: bool, run: bool) -> Vec<JsonValue> {
+        let mut events = events(texts, thinking);
+        let tokens: Vec<TokenId> = (0..texts.len() as u32).collect();
+        let mut out = Vec::new();
+        if run {
+            out.extend(events.on_tokens(&tokens));
+        } else {
+            for &token in &tokens {
+                out.extend(events.on_event(SchedEvent::Token { request: 0, token }));
+            }
+        }
+        out.extend(events.on_event(done(tokens.len() as u32)));
+        out
+    }
+
+    fn of_type<'a>(events: &'a [JsonValue], kind: &str) -> Vec<&'a JsonValue> {
+        events.iter().filter(|e| e["type"] == kind).collect()
+    }
+
+    fn joined(events: &[JsonValue], kind: &str) -> String {
+        of_type(events, kind).iter().map(|e| e["delta"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn a_run_across_the_thinking_close_is_one_reasoning_delta_then_one_content_delta() {
+        const TEXTS: &[&str] = &["let me ", "think", "</thi", "nk>The ", "answer"];
+        let run = produced(TEXTS, true, true);
+        let deltas: Vec<(&str, &str)> = run
+            .iter()
+            .filter(|e| e["type"].as_str().is_some_and(|t| t.ends_with("text.delta")))
+            .map(|e| (e["type"].as_str().unwrap(), e["delta"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            deltas,
+            [("response.reasoning_text.delta", "let me think"), ("response.output_text.delta", "The answer")]
+        );
+        let usage = &run.last().unwrap()["response"]["usage"];
+        assert_eq!(usage["output_tokens"], 5);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 4, "still counted token by token");
+    }
+
+    #[test]
+    fn a_run_is_byte_for_byte_the_text_and_calls_token_by_token_gives() {
+        const TEXTS: &[&str] = &[
+            "plan\n", "</think>\n", "Reading ", "<tool_", "call>\n<function=read>\n<parameter=path>\na.txt\n</para",
+            "meter>\n</function>\n</tool_call>", " then ", "more <", "tool_call>\n<function=b>\n</function>\n</tool_call>",
+        ];
+        let (one, run) = (produced(TEXTS, true, false), produced(TEXTS, true, true));
+        for kind in ["response.reasoning_text.delta", "response.output_text.delta"] {
+            assert_eq!(joined(&run, kind), joined(&one, kind), "{kind}");
+        }
+        let calls = |events: &[JsonValue]| -> Vec<JsonValue> {
+            of_type(events, "response.function_call_arguments.done").iter().map(|e| e["arguments"].clone()).collect()
+        };
+        assert_eq!(calls(&run), calls(&one));
+        assert_eq!(calls(&run).len(), 2);
+        assert_eq!(run.last().unwrap()["response"]["output"], one.last().unwrap()["response"]["output"]);
+        assert!(of_type(&run, "response.output_text.delta").len() < of_type(&one, "response.output_text.delta").len());
+    }
+
+    /// A round's tokens waiting together are one delta, and the ending still
+    /// comes after it.
+    #[tokio::test]
+    async fn a_round_of_tokens_already_waiting_is_one_delta_and_the_ending_follows_it() {
+        const TEXTS: &[&str] = &["one ", "two ", "three ", "four"];
+        let (route, mut stream) = tokio::sync::mpsc::unbounded_channel();
+        for token in 0..4 {
+            route.send(SchedEvent::Token { request: 0, token }).unwrap();
+        }
+        route.send(done(4)).unwrap();
+        let mut events = events(TEXTS, false);
+        let mut emitted = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let driven = drive(&mut events, &mut stream, deadline, |e| emitted.push(e)).await;
+        assert!(matches!(driven, Driven::Ended));
+        let deltas = of_type(&emitted, "response.output_text.delta");
+        assert_eq!(deltas.len(), 1, "{emitted:?}");
+        assert_eq!(deltas[0]["delta"], "one two three four");
+        let at = |kind: &str| emitted.iter().position(|e| e["type"] == kind).unwrap();
+        assert!(at("response.output_text.delta") < at("response.output_text.done"));
+        assert_eq!(emitted.last().unwrap()["type"], "response.completed");
     }
 }

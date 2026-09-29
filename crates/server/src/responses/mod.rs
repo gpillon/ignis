@@ -32,7 +32,8 @@ use serde_json::Value as JsonValue;
 use utoipa::ToSchema;
 
 use crate::api::{self, ApiError, CancelOnDrop};
-use crate::engine::EventStream;
+use crate::engine::{drain_tokens, EventStream};
+use ignis_core::SchedEvent;
 use crate::Server;
 use events::{ResponseEvents, ResponseObject};
 use input::CreateResponse;
@@ -61,13 +62,23 @@ pub(crate) async fn drive(
 ) -> Driven {
     let expiry = tokio::time::sleep_until(deadline);
     tokio::pin!(expiry);
+    let mut held = None;
     loop {
-        let event = tokio::select! {
-            biased;
-            () = &mut expiry => return Driven::TimedOut,
-            event = stream.recv() => event,
+        let event = match held.take() {
+            Some(event) => Some(event),
+            None => tokio::select! {
+                biased;
+                () = &mut expiry => return Driven::TimedOut,
+                event = stream.recv() => event,
+            },
         };
         match event {
+            // A token and every one already waiting behind it, as one run.
+            Some(SchedEvent::Token { token, .. }) => {
+                let mut run = vec![token];
+                held = drain_tokens(stream, &mut run);
+                events.on_tokens(&run).into_iter().for_each(&mut emit);
+            }
             Some(event) => {
                 events.on_event(event).into_iter().for_each(&mut emit);
                 if events.ending().is_some() {
@@ -172,6 +183,7 @@ pub(crate) async fn create_response(
             deadline: Box::pin(tokio::time::sleep_until(deadline)),
             timeout: server.request_timeout,
             ended: false,
+            held: None,
         })
         .into_response();
     }
@@ -202,6 +214,8 @@ struct EventSse {
     deadline: Pin<Box<tokio::time::Sleep>>,
     timeout: std::time::Duration,
     ended: bool,
+    /// The event that ended the last run of tokens, handled next.
+    held: Option<SchedEvent>,
 }
 
 impl Stream for EventSse {
@@ -226,7 +240,18 @@ impl Stream for EventSse {
                 this.ended = true;
                 continue;
             }
-            match this.stream.poll_recv(cx) {
+            let polled = match this.held.take() {
+                Some(event) => Poll::Ready(Some(event)),
+                None => this.stream.poll_recv(cx),
+            };
+            match polled {
+                // A token and every one already waiting behind it, as one run.
+                Poll::Ready(Some(SchedEvent::Token { token, .. })) => {
+                    let mut run = vec![token];
+                    this.held = drain_tokens(&mut this.stream, &mut run);
+                    this.pending.extend(this.events.on_tokens(&run));
+                    continue;
+                }
                 Poll::Ready(Some(event)) => {
                     this.pending.extend(this.events.on_event(event));
                     if this.events.ending().is_some() {

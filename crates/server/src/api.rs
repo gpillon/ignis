@@ -43,7 +43,7 @@ use ignis_core::{
 
 use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
-use crate::engine::{Completion, Engine, EventStream, RequestNotes, collect_completion};
+use crate::engine::{Completion, Engine, EventStream, RequestNotes, collect_completion, drain_tokens};
 use crate::media::{has_media, MediaRejection, MediaStats};
 use crate::template::{
     check_content_parts, check_roles, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
@@ -1507,6 +1507,9 @@ struct ChunkStream {
     pending: VecDeque<Event>,
     /// The `[DONE]` marker has been emitted (exactly once, at the end).
     done_sent: bool,
+    /// The event that ended the last run of tokens: taken before the stream
+    /// is polled again, so the order holds.
+    held: Option<SchedEvent>,
     /// At least one non-empty `Reasoning` delta was ever queued (GitHub
     /// #70 via #121 acceptance criterion 5).
     emitted_reasoning: bool,
@@ -1571,6 +1574,7 @@ impl ChunkStream {
             include_usage,
             pending: VecDeque::new(),
             done_sent: false,
+            held: None,
             emitted_reasoning: false,
             emitted_content_or_call: false,
         }
@@ -1709,7 +1713,11 @@ impl Stream for ChunkStream {
             if let Some(event) = this.pending.pop_front() {
                 return Poll::Ready(Some(Ok(event)));
             }
-            match this.stream.poll_recv(cx) {
+            let polled = match this.held.take() {
+                Some(event) => Poll::Ready(Some(event)),
+                None => this.stream.poll_recv(cx),
+            };
+            match polled {
                 Poll::Ready(None) => {
                     // Stream closed (the request completed and the engine
                     // removed its route — or the engine stopped): the
@@ -1723,11 +1731,16 @@ impl Stream for ChunkStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(event)) => match event {
                     SchedEvent::Token { token, .. } => {
-                        // The incremental decoder: zero, one, or two deltas
-                        // for this token (GitHub #68). Zero means the
-                        // decoder is holding back — loop to poll the next
-                        // scheduler event rather than returning nothing.
-                        for delta in this.decoder.push(&[token]) {
+                        // This token and every one already waiting behind
+                        // it, as one run: a round's tokens make one chunk
+                        // per channel, not one each, and nothing waits for
+                        // tokens still to come. The incremental decoder
+                        // (GitHub #68) may give nothing yet — holding back a
+                        // `</think>` prefix or a partial character — and
+                        // then the loop polls on rather than returning.
+                        let mut run = vec![token];
+                        this.held = drain_tokens(&mut this.stream, &mut run);
+                        for delta in this.decoder.push_run(&run) {
                             this.queue_decoder_delta(delta);
                         }
                     }
@@ -1872,6 +1885,72 @@ mod tests {
         assert_eq!(json["usage"]["prompt_tokens"], 58);
         assert_eq!(json["usage"]["completion_tokens"], 1500);
         assert_eq!(json["usage"]["total_tokens"], 1558);
+    }
+
+    /// Token `n` reads as `WORDS[n]`.
+    struct Words;
+
+    const WORDS: &[&str] = &["one ", "two ", "three ", "four"];
+
+    impl crate::decoder::TokenDecoder for Words {
+        fn push(&mut self, token: ignis_core::TokenId) -> String {
+            WORDS[token as usize].to_owned()
+        }
+        fn finish(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    /// A round's tokens already waiting when the stream is polled are one
+    /// chunk, not one per token; the finish chunk and `[DONE]` still follow.
+    #[tokio::test]
+    async fn a_round_of_tokens_already_waiting_is_one_chat_chunk() {
+        let scheduler = ignis_core::ConcreteScheduler::with_config(
+            ignis_core::SchedulerConfig { model: "m".into(), ..ignis_core::SchedulerConfig::default() },
+            Arc::new(ignis_core::MockCompute::new()),
+        );
+        let engine = Engine::new(Box::new(scheduler));
+        let (route, stream) = tokio::sync::mpsc::unbounded_channel();
+        for token in 0..4 {
+            route.send(SchedEvent::Token { request: 9, token }).unwrap();
+        }
+        route
+            .send(SchedEvent::Done {
+                request: 9,
+                tokens: 4,
+                reason: FinishReason::Stop,
+                spec: None,
+                readout: None,
+                attention: None,
+                drawn: None,
+                thinking: None,
+            })
+            .unwrap();
+        drop(route);
+        let chunks = ChunkStream::new(
+            stream,
+            CancelOnDrop::new(engine, 9),
+            "chatcmpl-9".into(),
+            0,
+            "m".into(),
+            OutputDecoder::new(Box::new(Words), false),
+            ToolSchemas::from_tools(&[]),
+            1,
+            false,
+        );
+        let body = Sse::new(chunks).into_response().into_body();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let data: Vec<&str> = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
+        assert_eq!(data.len(), 3, "one content chunk, the finish chunk, [DONE]: {data:?}");
+        let first: JsonValue = serde_json::from_str(data[0]).unwrap();
+        assert_eq!(first["choices"][0]["delta"]["content"], "one two three four");
+        let finish: JsonValue = serde_json::from_str(data[1]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert_eq!(data[2], "[DONE]");
     }
 
     // ── GitHub #120: tagged lanes (the `class` extension + "@<lane>") ────
