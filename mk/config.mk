@@ -61,10 +61,11 @@ DEVELOPER_MESSAGE_POLICY ?= inplace
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
 # Defaults: a 524288-token context -- twice the checkpoint's trained 262,144
-# positions, on the linear rotary table unless ROPE_SCALING names YaRN -- then
+# positions, which is why ROPE_SCALING below defaults to yarn:2 -- then
 # hq-e8-2b KV, DFlash2 speculation with a 7-token draft window. The G5 gate
-# legs (docs/specs/runtime/05) ran at MAX_CONTEXT=262144. Empty = leave the
-# flag off (the server's default); SPEC= turns speculation off.
+# legs (docs/specs/runtime/05) ran at MAX_CONTEXT=262144 ROPE_SCALING=none.
+# Empty = leave the flag off (the server's default); SPEC= turns speculation
+# off.
 MAX_CONTEXT ?= 524288
 KV_FORMAT ?= hq-e8-2b
 PREFILL_CHUNK ?= 1024
@@ -97,12 +98,14 @@ RETAINED_HOST ?=
 # (--vision-max-tokens); empty = the server's own envelope.
 VISION ?=
 VISION_MAX_TOKENS ?=
-# RoPE scaling (--rope-scaling, GitHub #227): the text rotary table. Empty
-# (or `none`) is the linear table the checkpoint was trained with, correct
+# RoPE scaling (--rope-scaling, GitHub #227): the text rotary table. `none`
+# (or empty) is the linear table the checkpoint was trained with, correct
 # through 262,144 positions; `yarn:F` rescales that envelope by F, which is
 # what a MAX_CONTEXT past it needs to mean anything. The full spelling is
-# `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]`.
-ROPE_SCALING ?=
+# `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]`. Defaults to yarn:2, the envelope
+# MAX_CONTEXT=524288 needs; it rescales every request's table, short ones
+# included, so MAX_CONTEXT=262144 wants ROPE_SCALING=none beside it.
+ROPE_SCALING ?= yarn:2
 # The KV-RAM host tier's budget (--kv-host-pool-bytes, P4-07, GitHub #125):
 # 0 disables the host tier entirely (no evict-to-RAM overflow path).
 KV_HOST_POOL_BYTES ?= 8G
