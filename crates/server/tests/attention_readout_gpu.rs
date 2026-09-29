@@ -201,6 +201,7 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
                 set: Some(set_query.clone()),
             })),
             constrained: None,
+            warm_up: false,
         };
 
         // One armed prefill, driven by the scheduler to its completion.

@@ -40,6 +40,7 @@ fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
     }
 }
 

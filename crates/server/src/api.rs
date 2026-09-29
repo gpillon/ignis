@@ -337,6 +337,7 @@ fn request_input(
         system_block_tokens: rendered.system_block_tokens,
         reuse_boundaries: Vec::new(),
         constrained: None,
+        warm_up: false,
 };
     Ok(PreparedRequest { input, model, prompt_tokens, media: None, part_ends: rendered.part_ends, text })
 }

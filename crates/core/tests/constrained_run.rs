@@ -262,6 +262,7 @@ mod scheduler {
             reuse_boundaries: Vec::new(),
             decision: None,
             constrained: Some(Arc::new(Schedule::new(steps).expect("a legal program"))),
+            warm_up: false,
         }
     }
 
@@ -467,6 +468,7 @@ mod terminator {
             reuse_boundaries: Vec::new(),
             decision: None,
             constrained: Some(Arc::new(schedule)),
+            warm_up: false,
         }
     }
 

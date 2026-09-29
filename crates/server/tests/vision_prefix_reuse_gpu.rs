@@ -99,6 +99,7 @@ fn request(provider: &ArtifactTemplateProvider, processor: &ignis_artifact::visi
     RequestInput {
         decision: None,
         constrained: None,
+        warm_up: false,
         model: MODEL.into(),
         tokens: rendered.tokens,
         params: DecodeParams { max_tokens: Some(MAX_TOKENS), ..DecodeParams::default() },

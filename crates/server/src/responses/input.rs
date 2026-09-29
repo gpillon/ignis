@@ -218,9 +218,9 @@ pub(crate) async fn prepare(
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
     let schemas = ToolSchemas::from_tools(&tools);
-    let (input, model, prompt_tokens, media) =
+    let (mut input, model, prompt_tokens, media) =
         api::prepare_request(server, model, &messages, params, &thinking, &tools).await?;
-    let _ = warm_up;
+    input.warm_up = warm_up;
 
     let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
     let response = ResponseObject {

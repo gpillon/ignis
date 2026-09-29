@@ -799,6 +799,30 @@ When output names a domain concept, use the term as defined here.
   **allowance**, clamped to the image. A head `point` is its centre and
   carries it as `extent`; a head `box` is it.
 
+## The Responses API
+
+- **Stream** — one of the independent request sequences a Responses
+  WebSocket multiplexes (OpenAI's `stream_id`; the connection's **default
+  stream** when it names none). Its requests run in order and never overlap;
+  different streams run side by side. It is the standard's word and nothing
+  in the engine: never call it a **lane**, which is a decode slot.
+- **Continuation cache** — what one Responses WebSocket remembers so a request
+  can name `previous_response_id` and send only new items: per **stream**, its
+  latest finished response and the whole conversation that response saw.
+  It chooses nothing about retained state: a continuation re-renders that
+  conversation, and reuse stays a content match on the **prompt checkpoint**
+  and **retained prefix** (ADR 0029). It dies with the connection.
+- **Warm-up request** — a request that ends where its prefill ends and
+  generates nothing, like a **decision**, but reads nothing out and keeps what
+  an ordinary request of the same prompt keeps: the **retained prefix** at its
+  system block and the **prompt checkpoint** at its generation opener, for the
+  turn that follows. The Responses WebSocket's `generate: false`.
+  _Avoid_: prewarm (for the request kind; it is the client's word for the act).
+- **Socket admission queue** — the one server-wide first-in, first-out queue a
+  Responses WebSocket request waits in when the engine is full, told so with
+  `response.queued`, instead of being refused with a 503 as an HTTP request
+  is. Only its head retries, each time a request leaves the scheduler.
+
 ## Observability
 
 - **Canonical event** — the one structured representation of a log occurrence

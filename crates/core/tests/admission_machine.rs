@@ -46,6 +46,7 @@ fn input(tokens: &[u32], max: u32) -> RequestInput {
             ..Default::default()
         },
         constrained: None,
+        warm_up: false,
     }
 }
 
@@ -362,6 +363,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
                 tokens: full_prompt,
                 params: DecodeParams::default(),
                 constrained: None,
+                warm_up: false,
             },
             RequestClass::Agent,
         ),
@@ -385,6 +387,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
                 tokens: (0..10).collect(),
                 params: DecodeParams::default(),
                 constrained: None,
+                warm_up: false,
             },
             RequestClass::Agent,
         )

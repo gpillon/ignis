@@ -326,7 +326,7 @@ fn lands_on(start: u32, take: u32, point: u32) -> bool {
 /// whole length, because the reservation is made at submit and which round
 /// closes the shape is not known then.
 fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
-    if input.is_decision() {
+    if input.ends_at_prefill() {
         return 0;
     }
     if let Some(schedule) = &input.constrained {
@@ -3476,6 +3476,10 @@ impl Scheduler for ConcreteScheduler {
         //
         // `FinishReason::Stop` because the decision is *answered* — nothing
         // was cut short. Its `tokens` is 0, honestly: it generated nothing.
+        //
+        // GitHub #282: a **warm-up** ends here too, for the same reasons, and
+        // always with `Stop` — its whole purpose, the state its prefill left
+        // behind, was published by the chunks that landed it.
         let decided: Vec<usize> = self
             .requests
             .iter()
@@ -3483,11 +3487,15 @@ impl Scheduler for ConcreteScheduler {
             .filter(|&(_, r)| {
                 r.state == RequestState::Prefilling
                     && r.prefill_complete()
-                    && r.input.is_decision()
+                    && r.input.ends_at_prefill()
             })
             .map(|(i, _)| i)
             .collect();
         for idx in decided {
+            if self.requests[idx].input.warm_up {
+                self.mark_done(idx, &mut events, FinishReason::Stop);
+                continue;
+            }
             // A decision that finished its prefill with no readout should be
             // impossible: its last chunk always carries at least one token
             // (`RequestInput::reuse_reach`) and always asks for one, and a

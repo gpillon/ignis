@@ -208,6 +208,7 @@ impl Loaded {
             system_block_tokens: Some(block),
             reuse_boundaries: Vec::new(),
             constrained: None,
+            warm_up: false,
         }
     }
 }

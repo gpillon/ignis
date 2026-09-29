@@ -197,6 +197,7 @@ fn the_set_costs_under(test: &str, image: &str, instruction: &str, bound_ms: f64
             }),
         }),
         constrained: None,
+        warm_up: false,
     };
 
     let mut gpu: [Vec<f64>; 3] = Default::default();

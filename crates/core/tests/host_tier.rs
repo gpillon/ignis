@@ -40,6 +40,7 @@ fn input(max: u32) -> RequestInput {
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
     }
 }
 
@@ -289,6 +290,7 @@ fn a_burst_on_one_prefix_overflows_through_materialized_snapshots_without_repref
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
 };
 
     // Eight fillers share one 16-token prefix (a whole page): the first
@@ -404,6 +406,7 @@ fn a_request_holding_a_shared_prefix_is_evicted_with_its_prefix_materialized() {
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
 };
 
     // `main` publishes a one-page head; `sub` claims it and prefills only its
@@ -507,6 +510,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                         ..DecodeParams::default()
                     },
                     constrained: None,
+                    warm_up: false,
                 },
                 RequestClass::Interactive,
             )
@@ -532,6 +536,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                     ..DecodeParams::default()
                 },
                 constrained: None,
+                warm_up: false,
             },
             RequestClass::Interactive,
         )
@@ -555,6 +560,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                     ..DecodeParams::default()
                 },
                 constrained: None,
+                warm_up: false,
             },
             RequestClass::Agent,
         )

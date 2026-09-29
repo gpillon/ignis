@@ -625,3 +625,60 @@ async fn closing_the_socket_cancels_what_it_had_running_and_queued() {
     metric_reaches(&metrics, "ignis_responses_queued_requests 0").await;
     metric_reaches(&metrics, "ignis_responses_sockets 0").await;
 }
+
+// ── acceptance 11: the warm-up (`generate: false`) ───────────────────────
+
+/// Twenty words: past one whole 16-token page, where retained state can be
+/// kept.
+fn words(prefix: &str) -> String {
+    (0..20).map(|n| format!("{prefix}{n}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Warm up with `warm_up` (as `generate: false`), then continue from it with
+/// `turn` on the same socket; the warm-up's terminal event and the turn's
+/// `cached_tokens`.
+async fn warm_then_continue(config: SchedulerConfig, warm_up: JsonValue, turn: JsonValue) -> (JsonValue, JsonValue) {
+    let live = live(server(&Script::with_boundaries(HashMap::new()), config, plain())).await;
+    let mut socket = socket(&live).await;
+    let mut event = create(&warm_up, None);
+    event["generate"] = json!(false);
+    send(&mut socket, event).await;
+    let warmed = stream_until_terminal(&mut socket, None).await;
+    let done = warmed.last().unwrap().clone();
+    let mut turn = create(&turn, None);
+    turn["previous_response_id"] = done["response"]["id"].clone();
+    send(&mut socket, turn).await;
+    let answered = stream_until_terminal(&mut socket, None).await.pop().unwrap();
+    assert_ne!(answered["type"], "error", "{answered}");
+    (done, answered["response"]["usage"]["input_tokens_details"]["cached_tokens"].clone())
+}
+
+#[tokio::test]
+async fn a_warm_up_prefills_without_generating_and_the_next_turn_resumes_from_it() {
+    let warm_up = json!({ "model": MODEL, "input": words("w"), "max_output_tokens": 64, "enable_thinking": false });
+    let turn = json!({ "model": MODEL, "input": "and now answer", "max_output_tokens": 1, "enable_thinking": false });
+    let (warmed, cached) = warm_then_continue(SchedulerConfig::default(), warm_up, turn).await;
+    assert_eq!(warmed["type"], "response.completed");
+    assert_eq!(warmed["response"]["output"], json!([]), "a warm-up has no output");
+    assert_eq!(warmed["response"]["usage"]["output_tokens"], 0);
+    assert_eq!(cached, 20, "the turn resumed from the checkpoint the warm-up took at its opener");
+}
+
+#[tokio::test]
+async fn a_warm_up_of_instructions_alone_serves_the_next_turn_its_system_block() {
+    let warm_up = json!({ "model": MODEL, "instructions": words("sys"), "enable_thinking": false });
+    let turn = json!({ "model": MODEL, "instructions": words("sys"), "input": "hi", "max_output_tokens": 1, "enable_thinking": false });
+    let (warmed, cached) = warm_then_continue(SchedulerConfig::default(), warm_up, turn).await;
+    assert_eq!(warmed["type"], "response.completed");
+    assert!(cached.as_u64().unwrap() >= 16, "at least the retained prefix's whole page: {cached}");
+}
+
+#[tokio::test]
+async fn a_warm_up_with_no_retained_slot_free_still_completes() {
+    let config = SchedulerConfig { retained_slots: 0, ..SchedulerConfig::default() };
+    let warm_up = json!({ "model": MODEL, "input": words("w"), "enable_thinking": false });
+    let turn = json!({ "model": MODEL, "input": "and now answer", "max_output_tokens": 1, "enable_thinking": false });
+    let (warmed, cached) = warm_then_continue(config, warm_up, turn).await;
+    assert_eq!(warmed["type"], "response.completed");
+    assert_eq!(cached, 0, "nothing was kept, and the turn still ran");
+}

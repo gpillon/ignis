@@ -47,6 +47,7 @@ fn head_point(prompt: Vec<TokenId>, begin: u32, count: u32) -> RequestInput {
             set: None,
         })),
         constrained: None,
+        warm_up: false,
     }
 }
 

@@ -1023,6 +1023,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
                     ..DecodeParams::default()
                 },
                 constrained: None,
+                warm_up: false,
             },
             RequestClass::Interactive,
         )
@@ -1058,6 +1059,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
                 constrained: None,
+                warm_up: false,
             },
             RequestClass::Interactive,
         )
@@ -1104,6 +1106,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
 };
     scheduler
         .submit(input(vec![1, 2, 3, 4]), RequestClass::Interactive)
@@ -1163,6 +1166,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
 };
     scheduler
         .submit(input(), RequestClass::Interactive)
@@ -1221,6 +1225,7 @@ fn checkpoint_input(tokens: Vec<u32>, opener: Option<u32>) -> RequestInput {
             ..DecodeParams::default()
         },
         constrained: None,
+        warm_up: false,
     }
 }
 
@@ -1513,6 +1518,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
                         ..DecodeParams::default()
                     },
                     constrained: None,
+                    warm_up: false,
                 },
                 RequestClass::Agent,
             )
@@ -1891,6 +1897,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
                 system_block_tokens: None,
                 reuse_boundaries: Vec::new(),
                 constrained: None,
+                warm_up: false,
             },
             RequestClass::Agent,
         )
