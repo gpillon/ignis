@@ -12,7 +12,9 @@ ignis-runtime = { path = "../runtime" }
 ignis-logging = { path = "../logging" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-axum = { workspace = true }
+# `ws`: the Responses API's WebSocket mode (GitHub #282), `tokio-tungstenite`
+# 0.29 underneath; a probe on 2026-09-29 found it adds no host `windows-sys`.
+axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true }
 futures-core = { workspace = true }
 utoipa = { workspace = true }
@@ -44,6 +46,10 @@ tracing-subscriber = { workspace = true }
 # the step ABI, which `ignis-bench` does not depend on. Dev-only, so no
 # production dependency edge is created.
 ignis-bench = { path = "../bench" }
+# The Responses WebSocket tests' client (GitHub #282): the same 0.29 axum's
+# `ws` feature serves, and `futures-util` for its `Sink`/`Stream` halves.
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 
 [features]
 # Forwards to the artifact crate's VRAM materialization path (ADR 0002) and
