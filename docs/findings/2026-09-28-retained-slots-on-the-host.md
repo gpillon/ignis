@@ -67,9 +67,10 @@ Same binary for every leg (prototype build, 2026-09-29):
 | device 8 | 475K | 52.8 s, 192, 1.31/3.75 s | 71.4 s, 139, 2.21/4.62 s |
 | host 16 | 677K | 52.1 s, 200, 1.51/3.30 s | 70.5 s, 145, 2.82/5.41 s |
 
-Raw runs are in the worktree's `.scratch/swarm-ab/` (`leg-8`, `legs-2-16`,
-`long-8-16`, `proto-*`, `final-*`); each leg keeps its server log, both
-`/metrics` scrapes and `requests.jsonl`.
+Raw runs are in `.scratch/retained-slots-281/` of the main checkout (local,
+untracked): `swarm-ab/` holds `leg-8`, `legs-2-16`, `long-8-16`, `proto-*`
+and `final-*`, each leg with its server log, both `/metrics` scrapes and
+`requests.jsonl`, and `decode-probe/` the single-stream check below.
 
 ## Finding
 
@@ -102,6 +103,16 @@ Raw runs are in the worktree's `.scratch/swarm-ab/` (`leg-8`, `legs-2-16`,
 - The same eight-device-slot leg on the long load took 93.5, 79.7 and 71.4 s
   on three runs. Differences below about 10% on that load are within noise,
   including the prototype's "host 16 is 14% faster".
+
+**4. Single-stream decode is unchanged** (2026-09-29). The same greedy prompt
+was sent three times, one request at a time, to each build. Every build ran
+~16 ms per speculative round:
+
+| build | prose, tok/s | predictable code, tok/s |
+|---|---|---|
+| host 16 | 167 | 491 |
+| device 8, same build | 167 | 489 |
+| the build before (`locate-long-context`) | 166 | 486 |
 
 ## Implications
 
