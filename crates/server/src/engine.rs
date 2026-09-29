@@ -1188,18 +1188,30 @@ mod tests {
         // the workload runs (GitHub #90): scraping must not change the facts
         // either.
         let scraping = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scraped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scraper = metrics.as_ref().map(|metrics| {
             engine.install_metrics(Arc::clone(metrics));
-            let (metrics, scraping) = (Arc::clone(metrics), Arc::clone(&scraping));
+            let (metrics, scraping, scraped) =
+                (Arc::clone(metrics), Arc::clone(&scraping), Arc::clone(&scraped));
             std::thread::spawn(move || {
                 let mut scrapes = 0u64;
                 while scraping.load(std::sync::atomic::Ordering::Relaxed) {
                     assert!(metrics.render().ends_with('\n'));
                     scrapes += 1;
+                    scraped.store(true, std::sync::atomic::Ordering::Release);
                 }
                 scrapes
             })
         });
+        // The first request goes in only once the scraper has rendered, so
+        // the workload always runs alongside it: on a fast runner the whole
+        // workload can otherwise finish before the thread is first scheduled
+        // (the v0.4.0 release run's linux leg saw no scrape at all).
+        if scraper.is_some() {
+            while !scraped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }
         let recorder = tokio::spawn(async move {
             let mut seen = Vec::new();
             while let Some(fact) = thread_rx.recv().await {
