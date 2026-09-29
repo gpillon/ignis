@@ -99,6 +99,13 @@ type Outcome =
   | { kind: "stopped" }
   | { kind: "failed"; message: string; notFound?: boolean };
 
+/** Resolves "stopped" once `signal` aborts, so a wait can give way to a stop. */
+const whenStopped = (signal?: AbortSignal) =>
+  new Promise<"stopped">((resolve) => {
+    if (signal?.aborted) resolve("stopped");
+    signal?.addEventListener("abort", () => resolve("stopped"), { once: true });
+  });
+
 const startsWith = (items: InputItem[], prefix: InputItem[]) =>
   prefix.length < items.length && prefix.every((item, i) => JSON.stringify(item) === JSON.stringify(items[i]));
 
@@ -172,6 +179,9 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
     try {
       const res = await doFetch("/v1/models", { headers: authHeaders() });
       if (res.status === 401) return { kind: "key", message: apiErrorMessage(401, await res.text()) };
+      // A proxy in front (the dev server's) answers for an ignis that is down or restarting: that is not
+      // an ignis without the socket, and the next turn should try the socket again.
+      if (res.status >= 500) return { kind: "unreachable", message: apiErrorMessage(res.status, await res.text()) };
       return { kind: "fallback" };
     } catch (err) {
       // ignis is not there at all: HTTP would fail the same way, and a restart should find the socket again.
@@ -289,19 +299,25 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
     const mine = new Promise<void>((resolve) => (release = resolve));
     const line = (before ?? Promise.resolve()).then(() => mine);
     lines.set(streamId, line);
-    await before;
     const releaseLine = () => {
       release();
       if (lines.get(streamId) === line) lines.delete(streamId);
     };
-    if (options.signal?.aborted) {
+    // A stop while this request waits ends it there: it never goes out.
+    const stop = whenStopped(options.signal);
+    if ((await Promise.race([before, stop])) === "stopped" || options.signal?.aborted) {
       releaseLine();
       return stopped();
     }
 
     const connection = connectionFor(streamId);
     try {
-      if (!(await connection.ready)) {
+      const ready = await Promise.race([connection.ready, stop]);
+      if (ready === "stopped") {
+        releaseLine();
+        return stopped();
+      }
+      if (!ready) {
         releaseLine();
         const found = await (connection.probe ??= probe());
         if (found.kind === "fallback") return "unavailable";

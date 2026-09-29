@@ -180,6 +180,16 @@ describe("the socket failing to open", () => {
     expect(probes).toHaveLength(1);
   });
 
+  it("fails the turn and keeps the socket when the probe gets a 5xx, as a dev proxy answers while ignis restarts", async () => {
+    const h = harness(502);
+    const streamChat = createStreamChat(h.socket);
+    const turn = streamChat({ request: request([user("a")]), onEvent: () => {} });
+    await tick();
+    h.sockets[0].refuse();
+    expect(await turn).toMatchObject({ ok: false, message: expect.stringMatching(/^502/) });
+    expect(getTransport()).toMatchObject({ choice: "websocket", fellBack: false, notice: false });
+  });
+
   it("fails the turn without leaving the socket when ignis cannot be reached at all", async () => {
     const h = harness("down");
     const { result } = h.start([user("a")]);
@@ -580,6 +590,34 @@ describe("stop", () => {
     h.start([user("b")], { streamId: "a" });
     await tick();
     expect(socket.creates()).toHaveLength(2);
+  });
+
+  it("stops a request still waiting for the socket to open, and never sends it", async () => {
+    const h = harness();
+    const controller = new AbortController();
+    const { result } = h.start([user("a")], { streamId: "a", signal: controller.signal });
+    await tick();
+    controller.abort();
+    expect(await result).toMatchObject({ ok: true, timeline: { stopped: true } });
+    h.sockets[0].accept();
+    await tick();
+    expect(h.sockets[0].creates()).toEqual([]);
+  });
+
+  it("stops a request still waiting behind its stream's previous one, and never sends it", async () => {
+    const h = harness();
+    h.start([user("a")], { streamId: "a" });
+    await tick();
+    h.sockets[0].accept();
+    await tick();
+    const controller = new AbortController();
+    const waiting = h.start([user("b")], { streamId: "a", signal: controller.signal });
+    await tick();
+    controller.abort();
+    expect(await waiting.result).toMatchObject({ ok: true, timeline: { stopped: true } });
+    for (const event of reply("a", "resp_a", { text: "done" })) h.sockets[0].emit(event);
+    await tick();
+    expect(h.sockets[0].creates()).toHaveLength(1);
   });
 
   it("holds a stream's next request until ignis has ended the stopped one", async () => {
