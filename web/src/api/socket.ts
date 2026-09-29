@@ -259,7 +259,7 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
           return end({ kind: "failed", message: error?.code ? `${error.code}: ${message}` : message });
         }
         if (event.type === "response.completed" && event.response) {
-          return end({ kind: "completed", id: event.response.id, output: replyItems(reply) });
+          return end({ kind: "completed", id: responseId ?? event.response.id, output: replyItems(reply) });
         }
         if (event.type === "response.incomplete") {
           return end(event.response?.status === "cancelled" ? { kind: "stopped" } : { kind: "ended" });

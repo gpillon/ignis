@@ -322,6 +322,47 @@ describe("a reply on the socket", () => {
 });
 
 describe("queued replies", () => {
+  it("fails a queued reply whose admission ignis then refused", async () => {
+    const h = harness();
+    const { result } = h.start([user("hi")], { streamId: "s" });
+    await tick();
+    h.sockets[0].accept();
+    await tick();
+    const socket = h.sockets[0];
+    socket.emit({ type: "response.created", stream_id: "s", response: { id: "resp_q0", status: "queued" } });
+    socket.emit({ type: "response.queued", stream_id: "s", response: { id: "resp_q0", status: "queued" } });
+    socket.emit({
+      type: "response.failed",
+      stream_id: "s",
+      response: { id: "resp_q0", status: "failed", error: { code: "context_length_exceeded", message: "the prompt does not fit" } },
+    });
+    expect(await result).toMatchObject({ ok: false, message: "context_length_exceeded: the prompt does not fit" });
+  });
+
+  it("keeps the id response.created gave a queued reply for its whole life: the cancel and the continuation use it", async () => {
+    const h = harness();
+    const first = h.start([user("a")], { streamId: "s" });
+    await tick();
+    h.sockets[0].accept();
+    await tick();
+    const socket = h.sockets[0];
+    socket.emit({ type: "response.created", stream_id: "s", response: { id: "resp_q0", status: "queued" } });
+    socket.emit({ type: "response.queued", stream_id: "s", response: { id: "resp_q0", status: "queued" } });
+    socket.emit({ type: "response.in_progress", stream_id: "s", response: { id: "resp_12", status: "in_progress" } });
+    socket.emit({ type: "response.output_text.delta", stream_id: "s", delta: "b" });
+    socket.emit({ type: "response.completed", stream_id: "s", response: { id: "resp_12", status: "completed", output: [{ type: "message" }], usage } });
+    await first.result;
+
+    const controller = new AbortController();
+    h.start([user("a"), { role: "assistant", content: "b" }, user("c")], { streamId: "s", signal: controller.signal });
+    await tick();
+    expect(socket.creates().at(-1)).toMatchObject({ previous_response_id: "resp_q0" });
+    socket.emit({ type: "response.created", stream_id: "s", response: { id: "resp_q1", status: "queued" } });
+    socket.emit({ type: "response.in_progress", stream_id: "s", response: { id: "resp_13", status: "in_progress" } });
+    controller.abort();
+    expect(socket.sent.at(-1)).toEqual({ type: "response.cancel", response_id: "resp_q1" });
+  });
+
   it("says the reply is queued, and counts the queue as queue time rather than TTFT", async () => {
     const h = harness();
     const seen: string[] = [];
