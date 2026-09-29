@@ -26,9 +26,12 @@
 
 #include "ninfer/ops/linear.h"
 
+#include "ignis_nvfp4_a16_mma.h"
+
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -103,6 +106,14 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
     case QType::NVFP4:
+        // A wide A16 call goes to the tensor cores instead of the vendored GEMV family's
+        // 32-column slices (kernel/include/ignis_nvfp4_a16_mma.h). AllowA4 keeps the vendored
+        // resolver, which picks W4A4 for the backbone at these widths.
+        if (policy == LinearPolicy::A16Only && ignis_nvfp4_a16_mma_applies(w.n, w.k, x.ne[1])) {
+            (void)detail::validate_nvfp4_weight(w, "nvfp4 linear");
+            ignis_nvfp4_a16_mma(x, w, out, stream);
+            return;
+        }
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::BF16_CTRL:

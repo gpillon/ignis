@@ -467,6 +467,29 @@ add_executable(ignis_kernel_dflash2_topk_test test_dflash2_topk.cu)
 target_link_libraries(ignis_kernel_dflash2_topk_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_dflash2_topk_test COMMAND ignis_kernel_dflash2_topk_test)
 
+# OURS, not vendored: the A16 NVFP4 linear's tensor-core route
+# (kernel/include/ignis_nvfp4_a16_mma.h), which takes every A16 call of 64
+# columns or more. Driven through the leaf's ops::linear with the vendored
+# linear harness's FP64 oracle and its A16 criterion, at prompt widths the
+# vendored test never reaches. No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_nvfp4_a16_mma_test
+  test_nvfp4_a16_mma.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
+)
+target_include_directories(ignis_kernel_nvfp4_a16_mma_test PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_nvfp4_a16_mma_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_nvfp4_a16_mma_test COMMAND ignis_kernel_nvfp4_a16_mma_test)
+
+# OURS: the same route timed against the vendored small-T GEMVs on one weight.
+# A timing is a finding, not a pass/fail, so a tool and NOT registered with
+# CTest.
+add_executable(ignis_nvfp4_a16_mma_bench
+  bench_nvfp4_a16_mma.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
+)
+target_include_directories(ignis_nvfp4_a16_mma_bench PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_nvfp4_a16_mma_bench PRIVATE ignis_kernel ignis_vendor)
+
 # GitHub #260 (ADR 0038): OURS, not vendored -- the attention readout
 # (kernel/src/attention_readout.h, a leaf-internal header, hence the include
 # of kernel/src). One query head's scores over a span of keys, from BF16 pages
