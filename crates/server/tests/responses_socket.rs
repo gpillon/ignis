@@ -686,11 +686,15 @@ async fn a_warm_up_prefills_without_generating_and_the_next_turn_resumes_from_it
 
 #[tokio::test]
 async fn a_warm_up_of_instructions_alone_serves_the_next_turn_its_system_block() {
-    let warm_up = json!({ "model": MODEL, "instructions": words("sys"), "enable_thinking": false });
-    let turn = json!({ "model": MODEL, "instructions": words("sys"), "input": "hi", "max_output_tokens": 1, "enable_thinking": false });
+    // Codex's prewarm: instructions and a tool, no input — which a template
+    // that needs a user query cannot render as it stands.
+    let tool = json!([{ "type": "function", "name": "shell", "parameters": { "type": "object", "properties": {} } }]);
+    let warm_up = json!({ "model": MODEL, "instructions": words("sys"), "tools": tool, "input": [], "enable_thinking": false });
+    let turn = json!({ "model": MODEL, "instructions": words("sys"), "tools": tool, "input": "hi", "max_output_tokens": 1, "enable_thinking": false });
     let (warmed, cached) = warm_then_continue(SchedulerConfig::default(), warm_up, turn).await;
-    assert_eq!(warmed["type"], "response.completed");
-    assert!(cached.as_u64().unwrap() >= 16, "at least the retained prefix's whole page: {cached}");
+    assert_eq!(warmed["type"], "response.completed", "{warmed}");
+    assert_eq!(warmed["response"]["usage"]["input_tokens"], 20, "exactly the system block was prefilled");
+    assert_eq!(cached, 16, "the turn stood on the retained prefix: the system block's whole page");
 }
 
 #[tokio::test]

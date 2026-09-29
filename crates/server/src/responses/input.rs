@@ -97,6 +97,9 @@ pub(crate) struct CreateResponse {
     class: Option<JsonValue>,
 }
 
+/// The user turn a system-only warm-up is rendered with, and cut from.
+const WARM_UP_PLACEHOLDER: &str = ".";
+
 /// A request ready to submit, and everything its response needs.
 pub(crate) struct Prepared {
     pub input: RequestInput,
@@ -188,6 +191,15 @@ pub(crate) async fn prepare(
     if let Some(instructions) = &instructions {
         messages.insert(0, ChatMessage::text("system", instructions.clone()));
     }
+    // A warm-up with no user message — Codex's prewarm, `instructions` and
+    // `tools` alone — keeps the system block the next turn will share. A
+    // chat template may refuse to render a conversation without a user query
+    // (the Qwen template does), so it is rendered with a placeholder turn and
+    // cut back to that block below; an ordinary request renders as sent.
+    let system_only = warm_up && !messages.iter().any(|m| m.role == "user");
+    if system_only {
+        messages.push(ChatMessage::text("user", WARM_UP_PLACEHOLDER));
+    }
     if messages.is_empty() {
         return Err(api::bad_request_param("input must not be empty", "input"));
     }
@@ -216,9 +228,24 @@ pub(crate) async fn prepare(
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
     let schemas = ToolSchemas::from_tools(&tools);
-    let (mut input, model, prompt_tokens, media) =
+    let (mut input, model, mut prompt_tokens, media) =
         api::prepare_request(server, model, &messages, params, &thinking, &tools).await?;
     input.warm_up = warm_up;
+    if system_only {
+        let Some(block) = input.system_block_tokens.filter(|_| input.multimodal.is_none()) else {
+            return Err(api::template_rejection(crate::template::TemplateRejection {
+                code: "render_failed",
+                message: "a warm-up with no user message keeps its system block, and this prompt has none to keep".into(),
+            }));
+        };
+        // The prompt is the system block and nothing else: it publishes the
+        // retained prefix there, and takes no checkpoint at an opener the
+        // placeholder put in.
+        input.tokens.truncate(block as usize);
+        input.opener_tokens = None;
+        input.user_turn_tokens = None;
+        prompt_tokens = block;
+    }
 
     let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
     let response = ResponseObject {

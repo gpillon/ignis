@@ -44,7 +44,8 @@ pub struct Rendered {
 /// every render. With `boundaries`, it reports the structure a real template
 /// does: the system block (its leading `system` messages' words), the last
 /// user turn, and the generation opener, followed — as a thinking template's
-/// is — by one token of generation prompt.
+/// is — by one token of generation prompt. Like the real Qwen template, it
+/// then refuses a conversation with no user message.
 #[derive(Default)]
 pub struct Script {
     decode: HashMap<TokenId, &'static str>,
@@ -87,6 +88,12 @@ impl TemplateProvider for Handle {
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
         self.0.seen.lock().unwrap().push(Rendered { messages: messages.to_vec(), tools: tools.to_vec() });
+        if self.0.boundaries && !messages.iter().any(|m| m.role == "user") {
+            return Err(TemplateRejection {
+                code: "render_failed",
+                message: "render chat template: invalid operation: No user query found in messages. (in chat_template.jinja:100)".into(),
+            });
+        }
         let mut rendered = SimpleTemplateProvider.apply_chat_template(messages, options, tools)?;
         if self.0.boundaries {
             let words = |m: &ChatMessage| m.content.text().split_whitespace().count() as u32;
