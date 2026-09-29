@@ -60,11 +60,12 @@ SYSTEM_MESSAGE_POLICY ?= merge
 DEVELOPER_MESSAGE_POLICY ?= inplace
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
-# Defaults are the G5 gate legs (docs/specs/runtime/05, the g5-run driver):
-# the full 262144-token envelope, hq-e8-2b KV, DFlash2 speculation with a
-# 7-token draft window. Empty = leave the flag off (the server's default);
-# SPEC= turns speculation off.
-MAX_CONTEXT ?= 262144
+# Defaults: a 524288-token context -- twice the checkpoint's trained 262,144
+# positions, on the linear rotary table unless ROPE_SCALING names YaRN -- then
+# hq-e8-2b KV, DFlash2 speculation with a 7-token draft window. The G5 gate
+# legs (docs/specs/runtime/05) ran at MAX_CONTEXT=262144. Empty = leave the
+# flag off (the server's default); SPEC= turns speculation off.
+MAX_CONTEXT ?= 524288
 KV_FORMAT ?= hq-e8-2b
 PREFILL_CHUNK ?= 1024
 REQUEST_TIMEOUT ?= 1800

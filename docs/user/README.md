@@ -636,8 +636,10 @@ Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
 `make dev-ui SPEC= MAX_CONTEXT=40960`) or in an untracked `local.mk`
 (`local.mk.example`). `make config` prints what is in force.
 
-With `CUDA=1` the server starts in the gate configuration: the full
-`MAX_CONTEXT=262144`, `KV_FORMAT=hq-e8-2b`, `SPEC=dflash2` with
+With `CUDA=1` the server starts with `MAX_CONTEXT=524288` -- twice the
+checkpoint's trained 262,144 positions, on the linear rotary table unless
+`ROPE_SCALING` names YaRN (the gate legs ran at `MAX_CONTEXT=262144`) --
+`KV_FORMAT=hq-e8-2b`, `SPEC=dflash2` with
 `DRAFT_TOKENS=7`, `KV_HOST_POOL_BYTES=8G`, `REQUEST_TIMEOUT=1800`. `SPEC=` turns
 speculation off. `VISION=1` loads the tower; `UNCENSORED=1` loads
 [the uncensored variant](#the-uncensored-variant) in place of the default
