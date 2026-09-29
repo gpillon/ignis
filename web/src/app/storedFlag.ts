@@ -13,6 +13,8 @@ import { useCallback, useState } from "react";
 export const STORED_FLAGS = {
   /** Send in one session while another still streams. */
   parallel: "ignis.parallelSessions",
+  /** Talk to ignis over HTTP chat completions rather than its Responses WebSocket (GitHub #283). */
+  httpTransport: "ignis.httpTransport",
 } as const;
 
 /**

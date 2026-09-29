@@ -400,7 +400,8 @@ export function TransportSetting() {
       <Segmented
         legend="Transport"
         name="transport"
-        value={transport.choice}
+        // The wire in use: after a fallback that is HTTP, and WebSocket is there to pick again.
+        value={transport.fellBack ? "http" : transport.choice}
         options={[
           { value: "websocket", label: "WebSocket" },
           { value: "http", label: "HTTP" },
@@ -409,7 +410,7 @@ export function TransportSetting() {
       />
       {transport.choice === "websocket" && transport.fellBack ? (
         <span className="border-l-2 border-ember pl-2 text-xs leading-snug text-ash">
-          ignis did not open the WebSocket, so this page talks to it over HTTP until it reloads.
+          ignis did not open the WebSocket, so this page talks to it over HTTP. Pick WebSocket to try it again.
         </span>
       ) : (
         <span className="text-xs leading-snug text-ash">

@@ -170,9 +170,13 @@ describe("SettingsPanel: the transport", () => {
 
   it("says when the page fell back to HTTP by itself, and tries the socket again once WebSocket is picked", () => {
     fallBackToHttp();
-    expect(transportRegion(panel())).toContain("did not open the WebSocket");
+    const fellBack = transportRegion(panel());
+    // The control shows the wire in use, so WebSocket is there to pick again.
+    expect(checked(fellBack)).toEqual(["HTTP"]);
+    expect(fellBack).toContain("did not open the WebSocket");
+    expect(fellBack).toContain("Pick WebSocket to try it again");
+    expect(fellBack).not.toContain("reloads");
     expect(activeTransport()).toBe("http");
-    chooseTransport("http");
     chooseTransport("websocket");
     expect(activeTransport()).toBe("websocket");
     expect(transportRegion(panel())).not.toContain("did not open the WebSocket");
