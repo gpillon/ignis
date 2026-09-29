@@ -143,6 +143,29 @@ decode round.
 
 The one different output diverges at character 1,771 of 1,828 (~token 370
 of 384), inside a list of SQL terms: a near-tie resolved the other way.
+
+On one server, main itself changes 3 of 8 outputs between its two rounds. The
+server log shows no prompt reuse in either round (`prefilled_tokens` equals
+`prompt_tokens`; the prompts are ~67 tokens). What differs is admission:
+
+- in round 1 the lanes join one at a time (first token at 140 ms for the
+  first lane, 1,185 ms for the last), each prompt in 2-3 chunks interleaved
+  with the running lanes' decode rounds;
+- in round 2 the prompts are packed into shared chunks and the lanes start
+  almost together.
+
+Different co-batching means different GEMM widths in prefill and different
+lane sets in decode. So a near-tie can flip without any change to the code.
+
+**dflash2 acceptance**, from the `spec.*` counters of the `request.done` log
+events of the same runs:
+
+| | main | A16 MMA route |
+|---|---|---|
+| 8 lanes, 16 requests: accepted / drafted | 3,674 / 17,148 = 0.214 | 3,679 / 17,118 = 0.215 |
+| 8 lanes: tokens per round | 2.487 | 2.492 |
+| 1 lane, 2 requests: accepted / drafted | 606 / 2,906 = 0.209 | 602 / 2,934 = 0.205 |
+
 ## Finding
 
 **Observed.** A16 NVFP4 at prompt width now runs on the tensor cores at
@@ -150,7 +173,8 @@ of 384), inside a list of SQL terms: a near-tie resolved the other way.
 cost class in prefill. Single-lane TTFT on a ~5K-token prompt dropped 12.8%.
 At one lane, greedy output is byte-identical and decode speed unchanged. At
 eight lanes, a round of 8 generations is 3-5% faster, and 15 of 16 outputs
-match main.
+match main. dflash2 acceptance is unchanged: 0.214 against 0.215 at eight
+lanes, and 0.209 against 0.205 at one lane (two requests).
 
 The route keeps the A16 contract, not the GEMVs' bits: where a sum rounds,
 the different accumulation order can round it to a different BF16.
@@ -165,8 +189,11 @@ acceptance changes the width of the target's batched rounds, and batched
 decode is not width-invariant
 ([batched decode width drift](2026-09-14-batched-decode-width-drift.md)). A
 late near-tie can therefore flip, which fits the single divergence. Main is
-16/16 against itself only because a fresh server replays the same schedule.
-Acceptance itself was not counted.
+16/16 against itself only because a fresh server replays the same admission
+schedule. Its 3/8 change between two rounds on one server says the same
+near-ties already flip in production whenever requests arrive differently.
+That co-batching, not reuse, is the cause is read from the logs. No
+experiment isolated it.
 
 ## Implications
 
@@ -185,8 +212,10 @@ Acceptance itself was not counted.
   `__syncthreads` per K step), would lower it. Not built.
 - One prompt length (~5.1K tokens). Longer prompts spend more of their time in
   attention, so the relative gain shrinks with length.
-- dflash2 acceptance was not measured directly, only through generation time
-  on one prompt.
+- Acceptance was counted on 16 eight-lane and 2 one-lane generations of short
+  essay prompts, not on agent traces
+  ([sampled acceptance](2026-09-24-dflash2-sampled-acceptance.md) measures
+  those).
 
 ## Follow-ups
 
