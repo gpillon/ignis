@@ -59,3 +59,20 @@ describe("Reply and the thinking budget", () => {
     expect(render(reply({ streaming: true, content: "", figures: undefined }))).not.toContain("Budget reached");
   });
 });
+
+// A reply the engine queued says so while it waits, and its figures keep the
+// wait apart from TTFT (GitHub #283).
+
+describe("Reply and the engine's queue", () => {
+  it("says the reply is queued while it waits for a lane", () => {
+    expect(render(reply({ streaming: true, queued: true, content: "", reasoning: "", figures: undefined }))).toContain("Queued: the engine is full");
+    expect(render(reply({ streaming: true, content: "", reasoning: "", figures: undefined }))).not.toContain("Queued");
+  });
+
+  it("shows the queue time beside TTFT once the reply is done, and nothing for a reply admitted at once", () => {
+    const html = render(reply({ figures: { ...figures, queueMs: 1200 } }));
+    expect(html).toMatch(/Queued<\/dt><dd[^>]*>1.20 s<\/dd>/);
+    expect(html.indexOf("Queued")).toBeLessThan(html.indexOf("TTFT"));
+    expect(render(reply())).not.toContain("Queued");
+  });
+});

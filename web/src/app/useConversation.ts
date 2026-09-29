@@ -39,9 +39,9 @@ import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/w
 // meanwhile is the caller's choice (`parallel`): off, the page runs one turn
 // and every Send waits for it; on, each session runs its own. On the socket
 // (GitHub #283) each session is a stream of its own, and each of its agents
-// too; over HTTP the browser's stream budget (GitHub #220) queues what the
-// connection cannot carry, so parallel sessions share the same five streams
-// on localhost.
+// too, all on one connection; over HTTP the browser's stream budget (GitHub
+// #220) queues what the connection cannot carry, so parallel sessions share
+// the same five streams on localhost.
 
 /**
  * A turn may start in `sessionId`: nothing streams there, and — unless

@@ -52,6 +52,11 @@ export function Reply(props: {
           </pre>
         </details>
       )}
+      {m.streaming && m.queued && (
+        <p className="font-display text-[13px] font-medium text-ash" role="status">
+          Queued: the engine is full, and this reply waits for a lane.
+        </p>
+      )}
       {editing ? (
         <MessageEditor
           initial={m.content}

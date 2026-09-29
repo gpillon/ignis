@@ -17,8 +17,8 @@ export function SessionLog({ rows, open, onToggle }: { rows: LogRow[]; open: boo
         <h2 className="font-display text-sm font-semibold">This session</h2>
         <p className="min-w-0 truncate text-xs text-ash">
           {rows.length === 0
-            ? "HTTP-observed figures for each reply collect here."
-            : `${count(replies.length, "reply", "replies")}${agentRows ? `, ${count(agentRows, "agent request", "agent requests")}` : ""}${last ? `, last decode ${describeFigures(last).decode}` : ""}. HTTP-observed: measured by the browser, not the engine.`}
+            ? "Browser-observed figures for each reply collect here."
+            : `${count(replies.length, "reply", "replies")}${agentRows ? `, ${count(agentRows, "agent request", "agent requests")}` : ""}${last ? `, last decode ${describeFigures(last).decode}` : ""}. Browser-observed: measured by the browser, not the engine.`}
         </p>
         <button
           type="button"

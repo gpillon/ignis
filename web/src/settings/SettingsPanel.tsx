@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { REASONING_EFFORTS } from "../api/request.ts";
+import { chooseTransport, useTransport } from "../api/transport.ts";
 import { ignisPrompt, setAllTools, type ToolsState, toolsInUse } from "../tools/index.ts";
 import type { Attachment } from "../tools/local/attachments.ts";
 import { useMemoryNotes } from "../tools/local/memory.ts";
@@ -138,6 +139,8 @@ function GeneralSettings(props: {
       />
 
       <ParallelSetting on={props.parallel} onChange={props.onParallelChange} />
+
+      <TransportSetting />
 
       <MarkdownSetting on={props.markdown} onChange={props.onMarkdownChange} />
     </>
@@ -379,11 +382,42 @@ function ParallelSetting({ on, onChange }: { on: boolean; onChange: (on: boolean
           Parallel sessions
         </span>
         <span className="text-xs leading-snug text-ash">
-          Send in one session while another still streams. A session still answers one reply at a time, and the browser
-          carries five streams at once, agents included — the rest wait for a connection.
+          Send in one session while another still streams. A session still answers one reply at a time. The WebSocket
+          carries every stream at once; over HTTP the browser carries five, agents included, and the rest wait for a
+          connection.
         </span>
       </div>
       <Switch on={on} onChange={onChange} labelledBy="parallel-label" />
+    </div>
+  );
+}
+
+/** The wire the conversation goes over (GitHub #283): the Responses WebSocket, or HTTP chat completions. */
+export function TransportSetting() {
+  const transport = useTransport();
+  return (
+    <div className="flex flex-col gap-2">
+      <Segmented
+        legend="Transport"
+        name="transport"
+        value={transport.choice}
+        options={[
+          { value: "websocket", label: "WebSocket" },
+          { value: "http", label: "HTTP" },
+        ]}
+        onChange={chooseTransport}
+      />
+      {transport.choice === "websocket" && transport.fellBack ? (
+        <span className="border-l-2 border-ember pl-2 text-xs leading-snug text-ash">
+          ignis did not open the WebSocket, so this page talks to it over HTTP until it reloads.
+        </span>
+      ) : (
+        <span className="text-xs leading-snug text-ash">
+          {transport.choice === "websocket"
+            ? "One connection for every session and agent; a turn sends only what is new."
+            : "Chat completions, one connection per stream. The Decide tab uses HTTP either way."}
+        </span>
+      )}
     </div>
   );
 }

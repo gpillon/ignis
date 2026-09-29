@@ -19,11 +19,13 @@ import { AGENT_SYSTEM_PROMPT, type AgentRun } from "../tools/agents/agents.ts";
 import { ALL_TOOLS, type ToolsState } from "../tools/index.ts";
 import { Header, type View } from "./Header.tsx";
 import { KeyPage } from "./KeyPage.tsx";
+import { TransportNotice } from "./TransportNotice.tsx";
 import { STORED_FLAGS, useStoredFlag } from "./storedFlag.ts";
 import { useConversation } from "./useConversation.ts";
 
-// The Playground (GitHub #164): a streaming chat against ignis's own
-// /v1/chat/completions, with per-request figures measured in the browser.
+// The Playground (GitHub #164): a streaming chat against ignis — over its
+// Responses WebSocket, or /v1/chat/completions (GitHub #283) — with
+// per-request figures measured in the browser.
 // Sessions, settings and figures live in memory; a reload starts over, apart
 // from the switches this browser stores (`storedFlag.ts`).
 // This is the page's layout; the conversation loop is useConversation.
@@ -120,6 +122,8 @@ export function App() {
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
       <Header model={model} busy={chat.busy} onOpen={(which) => (deciding ? setDecideDrawer(which) : setDrawer(which))} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} view={monitoring ? "monitor" : deciding ? "decide" : "chat"} onView={setView} monitorAvailable={monitorVisible} />
+
+      <TransportNotice />
 
       {monitoring && <Monitor />}
 
