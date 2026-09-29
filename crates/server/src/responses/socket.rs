@@ -235,7 +235,14 @@ impl Connection {
                     )),
                     // Pings are answered by the socket itself.
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(Message::Close(_))) => {
+                        // RFC 6455 §5.5.1: the socket has queued the echo of
+                        // the client's Close; reading on flushes it and ends
+                        // the connection cleanly.
+                        while let Some(Ok(_)) = self.socket.recv().await {}
+                        break;
+                    }
+                    Some(Err(_)) | None => break,
                 },
                 Some(outgoing) = self.inbox.recv() => match outgoing {
                     Outgoing::Event(event) => {

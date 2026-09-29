@@ -777,3 +777,23 @@ async fn a_request_the_engine_can_never_admit_is_refused_at_once_not_queued() {
     assert_eq!(refused["status"], 404);
     assert_eq!(refused["error"]["code"], "model_not_found");
 }
+
+/// RFC 6455 §5.5.1: a client's Close is answered with the server's own, so
+/// the connection ends cleanly rather than as a dropped socket.
+#[tokio::test]
+async fn a_client_close_is_answered_with_a_close_frame() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    let live = live(server(&Script::new(HashMap::new()), SchedulerConfig::default(), plain())).await;
+    let mut socket = socket(&live).await;
+    socket.close(Some(CloseFrame { code: CloseCode::Normal, reason: "bye".into() })).await.unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), socket.next()).await.expect("an answer within 10 s");
+    match answer {
+        Some(Ok(Message::Close(frame))) => {
+            assert_eq!(frame.map(|f| f.code), Some(CloseCode::Normal), "the close code is echoed");
+        }
+        other => panic!("expected the server's Close frame, got {other:?}"),
+    }
+}
