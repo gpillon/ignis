@@ -4,8 +4,9 @@
 //
 // The vendored `test_nvfp4_a16.cpp` stops at T=33, one column past the small-T
 // family, because that family is all the reference has for A16. The MMA route
-// takes every A16 call of 64 columns or more, so this test drives it where
-// the engine does: prompt-width calls. The criterion is the vendored one for
+// takes every A16 call of 64 columns or more (128 on the narrow problems), so
+// this test drives it where the engine does: prompt-width calls, and the
+// drafter's 64-column round at eight lanes. The criterion is the vendored one for
 // the A16 activation path (`tolerance_for(ActivationCompute::A16)`, one BF16
 // unit roundoff), against the harness's FP64 oracle over the dequantized
 // weight -- the route has to meet the same contract the GEMVs meet, not a
@@ -23,8 +24,8 @@
 //                every weight row -- all four row quartiles of a blockscale
 //                tile, both halves a 64-row CTA can sit in -- and every
 //                token of a ragged last CTA are compared, not a sample.
-//   boundaries   T = 64 (the first width the route takes), a multiple of
-//                the 128-column CTA, and one column either side of it.
+//   boundaries   the first width the route takes (64, or 128 below 4,096
+//                rows), multiples of the 128-column CTA, and ragged tails.
 //   geometries   every other registered NVFP4 problem, sampled, so no
 //                instantiation ships untested.
 //
@@ -57,6 +58,9 @@ int check_route_selection() {
     expect(ignis_nvfp4_a16_mma_applies(5120, 25600, 63), false, "T=63 stays on the GEMVs");
     expect(ignis_nvfp4_a16_mma_applies(5120, 25600, 64), true, "T=64 takes the MMA route");
     expect(ignis_nvfp4_a16_mma_applies(6144, 5120, 1024), true, "drafter qkv at prefill width");
+    expect(ignis_nvfp4_a16_mma_applies(1280, 5120, 64), false, "a narrow problem at T=64");
+    expect(ignis_nvfp4_a16_mma_applies(1280, 5120, 127), false, "a narrow problem at T=127");
+    expect(ignis_nvfp4_a16_mma_applies(256, 5120, 128), true, "a narrow problem at T=128");
     expect(ignis_nvfp4_a16_mma_applies(4096, 4096, 1024), false, "an unregistered problem");
     return failures;
 }
@@ -76,10 +80,10 @@ int run_nvfp4_a16_mma() {
                           {6144, 5120, 812U, Comparison::Sampled, true, production});
 
     constexpr std::array full{
-        Invocation{64, CallForm::Policy, kPolicy},
-        Invocation{127, CallForm::Policy, kPolicy},
         Invocation{128, CallForm::Policy, kPolicy},
         Invocation{129, CallForm::Policy, kPolicy},
+        Invocation{200, CallForm::Policy, kPolicy},
+        Invocation{256, CallForm::Policy, kPolicy},
         Invocation{300, CallForm::Policy, kPolicy},
     };
     failures += run_shape("NVFP4_A16_MMA", ActivationCompute::A16, make_nvfp4_weight,

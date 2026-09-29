@@ -55,12 +55,16 @@ constexpr int kWarpRows = 32;
 constexpr int kWarpCols = 32;
 constexpr int kStages = 2;
 
-// The narrowest call this route takes. Below it a grid of M/64 CTAs leaves
-// most of the card idle while each CTA walks the whole K axis, and the
-// vendored GEMV slices win: measured 2026-09-29 (ignis_nvfp4_a16_mma_bench),
-// T=33 ran 0.76-0.92x the GEMVs on the drafter and residual shapes, T=64
-// 1.38-1.47x.
+// The narrowest call this route takes. A lone CTA walks the whole K axis at
+// ~1.1 us per K step, so the route has a latency floor (~90 us at K=5120)
+// that the GEMV slices undercut until T is wide enough. Measured 2026-09-29
+// (ignis_nvfp4_a16_mma_bench): at T=33 the route ran 0.76-0.92x the GEMVs on
+// every shape; at T=64 it wins 1.38-1.50x on problems of 4,096+ rows, but
+// loses on the narrow ones ([1280, 5120] 0.70x, [256, 5120] 0.59x), which
+// win from T=128 (1.37x, 1.05x).
 constexpr std::int32_t kMinTokens = 64;
+constexpr std::int32_t kMinTokensNarrow = 128;
+constexpr std::int32_t kNarrowRowsBelow = 4096;
 
 constexpr int kWarpsM = kBlockRows / kWarpRows;
 constexpr int kWarpsN = kBlockCols / kWarpCols;
@@ -317,7 +321,7 @@ void launch_geometry(const ninfer::Tensor &x, const ninfer::Weight &w, ninfer::T
 
 bool ignis_nvfp4_a16_mma_applies(std::int32_t output_rows, std::int32_t input_rows,
                                  std::int32_t tokens) {
-  return tokens >= kMinTokens &&
+  return tokens >= (output_rows >= kNarrowRowsBelow ? kMinTokens : kMinTokensNarrow) &&
          ninfer::ops::detail::is_nvfp4_linear_problem(output_rows, input_rows);
 }
 

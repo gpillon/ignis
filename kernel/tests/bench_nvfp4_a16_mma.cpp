@@ -12,7 +12,7 @@
 // largest |mma - gemv| over the output as a same-input sanity figure (both
 // are held to the A16 criterion by the CTest; this only shows they agree).
 //
-//   ignis_nvfp4_a16_mma_bench [--iters 50] [--all]
+//   ignis_nvfp4_a16_mma_bench [--iters 50] [--all | --drafter | --narrow]
 
 #include "ignis_nvfp4_a16_mma.h"
 
@@ -144,20 +144,45 @@ void bench_shape(std::int32_t n, std::int32_t k, const std::vector<std::int32_t>
 
 int main(int argc, char** argv) {
     int iters = 50;
-    bool all  = false;
+    bool all     = false;
+    bool drafter = false;
+    bool narrow  = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--all") == 0) {
             all = true;
+        } else if (std::strcmp(argv[i], "--drafter") == 0) {
+            drafter = true;
+        } else if (std::strcmp(argv[i], "--narrow") == 0) {
+            narrow = true;
         }
     }
     const std::vector<std::int32_t> widths{64, 128, 394, 1024};
-    bench_shape(5120, 25600, widths, iters);
-    bench_shape(6144, 5120, widths, iters);
+    if (narrow) {
+        // The narrow registered problems, where M / 64 CTAs leaves the card
+        // idle until T spreads the grid over several token tiles.
+        const std::vector<std::int32_t> spread{64, 128, 256, 394, 512, 1024};
+        bench_shape(1280, 5120, spread, iters);
+        bench_shape(256, 5120, spread, iters);
+        return 0;
+    }
+    if (!drafter) {
+        bench_shape(5120, 25600, widths, iters);
+        bench_shape(6144, 5120, widths, iters);
+    }
     if (all) {
         bench_shape(5120, 17408, widths, iters);
         bench_shape(34816, 5120, widths, iters);
+    }
+    if (drafter) {
+        // The drafter's propose forward at IGNIS_DECODE_MAX_BATCH: a block of
+        // draft 7 + bonus per lane, eight lanes, is exactly 64 columns.
+        const std::vector<std::int32_t> round{64};
+        bench_shape(1280, 5120, round, iters);
+        bench_shape(5120, 4096, round, iters);
+        bench_shape(6144, 5120, round, iters);
+        bench_shape(5120, 17408, round, iters);
     }
     return 0;
 }

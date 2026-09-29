@@ -38,8 +38,9 @@
 #include <cuda_runtime.h>
 
 /* Whether an A16 call with this weight and column count takes the MMA route:
- * a registered NVFP4 problem at 64 columns or more. Narrower calls stay on the
- * vendored GEMVs, which win there (the threshold is measured; see
+ * a registered NVFP4 problem at 64 columns or more, 128 or more when it has
+ * fewer than 4,096 output rows. Narrower calls stay on the vendored GEMVs,
+ * which win there (the thresholds are measured; see
  * kernel/src/nvfp4_a16_mma.cu). */
 bool ignis_nvfp4_a16_mma_applies(std::int32_t output_rows, std::int32_t input_rows,
                                  std::int32_t tokens);

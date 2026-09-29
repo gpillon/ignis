@@ -14,7 +14,7 @@
 **Code:** branch `nvfp4-a16-mma`, which adds `kernel/src/nvfp4_a16_mma.cu`,
 `kernel/include/ignis_nvfp4_a16_mma.h` and the route in `kernel/src/linear.cu`.
 **Harness:** `kernel/tests/bench_nvfp4_a16_mma.cpp` (tool, not CTest), plus
-`ab_run.sh` and `trace_phase.sh` in `.scratch/gpu-resources-2026-09-29/`.
+`ab_run.sh`, `lanes8.sh` and `trace_phase.sh` in `.scratch/gpu-resources-2026-09-29/`.
 
 ## Question
 
@@ -26,8 +26,21 @@ it do to TTFT, output and decode?
 ## Evidence
 
 **The route.** `ops::linear` (our `kernel/src/linear.cu`) sends an NVFP4
-`A16Only` call of **64 columns or more** to `ignis_nvfp4_a16_mma`. Narrower
-calls, and every `AllowA4` call, keep the vendored dispatch.
+`A16Only` call to `ignis_nvfp4_a16_mma` from **64 columns** (128 for problems
+under 4,096 output rows). Narrower calls, and every `AllowA4` call, keep the
+vendored dispatch.
+
+Only the dflash2 drafter makes A16 NVFP4 calls, so only its calls change
+route (`grep "ops::linear(" kernel/src`: the output heads are W8, and the
+vision tower is Q4/Q5/Q6). They are:
+
+- the context append (`feature_projection`, and the five layers'
+  `query_key_value`), at prompt width in prefill, and at width x batch columns
+  after each decode round;
+- the propose forward (`attention_conv_proj`, `query_key_value`, `output`,
+  `mlp_conv_proj`, `mlp_down`), at (draft + 1) x batch columns: 64 at eight
+  lanes;
+- not the selector (56 columns at eight lanes).
 
 The kernel is a BF16 m16n8k16 MMA GEMM: 64x128x64 CTA tile, 8 warps, a
 2-stage cp.async ring. Each ring slot holds the weight exactly as it is stored:
@@ -43,11 +56,14 @@ A16 criterion (one BF16 unit roundoff, relative L2). It covers:
 
 - the two drafter matrices at T = 64, 394 and 1,024;
 - a full comparison of every output element on [256, 5120] and [1280, 5120] at
-  T = 64, 127, 128, 129 and 300;
-- the six other registered geometries, sampled.
+  T = 128, 129, 200, 256 and 300;
+- the six other registered geometries, sampled;
+- the route selection at its thresholds.
 
-A mutation that scales the epilogue by 1.01 fails it, and fails the vendored
-`test_nvfp4_a16`. The full kernel CTest suite passes: 67/67.
+A mutation that scales the epilogue by 1.01 fails it. With the route's first
+threshold (33 columns), the same mutation also failed the vendored
+`test_nvfp4_a16`. The full kernel CTest suite passes: 67/67, as does
+`cargo test --workspace` (1,916 passed).
 
 **Per call** (`ignis_nvfp4_a16_mma_bench`, median of 50, same weight and
 input):
@@ -66,10 +82,19 @@ input):
 (about 209 TF/s on the RTX 5090, per NVIDIA's spec), so at prompt width the A16 route has no
 headroom left.
 
-**Where the threshold sits.** At T = 33 the route was 0.76-0.92x the GEMVs.
-With a 5,120-row matrix the grid is only 80 CTAs on 170 SMs, and each CTA
-walks the whole K axis. At T = 64 it wins on every shape measured, so the
-route starts at 64.
+**Where the threshold sits.** The route has a latency floor: one CTA walks
+the whole K axis at ~1.1 us per 64-wide step, so ~90 us at K = 5,120 and
+~420 us at K = 25,600, however few tokens there are.
+
+- At T = 33 it ran 0.76-0.92x the GEMVs on every shape.
+- At T = 64 it wins on every problem with 4,096+ rows: 1.38-1.50x, including
+  the drafter's [5120, 4096] and [5120, 17408].
+- On the narrow problems it loses at T = 64 ([1280, 5120] 0.70x,
+  [256, 5120] 0.59x) and wins from 128 (1.37x, 1.05x; 10.2x and 8.2x at
+  1,024).
+
+So the threshold is 64, or 128 below 4,096 rows (`--narrow`, `--drafter` in
+the bench).
 
 **Prefill, as served** (nsys, `trace_phase.sh`, ~5,500-token cold prompts, one
 lane): the CUDA-core class of prefill device time fell from **21.1% to 1.5%**,
@@ -89,39 +114,62 @@ warm-ups, then two greedy 512-token generations):
 | 512-token generation | 3.82 s, 3.62 s | 3.79 s, 3.65 s |
 | generated text | — | **byte-identical** to main (both runs) |
 
+**Eight lanes** (`lanes8.sh`: 8 concurrent greedy 384-token generations with
+distinct prompts, two rounds, a fresh server per arm). This is the shape where
+the drafter's propose forward runs at 64 columns and takes the route every
+decode round.
+
+| | main | main again | A16 MMA route |
+|---|---|---|---|
+| round 1 wall time | 6.24 s | 6.27 s | **5.93 s** |
+| round 2 wall time | 5.59 s | 5.58 s | **5.42 s** |
+| outputs identical to main | — | 16/16 | 15/16 |
+
+The one different output diverges at character 1,771 of 1,828 (~token 370
+of 384), inside a list of SQL terms: a near-tie resolved the other way.
 ## Finding
 
 **Observed.** A16 NVFP4 at prompt width now runs on the tensor cores at
 93-96% of the BF16 peak. The drafter's context append no longer shows up as a
 cost class in prefill. Single-lane TTFT on a ~5K-token prompt dropped 12.8%.
-Greedy output and decode speed are unchanged.
+At one lane, greedy output is byte-identical and decode speed unchanged. At
+eight lanes, a round of 8 generations is 3-5% faster, and 15 of 16 outputs
+match main.
 
 **Inferred.** The TTFT gain is smaller than the ~18% of device time removed:
 end-to-end time also includes host time between requests and the gaps between
 kernels inside a chunk, which the route does not touch. Output is identical
 because greedy verification makes the target model alone decide each token. A
 drafter context that differs in accumulation order can change which drafts are
-accepted, but not what is emitted. Equal generation times say acceptance did
-not move measurably. Acceptance itself was not counted.
+accepted, but at one lane not what is emitted. At eight lanes, a different
+acceptance changes the width of the target's batched rounds, and batched
+decode is not width-invariant
+([batched decode width drift](2026-09-14-batched-decode-width-drift.md)). A
+late near-tie can therefore flip, which fits the single divergence. Main is
+16/16 against itself only because a fresh server replays the same schedule.
+Acceptance itself was not counted.
 
 ## Implications
 
 - The remaining prefill cost is the backbone on the tensor cores. The next
   prefill lever is the backbone GEMMs (already 71-87% tensor), attention, or
   the ~15% "other" class, not the drafter.
-- Any other A16 NVFP4 caller at 64 or more columns now gets the MMA route
-  automatically, because it is taken inside `ops::linear`.
+- A future A16 NVFP4 caller gets the route automatically, because it is taken
+  inside `ops::linear`. Today the only such caller is the drafter.
 
 ## Limits and unknowns
 
-- 33-63 columns stay on the GEMVs. The drafter's decode-time append (width x
-  batch columns, up to 64 at eight lanes) mostly lives there. A split-K or a
-  smaller CTA tile could win that range too. Not built.
-- One lane, one prompt length (~5.1K tokens). Longer prompts spend more of
-  their time in attention, so the relative gain shrinks with length.
+- Below the thresholds the GEMVs stay. That covers the drafter at one to
+  seven lanes (8-56 columns) and the narrow problems at 64-127. The cause is
+  the route's latency floor: the K loop is serial within a CTA. A split-K, or
+  a deeper pipeline with the decode overlapped (the ring runs three
+  `__syncthreads` per K step), would lower it. Not built.
+- One prompt length (~5.1K tokens). Longer prompts spend more of their time in
+  attention, so the relative gain shrinks with length.
 - dflash2 acceptance was not measured directly, only through generation time
   on one prompt.
 
 ## Follow-ups
 
-- Split-K (or a narrower tile) for 33-63 columns, then lower the threshold.
+- Lower the latency floor (split-K, or a pipelined decode), then lower the
+  thresholds.

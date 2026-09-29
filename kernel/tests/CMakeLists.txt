@@ -469,7 +469,7 @@ add_test(NAME ignis_kernel_dflash2_topk_test COMMAND ignis_kernel_dflash2_topk_t
 
 # OURS, not vendored: the A16 NVFP4 linear's tensor-core route
 # (kernel/include/ignis_nvfp4_a16_mma.h), which takes every A16 call of 64
-# columns or more. Driven through the leaf's ops::linear with the vendored
+# columns or more (128 below 4,096 output rows). Driven through the leaf's ops::linear with the vendored
 # linear harness's FP64 oracle and its A16 criterion, at prompt widths the
 # vendored test never reaches. No SKIP_RETURN_CODE (ADR 0006).
 add_executable(ignis_kernel_nvfp4_a16_mma_test
