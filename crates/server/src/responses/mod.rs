@@ -49,25 +49,35 @@ pub(crate) enum Driven {
 /// ends or `deadline` passes, handing each event to `emit` as it is made.
 /// A stream that closes without a finish (the engine dropped the request)
 /// ends the response `failed`.
+///
+/// The deadline is checked before every event, not only while the stream
+/// is idle: a request that keeps generating always has a token ready, and
+/// would otherwise never time out.
 pub(crate) async fn drive(
     events: &mut ResponseEvents,
     stream: &mut EventStream,
     deadline: tokio::time::Instant,
     mut emit: impl FnMut(JsonValue),
 ) -> Driven {
+    let expiry = tokio::time::sleep_until(deadline);
+    tokio::pin!(expiry);
     loop {
-        match tokio::time::timeout_at(deadline, stream.recv()).await {
-            Ok(Some(event)) => {
+        let event = tokio::select! {
+            biased;
+            () = &mut expiry => return Driven::TimedOut,
+            event = stream.recv() => event,
+        };
+        match event {
+            Some(event) => {
                 events.on_event(event).into_iter().for_each(&mut emit);
                 if events.ending().is_some() {
                     return Driven::Ended;
                 }
             }
-            Ok(None) => {
+            None => {
                 events.failed("server_error", dropped_message()).into_iter().for_each(&mut emit);
                 return Driven::Ended;
             }
-            Err(_) => return Driven::TimedOut,
         }
     }
 }
@@ -207,6 +217,14 @@ impl Stream for EventSse {
             if this.ended {
                 return Poll::Ready(None);
             }
+            // First, for the reason `drive` checks it first.
+            if this.deadline.as_mut().poll(cx).is_ready() {
+                // Left unfinished: dropping the body cancels the request.
+                let message = api::request_timeout_message(this.timeout);
+                this.pending.extend(this.events.failed("request_timeout", message));
+                this.ended = true;
+                continue;
+            }
             match this.stream.poll_recv(cx) {
                 Poll::Ready(Some(event)) => {
                     this.pending.extend(this.events.on_event(event));
@@ -222,16 +240,8 @@ impl Stream for EventSse {
                     this.ended = true;
                     continue;
                 }
-                Poll::Pending => {}
+                Poll::Pending => return Poll::Pending,
             }
-            if this.deadline.as_mut().poll(cx).is_ready() {
-                // Left unfinished: dropping the body cancels the request.
-                let message = api::request_timeout_message(this.timeout);
-                this.pending.extend(this.events.failed("request_timeout", message));
-                this.ended = true;
-                continue;
-            }
-            return Poll::Pending;
         }
     }
 }

@@ -49,18 +49,26 @@ pub struct Rendered {
 pub struct Script {
     decode: HashMap<TokenId, &'static str>,
     boundaries: bool,
+    /// What a token `decode` does not name reads as.
+    unnamed: &'static str,
     pub seen: Mutex<Vec<Rendered>>,
 }
 
 impl Script {
     /// Tokens decode to `decode`'s text, and to `?` otherwise.
     pub fn new(decode: HashMap<TokenId, &'static str>) -> Arc<Self> {
-        Arc::new(Self { decode, ..Self::default() })
+        Arc::new(Self { decode, unnamed: "?", ..Self::default() })
+    }
+
+    /// Every token reads as nothing: a request generates without a single
+    /// text event, however long it runs.
+    pub fn silent() -> Arc<Self> {
+        Arc::new(Self::default())
     }
 
     /// [`Script::new`], reporting the prompt's structure.
     pub fn with_boundaries(decode: HashMap<TokenId, &'static str>) -> Arc<Self> {
-        Arc::new(Self { decode, boundaries: true, ..Self::default() })
+        Arc::new(Self { decode, boundaries: true, unnamed: "?", ..Self::default() })
     }
 
     pub fn seen(&self) -> Vec<Rendered> {
@@ -93,7 +101,7 @@ impl TemplateProvider for Handle {
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
-        tokens.iter().map(|t| self.0.decode.get(t).copied().unwrap_or("?")).collect()
+        tokens.iter().map(|t| self.0.decode.get(t).copied().unwrap_or(self.0.unnamed)).collect()
     }
 
     fn thinking_capabilities(&self) -> ThinkingCapabilities {
@@ -101,17 +109,17 @@ impl TemplateProvider for Handle {
     }
 
     fn token_decoder(&self) -> Box<dyn TokenDecoder> {
-        Box::new(Decoder(self.0.decode.clone()))
+        Box::new(Decoder(self.0.decode.clone(), self.0.unnamed))
     }
     // `decoder_starts_in_reasoning` stays the trait default: a request with
     // thinking on starts in the reasoning channel, as a real template's does.
 }
 
-struct Decoder(HashMap<TokenId, &'static str>);
+struct Decoder(HashMap<TokenId, &'static str>, &'static str);
 
 impl TokenDecoder for Decoder {
     fn push(&mut self, token: TokenId) -> String {
-        self.0.get(&token).copied().unwrap_or("?").to_owned()
+        self.0.get(&token).copied().unwrap_or(self.1).to_owned()
     }
     fn finish(&mut self) -> String {
         String::new()
