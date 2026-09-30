@@ -84,6 +84,7 @@ than API.",
         (name = "models", description = "What this server loaded."),
         (name = "chat", description = "Chat completions, streaming and not."),
         (name = "responses", description = "The OpenAI responses API."),
+        (name = "tokenize", description = "A prompt's token count, and token ids back to text, without serving anything."),
         (name = "decide", description = "Typed decisions read from the readout (ADR 0034)."),
     ),
 )]

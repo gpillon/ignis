@@ -584,6 +584,17 @@ pub trait TemplateProvider: Send + Sync {
         None
     }
 
+    /// Whether `id` names a token of the loaded tokenizer (GitHub #285): what
+    /// `/v1/detokenize` checks its ids against, since a decode would skip one
+    /// with no token rather than refuse it.
+    ///
+    /// The default is `true`: a provider with no real tokenizer (the
+    /// placeholder hashes words into ids) has no vocabulary to be outside of.
+    fn is_token(&self, id: TokenId) -> bool {
+        let _ = id;
+        true
+    }
+
     /// Render generated tokens to the response text (`content` / `text`) —
     /// a whole-list decode, unaware of the reasoning/content split.
     fn render_tokens(&self, tokens: &[TokenId]) -> String;

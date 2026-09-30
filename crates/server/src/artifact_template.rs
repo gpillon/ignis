@@ -414,6 +414,10 @@ impl TemplateProvider for ArtifactTemplateProvider {
         self.set.tokenizer().encode(text).ok()
     }
 
+    fn is_token(&self, id: TokenId) -> bool {
+        self.set.tokenizer().knows(id)
+    }
+
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
         // `TokenId` is a `u32` alias, so the id slice is the tokenizer's
         // own input type.

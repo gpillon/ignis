@@ -194,3 +194,9 @@ The refusal message names what the caller can do instead: send the request.
   `vllm/entrypoints/openai/protocol.py` at a pinned version and adopt the
   names exactly — a half-matching shape is worse than an honestly different
   one.
+- **Round trip, as built (2026-09-30).** The artifact's tokenizer normalizes to NFC before it splits, so acceptance 3 holds byte for byte for text the
+  normalizer leaves alone (ASCII, multi-byte UTF-8, an emoji ending in a zero-width joiner) and, for
+  a decomposed `e` + combining accent, the ids spell the composed `é`: the round trip is over what
+  the tokenizer saw, which is what `count` counts. `detokenize` checks each id with the tokenizer's
+  own `id_to_token` because a decode skips an unknown id instead of refusing it. A load with no real tokenizer
+  (the placeholder provider) answers the raw form `501 tokenizer_unavailable` rather than inventing ids.

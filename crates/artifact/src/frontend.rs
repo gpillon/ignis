@@ -364,6 +364,14 @@ impl Tokenizer {
         Ok((output.get_ids().to_vec(), output.get_offsets().to_vec()))
     }
 
+    /// Whether `id` is a token this tokenizer has — in its vocabulary or among
+    /// its added tokens. `decode` skips an id it has no token for rather than
+    /// refusing it, so this is what tells a caller its ids are real (GitHub
+    /// #285).
+    pub fn knows(&self, id: u32) -> bool {
+        self.inner.id_to_token(id).is_some()
+    }
+
     /// Decode token ids to text.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.inner
@@ -1217,6 +1225,17 @@ mod tests {
         assert_eq!(offsets, vec![(0, 3), (4, 9), (11, 16), (17, 20)]);
         let spelled: Vec<&str> = offsets.iter().map(|&(a, b)| &text[a..b]).collect();
         assert_eq!(spelled, ["the", "quick", "brown", "fox"]);
+    }
+
+    #[test]
+    fn tokenizer_knows_the_ids_it_has_a_token_for() {
+        let tokenizer = Tokenizer::from_bytes(FIXTURE_TOKENIZER_JSON.as_bytes()).expect("parse");
+        let ids = tokenizer.encode("the quick brown fox").expect("encode");
+        assert!(ids.iter().all(|&id| tokenizer.knows(id)), "{ids:?}");
+        assert!(!tokenizer.knows(u32::MAX));
+        // `decode` skips an id it has no token for; `knows` is what says so.
+        let text = tokenizer.decode(&[ids[0], u32::MAX]).expect("decode");
+        assert_eq!(text, tokenizer.decode(&ids[..1]).expect("decode"));
     }
 
     #[test]

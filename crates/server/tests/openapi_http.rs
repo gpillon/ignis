@@ -83,6 +83,9 @@ fn the_document_lists_exactly_the_v1_surface() {
     let expected: BTreeSet<String> = [
         "get /v1/models",
         "post /v1/chat/completions",
+        // GitHub #285: the prompt counted without being served.
+        "post /v1/tokenize",
+        "post /v1/detokenize",
         "post /v1/responses",
         // GitHub #282: the Responses API's WebSocket mode, deliberately.
         "get /v1/responses",

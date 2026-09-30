@@ -143,6 +143,10 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
     OpenApiRouter::with_openapi(crate::openapi::ApiDoc::openapi())
         .routes(routes!(list_models))
         .routes(routes!(chat_completions))
+        // GitHub #285: the prompt counted without being served. Neither
+        // reaches the scheduler.
+        .routes(routes!(crate::tokenize::tokenize))
+        .routes(routes!(crate::tokenize::detokenize))
         // GitHub #282: the Responses API, and its WebSocket mode as the
         // `get` of the same path.
         .routes(routes!(crate::responses::create_response, crate::responses::socket::connect))
@@ -159,6 +163,8 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         )
         .route("/v1/models", options(cors_preflight))
         .route("/v1/chat/completions", options(cors_preflight))
+        .route("/v1/tokenize", options(cors_preflight))
+        .route("/v1/detokenize", options(cors_preflight))
         .route("/v1/responses", options(cors_preflight))
         .route("/v1/decide", options(cors_preflight))
         .split_for_parts()
@@ -275,6 +281,25 @@ pub(crate) struct PreparedRequest {
     /// The rendered text and each token's byte range in it (GitHub #275,
     /// [`RenderedPrompt::text`]); `None` unless asked for.
     pub text: Option<crate::template::PromptText>,
+}
+
+/// A conversation's render and nothing after it (GitHub #285): what
+/// `/v1/tokenize` counts. The path a text conversation takes to be submitted
+/// — instruction policy, then [`build_request`] — stopped before the
+/// submission, so its `prompt_tokens` is the usage figure the same body
+/// reports when served. Text only: a conversation with images is media
+/// acquisition first ([`prepare_input`]), which is exactly what a counting
+/// route must not do.
+pub(crate) fn render_prompt(
+    server: &Server,
+    messages: &[ChatMessage],
+    thinking: &ThinkingOptions,
+    tools: &[JsonValue],
+    structure: Structure,
+) -> Result<PreparedRequest, Response> {
+    let messages = &server.instruction_policy.normalize(messages).map_err(template_rejection)?;
+    build_request(server, None, messages, DecodeParams::default(), thinking, tools, structure)
+        .map_err(template_rejection)
 }
 
 /// The request's model, the templated prompt tokens, and the prompt-token

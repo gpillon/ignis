@@ -230,6 +230,8 @@ not.
 | `/v1/models` | GET | The loaded model. |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` is a 400). |
+| `/v1/tokenize` | POST | A body's prompt-token count without serving it ([below](#counting-a-prompt)). |
+| `/v1/detokenize` | POST | Token ids back to text, through the same tokenizer. |
 | `/v1/decide` | POST | The decision endpoint ([below](#decisions)). |
 | `/v1/systemone` | POST | The same handler under its Jev name. |
 | `/v1` | GET | The API reference — a 307 to `/v1/docs/` (ADR 0036). |
@@ -314,6 +316,31 @@ curl http://127.0.0.1:8000/v1/responses \
 ```
 
 With `--api-key`, add `-H "Authorization: Bearer $IGNIS_API_KEY"`.
+
+### Counting a prompt
+
+`POST /v1/tokenize` renders a chat body exactly as `/v1/chat/completions` would —
+chat template, tool block, thinking controls, system block — and answers how many
+tokens it prefills, **without submitting it**: no lane, no GPU, no KV page. The
+`count` is the `usage.prompt_tokens` the same body reports when served, and
+`max_model_len` is the server's `--max-context`, so one call says whether a body
+fits.
+
+```bash
+curl http://127.0.0.1:8000/v1/tokenize   -H 'Content-Type: application/json'   -d '{"messages":[{"role":"user","content":"Hello"}],"tools":[...],"return_token_ids":true}'
+# {"count":1234,"max_model_len":262144,"token_ids":[...]}
+```
+
+Send `messages` **or** a raw `prompt` (tokenized with no template), never both.
+`return_token_ids` and `return_text` add the ids and the rendered prompt.
+Sampling fields are ignored, `stream` is refused, and a body with an `image_url`
+part is a `400 media_not_countable`: an image's cost is its grid after
+preparation, which only fetching and decoding it would tell — send the request.
+`POST /v1/detokenize` takes `{"token_ids":[...]}` and answers `{"text":"..."}`; an
+id outside the vocabulary is a `400` naming its index. The tokenizer normalizes
+text to NFC, so a decomposed `e` + accent comes back as the composed `é`.
+Neither route enters the scheduler; the count of calls is
+`ignis_tokenize_requests_total{route}` with `--metrics`.
 
 ### Canary check
 
