@@ -331,6 +331,13 @@ async fn what_this_server_does_not_serve_is_a_400_naming_the_field() {
             "input[1].type",
             "invalid_request_error",
         ),
+        // Spec server/09: the rest of the Responses body, refused by value.
+        (with("top_logprobs", json!(3)), "top_logprobs", "unsupported_value"),
+        (with("truncation", json!("auto")), "truncation", "unsupported_value"),
+        (with("conversation", json!("conv_1")), "conversation", "unsupported_value"),
+        (with("prompt", json!({ "id": "pmpt_1" })), "prompt", "unsupported_value"),
+        (with("context_management", json!([{ "type": "compaction" }])), "context_management", "unsupported_value"),
+        (with("service_tier", json!("priority")), "service_tier", "unsupported_value"),
     ];
     for (body, param, code) in cases {
         let (status, _, answer) = post(&app, "/v1/responses", body.clone()).await;
@@ -366,6 +373,9 @@ async fn fields_that_do_not_change_the_answer_are_accepted() {
         "tool_choice": "auto",
         "background": false,
         "previous_response_id": null,
+        "top_logprobs": 0,
+        "max_tool_calls": 4,
+        "conversation": null,
         "some_future_field": { "x": 1 }
     });
     let (status, _, answer) = post(&app, "/v1/responses", body).await;

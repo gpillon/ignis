@@ -71,7 +71,19 @@ changing the URL alone. OpenAPI has no notion of an alias, so it is named \
 here rather than listed as a second path.\n\n\
 The Prometheus exposition is not part of this document (ADR 0017): it is \
 served on its own listener with `--metrics`, and it is monitoring rather \
-than API.",
+than API.\n\n\
+Every field of an OpenAI request body is honoured, accepted as inert, or \
+refused with a 400 naming it in `param` — never dropped in silence; each \
+completion operation lists its own.\n\n\
+Not served, by choice (these routes answer 404): embeddings and a generic \
+reranker (a second model on the card, whose VRAM plan gives it to one; a \
+classification is `/v1/decide`); `/v1/completions` (a raw prompt skips the \
+chat template the model was tuned on, and the turn boundaries reuse is keyed \
+on); `/v1/batches` (an offline queue is a storage service, and this server \
+holds no request past its connection); audio in or out (the model has no \
+audio tower or head); LoRA adapters (trained against BF16 weights, and the \
+checkpoint is NVFP4: merge and re-export instead); more than one loaded model \
+(the VRAM plan is decided at load, for one).",
         version = env!("CARGO_PKG_VERSION"),
         license(name = "Apache-2.0"),
     ),

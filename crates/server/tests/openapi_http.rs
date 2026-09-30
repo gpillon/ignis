@@ -112,6 +112,36 @@ fn the_counting_routes_carry_their_schemas() {
 }
 
 #[test]
+fn every_refused_field_is_named_in_its_operation_description() {
+    // Spec server/09: driven off the table the validator reads, so a refusal
+    // cannot be added without the document saying so.
+    use ignis_server::openai_fields::{table, Surface};
+    let document = document();
+    for (path, surface) in [("/v1/chat/completions", Surface::Chat), ("/v1/responses", Surface::Responses)] {
+        let description = document["paths"][path]["post"]["description"].as_str().unwrap_or_default();
+        for rule in table(surface) {
+            assert!(description.contains(&format!("`{}`", rule.name)), "{path}: `{}` not named", rule.name);
+            if let Some(reason) = rule.refusal {
+                assert!(description.contains(reason), "{path}: `{}`'s refusal not described", rule.name);
+            }
+        }
+    }
+    // What the chat operation honours beyond the classic fields.
+    let chat = document["paths"]["/v1/chat/completions"]["post"]["description"].as_str().unwrap();
+    for honoured in ["`max_completion_tokens`", "`stop`", "`usage.prompt_tokens_details.cached_tokens`"] {
+        assert!(chat.contains(honoured), "{honoured}");
+    }
+}
+
+#[test]
+fn the_document_names_what_the_server_does_not_serve() {
+    let description = document()["info"]["description"].as_str().unwrap_or_default().to_owned();
+    for choice in ["embeddings", "`/v1/completions`", "`/v1/batches`", "audio", "LoRA", "more than one loaded model"] {
+        assert!(description.contains(choice), "`{choice}` missing: {description}");
+    }
+}
+
+#[test]
 fn the_document_carries_no_monitoring_path() {
     // "Not for the monitoring" (GitHub #251), made checkable: the
     // Prometheus exposition is ADR 0017's contract, served on its own

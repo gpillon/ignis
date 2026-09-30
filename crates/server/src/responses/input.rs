@@ -22,10 +22,10 @@ use crate::Server;
 
 /// A Responses request: the `POST /v1/responses` body, and the body of a
 /// socket's `response.create` beside its `type`, `stream_id` and `generate`.
-/// Unknown fields are ignored (a tolerant reader, as chat completions is),
-/// which is how `store`, `include`, `metadata`, `user`, `prompt_cache_key`,
-/// `service_tier`, `truncation`, `client_metadata` and the rest that do not
-/// change the answer are accepted.
+/// Every other field OpenAI documents is inert or refused by value
+/// (`crate::openai_fields`, spec server/09) — `include`, `prompt_cache_key`,
+/// `client_metadata` and the rest that do not change the answer are
+/// accepted — and a field outside that list is ignored.
 #[derive(Clone, Default, Deserialize, ToSchema)]
 pub(crate) struct CreateResponse {
     model: Option<String>,
@@ -95,6 +95,12 @@ pub(crate) struct CreateResponse {
     /// The Lane tag, an ignis extension (see chat completions).
     #[schema(value_type = String)]
     class: Option<JsonValue>,
+    /// Every field not named above — after `sampling` took its own — for
+    /// `crate::openai_fields` to classify. The last flattened field, so it
+    /// takes only what the others left.
+    #[serde(flatten)]
+    #[schema(ignore)]
+    other: serde_json::Map<String, JsonValue>,
 }
 
 /// The user turn a system-only warm-up is rendered with, and cut from.
@@ -167,6 +173,8 @@ pub(crate) async fn prepare(
     history: Vec<JsonValue>,
     warm_up: bool,
 ) -> Result<Prepared, Response> {
+    crate::openai_fields::check(&req.other, crate::openai_fields::Surface::Responses)
+        .map_err(api::refused_field)?;
     if let Some(text) = &req.text {
         let format = text.get("format").and_then(|f| f.get("type"));
         if format.is_some_and(|f| f != "text") {

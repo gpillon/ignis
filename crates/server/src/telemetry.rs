@@ -218,10 +218,11 @@ pub struct Telemetry {
     /// The Prometheus projection this consumer keeps up to date, when
     /// `--metrics` installed one (GitHub #89, ADR 0017).
     metrics: Option<Arc<Metrics>>,
-    /// The latest cancelled requests, kept only while `metrics` is set: a
-    /// request can finish in the same step its cancel is sent, and then its
-    /// `Done` reaches this consumer after the cancel. It was counted once,
-    /// as cancelled, and must not be counted again as completed.
+    /// The latest cancelled (or stopped, [`Telemetry::on_stopped`])
+    /// requests, kept only while `metrics` is set: a request can finish in
+    /// the same step its cancel is sent, and then its `Done` reaches this
+    /// consumer after the cancel. It was counted once, as cancelled or as
+    /// completed, and must not be counted again as completed.
     recently_cancelled: VecDeque<RequestId>,
 }
 
@@ -332,16 +333,37 @@ impl Telemetry {
         if self.requests.remove(&id).is_none() {
             return;
         }
-        let Some(metrics) = &self.metrics else {
+        let Some(metrics) = self.metrics.clone() else {
             return;
         };
         metrics.record_cancelled();
+        self.remember_released(id);
+        let counters = self.counters();
+        metrics.set_scheduler_requests(counters.waiting, counters.running);
+    }
+
+    /// A request ended at its caller's stop sequence after `n` generated
+    /// tokens (spec server/09, [`crate::engine::Engine::stop`]). The
+    /// scheduler released it as it releases a cancel, with no `Done`, but it
+    /// finished: its `done` line is emitted here, with `stop`, and it counts
+    /// as completed. A `Done` that raced the release is not counted again.
+    pub fn on_stopped(&mut self, id: RequestId, n: u32) {
+        if !self.requests.contains_key(&id) {
+            // Its own `Done` came first: already reported.
+            return;
+        }
+        self.on_done(id, n, FinishReason::Stop, None, None);
+        if self.metrics.is_some() {
+            self.remember_released(id);
+        }
+    }
+
+    /// Remember `id` for the cancel/`Done` race (`recently_cancelled`).
+    fn remember_released(&mut self, id: RequestId) {
         if self.recently_cancelled.len() == RECENTLY_CANCELLED {
             self.recently_cancelled.pop_front();
         }
         self.recently_cancelled.push_back(id);
-        let counters = self.counters();
-        metrics.set_scheduler_requests(counters.waiting, counters.running);
     }
 
     /// A chunked-prefill step landed for a request still queued or mid-
@@ -1711,6 +1733,40 @@ mod tests {
             !events.iter().any(|e| e["event_name"] == "ignis.request.requeued"),
             "a requeue has no line of its own: {events:?}"
         );
+    }
+
+    /// Spec server/09: a request ended at its caller's stop sequence is
+    /// released like a cancel, but it completed — one `done` line with
+    /// `stop`, counted once as completed, even when its own `Done` raced the
+    /// release; and one whose `Done` came first is not reported twice.
+    #[test]
+    fn a_stopped_request_is_done_with_stop_and_counted_once_as_completed() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Interactive);
+            telemetry.on_admitted(1, 0);
+            telemetry.on_stopped(1, 5);
+            telemetry.on_done(1, 6, FinishReason::Stop, None, None); // raced the release
+            telemetry.note_submit(2, 3, RequestClass::Interactive);
+            telemetry.on_done(2, 2, FinishReason::Stop, None, None);
+            telemetry.on_stopped(2, 2); // its `Done` came first
+        });
+        let done: Vec<_> = events.iter().filter(|e| e["event_name"] == "ignis.request.done").collect();
+        assert_eq!(done[0]["attributes"]["request_id"], 1);
+        assert_eq!(done[0]["attributes"]["finish_reason"], "stop");
+        assert_eq!(done[0]["attributes"]["tokens"], 5);
+        assert!(!done.iter().any(|e| e["attributes"]["request_id"] == 2 && e["attributes"]["tokens"] != 2));
+
+        let text = metrics.render();
+        for line in [
+            "ignis_requests_completed_total 2",
+            "ignis_requests_cancelled_total 0",
+            "ignis_generated_tokens_total 7",
+        ] {
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        }
     }
 
     /// A cancelled request never completed: its late `Done` is not a

@@ -507,6 +507,10 @@ async fn the_budget_leaves_the_answer_room_inside_max_tokens() {
         // No room above the reserve: no budget, not a close at token 0.
         (serde_json::json!({ "max_tokens": ANSWER_RESERVE }), None),
         (serde_json::json!({ "max_tokens": 16 }), None),
+        // Spec server/09: `max_completion_tokens` is the same cap, and the
+        // budget leaves the answer its room inside it the same way.
+        (serde_json::json!({ "max_tokens": null, "max_completion_tokens": ANSWER_RESERVE + 1000 }), Some(1000)),
+        (serde_json::json!({ "max_tokens": null, "max_completion_tokens": ANSWER_RESERVE }), None),
     ] {
         assert_eq!(budget_of(&h, "/v1/chat/completions", extra.clone()).await, want, "{extra}");
     }

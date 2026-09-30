@@ -280,9 +280,22 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   or penalties, a non-neutral `top_p`, `top_k`, `presence_penalty` or
   `frequency_penalty` requires `temperature > 0` and is otherwise rejected
   rather than ignored.
+- `max_completion_tokens` is `max_tokens` under OpenAI's current name — the
+  one the current SDKs send. Both with different values is a 400.
+- `stop` (a string, or 1 to 4 non-empty strings) ends the answer before the
+  first sequence to appear in its content, with `finish_reason: "stop"`. The
+  sequence is never emitted, streaming included; it is never matched in the
+  reasoning, nor inside a tool call.
 - Non-streaming returns `choices[].message.content` plus `usage`; streaming
   emits `chat.completion.chunk` SSE frames (token deltas, a final
-  `finish_reason` chunk, then `[DONE]`).
+  `finish_reason` chunk, then `[DONE]`). `usage.prompt_tokens_details.cached_tokens`
+  is the prompt the request resumed from retained state instead of
+  prefilling (0 when none).
+- Every other OpenAI field is accepted as inert when its value asks for what
+  the server already does (`n: 1`, `store: false`, `logprobs: false`,
+  `response_format: {"type": "text"}`, `metadata`, `user`, ...) and refused
+  with a 400 `unsupported_value` naming it in `param` otherwise. The full
+  table is in the API reference at `/v1/docs/`; a field outside it is ignored.
 
 The responses API accepts `input` (a string or a message list), `model`,
 `max_output_tokens`, `temperature` and `seed`, and returns the responses shape

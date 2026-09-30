@@ -45,6 +45,7 @@ use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
 use crate::engine::{Completion, Engine, EventStream, RequestNotes, collect_completion, drain_tokens};
 use crate::media::{has_media, MediaRejection, MediaStats};
+use crate::openai_fields::{self, Surface};
 use crate::template::{
     check_content_parts, check_roles, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
     TemplateRejection,
@@ -140,7 +141,7 @@ pub fn router(state: Arc<Server>) -> Router {
 /// preflight is a browser mechanism, not an operation a client calls, and
 /// documenting it would put five meaningless entries in the document.
 fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
-    OpenApiRouter::with_openapi(crate::openapi::ApiDoc::openapi())
+    let (router, mut document) = OpenApiRouter::with_openapi(crate::openapi::ApiDoc::openapi())
         .routes(routes!(list_models))
         .routes(routes!(chat_completions))
         // GitHub #285: the prompt counted without being served. Neither
@@ -167,7 +168,24 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .route("/v1/detokenize", options(cors_preflight))
         .route("/v1/responses", options(cors_preflight))
         .route("/v1/decide", options(cors_preflight))
-        .split_for_parts()
+        .split_for_parts();
+    describe_fields(&mut document);
+    (router, document)
+}
+
+/// Spec server/09: each completion operation's description ends with its
+/// field table (`crate::openai_fields::describe`) — the table the validator
+/// reads, so the document cannot list a refusal the server does not make,
+/// nor miss one it does. A `#[utoipa::path]` description is a literal, which
+/// is why this is added to the generated document rather than written there.
+fn describe_fields(document: &mut utoipa::openapi::OpenApi) {
+    for (path, surface) in [("/v1/chat/completions", Surface::Chat), ("/v1/responses", Surface::Responses)] {
+        let operation = document.paths.paths.get_mut(path).and_then(|item| item.post.as_mut());
+        let operation = operation.expect("the completion operations are documented");
+        let description = operation.description.get_or_insert_with(String::new);
+        description.push_str("\n\n");
+        description.push_str(&openai_fields::describe(surface));
+    }
 }
 
 /// The OpenAPI document this build serves at `/v1/openapi.json`.
@@ -1129,8 +1147,9 @@ struct ModelInfo {
 
 // ── POST /v1/chat/completions ─────────────────────────────────────────────
 
-/// A chat-completions request (OpenAI wire shape; unknown fields are
-/// ignored — serde's default).
+/// A chat-completions request (OpenAI wire shape). Every other field OpenAI
+/// documents is inert or refused by value (`crate::openai_fields`, spec
+/// server/09); a field outside that list is ignored.
 #[derive(Deserialize, ToSchema)]
 struct ChatCompletionsRequest {
     model: Option<String>,
@@ -1142,7 +1161,19 @@ struct ChatCompletionsRequest {
     /// Streaming-only options. `include_usage: true` appends the trailing
     /// usage chunk (empty `choices`, populated `usage`) before `[DONE]`.
     stream_options: Option<StreamOptions>,
+    /// The cap on generated tokens, reasoning included.
     max_tokens: Option<u32>,
+    /// OpenAI's current name for `max_tokens` (spec server/09), what the
+    /// current SDKs send instead of it: the same cap, reasoning included.
+    /// Sent beside a different `max_tokens` it is a 400 — a body carrying
+    /// two different caps has no answer that is not a guess.
+    max_completion_tokens: Option<u32>,
+    /// A string, or an array of 1 to 4 non-empty strings (spec server/09):
+    /// the answer ends before the first of them to appear in its content,
+    /// which is not emitted, with `finish_reason: "stop"`. Never matched in
+    /// the reasoning, nor inside a tool call.
+    #[schema(value_type = Object)]
+    stop: Option<JsonValue>,
     /// An ignis extension: keep decoding past the model's EOS token. Used
     /// by the G3 inter-token-latency lanes, which are ended by the
     /// measurement window rather than by the model. Requires `max_tokens`.
@@ -1174,6 +1205,13 @@ struct ChatCompletionsRequest {
     /// the request under. Also settable via an "@<lane>" suffix on `model`
     /// (`split_model_lane`); this field wins if both are set.
     class: Option<JsonValue>,
+    /// Every field not named above — after `sampling` took its own — for
+    /// `crate::openai_fields` to classify. Must stay the last flattened
+    /// field: a flattened map takes whatever the flattened structs before it
+    /// left.
+    #[serde(flatten)]
+    #[schema(ignore)]
+    other: serde_json::Map<String, JsonValue>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1198,7 +1236,9 @@ struct StreamOptions {
 
 `stream: false` answers one JSON body. `stream: true` answers `text/event-stream`: one `data:` line per chunk in the `chat.completion.chunk` shape, a final chunk carrying `finish_reason` and an empty `delta`, then a literal `data: [DONE]` line. With `stream_options.include_usage: true` a usage-only chunk (empty `choices`) precedes it.
 
-Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text.",
+Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text.
+
+`max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.",
     request_body = ChatCompletionsRequest,
     responses(
         (status = 200, description = "The completion. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
@@ -1217,6 +1257,9 @@ async fn chat_completions(
     State(server): State<Arc<Server>>,
     Json(req): Json<ChatCompletionsRequest>,
 ) -> Response {
+    if let Err(refusal) = openai_fields::check(&req.other, Surface::Chat) {
+        return refused_field(refusal);
+    }
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
     }
@@ -1226,7 +1269,15 @@ async fn chat_completions(
     if let Err(rejection) = check_content_parts(&req.messages, server.media.is_some()) {
         return content_rejection(rejection);
     }
-    let params = match req.sampling.resolve(req.max_tokens, req.ignore_eos) {
+    let max_tokens = match one_cap(req.max_tokens, req.max_completion_tokens) {
+        Ok(cap) => cap,
+        Err(response) => return response,
+    };
+    let stop = match crate::stop::parse_stop(req.stop.as_ref()) {
+        Ok(stop) => stop,
+        Err(message) => return bad_request_param(&message, "stop"),
+    };
+    let params = match req.sampling.resolve(max_tokens, req.ignore_eos) {
         Ok(params) => params,
         Err(message) => return invalid_sampling_parameter(message),
     };
@@ -1279,75 +1330,375 @@ async fn chat_completions(
     let id = format!("chatcmpl-{request_id}");
     let created = now();
 
+    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
     if req.stream {
         // The SSE response: the request's event stream wrapped in the
         // `chat.completion.chunk` shape (a `[DONE]` marker terminates).
         let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
-        let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
         return Sse::new(ChunkStream::new(
             stream,
             CancelOnDrop::new(server.engine.clone(), request_id),
             id,
             created,
             model,
-            OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
-            schemas,
+            AnswerPipeline::new(
+                OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
+                schemas,
+                stop,
+            ),
             prompt_tokens,
             include_usage,
         ))
         .into_response();
     }
-    // Non-streaming: collect the request's tokens to its completion (a
-    // timeout guards a wedged engine from hanging the client).
-    match collect_completion(&mut stream, server.request_timeout).await {
-        Ok(Completion { reason: FinishReason::Error, .. }) => engine_error_response(),
-        Ok(Completion { tokens, reason, thinking: budget }) => {
-            let (reasoning_content, content, tool_calls) =
-                split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking, schemas);
-            let completion_tokens = tokens.len() as u32;
-            let finish_reason = resolve_finish_reason(reason, !tool_calls.is_empty(), false);
-            report_if_all_reasoning_no_content(
-                &id,
-                reasoning_content.as_deref().is_some_and(|r| !r.is_empty())
-                    && content.is_empty()
-                    && tool_calls.is_empty(),
-                finish_reason,
-            );
-            let tool_calls = if tool_calls.is_empty() {
-                None
-            } else {
-                Some(tool_calls.into_iter().map(ToolCallOut::from).collect())
-            };
-            Json(ChatCompletion {
-                id,
-                object: "chat.completion",
-                created,
-                model,
-                choices: vec![CompletionChoice {
-                    index: 0,
-                    message: AssistantMessage {
-                        role: "assistant",
-                        reasoning_content,
-                        content,
-                        tool_calls,
-                    },
-                    finish_reason,
-                    thinking_budget_forced_at: budget.and_then(|b| b.forced_at),
-                }],
-                usage: Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens: prompt_tokens.saturating_add(completion_tokens),
-                },
-            })
-            .into_response()
-        }
-        Err(_) => error_response(
+    let timed_out = || {
+        error_response(
             StatusCode::GATEWAY_TIMEOUT,
             "request_timeout",
             "request_timeout",
             request_timeout_message(server.request_timeout),
-        ),
+        )
+    };
+    if !stop.is_empty() {
+        // Non-streaming with `stop`: the tokens go through the streaming
+        // path's pipeline as they arrive, so the request ends at the token
+        // that completed a sequence instead of generating the tail nobody
+        // will read.
+        let pipeline = AnswerPipeline::new(
+            OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
+            schemas,
+            stop,
+        );
+        return match collect_answer(&server.engine, request_id, &mut stream, server.request_timeout, pipeline).await {
+            Ok(Answer { ending: AnswerEnding::Done(FinishReason::Error), .. }) => engine_error_response(),
+            Ok(answer) => {
+                let (reasoning, content, calls) = answer.parts();
+                let finish_reason = match answer.ending {
+                    AnswerEnding::Done(reason) => resolve_finish_reason(reason, !calls.is_empty(), answer.mid_call),
+                    AnswerEnding::Stopped => resolve_finish_reason(FinishReason::Stop, !calls.is_empty(), false),
+                };
+                let usage = Usage::new(prompt_tokens, answer.completion_tokens, answer.cached_tokens);
+                completion_body(id, created, model, reasoning, content, calls, finish_reason, answer.forced_at, usage)
+            }
+            Err(_) => timed_out(),
+        };
+    }
+    // Non-streaming: collect the request's tokens to its completion (a
+    // timeout guards a wedged engine from hanging the client).
+    match collect_completion(&mut stream, server.request_timeout).await {
+        Ok(Completion { reason: FinishReason::Error, .. }) => engine_error_response(),
+        Ok(Completion { tokens, reason, thinking: budget, cached_tokens }) => {
+            let (reasoning_content, content, tool_calls) =
+                split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking, schemas);
+            let completion_tokens = tokens.len() as u32;
+            let finish_reason = resolve_finish_reason(reason, !tool_calls.is_empty(), false);
+            let usage = Usage::new(prompt_tokens, completion_tokens, cached_tokens);
+            completion_body(
+                id,
+                created,
+                model,
+                reasoning_content,
+                content,
+                tool_calls,
+                finish_reason,
+                budget.and_then(|b| b.forced_at),
+                usage,
+            )
+        }
+        Err(_) => timed_out(),
+    }
+}
+
+/// The request's one generation cap (spec server/09): `max_tokens`, or
+/// `max_completion_tokens`, OpenAI's current name for it. Both, equal, is
+/// the one cap; both, different, is a 400 — an ignis rule (OpenAI accepts
+/// the deprecated `max_tokens` beside it) because two caps have no answer
+/// that is not a guess.
+fn one_cap(max_tokens: Option<u32>, max_completion_tokens: Option<u32>) -> Result<Option<u32>, Response> {
+    match (max_tokens, max_completion_tokens) {
+        (Some(a), Some(b)) if a != b => Err(bad_request_param(
+            &format!(
+                "max_completion_tokens ({b}) and max_tokens ({a}) are two different caps; send one of them (max_completion_tokens is the current name), or the same value in both"
+            ),
+            "max_completion_tokens",
+        )),
+        (a, b) => Ok(a.or(b)),
+    }
+}
+
+/// The 400 for a field [`openai_fields`] refused: `param` names it, and
+/// `code` is OpenAI's own for a value a server does not support.
+pub(crate) fn refused_field(refusal: openai_fields::Refusal) -> Response {
+    error_response_naming(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "unsupported_value",
+        refusal.message,
+        Some(refusal.param),
+    )
+}
+
+/// The non-streaming body, whichever path assembled the answer.
+#[allow(clippy::too_many_arguments)]
+fn completion_body(
+    id: String,
+    created: u64,
+    model: String,
+    reasoning_content: Option<String>,
+    content: String,
+    tool_calls: Vec<ScannedToolCall>,
+    finish_reason: &'static str,
+    thinking_budget_forced_at: Option<u32>,
+    usage: Usage,
+) -> Response {
+    report_if_all_reasoning_no_content(
+        &id,
+        reasoning_content.as_deref().is_some_and(|r| !r.is_empty()) && content.is_empty() && tool_calls.is_empty(),
+        finish_reason,
+    );
+    let tool_calls = if tool_calls.is_empty() {
+        None
+    } else {
+        Some(tool_calls.into_iter().map(ToolCallOut::from).collect())
+    };
+    Json(ChatCompletion {
+        id,
+        object: "chat.completion",
+        created,
+        model,
+        choices: vec![CompletionChoice {
+            index: 0,
+            message: AssistantMessage { role: "assistant", reasoning_content, content, tool_calls },
+            finish_reason,
+            thinking_budget_forced_at,
+        }],
+        usage,
+    })
+    .into_response()
+}
+
+/// How a non-streaming answer with `stop` ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnswerEnding {
+    /// The engine finished the request.
+    Done(FinishReason),
+    /// A stop sequence matched, and the request was stopped there.
+    Stopped,
+}
+
+/// A non-streaming answer, as [`collect_answer`] assembled it.
+struct Answer {
+    pieces: Vec<Piece>,
+    ending: AnswerEnding,
+    /// A tool call was open when the engine finished (dropped whole).
+    mid_call: bool,
+    completion_tokens: u32,
+    cached_tokens: u32,
+    forced_at: Option<u32>,
+}
+
+impl Answer {
+    /// The reasoning (absent when there was none), the content and the calls.
+    fn parts(&self) -> (Option<String>, String, Vec<ScannedToolCall>) {
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        for piece in &self.pieces {
+            match piece {
+                Piece::Reasoning(text) => reasoning.push_str(text),
+                Piece::Content(text) => content.push_str(text),
+                Piece::Call(call) => calls.push(call.clone()),
+            }
+        }
+        (Some(reasoning).filter(|r| !r.is_empty()), content, calls)
+    }
+}
+
+/// Drive a request with `stop` to its answer: each token through `pipeline`
+/// as it arrives, until the engine finishes the request or a stop sequence
+/// matches — then the request is stopped ([`Engine::stop`]) and nothing past
+/// that token is read. Bounded by `timeout`, as [`collect_completion`] is.
+async fn collect_answer(
+    engine: &Engine,
+    request: RequestId,
+    stream: &mut EventStream,
+    timeout: std::time::Duration,
+    mut pipeline: AnswerPipeline,
+) -> Result<Answer, crate::engine::CollectError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut pieces = Vec::new();
+    let mut cached_tokens = 0;
+    loop {
+        let event = match tokio::time::timeout_at(deadline, stream.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) | Err(_) => return Err(crate::engine::CollectError::NotCompleted),
+        };
+        let (ending, mid_call, forced_at) = match event {
+            SchedEvent::Token { token, .. } => {
+                join_pieces(&mut pieces, pipeline.push(&[token]));
+                if !pipeline.fired() {
+                    continue;
+                }
+                engine.stop(request, pipeline.consumed());
+                (AnswerEnding::Stopped, false, None)
+            }
+            SchedEvent::Done { reason, thinking, .. } => {
+                let (tail, mid_call) = pipeline.finish();
+                join_pieces(&mut pieces, tail);
+                (AnswerEnding::Done(reason), mid_call, thinking.and_then(|b| b.forced_at))
+            }
+            other => {
+                if let Some(reused) = crate::engine::reused_prompt_tokens(&other) {
+                    cached_tokens = cached_tokens.max(reused);
+                }
+                continue;
+            }
+        };
+        return Ok(Answer {
+            pieces,
+            ending,
+            mid_call,
+            completion_tokens: pipeline.consumed(),
+            cached_tokens,
+            forced_at,
+        });
+    }
+}
+
+/// One piece of a chat answer, in generation order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    Reasoning(String),
+    Content(String),
+    Call(ScannedToolCall),
+}
+
+/// Append `piece` to `pieces`, joined to the last one when both are text of
+/// the same channel; empty text is no piece at all.
+fn push_piece(pieces: &mut Vec<Piece>, piece: Piece) {
+    match (pieces.last_mut(), piece) {
+        (_, Piece::Reasoning(text) | Piece::Content(text)) if text.is_empty() => {}
+        (Some(Piece::Reasoning(last)), Piece::Reasoning(text)) | (Some(Piece::Content(last)), Piece::Content(text)) => {
+            last.push_str(&text)
+        }
+        (_, piece) => pieces.push(piece),
+    }
+}
+
+/// [`push_piece`] for each of `more`.
+fn join_pieces(pieces: &mut Vec<Piece>, more: Vec<Piece>) {
+    more.into_iter().for_each(|piece| push_piece(pieces, piece));
+}
+
+/// A request's generated tokens to the pieces of its answer: the reasoning
+/// and content split ([`OutputDecoder`], GitHub #68), tool calls out of the
+/// content ([`ToolCallScanner`], GitHub #121), and the caller's stop
+/// sequences over the content left (spec server/09,
+/// [`crate::stop::StopMatcher`]) — the order that keeps a stop sequence out
+/// of the reasoning and out of a call's arguments.
+///
+/// Tokens are decoded one at a time and the pieces joined per channel, which
+/// is the text [`OutputDecoder::push_run`] gives a run, in the same chunks;
+/// one at a time is what tells which token completed a stop sequence.
+struct AnswerPipeline {
+    decoder: OutputDecoder,
+    scanner: ToolCallScanner,
+    stop: Option<crate::stop::StopMatcher>,
+    /// Tokens fed so far: up to and including the one that completed a stop
+    /// sequence, which is the answer's `completion_tokens`.
+    consumed: u32,
+}
+
+impl AnswerPipeline {
+    fn new(decoder: OutputDecoder, schemas: ToolSchemas, stop: Vec<String>) -> Self {
+        Self {
+            decoder,
+            scanner: ToolCallScanner::with_schemas(schemas),
+            stop: (!stop.is_empty()).then(|| crate::stop::StopMatcher::new(stop)),
+            consumed: 0,
+        }
+    }
+
+    /// Whether a stop sequence matched: nothing more is read.
+    fn fired(&self) -> bool {
+        self.stop.as_ref().is_some_and(crate::stop::StopMatcher::fired)
+    }
+
+    /// The tokens fed so far.
+    fn consumed(&self) -> u32 {
+        self.consumed
+    }
+
+    /// Whether a complete tool call was emitted.
+    fn any_calls(&self) -> bool {
+        self.scanner.any_calls()
+    }
+
+    /// The pieces a run of tokens makes available, joined per channel. Stops
+    /// at the token whose text completed a stop sequence.
+    fn push(&mut self, tokens: &[ignis_core::TokenId]) -> Vec<Piece> {
+        let mut pieces = Vec::new();
+        for &token in tokens {
+            if self.fired() {
+                break;
+            }
+            self.consumed += 1;
+            for delta in self.decoder.push(&[token]) {
+                self.route(delta, &mut pieces);
+            }
+        }
+        pieces
+    }
+
+    /// The end of generation: what the decoder, the scanner and the matcher
+    /// still held, and whether a tool call was left open (read before the
+    /// scanner's flush clears it — GitHub #121 acceptance criterion 3).
+    fn finish(&mut self) -> (Vec<Piece>, bool) {
+        let mut pieces = Vec::new();
+        if self.fired() {
+            return (pieces, false);
+        }
+        for delta in self.decoder.finish() {
+            self.route(delta, &mut pieces);
+        }
+        let mid_call = self.scanner.is_mid_call();
+        for event in self.scanner.finish() {
+            self.route_tool_event(event, &mut pieces);
+        }
+        if let Some(stop) = self.stop.as_mut().filter(|s| !s.fired()) {
+            push_piece(&mut pieces, Piece::Content(stop.flush()));
+        }
+        (pieces, mid_call)
+    }
+
+    fn route(&mut self, delta: crate::decoder::Delta, pieces: &mut Vec<Piece>) {
+        match delta.channel {
+            Channel::Reasoning if !self.fired() => push_piece(pieces, Piece::Reasoning(delta.text)),
+            Channel::Reasoning => {}
+            Channel::Content => {
+                for event in self.scanner.feed(&delta.text) {
+                    self.route_tool_event(event, pieces);
+                }
+            }
+        }
+    }
+
+    fn route_tool_event(&mut self, event: ToolEvent, pieces: &mut Vec<Piece>) {
+        if self.fired() {
+            return;
+        }
+        match (event, self.stop.as_mut()) {
+            (ToolEvent::Content(text), None) => push_piece(pieces, Piece::Content(text)),
+            (ToolEvent::Content(text), Some(stop)) => push_piece(pieces, Piece::Content(stop.feed(&text).text)),
+            // A call ends the content before it: what the matcher held
+            // could only have continued that content, so it is released.
+            (ToolEvent::Call(call), stop) => {
+                if let Some(stop) = stop {
+                    push_piece(pieces, Piece::Content(stop.flush()));
+                }
+                push_piece(pieces, Piece::Call(call));
+            }
+        }
     }
 }
 
@@ -1428,6 +1779,27 @@ struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    /// Always present: a `0` says nothing was reused.
+    prompt_tokens_details: PromptTokensDetails,
+}
+
+impl Usage {
+    fn new(prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            prompt_tokens_details: PromptTokensDetails { cached_tokens },
+        }
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+struct PromptTokensDetails {
+    /// The prompt tokens this request resumed from retained state or a
+    /// shared prefix instead of prefilling (ADR 0029, spec server/09) — the
+    /// quantity `/v1/responses` reports as `input_tokens_details.cached_tokens`.
+    cached_tokens: u32,
 }
 
 /// One SSE chunk (the `chat.completion.chunk` shape): a token delta or the
@@ -1512,14 +1884,14 @@ struct ChunkStream {
     id: String,
     created: u64,
     model: String,
-    /// The incremental reasoning/content decoder (GitHub #68) — owns the
-    /// byte- and marker-splitting state across this request's whole token
-    /// stream (`crate::decoder::OutputDecoder`).
-    decoder: OutputDecoder,
-    /// Scans the decoder's `Content` channel for `<tool_call>` blocks
-    /// (GitHub #121) — reasoning text never passes through it.
-    tool_scanner: ToolCallScanner,
+    /// Tokens to the answer's pieces across this request's whole token
+    /// stream: the reasoning/content split, the tool calls, and the
+    /// caller's stop sequences ([`AnswerPipeline`]).
+    pipeline: AnswerPipeline,
     prompt_tokens: u32,
+    /// The prompt tokens the request did not prefill, as its reuse reports
+    /// arrive ([`crate::engine::reused_prompt_tokens`]).
+    cached_tokens: u32,
     /// `stream_options.include_usage` — gates the trailing usage chunk
     /// (OpenAI only sends it when the client opts in).
     include_usage: bool,
@@ -1532,6 +1904,9 @@ struct ChunkStream {
     pending: VecDeque<Event>,
     /// The `[DONE]` marker has been emitted (exactly once, at the end).
     done_sent: bool,
+    /// A stop sequence ended the answer: the finish chunk is queued and the
+    /// request's stream is never polled again.
+    stopped: bool,
     /// The event that ended the last run of tokens: taken before the stream
     /// is polled again, so the order holds.
     held: Option<SchedEvent>,
@@ -1561,6 +1936,13 @@ impl CancelOnDrop {
     pub(crate) fn completed(&mut self) {
         self.completed = true;
     }
+
+    /// A stop sequence ended the request after `tokens` generated tokens
+    /// ([`Engine::stop`]): it is released now, and reported done.
+    fn stop(&mut self, tokens: u32) {
+        self.engine.stop(self.request, tokens);
+        self.completed = true;
+    }
 }
 
 impl Drop for CancelOnDrop {
@@ -1582,8 +1964,7 @@ impl ChunkStream {
         id: String,
         created: u64,
         model: String,
-        decoder: OutputDecoder,
-        schemas: ToolSchemas,
+        pipeline: AnswerPipeline,
         prompt_tokens: u32,
         include_usage: bool,
     ) -> Self {
@@ -1593,53 +1974,53 @@ impl ChunkStream {
             id,
             created,
             model,
-            decoder,
-            tool_scanner: ToolCallScanner::with_schemas(schemas),
+            pipeline,
             prompt_tokens,
+            cached_tokens: 0,
             include_usage,
             pending: VecDeque::new(),
             done_sent: false,
+            stopped: false,
             held: None,
             emitted_reasoning: false,
             emitted_content_or_call: false,
         }
     }
 
-    /// Routes one decoder delta to its SSE chunk(s): a `Reasoning` delta
-    /// streams straight through; a `Content` delta is fed to the tool-call
-    /// scanner first, since it may resolve to plain content, a complete
-    /// tool call, or nothing yet (GitHub #121).
-    fn queue_decoder_delta(&mut self, delta: crate::decoder::Delta) {
-        match delta.channel {
-            Channel::Reasoning => {
-                if !delta.text.is_empty() {
+    /// Queues each piece as its SSE chunk: reasoning and content as their
+    /// deltas, a complete tool call as its own (GitHub #121). Pieces are
+    /// never empty ([`push_piece`]).
+    fn queue_pieces(&mut self, pieces: Vec<Piece>) {
+        for piece in pieces {
+            let chunk = match piece {
+                Piece::Reasoning(text) => {
                     self.emitted_reasoning = true;
+                    self.delta_chunk(crate::decoder::Delta { channel: Channel::Reasoning, text })
                 }
-                let event = self.delta_chunk(delta);
-                self.pending.push_back(event);
-            }
-            Channel::Content => {
-                for tool_event in self.tool_scanner.feed(&delta.text) {
-                    self.queue_tool_event(tool_event);
+                Piece::Content(text) => {
+                    self.emitted_content_or_call = true;
+                    self.delta_chunk(crate::decoder::Delta { channel: Channel::Content, text })
                 }
-            }
+                Piece::Call(call) => {
+                    self.emitted_content_or_call = true;
+                    self.tool_call_chunk(call)
+                }
+            };
+            self.pending.push_back(chunk);
         }
     }
 
-    /// Queues one tool-call-scanner event as its SSE chunk, tracking
-    /// `emitted_content_or_call` along the way — both `ToolEvent`
-    /// variants only ever carry non-empty payloads (`ToolCallScanner`
-    /// never emits an empty one), so every call here is real content.
-    fn queue_tool_event(&mut self, event: ToolEvent) {
-        self.emitted_content_or_call = true;
-        let chunk = match event {
-            ToolEvent::Content(text) => self.delta_chunk(crate::decoder::Delta {
-                channel: Channel::Content,
-                text,
-            }),
-            ToolEvent::Call(call) => self.tool_call_chunk(call),
-        };
-        self.pending.push_back(chunk);
+    /// The finish chunk, then (opt-in) the usage chunk.
+    fn queue_finish(&mut self, finish_reason: &'static str, forced_at: Option<u32>, completion_tokens: u32) {
+        report_if_all_reasoning_no_content(
+            &self.id,
+            self.emitted_reasoning && !self.emitted_content_or_call,
+            finish_reason,
+        );
+        self.pending.push_back(self.chunk_with(Delta::default(), Some(finish_reason), forced_at));
+        if self.include_usage {
+            self.pending.push_back(self.usage_chunk(completion_tokens));
+        }
     }
 
     /// One chunk (a decoded delta or the final `finish_reason` chunk).
@@ -1708,11 +2089,7 @@ impl ChunkStream {
             created: self.created,
             model: self.model.clone(),
             choices: vec![],
-            usage: Some(Usage {
-                prompt_tokens: self.prompt_tokens,
-                completion_tokens,
-                total_tokens: self.prompt_tokens.saturating_add(completion_tokens),
-            }),
+            usage: Some(Usage::new(self.prompt_tokens, completion_tokens, self.cached_tokens)),
         };
         Event::default().data(serde_json::to_string(&chunk).expect("chunk serializes"))
     }
@@ -1737,6 +2114,15 @@ impl Stream for ChunkStream {
         loop {
             if let Some(event) = this.pending.pop_front() {
                 return Poll::Ready(Some(Ok(event)));
+            }
+            // A stop sequence ended the answer: the request was stopped, and
+            // whatever it generated past that token is never read.
+            if this.stopped {
+                if !this.done_sent {
+                    this.done_sent = true;
+                    return Poll::Ready(Some(Ok(Event::default().data("[DONE]"))));
+                }
+                return Poll::Ready(None);
             }
             let polled = match this.held.take() {
                 Some(event) => Poll::Ready(Some(event)),
@@ -1765,45 +2151,45 @@ impl Stream for ChunkStream {
                         // then the loop polls on rather than returning.
                         let mut run = vec![token];
                         this.held = drain_tokens(&mut this.stream, &mut run);
-                        for delta in this.decoder.push_run(&run) {
-                            this.queue_decoder_delta(delta);
+                        let pieces = this.pipeline.push(&run);
+                        this.queue_pieces(pieces);
+                        // A stop sequence matched in this run: the request
+                        // ends at that token, `stop`, as the model's own
+                        // end would (spec server/09).
+                        if this.pipeline.fired() {
+                            let tokens = this.pipeline.consumed();
+                            this.cancel.stop(tokens);
+                            this.held = None;
+                            this.stopped = true;
+                            let finish_reason =
+                                resolve_finish_reason(FinishReason::Stop, this.pipeline.any_calls(), false);
+                            this.queue_finish(finish_reason, None, tokens);
                         }
                     }
-                    // The request completed: flush whatever the decoder
-                    // and the tool-call scanner held back, then the
-                    // finish-reason chunk, then (opt-in) the usage chunk —
-                    // all queued ahead of `[DONE]`.
+                    // The request completed: flush whatever the pipeline
+                    // held back, then the finish-reason chunk, then
+                    // (opt-in) the usage chunk — all queued ahead of
+                    // `[DONE]`.
                     SchedEvent::Done { reason, tokens, thinking, .. } => {
                         this.cancel.completed();
-                        for delta in this.decoder.finish() {
-                            this.queue_decoder_delta(delta);
-                        }
-                        // Read before `finish()` clears it (GitHub #121
-                        // acceptance criterion 3): a stop/cancel landing
-                        // mid-call must never be reported as a clean
-                        // `tool_calls` finish.
-                        let mid_call = this.tool_scanner.is_mid_call();
-                        for tool_event in this.tool_scanner.finish() {
-                            this.queue_tool_event(tool_event);
-                        }
-                        let any_calls = this.tool_scanner.any_calls();
-                        let finish_reason = resolve_finish_reason(reason, any_calls, mid_call);
-                        report_if_all_reasoning_no_content(
-                            &this.id,
-                            this.emitted_reasoning && !this.emitted_content_or_call,
-                            finish_reason,
-                        );
-                        let forced_at = thinking.and_then(|b| b.forced_at);
-                        this.pending
-                            .push_back(this.chunk_with(Delta::default(), Some(finish_reason), forced_at));
-                        if this.include_usage {
-                            this.pending.push_back(this.usage_chunk(tokens));
-                        }
+                        // `mid_call` is read before the scanner's flush
+                        // clears it (GitHub #121 acceptance criterion 3): a
+                        // stop/cancel landing mid-call must never be
+                        // reported as a clean `tool_calls` finish.
+                        let (pieces, mid_call) = this.pipeline.finish();
+                        this.queue_pieces(pieces);
+                        let finish_reason = resolve_finish_reason(reason, this.pipeline.any_calls(), mid_call);
+                        this.queue_finish(finish_reason, thinking.and_then(|b| b.forced_at), tokens);
                     }
                     // Other events for this request (admissions,
                     // evictions, restorations, requeues) do not change the
-                    // generated-token sequence — keep draining.
-                    _ => {}
+                    // generated-token sequence — keep draining, counting
+                    // what the prompt reused.
+                    other => {
+                        if let Some(reused) = crate::engine::reused_prompt_tokens(&other) {
+                            this.cached_tokens = this.cached_tokens.max(reused);
+                        }
+                    }
                 },
             }
         }
@@ -1899,17 +2285,122 @@ mod tests {
             created: 123,
             model: "test-model".into(),
             choices: vec![],
-            usage: Some(Usage {
-                prompt_tokens: 58,
-                completion_tokens: 1500,
-                total_tokens: 1558,
-            }),
+            usage: Some(Usage::new(58, 1500, 0)),
         };
         let json = serde_json::to_value(&c).expect("chunk serializes");
         assert_eq!(json["choices"], serde_json::json!([]));
         assert_eq!(json["usage"]["prompt_tokens"], 58);
         assert_eq!(json["usage"]["completion_tokens"], 1500);
         assert_eq!(json["usage"]["total_tokens"], 1558);
+        // Spec server/09: always there, a 0 included.
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+    }
+
+    // ── spec server/09: honoured or refused ─────────────────────────────
+
+    #[test]
+    fn the_other_fields_are_what_sampling_left() {
+        let req: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "temperature": 0.5,
+            "max_completion_tokens": 7,
+            "stop": "END",
+            "n": 2,
+            "user": "u",
+        }))
+        .expect("parses");
+        let mut keys: Vec<&String> = req.other.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["n", "user"]);
+        assert_eq!(req.max_completion_tokens, Some(7));
+    }
+
+    #[test]
+    fn one_cap_takes_either_name_and_refuses_two_different_caps() {
+        assert_eq!(one_cap(None, None).ok(), Some(None));
+        assert_eq!(one_cap(Some(5), None).ok(), Some(Some(5)));
+        assert_eq!(one_cap(None, Some(6)).ok(), Some(Some(6)));
+        assert_eq!(one_cap(Some(6), Some(6)).ok(), Some(Some(6)));
+        let refused = one_cap(Some(5), Some(6)).err().expect("two caps");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Tokens `0..` read as the given pieces of text.
+    struct Pieces(Vec<&'static str>);
+
+    impl crate::decoder::TokenDecoder for Pieces {
+        fn push(&mut self, token: ignis_core::TokenId) -> String {
+            self.0[token as usize].to_owned()
+        }
+        fn finish(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    fn pipeline(text: &[&'static str], thinking: bool, stop: &[&str]) -> AnswerPipeline {
+        AnswerPipeline::new(
+            OutputDecoder::new(Box::new(Pieces(text.to_vec())), thinking),
+            ToolSchemas::default(),
+            stop.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    /// Every token of `text` fed one run at a time, then the finish: the
+    /// pieces joined, and the tokens consumed.
+    fn answer(text: &[&'static str], thinking: bool, stop: &[&str]) -> (Vec<Piece>, u32) {
+        let mut p = pipeline(text, thinking, stop);
+        let mut pieces = Vec::new();
+        for token in 0..text.len() as u32 {
+            join_pieces(&mut pieces, p.push(&[token]));
+        }
+        join_pieces(&mut pieces, p.finish().0);
+        (pieces, p.consumed())
+    }
+
+    #[test]
+    fn stop_fires_across_tokens_and_ends_at_the_completing_one() {
+        let (pieces, consumed) = answer(&["one ", "E", "N", "D two", " three"], false, &["END"]);
+        assert_eq!(pieces, vec![Piece::Content("one ".into())]);
+        assert_eq!(consumed, 4, "the token that completed the sequence is the last one read");
+    }
+
+    #[test]
+    fn stop_never_fires_on_reasoning() {
+        let (pieces, consumed) = answer(&["think END", "</think>", "answer END more"], true, &["END"]);
+        assert_eq!(
+            pieces,
+            vec![Piece::Reasoning("think END".into()), Piece::Content("answer ".into())]
+        );
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn stop_never_fires_inside_a_tool_call() {
+        let call = "<tool_call>\n<function=w>\n<parameter=text>\nEND\n</parameter>\n</function>\n</tool_call>";
+        let (pieces, _) = answer(&["a", call, "b END c"], false, &["END"]);
+        assert_eq!(pieces.len(), 3, "{pieces:?}");
+        assert_eq!(pieces[0], Piece::Content("a".into()));
+        let Piece::Call(call) = &pieces[1] else { panic!("{pieces:?}") };
+        assert_eq!(call.arguments, r#"{"text":"END"}"#);
+        assert_eq!(pieces[2], Piece::Content("b ".into()));
+    }
+
+    #[test]
+    fn without_stop_the_pieces_are_the_decoders_text() {
+        let text = ["<think>", "a", "b</think>", "c", "d"];
+        let (pieces, consumed) = answer(&text, true, &[]);
+        let mut decoder = OutputDecoder::new(Box::new(Pieces(text.to_vec())), true);
+        let mut deltas = decoder.push_run(&[0, 1, 2, 3, 4]);
+        deltas.extend(decoder.finish());
+        let expected: Vec<Piece> = crate::decoder::join(deltas)
+            .into_iter()
+            .map(|d| match d.channel {
+                Channel::Reasoning => Piece::Reasoning(d.text),
+                Channel::Content => Piece::Content(d.text),
+            })
+            .collect();
+        assert_eq!(pieces, expected);
+        assert_eq!(consumed, 5);
     }
 
     /// Token `n` reads as `WORDS[n]`.
@@ -1958,8 +2449,7 @@ mod tests {
             "chatcmpl-9".into(),
             0,
             "m".into(),
-            OutputDecoder::new(Box::new(Words), false),
-            ToolSchemas::from_tools(&[]),
+            AnswerPipeline::new(OutputDecoder::new(Box::new(Words), false), ToolSchemas::from_tools(&[]), Vec::new()),
             1,
             false,
         );
