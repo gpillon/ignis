@@ -318,6 +318,34 @@ async fn stop_never_fires_inside_a_tool_call() {
 }
 
 #[tokio::test]
+async fn a_whitespace_stop_does_not_drop_the_calls_it_precedes() {
+    // The template's own whitespace before a call, and between two, is
+    // content; a caller's "\n\n" must not end the answer there.
+    let a = "<tool_call>\n<function=a>\n</function>\n</tool_call>";
+    let b = "<tool_call>\n<function=b>\n</function>\n</tool_call>";
+    let text = ["Reading it.", "\n\n", a, "\n\n", b, "\n\n", "Done."];
+    for stream in [false, true] {
+        let body = plain(json!({ "max_tokens": 50, "stop": "\n\n", "stream": stream }));
+        let (status, text) = post(&app_reading(&text), CHAT, &body).await;
+        assert_eq!(status, 200, "{text}");
+        let (content, calls, finish) = if stream {
+            let chunks = chunks(&text);
+            let calls = chunks.iter().filter(|c| !c["choices"][0]["delta"]["tool_calls"].is_null()).count();
+            (streamed_content(&chunks), calls, finish_chunk(&chunks)["choices"][0]["finish_reason"].clone())
+        } else {
+            let answer: JsonValue = serde_json::from_str(&text).unwrap();
+            let message = &answer["choices"][0]["message"];
+            let calls = message["tool_calls"].as_array().map_or(0, Vec::len);
+            (message["content"].as_str().unwrap().to_owned(), calls, answer["choices"][0]["finish_reason"].clone())
+        };
+        assert_eq!(calls, 2, "stream {stream}");
+        // The last "\n\n" is followed by text, not a call: it fires there.
+        assert_eq!(content, "Reading it.\n\n\n\n", "stream {stream}");
+        assert_eq!(finish, "tool_calls", "stream {stream}");
+    }
+}
+
+#[tokio::test]
 async fn stop_never_fires_on_reasoning() {
     let text = ["plan END more", "</think>", "answer END rest"];
     let body = json!({

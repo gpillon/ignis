@@ -337,7 +337,6 @@ async fn what_this_server_does_not_serve_is_a_400_naming_the_field() {
         (with("conversation", json!("conv_1")), "conversation", "unsupported_value"),
         (with("prompt", json!({ "id": "pmpt_1" })), "prompt", "unsupported_value"),
         (with("context_management", json!([{ "type": "compaction" }])), "context_management", "unsupported_value"),
-        (with("service_tier", json!("priority")), "service_tier", "unsupported_value"),
     ];
     for (body, param, code) in cases {
         let (status, _, answer) = post(&app, "/v1/responses", body.clone()).await;

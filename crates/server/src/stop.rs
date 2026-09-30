@@ -58,9 +58,20 @@ pub struct Fed {
 }
 
 /// Matches stop sequences over text that arrives in pieces.
+///
+/// **A match in whitespace alone waits for what follows it.** The template
+/// writes whitespace before a `<tool_call>` and between two calls, and that
+/// whitespace reaches the content channel; a caller's `"\n\n"` must not end
+/// the answer there and drop the calls it precedes. So a match that is
+/// whitespace, followed by nothing but whitespace yet, is held: a call next
+/// releases it as the content it was ([`StopMatcher::flush`]), any other
+/// text fires it, and so does the end of generation
+/// ([`StopMatcher::finish`]).
 pub struct StopMatcher {
     sequences: Vec<String>,
     hold: String,
+    /// A whitespace match waiting for what follows: it starts `hold`.
+    pending: bool,
     fired: bool,
 }
 
@@ -68,7 +79,7 @@ impl StopMatcher {
     /// A matcher over `sequences` (non-empty strings, as [`parse_stop`]
     /// returns them).
     pub fn new(sequences: Vec<String>) -> Self {
-        Self { sequences, hold: String::new(), fired: false }
+        Self { sequences, hold: String::new(), pending: false, fired: false }
     }
 
     /// Whether a sequence has matched.
@@ -83,23 +94,48 @@ impl StopMatcher {
             return Fed::default();
         }
         self.hold.push_str(text);
+        if self.pending {
+            if self.hold.trim().is_empty() {
+                return Fed::default();
+            }
+            return self.fire_at(0);
+        }
         // The earliest match wins: the text before it is the answer.
         let earliest = self.sequences.iter().filter_map(|s| self.hold.find(s.as_str())).min();
         if let Some(at) = earliest {
-            self.hold.truncate(at);
-            self.fired = true;
-            return Fed { text: std::mem::take(&mut self.hold), fired: true };
+            if !self.hold[at..].trim().is_empty() {
+                return self.fire_at(at);
+            }
+            self.pending = true;
+            return Fed { text: self.hold.drain(..at).collect(), fired: false };
         }
         let held = self.sequences.iter().map(|s| prefix_holdback(&self.hold, s)).max().unwrap_or(0);
         let safe = self.hold.len() - held;
         Fed { text: self.hold.drain(..safe).collect(), fired: false }
     }
 
-    /// The text held back as a possible prefix, released: the content it
-    /// might have continued has ended (a tool call interrupted it, or the
-    /// generation finished).
+    /// The match at `at` ends the answer: the text before it is the last.
+    fn fire_at(&mut self, at: usize) -> Fed {
+        self.hold.truncate(at);
+        self.fired = true;
+        Fed { text: std::mem::take(&mut self.hold), fired: true }
+    }
+
+    /// A tool call interrupts the content: what was held back — a possible
+    /// prefix, or a whitespace match that was the call's preamble — is
+    /// released as the content it was.
     pub fn flush(&mut self) -> String {
+        self.pending = false;
         std::mem::take(&mut self.hold)
+    }
+
+    /// The generation ended: a held prefix is released, and a held
+    /// whitespace match fires — nothing followed it.
+    pub fn finish(&mut self) -> String {
+        if self.pending {
+            return self.fire_at(0).text;
+        }
+        self.flush()
     }
 }
 
@@ -128,10 +164,31 @@ mod tests {
         for piece in pieces {
             out.push_str(&m.feed(piece).text);
         }
-        if !m.fired() {
-            out.push_str(&m.flush());
-        }
+        out.push_str(&m.finish());
         (out, m.fired())
+    }
+
+    #[test]
+    fn a_whitespace_match_before_a_tool_call_is_released_as_content() {
+        let mut m = matcher(&["\n\n"]);
+        assert_eq!(m.feed("Reading it.\n\n"), Fed { text: "Reading it.".to_owned(), fired: false });
+        assert_eq!(m.feed("\n"), Fed::default(), "still whitespace: still waiting");
+        // The scanner saw `<tool_call>`: the caller flushes before the call.
+        assert_eq!(m.flush(), "\n\n\n");
+        assert!(!m.fired());
+        assert_eq!(run(&mut m, &["after the call"]), ("after the call".to_owned(), false));
+    }
+
+    #[test]
+    fn a_whitespace_match_followed_by_text_fires() {
+        let mut m = matcher(&["\n\n"]);
+        assert_eq!(run(&mut m, &["one\n", "\n", "two"]), ("one".to_owned(), true));
+    }
+
+    #[test]
+    fn a_whitespace_match_at_the_end_fires() {
+        let mut m = matcher(&["\n\n"]);
+        assert_eq!(run(&mut m, &["one\n\n"]), ("one".to_owned(), true));
     }
 
     #[test]

@@ -104,13 +104,6 @@ fn null_or_disabled(value: &JsonValue) -> bool {
 
 const ALWAYS: &str = "any value";
 
-/// `service_tier`: one card, one tier.
-const SERVICE_TIER: FieldRule = FieldRule {
-    name: "service_tier",
-    inert: null_or_standard_tier,
-    inert_when: "`\"auto\"`, `\"default\"`",
-    refusal: Some("this server runs one card at one tier; send \"auto\" or \"default\", or omit it"),
-};
 
 /// The Chat Completions body's fields past what the handler reads.
 pub const CHAT: &[FieldRule] = &[
@@ -156,7 +149,12 @@ pub const CHAT: &[FieldRule] = &[
         inert_when: "`false`",
         refusal: Some("this server stores no completions; send false or omit it"),
     },
-    SERVICE_TIER,
+    FieldRule {
+        name: "service_tier",
+        inert: null_or_standard_tier,
+        inert_when: "`\"auto\"`, `\"default\"`",
+        refusal: Some("this server runs one card at one tier; send \"auto\" or \"default\", or omit it"),
+    },
     FieldRule {
         name: "modalities",
         inert: null_or_text_modality,
@@ -230,14 +228,16 @@ pub const CHAT: &[FieldRule] = &[
 /// hosted `tools`, `background` and `previous_response_id` are refused where
 /// they are read (`responses::input`).
 ///
-/// `parallel_tool_calls` and `store` are inert at every value here, unlike on
-/// chat: Codex sends `parallel_tool_calls: false` and `store: false`, and the
-/// Responses default of `store` is `true` (spec server/09 acceptance 2 — a
-/// value a real client sends is inert). Both are echoed on the response.
+/// `parallel_tool_calls`, `store` and `service_tier` are inert at every
+/// value here, unlike on chat (spec server/09 acceptance 2 — a value a real
+/// client sends is inert): Codex sends `parallel_tool_calls: false` and
+/// `store: false`, its flex and fast modes send `service_tier: "flex"` and
+/// `"priority"`, and the Responses default of `store` is `true`.
+/// `parallel_tool_calls` and `store` are echoed on the response.
 pub const RESPONSES: &[FieldRule] = &[
     FieldRule { name: "parallel_tool_calls", inert: always, inert_when: ALWAYS, refusal: None },
     FieldRule { name: "store", inert: always, inert_when: ALWAYS, refusal: None },
-    SERVICE_TIER,
+    FieldRule { name: "service_tier", inert: always, inert_when: ALWAYS, refusal: None },
     FieldRule {
         name: "top_logprobs",
         inert: null_or_zero,
@@ -438,7 +438,7 @@ mod tests {
         accepted(Surface::Responses, "include", &[json!(["reasoning.encrypted_content"])]);
         accepted(Surface::Responses, "prompt_cache_key", &[json!("thread-1")]);
         accepted(Surface::Responses, "client_metadata", &[json!({ "a": "b" })]);
-        accepted(Surface::Responses, "service_tier", &[json!("auto")]);
+        accepted(Surface::Responses, "service_tier", &[json!("auto"), json!("flex"), json!("priority")]);
         accepted(Surface::Responses, "truncation", &[json!("disabled")]);
         accepted(Surface::Responses, "top_logprobs", &[json!(0)]);
     }
@@ -450,7 +450,6 @@ mod tests {
         refused(Surface::Responses, "conversation", &[json!("conv_1")], "no conversations");
         refused(Surface::Responses, "prompt", &[json!({ "id": "pmpt_1" })], "prompt templates");
         refused(Surface::Responses, "context_management", &[json!([{ "type": "compaction" }])], "compaction");
-        refused(Surface::Responses, "service_tier", &[json!("priority")], "one tier");
     }
 
     #[test]

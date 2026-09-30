@@ -774,10 +774,10 @@ fn parse_tool_choice(tool_choice: Option<JsonValue>) -> Result<ToolChoice, Respo
         Some(JsonValue::String(s)) if s == "auto" => Ok(ToolChoice::Auto),
         Some(JsonValue::String(s)) if s == "none" => Ok(ToolChoice::None),
         Some(JsonValue::String(s)) if s == "required" => Err(bad_request(
-            "tool_choice: \"required\" is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\"",
+            "tool_choice: \"required\" is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\" (forcing a call is GitHub #286)",
         )),
         Some(JsonValue::Object(_)) => Err(bad_request(
-            "tool_choice naming a specific function is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\"",
+            "tool_choice naming a specific function is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\" (forcing a call is GitHub #286)",
         )),
         Some(other) => Err(bad_request(&format!(
             "tool_choice must be \"auto\" or \"none\", got {other}"
@@ -1545,7 +1545,7 @@ async fn collect_answer(
             SchedEvent::Done { reason, thinking, .. } => {
                 let (tail, mid_call) = pipeline.finish();
                 join_pieces(&mut pieces, tail);
-                (AnswerEnding::Done(reason), mid_call, thinking.and_then(|b| b.forced_at))
+                (AnswerEnding::Done(pipeline.ended(reason)), mid_call, thinking.and_then(|b| b.forced_at))
             }
             other => {
                 if let Some(reused) = crate::engine::reused_prompt_tokens(&other) {
@@ -1666,9 +1666,20 @@ impl AnswerPipeline {
             self.route_tool_event(event, &mut pieces);
         }
         if let Some(stop) = self.stop.as_mut().filter(|s| !s.fired()) {
-            push_piece(&mut pieces, Piece::Content(stop.flush()));
+            push_piece(&mut pieces, Piece::Content(stop.finish()));
         }
         (pieces, mid_call)
+    }
+
+    /// Why the answer ended, once the engine said `reason`: a stop sequence
+    /// that matched at the very end (a whitespace match nothing followed,
+    /// [`crate::stop::StopMatcher::finish`]) ended it, `stop`.
+    fn ended(&self, reason: FinishReason) -> FinishReason {
+        if self.fired() && reason != FinishReason::Error {
+            FinishReason::Stop
+        } else {
+            reason
+        }
     }
 
     fn route(&mut self, delta: crate::decoder::Delta, pieces: &mut Vec<Piece>) {
@@ -2178,6 +2189,7 @@ impl Stream for ChunkStream {
                         // reported as a clean `tool_calls` finish.
                         let (pieces, mid_call) = this.pipeline.finish();
                         this.queue_pieces(pieces);
+                        let reason = this.pipeline.ended(reason);
                         let finish_reason = resolve_finish_reason(reason, this.pipeline.any_calls(), mid_call);
                         this.queue_finish(finish_reason, thinking.and_then(|b| b.forced_at), tokens);
                     }
