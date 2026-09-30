@@ -102,6 +102,8 @@ export function titleOf(decision: Decision): string {
   const asked = first ? shorten(asText(first.instructions)) : "";
   if (asked) return asked;
   const { evidence } = decision.draft;
+  // A loaded file is named by its name: a log's first line is a timestamp.
+  if (evidence.mode !== "image" && evidence.file) return shorten(evidence.file.name);
   const about = shorten(evidence.mode === "image" ? (evidence.images[0]?.name ?? evidence.text) : evidence.text);
   return about || UNTITLED;
 }

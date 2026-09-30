@@ -18,10 +18,12 @@ import {
   jsonNull,
   jsonObject,
   jsonString,
+  type Parsed,
   parseOrdered,
   saysNothing,
   writeOrdered,
 } from "./json.ts";
+import type { FileSource } from "./evidenceFile.ts";
 import { type Cut, cutTarget } from "./locate.ts";
 
 /** The eight primitives `decide.rs` serves. */
@@ -247,10 +249,16 @@ export type Question = {
   extras: JsonEntry[];
 };
 
-/** The evidence, in the three shapes this tab offers for `state`. */
+/**
+ * The evidence, in the three shapes this tab offers for `state`.
+ *
+ * A text or a JSON one may say which file it was loaded from
+ * (`evidenceFile.ts`). The name is the bench's, to show a card rather than a
+ * textarea holding megabytes, and is never sent.
+ */
 export type Evidence =
-  | { mode: "text"; text: string }
-  | { mode: "json"; text: string }
+  | { mode: "text"; text: string; file?: FileSource }
+  | { mode: "json"; text: string; file?: FileSource }
   | { mode: "image"; images: PromptImage[]; text: string };
 
 export type EvidenceMode = Evidence["mode"];
@@ -260,21 +268,29 @@ export type EvidenceMode = Evidence["mode"];
  * is not a loss. Never sent, and reset whenever the whole draft is replaced —
  * a freshly loaded example has no history of its own.
  */
-export type Spare = { text: string; json: string; images: PromptImage[]; words: string };
+export type Spare = {
+  text: string;
+  json: string;
+  images: PromptImage[];
+  words: string;
+  /** The file the set-aside text or JSON was loaded from, so it comes back as a file and not as a pasted wall. */
+  textFile?: FileSource;
+  jsonFile?: FileSource;
+};
 
 export const EMPTY_SPARE: Spare = { text: "", json: "", images: [], words: "" };
 
 /** `evidence` moved aside, so the mode it is leaving can be returned to. */
 export function setAside(spare: Spare, evidence: Evidence): Spare {
-  if (evidence.mode === "text") return { ...spare, text: evidence.text };
-  if (evidence.mode === "json") return { ...spare, json: evidence.text };
+  if (evidence.mode === "text") return { ...spare, text: evidence.text, textFile: evidence.file };
+  if (evidence.mode === "json") return { ...spare, json: evidence.text, jsonFile: evidence.file };
   return { ...spare, images: evidence.images, words: evidence.text };
 }
 
 /** The evidence a mode is returned to, out of what was set aside. */
 export function restore(spare: Spare, mode: EvidenceMode): Evidence {
-  if (mode === "text") return { mode, text: spare.text };
-  if (mode === "json") return { mode, text: spare.json };
+  if (mode === "text") return spare.textFile ? { mode, text: spare.text, file: spare.textFile } : { mode, text: spare.text };
+  if (mode === "json") return spare.jsonFile ? { mode, text: spare.json, file: spare.jsonFile } : { mode, text: spare.json };
   return { mode, images: spare.images, text: spare.words };
 }
 
@@ -334,6 +350,34 @@ export function freeId(questions: Question[], stem: string): string {
 
 export const EMPTY_DRAFT: Draft = { evidence: { mode: "text", text: "" }, questions: [], extras: [] };
 
+/**
+ * `draft` with a loaded file's `evidence` in it (`evidenceFile.ts`), and what
+ * the draft held set aside when the file changes its shape — a JSON file
+ * dropped on a text draft leaves the text in Text.
+ *
+ * A text or a JSON file dropped on a draft that asks nothing yet comes with a
+ * `locate` to write: finding the line that answers is what a file is loaded
+ * here for, and an empty question says where to start better than a hint.
+ */
+export function loadEvidence(draft: Draft, spare: Spare, evidence: Evidence): { draft: Draft; spare: Spare } {
+  const kept = evidence.mode === draft.evidence.mode ? spare : setAside(spare, draft.evidence);
+  const questions = draft.questions.length === 0 && evidence.mode !== "image" ? [newQuestion("locate", "locate")] : draft.questions;
+  return { draft: { ...draft, evidence, questions }, spare: kept };
+}
+
+/**
+ * The evidence a JSON-view edit read back, as `before` when it is the same
+ * state: a request re-read after a question's edit still carries the loaded
+ * file, so the file stays a file — and the same object, so nothing cut from
+ * it is cut again. A JSON file is compared as the view writes it, since the
+ * view re-indents what it was loaded with.
+ */
+export function keepFile(before: Evidence, after: Evidence): Evidence {
+  if (before.mode === "image" || !before.file || after.mode !== before.mode) return after;
+  const same = before.mode === "text" ? after.text === before.text : writeOrdered(stateNode(before), 2) === after.text;
+  return same ? before : after;
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -361,7 +405,7 @@ export function validate(draft: Draft): Fault[] {
   const faults: Fault[] = [];
 
   if (draft.evidence.mode === "json") {
-    const parsed = parseOrdered(draft.evidence.text.trim() || "null");
+    const parsed = parseState(draft.evidence);
     if (!parsed.ok) {
       faults.push({
         code: "invalid_state_json",
@@ -599,6 +643,22 @@ function locateFaults(evidence: Evidence, question: Question, name: string): Fau
  * says.
  */
 export function locateTarget(evidence: Evidence, within: string): Cut | null {
+  const byWithin = cuts.get(evidence) ?? new Map<string, Cut | null>();
+  cuts.set(evidence, byWithin);
+  if (!byWithin.has(within)) byWithin.set(within, cutEvidence(evidence, within));
+  return byWithin.get(within) ?? null;
+}
+
+/**
+ * Every cut made, by the evidence it was made from. `validate` runs on each
+ * keystroke of every question, and a loaded log is megabytes: cutting it again
+ * each time would put the whole file between a key and its character. An edit
+ * that leaves the evidence alone keeps its object — `{ ...draft, questions }` —
+ * so the cut is found again, and one that changes it is a new object.
+ */
+const cuts = new WeakMap<Evidence, Map<string, Cut | null>>();
+
+function cutEvidence(evidence: Evidence, within: string): Cut | null {
   if (evidence.mode === "image") {
     return {
       ok: false,
@@ -607,8 +667,19 @@ export function locateTarget(evidence: Evidence, within: string): Cut | null {
     };
   }
   if (evidence.mode === "text") return cutTarget(jsonString(evidence.text), within);
-  const parsed = parseOrdered(evidence.text.trim() || "null");
+  const parsed = parseState(evidence);
   return parsed.ok ? cutTarget(parsed.node, within) : null;
+}
+
+const parses = new WeakMap<Evidence, Parsed>();
+
+/** A JSON evidence parsed, once per evidence object, for the reason `cuts` is kept. */
+function parseState(evidence: Extract<Evidence, { mode: "json" }>): Parsed {
+  const hit = parses.get(evidence);
+  if (hit) return hit;
+  const parsed = parseOrdered(evidence.text.trim() || "null");
+  parses.set(evidence, parsed);
+  return parsed;
 }
 
 export const hasImage = (evidence: Evidence) => evidence.mode === "image" && evidence.images.length > 0;
@@ -640,7 +711,7 @@ export const requestBody = (draft: Draft): string => writeOrdered(requestNode(dr
 function stateNode(evidence: Evidence): JsonNode {
   if (evidence.mode === "text") return jsonString(evidence.text);
   if (evidence.mode === "json") {
-    const parsed = parseOrdered(evidence.text.trim() || "null");
+    const parsed = parseState(evidence);
     // An unparseable state is a fault `validate` already reports; writing the
     // text verbatim keeps the editor's own bytes on the page instead of
     // inventing a value nobody typed.

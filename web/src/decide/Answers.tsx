@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import { asText } from "./json.ts";
 import { Bar, BoxGlyph, DigitTrace, DistributionRow, ImageMark, NoulMark, PointGlyph, ScoreMark } from "./marks.tsx";
 import { FOUND_THRESHOLD, type Target } from "./locate.ts";
@@ -13,6 +13,7 @@ import {
   type ResolvedKind,
 } from "./model.ts";
 import { type Answer, AXES, levelOrder, type Run } from "./request.ts";
+import { Strip } from "./Strip.tsx";
 
 // What came back (GitHub #247), read in the order the request declared.
 //
@@ -485,6 +486,13 @@ function Region({ region }: { region: { cells: number; share: number } }) {
 /** Segments either side of a `locate`'s pick that the context shows. */
 const CONTEXT = 2;
 
+/**
+ * The fewest segments a target has before its answer draws the strip. Below it
+ * the context and the ranking already show most of the text, and "line 7 of
+ * 12" needs no map.
+ */
+const STRIP_FROM = 50;
+
 type Located = Extract<Answer, { type: "locate" }>;
 
 /** What each resolved kind, method and compression did, for the chip that names it (GitHub #278). */
@@ -528,6 +536,23 @@ function LocateBody({ question, answer, draft }: { question: Question; answer: L
   const pointed = new Map(answer.pointers.map((pointer) => [pointer.segment, segmentText(pointer.value)]));
   const text = (segment: number): string | undefined => target?.segments[segment] ?? pointed.get(segment);
   const shares = new Map(answer.ranking.map((rank) => [rank.segment, rank.share]));
+  // Where in a long text the pick is, and where the rest of what was weighed
+  // sits around it: a ranking of near-duplicates far apart reads differently
+  // from one of neighbours.
+  const where =
+    target && target.segments.length >= STRIP_FROM ? (
+      <Strip
+        segments={target.segments}
+        pick={pick}
+        candidates={answer.ranking.map((rank) => rank.segment).filter((segment) => segment !== pick)}
+        label={
+          pick === null
+            ? `The ${answer.ranking.length} ${unit}s it weighed, across ${target.segments.length} ${unit}s`
+            : `${unit} ${pick} of ${target.segments.length}, and the ${unit}s it weighed around it`
+        }
+        className="mt-2 h-7"
+      />
+    ) : null;
   return (
     <div>
       <Route question={question} answer={answer} />
@@ -539,9 +564,12 @@ function LocateBody({ question, answer, draft }: { question: Question; answer: L
 
       <div className="mt-3">
         {pick === null ? (
-          <NotFound unit={unit} />
+          <>
+            <NotFound unit={unit} />
+            {where}
+          </>
         ) : (
-          <Pick question={question} pick={pick} value={answer.value} unit={unit} target={target} shares={shares} />
+          <Pick question={question} pick={pick} value={answer.value} unit={unit} target={target} shares={shares} where={where} />
         )}
       </div>
 
@@ -667,6 +695,7 @@ function Pick({
   unit,
   target,
   shares,
+  where,
 }: {
   question: Question;
   pick: number;
@@ -674,6 +703,8 @@ function Pick({
   unit: "line" | "item";
   target: Target | null;
   shares: Map<number, number>;
+  /** The strip, on a target long enough to need one. */
+  where: ReactNode;
 }) {
   const text = (segment: number): string | undefined => target?.segments[segment];
   const from = Math.max(0, pick - CONTEXT);
@@ -686,6 +717,7 @@ function Pick({
         {target && <span> of {target.segments.length}</span>}
         {question.within !== "" && <span className="ml-2 font-mono text-[12px]">in {question.within}</span>}
       </p>
+      {where}
       <p className="mt-1 break-words font-mono text-[17px] font-semibold leading-snug text-ember">{segmentText(value)}</p>
 
       {context.length > 0 && (

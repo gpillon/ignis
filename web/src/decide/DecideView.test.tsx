@@ -36,6 +36,13 @@ describe("DecideView", () => {
     }
   });
 
+  it("offers the reader's own file ahead of the examples", () => {
+    const html = renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />);
+    expect(html).toContain("Your own file");
+    expect(html).toContain("drop it anywhere on this tab");
+    expect(html.indexOf("Your own file")).toBeLessThan(html.indexOf(EXAMPLES[0].name));
+  });
+
   it("ships every text and JSON example sendable as it loads, the locates' pointers included", async () => {
     // The image example fetches its picture, which is the browser's to do.
     for (const example of EXAMPLES.filter((e) => e.id !== "onimage")) {
@@ -81,9 +88,9 @@ describe("DecideView", () => {
       card(ask("number")) +
       card(ask("scalar")) +
       card(ask("locate")) +
-      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "text", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />) +
-      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />) +
-      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "image", images: [], text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />);
+      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "text", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} onFiles={() => {}} fileError={null} />) +
+      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} onFiles={() => {}} fileError={null} />) +
+      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "image", images: [], text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} onFiles={() => {}} fileError={null} />);
     const fields = html.match(/<(input|textarea|select)\b[^>]*>/g) ?? [];
     expect(fields.length).toBeGreaterThan(10);
     for (const field of fields) expect(field).toMatch(/\s(id|name)="[^"]+"/);
@@ -272,13 +279,50 @@ describe("QuestionCard", () => {
 
 describe("EvidenceEditor", () => {
   it("offers the three shapes state accepts and says what each is for", () => {
-    const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{}" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />);
+    const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{}" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} onFiles={() => {}} fileError={null} />);
     for (const label of ["Text", "JSON", "Image"]) expect(html, label).toContain(`>${label}</button>`);
     expect(html).toContain("not as a quoted string");
   });
 
+  it("offers a file beside a text or a JSON evidence, and leaves pictures to the image picker", () => {
+    const editor = (evidence: Evidence) =>
+      renderToStaticMarkup(<EvidenceEditor evidence={evidence} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} onFiles={() => {}} fileError={null} />);
+    expect(editor({ mode: "text", text: "" })).toContain(">Open a file</button>");
+    expect(editor({ mode: "json", text: "" })).toContain(">Open a file</button>");
+    expect(editor({ mode: "image", images: [], text: "" })).not.toContain("Open a file");
+  });
+
+  it("shows a loaded file as a card — what it is, how long, where its errors are, how it begins and ends — and no textarea", () => {
+    const lines = Array.from({ length: 300 }, (_, i) => (i === 120 ? "09:15:40 ERROR orders pg: FATAL too many clients" : `09:14:${i} INFO gateway GET /v1/orders 200`));
+    const evidence: Evidence = { mode: "text", text: lines.join("\n"), file: { name: "prod-api.log", size: 6 * 1024 * 1024 } };
+    const html = renderToStaticMarkup(
+      <EvidenceEditor evidence={evidence} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} onFiles={() => {}} fileError={null} />,
+    );
+    expect(html).toContain("prod-api.log");
+    expect(html).toContain('<span class="text-ink">300</span> lines');
+    expect(html).toContain("6 MB");
+    expect(html).toContain("read as text");
+    expect(html).not.toContain('name="evidence-text"');
+    // The strip, and a legend for its one tinted column.
+    expect(html).toContain('role="img"');
+    expect(html).toContain("1 line reads as an error");
+    // The head and the tail, with the count of what lies between.
+    expect(html).toContain("09:14:0 INFO gateway");
+    expect(html).toContain("09:14:299 INFO gateway");
+    expect(html).toContain("294 more lines");
+    expect(html).toContain(">Edit the text</button>");
+    expect(html).toContain(">Open another</button>");
+  });
+
+  it("says why a file did not load", () => {
+    const html = renderToStaticMarkup(
+      <EvidenceEditor evidence={{ mode: "text", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} onFiles={() => {}} fileError="core.dump is not a text file." />,
+    );
+    expect(html).toContain("core.dump is not a text file.");
+  });
+
   it("shows the parse error it was handed", () => {
-    const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} invalid="not JSON (line 1, column 2)" />);
+    const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} onFiles={() => {}} fileError={null} invalid="not JSON (line 1, column 2)" />);
     expect(html).toContain("not JSON (line 1, column 2)");
     expect(html).toContain("border-warn");
   });

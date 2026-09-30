@@ -27,6 +27,8 @@ export function Bench({
   open,
   onEdit,
   onSpare,
+  onFiles,
+  fileError,
   onMode,
   onJson,
   onAdd,
@@ -45,6 +47,8 @@ export function Bench({
   open: boolean;
   onEdit: (draft: Draft) => void;
   onSpare: (spare: Spare) => void;
+  onFiles: (files: File[]) => void;
+  fileError: string | null;
   onMode: (mode: Mode) => void;
   onJson: (text: string) => void;
   onAdd: (kind: Primitive) => void;
@@ -68,6 +72,8 @@ export function Bench({
           spare={spare}
           onChange={(evidence) => onEdit({ ...draft, evidence })}
           onSpare={onSpare}
+          onFiles={onFiles}
+          fileError={fileError}
           invalid={jsonFault?.message}
         />
 

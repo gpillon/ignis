@@ -7,6 +7,9 @@ import {
   EMPTY_SPARE,
   type Evidence,
   freeId,
+  keepFile,
+  loadEvidence,
+  locateTarget,
   newQuestion,
   type Primitive,
   type Question,
@@ -323,6 +326,59 @@ describe("setAside and restore", () => {
   it("starts each mode empty, so a freshly replaced draft carries no history", () => {
     expect(restore(EMPTY_SPARE, "text")).toEqual({ mode: "text", text: "" });
     expect(restore(EMPTY_SPARE, "image")).toEqual({ mode: "image", images: [], text: "" });
+  });
+
+  it("gives a loaded file back as the file, not as its text", () => {
+    const log = { mode: "text", text: "a\nb", file: { name: "app.log", size: 3 } } as const;
+    const spare = setAside(setAside(EMPTY_SPARE, log), { mode: "json", text: "[]", file: { name: "t.json", size: 2 } });
+    expect(restore(spare, "text")).toEqual(log);
+    expect(restore(spare, "json")).toEqual({ mode: "json", text: "[]", file: { name: "t.json", size: 2 } });
+  });
+});
+
+// A file from disk as the evidence (evidenceFile.ts): its name is the bench's
+// and never the wire's, a draft that asks nothing is given a locate, and a
+// JSON-view edit that leaves the state alone leaves the file a file.
+describe("a loaded file", () => {
+  const file = { name: "prod-api.log", size: 42 };
+  const log: Evidence = { mode: "text", text: "09:14 INFO up\n09:15 ERROR down", file };
+
+  it("is sent as its text and nothing else", () => {
+    const body = requestBody(draft([question("where", "locate")], log));
+    expect(body).not.toContain("prod-api.log");
+    expect(JSON.parse(body).state).toBe("09:14 INFO up\n09:15 ERROR down");
+  });
+
+  it("comes with a locate to write when the draft asks nothing yet, and leaves the questions of one that does", () => {
+    const empty = loadEvidence(EMPTY_DRAFT, EMPTY_SPARE, log);
+    expect(empty.draft.evidence).toBe(log);
+    expect(empty.draft.questions.map((q) => [q.kind, q.id])).toEqual([["locate", "locate"]]);
+    const asked = draft([question("q", "noul")]);
+    expect(loadEvidence(asked, EMPTY_SPARE, log).draft.questions).toBe(asked.questions);
+    // A picture is not searched for a line.
+    expect(loadEvidence(EMPTY_DRAFT, EMPTY_SPARE, { mode: "image", images: [image], text: "" }).draft.questions).toEqual([]);
+  });
+
+  it("sets aside what the draft held when it changes the evidence's shape", () => {
+    const typed = draft([], { mode: "text", text: "typed by hand" });
+    const loaded = loadEvidence(typed, EMPTY_SPARE, { mode: "json", text: "[1, 2]", file });
+    expect(restore(loaded.spare, "text")).toEqual({ mode: "text", text: "typed by hand" });
+    // The same shape is replaced, not set aside.
+    expect(loadEvidence(typed, EMPTY_SPARE, log).spare.text).toBe("");
+  });
+
+  it("stays the same file through a JSON-view edit that leaves the state alone", () => {
+    expect(keepFile(log, { mode: "text", text: "09:14 INFO up\n09:15 ERROR down" })).toBe(log);
+    expect(keepFile(log, { mode: "text", text: "edited" })).toEqual({ mode: "text", text: "edited" });
+    // The view re-indents a JSON file; the state is still the one loaded.
+    const records: Evidence = { mode: "json", text: '[{"id":1},{"id":2}]', file };
+    const reread = readRequest(requestBody(draft([question("q", "locate")], records)));
+    expect(reread.ok && keepFile(records, reread.draft.evidence)).toBe(records);
+  });
+
+  it("is cut once per evidence, however many times the questions are edited", () => {
+    expect(locateTarget(log, "")).toBe(locateTarget(log, ""));
+    expect(locateTarget({ ...log }, "")).not.toBe(locateTarget(log, ""));
   });
 });
 

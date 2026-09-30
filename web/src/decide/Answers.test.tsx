@@ -576,6 +576,17 @@ describe("Answers", () => {
       expect(html).toMatch(/line <span[^>]*>3<\/span><span> of 8<\/span>/);
     });
 
+    it("maps where in a long text it sits, with the rest of what it weighed — and needs no map on a short one", () => {
+      const long = Array.from({ length: 400 }, (_, i) => `l${i} ok`).join("\n");
+      const far: Answer = { ...answer, segment: 300, value: "l300 ok", ranking: [{ segment: 300, share: 0.6 }, { segment: 20, share: 0.4 }] };
+      const html = render([question("where", "locate")], { where: far }, { mode: "text", text: long });
+      expect(html).toContain('aria-label="line 300 of 400, and the lines it weighed around it"');
+      // The pick at its own middle, the other candidate as a tick.
+      expect(html).toContain("left:75.125%");
+      expect(html).toContain("left:5.125%");
+      expect(render([question("where", "locate")], { where: answer }, { mode: "text", text: log })).not.toContain('role="img"');
+    });
+
     it("shows the lines either side of it, and elides the rest", () => {
       const html = render([question("where", "locate")], { where: answer }, { mode: "text", text: log });
       const context = html.slice(html.indexOf('aria-label="The lines around it"'), html.indexOf("How the heads voted"));

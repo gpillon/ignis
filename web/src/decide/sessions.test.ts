@@ -112,6 +112,11 @@ describe("titleOf", () => {
     expect(titleOf(withDraft(createDecision(1), draft))).toBe("receipt.jpg");
   });
 
+  it("names a loaded file by its name, and not by its first line", () => {
+    const draft: Draft = { ...EMPTY_DRAFT, evidence: { mode: "text", text: "2026-09-28T09:14:02Z INFO up", file: { name: "prod-api.log", size: 29 } } };
+    expect(titleOf(withDraft(createDecision(1), draft))).toBe("prod-api.log");
+  });
+
   it("is the placeholder while a decision is empty", () => {
     expect(titleOf(createDecision(1))).toBe(UNTITLED);
   });
