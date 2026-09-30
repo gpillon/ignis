@@ -106,6 +106,8 @@ enum TelemetryFact {
     /// the async side is doing with it.
     Tick(Occupancy),
     Cancelled(RequestId),
+    /// Sent by [`Engine::stop`]: released like a cancel, reported done.
+    Stopped(RequestId, u32),
     SetStats(Arc<dyn IntervalStatsProvider>),
     SetMetrics(Arc<Metrics>),
 }
@@ -336,6 +338,15 @@ impl Engine {
         // telemetry consumer hears of it from here rather than from the model
         // thread, whose loop stays unchanged (ADR 0017).
         let _ = self.facts.send(TelemetryFact::Cancelled(request));
+    }
+
+    /// End `request` at its caller's stop sequence (spec server/09) after
+    /// `tokens` generated tokens. The scheduler releases it as it releases a
+    /// cancelled request, but for the caller it finished: the request log
+    /// and the completed counter report it done with `stop`, not cancelled.
+    pub fn stop(&self, request: RequestId, tokens: u32) {
+        let _ = self.commands.send(Command::Cancel { request });
+        let _ = self.facts.send(TelemetryFact::Stopped(request, tokens));
     }
 
     /// A receiver that changes every time a request leaves the scheduler,
@@ -593,6 +604,7 @@ async fn telemetry_task(
                 counters.store(Arc::new(snapshot));
             }
             TelemetryFact::Cancelled(request) => telemetry.on_cancelled(request),
+            TelemetryFact::Stopped(request, tokens) => telemetry.on_stopped(request, tokens),
             TelemetryFact::SetStats(provider) => telemetry.with_stats(provider),
             TelemetryFact::SetMetrics(metrics) => telemetry.with_metrics(metrics),
         }
@@ -629,6 +641,18 @@ pub async fn collect_tokens(
     collect_completion(rx, timeout).await.map(|c| (c.tokens, c.reason))
 }
 
+/// The prompt tokens `event` reports its request did not prefill (ADR
+/// 0029): it resumed from retained state (a prompt checkpoint), or stood on
+/// a shared prefix (retained or a live sibling's). A request claims one or
+/// the other, never both, so the larger report is the whole of it — what
+/// `usage`'s `cached_tokens` is, on chat and on responses alike.
+pub fn reused_prompt_tokens(event: &SchedEvent) -> Option<u32> {
+    match event {
+        SchedEvent::StateReused { tokens, .. } | SchedEvent::PrefixReused { tokens, .. } => Some(*tokens),
+        _ => None,
+    }
+}
+
 /// A request's whole completion, as [`collect_completion`] gathers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
@@ -639,6 +663,9 @@ pub struct Completion {
     /// What the request's thinking budget did (spec server/08) — `None`
     /// when none was in effect.
     pub thinking: Option<ignis_core::thinking_budget::BudgetOutcome>,
+    /// The prompt tokens the request did not prefill
+    /// ([`reused_prompt_tokens`]); 0 when none.
+    pub cached_tokens: u32,
 }
 
 /// [`collect_tokens`], keeping what the finish event said beyond the reason:
@@ -646,15 +673,22 @@ pub struct Completion {
 pub async fn collect_completion(rx: &mut EventStream, timeout: Duration) -> Result<Completion, CollectError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut tokens = Vec::new();
+    let mut cached_tokens = 0;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(event)) => match event {
                 SchedEvent::Token { token, .. } => tokens.push(token),
-                SchedEvent::Done { reason, thinking, .. } => return Ok(Completion { tokens, reason, thinking }),
+                SchedEvent::Done { reason, thinking, .. } => {
+                    return Ok(Completion { tokens, reason, thinking, cached_tokens })
+                }
                 // Other events for this request (admissions, evictions,
                 // restorations) do not change the generated-token list —
-                // keep draining.
-                _ => {}
+                // keep draining, counting what the prompt reused.
+                other => {
+                    if let Some(reused) = reused_prompt_tokens(&other) {
+                        cached_tokens = cached_tokens.max(reused);
+                    }
+                }
             },
             // The stream closed without a Done (the engine gave up on the
             // request) or the timeout fired: either way, not completed.
@@ -1157,7 +1191,10 @@ mod tests {
             // The occupancy rides along, so the flag-off/flag-on comparison
             // is over the widened fact and not merely over its variant.
             TelemetryFact::Tick(occupancy) => format!("tick {occupancy:?}"),
-            TelemetryFact::Cancelled(_) | TelemetryFact::SetStats(_) | TelemetryFact::SetMetrics(_) => {
+            TelemetryFact::Cancelled(_)
+            | TelemetryFact::Stopped(..)
+            | TelemetryFact::SetStats(_)
+            | TelemetryFact::SetMetrics(_) => {
                 unreachable!("only the async side sends these")
             }
         }

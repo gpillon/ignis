@@ -237,6 +237,30 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Full flag table, API surface, model handling, container and release detail:
 **[docs/user](docs/user/README.md)**.
 
+Every field of the OpenAI request bodies is honoured, accepted as inert (a
+value asking for what the server already does, like `n: 1` or `store: false`),
+or refused with a `400` naming it in `param` — never dropped in silence. The
+table is in the API reference at `/v1/docs/`.
+
+## What it does not serve
+
+Choices, not gaps — so nobody goes looking for them:
+
+- **Embeddings, or a generic reranker.** Either is a second model on the card;
+  the VRAM plan gives the card to one. A classification is `/v1/decide`, read
+  off the loaded model's own readout.
+- **`/v1/completions`.** A raw prompt skips the chat template the model was
+  tuned on, and the turn boundaries reuse is keyed on; chat completions and
+  responses cover it.
+- **`/v1/batches`.** An offline queue is a storage service, and this server
+  holds no request past its connection: send the requests at once, and the
+  scheduler batches them.
+- **Audio, in or out.** The model has no audio tower and no audio head.
+- **LoRA adapters.** They are trained against BF16 weights, and the checkpoint
+  is NVFP4: merge the adapter and re-export the checkpoint instead.
+- **More than one loaded model.** One model family, one card: the VRAM plan is
+  decided at load, for one.
+
 ## Building it
 
 Two parts, in this order: the C++/CUDA kernel leaf, then the Rust workspace that

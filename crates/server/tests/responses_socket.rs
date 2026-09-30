@@ -305,6 +305,15 @@ async fn refused_events_and_bad_frames_are_error_events_and_the_socket_stays_ope
     assert_eq!(refused["error"]["param"], "tools[0].type");
     assert!(refused.get("stream_id").is_none(), "the default stream's events carry no stream_id");
 
+    // Spec server/09: the field table is the socket's too.
+    let mut stored = short("hi");
+    stored["conversation"] = json!("conv_1");
+    send(&mut socket, create(&stored, None)).await;
+    let refused = next_event(&mut socket).await;
+    assert_eq!(refused["status"], 400);
+    assert_eq!(refused["error"]["param"], "conversation");
+    assert_eq!(refused["error"]["code"], "unsupported_value");
+
     send(&mut socket, create(&short("still here"), None)).await;
     assert_eq!(stream_until_terminal(&mut socket, None).await.last().unwrap()["type"], "response.incomplete");
 }

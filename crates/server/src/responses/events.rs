@@ -268,15 +268,13 @@ impl ResponseEvents {
     /// report (counted, never an event), or the whole ending on `Done`.
     pub(crate) fn on_event(&mut self, event: SchedEvent) -> Vec<JsonValue> {
         let mut out = Vec::new();
+        // The tokens this request did not prefill: a reuse report, counted,
+        // never an event — the same quantity chat's `usage` reports.
+        if let Some(reused) = crate::engine::reused_prompt_tokens(&event) {
+            self.cached_tokens = self.cached_tokens.max(reused);
+        }
         match event {
             SchedEvent::Token { token, .. } => return self.on_tokens(&[token]),
-            // The tokens this request did not prefill because it resumed
-            // from retained state (a prompt checkpoint), or stood on a shared
-            // prefix (retained or a live sibling's). A request claims one or
-            // the other, never both, so the larger is the whole of it.
-            SchedEvent::StateReused { tokens, .. } | SchedEvent::PrefixReused { tokens, .. } => {
-                self.cached_tokens = self.cached_tokens.max(tokens);
-            }
             SchedEvent::Done { reason, thinking, .. } => {
                 self.response.thinking_budget_forced_at = thinking.and_then(|b| b.forced_at);
                 let ending = match reason {
