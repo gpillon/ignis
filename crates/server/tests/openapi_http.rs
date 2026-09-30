@@ -83,6 +83,9 @@ fn the_document_lists_exactly_the_v1_surface() {
     let expected: BTreeSet<String> = [
         "get /v1/models",
         "post /v1/chat/completions",
+        // GitHub #285: the prompt counted without being served.
+        "post /v1/tokenize",
+        "post /v1/detokenize",
         "post /v1/responses",
         // GitHub #282: the Responses API's WebSocket mode, deliberately.
         "get /v1/responses",
@@ -92,6 +95,20 @@ fn the_document_lists_exactly_the_v1_surface() {
     .map(str::to_owned)
     .collect();
     assert_eq!(documented(), expected);
+}
+
+#[test]
+fn the_counting_routes_carry_their_schemas() {
+    // GitHub #285: the request and response shapes are in the document, not
+    // only the two paths.
+    let document = document();
+    for schema in ["TokenizeRequest", "TokenizeResponse", "DetokenizeRequest", "DetokenizeResponse"] {
+        assert!(document["components"]["schemas"][schema].is_object(), "{schema}");
+    }
+    assert_eq!(
+        document["paths"]["/v1/tokenize"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/TokenizeRequest"
+    );
 }
 
 #[test]

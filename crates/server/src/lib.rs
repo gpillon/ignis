@@ -43,6 +43,7 @@ pub mod scalar;
 pub mod telemetry;
 pub mod template;
 pub mod thinking;
+pub mod tokenize;
 pub mod toolcall;
 
 use std::time::Duration;

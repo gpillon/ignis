@@ -139,7 +139,8 @@ The refusal message names what the caller can do instead: send the request.
   body. This is the test that keeps the two paths from drifting.
 - **Round trip.** `tokenize(return_token_ids) -> detokenize` returns the
   rendered text byte for byte, for an ASCII prompt, a prompt with multi-byte
-  UTF-8, and a prompt ending mid-grapheme.
+  UTF-8, and a prompt ending mid-grapheme (an emoji ending in a zero-width
+  joiner; a decomposed accent is the NFC case, *as built* below).
 - **Refusals**: both forms present; neither present; `messages` empty; an
   `image_url` part; `stream: true`; an out-of-range id on detokenize. Each
   with its code.
@@ -158,7 +159,8 @@ The refusal message names what the caller can do instead: send the request.
 2. **Ceiling.** Every answer carries `max_model_len` equal to the server's
    configured `--max-context`.
 3. **Round trip.** `detokenize(tokenize(x).token_ids)` is byte-identical to
-   the rendered text, on the UTF-8 cases above.
+   the rendered text, on the UTF-8 cases above — for text the tokenizer's NFC
+   normalizer leaves alone (see *Round trip, as built* below).
 4. **Raw form.** `prompt` tokenizes with no template applied.
 5. **Media refused.** A body with an `image_url` part answers `400
    media_not_countable` and fetches nothing (asserted: no media acquisition
@@ -194,3 +196,9 @@ The refusal message names what the caller can do instead: send the request.
   `vllm/entrypoints/openai/protocol.py` at a pinned version and adopt the
   names exactly — a half-matching shape is worse than an honestly different
   one.
+- **Round trip, as built (2026-09-30).** The artifact's tokenizer normalizes to NFC before it splits, so acceptance 3 holds byte for byte for text the
+  normalizer leaves alone (ASCII, multi-byte UTF-8, an emoji ending in a zero-width joiner) and, for
+  a decomposed `e` + combining accent, the ids spell the composed `é`: the round trip is over what
+  the tokenizer saw, which is what `count` counts. `detokenize` checks each id with the tokenizer's
+  own `id_to_token` because a decode skips an unknown id instead of refusing it. A load with no real tokenizer
+  (the placeholder provider) answers the raw form `501 tokenizer_unavailable` rather than inventing ids.

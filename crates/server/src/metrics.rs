@@ -103,6 +103,27 @@ impl Rejection {
     }
 }
 
+/// Which of the two counting routes a call reached:
+/// `ignis_tokenize_requests_total`'s fixed `route` label (GitHub #285).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizeRoute {
+    /// `POST /v1/tokenize`.
+    Tokenize,
+    /// `POST /v1/detokenize`.
+    Detokenize,
+}
+
+impl TokenizeRoute {
+    const ALL: [TokenizeRoute; 2] = [Self::Tokenize, Self::Detokenize];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tokenize => "tokenize",
+            Self::Detokenize => "detokenize",
+        }
+    }
+}
+
 /// Which typed primitive a question asked for: `ignis_decisions_total`'s
 /// fixed `type` label (GitHub #241, ADR 0034).
 ///
@@ -415,6 +436,10 @@ pub struct Metrics {
     /// server/08). Absent from the exposition until the first one, like the
     /// decision family.
     thinking_forced_closes: AtomicU64,
+    /// Per [`TokenizeRoute::ALL`] (GitHub #285). Absent from the exposition
+    /// until one of them moves. Counts calls, not requests of the lifecycle
+    /// above: a counting route never enters the scheduler.
+    tokenize_calls: [AtomicU64; TokenizeRoute::ALL.len()],
     /// Per [`LOCATE_SERIES`] (GitHub #278). Absent from the exposition until
     /// the first `locate`, like the decision family.
     locates: [AtomicU64; LOCATE_SERIES.len()],
@@ -477,6 +502,7 @@ impl Metrics {
             decisions: Default::default(),
             answer_mass: Ratio::new(&ANSWER_MASS_BOUNDS),
             thinking_forced_closes: AtomicU64::new(0),
+            tokenize_calls: Default::default(),
             locates: Default::default(),
             responses_sockets: AtomicU64::new(0),
             responses_queued: AtomicU64::new(0),
@@ -543,6 +569,16 @@ impl Metrics {
     /// server/08).
     pub(crate) fn record_thinking_forced_close(&self) {
         self.thinking_forced_closes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A call reached `/v1/tokenize` or `/v1/detokenize` (GitHub #285),
+    /// counted whatever it answered: the series says the route is used, and
+    /// a client polling it is what an operator looks for. Recorded by the
+    /// handler, like [`Metrics::record_rejected`], since the call has no fact
+    /// on the model thread's stream — it never reaches it.
+    pub(crate) fn record_tokenize(&self, route: TokenizeRoute) {
+        // `ALL` lists the routes in declaration order.
+        self.tokenize_calls[route as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A submission was rejected, for `reason`.
@@ -958,6 +994,19 @@ impl Metrics {
             );
             let _ = writeln!(out, "ignis_thinking_forced_closes_total {forced}");
         }
+        // GitHub #285: absent until the first call, for the decision
+        // family's reason.
+        if self.tokenize_calls.iter().map(read).sum::<u64>() > 0 {
+            declare(
+                &mut out,
+                "ignis_tokenize_requests_total",
+                "counter",
+                "Calls to the counting routes, which never enter the scheduler, by route.",
+            );
+            for (route, series) in TokenizeRoute::ALL.iter().zip(&self.tokenize_calls) {
+                let _ = writeln!(out, "ignis_tokenize_requests_total{{route=\"{}\"}} {}", route.label(), read(series));
+            }
+        }
         out
     }
 }
@@ -1033,6 +1082,23 @@ mod tests {
         let forced = Metrics::new();
         forced.record_thinking_forced_close();
         declared_once(&forced.render(), &[("ignis_thinking_forced_closes_total", "counter")]);
+        // And the counting routes' counter (GitHub #285).
+        let counted = Metrics::new();
+        counted.record_tokenize(TokenizeRoute::Tokenize);
+        declared_once(&counted.render(), &[("ignis_tokenize_requests_total", "counter")]);
+    }
+
+    /// GitHub #285: absent until a counting route is called, then both routes
+    /// have a series and a call moves exactly its own.
+    #[test]
+    fn the_tokenize_counter_is_absent_until_a_call_and_counts_by_route() {
+        let metrics = Metrics::new();
+        assert!(!metrics.render().contains("ignis_tokenize_requests_total"));
+        metrics.record_tokenize(TokenizeRoute::Tokenize);
+        metrics.record_tokenize(TokenizeRoute::Tokenize);
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_tokenize_requests_total", "route=\"tokenize\""), "2", "{text}");
+        assert_eq!(value(&text, "ignis_tokenize_requests_total", "route=\"detokenize\""), "0", "{text}");
     }
 
     /// GitHub #278: `ignis_locates_total` is absent until the first `locate`,

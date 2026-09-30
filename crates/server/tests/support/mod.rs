@@ -60,6 +60,10 @@ impl<T: TemplateProvider> TemplateProvider for SharedTemplate<T> {
         self.0.apply_chat_template(messages, options, tools)
     }
 
+    fn is_token(&self, id: TokenId) -> bool {
+        self.0.is_token(id)
+    }
+
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
         self.0.render_tokens(tokens)
     }
