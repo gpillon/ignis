@@ -327,7 +327,7 @@ tokens it prefills, **without submitting it**: no lane, no GPU, no KV page. The
 fits.
 
 ```bash
-curl http://127.0.0.1:8000/v1/tokenize   -H 'Content-Type: application/json'   -d '{"messages":[{"role":"user","content":"Hello"}],"tools":[...],"return_token_ids":true}'
+curl http://127.0.0.1:8000/v1/tokenize \n  -H 'Content-Type: application/json' \n  -d '{"messages":[{"role":"user","content":"Hello"}],"tools":[...],"return_token_ids":true}'
 # {"count":1234,"max_model_len":262144,"token_ids":[...]}
 ```
 
@@ -338,7 +338,8 @@ part is a `400 media_not_countable`: an image's cost is its grid after
 preparation, which only fetching and decoding it would tell — send the request.
 `POST /v1/detokenize` takes `{"token_ids":[...]}` and answers `{"text":"..."}`; an
 id outside the vocabulary is a `400` naming its index. The tokenizer normalizes
-text to NFC, so a decomposed `e` + accent comes back as the composed `é`.
+text to NFC, so a decomposed `e` + accent comes back as the composed `é` (the
+`text` a call returns is the rendered prompt as sent, before that).
 Neither route enters the scheduler; the count of calls is
 `ignis_tokenize_requests_total{route}` with `--metrics`.
 

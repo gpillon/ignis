@@ -98,6 +98,20 @@ fn the_document_lists_exactly_the_v1_surface() {
 }
 
 #[test]
+fn the_counting_routes_carry_their_schemas() {
+    // GitHub #285: the request and response shapes are in the document, not
+    // only the two paths.
+    let document = document();
+    for schema in ["TokenizeRequest", "TokenizeResponse", "DetokenizeRequest", "DetokenizeResponse"] {
+        assert!(document["components"]["schemas"][schema].is_object(), "{schema}");
+    }
+    assert_eq!(
+        document["paths"]["/v1/tokenize"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/TokenizeRequest"
+    );
+}
+
+#[test]
 fn the_document_carries_no_monitoring_path() {
     // "Not for the monitoring" (GitHub #251), made checkable: the
     // Prometheus exposition is ADR 0017's contract, served on its own

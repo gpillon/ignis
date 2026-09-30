@@ -205,6 +205,10 @@ fn fixture_bodies() -> Vec<(&'static str, Value)> {
         ("plain", json!({ "model": MODEL, "messages": [user("What is in the file?")] })),
         ("tools", json!({ "model": MODEL, "messages": [user("Read a.txt")], "tools": [tool()] })),
         (
+            "thinking on, explicitly, at a stated effort",
+            json!({ "model": MODEL, "messages": [user("hi")], "enable_thinking": true, "reasoning_effort": "low" }),
+        ),
+        (
             "thinking off",
             json!({ "model": MODEL, "messages": [user("hi")], "enable_thinking": false }),
         ),
@@ -235,8 +239,8 @@ async fn the_count_is_the_prompt_tokens_the_same_body_reports_when_served() {
     // The fixtures differ, so the equality above is not vacuous: the tool
     // block and the thinking controls are in the number.
     assert!(counts[1] > counts[0], "tools cost tokens: {counts:?}");
-    assert!(counts[2] < counts[0], "thinking off changes the render: {counts:?}");
-    assert!(counts[3] > counts[0] + 1000, "a long system block is counted: {counts:?}");
+    assert!(counts[3] < counts[0], "thinking off changes the render: {counts:?}");
+    assert!(counts[4] > counts[0] + 1000, "a long system block is counted: {counts:?}");
 }
 
 #[tokio::test]

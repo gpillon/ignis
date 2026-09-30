@@ -129,6 +129,7 @@ pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(req): Json<
     if req.stream {
         return bad_request_param("stream is not supported here: there is nothing to stream", "stream");
     }
+    let (return_ids, return_text) = (req.return_token_ids, req.return_text);
     let (ids, text) = match (req.messages.as_ref(), req.prompt.as_ref()) {
         (Some(_), Some(_)) => {
             return bad_request("send either `messages` or `prompt`, not both");
@@ -136,11 +137,15 @@ pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(req): Json<
         (None, None) => {
             return bad_request("send `messages` (a chat body) or `prompt` (a raw string) to count");
         }
-        (None, Some(prompt)) => match raw(&server, prompt.clone()).await {
-            Ok(ids) => (ids, req.return_text.then(|| prompt.clone())),
-            Err(response) => return response,
-        },
-        (Some(_), None) => match chat(&server, &req).await {
+        (None, Some(_)) => {
+            let prompt = req.prompt.expect("matched Some");
+            let text = return_text.then(|| prompt.clone());
+            match raw(&server, prompt).await {
+                Ok(ids) => (ids, text),
+                Err(response) => return response,
+            }
+        }
+        (Some(_), None) => match chat(&server, req).await {
             Ok(rendered) => rendered,
             Err(response) => return response,
         },
@@ -149,7 +154,7 @@ pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(req): Json<
         count: ids.len() as u32,
         max_model_len: server.engine.max_model_len(),
         text,
-        token_ids: req.return_token_ids.then_some(ids),
+        token_ids: return_ids.then_some(ids),
     })
     .into_response()
 }
@@ -172,8 +177,8 @@ async fn raw(server: &Arc<Server>, prompt: String) -> Result<Vec<u32>, Response>
 /// then rendered by the path it renders through, and no further.
 ///
 /// Returns the prompt's ids and, when the body asked for it, its text.
-async fn chat(server: &Arc<Server>, req: &TokenizeRequest) -> Result<(Vec<u32>, Option<String>), Response> {
-    let messages: Vec<ChatMessage> = req.messages.clone().unwrap_or_default();
+async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, Option<String>), Response> {
+    let messages: Vec<ChatMessage> = req.messages.unwrap_or_default();
     if messages.is_empty() {
         return Err(bad_request("messages must not be empty"));
     }
@@ -210,8 +215,8 @@ async fn chat(server: &Arc<Server>, req: &TokenizeRequest) -> Result<(Vec<u32>, 
         req.reasoning_effort.as_ref(),
         &thinking,
     )?;
-    let tools = resolve_tools(req.tools.clone(), req.tool_choice.clone())?;
-    let (model, _) = resolve_model_and_class(req.model.clone(), None).map_err(|message| bad_request(&message))?;
+    let tools = resolve_tools(req.tools, req.tool_choice)?;
+    let (model, _) = resolve_model_and_class(req.model, None).map_err(|message| bad_request(&message))?;
     if let Some(model) = model.filter(|model| !model.is_empty() && *model != server.engine.model_id()) {
         return Err(error_response(
             StatusCode::NOT_FOUND,
