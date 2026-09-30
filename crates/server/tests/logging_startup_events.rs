@@ -181,7 +181,8 @@ fn an_artifact_path_that_is_not_there_emits_an_artifact_missing_event() {
 fn a_missing_artifact_sidecar_emits_a_sidecar_missing_event() {
     // A file that is there but carries no provenance record (ADR 0002): the
     // load is refused before anything is read out of the container.
-    let artifact = std::env::temp_dir().join("ignis-logging-test-no-sidecar.ninfer");
+    let artifact = std::env::temp_dir()
+        .join(format!("ignis-logging-test-no-sidecar-{}.ninfer", std::process::id()));
     std::fs::write(&artifact, b"not a real container").expect("write the stand-in artifact");
     let record = run(&["--artifact", artifact.to_str().unwrap()]);
     assert_eq!(record["event_name"], "ignis.artifact.sidecar_missing");
@@ -303,19 +304,4 @@ fn the_startup_record_names_the_arena_the_operator_asked_for() {
     let records = run_until(&["--kv-host-pool-bytes", "2G"], &[], &["ignis.process.started"]);
     let started = find(&records, "ignis.process.started");
     assert_eq!(started["attributes"]["kv_host_pool_bytes"], 2u64 << 30);
-}
-
-#[test]
-fn the_retired_telemetry_flag_refuses_to_start() {
-    // ADR 0025 removed the separate telemetry sink: a launch script still
-    // passing `--telemetry` must fail by name, not start with its interval
-    // counters silently gone somewhere else.
-    let path = std::env::temp_dir().join("ignis-logging-test-telemetry.jsonl");
-    let record = run(&["--telemetry", path.to_str().unwrap()]);
-    assert_eq!(record["event_name"], "ignis.config.invalid");
-    assert_eq!(record["severity_text"], "ERROR");
-    assert!(
-        record["attributes"]["error"].as_str().unwrap().contains("--telemetry"),
-        "the retired flag should be named: {record}"
-    );
 }

@@ -850,7 +850,10 @@ mod tests {
             gdn_input: input,
             gdn_output: output,
         };
-        let path = std::env::temp_dir().join("ignis-layer-ref-round-trip.bin");
+        let path = std::env::temp_dir().join(format!(
+            "ignis-layer-ref-round-trip-{}.bin",
+            std::process::id()
+        ));
         fixture.write_to(&path).unwrap();
         assert_eq!(LayerFixture::read_from(&path).unwrap(), fixture);
         std::fs::remove_file(path).unwrap();
