@@ -55,11 +55,27 @@ closing tags and anything after the call are the model's own. The scanner in
 `toolcall.rs` then finds a block that is already open and parses it exactly
 as it parses one the model opened itself.
 
-This needs one new thing in the core: a schedule that, when spent, **hands
-the run back to free sampling instead of ending it**. Every schedule today
-ends its run when exhausted (`constrained.rs`, `Schedule`), because every
-constrained decode so far has been the whole answer. A forced opener is a
-prefix, not an answer.
+The core already does exactly this once. The thinking budget
+(`crates/core/src/thinking_budget.rs`, spec 08) forces the literal
+`</think>` one width-1 permitted set per round and then **stops forcing**,
+leaving the request generating. `ThinkingClose` holds the literal's token
+ids, `BudgetState::permitted` hands out one set per round and `None` once
+the literal is spent. That is a forced prefix that releases its run, built
+beside `Schedule` rather than inside it, precisely because a `Schedule` ends
+its run when exhausted and a prefix must not.
+
+So this spec generalizes that pattern rather than inventing one: the same
+shape, with the literal and the position it starts at coming from
+`tool_choice` instead of from a budget.
+
+**Note for triage.** Thinking is **on by default** on this server
+(`ThinkingOptions::default`, `thinking.rs:46`), and no OpenAI-SDK client
+sends `enable_thinking: false`. With the exclusion below, that means
+`tool_choice: "required"` from Codex, qwen-code or opencode answers `400`
+until the caller reaches for an ignis extension. That may be the right
+answer — or it may mean the feature this spec should build is "force the
+call *after* `</think>`", which is a different mechanism (see Further
+Notes). Decide that before implementing.
 
 ## User Stories
 
@@ -97,18 +113,34 @@ prefix, not an answer.
 
 ### Releasing the run
 
-- `Schedule` gains a **released** form: when its steps are spent the request
-  keeps generating, unconstrained, instead of finishing. The three outcomes
-  a spent schedule has today (ended on the terminator, spent at the cap,
-  cut short) are unchanged for every existing caller; a released schedule
-  simply has a fourth: spent and still running.
-- A released schedule has **no terminator** — a terminator ends a run, and
-  this one does not end anything.
+- The mechanism is `thinking_budget.rs`'s, generalized: a **forced literal**
+  holding token ids and a position to start at, and a per-request state that
+  answers "the permitted set for this round" with `Some([id])` while the
+  literal is unspent and `None` after. `None` is what the scheduler already
+  reads as "this round is unconstrained".
+- It is **not** a `Schedule`. A `Schedule` ends its run when exhausted
+  (`constrained.rs`) and every existing caller depends on that; a forced
+  prefix must not end anything. The two stay separate types.
+- The forced literal here starts at position 0 of the generation, so its
+  first token is drawn by the prefill (`PrefillJob::permitted`, #242) — the
+  one-round lag, handled exactly as a constrained decode handles it.
 - EOS during the forced prefix is impossible by construction (no step
   permits it). EOS after the release is an ordinary stop.
-- The core change is small and it is the one place this spec touches below
-  the server: `crates/core/src/constrained.rs` and the scheduler's check for
-  "schedule spent, therefore done".
+- The budget's own forced close and this one cannot collide: forcing is
+  refused with thinking on, and the budget only fires inside a reasoning
+  block.
+
+### The forced ids must be ids the model would itself emit
+
+A literal encoded by `encode_literal` is one tokenization of
+`<tool_call>\n`; the model, writing the same text, may merge differently at
+the `>`/`\n` boundary. Feeding the model a tokenization it would never
+produce degrades what follows it (the token-healing problem). So the forced
+ids are **checked against the real thing**: the tool calls recorded in
+#121's fixtures are tokenized, and the forced literal must be a prefix of
+those ids. Where it is not, the literal is shortened to the longest prefix
+that is — `<tool_call>` without the newline, if that is what the check
+says. The check is a test, not a runtime path.
 
 ### Thinking and forcing are exclusive
 
@@ -161,10 +193,14 @@ from the body, and guessing it would change what the model reads.
 
 ## Testing Decisions
 
-- **Core, on the mock**: a released schedule keeps the run alive when spent
-  and an ordinary one still ends it; the first forced token is drawn by the
-  prefill, not by the first round (the one-round lag — the test that cost a
-  GPU failure to learn at #242); a released schedule refuses a terminator.
+- **Core, on the mock**: a spent forced literal leaves the run generating
+  while a spent `Schedule` still ends it; the first forced token is drawn by
+  the prefill, not by the first round (the one-round lag — the test that
+  cost a GPU failure to learn at #242); the budget's forced close and a
+  forced opener never both apply to one round.
+- **The tokenization check**: the forced ids are a prefix of the ids the
+  recorded #121 tool calls tokenize to. This test is what decides whether
+  the literal carries the trailing newline.
 - **Server, over the mock engine**: `"required"` builds the `<tool_call>\n`
   schedule; a named function builds the longer one; an unknown name, a name
   that does not encode, thinking-on, and a too-small `max_tokens` each
@@ -191,19 +227,21 @@ from the body, and guessing it would change what the model reads.
    tools each return a call to that tool and no other.
 3. **Nothing leaks.** In neither case does any part of `<tool_call>` or
    `<function=` appear in `content` or in a content delta.
-4. **The release works.** A released schedule, spent, leaves the request
+4. **The release works.** A spent forced literal leaves the request
    generating; asserted in core on the mock, and visible end to end as
-   arguments that the schedule never permitted.
-5. **The refusals.** Thinking-on, an unknown function name, a literal that
+   arguments no permitted set ever allowed.
+5. **The ids are the model's own.** The forced literal is a prefix of the
+   ids the recorded #121 tool calls tokenize to.
+6. **The refusals.** Thinking-on, an unknown function name, a literal that
    does not encode, and a cap shorter than the opener each answer `400`
    with the documented code and `param`.
-6. **Speculation on.** Acceptance 1 and 2 hold with `--spec dflash2`.
-7. **Unchanged.** `"auto"` and `"none"` requests produce the same tokens as
+7. **Speculation on.** Acceptance 1 and 2 hold with `--spec dflash2`.
+8. **Unchanged.** `"auto"` and `"none"` requests produce the same tokens as
    before this spec, greedy, against a recorded fixture.
-8. **Docs.** The OpenAPI operation description says which `tool_choice`
+9. **Docs.** The OpenAPI operation description says which `tool_choice`
    values are served and names the thinking exclusion; `CONTEXT.md` gains
-   the released-schedule term.
-9. `cargo test` passes workspace-wide.
+   the forced-literal term.
+10. `cargo test` passes workspace-wide.
 
 ## Out of Scope
 
@@ -229,6 +267,14 @@ from the body, and guessing it would change what the model reads.
   there risks a step boundary inside a token the tokenizer merges across the
   `=`; and the model choosing among the offered tools is the behaviour the
   caller wanted — they asked for *a* call, not for *that* call.
-- **Prior art in this repo**: `scalar` (spec decide/10, #255) already forces
-  a literal prefix and then constrains; the only thing it does not do is
-  release.
+- **Prior art in this repo**, in order of closeness: the thinking budget
+  (spec 08, `thinking_budget.rs`) forces a literal and then releases — the
+  whole mechanism, at a different position; `scalar` (spec decide/10, #255)
+  forces a literal prefix and then keeps constraining.
+- **Forcing after `</think>`** — the thing the default-on note above points
+  at — is not this mechanism. The budget knows *in advance* where it will
+  force (a token count); "after the model's own close" is only known one
+  round late, so the round that discovers `</think>` has already drawn a
+  free token. Making that work means either accepting one free token
+  between the close and the opener, or a leaf that can re-draw. Neither is
+  in this spec.

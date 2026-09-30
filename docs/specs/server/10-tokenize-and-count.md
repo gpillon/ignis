@@ -186,6 +186,11 @@ The refusal message names what the caller can do instead: send the request.
 - **Why `max_model_len` in the same response**: the alternative is a flag on
   `/v1/models`, which is one more round trip for the decision the caller is
   making right now.
-- vLLM's `/tokenize` returns `count`, `max_model_len` and `tokens`; this
-  spec's shape is deliberately the same, so a client written against vLLM
-  works unchanged.
+- **The field names are ours, not vLLM's.** vLLM's `/tokenize` returns a
+  count and a token list under its own names, and its `/detokenize` takes
+  them back under others; this spec does not claim drop-in compatibility
+  with it, because nobody has checked the current shape against the source.
+  If compatibility is wanted, the implementing agent should read
+  `vllm/entrypoints/openai/protocol.py` at a pinned version and adopt the
+  names exactly — a half-matching shape is worse than an honestly different
+  one.

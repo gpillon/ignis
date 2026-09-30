@@ -210,25 +210,32 @@ do today.
 1. **No silent drop.** For every field in the table, a request carrying it is
    either honoured, accepted as inert, or refused with a `400` naming it in
    `param`. Asserted row by row.
-2. **A default-shaped SDK body is accepted.** A body carrying `n: 1`,
+2. **No client this repo talks to breaks.** Bodies captured from the
+   clients that reach this server today — qwen-code, opencode/Codex, the
+   Playground, and the OpenAI Python SDK's defaults — are all served
+   unchanged. **This acceptance comes first and it can edit the table**: a
+   value a real client sends is *inert*, never *refused*, whatever this spec
+   guessed. `parallel_tool_calls: false` and `store: true` are the two most
+   likely to move, and the recorded agent trace is the fixture.
+3. **A default-shaped SDK body is accepted.** A body carrying `n: 1`,
    `store: false`, `parallel_tool_calls: true`, `logprobs: false`,
    `response_format: {"type":"text"}`, `metadata`, `user` and
    `service_tier: "auto"` is served exactly as the same body without them.
-3. **`max_completion_tokens` caps.** A request carrying only it stops at that
+4. **`max_completion_tokens` caps.** A request carrying only it stops at that
    many generated tokens with `finish_reason: "length"`; carrying both with
    different values it answers `400`.
-4. **`stop` stops.** Every case in Testing Decisions holds, and the matched
+5. **`stop` stops.** Every case in Testing Decisions holds, and the matched
    sequence never appears in the response.
-5. **Reuse is visible on chat.** `usage.prompt_tokens_details.cached_tokens`
+6. **Reuse is visible on chat.** `usage.prompt_tokens_details.cached_tokens`
    is present on every chat response, streaming and not, and reports the same
    quantity `/v1/responses` reports for the same prompt.
-6. **Unchanged output.** A request that neither sets `stop` nor
+7. **Unchanged output.** A request that neither sets `stop` nor
    `max_completion_tokens` produces the same tokens as before this spec,
    greedy, asserted against a recorded fixture.
-7. **Docs.** The OpenAPI operation description lists the inert set and every
+8. **Docs.** The OpenAPI operation description lists the inert set and every
    refusal; `README.md` carries the "what this server does not serve"
    section.
-8. `cargo test` passes workspace-wide.
+9. `cargo test` passes workspace-wide.
 
 ## Out of Scope
 
