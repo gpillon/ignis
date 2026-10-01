@@ -114,7 +114,9 @@ the bench).
 
 **Prefill, as served** (nsys, `trace_phase.sh`, ~5,500-token cold prompts, one
 lane): the CUDA-core class of prefill device time fell from **21.1% to 1.5%**,
-and the tensor-core class rose from 64.4% to 76.8%. In one 8 s window the
+and the tensor-core class rose from 64.4% to 80.6% (76.8% as first
+reported: the class script had missed `nvfp4_a16_mma` itself; see
+[the prefill "other" class](2026-09-30-prefill-other-class.md)). In one 8 s window the
 drafter projections went from 1,197 ms of `nvfp4_small_t` to 201 ms of
 `nvfp4_a16_mma` plus 60 ms of remaining GEMV tails. The new kernel runs at 67%
 Tensor Active in the samples.
@@ -199,7 +201,9 @@ experiment isolated it.
 
 - The remaining prefill cost is the backbone on the tensor cores. The next
   prefill lever is the backbone GEMMs (already 71-87% tensor), attention, or
-  the ~15% "other" class, not the drafter.
+  the ~11% "other" class, not the drafter. Past the kernels, the retained
+  host slot capture stalls ~12% of a cold TTFT
+  ([the prefill "other" class](2026-09-30-prefill-other-class.md)).
 - A future A16 NVFP4 caller gets the route automatically, because it is taken
   inside `ops::linear`. Today the only such caller is the drafter.
 
