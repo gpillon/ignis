@@ -1,0 +1,174 @@
+{
+  "question": {
+    "type": "noul",
+    "instructions": "Does the cited evidence support the claim?",
+    "criteria": {
+      "true": "Yes. The claim follows directly from the cited evidence without requiring additional assumptions, business knowledge, or unstated rules.",
+      "false": "No. The claim is contradicted by the evidence or requires assumptions, external knowledge, or unstated rules that are not present in the cited evidence."
+    }
+  },
+  "cases": [
+    {
+      "id": 1,
+      "name": "Direct field read",
+      "expected": true,
+      "starred": false,
+      "tier": "gate",
+      "state": "Claim: The account plan has 4 high-value potentials.\n\nCited evidence: plan_health, plan_id=PLAN-1001, retrieved 2026-09-20.\nFields: high_value_potentials_count = 4, potentials_count = 11, linked_opportunities_count = 0.",
+      "note": "The claim restates a field. No inference. Corrected: the claim said \"whitespace potentials\", and no field names whitespace, so under these criteria the qualifier is unsupported (the stock model answered NO, 0.22)."
+    },
+    {
+      "id": 2,
+      "name": "Direct contradiction",
+      "expected": false,
+      "starred": false,
+      "tier": "gate",
+      "state": "Claim: The account plan has 4 high-value potentials.\n\nCited evidence: plan_health, plan_id=PLAN-1001, retrieved 2026-09-20.\nFields: high_value_potentials_count = 0, potentials_count = 11, linked_opportunities_count = 11.",
+      "note": "Inversion of case 1. Same claim, field contradicts it. Corrected with case 1, so the inversion pair stays one claim against opposite evidence."
+    },
+    {
+      "id": 3,
+      "name": "Threshold comparison",
+      "expected": true,
+      "starred": false,
+      "tier": "gate",
+      "state": "Claim: The scorecard has not been updated in more than three months.\n\nCited evidence: plan_health, plan_id=PLAN-1002, retrieved 2026-09-20.\nFields: days_since_scorecard_update = 118, days_since_whitespace_update = 41, days_since_map_update = 63.",
+      "note": "118 > ~90. Arithmetic on a present field, nothing external."
+    },
+    {
+      "id": 4,
+      "name": "Threshold comparison contradicted",
+      "expected": false,
+      "starred": false,
+      "tier": "watch",
+      "state": "Claim: The scorecard has not been updated in more than three months.\n\nCited evidence: plan_health, plan_id=PLAN-1002, retrieved 2026-09-20.\nFields: days_since_scorecard_update = 12, days_since_whitespace_update = 41, days_since_map_update = 63.",
+      "note": "Inversion of case 3."
+    },
+    {
+      "id": 5,
+      "name": "Right source, wrong subject",
+      "expected": false,
+      "starred": true,
+      "tier": "gate",
+      "state": "Claim: The renewal is at risk because the economic buyer changed in Q3.\n\nCited evidence: plan_health, plan_id=PLAN-1003, retrieved 2026-09-20.\nFields: days_since_scorecard_update = 12, tasks_open_count = 3, tasks_in_progress_count = 1.",
+      "note": "The citation is real, correctly formed and resolves. It simply says nothing about buyers or renewals. This is the case a reference-existence check cannot catch."
+    },
+    {
+      "id": 6,
+      "name": "Business judgement",
+      "expected": false,
+      "starred": false,
+      "tier": "gate",
+      "state": "Claim: Stakeholder coverage on this account is weak.\n\nCited evidence: stakeholder_map, account_name = 'Northwind Logistics', retrieved 2026-09-20.\nFields: 3 contacts mapped, 1 flagged as champion, no economic buyer identified, stakeholder_map_last_modified_date = 2026-03-04.",
+      "note": "\"Weak\" requires a threshold that exists nowhere in the evidence. The evidence is consistent with the claim but does not entail it."
+    },
+    {
+      "id": 7,
+      "name": "Wrong field, matching number",
+      "expected": false,
+      "starred": true,
+      "tier": "gate",
+      "state": "Claim: There are 12 open tasks on this account plan.\n\nCited evidence: plan_health, plan_id=PLAN-1004, retrieved 2026-09-20.\nFields: tasks_total_count = 12, tasks_open_count = 5, tasks_in_progress_count = 3.",
+      "note": "The number 12 is present, attached to a different field. Tests whether the model reads the field or pattern-matches the digit."
+    },
+    {
+      "id": 8,
+      "name": "Scope creep",
+      "expected": false,
+      "starred": false,
+      "tier": "gate",
+      "state": "Claim: No initiative on this account has any linked opportunity.\n\nCited evidence: whitespace_opportunity, initiative_name = 'Platform Modernisation', retrieved 2026-09-20.\nFields: linked_opportunities_count = 0.",
+      "note": "Evidence covers one initiative. The claim quantifies over all of them."
+    },
+    {
+      "id": 9,
+      "name": "Null is not false",
+      "expected": false,
+      "starred": true,
+      "tier": "gate",
+      "state": "Claim: The executive sponsor is not engaged on this account.\n\nCited evidence: stakeholder_map, account_name = 'Fabrikam Energy', retrieved 2026-09-20.\nFields: champion_identified = true, exec_sponsor_engaged = null.",
+      "note": "Null means unrecorded, not negative. A system that treats absent as false will publish this claim."
+    },
+    {
+      "id": 10,
+      "name": "Two-field comparison",
+      "expected": true,
+      "starred": false,
+      "tier": "gate",
+      "state": "Claim: There are more open tasks than tasks in progress.\n\nCited evidence: plan_health, plan_id=PLAN-1005, retrieved 2026-09-20.\nFields: tasks_total_count = 14, tasks_open_count = 7, tasks_in_progress_count = 2.",
+      "note": "Both operands present. Comparison only."
+    },
+    {
+      "id": 11,
+      "name": "Supported observation, unsupported cause",
+      "expected": false,
+      "starred": true,
+      "tier": "gate",
+      "state": "Claim: The plan is stale because the account owner changed.\n\nCited evidence: plan_health, plan_id=PLAN-1006, retrieved 2026-09-20.\nFields: days_since_scorecard_update = 140, days_since_whitespace_update = 152, days_since_map_update = 160.",
+      "note": "Staleness is entailed. The causal attribution is not — nothing in the evidence mentions ownership. A claim that is half-supported must still fail."
+    },
+    {
+      "id": 12,
+      "name": "Absence from an enumerated list",
+      "expected": true,
+      "starred": false,
+      "tier": "watch",
+      "state": "Claim: No economic buyer has been identified on the account map.\n\nCited evidence: stakeholder_map, account_name = 'Contoso Retail', retrieved 2026-09-20.\nFields: node count = 3, node roles (all nodes) = [Champion, Technical Evaluator, End User].",
+      "note": "Contrast with case 9. Here the list is complete and enumerated, so absence is informative. There the field was explicitly null. Corrected: the contributed text said `node roles present`, which does not state that the list is complete (only the node count implies it). On the abliterated artifact p(yes) was 0.32 as contributed, 0.56 corrected; stock, 0.71 corrected."
+    },
+    {
+      "id": 13,
+      "name": "Date arithmetic",
+      "expected": true,
+      "starred": false,
+      "tier": "known_failure",
+      "state": "Claim: The renewal is less than 90 days away.\n\nCited evidence: plan_header, plan_id=PLAN-1007, retrieved 2026-09-20.\nFields: as_of_date = 2026-09-20, renewal_date = 2026-11-15, plan_status = Active.",
+      "note": "56 days. Both dates present in the evidence. Corrected: \"days away\" needs a today, and `retrieved` is the extraction date, so `as_of_date` states it. Still answered NO (stock 0.35 corrected; the abliterated artifact 0.15 corrected, 0.03 as contributed): the model does not do this date arithmetic under these criteria. A known failure, not a relabel."
+    },
+    {
+      "id": 14,
+      "name": "Date arithmetic contradicted",
+      "expected": false,
+      "starred": false,
+      "tier": "gate",
+      "state": "Claim: The renewal is less than 90 days away.\n\nCited evidence: plan_header, plan_id=PLAN-1007, retrieved 2026-09-20.\nFields: as_of_date = 2026-09-20, renewal_date = 2027-06-30, plan_status = Active.",
+      "note": "Inversion of case 13. ~283 days. Corrected with case 13, so the inversion pair stays one claim against opposite evidence."
+    },
+    {
+      "id": 15,
+      "name": "Unstated standard",
+      "expected": false,
+      "starred": true,
+      "tier": "gate",
+      "state": "Claim: This account plan does not meet the minimum completeness standard.\n\nCited evidence: plan_health, plan_id=PLAN-1008, retrieved 2026-09-20.\nFields: scorecard_questions_answered = 14, scorecard_questions_total = 22.",
+      "note": "There is no standard in the evidence. The claim imports a rule from outside it."
+    },
+    {
+      "id": 16,
+      "name": "Date restatement",
+      "expected": true,
+      "starred": false,
+      "tier": "watch",
+      "state": "Claim: The account map has not been modified since March 2026.\n\nCited evidence: stakeholder_map, account_name = 'Litware Manufacturing', retrieved 2026-09-20.\nFields: stakeholder_map_last_modified_date = 2026-03-04, node count = 6.",
+      "note": ""
+    },
+    {
+      "id": 17,
+      "name": "Proportion",
+      "expected": true,
+      "starred": false,
+      "tier": "gate",
+      "state": "Claim: Fewer than half of the potentials are high-value.\n\nCited evidence: plan_health, plan_id=PLAN-1009, retrieved 2026-09-20.\nFields: high_value_potentials_count = 4, potentials_count = 11.",
+      "note": "4 < 5.5. Both operands present. Corrected: the claim said \"whitespace potentials\", and no field names whitespace, so under these criteria the qualifier is unsupported (the stock model answered NO, 0.18)."
+    },
+    {
+      "id": 18,
+      "name": "Zero-valued field",
+      "expected": true,
+      "starred": false,
+      "tier": "watch",
+      "state": "Claim: No task on this plan is currently in progress.\n\nCited evidence: plan_health, plan_id=PLAN-1010, retrieved 2026-09-20.\nFields: tasks_total_count = 9, tasks_open_count = 9, tasks_in_progress_count = 0.",
+      "note": "Explicit zero, not a null. Contrast with case 9."
+    }
+  ]
+}

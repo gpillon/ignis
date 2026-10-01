@@ -283,6 +283,16 @@ metrics), `locate_request_log.rs` its log line, and the vote's tests ask for
 `crates/server/tests/locate_shortlist_gpu.rs` answers the synthetic fixtures'
 questions on the card through `/v1/decide`, one of them past a window.
 
+## The entailment fixture
+
+`crates/server/tests/fixtures/entailment/` is a contributed set of 18
+synthetic "does the cited evidence support the claim?" cases for `noul`
+(provenance, ignis's corrections and the tiers in its `NOTICE.md`).
+`decide_entailment_gpu.rs` asserts the label of the `gate` cases only and
+prints every case's p(yes) and logit; `watch` and `known_failure` cases are
+printed, never asserted. `decide_entailment_fixture.rs` checks the set's
+shape on CPU, including that every cited name is a public one.
+
 ## The G2 measurement instrument (P2-05, GitHub #87)
 
 `ignis-bench ttft` measures time to first token at an **exact** prompt
