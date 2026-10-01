@@ -86,7 +86,10 @@
 //! [`SubmitError::ContextExceeded`] (GitHub #166): the leaf never reserves
 //! more than its `max_context` for one sequence, however empty the pool.
 //! A prefill that the backend keeps failing ends its request with
-//! [`FinishReason::Error`] after [`MAX_PREFILL_ATTEMPTS`] tries.
+//! [`FinishReason::Error`] after [`MAX_PREFILL_ATTEMPTS`] tries — at once
+//! when the failed chunk was partway through the prompt, since only a
+//! request's first chunk can rebuild the sequence a failure released
+//! (GitHub #296).
 //!
 //! **Request-lifecycle spans (GitHub #81, ADR 0012)** — the full hierarchy
 //! is documented once in `docs/design/tracing-spans.md`; this crate's own
@@ -3432,10 +3435,10 @@ impl Scheduler for ConcreteScheduler {
                 }
                 Err(e) => {
                     // A failed chunk leaves progress untouched: the batch
-                    // stays in its pre-call state (`Admitted`, or
-                    // `Prefilling` with its prior progress) and is retried
-                    // on the next advance with the *same* span — not a
-                    // span already applied; the fault is surfaced through
+                    // keeps its scheduler state (`Admitted`, or `Prefilling`
+                    // with its prior progress), and a request whose job can
+                    // rebuild its sequence is retried on the next advance
+                    // with the *same* span; the fault is surfaced through
                     // `last_error`.
                     //
                     // P4-07, GitHub #125: `RuntimeCompute::prefill_step`'s
@@ -3475,8 +3478,24 @@ impl Scheduler for ConcreteScheduler {
                     // `FinishReason::Error`. Every request in the failed
                     // batch is charged the attempt: the backend's error does
                     // not say which job failed.
-                    for &i in &batch {
-                        if self.requests[i].prefill_failures >= MAX_PREFILL_ATTEMPTS {
+                    //
+                    // GitHub #296: and a request whose job could not rebuild
+                    // its sequence ends at once. The backend released every
+                    // job's sequence above, and only a request's first job
+                    // builds one — from position 0, or against the reuse
+                    // claim it carries. A job partway through the prompt has
+                    // neither: its retry would get a fresh sequence at
+                    // position 0 under a span that starts mid-prompt, which
+                    // the leaf refuses, so every retry would fail and hide
+                    // the fault that actually happened behind that refusal.
+                    for (n, &i) in batch.iter().enumerate() {
+                        let job = &jobs[n];
+                        let rebuildable = job.start_position == 0
+                            || job.shared_prefix.is_some()
+                            || job.checkpoint.is_some();
+                        if !rebuildable
+                            || self.requests[i].prefill_failures >= MAX_PREFILL_ATTEMPTS
+                        {
                             self.mark_done(i, &mut events, FinishReason::Error);
                         }
                     }

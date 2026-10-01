@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use ignis_core::types::{
-    ComputeError, DecodeParams, RequestClass, RequestInput, RequestState, SchedEvent,
+    ComputeError, DecodeParams, FinishReason, RequestClass, RequestInput, RequestState,
+    SchedEvent,
 };
 use ignis_core::{
     ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig, resolve_serving_chunk_tokens,
@@ -306,9 +307,11 @@ impl Compute for PrefillFailsOnce {
 }
 
 #[test]
-fn a_failed_chunk_retry_does_not_resend_an_already_applied_span() {
-    // Chunk 1 (call #0) succeeds; chunk 2 (call #1) fails; the retry (call
-    // #2) must resend exactly chunk 2's span, not re-send chunk 1's.
+fn a_failed_chunk_never_resends_an_already_applied_span() {
+    // Chunk 1 (call #0) succeeds; chunk 2 (call #1) fails. A failed batch
+    // releases the request's sequence, and a chunk partway through the
+    // prompt cannot rebuild it (GitHub #296), so the request ends there:
+    // neither chunk 1's span nor chunk 2's ever reaches the backend again.
     let compute = Arc::new(PrefillFailsOnce {
         inner: MockCompute::new(),
         call: Mutex::new(0),
@@ -321,18 +324,15 @@ fn a_failed_chunk_retry_does_not_resend_an_already_applied_span() {
 
     sched.advance(); // call #0: chunk 1 (0..4) succeeds
     assert_eq!(sched.prefill_progress(id), Some(4));
-    sched.advance(); // call #1: chunk 2 (4..8) fails — progress must not move
-    assert_eq!(
-        sched.prefill_progress(id),
-        Some(4),
-        "a failed chunk must not advance progress"
+    let events = sched.advance(); // call #1: chunk 2 (4..8) fails
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SchedEvent::Done { request, reason: FinishReason::Error, .. } if *request == id
+        )),
+        "the request ends on the failed chunk: {events:?}"
     );
-    sched.advance(); // call #2 (the retry): must resend the same 4..8 span
-    assert_eq!(
-        sched.prefill_progress(id),
-        Some(8),
-        "the retry applied chunk 2"
-    );
+    assert!(sched.is_idle(), "nothing is left to retry");
 
     let jobs_for_id: Vec<PrefillJob> = compute
         .inner
@@ -341,17 +341,11 @@ fn a_failed_chunk_retry_does_not_resend_an_already_applied_span() {
         .flat_map(|b| b.iter().cloned())
         .filter(|j| j.request == id)
         .collect();
-    // Only two chunks ever reached the backend (the failed attempt never
-    // got past the wrapper, so `MockCompute` itself only saw the
-    // succeeding calls): chunk 1, then chunk 2 exactly once.
-    assert_eq!(jobs_for_id.len(), 2);
+    // Only chunk 1 ever landed (the failed attempt never got past the
+    // wrapper, so `MockCompute` itself only saw the succeeding call).
+    assert_eq!(jobs_for_id.len(), 1);
     assert_eq!(jobs_for_id[0].start_position, 0);
-    assert_eq!(jobs_for_id[1].start_position, 4);
-    assert_eq!(
-        jobs_for_id[1].tokens,
-        vec![5, 6, 7, 8],
-        "the retry carries exactly chunk 2's span, not chunk 1's again"
-    );
+    assert_eq!(*compute.call.lock().unwrap(), 2, "no retry was attempted");
 }
 
 #[test]
