@@ -266,3 +266,59 @@ fn failed_decode_ends_the_request_and_releases_its_lane() {
     sched.advance();
     assert_eq!(*compute.faults.lock().unwrap(), 1);
 }
+
+/// GitHub #296 — a failed chunk of a request that is already partway through
+/// its prompt cannot be retried in place: the backend's failure contract
+/// releases every job's sequence, and only a request's *first* job (position
+/// 0, or the job that carries its reuse claim) builds one. A retry would start
+/// a fresh sequence at position 0 under a span that begins mid-prompt, and the
+/// leaf refuses it — so the request ends on the fault that actually happened,
+/// at once, rather than after `MAX_PREFILL_ATTEMPTS` refusals that hide it.
+#[test]
+fn a_failed_chunk_partway_through_a_prompt_ends_its_request_at_once() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::new("qwen3.8-27b", compute.clone());
+    let prompt: Vec<u32> = (1..=1500).collect();
+    let id = sched
+        .submit(
+            ignis_core::types::RequestInput {
+                decision: None,
+                multimodal: None,
+                opener_tokens: None,
+                user_turn_tokens: None,
+                system_block_tokens: None,
+                reuse_boundaries: Vec::new(),
+                model: "qwen3.8-27b".into(),
+                tokens: prompt,
+                params: Default::default(),
+                constrained: None,
+                warm_up: false,
+            },
+            ignis_core::types::RequestClass::Agent,
+        )
+        .unwrap();
+
+    // The first chunk lands: the request is partway through its prompt.
+    let ev = sched.advance();
+    assert!(
+        !ev.iter().any(|e| matches!(e, SchedEvent::Done { .. })),
+        "the request is still prefilling: {ev:?}"
+    );
+    let landed: Vec<_> = compute.prefill_calls().iter().flatten().map(|j| j.start_position).collect();
+    assert_eq!(landed, vec![0], "one chunk, from the start");
+
+    // Its next chunk faults: the request ends there, on that fault.
+    compute.fail_prefill(id);
+    let ev = sched.advance();
+    assert!(
+        ev.iter().any(|e| matches!(
+            e,
+            SchedEvent::Done { request, tokens: 0, reason: FinishReason::Error, .. } if *request == id
+        )),
+        "the request ends with an error on its first failed continuing chunk: {ev:?}"
+    );
+    assert_eq!(sched.last_error(), Some(&ComputeError::Kernel(-1)));
+    assert!(sched.is_idle(), "nothing is left to retry");
+    assert_eq!(sched.kv_used_pages(), 0, "its reservation is released");
+    assert_eq!(compute.prefill_calls().len(), 1, "no retry reached the backend");
+}

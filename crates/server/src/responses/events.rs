@@ -287,7 +287,7 @@ impl ResponseEvents {
                     FinishReason::Error => {
                         self.response.error = Some(ResponseError {
                             code: "server_error".into(),
-                            message: "the engine could not run the request (its prefill failed repeatedly); see the server log".into(),
+                            message: crate::api::ENGINE_ERROR_MESSAGE.into(),
                         });
                         Ending::Failed
                     }

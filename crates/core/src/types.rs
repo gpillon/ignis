@@ -31,7 +31,9 @@ pub enum FinishReason {
     Length,
     /// The compute backend failed the request's prefill
     /// `MAX_PREFILL_ATTEMPTS` times in a row (GitHub #166): the request is
-    /// ended rather than retried on every advance.
+    /// ended rather than retried on every advance — or once, when the failed
+    /// job cannot build its sequence again (GitHub #296,
+    /// `PrefillJob::builds_its_sequence`).
     Error,
 }
 

@@ -185,7 +185,8 @@ pub struct Request {
     /// Consecutive `prefill_step` calls that failed with this request in
     /// the batch (GitHub #166). Reset by a successful chunk; at
     /// `MAX_PREFILL_ATTEMPTS` the scheduler ends the request with
-    /// [`crate::types::FinishReason::Error`] instead of retrying it forever.
+    /// [`crate::types::FinishReason::Error`] instead of retrying it forever
+    /// (sooner for a job that cannot be retried, GitHub #296).
     pub prefill_failures: u32,
 }
 

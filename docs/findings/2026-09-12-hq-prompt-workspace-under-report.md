@@ -3,9 +3,11 @@
 - Kind: discovery
 - Status: current
 - Observed: 2026-09-12
-- Last verified: 2026-09-12
+- Last verified: 2026-10-01
 - Scope: kernel / vendored `ninfer::ops::gqa_attention` capacity query, hq-e8-2b prefill
 - Related: [GitHub #123](https://github.com/gpillon/ignis/issues/123),
+  [GitHub #296](https://github.com/gpillon/ignis/issues/296),
+  [ADR 0037](../adr/0037-a-vendored-file-may-carry-a-correctness-patch.md),
   [ADR 0010](../adr/0010-vendored-reference-kernels.md),
   [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md),
   `kernel/include/ignis_gqa_workspace.h`
@@ -49,6 +51,19 @@ part-way through the layer.
 BF16 and INT8 are unaffected: neither has rider (1), so for them the query's
 `max` and the true sum coincide.
 
+**Past one band (GitHub #296, observed 2026-10-01).** The same query
+under-reports a banded hq Prompt call too: one whose envelope is past one
+262,144-key scratch band, where the route chains a carry state across bands
+instead of splitting keys. It adds that carry as raw arithmetic,
+`(2 * head_dim + 8) * q_heads * width`, but the op bumps the carry's three
+tensors at 256-byte alignment, so the answer is short by the padding after
+`carry_m` whenever `96 * width` is not a multiple of 256. The split partials,
+far larger, hide it except at a width `gqa_prefill_split_count` keeps at one
+split: 321..448 and 769..896 at the 27B geometry on a 170-SM RTX 5090, 224
+widths among 17..1024. In serving, an agent conversation past 344K keys whose
+last prompt chunk was 330 tokens wide threw `layer 3: ignis_gqa_layer_step:
+bad allocation` on every request.
+
 ## Finding
 
 **Observed.** The vendored capacity query under-reports an hq-e8-2b Prompt
@@ -78,6 +93,16 @@ is about to run — a narrower call pattern than the query handles correctly.
   modulo the prefill chunk.
 - `kernel/tests/test_hq_route_agreement.cu` runs every width in 9..16 so the
   correction has a test rather than a story.
+- The banded under-report (GitHub #296) is fixed in the vendored file, as the
+  follow-up below proposed: ADR 0037 (2026-09-22) admits a recorded
+  correctness patch, and the query violated its own contract with an
+  observation in ignis behind it. The patch sizes the carry through
+  `WorkspaceLayoutBuilder`; `ignis_kernel_gqa_workspace_capacity_test` replays
+  the op's allocations at every serving prompt width, in one band and past it,
+  and its banded arms are red without the patch on a 170-SM card.
+  `kernel/vendor/VENDOR.md` lists it as an Ignis-patched behaviour. The
+  narrow-width correction above stays at the caller: a different bug, with its
+  own test.
 
 ## Limits and unknowns
 

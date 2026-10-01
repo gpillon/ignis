@@ -5,13 +5,16 @@
 
 #[path = "support/responses.rs"]
 mod responses;
+#[path = "support/failing_prefill.rs"]
+mod failing_prefill;
+use failing_prefill::FailingPrefill;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
-use ignis_core::{Compute, ComputeError, MockCompute, PrefillJob, PrefillOutcome, SchedulerConfig};
+use ignis_core::{MockCompute, SchedulerConfig};
 use serde_json::{json, Value as JsonValue};
 use tower::ServiceExt;
 
@@ -399,25 +402,6 @@ async fn a_length_stop_ends_incomplete_with_its_reason() {
     assert_eq!(last["response"]["incomplete_details"], json!({ "reason": "max_output_tokens" }));
     assert_eq!(last["response"]["output"][0]["status"], "incomplete", "a cut message is incomplete");
     assert_eq!(last["response"]["usage"]["output_tokens"], 2);
-}
-
-/// A backend whose every prefill fails: the scheduler gives the request up
-/// with `FinishReason::Error` after its retries.
-struct FailingPrefill(MockCompute);
-
-impl Compute for FailingPrefill {
-    fn prefill_step(&self, _jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
-        Err(ComputeError::Kernel(-1))
-    }
-    fn decode_step(
-        &self,
-        jobs: &[ignis_core::DecodeJob],
-    ) -> Result<Vec<ignis_core::DecodeOutcome>, ComputeError> {
-        self.0.decode_step(jobs)
-    }
-    fn release(&self, request: ignis_core::RequestId) {
-        self.0.release(request);
-    }
 }
 
 #[tokio::test]

@@ -88,18 +88,25 @@ async function sendChat(options: ChatStreamOptions): Promise<StreamResult> {
 
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
     const parser = createSseParser();
+    let failed: string | undefined;
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
       for (const data of parser.push(value)) {
         const at = now();
         for (const event of parseChunk(data)) {
+          if (event.kind === "error") {
+            failed = event.message;
+            continue;
+          }
           recordEvent(timeline, event, at);
           options.onEvent(event);
         }
       }
     }
     timeline.endedAt ??= now();
+    // GitHub #296: an engine error is its own chunk, with the engine's message.
+    if (failed !== undefined) return { ok: false, message: failed, timeline };
     // ignis ends a stream the engine dropped with a bare `[DONE]`: no finish
     // reason means the reply did not really finish.
     if (timeline.finishReason === undefined) {

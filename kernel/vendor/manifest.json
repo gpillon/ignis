@@ -1380,7 +1380,12 @@
     },
     {
       "path": "src/ops/wrapper/gqa_attention.cpp",
-      "sha256": "e257cd1c33fba6edf06a36f10556885cbc477ab44df31119340502074b63ffed"
+      "sha256": "e257cd1c33fba6edf06a36f10556885cbc477ab44df31119340502074b63ffed",
+      "patch": {
+        "diff": "patches/src/ops/wrapper/gqa_attention.cpp.diff",
+        "sha256": "2ace619d6b64a43747649d497a3ce876bfb68ace477c448edd9da3c47b967c74",
+        "reason": "Correctness (ADR 0037, ignis GitHub #296): gqa_attention_workspace_capacity_bytes adds the banded hq prompt carry as raw (2*head_dim+8)*q_heads*width, but allocate_hq_prompt_scratch bumps carry_acc/carry_m/carry_l at 256-byte alignment; at a width with one key split and width%8!=0 the query is short by the padding after carry_m and a per-width caller's arena throws bad_alloc mid-layer. The carry is now sized through WorkspaceLayoutBuilder. Test: ignis_kernel_gqa_workspace_capacity_test (banded arms red without it)."
+      }
     },
     {
       "path": "src/ops/wrapper/kv_cache_append_prefix.cpp",

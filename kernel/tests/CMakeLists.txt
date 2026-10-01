@@ -447,6 +447,15 @@ target_include_directories(ignis_kernel_vision_workspace_test
 target_link_libraries(ignis_kernel_vision_workspace_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_vision_workspace_test COMMAND ignis_kernel_vision_workspace_test)
 
+# GitHub #296: OURS -- the vendored A1 capacity query against a layout-builder
+# replay of what the hq Prompt route bumps, at every serving prompt width, in
+# one scratch band and past it. Host-only layout arithmetic (the SM-count
+# query creates no context); it pins the recorded correctness patch on
+# kernel/vendor/src/ops/wrapper/gqa_attention.cpp (ADR 0037).
+add_executable(ignis_kernel_gqa_workspace_capacity_test test_gqa_workspace_capacity.cpp)
+target_link_libraries(ignis_kernel_gqa_workspace_capacity_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gqa_workspace_capacity_test COMMAND ignis_kernel_gqa_workspace_capacity_test)
+
 # P4-05 (GitHub #123): OURS, not vendored -- the hq attention routes against
 # ignis's own BF16 route on identical keys and values (ADR 0022's in-house
 # acceptance for a lossy format). The same q/k/v/gate/positions go through A1

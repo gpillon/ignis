@@ -25,6 +25,11 @@ describe("createSseParser", () => {
 });
 
 describe("parseChunk", () => {
+  it("reads an error chunk as the engine's error (GitHub #296)", () => {
+    const error = JSON.stringify({ error: { message: "the engine could not run the request", type: "engine_error", code: "engine_error" } });
+    expect(parseChunk(error)).toEqual([{ kind: "error", message: "the engine could not run the request" }]);
+  });
+
   it("separates reasoning from content", () => {
     expect(parseChunk(chunk({ reasoning_content: "hmm" }))).toEqual([{ kind: "reasoning", text: "hmm" }]);
     expect(parseChunk(chunk({ content: "Hi" }))).toEqual([{ kind: "content", text: "Hi" }]);

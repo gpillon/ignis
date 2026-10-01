@@ -562,10 +562,14 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                 partial_max = std::max(partial_max, layout.peak_bytes(1));
             }
             if (span < envelope.max_visible_keys) {
-                // Banded carry state (acc [head_dim, q_heads, width] bf16 + m/l fp32).
-                const std::size_t carry = (2ULL * kHeadDim + 8) *
-                                          static_cast<std::size_t>(q_heads) *
-                                          static_cast<std::size_t>(max_width);
+                // Banded carry state (acc [head_dim, q_heads, width] bf16 + m/l fp32), laid out
+                // as allocate_hq_prompt_scratch bumps it: each tensor 256-aligned, so the
+                // padding after m is counted (ignis GitHub #296).
+                WorkspaceLayoutBuilder carry_layout;
+                (void)carry_layout.alloc(DType::BF16, {kHeadDim, q_heads, max_width, 1});
+                (void)carry_layout.alloc(DType::FP32, {q_heads, max_width, 1, 1});
+                (void)carry_layout.alloc(DType::FP32, {q_heads, max_width, 1, 1});
+                const std::size_t carry = carry_layout.peak_bytes(1);
                 scratch += std::max(carry, partial_max);
             } else {
                 scratch += partial_max;
