@@ -185,6 +185,18 @@ pub struct PrefillJob {
     pub attention: Option<crate::pointing::AttentionQuery>,
 }
 
+impl PrefillJob {
+    /// Whether the backend builds this job's sequence rather than finding it
+    /// already built: a request's first job, at position 0 or carrying the
+    /// reuse claim it is allocated against. A failed batch releases every
+    /// job's sequence (P4-07, GitHub #125), so this is also whether a failed
+    /// job can be retried at all (GitHub #296): any other job would get a
+    /// fresh sequence at position 0 under a span that starts mid-prompt.
+    pub fn builds_its_sequence(&self) -> bool {
+        self.start_position == 0 || self.shared_prefix.is_some() || self.checkpoint.is_some()
+    }
+}
+
 /// One decode job: a single lane step for a running request.
 #[derive(Debug, Clone)]
 pub struct DecodeJob {
@@ -229,8 +241,8 @@ pub struct DecodeJob {
 ///
 /// A failed prefill batch reports nothing at all — it emits no chunk event,
 /// so an encode the failure discarded is never counted. Its retry
-/// (`MAX_PREFILL_ATTEMPTS`, and only of a request's first chunk — GitHub
-/// #296) re-encodes whatever the batch dropped, and *that* encode is
+/// (`MAX_PREFILL_ATTEMPTS`, of a job that
+/// [builds its sequence](PrefillJob::builds_its_sequence)) re-encodes whatever the batch dropped, and *that* encode is
 /// counted. What a request's total answers is "how much encode work did
 /// this request cause", not "what did this image cost to encode".
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -416,11 +428,8 @@ pub trait Compute: Send + Sync {
     /// a partial answer would be attributed to a chunk that never landed.
     ///
     /// A failed batch also releases every job's sequence (P4-07, GitHub
-    /// #125), so only a job that builds its sequence — the request's first,
-    /// at position 0 or carrying its reuse claim — can be retried. A request
-    /// whose failed job was partway through its prompt ends with
-    /// [`FinishReason::Error`](crate::types::FinishReason::Error) at once
-    /// (GitHub #296).
+    /// #125); see [`PrefillJob::builds_its_sequence`] for what that means
+    /// for a retry.
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError>;
 
     /// Run one decode round over every running lane. Returns, per job in

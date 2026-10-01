@@ -15,7 +15,9 @@
 use std::sync::{Arc, Mutex};
 
 use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
-use ignis_core::types::{ComputeError, DecodeParams, RequestClass, RequestInput, SchedEvent};
+use ignis_core::types::{
+    ComputeError, DecodeParams, FinishReason, RequestClass, RequestInput, SchedEvent,
+};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
 
 /// A prompt of `n` distinct tokens starting at `start` (a deterministic,
@@ -354,8 +356,17 @@ fn a_failed_prefill_retry_does_not_double_claim() {
     );
 
     // The retry (call #2, succeeds): the claimant keeps its claim (no
-    // double-claim), prefills its tail, and completes.
-    run_to_idle(&mut sched);
+    // double-claim), prefills its tail, and completes. A claimant's first
+    // job builds its sequence against the claim, so a failure of it is
+    // retried rather than ending the request (GitHub #296).
+    let events = run_to_idle(&mut sched);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SchedEvent::Done { request, reason, .. } if *request == sub && *reason != FinishReason::Error
+        )),
+        "the claimant's retry landed and it finished: {events:?}"
+    );
     assert_eq!(
         sched.sibling_prefix_reused_tok(),
         32,

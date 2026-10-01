@@ -87,9 +87,8 @@
 //! more than its `max_context` for one sequence, however empty the pool.
 //! A prefill that the backend keeps failing ends its request with
 //! [`FinishReason::Error`] after [`MAX_PREFILL_ATTEMPTS`] tries — at once
-//! when the failed chunk was partway through the prompt, since only a
-//! request's first chunk can rebuild the sequence a failure released
-//! (GitHub #296).
+//! when the failed job cannot build its sequence again
+//! ([`PrefillJob::builds_its_sequence`], GitHub #296).
 //!
 //! **Request-lifecycle spans (GitHub #81, ADR 0012)** — the full hierarchy
 //! is documented once in `docs/design/tracing-spans.md`; this crate's own
@@ -3479,21 +3478,13 @@ impl Scheduler for ConcreteScheduler {
                     // batch is charged the attempt: the backend's error does
                     // not say which job failed.
                     //
-                    // GitHub #296: and a request whose job could not rebuild
-                    // its sequence ends at once. The backend released every
-                    // job's sequence above, and only a request's first job
-                    // builds one — from position 0, or against the reuse
-                    // claim it carries. A job partway through the prompt has
-                    // neither: its retry would get a fresh sequence at
-                    // position 0 under a span that starts mid-prompt, which
-                    // the leaf refuses, so every retry would fail and hide
-                    // the fault that actually happened behind that refusal.
+                    // GitHub #296: and a request whose job cannot build its
+                    // sequence again ends at once
+                    // ([`PrefillJob::builds_its_sequence`]): every retry
+                    // would be refused, and hide the fault that actually
+                    // happened behind that refusal.
                     for (n, &i) in batch.iter().enumerate() {
-                        let job = &jobs[n];
-                        let rebuildable = job.start_position == 0
-                            || job.shared_prefix.is_some()
-                            || job.checkpoint.is_some();
-                        if !rebuildable
+                        if !jobs[n].builds_its_sequence()
                             || self.requests[i].prefill_failures >= MAX_PREFILL_ATTEMPTS
                         {
                             self.mark_done(i, &mut events, FinishReason::Error);

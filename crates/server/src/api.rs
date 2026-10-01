@@ -1042,14 +1042,15 @@ pub(crate) fn finish_reason_str(reason: FinishReason) -> &'static str {
 
 /// What a request the engine ended with [`FinishReason::Error`] is told, on
 /// every surface: the non-streaming `500`, the streaming error chunk, and the
-/// Responses `failed` event.
+/// Responses `failed` event. It names no stage: a failed prefill, a failed
+/// decode round and an unread decision all end that way.
 pub(crate) const ENGINE_ERROR_MESSAGE: &str =
-    "the engine could not run the request (its prefill failed); see the server log";
+    "the engine could not run the request; see the server log";
 
 /// The `500` a non-streaming request gets when the engine ended it with
 /// [`FinishReason::Error`] (GitHub #166): there is no completion to return.
 fn engine_error_response() -> Response {
-    error_response(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", "engine_error", ENGINE_ERROR_MESSAGE)
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(engine_error_body())).into_response()
 }
 
 /// The OpenAI `finish_reason`, tool-calls aware (GitHub #121). A generation
@@ -2222,19 +2223,24 @@ impl Stream for ChunkStream {
 
 // ── the error envelope ───────────────────────────────────────────────────
 
-/// The SSE event a chat stream ends with when the engine ended its request
-/// with [`FinishReason::Error`] (GitHub #296): the same `{"error": {...}}`
-/// body the non-streaming `500` carries.
-fn engine_error_chunk() -> Event {
-    let body = ApiError {
+/// The body of a request the engine ended with [`FinishReason::Error`]: the
+/// non-streaming `500`'s, and the error chunk a stream ends with (GitHub
+/// #296).
+fn engine_error_body() -> ApiError {
+    ApiError {
         error: ErrorBody {
             message: ENGINE_ERROR_MESSAGE.into(),
             r#type: "engine_error".into(),
             code: "engine_error".into(),
             param: None,
         },
-    };
-    Event::default().data(serde_json::to_string(&body).expect("the error body serializes"))
+    }
+}
+
+/// The SSE event a chat stream ends with when the engine ended its request
+/// with [`FinishReason::Error`] (GitHub #296).
+fn engine_error_chunk() -> Event {
+    Event::default().data(serde_json::to_string(&engine_error_body()).expect("the error body serializes"))
 }
 
 /// The OpenAI error body (`{"error": {...}}`). Every failure on this

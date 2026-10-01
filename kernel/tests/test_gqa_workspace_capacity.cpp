@@ -124,6 +124,7 @@ int main() {
 
   // --- 2. past one band: the carry chains the bands (GitHub #296) -------------
   sweep(ninfer::ops::kGqaHqPromptScratchBandKeys + 1, "banded (one key past the band)");
+  sweep(337'408, "banded (337,408 visible keys)");
   sweep(344'064, "banded (344,064 visible keys, the #296 conversation)");
 
   if (g_failed != 0) {

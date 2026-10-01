@@ -349,6 +349,36 @@ fn a_failed_chunk_never_resends_an_already_applied_span() {
 }
 
 #[test]
+fn a_failed_first_chunk_is_retried_with_exactly_its_span() {
+    // Chunk 1 (call #0) fails. A first job builds its sequence, so it is
+    // retried (call #1) with the same 0..4 span, and the prompt goes on.
+    let compute = Arc::new(PrefillFailsOnce {
+        inner: MockCompute::new(),
+        call: Mutex::new(0),
+        fail_on: 0,
+    });
+    let mut sched = sched_with_chunk(4, compute.clone());
+    let id = sched
+        .submit(input(&(1..=10).collect::<Vec<_>>(), 1), RequestClass::Agent)
+        .unwrap();
+
+    sched.advance(); // call #0: chunk 1 (0..4) fails
+    assert_eq!(sched.prefill_progress(id), Some(0), "a failed chunk must not advance progress");
+    sched.advance(); // call #1: the retry
+    assert_eq!(sched.prefill_progress(id), Some(4), "the retry applied chunk 1");
+
+    let jobs_for_id: Vec<PrefillJob> = compute
+        .inner
+        .prefill_calls()
+        .iter()
+        .flat_map(|b| b.iter().cloned())
+        .filter(|j| j.request == id)
+        .collect();
+    assert_eq!(jobs_for_id[0].start_position, 0);
+    assert_eq!(jobs_for_id[0].tokens, vec![1, 2, 3, 4], "the retry carries exactly chunk 1's span");
+}
+
+#[test]
 fn cancel_mid_prefill_aborts_and_releases_without_finishing() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = sched_with_chunk(4, compute.clone());

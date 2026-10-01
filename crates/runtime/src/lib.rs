@@ -1082,6 +1082,9 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // Core retries a failed *batch*, not only the job that failed, so any
         // failure below returns every sequence in the batch to zero state --
         // otherwise the retry would prefill an already-warmed span twice.
+        // Only a job that builds its sequence is retried at all; a request
+        // whose job was partway through its prompt ends instead (GitHub
+        // #296, `PrefillJob::builds_its_sequence`).
         macro_rules! unwind {
             ($err:expr) => {{
                 let released: Vec<_> = jobs

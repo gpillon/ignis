@@ -28,6 +28,9 @@ use ignis_server::Server;
 
 #[path = "support/mod.rs"]
 mod support;
+#[path = "support/failing_prefill.rs"]
+mod failing_prefill;
+use failing_prefill::FailingPrefill;
 use support::nudge;
 
 const MODEL: &str = "test-model";
@@ -471,22 +474,6 @@ async fn chat_completions_streaming_emits_chunks_then_done() {
         .map(|c| c["choices"][0]["delta"]["content"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(streamed_content, rendered(&expected_tokens));
-}
-
-/// A backend whose every prefill fails: the scheduler ends the request with
-/// `FinishReason::Error` after its retries (GitHub #166).
-struct FailingPrefill(MockCompute);
-
-impl Compute for FailingPrefill {
-    fn prefill_step(&self, _jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
-        Err(ComputeError::Kernel(-1))
-    }
-    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
-        self.0.decode_step(jobs)
-    }
-    fn release(&self, request: RequestId) {
-        self.0.release(request);
-    }
 }
 
 /// GitHub #296 — an engine error on a stream is an OpenAI error chunk, not a
