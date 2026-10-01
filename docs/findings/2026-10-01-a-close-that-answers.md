@@ -78,6 +78,7 @@ without them and one sampled run still globbed for them.
 | C0, greedy (the job's config) | 3, 2 of them deferring | ~5 min |
 | C2, greedy | 1, the report | 1m19s |
 | C2, model card | 1, the report | 1m42s |
+| the #297 build: C2 + default sampling, the job's config (no sampling fields) | 1, the report | 1m51s |
 
 opencode forwards `temperature` only when the model definition declares
 `"temperature": true`. Without it, a configured `top_p`/`top_k` reaches the
