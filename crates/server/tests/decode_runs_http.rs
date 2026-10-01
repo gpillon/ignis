@@ -28,7 +28,7 @@ fn app(compute: Arc<MockCompute>) -> axum::Router {
         },
         compute,
     );
-    Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider)).app()
+    Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider)).with_seedless_seed(0).app()
 }
 
 async fn chat(app: &axum::Router, body: serde_json::Value) -> (u16, String) {

@@ -163,7 +163,7 @@ always-current table; this one is a copy.
 |---|---|---|---|
 | `--enable-thinking <bool>` | `IGNIS_ENABLE_THINKING` | `true` | The server-wide default for `enable_thinking`. |
 | `--reasoning-effort <value>` | `IGNIS_REASONING_EFFORT` | template default | The server-wide default `reasoning_effort`. An effort the template does not take is rounded up to one it does (Qwen3.8: `high` and `max` are `xhigh`, `minimal` is `low`), the same as a per-request one. |
-| `--thinking-budget <n\|off>` | `IGNIS_THINKING_BUDGET` | `6144` | The server-wide thinking budget: after `n` reasoning tokens with the block still open, the model's own close (`…directly now.\n</think>`) is forced and the model answers. `off` = no default budget. A request's `thinking_budget` overrides it, and `reasoning_effort: max` runs without one. Set with a tokenizer that has no single-token `</think>`, the server refuses to start. |
+| `--thinking-budget <n\|off>` | `IGNIS_THINKING_BUDGET` | `6144` | The server-wide thinking budget: after `n` reasoning tokens with the block still open, a close (`My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.\n</think>`) is forced and the model answers. `off` = no default budget. A request's `thinking_budget` overrides it, and `reasoning_effort: max` runs without one. Set with a tokenizer that has no single-token `</think>`, the server refuses to start. |
 | `--system-message-policy <p>` | `IGNIS_SYSTEM_MESSAGE_POLICY` | `merge` | `merge`: a leading run of system messages joins the system prompt, a later one is its own block in place. `strict`: a system message that is not first is a 400. |
 | `--developer-message-policy <p>` | `IGNIS_DEVELOPER_MESSAGE_POLICY` | `inplace` | One of `inplace`, `into-system`, `after-system`, `one-after-system`, `reject`. A leading developer message is the system prompt except under `reject`. |
 
@@ -274,12 +274,21 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   streaming; top-level on `/v1/responses`): the reasoning tokens emitted when
   it began. The field is absent when the close was not forced.
 - Values outside the ranges above are rejected with
-  `invalid_sampling_parameter`; they are never silently clamped. Absent
-  sampling fields preserve greedy, fixed-seed behaviour (`temperature: 0`,
-  `seed: 0`). Because the leaf's greedy branch does not read stochastic filters
-  or penalties, a non-neutral `top_p`, `top_k`, `presence_penalty` or
-  `frequency_penalty` requires `temperature > 0` and is otherwise rejected
-  rather than ignored.
+  `invalid_sampling_parameter`; they are never silently clamped.
+- **Absent sampling fields take the Qwen3.8 model card's values** for the
+  request's mode, each field on its own (spec server/12):
+
+  | mode | `temperature` | `top_p` | `top_k` | `presence_penalty` | `frequency_penalty` |
+  |---|---:|---:|---:|---:|---:|
+  | thinking | 1.0 | 0.95 | 20 | 0 | 0 |
+  | `enable_thinking: false` | 0.7 | 0.80 | 20 | 1.5 | 0 |
+
+  An absent `seed` is a fresh one per request, so two identical requests are
+  two independent samples; a sent `seed` is kept. **Greedy is
+  `temperature: 0`**: the fields such a request does not send are neutral,
+  and because the leaf's greedy branch does not read stochastic filters or
+  penalties, a non-neutral `top_p`, `top_k`, `presence_penalty` or
+  `frequency_penalty` sent with it is rejected rather than ignored.
 - `max_completion_tokens` is `max_tokens` under OpenAI's current name — the
   one the current SDKs send. Both with different values is a 400.
 - `stop` (a string, or 1 to 4 non-empty strings) ends the answer before the

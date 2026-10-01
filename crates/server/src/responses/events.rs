@@ -32,6 +32,13 @@ use ignis_core::{FinishReason, SchedEvent, TokenId};
 use crate::decoder::{Channel, Delta, OutputDecoder};
 use crate::toolcall::{ToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
 
+/// An engine `f32` sampling value as the decimal it was written as: widened
+/// directly, `0.95_f32` is 0.949999988079071 — a number no client sent, and
+/// the default `top_p` since spec server/12.
+pub(crate) fn wire_number(value: f32) -> f64 {
+    value.to_string().parse().expect("an f32 prints as a decimal f64 parses")
+}
+
 /// The response object (OpenAI's `Response`): what `response.created`, every
 /// lifecycle event and the terminal event carry, and the non-streaming body.
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -62,7 +69,8 @@ pub(crate) struct ResponseObject {
     #[schema(value_type = Object)]
     pub reasoning: JsonValue,
     pub store: bool,
-    pub temperature: f32,
+    /// The sampling the request ran with, as decimals (`wire_number`).
+    pub temperature: f64,
     #[schema(value_type = Object)]
     pub text: JsonValue,
     #[schema(value_type = Object)]
@@ -70,7 +78,7 @@ pub(crate) struct ResponseObject {
     /// The request's `tools`, in the Responses shape it sent them in.
     #[schema(value_type = Vec<Object>)]
     pub tools: Vec<JsonValue>,
-    pub top_p: f32,
+    pub top_p: f64,
     pub truncation: &'static str,
     /// Absent (`null`) until the response ends.
     pub usage: Option<ResponseUsage>,
@@ -583,6 +591,13 @@ mod tests {
     use super::*;
     use crate::decoder::TokenDecoder;
     use crate::responses::{drive, Driven};
+
+    #[test]
+    fn a_sampling_value_is_echoed_as_the_decimal_it_was_written_as() {
+        for value in [0.95_f32, 0.8, 0.7, 1.0, 0.0, 0.6] {
+            assert_eq!(wire_number(value).to_string(), value.to_string());
+        }
+    }
 
     /// Token `n` is `TEXTS[n]`.
     struct Texts(&'static [&'static str]);

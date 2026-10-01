@@ -158,6 +158,7 @@ fn harness_from(template: RecordingTemplateProvider, setup: Setup) -> Harness {
         Box::new(SharedTemplate(Arc::clone(&template))),
     )
     .with_request_timeout(Duration::from_secs(5))
+    .with_seedless_seed(0)
     .with_thinking_defaults(true, setup.default_effort)
     .with_thinking_budget(setup.default_budget);
     Harness {
@@ -591,6 +592,40 @@ async fn a_forced_close_is_reported_on_the_choice_with_the_reasoning_tokens_befo
     // id the harness's decoder does not know, so a `?`.
     assert_eq!(choice["message"]["content"], "????", "{body}");
     assert!(choice["message"]["reasoning_content"].as_str().unwrap().ends_with("by the user, now."), "{body}");
+}
+
+#[tokio::test]
+async fn the_served_close_hands_off_with_the_answer_now_sentence() {
+    // Spec server/12: the close the server builds from THINKING_CLOSE_TEXT is
+    // what a budgeted request's reasoning ends with on the wire.
+    let text = ignis_server::thinking::THINKING_CLOSE_TEXT;
+    let end = text.find("</think>").unwrap();
+    let (head, tail) = (&text[..end], &text[end + "</think>".len()..]);
+    let close = ignis_server::thinking::thinking_close(|piece| match piece {
+        "</think>" => Ok(vec![THINK_END]),
+        whole if whole == text => Ok(vec![900, THINK_END, 902]),
+        other => Err(format!("unexpected text {other:?}")),
+    })
+    .unwrap();
+    let h = harness_from(
+        RecordingTemplateProvider::permissive(HashMap::from([(900, head), (THINK_END, "</think>"), (902, tail)])),
+        Setup { close: Some(close), ..Setup::default() },
+    );
+    for id in 0..16 {
+        h.compute.stop_after(id, 12);
+    }
+    let (status, body) =
+        call(&h.app, "POST", "/v1/chat/completions", Some(chat_request(serde_json::json!({ "thinking_budget": 3 })))).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let reasoning = v["choices"][0]["message"]["reasoning_content"].as_str().unwrap();
+    assert!(
+        reasoning.trim_end().ends_with(
+            "My thinking time is over. I must now write the complete final answer from what I already have, \
+             without calling any more tools."
+        ),
+        "{body}"
+    );
 }
 
 #[tokio::test]

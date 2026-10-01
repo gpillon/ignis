@@ -58,7 +58,8 @@ fn harness_over_with_timeout(compute: Arc<dyn Compute>, timeout: Duration) -> Ha
         Engine::new(Box::new(scheduler)),
         Box::new(SimpleTemplateProvider),
     )
-    .with_request_timeout(timeout);
+    .with_request_timeout(timeout)
+    .with_seedless_seed(0);
     Harness { app: server.app() }
 }
 
@@ -108,7 +109,7 @@ fn rejecting_template_harness() -> Harness {
         },
         Arc::new(MockCompute::new()),
     );
-    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(RejectingTemplateProvider));
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(RejectingTemplateProvider)).with_seedless_seed(0);
     Harness { app: server.app() }
 }
 
@@ -312,7 +313,8 @@ fn policy_harness(policy: InstructionPolicy) -> (Harness, Arc<RecordingTemplate>
     );
     let template = Arc::new(RecordingTemplate::default());
     let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(support::SharedTemplate(template.clone())))
-        .with_instruction_policy(policy);
+        .with_instruction_policy(policy)
+        .with_seedless_seed(0);
     (Harness { app: server.app() }, template)
 }
 
@@ -566,7 +568,8 @@ async fn dropping_a_streaming_response_cancels_the_request_and_releases_its_slot
     let server = Server::new(
         Engine::new(Box::new(scheduler)),
         Box::new(SimpleTemplateProvider),
-    );
+    )
+    .with_seedless_seed(0);
     let app = server.app();
 
     gated.arm();

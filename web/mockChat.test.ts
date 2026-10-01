@@ -55,6 +55,10 @@ describe("mockThinking", () => {
     const thinking = mockThinking(read({ thinking_budget: 2048 }), "hard one /budget");
     expect(thinking.forcedAt).toBe(2048);
     expect(thinking.reasoning.at(-1)).toBe(FORCED_CLOSE_TEXT);
+    // ignis's close since spec server/12 (thinking.rs THINKING_CLOSE_TEXT).
+    expect(FORCED_CLOSE_TEXT).toBe(
+      "\n\nMy thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.",
+    );
   });
 
   it("is never forced when there is no budget to spend", () => {

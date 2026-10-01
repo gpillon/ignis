@@ -113,15 +113,16 @@ fn harness(vision: Option<Vision>) -> Option<Harness> {
     })
 }
 
-/// One greedy, non-streaming completion. Temperature is left unset, which the
-/// API layer resolves to 0.0 — greedy sampling, the determinism check's own
-/// precondition. Thinking is off so the token budget buys content rather than
-/// a reasoning channel.
+/// One greedy, non-streaming completion. Temperature is an explicit 0 —
+/// greedy sampling, the determinism check's own precondition; an unset one
+/// would take the model card's sampling (spec server/12). Thinking is off so
+/// the token budget buys content rather than a reasoning channel.
 async fn complete(app: &axum::Router, prompt: &str) -> String {
     let body = serde_json::json!({
         "model": MODEL,
         "messages": [{ "role": "user", "content": prompt }],
         "max_tokens": MAX_TOKENS,
+        "temperature": 0,
         "stream": false,
         "enable_thinking": false
     });
