@@ -14,7 +14,7 @@ use ignis_core::{RequestClass, RequestInput};
 use crate::api::{self, SamplingRequestFields};
 use crate::decoder::OutputDecoder;
 use crate::engine::RequestNotes;
-use crate::responses::events::{ResponseEvents, ResponseObject};
+use crate::responses::events::{wire_number, ResponseEvents, ResponseObject};
 use crate::template::{check_content_parts, check_roles, ChatMessage, FunctionIn, MessageContent, ToolCallIn};
 use crate::thinking::ThinkingRequestFields;
 use crate::toolcall::ToolSchemas;
@@ -214,11 +214,6 @@ pub(crate) async fn prepare(
     check_roles(&messages).map_err(api::template_rejection)?;
     check_content_parts(&messages, server.media.is_some()).map_err(api::content_rejection)?;
 
-    let params = req
-        .sampling
-        .clone()
-        .resolve(req.max_output_tokens, req.ignore_eos)
-        .map_err(api::invalid_sampling_parameter)?;
     let effort = req.reasoning_effort.clone().or_else(|| {
         req.reasoning.as_ref().and_then(|r| r.get("effort")).filter(|e| !e.is_null()).cloned()
     });
@@ -231,6 +226,11 @@ pub(crate) async fn prepare(
             chat_template_kwargs: req.chat_template_kwargs.as_ref(),
         },
     )?;
+    let params = req
+        .sampling
+        .clone()
+        .resolve(req.max_output_tokens, req.ignore_eos, thinking.enable_thinking, server.seedless_seed)
+        .map_err(api::invalid_sampling_parameter)?;
     let (params, budget_dropped) =
         api::with_thinking_budget(server, params, req.thinking_budget.as_ref(), effort.as_ref(), &thinking)?;
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
@@ -272,11 +272,11 @@ pub(crate) async fn prepare(
         previous_response_id: req.previous_response_id.as_ref().and_then(|id| id.as_str()).map(str::to_owned),
         reasoning: json!({ "effort": effort, "summary": null }),
         store: req.store.as_ref().and_then(JsonValue::as_bool).unwrap_or(true),
-        temperature: params.temperature,
+        temperature: wire_number(params.temperature),
         text: json!({ "format": { "type": "text" } }),
         tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
         tools: req.tools.clone().unwrap_or_default(),
-        top_p: params.top_p,
+        top_p: wire_number(params.top_p),
         truncation: "disabled",
         usage: None,
         metadata: req.metadata.clone().unwrap_or_else(|| json!({})),

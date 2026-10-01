@@ -137,6 +137,7 @@ async fn a_non_streaming_completion_returns_coherent_text_with_finish_reason_and
             { "role": "user", "content": "In one sentence, what is 2 + 2?" }
         ],
         "max_tokens": 32,
+        "temperature": 0,
         "stream": false,
         "enable_thinking": false
     });
@@ -179,6 +180,7 @@ async fn a_streaming_completion_emits_token_deltas_then_a_finish_reason_chunk() 
             { "role": "user", "content": "In one sentence, what is 2 + 2?" }
         ],
         "max_tokens": 32,
+        "temperature": 0,
         "stream": true,
         "enable_thinking": false
     });
@@ -235,6 +237,7 @@ async fn a_streaming_completions_first_chunk_arrives_before_generation_completes
             { "role": "user", "content": "Count from one to twenty, one number per line." }
         ],
         "max_tokens": 64,
+        "temperature": 0,
         "stream": true
     });
     let body = Body::from(req.to_string().into_bytes());
@@ -289,6 +292,7 @@ async fn a_streaming_completion_with_a_multi_thousand_token_prompt_finishes_cohe
             { "role": "user", "content": content }
         ],
         "max_tokens": 32,
+        "temperature": 0,
         "stream": true,
         "enable_thinking": false
     });
@@ -357,6 +361,7 @@ async fn a_streaming_completion_with_dflash2_speculation_finishes_with_stop() {
             { "role": "user", "content": "In one word, what is the capital of France?" }
         ],
         "max_tokens": 64,
+        "temperature": 0,
         "stream": true,
         "stream_options": { "include_usage": true },
         "enable_thinking": false
@@ -407,6 +412,7 @@ async fn a_thinking_disabled_request_returns_a_real_answer_with_no_reasoning() {
             { "role": "user", "content": "In one word, what is the capital of France?" }
         ],
         "max_tokens": 32,
+        "temperature": 0,
         "stream": false,
         "enable_thinking": false
     });

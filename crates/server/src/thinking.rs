@@ -306,12 +306,17 @@ pub fn parse_default_reasoning_effort(value: &str) -> Result<Option<ReasoningEff
 // The thinking budget (2026-09-24, `ignis_core::thinking_budget`)
 // ---------------------------------------------------------------------------
 
-/// What the scheduler forces once a request's thinking budget is spent: the
-/// hand-off sentence Qwen's model card closes a budgeted block with, then the
-/// block's end marker and the line break before the answer. It opens with a
-/// line break so that the one token of it a natural close can still pick up
-/// (the leaf's one-round lag) is whitespace.
-pub const THINKING_CLOSE_TEXT: &str = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n";
+/// What the scheduler forces once a request's thinking budget is spent: a
+/// hand-off sentence, then the block's end marker and the line break before
+/// the answer. It opens with a line break so that the one token of it a
+/// natural close can still pick up (the leaf's one-round lag) is whitespace.
+///
+/// The sentence tells the model to answer, not to keep working (spec
+/// server/12): the model card's own ("Considering the limited time by the
+/// user, I have to give the solution based on the thinking directly now.")
+/// left an agent in a tool loop deferring with one more tool call, turn
+/// after turn (`docs/findings/2026-10-01-a-close-that-answers.md`).
+pub const THINKING_CLOSE_TEXT: &str = "\n\nMy thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.\n</think>\n\n";
 
 /// The reasoning block's end marker.
 pub const THINK_END_TEXT: &str = "</think>";
@@ -786,6 +791,8 @@ mod tests {
         let close = thinking_close(encode).expect("close");
         assert_eq!(close.think_end(), 7);
         assert_eq!(close.tokens().iter().filter(|&&t| t == 7).count(), 1);
+        // What the scheduler forces is the close text tokenized whole.
+        assert_eq!(close.tokens(), &encode(THINKING_CLOSE_TEXT).unwrap()[..]);
         let split = |_: &str| -> Result<Vec<u32>, String> { Ok(vec![1, 2]) };
         assert!(thinking_close(split).unwrap_err().contains("not one"));
     }
@@ -831,6 +838,14 @@ mod tests {
         // A close to force: nothing to refuse.
         let close = ignis_core::thinking_budget::ThinkingClose::new(vec![1, 2], 2);
         assert_eq!(check_default_budget_close(Some(8192), &close), Ok(()));
+    }
+
+    #[test]
+    fn the_forced_close_tells_the_model_to_answer() {
+        // Spec server/12: the hand-off that answers rather than defers.
+        let sentence = "My thinking time is over. I must now write the complete final answer \
+                        from what I already have, without calling any more tools.";
+        assert_eq!(THINKING_CLOSE_TEXT, format!("\n\n{sentence}\n</think>\n\n"));
     }
 
     #[test]

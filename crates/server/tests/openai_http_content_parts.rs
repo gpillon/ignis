@@ -42,6 +42,7 @@ fn app() -> axum::Router {
         Box::new(SimpleTemplateProvider),
     )
     .with_request_timeout(Duration::from_secs(5))
+    .with_seedless_seed(0)
     .app()
 }
 

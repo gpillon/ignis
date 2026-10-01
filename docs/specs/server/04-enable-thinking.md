@@ -321,10 +321,13 @@ and is absent otherwise. Server/08 has the request-log attributes and the
 Prometheus counter.
 
 Once a request's budget is spent with the block open, the scheduler forces the
-model card's close, one token per round:
+close below, one token per round. Until spec server/12 it was the model
+card's own ("Considering the limited time by the user, I have to give the
+solution based on the thinking directly now."), which left agents in a tool
+loop deferring with one more tool call instead of answering:
 
 ```text
-\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n
+\n\nMy thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.\n</think>\n\n
 ```
 
 It is tokenized once at load with the artifact's tokenizer, and it uses the

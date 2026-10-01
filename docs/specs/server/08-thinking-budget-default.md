@@ -51,7 +51,7 @@ The server ships with a measured thinking budget on by default:
 15. As the project owner, I want the default and its evidence recorded in a finding, so that a later change of model or template re-measures instead of guessing.
 16. As a Playground user, I want the Playground's own requests to follow the same server default, so that what I try matches what agents get.
 17. As an API client, I want a budget on a request with thinking off to be inert rather than an error, so that one client configuration works for both modes.
-18. As an API client, I want the forced close text to be the model card's own hand-off, so that the answer that follows is written in the model's usual register.
+18. As an API client, I want the forced close text to be the model card's own hand-off, so that the answer that follows is written in the model's usual register. (Replaced by spec server/12: in an agent's tool loop that hand-off deferred with one more tool call instead of answering.)
 19. As a maintainer, I want the budget to keep forcing through the constrained-decode seam only, so that no new leaf entry point or second forcing mechanism exists.
 20. As a maintainer, I want the default to live in the server's configuration next to the thinking defaults, so that there is one place thinking policy is set.
 21. As an API client that only knows `reasoning_effort`, I want `reasoning_effort: "max"` to mean "reason as long as you need", so that I can ask for unbounded thinking without knowing the ignis budget field.

@@ -139,6 +139,7 @@ pub fn server(script: &Arc<Script>, config: SchedulerConfig, compute: Arc<dyn Co
     Server::new(Engine::new(Box::new(scheduler)), Box::new(Handle(Arc::clone(script))))
         .with_request_timeout(Duration::from_secs(5))
         .with_wall_clock(Arc::new(FixedClock::new(CREATED_AT_MS)))
+        .with_seedless_seed(0)
 }
 
 /// The events of a `text/event-stream` body: each `event:` line's name, and

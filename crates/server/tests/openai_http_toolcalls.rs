@@ -107,7 +107,8 @@ fn harness_with(template: RecordingTemplateProvider) -> Harness {
         compute,
     );
     let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(template))
-        .with_request_timeout(Duration::from_secs(5));
+        .with_request_timeout(Duration::from_secs(5))
+        .with_seedless_seed(0);
     Harness { app: server.app() }
 }
 

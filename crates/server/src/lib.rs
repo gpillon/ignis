@@ -127,6 +127,11 @@ pub struct Server {
     /// The wall clock a response's `created_at` is read from (a fixed clock
     /// keeps a test's events byte-for-byte reproducible).
     pub wall_clock: std::sync::Arc<dyn telemetry::TelemetryClock>,
+    /// The seed a request that sends none draws with: `None`, the default,
+    /// is a fresh one per request (spec server/12); a fixed one keeps a
+    /// test's mock token streams reproducible, as a fixed `wall_clock` keeps
+    /// its events.
+    pub seedless_seed: Option<u64>,
 }
 
 impl Server {
@@ -152,6 +157,7 @@ impl Server {
             next_fan_out: std::sync::Arc::default(),
             responses: std::sync::Arc::default(),
             wall_clock: std::sync::Arc::new(telemetry::SystemClock),
+            seedless_seed: None,
         }
     }
 
@@ -173,6 +179,13 @@ impl Server {
     /// is 30 s).
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Give every request that sends no `seed` this one, instead of a fresh
+    /// seed per request (see [`Server::seedless_seed`]).
+    pub fn with_seedless_seed(mut self, seed: u64) -> Self {
+        self.seedless_seed = Some(seed);
         self
     }
 

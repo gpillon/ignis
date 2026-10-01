@@ -10,7 +10,7 @@ export const MOCK_DEFAULT_THINKING_BUDGET = 6144;
 const U32_MAX = 4_294_967_295;
 
 /** What ignis writes into the reasoning when the budget closes it (thinking.rs), less the `</think>` the stream never shows. */
-export const FORCED_CLOSE_TEXT = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.";
+export const FORCED_CLOSE_TEXT = "\n\nMy thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.";
 
 export type MockBudget =
   | { ok: false; error: { message: string; type: "invalid_request_error"; param: "thinking_budget"; code: null } }

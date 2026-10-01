@@ -563,36 +563,99 @@ pub(crate) struct SamplingRequestFields {
     seed: Option<JsonValue>,
 }
 
+/// The values a request's unset sampling fields take (spec server/12).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SamplingDefaults {
+    pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: i64,
+    pub presence_penalty: f64,
+    pub frequency_penalty: f64,
+}
+
+/// The Qwen3.8 model card's thinking-mode sampling — also what the
+/// artifact's own `generation_config.json` declares (`do_sample: true`,
+/// 1.0 / 0.95 / 20).
+pub(crate) const THINKING_SAMPLING: SamplingDefaults = SamplingDefaults {
+    temperature: 1.0,
+    top_p: 0.95,
+    top_k: 20,
+    presence_penalty: 0.0,
+    frequency_penalty: 0.0,
+};
+
+/// The Qwen3.8 model card's instruct (non-thinking) sampling.
+pub(crate) const INSTRUCT_SAMPLING: SamplingDefaults = SamplingDefaults {
+    temperature: 0.7,
+    top_p: 0.8,
+    top_k: 20,
+    presence_penalty: 1.5,
+    frequency_penalty: 0.0,
+};
+
+/// What the unset fields of an explicitly greedy request (`temperature: 0`)
+/// take: the values greedy sampling does not read anyway.
+const GREEDY_NEUTRAL: SamplingDefaults = SamplingDefaults {
+    temperature: 0.0,
+    top_p: 1.0,
+    top_k: 0,
+    presence_penalty: 0.0,
+    frequency_penalty: 0.0,
+};
+
+/// A seed of the request's own, for a request that sent none: two identical
+/// seedless requests are two independent samples.
+fn fresh_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
+
 impl SamplingRequestFields {
     /// `ignore_eos` is an ignis extension for bounded measurement streams.
     /// It is refused without a `max_tokens`, because the two together are
     /// what keeps such a request bounded: with neither an EOS nor a cap,
     /// a non-streaming request has nothing left to stop it, and only the
     /// streaming path cancels on client disconnect.
-    pub(crate) fn resolve(self, max_tokens: Option<u32>, ignore_eos: bool) -> Result<DecodeParams, String> {
+    ///
+    /// `thinking` is the request's resolved `enable_thinking`: an unset field
+    /// takes the model card's value for that mode ([`THINKING_SAMPLING`],
+    /// [`INSTRUCT_SAMPLING`]), except on a request whose `temperature` is an
+    /// explicit 0, which is greedy and whose unset fields are neutral.
+    /// `seedless` is [`crate::Server::seedless_seed`]: the seed of a request
+    /// that sends none, a fresh one when `None`.
+    pub(crate) fn resolve(
+        self,
+        max_tokens: Option<u32>,
+        ignore_eos: bool,
+        thinking: bool,
+        seedless: Option<u64>,
+    ) -> Result<DecodeParams, String> {
+        let mode = if thinking { THINKING_SAMPLING } else { INSTRUCT_SAMPLING };
         let temperature = bounded_f32(
             "temperature",
-            number("temperature", self.temperature, 0.0)?,
+            number("temperature", self.temperature, mode.temperature)?,
             0.0,
             2.0,
         )?;
-        let top_p = bounded_f32("top_p", number("top_p", self.top_p, 1.0)?, 0.0, 1.0)?;
+        // No mode's temperature is 0, so a 0 here is the request's own.
+        let defaults = if temperature == 0.0 { GREEDY_NEUTRAL } else { mode };
+        let top_p = bounded_f32("top_p", number("top_p", self.top_p, defaults.top_p)?, 0.0, 1.0)?;
         let presence_penalty = bounded_f32(
             "presence_penalty",
-            number("presence_penalty", self.presence_penalty, 0.0)?,
+            number("presence_penalty", self.presence_penalty, defaults.presence_penalty)?,
             -2.0,
             2.0,
         )?;
         let frequency_penalty = bounded_f32(
             "frequency_penalty",
-            number("frequency_penalty", self.frequency_penalty, 0.0)?,
+            number("frequency_penalty", self.frequency_penalty, defaults.frequency_penalty)?,
             -2.0,
             2.0,
         )?;
         let top_k = signed_integer(
             "top_k is an ignis extension and must be an integer",
             self.top_k,
-            0,
+            defaults.top_k,
         )?;
         if !(0..=20).contains(&top_k) {
             return Err(format!(
@@ -628,7 +691,10 @@ impl SamplingRequestFields {
             frequency_penalty,
             // The leaf keys its counter-based RNG with all 64 bits. Casting
             // preserves the complete signed OpenAI seed domain bit-for-bit.
-            seed: signed_integer("seed must be a signed 64-bit integer", self.seed, 0)? as u64,
+            seed: match self.seed {
+                None => seedless.unwrap_or_else(fresh_seed),
+                seed => signed_integer("seed must be a signed 64-bit integer", seed, 0)? as u64,
+            },
             ignore_eos,
             thinking_budget: None,
         })
@@ -1279,10 +1345,6 @@ async fn chat_completions(
         Ok(stop) => stop,
         Err(message) => return bad_request_param(&message, "stop"),
     };
-    let params = match req.sampling.resolve(max_tokens, req.ignore_eos) {
-        Ok(params) => params,
-        Err(message) => return invalid_sampling_parameter(message),
-    };
     let thinking = match resolve_thinking(
         &server,
         ThinkingRequestFields {
@@ -1294,6 +1356,10 @@ async fn chat_completions(
     ) {
         Ok(t) => t,
         Err(response) => return response,
+    };
+    let params = match req.sampling.resolve(max_tokens, req.ignore_eos, thinking.enable_thinking, server.seedless_seed) {
+        Ok(params) => params,
+        Err(message) => return invalid_sampling_parameter(message),
     };
     let (params, budget_dropped) = match with_thinking_budget(
         &server,

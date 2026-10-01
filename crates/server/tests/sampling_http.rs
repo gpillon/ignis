@@ -1,4 +1,5 @@
-//! End-to-end HTTP coverage for P3-04's sampling surface (GitHub #101).
+//! End-to-end HTTP coverage for P3-04's sampling surface (GitHub #101)
+//! and its model-card defaults (spec server/12, GitHub #297).
 //!
 //! The test compute is the CPU stand-in for the GPU boundary (ADR 0006): it
 //! turns the `DecodeParams` it receives into a token id, so the response body
@@ -67,12 +68,16 @@ fn token_for(params: DecodeParams) -> u32 {
 }
 
 fn app() -> axum::Router {
+    app_over(Arc::new(SamplingEchoCompute::default()))
+}
+
+fn app_over(compute: Arc<dyn Compute>) -> axum::Router {
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
             ..SchedulerConfig::default()
         },
-        Arc::new(SamplingEchoCompute::default()),
+        compute,
     );
     Server::new(
         Engine::new(Box::new(scheduler)),
@@ -83,16 +88,7 @@ fn app() -> axum::Router {
 }
 
 async fn call(app: &axum::Router, body: Value) -> (u16, String) {
-    let request = axum::http::Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (status, String::from_utf8(bytes.to_vec()).unwrap())
+    call_at(app, "/v1/chat/completions", body).await
 }
 
 fn request(field: &str, value: Value, stream: bool) -> Value {
@@ -172,16 +168,165 @@ async fn seed_reaches_each_chat_completion_mode() {
     assert_parameter_reaches_compute("seed", json!(-9), 107).await;
 }
 
+/// The test compute for the defaults (spec server/12): it records the
+/// `DecodeParams` each request's first decode job carries, so a test reads
+/// back exactly what the API layer resolved.
+#[derive(Default)]
+struct RecordingCompute {
+    seen: Mutex<Vec<DecodeParams>>,
+    generated: Mutex<HashSet<RequestId>>,
+}
+
+impl Compute for RecordingCompute {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        Ok(PrefillOutcome::nothing_encoded(jobs.len()))
+    }
+
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        let mut generated = self.generated.lock().unwrap();
+        Ok(jobs
+            .iter()
+            .map(|job| {
+                if !generated.insert(job.request) {
+                    return DecodeOutcome::finished(FinishReason::Length);
+                }
+                self.seen.lock().unwrap().push(job.params);
+                DecodeOutcome::token(100)
+            })
+            .collect())
+    }
+}
+
+fn recording_app() -> (axum::Router, Arc<RecordingCompute>) {
+    let compute = Arc::new(RecordingCompute::default());
+    (app_over(compute.clone()), compute)
+}
+
+async fn call_at(app: &axum::Router, uri: &str, body: Value) -> (u16, String) {
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+/// The three request shapes every default must hold on: chat completions
+/// streaming and not, and `/v1/responses`. `fields` are merged into each.
+fn surfaces(fields: Value) -> Vec<(&'static str, &'static str, Value)> {
+    let chat = |stream: bool| {
+        json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 1,
+            "stream": stream,
+        })
+    };
+    let responses = json!({ "model": MODEL, "input": "hello", "max_output_tokens": 1 });
+    let mut out = vec![
+        ("chat", "/v1/chat/completions", chat(false)),
+        ("chat stream", "/v1/chat/completions", chat(true)),
+        ("responses", "/v1/responses", responses),
+    ];
+    for (_, _, body) in &mut out {
+        for (key, value) in fields.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+    }
+    out
+}
+
+/// What one request resolved to, read back from the recording compute.
+async fn resolved(uri: &str, body: Value) -> DecodeParams {
+    let (app, compute) = recording_app();
+    let (status, response) = call_at(&app, uri, body).await;
+    assert_eq!(status, 200, "{uri}: {response}");
+    let seen = compute.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "{uri}: one decode job");
+    seen[0]
+}
+
+/// (temperature, top_p, top_k, presence_penalty, frequency_penalty)
+fn sampling(params: &DecodeParams) -> (f32, f32, i32, f32, f32) {
+    (
+        params.temperature,
+        params.top_p,
+        params.top_k,
+        params.presence_penalty,
+        params.frequency_penalty,
+    )
+}
+
 #[tokio::test]
-async fn absent_sampling_parameters_preserve_greedy_fixed_seed_defaults() {
-    let body = json!({
-        "model": MODEL,
-        "messages": [{ "role": "user", "content": "hello" }],
-        "max_tokens": 1,
-    });
-    let (status, response) = call(&app(), body).await;
-    assert_eq!(status, 200, "{response}");
-    assert_eq!(content(&response, false), "100");
+async fn absent_sampling_takes_the_model_cards_thinking_row() {
+    for (name, uri, body) in surfaces(json!({})) {
+        let params = resolved(uri, body).await;
+        assert_eq!(sampling(&params), (1.0, 0.95, 20, 0.0, 0.0), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn absent_sampling_without_thinking_takes_the_model_cards_instruct_row() {
+    for (name, uri, body) in surfaces(json!({ "enable_thinking": false })) {
+        let params = resolved(uri, body).await;
+        assert_eq!(sampling(&params), (0.7, 0.8, 20, 1.5, 0.0), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_field_replaces_only_its_own_default() {
+    for (fields, expected) in [
+        (json!({ "temperature": 0.6 }), (0.6, 0.95, 20, 0.0, 0.0)),
+        (json!({ "top_p": 0.5 }), (1.0, 0.5, 20, 0.0, 0.0)),
+        (json!({ "top_k": 5 }), (1.0, 0.95, 5, 0.0, 0.0)),
+        (json!({ "presence_penalty": 0.4 }), (1.0, 0.95, 20, 0.4, 0.0)),
+        (
+            json!({ "enable_thinking": false, "presence_penalty": 0.0 }),
+            (0.7, 0.8, 20, 0.0, 0.0),
+        ),
+    ] {
+        for (name, uri, body) in surfaces(fields.clone()) {
+            let params = resolved(uri, body).await;
+            assert_eq!(sampling(&params), expected, "{name}: {fields}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_zero_temperature_is_greedy_with_neutral_filters() {
+    for thinking in [true, false] {
+        let fields = json!({ "temperature": 0, "enable_thinking": thinking });
+        for (name, uri, body) in surfaces(fields) {
+            let params = resolved(uri, body).await;
+            assert_eq!(sampling(&params), (0.0, 1.0, 0, 0.0, 0.0), "{name}, thinking={thinking}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn top_p_without_temperature_is_served() {
+    // What opencode sends for a model that does not declare temperature
+    // support: top_p and top_k, no temperature (spec server/12).
+    for (name, uri, body) in surfaces(json!({ "top_p": 0.95, "top_k": 20 })) {
+        let params = resolved(uri, body).await;
+        assert_eq!(sampling(&params), (1.0, 0.95, 20, 0.0, 0.0), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn seedless_requests_draw_seeds_of_their_own() {
+    for (name, uri, body) in surfaces(json!({})) {
+        let first = resolved(uri, body.clone()).await;
+        let second = resolved(uri, body).await;
+        assert_ne!(first.seed, second.seed, "{name}: two seedless requests share a seed");
+    }
+    for (name, uri, body) in surfaces(json!({ "seed": 9 })) {
+        assert_eq!(resolved(uri, body).await.seed, 9, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -256,23 +401,28 @@ async fn nonzero_values_that_underflow_f32_are_rejected_not_ignored() {
 }
 
 #[tokio::test]
-async fn stochastic_only_settings_are_refused_when_greedy_would_ignore_them() {
+async fn stochastic_only_settings_are_refused_when_explicit_greedy_would_ignore_them() {
     for (field, value) in [
         ("top_p", json!(0.7)),
         ("top_k", json!(7)),
         ("presence_penalty", json!(0.4)),
         ("frequency_penalty", json!(-0.4)),
     ] {
-        let (status, body) = call(&app(), request(field, value, false)).await;
-        assert_eq!(status, 400, "{field}: {body}");
-        let error: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(error["error"]["code"], "invalid_sampling_parameter");
-        assert!(
-            error["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("temperature must be greater than 0")
-        );
+        let mut fields = json!({ "temperature": 0 });
+        fields[field] = value;
+        for (name, uri, body) in surfaces(fields) {
+            let (status, body) = call_at(&app(), uri, body).await;
+            assert_eq!(status, 400, "{name}, {field}: {body}");
+            let error: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(error["error"]["code"], "invalid_sampling_parameter", "{name}, {field}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("temperature must be greater than 0"),
+                "{name}, {field}: {body}"
+            );
+        }
     }
 }
 
