@@ -55,10 +55,52 @@ per the rule below.
     `{"x":` of a head `point`) is unchanged and stays last.
 
 Under L1 every question over one state shares the state whatever its kind,
-and spec 16's fan-out head reaches through it.
+up to the **page floor**: spec 16's fan-out head reaches through a text
+state, and through an image only when what its questions share after the
+image crosses the next KV page boundary.
+
+`locate` already renders this way (`QuestionKind::system_text` returns nothing
+for it and its kind text leads the user turn), measured GO in spec 18/19, so
+L1 is not new to this model; the readout and pointing kinds are what is
+unmeasured.
+
+### What layout alone cannot share (amended 2026-09-30)
+
+A shared prefix is whole KV pages and never ends inside a media item (#193,
+`Multimodal::floor_outside_media`). Under L1 the questions' common prefix
+ends where the kind text begins — right after the state. When the state
+ends with an image, the head's page floor lands inside that image and walks
+back to before it, so every question prefills the image again: the same
+cost as L0. Pinned today, on L0, by
+`crates/server/tests/decide_reuse_boundaries.rs::a_head_that_would_end_inside_an_image_stops_before_it`;
+L1 moves the divergence point, not the rule.
+
+So L1 shares:
+
+- a **JSON state** (the evidence ends before the ask, inside the text);
+- a parts state whose **last part is text** of a page or more, or whose
+  image happens to end within the page the shared text after it fills;
+- **not** the short `[one line][image]` state this spec's problem statement
+  leads with (the game agent's eyes and second stage), whatever the
+  accuracy result.
+
+Closing that last case is engine work, not layout: a fan-out head that ends
+exactly at the state's end — whole pages shared, the partial tail page
+copied, the GDN state kept there. The engine has that shape only for a
+chat's generation opener (`CheckpointClaim`, ADR 0029), refused for
+decisions (#238), with `seq_checkpoint.cu` demanding that the pages below
+be exactly the shared prefix. Out of scope here; its payoff for the game
+agent is its second stage and eyes only (the first stage is one question),
+and whether it is worth building is the owner's call after this spec's
+cost measurement.
 
 ## Implementation Decisions
 
+- **Cost first, on the CPU.** Before any GPU time: an L1 rendering behind a
+  test-only switch and a mock-engine test of what a `choice` + `point`
+  fan-out prefills over `[one line][image]` (expected: the image twice) and
+  over `[2 pages of text]` (expected: once). If the text case does not share
+  either, the accuracy run below is not worth its GPU time.
 - **Pre-registered rule.** First run L0 twice on every set below to measure
   run-to-run noise per metric. L1 becomes the default layout **iff**, on
   every set, it is no worse than L0 by more than that noise. Otherwise L0
@@ -83,9 +125,13 @@ and spec 16's fan-out head reaches through it.
 1. L0's noise and L1's numbers on every set are recorded as a finding with a
    README row, whichever way the rule goes.
 2. If the rule adopts L1 (for all kinds or a family): it is the default
-   rendering, the prompt-pinning tests pin the new bytes, and a `choice` +
-   `point` fan-out over one image state prefills the state once (asserted on
-   prefill token counts, as spec 16 does).
+   rendering, the prompt-pinning tests pin the new bytes, and, asserted on
+   prefill token counts as spec 16 does:
+   - a `choice` + `point` fan-out over a JSON state, or over a parts state
+     ending in a page or more of text, prefills the state once;
+   - the same fan-out over `[one line][image]` still prefills the image per
+     question, pinned by a test that names the page floor as the reason (the
+     limit stays visible until the engine work above lands).
 3. If it does not, nothing in the rendering changes.
 4. ADR 0034 (and `CONTEXT.md` if a term moves) record the outcome.
 5. `cargo test` passes workspace-wide.
