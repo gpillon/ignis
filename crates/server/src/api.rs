@@ -1040,15 +1040,16 @@ pub(crate) fn finish_reason_str(reason: FinishReason) -> &'static str {
     }
 }
 
+/// What a request the engine ended with [`FinishReason::Error`] is told, on
+/// every surface: the non-streaming `500`, the streaming error chunk, and the
+/// Responses `failed` event.
+pub(crate) const ENGINE_ERROR_MESSAGE: &str =
+    "the engine could not run the request (its prefill failed); see the server log";
+
 /// The `500` a non-streaming request gets when the engine ended it with
 /// [`FinishReason::Error`] (GitHub #166): there is no completion to return.
 fn engine_error_response() -> Response {
-    error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "engine_error",
-        "engine_error",
-        "the engine could not run the request (its prefill failed repeatedly); see the server log",
-    )
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", "engine_error", ENGINE_ERROR_MESSAGE)
 }
 
 /// The OpenAI `finish_reason`, tool-calls aware (GitHub #121). A generation
@@ -1234,7 +1235,7 @@ struct StreamOptions {
     summary = "A chat completion, streaming or not",
     description = "The OpenAI chat-completions contract, plus what ignis adds to it: `top_k`, `ignore_eos`, the thinking controls (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs`, `thinking_budget`), and the `class` lane tag the scheduler admits under.
 
-`stream: false` answers one JSON body. `stream: true` answers `text/event-stream`: one `data:` line per chunk in the `chat.completion.chunk` shape, a final chunk carrying `finish_reason` and an empty `delta`, then a literal `data: [DONE]` line. With `stream_options.include_usage: true` a usage-only chunk (empty `choices`) precedes it.
+`stream: false` answers one JSON body. `stream: true` answers `text/event-stream`: one `data:` line per chunk in the `chat.completion.chunk` shape, a final chunk carrying `finish_reason` and an empty `delta`, then a literal `data: [DONE]` line. With `stream_options.include_usage: true` a usage-only chunk (empty `choices`) precedes it. A request the engine could not run ends instead with one `{\"error\": {message, type, code}}` chunk (type and code `engine_error`) and then `[DONE]`: the status is already 200 by then.
 
 Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text.
 
@@ -2190,6 +2191,17 @@ impl Stream for ChunkStream {
                         let (pieces, mid_call) = this.pipeline.finish();
                         this.queue_pieces(pieces);
                         let reason = this.pipeline.ended(reason);
+                        // GitHub #296: an engine error is OpenAI's error
+                        // chunk, and nothing else, ahead of `[DONE]`. The
+                        // status went out as 200 when the stream began, so
+                        // this is what tells a client the request failed;
+                        // a finish chunk after it would hand the client a
+                        // `finish_reason` OpenAI does not define, which
+                        // clients read as an unknown finish and retry.
+                        if reason == FinishReason::Error {
+                            this.pending.push_back(engine_error_chunk());
+                            continue;
+                        }
                         let finish_reason = resolve_finish_reason(reason, this.pipeline.any_calls(), mid_call);
                         this.queue_finish(finish_reason, thinking.and_then(|b| b.forced_at), tokens);
                     }
@@ -2209,6 +2221,21 @@ impl Stream for ChunkStream {
 }
 
 // ── the error envelope ───────────────────────────────────────────────────
+
+/// The SSE event a chat stream ends with when the engine ended its request
+/// with [`FinishReason::Error`] (GitHub #296): the same `{"error": {...}}`
+/// body the non-streaming `500` carries.
+fn engine_error_chunk() -> Event {
+    let body = ApiError {
+        error: ErrorBody {
+            message: ENGINE_ERROR_MESSAGE.into(),
+            r#type: "engine_error".into(),
+            code: "engine_error".into(),
+            param: None,
+        },
+    };
+    Event::default().data(serde_json::to_string(&body).expect("the error body serializes"))
+}
 
 /// The OpenAI error body (`{"error": {...}}`). Every failure on this
 /// surface answers in this shape, `/v1/decide` included.

@@ -129,6 +129,19 @@ describe("streamChatCompletions", () => {
     expect(result.timeline.firstTokenAt).toBeDefined();
   });
 
+  it("reports a stream the engine ended with an error chunk as failed, with the engine's message (GitHub #296)", async () => {
+    const error = JSON.stringify({ error: { message: "the engine could not run the request", type: "engine_error", code: "engine_error" } });
+    const events: ChunkEvent[] = [];
+    const result = await streamChatCompletions({
+      body: {},
+      fetch: fakeFetch([`data: ${error}\n\n`, "data: [DONE]\n\n"]),
+      now: ticking(),
+      onEvent: (e) => events.push(e),
+    });
+    expect(result).toMatchObject({ ok: false, message: "the engine could not run the request" });
+    expect(events).toEqual([{ kind: "done" }]);
+  });
+
   it("returns the API error without streaming", async () => {
     const body = JSON.stringify({ error: { message: "messages must be non-empty", type: "invalid_request_error", code: null } });
     const result = await streamChatCompletions({ body: {}, fetch: fakeFetch([body], 400), now: ticking(), onEvent: () => {} });

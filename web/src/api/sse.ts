@@ -19,6 +19,12 @@ export type ChunkEvent =
    */
   | { kind: "finish"; reason: string; thinkingForcedAt?: number }
   | { kind: "usage"; usage: Usage }
+  /**
+   * The engine could not run the request (GitHub #296): an OpenAI error
+   * chunk, sent in place of the finish chunk because the status was already
+   * 200 when the stream began.
+   */
+  | { kind: "error"; message: string }
   | { kind: "done" };
 
 /** Buffers text reads and yields the `data` of each complete event. */
@@ -55,6 +61,7 @@ type WireChunk = {
     thinking_budget_forced_at?: unknown;
   }[];
   usage?: Usage | null;
+  error?: { message?: unknown };
 };
 
 /** What one `chat.completion.chunk` payload (or `[DONE]`) carries. */
@@ -65,6 +72,10 @@ export function parseChunk(data: string): ChunkEvent[] {
     chunk = JSON.parse(data) as WireChunk;
   } catch {
     return [];
+  }
+  if (chunk.error) {
+    const message = typeof chunk.error.message === "string" ? chunk.error.message : "the engine could not run the request";
+    return [{ kind: "error", message }];
   }
   const events: ChunkEvent[] = [];
   for (const choice of chunk.choices ?? []) {

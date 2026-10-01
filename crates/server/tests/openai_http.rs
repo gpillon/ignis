@@ -473,6 +473,52 @@ async fn chat_completions_streaming_emits_chunks_then_done() {
     assert_eq!(streamed_content, rendered(&expected_tokens));
 }
 
+/// A backend whose every prefill fails: the scheduler ends the request with
+/// `FinishReason::Error` after its retries (GitHub #166).
+struct FailingPrefill(MockCompute);
+
+impl Compute for FailingPrefill {
+    fn prefill_step(&self, _jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.0.decode_step(jobs)
+    }
+    fn release(&self, request: RequestId) {
+        self.0.release(request);
+    }
+}
+
+/// GitHub #296 — an engine error on a stream is an OpenAI error chunk, not a
+/// `finish_reason` OpenAI does not define: the status is already 200 when
+/// prefill fails, so the error chunk is the one thing a client (the AI SDK's
+/// OpenAI-compatible provider, among others) reads as a failed request
+/// rather than a finish it does not recognise and retries.
+#[tokio::test]
+async fn a_streaming_engine_error_is_an_error_chunk_then_done() {
+    let h = harness_over(Arc::new(FailingPrefill(MockCompute::new())));
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": 3,
+        "stream": true,
+        "stream_options": { "include_usage": true }
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "the stream had begun: {body}");
+    let data_lines: Vec<String> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:").map(|s| s.trim().to_string()))
+        .collect();
+    assert_eq!(data_lines.len(), 2, "the error chunk, then [DONE]: {body}");
+    assert_eq!(data_lines[1], "[DONE]");
+    let error: serde_json::Value = serde_json::from_str(&data_lines[0]).unwrap();
+    assert_eq!(error["error"]["type"], "engine_error", "{body}");
+    assert_eq!(error["error"]["code"], "engine_error", "{body}");
+    assert!(error["error"]["message"].as_str().is_some_and(|m| !m.is_empty()), "{body}");
+    assert!(error.get("choices").is_none(), "no finish chunk rides with it: {body}");
+}
+
 #[tokio::test]
 async fn chat_completions_streaming_with_include_usage_appends_a_usage_chunk() {
     let h = harness();
