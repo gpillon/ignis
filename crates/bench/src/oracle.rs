@@ -53,6 +53,31 @@ pub struct FixturePrompt {
     pub text: String,
     /// `text` tokenized with the artifact's tokenizer.
     pub token_ids: Vec<u32>,
+    /// The teacher-forced argmax expected at each position of `token_ids`,
+    /// when it is not the next fed token: Flash-Next's fixture feeds fixed
+    /// canary text and expects the quantized reference's argmax (spec
+    /// flash-next/04, ADR 0043). Absent, each fed token is its own expected
+    /// token (ADR 0014), which is the 27B's fixture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_argmax: Option<Vec<u32>>,
+}
+
+impl FixturePrompt {
+    /// The token each teacher-forced position is scored against: the
+    /// expected-argmax column when the fixture has one, else the fed tokens.
+    /// A column that does not have one entry per fed token is refused.
+    pub fn expected_tokens(&self) -> Result<&[u32], String> {
+        match &self.expected_argmax {
+            None => Ok(&self.token_ids),
+            Some(expected) if expected.len() == self.token_ids.len() => Ok(expected),
+            Some(expected) => Err(format!(
+                "canary {}: {} expected tokens for {} fed tokens",
+                self.id,
+                expected.len(),
+                self.token_ids.len()
+            )),
+        }
+    }
 }
 
 /// The canary oracle fixture: `oracle record`'s output, `oracle compare`'s
@@ -139,6 +164,7 @@ pub fn record(
             prompt: c.prompt.to_string(),
             text: outcome.output,
             token_ids,
+            expected_argmax: None,
         });
     }
     Ok(Fixture { model, max_tokens, prompts })
@@ -333,6 +359,18 @@ pub fn score_teacher_forced(
     }
 }
 
+/// Score one fixture canary teacher-forced: `predictions[i]` is the engine's
+/// argmax after being fed the canary's `token_ids[..i]`, judged against
+/// [`FixturePrompt::expected_tokens`]. Without an expected-argmax column this
+/// is [`score_teacher_forced`] on the fed tokens, exactly.
+pub fn score_canary(
+    prompt: &FixturePrompt,
+    predictions: &[u32],
+    first_n: usize,
+) -> Result<TeacherForcedResult, String> {
+    Ok(score_teacher_forced(&prompt.id, prompt.expected_tokens()?, predictions, first_n))
+}
+
 /// The suite's overall teacher-forced agreement: total matches over total
 /// scored positions (not a per-canary average — a canary with more scored
 /// positions weighs proportionally more). This is the figure
@@ -401,6 +439,7 @@ mod tests {
                 prompt: "what does main do?".into(),
                 text: "it prints hi".into(),
                 token_ids: vec![1, 2, 3],
+                expected_argmax: None,
             }],
         };
         let json = fixture.to_json().expect("serialize");
@@ -422,6 +461,7 @@ mod tests {
                 prompt: "2*3+4".into(),
                 text: "10".into(),
                 token_ids: vec![7],
+                expected_argmax: None,
             }],
         };
         fixture.write(&path).expect("write the fixture");
@@ -503,8 +543,8 @@ mod tests {
             model: "ref".into(),
             max_tokens: 8,
             prompts: vec![
-                FixturePrompt { id: "a".into(), prompt: "pa".into(), text: "ta".into(), token_ids: vec![1, 2] },
-                FixturePrompt { id: "b".into(), prompt: "pb".into(), text: "tb".into(), token_ids: vec![3, 4] },
+                FixturePrompt { id: "a".into(), prompt: "pa".into(), text: "ta".into(), token_ids: vec![1, 2], expected_argmax: None },
+                FixturePrompt { id: "b".into(), prompt: "pb".into(), text: "tb".into(), token_ids: vec![3, 4], expected_argmax: None },
             ],
         };
         let candidate = Fixture {
@@ -515,6 +555,7 @@ mod tests {
                 prompt: "pa".into(),
                 text: "ta".into(),
                 token_ids: vec![1, 2],
+                expected_argmax: None,
             }],
         };
         let err = compare_fixtures(&oracle, &candidate, 8)
@@ -524,7 +565,7 @@ mod tests {
         let candidate_complete = Fixture {
             prompts: vec![
                 oracle.prompts[0].clone(),
-                FixturePrompt { id: "b".into(), prompt: "pb".into(), text: "tb".into(), token_ids: vec![3, 9] },
+                FixturePrompt { id: "b".into(), prompt: "pb".into(), text: "tb".into(), token_ids: vec![3, 9], expected_argmax: None },
             ],
             ..candidate
         };
@@ -684,5 +725,85 @@ mod tests {
         let overall = overall_teacher_forced_agreement(&results);
         assert_eq!(overall, 99.0 / 102.0);
         assert!(meets_g1_floor(overall), "99/102 = 97.1% clears the 95% floor");
+    }
+
+    // ── the expected-argmax column (spec flash-next/04) ───────────────────
+
+    fn canary(token_ids: Vec<u32>, expected_argmax: Option<Vec<u32>>) -> FixturePrompt {
+        FixturePrompt {
+            id: "c".into(),
+            prompt: "p".into(),
+            text: "t".into(),
+            token_ids,
+            expected_argmax,
+        }
+    }
+
+    fn committed_oracle_fixture() -> (String, Fixture) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("oracle_canary.json");
+        let text = std::fs::read_to_string(&path).expect("read the committed oracle fixture");
+        let fixture = Fixture::from_json(&text).expect("parse the committed oracle fixture");
+        (text, fixture)
+    }
+
+    /// The 27B's committed fixture carries no expected column, writes back
+    /// without one, and every canary scores exactly as `score_teacher_forced`
+    /// on its own tokens does, for a full match, a mismatch and a short run.
+    #[test]
+    fn the_27b_fixture_has_no_expected_column_and_scores_exactly_as_before() {
+        let (text, fixture) = committed_oracle_fixture();
+        assert!(!fixture.prompts.is_empty());
+        let original: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fixture.to_json().expect("serialize")).expect("json");
+        assert_eq!(rewritten, original, "the fixture writes back exactly as recorded");
+        for prompt in &fixture.prompts {
+            assert_eq!(prompt.expected_argmax, None, "{}", prompt.id);
+            let mut flipped = prompt.token_ids.clone();
+            flipped[1] = flipped[1].wrapping_add(1);
+            let short = &prompt.token_ids[..prompt.token_ids.len() / 2];
+            for predictions in [prompt.token_ids.as_slice(), flipped.as_slice(), short] {
+                let before = score_teacher_forced(&prompt.id, &prompt.token_ids, predictions, 32);
+                assert_eq!(score_canary(prompt, predictions, 32), Ok(before), "{}", prompt.id);
+            }
+        }
+    }
+
+    /// With the column, a position is judged against the expected argmax,
+    /// not against the token the harness fed next.
+    #[test]
+    fn an_expected_column_is_what_the_predictions_are_scored_against() {
+        let prompt = canary(vec![10, 11, 12, 13], Some(vec![10, 99, 12, 98]));
+        let result = score_canary(&prompt, &[10, 99, 12, 13], 32).expect("score");
+        assert_eq!((result.compared, result.agree), (4, 3));
+        assert_eq!(
+            result.mismatches,
+            vec![TeacherForcedMismatch { position: 3, expected: 98, predicted: Some(13) }]
+        );
+        assert_eq!(prompt.expected_tokens(), Ok(&[10, 99, 12, 98][..]));
+    }
+
+    /// One expected token per fed token: a column of another length is a
+    /// recorder bug, refused rather than truncated.
+    #[test]
+    fn an_expected_column_of_another_length_is_refused() {
+        let prompt = canary(vec![10, 11, 12], Some(vec![10, 11]));
+        let err = score_canary(&prompt, &[10, 11, 12], 32).unwrap_err();
+        assert!(err.contains("2 expected") && err.contains("3 fed"), "{err}");
+    }
+
+    #[test]
+    fn an_expected_column_round_trips_and_an_absent_one_stays_absent() {
+        let with = Fixture { model: "flash-next".into(), max_tokens: 32, prompts: vec![canary(vec![1, 2], Some(vec![3, 4]))] };
+        let json = with.to_json().expect("serialize");
+        assert!(json.contains("expected_argmax"));
+        assert_eq!(Fixture::from_json(&json).expect("parse"), with);
+        let without = Fixture { model: "qwen".into(), max_tokens: 32, prompts: vec![canary(vec![1, 2], None)] };
+        let json = without.to_json().expect("serialize");
+        assert!(!json.contains("expected_argmax"), "{json}");
+        assert_eq!(Fixture::from_json(&json).expect("parse"), without);
     }
 }

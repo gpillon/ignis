@@ -50,7 +50,7 @@ use ignis_core::step::prefill_program;
 
 use ignis_bench::oracle::{
     Fixture, G1_AGREEMENT_FLOOR, TeacherForcedResult, meets_g1_floor,
-    overall_teacher_forced_agreement, score_teacher_forced,
+    overall_teacher_forced_agreement, score_canary,
 };
 
 use ignis_server::artifact_template::ArtifactTemplateProvider;
@@ -225,7 +225,10 @@ fn teacher_forced_canary_agreement_meets_the_g1_floor() {
             position += 1;
         }
 
-        let result = score_teacher_forced(&canary.id, &canary.token_ids, &predictions, FIRST_N);
+        // Scored against the fixture's expected-argmax column when it has one
+        // (spec flash-next/04), else against the fed tokens, as ADR 0014 scores.
+        let result = score_canary(canary, &predictions, FIRST_N)
+            .unwrap_or_else(|e| panic!("{}: {e}", canary.id));
         for m in &result.mismatches {
             eprintln!(
                 "G1 {} position {}: mismatch -- ours={:?} oracle={}",
