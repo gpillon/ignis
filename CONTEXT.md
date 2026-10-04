@@ -6,7 +6,8 @@ When output names a domain concept, use the term as defined here.
 ## Engine & process
 
 - **ignis** — the Rust inference engine for Qwen 3.8-27B on a single RTX 5090 (SM120a).
-  Deliberately specialized: one model family, one GPU class.
+  Deliberately specialized: one model family, one GPU class. ADR 0043
+  adds a second model, **Flash-Next**, one loaded at a time.
 - **Kernel leaf** — the C++/CUDA compute library linked into ignis behind a C ABI.
   The forward pass and all GPU compute live here; Rust owns everything above the
   **step** — scheduling, KV accounting, serving (ADR 0009).
@@ -109,6 +110,36 @@ When output names a domain concept, use the term as defined here.
 - **Fused plane** — a single stored tensor holding several projections stacked
   by row (e.g. `attention/query_key_gate_value`, `mlp/gate_up`). Its row order
   is part of the artifact contract, not a guess.
+
+## Flash-Next (specs `flash-next/01-06`, ADRs 0043-0044)
+
+- **Flash-Next** — Qwen3.8-Flash-Next, the second model: 125B mixture of
+  experts, 6B active, 48 layers in 12 blocks of 3 GDN + 1 QSA, hidden 2560.
+  Served from its own artifact, selected at start; never loaded beside the 27B.
+- **Expert** — one of a layer's 512 routed SwiGLU MLPs (2560 → 640 → 2560);
+  the **router** picks 10 per token. The **shared expert** runs for every
+  token, gated by a sigmoid.
+- **Expert projection** — an expert's fused gate/up plane or its down plane:
+  the unit the artifact stores contiguously and residency moves.
+- **K** — an expert projection's bit width in the trellis format, one of
+  2, 2.5, 3, 4, chosen per expert by **allocation** on calibration distortion
+  (mean 2.5 bits per weight).
+- **K class** — expert projections of one shape and one K, hence one byte
+  size: eight classes, each with its own slot pool in the expert cache.
+- **Expert pool** — every expert projection, in pinned host RAM for the life of
+  the load.
+- **Expert cache** — the fixed-size VRAM slot pools that hold the projections
+  in use, replaced least-recently-used; a plan line at load.
+- **Router lookahead** — the next layer's router applied to this layer's MoE
+  input to prefetch its likely experts into the cache.
+- **QSA layer** — Flash-Next's attention layer: GQA 24 query / 2 KV heads of
+  256 with an **indexer** that, above 2051 tokens, selects the key blocks the
+  attention reads (sparse); dense below.
+- **Hyper-connection streams** — Flash-Next's residual: four streams per token,
+  each sublayer reading a learned mix and writing back through a gated residual.
+- **N-gram table** — Flash-Next's hashed n-gram embedding table (320M rows,
+  INT4), a **host-streamed** object: read row by row from NVMe through a RAM
+  hot-row cache, never materialized on the device.
 
 ## Weights & artifact
 
