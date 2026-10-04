@@ -31,7 +31,7 @@
   </tr>
 </table>
 
-<p align="center"><sub>Measured on one RTX 5090. How, and against what: <a href="#how-fast">How fast</a>.</sub></p>
+<p align="center"><sub>Measured on one RTX 5090, 64 GB DDR4-3200 MT/s, PCIe 3.0. How, and against what: <a href="#how-fast">How fast</a>.</sub></p>
 
 ---
 
