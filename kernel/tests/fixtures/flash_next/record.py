@@ -35,7 +35,7 @@ bit-exact against `reconstruct` before anything is written.
 Container format (IGNFX001), little-endian: the 8-byte magic, then records until EOF, each
   u32 name_len, name (utf-8), u32 dtype, u32 ndim, u64 dims[ndim], u64 nbytes, payload.
 dtype codes: 0 u8, 1 i16, 2 u16, 3 i32, 4 f16, 5 bf16 (as u16 bits), 6 f32, 7 f64, 8 u32, 9 u64.
-kernel/tests/flash_next_fixture.h reads it.
+kernel/tests/moe_fixture.h reads it.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEV = torch.device("cuda:0")
 
 # ---------------------------------------------------------------------------------------------
-# Counter hash shared with the C++ tests (kernel/tests/flash_next_fixture.h): lowbias32 of
+# Counter hash shared with the C++ tests (kernel/tests/moe_fixture.h): lowbias32 of
 # (i * 0x9E3779B9 + stream * 0x85EBCA6B) mod 2^32. Vectorized in int64 with explicit masking.
 
 M32 = 0xFFFFFFFF

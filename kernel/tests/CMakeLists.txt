@@ -554,3 +554,19 @@ add_test(NAME ignis_kernel_seq_prefix_test COMMAND ignis_kernel_seq_prefix_test)
 add_executable(ignis_kernel_seq_checkpoint_test test_seq_checkpoint.cpp)
 target_link_libraries(ignis_kernel_seq_checkpoint_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_seq_checkpoint_test COMMAND ignis_kernel_seq_checkpoint_test)
+
+# --- Flash-Next MoE ops (spec flash-next/02, GitHub #300): OURS -------------------------------
+#
+# Every op in kernel/include/ignis_moe.h is our own implementation (ADR 0043). The fixtures
+# under fixtures/flash_next/ were recorded once from exllamav3's `reconstruct` and the
+# checkpoint's transformers router by fixtures/flash_next/record.py; the tests read them through
+# an absolute path baked in at configure time. Same no-SKIP_RETURN_CODE rule as every other GPU
+# test here (ADR 0006).
+set(IGNIS_FLASH_NEXT_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next")
+foreach(name IN ITEMS trellis_decode moe_router)
+  add_executable(ignis_kernel_${name}_test test_${name}.cu)
+  target_compile_definitions(ignis_kernel_${name}_test PRIVATE
+    IGNIS_FLASH_NEXT_FIXTURE_DIR="${IGNIS_FLASH_NEXT_FIXTURE_DIR}")
+  target_link_libraries(ignis_kernel_${name}_test PRIVATE ignis_kernel ignis_vendor)
+  add_test(NAME ignis_kernel_${name}_test COMMAND ignis_kernel_${name}_test)
+endforeach()
