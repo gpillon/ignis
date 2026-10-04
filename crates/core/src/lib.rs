@@ -56,6 +56,7 @@ pub mod pointing;
 pub mod prefix;
 pub mod constrained;
 pub mod request;
+pub mod residency;
 pub mod retained_slot;
 pub mod rope_scaling;
 pub mod scheduler;
