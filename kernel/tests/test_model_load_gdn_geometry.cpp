@@ -4,8 +4,9 @@
 // The 27B has 48 GDN layers and 48 GDN value heads, so a binder that sized the
 // per-head GDN parameters (`gdn/a_log`, `gdn/dt_bias`, the gated norm's width)
 // by the layer count bound it anyway. Flash-Next has 36 GDN layers of 48 value
-// heads, and the same binder refuses it. This pins the binder to the
-// value-head count, with the layer count checked against the layer kinds.
+// heads, and the same binder refused it. This pins the binder to the
+// value-head count (`ignis_topology::gdn_value_heads`), with the layer count
+// checked against the layer kinds, and the family's refusals beside them.
 //
 // Host-only by construction: `ignis_model_plan_reservations` allocates nothing,
 // and every arm below fails at binding -- the arms that bind every layer prove
@@ -87,6 +88,7 @@ Topology topology_of(const Geometry &g) {
   t.raw.gdn_state_rows   = g.value_heads * kGdnHeadDim;
   t.raw.gdn_state_cols   = g.key_heads * kGdnHeadDim;
   t.raw.gdn_num_layers   = g.gdn_layers;
+  t.raw.gdn_value_heads  = g.value_heads;
   t.raw.gdn_q_width      = g.key_heads * kGdnHeadDim;
   t.raw.gdn_z_width      = g.value_heads * kGdnHeadDim;
   t.raw.gdn_ab_width     = 2 * g.value_heads;
@@ -182,11 +184,54 @@ void binds_every_layer(const Geometry &g, const std::string &label) {
             "\"");
 }
 
+// A topology the leaf refuses before binding anything, with a message holding
+// every one of `wanted`.
+void refused(const Topology &topology, const std::vector<std::string> &wanted,
+             const std::string &label) {
+  std::vector<Named> named = tensors_of(kFlashNext);
+  const std::string message = plan_error(topology.raw, named);
+  for (const std::string &part : wanted) {
+    check(message.find(part) != std::string::npos,
+          label + ": refused naming \"" + part + "\": got \"" + message + "\"");
+  }
+}
+
 } // namespace
 
 int main() {
   binds_every_layer(kFlashNext, "36 GDN layers of 48 value heads (Flash-Next)");
   binds_every_layer(kTwoLayersFourHeads, "2 GDN layers of 4 value heads");
+
+  // The inverse conflation: the value heads handed over as the layer count.
+  Topology swapped = topology_of(kFlashNext);
+  swapped.raw.gdn_num_layers = kFlashNext.value_heads;
+  refused(swapped, {"gdn_num_layers (48)", "GDN layer count (36)"}, "48 GDN layers claimed of 36");
+
+  Topology uneven = topology_of(kFlashNext);
+  uneven.raw.gdn_value_heads = 5;
+  refused(uneven, {"gdn_state_rows is not a multiple of gdn_value_heads"}, "5 value heads");
+
+  Topology headless = topology_of(kFlashNext);
+  headless.raw.gdn_value_heads = 0;
+  refused(headless, {"gdn_value_heads must be positive"}, "no value heads");
+
+  // ADR 0043: the family names the program. Flash-Next's is not built yet,
+  // and a 27B topology carries none of its blocks.
+  Topology flash_next = topology_of(kFlashNext);
+  flash_next.raw.family = IGNIS_MODEL_FAMILY_FLASH_NEXT;
+  refused(flash_next, {"Flash-Next program is not built yet"}, "the Flash-Next family");
+
+  Topology unknown = topology_of(kFlashNext);
+  unknown.raw.family = 7;
+  refused(unknown, {"family 7"}, "an unknown family");
+
+  Topology dense_with_experts = topology_of(kFlashNext);
+  dense_with_experts.raw.moe.num_experts = 512;
+  refused(dense_with_experts, {"carries no MoE block"}, "a 27B topology with experts");
+
+  Topology dense_with_ngram = topology_of(kFlashNext);
+  dense_with_ngram.raw.ngram.layer = 1;
+  refused(dense_with_ngram, {"carries no n-gram block"}, "a 27B topology with an n-gram layer");
 
   if (g_failed != 0) {
     std::fprintf(stderr, "model load GDN geometry test: %d check(s) failed\n", g_failed);

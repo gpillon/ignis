@@ -526,6 +526,183 @@ impl ModelConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The topology at the step ABI (`struct ignis_topology`, ADR 0009)
+// ---------------------------------------------------------------------------
+
+impl LayerKind {
+    /// `enum ignis_layer_kind`.
+    pub fn abi_code(self) -> i32 {
+        match self {
+            LayerKind::Gdn => 0,
+            LayerKind::Gqa => 1,
+        }
+    }
+}
+
+impl ModelFamily {
+    /// The model's name, as a refusal names it to a client.
+    pub fn name(self) -> &'static str {
+        match self {
+            ModelFamily::Qwen38_27b => "Qwen3.8-27B",
+            ModelFamily::FlashNext => "Qwen3.8-Flash-Next",
+        }
+    }
+
+    /// `enum ignis_model_family`.
+    pub fn abi_code(self) -> i32 {
+        match self {
+            ModelFamily::Qwen38_27b => 0,
+            ModelFamily::FlashNext => 1,
+        }
+    }
+}
+
+/// 1:1 with `struct ignis_moe_topology`; all zero for a dense MLP.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IgnisMoeTopology {
+    pub num_experts: u64,
+    pub experts_per_token: u64,
+    pub expert_intermediate: u64,
+    pub shared_expert_intermediate: u64,
+}
+
+/// 1:1 with `struct ignis_hyper_topology`; all zero for one residual stream.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IgnisHyperTopology {
+    pub streams: u64,
+    pub rank: u64,
+}
+
+/// 1:1 with `struct ignis_indexer_topology`; all zero for plain GQA.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IgnisIndexerTopology {
+    pub heads: u64,
+    pub head_dim: u64,
+    pub kv_heads: u64,
+    pub compress_ratio: u64,
+    pub budget: u64,
+}
+
+/// 1:1 with `struct ignis_ngram_topology`: what the device side of the
+/// n-gram embedding is shaped by (the hashing is the host's, `crate::ngram`).
+/// All zero without an n-gram embedding.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IgnisNgramTopology {
+    pub ngram_size: u64,
+    pub heads_per_ngram: u64,
+    pub embed_dim: u64,
+    pub conv_kernel: u64,
+    pub layer: u64,
+}
+
+/// 1:1 with `struct ignis_topology` (`kernel/include/ignis_model.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IgnisTopology {
+    pub num_layers: u32,
+    pub layer_kinds: *const i32,
+    pub hidden: u64,
+    pub vocab: u64,
+    pub num_q_heads: u64,
+    pub num_kv_heads: u64,
+    pub head_dim: u64,
+    pub rotary_dim: u64,
+    pub rope_theta: f64,
+    pub gdn_state_rows: u64,
+    pub gdn_state_cols: u64,
+    pub gdn_num_layers: u64,
+    pub gdn_q_width: u64,
+    pub gdn_z_width: u64,
+    pub gdn_ab_width: u64,
+    pub ffn_intermediate: u64,
+    pub rms_norm_eps: f32,
+    pub family: i32,
+    pub gdn_value_heads: u64,
+    pub moe: IgnisMoeTopology,
+    pub hyper: IgnisHyperTopology,
+    pub indexer: IgnisIndexerTopology,
+    pub ngram: IgnisNgramTopology,
+}
+
+/// A topology descriptor and the layer-kind array its pointer reads, owned
+/// together so the pointer cannot outlive the array.
+#[derive(Debug)]
+pub struct TopologyAbi {
+    /// Read only through `raw.layer_kinds`: held so that pointer stays valid.
+    #[allow(dead_code)]
+    layer_kinds: Vec<i32>,
+    raw: IgnisTopology,
+}
+
+impl TopologyAbi {
+    /// The descriptor `ignis_model_load` reads, valid while `self` lives.
+    pub fn raw(&self) -> &IgnisTopology {
+        &self.raw
+    }
+}
+
+impl ModelConfig {
+    /// This topology as it crosses the step ABI.
+    pub fn topology_abi(&self) -> TopologyAbi {
+        let layer_kinds: Vec<i32> = self.layer_kinds.iter().map(|kind| kind.abi_code()).collect();
+        let moe = self.moe.map_or_else(IgnisMoeTopology::default, |moe| IgnisMoeTopology {
+            num_experts: moe.num_experts,
+            experts_per_token: moe.experts_per_token,
+            expert_intermediate: moe.expert_intermediate,
+            shared_expert_intermediate: moe.shared_expert_intermediate,
+        });
+        let hyper = self
+            .hyper_connections
+            .map_or_else(IgnisHyperTopology::default, |hyper| IgnisHyperTopology { streams: hyper.streams, rank: hyper.rank });
+        let indexer = self.indexer.map_or_else(IgnisIndexerTopology::default, |indexer| IgnisIndexerTopology {
+            heads: indexer.heads,
+            head_dim: indexer.head_dim,
+            kv_heads: indexer.kv_heads,
+            compress_ratio: indexer.compress_ratio,
+            budget: indexer.budget,
+        });
+        let ngram = self.ngram.map_or_else(IgnisNgramTopology::default, |ngram| IgnisNgramTopology {
+            ngram_size: ngram.ngram_size,
+            heads_per_ngram: ngram.heads_per_ngram,
+            embed_dim: ngram.embed_dim,
+            conv_kernel: ngram.conv_kernel,
+            layer: ngram.layer as u64,
+        });
+        let raw = IgnisTopology {
+            num_layers: self.num_layers as u32,
+            // The Vec's heap buffer does not move when the Vec does.
+            layer_kinds: layer_kinds.as_ptr(),
+            hidden: self.hidden,
+            vocab: self.vocab,
+            num_q_heads: self.num_q_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            rotary_dim: self.rotary_dim,
+            rope_theta: self.rope_theta,
+            gdn_state_rows: self.gdn_state_rows,
+            gdn_state_cols: self.gdn_state_cols,
+            gdn_num_layers: self.gdn_num_layers,
+            gdn_q_width: self.gdn_q_width,
+            gdn_z_width: self.gdn_z_width,
+            gdn_ab_width: self.gdn_ab_width,
+            ffn_intermediate: self.ffn_intermediate,
+            rms_norm_eps: self.rms_norm_eps,
+            family: self.family.abi_code(),
+            gdn_value_heads: self.gdn_value_heads,
+            moe,
+            hyper,
+            indexer,
+            ngram,
+        };
+        TopologyAbi { layer_kinds, raw }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +879,82 @@ mod tests {
         assert_eq!(cfg.residual_bytes_per_token(), 10_240);
         assert_eq!(cfg.indexer_bytes_per_token(), 0);
         assert_eq!(cfg.ngram_conv_state_bytes(), 0);
+    }
+
+    fn kinds_of(abi: &TopologyAbi) -> Vec<i32> {
+        let raw = abi.raw();
+        unsafe { std::slice::from_raw_parts(raw.layer_kinds, raw.num_layers as usize) }.to_vec()
+    }
+
+    /// The 27B's descriptor is the one `model_load` built before Flash-Next
+    /// (every field below is its old literal), with the value heads that
+    /// field held implicitly and none of Flash-Next's blocks.
+    #[test]
+    fn the_27b_topology_crosses_the_abi_field_for_field() {
+        let abi = ModelConfig::qwen38_27b().topology_abi();
+        let raw = abi.raw();
+        assert_eq!(raw.num_layers, 64);
+        let kinds = kinds_of(&abi);
+        assert_eq!(kinds.len(), 64);
+        for (i, &kind) in kinds.iter().enumerate() {
+            assert_eq!(kind, if (i + 1) % 4 == 0 { 1 } else { 0 }, "layer {i}: GQA = 1, GDN = 0");
+        }
+        assert_eq!((raw.hidden, raw.vocab), (5120, 248_320));
+        assert_eq!((raw.num_q_heads, raw.num_kv_heads, raw.head_dim), (24, 4, 256));
+        assert_eq!((raw.rotary_dim, raw.rope_theta), (64, 1e7));
+        assert_eq!((raw.gdn_state_rows, raw.gdn_state_cols, raw.gdn_num_layers), (6144, 2048, 48));
+        assert_eq!((raw.gdn_q_width, raw.gdn_z_width, raw.gdn_ab_width), (2048, 6144, 96));
+        assert_eq!(raw.ffn_intermediate, 17_408);
+        assert_eq!(raw.rms_norm_eps, 1.0e-6);
+        assert_eq!(raw.family, 0, "IGNIS_MODEL_FAMILY_QWEN38_27B");
+        assert_eq!(raw.gdn_value_heads, 48);
+        assert_eq!(raw.moe, IgnisMoeTopology::default());
+        assert_eq!(raw.hyper, IgnisHyperTopology::default());
+        assert_eq!(raw.indexer, IgnisIndexerTopology::default());
+        assert_eq!(raw.ngram, IgnisNgramTopology::default());
+    }
+
+    /// Flash-Next's descriptor carries its 36 GDN layers and its 48 GDN value
+    /// heads as two fields, and every block the leaf will derive its buffers
+    /// from.
+    #[test]
+    fn flash_next_crosses_the_abi_with_its_gdn_layers_and_value_heads_apart() {
+        let abi = ModelConfig::qwen38_flash_next().topology_abi();
+        let raw = abi.raw();
+        assert_eq!(raw.family, 1, "IGNIS_MODEL_FAMILY_FLASH_NEXT");
+        assert_eq!(raw.num_layers, 48);
+        assert_eq!(kinds_of(&abi).iter().filter(|&&kind| kind == 1).count(), 12);
+        assert_eq!((raw.gdn_num_layers, raw.gdn_value_heads), (36, 48));
+        assert_eq!((raw.hidden, raw.num_kv_heads, raw.ffn_intermediate), (2560, 2, 0));
+        assert_eq!(
+            raw.moe,
+            IgnisMoeTopology { num_experts: 512, experts_per_token: 10, expert_intermediate: 640, shared_expert_intermediate: 640 }
+        );
+        assert_eq!(raw.hyper, IgnisHyperTopology { streams: 4, rank: 320 });
+        assert_eq!(
+            raw.indexer,
+            IgnisIndexerTopology { heads: 4, head_dim: 128, kv_heads: 1, compress_ratio: 4, budget: 2048 }
+        );
+        assert_eq!(
+            raw.ngram,
+            IgnisNgramTopology { ngram_size: 3, heads_per_ngram: 8, embed_dim: 2560, conv_kernel: 4, layer: 1 }
+        );
+    }
+
+    /// `struct ignis_topology` has no `size` field, so both sides pin its
+    /// layout: kernel/include/ignis_model.h static_asserts the same size and
+    /// offsets. The fields before `family` keep the offsets they had.
+    #[test]
+    fn the_topology_descriptor_is_the_leafs_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(IgnisTopology, rms_norm_eps), 128);
+        assert_eq!(offset_of!(IgnisTopology, family), 132);
+        assert_eq!(offset_of!(IgnisTopology, gdn_value_heads), 136);
+        assert_eq!(offset_of!(IgnisTopology, moe), 144);
+        assert_eq!(offset_of!(IgnisTopology, hyper), 176);
+        assert_eq!(offset_of!(IgnisTopology, indexer), 192);
+        assert_eq!(offset_of!(IgnisTopology, ngram), 232);
+        assert_eq!(size_of::<IgnisTopology>(), 272);
     }
 
     /// `gdn_value_heads * gdn_head_dim` must equal `gdn_state_rows` (the

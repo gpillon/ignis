@@ -241,7 +241,7 @@ struct Geometry {
   int64_t gdn_norm_width;
   int64_t gdn_ab_width;
   int64_t gdn_state_rows;
-  int64_t gdn_num_layers;
+  int64_t gdn_value_heads;
 
   static Geometry from(const ignis_topology &t) {
     Geometry g{};
@@ -256,10 +256,11 @@ struct Geometry {
         static_cast<int64_t>(t.gdn_q_width + t.gdn_state_cols + t.gdn_state_rows + t.gdn_z_width);
     g.gdn_ab_width = static_cast<int64_t>(t.gdn_ab_width);
     g.gdn_state_rows = static_cast<int64_t>(t.gdn_state_rows);
-    g.gdn_num_layers = static_cast<int64_t>(t.gdn_num_layers);
-    // The GDN gated RMSNorm's per-head width (state_rows / value heads); the
-    // caller already rejected gdn_num_layers == 0 with gdn_state_rows != 0.
-    g.gdn_norm_width = t.gdn_num_layers == 0 ? 0 : g.gdn_state_rows / g.gdn_num_layers;
+    g.gdn_value_heads = static_cast<int64_t>(t.gdn_value_heads);
+    // The GDN gated RMSNorm's per-head width (state_rows / value heads). A
+    // topology without GDN layers may carry no value heads; one with them
+    // was refused unless the value heads divide state_rows.
+    g.gdn_norm_width = t.gdn_value_heads == 0 ? 0 : g.gdn_state_rows / g.gdn_value_heads;
     return g;
   }
 };
@@ -285,8 +286,8 @@ bool bind_gqa_layer(ModelBinder &binder, const std::string &prefix, const Geomet
 bool bind_gdn_layer(ModelBinder &binder, const std::string &prefix, const Geometry &g,
                      GdnLayerWeights &w) {
   return binder.bind(prefix + "input_norm", {g.hidden}, w.input_norm) &&
-         binder.bind(prefix + "gdn/a_log", {g.gdn_num_layers}, w.a_log) &&
-         binder.bind(prefix + "gdn/dt_bias", {g.gdn_num_layers}, w.dt_bias) &&
+         binder.bind(prefix + "gdn/a_log", {g.gdn_value_heads}, w.a_log) &&
+         binder.bind(prefix + "gdn/dt_bias", {g.gdn_value_heads}, w.dt_bias) &&
          binder.bind(prefix + "gdn/convolution", {kGdnConvKernel, g.gdn_conv_channels},
                      w.convolution) &&
          binder.bind(prefix + "gdn/a_b_projection", {g.gdn_ab_width, g.hidden}, w.a_b_projection) &&
@@ -885,6 +886,30 @@ std::size_t vision_embedding_pool_bytes(std::int64_t hidden, std::int32_t envelo
   return ((want + page - 1) / page) * page;
 }
 
+// GitHub #302: the first Flash-Next block a topology carries, by name, or
+// null when it carries none (every field zero).
+const char *flash_next_block_in(const ignis_topology &t) {
+  const ignis_moe_topology &moe = t.moe;
+  if ((moe.num_experts | moe.experts_per_token | moe.expert_intermediate |
+       moe.shared_expert_intermediate) != 0) {
+    return "MoE";
+  }
+  if ((t.hyper.streams | t.hyper.rank) != 0) {
+    return "hyper-connection";
+  }
+  const ignis_indexer_topology &indexer = t.indexer;
+  if ((indexer.heads | indexer.head_dim | indexer.kv_heads | indexer.compress_ratio |
+       indexer.budget) != 0) {
+    return "indexer";
+  }
+  const ignis_ngram_topology &ngram = t.ngram;
+  if ((ngram.ngram_size | ngram.heads_per_ngram | ngram.embed_dim | ngram.conv_kernel |
+       ngram.layer) != 0) {
+    return "n-gram";
+  }
+  return nullptr;
+}
+
 // The argument checks and the tensor binding of a load, shared by the load
 // itself and by its plan (GitHub #210) so the two refuse the same calls with
 // the same messages. Allocates nothing on the device. Null (error set) on
@@ -899,12 +924,41 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     set_error("ignis_model_load: topology.layer_kinds is null");
     return nullptr;
   }
-  if (topology->gdn_num_layers == 0) {
-    set_error("ignis_model_load: topology.gdn_num_layers must be positive");
+  // GitHub #302: the GDN layer count and the GDN value-head count are two
+  // numbers (48 and 48 on the 27B, 36 and 48 on Flash-Next). The layer count
+  // is the layer kinds'; the value heads size every per-head GDN parameter.
+  uint64_t gdn_layers = 0;
+  for (uint32_t i = 0; i < topology->num_layers; ++i) {
+    gdn_layers += topology->layer_kinds[i] == IGNIS_LAYER_GDN ? 1 : 0;
+  }
+  if (topology->gdn_num_layers != gdn_layers) {
+    set_error("ignis_model_load: topology.gdn_num_layers (" + std::to_string(topology->gdn_num_layers) +
+              ") is not the topology's GDN layer count (" + std::to_string(gdn_layers) + ")");
     return nullptr;
   }
-  if (topology->gdn_state_rows % topology->gdn_num_layers != 0) {
-    set_error("ignis_model_load: gdn_state_rows is not a multiple of gdn_num_layers");
+  if (gdn_layers > 0 && topology->gdn_value_heads == 0) {
+    set_error("ignis_model_load: topology.gdn_value_heads must be positive");
+    return nullptr;
+  }
+  if (topology->gdn_value_heads != 0 && topology->gdn_state_rows % topology->gdn_value_heads != 0) {
+    set_error("ignis_model_load: gdn_state_rows is not a multiple of gdn_value_heads");
+    return nullptr;
+  }
+  // ADR 0043: the family names the program. Flash-Next's blocks are all zero
+  // in a 27B topology, and Flash-Next's own program is not built yet.
+  if (topology->family != IGNIS_MODEL_FAMILY_QWEN38_27B &&
+      topology->family != IGNIS_MODEL_FAMILY_FLASH_NEXT) {
+    set_error("ignis_model_load: topology.family " + std::to_string(topology->family) +
+              " is not an ignis_model_family");
+    return nullptr;
+  }
+  if (topology->family == IGNIS_MODEL_FAMILY_FLASH_NEXT) {
+    set_error("ignis_model_load: the Flash-Next program is not built yet (spec flash-next/04)");
+    return nullptr;
+  }
+  if (const char *block = flash_next_block_in(*topology); block != nullptr) {
+    set_error(std::string("ignis_model_load: a Qwen 3.8-27B topology carries no ") + block +
+              " block");
     return nullptr;
   }
   // P2-01 (GitHub #83): the prefill chunk width the caller will hand

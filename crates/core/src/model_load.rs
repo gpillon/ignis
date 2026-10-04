@@ -26,7 +26,7 @@ use ignis_artifact::{
     ModelScope, NumericFormat, ObjectHandle, Reader, StorageLayout,
 };
 
-use crate::compute::{LayerKind, ModelConfig};
+use crate::compute::ModelConfig;
 use crate::kv_format::KvFormat;
 use crate::rope_scaling::RopeScaling;
 use crate::speculation::{ProposalHead, SpeculativeBackend, Speculation};
@@ -34,6 +34,8 @@ use crate::vision::Vision;
 
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
+
+    use crate::compute::IgnisTopology;
 
     /// Opaque loaded-model handle (`kernel/include/ignis_model.h`).
     ///
@@ -60,28 +62,6 @@ pub(crate) mod ffi {
         pub ndim: u32,
         pub weight_scale_divisor: f32,
         pub input_scale_divisor: f32,
-    }
-
-    /// 1:1 with `struct ignis_topology`.
-    #[repr(C)]
-    pub struct IgnisTopology {
-        pub num_layers: u32,
-        pub layer_kinds: *const i32,
-        pub hidden: u64,
-        pub vocab: u64,
-        pub num_q_heads: u64,
-        pub num_kv_heads: u64,
-        pub head_dim: u64,
-        pub rotary_dim: u64,
-        pub rope_theta: f64,
-        pub gdn_state_rows: u64,
-        pub gdn_state_cols: u64,
-        pub gdn_num_layers: u64,
-        pub gdn_q_width: u64,
-        pub gdn_z_width: u64,
-        pub gdn_ab_width: u64,
-        pub ffn_intermediate: u64,
-        pub rms_norm_eps: f32,
     }
 
     /// 1:1 with `struct ignis_model_load_options` (ADR 0016: `size` first).
@@ -527,40 +507,6 @@ fn build_bound_tensors(
     Ok((names, tensors))
 }
 
-/// The Qwen 3.8-27B topology descriptor (ADR 0009: one source for the
-/// leaf's per-layer schema, not guesses). `layer_kinds_buf` is the backing
-/// storage for the returned descriptor's pointer -- keep it alive for as
-/// long as the descriptor is used.
-fn qwen38_27b_topology(layer_kinds_buf: &mut Vec<i32>) -> ffi::IgnisTopology {
-    let cfg = ModelConfig::qwen38_27b();
-    layer_kinds_buf.clear();
-    layer_kinds_buf.extend(cfg.layer_kinds.iter().map(|kind| match kind {
-        LayerKind::Gdn => 0,
-        LayerKind::Gqa => 1,
-    }));
-    ffi::IgnisTopology {
-        num_layers: cfg.num_layers as u32,
-        layer_kinds: layer_kinds_buf.as_ptr(),
-        hidden: cfg.hidden,
-        vocab: cfg.vocab,
-        num_q_heads: cfg.num_q_heads,
-        num_kv_heads: cfg.num_kv_heads,
-        head_dim: cfg.head_dim,
-        rotary_dim: cfg.rotary_dim,
-        rope_theta: cfg.rope_theta,
-        gdn_state_rows: cfg.gdn_state_rows,
-        gdn_state_cols: cfg.gdn_state_cols,
-        gdn_num_layers: cfg.gdn_num_layers,
-        gdn_q_width: cfg.gdn_q_width,
-        gdn_z_width: cfg.gdn_z_width,
-        gdn_ab_width: cfg.gdn_ab_width,
-        ffn_intermediate: cfg.ffn_intermediate,
-        // The Qwen 3.8-27B text config's RMSNorm epsilon (the reference's
-        // `TextConfig::rms_epsilon`, `qwen3_6_27b/impl/config.h`).
-        rms_norm_eps: 1.0e-6,
-    }
-}
-
 /// Load the Qwen 3.8-27B text model from a device-materialized artifact
 /// (P1-17): build the bound-tensor + topology descriptors and call
 /// `ignis_model_load`. `handles` must be the handles [`ignis_artifact::bind_text_scope_27b`]
@@ -662,8 +608,7 @@ pub fn load_qwen38_27b_with_options(
         model_scope(speculation, vision),
         device_placement(artifact),
     )?;
-    let mut layer_kinds_buf = Vec::new();
-    let topology = qwen38_27b_topology(&mut layer_kinds_buf);
+    let topology = ModelConfig::qwen38_27b().topology_abi();
     let options = load_options(speculation, vision, rope_scaling, text_readout_keys(reader));
 
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
@@ -671,7 +616,7 @@ pub fn load_qwen38_27b_with_options(
         ffi::ignis_model_load(
             tensors.as_ptr(),
             tensors.len() as u64,
-            &topology,
+            topology.raw(),
             prefill_chunk_tokens,
             max_context_tokens,
             kv_format.abi_code(),
@@ -713,8 +658,7 @@ pub fn plan_qwen38_27b_reservations(
         model_scope(speculation, vision),
         planned_placement(plan),
     )?;
-    let mut layer_kinds_buf = Vec::new();
-    let topology = qwen38_27b_topology(&mut layer_kinds_buf);
+    let topology = ModelConfig::qwen38_27b().topology_abi();
     let options = load_options(speculation, vision, rope_scaling, text_readout_keys(reader));
 
     let mut reservations = IgnisModelReservations::default();
@@ -722,7 +666,7 @@ pub fn plan_qwen38_27b_reservations(
         ffi::ignis_model_plan_reservations(
             tensors.as_ptr(),
             tensors.len() as u64,
-            &topology,
+            topology.raw(),
             prefill_chunk_tokens,
             max_context_tokens,
             kv_format.abi_code(),

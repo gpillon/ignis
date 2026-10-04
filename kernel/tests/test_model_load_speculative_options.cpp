@@ -55,7 +55,7 @@ ignis_topology no_layer_topology() {
   topology.hidden           = kHidden;
   topology.vocab            = kVocab;
   topology.ffn_intermediate = kFfn;
-  topology.gdn_num_layers   = 1;
+  topology.gdn_num_layers   = 0;
   return topology;
 }
 
