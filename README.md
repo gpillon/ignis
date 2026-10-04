@@ -17,7 +17,21 @@
   <img alt="target SM120a" src="https://img.shields.io/badge/target-SM120a%20%2F%20RTX%205090%20%7C%20RTX%20PRO%206000-d94b1f?style=flat-square">
   <img alt="model Qwen3.8-27B NVFP4" src="https://img.shields.io/badge/model-Qwen3.8--27B%20NVFP4-d94b1f?style=flat-square">
   <img alt="API OpenAI-compatible" src="https://img.shields.io/badge/API-OpenAI--compatible-d94b1f?style=flat-square">
+  <br>
+  <a href="https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer"><img alt="weights on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20weights-Qwen3.8--27B%20NVFP4%20%2B%20DFlash2-ffb000?style=flat-square"></a>
+  <a href="https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer"><img alt="uncensored weights on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20weights-uncensored%20(abliterated)-ffb000?style=flat-square"></a>
 </p>
+
+<table align="center">
+  <tr>
+    <td align="center"><b>367 tok/s</b><br><sub>one lane, coding prompts</sub></td>
+    <td align="center"><b>1,065 tok/s</b><br><sub>eight lanes, aggregate</sub></td>
+    <td align="center"><b>7.11x</b><br><sub>KV capacity of BF16</sub></td>
+    <td align="center"><b>~36 ms</b><br><sub>a decision, zero tokens decoded</sub></td>
+  </tr>
+</table>
+
+<p align="center"><sub>Measured on one RTX 5090. How, and against what: <a href="#how-fast">How fast</a>.</sub></p>
 
 ---
 
@@ -51,9 +65,43 @@ ignis-server                       # no model yet? it offers to fetch one
 ```
 
 Then the OpenAI API is on <http://127.0.0.1:8000/v1> and the Playground on
-<http://127.0.0.1:8000/ui/>. Everything else — the container, building from a
-checkout, every flag — is [Quick start](#quick-start) and
-[docs/user](docs/user/README.md).
+<http://127.0.0.1:8000/ui/>. The weights are on Hugging Face in two flavours,
+the standard one and an uncensored one: [The weights](#the-weights). Everything
+else — the container, building from a checkout, every flag — is
+[Quick start](#quick-start) and [docs/user](docs/user/README.md).
+
+## How fast
+
+**Ignis on one RTX 5090** — Qwen3.8-27B NVFP4, hq-e8-2b KV, DFlash2 speculative
+decoding with 7 draft tokens, greedy, short prompts:
+
+| load | throughput | source |
+|---|---:|---|
+| one lane, eight coding prompts (write, edit, explain), geometric mean | **367 tok/s** | [upstream quick wins](docs/findings/2026-09-24-upstream-quick-wins-ab.md) |
+| one lane, predictable code / free prose | **491** / **167 tok/s** | [retained slots on the host](docs/findings/2026-09-28-retained-slots-on-the-host.md) |
+| eight lanes at once, aggregate | **1,065 tok/s** | [upstream quick wins](docs/findings/2026-09-24-upstream-quick-wins-ab.md) |
+
+**Other engines, same card, same model** — single-stream decode as their
+authors published it:
+
+| engine | weights and speculation | single-stream decode | source |
+|---|---|---:|---|
+| vLLM (main `g41f179b57`) | NVFP4, FP8 KV, DFlash2 drafter with 6 tokens | ~304 tok/s code at 8K, 221 at 60K | [HF discussion #132](https://huggingface.co/Qwen/Qwen3.8-27B/discussions/132) |
+| llama.cpp | NVFP4-MTP GGUF, q8_0 KV, MTP with 4 tokens | 122–142 tok/s | [DataCamp, 2026-08-25](https://www.datacamp.com/tutorial/how-to-run-qwen3-8-27b-locally) |
+| llama.cpp | MTP | 70.5 tok/s | [HF discussion #132](https://huggingface.co/Qwen/Qwen3.8-27B/discussions/132) |
+
+Those rows are other people's runs: their prompts, their drafters, their
+context lengths. They are not a same-session benchmark, so read them as an order
+of magnitude, not a ratio. **Prefill is where ignis is not ahead:** vLLM's
+published ~12,500 tok/s at 60K is above ignis's measured 6,600 tok/s on a cold
+46K prompt and 4,600 tok/s on a cold 105K one.
+
+**The one same-session comparison** is against
+[NInfer](#lineage), the engine whose kernels ignis started from: same artifact,
+same card, one session, two process launches per side, before ignis had
+speculative decoding. ignis is **1.06x the reference at one lane and 3.07x at
+four**, and 3% behind it on inter-token latency p95
+([hq vs BF16 live/live](docs/findings/2026-09-13-hq-vs-bf16-live-live.md)).
 
 ## What sets it apart
 
@@ -201,6 +249,34 @@ latency quantiles:
 
 ## Quick start
 
+### The weights
+
+Two images of the same model, both on Hugging Face, both 18.07 GiB, both
+carrying the DFlash2 drafter:
+
+| | Hugging Face | file |
+|---|---|---|
+| **Standard** | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer) | `qwen3_8_27b_nvfp4full-v2.ninfer` |
+| **Uncensored** | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | `qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer` |
+
+The server fetches the standard one by itself the first time it starts without
+a model, and checks its size and SHA-256 before using it. To download either one
+by hand:
+
+```
+hf download gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer --local-dir models
+hf download gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer --local-dir models
+```
+
+The uncensored image is the standard one with the
+[huihui-ai abliteration](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated)
+applied: 1,255 of its 1,325 objects are byte-identical, and only the 70 matrices
+the abliteration changed are re-encoded. The server never downloads it on its
+own; start it with `--artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer`,
+or `make dev UNCENSORED=1` from a checkout. **It does not refuse**, so put the
+guardrails in the application or tool layer and do not expose it to untrusted
+users.
+
 ### Container
 
 ```
@@ -304,8 +380,8 @@ time — check `make gpu-status` before starting anything on it.
 | [`docs/agents/`](docs/agents/) | Conventions for agents working in this repo. |
 | [`CONTEXT.md`](CONTEXT.md) | The glossary. One vocabulary, one meaning per term. |
 
-An OpenAPI description of the HTTP surface is planned and will supersede the
-API section of the user docs.
+The OpenAPI description of the HTTP surface is served at `/v1/openapi.json`,
+with a browsable reference at `/v1/docs/`.
 
 ## Lineage
 
