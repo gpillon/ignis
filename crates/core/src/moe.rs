@@ -1,0 +1,327 @@
+//! Flash-Next's mixture-of-experts ops in the kernel leaf (spec flash-next/02, GitHub #300):
+//! the flat C ABI of `kernel/include/ignis_moe.h`, 1:1, and thin wrappers that turn its return
+//! codes into `Result`s carrying the leaf's own message.
+//!
+//! The ops are program-side ops (ADR 0009): the Flash-Next layer program (spec 04) calls them
+//! inside the leaf, and these bindings exist for Rust-side tests and tools that drive them
+//! directly. Every pointer argument is a device pointer the caller vouches for, so the
+//! wrappers are `unsafe`; the shapes and counts they take are checked by the leaf.
+//!
+//! All of them are our own implementation, with no port claim (ADR 0010 / ADR 0043).
+
+#![cfg(feature = "cuda")]
+
+use std::ffi::CStr;
+use std::os::raw::c_void;
+
+/// The MoE block's hidden width.
+pub const HIDDEN: u32 = 2560;
+/// Routed experts per layer.
+pub const EXPERTS: u32 = 512;
+/// Experts the router selects per token.
+pub const TOP_K: u32 = 10;
+/// Each expert's (and the shared expert's) intermediate width.
+pub const INTERMEDIATE: u32 = 640;
+/// Tokens the decode route serves in one launch.
+pub const DECODE_MAX_TOKENS: u32 = 8;
+
+/// The fused gate/up expert projection, (in, out) = (2560, 1280).
+pub const PROJ_GATE_UP: u32 = 0;
+/// The down expert projection, (in, out) = (640, 2560).
+pub const PROJ_DOWN: u32 = 1;
+
+/// One slot-table entry, 1:1 with `struct ignis_moe_slot`: the device address of an expert
+/// projection's record (layout.md §3) and its bit width as `k2 = 2 K`. A layer's table is
+/// `EXPERTS * 2` entries indexed `expert * 2 + projection`; a selected entry with a NULL
+/// record traps the kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeSlot {
+    pub record: *const c_void,
+    pub k2: u32,
+    pub reserved: u32,
+}
+
+impl MoeSlot {
+    /// The entry of a projection that is not resident.
+    pub const ABSENT: MoeSlot = MoeSlot { record: std::ptr::null(), k2: 0, reserved: 0 };
+}
+
+/// 1:1 with `kernel/include/ignis_moe.h`.
+pub mod ffi {
+    use super::MoeSlot;
+    use std::os::raw::{c_char, c_void};
+
+    unsafe extern "C" {
+        pub fn ignis_moe_record_bytes(projection: u32, k2: u32, bytes: *mut u64) -> i32;
+        pub fn ignis_moe_trellis_reconstruct(
+            trellis: *const c_void,
+            k2: u32,
+            in_features: u32,
+            out_features: u32,
+            w_f16: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_moe_router(
+            x: *const c_void,
+            tokens: u32,
+            w_router: *const c_void,
+            ids: *mut i32,
+            weights: *mut f32,
+            logits: *mut f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_moe_experts_decode(
+            x: *const c_void,
+            tokens: u32,
+            ids: *const i32,
+            weights: *const f32,
+            slots: *const MoeSlot,
+            workspace: *mut c_void,
+            acc: *mut i64,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_moe_experts_prefill(
+            x: *const c_void,
+            tokens: u32,
+            ids: *const i32,
+            weights: *const f32,
+            slots: *const MoeSlot,
+            workspace: *mut c_void,
+            max_tokens: u32,
+            acc: *mut i64,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_fp8_linear(
+            weight: *const c_void,
+            rows: u32,
+            cols: u32,
+            x: *const c_void,
+            tokens: u32,
+            y: *mut c_void,
+            y_f32: u32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_fp8_linear_swiglu(
+            gate: *const c_void,
+            up: *const c_void,
+            rows: u32,
+            cols: u32,
+            x: *const c_void,
+            tokens: u32,
+            h: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_moe_shared_expert(
+            gate: *const c_void,
+            up: *const c_void,
+            down: *const c_void,
+            x: *const c_void,
+            tokens: u32,
+            h: *mut c_void,
+            shared: *mut f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_moe_combine(
+            acc: *mut i64,
+            shared: *const f32,
+            x: *const c_void,
+            w_gate: *const c_void,
+            tokens: u32,
+            out: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_moe_workspace_bytes(max_tokens: u32) -> u64;
+        pub fn ignis_moe_workspace_init(
+            workspace: *mut c_void,
+            max_tokens: u32,
+            acc: *mut i64,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_moe_stream_sync(stream: *mut c_void) -> i32;
+        pub fn ignis_moe_last_error() -> *const c_char;
+    }
+}
+
+/// The leaf's message for the most recent failed MoE call on this thread.
+pub fn last_error() -> String {
+    unsafe { CStr::from_ptr(ffi::ignis_moe_last_error()) }.to_string_lossy().into_owned()
+}
+
+fn check(rc: i32) -> Result<(), String> {
+    if rc == 0 { Ok(()) } else { Err(last_error()) }
+}
+
+/// Bytes of one expert-projection record, padding included (layout.md's class table).
+pub fn record_bytes(projection: u32, k2: u32) -> Result<u64, String> {
+    let mut bytes = 0u64;
+    check(unsafe { ffi::ignis_moe_record_bytes(projection, k2, &mut bytes) })?;
+    Ok(bytes)
+}
+
+/// The routed-expert workspace for chunks of up to `max_tokens` tokens (the `acc` buffer, int64
+/// `[max_tokens][2560]`, is the caller's own plan line).
+pub fn workspace_bytes(max_tokens: u32) -> u64 {
+    unsafe { ffi::ignis_moe_workspace_bytes(max_tokens) }
+}
+
+/// Blocks until `stream` (null: the legacy default stream) is idle.
+pub fn stream_sync(stream: *mut c_void) -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_stream_sync(stream) })
+}
+
+/// Decodes a trellis tensor to its fp16 `[in][out]` inner weight.
+///
+/// # Safety
+/// `trellis` and `w_f16` are device pointers of the sizes `in`, `out` and `k2` imply.
+pub unsafe fn trellis_reconstruct(
+    trellis: *const c_void,
+    k2: u32,
+    in_features: u32,
+    out_features: u32,
+    w_f16: *mut c_void,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_trellis_reconstruct(trellis, k2, in_features, out_features, w_f16, stream) })
+}
+
+/// The router: ids `[tokens][10]`, weights `[tokens][10]` and fp32 logits `[tokens][512]`.
+///
+/// # Safety
+/// Every pointer is a device pointer of the size `tokens` implies.
+pub unsafe fn router(
+    x: *const c_void,
+    tokens: u32,
+    w_router: *const c_void,
+    ids: *mut i32,
+    weights: *mut f32,
+    logits: *mut f32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_router(x, tokens, w_router, ids, weights, logits, stream) })
+}
+
+/// The routed experts on the decode route (1..=8 tokens), into the fixed-point `acc`.
+///
+/// # Safety
+/// Every pointer is a device pointer of the size `tokens` and the workspace plan imply.
+pub unsafe fn experts_decode(
+    x: *const c_void,
+    tokens: u32,
+    ids: *const i32,
+    weights: *const f32,
+    slots: *const MoeSlot,
+    workspace: *mut c_void,
+    acc: *mut i64,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_experts_decode(x, tokens, ids, weights, slots, workspace, acc, stream) })
+}
+
+/// The routed experts on the prefill route, into the fixed-point `acc`.
+///
+/// # Safety
+/// Every pointer is a device pointer of the size `tokens` and the workspace plan imply.
+pub unsafe fn experts_prefill(
+    x: *const c_void,
+    tokens: u32,
+    ids: *const i32,
+    weights: *const f32,
+    slots: *const MoeSlot,
+    workspace: *mut c_void,
+    max_tokens: u32,
+    acc: *mut i64,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    check(unsafe {
+        ffi::ignis_moe_experts_prefill(x, tokens, ids, weights, slots, workspace, max_tokens, acc, stream)
+    })
+}
+
+/// The FP8 row-scale linear; `y_f32` selects fp32 output, else BF16.
+///
+/// # Safety
+/// Every pointer is a device pointer of the size the shapes imply.
+pub unsafe fn fp8_linear(
+    weight: *const c_void,
+    rows: u32,
+    cols: u32,
+    x: *const c_void,
+    tokens: u32,
+    y: *mut c_void,
+    y_f32: bool,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    check(unsafe { ffi::ignis_fp8_linear(weight, rows, cols, x, tokens, y, y_f32 as u32, stream) })
+}
+
+/// The shared expert into fp32 `shared` `[tokens][2560]`, `h` its BF16 `[tokens][640]` scratch.
+///
+/// # Safety
+/// Every pointer is a device pointer of the size `tokens` implies.
+pub unsafe fn shared_expert(
+    gate: *const c_void,
+    up: *const c_void,
+    down: *const c_void,
+    x: *const c_void,
+    tokens: u32,
+    h: *mut c_void,
+    shared: *mut f32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_shared_expert(gate, up, down, x, tokens, h, shared, stream) })
+}
+
+/// The combine into BF16 `out`, zeroing the `acc` rows it read.
+///
+/// # Safety
+/// Every pointer is a device pointer of the size `tokens` implies.
+pub unsafe fn combine(
+    acc: *mut i64,
+    shared: *const f32,
+    x: *const c_void,
+    w_gate: *const c_void,
+    tokens: u32,
+    out: *mut c_void,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_combine(acc, shared, x, w_gate, tokens, out, stream) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_entry_matches_the_c_struct() {
+        // struct ignis_moe_slot { const void *record; uint32_t k2; uint32_t reserved; }
+        assert_eq!(std::mem::size_of::<MoeSlot>(), 16);
+        assert_eq!(std::mem::align_of::<MoeSlot>(), 8);
+        let slot = MoeSlot { record: std::ptr::null(), k2: 5, reserved: 0 };
+        let base = &slot as *const MoeSlot as usize;
+        assert_eq!(&slot.k2 as *const u32 as usize - base, 8);
+        assert_eq!(&slot.reserved as *const u32 as usize - base, 12);
+    }
+
+    #[test]
+    fn record_bytes_are_layout_mds_class_table() {
+        // docs/specs/flash-next/layout.md §3, record bytes with padding, k2 = 4, 5, 6, 8.
+        let gate_up = [827_392u64, 1_032_192, 1_236_992, 1_646_592];
+        let down = [417_792u64, 520_192, 622_592, 827_392];
+        for (i, k2) in [4u32, 5, 6, 8].into_iter().enumerate() {
+            assert_eq!(record_bytes(PROJ_GATE_UP, k2), Ok(gate_up[i]));
+            assert_eq!(record_bytes(PROJ_DOWN, k2), Ok(down[i]));
+        }
+        let refused = record_bytes(PROJ_DOWN, 7).unwrap_err();
+        assert!(refused.contains("k2"), "{refused}");
+    }
+
+    #[test]
+    fn workspace_grows_with_the_chunk() {
+        let decode_only = workspace_bytes(1);
+        let chunk = workspace_bytes(4096);
+        assert!(decode_only > 0);
+        // The prefill rows dominate: at least the SwiGLU outputs of 4096 tokens x 10 experts.
+        assert!(chunk - decode_only >= 4096 * 10 * 640 * 4 - 640 * 10 * 4);
+    }
+}

@@ -52,6 +52,8 @@ pub mod locate;
 pub mod mock;
 #[cfg(feature = "cuda")]
 pub mod model_load;
+#[cfg(feature = "cuda")]
+pub mod moe;
 pub mod ngram;
 pub mod pointing;
 pub mod prefix;
