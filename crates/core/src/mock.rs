@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::decision::{Readout, argmax, log_sum_exp};
 use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, NO_HOST_ROOM};
@@ -853,15 +854,27 @@ pub struct GateController {
     release_tx: SyncSender<()>,
 }
 
+/// How long [`GateController::wait_entered`] waits for the armed call. A
+/// gated step enters within microseconds; a request that never reaches
+/// decode (cancelled first) would otherwise block its CI job until the job
+/// itself is killed — one Windows run sat four hours that way.
+const GATE_ENTRY_LIMIT: Duration = Duration::from_secs(60);
+
 impl GateController {
     /// Blocks the calling thread until the gated `decode_step` call has
     /// entered the gate — proof that whatever is driving `Compute` (in
     /// production, the model thread) is now stuck inside this call and
     /// cannot do anything else until [`GateController::release`] is called.
+    /// Panics after a minute (`GATE_ENTRY_LIMIT`): a gate nobody enters is a
+    /// failed test, not a hung one.
     pub fn wait_entered(&self) {
-        self.entered_rx
-            .recv()
-            .expect("the armed decode_step must enter the gate before the compute is dropped");
+        self.wait_entered_within(GATE_ENTRY_LIMIT);
+    }
+
+    fn wait_entered_within(&self, limit: Duration) {
+        self.entered_rx.recv_timeout(limit).unwrap_or_else(|e| {
+            panic!("the armed decode_step must enter the gate within {limit:?}: {e}")
+        });
     }
 
     /// Releases the held `decode_step` call, letting it complete.
@@ -950,5 +963,20 @@ impl Compute for GatedCompute {
 
     fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
         self.inner.spill_checkpoint(publisher)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A gate nobody enters fails the test instead of hanging it: a request
+    /// cancelled before its first decode step never reaches the gate.
+    #[test]
+    #[should_panic(expected = "must enter the gate within")]
+    fn a_gate_nobody_enters_fails_instead_of_hanging() {
+        let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
+        gated.arm();
+        controller.wait_entered_within(Duration::from_millis(10));
     }
 }

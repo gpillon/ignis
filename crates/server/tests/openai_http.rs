@@ -622,9 +622,15 @@ async fn dropping_a_streaming_response_cancels_the_request_and_releases_its_slot
         .unwrap();
     let second_response = app.clone().oneshot(second).await.unwrap();
     assert_eq!(second_response.status(), 200);
-    drop(second_response.into_body());
+    // The body lives until the gate is passed: dropping it cancels the
+    // request, and a cancel the model thread reads before the request's
+    // first advance releases it with no decode step at all — the gate is
+    // never entered and `wait_entered` waits forever. A Windows CI run hung
+    // four hours on exactly that.
+    let second_body = second_response.into_body();
     controller.wait_entered();
     controller.release();
+    drop(second_body);
 }
 
 // ── POST /v1/responses ────────────────────────────────────────────────────
