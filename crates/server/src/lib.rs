@@ -132,6 +132,10 @@ pub struct Server {
     /// test's mock token streams reproducible, as a fixed `wall_clock` keeps
     /// its events.
     pub seedless_seed: Option<u64>,
+    /// The loaded model (ADR 0043). Flash-Next has no vision tower and no
+    /// readouts: an image or a `/v1/decide` request to it is refused naming
+    /// it (spec flash-next/04). The 27B by default.
+    pub family: ignis_core::compute::ModelFamily,
 }
 
 impl Server {
@@ -158,7 +162,31 @@ impl Server {
             responses: std::sync::Arc::default(),
             wall_clock: std::sync::Arc::new(telemetry::SystemClock),
             seedless_seed: None,
+            family: ignis_core::compute::ModelFamily::Qwen38_27b,
         }
+    }
+
+    /// Serve `family` (see [`Server::family`]).
+    pub fn with_family(mut self, family: ignis_core::compute::ModelFamily) -> Self {
+        self.family = family;
+        self
+    }
+
+    /// The content-part check every endpoint runs before admission (GitHub
+    /// #175, #179): an image is refused on a load without vision, and on
+    /// Flash-Next, which has no vision tower, the refusal names the model.
+    pub fn check_content_parts(
+        &self,
+        messages: &[template::ChatMessage],
+    ) -> Result<(), template::ContentRejection> {
+        template::check_content_parts(messages, self.media.is_some()).map_err(|mut rejection| {
+            if rejection.code == "vision_disabled"
+                && self.family == ignis_core::compute::ModelFamily::FlashNext
+            {
+                rejection.message = format!("{}: {} takes no images", rejection.message, self.family.name());
+            }
+            rejection
+        })
     }
 
     /// A server over `engine`'s scheduler with the artifact's real

@@ -41,7 +41,7 @@ use crate::api::{
 };
 use crate::media::has_media;
 use crate::metrics::TokenizeRoute;
-use crate::template::{check_content_parts, check_roles, ChatMessage};
+use crate::template::{check_roles, ChatMessage};
 use crate::thinking::ThinkingRequestFields;
 use crate::Server;
 
@@ -196,7 +196,7 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
             Some("messages"),
         ));
     }
-    check_content_parts(&messages, server.media.is_some()).map_err(content_rejection)?;
+    server.check_content_parts(&messages).map_err(content_rejection)?;
     let thinking = resolve_thinking(
         server,
         ThinkingRequestFields {

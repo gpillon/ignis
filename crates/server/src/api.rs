@@ -47,7 +47,7 @@ use crate::engine::{Completion, Engine, EventStream, RequestNotes, collect_compl
 use crate::media::{has_media, MediaRejection, MediaStats};
 use crate::openai_fields::{self, Surface};
 use crate::template::{
-    check_content_parts, check_roles, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
+    check_roles, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
     TemplateRejection,
 };
 use crate::thinking::{
@@ -1334,7 +1334,7 @@ async fn chat_completions(
     if let Err(rejection) = check_roles(&req.messages) {
         return template_rejection(rejection);
     }
-    if let Err(rejection) = check_content_parts(&req.messages, server.media.is_some()) {
+    if let Err(rejection) = server.check_content_parts(&req.messages) {
         return content_rejection(rejection);
     }
     let max_tokens = match one_cap(req.max_tokens, req.max_completion_tokens) {

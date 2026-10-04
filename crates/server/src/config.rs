@@ -841,6 +841,30 @@ fn resolve_speculation(
         .map_err(|_| out_of_range())
 }
 
+/// The start options the loaded model cannot honour, refused by name
+/// before it serves (spec flash-next/04): the model family is read from the
+/// artifact, so a flag chosen for the other model is refused rather than
+/// ignored. Flash-Next has no speculative decoding and no vision tower.
+pub fn refuse_for_family(
+    config: &Config,
+    family: ignis_core::compute::ModelFamily,
+) -> Result<(), ConfigError> {
+    if family != ignis_core::compute::ModelFamily::FlashNext {
+        return Ok(());
+    }
+    if let Some(speculation) = config.speculation {
+        return Err(ConfigError(format!(
+            "`--spec {}`: {} has no speculative decoding",
+            speculation.backend().as_str(),
+            family.name()
+        )));
+    }
+    if config.vision.is_some() {
+        return Err(ConfigError(format!("`--vision`: {} takes no images", family.name())));
+    }
+    Ok(())
+}
+
 /// Parse a `u32` count for `flag`, naming the flag, `unit`, and the
 /// offending text on failure.
 fn parse_count(flag: &str, unit: &str, raw: &str) -> Result<u32, ConfigError> {
@@ -2240,6 +2264,31 @@ mod tests {
         assert!(err.0.contains("--rope-scaling"), "{}", err.0);
         let err = resolve(&args(&["--rope-scaling", "linear"]), no_env).expect_err("bad shape");
         assert!(err.0.contains("--rope-scaling"), "{}", err.0);
+    }
+
+    // ── the loaded model's family (spec flash-next/04, GitHub #302) ───────
+
+    #[test]
+    fn flash_next_refuses_speculation_and_vision_at_start_naming_itself() {
+        use ignis_core::compute::ModelFamily;
+        let spec = expect_config(
+            resolve(&args(&["--spec", "dflash2", "--draft-tokens", "7"]), no_env).expect("resolve"),
+        );
+        let err = refuse_for_family(&spec, ModelFamily::FlashNext).expect_err("no speculation");
+        assert!(err.0.contains("--spec dflash2") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+        let vision = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
+        let err = refuse_for_family(&vision, ModelFamily::FlashNext).expect_err("no vision");
+        assert!(err.0.contains("--vision") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+        let plain = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(refuse_for_family(&plain, ModelFamily::FlashNext), Ok(()));
+    }
+
+    #[test]
+    fn the_27b_takes_every_start_option_it_took_before() {
+        use ignis_core::compute::ModelFamily;
+        let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--vision"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(refuse_for_family(&config, ModelFamily::Qwen38_27b), Ok(()));
     }
 
     // ── vision as a load option (GitHub #177) ─────────────────────────────
