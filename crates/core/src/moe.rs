@@ -47,9 +47,21 @@ impl MoeSlot {
     pub const ABSENT: MoeSlot = MoeSlot { record: std::ptr::null(), k2: 0, reserved: 0 };
 }
 
+/// The device buffers one MoE block needs, 1:1 with `struct ignis_moe_plan`: the plan lines a
+/// Flash-Next load reserves (ADR 0030), each rounded up to 256 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MoePlan {
+    pub workspace: u64,
+    pub acc: u64,
+    pub router: u64,
+    pub shared: u64,
+    pub total: u64,
+}
+
 /// 1:1 with `kernel/include/ignis_moe.h`.
 pub mod ffi {
-    use super::MoeSlot;
+    use super::{MoePlan, MoeSlot};
     use std::os::raw::{c_char, c_void};
 
     unsafe extern "C" {
@@ -138,6 +150,7 @@ pub mod ffi {
             acc: *mut i64,
             stream: *mut c_void,
         ) -> i32;
+        pub fn ignis_moe_plan_bytes(max_tokens: u32, plan: *mut MoePlan) -> i32;
         pub fn ignis_moe_stream_sync(stream: *mut c_void) -> i32;
         pub fn ignis_moe_last_error() -> *const c_char;
     }
@@ -163,6 +176,13 @@ pub fn record_bytes(projection: u32, k2: u32) -> Result<u64, String> {
 /// `[max_tokens][2560]`, is the caller's own plan line).
 pub fn workspace_bytes(max_tokens: u32) -> u64 {
     unsafe { ffi::ignis_moe_workspace_bytes(max_tokens) }
+}
+
+/// The MoE block's plan lines for calls of up to `max_tokens` tokens.
+pub fn plan_bytes(max_tokens: u32) -> Result<MoePlan, String> {
+    let mut plan = MoePlan::default();
+    check(unsafe { ffi::ignis_moe_plan_bytes(max_tokens, &mut plan) })?;
+    Ok(plan)
 }
 
 /// Blocks until `stream` (null: the legacy default stream) is idle.
@@ -314,6 +334,20 @@ mod tests {
         }
         let refused = record_bytes(PROJ_DOWN, 7).unwrap_err();
         assert!(refused.contains("k2"), "{refused}");
+    }
+
+    #[test]
+    fn plan_lines_at_a_4096_token_chunk() {
+        // By hand from the layout (kernel/src/moe_workspace.cuh) at 4096 tokens: decode counters
+        // 2,048 + partials 13,107,200 + h 1,638,400; prefill chunk histograms 131,072, expert
+        // offsets 2,304, item count 256, 1,152 items 9,216, sorted rows 163,840, h 104,857,600.
+        let plan = plan_bytes(4096).unwrap();
+        assert_eq!(plan.workspace, 119_911_936);
+        assert_eq!(plan.acc, 4096 * 2560 * 8);
+        assert_eq!(plan.router, 163_840 + 163_840 + 8_388_608);
+        assert_eq!(plan.shared, 5_242_880 + 41_943_040);
+        assert_eq!(plan.total, 259_700_224);
+        assert!(plan_bytes(0).is_err());
     }
 
     #[test]

@@ -563,13 +563,19 @@ add_test(NAME ignis_kernel_seq_checkpoint_test COMMAND ignis_kernel_seq_checkpoi
 # an absolute path baked in at configure time. Same no-SKIP_RETURN_CODE rule as every other GPU
 # test here (ADR 0006).
 set(IGNIS_FLASH_NEXT_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next")
-foreach(name IN ITEMS trellis_decode moe_router moe_experts)
+foreach(name IN ITEMS trellis_decode moe_router moe_experts fp8_linear moe_shared_combine moe_block)
   add_executable(ignis_kernel_${name}_test test_${name}.cu)
   target_compile_definitions(ignis_kernel_${name}_test PRIVATE
     IGNIS_FLASH_NEXT_FIXTURE_DIR="${IGNIS_FLASH_NEXT_FIXTURE_DIR}")
   target_link_libraries(ignis_kernel_${name}_test PRIVATE ignis_kernel ignis_vendor)
   add_test(NAME ignis_kernel_${name}_test COMMAND ignis_kernel_${name}_test)
 endforeach()
+# A selected expert projection with no record traps the expert kernels; a trap kills the
+# context, so each route runs in its own process.
+add_executable(ignis_kernel_moe_slot_trap_test test_moe_slot_trap.cu)
+target_link_libraries(ignis_kernel_moe_slot_trap_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_moe_slot_trap_decode_test COMMAND ignis_kernel_moe_slot_trap_test decode)
+add_test(NAME ignis_kernel_moe_slot_trap_prefill_test COMMAND ignis_kernel_moe_slot_trap_test prefill)
 # The MoE microbenchmark: a report of every op's achieved bandwidth or throughput, and a
 # pass/fail CTest for one figure only, the spec's decode floor (one-token routed decode >= 50%
 # of the DRAM roofline). Timing wants the card to itself, as every test here does.

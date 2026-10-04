@@ -147,6 +147,17 @@ uint64_t ignis_moe_workspace_bytes(uint32_t max_tokens);
  * once at load. The ops leave it ready for their next call. */
 int32_t ignis_moe_workspace_init(void *workspace, uint32_t max_tokens, int64_t *acc, void *stream);
 
+/* Every device buffer one MoE block needs for calls of up to `max_tokens` tokens, as the plan
+ * lines the load reserves (ADR 0030); the expert weights themselves are residency's (spec 03). */
+struct ignis_moe_plan {
+  uint64_t workspace;  /* ignis_moe_workspace_bytes(max_tokens) */
+  uint64_t acc;        /* the routed accumulator, int64 [max_tokens][2560] */
+  uint64_t router;     /* ids int32 [max][10], weights fp32 [max][10], logits fp32 [max][512] */
+  uint64_t shared;     /* the shared expert's h BF16 [max][640] and output fp32 [max][2560] */
+  uint64_t total;      /* the four lines, each rounded up to 256 bytes */
+};
+int32_t ignis_moe_plan_bytes(uint32_t max_tokens, struct ignis_moe_plan *plan);
+
 /* Blocks the host until `stream` (NULL: the legacy default stream) has finished its work; for
  * tests and tools that drive the ops directly. */
 int32_t ignis_moe_stream_sync(void *stream);

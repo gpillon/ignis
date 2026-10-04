@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -164,6 +165,35 @@ int main() {
   DeviceBytes dx(x.size() * 2);
   upload(dx, x);
 
+  // Device time per call: `calls` launches captured in one CUDA graph and replayed, so WDDM's
+  // per-launch submission cost (several us) is not measured -- the engine runs decode as graphs.
+  cudaStream_t bench_stream;
+  MOE_CUDA(cudaStreamCreateWithFlags(&bench_stream, cudaStreamNonBlocking));
+  auto time_us = [&](int calls, const std::function<void(int, cudaStream_t)> &launch) {
+    for (int c = 0; c < 4; ++c) launch(c, bench_stream);  // first-call setup outside the capture
+    MOE_CUDA(cudaStreamSynchronize(bench_stream));
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    MOE_CUDA(cudaStreamBeginCapture(bench_stream, cudaStreamCaptureModeGlobal));
+    for (int c = 0; c < calls; ++c) launch(c, bench_stream);
+    MOE_CUDA(cudaStreamEndCapture(bench_stream, &graph));
+    MOE_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+    MOE_CUDA(cudaGraphLaunch(exec, bench_stream));  // warm-up, also cycles the L2
+    cudaEvent_t a, b;
+    MOE_CUDA(cudaEventCreate(&a));
+    MOE_CUDA(cudaEventCreate(&b));
+    const int replays = 3;
+    MOE_CUDA(cudaEventRecord(a, bench_stream));
+    for (int r = 0; r < replays; ++r) MOE_CUDA(cudaGraphLaunch(exec, bench_stream));
+    MOE_CUDA(cudaEventRecord(b, bench_stream));
+    MOE_CUDA(cudaEventSynchronize(b));
+    float ms = 0.0f;
+    MOE_CUDA(cudaEventElapsedTime(&ms, a, b));
+    MOE_CUDA(cudaGraphExecDestroy(exec));
+    MOE_CUDA(cudaGraphDestroy(graph));
+    return 1e3 * ms / (calls * replays);
+  };
+
   bool floor_ok = true;
   for (int tokens : {1, 2, 3}) {
     const int calls = 320;
@@ -183,27 +213,99 @@ int main() {
       bytes += tokens * kH * 2.0;
     }
     bytes /= calls;
-    auto launch = [&](int c) {
+    const double us = time_us(calls, [&](int c, cudaStream_t st) {
       MOE_RC(ignis_moe_experts_decode(dx.p, tokens, dids.as<int32_t>() + static_cast<std::size_t>(c) * tokens * kTop,
                                       dw.as<float>() + static_cast<std::size_t>(c) * tokens * kTop,
-                                      d_slots.as<ignis_moe_slot>(), workspace.p, acc.as<int64_t>(), nullptr));
-    };
-    for (int c = 0; c < 64; ++c) launch(c);  // warm-up, also cycles the L2
-    cudaEvent_t a, b;
-    MOE_CUDA(cudaEventCreate(&a));
-    MOE_CUDA(cudaEventCreate(&b));
-    MOE_CUDA(cudaEventRecord(a));
-    for (int c = 0; c < calls; ++c) launch(c);
-    MOE_CUDA(cudaEventRecord(b));
-    MOE_CUDA(cudaEventSynchronize(b));
-    float ms = 0.0f;
-    MOE_CUDA(cudaEventElapsedTime(&ms, a, b));
-    const double us = 1e3 * ms / calls;
+                                      d_slots.as<ignis_moe_slot>(), workspace.p, acc.as<int64_t>(), st));
+    });
     const double gbs = bytes / (us * 1e-6) / 1e9;
     std::printf("  routed decode, %d token(s): %.1f us per layer, %.2f MB read, %.0f GB/s = %.1f%% of roofline (%.1f%% of streaming read)\n",
                 tokens, us, bytes / 1e6, gbs, 100.0 * gbs / roof, 100.0 * gbs / sustained);
     if (tokens == 1 && gbs < kDecodeFloor * roof) floor_ok = false;
   }
+
+  // The other ops, each over copies that together exceed the L2 so the weights come from DRAM.
+  {
+    // Router at decode: 32 router weights (2.6 MB each).
+    const int copies = 32;
+    const std::size_t wbytes = static_cast<std::size_t>(kE) * kH * 2;
+    DeviceBytes rw(wbytes * copies), ids(8 * kTop * 4), w(8 * kTop * 4), logits(8 * kE * 4);
+    MOE_CUDA(cudaMemset(rw.p, 0x3c, wbytes * copies));
+    for (int tokens : {1, 3}) {
+      const double us = time_us(256, [&](int c, cudaStream_t st) {
+        MOE_RC(ignis_moe_router(dx.p, tokens, static_cast<char *>(rw.p) + (c % copies) * wbytes, ids.as<int32_t>(),
+                                w.as<float>(), logits.as<float>(), st));
+      });
+      const double gbs = wbytes / (us * 1e-6) / 1e9;
+      std::printf("  router, %d token(s): %.1f us, %.2f MB read, %.0f GB/s = %.1f%% of roofline\n", tokens, us, wbytes / 1e6, gbs,
+                  100.0 * gbs / roof);
+    }
+  }
+  {
+    // Shared expert at decode: 32 copies of its three FP8 matrices (4.9 MB a set).
+    const int copies = 32;
+    const std::size_t gu_bytes = static_cast<std::size_t>(kI) * kH + 256 + kI * 2;  // codes, pad, scales
+    const std::size_t dn_bytes = static_cast<std::size_t>(kH) * kI + 256 + kH * 2;
+    const std::size_t set = (2 * gu_bytes + dn_bytes + 255) / 256 * 256;
+    DeviceBytes weights(set * copies), h(8 * kI * 2), shared(8 * kH * 4);
+    MOE_CUDA(cudaMemset(weights.p, 0x22, set * copies));
+    const double bytes = 2.0 * kI * kH + 1.0 * kH * kI;
+    for (int tokens : {1, 3}) {
+      const double us = time_us(256, [&](int c, cudaStream_t st) {
+        const char *base = static_cast<const char *>(weights.p) + (c % copies) * set;
+        MOE_RC(ignis_moe_shared_expert(base, base + (gu_bytes + 15) / 16 * 16, base + 2 * ((gu_bytes + 15) / 16 * 16), dx.p, tokens,
+                                       h.p, shared.as<float>(), st));
+      });
+      const double gbs = bytes / (us * 1e-6) / 1e9;
+      std::printf("  shared expert (FP8), %d token(s): %.1f us, %.2f MB read, %.0f GB/s = %.1f%% of roofline\n", tokens, us,
+                  bytes / 1e6, gbs, 100.0 * gbs / roof);
+    }
+    // Combine at decode.
+    DeviceBytes wg(kH * 2), out(8 * kH * 2);
+    MOE_CUDA(cudaMemset(wg.p, 0, kH * 2));
+    const double us = time_us(256, [&](int, cudaStream_t st) {
+      MOE_RC(ignis_moe_combine(acc.as<int64_t>(), shared.as<float>(), dx.p, wg.p, 1, out.p, st));
+    });
+    std::printf("  combine, 1 token: %.1f us\n", us);
+  }
+  {
+    // Prefill, 2048 tokens: routed experts over the pool (uniform routing, ~64 rows per expert),
+    // and the shared expert's FP8 linears; TFLOP/s against the BF16/FP16 dense tensor peak.
+    const int tokens = 2048;
+    const double peak_tflops = 209.5;  // RTX 5090, dense FP16/BF16 tensor (NVIDIA's figure)
+    DeviceBytes pws(ignis_moe_workspace_bytes(tokens)), pacc(static_cast<std::size_t>(tokens) * kH * 8);
+    MOE_RC(ignis_moe_workspace_init(pws.p, tokens, pacc.as<int64_t>(), nullptr));
+    const std::vector<uint16_t> px = make_tokens(tokens, 32, 2.0f);
+    std::vector<int32_t> ids(static_cast<std::size_t>(tokens) * kTop);
+    for (int t = 0; t < tokens; ++t) {
+      for (int r = 0; r < kTop; ++r) ids[static_cast<std::size_t>(t) * kTop + r] = (t * 37 + r * 32) % kPool;
+    }
+    std::vector<float> w(ids.size(), 0.1f);
+    DeviceBytes dpx(px.size() * 2), dids(ids.size() * 4), dw(w.size() * 4);
+    upload(dpx, px);
+    upload(dids, ids);
+    upload(dw, w);
+    const double us = time_us(8, [&](int, cudaStream_t st) {
+      MOE_RC(ignis_moe_experts_prefill(dpx.p, tokens, dids.as<int32_t>(), dw.as<float>(), d_slots.as<ignis_moe_slot>(), pws.p,
+                                       tokens, pacc.as<int64_t>(), st));
+    });
+    const double flops = 2.0 * tokens * kTop * (static_cast<double>(kH) * 2 * kI + static_cast<double>(kI) * kH);
+    std::printf("  routed prefill, %d tokens: %.0f us per layer, %.1f TFLOP/s = %.1f%% of the %.1f dense tensor peak\n", tokens, us,
+                flops / (us * 1e-6) / 1e12, 100.0 * flops / (us * 1e-6) / 1e12 / peak_tflops, peak_tflops);
+    const std::size_t gu_bytes = static_cast<std::size_t>(kI) * kH + 256 + kI * 2;
+    DeviceBytes gw(gu_bytes), uw(gu_bytes), dn(static_cast<std::size_t>(kH) * kI + 256 + kH * 2), h(static_cast<std::size_t>(tokens) * kI * 2),
+        shared(static_cast<std::size_t>(tokens) * kH * 4);
+    MOE_CUDA(cudaMemset(gw.p, 0x22, gu_bytes));
+    MOE_CUDA(cudaMemset(uw.p, 0x22, gu_bytes));
+    MOE_CUDA(cudaMemset(dn.p, 0x22, dn.bytes));
+    const double sus = time_us(8, [&](int, cudaStream_t st) {
+      MOE_RC(ignis_moe_shared_expert(gw.p, uw.p, dn.p, dpx.p, tokens, h.p, shared.as<float>(), st));
+    });
+    const double sflops = 2.0 * tokens * 3.0 * kH * kI;
+    std::printf("  shared expert prefill, %d tokens: %.0f us, %.1f TFLOP/s = %.1f%% of peak\n", tokens, sus,
+                sflops / (sus * 1e-6) / 1e12, 100.0 * sflops / (sus * 1e-6) / 1e12 / peak_tflops);
+  }
+
   if (!floor_ok) {
     std::fprintf(stderr, "bench_moe: the 1-token decode is below %.0f%% of the DRAM roofline\n", 100.0 * kDecodeFloor);
     return 1;

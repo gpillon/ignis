@@ -35,12 +35,12 @@ namespace {
 
 // One warp per tile: each lane reads its two words, decodes its eight weights and stores them
 // at their (row, column) -- the expert ops' own decoder, writing instead of multiplying.
-__global__ void trellis_reconstruct_kernel(const uint32_t *trellis, int k2, int tiles_k,
-                                           int tiles_n, __half *w) {
+template <int K2>
+__global__ void trellis_reconstruct_kernel(const uint32_t *trellis, int tiles_k, int tiles_n, __half *w) {
   const int lane = threadIdx.x & 31;
   const int warps = (blockDim.x >> 5) * gridDim.x;
-  const int words = ignis_trellis::tile_words(k2);
-  const ignis_trellis::LanePlan plan = ignis_trellis::lane_plan(k2, lane);
+  constexpr int words = ignis_trellis::tile_words(K2);
+  const ignis_trellis::LanePlan plan = ignis_trellis::lane_plan(K2, lane);
   const int out = tiles_n * 16;
   const int r0 = (lane % 4) * 2;
   const int c0 = lane / 4;
@@ -48,7 +48,7 @@ __global__ void trellis_reconstruct_kernel(const uint32_t *trellis, int k2, int 
        tile += warps) {
     const uint32_t *t = trellis + static_cast<size_t>(tile) * words;
     uint32_t frag[4];
-    ignis_trellis::decode_fragment(t[plan.w0], t[plan.w1], plan, frag);
+    ignis_trellis::decode_fragment<K2>(t[plan.w0], t[plan.w1], plan, frag);
     const int tk = tile / tiles_n;
     const int tn = tile % tiles_n;
 #pragma unroll
@@ -104,10 +104,17 @@ extern "C" int32_t ignis_moe_trellis_reconstruct(const void *trellis, uint32_t k
   const int tiles = static_cast<int>(in / 16 * (out / 16));
   const int warps_per_block = 8;
   const int blocks = (tiles + warps_per_block - 1) / warps_per_block;
-  trellis_reconstruct_kernel<<<blocks < 4096 ? blocks : 4096, warps_per_block * 32, 0,
-                               static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const uint32_t *>(trellis), static_cast<int>(k2), static_cast<int>(in / 16),
-      static_cast<int>(out / 16), static_cast<__half *>(w_f16));
+  const dim3 grid(blocks < 4096 ? blocks : 4096);
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  const uint32_t *t = static_cast<const uint32_t *>(trellis);
+  __half *w = static_cast<__half *>(w_f16);
+  const int tk = static_cast<int>(in / 16), tn = static_cast<int>(out / 16);
+  switch (k2) {
+  case 4: trellis_reconstruct_kernel<4><<<grid, warps_per_block * 32, 0, s>>>(t, tk, tn, w); break;
+  case 5: trellis_reconstruct_kernel<5><<<grid, warps_per_block * 32, 0, s>>>(t, tk, tn, w); break;
+  case 6: trellis_reconstruct_kernel<6><<<grid, warps_per_block * 32, 0, s>>>(t, tk, tn, w); break;
+  default: trellis_reconstruct_kernel<8><<<grid, warps_per_block * 32, 0, s>>>(t, tk, tn, w); break;
+  }
   return check_launch("ignis_moe_trellis_reconstruct");
 }
 

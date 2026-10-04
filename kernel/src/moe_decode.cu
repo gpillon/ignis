@@ -189,7 +189,7 @@ __device__ __forceinline__ void mma_k_loop(const Shared &s, int tokens, const ui
 #pragma unroll
       for (int n = 0; n < NT; ++n) {
         uint32_t frag[4];
-        ignis_trellis::decode_fragment(cur[i][n][0], cur[i][n][1], plan, frag);
+        ignis_trellis::decode_fragment<K2>(cur[i][n][0], cur[i][n][1], plan, frag);
         mma_f16(acc[n][0], a, frag[0], frag[1]);
         mma_f16(acc[n][1], a, frag[2], frag[3]);
       }
@@ -422,6 +422,18 @@ using namespace ignis_moe;
 
 extern "C" uint64_t ignis_moe_workspace_bytes(uint32_t max_tokens) {
   return workspace_layout(max_tokens).total;
+}
+
+extern "C" int32_t ignis_moe_plan_bytes(uint32_t max_tokens, struct ignis_moe_plan *plan) {
+  if (plan == nullptr) return fail("ignis_moe_plan_bytes: plan is NULL");
+  if (max_tokens == 0) return fail("ignis_moe_plan_bytes: max_tokens must be at least 1");
+  const uint64_t t = max_tokens;
+  plan->workspace = align256(workspace_layout(max_tokens).total);
+  plan->acc = align256(t * kHidden * 8);
+  plan->router = align256(t * kTopK * 4) + align256(t * kTopK * 4) + align256(t * kExperts * 4);
+  plan->shared = align256(t * kInter * 2) + align256(t * kHidden * 4);
+  plan->total = plan->workspace + plan->acc + plan->router + plan->shared;
+  return 0;
 }
 
 extern "C" int32_t ignis_moe_workspace_init(void *workspace, uint32_t max_tokens, int64_t *acc, void *stream) {

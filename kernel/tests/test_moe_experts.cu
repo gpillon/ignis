@@ -6,9 +6,14 @@
 //               expert and K, against the fp64 product of the exactly decoded weights. The
 //               routing covers all four K classes for both projections in one launch and
 //               shares experts between consecutive tokens.
+//   prefill    1 to 4096 tokens through ignis_moe_experts_prefill (device grouping, one launch
+//               per projection family), routed with skew: expert 7 in every token (a group of the
+//               whole chunk), expert 300 in token 0 only (a group of one), half the other picks
+//               from 32 warm experts, expert 0 never. Checked against fp64 on a sample of tokens
+//               that always includes the first and the last.
 //   determinism the same call twice, the records placed in a different order in device memory
 //               (other slot addresses), and the call captured in a CUDA graph and replayed
-//               twice: every accumulator bit equal.
+//               twice: every accumulator bit equal, for both routes.
 //
 // Tolerance. The kernels round each rotated activation to fp16 for the tensor cores (scaled by a
 // power of two so it is a normal number: relative error <= 2^-11) twice, at the gate/up input
@@ -66,17 +71,41 @@ std::vector<int32_t> covering_experts() {
   return picks;
 }
 
+// Prefill routing with skew: expert 7 in every token, 300 in token 0 only, 0 never, half the
+// rest from 32 warm experts.
+void make_skewed_routing(int tokens, uint32_t stream, std::vector<int32_t> &ids, std::vector<float> &weights) {
+  std::vector<float> unused;
+  make_routing(tokens, stream, 0, ids, weights);  // for the weights
+  uint64_t draw = 0;
+  for (int t = 0; t < tokens; ++t) {
+    int32_t *row = &ids[static_cast<std::size_t>(t) * kTop];
+    int n = 0;
+    row[n++] = 7;
+    if (t == 0) row[n++] = 300;
+    while (n < kTop) {
+      const uint32_t h = hash_u32(stream + 7, draw++);
+      const int32_t e = (h & 1u) ? static_cast<int32_t>(16 + (h >> 1) % 32) : static_cast<int32_t>((h >> 1) % kE);
+      if (e == 0 || e == 7 || e == 300 || std::find(row, row + n, e) != row + n) continue;
+      row[n++] = e;
+    }
+  }
+}
+
 struct Call {
   std::vector<uint16_t> x;
   std::vector<int32_t> ids;
   std::vector<float> weights;
   DeviceBytes dx, dids, dw;
-  Call(int tokens, uint32_t stream)
+  Call(int tokens, uint32_t stream, bool skewed = false)
       : x(make_tokens(tokens, stream, 2.0f)), dx(x.size() * 2), dids(static_cast<std::size_t>(tokens) * kTop * 4),
         dw(static_cast<std::size_t>(tokens) * kTop * 4) {
-    make_routing(tokens, stream + 1, 3, ids, weights);
+    if (skewed) {
+      make_skewed_routing(tokens, stream + 1, ids, weights);
+    } else {
+      make_routing(tokens, stream + 1, 3, ids, weights);
+    }
     const std::vector<int32_t> cover = covering_experts();
-    for (std::size_t i = 0; i < cover.size() && i < static_cast<std::size_t>(kTop); ++i) {
+    for (std::size_t i = 0; !skewed && i < cover.size() && i < static_cast<std::size_t>(kTop); ++i) {
       // Token 0 takes the covering experts first (keeping its ids distinct).
       for (int r = 0; r < kTop; ++r) {
         if (ids[r] == cover[i]) ids[r] = ids[i];
@@ -125,42 +154,87 @@ void decode_arm(Buffers &b, const ExpertSet &set) {
   }
 }
 
-void determinism_arm(Buffers &b, ExpertSet &set) {
-  const int tokens = 3;
-  const Call c(tokens, 900);
-  const std::vector<int64_t> first = run_decode(b, set, c, tokens);
-  check(run_decode(b, set, c, tokens) == first, "decode: a second run agrees bit for bit");
+std::vector<int64_t> run_prefill(Buffers &b, const ExpertSet &set, const Call &c, int tokens) {
+  b.clear_acc(tokens);
+  MOE_RC(ignis_moe_experts_prefill(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(), set.d_slots.as<ignis_moe_slot>(),
+                                   b.workspace.p, kMaxTokens, b.acc.as<int64_t>(), nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  return download<int64_t>(b.acc.p, static_cast<std::size_t>(tokens) * kH);
+}
 
-  // Other slot addresses: the records in reverse order.
-  std::vector<int> order(2 * kRecords);
-  std::iota(order.rbegin(), order.rend(), 0);
-  set.place(order);
-  check(run_decode(b, set, c, tokens) == first, "decode: records in other slots agree bit for bit");
-
-  // Graph capture and two replays.
-  cudaStream_t stream;
-  MOE_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  cudaGraph_t graph;
-  cudaGraphExec_t exec;
-  MOE_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-  MOE_CUDA(cudaMemsetAsync(b.acc.p, 0, static_cast<std::size_t>(tokens) * kH * 8, stream));
-  MOE_RC(ignis_moe_experts_decode(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(),
-                                  set.d_slots.as<ignis_moe_slot>(), b.workspace.p, b.acc.as<int64_t>(), stream));
-  MOE_CUDA(cudaStreamEndCapture(stream, &graph));
-  MOE_CUDA(cudaGraphInstantiate(&exec, graph, 0));
-  for (int replay = 0; replay < 2; ++replay) {
-    MOE_CUDA(cudaGraphLaunch(exec, stream));
-    MOE_CUDA(cudaStreamSynchronize(stream));
-    check(download<int64_t>(b.acc.p, static_cast<std::size_t>(tokens) * kH) == first,
-          "decode: graph replay " + std::to_string(replay + 1) + " agrees bit for bit");
+void prefill_arm(Buffers &b, const ExpertSet &set) {
+  for (int tokens : {1, 3, 64, 257, 2048, 4096}) {
+    const Call c(tokens, 1200 + tokens, true);
+    const std::vector<int64_t> acc = run_prefill(b, set, c, tokens);
+    std::vector<int> sample;
+    const int step = tokens > 24 ? tokens / 23 : 1;
+    for (int t = 0; t < tokens; t += step) sample.push_back(t);
+    if (sample.back() != tokens - 1) sample.push_back(tokens - 1);
+    const std::string name = "prefill, " + std::to_string(tokens) + " token(s)";
+    check_against_f64(name.c_str(), set, c, acc, sample);
+    if (tokens == 2048) {
+      check(run_prefill(b, set, c, tokens) == acc, "prefill: a second run agrees bit for bit");
+    }
   }
-  MOE_CUDA(cudaGraphExecDestroy(exec));
-  MOE_CUDA(cudaGraphDestroy(graph));
-  MOE_CUDA(cudaStreamDestroy(stream));
-  std::vector<int> identity(2 * kRecords);
-  std::iota(identity.begin(), identity.end(), 0);
-  set.place(identity);
-  std::printf("  determinism: rerun, other slots and two graph replays compared bit for bit\n");
+}
+
+void determinism_arm(Buffers &b, ExpertSet &set) {
+  struct Route {
+    const char *name;
+    int tokens;
+    bool prefill;
+  };
+  for (const Route &route : {Route{"decode", 3, false}, Route{"prefill", 257, true}}) {
+    const Call c(route.tokens, route.prefill ? 901 : 900, route.prefill);
+    const int tokens = route.tokens;
+    auto enqueue = [&](cudaStream_t stream) {
+      MOE_CUDA(cudaMemsetAsync(b.acc.p, 0, static_cast<std::size_t>(tokens) * kH * 8, stream));
+      if (route.prefill) {
+        MOE_RC(ignis_moe_experts_prefill(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(), set.d_slots.as<ignis_moe_slot>(),
+                                         b.workspace.p, kMaxTokens, b.acc.as<int64_t>(), stream));
+      } else {
+        MOE_RC(ignis_moe_experts_decode(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(), set.d_slots.as<ignis_moe_slot>(),
+                                        b.workspace.p, b.acc.as<int64_t>(), stream));
+      }
+    };
+    auto result = [&]() { return download<int64_t>(b.acc.p, static_cast<std::size_t>(tokens) * kH); };
+    enqueue(nullptr);
+    MOE_CUDA(cudaDeviceSynchronize());
+    const std::vector<int64_t> first = result();
+    enqueue(nullptr);
+    MOE_CUDA(cudaDeviceSynchronize());
+    check(result() == first, std::string(route.name) + ": a second run agrees bit for bit");
+
+    // Other slot addresses: the records in reverse order.
+    std::vector<int> order(2 * kRecords);
+    std::iota(order.rbegin(), order.rend(), 0);
+    set.place(order);
+    enqueue(nullptr);
+    MOE_CUDA(cudaDeviceSynchronize());
+    check(result() == first, std::string(route.name) + ": records in other slots agree bit for bit");
+
+    // Graph capture and two replays.
+    cudaStream_t stream;
+    MOE_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    MOE_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    enqueue(stream);
+    MOE_CUDA(cudaStreamEndCapture(stream, &graph));
+    MOE_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+    for (int replay = 0; replay < 2; ++replay) {
+      MOE_CUDA(cudaGraphLaunch(exec, stream));
+      MOE_CUDA(cudaStreamSynchronize(stream));
+      check(result() == first, std::string(route.name) + ": graph replay " + std::to_string(replay + 1) + " agrees bit for bit");
+    }
+    MOE_CUDA(cudaGraphExecDestroy(exec));
+    MOE_CUDA(cudaGraphDestroy(graph));
+    MOE_CUDA(cudaStreamDestroy(stream));
+    std::vector<int> identity(2 * kRecords);
+    std::iota(identity.begin(), identity.end(), 0);
+    set.place(identity);
+    std::printf("  determinism (%s, %d tokens): rerun, other slots and two graph replays compared bit for bit\n", route.name, tokens);
+  }
 }
 
 }  // namespace
@@ -175,6 +249,7 @@ int main() {
   set.place(identity);
   Buffers buffers;
   decode_arm(buffers, set);
+  prefill_arm(buffers, set);
   determinism_arm(buffers, set);
   if (g_failed != 0) {
     std::fprintf(stderr, "test_moe_experts: %d failure(s)\n", g_failed);

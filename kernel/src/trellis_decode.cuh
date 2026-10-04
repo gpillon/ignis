@@ -37,12 +37,15 @@ __host__ __device__ constexpr int step_end(int k2, int p) {
 // u32 words per tile: 256 * K / 32.
 __host__ __device__ constexpr int tile_words(int k2) { return 4 * k2; }
 
-// Which two u32 words of a tile lane `lane` reads, and the right shifts that bring each of its
-// eight states to the bottom of the 64-bit window (word w0 high, word w1 low).
+// Which two u32 words of a tile lane `lane` reads, and how far its first window bit sits below
+// the top of the 64-bit window (word w0 high, word w1 low). Shifting the window left by `off`
+// puts every lane's first bit at bit 63, after which the eight states sit at the same offsets
+// in every lane: a lane's steps start at an even step, so even K = 2.5's 2/3-bit pattern is
+// lane-independent from there.
 struct LanePlan {
   int w0;
   int w1;
-  int shift[8];
+  uint32_t off;
 };
 
 __host__ __device__ inline LanePlan lane_plan(int k2, int lane) {
@@ -52,23 +55,32 @@ __host__ __device__ inline LanePlan lane_plan(int k2, int lane) {
   const int w0 = first >= 0 ? first / 32 : -1;
   plan.w0 = w0 < 0 ? words - 1 : w0;
   plan.w1 = (w0 + 1) % words;  // read but unused when the window ends inside w0
-  const int base = 32 * w0;
-  for (int j = 0; j < 8; ++j) plan.shift[j] = 64 - (step_end(k2, 8 * lane + j) - base);
+  plan.off = static_cast<uint32_t>(first - 32 * w0);
   return plan;
 }
 
-// Lane `plan`'s eight weights of one tile, from that tile's u32 words `word0` (= tile[w0]) and
-// `word1` (= tile[w1]), as four half2 registers in fragment order: frag[0] = B rows
-// (k0, k0 + 1) of n8 half 0, frag[1] = rows (k0 + 8, k0 + 9) of half 0, frag[2] and frag[3]
+// The right shift that brings state j of a lane (0..7) to the bottom of the normalized window:
+// state j ends 16 + (end of step j - end of step 0) bits below the window's top.
+__host__ __device__ constexpr int state_shift(int k2, int j) {
+  return 64 - (16 + step_end(k2, j) - step_end(k2, 0));
+}
+
+// Lane `plan`'s eight weights of one tile of class K2, from that tile's u32 words `word0`
+// (= tile[w0]) and `word1` (= tile[w1]), as four half2 registers in fragment order: frag[0] = B
+// rows (k0, k0 + 1) of n8 half 0, frag[1] = rows (k0 + 8, k0 + 9) of half 0, frag[2] and frag[3]
 // the same for half 1.
-__device__ __forceinline__ void decode_fragment(uint32_t word0, uint32_t word1,
-                                                const LanePlan &plan, uint32_t (&frag)[4]) {
-  const uint64_t window = (static_cast<uint64_t>(word0) << 32) | word1;
+template <int K2>
+__device__ __forceinline__ void decode_fragment(uint32_t word0, uint32_t word1, const LanePlan &plan,
+                                                uint32_t (&frag)[4]) {
+  const uint64_t window = ((static_cast<uint64_t>(word0) << 32) | word1) << plan.off;
+  const uint32_t hi = static_cast<uint32_t>(window >> 32);
+  const uint32_t lo = static_cast<uint32_t>(window);
   uint32_t bits[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    const uint32_t state = static_cast<uint32_t>(window >> plan.shift[j]) & 0xFFFFu;
-    bits[j] = __dp4a(state * kMul1, 0x01010101u, 0x6400u);
+    const int sh = state_shift(K2, j);  // a constant once the loop is unrolled
+    const uint32_t raw = sh >= 32 ? hi >> (sh - 32) : __funnelshift_r(lo, hi, sh);
+    bits[j] = __dp4a((raw & 0xFFFFu) * kMul1, 0x01010101u, 0x6400u);
   }
   const __half2 k_inv = __halves2half2(__ushort_as_half(0x1EEE), __ushort_as_half(0x1EEE));
   const __half2 k_bias = __halves2half2(__ushort_as_half(0xC931), __ushort_as_half(0xC931));
