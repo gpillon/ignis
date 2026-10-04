@@ -28,6 +28,7 @@
     <td align="center"><b>1,065 tok/s</b><br><sub>eight lanes, aggregate</sub></td>
     <td align="center"><b>7.11x</b><br><sub>KV capacity of BF16</sub></td>
     <td align="center"><b>~36 ms</b><br><sub>a decision, zero tokens decoded</sub></td>
+    <td align="center"><b>512K</b><br><sub>default context</sub></td>
   </tr>
 </table>
 
