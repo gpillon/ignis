@@ -62,15 +62,18 @@ Windows `.zip`, a Linux `.tar.gz`, or the `linux/amd64` container image on
 `ghcr.io/gpillon/ignis`. Run it on a Blackwell card:
 
 ```
-ignis-server --max-context 524288 --rope-scaling yarn:2 --spec dflash2 --draft-tokens 7
+ignis-server --max-context 524288 --rope-scaling yarn:2 \
+  --spec dflash2 --draft-tokens 7 --vision --metrics
 ```
 
-No model yet? It offers to fetch one. Those flags are the configuration the
-numbers below were taken with: a 512K context, and DFlash2 speculative decoding,
-which the bare `ignis-server` leaves off (it starts at a 40,960-token context).
+No model yet? It offers to fetch one. Those flags turn on what the bare
+`ignis-server` leaves off: the 512K context (it starts at 40,960), DFlash2
+speculative decoding, image input, and the Prometheus metrics the Playground's
+Monitor reads.
 
-Then the OpenAI API is on <http://127.0.0.1:8000/v1> and the Playground on
-<http://127.0.0.1:8000/ui/>. The weights are on Hugging Face in two flavours,
+Then the OpenAI API is on <http://127.0.0.1:8000/v1>, the Playground and its
+Monitor on <http://127.0.0.1:8000/ui/>, and Prometheus on
+<http://127.0.0.1:9464/metrics>. The weights are on Hugging Face in two flavours,
 the standard one and an uncensored one: [The weights](#the-weights). Everything
 else — the container, building from a checkout, every flag — is
 [Quick start](#quick-start) and [docs/user](docs/user/README.md).
