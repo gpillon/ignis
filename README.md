@@ -73,7 +73,9 @@ else — the container, building from a checkout, every flag — is
 ## How fast
 
 **Ignis on one RTX 5090** — Qwen3.8-27B NVFP4, hq-e8-2b KV, DFlash2 speculative
-decoding with 7 draft tokens, greedy, short prompts:
+decoding with 7 draft tokens, greedy, short prompts. The default context is
+**512K tokens** (524,288 with `yarn:2`, what `make` serves); these runs used a
+262,144-token maximum:
 
 | load | throughput | source |
 |---|---:|---|
