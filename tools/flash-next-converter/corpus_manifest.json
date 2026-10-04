@@ -1,0 +1,28 @@
+{
+ "schema": "flash-next-corpus-v1",
+ "note": "Exactly the compression study's run 4-8 calibration and test set (spec 01, 'Decided'). Files are read from --ood-dir / --windows-dir and must match these sha256s; every source a file declares must be in the allowlist.",
+ "allowlist": {
+  "ignis-repo": {"what": "this repository's own source code and documentation", "licence": "owner's own"},
+  "ignis-own-samples": {"what": "the model's own sampled chat turns from the owner's effort sweep, templated", "licence": "owner's own"},
+  "ignis-canary": {"what": "the canary prompts and recorded completions of crates/bench/tests/fixtures/oracle_canary.json", "licence": "owner's own"},
+  "wikitext-103": {"what": "Salesforce/wikitext wikitext-103-raw-v1 test", "licence": "CC BY-SA 3.0"},
+  "wikimedia-wikipedia-20231101": {"what": "wikimedia/wikipedia 20231101.it/.zh/.de/.ja, first parquet shard", "licence": "CC BY-SA 4.0"},
+  "openai-gsm8k": {"what": "openai/gsm8k main test", "licence": "MIT"},
+  "transformers-source": {"what": "modeling_*.py of the installed transformers package", "licence": "Apache-2.0"},
+  "tiger-lab-mmlu-pro": {"what": "TIGER-Lab/MMLU-Pro test questions", "licence": "MIT"}
+ },
+ "files": {
+  "windows.json": {"dir": "windows", "sha256": "86b4dd6a1d0cb5b7a02ec4fc5e3c27fa01137635504f02bed7a370e29c60b1a7", "sources": ["ignis-repo", "ignis-own-samples"]},
+  "windows_meta.json": {"dir": "windows", "sha256": "6e2b66756918b67e8aa653465d8849073c438c406d4640b61673b038a6a84995", "sources": ["ignis-repo", "ignis-own-samples"]},
+  "long_windows.json": {"dir": "windows", "sha256": "80e1fe74327961ccc6754063798e9cf031466584ff332b8eca8b681ae1f46b86", "sources": ["ignis-repo"]},
+  "long_windows_meta.json": {"dir": "windows", "sha256": "9b9086970e66b31d754f5469be6091aca54e7b63076d01fd726e8e8aaa4b181f", "sources": ["ignis-repo"]},
+  "run4_chunks.json": {"dir": "ood", "sha256": "34efdb472de8428d092868777c06bbd653d206307cb81ef2f5287be0d395b256", "sources": ["wikitext-103", "wikimedia-wikipedia-20231101", "openai-gsm8k", "transformers-source"]},
+  "chunks.json": {"dir": "ood", "sha256": "6d6fdb093c819752ca548238203f084f4e2a30f208dd9fe9c0c3453de508cc5d", "sources": ["wikitext-103", "wikimedia-wikipedia-20231101", "openai-gsm8k", "transformers-source", "tiger-lab-mmlu-pro"]},
+  "calib_mmlu.json": {"dir": "ood", "sha256": "957709acba8fb86124abecc9c6e51b65c392af8abf35011737072e6929d880ab", "sources": ["tiger-lab-mmlu-pro"]}
+ },
+ "long8192": [
+  {"window": 3, "kind": "code", "starts": [0, 8192, 16384, 24576]},
+  {"window": 5, "kind": "prose", "starts": [0, 8192, 16384, 24576]}
+ ],
+ "canary": {"file": "crates/bench/tests/fixtures/oracle_canary.json", "sources": ["ignis-canary"]}
+}
