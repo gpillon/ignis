@@ -563,10 +563,29 @@ add_test(NAME ignis_kernel_seq_checkpoint_test COMMAND ignis_kernel_seq_checkpoi
 # an absolute path baked in at configure time. Same no-SKIP_RETURN_CODE rule as every other GPU
 # test here (ADR 0006).
 set(IGNIS_FLASH_NEXT_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next")
-foreach(name IN ITEMS trellis_decode moe_router)
+foreach(name IN ITEMS trellis_decode moe_router moe_experts)
   add_executable(ignis_kernel_${name}_test test_${name}.cu)
   target_compile_definitions(ignis_kernel_${name}_test PRIVATE
     IGNIS_FLASH_NEXT_FIXTURE_DIR="${IGNIS_FLASH_NEXT_FIXTURE_DIR}")
   target_link_libraries(ignis_kernel_${name}_test PRIVATE ignis_kernel ignis_vendor)
   add_test(NAME ignis_kernel_${name}_test COMMAND ignis_kernel_${name}_test)
 endforeach()
+# The MoE microbenchmark: a report of every op's achieved bandwidth or throughput, and a
+# pass/fail CTest for one figure only, the spec's decode floor (one-token routed decode >= 50%
+# of the DRAM roofline). Timing wants the card to itself, as every test here does.
+add_executable(ignis_kernel_moe_bench bench_moe.cu)
+target_link_libraries(ignis_kernel_moe_bench PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_moe_bench COMMAND ignis_kernel_moe_bench)
+
+# GitHub #302 (spec flash-next/04): OURS -- the GDN layer count and value-head count as two
+# topology numbers at the binder. Host-only (every arm fails at binding), like the other
+# model-load option tests above.
+add_executable(ignis_kernel_model_load_gdn_geometry_test test_model_load_gdn_geometry.cpp)
+target_link_libraries(ignis_kernel_model_load_gdn_geometry_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_model_load_gdn_geometry_test COMMAND ignis_kernel_model_load_gdn_geometry_test)
+
+# GitHub #301 (spec flash-next/03): OURS -- the expert residency miss path measured (copy
+# engine against SM-driven copies from mapped pinned memory). A timing is a finding, not a
+# pass/fail, so a tool and NOT registered with CTest. CUDA runtime only.
+add_executable(ignis_expert_miss_path_bench bench_expert_miss_path.cu)
+target_link_libraries(ignis_expert_miss_path_bench PRIVATE CUDA::cudart)
