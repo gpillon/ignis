@@ -101,7 +101,7 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--draft-head $(DRAFT_HEAD)))
 SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
-  $(if $(MODEL),--model $(MODEL)) \
+  $(if $(SERVED_MODEL),--model $(SERVED_MODEL)) \
   $(if $(filter 1,$(UI)),--ui,--no-ui) \
   $(if $(filter 1,$(METRICS)),--metrics $(if $(METRICS_BIND),--metrics-bind $(METRICS_BIND))) \
   $(if $(API_KEY),--api-key $(API_KEY)) \
@@ -110,7 +110,10 @@ SERVER_FLAGS = --bind $(BIND) \
   $(if $(DEVELOPER_MESSAGE_POLICY),--developer-message-policy $(DEVELOPER_MESSAGE_POLICY)) \
   $(ARGS)
 SERVER_ENV = $(if $(LOG_LEVEL),IGNIS_LOG_LEVEL=$(LOG_LEVEL)) $(if $(LOG_FORMAT),IGNIS_LOG_FORMAT=$(LOG_FORMAT))
-SMOKE_MODEL := $(or $(MODEL),qwen3.8-27b)
+# The served id: Flash-Next's own, none for the 27B (the server's default), or
+# the id MODEL names (mk/config.mk).
+SERVED_MODEL := $(if $(filter flash-next,$(MODEL)),qwen3.8-flash-next,$(filter-out 27b,$(MODEL)))
+SMOKE_MODEL := $(or $(SERVED_MODEL),qwen3.8-27b)
 # A generated key (API_KEY=auto) is unknown to make: pass the printed one.
 SMOKE_AUTH := $(if $(filter-out auto,$(API_KEY)),-H 'Authorization: Bearer $(API_KEY)')
 
@@ -179,7 +182,7 @@ config: ## Print the resolved knobs and paths
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),rest of the VRAM budget) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD))) rope=$(or $(ROPE_SCALING),none)"
 	@echo "VISION (CUDA=1) $(if $(filter 1,$(VISION)),on  max_tokens=$(or $(VISION_MAX_TOKENS),(server default)),off  (image parts are refused with vision_disabled))"
 	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1G))) retained_device=$(or $(RETAINED_DEVICE),(server default: 0)) retained_host=$(or $(RETAINED_HOST),(server default: two per lane))"
-	@echo "MODEL           $(or $(MODEL),(server default))"
+	@echo "MODEL           $(if $(filter flash-next,$(MODEL)),flash-next  (Qwen3.8-Flash-Next as $(SERVED_MODEL); its 3 lanes / prefetch width 16 / 1G n-gram hot rows are not server flags yet),$(if $(SERVED_MODEL),27b  (served as $(SERVED_MODEL)),27b  (server default id)))"
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"
 	@echo "LOG_FORMAT      $(or $(LOG_FORMAT),(server default))"

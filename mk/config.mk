@@ -22,6 +22,24 @@ METRICS ?= 0
 # The metrics listener (--metrics-bind). Empty = the server's 127.0.0.1:9464.
 METRICS_BIND ?=
 
+# The model (ADR 0043, spec flash-next/04): one per process, chosen at start.
+# MODEL=flash-next serves Qwen3.8-Flash-Next from its own artifact, as
+# qwen3.8-flash-next, with the defaults below (each still a knob). MODEL=27b,
+# or empty, is Qwen3.8-27B, the default. Any other value is the 27B served
+# under that id (--model), as before.
+MODEL ?=
+ifeq ($(MODEL),flash-next)
+  ARTIFACT ?= F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_trellis_a25-v2.ninfer
+  # 128K tokens per lane under hq-e8-2b, inside the checkpoint's 262,144
+  # trained positions (so no YaRN); 8192-token prefill chunks amortize a
+  # chunk's expert transfer (spec flash-next/03); no speculation, no vision.
+  MAX_CONTEXT ?= 131072
+  ROPE_SCALING ?= none
+  PREFILL_CHUNK ?= 8192
+  SPEC ?=
+  VISION ?=
+endif
+
 # The .ninfer container (used with CUDA=1 only). See README "Models".
 # UNCENSORED=1 takes the huihui-abliterated twin of the default image from the
 # same directory instead: the same container with the 70 matrices the
@@ -37,7 +55,6 @@ endif
 
 # Server settings. Empty = the server's own default.
 BIND ?= 127.0.0.1:8000
-MODEL ?=
 LOG_LEVEL ?=
 LOG_FORMAT ?=
 # The key /v1 requires (--api-key). Empty = no key; auto = the server
