@@ -147,6 +147,10 @@ uint64_t ignis_moe_workspace_bytes(uint32_t max_tokens);
  * once at load. The ops leave it ready for their next call. */
 int32_t ignis_moe_workspace_init(void *workspace, uint32_t max_tokens, int64_t *acc, void *stream);
 
+/* Blocks the host until `stream` (NULL: the legacy default stream) has finished its work; for
+ * tests and tools that drive the ops directly. */
+int32_t ignis_moe_stream_sync(void *stream);
+
 /* Thread-local message from the most recent failed call. Never NULL. */
 const char *ignis_moe_last_error(void);
 

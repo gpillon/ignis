@@ -111,4 +111,10 @@ extern "C" int32_t ignis_moe_trellis_reconstruct(const void *trellis, uint32_t k
   return check_launch("ignis_moe_trellis_reconstruct");
 }
 
+extern "C" int32_t ignis_moe_stream_sync(void *stream) {
+  const cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+  if (err != cudaSuccess) return fail(std::string("ignis_moe_stream_sync: ") + cudaGetErrorString(err));
+  return 0;
+}
+
 extern "C" const char *ignis_moe_last_error(void) { return last_error_cstr(); }
