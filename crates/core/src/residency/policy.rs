@@ -25,10 +25,14 @@
 //!      entry of the pool, so a prefill evicts nothing;
 //! 5. with a lookahead, takes the first `prefetch_width` experts of each
 //!    lane's ranking for the next layer, both projections of each — the
-//!    **candidates** — skips what is resident or staged, and admits the rest
-//!    in canonical key order the same way, except that a decode prefetch with
-//!    no victim available is **dropped**, not an error, and so is a
-//!    candidate step 4 had to evict;
+//!    **candidates**, in **rank order**: every lane's first expert, then
+//!    every lane's second, …, gate/up before down, a repeat kept where it
+//!    first appears — skips what is resident or staged, and admits the rest
+//!    in that order the same way, except that a decode prefetch is
+//!    **dropped**, not an error, when no victim is available, when step 4
+//!    had to evict it, or once the step's prefetches would pass
+//!    `prefetch_budget_bytes` (decode only: a prefill streams its lookahead
+//!    whole);
 //! 6. releases this layer's staged projections: the expert kernel has run.
 //!
 //! **Victim:** of a class's resident projections not stamped by the current
@@ -60,9 +64,9 @@
 //! hottest-first list before the first step; the hottest gets the most
 //! recent stamp, so the least hot is evicted first.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
-use super::class::{ExpertCatalog, KClass, ProjectionId};
+use super::class::{ExpertCatalog, KClass, Projection, ProjectionId};
 use super::metrics::ResidencyCounters;
 
 /// The router's lookahead width the spec sets by default (a load option).
@@ -94,7 +98,7 @@ impl Phase {
 }
 
 /// Where a copied projection lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Admission {
     /// A slot of its class's pool: a cache entry from now on.
     Slot,
@@ -110,6 +114,11 @@ pub struct PolicyConfig {
     pub capacity: [u32; KClass::COUNT],
     /// Experts taken from the top of each lane's lookahead ranking.
     pub prefetch_width: usize,
+    /// The most a decode step may prefetch, in bytes; `None`: no limit. The
+    /// link is shared with the step's own misses, so a prefetch only pays
+    /// while it fits beside the step's compute (the study's window: one
+    /// layer's compute time at the link's bandwidth).
+    pub prefetch_budget_bytes: Option<u64>,
 }
 
 /// One layer step of a routing trace.
@@ -203,13 +212,54 @@ struct Entry {
     prefetched: bool,
 }
 
+/// Every projection's entry, if resident, indexed densely by (layer,
+/// expert, plane): the model's hottest lookup.
+#[derive(Debug, Clone)]
+struct Resident {
+    experts: usize,
+    entries: Vec<Option<Entry>>,
+}
+
+impl Resident {
+    fn new(catalog: &ExpertCatalog) -> Self {
+        let experts = usize::from(catalog.experts());
+        Self {
+            experts,
+            entries: vec![None; usize::from(catalog.layers()) * experts * 2],
+        }
+    }
+
+    fn at(&self, id: &ProjectionId) -> usize {
+        (usize::from(id.layer) * self.experts + usize::from(id.expert)) * 2
+            + usize::from(id.projection == Projection::Down)
+    }
+
+    fn contains_key(&self, id: &ProjectionId) -> bool {
+        self.entries[self.at(id)].is_some()
+    }
+
+    fn get(&self, id: &ProjectionId) -> Option<&Entry> {
+        self.entries[self.at(id)].as_ref()
+    }
+
+    fn insert(&mut self, id: ProjectionId, entry: Entry) {
+        let at = self.at(&id);
+        self.entries[at] = Some(entry);
+    }
+
+    fn remove(&mut self, id: &ProjectionId) {
+        let at = self.at(id);
+        self.entries[at] = None;
+    }
+}
+
 /// The policy model. See the module documentation for its contract.
 #[derive(Debug, Clone)]
 pub struct ResidencyModel {
     catalog: ExpertCatalog,
     config: PolicyConfig,
     clock: u64,
-    resident: HashMap<ProjectionId, Entry>,
+    resident: Resident,
     /// Per class, its resident projections by `(stamp, key)`: the first
     /// unpinned one is the victim.
     lru: [BTreeSet<(u64, ProjectionId)>; KClass::COUNT],
@@ -222,10 +272,10 @@ impl ResidencyModel {
     /// A cold model: every pool empty.
     pub fn new(catalog: ExpertCatalog, config: PolicyConfig) -> Self {
         Self {
+            resident: Resident::new(&catalog),
             catalog,
             config,
             clock: 0,
-            resident: HashMap::new(),
             lru: Default::default(),
             staged: BTreeSet::new(),
             counters: ResidencyCounters::default(),
@@ -247,7 +297,7 @@ impl ResidencyModel {
 
     /// Whether a projection is in its class's pool now.
     pub fn is_resident(&self, id: ProjectionId) -> bool {
-        self.resident.contains_key(&id)
+        self.catalog.contains(id) && self.resident.contains_key(&id)
     }
 
     /// Everything counted since the model was made.
@@ -308,12 +358,7 @@ impl ResidencyModel {
 
         let selected = projections_of(layer, step.selected.iter().copied());
         let candidates = match next_layer {
-            Some(next) => projections_of(
-                next,
-                step.lookahead
-                    .iter()
-                    .flat_map(|lane| lane.iter().take(self.config.prefetch_width).copied()),
-            ),
+            Some(next) => ranked_candidates(next, step.lookahead, self.config.prefetch_width),
             None => Vec::new(),
         };
         // What the next layer is predicted to read and already holds: this
@@ -377,6 +422,12 @@ impl ResidencyModel {
             out.misses.push((id, admission));
         }
 
+        let budget = match step.phase {
+            Phase::Decode => self.config.prefetch_budget_bytes,
+            Phase::Prefill => None,
+        };
+        let mut spent = 0u64;
+        let mut spent_out = false;
         for id in candidates {
             if self.resident.contains_key(&id) || self.staged.contains(&id) {
                 continue;
@@ -384,6 +435,12 @@ impl ResidencyModel {
             // A protected candidate this step's misses had to take is not
             // fetched back by the same step.
             if out.evictions.contains(&id) {
+                out.prefetch_dropped.push(id);
+                continue;
+            }
+            let bytes = self.catalog.bytes(id);
+            spent_out |= budget.is_some_and(|b| spent + bytes > b);
+            if spent_out {
                 out.prefetch_dropped.push(id);
                 continue;
             }
@@ -399,7 +456,7 @@ impl ResidencyModel {
                 }
                 Phase::Prefill => self.admit_without_evicting(id, now, true),
             };
-            let bytes = self.catalog.bytes(id);
+            spent += bytes;
             self.counters.prefetch_issued += 1;
             self.counters.bytes_moved[phase] += bytes;
             out.bytes_moved += bytes;
@@ -408,6 +465,8 @@ impl ResidencyModel {
 
         self.staged.retain(|id| id.layer != layer);
         out.evictions.sort();
+        out.prefetches.sort();
+        out.prefetch_dropped.sort();
         Ok(out)
     }
 
@@ -495,9 +554,29 @@ impl ResidencyModel {
 fn projections_of(layer: u16, experts: impl Iterator<Item = u16>) -> Vec<ProjectionId> {
     let mut set = BTreeSet::new();
     for expert in experts {
-        for projection in super::class::Projection::ALL {
+        for projection in Projection::ALL {
             set.insert(ProjectionId::new(layer, expert, projection));
         }
     }
     set.into_iter().collect()
+}
+
+/// The lookahead's candidates for `layer` in rank order: every lane's
+/// first expert, then every lane's second, up to `width`, both projections
+/// of each, a repeat kept where it first appears.
+fn ranked_candidates(layer: u16, lanes: &[&[u16]], width: usize) -> Vec<ProjectionId> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for rank in 0..width {
+        for lane in lanes {
+            let Some(&expert) = lane.get(rank) else { continue };
+            for projection in Projection::ALL {
+                let id = ProjectionId::new(layer, expert, projection);
+                if seen.insert(id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
 }

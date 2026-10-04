@@ -139,8 +139,8 @@ pub fn plan_host(request: &HostPlanRequest) -> Result<HostPlan, HostPlanError> {
 }
 
 /// What the expert cache line is made from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpertCacheRequest {
+#[derive(Debug, Clone, Copy)]
+pub struct ExpertCacheRequest<'a> {
     /// The VRAM plan's budget ([`crate::vram::VramPlan::budget_bytes`]).
     pub budget_bytes: u64,
     /// Everything the VRAM plan placed, the named KV pool included
@@ -153,13 +153,11 @@ pub struct ExpertCacheRequest {
     pub table_bytes: u64,
     /// [`EXPERT_CACHE_FLOOR_BYTES`] for a real load.
     pub floor_bytes: u64,
-    /// One slot of each class, indexed like [`KClass::ALL`].
-    pub slot_bytes: [u64; KClass::COUNT],
-    /// Projections per class ([`ExpertCatalog::class_counts`]): a pool never
-    /// holds more slots than its class has projections.
-    pub projections: [u64; KClass::COUNT],
-    /// Calibration selections per class ([`class_selections`]).
-    pub selections: [u64; KClass::COUNT],
+    /// The artifact's experts: slot bytes and projections per class.
+    pub catalog: &'a ExpertCatalog,
+    /// Calibration selections per (layer, expert), layer-major: the
+    /// sidecar's `expert_traffic`.
+    pub traffic: &'a [u64],
     /// [`min_slots_per_class`]: what every populated class gets first.
     pub min_slots: u32,
 }
@@ -176,8 +174,8 @@ pub struct ClassPool {
 pub struct ExpertCachePlan {
     /// The line: budget − planned − staging ring − tables.
     pub cache_bytes: u64,
-    /// Indexed like [`KClass::ALL`]. Their sum is at most `cache_bytes`;
-    /// flooring to whole slots leaves under one slot per class unused.
+    /// Indexed like [`KClass::ALL`]. Their sum is at most `cache_bytes`,
+    /// short of it by less than one slot of some class.
     pub pools: [ClassPool; KClass::COUNT],
     pub staging_ring_bytes: u64,
     pub table_bytes: u64,
@@ -247,13 +245,21 @@ impl std::error::Error for ExpertCachePlanError {}
 /// The expert cache line and its split, or a refusal below the floor.
 ///
 /// Every class with projections first gets `min(min_slots, projections)`
-/// slots. What is left is shared by **byte traffic** — calibration
-/// selections × slot bytes, so a pool's share of the cache is its class's
-/// share of the bytes routing asks for — by water-filling: a class whose
-/// share would exceed its projections is capped there and the rest is
-/// shared again among the others.
+/// slots. The rest is split the way **one LRU over all classes** would hold
+/// it: each class gets the bytes such an LRU of that size is expected to
+/// keep of it, from the calibration selection rates (the Che approximation:
+/// a projection selected at rate λ is resident with probability
+/// `1 − e^(−λT)`, with `T` set so the expected bytes fill the cache). Whole
+/// slots are floored, and what flooring leaves goes one slot at a time to
+/// the classes with the largest remainders that still fit.
+///
+/// Per-class pools are fixed at load, so this is the static split closest
+/// to the single LRU the study simulated: splitting by raw byte traffic
+/// starves the K = 2 classes, whose many cold experts an LRU keeps far more
+/// of than their traffic suggests, and cost 1.5x the simulated three-lane
+/// residency on the study's routing (`expert_residency_study_replay.rs`).
 pub fn plan_expert_cache(
-    request: &ExpertCacheRequest,
+    request: &ExpertCacheRequest<'_>,
 ) -> Result<ExpertCachePlan, ExpertCachePlanError> {
     let cache = request
         .budget_bytes
@@ -271,45 +277,40 @@ pub fn plan_expert_cache(
         });
     }
 
+    let catalog = request.catalog;
+    let slot_bytes: [u64; KClass::COUNT] = std::array::from_fn(|i| catalog.slot_bytes(KClass::ALL[i]));
+    let projections = catalog.class_counts();
     let mut slots = [0u64; KClass::COUNT];
     let mut left = cache;
     for i in 0..KClass::COUNT {
-        let first = u64::from(request.min_slots).min(request.projections[i]);
-        let bytes = first * request.slot_bytes[i];
-        slots[i] = first;
-        left = left.saturating_sub(bytes);
+        slots[i] = u64::from(request.min_slots).min(projections[i]);
+        left = left.saturating_sub(slots[i] * slot_bytes[i]);
     }
 
-    let room = |i: usize, slots: &[u64; KClass::COUNT]| request.projections[i] - slots[i];
-    let weight = |i: usize| u128::from(request.selections[i]) * u128::from(request.slot_bytes[i]);
-    let mut active: Vec<usize> = (0..KClass::COUNT)
-        .filter(|&i| room(i, &slots) > 0 && weight(i) > 0 && request.slot_bytes[i] > 0)
-        .collect();
-    while !active.is_empty() {
-        let total: u128 = active.iter().map(|&i| weight(i)).sum();
-        let share = |i: usize| (u128::from(left) * weight(i) / total) as u64 / request.slot_bytes[i];
-        let capped: Vec<usize> = active
-            .iter()
-            .copied()
-            .filter(|&i| share(i) >= room(i, &slots))
-            .collect();
-        if capped.is_empty() {
-            for &i in &active {
-                slots[i] += share(i);
-            }
-            break;
+    let target = expected_lru_bytes(catalog, request.traffic, left);
+    let mut remainder = [0f64; KClass::COUNT];
+    for i in 0..KClass::COUNT {
+        if slot_bytes[i] == 0 {
+            continue;
         }
-        for &i in &capped {
-            let more = room(i, &slots);
-            slots[i] += more;
-            left -= more * request.slot_bytes[i];
+        let exact = target[i] / slot_bytes[i] as f64;
+        let more = (exact.floor() as u64).min(projections[i] - slots[i]);
+        slots[i] += more;
+        left = left.saturating_sub(more * slot_bytes[i]);
+        remainder[i] = exact - more as f64;
+    }
+    let mut order: Vec<usize> = (0..KClass::COUNT).collect();
+    order.sort_by(|&a, &b| remainder[b].total_cmp(&remainder[a]).then(a.cmp(&b)));
+    for i in order {
+        if slots[i] < projections[i] && slot_bytes[i] > 0 && slot_bytes[i] <= left {
+            slots[i] += 1;
+            left -= slot_bytes[i];
         }
-        active.retain(|i| !capped.contains(i));
     }
 
     let pools = std::array::from_fn(|i| ClassPool {
         slots: slots[i] as u32,
-        bytes: slots[i] * request.slot_bytes[i],
+        bytes: slots[i] * slot_bytes[i],
     });
     Ok(ExpertCachePlan {
         cache_bytes: cache,
@@ -317,6 +318,69 @@ pub fn plan_expert_cache(
         staging_ring_bytes: request.staging_ring_bytes,
         table_bytes: request.table_bytes,
     })
+}
+
+/// Bytes per class that one LRU of `cache` bytes over every projection is
+/// expected to hold (the Che approximation, see [`plan_expert_cache`]). A
+/// cache larger than every selected projection holds them all, and its rest
+/// is shared by the never-selected bytes of each class.
+fn expected_lru_bytes(catalog: &ExpertCatalog, traffic: &[u64], cache: u64) -> [f64; KClass::COUNT] {
+    // (class, bytes, selections) per projection that has any traffic, and
+    // the bytes of the ones that have none.
+    let mut selected = Vec::new();
+    let mut idle = [0f64; KClass::COUNT];
+    for (layer, expert, count) in per_expert(catalog, traffic) {
+        for projection in Projection::ALL {
+            let id = ProjectionId::new(layer, expert, projection);
+            let class = catalog.class_of(id).index();
+            let bytes = catalog.bytes(id) as f64;
+            if count > 0 {
+                selected.push((class, bytes, count as f64));
+            } else {
+                idle[class] += bytes;
+            }
+        }
+    }
+    let cache = cache as f64;
+    let total: f64 = selected.iter().map(|(_, b, _)| b).sum();
+    let mut out = [0f64; KClass::COUNT];
+    if total <= cache {
+        for (class, bytes, _) in &selected {
+            out[*class] += bytes;
+        }
+        let idle_total: f64 = idle.iter().sum();
+        if idle_total > 0.0 {
+            for i in 0..KClass::COUNT {
+                out[i] += (cache - total).min(idle_total) * idle[i] / idle_total;
+            }
+        }
+        return out;
+    }
+    let rate_sum: f64 = selected.iter().map(|(_, _, c)| c).sum();
+    let held = |t: f64| -> f64 {
+        selected
+            .iter()
+            .map(|(_, b, c)| b * -(-(c / rate_sum) * t).exp_m1())
+            .sum()
+    };
+    // Bisect the characteristic time on a log scale: `held` rises from 0
+    // to `total` > `cache`.
+    let (mut lo, mut hi) = (1e-9f64, 1.0f64);
+    while held(hi) < cache {
+        hi *= 2.0;
+    }
+    for _ in 0..200 {
+        let mid = (lo * hi).sqrt();
+        if held(mid) < cache {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    for (class, bytes, count) in &selected {
+        out[*class] += bytes * -(-(count / rate_sum) * lo).exp_m1();
+    }
+    out
 }
 
 /// The slots a class needs so that no decode step can be refused and its
@@ -350,20 +414,6 @@ pub const LRU_ENTRY_BYTES: u64 = 16;
 /// before.
 pub fn residency_table_bytes(layers: u64, experts: u64) -> u64 {
     layers * experts * 2 * (SLOT_TABLE_ENTRY_BYTES + LRU_ENTRY_BYTES)
-}
-
-/// Calibration selections per class, from the sidecar's per-expert traffic
-/// (`expert_traffic`: selections per (layer, expert), layer-major). A
-/// selected expert reads both its projections.
-pub fn class_selections(catalog: &ExpertCatalog, counts: &[u64]) -> [u64; KClass::COUNT] {
-    let mut out = [0u64; KClass::COUNT];
-    for (layer, expert, count) in per_expert(catalog, counts) {
-        for projection in Projection::ALL {
-            let class = catalog.class_of(ProjectionId::new(layer, expert, projection));
-            out[class.index()] += count;
-        }
-    }
-    out
 }
 
 /// The warm start's order: both projections of every selected expert,

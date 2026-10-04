@@ -5,7 +5,7 @@
 
 use ignis_core::residency::{
     ExpertCacheRequest, ExpertCatalog, HOST_MARGIN_BYTES, HostPlanError, HostPlanRequest, KBits,
-    KClass, Projection, ProjectionId, class_selections, min_slots_per_class, plan_expert_cache,
+    Projection, ProjectionId, min_slots_per_class, plan_expert_cache,
     plan_host, prefill_staging_ring_bytes, residency_table_bytes, warm_start_order,
 };
 
@@ -82,84 +82,90 @@ fn a_machine_short_of_the_pool_itself_names_the_pool() {
 // ---- the VRAM expert cache -------------------------------------------------
 
 const GU2: usize = 0;
+const GU4: usize = 3;
 const DN2: usize = 4;
+const DN4: usize = 7;
 
-/// Two populated classes, gate/up K2 (100 B slots) and down K2 (50 B).
-fn cache_request() -> ExpertCacheRequest {
-    let mut slot_bytes = [1u64; 8];
-    slot_bytes[GU2] = 100;
-    slot_bytes[DN2] = 50;
-    let mut projections = [0u64; 8];
-    projections[GU2] = 1000;
-    projections[DN2] = 1000;
-    let mut selections = [0u64; 8];
-    selections[GU2] = 30;
-    selections[DN2] = 40;
+/// One layer of twenty experts: ten hot ones at K = 4 (nine selections
+/// each), ten cold ones at K = 2 (one each); every slot 100 bytes.
+fn hot_and_cold() -> (ExpertCatalog, Vec<u64>) {
+    let map = (0..20)
+        .map(|e| if e < 10 { (KBits::K4, KBits::K4) } else { (KBits::K2, KBits::K2) })
+        .collect();
+    let catalog = ExpertCatalog::new(1, 20, map, [100; 8]).expect("catalog");
+    let traffic = (0..20).map(|e| if e < 10 { 9 } else { 1 }).collect();
+    (catalog, traffic)
+}
+
+fn cache_request<'a>(catalog: &'a ExpertCatalog, traffic: &'a [u64]) -> ExpertCacheRequest<'a> {
     ExpertCacheRequest {
-        budget_bytes: 11_800,
+        budget_bytes: 3_800,
         planned_bytes: 1_000,
         staging_ring_bytes: 500,
         table_bytes: 300,
-        floor_bytes: 5_000,
-        slot_bytes,
-        projections,
-        selections,
-        min_slots: 2,
+        floor_bytes: 1_500,
+        catalog,
+        traffic,
+        min_slots: 0,
     }
 }
 
 #[test]
-fn the_cache_takes_what_the_plan_leaves_and_splits_it_by_byte_traffic() {
-    let plan = plan_expert_cache(&cache_request()).expect("fits");
-    // 11,800 - 1,000 planned - 500 ring - 300 tables.
-    assert_eq!(plan.cache_bytes, 10_000);
-    // Two slots each first (300 B), then 9,700 B split 3:2 by selections x
-    // slot bytes (30 x 100 against 40 x 50): 5,820 B -> 58 more gate/up
-    // slots, 3,880 B -> 77 more down slots.
-    let capacity = plan.capacity();
-    assert_eq!(capacity[GU2], 60);
-    assert_eq!(capacity[DN2], 79);
-    for (i, slots) in capacity.iter().enumerate() {
-        if i != GU2 && i != DN2 {
-            assert_eq!(*slots, 0, "class {i} has no projections");
-        }
-    }
-    assert_eq!(plan.pools[GU2].bytes, 6_000);
-    assert_eq!(plan.pools[DN2].bytes, 3_950);
-    assert!(plan.pooled_bytes() <= plan.cache_bytes);
+fn the_cache_takes_what_the_plan_leaves_and_splits_it_as_one_lru_would_hold_it() {
+    let (catalog, traffic) = hot_and_cold();
+    let plan = plan_expert_cache(&cache_request(&catalog, &traffic)).expect("fits");
+    // 3,800 - 1,000 planned - 500 ring - 300 tables.
+    assert_eq!(plan.cache_bytes, 2_000);
+    // One LRU of 20 slots over 20 hot projections (rate 9) and 20 cold ones
+    // (rate 1) keeps a fraction 1 - u^9 of each hot one and 1 - u of each
+    // cold one, with u^9 + u = 1: u = 0.8243. So 8.24 slots per hot class,
+    // 1.76 per cold one; flooring leaves two slots, which go to the largest
+    // remainders. Raw traffic (9:1) would have given the cold classes one.
+    assert_eq!(plan.capacity(), [2, 0, 0, 8, 2, 0, 0, 8]);
+    assert_eq!(plan.pooled_bytes(), 2_000);
+    assert_eq!(plan.pools[GU4].bytes, 800);
 }
 
 #[test]
-fn a_class_never_gets_more_slots_than_it_has_projections_and_its_share_goes_to_the_rest() {
-    let mut request = cache_request();
-    request.projections[GU2] = 20;
+fn a_cache_larger_than_every_projection_holds_them_all() {
+    let (catalog, traffic) = hot_and_cold();
+    let request = ExpertCacheRequest {
+        budget_bytes: 10_000,
+        ..cache_request(&catalog, &traffic)
+    };
     let plan = plan_expert_cache(&request).expect("fits");
-    let capacity = plan.capacity();
-    assert_eq!(capacity[GU2], 20);
-    // 10,000 - 2,000 for the whole gate/up class = 8,000 B of downs.
-    assert_eq!(capacity[DN2], 160);
-    assert_eq!(plan.pooled_bytes(), 10_000);
+    assert_eq!(plan.capacity(), [10, 0, 0, 10, 10, 0, 0, 10]);
 }
 
 #[test]
 fn every_populated_class_gets_its_minimum_even_without_traffic() {
-    let mut request = cache_request();
-    request.selections[DN2] = 0;
+    let (catalog, mut traffic) = hot_and_cold();
+    traffic[10..].fill(0);
+    let request = ExpertCacheRequest {
+        min_slots: 3,
+        ..cache_request(&catalog, &traffic)
+    };
     let plan = plan_expert_cache(&request).expect("fits");
-    assert_eq!(plan.capacity()[DN2], 2);
-    // Everything else goes to the class that has traffic.
-    assert_eq!(plan.capacity()[GU2], (10_000 - 100) / 100);
+    // Three slots each first (1,200 B); the 800 B left go to the classes
+    // with traffic, equally hot: four more each.
+    assert_eq!(plan.capacity()[GU2], 3);
+    assert_eq!(plan.capacity()[DN2], 3);
+    assert_eq!(plan.capacity()[GU4], 7);
+    assert_eq!(plan.capacity()[DN4], 7);
 }
 
 #[test]
 fn a_cache_below_its_floor_refuses_naming_what_to_shrink() {
-    let mut request = cache_request();
-    request.planned_bytes = 7_000;
+    let (catalog, traffic) = hot_and_cold();
+    let request = ExpertCacheRequest {
+        planned_bytes: 2_000,
+        ..cache_request(&catalog, &traffic)
+    };
     let err = plan_expert_cache(&request).expect_err("below the floor");
     let message = err.to_string();
     for needle in [
-        "4000", // the cache it would get
-        "5000", // the floor
+        "1000", // the cache it would get
+        "1500", // the floor
         "--max-context",
         "--vram-headroom-bytes",
         "prefill chunk",
@@ -209,19 +215,10 @@ fn the_tables_cost_a_slot_table_entry_and_an_lru_entry_per_projection() {
 }
 
 #[test]
-fn the_sidecar_s_per_expert_traffic_gives_class_selections_and_the_warm_start_order() {
+fn the_sidecar_s_per_expert_traffic_gives_the_warm_start_order() {
     // Selections per (layer, expert), layer-major, as converter.json's
     // expert_traffic records them.
     let counts = [5, 0, 9, 7, 9, 1];
-    let selections = class_selections(&catalog(), &counts);
-    let gu = |k| KClass::new(Projection::GateUp, k).index();
-    let dn = |k| KClass::new(Projection::Down, k).index();
-    assert_eq!(selections[gu(KBits::K2)], 5 + 9 + 1);
-    assert_eq!(selections[gu(KBits::K3)], 9);
-    assert_eq!(selections[gu(KBits::K4)], 7);
-    assert_eq!(selections[dn(KBits::K2)], 5 + 9 + 7 + 1);
-    assert_eq!(selections[dn(KBits::K2_5)], 9);
-
     let order = warm_start_order(&catalog(), &counts);
     let p = |layer, expert, projection| ProjectionId::new(layer, expert, projection);
     // Hottest first; a tie keeps the canonical key order; an expert never

@@ -38,8 +38,11 @@
 //!   copy jobs and into the slot table; a *copy* kernel of about 8-16 blocks
 //!   (the finding's best grid) moves the jobs from the mapped pool; the
 //!   expert kernel follows. Prefetch jobs run on a second captured stream
-//!   beside the expert kernel and join before the next resolve. Launch
-//!   shapes are fixed; the job count lives in device memory.
+//!   beside the expert kernel and join before the next resolve, held to a
+//!   per-step byte budget: unbudgeted, W = 16 asks the link for more than a
+//!   decode step lasts (7.2 ms of transfers per 6 ms step at one lane, 29
+//!   at three, on the study's routing). Launch shapes are fixed; the job
+//!   count lives in device memory.
 //! - **Tested against this module:** the GPU replay drives resolve and copy
 //!   with recorded traces and reads back each step's hits, misses and
 //!   evictions, which must equal [`StepOutcome`]'s.
@@ -58,7 +61,7 @@ pub use metrics::{FAMILIES, MetricFamily, ResidencyCounters, Sample};
 pub use plan::{
     ClassPool, EXPERT_CACHE_FLOOR_BYTES, ExpertCachePlan, ExpertCachePlanError,
     ExpertCacheRequest, HOST_MARGIN_BYTES, HostPlan, HostPlanError, HostPlanRequest,
-    class_selections, min_slots_per_class, plan_expert_cache, plan_host,
+    min_slots_per_class, plan_expert_cache, plan_host,
     prefill_staging_ring_bytes, residency_table_bytes, warm_start_order,
 };
 pub use policy::{
