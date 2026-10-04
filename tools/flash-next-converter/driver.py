@@ -65,13 +65,24 @@ class Checkpoint:
                                                      "small": small})
         log(f"checkpoint: next layer {next_layer}, {nbytes / 1e9:.1f} GB in {time.time() - t0:.0f}s")
 
-    def load(self, fingerprint):
-        """(state, next_layer), or None when there is no complete checkpoint of this run."""
+    def _meta(self, fingerprint):
         try:
             meta = json.load(open(self._meta_path()))
         except (OSError, ValueError):
             return None
         if meta.get("status") != "complete" or meta.get("fingerprint") != fingerprint:
+            return None
+        return meta
+
+    def next_layer(self, fingerprint):
+        """The layer a complete checkpoint of this run resumes at, without loading it."""
+        meta = self._meta(fingerprint)
+        return meta["next_layer"] if meta else None
+
+    def load(self, fingerprint):
+        """(state, next_layer), or None when there is no complete checkpoint of this run."""
+        meta = self._meta(fingerprint)
+        if meta is None:
             return None
         state = dict(meta["small"])
         for name, path in meta["files"].items():

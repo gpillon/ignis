@@ -143,5 +143,24 @@ def test_checkpoint_files_are_spread_over_their_directories(tmp_path):
     ck.save({"bf16.cal": torch.ones(3), "q.test": torch.zeros(2), "stats": {"a": 1}}, 4, "fp")
     assert sorted(os.listdir(tmp_path / "big")) == ["bf16.cal.pt", "meta.json"]
     assert "q.test.pt" in os.listdir(tmp_path / "small")
+    assert ck.next_layer("fp") == 4 and ck.next_layer("other") is None
     state, nxt = ck.load("fp")
     assert nxt == 4 and torch.equal(state["bf16.cal"], torch.ones(3)) and state["stats"] == {"a": 1}
+
+
+def test_without_a_checkpoint_the_stop_still_exits_75_and_the_relaunch_replays(tmp_path):
+    stop = tmp_path / "STOP"
+    toy = Toy(str(tmp_path / "work"))
+    orig = toy.process
+
+    def process(L, state):
+        orig(L, state)
+        if L == 1:
+            stop.write_text("")
+    toy.process = process
+    assert driver.LayerLoop(N, toy.layer_dir, stop_file=str(stop)).run(toy)[0] == driver.EXIT_STOPPED
+    stop.unlink()
+    toy2 = Toy(str(tmp_path / "work"))
+    code, state = driver.LayerLoop(N, toy2.layer_dir, stop_file=str(stop)).run(toy2)
+    assert code == driver.EXIT_DONE and toy2.replayed == [0, 1] and toy2.processed == [2, 3, 4, 5]
+    assert torch.equal(state["x"], expected())

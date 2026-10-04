@@ -62,3 +62,40 @@ def test_rate_counts_scales_but_not_padding():
     assert layout.rate("gu", 5) == pytest.approx(2.5 + 0.01875)
     assert layout.rate("dn", 4) == pytest.approx(2.0 + 0.03125)
     assert layout.stored_rate("dn", 4) == pytest.approx(417792 * 8 / (640 * 2560))
+
+
+def test_encodings_follow_the_contract_table():
+    # layout.md §6.2, from the checkpoint's own names and shapes
+    cases = {
+        ("linear_attn.in_proj_qkv.weight", (10240, 2560)): "fp8",
+        ("linear_attn.in_proj_a.weight", (48, 2560)): "fp8",
+        ("self_attn.indexer.index_qk_proj.weight", (640, 2560)): "fp8",
+        ("mlp.shared_expert.down_proj.weight", (2560, 640)): "fp8",
+        ("attn_hyper_connection.input_mix_weight_down.weight", (320, 10240)): "fp8",
+        ("ple.key_proj.weight", (10240, 2560)): "fp8",
+        ("embed_tokens.weight", (248320, 2560)): "fp8",
+        ("mlp.gate.weight", (512, 2560)): "bf16",
+        ("mlp.shared_expert_gate.weight", (1, 2560)): "bf16",
+        ("mlp_hyper_connection.block_inject_weight.weight", (4, 10240)): "bf16",
+        ("attn_hyper_connection.hc_norm.weight", (10240,)): "bf16",
+        ("linear_attn.conv1d.weight", (10240, 1, 4)): "bf16",
+        ("linear_attn.A_log", (48,)): "bf16",
+        ("mlp.experts.gate_up_proj", (512, 1280, 2560)): "expert",
+    }
+    for (name, shape), want in cases.items():
+        assert layout.encoding_of(name, shape) == want, name
+    assert layout.measured_by_study("linear_attn.out_proj.weight")
+    assert not layout.measured_by_study("attn_hyper_connection.input_mix_weight_up.weight")
+
+
+def test_the_fixture_tree_is_complete_and_readable(tmp_path):
+    import fixture
+    work = fixture.make(str(tmp_path))
+    for L in range(2):
+        d = tmp_path / "work" / "layers" / f"L{L:02d}"
+        assert layout.is_done(d)
+        index = layout.read_index(d / "experts.idx")
+        assert len(index) == 16 and len({(e.proj, e.k2) for e in index}) >= 3
+    raw = (tmp_path / "work" / "ngram" / "table" / "shard_000.int4").read_bytes()
+    assert len(raw) == 1000 * 90
+    assert layout.is_done(tmp_path / "work" / "ngram") and layout.is_done(tmp_path / "work" / "global")

@@ -160,3 +160,31 @@ def mark_done(directory, digests=None):
 
 def is_done(directory):
     return os.path.isfile(os.path.join(directory, "DONE"))
+
+
+# ---------------------------------------------------------------- non-expert encodings (§6.2)
+
+# the projections the study measured in FP8 (run 6's NONEXPERT list)
+STUDY_FP8 = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b",
+             "linear_attn.out_proj", "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+             "self_attn.indexer.index_qk_proj", "mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj",
+             "mlp.shared_expert.down_proj")
+ROUTER = "mlp.gate.weight"
+FP8_MIN_ROWS = 16
+
+
+def encoding_of(name, shape):
+    """'expert', 'fp8' or 'bf16' for a checkpoint tensor (name without the model prefix's
+    `layers.N.`): every 2-D linear weight with at least 16 rows and columns is FP8 except
+    the router; the experts are trellis records; everything else stays bf16."""
+    if name.startswith("mlp.experts."):
+        return "expert"
+    if name == ROUTER or name.startswith("ple.ple_embedding."):
+        return "bf16"
+    if name.endswith(".weight") and len(shape) == 2 and min(shape) >= FP8_MIN_ROWS and "norm" not in name:
+        return "fp8"
+    return "bf16"
+
+
+def measured_by_study(name):
+    return name[:-len(".weight")].endswith(STUDY_FP8) if name.endswith(".weight") else False
