@@ -32,6 +32,7 @@ pub mod materializer;
 pub mod normalize;
 pub mod f64_reference;
 pub mod vision;
+pub mod writer;
 
 /// FFI declarations for the kernel leaf's device surface (feature `cuda`
 /// only — the default build is pure Rust).
@@ -60,6 +61,7 @@ pub use frontend::{
     FRONTEND_RESOURCES, FrontendSet,
     MessageContent, ReasoningEffort, Role, ThinkingCapabilities, ToolCall, Tokenizer,
 };
+pub use writer::{directory_json, ContainerWriter, WriterState};
 pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};
 pub use normalize::{normalize_tensor, NormalizedTensor};
 pub use inventory::{
@@ -1417,6 +1419,27 @@ mod tests {
                 dst,
                 &reader.mapped_bytes()[payload_offset as usize..(payload_offset + 4096) as usize]
             );
+        });
+    }
+
+    #[test]
+    fn a_directory_padded_with_trailing_spaces_reads_as_the_same_directory() {
+        // The streaming writer reserves the header region before it knows
+        // the directory and pads the JSON it writes there with spaces: JSON
+        // allows trailing whitespace, and `json_bytes` then covers the whole
+        // reservation.
+        let directory = dir_with(
+            r#"{"name":"t/x","kind":"tensor","shape":[4,8],"format":"BF16",
+                 "layout":"contiguous-le-v1","offset":0,"bytes":64}"#,
+        );
+        let padded = format!("{directory}{}", " ".repeat(8192 - directory.len()));
+        let file = build_artifact(&padded, &[0xA5u8; 64]);
+        with_artifact_file("padded-directory", &file, |path| {
+            let reader = Reader::open(path).expect("a space-padded directory parses");
+            assert_eq!(reader.objects().len(), 1);
+            // 16-byte prefix + 8192 bytes of JSON, rounded up to 4096.
+            assert_eq!(reader.payload_offset(), 12288);
+            assert_eq!(reader.payload("t/x").unwrap().data, &[0xA5u8; 64]);
         });
     }
 
