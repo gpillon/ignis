@@ -28,7 +28,7 @@
     <td align="center"><b>1,065 tok/s</b><br><sub>eight lanes, aggregate</sub></td>
     <td align="center"><b>7.11x</b><br><sub>KV capacity of BF16</sub></td>
     <td align="center"><b>~36 ms</b><br><sub>a decision, zero tokens decoded</sub></td>
-    <td align="center"><b>512K</b><br><sub>default context</sub></td>
+    <td align="center"><b>512K</b><br><sub>context, YaRN x2</sub></td>
   </tr>
 </table>
 
@@ -62,8 +62,12 @@ Windows `.zip`, a Linux `.tar.gz`, or the `linux/amd64` container image on
 `ghcr.io/gpillon/ignis`. Run it on a Blackwell card:
 
 ```
-ignis-server                       # no model yet? it offers to fetch one
+ignis-server --max-context 524288 --rope-scaling yarn:2 --spec dflash2 --draft-tokens 7
 ```
+
+No model yet? It offers to fetch one. Those flags are the configuration the
+numbers below were taken with: a 512K context, and DFlash2 speculative decoding,
+which the bare `ignis-server` leaves off (it starts at a 40,960-token context).
 
 Then the OpenAI API is on <http://127.0.0.1:8000/v1> and the Playground on
 <http://127.0.0.1:8000/ui/>. The weights are on Hugging Face in two flavours,
@@ -74,9 +78,9 @@ else — the container, building from a checkout, every flag — is
 ## How fast
 
 **Ignis on one RTX 5090** — Qwen3.8-27B NVFP4, hq-e8-2b KV, DFlash2 speculative
-decoding with 7 draft tokens, greedy, short prompts. The default context is
-**512K tokens** (524,288 with `yarn:2`, what `make` serves); these runs used a
-262,144-token maximum:
+decoding with 7 draft tokens, greedy, short prompts. The served context is
+**512K tokens**: the checkpoint's native 262,144 stretched by YaRN x2, as the
+TL;DR flags and `make` set it. These runs used a 262,144-token maximum:
 
 | load | throughput | source |
 |---|---:|---|
