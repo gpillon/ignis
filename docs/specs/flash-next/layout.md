@@ -468,6 +468,17 @@ Top level adds `"render": {"template": "chat_template.jinja@de4b8e4…",
 | `lookahead.i16` | i16 `(N, 48, 20)` | layer L's MoE input through router L+1 (BF16 weights), top-20, descending; layer 47's row is −1 |
 
 Token-major, so a replay walks token by token and layer by layer. Only valid tokens are
-included. Residency takes the first W (default 16) lookahead ids, and its pool sizes
+included. `manifest.json` is exactly:
+
+```json
+{"tokens": N, "layers": 48, "set": "test", "chunks": [0, 1, 6, 7], "valid": [2048, 2048, 2048, 2048],
+ "stream": "quantized", "order": "token-major (N, layers, k)"}
+```
+
+`set` is `"test"` (the 2048-token test chunks) or `"long"` (`traces/long8192/`); `chunks`
+are indices within that set, in file order; `valid` has the same length and sums to `N`.
+Chunk indices are unique within a set but not across sets (long8192's 0.. collide with
+the test chunks'), so a replay keys a chunk by (set, index) and resets its state at each
+chunk boundary. Residency takes the first W (default 16) lookahead ids, and its pool sizes
 and warm-start order from `converter.json`'s `k_map`, `k_classes[].record_bytes` and
 `expert_traffic`.
