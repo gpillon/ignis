@@ -63,7 +63,10 @@ inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 5;
  * own layout, per model family -- family 1 in the high byte, its version in
  * the low -- so a blob of one family is never read as the other's whatever
  * either side's version is. 1: the 27B's sections plus the indexer's keys,
- * its tail and the n-gram conv state. */
+ * its tail and the n-gram conv state. The Flash-Next leaf (Rust,
+ * flash_next_leaf.rs) puts its n-gram hashing context in a 256-byte block
+ * before these bytes and names this version in its blob identity: changing
+ * that block bumps it. */
 inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersionFlashNext = 0x101;
 
 /* 'IGNISSNP' little-endian: the first thing a restore checks, so a foreign
