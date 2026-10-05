@@ -59,7 +59,7 @@ impl Table {
         let data: Vec<Vec<u8>> = plan.reads.iter().map(|read| self.read(read)).collect();
         let reads: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
         let mut out = vec![0u8; plan.sources.len() * ROW_BYTES as usize];
-        plan.gather(&self.hot_bytes(hot), &reads, ROW_BYTES as usize, &mut out).expect("gather");
+        plan.gather(&self.hot_bytes(hot), &reads, &mut out).expect("gather");
         out
     }
 }
@@ -92,7 +92,7 @@ fn straddling_row(layout: &TableLayout) -> u64 {
 #[test]
 fn every_requested_row_arrives_from_ram_or_an_aligned_read() {
     let table = Table::write("mixed", 2000, 1000, ROW_BYTES);
-    let hot = HotRows::from_ranked(&[5, 17, 1999, 3, 600], 4 * ROW_BYTES, ROW_BYTES).expect("hot rows");
+    let hot = HotRows::from_ranked(&[5, 17, 1999, 3, 600], 4 * HOT_ROW_COST, ROW_BYTES).expect("hot rows");
     let straddling = straddling_row(&table.layout);
     let rows = [5, 6, 7, 5, straddling, 1999, 45, 46, 1000, 1998, 0, 6, straddling];
     let plan = plan_gather(&rows, &hot, &table.layout, POLICY).expect("plan");
@@ -146,17 +146,21 @@ fn far_apart_rows_are_separate_reads_and_no_read_passes_the_cap() {
 fn a_padded_stride_reads_only_the_rows_bytes() {
     // A 128-byte stride (rows padded to a power of two) with an aligned base.
     let table = Table::write("stride", 1000, SECTOR, 128);
-    let hot = HotRows::from_ranked(&[31], ROW_BYTES, ROW_BYTES).expect("hot rows");
+    let hot = HotRows::from_ranked(&[31], HOT_ROW_COST, ROW_BYTES).expect("hot rows");
     let rows = [31, 32, 63, 64, 999];
     let plan = plan_gather(&rows, &hot, &table.layout, POLICY).expect("plan");
     assert_rows(&table.execute(&plan, &hot), &rows);
 }
 
+/// A hot row costs its bytes and its 4-byte index entry: the budget is the
+/// cache's whole RAM.
+const HOT_ROW_COST: u64 = ROW_BYTES + 4;
+
 #[test]
 fn the_hot_set_is_the_ranked_lists_head_within_the_budget() {
     // Ranked most frequent first, a repeat ignored, the budget fitting three
     // rows (and most of a fourth, which does not count).
-    let hot = HotRows::from_ranked(&[9, 4, 9, 7, 2], 3 * ROW_BYTES + 89, ROW_BYTES).expect("hot rows");
+    let hot = HotRows::from_ranked(&[9, 4, 9, 7, 2], 4 * HOT_ROW_COST - 1, ROW_BYTES).expect("hot rows");
     assert_eq!(hot.len(), 3);
     let mut held: Vec<u32> = hot.rows().to_vec();
     held.sort_unstable();
@@ -166,7 +170,11 @@ fn the_hot_set_is_the_ranked_lists_head_within_the_budget() {
         assert_eq!(u64::from(hot.rows()[slot]), row, "slot {slot} holds row {row}");
     }
     assert_eq!(hot.slot(2), None);
-    assert_eq!(hot.bytes(), 3 * ROW_BYTES);
+    assert_eq!(hot.bytes(), 3 * HOT_ROW_COST);
+    // Three rows' bytes alone do not hold three rows and their index.
+    let tight = HotRows::from_ranked(&[9, 4, 7], 3 * ROW_BYTES, ROW_BYTES).expect("hot rows");
+    assert_eq!(tight.len(), 2);
+    assert!(tight.bytes() <= 3 * ROW_BYTES);
 }
 
 #[test]
@@ -174,7 +182,7 @@ fn loading_the_hot_rows_is_a_gather_of_its_own() {
     // The cache's rows are read from the table at load with the same plan,
     // in slot order.
     let table = Table::write("load", 2000, 1000, ROW_BYTES);
-    let hot = HotRows::from_ranked(&[1500, 3, 700, 4], 4 * ROW_BYTES, ROW_BYTES).expect("hot rows");
+    let hot = HotRows::from_ranked(&[1500, 3, 700, 4], 4 * HOT_ROW_COST, ROW_BYTES).expect("hot rows");
     let none = HotRows::from_ranked(&[], 0, ROW_BYTES).expect("no hot rows");
     let wanted: Vec<u64> = hot.rows().iter().map(|&row| u64::from(row)).collect();
     let plan = plan_gather(&wanted, &none, &table.layout, POLICY).expect("plan");
@@ -191,4 +199,9 @@ fn a_plan_refuses_what_it_cannot_read() {
     assert!(odd.contains("power of two"), "{odd}");
     let small = plan_gather(&[1], &hot, &layout, ReadPolicy { alignment: SECTOR, max_read_bytes: SECTOR }).unwrap_err();
     assert!(small.contains("max_read_bytes"), "{small}");
+    // A cache of rows of another width than the table's would hand out the
+    // wrong bytes for every hot row.
+    let other = HotRows::from_ranked(&[1], 2 * HOT_ROW_COST, ROW_BYTES + 6).expect("hot rows");
+    let width = plan_gather(&[1], &other, &layout, POLICY).unwrap_err();
+    assert!(width.contains("96") && width.contains("90"), "{width}");
 }

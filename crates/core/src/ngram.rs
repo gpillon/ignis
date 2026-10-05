@@ -231,10 +231,13 @@ impl TableLayout {
     }
 }
 
+/// The bytes of the cache's index per hot row: its row id.
+const HOT_ROW_INDEX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
+
 /// The RAM hot-row cache: the head of the artifact's hot list (rows ranked
-/// most frequent first) that fits a byte budget. Slot `s` holds row
-/// `rows()[s]`, in ascending row order, so a row's slot is a binary search
-/// and the cache's index costs 4 bytes a row.
+/// most frequent first) that fits a byte budget, its index included. Slot
+/// `s` holds row `rows()[s]`, in ascending row order, so a row's slot is a
+/// binary search and the index costs 4 bytes a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotRows {
     rows: Vec<u32>,
@@ -242,12 +245,13 @@ pub struct HotRows {
 }
 
 impl HotRows {
-    /// The first distinct rows of `ranked` that fit `budget_bytes` whole.
+    /// The first distinct rows of `ranked` whose bytes and index entries fit
+    /// `budget_bytes` whole.
     pub fn from_ranked(ranked: &[u64], budget_bytes: u64, row_bytes: u64) -> Result<Self, String> {
         if row_bytes == 0 {
             return Err("a hot-row cache of 0-byte rows".to_string());
         }
-        let capacity = (budget_bytes / row_bytes) as usize;
+        let capacity = (budget_bytes / (row_bytes + HOT_ROW_INDEX_BYTES)) as usize;
         let mut seen = std::collections::HashSet::with_capacity(capacity.min(ranked.len()));
         let mut rows = Vec::with_capacity(capacity.min(ranked.len()));
         for &row in ranked {
@@ -273,9 +277,9 @@ impl HotRows {
         self.rows.is_empty()
     }
 
-    /// The bytes the cache's rows occupy.
+    /// The RAM the cache occupies: its rows and its index.
     pub fn bytes(&self) -> u64 {
-        self.rows.len() as u64 * self.row_bytes
+        self.rows.len() as u64 * (self.row_bytes + HOT_ROW_INDEX_BYTES)
     }
 
     /// The rows held, in slot order: what the cache loads at start.
@@ -322,6 +326,8 @@ pub enum RowSource {
 pub struct GatherPlan {
     pub reads: Vec<AlignedRead>,
     pub sources: Vec<RowSource>,
+    /// The width of every row the plan gathers: the table's, and the cache's.
+    pub row_bytes: usize,
 }
 
 impl GatherPlan {
@@ -331,9 +337,10 @@ impl GatherPlan {
     }
 
     /// Copies every requested row, in request order, into `out`
-    /// (`row_bytes` each) from the cache's bytes (`hot`, slot order) and
-    /// each read's returned bytes (`reads`, plan order).
-    pub fn gather(&self, hot: &[u8], reads: &[&[u8]], row_bytes: usize, out: &mut [u8]) -> Result<(), String> {
+    /// ([`GatherPlan::row_bytes`] each) from the cache's bytes (`hot`, slot
+    /// order) and each read's returned bytes (`reads`, plan order).
+    pub fn gather(&self, hot: &[u8], reads: &[&[u8]], out: &mut [u8]) -> Result<(), String> {
+        let row_bytes = self.row_bytes;
         if reads.len() != self.reads.len() {
             return Err(format!("{} reads returned for a plan of {}", reads.len(), self.reads.len()));
         }
@@ -359,6 +366,12 @@ impl GatherPlan {
 /// file range. Every missing row is read once; rows whose sectors touch or
 /// overlap share a read up to `policy.max_read_bytes`.
 pub fn plan_gather(rows: &[u64], hot: &HotRows, layout: &TableLayout, policy: ReadPolicy) -> Result<GatherPlan, String> {
+    if hot.row_bytes != layout.row_bytes {
+        return Err(format!(
+            "the hot-row cache holds {}-byte rows, the table {}-byte ones",
+            hot.row_bytes, layout.row_bytes
+        ));
+    }
     let alignment = policy.alignment;
     if alignment == 0 || !alignment.is_power_of_two() {
         return Err(format!("read alignment {alignment} is not a power of two"));
@@ -414,5 +427,5 @@ pub fn plan_gather(rows: &[u64], hot: &HotRows, layout: &TableLayout, policy: Re
             }
         })
         .collect();
-    Ok(GatherPlan { reads, sources })
+    Ok(GatherPlan { reads, sources, row_bytes: layout.row_bytes as usize })
 }
