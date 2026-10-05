@@ -608,6 +608,20 @@ target_include_directories(ignis_kernel_flash_next_bind_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_flash_next_bind_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_bind_test COMMAND ignis_kernel_flash_next_bind_test)
+# fn_linear (kernel/src/flash_next/linear.cu): the BF16 route against fp64 at the
+# program's shapes, both routes, and the FP8 routing. GPU.
+add_executable(ignis_kernel_flash_next_linear_test test_flash_next_linear.cu)
+target_include_directories(ignis_kernel_flash_next_linear_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_linear_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_linear_test COMMAND ignis_kernel_flash_next_linear_test)
+# The hyper-connection mix and inject (kernel/src/flash_next/hc.cu) against a
+# BF16-rounding fp64 reference of the checkpoint's module. GPU.
+add_executable(ignis_kernel_flash_next_hc_test test_flash_next_hc.cu)
+target_include_directories(ignis_kernel_flash_next_hc_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_hc_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_hc_test COMMAND ignis_kernel_flash_next_hc_test)
 
 # GitHub #301 (spec flash-next/03): OURS -- the expert residency miss path measured (copy
 # engine against SM-driven copies from mapped pinned memory). A timing is a finding, not a
