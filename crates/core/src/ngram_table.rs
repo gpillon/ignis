@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use ignis_artifact::flash_next::FlashNextPlan;
-use ignis_artifact::{AlignedBuffer, DirectReader, Object, Reader, DIRECT_IO_ALIGNMENT};
+use ignis_artifact::{AlignedBuffer, DirectReader, NumericFormat, Object, Reader, DIRECT_IO_ALIGNMENT};
 
 use crate::compute::NgramGeometry;
 use crate::ngram::{
@@ -44,8 +44,9 @@ pub const DEFAULT_MAX_READ_BYTES: u64 = 64 << 10;
 /// The longest read the hot-row load issues: the hot rows are dense enough in
 /// the table that the load is close to a scan.
 const HOT_LOAD_MAX_READ_BYTES: u64 = 4 << 20;
-/// Hot rows loaded per plan (bounds the load's buffers).
-const HOT_LOAD_BATCH_ROWS: usize = 1 << 20;
+/// The file span one hot-row load plan covers: its reads, all held until
+/// the plan is gathered, take at most this much RAM beside the cache.
+const HOT_LOAD_SPAN_BYTES: u64 = 64 << 20;
 
 /// What an [`NgramTable`] is opened with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,7 @@ impl Default for NgramTableOptions {
     }
 }
 
-/// Rows gathered so far, by source (the table's metrics).
+/// Rows gathered so far, by source: plain counters the server reads and exposes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NgramCounters {
     /// Rows staged.
@@ -160,7 +161,8 @@ impl Drop for ReadPool {
 pub struct NgramTable {
     hasher: NgramHasher,
     hot: HotRows,
-    hot_bytes: Vec<u8>,
+    /// The cached rows' bytes, in slot order.
+    hot_data: Vec<u8>,
     layout: TableLayout,
     policy: ReadPolicy,
     pool: ReadPool,
@@ -193,7 +195,7 @@ impl NgramTable {
         let mut table = Self {
             hasher,
             hot,
-            hot_bytes: Vec::new(),
+            hot_data: Vec::new(),
             layout,
             policy,
             pool: ReadPool::new(path, options.read_threads)?,
@@ -202,7 +204,7 @@ impl NgramTable {
             reads: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
         };
-        table.hot_bytes = table.load_hot_rows()?;
+        table.hot_data = table.load_hot_rows()?;
         Ok(table)
     }
 
@@ -237,22 +239,28 @@ impl NgramTable {
         }
         let layout = TableLayout { base_offset: placement.file_offset, row_stride: row_bytes, row_bytes, rows };
 
-        let words = |name: &str, width: usize| -> Result<Vec<i64>, String> {
+        // The container mapping (spec flash-next/01): the hash buffers are I64,
+        // the hot list I32 row ids.
+        let words = |name: &str, format: NumericFormat| -> Result<Vec<i64>, String> {
+            match reader.find(name) {
+                Some(Object::Tensor(t)) if t.format == format && t.shape.len() == 1 => {}
+                _ => return Err(format!("{name} is not a {} vector", format.name())),
+            }
             let data = reader.payload(name).map_err(|e| e.to_string())?.data;
-            Ok(data
-                .chunks_exact(width)
-                .map(|w| if width == 8 { i64::from_le_bytes(w.try_into().unwrap()) } else { i64::from(i32::from_le_bytes(w.try_into().unwrap())) })
-                .collect())
+            Ok(match format {
+                NumericFormat::I64 => data.chunks_exact(8).map(|w| i64::from_le_bytes(w.try_into().unwrap())).collect(),
+                _ => data.chunks_exact(4).map(|w| i64::from(i32::from_le_bytes(w.try_into().unwrap()))).collect(),
+            })
         };
         let buffers = NgramHashBuffers {
-            layer_multipliers: words(&format!("{prefix}.layer_multipliers"), 8)?,
-            head_vocab_sizes: words(&format!("{prefix}.ngram_heads_vocab_sizes"), 8)?,
-            head_offsets: words(&format!("{prefix}.ngram_heads_offsets"), 8)?,
+            layer_multipliers: words(&format!("{prefix}.layer_multipliers"), NumericFormat::I64)?,
+            head_vocab_sizes: words(&format!("{prefix}.ngram_heads_vocab_sizes"), NumericFormat::I64)?,
+            head_offsets: words(&format!("{prefix}.ngram_heads_offsets"), NumericFormat::I64)?,
         };
-        let ranked: Vec<u64> = words(&format!("{prefix}.ngram_embedding.hot_rows"), 4)?
+        let ranked = words(&format!("{prefix}.ngram_embedding.hot_rows"), NumericFormat::I32)?
             .into_iter()
-            .map(|row| row as u64)
-            .collect();
+            .map(|row| u64::try_from(row).map_err(|_| format!("hot row {row} is negative")))
+            .collect::<Result<Vec<u64>, String>>()?;
         let hasher = NgramHasher::new(geometry, buffers)?;
         Self::open(path, layout, hasher, &ranked, options)
     }
@@ -298,17 +306,14 @@ impl NgramTable {
         self.begin_rows(&rows)
     }
 
-    /// Hash a step's tokens for several sequences at once, `lanes[l]`
-    /// continuing with `tokens[l]`, and start fetching their rows in one plan,
-    /// lane-major: the order of a call's `Batch` rows (a decode step: one
-    /// token per lane).
-    pub fn begin_batch(&self, lanes: &mut [&mut NgramContext], tokens: &[&[u32]]) -> Result<PendingRows<'_>, String> {
-        if lanes.len() != tokens.len() {
-            return Err(format!("{} sequences for {} token runs", lanes.len(), tokens.len()));
-        }
-        let mut rows = Vec::with_capacity(tokens.iter().map(|t| t.len()).sum::<usize>() * self.hasher.heads());
-        for (context, run) in lanes.iter_mut().zip(tokens) {
-            self.hasher.hash(context, run, &mut rows);
+    /// Hash a step's tokens for several sequences at once, each lane's
+    /// context continuing with its tokens, and start fetching their rows in
+    /// one plan, lane-major: the order of a call's `Batch` rows (a decode
+    /// step: one token per lane).
+    pub fn begin_batch(&self, lanes: &mut [(&mut NgramContext, &[u32])]) -> Result<PendingRows<'_>, String> {
+        let mut rows = Vec::with_capacity(lanes.iter().map(|(_, t)| t.len()).sum::<usize>() * self.hasher.heads());
+        for (context, tokens) in lanes.iter_mut() {
+            self.hasher.hash(context, tokens, &mut rows);
         }
         self.begin_rows(&rows)
     }
@@ -335,19 +340,26 @@ impl NgramTable {
         }
     }
 
-    /// Read the hot rows from the file into their slots, a batch of rows at
-    /// a time, with the coalescing reads the step path uses but longer.
+    /// Read the hot rows from the file into their slots, with the coalescing
+    /// reads the step path uses but longer, one plan per HOT_LOAD_SPAN_BYTES
+    /// of the file: the rows are in ascending order, so a plan's reads lie in
+    /// its rows' span and the RAM they hold is bounded by bytes, whatever the
+    /// rows' density.
     fn load_hot_rows(&self) -> Result<Vec<u8>, String> {
         let row_bytes = self.row_bytes();
         let mut bytes = vec![0u8; self.hot.len() * row_bytes];
         let empty = HotRows::from_ranked(&[], 0, self.layout.row_bytes)?;
         let policy = ReadPolicy { alignment: DIRECT_IO_ALIGNMENT, max_read_bytes: HOT_LOAD_MAX_READ_BYTES.max(self.policy.max_read_bytes) };
         let rows: Vec<u64> = self.hot.rows().iter().map(|&row| u64::from(row)).collect();
-        for (batch, chunk) in rows.chunks(HOT_LOAD_BATCH_ROWS).enumerate() {
-            let plan = plan_gather(chunk, &empty, &self.layout, policy)?;
+        let mut first = 0;
+        while first < rows.len() {
+            let span_start = rows[first] * self.layout.row_stride;
+            let end = first + rows[first..].partition_point(|&row| row * self.layout.row_stride + self.layout.row_bytes - span_start <= HOT_LOAD_SPAN_BYTES);
+            let end = end.max(first + 1);
+            let plan = plan_gather(&rows[first..end], &empty, &self.layout, policy)?;
             let results = self.pool.submit(&plan.reads)?;
-            let start = batch * HOT_LOAD_BATCH_ROWS * row_bytes;
-            collect_and_gather(&plan, results, &[], &mut bytes[start..start + chunk.len() * row_bytes])?;
+            collect_and_gather(&plan, results, &[], &mut bytes[first * row_bytes..end * row_bytes])?;
+            first = end;
         }
         Ok(bytes)
     }
@@ -371,7 +383,7 @@ impl PendingRows<'_> {
     /// (`rows() * row_bytes` bytes: the model's pinned staging).
     pub fn finish(self, out: &mut [u8]) -> Result<(), String> {
         let table = self.table;
-        collect_and_gather(&self.plan, self.results, &table.hot_bytes, out)?;
+        collect_and_gather(&self.plan, self.results, &table.hot_data, out)?;
         let hot = self.plan.sources.iter().filter(|s| matches!(s, crate::ngram::RowSource::Hot { .. })).count();
         table.rows.fetch_add(self.plan.sources.len() as u64, Ordering::Relaxed);
         table.hot_hits.fetch_add(hot as u64, Ordering::Relaxed);
@@ -512,6 +524,20 @@ mod tests {
     }
 
     #[test]
+    fn a_hot_list_spread_over_more_than_one_load_span_loads_every_row() {
+        // 800,000 rows of 90 bytes span ~69 MiB: more than one 64 MiB load
+        // plan, with hot rows on both sides of the boundary.
+        let table_file = TableFile::write("span", 800_000, 4096);
+        let ranked: Vec<u64> = (0..800_000).step_by(997).collect();
+        let table = NgramTable::open(&table_file.path, table_file.layout, hasher(800_000), &ranked, options(1 << 20)).unwrap();
+        assert_eq!(table.hot_rows(), ranked.len());
+        let mut out = vec![0u8; ranked.len() * ROW_BYTES as usize];
+        table.begin_rows(&ranked).unwrap().finish(&mut out).unwrap();
+        assert_eq!(out, expected(&ranked));
+        assert_eq!(table.counters().reads, 0, "every row came from the cache");
+    }
+
+    #[test]
     fn the_last_row_reads_through_the_files_short_end() {
         // 1,000 rows end mid-sector: the last read comes back short.
         let table_file = TableFile::write("tail", 1_000, 4096);
@@ -588,9 +614,9 @@ mod tests {
             let mut out = vec![0u8; prompt.len() * table.token_bytes()];
             table.stage(context, prompt, &mut out).unwrap();
         }
-        let mut lanes: Vec<&mut NgramContext> = contexts.iter_mut().collect();
-        let steps: Vec<&[u32]> = next.iter().map(std::slice::from_ref).collect();
-        let pending = table.begin_batch(&mut lanes, &steps).unwrap();
+        let mut lanes: Vec<(&mut NgramContext, &[u32])> =
+            contexts.iter_mut().zip(&next).map(|(c, t)| (c, std::slice::from_ref(t))).collect();
+        let pending = table.begin_batch(&mut lanes).unwrap();
         assert_eq!(pending.rows(), 3 * 2);
         let mut batch = vec![0u8; 3 * table.token_bytes()];
         pending.finish(&mut batch).unwrap();
