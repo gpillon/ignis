@@ -1,0 +1,28 @@
+{
+ "files": {
+  "embed_tokens.weight.bin": {
+   "bytes": 132096,
+   "sha256": "13f90e8665b594baee57cca409458fe1dd3cb27d63d76507ffa4a9bcc5f8e919"
+  },
+  "hyper_connection_mixer.hc_norm.weight.bin": {
+   "bytes": 2048,
+   "sha256": "c176b57ab0830dde897f776752c1edfae20eefe491a46a7e3c3e835f98f6be31"
+  },
+  "hyper_connection_mixer.input_mix_weight_down.weight.bin": {
+   "bytes": 32832,
+   "sha256": "3f19797810c56f2f78c32259d35993d15e508f1449d20de1abf095b4b9ceb7ab"
+  },
+  "hyper_connection_mixer.input_mix_weight_up.weight.bin": {
+   "bytes": 34816,
+   "sha256": "c48fe305e6003729059af69288df9aa59535194f22b3474b942a7ba09a3c5663"
+  },
+  "lm_head.weight.bin": {
+   "bytes": 132096,
+   "sha256": "cf6b28299037c4cbcdff937bd64577ca3137654437919c657cf5a7c6fe2b7f94"
+  },
+  "tensors.json": {
+   "bytes": 1739,
+   "sha256": "53f8c7661e6eea1ffa292e04ba46357d1db4979c32e7dfde2e9755a104557057"
+  }
+ }
+}
