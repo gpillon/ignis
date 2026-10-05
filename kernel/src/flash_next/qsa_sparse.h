@@ -17,7 +17,8 @@
 // each row's list length is read on the device.
 //
 // KV sources: the paged BF16 planes (ninfer page-major [head_dim][64][kv_heads][pages]), or a
-// BF16 scratch the hq-e8-2b route decodes the selected rows into, read by list index.
+// BF16 scratch the hq-e8-2b route decodes rows into: a decode call's listed rows (read by list
+// index), or a prefill lane's visible rows once per layer (read by position).
 
 #pragma once
 
@@ -39,17 +40,60 @@ using Status = const char *;
 
 // Where a row's listed tokens' K and V rows are read from.
 struct KvSource {
-  // Paged (by_index false): BF16 pages of one attention layer, element (page, head, offset, d) at
-  // ((page * kv_heads + head) * 64 + offset) * head_dim + d; a lane's page table row is its slot's.
+  enum class Mode : int32_t {
+    // BF16 pages of one attention layer: element (page, head, offset, d) at
+    // ((page * kv_heads + head) * 64 + offset) * head_dim + d; a lane's page table row is its slot's.
+    Paged = 0,
+    // BF16 [rows][selection_width][kv_heads][head_dim]: row r's i-th listed token at
+    // r * selection_width + i (decode_listed_hq's output).
+    ByIndex = 1,
+    // BF16 [positions][kv_heads][head_dim] of the call's one lane, by absolute position
+    // (decode_visible_hq's output).
+    ByPosition = 2,
+  };
   const __nv_bfloat16 *k = nullptr;
   const __nv_bfloat16 *v = nullptr;
+  const int32_t *block_tables = nullptr;  // Paged only
+  int32_t logical_pages = 0;              // Paged only
+  int32_t kv_heads = 0;
+  Mode mode = Mode::Paged;
+};
+
+// hq-e8-2b K/V of one attention layer (ADR 0022), and where its rows are read EXACTLY instead of
+// decoded -- the 27B's rules (vendored gqa_attention_*_hq), so the sparse route reads the same
+// values as S2's dense hq route:
+//   1. fresh: positions at or past the lane's first position in the call come from the call's own
+//      BF16 K/V [rows][kv_heads][head_dim] (plain frame), when given;
+//   2. residual window: positions below kGqaHqSinkKeys, or in the kGqaHqRecentKeys before the
+//      call's first position with their ring bit set, come from the side planes (rotated frame,
+//      [slot][sink + recent][kv_heads][head_dim], ring words [slot][recent / 32]), when given;
+//   3. otherwise the codec row (code plane [64][64][kv_heads][pages], metadata [8][64][...]),
+//      decoded with the vendored hq_codec.cuh device functions (dither seed (head, position,
+//      role), the engine sign diagonal).
+// The output rows are in the PLAIN frame (rotated rows un-rotated once, rounded once to BF16), so
+// attend is format-agnostic.
+struct HqSource {
+  const uint8_t *k_codes = nullptr, *k_meta = nullptr, *v_codes = nullptr, *v_meta = nullptr;
   const int32_t *block_tables = nullptr;
   int32_t logical_pages = 0;
   int32_t kv_heads = 0;
-  // By index (by_index true): k/v are BF16 [rows][selection_width][kv_heads][head_dim], row r's
-  // i-th listed token at (r * selection_width + i); block_tables is unused.
-  bool by_index = false;
+  const __nv_bfloat16 *fresh_k = nullptr, *fresh_v = nullptr;
+  const __nv_bfloat16 *residual_k = nullptr, *residual_v = nullptr;
+  const uint32_t *ring_valid = nullptr;
 };
+
+// Decode lanes: every listed token of every row into k/v [rows][selection_width][kv_heads][head_dim]
+// (listed_hq_bytes each); `out` becomes the ByIndex source over them. Graph-safe.
+Status decode_listed_hq(const Geometry &g, const HqSource &hq, const Batch &batch, const Selection &selection,
+                        __nv_bfloat16 *k, __nv_bfloat16 *v, KvSource *out, cudaStream_t stream);
+std::size_t listed_hq_bytes(const Geometry &g, int32_t rows);
+
+// Prefill (one lane, batch.max_visible exact): positions [0, batch.max_visible) into k/v
+// [max_visible][kv_heads][head_dim] (visible_hq_bytes each: 1 KiB per position and role at
+// Flash-Next's geometry, 256 MiB for both roles at 128K); `out` becomes the ByPosition source.
+Status decode_visible_hq(const Geometry &g, const HqSource &hq, const Batch &batch, __nv_bfloat16 *k,
+                         __nv_bfloat16 *v, KvSource *out, cudaStream_t stream);
+std::size_t visible_hq_bytes(const Geometry &g, int32_t max_visible);
 
 // The geometry this kernel is written for; anything else is refused by name.
 Status check_geometry(const Geometry &g);

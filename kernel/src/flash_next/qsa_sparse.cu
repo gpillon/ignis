@@ -9,8 +9,14 @@
 //            with each warp on 64 of the 256 output columns. One split writes O / l in BF16, several
 //            write (O, m, l) partials.
 //   combine  one CTA per (row, query head): the partials merged by their maxima.
+//   hq rows  (hq-e8-2b only) eight lanes per (token, KV head, role) row: the fresh, residual or
+//            codec source of qsa_sparse.h, a codec row decoded by the vendored hq_decode_row_group
+//            into shared memory, then each warp un-rotates its four staged rows (the vendored
+//            inverse FWHT with the engine signs) into the plain-frame BF16 scratch.
 
 #include "qsa_sparse.h"
+
+#include "ops/kernel/hq_codec.cuh"
 
 #include <cmath>
 
@@ -121,8 +127,10 @@ __global__ void __launch_bounds__(kThreads) attend_kernel(AttendArgs a) {
       uint4 v = make_uint4(0, 0, 0, 0);
       if (pos >= 0) {
         size_t at;
-        if (a.kv.by_index) {
+        if (a.kv.mode == KvSource::Mode::ByIndex) {
           at = ((static_cast<size_t>(row) * a.width + (t0 + t)) * kv_heads + kvh) * kHeadDim;
+        } else if (a.kv.mode == KvSource::Mode::ByPosition) {
+          at = (static_cast<size_t>(pos) * kv_heads + kvh) * kHeadDim;
         } else {
           const int32_t page = a.kv.block_tables[static_cast<size_t>(slot) * a.kv.logical_pages + (pos >> 6)];
           at = ((static_cast<size_t>(page) * kv_heads + kvh) * 64 + (pos & 63)) * kHeadDim;
@@ -251,6 +259,118 @@ __global__ void combine_kernel(const float *partial_o, const float2 *partial_ml,
   out[(static_cast<size_t>(row) * q_heads + h) * kHeadDim + d] = __float2bfloat16_rn(den > 0.0F ? num / den : 0.0F);
 }
 
+constexpr int kHqThreads = 128;
+constexpr int kHqUnits = kHqThreads / 8;  // rows per CTA, eight lanes each
+
+struct HqArgs {
+  HqSource hq;
+  const int32_t *slots;
+  const int32_t *positions;
+  int32_t tokens;
+  const int32_t *list;    // listed: [rows][width]
+  const int32_t *counts;  // listed: [rows]
+  int32_t width;
+  int32_t visible;  // visible: positions [0, visible)
+  __nv_bfloat16 *k;
+  __nv_bfloat16 *v;
+};
+
+template <bool kListed>
+__global__ void __launch_bounds__(kHqThreads) hq_rows_kernel(HqArgs a) {
+  using namespace ninfer::ops;
+  __shared__ __align__(16) __nv_bfloat16 staged[kHqUnits][kHqHeadDim];
+  __shared__ __align__(16) std::uint16_t symbols[kHqUnits][kHqHeadDim];
+  __shared__ std::int8_t signs[kHqHeadDim];
+  __shared__ int rotated[kHqUnits];
+  __shared__ __nv_bfloat16 *dsts[kHqUnits];
+  hq_engine_signs_fill(signs);
+  __syncthreads();
+
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int u = tid >> 3, lane8 = tid & 7;
+  const int32_t kvh2 = a.hq.kv_heads * 2;
+  const int32_t row = kListed ? static_cast<int32_t>(blockIdx.y) : 0;
+  const int32_t unit = static_cast<int32_t>(blockIdx.x) * kHqUnits + u;
+  const int32_t i = unit / kvh2;
+  const int32_t head = (unit % kvh2) >> 1;
+  const bool role_v = (unit & 1) != 0;
+  const int32_t seq = kListed ? row / a.tokens : 0;
+  const int32_t first = a.positions[seq];
+  const int32_t slot = a.slots[seq];
+  int32_t pos = -1;
+  if (kListed) {
+    if (i < a.width && i < a.counts[row]) pos = a.list[static_cast<size_t>(row) * a.width + i];
+  } else if (i < a.visible) {
+    pos = i;
+  }
+  int mode = 0;  // 0 nothing, 1 copied as is, 2 rotated row staged
+  __nv_bfloat16 *dst = nullptr;
+  if (pos >= 0) {
+    dst = (role_v ? a.v : a.k) +
+          ((kListed ? static_cast<size_t>(row) * a.width + i : static_cast<size_t>(pos)) * a.hq.kv_heads + head) *
+              kHqHeadDim;
+    const int32_t end = first + a.tokens;
+    const bool fresh = a.hq.fresh_k != nullptr && pos >= first && pos < end;
+    const int32_t window_end = a.hq.fresh_k != nullptr ? first : end;
+    const bool side =
+        !fresh && a.hq.residual_k != nullptr &&
+        (pos < static_cast<int32_t>(kGqaHqSinkKeys) ||
+         (pos >= window_end - static_cast<int32_t>(kGqaHqRecentKeys) && pos < window_end &&
+          hq_ring_slot_valid(a.hq.ring_valid == nullptr
+                                 ? nullptr
+                                 : a.hq.ring_valid + static_cast<size_t>(slot) * (kGqaHqRecentKeys / 32),
+                             pos)));
+    if (fresh) {
+      const __nv_bfloat16 *src = (role_v ? a.hq.fresh_v : a.hq.fresh_k) +
+                                 ((static_cast<size_t>(seq) * a.tokens + (pos - first)) * a.hq.kv_heads + head) *
+                                     kHqHeadDim;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        reinterpret_cast<uint4 *>(dst)[lane8 * 4 + j] = reinterpret_cast<const uint4 *>(src)[lane8 * 4 + j];
+      }
+      mode = 1;
+    } else if (side) {
+      const int32_t side_row = pos < static_cast<int32_t>(kGqaHqSinkKeys)
+                                   ? pos
+                                   : static_cast<int32_t>(kGqaHqSinkKeys) +
+                                         (pos & (static_cast<int32_t>(kGqaHqRecentKeys) - 1));
+      const __nv_bfloat16 *src =
+          (role_v ? a.hq.residual_v : a.hq.residual_k) +
+          ((static_cast<size_t>(slot) * (kGqaHqSinkKeys + kGqaHqRecentKeys) + side_row) * a.hq.kv_heads + head) *
+              kHqHeadDim;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        reinterpret_cast<uint4 *>(staged[u])[lane8 * 4 + j] = reinterpret_cast<const uint4 *>(src)[lane8 * 4 + j];
+      }
+      mode = 2;
+    } else {
+      const int32_t page = a.hq.block_tables[static_cast<size_t>(slot) * a.hq.logical_pages + (pos >> 6)];
+      const size_t row_at = (static_cast<size_t>(page) * a.hq.kv_heads + head) * 64 + (pos & 63);
+      hq_decode_row_group((role_v ? a.hq.v_codes : a.hq.k_codes) + row_at * kHqRowBudgetBytes,
+                          (role_v ? a.hq.v_meta : a.hq.k_meta) + row_at * kHqMetaBytes, staged[u], lane8, 0,
+                          hq_dither_row_seed(head, pos, role_v), symbols[u]);
+      mode = 2;
+    }
+  }
+  if (lane8 == 0) {
+    rotated[u] = mode == 2;
+    dsts[u] = dst;
+  }
+  __syncwarp();
+  // Each warp un-rotates its own four units' staged rows.
+  for (int q = 0; q < 4; ++q) {
+    const int w = warp * 4 + q;
+    if (!rotated[w]) continue;
+    float reg[8];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) reg[s] = __bfloat162float(staged[w][s * 32 + lane]);
+    hq_ifwht256_sign(reg, signs, 0, lane);
+#pragma unroll
+    for (int s = 0; s < 8; ++s) dsts[w][s * 32 + lane] = __float2bfloat16_rn(reg[s]);
+  }
+}
+
+
 Status launched(const char *what) { return cudaPeekAtLastError() == cudaSuccess ? nullptr : what; }
 
 // Splits so that a narrow call still has ~512 CTAs; a list of selection_width tokens has at most
@@ -286,6 +406,9 @@ Status attend(const Geometry &g, const KvSource &kv, const Batch &batch, const _
   if (const Status st = check_geometry(g)) return st;
   if (selection.dense) return "sparse attention: the selection is dense";
   if (kv.kv_heads != g.kv_heads) return "sparse attention: KV source head count is not the topology's";
+  if (kv.mode == KvSource::Mode::ByPosition && batch.lanes != 1) {
+    return "sparse attention: a by-position source serves one lane";
+  }
   const int32_t rows = batch.rows();
   if (rows <= 0) return nullptr;
   const int32_t splits = splits_for(g, rows);
@@ -317,6 +440,74 @@ Status attend(const Geometry &g, const KvSource &kv, const Batch &batch, const _
                                                                    g.q_heads, out);
     return launched("sparse attention: combine launch failed");
   }
+  return nullptr;
+}
+
+
+std::size_t listed_hq_bytes(const Geometry &g, int32_t rows) {
+  return static_cast<size_t>(rows) * g.selection_width() * g.kv_heads * kHeadDim * sizeof(__nv_bfloat16);
+}
+
+std::size_t visible_hq_bytes(const Geometry &g, int32_t max_visible) {
+  return static_cast<size_t>(max_visible) * g.kv_heads * kHeadDim * sizeof(__nv_bfloat16);
+}
+
+namespace {
+
+Status check_hq(const Geometry &g, const HqSource &hq) {
+  if (const Status st = check_geometry(g)) return st;
+  if (hq.k_codes == nullptr || hq.k_meta == nullptr || hq.v_codes == nullptr || hq.v_meta == nullptr ||
+      hq.block_tables == nullptr) {
+    return "sparse attention: hq source without its planes";
+  }
+  if (hq.kv_heads != g.kv_heads) return "sparse attention: hq source head count is not the topology's";
+  if ((hq.fresh_k == nullptr) != (hq.fresh_v == nullptr) || (hq.residual_k == nullptr) != (hq.residual_v == nullptr)) {
+    return "sparse attention: hq fresh or residual rows given for one role only";
+  }
+  return nullptr;
+}
+
+HqArgs hq_args(const HqSource &hq, const Batch &batch, __nv_bfloat16 *k, __nv_bfloat16 *v) {
+  HqArgs a{};
+  a.hq = hq;
+  a.slots = batch.slots;
+  a.positions = batch.positions;
+  a.tokens = batch.tokens;
+  a.k = k;
+  a.v = v;
+  return a;
+}
+
+}  // namespace
+
+Status decode_listed_hq(const Geometry &g, const HqSource &hq, const Batch &batch, const Selection &selection,
+                        __nv_bfloat16 *k, __nv_bfloat16 *v, KvSource *out, cudaStream_t stream) {
+  if (const Status st = check_hq(g, hq)) return st;
+  if (selection.dense) return "sparse attention: the selection is dense";
+  const int32_t rows = batch.rows();
+  if (rows <= 0) return nullptr;
+  HqArgs a = hq_args(hq, batch, k, v);
+  a.list = selection.tokens;
+  a.counts = selection.counts;
+  a.width = g.selection_width();
+  const int32_t units = a.width * g.kv_heads * 2;
+  hq_rows_kernel<true><<<dim3((units + kHqUnits - 1) / kHqUnits, rows), kHqThreads, 0, stream>>>(a);
+  if (const Status st = launched("sparse attention: hq listed rows launch failed")) return st;
+  *out = KvSource{k, v, nullptr, 0, g.kv_heads, KvSource::Mode::ByIndex};
+  return nullptr;
+}
+
+Status decode_visible_hq(const Geometry &g, const HqSource &hq, const Batch &batch, __nv_bfloat16 *k,
+                         __nv_bfloat16 *v, KvSource *out, cudaStream_t stream) {
+  if (const Status st = check_hq(g, hq)) return st;
+  if (batch.lanes != 1) return "sparse attention: the visible-row decode serves one prefill lane";
+  if (batch.max_visible <= 0) return nullptr;
+  HqArgs a = hq_args(hq, batch, k, v);
+  a.visible = batch.max_visible;
+  const int64_t units = static_cast<int64_t>(batch.max_visible) * g.kv_heads * 2;
+  hq_rows_kernel<false><<<static_cast<unsigned>((units + kHqUnits - 1) / kHqUnits), kHqThreads, 0, stream>>>(a);
+  if (const Status st = launched("sparse attention: hq visible rows launch failed")) return st;
+  *out = KvSource{k, v, nullptr, 0, g.kv_heads, KvSource::Mode::ByPosition};
   return nullptr;
 }
 
