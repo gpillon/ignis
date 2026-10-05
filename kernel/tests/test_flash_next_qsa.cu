@@ -13,25 +13,27 @@
 //               sparse prefill chunk past dense_threshold(). Every call's K/V rows in the pages
 //               against K/V recomputed from x; every BF16 call against fp64 attention over those
 //               recomputed K/V on sampled rows; every hq-e8-2b call bit-identical to BF16 while
-//               every key it reads is the call's own, else within a bound DERIVED FROM THE
-//               MEASURED CODEC ERROR of the very rows it read, propagated through the softmax, the
-//               gate and o_proj; the residual window's rows exact after a chunk wider than the ring.
+//               every key it reads is the call's own, else against fp64 attention over the very
+//               rows it reads (decoded beforehand from the same store state and the call's own
+//               rows), and against the BF16 route within the difference the measured codec error
+//               makes between the two fp64 references; the residual window's rows exact after a
+//               chunk wider than the ring.
 //   entry       fn_qsa_attention itself on seq pools of both formats: bit-identical to qsa::run,
 //               its K/V in its own attention layer's planes and window only, its refusals.
 //
 // Bounds. Attention on the same q and K/V: the probabilities are rounded to BF16 for the value
 // product while the normalizer is their fp32 sum, and the output is rounded once, so
 // |o - o_ref| <= 3 * 2^-9 * A with A = sum_j p_j |v_j| (stated as 2^-7 A; 2^-6 A for the whole
-// sublayer, which adds rare BF16 rounding flips of q, k and v against the restatement). The gate
-// and o_proj propagate it elementwise: y's bound is sum_c |W_ic| B_c + 2^-8 |y_i|, B_c the gated
-// element's. hq against BF16 adds, per query head, Delta = max_j |q . (k'_j - k_j)| / 16 over the
-// keys read (k' what the hq route read, k exact): every probability moves by a factor within
-// e^(+-2 Delta), so |o' - o| <= (e^(2 Delta) - 1) sum_j p_j |v'_j| + sum_j p_j |v'_j - v_j|. What
-// the hq route read is measured by decoding the same rows back after the call: a key the call
-// read from the codec decodes to the same row; a key it read exactly (its own, a sink, the ring)
-// has at most the rotation's round-trip error, ||k' - k|| <= 2^-7 ||k|| and
-// |v'_d - v_d| <= 2^-7 (||v|| + |v_d|) (one BF16 rounding in the rotated frame, one after it), so
-// each key's term is the larger of the measured error and that round-trip bound.
+// sublayer, which adds rare BF16 rounding flips of q against the restatement). The gate and
+// o_proj propagate it elementwise: y's bound is sum_c |W_ic| B_c + 2^-8 |y_i|, B_c the gated
+// element's. The hq route is held to the same bound against the fp64 attention over the rows it
+// reads, and to the BF16 route within |y_ref(read rows) - y_ref(exact rows)| plus both bounds:
+// the tolerance is the codec error measured on those rows, carried through the same fp64 path.
+//
+// K rows against the restatement: a projection value one BF16 flip apart (the FP8 linear's fp32
+// sum against fp64) moves a rope output by one rounding of its larger product, which can be many
+// ulps of a small output after cancellation: the check allows 2^-6 of the head row's largest
+// value, and requires 99% of the values bit-exact.
 
 #include "flash_next/qsa.h"
 
@@ -228,18 +230,23 @@ std::vector<double> lane_rows(const Store &s, const std::vector<int32_t> &tables
   return plane_rows((role_v ? s.v : s.k)->p, kPages, tables, kLogicalPages, slot, n);
 }
 
-// Rows [first, first + count) against the restated ones: within a BF16 rounding flip, 99% exact.
+// Rows [first, first + count) against the restated ones: every value within 2^-6 of its head
+// row's largest (a flip moved through rope), 99% bit-exact.
 void check_rows(const std::string &name, const std::vector<double> &got, const std::vector<double> &want,
                 int32_t first, int32_t count) {
   long exact = 0, total = 0;
   bool within = true;
-  for (std::size_t i = static_cast<std::size_t>(first) * KVH * D; i < static_cast<std::size_t>(first + count) * KVH * D; ++i) {
-    const double e = std::fabs(got[i] - want[i]);
-    exact += e == 0.0;
-    ++total;
-    within = within && e <= std::ldexp(std::fabs(want[i]), -6) + 1e-3;
+  for (std::size_t row = static_cast<std::size_t>(first) * KVH; row < static_cast<std::size_t>(first + count) * KVH; ++row) {
+    double peak = 0.0;
+    for (int d = 0; d < D; ++d) peak = std::max(peak, std::fabs(want[row * D + d]));
+    for (int d = 0; d < D; ++d) {
+      const double e = std::fabs(got[row * D + d] - want[row * D + d]);
+      exact += e == 0.0;
+      ++total;
+      within = within && e <= std::ldexp(peak, -6);
+    }
   }
-  check(within, name + ": every row within a BF16 rounding flip of the K/V recomputed from x");
+  check(within, name + ": every value within 2^-6 of its head row's largest of the K/V recomputed from x");
   check(exact * 100 >= total * 99, name + ": 99% of the K/V values bit-exact");
 }
 
@@ -247,7 +254,7 @@ void check_rows(const std::string &name, const std::vector<double> &got, const s
 
 struct RowRef {
   std::vector<double> y;      // fp64, unrounded
-  std::vector<double> bound;  // the BF16 route against y, or the hq route against the BF16 route
+  std::vector<double> bound;  // a route reading the same K/V rows, against y
 };
 
 // sum_c |W[i][c]| b[c] for every output i.
@@ -263,75 +270,46 @@ std::vector<double> project_abs(const Proj &p, const std::vector<double> &b) {
   return y;
 }
 
-double norm2(const double *v) {
-  double s = 0.0;
-  for (int d = 0; d < D; ++d) s += v[d] * v[d];
-  return std::sqrt(s);
-}
-
-// One query row at `position` attending `keys` (ascending) of the K/V rows k, v ([n][KVH][D]).
-// Without decoded rows: y and the bound of the BF16 route against it. With the rows the hq route
-// read (kd, vd, same layout, indexed like k, v -- which are then the BF16 route's own rows): the
-// bound of the hq route against the BF16 route.
+// One query row at `position` attending `keys` (ascending) of the K/V rows k, v ([n][KVH][D],
+// indexed by position): y in fp64 and the bound of a route that reads these rows against it.
 RowRef reference_row(const Weights &w, const Rope &rope, const std::vector<uint16_t> &x_bf16, int32_t position,
-                     const std::vector<int32_t> &keys, const std::vector<double> &k, const std::vector<double> &v,
-                     const std::vector<double> *kd, const std::vector<double> *vd) {
+                     const std::vector<int32_t> &keys, const std::vector<double> &k, const std::vector<double> &v) {
   const std::vector<double> x = as_double(x_bf16.data(), x_bf16.size());
   std::vector<double> qg = project(w.q, x);
   for (double &e : qg) e = bf16r(e);
   std::vector<double> gated(qsa::kOutWidth), b(qsa::kOutWidth);
-  const bool hq = kd != nullptr;
   for (int h = 0; h < QH; ++h) {
     const std::vector<double> q = norm_rope(&qg[static_cast<std::size_t>(h) * 2 * D], w.q_norm, rope, position);
-    const double qn = norm2(q.data());
     const int kvh = h / qsa::kGroup;
-    std::vector<double> p(keys.size()), vn(keys.size());
+    std::vector<double> p(keys.size());
     double m = -1e300;
-    double delta = 0.0;
     for (std::size_t i = 0; i < keys.size(); ++i) {
       const std::size_t row = (static_cast<std::size_t>(keys[i]) * KVH + kvh) * D;
       double dot = 0.0;
       for (int d = 0; d < D; ++d) dot += q[d] * k[row + d];
-      if (hq) {
-        double ddot = 0.0;
-        for (int d = 0; d < D; ++d) ddot += q[d] * ((*kd)[row + d] - k[row + d]);
-        const double round_trip = std::ldexp(qn * norm2(&k[row]), -7);
-        delta = std::max(delta, std::max(std::fabs(ddot), round_trip) * kScale);
-        vn[i] = norm2(&v[row]);
-      }
       p[i] = dot * kScale;
       m = std::max(m, p[i]);
     }
     double l = 0.0;
     for (double &e : p) l += (e = std::exp(e - m));
     for (double &e : p) e /= l;
-    const double grow = std::exp(2.0 * delta);
     for (int d = 0; d < D; ++d) {
-      double o = 0.0, a = 0.0, ad = 0.0, dv = 0.0;
+      double o = 0.0, a = 0.0;
       for (std::size_t i = 0; i < keys.size(); ++i) {
         const std::size_t at = (static_cast<std::size_t>(keys[i]) * KVH + kvh) * D + d;
         o += p[i] * v[at];
         a += p[i] * std::fabs(v[at]);
-        if (hq) {
-          ad += p[i] * std::fabs((*vd)[at]);
-          const double round_trip = std::ldexp(vn[i] + std::fabs(v[at]), -7);
-          dv += p[i] * std::max(std::fabs((*vd)[at] - v[at]), round_trip);
-        }
       }
       const std::size_t c = static_cast<std::size_t>(h) * D + d;
       const double sg = bf16r(sigmoid(qg[static_cast<std::size_t>(h) * 2 * D + D + d]));
       gated[c] = bf16r(bf16r(o) * sg);
-      // The BF16 route's own error, once (against fp64) or twice (each route against its exact
-      // attention), plus the hq route's input error.
-      b[c] = hq ? sg * (std::ldexp(a, -6) + std::ldexp(grow * ad, -6) + (grow - 1.0) * ad + dv) +
-                      std::ldexp(std::fabs(gated[c]), -7)
-                : sg * std::ldexp(a, -6) + std::ldexp(std::fabs(gated[c]), -8);
+      b[c] = sg * std::ldexp(a, -6) + std::ldexp(std::fabs(gated[c]), -8);
     }
   }
   RowRef r;
   r.y = project(w.o, gated);
   r.bound = project_abs(w.o, b);
-  for (int i = 0; i < H; ++i) r.bound[i] += std::ldexp(std::fabs(r.y[i]), hq ? -7 : -8) + 1e-6;
+  for (int i = 0; i < H; ++i) r.bound[i] += std::ldexp(std::fabs(r.y[i]), -8) + 1e-6;
   return r;
 }
 
@@ -546,6 +524,8 @@ int main() {
   DeviceBytes d_sel_tokens(static_cast<std::size_t>(kSparseRows) * kWidth * 4), d_sel_counts(kSparseRows * 4);
   const std::size_t decoded_bytes = std::max(sparse::listed_hq_bytes(g, kSparseRows), sparse::visible_hq_bytes(g, kWidth));
   DeviceBytes d_dec_k(decoded_bytes), d_dec_v(decoded_bytes);
+  DeviceBytes d_fresh_k(static_cast<std::size_t>(kMaxRows) * qsa::kKvWidth * 2);
+  DeviceBytes d_fresh_v(static_cast<std::size_t>(kMaxRows) * qsa::kKvWidth * 2);
   const int slot_of[kSlots] = {2, 0, 1};
   int32_t frontier[kSlots] = {0, 0, 0};
   RefKv ref[kSlots];
@@ -591,10 +571,46 @@ int main() {
       selection.counts = d_sel_counts.as<int32_t>();
     }
     MOE_CUDA(cudaDeviceSynchronize());  // pageable uploads may still be in flight for another stream
+    // The hq call's rows, decoded before it runs from the same store state with its own K/V as
+    // the fresh rows -- the BF16 call's, computed by the same kernels from the same inputs: exactly
+    // what the hq call reads.
+    std::vector<double> kd, vd;
+    auto decode_before_hq = [&]() {
+      std::vector<uint16_t> fk, fv;
+      for (std::size_t l = 0; l < lanes.size(); ++l) {
+        const int n = firsts[l] + tokens;
+        for (auto [rows_of, out] : {std::pair{lane_rows(bf16_store, tables, slot_of[lanes[l]], n, false), &fk},
+                                    std::pair{lane_rows(bf16_store, tables, slot_of[lanes[l]], n, true), &fv}}) {
+          for (std::size_t i = static_cast<std::size_t>(firsts[l]) * qsa::kKvWidth; i < static_cast<std::size_t>(n) * qsa::kKvWidth; ++i) {
+            out->push_back(f32_to_bf16(static_cast<float>(rows_of[i])));
+          }
+        }
+      }
+      upload(d_fresh_k, fk);
+      upload(d_fresh_v, fv);
+      MOE_CUDA(cudaDeviceSynchronize());
+      sparse::HqSource src = hq_store.hq(dt);
+      src.fresh_k = d_fresh_k.as<__nv_bfloat16>();
+      src.fresh_v = d_fresh_v.as<__nv_bfloat16>();
+      sparse::KvSource out;
+      const bool listed = lists != nullptr && tokens == 1;
+      const sparse::Status st =
+          listed ? sparse::decode_listed_hq(g, src, batch, selection, d_dec_k.as<__nv_bfloat16>(), d_dec_v.as<__nv_bfloat16>(),
+                                            &out, stream)
+                 : sparse::decode_visible_hq(g, src, batch, d_dec_k.as<__nv_bfloat16>(), d_dec_v.as<__nv_bfloat16>(), &out,
+                                             stream);
+      check(st == nullptr, name + ": decoding the hq call's rows launches");
+      MOE_CUDA(cudaStreamSynchronize(stream));
+      const std::size_t n = listed ? static_cast<std::size_t>(rows) * kWidth : static_cast<std::size_t>(batch.max_visible);
+      kd = as_double(download<uint16_t>(d_dec_k.p, n * KVH * D).data(), n * KVH * D);
+      vd = as_double(download<uint16_t>(d_dec_v.p, n * KVH * D).data(), n * KVH * D);
+    };
     for (int f = 0; f < 2; ++f) {
       void *y = f == 0 ? d_y_bf16.p : d_y_hq.p;
+      if (f == 1 && !same) decode_before_hq();
       if (graphs != nullptr) {
         MOE_CUDA(cudaGraphLaunch(graphs[f], stream));
+        MOE_CUDA(cudaStreamSynchronize(stream));
       } else {
         arena.reset_peak();
         FN_RC(qsa::run(g, f == 0 ? kv_bf16 : kv_hq, ix_rope, wv, batch, d_x.p, selection, y, arena, stream));
@@ -606,31 +622,11 @@ int main() {
         check(arena.peak_used() <= allowed, name + ": scratch peak within its plan lines");
       }
     }
-    MOE_CUDA(cudaStreamSynchronize(stream));
     const std::vector<uint16_t> y_bf16 = download<uint16_t>(d_y_bf16.p, static_cast<std::size_t>(rows) * H);
     const std::vector<uint16_t> y_hq = download<uint16_t>(d_y_hq.p, static_cast<std::size_t>(rows) * H);
     if (same) check(y_bf16 == y_hq, name + ": hq-e8-2b bit-identical to BF16 (every key read is the call's own)");
 
-    // The rows the hq call read, decoded back after it with the window of its frontier: a key the
-    // call read from the codec decodes to the same row, one it read exactly is bounded by the
-    // round trip (reference_row).
-    std::vector<double> kd, vd;
-    if (!same) {
-      sparse::KvSource out;
-      const bool listed = lists != nullptr;
-      const sparse::Status st =
-          listed ? sparse::decode_listed_hq(g, hq_store.hq(dt), batch, selection, d_dec_k.as<__nv_bfloat16>(),
-                                            d_dec_v.as<__nv_bfloat16>(), &out, stream)
-                 : sparse::decode_visible_hq(g, hq_store.hq(dt), batch, d_dec_k.as<__nv_bfloat16>(),
-                                             d_dec_v.as<__nv_bfloat16>(), &out, stream);
-      check(st == nullptr, name + ": decoding the rows back launches");
-      MOE_CUDA(cudaStreamSynchronize(stream));
-      const std::size_t n = listed ? static_cast<std::size_t>(rows) * kWidth : static_cast<std::size_t>(batch.max_visible);
-      kd = as_double(download<uint16_t>(d_dec_k.p, n * KVH * D).data(), n * KVH * D);
-      vd = as_double(download<uint16_t>(d_dec_v.p, n * KVH * D).data(), n * KVH * D);
-    }
-
-    std::vector<std::vector<double>> got, got_hq, want, bound, hq_bound;
+    std::vector<std::vector<double>> got, got_hq, want, bound, want_hq, bound_hq, codec_bound;
     for (std::size_t l = 0; l < lanes.size(); ++l) {
       const int lane = lanes[l];
       const int n = firsts[l] + tokens;
@@ -648,14 +644,14 @@ int main() {
           for (int32_t j = 0; j <= position; ++j) keys.push_back(j);
         }
         const std::vector<uint16_t> xr = token_input(lane, position);
-        const RowRef fp64 = reference_row(w, rope, xr, position, keys, ref[lane].k, ref[lane].v, nullptr, nullptr);
+        const RowRef fp64 = reference_row(w, rope, xr, position, keys, ref[lane].k, ref[lane].v);
         got.push_back(row_of(y_bf16, r));
         got_hq.push_back(row_of(y_hq, r));
         want.push_back(fp64.y);
         bound.push_back(fp64.bound);
         if (!same) {
           std::vector<double> kdr = kd, vdr = vd;
-          if (lists != nullptr) {
+          if (lists != nullptr && tokens == 1) {
             // The listed scratch holds row r's i-th listed key at r * width + i: re-index by position.
             kdr.assign(k.size(), 0.0);
             vdr.assign(v.size(), 0.0);
@@ -666,12 +662,30 @@ int main() {
               std::copy_n(&vd[from], KVH * D, &vdr[to]);
             }
           }
-          hq_bound.push_back(reference_row(w, rope, xr, position, keys, k, v, &kdr, &vdr).bound);
+          const RowRef read = reference_row(w, rope, xr, position, keys, kdr, vdr);
+          want_hq.push_back(read.y);
+          bound_hq.push_back(read.bound);
+          // hq against BF16: the two fp64 references' difference -- the measured codec error of
+          // the rows read, carried through attention, gate and o_proj -- plus both routes' bounds.
+          std::vector<double> tol(H);
+          for (int i = 0; i < H; ++i) tol[i] = std::fabs(read.y[i] - fp64.y[i]) + read.bound[i] + fp64.bound[i];
+          codec_bound.push_back(tol);
         }
       }
     }
     check_bounded(name + " (BF16 vs fp64)", got, want, bound);
-    if (!same) check_bounded(name + " (hq-e8-2b vs BF16)", got_hq, got, hq_bound);
+    if (!same) {
+      check_bounded(name + " (hq-e8-2b vs fp64 over the rows it read)", got_hq, want_hq, bound_hq);
+      check_bounded(name + " (hq-e8-2b vs BF16, codec tolerance)", got_hq, got, codec_bound);
+      double num = 0.0, den = 0.0;
+      for (std::size_t r = 0; r < want.size(); ++r) {
+        for (int i = 0; i < H; ++i) {
+          num += (want_hq[r][i] - want[r][i]) * (want_hq[r][i] - want[r][i]);
+          den += want[r][i] * want[r][i];
+        }
+      }
+      std::printf("  %s: the codec's effect on the fp64 output, relative L2 %.3e\n", name.c_str(), std::sqrt(num / den));
+    }
     for (std::size_t l = 0; l < lanes.size(); ++l) frontier[lanes[l]] += tokens;
   };
 

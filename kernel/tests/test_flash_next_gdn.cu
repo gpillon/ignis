@@ -18,7 +18,8 @@
 // plus the BF16 output rounding (2^-9 relative) and the rare BF16 rounding flips of the
 // intermediate stores. Checked: relative L2 per call <= 2^-7 and every element within 2^-6 of the
 // call's largest reference; the fp32 state within relative L2 2^-7 of the fp64 one; the conv taps
-// (BF16 projections) within one BF16 ulp, almost all of them exact.
+// (the BF16 projections) within the rounding of the FP8 linear's fp32 accumulation bound, almost
+// all of them exact.
 
 #include "flash_next/gdn.h"
 
@@ -99,12 +100,14 @@ void build(Weights &w) {
 // its recurrent state, [VH][D (value)][D (key)].
 struct Lane {
   std::vector<double> taps = std::vector<double>(static_cast<std::size_t>(3) * C, 0.0);
+  std::vector<double> tap_bound = std::vector<double>(static_cast<std::size_t>(3) * C, 0.0);  // fp32 sum bound
   std::vector<double> state = std::vector<double>(static_cast<std::size_t>(VH) * D * D, 0.0);
 };
 
 // One token through the layer; returns y (fp64, unrounded).
 std::vector<double> reference_token(const Weights &w, Lane &lane, const std::vector<double> &x) {
-  std::vector<double> qkv = project(w.qkv, x), z = project(w.z, x), a = project(w.a, x), b = project(w.b, x);
+  std::vector<double> qkv_bound;
+  std::vector<double> qkv = project(w.qkv, x, &qkv_bound), z = project(w.z, x), a = project(w.a, x), b = project(w.b, x);
   for (auto *v : {&qkv, &z, &a, &b}) {
     for (double &e : *v) e = bf16r(e);
   }
@@ -120,8 +123,10 @@ std::vector<double> reference_token(const Weights &w, Lane &lane, const std::vec
   }
   for (int j = 0; j < 2; ++j) {
     std::copy_n(&lane.taps[static_cast<std::size_t>(j + 1) * C], C, &lane.taps[static_cast<std::size_t>(j) * C]);
+    std::copy_n(&lane.tap_bound[static_cast<std::size_t>(j + 1) * C], C, &lane.tap_bound[static_cast<std::size_t>(j) * C]);
   }
   std::copy_n(qkv.data(), C, &lane.taps[static_cast<std::size_t>(2) * C]);
+  std::copy_n(qkv_bound.data(), C, &lane.tap_bound[static_cast<std::size_t>(2) * C]);
 
   auto l2 = [](const double *v, double *out) {
     double s = 0.0;
@@ -330,9 +335,12 @@ int main() {
     for (std::size_t i = 0; i < static_cast<std::size_t>(3) * C; ++i) {
       const double got = bf16_to_f32(conv[cb + i]), want = lanes[id].taps[i];
       exact += got == want;
-      within += std::fabs(got - want) <= std::ldexp(std::fabs(want), -7);
+      // Both sides round to BF16 values within the FP8 linear's fp32 accumulation bound of the
+      // same sum: they differ by at most that bound plus the two roundings (a near-zero tap may
+      // round apart by more than one of its own ulps).
+      within += std::fabs(got - want) <= lanes[id].tap_bound[i] + std::ldexp(std::fabs(got) + std::fabs(want), -8);
     }
-    check(within == 3 * C, "lane " + std::to_string(id) + ": conv taps within one BF16 ulp");
+    check(within == 3 * C, "lane " + std::to_string(id) + ": conv taps within the projection's rounding bound");
     check(exact >= 3 * C * 99 / 100, "lane " + std::to_string(id) + ": conv taps 99% exact");
     const std::size_t rb = static_cast<std::size_t>(slot_of[id]) * VH * D * D;
     double num = 0.0, den = 0.0;

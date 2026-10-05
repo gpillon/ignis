@@ -85,19 +85,26 @@ inline double weight(const Proj &p, int r, int c) {
   return e4m3_lut()[p.payload[static_cast<std::size_t>(r) * p.cols + c]] * p.scale[r];
 }
 
-// y[r] = scale[r] * sum_c code[r][c] * x[c] in fp64, rows split over host threads.
-inline std::vector<double> project(const Proj &p, const std::vector<double> &x) {
+// y[r] = scale[r] * sum_c code[r][c] * x[c] in fp64, rows split over host threads; with `bound`,
+// also each row's fp32 accumulation bound as the FP8 linear's own test states it
+// (fp8_sum_bound: (cols / 8 + 64) u sum |terms|).
+inline std::vector<double> project(const Proj &p, const std::vector<double> &x, std::vector<double> *bound = nullptr) {
   const double *lut = e4m3_lut();
   std::vector<double> y(p.rows);
+  if (bound != nullptr) bound->assign(p.rows, 0.0);
   constexpr int kThreads = 8;
   std::vector<std::thread> pool;
   for (int t = 0; t < kThreads; ++t) {
     pool.emplace_back([&, t]() {
       for (int r = t; r < p.rows; r += kThreads) {
         const uint8_t *row = &p.payload[static_cast<std::size_t>(r) * p.cols];
-        double s = 0.0;
-        for (int c = 0; c < p.cols; ++c) s += lut[row[c]] * x[c];
+        double s = 0.0, a = 0.0;
+        for (int c = 0; c < p.cols; ++c) {
+          s += lut[row[c]] * x[c];
+          a += std::fabs(lut[row[c]] * x[c]);
+        }
         y[r] = s * p.scale[r];
+        if (bound != nullptr) (*bound)[r] = fp8_sum_bound(p.cols, a * std::fabs(p.scale[r]));
       }
     });
   }
