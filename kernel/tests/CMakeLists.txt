@@ -604,3 +604,15 @@ add_test(NAME ignis_kernel_flash_next_contract_test COMMAND ignis_kernel_flash_n
 # pass/fail, so a tool and NOT registered with CTest. CUDA runtime only.
 add_executable(ignis_expert_miss_path_bench bench_expert_miss_path.cu)
 target_link_libraries(ignis_expert_miss_path_bench PRIVATE CUDA::cudart)
+
+# GitHub #301 (spec flash-next/03): OURS -- expert residency's device side replayed against the
+# CPU policy model's outcomes (fixtures/residency/trace_v1.txt, written by
+# crates/core/tests/expert_residency_fixture.rs): outcomes, copies and slot-table invariants, once
+# eagerly and once with the decode steps as captured CUDA graphs. Same no-SKIP_RETURN_CODE rule as
+# every GPU test here (ADR 0006).
+add_executable(ignis_kernel_residency_trace_test test_residency_trace.cu)
+target_compile_definitions(ignis_kernel_residency_trace_test PRIVATE
+  IGNIS_RESIDENCY_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/residency/trace_v1.txt")
+target_link_libraries(ignis_kernel_residency_trace_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_residency_trace_test COMMAND ignis_kernel_residency_trace_test)
+add_test(NAME ignis_kernel_residency_graph_test COMMAND ignis_kernel_residency_trace_test graph)
