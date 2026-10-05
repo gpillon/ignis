@@ -241,17 +241,7 @@ impl NgramTable {
 
         // The container mapping (spec flash-next/01): the hash buffers are I64,
         // the hot list I32 row ids.
-        let words = |name: &str, format: NumericFormat| -> Result<Vec<i64>, String> {
-            match reader.find(name) {
-                Some(Object::Tensor(t)) if t.format == format && t.shape.len() == 1 => {}
-                _ => return Err(format!("{name} is not a {} vector", format.name())),
-            }
-            let data = reader.payload(name).map_err(|e| e.to_string())?.data;
-            Ok(match format {
-                NumericFormat::I64 => data.chunks_exact(8).map(|w| i64::from_le_bytes(w.try_into().unwrap())).collect(),
-                _ => data.chunks_exact(4).map(|w| i64::from(i32::from_le_bytes(w.try_into().unwrap()))).collect(),
-            })
-        };
+        let words = |name: &str, format: NumericFormat| integer_vector(reader, name, format);
         let buffers = NgramHashBuffers {
             layer_multipliers: words(&format!("{prefix}.layer_multipliers"), NumericFormat::I64)?,
             head_vocab_sizes: words(&format!("{prefix}.ngram_heads_vocab_sizes"), NumericFormat::I64)?,
@@ -363,6 +353,28 @@ impl NgramTable {
         }
         Ok(bytes)
     }
+}
+
+/// An I64 or I32 vector of the artifact, as i64, refused unless the
+/// container stores it in exactly that format.
+fn integer_vector(reader: &Reader, name: &str, format: NumericFormat) -> Result<Vec<i64>, String> {
+    let width = match format {
+        NumericFormat::I64 => 8,
+        NumericFormat::I32 => 4,
+        other => return Err(format!("{} is not an integer format", other.name())),
+    };
+    match reader.find(name) {
+        Some(Object::Tensor(t)) if t.format == format && t.shape.len() == 1 => {}
+        _ => return Err(format!("{name} is not a {} vector", format.name())),
+    }
+    let data = reader.payload(name).map_err(|e| e.to_string())?.data;
+    Ok(data
+        .chunks_exact(width)
+        .map(|w| match width {
+            8 => i64::from_le_bytes(w.try_into().unwrap()),
+            _ => i64::from(i32::from_le_bytes(w.try_into().unwrap())),
+        })
+        .collect())
 }
 
 /// A gather in flight: its reads are queued or running on the table's
@@ -657,6 +669,25 @@ mod tests {
         let rows = reader.payload(&flash_next::ngram_table_name(&FlashNextGeometry::fixture())).unwrap().data;
         let want: Vec<u8> = ids.iter().flat_map(|&r| rows[r as usize * 90..r as usize * 90 + 90].to_vec()).collect();
         assert_eq!(staged, want, "each token's rows, in head order, as the artifact stores them");
+    }
+
+    #[test]
+    fn the_artifacts_n_gram_vectors_are_read_only_in_their_stored_format() {
+        let artifact = ignis_artifact::flash_next::fixture::build("ngram-types").unwrap();
+        let reader = Reader::open(&artifact.path).unwrap();
+        let prefix = "layers.1.ple.ple_embedding";
+        let hot = format!("{prefix}.ngram_embedding.hot_rows");
+        let multipliers = format!("{prefix}.layer_multipliers");
+        let rows = integer_vector(&reader, &hot, NumericFormat::I32).unwrap();
+        assert_eq!(rows, [17, 3, 999, 0, 512, 64]);
+        assert_eq!(integer_vector(&reader, &multipliers, NumericFormat::I64).unwrap().len(), 3);
+        // The other width would decode garbage: refused instead.
+        let err = integer_vector(&reader, &hot, NumericFormat::I64).unwrap_err();
+        assert!(err.contains("is not a I64 vector"), "{err}");
+        let err = integer_vector(&reader, &multipliers, NumericFormat::I32).unwrap_err();
+        assert!(err.contains("is not a I32 vector"), "{err}");
+        let err = integer_vector(&reader, &format!("{prefix}.ngram_embedding.weight"), NumericFormat::I32).unwrap_err();
+        assert!(err.contains("is not a I32 vector"), "{err}");
     }
 
     #[test]
