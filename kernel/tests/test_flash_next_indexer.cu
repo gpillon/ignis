@@ -31,13 +31,18 @@
 //   2051) sets Selection::dense and writes nothing;
 // - a decode call captured in a CUDA graph and replayed equals its eager run;
 // - the checks bite: a block key roped one block late (positions shifted by 4 into a spare slot)
-//   and a query roped one position late (a shifted batch) each fail the element check.
+//   and a query roped one position late (a shifted batch) each fail the element check;
+// - fn_indexer_select, the program's entry point, on a real seq pool with indexer sections
+//   (attention layer 1 of 2, its arena exactly fn_indexer_select_scratch_bytes): a dense chunk
+//   [0, 2000) sets Selection::dense, then the sparse chunk [2000, 4096) selects what the stages'
+//   one-shot run selected, and the pool's layer-1 section holds the stages' block keys.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
 #include "../src/flash_next/indexer.h"
 
 #include "ignis_moe.h"
+#include "ignis_seq_internal.h"
 #include "moe_fixture.h"
 
 #include <algorithm>
@@ -558,9 +563,11 @@ int main() {
   }
 
   // Lane 0 again in one call, slot 2: the same state and the same selections as chunks + decode.
+  std::vector<int32_t> one_shot_lists;
   {
     load_rows(x0, 0, 4099);
     run_call(d, g, rope, arena, {2}, {0}, 4099, 4099, "one-shot [0,4099)");
+    one_shot_lists = download<int32_t>(d.tok_a.p, static_cast<std::size_t>(4096) * kWidth);
     check(slot_block_keys(d, 2, 1024) == keys_after_4098, "one-shot block keys differ from chunked + decode");
     check(download<uint16_t>(d.tail.as<uint16_t>() + 2 * 3 * kHd, 3 * kHd) == tail_after_4098,
           "one-shot tail differs from chunked + decode");
@@ -568,6 +575,88 @@ int main() {
       check(download<int32_t>(d.tok_a.as<int32_t>() + static_cast<std::size_t>(p) * kWidth, kWidth) == decode_lists[p - 4096],
             "one-shot row " + std::to_string(p) + " selects differently from decode");
     }
+  }
+
+  // fn_indexer_select on a seq pool: attention layer 1 of 2, lane 0's tokens.
+  {
+    ignis_seq_pool_spec spec{};
+    spec.num_kv_heads = 2;
+    spec.head_dim = 256;
+    spec.kv_format = IGNIS_KV_FORMAT_BF16;
+    spec.kv_page_group_count = 80;
+    spec.max_context_tokens = 4160;
+    spec.slot_count = 1;
+    spec.gdn_num_layers = 1;
+    spec.gdn_conv_channels = 10240;
+    spec.gdn_value_heads = 48;
+    spec.gdn_head_dim = 128;
+    spec.vocab = 1024;
+    spec.kv_num_layers = 2;
+    spec.indexer_key_dim = kHd;
+    spec.indexer_compress_tokens = 4;
+    ignis_seq_pool *pool = nullptr;
+    ignis_seq *seq = nullptr;
+    if (ignis_seq_pool_create(&spec, &pool) != 0 || ignis_seq_alloc(pool, 4096, &seq) != 0) {
+      std::fprintf(stderr, "FATAL: seq pool: %s\n", ignis_seq_last_error());
+      return 1;
+    }
+    fn::IndexerLayerState layers[2];
+    for (int l = 0; l < 2; ++l) {
+      layers[l].block_keys = pool->indexer_block_keys(l);
+      layers[l].blocks_per_page = ix::kBlocksPerPage;
+      layers[l].tail_keys = pool->indexer_tail_keys(l);
+    }
+    fn::Context ctx;
+    ctx.g = g;
+    ctx.kv_format = IGNIS_KV_FORMAT_BF16;
+    ctx.rope = ninfer::ops::rope_linear_frequencies(1e7F, 64);
+    ctx.pool = pool;
+    ctx.indexer = layers;
+    fn::IndexerWeights wts;
+    wts.qk_proj = fn::Linear{d.w.p, kQk, kHidden, fn::WeightFormat::Fp8RowScale};
+    wts.q_norm = d.q_norm.p;
+    wts.k_norm = d.k_norm.p;
+    const std::vector<int32_t> slot = {seq->slot};
+    bool ok = true;
+    for (const auto &c : {std::pair<int, int>{0, 2000}, std::pair<int, int>{2000, 4096}}) {
+      const int n = c.second - c.first;
+      load_rows(x0, c.first, n);
+      const std::vector<int32_t> first = {c.first};
+      MOE_CUDA(cudaMemcpyAsync(d.slots.p, slot.data(), 4, cudaMemcpyHostToDevice, d.stream));
+      MOE_CUDA(cudaMemcpyAsync(d.positions.p, first.data(), 4, cudaMemcpyHostToDevice, d.stream));
+      fn::Batch b;
+      b.lanes = 1;
+      b.tokens = n;
+      b.slots = d.slots.as<int32_t>();
+      b.positions = d.positions.as<int32_t>();
+      b.max_visible = c.second;
+      ninfer::DeviceArena exact_arena(fn::fn_indexer_select_scratch_bytes(g, n, c.second));
+      fn::Selection out{d.tok_b.as<int32_t>(), d.cnt_b.as<int32_t>()};
+      if (fn::fn_indexer_select(ctx, 1, wts, b, d.xin.p, out, exact_arena, d.stream) != 0) {
+        std::fprintf(stderr, "FATAL: fn_indexer_select: %s\n", fn::fn_last_error());
+        return 1;
+      }
+      MOE_CUDA(cudaStreamSynchronize(d.stream));
+      if (c.first == 0) {
+        check(out.dense, "fn_indexer_select: a call up to 2000 visible tokens must set Selection::dense");
+        continue;
+      }
+      check(!out.dense, "fn_indexer_select: a call up to 4096 visible tokens is not dense");
+      const auto got = download<int32_t>(d.tok_b.p, static_cast<std::size_t>(n) * kWidth);
+      ok = ok && std::equal(got.begin(), got.end(), one_shot_lists.begin() + static_cast<std::size_t>(c.first) * kWidth);
+    }
+    check(ok, "fn_indexer_select: the sparse chunk selects differently from the stages' one-shot run");
+    // The pool's layer-1 section against the stages' keys (slot 0, chunked + decode).
+    const auto row = download<int32_t>(pool->kv_pool.block_table_row(seq->slot).data, 64);
+    bool keys_equal = true;
+    for (int bk = 0; bk < 1024 && keys_equal; ++bk) {
+      const std::size_t at = (static_cast<std::size_t>(row[bk / 16]) * ix::kBlocksPerPage + bk % 16) * kHd;
+      const auto key = download<uint16_t>(static_cast<uint16_t *>(layers[1].block_keys) + at, kHd);
+      keys_equal = std::equal(key.begin(), key.end(), keys_after_4098.begin() + static_cast<std::size_t>(bk) * kHd);
+    }
+    check(keys_equal, "fn_indexer_select: the pool's layer-1 block keys differ from the stages'");
+    ignis_seq_release(pool, seq);
+    ignis_seq_pool_free(pool);
   }
 
   // The checks bite. A block key roped one block late: the first 64 tokens appended as if they
