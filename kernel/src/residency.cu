@@ -30,10 +30,13 @@ int32_t fail(const std::string &message) {
   return -1;
 }
 
+// A failure is reported through the return value and consumed from the thread's last error:
+// left there, it would be read back by the next launch check and blamed on that launch.
 #define RESIDENCY_CUDA(expr)                                                                      \
   do {                                                                                            \
     const cudaError_t status_ = (expr);                                                           \
     if (status_ != cudaSuccess) {                                                                 \
+      (void)cudaGetLastError();                                                                   \
       return fail(std::string(#expr) + ": " + cudaGetErrorString(status_));                       \
     }                                                                                             \
   } while (0)
@@ -829,8 +832,8 @@ int32_t ignis_residency_join(ignis_residency *r, void *stream) {
   if (r == nullptr) return fail("residency: no residency");
   if (!r->forked) return 0;
   // Cleared first: after a failed capture the join event belongs to a dead capture and the
-  // wait fails (cudaErrorCapturedEvent); its copies never ran, so there is nothing left to
-  // join, and every later step must not fail on it again.
+  // wait fails; its copies never ran, so there is nothing left to join, and every later step
+  // must not fail on it again.
   r->forked = false;
   RESIDENCY_CUDA(cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), r->join, 0));
   return 0;

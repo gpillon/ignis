@@ -398,7 +398,12 @@ int main(int argc, char **argv) {
     check(ended != cudaSuccess, "a capture with an unjoined prefetch fork must fail to end");
     if (g) cudaGraphDestroy(g);
     cudaGetLastError();  // the capture's error is not the test's
-    ignis_residency_join(r, stream);  // may report the dead event; must forget it either way
+    // May report the dead event; must forget it either way, and leave no last error behind for
+    // the next step's launch check to read as its own.
+    const int32_t joined = ignis_residency_join(r, stream);
+    std::printf("join after the failed capture: %s\n", joined == 0 ? "ok" : ignis_residency_last_error());
+    check(cudaPeekAtLastError() == cudaSuccess,
+          std::string("the join leaves a last error behind: ") + cudaGetErrorString(cudaPeekAtLastError()));
     check(ignis_residency_join(r, stream) == 0, std::string("a second join still fails: ") + ignis_residency_last_error());
     // A normal step now runs; the replay below starts from this state.
     CUDA_OK(cudaStreamSynchronize(stream));
