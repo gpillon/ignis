@@ -222,6 +222,9 @@ pub struct ModelConfig {
     /// reference's state matrix is `gdn_head_dim x gdn_head_dim` per value
     /// head: `value_head_dim == key_head_dim`, GitHub #55).
     pub gdn_head_dim: u64,
+    /// The GDN causal conv's kernel width (`linear_conv_kernel_dim`): the
+    /// conv keeps `gdn_conv_kernel - 1` past taps per channel.
+    pub gdn_conv_kernel: u64,
     /// The GQA RoPE rotary dim (of `head_dim` — the first `rotary_dim`
     /// dims of each q / k head are rotated; `rotary_dim / 2` pairs,
     /// GitHub #28).
@@ -342,6 +345,20 @@ impl ModelConfig {
         })
     }
 
+    /// The indexer's raw keys of a sequence's incomplete block: the
+    /// checkpoint pools a block once its `compress_ratio` keys exist, so up
+    /// to `compress_ratio - 1` raw BF16 keys wait in every attention layer.
+    /// Per sequence, not per token. 0 without an indexer.
+    pub fn indexer_tail_bytes(&self) -> u64 {
+        self.indexer.map_or(0, |indexer| {
+            self.attention_layer_count() as u64
+                * (indexer.compress_ratio - 1)
+                * indexer.kv_heads
+                * indexer.head_dim
+                * 2
+        })
+    }
+
     /// The n-gram embedding's dilated-conv state per lane: its past
     /// positions of the BF16 PLE output, one channel per residual feature.
     /// 0 without an n-gram embedding.
@@ -376,6 +393,7 @@ impl ModelConfig {
             // state, so key_head_dim is the same 8.
             gdn_value_heads: 2,
             gdn_head_dim: 8,
+            gdn_conv_kernel: 4,
             rotary_dim: 8,
             rope_theta: 1e7,
             ffn_intermediate: 32,
@@ -428,6 +446,7 @@ impl ModelConfig {
             // 128.
             gdn_value_heads: 48,
             gdn_head_dim: 128,
+            gdn_conv_kernel: 4,
             // The GQA RoPE geometry (GitHub #28): the split-half NeoX
             // rotary of `rotary_dim` = 64 of `head_dim` = 256 (32 pairs),
             // base θ = 1e7 (the reference's `rope_linear_frequencies`
@@ -482,6 +501,7 @@ impl ModelConfig {
             gdn_ab_width: 96,
             gdn_value_heads: 48,
             gdn_head_dim: 128,
+            gdn_conv_kernel: 4,
             // `partial_rotary_factor` 0.25 of `head_dim` 256. The config's
             // interleaved M-RoPE sections (11, 11, 10 pairs) rotate one text
             // position on all three axes, which is the 1-D table.
@@ -541,6 +561,38 @@ impl LayerKind {
 }
 
 impl ModelFamily {
+    /// The family an artifact's identity `model_id` names, or `None` for an
+    /// artifact of neither model (a test fixture).
+    pub fn of_model_id(model_id: &str) -> Option<Self> {
+        [ModelFamily::Qwen38_27b, ModelFamily::FlashNext]
+            .into_iter()
+            .find(|family| family.model_id() == model_id)
+    }
+
+    /// The `model_id` of this family's artifacts, and the id it is served
+    /// under by default.
+    pub fn model_id(self) -> &'static str {
+        match self {
+            ModelFamily::Qwen38_27b => "qwen3.8-27b",
+            ModelFamily::FlashNext => "qwen3.8-flash-next",
+        }
+    }
+
+    /// Whether the model has a vision tower to take image parts with.
+    pub fn takes_images(self) -> bool {
+        self == ModelFamily::Qwen38_27b
+    }
+
+    /// Whether the model serves `/v1/decide`'s readouts.
+    pub fn serves_readouts(self) -> bool {
+        self == ModelFamily::Qwen38_27b
+    }
+
+    /// Whether the model has a speculative backend (the DFlash2 drafter).
+    pub fn speculates(self) -> bool {
+        self == ModelFamily::Qwen38_27b
+    }
+
     /// The model's name, as a refusal names it to a client.
     pub fn name(self) -> &'static str {
         match self {
@@ -600,9 +652,11 @@ pub struct IgnisNgramTopology {
     pub layer: u64,
 }
 
-/// 1:1 with `struct ignis_topology` (`kernel/include/ignis_model.h`).
+/// 1:1 with `struct ignis_topology` (`kernel/include/ignis_model.h`). Not
+/// `Clone`: its `layer_kinds` pointer is valid only inside the
+/// [`TopologyAbi`] that owns the array.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct IgnisTopology {
     pub num_layers: u32,
     pub layer_kinds: *const i32,
@@ -623,6 +677,8 @@ pub struct IgnisTopology {
     pub rms_norm_eps: f32,
     pub family: i32,
     pub gdn_value_heads: u64,
+    pub gdn_head_dim: u64,
+    pub gdn_conv_kernel: u64,
     pub moe: IgnisMoeTopology,
     pub hyper: IgnisHyperTopology,
     pub indexer: IgnisIndexerTopology,
@@ -649,6 +705,11 @@ impl TopologyAbi {
 impl ModelConfig {
     /// This topology as it crosses the step ABI.
     pub fn topology_abi(&self) -> TopologyAbi {
+        assert_eq!(
+            self.num_layers,
+            self.layer_kinds.len(),
+            "ModelConfig: num_layers is not the number of layer kinds"
+        );
         let layer_kinds: Vec<i32> = self.layer_kinds.iter().map(|kind| kind.abi_code()).collect();
         let moe = self.moe.map_or_else(IgnisMoeTopology::default, |moe| IgnisMoeTopology {
             num_experts: moe.num_experts,
@@ -674,7 +735,7 @@ impl ModelConfig {
             layer: ngram.layer as u64,
         });
         let raw = IgnisTopology {
-            num_layers: self.num_layers as u32,
+            num_layers: layer_kinds.len() as u32,
             // The Vec's heap buffer does not move when the Vec does.
             layer_kinds: layer_kinds.as_ptr(),
             hidden: self.hidden,
@@ -694,6 +755,8 @@ impl ModelConfig {
             rms_norm_eps: self.rms_norm_eps,
             family: self.family.abi_code(),
             gdn_value_heads: self.gdn_value_heads,
+            gdn_head_dim: self.gdn_head_dim,
+            gdn_conv_kernel: self.gdn_conv_kernel,
             moe,
             hyper,
             indexer,
@@ -950,11 +1013,71 @@ mod tests {
         assert_eq!(offset_of!(IgnisTopology, rms_norm_eps), 128);
         assert_eq!(offset_of!(IgnisTopology, family), 132);
         assert_eq!(offset_of!(IgnisTopology, gdn_value_heads), 136);
-        assert_eq!(offset_of!(IgnisTopology, moe), 144);
-        assert_eq!(offset_of!(IgnisTopology, hyper), 176);
-        assert_eq!(offset_of!(IgnisTopology, indexer), 192);
-        assert_eq!(offset_of!(IgnisTopology, ngram), 232);
-        assert_eq!(size_of::<IgnisTopology>(), 272);
+        assert_eq!(offset_of!(IgnisTopology, gdn_head_dim), 144);
+        assert_eq!(offset_of!(IgnisTopology, gdn_conv_kernel), 152);
+        assert_eq!(offset_of!(IgnisTopology, moe), 160);
+        assert_eq!(offset_of!(IgnisTopology, hyper), 192);
+        assert_eq!(offset_of!(IgnisTopology, indexer), 208);
+        assert_eq!(offset_of!(IgnisTopology, ngram), 248);
+        assert_eq!(size_of::<IgnisTopology>(), 288);
+    }
+
+    /// The descriptor's layer count is its kinds array's length, so the leaf
+    /// can never read past it; a config whose count disagrees is a bug, not
+    /// a topology.
+    #[test]
+    #[should_panic(expected = "num_layers")]
+    fn a_config_whose_layer_count_is_not_its_kinds_is_refused() {
+        let mut cfg = ModelConfig::qwen38_27b();
+        cfg.num_layers = 65;
+        let _ = cfg.topology_abi();
+    }
+
+    /// The GDN head dim and conv kernel cross as topology fields:
+    /// `linear_key_head_dim` / `linear_value_head_dim` 128 and
+    /// `linear_conv_kernel_dim` 4, the same on both models.
+    #[test]
+    fn the_gdn_head_dim_and_conv_kernel_cross_the_abi() {
+        for cfg in [ModelConfig::qwen38_27b(), ModelConfig::qwen38_flash_next()] {
+            assert_eq!((cfg.gdn_head_dim, cfg.gdn_conv_kernel), (128, 4), "{:?}", cfg.family);
+            let abi = cfg.topology_abi();
+            assert_eq!((abi.raw().gdn_head_dim, abi.raw().gdn_conv_kernel), (128, 4));
+        }
+    }
+
+    /// The indexer pools only complete blocks (`update_indexer` keeps raw
+    /// keys; a block's pooled key exists once its 4 keys do), so a sequence
+    /// also holds the incomplete block's raw keys: up to 3 BF16 keys of 128
+    /// in each of the 12 QSA layers.
+    #[test]
+    fn the_indexer_state_counts_the_incomplete_blocks_raw_keys() {
+        assert_eq!(ModelConfig::qwen38_flash_next().indexer_tail_bytes(), 12 * 3 * 128 * 2);
+        assert_eq!(ModelConfig::qwen38_27b().indexer_tail_bytes(), 0);
+    }
+
+    /// An artifact's identity names its model: the 27B container's
+    /// `model_id` is `qwen3.8-27b` (crates/artifact/tests/real_artifact.rs),
+    /// Flash-Next's `qwen3.8-flash-next` (docs/specs/flash-next/layout.md);
+    /// each is also the id the model is served under by default.
+    #[test]
+    fn a_model_id_names_its_family() {
+        assert_eq!(ModelFamily::of_model_id("qwen3.8-27b"), Some(ModelFamily::Qwen38_27b));
+        assert_eq!(ModelFamily::of_model_id("qwen3.8-flash-next"), Some(ModelFamily::FlashNext));
+        assert_eq!(ModelFamily::of_model_id("fixture-model"), None);
+        for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+            assert_eq!(ModelFamily::of_model_id(family.model_id()), Some(family));
+        }
+    }
+
+    /// What each model can serve beyond text: Flash-Next has no vision
+    /// tower, no readouts and no speculative decoding (spec flash-next/04,
+    /// Out of Scope).
+    #[test]
+    fn flash_next_serves_text_only() {
+        let dense = ModelFamily::Qwen38_27b;
+        assert!(dense.takes_images() && dense.serves_readouts() && dense.speculates());
+        let flash = ModelFamily::FlashNext;
+        assert!(!flash.takes_images() && !flash.serves_readouts() && !flash.speculates());
     }
 
     /// `gdn_value_heads * gdn_head_dim` must equal `gdn_state_rows` (the

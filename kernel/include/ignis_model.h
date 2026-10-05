@@ -163,10 +163,17 @@ struct ignis_topology {
   float rms_norm_eps;
   int32_t family; /* enum ignis_model_family */
   /* The GDN value heads (GitHub #302): the length of a GDN layer's
-   * `gdn/a_log` and `gdn/dt_bias`, and `gdn_state_rows / gdn_value_heads` is
-   * its gated norm's width. 48 on the 27B, as its GDN layers are; 48 on
-   * Flash-Next, whose GDN layers are 36. */
+   * `gdn/a_log` and `gdn/dt_bias`, and the recurrence's head count. 48 on
+   * the 27B, as its GDN layers are; 48 on Flash-Next, whose GDN layers are
+   * 36. */
   uint64_t gdn_value_heads;
+  /* One GDN value (and key) head's width: gdn_state_rows is
+   * gdn_value_heads x gdn_head_dim, and the gated norm is this wide. The
+   * recurrence runs 128; a load with GDN layers refuses another. */
+  uint64_t gdn_head_dim;
+  /* The GDN causal conv's kernel width (`linear_conv_kernel_dim`); the conv
+   * runs 4, and a load with GDN layers refuses another. */
+  uint64_t gdn_conv_kernel;
   struct ignis_moe_topology moe;
   struct ignis_hyper_topology hyper;
   struct ignis_indexer_topology indexer;
@@ -174,15 +181,17 @@ struct ignis_topology {
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(struct ignis_topology) == 272,
+static_assert(sizeof(struct ignis_topology) == 288,
               "ignis_topology drifted from crates/core/src/compute.rs IgnisTopology");
 static_assert(offsetof(struct ignis_topology, rms_norm_eps) == 128 &&
                   offsetof(struct ignis_topology, family) == 132 &&
                   offsetof(struct ignis_topology, gdn_value_heads) == 136 &&
-                  offsetof(struct ignis_topology, moe) == 144 &&
-                  offsetof(struct ignis_topology, hyper) == 176 &&
-                  offsetof(struct ignis_topology, indexer) == 192 &&
-                  offsetof(struct ignis_topology, ngram) == 232,
+                  offsetof(struct ignis_topology, gdn_head_dim) == 144 &&
+                  offsetof(struct ignis_topology, gdn_conv_kernel) == 152 &&
+                  offsetof(struct ignis_topology, moe) == 160 &&
+                  offsetof(struct ignis_topology, hyper) == 192 &&
+                  offsetof(struct ignis_topology, indexer) == 208 &&
+                  offsetof(struct ignis_topology, ngram) == 248,
               "ignis_topology's field offsets drifted from crates/core/src/compute.rs IgnisTopology");
 #endif
 
@@ -384,10 +393,11 @@ int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors, 
  * Returns 0 and a handle in `*out_model` on success. Returns -1 (no model
  * produced; see ignis_model_last_error) on a null argument, a duplicate
  * name, a missing or extra bound tensor, a tensor whose shape does not
- * match the one `topology` implies, an inconsistent `topology` (a GDN layer
- * count other than its GDN layer kinds', GDN value heads that do not divide
- * `gdn_state_rows`, an unknown family, a Flash-Next block in a 27B
- * topology), a Flash-Next topology (its program is not built yet, GitHub
+ * match the one `topology` implies, an inconsistent `topology` (an unknown
+ * layer kind, a GDN layer count other than its GDN layer kinds',
+ * `gdn_state_rows` other than `gdn_value_heads x gdn_head_dim`, a GDN head dim
+ * or conv kernel the GDN ops do not run, an unknown family, a Flash-Next
+ * block in a 27B topology), a Flash-Next topology (its program is not built yet, GitHub
  * #302), an invalid `prefill_chunk_tokens` /
  * `max_context_tokens` / `kv_format` / `options`, or a chunk width whose
  * scratch reservation does not fit the device's free memory -- a load is

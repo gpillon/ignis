@@ -89,6 +89,8 @@ Topology topology_of(const Geometry &g) {
   t.raw.gdn_state_cols   = g.key_heads * kGdnHeadDim;
   t.raw.gdn_num_layers   = g.gdn_layers;
   t.raw.gdn_value_heads  = g.value_heads;
+  t.raw.gdn_head_dim     = kGdnHeadDim;
+  t.raw.gdn_conv_kernel  = kConvKernel;
   t.raw.gdn_q_width      = g.key_heads * kGdnHeadDim;
   t.raw.gdn_z_width      = g.value_heads * kGdnHeadDim;
   t.raw.gdn_ab_width     = 2 * g.value_heads;
@@ -207,9 +209,31 @@ int main() {
   swapped.raw.gdn_num_layers = kFlashNext.value_heads;
   refused(swapped, {"gdn_num_layers (48)", "GDN layer count (36)"}, "48 GDN layers claimed of 36");
 
+  // The value heads must account for the value width the projections are
+  // sized by, head for head: neither more rows than heads, nor fewer.
   Topology uneven = topology_of(kFlashNext);
   uneven.raw.gdn_value_heads = 5;
-  refused(uneven, {"gdn_state_rows is not a multiple of gdn_value_heads"}, "5 value heads");
+  refused(uneven, {"gdn_state_rows (6144) is not gdn_value_heads x gdn_head_dim (5 x 128)"},
+          "5 value heads");
+  Topology wide = topology_of(kFlashNext);
+  wide.raw.gdn_state_rows += kGdnHeadDim;
+  refused(wide, {"gdn_state_rows (6272) is not gdn_value_heads x gdn_head_dim (48 x 128)"},
+          "a value width one head past the heads");
+
+  // The GDN ops run head dim 128 and conv kernel 4: a topology asking for
+  // other values is refused, not run against these.
+  Topology narrow_heads = topology_of(kFlashNext);
+  narrow_heads.raw.gdn_head_dim = 64;
+  refused(narrow_heads, {"gdn_head_dim 64"}, "a head dim of 64");
+  Topology short_conv = topology_of(kFlashNext);
+  short_conv.raw.gdn_conv_kernel = 3;
+  refused(short_conv, {"gdn_conv_kernel 3"}, "a conv kernel of 3");
+
+  // A layer is GDN or GQA: any other kind is refused rather than bound as a
+  // GDN layer the state pool was never sized for.
+  Topology odd_kind = topology_of(kFlashNext);
+  odd_kind.kinds[5] = 2;
+  refused(odd_kind, {"layer 5's kind 2"}, "an unknown layer kind");
 
   Topology headless = topology_of(kFlashNext);
   headless.raw.gdn_value_heads = 0;
@@ -228,6 +252,15 @@ int main() {
   Topology dense_with_experts = topology_of(kFlashNext);
   dense_with_experts.raw.moe.num_experts = 512;
   refused(dense_with_experts, {"carries no MoE block"}, "a 27B topology with experts");
+
+  Topology dense_with_streams = topology_of(kFlashNext);
+  dense_with_streams.raw.hyper.streams = 4;
+  refused(dense_with_streams, {"carries no hyper-connection block"},
+          "a 27B topology with hyper-connections");
+
+  Topology dense_with_indexer = topology_of(kFlashNext);
+  dense_with_indexer.raw.indexer.budget = 2048;
+  refused(dense_with_indexer, {"carries no indexer block"}, "a 27B topology with an indexer");
 
   Topology dense_with_ngram = topology_of(kFlashNext);
   dense_with_ngram.raw.ngram.layer = 1;

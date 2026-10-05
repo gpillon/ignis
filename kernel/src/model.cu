@@ -238,10 +238,12 @@ struct Geometry {
   int64_t ffn_intermediate;
   int64_t gdn_conv_channels;
   int64_t gdn_in_proj_m;
-  int64_t gdn_norm_width;
   int64_t gdn_ab_width;
   int64_t gdn_state_rows;
   int64_t gdn_value_heads;
+  // The GDN head dim: one value head's width, and so the gated RMSNorm's.
+  int64_t gdn_head_dim;
+  int64_t gdn_conv_kernel;
 
   static Geometry from(const ignis_topology &t) {
     Geometry g{};
@@ -257,18 +259,18 @@ struct Geometry {
     g.gdn_ab_width = static_cast<int64_t>(t.gdn_ab_width);
     g.gdn_state_rows = static_cast<int64_t>(t.gdn_state_rows);
     g.gdn_value_heads = static_cast<int64_t>(t.gdn_value_heads);
-    // The GDN gated RMSNorm's per-head width (state_rows / value heads). A
-    // topology without GDN layers may carry no value heads; one with them
-    // was refused unless the value heads divide state_rows.
-    g.gdn_norm_width = t.gdn_value_heads == 0 ? 0 : g.gdn_state_rows / g.gdn_value_heads;
+    g.gdn_head_dim = static_cast<int64_t>(t.gdn_head_dim);
+    g.gdn_conv_kernel = static_cast<int64_t>(t.gdn_conv_kernel);
     return g;
   }
 };
 
-// The GDN causal-conv kernel width (the reference's `gdn_conv_kernel`
-// model constant -- not per-model config, so it is not on the topology
-// descriptor).
+// The GDN geometry the vendored ops run (GitHub #302): the causal conv at
+// kernel width 4 (its state pool keeps 3 taps, kIgnisGdnConvStateWidth) and
+// the recurrence at head dim 128. Both are topology fields; a topology that
+// asks for another value is refused at load, not run against these.
 constexpr int64_t kGdnConvKernel = 4;
+constexpr int64_t kGdnHeadDim = 128;
 
 bool bind_gqa_layer(ModelBinder &binder, const std::string &prefix, const Geometry &g,
                      GqaLayerWeights &w) {
@@ -288,12 +290,12 @@ bool bind_gdn_layer(ModelBinder &binder, const std::string &prefix, const Geomet
   return binder.bind(prefix + "input_norm", {g.hidden}, w.input_norm) &&
          binder.bind(prefix + "gdn/a_log", {g.gdn_value_heads}, w.a_log) &&
          binder.bind(prefix + "gdn/dt_bias", {g.gdn_value_heads}, w.dt_bias) &&
-         binder.bind(prefix + "gdn/convolution", {kGdnConvKernel, g.gdn_conv_channels},
+         binder.bind(prefix + "gdn/convolution", {g.gdn_conv_kernel, g.gdn_conv_channels},
                      w.convolution) &&
          binder.bind(prefix + "gdn/a_b_projection", {g.gdn_ab_width, g.hidden}, w.a_b_projection) &&
          binder.bind(prefix + "gdn/query_key_value_z", {g.gdn_in_proj_m, g.hidden},
                      w.query_key_value_z) &&
-         binder.bind(prefix + "gdn/norm", {g.gdn_norm_width}, w.norm) &&
+         binder.bind(prefix + "gdn/norm", {g.gdn_head_dim}, w.norm) &&
          binder.bind(prefix + "gdn/output", {g.hidden, g.gdn_state_rows}, w.output) &&
          binder.bind(prefix + "post_attention_norm", {g.hidden}, w.post_attention_norm) &&
          binder.bind(prefix + "mlp/gate_up", {2 * g.ffn_intermediate, g.hidden}, w.mlp_gate_up) &&
@@ -386,12 +388,6 @@ static_assert(kDflash2FeatureTaps == static_cast<int64_t>(kDflash2TapLayers.size
 // This is a load-time host-arithmetic mirror of those files' allocation
 // sequence, not a dry run: no device call, no sequence-state pool (it does
 // not exist yet at model-load time), and no kernel dispatch.
-//
-// The GDN recurrence's fixed per-head state dimension for this project's
-// single model family (ADR 0001): value_head_dim == key_head_dim == 128
-// (mirrors the sequence-state pool's spec, GitHub #55, which the model
-// handle's GDN layers are bound against).
-constexpr int64_t kGdnHeadDim = 128;
 
 constexpr std::size_t kArenaAlign = 256;
 
@@ -492,8 +488,8 @@ std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLay
   const auto conv_channels = q_width + state_cols + state_rows;
   const auto value_width = state_rows;
   const auto qk_width = (q_width + state_cols) / 2;
-  const auto value_heads = value_width / static_cast<std::int32_t>(kGdnHeadDim);
-  const auto qk_heads = qk_width / static_cast<std::int32_t>(kGdnHeadDim);
+  const auto value_heads = static_cast<std::int32_t>(topology.gdn_value_heads);
+  const auto qk_heads = qk_width / static_cast<std::int32_t>(topology.gdn_head_dim);
   const std::int32_t columns = T * batch;
 
   std::size_t bytes = 0;
@@ -591,10 +587,13 @@ ninfer::GdnReplayRecordSpec verify_record_spec(const ignis_topology &topology, u
   spec.width = static_cast<std::int32_t>(window) + 1;
   spec.conv_channels =
       static_cast<std::int32_t>(topology.gdn_q_width + topology.gdn_state_cols + topology.gdn_state_rows);
-  spec.qk_heads = static_cast<std::int32_t>(topology.gdn_q_width / kGdnHeadDim);
-  spec.value_heads = static_cast<std::int32_t>(topology.gdn_state_rows / kGdnHeadDim);
-  spec.key_dim = static_cast<std::int32_t>(kGdnHeadDim);
-  spec.value_dim = static_cast<std::int32_t>(kGdnHeadDim);
+  // A topology without GDN layers carries no head dim: it records nothing.
+  spec.qk_heads = topology.gdn_head_dim == 0
+                      ? 0
+                      : static_cast<std::int32_t>(topology.gdn_q_width / topology.gdn_head_dim);
+  spec.value_heads = static_cast<std::int32_t>(topology.gdn_value_heads);
+  spec.key_dim = static_cast<std::int32_t>(topology.gdn_head_dim);
+  spec.value_dim = static_cast<std::int32_t>(topology.gdn_head_dim);
   return spec;
 }
 
@@ -929,20 +928,43 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // is the layer kinds'; the value heads size every per-head GDN parameter.
   uint64_t gdn_layers = 0;
   for (uint32_t i = 0; i < topology->num_layers; ++i) {
-    gdn_layers += topology->layer_kinds[i] == IGNIS_LAYER_GDN ? 1 : 0;
+    const int32_t kind = topology->layer_kinds[i];
+    if (kind != IGNIS_LAYER_GDN && kind != IGNIS_LAYER_GQA) {
+      set_error("ignis_model_load: layer " + std::to_string(i) + "'s kind " + std::to_string(kind) +
+                " is not an ignis_layer_kind");
+      return nullptr;
+    }
+    gdn_layers += kind == IGNIS_LAYER_GDN ? 1 : 0;
   }
   if (topology->gdn_num_layers != gdn_layers) {
     set_error("ignis_model_load: topology.gdn_num_layers (" + std::to_string(topology->gdn_num_layers) +
               ") is not the topology's GDN layer count (" + std::to_string(gdn_layers) + ")");
     return nullptr;
   }
-  if (gdn_layers > 0 && topology->gdn_value_heads == 0) {
-    set_error("ignis_model_load: topology.gdn_value_heads must be positive");
-    return nullptr;
-  }
-  if (topology->gdn_value_heads != 0 && topology->gdn_state_rows % topology->gdn_value_heads != 0) {
-    set_error("ignis_model_load: gdn_state_rows is not a multiple of gdn_value_heads");
-    return nullptr;
+  // The heads every GDN parameter is sized by, checked against the widths
+  // the projections are sized by, and the geometry the vendored conv and
+  // recurrence run. A topology without GDN layers needs none of it.
+  if (gdn_layers > 0) {
+    if (topology->gdn_value_heads == 0) {
+      set_error("ignis_model_load: topology.gdn_value_heads must be positive");
+      return nullptr;
+    }
+    if (topology->gdn_head_dim != static_cast<uint64_t>(kGdnHeadDim)) {
+      set_error("ignis_model_load: topology.gdn_head_dim " + std::to_string(topology->gdn_head_dim) +
+                " is not the " + std::to_string(kGdnHeadDim) + " the GDN recurrence runs");
+      return nullptr;
+    }
+    if (topology->gdn_conv_kernel != static_cast<uint64_t>(kGdnConvKernel)) {
+      set_error("ignis_model_load: topology.gdn_conv_kernel " + std::to_string(topology->gdn_conv_kernel) +
+                " is not the " + std::to_string(kGdnConvKernel) + " the GDN causal conv runs");
+      return nullptr;
+    }
+    if (topology->gdn_state_rows != topology->gdn_value_heads * topology->gdn_head_dim) {
+      set_error("ignis_model_load: gdn_state_rows (" + std::to_string(topology->gdn_state_rows) +
+                ") is not gdn_value_heads x gdn_head_dim (" + std::to_string(topology->gdn_value_heads) +
+                " x " + std::to_string(topology->gdn_head_dim) + ")");
+      return nullptr;
+    }
   }
   // ADR 0043: the family names the program. Flash-Next's blocks are all zero
   // in a 27B topology, and Flash-Next's own program is not built yet.
