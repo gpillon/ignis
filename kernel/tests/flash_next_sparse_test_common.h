@@ -112,18 +112,18 @@ inline RowFn exact_rows(const Pages &pg) {
 //   times (1 + d), |d| <= 2^-9 (BF16) + 2^-12 (exp2f and the fp32 rescales by exp2 of maxima
 //   differences, at most 65 of them); normalized by the sum of the same weights, the output moves
 //   by at most (2^-9 + 2^-12) sum_j w_j |v_j - out| (w the exact softmax).
-// - A score moves by at most e_j = (255 u + row_rel) sum_d |q_d k_jd| / 16 (fp32 accumulation of
-//   256 exact products, u = 2^-24, plus K rows the kernel may read up to row_rel off the reference's,
-//   e.g. one BF16 ulp, 2^-7 relative, for decoded hq rows), so every weight by a factor within
-//   e^(+-2 max e_j): (e^(2 max e_j) - 1) sum_j w_j |v_j - out|.
-// - V rows read up to row_rel off: row_rel sum_j w_j |v_j|; the fp32 accumulation of up to n
-//   products: n u sum_j w_j |v_j|; the BF16 rounding of the result: 2^-9 |out|.
+// - A score moves by at most e_j = 255 u sum_d |q_d k_jd| / 16 (fp32 accumulation of 256 exact
+//   products, u = 2^-24), so every weight by a factor within e^(+-2 max e_j):
+//   (e^(2 max e_j) - 1) sum_j w_j |v_j - out|.
+// - The fp32 accumulation of up to n products: n u sum_j w_j |v_j|; the BF16 rounding of the
+//   result: 2^-9 |out|.
+// The rows are the ones the kernel reads (for hq KV: its decoded scratch, downloaded).
 struct Reference {
   std::vector<double> out, bound;  // [q_heads][head_dim]
 };
 
 inline Reference reference(const RowFn &rows, const std::vector<uint16_t> &q, int row, int slot,
-                           const std::vector<int32_t> &list, double row_rel = 0.0) {
+                           const std::vector<int32_t> &list) {
   const size_t n = list.size();
   std::vector<double> k(n * kKvHeads * kHd), v(n * kKvHeads * kHd);
   for (size_t j = 0; j < n; ++j) {
@@ -151,7 +151,7 @@ inline Reference reference(const RowFn &rows, const std::vector<uint16_t> &q, in
       m = std::max(m, w[j]);
       terms = std::max(terms, abs_sum);
     }
-    const double reweight = std::exp(2.0 * (255.0 * 0x1p-24 + row_rel) * terms / 16.0) - 1.0;
+    const double reweight = std::exp(2.0 * 255.0 * 0x1p-24 * terms / 16.0) - 1.0;
     double l = 0.0;
     for (size_t j = 0; j < n; ++j) {
       w[j] = std::exp(w[j] - m);
@@ -171,7 +171,7 @@ inline Reference reference(const RowFn &rows, const std::vector<uint16_t> &q, in
         dev += w[j] * std::fabs(vj - out[d]);
         mag += w[j] * std::fabs(vj);
       }
-      bound[d] = (0x1p-9 + 0x1p-12 + reweight) * dev + (static_cast<double>(n) * 0x1p-24 + row_rel) * mag +
+      bound[d] = (0x1p-9 + 0x1p-12 + reweight) * dev + static_cast<double>(n) * 0x1p-24 * mag +
                  0x1p-9 * std::fabs(out[d]) + 0x1p-40;
     }
   }
@@ -243,13 +243,13 @@ inline std::vector<uint16_t> run(Device &d, const Call &c, const Enqueue &enqueu
 // Every `sample_step`-th row of a call against the fp64 reference over the rows `rows` names,
 // each output within its derived bound (reference()). Returns whether every checked one was.
 inline bool check_call(const std::string &what, const RowFn &rows, const std::vector<uint16_t> &q, const Call &c,
-                       const std::vector<uint16_t> &got, int sample_step, double row_rel = 0.0) {
+                       const std::vector<uint16_t> &got, int sample_step) {
   const int n = static_cast<int>(c.lists.size());
   double worst = 0.0;
   int checked = 0;
   for (int r = 0; r < n; r += sample_step) {
     const int slot = c.slots[r / c.tokens];
-    const Reference ref = reference(rows, q, r, slot, c.lists[r], row_rel);
+    const Reference ref = reference(rows, q, r, slot, c.lists[r]);
     for (size_t i = 0; i < ref.out.size(); ++i) {
       const double err = std::fabs(bf16_to_f32(got[static_cast<size_t>(r) * kQHeads * kHd + i]) - ref.out[i]);
       worst = std::max(worst, err / ref.bound[i]);

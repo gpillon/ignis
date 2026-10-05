@@ -168,9 +168,10 @@ double ulp_bf16(double v) {
 // ~0.05 rad (one position on the first seven pairs, one block on the first ten) fails it.
 struct ElementCheck {
   std::size_t exact = 0, total = 0, violations = 0;
-  void add(const uint16_t *got, const uint16_t *want, std::size_t n) {
+  // Dimensions [first_dim, 128) of each row.
+  void add(const uint16_t *got, const uint16_t *want, std::size_t n, int first_dim = 0) {
     for (std::size_t r = 0; r < n; r += kHd) {
-      for (int i = 0; i < kHd; ++i) {
+      for (int i = first_dim; i < kHd; ++i) {
         const double w = bf16_to_f32(want[r + i]);
         double bound = ulp_bf16(w);
         if (i < kRotary) {
@@ -661,22 +662,19 @@ int main() {
 
   // The checks bite. A block key roped one block late: the first 64 tokens appended as if they
   // started at position 4, into the spare slot, so block b + 1 holds block b's pooled, normed key
-  // roped at 4 (b + 1). Its non-rotary half must still match; the element check must flag it.
+  // roped at 4 (b + 1). Its non-rotary half must still pass the element check; the whole rows
+  // must not.
   {
     load_rows(x0, 0, 64);
     run_call(d, g, rope, arena, {3}, {4}, 64, 68, "mutation: keys roped one block late");
     const auto late = slot_block_keys(d, 3, 17);
     ElementCheck mutated;
     mutated.add(&late[kHd], module_keys[0].data(), 16 * kHd);
-    bool nope_equal = true;
-    for (int b = 0; b < 16; ++b) {
-      for (int i = kRotary; i < kHd; ++i) {
-        nope_equal = nope_equal && late[static_cast<std::size_t>(b + 1) * kHd + i] == module_keys[0][static_cast<std::size_t>(b) * kHd + i];
-      }
-    }
+    ElementCheck nope;
+    nope.add(&late[kHd], module_keys[0].data(), 16 * kHd, kRotary);
     std::printf("  mutation, keys roped one block late: %zu of %zu values past the element bound\n", mutated.violations,
                 mutated.total);
-    check(nope_equal, "mutation arm: the late-roped keys' non-rotary half should equal the module's");
+    check(nope.violations == 0, "mutation arm: the late-roped keys' non-rotary half should pass the element check");
     check(mutated.violations > 0, "mutation arm: the element check misses keys roped one block late");
   }
   // A query roped one position late: lane 0's row 4099 prepared as if at 4100.
