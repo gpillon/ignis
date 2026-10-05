@@ -633,6 +633,14 @@ target_include_directories(ignis_kernel_flash_next_embed_head_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_flash_next_embed_head_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_embed_head_test COMMAND ignis_kernel_flash_next_embed_head_test)
+# Slice S2 (kern): the GDN layer core (kernel/src/flash_next/gdn.cu) at the real geometry against
+# an fp64 restatement of the checkpoint's Qwen4ExpTextGatedDeltaNet: prefill chunks, decode lanes
+# eager and as a replayed graph, state carry and slot isolation. GPU.
+add_executable(ignis_kernel_flash_next_gdn_test test_flash_next_gdn.cu)
+target_include_directories(ignis_kernel_flash_next_gdn_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_gdn_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_gdn_test COMMAND ignis_kernel_flash_next_gdn_test)
 
 # GitHub #301 (spec flash-next/03): OURS -- the expert residency miss path measured (copy
 # engine against SM-driven copies from mapped pinned memory). A timing is a finding, not a
