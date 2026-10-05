@@ -575,19 +575,21 @@ pub fn prefill_staging_ring_bytes(catalog: &ExpertCatalog) -> u64 {
     2 * heaviest
 }
 
-/// One slot-table entry (a device address and the K) per projection, as the
-/// expert kernels read it (spec flash-next/02).
-pub const SLOT_TABLE_ENTRY_BYTES: u64 = 16;
+/// Per projection, what the leaf's residency keeps (`kernel/src/residency.cu`):
+/// its slot-table entry as the expert kernels read it (16 bytes), its state
+/// (class, K, host offset, slot, flags: 15 bytes) and the LRU entry of the
+/// slot it may hold (owner and stamp: 12 bytes), rounded up.
+pub const TABLE_BYTES_PER_PROJECTION: u64 = 48;
 
-/// One device LRU entry (a stamp and a key) per slot.
-pub const LRU_ENTRY_BYTES: u64 = 16;
-
-/// Residency's device tables: a slot-table entry per projection and an LRU
-/// entry per slot, counted for as many slots as there are projections — an
-/// upper bound that does not depend on the cache split it is subtracted
-/// before.
-pub fn residency_table_bytes(layers: u64, experts: u64) -> u64 {
-    layers * experts * 2 * (SLOT_TABLE_ENTRY_BYTES + LRU_ENTRY_BYTES)
+/// Residency's device tables, an upper bound of the leaf's own line
+/// (`ignis_residency_plan_bytes`'s `tables`, which a cuda load reserves): the
+/// per-projection tables counted for as many slots as there are projections,
+/// so it does not depend on the cache split it is subtracted before; two
+/// copy-job lists and the ring's key lists of one layer each; the lookahead
+/// ranking of a chunk; and the scalars and allocation rounding.
+pub fn residency_table_bytes(layers: u64, experts: u64, max_tokens: u64, lookahead_width: u64) -> u64 {
+    let keys = layers * experts * 2;
+    keys * TABLE_BYTES_PER_PROJECTION + 2 * (2 * experts) * (24 + 4) + max_tokens * lookahead_width * 4 + 16 * 1024
 }
 
 /// The warm start's order: both projections of every selected expert,

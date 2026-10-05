@@ -182,7 +182,12 @@ fn load(root: &Path) -> Study {
 fn cache_plan(study: &Study) -> ExpertCachePlan {
     let catalog = &study.catalog;
     let ring = prefill_staging_ring_bytes(catalog);
-    let tables = residency_table_bytes(u64::from(catalog.layers()), u64::from(catalog.experts()));
+    let tables = residency_table_bytes(
+        u64::from(catalog.layers()),
+        u64::from(catalog.experts()),
+        8192,
+        DEFAULT_PREFETCH_WIDTH as u64,
+    );
     plan_expert_cache(&ExpertCacheRequest {
         budget_bytes: CACHE_BYTES + ring + tables,
         planned_bytes: 0,

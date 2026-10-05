@@ -4,16 +4,18 @@
 //! VRAM replaced by recency, and the ones the next layer will probably need
 //! copied ahead by the next layer's router.
 //!
-//! This module is the CPU side, with no device code:
+//! The CPU side, with no device code:
 //! - [`class`]: the unit residency moves (one expert projection) and its
 //!   eight K classes;
 //! - [`policy`]: the replacement policy as a deterministic, trace-driven
 //!   model — the contract the GPU implementation is tested against;
 //! - [`plan`]: the host plan and residency's VRAM plan lines (ADR 0030),
 //!   and [`host_memory`], the host plan's one measured input;
-//! - [`counters`]: what residency counts, for the server to export.
+//! - [`counters`]: what residency counts, for the server to export;
+//! - `device` (feature `cuda`): the leaf's residency object, the device
+//!   side below, as an owning handle.
 //!
-//! # The device side (designed, not built yet)
+//! # The device side (`kernel/include/ignis_residency.h`)
 //!
 //! The miss path was measured first (spec acceptance 3,
 //! `docs/findings/2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md`):
@@ -62,6 +64,8 @@
 
 pub mod class;
 pub mod counters;
+#[cfg(feature = "cuda")]
+pub mod device;
 pub mod host_memory;
 pub mod plan;
 pub mod policy;

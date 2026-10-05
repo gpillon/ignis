@@ -284,9 +284,15 @@ fn the_staging_ring_holds_two_of_the_heaviest_layer() {
 }
 
 #[test]
-fn the_tables_cost_a_slot_table_entry_and_an_lru_entry_per_projection() {
+fn the_tables_line_is_an_upper_bound_counted_per_projection_and_per_chunk() {
     // 48 layers x 512 experts x 2 projections, 32 bytes each.
-    assert_eq!(residency_table_bytes(48, 512), 48 * 512 * 2 * 32);
+    // 48 bytes a projection, two job lists and two ring key lists of one
+    // layer, the lookahead ranking of an 8192-token chunk at W = 16, 16 KiB
+    // of scalars and rounding.
+    assert_eq!(
+        residency_table_bytes(48, 512, 8192, 16),
+        48 * 512 * 2 * 48 + 2 * 1024 * 28 + 8192 * 16 * 4 + 16 * 1024
+    );
 }
 
 #[test]
