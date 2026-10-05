@@ -25,6 +25,7 @@ pub mod binding;
 pub mod binder;
 pub mod checksum;
 pub mod device;
+pub mod direct;
 pub mod fixture;
 pub mod flash_next;
 pub mod frontend;
@@ -55,6 +56,7 @@ pub use checksum::{
     verify, ChecksumReport, GraftedSource, Nvfp4Record, ObjectCheck, Outcome, Sidecar,
 };
 pub use device::{CpuDevice, Device, DeviceBuffer};
+pub use direct::{AlignedBuffer, DirectReader};
 #[cfg(feature = "cuda")]
 pub use device::CudaDevice;
 #[cfg(feature = "cuda")]
