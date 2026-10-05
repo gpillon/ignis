@@ -40,8 +40,11 @@ runtime only). Each cell copies `n` projections of `S` bytes from random
 every rep uses a fresh list, so no rep rereads what L2 kept from the last.
 Times are device time between events, median of 15 reps. The SM-driven copy
 is one launch per list, a grid-stride walk over 16-byte vectors, swept over
-8-680 blocks × 256/512 threads × 1/4/8 loads in flight per thread; the
-correctness of its copy was checked byte for byte.
+8-680 blocks × 256/512 threads × 1/4/8 loads in flight per thread. Its
+copy was checked byte for byte once, on one list of 20 × 1 MiB copied by the
+sweep's last configuration (680 blocks × 512 threads, 8 loads in flight);
+every grid runs the same kernel code, so the check covers the copy's
+indexing, not each launch shape separately.
 
 RTX 5090 (170 SMs, one async copy engine reported), WDDM, PCIe Gen 3 x16 (the
 host's cap, see the snapshot-transfer finding). Two consecutive full runs,

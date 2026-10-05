@@ -29,6 +29,15 @@ use covers — and to record that `SchedEvent::StateReused` widens beside
 **Amended 2026-09-29 by spec vram-budget/02** (GitHub #281): retained slots
 come in two kinds, and the default ones live in pinned host memory — see the
 amendment at the end.
+**Amended 2026-10-05 by spec flash-next/03** (GitHub #301): under Flash-Next
+the **expert cache** takes the rest, not the KV pool. The load names its KV
+pool (a fixed line, sized from the per-lane context), and three lines follow
+it: `expert_cache` (budget − every line above − the two below; floor 12 GiB,
+refused below it), `prefill_staging` (two of the heaviest layer's expert
+projections, so a prefill's scan-resistant stream cannot overflow it) and
+`residency_tables`. The expert cache is split into eight K-class pools at
+load and nothing is allocated while serving. A 27B load's plan is unchanged.
+Lines and arithmetic: `crates/core/src/residency/plan.rs`.
 
 ## Context
 

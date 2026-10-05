@@ -79,6 +79,14 @@ Recorded by the handler, like the rejection counter, and it takes the decision
 family's exception: absent until the first call. A tokenize call is not a
 request of the lifecycle — it has no lane, no TTFT and no completion — so it
 moves none of `ignis_requests_*`.
+Amended 2026-10-05 (#301, spec flash-next/03): seven families for Flash-Next's
+**expert residency**, the last seven rows of the table. Core keeps the facts
+(`ignis_core::residency::ResidencyCounters`, counted by the residency step);
+the server names and renders them (`render_expert_residency`), so nothing on
+the inference path names an exposition. Fixed labels: `class` the eight K-class
+spellings (`gate_up_k2` … `down_k4`), `phase=decode|prefill`,
+`state=capacity|in_use`; zeros exported. Only a Flash-Next load has an expert
+cache: a 27B load never renders them.
 
 ## Context
 
@@ -246,6 +254,13 @@ The initial stable metric contract is:
 | `ignis_tokenize_requests_total` | counter | `route=tokenize\|detokenize` | Calls to `POST /v1/tokenize` and `/v1/detokenize`, whatever they answered (#285, spec server/10). Not requests of the lifecycle above: they never enter the scheduler. **Absent until the first one** |
 | `ignis_responses_sockets` | gauge | none | Open Responses API WebSocket connections (#282) |
 | `ignis_responses_queued_requests` | gauge | none | Responses WebSocket requests waiting in the server-wide **socket admission queue**; a request the engine found full is counted here rather than in `ignis_requests_rejected_total` (#282) |
+| `ignis_expert_cache_hits_total` | counter | `class`, `phase=decode\|prefill` | Flash-Next: selected expert projections already resident in the VRAM expert cache, or staged for their layer (#301). A decode hit rate is hits over hits plus misses of `phase="decode"` |
+| `ignis_expert_cache_misses_total` | counter | `class`, `phase=decode\|prefill` | Flash-Next: selected expert projections copied in from the pinned host pool by their own step (#301) |
+| `ignis_expert_prefetches_issued_total` | counter | none | Flash-Next: projections copied ahead for the next layer by the router lookahead (#301) |
+| `ignis_expert_prefetches_used_total` | counter | none | Flash-Next: prefetched projections at their first use, whenever it comes (#301) |
+| `ignis_expert_bytes_moved_total` | counter | `phase=decode\|prefill` | Flash-Next: bytes of expert projections copied host-to-device, misses and prefetches (#301) |
+| `ignis_expert_residency_stall_seconds_total` | counter | none | Flash-Next: time the expert kernels waited on residency (#301) |
+| `ignis_expert_cache_slots` | gauge | `class`, `state=capacity\|in_use` | Flash-Next: VRAM expert cache slots per K class, reserved at load and in use (#301) |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
 reserved lines (eleven, twelve since #257 added `hq_residual_window`), the budget, the KV pool's pages and page bytes, the
