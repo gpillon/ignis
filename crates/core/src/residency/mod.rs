@@ -27,9 +27,17 @@
 //!   artifact's expert index (offset per (layer, expert, projection)).
 //! - **Device, reserved at load as [`ExpertCachePlan`]'s lines:** the eight
 //!   class pools; the prefill staging ring; the tables — per projection its
-//!   slot-table entry (device address and K, what spec 02's expert kernels
-//!   read) and its slot (or none), per slot its owner key and stamp, and the
-//!   clock.
+//!   slot-table entry (`crate::moe::MoeSlot`, 16 bytes: device address and
+//!   `k2`, a layer's table indexed `expert · 2 + projection`, what spec 02's
+//!   expert kernels read) and its slot (or none), per slot its owner key and
+//!   stamp, and the clock.
+//! - **A non-resident projection's entry is always `MoeSlot::ABSENT`** (a
+//!   null record): the table starts that way, an eviction writes it back in
+//!   the same resolve that hands the slot to its new owner, and a staged
+//!   projection's entry returns to it when the ring releases its layer. The
+//!   expert kernels trap on a selected `ABSENT` entry, in every build, so a
+//!   stale address is never left to be read as some other projection's
+//!   bytes.
 //! - **Per layer step, on the compute stream:** a *resolve* kernel takes the
 //!   router's selection (and the next router's lookahead) and does exactly
 //!   [`ResidencyModel::step`] — hits stamped, victims the first unpinned
