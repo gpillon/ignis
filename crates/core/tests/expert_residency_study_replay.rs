@@ -424,6 +424,10 @@ fn report(label: &str, rates: &[(String, f64)], one: &Tally, three: &Tally) {
             println!("  {domain:6} {:5.1}%  ({:.0}%)", mean * 100.0, simulated * 100.0);
         }
     }
+    // Domains the converter traces beyond the study's (de, ja): printed, nothing to compare.
+    for (domain, mean) in rates.iter().filter(|(d, _)| SIMULATED.iter().all(|(s, _)| s != d)) {
+        println!("  {domain:6} {:5.1}%  (not simulated)", mean * 100.0);
+    }
     for (lanes, t, simulated) in [(1, one, SIMULATED_COST[0]), (3, three, SIMULATED_COST[1])] {
         println!(
             "  {lanes} lane(s): hit {:.1}% | demand {:.1} MB + prefetch {:.1} MB per round, {:.2} ms of link at 12 GB/s | demand cost {:.2} ms per round (simulation {:.1} ms)",
