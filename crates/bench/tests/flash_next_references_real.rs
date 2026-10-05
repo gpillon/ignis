@@ -185,3 +185,23 @@ fn the_g1_column_is_the_canary_sets_quantized_argmax_at_the_rows_the_run_reads()
     assert_eq!(run.overall, 1.0);
     assert!(run.pass);
 }
+
+#[test]
+fn the_converters_dry_run_record_and_g1_fixture_parse() {
+    // The converter's real JSON shapes (a 2-layer dry run kept its record and
+    // fixture): extra keys, nulls and the fixture's canary_source_model.
+    let dir = std::path::Path::new("F:/ai/models/fn-dryrun-report");
+    if !dir.join("run2").join("converter.json").exists() {
+        eprintln!("skip: {} holds no dry-run record", dir.display());
+        return;
+    }
+    let record = ConverterRecord::read(&dir.join("run2").join("converter.json")).unwrap();
+    assert_eq!(record.status, "dry-run");
+    assert_eq!(record.mmlu.n, 281);
+    assert!(record.kld.quantized.contains_key("mmlu") && record.kld_long8192.q.contains_key("prose"));
+    let fixture = Fixture::read(&dir.join("g1_flash_next.json")).unwrap();
+    assert_eq!(fixture.reference.as_deref(), Some("quantized"));
+    for prompt in &fixture.prompts {
+        assert_eq!(prompt.expected_tokens().unwrap().len(), prompt.token_ids.len(), "{}", prompt.id);
+    }
+}
