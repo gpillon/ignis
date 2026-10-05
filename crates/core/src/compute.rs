@@ -772,6 +772,18 @@ impl ModelFamily {
             .find(|family| family.model_id() == model_id)
     }
 
+    /// Host retained slots a load of this family keeps by default with
+    /// prompt reuse on (`--retained-host`): two per decode lane on the 27B
+    /// (GitHub #281); 8 on Flash-Next, a chain link and a checkpoint for
+    /// three agents and a shared system block, ~1 GiB of pinned images
+    /// beside 37.7 GB of pinned experts (spec flash-next/05).
+    pub fn default_retained_host_slots(self) -> u32 {
+        match self {
+            ModelFamily::Qwen38_27b => 2 * crate::N_DECODE_LANES as u32,
+            ModelFamily::FlashNext => 8,
+        }
+    }
+
     /// The `model_id` of this family's artifacts, and the id it is served
     /// under by default.
     pub fn model_id(self) -> &'static str {

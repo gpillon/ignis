@@ -1,6 +1,7 @@
 //! Expert residency's reservations as **plan lines** computed at load (ADR
 //! 0030): the host plan (the pinned expert pool, the n-gram hot rows, staging
-//! buffers) with its refusal margin, and the VRAM lines — the expert cache,
+//! buffers, and prompt reuse's host retained slots and KV-RAM arena) with its
+//! refusal margin, and the VRAM lines — the expert cache,
 //! split into eight K-class pools, the prefill staging ring and residency's
 //! tables.
 //!
@@ -37,6 +38,12 @@ pub struct HostPlanRequest {
     pub ngram_hot_rows_bytes: u64,
     /// Host staging buffers: the artifact read buffers and the like.
     pub staging_bytes: u64,
+    /// Prompt reuse's host retained slots (`--retained-host`, spec
+    /// flash-next/05): one pinned block of a state image per slot.
+    pub retained_host_slots_bytes: u64,
+    /// Prompt reuse's KV-RAM arena (`--kv-host-pool-bytes`, spec
+    /// flash-next/05): materialized blobs the device gave up.
+    pub kv_ram_arena_bytes: u64,
 }
 
 /// The host plan the load carries out.
@@ -50,16 +57,25 @@ pub struct HostPlan {
 
 impl HostPlan {
     /// `(name, bytes)` in plan order.
-    pub fn entries(&self) -> [(&'static str, u64); 3] {
+    pub fn entries(&self) -> [(&'static str, u64); HOST_PLAN_LINES] {
         host_lines(&self.request)
     }
 }
 
-fn host_lines(request: &HostPlanRequest) -> [(&'static str, u64); 3] {
+/// The host plan's lines.
+pub const HOST_PLAN_LINES: usize = 5;
+
+/// The lines in plan order: what the model needs to run first, prompt
+/// reuse's last, so a plan short of room names a reuse line -- the one an
+/// operator can shrink without losing the model -- whenever giving up reuse
+/// would make it fit.
+fn host_lines(request: &HostPlanRequest) -> [(&'static str, u64); HOST_PLAN_LINES] {
     [
         ("expert_pool", request.expert_pool_bytes),
         ("ngram_hot_rows", request.ngram_hot_rows_bytes),
         ("staging", request.staging_bytes),
+        ("retained_host_slots", request.retained_host_slots_bytes),
+        ("kv_ram_arena", request.kv_ram_arena_bytes),
     ]
 }
 
@@ -74,7 +90,7 @@ pub enum HostPlanError {
         /// The first line, in plan order, whose running total passes what
         /// the margin leaves usable.
         crossing_line: &'static str,
-        lines: [(&'static str, u64); 3],
+        lines: [(&'static str, u64); HOST_PLAN_LINES],
     },
 }
 
@@ -96,6 +112,10 @@ impl std::fmt::Display for HostPlanError {
         let remedy = match *crossing_line {
             "ngram_hot_rows" => "load fewer n-gram hot rows, or free memory",
             "staging" => "give the load smaller staging buffers, or free memory",
+            "retained_host_slots" => {
+                "give prompt reuse fewer host retained slots (--retained-host), or free memory"
+            }
+            "kv_ram_arena" => "give KV-RAM a smaller arena (--kv-host-pool-bytes), or free memory",
             _ => "free memory: close other applications",
         };
         write!(

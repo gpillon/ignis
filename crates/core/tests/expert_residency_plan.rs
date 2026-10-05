@@ -20,6 +20,8 @@ fn host(available: u64) -> HostPlanRequest {
         expert_pool_bytes: 38 * GIB,
         ngram_hot_rows_bytes: 2 * GIB,
         staging_bytes: GIB,
+        retained_host_slots_bytes: 0,
+        kv_ram_arena_bytes: 0,
     }
 }
 
@@ -27,7 +29,10 @@ fn host(available: u64) -> HostPlanRequest {
 fn the_host_plan_adds_its_lines_and_says_what_it_leaves() {
     let plan = plan_host(&host(52 * GIB)).expect("fits");
     let names: Vec<_> = plan.entries().iter().map(|(name, _)| *name).collect();
-    assert_eq!(names, ["expert_pool", "ngram_hot_rows", "staging"]);
+    assert_eq!(
+        names,
+        ["expert_pool", "ngram_hot_rows", "staging", "retained_host_slots", "kv_ram_arena"]
+    );
     assert_eq!(plan.total_bytes, 41 * GIB);
     assert_eq!(plan.left_bytes, 11 * GIB);
 }

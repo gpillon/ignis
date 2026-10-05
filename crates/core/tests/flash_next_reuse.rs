@@ -9,11 +9,13 @@
 //! suites state in blobs is that many of those. A policy that leaned on the
 //! 27B's sizes, or on every blob being the same size, fails here.
 //!
-//! Below them, blob identity across the two models.
+//! Below them, blob identity across the two models, and the host plan's two
+//! reuse lines.
 
 use std::sync::Arc;
 
-use ignis_core::compute::ModelConfig;
+use ignis_core::compute::{ModelConfig, ModelFamily};
+use ignis_core::residency::{HostPlanError, HostPlanRequest, plan_host};
 use ignis_core::types::{DecodeParams, RequestClass, RequestInput};
 use ignis_core::{
     ArtifactHash, BlobIdentity, ConcreteScheduler, IdentityField, KvFormat, MockCompute,
@@ -152,4 +154,85 @@ fn a_flash_next_blob_is_refused_under_the_27b_by_its_artifact() {
     }
     // And Flash-Next takes back what it produced.
     assert_eq!(after_one_turn(flash_next_load()).checkpoint_pool().accepts(&header), Ok(()));
+}
+
+// ── The host plan's reuse lines (spec flash-next/05 acceptance 4) ───────
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Retained host slots by default: 8 on Flash-Next (three agents' chain link
+/// and checkpoint each, and a shared system block), against the 27B's two
+/// per decode lane.
+#[test]
+fn flash_next_defaults_to_eight_host_retained_slots() {
+    assert_eq!(ModelFamily::FlashNext.default_retained_host_slots(), 8);
+    assert_eq!(
+        ModelFamily::Qwen38_27b.default_retained_host_slots(),
+        2 * ignis_core::N_DECODE_LANES as u32
+    );
+}
+
+/// Spec 05's host plan with the defaults: ~53 GB available, 37.7 GB of
+/// pinned experts, 1 GiB of n-gram hot rows, ~0.5 GiB of staging, eight
+/// host slots of one image each (~1 GiB) and a 2 GiB KV-RAM arena.
+fn spec_host_plan(available: u64) -> HostPlanRequest {
+    let image = ModelConfig::qwen38_flash_next().state_image(KvFormat::HqE8_2b).slot_bytes();
+    HostPlanRequest {
+        available_physical_bytes: available,
+        expert_pool_bytes: 37_700_000_000,
+        ngram_hot_rows_bytes: GIB,
+        staging_bytes: GIB / 2,
+        retained_host_slots_bytes: u64::from(ModelFamily::FlashNext.default_retained_host_slots()) * image,
+        kv_ram_arena_bytes: 2 * GIB,
+    }
+}
+
+#[test]
+fn the_host_plan_charges_the_retained_slots_and_the_kv_ram_arena() {
+    let plan = plan_host(&spec_host_plan(53_000_000_000)).expect("the spec's defaults fit");
+    let lines = plan.entries();
+    let names: Vec<_> = lines.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        names,
+        ["expert_pool", "ngram_hot_rows", "staging", "retained_host_slots", "kv_ram_arena"]
+    );
+    assert_eq!(lines[3].1, 8 * 130_014_464, "eight images, ~1 GiB");
+    assert_eq!(lines[4].1, 2 * GIB);
+    // The spec's table: ~10 GB left for the n-gram page cache and the margin.
+    assert!((10_000_000_000..11_000_000_000).contains(&plan.left_bytes), "{}", plan.left_bytes);
+}
+
+#[test]
+fn a_host_plan_short_at_the_retained_slots_names_them() {
+    // 46 GB available, 39.56 GB usable past the 6 GiB margin: the experts,
+    // hot rows and staging fit (39.31 GB), the eight slots cross.
+    let err = plan_host(&spec_host_plan(46_000_000_000)).expect_err("below the margin");
+    let message = err.to_string();
+    let HostPlanError::BelowMargin { crossing_line, .. } = err;
+    assert_eq!(crossing_line, "retained_host_slots");
+    assert!(message.contains("--retained-host"), "{message}");
+    assert!(!message.contains("--kv-host-pool-bytes"), "{message}");
+}
+
+#[test]
+fn a_host_plan_short_at_the_kv_ram_arena_names_it() {
+    // 48 GB available, 41.56 GB usable: everything but the arena fits.
+    let err = plan_host(&spec_host_plan(48_000_000_000)).expect_err("below the margin");
+    let message = err.to_string();
+    let HostPlanError::BelowMargin { crossing_line, .. } = err;
+    assert_eq!(crossing_line, "kv_ram_arena");
+    assert!(message.contains("--kv-host-pool-bytes"), "{message}");
+    assert!(message.contains(&(2 * GIB).to_string()), "{message}");
+}
+
+#[test]
+fn prompt_reuse_off_charges_the_host_plan_nothing() {
+    let off = HostPlanRequest {
+        retained_host_slots_bytes: 0,
+        kv_ram_arena_bytes: 0,
+        ..spec_host_plan(53_000_000_000)
+    };
+    let on = plan_host(&spec_host_plan(53_000_000_000)).unwrap();
+    let plan = plan_host(&off).unwrap();
+    assert_eq!(on.total_bytes - plan.total_bytes, 8 * 130_014_464 + 2 * GIB);
 }
