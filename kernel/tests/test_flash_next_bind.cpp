@@ -109,6 +109,7 @@ ignis_topology flash_next_topology(std::vector<int32_t> &kinds) {
   t.num_kv_heads = 2;
   t.head_dim = 256;
   t.rotary_dim = 64;
+  t.rope_theta = 1e7;
   t.gdn_state_rows = 6144;
   t.gdn_state_cols = 2048;
   t.gdn_num_layers = 36;
@@ -278,9 +279,11 @@ int main() {
           "a topology without hyper-connections is not Flash-Next's: got \"" + error + "\"");
   }
 
-  // Through the load ABI: the Flash-Next family reaches this binder, a set
-  // that binds is told so (the program itself is the next step), a binder
-  // fault comes back by name, and the 27B's options are refused.
+  // Through the load ABI: the Flash-Next family reaches this binder and its
+  // program (kernel/src/flash_next/program.cu), whose plan lines a set that
+  // binds gets back; a binder fault comes back by name, the 27B's options
+  // and a lane count past the round's widest are refused, and a load
+  // without its expert residency is refused before it reserves anything.
   {
     std::vector<int32_t> kinds;
     const ignis_topology topology = flash_next_topology(kinds);
@@ -292,9 +295,23 @@ int main() {
       return rc == 0 ? std::string("(planned)") : std::string(ignis_model_last_error());
     };
     const std::string bound = plan(nullptr);
-    check(bound.find("Flash-Next weights bind (") != std::string::npos &&
-              bound.find("program is not built yet") != std::string::npos,
-          "the load ABI binds a complete Flash-Next set: got \"" + bound + "\"");
+    check(bound == "(planned)", "the load ABI plans a complete Flash-Next set: got \"" + bound + "\"");
+    check(out.workspace_bytes > 0 && out.decode_graph_bytes > 0 && out.sampling_bytes > 0 &&
+              out.activation_bytes > 0 && out.verify_round_bytes == 0 && out.drafter_round_bytes == 0 &&
+              out.media_embedding_bytes == 0,
+          "its plan names a workspace, a decode round, sampling and activations, and no 27B line");
+    ignis_model_load_options lanes{};
+    lanes.size = sizeof(lanes);
+    lanes.decode_lanes = 9;
+    const std::string wide = plan(&lanes);
+    check(wide.find("decode_lanes 9") != std::string::npos,
+          "nine decode lanes are refused by name: got \"" + wide + "\"");
+    ignis_model *model = nullptr;
+    const int32_t loaded = ignis_model_load(tensors.data(), tensors.size(), &topology, 8192, 131072,
+                                            IGNIS_KV_FORMAT_HQ_E8_2B, nullptr, &model);
+    const std::string unresident = ignis_model_last_error();
+    check(loaded != 0 && model == nullptr && unresident.find("needs its expert residency") != std::string::npos,
+          "a load without its residency is refused by name: got \"" + unresident + "\"");
     ignis_model_load_options vision{};
     vision.size = sizeof(vision);
     vision.vision_max_tokens = 8192;

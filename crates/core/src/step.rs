@@ -86,6 +86,9 @@ pub(crate) mod ffi {
         /// summed from has to come from somewhere, and this is the cheapest
         /// thing that is not the host reading logits (ADR 0034).
         pub out_permitted_probs: *mut f32,
+        /// GitHub #302: each lane's n-gram table rows on a Flash-Next load,
+        /// host `[batch][16][90]`; null on the 27B.
+        pub ngram_rows: *const u8,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -150,6 +153,9 @@ pub(crate) mod ffi {
         /// host, `[attention_set_count][attention_key_count]`, or null. With
         /// rows the grid's columns may be 0 and the neighbours null.
         pub out_attention_set_rows: *mut f32,
+        /// GitHub #302: the span's n-gram table rows on a Flash-Next load,
+        /// host `[num_tokens][16][90]`; null on the 27B.
+        pub ngram_rows: *const u8,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -607,6 +613,7 @@ impl PrefillRoute {
             out_attention_set_neighbours: std::ptr::null_mut(),
             out_span_logits: std::ptr::null_mut(),
             out_attention_set_rows: std::ptr::null_mut(),
+            ngram_rows: std::ptr::null(),
         }
     }
 }
@@ -1034,6 +1041,7 @@ pub fn decode_program_batch_permitted(
         out_committed_counts: std::ptr::null_mut(),
         out_extents: std::ptr::null_mut(),
         out_permitted_probs: probabilities.as_mut_ptr(),
+        ngram_rows: std::ptr::null(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -1161,6 +1169,7 @@ pub fn decode_program_verify_runs(
         // GitHub #242: a verify round refuses a permitted set outright, so
         // there is no probability for it to report.
         out_permitted_probs: std::ptr::null_mut(),
+        ngram_rows: std::ptr::null(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(

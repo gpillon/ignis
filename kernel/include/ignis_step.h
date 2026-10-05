@@ -274,6 +274,11 @@ struct ignis_prefill_options {
    * then no neighbour is gathered. The set's argmax and peaks are still
    * written, and still say the set was read whole. Appended (ADR 0016). */
   float *out_attention_set_rows;
+  /* GitHub #302: a Flash-Next span's n-gram table rows, host
+   * `[num_tokens][16][90]` as ignis_core::ngram_table stages them (each
+   * token's 16 heads' INT4 rows, layout.md section 7.1) -- required on a
+   * Flash-Next load, NULL on the 27B. */
+  const uint8_t *ngram_rows;
 };
 
 /* The most heads a readout may bring whole rows back for (GitHub #275): the
@@ -510,6 +515,10 @@ struct ignis_decode_options {
    * `ignis_sampling_params::permitted_ids`. Filled only for the anchor, so a
    * verify round reports the anchor's and says nothing about its drafts. */
   float *out_permitted_probs; /* [batch_size], or NULL */
+  /* GitHub #302: on a Flash-Next load, each lane's n-gram table rows for the
+   * token this round consumes (its pending token), host `[batch_size][16]
+   * [90]` -- required there, NULL on the 27B. */
+  const uint8_t *ngram_rows;
 };
 
 /* Complete one decode round for a batch of sequence handles.  Each output is

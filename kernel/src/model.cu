@@ -30,6 +30,7 @@
 #include "ignis_dflash2_topk.h"
 
 #include "flash_next/bind.h"
+#include "flash_next/program.h"
 
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
@@ -1106,9 +1107,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.attention_text_max_keys = std::min(attention_text_max_keys, max_context_tokens);
 
   // GitHub #302: Flash-Next binds its own schema (kernel/src/flash_next/
-  // bind.cu) and has no drafter, vision tower or attention readouts. Its
-  // program is the next step: a load that binds is refused after binding,
-  // so a caller learns whether its descriptors are right.
+  // bind.cu) into its own program (kernel/src/flash_next/program.h), and has
+  // no drafter, vision tower or attention readouts. Its decode lanes and its
+  // residency are its options alone.
   if (flash_next) {
     if (speculative_backend != IGNIS_SPECULATIVE_NONE || vision_max_tokens != 0 ||
         attention_text_max_keys != 0) {
@@ -1116,12 +1117,18 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       return nullptr;
     }
     std::string error;
-    if (ignis::flash_next::bind_flash_next(tensors, count, *topology, &error) == nullptr) {
+    auto program = ignis::flash_next::bind_model(tensors, count, *topology, prefill_chunk_tokens,
+                                                 max_context_tokens, kv_format, options, &error);
+    if (program == nullptr) {
       set_error("ignis_model_load: " + error);
       return nullptr;
     }
-    set_error("ignis_model_load: the Flash-Next weights bind (" + std::to_string(count) +
-              " tensors), but its program is not built yet (spec flash-next/04)");
+    auto model = std::make_unique<ignis_model>();
+    model->flash_next.reset(program.release());
+    return model;
+  }
+  if (options != nullptr && (options->decode_lanes != 0 || options->residency != nullptr)) {
+    set_error("ignis_model_load: decode_lanes and residency are Qwen3.8-Flash-Next's options");
     return nullptr;
   }
 
@@ -1421,6 +1428,10 @@ extern "C" int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor
   if (model == nullptr) {
     return -1;
   }
+  if (model->flash_next) {
+    *out = ignis::flash_next::reservations(*model->flash_next);
+    return 0;
+  }
   try {
     *out = plan_load_sizes(*model, *topology, prefill_chunk_tokens, max_context_tokens, load)
                .reservations();
@@ -1463,6 +1474,21 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   }
   model->bound_tensor_count = count;
   model->vram_bytes = vram_bytes;
+
+  // GitHub #302: a Flash-Next load reserves and prepares its own program.
+  if (model->flash_next) {
+    std::string error;
+    if (ignis::flash_next::finish_load(*model, &error) != 0) {
+      set_error("ignis_model_load: " + error);
+      if (model->stream != nullptr) {
+        cudaStreamDestroy(model->stream);
+        model->stream = nullptr;
+      }
+      return -1;
+    }
+    *out_model = model.release();
+    return 0;
+  }
 
   // The step ABI's geometry + program resources (ADR 0009, GitHub #54): a
   // dedicated stream and a small scratch arena for step intermediates
@@ -1680,7 +1706,7 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
   out_stats->vram_bytes = model->vram_bytes;
   out_stats->bound_tensor_count = model->bound_tensor_count;
   out_stats->vision_reserved_bytes = model->vision_reserved_bytes();
-  out_stats->reserved = reserved_of(*model);
+  out_stats->reserved = model->flash_next ? ignis::flash_next::reserved(*model) : reserved_of(*model);
   return 0;
 }
 

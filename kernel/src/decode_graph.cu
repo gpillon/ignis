@@ -19,6 +19,7 @@
 #include "ignis_gqa_layer.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "flash_next/program.h"
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
@@ -387,6 +388,24 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   // ignis_decode_graph_last_error's "empty if every width captured"
   // contract (kernel/include/ignis_step.h).
   set_error("");
+  // GitHub #302: a Flash-Next load captures its own rounds, widths
+  // 1..decode_lanes, under the same never-refuse-service rule.
+  if (model->flash_next) {
+    const auto began = std::chrono::steady_clock::now();
+    uint32_t ready_mask = 0;
+    std::string error;
+    const int32_t rc = ignis::flash_next::capture_decode_graphs(model, pool, &ready_mask, &error);
+    set_error(error);
+    if (out_capture_micros != nullptr) {
+      *out_capture_micros = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began)
+              .count());
+    }
+    if (out_ready_mask != nullptr) {
+      *out_ready_mask = ready_mask;
+    }
+    return rc;
+  }
   const auto began = std::chrono::steady_clock::now();
   uint32_t ready_mask = 0;
   for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {

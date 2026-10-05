@@ -198,6 +198,10 @@ static_assert(offsetof(struct ignis_topology, rms_norm_eps) == 128 &&
 /* Opaque loaded-model handle. Never dereferenced across the boundary. */
 struct ignis_model;
 
+/* A Flash-Next load's expert residency (ignis_residency.h), created and
+ * filled by the caller before the load. */
+struct ignis_residency;
+
 /* The speculative backend a load selects (P5-02, GitHub #150, spec 05).
  * Speculation is engine residency, fixed for the life of the load. */
 enum ignis_speculative_backend {
@@ -287,6 +291,15 @@ struct ignis_model_load_options {
    * most one vision item's span, as before. The caller passes the ceiling
    * its calibration measured (`LOCATE_MAX_KEYS`); capped by the context. */
   uint32_t attention_text_max_keys;
+  /* GitHub #302: Flash-Next's decode lanes -- the widest decode round, and
+   * the round graphs' widths 1..decode_lanes; the MoE workspace and the
+   * expert residency are sized by it. 0 = 3. At most 8. 0 on the 27B. */
+  uint32_t decode_lanes;
+  /* GitHub #302: Flash-Next's expert residency, BORROWED: the caller keeps
+   * it alive until ignis_model_free has returned, and frees it after. A
+   * Flash-Next load needs one; ignis_model_plan_reservations does not read
+   * it. NULL on the 27B. */
+  struct ignis_residency *residency;
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many
@@ -320,6 +333,12 @@ struct ignis_model_reservations {
   /* The DFlash2 drafter's feature taps, append counts and round scratch; 0
    * without the drafter. */
   uint64_t drafter_round_bytes;
+  /* GitHub #302: Flash-Next's activations outside the workspace -- the
+   * hyper-connection residual, the sublayer input and output, the call's
+   * staged inputs (ids, slots, positions, n-gram rows) -- and its MoE
+   * block's workspace, accumulator, router and shared-expert buffers. 0 on
+   * the 27B, whose activations live in its workspace. */
+  uint64_t activation_bytes;
 };
 
 struct ignis_model_stats {
@@ -397,8 +416,9 @@ int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors, 
  * layer kind, a GDN layer count other than its GDN layer kinds',
  * `gdn_state_rows` other than `gdn_value_heads x gdn_head_dim`, a GDN head dim
  * or conv kernel the GDN ops do not run, an unknown family, a Flash-Next
- * block in a 27B topology), a Flash-Next topology (its program is not built yet, GitHub
- * #302), an invalid `prefill_chunk_tokens` /
+ * block in a 27B topology), a Flash-Next load without its residency or with
+ * a geometry its program does not run (GitHub #302), an invalid
+ * `prefill_chunk_tokens` /
  * `max_context_tokens` / `kv_format` / `options`, or a chunk width whose
  * scratch reservation does not fit the device's free memory -- a load is
  * all-or-nothing. */

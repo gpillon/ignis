@@ -90,6 +90,12 @@ pub(crate) mod ffi {
         /// readout reads, and so the room the load reserves for one; 0 =
         /// none.
         pub attention_text_max_keys: u32,
+        /// GitHub #302: Flash-Next's decode lanes (0 = 3, at most 8); 0 on
+        /// the 27B.
+        pub decode_lanes: u32,
+        /// GitHub #302: Flash-Next's expert residency, borrowed for the
+        /// model's life (`ignis_residency`); null on the 27B.
+        pub residency: *mut std::ffi::c_void,
     }
 
     /// 1:1 with `struct ignis_model_reservations` (GitHub #210): every
@@ -104,6 +110,9 @@ pub(crate) mod ffi {
         pub decode_graph_bytes: u64,
         pub verify_round_bytes: u64,
         pub drafter_round_bytes: u64,
+        /// GitHub #302: Flash-Next's activations and MoE buffers outside the
+        /// workspace; 0 on the 27B.
+        pub activation_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_model_stats`.
@@ -333,6 +342,8 @@ fn load_options(
             rope_scaling_beta_slow: rope_scaling.beta_slow(),
             vision_item_max_tokens: vision.map_or(0, |v| v.item_max_tokens()),
             attention_text_max_keys: text_keys,
+            decode_lanes: 0,
+            residency: std::ptr::null_mut(),
         }
     })
 }
@@ -753,10 +764,9 @@ fn build_flash_next_bound_tensors(
 /// asked before the weights are on the device: `fn_plan` is what
 /// [`ignis_artifact::flash_next::bind`] returned for `reader` and
 /// `geometry`. The topology is the geometry's
-/// ([`ModelConfig::flash_next_from`]), so a reduced fixture plans the same
-/// way. Until the Flash-Next program exists the leaf binds the descriptors
-/// and refuses after binding, saying so: the error names whether the
-/// descriptors bind.
+/// ([`ModelConfig::flash_next_from`]). The leaf binds the descriptors
+/// first and then checks the geometry its program runs, so a reduced
+/// fixture's refusal still says its descriptors bind.
 pub fn plan_flash_next_reservations(
     fn_plan: &FlashNextPlan,
     geometry: &FlashNextGeometry,
@@ -808,8 +818,9 @@ mod tests {
 
     /// GitHub #302: the descriptors this loader builds for the artifact
     /// crate's Flash-Next fixture artifact (packed from its converter work
-    /// tree) and the leaf's binder agree: every one binds, and the leaf
-    /// refuses only because the Flash-Next program is the next step.
+    /// tree) and the leaf's binder agree: every one binds. The fixture is a
+    /// small geometry (hidden 256), which the program's specialized ops do
+    /// not run, so the leaf refuses it -- after binding, and saying so.
     #[test]
     fn a_flash_next_fixture_artifacts_descriptors_bind_in_the_leaf() {
         let tree = flash_next::fixture::WorkTree::new("model-load-bind").expect("work tree");
@@ -818,9 +829,8 @@ mod tests {
         let reader = Reader::open(&tree.artifact_path()).expect("open the fixture artifact");
         let fn_plan = flash_next::bind(&reader, &tree.geometry).expect("bind the fixture artifact");
         let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, 128, 1024, KvFormat::HqE8_2b)
-            .expect_err("the program is not built yet");
-        assert!(err.contains("Flash-Next weights bind ("), "{err}");
-        assert!(err.contains("program is not built yet"), "{err}");
+            .expect_err("the fixture's geometry is not one the program runs");
+        assert!(err.contains("does not run this geometry (its weights bind)"), "{err}");
     }
 
     #[test]
@@ -1007,9 +1017,14 @@ mod tests {
         // scalars, the uint32 vision item bound and (GitHub #275) the uint32
         // text readout's keys, which fill what was the struct's padding --
         // so the size did not move (ADR 0041 records why that is accepted).
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 48);
-        // uint64 x 3, then (GitHub #210) the six uint64 reservation lines.
-        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 72);
+        // GitHub #302: then the uint32 decode lanes, padding, and the
+        // residency pointer.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 64);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, decode_lanes), 48);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, residency), 56);
+        // uint64 x 3, then (GitHub #210) the six uint64 reservation lines and
+        // (GitHub #302) the seventh, Flash-Next's activations.
+        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 80);
     }
 
     #[test]
