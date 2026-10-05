@@ -15,7 +15,8 @@
 //! [`crate::scheduler::Compute`] adapter at P1-24 (#60). Until then, the
 //! engine drives [`crate::mock::MockCompute`] (ADR 0006).
 
-use crate::kv_format::KvGeometry;
+use crate::hq_ring::{RECENT_KEYS, RING_WORDS, SINK_KEYS};
+use crate::kv_format::{KvFormat, KvGeometry};
 
 // ---------------------------------------------------------------------------
 // Topology (ADR 0001: the model config the forward pass is parameterized by)
@@ -367,6 +368,38 @@ impl ModelConfig {
             .map_or(0, |ngram| ngram.conv_state_tokens() * self.residual_width() * 2)
     }
 
+    /// The mutable state a sequence holds whatever its length, under
+    /// `kv_format` (spec flash-next/05): what a lane, a retained slot and a
+    /// snapshot blob carry beside the KV pages.
+    pub fn state_image(&self, kv_format: KvFormat) -> StateImage {
+        let gdn_layers = self.gdn_layer_count() as u64;
+        let attention_layers = self.attention_layer_count() as u64;
+        let hq_residual_window = match kv_format {
+            KvFormat::Bf16 => 0,
+            KvFormat::HqE8_2b => {
+                2 * attention_layers * (SINK_KEYS + RECENT_KEYS) * self.num_kv_heads * self.head_dim * 2
+                    + RING_WORDS as u64 * 4
+            }
+        };
+        StateImage {
+            gdn_recurrent: gdn_layers * self.gdn_value_heads * self.gdn_head_dim * self.gdn_head_dim * 4,
+            gdn_conv_taps: gdn_layers * self.gdn_conv_channels() * (self.gdn_conv_kernel - 1) * 2,
+            ngram_conv_state: self.ngram_conv_state_bytes(),
+            indexer_tail: self.indexer_tail_bytes(),
+            hq_residual_window,
+            penalty_counts: self.vocab * 4,
+        }
+    }
+
+    /// The sections a sequence holds per token under `kv_format`, in pages
+    /// shared by refcount (spec flash-next/05).
+    pub fn paged_sections(&self, kv_format: KvFormat) -> PagedSections {
+        PagedSections {
+            kv_per_token: kv_format.bytes_per_token(self.kv_geometry()),
+            indexer_keys_per_token: self.indexer_bytes_per_token(),
+        }
+    }
+
     /// A small, fast synthetic topology for CPU tests (one GDN + one GQA
     /// layer, small dims, a small paged KV) — exercises every geometry
     /// derivation with a deterministic synthetic model.
@@ -605,6 +638,114 @@ impl ModelConfig {
             }),
             ..checkpoint
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A sequence's state, section by section (ADR 0024)
+// ---------------------------------------------------------------------------
+
+/// Where every section of a slot starts: a multiple of this
+/// (`kIgnisSeqSectionAlign`), so a host-to-device copy of a section never
+/// starts mid-word.
+pub const STATE_SECTION_ALIGN: u64 = 256;
+
+/// A sequence's mutable state image (ADR 0024, spec flash-next/05): the
+/// sections a second sequence must copy rather than share, which a lane, a
+/// retained slot and a snapshot blob hold whatever the prompt length. Each
+/// is derived from the topology, so no section of one model's size reaches
+/// the other's.
+///
+/// Two things that travel with a sequence are not here. The drafter's
+/// window is a load option (speculation), not topology: the 27B's image with
+/// DFlash2 is this plus the window. The position and last token are the
+/// leaf's progress scalars, a few hundred bytes kept beside a slot, not in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateImage {
+    /// Every GDN layer's recurrent state: `gdn_value_heads` fp32 square
+    /// matrices of `gdn_head_dim`.
+    pub gdn_recurrent: u64,
+    /// Every GDN layer's causal-conv taps: the last `gdn_conv_kernel - 1`
+    /// BF16 inputs of each conv channel.
+    pub gdn_conv_taps: u64,
+    /// The n-gram embedding's conv input columns
+    /// ([`ModelConfig::ngram_conv_state_bytes`]); 0 without one.
+    pub ngram_conv_state: u64,
+    /// The indexer's raw keys of the incomplete compression block
+    /// ([`ModelConfig::indexer_tail_bytes`]): per slot, not in a page; 0
+    /// without an indexer.
+    pub indexer_tail: u64,
+    /// The hq-e8-2b residual window: every attention layer's exact sink and
+    /// ring rows, K then V, plus the ring's validity words; 0 under BF16 KV.
+    pub hq_residual_window: u64,
+    /// One int32 presence/frequency penalty count per vocab entry.
+    pub penalty_counts: u64,
+}
+
+impl StateImage {
+    /// `(name, bytes)` per section.
+    pub fn entries(&self) -> [(&'static str, u64); 6] {
+        [
+            ("gdn_recurrent", self.gdn_recurrent),
+            ("gdn_conv_taps", self.gdn_conv_taps),
+            ("ngram_conv_state", self.ngram_conv_state),
+            ("indexer_tail", self.indexer_tail),
+            ("hq_residual_window", self.hq_residual_window),
+            ("penalty_counts", self.penalty_counts),
+        ]
+    }
+
+    /// Every section's bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.entries().iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    /// What one slot holds: every present section from a
+    /// [`STATE_SECTION_ALIGN`] boundary.
+    pub fn slot_bytes(&self) -> u64 {
+        self.entries()
+            .iter()
+            .map(|(_, bytes)| bytes.div_ceil(STATE_SECTION_ALIGN) * STATE_SECTION_ALIGN)
+            .sum()
+    }
+}
+
+impl std::fmt::Display for StateImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "state image {} bytes (", self.total_bytes())?;
+        for (i, (name, bytes)) in self.entries().iter().enumerate() {
+            write!(f, "{}{name} {bytes}", if i == 0 { "" } else { ", " })?;
+        }
+        write!(f, ")")
+    }
+}
+
+/// The sections a sequence holds per token, in pages a second sequence
+/// shares by refcount (spec flash-next/05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedSections {
+    /// K and V of every attention layer, in the load's KV format.
+    pub kv_per_token: u64,
+    /// The indexer's compressed keys, one per block of `compress_ratio`
+    /// tokens; 0 without an indexer.
+    pub indexer_keys_per_token: u64,
+}
+
+impl PagedSections {
+    pub fn bytes_per_token(&self) -> u64 {
+        self.kv_per_token + self.indexer_keys_per_token
+    }
+}
+
+impl std::fmt::Display for PagedSections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "paged {} bytes per token (kv {}, indexer_keys {})",
+            self.bytes_per_token(),
+            self.kv_per_token,
+            self.indexer_keys_per_token
+        )
     }
 }
 
@@ -1171,6 +1312,94 @@ mod tests {
         assert!(dense.takes_images() && dense.serves_readouts() && dense.speculates());
         let flash = ModelFamily::FlashNext;
         assert!(!flash.takes_images() && !flash.serves_readouts() && !flash.speculates());
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Spec flash-next/05's mutable image, section by section, from the
+    /// checkpoint's own numbers: 36 GDN layers of 48 fp32 128 x 128 state
+    /// matrices; 3 BF16 conv taps of 10,240 channels per GDN layer; the
+    /// n-gram conv's 9 past columns over 4 streams x 2560 (the spec's ~45
+    /// KiB counted one stream of 2560 and 2.25 columns); 3 raw BF16 indexer
+    /// keys of 128 per QSA layer; the hq residual window's 32 sink + 512
+    /// ring rows of 2 heads x 256 in 12 layers, both roles, plus 16 ring
+    /// words; one int32 penalty count per vocab entry. ~124 MiB as the spec
+    /// estimated, 130,014,272 bytes as derived.
+    #[test]
+    fn flash_next_mutable_image_is_derived_from_its_topology() {
+        let image = ModelConfig::qwen38_flash_next().state_image(KvFormat::HqE8_2b);
+        assert_eq!(image.gdn_recurrent, 36 * 48 * 128 * 128 * 4);
+        assert_eq!(image.gdn_recurrent, 108 * MIB);
+        assert_eq!(image.gdn_conv_taps, 36 * 10_240 * 3 * 2);
+        assert_eq!(image.ngram_conv_state, 9 * 4 * 2560 * 2);
+        assert_eq!(image.indexer_tail, 12 * 3 * 128 * 2);
+        assert_eq!(image.hq_residual_window, 2 * 12 * (544 * 2 * 256 * 2) + 16 * 4);
+        assert_eq!(image.penalty_counts, 248_320 * 4);
+        assert_eq!(image.total_bytes(), 130_014_272);
+        assert_eq!(image.total_bytes() / MIB, 123, "~124 MiB");
+        // A slot lays each section out at the leaf's 256-byte alignment: the
+        // window's 64 ring-word bytes round up to 256.
+        assert_eq!(image.slot_bytes(), 130_014_272 + 192);
+
+        // BF16 KV has no residual window.
+        let bf16 = ModelConfig::qwen38_flash_next().state_image(KvFormat::Bf16);
+        assert_eq!(bf16.hq_residual_window, 0);
+        assert_eq!(bf16.total_bytes(), 130_014_272 - image.hq_residual_window);
+    }
+
+    /// The same derivation gives the 27B's sections the leaf documents: its
+    /// 144 MiB GDN floor (`IGNIS_SEQ_SECTION_GDN_RECURRENT`) and its 34 MiB
+    /// residual window (spec flash-next/05), and none of Flash-Next's. The
+    /// drafter's window is a load option, not topology, so the 27B's 221.8
+    /// MiB with DFlash2 is this plus the drafter's ~40 MiB.
+    #[test]
+    fn the_27b_mutable_image_has_its_own_sections_and_no_flash_next_ones() {
+        let image = ModelConfig::qwen38_27b().state_image(KvFormat::HqE8_2b);
+        assert_eq!(image.gdn_recurrent, 144 * MIB);
+        assert_eq!(image.gdn_conv_taps, 48 * 10_240 * 3 * 2);
+        assert_eq!(image.hq_residual_window, 34 * MIB + 16 * 4);
+        assert_eq!(image.penalty_counts, 248_320 * 4);
+        assert_eq!((image.ngram_conv_state, image.indexer_tail), (0, 0));
+    }
+
+    /// The sections a sequence holds per token, shared by refcount: KV
+    /// (3,456 bytes in hq-e8-2b, 24,576 in BF16) and the indexer's
+    /// compressed keys (768). Spec flash-next/05's retained 30K-token
+    /// conversation: ~127 MB of pages (104 MB KV, 23 MB indexer).
+    #[test]
+    fn flash_next_paged_sections_are_kv_and_indexer_keys() {
+        let cfg = ModelConfig::qwen38_flash_next();
+        let hq = cfg.paged_sections(KvFormat::HqE8_2b);
+        assert_eq!((hq.kv_per_token, hq.indexer_keys_per_token), (3_456, 768));
+        assert_eq!(hq.bytes_per_token(), 4_224);
+        assert_eq!(30_000 * hq.kv_per_token, 103_680_000);
+        assert_eq!(30_000 * hq.indexer_keys_per_token, 23_040_000);
+        let bf16 = cfg.paged_sections(KvFormat::Bf16);
+        assert_eq!((bf16.kv_per_token, bf16.indexer_keys_per_token), (24_576, 768));
+        let dense = ModelConfig::qwen38_27b().paged_sections(KvFormat::HqE8_2b);
+        assert_eq!((dense.kv_per_token, dense.indexer_keys_per_token), (9_216, 0));
+    }
+
+    /// What a load prints: every section by name with its bytes.
+    #[test]
+    fn the_image_and_the_paged_sections_print_every_section() {
+        let cfg = ModelConfig::qwen38_flash_next();
+        let image = cfg.state_image(KvFormat::HqE8_2b).to_string();
+        for needle in [
+            "130014272",
+            "gdn_recurrent 113246208",
+            "gdn_conv_taps 2211840",
+            "ngram_conv_state 184320",
+            "indexer_tail 9216",
+            "hq_residual_window 13369408",
+            "penalty_counts 993280",
+        ] {
+            assert!(image.contains(needle), "{needle} missing: {image}");
+        }
+        let paged = cfg.paged_sections(KvFormat::HqE8_2b).to_string();
+        for needle in ["4224", "kv 3456", "indexer_keys 768"] {
+            assert!(paged.contains(needle), "{needle} missing: {paged}");
+        }
     }
 
     /// `gdn_value_heads * gdn_head_dim` must equal `gdn_state_rows` (the
