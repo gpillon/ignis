@@ -590,6 +590,15 @@ add_executable(ignis_kernel_model_load_gdn_geometry_test test_model_load_gdn_geo
 target_link_libraries(ignis_kernel_model_load_gdn_geometry_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_model_load_gdn_geometry_test COMMAND ignis_kernel_model_load_gdn_geometry_test)
 
+# GitHub #302 (spec flash-next/04): OURS -- the Flash-Next program's internal
+# contract (kernel/src/flash_next/flash_next_internal.h), its geometry read off
+# the topology. Host-only; reaches into kernel/src for the leaf-internal header.
+add_executable(ignis_kernel_flash_next_contract_test test_flash_next_contract.cpp)
+target_include_directories(ignis_kernel_flash_next_contract_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_contract_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_contract_test COMMAND ignis_kernel_flash_next_contract_test)
+
 # GitHub #301 (spec flash-next/03): OURS -- the expert residency miss path measured (copy
 # engine against SM-driven copies from mapped pinned memory). A timing is a finding, not a
 # pass/fail, so a tool and NOT registered with CTest. CUDA runtime only.
