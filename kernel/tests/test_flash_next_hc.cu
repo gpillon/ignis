@@ -7,7 +7,13 @@
 // computes in fp64 inside each module:
 // - the mix's output and injection weights within a few BF16 ulps (the only
 //   difference is fp32 against fp64 accumulation, which can move a rounding
-//   by one ulp and carry it through sigmoid and the stream mean);
+//   by one ulp and carry it through sigmoid and the stream mean). An output
+//   is a mean of four streams' terms that can cancel, so its error is
+//   measured against the terms' mean magnitude, not against the mean itself:
+//   one term's one-ulp move is up to 2^-8 of that term, many times more of
+//   a result the terms cancel down to (window 1, 2026-10-05: 4.5e-2 and
+//   7.7e-2 against the result, reproduced on the CPU by fp32 against fp64
+//   accumulation, which measured 6.4e-3 against the terms);
 // - the final mixer (no inject weights) the same;
 // - the inject, given the same weights, bit for bit.
 // Rows 1, 3 (decode lanes) and 1100 (past one 1024-row wave).
@@ -99,8 +105,9 @@ struct Weights {
 };
 
 // The BF16 module, in fp64 between its roundings.
+// `terms[h]` is the mean magnitude of the four stream terms x[h] averages.
 void reference_mix(const Weights &w, const std::vector<uint16_t> &hidden, int row, bool with_inject,
-                   std::vector<double> &x, std::vector<double> &inj) {
+                   std::vector<double> &x, std::vector<double> &terms, std::vector<double> &inj) {
   std::vector<double> normed(kWidth);
   for (int s = 0; s < kStreams; ++s) {
     double squares = 0.0;
@@ -125,8 +132,10 @@ void reference_mix(const Weights &w, const std::vector<uint16_t> &hidden, int ro
     act[k] = bf(scaled / (1.0 + std::exp(-scaled)));
   }
   x.assign(kHidden, 0.0);
+  terms.assign(kHidden, 0.0);
   for (int h = 0; h < kHidden; ++h) {
     double sum = 0.0;
+    double magnitude = 0.0;
     for (int s = 0; s < kStreams; ++s) {
       const int i = s * kHidden + h;
       double u = 0.0;
@@ -135,8 +144,10 @@ void reference_mix(const Weights &w, const std::vector<uint16_t> &hidden, int ro
       }
       const double m = bf(1.0 / (1.0 + std::exp(-bf(u))));
       sum += bf(m * normed[i]);
+      magnitude += std::fabs(bf(m * normed[i]));
     }
     x[h] = bf(sum / kStreams);
+    terms[h] = magnitude / kStreams;
   }
   inj.assign(kStreams, 0.0);
   if (with_inject) {
@@ -185,8 +196,8 @@ void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, int rows
   double worst = 0.0;
   int bad = 0;
   for (int row = 0; row < rows; row += rows > 8 ? 137 : 1) {
-    std::vector<double> rx, rinj;
-    reference_mix(w, hidden, row, with_inject, rx, rinj);
+    std::vector<double> rx, rterms, rinj;
+    reference_mix(w, hidden, row, with_inject, rx, rterms, rinj);
     double rms = 0.0;
     for (double v : rx) {
       rms += v * v;
@@ -194,7 +205,7 @@ void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, int rows
     rms = std::sqrt(rms / kHidden);
     for (int h = 0; h < kHidden; ++h) {
       const double got = bf16_value(x[static_cast<std::size_t>(row) * kHidden + h]);
-      const double err = std::fabs(got - rx[h]) / (std::fabs(rx[h]) + 1e-3 * rms);
+      const double err = std::fabs(got - rx[h]) / (rterms[h] + 1e-3 * rms);
       worst = std::max(worst, err);
       bad += err > std::ldexp(1.0, -6) ? 1 : 0;
     }
@@ -206,7 +217,7 @@ void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, int rows
     }
   }
   check(bad == 0, label + ": " + std::to_string(bad) + " values past 2^-6 of the reference");
-  std::printf("  %s: worst relative error %.2e\n", label.c_str(), worst);
+  std::printf("  %s: worst error against the terms %.2e\n", label.c_str(), worst);
 
   // The inject, given these weights: bit for bit.
   if (with_inject) {
