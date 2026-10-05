@@ -55,6 +55,7 @@ pub mod model_load;
 #[cfg(feature = "cuda")]
 pub mod moe;
 pub mod ngram;
+pub mod ngram_table;
 pub mod pointing;
 pub mod prefix;
 pub mod constrained;
