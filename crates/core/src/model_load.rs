@@ -760,6 +760,64 @@ fn build_flash_next_bound_tensors(
     Ok((names, tensors))
 }
 
+/// Load a Flash-Next artifact whose non-expert tensors `artifact` holds on
+/// the device (`fn_plan` and `geometry` as
+/// [`ignis_artifact::flash_next::bind`] took them), with `decode_lanes`
+/// decode lanes and the expert residency it borrows. The returned model
+/// must be dropped before `residency` and `artifact` (GitHub #302).
+#[allow(clippy::too_many_arguments)]
+pub fn load_flash_next(
+    fn_plan: &FlashNextPlan,
+    geometry: &FlashNextGeometry,
+    artifact: &MaterializedArtifact,
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+    decode_lanes: u32,
+    residency: &crate::residency::device::DeviceResidency,
+) -> Result<Model, String> {
+    validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
+    let placement = |handle: ObjectHandle| {
+        let view = artifact.device_view(handle).map_err(|e| e.to_string())?;
+        Ok((view.bytes, view.base as *const c_void))
+    };
+    let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
+    let topology = ModelConfig::flash_next_from(geometry).topology_abi();
+    let options = ffi::IgnisModelLoadOptions {
+        size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
+        speculative_backend: 0,
+        draft_tokens: 0,
+        vision_max_tokens: 0,
+        vision_embedding_pool_bytes: 0,
+        rope_scaling_factor: 0.0,
+        rope_scaling_temperature: 0.0,
+        rope_scaling_beta_fast: 0.0,
+        rope_scaling_beta_slow: 0.0,
+        vision_item_max_tokens: 0,
+        attention_text_max_keys: 0,
+        decode_lanes,
+        residency: residency.as_raw(),
+    };
+    let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
+    let rc = unsafe {
+        ffi::ignis_model_load(
+            tensors.as_ptr(),
+            tensors.len() as u64,
+            topology.raw(),
+            prefill_chunk_tokens,
+            max_context_tokens,
+            kv_format.abi_code(),
+            &options,
+            &mut handle,
+        )
+    };
+    if rc != 0 || handle.is_null() {
+        let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
+        return Err(message.to_string_lossy().into_owned());
+    }
+    Ok(Model { handle })
+}
+
 /// What a load of a Flash-Next artifact would reserve beside the weights,
 /// asked before the weights are on the device: `fn_plan` is what
 /// [`ignis_artifact::flash_next::bind`] returned for `reader` and

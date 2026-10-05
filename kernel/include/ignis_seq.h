@@ -362,6 +362,12 @@ void ignis_seq_release(struct ignis_seq_pool *pool, struct ignis_seq *seq);
  * argument. */
 int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq_stats *out_stats);
 
+/* The token the sequence's next decode round consumes and emits -- the
+ * successor its prefill or its last round drew -- or -1 for a null sequence
+ * or one not prefilled yet (GitHub #302: a Flash-Next round needs each
+ * lane's n-gram rows for it, hashed on the host before the round). */
+int32_t ignis_seq_pending_token(const struct ignis_seq *seq);
+
 /* --- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
  *
  * On ADR 0016: it rules that "later phases add fields, not parameters and

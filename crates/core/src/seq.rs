@@ -239,6 +239,7 @@ pub(crate) mod ffi {
         pub fn ignis_seq_release(pool: *mut IgnisSeqPool, seq: *mut IgnisSeq);
 
         pub fn ignis_seq_stats(seq: *const IgnisSeq, out_stats: *mut IgnisSeqStats) -> i32;
+        pub fn ignis_seq_pending_token(seq: *const IgnisSeq) -> i32;
 
         pub fn ignis_seq_snapshot_format_version() -> u32;
 
@@ -1015,6 +1016,14 @@ impl<'a> Seq<'a> {
         let rc = unsafe { ffi::ignis_seq_stats(self.handle, &mut stats) };
         assert_eq!(rc, 0, "ignis_seq_stats: null handle (unreachable — Seq always holds one)");
         stats
+    }
+
+    /// The token this sequence's next decode round consumes and emits,
+    /// or `None` before its prefill (GitHub #302: the host hashes its n-gram
+    /// rows before the round).
+    pub fn pending_token(&self) -> Option<i32> {
+        let token = unsafe { ffi::ignis_seq_pending_token(self.handle) };
+        (token >= 0).then_some(token)
     }
 
     /// Bytes a snapshot of this sequence costs **as it stands now** (ADR

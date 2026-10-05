@@ -37,6 +37,8 @@ pub mod checkpoint;
 pub mod compute;
 pub mod concrete;
 pub mod decision;
+#[cfg(feature = "cuda")]
+pub mod flash_next;
 pub mod gdn;
 #[cfg(feature = "cuda")]
 pub mod gdn_layer;

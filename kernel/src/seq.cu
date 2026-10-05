@@ -1153,6 +1153,10 @@ extern "C" int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq
   return 0;
 }
 
+extern "C" int32_t ignis_seq_pending_token(const struct ignis_seq *seq) {
+  return seq == nullptr ? -1 : seq->pending_token;
+}
+
 extern "C" uint32_t ignis_seq_snapshot_format_version(void) {
   return kIgnisSeqSnapshotFormatVersion;
 }

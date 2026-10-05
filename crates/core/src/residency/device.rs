@@ -240,6 +240,13 @@ impl DeviceResidency {
         &self.desc
     }
 
+    /// The leaf object, for a Flash-Next load to borrow
+    /// (`ignis_model_load_options::residency`): the load must be freed
+    /// before this residency is (GitHub #302).
+    pub fn as_raw(&self) -> *mut std::ffi::c_void {
+        self.raw.as_ptr().cast()
+    }
+
     /// The pinned host expert pool, for the loader to fill.
     pub fn host_pool_mut(&mut self) -> &mut [u8] {
         let base = unsafe { ffi::ignis_residency_host_pool(self.raw.as_ptr()) } as *mut u8;

@@ -815,6 +815,106 @@ pub fn prefill_program_span_logits(
     Ok(())
 }
 
+/// GitHub #302: one span of a Flash-Next sequence, greedy or under
+/// `sampling` (`None`: greedy), with the span's n-gram table rows
+/// (`ngram_rows`: `[token_ids.len()][16][90]`, as
+/// `NgramTable::begin(..).finish(..)` stages them) and, with
+/// `out_span_logits`, the BF16 logits of every position
+/// (`[token_ids.len()][vocab]`, as [`prefill_program_span_logits`]).
+pub fn prefill_flash_next(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    sampling: Option<SamplingParams>,
+    ngram_rows: &[u8],
+    out_span_logits: Option<&mut [u16]>,
+) -> Result<(), String> {
+    if ngram_rows.len() % token_ids.len().max(1) != 0 || ngram_rows.is_empty() {
+        return Err(format!(
+            "prefill_flash_next: {} n-gram row bytes for {} tokens",
+            ngram_rows.len(),
+            token_ids.len()
+        ));
+    }
+    let span_logits = match out_span_logits {
+        Some(rows) => rows.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+    let options = ffi::IgnisPrefillOptions {
+        out_span_logits: span_logits,
+        ngram_rows: ngram_rows.as_ptr(),
+        ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
+    };
+    let params = sampling.map_or(GREEDY, SamplingParams::to_ffi);
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &params,
+            &options,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// GitHub #302: one Flash-Next decode round, greedy per lane or under
+/// `sampling` (empty: every lane greedy), with each lane's n-gram table rows
+/// for the token it consumes (`ngram_rows`: `[sequences.len()][16][90]`, its
+/// pending token's rows). Returns the tokens the round emitted.
+pub fn decode_flash_next(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    sampling: &[SamplingParams],
+    ngram_rows: &[u8],
+) -> Result<Vec<i32>, String> {
+    if !sampling.is_empty() && sampling.len() != sequences.len() {
+        return Err(format!("decode_flash_next: {} sampling entries for {} lanes", sampling.len(), sequences.len()));
+    }
+    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    let params: Vec<_> = if sampling.is_empty() {
+        vec![GREEDY; handles.len()]
+    } else {
+        sampling.iter().copied().map(SamplingParams::to_ffi).collect()
+    };
+    let options = ffi::IgnisDecodeOptions {
+        size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
+        speculative_window: 0,
+        drafts: std::ptr::null(),
+        draft_counts: std::ptr::null(),
+        out_committed_counts: std::ptr::null_mut(),
+        out_extents: std::ptr::null_mut(),
+        out_permitted_probs: std::ptr::null_mut(),
+        ngram_rows: ngram_rows.as_ptr(),
+    };
+    let mut tokens = vec![-1; handles.len()];
+    let rc = unsafe {
+        ffi::ignis_program_decode(
+            model.handle(),
+            pool.handle(),
+            handles.as_mut_ptr(),
+            handles.len() as u64,
+            params.as_ptr(),
+            tokens.as_mut_ptr(),
+            &options,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(tokens)
+}
+
 /// Emit one greedy token for each sequence and prepare the following round.
 pub fn decode_program_batch(
     model: &Model,
