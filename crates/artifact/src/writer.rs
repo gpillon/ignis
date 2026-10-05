@@ -1,6 +1,7 @@
-//! The streaming `.ninfer` v2 writer: the one path that writes a container
-//! (spec flash-next/01: the packer and the Flash-Next fixture both go
-//! through it, so reader and writer share one implementation).
+//! The streaming `.ninfer` v2 writer the packer and the Flash-Next fixture
+//! write through (spec flash-next/01: reader and writer share one
+//! implementation). `crate::fixture::build_file` still assembles the small
+//! in-memory containers of the older reader tests.
 //!
 //! The v2 framing puts the JSON directory *before* the payload, and the
 //! directory of an artifact assembled layer by layer is not known until the
@@ -148,11 +149,7 @@ impl ContainerWriter {
     /// Create (truncating) `path` with `header_bytes` reserved for the prefix
     /// and the directory.
     pub fn create(path: &Path, identity: ArtifactIdentity, header_bytes: u64) -> Result<Self> {
-        if header_bytes <= PREFIX_BYTES || !header_bytes.is_multiple_of(PAYLOAD_ALIGNMENT) {
-            return Err(fail(format!(
-                "header reservation {header_bytes} must be a positive multiple of {PAYLOAD_ALIGNMENT}"
-            )));
-        }
+        check_header_bytes(header_bytes)?;
         if identity.model_id.is_empty() || identity.weights_id.is_empty() {
             return Err(fail("artifact identity strings must be nonempty"));
         }
@@ -182,6 +179,7 @@ impl ContainerWriter {
     /// state's cursor (anything written after the state was taken is
     /// dropped and will be written again).
     pub fn resume(path: &Path, state: WriterState) -> Result<Self> {
+        check_header_bytes(state.header_bytes)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -313,13 +311,18 @@ impl ContainerWriter {
             // One byte past the object's end is read on purpose: it is how a
             // long source is told apart from an exact one.
             let want = buffer.len().min((bytes - written) as usize + 1);
-            let got = source
-                .read(&mut buffer[..want])
-                .map_err(|e| fail(format!("read payload of {name}: {e}")))?;
+            let got = match source.read(&mut buffer[..want]) {
+                Ok(got) => got,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(fail(format!("read payload of {name}: {e}"))),
+            };
             if got == 0 {
                 break;
             }
             if written + got as u64 > bytes {
+                // An object that cannot be exact is dropped, as if never
+                // begun: a later end_object cannot accept it.
+                self.abandon_open()?;
                 return Err(fail(format!(
                     "payload of {name} is longer than the {bytes} bytes its layout stores"
                 )));
@@ -337,29 +340,38 @@ impl ContainerWriter {
         Ok(total)
     }
 
-    /// Close the open object: it must hold exactly its stored size.
+    /// Close the open object: it must hold exactly its stored size (a short
+    /// one is dropped, as if never begun).
     pub fn end_object(&mut self) -> Result<()> {
         let open = self
             .state
             .open
-            .take()
+            .as_ref()
             .ok_or_else(|| fail("no object is open"))?;
         if open.written != open.object.bytes() {
             let name = open.object.name().to_owned();
             let (written, bytes) = (open.written, open.object.bytes());
-            // Keep the writer usable: the short object is dropped, as if
-            // never begun.
-            self.names.remove(&name);
-            self.state.cursor = self.state.written_end();
-            self.file
-                .seek(SeekFrom::Start(self.state.header_bytes + self.state.cursor))
-                .map_err(|e| fail(format!("seek container: {e}")))?;
+            self.abandon_open()?;
             return Err(fail(format!(
                 "payload of {name} ended after {written} bytes; its layout stores {bytes}"
             )));
         }
+        let open = self.state.open.take().expect("checked above");
         self.state.objects.push(open.object);
         Ok(())
+    }
+
+    /// Drop the open object and put the cursor back where the finished
+    /// objects end, keeping the writer usable.
+    fn abandon_open(&mut self) -> Result<()> {
+        if let Some(open) = self.state.open.take() {
+            self.names.remove(open.object.name());
+        }
+        self.state.cursor = self.state.written_end();
+        self.file
+            .seek(SeekFrom::Start(self.state.header_bytes + self.state.cursor))
+            .map(|_| ())
+            .map_err(|e| fail(format!("seek container: {e}")))
     }
 
     /// Flush what was written to disk (call before persisting the state).
@@ -439,6 +451,24 @@ impl ContainerWriter {
             .set_len(len)
             .map_err(|e| fail(format!("resize container to {len}: {e}")))
     }
+}
+
+/// The header reservation must hold the prefix and start the payload on a
+/// 4096 boundary.
+fn check_header_bytes(header_bytes: u64) -> Result<()> {
+    if header_bytes <= PREFIX_BYTES || !header_bytes.is_multiple_of(PAYLOAD_ALIGNMENT) {
+        return Err(fail(format!(
+            "header reservation {header_bytes} must be a positive multiple of {PAYLOAD_ALIGNMENT}"
+        )));
+    }
+    Ok(())
+}
+
+/// The bytes `object` adds to the directory JSON (its entry and a comma),
+/// for a caller that bounds the directory before writing: with `u64::MAX`
+/// offset and size it is an upper bound for any placement.
+pub fn entry_json_bytes(object: &Object) -> u64 {
+    object_value(object).to_string().len() as u64 + 1
 }
 
 /// The closed directory JSON (`identity` + `objects`, exactly the members
@@ -597,28 +627,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("longer than the 64 bytes"), "{err}");
-        // The long tensor is still open: the caller gives up on it the way
-        // the packer does, by not persisting and resuming from its last
-        // state. Here a fresh writer stands in for that.
-        drop(writer);
-
-        let mut writer = ContainerWriter::create(&path.0, identity(), 4096).unwrap();
-        let err = writer
-            .append_tensor("t/x", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8], &mut short.as_slice())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ended after 63 bytes"), "{err}");
-        // A short object is dropped: the name is free again and nothing of
-        // it stays in the file.
+        // Either way the object is dropped: nothing is left open, both names
+        // are free again and nothing of them stays in the file.
+        let err = writer.end_object().unwrap_err().to_string();
+        assert!(err.contains("no object is open"), "{err}");
+        writer
+            .append_resource("t/y", ResourceEncoding::RawBytesV1, 1, &mut &b"y"[..])
+            .unwrap();
         writer
             .append_resource("t/x", ResourceEncoding::RawBytesV1, 2, &mut &b"ok"[..])
             .unwrap();
         let file_bytes = writer.finish().unwrap();
         let reader = Reader::open(&path.0).unwrap();
-        assert_eq!(reader.objects().len(), 1);
+        assert_eq!(reader.objects().len(), 2);
+        assert_eq!(reader.payload("t/y").unwrap().data, b"y");
         assert_eq!(reader.payload("t/x").unwrap().data, b"ok");
-        assert_eq!(file_bytes, 4096 + 2);
+        assert_eq!(file_bytes, 4096 + 3);
         assert_eq!(reader.file_bytes(), file_bytes);
+    }
+
+    #[test]
+    fn a_source_that_hands_over_its_bytes_in_two_reads_cannot_overfill_an_object() {
+        // Exactly the stored size in the first read, one byte more in the
+        // second: the second read must still be refused.
+        struct TwoReads(u8);
+        impl Read for TwoReads {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                match self.0 {
+                    1 => {
+                        buf[..64].fill(7);
+                        Ok(64)
+                    }
+                    2 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                    3 => {
+                        buf[0] = 8;
+                        Ok(1)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let path = TempPath::new("two-reads");
+        let mut writer = ContainerWriter::create(&path.0, identity(), 4096).unwrap();
+        writer
+            .begin_tensor("t/x", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
+            .unwrap();
+        let err = writer.write(&mut TwoReads(0)).unwrap_err().to_string();
+        assert!(err.contains("longer than the 64 bytes"), "an interrupted read is retried: {err}");
+        assert!(writer.end_object().is_err(), "the over-long object is gone");
+    }
+
+    #[test]
+    fn a_state_with_a_bad_header_reservation_is_not_resumed() {
+        let path = TempPath::new("bad-header");
+        let mut writer = ContainerWriter::create(&path.0, identity(), 4096).unwrap();
+        writer
+            .append_resource("r", ResourceEncoding::RawBytesV1, 1, &mut &b"r"[..])
+            .unwrap();
+        let mut state = writer.state().clone();
+        drop(writer);
+        state.header_bytes = 4000;
+        let err = ContainerWriter::resume(&path.0, state).err().expect("refused").to_string();
+        assert!(err.contains("must be a positive multiple of 4096"), "{err}");
     }
 
     #[test]
