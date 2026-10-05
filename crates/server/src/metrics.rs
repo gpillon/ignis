@@ -22,6 +22,7 @@ use axum::Router;
 use axum::http::header;
 use axum::routing::get;
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
+use ignis_core::residency::{KClass, Phase, ResidencyCounters};
 use ignis_core::{RetainedSkip, SubmitError};
 
 /// What one load reserved, and the shapes the reservations bound (GitHub
@@ -1011,6 +1012,105 @@ impl Metrics {
     }
 }
 
+/// Flash-Next's expert residency (spec flash-next/03, GitHub #301): the
+/// families a Flash-Next load exports from the facts residency keeps
+/// ([`ResidencyCounters`]) and its K-class pools' slot capacity and
+/// occupancy (indexed like [`KClass::ALL`]). Fixed cardinality -- `class`
+/// takes the eight K-class spellings, `phase` `decode|prefill`, `state`
+/// `capacity|in_use` -- with zeros exported. Counters and gauges in their
+/// own units, no ratio: a decode hit rate is `hits` over `hits + misses` of
+/// `phase="decode"`. A 27B load has no expert cache and never renders these;
+/// the Flash-Next serving work (spec flash-next/04) renders them beside
+/// [`Metrics::render`].
+pub fn render_expert_residency(
+    out: &mut String,
+    counters: &ResidencyCounters,
+    capacity: &[u32; KClass::COUNT],
+    occupancy: &[u32; KClass::COUNT],
+) {
+    for (name, help, series) in [
+        (
+            "ignis_expert_cache_hits_total",
+            "Selected expert projections already resident in the VRAM expert cache, or staged for their layer, by K class and phase.",
+            &counters.hits,
+        ),
+        (
+            "ignis_expert_cache_misses_total",
+            "Selected expert projections copied in from the pinned host pool by their own step, by K class and phase.",
+            &counters.misses,
+        ),
+    ] {
+        declare(out, name, "counter", help);
+        for class in KClass::ALL {
+            for phase in Phase::ALL {
+                let _ = writeln!(
+                    out,
+                    "{name}{{class=\"{}\",phase=\"{}\"}} {}",
+                    class.as_str(),
+                    phase.as_str(),
+                    series[class.index()][phase.index()]
+                );
+            }
+        }
+    }
+    for (name, help, value) in [
+        (
+            "ignis_expert_prefetches_issued_total",
+            "Expert projections copied ahead for the next layer by the router lookahead.",
+            counters.prefetch_issued,
+        ),
+        (
+            "ignis_expert_prefetches_used_total",
+            "Prefetched expert projections at their first use, whenever it comes.",
+            counters.prefetch_used,
+        ),
+    ] {
+        declare(out, name, "counter", help);
+        let _ = writeln!(out, "{name} {value}");
+    }
+    declare(
+        out,
+        "ignis_expert_bytes_moved_total",
+        "counter",
+        "Bytes of expert projections copied host-to-device, misses and prefetches, by phase.",
+    );
+    for phase in Phase::ALL {
+        let _ = writeln!(
+            out,
+            "ignis_expert_bytes_moved_total{{phase=\"{}\"}} {}",
+            phase.as_str(),
+            counters.bytes_moved[phase.index()]
+        );
+    }
+    declare(
+        out,
+        "ignis_expert_residency_stall_seconds_total",
+        "counter",
+        "Time the expert kernels waited on residency to bring their projections in.",
+    );
+    let _ = writeln!(
+        out,
+        "ignis_expert_residency_stall_seconds_total {}",
+        decimal(counters.stall_nanos, 1_000_000_000)
+    );
+    declare(
+        out,
+        "ignis_expert_cache_slots",
+        "gauge",
+        "VRAM expert cache slots per K class: capacity reserved at load, and in use.",
+    );
+    for class in KClass::ALL {
+        for (state, slots) in [("capacity", capacity), ("in_use", occupancy)] {
+            let _ = writeln!(
+                out,
+                "ignis_expert_cache_slots{{class=\"{}\",state=\"{state}\"}} {}",
+                class.as_str(),
+                slots[class.index()]
+            );
+        }
+    }
+}
+
 /// A metric's `HELP` and `TYPE` lines.
 fn declare(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# HELP {name} {help}");
@@ -1699,5 +1799,59 @@ mod tests {
     fn a_label_value_is_escaped_per_the_text_format() {
         assert_eq!(escape_label_value(r#"a"b\c"#), r#"a\"b\\c"#);
         assert_eq!(escape_label_value("a\nb"), r"a\nb");
+    }
+
+    #[test]
+    fn expert_residency_renders_fixed_families_from_its_counts() {
+        use ignis_core::residency::{KBits, Projection};
+        let mut counters = ResidencyCounters::default();
+        let down_k2 = KClass::new(Projection::Down, KBits::K2);
+        counters.hits[down_k2.index()][Phase::Decode.index()] = 7;
+        counters.misses[down_k2.index()][Phase::Prefill.index()] = 3;
+        counters.prefetch_issued = 5;
+        counters.prefetch_used = 4;
+        counters.bytes_moved = [1_000, 2_000];
+        counters.stall_nanos = 1_500_000;
+        let mut capacity = [0u32; KClass::COUNT];
+        capacity[down_k2.index()] = 40;
+        let mut occupancy = [0u32; KClass::COUNT];
+        occupancy[down_k2.index()] = 12;
+        let mut text = String::new();
+        render_expert_residency(&mut text, &counters, &capacity, &occupancy);
+
+        // Help and type once per family; 8 x 2 hits, 8 x 2 misses, 2
+        // prefetch, 2 bytes, 1 stall, 8 x 2 slots, zeros included.
+        for (name, kind) in [
+            ("ignis_expert_cache_hits_total", "counter"),
+            ("ignis_expert_cache_misses_total", "counter"),
+            ("ignis_expert_prefetches_issued_total", "counter"),
+            ("ignis_expert_prefetches_used_total", "counter"),
+            ("ignis_expert_bytes_moved_total", "counter"),
+            ("ignis_expert_residency_stall_seconds_total", "counter"),
+            ("ignis_expert_cache_slots", "gauge"),
+        ] {
+            assert_eq!(text.matches(&format!("# TYPE {name} {kind}\n")).count(), 1, "{name}");
+            assert_eq!(text.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
+        }
+        assert_eq!(samples(&text).len(), 53);
+        let hits = |labels: &str| value(&text, "ignis_expert_cache_hits_total", labels);
+        assert_eq!(hits("class=\"down_k2\",phase=\"decode\""), "7");
+        assert_eq!(hits("class=\"gate_up_k2_5\",phase=\"prefill\""), "0");
+        assert_eq!(
+            value(&text, "ignis_expert_cache_misses_total", "class=\"down_k2\",phase=\"prefill\""),
+            "3"
+        );
+        assert_eq!(value(&text, "ignis_expert_prefetches_issued_total", ""), "5");
+        assert_eq!(value(&text, "ignis_expert_prefetches_used_total", ""), "4");
+        assert_eq!(value(&text, "ignis_expert_bytes_moved_total", "phase=\"prefill\""), "2000");
+        assert_eq!(value(&text, "ignis_expert_residency_stall_seconds_total", ""), "0.0015");
+        assert_eq!(
+            value(&text, "ignis_expert_cache_slots", "class=\"down_k2\",state=\"capacity\""),
+            "40"
+        );
+        assert_eq!(
+            value(&text, "ignis_expert_cache_slots", "class=\"down_k2\",state=\"in_use\""),
+            "12"
+        );
     }
 }
