@@ -140,10 +140,17 @@ fn teacher_forced_canary_agreement_meets_the_g1_floor() {
     let mut results: Vec<TeacherForcedResult> = Vec::with_capacity(fixture.prompts.len());
 
     for canary in &fixture.prompts {
-        let prompt_tokens: Vec<i32> = provider
-            .apply_chat_template(&[ChatMessage::text("user", canary.prompt.clone())], &thinking, &[])
+        // A fixture that recorded its rendered prompt (Flash-Next's,
+        // docs/specs/flash-next/layout.md §11) is fed exactly that; the 27B's
+        // canary text is rendered with the artifact's template.
+        let prompt_tokens: Vec<i32> = canary
+            .prompt_tokens(|text| {
+                provider
+                    .apply_chat_template(&[ChatMessage::text("user", text.to_string())], &thinking, &[])
+                    .map(|rendered| rendered.tokens)
+                    .map_err(|e| format!("{e:?}"))
+            })
             .expect("render canary prompt")
-            .tokens
             .into_iter()
             .map(|id| i32::try_from(id).expect("token id fits i32"))
             .collect();
