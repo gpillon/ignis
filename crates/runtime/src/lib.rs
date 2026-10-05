@@ -19,6 +19,10 @@ use ignis_core::{
 mod cuda_leaf;
 #[cfg(feature = "cuda")]
 pub use cuda_leaf::{CudaLeaf, CudaLeafConfig, CudaModel, PlannedReservations};
+#[cfg(feature = "cuda")]
+mod flash_next_leaf;
+#[cfg(feature = "cuda")]
+pub use flash_next_leaf::{FlashNextLeaf, FlashNextModel, FlashNextSequence};
 
 /// Tokens held by one physical KV page, in either format
 /// (`kPagedKVPageSize`). Re-exported from `ignis-core` so the server's

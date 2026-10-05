@@ -33,6 +33,10 @@ use crate::step::{capture_decode_graphs, decode_flash_next, prefill_flash_next, 
 /// The prefetch lookahead residency ranks per lane: the next layer's top 16.
 pub const LOOKAHEAD_WIDTH: u32 = 16;
 
+/// The decode lanes a Flash-Next load serves by default (spec flash-next/04:
+/// three agents); the leaf's own default for a load option of 0.
+pub const DEFAULT_DECODE_LANES: u32 = 3;
+
 /// What a Flash-Next engine is loaded with.
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
@@ -53,7 +57,7 @@ impl Default for EngineOptions {
             prefill_chunk_tokens: 2048,
             max_context_tokens: 32 * 1024,
             kv_format: KvFormat::HqE8_2b,
-            decode_lanes: 3,
+            decode_lanes: DEFAULT_DECODE_LANES,
             expert_cache_bytes: 12 << 30,
             ngram: NgramTableOptions::default(),
             capture_graphs: true,
@@ -226,6 +230,7 @@ impl FlashNextEngine {
                 &[],
                 &rows,
                 Some(&mut logits),
+                None,
             )?;
             sink(index * chunk, &logits)?;
         }
@@ -247,7 +252,7 @@ impl FlashNextEngine {
             let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
             self.table.stage(&mut context, prompt, &mut rows)?;
             let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], &rows, None)?;
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], &rows, None, None)?;
             seqs.push(seq);
             contexts.push(context);
         }

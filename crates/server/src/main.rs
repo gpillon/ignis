@@ -140,9 +140,11 @@ fn exit_after_flush(logging_handle: &ignis_logging::LoggingHandle, code: i32) ->
 /// its `max_tokens` cap, so a missing one is a load failure like the
 /// checksum / sidecar checks above it, not a silent default.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn cuda_scheduler(
     artifact_path: &std::path::Path,
     model: &str,
+    family: ModelFamily,
     frontend: &ignis_artifact::FrontendSet,
     shape: ignis_server::runtime::EngineShape,
     vision_item_bound: Option<u64>,
@@ -171,7 +173,20 @@ fn cuda_scheduler(
         }),
         ..shape
     };
-    match ignis_server::runtime::cuda_scheduler_with_thinking_close(artifact_path, model.into(), eos, shape, thinking_close) {
+    // GitHub #302: a Flash-Next artifact runs its own program and leaf.
+    let loaded = match family {
+        ModelFamily::FlashNext => {
+            ignis_server::runtime::flash_next_scheduler(artifact_path, model.into(), eos, shape, thinking_close)
+        }
+        ModelFamily::Qwen38_27b => ignis_server::runtime::cuda_scheduler_with_thinking_close(
+            artifact_path,
+            model.into(),
+            eos,
+            shape,
+            thinking_close,
+        ),
+    };
+    match loaded {
         Ok((scheduler, reserved)) => {
             tracing::info!(
                 name: "ignis.model.loaded",
@@ -447,12 +462,14 @@ async fn main() {
                 exit_after_flush(&logging_handle, 1);
             }
         };
+        // GitHub #302: Flash-Next has no drafter; a flag asking for one is
+        // refused rather than ignored.
         #[cfg(feature = "cuda")]
-        if family == ModelFamily::FlashNext {
+        if family == ModelFamily::FlashNext && engine_shape.speculation.is_some() {
             tracing::error!(
-                name: "ignis.model.unsupported",
+                name: "ignis.config.unsupported",
                 model = family.name(),
-                "its forward is not built yet (spec flash-next/04) -- refusing to start"
+                "Qwen3.8-Flash-Next has no speculative decoding: drop --spec -- refusing to start"
             );
             exit_after_flush(&logging_handle, 1);
         }
@@ -501,6 +518,7 @@ async fn main() {
             let (scheduler, reserved) = cuda_scheduler(
                 artifact_path,
                 &model,
+                family,
                 &frontend,
                 engine_shape,
                 item_bound,

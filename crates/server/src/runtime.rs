@@ -447,6 +447,151 @@ pub fn cuda_scheduler_with_thinking_close(
     Ok((sched, reserved))
 }
 
+/// GitHub #302: the scheduler for a Qwen3.8-Flash-Next artifact, over
+/// [`ignis_runtime::FlashNextLeaf`]. The VRAM budget (`shape.vram`, as the
+/// 27B's) holds the weights, the CUDA context, the program's reservations,
+/// the sequence pool, residency's staging ring and tables; the expert cache
+/// takes the rest and is refused below its floor (spec flash-next/03).
+///
+/// Flash-Next serves no prompt reuse and no KV-RAM tier yet (spec 05): its
+/// pool's sections are not in the clone table, so the scheduler runs with
+/// both off and its lanes are the load's decode lanes, every request
+/// resident while it runs.
+#[cfg(feature = "cuda")]
+pub fn flash_next_scheduler(
+    artifact_path: &std::path::Path,
+    model_id: String,
+    eos: TokenId,
+    shape: EngineShape,
+    thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
+) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
+    use ignis_artifact::flash_next::{self, FlashNextGeometry};
+    use ignis_artifact::{CudaDevice, Reader};
+    use ignis_core::compute::ModelConfig;
+    use ignis_core::flash_next::{EngineOptions, LOOKAHEAD_WIDTH};
+    use ignis_core::residency::load::catalog;
+    use ignis_core::residency::{prefill_staging_ring_bytes, residency_table_bytes, EXPERT_CACHE_FLOOR_BYTES};
+    use ignis_core::seq::{SeqPool, SeqPoolBudget};
+    use ignis_runtime::{FlashNextLeaf, KV_PAGE_TOKENS};
+
+    let lanes = ignis_core::flash_next::DEFAULT_DECODE_LANES;
+    let (free_at_start_bytes, _) = CudaDevice::nvml_memory(0)
+        .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
+    let budget_bytes = match shape.vram {
+        ignis_core::VramMode::Derived { headroom_bytes } => free_at_start_bytes.saturating_sub(headroom_bytes),
+        ignis_core::VramMode::Explicit { budget_bytes, .. } => budget_bytes,
+    };
+
+    // The plan, before anything is on the device.
+    let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
+    let geometry = FlashNextGeometry::qwen38_flash_next();
+    let plan = flash_next::bind(&reader, &geometry).map_err(|e| format!("bind the Flash-Next artifact: {e:?}"))?;
+    let reserved = ignis_core::model_load::plan_flash_next_reservations(
+        &plan,
+        &geometry,
+        shape.prefill_chunk,
+        shape.max_context,
+        shape.kv_format,
+    )?;
+    let config = ModelConfig::flash_next_from(&geometry);
+    let pages_per_lane = shape.max_context.div_ceil(KV_PAGE_TOKENS);
+    let pool_plan = SeqPool::plan(
+        &config,
+        &SeqPoolBudget {
+            kv_format: shape.kv_format,
+            kv_page_group_count: pages_per_lane * lanes,
+            max_context_tokens: shape.max_context,
+            slot_count: lanes,
+            retained_slot_count: 0,
+            retained_host_slot_count: 0,
+        },
+        None,
+    )?;
+    let cat = catalog(&plan.experts)?;
+    let max_tokens = shape.prefill_chunk.max(lanes);
+    let residency_fixed = prefill_staging_ring_bytes(&cat)
+        + residency_table_bytes(
+            u64::from(cat.layers()),
+            u64::from(cat.experts()),
+            u64::from(max_tokens),
+            u64::from(LOOKAHEAD_WIDTH),
+        );
+    let lines = ignis_core::VramLines {
+        weights: plan.plan.device_capacity_bytes,
+        cuda_context: ignis_runtime::CUDA_CONTEXT_BYTES,
+        workspace: reserved.workspace_bytes + reserved.activation_bytes,
+        sampling: reserved.sampling_bytes,
+        decode_graph: reserved.decode_graph_bytes,
+        lane_state: pool_plan.lane_state_bytes + pool_plan.indexer_bytes + pool_plan.ngram_conv_bytes,
+        hq_residual_window: pool_plan.hq_residual_bytes,
+        ..ignis_core::VramLines::default()
+    };
+    let planned = lines.total() + pool_plan.kv_bytes + residency_fixed;
+    let expert_cache_bytes = budget_bytes.saturating_sub(planned);
+    if expert_cache_bytes < EXPERT_CACHE_FLOOR_BYTES {
+        return Err(format!(
+            "the VRAM expert cache would get {expert_cache_bytes} bytes, below its {EXPERT_CACHE_FLOOR_BYTES}-byte              floor: the {budget_bytes}-byte budget holds {planned} for the weights, the program, the pool and              residency's ring and tables; shorten --max-context or --prefill-chunk, or free VRAM"
+        ));
+    }
+    // hotpath-lint-allow: one line per model load.
+    tracing::info!(
+        name: "ignis.runtime.flash_next_plan",
+        budget_bytes,
+        weights_bytes = lines.weights,
+        program_bytes = lines.workspace + lines.sampling + lines.decode_graph,
+        pool_bytes = pool_plan.kv_bytes + lines.lane_state + lines.hq_residual_window,
+        residency_fixed_bytes = residency_fixed,
+        expert_cache_bytes,
+        lanes,
+        "flash-next vram plan"
+    );
+
+    let options = EngineOptions {
+        prefill_chunk_tokens: shape.prefill_chunk,
+        max_context_tokens: shape.max_context,
+        kv_format: shape.kv_format,
+        decode_lanes: lanes,
+        expert_cache_bytes,
+        capture_graphs: true,
+        ..EngineOptions::default()
+    };
+    drop(reader);
+    let leaf = FlashNextLeaf::open(artifact_path, options)?;
+    let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
+    let stats = model.stats().map_err(|e| format!("runtime stats: {e:?}"))?;
+    let capacity_pages = stats.kv_page_count;
+    let sched = scheduler(
+        SchedulerConfig {
+            model: model_id,
+            kv_page_tokens: KV_PAGE_TOKENS,
+            max_sequence_tokens: shape.max_context,
+            kv_capacity_pages: capacity_pages,
+            host_capacity_bytes: 0,
+            serving_chunk_tokens: shape.prefill_chunk,
+            prompt_reuse: false,
+            retained_slots: 0,
+            max_in_flight: lanes as usize,
+            max_prefill_batch: lanes as usize,
+            resident_slot_capacity: lanes,
+            thinking_close,
+            ..SchedulerConfig::default()
+        },
+        model,
+        eos,
+    );
+    let reserved = crate::metrics::LoadReservations {
+        lines: ignis_core::VramLines { residual: 0, ..lines },
+        budget_bytes,
+        kv_pool_pages: capacity_pages,
+        kv_page_bytes: stats.kv_page_bytes,
+        kv_ram_arena_bytes: 0,
+        retained_slots: 0,
+        retained_host_slots: 0,
+        retained_host_bytes: 0,
+    };
+    Ok((sched, reserved))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

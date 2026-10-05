@@ -820,8 +820,9 @@ pub fn prefill_program_span_logits(
 /// not empty), with the span's n-gram table rows (`ngram_rows`:
 /// `[token_ids.len()][16][90]`, as `NgramTable::begin(..).finish(..)` stages
 /// them) and, with `out_span_logits`, the BF16 logits of every position
-/// (`[token_ids.len()][vocab]`, as [`prefill_program_span_logits`]). Returns
-/// the drawn token's probability within its permitted set (0 without one).
+/// (`[token_ids.len()][vocab]`, as [`prefill_program_span_logits`]); with
+/// `out_logits`, the last position's logits as floats. Returns the drawn
+/// token's probability within its permitted set (0 without one).
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_flash_next(
     model: &Model,
@@ -833,6 +834,7 @@ pub fn prefill_flash_next(
     permitted: &[i32],
     ngram_rows: &[u8],
     out_span_logits: Option<&mut [u16]>,
+    out_logits: Option<&mut [f32]>,
 ) -> Result<f32, String> {
     if token_ids.is_empty() || ngram_rows.is_empty() || ngram_rows.len() % token_ids.len() != 0 {
         return Err(format!(
@@ -853,6 +855,10 @@ pub fn prefill_flash_next(
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     let params = permitted_params("prefill_flash_next", sampling, permitted)?;
+    let logits = match out_logits {
+        Some(row) => row.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
     let rc = unsafe {
         ffi::ignis_program_prefill(
             model.handle(),
@@ -863,7 +869,7 @@ pub fn prefill_flash_next(
             start_position,
             &params,
             &options,
-            std::ptr::null_mut(),
+            logits,
         )
     };
     if rc != 0 {
