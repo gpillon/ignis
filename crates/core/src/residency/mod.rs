@@ -33,16 +33,19 @@
 //! - **Per layer step, on the compute stream:** a *resolve* kernel takes the
 //!   router's selection (and the next router's lookahead) and does exactly
 //!   [`ResidencyModel::step`] — hits stamped, victims the first unpinned
-//!   slots by `(protected, stamp, key)` with key `layer · 1024 + expert · 2
-//!   + projection` (the canonical order), misses and prefetches written as
+//!   slots by `(stamp, key)` with key `layer · 1024 + expert · 2 +
+//!   projection` (the canonical order), misses and prefetches written as
 //!   copy jobs and into the slot table; a *copy* kernel of about 8-16 blocks
 //!   (the finding's best grid) moves the jobs from the mapped pool; the
 //!   expert kernel follows. Prefetch jobs run on a second captured stream
-//!   beside the expert kernel and join before the next resolve, held to a
-//!   per-step byte budget: unbudgeted, W = 16 asks the link for more than a
-//!   decode step lasts (7.2 ms of transfers per 6 ms step at one lane, 29
-//!   at three, on the study's routing). Launch shapes are fixed; the job
-//!   count lives in device memory.
+//!   beside the expert kernel and join before the next resolve. They are
+//!   taken in rank order (every lane's best expert first) and held to a
+//!   per-step byte budget, a candidate that would pass it skipped: the
+//!   default ([`default_prefetch_budget_bytes`]) is one layer's share of the
+//!   round at the link's bandwidth, since unbudgeted W = 16 asks the link for
+//!   more than a decode step lasts (7.2 ms of transfers per 6 ms step at one
+//!   lane, 29 at three, on the study's routing). Launch shapes are fixed;
+//!   the job count lives in device memory.
 //! - **Tested against this module:** the GPU replay drives resolve and copy
 //!   with recorded traces and reads back each step's hits, misses and
 //!   evictions, which must equal [`StepOutcome`]'s.
