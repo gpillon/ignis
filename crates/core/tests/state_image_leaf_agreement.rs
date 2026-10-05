@@ -80,3 +80,20 @@ fn the_flash_next_image_is_the_slot_the_leaf_lays_out() {
         assert_eq!(cfg.state_image(format).slot_bytes(), plan.retained_host_bytes, "Flash-Next {format}");
     }
 }
+
+/// Spec flash-next/05's default reuse load: 8 host retained slots in hq-e8-2b,
+/// 130,014,464 bytes each (the spec's figure), about 1 GiB on the host plan's
+/// retained-slots line -- and the pool keeps a page per slot beside every
+/// lane's whole context.
+#[test]
+#[ignore]
+fn the_default_flash_next_reuse_load_pins_eight_images_on_the_host() {
+    use ignis_core::flash_next::EngineOptions;
+    let cfg = ModelConfig::qwen38_flash_next();
+    let options = EngineOptions { retained_host_slots: 8, ..EngineOptions::default() };
+    let plan = SeqPool::plan(&cfg, &options.pool_budget(), None).unwrap_or_else(|e| panic!("Flash-Next: {e}"));
+    assert_eq!(plan.retained_host_bytes, 8 * 130_014_464);
+    assert_eq!(plan.retained_state_bytes, 0, "no device slot by default");
+    let lanes = options.decode_lanes;
+    assert_eq!(options.pool_budget().kv_page_group_count, lanes * options.max_context_tokens.div_ceil(64) + 8);
+}

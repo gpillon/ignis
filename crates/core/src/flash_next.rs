@@ -49,6 +49,15 @@ pub struct EngineOptions {
     pub ngram: NgramTableOptions,
     /// Capture the decode rounds' graphs after the pool exists.
     pub capture_graphs: bool,
+    /// Prompt reuse's retained slots (spec flash-next/05): on the device
+    /// (`--retained-device`, each one an image's worth of expert cache) and
+    /// in the pool's pinned host block (`--retained-host`). Both 0 for an
+    /// engine that retains nothing.
+    pub retained_device_slots: u32,
+    pub retained_host_slots: u32,
+    /// The KV-RAM arena this load pins for its host tier
+    /// (`--kv-host-pool-bytes`); 0 creates none.
+    pub kv_ram_arena_bytes: u64,
 }
 
 impl EngineOptions {
@@ -62,26 +71,40 @@ impl EngineOptions {
         self
     }
 
-    /// The sequence pool these options build: every lane's whole context.
+    /// Every retained slot, device and host: the scheduler's slot indices,
+    /// the device ones first.
+    pub fn retained_slots(&self) -> u32 {
+        self.retained_device_slots + self.retained_host_slots
+    }
+
+    /// The sequence pool these options build: every lane's whole context,
+    /// plus one page per retained slot -- a checkpoint keeps the page its
+    /// opener ends inside, as on the 27B (`VramRequest::retained_slots`).
     pub fn pool_budget(&self) -> SeqPoolBudget {
         SeqPoolBudget {
             kv_format: self.kv_format,
-            kv_page_group_count: self.max_context_tokens.div_ceil(64) * self.decode_lanes,
+            kv_page_group_count: self.max_context_tokens.div_ceil(64) * self.decode_lanes + self.retained_slots(),
             max_context_tokens: self.max_context_tokens,
             slot_count: self.decode_lanes,
-            retained_slot_count: 0,
-            retained_host_slot_count: 0,
+            retained_slot_count: self.retained_device_slots,
+            retained_host_slot_count: self.retained_host_slots,
         }
     }
 }
 
 /// The device bytes a pool of `budget` holds for `config`: its KV arena,
-/// the lanes' state, the residual window and the indexer and n-gram
-/// sections (the indexer's keys, 768 bytes per token of context, are part
-/// of the context's price, not the KV line alone).
+/// the lanes' state, the device retained slots' images, the residual window
+/// and the indexer and n-gram sections (the indexer's keys, 768 bytes per
+/// token of context, are part of the context's price, not the KV line
+/// alone). The host retained slots are host memory, in none of these.
 pub fn pool_device_bytes(config: &ModelConfig, budget: &SeqPoolBudget) -> Result<u64, String> {
     let plan = SeqPool::plan(config, budget, None)?;
-    Ok(plan.kv_bytes + plan.lane_state_bytes + plan.hq_residual_bytes + plan.indexer_bytes + plan.ngram_conv_bytes)
+    Ok(plan.kv_bytes
+        + plan.lane_state_bytes
+        + plan.retained_state_bytes
+        + plan.hq_residual_bytes
+        + plan.indexer_bytes
+        + plan.ngram_conv_bytes)
 }
 
 impl Default for EngineOptions {
@@ -94,6 +117,9 @@ impl Default for EngineOptions {
             expert_cache_bytes: 12 << 30,
             ngram: NgramTableOptions::default(),
             capture_graphs: true,
+            retained_device_slots: 0,
+            retained_host_slots: 0,
+            kv_ram_arena_bytes: 0,
         }
     }
 }

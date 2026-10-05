@@ -96,6 +96,32 @@ fn chunked_streams_hash_as_the_whole_stream_does() {
     }
 }
 
+/// A context read back from its recent tokens -- what a Flash-Next blob
+/// carries across a snapshot or a claim (spec flash-next/05) -- continues
+/// every stream with the checkpoint's own ids, cut anywhere; one of another
+/// length is refused.
+#[test]
+fn a_context_rebuilt_from_its_recent_tokens_continues_the_stream() {
+    let fixture = fixture();
+    let hasher = hasher(&fixture);
+    for stream in fixture["streams"].as_array().expect("streams") {
+        let name = stream["name"].as_str().expect("name");
+        let tokens = u32s(&stream["tokens"]);
+        let mut whole = Vec::new();
+        hasher.hash(&mut NgramContext::new(&hasher), &tokens, &mut whole);
+        for cut in [0, 1, 2, tokens.len() / 2, tokens.len()].into_iter().filter(|&cut| cut <= tokens.len()) {
+            let mut before = NgramContext::new(&hasher);
+            let mut ids = Vec::new();
+            hasher.hash(&mut before, &tokens[..cut], &mut ids);
+            let mut after = NgramContext::from_recent(&hasher, before.recent()).expect("the same length");
+            assert_eq!(after, before, "{name}: cut at {cut}");
+            hasher.hash(&mut after, &tokens[cut..], &mut ids);
+            assert_eq!(ids, whole, "{name}: cut at {cut}");
+        }
+    }
+    assert!(NgramContext::from_recent(&hasher, &[1, 2, 3]).is_err(), "three tokens for a 3-gram's context of two");
+}
+
 /// The buffers the config rebuilds are the ones the checkpoint stores (the
 /// recorder found them equal), so a mis-stored artifact buffer is caught.
 #[test]

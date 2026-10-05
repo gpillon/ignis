@@ -120,6 +120,23 @@ impl NgramContext {
     pub fn new(hasher: &NgramHasher) -> Self {
         Self { recent: vec![hasher.eos; hasher.geometry.context_tokens() as usize] }
     }
+
+    /// A context holding `recent`, oldest first: one read back from a
+    /// snapshot blob (spec flash-next/05). Refused unless it holds exactly
+    /// the tokens [`NgramContext::new`] would.
+    pub fn from_recent(hasher: &NgramHasher, recent: &[u32]) -> Result<Self, String> {
+        let tokens = hasher.geometry.context_tokens() as usize;
+        if recent.len() != tokens {
+            return Err(format!("an n-gram context of {} tokens, not {tokens}", recent.len()));
+        }
+        Ok(Self { recent: recent.to_vec() })
+    }
+
+    /// The tokens it holds, oldest first: the last ones hashed, EOS where
+    /// there were none.
+    pub fn recent(&self) -> &[u32] {
+        &self.recent
+    }
 }
 
 /// Hashes tokens to their n-gram table rows, bit-exact with the checkpoint.
