@@ -601,6 +601,13 @@ target_include_directories(ignis_kernel_flash_next_contract_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_flash_next_contract_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_contract_test COMMAND ignis_kernel_flash_next_contract_test)
+# The Flash-Next binder (kernel/src/flash_next/bind.cu) at the real 48-layer
+# schema: binds, places, refuses by name. Host-only.
+add_executable(ignis_kernel_flash_next_bind_test test_flash_next_bind.cpp)
+target_include_directories(ignis_kernel_flash_next_bind_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_bind_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_bind_test COMMAND ignis_kernel_flash_next_bind_test)
 
 # GitHub #301 (spec flash-next/03): OURS -- the expert residency miss path measured (copy
 # engine against SM-driven copies from mapped pinned memory). A timing is a finding, not a
