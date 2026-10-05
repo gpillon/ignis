@@ -387,14 +387,14 @@ mod tests {
     #[test]
     fn plan_lines_at_a_4096_token_chunk() {
         // By hand from the layout (kernel/src/moe_workspace.cuh) at 4096 tokens: decode counters
-        // 2,048 + gate/up sums 6,553,600 + h 1,638,400; prefill chunk histograms 131,072, expert
+        // 3,328 + gate/up sums 6,553,600; prefill chunk histograms 131,072, expert
         // offsets 2,304, item count 256, 1,152 items 9,216, sorted rows 163,840, h 104,857,600.
         let plan = plan_bytes(8, 4096).unwrap();
-        assert_eq!(plan.workspace, 113_358_336);
+        assert_eq!(plan.workspace, 111_721_216);
         assert_eq!(plan.acc, 4096 * 2560 * 8);
         assert_eq!(plan.router, 163_840 + 163_840 + 8_388_608);
         assert_eq!(plan.shared, 5_242_880 + 41_943_040);
-        assert_eq!(plan.total, 253_146_624);
+        assert_eq!(plan.total, 251_509_504);
         assert!(plan_bytes(0, 4096).is_err());
         assert!(plan_bytes(9, 4096).is_err());
         assert!(plan_bytes(8, 0).is_err());
@@ -411,9 +411,9 @@ mod tests {
 
     #[test]
     fn decode_regions_follow_the_lane_count() {
-        // gate/up sums int64 [10 D][D][1280] and h f32 [10 D][D][640]: 8 lanes against 3.
+        // gate/up sums int64 [10 D][D][1280]: 8 lanes against 3.
         let eight = workspace_bytes(8, 4096);
         let three = workspace_bytes(3, 4096);
-        assert_eq!(eight - three, (6_553_600 - 921_600) + (1_638_400 - 230_400));
+        assert_eq!(eight - three, 6_553_600 - 921_600);
     }
 }
