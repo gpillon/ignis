@@ -1,0 +1,11 @@
+{
+ "generator": "crates/bench/tests/fixtures/flash_next_kld/record.py",
+ "seed": 20261005,
+ "vocab": 2048,
+ "cases": 21,
+ "scoring_py_sha256": "cd8d3a205ba604c09056f7198843929db8c92f82449f2c037a3d723b666ce5b0",
+ "cand_bf16_sha256": "f46396ade66014ca46d46d623013ee3db8c7973e935fd289ce41a8aafbc4d41d",
+ "torch": "2.13.0+cu130",
+ "numpy": "2.5.3",
+ "python": "3.12.6"
+}
