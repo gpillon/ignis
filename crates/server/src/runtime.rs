@@ -50,6 +50,9 @@ pub struct EngineShape {
     /// (`--retained-host`), both 0 with prompt reuse off unless named.
     pub retained_device_slots: u32,
     pub retained_host_slots: u32,
+    /// Whether the operator named the host count; unnamed, a Flash-Next load
+    /// takes its family's default ([`EngineShape::for_family`]).
+    pub retained_host_named: bool,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority (`--retained-interactive-ttl`, GitHub #190).
     pub retained_interactive_ttl: std::time::Duration,
@@ -82,6 +85,7 @@ impl Default for EngineShape {
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
             retained_device_slots: crate::config::DEFAULT_RETAINED_DEVICE_SLOTS,
             retained_host_slots: crate::config::DEFAULT_RETAINED_HOST_SLOTS,
+            retained_host_named: false,
             retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
             speculation: None,
             vision: None,
@@ -102,6 +106,7 @@ impl From<&crate::config::Config> for EngineShape {
             prompt_reuse: config.prompt_reuse,
             retained_device_slots: config.retained_device_slots,
             retained_host_slots: config.retained_host_slots,
+            retained_host_named: config.retained_host_named,
             retained_interactive_ttl: std::time::Duration::from_secs(u64::from(
                 config.retained_interactive_ttl_secs,
             )),
@@ -117,6 +122,18 @@ impl EngineShape {
     /// one pool the scheduler hands out (GitHub #281).
     pub fn retained_slots(&self) -> u32 {
         self.retained_device_slots + self.retained_host_slots
+    }
+
+    /// This shape for an artifact of `family`: the host retained slots the
+    /// operator did not name are the family's default when prompt reuse is
+    /// on (Flash-Next's 8, spec flash-next/05) -- the config resolved the
+    /// 27B's before the artifact named its model. A named count, or reuse
+    /// off, is left as it is.
+    pub fn for_family(self, family: ignis_core::compute::ModelFamily) -> Self {
+        if self.retained_host_named || !self.prompt_reuse {
+            return self;
+        }
+        Self { retained_host_slots: family.default_retained_host_slots(), ..self }
     }
 }
 
@@ -453,10 +470,12 @@ pub fn cuda_scheduler_with_thinking_close(
 /// the sequence pool, residency's staging ring and tables; the expert cache
 /// takes the rest and is refused below its floor (spec flash-next/03).
 ///
-/// Flash-Next serves no prompt reuse and no KV-RAM tier yet (spec 05): its
-/// pool's sections are not in the clone table, so the scheduler runs with
-/// both off and its lanes are the load's decode lanes, every request
-/// resident while it runs.
+/// Prompt reuse and the KV-RAM tier are the 27B's (spec flash-next/05, ADR
+/// 0029): the shape's `--prompt-reuse`, retained slots (host 8 and device 0
+/// unless named, [`EngineShape::for_family`]) and `--kv-host-pool-bytes`
+/// arena, which the leaf pins as its own. The retained slots are lines of
+/// the pool (device) and of the host plan (host), the arena a host-plan
+/// line; the scheduler's lanes are the load's decode lanes.
 #[cfg(feature = "cuda")]
 pub fn flash_next_scheduler(
     artifact_path: &std::path::Path,
@@ -474,9 +493,10 @@ pub fn flash_next_scheduler(
         available_physical_bytes, plan_host, prefill_staging_ring_bytes, residency_table_bytes, HostPlanRequest,
         EXPERT_CACHE_FLOOR_BYTES,
     };
-    use ignis_core::seq::{SeqPool, SeqPoolBudget};
+    use ignis_core::seq::SeqPool;
     use ignis_runtime::{FlashNextLeaf, KV_PAGE_TOKENS};
 
+    let shape = shape.for_family(ignis_core::compute::ModelFamily::FlashNext);
     let lanes = ignis_core::flash_next::DEFAULT_DECODE_LANES;
     let (free_at_start_bytes, _) = CudaDevice::nvml_memory(0)
         .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
@@ -498,19 +518,21 @@ pub fn flash_next_scheduler(
         lanes,
     )?;
     let config = ModelConfig::flash_next_from(&geometry);
-    let pages_per_lane = shape.max_context.div_ceil(KV_PAGE_TOKENS);
-    let pool_plan = SeqPool::plan(
-        &config,
-        &SeqPoolBudget {
-            kv_format: shape.kv_format,
-            kv_page_group_count: pages_per_lane * lanes,
-            max_context_tokens: shape.max_context,
-            slot_count: lanes,
-            retained_slot_count: 0,
-            retained_host_slot_count: 0,
-        },
-        None,
-    )?;
+    // The options the leaf loads with, but for the expert cache, which is
+    // what the plan below leaves: one budget for the pool the plan charges
+    // and the pool the leaf builds.
+    let mut options = EngineOptions {
+        prefill_chunk_tokens: shape.prefill_chunk,
+        max_context_tokens: shape.max_context,
+        kv_format: shape.kv_format,
+        decode_lanes: lanes,
+        capture_graphs: true,
+        retained_device_slots: shape.retained_device_slots,
+        retained_host_slots: shape.retained_host_slots,
+        kv_ram_arena_bytes: shape.host_pool_bytes,
+        ..EngineOptions::default()
+    };
+    let pool_plan = SeqPool::plan(&config, &options.pool_budget(), None)?;
     let cat = catalog(&plan.experts)?;
     let max_tokens = shape.prefill_chunk.max(lanes);
     let residency_fixed = prefill_staging_ring_bytes(&cat)
@@ -527,6 +549,7 @@ pub fn flash_next_scheduler(
         sampling: reserved.sampling_bytes,
         decode_graph: reserved.decode_graph_bytes,
         lane_state: pool_plan.lane_state_bytes + pool_plan.indexer_bytes + pool_plan.ngram_conv_bytes,
+        retained_slots: pool_plan.retained_state_bytes,
         hq_residual_window: pool_plan.hq_residual_bytes,
         ..ignis_core::VramLines::default()
     };
@@ -544,21 +567,13 @@ pub fn flash_next_scheduler(
         weights_bytes = lines.weights,
         program_bytes = lines.workspace + lines.sampling + lines.decode_graph,
         pool_bytes = pool_plan.kv_bytes + lines.lane_state + lines.hq_residual_window,
+        retained_device_bytes = lines.retained_slots,
         residency_fixed_bytes = residency_fixed,
         expert_cache_bytes,
         lanes,
         "flash-next vram plan"
     );
-
-    let options = EngineOptions {
-        prefill_chunk_tokens: shape.prefill_chunk,
-        max_context_tokens: shape.max_context,
-        kv_format: shape.kv_format,
-        decode_lanes: lanes,
-        expert_cache_bytes,
-        capture_graphs: true,
-        ..EngineOptions::default()
-    };
+    options.expert_cache_bytes = expert_cache_bytes;
     // The host plan (spec flash-next/03), measured before the first pinned
     // allocation: the expert pool and the n-gram hot rows must leave the
     // margin, or the start is refused naming the line that crosses it.
@@ -568,8 +583,8 @@ pub fn flash_next_scheduler(
             expert_pool_bytes: pool_layout(&plan.experts).bytes,
             ngram_hot_rows_bytes: options.ngram.hot_bytes,
             staging_bytes: 0,
-            retained_host_slots_bytes: 0,
-            kv_ram_arena_bytes: 0,
+            retained_host_slots_bytes: pool_plan.retained_host_bytes,
+            kv_ram_arena_bytes: options.kv_ram_arena_bytes,
         })
         .map_err(|e| e.to_string())?;
         // hotpath-lint-allow: one line per model load.
@@ -578,6 +593,9 @@ pub fn flash_next_scheduler(
             available_bytes = available,
             planned_bytes = host.total_bytes,
             left_bytes = host.left_bytes,
+            retained_host_slots = options.retained_host_slots,
+            retained_host_bytes = pool_plan.retained_host_bytes,
+            kv_ram_arena_bytes = options.kv_ram_arena_bytes,
             "flash-next host plan"
         );
     }
@@ -586,21 +604,15 @@ pub fn flash_next_scheduler(
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
     let stats = model.stats().map_err(|e| format!("runtime stats: {e:?}"))?;
     let capacity_pages = stats.kv_page_count;
+    // The 27B's reuse configuration (prompt reuse, retained slots, the
+    // KV-RAM tier's bytes), over this load's lanes.
     let sched = scheduler(
         SchedulerConfig {
-            model: model_id,
-            kv_page_tokens: KV_PAGE_TOKENS,
-            max_sequence_tokens: shape.max_context,
-            kv_capacity_pages: capacity_pages,
-            host_capacity_bytes: 0,
-            serving_chunk_tokens: shape.prefill_chunk,
-            prompt_reuse: false,
-            retained_slots: 0,
             max_in_flight: lanes as usize,
             max_prefill_batch: lanes as usize,
             resident_slot_capacity: lanes,
             thinking_close,
-            ..SchedulerConfig::default()
+            ..scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages)
         },
         model,
         eos,
@@ -610,10 +622,10 @@ pub fn flash_next_scheduler(
         budget_bytes,
         kv_pool_pages: capacity_pages,
         kv_page_bytes: stats.kv_page_bytes,
-        kv_ram_arena_bytes: 0,
-        retained_slots: 0,
-        retained_host_slots: 0,
-        retained_host_bytes: 0,
+        kv_ram_arena_bytes: shape.host_pool_bytes,
+        retained_slots: sched.retained_slot_count(),
+        retained_host_slots: shape.retained_host_slots,
+        retained_host_bytes: pool_plan.retained_host_bytes,
     };
     Ok((sched, reserved))
 }
@@ -752,6 +764,22 @@ mod tests {
     }
 
     #[test]
+    fn a_flash_next_load_keeps_eight_host_retained_slots_unless_one_is_named() {
+        // Spec flash-next/05: host 8, device 0 and a 2 GiB arena by default.
+        use ignis_core::compute::ModelFamily;
+        let unnamed = EngineShape::default();
+        let flash = unnamed.for_family(ModelFamily::FlashNext);
+        assert_eq!((flash.retained_device_slots, flash.retained_host_slots), (0, 8));
+        assert_eq!(flash.host_pool_bytes, 2 << 30);
+        assert_eq!(unnamed.for_family(ModelFamily::Qwen38_27b).retained_host_slots, 16, "the 27B's own");
+
+        let named = EngineShape { retained_host_slots: 16, retained_host_named: true, ..EngineShape::default() };
+        assert_eq!(named.for_family(ModelFamily::FlashNext).retained_host_slots, 16, "a named count stands");
+        let off = EngineShape { prompt_reuse: false, retained_host_slots: 0, ..EngineShape::default() };
+        assert_eq!(off.for_family(ModelFamily::FlashNext).retained_host_slots, 0, "reuse off retains nothing");
+    }
+
+    #[test]
     fn the_operator_prefill_chunk_reaches_the_scheduler_config() {
         let shape = EngineShape {
             prefill_chunk: 512,
@@ -763,6 +791,7 @@ mod tests {
             prompt_reuse: true,
             retained_device_slots: 2,
             retained_host_slots: 3,
+            retained_host_named: true,
             retained_interactive_ttl: std::time::Duration::from_secs(60),
             speculation: None,
             vision: None,

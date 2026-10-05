@@ -159,6 +159,10 @@ pub struct Config {
     /// prompt reuse off unless named.
     pub retained_device_slots: u32,
     pub retained_host_slots: u32,
+    /// Whether the operator named [`Config::retained_host_slots`]
+    /// (`--retained-host` / `IGNIS_RETAINED_HOST`). Unnamed, a Flash-Next
+    /// load takes its own default (spec flash-next/05), not the 27B's.
+    pub retained_host_named: bool,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority after its conversation last used it, in seconds
     /// (`--retained-interactive-ttl`, GitHub #190). Past it the entry ranks as
@@ -495,6 +499,7 @@ pub fn resolve(
         ("--retained-device", "IGNIS_RETAINED_DEVICE"),
         if prompt_reuse { DEFAULT_RETAINED_DEVICE_SLOTS } else { 0 },
     )?;
+    let retained_host_named = non_empty(retained_host.clone().or_else(|| env("IGNIS_RETAINED_HOST"))).is_some();
     let retained_host_slots = resolve_retained_count(
         retained_host,
         &env,
@@ -584,6 +589,7 @@ pub fn resolve(
         prompt_reuse,
         retained_device_slots,
         retained_host_slots,
+        retained_host_named,
         retained_interactive_ttl_secs,
         instruction_policy,
         speculation,
@@ -2005,6 +2011,22 @@ mod tests {
             let err = resolve(&args(&[flag, "8G"]), no_env).expect_err("not a count");
             assert!(err.0.contains(flag), "{}", err.0);
         }
+    }
+
+    #[test]
+    fn the_config_records_whether_the_host_retained_count_was_named() {
+        // Spec flash-next/05: an unnamed count is the 27B's default here and
+        // Flash-Next's own once the artifact names its model, so the config
+        // keeps which of the two it is.
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert!(!config.retained_host_named);
+        let config = expect_config(resolve(&args(&["--retained-device", "2"]), no_env).expect("resolve"));
+        assert!(!config.retained_host_named, "the device count names nothing of the host's");
+        let config = expect_config(resolve(&args(&["--retained-host", "16"]), no_env).expect("resolve"));
+        assert!(config.retained_host_named, "named at the 27B's default value is still named");
+        let env = env_map(&[("IGNIS_RETAINED_HOST", "3")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert!(config.retained_host_named, "the env var names it too");
     }
 
     #[test]

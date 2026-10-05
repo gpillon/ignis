@@ -288,6 +288,7 @@ async fn main() {
         prompt_reuse: _,
         retained_device_slots: _,
         retained_host_slots: _,
+        retained_host_named: _,
         retained_interactive_ttl_secs: _,
         instruction_policy,
         speculation: _,
