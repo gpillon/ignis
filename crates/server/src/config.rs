@@ -74,6 +74,7 @@ pub const MAX_VISION_EMBEDDING_POOL_MIB: u64 = 64 * 1024;
 pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUNK_ALIGNMENT};
 
 pub use ignis_core::{KvFormat, VramMode};
+use ignis_core::compute::ModelFamily;
 
 /// `--vram-headroom-bytes`' default: what a derived VRAM budget leaves to the
 /// desktop and every other process on the card (GitHub #210).
@@ -88,6 +89,10 @@ pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub model: String,
+    /// Whether the operator named [`Config::model`] (`--model` /
+    /// `IGNIS_MODEL`). Unnamed, a load is served under its own model's id
+    /// ([`served_model_for`]), not the 27B's default.
+    pub model_named: bool,
     pub bind: String,
     pub artifact: Option<PathBuf>,
     /// May the server fetch [`Config::model`] when no artifact is on disk
@@ -439,9 +444,9 @@ pub fn resolve(
         i += 1;
     }
 
-    let model = model
-        .or_else(|| env("IGNIS_MODEL"))
-        .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+    let model = model.or_else(|| env("IGNIS_MODEL"));
+    let model_named = model.is_some();
+    let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_owned());
     let bind = bind
         .or_else(|| env("IGNIS_BIND"))
         .unwrap_or_else(|| DEFAULT_BIND.to_owned());
@@ -556,6 +561,7 @@ pub fn resolve(
 
     Ok(ConfigOutcome::Config(Config {
         model,
+        model_named,
         bind,
         artifact,
         model_download: resolve_model_download(model_download, &env)?,
@@ -841,28 +847,35 @@ fn resolve_speculation(
         .map_err(|_| out_of_range())
 }
 
-/// The start options the loaded model cannot honour, refused by name
-/// before it serves (spec flash-next/04): the model family is read from the
-/// artifact, so a flag chosen for the other model is refused rather than
-/// ignored. Flash-Next has no speculative decoding and no vision tower.
-pub fn refuse_for_family(
-    config: &Config,
-    family: ignis_core::compute::ModelFamily,
-) -> Result<(), ConfigError> {
-    if family != ignis_core::compute::ModelFamily::FlashNext {
-        return Ok(());
+/// The one place the loaded model's family meets the start options (spec
+/// flash-next/04): the family is the artifact's, so a start option chosen
+/// for the other model is refused by name rather than served around.
+///
+/// Returns the id the load is served under: the operator's, or with none
+/// named, the model's own ([`ModelFamily::model_id`], which the 27B's
+/// default already is). Refused: a named id that is the other model's, and
+/// on a model without them, speculation and vision.
+pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, ConfigError> {
+    if config.model_named
+        && ModelFamily::of_model_id(&config.model).is_some_and(|named| named != family)
+    {
+        return Err(ConfigError(format!(
+            "`--model {}` names another model than the artifact's, which is {}",
+            config.model,
+            family.name()
+        )));
     }
-    if let Some(speculation) = config.speculation {
+    if let Some(speculation) = config.speculation.filter(|_| !family.speculates()) {
         return Err(ConfigError(format!(
             "`--spec {}`: {} has no speculative decoding",
             speculation.backend().as_str(),
             family.name()
         )));
     }
-    if config.vision.is_some() {
+    if config.vision.is_some() && !family.takes_images() {
         return Err(ConfigError(format!("`--vision`: {} takes no images", family.name())));
     }
-    Ok(())
+    Ok(if config.model_named { config.model.clone() } else { family.model_id().to_owned() })
 }
 
 /// Parse a `u32` count for `flag`, naming the flag, `unit`, and the
@@ -2274,13 +2287,11 @@ mod tests {
         let spec = expect_config(
             resolve(&args(&["--spec", "dflash2", "--draft-tokens", "7"]), no_env).expect("resolve"),
         );
-        let err = refuse_for_family(&spec, ModelFamily::FlashNext).expect_err("no speculation");
+        let err = served_model_for(&spec, ModelFamily::FlashNext).expect_err("no speculation");
         assert!(err.0.contains("--spec dflash2") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
         let vision = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
-        let err = refuse_for_family(&vision, ModelFamily::FlashNext).expect_err("no vision");
+        let err = served_model_for(&vision, ModelFamily::FlashNext).expect_err("no vision");
         assert!(err.0.contains("--vision") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
-        let plain = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(refuse_for_family(&plain, ModelFamily::FlashNext), Ok(()));
     }
 
     #[test]
@@ -2288,7 +2299,36 @@ mod tests {
         use ignis_core::compute::ModelFamily;
         let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--vision"]);
         let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(refuse_for_family(&config, ModelFamily::Qwen38_27b), Ok(()));
+        assert_eq!(served_model_for(&config, ModelFamily::Qwen38_27b), Ok(DEFAULT_MODEL.to_owned()));
+    }
+
+    /// With no `--model`, a load is served under its own model's id: the
+    /// artifact's family decides, not the 27B's default.
+    #[test]
+    fn an_unnamed_served_id_is_the_loaded_models_own() {
+        use ignis_core::compute::ModelFamily;
+        let plain = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(served_model_for(&plain, ModelFamily::FlashNext), Ok("qwen3.8-flash-next".to_owned()));
+        assert_eq!(served_model_for(&plain, ModelFamily::Qwen38_27b), Ok("qwen3.8-27b".to_owned()));
+    }
+
+    /// A served id that names the other model is refused at start, whether
+    /// the flag or the environment named it: the artifact decides the model,
+    /// and a client must never be told it talks to one while the other
+    /// answers. Any other id is the operator's to choose.
+    #[test]
+    fn a_served_id_naming_the_other_model_is_refused_at_start() {
+        use ignis_core::compute::ModelFamily;
+        let named = |id: &'static str| expect_config(resolve(&args(&["--model", id]), no_env).expect("resolve"));
+        let err = served_model_for(&named("qwen3.8-flash-next"), ModelFamily::Qwen38_27b).expect_err("27B artifact");
+        assert!(err.0.contains("qwen3.8-flash-next") && err.0.contains("Qwen3.8-27B"), "{}", err.0);
+        let err = served_model_for(&named("qwen3.8-27b"), ModelFamily::FlashNext).expect_err("Flash-Next artifact");
+        assert!(err.0.contains("qwen3.8-27b") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+        let env = env_map(&[("IGNIS_MODEL", "qwen3.8-flash-next")]);
+        let from_env = expect_config(resolve(&[], env).expect("resolve"));
+        assert!(served_model_for(&from_env, ModelFamily::Qwen38_27b).is_err(), "the env form too");
+        assert_eq!(served_model_for(&named("my-id"), ModelFamily::FlashNext), Ok("my-id".to_owned()));
+        assert_eq!(served_model_for(&named("qwen3.8-27b"), ModelFamily::Qwen38_27b), Ok("qwen3.8-27b".to_owned()));
     }
 
     // ── vision as a load option (GitHub #177) ─────────────────────────────

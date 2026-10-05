@@ -180,9 +180,7 @@ impl Server {
         messages: &[template::ChatMessage],
     ) -> Result<(), template::ContentRejection> {
         template::check_content_parts(messages, self.media.is_some()).map_err(|mut rejection| {
-            if rejection.code == "vision_disabled"
-                && self.family == ignis_core::compute::ModelFamily::FlashNext
-            {
+            if rejection.code == "vision_disabled" && !self.family.takes_images() {
                 rejection.message = format!("{}: {} takes no images", rejection.message, self.family.name());
             }
             rejection

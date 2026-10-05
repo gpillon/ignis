@@ -93,6 +93,7 @@
 use std::sync::Arc;
 
 use ignis_core::{
+    compute::ModelFamily,
     mock::MockCompute,
     Compute, ConcreteScheduler, Scheduler, SchedulerConfig,
 };
@@ -250,8 +251,12 @@ async fn main() {
     // width or a pool that cannot serve the configured context.
     #[cfg(feature = "cuda")]
     let engine_shape = ignis_server::runtime::EngineShape::from(&config);
+    // What the loaded model's family is checked against once the artifact
+    // names it (`config::served_model_for`, spec flash-next/04).
+    let start_options = config.clone();
     let Config {
         model,
+        model_named: _,
         bind,
         artifact,
         model_download,
@@ -419,6 +424,39 @@ async fn main() {
             }
         };
 
+        // ADR 0043: the artifact names its model, and the start options meet
+        // it in one place, which decides the served id or refuses the start
+        // naming the model (spec flash-next/04). An artifact of neither model
+        // is served as the 27B always was.
+        let family = match loader::artifact_family(artifact_path) {
+            Ok(family) => family.unwrap_or(ModelFamily::Qwen38_27b),
+            Err(err) => {
+                tracing::error!(
+                    name: "ignis.artifact.load_failed",
+                    artifact = %artifact_path.display(),
+                    error = %err,
+                    "refusing to start"
+                );
+                exit_after_flush(&logging_handle, 1);
+            }
+        };
+        let model = match config::served_model_for(&start_options, family) {
+            Ok(model) => model,
+            Err(err) => {
+                tracing::error!(name: "ignis.config.model_mismatch", error = %err, "refusing to start");
+                exit_after_flush(&logging_handle, 1);
+            }
+        };
+        #[cfg(feature = "cuda")]
+        if family == ModelFamily::FlashNext {
+            tracing::error!(
+                name: "ignis.model.unsupported",
+                model = family.name(),
+                "its forward is not built yet (spec flash-next/04) -- refusing to start"
+            );
+            exit_after_flush(&logging_handle, 1);
+        }
+
         // The thinking budget's forced close (2026-09-24), in this model's
         // own tokens. A tokenizer that splits `</think>` leaves every budget
         // inert: with a default budget configured that is a refused start
@@ -486,7 +524,7 @@ async fn main() {
 
         let engine = Engine::with_clock(scheduler, Arc::new(SystemClock));
         let provider = ignis_server::artifact_template::ArtifactTemplateProvider::new(frontend);
-        match processor {
+        let server = match processor {
             None => Server::new(engine, Box::new(provider)),
             Some(processor) => {
                 let acquirer = ignis_server::media::MediaAcquirer::new(
@@ -496,7 +534,8 @@ async fn main() {
                 );
                 Server::new(engine, Box::new(provider.with_vision(processor))).with_media(Arc::new(acquirer))
             }
-        }
+        };
+        server.with_family(family)
     } else {
         // Why there is no artifact was said once, with its reason, where the
         // decision was made (`ignis.model.placeholder_template` above).

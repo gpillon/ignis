@@ -183,6 +183,11 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
         return Err(bad_request("messages must not be empty"));
     }
     check_roles(&messages).map_err(template_rejection)?;
+    // A model with no vision tower refuses an image for that, naming itself
+    // (spec flash-next/04), before this route's own reason below.
+    if !server.family.takes_images() {
+        server.check_content_parts(&messages).map_err(content_rejection)?;
+    }
     // Before the content-part check, which on a load without `--vision`
     // would answer `vision_disabled`: the refusal that matters here is that
     // this route never counts an image, whatever the load can do with one.

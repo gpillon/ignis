@@ -2413,18 +2413,13 @@ pub async fn decide(
 ) -> axum::response::Response {
     // Flash-Next has no readouts (spec flash-next/04): the endpoint is not
     // served at all, whatever the body says, and the 400 names the model.
-    if server.family == ignis_core::compute::ModelFamily::FlashNext {
-        return (
+    if !server.family.serves_readouts() {
+        return crate::api::error_response(
             axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": "model_unsupported",
-                    "message": format!("/v1/decide is not served by {}: it has no readouts", server.family.name()),
-                }
-            })),
-        )
-            .into_response();
+            "invalid_request_error",
+            "model_unsupported",
+            format!("/v1/decide is not served by {}: it has no readouts", server.family.name()),
+        );
     }
     // A body that will not parse is a malformed request, which is the same
     // 422 a body that parses into nonsense gets. Jev answers 422 for "a
