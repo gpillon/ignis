@@ -107,9 +107,19 @@ inline RowFn exact_rows(const Pages &pg) {
   };
 }
 
-// fp64 attention of one row (all query heads) over its list.
-inline std::vector<double> reference(const RowFn &rows, const std::vector<uint16_t> &q, int row, int slot,
-                                     const std::vector<int32_t> &list) {
+// fp64 attention of one row (all query heads) over its list, and each output's error bound.
+// The kernel's weights are p = bf16(exp2(s - m)) for its running maximum m, so each is the exact
+// weight times (1 + d), |d| <= 2^-9 (BF16 rounding) + 2^-12 (the fp32 score, exp2f, and the
+// later fp32 rescales by exp2 of maxima differences); normalized by the sum of the same weights,
+// the output moves by at most (2^-9 + 2^-12) sum_j w_j |v_j - out| (w the exact softmax). Then the
+// fp32 accumulation of up to n products, n u sum_j w_j |v_j| (u = 2^-24), and the BF16 rounding
+// of the result, 2^-9 |out|.
+struct Reference {
+  std::vector<double> out, bound;  // [q_heads][head_dim]
+};
+
+inline Reference reference(const RowFn &rows, const std::vector<uint16_t> &q, int row, int slot,
+                           const std::vector<int32_t> &list) {
   const size_t n = list.size();
   std::vector<double> k(n * kKvHeads * kHd), v(n * kKvHeads * kHd);
   for (size_t j = 0; j < n; ++j) {
@@ -118,7 +128,10 @@ inline std::vector<double> reference(const RowFn &rows, const std::vector<uint16
       rows(1, slot, list[j], h, &v[(j * kKvHeads + h) * kHd]);
     }
   }
-  std::vector<double> out(static_cast<size_t>(kQHeads) * kHd, 0.0), s(n);
+  Reference ref;
+  ref.out.assign(static_cast<size_t>(kQHeads) * kHd, 0.0);
+  ref.bound.assign(ref.out.size(), 0.0);
+  std::vector<double> w(n);
   for (int h = 0; h < kQHeads; ++h) {
     const int kvh = h / sp::kGroup;
     const uint16_t *qh = &q[(static_cast<size_t>(row) * kQHeads + h) * kHd];
@@ -127,20 +140,32 @@ inline std::vector<double> reference(const RowFn &rows, const std::vector<uint16
       double dot = 0.0;
       const double *kr = &k[(j * kKvHeads + kvh) * kHd];
       for (int d = 0; d < kHd; ++d) dot += static_cast<double>(bf16_to_f32(qh[d])) * kr[d];
-      s[j] = dot / 16.0;
-      m = std::max(m, s[j]);
+      w[j] = dot / 16.0;
+      m = std::max(m, w[j]);
     }
     double l = 0.0;
     for (size_t j = 0; j < n; ++j) {
-      s[j] = std::exp(s[j] - m);
-      l += s[j];
+      w[j] = std::exp(w[j] - m);
+      l += w[j];
     }
+    for (size_t j = 0; j < n; ++j) w[j] /= l;
+    double *out = &ref.out[static_cast<size_t>(h) * kHd];
+    double *bound = &ref.bound[static_cast<size_t>(h) * kHd];
     for (size_t j = 0; j < n; ++j) {
       const double *vr = &v[(j * kKvHeads + kvh) * kHd];
-      for (int d = 0; d < kHd; ++d) out[static_cast<size_t>(h) * kHd + d] += s[j] / l * vr[d];
+      for (int d = 0; d < kHd; ++d) out[d] += w[j] * vr[d];
+    }
+    for (int d = 0; d < kHd; ++d) {
+      double dev = 0.0, mag = 0.0;
+      for (size_t j = 0; j < n; ++j) {
+        const double vj = v[(j * kKvHeads + kvh) * kHd + d];
+        dev += w[j] * std::fabs(vj - out[d]);
+        mag += w[j] * std::fabs(vj);
+      }
+      bound[d] = (0x1p-9 + 0x1p-12) * dev + static_cast<double>(n) * 0x1p-24 * mag + 0x1p-9 * std::fabs(out[d]) + 0x1p-40;
     }
   }
-  return out;
+  return ref;
 }
 
 struct Device {
@@ -205,32 +230,77 @@ inline std::vector<uint16_t> run(Device &d, const Call &c, const Enqueue &enqueu
   return download<uint16_t>(d.out.p, static_cast<size_t>(rows) * kQHeads * kHd);
 }
 
-// Every `sample_step`-th row of a call against the fp64 reference over the rows `rows` names.
-// S is BF16 products summed in fp32; P is rounded to BF16 (2^-9 relative per weight) and the
-// output too (2^-9 of |out|): |out - ref| <= 2^-9 max|v| + 2^-9 |ref| + fp32 noise, asserted as
-// 2^-8 (1 + |ref|) since max|v| <= 1.
-inline void check_call(const std::string &what, const RowFn &rows, const std::vector<uint16_t> &q, const Call &c,
+// Every `sample_step`-th row of a call against the fp64 reference over the rows `rows` names,
+// each output within its derived bound (reference()). Returns whether every checked one was.
+inline bool check_call(const std::string &what, const RowFn &rows, const std::vector<uint16_t> &q, const Call &c,
                        const std::vector<uint16_t> &got, int sample_step) {
   const int n = static_cast<int>(c.lists.size());
   double worst = 0.0;
   int checked = 0;
   for (int r = 0; r < n; r += sample_step) {
     const int slot = c.slots[r / c.tokens];
-    const auto ref = reference(rows, q, r, slot, c.lists[r]);
-    for (size_t i = 0; i < ref.size(); ++i) {
-      const double o = bf16_to_f32(got[static_cast<size_t>(r) * kQHeads * kHd + i]);
-      const double err = std::fabs(o - ref[i]);
-      const double bound = std::ldexp(1.0, -8) * (1.0 + std::fabs(ref[i]));
-      worst = std::max(worst, err / bound);
-      if (!(err <= bound)) {
+    const Reference ref = reference(rows, q, r, slot, c.lists[r]);
+    for (size_t i = 0; i < ref.out.size(); ++i) {
+      const double err = std::fabs(bf16_to_f32(got[static_cast<size_t>(r) * kQHeads * kHd + i]) - ref.out[i]);
+      worst = std::max(worst, err / ref.bound[i]);
+      if (!(err <= ref.bound[i])) {
         check(false, what + ": row " + std::to_string(r) + " element " + std::to_string(i) + " error " +
-                         std::to_string(err) + " above " + std::to_string(bound));
-        return;
+                         std::to_string(err) + " above " + std::to_string(ref.bound[i]));
+        return false;
       }
     }
     ++checked;
   }
   std::printf("  %-40s %3d rows checked, worst error %.3f of the bound\n", what.c_str(), checked, worst);
+  return true;
+}
+
+// Position-coded pages for the exactness arms: every K row zero, except the `needles` (slot,
+// position) rows whose K is 4 in every dimension; V row (pos, head) one-hot at dimension
+// code(pos, head). With q = 1 everywhere, a row without a needle in its list has all scores 0,
+// so every weight is exactly 1 and its output is exactly (listed positions coding to d) / count:
+// one wrong, missing or repeated row moves an output by 1/count, ~16 BF16 ulps of the value at
+// 2051 tokens. A needle scores 64 against 0 for the rest, so the output is its V row to
+// exp2(-92).
+inline int code_of(int pos, int head) { return (pos * 7 + head * 3) % kHd; }
+
+inline Pages make_coded_pages(const std::vector<std::pair<int, int>> &needles) {
+  Pages pg;
+  const size_t n = static_cast<size_t>(kPhysicalPages) * kKvHeads * 64 * kHd;
+  pg.k.assign(n, 0);
+  pg.v.assign(n, 0);
+  pg.tables.resize(kPhysicalPages);
+  for (int i = 0; i < kPhysicalPages; ++i) pg.tables[i] = (i * 101 + 7) % kPhysicalPages;
+  for (int slot = 0; slot < kSlots; ++slot) {
+    for (int pos = 0; pos < kSeqTokens; ++pos) {
+      for (int h = 0; h < kKvHeads; ++h) pg.v[pg.row_at(slot, pos, h) + code_of(pos, h)] = f32_to_bf16(1.0F);
+    }
+  }
+  for (const auto &[slot, pos] : needles) {
+    for (int h = 0; h < kKvHeads; ++h)
+      for (int d = 0; d < kHd; ++d) pg.k[pg.row_at(slot, pos, h) + d] = f32_to_bf16(4.0F);
+  }
+  return pg;
+}
+
+// The exact expectation over coded pages for a row without a needle, compared to a BF16 ulp
+// (the kernel divides by the count through an fp32 reciprocal, then rounds once to BF16).
+// Returns the number of outputs past that.
+inline int coded_mismatches(const Call &c, const std::vector<uint16_t> &got, int r) {
+  int bad = 0;
+  const auto &list = c.lists[r];
+  for (int h = 0; h < kQHeads; ++h) {
+    const int kvh = h / sp::kGroup;
+    std::vector<double> want(kHd, 0.0);
+    for (int32_t pos : list) want[code_of(pos, kvh)] += 1.0;
+    for (int d = 0; d < kHd; ++d) {
+      const double w = want[d] / static_cast<double>(list.size());
+      const double o = bf16_to_f32(got[(static_cast<size_t>(r) * kQHeads + h) * kHd + d]);
+      const double ulp = w == 0.0 ? 0.0 : std::ldexp(1.0, std::ilogb(w) - 7);
+      bad += !(std::fabs(o - w) <= ulp);
+    }
+  }
+  return bad;
 }
 
 }  // namespace sparse_test

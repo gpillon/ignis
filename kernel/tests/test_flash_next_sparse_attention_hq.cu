@@ -14,8 +14,11 @@
 //             replayed from a CUDA graph;
 //   fresh     the call's own token rows read exactly from its BF16 K/V instead of the codec;
 //   residual  sink and recent-window rows read from the side planes (rotated frame) instead of
-//             the codec, by the 27B's rule;
+//             the codec, by the 27B's decode rule (no fresh rows: the window is the call's last
+//             512 keys, its own among them, as the ring stands after the append);
 //   prefill   one lane's visible rows decoded once (the chunk's own rows fresh), read by position;
+//   prefill + residual  a 200-token chunk at 3000 with its own rows fresh and the ring as it stands
+//             BEFORE the call's append: sinks and [2488, 3000) from the side planes;
 //   report    the hq route against the BF16 route on the same keys and values, beside the codec's
 //             measured row error on these rows (ADR 0022's in-house acceptance needs real
 //             Flash-Next rows for its tolerance; this prints the synthetic figure).
@@ -25,6 +28,8 @@
 #include "flash_next_sparse_test_common.h"
 
 #include "ops/kernel/hq_codec.cuh"
+
+#include <functional>
 
 using namespace sparse_test;
 
@@ -78,8 +83,8 @@ double engine_sign(int d) {
   return (x & 1U) ? 1.0 : -1.0;
 }
 
-// x = signs . (H u) / 16 (the inverse of u = H (signs . x) / 16); in place when rotate is false,
-// the forward rotation when true.
+// forward: u = H (signs . x) / 16; else its inverse x = signs . (H u) / 16 (H the Sylvester
+// Hadamard of order 256).
 void hadamard256(const double *in, double *out, bool forward) {
   double t[kHd];
   for (int d = 0; d < kHd; ++d) t[d] = forward ? in[d] * engine_sign(d) : in[d];
@@ -101,6 +106,50 @@ double ulps(uint16_t a, double want) {
   const double mag = std::max(std::fabs(static_cast<double>(fa)), std::fabs(want));
   if (mag < 1e-30) return 0.0;
   return std::fabs(fa - want) / std::ldexp(1.0, std::ilogb(mag) - 7);
+}
+
+// The residual window's side planes as the vendored fill leaves them: every (slot, position)
+// `is_side` names (up to last[slot]) holds the BF16 rounding of its rotated row (the dual write),
+// every ring bit set. `plain` is what the route must return for such a row: the fp64 un-rotation
+// of the stored BF16 values.
+struct SidePlanes {
+  std::vector<uint16_t> k, v;
+  std::vector<uint32_t> ring;
+  std::vector<double> plain;  // [role][slot][sink + recent][kv_heads][256]
+  static size_t index(int slot, int pos, int head) {
+    const int row = pos < kSink ? pos : kSink + (pos & (kRecent - 1));
+    return (static_cast<size_t>(slot) * (kSink + kRecent) + row) * kKvHeads * kHd + static_cast<size_t>(head) * kHd;
+  }
+};
+
+SidePlanes make_side(const Pages &pg, const std::function<bool(int, int)> &is_side, const std::vector<int> &last) {
+  SidePlanes sp_;
+  const size_t n = static_cast<size_t>(kSlots) * (kSink + kRecent) * kKvHeads * kHd;
+  sp_.k.assign(n, 0);
+  sp_.v.assign(n, 0);
+  sp_.ring.assign(static_cast<size_t>(kSlots) * (kRecent / 32), 0xFFFFFFFFU);
+  sp_.plain.assign(2 * n, 0.0);
+  for (int slot = 0; slot < static_cast<int>(last.size()); ++slot) {
+    for (int pos = 0; pos <= last[slot]; ++pos) {
+      if (!is_side(slot, pos)) continue;
+      for (int h = 0; h < kKvHeads; ++h) {
+        for (int role = 0; role < 2; ++role) {
+          double x[kHd], u[kHd], back[kHd];
+          const size_t at = pg.row_at(slot, pos, h);
+          for (int dd = 0; dd < kHd; ++dd) x[dd] = bf16_to_f32((role == 0 ? pg.k : pg.v)[at + dd]);
+          hadamard256(x, u, true);
+          uint16_t *dst = &(role == 0 ? sp_.k : sp_.v)[SidePlanes::index(slot, pos, h)];
+          for (int dd = 0; dd < kHd; ++dd) {
+            dst[dd] = f32_to_bf16(static_cast<float>(u[dd]));
+            u[dd] = bf16_to_f32(dst[dd]);
+          }
+          hadamard256(u, back, false);
+          std::copy(back, back + kHd, &sp_.plain[static_cast<size_t>(role) * n + SidePlanes::index(slot, pos, h)]);
+        }
+      }
+    }
+  }
+  return sp_;
 }
 
 }  // namespace
@@ -281,57 +330,83 @@ int main() {
     check_call("decode, own token fresh", rows, q, dec, run(d, dec, listed(with_fresh), stream), 1);
   }
 
-  // residual: sinks and each lane's recent window [p + 1 - 512, p + 1) from the side planes.
-  {
-    const size_t per_slot = static_cast<size_t>(kSink + kRecent) * kKvHeads * kHd;
-    std::vector<uint16_t> rk(per_slot * kSlots, 0), rv(rk.size(), 0);
-    std::vector<uint32_t> ring(static_cast<size_t>(kSlots) * (kRecent / 32), 0xFFFFFFFFU);
-    std::vector<double> plain_side(rk.size() * 2);  // what the route must return for a side row
-    auto side_index = [&](int slot, int pos, int head) {
-      const int row = pos < kSink ? pos : kSink + (pos & (kRecent - 1));
-      return (static_cast<size_t>(slot) * (kSink + kRecent) + row) * kKvHeads * kHd + static_cast<size_t>(head) * kHd;
-    };
-    auto is_side = [&](int slot, int pos) {
-      const int p = dec.positions[slot];
-      return pos < kSink || (pos >= p + 1 - kRecent && pos <= p);
-    };
-    for (int slot = 0; slot < kSlots; ++slot) {
-      for (int pos = 0; pos <= dec.positions[slot]; ++pos) {
-        if (!is_side(slot, pos)) continue;
-        for (int h = 0; h < kKvHeads; ++h) {
-          for (int role = 0; role < 2; ++role) {
-            double x[kHd], u[kHd], back[kHd];
-            const size_t at = pg.row_at(slot, pos, h);
-            for (int dd = 0; dd < kHd; ++dd) x[dd] = bf16_to_f32((role == 0 ? pg.k : pg.v)[at + dd]);
-            hadamard256(x, u, true);
-            uint16_t *dst = &(role == 0 ? rk : rv)[side_index(slot, pos, h)];
-            for (int dd = 0; dd < kHd; ++dd) {
-              dst[dd] = f32_to_bf16(static_cast<float>(u[dd]));
-              u[dd] = bf16_to_f32(dst[dd]);
-            }
-            hadamard256(u, back, false);
-            std::copy(back, back + kHd, &plain_side[static_cast<size_t>(role) * rk.size() + side_index(slot, pos, h)]);
-          }
-        }
-      }
+  // The side planes as the route will see them: uploaded, and the expected rows.
+  struct Uploaded {
+    DeviceBytes k, v, ring;
+    explicit Uploaded(const SidePlanes &sides) : k(sides.k.size() * 2), v(sides.v.size() * 2), ring(sides.ring.size() * 4) {
+      upload(k, sides.k);
+      upload(v, sides.v);
+      upload(ring, sides.ring);
     }
-    DeviceBytes drk(rk.size() * 2), drv(rv.size() * 2), dring(ring.size() * 4);
-    upload(drk, rk);
-    upload(drv, rv);
-    upload(dring, ring);
-    sp::HqSource with_residual = hq;
-    with_residual.residual_k = drk.as<__nv_bfloat16>();
-    with_residual.residual_v = drv.as<__nv_bfloat16>();
-    with_residual.ring_valid = dring.as<uint32_t>();
-    const RowFn rows = [&](int role, int slot, int pos, int head, double *out) {
-      if (is_side(slot, pos)) {
-        const double *src = &plain_side[static_cast<size_t>(role) * rk.size() + side_index(slot, pos, head)];
+  };
+  auto residual_rows = [&](const SidePlanes &sides, const std::function<bool(int, int)> &is_side,
+                           const std::function<bool(int, int)> &is_fresh) -> RowFn {
+    return [&, is_side, is_fresh](int role, int slot, int pos, int head, double *out) {
+      if (is_fresh(slot, pos)) {
+        exact(role, slot, pos, head, out);
+      } else if (is_side(slot, pos)) {
+        const double *src = &sides.plain[static_cast<size_t>(role) * sides.k.size() + SidePlanes::index(slot, pos, head)];
         std::copy(src, src + kHd, out);
       } else {
         codec(role, slot, pos, head, out);
       }
     };
-    check_call("decode, residual window", rows, q, dec, run(d, dec, listed(with_residual), stream), 1);
+  };
+
+  // residual: sinks and each lane's recent window [p + 1 - 512, p + 1) from the side planes.
+  {
+    const auto is_side = [&](int slot, int pos) {
+      const int p = dec.positions[slot];
+      return pos < kSink || (pos >= p + 1 - kRecent && pos <= p);
+    };
+    const SidePlanes sides = make_side(pg, is_side, {dec.positions[0], dec.positions[1], dec.positions[2]});
+    Uploaded up(sides);
+    sp::HqSource with_residual = hq;
+    with_residual.residual_k = up.k.as<__nv_bfloat16>();
+    with_residual.residual_v = up.v.as<__nv_bfloat16>();
+    with_residual.ring_valid = up.ring.as<uint32_t>();
+    check_call("decode, residual window", residual_rows(sides, is_side, [](int, int) { return false; }), q, dec,
+               run(d, dec, listed(with_residual), stream), 1);
+  }
+
+  // prefill + residual: a 200-token chunk at P = 3000 on a 3000-token history, its own rows
+  // fresh, the ring as it stands BEFORE the call's append (keys [P - 512, P) and the sinks).
+  {
+    constexpr int kP = 3000, kChunk = 200;
+    Call c;
+    c.slots = {0};
+    c.positions = {kP};
+    c.tokens = kChunk;
+    c.max_visible = kP + kChunk;
+    for (int r = 0; r < kChunk; ++r) c.lists.push_back(make_list(kP + r, 7));
+    std::vector<uint16_t> fk(static_cast<size_t>(kChunk) * kKvHeads * kHd), fv(fk.size());
+    for (int r = 0; r < kChunk; ++r) {
+      for (int h = 0; h < kKvHeads; ++h) {
+        const size_t at = pg.row_at(0, kP + r, h);
+        std::copy(&pg.k[at], &pg.k[at] + kHd, &fk[(static_cast<size_t>(r) * kKvHeads + h) * kHd]);
+        std::copy(&pg.v[at], &pg.v[at] + kHd, &fv[(static_cast<size_t>(r) * kKvHeads + h) * kHd]);
+      }
+    }
+    DeviceBytes dfk(fk.size() * 2), dfv(fv.size() * 2);
+    upload(dfk, fk);
+    upload(dfv, fv);
+    const auto is_side = [](int slot, int pos) { return slot == 0 && (pos < kSink || (pos >= kP - kRecent && pos < kP)); };
+    const auto is_fresh = [](int slot, int pos) { return slot == 0 && pos >= kP; };
+    const SidePlanes sides = make_side(pg, is_side, {kP - 1});
+    Uploaded up(sides);
+    sp::HqSource src = hq;
+    src.fresh_k = dfk.as<__nv_bfloat16>();
+    src.fresh_v = dfv.as<__nv_bfloat16>();
+    src.residual_k = up.k.as<__nv_bfloat16>();
+    src.residual_v = up.v.as<__nv_bfloat16>();
+    src.ring_valid = up.ring.as<uint32_t>();
+    DeviceBytes pk(sp::visible_hq_bytes(g, c.max_visible)), pv(sp::visible_hq_bytes(g, c.max_visible));
+    const auto got = run(d, c, [&](const fn::Batch &b, const fn::Selection &sel, cudaStream_t s) {
+      sp::KvSource kv;
+      SP_OK(sp::decode_visible_hq(g, src, b, pk.as<__nv_bfloat16>(), pv.as<__nv_bfloat16>(), &kv, s));
+      SP_OK(sp::attend(g, kv, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
+    }, stream);
+    check_call("prefill, fresh + residual (pre-append)", residual_rows(sides, is_side, is_fresh), q, c, got, 9);
   }
 
   // prefill: one lane's visible rows decoded once per call, the chunk's own rows fresh.

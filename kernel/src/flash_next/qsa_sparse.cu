@@ -17,11 +17,16 @@
 #include "qsa_sparse.h"
 
 #include "ops/kernel/hq_codec.cuh"
+#include "ops/kernel/paged_kv_address.cuh"
 
 #include <cmath>
 
 namespace ignis::flash_next::sparse {
 namespace {
+
+using ninfer::kPagedKVPageSize;
+using ninfer::ops::kPagedKVPageMask;
+using ninfer::ops::kPagedKVPageShift;
 
 constexpr int kThreads = 128;
 constexpr int kPitch = kHeadDim + 8;     // BF16 elements per K/V/Q row in shared memory
@@ -132,8 +137,9 @@ __global__ void __launch_bounds__(kThreads) attend_kernel(AttendArgs a) {
         } else if (a.kv.mode == KvSource::Mode::ByPosition) {
           at = (static_cast<size_t>(pos) * kv_heads + kvh) * kHeadDim;
         } else {
-          const int32_t page = a.kv.block_tables[static_cast<size_t>(slot) * a.kv.logical_pages + (pos >> 6)];
-          at = ((static_cast<size_t>(page) * kv_heads + kvh) * 64 + (pos & 63)) * kHeadDim;
+          const int32_t page =
+              a.kv.block_tables[static_cast<size_t>(slot) * a.kv.logical_pages + (pos >> kPagedKVPageShift)];
+          at = ((static_cast<size_t>(page) * kv_heads + kvh) * kPagedKVPageSize + (pos & kPagedKVPageMask)) * kHeadDim;
         }
         v = *reinterpret_cast<const uint4 *>((role == 0 ? a.kv.k : a.kv.v) + at + part * 8);
       }
@@ -303,7 +309,7 @@ __global__ void __launch_bounds__(kHqThreads) hq_rows_kernel(HqArgs a) {
   } else if (i < a.visible) {
     pos = i;
   }
-  int mode = 0;  // 0 nothing, 1 copied as is, 2 rotated row staged
+  bool rotated_row = false;  // a rotated row waits in staged[u] for the warp's un-rotation
   __nv_bfloat16 *dst = nullptr;
   if (pos >= 0) {
     dst = (role_v ? a.v : a.k) +
@@ -328,7 +334,6 @@ __global__ void __launch_bounds__(kHqThreads) hq_rows_kernel(HqArgs a) {
       for (int j = 0; j < 4; ++j) {
         reinterpret_cast<uint4 *>(dst)[lane8 * 4 + j] = reinterpret_cast<const uint4 *>(src)[lane8 * 4 + j];
       }
-      mode = 1;
     } else if (side) {
       const int32_t side_row = pos < static_cast<int32_t>(kGqaHqSinkKeys)
                                    ? pos
@@ -342,18 +347,20 @@ __global__ void __launch_bounds__(kHqThreads) hq_rows_kernel(HqArgs a) {
       for (int j = 0; j < 4; ++j) {
         reinterpret_cast<uint4 *>(staged[u])[lane8 * 4 + j] = reinterpret_cast<const uint4 *>(src)[lane8 * 4 + j];
       }
-      mode = 2;
+      rotated_row = true;
     } else {
-      const int32_t page = a.hq.block_tables[static_cast<size_t>(slot) * a.hq.logical_pages + (pos >> 6)];
-      const size_t row_at = (static_cast<size_t>(page) * a.hq.kv_heads + head) * 64 + (pos & 63);
+      const int32_t page =
+          a.hq.block_tables[static_cast<size_t>(slot) * a.hq.logical_pages + (pos >> kPagedKVPageShift)];
+      const size_t row_at =
+          (static_cast<size_t>(page) * a.hq.kv_heads + head) * kPagedKVPageSize + (pos & kPagedKVPageMask);
       hq_decode_row_group((role_v ? a.hq.v_codes : a.hq.k_codes) + row_at * kHqRowBudgetBytes,
                           (role_v ? a.hq.v_meta : a.hq.k_meta) + row_at * kHqMetaBytes, staged[u], lane8, 0,
                           hq_dither_row_seed(head, pos, role_v), symbols[u]);
-      mode = 2;
+      rotated_row = true;
     }
   }
   if (lane8 == 0) {
-    rotated[u] = mode == 2;
+    rotated[u] = rotated_row;
     dsts[u] = dst;
   }
   __syncwarp();
@@ -479,6 +486,15 @@ HqArgs hq_args(const HqSource &hq, const Batch &batch, __nv_bfloat16 *k, __nv_bf
 }
 
 }  // namespace
+
+std::size_t scratch_bytes(const Geometry &g, int32_t kv_format, int32_t rows, int32_t tokens, int32_t max_visible) {
+  const auto align = [](std::size_t v) { return (v + 255) / 256 * 256; };
+  std::size_t bytes = align(partial_bytes(g, rows));
+  if (kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
+    bytes += 2 * align(tokens == 1 ? listed_hq_bytes(g, rows) : visible_hq_bytes(g, max_visible));
+  }
+  return bytes;
+}
 
 Status decode_listed_hq(const Geometry &g, const HqSource &hq, const Batch &batch, const Selection &selection,
                         __nv_bfloat16 *k, __nv_bfloat16 *v, KvSource *out, cudaStream_t stream) {

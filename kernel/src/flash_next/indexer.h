@@ -29,6 +29,8 @@
 
 #include "flash_next_internal.h"
 
+#include "core/paged_kv_cache.h"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -41,7 +43,7 @@ namespace ignis::flash_next::indexer {
 inline constexpr int32_t kHeadDim = 128;
 inline constexpr int32_t kRotaryDim = 64;
 inline constexpr int32_t kCompress = 4;
-inline constexpr int32_t kPageTokens = 64;  // ninfer::kPagedKVPageSize
+inline constexpr int32_t kPageTokens = ninfer::kPagedKVPageSize;
 inline constexpr int32_t kBlocksPerPage = kPageTokens / kCompress;
 
 // One attention layer's indexer section, as the kernels address it.

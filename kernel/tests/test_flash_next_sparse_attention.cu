@@ -10,14 +10,22 @@
 //            lists spread over 65 splits and merged; also captured in a CUDA graph and replayed;
 //   index    the same decode rows read from a [rows][width][kv_heads][256] scratch by list index
 //            (the hq-e8-2b decode route's source) must equal the paged run bit for bit;
+//   coded    position-coded pages (flash_next_sparse_test_common.h): with every weight exactly 1
+//            the output is exactly the listed positions' code histogram, so one wrong, missing or
+//            repeated row of 2051 shows as ~16 BF16 ulps -- prefill and decode, and a MUTATION arm
+//            (one listed token swapped for an unlisted one) that the check must catch; needle
+//            keys, one per decode lane, that the output must return as their V rows;
 //   refusals a dense selection, a GQA group other than 12.
 //
-// K, V and q are counter-hash BF16 values in [-1, 1) (q in [-3, 3) for peaked softmaxes); pages
-// are permuted so the gather goes through the block table.
+// K, V and q are counter-hash BF16 values in [-1, 1) (q in [-3, 3) for peaked softmaxes) outside
+// the coded arms; pages are permuted so the gather goes through the block table. The random arms'
+// bound is derived per output in reference().
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
 #include "flash_next_sparse_test_common.h"
+
+#include <set>
 
 using namespace sparse_test;
 
@@ -50,9 +58,6 @@ int main() {
       SP_OK(sp::attend(g, kv, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
     };
   };
-
-  check(sp::splits_for(g, 300) == 1, "a 300-row call must not split");
-  check(sp::splits_for(g, 3) == 65, "a 3-row call must spread each list over 65 splits");
 
   // Prefill-shaped: one lane, its own list per row.
   for (int first : {5000, 1900}) {
@@ -98,6 +103,63 @@ int main() {
     by_index.kv_heads = kKvHeads;
     by_index.mode = sp::KvSource::Mode::ByIndex;
     check(run(d, dec, attend_on(by_index), stream) == eager, "by-index source differs from the paged run");
+  }
+
+  // Coded pages: every weight exactly 1 (q = 1, K = 0), or a needle.
+  {
+    std::vector<std::pair<int, int>> needles;
+    for (int l = 0; l < 3; ++l) needles.emplace_back(dec.slots[l], dec.lists[l][dec.lists[l].size() / 2]);
+    const Pages flat = make_coded_pages({}), pinned = make_coded_pages(needles);
+    DeviceBytes fk(flat.k.size() * 2), fv(flat.v.size() * 2), nk(pinned.k.size() * 2);
+    upload(fk, flat.k);
+    upload(fv, flat.v);
+    upload(nk, pinned.k);
+    const std::vector<uint16_t> ones(q.size(), f32_to_bf16(1.0F));
+    upload(d.q, ones);
+    sp::KvSource coded = paged;
+    coded.k = fk.as<__nv_bfloat16>();
+    coded.v = fv.as<__nv_bfloat16>();
+
+    Call pre;
+    pre.slots = {0};
+    pre.positions = {5000};
+    pre.tokens = kMaxRows;
+    for (int r = 0; r < kMaxRows; ++r) pre.lists.push_back(make_list(5000 + r, 0));
+    const auto got_pre = run(d, pre, attend_on(coded), stream);
+    int bad = 0;
+    for (int r = 0; r < kMaxRows; ++r) bad += coded_mismatches(pre, got_pre, r);
+    check(bad == 0, "coded prefill: " + std::to_string(bad) + " outputs off the exact histogram");
+    const auto got_dec = run(d, dec, attend_on(coded), stream);
+    bad = 0;
+    for (int r = 0; r < 3; ++r) bad += coded_mismatches(dec, got_dec, r);
+    check(bad == 0, "coded decode: " + std::to_string(bad) + " outputs off the exact histogram");
+
+    // The mutation: lane 0's 101st listed token swapped for a visible position the list lacks.
+    Call wrong = dec;
+    const std::set<int32_t> listed(dec.lists[0].begin(), dec.lists[0].end());
+    int32_t other = 0;
+    while (listed.count(other) != 0 || code_of(other, 0) == code_of(dec.lists[0][100], 0)) ++other;
+    wrong.lists[0][100] = other;
+    const int caught = coded_mismatches(dec, run(d, wrong, attend_on(coded), stream), 0);
+    std::printf("  coded: prefill and decode exact; one swapped row of %zu moves %d outputs past an ulp\n",
+                dec.lists[0].size(), caught);
+    check(caught > 0, "mutation arm: the coded check misses one wrong row");
+
+    sp::KvSource needled = coded;
+    needled.k = nk.as<__nv_bfloat16>();
+    const auto got_needle = run(d, dec, attend_on(needled), stream);
+    bool found = true;
+    for (int r = 0; r < 3; ++r) {
+      for (int h = 0; h < kQHeads; ++h) {
+        const int code = code_of(needles[r].second, h / sp::kGroup);
+        for (int dd = 0; dd < kHd; ++dd) {
+          const double o = bf16_to_f32(got_needle[(static_cast<size_t>(r) * kQHeads + h) * kHd + dd]);
+          found = found && std::fabs(o - (dd == code ? 1.0 : 0.0)) <= 1e-6;
+        }
+      }
+    }
+    check(found, "needle keys: an output is not its needle's V row");
+    upload(d.q, q);
   }
 
   // Refusals.

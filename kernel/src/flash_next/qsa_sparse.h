@@ -2,8 +2,10 @@
 // slice S3): OURS (ADR 0043), no port claim. Above dense_threshold() visible tokens every query
 // row attends only to the tokens its indexer selection lists (indexer.h); this is that
 // attention, called by S2's fn_qsa_attention when the Selection is not dense, after its q/k
-// norms, rope and the K/V append, and before its sigmoid gate and o_proj (coordinator,
-// 2026-10-05: one gathered kernel for prefill rows and decode lanes).
+// norms and rope, and before its sigmoid gate and o_proj (coordinator, 2026-10-05: one gathered
+// kernel for prefill rows and decode lanes). BF16 KV: attend after the call's K/V append (it reads
+// the pages). hq-e8-2b KV: decode_listed_hq / decode_visible_hq BEFORE the append, with the call's
+// own rows as fresh (see HqSource), then the append, then attend.
 //
 // The math is the checkpoint's attention restricted to the selected tokens (eager / sdpa with
 // the indexer's mask): for query head h of row r, over the row's listed tokens j,
@@ -64,9 +66,14 @@ struct KvSource {
 // values as S2's dense hq route:
 //   1. fresh: positions at or past the lane's first position in the call come from the call's own
 //      BF16 K/V [rows][kv_heads][head_dim] (plain frame), when given;
-//   2. residual window: positions below kGqaHqSinkKeys, or in the kGqaHqRecentKeys before the
-//      call's first position with their ring bit set, come from the side planes (rotated frame,
-//      [slot][sink + recent][kv_heads][head_dim], ring words [slot][recent / 32]), when given;
+//   2. residual window: positions below kGqaHqSinkKeys, or in the recent window with their ring
+//      bit set, come from the side planes (rotated frame, [slot][sink + recent][kv_heads]
+//      [head_dim], ring words [slot][recent / 32]), when given. With fresh rows the window is the
+//      kGqaHqRecentKeys BEFORE the call's first position, and the decode must run BEFORE the
+//      call's append: the append writes the call's keys into the ring slots of keys
+//      [first - recent, end - recent), which this would read as theirs (the vendored prompt route's
+//      has_fresh rule, attend-first since #258). Without fresh rows the window is the call's last
+//      kGqaHqRecentKeys, its own keys among them, read AFTER the append (the vendored decode rule);
 //   3. otherwise the codec row (code plane [64][64][kv_heads][pages], metadata [8][64][...]),
 //      decoded with the vendored hq_codec.cuh device functions (dither seed (head, position,
 //      role), the engine sign diagonal).
@@ -94,6 +101,13 @@ std::size_t listed_hq_bytes(const Geometry &g, int32_t rows);
 Status decode_visible_hq(const Geometry &g, const HqSource &hq, const Batch &batch, __nv_bfloat16 *k,
                          __nv_bfloat16 *v, KvSource *out, cudaStream_t stream);
 std::size_t visible_hq_bytes(const Geometry &g, int32_t max_visible);
+
+// Everything a QSA layer call of `rows` rows (`tokens` per lane) needs from the arena for the
+// sparse route and the hq decode, at the load's kv_format (enum ignis_kv_format): decode splits'
+// partials, plus under hq-e8-2b both roles' decoded rows -- listed rows for a decode call
+// (tokens == 1), the lane's visible rows up to max_visible for a prefill call (S2's dense hq
+// prefill reads the same). The plan sums the larger of its prefill and decode calls.
+std::size_t scratch_bytes(const Geometry &g, int32_t kv_format, int32_t rows, int32_t tokens, int32_t max_visible);
 
 // The geometry this kernel is written for; anything else is refused by name.
 Status check_geometry(const Geometry &g);
