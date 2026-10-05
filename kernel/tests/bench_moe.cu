@@ -84,21 +84,23 @@ uint32_t mix_k2(int i, const int (&counts)[4]) {
 }
 
 struct Pool {
+  int size = 0;
   DeviceBytes buffer;
   std::vector<ignis_moe_slot> slots;
   std::vector<uint64_t> data_bytes;  // per pool expert: gate/up + down record data, no padding
   explicit Pool(std::size_t total) : buffer(total) {}
 };
 
-std::unique_ptr<Pool> make_pool() {
+// A pool of `size` experts at the study's K mix, or every projection at `uniform_k2`.
+std::unique_ptr<Pool> make_pool(int size, uint32_t uniform_k2) {
   const int gu_counts[4] = {221, 114, 165, 12};
   const int dn_counts[4] = {233, 106, 159, 14};
   std::vector<Record> gu, dn;
   std::size_t total = 0;
   std::vector<std::vector<uint8_t>> blobs;
-  for (int i = 0; i < kPool; ++i) {
-    Record g = make_record(70000 + 4 * i, kH, 2 * kI, mix_k2(i, gu_counts), 0.03f, 0.3f);
-    Record d = make_record(90000 + 4 * i, kI, kH, mix_k2(i * 7 + 1, dn_counts), 0.05f, 0.1f);
+  for (int i = 0; i < size; ++i) {
+    Record g = make_record(70000 + 4 * i, kH, 2 * kI, uniform_k2 ? uniform_k2 : mix_k2(i, gu_counts), 0.03f, 0.3f);
+    Record d = make_record(90000 + 4 * i, kI, kH, uniform_k2 ? uniform_k2 : mix_k2(i * 7 + 1, dn_counts), 0.05f, 0.1f);
     blobs.push_back(g.bytes());
     blobs.push_back(d.bytes());
     total += blobs[blobs.size() - 2].size() + blobs.back().size();
@@ -106,9 +108,10 @@ std::unique_ptr<Pool> make_pool() {
     dn.push_back(std::move(d));
   }
   auto pool = std::make_unique<Pool>(total);
+  pool->size = size;
   pool->slots.assign(static_cast<std::size_t>(kE) * 2, ignis_moe_slot{nullptr, 0, 0});
   std::size_t at = 0;
-  for (int i = 0; i < kPool; ++i) {
+  for (int i = 0; i < size; ++i) {
     for (int p = 0; p < 2; ++p) {
       const auto &blob = blobs[2 * i + p];
       MOE_CUDA(cudaMemcpy(static_cast<char *>(pool->buffer.p) + at, blob.data(), blob.size(), cudaMemcpyHostToDevice));
@@ -123,10 +126,11 @@ std::unique_ptr<Pool> make_pool() {
 }
 
 // `calls` routings of `tokens` tokens, each call's 10 * tokens experts distinct and taken from a
-// window of the pool that the next several calls (>= 300 MB of weights) do not touch.
-std::vector<int32_t> make_calls(int calls, int tokens) {
+// window of the pool that the next several calls (well past the L2) do not touch; `windows` = 1
+// routes every call to the same experts, which then live in the L2.
+std::vector<int32_t> make_calls(int calls, int tokens, int pool_size, int windows = 0) {
   const int width = kTop * tokens;
-  const int windows = kPool / width;
+  if (windows == 0) windows = pool_size / width;
   std::vector<int32_t> ids(static_cast<std::size_t>(calls) * width);
   for (int c = 0; c < calls; ++c) {
     for (int i = 0; i < width; ++i) ids[static_cast<std::size_t>(c) * width + i] = (c % windows) * width + i;
@@ -146,7 +150,7 @@ int main() {
   std::printf("MoE microbenchmark on %s: DRAM roofline %.0f GB/s (theoretical), streaming read %.0f GB/s (%.0f%%), L2 %d MB\n",
               prop.name, roof, sustained, 100.0 * sustained / roof, prop.l2CacheSize >> 20);
 
-  const auto pool = make_pool();
+  const auto pool = make_pool(kPool, 0);
   {
     const int gu_counts[4] = {221, 114, 165, 12};
     const int dn_counts[4] = {233, 106, 159, 14};
@@ -197,7 +201,7 @@ int main() {
   bool floor_ok = true;
   for (int tokens : {1, 2, 3}) {
     const int calls = 320;
-    const std::vector<int32_t> ids = make_calls(calls, tokens);
+    const std::vector<int32_t> ids = make_calls(calls, tokens, kPool);
     std::vector<float> w(ids.size(), 0.1f);
     DeviceBytes dids(ids.size() * 4), dw(w.size() * 4);
     upload(dids, ids);
@@ -222,6 +226,42 @@ int main() {
     std::printf("  routed decode, %d token(s): %.1f us per layer, %.2f MB read, %.0f GB/s = %.1f%% of roofline (%.1f%% of streaming read)\n",
                 tokens, us, bytes / 1e6, gbs, 100.0 * gbs / roof, 100.0 * gbs / sustained);
     if (tokens == 1 && gbs < kDecodeFloor * roof) floor_ok = false;
+  }
+
+  // Diagnostics for the 1-token decode: the same experts every call (weights in the L2, so the
+  // DRAM is out of the picture), and pools of one K class (all K = 2 against all K = 4: twice the
+  // bytes for the same weights -- time that follows the bytes is memory-bound, time that does not
+  // is compute- or latency-bound).
+  auto decode_us = [&](const Pool &pl, int windows, double *mb) {
+    DeviceBytes slots(pl.slots.size() * sizeof(ignis_moe_slot));
+    upload(slots, pl.slots);
+    const int calls = 256;
+    const std::vector<int32_t> ids = make_calls(calls, 1, pl.size, windows);
+    std::vector<float> w(ids.size(), 0.1f);
+    DeviceBytes dids(ids.size() * 4), dw(w.size() * 4);
+    upload(dids, ids);
+    upload(dw, w);
+    double bytes = 0.0;
+    for (int c = 0; c < calls; ++c) {
+      for (int r = 0; r < kTop; ++r) bytes += static_cast<double>(pl.data_bytes[ids[static_cast<std::size_t>(c) * kTop + r]]);
+    }
+    *mb = bytes / calls / 1e6;
+    return time_us(calls, [&](int c, cudaStream_t st) {
+      MOE_RC(ignis_moe_experts_decode(dx.p, 1, dids.as<int32_t>() + static_cast<std::size_t>(c) * kTop,
+                                      dw.as<float>() + static_cast<std::size_t>(c) * kTop, slots.as<ignis_moe_slot>(),
+                                      workspace.p, acc.as<int64_t>(), st));
+    });
+  };
+  {
+    double mb = 0.0;
+    const double l2 = decode_us(*pool, 1, &mb);
+    std::printf("  diagnostic: 1-token decode with its experts L2-resident: %.1f us (%.2f MB)\n", l2, mb);
+    for (uint32_t k2 : {4u, 8u}) {
+      const auto uniform = make_pool(128, k2);
+      const double us = decode_us(*uniform, 0, &mb);
+      std::printf("  diagnostic: 1-token decode, every projection at K = %g: %.1f us for %.2f MB = %.0f GB/s\n", k2 / 2.0, us, mb,
+                  mb * 1e6 / (us * 1e-6) / 1e9);
+    }
   }
 
   // The other ops, each over copies that together exceed the L2 so the weights come from DRAM.

@@ -1,28 +1,35 @@
 // ignis kernel leaf: Flash-Next's routed experts for 1..8 decode tokens, in ONE launch for all
 // experts and all four K -- OURS (kernel/include/ignis_moe.h).
 //
-// The launch is a persistent grid that takes work units by ticket from a counter in the
-// workspace. Tickets [0, nA) are gate/up units, [nA, nA + nB) down units:
+// The launch is a persistent grid (two CTAs per SM) that takes work units by ticket from a
+// counter in the workspace. Every unit is the same shape: 640 inputs against one block of 128
+// output columns, one 16-column tile per warp, the tokens as MMA rows. Tickets [0, nA) are
+// gate/up units, [nA, nA + nB) down units:
 //
-//   gate/up unit (expert u, output block b in 0..4, k-split s in 0..3)
-//       inputs 640s .. 640s + 639 of the fused gate/up plane against output columns
-//       [128b, 128b + 128) (gate) and [640 + 128b, ...) (up). The CTA rotates the tokens'
-//       inputs (x o suh, then the 128-wide Hadamard), scales each token's rotated row by a power
-//       of two into fp16 range, and runs m16n8k16 MMAs with the tokens as rows and the weights
-//       decoded from the trellis straight into B fragments in registers. Its fp32 partials go to
-//       the workspace; the CTA that completes (u, b) last -- counted by an integer arrival
-//       counter -- sums the four partials in split order, applies the output Hadamard and svh,
-//       SwiGLU, and writes 128 entries of the expert's intermediate h, then bumps h_ready[u].
-//   down unit (expert u, output block c in 0..19)
-//       waits for h_ready[u] == 5, rotates h o suh_down the same way, multiplies against output
-//       columns [128c, 128c + 128) of down, applies the output Hadamard and svh, and adds
-//       weight x value for every token that selected u into the fixed-point accumulator.
+//   gate/up unit (expert u, column block cb in 0..9, k-split s in 0..3)
+//       columns [128 cb, 128 cb + 128) of the fused plane (cb < 5: gate block cb; cb >= 5: up
+//       block cb - 5) over inputs 640s .. 640s + 639. The CTA rotates the tokens' inputs (x o suh,
+//       then the 128-wide Hadamard), scales each row by a power of two into fp16 range, and runs
+//       m16n8k16 MMAs on weights decoded from the trellis straight into B fragments. Its
+//       pre-rotation sums are added into an int64 fixed-point accumulator; the eighth arrival on
+//       output block b (gate and up, four splits each) reads gate and up back, rotates them,
+//       applies svh and SwiGLU, writes 128 entries of the expert's h, zeroes what it read and
+//       bumps h_ready[u].
+//   down unit (expert u, column block c in 0..19)
+//       issues its weight loads, waits for h_ready[u] == 5, rotates h o suh_down the same way,
+//       multiplies, applies the output Hadamard and svh, and adds weight x value for every token
+//       that selected u into the fixed-point output accumulator.
+//
+// Memory-level parallelism is the point of the shape: a warp's tile is 64-128 contiguous bytes,
+// so each lane loads ONE u32 word of each of its 40 tiles -- every load of the unit is in flight
+// at once, in 40 registers -- and takes the two words its decode window needs from its
+// neighbours with shuffles.
 //
 // A down ticket is only handed out after every gate/up ticket has been taken by a running CTA,
 // and gate/up units wait on nothing, so the wait cannot deadlock whatever the residency.
-// Deterministic by construction: every floating-point sum has a fixed order, the cross-CTA
-// sums are integer, and nothing reads the slot address except to load from it. The last CTA
-// out resets the counters, so the launch replays from a CUDA graph.
+// Deterministic by construction: every floating-point sum inside a unit has a fixed order, the
+// cross-unit sums are integer, and nothing reads the slot address except to load from it. The
+// last CTA out resets the counters, so the launch replays from a CUDA graph.
 
 #include "moe_common.cuh"
 #include "moe_workspace.cuh"
@@ -40,7 +47,6 @@ constexpr int kWarps = kThreads / 32;
 constexpr int kSplitK = kHidden / kDecodeSplits;  // 640: the k range of every unit, both kinds
 constexpr int kKTiles = kSplitK / 16;              // 40
 constexpr int kAStride = kSplitK + 8;              // fp16 per A row, padded off the bank stride
-constexpr int kGroup = 8;                          // k-tiles of weight words in flight per warp
 
 struct Shared {
   int n_unique;
@@ -145,63 +151,38 @@ __device__ void prepare_a(Shared &s, int tokens, const __half *suh, In in) {
   __syncthreads();
 }
 
-// acc[n] += A(tokens x 640) . W(640 x 16) for the warp's NT tiles, tile (kt, n) at
-// base[n] + kt * stride u32 words. Weight words are loaded a group of k-tiles ahead.
-template <int K2, int NT>
-__device__ __forceinline__ void mma_k_loop(const Shared &s, int tokens, const uint32_t *const *base,
-                                           int stride, const ignis_trellis::LanePlan &plan,
-                                           float (&acc)[NT][2][4]) {
+// The lane's word of each of the warp's 40 tiles, tile kt at base + kt * stride u32 words.
+template <int K2>
+__device__ __forceinline__ void load_tiles(const uint32_t *base, int stride, uint32_t (&words)[kKTiles]) {
+  constexpr int tile_words = ignis_trellis::tile_words(K2);
+  const int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int kt = 0; kt < kKTiles; ++kt) words[kt] = lane < tile_words ? __ldg(base + kt * stride + lane) : 0u;
+}
+
+// acc += A(tokens x 640) . W(640 x 16) for the warp's tile, from the words load_tiles fetched.
+template <int K2>
+__device__ __forceinline__ void mma_tiles(const Shared &s, int tokens, const uint32_t (&words)[kKTiles],
+                                          float (&acc)[2][4]) {
   const int lane = threadIdx.x & 31;
   const int g = lane >> 2;
   const int c = lane & 3;
   const bool row = g < tokens;
-  uint32_t cur[kGroup][NT][2];
-  uint32_t nxt[kGroup][NT][2];
+  const ignis_trellis::LanePlan plan = ignis_trellis::lane_plan(K2, lane);
 #pragma unroll
-  for (int i = 0; i < kGroup; ++i) {
-#pragma unroll
-    for (int n = 0; n < NT; ++n) {
-      const uint32_t *t = base[n] + i * stride;
-      cur[i][n][0] = __ldg(t + plan.w0);
-      cur[i][n][1] = __ldg(t + plan.w1);
+  for (int kt = 0; kt < kKTiles; ++kt) {
+    const uint32_t w0 = __shfl_sync(0xFFFFFFFFu, words[kt], plan.w0);
+    const uint32_t w1 = __shfl_sync(0xFFFFFFFFu, words[kt], plan.w1);
+    uint32_t frag[4];
+    ignis_trellis::decode_fragment<K2>(w0, w1, plan, frag);
+    const int k = kt * 16 + 2 * c;
+    uint32_t a[4] = {0u, 0u, 0u, 0u};
+    if (row) {
+      a[0] = *reinterpret_cast<const uint32_t *>(&s.a[g][k]);
+      a[2] = *reinterpret_cast<const uint32_t *>(&s.a[g][k + 8]);
     }
-  }
-  for (int grp = 0; grp < kKTiles / kGroup; ++grp) {
-    if (grp + 1 < kKTiles / kGroup) {
-#pragma unroll
-      for (int i = 0; i < kGroup; ++i) {
-#pragma unroll
-        for (int n = 0; n < NT; ++n) {
-          const uint32_t *t = base[n] + ((grp + 1) * kGroup + i) * stride;
-          nxt[i][n][0] = __ldg(t + plan.w0);
-          nxt[i][n][1] = __ldg(t + plan.w1);
-        }
-      }
-    }
-#pragma unroll
-    for (int i = 0; i < kGroup; ++i) {
-      const int k = (grp * kGroup + i) * 16 + 2 * c;
-      uint32_t a[4] = {0u, 0u, 0u, 0u};
-      if (row) {
-        a[0] = *reinterpret_cast<const uint32_t *>(&s.a[g][k]);
-        a[2] = *reinterpret_cast<const uint32_t *>(&s.a[g][k + 8]);
-      }
-#pragma unroll
-      for (int n = 0; n < NT; ++n) {
-        uint32_t frag[4];
-        ignis_trellis::decode_fragment<K2>(cur[i][n][0], cur[i][n][1], plan, frag);
-        mma_f16(acc[n][0], a, frag[0], frag[1]);
-        mma_f16(acc[n][1], a, frag[2], frag[3]);
-      }
-    }
-#pragma unroll
-    for (int i = 0; i < kGroup; ++i) {
-#pragma unroll
-      for (int n = 0; n < NT; ++n) {
-        cur[i][n][0] = nxt[i][n][0];
-        cur[i][n][1] = nxt[i][n][1];
-      }
-    }
+    mma_f16(acc[0], a, frag[0], frag[1]);
+    mma_f16(acc[1], a, frag[2], frag[3]);
   }
 }
 
@@ -212,13 +193,13 @@ struct Params {
   const float *weights;
   const ignis_moe_slot *slots;
   DecodeCounters *counters;
-  float *partials;
+  long long *gate_up;  // int64 [unique][8 tokens][1280], fixed point, zero between calls
   float *h;
   long long *acc;
 };
 
 template <int K2>
-__device__ void gate_up_unit(Shared &s, const Params &p, int u, int b, int split, const ignis_moe_slot &slot) {
+__device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int split, const ignis_moe_slot &slot) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tokens = p.tokens;
@@ -227,61 +208,49 @@ __device__ void gate_up_unit(Shared &s, const Params &p, int u, int b, int split
                                                        trellis_bytes(kHidden, kGateUpOut, K2));
   const __half *svh = suh + kHidden;
   const int k0 = split * kSplitK;
+  constexpr int words = ignis_trellis::tile_words(K2);
+  constexpr int tiles_n = kGateUpOut / 16;
 
+  // Every weight load of the unit first; the rotation overlaps them.
+  uint32_t w[kKTiles];
+  load_tiles<K2>(trellis + (static_cast<size_t>(k0 / 16) * tiles_n + 8 * cb + warp) * words, tiles_n * words, w);
   prepare_a(s, tokens, suh + k0, [&](int t, int k) {
     return __bfloat162float(p.x[static_cast<size_t>(t) * kHidden + k0 + k]);
   });
-
-  // Warp w owns local tiles 2w, 2w + 1: 0..7 are gate columns 128b.., 8..15 up columns.
-  constexpr int words = ignis_trellis::tile_words(K2);
-  constexpr int tiles_n = kGateUpOut / 16;
-  const uint32_t *base[2];
-  int local[2];
-#pragma unroll
-  for (int n = 0; n < 2; ++n) {
-    local[n] = 2 * warp + n;
-    const int tn = local[n] < 8 ? 8 * b + local[n] : kInter / 16 + 8 * b + (local[n] - 8);
-    base[n] = trellis + (static_cast<size_t>(k0 / 16) * tiles_n + tn) * words;
-  }
-  const ignis_trellis::LanePlan plan = ignis_trellis::lane_plan(K2, lane);
-  float acc[2][2][4] = {};
-  mma_k_loop<K2, 2>(s, tokens, base, tiles_n * words, plan, acc);
+  float acc[2][4] = {};
+  mma_tiles<K2>(s, tokens, w, acc);
 
   const int g = lane >> 2;
   const int c = lane & 3;
   if (g < tokens) {
     const float inv = 1.0f / s.scale[g];
-    float *dst = p.partials + ((static_cast<size_t>(u) * kGateUpBlocks + b) * kDecodeSplits + split) * kDecodeMaxTokens * 256 +
-                 static_cast<size_t>(g) * 256;
+    long long *dst = p.gate_up + (static_cast<size_t>(u) * kDecodeMaxTokens + g) * kGateUpOut + 128 * cb + warp * 16 + 2 * c;
 #pragma unroll
-    for (int n = 0; n < 2; ++n) {
-#pragma unroll
-      for (int hf = 0; hf < 2; ++hf) {
-        const int col = local[n] * 16 + hf * 8 + 2 * c;
-        *reinterpret_cast<float2 *>(dst + col) = make_float2(acc[n][hf][0] * inv, acc[n][hf][1] * inv);
-      }
+    for (int hf = 0; hf < 2; ++hf) {
+      add_fixed(dst + hf * 8, acc[hf][0] * inv);
+      add_fixed(dst + hf * 8 + 1, acc[hf][1] * inv);
     }
   }
   __threadfence();
   __syncthreads();
+  const int b = cb % kGateUpBlocks;
   if (threadIdx.x == 0) {
     const uint32_t before = atomicAdd(&p.counters->gate_up_arrivals[u * kGateUpBlocks + b], 1u);
-    s.is_last = before == kDecodeSplits - 1;
+    s.is_last = before == 2 * kDecodeSplits - 1;
   }
   __syncthreads();
   if (!s.is_last) return;
 
-  // Last arrival for (u, b): sum the splits in order, rotate back, scale, SwiGLU.
+  // Eighth arrival for (u, b): read gate and up back, rotate, scale, SwiGLU; zero what was read.
   __threadfence();
   float(*y)[256] = reinterpret_cast<float(*)[256]>(&s.xh[0][0]);
-  const float *part = p.partials + (static_cast<size_t>(u) * kGateUpBlocks + b) * kDecodeSplits * kDecodeMaxTokens * 256;
+  long long *row = p.gate_up + static_cast<size_t>(u) * kDecodeMaxTokens * kGateUpOut;
   for (int i = threadIdx.x; i < tokens * 256; i += blockDim.x) {
     const int t = i / 256;
     const int col = i % 256;
-    float sum = 0.0f;
-#pragma unroll
-    for (int sp = 0; sp < kDecodeSplits; ++sp) sum += __ldcg(part + (static_cast<size_t>(sp) * kDecodeMaxTokens + t) * 256 + col);
-    y[t][col] = sum;
+    long long *at = row + static_cast<size_t>(t) * kGateUpOut + (col < 128 ? 0 : kInter) + 128 * b + (col & 127);
+    y[t][col] = from_fixed(__ldcg(at));
+    *at = 0;
   }
   __syncthreads();
   for (int q2 = warp; q2 < 2 * tokens; q2 += kWarps) {
@@ -321,32 +290,32 @@ __device__ void down_unit(Shared &s, const Params &p, int u, int cb, const ignis
   const __half *suh = reinterpret_cast<const __half *>(static_cast<const char *>(slot.record) +
                                                        trellis_bytes(kInter, kHidden, K2));
   const __half *svh = suh + kInter;
+  constexpr int words = ignis_trellis::tile_words(K2);
+  constexpr int tiles_n = kHidden / 16;
 
+  // The weights do not depend on h: their loads are in flight while the unit waits for it.
+  uint32_t w[kKTiles];
+  load_tiles<K2>(trellis + static_cast<size_t>(8 * cb + warp) * words, tiles_n * words, w);
   if (threadIdx.x == 0) {
     while (ld_acquire(&p.counters->h_ready[u]) < static_cast<uint32_t>(kGateUpBlocks)) __nanosleep(64);
   }
   __syncthreads();
   const float *h = p.h + static_cast<size_t>(u) * kDecodeMaxTokens * kInter;
   prepare_a(s, tokens, suh, [&](int t, int k) { return __ldcg(h + static_cast<size_t>(t) * kInter + k); });
-
-  constexpr int words = ignis_trellis::tile_words(K2);
-  constexpr int tiles_n = kHidden / 16;
-  const uint32_t *base[1] = {trellis + static_cast<size_t>(8 * cb + warp) * words};
-  const ignis_trellis::LanePlan plan = ignis_trellis::lane_plan(K2, lane);
-  float acc[1][2][4] = {};
-  mma_k_loop<K2, 1>(s, tokens, base, tiles_n * words, plan, acc);
+  float acc[2][4] = {};
+  mma_tiles<K2>(s, tokens, w, acc);
 
   float(*y)[128] = reinterpret_cast<float(*)[128]>(&s.xh[0][0]);
   const int g = lane >> 2;
   const int c = lane & 3;
-  __syncthreads();  // everyone is done reading s.a / s.xh's rows before they are reused
+  __syncthreads();  // every warp is done reading s.xh's rotated rows before y reuses them
   if (g < tokens) {
     const float inv = 1.0f / s.scale[g];
 #pragma unroll
     for (int hf = 0; hf < 2; ++hf) {
       const int col = warp * 16 + hf * 8 + 2 * c;
-      y[g][col] = acc[0][hf][0] * inv;
-      y[g][col + 1] = acc[0][hf][1] * inv;
+      y[g][col] = acc[hf][0] * inv;
+      y[g][col + 1] = acc[hf][1] * inv;
     }
   }
   __syncthreads();
@@ -356,21 +325,21 @@ __device__ void down_unit(Shared &s, const Params &p, int u, int cb, const ignis
 #pragma unroll
     for (int q = 0; q < 4; ++q) v[q] = y[t][4 * lane + q];
     warp_hadamard128(v);
-    const float w = s.unique_w[u][t];
+    const float wt = s.unique_w[u][t];
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
       const int col = 128 * cb + 4 * lane + q;
-      add_fixed(p.acc + static_cast<size_t>(t) * kHidden + col, w * (v[q] * __half2float(svh[col])));
+      add_fixed(p.acc + static_cast<size_t>(t) * kHidden + col, wt * (v[q] * __half2float(svh[col])));
     }
   }
   __syncthreads();
 }
 
-__global__ void __launch_bounds__(kThreads) experts_decode_kernel(Params p) {
+__global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
   __shared__ Shared s;
   build_unique(s, p.ids, p.weights, p.tokens);
   const int n_unique = s.n_unique;
-  const int n_gate_up = n_unique * kGateUpBlocks * kDecodeSplits;
+  const int n_gate_up = n_unique * 2 * kGateUpBlocks * kDecodeSplits;
   const int n_total = n_gate_up + n_unique * kDownBlocks;
   for (;;) {
     if (threadIdx.x == 0) s.ticket = static_cast<int>(atomicAdd(&p.counters->ticket, 1u));
@@ -379,15 +348,15 @@ __global__ void __launch_bounds__(kThreads) experts_decode_kernel(Params p) {
     __syncthreads();
     if (ticket >= n_total) break;
     if (ticket < n_gate_up) {
-      const int u = ticket / (kGateUpBlocks * kDecodeSplits);
-      const int b = ticket / kDecodeSplits % kGateUpBlocks;
+      const int u = ticket / (2 * kGateUpBlocks * kDecodeSplits);
+      const int cb = ticket / kDecodeSplits % (2 * kGateUpBlocks);
       const int split = ticket % kDecodeSplits;
       const ignis_moe_slot slot = load_slot(p.slots, s.unique_id[u], IGNIS_MOE_PROJ_GATE_UP);
       switch (slot.k2) {
-      case 4: gate_up_unit<4>(s, p, u, b, split, slot); break;
-      case 5: gate_up_unit<5>(s, p, u, b, split, slot); break;
-      case 6: gate_up_unit<6>(s, p, u, b, split, slot); break;
-      default: gate_up_unit<8>(s, p, u, b, split, slot); break;
+      case 4: gate_up_unit<4>(s, p, u, cb, split, slot); break;
+      case 5: gate_up_unit<5>(s, p, u, cb, split, slot); break;
+      case 6: gate_up_unit<6>(s, p, u, cb, split, slot); break;
+      default: gate_up_unit<8>(s, p, u, cb, split, slot); break;
       }
     } else {
       const int d = ticket - n_gate_up;
@@ -472,7 +441,7 @@ extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, cons
   p.weights = weights;
   p.slots = slots;
   p.counters = reinterpret_cast<DecodeCounters *>(ws + l.decode_counters);
-  p.partials = reinterpret_cast<float *>(ws + l.decode_partials);
+  p.gate_up = reinterpret_cast<long long *>(ws + l.decode_gate_up);
   p.h = reinterpret_cast<float *>(ws + l.decode_h);
   p.acc = reinterpret_cast<long long *>(acc);
   experts_decode_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(p);

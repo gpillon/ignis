@@ -339,14 +339,14 @@ mod tests {
     #[test]
     fn plan_lines_at_a_4096_token_chunk() {
         // By hand from the layout (kernel/src/moe_workspace.cuh) at 4096 tokens: decode counters
-        // 2,048 + partials 13,107,200 + h 1,638,400; prefill chunk histograms 131,072, expert
+        // 2,048 + gate/up sums 6,553,600 + h 1,638,400; prefill chunk histograms 131,072, expert
         // offsets 2,304, item count 256, 1,152 items 9,216, sorted rows 163,840, h 104,857,600.
         let plan = plan_bytes(4096).unwrap();
-        assert_eq!(plan.workspace, 119_911_936);
+        assert_eq!(plan.workspace, 113_358_336);
         assert_eq!(plan.acc, 4096 * 2560 * 8);
         assert_eq!(plan.router, 163_840 + 163_840 + 8_388_608);
         assert_eq!(plan.shared, 5_242_880 + 41_943_040);
-        assert_eq!(plan.total, 259_700_224);
+        assert_eq!(plan.total, 253_146_624);
         assert!(plan_bytes(0).is_err());
     }
 
