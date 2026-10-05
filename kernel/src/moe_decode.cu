@@ -2,9 +2,9 @@
 // experts and all four K -- OURS (kernel/include/ignis_moe.h).
 //
 // The launch is a persistent grid (two CTAs per SM) that takes work units by ticket from a
-// counter in the workspace. Every unit is the same shape: 640 inputs against one block of 128
-// output columns, one 16-column tile per warp, the tokens as MMA rows. Tickets [0, nA) are
-// gate/up units, [nA, nA + nB) down units:
+// counter in the workspace, each CTA one ticket ahead of the unit it is running. Every unit is
+// the same shape: 640 inputs against one block of 128 output columns, one 16-column tile per
+// warp, the tokens as MMA rows. Tickets [0, nA) are gate/up units, [nA, nA + nB) down units:
 //
 //   gate/up unit (expert u, column block cb in 0..9, k-split s in 0..3)
 //       columns [128 cb, 128 cb + 128) of the fused plane (cb < 5: gate block cb; cb >= 5: up
@@ -341,12 +341,17 @@ __global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
   const int n_unique = s.n_unique;
   const int n_gate_up = n_unique * 2 * kGateUpBlocks * kDecodeSplits;
   const int n_total = n_gate_up + n_unique * kDownBlocks;
-  for (;;) {
-    if (threadIdx.x == 0) s.ticket = static_cast<int>(atomicAdd(&p.counters->ticket, 1u));
-    __syncthreads();
-    const int ticket = s.ticket;
-    __syncthreads();
-    if (ticket >= n_total) break;
+  if (threadIdx.x == 0) s.ticket = static_cast<int>(atomicAdd(&p.counters->ticket, 1u));
+  __syncthreads();
+  int ticket = s.ticket;
+  __syncthreads();
+  while (ticket < n_total) {
+    // The next ticket is taken now and read after this unit, so its round trip overlaps the
+    // unit's work. Still deadlock-free: a CTA's prefetched ticket is later than its current one,
+    // so every gate/up ticket is held by a CTA whose current unit is gate/up, which waits on
+    // nothing.
+    uint32_t next = 0;
+    if (threadIdx.x == 0) next = atomicAdd(&p.counters->ticket, 1u);
     if (ticket < n_gate_up) {
       const int u = ticket / (2 * kGateUpBlocks * kDecodeSplits);
       const int cb = ticket / kDecodeSplits % (2 * kGateUpBlocks);
@@ -371,6 +376,9 @@ __global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
       }
     }
     __syncthreads();
+    if (threadIdx.x == 0) s.ticket = static_cast<int>(next);
+    __syncthreads();
+    ticket = s.ticket;
   }
   // The last CTA out leaves the counters as it found them, so the launch replays.
   if (threadIdx.x == 0) {
