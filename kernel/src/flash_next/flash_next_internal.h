@@ -201,7 +201,8 @@ int32_t fn_linear(const Linear &w, const void *x, int32_t rows, void *y, bool y_
 struct GdnWeights {
   Linear in_proj_qkv;  // [q 2048 + k 2048 + v 6144, hidden]
   Linear in_proj_z;    // [6144, hidden]
-  Linear in_proj_ab;   // [a 48 + b 48, hidden]: in_proj_a then in_proj_b, row-concatenated at load
+  Linear in_proj_a;    // [value_heads, hidden] (FP8: 48 rows reach the converter's FP8 minimum)
+  Linear in_proj_b;    // [value_heads, hidden]
   const void *conv = nullptr;     // BF16 conv1d [10240][kernel]
   const void *a_log = nullptr;    // BF16 [value_heads]
   const void *dt_bias = nullptr;  // BF16 [value_heads]
