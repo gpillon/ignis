@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-10-05
-- Last verified: 2026-10-05
+- Last verified: 2026-10-06
 - Scope: kernel / Flash-Next routed-expert decode (`kernel/src/moe_decode.cu`)
 - Related: [GitHub #300](https://github.com/gpillon/ignis/issues/300),
   [spec flash-next/02](../specs/flash-next/02-the-moe-kernels.md) (Acceptance 6),
@@ -31,6 +31,8 @@ measured 1,531-1,677 GB/s in the same runs.
 | + next ticket taken during the unit (76cff4c) | 25.6 us, 33.5% | 42.2% | 48.3% | 21.1 us | 22.5 / 28.3 us |
 | variant: 80 regs, 3 CTAs/SM, rotation scale from a norm bound | 35.6 us | — | — | 29.9 us | 33.6 / 34.2 us |
 | variant: 128 regs, 2 CTAs/SM, norm-bound scale | 29.5 us | — | — | 23.3 us | 26.7 / 32.6 us |
+| tickets again, session 2 (2026-10-06; streaming read 1,390 GB/s that run) | 26.4 us, 32.5% | 38.9% | 45.0% | 24.7 us | 23.9 / 31.3 us |
+| clusters: one 8-CTA thread-block cluster per expert, DSMEM reductions (d6bb40c), same run | 38.3 us, 22.4% | 21.3% | 26.7% | 32.8 us | 36.8 / 40.1 us |
 
 `cuobjdump --dump-resource-usage` / `-sass` on the object: the inner loop is the designed
 ~5 instructions per weight (SHF, LOP3, IMAD, IDP4A per state, PRMT + HFMA2 per pair), no spills
@@ -48,6 +50,12 @@ in the measured versions.
 - Raising occupancy by cutting registers (3 CTAs/SM) made it slower: the compiler sinks the
   weight loads towards their uses under register pressure, and the per-unit fixed latency grows.
 - More tokens amortize the structure: three tokens reach 48.3% of the roofline.
+- One cluster per expert (plan item 1) is slower, 38.3 us. The card does not co-schedule ten
+  16-CTA clusters (`ignis_moe_decode_cluster_size` falls back to the portable 8), so a token's
+  ten experts run on 80 CTAs -- about half the 170 SMs -- and each CTA streams an eighth of an
+  expert serially; with the weights in the L2 it still takes 32.8 us. Removing the reduction
+  stage and the tickets does not pay for losing half the card: at one token the expert count
+  (ten) times the cluster size that fits a GPC caps the SMs a cluster-per-expert launch uses.
 
 ## Implications
 
@@ -66,4 +74,8 @@ shares some, which helps the multi-token figures.
 
 ## Follow-ups
 
-Acceptance 6 of spec flash-next/02 stays open; the bench's `--check-floor` is the check.
+Acceptance 6 of spec flash-next/02 stays open; the bench's `--check-floor` is the check. The
+ticket route stays the default (`ignis_moe_workspace::decode_route`); the cluster route is kept,
+tested on both routes, for the shapes where experts outnumber what one wave of tickets covers.
+Plan item 2 (the gate/up reduction folded into the down units, cp.async-staged unit weights)
+is the next candidate.
