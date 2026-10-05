@@ -452,6 +452,11 @@ fn tensor_view(
             let g = row_scale_geometry(tensor.format, &tensor.shape)?;
             (None, Some(g.scale_plane_offset), None)
         }
+        // Flash-Next's expert projections and n-gram table: the Flash-Next
+        // plan puts them in the host pool or streams them, never in the
+        // device arena, and their planes are each record's own (the
+        // geometry functions name them). A device view carries the base.
+        StorageLayout::TrellisTile16V1 | StorageLayout::RowInterleavedV1 => (None, None, None),
     };
     Ok(TensorView {
         name: tensor.name.clone(),
