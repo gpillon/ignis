@@ -28,7 +28,7 @@ use crate::residency::{
     residency_table_bytes, ExpertCacheRequest, ExpertTraffic, KClass,
 };
 use crate::seq::{SeqPool, SeqPoolBudget};
-use crate::step::{capture_decode_graphs, decode_flash_next, prefill_flash_next};
+use crate::step::{capture_decode_graphs, decode_flash_next, prefill_flash_next, SamplingParams};
 
 /// The prefetch lookahead residency ranks per lane: the next layer's top 16.
 pub const LOOKAHEAD_WIDTH: u32 = 16;
@@ -216,7 +216,17 @@ impl FlashNextEngine {
             logits.resize(piece.len() * vocab, 0);
             let ids: Vec<i32> = piece.iter().map(|&t| t as i32).collect();
             let start = (index * chunk) as u64;
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, start, None, &rows, Some(&mut logits))?;
+            prefill_flash_next(
+                &self.model,
+                &self.pool,
+                &mut seq,
+                &ids,
+                start,
+                SamplingParams::greedy(),
+                &[],
+                &rows,
+                Some(&mut logits),
+            )?;
             sink(index * chunk, &logits)?;
         }
         Ok(())
@@ -237,7 +247,7 @@ impl FlashNextEngine {
             let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
             self.table.stage(&mut context, prompt, &mut rows)?;
             let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, &rows, None)?;
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], &rows, None)?;
             seqs.push(seq);
             contexts.push(context);
         }
@@ -252,8 +262,9 @@ impl FlashNextEngine {
                 contexts.iter_mut().zip(pending.iter()).map(|(c, t)| (c, &t[..])).collect();
             self.table.begin_batch(&mut lanes)?.finish(&mut rows)?;
             let mut handles: Vec<_> = seqs.iter_mut().collect();
-            let emitted = decode_flash_next(&self.model, &self.pool, &mut handles, &[], &rows)?;
-            for (lane, token) in emitted.into_iter().enumerate() {
+            let greedy = vec![(SamplingParams::greedy(), &[][..]); handles.len()];
+            let emitted = decode_flash_next(&self.model, &self.pool, &mut handles, &greedy, &rows)?;
+            for (lane, (token, _)) in emitted.into_iter().enumerate() {
                 out[lane].push(token as u32);
             }
         }

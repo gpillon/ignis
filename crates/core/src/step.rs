@@ -815,39 +815,44 @@ pub fn prefill_program_span_logits(
     Ok(())
 }
 
-/// GitHub #302: one span of a Flash-Next sequence, greedy or under
-/// `sampling` (`None`: greedy), with the span's n-gram table rows
-/// (`ngram_rows`: `[token_ids.len()][16][90]`, as
-/// `NgramTable::begin(..).finish(..)` stages them) and, with
-/// `out_span_logits`, the BF16 logits of every position
-/// (`[token_ids.len()][vocab]`, as [`prefill_program_span_logits`]).
+/// GitHub #302: one span of a Flash-Next sequence, its last position's
+/// successor drawn under `sampling` (restricted to `permitted` when it is
+/// not empty), with the span's n-gram table rows (`ngram_rows`:
+/// `[token_ids.len()][16][90]`, as `NgramTable::begin(..).finish(..)` stages
+/// them) and, with `out_span_logits`, the BF16 logits of every position
+/// (`[token_ids.len()][vocab]`, as [`prefill_program_span_logits`]). Returns
+/// the drawn token's probability within its permitted set (0 without one).
+#[allow(clippy::too_many_arguments)]
 pub fn prefill_flash_next(
     model: &Model,
     pool: &SeqPool,
     sequence: &mut Seq<'_>,
     token_ids: &[i32],
     start_position: u64,
-    sampling: Option<SamplingParams>,
+    sampling: SamplingParams,
+    permitted: &[i32],
     ngram_rows: &[u8],
     out_span_logits: Option<&mut [u16]>,
-) -> Result<(), String> {
-    if ngram_rows.len() % token_ids.len().max(1) != 0 || ngram_rows.is_empty() {
+) -> Result<f32, String> {
+    if token_ids.is_empty() || ngram_rows.is_empty() || ngram_rows.len() % token_ids.len() != 0 {
         return Err(format!(
             "prefill_flash_next: {} n-gram row bytes for {} tokens",
             ngram_rows.len(),
             token_ids.len()
         ));
     }
+    let mut probability = 0.0f32;
     let span_logits = match out_span_logits {
         Some(rows) => rows.as_mut_ptr(),
         None => std::ptr::null_mut(),
     };
     let options = ffi::IgnisPrefillOptions {
         out_span_logits: span_logits,
+        out_permitted_prob: &mut probability,
         ngram_rows: ngram_rows.as_ptr(),
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
-    let params = sampling.map_or(GREEDY, SamplingParams::to_ffi);
+    let params = permitted_params("prefill_flash_next", sampling, permitted)?;
     let rc = unsafe {
         ffi::ignis_program_prefill(
             model.handle(),
@@ -864,29 +869,31 @@ pub fn prefill_flash_next(
     if rc != 0 {
         return Err(last_error());
     }
-    Ok(())
+    Ok(probability)
 }
 
-/// GitHub #302: one Flash-Next decode round, greedy per lane or under
-/// `sampling` (empty: every lane greedy), with each lane's n-gram table rows
-/// for the token it consumes (`ngram_rows`: `[sequences.len()][16][90]`, its
-/// pending token's rows). Returns the tokens the round emitted.
+/// GitHub #302: one Flash-Next decode round, each lane drawn under its own
+/// sampling parameters and permitted set (`lanes`, parallel to
+/// `sequences`), with each lane's n-gram table rows for the token it
+/// consumes (`ngram_rows`: `[sequences.len()][16][90]`, its pending token's
+/// rows). Returns each lane's emitted token and its probability within its
+/// permitted set (0 without one).
 pub fn decode_flash_next(
     model: &Model,
     pool: &SeqPool,
     sequences: &mut [&mut Seq<'_>],
-    sampling: &[SamplingParams],
+    lanes: &[(SamplingParams, &[i32])],
     ngram_rows: &[u8],
-) -> Result<Vec<i32>, String> {
-    if !sampling.is_empty() && sampling.len() != sequences.len() {
-        return Err(format!("decode_flash_next: {} sampling entries for {} lanes", sampling.len(), sequences.len()));
+) -> Result<Vec<(i32, f32)>, String> {
+    if lanes.len() != sequences.len() {
+        return Err(format!("decode_flash_next: {} lanes' sampling for {} sequences", lanes.len(), sequences.len()));
     }
     let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
-    let params: Vec<_> = if sampling.is_empty() {
-        vec![GREEDY; handles.len()]
-    } else {
-        sampling.iter().copied().map(SamplingParams::to_ffi).collect()
-    };
+    let params = lanes
+        .iter()
+        .map(|(sampling, permitted)| permitted_params("decode_flash_next", *sampling, permitted))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut probabilities = vec![0.0f32; handles.len()];
     let options = ffi::IgnisDecodeOptions {
         size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
         speculative_window: 0,
@@ -894,7 +901,7 @@ pub fn decode_flash_next(
         draft_counts: std::ptr::null(),
         out_committed_counts: std::ptr::null_mut(),
         out_extents: std::ptr::null_mut(),
-        out_permitted_probs: std::ptr::null_mut(),
+        out_permitted_probs: probabilities.as_mut_ptr(),
         ngram_rows: ngram_rows.as_ptr(),
     };
     let mut tokens = vec![-1; handles.len()];
@@ -912,7 +919,7 @@ pub fn decode_flash_next(
     if rc != 0 {
         return Err(last_error());
     }
-    Ok(tokens)
+    Ok(tokens.into_iter().zip(probabilities).collect())
 }
 
 /// Emit one greedy token for each sequence and prepare the following round.
