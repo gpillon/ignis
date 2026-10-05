@@ -574,6 +574,16 @@ pub fn flash_next_scheduler(
         "flash-next vram plan"
     );
     options.expert_cache_bytes = expert_cache_bytes;
+    // Spec flash-next/05: what one sequence's reusable state costs, derived
+    // from the topology -- the image a retained slot or a blob holds, and
+    // what each token adds to the pages.
+    // hotpath-lint-allow: one line per model load.
+    tracing::info!(
+        name: "ignis.runtime.flash_next_state",
+        state_image = %config.state_image(shape.kv_format),
+        paged = %config.paged_sections(shape.kv_format),
+        "flash-next sequence state"
+    );
     // The host plan (spec flash-next/03), measured before the first pinned
     // allocation: the expert pool and the n-gram hot rows must leave the
     // margin, or the start is refused naming the line that crosses it.
