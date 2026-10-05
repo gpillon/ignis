@@ -544,6 +544,68 @@ impl ModelConfig {
             }),
         }
     }
+
+    /// The Flash-Next topology of an artifact's geometry (the artifact crate
+    /// keeps its own, `ignis_artifact::flash_next::FlashNextGeometry`: the
+    /// counts and widths its inventory is shaped by). What that geometry does
+    /// not carry -- routing, rotary, the indexer's budget, the norms' epsilon,
+    /// the n-gram hashing constants -- is the checkpoint's config, as
+    /// [`ModelConfig::qwen38_flash_next`] states it. A reduced fixture
+    /// geometry gives a reduced topology of the same program.
+    pub fn flash_next_from(g: &ignis_artifact::flash_next::FlashNextGeometry) -> Self {
+        let checkpoint = Self::qwen38_flash_next();
+        let layer_kinds: Vec<LayerKind> = (0..g.layers)
+            .map(|i| if g.is_attention_layer(i) { LayerKind::Gqa } else { LayerKind::Gdn })
+            .collect();
+        let gdn_layers = layer_kinds.iter().filter(|&&kind| kind == LayerKind::Gdn).count() as u64;
+        let key_width = g.gdn_key_heads * g.gdn_head_dim;
+        let value_width = g.gdn_value_heads * g.gdn_head_dim;
+        let moe = checkpoint.moe.expect("Flash-Next is MoE");
+        let indexer = checkpoint.indexer.expect("Flash-Next has an indexer");
+        let ngram = checkpoint.ngram.expect("Flash-Next has the n-gram embedding");
+        Self {
+            num_layers: g.layers,
+            layer_kinds,
+            hidden: g.hidden,
+            vocab: g.vocab,
+            num_q_heads: g.attention_heads,
+            num_kv_heads: g.kv_heads,
+            head_dim: g.head_dim,
+            gdn_state_rows: value_width,
+            gdn_state_cols: key_width,
+            gdn_num_layers: gdn_layers,
+            gdn_q_width: key_width,
+            gdn_z_width: value_width,
+            gdn_ab_width: 2 * g.gdn_value_heads,
+            gdn_value_heads: g.gdn_value_heads,
+            gdn_head_dim: g.gdn_head_dim,
+            gdn_conv_kernel: g.conv_kernel,
+            // `partial_rotary_factor` 0.25 of the head.
+            rotary_dim: g.head_dim / 4,
+            moe: Some(MoeGeometry {
+                num_experts: g.experts,
+                expert_intermediate: g.expert_intermediate,
+                shared_expert_intermediate: g.shared_intermediate,
+                ..moe
+            }),
+            hyper_connections: Some(HyperConnections { streams: g.hc_streams, rank: g.hc_rank }),
+            indexer: Some(IndexerGeometry {
+                heads: g.indexer_heads,
+                head_dim: g.indexer_head_dim,
+                kv_heads: g.indexer_kv_heads,
+                ..indexer
+            }),
+            ngram: Some(NgramGeometry {
+                ngram_size: g.ngram_size,
+                heads_per_ngram: g.heads_per_ngram,
+                embed_dim: g.ple_embed_dim(),
+                conv_kernel: g.ple_conv_kernel,
+                layer: g.ple_layer,
+                ..ngram
+            }),
+            ..checkpoint
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1082,37 @@ mod tests {
         assert_eq!(offset_of!(IgnisTopology, indexer), 208);
         assert_eq!(offset_of!(IgnisTopology, ngram), 248);
         assert_eq!(size_of::<IgnisTopology>(), 288);
+    }
+
+    /// The artifact crate keeps its own Flash-Next geometry (it sits below
+    /// core); the topology built from it is the one this crate states, field
+    /// for field, so the two can never drift apart unnoticed.
+    #[test]
+    fn the_artifacts_flash_next_geometry_is_this_topology() {
+        use ignis_artifact::flash_next::FlashNextGeometry;
+        let from_artifact = ModelConfig::flash_next_from(&FlashNextGeometry::qwen38_flash_next());
+        let stated = ModelConfig::qwen38_flash_next();
+        assert_eq!(format!("{from_artifact:?}"), format!("{stated:?}"));
+    }
+
+    /// The artifact crate's reduced fixture geometry gives a consistent
+    /// reduced topology: its own counts, Flash-Next's blocks and constants.
+    #[test]
+    fn the_fixture_geometry_gives_a_reduced_flash_next_topology() {
+        use ignis_artifact::flash_next::FlashNextGeometry;
+        let cfg = ModelConfig::flash_next_from(&FlashNextGeometry::fixture());
+        assert_eq!(cfg.family, ModelFamily::FlashNext);
+        assert_eq!(cfg.num_layers, 2);
+        assert_eq!(cfg.layer_kinds, vec![LayerKind::Gdn, LayerKind::Gqa]);
+        assert_eq!((cfg.hidden, cfg.vocab), (256, 512));
+        assert_eq!((cfg.gdn_num_layers, cfg.gdn_value_heads, cfg.gdn_head_dim), (1, 4, 32));
+        assert_eq!(cfg.gdn_value_heads * cfg.gdn_head_dim, cfg.gdn_state_rows);
+        assert_eq!((cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim), (2, 1, 64, 16));
+        assert_eq!(cfg.moe.unwrap().num_experts, 8);
+        assert_eq!(cfg.moe.unwrap().experts_per_token, 10);
+        assert_eq!(cfg.hyper_connections.unwrap().rank, 32);
+        assert_eq!(cfg.ngram.unwrap().heads(), 2);
+        assert_eq!(cfg.ngram.unwrap().layer, 1);
     }
 
     /// The descriptor's layer count is its kinds array's length, so the leaf
