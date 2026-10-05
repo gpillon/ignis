@@ -420,6 +420,14 @@ prose part 1; neither is in the calibration, which uses long windows 0-2), `cana
   `KL ≈ Σ_{i∈I} e^{r_i}(r_i − c_i) + R · (log R − log(1 − Σ_{i∈I} e^{c_i}))`,
   with the tail term dropped when `R < 1e-12`. It is a lower bound of the exact KL; the
   converter reports both so the engine's figure is compared like with like.
+- **Proposed for the next conversion** (not in the 2026-10-05 run's output):
+  `q_lp_at_bf16_ids.f32`, f32 `(P, 64)`, the quantized stream's log-probs at the BF16
+  row's top-64 ids (`lq.gather(-1, r_ids)` in `finish.py` `_score_window`, about 35 MB for
+  `test2048`). With it the quantized `kld_top64` is reproducible from the set alone;
+  without it, only at the positions whose BF16 top-64 ids are all in the quantized top-64,
+  since a quantized log-prob outside its own top-64 is not stored: at most 0.01% of the
+  positions of any domain in the 2026-10-05 run. The acceptance scorers
+  (`crates/bench/src/flash_next/references.rs`) read the file when it is present.
 
 **Kernel references (spec 02).**
 - `references/moe_block/LNN/` for layers 2, 24 and 46: 64 tokens (positions
