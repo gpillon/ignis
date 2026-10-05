@@ -659,3 +659,8 @@ target_compile_definitions(ignis_kernel_flash_next_ngram_test PRIVATE
   IGNIS_FLASH_NEXT_NGRAM_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_ngram")
 target_link_libraries(ignis_kernel_flash_next_ngram_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_ngram_test COMMAND ignis_kernel_flash_next_ngram_test)
+# The resolve's cost per layer step at Flash-Next's geometry (48 x 512, real pool capacities,
+# 4 KiB records so PCIe is not what it times). A timing is a finding, not a pass/fail: a tool,
+# NOT registered with CTest.
+add_executable(ignis_residency_resolve_bench bench_residency_resolve.cu)
+target_link_libraries(ignis_residency_resolve_bench PRIVATE ignis_kernel ignis_vendor)
