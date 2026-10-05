@@ -239,11 +239,13 @@ int main() {
   headless.raw.gdn_value_heads = 0;
   refused(headless, {"gdn_value_heads must be positive"}, "no value heads");
 
-  // ADR 0043: the family names the program. Flash-Next's is not built yet,
-  // and a 27B topology carries none of its blocks.
+  // ADR 0043: the family names the program. The Flash-Next family goes to
+  // its own binder (kernel/src/flash_next/bind.cu), which refuses a topology
+  // without Flash-Next's blocks; a 27B topology carries none of them.
   Topology flash_next = topology_of(kFlashNext);
   flash_next.raw.family = IGNIS_MODEL_FAMILY_FLASH_NEXT;
-  refused(flash_next, {"Flash-Next program is not built yet"}, "the Flash-Next family");
+  refused(flash_next, {"bind_flash_next: not a Flash-Next topology"},
+          "the Flash-Next family without its blocks");
 
   Topology unknown = topology_of(kFlashNext);
   unknown.raw.family = 7;

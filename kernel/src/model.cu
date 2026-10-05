@@ -29,6 +29,8 @@
 
 #include "ignis_dflash2_topk.h"
 
+#include "flash_next/bind.h"
+
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/weight.h"
@@ -941,10 +943,19 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
               ") is not the topology's GDN layer count (" + std::to_string(gdn_layers) + ")");
     return nullptr;
   }
+  // ADR 0043: the family names the program.
+  if (topology->family != IGNIS_MODEL_FAMILY_QWEN38_27B &&
+      topology->family != IGNIS_MODEL_FAMILY_FLASH_NEXT) {
+    set_error("ignis_model_load: topology.family " + std::to_string(topology->family) +
+              " is not an ignis_model_family");
+    return nullptr;
+  }
+  const bool flash_next = topology->family == IGNIS_MODEL_FAMILY_FLASH_NEXT;
   // The heads every GDN parameter is sized by, checked against the widths
   // the projections are sized by, and the geometry the vendored conv and
-  // recurrence run. A topology without GDN layers needs none of it.
-  if (gdn_layers > 0) {
+  // recurrence run. A topology without GDN layers needs none of it, and
+  // Flash-Next's GDN layers are its own program's to check.
+  if (gdn_layers > 0 && !flash_next) {
     if (topology->gdn_value_heads == 0) {
       set_error("ignis_model_load: topology.gdn_value_heads must be positive");
       return nullptr;
@@ -966,19 +977,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       return nullptr;
     }
   }
-  // ADR 0043: the family names the program. Flash-Next's blocks are all zero
-  // in a 27B topology, and Flash-Next's own program is not built yet.
-  if (topology->family != IGNIS_MODEL_FAMILY_QWEN38_27B &&
-      topology->family != IGNIS_MODEL_FAMILY_FLASH_NEXT) {
-    set_error("ignis_model_load: topology.family " + std::to_string(topology->family) +
-              " is not an ignis_model_family");
-    return nullptr;
-  }
-  if (topology->family == IGNIS_MODEL_FAMILY_FLASH_NEXT) {
-    set_error("ignis_model_load: the Flash-Next program is not built yet (spec flash-next/04)");
-    return nullptr;
-  }
-  if (const char *block = flash_next_block_in(*topology); block != nullptr) {
+  // Flash-Next's blocks are all zero in a 27B topology.
+  if (const char *block = flash_next ? nullptr : flash_next_block_in(*topology); block != nullptr) {
     set_error(std::string("ignis_model_load: a Qwen 3.8-27B topology carries no ") + block +
               " block");
     return nullptr;
@@ -1104,6 +1104,26 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.vision_embedding_pool_bytes = vision_embedding_pool_request;
   out.rope_scaling = rope_scaling;
   out.attention_text_max_keys = std::min(attention_text_max_keys, max_context_tokens);
+
+  // GitHub #302: Flash-Next binds its own schema (kernel/src/flash_next/
+  // bind.cu) and has no drafter, vision tower or attention readouts. Its
+  // program is the next step: a load that binds is refused after binding,
+  // so a caller learns whether its descriptors are right.
+  if (flash_next) {
+    if (speculative_backend != IGNIS_SPECULATIVE_NONE || vision_max_tokens != 0 ||
+        attention_text_max_keys != 0) {
+      set_error("ignis_model_load: Qwen3.8-Flash-Next has no speculative decoding, vision or attention readouts");
+      return nullptr;
+    }
+    std::string error;
+    if (ignis::flash_next::bind_flash_next(tensors, count, *topology, &error) == nullptr) {
+      set_error("ignis_model_load: " + error);
+      return nullptr;
+    }
+    set_error("ignis_model_load: the Flash-Next weights bind (" + std::to_string(count) +
+              " tensors), but its program is not built yet (spec flash-next/04)");
+    return nullptr;
+  }
 
   ModelBinder binder(tensors, count);
   if (!binder.build_index(count)) {

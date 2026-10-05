@@ -12,6 +12,9 @@
 
 #include "flash_next/bind.h"
 
+#include "ignis_model.h"
+#include "ignis_seq.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -273,6 +276,35 @@ int main() {
     check(ignis::flash_next::bind_flash_next(tensors.data(), tensors.size(), topology, &error) == nullptr &&
               error.find("not a Flash-Next topology") != std::string::npos,
           "a topology without hyper-connections is not Flash-Next's: got \"" + error + "\"");
+  }
+
+  // Through the load ABI: the Flash-Next family reaches this binder, a set
+  // that binds is told so (the program itself is the next step), a binder
+  // fault comes back by name, and the 27B's options are refused.
+  {
+    std::vector<int32_t> kinds;
+    const ignis_topology topology = flash_next_topology(kinds);
+    auto tensors = descriptors(named);
+    ignis_model_reservations out{};
+    const auto plan = [&](const ignis_model_load_options *options) {
+      const int32_t rc = ignis_model_plan_reservations(tensors.data(), tensors.size(), &topology, 8192,
+                                                       131072, IGNIS_KV_FORMAT_HQ_E8_2B, options, &out);
+      return rc == 0 ? std::string("(planned)") : std::string(ignis_model_last_error());
+    };
+    const std::string bound = plan(nullptr);
+    check(bound.find("Flash-Next weights bind (") != std::string::npos &&
+              bound.find("program is not built yet") != std::string::npos,
+          "the load ABI binds a complete Flash-Next set: got \"" + bound + "\"");
+    ignis_model_load_options vision{};
+    vision.size = sizeof(vision);
+    vision.vision_max_tokens = 8192;
+    const std::string refused = plan(&vision);
+    check(refused.find("Qwen3.8-Flash-Next has no speculative decoding, vision") != std::string::npos,
+          "vision on a Flash-Next load is refused by name: got \"" + refused + "\"");
+    tensors.pop_back();
+    const std::string missing = plan(nullptr);
+    check(missing.find("bind_flash_next: missing bound tensor") != std::string::npos,
+          "a binder fault comes back through the load ABI: got \"" + missing + "\"");
   }
 
   if (g_failed != 0) {
