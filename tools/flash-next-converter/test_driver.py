@@ -176,3 +176,51 @@ def test_a_finished_layer_whose_files_no_longer_match_done_is_redone(tmp_path):
     # the checkpoint (layer 4) is past the torn layer 1: the run restarts from layer 0
     assert toy2.replayed == [0, 2, 3, 4, 5] and toy2.processed == [1]
     assert torch.equal(state["x"], expected())
+
+
+def test_a_full_disk_before_a_layer_checkpoints_and_exits_4_and_the_relaunch_resumes(tmp_path):
+    toy = Toy(str(tmp_path / "work"))
+    lp = loop(tmp_path, toy, every=100)
+    lp.space_check = lambda L: "F: below the floor" if L == 3 else None
+    code, _ = lp.run(toy)
+    assert code == driver.EXIT_DISK == 4 and toy.processed == [0, 1, 2]
+    toy2 = Toy(str(tmp_path / "work"))
+    code, state = loop(tmp_path, toy2, every=100).run(toy2)
+    assert code == driver.EXIT_DONE and toy2.replayed == [] and toy2.processed == [3, 4, 5]
+    assert torch.equal(state["x"], expected())
+
+
+def test_the_last_layer_is_checkpointed_so_a_crash_in_the_head_replays_nothing(tmp_path):
+    toy = Toy(str(tmp_path / "work"))
+    loop(tmp_path, toy, every=0).run(toy)
+    toy2 = Toy(str(tmp_path / "work"))
+    code, state = loop(tmp_path, toy2, every=0).run(toy2)
+    assert code == driver.EXIT_DONE and toy2.replayed == [] and toy2.processed == []
+    assert torch.equal(state["x"], expected())
+
+
+def test_a_checkpoint_without_room_leaves_the_old_slot_and_exits_4(tmp_path):
+    toy = Toy(str(tmp_path / "work"))
+    ck = driver.Checkpoint([str(tmp_path / "ck")], placement=lambda name: 0)
+    lp = driver.LayerLoop(N, toy.layer_dir, checkpoint=ck, every=2)
+    room = {"free": 10 ** 12}
+    ck.free = lambda d: room["free"]
+    orig = toy.process
+
+    def process(L, state):
+        orig(L, state)
+        if L == 1:
+            room["free"] = 0            # someone fills the drive after the first checkpoint
+    toy.process = process
+    ck.headroom = 0
+    room["free"] = 10 ** 12
+    code, _ = lp.run(toy)
+    # the checkpoint after layer 1 (next layer 2) finds no room: exit 4, nothing written
+    assert code == driver.EXIT_DISK and toy.processed == [0, 1]
+    assert ck.next_layer(toy.fingerprint()) is None
+    room["free"] = 10 ** 12
+    ck.save({"x": torch.ones(3)}, 2, "fp")
+    room["free"] = 0
+    with pytest.raises(driver.NoRoom):
+        ck.save({"x": torch.ones(10 ** 6)}, 4, "fp")
+    assert ck.next_layer("fp") == 2      # the old slot is intact

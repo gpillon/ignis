@@ -54,7 +54,10 @@ other streams' on `C:/flash-next-ckpt-small`, the packer at `target/x86_64-pc-wi
 
 - **Watch:** `convert.log` in `-Out` (one line per layer: time, RSS, VRAM peak, MoE dB beside
   run 6 / run 8, rates, K histogram); `convert.exit` appears when the pass ends.
-- **Exit codes of the pass:** 0 done; 75 stopped by the stop file; 2 refused (GPU lock, a GPU
+- **Exit codes of the pass:** 0 done; 75 stopped by the stop file; 4 stopped because a drive
+  filled during the run (before a layer, F: must hold the rest of the output + 5 GB,
+  `--disk-floor-gb`; a checkpoint needs room for its slot on E:/C:), checkpointed first when
+  it can be, relaunch after freeing space; 2 refused (GPU lock, a GPU
   workload or VRAM in use, disk, a work tree of another configuration); 3 done but an
   acceptance check FAILED (rates over `--budget`, the MoE error of acceptance 3, KLD or MMLU of
   acceptance 4, or a work-file re-decode mismatch): the report names the fallback, a
@@ -104,8 +107,10 @@ Measured on the 2-layer dry run of 2026-10-05 (`--layers 2 --table-shards 4`), o
   drive). Packing moves the work files into the container and deletes them as it goes (peak
   ~74 GB + one unit).
 - **Checkpoint:** one slot, 13.5 GB (BF16 stream) on `E:/flash-next-ckpt` + 6.9 GB (quantized
-  and FP8-only streams) on `C:/flash-next-ckpt-small`; written in 83 s, loaded in 38 s; every
-  6 layers (`--ckpt-every`) and at the stop file. The old slot's files are removed before the
+  and FP8-only streams) on `C:/flash-next-ckpt-small`; written in 53-83 s, loaded in 38 s;
+  every 3 layers (`--ckpt-every`), after the last layer and at every clean stop: a crash costs
+  at most 2 layers, and about 20 min of checkpoint writes in all. The old slot's files are
+  removed before the
   new ones are written (two copies do not fit), so the peak is one slot; the slot is marked
   invalid first and a torn slot is never loaded.
 - **Resume:** checked on the dry run: a relaunch with the stop file present loads the
