@@ -221,6 +221,7 @@ ignis_seq_pool_spec small_spec() {
   spec.max_context_tokens  = 128; // pages_for_tokens(128) == 2
   spec.slot_count          = 3;
   spec.gdn_num_layers      = 2;
+  spec.kv_num_layers = kIgnisGqaLayerCount;
   spec.gdn_conv_channels   = 6;
   spec.gdn_value_heads     = 2;
   spec.gdn_head_dim        = 4;
@@ -241,6 +242,7 @@ ignis_seq_pool_spec qwen38_27b_spec(int32_t kv_format, std::uint32_t context_tok
   spec.max_context_tokens  = context_tokens;
   spec.slot_count          = slot_count;
   spec.gdn_num_layers      = 48;
+  spec.kv_num_layers = kIgnisGqaLayerCount;
   spec.gdn_conv_channels   = 10240; // q 2048 + k 2048 + v 6144
   spec.gdn_value_heads     = 48;
   spec.gdn_head_dim        = 128;

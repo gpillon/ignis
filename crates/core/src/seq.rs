@@ -89,6 +89,9 @@ pub(crate) mod ffi {
         /// Host retained slots after them (GitHub #281): their images in one
         /// pinned host block reserved at pool create.
         pub retained_host_slot_count: u32,
+        /// The attention layers the pool stores K/V for (GitHub #302): the
+        /// topology's attention-layer count.
+        pub kv_num_layers: u32,
     }
 
     /// 1:1 with `struct ignis_seq_pool_stats`.
@@ -521,6 +524,7 @@ fn pool_spec(
         speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
         retained_slot_count: budget.retained_slot_count,
         retained_host_slot_count: budget.retained_host_slot_count,
+        kv_num_layers: cfg.attention_layer_count() as u32,
     }
 }
 
@@ -1446,3 +1450,34 @@ unsafe impl Send for PinnedBuffer {}
 // `SeqPool`'s documented single-thread-driver contract above) but never
 // shared by reference across threads, so only `Send` is asserted.
 unsafe impl Send for Seq<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compute::ModelConfig;
+
+    /// `struct ignis_seq_pool_spec` has no `size` field: both sides pin it
+    /// (`kernel/include/ignis_seq.h` static_asserts the same 60 bytes).
+    #[test]
+    fn the_pool_spec_mirror_is_the_leafs_size() {
+        assert_eq!(std::mem::size_of::<ffi::IgnisSeqPoolSpec>(), 60);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisSeqPoolSpec, kv_num_layers), 56);
+    }
+
+    /// GitHub #302: a pool holds the K/V of the topology's attention layers.
+    #[test]
+    fn a_pool_stores_the_topologys_attention_layers() {
+        let budget = SeqPoolBudget {
+            kv_format: crate::KvFormat::HqE8_2b,
+            kv_page_group_count: 8,
+            max_context_tokens: 512,
+            slot_count: 3,
+            retained_slot_count: 0,
+            retained_host_slot_count: 0,
+        };
+        assert_eq!(pool_spec(&ModelConfig::qwen38_27b(), &budget, None).kv_num_layers, 16);
+        let flash = pool_spec(&ModelConfig::qwen38_flash_next(), &budget, None);
+        assert_eq!((flash.kv_num_layers, flash.num_kv_heads, flash.head_dim), (12, 2, 256));
+        assert_eq!((flash.gdn_num_layers, flash.gdn_value_heads), (36, 48));
+    }
+}

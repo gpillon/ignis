@@ -38,9 +38,12 @@ inline constexpr int32_t kIgnisGdnConvKernel = 4;
  * op's slot stride is `channels * 3`, so the pool must carry 3 taps. */
 inline constexpr int32_t kIgnisGdnConvStateWidth = kIgnisGdnConvKernel - 1;
 
-/* The Qwen 3.8 text backbone has one full-attention layer every four layers:
- * 3, 7, ..., 63. Each keeps independent K/V history, so the paged pool owns
- * one K/V-plane pair and one frontier per GQA layer. */
+/* The most attention layers a pool holds: the Qwen 3.8-27B backbone's, one
+ * every four layers (3, 7, ..., 63). Each keeps independent K/V history, so
+ * the paged pool owns one K/V-plane pair and one frontier per attention
+ * layer -- `ignis_seq_pool::kv_num_layers` of them (Flash-Next's are 12),
+ * this being the capacity of a sequence's frontier array and of a blob's
+ * progress image. */
 inline constexpr int32_t kIgnisGqaLayerCount = 16;
 
 /* The other 48 of the 64 backbone layers: 0, 1, 2, 4, 5, 6, 8, ... Each keeps
@@ -136,6 +139,9 @@ struct ignis_seq_pool {
    * extent is the codec's row budget, not head_dim. */
   std::int32_t kv_head_dim     = 0;
   std::int32_t kv_num_kv_heads = 0;
+  /* The attention layers the pool stores K/V for (GitHub #302): the spec's
+   * `kv_num_layers`, at most kIgnisGqaLayerCount. */
+  std::int32_t kv_num_layers = 0;
   /* Lane slots only, `0..slot_count`: the retained slots past them are never
    * listed here (GitHub #211). */
   std::vector<std::int32_t> free_slots;
@@ -263,7 +269,7 @@ struct ignis_seq_pool {
   // alike: every layer's K plane, then every layer's V plane, then its ring
   // words. 0 on a BF16 pool.
   std::uint64_t hq_residual_slot_bytes() const {
-    return has_hq_residual() ? 2u * kIgnisGqaLayerCount * hq_residual_plane_bytes() +
+    return has_hq_residual() ? 2u * static_cast<std::uint32_t>(kv_num_layers) * hq_residual_plane_bytes() +
                                    kIgnisHqRingWords * sizeof(std::uint32_t)
                              : 0;
   }

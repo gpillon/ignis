@@ -601,6 +601,11 @@ target_include_directories(ignis_kernel_flash_next_contract_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_flash_next_contract_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_contract_test COMMAND ignis_kernel_flash_next_contract_test)
+# A sequence pool of the topology's attention layers (kv_num_layers), planned
+# without building it. Host-only.
+add_executable(ignis_kernel_seq_pool_layers_test test_seq_pool_layers.cpp)
+target_link_libraries(ignis_kernel_seq_pool_layers_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_pool_layers_test COMMAND ignis_kernel_seq_pool_layers_test)
 # The Flash-Next binder (kernel/src/flash_next/bind.cu) at the real 48-layer
 # schema: binds, places, refuses by name. Host-only.
 add_executable(ignis_kernel_flash_next_bind_test test_flash_next_bind.cpp)

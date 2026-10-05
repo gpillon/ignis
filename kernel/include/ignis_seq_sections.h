@@ -306,7 +306,7 @@ inline ignis_seq_snapshot_geometry ignis_seq_snapshot_geometry_of(const ignis_se
   geometry.kv_head_dim     = static_cast<std::uint32_t>(pool.kv_head_dim);
   geometry.kv_page_size    = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
   geometry.kv_plane_count  = static_cast<std::uint32_t>(pool.kv_pool.plane_count());
-  geometry.gqa_layer_count = static_cast<std::uint32_t>(kIgnisGqaLayerCount);
+  geometry.gqa_layer_count = static_cast<std::uint32_t>(pool.kv_num_layers);
   geometry.kv_page_bytes   = pool.kv_page_bytes;
   geometry.gdn_num_layers  = gdn.layers;
   geometry.gdn_conv_channels        = static_cast<std::uint32_t>(gdn.conv_channels);

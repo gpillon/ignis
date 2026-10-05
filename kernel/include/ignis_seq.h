@@ -198,7 +198,16 @@ struct ignis_seq_pool_spec {
    * a claim from one cross PCIe, synchronized; the object's KV pages stay in
    * the device pool either way. 0 reserves none. */
   uint32_t retained_host_slot_count;
+  /* The attention layers whose K/V the pool stores, one plane run each (the
+   * topology's attention-layer count, GitHub #302): 16 on Qwen 3.8-27B, 12
+   * on Flash-Next. 1..16; the hq-e8-2b residual window and a blob's
+   * geometry follow it. */
+  uint32_t kv_num_layers;
 };
+#ifdef __cplusplus
+static_assert(sizeof(struct ignis_seq_pool_spec) == 60,
+              "ignis_seq_pool_spec drifted from crates/core/src/seq.rs IgnisSeqPoolSpec");
+#endif
 
 struct ignis_seq_pool_stats {
   uint32_t kv_page_group_count;

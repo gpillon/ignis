@@ -179,16 +179,17 @@ void ignis_seq_copy_hq_residual(const ignis_seq_pool &pool, std::int32_t slot, v
   auto *image               = static_cast<unsigned char *>(host);
   for (const bool role_v : {false, true}) {
     void *device        = pool.hq_residual_plane(role_v, 0, slot);
-    unsigned char *here = image + (role_v ? kIgnisGqaLayerCount * plane : 0);
+    const auto layers   = static_cast<std::size_t>(pool.kv_num_layers);
+    unsigned char *here = image + (role_v ? layers * plane : 0);
     const cudaError_t err =
-        to_host ? cudaMemcpy2DAsync(here, plane, device, pitch, plane, kIgnisGqaLayerCount, kind, nullptr)
-                : cudaMemcpy2DAsync(device, pitch, here, plane, plane, kIgnisGqaLayerCount, kind, nullptr);
+        to_host ? cudaMemcpy2DAsync(here, plane, device, pitch, plane, layers, kind, nullptr)
+                : cudaMemcpy2DAsync(device, pitch, here, plane, plane, layers, kind, nullptr);
     if (err != cudaSuccess) {
       throw std::runtime_error(std::string("cudaMemcpy2DAsync(hq residual ") +
                                (role_v ? "v" : "k") + ") failed: " + cudaGetErrorString(err));
     }
   }
-  unsigned char *ring    = image + 2 * kIgnisGqaLayerCount * plane;
+  unsigned char *ring    = image + 2 * static_cast<std::size_t>(pool.kv_num_layers) * plane;
   const std::size_t ring_bytes = kIgnisHqRingWords * sizeof(std::uint32_t);
   checked_memcpy_async(to_host ? static_cast<void *>(ring) : static_cast<void *>(pool.hq_ring_words(slot)),
                        to_host ? static_cast<const void *>(pool.hq_ring_words(slot)) : ring, ring_bytes,
@@ -203,7 +204,8 @@ void ignis_seq_zero_hq_residual(ignis_seq_pool &pool, std::int32_t slot) {
   const std::size_t pitch = pool.hq_residual_layer_pitch();
   for (const bool role_v : {false, true}) {
     const cudaError_t err =
-        cudaMemset2D(pool.hq_residual_plane(role_v, 0, slot), pitch, 0, plane, kIgnisGqaLayerCount);
+        cudaMemset2D(pool.hq_residual_plane(role_v, 0, slot), pitch, 0, plane,
+                     static_cast<std::size_t>(pool.kv_num_layers));
     if (err != cudaSuccess) {
       throw std::runtime_error(std::string("cudaMemset2D(hq residual) failed: ") +
                                cudaGetErrorString(err));
@@ -594,6 +596,13 @@ bool validate_pool_spec(const struct ignis_seq_pool_spec &spec, const std::strin
               " is not an ignis_kv_format");
     return false;
   }
+  // GitHub #302: the attention layers are the topology's (16 on the 27B, 12
+  // on Flash-Next), within what a sequence's frontier array holds.
+  if (spec.kv_num_layers == 0 || spec.kv_num_layers > static_cast<std::uint32_t>(kIgnisGqaLayerCount)) {
+    set_error(fn + ": kv_num_layers " + std::to_string(spec.kv_num_layers) + " is not in 1.." +
+              std::to_string(kIgnisGqaLayerCount));
+    return false;
+  }
   // The codec's row budget is defined for a 256-dimension row only
   // (kHqHeadDim); a pool of any other head_dim would plan planes the hq
   // append path cannot write.
@@ -661,8 +670,8 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   // selects its own run (`ignis_kv_plane_index`), so a layer's K/V history
   // never aliases another layer's pages.
   kv_spec.planes.reserve(static_cast<std::size_t>(ignis_kv_planes_per_layer(spec.kv_format)) *
-                         kIgnisGqaLayerCount);
-  for (int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+                         spec.kv_num_layers);
+  for (std::uint32_t layer = 0; layer < spec.kv_num_layers; ++layer) {
     push_layer_planes(kv_spec, spec.kv_format, spec.num_kv_heads, spec.head_dim);
   }
   out.kv_layout     = ninfer::plan_paged_kv_pool(kv_builder, kv_spec);
@@ -717,7 +726,7 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   if (spec.kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
     out.hq_residual_plane_bytes = static_cast<std::size_t>(kIgnisHqHeadDim) * spec.num_kv_heads *
                                   kIgnisHqResidualRows * sizeof(std::uint16_t);
-    const std::size_t planes = static_cast<std::size_t>(kIgnisGqaLayerCount) * state_slots;
+    const std::size_t planes = static_cast<std::size_t>(spec.kv_num_layers) * state_slots;
     out.hq_residual_bytes = 2 * planes * out.hq_residual_plane_bytes +
                             static_cast<std::size_t>(state_slots) * kIgnisHqRingWords *
                                 sizeof(std::uint32_t);
@@ -769,7 +778,7 @@ std::uint64_t host_image_stride(const PoolLayout &layout, const struct ignis_seq
     stride += aligned(cyclic_lane_bytes(layout.dflash2_window_layout));
   }
   if (layout.hq_residual_plane_bytes != 0) {
-    stride += aligned(2u * kIgnisGqaLayerCount * layout.hq_residual_plane_bytes +
+    stride += aligned(2u * spec.kv_num_layers * layout.hq_residual_plane_bytes +
                       kIgnisHqRingWords * sizeof(std::uint32_t));
   }
   return stride;
@@ -827,6 +836,7 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     pool->kv_format       = spec->kv_format;
     pool->kv_head_dim     = static_cast<std::int32_t>(spec->head_dim);
     pool->kv_num_kv_heads = static_cast<std::int32_t>(spec->num_kv_heads);
+    pool->kv_num_layers   = static_cast<std::int32_t>(spec->kv_num_layers);
 
     if (layout.dflash2) {
       pool->dflash2_arena = std::make_unique<ninfer::DeviceArena>(layout.dflash2_bytes);
@@ -847,7 +857,7 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
 
     if (layout.hq_residual_bytes != 0) {
       const std::size_t planes =
-          static_cast<std::size_t>(kIgnisGqaLayerCount) * state_slot_count(*spec);
+          static_cast<std::size_t>(spec->kv_num_layers) * state_slot_count(*spec);
       pool->hq_residual = std::make_unique<ninfer::DeviceBuffer>(layout.hq_residual_bytes);
       // Zeroed once here and per slot at every alloc: no bit is set and no
       // side row holds anything until an append writes it.
@@ -1376,7 +1386,7 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
       for (const bool role_v : {false, true}) {
         const cudaError_t err = cudaMemcpy2DAsync(
             pool.hq_residual_plane(role_v, 0, dst), pitch, pool.hq_residual_plane(role_v, 0, src),
-            pitch, plane, kIgnisGqaLayerCount, cudaMemcpyDeviceToDevice, nullptr);
+            pitch, plane, static_cast<std::size_t>(pool.kv_num_layers), cudaMemcpyDeviceToDevice, nullptr);
         if (err != cudaSuccess) {
           throw std::runtime_error(std::string("cudaMemcpy2DAsync(") + what +
                                    ", slot to slot) failed: " + cudaGetErrorString(err));
