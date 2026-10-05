@@ -16,8 +16,12 @@
 // Checked:
 // - the projection is the exact sum (the fixture's inputs make every fp32 partial sum exact), so
 //   the indexer's own arithmetic is all that is compared;
-// - block keys (all 1025 of lane 0) and queries of the recorded rows against the module's, to a
-//   BF16 ulp (the RMSNorm's fp32 sum of squares runs in another order);
+// - block keys (all 1025 of lane 0) and queries of the recorded rows against the module's: at
+//   least 99% bit-exact, and every value within 2^-7 of its 128-wide row's largest magnitude. The
+//   RMSNorm's fp32 sum of squares runs in another order than torch's, so a normed value can land
+//   one BF16 ulp away; rope's BF16 sum of two rounded products then carries that ulp of the
+//   larger term into a result that may be near zero, which an ulp metric of the result would
+//   blow up into hundreds of "ulps" (seen on the first run);
 // - scores of the recorded rows against the module's, within kScoreTol;
 // - selection: every recorded row's blocks equal the module's except at DOCUMENTED TIES, i.e. a
 //   block in one set and not the other must score within kScoreTol of the module's k-th score;
@@ -138,12 +142,25 @@ struct Row {
   std::vector<int32_t> select;  // ascending blocks (the documented rule)
 };
 
-double bf16_ulps(uint16_t a, uint16_t b) {
-  const float fa = bf16_to_f32(a), fb = bf16_to_f32(b);
-  if (fa == fb) return 0.0;
-  const float mag = std::max(std::fabs(fa), std::fabs(fb));
-  return std::fabs(fa - fb) / std::ldexp(1.0F, std::ilogb(mag) - 7);
-}
+// Agreement of BF16 rows of 128 with the module's: how many values are bit-exact, and the worst
+// difference relative to the largest magnitude of the module's row.
+struct Agreement {
+  std::size_t exact = 0, total = 0;
+  double worst = 0.0;
+  void add(const uint16_t *got, const uint16_t *want, std::size_t n) {
+    for (std::size_t r = 0; r < n; r += kHd) {
+      double mag = 0.0;
+      for (int i = 0; i < kHd; ++i) mag = std::max(mag, static_cast<double>(std::fabs(bf16_to_f32(want[r + i]))));
+      for (int i = 0; i < kHd; ++i) {
+        const double diff = std::fabs(static_cast<double>(bf16_to_f32(got[r + i])) - bf16_to_f32(want[r + i]));
+        exact += got[r + i] == want[r + i];
+        ++total;
+        worst = std::max(worst, mag > 0.0 ? diff / mag : diff);
+      }
+    }
+  }
+  bool ok() const { return total > 0 && exact * 100 >= total * 99 && worst <= std::ldexp(1.0, -7); }
+};
 
 // The documented rule on a score row: the k largest, ties by lowest block index; ascending.
 std::vector<int32_t> rule(const std::vector<float> &s, int k) {
@@ -218,7 +235,10 @@ CallResult run_call(Device &d, const fn::Geometry &g, const ix::Rope &rope, ninf
   fn::Selection sel_b{d.tok_b.as<int32_t>(), d.cnt_b.as<int32_t>()};
   IX_OK(ix::select(g, paged, rope, d.q_norm.p, b, d.qk.p, sel_b, arena, d.stream));
   res.dense = sel_b.dense;
-  if (res.dense) return res;
+  if (res.dense) {
+    MOE_CUDA(cudaStreamSynchronize(d.stream));
+    return res;
+  }
   IX_OK(ix::prepare_queries(g, rope, d.q_norm.p, b, 0, rows, d.qk.p, d.q.as<__nv_bfloat16>(), d.stream));
   IX_OK(ix::score(g, paged, b, 0, rows, d.q.as<__nv_bfloat16>(), res.max_blocks, d.scores.as<float>(),
                   d.score_stride, d.stream));
@@ -246,7 +266,7 @@ CallResult run_call(Device &d, const fn::Geometry &g, const ix::Rope &rope, ninf
 // fixture_lanes[l], its first token at positions[l].
 void check_rows(const Device &d, const std::vector<Row> &recorded, const std::vector<int> &fixture_lanes,
                 const std::vector<int32_t> &positions, int tokens, const std::string &what, int *rows_checked,
-                int *documented_ties, double *max_score_err, double *max_q_ulps) {
+                int *documented_ties, double *max_score_err, Agreement *queries) {
   for (const Row &rec : recorded) {
     for (std::size_t l = 0; l < positions.size(); ++l) {
       const int t = rec.position - positions[l];
@@ -265,7 +285,7 @@ void check_rows(const Device &d, const std::vector<Row> &recorded, const std::ve
       }
       // q
       const auto q = download<uint16_t>(d.q.as<__nv_bfloat16>() + static_cast<std::size_t>(row) * kHeads * kHd, kHeads * kHd);
-      for (int i = 0; i < kHeads * kHd; ++i) *max_q_ulps = std::max(*max_q_ulps, bf16_ulps(q[i], rec.q[i]));
+      queries->add(q.data(), rec.q.data(), q.size());
       // scores
       const auto s = download<float>(d.scores.as<float>() + static_cast<std::size_t>(row) * d.score_stride, blocks);
       double err = 0.0;
@@ -376,13 +396,13 @@ int main() {
   std::vector<int32_t> tables(kPhysicalPages);
   for (int i = 0; i < kPhysicalPages; ++i) tables[i] = (i * 173 + 29) % kPhysicalPages;  // a permutation
   upload(d.tables, tables);
-  MOE_CUDA(cudaMemset(d.keys.p, 0, d.keys.bytes));
-  MOE_CUDA(cudaMemset(d.tail.p, 0, d.tail.bytes));
+  MOE_CUDA(cudaMemsetAsync(d.keys.p, 0, d.keys.bytes, d.stream));
+  MOE_CUDA(cudaMemsetAsync(d.tail.p, 0, d.tail.bytes, d.stream));
   ninfer::DeviceArena arena(ix::select_scratch_bytes(g, kT, 8192) + (1 << 20));
 
   // The exactness premise: the device projection equals the exact sum, bit for bit.
   {
-    MOE_CUDA(cudaMemcpy(d.xin.p, x0.data(), 3 * kHidden * 2, cudaMemcpyHostToDevice));
+    MOE_CUDA(cudaMemcpyAsync(d.xin.p, x0.data(), 3 * kHidden * 2, cudaMemcpyHostToDevice, d.stream));
     if (ignis_fp8_linear(d.w.p, kQk, kHidden, d.xin.p, 3, d.qk.p, 0, d.stream) != 0) return 1;
     MOE_CUDA(cudaStreamSynchronize(d.stream));
     const auto qk = download<uint16_t>(d.qk.p, 3 * kQk);
@@ -400,10 +420,11 @@ int main() {
   }
 
   int rows_checked = 0, ties = 0;
-  double max_score_err = 0.0, max_q_ulps = 0.0;
+  double max_score_err = 0.0;
+  Agreement queries;
   auto load_rows = [&](const std::vector<uint16_t> &x, int first, int n) {
-    MOE_CUDA(cudaMemcpy(d.xin.p, &x[static_cast<std::size_t>(first) * kHidden], static_cast<std::size_t>(n) * kHidden * 2,
-                        cudaMemcpyHostToDevice));
+    MOE_CUDA(cudaMemcpyAsync(d.xin.p, &x[static_cast<std::size_t>(first) * kHidden],
+                             static_cast<std::size_t>(n) * kHidden * 2, cudaMemcpyHostToDevice, d.stream));
   };
 
   // Lane 0, slot 0: prefill chunks whose boundaries split blocks.
@@ -414,25 +435,26 @@ int main() {
     const std::string what = "prefill [" + std::to_string(c[0]) + "," + std::to_string(c[1]) + ")";
     const CallResult res = run_call(d, g, rope, arena, {0}, {c[0]}, n, c[1], what);
     check(res.dense == (c[1] <= 2051), what + ": Selection::dense is wrong");
-    if (!res.dense) check_rows(d, recorded, {0}, {c[0]}, n, what, &rows_checked, &ties, &max_score_err, &max_q_ulps);
+    if (!res.dense) check_rows(d, recorded, {0}, {c[0]}, n, what, &rows_checked, &ties, &max_score_err, &queries);
   }
   // Lane 1, slot 1: one prefill call.
   {
     load_rows(x1, 0, 4096);
     const CallResult res = run_call(d, g, rope, arena, {1}, {0}, 4096, 4096, "lane 1 prefill");
     check(!res.dense, "lane 1 prefill: a 4096-token call is not dense");
-    check_rows(d, recorded, {1}, {0}, 4096, "lane 1 prefill", &rows_checked, &ties, &max_score_err, &max_q_ulps);
+    check_rows(d, recorded, {1}, {0}, 4096, "lane 1 prefill", &rows_checked, &ties, &max_score_err, &queries);
   }
   // Decode 4096..4099, both lanes in one call; the graph bound 8192 stands for max_visible.
   std::vector<int32_t> decode_lists[3];
   std::vector<uint16_t> keys_after_4098, tail_after_4098;
   for (int p = 4096; p < 4100; ++p) {
-    MOE_CUDA(cudaMemcpy(d.xin.p, &x0[static_cast<std::size_t>(p) * kHidden], kHidden * 2, cudaMemcpyHostToDevice));
-    MOE_CUDA(cudaMemcpy(d.xin.as<uint16_t>() + kHidden, &x1[static_cast<std::size_t>(p) * kHidden], kHidden * 2,
-                        cudaMemcpyHostToDevice));
+    MOE_CUDA(cudaMemcpyAsync(d.xin.p, &x0[static_cast<std::size_t>(p) * kHidden], kHidden * 2, cudaMemcpyHostToDevice,
+                             d.stream));
+    MOE_CUDA(cudaMemcpyAsync(d.xin.as<uint16_t>() + kHidden, &x1[static_cast<std::size_t>(p) * kHidden], kHidden * 2,
+                             cudaMemcpyHostToDevice, d.stream));
     const std::string what = "decode " + std::to_string(p);
     run_call(d, g, rope, arena, {0, 1}, {p, p}, 1, 8192, what);
-    check_rows(d, recorded, {0, 1}, {p, p}, 1, what, &rows_checked, &ties, &max_score_err, &max_q_ulps);
+    check_rows(d, recorded, {0, 1}, {p, p}, 1, what, &rows_checked, &ties, &max_score_err, &queries);
     if (p < 4099) decode_lists[p - 4096] = download<int32_t>(d.tok_a.p, kWidth);
     if (p == 4098) {
       keys_after_4098 = slot_block_keys(d, 0, 1024);
@@ -451,7 +473,7 @@ int main() {
     b.positions = d.positions.as<int32_t>();
     b.max_visible = 8192;
     fn::Selection sel{d.tok_b.as<int32_t>(), d.cnt_b.as<int32_t>()};
-    MOE_CUDA(cudaMemset(d.tok_b.p, 0x7F, 2 * kWidth * 4));
+    MOE_CUDA(cudaMemsetAsync(d.tok_b.p, 0x7F, 2 * kWidth * 4, d.stream));
     cudaGraph_t graph = nullptr;
     MOE_CUDA(cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal));
     if (ignis_fp8_linear(d.w.p, kQk, kHidden, d.xin.p, 2, d.qk.p, 0, d.stream) != 0) return 1;
@@ -471,15 +493,11 @@ int main() {
   {
     const auto want = need(fx, "lane0.block_keys").as<uint16_t>();
     const auto got = slot_block_keys(d, 0, 1025);
-    double worst = 0.0;
-    std::size_t exact = 0;
-    for (std::size_t i = 0; i < want.size(); ++i) {
-      const double u = bf16_ulps(got[i], want[i]);
-      worst = std::max(worst, u);
-      exact += u == 0.0;
-    }
-    std::printf("  block keys: %zu / %zu bit-exact with the module, worst %.0f ulp\n", exact, want.size(), worst);
-    check(worst <= 1.0, "block keys differ from the module's by more than one BF16 ulp");
+    Agreement keys;
+    keys.add(got.data(), want.data(), want.size());
+    std::printf("  block keys: %zu / %zu bit-exact with the module, worst %.2e of the row's largest\n", keys.exact,
+                keys.total, keys.worst);
+    check(keys.ok(), "block keys differ from the module's (under 99% bit-exact, or a value past 2^-7)");
   }
 
   // Lane 0 again in one call, slot 2: the same state and the same selections as chunks + decode.
@@ -495,12 +513,12 @@ int main() {
     }
   }
 
-  std::printf("  %d recorded rows checked; scores within %.2e of the module; queries within %.0f ulp; "
-              "%d block(s) differ from the module, all at documented ties\n",
-              rows_checked, max_score_err, max_q_ulps, ties);
+  std::printf("  %d recorded rows checked; scores within %.2e of the module; queries %zu / %zu bit-exact, "
+              "worst %.2e of the row's largest; %d block(s) differ from the module, all at documented ties\n",
+              rows_checked, max_score_err, queries.exact, queries.total, queries.worst, ties);
   check(rows_checked == static_cast<int>(recorded.size()) - 2,  // rows 2049 and 2050 sit in dense calls
         "not every recorded row was checked: " + std::to_string(rows_checked));
-  check(max_q_ulps <= 1.0, "queries differ from the module's by more than one BF16 ulp");
+  check(queries.ok(), "queries differ from the module's (under 99% bit-exact, or a value past 2^-7)");
   MOE_CUDA(cudaStreamDestroy(d.stream));
   if (g_failed != 0) {
     std::fprintf(stderr, "test_flash_next_indexer: %d failure(s)\n", g_failed);

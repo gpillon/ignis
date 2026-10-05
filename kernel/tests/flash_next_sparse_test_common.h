@@ -173,10 +173,12 @@ inline std::vector<uint16_t> run(Device &d, const Call &c, const Enqueue &enqueu
     counts[r] = static_cast<int32_t>(c.lists[r].size());
     std::copy(c.lists[r].begin(), c.lists[r].end(), tokens.begin() + static_cast<size_t>(r) * kWidth);
   }
-  MOE_CUDA(cudaMemcpy(d.tokens.p, tokens.data(), tokens.size() * 4, cudaMemcpyHostToDevice));
-  MOE_CUDA(cudaMemcpy(d.counts.p, counts.data(), counts.size() * 4, cudaMemcpyHostToDevice));
-  MOE_CUDA(cudaMemcpy(d.slots.p, c.slots.data(), c.slots.size() * 4, cudaMemcpyHostToDevice));
-  MOE_CUDA(cudaMemcpy(d.positions.p, c.positions.data(), c.positions.size() * 4, cudaMemcpyHostToDevice));
+  // Everything on `stream`: a non-blocking stream is not ordered after the legacy stream.
+  MOE_CUDA(cudaMemcpyAsync(d.tokens.p, tokens.data(), tokens.size() * 4, cudaMemcpyHostToDevice, stream));
+  MOE_CUDA(cudaMemcpyAsync(d.counts.p, counts.data(), counts.size() * 4, cudaMemcpyHostToDevice, stream));
+  MOE_CUDA(cudaMemcpyAsync(d.slots.p, c.slots.data(), c.slots.size() * 4, cudaMemcpyHostToDevice, stream));
+  MOE_CUDA(cudaMemcpyAsync(d.positions.p, c.positions.data(), c.positions.size() * 4, cudaMemcpyHostToDevice,
+                           stream));
   fn::Batch b;
   b.lanes = static_cast<int32_t>(c.slots.size());
   b.tokens = c.tokens;
@@ -184,7 +186,7 @@ inline std::vector<uint16_t> run(Device &d, const Call &c, const Enqueue &enqueu
   b.positions = d.positions.as<int32_t>();
   b.max_visible = c.max_visible;
   fn::Selection sel{d.tokens.as<int32_t>(), d.counts.as<int32_t>()};
-  MOE_CUDA(cudaMemset(d.out.p, 0xFF, static_cast<size_t>(rows) * kQHeads * kHd * 2));
+  MOE_CUDA(cudaMemsetAsync(d.out.p, 0xFF, static_cast<size_t>(rows) * kQHeads * kHd * 2, stream));
   if (graph) {
     cudaGraph_t gr = nullptr;
     cudaGraphExec_t ex = nullptr;
