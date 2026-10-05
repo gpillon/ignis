@@ -18,15 +18,14 @@ constexpr int kDecodeSplits = 4;                             // k-splits of a ga
 
 inline std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
 
-// Decode route (tickets): counters and the gate/up fixed-point sums, all zero between calls. Per
-// (distinct expert, h block): the gate/up units that have added into it and the down units that
-// have read it back.
+// Decode route: counters and the gate/up fixed-point sums (zero between calls), and the SwiGLU
+// output h of every distinct expert.
 struct DecodeCounters {
   uint32_t ticket;
   uint32_t done;
   uint32_t pad[30];
-  uint32_t block_arrivals[kDecodeMaxUnique * kGateUpBlocks];
-  uint32_t block_readers[kDecodeMaxUnique * kGateUpBlocks];
+  uint32_t gate_up_arrivals[kDecodeMaxUnique * kGateUpBlocks];
+  uint32_t h_ready[kDecodeMaxUnique];
 };
 
 // Prefill route: tokens are grouped by expert in 64-token chunks of the call.
@@ -45,6 +44,7 @@ inline uint32_t max_items(uint32_t tokens) {
 struct WorkspaceLayout {
   std::size_t decode_counters = 0;
   std::size_t decode_gate_up = 0;   // int64 [10 D][D][1280], fixed point (D = decode tokens)
+  std::size_t decode_h = 0;         // f32 [10 D][D][640]
   std::size_t chunk_hist = 0;       // u32 [chunks][512]: assignments per expert per chunk, then bases
   std::size_t expert_offset = 0;    // u32 [513]: first sorted row of each expert, then the total
   std::size_t item_count = 0;       // u32 [1]
@@ -67,6 +67,7 @@ inline WorkspaceLayout workspace_layout(uint32_t decode_tokens, uint32_t max_tok
   };
   l.decode_counters = take(sizeof(DecodeCounters));
   l.decode_gate_up = take(sizeof(int64_t) * kTopK * d * d * kGateUpOut);
+  l.decode_h = take(sizeof(float) * kTopK * d * d * kInter);
   l.chunk_hist = take(sizeof(uint32_t) * group_chunks(max_tokens) * kExperts);
   l.expert_offset = take(sizeof(uint32_t) * (kExperts + 1));
   l.item_count = take(sizeof(uint32_t));

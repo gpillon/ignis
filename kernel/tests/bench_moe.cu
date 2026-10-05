@@ -21,8 +21,6 @@
 #include "moe_experts_common.h"
 #include "moe_fixture.h"
 
-#include "../src/moe_trace.h"
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -287,71 +285,6 @@ int main(int argc, char **argv) {
       }
     }
 
-  }
-
-  // Where the ticket route's one-token launch spends its time: one traced call (the kernel's
-  // global-timer stamps per unit, moe_trace.h) with its experts cold, and the same call again
-  // with them in the L2. Times from the first unit's start.
-  {
-    const int calls = 32;
-    const std::vector<int32_t> ids = make_calls(calls, 1, kPool);
-    std::vector<float> w(ids.size(), 0.1f);
-    DeviceBytes dids(ids.size() * 4), dw(w.size() * 4);
-    upload(dids, ids);
-    upload(dw, w);
-    const int units = kTop * (40 + 20);
-    DeviceBytes trace(static_cast<std::size_t>(units) * IGNIS_MOE_TRACE_WORDS * 8);
-    auto call = [&](int c, bool traced) {
-      const int32_t *i = dids.as<int32_t>() + static_cast<std::size_t>(c) * kTop;
-      const float *wt = dw.as<float>() + static_cast<std::size_t>(c) * kTop;
-      MOE_RC(traced ? ignis_moe_experts_decode_trace(dx.p, 1, i, wt, d_slots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(),
-                                                     trace.as<unsigned long long>(), nullptr)
-                    : ignis_moe_experts_decode(dx.p, 1, i, wt, d_slots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(), nullptr));
-      MOE_CUDA(cudaDeviceSynchronize());
-    };
-    auto report = [&](const char *what) {
-      const std::vector<unsigned long long> r = download<unsigned long long>(trace.p, static_cast<std::size_t>(units) * IGNIS_MOE_TRACE_WORDS);
-      unsigned long long t0 = ~0ull, t1 = 0;
-      for (int u = 0; u < units; ++u) {
-        t0 = std::min(t0, r[u * IGNIS_MOE_TRACE_WORDS + 3]);
-        t1 = std::max(t1, r[u * IGNIS_MOE_TRACE_WORDS + 6]);
-      }
-      auto median = [](std::vector<double> v) {
-        std::sort(v.begin(), v.end());
-        return v.empty() ? 0.0 : v[v.size() / 2];
-      };
-      std::vector<double> ready[2], mma[2], tail[2], begin[2], end[2], wait;
-      for (int u = 0; u < units; ++u) {
-        const unsigned long long *e = &r[static_cast<std::size_t>(u) * IGNIS_MOE_TRACE_WORDS];
-        const int kind = static_cast<int>(e[2]);
-        ready[kind].push_back((e[4] - e[3]) * 1e-3);
-        mma[kind].push_back((e[5] - e[4]) * 1e-3);
-        tail[kind].push_back((e[6] - e[5]) * 1e-3);
-        begin[kind].push_back((e[3] - t0) * 1e-3);
-        end[kind].push_back((e[6] - t0) * 1e-3);
-        if (kind == 1) wait.push_back(e[7] * 1e-3);
-      }
-      std::vector<double> gu_begin = begin[0];
-      std::sort(gu_begin.begin(), gu_begin.end());
-      int second_wave = 0;
-      for (double b : gu_begin) second_wave += b > gu_begin.front() + 1.0;
-      std::printf("  trace, 1 token, %s: span %.1f us (from the first unit's start to the last unit's end)\n", what, (t1 - t0) * 1e-3);
-      std::printf("    gate/up %zu units: begin to rotated %.2f, rotated to summed %.2f, to arrived %.2f us (medians); "
-                  "%d start more than 1 us after the first; last ends at %.1f us\n",
-                  ready[0].size(), median(ready[0]), median(mma[0]), median(tail[0]), second_wave,
-                  *std::max_element(end[0].begin(), end[0].end()));
-      std::printf("    down %zu units: first starts at %.1f us, median start %.1f us; begin to first block in %.2f, first block to "
-                  "last multiplied %.2f, to accumulated %.2f us (medians); waiting for h %.2f us (median), %.2f (max); last "
-                  "ends at %.1f us\n",
-                  ready[1].size(), *std::min_element(begin[1].begin(), begin[1].end()), median(begin[1]), median(ready[1]),
-                  median(mma[1]), median(tail[1]), median(wait), *std::max_element(wait.begin(), wait.end()),
-                  *std::max_element(end[1].begin(), end[1].end()));
-    };
-    for (int c = 8; c < calls; ++c) call(c, false);  // other experts through the L2
-    call(0, true);
-    report("experts from DRAM");
-    call(0, true);
-    report("experts in the L2");
   }
 
   // The other ops, each over copies that together exceed the L2 so the weights come from DRAM.
