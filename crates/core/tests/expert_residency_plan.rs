@@ -4,9 +4,10 @@
 //! numbers the loader has measured or read from the artifact.
 
 use ignis_core::residency::{
-    ExpertCacheRequest, ExpertCatalog, HOST_MARGIN_BYTES, HostPlanError, HostPlanRequest, KBits,
-    Projection, ProjectionId, min_slots_per_class, plan_expert_cache,
-    plan_host, prefill_staging_ring_bytes, residency_table_bytes, warm_start_order,
+    ExpertCachePlanError, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, HOST_MARGIN_BYTES,
+    HostPlanError, HostPlanRequest, KBits, Projection, ProjectionId, default_prefetch_budget_bytes,
+    min_slots_per_class, plan_expert_cache, plan_host, prefill_staging_ring_bytes,
+    residency_table_bytes, warm_start_order,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -75,8 +76,27 @@ fn this_machine_reports_its_available_physical_memory() {
 #[test]
 fn a_machine_short_of_the_pool_itself_names_the_pool() {
     let err = plan_host(&host(40 * GIB)).expect_err("below the margin");
+    let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "expert_pool");
+    assert!(message.contains("close other applications"), "{message}");
+    assert!(!message.contains("hot rows"), "{message}");
+}
+
+#[test]
+fn the_staging_line_crossing_names_staging_and_its_own_remedy() {
+    // 41.5 GiB available, 35.5 usable: the pool and the hot rows fit (40),
+    // the staging buffers cross.
+    let request = HostPlanRequest {
+        expert_pool_bytes: 33 * GIB,
+        ..host(41 * GIB + GIB / 2)
+    };
+    let err = plan_host(&request).expect_err("below the margin");
+    let message = err.to_string();
+    let HostPlanError::BelowMargin { crossing_line, .. } = err;
+    assert_eq!(crossing_line, "staging");
+    assert!(message.contains("smaller staging buffers"), "{message}");
+    assert!(!message.contains("hot rows,"), "{message}");
 }
 
 // ---- the VRAM expert cache -------------------------------------------------
@@ -88,16 +108,21 @@ const DN4: usize = 7;
 
 /// One layer of twenty experts: ten hot ones at K = 4 (nine selections
 /// each), ten cold ones at K = 2 (one each); every slot 100 bytes.
-fn hot_and_cold() -> (ExpertCatalog, Vec<u64>) {
+fn hot_and_cold() -> (ExpertCatalog, ExpertTraffic) {
+    hot_and_cold_with(1)
+}
+
+fn hot_and_cold_with(cold_selections: u64) -> (ExpertCatalog, ExpertTraffic) {
     let map = (0..20)
         .map(|e| if e < 10 { (KBits::K4, KBits::K4) } else { (KBits::K2, KBits::K2) })
         .collect();
     let catalog = ExpertCatalog::new(1, 20, map, [100; 8]).expect("catalog");
-    let traffic = (0..20).map(|e| if e < 10 { 9 } else { 1 }).collect();
+    let counts = (0..20).map(|e| if e < 10 { 9 } else { cold_selections }).collect();
+    let traffic = ExpertTraffic::new(&catalog, counts).expect("traffic");
     (catalog, traffic)
 }
 
-fn cache_request<'a>(catalog: &'a ExpertCatalog, traffic: &'a [u64]) -> ExpertCacheRequest<'a> {
+fn cache_request<'a>(catalog: &'a ExpertCatalog, traffic: &'a ExpertTraffic) -> ExpertCacheRequest<'a> {
     ExpertCacheRequest {
         budget_bytes: 3_800,
         planned_bytes: 1_000,
@@ -124,6 +149,13 @@ fn the_cache_takes_what_the_plan_leaves_and_splits_it_as_one_lru_would_hold_it()
     assert_eq!(plan.capacity(), [2, 0, 0, 8, 2, 0, 0, 8]);
     assert_eq!(plan.pooled_bytes(), 2_000);
     assert_eq!(plan.pools[GU4].bytes, 800);
+    // Each class one LRU over equally hot projections: 8 of 10 hot ones and
+    // 2 of 10 cold ones resident, weighted by selections (180 hot, 20 cold).
+    assert!((plan.expected_hit_rate - (180.0 * 0.8 + 20.0 * 0.2) / 200.0).abs() < 1e-6);
+    let printed = plan.to_string();
+    for needle in ["expert_cache 2000 bytes", "expected hit rate 74.0%", "before locality", "gate_up_k4 8", "down_k2 2"] {
+        assert!(printed.contains(needle), "{needle} missing: {printed}");
+    }
 }
 
 #[test]
@@ -139,8 +171,7 @@ fn a_cache_larger_than_every_projection_holds_them_all() {
 
 #[test]
 fn every_populated_class_gets_its_minimum_even_without_traffic() {
-    let (catalog, mut traffic) = hot_and_cold();
-    traffic[10..].fill(0);
+    let (catalog, traffic) = hot_and_cold_with(0);
     let request = ExpertCacheRequest {
         min_slots: 3,
         ..cache_request(&catalog, &traffic)
@@ -152,6 +183,35 @@ fn every_populated_class_gets_its_minimum_even_without_traffic() {
     assert_eq!(plan.capacity()[DN2], 3);
     assert_eq!(plan.capacity()[GU4], 7);
     assert_eq!(plan.capacity()[DN4], 7);
+}
+
+#[test]
+fn class_minimums_the_cache_cannot_hold_refuse_rather_than_overrun_it() {
+    let (catalog, traffic) = hot_and_cold();
+    // No floor, and 400 B of cache against four classes of 3 x 100 B.
+    let request = ExpertCacheRequest {
+        planned_bytes: 2_600,
+        floor_bytes: 0,
+        min_slots: 3,
+        ..cache_request(&catalog, &traffic)
+    };
+    let err = plan_expert_cache(&request).expect_err("below the minimums");
+    assert_eq!(
+        err,
+        ExpertCachePlanError::BelowClassMinimum {
+            cache_bytes: 400,
+            needed_bytes: 1_200,
+            min_slots: 3
+        }
+    );
+    assert!(err.to_string().contains("1200"), "{err}");
+}
+
+#[test]
+fn traffic_that_does_not_cover_the_catalog_is_refused() {
+    let (catalog, _) = hot_and_cold();
+    let err = ExpertTraffic::new(&catalog, vec![1; 19]).expect_err("one expert short");
+    assert_eq!((err.expected, err.got), (20, 19));
 }
 
 #[test]
@@ -178,6 +238,21 @@ fn a_cache_below_its_floor_refuses_naming_what_to_shrink() {
 #[test]
 fn the_spec_s_floor_is_twelve_gib() {
     assert_eq!(ignis_core::residency::EXPERT_CACHE_FLOOR_BYTES, 12 * GIB);
+}
+
+#[test]
+fn the_default_prefetch_budget_is_one_layer_s_share_of_the_round_at_the_link_s_speed() {
+    // 6 ms a round at one lane, 7 at three, over 48 layers at 12 GB/s.
+    let small = |largest: u64| {
+        let mut slot_bytes = [100u64; 8];
+        slot_bytes[3] = largest;
+        ExpertCatalog::new(48, 1, vec![(KBits::K2, KBits::K2); 48], slot_bytes).expect("catalog")
+    };
+    assert_eq!(default_prefetch_budget_bytes(1, &small(100)), 1_500_000);
+    assert_eq!(default_prefetch_budget_bytes(3, &small(100)), 1_750_000);
+    // Never below one projection of the largest class: spec 01's gate/up at
+    // K = 4 (1,646,592 B) is larger than one lane's window.
+    assert_eq!(default_prefetch_budget_bytes(1, &small(1_646_592)), 1_646_592);
 }
 
 #[test]
@@ -218,8 +293,8 @@ fn the_tables_cost_a_slot_table_entry_and_an_lru_entry_per_projection() {
 fn the_sidecar_s_per_expert_traffic_gives_the_warm_start_order() {
     // Selections per (layer, expert), layer-major, as converter.json's
     // expert_traffic records them.
-    let counts = [5, 0, 9, 7, 9, 1];
-    let order = warm_start_order(&catalog(), &counts);
+    let traffic = ExpertTraffic::new(&catalog(), vec![5, 0, 9, 7, 9, 1]).expect("traffic");
+    let order = warm_start_order(&traffic);
     let p = |layer, expert, projection| ProjectionId::new(layer, expert, projection);
     // Hottest first; a tie keeps the canonical key order; an expert never
     // selected is not warmed.

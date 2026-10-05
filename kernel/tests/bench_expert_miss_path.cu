@@ -128,8 +128,9 @@ struct Pools {
     size_t slot_bytes = 0;
 };
 
-// `lists` job lists of n copies of `bytes` each: distinct random sources in
-// the host pool, distinct slots on the device.
+// `lists` job lists of n copies of `bytes` each: random sources in the host
+// pool (two may overlap, which costs a copy nothing), distinct slots on the
+// device.
 struct Lists {
     int n = 0;
     size_t bytes = 0;
@@ -299,6 +300,10 @@ int main(int argc, char** argv) {
         else if (a == "--reps" && i + 1 < argc) { reps = std::atoi(argv[++i]); }
         else if (a == "--quick") { quick = true; }
         else { std::fprintf(stderr, "usage: %s [--host-gib 4] [--reps 15] [--quick]\n", argv[0]); return 2; }
+    }
+    if (reps < 1 || host_gib < 1) {
+        std::fprintf(stderr, "--reps and --host-gib must be at least 1\n");
+        return 2;
     }
 
     int dev = 0;

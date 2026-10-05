@@ -51,6 +51,12 @@ impl KBits {
         }
     }
 
+    /// The K whose [`KBits::half_bits`] is `half_bits` — the artifact's
+    /// `k2` field (layout.md §3) — if it is one of the four.
+    pub fn from_half_bits(half_bits: u32) -> Option<KBits> {
+        KBits::ALL.into_iter().find(|k| k.half_bits() == half_bits)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             KBits::K2 => "k2",

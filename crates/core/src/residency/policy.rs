@@ -29,22 +29,18 @@
 //!    every lane's second, …, gate/up before down, a repeat kept where it
 //!    first appears — skips what is resident or staged, and admits the rest
 //!    in that order the same way, except that a decode prefetch is
-//!    **dropped**, not an error, when no victim is available, when step 4
-//!    had to evict it, or once the step's prefetches would pass
-//!    `prefetch_budget_bytes` (decode only: a prefill streams its lookahead
-//!    whole);
+//!    **dropped**, not an error, when no victim is available or when it
+//!    would take the step's prefetches past `prefetch_budget_bytes` (the
+//!    walk then goes on down the rank for one that fits; decode only — a
+//!    prefill streams its lookahead whole);
 //! 6. releases this layer's staged projections: the expert kernel has run.
 //!
 //! **Victim:** of a class's resident projections not stamped by the current
-//! step, the one with the smallest `(stamp, key)` that is not **protected**;
-//! a candidate already resident at the start of the step is protected, so a
-//! step does not evict what it predicts the next layer reads. Only a miss,
-//! and only when nothing unprotected is left, takes the smallest protected
-//! one; a prefetch never does. Everything the current step stamped — its
-//! hits, its misses, its prefetches — is **pinned** until the step ends, so a
-//! step never evicts what its own kernel reads. That makes a step's victims
-//! order-independent: the `k` victims of a class are its first `k` unpinned
-//! projections ordered by `(protected, stamp, key)`, however the misses are
+//! step, the one with the smallest `(stamp, key)`. Everything the current
+//! step stamped — its hits, its misses, its prefetches — is **pinned** until
+//! the step ends, so a step never evicts what its own kernel reads. That
+//! makes a step's victims order-independent: the `k` victims of a class are
+//! its `k` smallest unpinned `(stamp, key)` pairs, however the misses are
 //! walked.
 //!
 //! A decode step whose class cannot hold its selection — more misses than
@@ -67,7 +63,7 @@
 use std::collections::BTreeSet;
 
 use super::class::{ExpertCatalog, KClass, Projection, ProjectionId};
-use super::metrics::ResidencyCounters;
+use super::counters::ResidencyCounters;
 
 /// The router's lookahead width the spec sets by default (a load option).
 pub const DEFAULT_PREFETCH_WIDTH: usize = 16;
@@ -361,13 +357,6 @@ impl ResidencyModel {
             Some(next) => ranked_candidates(next, step.lookahead, self.config.prefetch_width),
             None => Vec::new(),
         };
-        // What the next layer is predicted to read and already holds: this
-        // step's misses take it only when nothing else can go.
-        let protected: BTreeSet<ProjectionId> = candidates
-            .iter()
-            .copied()
-            .filter(|id| self.resident.contains_key(id))
-            .collect();
         let (mut hits, mut misses) = (Vec::new(), Vec::new());
         for &id in &selected {
             if self.resident.contains_key(&id) || self.staged.contains(&id) {
@@ -389,7 +378,7 @@ impl ResidencyModel {
 
         for &id in &hits {
             let class = self.catalog.class_of(id).index();
-            self.counters.hits[class] += 1;
+            self.counters.hits[class][phase] += 1;
             if let Some(entry) = self.resident.get(&id).copied() {
                 if entry.prefetched {
                     out.prefetch_hits.push(id);
@@ -408,7 +397,7 @@ impl ResidencyModel {
             let class = self.catalog.class_of(id).index();
             let admission = match step.phase {
                 Phase::Decode => {
-                    let room = self.make_room(class, now, &protected, true, &mut out.evictions);
+                    let room = self.make_room(class, now, &mut out.evictions);
                     debug_assert!(room, "check_room promised a slot");
                     self.insert(id, now, false);
                     Admission::Slot
@@ -427,27 +416,19 @@ impl ResidencyModel {
             Phase::Prefill => None,
         };
         let mut spent = 0u64;
-        let mut spent_out = false;
         for id in candidates {
             if self.resident.contains_key(&id) || self.staged.contains(&id) {
                 continue;
             }
-            // A protected candidate this step's misses had to take is not
-            // fetched back by the same step.
-            if out.evictions.contains(&id) {
-                out.prefetch_dropped.push(id);
-                continue;
-            }
             let bytes = self.catalog.bytes(id);
-            spent_out |= budget.is_some_and(|b| spent + bytes > b);
-            if spent_out {
+            if budget.is_some_and(|b| spent + bytes > b) {
                 out.prefetch_dropped.push(id);
                 continue;
             }
             let class = self.catalog.class_of(id).index();
             let admission = match step.phase {
                 Phase::Decode => {
-                    if !self.make_room(class, now, &protected, false, &mut out.evictions) {
+                    if !self.make_room(class, now, &mut out.evictions) {
                         out.prefetch_dropped.push(id);
                         continue;
                     }
@@ -497,36 +478,21 @@ impl ResidencyModel {
         Ok(())
     }
 
-    /// A free slot in `class`, evicting its victim if it has none: the
-    /// smallest `(stamp, key)` not pinned by this step and not `protected`,
-    /// or — only when `may_take_protected` and nothing else can go — the
-    /// smallest protected one. False when no victim may be taken.
-    fn make_room(
-        &mut self,
-        class: usize,
-        now: u64,
-        protected: &BTreeSet<ProjectionId>,
-        may_take_protected: bool,
-        evictions: &mut Vec<ProjectionId>,
-    ) -> bool {
+    /// A free slot in `class`, evicting its victim if it has none. False
+    /// when every resident projection of the class is pinned.
+    fn make_room(&mut self, class: usize, now: u64, evictions: &mut Vec<ProjectionId>) -> bool {
         if (self.lru[class].len() as u32) < self.config.capacity[class] {
             return true;
         }
-        // Pinned entries carry `now`, the largest stamp, so they sit at the
-        // end and every walk below stops before them.
-        let unpinned = || self.lru[class].iter().take_while(|(stamp, _)| *stamp < now);
-        let victim = unpinned()
-            .find(|(_, id)| !protected.contains(id))
-            .or_else(|| unpinned().next().filter(|_| may_take_protected))
-            .copied();
-        match victim {
-            Some((stamp, victim)) => {
+        // Pinned entries carry `now`, the largest stamp, so they sit last.
+        match self.lru[class].first().copied() {
+            Some((stamp, victim)) if stamp < now => {
                 self.lru[class].remove(&(stamp, victim));
                 self.resident.remove(&victim);
                 evictions.push(victim);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 

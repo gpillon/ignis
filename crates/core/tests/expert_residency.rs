@@ -234,26 +234,35 @@ fn the_prefetch_width_takes_the_top_of_each_lane_s_ranking() {
 }
 
 #[test]
-fn a_decode_step_s_prefetches_stop_at_its_budget_best_ranked_first() {
+fn a_decode_step_s_prefetches_keep_to_its_budget_best_ranked_first() {
     let mut m = ResidencyModel::new(
         small_catalog(),
         PolicyConfig {
             capacity: ROOMY,
             prefetch_width: 16,
-            prefetch_budget_bytes: Some(350),
+            prefetch_budget_bytes: Some(500),
         },
     );
     let lane: &[u16] = &[2, 3];
     let step = m.step(&LayerStep::decode(0, &[0]).lookahead(&[lane])).expect("step");
-    // Rank order: expert 2's gate/up (K3, 300 B) fits; its down (100 B)
-    // would pass 350, and so would everything after it.
-    assert_eq!(step.prefetches, vec![(gate_up(1, 2), Admission::Slot)]);
-    assert_eq!(step.prefetch_dropped, vec![down(1, 2), gate_up(1, 3), down(1, 3)]);
+    // Rank order: expert 2's gate/up (K3, 300 B) and down (100 B) fit;
+    // expert 3's gate/up (K4, 400 B) would pass 500 and is skipped; its down
+    // (100 B) still fits.
+    assert_eq!(
+        step.prefetches,
+        vec![
+            (gate_up(1, 2), Admission::Slot),
+            (down(1, 2), Admission::Slot),
+            (down(1, 3), Admission::Slot),
+        ]
+    );
+    assert_eq!(step.prefetch_dropped, vec![gate_up(1, 3)]);
     // The step's own misses are never budgeted.
-    assert_eq!(step.bytes_moved, 200 + 100 + 300);
+    assert_eq!(step.bytes_moved, 200 + 100 + 500);
     // A prefill streams its lookahead whole.
     let step = m.step(&LayerStep::prefill(0, &[1]).lookahead(&[&[3, 0][..]])).expect("step");
-    assert_eq!(step.prefetches.len(), 4);
+    assert_eq!(step.prefetches.len(), 3);
+    assert!(step.prefetch_dropped.is_empty());
 }
 
 #[test]
@@ -267,30 +276,6 @@ fn a_prefetch_never_evicts_the_current_step_and_is_dropped_when_nothing_else_can
     assert_eq!(step.evictions, vec![down(1, 0)]);
     assert!(step.prefetches.contains(&(down(1, 1), Admission::Slot)));
     assert_eq!(step.prefetch_dropped, vec![down(1, 2)]);
-}
-
-#[test]
-fn a_step_s_misses_spare_what_its_lookahead_names_for_the_next_layer() {
-    let mut m = model(tight_downs(2), 16);
-    decode(&mut m, 1, &[0]); // down(1, 0): the oldest down
-    decode(&mut m, 0, &[1]); // down(0, 1): full now
-    let lane: &[u16] = &[0];
-    let step = m.step(&LayerStep::decode(0, &[2]).lookahead(&[lane])).expect("step");
-    // The lookahead names expert 0 of layer 1, so its old down is spared and
-    // the younger down(0, 1) goes; nothing is fetched back.
-    assert_eq!(step.evictions, vec![down(0, 1)]);
-    assert!(step.prefetches.is_empty());
-}
-
-#[test]
-fn a_miss_takes_a_protected_projection_only_when_nothing_else_can_go_and_does_not_refetch_it() {
-    let mut m = model(tight_downs(1), 16);
-    decode(&mut m, 1, &[0]);
-    let lane: &[u16] = &[0];
-    let step = m.step(&LayerStep::decode(0, &[2]).lookahead(&[lane])).expect("step");
-    assert_eq!(step.evictions, vec![down(1, 0)]);
-    assert_eq!(step.prefetch_dropped, vec![down(1, 0)]);
-    assert!(step.prefetches.is_empty());
 }
 
 #[test]
@@ -505,13 +490,15 @@ fn over_random_traces_the_model_keeps_every_promise_of_its_contract() {
             assert_eq!(seen, selected.iter().copied().collect::<Vec<_>>(), "seed {seed}");
 
             // No eviction of a pinned projection: nothing the step selected
-            // or prefetched is given up by that same step.
+            // is given up by that same step, and every projection it
+            // prefetched into a slot is still there when it ends.
             for evicted in &out.evictions {
                 assert!(!selected.contains(evicted), "seed {seed}: evicted a selected {evicted:?}");
-                assert!(
-                    !out.prefetches.iter().any(|(p, _)| p == evicted),
-                    "seed {seed}: evicted its own prefetch {evicted:?}"
-                );
+            }
+            for (p, admission) in &out.prefetches {
+                if *admission == Admission::Slot {
+                    assert!(m.is_resident(*p), "seed {seed}: lost its own prefetch {p:?}");
+                }
             }
             // A prefill evicts nothing.
             if s.prefill {
@@ -621,69 +608,34 @@ fn decode_without_prefetch_is_a_plain_per_class_lru() {
     }
 }
 
-// ---- metrics ----------------------------------------------------------------
+// ---- counts -------------------------------------------------------------------
 
 #[test]
-fn the_metric_families_are_fixed_and_carry_what_the_model_counted() {
-    use ignis_core::residency::FAMILIES;
-    let names: Vec<_> = FAMILIES.iter().map(|f| f.name).collect();
-    assert_eq!(
-        names,
-        [
-            "ignis_expert_cache_hits_total",
-            "ignis_expert_cache_misses_total",
-            "ignis_expert_prefetches_issued_total",
-            "ignis_expert_prefetches_used_total",
-            "ignis_expert_bytes_moved_total",
-            "ignis_expert_residency_stall_seconds_total",
-            "ignis_expert_cache_slots",
-        ]
-    );
-    for family in FAMILIES {
-        assert_eq!(family.name.ends_with("_total"), family.kind == "counter", "{}", family.name);
-    }
-
+fn the_counters_count_hits_and_misses_by_class_and_phase_and_bytes_by_phase() {
+    use ignis_core::residency::Phase;
     let mut m = model(tight_downs(2), 16);
     let lane: &[u16] = &[1];
     m.step(&LayerStep::decode(0, &[0]).lookahead(&[lane])).expect("step");
     decode(&mut m, 1, &[1]);
-    prefill(&mut m, 0, &[2]);
-    let samples = m.counters().samples(&m.config().capacity, &m.occupancy());
-    // 8 hit classes + 8 x 2 miss phases + 2 prefetch + 2 byte phases + 1
-    // stall + 8 x 2 slot states, zeros included.
-    assert_eq!(samples.len(), 45);
-    let value = |name: &str, labels: &[(&str, &str)]| {
-        samples
-            .iter()
-            .find(|s| s.name == name && s.labels.as_slice() == labels)
-            .unwrap_or_else(|| panic!("{name} {labels:?}"))
-            .value
-    };
-    // Decode: gate/up K2 + down of expert 0, prefetch of expert 1 (K2.5 +
-    // down) used by the second step. Prefill: expert 2 (K3 + down).
-    assert_eq!(value("ignis_expert_cache_hits_total", &[("class", "gate_up_k2_5")]), 1.0);
-    assert_eq!(value("ignis_expert_cache_hits_total", &[("class", "down_k2")]), 1.0);
-    assert_eq!(
-        value("ignis_expert_cache_misses_total", &[("class", "down_k2"), ("phase", "decode")]),
-        1.0
-    );
-    assert_eq!(
-        value("ignis_expert_cache_misses_total", &[("class", "down_k2"), ("phase", "prefill")]),
-        1.0
-    );
-    assert_eq!(value("ignis_expert_prefetches_issued_total", &[]), 2.0);
-    assert_eq!(value("ignis_expert_prefetches_used_total", &[]), 2.0);
-    assert_eq!(value("ignis_expert_bytes_moved_total", &[("phase", "decode")]), 650.0);
-    assert_eq!(value("ignis_expert_bytes_moved_total", &[("phase", "prefill")]), 400.0);
-    assert_eq!(value("ignis_expert_residency_stall_seconds_total", &[]), 0.0);
-    assert_eq!(
-        value("ignis_expert_cache_slots", &[("class", "down_k2"), ("state", "capacity")]),
-        2.0
-    );
-    // Downs of experts 0 and 1, then the prefill's down found a full class
-    // and was staged: still two.
-    assert_eq!(
-        value("ignis_expert_cache_slots", &[("class", "down_k2"), ("state", "in_use")]),
-        2.0
-    );
+    prefill(&mut m, 0, &[0, 2]);
+    let c = m.counters();
+    let gu = |k| KClass::new(Projection::GateUp, k).index();
+    let dn = KClass::new(Projection::Down, KBits::K2).index();
+    let (d, p) = (Phase::Decode.index(), Phase::Prefill.index());
+    // Decode: expert 0 (gate/up K2 + down) misses, and expert 1 (K2.5 +
+    // down), prefetched, hits at layer 1. Prefill: expert 0 hits, expert 2
+    // (K3 + down) misses; its down finds the down pool full and is staged.
+    assert_eq!(c.misses[gu(KBits::K2)][d], 1);
+    assert_eq!(c.misses[dn][d], 1);
+    assert_eq!(c.hits[gu(KBits::K2_5)][d], 1);
+    assert_eq!(c.hits[dn][d], 1);
+    assert_eq!(c.hits[gu(KBits::K2)][p], 1);
+    assert_eq!(c.hits[dn][p], 1);
+    assert_eq!(c.misses[gu(KBits::K3)][p], 1);
+    assert_eq!(c.misses[dn][p], 1);
+    assert_eq!(c.prefetch_issued, 2);
+    assert_eq!(c.prefetch_used, 2);
+    assert_eq!(c.bytes_moved, [200 + 100 + 250 + 100, 300 + 100]);
+    assert_eq!(c.stall_nanos, 0);
+    assert_eq!(m.occupancy()[dn], 2);
 }

@@ -7,7 +7,7 @@ in the shape `docs/specs/flash-next/layout.md` gives the real artifact, so one r
 serves both:
 
     <out>/work/converter.json          k_map, k_classes (record bytes), expert_traffic
-    <out>/traces/<domain>/manifest.json
+    <out>/traces/<domain>/manifest.json  finish.py's fields: tokens, layers, set, chunks, valid
     <out>/traces/<domain>/experts.i16   (N, 48, 10) the router's top-10 per token, layer
     <out>/traces/<domain>/lookahead.i16 (N, 48, 20) router L+1 on layer L's MoE input
 
@@ -100,7 +100,7 @@ def main():
         for i, k in enumerate(K):
             n = sum(row[proj].count(K2[i]) for row in k_layers)
             k_classes.append({"class": f"{proj}-{k:g}", "projections": n,
-                              "record_bytes": RECORD[proj][i]})
+                              "record_bytes": RECORD[proj][i], "traffic_share": None})
     os.makedirs(f"{a.out}/work", exist_ok=True)
     with open(f"{a.out}/work/converter.json", "w", encoding="utf-8") as f:
         json.dump({"schema": "flash-next-converter-v1",
@@ -122,15 +122,18 @@ def main():
         rows = np.nonzero(test_kind == kid)[0]
         if rows.size == 0:
             continue
-        chunks = []
-        for ch in sorted(set(chunk_of[test_tok[rows]].tolist())):
-            chunks.append({"chunk": ch, "valid": int((chunk_of[test_tok[rows]] == ch).sum())})
+        chunks = sorted(set(chunk_of[test_tok[rows]].tolist()))
+        valid = [int((chunk_of[test_tok[rows]] == ch).sum()) for ch in chunks]
         out = f"{a.out}/traces/{kind}"
         os.makedirs(out, exist_ok=True)
         experts[rows].astype("<i2").tofile(f"{out}/experts.i16")
         look[rows].astype("<i2").tofile(f"{out}/lookahead.i16")
         with open(f"{out}/manifest.json", "w", encoding="utf-8") as f:
-            json.dump({"tokens": int(rows.size), "chunks": chunks}, f)
+            # finish.py's manifest, field for field (layout.md §12).
+            json.dump({"tokens": int(rows.size), "layers": LAYERS, "set": "test",
+                       "chunks": chunks, "valid": valid,
+                       "stream": "bf16 (study run 3, proxy)",
+                       "order": "token-major (N, layers, k)"}, f)
         print(f"{kind}: {rows.size} tokens, {len(chunks)} chunks", flush=True)
     print("mean b/w incl. scales:", {p: round(float(np.mean(v)), 4) for p, v in means.items()})
 
