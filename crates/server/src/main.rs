@@ -705,7 +705,9 @@ async fn main() {
 
     tracing::info!(
         name: "ignis.process.started",
-        model = %model,
+        // The id the load is served under (`config::served_model_for`): a
+        // Flash-Next artifact started without `--model` is its own.
+        model = %server.engine.model_id(),
         bind = %bind,
         api_key_required = auth,
         metrics = metrics.as_deref().unwrap_or("off"),
