@@ -21,6 +21,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
+use ignis_artifact::flash_next::{self, FlashNextGeometry, FlashNextPlan};
 use ignis_artifact::{
     model_scope_27b_with, DraftModule, InventoryEntry, MaterializationPlan, MaterializedArtifact,
     ModelScope, NumericFormat, ObjectHandle, Reader, StorageLayout,
@@ -693,6 +694,109 @@ pub fn plan_qwen38_27b_reservations(
 }
 
 // ---------------------------------------------------------------------------
+// Flash-Next (spec flash-next/04, GitHub #302, ADR 0043)
+// ---------------------------------------------------------------------------
+
+/// The bound-tensor descriptors of a Flash-Next artifact's device tensors
+/// (every non-expert tensor of `ignis_artifact::flash_next`'s inventory whose
+/// role is the device), at the addresses `placement` gives, with the names
+/// the leaf's binder (`kernel/src/flash_next/bind.cu`) reads. The experts are
+/// residency's and the n-gram objects the host's: none of them crosses.
+fn build_flash_next_bound_tensors(
+    fn_plan: &FlashNextPlan,
+    geometry: &FlashNextGeometry,
+    placement: impl Fn(ObjectHandle) -> Result<(u64, *const c_void), String>,
+) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
+    let mut entries = flash_next::global_entries(geometry);
+    for layer in 0..geometry.layers {
+        entries.extend(flash_next::layer_entries(geometry, layer));
+    }
+    let mut names = Vec::with_capacity(entries.len());
+    let mut tensors = Vec::with_capacity(entries.len());
+    for entry in entries.iter().filter(|entry| entry.role == flash_next::Role::Device) {
+        let handle = *fn_plan
+            .handles
+            .get(&entry.name)
+            .ok_or_else(|| format!("{}: not bound by the Flash-Next plan", entry.name))?;
+        let flash_next::ShapeRule::Exact(dims) = &entry.shape else {
+            return Err(format!("{}: a device tensor has an exact shape", entry.name));
+        };
+        if dims.len() > 4 {
+            return Err(format!("{}: rank {} exceeds the ABI's rank-4 shape", entry.name, dims.len()));
+        }
+        let mut shape = [1i32; 4];
+        for (dst, &dim) in shape.iter_mut().zip(dims.iter()) {
+            *dst = i32::try_from(dim).map_err(|_| format!("{}: dimension {dim} overflows i32", entry.name))?;
+        }
+        let (bytes, qdata) = placement(handle)?;
+        let name = CString::new(entry.name.as_str()).map_err(|e| e.to_string())?;
+        tensors.push(ffi::IgnisBoundTensor {
+            name: name.as_ptr(),
+            qtype: qtype_code(entry.format),
+            layout: layout_code(entry.layout),
+            qdata,
+            qhigh: std::ptr::null(),
+            scales: std::ptr::null(),
+            bytes,
+            shape,
+            padded_shape: shape,
+            ndim: dims.len() as u32,
+            weight_scale_divisor: 0.0,
+            input_scale_divisor: 0.0,
+        });
+        names.push(name);
+    }
+    Ok((names, tensors))
+}
+
+/// What a load of a Flash-Next artifact would reserve beside the weights,
+/// asked before the weights are on the device: `fn_plan` is what
+/// [`ignis_artifact::flash_next::bind`] returned for `reader` and
+/// `geometry`. The topology is the geometry's
+/// ([`ModelConfig::flash_next_from`]), so a reduced fixture plans the same
+/// way. Until the Flash-Next program exists the leaf binds the descriptors
+/// and refuses after binding, saying so: the error names whether the
+/// descriptors bind.
+pub fn plan_flash_next_reservations(
+    fn_plan: &FlashNextPlan,
+    geometry: &FlashNextGeometry,
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+) -> Result<IgnisModelReservations, String> {
+    validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
+    let placement = |handle: ObjectHandle| {
+        fn_plan
+            .plan
+            .device_objects
+            .iter()
+            .find(|placed| placed.handle == handle)
+            .map(|placed| (placed.bytes, std::ptr::null()))
+            .ok_or_else(|| "a Flash-Next tensor is not a device object of the plan".to_string())
+    };
+    let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
+    let topology = ModelConfig::flash_next_from(geometry).topology_abi();
+    let mut reservations = IgnisModelReservations::default();
+    let rc = unsafe {
+        ffi::ignis_model_plan_reservations(
+            tensors.as_ptr(),
+            tensors.len() as u64,
+            topology.raw(),
+            prefill_chunk_tokens,
+            max_context_tokens,
+            kv_format.abi_code(),
+            std::ptr::null(),
+            &mut reservations,
+        )
+    };
+    if rc != 0 {
+        let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
+        return Err(message.to_string_lossy().into_owned());
+    }
+    Ok(reservations)
+}
+
+// ---------------------------------------------------------------------------
 // Tests (CPU-only: no CUDA call in this file's mapping / host-read helpers,
 // so these run without a GPU -- only `--features cuda` gates compiling them
 // at all, the same as the rest of this module).
@@ -701,6 +805,23 @@ pub fn plan_qwen38_27b_reservations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub #302: the descriptors this loader builds for the artifact
+    /// crate's Flash-Next fixture artifact (packed from its converter work
+    /// tree) and the leaf's binder agree: every one binds, and the leaf
+    /// refuses only because the Flash-Next program is the next step.
+    #[test]
+    fn a_flash_next_fixture_artifacts_descriptors_bind_in_the_leaf() {
+        let tree = flash_next::fixture::WorkTree::new("model-load-bind").expect("work tree");
+        tree.write_all().expect("write the work tree");
+        ignis_artifact::packer::pack(&tree.pack_options(), &mut |_| {}).expect("pack");
+        let reader = Reader::open(&tree.artifact_path()).expect("open the fixture artifact");
+        let fn_plan = flash_next::bind(&reader, &tree.geometry).expect("bind the fixture artifact");
+        let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, 128, 1024, KvFormat::HqE8_2b)
+            .expect_err("the program is not built yet");
+        assert!(err.contains("Flash-Next weights bind ("), "{err}");
+        assert!(err.contains("program is not built yet"), "{err}");
+    }
 
     #[test]
     fn validate_prefill_config_accepts_the_default_chunk() {
