@@ -97,7 +97,7 @@ pub use kv_format::{
     DEFAULT_KV_POOL_BYTES, KV_PAGE_TOKENS, KvBudgetTooSmall, KvFormat, KvGeometry, KvPlaneDtype,
     KvPlaneSpec, KvPoolPlan, auto_kv_pool_bytes, plan_kv_pool, plan_kv_pool_for_context,
 };
-pub use mock::MockCompute;
+pub use mock::{MockCompute, MockSections};
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
 pub use retained_slot::{

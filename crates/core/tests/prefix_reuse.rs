@@ -18,7 +18,16 @@ use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Prefi
 use ignis_core::types::{
     ComputeError, DecodeParams, FinishReason, RequestClass, RequestInput, SchedEvent,
 };
-use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
+use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
+
+/// What the mock charges a KV-RAM blob: one nominal byte in this suite's own
+/// run; Flash-Next's image and per-token bytes when `flash_next_reuse.rs`
+/// mounts it (spec flash-next/05), which is why every mock and every KV-RAM
+/// capacity below goes through it.
+#[allow(dead_code)]
+fn sections() -> ignis_core::MockSections {
+    ignis_core::MockSections::NOMINAL
+}
 
 /// A prompt of `n` distinct tokens starting at `start` (a deterministic,
 /// distinct token stream per request).
@@ -47,7 +56,13 @@ fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
 }
 
 fn scheduler(compute: Arc<MockCompute>) -> ConcreteScheduler {
-    ConcreteScheduler::new("qwen3.8-27b", compute)
+    ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            ..crate::sections().scale(SchedulerConfig::default())
+        },
+        compute,
+    )
 }
 
 /// Drive the scheduler to idle, collecting every event.
@@ -61,7 +76,7 @@ fn run_to_idle(sched: &mut ConcreteScheduler) -> Vec<SchedEvent> {
 
 #[test]
 fn a_sibling_skips_the_shared_prefix() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
 
     // The main agent: a 32-token prompt (2 KV pages at the default 16-token
@@ -119,7 +134,7 @@ fn a_sibling_skips_the_shared_prefix() {
 
 #[test]
 fn a_1_main_n_subagents_load_increments_the_counter() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
 
     // The main agent (a 32-token system-prompt prefix).
@@ -174,7 +189,7 @@ fn a_1_main_n_subagents_load_increments_the_counter() {
 
 #[test]
 fn the_shared_prefix_is_charged_once_not_per_claimant() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
 
     // The main registers a 32-token prefix (2 KV pages).
@@ -223,7 +238,7 @@ fn the_shared_prefix_is_charged_once_not_per_claimant() {
 
 #[test]
 fn no_reuse_when_there_is_no_shared_prefix() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
 
     // Two requests with entirely different prompts: no shared prefix, so no
@@ -262,7 +277,7 @@ fn a_full_prompt_match_skips_the_entire_prefill() {
     // A request whose prompt is *exactly* a cached prefix (no tail) skips
     // the whole prefill — its prefill job carries an empty tail (it only
     // sets up the decode state).
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
 
     // The main registers a 32-token prefix.
@@ -326,11 +341,17 @@ fn a_failed_prefill_retry_does_not_double_claim() {
     // the `sibling_prefix_reused_tok` counter, and pin the entry forever
     // — the release happens once, at completion).
     let compute = Arc::new(PrefillFailsOn {
-        inner: MockCompute::new(),
+        inner: MockCompute::with_sections(crate::sections()),
         call: Mutex::new(0),
         fail_on: 1, // the claimant's prefill (the 2nd prefill call) faults
     });
-    let mut sched = ConcreteScheduler::new("qwen3.8-27b", compute);
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            ..crate::sections().scale(SchedulerConfig::default())
+        },
+        compute,
+    );
 
     // The main (a 32-token prefix) prefills (call #0, succeeds) and
     // registers the shared prefix.
@@ -404,7 +425,7 @@ fn a_publishing_request_is_cut_at_the_page_boundary_it_publishes() {
     // so the chunk that lands on the prefix has to stop there. A 40-token
     // prompt shares its first 32 tokens (2 pages of 16), so its prefill is
     // two chunks — 32 then 8 — and the publish rides on the first.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let main_id = sched
         .submit(input("qwen3.8-27b", tokens(1, 40), 8), RequestClass::Agent)
@@ -434,7 +455,7 @@ fn a_publishing_request_is_cut_at_the_page_boundary_it_publishes() {
 
 #[test]
 fn a_claimant_is_allocated_against_the_publisher_s_prefix() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let main_id = sched
         .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
@@ -473,7 +494,7 @@ fn a_full_prompt_match_carries_no_tail_to_prefill() {
     // where it needs to be, pending token included, so there is nothing left
     // to warm. The job still exists — it is what allocates the sequence
     // against the prefix.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let main_id = sched
         .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
@@ -499,7 +520,7 @@ fn the_backend_prefix_is_released_once_the_last_claimant_is_gone() {
     // The scheduler's entry and the leaf's prefix are one object seen from
     // two sides. When the entry drops, the backend's handle has to drop with
     // it, or the leaf pins the shared pages for the life of the process.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let main_id = sched
         .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
@@ -538,7 +559,7 @@ fn two_identical_prompts_in_one_batch_leave_exactly_one_prefix_behind() {
     // both see an empty cache and neither can claim. Only one may publish —
     // a second leaf prefix would hold its pages with no cache entry to
     // release it and no sibling that could ever claim it.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let first = sched
         .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
@@ -578,7 +599,7 @@ fn a_publish_the_cache_declines_is_released_immediately() {
     // on the spot — nothing else ever would. Driven here through the one
     // decline the scheduler can reach: a prompt whose page-aligned head is
     // already registered by a live request.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let main_id = sched
         .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)

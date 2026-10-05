@@ -93,6 +93,67 @@ struct Inner {
     /// Constrained steps served so far, per request: what varies the mock's
     /// pick from one step to the next.
     drawn: HashMap<RequestId, u32>,
+    /// Where each request's last prefill chunk ended: with `generated`, the
+    /// tokens a live snapshot of it covers.
+    prefilled: HashMap<RequestId, u32>,
+    /// The tokens each captured checkpoint covers, by publisher: what its
+    /// materialized blob is sized from.
+    checkpoint_tokens: HashMap<RequestId, u32>,
+}
+
+/// What the mock charges a KV-RAM blob: a mutable image plus the paged bytes
+/// of every token it covers (spec flash-next/05).
+///
+/// [`MockSections::NOMINAL`], one byte a blob whatever its length, is what a
+/// scenario that counts entries wants, and the mock's default.
+/// [`MockSections::of`] is a model's real sizes, under which the same
+/// scenarios run with blobs of the size and the spread a load sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MockSections {
+    pub image_bytes: u64,
+    pub bytes_per_token: u64,
+}
+
+impl MockSections {
+    /// One nominal byte a blob.
+    pub const NOMINAL: Self = Self {
+        image_bytes: 1,
+        bytes_per_token: 0,
+    };
+
+    /// `cfg`'s sizes under `kv_format`: its state image as a slot holds it,
+    /// and its paged sections per token.
+    pub fn of(cfg: &crate::compute::ModelConfig, kv_format: crate::kv_format::KvFormat) -> Self {
+        Self {
+            image_bytes: cfg.state_image(kv_format).slot_bytes(),
+            bytes_per_token: cfg.paged_sections(kv_format).bytes_per_token(),
+        }
+    }
+
+    /// A blob covering `tokens`.
+    pub fn blob_bytes(&self, tokens: u32) -> u64 {
+        self.image_bytes + u64::from(tokens) * self.bytes_per_token
+    }
+
+    /// KV-RAM bytes for `blobs` blobs of at most `max_tokens` each: the
+    /// largest blob, `blobs` times. That holds exactly `blobs` of them,
+    /// whatever their lengths, while the image outweighs `blobs` blobs'
+    /// paged bytes -- as it does for every scenario's few blobs -- and at
+    /// least `blobs` otherwise. [`MockSections::NOMINAL`]'s is `blobs`.
+    pub fn capacity_for(&self, blobs: u64, max_tokens: u32) -> u64 {
+        blobs.saturating_mul(self.blob_bytes(max_tokens))
+    }
+
+    /// `config` with its KV-RAM capacity, which a scenario states in
+    /// nominal blobs, in bytes of these: [`MockSections::capacity_for`] at
+    /// the config's own longest sequence. [`MockSections::NOMINAL`] leaves
+    /// it as it is.
+    pub fn scale(&self, config: crate::concrete::SchedulerConfig) -> crate::concrete::SchedulerConfig {
+        crate::concrete::SchedulerConfig {
+            host_capacity_bytes: self.capacity_for(config.host_capacity_bytes, config.max_sequence_tokens),
+            ..config
+        }
+    }
 }
 
 /// Which blob a span of [`MockHostArena`] holds: the three kinds the host
@@ -181,6 +242,7 @@ impl MockHostArena {
 pub struct MockCompute {
     seed: u64,
     identity: crate::identity::BlobIdentity,
+    sections: MockSections,
     inner: Mutex<Inner>,
 }
 
@@ -196,7 +258,18 @@ impl MockCompute {
         Self {
             seed,
             identity: crate::identity::BlobIdentity::UNSET,
+            sections: MockSections::NOMINAL,
             inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    /// A mock whose KV-RAM blobs are sized by `sections` (spec
+    /// flash-next/05): a model's real image and per-token bytes instead of
+    /// one nominal byte each.
+    pub fn with_sections(sections: MockSections) -> Self {
+        Self {
+            sections,
+            ..Self::new()
         }
     }
 
@@ -434,6 +507,7 @@ impl Compute for MockCompute {
             // Learn the request's limits / seed from its params.
             g.limits.insert(job.request, job.params.max_tokens);
             g.seeds.insert(job.request, job.params.seed);
+            g.prefilled.insert(job.request, job.start_position + job.tokens.len() as u32);
         }
         for job in jobs {
             // GitHub #242: a prefill *draws*, and a run's first token is
@@ -458,8 +532,15 @@ impl Compute for MockCompute {
                 // you asked for happen?" — so the retained ledger is
                 // exercisable. `capture_failures` makes a backend that
                 // declines the bet testable too.
-                checkpoint_captured: job.capture_checkpoint.is_some()
-                    && !g.capture_refusals.remove(&job.request),
+                checkpoint_captured: {
+                    let captured = job.capture_checkpoint.is_some()
+                        && !g.capture_refusals.remove(&job.request);
+                    if captured {
+                        let tokens = job.start_position + job.tokens.len() as u32;
+                        g.checkpoint_tokens.insert(job.request, tokens);
+                    }
+                    captured
+                },
                 // GitHub #237 / ADR 0034: the `Compute` seam now carries a
                 // second kind of answer, and every CPU-only implementation
                 // of it has to produce one or the scheduler's tests stop
@@ -501,9 +582,10 @@ impl Compute for MockCompute {
     }
 
     // GitHub #190: a materialized checkpoint blob is one nominal byte, so
-    // `host_capacity_bytes` counts how many spilled checkpoints KV-RAM holds.
-    fn checkpoint_snapshot_size(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
-        Ok(1)
+    // `host_capacity_bytes` counts how many spilled checkpoints KV-RAM holds
+    // -- or, with `with_sections`, the image and the tokens it covers.
+    fn checkpoint_snapshot_size(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        Ok(self.checkpoint_bytes(publisher))
     }
 
     fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
@@ -513,25 +595,27 @@ impl Compute for MockCompute {
         // Placed before it is recorded: a spill the arena turns away is one
         // that did not happen, and a test reading `spilled_checkpoints()`
         // must not see it.
-        if !self.place_blob(MockBlob::Checkpoint(publisher), 1) {
+        let bytes = self.checkpoint_bytes(publisher);
+        if !self.place_blob(MockBlob::Checkpoint(publisher), bytes) {
             return Err(ComputeError::Kernel(NO_HOST_ROOM));
         }
         self.inner.lock().unwrap().checkpoints_spilled.push(publisher);
-        Ok(1)
+        Ok(bytes)
     }
 
-    // GitHub #190: a retained prefix's blob is one nominal byte too.
-    fn prefix_snapshot_size(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
-        Ok(1)
+    // GitHub #190: a retained prefix's blob is sized the same way.
+    fn prefix_snapshot_size(&self, _publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+        Ok(self.sections.blob_bytes(tokens))
     }
 
     fn spill_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
         // Placed before it is recorded, as in `spill_checkpoint`.
-        if !self.place_blob(MockBlob::Prefix(publisher, tokens), 1) {
+        let bytes = self.sections.blob_bytes(tokens);
+        if !self.place_blob(MockBlob::Prefix(publisher, tokens), bytes) {
             return Err(ComputeError::Kernel(NO_HOST_ROOM));
         }
         self.inner.lock().unwrap().prefixes_spilled.push((publisher, tokens));
-        Ok(1)
+        Ok(bytes)
     }
 
     fn restore_prefix(&self, publisher: RequestId, tokens: u32, _slot: u32) -> Result<u64, ComputeError> {
@@ -644,9 +728,10 @@ impl Compute for MockCompute {
     // discard). One nominal byte per snapshot, uniform across every
     // request, is exactly what the existing page-based scenarios already
     // assumed before this ticket's byte-budget rewrite: a fixed per-entry
-    // cost that scales purely with entry *count*.
-    fn snapshot_size(&self, _request: RequestId) -> Result<u64, ComputeError> {
-        Ok(1)
+    // cost that scales purely with entry *count*. `with_sections` sizes it
+    // by the tokens the sequence holds instead.
+    fn snapshot_size(&self, request: RequestId) -> Result<u64, ComputeError> {
+        Ok(self.live_bytes(request))
     }
 
     fn host_blob_fits(&self, bytes: u64) -> bool {
@@ -658,9 +743,10 @@ impl Compute for MockCompute {
     }
 
     fn evict(&self, request: RequestId) -> Result<u64, ComputeError> {
+        let bytes = self.live_bytes(request);
         let mut g = self.inner.lock().unwrap();
         if let Some(arena) = g.arena.as_mut() {
-            if !arena.place(MockBlob::Live(request), 1) {
+            if !arena.place(MockBlob::Live(request), bytes) {
                 // What the leaf reports when no span is long enough
                 // (`crate::seq::NO_HOST_ROOM`). The scheduler probes with
                 // `host_blob_fits` first, so reaching this means a test
@@ -668,7 +754,7 @@ impl Compute for MockCompute {
                 return Err(ComputeError::Kernel(NO_HOST_ROOM));
             }
         }
-        Ok(1)
+        Ok(bytes)
     }
 
     fn restore(&self, request: RequestId, _context_tokens: u32) -> Result<(), ComputeError> {
@@ -682,6 +768,21 @@ impl Compute for MockCompute {
 }
 
 impl MockCompute {
+    /// A spilled checkpoint's blob: the image and the tokens it covers.
+    fn checkpoint_bytes(&self, publisher: RequestId) -> u64 {
+        let tokens = self.inner.lock().unwrap().checkpoint_tokens.get(&publisher).copied();
+        self.sections.blob_bytes(tokens.unwrap_or(0))
+    }
+
+    /// A live sequence's snapshot: the image, its prompt and what it
+    /// generated.
+    fn live_bytes(&self, request: RequestId) -> u64 {
+        let g = self.inner.lock().unwrap();
+        let tokens = g.prefilled.get(&request).copied().unwrap_or(0)
+            + g.generated.get(&request).copied().unwrap_or(0);
+        self.sections.blob_bytes(tokens)
+    }
+
     /// Place `blob` of `bytes` in the modelled arena, if there is one.
     /// `false` when it is there and has no span long enough.
     fn place_blob(&self, blob: MockBlob, bytes: u64) -> bool {

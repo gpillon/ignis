@@ -64,6 +64,15 @@ use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, Sch
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
+/// What the mock charges a KV-RAM blob: one nominal byte in this suite's own
+/// run; Flash-Next's image and per-token bytes when `flash_next_reuse.rs`
+/// mounts it (spec flash-next/05), which is why every mock and every KV-RAM
+/// capacity below goes through it.
+#[allow(dead_code)]
+fn sections() -> ignis_core::MockSections {
+    ignis_core::MockSections::NOMINAL
+}
+
 const MODEL: &str = "qwen3.8-27b";
 /// The default scheduler's KV page, in tokens.
 const PAGE: u32 = 16;
@@ -116,7 +125,7 @@ fn scheduler(compute: Arc<MockCompute>, config: SchedulerConfig) -> ConcreteSche
 fn config() -> SchedulerConfig {
     SchedulerConfig {
         model: MODEL.into(),
-        ..SchedulerConfig::default()
+        ..crate::sections().scale(SchedulerConfig::default())
     }
 }
 
@@ -198,7 +207,7 @@ fn first_job(compute: &MockCompute, request: RequestId) -> ignis_core::scheduler
 
 #[test]
 fn a_second_subagent_arriving_after_the_first_finished_skips_the_system_block() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
 
     // The first subagent runs and **finishes**. Nothing of it is live when the
@@ -255,7 +264,7 @@ fn a_whole_burst_of_subagents_claims_the_one_retained_block() {
     // Five members keep eleven images on the device — the block, and each
     // member's chained link and checkpoint — so the load has room for them
     // (GitHub #215: every one takes a retained slot).
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig {
@@ -296,7 +305,7 @@ fn a_whole_burst_of_subagents_claims_the_one_retained_block() {
 fn a_subagent_with_a_different_block_shares_nothing() {
     // Matched by content, never by shape: a burst under different
     // instructions renders a different block, and must reuse none of it.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     sched.submit(subagent(500), RequestClass::Agent).unwrap();
     run_to_idle(&mut sched);
@@ -342,7 +351,7 @@ fn the_prefill_is_cut_at_the_system_block_and_again_at_the_opener() {
     // captures there. Three cuts, one retained prefix, one prompt checkpoint
     // — and the capture's precondition is satisfied rather than weakened
     // (see this file's header).
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let id = sched.submit(subagent(500), RequestClass::Agent).unwrap();
     run_to_idle(&mut sched);
@@ -394,7 +403,7 @@ fn a_block_and_an_opener_in_one_page_leave_both_a_retained_prefix_and_a_checkpoi
     // A 35-token block (two whole pages) with a 45-token opener: 45 / 16 is 2,
     // which is the publish point's page count, so `checkpoint_point` is
     // satisfied on the very prefix the block published.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let id = sched
         .submit(
@@ -465,7 +474,7 @@ fn a_block_under_one_page_publishes_nothing_and_leaves_the_checkpoint_alone() {
     // cannot be split between two requests. The request keeps #186's opener
     // page and its prompt checkpoint with it, which is strictly better than
     // giving up both.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let id = sched
         .submit(
@@ -492,7 +501,7 @@ fn a_render_with_no_system_block_behaves_exactly_as_it_did_before() {
     // Three of the seven reference-recorded renders carry neither a system
     // message nor tools. They report no boundary, and nothing about them
     // changes.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let id = sched
         .submit(input(tokens(1, 40), None, Some(37), 4), RequestClass::Interactive)
@@ -517,7 +526,7 @@ fn a_longer_prompt_checkpoint_match_wins_over_the_retained_prefix() {
     // **concurrent**: whoever arrives second claims what is already there and
     // therefore publishes nothing. A burst and a conversation landing in one
     // batch is exactly that case.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     // The conversation: no system block reported, so it publishes at its
     // opener's page (32) and captures a checkpoint at 37.
@@ -581,7 +590,7 @@ fn a_longer_prompt_checkpoint_match_wins_over_the_retained_prefix() {
 fn a_retained_prefix_wins_when_no_checkpoint_reaches_further() {
     // The mirror, so the comparison above is not passing for the wrong
     // reason: a checkpoint that matches nothing leaves the prefix to win.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     sched
         .submit(input(tokens(1, 40), None, Some(37), 4), RequestClass::Interactive)
@@ -608,7 +617,7 @@ fn a_live_request_takes_a_retained_prefix_back_rather_than_waiting_for_it() {
     // victim — always, and before the eviction machinery is asked for
     // anything. A retained prefix must never be the reason a live request is
     // refused, evicted or made to wait.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     // Room for six pages: the burst's two, and four for whoever comes next.
     let mut sched = scheduler(
         compute.clone(),
@@ -668,7 +677,7 @@ fn the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds() {
     // The two entries exist together only because the requests that left them
     // were concurrent (whoever arrives second claims and therefore publishes
     // nothing), which is a burst and a conversation landing in one batch.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig {
@@ -763,7 +772,7 @@ fn a_lifecycle_fact_names_which_kind_of_retained_state_moved() {
     // kind, and a fact that guessed the kind from the tier or the operation
     // could not tell these two steps apart — both are a `Discard` or a
     // `Spill` in the same two tiers.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig {
@@ -817,7 +826,7 @@ fn a_retained_prefix_a_live_request_stands_on_is_not_given_up_for_nothing() {
     // Its pages come back only at refcount zero, so discarding a retention a
     // live claimant is also holding frees not one page — and would cost every
     // later subagent its reuse. The first-victim path has to know that.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig {
@@ -858,7 +867,7 @@ fn prompt_reuse_off_retains_no_prefix() {
     // A cold bench measures a cold engine: nothing is retained, so the head
     // goes back to the whole prompt's pages and a later subagent pays its
     // block again.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig {
@@ -911,7 +920,7 @@ fn a_multimodal_prompt_ending_at_a_checkpoint_opener_does_not_resume_from_it() {
     // A checkpoint's own capture always leaves a tail, but a claimant's
     // prompt can stop exactly at that opener: it takes the whole-page head
     // below instead, and prefills the rest.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     sched
         .submit(subagent_with_image(500, 0xAA), RequestClass::Agent)
@@ -936,7 +945,7 @@ fn a_multimodal_burst_shares_the_block_whatever_image_each_subagent_sends() {
     // like any other, because the prefix is keyed by its images too. The
     // block holds no image, so a subagent sending another picture still skips
     // it — and nothing past it, where the pictures differ.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     sched
         .submit(subagent_with_image(500, 0xAA), RequestClass::Agent)

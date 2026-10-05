@@ -25,6 +25,15 @@ use ignis_core::retained_slot::RetainedSkip;
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
+/// What the mock charges a KV-RAM blob: one nominal byte in this suite's own
+/// run; Flash-Next's image and per-token bytes when `flash_next_reuse.rs`
+/// mounts it (spec flash-next/05), which is why every mock and every KV-RAM
+/// capacity below goes through it.
+#[allow(dead_code)]
+fn sections() -> ignis_core::MockSections {
+    ignis_core::MockSections::NOMINAL
+}
+
 const MODEL: &str = "qwen3.8-27b";
 /// The default scheduler's KV page, in tokens.
 const PAGE: u32 = 16;
@@ -90,7 +99,7 @@ fn scheduler(compute: Arc<MockCompute>, retained_slots: u32) -> ConcreteSchedule
         SchedulerConfig {
             model: MODEL.into(),
             retained_slots,
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
         compute,
     )
@@ -151,7 +160,7 @@ fn done(events: &[SchedEvent], request: RequestId) -> bool {
 
 #[test]
 fn a_checkpoint_and_the_prefix_under_it_hold_two_slots() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), 8);
     assert_eq!(sched.retained_slot_count(), 8);
     let a = sched.submit(turn(1), RequestClass::Interactive).unwrap();
@@ -173,7 +182,7 @@ fn a_checkpoint_and_the_prefix_under_it_hold_two_slots() {
 
 #[test]
 fn a_chained_link_is_one_more_slot() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), 8);
     sched.submit(turn(1), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -193,7 +202,7 @@ fn a_chained_link_is_one_more_slot() {
 
 #[test]
 fn a_checkpoint_holds_its_partial_tail_page_as_one_kv_page() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute, 8);
     sched.submit(turn(1), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -205,7 +214,7 @@ fn a_checkpoint_holds_its_partial_tail_page_as_one_kv_page() {
     assert_eq!(sched.retained_tail_pages(), 1);
 
     // An opener on a page boundary ends inside no page: nothing to copy.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute, 8);
     sched
         .submit(input(tokens(1, 40), None, Some(2 * PAGE), 4), RequestClass::Interactive)
@@ -220,7 +229,7 @@ fn a_checkpoint_holds_its_partial_tail_page_as_one_kv_page() {
 
 #[test]
 fn a_full_set_of_slots_gives_up_an_agent_checkpoint_before_an_interactive_one() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), 4);
     let interactive = sched.submit(turn(1), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -240,7 +249,7 @@ fn a_full_set_of_slots_gives_up_an_agent_checkpoint_before_an_interactive_one() 
 
 #[test]
 fn checkpoints_are_given_up_before_retained_prefixes() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), 3);
     let a = sched.submit(subagent(1, 500), RequestClass::Agent).unwrap();
     run_to_idle(&mut sched);
@@ -264,7 +273,7 @@ fn checkpoints_are_given_up_before_retained_prefixes() {
 
 #[test]
 fn a_claimed_checkpoint_and_the_chain_under_a_live_request_are_never_given_up() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), 3);
     let a = sched.submit(subagent(1, 500), RequestClass::Agent).unwrap();
     run_to_idle(&mut sched);
@@ -312,7 +321,7 @@ fn a_claimed_checkpoint_and_the_chain_under_a_live_request_are_never_given_up() 
 
 #[test]
 fn a_skipped_capture_does_not_cut_the_prefill_at_the_opener() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), 1);
     let a = sched.submit(turn(1), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut sched);
@@ -330,12 +339,12 @@ fn a_skipped_capture_does_not_cut_the_prefill_at_the_opener() {
 fn a_capture_with_no_kv_page_for_its_tail_is_skipped() {
     // 40 prompt tokens and 4 to generate reserve three pages, and the pool has
     // exactly three: the page the opener ends inside has nowhere to go.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
             kv_capacity_pages: 3,
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
         compute.clone(),
     );
@@ -350,7 +359,7 @@ fn a_capture_with_no_kv_page_for_its_tail_is_skipped() {
 
 #[test]
 fn a_failed_prefill_batch_gives_its_slots_back() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), 2);
     let a = sched.submit(turn(1), RequestClass::Interactive).unwrap();
     compute.fail_prefill(a);
@@ -380,7 +389,7 @@ fn a_tail_page_beside_a_live_request_comes_back_before_anyone_live_waits() {
             SchedulerConfig {
                 model: MODEL.into(),
                 kv_capacity_pages,
-                ..SchedulerConfig::default()
+                ..crate::sections().scale(SchedulerConfig::default())
             },
             compute,
         )
@@ -399,7 +408,7 @@ fn a_tail_page_beside_a_live_request_comes_back_before_anyone_live_waits() {
     let (long_pages, other_pages) = ((40 + 200u32).div_ceil(PAGE), (40 + 4u32).div_ceil(PAGE));
 
     // A pool with room for both only without the tail page.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = with_pages(compute.clone(), long_pages + other_pages);
     let a = sched.submit(long(), RequestClass::Interactive).unwrap();
     until_captured(&mut sched);
@@ -426,7 +435,7 @@ fn a_skip_names_the_slots_held_when_it_happened() {
     // Two turns prefilled in one batch, one slot: the first publish takes it,
     // and the second is skipped in the same tick — before any report of the
     // slot the first one took.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), 1);
     let a = sched.submit(turn(1), RequestClass::Interactive).unwrap();
     let b = sched.submit(turn(100), RequestClass::Interactive).unwrap();
@@ -450,7 +459,7 @@ fn a_skip_names_the_slots_held_when_it_happened() {
 
 #[test]
 fn a_load_with_no_retained_slots_and_prompt_reuse_on_says_what_it_skipped() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute, 0);
     let a = sched.submit(turn(1), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut sched);
@@ -463,13 +472,13 @@ fn prompt_reuse_off_with_slots_shares_live_siblings_and_retains_nothing() {
     // The slots a load gives with prompt reuse off are for live siblings
     // alone: a head is published and claimed while its publisher runs, no
     // checkpoint is captured, and the slot comes back when the head goes.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
             prompt_reuse: false,
             retained_slots: 2,
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
         compute.clone(),
     );
@@ -494,13 +503,13 @@ fn prompt_reuse_off_with_slots_shares_live_siblings_and_retains_nothing() {
 #[test]
 fn prompt_reuse_off_reserves_no_slots() {
     // What the server resolves `--prompt-reuse off` to by default.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
             prompt_reuse: false,
             retained_slots: 0,
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
         compute.clone(),
     );

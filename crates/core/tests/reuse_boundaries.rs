@@ -27,6 +27,15 @@ use ignis_core::types::{
 };
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
+/// What the mock charges a KV-RAM blob: one nominal byte in this suite's own
+/// run; Flash-Next's image and per-token bytes when `flash_next_reuse.rs`
+/// mounts it (spec flash-next/05), which is why every mock and every KV-RAM
+/// capacity below goes through it.
+#[allow(dead_code)]
+fn sections() -> ignis_core::MockSections {
+    ignis_core::MockSections::NOMINAL
+}
+
 const MODEL: &str = "qwen3.8-27b";
 /// The default scheduler's KV page, in tokens.
 const PAGE: u32 = 16;
@@ -70,7 +79,7 @@ fn scheduler(compute: Arc<MockCompute>) -> ConcreteScheduler {
     ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
         compute,
     )
@@ -110,7 +119,7 @@ fn published(compute: &MockCompute, request: RequestId) -> Vec<Option<u32>> {
 
 #[test]
 fn every_boundary_a_request_carries_is_published_in_order_as_a_chain() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let first = sched
         .submit(input(prompt(500), vec![ReuseBoundary::retained(50)]), RequestClass::Agent)
@@ -155,7 +164,7 @@ fn a_request_that_resumed_still_publishes_what_the_server_predicted() {
     // head of its own (#187's gate): nobody extends a burst sibling's prompt.
     // A predicted boundary is exactly the claim that somebody will, so the
     // gate does not hold it back.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     sched
         .submit(input(prompt(500), vec![ReuseBoundary::retained(50)]), RequestClass::Agent)
@@ -172,7 +181,7 @@ fn a_request_that_resumed_still_publishes_what_the_server_predicted() {
 
 #[test]
 fn a_fan_out_head_outlives_its_publisher_and_goes_when_the_fan_out_ends() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let first = sched
         .submit(input(prompt(500), vec![ReuseBoundary::fan_out(50, 7)]), RequestClass::Agent)
@@ -214,7 +223,7 @@ fn a_fan_out_head_outlives_its_publisher_and_goes_when_the_fan_out_ends() {
 #[test]
 fn a_fan_out_head_at_a_retained_boundarys_place_stays_retained() {
     // 49 and 50 floor to the same page: one boundary, the longer lifetime.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let first = sched
         .submit(
@@ -241,7 +250,7 @@ fn a_fan_out_head_at_a_retained_boundarys_place_stays_retained() {
 fn a_fan_out_that_ended_before_its_head_was_published_publishes_none() {
     // The client went away while the first question was still queued: its
     // head is a bet on followers that will never be asked.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let first = sched
         .submit(input(prompt(500), vec![ReuseBoundary::fan_out(50, 7)]), RequestClass::Agent)
@@ -254,7 +263,7 @@ fn a_fan_out_that_ended_before_its_head_was_published_publishes_none() {
 
 #[test]
 fn a_boundary_that_floors_to_nothing_or_onto_the_block_adds_nothing() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone());
     let first = sched
         .submit(
@@ -272,12 +281,12 @@ fn a_boundary_that_floors_to_nothing_or_onto_the_block_adds_nothing() {
 
 #[test]
 fn prompt_reuse_off_publishes_no_boundary_it_was_handed() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
             prompt_reuse: false,
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
         compute.clone(),
     );
