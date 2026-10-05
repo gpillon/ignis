@@ -116,9 +116,18 @@ impl DirectReader {
                 buf.len()
             )));
         }
+        self.read_chunked(offset, buf, MAX_READ_CHUNK)
+    }
+
+    /// The read loop, at most `chunk` bytes (a multiple of the alignment) per
+    /// system call: one Windows ReadFile moves at most 4 GiB - 1 bytes, not a
+    /// sector multiple, which an unbuffered handle refuses.
+    fn read_chunked(&self, offset: u64, buf: &mut [u8], chunk: usize) -> Result<usize> {
+        let align = DIRECT_IO_ALIGNMENT as usize;
         let mut total = 0usize;
         while total < buf.len() {
-            match read_at(&self.file, offset + total as u64, &mut buf[total..]) {
+            let end = buf.len().min(total + chunk);
+            match read_at(&self.file, offset + total as u64, &mut buf[total..end]) {
                 Ok(0) => break,
                 Ok(n) => total += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -136,6 +145,9 @@ impl DirectReader {
         Ok(total)
     }
 }
+
+/// The most one read system call is asked for (see `read_chunked`).
+const MAX_READ_CHUNK: usize = 1 << 30;
 
 #[cfg(windows)]
 const UNBUFFERED_FLAG: u32 = windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
@@ -214,6 +226,19 @@ mod tests {
         assert_eq!(&buf.as_slice()[..1000], &bytes[3 * 4096..]);
         // Past the end: nothing.
         assert_eq!(reader.read_at(4 * 4096, buf.as_mut_slice()).unwrap(), 0);
+        drop(reader);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_read_longer_than_one_chunk_is_issued_in_chunks() {
+        let bytes = pattern(5 * 4096 + 700);
+        let path = temp_file("chunks", &bytes);
+        let reader = DirectReader::open(&path).unwrap();
+        let mut buf = AlignedBuffer::new(6 * 4096).unwrap();
+        // One block per system call: six calls, the last one short.
+        assert_eq!(reader.read_chunked(0, buf.as_mut_slice(), 4096).unwrap(), 5 * 4096 + 700);
+        assert_eq!(&buf.as_slice()[..bytes.len()], &bytes[..]);
         drop(reader);
         std::fs::remove_file(&path).unwrap();
     }

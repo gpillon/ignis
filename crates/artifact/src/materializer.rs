@@ -14,10 +14,9 @@
 //! sub-allocation pattern): one `allocate(capacity)`, each device object
 //! lives at its plan offset inside it.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
-
 use crate::binder::MaterializationPlan;
 use crate::device::{Device, DeviceBuffer};
+use crate::direct::AlignedBuffer;
 use crate::{
     block_scale_geometry, checked_add, fail, row_scale_geometry, row_split_geometry, Reader,
     Result, StorageLayout, TensorDescriptor, DIRECT_IO_ALIGNMENT,
@@ -294,8 +293,8 @@ pub fn materialize<D: Device>(
         max_staging_len = max_staging_len.max((read_end - read_begin) as usize);
     }
     let staging_slots = STAGING_SLOTS.min(plan.device_objects.len());
-    let mut slots: Vec<AlignedStaging> = (0..staging_slots)
-        .map(|_| AlignedStaging::new(max_staging_len.max(DIRECT_IO_ALIGNMENT as usize)))
+    let mut slots: Vec<AlignedBuffer> = (0..staging_slots)
+        .map(|_| AlignedBuffer::new(max_staging_len.max(DIRECT_IO_ALIGNMENT as usize)))
         .collect::<Result<Vec<_>>>()?;
     let mut pending = 0usize;
 
@@ -358,7 +357,7 @@ pub fn materialize<D: Device>(
             device.synchronize()?;
             pending = 0;
         }
-        let buf = slots[s].as_slice();
+        let buf = slots[s].as_mut_slice();
         let read = reader.read_direct(read_begin, &mut buf[0..staging_len])?;
         let head = (span.absolute_offset - read_begin) as usize;
         let needed = checked_add(head as u64, dev.bytes, "staging head overflow u64")? as usize;
@@ -404,42 +403,6 @@ pub fn materialize<D: Device>(
 /// through four pinned slots; peak host staging = `STAGING_SLOTS` x the
 /// largest aligned span, not the sum of every object).
 const STAGING_SLOTS: usize = 4;
-
-/// A 4096-aligned staging buffer for direct I/O (page-aligned allocation:
-/// the reader's direct path requires 4096-aligned offsets, lengths, *and*
-/// addresses).
-struct AlignedStaging {
-    ptr: std::ptr::NonNull<u8>,
-    layout: Layout,
-}
-
-impl AlignedStaging {
-    fn new(len: usize) -> Result<Self> {
-        let layout = Layout::from_size_align(len, DIRECT_IO_ALIGNMENT as usize).map_err(|e| {
-            fail(format!(
-                "staging length {len} is not a valid 4096-aligned layout: {e}"
-            ))
-        })?;
-        let ptr = unsafe { alloc_zeroed(layout) };
-        if ptr.is_null() {
-            return Err(fail("staging buffer allocation failed"));
-        }
-        Ok(Self {
-            ptr: std::ptr::NonNull::new(ptr).unwrap(),
-            layout,
-        })
-    }
-
-    fn as_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
-    }
-}
-
-impl Drop for AlignedStaging {
-    fn drop(&mut self) {
-        unsafe { dealloc(self.ptr.as_ptr() as *mut u8, self.layout) };
-    }
-}
 
 /// Build the typed view for a device object (plane offsets from the
 /// reader-computed layout geometry).
@@ -537,9 +500,11 @@ mod tests {
 
     #[test]
     fn aligned_staging_is_4096_aligned() {
-        let mut s = AlignedStaging::new(4096 * 2).expect("staging");
-        assert_eq!(s.ptr.as_ptr() as usize % 4096, 0);
+        // The staging slots are the direct reader's aligned buffers.
+        let mut s = AlignedBuffer::new(4096 * 2).expect("staging");
+        assert_eq!(s.as_mut_slice().as_ptr() as usize % 4096, 0);
         assert_eq!(s.as_slice().len(), 4096 * 2);
+        assert_eq!(AlignedBuffer::new(5000).unwrap().len(), 8192, "rounded up to whole blocks");
     }
 
     #[test]
