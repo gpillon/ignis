@@ -12,7 +12,7 @@
 # -PackerExtra "--accept-status dry-run --keep-work --layers 2".
 #
 # Files in -Out: convert.out / convert.err (the converter's streams), convert.log (one line per
-# layer), convert.exit (0 done, 75 stopped by the stop file, 4 a drive filled, 2 refused, 3 an acceptance check
+# layer), convert.exit (0 done, 75 stopped by the stop file, 2 refused, 3 an acceptance check
 # FAILED, 1 error); after an exit 0: pack.out / pack.exit (the packer) and verify.log /
 # verify.json / verify.exit (the container decode check).
 param(

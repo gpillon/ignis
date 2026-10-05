@@ -25,14 +25,3 @@ def test_a_work_tree_of_another_configuration_is_refused(tmp_path):
 
 def test_the_disk_estimate_is_the_readme_figure():
     assert 73e9 < convert.expected_output_bytes(48, 128) < 75e9
-
-
-def test_the_output_drive_is_checked_against_the_rest_of_the_run(tmp_path):
-    import argparse
-    a = argparse.Namespace(out=str(tmp_path), layers=48, table_shards=128, disk_floor_gb=5.0)
-    rest = convert.expected_output_bytes(48, 128)
-    assert convert.output_space(a, free=lambda p: rest + 6e9) is None
-    why = convert.output_space(a, free=lambda p: rest + 4e9)
-    assert why and "floor" in why
-    (tmp_path / "written.bin").write_bytes(b"x" * 10 ** 6)       # what is written no longer counts
-    assert convert.output_space(a, free=lambda p: rest + 5e9 - 10 ** 6 + 1) is None

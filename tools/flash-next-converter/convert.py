@@ -4,9 +4,8 @@
     python convert.py verify --lock-owner ... --artifact X.ninfer   # after packing: decode from the container
     python convert.py fixture --out DIR          # a reduced work tree for the packer's tests
 
-Exit codes: 0 done (PASS or dry run); 75 stopped by the stop file; 4 stopped because a
-drive filled during the run (checkpointed first when the checkpoint drives have room);
-2 refused (GPU lock, GPU busy, disk, a work tree of another configuration); 3 done but an acceptance check
+Exit codes: 0 done (PASS or dry run); 75 stopped by the stop file; 2 refused (GPU lock,
+GPU busy, disk, a work tree of another configuration); 3 done but an acceptance check
 FAILED (rates over --budget, MoE error, KLD/MMLU, or a work-file re-decode mismatch; the
 report names the 3.0-bit fallback), or for verify a container decode mismatch; 1 error
 (traceback in the log). See README.md for the full command and its figures.
@@ -97,18 +96,6 @@ def preflight_run(a, log):
     return ck_dirs
 
 
-def output_space(a, free=None):
-    """None while the output drive holds the rest of the run plus the floor, else why not.
-    Checked before each layer, so a drive filled by someone else stops the run cleanly."""
-    import preflight
-    rest = max(expected_output_bytes(a.layers, a.table_shards) - dir_bytes(a.out), 0)
-    have = (free or preflight.free_bytes)(a.out)
-    if have < rest + a.disk_floor_gb * GB:
-        return (f"{a.out}: {have / GB:.1f} GB free, the rest of the run writes {rest / GB:.1f} GB "
-                f"(+{a.disk_floor_gb:g} GB floor)")
-    return None
-
-
 def check_run_record(conv):
     """A work tree belongs to one configuration (revision, corpus, layers, table shards, budget):
     returns why this one differs, or None after recording it on first use."""
@@ -157,7 +144,7 @@ def cmd_run(a):
         peek = ck.next_layer(conv.fingerprint()) if ck else None
         conv.start_table(need_gather=not (peek and peek >= 2))
         loop = driver.LayerLoop(a.layers, conv.layer_dir, stop_file=a.stop_file, checkpoint=ck,
-                                every=a.ckpt_every, log=log, space_check=lambda L: output_space(a))
+                                every=a.ckpt_every, log=log)
         code, state = loop.run(conv)
         if code != driver.EXIT_DONE:
             return code
@@ -236,13 +223,10 @@ def main(argv=None):
     r.add_argument("--stop-file", default=None, help="checked before each layer: checkpoint and exit 75")
     r.add_argument("--ckpt-dir", default="E:/flash-next-ckpt", help="the BF16 stream's checkpoint (~13.6 GB)")
     r.add_argument("--ckpt-small-dir", default=None, help="the other streams' checkpoint (~6.9 GB)")
-    r.add_argument("--ckpt-every", type=int, default=3,
-                   help="checkpoint every N layers (always after the last layer and on a stop)")
+    r.add_argument("--ckpt-every", type=int, default=6, help="checkpoint every N layers (0: only on stop)")
     r.add_argument("--vram-gb", type=float, default=24.0)
     r.add_argument("--prefetch", type=int, default=1, choices=(0, 1), help="fetch layer L+1 during L (+5 GB RAM)")
-    r.add_argument("--disk-margin-gb", type=float, default=15.0, help="free space the start requires beyond the output")
-    r.add_argument("--disk-floor-gb", type=float, default=5.0,
-                   help="free space each layer requires beyond the rest of the output (else exit 4)")
+    r.add_argument("--disk-margin-gb", type=float, default=15.0)
     r.set_defaults(fn=cmd_run)
     v = sub.add_parser("verify", help="after packing: decode the sampled projections from the container")
     v.add_argument("--artifact", required=True)
