@@ -8,7 +8,8 @@
 #       [-StopFile <Out>/STOP] [-Extra "..."]
 #
 # A dry run goes to its own -Out (a work tree belongs to one configuration; the converter refuses
-# another): -Out F:/ai/models/fn-dryrun -Extra "--layers 2 --table-shards 4 --ckpt-every 1".
+# another): -Out F:/ai/models/fn-dryrun -Extra "--layers 2 --table-shards 4 --ckpt-every 1"
+# -PackerExtra "--accept-status dry-run --keep-work --layers 2".
 #
 # Files in -Out: convert.out / convert.err (the converter's streams), convert.log (one line per
 # layer), convert.exit (0 done, 75 stopped by the stop file, 2 refused, 3 an acceptance check
@@ -26,6 +27,7 @@ param(
     [int]$Prefetch = 0,
     [string]$Python = "F:/ai/ngram-venv/Scripts/python.exe",
     [string]$Packer = "",
+    [string]$PackerExtra = "",
     [switch]$Detached
 )
 $ErrorActionPreference = "Stop"
@@ -33,7 +35,7 @@ $tool = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo = Resolve-Path (Join-Path $tool "..\..")
 $bash = "C:/Program Files/Git/bin/bash.exe"
 $lock = "F:/ai/opencode/.inference-qwen-worktrees/.swarm/gpu-lock.sh"
-if (-not $Packer) { $Packer = Join-Path $repo "target/release/ignis-artifact-pack.exe" }
+if (-not $Packer) { $Packer = Join-Path $repo "target/x86_64-pc-windows-msvc/release/ignis-artifact-pack.exe" }
 $artifact = Join-Path $Out "qwen3_8_flash_next_trellis_a25-v2.ninfer"
 
 function Invoke-Logged([string]$exe, [string[]]$argv, [string]$stdout, [string]$stderr) {
@@ -55,8 +57,9 @@ if ($Detached) {
         $code = Invoke-Logged $Python $argv "$Out/convert.out" "$Out/convert.err"
         Set-Content -Path "$Out/convert.exit" -Value $code -Encoding ascii
         if ($code -eq 0 -and (Test-Path $Packer)) {
-            $pcode = Invoke-Logged $Packer @("--work", "`"$Out/work`"", "--out", "`"$artifact`"") `
-                "$Out/pack.out" "$Out/pack.err"
+            $pargv = @("--work", "`"$Out/work`"", "--out", "`"$artifact`"")
+            if ($PackerExtra) { $pargv += $PackerExtra.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries) }
+            $pcode = Invoke-Logged $Packer $pargv "$Out/pack.out" "$Out/pack.err"
             Set-Content -Path "$Out/pack.exit" -Value $pcode -Encoding ascii
             if ($pcode -eq 0) {
                 $vcode = Invoke-Logged $Python @("convert.py", "verify", "--artifact", "`"$artifact`"",
@@ -82,6 +85,7 @@ try {
               "-Python", "`"$Python`"", "-Packer", "`"$Packer`"")
     if ($StopFile) { $argv += @("-StopFile", "`"$StopFile`"") }
     if ($Extra) { $argv += @("-Extra", "`"$Extra`"") }
+    if ($PackerExtra) { $argv += @("-PackerExtra", "`"$PackerExtra`"") }
     $p = Start-Process -FilePath "powershell.exe" -ArgumentList $argv -WindowStyle Hidden -PassThru
 } catch {
     & $bash $lock release $LockOwner | Out-Null

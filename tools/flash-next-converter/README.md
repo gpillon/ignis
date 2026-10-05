@@ -50,7 +50,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/flash-next-converter/l
 ```
 
 Defaults: `--prefetch 0` (RAM), the BF16 stream's checkpoint on `E:/flash-next-ckpt`, the
-other streams' on `C:/flash-next-ckpt-small`, the packer at `target/release/ignis-artifact-pack.exe`.
+other streams' on `C:/flash-next-ckpt-small`, the packer at `target/x86_64-pc-windows-msvc/release/ignis-artifact-pack.exe` (build it with `cargo build --release -p ignis-artifact --bin ignis-artifact-pack`).
 
 - **Watch:** `convert.log` in `-Out` (one line per layer: time, RSS, VRAM peak, MoE dB beside
   run 6 / run 8, rates, K histogram); `convert.exit` appears when the pass ends.
