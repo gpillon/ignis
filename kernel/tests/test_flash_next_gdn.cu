@@ -19,7 +19,7 @@
 
 #include "flash_next/gdn.h"
 
-#include "fp8_test_common.h"
+#include "flash_next_s2_test_common.h"
 #include "ignis_fp8_linear.h"
 
 #include "core/arena.h"
@@ -32,22 +32,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
-using namespace moe_test;
+using namespace s2_test;
 namespace fn = ignis::flash_next;
-
-#define FN_RC(expr)                                                                                \
-  do {                                                                                             \
-    const int32_t rc_ = (expr);                                                                    \
-    if (rc_ != 0) {                                                                                \
-      std::fprintf(stderr, "FATAL: %s returned %d: %s\n", #expr, rc_, fn::fn_last_error());       \
-      std::exit(EXIT_FAILURE);                                                                     \
-    }                                                                                              \
-  } while (0)
 
 namespace {
 
@@ -59,69 +48,6 @@ constexpr int VH = fn::gdn::kValueHeads;
 constexpr int D = fn::gdn::kHeadDim;
 constexpr int kSlots = 5;
 constexpr float kEps = 1e-6F;
-
-double bf16r(double v) { return bf16_to_f32(f32_to_bf16(static_cast<float>(v))); }
-
-// An FP8 row-scale matrix kept as its device payload plus a code LUT (no fp64 copy of the codes:
-// the projections here are tens of millions of weights).
-struct Proj {
-  int rows = 0, cols = 0;
-  std::vector<uint8_t> payload;
-  std::vector<double> scale;
-  std::unique_ptr<DeviceBytes> dev;
-};
-
-double g_lut[256];
-
-double code_rms() {
-  double s = 0.0;
-  int n = 0;
-  for (int c = 0; c < 256; ++c) {
-    if ((c & 0x7F) == 0x7F) continue;
-    s += g_lut[c] * g_lut[c];
-    ++n;
-  }
-  return std::sqrt(s / n);
-}
-
-void make_proj(Proj &p, uint32_t stream, int rows, int cols, double input_rms, double output_rms) {
-  const double mag = output_rms / (std::sqrt(static_cast<double>(cols)) * code_rms() * input_rms);
-  Fp8Matrix m = make_fp8(stream, rows, cols, static_cast<float>(mag));
-  p.rows = rows;
-  p.cols = cols;
-  p.payload = std::move(m.payload);
-  p.scale = std::move(m.scale);
-  p.dev = std::make_unique<DeviceBytes>(p.payload.size());
-  upload(*p.dev, p.payload);
-}
-
-fn::Linear linear(const Proj &p) {
-  fn::Linear l;
-  l.data = p.dev->p;
-  l.rows = p.rows;
-  l.cols = p.cols;
-  l.format = fn::WeightFormat::Fp8RowScale;
-  return l;
-}
-
-// y[r] = scale[r] * sum_c code[r][c] * x[c] in fp64, rows split over threads.
-std::vector<double> project(const Proj &p, const std::vector<double> &x) {
-  std::vector<double> y(p.rows);
-  const unsigned threads = 8;
-  std::vector<std::thread> pool;
-  for (unsigned t = 0; t < threads; ++t) {
-    pool.emplace_back([&, t]() {
-      for (int r = static_cast<int>(t); r < p.rows; r += static_cast<int>(threads)) {
-        const uint8_t *row = &p.payload[static_cast<std::size_t>(r) * p.cols];
-        double s = 0.0;
-        for (int c = 0; c < p.cols; ++c) s += g_lut[row[c]] * x[c];
-        y[r] = s * p.scale[r];
-      }
-    });
-  }
-  for (auto &t : pool) t.join();
-  return y;
-}
 
 struct Weights {
   Proj qkv, z, a, b, out;
@@ -142,15 +68,6 @@ struct Weights {
   }
 };
 
-std::vector<uint16_t> bf16_vector(uint32_t stream, std::size_t n, double lo, double hi) {
-  std::vector<uint16_t> v(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    const double u = 0.5 * (hash_uniform(stream, i, 1.0F) + 1.0);
-    v[i] = f32_to_bf16(static_cast<float>(lo + (hi - lo) * u));
-  }
-  return v;
-}
-
 void build(Weights &w) {
   const double x_rms = 1.0 / std::sqrt(3.0);  // inputs uniform in [-1, 1)
   make_proj(w.qkv, 101, C, H, x_rms, 1.0);
@@ -167,11 +84,10 @@ void build(Weights &w) {
   }
   w.dt_bias = bf16_vector(115, VH, -5.0, -2.0);
   w.norm = bf16_vector(117, D, 0.5, 1.5);
-  for (auto [dev, host] : {std::pair{&w.d_conv, &w.conv}, std::pair{&w.d_a_log, &w.a_log},
-                           std::pair{&w.d_dt_bias, &w.dt_bias}, std::pair{&w.d_norm, &w.norm}}) {
-    *dev = std::make_unique<DeviceBytes>(host->size() * 2);
-    upload(**dev, *host);
-  }
+  w.d_conv = device_copy(w.conv);
+  w.d_a_log = device_copy(w.a_log);
+  w.d_dt_bias = device_copy(w.dt_bias);
+  w.d_norm = device_copy(w.norm);
 }
 
 // One lane of the fp64 restatement: its conv taps (the last three BF16 projected qkv rows) and
@@ -256,12 +172,6 @@ std::vector<uint16_t> token_input(uint32_t lane, int position) {
   return v;
 }
 
-std::vector<double> as_double(const std::vector<uint16_t> &v) {
-  std::vector<double> d(v.size());
-  for (std::size_t i = 0; i < v.size(); ++i) d[i] = bf16_to_f32(v[i]);
-  return d;
-}
-
 // Output check of one call: rows of y (BF16) against the fp64 rows.
 void check_output(const std::string &name, const std::vector<uint16_t> &y, const std::vector<std::vector<double>> &ref) {
   double num = 0.0, den = 0.0, worst = 0.0, peak = 0.0;
@@ -306,7 +216,6 @@ fn::Geometry geometry() {
 }  // namespace
 
 int main() {
-  for (int c = 0; c < 256; ++c) g_lut[c] = e4m3_to_f32(static_cast<uint8_t>(c));
   MOE_CUDA(cudaSetDevice(0));
   if (ignis_fp8_linear_prepare() != 0) {
     std::fprintf(stderr, "FATAL: ignis_fp8_linear_prepare: %s\n", ignis_fp8_linear_last_error());
@@ -356,7 +265,7 @@ int main() {
       for (int t = 0; t < tokens; ++t) {
         const std::vector<uint16_t> xt = token_input(static_cast<uint32_t>(id), position[id] + t);
         std::copy(xt.begin(), xt.end(), x.begin() + (l * tokens + t) * static_cast<std::size_t>(H));
-        ref.push_back(reference_token(w, lanes[id], as_double(xt)));
+        ref.push_back(reference_token(w, lanes[id], as_double(xt.data(), xt.size())));
       }
       position[id] += tokens;
     }

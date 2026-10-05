@@ -636,11 +636,16 @@ add_test(NAME ignis_kernel_flash_next_embed_head_test COMMAND ignis_kernel_flash
 # Slice S2 (kern): the GDN layer core (kernel/src/flash_next/gdn.cu) at the real geometry against
 # an fp64 restatement of the checkpoint's Qwen4ExpTextGatedDeltaNet: prefill chunks, decode lanes
 # eager and as a replayed graph, state carry and slot isolation. GPU.
-add_executable(ignis_kernel_flash_next_gdn_test test_flash_next_gdn.cu)
-target_include_directories(ignis_kernel_flash_next_gdn_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-target_link_libraries(ignis_kernel_flash_next_gdn_test PRIVATE ignis_kernel ignis_vendor)
-add_test(NAME ignis_kernel_flash_next_gdn_test COMMAND ignis_kernel_flash_next_gdn_test)
+# The QSA attention sublayer (kernel/src/flash_next/qsa.cu, qsa_dense.cu) on paged K/V of both
+# formats: the norms and rope, the dense kernel against fp64, the whole sublayer in prefill and in
+# graph-captured decode, hq-e8-2b within a bound derived from its measured codec error. GPU.
+foreach(name IN ITEMS gdn qsa)
+  add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
+  target_include_directories(ignis_kernel_flash_next_${name}_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+  target_link_libraries(ignis_kernel_flash_next_${name}_test PRIVATE ignis_kernel ignis_vendor)
+  add_test(NAME ignis_kernel_flash_next_${name}_test COMMAND ignis_kernel_flash_next_${name}_test)
+endforeach()
 
 # GitHub #301 (spec flash-next/03): OURS -- the expert residency miss path measured (copy
 # engine against SM-driven copies from mapped pinned memory). A timing is a finding, not a
