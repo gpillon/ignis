@@ -4,11 +4,14 @@
 // Qwen4ExpTextGatedDeltaNet that rounds to BF16 where the checkpoint stores BF16.
 //
 // Three lanes in a five-slot state pool, as the program drives them: one-lane prefill calls (one
-// crossing the recurrence's 64-token chunk), a one-token prefill, a three-lane decode round run
-// eagerly, two more captured once as a CUDA graph and replayed with new inputs, then a second
-// prefill chunk on a lane whose state is no longer zero. Every call's output, every lane's final
-// state, the untouched slots and every call's scratch peak (against fn_gdn_layer_scratch_bytes)
-// are checked.
+// crossing the recurrence's 64-token chunk and the convolution's 64-token chunk), a one-token
+// prefill, a three-lane decode round run eagerly, two more captured once as a CUDA graph and
+// replayed with new inputs and the lanes in another order (the slots are read on the device),
+// then a second prefill chunk on a lane whose state is no longer zero. Every call's output, every
+// lane's final state, the untouched slots and every call's scratch peak (against
+// fn_gdn_layer_scratch_bytes) are checked. The convolution weight is the artifact's
+// [channels][4] (conv1d.weight), random per tap, so a tap-major read cannot pass. Then
+// fn_gdn_layer itself on a seq pool: its layer and slot, and its refusals.
 //
 // Tolerance: the layer's output inherits the vendored recurrence's own criterion (relative L2
 // 4.1e-3, gross 5.5e-3 of the largest reference; vendor/tests/ops/test_gated_delta_net.cpp),
@@ -21,6 +24,8 @@
 
 #include "flash_next_s2_test_common.h"
 #include "ignis_fp8_linear.h"
+#include "ignis_seq.h"
+#include "ignis_seq_internal.h"
 
 #include "core/arena.h"
 
@@ -97,21 +102,21 @@ struct Lane {
   std::vector<double> state = std::vector<double>(static_cast<std::size_t>(VH) * D * D, 0.0);
 };
 
-double sigmoid(double v) { return 1.0 / (1.0 + std::exp(-v)); }
-
 // One token through the layer; returns y (fp64, unrounded).
 std::vector<double> reference_token(const Weights &w, Lane &lane, const std::vector<double> &x) {
   std::vector<double> qkv = project(w.qkv, x), z = project(w.z, x), a = project(w.a, x), b = project(w.b, x);
   for (auto *v : {&qkv, &z, &a, &b}) {
     for (double &e : *v) e = bf16r(e);
   }
-  // Depthwise causal conv over [taps..., qkv] then SiLU, rounded once (the vendored op's storage).
+  // Depthwise causal conv over [taps..., qkv] with the weight [c][j], rounded to BF16 (F.conv1d in
+  // BF16), then SiLU rounded again.
   std::vector<double> conv(C);
   for (int c = 0; c < C; ++c) {
     double s = 0.0;
     for (int j = 0; j < 3; ++j) s += bf16_to_f32(w.conv[static_cast<std::size_t>(c) * 4 + j]) * lane.taps[static_cast<std::size_t>(j) * C + c];
     s += bf16_to_f32(w.conv[static_cast<std::size_t>(c) * 4 + 3]) * qkv[c];
-    conv[c] = bf16r(s * sigmoid(s));
+    const double sb = bf16r(s);
+    conv[c] = bf16r(sb * sigmoid(sb));
   }
   for (int j = 0; j < 2; ++j) {
     std::copy_n(&lane.taps[static_cast<std::size_t>(j + 1) * C], C, &lane.taps[static_cast<std::size_t>(j) * C]);
@@ -271,6 +276,7 @@ int main() {
     }
     upload(d_x, x);
     upload(d_slots, slots);
+    MOE_CUDA(cudaDeviceSynchronize());  // pageable uploads may still be in flight for another stream
     fn::Batch batch;
     batch.lanes = static_cast<int32_t>(lane_ids.size());
     batch.tokens = tokens;
@@ -294,8 +300,8 @@ int main() {
   call("prefill lane C, 1 token", {2}, 1, nullptr);
   call("decode round 1, 3 lanes, eager", {0, 1, 2}, 1, nullptr);
 
-  // Rounds 2 and 3 replay one captured graph; only x changes between them (the slots too could:
-  // they are read on the device).
+  // Rounds 2 and 3 replay one captured graph; round 3 takes the lanes in another order, so its
+  // inputs and slots both change under the same launches.
   cudaGraph_t graph;
   cudaGraphExec_t exec;
   {
@@ -310,7 +316,7 @@ int main() {
     MOE_CUDA(cudaGraphInstantiate(&exec, graph, 0));
   }
   call("decode round 2, graph replay", {0, 1, 2}, 1, &exec);
-  call("decode round 3, graph replay", {0, 1, 2}, 1, &exec);
+  call("decode round 3, graph replay, lanes C A B", {2, 0, 1}, 1, &exec);
   MOE_CUDA(cudaGraphExecDestroy(exec));
   MOE_CUDA(cudaGraphDestroy(graph));
   call("prefill lane A again, 20 tokens on a carried state", {0}, 20, nullptr);
@@ -346,6 +352,86 @@ int main() {
     const auto *rb = reinterpret_cast<const uint8_t *>(&rec[static_cast<std::size_t>(s) * VH * D * D]);
     for (std::size_t i = 0; i < static_cast<std::size_t>(VH) * D * D * 4; ++i) same = same && rb[i] == 0x3C;
     check(same, "slot " + std::to_string(s) + " (no lane's) is untouched");
+  }
+
+  // fn_gdn_layer on a seq pool of three GDN layers, one sequence: bit-identical to gdn::run on
+  // buffers of its own, its state in layer 1 of the sequence's slot and nowhere else.
+  {
+    ignis_seq_pool_spec spec{};
+    spec.num_kv_heads = 2;
+    spec.head_dim = 256;
+    spec.kv_format = IGNIS_KV_FORMAT_BF16;
+    spec.kv_page_group_count = 4;
+    spec.max_context_tokens = 256;
+    spec.slot_count = 2;
+    spec.gdn_num_layers = 3;
+    spec.gdn_conv_channels = C;
+    spec.gdn_value_heads = VH;
+    spec.gdn_head_dim = D;
+    spec.vocab = 1024;
+    spec.kv_num_layers = 1;
+    ignis_seq_pool *pool = nullptr;
+    ignis_seq *seq = nullptr;
+    if (ignis_seq_pool_create(&spec, &pool) != 0 || ignis_seq_alloc(pool, 64, &seq) != 0) {
+      std::fprintf(stderr, "FATAL: seq pool: %s\n", ignis_seq_last_error());
+      return EXIT_FAILURE;
+    }
+    fn::Context ctx;
+    ctx.g = g;
+    ctx.pool = pool;
+    Device own;
+    MOE_CUDA(cudaMemset(own.conv.p, 0, own.conv.bytes));
+    MOE_CUDA(cudaMemset(own.recurrent.p, 0, own.recurrent.bytes));
+    DeviceBytes d_y_own(d_y.bytes);
+    bool same = true;
+    for (int tokens : {6, 1}) {
+      std::vector<uint16_t> x;
+      for (int t = 0; t < tokens; ++t) {
+        const std::vector<uint16_t> xt = token_input(7, 100 * tokens + t);
+        x.insert(x.end(), xt.begin(), xt.end());
+      }
+      upload(d_x, x);
+      upload(d_slots, std::vector<int32_t>{seq->slot});
+      MOE_CUDA(cudaDeviceSynchronize());
+      fn::Batch batch;
+      batch.lanes = 1;
+      batch.tokens = tokens;
+      batch.slots = d_slots.as<int32_t>();
+      FN_RC(fn::fn_gdn_layer(ctx, 1, wv, batch, d_x.p, d_y.p, arena, stream));
+      FN_RC(fn::gdn::run(g, own.state(), wv, batch, d_x.p, d_y_own.p, arena, stream));
+      MOE_CUDA(cudaStreamSynchronize(stream));
+      same = same && download<uint16_t>(d_y.p, static_cast<std::size_t>(tokens) * H) ==
+                         download<uint16_t>(d_y_own.p, static_cast<std::size_t>(tokens) * H);
+    }
+    check(same, "fn_gdn_layer: prefill and decode outputs bit-identical to gdn::run");
+    const std::size_t conv_bytes = static_cast<std::size_t>(3) * C * 2;
+    const std::size_t rec_bytes = static_cast<std::size_t>(VH) * D * D * 4;
+    auto bytes_at = [](const void *p, std::size_t n) { return download<uint8_t>(p, n); };
+    check(bytes_at(pool->gdn_pool.conv_slot(1, seq->slot).data, conv_bytes) ==
+                  bytes_at(static_cast<const char *>(own.conv.p) + seq->slot * conv_bytes, conv_bytes) &&
+              bytes_at(pool->gdn_pool.recurrent_slot(1, seq->slot).data, rec_bytes) ==
+                  bytes_at(static_cast<const char *>(own.recurrent.p) + seq->slot * rec_bytes, rec_bytes),
+          "fn_gdn_layer: the state lands in GDN layer 1 at the sequence's slot");
+    bool others_zero = true;
+    for (uint32_t layer : {0U, 2U}) {
+      for (uint8_t b : bytes_at(pool->gdn_pool.conv_slot(layer, seq->slot).data, conv_bytes)) others_zero = others_zero && b == 0;
+      for (uint8_t b : bytes_at(pool->gdn_pool.recurrent_slot(layer, seq->slot).data, rec_bytes)) others_zero = others_zero && b == 0;
+    }
+    check(others_zero, "fn_gdn_layer: GDN layers 0 and 2 are untouched");
+    fn::Batch one;
+    one.lanes = 1;
+    one.tokens = 1;
+    one.slots = d_slots.as<int32_t>();
+    check(fn::fn_gdn_layer(ctx, 3, wv, one, d_x.p, d_y.p, arena, stream) != 0 &&
+              std::strstr(fn::fn_last_error(), "GDN layer 3") != nullptr,
+          "fn_gdn_layer: a GDN ordinal past the pool's layers is refused by name");
+    fn::Context no_pool;
+    no_pool.g = g;
+    check(fn::fn_gdn_layer(no_pool, 0, wv, one, d_x.p, d_y.p, arena, stream) != 0 &&
+              std::strstr(fn::fn_last_error(), "no seq pool") != nullptr,
+          "fn_gdn_layer: a context without a seq pool is refused by name");
+    ignis_seq_release(pool, seq);
+    ignis_seq_pool_free(pool);
   }
 
   // Refusals by name.

@@ -38,6 +38,7 @@ constexpr int kSmemBytes = kQBytes + 4 * kTileBytes;  // Q, then K and V double-
 struct DenseArgs {
   sparse::KvSource source;
   const int32_t *slots;
+  int32_t slot_count;
   const int32_t *positions;
   const __nv_bfloat16 *q;
   __nv_bfloat16 *out;
@@ -124,6 +125,7 @@ __global__ void __launch_bounds__(kThreads) dense_kernel(DenseArgs a) {
   const int32_t first = a.positions[0];
   const int32_t slot = a.slots[0];
   if (first < 0 || first + a.tokens > a.max_visible) __trap();
+  if (a.source.mode == sparse::KvSource::Mode::Paged && (slot < 0 || slot >= a.slot_count)) __trap();
   // The keys this CTA reads: up to its last row's position.
   const int32_t keys = first + row0 + rows_here;
   const int32_t tiles = (keys + kKeys - 1) / kKeys;
@@ -261,7 +263,7 @@ __global__ void __launch_bounds__(kThreads) dense_kernel(DenseArgs a) {
 
 }  // namespace
 
-Status attend_dense(const Geometry &g, const sparse::KvSource &source, const Batch &batch,
+Status attend_dense(const Geometry &g, const sparse::KvSource &source, int32_t slots, const Batch &batch,
                     const __nv_bfloat16 *q, __nv_bfloat16 *out, cudaStream_t stream) {
   if (batch.lanes != 1 || batch.tokens <= 0 || batch.slots == nullptr || batch.positions == nullptr) {
     return "qsa dense attention: a call is one lane of at least one token";
@@ -269,14 +271,14 @@ Status attend_dense(const Geometry &g, const sparse::KvSource &source, const Bat
   if (batch.max_visible > g.dense_threshold()) return "qsa dense attention: more visible tokens than dense_threshold()";
   if (source.kv_heads != kKvHeads || source.k == nullptr || source.v == nullptr ||
       source.mode == sparse::KvSource::Mode::ByIndex ||
-      (source.mode == sparse::KvSource::Mode::Paged && source.block_tables == nullptr)) {
+      (source.mode == sparse::KvSource::Mode::Paged && (source.block_tables == nullptr || slots <= 0))) {
     return "qsa dense attention: K/V must be the BF16 pages or a by-position scratch of 2 KV heads";
   }
   static_assert(kSmemBytes <= 227 * 1024, "dense attention's shared memory");
   if (cudaFuncSetAttribute(dense_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes) != cudaSuccess) {
     return "qsa dense attention: cannot set the shared memory size";
   }
-  DenseArgs a{source, batch.slots, batch.positions, q, out, batch.tokens, batch.max_visible,
+  DenseArgs a{source, batch.slots, slots, batch.positions, q, out, batch.tokens, batch.max_visible,
               0.0625F * 1.4426950408889634F};
   const dim3 grid(static_cast<unsigned>((batch.tokens + kRows - 1) / kRows), kQHeads);
   dense_kernel<<<grid, kThreads, kSmemBytes, stream>>>(a);

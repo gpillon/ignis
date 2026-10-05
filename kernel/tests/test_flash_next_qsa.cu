@@ -8,25 +8,37 @@
 //               against fp64 attention with the bound of its own roundings.
 //   layer       qsa::run, three lanes in a paged store per format: one-shot and chunked prefill
 //               (a chunk shorter than the hq ring on >= 1024 history, one longer than the ring
-//               up to dense_threshold()), then decode rounds on S3's sparse route, the first eager
-//               and two replaying captured graphs. Every BF16 call against fp64 on sampled rows;
-//               every hq-e8-2b call bit-identical to BF16 while every key it reads is the call's
-//               own, else within a bound DERIVED FROM THE MEASURED CODEC ERROR of the very rows it
-//               read (the rows decoded back after the call), propagated through the softmax, the
+//               up to dense_threshold()), decode rounds on S3's sparse route -- the first eager,
+//               two replaying captured graphs, the last with the lanes in another order -- and a
+//               sparse prefill chunk past dense_threshold(). Every call's K/V rows in the pages
+//               against K/V recomputed from x; every BF16 call against fp64 attention over those
+//               recomputed K/V on sampled rows; every hq-e8-2b call bit-identical to BF16 while
+//               every key it reads is the call's own, else within a bound DERIVED FROM THE
+//               MEASURED CODEC ERROR of the very rows it read, propagated through the softmax, the
 //               gate and o_proj; the residual window's rows exact after a chunk wider than the ring.
+//   entry       fn_qsa_attention itself on seq pools of both formats: bit-identical to qsa::run,
+//               its K/V in its own attention layer's planes and window only, its refusals.
 //
 // Bounds. Attention on the same q and K/V: the probabilities are rounded to BF16 for the value
 // product while the normalizer is their fp32 sum, and the output is rounded once, so
-// |o - o_ref| <= 3 * 2^-9 * A with A = sum_j p_j |v_j| (stated as 2^-7 A). The gate and o_proj
-// propagate it elementwise: y's bound is sum_c |W_ic| B_c + 2^-8 |y_i|, B_c the gated element's.
-// hq against BF16 adds, per query head, Delta = max_j |q . (k'_j - k_j)| / 16 over the keys read
-// (k' decoded, k exact): every probability moves by a factor within e^(+-2 Delta), so
-// |o' - o| <= (e^(2 Delta) - 1) sum_j p_j |v'_j| + sum_j p_j |v'_j - v_j|.
+// |o - o_ref| <= 3 * 2^-9 * A with A = sum_j p_j |v_j| (stated as 2^-7 A; 2^-6 A for the whole
+// sublayer, which adds rare BF16 rounding flips of q, k and v against the restatement). The gate
+// and o_proj propagate it elementwise: y's bound is sum_c |W_ic| B_c + 2^-8 |y_i|, B_c the gated
+// element's. hq against BF16 adds, per query head, Delta = max_j |q . (k'_j - k_j)| / 16 over the
+// keys read (k' what the hq route read, k exact): every probability moves by a factor within
+// e^(+-2 Delta), so |o' - o| <= (e^(2 Delta) - 1) sum_j p_j |v'_j| + sum_j p_j |v'_j - v_j|. What
+// the hq route read is measured by decoding the same rows back after the call: a key the call
+// read from the codec decodes to the same row; a key it read exactly (its own, a sink, the ring)
+// has at most the rotation's round-trip error, ||k' - k|| <= 2^-7 ||k|| and
+// |v'_d - v_d| <= 2^-7 (||v|| + |v_d|) (one BF16 rounding in the rotated frame, one after it), so
+// each key's term is the larger of the measured error and that round-trip bound.
 
 #include "flash_next/qsa.h"
 
 #include "flash_next_s2_test_common.h"
 #include "ignis_fp8_linear.h"
+#include "ignis_seq.h"
+#include "ignis_seq_internal.h"
 
 #include "core/arena.h"
 #include "ninfer/ops/rope.h"
@@ -57,6 +69,7 @@ constexpr int kSlots = 3;
 constexpr int kLogicalPages = 40;  // 2560 tokens a lane
 constexpr int kPages = 128;
 constexpr int kWidth = 2051;       // dense_threshold() = selection_width()
+constexpr int kSparseRows = 40;    // the sparse prefill chunk
 constexpr double kScale = 1.0 / 16.0;
 constexpr float kEps = 1e-6F;
 
@@ -72,8 +85,6 @@ fn::Geometry geometry() {
   g.rms_norm_eps = kEps;
   return g;
 }
-
-double sigmoid(double v) { return 1.0 / (1.0 + std::exp(-v)); }
 
 struct Weights {
   Proj q, k, v, o;
@@ -127,11 +138,27 @@ std::vector<double> norm_rope(const double *x, const std::vector<uint16_t> &w, c
   return n;
 }
 
-// ---- inputs and the paged stores ------------------------------------------------------------
+// ---- inputs, the restated K/V and the paged stores ------------------------------------------
 
 std::vector<uint16_t> token_input(int lane, int32_t position) {
   return bf16_vector(3000 + lane, H, -1.0, 1.0, static_cast<uint64_t>(position) * H);
 }
+
+// A lane's K and V rows recomputed from its inputs: [position][KVH][D] each, fp64 of BF16 values.
+struct RefKv {
+  std::vector<double> k, v;
+  void append(const Weights &w, const Rope &rope, int lane, int32_t position) {
+    const std::vector<uint16_t> xb = token_input(lane, position);
+    const std::vector<double> x = as_double(xb.data(), xb.size());
+    std::vector<double> kp = project(w.k, x), vp = project(w.v, x);
+    for (double &e : kp) e = bf16r(e);
+    for (int h = 0; h < KVH; ++h) {
+      const std::vector<double> kr = norm_rope(&kp[static_cast<std::size_t>(h) * D], w.k_norm, rope, position);
+      k.insert(k.end(), kr.begin(), kr.end());
+    }
+    for (double e : vp) v.push_back(bf16r(e));
+  }
+};
 
 struct Store {
   int32_t format = IGNIS_KV_FORMAT_BF16;
@@ -154,6 +181,7 @@ struct Store {
     out.kv_format = format;
     out.block_tables = tables;
     out.logical_pages = kLogicalPages;
+    out.slots = kSlots;
     out.k = k->p;
     out.v = v->p;
     if (format == IGNIS_KV_FORMAT_HQ_E8_2B) {
@@ -181,13 +209,13 @@ struct Store {
   }
 };
 
-// Rows [0, n) of a lane in a BF16 store, [n][KVH][D] in fp64, per role.
-std::vector<double> lane_rows(const Store &s, const std::vector<int32_t> &tables, int slot, int n, bool role_v) {
-  const std::vector<uint16_t> plane =
-      download<uint16_t>((role_v ? s.v : s.k)->p, static_cast<std::size_t>(kPages) * KVH * 64 * D);
+// Rows [0, n) of the lane at block-table row `slot` of a BF16 plane, [n][KVH][D] in fp64.
+std::vector<double> plane_rows(const void *plane_dev, std::size_t plane_pages, const std::vector<int32_t> &tables,
+                               int logical_pages, int slot, int n) {
+  const std::vector<uint16_t> plane = download<uint16_t>(plane_dev, plane_pages * KVH * 64 * D);
   std::vector<double> rows(static_cast<std::size_t>(n) * KVH * D);
   for (int j = 0; j < n; ++j) {
-    const int page = tables[static_cast<std::size_t>(slot) * kLogicalPages + j / 64];
+    const int page = tables[static_cast<std::size_t>(slot) * logical_pages + j / 64];
     for (int h = 0; h < KVH; ++h) {
       const std::size_t at = ((static_cast<std::size_t>(page) * KVH + h) * 64 + j % 64) * D;
       for (int d = 0; d < D; ++d) rows[(static_cast<std::size_t>(j) * KVH + h) * D + d] = bf16_to_f32(plane[at + d]);
@@ -196,12 +224,30 @@ std::vector<double> lane_rows(const Store &s, const std::vector<int32_t> &tables
   return rows;
 }
 
+std::vector<double> lane_rows(const Store &s, const std::vector<int32_t> &tables, int slot, int n, bool role_v) {
+  return plane_rows((role_v ? s.v : s.k)->p, kPages, tables, kLogicalPages, slot, n);
+}
+
+// Rows [first, first + count) against the restated ones: within a BF16 rounding flip, 99% exact.
+void check_rows(const std::string &name, const std::vector<double> &got, const std::vector<double> &want,
+                int32_t first, int32_t count) {
+  long exact = 0, total = 0;
+  bool within = true;
+  for (std::size_t i = static_cast<std::size_t>(first) * KVH * D; i < static_cast<std::size_t>(first + count) * KVH * D; ++i) {
+    const double e = std::fabs(got[i] - want[i]);
+    exact += e == 0.0;
+    ++total;
+    within = within && e <= std::ldexp(std::fabs(want[i]), -6) + 1e-3;
+  }
+  check(within, name + ": every row within a BF16 rounding flip of the K/V recomputed from x");
+  check(exact * 100 >= total * 99, name + ": 99% of the K/V values bit-exact");
+}
+
 // ---- the reference of one row and its bounds ------------------------------------------------
 
 struct RowRef {
-  std::vector<double> y;          // fp64, unrounded
-  std::vector<double> bound;      // BF16 route against y
-  std::vector<double> hq_bound;   // hq-e8-2b route against the BF16 route (when decoded rows given)
+  std::vector<double> y;      // fp64, unrounded
+  std::vector<double> bound;  // the BF16 route against y, or the hq route against the BF16 route
 };
 
 // sum_c |W[i][c]| b[c] for every output i.
@@ -217,39 +263,48 @@ std::vector<double> project_abs(const Proj &p, const std::vector<double> &b) {
   return y;
 }
 
-// One query row at `position` attending `keys` (ascending) of the lane's exact rows
-// [n][KVH][D] (k, v). With decoded rows (k', v', same layout, indexed like the exact ones)
-// also the hq-against-BF16 bound.
+double norm2(const double *v) {
+  double s = 0.0;
+  for (int d = 0; d < D; ++d) s += v[d] * v[d];
+  return std::sqrt(s);
+}
+
+// One query row at `position` attending `keys` (ascending) of the K/V rows k, v ([n][KVH][D]).
+// Without decoded rows: y and the bound of the BF16 route against it. With the rows the hq route
+// read (kd, vd, same layout, indexed like k, v -- which are then the BF16 route's own rows): the
+// bound of the hq route against the BF16 route.
 RowRef reference_row(const Weights &w, const Rope &rope, const std::vector<uint16_t> &x_bf16, int32_t position,
                      const std::vector<int32_t> &keys, const std::vector<double> &k, const std::vector<double> &v,
                      const std::vector<double> *kd, const std::vector<double> *vd) {
   const std::vector<double> x = as_double(x_bf16.data(), x_bf16.size());
   std::vector<double> qg = project(w.q, x);
   for (double &e : qg) e = bf16r(e);
-  std::vector<double> gated(qsa::kOutWidth), b_bf16(qsa::kOutWidth), b_hq(qsa::kOutWidth);
+  std::vector<double> gated(qsa::kOutWidth), b(qsa::kOutWidth);
+  const bool hq = kd != nullptr;
   for (int h = 0; h < QH; ++h) {
     const std::vector<double> q = norm_rope(&qg[static_cast<std::size_t>(h) * 2 * D], w.q_norm, rope, position);
+    const double qn = norm2(q.data());
     const int kvh = h / qsa::kGroup;
-    std::vector<double> s(keys.size()), p(keys.size());
+    std::vector<double> p(keys.size()), vn(keys.size());
     double m = -1e300;
     double delta = 0.0;
     for (std::size_t i = 0; i < keys.size(); ++i) {
-      const double *kr = &k[(static_cast<std::size_t>(keys[i]) * KVH + kvh) * D];
-      double dot = 0.0, ddot = 0.0;
-      for (int d = 0; d < D; ++d) dot += q[d] * kr[d];
-      if (kd != nullptr) {
-        const double *kdr = &(*kd)[(static_cast<std::size_t>(keys[i]) * KVH + kvh) * D];
-        for (int d = 0; d < D; ++d) ddot += q[d] * (kdr[d] - kr[d]);
-        delta = std::max(delta, std::fabs(ddot) * kScale);
+      const std::size_t row = (static_cast<std::size_t>(keys[i]) * KVH + kvh) * D;
+      double dot = 0.0;
+      for (int d = 0; d < D; ++d) dot += q[d] * k[row + d];
+      if (hq) {
+        double ddot = 0.0;
+        for (int d = 0; d < D; ++d) ddot += q[d] * ((*kd)[row + d] - k[row + d]);
+        const double round_trip = std::ldexp(qn * norm2(&k[row]), -7);
+        delta = std::max(delta, std::max(std::fabs(ddot), round_trip) * kScale);
+        vn[i] = norm2(&v[row]);
       }
-      s[i] = dot * kScale;
-      m = std::max(m, s[i]);
+      p[i] = dot * kScale;
+      m = std::max(m, p[i]);
     }
     double l = 0.0;
-    for (std::size_t i = 0; i < keys.size(); ++i) {
-      p[i] = std::exp(s[i] - m);
-      l += p[i];
-    }
+    for (double &e : p) l += (e = std::exp(e - m));
+    for (double &e : p) e /= l;
     const double grow = std::exp(2.0 * delta);
     for (int d = 0; d < D; ++d) {
       double o = 0.0, a = 0.0, ad = 0.0, dv = 0.0;
@@ -257,31 +312,26 @@ RowRef reference_row(const Weights &w, const Rope &rope, const std::vector<uint1
         const std::size_t at = (static_cast<std::size_t>(keys[i]) * KVH + kvh) * D + d;
         o += p[i] * v[at];
         a += p[i] * std::fabs(v[at]);
-        if (vd != nullptr) {
+        if (hq) {
           ad += p[i] * std::fabs((*vd)[at]);
-          dv += p[i] * std::fabs((*vd)[at] - v[at]);
+          const double round_trip = std::ldexp(vn[i] + std::fabs(v[at]), -7);
+          dv += p[i] * std::max(std::fabs((*vd)[at] - v[at]), round_trip);
         }
       }
-      o /= l;
-      a /= l;
-      ad /= l;
-      dv /= l;
       const std::size_t c = static_cast<std::size_t>(h) * D + d;
       const double sg = bf16r(sigmoid(qg[static_cast<std::size_t>(h) * 2 * D + D + d]));
       gated[c] = bf16r(bf16r(o) * sg);
-      b_bf16[c] = sg * std::ldexp(a, -6) + std::ldexp(std::fabs(gated[c]), -8);
-      b_hq[c] = b_bf16[c] + sg * ((grow - 1.0) * ad + dv + std::ldexp(grow * ad, -6)) +
-                std::ldexp(std::fabs(gated[c]), -8);
+      // The BF16 route's own error, once (against fp64) or twice (each route against its exact
+      // attention), plus the hq route's input error.
+      b[c] = hq ? sg * (std::ldexp(a, -6) + std::ldexp(grow * ad, -6) + (grow - 1.0) * ad + dv) +
+                      std::ldexp(std::fabs(gated[c]), -7)
+                : sg * std::ldexp(a, -6) + std::ldexp(std::fabs(gated[c]), -8);
     }
   }
   RowRef r;
   r.y = project(w.o, gated);
-  r.bound = project_abs(w.o, b_bf16);
-  for (int i = 0; i < H; ++i) r.bound[i] += std::ldexp(std::fabs(r.y[i]), -8) + 1e-6;
-  if (kd != nullptr) {
-    r.hq_bound = project_abs(w.o, b_hq);
-    for (int i = 0; i < H; ++i) r.hq_bound[i] += std::ldexp(std::fabs(r.y[i]), -7) + 1e-6;
-  }
+  r.bound = project_abs(w.o, b);
+  for (int i = 0; i < H; ++i) r.bound[i] += std::ldexp(std::fabs(r.y[i]), hq ? -7 : -8) + 1e-6;
   return r;
 }
 
@@ -308,6 +358,16 @@ std::vector<double> row_of(const std::vector<uint16_t> &y, int row) {
   return as_double(&y[static_cast<std::size_t>(row) * H], H);
 }
 
+// The visible tokens a hand-made selection keeps at `position`: everything while at most kWidth
+// are visible, else the first 64, every third and the last 48 (always the row's own token).
+std::vector<int32_t> selection_at(int32_t position) {
+  std::vector<int32_t> list;
+  for (int32_t j = 0; j <= position; ++j) {
+    if (position < kWidth || j < 64 || j % 3 == 0 || j > position - 48) list.push_back(j);
+  }
+  return list;
+}
+
 }  // namespace
 
 int main() {
@@ -323,7 +383,8 @@ int main() {
     other.kv_heads = 4;
     check(qsa::check_geometry(other) != nullptr, "another KV head count is refused");
   }
-  const fn::indexer::Rope ix_rope = fn::indexer::rope_from(ninfer::ops::rope_linear_frequencies(1e7F, 64));
+  const ninfer::ops::RopeFrequencies frequencies = ninfer::ops::rope_linear_frequencies(1e7F, 64);
+  const fn::indexer::Rope ix_rope = fn::indexer::rope_from(frequencies);
   Rope rope;
   std::memcpy(rope.inv_freq, ix_rope.inv_freq, sizeof(rope.inv_freq));
   cudaStream_t stream;
@@ -351,11 +412,11 @@ int main() {
     const int32_t positions[rows] = {0, 1, 4097, 65535, 131071};
     std::vector<uint16_t> qg = bf16_vector(301, static_cast<std::size_t>(rows) * qsa::kQProjWidth, -2.0, 2.0);
     std::vector<uint16_t> k = bf16_vector(303, static_cast<std::size_t>(rows) * qsa::kKvWidth, -2.0, 2.0);
-    const std::vector<uint16_t> k_in = k;
     auto d_qg = device_copy(qg);
     auto d_k = device_copy(k);
     DeviceBytes d_q(static_cast<std::size_t>(rows) * qsa::kOutWidth * 2);
     upload(d_positions, std::vector<int32_t>(positions, positions + rows));
+    MOE_CUDA(cudaDeviceSynchronize());
     fn::Batch batch;
     batch.lanes = rows;
     batch.tokens = 1;
@@ -382,7 +443,7 @@ int main() {
         compare(&q_out[(static_cast<std::size_t>(r) * QH + h) * D], norm_rope(x.data(), w.q_norm, rope, positions[r]));
       }
       for (int h = 0; h < KVH; ++h) {
-        const std::vector<double> x = as_double(&k_in[(static_cast<std::size_t>(r) * KVH + h) * D], D);
+        const std::vector<double> x = as_double(&k[(static_cast<std::size_t>(r) * KVH + h) * D], D);
         compare(&k_out[(static_cast<std::size_t>(r) * KVH + h) * D], norm_rope(x.data(), w.k_norm, rope, positions[r]));
       }
     }
@@ -402,6 +463,7 @@ int main() {
     // All n rows into lane 1's pages, one append.
     upload(d_slots, std::vector<int32_t>{1});
     upload(d_positions, std::vector<int32_t>{0});
+    MOE_CUDA(cudaDeviceSynchronize());
     fn::Batch fill;
     fill.lanes = 1;
     fill.tokens = n;
@@ -409,6 +471,7 @@ int main() {
     fill.positions = d_positions.as<int32_t>();
     check(qsa::append(g, pages.kv(dt), fill, d_k->as<__nv_bfloat16>(), d_v->as<__nv_bfloat16>(), stream) == nullptr,
           "dense: append launches");
+    MOE_CUDA(cudaStreamSynchronize(stream));
     const std::vector<double> kh = as_double(k.data(), k.size()), vh = as_double(v.data(), v.size());
     check(lane_rows(pages, tables, 1, n, false) == kh && lane_rows(pages, tables, 1, n, true) == vh,
           "dense: the BF16 append stores every row bit for bit");
@@ -421,15 +484,17 @@ int main() {
       auto d_q = device_copy(q);
       DeviceBytes d_o1(q.size() * 2), d_o2(q.size() * 2);
       upload(d_positions, std::vector<int32_t>{first});
+      MOE_CUDA(cudaDeviceSynchronize());
       fn::Batch batch;
       batch.lanes = 1;
       batch.tokens = tokens;
       batch.slots = d_slots.as<int32_t>();
       batch.positions = d_positions.as<int32_t>();
       batch.max_visible = first + tokens;
-      check(qsa::attend_dense(g, paged, batch, d_q->as<__nv_bfloat16>(), d_o1.as<__nv_bfloat16>(), stream) == nullptr &&
-                qsa::attend_dense(g, by_position, batch, d_q->as<__nv_bfloat16>(), d_o2.as<__nv_bfloat16>(), stream) ==
-                    nullptr,
+      check(qsa::attend_dense(g, paged, kSlots, batch, d_q->as<__nv_bfloat16>(), d_o1.as<__nv_bfloat16>(), stream) ==
+                    nullptr &&
+                qsa::attend_dense(g, by_position, kSlots, batch, d_q->as<__nv_bfloat16>(), d_o2.as<__nv_bfloat16>(),
+                                  stream) == nullptr,
             "dense: launches");
       MOE_CUDA(cudaStreamSynchronize(stream));
       const std::vector<uint16_t> o1 = download<uint16_t>(d_o1.p, q.size());
@@ -478,16 +543,17 @@ int main() {
   ninfer::DeviceArena arena(fn::fn_qsa_attention_scratch_bytes(g, kMaxRows));
   DeviceBytes d_x(static_cast<std::size_t>(kMaxRows) * H * 2);
   DeviceBytes d_y_bf16(static_cast<std::size_t>(kMaxRows) * H * 2), d_y_hq(static_cast<std::size_t>(kMaxRows) * H * 2);
-  DeviceBytes d_sel_tokens(static_cast<std::size_t>(kSlots) * kWidth * 4), d_sel_counts(kSlots * 4);
-  DeviceBytes d_dec_k(sparse::listed_hq_bytes(g, kSlots) + sparse::visible_hq_bytes(g, kWidth));
-  DeviceBytes d_dec_v(sparse::listed_hq_bytes(g, kSlots) + sparse::visible_hq_bytes(g, kWidth));
+  DeviceBytes d_sel_tokens(static_cast<std::size_t>(kSparseRows) * kWidth * 4), d_sel_counts(kSparseRows * 4);
+  const std::size_t decoded_bytes = std::max(sparse::listed_hq_bytes(g, kSparseRows), sparse::visible_hq_bytes(g, kWidth));
+  DeviceBytes d_dec_k(decoded_bytes), d_dec_v(decoded_bytes);
   const int slot_of[kSlots] = {2, 0, 1};
   int32_t frontier[kSlots] = {0, 0, 0};
+  RefKv ref[kSlots];
 
-  // One call of both formats. `lists` (decode) holds each lane's selection, else the call is dense.
-  // `check_rows`: the call's rows checked against fp64; `same`: the formats must agree bit for bit.
+  // One call of both formats. `lists` holds each row's selection, else the call is dense.
+  // `check_at`: the call's rows checked against fp64; `same`: the formats must agree bit for bit.
   auto call = [&](const std::string &name, const std::vector<int> &lanes, int tokens,
-                  const std::vector<std::vector<int32_t>> *lists, const std::vector<int> &check_rows, bool same,
+                  const std::vector<std::vector<int32_t>> *lists, const std::vector<int> &check_at, bool same,
                   cudaGraphExec_t *graphs) {
     const int rows = static_cast<int>(lanes.size()) * tokens;
     std::vector<uint16_t> x(static_cast<std::size_t>(rows) * H);
@@ -498,6 +564,7 @@ int main() {
       for (int t = 0; t < tokens; ++t) {
         const std::vector<uint16_t> xt = token_input(lanes[l], frontier[lanes[l]] + t);
         std::copy(xt.begin(), xt.end(), x.begin() + (l * tokens + t) * static_cast<std::size_t>(H));
+        ref[lanes[l]].append(w, rope, lanes[l], frontier[lanes[l]] + t);
       }
     }
     upload(d_x, x);
@@ -523,6 +590,7 @@ int main() {
       selection.tokens = d_sel_tokens.as<int32_t>();
       selection.counts = d_sel_counts.as<int32_t>();
     }
+    MOE_CUDA(cudaDeviceSynchronize());  // pageable uploads may still be in flight for another stream
     for (int f = 0; f < 2; ++f) {
       void *y = f == 0 ? d_y_bf16.p : d_y_hq.p;
       if (graphs != nullptr) {
@@ -531,8 +599,11 @@ int main() {
         arena.reset_peak();
         FN_RC(qsa::run(g, f == 0 ? kv_bf16 : kv_hq, ix_rope, wv, batch, d_x.p, selection, y, arena, stream));
         MOE_CUDA(cudaStreamSynchronize(stream));
-        check(arena.peak_used() <= fn::fn_qsa_attention_scratch_bytes(g, rows),
-              name + ": scratch peak within fn_qsa_attention_scratch_bytes");
+        // A sparse prefill call under hq-e8-2b also decodes every visible row: S3's plan line.
+        const bool s3_line = f == 1 && lists != nullptr && tokens > 1;
+        const std::size_t allowed = fn::fn_qsa_attention_scratch_bytes(g, rows) +
+                                    (s3_line ? 2 * ((sparse::visible_hq_bytes(g, batch.max_visible) + 255) / 256 * 256) : 0);
+        check(arena.peak_used() <= allowed, name + ": scratch peak within its plan lines");
       }
     }
     MOE_CUDA(cudaStreamSynchronize(stream));
@@ -540,19 +611,18 @@ int main() {
     const std::vector<uint16_t> y_hq = download<uint16_t>(d_y_hq.p, static_cast<std::size_t>(rows) * H);
     if (same) check(y_bf16 == y_hq, name + ": hq-e8-2b bit-identical to BF16 (every key read is the call's own)");
 
-    // The rows the hq call read, decoded back after it with the window of its frontier: a key
-    // exact here was exact in the call too (the call's window covers the 512 keys before it and
-    // its own), so the measured error is an upper bound of the call's.
+    // The rows the hq call read, decoded back after it with the window of its frontier: a key the
+    // call read from the codec decodes to the same row, one it read exactly is bounded by the
+    // round trip (reference_row).
     std::vector<double> kd, vd;
     if (!same) {
-      fn::Batch m = batch;
-      fn::Selection ms = selection;
-      sparse::HqSource src = hq_store.hq(dt);
       sparse::KvSource out;
       const bool listed = lists != nullptr;
       const sparse::Status st =
-          listed ? sparse::decode_listed_hq(g, src, m, ms, d_dec_k.as<__nv_bfloat16>(), d_dec_v.as<__nv_bfloat16>(), &out, stream)
-                 : sparse::decode_visible_hq(g, src, m, d_dec_k.as<__nv_bfloat16>(), d_dec_v.as<__nv_bfloat16>(), &out, stream);
+          listed ? sparse::decode_listed_hq(g, hq_store.hq(dt), batch, selection, d_dec_k.as<__nv_bfloat16>(),
+                                            d_dec_v.as<__nv_bfloat16>(), &out, stream)
+                 : sparse::decode_visible_hq(g, hq_store.hq(dt), batch, d_dec_k.as<__nv_bfloat16>(),
+                                             d_dec_v.as<__nv_bfloat16>(), &out, stream);
       check(st == nullptr, name + ": decoding the rows back launches");
       MOE_CUDA(cudaStreamSynchronize(stream));
       const std::size_t n = listed ? static_cast<std::size_t>(rows) * kWidth : static_cast<std::size_t>(batch.max_visible);
@@ -561,39 +631,44 @@ int main() {
     }
 
     std::vector<std::vector<double>> got, got_hq, want, bound, hq_bound;
-    for (int r : check_rows) {
-      const int l = r / tokens;
+    for (std::size_t l = 0; l < lanes.size(); ++l) {
       const int lane = lanes[l];
-      const int32_t position = firsts[l] + r % tokens;
       const int n = firsts[l] + tokens;
       const std::vector<double> k = lane_rows(bf16_store, tables, slot_of[lane], n, false);
       const std::vector<double> v = lane_rows(bf16_store, tables, slot_of[lane], n, true);
-      std::vector<int32_t> keys;
-      std::vector<double> kdr, vdr;
-      if (lists != nullptr) {
-        keys = (*lists)[r];
-      } else {
-        for (int32_t j = 0; j <= position; ++j) keys.push_back(j);
-      }
-      if (!same && lists != nullptr) {
-        // The listed scratch holds row r's i-th listed key at r * width + i: re-index by position.
-        kdr.assign(k.size(), 0.0);
-        vdr.assign(v.size(), 0.0);
-        for (std::size_t i = 0; i < keys.size(); ++i) {
-          const std::size_t from = (static_cast<std::size_t>(r) * kWidth + i) * KVH * D;
-          const std::size_t to = static_cast<std::size_t>(keys[i]) * KVH * D;
-          std::copy_n(&kd[from], KVH * D, &kdr[to]);
-          std::copy_n(&vd[from], KVH * D, &vdr[to]);
+      check_rows(name + " lane " + std::to_string(lane) + " K", k, ref[lane].k, firsts[l], tokens);
+      check_rows(name + " lane " + std::to_string(lane) + " V", v, ref[lane].v, firsts[l], tokens);
+      for (int r : check_at) {
+        if (r / tokens != static_cast<int>(l)) continue;
+        const int32_t position = firsts[l] + r % tokens;
+        std::vector<int32_t> keys;
+        if (lists != nullptr) {
+          keys = (*lists)[r];
+        } else {
+          for (int32_t j = 0; j <= position; ++j) keys.push_back(j);
+        }
+        const std::vector<uint16_t> xr = token_input(lane, position);
+        const RowRef fp64 = reference_row(w, rope, xr, position, keys, ref[lane].k, ref[lane].v, nullptr, nullptr);
+        got.push_back(row_of(y_bf16, r));
+        got_hq.push_back(row_of(y_hq, r));
+        want.push_back(fp64.y);
+        bound.push_back(fp64.bound);
+        if (!same) {
+          std::vector<double> kdr = kd, vdr = vd;
+          if (lists != nullptr) {
+            // The listed scratch holds row r's i-th listed key at r * width + i: re-index by position.
+            kdr.assign(k.size(), 0.0);
+            vdr.assign(v.size(), 0.0);
+            for (std::size_t i = 0; i < keys.size(); ++i) {
+              const std::size_t from = (static_cast<std::size_t>(r) * kWidth + i) * KVH * D;
+              const std::size_t to = static_cast<std::size_t>(keys[i]) * KVH * D;
+              std::copy_n(&kd[from], KVH * D, &kdr[to]);
+              std::copy_n(&vd[from], KVH * D, &vdr[to]);
+            }
+          }
+          hq_bound.push_back(reference_row(w, rope, xr, position, keys, k, v, &kdr, &vdr).bound);
         }
       }
-      const std::vector<double> *kp = same ? nullptr : (lists != nullptr ? &kdr : &kd);
-      const std::vector<double> *vp = same ? nullptr : (lists != nullptr ? &vdr : &vd);
-      RowRef ref = reference_row(w, rope, token_input(lane, position), position, keys, k, v, kp, vp);
-      got.push_back(row_of(y_bf16, r));
-      got_hq.push_back(row_of(y_hq, r));
-      want.push_back(ref.y);
-      bound.push_back(ref.bound);
-      if (!same) hq_bound.push_back(ref.hq_bound);
     }
     check_bounded(name + " (BF16 vs fp64)", got, want, bound);
     if (!same) check_bounded(name + " (hq-e8-2b vs BF16)", got_hq, got, hq_bound);
@@ -614,6 +689,7 @@ int main() {
     m.tokens = 1;
     upload(d_slots, std::vector<int32_t>{slot_of[0]});
     upload(d_positions, std::vector<int32_t>{frontier[0] - 1});
+    MOE_CUDA(cudaDeviceSynchronize());
     m.slots = d_slots.as<int32_t>();
     m.positions = d_positions.as<int32_t>();
     m.max_visible = frontier[0];
@@ -655,20 +731,14 @@ int main() {
   call("lane B prefill P=0 T=700", {1}, 700, nullptr, {0, 699}, true, nullptr);
   call("lane C prefill P=0 T=40", {2}, 40, nullptr, {39}, true, nullptr);
 
-  // Decode: S3's sparse route on hand-made selections (a strided subset past dense_threshold, all
-  // visible tokens below it), always with the new token.
-  auto lists_now = [&]() {
-    std::vector<std::vector<int32_t>> lists(kSlots);
-    for (int lane = 0; lane < kSlots; ++lane) {
-      const int32_t p = frontier[lane];
-      for (int32_t j = 0; j <= p; ++j) {
-        if (p < kWidth || j < 64 || j % 3 == 0 || j > p - 48) lists[lane].push_back(j);
-      }
-    }
+  // Decode: S3's sparse route on hand-made selections, rows in the call's lane order.
+  auto lists_for = [&](const std::vector<int> &lanes) {
+    std::vector<std::vector<int32_t>> lists;
+    for (int lane : lanes) lists.push_back(selection_at(frontier[lane]));
     return lists;
   };
   {
-    const auto lists = lists_now();
+    const auto lists = lists_for({0, 1, 2});
     call("decode round 1, 3 lanes, eager", {0, 1, 2}, 1, &lists, {0, 1, 2}, false, nullptr);
   }
   cudaGraphExec_t graphs[2];
@@ -692,13 +762,158 @@ int main() {
       MOE_CUDA(cudaGraphInstantiate(&graphs[f], captured[f], 0));
     }
   }
-  for (int round = 2; round <= 3; ++round) {
-    const auto lists = lists_now();
-    call("decode round " + std::to_string(round) + ", graph replay", {0, 1, 2}, 1, &lists, {0, 1, 2}, false, graphs);
+  {
+    const auto lists = lists_for({0, 1, 2});
+    call("decode round 2, graph replay", {0, 1, 2}, 1, &lists, {0, 1, 2}, false, graphs);
+  }
+  {
+    const auto lists = lists_for({2, 0, 1});
+    call("decode round 3, graph replay, lanes C A B", {2, 0, 1}, 1, &lists, {0, 1, 2}, false, graphs);
   }
   for (int f = 0; f < 2; ++f) {
     MOE_CUDA(cudaGraphExecDestroy(graphs[f]));
     MOE_CUDA(cudaGraphDestroy(captured[f]));
+  }
+
+  // A prefill chunk past dense_threshold: every row its own selection, on S3's sparse route.
+  {
+    std::vector<std::vector<int32_t>> lists;
+    for (int t = 0; t < kSparseRows; ++t) lists.push_back(selection_at(frontier[0] + t));
+    call("lane A sparse prefill T=40 past dense_threshold", {0}, kSparseRows, &lists, {0, 17, 39}, false, nullptr);
+  }
+
+  // ---- entry: fn_qsa_attention on seq pools -------------------------------------------------
+  // Attention layer 1 of a three-layer pool, one sequence, dense prefill then a decode token:
+  // bit-identical to qsa::run on stores of its own, its rows in layer 1's planes (and, under hq,
+  // window) only.
+  for (int32_t format : {IGNIS_KV_FORMAT_BF16, IGNIS_KV_FORMAT_HQ_E8_2B}) {
+    const std::string fname = format == IGNIS_KV_FORMAT_BF16 ? "entry (bf16)" : "entry (hq-e8-2b)";
+    ignis_seq_pool_spec spec{};
+    spec.num_kv_heads = KVH;
+    spec.head_dim = D;
+    spec.kv_format = format;
+    spec.kv_page_group_count = 8;
+    spec.max_context_tokens = 256;
+    spec.slot_count = 2;
+    spec.gdn_num_layers = 1;
+    spec.gdn_conv_channels = 10240;
+    spec.gdn_value_heads = 48;
+    spec.gdn_head_dim = 128;
+    spec.vocab = 1024;
+    spec.kv_num_layers = 3;
+    ignis_seq_pool *pool = nullptr;
+    ignis_seq *seq = nullptr;
+    if (ignis_seq_pool_create(&spec, &pool) != 0 || ignis_seq_alloc(pool, 128, &seq) != 0) {
+      std::fprintf(stderr, "FATAL: seq pool: %s\n", ignis_seq_last_error());
+      return EXIT_FAILURE;
+    }
+    Store own(format);
+    const qsa::Kv own_kv = own.kv(dt);
+    fn::Context ctx;
+    ctx.g = g;
+    ctx.kv_format = format;
+    ctx.rope = frequencies;
+    ctx.pool = pool;
+    bool same = true;
+    int32_t first = 0;
+    for (int tokens : {50, 1}) {
+      std::vector<uint16_t> x;
+      for (int t = 0; t < tokens; ++t) {
+        const std::vector<uint16_t> xt = token_input(7, first + t);
+        x.insert(x.end(), xt.begin(), xt.end());
+      }
+      upload(d_x, x);
+      upload(d_slots, std::vector<int32_t>{seq->slot});
+      upload(d_positions, std::vector<int32_t>{first});
+      std::vector<int32_t> list(kWidth, -1);
+      for (int32_t j = 0; j <= first; ++j) list[j] = j;
+      upload(d_sel_tokens, list);
+      upload(d_sel_counts, std::vector<int32_t>{first + 1});
+      MOE_CUDA(cudaDeviceSynchronize());
+      fn::Batch batch;
+      batch.lanes = 1;
+      batch.tokens = tokens;
+      batch.slots = d_slots.as<int32_t>();
+      batch.positions = d_positions.as<int32_t>();
+      batch.max_visible = first + tokens;
+      fn::Selection selection;
+      selection.dense = tokens > 1;
+      selection.tokens = d_sel_tokens.as<int32_t>();
+      selection.counts = d_sel_counts.as<int32_t>();
+      // The own store's slot of the same index: its block-table row differs, its values do not.
+      FN_RC(fn::fn_qsa_attention(ctx, 1, wv, batch, d_x.p, selection, d_y_bf16.p, arena, stream));
+      FN_RC(qsa::run(g, own_kv, ix_rope, wv, batch, d_x.p, selection, d_y_hq.p, arena, stream));
+      MOE_CUDA(cudaStreamSynchronize(stream));
+      same = same && download<uint16_t>(d_y_bf16.p, static_cast<std::size_t>(tokens) * H) ==
+                         download<uint16_t>(d_y_hq.p, static_cast<std::size_t>(tokens) * H);
+      first += tokens;
+    }
+    check(same, fname + ": prefill and decode outputs bit-identical to qsa::run");
+    // The sequence's rows in each attention layer's K plane (codes under hq): layer 1 holds the
+    // own store's rows, layers 0 and 2 nothing.
+    const std::vector<int32_t> row = download<int32_t>(pool->kv_pool.block_table_row(seq->slot).data, 4);
+    const std::size_t row_bytes = format == IGNIS_KV_FORMAT_BF16 ? D * 2 : 64;
+    auto rows_of = [&](const void *plane, const std::vector<int32_t> &pages_of) {
+      std::vector<uint8_t> out;
+      for (int32_t j = 0; j < first; ++j) {
+        for (int h = 0; h < KVH; ++h) {
+          const std::size_t at = ((static_cast<std::size_t>(pages_of[j / 64]) * KVH + h) * 64 + j % 64) * row_bytes;
+          const std::vector<uint8_t> r = download<uint8_t>(static_cast<const uint8_t *>(plane) + at, row_bytes);
+          out.insert(out.end(), r.begin(), r.end());
+        }
+      }
+      return out;
+    };
+    const std::vector<int32_t> own_pages(tables.begin() + static_cast<std::ptrdiff_t>(seq->slot) * kLogicalPages,
+                                         tables.begin() + static_cast<std::ptrdiff_t>(seq->slot + 1) * kLogicalPages);
+    const auto plane = [&](int32_t layer) {
+      return pool->kv_pool.plane(ignis_kv_plane_index(format, layer, IGNIS_KV_PLANE_K)).data;
+    };
+    check(rows_of(plane(1), row) == rows_of(own.k->p, own_pages), fname + ": layer 1's K plane holds the call's rows");
+    bool empty = true;
+    for (int32_t layer : {0, 2}) {
+      for (uint8_t b : rows_of(plane(layer), row)) empty = empty && b == 0;
+    }
+    check(empty, fname + ": attention layers 0 and 2 are untouched");
+    if (format == IGNIS_KV_FORMAT_HQ_E8_2B) {
+      const std::size_t window = static_cast<std::size_t>(544) * KVH * D * 2;
+      const std::vector<uint8_t> w1 = download<uint8_t>(pool->hq_residual_plane(false, 1, seq->slot), window);
+      const std::vector<uint8_t> own_w =
+          download<uint8_t>(static_cast<const uint8_t *>(own.res_k->p) + seq->slot * window, window);
+      check(w1 == own_w, fname + ": layer 1's residual window holds the call's rows");
+      bool other_windows = true;
+      for (int32_t layer : {0, 2}) {
+        for (uint8_t b : download<uint8_t>(pool->hq_residual_plane(false, layer, seq->slot), window)) {
+          other_windows = other_windows && b == 0;
+        }
+      }
+      check(other_windows, fname + ": layers 0 and 2's residual windows are untouched");
+    }
+    // Refusals by name.
+    fn::Batch one;
+    one.lanes = 1;
+    one.tokens = 1;
+    one.slots = d_slots.as<int32_t>();
+    one.positions = d_positions.as<int32_t>();
+    one.max_visible = first + 1;
+    fn::Selection dense;
+    dense.dense = true;
+    auto refused = [&](const fn::Context &c, int32_t ordinal, const char *needle) {
+      return fn::fn_qsa_attention(c, ordinal, wv, one, d_x.p, dense, d_y_bf16.p, arena, stream) != 0 &&
+             std::strstr(fn::fn_last_error(), needle) != nullptr;
+    };
+    check(refused(ctx, 3, "attention layer 3"), fname + ": an attention ordinal past the pool's layers is refused");
+    fn::Context other = ctx;
+    other.kv_format = format == IGNIS_KV_FORMAT_BF16 ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16;
+    check(refused(other, 1, "format"), fname + ": a KV format other than the pool's is refused");
+    other = ctx;
+    other.rope.attention_factor = 2.0F;
+    check(refused(other, 1, "attention factor"), fname + ": a rope attention factor is refused");
+    other = ctx;
+    other.pool = nullptr;
+    check(refused(other, 1, "no seq pool"), fname + ": a context without a seq pool is refused");
+    ignis_seq_release(pool, seq);
+    ignis_seq_pool_free(pool);
   }
 
   // Refusals by name.
@@ -720,6 +935,18 @@ int main() {
     check(qsa::run(g, kv_bf16, ix_rope, short_w, bad, d_x.p, dense, d_y_bf16.p, arena, stream) != 0 &&
               std::strstr(fn::fn_last_error(), "wrong shape") != nullptr,
           "a wrongly shaped weight is refused by name");
+    fn::Batch many;
+    many.lanes = qsa::kMaxDecodeLanes + 1;
+    many.tokens = 1;
+    many.slots = d_slots.as<int32_t>();
+    many.positions = d_positions.as<int32_t>();
+    many.max_visible = 8;
+    fn::Selection listed;
+    listed.tokens = d_sel_tokens.as<int32_t>();
+    listed.counts = d_sel_counts.as<int32_t>();
+    check(qsa::run(g, kv_bf16, ix_rope, wv, many, d_x.p, listed, d_y_bf16.p, arena, stream) != 0 &&
+              std::strstr(fn::fn_last_error(), "decode call is at most") != nullptr,
+          "a decode call of more lanes than kMaxDecodeLanes is refused by name");
   }
   MOE_CUDA(cudaStreamDestroy(stream));
 

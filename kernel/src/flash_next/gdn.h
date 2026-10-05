@@ -6,7 +6,8 @@
 // The oracle is transformers' Qwen4ExpTextGatedDeltaNet (models/qwen4_exp/modeling_qwen4_exp.py):
 //
 //   qkv = in_proj_qkv(x), z = in_proj_z(x), a = in_proj_a(x), b = in_proj_b(x)   BF16 each
-//   qkv = silu(causal_conv1d(qkv))            depthwise, kernel 4, over the 10240 channels
+//   qkv = silu(causal_conv1d(qkv))            depthwise, kernel 4, over the 10240 channels, the
+//                                             weight [channels][4] as conv1d.weight stores it
 //   q, k, v = split(qkv, [2048, 2048, 6144])  16 / 16 / 48 heads of 128
 //   beta = bf16(sigmoid(b));  g = -exp(A_log) * softplus(a + dt_bias)          fp32
 //   o = gated_delta_rule(l2norm(q), l2norm(k), v, g, beta) / sqrt(128)        value head h reads
@@ -14,14 +15,16 @@
 //   o = rmsnorm_gated(o, z): bf16(bf16(weight * bf16(o * rsqrt(mean(o^2) + eps))) * sigmoid(z))
 //   y = out_proj(o)
 //
-// The projections are fn_linear; the convolution and the recurrence are the vendored ninfer ops,
-// whose geometry is the 27B's (16 / 48 heads of 128, kernel 4); the gating and the sigmoid-gated
-// norm are ours (the 27B's gating takes FP32 A_log / dt_bias and its norm gates with SiLU).
+// The projections are fn_linear; the recurrence is the vendored ninfer op, whose geometry is the
+// 27B's (16 / 48 heads of 128); the convolution, the gating and the sigmoid-gated norm are ours
+// (the vendored convolution reads its weight tap-major, the 27B's gating takes FP32 A_log /
+// dt_bias, its norm gates with SiLU).
 //
-// A call is either one token per lane (decode, and a one-token prefill chunk), run on the
-// vendored snapshot forms, which read and write each lane's state at its slot from device memory
-// (graph-safe); or one lane of several tokens (prefill, eager), whose state is gathered from its
-// slot into scratch, advanced by the plain forms and scattered back.
+// A call is either one token per lane (decode, and a one-token prefill chunk), whose recurrence
+// runs on the vendored snapshot form, reading and writing each lane's state at its slot from
+// device memory (graph-safe); or one lane of several tokens (prefill, eager), whose recurrent
+// state is gathered from its slot into scratch, advanced by the plain form and scattered back. The
+// convolution reads and writes the lane's taps at its slot in both.
 
 #pragma once
 

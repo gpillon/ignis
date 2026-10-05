@@ -95,11 +95,11 @@ struct AppendArgs {
   const __nv_bfloat16 *v;
 };
 
-// The physical page of `position` in the lane's block-table row; an unmapped page traps rather
-// than write another sequence's page.
+// The physical page of `position` in the lane's block-table row; a slot outside the table or an
+// unmapped page traps rather than write another sequence's page or residual window.
 __device__ __forceinline__ int32_t page_of(const Kv &kv, int32_t slot, int32_t position) {
   const int32_t logical = position >> 6;
-  if (position < 0 || logical >= kv.logical_pages) __trap();
+  if (slot < 0 || slot >= kv.slots || position < 0 || logical >= kv.logical_pages) __trap();
   const int32_t page = kv.block_tables[static_cast<int64_t>(slot) * kv.logical_pages + logical];
   if (page < 0) __trap();
   return page;
@@ -225,7 +225,8 @@ Status append(const Geometry &g, const Kv &kv, const Batch &batch, const __nv_bf
   if (batch.rows() <= 0 || batch.slots == nullptr || batch.positions == nullptr) {
     return "qsa append: an empty batch, or no slots or positions";
   }
-  if (kv.block_tables == nullptr || kv.logical_pages <= 0 || kv.k == nullptr || kv.v == nullptr) {
+  if (kv.block_tables == nullptr || kv.logical_pages <= 0 || kv.slots <= 0 || kv.k == nullptr ||
+      kv.v == nullptr) {
     return "qsa append: no pages";
   }
   AppendArgs a{kv, batch.slots, batch.positions, batch.tokens, batch.rows(), k, v};
@@ -270,6 +271,9 @@ int32_t run(const Geometry &g, const Kv &kv, const indexer::Rope &rope, const Qs
   }
   if (selection.dense && (batch.lanes != 1 || batch.max_visible > g.dense_threshold())) {
     return fail("a dense call is one lane of at most dense_threshold() visible tokens");
+  }
+  if (batch.tokens == 1 && batch.lanes > kMaxDecodeLanes) {
+    return fail("a decode call is at most " + std::to_string(kMaxDecodeLanes) + " lanes");
   }
   const bool hq = kv.kv_format == IGNIS_KV_FORMAT_HQ_E8_2B;
 
@@ -328,7 +332,7 @@ int32_t run(const Geometry &g, const Kv &kv, const indexer::Rope &rope, const Qs
     if (const Status st = append(g, kv, batch, k, v, stream)) return fail(st);
 
     if (selection.dense) {
-      if (const Status st = attend_dense(g, source, batch, q, out, stream)) return fail(st);
+      if (const Status st = attend_dense(g, source, kv.slots, batch, q, out, stream)) return fail(st);
     } else {
       const std::size_t partials = sparse::partial_bytes(g, rows);
       void *partial = partials == 0 ? nullptr : scratch.alloc_bytes(partials).data;
@@ -367,6 +371,7 @@ int32_t fn_qsa_attention(const Context &ctx, int32_t attn_ordinal, const QsaWeig
     kv.kv_format = ctx.kv_format;
     kv.block_tables = static_cast<const int32_t *>(pool->kv_pool.block_tables().data);
     kv.logical_pages = static_cast<int32_t>(pool->kv_pool.logical_page_capacity());
+    kv.slots = pool->kv_pool.table_row_count();
     kv.k = plane(IGNIS_KV_PLANE_K);
     kv.v = plane(IGNIS_KV_PLANE_V);
     if (ctx.kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
@@ -384,14 +389,15 @@ int32_t fn_qsa_attention(const Context &ctx, int32_t attn_ordinal, const QsaWeig
   return qsa::run(ctx.g, kv, indexer::rope_from(ctx.rope), w, batch, x, selection, y, scratch, stream);
 }
 
-// The activations, the widest hq decode a call of `rows` rows makes when dense or decoding
-// (listed rows, or dense_threshold() visible ones), and the sparse route's partials. A sparse
-// PREFILL call under hq-e8-2b decodes every visible row (S3's decode_visible_hq), which scales
-// with batch.max_visible -- not a parameter here; such a call's arena must hold
-// 2 * visible_hq_bytes(g, max_visible) beyond this (raised with the coordinator, 2026-10-05).
+// The activations, the widest hq decode a dense or decode call makes (dense_threshold() visible
+// rows, or the listed rows of at most kMaxDecodeLanes lanes), and the sparse route's partials. A
+// sparse PREFILL call under hq-e8-2b also decodes every visible row (S3's decode_visible_hq,
+// 2 * visible_hq_bytes(g, max_visible)): that scales with max_visible, so it is S3's plan line,
+// not this one (coordinator, 2026-10-05).
 std::size_t fn_qsa_attention_scratch_bytes(const Geometry &g, int32_t rows) {
   if (rows <= 0) return 0;
-  const std::size_t decoded = std::max(sparse::listed_hq_bytes(g, rows), sparse::visible_hq_bytes(g, g.dense_threshold()));
+  const std::size_t decoded = std::max(sparse::listed_hq_bytes(g, std::min(rows, qsa::kMaxDecodeLanes)),
+                                       sparse::visible_hq_bytes(g, g.dense_threshold()));
   return qsa::activation_bytes(rows) + 2 * qsa::aligned(decoded) + qsa::aligned(sparse::partial_bytes(g, rows));
 }
 

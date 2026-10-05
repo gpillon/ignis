@@ -32,6 +32,8 @@ using namespace moe_test;
 
 inline double bf16r(double v) { return bf16_to_f32(f32_to_bf16(static_cast<float>(v))); }
 
+inline double sigmoid(double v) { return 1.0 / (1.0 + std::exp(-v)); }
+
 // E4M3FN value of every code.
 inline const double *e4m3_lut() {
   static const std::vector<double> lut = [] {

@@ -44,14 +44,17 @@ inline constexpr int32_t kGroup = kQHeads / kKvHeads;          // 12
 inline constexpr int32_t kQProjWidth = kQHeads * 2 * kHeadDim;  // 12288: [q 256 | gate 256] per head
 inline constexpr int32_t kKvWidth = kKvHeads * kHeadDim;        // 512
 inline constexpr int32_t kOutWidth = kQHeads * kHeadDim;        // 6144
+// The most lanes a decode call (one token each) takes: S3's listed hq decode is sized by it.
+inline constexpr int32_t kMaxDecodeLanes = 8;
 
 using Status = const char *;
 
 // One attention layer's K/V in the lanes' pages (the seq pool's planes of the layer, or a test's).
 struct Kv {
   int32_t kv_format = 0;                  // enum ignis_kv_format
-  const int32_t *block_tables = nullptr;  // DEVICE [table rows][logical_pages]: physical page ids
+  const int32_t *block_tables = nullptr;  // DEVICE [slots][logical_pages]: physical page ids
   int32_t logical_pages = 0;
+  int32_t slots = 0;                      // block-table rows; a lane's slot outside them traps
   // BF16: the K and V planes, page-major [page][kv_heads][64][256]. hq-e8-2b: the code planes
   // [page][kv_heads][64][64 bytes] and the metadata planes [page][kv_heads][64][8 bytes].
   void *k = nullptr;
@@ -83,10 +86,10 @@ Status append(const Geometry &g, const Kv &kv, const Batch &batch, const __nv_bf
               const __nv_bfloat16 *v, cudaStream_t stream);
 
 // Causal attention for a call of ONE lane: row t (position positions[0] + t) over the keys
-// [0, positions[0] + t] read from `source` (S3's KvSource: the BF16 pages, Paged, or a decoded
-// scratch, ByPosition). q: BF16 [tokens][kQHeads][256]; out: BF16 [tokens][kQHeads][256], before
-// the gate. Requires batch.max_visible <= dense_threshold().
-Status attend_dense(const Geometry &g, const sparse::KvSource &source, const Batch &batch,
+// [0, positions[0] + t] read from `source` (S3's KvSource: the BF16 pages, Paged, whose lane slot
+// must be below `slots`, or a decoded scratch, ByPosition). q: BF16 [tokens][kQHeads][256]; out:
+// BF16 [tokens][kQHeads][256], before the gate. Requires batch.max_visible <= dense_threshold().
+Status attend_dense(const Geometry &g, const sparse::KvSource &source, int32_t slots, const Batch &batch,
                     const __nv_bfloat16 *q, __nv_bfloat16 *out, cudaStream_t stream);
 
 // out = bf16(out * bf16(sigmoid(gate))) in place, gate the second half of each head in qg.
