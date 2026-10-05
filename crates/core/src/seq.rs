@@ -92,6 +92,14 @@ pub(crate) mod ffi {
         /// The attention layers the pool stores K/V for (GitHub #302): the
         /// topology's attention-layer count.
         pub kv_num_layers: u32,
+        /// Flash-Next's indexer section (GitHub #302): one compressed key's
+        /// BF16 elements and the tokens a block compresses; 0 and 0 for none.
+        pub indexer_key_dim: u32,
+        pub indexer_compress_tokens: u32,
+        /// Flash-Next's n-gram conv state (GitHub #302): columns and
+        /// channels per slot; 0 and 0 for none.
+        pub ngram_conv_columns: u32,
+        pub ngram_conv_channels: u32,
     }
 
     /// 1:1 with `struct ignis_seq_pool_stats`.
@@ -130,6 +138,10 @@ pub(crate) mod ffi {
         /// block -- host memory, in none of the device lines above.
         pub retained_host_slot_count: u32,
         pub retained_host_bytes: u64,
+        /// Flash-Next's sections (GitHub #302): the indexer's block keys
+        /// and tails, and the n-gram conv state; 0 without them.
+        pub indexer_bytes: u64,
+        pub ngram_conv_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_seq_pool_plan` (GitHub #210): what a pool
@@ -146,6 +158,9 @@ pub(crate) mod ffi {
         pub hq_residual_bytes: u64,
         /// The host retained slots' pinned block (GitHub #281).
         pub retained_host_bytes: u64,
+        /// Flash-Next's indexer and n-gram sections (GitHub #302).
+        pub indexer_bytes: u64,
+        pub ngram_conv_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_alloc_count` (GitHub #211).
@@ -525,6 +540,10 @@ fn pool_spec(
         retained_slot_count: budget.retained_slot_count,
         retained_host_slot_count: budget.retained_host_slot_count,
         kv_num_layers: cfg.attention_layer_count() as u32,
+        indexer_key_dim: cfg.indexer.map_or(0, |i| (i.kv_heads * i.head_dim) as u32),
+        indexer_compress_tokens: cfg.indexer.map_or(0, |i| i.compress_ratio as u32),
+        ngram_conv_columns: cfg.ngram.map_or(0, |n| n.conv_state_tokens() as u32),
+        ngram_conv_channels: cfg.ngram.map_or(0, |_| cfg.residual_width() as u32),
     }
 }
 
@@ -1460,8 +1479,9 @@ mod tests {
     /// (`kernel/include/ignis_seq.h` static_asserts the same 60 bytes).
     #[test]
     fn the_pool_spec_mirror_is_the_leafs_size() {
-        assert_eq!(std::mem::size_of::<ffi::IgnisSeqPoolSpec>(), 60);
+        assert_eq!(std::mem::size_of::<ffi::IgnisSeqPoolSpec>(), 76);
         assert_eq!(std::mem::offset_of!(ffi::IgnisSeqPoolSpec, kv_num_layers), 56);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisSeqPoolSpec, ngram_conv_channels), 72);
     }
 
     /// GitHub #302: a pool holds the K/V of the topology's attention layers.
@@ -1479,5 +1499,26 @@ mod tests {
         let flash = pool_spec(&ModelConfig::qwen38_flash_next(), &budget, None);
         assert_eq!((flash.kv_num_layers, flash.num_kv_heads, flash.head_dim), (12, 2, 256));
         assert_eq!((flash.gdn_num_layers, flash.gdn_value_heads), (36, 48));
+    }
+
+    /// GitHub #302: a Flash-Next pool carries the indexer's 128-wide keys of
+    /// 4-token blocks and the n-gram conv's 9 columns of 4 x 2560; the 27B's
+    /// carries neither.
+    #[test]
+    fn a_flash_next_pool_carries_the_indexer_and_ngram_sections() {
+        let budget = SeqPoolBudget {
+            kv_format: crate::KvFormat::HqE8_2b,
+            kv_page_group_count: 8,
+            max_context_tokens: 512,
+            slot_count: 3,
+            retained_slot_count: 0,
+            retained_host_slot_count: 0,
+        };
+        let flash = pool_spec(&ModelConfig::qwen38_flash_next(), &budget, None);
+        assert_eq!((flash.indexer_key_dim, flash.indexer_compress_tokens), (128, 4));
+        assert_eq!((flash.ngram_conv_columns, flash.ngram_conv_channels), (9, 10_240));
+        let dense = pool_spec(&ModelConfig::qwen38_27b(), &budget, None);
+        assert_eq!((dense.indexer_key_dim, dense.indexer_compress_tokens), (0, 0));
+        assert_eq!((dense.ngram_conv_columns, dense.ngram_conv_channels), (0, 0));
     }
 }

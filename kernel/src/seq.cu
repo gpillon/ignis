@@ -132,6 +132,30 @@ void zero_dflash2_lane(ignis_seq_pool &pool, std::int32_t slot) {
   }
 }
 
+// GitHub #302: a slot's Flash-Next tails and n-gram conv columns, zeroed so
+// nothing of its previous occupant is read as this sequence's history.
+void zero_flash_next_slot(ignis_seq_pool &pool, std::int32_t slot) {
+  if (pool.has_indexer()) {
+    for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+      void *tail = static_cast<unsigned char *>(pool.indexer_tail_keys(layer)) +
+                   static_cast<std::uint64_t>(slot) * pool.indexer_tail_slot_bytes;
+      const cudaError_t err = cudaMemset(tail, 0, pool.indexer_tail_slot_bytes);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemset(indexer tail) failed: ") + cudaGetErrorString(err));
+      }
+    }
+  }
+  if (pool.has_ngram_conv()) {
+    const cudaError_t err =
+        cudaMemset(static_cast<unsigned char *>(pool.ngram_conv->p) +
+                       static_cast<std::uint64_t>(slot) * pool.ngram_conv_slot_bytes,
+                   0, pool.ngram_conv_slot_bytes);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemset(n-gram conv state) failed: ") + cudaGetErrorString(err));
+    }
+  }
+}
+
 // ---- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
 
 // Why a restore target cannot already hold shared history, or nullptr if it
@@ -603,6 +627,29 @@ bool validate_pool_spec(const struct ignis_seq_pool_spec &spec, const std::strin
               std::to_string(kIgnisGqaLayerCount));
     return false;
   }
+  // GitHub #302: Flash-Next's sections, each all or nothing.
+  const bool indexer = spec.indexer_key_dim != 0 || spec.indexer_compress_tokens != 0;
+  if (indexer && (spec.indexer_key_dim == 0 || spec.indexer_key_dim % 8 != 0 ||
+                  spec.indexer_compress_tokens < 2 ||
+                  ninfer::kPagedKVPageSize % spec.indexer_compress_tokens != 0)) {
+    set_error(fn + ": indexer_key_dim " + std::to_string(spec.indexer_key_dim) +
+              " and indexer_compress_tokens " + std::to_string(spec.indexer_compress_tokens) +
+              " are not a key width (a positive multiple of 8) and a block that divides the " +
+              std::to_string(ninfer::kPagedKVPageSize) + "-token page");
+    return false;
+  }
+  const bool ngram = spec.ngram_conv_columns != 0 || spec.ngram_conv_channels != 0;
+  if (ngram && (spec.ngram_conv_columns == 0 || spec.ngram_conv_channels == 0)) {
+    set_error(fn + ": ngram_conv_columns " + std::to_string(spec.ngram_conv_columns) +
+              " and ngram_conv_channels " + std::to_string(spec.ngram_conv_channels) +
+              " are both set or both 0");
+    return false;
+  }
+  if ((indexer || ngram) && (spec.retained_slot_count != 0 || spec.retained_host_slot_count != 0)) {
+    set_error(fn + ": a pool with Flash-Next's indexer or n-gram sections holds no retained slots: " +
+              "snapshots and clones do not carry those sections yet (spec flash-next/05)");
+    return false;
+  }
   // The codec's row budget is defined for a 256-dimension row only
   // (kHqHeadDim); a pool of any other head_dim would plan planes the hq
   // append path cannot write.
@@ -642,6 +689,14 @@ struct PoolLayout {
    * their V planes, then their ring words, in one buffer. 0 on a BF16 pool. */
   std::size_t hq_residual_bytes = 0;
   std::size_t hq_residual_plane_bytes = 0;
+  /* GitHub #302: Flash-Next's indexer section -- every attention layer's
+   * block keys (per physical page), then every layer's tails (per state
+   * slot) -- and its n-gram conv state (per state slot). 0 without them. */
+  std::uint64_t indexer_block_layer_bytes = 0;
+  std::uint64_t indexer_tail_slot_bytes = 0;
+  std::size_t indexer_bytes = 0;
+  std::uint64_t ngram_conv_slot_bytes = 0;
+  std::size_t ngram_conv_bytes = 0;
 };
 
 // Every slot the state arenas hold: the lanes, then the device retained slots
@@ -731,6 +786,20 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
                             static_cast<std::size_t>(state_slots) * kIgnisHqRingWords *
                                 sizeof(std::uint32_t);
   }
+  // GitHub #302: Flash-Next's sections, BF16 throughout.
+  if (spec.indexer_key_dim != 0) {
+    const std::uint64_t key_bytes = static_cast<std::uint64_t>(spec.indexer_key_dim) * 2u;
+    out.indexer_block_layer_bytes = static_cast<std::uint64_t>(spec.kv_page_group_count) *
+                                    (ninfer::kPagedKVPageSize / spec.indexer_compress_tokens) * key_bytes;
+    out.indexer_tail_slot_bytes = (spec.indexer_compress_tokens - 1u) * key_bytes;
+    out.indexer_bytes = static_cast<std::size_t>(spec.kv_num_layers) *
+                        (out.indexer_block_layer_bytes + state_slots * out.indexer_tail_slot_bytes);
+  }
+  if (spec.ngram_conv_columns != 0) {
+    out.ngram_conv_slot_bytes = static_cast<std::uint64_t>(spec.ngram_conv_columns) *
+                                spec.ngram_conv_channels * 2u;
+    out.ngram_conv_bytes = static_cast<std::size_t>(state_slots * out.ngram_conv_slot_bytes);
+  }
   return out;
 }
 
@@ -806,6 +875,8 @@ extern "C" int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
     out->retained_state_bytes = spec->retained_slot_count * layout.slot_state_bytes;
     out->hq_residual_bytes = layout.hq_residual_bytes;
     out->retained_host_bytes = spec->retained_host_slot_count * host_image_stride(layout, *spec);
+    out->indexer_bytes = layout.indexer_bytes;
+    out->ngram_conv_bytes = layout.ngram_conv_bytes;
     return 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_seq_pool_plan: ") + e.what());
@@ -871,6 +942,24 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
       if (pool->hq_residual_plane_bytes() != layout.hq_residual_plane_bytes) {
         throw std::logic_error("the hq residual plane the pool addresses is not the one it planned");
       }
+    }
+
+    // GitHub #302: Flash-Next's sections. Zeroed once here and a slot's
+    // tails and conv columns again at every alloc; a page's block keys are
+    // written before any read of them (a block is read once complete).
+    if (layout.indexer_bytes != 0) {
+      pool->indexer_state = std::make_unique<ninfer::DeviceBuffer>(layout.indexer_bytes);
+      pool->indexer_state->fill(0);
+      pool->indexer_key_dim = static_cast<std::int32_t>(spec->indexer_key_dim);
+      pool->indexer_compress_tokens = static_cast<std::int32_t>(spec->indexer_compress_tokens);
+      pool->indexer_block_layer_bytes = layout.indexer_block_layer_bytes;
+      pool->indexer_tail_slot_bytes = layout.indexer_tail_slot_bytes;
+      pool->indexer_slots = static_cast<std::int32_t>(state_slot_count(*spec));
+    }
+    if (layout.ngram_conv_bytes != 0) {
+      pool->ngram_conv = std::make_unique<ninfer::DeviceBuffer>(layout.ngram_conv_bytes);
+      pool->ngram_conv->fill(0);
+      pool->ngram_conv_slot_bytes = layout.ngram_conv_slot_bytes;
     }
 
     // GitHub #281: the host retained slots' pinned block, reserved whole
@@ -945,7 +1034,16 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
   // GitHub #281: host memory, in none of the device lines above.
   out_stats->retained_host_slot_count = pool->retained_slot_count - pool->retained_device_slot_count;
   out_stats->retained_host_bytes      = pool->retained_host.bytes;
+  out_stats->indexer_bytes    = pool->has_indexer() ? pool->indexer_state->bytes : 0;
+  out_stats->ngram_conv_bytes = pool->has_ngram_conv() ? pool->ngram_conv->bytes : 0;
   return 0;
+}
+
+const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool) {
+  return pool.has_flash_next_sections()
+             ? "this pool's Flash-Next indexer and n-gram sections are not carried by snapshots, "
+               "clones or prefixes yet (spec flash-next/05)"
+             : nullptr;
 }
 
 extern "C" void ignis_seq_pool_free(struct ignis_seq_pool *pool) {
@@ -1007,6 +1105,7 @@ extern "C" int32_t ignis_seq_alloc(struct ignis_seq_pool *pool, uint32_t context
     // an exact row -- neither a ring bit, which names no position, nor a sink
     // row, which the kernels read with no bit at all.
     ignis_seq_zero_hq_residual(*pool, slot);
+    zero_flash_next_slot(*pool, slot);
     seq->slot = slot;
 
     pool->free_slots.pop_back();
@@ -1071,6 +1170,10 @@ extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
     set_error("ignis_seq_snapshot_size: the sequence was not drawn from this pool");
     return -1;
   }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    set_error(std::string("ignis_seq_snapshot_size: ") + refusal);
+    return -1;
+  }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
     set_error("ignis_seq_snapshot_size: sequence slot " + std::to_string(seq->slot) +
               " is mid-chunk (program frontier " + std::to_string(seq->position) +
@@ -1096,6 +1199,10 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
   }
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_snapshot: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    set_error(std::string("ignis_seq_snapshot: ") + refusal);
     return -1;
   }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
@@ -1172,6 +1279,10 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
   }
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_restore: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    set_error(std::string("ignis_seq_restore: ") + refusal);
     return -1;
   }
   if (const char *refusal = shared_prefix_refusal(*seq)) {

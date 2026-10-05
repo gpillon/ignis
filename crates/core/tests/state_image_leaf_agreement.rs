@@ -1,7 +1,6 @@
 //! A model's mutable state image, derived from its topology
-//! (`ModelConfig::state_image`, spec flash-next/05), agrees with the slot the
-//! leaf's sequence pool lays out for it (`ignis_seq_pool_plan`'s
-//! `retained_host_bytes` at one host retained slot: exactly one image).
+//! (`ModelConfig::state_image`, spec flash-next/05), agrees with what the
+//! leaf's sequence pool lays out for one slot (`ignis_seq_pool_plan`).
 //!
 //! The Rust derivation is what a load prints and what a host plan charges;
 //! the leaf's planner is what a slot really holds. A section either one
@@ -14,57 +13,68 @@
 
 #![cfg(feature = "cuda")]
 
-use ignis_core::compute::{ModelConfig, STATE_SECTION_ALIGN};
+use ignis_core::compute::ModelConfig;
 use ignis_core::kv_format::KvFormat;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 
-/// One image, as the leaf lays a host retained slot out.
-fn leaf_slot_bytes(cfg: &ModelConfig, kv_format: KvFormat) -> u64 {
-    let budget = SeqPoolBudget {
+const PAGES: u32 = 8;
+const SLOTS: u32 = 3;
+
+fn budget(kv_format: KvFormat, retained_host_slot_count: u32) -> SeqPoolBudget {
+    SeqPoolBudget {
         kv_format,
-        kv_page_group_count: 8,
+        kv_page_group_count: PAGES,
         max_context_tokens: 512,
-        slot_count: 1,
+        slot_count: SLOTS,
         retained_slot_count: 0,
-        retained_host_slot_count: 1,
-    };
-    SeqPool::plan(cfg, &budget, None)
-        .unwrap_or_else(|e| panic!("{:?} {kv_format}: {e}", cfg.family))
-        .retained_host_bytes
+        retained_host_slot_count,
+    }
 }
 
-fn aligned(bytes: u64) -> u64 {
-    bytes.div_ceil(STATE_SECTION_ALIGN) * STATE_SECTION_ALIGN
-}
-
+/// The 27B's image is exactly one host retained slot as the leaf lays it
+/// out: every section from a 256-byte boundary.
 #[test]
 #[ignore]
 fn the_27b_image_is_the_slot_the_leaf_lays_out() {
     let cfg = ModelConfig::qwen38_27b();
     for format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
-        assert_eq!(
-            cfg.state_image(format).slot_bytes(),
-            leaf_slot_bytes(&cfg, format),
-            "27B {format}"
-        );
+        let plan = SeqPool::plan(&cfg, &budget(format, 1), None).unwrap_or_else(|e| panic!("27B {format}: {e}"));
+        assert_eq!(cfg.state_image(format).slot_bytes(), plan.retained_host_bytes, "27B {format}");
     }
 }
 
-/// The leaf's slot has every section but the two only Flash-Next has, the
-/// n-gram conv state and the indexer tail: the forward that writes them
-/// (spec flash-next/04, S1) adds them to the leaf's section table. When it
-/// does, this goes red until the subtraction below is removed.
+/// Flash-Next's pool holds no retained slot yet (its sections are not in the
+/// clone table, spec flash-next/05), so its image is read off the pool's own
+/// lines, one slot's share of each: the GDN and penalty state, the residual
+/// window, the indexer's tails (its block keys are per page, not per slot)
+/// and the n-gram conv state.
 #[test]
 #[ignore]
-fn flash_next_image_is_the_slot_the_leaf_lays_out_less_the_sections_its_forward_adds() {
+fn flash_next_image_is_one_slots_share_of_the_pools_state() {
     let cfg = ModelConfig::qwen38_flash_next();
+    let indexer = cfg.indexer.expect("Flash-Next has an indexer");
+    let block_keys = cfg.attention_layer_count() as u64
+        * u64::from(PAGES)
+        * (64 / indexer.compress_ratio)
+        * indexer.kv_heads
+        * indexer.head_dim
+        * 2;
     for format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
-        let image = cfg.state_image(format);
-        let not_yet_in_the_leaf = aligned(image.ngram_conv_state) + aligned(image.indexer_tail);
-        assert_eq!(
-            image.slot_bytes() - not_yet_in_the_leaf,
-            leaf_slot_bytes(&cfg, format),
-            "Flash-Next {format}"
-        );
+        let plan = SeqPool::plan(&cfg, &budget(format, 0), None).unwrap_or_else(|e| panic!("Flash-Next {format}: {e}"));
+        let slots = u64::from(SLOTS);
+        let per_slot = plan.slot_state_bytes
+            + plan.hq_residual_bytes / slots
+            + (plan.indexer_bytes - block_keys) / slots
+            + plan.ngram_conv_bytes / slots;
+        assert_eq!(cfg.state_image(format).total_bytes(), per_slot, "Flash-Next {format}");
     }
+}
+
+/// And a retained slot beside those sections is refused by name.
+#[test]
+#[ignore]
+fn a_flash_next_pool_refuses_a_retained_slot() {
+    let cfg = ModelConfig::qwen38_flash_next();
+    let err = SeqPool::plan(&cfg, &budget(KvFormat::HqE8_2b, 1), None).expect_err("a host retained slot");
+    assert!(err.contains("no retained slots"), "{err}");
 }

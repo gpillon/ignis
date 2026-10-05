@@ -154,6 +154,10 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
         "ignis_seq_checkpoint_capture: the sequence was not drawn from this pool");
     return -1;
   }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    ignis_seq_set_last_error(std::string("ignis_seq_checkpoint_capture: ") + refusal);
+    return -1;
+  }
   if (opener_tokens == 0) {
     ignis_seq_set_last_error("ignis_seq_checkpoint_capture: opener_tokens must be positive");
     return -1;

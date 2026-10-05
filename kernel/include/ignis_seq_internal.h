@@ -125,6 +125,14 @@ inline std::size_t ignis_kv_plane_index(int32_t kv_format, int32_t gqa_layer,
          static_cast<std::size_t>(within);
 }
 
+struct ignis_seq_pool;
+/* GitHub #302: why a sequence of `pool` cannot be snapshotted, restored,
+ * captured as a checkpoint or published as a prefix, or nullptr. Those
+ * carry the sections ignis_seq_sections.h's table lists, and Flash-Next's
+ * indexer and n-gram sections are not in it yet (spec flash-next/05): a
+ * clone without them would hand a claimant the wrong state. */
+const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool);
+
 struct ignis_seq_pool {
   ninfer::DeviceArena kv_arena;
   ninfer::PagedKVPool kv_pool;
@@ -238,6 +246,36 @@ struct ignis_seq_pool {
   std::int32_t hq_residual_slots = 0;
 
   bool has_hq_residual() const { return hq_residual != nullptr; }
+
+  /* GitHub #302: Flash-Next's QSA indexer section, every attention layer's:
+   * its complete blocks' keys beside the KV pages,
+   * [layer][physical page][64 / compress][key_dim] BF16, then the
+   * incomplete block's raw keys per state slot,
+   * [layer][slot][compress - 1][key_dim] BF16. Null without an indexer. */
+  std::unique_ptr<ninfer::DeviceBuffer> indexer_state;
+  std::int32_t indexer_key_dim = 0;
+  std::int32_t indexer_compress_tokens = 0;
+  std::uint64_t indexer_block_layer_bytes = 0;
+  std::uint64_t indexer_tail_slot_bytes = 0;
+  std::int32_t indexer_slots = 0;
+  bool has_indexer() const { return indexer_state != nullptr; }
+  void *indexer_block_keys(std::int32_t attention_layer) const {
+    return static_cast<unsigned char *>(indexer_state->p) +
+           static_cast<std::uint64_t>(attention_layer) * indexer_block_layer_bytes;
+  }
+  void *indexer_tail_keys(std::int32_t attention_layer) const {
+    return static_cast<unsigned char *>(indexer_state->p) +
+           static_cast<std::uint64_t>(kv_num_layers) * indexer_block_layer_bytes +
+           static_cast<std::uint64_t>(attention_layer) * indexer_slots * indexer_tail_slot_bytes;
+  }
+
+  /* GitHub #302: Flash-Next's n-gram conv state, [slot][columns][channels]
+   * BF16, oldest column first. Null without an n-gram embedding. */
+  std::unique_ptr<ninfer::DeviceBuffer> ngram_conv;
+  std::uint64_t ngram_conv_slot_bytes = 0;
+  bool has_ngram_conv() const { return ngram_conv != nullptr; }
+
+  bool has_flash_next_sections() const { return has_indexer() || has_ngram_conv(); }
 
   // One (layer, slot) side plane: every KV head's 544 rows.
   std::uint64_t hq_residual_plane_bytes() const {

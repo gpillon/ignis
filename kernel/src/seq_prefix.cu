@@ -144,6 +144,10 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     ignis_seq_set_last_error("ignis_seq_prefix_publish: the sequence was not drawn from this pool");
     return -1;
   }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    ignis_seq_set_last_error(std::string("ignis_seq_prefix_publish: ") + refusal);
+    return -1;
+  }
   const auto page_size = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
   if (prefix_tokens == 0 || prefix_tokens % page_size != 0) {
     ignis_seq_set_last_error("ignis_seq_prefix_publish: a shared prefix is a whole number of " +

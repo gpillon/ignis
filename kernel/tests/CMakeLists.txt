@@ -606,6 +606,12 @@ add_test(NAME ignis_kernel_flash_next_contract_test COMMAND ignis_kernel_flash_n
 add_executable(ignis_kernel_seq_pool_layers_test test_seq_pool_layers.cpp)
 target_link_libraries(ignis_kernel_seq_pool_layers_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_seq_pool_layers_test COMMAND ignis_kernel_seq_pool_layers_test)
+# GitHub #302: a pool with Flash-Next's indexer and n-gram sections holds them,
+# zeroes a slot's for its next sequence, and refuses every snapshot and clone
+# by name. GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_seq_flash_next_sections_test test_seq_flash_next_sections.cpp)
+target_link_libraries(ignis_kernel_seq_flash_next_sections_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_flash_next_sections_test COMMAND ignis_kernel_seq_flash_next_sections_test)
 # The Flash-Next binder (kernel/src/flash_next/bind.cu) at the real 48-layer
 # schema: binds, places, refuses by name. Host-only.
 add_executable(ignis_kernel_flash_next_bind_test test_flash_next_bind.cpp)

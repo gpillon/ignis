@@ -203,9 +203,26 @@ struct ignis_seq_pool_spec {
    * on Flash-Next. 1..16; the hq-e8-2b residual window and a blob's
    * geometry follow it. */
   uint32_t kv_num_layers;
+  /* Flash-Next's QSA indexer section (GitHub #302), one per attention
+   * layer, or 0 and 0 for none (the 27B): the BF16 elements of one
+   * compressed block key, and the tokens a block compresses (a divisor of
+   * the 64-token KV page). Complete blocks' keys live beside the KV pages,
+   * `64 / indexer_compress_tokens` per physical page; the incomplete
+   * block's raw keys, up to `indexer_compress_tokens - 1`, per slot. */
+  uint32_t indexer_key_dim;
+  uint32_t indexer_compress_tokens;
+  /* Flash-Next's n-gram embedding conv state (GitHub #302), per slot: its
+   * past input columns of `ngram_conv_channels` BF16 each, or 0 and 0 for
+   * none. */
+  uint32_t ngram_conv_columns;
+  uint32_t ngram_conv_channels;
+  /* A pool with either section holds no retained slot and takes no
+   * snapshot, clone or prefix: those carry the sections the table in
+   * ignis_seq_sections.h lists, and these are not in it yet (spec
+   * flash-next/05). */
 };
 #ifdef __cplusplus
-static_assert(sizeof(struct ignis_seq_pool_spec) == 60,
+static_assert(sizeof(struct ignis_seq_pool_spec) == 76,
               "ignis_seq_pool_spec drifted from crates/core/src/seq.rs IgnisSeqPoolSpec");
 #endif
 
@@ -254,6 +271,10 @@ struct ignis_seq_pool_stats {
    * above. */
   uint32_t retained_host_slot_count;
   uint64_t retained_host_bytes;
+  /* Flash-Next's sections (GitHub #302), 0 without them: the indexer's
+   * block keys and tails, and the n-gram conv state. */
+  uint64_t indexer_bytes;
+  uint64_t ngram_conv_bytes;
 };
 
 /* What a pool built from a spec occupies, planned without building it
@@ -273,6 +294,10 @@ struct ignis_seq_pool_plan {
   /* = ignis_seq_pool_stats::retained_host_bytes of the built pool (GitHub
    * #281): pinned host memory, not device. */
   uint64_t retained_host_bytes;
+  /* = ignis_seq_pool_stats::indexer_bytes and ::ngram_conv_bytes of the
+   * built pool (GitHub #302). */
+  uint64_t indexer_bytes;
+  uint64_t ngram_conv_bytes;
 };
 
 struct ignis_seq_stats {

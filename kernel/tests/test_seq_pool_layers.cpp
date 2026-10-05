@@ -87,6 +87,57 @@ int main() {
           "kv_num_layers " + std::to_string(layers) + " is refused by name: got \"" + message + "\"");
   }
 
+  // Flash-Next's sections (GitHub #302): the indexer's block keys, 16 per
+  // 64-token page of 128 BF16, per attention layer and physical page, plus
+  // its 3 raw keys per slot and layer; the n-gram conv's 9 columns of 10,240
+  // BF16 per slot. A spec without them plans none.
+  check(twelve.indexer_bytes == 0 && twelve.ngram_conv_bytes == 0,
+        "a pool without Flash-Next's sections plans none of them");
+  ignis_seq_pool_spec flash = spec_of(IGNIS_KV_FORMAT_HQ_E8_2B, 12);
+  flash.indexer_key_dim = 128;
+  flash.indexer_compress_tokens = 4;
+  flash.ngram_conv_columns = 9;
+  flash.ngram_conv_channels = 10240;
+  struct ignis_seq_pool_plan sectioned{};
+  check(plan(flash, sectioned), std::string("a Flash-Next pool plans: ") + ignis_seq_last_error());
+  check(sectioned.indexer_bytes == 12ull * (8 * 16 * 128 * 2 + 3 * 3 * 128 * 2),
+        "indexer: 12 layers x (8 pages x 16 blocks + 3 slots x 3 tail keys) x 128 x 2 B: got " +
+            std::to_string(sectioned.indexer_bytes));
+  check(sectioned.ngram_conv_bytes == 3ull * 9 * 10240 * 2,
+        "n-gram conv: 3 slots x 9 columns x 10,240 x 2 B: got " + std::to_string(sectioned.ngram_conv_bytes));
+  check(sectioned.kv_bytes == hq12.kv_bytes && sectioned.hq_residual_bytes == hq12.hq_residual_bytes &&
+            sectioned.lane_state_bytes == hq12.lane_state_bytes,
+        "the sections leave every other line as it was");
+
+  // Each section all or nothing, a block that divides the page, and no
+  // retained slot beside them: refused by name.
+  struct Refused {
+    const char *what;
+    void (*apply)(ignis_seq_pool_spec &);
+    const char *needle;
+  };
+  const Refused refusals[] = {
+      {"a key width with no block", [](ignis_seq_pool_spec &s) { s.indexer_compress_tokens = 0; },
+       "indexer_key_dim"},
+      {"a block that does not divide the page", [](ignis_seq_pool_spec &s) { s.indexer_compress_tokens = 3; },
+       "indexer_compress_tokens 3"},
+      {"conv columns with no channels", [](ignis_seq_pool_spec &s) { s.ngram_conv_channels = 0; },
+       "ngram_conv_columns"},
+      {"a device retained slot", [](ignis_seq_pool_spec &s) { s.retained_slot_count = 1; },
+       "no retained slots"},
+      {"a host retained slot", [](ignis_seq_pool_spec &s) { s.retained_host_slot_count = 1; },
+       "no retained slots"},
+  };
+  for (const Refused &r : refusals) {
+    ignis_seq_pool_spec spec = flash;
+    r.apply(spec);
+    struct ignis_seq_pool_plan out{};
+    const bool planned = plan(spec, out);
+    const std::string message = ignis_seq_last_error();
+    check(!planned && message.find(r.needle) != std::string::npos,
+          std::string(r.what) + " is refused by name: got \"" + message + "\"");
+  }
+
   if (g_failed != 0) {
     std::fprintf(stderr, "seq pool layers test: %d check(s) failed\n", g_failed);
     return 1;
