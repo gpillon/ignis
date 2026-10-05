@@ -11,6 +11,8 @@
 //!   model — the contract the GPU implementation is tested against;
 //! - [`plan`]: the host plan and residency's VRAM plan lines (ADR 0030),
 //!   and [`host_memory`], the host plan's one measured input;
+//! - [`load`]: the host expert pool's layout and its filling from the
+//!   artifact's expert index;
 //! - [`counters`]: what residency counts, for the server to export;
 //! - `device` (feature `cuda`): the leaf's residency object, the device
 //!   side below, as an owning handle.
@@ -67,6 +69,7 @@ pub mod counters;
 #[cfg(feature = "cuda")]
 pub mod device;
 pub mod host_memory;
+pub mod load;
 pub mod plan;
 pub mod policy;
 
