@@ -129,6 +129,12 @@ def rss_gb():
     return gb(psutil.Process().memory_info().rss)
 
 
+def peak_ws_gb():
+    """The process's peak working set so far (Windows; the RSS on other systems)."""
+    m = psutil.Process().memory_info()
+    return gb(getattr(m, "peak_wset", m.rss))
+
+
 # ---------------------------------------------------------------- the n-gram table sweep
 
 class TableSweep(threading.Thread):
@@ -629,6 +635,7 @@ class Conversion:
         rec["time_s"] = time.time() - t0
         rec["time_split_s"] = dict(tm)
         rec["rss_gb"] = rss_gb()
+        rec["peak_ws_gb"] = peak_ws_gb()
         rec["vram_peak_gb"] = gb(torch.cuda.max_memory_reserved())
         if convert:
             rec["experts_bin"] = {"bytes": os.path.getsize(os.path.join(d, "experts.bin")),
@@ -644,7 +651,8 @@ class Conversion:
         L = r["layer"]
         ref6 = RUN6_DB[L]
         ref8 = f"{RUN8_DB[L]:.2f}" if L < len(RUN8_DB) else "-"
-        return (f"layer {L} {r['time_s']:.0f}s | RSS {r['rss_gb']:.1f} GB | VRAM peak {r['vram_peak_gb']:.1f} GB | "
+        return (f"layer {L} {r['time_s']:.0f}s | RSS {r['rss_gb']:.1f} GB (peak so far {r['peak_ws_gb']:.1f}) | "
+                f"VRAM peak {r['vram_peak_gb']:.1f} GB | "
                 f"MoE {r['moe_db']:.2f} dB (run6 {ref6:.2f}, run8 {ref8}) | rate gu/dn {r['rates']['gu']:.4f}/"
                 f"{r['rates']['dn']:.4f} | K hist gu {r['k_hist']['gu']} dn {r['k_hist']['dn']} | "
                 + " ".join(f"{k} {v:.0f}" for k, v in r["time_split_s"].items()))
