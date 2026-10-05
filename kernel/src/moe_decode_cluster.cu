@@ -1,5 +1,6 @@
 // ignis kernel leaf: Flash-Next's routed experts for 1..8 decode tokens, one thread-block
-// cluster per selected expert -- OURS (kernel/include/ignis_moe.h, IGNIS_MOE_DECODE_CLUSTERS).
+// cluster per selected expert -- OURS (kernel/include/ignis_moe.h: a workspace whose
+// decode_route is IGNIS_MOE_DECODE_CLUSTERS).
 //
 // The ticket kernel (moe_decode.cu) is bound by its structure, not by DRAM (finding
 // docs/findings/2026-10-05-moe-decode-is-structure-bound.md): units in a second wave, a

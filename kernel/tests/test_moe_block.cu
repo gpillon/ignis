@@ -151,9 +151,11 @@ void block_arm(Block &b, int tokens) {
 int main(int argc, char **argv) {
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
-  const std::string route = select_decode_route(argc, argv);
-  std::printf("whole MoE block: router -> routed experts -> shared expert -> combine; decode route: %s\n", route.c_str());
+  const uint32_t route = decode_route_arg(argc, argv);
+  std::printf("whole MoE block: router -> routed experts -> shared expert -> combine; decode route: %s\n",
+              decode_route_name(route).c_str());
   Block block;
+  block.ws.decode_route = route;
   for (int tokens : {1, 3, 64, 300}) block_arm(block, tokens);
   if (g_failed != 0) {
     std::fprintf(stderr, "test_moe_block: %d failure(s)\n", g_failed);

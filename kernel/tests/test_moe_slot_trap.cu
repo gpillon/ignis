@@ -73,15 +73,13 @@ int main(int argc, char **argv) {
   upload(dids, ids);
   upload(dw, w);
   upload(dslots, slots);
-  const ignis_moe_workspace ws{wsb.p, IGNIS_MOE_DECODE_MAX_TOKENS, max_tokens};
+  const ignis_moe_workspace ws{wsb.p, IGNIS_MOE_DECODE_MAX_TOKENS, max_tokens,
+                               clusters ? IGNIS_MOE_DECODE_CLUSTERS : IGNIS_MOE_DECODE_TICKETS};
   MOE_RC(ignis_moe_workspace_init(&ws, acc.as<int64_t>(), nullptr));
   MOE_CUDA(cudaDeviceSynchronize());
-  if (clusters) {
-    if (ignis_moe_decode_cluster_size() == 0) {
-      std::fprintf(stderr, "test_moe_slot_trap (%s-clusters): this device runs no decode cluster\n", mode.c_str());
-      return 1;
-    }
-    MOE_RC(ignis_moe_set_decode_route(IGNIS_MOE_DECODE_CLUSTERS));
+  if (clusters && ignis_moe_decode_cluster_size() == 0) {
+    std::fprintf(stderr, "test_moe_slot_trap (%s-clusters): this device runs no decode cluster\n", mode.c_str());
+    return 1;
   }
 
   const int32_t rc = prefill ? ignis_moe_experts_prefill(dx.p, tokens, dids.as<int32_t>(), dw.as<float>(),

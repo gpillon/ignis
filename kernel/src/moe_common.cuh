@@ -41,8 +41,6 @@ struct DecodeLaunch {
   int cluster_size = 0;
 };
 int32_t require_prepared(const char *op, DecodeLaunch *decode);
-// The process-wide decode route (IGNIS_MOE_DECODE_TICKETS or IGNIS_MOE_DECODE_CLUSTERS).
-int32_t decode_route();
 // Each translation unit's share of ignis_moe_prepare: its kernels' attributes.
 int32_t prepare_router();
 int32_t prepare_prefill();

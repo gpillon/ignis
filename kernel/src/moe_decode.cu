@@ -408,7 +408,7 @@ extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, cons
   DecodeLaunch launch;
   if (require_prepared("ignis_moe_experts_decode", &launch) != 0) return -1;
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
-  if (decode_route() == IGNIS_MOE_DECODE_CLUSTERS) {
+  if (workspace->decode_route == IGNIS_MOE_DECODE_CLUSTERS) {
     if (launch.cluster_size == 0) return fail("ignis_moe_experts_decode: this device runs no decode cluster");
     return decode_clusters(launch.cluster_size, static_cast<const __nv_bfloat16 *>(x), static_cast<int>(tokens), ids,
                            weights, slots, reinterpret_cast<long long *>(acc), s);

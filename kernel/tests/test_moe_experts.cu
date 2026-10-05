@@ -267,13 +267,15 @@ void determinism_arm(Buffers &b, ExpertSet &set) {
 int main(int argc, char **argv) {
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
-  const std::string route = select_decode_route(argc, argv);
-  std::printf("routed experts at 2560 / 640 / 512 x top-10, K in {2, 2.5, 3, 4}; decode route: %s\n", route.c_str());
+  const uint32_t route = decode_route_arg(argc, argv);
+  std::printf("routed experts at 2560 / 640 / 512 x top-10, K in {2, 2.5, 3, 4}; decode route: %s\n",
+              decode_route_name(route).c_str());
   ExpertSet set;
   std::vector<int> identity(2 * kRecords);
   std::iota(identity.begin(), identity.end(), 0);
   set.place(identity);
   Buffers buffers;
+  buffers.ws.decode_route = route;
   decode_arm(buffers, set);
   accumulator_arm(buffers, set);
   prefill_arm(buffers, set);

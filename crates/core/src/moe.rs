@@ -30,11 +30,11 @@ pub const PROJ_GATE_UP: u32 = 0;
 /// The down expert projection, (in, out) = (640, 2560).
 pub const PROJ_DOWN: u32 = 1;
 
-/// The decode route's two implementations (`IGNIS_MOE_DECODE_*`, `set_decode_route`): one
-/// persistent launch of work units taken by ticket (the default), or one thread-block cluster per
-/// selected expert.
-pub const DECODE_TICKETS: i32 = 0;
-pub const DECODE_CLUSTERS: i32 = 1;
+/// The decode route of a workspace (`MoeWorkspace::decode_route`, `IGNIS_MOE_DECODE_*`): one
+/// persistent launch of work units taken by ticket, or one thread-block cluster per selected
+/// expert.
+pub const DECODE_TICKETS: u32 = 0;
+pub const DECODE_CLUSTERS: u32 = 1;
 
 /// One slot-table entry, 1:1 with `struct ignis_moe_slot`: the device address of an expert
 /// projection's record (layout.md §3) and its bit width as `k2 = 2 K`. A layer's table is
@@ -53,14 +53,16 @@ impl MoeSlot {
     pub const ABSENT: MoeSlot = MoeSlot { record: std::ptr::null(), k2: 0, reserved: 0 };
 }
 
-/// A MoE workspace, 1:1 with `struct ignis_moe_workspace`: its device base and the two
-/// capacities it was sized for (`workspace_bytes`), passed to every routed-expert call.
+/// A MoE workspace, 1:1 with `struct ignis_moe_workspace`: its device base, the two capacities it
+/// was sized for (`workspace_bytes`) and the decode route of the model instance that owns it,
+/// passed to every routed-expert call.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoeWorkspace {
     pub base: *mut c_void,
     pub decode_tokens: u32,
     pub prefill_tokens: u32,
+    pub decode_route: u32,
 }
 
 /// The device buffers one MoE block needs, 1:1 with `struct ignis_moe_plan`: the plan lines a
@@ -160,7 +162,6 @@ pub mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn ignis_moe_prepare() -> i32;
-        pub fn ignis_moe_set_decode_route(route: i32) -> i32;
         pub fn ignis_moe_decode_cluster_size() -> i32;
         pub fn ignis_moe_workspace_bytes(decode_tokens: u32, prefill_tokens: u32) -> u64;
         pub fn ignis_moe_workspace_init(
@@ -195,12 +196,6 @@ pub fn record_bytes(projection: u32, k2: u32) -> Result<u64, String> {
 /// device that was not prepared.
 pub fn prepare() -> Result<(), String> {
     check(unsafe { ffi::ignis_moe_prepare() })
-}
-
-/// Selects the decode route (`DECODE_TICKETS` or `DECODE_CLUSTERS`), process-wide: at load,
-/// before any decode call is captured. An unknown route is refused.
-pub fn set_decode_route(route: i32) -> Result<(), String> {
-    check(unsafe { ffi::ignis_moe_set_decode_route(route) })
 }
 
 /// The CTAs per expert cluster the current device runs `DECODE_CLUSTERS` with (16 or 8), or 0 if
@@ -355,11 +350,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_routes_are_the_two_named_ones() {
-        assert!(set_decode_route(2).is_err());
-        assert!(last_error().contains("unknown route 2"));
-        set_decode_route(DECODE_CLUSTERS).unwrap();
-        set_decode_route(DECODE_TICKETS).unwrap();
+    fn workspace_matches_the_c_struct() {
+        // struct ignis_moe_workspace { void *base; uint32_t decode_tokens, prefill_tokens, decode_route; }
+        assert_eq!(std::mem::size_of::<MoeWorkspace>(), 24);
+        let ws = MoeWorkspace { base: std::ptr::null_mut(), decode_tokens: 3, prefill_tokens: 8192, decode_route: DECODE_CLUSTERS };
+        let base = &ws as *const MoeWorkspace as usize;
+        assert_eq!(&ws.decode_tokens as *const u32 as usize - base, 8);
+        assert_eq!(&ws.prefill_tokens as *const u32 as usize - base, 12);
+        assert_eq!(&ws.decode_route as *const u32 as usize - base, 16);
     }
 
     #[test]

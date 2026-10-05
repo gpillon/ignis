@@ -105,11 +105,21 @@ int32_t ignis_moe_prepare(void);
  * One MoE workspace serves both routes: its decode regions are sized for `decode_tokens` (the
  * load's lane count, 1..IGNIS_MOE_DECODE_MAX_TOKENS) and its prefill regions for
  * `prefill_tokens` (the load's maximum prefill chunk). The ops take the same description they
- * were sized with. */
+ * were sized with.
+ *
+ * `decode_route` picks the decode kernel of the model instance that owns the workspace -- one
+ * contract, held to the same fp64 bounds -- and is chosen with it, at load:
+ *   IGNIS_MOE_DECODE_TICKETS   (0) one persistent launch of work units taken by ticket;
+ *   IGNIS_MOE_DECODE_CLUSTERS  (1) one thread-block cluster per selected expert, its reductions
+ *                                  in distributed shared memory (needs no workspace regions).
+ * A captured graph keeps the kernel it was captured with. */
+#define IGNIS_MOE_DECODE_TICKETS 0
+#define IGNIS_MOE_DECODE_CLUSTERS 1
 struct ignis_moe_workspace {
   void *base;
   uint32_t decode_tokens;
   uint32_t prefill_tokens;
+  uint32_t decode_route;
 };
 
 /* The bytes `base` must hold (the routed accumulator `acc` is separate, see below). */
@@ -162,16 +172,8 @@ int32_t ignis_moe_experts_prefill(const void *x, uint32_t tokens, const int32_t 
                                   const struct ignis_moe_workspace *workspace, int64_t *acc,
                                   void *stream);
 
-/* The decode route's two implementations, one contract (held to the same fp64 bounds):
- * TICKETS, one persistent launch of work units taken by ticket (the default), and CLUSTERS, one
- * thread-block cluster per selected expert with its reductions in distributed shared memory.
- * The route is process-wide: set it at load, before capturing any decode call (a captured graph
- * keeps the kernel it was captured with). Returns -1 for an unknown route. */
-#define IGNIS_MOE_DECODE_TICKETS 0
-#define IGNIS_MOE_DECODE_CLUSTERS 1
-int32_t ignis_moe_set_decode_route(int32_t route);
-/* The CTAs per expert cluster the current device runs the CLUSTERS route with (16, or the
- * portable 8), set by ignis_moe_prepare; 0 if it was not prepared or runs no such cluster (the
+/* The CTAs per expert cluster the current device runs IGNIS_MOE_DECODE_CLUSTERS with (16, or the
+ * portable 8), set by ignis_moe_prepare; 0 if it was not prepared or runs no such cluster (that
  * route then refuses to run). */
 int32_t ignis_moe_decode_cluster_size(void);
 

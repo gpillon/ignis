@@ -28,7 +28,6 @@ namespace {
 constexpr int kMaxDevices = 64;
 std::atomic<int> g_decode_grid[kMaxDevices];     // 0 until the device is prepared
 std::atomic<int> g_cluster_size[kMaxDevices];    // 0: the device runs no decode cluster
-std::atomic<int> g_decode_route{IGNIS_MOE_DECODE_TICKETS};
 }  // namespace
 
 int32_t require_prepared(const char *op, DecodeLaunch *decode) {
@@ -48,7 +47,6 @@ int32_t require_prepared(const char *op, DecodeLaunch *decode) {
   return 0;
 }
 
-int32_t decode_route() { return g_decode_route.load(); }
 
 int32_t check_launch(const char *op) {
   const cudaError_t err = cudaGetLastError();
@@ -154,14 +152,6 @@ extern "C" int32_t ignis_moe_prepare(void) {
   prepare_decode_clusters(&cluster_size);
   g_cluster_size[device].store(cluster_size);
   g_decode_grid[device].store(grid);
-  return 0;
-}
-
-extern "C" int32_t ignis_moe_set_decode_route(int32_t route) {
-  if (route != IGNIS_MOE_DECODE_TICKETS && route != IGNIS_MOE_DECODE_CLUSTERS) {
-    return fail("ignis_moe_set_decode_route: unknown route " + std::to_string(route));
-  }
-  g_decode_route.store(route);
   return 0;
 }
 

@@ -273,7 +273,7 @@ fn run_block(
     let decode_tokens = if decode_route { n } else { 1 };
     let workspace = zeroed(dev, moe::workspace_bytes(decode_tokens, n) as usize)?;
     let acc = zeroed(dev, tokens * H * 8)?;
-    let ws = MoeWorkspace { base: ptr(&workspace), decode_tokens, prefill_tokens: n };
+    let ws = MoeWorkspace { base: ptr(&workspace), decode_tokens, prefill_tokens: n, decode_route: moe::DECODE_TICKETS };
     let null = std::ptr::null_mut();
     if !ran(unsafe { moe::workspace_init(&ws, ptr(&acc) as *mut i64, null) }, "workspace init") {
         return None;

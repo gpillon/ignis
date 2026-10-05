@@ -204,16 +204,17 @@ int main(int argc, char **argv) {
     return 1e3 * ms / (calls * replays);
   };
 
-  // Both decode routes (ignis_moe_set_decode_route); the floor counts as met if one meets it.
+  // Both decode routes (the workspace's decode_route); the floor counts as met if one meets it.
   bool floor_ok = false;
-  std::vector<int32_t> routes = {IGNIS_MOE_DECODE_TICKETS};
+  std::vector<uint32_t> routes = {IGNIS_MOE_DECODE_TICKETS};
   if (ignis_moe_decode_cluster_size() > 0) {
     routes.push_back(IGNIS_MOE_DECODE_CLUSTERS);
   } else {
     std::printf("  (this device runs no decode cluster: the clusters route is not measured)\n");
   }
-  for (const int32_t route : routes) {
-    MOE_RC(ignis_moe_set_decode_route(route));
+  for (const uint32_t route : routes) {
+    ignis_moe_workspace wsr = ws;
+    wsr.decode_route = route;
     if (route == IGNIS_MOE_DECODE_TICKETS) {
       std::printf("  decode route: tickets\n");
     } else {
@@ -240,7 +241,7 @@ int main(int argc, char **argv) {
       const double us = time_us(calls, [&](int c, cudaStream_t st) {
         MOE_RC(ignis_moe_experts_decode(dx.p, tokens, dids.as<int32_t>() + static_cast<std::size_t>(c) * tokens * kTop,
                                         dw.as<float>() + static_cast<std::size_t>(c) * tokens * kTop,
-                                        d_slots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(), st));
+                                        d_slots.as<ignis_moe_slot>(), &wsr, acc.as<int64_t>(), st));
       });
       const double gbs = bytes / (us * 1e-6) / 1e9;
       std::printf("  routed decode, %d token(s): %.1f us per layer, %.2f MB read, %.0f GB/s = %.1f%% of roofline (%.1f%% of streaming read)\n",
@@ -269,7 +270,7 @@ int main(int argc, char **argv) {
       return time_us(calls, [&](int c, cudaStream_t st) {
         MOE_RC(ignis_moe_experts_decode(dx.p, 1, dids.as<int32_t>() + static_cast<std::size_t>(c) * kTop,
                                         dw.as<float>() + static_cast<std::size_t>(c) * kTop, slots.as<ignis_moe_slot>(),
-                                        &ws, acc.as<int64_t>(), st));
+                                        &wsr, acc.as<int64_t>(), st));
       });
     };
     {
@@ -285,7 +286,6 @@ int main(int argc, char **argv) {
     }
 
   }
-  MOE_RC(ignis_moe_set_decode_route(IGNIS_MOE_DECODE_TICKETS));
 
   // The other ops, each over copies that together exceed the L2 so the weights come from DRAM.
   {
