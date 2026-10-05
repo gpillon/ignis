@@ -10,11 +10,15 @@ time, never the finished layers.
 
 The checkpoint is a single slot spread over one or more directories (the BF16 stream on
 one drive, the smaller streams on another): the disks here hold one copy, not two. It
-is marked invalid before its old files are removed and valid only after every new file
-is written, so a crash mid-write leaves an invalid slot, never a mixed one.
+is written every `every` layers, after the last layer, and on every clean stop. Before a
+write it checks that each drive has room for the new slot (counting the old slot's files,
+which go first); without room it leaves the old slot untouched and raises NoRoom. It is
+marked invalid before its old files are removed and valid only after every new file is
+written, so a crash mid-write leaves an invalid slot, never a mixed one.
 
-The stop file is checked before each layer: when present the loop checkpoints and
-returns EXIT_STOPPED (75), so the coordinator can open a GPU window and relaunch.
+Before each layer the loop checks the stop file (exit EXIT_STOPPED, 75) and the space the
+layer will write (`space_check`; exit EXIT_DISK, 4): either way it checkpoints first, so
+the relaunch resumes where it stopped.
 """
 import json
 import os
@@ -25,15 +29,28 @@ import torch
 
 import layout
 
-EXIT_DONE, EXIT_ERROR, EXIT_REFUSED, EXIT_QUALITY_FAIL, EXIT_STOPPED = 0, 1, 2, 3, 75
+EXIT_DONE, EXIT_ERROR, EXIT_REFUSED, EXIT_QUALITY_FAIL, EXIT_DISK, EXIT_STOPPED = 0, 1, 2, 3, 4, 75
+GB = 1e9
+
+
+class NoRoom(RuntimeError):
+    pass
+
+
+def _free(path):
+    import preflight
+    return preflight.free_bytes(path)
 
 
 class Checkpoint:
-    def __init__(self, dirs, placement):
+    def __init__(self, dirs, placement, free=_free, headroom=1 * GB):
         """`dirs`: slot directories; `placement(name) -> index into dirs` for each state entry.
-        Entries that are not tensors go into the first directory's meta.json."""
+        Entries that are not tensors go into the first directory's meta.json. `free(dir)` gives
+        a drive's free bytes; a write keeps `headroom` free on every drive it touches."""
         self.dirs = list(dirs)
         self.placement = placement
+        self.free = free
+        self.headroom = headroom
 
     def _meta_path(self):
         return os.path.join(self.dirs[0], "meta.json")
@@ -42,8 +59,23 @@ class Checkpoint:
         os.makedirs(self.dirs[0], exist_ok=True)
         layout.write_json_atomic(self._meta_path(), {"status": "writing"})
 
+    def _check_room(self, state):
+        need = {}
+        for name, v in state.items():
+            if torch.is_tensor(v):
+                d = self.dirs[self.placement(name)]
+                need[d] = need.get(d, 0) + v.numel() * v.element_size()
+        for d, n in need.items():
+            os.makedirs(d, exist_ok=True)
+            old = sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)
+                      if f.endswith(".pt") or f.endswith(".pt.tmp"))
+            if self.free(d) + old < n + self.headroom:
+                raise NoRoom(f"checkpoint: {d} has {(self.free(d) + old) / GB:.1f} GB for a "
+                             f"{n / GB:.1f} GB slot (+{self.headroom / GB:.0f} GB headroom)")
+
     def save(self, state, next_layer, fingerprint, log=print):
         t0 = time.time()
+        self._check_room(state)
         self.invalidate()
         for d in self.dirs:
             os.makedirs(d, exist_ok=True)
@@ -92,16 +124,28 @@ class Checkpoint:
 
 
 class LayerLoop:
-    def __init__(self, n_layers, layer_dir, stop_file=None, checkpoint=None, every=0, log=print):
+    def __init__(self, n_layers, layer_dir, stop_file=None, checkpoint=None, every=0, log=print,
+                 space_check=None):
+        """`space_check(L)` returns None when layer L may write, or why the disk is too full."""
         self.n = n_layers
         self.layer_dir = layer_dir
         self.stop_file = stop_file
         self.checkpoint = checkpoint
         self.every = every
         self.log = log
+        self.space_check = space_check
 
     def _stop_requested(self):
         return bool(self.stop_file) and os.path.exists(self.stop_file)
+
+    def _save(self, state, next_layer, fp):
+        """Checkpoints; False (old slot untouched) when a drive lacks the room."""
+        try:
+            self.checkpoint.save(state, next_layer, fp, self.log)
+            return True
+        except NoRoom as e:
+            self.log(f"{e}: the previous checkpoint is kept")
+            return False
 
     def run(self, model):
         """model: fingerprint(), initial_state(), process(L, state), replay(L, state).
@@ -124,11 +168,17 @@ class LayerLoop:
             state, start = model.initial_state(), 0
         dirty = False   # whether the state moved past the checkpoint
         for L in range(start, self.n):
-            if self._stop_requested():
+            stop = self._stop_requested()
+            full = None if stop or not self.space_check or layout.is_done(self.layer_dir(L)) \
+                else self.space_check(L)
+            if stop or full:
                 if dirty and self.checkpoint:
-                    self.checkpoint.save(state, L, fp, self.log)
-                self.log(f"stop file {self.stop_file} present: stopping before layer {L}")
-                return EXIT_STOPPED, state
+                    self._save(state, L, fp)
+                if stop:
+                    self.log(f"stop file {self.stop_file} present: stopping before layer {L}")
+                    return EXIT_STOPPED, state
+                self.log(f"stopping before layer {L}: {full}")
+                return EXIT_DISK, state
             d = self.layer_dir(L)
             if layout.is_done(d):
                 model.replay(L, state)
@@ -137,8 +187,11 @@ class LayerLoop:
                     shutil.rmtree(d)
                 model.process(L, state)
             dirty = True
-            if self.checkpoint and self.every and (L + 1) % self.every == 0 and L + 1 < self.n \
+            last = L + 1 == self.n
+            if self.checkpoint and (last or (self.every and (L + 1) % self.every == 0)) \
                     and not self._stop_requested():
-                self.checkpoint.save(state, L + 1, fp, self.log)
-                dirty = False
+                if self._save(state, L + 1, fp):
+                    dirty = False
+                elif not last:
+                    return EXIT_DISK, state
         return EXIT_DONE, state
