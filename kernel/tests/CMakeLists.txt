@@ -669,3 +669,22 @@ add_test(NAME ignis_kernel_flash_next_ngram_test COMMAND ignis_kernel_flash_next
 # NOT registered with CTest.
 add_executable(ignis_residency_resolve_bench bench_residency_resolve.cu)
 target_link_libraries(ignis_residency_resolve_bench PRIVATE ignis_kernel ignis_vendor)
+
+# GitHub #302 (spec flash-next/04, slice S3): OURS -- the QSA indexer and the sparse attention.
+# The indexer's stages (kernel/src/flash_next/indexer.cu) at the real geometry against the
+# checkpoint's own Qwen4ExpTextQSAIndexer, recorded once on CPU by
+# fixtures/flash_next_indexer/record_indexer.py: chunks that split blocks, two-lane decode, a
+# one-shot replay, documented score ties, a graph-captured decode. The sparse attention
+# (kernel/src/flash_next/qsa_sparse.cu) against fp64 attention masked to each row's selected
+# tokens, over BF16 pages and over hq-e8-2b rows decoded with the vendored codec. GPU, same
+# no-SKIP_RETURN_CODE rule (ADR 0006).
+add_executable(ignis_kernel_flash_next_indexer_test test_flash_next_indexer.cu)
+target_compile_definitions(ignis_kernel_flash_next_indexer_test PRIVATE
+  IGNIS_FLASH_NEXT_INDEXER_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_indexer/indexer_ref.bin")
+target_link_libraries(ignis_kernel_flash_next_indexer_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_indexer_test COMMAND ignis_kernel_flash_next_indexer_test)
+foreach(name IN ITEMS sparse_attention sparse_attention_hq)
+  add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
+  target_link_libraries(ignis_kernel_flash_next_${name}_test PRIVATE ignis_kernel ignis_vendor)
+  add_test(NAME ignis_kernel_flash_next_${name}_test COMMAND ignis_kernel_flash_next_${name}_test)
+endforeach()
