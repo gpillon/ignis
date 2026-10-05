@@ -194,6 +194,13 @@ fn qtype_code(format: NumericFormat) -> i32 {
         NumericFormat::I32 => 6,
         NumericFormat::Nvfp4 => 7,
         NumericFormat::Fp8E4M3FnRowBf16S => 8,
+        // Flash-Next formats are not bound by the 27B loader.
+        NumericFormat::I64
+        | NumericFormat::Q4G32F16S
+        | NumericFormat::TrellisMul1K2
+        | NumericFormat::TrellisMul1K2p5
+        | NumericFormat::TrellisMul1K3
+        | NumericFormat::TrellisMul1K4 => -1,
     }
 }
 
@@ -204,6 +211,8 @@ fn layout_code(layout: StorageLayout) -> i32 {
         StorageLayout::ContiguousLeV1 => 1,
         StorageLayout::BlockScaleK16M128x4V1 => 2,
         StorageLayout::RowScaleV1 => 3,
+        // Flash-Next layouts are not bound by the 27B loader.
+        StorageLayout::TrellisTile16V1 | StorageLayout::RowInterleavedV1 => -1,
     }
 }
 
@@ -734,6 +743,7 @@ mod tests {
         assert_eq!(qtype_code(NumericFormat::I32), 6);
         assert_eq!(qtype_code(NumericFormat::Nvfp4), 7);
         assert_eq!(qtype_code(NumericFormat::Fp8E4M3FnRowBf16S), 8);
+        assert_eq!(qtype_code(NumericFormat::TrellisMul1K2p5), -1, "no 27B QType");
     }
 
     #[test]
@@ -743,6 +753,7 @@ mod tests {
         assert_eq!(layout_code(StorageLayout::ContiguousLeV1), 1);
         assert_eq!(layout_code(StorageLayout::BlockScaleK16M128x4V1), 2);
         assert_eq!(layout_code(StorageLayout::RowScaleV1), 3);
+        assert_eq!(layout_code(StorageLayout::TrellisTile16V1), -1, "no 27B QuantLayout");
     }
 
     #[test]
