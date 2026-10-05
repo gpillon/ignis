@@ -229,6 +229,7 @@ void ties_arm() {
 int main() {
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
+  MOE_RC(ignis_moe_prepare());
   const auto fx = read_fixture(std::string(IGNIS_FLASH_NEXT_FIXTURE_DIR) + "/router_ref.bin");
   const auto geo = need(fx, "geometry").as<int32_t>();
   const auto amp = need(fx, "amplitudes").as<float>();
@@ -262,6 +263,29 @@ int main() {
     check(same, "tokens routed " + std::to_string(count) + " at a time match the 192-token call bit for bit");
   }
   ties_arm();
+
+  // A token whose activations are NaN: ten distinct ids in range (0..9, since every logit ranks
+  // as -inf), NaN weights for the expert ops to trap on, and its neighbours untouched.
+  {
+    const int count = 8;
+    std::vector<uint16_t> xn(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(count) * H);
+    for (int k = 0; k < H; ++k) xn[static_cast<std::size_t>(3) * H + k] = 0x7FC0;
+    DeviceBytes dxn(xn.size() * 2);
+    upload(dxn, xn);
+    const Out n = run(dxn.p, count, dw.p);
+    bool ok = true;
+    for (int r = 0; r < K; ++r) ok = ok && n.ids[3 * K + r] == r && std::isnan(n.weights[3 * K + r]);
+    check(ok, "a NaN token gets ids 0..9 and NaN weights");
+    bool others = true;
+    for (int t = 0; t < count; ++t) {
+      if (t == 3) continue;
+      for (int r = 0; r < K; ++r) {
+        others = others && n.ids[t * K + r] == o.ids[t * K + r] && n.weights[t * K + r] == o.weights[t * K + r];
+      }
+    }
+    check(others, "a NaN token leaves the other tokens' selection bit for bit");
+    std::printf("  NaN token: ids %d..%d, weight %f\n", n.ids[3 * K], n.ids[3 * K + K - 1], n.weights[3 * K]);
+  }
   if (g_failed != 0) {
     std::fprintf(stderr, "test_moe_router: %d failure(s)\n", g_failed);
     return 1;

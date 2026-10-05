@@ -15,12 +15,15 @@
 // The SwiGLU form runs the gate and up weights in the same CTA and writes silu(g) * u in BF16.
 // Both routes are deterministic: no atomics, fixed summation order per output.
 
+#include "ignis_fp8_linear.h"
 #include "moe_common.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+#include <atomic>
 
 namespace ignis_moe {
 namespace {
@@ -301,18 +304,30 @@ __global__ void __launch_bounds__(256) fp8_mma_kernel(const __nv_bfloat16 *__res
 
 constexpr size_t kMmaSmem = sizeof(MmaSmem) > sizeof(float) * kBM * 129 ? sizeof(MmaSmem) : sizeof(float) * kBM * 129;
 
+constexpr int kMaxDevices = 64;
+std::atomic<bool> g_prepared[kMaxDevices];
+
+int32_t require_fp8_prepared(const char *op) {
+  int device = 0;
+  const cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return fail(std::string(op) + ": " + cudaGetErrorString(err));
+  if (device < 0 || device >= kMaxDevices || !g_prepared[device].load()) {
+    return fail(std::string(op) + ": device " + std::to_string(device) +
+                " is not prepared; call ignis_fp8_linear_prepare (or ignis_moe_prepare) at load");
+  }
+  return 0;
+}
+
 template <int MODE>
 int32_t launch(const char *op, Fp8Weight w0, Fp8Weight w1, uint32_t rows, uint32_t cols, const void *x,
                uint32_t tokens, void *y, uint32_t y_f32, cudaStream_t s) {
+  if (require_fp8_prepared(op) != 0) return -1;
   const __nv_bfloat16 *xb = static_cast<const __nv_bfloat16 *>(x);
   if (tokens <= static_cast<uint32_t>(kGemvMaxTokens)) {
     const int warps = 8;
     fp8_gemv_kernel<MODE><<<(rows + warps - 1) / warps, warps * 32, 0, s>>>(xb, static_cast<int>(tokens), static_cast<int>(rows),
                                                                           static_cast<int>(cols), w0, w1, y, static_cast<int>(y_f32));
   } else {
-    static const cudaError_t attr =
-        cudaFuncSetAttribute(fp8_mma_kernel<MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaSmem));
-    if (attr != cudaSuccess) return fail(std::string(op) + ": " + cudaGetErrorString(attr));
     const int cols_per_cta = MODE == 0 ? kBN : kBN / 2;
     const dim3 grid((rows + cols_per_cta - 1) / cols_per_cta, (tokens + kBM - 1) / kBM);
     fp8_mma_kernel<MODE><<<grid, 256, kMmaSmem, s>>>(xb, static_cast<int>(tokens), static_cast<int>(rows), static_cast<int>(cols),
@@ -321,7 +336,9 @@ int32_t launch(const char *op, Fp8Weight w0, Fp8Weight w1, uint32_t rows, uint32
   return check_launch(op);
 }
 
-int32_t validate(const char *op, uint32_t rows, uint32_t cols, uint32_t tokens) {
+int32_t validate(const char *op, uint32_t rows, uint32_t cols, uint32_t tokens, const void *y) {
+  // The MMA route stores two outputs at a time (float2 / bf16x2).
+  if ((reinterpret_cast<uintptr_t>(y) & 7) != 0) return fail(std::string(op) + ": the output must be 8-byte aligned");
   if (rows == 0 || rows % 16 != 0) return fail(std::string(op) + ": rows must be a positive multiple of 16");
   if (cols == 0 || cols % 64 != 0) return fail(std::string(op) + ": cols must be a positive multiple of 64");
   if (tokens == 0) return fail(std::string(op) + ": tokens must be at least 1");
@@ -333,10 +350,27 @@ int32_t validate(const char *op, uint32_t rows, uint32_t cols, uint32_t tokens) 
 
 using namespace ignis_moe;
 
+extern "C" int32_t ignis_fp8_linear_prepare(void) {
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) {
+    err = cudaFuncSetAttribute(fp8_mma_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaSmem));
+  }
+  if (err == cudaSuccess) {
+    err = cudaFuncSetAttribute(fp8_mma_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaSmem));
+  }
+  if (err != cudaSuccess) return fail(std::string("ignis_fp8_linear_prepare: ") + cudaGetErrorString(err));
+  if (device < 0 || device >= kMaxDevices) return fail("ignis_fp8_linear_prepare: device id out of range");
+  g_prepared[device].store(true);
+  return 0;
+}
+
+extern "C" const char *ignis_fp8_linear_last_error(void) { return last_error_cstr(); }
+
 extern "C" int32_t ignis_fp8_linear(const void *weight, uint32_t rows, uint32_t cols, const void *x,
                                     uint32_t tokens, void *y, uint32_t y_f32, void *stream) {
   if (weight == nullptr || x == nullptr || y == nullptr) return fail("ignis_fp8_linear: NULL pointer");
-  if (validate("ignis_fp8_linear", rows, cols, tokens) != 0) return -1;
+  if (validate("ignis_fp8_linear", rows, cols, tokens, y) != 0) return -1;
   if ((reinterpret_cast<uintptr_t>(weight) | reinterpret_cast<uintptr_t>(x)) & 15) {
     return fail("ignis_fp8_linear: weight and x must be 16-byte aligned");
   }
@@ -347,7 +381,7 @@ extern "C" int32_t ignis_fp8_linear(const void *weight, uint32_t rows, uint32_t 
 extern "C" int32_t ignis_fp8_linear_swiglu(const void *gate, const void *up, uint32_t rows, uint32_t cols,
                                            const void *x, uint32_t tokens, void *h, void *stream) {
   if (gate == nullptr || up == nullptr || x == nullptr || h == nullptr) return fail("ignis_fp8_linear_swiglu: NULL pointer");
-  if (validate("ignis_fp8_linear_swiglu", rows, cols, tokens) != 0) return -1;
+  if (validate("ignis_fp8_linear_swiglu", rows, cols, tokens, h) != 0) return -1;
   if ((reinterpret_cast<uintptr_t>(gate) | reinterpret_cast<uintptr_t>(up) | reinterpret_cast<uintptr_t>(x)) & 15) {
     return fail("ignis_fp8_linear_swiglu: weights and x must be 16-byte aligned");
   }

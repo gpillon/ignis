@@ -90,8 +90,10 @@ struct ExpertSet {
       gu.push_back(make_record(40000 + 16 * r, kH, 2 * kI, kRecordK2[r], 0.03f, 0.3f));
       dn.push_back(make_record(50000 + 16 * r, kI, kH, kRecordK2[(r + 5) % kRecords], 0.05f, 0.1f));
     }
-    // Inner weights from the kernel decoder, one record per K class re-checked on the host.
-    std::vector<uint32_t> checked;
+    // Inner weights from the kernel decoder; one record per K class of each projection
+    // re-checked against the host restatement, so the fp64 reference never rests on the kernel
+    // alone.
+    std::vector<uint32_t> checked_gu, checked_dn;
     for (auto *set : {&gu, &dn}) {
       for (Record &r : *set) {
         DeviceBytes w(r.words.size() * 2), out(static_cast<std::size_t>(r.in) * r.out * 2);
@@ -99,10 +101,12 @@ struct ExpertSet {
         MOE_RC(ignis_moe_trellis_reconstruct(w.p, r.k2, r.in, r.out, out.p, nullptr));
         MOE_CUDA(cudaDeviceSynchronize());
         r.inner = download<uint16_t>(out.p, static_cast<std::size_t>(r.in) * r.out);
-        if (set == &dn && std::find(checked.begin(), checked.end(), r.k2) == checked.end()) {
+        std::vector<uint32_t> &checked = set == &gu ? checked_gu : checked_dn;
+        if (std::find(checked.begin(), checked.end(), r.k2) == checked.end()) {
           checked.push_back(r.k2);
           check(r.inner == host_trellis_decode(r.words.data(), r.k2, r.in, r.out),
-                "kernel decode equals the host restatement (down, k2 " + std::to_string(r.k2) + ")");
+                std::string("kernel decode equals the host restatement (") + (set == &gu ? "gate/up" : "down") +
+                    ", k2 " + std::to_string(r.k2) + ")");
         }
       }
     }

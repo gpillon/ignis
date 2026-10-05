@@ -125,6 +125,7 @@ void swiglu_arm(int tokens) {
 int main() {
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
+  MOE_RC(ignis_fp8_linear_prepare());
   std::printf("FP8 row-scale linear (E4M3 + BF16 row scale), BF16 activations, fp32 accumulation\n");
   for (int tokens : {1, 3, 8, 9, 200, 2048}) linear_arm(640, 2560, tokens, tokens % 2 == 1);
   for (int tokens : {1, 8, 129, 1000}) linear_arm(2560, 640, tokens, true);

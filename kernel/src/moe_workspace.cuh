@@ -43,8 +43,8 @@ inline uint32_t max_items(uint32_t tokens) {
 
 struct WorkspaceLayout {
   std::size_t decode_counters = 0;
-  std::size_t decode_gate_up = 0;   // int64 [unique][8 tokens][1280], fixed point
-  std::size_t decode_h = 0;         // f32 [unique][8 tokens][640]
+  std::size_t decode_gate_up = 0;   // int64 [10 D][D][1280], fixed point (D = decode tokens)
+  std::size_t decode_h = 0;         // f32 [10 D][D][640]
   std::size_t chunk_hist = 0;       // u32 [chunks][512]: assignments per expert per chunk, then bases
   std::size_t expert_offset = 0;    // u32 [513]: first sorted row of each expert, then the total
   std::size_t item_count = 0;       // u32 [1]
@@ -54,8 +54,11 @@ struct WorkspaceLayout {
   std::size_t total = 0;
 };
 
-inline WorkspaceLayout workspace_layout(uint32_t max_tokens) {
+// The layout for a workspace whose decode regions hold `decode_tokens` tokens (the load's lane
+// count) and whose prefill regions hold `max_tokens` (the load's maximum prefill chunk).
+inline WorkspaceLayout workspace_layout(uint32_t decode_tokens, uint32_t max_tokens) {
   WorkspaceLayout l;
+  const std::size_t d = decode_tokens;
   std::size_t off = 0;
   auto take = [&](std::size_t bytes) {
     const std::size_t at = off;
@@ -63,8 +66,8 @@ inline WorkspaceLayout workspace_layout(uint32_t max_tokens) {
     return at;
   };
   l.decode_counters = take(sizeof(DecodeCounters));
-  l.decode_gate_up = take(sizeof(int64_t) * kDecodeMaxUnique * kDecodeMaxTokens * kGateUpOut);
-  l.decode_h = take(sizeof(float) * kDecodeMaxUnique * kDecodeMaxTokens * kInter);
+  l.decode_gate_up = take(sizeof(int64_t) * kTopK * d * d * kGateUpOut);
+  l.decode_h = take(sizeof(float) * kTopK * d * d * kInter);
   l.chunk_hist = take(sizeof(uint32_t) * group_chunks(max_tokens) * kExperts);
   l.expert_offset = take(sizeof(uint32_t) * (kExperts + 1));
   l.item_count = take(sizeof(uint32_t));
@@ -73,6 +76,16 @@ inline WorkspaceLayout workspace_layout(uint32_t max_tokens) {
   l.prefill_h = take(sizeof(float) * static_cast<std::size_t>(max_tokens) * kTopK * kInter);
   l.total = off;
   return l;
+}
+
+// 0 when the description is usable, else -1 with the reason recorded for `op`.
+inline int32_t check_workspace(const char *op, const ignis_moe_workspace *ws) {
+  if (ws == nullptr || ws->base == nullptr) return fail(std::string(op) + ": workspace is NULL");
+  if (ws->decode_tokens == 0 || ws->decode_tokens > static_cast<uint32_t>(kDecodeMaxTokens)) {
+    return fail(std::string(op) + ": workspace decode_tokens must be 1.." + std::to_string(kDecodeMaxTokens));
+  }
+  if (ws->prefill_tokens == 0) return fail(std::string(op) + ": workspace prefill_tokens must be at least 1");
+  return 0;
 }
 
 }  // namespace ignis_moe

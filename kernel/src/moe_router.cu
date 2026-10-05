@@ -11,7 +11,10 @@
 //   select   one warp per token: the 512 logits rounded to BF16 (the transformers module's
 //            F.linear output dtype, measured by kernel/tests/fixtures/flash_next/record.py),
 //            ten rounds of a warp arg-max ordered by (value descending, expert ascending), and
-//            a softmax over the ten in fp32 rounded to BF16 as the module returns it.
+//            a softmax over the ten in fp32 rounded to BF16 as the module returns it. A NaN
+//            logit ranks as -inf, so a token whose input is not finite still gets ten distinct
+//            ids in range (0..9 when every logit is NaN) and NaN weights, on which the expert
+//            ops trap; nothing downstream indexes with a garbage id.
 //
 // At decode the weight (2.6 MB) is the whole cost; groups of 4 experts give 128 CTAs so the read
 // spreads over the card. Wide calls use groups of 32 so each token tile is staged fewer times.
@@ -87,7 +90,8 @@ __global__ void router_select_kernel(const float *__restrict__ logits, int token
 #pragma unroll
   for (int i = 0; i < kPerLane; ++i) {
     // BF16, as the checkpoint's router returns its logits: fp32 rounded to nearest even.
-    v[i] = __bfloat162float(__float2bfloat16_rn(logits[static_cast<size_t>(t) * kExperts + i * 32 + lane]));
+    const float l = logits[static_cast<size_t>(t) * kExperts + i * 32 + lane];
+    v[i] = isnan(l) ? -INFINITY : __bfloat162float(__float2bfloat16_rn(l));
   }
   uint32_t taken = 0;
   float chosen[kTopK];
@@ -104,7 +108,8 @@ __global__ void router_select_kernel(const float *__restrict__ logits, int token
       const Pick o{__shfl_xor_sync(0xFFFFFFFFu, best.value, m), __shfl_xor_sync(0xFFFFFFFFu, best.id, m)};
       if (better(o, best)) best = o;
     }
-    if ((best.id & 31) == lane) taken |= 1u << (best.id >> 5);
+    // best.id is always a real expert here (512 candidates, ten rounds, no NaN left).
+    if (best.id < kExperts && (best.id & 31) == lane) taken |= 1u << (best.id >> 5);
     chosen[r] = best.value;
     if (lane == 0) ids[static_cast<size_t>(t) * kTopK + r] = best.id;
   }
@@ -124,6 +129,14 @@ __global__ void router_select_kernel(const float *__restrict__ logits, int token
 }
 
 }  // namespace
+
+int32_t prepare_router() {
+  const cudaError_t err = cudaFuncSetAttribute(router_logits_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               kTokenTile * kHidden * 2);
+  if (err != cudaSuccess) return fail(std::string("ignis_moe_prepare (router): ") + cudaGetErrorString(err));
+  return 0;
+}
+
 }  // namespace ignis_moe
 
 using namespace ignis_moe;
@@ -146,9 +159,7 @@ extern "C" int32_t ignis_moe_router(const void *x, uint32_t tokens, const void *
   const dim3 grid((tokens + kTokenTile - 1) / kTokenTile, kExperts / experts_per_cta);
   const int rows = tokens < static_cast<uint32_t>(kTokenTile) ? static_cast<int>(tokens) : kTokenTile;
   const size_t smem = static_cast<size_t>(rows) * kHidden * 2;
-  static const cudaError_t attr = cudaFuncSetAttribute(
-      router_logits_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kTokenTile * kHidden * 2);
-  if (attr != cudaSuccess) return fail(std::string("ignis_moe_router: ") + cudaGetErrorString(attr));
+  if (require_prepared("ignis_moe_router", nullptr) != 0) return -1;
   router_logits_kernel<<<grid, threads, smem, s>>>(static_cast<const __nv_bfloat16 *>(x),
                                                    static_cast<int>(tokens),
                                                    static_cast<const __nv_bfloat16 *>(w_router),

@@ -168,8 +168,9 @@ int main(int argc, char **argv) {
   }
   DeviceBytes d_slots(pool->slots.size() * sizeof(ignis_moe_slot));
   upload(d_slots, pool->slots);
-  DeviceBytes workspace(ignis_moe_workspace_bytes(64)), acc(64 * kH * 8);
-  MOE_RC(ignis_moe_workspace_init(workspace.p, 64, acc.as<int64_t>(), nullptr));
+  DeviceBytes workspace(ignis_moe_workspace_bytes(IGNIS_MOE_DECODE_MAX_TOKENS, 64)), acc(64 * kH * 8);
+  const ignis_moe_workspace ws{workspace.p, IGNIS_MOE_DECODE_MAX_TOKENS, 64};
+  MOE_RC(ignis_moe_workspace_init(&ws, acc.as<int64_t>(), nullptr));
   const std::vector<uint16_t> x = make_tokens(8, 31, 2.0f);
   DeviceBytes dx(x.size() * 2);
   upload(dx, x);
@@ -225,7 +226,7 @@ int main(int argc, char **argv) {
     const double us = time_us(calls, [&](int c, cudaStream_t st) {
       MOE_RC(ignis_moe_experts_decode(dx.p, tokens, dids.as<int32_t>() + static_cast<std::size_t>(c) * tokens * kTop,
                                       dw.as<float>() + static_cast<std::size_t>(c) * tokens * kTop,
-                                      d_slots.as<ignis_moe_slot>(), workspace.p, acc.as<int64_t>(), st));
+                                      d_slots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(), st));
     });
     const double gbs = bytes / (us * 1e-6) / 1e9;
     std::printf("  routed decode, %d token(s): %.1f us per layer, %.2f MB read, %.0f GB/s = %.1f%% of roofline (%.1f%% of streaming read)\n",
@@ -254,7 +255,7 @@ int main(int argc, char **argv) {
     return time_us(calls, [&](int c, cudaStream_t st) {
       MOE_RC(ignis_moe_experts_decode(dx.p, 1, dids.as<int32_t>() + static_cast<std::size_t>(c) * kTop,
                                       dw.as<float>() + static_cast<std::size_t>(c) * kTop, slots.as<ignis_moe_slot>(),
-                                      workspace.p, acc.as<int64_t>(), st));
+                                      &ws, acc.as<int64_t>(), st));
     });
   };
   {
@@ -318,8 +319,9 @@ int main(int argc, char **argv) {
     // and the shared expert's FP8 linears; TFLOP/s against the BF16/FP16 dense tensor peak.
     const int tokens = 2048;
     const double peak_tflops = 209.5;  // RTX 5090, dense FP16/BF16 tensor (NVIDIA's figure)
-    DeviceBytes pws(ignis_moe_workspace_bytes(tokens)), pacc(static_cast<std::size_t>(tokens) * kH * 8);
-    MOE_RC(ignis_moe_workspace_init(pws.p, tokens, pacc.as<int64_t>(), nullptr));
+    DeviceBytes pws(ignis_moe_workspace_bytes(1, tokens)), pacc(static_cast<std::size_t>(tokens) * kH * 8);
+    const ignis_moe_workspace pdesc{pws.p, 1, static_cast<uint32_t>(tokens)};
+    MOE_RC(ignis_moe_workspace_init(&pdesc, pacc.as<int64_t>(), nullptr));
     const std::vector<uint16_t> px = make_tokens(tokens, 32, 2.0f);
     std::vector<int32_t> ids(static_cast<std::size_t>(tokens) * kTop);
     for (int t = 0; t < tokens; ++t) {
@@ -331,8 +333,8 @@ int main(int argc, char **argv) {
     upload(dids, ids);
     upload(dw, w);
     const double us = time_us(8, [&](int, cudaStream_t st) {
-      MOE_RC(ignis_moe_experts_prefill(dpx.p, tokens, dids.as<int32_t>(), dw.as<float>(), d_slots.as<ignis_moe_slot>(), pws.p,
-                                       tokens, pacc.as<int64_t>(), st));
+      MOE_RC(ignis_moe_experts_prefill(dpx.p, tokens, dids.as<int32_t>(), dw.as<float>(), d_slots.as<ignis_moe_slot>(), &pdesc,
+                                       pacc.as<int64_t>(), st));
     });
     const double flops = 2.0 * tokens * kTop * (static_cast<double>(kH) * 2 * kI + static_cast<double>(kI) * kH);
     std::printf("  routed prefill, %d tokens: %.0f us per layer, %.1f TFLOP/s = %.1f%% of the %.1f dense tensor peak\n", tokens, us,

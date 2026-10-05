@@ -43,8 +43,9 @@ struct Block {
   Fp8Matrix gate, up, down;
   std::vector<uint16_t> w_gate;  // BF16 [2560]
   DeviceBytes d_router, d_gate, d_up, d_down, d_wgate;
-  DeviceBytes workspace{ignis_moe_workspace_bytes(kMaxTokens)};
+  DeviceBytes workspace{ignis_moe_workspace_bytes(IGNIS_MOE_DECODE_MAX_TOKENS, kMaxTokens)};
   DeviceBytes acc{static_cast<std::size_t>(kMaxTokens) * kH * 8};
+  ignis_moe_workspace ws{workspace.p, IGNIS_MOE_DECODE_MAX_TOKENS, kMaxTokens};
 
   Block()
       : router_w(static_cast<std::size_t>(kE) * kH), gate(make_fp8(6001, kI, kH, 0.003f)), up(make_fp8(6002, kI, kH, 0.003f)),
@@ -60,7 +61,7 @@ struct Block {
     std::vector<int> identity(2 * kRecords);
     std::iota(identity.begin(), identity.end(), 0);
     experts.place(identity);
-    MOE_RC(ignis_moe_workspace_init(workspace.p, kMaxTokens, acc.as<int64_t>(), nullptr));
+    MOE_RC(ignis_moe_workspace_init(&ws, acc.as<int64_t>(), nullptr));
     MOE_CUDA(cudaDeviceSynchronize());
   }
 };
@@ -75,10 +76,10 @@ void block_arm(Block &b, int tokens) {
     MOE_RC(ignis_moe_router(dx.p, tokens, b.d_router.p, ids.as<int32_t>(), w.as<float>(), logits.as<float>(), stream));
     if (tokens <= IGNIS_MOE_DECODE_MAX_TOKENS) {
       MOE_RC(ignis_moe_experts_decode(dx.p, tokens, ids.as<int32_t>(), w.as<float>(), b.experts.d_slots.as<ignis_moe_slot>(),
-                                      b.workspace.p, b.acc.as<int64_t>(), stream));
+                                      &b.ws, b.acc.as<int64_t>(), stream));
     } else {
       MOE_RC(ignis_moe_experts_prefill(dx.p, tokens, ids.as<int32_t>(), w.as<float>(), b.experts.d_slots.as<ignis_moe_slot>(),
-                                       b.workspace.p, kMaxTokens, b.acc.as<int64_t>(), stream));
+                                       &b.ws, b.acc.as<int64_t>(), stream));
     }
     MOE_RC(ignis_moe_shared_expert(b.d_gate.p, b.d_up.p, b.d_down.p, dx.p, tokens, h.p, shared.as<float>(), stream));
     MOE_RC(ignis_moe_combine(b.acc.as<int64_t>(), shared.as<float>(), dx.p, b.d_wgate.p, tokens, out.p, stream));

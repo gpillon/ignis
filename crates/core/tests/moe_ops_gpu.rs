@@ -51,14 +51,20 @@ fn read_fixture(name: &str) -> HashMap<String, Vec<u8>> {
     out
 }
 
+/// The device, prepared for the MoE ops (ignis_moe_prepare), or `None` after the profile's verdict.
 fn device() -> Option<CudaDevice> {
-    match CudaDevice::create(0) {
-        Ok(d) => Some(d),
+    let dev = match CudaDevice::create(0) {
+        Ok(d) => d,
         Err(e) => {
             gpu_profile::skip_or_fail(&format!("no CUDA device: {e}"));
-            None
+            return None;
         }
+    };
+    if let Err(e) = moe::prepare() {
+        gpu_profile::skip_or_fail(&format!("ignis_moe_prepare: {e}"));
+        return None;
     }
+    Some(dev)
 }
 
 fn upload(dev: &mut CudaDevice, bytes: &[u8]) -> DeviceBuffer {

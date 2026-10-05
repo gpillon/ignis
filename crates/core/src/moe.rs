@@ -47,6 +47,16 @@ impl MoeSlot {
     pub const ABSENT: MoeSlot = MoeSlot { record: std::ptr::null(), k2: 0, reserved: 0 };
 }
 
+/// A MoE workspace, 1:1 with `struct ignis_moe_workspace`: its device base and the two
+/// capacities it was sized for (`workspace_bytes`), passed to every routed-expert call.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeWorkspace {
+    pub base: *mut c_void,
+    pub decode_tokens: u32,
+    pub prefill_tokens: u32,
+}
+
 /// The device buffers one MoE block needs, 1:1 with `struct ignis_moe_plan`: the plan lines a
 /// Flash-Next load reserves (ADR 0030), each rounded up to 256 bytes.
 #[repr(C)]
@@ -61,7 +71,7 @@ pub struct MoePlan {
 
 /// 1:1 with `kernel/include/ignis_moe.h`.
 pub mod ffi {
-    use super::{MoePlan, MoeSlot};
+    use super::{MoePlan, MoeSlot, MoeWorkspace};
     use std::os::raw::{c_char, c_void};
 
     unsafe extern "C" {
@@ -89,7 +99,7 @@ pub mod ffi {
             ids: *const i32,
             weights: *const f32,
             slots: *const MoeSlot,
-            workspace: *mut c_void,
+            workspace: *const MoeWorkspace,
             acc: *mut i64,
             stream: *mut c_void,
         ) -> i32;
@@ -99,11 +109,11 @@ pub mod ffi {
             ids: *const i32,
             weights: *const f32,
             slots: *const MoeSlot,
-            workspace: *mut c_void,
-            max_tokens: u32,
+            workspace: *const MoeWorkspace,
             acc: *mut i64,
             stream: *mut c_void,
         ) -> i32;
+        pub fn ignis_fp8_linear_prepare() -> i32;
         pub fn ignis_fp8_linear(
             weight: *const c_void,
             rows: u32,
@@ -143,14 +153,14 @@ pub mod ffi {
             out: *mut c_void,
             stream: *mut c_void,
         ) -> i32;
-        pub fn ignis_moe_workspace_bytes(max_tokens: u32) -> u64;
+        pub fn ignis_moe_prepare() -> i32;
+        pub fn ignis_moe_workspace_bytes(decode_tokens: u32, prefill_tokens: u32) -> u64;
         pub fn ignis_moe_workspace_init(
-            workspace: *mut c_void,
-            max_tokens: u32,
+            workspace: *const MoeWorkspace,
             acc: *mut i64,
             stream: *mut c_void,
         ) -> i32;
-        pub fn ignis_moe_plan_bytes(max_tokens: u32, plan: *mut MoePlan) -> i32;
+        pub fn ignis_moe_plan_bytes(decode_tokens: u32, prefill_tokens: u32, plan: *mut MoePlan) -> i32;
         pub fn ignis_moe_stream_sync(stream: *mut c_void) -> i32;
         pub fn ignis_moe_last_error() -> *const c_char;
     }
@@ -172,16 +182,31 @@ pub fn record_bytes(projection: u32, k2: u32) -> Result<u64, String> {
     Ok(bytes)
 }
 
-/// The routed-expert workspace for chunks of up to `max_tokens` tokens (the `acc` buffer, int64
-/// `[max_tokens][2560]`, is the caller's own plan line).
-pub fn workspace_bytes(max_tokens: u32) -> u64 {
-    unsafe { ffi::ignis_moe_workspace_bytes(max_tokens) }
+/// Prepares the current device for every MoE op and the FP8 linear (kernel attributes, launch
+/// geometry); once per device at load, outside any stream capture. The ops refuse to run on a
+/// device that was not prepared.
+pub fn prepare() -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_prepare() })
 }
 
-/// The MoE block's plan lines for calls of up to `max_tokens` tokens.
-pub fn plan_bytes(max_tokens: u32) -> Result<MoePlan, String> {
+/// The routed-expert workspace for `decode_tokens` lanes and prefill chunks of `prefill_tokens`
+/// (the `acc` buffer is the caller's own plan line).
+pub fn workspace_bytes(decode_tokens: u32, prefill_tokens: u32) -> u64 {
+    unsafe { ffi::ignis_moe_workspace_bytes(decode_tokens, prefill_tokens) }
+}
+
+/// Zeroes a fresh workspace and `acc` and prepares the device; once at load.
+///
+/// # Safety
+/// `workspace.base` and `acc` are device buffers of the sizes the plan gives.
+pub unsafe fn workspace_init(workspace: &MoeWorkspace, acc: *mut i64, stream: *mut c_void) -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_workspace_init(workspace, acc, stream) })
+}
+
+/// The MoE block's plan lines for `decode_tokens` lanes and prefill chunks of `prefill_tokens`.
+pub fn plan_bytes(decode_tokens: u32, prefill_tokens: u32) -> Result<MoePlan, String> {
     let mut plan = MoePlan::default();
-    check(unsafe { ffi::ignis_moe_plan_bytes(max_tokens, &mut plan) })?;
+    check(unsafe { ffi::ignis_moe_plan_bytes(decode_tokens, prefill_tokens, &mut plan) })?;
     Ok(plan)
 }
 
@@ -231,7 +256,7 @@ pub unsafe fn experts_decode(
     ids: *const i32,
     weights: *const f32,
     slots: *const MoeSlot,
-    workspace: *mut c_void,
+    workspace: &MoeWorkspace,
     acc: *mut i64,
     stream: *mut c_void,
 ) -> Result<(), String> {
@@ -248,14 +273,11 @@ pub unsafe fn experts_prefill(
     ids: *const i32,
     weights: *const f32,
     slots: *const MoeSlot,
-    workspace: *mut c_void,
-    max_tokens: u32,
+    workspace: &MoeWorkspace,
     acc: *mut i64,
     stream: *mut c_void,
 ) -> Result<(), String> {
-    check(unsafe {
-        ffi::ignis_moe_experts_prefill(x, tokens, ids, weights, slots, workspace, max_tokens, acc, stream)
-    })
+    check(unsafe { ffi::ignis_moe_experts_prefill(x, tokens, ids, weights, slots, workspace, acc, stream) })
 }
 
 /// The FP8 row-scale linear; `y_f32` selects fp32 output, else BF16.
@@ -341,21 +363,31 @@ mod tests {
         // By hand from the layout (kernel/src/moe_workspace.cuh) at 4096 tokens: decode counters
         // 2,048 + gate/up sums 6,553,600 + h 1,638,400; prefill chunk histograms 131,072, expert
         // offsets 2,304, item count 256, 1,152 items 9,216, sorted rows 163,840, h 104,857,600.
-        let plan = plan_bytes(4096).unwrap();
+        let plan = plan_bytes(8, 4096).unwrap();
         assert_eq!(plan.workspace, 113_358_336);
         assert_eq!(plan.acc, 4096 * 2560 * 8);
         assert_eq!(plan.router, 163_840 + 163_840 + 8_388_608);
         assert_eq!(plan.shared, 5_242_880 + 41_943_040);
         assert_eq!(plan.total, 253_146_624);
-        assert!(plan_bytes(0).is_err());
+        assert!(plan_bytes(0, 4096).is_err());
+        assert!(plan_bytes(9, 4096).is_err());
+        assert!(plan_bytes(8, 0).is_err());
     }
 
     #[test]
     fn workspace_grows_with_the_chunk() {
-        let decode_only = workspace_bytes(1);
-        let chunk = workspace_bytes(4096);
+        let decode_only = workspace_bytes(1, 1);
+        let chunk = workspace_bytes(1, 4096);
         assert!(decode_only > 0);
         // The prefill rows dominate: at least the SwiGLU outputs of 4096 tokens x 10 experts.
         assert!(chunk - decode_only >= 4096 * 10 * 640 * 4 - 640 * 10 * 4);
+    }
+
+    #[test]
+    fn decode_regions_follow_the_lane_count() {
+        // gate/up sums int64 [10 D][D][1280] and h f32 [10 D][D][640]: 8 lanes against 3.
+        let eight = workspace_bytes(8, 4096);
+        let three = workspace_bytes(3, 4096);
+        assert_eq!(eight - three, (6_553_600 - 921_600) + (1_638_400 - 230_400));
     }
 }

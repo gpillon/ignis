@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <string>
+#include <type_traits>
 
 namespace ignis_moe {
 
@@ -29,19 +30,62 @@ int32_t fail(const std::string &message);
 // 0, or -1 with the launch error recorded, for the kernel(s) just enqueued.
 int32_t check_launch(const char *op);
 
+// ---- per-device preparation (host) -----------------------------------------------------------
+
+// What ignis_moe_prepare records for a device: the decode launch's grid (0: not prepared).
+// require_prepared fails the op, naming it, on a device nobody prepared; nothing configures
+// itself lazily, so an op's first call inside a stream capture is like any other.
+int32_t require_prepared(const char *op, int *decode_grid);
+// Each translation unit's share of ignis_moe_prepare: its kernels' attributes.
+int32_t prepare_router();
+int32_t prepare_prefill();
+int32_t prepare_decode(int *grid);
+
 // ---- slots -----------------------------------------------------------------------------------
 
-__device__ __forceinline__ bool valid_k2(uint32_t k2) {
+__host__ __device__ __forceinline__ bool valid_k2(uint32_t k2) {
   return k2 == 4u || k2 == 5u || k2 == 6u || k2 == 8u;
+}
+
+// An expert id the router could not have produced traps: it would index outside the slot table
+// and the grouping buffers.
+__device__ __forceinline__ void check_expert(int expert) {
+  if (static_cast<unsigned>(expert) >= static_cast<unsigned>(kExperts)) { __trap(); }
 }
 
 // The slot of (expert, projection), trapped if it is not resident: a selected projection without
 // a record is a residency bug, and reading it as weights would only hide it.
 __device__ __forceinline__ ignis_moe_slot load_slot(const ignis_moe_slot *slots, int expert,
                                                     int projection) {
+  check_expert(expert);
   const ignis_moe_slot s = slots[expert * 2 + projection];
   if (s.record == nullptr || !valid_k2(s.k2)) { __trap(); }
   return s;
+}
+
+// Runs f(std::integral_constant<int, K2>{}) for the slot's K class: the one place the four K
+// instantiations are chosen.
+template <typename F> __device__ __forceinline__ void dispatch_k2(uint32_t k2, F &&f) {
+  switch (k2) {
+  case 4: f(std::integral_constant<int, 4>{}); break;
+  case 5: f(std::integral_constant<int, 5>{}); break;
+  case 6: f(std::integral_constant<int, 6>{}); break;
+  default: f(std::integral_constant<int, 8>{}); break;
+  }
+}
+
+// A record's planes (layout.md §3): the trellis at offset 0, then suh [in] and svh [out] fp16.
+struct RecordPlanes {
+  const uint32_t *trellis;
+  const __half *suh;
+  const __half *svh;
+};
+
+__device__ __forceinline__ RecordPlanes record_planes(const ignis_moe_slot &slot, uint32_t in,
+                                                      uint32_t out, uint32_t k2) {
+  const char *base = static_cast<const char *>(slot.record);
+  const __half *suh = reinterpret_cast<const __half *>(base + in * out / 16u * k2);
+  return RecordPlanes{reinterpret_cast<const uint32_t *>(base), suh, suh + in};
 }
 
 // Bytes of a record's trellis tensor: in * out * K / 8.
@@ -52,8 +96,11 @@ __host__ __device__ __forceinline__ uint32_t trellis_bytes(uint32_t in, uint32_t
 // ---- the routed accumulator: int64 with 32 fractional bits -----------------------------------
 
 // v * 2^32 as an integer. The float product is exact (power of two); the conversion rounds only
-// the bits below 2^-32, so integer sums of these are exact and order-independent.
+// the bits below 2^-32, so integer sums of these are exact and order-independent. A value the
+// format cannot hold -- not finite, or |v| >= 2^31 -- traps: saturating or zeroing it would turn
+// a broken activation into a finite wrong answer.
 __device__ __forceinline__ long long to_fixed(float v) {
+  if (!(fabsf(v) < 2147483648.0f)) { __trap(); }
   return __float2ll_rn(v * 4294967296.0f);
 }
 
@@ -83,6 +130,13 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], 
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void *smem) {
+  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(s));
 }
 
 __device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {

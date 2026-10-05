@@ -17,8 +17,9 @@
 //            SwiGLU, and stores the row's h.
 //   down     item x output block c (0..19): the same over h's 640 inputs; the epilogue adds
 //            weight x value into the fixed-point accumulator at the row's token.
-// m16 row blocks beyond an item's rows skip their MMAs, so a one-token expert costs its weight
-// read and little compute. Everything is deterministic: a row's result does not depend on the
+// An item of at most 16 rows takes a narrow layout (one m16 block, all eight warps along the
+// columns), so a one-token expert costs its weight read and little else; a wide item's m16
+// blocks beyond its rows skip their MMAs. Everything is deterministic: a row's result does not depend on the
 // other rows of its tile, and the cross-expert sum is integer.
 
 #include "moe_common.cuh"
@@ -43,7 +44,11 @@ __global__ void group_count_kernel(const int32_t *__restrict__ ids, int tokens, 
   __syncthreads();
   const int a0 = blockIdx.x * kGroupChunk * kTopK;
   const int a1 = min(tokens * kTopK, a0 + kGroupChunk * kTopK);
-  for (int a = a0 + threadIdx.x; a < a1; a += blockDim.x) atomicAdd(&h[ids[a]], 1u);
+  for (int a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
+    const int e = ids[a];
+    check_expert(e);
+    atomicAdd(&h[e], 1u);
+  }
   __syncthreads();
   for (int i = threadIdx.x; i < kExperts; i += blockDim.x) hist[static_cast<size_t>(blockIdx.x) * kExperts + i] = h[i];
 }
@@ -93,6 +98,7 @@ __global__ void group_scatter_kernel(const int32_t *__restrict__ ids, int tokens
   __syncthreads();
   if (i < n) {
     const int e = e_s[i];
+    check_expert(e);
     uint32_t rank = 0;
     for (int j = 0; j < i; ++j) rank += e_s[j] == e;
     sorted[base[static_cast<size_t>(blockIdx.x) * kExperts + e] + rank] = a0 + i;
@@ -143,20 +149,13 @@ __device__ __forceinline__ Tile carve(unsigned char *smem) {
   return t;
 }
 
-__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void *smem) {
-  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(s));
-}
-
 // Per-row fp16 scale from a bound: a rotated entry is at most the 2-norm of its 128-block of
 // in(row, k) * suh[k], so the largest block norm bounds the whole row.
-template <typename In>
+template <int kRows, typename In>
 __device__ void row_scales(const Tile &t, int rows, int in_width, const __half *suh, In in) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  for (int r = warp; r < kTileRows; r += kThreads / 32) {
+  for (int r = warp; r < kRows; r += kThreads / 32) {
     float bound = 0.0f;
     if (r < rows) {
       for (int blk = 0; blk < in_width / 128; ++blk) {
@@ -175,12 +174,12 @@ __device__ void row_scales(const Tile &t, int rows, int in_width, const __half *
   }
 }
 
-// Rotate k-block `kb` of every row into t.a as fp16 (rows past `rows` zero).
-template <typename In>
+// Rotate k-block `kb` of the first kRows rows into t.a as fp16 (rows past `rows` zero).
+template <int kRows, typename In>
 __device__ void prepare_a(const Tile &t, int rows, int kb, const __half *suh, In in) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  for (int r = warp; r < kTileRows; r += kThreads / 32) {
+  for (int r = warp; r < kRows; r += kThreads / 32) {
     float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if (r < rows) {
 #pragma unroll
@@ -251,66 +250,83 @@ __device__ __forceinline__ int item_rows(const Params &p, int e, int r0) {
   return min(kTileRows, static_cast<int>(p.offset[e + 1] - p.offset[e]) - r0);
 }
 
-template <int K2>
-__device__ void gate_up_tile(const Tile &t, const Params &p, int e, int r0, int b, const ignis_moe_slot &slot) {
-  constexpr int words = ignis_trellis::tile_words(K2);
-  constexpr int stage_words = 8 * 16 * words;
+// The warp layout of a tile. Wide items (more than 16 rows) put the 8 warps on a 2 x 4 grid of
+// 32-row x (NT tiles) blocks; narrow items -- the small groups real routing is full of -- have
+// one m16 block, so all 8 warps go along the columns and none sits idle.
+template <bool kNarrow, int kTilesPerCta> struct WarpGrid {
+  static constexpr int kMT = kNarrow ? 1 : 2;                                  // m16 blocks per warp
+  static constexpr int kNT = kNarrow ? kTilesPerCta / 8 : kTilesPerCta / 4;    // n tiles per warp
+  static constexpr int kRows = kNarrow ? 16 : kTileRows;                       // rows prepared
+  __device__ static int warp_m(int warp) { return kNarrow ? 0 : warp >> 2; }
+  __device__ static int slot0(int warp) { return kNarrow ? kNT * warp : kNT * (warp & 3); }
+};
+
+// acc / scale into t.y: row r, column (slot0 + n) * 16 + ...
+template <class G>
+__device__ __forceinline__ void store_tile(const Tile &t, int warp, const float (&acc)[G::kMT][G::kNT][2][4]) {
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int warp_m = warp >> 2;  // rows 32 warp_m ..
-  const int warp_n = warp & 3;   // tile slots 4 warp_n .. (0..7 gate, 8..15 up)
-  const int rows = item_rows(p, e, r0);
-  const uint32_t first_row = p.offset[e] + r0;
-  const uint32_t *trellis = static_cast<const uint32_t *>(slot.record);
-  const __half *suh = reinterpret_cast<const __half *>(static_cast<const char *>(slot.record) + trellis_bytes(kHidden, kGateUpOut, K2));
-  const __half *svh = suh + kHidden;
-
-  if (threadIdx.x < kTileRows) {
-    t.token[threadIdx.x] = threadIdx.x < rows ? p.sorted[first_row + threadIdx.x] / kTopK : 0;
-  }
-  __syncthreads();
-  auto x_in = [&](int r, int k) { return __bfloat162float(p.x[static_cast<size_t>(t.token[r]) * kHidden + k]); };
-  row_scales(t, rows, kHidden, suh, x_in);
-
-  const int run_start[2] = {8 * b, kInter / 16 + 8 * b};
-  stage_weights<K2>(t.b, trellis, kGateUpOut / 16, 0, 2, run_start);
-  cp_async_commit();
-  const ignis_trellis::LanePlan plan = ignis_trellis::lane_plan(K2, lane);
-  float acc[2][4][2][4] = {};
-  constexpr int kBlocks = kHidden / 128;
-  for (int kb = 0; kb < kBlocks; ++kb) {
-    // t.scale is visible, and every warp is done with t.a and with the stage refilled below.
-    __syncthreads();
-    if (kb + 1 < kBlocks) stage_weights<K2>(t.b + ((kb + 1) & 1) * stage_words, trellis, kGateUpOut / 16, kb + 1, 2, run_start);
-    cp_async_commit();
-    prepare_a(t, rows, kb, suh, x_in);
-    cp_async_wait<1>();
-    __syncthreads();
-    mma_block<K2, 2, 4>(t, t.b + (kb & 1) * stage_words, 2, 4 * warp_n, warp_m, rows, plan, acc);
-  }
-  cp_async_wait<0>();
-  __syncthreads();
-
-  // Epilogue: rows x 256 to shared memory (undoing the row scale), rotate back, svh, SwiGLU.
   const int g = lane >> 2;
   const int c = lane & 3;
 #pragma unroll
-  for (int mi = 0; mi < 2; ++mi) {
+  for (int mi = 0; mi < G::kMT; ++mi) {
 #pragma unroll
     for (int hh = 0; hh < 2; ++hh) {
-      const int r = warp_m * 32 + mi * 16 + g + hh * 8;
+      const int r = G::warp_m(warp) * 16 * G::kMT + mi * 16 + g + hh * 8;
       const float inv = 1.0f / t.scale[r];
 #pragma unroll
-      for (int n = 0; n < 4; ++n) {
+      for (int n = 0; n < G::kNT; ++n) {
 #pragma unroll
         for (int hf = 0; hf < 2; ++hf) {
-          const int col = (4 * warp_n + n) * 16 + hf * 8 + 2 * c;
+          const int col = (G::slot0(warp) + n) * 16 + hf * 8 + 2 * c;
           t.y[r][col] = acc[mi][n][hf][2 * hh] * inv;
           t.y[r][col + 1] = acc[mi][n][hf][2 * hh + 1] * inv;
         }
       }
     }
   }
+}
+
+template <int K2, bool kNarrow>
+__device__ void gate_up_tile(const Tile &t, const Params &p, int e, int r0, int b, const ignis_moe_slot &slot) {
+  using G = WarpGrid<kNarrow, 16>;
+  constexpr int words = ignis_trellis::tile_words(K2);
+  constexpr int stage_words = 8 * 16 * words;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int rows = item_rows(p, e, r0);
+  const uint32_t first_row = p.offset[e] + r0;
+  const RecordPlanes planes = record_planes(slot, kHidden, kGateUpOut, K2);
+  const __half *suh = planes.suh;
+  const __half *svh = planes.svh;
+
+  if (threadIdx.x < kTileRows) {
+    t.token[threadIdx.x] = threadIdx.x < rows ? p.sorted[first_row + threadIdx.x] / kTopK : 0;
+  }
+  __syncthreads();
+  auto x_in = [&](int r, int k) { return __bfloat162float(p.x[static_cast<size_t>(t.token[r]) * kHidden + k]); };
+  row_scales<G::kRows>(t, rows, kHidden, suh, x_in);
+
+  const int run_start[2] = {8 * b, kInter / 16 + 8 * b};
+  stage_weights<K2>(t.b, planes.trellis, kGateUpOut / 16, 0, 2, run_start);
+  cp_async_commit();
+  const ignis_trellis::LanePlan plan = ignis_trellis::lane_plan(K2, lane);
+  float acc[G::kMT][G::kNT][2][4] = {};
+  constexpr int kBlocks = kHidden / 128;
+  for (int kb = 0; kb < kBlocks; ++kb) {
+    // t.scale is visible, and every warp is done with t.a and with the stage refilled below.
+    __syncthreads();
+    if (kb + 1 < kBlocks) stage_weights<K2>(t.b + ((kb + 1) & 1) * stage_words, planes.trellis, kGateUpOut / 16, kb + 1, 2, run_start);
+    cp_async_commit();
+    prepare_a<G::kRows>(t, rows, kb, suh, x_in);
+    cp_async_wait<1>();
+    __syncthreads();
+    mma_block<K2, G::kMT, G::kNT>(t, t.b + (kb & 1) * stage_words, 2, G::slot0(warp), G::warp_m(warp), rows, plan, acc);
+  }
+  cp_async_wait<0>();
+  __syncthreads();
+
+  // Epilogue: rows x 256 to shared memory (undoing the row scale), rotate back, svh, SwiGLU.
+  store_tile<G>(t, warp, acc);
   __syncthreads();
   for (int r = warp; r < rows; r += kThreads / 32) {
     float gv[4], uv[4];
@@ -332,19 +348,18 @@ __device__ void gate_up_tile(const Tile &t, const Params &p, int e, int r0, int 
   }
 }
 
-template <int K2>
+template <int K2, bool kNarrow>
 __device__ void down_tile(const Tile &t, const Params &p, int e, int r0, int cb, const ignis_moe_slot &slot) {
+  using G = WarpGrid<kNarrow, 8>;
   constexpr int words = ignis_trellis::tile_words(K2);
   constexpr int stage_words = 8 * 8 * words;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  const int warp_m = warp >> 2;
-  const int warp_n = warp & 3;  // tile slots 2 warp_n, 2 warp_n + 1
   const int rows = item_rows(p, e, r0);
   const uint32_t first_row = p.offset[e] + r0;
-  const uint32_t *trellis = static_cast<const uint32_t *>(slot.record);
-  const __half *suh = reinterpret_cast<const __half *>(static_cast<const char *>(slot.record) + trellis_bytes(kInter, kHidden, K2));
-  const __half *svh = suh + kInter;
+  const RecordPlanes planes = record_planes(slot, kInter, kHidden, K2);
+  const __half *suh = planes.suh;
+  const __half *svh = planes.svh;
 
   if (threadIdx.x < kTileRows) {
     const int a = threadIdx.x < rows ? p.sorted[first_row + threadIdx.x] : 0;
@@ -353,45 +368,27 @@ __device__ void down_tile(const Tile &t, const Params &p, int e, int r0, int cb,
   }
   __syncthreads();
   auto h_in = [&](int r, int k) { return p.h[static_cast<size_t>(first_row + r) * kInter + k]; };
-  row_scales(t, rows, kInter, suh, h_in);
+  row_scales<G::kRows>(t, rows, kInter, suh, h_in);
 
   const int run_start[1] = {8 * cb};
-  stage_weights<K2>(t.b, trellis, kHidden / 16, 0, 1, run_start);
+  stage_weights<K2>(t.b, planes.trellis, kHidden / 16, 0, 1, run_start);
   cp_async_commit();
   const ignis_trellis::LanePlan plan = ignis_trellis::lane_plan(K2, lane);
-  float acc[2][2][2][4] = {};
+  float acc[G::kMT][G::kNT][2][4] = {};
   constexpr int kBlocks = kInter / 128;
   for (int kb = 0; kb < kBlocks; ++kb) {
     __syncthreads();
-    if (kb + 1 < kBlocks) stage_weights<K2>(t.b + ((kb + 1) & 1) * stage_words, trellis, kHidden / 16, kb + 1, 1, run_start);
+    if (kb + 1 < kBlocks) stage_weights<K2>(t.b + ((kb + 1) & 1) * stage_words, planes.trellis, kHidden / 16, kb + 1, 1, run_start);
     cp_async_commit();
-    prepare_a(t, rows, kb, suh, h_in);
+    prepare_a<G::kRows>(t, rows, kb, suh, h_in);
     cp_async_wait<1>();
     __syncthreads();
-    mma_block<K2, 2, 2>(t, t.b + (kb & 1) * stage_words, 1, 2 * warp_n, warp_m, rows, plan, acc);
+    mma_block<K2, G::kMT, G::kNT>(t, t.b + (kb & 1) * stage_words, 1, G::slot0(warp), G::warp_m(warp), rows, plan, acc);
   }
   cp_async_wait<0>();
   __syncthreads();
 
-  const int g = lane >> 2;
-  const int c = lane & 3;
-#pragma unroll
-  for (int mi = 0; mi < 2; ++mi) {
-#pragma unroll
-    for (int hh = 0; hh < 2; ++hh) {
-      const int r = warp_m * 32 + mi * 16 + g + hh * 8;
-      const float inv = 1.0f / t.scale[r];
-#pragma unroll
-      for (int n = 0; n < 2; ++n) {
-#pragma unroll
-        for (int hf = 0; hf < 2; ++hf) {
-          const int col = (2 * warp_n + n) * 16 + hf * 8 + 2 * c;
-          t.y[r][col] = acc[mi][n][hf][2 * hh] * inv;
-          t.y[r][col + 1] = acc[mi][n][hf][2 * hh + 1] * inv;
-        }
-      }
-    }
-  }
+  store_tile<G>(t, warp, acc);
   __syncthreads();
   for (int r = warp; r < rows; r += kThreads / 32) {
     float v[4];
@@ -411,12 +408,14 @@ __global__ void __launch_bounds__(kThreads) prefill_gate_up_kernel(Params p) {
   const Tile t = carve(smem);
   const int2 item = p.items[blockIdx.x];
   const ignis_moe_slot slot = load_slot(p.slots, item.x, IGNIS_MOE_PROJ_GATE_UP);
-  switch (slot.k2) {
-  case 4: gate_up_tile<4>(t, p, item.x, item.y, blockIdx.y, slot); break;
-  case 5: gate_up_tile<5>(t, p, item.x, item.y, blockIdx.y, slot); break;
-  case 6: gate_up_tile<6>(t, p, item.x, item.y, blockIdx.y, slot); break;
-  default: gate_up_tile<8>(t, p, item.x, item.y, blockIdx.y, slot); break;
-  }
+  const bool narrow = item_rows(p, item.x, item.y) <= 16;
+  dispatch_k2(slot.k2, [&](auto k2) {
+    if (narrow) {
+      gate_up_tile<decltype(k2)::value, true>(t, p, item.x, item.y, blockIdx.y, slot);
+    } else {
+      gate_up_tile<decltype(k2)::value, false>(t, p, item.x, item.y, blockIdx.y, slot);
+    }
+  });
 }
 
 __global__ void __launch_bounds__(kThreads) prefill_down_kernel(Params p) {
@@ -425,31 +424,48 @@ __global__ void __launch_bounds__(kThreads) prefill_down_kernel(Params p) {
   const Tile t = carve(smem);
   const int2 item = p.items[blockIdx.x];
   const ignis_moe_slot slot = load_slot(p.slots, item.x, IGNIS_MOE_PROJ_DOWN);
-  switch (slot.k2) {
-  case 4: down_tile<4>(t, p, item.x, item.y, blockIdx.y, slot); break;
-  case 5: down_tile<5>(t, p, item.x, item.y, blockIdx.y, slot); break;
-  case 6: down_tile<6>(t, p, item.x, item.y, blockIdx.y, slot); break;
-  default: down_tile<8>(t, p, item.x, item.y, blockIdx.y, slot); break;
-  }
+  const bool narrow = item_rows(p, item.x, item.y) <= 16;
+  dispatch_k2(slot.k2, [&](auto k2) {
+    if (narrow) {
+      down_tile<decltype(k2)::value, true>(t, p, item.x, item.y, blockIdx.y, slot);
+    } else {
+      down_tile<decltype(k2)::value, false>(t, p, item.x, item.y, blockIdx.y, slot);
+    }
+  });
 }
 
 }  // namespace
+
+int32_t prepare_prefill() {
+  const cudaError_t a1 =
+      cudaFuncSetAttribute(prefill_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmemBytes));
+  const cudaError_t a2 =
+      cudaFuncSetAttribute(prefill_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmemBytes));
+  if (a1 != cudaSuccess || a2 != cudaSuccess) {
+    return fail(std::string("ignis_moe_prepare (prefill): ") + cudaGetErrorString(a1 != cudaSuccess ? a1 : a2));
+  }
+  return 0;
+}
+
 }  // namespace ignis_moe
 
 using namespace ignis_moe;
 
 extern "C" int32_t ignis_moe_experts_prefill(const void *x, uint32_t tokens, const int32_t *ids,
                                              const float *weights, const struct ignis_moe_slot *slots,
-                                             void *workspace, uint32_t max_tokens, int64_t *acc, void *stream) {
-  if (x == nullptr || ids == nullptr || weights == nullptr || slots == nullptr || workspace == nullptr || acc == nullptr) {
+                                             const struct ignis_moe_workspace *workspace, int64_t *acc, void *stream) {
+  if (x == nullptr || ids == nullptr || weights == nullptr || slots == nullptr || acc == nullptr) {
     return fail("ignis_moe_experts_prefill: NULL pointer");
   }
-  if (tokens == 0 || tokens > max_tokens) {
-    return fail("ignis_moe_experts_prefill: tokens must be 1..max_tokens (" + std::to_string(max_tokens) + ")");
+  if (check_workspace("ignis_moe_experts_prefill", workspace) != 0) return -1;
+  if (tokens == 0 || tokens > workspace->prefill_tokens) {
+    return fail("ignis_moe_experts_prefill: tokens must be 1.." + std::to_string(workspace->prefill_tokens) +
+                " (the workspace's prefill_tokens)");
   }
+  if (require_prepared("ignis_moe_experts_prefill", nullptr) != 0) return -1;
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
-  const WorkspaceLayout l = workspace_layout(max_tokens);
-  char *ws = static_cast<char *>(workspace);
+  const WorkspaceLayout l = workspace_layout(workspace->decode_tokens, workspace->prefill_tokens);
+  char *ws = static_cast<char *>(workspace->base);
   uint32_t *hist = reinterpret_cast<uint32_t *>(ws + l.chunk_hist);
   Params p;
   p.x = static_cast<const __nv_bfloat16 *>(x);
@@ -468,14 +484,6 @@ extern "C" int32_t ignis_moe_experts_prefill(const void *x, uint32_t tokens, con
                                            const_cast<int2 *>(p.items));
   group_scatter_kernel<<<chunks, kGroupChunk * kTopK, 0, s>>>(ids, static_cast<int>(tokens), hist, const_cast<int32_t *>(p.sorted));
   if (check_launch("ignis_moe_experts_prefill (grouping)") != 0) return -1;
-
-  static const cudaError_t a1 =
-      cudaFuncSetAttribute(prefill_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmemBytes));
-  static const cudaError_t a2 =
-      cudaFuncSetAttribute(prefill_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmemBytes));
-  if (a1 != cudaSuccess || a2 != cudaSuccess) {
-    return fail(std::string("ignis_moe_experts_prefill: ") + cudaGetErrorString(a1 != cudaSuccess ? a1 : a2));
-  }
   const uint32_t items = max_items(tokens);
   prefill_gate_up_kernel<<<dim3(items, kGateUpBlocks), kThreads, kSmemBytes, s>>>(p);
   if (check_launch("ignis_moe_experts_prefill (gate/up)") != 0) return -1;

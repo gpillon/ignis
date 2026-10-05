@@ -193,8 +193,9 @@ struct Params {
   const float *weights;
   const ignis_moe_slot *slots;
   DecodeCounters *counters;
-  long long *gate_up;  // int64 [unique][8 tokens][1280], fixed point, zero between calls
-  float *h;
+  int cap;             // the workspace's decode tokens: the row stride of gate_up and h
+  long long *gate_up;  // int64 [unique][cap][1280], fixed point, zero between calls
+  float *h;            // f32 [unique][cap][640]
   long long *acc;
 };
 
@@ -203,10 +204,10 @@ __device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int spli
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tokens = p.tokens;
-  const uint32_t *trellis = static_cast<const uint32_t *>(slot.record);
-  const __half *suh = reinterpret_cast<const __half *>(static_cast<const char *>(slot.record) +
-                                                       trellis_bytes(kHidden, kGateUpOut, K2));
-  const __half *svh = suh + kHidden;
+  const RecordPlanes planes = record_planes(slot, kHidden, kGateUpOut, K2);
+  const uint32_t *trellis = planes.trellis;
+  const __half *suh = planes.suh;
+  const __half *svh = planes.svh;
   const int k0 = split * kSplitK;
   constexpr int words = ignis_trellis::tile_words(K2);
   constexpr int tiles_n = kGateUpOut / 16;
@@ -224,7 +225,7 @@ __device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int spli
   const int c = lane & 3;
   if (g < tokens) {
     const float inv = 1.0f / s.scale[g];
-    long long *dst = p.gate_up + (static_cast<size_t>(u) * kDecodeMaxTokens + g) * kGateUpOut + 128 * cb + warp * 16 + 2 * c;
+    long long *dst = p.gate_up + (static_cast<size_t>(u) * p.cap + g) * kGateUpOut + 128 * cb + warp * 16 + 2 * c;
 #pragma unroll
     for (int hf = 0; hf < 2; ++hf) {
       add_fixed(dst + hf * 8, acc[hf][0] * inv);
@@ -244,7 +245,7 @@ __device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int spli
   // Eighth arrival for (u, b): read gate and up back, rotate, scale, SwiGLU; zero what was read.
   __threadfence();
   float(*y)[256] = reinterpret_cast<float(*)[256]>(&s.xh[0][0]);
-  long long *row = p.gate_up + static_cast<size_t>(u) * kDecodeMaxTokens * kGateUpOut;
+  long long *row = p.gate_up + static_cast<size_t>(u) * p.cap * kGateUpOut;
   for (int i = threadIdx.x; i < tokens * 256; i += blockDim.x) {
     const int t = i / 256;
     const int col = i % 256;
@@ -270,7 +271,7 @@ __device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int spli
   for (int i = threadIdx.x; i < tokens * 128; i += blockDim.x) {
     const int t = i / 128;
     const int j = i % 128;
-    p.h[(static_cast<size_t>(u) * kDecodeMaxTokens + t) * kInter + 128 * b + j] = silu(y[t][j]) * y[t][128 + j];
+    p.h[(static_cast<size_t>(u) * p.cap + t) * kInter + 128 * b + j] = silu(y[t][j]) * y[t][128 + j];
   }
   __threadfence();
   __syncthreads();
@@ -286,10 +287,10 @@ __device__ void down_unit(Shared &s, const Params &p, int u, int cb, const ignis
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tokens = p.tokens;
-  const uint32_t *trellis = static_cast<const uint32_t *>(slot.record);
-  const __half *suh = reinterpret_cast<const __half *>(static_cast<const char *>(slot.record) +
-                                                       trellis_bytes(kInter, kHidden, K2));
-  const __half *svh = suh + kInter;
+  const RecordPlanes planes = record_planes(slot, kInter, kHidden, K2);
+  const uint32_t *trellis = planes.trellis;
+  const __half *suh = planes.suh;
+  const __half *svh = planes.svh;
   constexpr int words = ignis_trellis::tile_words(K2);
   constexpr int tiles_n = kHidden / 16;
 
@@ -300,7 +301,7 @@ __device__ void down_unit(Shared &s, const Params &p, int u, int cb, const ignis
     while (ld_acquire(&p.counters->h_ready[u]) < static_cast<uint32_t>(kGateUpBlocks)) __nanosleep(64);
   }
   __syncthreads();
-  const float *h = p.h + static_cast<size_t>(u) * kDecodeMaxTokens * kInter;
+  const float *h = p.h + static_cast<size_t>(u) * p.cap * kInter;
   prepare_a(s, tokens, suh, [&](int t, int k) { return __ldcg(h + static_cast<size_t>(t) * kInter + k); });
   float acc[2][4] = {};
   mma_tiles<K2>(s, tokens, w, acc);
@@ -357,23 +358,13 @@ __global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
       const int cb = ticket / kDecodeSplits % (2 * kGateUpBlocks);
       const int split = ticket % kDecodeSplits;
       const ignis_moe_slot slot = load_slot(p.slots, s.unique_id[u], IGNIS_MOE_PROJ_GATE_UP);
-      switch (slot.k2) {
-      case 4: gate_up_unit<4>(s, p, u, cb, split, slot); break;
-      case 5: gate_up_unit<5>(s, p, u, cb, split, slot); break;
-      case 6: gate_up_unit<6>(s, p, u, cb, split, slot); break;
-      default: gate_up_unit<8>(s, p, u, cb, split, slot); break;
-      }
+      dispatch_k2(slot.k2, [&](auto k2) { gate_up_unit<decltype(k2)::value>(s, p, u, cb, split, slot); });
     } else {
       const int d = ticket - n_gate_up;
       const int u = d / kDownBlocks;
       const int cb = d % kDownBlocks;
       const ignis_moe_slot slot = load_slot(p.slots, s.unique_id[u], IGNIS_MOE_PROJ_DOWN);
-      switch (slot.k2) {
-      case 4: down_unit<4>(s, p, u, cb, slot); break;
-      case 5: down_unit<5>(s, p, u, cb, slot); break;
-      case 6: down_unit<6>(s, p, u, cb, slot); break;
-      default: down_unit<8>(s, p, u, cb, slot); break;
-      }
+      dispatch_k2(slot.k2, [&](auto k2) { down_unit<decltype(k2)::value>(s, p, u, cb, slot); });
     }
     __syncthreads();
     if (threadIdx.x == 0) s.ticket = static_cast<int>(next);
@@ -395,17 +386,37 @@ __global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
 }  // namespace
 }  // namespace ignis_moe
 
-using namespace ignis_moe;
+namespace ignis_moe {
 
-extern "C" uint64_t ignis_moe_workspace_bytes(uint32_t max_tokens) {
-  return workspace_layout(max_tokens).total;
+int32_t prepare_decode(int *grid) {
+  int device = 0, sms = 0, per_sm = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) err = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  if (err == cudaSuccess) err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, experts_decode_kernel, kThreads, 0);
+  if (err != cudaSuccess) return fail(std::string("ignis_moe_prepare (decode): ") + cudaGetErrorString(err));
+  if (per_sm <= 0) return fail("ignis_moe_prepare (decode): the decode kernel fits no CTA on an SM");
+  // Every CTA resident at once when the launch runs alone; the ticket scheme does not need it,
+  // but a grid larger than the card would only queue CTAs behind spinning ones.
+  *grid = sms * per_sm;
+  return 0;
 }
 
-extern "C" int32_t ignis_moe_plan_bytes(uint32_t max_tokens, struct ignis_moe_plan *plan) {
+}  // namespace ignis_moe
+
+using namespace ignis_moe;
+
+extern "C" uint64_t ignis_moe_workspace_bytes(uint32_t decode_tokens, uint32_t prefill_tokens) {
+  return workspace_layout(decode_tokens, prefill_tokens).total;
+}
+
+extern "C" int32_t ignis_moe_plan_bytes(uint32_t decode_tokens, uint32_t prefill_tokens, struct ignis_moe_plan *plan) {
   if (plan == nullptr) return fail("ignis_moe_plan_bytes: plan is NULL");
-  if (max_tokens == 0) return fail("ignis_moe_plan_bytes: max_tokens must be at least 1");
-  const uint64_t t = max_tokens;
-  plan->workspace = align256(workspace_layout(max_tokens).total);
+  if (decode_tokens == 0 || decode_tokens > static_cast<uint32_t>(kDecodeMaxTokens) || prefill_tokens == 0) {
+    return fail("ignis_moe_plan_bytes: decode_tokens must be 1.." + std::to_string(kDecodeMaxTokens) +
+                " and prefill_tokens at least 1");
+  }
+  const uint64_t t = decode_tokens > prefill_tokens ? decode_tokens : prefill_tokens;
+  plan->workspace = align256(workspace_layout(decode_tokens, prefill_tokens).total);
   plan->acc = align256(t * kHidden * 8);
   plan->router = align256(t * kTopK * 4) + align256(t * kTopK * 4) + align256(t * kExperts * 4);
   plan->shared = align256(t * kInter * 2) + align256(t * kHidden * 4);
@@ -413,35 +424,34 @@ extern "C" int32_t ignis_moe_plan_bytes(uint32_t max_tokens, struct ignis_moe_pl
   return 0;
 }
 
-extern "C" int32_t ignis_moe_workspace_init(void *workspace, uint32_t max_tokens, int64_t *acc, void *stream) {
-  if (workspace == nullptr || acc == nullptr) return fail("ignis_moe_workspace_init: NULL pointer");
-  if (max_tokens == 0) return fail("ignis_moe_workspace_init: max_tokens must be at least 1");
+extern "C" int32_t ignis_moe_workspace_init(const struct ignis_moe_workspace *workspace, int64_t *acc, void *stream) {
+  if (check_workspace("ignis_moe_workspace_init", workspace) != 0) return -1;
+  if (acc == nullptr) return fail("ignis_moe_workspace_init: acc is NULL");
+  if (ignis_moe_prepare() != 0) return -1;
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
-  cudaError_t err = cudaMemsetAsync(workspace, 0, workspace_layout(max_tokens).total, s);
-  if (err == cudaSuccess) err = cudaMemsetAsync(acc, 0, static_cast<size_t>(max_tokens) * kHidden * sizeof(int64_t), s);
+  const uint64_t rows = workspace->decode_tokens > workspace->prefill_tokens ? workspace->decode_tokens : workspace->prefill_tokens;
+  cudaError_t err =
+      cudaMemsetAsync(workspace->base, 0, workspace_layout(workspace->decode_tokens, workspace->prefill_tokens).total, s);
+  if (err == cudaSuccess) err = cudaMemsetAsync(acc, 0, rows * kHidden * sizeof(int64_t), s);
   if (err != cudaSuccess) return fail(std::string("ignis_moe_workspace_init: ") + cudaGetErrorString(err));
   return 0;
 }
 
 extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, const int32_t *ids,
                                             const float *weights, const struct ignis_moe_slot *slots,
-                                            void *workspace, int64_t *acc, void *stream) {
-  if (x == nullptr || ids == nullptr || weights == nullptr || slots == nullptr || workspace == nullptr || acc == nullptr) {
+                                            const struct ignis_moe_workspace *workspace, int64_t *acc, void *stream) {
+  if (x == nullptr || ids == nullptr || weights == nullptr || slots == nullptr || acc == nullptr) {
     return fail("ignis_moe_experts_decode: NULL pointer");
   }
-  if (tokens == 0 || tokens > static_cast<uint32_t>(kDecodeMaxTokens)) {
-    return fail("ignis_moe_experts_decode: tokens must be 1.." + std::to_string(kDecodeMaxTokens));
+  if (check_workspace("ignis_moe_experts_decode", workspace) != 0) return -1;
+  if (tokens == 0 || tokens > workspace->decode_tokens) {
+    return fail("ignis_moe_experts_decode: tokens must be 1.." + std::to_string(workspace->decode_tokens) +
+                " (the workspace's decode_tokens)");
   }
-  static int grid = 0;
-  if (grid == 0) {
-    int device = 0, sms = 0, per_sm = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, experts_decode_kernel, kThreads, 0);
-    grid = sms * (per_sm > 0 ? per_sm : 1);
-  }
-  const WorkspaceLayout l = workspace_layout(0);
-  char *ws = static_cast<char *>(workspace);
+  int grid = 0;
+  if (require_prepared("ignis_moe_experts_decode", &grid) != 0) return -1;
+  const WorkspaceLayout l = workspace_layout(workspace->decode_tokens, workspace->prefill_tokens);
+  char *ws = static_cast<char *>(workspace->base);
   Params p;
   p.x = static_cast<const __nv_bfloat16 *>(x);
   p.tokens = static_cast<int>(tokens);
@@ -449,6 +459,7 @@ extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, cons
   p.weights = weights;
   p.slots = slots;
   p.counters = reinterpret_cast<DecodeCounters *>(ws + l.decode_counters);
+  p.cap = static_cast<int>(workspace->decode_tokens);
   p.gate_up = reinterpret_cast<long long *>(ws + l.decode_gate_up);
   p.h = reinterpret_cast<float *>(ws + l.decode_h);
   p.acc = reinterpret_cast<long long *>(acc);

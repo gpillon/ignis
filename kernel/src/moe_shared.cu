@@ -69,6 +69,7 @@ extern "C" int32_t ignis_moe_combine(int64_t *acc, const float *shared, const vo
     return fail("ignis_moe_combine: NULL pointer");
   }
   if (tokens == 0) return fail("ignis_moe_combine: tokens must be at least 1");
+  if (require_prepared("ignis_moe_combine", nullptr) != 0) return -1;
   combine_kernel<<<tokens, kCombineThreads, 0, static_cast<cudaStream_t>(stream)>>>(
       reinterpret_cast<long long *>(acc), shared, static_cast<const __nv_bfloat16 *>(x),
       static_cast<const __nv_bfloat16 *>(w_gate), static_cast<__nv_bfloat16 *>(out));

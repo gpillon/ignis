@@ -18,7 +18,8 @@
  * - Every call enqueues on `stream` (a `cudaStream_t`, NULL for the legacy stream), allocates
  *   nothing, never synchronizes the host, and is capturable in a CUDA graph. Workspaces are
  *   sized by the `*_workspace_bytes` queries from the load's maxima, reserved at load (plan
- *   lines, ADR 0030), and initialized once by `ignis_moe_workspace_init`.
+ *   lines, ADR 0030), and initialized once by `ignis_moe_workspace_init`, which also prepares
+ *   the device (`ignis_moe_prepare`).
  * - Results are deterministic: a fixed input gives the same bits run to run, whatever the
  *   number of CTAs, whichever slot an expert occupies, and whatever order the hardware
  *   completes work in. Nothing depends on the order of floating-point atomics: the routed
@@ -30,6 +31,8 @@
 #define IGNIS_MOE_H
 
 #include <stdint.h>
+
+#include "ignis_fp8_linear.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -90,46 +93,79 @@ int32_t ignis_moe_trellis_reconstruct(const void *trellis, uint32_t k2, uint32_t
 int32_t ignis_moe_router(const void *x, uint32_t tokens, const void *w_router, int32_t *ids,
                          float *weights, float *logits, void *stream);
 
+/* ---- preparation -----------------------------------------------------------------------------
+ * Prepares the current device for every op in this header (and the FP8 linear's): kernel
+ * attributes and launch geometry. Call once per device at load, outside any stream capture.
+ * The ops never configure themselves lazily -- on a device that was not prepared they refuse to
+ * run -- so a first call inside a CUDA graph capture behaves like any other. Thread-safe; a
+ * failure is not remembered, the next call retries. */
+int32_t ignis_moe_prepare(void);
+
+/* ---- workspace -------------------------------------------------------------------------------
+ * One MoE workspace serves both routes: its decode regions are sized for `decode_tokens` (the
+ * load's lane count, 1..IGNIS_MOE_DECODE_MAX_TOKENS) and its prefill regions for
+ * `prefill_tokens` (the load's maximum prefill chunk). The ops take the same description they
+ * were sized with. */
+struct ignis_moe_workspace {
+  void *base;
+  uint32_t decode_tokens;
+  uint32_t prefill_tokens;
+};
+
+/* The bytes `base` must hold (the routed accumulator `acc` is separate, see below). */
+uint64_t ignis_moe_workspace_bytes(uint32_t decode_tokens, uint32_t prefill_tokens);
+
+/* Makes a fresh workspace ready (and zeroes `acc`, int64 [max(decode, prefill)][2560]); enqueued
+ * on `stream`, and prepares the device (ignis_moe_prepare). Call once at load. Every op leaves
+ * the workspace ready for its next call. */
+int32_t ignis_moe_workspace_init(const struct ignis_moe_workspace *workspace, int64_t *acc,
+                                 void *stream);
+
+/* Every device buffer one MoE block needs, as the plan lines the load reserves (ADR 0030); the
+ * expert weights themselves are residency's (spec 03). `max` below is max(decode, prefill). */
+struct ignis_moe_plan {
+  uint64_t workspace;  /* ignis_moe_workspace_bytes(decode_tokens, prefill_tokens) */
+  uint64_t acc;        /* the routed accumulator, int64 [max][2560] */
+  uint64_t router;     /* ids int32 [max][10], weights fp32 [max][10], logits fp32 [max][512] */
+  uint64_t shared;     /* the shared expert's h BF16 [max][640] and output fp32 [max][2560] */
+  uint64_t total;      /* the four lines, each rounded up to 256 bytes */
+};
+int32_t ignis_moe_plan_bytes(uint32_t decode_tokens, uint32_t prefill_tokens,
+                             struct ignis_moe_plan *plan);
+
 /* ---- routed experts ------------------------------------------------------------------------
  * The ten selected experts of every token, weighted by their routing weights and summed into
  * `acc`, an int64 [tokens][2560] fixed-point accumulator with 32 fractional bits: the value of
  * an element is acc * 2^-32. Each expert's contribution is converted exactly (rounded only
  * below 2^-32) and added with integer atomics, so the sum is independent of the order the
- * contributions arrive in. `acc` must be zero on entry (`ignis_moe_workspace_init` zeroes it,
- * `ignis_moe_combine` re-zeroes what it reads).
+ * contributions arrive in.
  *
- * `ids`/`weights` are the router's outputs; `slots` the layer's slot table.
+ * `acc` is state the caller owns: the ops ADD into it. It must be zero on entry --
+ * `ignis_moe_workspace_init` zeroes it and `ignis_moe_combine` re-zeroes the rows it reads -- and
+ * an expert op called twice without a combine between leaves exactly the sum of both calls. A
+ * contribution that is not finite, or too large for the format (|value| >= 2^31), traps the
+ * kernel rather than turning into a finite wrong number.
  *
- * Decode route: 1..IGNIS_MOE_DECODE_MAX_TOKENS tokens in ONE launch for all experts and all
- * four K: gate/up, SwiGLU, down and the weighted accumulation. Prefill route: any number of
- * tokens up to the workspace's maximum chunk; the tokens are grouped by expert on the device
- * and each projection family runs as one launch over all experts; `max_tokens` is the
- * workspace's chunk maximum. */
+ * `ids`/`weights` are the router's outputs; an id outside [0, 512) traps. `slots` is the layer's
+ * slot table.
+ *
+ * Decode route: 1..workspace->decode_tokens tokens in ONE launch for all experts and all four K:
+ * gate/up, SwiGLU, down and the weighted accumulation. Prefill route: 1..prefill_tokens tokens;
+ * they are grouped by expert on the device and each projection family runs as one launch over
+ * all experts. */
 int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, const int32_t *ids,
                                  const float *weights, const struct ignis_moe_slot *slots,
-                                 void *workspace, int64_t *acc, void *stream);
+                                 const struct ignis_moe_workspace *workspace, int64_t *acc,
+                                 void *stream);
 int32_t ignis_moe_experts_prefill(const void *x, uint32_t tokens, const int32_t *ids,
                                   const float *weights, const struct ignis_moe_slot *slots,
-                                  void *workspace, uint32_t max_tokens, int64_t *acc,
+                                  const struct ignis_moe_workspace *workspace, int64_t *acc,
                                   void *stream);
 
-/* ---- FP8 row-scale linear (spec 04's, used by the shared expert) -----------------------------
- * `weight` is an FP8_E4M3FN_ROW_BF16S / row-scale-v1 payload (layout.md §6.1): E4M3FN codes
- * [rows][cols], zero padding to a multiple of 256 bytes, then BF16 scales [rows]; 16-byte
- * aligned. y[t][r] = scale[r] * sum_c e4m3(code[r][c]) * x[t][c], BF16 activations, fp32
- * accumulation. `cols` is a multiple of 64 and `rows` a multiple of 16. `y_f32` selects fp32
- * output (else BF16). Decode-width calls take a GEMV route, wide ones the tensor cores. */
-int32_t ignis_fp8_linear(const void *weight, uint32_t rows, uint32_t cols, const void *x,
-                         uint32_t tokens, void *y, uint32_t y_f32, void *stream);
-
-/* h[t][r] = silu(gate . x_t)[r] * (up . x_t)[r] in BF16, for two FP8 row-scale weights of the
- * same shape. */
-int32_t ignis_fp8_linear_swiglu(const void *gate, const void *up, uint32_t rows, uint32_t cols,
-                                const void *x, uint32_t tokens, void *h, void *stream);
-
 /* ---- shared expert and combine ---------------------------------------------------------------
- * The shared expert's SwiGLU (FP8 gate_proj/up_proj [640][2560], down_proj [2560][640]) into
- * `shared` (fp32 [tokens][2560]); `h` is BF16 [tokens][640] scratch from the workspace plan. */
+ * The shared expert's SwiGLU on the FP8 row-scale linear (ignis_fp8_linear.h; gate_proj and
+ * up_proj [640][2560], down_proj [2560][640]) into `shared` (fp32 [tokens][2560]); `h` is BF16
+ * [tokens][640] scratch from the plan. */
 int32_t ignis_moe_shared_expert(const void *gate, const void *up, const void *down, const void *x,
                                 uint32_t tokens, void *h, float *shared, void *stream);
 
@@ -137,26 +173,6 @@ int32_t ignis_moe_shared_expert(const void *gate, const void *up, const void *do
  * `w_gate` is the BF16 shared_expert_gate [2560]. Zeroes `acc` [tokens][2560] behind it. */
 int32_t ignis_moe_combine(int64_t *acc, const float *shared, const void *x, const void *w_gate,
                           uint32_t tokens, void *out, void *stream);
-
-/* ---- workspace -------------------------------------------------------------------------------
- * The device workspace the routed-expert ops need for chunks of up to `max_tokens` tokens
- * (decode and prefill share it; size it for the larger of the two), excluding `acc`. */
-uint64_t ignis_moe_workspace_bytes(uint32_t max_tokens);
-
-/* Prepares a fresh workspace (and zeroes `acc` [max_tokens][2560]); enqueued on `stream`. Call
- * once at load. The ops leave it ready for their next call. */
-int32_t ignis_moe_workspace_init(void *workspace, uint32_t max_tokens, int64_t *acc, void *stream);
-
-/* Every device buffer one MoE block needs for calls of up to `max_tokens` tokens, as the plan
- * lines the load reserves (ADR 0030); the expert weights themselves are residency's (spec 03). */
-struct ignis_moe_plan {
-  uint64_t workspace;  /* ignis_moe_workspace_bytes(max_tokens) */
-  uint64_t acc;        /* the routed accumulator, int64 [max_tokens][2560] */
-  uint64_t router;     /* ids int32 [max][10], weights fp32 [max][10], logits fp32 [max][512] */
-  uint64_t shared;     /* the shared expert's h BF16 [max][640] and output fp32 [max][2560] */
-  uint64_t total;      /* the four lines, each rounded up to 256 bytes */
-};
-int32_t ignis_moe_plan_bytes(uint32_t max_tokens, struct ignis_moe_plan *plan);
 
 /* Blocks the host until `stream` (NULL: the legacy default stream) has finished its work; for
  * tests and tools that drive the ops directly. */

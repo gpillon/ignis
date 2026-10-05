@@ -44,10 +44,11 @@ constexpr double kRelMax = 1e-2;
 constexpr uint32_t kMaxTokens = 4096;
 
 struct Buffers {
-  DeviceBytes workspace{ignis_moe_workspace_bytes(kMaxTokens)};
+  DeviceBytes workspace{ignis_moe_workspace_bytes(IGNIS_MOE_DECODE_MAX_TOKENS, kMaxTokens)};
   DeviceBytes acc{static_cast<std::size_t>(kMaxTokens) * kH * 8};
+  ignis_moe_workspace ws{workspace.p, IGNIS_MOE_DECODE_MAX_TOKENS, kMaxTokens};
   Buffers() {
-    MOE_RC(ignis_moe_workspace_init(workspace.p, kMaxTokens, acc.as<int64_t>(), nullptr));
+    MOE_RC(ignis_moe_workspace_init(&ws, acc.as<int64_t>(), nullptr));
     MOE_CUDA(cudaDeviceSynchronize());
   }
   void clear_acc(int tokens) {
@@ -121,7 +122,7 @@ struct Call {
 std::vector<int64_t> run_decode(Buffers &b, const ExpertSet &set, const Call &c, int tokens) {
   b.clear_acc(tokens);
   MOE_RC(ignis_moe_experts_decode(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(),
-                                  set.d_slots.as<ignis_moe_slot>(), b.workspace.p, b.acc.as<int64_t>(), nullptr));
+                                  set.d_slots.as<ignis_moe_slot>(), &b.ws, b.acc.as<int64_t>(), nullptr));
   MOE_CUDA(cudaDeviceSynchronize());
   return download<int64_t>(b.acc.p, static_cast<std::size_t>(tokens) * kH);
 }
@@ -154,10 +155,34 @@ void decode_arm(Buffers &b, const ExpertSet &set) {
   }
 }
 
+// The accumulator is the caller's state and the ops add into it: two calls with no combine (and
+// no zeroing) between leave exactly twice one call, bit for bit, on both routes.
+void accumulator_arm(Buffers &b, const ExpertSet &set) {
+  for (bool prefill : {false, true}) {
+    const int tokens = prefill ? 40 : 3;
+    const Call c(tokens, prefill ? 1301 : 1300, prefill);
+    auto call = [&]() {
+      MOE_RC(prefill ? ignis_moe_experts_prefill(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(),
+                                                 set.d_slots.as<ignis_moe_slot>(), &b.ws, b.acc.as<int64_t>(), nullptr)
+                     : ignis_moe_experts_decode(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(),
+                                                set.d_slots.as<ignis_moe_slot>(), &b.ws, b.acc.as<int64_t>(), nullptr));
+      MOE_CUDA(cudaDeviceSynchronize());
+      return download<int64_t>(b.acc.p, static_cast<std::size_t>(tokens) * kH);
+    };
+    b.clear_acc(tokens);
+    const std::vector<int64_t> once = call();
+    std::vector<int64_t> twice = once;
+    for (int64_t &v : twice) v *= 2;
+    check(call() == twice,
+          std::string(prefill ? "prefill" : "decode") + ": a second call without combine adds exactly the first again");
+  }
+  std::printf("  accumulator: a second call without combine adds exactly the first (decode and prefill)\n");
+}
+
 std::vector<int64_t> run_prefill(Buffers &b, const ExpertSet &set, const Call &c, int tokens) {
   b.clear_acc(tokens);
   MOE_RC(ignis_moe_experts_prefill(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(), set.d_slots.as<ignis_moe_slot>(),
-                                   b.workspace.p, kMaxTokens, b.acc.as<int64_t>(), nullptr));
+                                   &b.ws, b.acc.as<int64_t>(), nullptr));
   MOE_CUDA(cudaDeviceSynchronize());
   return download<int64_t>(b.acc.p, static_cast<std::size_t>(tokens) * kH);
 }
@@ -191,10 +216,10 @@ void determinism_arm(Buffers &b, ExpertSet &set) {
       MOE_CUDA(cudaMemsetAsync(b.acc.p, 0, static_cast<std::size_t>(tokens) * kH * 8, stream));
       if (route.prefill) {
         MOE_RC(ignis_moe_experts_prefill(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(), set.d_slots.as<ignis_moe_slot>(),
-                                         b.workspace.p, kMaxTokens, b.acc.as<int64_t>(), stream));
+                                         &b.ws, b.acc.as<int64_t>(), stream));
       } else {
         MOE_RC(ignis_moe_experts_decode(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(), set.d_slots.as<ignis_moe_slot>(),
-                                        b.workspace.p, b.acc.as<int64_t>(), stream));
+                                        &b.ws, b.acc.as<int64_t>(), stream));
       }
     };
     auto result = [&]() { return download<int64_t>(b.acc.p, static_cast<std::size_t>(tokens) * kH); };
@@ -249,6 +274,7 @@ int main() {
   set.place(identity);
   Buffers buffers;
   decode_arm(buffers, set);
+  accumulator_arm(buffers, set);
   prefill_arm(buffers, set);
   determinism_arm(buffers, set);
   if (g_failed != 0) {

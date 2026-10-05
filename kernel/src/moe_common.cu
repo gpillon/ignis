@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <string>
 
 namespace ignis_moe {
@@ -21,6 +22,24 @@ void set_error(const std::string &message) { g_last_error = message; }
 int32_t fail(const std::string &message) {
   set_error(message);
   return -1;
+}
+
+namespace {
+constexpr int kMaxDevices = 64;
+std::atomic<int> g_decode_grid[kMaxDevices];  // 0 until the device is prepared
+}  // namespace
+
+int32_t require_prepared(const char *op, int *decode_grid) {
+  int device = 0;
+  const cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return fail(std::string(op) + ": " + cudaGetErrorString(err));
+  const int grid = device >= 0 && device < kMaxDevices ? g_decode_grid[device].load() : 0;
+  if (grid == 0) {
+    return fail(std::string(op) + ": device " + std::to_string(device) +
+                " is not prepared; call ignis_moe_prepare (or ignis_moe_workspace_init) at load");
+  }
+  if (decode_grid != nullptr) *decode_grid = grid;
+  return 0;
 }
 
 int32_t check_launch(const char *op) {
@@ -69,9 +88,7 @@ using namespace ignis_moe;
 
 extern "C" int32_t ignis_moe_record_bytes(uint32_t projection, uint32_t k2, uint64_t *bytes) {
   if (bytes == nullptr) return fail("ignis_moe_record_bytes: bytes is NULL");
-  if (k2 != 4 && k2 != 5 && k2 != 6 && k2 != 8) {
-    return fail("ignis_moe_record_bytes: k2 must be 4, 5, 6 or 8");
-  }
+  if (!valid_k2(k2)) return fail("ignis_moe_record_bytes: k2 must be 4, 5, 6 or 8");
   uint64_t in = 0, out = 0;
   if (projection == IGNIS_MOE_PROJ_GATE_UP) {
     in = kHidden;
@@ -92,9 +109,7 @@ extern "C" int32_t ignis_moe_trellis_reconstruct(const void *trellis, uint32_t k
   if (trellis == nullptr || w_f16 == nullptr) {
     return fail("ignis_moe_trellis_reconstruct: NULL pointer");
   }
-  if (k2 != 4 && k2 != 5 && k2 != 6 && k2 != 8) {
-    return fail("ignis_moe_trellis_reconstruct: k2 must be 4, 5, 6 or 8");
-  }
+  if (!valid_k2(k2)) return fail("ignis_moe_trellis_reconstruct: k2 must be 4, 5, 6 or 8");
   if (in == 0 || out == 0 || in % 16 != 0 || out % 16 != 0) {
     return fail("ignis_moe_trellis_reconstruct: in and out must be positive multiples of 16");
   }
@@ -116,6 +131,19 @@ extern "C" int32_t ignis_moe_trellis_reconstruct(const void *trellis, uint32_t k
   default: trellis_reconstruct_kernel<8><<<grid, warps_per_block * 32, 0, s>>>(t, tk, tn, w); break;
   }
   return check_launch("ignis_moe_trellis_reconstruct");
+}
+
+extern "C" int32_t ignis_moe_prepare(void) {
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return fail(std::string("ignis_moe_prepare: ") + cudaGetErrorString(err));
+  if (device < 0 || device >= kMaxDevices) return fail("ignis_moe_prepare: device id out of range");
+  int grid = 0;
+  if (ignis_fp8_linear_prepare() != 0 || prepare_router() != 0 || prepare_prefill() != 0 || prepare_decode(&grid) != 0) {
+    return -1;
+  }
+  g_decode_grid[device].store(grid);
+  return 0;
 }
 
 extern "C" int32_t ignis_moe_stream_sync(void *stream) {

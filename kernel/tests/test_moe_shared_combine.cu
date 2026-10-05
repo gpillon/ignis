@@ -129,6 +129,7 @@ void combine_arm(int tokens) {
 int main() {
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
+  MOE_RC(ignis_moe_prepare());
   std::printf("shared expert (FP8 SwiGLU, sigmoid gate) and combine\n");
   for (int tokens : {1, 3, 300}) shared_arm(tokens);
   for (int tokens : {1, 3, 4096}) combine_arm(tokens);
