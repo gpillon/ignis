@@ -298,6 +298,21 @@ impl NgramTable {
         self.begin_rows(&rows)
     }
 
+    /// Hash a step's tokens for several sequences at once, `lanes[l]`
+    /// continuing with `tokens[l]`, and start fetching their rows in one plan,
+    /// lane-major: the order of a call's `Batch` rows (a decode step: one
+    /// token per lane).
+    pub fn begin_batch(&self, lanes: &mut [&mut NgramContext], tokens: &[&[u32]]) -> Result<PendingRows<'_>, String> {
+        if lanes.len() != tokens.len() {
+            return Err(format!("{} sequences for {} token runs", lanes.len(), tokens.len()));
+        }
+        let mut rows = Vec::with_capacity(tokens.iter().map(|t| t.len()).sum::<usize>() * self.hasher.heads());
+        for (context, run) in lanes.iter_mut().zip(tokens) {
+            self.hasher.hash(context, run, &mut rows);
+        }
+        self.begin_rows(&rows)
+    }
+
     /// Start fetching table rows `rows` (any order, repeats allowed).
     pub fn begin_rows(&self, rows: &[u64]) -> Result<PendingRows<'_>, String> {
         let plan = plan_gather(rows, &self.hot, &self.layout, self.policy)?;
@@ -549,6 +564,37 @@ mod tests {
         let mut ids = Vec::new();
         table.hasher().hash(&mut table.new_context(), &tokens, &mut ids);
         assert_eq!(whole, expected(&ids));
+    }
+
+    #[test]
+    fn a_decode_step_stages_every_lanes_token_lane_major() {
+        let table_file = TableFile::write("lanes", 1_000, 4096);
+        let table = NgramTable::open(&table_file.path, table_file.layout, hasher(1_000), &[5, 50], options(1 << 16)).unwrap();
+        let prompts: [&[u32]; 3] = [&[1, 2, 3], &[9, 7], &[4]];
+        let next = [21u32, 22, 23];
+        // Each sequence alone: its prompt, then its next token.
+        let mut alone = Vec::new();
+        for (prompt, &token) in prompts.iter().zip(&next) {
+            let mut context = table.new_context();
+            let mut out = vec![0u8; prompt.len() * table.token_bytes()];
+            table.stage(&mut context, prompt, &mut out).unwrap();
+            let mut step = vec![0u8; table.token_bytes()];
+            table.stage(&mut context, &[token], &mut step).unwrap();
+            alone.push(step);
+        }
+        // The three prompts admitted, then one decode step for all lanes.
+        let mut contexts: Vec<NgramContext> = (0..3).map(|_| table.new_context()).collect();
+        for (context, prompt) in contexts.iter_mut().zip(prompts) {
+            let mut out = vec![0u8; prompt.len() * table.token_bytes()];
+            table.stage(context, prompt, &mut out).unwrap();
+        }
+        let mut lanes: Vec<&mut NgramContext> = contexts.iter_mut().collect();
+        let steps: Vec<&[u32]> = next.iter().map(std::slice::from_ref).collect();
+        let pending = table.begin_batch(&mut lanes, &steps).unwrap();
+        assert_eq!(pending.rows(), 3 * 2);
+        let mut batch = vec![0u8; 3 * table.token_bytes()];
+        pending.finish(&mut batch).unwrap();
+        assert_eq!(batch, alone.concat());
     }
 
     #[test]
