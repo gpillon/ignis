@@ -35,6 +35,31 @@ GitHub, not open questions.
   transformers modeling code at the ticket's start; they are checks, not open
   decisions.
 
+## Departures (2026-10-05, implementation)
+
+Found while building the leaf side (#303); the coordinator may veto.
+
+- **The n-gram id context is stored, 8 bytes of it.** Story 17 and "The
+  n-gram embedding across a claim" say no id context is stored, because a
+  claim's first tokens can be hashed from the prompt's own preceding tokens.
+  That holds for a claim, but the leaf's seam hands a claim no preceding
+  tokens, and a live sequence evicted to KV-RAM and restored has no prompt
+  to hash from at all. So the leaf keeps each sequence's context (its last
+  two token ids) beside its pool state: a prefix and a checkpoint keep the
+  context at their end, and every blob carries it in a 256-byte block before
+  the pool's bytes. The content match still guarantees it equals what the
+  prompt would give; the claim's bit-exactness test checks it.
+- **The indexer tail is an image section, not part of a KV tail page** (the
+  section table above already says so): only complete blocks' keys ride the
+  pages.
+- **The KV-RAM arena is the model instance's own** (`HostArena`, the same
+  first-fit pinned region as the 27B's process-wide one), created at load and
+  freed when its last blob and the leaf have gone; the 27B keeps the
+  process-wide arena unchanged.
+- **Retained pages are pool lines.** The pool holds one KV page per retained
+  slot beside every lane's whole context, as the 27B's (a checkpoint keeps the
+  page its opener ends inside).
+
 ## Problem Statement
 
 On Flash-Next a prefill is bound by PCIe, not by compute. Every chunk streams
