@@ -21,8 +21,10 @@
  *
  * One departure in *when*, not *what*: the policy releases a layer's staged projections at the
  * end of its step; here the release (their table entries back to ABSENT) happens at the start of
- * the next step, because the expert op reads them after `ignis_residency_step` returns. The
- * released keys belong to another layer than the next step's, so no outcome differs.
+ * the next step, because the expert op reads them after `ignis_residency_step` returns. When the
+ * next step is another layer, the released keys are not its own; when it is the same layer (a
+ * forward restarted at that layer), the step treats them as released before it classifies, as
+ * the policy would. No outcome differs either way.
  *
  * Slot-table rule: a projection that is neither resident nor staged for its layer has the entry
  * `{NULL, 0}` (ignis_moe.h's ABSENT): at creation, after an eviction (written in the same step
@@ -33,8 +35,12 @@
  * model (no process-wide state; phase 2's model switch is a reload). A step allocates nothing,
  * never synchronizes the host and is capturable in a CUDA graph: the resolve kernel and the
  * demand copy run on the caller's stream; prefetch copies run on a stream residency owns,
- * forked from the caller's stream after the resolve and joined back at the start of the next
- * step (or by `ignis_residency_join`, which a graph capture must call before it ends).
+ * forked from the caller's stream after the demand copy and joined back at the start of the
+ * next step. A step with a lookahead therefore leaves a fork open until the next step, so call
+ * `ignis_residency_join` on the stream (a) before beginning a capture, (b) before ending a
+ * capture that stops after such a step, and (c) before launching a captured graph after eager
+ * steps. A full forward needs none of it: its last layer has no lookahead and joins the one
+ * before.
  *
  * Return 0 on success, -1 on a refused argument or a CUDA error; the reason is in
  * `ignis_residency_last_error()`.
@@ -65,7 +71,8 @@ struct ignis_residency_desc {
   uint32_t max_tokens;          /* most tokens a step serves: decode lanes or the prefill chunk */
   uint32_t lookahead_width;     /* W: experts taken from each lookahead row; 0 = none */
   uint64_t prefetch_budget_bytes; /* per decode step, or IGNIS_RESIDENCY_NO_BUDGET */
-  uint64_t staging_half_bytes;  /* one half of the prefill staging ring (the heaviest layer) */
+  uint64_t staging_half_bytes;  /* one half of the prefill staging ring (>= the heaviest layer;
+                                 * a multiple of 16) */
   uint64_t host_pool_bytes;     /* the pinned expert pool */
   uint32_t copy_blocks;         /* the copy kernel's grid; 0 = 16 */
   uint32_t report;              /* 1: keep each step's outcome for ignis_residency_last_report */
@@ -128,8 +135,8 @@ int32_t ignis_residency_step_ranked(struct ignis_residency *r, uint32_t layer, u
                                     const int32_t *ids, uint32_t tokens, const int32_t *lookahead,
                                     uint32_t rows, uint32_t stride, void *stream);
 
-/* Joins the prefetch copies of the last step into `stream`. Steps do it themselves at their
- * start; a graph capture calls it before ending the capture. */
+/* Joins the prefetch copies of the last step into `stream` (see the capture rules above).
+ * Steps do it themselves at their start. */
 int32_t ignis_residency_join(struct ignis_residency *r, void *stream);
 
 /* What residency counted since creation, 1:1 with crates/core's ResidencyCounters; `[class]
@@ -144,7 +151,8 @@ struct ignis_residency_counters {
 };
 int32_t ignis_residency_read_counters(struct ignis_residency *r, struct ignis_residency_counters *out);
 
-/* The last step's outcome (needs `report` at creation; tests). `status` is 0, 1 + the class a
+/* The outcome of the last step of `layer` (needs `report` at creation; tests: a captured round
+ * leaves one per layer). `status` is 0, 1 + the class a
  * decode step was refused for (its misses outnumber the class's free and unpinned slots; the
  * step changed nothing, so its missing projections stay ABSENT and an expert op run on it
  * traps), or
@@ -162,8 +170,9 @@ struct ignis_residency_report {
   uint32_t reserved;
   uint64_t bytes_moved;
 };
-int32_t ignis_residency_last_report(struct ignis_residency *r, struct ignis_residency_report *head,
-                                    uint32_t *entries, uint32_t capacity);
+int32_t ignis_residency_last_report(struct ignis_residency *r, uint32_t layer,
+                                    struct ignis_residency_report *head, uint32_t *entries,
+                                    uint32_t capacity);
 
 /* Where the pools and the ring sit (tests: every non-ABSENT entry must point inside them). */
 struct ignis_residency_layout {

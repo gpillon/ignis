@@ -42,6 +42,7 @@ constexpr uint32_t kClasses = IGNIS_RESIDENCY_CLASSES;
 constexpr uint32_t kTopK = IGNIS_MOE_TOP_K;
 constexpr uint32_t kThreads = 1024;
 constexpr uint32_t kMaxKeysPerLayer = 2 * IGNIS_MOE_EXPERTS;  // one thread per key
+static_assert(kMaxKeysPerLayer <= kThreads, "the resolve classifies one key per thread");
 constexpr uint32_t kNone = 0xFFFFFFFFu;
 constexpr uint32_t kKeyBits = 20;  // keys and slot indices fit below 2^20
 constexpr unsigned long long kNoSlot = ~0ull;
@@ -83,6 +84,10 @@ struct State {
   uint32_t half_count[2];
   uint32_t n_demand;
   uint32_t n_prefetch;
+  // The layer of the last committed step, or kNone: a ring half tagged with the current layer
+  // holds this step's lookahead only when the last step was another layer; after a step of the
+  // same layer (a restarted forward) it holds that step's own, released, entries.
+  uint32_t last_layer;
 };
 
 // Everything the kernels read, by value.
@@ -108,8 +113,8 @@ struct Dev {
   Job *demand;               // [experts * 2]
   Job *prefetch;             // [experts * 2]
   Counters *counters;
-  Report *report;            // NULL without a report
-  uint32_t *report_entries;  // [kLists][4 * experts]
+  Report *report;            // [layers], NULL without a report
+  uint32_t *report_entries;  // [layers][kLists][4 * experts]
 };
 
 
@@ -162,8 +167,9 @@ __device__ int32_t find_slot(const Dev &d, uint32_t c, unsigned long long now, b
   return d.slot_of[best & ((1u << kKeyBits) - 1)];
 }
 
-__device__ void report_push(const Dev &d, uint32_t list, uint32_t *count, uint32_t entry) {
-  if (d.report_entries != nullptr) d.report_entries[list * 4 * d.experts + *count] = entry;
+__device__ void report_push(const Dev &d, uint32_t *entries, uint32_t list, uint32_t *count,
+                            uint32_t entry) {
+  if (entries != nullptr) entries[list * 4 * d.experts + *count] = entry;
   ++*count;
 }
 
@@ -171,7 +177,7 @@ __device__ void report_push(const Dev &d, uint32_t list, uint32_t *count, uint32
 // slot table, queues the copy.
 __device__ void place(const Dev &d, uint32_t key, uint32_t c, int32_t slot,
                       unsigned long long now, bool prefetched, Job *jobs, uint32_t *n_jobs,
-                      uint32_t *count) {
+                      uint32_t *entries, uint32_t *count) {
   const uint32_t old = d.owner[c][slot];
   if (old == kNone) {
     ++d.st->used[c];
@@ -179,7 +185,7 @@ __device__ void place(const Dev &d, uint32_t key, uint32_t c, int32_t slot,
     d.slot_of[old] = -1;
     d.flags[old] = 0;
     d.table[old] = ignis_moe_slot{nullptr, 0, 0};
-    report_push(d, kEvictions, &count[kEvictions], old);
+    report_push(d, entries, kEvictions, &count[kEvictions], old);
   }
   d.owner[c][slot] = key;
   d.stamp[c][slot] = now;
@@ -225,6 +231,10 @@ __global__ void __launch_bounds__(kThreads)
   const bool decode = phase == IGNIS_RESIDENCY_DECODE;
   const bool look = lookahead != nullptr && layer + 1 < d.layers && d.width > 0;
   State *st = d.st;
+  Report *report = d.report != nullptr ? d.report + layer : nullptr;
+  uint32_t *entries =
+      d.report_entries != nullptr ? d.report_entries + layer * kLists * 4 * d.experts : nullptr;
+  const bool repeat = st->last_layer == layer;
 
   if (t < IGNIS_MOE_EXPERTS / 32) s_sel[t] = 0;
   if (t < IGNIS_MOE_EXPERTS) s_pos[t] = kNone;
@@ -259,10 +269,10 @@ __global__ void __launch_bounds__(kThreads)
   }
   __syncthreads();
   if (s_status != 0) {
-    if (t == 0 && d.report != nullptr) {
-      d.report->status = s_status;
-      for (uint32_t l = 0; l < kLists; ++l) d.report->count[l] = 0;
-      d.report->bytes_moved = 0;
+    if (t == 0 && report != nullptr) {
+      report->status = s_status;
+      for (uint32_t l = 0; l < kLists; ++l) report->count[l] = 0;
+      report->bytes_moved = 0;
     }
     if (t == 0) st->n_demand = st->n_prefetch = 0;
     return;
@@ -277,7 +287,8 @@ __global__ void __launch_bounds__(kThreads)
     if (selected) {
       c = d.cls[key];
       resident = d.slot_of[key] >= 0;
-      staged = !resident && (d.flags[key] & kStaged) && st->half_layer[layer & 1] == layer;
+      staged = !resident && !repeat && (d.flags[key] & kStaged) &&
+               st->half_layer[layer & 1] == layer;
       if (resident) atomicAdd(&s_pinned[c], 1u);
       if (!resident && !staged) atomicAdd(&s_need[c], 1u);
     }
@@ -297,20 +308,21 @@ __global__ void __launch_bounds__(kThreads)
   }
   __syncthreads();
   if (s_status != 0) {
-    if (t == 0 && d.report != nullptr) {
-      d.report->status = s_status;
-      for (uint32_t l = 0; l < kLists; ++l) d.report->count[l] = 0;
-      d.report->bytes_moved = 0;
+    if (t == 0 && report != nullptr) {
+      report->status = s_status;
+      for (uint32_t l = 0; l < kLists; ++l) report->count[l] = 0;
+      report->bytes_moved = 0;
     }
     if (t == 0) st->n_demand = st->n_prefetch = 0;
     return;
   }
 
-  // 4. Committed: the clock, and the ring halves staged for any other layer are released.
+  // 4. Committed: the clock, and the ring halves staged for any other layer -- or, after a step
+  //    of this same layer, for this one too -- are released.
   const unsigned long long now = st->clock + 1;
   for (uint32_t h = 0; h < 2; ++h) {
     const uint32_t tag = st->half_layer[h];
-    if (tag != kNone && tag != layer) {
+    if (tag != kNone && (tag != layer || repeat)) {
       for (uint32_t i = t; i < st->half_count[h]; i += blockDim.x) {
         const uint32_t k = d.half_keys[h * nk + i];
         d.table[k] = ignis_moe_slot{nullptr, 0, 0};
@@ -321,8 +333,9 @@ __global__ void __launch_bounds__(kThreads)
   __syncthreads();
   if (t == 0) {
     st->clock = now;
+    st->last_layer = layer;
     for (uint32_t h = 0; h < 2; ++h) {
-      if (st->half_layer[h] != kNone && st->half_layer[h] != layer) {
+      if (st->half_layer[h] != kNone && (st->half_layer[h] != layer || repeat)) {
         st->half_layer[h] = kNone;
         st->half_count[h] = 0;
         st->half_fill[h] = 0;
@@ -348,10 +361,10 @@ __global__ void __launch_bounds__(kThreads)
   uint32_t pos_hit, pos_pf, pos_miss, total;
   BlockScan(s_scan).ExclusiveSum(hit ? 1u : 0u, pos_hit, total);
   __syncthreads();
-  if (hit && d.report_entries) d.report_entries[kHits * 2 * nk + pos_hit] = key;
+  if (hit && entries) entries[kHits * 2 * nk + pos_hit] = key;
   BlockScan(s_scan).ExclusiveSum(prefetch_hit ? 1u : 0u, pos_pf, total);
   __syncthreads();
-  if (prefetch_hit && d.report_entries) d.report_entries[kPrefetchHits * 2 * nk + pos_pf] = key;
+  if (prefetch_hit && entries) entries[kPrefetchHits * 2 * nk + pos_pf] = key;
   BlockScan(s_scan).ExclusiveSum(miss ? 1u : 0u, pos_miss, total);
   __syncthreads();
   if (miss) s_list[pos_miss] = key;
@@ -374,11 +387,11 @@ __global__ void __launch_bounds__(kThreads)
     if (t == 0) {
       const unsigned long long bytes = d.record_bytes[mc];
       if (slot >= 0) {
-        place(d, k, mc, slot, now, false, d.demand, &n_demand, count);
-        report_push(d, kMisses, &count[kMisses], k);
+        place(d, k, mc, slot, now, false, d.demand, &n_demand, entries, count);
+        report_push(d, entries, kMisses, &count[kMisses], k);
       } else {
         stage(d, k, layer & 1, layer, d.demand, &n_demand);
-        report_push(d, kMisses, &count[kMisses], k | IGNIS_RESIDENCY_STAGING_BIT);
+        report_push(d, entries, kMisses, &count[kMisses], k | IGNIS_RESIDENCY_STAGING_BIT);
       }
       atomicAdd(&d.counters->misses[mc][phase], 1ull);
       moved += bytes;
@@ -406,7 +419,7 @@ __global__ void __launch_bounds__(kThreads)
       const uint32_t kc = d.cls[k];
       const unsigned long long bytes = d.record_bytes[kc];
       if (decode && d.budget != IGNIS_RESIDENCY_NO_BUDGET && spent + bytes > d.budget) {
-        if (t == 0) report_push(d, kDropped, &count[kDropped], k);
+        if (t == 0) report_push(d, entries, kDropped, &count[kDropped], k);
         __syncthreads();
         continue;
       }
@@ -415,13 +428,13 @@ __global__ void __launch_bounds__(kThreads)
       if (decode || room) slot = find_slot(d, kc, now, decode, s_scratch);
       if (t == 0) {
         if (slot >= 0) {
-          place(d, k, kc, slot, now, true, d.prefetch, &n_prefetch, count);
-          report_push(d, kPrefetches, &count[kPrefetches], k);
+          place(d, k, kc, slot, now, true, d.prefetch, &n_prefetch, entries, count);
+          report_push(d, entries, kPrefetches, &count[kPrefetches], k);
         } else if (!decode) {
           stage(d, k, (layer + 1) & 1, layer + 1, d.prefetch, &n_prefetch);
-          report_push(d, kPrefetches, &count[kPrefetches], k | IGNIS_RESIDENCY_STAGING_BIT);
+          report_push(d, entries, kPrefetches, &count[kPrefetches], k | IGNIS_RESIDENCY_STAGING_BIT);
         } else {
-          report_push(d, kDropped, &count[kDropped], k);
+          report_push(d, entries, kDropped, &count[kDropped], k);
         }
         if (slot >= 0 || !decode) {
           ++d.counters->prefetch_issued;
@@ -440,13 +453,13 @@ __global__ void __launch_bounds__(kThreads)
     d.counters->bytes_moved[phase] += moved;
     st->n_demand = n_demand;
     st->n_prefetch = n_prefetch;
-    if (d.report != nullptr) {
-      d.report->status = 0;
+    if (report != nullptr) {
+      report->status = 0;
       count[kHits] = 0;
       count[kPrefetchHits] = s_prefetch_hits;
       for (uint32_t k = 0; k < kClasses; ++k) count[kHits] += s_hits[k];
-      for (uint32_t l = 0; l < kLists; ++l) d.report->count[l] = count[l];
-      d.report->bytes_moved = moved;
+      for (uint32_t l = 0; l < kLists; ++l) report->count[l] = count[l];
+      report->bytes_moved = moved;
     }
   }
 }
@@ -539,8 +552,8 @@ Carve carve(const ignis_residency_desc &d) {
   c.demand = take(2ull * d.experts * sizeof(Job));
   c.prefetch = take(2ull * d.experts * sizeof(Job));
   c.counters = take(sizeof(Counters));
-  c.report = take(d.report ? sizeof(Report) : 0);
-  c.report_entries = take(d.report ? static_cast<uint64_t>(kLists) * 4 * d.experts * 4 : 0);
+  c.report = take(d.report ? sizeof(Report) * d.layers : 0);
+  c.report_entries = take(d.report ? static_cast<uint64_t>(d.layers) * kLists * 4 * d.experts * 4 : 0);
   c.ranked = take(static_cast<uint64_t>(d.max_tokens) * d.lookahead_width * 4);
   c.total = at;
   return c;
@@ -562,6 +575,9 @@ int32_t check_desc(const ignis_residency_desc *d) {
     }
   }
   if (d->max_tokens == 0) return fail("residency: max_tokens must be at least 1");
+  if (d->staging_half_bytes % 16 != 0) {
+    return fail("residency: staging_half_bytes must be a multiple of 16 (the copies store 16-byte units)");
+  }
   if (d->lookahead_width > IGNIS_MOE_EXPERTS) return fail("residency: lookahead_width exceeds the experts");
   if (d->copy_blocks > 1024) return fail("residency: copy_blocks must be at most 1024");
   return 0;
@@ -684,6 +700,7 @@ int32_t ignis_residency_create(const ignis_residency_desc *desc, const uint8_t *
   }
   State state{};
   state.half_layer[0] = state.half_layer[1] = kNone;
+  state.last_layer = kNone;
   std::memcpy(image.data() + r->layout.state, &state, sizeof(State));
   e = cudaMemcpy(r->tables, image.data(), image.size(), cudaMemcpyHostToDevice);
   if (e != cudaSuccess) return cleanup(fail(std::string("residency: initializing the tables: ") + cudaGetErrorString(e)));
@@ -873,21 +890,23 @@ int32_t ignis_residency_read_counters(ignis_residency *r, ignis_residency_counte
   return 0;
 }
 
-int32_t ignis_residency_last_report(ignis_residency *r, ignis_residency_report *head,
-                                    uint32_t *entries, uint32_t capacity) {
+int32_t ignis_residency_last_report(ignis_residency *r, uint32_t layer,
+                                    ignis_residency_report *head, uint32_t *entries,
+                                    uint32_t capacity) {
   if (r == nullptr || head == nullptr) return fail("residency: report arguments");
   if (r->dev.report == nullptr) return fail("residency: created without a report");
+  if (layer >= r->desc.layers) return fail("residency: no such layer");
   RESIDENCY_CUDA(cudaDeviceSynchronize());
-  RESIDENCY_CUDA(cudaMemcpy(head, r->dev.report, sizeof(*head), cudaMemcpyDeviceToHost));
+  RESIDENCY_CUDA(cudaMemcpy(head, r->dev.report + layer, sizeof(*head), cudaMemcpyDeviceToHost));
   if (head->status != 0) return 0;
   const uint64_t stride = 4ull * r->desc.experts;
+  const uint32_t *base = r->dev.report_entries + static_cast<uint64_t>(layer) * kLists * stride;
   for (uint32_t l = 0; l < kLists; ++l) {
     if (head->count[l] > capacity) return fail("residency: a report list is longer than the capacity given");
     if (head->count[l] > 0 && entries == nullptr) return fail("residency: no entries buffer");
     if (head->count[l] > 0) {
-      RESIDENCY_CUDA(cudaMemcpy(entries + static_cast<uint64_t>(l) * capacity,
-                                r->dev.report_entries + l * stride, head->count[l] * 4ull,
-                                cudaMemcpyDeviceToHost));
+      RESIDENCY_CUDA(cudaMemcpy(entries + static_cast<uint64_t>(l) * capacity, base + l * stride,
+                                head->count[l] * 4ull, cudaMemcpyDeviceToHost));
     }
   }
   return 0;

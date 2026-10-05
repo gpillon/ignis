@@ -12,8 +12,10 @@
 //     or into the staging ring, no two entries share a slot, an evicted projection is ABSENT,
 //     and a staged projection is ABSENT again once a step of another layer has run;
 //   - at the end, the counters add up to the trace.
-// `graph` runs the decode steps through CUDA graphs captured once per step shape and replayed
-// with new ids in the same buffers: decode residency is graph-capturable (spec acceptance 3).
+// `graph` runs every whole decode round (all layers in order, one token count) as one CUDA graph,
+// captured once per token count and replayed with new ids in the same buffers: decode residency
+// is graph-capturable across the layer steps of a round (spec acceptance 3); the rest runs
+// eagerly. Each layer's outcome is read from its own report.
 // Same no-SKIP_RETURN_CODE rule as every GPU test here (ADR 0006).
 
 #include "ignis_residency.h"
@@ -182,10 +184,9 @@ uint8_t pattern(uint32_t key, uint64_t i) {
   return static_cast<uint8_t>((key * 2654435761u + i * 40503u) >> 13);
 }
 
-// The per-shape buffers and graph of the graph mode.
-struct Shape {
-  int32_t *ids = nullptr;
-  int32_t *lookahead = nullptr;
+// A decode round captured as one CUDA graph: per layer, the ids and lookahead buffers it reads.
+struct Round {
+  std::vector<int32_t *> ids, lookahead;
   cudaGraphExec_t exec = nullptr;
 };
 
@@ -234,7 +235,7 @@ int main(int argc, char **argv) {
               f.layers, f.experts, static_cast<unsigned>(f.steps.size()),
               static_cast<unsigned long long>(plan.total), static_cast<unsigned long long>(plan.pools),
               static_cast<unsigned long long>(plan.staging), static_cast<unsigned long long>(plan.tables),
-              graph_mode ? ", decode steps as CUDA graphs" : "");
+              graph_mode ? ", whole decode rounds as CUDA graphs" : "");
 
   ignis_residency *r = nullptr;
   RES_OK(ignis_residency_create(&desc, f.k2.data(), offsets.data(), &r));
@@ -253,7 +254,7 @@ int main(int argc, char **argv) {
   int32_t *d_ids = nullptr, *d_look = nullptr;
   CUDA_OK(cudaMalloc(&d_ids, static_cast<size_t>(max_rows) * f.top_k * 4));
   CUDA_OK(cudaMalloc(&d_look, static_cast<size_t>(max_rows) * std::max(f.width, 1u) * 4));
-  std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Shape> shapes;  // (layer, tokens, rows)
+  std::map<uint32_t, Round> rounds;  // by token count
 
   const uint32_t capacity = 4 * f.experts;
   std::vector<uint32_t> entries(static_cast<size_t>(IGNIS_RESIDENCY_LISTS) * capacity);
@@ -261,60 +262,20 @@ int main(int argc, char **argv) {
   std::vector<uint8_t> record;
   std::vector<uint32_t> staged_prev;  // keys staged by the previous step
   uint32_t prev_layer = UINT32_MAX;
-  uint64_t total_bytes = 0, total_prefetch_hits = 0;
-  uint32_t graph_replays = 0;
+  uint64_t total_bytes = 0, total_prefetch_hits = 0, total_prefetches = 0;
+  uint64_t want_hits[8][2] = {}, want_misses[8][2] = {};
+  uint32_t graph_rounds = 0;
 
-  for (size_t si = 0; si < f.steps.size(); ++si) {
+  // One step's outcome against the model's.
+  auto compare = [&](size_t si) {
     const Step &s = f.steps[si];
     const std::string at = "step " + std::to_string(si) + " (layer " + std::to_string(s.layer) +
                            (s.phase ? ", prefill" : ", decode") + ")";
-    const bool has_look = s.rows > 0;
-    const bool as_graph = graph_mode && s.phase == IGNIS_RESIDENCY_DECODE;
-    if (as_graph) {
-      const auto shape_key = std::make_tuple(s.layer, s.tokens, s.rows);
-      Shape &shape = shapes[shape_key];
-      if (shape.exec == nullptr) {
-        CUDA_OK(cudaMalloc(&shape.ids, s.ids.size() * 4));
-        if (has_look) CUDA_OK(cudaMalloc(&shape.lookahead, s.lookahead.size() * 4));
-        RES_OK(ignis_residency_join(r, stream));  // nothing outstanding enters the capture
-        cudaGraph_t g = nullptr;
-        CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        RES_OK(ignis_residency_step_ranked(r, s.layer, s.phase, shape.ids, s.tokens,
-                                           has_look ? shape.lookahead : nullptr, s.rows, s.stride,
-                                           stream));
-        RES_OK(ignis_residency_join(r, stream));
-        CUDA_OK(cudaStreamEndCapture(stream, &g));
-        CUDA_OK(cudaGraphInstantiate(&shape.exec, g, 0));
-        CUDA_OK(cudaGraphDestroy(g));
-      } else {
-        ++graph_replays;
-      }
-      RES_OK(ignis_residency_join(r, stream));
-      CUDA_OK(cudaMemcpyAsync(shape.ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
-      if (has_look) {
-        CUDA_OK(cudaMemcpyAsync(shape.lookahead, s.lookahead.data(), s.lookahead.size() * 4,
-                                cudaMemcpyHostToDevice, stream));
-      }
-      CUDA_OK(cudaGraphLaunch(shape.exec, stream));
-    } else {
-      CUDA_OK(cudaMemcpyAsync(d_ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
-      if (has_look) {
-        CUDA_OK(cudaMemcpyAsync(d_look, s.lookahead.data(), s.lookahead.size() * 4,
-                                cudaMemcpyHostToDevice, stream));
-      }
-      RES_OK(ignis_residency_step_ranked(r, s.layer, s.phase, d_ids, s.tokens,
-                                         has_look ? d_look : nullptr, s.rows, s.stride, stream));
-    }
-    CUDA_OK(cudaStreamSynchronize(stream));
-    RES_OK(ignis_residency_join(r, stream));
-    CUDA_OK(cudaStreamSynchronize(stream));
-
     ignis_residency_report head{};
-    RES_OK(ignis_residency_last_report(r, &head, entries.data(), capacity));
+    RES_OK(ignis_residency_last_report(r, s.layer, &head, entries.data(), capacity));
     check(head.status == s.expect.status,
           at + ": status " + std::to_string(head.status) + ", the model " + std::to_string(s.expect.status));
-    if (head.status != 0 || s.expect.status != 0) continue;
-
+    if (head.status != 0 || s.expect.status != 0) return;
     static const char *kNames[IGNIS_RESIDENCY_LISTS] = {"hits", "prefetch hits", "misses",
                                                          "evictions", "prefetches", "dropped"};
     for (int l = 0; l < IGNIS_RESIDENCY_LISTS; ++l) {
@@ -334,8 +295,15 @@ int main(int argc, char **argv) {
           at + ": bytes " + std::to_string(head.bytes_moved) + ", the model " + std::to_string(s.expect.bytes));
     total_bytes += s.expect.bytes;
     total_prefetch_hits += s.expect.list[1].size();
+    total_prefetches += s.expect.list[4].size();
+    for (uint32_t k : s.expect.list[0]) ++want_hits[class_of(f, k)][s.phase];
+    for (uint32_t k : s.expect.list[2]) ++want_misses[class_of(f, k & ~IGNIS_RESIDENCY_STAGING_BIT)][s.phase];
+  };
 
-    // The slot table, every layer.
+  // The slot table: every entry ABSENT or inside its class pool on a slot boundary or inside the
+  // ring, no two sharing a slot, every live entry holding its own record's bytes. With
+  // `si` (an eager step), also that step's evictions and the previous step's staging.
+  auto check_table = [&](const std::string &at, const Step *s) {
     CUDA_OK(cudaMemcpy(table.data(), ignis_residency_slot_table(r, 0), keys * sizeof(ignis_moe_slot),
                        cudaMemcpyDeviceToHost));
     std::set<const void *> used;
@@ -355,42 +323,123 @@ int main(int argc, char **argv) {
       const bool in_ring = ring != nullptr && p >= ring && p + f.record_bytes[c] <= ring + layout.ring_bytes;
       check(in_pool || in_ring, at + ": key " + std::to_string(key) + " points outside its class pool and the ring");
       check(used.insert(e.record).second, at + ": two entries share " + std::to_string(reinterpret_cast<uintptr_t>(e.record)));
+      const uint64_t b = f.record_bytes[c];
+      record.resize(b);
+      CUDA_OK(cudaMemcpy(record.data(), e.record, b, cudaMemcpyDeviceToHost));
+      check(std::memcmp(record.data(), host + offsets[key], b) == 0,
+            at + ": key " + std::to_string(key) + " does not hold its record");
     }
-    for (uint32_t k : s.expect.list[3]) {  // evicted: ABSENT now
-      check(table[k].record == nullptr, at + ": evicted key " + std::to_string(k) + " is not ABSENT");
+    if (s == nullptr || s->expect.status != 0) return;
+    // Selected: live now.
+    for (int l : {0, 2}) {
+      for (uint32_t k : s->expect.list[l]) {
+        const uint32_t key = k & ~IGNIS_RESIDENCY_STAGING_BIT;
+        check(table[key].record != nullptr, at + ": selected key " + std::to_string(key) + " is ABSENT");
+      }
     }
-    if (prev_layer != UINT32_MAX && prev_layer != s.layer) {
+    // Evicted: ABSENT, unless the same step brought it back (a miss or a prefetch).
+    std::set<uint32_t> back;
+    for (int l : {2, 4}) {
+      for (uint32_t k : s->expect.list[l]) back.insert(k & ~IGNIS_RESIDENCY_STAGING_BIT);
+    }
+    for (uint32_t k : s->expect.list[3]) {
+      if (back.count(k) == 0) check(table[k].record == nullptr, at + ": evicted key " + std::to_string(k) + " is not ABSENT");
+    }
+    // Staged by the previous step: released once a step of another layer -- or of the same
+    // layer again -- has run, unless this step selected it again.
+    if (prev_layer != UINT32_MAX) {
+      std::set<uint32_t> now_live;
+      for (int l : {0, 2, 4}) {
+        for (uint32_t k : s->expect.list[l]) now_live.insert(k & ~IGNIS_RESIDENCY_STAGING_BIT);
+      }
       for (uint32_t k : staged_prev) {
-        if (k / nk != s.layer) {
+        const bool lookahead_for_this = k / nk == s->layer && prev_layer != s->layer;
+        if (!lookahead_for_this && now_live.count(k) == 0) {
           check(table[k].record == nullptr, at + ": key " + std::to_string(k) + " staged by the previous step is not ABSENT");
         }
       }
     }
+  };
+  auto remember_staging = [&](const Step &s) {
     staged_prev.clear();
-    for (int l : {2, 4}) {
-      for (uint32_t k : s.expect.list[l]) {
-        if (k & IGNIS_RESIDENCY_STAGING_BIT) staged_prev.push_back(k & ~IGNIS_RESIDENCY_STAGING_BIT);
+    if (s.expect.status == 0) {
+      for (int l : {2, 4}) {
+        for (uint32_t k : s.expect.list[l]) {
+          if (k & IGNIS_RESIDENCY_STAGING_BIT) staged_prev.push_back(k & ~IGNIS_RESIDENCY_STAGING_BIT);
+        }
       }
     }
     prev_layer = s.layer;
-
-    // The copies: every selected projection's entry holds its own record.
-    for (int l : {0, 2}) {
-      for (uint32_t k : s.expect.list[l]) {
-        const uint32_t key = k & ~IGNIS_RESIDENCY_STAGING_BIT;
-        const ignis_moe_slot &e = table[key];
-        if (e.record == nullptr) {
-          check(false, at + ": selected key " + std::to_string(key) + " is ABSENT");
-          continue;
-        }
-        const uint64_t b = f.record_bytes[class_of(f, key)];
-        record.resize(b);
-        CUDA_OK(cudaMemcpy(record.data(), e.record, b, cudaMemcpyDeviceToHost));
-        check(std::memcmp(record.data(), host + offsets[key], b) == 0,
-              at + ": selected key " + std::to_string(key) + " does not hold its record");
-      }
+  };
+  // A whole decode round from `si`: every layer in order, one token count.
+  auto is_round = [&](size_t si) {
+    if (si + f.layers > f.steps.size()) return false;
+    for (uint32_t l = 0; l < f.layers; ++l) {
+      const Step &s = f.steps[si + l];
+      if (s.phase != IGNIS_RESIDENCY_DECODE || s.layer != l || s.tokens != f.steps[si].tokens) return false;
+      if ((l + 1 < f.layers) != (s.rows > 0) || (s.rows > 0 && (s.rows != s.tokens || s.stride != f.width))) return false;
     }
-    if (g_failures > 40) break;
+    return true;
+  };
+
+  size_t si = 0;
+  while (si < f.steps.size() && g_failures <= 40) {
+    if (graph_mode && is_round(si)) {
+      const uint32_t tokens = f.steps[si].tokens;
+      Round &round = rounds[tokens];
+      if (round.exec == nullptr) {
+        for (uint32_t l = 0; l < f.layers; ++l) {
+          int32_t *ids = nullptr, *look = nullptr;
+          CUDA_OK(cudaMalloc(&ids, static_cast<size_t>(tokens) * f.top_k * 4));
+          if (l + 1 < f.layers) CUDA_OK(cudaMalloc(&look, static_cast<size_t>(tokens) * f.width * 4));
+          round.ids.push_back(ids);
+          round.lookahead.push_back(look);
+        }
+        RES_OK(ignis_residency_join(r, stream));  // nothing outstanding enters the capture
+        cudaGraph_t g = nullptr;
+        CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        for (uint32_t l = 0; l < f.layers; ++l) {
+          RES_OK(ignis_residency_step_ranked(r, l, IGNIS_RESIDENCY_DECODE, round.ids[l], tokens,
+                                             round.lookahead[l], round.lookahead[l] ? tokens : 0,
+                                             round.lookahead[l] ? f.width : 0, stream));
+        }
+        RES_OK(ignis_residency_join(r, stream));
+        CUDA_OK(cudaStreamEndCapture(stream, &g));
+        CUDA_OK(cudaGraphInstantiate(&round.exec, g, 0));
+        CUDA_OK(cudaGraphDestroy(g));
+      }
+      RES_OK(ignis_residency_join(r, stream));
+      for (uint32_t l = 0; l < f.layers; ++l) {
+        const Step &s = f.steps[si + l];
+        CUDA_OK(cudaMemcpyAsync(round.ids[l], s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
+        if (round.lookahead[l]) {
+          CUDA_OK(cudaMemcpyAsync(round.lookahead[l], s.lookahead.data(), s.lookahead.size() * 4,
+                                  cudaMemcpyHostToDevice, stream));
+        }
+      }
+      CUDA_OK(cudaGraphLaunch(round.exec, stream));
+      CUDA_OK(cudaStreamSynchronize(stream));
+      for (uint32_t l = 0; l < f.layers; ++l) compare(si + l);
+      check_table("round from step " + std::to_string(si), nullptr);
+      remember_staging(f.steps[si + f.layers - 1]);
+      ++graph_rounds;
+      si += f.layers;
+      continue;
+    }
+    const Step &s = f.steps[si];
+    const bool has_look = s.rows > 0;
+    CUDA_OK(cudaMemcpyAsync(d_ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
+    if (has_look) {
+      CUDA_OK(cudaMemcpyAsync(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice, stream));
+    }
+    RES_OK(ignis_residency_step_ranked(r, s.layer, s.phase, d_ids, s.tokens, has_look ? d_look : nullptr,
+                                       s.rows, s.stride, stream));
+    RES_OK(ignis_residency_join(r, stream));
+    CUDA_OK(cudaStreamSynchronize(stream));
+    compare(si);
+    check_table("step " + std::to_string(si) + " (layer " + std::to_string(s.layer) + ")", &s);
+    remember_staging(s);
+    ++si;
   }
 
   ignis_residency_counters counters{};
@@ -398,12 +447,19 @@ int main(int argc, char **argv) {
   const uint64_t moved = counters.bytes_moved[0] + counters.bytes_moved[1];
   check(moved == total_bytes, "counters: bytes moved " + std::to_string(moved) + ", the trace " + std::to_string(total_bytes));
   check(counters.prefetch_used == total_prefetch_hits, "counters: prefetches used");
-  if (graph_mode) check(graph_replays > 0, "graph mode replayed no captured step");
+  check(counters.prefetch_issued == total_prefetches, "counters: prefetches issued");
+  for (int c = 0; c < 8; ++c) {
+    for (int p = 0; p < 2; ++p) {
+      check(counters.hits[c][p] == want_hits[c][p], "counters: hits of class " + std::to_string(c));
+      check(counters.misses[c][p] == want_misses[c][p], "counters: misses of class " + std::to_string(c));
+    }
+  }
+  if (graph_mode) check(graph_rounds > 2, "graph mode replayed too few captured rounds");
 
-  for (auto &[k, shape] : shapes) {
-    if (shape.exec) cudaGraphExecDestroy(shape.exec);
-    cudaFree(shape.ids);
-    cudaFree(shape.lookahead);
+  for (auto &[k, round] : rounds) {
+    if (round.exec) cudaGraphExecDestroy(round.exec);
+    for (auto *p : round.ids) cudaFree(p);
+    for (auto *p : round.lookahead) cudaFree(p);
   }
   cudaFree(d_ids);
   cudaFree(d_look);
@@ -413,7 +469,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;
   }
-  std::printf("residency trace: %zu steps equal the policy model%s (warm start admitted %u, %u graph replays)\n",
-              f.steps.size(), graph_mode ? " through graphs" : "", admitted, graph_replays);
+  std::printf("residency trace: %zu steps equal the policy model%s (warm start admitted %u, %u captured rounds)\n",
+              f.steps.size(), graph_mode ? " through graphs" : "", admitted, graph_rounds);
   return 0;
 }

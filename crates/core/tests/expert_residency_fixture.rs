@@ -11,8 +11,10 @@
 //!
 //! The trace covers decode rounds of one to three lanes with a lookahead,
 //! prefill chunks with a lookahead (the rank-interleaved first-occurrence
-//! order over tokens), a prefetch budget that bites, a warm start, and steps
-//! the model refuses (a class that cannot hold its selection).
+//! order over tokens), a prefetch budget that bites, a warm start, steps the
+//! model refuses (a class that cannot hold its selection), and forwards
+//! restarted at a layer (the same layer twice in a row, in decode and in
+//! prefill).
 //!
 //! Format, whitespace-separated, one record per line:
 //! ```text
@@ -52,7 +54,7 @@ const WIDTH: usize = 4;
 const RECORD_BYTES: [u64; 8] = [4096, 8192, 12288, 16384, 4096, 4096, 8192, 8192];
 /// Tight enough to evict, and for the down K4 class tight enough that a
 /// three-lane round can be refused.
-const CAPACITY: [u32; 8] = [40, 36, 36, 30, 44, 34, 34, 9];
+const CAPACITY: [u32; 8] = [40, 36, 36, 30, 44, 34, 34, 8];
 const BUDGET: u64 = 20_480;
 
 struct Rng(u64);
@@ -147,8 +149,19 @@ fn trace(rng: &mut Rng, rounds: usize) -> Vec<Step> {
                 layer,
                 prefill,
                 ids: per_layer[usize::from(layer)].clone(),
-                lookahead,
+                lookahead: lookahead.clone(),
             });
+            // A forward restarted at this layer: the same layer twice in a row, the second with
+            // other tokens. The first step's staging is released before the second classifies.
+            let restart = (round == 24 || round == 34) && layer == 1 || round == 12 && layer == 2;
+            if restart {
+                steps.push(Step {
+                    layer,
+                    prefill,
+                    ids: (0..rows).map(|_| rng.experts(TOP_K)).collect(),
+                    lookahead,
+                });
+            }
         }
     }
     steps

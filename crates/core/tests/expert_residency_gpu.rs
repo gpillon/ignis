@@ -5,7 +5,8 @@
 //! - The leaf's own plan line for the tables stays within the CPU plan's
 //!   upper bound (host arithmetic, no GPU: runs with `--features cuda`).
 //! - On random traces -- decode of one to three lanes, prefill chunks, a
-//!   lookahead with holes, a budget or none, a warm start, refused steps --
+//!   lookahead with holes, a budget or none, a warm start, refused steps,
+//!   forwards restarted at a layer --
 //!   every step's outcome on the device equals `ResidencyModel::step`'s, and
 //!   the counters agree at the end. Half the steps hand the lookahead over as
 //!   the next router's logits, so the device's own ranking (BF16-rounded,
@@ -168,7 +169,15 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
         for round in 0..30 {
             let prefill = round % 4 == 3;
             let rows = if prefill { 4 + rng.below(5) as usize } else { 1 + rng.below(3) as usize };
+            // Now and then a forward restarted at a layer: the same layer twice in a row.
+            let mut order = Vec::new();
             for layer in 0..LAYERS {
+                order.push(layer);
+                if rng.below(8) == 0 {
+                    order.push(layer);
+                }
+            }
+            for layer in order {
                 let mut ids = Vec::with_capacity(rows * TOP_K);
                 for _ in 0..rows {
                     let mut row: Vec<u16> = Vec::new();
@@ -244,7 +253,7 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
                     gpu_profile::skip_or_fail(&format!("ignis_residency_step: {e}"));
                     return;
                 }
-                let report = gpu.last_report().expect("report");
+                let report = gpu.last_report(u32::from(layer)).expect("report");
                 let lane_refs: Vec<&[u16]> = lanes.iter().map(Vec::as_slice).collect();
                 let step = if prefill { LayerStep::prefill(layer, &selected) } else { LayerStep::decode(layer, &selected) };
                 let at = format!("seed {seed} round {round} layer {layer}");

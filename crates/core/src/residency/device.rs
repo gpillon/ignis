@@ -136,6 +136,7 @@ mod ffi {
         pub fn ignis_residency_read_counters(r: *mut RawResidency, out: *mut RawCounters) -> i32;
         pub fn ignis_residency_last_report(
             r: *mut RawResidency,
+            layer: u32,
             head: *mut RawReport,
             entries: *mut u32,
             capacity: u32,
@@ -253,7 +254,13 @@ impl DeviceResidency {
     /// The optional warm start, hottest first; how many were admitted.
     pub fn warm_start(&mut self, hottest_first: &[ProjectionId]) -> Result<usize, String> {
         let experts = self.desc.experts as u16;
-        let keys: Vec<u32> = hottest_first.iter().map(|&id| key(experts, id)).collect();
+        // A projection outside the catalog is skipped, as the policy skips it; its key
+        // would otherwise alias another layer's.
+        let keys: Vec<u32> = hottest_first
+            .iter()
+            .filter(|id| u32::from(id.layer) < self.desc.layers && id.expert < experts)
+            .map(|&id| key(experts, id))
+            .collect();
         let mut admitted = 0u32;
         check(unsafe {
             ffi::ignis_residency_warm_start(self.raw.as_ptr(), keys.as_ptr(), keys.len() as u32, &mut admitted)
@@ -333,14 +340,14 @@ impl DeviceResidency {
         })
     }
 
-    /// The last step's outcome, every list sorted into key order; waits for
-    /// the device.
-    pub fn last_report(&self) -> Result<DeviceReport, String> {
+    /// The outcome of the last step of `layer`, every list sorted into key
+    /// order; waits for the device.
+    pub fn last_report(&self, layer: u32) -> Result<DeviceReport, String> {
         let capacity = 4 * self.desc.experts;
         let mut head = RawReport::default();
         let mut entries = vec![0u32; LISTS * capacity as usize];
         check(unsafe {
-            ffi::ignis_residency_last_report(self.raw.as_ptr(), &mut head, entries.as_mut_ptr(), capacity)
+            ffi::ignis_residency_last_report(self.raw.as_ptr(), layer, &mut head, entries.as_mut_ptr(), capacity)
         })?;
         let experts = self.desc.experts as u16;
         let list = |l: usize| -> Vec<u32> {
