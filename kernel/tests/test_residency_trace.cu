@@ -382,6 +382,28 @@ int main(int argc, char **argv) {
     return true;
   };
 
+  // A capture that fails after a step with a lookahead (ended without the join, so its fork is
+  // unjoined) leaves residency able to step: the join reports the dead capture's event once and
+  // forgets it, and the fixture then replays from its first step as if nothing had happened --
+  // the captured step never ran.
+  {
+    const Step &s = f.steps[0];
+    check(s.rows > 0 && s.layer + 1 < f.layers, "the fixture's first step has a lookahead");
+    CUDA_OK(cudaMemcpy(d_ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    RES_OK(ignis_residency_step_ranked(r, s.layer, s.phase, d_ids, s.tokens, d_look, s.rows, s.stride, stream));
+    cudaGraph_t g = nullptr;
+    const cudaError_t ended = cudaStreamEndCapture(stream, &g);
+    check(ended != cudaSuccess, "a capture with an unjoined prefetch fork must fail to end");
+    if (g) cudaGraphDestroy(g);
+    cudaGetLastError();  // the capture's error is not the test's
+    ignis_residency_join(r, stream);  // may report the dead event; must forget it either way
+    check(ignis_residency_join(r, stream) == 0, std::string("a second join still fails: ") + ignis_residency_last_error());
+    // A normal step now runs; the replay below starts from this state.
+    CUDA_OK(cudaStreamSynchronize(stream));
+  }
+
   size_t si = 0;
   while (si < f.steps.size() && g_failures <= 40) {
     if (graph_mode && is_round(si)) {

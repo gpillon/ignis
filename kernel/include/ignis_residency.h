@@ -136,7 +136,9 @@ int32_t ignis_residency_step_ranked(struct ignis_residency *r, uint32_t layer, u
                                     uint32_t rows, uint32_t stride, void *stream);
 
 /* Joins the prefetch copies of the last step into `stream` (see the capture rules above).
- * Steps do it themselves at their start. */
+ * Steps do it themselves at their start. After a capture that failed with a fork open, the
+ * wait on its dead event fails once; the fork is forgotten either way (its copies never ran),
+ * so the next step runs normally. */
 int32_t ignis_residency_join(struct ignis_residency *r, void *stream);
 
 /* What residency counted since creation, 1:1 with crates/core's ResidencyCounters; `[class]

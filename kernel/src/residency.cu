@@ -828,8 +828,11 @@ int32_t ignis_residency_warm_start(ignis_residency *r, const uint32_t *keys, uin
 int32_t ignis_residency_join(ignis_residency *r, void *stream) {
   if (r == nullptr) return fail("residency: no residency");
   if (!r->forked) return 0;
-  RESIDENCY_CUDA(cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), r->join, 0));
+  // Cleared first: after a failed capture the join event belongs to a dead capture and the
+  // wait fails (cudaErrorCapturedEvent); its copies never ran, so there is nothing left to
+  // join, and every later step must not fail on it again.
   r->forked = false;
+  RESIDENCY_CUDA(cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), r->join, 0));
   return 0;
 }
 
