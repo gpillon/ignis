@@ -760,6 +760,26 @@ fn build_flash_next_bound_tensors(
     Ok((names, tensors))
 }
 
+/// A Flash-Next load's options: its decode lanes and its borrowed residency
+/// (null when only planning); nothing of the 27B's.
+fn flash_next_options(decode_lanes: u32, residency: *mut c_void) -> ffi::IgnisModelLoadOptions {
+    ffi::IgnisModelLoadOptions {
+        size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
+        speculative_backend: 0,
+        draft_tokens: 0,
+        vision_max_tokens: 0,
+        vision_embedding_pool_bytes: 0,
+        rope_scaling_factor: 0.0,
+        rope_scaling_temperature: 0.0,
+        rope_scaling_beta_fast: 0.0,
+        rope_scaling_beta_slow: 0.0,
+        vision_item_max_tokens: 0,
+        attention_text_max_keys: 0,
+        decode_lanes,
+        residency,
+    }
+}
+
 /// Load a Flash-Next artifact whose non-expert tensors `artifact` holds on
 /// the device (`fn_plan` and `geometry` as
 /// [`ignis_artifact::flash_next::bind`] took them), with `decode_lanes`
@@ -783,21 +803,7 @@ pub fn load_flash_next(
     };
     let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
     let topology = ModelConfig::flash_next_from(geometry).topology_abi();
-    let options = ffi::IgnisModelLoadOptions {
-        size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
-        speculative_backend: 0,
-        draft_tokens: 0,
-        vision_max_tokens: 0,
-        vision_embedding_pool_bytes: 0,
-        rope_scaling_factor: 0.0,
-        rope_scaling_temperature: 0.0,
-        rope_scaling_beta_fast: 0.0,
-        rope_scaling_beta_slow: 0.0,
-        vision_item_max_tokens: 0,
-        attention_text_max_keys: 0,
-        decode_lanes,
-        residency: residency.as_raw(),
-    };
+    let options = flash_next_options(decode_lanes, residency.as_raw());
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
         ffi::ignis_model_load(
@@ -831,6 +837,7 @@ pub fn plan_flash_next_reservations(
     prefill_chunk_tokens: u32,
     max_context_tokens: u32,
     kv_format: KvFormat,
+    decode_lanes: u32,
 ) -> Result<IgnisModelReservations, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let placement = |handle: ObjectHandle| {
@@ -844,6 +851,7 @@ pub fn plan_flash_next_reservations(
     };
     let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
     let topology = ModelConfig::flash_next_from(geometry).topology_abi();
+    let options = flash_next_options(decode_lanes, std::ptr::null_mut());
     let mut reservations = IgnisModelReservations::default();
     let rc = unsafe {
         ffi::ignis_model_plan_reservations(
@@ -853,7 +861,7 @@ pub fn plan_flash_next_reservations(
             prefill_chunk_tokens,
             max_context_tokens,
             kv_format.abi_code(),
-            std::ptr::null(),
+            &options,
             &mut reservations,
         )
     };
@@ -886,7 +894,7 @@ mod tests {
         ignis_artifact::packer::pack(&tree.pack_options(), &mut |_| {}).expect("pack");
         let reader = Reader::open(&tree.artifact_path()).expect("open the fixture artifact");
         let fn_plan = flash_next::bind(&reader, &tree.geometry).expect("bind the fixture artifact");
-        let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, 128, 1024, KvFormat::HqE8_2b)
+        let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, 128, 1024, KvFormat::HqE8_2b, 3)
             .expect_err("the fixture's geometry is not one the program runs");
         assert!(err.contains("does not run this geometry (its weights bind)"), "{err}");
     }

@@ -445,6 +445,11 @@ const char *ignis_decode_graph_last_error(void);
  * unchanged per-token loop. After a chunked prefill, `seq`'s state is
  * exactly what the per-token route would have left.
  *
+ * GitHub #302: on a Flash-Next load a chunk that fails does NOT leave `seq`
+ * at its pre-chunk state -- its GDN, indexer and n-gram sections advance in
+ * place layer by layer -- so the error says the sequence is not usable past
+ * it, and the caller releases it (the request fails) rather than retrying.
+ *
  * On a model loaded with IGNIS_SPECULATIVE_DFLASH2 (P5-03, GitHub #152) the
  * chunked route also taps the target's layer 5/19/33/47/61 outputs for the
  * span's last min(2048, num_tokens) positions into chunk-scoped scratch --

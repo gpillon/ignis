@@ -97,7 +97,11 @@ fn a_span_is_deterministic_and_decode_agrees_with_prefill() {
     let Some(mut engine) = engine() else { return };
     let vocab = engine.vocab();
     println!("graphs ready: {:#b}", engine.graphs_ready());
-    assert_ne!(engine.graphs_ready() & 1, 0, "the one-lane round captured a graph");
+    if let Some(error) = engine.graph_error() {
+        println!("graph capture: {error}");
+    }
+    assert_ne!(engine.graphs_ready() & 1, 0, "the one-lane round captured a graph: {:?}", engine.graph_error());
+    assert_eq!(engine.reserved(), engine.planned(), "the load holds what its plan laid out");
 
     // A span past one chunk and past the dense threshold (2051 visible tokens).
     let tokens = prompt(2600, 1);

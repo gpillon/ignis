@@ -31,7 +31,7 @@ use ignis_core::residency::{
     default_prefetch_budget_bytes, min_slots_per_class, plan_expert_cache, prefill_staging_ring_bytes,
     residency_table_bytes, ExpertCacheRequest, ExpertTraffic, KClass,
 };
-use ignis_core::seq::{Seq, SeqCheckpoint, SeqPool, SeqPoolBudget, SeqPrefix};
+use ignis_core::seq::{Seq, SeqCheckpoint, SeqPool, SeqPrefix};
 use ignis_core::step;
 use ignis_core::types::{DecodeParams, TokenId};
 
@@ -103,6 +103,7 @@ impl FlashNextLeaf {
     /// (the expert cache split into its eight K-class pools by resid's plan,
     /// the pinned pool filled from the file) and open the n-gram table.
     pub fn open(path: &Path, options: EngineOptions) -> Result<Self, String> {
+        let options = options.normalized();
         let reader = Reader::open(path).map_err(|e| format!("open {}: {e:?}", path.display()))?;
         let geometry = FlashNextGeometry::qwen38_flash_next();
         let plan = flash_next::bind(&reader, &geometry).map_err(|e| format!("bind the Flash-Next artifact: {e:?}"))?;
@@ -208,15 +209,8 @@ impl StepLeaf for FlashNextLeaf {
             &self.residency,
         )
         .map_err(|e| leaf_error("model load", e))?;
-        let budget = SeqPoolBudget {
-            kv_format: o.kv_format,
-            kv_page_group_count: o.max_context_tokens.div_ceil(64) * o.decode_lanes,
-            max_context_tokens: o.max_context_tokens,
-            slot_count: o.decode_lanes,
-            retained_slot_count: 0,
-            retained_host_slot_count: 0,
-        };
-        let pool = SeqPool::create(&self.config, &budget).map_err(|e| leaf_error("seq pool create", e))?;
+        let pool =
+            SeqPool::create(&self.config, &o.pool_budget()).map_err(|e| leaf_error("seq pool create", e))?;
         if o.capture_graphs {
             let capture = step::capture_decode_graphs(&model, &pool).map_err(|e| leaf_error("graph capture", e))?;
             // hotpath-lint-allow: model-load-time only, once per process start (GitHub #80).
@@ -250,6 +244,9 @@ impl StepLeaf for FlashNextLeaf {
                 workspace: reserved.workspace_bytes + reserved.activation_bytes,
                 sampling: reserved.sampling_bytes,
                 decode_graph: reserved.decode_graph_bytes,
+                lane_state: pool_stats.lane_state_bytes + pool_stats.indexer_bytes + pool_stats.ngram_conv_bytes,
+                hq_residual_window: pool_stats.hq_residual_bytes,
+                kv_pool: pool_stats.kv_arena_bytes,
                 ..ReservedBytes::default()
             },
         })

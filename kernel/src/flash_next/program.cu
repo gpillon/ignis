@@ -269,16 +269,23 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
         phase == IGNIS_RESIDENCY_DECODE
             ? ignis_moe_experts_decode(x, static_cast<uint32_t>(rows), ids, weights, slots, &workspace, acc, stream)
             : ignis_moe_experts_prefill(x, static_cast<uint32_t>(rows), ids, weights, slots, &workspace, acc, stream);
+    // The routed accumulator must be zero on every op's entry (ignis_moe.h); a failure before
+    // the combine re-zeroes what the experts added, or the next call would add into it.
+    const auto fail_moe = [&](const std::string &what) {
+      const std::string detail = ignis_moe_last_error();
+      (void)cudaMemsetAsync(acc, 0, static_cast<std::size_t>(rows) * g.hidden * sizeof(int64_t), stream);
+      return fail(where + what, detail.c_str());
+    };
     if (experts != 0) {
-      return fail(where + " experts", ignis_moe_last_error());
+      return fail_moe(" experts");
     }
     auto *shared = static_cast<float *>(fn.shared_out->p);
     if (ignis_moe_shared_expert(layer.moe.shared_gate, layer.moe.shared_up, layer.moe.shared_down, x,
                                 static_cast<uint32_t>(rows), fn.shared_h->p, shared, stream) != 0) {
-      return fail(where + " shared expert", ignis_moe_last_error());
+      return fail_moe(" shared expert");
     }
     if (ignis_moe_combine(acc, shared, x, layer.moe.shared_expert_gate, static_cast<uint32_t>(rows), y, stream) != 0) {
-      return fail(where + " MoE combine", ignis_moe_last_error());
+      return fail_moe(" MoE combine");
     }
     if (fn_hc_inject(g, y, inj, rows, residual, stream) != 0) {
       return fail(where + " MoE inject", fn_last_error());
@@ -394,7 +401,7 @@ ignis_model_reservations reservations(const FlashNextModel &fn) {
   ignis_model_reservations out{};
   out.workspace_bytes = fn.sizes.prefill_scratch;
   out.sampling_bytes = sampling_staging_bytes(fn.sizes);
-  out.decode_graph_bytes = fn.sizes.decode_scratch + 2 * sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH;
+  out.decode_graph_bytes = fn.sizes.decode_scratch;
   out.activation_bytes = fn.sizes.activations + fn.sizes.moe;
   return out;
 }
@@ -458,8 +465,6 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     model.scratch = std::make_unique<ninfer::DeviceArena>(s.prefill_scratch);
     model.prefill_scratch_bytes = s.prefill_scratch;
     model.decode_graph_scratch = std::make_unique<ninfer::DeviceArena>(s.decode_scratch);
-    model.decode_graph_token_ids = buffer(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
-    model.decode_graph_slots = buffer(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
 
     // The sampling staging, as model.cu reserves it for the 27B.
     model.sampling_single_configs = std::make_unique<ninfer::DeviceBuffer>(sizeof(ninfer::ops::SamplingConfig));
@@ -873,6 +878,12 @@ int32_t capture_decode_graphs(ignis_model *model, ignis_seq_pool *pool, uint32_t
                          &failure);
     if (ok) {
       ok = run_round(model, fn, views.ctx, width, /*constrained=*/false, &failure) == 0;
+      if (!ok) {
+        // A round that stopped after a step with a lookahead left residency's prefetch forked:
+        // it joins before the capture ends (ignis_residency.h rule (b)), or the end fails and
+        // the fork outlives the capture.
+        (void)ignis_residency_join(fn.residency, stream);
+      }
       const cudaError_t end = cudaStreamEndCapture(stream, &graph);
       if (end != cudaSuccess && ok) {
         ok = check_cuda(end, "cudaStreamEndCapture", &failure);
@@ -892,6 +903,11 @@ int32_t capture_decode_graphs(ignis_model *model, ignis_seq_pool *pool, uint32_t
       *out_ready_mask |= 1U << (width - 1);
     } else {
       // A failed capture degrades this width to the eager round; it never refuses service.
+      // A forward that stopped inside the capture after a lookahead step left residency's
+      // prefetch fork on the dead capture: one join, outside any capture, clears it (dc4af5b)
+      // before the next width begins its own.
+      (void)cudaGetLastError();
+      (void)ignis_residency_join(fn.residency, stream);
       (void)cudaGetLastError();
       *error = "ignis_decode_graph_capture: width " + std::to_string(width) + ": " + failure;
     }

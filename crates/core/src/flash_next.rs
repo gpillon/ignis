@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 
 use ignis_artifact::flash_next::{self, FlashNextGeometry, FlashNextPlan};
 use ignis_artifact::packer::ARTIFACT_FILE_NAME;
-use ignis_artifact::{materialize, CudaDevice, MaterializedArtifact, Reader};
+use ignis_artifact::{materialize, CudaDevice, Device, MaterializedArtifact, Reader};
 
 use crate::compute::ModelConfig;
 use crate::kv_format::KvFormat;
-use crate::model_load::{load_flash_next, Model};
+use crate::model_load::{load_flash_next, plan_flash_next_reservations, IgnisModelReservations, Model};
 use crate::ngram_table::{NgramTable, NgramTableOptions};
 use crate::residency::device::{DeviceResidency, ResidencyDesc};
 use crate::residency::load::{catalog, fill_expert_pool, pool_layout};
@@ -51,6 +51,39 @@ pub struct EngineOptions {
     pub capture_graphs: bool,
 }
 
+impl EngineOptions {
+    /// These options with the decode lanes normalized once: 0 is the
+    /// default, as the leaf reads it -- so the pool, the residency and the
+    /// load agree on one count.
+    pub fn normalized(mut self) -> Self {
+        if self.decode_lanes == 0 {
+            self.decode_lanes = DEFAULT_DECODE_LANES;
+        }
+        self
+    }
+
+    /// The sequence pool these options build: every lane's whole context.
+    pub fn pool_budget(&self) -> SeqPoolBudget {
+        SeqPoolBudget {
+            kv_format: self.kv_format,
+            kv_page_group_count: self.max_context_tokens.div_ceil(64) * self.decode_lanes,
+            max_context_tokens: self.max_context_tokens,
+            slot_count: self.decode_lanes,
+            retained_slot_count: 0,
+            retained_host_slot_count: 0,
+        }
+    }
+}
+
+/// The device bytes a pool of `budget` holds for `config`: its KV arena,
+/// the lanes' state, the residual window and the indexer and n-gram
+/// sections (the indexer's keys, 768 bytes per token of context, are part
+/// of the context's price, not the KV line alone).
+pub fn pool_device_bytes(config: &ModelConfig, budget: &SeqPoolBudget) -> Result<u64, String> {
+    let plan = SeqPool::plan(config, budget, None)?;
+    Ok(plan.kv_bytes + plan.lane_state_bytes + plan.hq_residual_bytes + plan.indexer_bytes + plan.ngram_conv_bytes)
+}
+
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
@@ -78,16 +111,27 @@ pub struct FlashNextEngine {
     config: ModelConfig,
     options: EngineOptions,
     graphs_ready: u32,
+    graph_error: Option<String>,
+    planned: IgnisModelReservations,
 }
 
 impl FlashNextEngine {
     /// Load the artifact in `dir` (`Qwen3.8-Flash-Next-ignis`, spec 01).
     pub fn load(dir: &Path, options: EngineOptions) -> Result<Self, String> {
+        let options = options.normalized();
         let path: PathBuf = dir.join(ARTIFACT_FILE_NAME);
         let reader = Reader::open(&path).map_err(|e| format!("open {}: {e:?}", path.display()))?;
         let geometry = FlashNextGeometry::qwen38_flash_next();
         let plan = flash_next::bind(&reader, &geometry).map_err(|e| format!("bind the Flash-Next artifact: {e:?}"))?;
         let config = ModelConfig::flash_next_from(&geometry);
+        let planned = plan_flash_next_reservations(
+            &plan,
+            &geometry,
+            options.prefill_chunk_tokens,
+            options.max_context_tokens,
+            options.kv_format,
+            options.decode_lanes,
+        )?;
 
         let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
         let artifact =
@@ -105,21 +149,28 @@ impl FlashNextEngine {
             options.decode_lanes,
             &residency,
         )?;
-        let pages_per_lane = options.max_context_tokens.div_ceil(64);
-        let budget = SeqPoolBudget {
-            kv_format: options.kv_format,
-            kv_page_group_count: pages_per_lane * options.decode_lanes,
-            max_context_tokens: options.max_context_tokens,
-            slot_count: options.decode_lanes,
-            retained_slot_count: 0,
-            retained_host_slot_count: 0,
-        };
+        // The pool is planned against what is free before it is created, so a
+        // context the card cannot hold is a refusal naming it, not an
+        // allocation failure.
+        let budget = options.pool_budget();
+        let pool_bytes = pool_device_bytes(&config, &budget)?;
+        let free = device.free_bytes().unwrap_or(u64::MAX);
+        if pool_bytes > free {
+            return Err(format!(
+                "the sequence pool of {} lanes of {} tokens needs {pool_bytes} bytes (KV, lane state, the \
+                 indexer's keys and the n-gram state), and {free} are free after the weights, the program and \
+                 the expert cache: shorten max_context_tokens or the expert cache",
+                options.decode_lanes, options.max_context_tokens
+            ));
+        }
         let pool = SeqPool::create(&config, &budget)?;
-        let graphs_ready = if options.capture_graphs {
+        let (graphs_ready, graph_error) = if options.capture_graphs {
             let capture = capture_decode_graphs(&model, &pool)?;
-            (1..=options.decode_lanes).filter(|&w| capture.is_ready(w)).fold(0, |mask, w| mask | 1 << (w - 1))
+            let mask = (1..=options.decode_lanes).filter(|&w| capture.is_ready(w)).fold(0, |mask, w| mask | 1 << (w - 1));
+            let complete = mask == (1u32 << options.decode_lanes) - 1;
+            (mask, (!complete).then(crate::step::last_decode_graph_error))
         } else {
-            0
+            (0, None)
         };
         Ok(Self {
             model,
@@ -131,6 +182,8 @@ impl FlashNextEngine {
             config,
             options,
             graphs_ready,
+            graph_error,
+            planned,
         })
     }
 
@@ -188,6 +241,23 @@ impl FlashNextEngine {
     /// Bit `w - 1` set when the round of `w` lanes replays a graph.
     pub fn graphs_ready(&self) -> u32 {
         self.graphs_ready
+    }
+
+    /// Why a width's graph did not capture (the leaf's last capture error),
+    /// when one did not.
+    pub fn graph_error(&self) -> Option<&str> {
+        self.graph_error.as_deref()
+    }
+
+    /// The reservations the load planned before anything was on the device,
+    /// and what the loaded model holds (`ignis_model_stats`): equal, or the
+    /// plan no longer describes the load.
+    pub fn planned(&self) -> IgnisModelReservations {
+        self.planned
+    }
+
+    pub fn reserved(&self) -> IgnisModelReservations {
+        self.model.stats().reserved
     }
 
     pub fn residency(&self) -> &DeviceResidency {

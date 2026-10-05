@@ -815,6 +815,14 @@ pub fn prefill_program_span_logits(
     Ok(())
 }
 
+/// GitHub #302: one token's n-gram table rows on Flash-Next, as the leaf
+/// reads them: 16 heads of 90-byte INT4 rows (layout.md 7.1), 1,440 bytes.
+pub fn flash_next_ngram_token_bytes() -> usize {
+    let ngram = crate::compute::ModelConfig::qwen38_flash_next().ngram.expect("Flash-Next has the n-gram embedding");
+    let head_dim = ngram.head_dim() as usize;
+    ngram.heads() as usize * (head_dim / 2 + head_dim / 32 * 2)
+}
+
 /// GitHub #302: one span of a Flash-Next sequence, its last position's
 /// successor drawn under `sampling` (restricted to `permitted` when it is
 /// not empty), with the span's n-gram table rows (`ngram_rows`:
@@ -836,12 +844,30 @@ pub fn prefill_flash_next(
     out_span_logits: Option<&mut [u16]>,
     out_logits: Option<&mut [f32]>,
 ) -> Result<f32, String> {
-    if token_ids.is_empty() || ngram_rows.is_empty() || ngram_rows.len() % token_ids.len() != 0 {
+    // Exact lengths: the leaf reads and writes these buffers by the span's
+    // own count, never by the slices' (no over-read or over-write in C).
+    let vocab = crate::compute::ModelConfig::qwen38_flash_next().vocab as usize;
+    if token_ids.is_empty() || ngram_rows.len() != token_ids.len() * flash_next_ngram_token_bytes() {
         return Err(format!(
-            "prefill_flash_next: {} n-gram row bytes for {} tokens",
+            "prefill_flash_next: {} n-gram row bytes for {} tokens of {} bytes",
             ngram_rows.len(),
-            token_ids.len()
+            token_ids.len(),
+            flash_next_ngram_token_bytes()
         ));
+    }
+    if let Some(rows) = &out_span_logits {
+        if rows.len() != token_ids.len() * vocab {
+            return Err(format!(
+                "prefill_flash_next: {} span logits for {} tokens of {vocab} columns",
+                rows.len(),
+                token_ids.len()
+            ));
+        }
+    }
+    if let Some(row) = &out_logits {
+        if row.len() < vocab {
+            return Err(format!("prefill_flash_next: a logits row of {} for {vocab} columns", row.len()));
+        }
     }
     let mut probability = 0.0f32;
     let span_logits = match out_span_logits {
@@ -893,6 +919,14 @@ pub fn decode_flash_next(
 ) -> Result<Vec<(i32, f32)>, String> {
     if lanes.len() != sequences.len() {
         return Err(format!("decode_flash_next: {} lanes' sampling for {} sequences", lanes.len(), sequences.len()));
+    }
+    if ngram_rows.len() != sequences.len() * flash_next_ngram_token_bytes() {
+        return Err(format!(
+            "decode_flash_next: {} n-gram row bytes for {} lanes of {} bytes",
+            ngram_rows.len(),
+            sequences.len(),
+            flash_next_ngram_token_bytes()
+        ));
     }
     let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
     let params = lanes

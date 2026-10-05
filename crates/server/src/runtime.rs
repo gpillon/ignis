@@ -469,8 +469,11 @@ pub fn flash_next_scheduler(
     use ignis_artifact::{CudaDevice, Reader};
     use ignis_core::compute::ModelConfig;
     use ignis_core::flash_next::{EngineOptions, LOOKAHEAD_WIDTH};
-    use ignis_core::residency::load::catalog;
-    use ignis_core::residency::{prefill_staging_ring_bytes, residency_table_bytes, EXPERT_CACHE_FLOOR_BYTES};
+    use ignis_core::residency::load::{catalog, pool_layout};
+    use ignis_core::residency::{
+        available_physical_bytes, plan_host, prefill_staging_ring_bytes, residency_table_bytes, HostPlanRequest,
+        EXPERT_CACHE_FLOOR_BYTES,
+    };
     use ignis_core::seq::{SeqPool, SeqPoolBudget};
     use ignis_runtime::{FlashNextLeaf, KV_PAGE_TOKENS};
 
@@ -492,6 +495,7 @@ pub fn flash_next_scheduler(
         shape.prefill_chunk,
         shape.max_context,
         shape.kv_format,
+        lanes,
     )?;
     let config = ModelConfig::flash_next_from(&geometry);
     let pages_per_lane = shape.max_context.div_ceil(KV_PAGE_TOKENS);
@@ -555,6 +559,28 @@ pub fn flash_next_scheduler(
         capture_graphs: true,
         ..EngineOptions::default()
     };
+    // The host plan (spec flash-next/03), measured before the first pinned
+    // allocation: the expert pool and the n-gram hot rows must leave the
+    // margin, or the start is refused naming the line that crosses it.
+    if let Some(available) = available_physical_bytes() {
+        let host = plan_host(&HostPlanRequest {
+            available_physical_bytes: available,
+            expert_pool_bytes: pool_layout(&plan.experts).bytes,
+            ngram_hot_rows_bytes: options.ngram.hot_bytes,
+            staging_bytes: 0,
+            retained_host_slots_bytes: 0,
+            kv_ram_arena_bytes: 0,
+        })
+        .map_err(|e| e.to_string())?;
+        // hotpath-lint-allow: one line per model load.
+        tracing::info!(
+            name: "ignis.runtime.flash_next_host_plan",
+            available_bytes = available,
+            planned_bytes = host.total_bytes,
+            left_bytes = host.left_bytes,
+            "flash-next host plan"
+        );
+    }
     drop(reader);
     let leaf = FlashNextLeaf::open(artifact_path, options)?;
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);

@@ -2533,9 +2533,16 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model->vision_pool.buffer != nullptr) {
     out_stats->vram_bytes += model->vision_pool.buffer->bytes;
   }
-  // GitHub #302: Flash-Next's activations and MoE buffers.
+  // GitHub #302: Flash-Next's activations and MoE buffers, and its pool's
+  // indexer and n-gram sections.
   if (model->flash_next) {
     out_stats->vram_bytes += ignis::flash_next::reserved(*model).activation_bytes;
+  }
+  if (pool->has_indexer()) {
+    out_stats->vram_bytes += pool->indexer_state->bytes;
+  }
+  if (pool->has_ngram_conv()) {
+    out_stats->vram_bytes += pool->ngram_conv->bytes;
   }
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
