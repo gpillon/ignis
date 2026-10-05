@@ -1,13 +1,17 @@
 """Qwen3.8-Flash-Next -> ignis work files, references and traces (spec 01, GitHub #299).
 
     python convert.py run --lock-owner flash-next-convert --ood-dir ... --windows-dir ... --table-cache ...
-    python convert.py fixture --out DIR          # a reduced work tree for the packer's CPU tests
+    python convert.py verify --lock-owner ... --artifact X.ninfer   # after packing: decode from the container
+    python convert.py fixture --out DIR          # a reduced work tree for the packer's tests
 
-Exit codes: 0 done (PASS or dry run), 75 stopped by the stop file, 2 refused by the
-preflight, 3 done but the quality acceptance FAILED (the report names the fallback),
-1 error. See README.md for the full command and its disk, RAM and time figures.
+Exit codes: 0 done (PASS or dry run); 75 stopped by the stop file; 2 refused (GPU lock,
+GPU busy, disk, a work tree of another configuration); 3 done but an acceptance check
+FAILED (rates over --budget, MoE error, KLD/MMLU, or a work-file re-decode mismatch; the
+report names the 3.0-bit fallback), or for verify a container decode mismatch; 1 error
+(traceback in the log). See README.md for the full command and its figures.
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -64,6 +68,50 @@ def dir_bytes(path):
     return total
 
 
+def preflight_run(a, log):
+    """The checks before any GPU or disk work; returns the checkpoint directories (or None)."""
+    import preflight
+    import trellis
+    preflight.check_gpu(a.lock_owner)
+    out_need = max(expected_output_bytes(a.layers, a.table_shards) - dir_bytes(a.out), 0)
+    small_dir = a.ckpt_small_dir or os.path.join(a.out, "work", "state", "ckpt")
+    big_ck, small_ck = 13.6 * GB, 6.9 * GB      # the state sizes of the run 8 corpus (README)
+    same_drive = os.path.splitdrive(os.path.abspath(small_dir))[0].lower() == \
+        os.path.splitdrive(os.path.abspath(a.out))[0].lower()
+    free = preflight.check_disk(a.out, out_need + (small_ck if same_drive else 0), a.disk_margin_gb * GB, "output")
+    log(f"disk: {free / GB:.1f} GB free on {a.out}; output still to write {out_need / GB:.1f} GB "
+        f"+ {'small checkpoint ' + format(small_ck / GB, '.1f') + ' GB + ' if same_drive else ''}"
+        f"margin {a.disk_margin_gb} GB")
+    if not same_drive:
+        preflight.check_disk(small_dir, small_ck - dir_bytes(small_dir), 1 * GB, "small checkpoint")
+    ck_dirs = [a.ckpt_dir, small_dir]
+    try:
+        preflight.check_disk(a.ckpt_dir, big_ck - dir_bytes(a.ckpt_dir), 1 * GB, "checkpoint")
+    except preflight.Refused as e:
+        log(f"WARNING {e}: no state checkpoint; a relaunch replays the finished layers from layer 0")
+        ck_dirs = None
+    trellis.check_version()
+    frac, total = preflight.cap_vram(a.vram_gb)
+    log(f"VRAM cap {a.vram_gb} GB ({frac:.3f} of {total / GB:.1f} GB)")
+    return ck_dirs
+
+
+def check_run_record(conv):
+    """A work tree belongs to one configuration (revision, corpus, layers, table shards, budget):
+    returns why this one differs, or None after recording it on first use."""
+    import layout
+    path = os.path.join(conv.work, "state", "run.json")
+    want = json.loads(json.dumps(conv.run_record()))
+    if os.path.exists(path):
+        have = json.load(open(path))
+        if have != want:
+            keys = sorted(k for k in set(have) | set(want) if have.get(k) != want.get(k))
+            return f"{conv.work} was made by another configuration (differs in {keys}): use a fresh --out"
+        return None
+    layout.write_json_atomic(path, want)
+    return None
+
+
 def cmd_run(a):
     import driver
     import preflight
@@ -72,39 +120,27 @@ def cmd_run(a):
     log(f"convert {' '.join(sys.argv[1:])}")
     t_start = time.time()
     try:
-        preflight.check_gpu(a.lock_owner)
-        out_need = expected_output_bytes(a.layers, a.table_shards) - dir_bytes(a.out)
-        small_dir = a.ckpt_small_dir or os.path.join(a.out, "work", "state", "ckpt")
-        # state checkpoint sizes are known once the corpus is loaded; reserve them now
-        big_ck, small_ck = 13.6 * GB, 6.9 * GB
-        same_drive = os.path.splitdrive(os.path.abspath(small_dir))[0].lower() == \
-            os.path.splitdrive(os.path.abspath(a.out))[0].lower()
-        free = preflight.check_disk(a.out, max(out_need, 0) + (small_ck if same_drive else 0),
-                                    a.disk_margin_gb * GB, "output")
-        log(f"disk: {free / GB:.1f} GB free on {a.out}; output still to write {max(out_need, 0) / GB:.1f} GB "
-            f"+ small checkpoint {small_ck / GB:.1f} GB + margin {a.disk_margin_gb} GB")
-        ck_dirs = [a.ckpt_dir, small_dir]
-        try:
-            preflight.check_disk(a.ckpt_dir, big_ck - dir_bytes(a.ckpt_dir), 1 * GB, "checkpoint")
-        except preflight.Refused as e:
-            log(f"WARNING {e}: no state checkpoint; a relaunch replays the finished layers from layer 0")
-            ck_dirs = None
-        import torch
-        import trellis
-        trellis.check_version()
-        frac, total = preflight.cap_vram(a.vram_gb)
-        log(f"VRAM cap {a.vram_gb} GB ({frac:.3f} of {total / GB:.1f} GB)")
+        ck_dirs = preflight_run(a, log)
     except preflight.Refused as e:
         log(f"REFUSED: {e}")
         return driver.EXIT_REFUSED
+    except Exception:
+        log("ERROR in the preflight\n" + traceback.format_exc())
+        return driver.EXIT_ERROR
     try:
-        import pipeline
         import finish
+        import pipeline
         conv = pipeline.Conversion(a, log)
+        why = check_run_record(conv)
+        if why:
+            log(f"REFUSED: {why}")
+            return driver.EXIT_REFUSED
         big, small = state_bytes(conv)
         log(f"state: BF16 stream {big / GB:.1f} GB, quantized + FP8-only {small / GB:.1f} GB; RSS "
             f"{pipeline.rss_gb():.1f} GB")
-        ck = driver.Checkpoint(ck_dirs, placement=lambda name: 0 if name.startswith("bf16.") else 1)             if ck_dirs else None
+        ck = None
+        if ck_dirs:
+            ck = driver.Checkpoint(ck_dirs, placement=lambda name: 0 if name.startswith("bf16.") else 1)
         peek = ck.next_layer(conv.fingerprint()) if ck else None
         conv.start_table(need_gather=not (peek and peek >= 2))
         loop = driver.LayerLoop(a.layers, conv.layer_dir, stop_file=a.stop_file, checkpoint=ck,
@@ -117,6 +153,44 @@ def cmd_run(a):
             if conv.sweep.error:
                 raise conv.sweep.error
         return finish.finish(conv, state, t_start)
+    except Exception:
+        log("ERROR\n" + traceback.format_exc())
+        return driver.EXIT_ERROR
+
+
+def cmd_verify(a):
+    """After packing: decode the sampled expert projections from the container's own bytes and
+    compare them with the sha256 the pass recorded (spec 01 acceptance 7)."""
+    import hashlib
+    import container
+    import driver
+    import layout
+    import preflight
+    import torch
+    import trellis
+    sidecar = a.sidecar or a.artifact + ".conversion.json"
+    log = Log(os.path.join(os.path.dirname(os.path.abspath(a.artifact)), "verify.log"))
+    try:
+        preflight.check_gpu(a.lock_owner)
+        preflight.cap_vram(a.vram_gb)
+        side = json.load(open(sidecar))
+        c = container.Container(a.artifact)
+        bad = []
+        for s in side["decode_sha256"]:
+            proj = s["class"].split("-")[0]
+            k2, rec = c.expert_record(s["layer"], s["expert"], proj)
+            w = trellis.decode(rec, k2, proj, "cuda").to(torch.bfloat16)
+            if hashlib.sha256(w.cpu().view(torch.int16).numpy().tobytes()).hexdigest() != s["sha256"]:
+                bad.append(f"L{s['layer']} {s['class']} expert {s['expert']}")
+        result = {"artifact": a.artifact, "projections_checked": len(side["decode_sha256"]),
+                  "bit_identical": not bad, "mismatches": bad}
+        layout.write_json_atomic(os.path.join(os.path.dirname(os.path.abspath(a.artifact)), "verify.json"), result)
+        log(f"verify: {result['projections_checked']} projections decoded from the container, "
+            f"bit-identical to the pass: {not bad}" + (f"; mismatches {bad}" if bad else ""))
+        return 0 if not bad else driver.EXIT_QUALITY_FAIL
+    except preflight.Refused as e:
+        log(f"REFUSED: {e}")
+        return driver.EXIT_REFUSED
     except Exception:
         log("ERROR\n" + traceback.format_exc())
         return driver.EXIT_ERROR
@@ -150,6 +224,12 @@ def main(argv=None):
     r.add_argument("--prefetch", type=int, default=1, choices=(0, 1), help="fetch layer L+1 during L (+5 GB RAM)")
     r.add_argument("--disk-margin-gb", type=float, default=15.0)
     r.set_defaults(fn=cmd_run)
+    v = sub.add_parser("verify", help="after packing: decode the sampled projections from the container")
+    v.add_argument("--artifact", required=True)
+    v.add_argument("--sidecar", default=None, help="default: <artifact>.conversion.json")
+    v.add_argument("--lock-owner", required=True)
+    v.add_argument("--vram-gb", type=float, default=24.0)
+    v.set_defaults(fn=cmd_verify)
     f = sub.add_parser("fixture", help="a reduced work tree (2 layers, 8 experts, 1000 table rows), CPU only")
     f.add_argument("--out", required=True)
     f.set_defaults(fn=cmd_fixture)

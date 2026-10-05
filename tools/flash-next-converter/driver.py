@@ -1,7 +1,8 @@
 """The layer loop: one decoder layer at a time, resumable, stoppable, crash-safe.
 
-A layer is *finished* when its work directory holds DONE (layout.md §2). On launch the
-loop loads the state checkpoint if it is complete and of this configuration, then
+A layer is *finished* when its work directory holds DONE (layout.md §2) and its files still
+match it (a torn directory is wiped). On launch the loop loads the state checkpoint if it
+is complete, of this configuration and not past an unfinished layer, then
 walks the layers: a finished layer is **replayed** (the streams run forward from the
 work files, nothing is re-encoded), an unfinished one is wiped and **processed**.
 Without a usable checkpoint the replay starts at layer 0, so a torn checkpoint costs
@@ -106,14 +107,21 @@ class LayerLoop:
         """model: fingerprint(), initial_state(), process(L, state), replay(L, state).
         Returns (exit code, state)."""
         fp = model.fingerprint()
+        for L in range(self.n):
+            d = self.layer_dir(L)
+            if layout.is_done(d) and not layout.verify_done(d):
+                self.log(f"layer {L}: its files do not match DONE, the layer is redone")
+                shutil.rmtree(d)
+        first_open = next((L for L in range(self.n) if not layout.is_done(self.layer_dir(L))), self.n)
         got = self.checkpoint.load(fp) if self.checkpoint else None
+        if got is not None and got[1] > first_open:
+            self.log(f"the checkpoint (layer {got[1]}) is past unfinished layer {first_open}: not used")
+            got = None
         if got is not None:
             state, start = got
             self.log(f"resumed from the checkpoint at layer {start}")
         else:
             state, start = model.initial_state(), 0
-        if any(not layout.is_done(self.layer_dir(L)) for L in range(start)):
-            raise RuntimeError("the checkpoint is past a layer whose work directory is not finished")
         dirty = False   # whether the state moved past the checkpoint
         for L in range(start, self.n):
             if self._stop_requested():

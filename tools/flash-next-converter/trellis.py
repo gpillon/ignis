@@ -68,11 +68,11 @@ def decode(rec, k2, proj, device):
     ext, xq = _ext()
     i, o = layout.SHAPES[proj]
     w = torch.empty((i, o), dtype=torch.half, device=device)
-    ext.reconstruct(w, torch.from_numpy(np.ascontiguousarray(rec["trellis"])).to(device), k_value(k2), False, True)
+    ext.reconstruct(w, torch.from_numpy(np.array(rec["trellis"])).to(device), k_value(k2), False, True)
     w = xq.preapply_had_l(w.float(), 128)
-    w *= torch.from_numpy(np.ascontiguousarray(rec["suh"])).to(device).float()[:, None]
+    w *= torch.from_numpy(np.array(rec["suh"])).to(device).float()[:, None]
     w = xq.preapply_had_r(w, 128)
-    w *= torch.from_numpy(np.ascontiguousarray(rec["svh"])).to(device).float()[None, :]
+    w *= torch.from_numpy(np.array(rec["svh"])).to(device).float()[None, :]
     return w.T
 
 
@@ -80,3 +80,37 @@ def debug_dir(work):
     d = os.path.join(work, "state", "exl3_debug")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def reconstruct_raw(rec, k2, proj, device):
+    """exllamav3's reconstruct output alone: the (in, out) fp16 weight in the rotated basis."""
+    ext, _ = _ext()
+    i, o = layout.SHAPES[proj]
+    w = torch.empty((i, o), dtype=torch.half, device=device)
+    ext.reconstruct(w, torch.from_numpy(np.array(rec["trellis"])).to(device), k_value(k2), False, True)
+    return w
+
+
+# kern's full-shape decode checksum (kernel/tests/fixtures/flash_next/record.py, checksum_u16), copied
+M32 = 0xFFFFFFFF
+
+
+def lowbias32(x):
+    x = x & M32
+    x = x ^ (x >> 16)
+    x = (x * 0x7FEB352D) & M32
+    x = x ^ (x >> 15)
+    x = (x * 0x846CA68B) & M32
+    x = x ^ (x >> 16)
+    return x
+
+
+def checksum_u16(values16):
+    """sum_i u16[i] * (lowbias32(i) | 1) mod 2^64 over the row-major (in, out) fp16 bits."""
+    v = values16.reshape(-1).view(torch.int16).to(torch.int64).cpu() & 0xFFFF
+    mult = lowbias32(torch.arange(v.numel(), dtype=torch.int64)) | 1
+    prod = v * mult  # < 2^48, exact in int64
+    total = 0
+    for chunk in prod.split(1 << 20):
+        total = (total + int(chunk.sum().item())) % (1 << 64)
+    return total

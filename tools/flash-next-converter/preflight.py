@@ -1,8 +1,8 @@
 """Before the first byte: a free GPU (held by our lock), a VRAM cap, enough disk.
 
 The card fits one run at a time and the loser dies with no diagnostic, so the converter
-refuses to start unless the shared GPU lock is held by the owner it was launched as and
-no other process has a compute context on the card.
+refuses to start unless the shared GPU lock is held by the owner it was launched as, no
+known GPU workload is running and little VRAM is in use (the Makefile's gpu-guard rules).
 """
 import os
 import shutil
@@ -45,16 +45,20 @@ def vram_used_mib():
     return int(out.stdout.split()[0])
 
 
-def check_gpu(expected_owner, lock_dir=LOCK_DIR):
+def process_names():
+    import psutil
+    return [p.info["name"] or "" for p in psutil.process_iter(["name"])]
+
+
+def check_gpu(expected_owner, lock_dir=LOCK_DIR, names=process_names, vram_used=vram_used_mib):
     owner = lock_owner(lock_dir)
     if owner != expected_owner:
         raise Refused(f"the GPU lock is held by {owner!r}, not {expected_owner!r}: take it first "
                       f"(bash .swarm/gpu-lock.sh try {expected_owner} ...)")
-    import psutil
-    held = gpu_holders(p.info["name"] or "" for p in psutil.process_iter(["name"]))
+    held = gpu_holders(names())
     if held:
         raise Refused(f"GPU workloads are running: {held}")
-    used = vram_used_mib()
+    used = vram_used()
     if used >= VRAM_THRESHOLD_MIB:
         raise Refused(f"{used} MiB of VRAM already in use (guard threshold {VRAM_THRESHOLD_MIB} MiB)")
     return used
@@ -69,9 +73,13 @@ def cap_vram(gb):
 
 
 def free_bytes(path):
+    """Free bytes on the drive of `path`, which need not exist yet (its drive must)."""
     p = os.path.abspath(path)
     while not os.path.exists(p):
-        p = os.path.dirname(p)
+        parent = os.path.dirname(p)
+        if parent == p:
+            raise Refused(f"{path}: no such drive")
+        p = parent
     return shutil.disk_usage(p).free
 
 

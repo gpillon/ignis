@@ -78,3 +78,36 @@ def test_a_source_outside_the_allowlist_is_refused(tmp_path):
 
 def test_the_committed_manifest_only_names_allowlisted_sources():
     corpus.check_allowlist(json.load(open(corpus.MANIFEST)))
+
+
+def test_a_table_cache_shard_that_moved_is_refused(tmp_path):
+    (tmp_path / "shard_0.weight.pt").write_bytes(b"a" * 3000)
+    size, head, tail = corpus._head_tail(tmp_path / "shard_0.weight.pt")
+    man = {"table_cache": {"files": [{"file": "shard_0.weight.pt", "bytes": size, "head_sha256": head,
+                                      "tail_sha256": tail}]}}
+    corpus.check_table_cache(tmp_path, 1, man)
+    (tmp_path / "shard_0.weight.pt").write_bytes(b"a" * 2999 + b"b")
+    with pytest.raises(corpus.CorpusError, match="first/last"):
+        corpus.check_table_cache(tmp_path, 1, man)
+
+
+def test_the_committed_manifest_pins_all_128_table_shards():
+    man = json.load(open(corpus.MANIFEST))
+    assert [f["file"] for f in man["table_cache"]["files"]] == [f"shard_{n}.weight.pt" for n in range(128)]
+
+
+def test_a_hot_sample_file_that_changed_is_refused(tmp_path):
+    man = copy.deepcopy(json.load(open(corpus.MANIFEST)))
+    man["hot_sample"]["corpora"] = [c for c in man["hot_sample"]["corpora"] if c["kind"] == "parquet"][:1]
+    f = man["hot_sample"]["corpora"][0]["files"][0]
+    (tmp_path / f["file"]).parent.mkdir(parents=True)
+    (tmp_path / f["file"]).write_bytes(b"not the pinned parquet")
+    with pytest.raises(corpus.CorpusError, match="sha256"):
+        list(corpus.hot_sample_corpora(tmp_path, tmp_path, man))
+
+
+def test_licences_name_each_used_source():
+    man = json.load(open(corpus.MANIFEST))
+    lic = corpus.licences(man, ["tiger-lab-mmlu-pro", "wikitext-103", "tiger-lab-mmlu-pro"])
+    assert lic == {"tiger-lab-mmlu-pro": man["allowlist"]["tiger-lab-mmlu-pro"],
+                   "wikitext-103": man["allowlist"]["wikitext-103"]}

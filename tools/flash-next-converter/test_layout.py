@@ -99,3 +99,15 @@ def test_the_fixture_tree_is_complete_and_readable(tmp_path):
     raw = (tmp_path / "work" / "ngram" / "table" / "shard_000.int4").read_bytes()
     assert len(raw) == 1000 * 90
     assert layout.is_done(tmp_path / "work" / "ngram") and layout.is_done(tmp_path / "work" / "global")
+
+
+def test_done_verification_catches_a_torn_or_changed_file(tmp_path):
+    (tmp_path / "a.bin").write_bytes(b"x" * 100)
+    (tmp_path / "b.json").write_text("{}")
+    layout.mark_done(tmp_path)
+    assert layout.verify_done(tmp_path)
+    (tmp_path / "a.bin").write_bytes(b"x" * 99 + b"y")      # same size, other bytes
+    assert not layout.verify_done(tmp_path)
+    (tmp_path / "a.bin").write_bytes(b"x" * 50)              # torn
+    assert not layout.verify_done(tmp_path)
+    assert not layout.verify_done(tmp_path / "missing")

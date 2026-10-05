@@ -1,10 +1,13 @@
 """After the last layer: the head over the three streams, the stored references, the G1
-fixture, the routing traces, the self-check, converter.json and the plain report.
+fixture, the routing traces, the kernel references, the verdicts, converter.json and the
+plain report.
 """
 import hashlib
+import importlib.metadata as md
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -12,9 +15,8 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-import fp8
+import corpus as corpus_mod
 import layout
 import pipeline as P
 import scoring
@@ -144,12 +146,17 @@ def _score_window(heads, states, tokens, valid, writer, acc, kind, mm=(), letter
     return torch.cat(argmax_q), torch.cat(argmax_r)
 
 
+def _accumulator():
+    """stream -> measure -> domain -> [per-position tensors], plus MMLU (answer, gold) rows."""
+    acc = {k: defaultdict(lambda: defaultdict(list)) for k in ("q", "f8", "ref", "head")}
+    acc["mmlu"] = defaultdict(list)
+    return acc
+
+
 def head_pass(conv, state, refs_root):
     dev = conv.dev
     heads = {"bf16": Head(conv, quantized=False), "q": Head(conv, quantized=True)}
-    acc = {"q": defaultdict(lambda: defaultdict(list)), "f8": defaultdict(lambda: defaultdict(list)),
-           "ref": defaultdict(lambda: defaultdict(list)), "head": defaultdict(lambda: defaultdict(list)),
-           "mmlu": defaultdict(list)}
+    acc = _accumulator()
     letters = conv.corpus.letter_ids
     with torch.no_grad():
         w = RefWriter(refs_root, "test2048")
@@ -162,9 +169,7 @@ def head_pass(conv, state, refs_root):
             _score_window(heads, states, c["ids"], c["valid"], w, acc, c["kind"], mm=marks, letters=letters)
             del states
         w.close()
-        long_acc = {"q": defaultdict(lambda: defaultdict(list)), "f8": defaultdict(lambda: defaultdict(list)),
-                    "ref": defaultdict(lambda: defaultdict(list)), "head": defaultdict(lambda: defaultdict(list)),
-                    "mmlu": defaultdict(list)}
+        long_acc = _accumulator()
         w = RefWriter(refs_root, "long8192")
         for j, x in enumerate(conv.corpus.long):
             states = {"bf16": state["bf16.long"][j].to(dev), "q": state["q.long"][j].to(dev)}
@@ -173,9 +178,7 @@ def head_pass(conv, state, refs_root):
         w.close()
         g1 = []
         w = RefWriter(refs_root, "canary")
-        canary_acc = {"q": defaultdict(lambda: defaultdict(list)), "f8": defaultdict(lambda: defaultdict(list)),
-                      "ref": defaultdict(lambda: defaultdict(list)), "head": defaultdict(lambda: defaultdict(list)),
-                      "mmlu": defaultdict(list)}
+        canary_acc = _accumulator()
         for j, x in enumerate(conv.canary):
             seq = x["prompt_ids"] + x["token_ids"]
             states = {"bf16": state["bf16.canary"][j].to(dev), "q": state["q.canary"][j].to(dev)}
@@ -203,6 +206,7 @@ def _mean(parts):
 
 
 def summarize(acc):
+    """Per-domain means of the per-position measures: KLD exact and top-64, top-1, perplexity."""
     out = {}
     for v in ("q", "f8"):
         out[v] = {}
@@ -228,12 +232,12 @@ def traces(conv, root):
         rows = np.concatenate([j * T + np.arange(v) for j, v in zip(js, valids)])
         d = os.path.join(root, name)
         os.makedirs(d, exist_ok=True)
-        for what, dt, width in (("experts", np.int16, 10), ("weights", np.float16, 10), ("lookahead", np.int16, 20)):
+        for what, dt, width, fname in (("experts", "<i2", 10, "experts.i16"), ("weights", "<f2", 10, "weights.f16"),
+                                       ("lookahead", "<i2", 20, "lookahead.i16")):
             arr = np.empty((rows.size, conv.n_layers, width), dtype=dt)
             for L in range(conv.n_layers):
                 arr[:, L] = np.load(os.path.join(conv.layer_dir(L), f"route_{s}_{what}.npy"), mmap_mode="r")[rows]
-            arr.astype({"experts": "<i2", "weights": "<f2", "lookahead": "<i2"}[what]).tofile(
-                os.path.join(d, {"experts": "experts.i16", "weights": "weights.f16", "lookahead": "lookahead.i16"}[what]))
+            arr.tofile(os.path.join(d, fname))
         layout.write_json_atomic(os.path.join(d, "manifest.json"), {
             "tokens": int(rows.size), "layers": conv.n_layers, "set": s, "chunks": js, "valid": valids,
             "stream": "quantized", "order": "token-major (N, layers, k)"})
@@ -241,21 +245,114 @@ def traces(conv, root):
     return out
 
 
-def self_check(conv):
-    n, bad = 0, []
-    for L in range(conv.n_layers):
-        d = conv.layer_dir(L)
-        rec = json.load(open(os.path.join(d, "layer.json")))
+def redecode_work_files(conv, samples):
+    """Re-decodes the sampled projections from the work files: catches a work file that changed
+    after the pass. The check of the container itself is `convert.py verify` after packing."""
+    bad = []
+    for s in samples:
+        d = conv.layer_dir(s["layer"])
         index = {(e.expert, e.proj): e for e in layout.read_index(os.path.join(d, "experts.idx"))}
-        for cls, s in rec["decode_sha256"].items():
-            proj = cls.split("-")[0]
-            en = index[(s["expert"], proj)]
-            w = trellis.decode(layout.read_record(os.path.join(d, "experts.bin"), en), en.k2, proj, conv.dev)
-            got = hashlib.sha256(w.to(torch.bfloat16).cpu().view(torch.int16).numpy().tobytes()).hexdigest()
-            n += 1
-            if got != s["sha256"]:
-                bad.append(f"L{L} {cls} expert {s['expert']}")
-    return {"projections_checked": n, "bit_identical": not bad, "mismatches": bad}
+        en = index[(s["expert"], s["proj"])]
+        w = trellis.decode(layout.read_record(os.path.join(d, "experts.bin"), en), en.k2, en.proj, conv.dev)
+        if hashlib.sha256(w.to(torch.bfloat16).cpu().view(torch.int16).numpy().tobytes()).hexdigest() != s["sha256"]:
+            bad.append(f"L{s['layer']} {s['class']} expert {s['expert']}")
+    return {"projections_checked": len(samples), "bit_identical": not bad, "mismatches": bad}
+
+
+def kernel_references(conv, layers, refs_root):
+    """Spec 02's machine-local inputs: trellis checksums and the whole-MoE-block recordings."""
+    checks = [c for l in layers for c in l.get("trellis_checksums", [])]
+    layout.write_json_atomic(os.path.join(refs_root, "trellis_checksums.json"), {
+        "checksum": "sum_i u16(reconstruct fp16 bits[i]) * (lowbias32(i) | 1) mod 2^64, row-major (in, out)",
+        "revision": P.fetch.REVISION, "entries": checks})
+    for l in layers:
+        src = os.path.join(conv.layer_dir(l["layer"]), "moe_block")
+        if os.path.isdir(src):
+            dst = os.path.join(refs_root, "moe_block", f"L{l['layer']:02d}")
+            os.makedirs(dst, exist_ok=True)
+            for f in os.listdir(src):
+                shutil.copyfile(os.path.join(src, f), os.path.join(dst, f))
+    return len(checks)
+
+
+FP8_FLAG_KLD = 0.01
+
+
+def verdict(layers, summary, mmlu_rows, redecode_ok, budget, full):
+    """The acceptance verdicts of spec 01 from the pass's measurements (pure, unit-tested).
+    `mmlu_rows`: {"ref"|"q"|"f8": [(answer, gold)]}. Returns the record and the exit code."""
+    rates = {p: float(np.mean([l["rates"][p] for l in layers])) for p in ("gu", "dn")}
+    a2 = all(rates[p] <= budget + 1e-12 for p in rates) and all(
+        set(l["k2"][p]) <= set(layout.K2_SET) for l in layers for p in ("gu", "dn"))
+    dbs = [l["moe_db"] for l in layers]
+    mean15 = float(np.mean(dbs[1:6])) if len(dbs) >= 6 else None
+    worse = [l["layer"] for l in layers if l["moe_db"] > P.RUN6_DB[l["layer"]] + 1.0]
+    a3 = mean15 is not None and mean15 <= P.RUN8_MEAN_1_5 + 0.5
+    kld = {"quantized": {}, "fp8_only": {}}
+    a4_kld = True
+    for kind, s in summary["q"].items():
+        lim = 1.1 * P.RUN6_KLD[kind] if kind in P.RUN6_KLD else None
+        ok = lim is None or s["kld"] <= lim
+        a4_kld &= ok
+        kld["quantized"][kind] = dict(s, run6=P.RUN6_KLD.get(kind, P.RUN6_KLD_INFO.get(kind)), limit=lim, within=ok)
+    flags = []
+    for kind, s in summary["f8"].items():
+        kld["fp8_only"][kind] = dict(s, run6_fp8=P.RUN6_FP8_KLD.get(kind))
+        if s["kld"] > FP8_FLAG_KLD:
+            flags.append(f"FP8-only KLD {s['kld']:.4f} > {FP8_FLAG_KLD} on {kind}: the FP8 non-experts cost measurably")
+    ok_ref = [a == g for a, g in mmlu_rows.get("ref", [])]
+    mmlu = {"n": len(ok_ref), "bf16": float(np.mean(ok_ref)) if ok_ref else None, "mcnemar": {}}
+    a4_mmlu = True
+    for v, name in (("q", "quantized"), ("f8", "fp8_only")):
+        okv = [a == g for a, g in mmlu_rows.get(v, [])]
+        mmlu[name] = float(np.mean(okv)) if okv else None
+        lost, gained, p = scoring.paired(ok_ref, okv)
+        mmlu["mcnemar"][name] = {"lost": lost, "gained": gained, "p": p}
+        if v == "q":
+            significantly_below = lost > gained and p <= 0.05
+            a4_mmlu = mmlu[name] is not None and mmlu[name] >= P.MMLU_FLOOR and not significantly_below
+    a4 = a4_kld and a4_mmlu
+    if not full:
+        word, code = "DRY-RUN", 0
+    elif a2 and a3 and a4 and redecode_ok:
+        word, code = "PASS", 0
+    else:
+        word, code = "FAIL", 3
+    return {"verdict": word, "rates": rates, "flags": flags,
+            "acceptance2": {"pass": a2, "budget": budget},
+            "acceptance3": {"mean_db_layers_1_5": mean15, "run8_mean_db_layers_1_5": P.RUN8_MEAN_1_5,
+                            "named_layers_worse_than_run6_by_1db": worse, "pass": a3},
+            "kld": kld, "mmlu": mmlu,
+            "acceptance4": {"pass": a4, "kld_pass": a4_kld, "mmlu_pass": a4_mmlu,
+                            "fallback": "re-convert at a 3.0-bit mean into a new -Out: -Extra \"--budget 3.0\" "
+                                        "(45.3 GB pinned)"}}, code
+
+
+def _tokens(chunks, cal):
+    out = defaultdict(int)
+    for c in chunks:
+        if bool(c["cal"]) == cal and (cal or c["test"]):
+            out[c["kind"]] += c["valid"]
+    return dict(out)
+
+
+def k_classes(layers):
+    """Per K class: projection count, record bytes, calibration selections landing on it, share."""
+    counts, selections = defaultdict(int), defaultdict(int)
+    for l in layers:
+        tr = l["expert_traffic"]
+        for p in ("gu", "dn"):
+            for e, k2 in enumerate(l["k2"][p]):
+                counts[(p, k2)] += 1
+                selections[(p, k2)] += tr[e]
+    total = sum(sum(l["expert_traffic"]) for l in layers)
+    out = []
+    for p in ("gu", "dn"):
+        for k2 in layout.K2_SET:
+            out.append({"class": f"{p}-{k2 / 2:g}", "k2": k2, "projections": counts[(p, k2)],
+                        "record_bytes": layout.record_bytes(p, k2), "selections": selections[(p, k2)],
+                        "traffic_share": selections[(p, k2)] / total if total else 0.0})
+    return out
 
 
 def finish(conv, state, t_start):
@@ -268,135 +365,82 @@ def finish(conv, state, t_start):
     summary = summarize(acc)
     long_summary = summarize(long_acc)
     tr = traces(conv, os.path.join(conv.out, "traces"))
-    sc = self_check(conv)
     layers = [json.load(open(os.path.join(conv.layer_dir(L), "layer.json"))) for L in range(conv.n_layers)]
-    full = conv.n_layers == P.N_LAYERS
-
-    # acceptance 2
-    rates = {p: float(np.mean([l["rates"][p] for l in layers])) for p in ("gu", "dn")}
-    stored = {p: float(np.mean([l["stored_rates"][p] for l in layers])) for p in ("gu", "dn")}
-    a2 = all(rates[p] <= 2.5 + 1e-12 for p in rates) and all(
-        set(l["k2"][p]) <= set(layout.K2_SET) for l in layers for p in ("gu", "dn"))
-    # acceptance 3
-    dbs = [l["moe_db"] for l in layers]
-    mean15 = float(np.mean(dbs[1:6])) if len(dbs) >= 6 else None
-    worse = [l["layer"] for l in layers if l["moe_db"] > P.RUN6_DB[l["layer"]] + 1.0]
-    a3 = mean15 is not None and mean15 <= P.RUN8_MEAN_1_5 + 0.5
-    # acceptance 4
-    kld = {"quantized": {}, "fp8_only": {}}
-    a4_kld = True
-    for kind, s in summary["q"].items():
-        lim = 1.1 * P.RUN6_KLD[kind] if kind in P.RUN6_KLD else None
-        ok = lim is None or s["kld"] <= lim
-        a4_kld &= ok
-        kld["quantized"][kind] = dict(s, run6=P.RUN6_KLD.get(kind, P.RUN6_KLD_INFO.get(kind)), limit=lim, pass_=ok)
-    for kind, s in summary["f8"].items():
-        kld["fp8_only"][kind] = dict(s, run6_fp8=P.RUN6_FP8_KLD.get(kind))
-    mm = acc["mmlu"]
-    ok_ref = [a == g for a, g in mm["ref"]]
-    mmlu = {"n": len(ok_ref), "bf16": float(np.mean(ok_ref)) if ok_ref else None, "mcnemar": {}}
-    a4_mmlu = True
-    for v, name in (("q", "quantized"), ("f8", "fp8_only")):
-        okv = [a == g for a, g in mm[v]]
-        mmlu[name] = float(np.mean(okv)) if okv else None
-        lost, gained, p = scoring.paired(ok_ref, okv)
-        mmlu["mcnemar"][name] = {"lost": lost, "gained": gained, "p": p}
-        if v == "q":
-            sig_below = lost > gained and p <= 0.05
-            a4_mmlu = mmlu[name] is not None and mmlu[name] >= P.MMLU_FLOOR and not sig_below
-    a4 = a4_kld and a4_mmlu
-    verdict = "PASS" if (a2 and a3 and a4 and sc["bit_identical"]) else "FAIL"
-    if not full:
-        verdict = "DRY-RUN"
-    total = time.time() - t_start
+    samples = [s for l in layers for s in l["decode_sha256"]]
+    rd = redecode_work_files(conv, samples)
+    n_checks = kernel_references(conv, layers, refs_root)
+    full = conv.n_layers == P.N_LAYERS and conv.table_shards == P.TABLE_SHARDS
+    v, code = verdict(layers, summary, acc["mmlu"], rd["bit_identical"], conv.args.budget, full)
     hot = json.load(open(os.path.join(conv.work, "ngram", "hot_rows.json")))
+    man = json.load(open(corpus_mod.MANIFEST))
+    sources = [s for e in conv.corpus.manifest for s in e["sources"]] + man["canary"]["sources"] + \
+        [s for c in man["hot_sample"]["corpora"] for s in c["sources"]]
     repo = conv.args.repo
-    import importlib.metadata as md
+    stored = {p: float(np.mean([l["stored_rates"][p] for l in layers])) for p in ("gu", "dn")}
     record = {
         "schema": P.CONVERTER_SCHEMA,
         "status": "complete" if full else "dry-run",
-        "verdict": verdict,
+        "verdict": v["verdict"],
+        "flags": v["flags"],
         "source": {"repo": P.fetch.REPO, "revision": P.fetch.REVISION},
         "converter": {"commit": _git(repo, "rev-parse", "HEAD"),
                       "dirty": bool(_git(repo, "status", "--porcelain", "--", "tools/flash-next-converter")),
                       "seed_rule": "exllamav3 seed L*10000 + proj*1000 + expert (proj 0 gate/up, 1 down)",
-                      "command": " ".join(sys.argv)},
+                      "command": " ".join(sys.argv), "run": conv.run_record()},
         "versions": {"exllamav3": md.version("exllamav3"), "transformers": md.version("transformers"),
                      "torch": torch.__version__, "python": platform.python_version()},
         "quantizer": {"codebook": "mul1", "apply_out_scales": True, "K_set": [k / 2 for k in layout.K2_SET],
                       "hessian": "g^2-weighted per-expert input metric on calibration tokens; gate/up shrunk 5% "
-                                 "toward the layer H, down 5% toward I", "budget_bits": conv.args.budget,
-                      "batch": P.BQ},
-        "corpus": {"manifest": conv.corpus.manifest,
+                                 "toward the layer H, down 5% toward I; an expert with no calibration token takes "
+                                 "the layer H (gate/up) and its all-token activation moment (down)",
+                      "budget_bits": conv.args.budget, "batch": P.BQ,
+                      "hessian_fallback": {l["layer"]: l.get("hessian_fallback", []) for l in layers}},
+        "corpus": {"manifest": conv.corpus.manifest, "licences": corpus_mod.licences(man, sources),
                    "calibration_chunks": sum(1 for c in conv.chunks if c["cal"]),
                    "test_chunks": len(conv.test_sel),
-                   "tokens_per_domain": {
-                       "calibration": _tokens(conv.chunks, True), "test": _tokens(conv.chunks, False)},
-                   "long8192": [x["source"] for x in conv.corpus.long],
-                   "canary": [x["id"] for x in conv.canary]},
+                   "tokens_per_domain": {"calibration": _tokens(conv.chunks, True),
+                                         "test": _tokens(conv.chunks, False)},
+                   "long8192": [{"window": x["window"], "start": x["start"], "kind": x["kind"]}
+                                for x in conv.corpus.long],
+                   "canary": [x["id"] for x in conv.canary],
+                   "hot_sample_tokens": hot.get("sample_tokens")},
         "k_map": {"layers": [{"layer": l["layer"], "gu": l["k2"]["gu"], "dn": l["k2"]["dn"]} for l in layers]},
         "k_hist": [{"layer": l["layer"], **{p: dict(zip(["2", "2.5", "3", "4"], l["k_hist"][p]))
                                             for p in ("gu", "dn")}} for l in layers],
         "rates": {"per_layer": [{"layer": l["layer"], "gu": l["rates"]["gu"], "dn": l["rates"]["dn"],
                                  "gu_stored": l["stored_rates"]["gu"], "dn_stored": l["stored_rates"]["dn"]}
                                 for l in layers],
-                  "mean": {"gu": rates["gu"], "dn": rates["dn"], "gu_stored": stored["gu"], "dn_stored": stored["dn"]}},
-        "k_classes": _k_classes(layers),
+                  "mean": {"gu": v["rates"]["gu"], "dn": v["rates"]["dn"], "gu_stored": stored["gu"],
+                           "dn_stored": stored["dn"]}},
+        "k_classes": k_classes(layers),
         "expert_traffic": {"layers": [{"layer": l["layer"], "counts": l["expert_traffic"]} for l in layers]},
         "moe_error_db": [{"layer": l["layer"], "db": l["moe_db"], "run6_db": l["run6_db"], "run8_db": l["run8_db"],
                           "per_kind_db": l["moe_db_kind"]} for l in layers],
-        "acceptance2": {"pass": a2},
-        "acceptance3": {"mean_db_layers_1_5": mean15, "run8_mean_db_layers_1_5": P.RUN8_MEAN_1_5,
-                        "named_layers_worse_than_run6_by_1db": worse, "pass": a3},
-        "kld": kld,
+        "acceptance2": v["acceptance2"],
+        "acceptance3": v["acceptance3"],
+        "kld": v["kld"],
         "kld_long8192": long_summary,
         "kld_head_fp8_only": summary["head_fp8_only"],
-        "mmlu": mmlu,
-        "acceptance4": {"pass": a4, "kld_pass": a4_kld, "mmlu_pass": a4_mmlu,
-                        "fallback": "re-convert at a 3.0-bit mean: --budget 3.0 (45.3 GB pinned)"},
-        "self_check": sc,
+        "mmlu": v["mmlu"],
+        "acceptance4": v["acceptance4"],
+        "experts_bin": [{"layer": l["layer"], **l["experts_bin"]} for l in layers],
+        "decode_sha256": [{"layer": s["layer"], "class": s["class"], "expert": s["expert"], "sha256": s["sha256"]}
+                          for s in samples],
+        "self_check": {"work_files": rd, "container": "convert.py verify, after packing"},
         "ngram": {"rows": P.TABLE_SHARDS * P.SHARD_ROWS, "row_bytes": 90, "hot_rows": hot["rows"],
                   "hot_rows_bytes": hot["bytes"], "shards_converted": conv.table_shards},
-        "references": {"dir": "references", "sets": ["test2048", "long8192", "canary"], "g1": "g1_flash_next.json"},
+        "references": {"dir": "references", "sets": ["test2048", "long8192", "canary"], "g1": "g1_flash_next.json",
+                       "trellis_checksums": n_checks,
+                       "moe_block": [f"L{L:02d}" for L in P.MOE_BLOCK_LAYERS if L < conv.n_layers]},
         "traces": {"dir": "traces", "domains": tr},
-        "time_s": {"total": total, "per_layer": [l["time_s"] for l in layers]},
+        "time_s": {"total": time.time() - t_start, "per_layer": [l["time_s"] for l in layers]},
     }
     layout.write_json_atomic(os.path.join(conv.work, "converter.json"), record)
     report = render_report(record, layers)
     with open(os.path.join(conv.out, "report.txt"), "w", encoding="utf-8") as f:
         f.write(report)
     log(report)
-    if verdict == "FAIL":
-        return 3
-    return 0
-
-
-def _tokens(chunks, cal):
-    out = defaultdict(int)
-    for c in chunks:
-        if bool(c["cal"]) == cal and (cal or c["test"]):
-            out[c["kind"]] += c["valid"]
-    return dict(out)
-
-
-def _k_classes(layers):
-    counts = defaultdict(int)
-    traffic = defaultdict(float)
-    total = 0.0
-    for l in layers:
-        tr = l["expert_traffic"]
-        for p in ("gu", "dn"):
-            for e, k2 in enumerate(l["k2"][p]):
-                counts[(p, k2)] += 1
-                traffic[(p, k2)] += tr[e]
-        total += sum(tr)
-    out = []
-    for p in ("gu", "dn"):
-        for k2 in layout.K2_SET:
-            out.append({"class": f"{p}-{k2 / 2:g}", "k2": k2, "projections": counts[(p, k2)],
-                        "record_bytes": layout.record_bytes(p, k2),
-                        "traffic_share": traffic[(p, k2)] / total if total else 0.0})
-    return out
+    return code
 
 
 def render_report(r, layers):
@@ -406,8 +450,10 @@ def render_report(r, layers):
              f"{' (dirty)' if r['converter']['dirty'] else ''}  exllamav3 {r['versions']['exllamav3']}  "
              f"transformers {r['versions']['transformers']}")
     m = r["rates"]["mean"]
-    L.append(f"rate (K + scales, b/w): gate/up {m['gu']:.4f}  down {m['dn']:.4f}   stored incl. 4 KiB padding: "
-             f"{m['gu_stored']:.4f} / {m['dn_stored']:.4f}   acceptance 2 {'PASS' if r['acceptance2']['pass'] else 'FAIL'}")
+    a2 = r["acceptance2"]
+    L.append(f"rate (K + scales, b/w): gate/up {m['gu']:.4f}  down {m['dn']:.4f} (budget {a2['budget']})   stored "
+             f"incl. 4 KiB padding: {m['gu_stored']:.4f} / {m['dn_stored']:.4f}   acceptance 2 "
+             f"{'PASS' if a2['pass'] else 'FAIL'}")
     L.append("")
     L.append("layer | MoE dB | run 6 | run 8 | K hist gu [2,2.5,3,4] | K hist dn | time s")
     for l in layers:
@@ -416,14 +462,16 @@ def render_report(r, layers):
                  f"{l['k_hist']['dn']} | {l['time_s']:.0f}")
     a3 = r["acceptance3"]
     L.append(f"mean dB layers 1-5 {a3['mean_db_layers_1_5']} (run 8 {a3['run8_mean_db_layers_1_5']}, limit +0.5): "
-             f"{'PASS' if a3['pass'] else 'FAIL'}; layers worse than run 6 by > 1 dB: {a3['named_layers_worse_than_run6_by_1db'] or 'none'}")
+             f"{'PASS' if a3['pass'] else 'FAIL'}; layers worse than run 6 by > 1 dB: "
+             f"{a3['named_layers_worse_than_run6_by_1db'] or 'none'}")
     L.append("")
-    L.append("KLD vs BF16 (test chunks) | quantized exact / top-64 / top-1 | limit (run 6 x 1.1) | FP8-only | run 6 FP8-only")
+    L.append("KLD vs BF16 (test chunks) | quantized exact / top-64 / top-1 | limit (run 6 x 1.1) | "
+             "FP8-only exact | run 6 FP8-only")
     for kind, s in r["kld"]["quantized"].items():
         f = r["kld"]["fp8_only"].get(kind, {})
         lim = f"{s['limit']:.3f}" if s["limit"] is not None else "  -  "
         L.append(f"  {kind:6s} {s['kld']:.4f} / {s['kld_top64']:.4f} / {s['top1'] * 100:.1f}% | {lim} "
-                 f"{'ok' if s['pass_'] else 'OVER'} | {f.get('kld', float('nan')):.4f} | {f.get('run6_fp8')}")
+                 f"{'ok' if s['within'] else 'OVER'} | {f.get('kld', float('nan')):.4f} | {f.get('run6_fp8')}")
     L.append("head alone in FP8 (BF16 stream, KLD): " + ", ".join(
         f"{k} {v:.4f}" for k, v in r["kld_head_fp8_only"].items()))
     mm = r["mmlu"]
@@ -431,8 +479,11 @@ def render_report(r, layers):
              f"(lost/gained/p {mm['mcnemar']['quantized']}), FP8-only {mm['fp8_only']} "
              f"({mm['mcnemar']['fp8_only']}); floor {P.MMLU_FLOOR}")
     a4 = r["acceptance4"]
-    L.append(f"acceptance 4: {'PASS' if a4['pass'] else 'FAIL — fallback: ' + a4['fallback']}")
-    sc = r["self_check"]
-    L.append(f"self-check: {sc['projections_checked']} projections re-decoded, bit-identical {sc['bit_identical']}")
+    L.append(f"acceptance 4: {'PASS' if a4['pass'] else 'FAIL; fallback: ' + a4['fallback']}")
+    for fl in r["flags"]:
+        L.append(f"FLAG {fl}")
+    sc = r["self_check"]["work_files"]
+    L.append(f"self-check (work files): {sc['projections_checked']} projections re-decoded, bit-identical "
+             f"{sc['bit_identical']}; the container check is `convert.py verify` after packing")
     L.append(f"time: {r['time_s']['total'] / 3600:.2f} h")
     return "\n".join(L) + "\n"

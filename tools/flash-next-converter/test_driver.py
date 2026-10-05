@@ -164,3 +164,15 @@ def test_without_a_checkpoint_the_stop_still_exits_75_and_the_relaunch_replays(t
     code, state = driver.LayerLoop(N, toy2.layer_dir, stop_file=str(stop)).run(toy2)
     assert code == driver.EXIT_DONE and toy2.replayed == [0, 1] and toy2.processed == [2, 3, 4, 5]
     assert torch.equal(state["x"], expected())
+
+
+def test_a_finished_layer_whose_files_no_longer_match_done_is_redone(tmp_path):
+    toy = Toy(str(tmp_path / "work"))
+    loop(tmp_path, toy, every=2).run(toy)
+    with open(os.path.join(toy.layer_dir(1), "w.bin"), "wb") as f:
+        f.write(b"torn")
+    toy2 = Toy(str(tmp_path / "work"))
+    code, state = loop(tmp_path, toy2, every=2).run(toy2)
+    # the checkpoint (layer 4) is past the torn layer 1: the run restarts from layer 0
+    assert toy2.replayed == [0, 2, 3, 4, 5] and toy2.processed == [1]
+    assert torch.equal(state["x"], expected())

@@ -17,10 +17,7 @@ the self-check and the report.
 """
 import hashlib
 import json
-import math
 import os
-import subprocess
-import sys
 import threading
 import time
 from collections import defaultdict
@@ -49,6 +46,11 @@ FRONTEND = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "g
 TABLE_SHARDS, SHARD_ROWS = 128, 2_500_012
 HOT_CAP_ROWS = (2 << 30) // table.ROW_BYTES
 CONVERTER_SCHEMA = "flash-next-converter-v1"
+# kernel-level recordings for spec 02 (layout.md §10): whole-MoE-block inputs/outputs and
+# full-shape reconstruct checksums at three depths
+MOE_BLOCK_LAYERS, MOE_BLOCK_TOKENS, MOE_BLOCK_FIRST = (2, 24, 46), 64, 1024
+CHECKSUM_LAYERS, CHECKSUMS_PER_CLASS = (0, 24, 47), 2
+FALLBACK_TOKENS = 65536
 
 # the study's per-layer MoE error (dB, held-out tokens): run 6 dA250f_fp8_t4, run 8 exl3_a25
 RUN6_DB = [-19.96, -17.28, -16.26, -16.61, -15.67, -12.71, -12.91, -14.84, -14.66, -14.39, -14.42, -14.23, -13.91,
@@ -205,7 +207,6 @@ class Conversion:
         self.n_layers = args.layers
         self.table_shards = args.table_shards
         self.dev = "cuda"
-        self.dry = self.n_layers < N_LAYERS or self.table_shards < TABLE_SHARDS
         for d in ("state", "frontend", "global", "ngram", "layers"):
             os.makedirs(os.path.join(self.work, d), exist_ok=True)
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -227,7 +228,6 @@ class Conversion:
         self.sweep = None
         self.ple_bf16 = self.ple_q = None
         self.exl3_debug = trellis.debug_dir(self.work)
-        self.layer_time = {}
 
     # ------------------------------------------------------------ setup
     def _frontend(self):
@@ -279,10 +279,7 @@ class Conversion:
         eos = self.cfg.eos_token_id if not isinstance(self.cfg.eos_token_id, list) else self.cfg.eos_token_id[0]
         self.eos = eos
         rows = [x["prompt_ids"] + x["token_ids"] for x in self.canary]
-        self.canary_valid = [len(r) for r in rows]
         self.ids["canary"] = torch.tensor([r + [eos] * (tc - len(r)) for r in rows])
-        self.valid = {"chunks": [x["valid"] for x in c.chunks], "test": [c.chunks[i]["valid"] for i in self.test_sel],
-                      "long": [8192] * len(c.long), "canary": self.canary_valid}
         # stream -> sets it carries; set -> batch size
         self.stream_sets = {"bf16": ("chunks", "long", "canary"), "q": ("test", "long", "canary"), "f8": ("test",)}
         self.batch = {"chunks": 8, "test": 8, "long": 1, "canary": len(self.canary)}
@@ -297,10 +294,16 @@ class Conversion:
 
     def fingerprint(self):
         h = hashlib.sha256()
-        h.update(json.dumps({"schema": CONVERTER_SCHEMA, "revision": fetch.REVISION,
-                             "corpus": self.corpus.manifest, "canary": [x["prompt_ids"] + x["token_ids"] for x in self.canary],
-                             "table_shards": self.table_shards}, sort_keys=True).encode())
+        h.update(json.dumps(self.run_record(), sort_keys=True).encode())
         return h.hexdigest()
+
+    def run_record(self):
+        """Everything the work tree depends on: a tree made with another value is refused."""
+        man = json.load(open(corpus_mod.MANIFEST))
+        return {"schema": CONVERTER_SCHEMA, "revision": fetch.REVISION, "corpus": self.corpus.manifest,
+                "canary": [x["prompt_ids"] + x["token_ids"] for x in self.canary], "layers": self.n_layers,
+                "table_shards": self.table_shards, "budget": self.args.budget,
+                "hot_sample": man["hot_sample"], "long8192": man["long8192"]}
 
     def layer_dir(self, L):
         return os.path.join(self.work, "layers", f"L{L:02d}")
@@ -319,6 +322,7 @@ class Conversion:
         for k, v in bufs.items():
             ng._buffers[k] = v
         ng.ngram_embedding = IdCap()
+        self._ng = ng
         out = {}
         for name in ("chunks", "long", "canary"):
             ids = self.ids[name]
@@ -331,21 +335,45 @@ class Conversion:
             return
         for k, v in self.ngram_bufs.items():
             v.numpy().astype("<i8").tofile(os.path.join(d, f"{k}.i64"))
-        cal_rows = [self.ngram_ids["chunks"][i, :x["valid"]] for i, x in enumerate(self.chunks) if x["cal"]]
-        hot = table.hot_rows(torch.cat(cal_rows).numpy(), HOT_CAP_ROWS)
+        cal = torch.cat([self.ngram_ids["chunks"][i, :x["valid"]] for i, x in enumerate(self.chunks)
+                         if x["cal"]]).numpy().ravel()
+        sample, sample_tokens = self._hot_sample_rows()
+        ids = np.concatenate([cal, sample])
+        hot = table.hot_rows(ids, HOT_CAP_ROWS)
         hot.astype("<u4").tofile(os.path.join(d, "hot_rows.u32"))
-        counts = np.unique(torch.cat(cal_rows).numpy().ravel(), return_counts=True)[1]
+        counts = np.unique(ids, return_counts=True)[1]
         layout.write_json_atomic(os.path.join(d, "hot_rows.json"), {
             "rows": int(hot.size), "bytes": int(hot.size * table.ROW_BYTES), "cap_rows": HOT_CAP_ROWS,
-            "calibration_lookups": int(counts.sum()), "lookups_covered": int(np.sort(counts)[::-1][:hot.size].sum()),
+            "calibration_lookups": int(cal.size), "sample_lookups": int(sample.size), "sample_tokens": sample_tokens,
+            "lookups_covered": int(np.sort(counts)[::-1][:hot.size].sum()),
             "table_rows": TABLE_SHARDS * SHARD_ROWS, "row_bytes": table.ROW_BYTES, "shards": self.table_shards,
             "complete": self.table_shards == TABLE_SHARDS})
         layout.mark_done(os.path.join(d, "table"))
         layout.mark_done(d)
 
+    def _hot_sample_rows(self):
+        """Table rows of the n-gram coverage sample's train documents (review/ngram_coverage.py):
+        each corpus up to its token budget, every 4th document held out, at most 8192 tokens each."""
+        budget = json.load(open(corpus_mod.MANIFEST))["hot_sample"]["tokens_per_corpus"]
+        rows, tokens = [], {}
+        for name, docs in corpus_mod.hot_sample_corpora(self.args.repo, self.args.ood_dir):
+            n = 0
+            for i, text in enumerate(docs):
+                ids = self.tok(text, add_special_tokens=False)["input_ids"][:8192]
+                if len(ids) < 8:
+                    continue
+                if i % 4 != 3:
+                    rows.append(self._ng(torch.tensor(ids)[None], None)[0].numpy().ravel())
+                n += len(ids)
+                if n >= budget:
+                    break
+            tokens[name] = n
+        return np.concatenate(rows), tokens
+
     def _verify_table_cache(self):
-        """The study's cache was fetched from `main`: its first MiB of two shards must equal the
-        pinned revision's bytes."""
+        """The study's cache (fetched from `main`) must match the manifest's pins, and its first
+        MiB of shards 0 and 127 the pinned revision's bytes."""
+        corpus_mod.check_table_cache(self.args.table_cache, self.table_shards)
         for n in (0, TABLE_SHARDS - 1):
             name = f"{PFX}layers.1.ple.ple_embedding.ngram_embedding.shard_{n}.weight"
             f = self.src.index[name]
@@ -523,21 +551,31 @@ class Conversion:
                 mod.weight.data = w0
         return restore
 
-    def _decode_experts(self, d):
-        """The layer's expert weights as decoded from its experts.bin (bf16, HF layout)."""
+    def _decode_experts(self, d, L, convert):
+        """The layer's expert weights as decoded from its experts.bin (bf16, HF layout). When
+        converting, also the self-check samples (first expert of each K class: sha256 of its
+        decoded bf16 weight) and, at CHECKSUM_LAYERS, kern's reconstruct checksums."""
         index = layout.read_index(os.path.join(d, "experts.idx"))
         path = os.path.join(d, "experts.bin")
         gq = torch.empty((E, 2 * I, HID), dtype=torch.bfloat16, device=self.dev)
         dq = torch.empty((E, HID, I), dtype=torch.bfloat16, device=self.dev)
-        sample = {}
+        sample, checks = [], []
         for en in index:
-            w = trellis.decode(layout.read_record(path, en), en.k2, en.proj, self.dev).to(torch.bfloat16)
+            rec = layout.read_record(path, en)
+            w = trellis.decode(rec, en.k2, en.proj, self.dev).to(torch.bfloat16)
             (gq if en.proj == "gu" else dq)[en.expert] = w
-            cls = f"{en.proj}-{en.k2}"
-            if cls not in sample:
-                sample[cls] = {"expert": en.expert,
-                               "sha256": hashlib.sha256(w.cpu().view(torch.int16).numpy().tobytes()).hexdigest()}
-        return gq, dq, index, sample
+            if not convert:
+                continue
+            cls = f"{en.proj}-{en.k2 / 2:g}"
+            if not any(x["class"] == cls for x in sample):
+                sample.append({"layer": L, "class": cls, "proj": en.proj, "k2": en.k2, "expert": en.expert,
+                               "sha256": hashlib.sha256(w.cpu().view(torch.int16).numpy().tobytes()).hexdigest()})
+            same = sum(x["proj"] == en.proj and x["k2"] == en.k2 for x in checks)
+            if L in CHECKSUM_LAYERS and same < CHECKSUMS_PER_CLASS:
+                raw = trellis.reconstruct_raw(rec, en.k2, en.proj, self.dev)
+                checks.append({"layer": L, "expert": en.expert, "proj": en.proj, "k2": en.k2,
+                               "checksum": f"{trellis.checksum_u16(raw):016x}"})
+        return gq, dq, sample, checks
 
     # ------------------------------------------------------------ one layer
     def process(self, L, state):
@@ -577,18 +615,21 @@ class Conversion:
                 layout.write_json_atomic(os.path.join(d, "tensors.json"), {"tensors": entries})
                 tm["write"] += time.time() - ta
             ta = time.time()
-            gq, dq, index, sample = self._decode_experts(d)
+            gq, dq, sample, checks = self._decode_experts(d, L, convert)
             fp8w = self._fp8_weights(d, self.dev)
             tm["decode"] = time.time() - ta
             if convert:
                 self._moe_error(experts, gq, dq, moe, rec)
                 del moe
                 rec["decode_sha256"] = sample
+                rec["trellis_checksums"] = checks
             # quantized stream
             ta = time.time()
             experts.gate_up_proj.data, experts.down_proj.data = gq, dq
             restore = self._swap_fp8(layer, fp8w)
             routes = {}
+            if convert and L in MOE_BLOCK_LAYERS:
+                self._record_moe_block(layer, state, L, d)
             for s in self.stream_sets["q"]:
                 r = self._run(layer, state, "q", s, route=convert and s in ("test", "long"), L=L)
                 if r is not None:
@@ -615,8 +656,10 @@ class Conversion:
         rec["rss_gb"] = rss_gb()
         rec["vram_peak_gb"] = gb(torch.cuda.max_memory_reserved())
         if convert:
+            rec["experts_bin"] = {"bytes": os.path.getsize(os.path.join(d, "experts.bin")),
+                                  "sha256": layout.file_digest(os.path.join(d, "experts.bin"))}
             layout.write_json_atomic(os.path.join(d, "layer.json"), rec)
-            layout.mark_done(d)
+            layout.mark_done(d, {"experts.bin": rec["experts_bin"]["sha256"]})
             self.log(self._layer_line(rec))
         else:
             self.log(f"layer {L} replayed in {rec['time_s']:.0f}s | RSS {rec['rss_gb']:.1f} GB | "
@@ -651,8 +694,9 @@ class Conversion:
             sl = slice(b0, b0 + BQ)
             ta = time.time()
             Hg, Hd = expert_hessians(X, idx_cal, rw, Wgu0, Wdn0, list(range(b0, b0 + BQ)))
-            mats = {"gu": (Wgu0[sl].float(), Hg, trellis.shrink(Hg, Hl.expand(BQ, -1, -1))),
-                    "dn": (Wdn0[sl].float(), Hd, trellis.shrink(Hd, eye.expand(BQ, -1, -1)))}
+            Qg, Qd = self._fallback_hessians(X, Hl, Wgu0, Hg, Hd, b0, rec)
+            mats = {"gu": (Wgu0[sl].float(), Hg, trellis.shrink(Qg, Hl.expand(BQ, -1, -1))),
+                    "dn": (Wdn0[sl].float(), Hd, trellis.shrink(Qd, eye.expand(BQ, -1, -1)))}
             tm["hess"] += time.time() - ta
             for mi, (p, (W, H, Hs)) in enumerate(mats.items()):
                 en[p][sl] = torch.einsum("bmi,bij,bmj->b", W, H, W)
@@ -686,6 +730,64 @@ class Conversion:
         rec["unrouted"] = {p: int((en[p] <= 0).sum()) for p in ("gu", "dn")}
         rec["record_sha256"] = digests
         return {"Xte": Xte, "ite": ite, "wte": wte, "y_ref": y_ref, "r2": r2}
+
+    def _record_moe_block(self, layer, state, L, d):
+        """Spec 02's whole-MoE-block reference: MOE_BLOCK_TOKENS tokens of the first test chunk
+        through this layer's quantized MoE block (layout.md §10, moe_block/). Runs the layer on a
+        copy of that chunk's state, so the stream itself is untouched."""
+        cap = {}
+        hooks = [layer.mlp.register_forward_hook(lambda m, a, o: cap.update(x=a[0], y=o)),
+                 layer.mlp.gate.register_forward_hook(lambda m, a, o: cap.__setitem__("r", o))]
+        try:
+            h = state["q.test"][0:1].to(self.dev)
+            if layer.ple is not None:
+                layer.ple.ple_embedding.cur = self._ple("q", "test", [0]).to(self.dev)
+            pe, mk = self._pe_mask(1, CH)
+            layer(h, position_embeddings=pe, attention_mask=mk[0], conv_mask=mk[1], past_key_values=None,
+                  ple_input_ids=self.ids["test"][0:1].to(self.dev))
+        finally:
+            for hk in hooks:
+                hk.remove()
+        sl = slice(MOE_BLOCK_FIRST, MOE_BLOCK_FIRST + MOE_BLOCK_TOKENS)
+        x = cap["x"][0, sl]
+        mlp = layer.mlp
+        shared = torch.sigmoid(mlp.shared_expert_gate(x)) * mlp.shared_expert(x)
+        T = cap["x"].shape[1]
+        rows = slice(MOE_BLOCK_FIRST, MOE_BLOCK_FIRST + MOE_BLOCK_TOKENS)   # router outputs are (tokens, k)
+        out = os.path.join(d, "moe_block")
+        os.makedirs(out, exist_ok=True)
+        x.contiguous().view(torch.int16).cpu().numpy().astype("<i2").tofile(os.path.join(out, "x.bf16"))
+        cap["y"][0, sl].float().cpu().numpy().astype("<f4").tofile(os.path.join(out, "y.f32"))
+        assert cap["r"][2].shape[0] == T
+        cap["r"][2][rows].to(torch.int32).cpu().numpy().astype("<i4").tofile(os.path.join(out, "ids.i32"))
+        cap["r"][1][rows].float().cpu().numpy().astype("<f4").tofile(os.path.join(out, "weights.f32"))
+        shared.float().cpu().numpy().astype("<f4").tofile(os.path.join(out, "shared.f32"))
+        c = self.chunks[self.test_sel[0]]
+        layout.write_json_atomic(os.path.join(out, "manifest.json"), {
+            "layer": L, "tokens": MOE_BLOCK_TOKENS, "first_position": MOE_BLOCK_FIRST, "test_chunk": 0,
+            "kind": c["kind"], "source": c["source"], "revision": fetch.REVISION, "stream": "quantized",
+            "files": {"x.bf16": "(N, 2560) bf16, the block's input", "y.f32": "(N, 2560) block output, bf16 upcast",
+                      "ids.i32": "(N, 10) router top-10, descending", "weights.f32": "(N, 10) routing weights",
+                      "shared.f32": "(N, 2560) sigmoid(shared_expert_gate(x)) * shared_expert(x)"}})
+
+    def _fallback_hessians(self, X, Hl, Wgu, Hg, Hd, b0, rec):
+        """Spec 01: an expert no calibration token was routed to is quantized with the layer's
+        Hessian, not left to exllamav3's uncalibrated fallback (the study's run 8 did the latter).
+        Gate/up takes the layer H; down takes its activations' second moment over the first
+        FALLBACK_TOKENS calibration tokens as if they were all routed to it. The allocation still
+        sees zero routed energy, so such an expert gets K = 2 as in run 8."""
+        empty = [b for b in range(Hg.shape[0]) if not torch.any(Hg[b])]
+        if not empty:
+            return Hg, Hd
+        Qg, Qd = Hg.clone(), Hd.clone()
+        xs = X[self.cal_mask.nonzero()[:FALLBACK_TOKENS, 0]].float()
+        for b in empty:
+            y = xs @ Wgu[b0 + b].float().T
+            a = F.silu(y[:, :I]) * y[:, I:]
+            Qg[b] = Hl
+            Qd[b] = a.T @ a / a.shape[0]
+            rec.setdefault("hessian_fallback", []).append(b0 + b)
+        return Qg, Qd
 
     def _moe_error(self, experts, gq, dq, m, rec):
         """Run 8's MoE error on held-out tokens, with the experts decoded from the written file."""

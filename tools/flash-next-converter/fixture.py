@@ -5,7 +5,6 @@ classes (records at the real projection shapes, so the size table holds), a few 
 BF16 tensors, a 1,000-row table shard, the hash buffers, a hot-row list and DONE markers.
 The trellis words are random: this checks layout, not decode.
 """
-import json
 import os
 
 import numpy as np
@@ -66,7 +65,8 @@ def make(out, n_layers=2, n_experts=8, table_rows=1000, seed=0):
     np.arange(16, dtype="<i8").tofile(os.path.join(d, "ngram_heads_vocab_sizes.i64"))
     np.arange(16, dtype="<i8").tofile(os.path.join(d, "ngram_heads_offsets.i64"))
     table.hot_rows(rng.integers(0, table_rows, 5000), 100).astype("<u4").tofile(os.path.join(d, "hot_rows.u32"))
-    layout.write_json_atomic(os.path.join(d, "hot_rows.json"), {"rows": 100, "table_rows": table_rows, "row_bytes": 90})
+    layout.write_json_atomic(os.path.join(d, "hot_rows.json"), {"rows": 100, "table_rows": table_rows, "row_bytes": 90,
+                                                                  "shards": 1, "complete": True})
     layout.mark_done(d)
     d = os.path.join(work, "frontend")
     os.makedirs(d, exist_ok=True)

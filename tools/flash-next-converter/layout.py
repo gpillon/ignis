@@ -137,6 +137,7 @@ def file_digest(path, block=64 << 20):
 
 
 def write_json_atomic(path, obj):
+    """Writes JSON through a flushed temporary file and a rename."""
     tmp = str(path) + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         json.dump(obj, f, indent=1)
@@ -145,17 +146,40 @@ def write_json_atomic(path, obj):
     os.replace(tmp, path)
 
 
+def _fsync(path):
+    fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def mark_done(directory, digests=None):
-    """Writes DONE last: every other file of the directory with its size and sha256.
-    `digests` (name -> sha256) skips re-hashing files whose digest is already known."""
+    """Writes DONE last: every other file of the directory with its size and sha256, each file
+    flushed to disk first. `digests` (name -> sha256) skips re-hashing known files."""
     digests = digests or {}
     files = {}
     for name in sorted(os.listdir(directory)):
         p = os.path.join(directory, name)
         if name in ("DONE", "DONE.tmp") or not os.path.isfile(p):
             continue
+        _fsync(p)
         files[name] = {"bytes": os.path.getsize(p), "sha256": digests.get(name) or file_digest(p)}
     write_json_atomic(os.path.join(directory, "DONE"), {"files": files})
+
+
+def verify_done(directory):
+    """Whether every file DONE lists is there with its size and sha256 (a torn directory is
+    redone, never read)."""
+    try:
+        files = json.load(open(os.path.join(directory, "DONE")))["files"]
+    except (OSError, ValueError, KeyError):
+        return False
+    for name, f in files.items():
+        p = os.path.join(directory, name)
+        if not os.path.isfile(p) or os.path.getsize(p) != f["bytes"] or file_digest(p) != f["sha256"]:
+            return False
+    return True
 
 
 def is_done(directory):
