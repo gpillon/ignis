@@ -622,6 +622,12 @@ target_include_directories(ignis_kernel_flash_next_hc_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_flash_next_hc_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_hc_test COMMAND ignis_kernel_flash_next_hc_test)
+# The token embedding and the head (kernel/src/flash_next/embed_head.cu). GPU.
+add_executable(ignis_kernel_flash_next_embed_head_test test_flash_next_embed_head.cu)
+target_include_directories(ignis_kernel_flash_next_embed_head_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_embed_head_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_embed_head_test COMMAND ignis_kernel_flash_next_embed_head_test)
 
 # GitHub #301 (spec flash-next/03): OURS -- the expert residency miss path measured (copy
 # engine against SM-driven copies from mapped pinned memory). A timing is a finding, not a
@@ -640,3 +646,16 @@ target_compile_definitions(ignis_kernel_residency_trace_test PRIVATE
 target_link_libraries(ignis_kernel_residency_trace_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_residency_trace_test COMMAND ignis_kernel_residency_trace_test)
 add_test(NAME ignis_kernel_residency_graph_test COMMAND ignis_kernel_residency_trace_test graph)
+
+# GitHub #302 (spec flash-next/04, slice S4): OURS -- the n-gram embedding's device side
+# (kernel/src/flash_next/ngram.cu) at the real geometry, against transformers'
+# Qwen4ExpTextPLELayer recorded by fixtures/flash_next_ngram/record.py: one shot, chunked prefill
+# and decode, three lanes, a call spanning two windows, a reused slot. `--host-only` runs the
+# host model's check alone (no CUDA). GPU.
+add_executable(ignis_kernel_flash_next_ngram_test test_flash_next_ngram.cu)
+target_include_directories(ignis_kernel_flash_next_ngram_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(ignis_kernel_flash_next_ngram_test PRIVATE
+  IGNIS_FLASH_NEXT_NGRAM_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_ngram")
+target_link_libraries(ignis_kernel_flash_next_ngram_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_ngram_test COMMAND ignis_kernel_flash_next_ngram_test)

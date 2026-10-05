@@ -1,0 +1,28 @@
+{
+ "recorded": "2026-10-05T13:30:53+00:00",
+ "torch": "2.13.0+cu130",
+ "transformers": "5.17.0",
+ "oracle": "transformers Qwen4ExpTextPLELayer.forward, bf16, CPU, past_key_values=None",
+ "tokens": 16,
+ "streams": {
+  "key_proj": 4101,
+  "value_proj": 4201,
+  "norm_key": 4301,
+  "norm_query": 4302,
+  "norm_conv": 4303,
+  "conv": 4304,
+  "hidden": 4401,
+  "row_codes": 4501,
+  "row_scales": 4502
+ },
+ "magnitudes": {
+  "key_scale": 0.0004,
+  "value_scale": 0.0008,
+  "norm": 0.5,
+  "conv": 0.5,
+  "hidden": 0.05,
+  "row_scale": 0.02
+ },
+ "ple_out_abs_max": 5.125,
+ "ple_out_abs_mean": 0.25135764479637146
+}
