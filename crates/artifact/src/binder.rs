@@ -31,23 +31,24 @@ pub struct DevicePlacement {
     pub offset: u64,
     /// Exact stored payload length.
     pub bytes: u64,
-    /// File alignment applied to this object's offset (256 B for tensors).
+    /// File alignment applied to this object's offset (its layout's,
+    /// [`crate::tensor_alignment`]).
     pub alignment: u64,
 }
 
-/// One host-retained placement: a resource, or a small tensor the host
-/// reads (the bytes stay in RAM).
+/// One host-retained placement: its bytes stay in RAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostPlacement {
     /// The retained object.
     pub handle: ObjectHandle,
 }
 
-/// One placement in the pinned host pool (Flash-Next's expert projections:
-/// residency moves them from there into its device cache, spec
-/// flash-next/03). The materializer does not fill the pool; residency does.
+/// One placement in the **expert pool** (CONTEXT.md: every expert
+/// projection, in pinned host RAM for the life of the model; residency moves
+/// them from there into its device cache, spec flash-next/03). The
+/// materializer does not fill the pool; residency does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostPoolPlacement {
+pub struct ExpertPoolPlacement {
     pub handle: ObjectHandle,
     /// Offset inside the pool (aligned to the object's file alignment).
     pub offset: u64,
@@ -78,10 +79,13 @@ pub struct MaterializationPlan {
     pub device_objects: Vec<DevicePlacement>,
     /// Host-retained resources in binding order.
     pub host_objects: Vec<HostPlacement>,
-    /// Pinned host pool size, alignment-aware (0 without pool objects).
-    pub host_pool_capacity_bytes: u64,
-    /// Pinned host pool placements in binding order.
-    pub host_pool_objects: Vec<HostPoolPlacement>,
+    /// Host-retained tensors in binding order (small tensors the host reads,
+    /// kept apart from the resources).
+    pub host_tensor_objects: Vec<HostPlacement>,
+    /// Expert pool size, alignment-aware (0 without pool objects).
+    pub expert_pool_capacity_bytes: u64,
+    /// Expert pool placements in binding order.
+    pub expert_pool_objects: Vec<ExpertPoolPlacement>,
     /// Host-streamed objects in binding order.
     pub streamed_objects: Vec<StreamedPlacement>,
 }
@@ -95,8 +99,9 @@ pub struct Binder<'a> {
     device_objects: Vec<DevicePlacement>,
     host_objects: Vec<HostPlacement>,
     capacity: u64,
-    host_pool_objects: Vec<HostPoolPlacement>,
-    host_pool_capacity: u64,
+    host_tensor_objects: Vec<HostPlacement>,
+    expert_pool_objects: Vec<ExpertPoolPlacement>,
+    expert_pool_capacity: u64,
     streamed_objects: Vec<StreamedPlacement>,
 }
 
@@ -112,8 +117,9 @@ impl<'a> Binder<'a> {
             device_objects: Vec::new(),
             host_objects: Vec::new(),
             capacity: 0,
-            host_pool_objects: Vec::new(),
-            host_pool_capacity: 0,
+            host_tensor_objects: Vec::new(),
+            expert_pool_objects: Vec::new(),
+            expert_pool_capacity: 0,
             streamed_objects: Vec::new(),
         }
     }
@@ -205,12 +211,7 @@ impl<'a> Binder<'a> {
 
     /// Place a consumed tensor into the device arena (256-byte aligned).
     pub fn materialize_on_device(&mut self, handle: ObjectHandle) -> Result<()> {
-        if self.planned[handle.index] {
-            return Err(fail(format!(
-                "artifact object has more than one materialization placement: {}",
-                self.reader.objects()[handle.index].name()
-            )));
-        }
+        self.claim_placement(handle)?;
         let tensor = match &self.reader.objects()[handle.index] {
             Object::Tensor(t) => t,
             Object::Resource(_) => {
@@ -237,12 +238,7 @@ impl<'a> Binder<'a> {
     /// Retain a consumed resource on the host (its bytes stay in RAM; the
     /// reference `take_resource_bytes` pattern).
     pub fn retain_on_host(&mut self, handle: ObjectHandle) -> Result<()> {
-        if self.planned[handle.index] {
-            return Err(fail(format!(
-                "artifact object has more than one materialization placement: {}",
-                self.reader.objects()[handle.index].name()
-            )));
-        }
+        self.claim_placement(handle)?;
         if !matches!(&self.reader.objects()[handle.index], Object::Resource(_)) {
             return Err(fail(format!(
                 "tensor cannot be retained as a host resource: {}",
@@ -255,8 +251,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Retain a consumed tensor's bytes on the host (a small tensor the
-    /// host reads, e.g. Flash-Next's n-gram hash buffers): placed like a
-    /// retained resource.
+    /// host reads, e.g. Flash-Next's n-gram hash buffers).
     pub fn retain_tensor_on_host(&mut self, handle: ObjectHandle) -> Result<()> {
         self.claim_placement(handle)?;
         if !matches!(&self.reader.objects()[handle.index], Object::Tensor(_)) {
@@ -265,28 +260,28 @@ impl<'a> Binder<'a> {
                 self.reader.objects()[handle.index].name()
             )));
         }
-        self.host_objects.push(HostPlacement { handle });
+        self.host_tensor_objects.push(HostPlacement { handle });
         self.planned[handle.index] = true;
         Ok(())
     }
 
-    /// Place a consumed tensor in the pinned host pool, aligned to its file
+    /// Place a consumed tensor in the expert pool, aligned to its file
     /// alignment. Returns its pool offset.
-    pub fn place_in_host_pool(&mut self, handle: ObjectHandle) -> Result<u64> {
+    pub fn place_in_expert_pool(&mut self, handle: ObjectHandle) -> Result<u64> {
         self.claim_placement(handle)?;
         let tensor = match &self.reader.objects()[handle.index] {
             Object::Tensor(t) => t,
             Object::Resource(r) => {
                 return Err(fail(format!(
-                    "resource cannot be placed in the host pool: {}",
+                    "resource cannot be placed in the expert pool: {}",
                     r.name
                 )))
             }
         };
         let alignment = crate::tensor_alignment(tensor.layout);
-        let offset = align_up(self.host_pool_capacity, alignment, "host pool offset")?;
-        self.host_pool_capacity = checked_add(offset, tensor.bytes, "host pool size")?;
-        self.host_pool_objects.push(HostPoolPlacement {
+        let offset = align_up(self.expert_pool_capacity, alignment, "expert pool offset")?;
+        self.expert_pool_capacity = checked_add(offset, tensor.bytes, "expert pool size")?;
+        self.expert_pool_objects.push(ExpertPoolPlacement {
             handle,
             offset,
             bytes: tensor.bytes,
@@ -324,12 +319,7 @@ impl<'a> Binder<'a> {
 
     /// Mark a consumed object as validated-only (no placement, no upload).
     pub fn validate_only(&mut self, handle: ObjectHandle) -> Result<()> {
-        if self.planned[handle.index] {
-            return Err(fail(format!(
-                "artifact object has more than one materialization placement: {}",
-                self.reader.objects()[handle.index].name()
-            )));
-        }
+        self.claim_placement(handle)?;
         self.planned[handle.index] = true;
         Ok(())
     }
@@ -347,8 +337,9 @@ impl<'a> Binder<'a> {
             device_capacity_bytes: self.capacity,
             device_objects: self.device_objects.clone(),
             host_objects: self.host_objects.clone(),
-            host_pool_capacity_bytes: self.host_pool_capacity,
-            host_pool_objects: self.host_pool_objects.clone(),
+            host_tensor_objects: self.host_tensor_objects.clone(),
+            expert_pool_capacity_bytes: self.expert_pool_capacity,
+            expert_pool_objects: self.expert_pool_objects.clone(),
             streamed_objects: self.streamed_objects.clone(),
         }
     }
@@ -376,8 +367,9 @@ impl<'a> Binder<'a> {
             device_capacity_bytes: self.capacity,
             device_objects: self.device_objects.clone(),
             host_objects: self.host_objects.clone(),
-            host_pool_capacity_bytes: self.host_pool_capacity,
-            host_pool_objects: self.host_pool_objects.clone(),
+            host_tensor_objects: self.host_tensor_objects.clone(),
+            expert_pool_capacity_bytes: self.expert_pool_capacity,
+            expert_pool_objects: self.expert_pool_objects.clone(),
             streamed_objects: self.streamed_objects.clone(),
         })
     }
@@ -522,10 +514,10 @@ mod tests {
     }
 
     /// The host-side placements: a tensor kept in host memory, one placed in
-    /// the pinned host pool, one handed over as a file range. All count as
-    /// placed for ADR 0002, and none of them takes device arena space.
+    /// the expert pool, one handed over as a file range. All count as placed
+    /// for ADR 0002, and none of them takes device arena space.
     #[test]
-    fn host_pool_streamed_and_host_tensor_placements_complete_the_bind() {
+    fn expert_pool_streamed_and_host_tensor_placements_complete_the_bind() {
         let (_artifact, reader) = fixture_reader("host-roles");
         let mut binder = Binder::new(&reader);
         let resource = binder
@@ -545,12 +537,12 @@ mod tests {
             )
             .expect("one of two formats");
         assert_eq!(format, NumericFormat::Nvfp4);
-        assert_eq!(binder.place_in_host_pool(nvfp4).expect("pool"), 0);
+        assert_eq!(binder.place_in_expert_pool(nvfp4).expect("pool"), 0);
         let q4 = binder
             .require_tensor("w/q4", NumericFormat::Q4G64F16S, StorageLayout::RowSplitK128V1, &[128, 128])
             .expect("q4");
         // 4612 bytes of NVFP4, then the next pool slot at its alignment.
-        assert_eq!(binder.place_in_host_pool(q4).expect("pool"), 4864);
+        assert_eq!(binder.place_in_expert_pool(q4).expect("pool"), 4864);
         let fp8 = binder
             .require_tensor("w/fp8", NumericFormat::Fp8E4M3FnRowBf16S, StorageLayout::RowScaleV1, &[128, 64])
             .expect("fp8");
@@ -559,8 +551,9 @@ mod tests {
         let plan = binder.finish().expect("every object consumed and placed");
         assert_eq!(plan.device_capacity_bytes, 0);
         assert!(plan.device_objects.is_empty());
-        assert_eq!(plan.host_objects.len(), 2);
-        assert_eq!(plan.host_pool_capacity_bytes, 4864 + 8704);
+        assert_eq!(plan.host_objects.len(), 1, "the resource");
+        assert_eq!(plan.host_tensor_objects, [HostPlacement { handle: bf16 }]);
+        assert_eq!(plan.expert_pool_capacity_bytes, 4864 + 8704);
         let streamed = plan.streamed_objects[0];
         assert_eq!(streamed.handle, fp8);
         assert_eq!(streamed.bytes, 8448);
@@ -577,12 +570,12 @@ mod tests {
             .require_resource("frontend/tokenizer.json", ResourceEncoding::RawBytesV1)
             .expect("resource");
         assert!(binder.retain_tensor_on_host(resource).is_err());
-        assert!(binder.place_in_host_pool(resource).is_err());
+        assert!(binder.place_in_expert_pool(resource).is_err());
         let bf16 = binder
             .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
             .expect("bf16");
         binder.stream_from_host(bf16).expect("streamed");
-        let err = binder.place_in_host_pool(bf16).expect_err("a second placement");
+        let err = binder.place_in_expert_pool(bf16).expect_err("a second placement");
         assert!(err.to_string().contains("more than one materialization placement"), "{err}");
         let err = binder
             .require_tensor_of("w/q4", &[NumericFormat::Nvfp4], StorageLayout::RowSplitK128V1, &[128, 128])

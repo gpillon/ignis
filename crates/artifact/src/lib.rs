@@ -26,10 +26,12 @@ pub mod binder;
 pub mod checksum;
 pub mod device;
 pub mod fixture;
+pub mod flash_next;
 pub mod frontend;
 pub mod inventory;
 pub mod materializer;
 pub mod normalize;
+pub mod packer;
 pub mod f64_reference;
 pub mod vision;
 pub mod writer;
@@ -46,7 +48,7 @@ pub mod kv_budget;
 
 pub use binding::{Binding, Bf16View, Nvfp4View};
 pub use binder::{
-    Binder, DevicePlacement, HostPlacement, HostPoolPlacement, MaterializationPlan, ObjectHandle,
+    Binder, DevicePlacement, ExpertPoolPlacement, HostPlacement, MaterializationPlan, ObjectHandle,
     StreamedPlacement,
 };
 pub use checksum::{

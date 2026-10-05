@@ -102,6 +102,8 @@ impl TensorView {
 enum MaterializedObject {
     Tensor(TensorView),
     Resource(Vec<u8>),
+    /// A host-retained tensor's bytes (`Binder::retain_tensor_on_host`).
+    HostTensor(Vec<u8>),
     /// Consumed but placed nowhere (`validate_only`).
     Unplaced,
 }
@@ -138,6 +140,16 @@ impl MaterializedArtifact {
             Some(_) => Err(fail(
                 "object handle does not name a materialized resource",
             )),
+            None => Err(fail("object handle is out of range")),
+        }
+    }
+
+    /// The bytes of a host-retained tensor (e.g. Flash-Next's n-gram hash
+    /// buffers).
+    pub fn host_tensor_bytes(&self, handle: crate::binder::ObjectHandle) -> Result<&[u8]> {
+        match self.objects.get(handle.index) {
+            Some(MaterializedObject::HostTensor(bytes)) => Ok(bytes),
+            Some(_) => Err(fail("object handle does not name a host-retained tensor")),
             None => Err(fail("object handle is out of range")),
         }
     }
@@ -236,6 +248,18 @@ pub fn materialize<D: Device>(
         stats.file_bytes =
             checked_add(stats.file_bytes, bytes.len() as u64, "artifact read bytes overflow u64")?;
         objects[host.handle.index] = MaterializedObject::Resource(bytes);
+    }
+
+    // --- host-retained tensors (small tensors the host reads) -------------
+    for host in &plan.host_tensor_objects {
+        let object = reader
+            .objects()
+            .get(host.handle.index)
+            .ok_or_else(|| fail("host tensor handle is out of range"))?;
+        let bytes = reader.payload_at(object)?.data.to_vec();
+        stats.file_bytes =
+            checked_add(stats.file_bytes, bytes.len() as u64, "artifact read bytes overflow u64")?;
+        objects[host.handle.index] = MaterializedObject::HostTensor(bytes);
     }
 
     // --- device objects: direct I/O -> bounded staging pool -> device ------
