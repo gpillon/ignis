@@ -242,6 +242,7 @@ pub(crate) mod ffi {
         pub fn ignis_seq_pending_token(seq: *const IgnisSeq) -> i32;
 
         pub fn ignis_seq_snapshot_format_version() -> u32;
+        pub fn ignis_seq_pool_snapshot_format_version(pool: *const IgnisSeqPool) -> u32;
 
         pub fn ignis_seq_snapshot_size(
             pool: *const IgnisSeqPool,
@@ -625,6 +626,14 @@ impl SeqPool {
             return Err(last_error());
         }
         Ok(plan)
+    }
+
+    /// The snapshot blob format version this pool writes and accepts: the
+    /// 27B layout's [`snapshot_format_version`], or Flash-Next's own when
+    /// the pool carries its indexer and n-gram sections (spec flash-next/05).
+    /// A blob identity names this one, so a blob never crosses families.
+    pub fn snapshot_format_version(&self) -> u32 {
+        unsafe { ffi::ignis_seq_pool_snapshot_format_version(self.handle) }
     }
 
     /// Pool-wide geometry + live usage.

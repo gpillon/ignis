@@ -43,11 +43,9 @@ fn the_27b_image_is_the_slot_the_leaf_lays_out() {
     }
 }
 
-/// Flash-Next's pool holds no retained slot yet (its sections are not in the
-/// clone table, spec flash-next/05), so its image is read off the pool's own
-/// lines, one slot's share of each: the GDN and penalty state, the residual
-/// window, the indexer's tails (its block keys are per page, not per slot)
-/// and the n-gram conv state.
+/// Flash-Next's image read off the pool's own lines, one slot's share of
+/// each: the GDN and penalty state, the residual window, the indexer's tails
+/// (its block keys are per page, not per slot) and the n-gram conv state.
 #[test]
 #[ignore]
 fn flash_next_image_is_one_slots_share_of_the_pools_state() {
@@ -70,11 +68,15 @@ fn flash_next_image_is_one_slots_share_of_the_pools_state() {
     }
 }
 
-/// And a retained slot beside those sections is refused by name.
+/// And a host retained slot holds exactly that image, every section from a
+/// 256-byte boundary: its indexer tails and n-gram conv state are cloned
+/// with the rest (spec flash-next/05), so a claim restores all of it.
 #[test]
 #[ignore]
-fn a_flash_next_pool_refuses_a_retained_slot() {
+fn the_flash_next_image_is_the_slot_the_leaf_lays_out() {
     let cfg = ModelConfig::qwen38_flash_next();
-    let err = SeqPool::plan(&cfg, &budget(KvFormat::HqE8_2b, 1), None).expect_err("a host retained slot");
-    assert!(err.contains("no retained slots"), "{err}");
+    for format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
+        let plan = SeqPool::plan(&cfg, &budget(format, 1), None).unwrap_or_else(|e| panic!("Flash-Next {format}: {e}"));
+        assert_eq!(cfg.state_image(format).slot_bytes(), plan.retained_host_bytes, "Flash-Next {format}");
+    }
 }

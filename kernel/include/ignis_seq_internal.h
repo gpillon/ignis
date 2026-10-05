@@ -127,10 +127,10 @@ inline std::size_t ignis_kv_plane_index(int32_t kv_format, int32_t gqa_layer,
 
 struct ignis_seq_pool;
 /* GitHub #302: why a sequence of `pool` cannot be snapshotted, restored,
- * captured as a checkpoint or published as a prefix, or nullptr. Those
- * carry the sections ignis_seq_sections.h's table lists, and Flash-Next's
- * indexer and n-gram sections are not in it yet (spec flash-next/05): a
- * clone without them would hand a claimant the wrong state. */
+ * captured as a checkpoint or published as a prefix, or nullptr. Since
+ * GitHub #303 the section table carries Flash-Next's indexer and n-gram
+ * sections, and no pool is refused; the seam stays, so a section a pool
+ * holds and the table does not list has one place to say so. */
 const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool);
 
 struct ignis_seq_pool {
@@ -267,6 +267,25 @@ struct ignis_seq_pool {
     return static_cast<unsigned char *>(indexer_state->p) +
            static_cast<std::uint64_t>(kv_num_layers) * indexer_block_layer_bytes +
            static_cast<std::uint64_t>(attention_layer) * indexer_slots * indexer_tail_slot_bytes;
+  }
+  /* GitHub #303: one physical page's block keys in one attention layer, and
+   * where they sit. */
+  std::uint64_t indexer_page_bytes() const {
+    return static_cast<std::uint64_t>(ninfer::kPagedKVPageSize / indexer_compress_tokens) *
+           static_cast<std::uint64_t>(indexer_key_dim) * 2u;
+  }
+  void *indexer_page_keys(std::int32_t attention_layer, std::int32_t page) const {
+    return static_cast<unsigned char *>(indexer_block_keys(attention_layer)) +
+           static_cast<std::uint64_t>(page) * indexer_page_bytes();
+  }
+  /* GitHub #303: one slot's indexer tail in one attention layer, and its n-gram
+   * conv columns. */
+  void *indexer_slot_tail(std::int32_t attention_layer, std::int32_t slot) const {
+    return static_cast<unsigned char *>(indexer_tail_keys(attention_layer)) +
+           static_cast<std::uint64_t>(slot) * indexer_tail_slot_bytes;
+  }
+  void *ngram_slot_conv(std::int32_t slot) const {
+    return static_cast<unsigned char *>(ngram_conv->p) + static_cast<std::uint64_t>(slot) * ngram_conv_slot_bytes;
   }
 
   /* GitHub #302: Flash-Next's n-gram conv state, [slot][columns][channels]

@@ -268,6 +268,46 @@ void pack_logical_pages(const ignis_seq_pool &pool, const ignis_seq &seq, std::u
   ignis_seq_pack_pages_to_host(pool, pages, dst);
 }
 
+// The physical pages of `seq`'s first `count` logical pages: its prefix
+// chain's, then its own (GitHub #303: what the indexer keys are packed by).
+std::vector<std::int32_t> logical_page_ids(const ignis_seq &seq, std::uint32_t count) {
+  std::vector<std::int32_t> pages = ignis_seq_prefix_chain_page_ids(seq.prefix);
+  const auto own = seq.kv.page_ids();
+  pages.insert(pages.end(), own.begin(), own.end());
+  if (count > pages.size()) {
+    throw std::logic_error("snapshot extent exceeds the sequence's logical pages");
+  }
+  pages.resize(count);
+  return pages;
+}
+
+// GitHub #303: `pages`' indexer keys, every attention layer, into a blob's
+// IGNIS_SEQ_SECTION_INDEXER_KEYS payload at `dst` (layer by layer, page by
+// page), or back out of one.
+void pack_indexer_keys_to_host(const ignis_seq_pool &pool, const std::vector<std::int32_t> &pages,
+                               unsigned char *dst) {
+  const std::size_t bytes = static_cast<std::size_t>(pool.indexer_page_bytes());
+  for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+    for (const std::int32_t page : pages) {
+      checked_memcpy_async(dst, pool.indexer_page_keys(layer, page), bytes, cudaMemcpyDeviceToHost,
+                           "indexer keys");
+      dst += bytes;
+    }
+  }
+}
+
+void unpack_indexer_keys_from_host(const ignis_seq_pool &pool, const std::vector<std::int32_t> &pages,
+                                   const unsigned char *src) {
+  const std::size_t bytes = static_cast<std::size_t>(pool.indexer_page_bytes());
+  for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+    for (const std::int32_t page : pages) {
+      checked_memcpy_async(pool.indexer_page_keys(layer, page), const_cast<unsigned char *>(src), bytes,
+                           cudaMemcpyHostToDevice, "indexer keys");
+      src += bytes;
+    }
+  }
+}
+
 // Write pool slot `slot`'s payload of the device-resident CLONE section
 // `section` into a blob at `base`, laid out by `sections`. False for a
 // section this does not write -- KV pages and progress, which the caller
@@ -304,6 +344,18 @@ bool pack_slot_section_to_host(const ignis_seq_pool &pool, std::int32_t slot,
     return true;
   case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
     ignis_seq_copy_hq_residual(pool, slot, at, cudaMemcpyDeviceToHost);
+    return true;
+  case IGNIS_SEQ_SECTION_INDEXER_TAIL:
+    // GitHub #303: every attention layer's tail of the slot, in layer order.
+    for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+      checked_memcpy_async(at + static_cast<std::uint64_t>(layer) * pool.indexer_tail_slot_bytes,
+                           pool.indexer_slot_tail(layer, slot), static_cast<std::size_t>(pool.indexer_tail_slot_bytes),
+                           cudaMemcpyDeviceToHost, "indexer tail");
+    }
+    return true;
+  case IGNIS_SEQ_SECTION_NGRAM_CONV:
+    checked_memcpy_async(at, pool.ngram_slot_conv(slot), static_cast<std::size_t>(section.bytes),
+                         cudaMemcpyDeviceToHost, "n-gram conv state");
     return true;
   default:
     return false;
@@ -343,6 +395,18 @@ bool unpack_slot_section_from_host(ignis_seq_pool &pool, std::int32_t slot,
     // whatever sequence held that slot before (the reference's
     // program_impl.h:1126 records the bug a restore without this is).
     ignis_seq_copy_hq_residual(pool, slot, const_cast<unsigned char *>(at), cudaMemcpyHostToDevice);
+    return true;
+  case IGNIS_SEQ_SECTION_INDEXER_TAIL:
+    for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+      checked_memcpy_async(pool.indexer_slot_tail(layer, slot),
+                           const_cast<unsigned char *>(at) + static_cast<std::uint64_t>(layer) * pool.indexer_tail_slot_bytes,
+                           static_cast<std::size_t>(pool.indexer_tail_slot_bytes), cudaMemcpyHostToDevice,
+                           "indexer tail");
+    }
+    return true;
+  case IGNIS_SEQ_SECTION_NGRAM_CONV:
+    checked_memcpy_async(pool.ngram_slot_conv(slot), const_cast<unsigned char *>(at),
+                         static_cast<std::size_t>(section.bytes), cudaMemcpyHostToDevice, "n-gram conv state");
     return true;
   default:
     return false;
@@ -478,6 +542,9 @@ void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_s
     case IGNIS_SEQ_SECTION_KV_PAGES:
       ignis_seq_pack_pages_to_host(pool, history, at);
       break;
+    case IGNIS_SEQ_SECTION_INDEXER_KEYS:
+      pack_indexer_keys_to_host(pool, history, at);
+      break;
     case IGNIS_SEQ_SECTION_PROGRESS:
       std::memcpy(at, &progress, sizeof(progress));
       break;
@@ -535,9 +602,9 @@ std::string snapshot_refusal(const ignis_seq_pool &pool, const ignis_seq &seq,
   if (header.magic != kIgnisSeqSnapshotMagic) {
     return "buffer is not an ignis sequence snapshot (bad magic)";
   }
-  if (header.format_version != kIgnisSeqSnapshotFormatVersion) {
+  if (header.format_version != ignis_seq_snapshot_format_version_of(pool)) {
     return "snapshot format version " + std::to_string(header.format_version) +
-           ", this leaf writes and accepts " + std::to_string(kIgnisSeqSnapshotFormatVersion);
+           ", this pool writes and accepts " + std::to_string(ignis_seq_snapshot_format_version_of(pool));
   }
   if (header.header_bytes != sizeof(ignis_seq_snapshot_header) ||
       header.section_record_bytes != sizeof(ignis_seq_section)) {
@@ -645,11 +712,7 @@ bool validate_pool_spec(const struct ignis_seq_pool_spec &spec, const std::strin
               " are both set or both 0");
     return false;
   }
-  if ((indexer || ngram) && (spec.retained_slot_count != 0 || spec.retained_host_slot_count != 0)) {
-    set_error(fn + ": a pool with Flash-Next's indexer or n-gram sections holds no retained slots: " +
-              "snapshots and clones do not carry those sections yet (spec flash-next/05)");
-    return false;
-  }
+
   // The codec's row budget is defined for a 256-dimension row only
   // (kHqHeadDim); a pool of any other head_dim would plan planes the hq
   // append path cannot write.
@@ -850,6 +913,13 @@ std::uint64_t host_image_stride(const PoolLayout &layout, const struct ignis_seq
     stride += aligned(2u * spec.kv_num_layers * layout.hq_residual_plane_bytes +
                       kIgnisHqRingWords * sizeof(std::uint32_t));
   }
+  // GitHub #303: Flash-Next's slot sections, in table order.
+  if (layout.indexer_tail_slot_bytes != 0) {
+    stride += aligned(static_cast<std::uint64_t>(spec.kv_num_layers) * layout.indexer_tail_slot_bytes);
+  }
+  if (layout.ngram_conv_slot_bytes != 0) {
+    stride += aligned(layout.ngram_conv_slot_bytes);
+  }
   return stride;
 }
 
@@ -1040,10 +1110,8 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
 }
 
 const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool) {
-  return pool.has_flash_next_sections()
-             ? "this pool's Flash-Next indexer and n-gram sections are not carried by snapshots, "
-               "clones or prefixes yet (spec flash-next/05)"
-             : nullptr;
+  (void)pool;
+  return nullptr;
 }
 
 extern "C" void ignis_seq_pool_free(struct ignis_seq_pool *pool) {
@@ -1161,6 +1229,10 @@ extern "C" uint32_t ignis_seq_snapshot_format_version(void) {
   return kIgnisSeqSnapshotFormatVersion;
 }
 
+extern "C" uint32_t ignis_seq_pool_snapshot_format_version(const struct ignis_seq_pool *pool) {
+  return pool == nullptr ? 0 : ignis_seq_snapshot_format_version_of(*pool);
+}
+
 extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
                                             const struct ignis_seq *seq, uint64_t *out_bytes) {
   if (out_bytes != nullptr) {
@@ -1243,6 +1315,9 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
       switch (section.kind) {
       case IGNIS_SEQ_SECTION_KV_PAGES:
         pack_logical_pages(*pool, *seq, pages, at);
+        break;
+      case IGNIS_SEQ_SECTION_INDEXER_KEYS:
+        pack_indexer_keys_to_host(*pool, logical_page_ids(*seq, pages), at);
         break;
       case IGNIS_SEQ_SECTION_PROGRESS: {
         const ignis_seq_progress_image image = ignis_seq_progress_of(*seq);
@@ -1340,6 +1415,15 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
                                                      header.kv_page_count, header.kv_page_count,
                                                      nullptr);
         break;
+      case IGNIS_SEQ_SECTION_INDEXER_KEYS: {
+        // The target owns its history (a restore refuses a shared prefix),
+        // so its logical pages are its own allocation's first pages.
+        std::vector<std::int32_t> own;
+        const auto ids = seq->kv.page_ids();
+        own.assign(ids.begin(), ids.begin() + header.kv_page_count);
+        unpack_indexer_keys_from_host(*pool, own, at);
+        break;
+      }
       case IGNIS_SEQ_SECTION_PROGRESS:
         std::memcpy(&image, at, sizeof(image));
         break;
@@ -1511,6 +1595,22 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
            kIgnisHqRingWords * sizeof(std::uint32_t), what);
       break;
     }
+    case IGNIS_SEQ_SECTION_INDEXER_TAIL: {
+      // GitHub #303: one 2D copy, a slot's tail in every attention layer.
+      const std::size_t pitch = static_cast<std::size_t>(pool.indexer_slots) * pool.indexer_tail_slot_bytes;
+      const cudaError_t err = cudaMemcpy2DAsync(
+          pool.indexer_slot_tail(0, dst), pitch, pool.indexer_slot_tail(0, src), pitch,
+          static_cast<std::size_t>(pool.indexer_tail_slot_bytes), static_cast<std::size_t>(pool.kv_num_layers),
+          cudaMemcpyDeviceToDevice, nullptr);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpy2DAsync(") + what + ", slot to slot) failed: " +
+                                 cudaGetErrorString(err));
+      }
+      break;
+    }
+    case IGNIS_SEQ_SECTION_NGRAM_CONV:
+      copy(pool.ngram_slot_conv(dst), pool.ngram_slot_conv(src), static_cast<std::size_t>(section.bytes), what);
+      break;
     default:
       throw std::logic_error(std::string("state section ") + what +
                              " has no slot-to-slot copy implementation");

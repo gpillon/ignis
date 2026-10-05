@@ -109,8 +109,8 @@ int main() {
             sectioned.lane_state_bytes == hq12.lane_state_bytes,
         "the sections leave every other line as it was");
 
-  // Each section all or nothing, a block that divides the page, and no
-  // retained slot beside them: refused by name.
+  // Each section all or nothing, and a block that divides the page: refused
+  // by name.
   struct Refused {
     const char *what;
     void (*apply)(ignis_seq_pool_spec &);
@@ -123,11 +123,24 @@ int main() {
        "indexer_compress_tokens 3"},
       {"conv columns with no channels", [](ignis_seq_pool_spec &s) { s.ngram_conv_channels = 0; },
        "ngram_conv_columns"},
-      {"a device retained slot", [](ignis_seq_pool_spec &s) { s.retained_slot_count = 1; },
-       "no retained slots"},
-      {"a host retained slot", [](ignis_seq_pool_spec &s) { s.retained_host_slot_count = 1; },
-       "no retained slots"},
   };
+  // GitHub #303: the sections are in the clone table, so a Flash-Next pool
+  // holds retained slots like any other: a host slot's image carries every
+  // layer's indexer tail and the n-gram conv state, each from a 256-byte
+  // boundary, beside the 27B's sections.
+  {
+    ignis_seq_pool_spec hosted = flash;
+    hosted.retained_host_slot_count = 2;
+    ignis_seq_pool_spec plain = spec_of(IGNIS_KV_FORMAT_HQ_E8_2B, 12);
+    plain.retained_host_slot_count = 2;
+    struct ignis_seq_pool_plan with{}, without{};
+    check(plan(hosted, with), std::string("a Flash-Next pool with host retained slots plans: ") +
+                                  ignis_seq_last_error());
+    check(plan(plain, without), "the same pool without the sections plans");
+    check(with.retained_host_bytes - without.retained_host_bytes == 2ull * (12 * 3 * 128 * 2 + 9 * 10240 * 2),
+          "two host images grow by their indexer tails and n-gram conv state: got " +
+              std::to_string(with.retained_host_bytes - without.retained_host_bytes));
+  }
   for (const Refused &r : refusals) {
     ignis_seq_pool_spec spec = flash;
     r.apply(spec);

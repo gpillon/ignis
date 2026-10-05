@@ -118,6 +118,19 @@ inline void ignis_seq_copy_kv_page(ignis_seq_pool &pool, std::int32_t src_page,
                                cudaGetErrorString(err));
     }
   }
+  // GitHub #303: the page's indexer block keys go with it -- a claimant's
+  // copy of a checkpoint's tail page addresses its own page's keys.
+  if (pool.has_indexer()) {
+    for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+      const cudaError_t err =
+          cudaMemcpyAsync(pool.indexer_page_keys(layer, dst_page), pool.indexer_page_keys(layer, src_page),
+                          static_cast<std::size_t>(pool.indexer_page_bytes()), cudaMemcpyDeviceToDevice, nullptr);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpyAsync(indexer keys of the KV tail page) failed: ") +
+                                 cudaGetErrorString(err));
+      }
+    }
+  }
 }
 
 /* Allocate a sequence against `prefix`, cloning the prefix's own mutable

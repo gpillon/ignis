@@ -294,19 +294,14 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
   return 0;
 }
 
-// Every per-layer frontier of the sequence moves with its program frontier, attention and GDN
-// layers alike, once a call's device work is confirmed complete.
-void advance_frontiers(const FlashNextModel &fn, ignis_seq *seq, uint32_t tokens) {
+// Every per-layer frontier of the sequence moves with its program frontier once a call's device
+// work is confirmed complete. All of them, the arrays' entries past Flash-Next's 12 attention and
+// 36 GDN layers included: a layer the model does not have is trivially caught up, and the chunk
+// boundary a snapshot or a clone checks (ignis_seq_at_chunk_boundary) reads every entry.
+void advance_frontiers(ignis_seq *seq, uint32_t tokens) {
   seq->position += tokens;
-  int32_t attention = 0;
-  int32_t gdn = 0;
-  for (const LayerWeights &layer : fn.weights->layers) {
-    if (layer.attention) {
-      seq->gqa_positions[static_cast<std::size_t>(attention++)] += tokens;
-    } else {
-      seq->gdn_positions[static_cast<std::size_t>(gdn++)] += tokens;
-    }
-  }
+  for (auto &frontier : seq->gqa_positions) frontier += tokens;
+  for (auto &frontier : seq->gdn_positions) frontier += tokens;
 }
 
 float bf16_to_f32(std::uint16_t bits) {
@@ -646,7 +641,7 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
       }
       return -1;
     }
-    advance_frontiers(fn, seq, static_cast<uint32_t>(chunk));
+    advance_frontiers(seq, static_cast<uint32_t>(chunk));
     if (last) {
       seq->pending_token = successor;
       if (out_logits != nullptr) {
@@ -854,7 +849,7 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   for (uint64_t i = 0; i < batch_size; ++i) {
     out_token_ids[i] = sequences[i]->pending_token;
     sequences[i]->pending_token = successors[i];
-    advance_frontiers(fn, sequences[i], 1);
+    advance_frontiers(sequences[i], 1);
   }
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began).count());

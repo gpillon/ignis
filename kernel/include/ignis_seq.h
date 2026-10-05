@@ -391,6 +391,11 @@ int32_t ignis_seq_pending_token(const struct ignis_seq *seq);
  * across builds records this alongside them. */
 uint32_t ignis_seq_snapshot_format_version(void);
 
+/* The blob layout version `pool` writes and accepts (GitHub #303): per model
+ * family -- the 27B's above, or Flash-Next's own numbering for a pool with
+ * its indexer and n-gram sections. 0 for a null pool. */
+uint32_t ignis_seq_pool_snapshot_format_version(const struct ignis_seq_pool *pool);
+
 /* Bytes ignis_seq_snapshot would write for `seq` as it stands now.
  *
  * A whole-sequence figure: its written KV history (not its whole
