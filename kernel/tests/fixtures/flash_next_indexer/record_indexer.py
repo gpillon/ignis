@@ -27,13 +27,15 @@ Two sequences ("lanes") of 4100 tokens:
           those rows at any position. With fewer than 512 positive blocks the selection is
           decided among exact zero ties, i.e. by the tie rule alone.
 
-The tie rule. `scores.topk(k)` keeps the k largest and leaves ties at the k-th value to the
-implementation. torch on CPU does not keep the lowest index (measured here, see provenance);
-torch on CUDA -- what the converter's reference ran -- writes the values strictly above the k-th
-and then the equal ones in index order ("choose the first seen set", TensorTopK.cu). The fixture's
-expected selection is that rule stated explicitly: stable descending sort, LOWEST BLOCK INDEX
-FIRST among equal scores (check_topk_ties_cuda.py verifies torch CUDA against it on a GPU). The
-CPU `topk` selection's agreement with it is recorded per row in the provenance.
+The expected selection is the MODULE's own: the blocks its selected-token mask keeps
+(`module_select`). Where scores tie at the k-th value, `scores.topk(k)` leaves the choice to the
+implementation: torch on CPU (this recording) does not keep the lowest index (measured here, see
+provenance); torch on CUDA -- what the converter's references ran -- writes the values strictly
+above the k-th and then the equal ones in index order ("choose the first seen set",
+TensorTopK.cu). ignis keeps that CUDA order as its documented rule, LOWEST BLOCK INDEX FIRST among
+equal scores, and the test allows ignis's selection to differ from the module's only at such
+ties. `rule_select` is the rule applied to the module's scores, for check_topk_ties_cuda.py,
+which confirms torch CUDA's order on a GPU.
 
 Writes, next to itself: indexer_ref.bin (IGNFX001, kernel/tests/moe_fixture.h reads it) and
 indexer_provenance.json.
@@ -309,8 +311,7 @@ def main():
         exact = (x @ w.T).to(torch.bfloat16)  # fp64 sum, one rounding: what any exact fp32 sum gives
         assert torch.equal(qk, exact), f"lane {lane}: the module's projection is not the exact sum"
         wr.put(f"lane{lane}.rows", torch.tensor(rows, dtype=torch.int32))
-        if lane == 0:  # every block key of one lane localizes a key-path error
-            wr.put(f"lane{lane}.block_keys", all_keys)
+        wr.put(f"lane{lane}.block_keys", all_keys)  # the test's score bound needs them
         for r in rows:
             q, s, dots = out[r]
             n = s.numel()
@@ -330,10 +331,11 @@ def main():
             }
             wr.put(f"lane{lane}.row{r}.q", q)
             wr.put(f"lane{lane}.row{r}.scores", s.float())
-            wr.put(f"lane{lane}.row{r}.select", rule.to(torch.int32))
+            wr.put(f"lane{lane}.row{r}.module_select", mod.to(torch.int32))
+            wr.put(f"lane{lane}.row{r}.rule_select", rule.to(torch.int32))
         print(f"lane {lane}: module mask == re-derivation on {len(rows)} rows")
     wr.close()
-    with open(os.path.join(HERE, "indexer_provenance.json"), "w") as f:
+    with open(os.path.join(HERE, "indexer_provenance.json"), "w", newline="\n") as f:
         json.dump(prov, f, indent=2, sort_keys=True)
         f.write("\n")
     for key, v in prov["rows"].items():

@@ -16,21 +16,22 @@
 // Checked:
 // - the projection is the exact sum (the fixture's inputs make every fp32 partial sum exact), so
 //   the indexer's own arithmetic is all that is compared;
-// - block keys (all 1025 of lane 0) and queries of the recorded rows against the module's: at
-//   least 99% bit-exact, and every value within 2^-7 of its 128-wide row's largest magnitude. The
-//   RMSNorm's fp32 sum of squares runs in another order than torch's, so a normed value can land
-//   one BF16 ulp away; rope's BF16 sum of two rounded products then carries that ulp of the
-//   larger term into a result that may be near zero, which an ulp metric of the result would
-//   blow up into hundreds of "ulps" (seen on the first run);
-// - scores of the recorded rows against the module's, within kScoreTol;
-// - selection: every recorded row's blocks equal the module's except at DOCUMENTED TIES, i.e. a
-//   block in one set and not the other must score within kScoreTol of the module's k-th score;
-//   rows with at most 512 blocks list every visible token; the tail tokens follow the blocks;
+// - block keys (all 1025 of both lanes) and queries of the recorded rows against the module's,
+//   element by element within the bound ElementCheck derives (one BF16 ulp, plus the rotary
+//   pair's carry for rope dims);
+// - scores of the recorded rows against the module's, each within the bound score_bound derives
+//   from the actual query and key differences and fp32 accumulation;
+// - selection: every recorded row's blocks equal the MODULE's own selection except at DOCUMENTED
+//   TIES: a block in one set and not the other must score within the two blocks' bounds of the
+//   module's k-th block (an exact tie, the zero scores relu makes, is a zero gap); rows with at
+//   most 512 blocks list every visible token; the tail tokens follow the blocks;
 // - the tie rule exactly: every sparse row's selection equals "the k largest of OUR scores,
 //   lowest block index first among equal ones" recomputed on the host from the downloaded scores;
 // - the wave driver (select) writes what the staged calls wrote; a dense call (max_visible <=
 //   2051) sets Selection::dense and writes nothing;
-// - a decode call captured in a CUDA graph and replayed equals its eager run.
+// - a decode call captured in a CUDA graph and replayed equals its eager run;
+// - the checks bite: a block key roped one block late (positions shifted by 4 into a spare slot)
+//   and a query roped one position late (a shifted batch) each fail the element check.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
@@ -61,10 +62,10 @@ constexpr int kQk = (kHeads + 1) * kHd;
 constexpr int kT = 4100;
 constexpr int kBlockTopk = 512;
 constexpr int kWidth = 2051;
-constexpr int kSlots = 3;
+constexpr int kSlots = 4;  // lane 0 chunked, lane 1, lane 0 one-shot, the mutation arm
 constexpr int kLogicalPages = 72;
 constexpr int kPhysicalPages = kSlots * kLogicalPages;
-constexpr float kScoreTol = 2e-3F;
+constexpr int kRotary = 64;
 
 constexpr uint32_t kCodes = 0x1D00, kScale = 0x1D01, kQNorm = 0x1D02, kKNorm = 0x1D03;
 constexpr uint32_t kX0 = 0x1D10, kX1 = 0x1D11, kXQ = 0x1D12;
@@ -137,30 +138,68 @@ void grid_token(uint32_t stream, int t, uint16_t *out) {
 // The fixture's per-row record.
 struct Row {
   int lane = 0, position = 0;
-  std::vector<uint16_t> q;   // [4][128] BF16
-  std::vector<float> scores;  // [blocks]
-  std::vector<int32_t> select;  // ascending blocks (the documented rule)
+  std::vector<uint16_t> q;              // [4][128] BF16, the module's
+  std::vector<float> scores;            // [blocks], the module's
+  std::vector<int32_t> module_select;  // ascending blocks the module's own mask keeps
 };
 
-// Agreement of BF16 rows of 128 with the module's: how many values are bit-exact, and the worst
-// difference relative to the largest magnitude of the module's row.
-struct Agreement {
-  std::size_t exact = 0, total = 0;
-  double worst = 0.0;
+// One BF16 ulp at |v| (the smallest normal's below it).
+double ulp_bf16(double v) {
+  const double a = std::fabs(v);
+  return a < 0x1p-126 ? 0x1p-133 : std::ldexp(1.0, std::ilogb(a) - 7);
+}
+
+// A 128-wide normed + roped row (a query head or a block key) against the module's, element by
+// element. The one step whose arithmetic differs from torch's is the RMSNorm's fp32 sum of
+// squares (another order), so a normed value x may land one BF16 ulp away; the pooled mean of
+// four BF16 values in fp32 is exact either way. A dimension past the rotary 64 is that x: one
+// ulp. A rotary dimension is bf16(bf16(x1 c) + bf16(-+x2 s)) for its pair (x1, x2): a product
+// moves by at most ulp(x) from x, ulp(x) more if c or s (fp32 cos/sin rounded to BF16) sits on the
+// other side of a BF16 rounding boundary, and ulp(x) from its own rounding; the sum by those two
+// terms plus both sides' final rounding (ulp(y), and ulp(r) for a cancelling sum that grew), so
+// |diff| <= 6 ulp(r) + ulp(y), r = |(y1, y2)| = |(x1, x2)| (the rotation keeps the pair's norm).
+// That bound is what lets a near-zero rotary output -- torch's cancelling sum, hundreds of the
+// output's own ulps away after a one-ulp input difference -- pass. A rope angle off by more than
+// ~0.05 rad (one position on the first seven pairs, one block on the first ten) fails it.
+struct ElementCheck {
+  std::size_t exact = 0, total = 0, violations = 0;
   void add(const uint16_t *got, const uint16_t *want, std::size_t n) {
     for (std::size_t r = 0; r < n; r += kHd) {
-      double mag = 0.0;
-      for (int i = 0; i < kHd; ++i) mag = std::max(mag, static_cast<double>(std::fabs(bf16_to_f32(want[r + i]))));
       for (int i = 0; i < kHd; ++i) {
-        const double diff = std::fabs(static_cast<double>(bf16_to_f32(got[r + i])) - bf16_to_f32(want[r + i]));
+        const double w = bf16_to_f32(want[r + i]);
+        double bound = ulp_bf16(w);
+        if (i < kRotary) {
+          const int pair = i % (kRotary / 2);
+          const double y1 = bf16_to_f32(want[r + pair]), y2 = bf16_to_f32(want[r + pair + kRotary / 2]);
+          bound += 6.0 * ulp_bf16(std::sqrt(y1 * y1 + y2 * y2));
+        }
         exact += got[r + i] == want[r + i];
+        violations += !(std::fabs(bf16_to_f32(got[r + i]) - w) <= bound);
         ++total;
-        worst = std::max(worst, mag > 0.0 ? diff / mag : diff);
       }
     }
   }
-  bool ok() const { return total > 0 && exact * 100 >= total * 99 && worst <= std::ldexp(1.0, -7); }
 };
+
+// The bound on |our score - the module's| for one block: the first-order effect of the actual
+// differences of the queries (dq) and the key (dk), |dq| |k| + |q| |dk| + |dq| |dk| over the four
+// heads (relu moves no score further than its argument), plus both sides' fp32 accumulation --
+// 128 exact BF16 products summed in any order, at most 127 u sum|q k| each, u = 2^-24 -- and the
+// relu sum and scale (5 u of the score), all divided by sqrt(128) like the score.
+double score_bound(const uint16_t *q_ours, const uint16_t *q_mod, const uint16_t *k_ours, const uint16_t *k_mod,
+                   double score) {
+  double first = 0.0, terms = 0.0;
+  for (int h = 0; h < kHeads; ++h) {
+    for (int dd = 0; dd < kHd; ++dd) {
+      const double qm = bf16_to_f32(q_mod[h * kHd + dd]), km = bf16_to_f32(k_mod[dd]);
+      const double dq = std::fabs(bf16_to_f32(q_ours[h * kHd + dd]) - qm);
+      const double dk = std::fabs(bf16_to_f32(k_ours[dd]) - km);
+      first += dq * std::fabs(km) + std::fabs(qm) * dk + dq * dk;
+      terms += std::fabs(qm * km);
+    }
+  }
+  return (first + 2.0 * 127.0 * 0x1p-24 * terms) / std::sqrt(static_cast<double>(kHd)) + 5.0 * 0x1p-24 * std::fabs(score);
+}
 
 // The documented rule on a score row: the k largest, ties by lowest block index; ascending.
 std::vector<int32_t> rule(const std::vector<float> &s, int k) {
@@ -174,6 +213,14 @@ std::vector<int32_t> rule(const std::vector<float> &s, int k) {
   std::sort(order.begin(), order.end());
   return order;
 }
+
+// What the recorded rows add up to.
+struct Stats {
+  int rows_checked = 0;
+  int documented_ties = 0;       // blocks in one selection and not the other
+  double worst_score = 0.0;      // the largest |our score - the module's| / its bound
+  ElementCheck queries;
+};
 
 constexpr std::size_t kPayloadBytes = (static_cast<std::size_t>(kQk) * kHidden + 255) / 256 * 256 + kQk * 2;
 constexpr int32_t kScoreStride = 2048;  // the decode calls' bound: max_visible 8192 / 4
@@ -262,18 +309,32 @@ CallResult run_call(Device &d, const fn::Geometry &g, const ix::Rope &rope, ninf
   return res;
 }
 
-// Checks the recorded rows that fall in a sparse call: batch lane l is the fixture's lane
-// fixture_lanes[l], its first token at positions[l].
+std::vector<uint16_t> slot_block_keys(const Device &d, int slot, int blocks) {
+  const auto tables = download<int32_t>(d.tables.p, static_cast<std::size_t>(kPhysicalPages));
+  std::vector<uint16_t> out(static_cast<std::size_t>(blocks) * kHd);
+  for (int b = 0; b < blocks; ++b) {
+    const int page = tables[slot * kLogicalPages + (4 * b) / 64];
+    const std::size_t at = (static_cast<std::size_t>(page) * 16 + ((4 * b) % 64) / 4) * kHd;
+    MOE_CUDA(cudaMemcpy(&out[static_cast<std::size_t>(b) * kHd], d.keys.as<uint16_t>() + at, kHd * 2,
+                        cudaMemcpyDeviceToHost));
+  }
+  return out;
+}
+
+// Checks the recorded rows that fall in a sparse call: batch lane l is fixture lane
+// fixture_lanes[l] in slot slots[l], its first token at positions[l]; module_keys[lane] are the
+// module's block keys of fixture lane `lane`.
 void check_rows(const Device &d, const std::vector<Row> &recorded, const std::vector<int> &fixture_lanes,
-                const std::vector<int32_t> &positions, int tokens, const std::string &what, int *rows_checked,
-                int *documented_ties, double *max_score_err, Agreement *queries) {
-  for (const Row &rec : recorded) {
-    for (std::size_t l = 0; l < positions.size(); ++l) {
+                const std::vector<int32_t> &slots, const std::vector<int32_t> &positions, int tokens,
+                const std::vector<uint16_t> (&module_keys)[2], const std::string &what, Stats *st) {
+  for (std::size_t l = 0; l < positions.size(); ++l) {
+    std::vector<uint16_t> keys;  // this lane's block keys, read once
+    for (const Row &rec : recorded) {
       const int t = rec.position - positions[l];
       if (fixture_lanes[l] != rec.lane || t < 0 || t >= tokens) continue;
       const int row = static_cast<int>(l) * tokens + t;
       const std::string tag = what + " lane " + std::to_string(rec.lane) + " row " + std::to_string(rec.position);
-      ++*rows_checked;
+      ++st->rows_checked;
       const int blocks = (rec.position + 1) / 4;
       const auto tokens_row = download<int32_t>(d.tok_a.as<int32_t>() + static_cast<std::size_t>(row) * kWidth, kWidth);
       const int32_t count = download<int32_t>(d.cnt_a.as<int32_t>() + row, 1)[0];
@@ -283,15 +344,23 @@ void check_rows(const Device &d, const std::vector<Row> &recorded, const std::ve
         check(ok, tag + ": a dense row must list every visible token");
         continue;
       }
-      // q
+      if (keys.empty()) keys = slot_block_keys(d, slots[l], (kT + 3) / 4);
+      const uint16_t *mk = module_keys[rec.lane].data();
+      // queries
       const auto q = download<uint16_t>(d.q.as<__nv_bfloat16>() + static_cast<std::size_t>(row) * kHeads * kHd, kHeads * kHd);
-      queries->add(q.data(), rec.q.data(), q.size());
-      // scores
+      st->queries.add(q.data(), rec.q.data(), q.size());
+      // scores, each within its derived bound
       const auto s = download<float>(d.scores.as<float>() + static_cast<std::size_t>(row) * d.score_stride, blocks);
-      double err = 0.0;
-      for (int b = 0; b < blocks; ++b) err = std::max(err, std::fabs(static_cast<double>(s[b]) - rec.scores[b]));
-      *max_score_err = std::max(*max_score_err, err);
-      check(err <= kScoreTol, tag + ": score error " + std::to_string(err) + " above the tolerance");
+      std::vector<double> bound(blocks);
+      bool scores_ok = true;
+      for (int b = 0; b < blocks; ++b) {
+        bound[b] = score_bound(q.data(), rec.q.data(), &keys[static_cast<std::size_t>(b) * kHd],
+                               &mk[static_cast<std::size_t>(b) * kHd], rec.scores[b]);
+        const double dev = std::fabs(static_cast<double>(s[b]) - rec.scores[b]);
+        st->worst_score = std::max(st->worst_score, dev / bound[b]);
+        scores_ok = scores_ok && dev <= bound[b];
+      }
+      check(scores_ok, tag + ": a score differs from the module's past its derived bound");
       // the list's shape
       std::vector<int32_t> ours;
       bool shape = count == kBlockTopk * 4 + (rec.position + 1 - blocks * 4);
@@ -307,35 +376,25 @@ void check_rows(const Device &d, const std::vector<Row> &recorded, const std::ve
       check(shape, tag + ": the list is not 512 ascending blocks then the tail");
       // the tie rule, exactly, on our own scores
       check(ours == rule(s, kBlockTopk), tag + ": selection differs from the tie rule on its own scores");
-      // against the module: a difference only at documented ties
-      std::vector<float> sorted(rec.scores);
-      std::sort(sorted.begin(), sorted.end(), std::greater<float>());
-      const float kth = sorted[kBlockTopk - 1];
-      std::set<int32_t> a(ours.begin(), ours.end()), m(rec.select.begin(), rec.select.end());
-      int differ = 0;
-      bool all_ties = true;
-      for (int32_t b : a) {
-        if (m.count(b) == 0) { ++differ; all_ties = all_ties && std::fabs(rec.scores[b] - kth) <= kScoreTol; }
+      // against the module's own selection: a block in only one of the two must tie with the
+      // module's k-th block within the two blocks' score bounds (an exact tie is a zero gap)
+      std::vector<int32_t> by_score(blocks);
+      for (int b = 0; b < blocks; ++b) by_score[b] = b;
+      std::stable_sort(by_score.begin(), by_score.end(),
+                       [&](int32_t a, int32_t b) { return rec.scores[a] > rec.scores[b]; });
+      const int32_t kth = by_score[kBlockTopk - 1];
+      std::set<int32_t> a(ours.begin(), ours.end()), m(rec.module_select.begin(), rec.module_select.end());
+      bool at_ties = true;
+      for (const auto &[one, other] : {std::make_pair(&a, &m), std::make_pair(&m, &a)}) {
+        for (int32_t b : *one) {
+          if (other->count(b) != 0) continue;
+          ++st->documented_ties;
+          at_ties = at_ties && std::fabs(static_cast<double>(rec.scores[b]) - rec.scores[kth]) <= bound[b] + bound[kth];
+        }
       }
-      for (int32_t b : m) {
-        if (a.count(b) == 0) { ++differ; all_ties = all_ties && std::fabs(rec.scores[b] - kth) <= kScoreTol; }
-      }
-      *documented_ties += differ;
-      check(all_ties, tag + ": a selected block differs from the module's away from a score tie");
+      check(at_ties, tag + ": a selected block differs from the module's away from a score tie");
     }
   }
-}
-
-std::vector<uint16_t> slot_block_keys(const Device &d, int slot, int blocks) {
-  const auto tables = download<int32_t>(d.tables.p, static_cast<std::size_t>(kPhysicalPages));
-  std::vector<uint16_t> out(static_cast<std::size_t>(blocks) * kHd);
-  for (int b = 0; b < blocks; ++b) {
-    const int page = tables[slot * kLogicalPages + (4 * b) / 64];
-    const std::size_t at = (static_cast<std::size_t>(page) * 16 + ((4 * b) % 64) / 4) * kHd;
-    MOE_CUDA(cudaMemcpy(&out[static_cast<std::size_t>(b) * kHd], d.keys.as<uint16_t>() + at, kHd * 2,
-                        cudaMemcpyDeviceToHost));
-  }
-  return out;
 }
 
 }  // namespace
@@ -374,6 +433,8 @@ int main() {
   }
   for (int32_t r : lane1_rows) std::memcpy(&x1[static_cast<std::size_t>(r) * kHidden], xq.data(), kHidden * 2);
 
+  const std::vector<uint16_t> module_keys[2] = {need(fx, "lane0.block_keys").as<uint16_t>(),
+                                                need(fx, "lane1.block_keys").as<uint16_t>()};
   std::vector<Row> recorded;
   for (int lane = 0; lane < 2; ++lane) {
     for (int32_t r : (lane == 0 ? lane0_rows : lane1_rows)) {
@@ -383,7 +444,7 @@ int main() {
       row.position = r;
       row.q = need(fx, p + "q").as<uint16_t>();
       row.scores = need(fx, p + "scores").as<float>();
-      row.select = need(fx, p + "select").as<int32_t>();
+      row.module_select = need(fx, p + "module_select").as<int32_t>();
       recorded.push_back(std::move(row));
     }
   }
@@ -394,7 +455,7 @@ int main() {
   upload(d.q_norm, w.q_norm);
   upload(d.k_norm, w.k_norm);
   std::vector<int32_t> tables(kPhysicalPages);
-  for (int i = 0; i < kPhysicalPages; ++i) tables[i] = (i * 173 + 29) % kPhysicalPages;  // a permutation
+  for (int i = 0; i < kPhysicalPages; ++i) tables[i] = (i * 173 + 29) % kPhysicalPages;  // a permutation of 288
   upload(d.tables, tables);
   MOE_CUDA(cudaMemsetAsync(d.keys.p, 0, d.keys.bytes, d.stream));
   MOE_CUDA(cudaMemsetAsync(d.tail.p, 0, d.tail.bytes, d.stream));
@@ -419,9 +480,7 @@ int main() {
     check(exact, "the FP8 projection of grid inputs is not the exact sum");
   }
 
-  int rows_checked = 0, ties = 0;
-  double max_score_err = 0.0;
-  Agreement queries;
+  Stats st;
   auto load_rows = [&](const std::vector<uint16_t> &x, int first, int n) {
     MOE_CUDA(cudaMemcpyAsync(d.xin.p, &x[static_cast<std::size_t>(first) * kHidden],
                              static_cast<std::size_t>(n) * kHidden * 2, cudaMemcpyHostToDevice, d.stream));
@@ -435,14 +494,14 @@ int main() {
     const std::string what = "prefill [" + std::to_string(c[0]) + "," + std::to_string(c[1]) + ")";
     const CallResult res = run_call(d, g, rope, arena, {0}, {c[0]}, n, c[1], what);
     check(res.dense == (c[1] <= 2051), what + ": Selection::dense is wrong");
-    if (!res.dense) check_rows(d, recorded, {0}, {c[0]}, n, what, &rows_checked, &ties, &max_score_err, &queries);
+    if (!res.dense) check_rows(d, recorded, {0}, {0}, {c[0]}, n, module_keys, what, &st);
   }
   // Lane 1, slot 1: one prefill call.
   {
     load_rows(x1, 0, 4096);
     const CallResult res = run_call(d, g, rope, arena, {1}, {0}, 4096, 4096, "lane 1 prefill");
     check(!res.dense, "lane 1 prefill: a 4096-token call is not dense");
-    check_rows(d, recorded, {1}, {0}, 4096, "lane 1 prefill", &rows_checked, &ties, &max_score_err, &queries);
+    check_rows(d, recorded, {1}, {1}, {0}, 4096, module_keys, "lane 1 prefill", &st);
   }
   // Decode 4096..4099, both lanes in one call; the graph bound 8192 stands for max_visible.
   std::vector<int32_t> decode_lists[3];
@@ -454,7 +513,7 @@ int main() {
                              cudaMemcpyHostToDevice, d.stream));
     const std::string what = "decode " + std::to_string(p);
     run_call(d, g, rope, arena, {0, 1}, {p, p}, 1, 8192, what);
-    check_rows(d, recorded, {0, 1}, {p, p}, 1, what, &rows_checked, &ties, &max_score_err, &queries);
+    check_rows(d, recorded, {0, 1}, {0, 1}, {p, p}, 1, module_keys, what, &st);
     if (p < 4099) decode_lists[p - 4096] = download<int32_t>(d.tok_a.p, kWidth);
     if (p == 4098) {
       keys_after_4098 = slot_block_keys(d, 0, 1024);
@@ -489,15 +548,13 @@ int main() {
     MOE_CUDA(cudaGraphDestroy(graph));
   }
 
-  // Lane 0's block keys against the module's, all 1025 blocks.
-  {
-    const auto want = need(fx, "lane0.block_keys").as<uint16_t>();
-    const auto got = slot_block_keys(d, 0, 1025);
-    Agreement keys;
-    keys.add(got.data(), want.data(), want.size());
-    std::printf("  block keys: %zu / %zu bit-exact with the module, worst %.2e of the row's largest\n", keys.exact,
-                keys.total, keys.worst);
-    check(keys.ok(), "block keys differ from the module's (under 99% bit-exact, or a value past 2^-7)");
+  // Both lanes' block keys against the module's, all 1025 blocks.
+  for (int lane = 0; lane < 2; ++lane) {
+    ElementCheck keys;
+    keys.add(slot_block_keys(d, lane, 1025).data(), module_keys[lane].data(), module_keys[lane].size());
+    std::printf("  lane %d block keys: %zu / %zu bit-exact with the module, %zu past the element bound\n", lane,
+                keys.exact, keys.total, keys.violations);
+    check(keys.violations == 0, "lane " + std::to_string(lane) + " block keys differ from the module's past the bound");
   }
 
   // Lane 0 again in one call, slot 2: the same state and the same selections as chunks + decode.
@@ -513,12 +570,58 @@ int main() {
     }
   }
 
-  std::printf("  %d recorded rows checked; scores within %.2e of the module; queries %zu / %zu bit-exact, "
-              "worst %.2e of the row's largest; %d block(s) differ from the module, all at documented ties\n",
-              rows_checked, max_score_err, queries.exact, queries.total, queries.worst, ties);
-  check(rows_checked == static_cast<int>(recorded.size()) - 2,  // rows 2049 and 2050 sit in dense calls
-        "not every recorded row was checked: " + std::to_string(rows_checked));
-  check(queries.ok(), "queries differ from the module's (under 99% bit-exact, or a value past 2^-7)");
+  // The checks bite. A block key roped one block late: the first 64 tokens appended as if they
+  // started at position 4, into the spare slot, so block b + 1 holds block b's pooled, normed key
+  // roped at 4 (b + 1). Its non-rotary half must still match; the element check must flag it.
+  {
+    load_rows(x0, 0, 64);
+    run_call(d, g, rope, arena, {3}, {4}, 64, 68, "mutation: keys roped one block late");
+    const auto late = slot_block_keys(d, 3, 17);
+    ElementCheck mutated;
+    mutated.add(&late[kHd], module_keys[0].data(), 16 * kHd);
+    bool nope_equal = true;
+    for (int b = 0; b < 16; ++b) {
+      for (int i = kRotary; i < kHd; ++i) {
+        nope_equal = nope_equal && late[static_cast<std::size_t>(b + 1) * kHd + i] == module_keys[0][static_cast<std::size_t>(b) * kHd + i];
+      }
+    }
+    std::printf("  mutation, keys roped one block late: %zu of %zu values past the element bound\n", mutated.violations,
+                mutated.total);
+    check(nope_equal, "mutation arm: the late-roped keys' non-rotary half should equal the module's");
+    check(mutated.violations > 0, "mutation arm: the element check misses keys roped one block late");
+  }
+  // A query roped one position late: lane 0's row 4099 prepared as if at 4100.
+  {
+    load_rows(x0, 4099, 1);
+    if (ignis_fp8_linear(d.w.p, kQk, kHidden, d.xin.p, 1, d.qk.p, 0, d.stream) != 0) return 1;
+    const std::vector<int32_t> late_slot = {0}, late_pos = {4100};
+    MOE_CUDA(cudaMemcpyAsync(d.slots.p, late_slot.data(), 4, cudaMemcpyHostToDevice, d.stream));
+    MOE_CUDA(cudaMemcpyAsync(d.positions.p, late_pos.data(), 4, cudaMemcpyHostToDevice, d.stream));
+    fn::Batch b;
+    b.lanes = 1;
+    b.tokens = 1;
+    b.slots = d.slots.as<int32_t>();
+    b.positions = d.positions.as<int32_t>();
+    b.max_visible = 4101;
+    IX_OK(ix::prepare_queries(g, rope, d.q_norm.p, b, 0, 1, d.qk.p, d.q.as<__nv_bfloat16>(), d.stream));
+    MOE_CUDA(cudaStreamSynchronize(d.stream));
+    const auto late = download<uint16_t>(d.q.p, kHeads * kHd);
+    const auto it = std::find_if(recorded.begin(), recorded.end(),
+                                 [](const Row &r) { return r.lane == 0 && r.position == 4099; });
+    ElementCheck mutated;
+    mutated.add(late.data(), it->q.data(), late.size());
+    std::printf("  mutation, query roped one position late: %zu of %zu values past the element bound\n",
+                mutated.violations, mutated.total);
+    check(mutated.violations > 0, "mutation arm: the element check misses a query roped one position late");
+  }
+
+  std::printf("  %d recorded rows checked; scores within %.2f of their derived bounds; queries %zu / %zu bit-exact, "
+              "%zu past the element bound; %d block(s) differ from the module, all at documented ties\n",
+              st.rows_checked, st.worst_score, st.queries.exact, st.queries.total, st.queries.violations,
+              st.documented_ties);
+  check(st.rows_checked == static_cast<int>(recorded.size()) - 2,  // rows 2049 and 2050 sit in dense calls
+        "not every recorded row was checked: " + std::to_string(st.rows_checked));
+  check(st.queries.violations == 0, "queries differ from the module's past the element bound");
   MOE_CUDA(cudaStreamDestroy(d.stream));
   if (g_failed != 0) {
     std::fprintf(stderr, "test_flash_next_indexer: %d failure(s)\n", g_failed);
