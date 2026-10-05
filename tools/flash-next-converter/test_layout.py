@@ -111,3 +111,22 @@ def test_done_verification_catches_a_torn_or_changed_file(tmp_path):
     (tmp_path / "a.bin").write_bytes(b"x" * 50)              # torn
     assert not layout.verify_done(tmp_path)
     assert not layout.verify_done(tmp_path / "missing")
+
+
+def test_the_reduced_tree_has_every_k_class_and_the_real_inventory(tmp_path):
+    import fixture
+    work = fixture.make_reduced(str(tmp_path / "work"))
+    classes = set()
+    names = set()
+    for L in range(2):
+        d = tmp_path / "work" / "layers" / f"L{L:02d}"
+        assert layout.verify_done(d)
+        index = layout.read_index(d / "experts.idx", fixture.REDUCED_SHAPES)
+        classes |= {(e.proj, e.k2) for e in index}
+        names |= {t["name"] for t in __import__("json").load(open(d / "tensors.json"))["tensors"]}
+    assert len(classes) == 8
+    assert "layers.0.linear_attn.in_proj_qkv.weight" in names and "layers.1.self_attn.q_proj.weight" in names
+    assert "layers.1.ple.key_proj.weight" in names and "layers.1.mlp.gate.weight" in names
+    assert (tmp_path / "work" / "ngram" / "table" / "shard_001.int4").stat().st_size == 500 * 90
+    total = sum(f.stat().st_size for f in (tmp_path / "work").rglob("*") if f.is_file())
+    assert total < 3 << 20                     # ~2.4 MB

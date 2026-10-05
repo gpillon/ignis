@@ -32,6 +32,7 @@ import corpus as corpus_mod
 import fetch
 import fp8
 import layout
+import nonexpert
 import scoring
 import table
 import trellis
@@ -413,36 +414,10 @@ class Conversion:
                      "hyper_connection_mixer.input_mix_weight_up.weight"):
             full = name if name.startswith("lm_head") else PFX + name
             t = self.src.get(full)
-            entries.append(self._write_tensor(d, name, t))
+            entries.append(nonexpert.write_tensor(d, name, t))
             del t
         layout.write_json_atomic(os.path.join(d, "tensors.json"), {"tensors": entries})
         layout.mark_done(d)
-
-    def _write_tensor(self, d, name, t, prefix=""):
-        """Writes one non-expert tensor as its container payload; `name` is layer-local."""
-        enc = layout.encoding_of(name, tuple(t.shape))
-        if enc == "fp8":
-            payload = fp8.encode(t)
-            fmt, lay = "FP8_E4M3FN_ROW_BF16S", "row-scale-v1"
-        else:
-            payload = t.detach().to(torch.bfloat16).cpu().contiguous().view(torch.int16).numpy().tobytes()
-            fmt, lay = "BF16", "contiguous-le-v1"
-        fname = name + ".bin"
-        with open(os.path.join(d, fname), "wb") as f:
-            f.write(payload)
-        return {"name": prefix + name, "file": fname, "format": fmt, "layout": lay, "shape": list(t.shape),
-                "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
-                "fp8_measured_by_study": layout.measured_by_study(name) if enc == "fp8" else None}
-
-    def _fp8_weights(self, d, device):
-        """layer-local name -> the bf16 weight each FP8 payload of a directory stands for."""
-        out = {}
-        for t in json.load(open(os.path.join(d, "tensors.json")))["tensors"]:
-            if t["format"].startswith("FP8"):
-                raw = bytearray(open(os.path.join(d, t["file"]), "rb").read())
-                name = t["name"].split(".", 2)[2] if t["name"].startswith("layers.") else t["name"]
-                out[name] = fp8.decode(raw, t["shape"], device)
-        return out
 
     # ------------------------------------------------------------ initial state
     def initial_state(self):
@@ -610,13 +585,13 @@ class Conversion:
                 del X, ridx, rw
                 torch.cuda.empty_cache()
                 ta = time.time()
-                entries = [self._write_tensor(d, name, t, prefix=f"layers.{L}.") for name, t in layer.state_dict().items()
+                entries = [nonexpert.write_tensor(d, name, t, prefix=f"layers.{L}.") for name, t in layer.state_dict().items()
                            if layout.encoding_of(name, tuple(t.shape)) != "expert"]
                 layout.write_json_atomic(os.path.join(d, "tensors.json"), {"tensors": entries})
                 tm["write"] += time.time() - ta
             ta = time.time()
             gq, dq, sample, checks = self._decode_experts(d, L, convert)
-            fp8w = self._fp8_weights(d, self.dev)
+            fp8w = nonexpert.fp8_weights(d, self.dev)
             tm["decode"] = time.time() - ta
             if convert:
                 self._moe_error(experts, gq, dq, moe, rec)

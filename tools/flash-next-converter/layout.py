@@ -26,16 +26,17 @@ def _check_k2(k2):
         raise ValueError(f"k2 {k2} is not one of {K2_SET} (K in 2, 2.5, 3, 4)")
 
 
-def trellis_bytes(proj, k2):
+def trellis_bytes(proj, k2, shapes=SHAPES):
     _check_k2(k2)
-    i, o = SHAPES[proj]
+    i, o = shapes[proj]
     return i * o * k2 // 16
 
 
-def record_bytes(proj, k2):
-    """Bytes of one record: trellis, suh, svh, zero padding to a 4096 multiple (§3)."""
-    i, o = SHAPES[proj]
-    data = trellis_bytes(proj, k2) + 2 * (i + o)
+def record_bytes(proj, k2, shapes=SHAPES):
+    """Bytes of one record: trellis, suh, svh, zero padding to a 4096 multiple (§3).
+    `shapes` (proj -> (in, out)) is the real model's unless a reduced fixture passes its own."""
+    i, o = shapes[proj]
+    data = trellis_bytes(proj, k2, shapes) + 2 * (i + o)
     return -(-data // PAGE) * PAGE
 
 
@@ -59,9 +60,9 @@ class IndexEntry:
     offset: int
 
 
-def record_payload(proj, k2, rec):
+def record_payload(proj, k2, rec, shapes=SHAPES):
     """The record's bytes from exllamav3's tensors (NumPy arrays), checked against the class."""
-    i, o = SHAPES[proj]
+    i, o = shapes[proj]
     trellis, suh, svh = rec["trellis"], rec["suh"], rec["svh"]
     want = (i // 16, o // 16, 8 * k2)
     if trellis.dtype != np.int16 or tuple(trellis.shape) != want:
@@ -70,10 +71,10 @@ def record_payload(proj, k2, rec):
         raise ValueError(f"{proj}: suh/svh must be fp16 ({i},) / ({o},)")
     body = np.ascontiguousarray(trellis).tobytes() + np.ascontiguousarray(suh).tobytes() \
         + np.ascontiguousarray(svh).tobytes()
-    return body + bytes(record_bytes(proj, k2) - len(body))
+    return body + bytes(record_bytes(proj, k2, shapes) - len(body))
 
 
-def write_experts(directory, n_experts, record_of):
+def write_experts(directory, n_experts, record_of, shapes=SHAPES):
     """Writes experts.bin and experts.idx for experts 0..n-1, gate/up before down (§4).
 
     `record_of(expert, proj)` returns (k2, {"trellis", "suh", "svh"} as NumPy arrays).
@@ -83,7 +84,7 @@ def write_experts(directory, n_experts, record_of):
         for e in range(n_experts):
             for proj in ("gu", "dn"):
                 k2, rec = record_of(e, proj)
-                payload = record_payload(proj, k2, rec)
+                payload = record_payload(proj, k2, rec, shapes)
                 f.write(payload)
                 entries.append(IndexEntry(e, proj, k2, len(payload), offset))
                 digests.append(hashlib.sha256(payload).hexdigest())
@@ -94,7 +95,7 @@ def write_experts(directory, n_experts, record_of):
     return entries, digests
 
 
-def read_index(path):
+def read_index(path, shapes=SHAPES):
     raw = open(path, "rb").read()
     if len(raw) % INDEX_ENTRY.size:
         raise ValueError(f"{path}: {len(raw)} bytes is not a whole number of index entries")
@@ -102,21 +103,21 @@ def read_index(path):
     for n in range(len(raw) // INDEX_ENTRY.size):
         e, p, k2, size, off = INDEX_ENTRY.unpack_from(raw, n * INDEX_ENTRY.size)
         proj = PROJ_NAME[p]
-        if size != record_bytes(proj, k2) or off != offset:
+        if size != record_bytes(proj, k2, shapes) or off != offset:
             raise ValueError(f"{path}: entry {n} (expert {e} {proj}) size {size} offset {off}, want "
-                             f"{record_bytes(proj, k2)} at {offset}")
+                             f"{record_bytes(proj, k2, shapes)} at {offset}")
         out.append(IndexEntry(e, proj, k2, size, off))
         offset += size
     return out
 
 
-def read_record(path, entry):
+def read_record(path, entry, shapes=SHAPES):
     """exllamav3's tensors of one record, as NumPy arrays (§3)."""
-    i, o = SHAPES[entry.proj]
+    i, o = shapes[entry.proj]
     with open(path, "rb") as f:
         f.seek(entry.offset)
         raw = f.read(entry.size)
-    t = trellis_bytes(entry.proj, entry.k2)
+    t = trellis_bytes(entry.proj, entry.k2, shapes)
     trellis = np.frombuffer(raw, dtype=np.int16, count=t // 2).reshape(i // 16, o // 16, 8 * entry.k2)
     suh = np.frombuffer(raw, dtype=np.float16, count=i, offset=t)
     svh = np.frombuffer(raw, dtype=np.float16, count=o, offset=t + 2 * i)

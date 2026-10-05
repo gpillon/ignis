@@ -198,8 +198,12 @@ def cmd_verify(a):
 
 def cmd_fixture(a):
     import fixture
-    fixture.make(a.out)
-    print(f"fixture work tree written to {a.out}")
+    if a.reduced:
+        fixture.make_reduced(a.out)
+        print(f"reduced-geometry work tree written to {a.out}")
+    else:
+        fixture.make(a.out)
+        print(f"fixture work tree written to {a.out}/work")
     return 0
 
 
@@ -232,6 +236,8 @@ def main(argv=None):
     v.set_defaults(fn=cmd_verify)
     f = sub.add_parser("fixture", help="a reduced work tree (2 layers, 8 experts, 1000 table rows), CPU only")
     f.add_argument("--out", required=True)
+    f.add_argument("--reduced", action="store_true",
+                   help="the packer's reduced geometry from the HF modeling code; --out is the work root")
     f.set_defaults(fn=cmd_fixture)
     a = ap.parse_args(argv)
     return a.fn(a)

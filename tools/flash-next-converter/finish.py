@@ -18,6 +18,7 @@ import torch
 
 import corpus as corpus_mod
 import layout
+import nonexpert
 import pipeline as P
 import scoring
 import trellis
@@ -41,7 +42,7 @@ class Head:
         sd = src.load(P.PFX + "hyper_connection_mixer.")
         lm = src.get("lm_head.weight")
         if quantized:
-            w = conv._fp8_weights(g, "cpu")
+            w = nonexpert.fp8_weights(g, "cpu")
             sd = {k: (w["hyper_connection_mixer." + k] if "hyper_connection_mixer." + k in w else v) for k, v in sd.items()}
             lm = w["lm_head.weight"]
         with torch.device("meta"):
