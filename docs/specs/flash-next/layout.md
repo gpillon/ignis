@@ -53,6 +53,10 @@ beside the artifact (a few hundred MB).
   written last of all, after the end-of-run measurements, and its presence (with
   `"status": "complete"`) means the whole work tree is complete.
 - The packer may delete a directory's files after appending them to the container.
+- The packer reads only `experts.bin`, `experts.idx`, `tensors.json` and the files
+  `tensors.json` lists, the `ngram/` files of §7 and `frontend/`. Everything else in a
+  layer directory (`layer.json`, `route_*.npy`) is the converter's own record, read by its
+  end-of-run steps.
 
 ## 3. Expert projections: the trellis record [decided]
 
@@ -180,7 +184,10 @@ so the packer copies bytes and the reader's `tensor_encoded_size` validates them
   - The scale of a row is `amax(|W[r, :]|) / 448` rounded **up** to the next bf16
     (so no code saturates), or 1.0 for an all-zero row; codes are
     `round_to_nearest_even_e4m3fn(W / scale_bf16)`. Every stream that runs "FP8"
-    weights in the converter dequantizes the stored bytes.
+    weights in the converter dequantizes the stored bytes: `code · scale` in fp32,
+    rounded to bf16, since the reference runs the checkpoint's modules in bf16 (the
+    decoded trellis experts are rounded to bf16 the same way). An engine that keeps the
+    product in fp32 differs from the reference by that rounding only.
   - **Spec departure, [ASK]:** spec 01 and spec 04 say "fp32 per-row scale" *and*
     "the container's existing row-scale layout"; the existing layout's scale is bf16.
     This document takes the existing layout (no new format code; the materializer and
@@ -368,7 +375,7 @@ G1 sequences, §11).
 | file | type, shape | content |
 |---|---|---|
 | `manifest.json` | | windows in order: `{index, kind, source, length, valid, first_position}`; `P = Σ valid` |
-| `tokens.u32` | u32 `(n_windows, length)` | the fed token ids (EOS padding past `valid`) |
+| `tokens.u32` | u32, each window's `length` tokens, concatenated in window order | the fed token ids (EOS padding past `valid`) |
 | `bf16_top64_ids.i32` | i32 `(P, 64)` | BF16 stream: the 64 most probable next tokens, descending |
 | `bf16_top64_lp.f32` | f32 `(P, 64)` | their log-probabilities (nats) |
 | `bf16_lse.f32` | f32 `(P,)` | `logsumexp` of the position's logits |
