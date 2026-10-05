@@ -88,10 +88,15 @@ impl FixturePrompt {
 
     /// The token each teacher-forced position is scored against: the
     /// expected-argmax column when the fixture has one, else the fed tokens.
-    /// A column that does not have one entry per fed token is refused.
+    /// A column that does not have one entry per fed token is refused, and so
+    /// is one without the recorded prompt it was conditioned on.
     pub fn expected_tokens(&self) -> Result<&[u32], String> {
         match &self.expected_argmax {
             None => Ok(&self.token_ids),
+            Some(_) if self.prompt_token_ids.is_none() => Err(format!(
+                "canary {}: expected_argmax without the prompt_token_ids it was recorded after",
+                self.id
+            )),
             Some(expected) if expected.len() == self.token_ids.len() => Ok(expected),
             Some(expected) => Err(format!(
                 "canary {}: {} expected tokens for {} fed tokens",
@@ -774,12 +779,15 @@ mod tests {
 
     // ── the expected-argmax column (spec flash-next/04) ───────────────────
 
+    /// A canary; with an expected column, also the recorded prompt the
+    /// column was conditioned on, as layout.md §11 writes them together.
     fn canary(token_ids: Vec<u32>, expected_argmax: Option<Vec<u32>>) -> FixturePrompt {
         FixturePrompt {
             id: "c".into(),
             prompt: "p".into(),
             text: "t".into(),
             token_ids,
+            prompt_token_ids: expected_argmax.as_ref().map(|_| vec![1, 2]),
             expected_argmax,
             ..Default::default()
         }
@@ -834,6 +842,17 @@ mod tests {
 
     /// One expected token per fed token: a column of another length is a
     /// recorder bug, refused rather than truncated.
+    /// The expected argmax is conditioned on the recorded prompt: a column
+    /// with no recorded prompt would be scored after a prompt the harness
+    /// rendered itself, so it is refused, not scored.
+    #[test]
+    fn an_expected_column_without_its_recorded_prompt_is_refused() {
+        let mut prompt = canary(vec![10, 11, 12], Some(vec![10, 11, 12]));
+        prompt.prompt_token_ids = None;
+        let err = score_canary(&prompt, &[10, 11, 12], 32).unwrap_err();
+        assert!(err.contains("expected_argmax") && err.contains("prompt_token_ids"), "{err}");
+    }
+
     #[test]
     fn an_expected_column_of_another_length_is_refused() {
         let prompt = canary(vec![10, 11, 12], Some(vec![10, 11]));
