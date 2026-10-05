@@ -178,7 +178,7 @@ __global__ void __launch_bounds__(kThreads) conv_add(
 
   // A sequence's first token starts from zeros (the reference pads its conv
   // input), whatever the slot held before.
-  const bool fresh = t0 == 0 && positions != nullptr && positions[lane] == 0;
+  const bool fresh = t0 == 0 && positions[lane] == 0;
   float ring[kStateColumns];
 #pragma unroll
   for (int m = 0; m < kStateColumns; ++m) {
@@ -217,6 +217,15 @@ __global__ void __launch_bounds__(kThreads) conv_add(
 
 std::size_t aligned(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
+// A launch's own failure, named, before the next launch can mask it.
+bool launched(const char *what) {
+  if (const cudaError_t err = cudaGetLastError(); err != cudaSuccess) {
+    fn_set_error(std::string("fn_ngram_add: ") + what + ": launch failed: " + cudaGetErrorString(err));
+    return false;
+  }
+  return true;
+}
+
 // The rows of one window and the scratch they take.
 struct WindowBytes {
   std::size_t e, k, v, gates, rms;
@@ -254,7 +263,8 @@ std::string check(const Context &ctx, const NgramWeights &w, const Batch &batch)
     return "an n-gram norm or conv weight is missing";
   }
   if (ctx.ngram.conv_columns == nullptr) return "the lanes' n-gram conv state is missing";
-  if (batch.lanes <= 0 || batch.lanes > kWindowRows || batch.tokens <= 0 || batch.slots == nullptr) {
+  if (batch.lanes <= 0 || batch.lanes > kWindowRows || batch.tokens <= 0 || batch.slots == nullptr ||
+      batch.positions == nullptr) {
     return "a batch of " + std::to_string(batch.lanes) + " lanes of " + std::to_string(batch.tokens) +
            " tokens";
   }
@@ -294,6 +304,7 @@ int32_t fn_ngram_add(const Context &ctx, const NgramWeights &w, const Batch &bat
       const int32_t window = batch.lanes * n;
       dequant_rows<<<window, kThreads, 0, stream>>>(rows, batch.tokens, t0, n, g.ngram_heads,
                                                      g.ngram_head_dim(), g.ngram_row_bytes(), e);
+      if (!launched("dequant")) return -1;
       if (fn_linear(w.key_proj, e, window, k, false, scratch, stream) != 0 ||
           fn_linear(w.value_proj, e, window, v, false, scratch, stream) != 0) {
         return -1;  // fn_linear named the failure
@@ -302,15 +313,13 @@ int32_t fn_ngram_add(const Context &ctx, const NgramWeights &w, const Batch &bat
           k, v, h, static_cast<const __nv_bfloat16 *>(w.norm_key),
           static_cast<const __nv_bfloat16 *>(w.norm_query), batch.tokens, t0, n, g.hidden,
           g.rms_norm_eps, sqrt_width, gates, rms);
+      if (!launched("gate")) return -1;
       const int32_t channels = g.residual_width();
       conv_add<<<dim3((channels + kThreads - 1) / kThreads, batch.lanes), kThreads, 0, stream>>>(
           v, gates, rms, static_cast<const __nv_bfloat16 *>(w.norm_conv),
           static_cast<const __nv_bfloat16 *>(w.conv), batch.slots, batch.positions, state, h,
           batch.tokens, t0, n, g.hidden, g.streams);
-    }
-    if (const cudaError_t err = cudaGetLastError(); err != cudaSuccess) {
-      fn_set_error(std::string("fn_ngram_add: ") + cudaGetErrorString(err));
-      return -1;
+      if (!launched("conv")) return -1;
     }
     return 0;
   } catch (const std::exception &error) {

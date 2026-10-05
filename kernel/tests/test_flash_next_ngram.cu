@@ -14,8 +14,13 @@
 //                one call shorter than the conv's 9 past columns): matches the one-shot call.
 //   lanes        three sequences in three slots, decoded one token per call, all lanes in each
 //                call: each matches its own one-shot call.
+//   positions    one call whose lanes sit at positions 5, 0 and 12: each matches its own run.
+//   graph        the decode rounds captured once in a CUDA graph and replayed with the inputs,
+//                slots and positions refreshed in place: bit for bit the eager rounds.
 //   windows      300 tokens in one call (two internal windows): matches 150 + 150.
 //   fresh        a slot left dirty by an earlier sequence: a call at position 0 ignores it.
+//
+// Every call's scratch arena is exactly fn_ngram_add_scratch_bytes(): the declaration is held.
 //
 // `--host-only` runs the host-model check alone (no CUDA call): the tolerance calibration.
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
@@ -219,10 +224,13 @@ bool within_reference(const Diff &d) {
   return d.max_abs <= std::ldexp(d.max_ref, -6) && d.mean_abs() <= std::ldexp(d.max_ref, -12);
 }
 
-// Device against host model (or against itself across call shapes): fp32 accumulation order and
-// the BF16 roundings it can flip. max |d| <= 2^-6 * max|ref|, mean |d| <= 2^-12 * max|ref|.
+// Device against the host model (or against itself across call shapes): both run the same
+// arithmetic; the FP8 linear's fp32 sums against the host's fp64 ones (and the GEMV route's order
+// against the tensor cores') can only flip a BF16 rounding here and there, about one BF16 ulp of
+// the value it touches. max |d| <= 2^-7 max|ref| (two ulps at the largest outputs), mean |d| <=
+// 2^-14 max|ref| (a quarter of the reference tolerance's mean).
 bool within_device(const Diff &d) {
-  return d.max_abs <= std::ldexp(d.max_ref, -6) && d.mean_abs() <= std::ldexp(d.max_ref, -12);
+  return d.max_abs <= std::ldexp(d.max_ref, -7) && d.mean_abs() <= std::ldexp(d.max_ref, -14);
 }
 
 std::vector<float> to_float(const std::vector<uint16_t> &bits) {
@@ -287,7 +295,8 @@ struct Device {
     upload(d_hidden, hidden);
     upload(d_slots, slots);
     upload(d_positions, positions);
-    ninfer::DeviceArena scratch(fn::fn_ngram_add_scratch_bytes(ctx.g, n) + (64u << 20));
+    // Exactly the declared scratch: a call that needs more fails here.
+    ninfer::DeviceArena scratch(fn::fn_ngram_add_scratch_bytes(ctx.g, n));
     fn::Batch batch;
     batch.lanes = lanes;
     batch.tokens = tokens;
@@ -421,6 +430,104 @@ int main(int argc, char **argv) {
       report(("lane " + std::to_string(l) + " decoded vs alone").c_str(), d);
       check(within_device(d), "lane " + std::to_string(l) + " decoded beside two others matches its own run");
     }
+  }
+  {
+    // One call whose lanes sit at different positions: 5 tokens in, fresh, 12 tokens in.
+    const std::vector<int> prefix = {5, 0, 12};
+    const std::vector<int32_t> slots = {0, 3, 2};
+    std::vector<uint8_t> step_rows;
+    std::vector<uint16_t> step_hidden;
+    std::vector<std::vector<uint16_t>> alone;
+    std::vector<int32_t> positions;
+    for (int l = 0; l < 3; ++l) {
+      const int length = prefix[l] + 1;
+      const auto lane_rows = gathered_rows(S_ROW_CODES + 200 + l, S_ROW_SCALES + 200 + l, length);
+      const auto lane_hidden = bf16_vector(S_HIDDEN + 200 + l, static_cast<std::size_t>(length) * kWidth, HIDDEN_AMP);
+      const auto whole = run_chunks(device, lane_rows, lane_hidden, {length}, 1);
+      alone.push_back(hidden_slice(whole, prefix[l], 1));
+      if (prefix[l] > 0) run_chunks(device, lane_rows, lane_hidden, {prefix[l]}, slots[l]);
+      const auto r = row_slice(lane_rows, prefix[l], 1);
+      const auto h = hidden_slice(lane_hidden, prefix[l], 1);
+      step_rows.insert(step_rows.end(), r.begin(), r.end());
+      step_hidden.insert(step_hidden.end(), h.begin(), h.end());
+      positions.push_back(prefix[l]);
+    }
+    device.call(step_rows, step_hidden, 3, 1, slots, positions);
+    for (int l = 0; l < 3; ++l) {
+      const Diff d = diff(to_float(hidden_slice(step_hidden, l, 1)), to_float(alone[l]));
+      report(("lane at position " + std::to_string(prefix[l]) + " vs alone").c_str(), d);
+      check(within_device(d), "a lane at position " + std::to_string(prefix[l]) + " matches its own run");
+    }
+  }
+  {
+    // The decode rounds as a CUDA graph: captured once, replayed with fixed buffers whose
+    // contents (rows, hidden, positions) are refreshed before each launch.
+    const int lanes = 3;
+    const std::vector<int32_t> slots = {1, 3, 0};
+    std::vector<std::vector<uint8_t>> lane_rows;
+    std::vector<std::vector<uint16_t>> lane_hidden;
+    for (int l = 0; l < lanes; ++l) {
+      lane_rows.push_back(gathered_rows(S_ROW_CODES + 300 + l, S_ROW_SCALES + 300 + l, kTokens));
+      lane_hidden.push_back(bf16_vector(S_HIDDEN + 300 + l, static_cast<std::size_t>(kTokens) * kWidth, HIDDEN_AMP));
+    }
+    auto round_inputs = [&](int t, std::vector<uint8_t> &r, std::vector<uint16_t> &h) {
+      r.clear();
+      h.clear();
+      for (int l = 0; l < lanes; ++l) {
+        const auto rr = row_slice(lane_rows[l], t, 1);
+        const auto hh = hidden_slice(lane_hidden[l], t, 1);
+        r.insert(r.end(), rr.begin(), rr.end());
+        h.insert(h.end(), hh.begin(), hh.end());
+      }
+    };
+    // Eager rounds.
+    std::vector<uint16_t> eager;
+    for (int t = 0; t < kTokens; ++t) {
+      std::vector<uint8_t> r;
+      std::vector<uint16_t> h;
+      round_inputs(t, r, h);
+      device.call(r, h, lanes, 1, slots, std::vector<int32_t>(lanes, t));
+      eager.insert(eager.end(), h.begin(), h.end());
+    }
+    // The same rounds replayed from one captured graph.
+    const std::size_t row_bytes = static_cast<std::size_t>(lanes) * kHeads * kRowBytes;
+    const std::size_t hidden_count = static_cast<std::size_t>(lanes) * kWidth;
+    DeviceBytes d_rows(row_bytes), d_hidden(hidden_count * 2), d_slots(lanes * 4), d_positions(lanes * 4);
+    upload(d_slots, slots);
+    ninfer::DeviceArena scratch(fn::fn_ngram_add_scratch_bytes(device.ctx.g, lanes));
+    fn::Batch batch;
+    batch.lanes = lanes;
+    batch.tokens = 1;
+    batch.slots = d_slots.as<int32_t>();
+    batch.positions = d_positions.as<int32_t>();
+    batch.max_visible = kTokens;
+    cudaStream_t stream;
+    NG_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cudaGraph_t graph;
+    NG_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    NG_RC(fn::fn_ngram_add(device.ctx, device.w, batch, d_rows.p, d_hidden.p, scratch, stream));
+    NG_CUDA(cudaStreamEndCapture(stream, &graph));
+    cudaGraphExec_t exec;
+    NG_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+    std::vector<uint16_t> replayed;
+    for (int t = 0; t < kTokens; ++t) {
+      std::vector<uint8_t> r;
+      std::vector<uint16_t> h;
+      round_inputs(t, r, h);
+      upload(d_rows, r);
+      upload(d_hidden, h);
+      upload(d_positions, std::vector<int32_t>(lanes, t));
+      NG_CUDA(cudaGraphLaunch(exec, stream));
+      NG_CUDA(cudaStreamSynchronize(stream));
+      const auto out = download<uint16_t>(d_hidden.p, hidden_count);
+      replayed.insert(replayed.end(), out.begin(), out.end());
+    }
+    NG_CUDA(cudaGraphExecDestroy(exec));
+    NG_CUDA(cudaGraphDestroy(graph));
+    NG_CUDA(cudaStreamDestroy(stream));
+    const Diff d = diff(to_float(replayed), to_float(eager));
+    report("graph replay vs eager rounds", d);
+    check(d.max_abs == 0.0, "the decode rounds replayed from a captured graph equal the eager rounds");
   }
   {
     // 300 tokens: one call spans two internal windows.
