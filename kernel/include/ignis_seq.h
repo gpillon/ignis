@@ -835,6 +835,36 @@ int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr);
  * code. */
 void ignis_host_pinned_free(void *ptr);
 
+/* --- an owned KV-RAM arena (GitHub #303, spec flash-next/05) -------------
+ *
+ * The same first-fit pinned arena, owned by whoever creates it rather than
+ * held by the process: a Flash-Next model instance pins its own and frees it
+ * on its drop path, so nothing of its host tier outlives the model (spec
+ * flash-next/05's no-singleton rule; the process-wide arena above stays the
+ * 27B's). Each arena has its own lock, so a blob may be released from any
+ * thread. */
+struct ignis_host_arena;
+
+/* Pin an arena of `bytes` (positive). Returns 0 and the arena in `out`;
+ * -1 on a null `out`, a `bytes` of 0, or a pinned allocation the host
+ * refuses (see ignis_seq_last_error). */
+int32_t ignis_host_arena_create(uint64_t bytes, struct ignis_host_arena **out);
+
+/* Release the arena and its pinned memory. Every region taken from it must
+ * already be released. NULL is a no-op. */
+void ignis_host_arena_free(struct ignis_host_arena *arena);
+
+/* ignis_host_pinned_pool_stats, ignis_host_pinned_can_alloc,
+ * ignis_host_pinned_alloc and ignis_host_pinned_free, for one arena: the
+ * same codes, IGNIS_SEQ_ERR_NO_HOST_ROOM included. A null arena is -1 (and
+ * a no-op for the release). */
+int32_t ignis_host_arena_stats(struct ignis_host_arena *arena, uint64_t *out_capacity,
+                               uint64_t *out_used);
+int32_t ignis_host_arena_can_alloc(struct ignis_host_arena *arena, uint64_t bytes,
+                                   int32_t *out_fits);
+int32_t ignis_host_arena_alloc(struct ignis_host_arena *arena, uint64_t bytes, void **out_ptr);
+void ignis_host_arena_release(struct ignis_host_arena *arena, void *ptr);
+
 /* The message from the most recent failing call on this thread
  * (thread-local; overwritten by the next call; empty string if none failed
  * yet). Never NULL. */

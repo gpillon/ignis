@@ -53,6 +53,10 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct IgnisSeq([u8; 1]);
 
+    /// Opaque owned KV-RAM arena (GitHub #303).
+    #[repr(C)]
+    pub struct IgnisHostArena([u8; 1]);
+
     /// Opaque shared-prefix handle (P4-10, GitHub #126).
     #[repr(C)]
     pub struct IgnisSeqPrefix([u8; 1]);
@@ -386,6 +390,19 @@ pub(crate) mod ffi {
         /// Return a region [`ignis_host_pinned_alloc`] gave out to the
         /// arena. NULL is a no-op.
         pub fn ignis_host_pinned_free(ptr: *mut c_void);
+
+        /// An owned KV-RAM arena (GitHub #303): the process-wide arena's
+        /// calls, for one arena its creator frees. `bytes` must be positive.
+        pub fn ignis_host_arena_create(bytes: u64, out: *mut *mut IgnisHostArena) -> i32;
+        pub fn ignis_host_arena_free(arena: *mut IgnisHostArena);
+        pub fn ignis_host_arena_stats(
+            arena: *mut IgnisHostArena,
+            out_capacity: *mut u64,
+            out_used: *mut u64,
+        ) -> i32;
+        pub fn ignis_host_arena_can_alloc(arena: *mut IgnisHostArena, bytes: u64, out_fits: *mut i32) -> i32;
+        pub fn ignis_host_arena_alloc(arena: *mut IgnisHostArena, bytes: u64, out_ptr: *mut *mut c_void) -> i32;
+        pub fn ignis_host_arena_release(arena: *mut IgnisHostArena, ptr: *mut c_void);
     }
 
     // Test-only diagnostic seam (`kernel/include/ignis_kv_capture.h`,
@@ -1480,6 +1497,126 @@ impl Drop for PinnedBuffer {
 // (restore) — never accessed from two threads at once, matching every other
 // handle in this module.
 unsafe impl Send for PinnedBuffer {}
+
+/// A KV-RAM arena its owner holds (GitHub #303, spec flash-next/05): the
+/// same first-fit pinned region as [`HostPinnedPool`], pinned once at load,
+/// but owned by one model instance and freed when the last thing holding it
+/// drops, rather than held by the process. Flash-Next's host tier lives in
+/// one, so nothing of it outlives the model (spec flash-next/05's
+/// no-singleton rule).
+///
+/// Shared by `Arc`: every [`ArenaBuffer`] taken from it holds the arena, so
+/// a blob can never outlive the region it sits in, whatever order the maps
+/// holding them drop in.
+#[derive(Debug)]
+pub struct HostArena {
+    handle: *mut ffi::IgnisHostArena,
+}
+
+// The leaf's arena takes its own lock on every call, so it may be used and
+// freed into from any thread.
+unsafe impl Send for HostArena {}
+unsafe impl Sync for HostArena {}
+
+impl HostArena {
+    /// Pin `bytes` (positive). The error names the size and the flag that
+    /// sets it, as [`HostPinnedPool::create`]'s does.
+    pub fn create(bytes: u64) -> Result<std::sync::Arc<Self>, String> {
+        let mut handle = std::ptr::null_mut();
+        let rc = unsafe { ffi::ignis_host_arena_create(bytes, &mut handle) };
+        if rc != 0 || handle.is_null() {
+            return Err(format!(
+                "KV-RAM arena of {bytes} bytes: {} \
+                 (--kv-host-pool-bytes sets this size; 0 disables the tier)",
+                last_error()
+            ));
+        }
+        Ok(std::sync::Arc::new(Self { handle }))
+    }
+
+    /// The arena's capacity and the bytes its live blobs hold (what they
+    /// asked for, as [`host_pool_stats`] counts).
+    pub fn stats(&self) -> (u64, u64) {
+        let (mut capacity, mut used) = (0u64, 0u64);
+        let rc = unsafe { ffi::ignis_host_arena_stats(self.handle, &mut capacity, &mut used) };
+        assert_eq!(rc, 0, "ignis_host_arena_stats: no argument is null");
+        (capacity, used)
+    }
+
+    /// Whether a blob of `bytes` would find a free span right now: `false`
+    /// when the arena is full or fragmented, and for a `bytes` of 0.
+    pub fn fits(&self, bytes: u64) -> bool {
+        let mut fits = 0i32;
+        let rc = unsafe { ffi::ignis_host_arena_can_alloc(self.handle, bytes, &mut fits) };
+        rc == 0 && fits != 0
+    }
+
+    /// Place `bytes` in the arena, not zeroed (a snapshot overwrites every
+    /// byte before it is read back).
+    pub fn alloc(self: &std::sync::Arc<Self>, bytes: u64) -> Result<ArenaBuffer, PinnedAllocError> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { ffi::ignis_host_arena_alloc(self.handle, bytes, &mut ptr) };
+        if rc == NO_HOST_ROOM {
+            return Err(PinnedAllocError::NoRoom);
+        }
+        if rc != 0 || ptr.is_null() {
+            return Err(PinnedAllocError::Failed(last_error()));
+        }
+        Ok(ArenaBuffer { arena: std::sync::Arc::clone(self), ptr, len: bytes as usize })
+    }
+}
+
+impl Drop for HostArena {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_host_arena_free(self.handle) };
+    }
+}
+
+/// A span of a [`HostArena`], released to it on drop. Holds the arena, so
+/// the region outlives the buffer.
+pub struct ArenaBuffer {
+    arena: std::sync::Arc<HostArena>,
+    ptr: *mut c_void,
+    len: usize,
+}
+
+impl std::ops::Deref for ArenaBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // Safety: `ptr` is a live span of `len` bytes of `arena`, which this
+        // buffer keeps alive; released only in `Drop`.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for ArenaBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // Safety: see `Deref` above; `&mut self` guarantees exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
+    }
+}
+
+impl AsRef<[u8]> for ArenaBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsMut<[u8]> for ArenaBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
+impl Drop for ArenaBuffer {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_host_arena_release(self.arena.handle, self.ptr) };
+    }
+}
+
+// `Send` as `PinnedBuffer`: one owner at a time, and the arena it returns to
+// takes its own lock.
+unsafe impl Send for ArenaBuffer {}
 
 // A `Seq` is moved into the scheduler's `Mutex`-guarded live-sequence map
 // (never accessed from more than one thread at a time — the engine drives

@@ -1864,6 +1864,117 @@ extern "C" void ignis_host_pinned_free(void *ptr) {
   }
 }
 
+// ---- an owned KV-RAM arena (GitHub #303) -----------------------------------
+
+struct ignis_host_arena {
+  explicit ignis_host_arena(std::size_t bytes) : arena(bytes) {}
+  std::mutex mutex;
+  ninfer::HostPinnedArena arena;
+};
+
+extern "C" int32_t ignis_host_arena_create(uint64_t bytes, struct ignis_host_arena **out) {
+  if (out == nullptr) {
+    set_error("ignis_host_arena_create: null out");
+    return -1;
+  }
+  *out = nullptr;
+  if (bytes == 0) {
+    set_error("ignis_host_arena_create: bytes must be positive (a disabled tier creates no arena)");
+    return -1;
+  }
+  try {
+    *out = new ignis_host_arena(static_cast<std::size_t>(bytes));
+  } catch (const std::exception &e) {
+    set_error("ignis_host_arena_create: pinning " + std::to_string(bytes) +
+              " bytes of KV-RAM failed: " + e.what());
+    return -1;
+  }
+  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_ARENA, true, bytes);
+  return 0;
+}
+
+extern "C" void ignis_host_arena_free(struct ignis_host_arena *arena) {
+  if (arena == nullptr) {
+    return;
+  }
+  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_ARENA, false, 0);
+  delete arena;
+}
+
+extern "C" int32_t ignis_host_arena_stats(struct ignis_host_arena *arena, uint64_t *out_capacity,
+                                          uint64_t *out_used) {
+  if (arena == nullptr || out_capacity == nullptr || out_used == nullptr) {
+    set_error("ignis_host_arena_stats: null argument");
+    return -1;
+  }
+  const std::lock_guard<std::mutex> guard(arena->mutex);
+  *out_capacity = static_cast<uint64_t>(arena->arena.capacity());
+  *out_used     = static_cast<uint64_t>(arena->arena.used());
+  return 0;
+}
+
+extern "C" int32_t ignis_host_arena_can_alloc(struct ignis_host_arena *arena, uint64_t bytes,
+                                              int32_t *out_fits) {
+  if (arena == nullptr || out_fits == nullptr) {
+    set_error("ignis_host_arena_can_alloc: null argument");
+    return -1;
+  }
+  *out_fits = 0;
+  if (bytes == 0) {
+    set_error("ignis_host_arena_can_alloc: bytes must be positive");
+    return -1;
+  }
+  const std::lock_guard<std::mutex> guard(arena->mutex);
+  try {
+    *out_fits = arena->arena.can_alloc(static_cast<std::size_t>(bytes)) ? 1 : 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_host_arena_can_alloc: ") + e.what());
+    return -1;
+  }
+  return 0;
+}
+
+extern "C" int32_t ignis_host_arena_alloc(struct ignis_host_arena *arena, uint64_t bytes,
+                                          void **out_ptr) {
+  if (arena == nullptr || out_ptr == nullptr) {
+    set_error("ignis_host_arena_alloc: null argument");
+    return -1;
+  }
+  *out_ptr = nullptr;
+  if (bytes == 0) {
+    set_error("ignis_host_arena_alloc: bytes must be positive");
+    return -1;
+  }
+  const std::lock_guard<std::mutex> guard(arena->mutex);
+  void *ptr = nullptr;
+  try {
+    ptr = arena->arena.try_alloc(static_cast<std::size_t>(bytes));
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_host_arena_alloc: ") + e.what());
+    return -1;
+  }
+  if (ptr == nullptr) {
+    set_error("ignis_host_arena_alloc: no free span of " + std::to_string(bytes) + " bytes in the " +
+              std::to_string(arena->arena.capacity()) + "-byte KV-RAM arena (" +
+              std::to_string(arena->arena.used()) + " bytes held)");
+    return IGNIS_SEQ_ERR_NO_HOST_ROOM;
+  }
+  *out_ptr = ptr;
+  return 0;
+}
+
+extern "C" void ignis_host_arena_release(struct ignis_host_arena *arena, void *ptr) {
+  if (arena == nullptr || ptr == nullptr) {
+    return;
+  }
+  const std::lock_guard<std::mutex> guard(arena->mutex);
+  try {
+    arena->arena.free(ptr);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "ignis_host_arena_release: %s\n", e.what());
+  }
+}
+
 extern "C" const char *ignis_seq_last_error(void) {
   return g_last_error.c_str();
 }
