@@ -28,7 +28,11 @@ METRICS_BIND ?=
 # or empty, is Qwen3.8-27B, the default. Any other value is the 27B served
 # under that id (--model), as before.
 MODEL ?=
-ifeq ($(MODEL),flash-next)
+# The family MODEL selects, decided here once: every other place reads this.
+# The server still checks it against the artifact's own at start, and refuses
+# a served id that names the other model.
+MODEL_FAMILY := $(if $(filter flash-next,$(MODEL)),flash-next,27b)
+ifeq ($(MODEL_FAMILY),flash-next)
   ARTIFACT ?= F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_trellis_a25-v2.ninfer
   # 128K tokens per lane under hq-e8-2b, inside the checkpoint's 262,144
   # trained positions (so no YaRN); 8192-token prefill chunks amortize a
