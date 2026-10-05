@@ -21,16 +21,11 @@ use std::path::Path;
 use ignis_artifact::flash_next::{self, FlashNextGeometry, FlashNextPlan};
 use ignis_artifact::{materialize, CudaDevice, Device, MaterializedArtifact, Reader};
 use ignis_core::compute::ModelConfig;
-use ignis_core::flash_next::{EngineOptions, LOOKAHEAD_WIDTH};
+use ignis_core::flash_next::{build_residency, EngineOptions};
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::ngram::NgramContext;
 use ignis_core::ngram_table::NgramTable;
-use ignis_core::residency::device::{DeviceResidency, ResidencyDesc};
-use ignis_core::residency::load::{catalog, fill_expert_pool, pool_layout};
-use ignis_core::residency::{
-    default_prefetch_budget_bytes, min_slots_per_class, plan_expert_cache, prefill_staging_ring_bytes,
-    residency_table_bytes, ExpertCacheRequest, ExpertTraffic, KClass,
-};
+use ignis_core::residency::device::DeviceResidency;
 use ignis_core::seq::{Seq, SeqCheckpoint, SeqPool, SeqPrefix};
 use ignis_core::step;
 use ignis_core::types::{DecodeParams, TokenId};
@@ -110,7 +105,7 @@ impl FlashNextLeaf {
         let config = ModelConfig::flash_next_from(&geometry);
         let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
         let artifact = materialize(&reader, &plan.plan, &mut device, None).map_err(|e| format!("materialize: {e}"))?;
-        let residency = residency(path, &plan, &options)?;
+        let residency = build_residency(path, &plan, &options)?;
         let ngram = config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?;
         let table = NgramTable::from_artifact(path, &reader, &plan, ngram, options.ngram)?;
         Ok(Self {
@@ -144,48 +139,6 @@ impl FlashNextLeaf {
         self.table.stage(context, tokens, &mut rows)?;
         Ok(rows)
     }
-}
-
-/// The expert residency of `plan` (as `ignis_core::flash_next`'s engine
-/// builds it, with traffic uniform until the converter's calibration
-/// traffic is wired).
-fn residency(path: &Path, plan: &FlashNextPlan, options: &EngineOptions) -> Result<DeviceResidency, String> {
-    let index = &plan.experts;
-    let cat = catalog(index)?;
-    let layout = pool_layout(index);
-    let (layers, experts) = (u64::from(cat.layers()), u64::from(cat.experts()));
-    let traffic = ExpertTraffic::new(&cat, vec![1; (layers * experts) as usize]).map_err(|e| e.to_string())?;
-    let max_tokens = options.prefill_chunk_tokens.max(options.decode_lanes);
-    let staging_ring = prefill_staging_ring_bytes(&cat);
-    let tables = residency_table_bytes(layers, experts, u64::from(max_tokens), u64::from(LOOKAHEAD_WIDTH));
-    let cache = plan_expert_cache(&ExpertCacheRequest {
-        budget_bytes: options.expert_cache_bytes + staging_ring + tables,
-        planned_bytes: 0,
-        staging_ring_bytes: staging_ring,
-        table_bytes: tables,
-        floor_bytes: 0,
-        catalog: &cat,
-        traffic: &traffic,
-        min_slots: min_slots_per_class(options.decode_lanes, 10, LOOKAHEAD_WIDTH),
-    })
-    .map_err(|e| e.to_string())?;
-    let desc = ResidencyDesc {
-        layers: layers as u32,
-        experts: experts as u32,
-        capacity: cache.capacity(),
-        record_bytes: std::array::from_fn(|i| cat.slot_bytes(KClass::ALL[i])),
-        max_tokens,
-        lookahead_width: LOOKAHEAD_WIDTH,
-        prefetch_budget_bytes: default_prefetch_budget_bytes(options.decode_lanes, &cat),
-        staging_half_bytes: staging_ring / 2,
-        host_pool_bytes: layout.bytes,
-        copy_blocks: 16,
-        report: 0,
-    };
-    let mut residency = DeviceResidency::new(&desc, &layout.k2, &layout.offsets)?;
-    let mut file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    fill_expert_pool(&mut file, index, residency.host_pool_mut()).map_err(|e| format!("fill the expert pool: {e}"))?;
-    Ok(residency)
 }
 
 impl StepLeaf for FlashNextLeaf {

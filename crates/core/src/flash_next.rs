@@ -25,7 +25,7 @@ use crate::residency::device::{DeviceResidency, ResidencyDesc};
 use crate::residency::load::{catalog, fill_expert_pool, pool_layout};
 use crate::residency::{
     default_prefetch_budget_bytes, min_slots_per_class, plan_expert_cache, prefill_staging_ring_bytes,
-    residency_table_bytes, ExpertCacheRequest, ExpertTraffic, KClass,
+    residency_table_bytes, warm_start_order, ExpertCacheRequest, ExpertTraffic, KClass,
 };
 use crate::seq::{SeqPool, SeqPoolBudget};
 use crate::step::{capture_decode_graphs, decode_flash_next, prefill_flash_next, SamplingParams};
@@ -98,6 +98,70 @@ impl Default for EngineOptions {
     }
 }
 
+/// The calibration selections per (layer, expert) the converter recorded
+/// in the artifact's sidecar (`<artifact>.conversion.json`, its
+/// `expert_traffic`), or `None` when the sidecar has none.
+pub fn sidecar_traffic(artifact: &Path) -> Option<Vec<u64>> {
+    let text = std::fs::read_to_string(ignis_artifact::packer::sidecar_path(artifact)).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("expert_traffic")?
+        .get("layers")?
+        .as_array()?
+        .iter()
+        .map(|layer| layer.get("counts")?.as_array()?.iter().map(|c| c.as_u64()).collect::<Option<Vec<u64>>>())
+        .collect::<Option<Vec<Vec<u64>>>>()
+        .map(|layers| layers.concat())
+}
+
+/// The expert residency of the artifact at `path` bound as `plan`, for a
+/// load of `options` (spec flash-next/03): the eight K-class pools split from
+/// `expert_cache_bytes` the way one LRU over the calibration traffic would
+/// hold them (the sidecar's; uniform when it has none), the pinned pool
+/// filled from the file, and the warm start -- the hottest projections,
+/// hottest first, up to each pool -- before the first step.
+pub fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOptions) -> Result<DeviceResidency, String> {
+    let index = &plan.experts;
+    let cat = catalog(index)?;
+    let layout = pool_layout(index);
+    let (layers, experts) = (u64::from(cat.layers()), u64::from(cat.experts()));
+    let counts = sidecar_traffic(path)
+        .filter(|counts| counts.len() == (layers * experts) as usize)
+        .unwrap_or_else(|| vec![1; (layers * experts) as usize]);
+    let traffic = ExpertTraffic::new(&cat, counts).map_err(|e| e.to_string())?;
+    let max_tokens = options.prefill_chunk_tokens.max(options.decode_lanes);
+    let staging_ring = prefill_staging_ring_bytes(&cat);
+    let tables = residency_table_bytes(layers, experts, u64::from(max_tokens), u64::from(LOOKAHEAD_WIDTH));
+    let cache = plan_expert_cache(&ExpertCacheRequest {
+        budget_bytes: options.expert_cache_bytes + staging_ring + tables,
+        planned_bytes: 0,
+        staging_ring_bytes: staging_ring,
+        table_bytes: tables,
+        floor_bytes: 0,
+        catalog: &cat,
+        traffic: &traffic,
+        min_slots: min_slots_per_class(options.decode_lanes, 10, LOOKAHEAD_WIDTH),
+    })
+    .map_err(|e| e.to_string())?;
+    let desc = ResidencyDesc {
+        layers: layers as u32,
+        experts: experts as u32,
+        capacity: cache.capacity(),
+        record_bytes: std::array::from_fn(|i| cat.slot_bytes(KClass::ALL[i])),
+        max_tokens,
+        lookahead_width: LOOKAHEAD_WIDTH,
+        prefetch_budget_bytes: default_prefetch_budget_bytes(options.decode_lanes, &cat),
+        staging_half_bytes: staging_ring / 2,
+        host_pool_bytes: layout.bytes,
+        copy_blocks: 16,
+        report: 0,
+    };
+    let mut residency = DeviceResidency::new(&desc, &layout.k2, &layout.offsets)?;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    fill_expert_pool(&mut file, index, residency.host_pool_mut()).map_err(|e| format!("fill the expert pool: {e}"))?;
+    residency.warm_start(&warm_start_order(&traffic))?;
+    Ok(residency)
+}
+
 /// A loaded Flash-Next model and everything it runs on. Field order is drop
 /// order: the model goes before the pool it captured graphs against, the
 /// residency and device weights it borrows, and the device they live on.
@@ -136,7 +200,7 @@ impl FlashNextEngine {
         let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
         let artifact =
             materialize(&reader, &plan.plan, &mut device, None).map_err(|e| format!("materialize: {e}"))?;
-        let residency = Self::build_residency(&path, &plan, &options)?;
+        let residency = build_residency(&path, &plan, &options)?;
         let ngram = config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?;
         let table = NgramTable::from_artifact(&path, &reader, &plan, ngram, options.ngram)?;
         let model = load_flash_next(
@@ -185,49 +249,6 @@ impl FlashNextEngine {
             graph_error,
             planned,
         })
-    }
-
-    /// The expert residency of `plan`: the eight K-class pools split from
-    /// the expert cache bytes (calibration traffic uniform: this engine
-    /// measures correctness, not hit rates), its pinned pool filled from the
-    /// file.
-    fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOptions) -> Result<DeviceResidency, String> {
-        let index = &plan.experts;
-        let cat = catalog(index)?;
-        let layout = pool_layout(index);
-        let (layers, experts) = (u64::from(cat.layers()), u64::from(cat.experts()));
-        let traffic = ExpertTraffic::new(&cat, vec![1; (layers * experts) as usize]).map_err(|e| e.to_string())?;
-        let max_tokens = options.prefill_chunk_tokens.max(options.decode_lanes);
-        let staging_ring = prefill_staging_ring_bytes(&cat);
-        let tables = residency_table_bytes(layers, experts, u64::from(max_tokens), u64::from(LOOKAHEAD_WIDTH));
-        let cache = plan_expert_cache(&ExpertCacheRequest {
-            budget_bytes: options.expert_cache_bytes + staging_ring + tables,
-            planned_bytes: 0,
-            staging_ring_bytes: staging_ring,
-            table_bytes: tables,
-            floor_bytes: 0,
-            catalog: &cat,
-            traffic: &traffic,
-            min_slots: min_slots_per_class(options.decode_lanes, 10, LOOKAHEAD_WIDTH),
-        })
-        .map_err(|e| e.to_string())?;
-        let desc = ResidencyDesc {
-            layers: layers as u32,
-            experts: experts as u32,
-            capacity: cache.capacity(),
-            record_bytes: std::array::from_fn(|i| cat.slot_bytes(KClass::ALL[i])),
-            max_tokens,
-            lookahead_width: LOOKAHEAD_WIDTH,
-            prefetch_budget_bytes: default_prefetch_budget_bytes(options.decode_lanes, &cat),
-            staging_half_bytes: staging_ring / 2,
-            host_pool_bytes: layout.bytes,
-            copy_blocks: 16,
-            report: 0,
-        };
-        let mut residency = DeviceResidency::new(&desc, &layout.k2, &layout.offsets)?;
-        let mut file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        fill_expert_pool(&mut file, index, residency.host_pool_mut()).map_err(|e| format!("fill the expert pool: {e}"))?;
-        Ok(residency)
     }
 
     pub fn vocab(&self) -> usize {
@@ -369,5 +390,30 @@ impl FlashNextEngine {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sidecar's `expert_traffic`, layer after layer, as the residency's
+    /// split reads it; none without a sidecar or the section.
+    #[test]
+    fn the_sidecar_traffic_is_read_layer_major() {
+        let dir = std::env::temp_dir().join(format!("ignis-sidecar-traffic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact = dir.join("model.ninfer");
+        assert_eq!(sidecar_traffic(&artifact), None, "no sidecar");
+        let sidecar = ignis_artifact::packer::sidecar_path(&artifact);
+        std::fs::write(
+            &sidecar,
+            r#"{"expert_traffic": {"layers": [{"layer": 0, "counts": [1, 2]}, {"layer": 1, "counts": [3, 4]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(sidecar_traffic(&artifact), Some(vec![1, 2, 3, 4]));
+        std::fs::write(&sidecar, r#"{"schema": "flash-next-converter-v1"}"#).unwrap();
+        assert_eq!(sidecar_traffic(&artifact), None, "a sidecar without the section");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
