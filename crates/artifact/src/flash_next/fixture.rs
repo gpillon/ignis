@@ -124,8 +124,12 @@ impl WorkTree {
                 };
                 let heads = g.ngram_heads() as i64;
                 write(&dir.join("layer_multipliers.i64"), &words(vec![23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071]))?;
-                write(&dir.join("ngram_heads_vocab_sizes.i64"), &words((0..heads).map(|h| 500 + h).collect()))?;
-                write(&dir.join("ngram_heads_offsets.i64"), &words((0..heads).map(|h| 500 * h).collect()))?;
+                // Prime head ranges that fit the table (the checkpoint's are primes
+                // above 20M; the hashing only needs each range inside the table).
+                let sizes: Vec<i64> = (0..heads).map(|h| [491, 499][h as usize % 2]).collect();
+                let offsets: Vec<i64> = sizes.iter().scan(0, |at, &size| { let first = *at; *at += size; Some(first) }).collect();
+                write(&dir.join("ngram_heads_vocab_sizes.i64"), &words(sizes))?;
+                write(&dir.join("ngram_heads_offsets.i64"), &words(offsets))?;
                 let hot: Vec<u8> = HOT_ROWS.iter().flat_map(|r| r.to_le_bytes()).collect();
                 write(&dir.join("hot_rows.u32"), &hot)?;
                 let manifest = json!({
