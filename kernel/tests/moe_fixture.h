@@ -10,6 +10,8 @@
 #ifndef IGNIS_MOE_FIXTURE_H
 #define IGNIS_MOE_FIXTURE_H
 
+#include "ignis_moe.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -51,6 +53,23 @@ inline void check(bool ok, const std::string &what) {
       std::exit(EXIT_FAILURE);                                                                     \
     }                                                                                              \
   } while (0)
+
+// The decode route a test runs: "clusters" among its arguments selects IGNIS_MOE_DECODE_CLUSTERS
+// (the device prepared first, so its cluster size is known); a device that runs no decode cluster
+// fails the test rather than skipping it. Returns the route's name for the log.
+inline std::string select_decode_route(int argc, char **argv) {
+  bool clusters = false;
+  for (int i = 1; i < argc; ++i) clusters = clusters || std::string(argv[i]) == "clusters";
+  if (!clusters) return "tickets";
+  MOE_RC(ignis_moe_prepare());
+  const int32_t size = ignis_moe_decode_cluster_size();
+  if (size == 0) {
+    std::fprintf(stderr, "FATAL: this device runs no decode cluster (ignis_moe_decode_cluster_size() == 0)\n");
+    std::exit(EXIT_FAILURE);
+  }
+  MOE_RC(ignis_moe_set_decode_route(IGNIS_MOE_DECODE_CLUSTERS));
+  return "clusters of " + std::to_string(size) + " CTAs";
+}
 
 struct DeviceBytes {
   void *p = nullptr;

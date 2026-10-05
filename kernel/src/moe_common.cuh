@@ -32,14 +32,27 @@ int32_t check_launch(const char *op);
 
 // ---- per-device preparation (host) -----------------------------------------------------------
 
-// What ignis_moe_prepare records for a device: the decode launch's grid (0: not prepared).
+// What ignis_moe_prepare records for a device: the ticket decode launch's grid (0: not
+// prepared) and the cluster decode route's CTAs per cluster (0: the device runs none).
 // require_prepared fails the op, naming it, on a device nobody prepared; nothing configures
 // itself lazily, so an op's first call inside a stream capture is like any other.
-int32_t require_prepared(const char *op, int *decode_grid);
+struct DecodeLaunch {
+  int grid = 0;
+  int cluster_size = 0;
+};
+int32_t require_prepared(const char *op, DecodeLaunch *decode);
+// The process-wide decode route (IGNIS_MOE_DECODE_TICKETS or IGNIS_MOE_DECODE_CLUSTERS).
+int32_t decode_route();
 // Each translation unit's share of ignis_moe_prepare: its kernels' attributes.
 int32_t prepare_router();
 int32_t prepare_prefill();
 int32_t prepare_decode(int *grid);
+// The cluster route (moe_decode_cluster.cu): 16 CTAs per expert where the device co-schedules
+// a token's ten such clusters, else 8, else 0 (the route is then refused); never fails.
+void prepare_decode_clusters(int *cluster_size);
+int32_t decode_clusters(int cluster_size, const __nv_bfloat16 *x, int tokens, const int32_t *ids,
+                        const float *weights, const ignis_moe_slot *slots, long long *acc,
+                        cudaStream_t stream);
 
 // ---- slots -----------------------------------------------------------------------------------
 

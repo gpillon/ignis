@@ -30,6 +30,12 @@ pub const PROJ_GATE_UP: u32 = 0;
 /// The down expert projection, (in, out) = (640, 2560).
 pub const PROJ_DOWN: u32 = 1;
 
+/// The decode route's two implementations (`IGNIS_MOE_DECODE_*`, `set_decode_route`): one
+/// persistent launch of work units taken by ticket (the default), or one thread-block cluster per
+/// selected expert.
+pub const DECODE_TICKETS: i32 = 0;
+pub const DECODE_CLUSTERS: i32 = 1;
+
 /// One slot-table entry, 1:1 with `struct ignis_moe_slot`: the device address of an expert
 /// projection's record (layout.md §3) and its bit width as `k2 = 2 K`. A layer's table is
 /// `EXPERTS * 2` entries indexed `expert * 2 + projection`; a selected entry with a NULL
@@ -154,6 +160,8 @@ pub mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn ignis_moe_prepare() -> i32;
+        pub fn ignis_moe_set_decode_route(route: i32) -> i32;
+        pub fn ignis_moe_decode_cluster_size() -> i32;
         pub fn ignis_moe_workspace_bytes(decode_tokens: u32, prefill_tokens: u32) -> u64;
         pub fn ignis_moe_workspace_init(
             workspace: *const MoeWorkspace,
@@ -187,6 +195,18 @@ pub fn record_bytes(projection: u32, k2: u32) -> Result<u64, String> {
 /// device that was not prepared.
 pub fn prepare() -> Result<(), String> {
     check(unsafe { ffi::ignis_moe_prepare() })
+}
+
+/// Selects the decode route (`DECODE_TICKETS` or `DECODE_CLUSTERS`), process-wide: at load,
+/// before any decode call is captured. An unknown route is refused.
+pub fn set_decode_route(route: i32) -> Result<(), String> {
+    check(unsafe { ffi::ignis_moe_set_decode_route(route) })
+}
+
+/// The CTAs per expert cluster the current device runs `DECODE_CLUSTERS` with (16 or 8), or 0 if
+/// the device was not prepared or runs no such cluster.
+pub fn decode_cluster_size() -> i32 {
+    unsafe { ffi::ignis_moe_decode_cluster_size() }
 }
 
 /// The routed-expert workspace for `decode_tokens` lanes and prefill chunks of `prefill_tokens`
@@ -333,6 +353,14 @@ pub unsafe fn combine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_routes_are_the_two_named_ones() {
+        assert!(set_decode_route(2).is_err());
+        assert!(last_error().contains("unknown route 2"));
+        set_decode_route(DECODE_CLUSTERS).unwrap();
+        set_decode_route(DECODE_TICKETS).unwrap();
+    }
 
     #[test]
     fn slot_entry_matches_the_c_struct() {

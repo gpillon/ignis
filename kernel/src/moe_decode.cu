@@ -31,8 +31,7 @@
 // cross-unit sums are integer, and nothing reads the slot address except to load from it. The
 // last CTA out resets the counters, so the launch replays from a CUDA graph.
 
-#include "moe_common.cuh"
-#include "moe_workspace.cuh"
+#include "moe_decode_common.cuh"
 #include "trellis_decode.cuh"
 
 #include <cuda_bf16.h>
@@ -67,48 +66,6 @@ __device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
   uint32_t v;
   asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
   return v;
-}
-
-// The distinct experts of the call in order of first appearance (token-major, rank order),
-// with each token's routing weight for them and the mask of tokens that selected them.
-__device__ void build_unique(Shared &s, const int32_t *ids, const float *weights, int tokens) {
-  const int n = tokens * kTopK;
-  const int i = threadIdx.x;
-  for (int j = threadIdx.x; j < kDecodeMaxUnique * kDecodeMaxTokens; j += blockDim.x) {
-    (&s.unique_w[0][0])[j] = 0.0f;
-  }
-  if (i < kDecodeMaxUnique) s.unique_sel[i] = 0u;
-  int e = -1;
-  if (i < n) {
-    e = ids[i];
-    int f = i;
-    for (int j = 0; j < i; ++j) {
-      if (ids[j] == e) {
-        f = j;
-        break;
-      }
-    }
-    s.first[i] = f;
-  }
-  __syncthreads();
-  if (i < n && s.first[i] == i) {
-    int slot = 0;
-    for (int j = 0; j < i; ++j) slot += s.first[j] == j;
-    s.slot_of[i] = slot;
-    s.unique_id[slot] = e;
-  }
-  if (i == 0) {
-    int count = 0;
-    for (int j = 0; j < n; ++j) count += s.first[j] == j;
-    s.n_unique = count;
-  }
-  __syncthreads();
-  if (i < n) {
-    const int u = s.slot_of[s.first[i]];
-    s.unique_w[u][i / kTopK] = weights[i];
-    atomicOr(&s.unique_sel[u], 1u << (i / kTopK));
-  }
-  __syncthreads();
 }
 
 // Rotate `tokens` rows of 640 inputs (input `in(t, k)` times suh[k]) into s.a as fp16, each
@@ -448,8 +405,14 @@ extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, cons
     return fail("ignis_moe_experts_decode: tokens must be 1.." + std::to_string(workspace->decode_tokens) +
                 " (the workspace's decode_tokens)");
   }
-  int grid = 0;
-  if (require_prepared("ignis_moe_experts_decode", &grid) != 0) return -1;
+  DecodeLaunch launch;
+  if (require_prepared("ignis_moe_experts_decode", &launch) != 0) return -1;
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  if (decode_route() == IGNIS_MOE_DECODE_CLUSTERS) {
+    if (launch.cluster_size == 0) return fail("ignis_moe_experts_decode: this device runs no decode cluster");
+    return decode_clusters(launch.cluster_size, static_cast<const __nv_bfloat16 *>(x), static_cast<int>(tokens), ids,
+                           weights, slots, reinterpret_cast<long long *>(acc), s);
+  }
   const WorkspaceLayout l = workspace_layout(workspace->decode_tokens, workspace->prefill_tokens);
   char *ws = static_cast<char *>(workspace->base);
   Params p;
@@ -463,6 +426,6 @@ extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, cons
   p.gate_up = reinterpret_cast<long long *>(ws + l.decode_gate_up);
   p.h = reinterpret_cast<float *>(ws + l.decode_h);
   p.acc = reinterpret_cast<long long *>(acc);
-  experts_decode_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(p);
+  experts_decode_kernel<<<launch.grid, kThreads, 0, s>>>(p);
   return check_launch("ignis_moe_experts_decode");
 }

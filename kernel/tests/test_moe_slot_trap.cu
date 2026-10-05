@@ -30,7 +30,11 @@
 using namespace moe_test;
 
 int main(int argc, char **argv) {
-  const std::string mode = argc > 1 ? argv[1] : "decode";
+  // A "-clusters" suffix runs a decode mode on the clusters route.
+  std::string mode = argc > 1 ? argv[1] : "decode";
+  const std::string suffix = "-clusters";
+  const bool clusters = mode.size() > suffix.size() && mode.compare(mode.size() - suffix.size(), suffix.size(), suffix) == 0;
+  if (clusters) mode.resize(mode.size() - suffix.size());
   const bool prefill = mode.rfind("prefill", 0) == 0;
   const bool bad_id = mode.find("-id") != std::string::npos;
   const bool nan = mode == "decode-nan";
@@ -72,6 +76,13 @@ int main(int argc, char **argv) {
   const ignis_moe_workspace ws{wsb.p, IGNIS_MOE_DECODE_MAX_TOKENS, max_tokens};
   MOE_RC(ignis_moe_workspace_init(&ws, acc.as<int64_t>(), nullptr));
   MOE_CUDA(cudaDeviceSynchronize());
+  if (clusters) {
+    if (ignis_moe_decode_cluster_size() == 0) {
+      std::fprintf(stderr, "test_moe_slot_trap (%s-clusters): this device runs no decode cluster\n", mode.c_str());
+      return 1;
+    }
+    MOE_RC(ignis_moe_set_decode_route(IGNIS_MOE_DECODE_CLUSTERS));
+  }
 
   const int32_t rc = prefill ? ignis_moe_experts_prefill(dx.p, tokens, dids.as<int32_t>(), dw.as<float>(),
                                                          dslots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(), nullptr)

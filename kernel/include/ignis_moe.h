@@ -162,6 +162,19 @@ int32_t ignis_moe_experts_prefill(const void *x, uint32_t tokens, const int32_t 
                                   const struct ignis_moe_workspace *workspace, int64_t *acc,
                                   void *stream);
 
+/* The decode route's two implementations, one contract (held to the same fp64 bounds):
+ * TICKETS, one persistent launch of work units taken by ticket (the default), and CLUSTERS, one
+ * thread-block cluster per selected expert with its reductions in distributed shared memory.
+ * The route is process-wide: set it at load, before capturing any decode call (a captured graph
+ * keeps the kernel it was captured with). Returns -1 for an unknown route. */
+#define IGNIS_MOE_DECODE_TICKETS 0
+#define IGNIS_MOE_DECODE_CLUSTERS 1
+int32_t ignis_moe_set_decode_route(int32_t route);
+/* The CTAs per expert cluster the current device runs the CLUSTERS route with (16, or the
+ * portable 8), set by ignis_moe_prepare; 0 if it was not prepared or runs no such cluster (the
+ * route then refuses to run). */
+int32_t ignis_moe_decode_cluster_size(void);
+
 /* ---- shared expert and combine ---------------------------------------------------------------
  * The shared expert's SwiGLU on the FP8 row-scale linear (ignis_fp8_linear.h; gate_proj and
  * up_proj [640][2560], down_proj [2560][640]) into `shared` (fp32 [tokens][2560]); `h` is BF16

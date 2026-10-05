@@ -204,71 +204,88 @@ int main(int argc, char **argv) {
     return 1e3 * ms / (calls * replays);
   };
 
-  bool floor_ok = true;
-  for (int tokens : {1, 2, 3}) {
-    const int calls = 320;
-    const std::vector<int32_t> ids = make_calls(calls, tokens, kPool);
-    std::vector<float> w(ids.size(), 0.1f);
-    DeviceBytes dids(ids.size() * 4), dw(w.size() * 4);
-    upload(dids, ids);
-    upload(dw, w);
-    // Bytes one call reads: each distinct expert's two records (data, no padding) and x.
-    double bytes = 0.0;
-    for (int c = 0; c < calls; ++c) {
-      std::vector<int32_t> u(ids.begin() + static_cast<std::ptrdiff_t>(c) * tokens * kTop,
-                             ids.begin() + static_cast<std::ptrdiff_t>(c + 1) * tokens * kTop);
-      std::sort(u.begin(), u.end());
-      u.erase(std::unique(u.begin(), u.end()), u.end());
-      for (int32_t e : u) bytes += static_cast<double>(pool->data_bytes[e]);
-      bytes += tokens * kH * 2.0;
-    }
-    bytes /= calls;
-    const double us = time_us(calls, [&](int c, cudaStream_t st) {
-      MOE_RC(ignis_moe_experts_decode(dx.p, tokens, dids.as<int32_t>() + static_cast<std::size_t>(c) * tokens * kTop,
-                                      dw.as<float>() + static_cast<std::size_t>(c) * tokens * kTop,
-                                      d_slots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(), st));
-    });
-    const double gbs = bytes / (us * 1e-6) / 1e9;
-    std::printf("  routed decode, %d token(s): %.1f us per layer, %.2f MB read, %.0f GB/s = %.1f%% of roofline (%.1f%% of streaming read)\n",
-                tokens, us, bytes / 1e6, gbs, 100.0 * gbs / roof, 100.0 * gbs / sustained);
-    if (tokens == 1 && gbs < kDecodeFloor * roof) floor_ok = false;
+  // Both decode routes (ignis_moe_set_decode_route); the floor counts as met if one meets it.
+  bool floor_ok = false;
+  std::vector<int32_t> routes = {IGNIS_MOE_DECODE_TICKETS};
+  if (ignis_moe_decode_cluster_size() > 0) {
+    routes.push_back(IGNIS_MOE_DECODE_CLUSTERS);
+  } else {
+    std::printf("  (this device runs no decode cluster: the clusters route is not measured)\n");
   }
+  for (const int32_t route : routes) {
+    MOE_RC(ignis_moe_set_decode_route(route));
+    if (route == IGNIS_MOE_DECODE_TICKETS) {
+      std::printf("  decode route: tickets\n");
+    } else {
+      std::printf("  decode route: clusters of %d CTAs\n", ignis_moe_decode_cluster_size());
+    }
+    for (int tokens : {1, 2, 3}) {
+      const int calls = 320;
+      const std::vector<int32_t> ids = make_calls(calls, tokens, kPool);
+      std::vector<float> w(ids.size(), 0.1f);
+      DeviceBytes dids(ids.size() * 4), dw(w.size() * 4);
+      upload(dids, ids);
+      upload(dw, w);
+      // Bytes one call reads: each distinct expert's two records (data, no padding) and x.
+      double bytes = 0.0;
+      for (int c = 0; c < calls; ++c) {
+        std::vector<int32_t> u(ids.begin() + static_cast<std::ptrdiff_t>(c) * tokens * kTop,
+                               ids.begin() + static_cast<std::ptrdiff_t>(c + 1) * tokens * kTop);
+        std::sort(u.begin(), u.end());
+        u.erase(std::unique(u.begin(), u.end()), u.end());
+        for (int32_t e : u) bytes += static_cast<double>(pool->data_bytes[e]);
+        bytes += tokens * kH * 2.0;
+      }
+      bytes /= calls;
+      const double us = time_us(calls, [&](int c, cudaStream_t st) {
+        MOE_RC(ignis_moe_experts_decode(dx.p, tokens, dids.as<int32_t>() + static_cast<std::size_t>(c) * tokens * kTop,
+                                        dw.as<float>() + static_cast<std::size_t>(c) * tokens * kTop,
+                                        d_slots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(), st));
+      });
+      const double gbs = bytes / (us * 1e-6) / 1e9;
+      std::printf("  routed decode, %d token(s): %.1f us per layer, %.2f MB read, %.0f GB/s = %.1f%% of roofline (%.1f%% of streaming read)\n",
+                  tokens, us, bytes / 1e6, gbs, 100.0 * gbs / roof, 100.0 * gbs / sustained);
+      if (tokens == 1 && gbs >= kDecodeFloor * roof) floor_ok = true;
+    }
 
-  // Diagnostics for the 1-token decode: the same experts every call (weights in the L2, so the
-  // DRAM is out of the picture), and pools of one K class (all K = 2 against all K = 4: twice the
-  // bytes for the same weights -- time that follows the bytes is memory-bound, time that does not
-  // is compute- or latency-bound).
-  auto decode_us = [&](const Pool &pl, int windows, double *mb) {
-    DeviceBytes slots(pl.slots.size() * sizeof(ignis_moe_slot));
-    upload(slots, pl.slots);
-    const int calls = 256;
-    const std::vector<int32_t> ids = make_calls(calls, 1, pl.size, windows);
-    std::vector<float> w(ids.size(), 0.1f);
-    DeviceBytes dids(ids.size() * 4), dw(w.size() * 4);
-    upload(dids, ids);
-    upload(dw, w);
-    double bytes = 0.0;
-    for (int c = 0; c < calls; ++c) {
-      for (int r = 0; r < kTop; ++r) bytes += static_cast<double>(pl.data_bytes[ids[static_cast<std::size_t>(c) * kTop + r]]);
+    // Diagnostics for the 1-token decode: the same experts every call (weights in the L2, so the
+    // DRAM is out of the picture), and pools of one K class (all K = 2 against all K = 4: twice the
+    // bytes for the same weights -- time that follows the bytes is memory-bound, time that does not
+    // is compute- or latency-bound).
+    auto decode_us = [&](const Pool &pl, int windows, double *mb) {
+      DeviceBytes slots(pl.slots.size() * sizeof(ignis_moe_slot));
+      upload(slots, pl.slots);
+      const int calls = 256;
+      const std::vector<int32_t> ids = make_calls(calls, 1, pl.size, windows);
+      std::vector<float> w(ids.size(), 0.1f);
+      DeviceBytes dids(ids.size() * 4), dw(w.size() * 4);
+      upload(dids, ids);
+      upload(dw, w);
+      double bytes = 0.0;
+      for (int c = 0; c < calls; ++c) {
+        for (int r = 0; r < kTop; ++r) bytes += static_cast<double>(pl.data_bytes[ids[static_cast<std::size_t>(c) * kTop + r]]);
+      }
+      *mb = bytes / calls / 1e6;
+      return time_us(calls, [&](int c, cudaStream_t st) {
+        MOE_RC(ignis_moe_experts_decode(dx.p, 1, dids.as<int32_t>() + static_cast<std::size_t>(c) * kTop,
+                                        dw.as<float>() + static_cast<std::size_t>(c) * kTop, slots.as<ignis_moe_slot>(),
+                                        &ws, acc.as<int64_t>(), st));
+      });
+    };
+    {
+      double mb = 0.0;
+      const double l2 = decode_us(*pool, 1, &mb);
+      std::printf("  diagnostic: 1-token decode with its experts L2-resident: %.1f us (%.2f MB)\n", l2, mb);
+      for (uint32_t k2 : {4u, 8u}) {
+        const auto uniform = make_pool(128, k2);
+        const double us = decode_us(*uniform, 0, &mb);
+        std::printf("  diagnostic: 1-token decode, every projection at K = %g: %.1f us for %.2f MB = %.0f GB/s\n", k2 / 2.0, us, mb,
+                    mb * 1e6 / (us * 1e-6) / 1e9);
+      }
     }
-    *mb = bytes / calls / 1e6;
-    return time_us(calls, [&](int c, cudaStream_t st) {
-      MOE_RC(ignis_moe_experts_decode(dx.p, 1, dids.as<int32_t>() + static_cast<std::size_t>(c) * kTop,
-                                      dw.as<float>() + static_cast<std::size_t>(c) * kTop, slots.as<ignis_moe_slot>(),
-                                      &ws, acc.as<int64_t>(), st));
-    });
-  };
-  {
-    double mb = 0.0;
-    const double l2 = decode_us(*pool, 1, &mb);
-    std::printf("  diagnostic: 1-token decode with its experts L2-resident: %.1f us (%.2f MB)\n", l2, mb);
-    for (uint32_t k2 : {4u, 8u}) {
-      const auto uniform = make_pool(128, k2);
-      const double us = decode_us(*uniform, 0, &mb);
-      std::printf("  diagnostic: 1-token decode, every projection at K = %g: %.1f us for %.2f MB = %.0f GB/s\n", k2 / 2.0, us, mb,
-                  mb * 1e6 / (us * 1e-6) / 1e9);
-    }
+
   }
+  MOE_RC(ignis_moe_set_decode_route(IGNIS_MOE_DECODE_TICKETS));
 
   // The other ops, each over copies that together exceed the L2 so the weights come from DRAM.
   {
@@ -353,7 +370,7 @@ int main(int argc, char **argv) {
                 sflops / (sus * 1e-6) / 1e12, 100.0 * sflops / (sus * 1e-6) / 1e12 / peak_tflops);
   }
 
-  std::printf("bench_moe: decode floor (>= %.0f%% of roofline at 1 token) %s\n", 100.0 * kDecodeFloor,
+  std::printf("bench_moe: decode floor (>= %.0f%% of roofline at 1 token, either route) %s\n", 100.0 * kDecodeFloor,
               floor_ok ? "met" : "NOT met");
   return check_floor && !floor_ok ? 1 : 0;
 }

@@ -576,8 +576,14 @@ endforeach()
 # trap kills the context, so each condition runs in its own process.
 add_executable(ignis_kernel_moe_slot_trap_test test_moe_slot_trap.cu)
 target_link_libraries(ignis_kernel_moe_slot_trap_test PRIVATE ignis_kernel ignis_vendor)
-foreach(mode IN ITEMS decode prefill decode-id prefill-id decode-nan)
+foreach(mode IN ITEMS decode prefill decode-id prefill-id decode-nan decode-clusters decode-id-clusters
+                     decode-nan-clusters)
   add_test(NAME ignis_kernel_moe_slot_trap_${mode}_test COMMAND ignis_kernel_moe_slot_trap_test ${mode})
+endforeach()
+# The decode route's second implementation (IGNIS_MOE_DECODE_CLUSTERS, one thread-block cluster
+# per expert) held to the same tests as the default.
+foreach(name IN ITEMS moe_experts moe_block)
+  add_test(NAME ignis_kernel_${name}_clusters_test COMMAND ignis_kernel_${name}_test clusters)
 endforeach()
 # The MoE microbenchmark: a report of every op's achieved bandwidth or throughput. The spec's
 # decode floor (one-token routed decode >= 50% of the DRAM roofline) is its one pass/fail,

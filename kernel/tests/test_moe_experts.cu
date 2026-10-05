@@ -264,10 +264,11 @@ void determinism_arm(Buffers &b, ExpertSet &set) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char **argv) {
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
-  std::printf("routed experts at 2560 / 640 / 512 x top-10, K in {2, 2.5, 3, 4}\n");
+  const std::string route = select_decode_route(argc, argv);
+  std::printf("routed experts at 2560 / 640 / 512 x top-10, K in {2, 2.5, 3, 4}; decode route: %s\n", route.c_str());
   ExpertSet set;
   std::vector<int> identity(2 * kRecords);
   std::iota(identity.begin(), identity.end(), 0);
