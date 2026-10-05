@@ -19,9 +19,10 @@
 //   prefill   one lane's visible rows decoded once (the chunk's own rows fresh), read by position;
 //   prefill + residual  a 200-token chunk at 3000 with its own rows fresh and the ring as it stands
 //             BEFORE the call's append: sinks and [2488, 3000) from the side planes;
-//   report    the hq route against the BF16 route on the same keys and values, beside the codec's
-//             measured row error on these rows (ADR 0022's in-house acceptance needs real
-//             Flash-Next rows for its tolerance; this prints the synthetic figure).
+//   hq vs BF16 the hq route against the BF16 route on the same keys and values (ADR 0022's in-house
+//             acceptance), within a tolerance derived from the codec error MEASURED on the rows
+//             read (codec_bound): synthetic rows here; spec 04 AC7 wants the same on real
+//             Flash-Next KV rows, which needs the artifact.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
@@ -38,6 +39,9 @@ namespace {
 constexpr int kSink = static_cast<int>(ninfer::ops::kGqaHqSinkKeys);
 constexpr int kRecent = static_cast<int>(ninfer::ops::kGqaHqRecentKeys);
 constexpr int kRowsPerRole = kPhysicalPages * kKvHeads * 64;
+// The route reads decoded and side rows un-rotated in fp32 and rounded to BF16, the expectation
+// un-rotates them in fp64: at most one BF16 ulp apart, 2^-7 of the value (the rows check below).
+constexpr double kRowRel = 0x1p-7;
 
 // One warp per (physical row, role): the vendored encoder.
 __global__ void encode_kernel(const __nv_bfloat16 *k, const __nv_bfloat16 *v, const int32_t *position_of,
@@ -152,6 +156,62 @@ SidePlanes make_side(const Pages &pg, const std::function<bool(int, int)> &is_si
   return sp_;
 }
 
+// The tolerance of the hq route against the BF16 route for one row, from the codec error of the
+// very rows it reads: with exact weights w (softmax of q.K/16) and exact V, the decoded K~ moves
+// every score by at most d = max_j |q.(K~_j - K_j)| / 16, so every weight by a factor within
+// e^(+-2d), and out~ - out = sum_j w~_j (V~_j - V_j) + sum_j (w~_j - w_j)(V_j - out). Hence
+// |out~_i - out_i| <= e^(2d) sum_j w_j |dV_ji| + (e^(2d) - 1) sum_j w_j |V_ji - out_i|, to which
+// each kernel's own numeric bound (reference()) is added.
+std::vector<double> codec_bound(const RowFn &exact, const RowFn &decoded, const std::vector<uint16_t> &q, int row,
+                                int slot, const std::vector<int32_t> &list) {
+  const size_t n = list.size();
+  std::vector<double> k(n * kKvHeads * kHd), v(k.size()), dk(k.size()), dv(k.size());
+  for (size_t j = 0; j < n; ++j) {
+    for (int h = 0; h < kKvHeads; ++h) {
+      const size_t at = (j * kKvHeads + h) * kHd;
+      exact(0, slot, list[j], h, &k[at]);
+      exact(1, slot, list[j], h, &v[at]);
+      decoded(0, slot, list[j], h, &dk[at]);
+      decoded(1, slot, list[j], h, &dv[at]);
+      for (int d = 0; d < kHd; ++d) {
+        dk[at + d] -= k[at + d];
+        dv[at + d] -= v[at + d];
+      }
+    }
+  }
+  std::vector<double> bound(static_cast<size_t>(kQHeads) * kHd), w(n);
+  for (int h = 0; h < kQHeads; ++h) {
+    const int kvh = h / sp::kGroup;
+    const uint16_t *qh = &q[(static_cast<size_t>(row) * kQHeads + h) * kHd];
+    double m = -1e300, shift = 0.0;
+    for (size_t j = 0; j < n; ++j) {
+      double dot = 0.0, ddot = 0.0;
+      for (int d = 0; d < kHd; ++d) {
+        dot += bf16_to_f32(qh[d]) * k[(j * kKvHeads + kvh) * kHd + d];
+        ddot += bf16_to_f32(qh[d]) * dk[(j * kKvHeads + kvh) * kHd + d];
+      }
+      w[j] = dot / 16.0;
+      m = std::max(m, w[j]);
+      shift = std::max(shift, std::fabs(ddot) / 16.0);
+    }
+    double l = 0.0;
+    for (size_t j = 0; j < n; ++j) l += (w[j] = std::exp(w[j] - m));
+    const double grow = std::exp(2.0 * shift);
+    for (int d = 0; d < kHd; ++d) {
+      double out = 0.0;
+      for (size_t j = 0; j < n; ++j) out += w[j] / l * v[(j * kKvHeads + kvh) * kHd + d];
+      double dv_sum = 0.0, spread = 0.0;
+      for (size_t j = 0; j < n; ++j) {
+        const size_t at = (j * kKvHeads + kvh) * kHd + d;
+        dv_sum += w[j] / l * std::fabs(dv[at]);
+        spread += w[j] / l * std::fabs(v[at] - out);
+      }
+      bound[static_cast<size_t>(h) * kHd + d] = grow * dv_sum + (grow - 1.0) * spread;
+    }
+  }
+  return bound;
+}
+
 }  // namespace
 
 int main() {
@@ -261,10 +321,10 @@ int main() {
                 total, worst);
     check(worst <= 1.0, "decoded rows differ from the vendored decode + fp64 un-rotation by more than an ulp");
   }
-  check_call("decode over decoded rows", codec, q, dec, eager, 1);
+  check_call("decode over decoded rows", codec, q, dec, eager, 1, kRowRel);
   check(run(d, dec, listed(hq), stream, true) == eager, "hq decode: the graph replay differs from eager");
 
-  // report: the hq route against the BF16 route on the same keys and values.
+  // hq vs BF16: the hq route against the BF16 route on the same keys and values.
   {
     DeviceBytes ek(sp::listed_hq_bytes(g, 3)), ev(sp::listed_hq_bytes(g, 3));
     std::vector<uint16_t> hk(sp::listed_hq_bytes(g, 3) / 2, 0), hv(hk.size(), 0);
@@ -298,14 +358,25 @@ int main() {
       SP_OK(sp::attend(g, bf16, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
     }, stream);
     double diff2 = 0.0, base2 = 0.0, worst = 0.0;
-    for (size_t i = 0; i < base.size(); ++i) {
-      const double a = bf16_to_f32(eager[i]), b = bf16_to_f32(base[i]);
-      diff2 += (a - b) * (a - b);
-      base2 += b * b;
-      worst = std::max(worst, std::fabs(a - b));
+    bool within = true;
+    for (int r = 0; r < 3; ++r) {
+      const auto codec_part = codec_bound(exact, codec, q, r, dec.slots[r], dec.lists[r]);
+      const auto exact_num = reference(exact, q, r, dec.slots[r], dec.lists[r]).bound;
+      const auto codec_num = reference(codec, q, r, dec.slots[r], dec.lists[r], kRowRel).bound;
+      for (size_t i = 0; i < codec_part.size(); ++i) {
+        const size_t at = static_cast<size_t>(r) * kQHeads * kHd + i;
+        const double a = bf16_to_f32(eager[at]), b = bf16_to_f32(base[at]);
+        const double tol = codec_part[i] + exact_num[i] + codec_num[i];
+        diff2 += (a - b) * (a - b);
+        base2 += b * b;
+        worst = std::max(worst, std::fabs(a - b) / tol);
+        within = within && std::fabs(a - b) <= tol;
+      }
     }
-    std::printf("  hq vs BF16 route, same K/V: output rel. RMS %.4f (max |diff| %.4f); codec row rel. RMS %.4f\n",
+    std::printf("  hq vs BF16 route, same K/V: output rel. RMS %.4f, worst %.3f of the codec-derived tolerance; "
+                "codec row rel. RMS %.4f\n",
                 std::sqrt(diff2 / base2), worst, std::sqrt(err2 / ref2));
+    check(within, "hq vs BF16 route: an output differs past the tolerance derived from the measured codec error");
   }
 
   // fresh: each lane's own token read exactly from the call's BF16 K/V.
@@ -327,7 +398,7 @@ int main() {
     const RowFn rows = [&](int role, int slot, int pos, int head, double *out) {
       (pos == dec.positions[slot] ? exact : codec)(role, slot, pos, head, out);
     };
-    check_call("decode, own token fresh", rows, q, dec, run(d, dec, listed(with_fresh), stream), 1);
+    check_call("decode, own token fresh", rows, q, dec, run(d, dec, listed(with_fresh), stream), 1, kRowRel);
   }
 
   // The side planes as the route will see them: uploaded, and the expected rows.
@@ -366,7 +437,7 @@ int main() {
     with_residual.residual_v = up.v.as<__nv_bfloat16>();
     with_residual.ring_valid = up.ring.as<uint32_t>();
     check_call("decode, residual window", residual_rows(sides, is_side, [](int, int) { return false; }), q, dec,
-               run(d, dec, listed(with_residual), stream), 1);
+               run(d, dec, listed(with_residual), stream), 1, kRowRel);
   }
 
   // prefill + residual: a 200-token chunk at P = 3000 on a 3000-token history, its own rows
@@ -406,7 +477,7 @@ int main() {
       SP_OK(sp::decode_visible_hq(g, src, b, pk.as<__nv_bfloat16>(), pv.as<__nv_bfloat16>(), &kv, s));
       SP_OK(sp::attend(g, kv, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
     }, stream);
-    check_call("prefill, fresh + residual (pre-append)", residual_rows(sides, is_side, is_fresh), q, c, got, 9);
+    check_call("prefill, fresh + residual (pre-append)", residual_rows(sides, is_side, is_fresh), q, c, got, 9, kRowRel);
   }
 
   // prefill: one lane's visible rows decoded once per call, the chunk's own rows fresh.
@@ -440,7 +511,7 @@ int main() {
     const RowFn rows = [&](int role, int slot, int pos, int head, double *out) {
       (pos >= 5000 ? exact : codec)(role, slot, pos, head, out);
     };
-    check_call("prefill, visible rows by position", rows, q, c, got, 7);
+    check_call("prefill, visible rows by position", rows, q, c, got, 7, kRowRel);
   }
 
   // Refusals.
