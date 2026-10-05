@@ -604,12 +604,20 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
         }
       }
       if (last) {
-        void *logits = model->scratch->alloc_bytes(vocab * sizeof(std::uint16_t)).data;
-        if (fn_head(g, fn.weights->final_mixer, fn.weights->head, residual_row(chunk - 1), 1, logits,
+        // The draw's row is computed in the span readout's own block (the 32-row block of the
+        // chunk that holds its last row), so a span's row and the draw's are one computation, bit
+        // for bit, whatever the linears' routes do with a row count; the head reads the weights
+        // once either way.
+        const int32_t block_first = (chunk - 1) / kSpanLogitRows * kSpanLogitRows;
+        const int32_t block_rows = chunk - block_first;
+        auto *block = static_cast<unsigned char *>(
+            model->scratch->alloc_bytes(static_cast<std::size_t>(kSpanLogitRows) * vocab * sizeof(std::uint16_t)).data);
+        if (fn_head(g, fn.weights->final_mixer, fn.weights->head, residual_row(block_first), block_rows, block,
                     *model->scratch, stream) != 0) {
           error = std::string("the head: ") + fn_last_error();
           return false;
         }
+        void *logits = block + static_cast<std::size_t>(block_rows - 1) * vocab * sizeof(std::uint16_t);
         const ninfer::Tensor logits_tensor(logits, ninfer::DType::BF16, {g.vocab, 1, 1, 1});
         if (step::sample_single(model, pool, seq, logits_tensor, *sampling, ninfer::ops::kSamplePurposePrefill,
                                 position + chunk - 1, &successor, options->out_permitted_prob) != 0) {

@@ -5,7 +5,10 @@
 //! held to each other.
 //!
 //! - **A span is deterministic.** The same tokens teacher-forced twice from
-//!   position 0 give the same logits, bit for bit, every position.
+//!   position 0 give the same logits, bit for bit, every position; and a
+//!   span's row is the draw's own row -- equal, bit for bit, to the last
+//!   logits of the prefix prompt that ends there, where the two cut the same
+//!   chunks (the span-logits readout the acceptance scorers read).
 //! - **Decode agrees with prefill.** Greedy generation through decode rounds
 //!   (graphs, one lane and three) and a teacher-forced prefill of the prompt
 //!   and the generated tokens pick the same argmax at each generated
@@ -110,6 +113,17 @@ fn a_span_is_deterministic_and_decode_agrees_with_prefill() {
     let again = all_rows(&mut engine, &tokens);
     let differing = first.chunks_exact(vocab).zip(again.chunks_exact(vocab)).filter(|(a, b)| a != b).count();
     assert_eq!(differing, 0, "{differing} of {} rows differ between two identical spans", tokens.len());
+
+    // The readout's rows are the draw's own rows: where a span and a prefix
+    // prompt cut the same chunks -- the first chunk's end, and the span's end
+    // -- the span's row equals the prefix's last-position logits bit for bit.
+    let chunk = engine.options().prefill_chunk_tokens as usize;
+    for end in [chunk, tokens.len()] {
+        let last = engine.last_logits(&tokens[..end]).unwrap_or_else(|e| panic!("last logits at {end}: {e}"));
+        let row = &first[(end - 1) * vocab..end * vocab];
+        let differing = row.iter().zip(&last).filter(|&(&b, &f)| bf16(b).to_bits() != f.to_bits()).count();
+        assert_eq!(differing, 0, "row {}: {differing} logits differ from the prefix prompt's last row", end - 1);
+    }
 
     // Decode against prefill, on one lane and on three.
     for lanes in [1usize, 3] {

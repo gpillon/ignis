@@ -307,6 +307,31 @@ impl FlashNextEngine {
         Ok(())
     }
 
+    /// The last position's logits of `tokens` prefilled from position 0 on a
+    /// fresh sequence, as floats: the draw's own row, which a span's row at
+    /// the same position equals bit for bit where the two cut the same chunks.
+    pub fn last_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        let mut seq = self.pool.alloc(self.options.max_context_tokens)?;
+        let mut context = self.table.new_context();
+        let mut rows = vec![0u8; tokens.len() * self.table.token_bytes()];
+        self.table.stage(&mut context, tokens, &mut rows)?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let mut logits = vec![0f32; self.vocab()];
+        prefill_flash_next(
+            &self.model,
+            &self.pool,
+            &mut seq,
+            &ids,
+            0,
+            SamplingParams::greedy(),
+            &[],
+            &rows,
+            None,
+            Some(&mut logits),
+        )?;
+        Ok(logits)
+    }
+
     /// Greedy generation of `count` tokens after `prompt`, on lanes of one
     /// prompt each (all of them at once: one round of `prompts.len()` lanes
     /// per token).
