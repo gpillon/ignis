@@ -612,9 +612,10 @@ pub fn flash_next_scheduler(
     }
     drop(reader);
     let leaf = FlashNextLeaf::open(artifact_path, options)?;
-    // GitHub #301, #302: the exposition reads the leaf's counters through
-    // their cell, never through the leaf, which drops with its model.
-    let counters = leaf.counters();
+    // GitHub #301, #302: the telemetry consumer reads the leaf's counters
+    // through their source, never through the leaf, which drops with its
+    // model.
+    let counters = leaf.counter_source();
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
     let stats = model.stats().map_err(|e| format!("runtime stats: {e:?}"))?;
     let capacity_pages = stats.kv_page_count;

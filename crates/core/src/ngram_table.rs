@@ -70,13 +70,47 @@ impl Default for NgramTableOptions {
 /// Rows gathered so far, by source: plain counters the server reads and exposes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NgramCounters {
-    /// Rows staged.
+    /// Rows staged: the hot rows and the file's.
     pub rows: u64,
     /// Of them, rows the hot-row cache held.
     pub hot_rows: u64,
+    /// Of them, rows read from the file.
+    pub file_rows: u64,
     /// Reads issued to the file, and their bytes.
     pub reads: u64,
     pub read_bytes: u64,
+}
+
+/// The table's counts, which a reader may hold past the table: every one
+/// counted at its source and only growing, so no reader derives one from two.
+#[derive(Debug, Default)]
+pub struct NgramCounts {
+    hot_rows: AtomicU64,
+    file_rows: AtomicU64,
+    reads: AtomicU64,
+    read_bytes: AtomicU64,
+}
+
+impl NgramCounts {
+    /// One gather's rows by source, and the reads behind them.
+    pub fn record(&self, hot_rows: u64, file_rows: u64, reads: u64, read_bytes: u64) {
+        self.hot_rows.fetch_add(hot_rows, Ordering::Relaxed);
+        self.file_rows.fetch_add(file_rows, Ordering::Relaxed);
+        self.reads.fetch_add(reads, Ordering::Relaxed);
+        self.read_bytes.fetch_add(read_bytes, Ordering::Relaxed);
+    }
+
+    pub fn read(&self) -> NgramCounters {
+        let hot_rows = self.hot_rows.load(Ordering::Relaxed);
+        let file_rows = self.file_rows.load(Ordering::Relaxed);
+        NgramCounters {
+            rows: hot_rows + file_rows,
+            hot_rows,
+            file_rows,
+            reads: self.reads.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// One read's result: its index in the plan, its buffer and the bytes that
@@ -166,10 +200,7 @@ pub struct NgramTable {
     layout: TableLayout,
     policy: ReadPolicy,
     pool: ReadPool,
-    rows: AtomicU64,
-    hot_hits: AtomicU64,
-    reads: AtomicU64,
-    read_bytes: AtomicU64,
+    counts: Arc<NgramCounts>,
 }
 
 impl NgramTable {
@@ -199,10 +230,7 @@ impl NgramTable {
             layout,
             policy,
             pool: ReadPool::new(path, options.read_threads)?,
-            rows: AtomicU64::new(0),
-            hot_hits: AtomicU64::new(0),
-            reads: AtomicU64::new(0),
-            read_bytes: AtomicU64::new(0),
+            counts: Arc::default(),
         };
         table.hot_data = table.load_hot_rows()?;
         Ok(table)
@@ -322,12 +350,12 @@ impl NgramTable {
 
     /// The rows gathered so far, by source.
     pub fn counters(&self) -> NgramCounters {
-        NgramCounters {
-            rows: self.rows.load(Ordering::Relaxed),
-            hot_rows: self.hot_hits.load(Ordering::Relaxed),
-            reads: self.reads.load(Ordering::Relaxed),
-            read_bytes: self.read_bytes.load(Ordering::Relaxed),
-        }
+        self.counts.read()
+    }
+
+    /// The counts themselves, for a reader on another thread.
+    pub fn counts(&self) -> Arc<NgramCounts> {
+        Arc::clone(&self.counts)
     }
 
     /// Read the hot rows from the file into their slots, with the coalescing
@@ -397,10 +425,12 @@ impl PendingRows<'_> {
         let table = self.table;
         collect_and_gather(&self.plan, self.results, &table.hot_data, out)?;
         let hot = self.plan.sources.iter().filter(|s| matches!(s, crate::ngram::RowSource::Hot { .. })).count();
-        table.rows.fetch_add(self.plan.sources.len() as u64, Ordering::Relaxed);
-        table.hot_hits.fetch_add(hot as u64, Ordering::Relaxed);
-        table.reads.fetch_add(self.plan.reads.len() as u64, Ordering::Relaxed);
-        table.read_bytes.fetch_add(self.plan.read_bytes(), Ordering::Relaxed);
+        table.counts.record(
+            hot as u64,
+            (self.plan.sources.len() - hot) as u64,
+            self.plan.reads.len() as u64,
+            self.plan.read_bytes(),
+        );
         Ok(())
     }
 }
@@ -515,7 +545,11 @@ mod tests {
         let counters = table.counters();
         assert_eq!(counters.rows, rows.len() as u64);
         assert_eq!(counters.hot_rows, 4, "rows 0, 37 twice and 74 are hot");
+        assert_eq!(counters.file_rows, 5, "the other five came from the file");
         assert!(counters.reads >= 1 && counters.read_bytes % 4096 == 0);
+        let counts = table.counts();
+        drop(table);
+        assert_eq!(counts.read(), counters, "a reader's handle outlives the table and reads what it counted");
     }
 
     #[test]

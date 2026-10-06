@@ -28,11 +28,12 @@ use ignis_artifact::flash_next::{self, FlashNextGeometry, FlashNextPlan};
 use ignis_artifact::{materialize, CudaDevice, Device, MaterializedArtifact, Reader};
 use ignis_core::compute::ModelConfig;
 use ignis_core::flash_next::{build_residency, EngineOptions};
-use ignis_core::flash_next_counters::{FlashNextCounterCell, FlashNextCounters};
+use ignis_core::flash_next_counters::FlashNextCounterSource;
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::ngram::NgramContext;
 use ignis_core::ngram_table::NgramTable;
 use ignis_core::residency::device::DeviceResidency;
+use ignis_core::residency::ResidencyMirror;
 use ignis_core::seq::{ArenaBuffer, HostArena, PinnedAllocError, Seq, SeqCheckpoint, SeqPool, SeqPrefix};
 use ignis_core::step;
 use ignis_core::types::{DecodeParams, TokenId};
@@ -94,9 +95,9 @@ pub struct FlashNextCheckpoint {
 /// the n-gram table and the KV-RAM arena. Field order is drop order (the
 /// device last).
 pub struct FlashNextLeaf {
-    /// What residency and the n-gram table counted (GitHub #301, #302),
-    /// published after every step: numbers only, so it may outlive the leaf.
-    counters: Arc<FlashNextCounterCell>,
+    /// Where residency's mirror and the n-gram table's counts are read
+    /// (GitHub #301, #302): host memory only, so it may outlive the leaf.
+    counters: Arc<FlashNextCounterSource>,
     arena: Option<Arc<HostArena>>,
     /// The blob layout version of the model's pool, read once it exists.
     layout_version: OnceLock<u32>,
@@ -132,15 +133,20 @@ impl FlashNextLeaf {
         let config = ModelConfig::flash_next_from(&geometry);
         let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
         let artifact = materialize(&reader, &plan.plan, &mut device, None).map_err(|e| format!("materialize: {e}"))?;
-        let residency = build_residency(path, &plan, &options)?;
+        let mut residency = build_residency(path, &plan, &options)?;
+        // Before the first step, and so before any graph captures one: the
+        // last layer of every step writes the totals into host memory.
+        let mirror = Arc::new(ResidencyMirror::new());
+        residency.mirror(Arc::clone(&mirror))?;
         let ngram = config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?;
         let table = NgramTable::from_artifact(path, &reader, &plan, ngram, options.ngram)?;
+        let counters = Arc::new(FlashNextCounterSource::new(mirror, residency.desc().capacity, table.counts()));
         let arena = match options.kv_ram_arena_bytes {
             0 => None,
             bytes => Some(HostArena::create(bytes)?),
         };
-        let leaf = Self {
-            counters: Arc::default(),
+        Ok(Self {
+            counters,
             arena,
             layout_version: OnceLock::new(),
             residency,
@@ -152,31 +158,13 @@ impl FlashNextLeaf {
             artifact,
             reader,
             device,
-        };
-        // The pools' capacity, and what a warm start filled, before any step.
-        leaf.publish_counters();
-        Ok(leaf)
+        })
     }
 
-    /// The cell this load's counters land in, after every step.
-    pub fn counters(&self) -> Arc<FlashNextCounterCell> {
+    /// Where this load's counters are read, on any thread, with no call into
+    /// the leaf: the steps do nothing for it.
+    pub fn counter_source(&self) -> Arc<FlashNextCounterSource> {
         Arc::clone(&self.counters)
-    }
-
-    /// Residency's counters and occupancy, read off the device (each waits
-    /// for residency's work, of which a finished step leaves none), and the
-    /// n-gram table's, into the cell. A failed read keeps the last reading:
-    /// no step fails for a count.
-    fn publish_counters(&self) {
-        let (Ok(residency), Ok(in_use)) = (self.residency.counters(), self.residency.slots_in_use()) else {
-            return;
-        };
-        self.counters.publish(&FlashNextCounters {
-            residency,
-            slots_capacity: self.residency.desc().capacity,
-            slots_in_use: Some(in_use),
-            ngram: self.table.counters(),
-        });
     }
 
     /// The decode lanes the load serves: the scheduler's resident lanes.
@@ -461,7 +449,6 @@ impl StepLeaf for FlashNextLeaf {
         )
         .map_err(|e| leaf_error("prefill", e))?;
         sequence.context = context;
-        self.publish_counters();
         Ok(drawn)
     }
 
@@ -500,7 +487,6 @@ impl StepLeaf for FlashNextLeaf {
         for (sequence, context) in sequences.iter_mut().zip(contexts) {
             sequence.context = context;
         }
-        self.publish_counters();
         Ok(drawn
             .into_iter()
             .zip(lanes)

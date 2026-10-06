@@ -15,14 +15,14 @@
 //! which Prometheus does not assume either.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use axum::Router;
 use axum::http::header;
 use axum::routing::get;
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
-use ignis_core::flash_next_counters::FlashNextCounterCell;
+use ignis_core::flash_next_counters::{FlashNextCounterSource, FlashNextCounters};
 use ignis_core::ngram_table::NgramCounters;
 use ignis_core::residency::{KClass, Phase, ResidencyCounters};
 use ignis_core::{RetainedSkip, SubmitError};
@@ -56,10 +56,11 @@ pub struct LoadReservations {
     /// memory, beside the plan's lines rather than one of them.
     pub retained_host_slots: u32,
     pub retained_host_bytes: u64,
-    /// A Flash-Next load's counter cell (GitHub #301, #302), which its leaf
-    /// publishes into; `None` on a 27B load. The one live part: it rides
-    /// here only to reach the exposition the way the rest does.
-    pub flash_next: Option<Arc<FlashNextCounterCell>>,
+    /// Where a Flash-Next load's counters are read (GitHub #301, #302);
+    /// `None` on a 27B load. Not a reservation: it rides here to reach the
+    /// telemetry consumer, which reads it at every tick
+    /// ([`crate::Server::with_load_reservations`]).
+    pub flash_next: Option<Arc<FlashNextCounterSource>>,
 }
 
 /// The exposition's content type: Prometheus text format 0.0.4.
@@ -455,9 +456,78 @@ pub struct Metrics {
     responses_sockets: AtomicU64,
     responses_queued: AtomicU64,
     /// A Flash-Next load's expert residency and n-gram counters (GitHub
-    /// #301, #302), which its leaf publishes after its steps; never set on
-    /// a 27B load, whose exposition then ends where it always did.
-    flash_next: OnceLock<Arc<FlashNextCounterCell>>,
+    /// #301, #302), as the telemetry consumer last read them, and 1 in
+    /// `flash_next_loaded` while the load has them. Never set on a 27B load,
+    /// whose exposition then ends where it always did.
+    flash_next: FlashNextSeries,
+    flash_next_loaded: AtomicU64,
+}
+
+/// [`FlashNextCounters`] as fixed atomics, each series stored and read on
+/// its own.
+#[derive(Debug, Default)]
+struct FlashNextSeries {
+    hits: [[AtomicU64; 2]; KClass::COUNT],
+    misses: [[AtomicU64; 2]; KClass::COUNT],
+    prefetch_issued: AtomicU64,
+    prefetch_used: AtomicU64,
+    bytes_moved: [AtomicU64; 2],
+    slots_capacity: [AtomicU64; KClass::COUNT],
+    slots_in_use: [AtomicU64; KClass::COUNT],
+    ngram_hot_rows: AtomicU64,
+    ngram_file_rows: AtomicU64,
+    ngram_reads: AtomicU64,
+    ngram_read_bytes: AtomicU64,
+}
+
+impl FlashNextSeries {
+    fn store(&self, reading: &FlashNextCounters) {
+        let store = |series: &AtomicU64, value: u64| series.store(value, Ordering::Relaxed);
+        let r = &reading.residency;
+        for class in 0..KClass::COUNT {
+            for phase in 0..2 {
+                store(&self.hits[class][phase], r.hits[class][phase]);
+                store(&self.misses[class][phase], r.misses[class][phase]);
+            }
+            store(&self.slots_capacity[class], u64::from(reading.slots_capacity[class]));
+            store(&self.slots_in_use[class], u64::from(reading.slots_in_use[class]));
+        }
+        store(&self.prefetch_issued, r.prefetch_issued);
+        store(&self.prefetch_used, r.prefetch_used);
+        for phase in 0..2 {
+            store(&self.bytes_moved[phase], r.bytes_moved[phase]);
+        }
+        let n = &reading.ngram;
+        store(&self.ngram_hot_rows, n.hot_rows);
+        store(&self.ngram_file_rows, n.file_rows);
+        store(&self.ngram_reads, n.reads);
+        store(&self.ngram_read_bytes, n.read_bytes);
+    }
+
+    fn load(&self) -> FlashNextCounters {
+        let load = |series: &AtomicU64| series.load(Ordering::Relaxed);
+        let hot_rows = load(&self.ngram_hot_rows);
+        let file_rows = load(&self.ngram_file_rows);
+        FlashNextCounters {
+            residency: ResidencyCounters {
+                hits: self.hits.each_ref().map(|phases| phases.each_ref().map(load)),
+                misses: self.misses.each_ref().map(|phases| phases.each_ref().map(load)),
+                prefetch_issued: load(&self.prefetch_issued),
+                prefetch_used: load(&self.prefetch_used),
+                bytes_moved: self.bytes_moved.each_ref().map(load),
+                stall_nanos: 0,
+            },
+            slots_capacity: self.slots_capacity.each_ref().map(|c| load(c) as u32),
+            slots_in_use: self.slots_in_use.each_ref().map(|c| load(c) as u32),
+            ngram: NgramCounters {
+                rows: hot_rows + file_rows,
+                hot_rows,
+                file_rows,
+                reads: load(&self.ngram_reads),
+                read_bytes: load(&self.ngram_read_bytes),
+            },
+        }
+    }
 }
 
 /// One retained-state family: a count per residency tier and per kind of
@@ -517,16 +587,19 @@ impl Metrics {
             locates: Default::default(),
             responses_sockets: AtomicU64::new(0),
             responses_queued: AtomicU64::new(0),
-            flash_next: OnceLock::new(),
+            flash_next: FlashNextSeries::default(),
+            flash_next_loaded: AtomicU64::new(0),
         }
     }
 
-    /// A Flash-Next load's counters (GitHub #301, #302): rendered from
-    /// `cell`, which its leaf publishes into after every step whether or not
-    /// anything reads it, after every other family. Set once, before the
-    /// first request; a second call is ignored.
-    pub(crate) fn set_flash_next(&self, cell: Arc<FlashNextCounterCell>) {
-        let _ = self.flash_next.set(cell);
+    /// A Flash-Next load's counters as the telemetry consumer read them
+    /// (GitHub #301, #302), rendered after every other family; `None` for a
+    /// load that has none, which takes the families out again.
+    pub(crate) fn set_flash_next(&self, reading: Option<&FlashNextCounters>) {
+        if let Some(reading) = reading {
+            self.flash_next.store(reading);
+        }
+        self.flash_next_loaded.store(u64::from(reading.is_some()), Ordering::Relaxed);
     }
 
     /// A `locate` was answered (GitHub #278, spec 22): by the kind it
@@ -688,9 +761,6 @@ impl Metrics {
         self.retained_slots_capacity.store(u64::from(reserved.retained_slots), Ordering::Relaxed);
         self.retained_host_slots.store(u64::from(reserved.retained_host_slots), Ordering::Relaxed);
         self.retained_host_bytes.store(reserved.retained_host_bytes, Ordering::Relaxed);
-        if let Some(cell) = reserved.flash_next {
-            self.set_flash_next(cell);
-        }
     }
 
     /// A request's first token came `ms` after its submission.
@@ -1032,14 +1102,9 @@ impl Metrics {
         }
         // GitHub #301, #302: last, so a 27B load's exposition is the same
         // bytes it was before Flash-Next.
-        if let Some(cell) = self.flash_next.get() {
-            let reading = cell.read();
-            render_expert_residency(
-                &mut out,
-                &reading.residency,
-                &reading.slots_capacity,
-                reading.slots_in_use.as_ref(),
-            );
+        if read(&self.flash_next_loaded) == 1 {
+            let reading = self.flash_next.load();
+            render_expert_residency(&mut out, &reading.residency, &reading.slots_capacity, &reading.slots_in_use);
             render_ngram(&mut out, &reading.ngram);
         }
         out
@@ -1054,13 +1119,15 @@ impl Metrics {
 /// `capacity|in_use` -- with zeros exported. Counters and gauges in their
 /// own units, no ratio: a decode hit rate is `hits` over `hits + misses` of
 /// `phase="decode"`. A 27B load has no expert cache and never renders these;
-/// [`Metrics::render`] renders them for a Flash-Next load, from what its
-/// leaf published. Without `occupancy` the slots export their capacity alone.
+/// [`Metrics::render`] renders them for a Flash-Next load, from what the
+/// telemetry consumer read. The kernels' wait (`stall_nanos`) is not
+/// exported: the device does not time it yet, and ADR 0017 exports no
+/// placeholder.
 pub fn render_expert_residency(
     out: &mut String,
     counters: &ResidencyCounters,
     capacity: &[u32; KClass::COUNT],
-    occupancy: Option<&[u32; KClass::COUNT]>,
+    occupancy: &[u32; KClass::COUNT],
 ) {
     for (name, help, series) in [
         (
@@ -1118,24 +1185,12 @@ pub fn render_expert_residency(
     }
     declare(
         out,
-        "ignis_expert_residency_stall_seconds_total",
-        "counter",
-        "Time the expert kernels waited on residency to bring their projections in.",
-    );
-    let _ = writeln!(
-        out,
-        "ignis_expert_residency_stall_seconds_total {}",
-        decimal(counters.stall_nanos, 1_000_000_000)
-    );
-    declare(
-        out,
         "ignis_expert_cache_slots",
         "gauge",
         "VRAM expert cache slots per K class: capacity reserved at load, and in use.",
     );
     for class in KClass::ALL {
-        for (state, slots) in [("capacity", Some(capacity)), ("in_use", occupancy)] {
-            let Some(slots) = slots else { continue };
+        for (state, slots) in [("capacity", capacity), ("in_use", occupancy)] {
             let _ = writeln!(
                 out,
                 "ignis_expert_cache_slots{{class=\"{}\",state=\"{state}\"}} {}",
@@ -1158,10 +1213,7 @@ pub fn render_ngram(out: &mut String, counters: &NgramCounters) {
         "counter",
         "N-gram embedding rows staged for prefill spans and decode rounds, by source: the RAM hot-row cache or the artifact file.",
     );
-    for (source, rows) in [
-        ("hot", counters.hot_rows),
-        ("file", counters.rows.saturating_sub(counters.hot_rows)),
-    ] {
+    for (source, rows) in [("hot", counters.hot_rows), ("file", counters.file_rows)] {
         let _ = writeln!(out, "ignis_ngram_rows_total{{source=\"{source}\"}} {rows}");
     }
     for (name, help, value) in [
@@ -1888,23 +1940,24 @@ mod tests {
         let mut occupancy = [0u32; KClass::COUNT];
         occupancy[down_k2.index()] = 12;
         let mut text = String::new();
-        render_expert_residency(&mut text, &counters, &capacity, Some(&occupancy));
+        render_expert_residency(&mut text, &counters, &capacity, &occupancy);
 
         // Help and type once per family; 8 x 2 hits, 8 x 2 misses, 2
-        // prefetch, 2 bytes, 1 stall, 8 x 2 slots, zeros included.
+        // prefetch, 2 bytes, 8 x 2 slots, zeros included.
         for (name, kind) in [
             ("ignis_expert_cache_hits_total", "counter"),
             ("ignis_expert_cache_misses_total", "counter"),
             ("ignis_expert_prefetches_issued_total", "counter"),
             ("ignis_expert_prefetches_used_total", "counter"),
             ("ignis_expert_bytes_moved_total", "counter"),
-            ("ignis_expert_residency_stall_seconds_total", "counter"),
             ("ignis_expert_cache_slots", "gauge"),
         ] {
             assert_eq!(text.matches(&format!("# TYPE {name} {kind}\n")).count(), 1, "{name}");
             assert_eq!(text.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
         }
-        assert_eq!(samples(&text).len(), 53);
+        assert_eq!(samples(&text).len(), 52);
+        // The device does not time the kernels' wait yet: no placeholder.
+        assert!(!text.contains("stall"), "{text}");
         let hits = |labels: &str| value(&text, "ignis_expert_cache_hits_total", labels);
         assert_eq!(hits("class=\"down_k2\",phase=\"decode\""), "7");
         assert_eq!(hits("class=\"gate_up_k2_5\",phase=\"prefill\""), "0");
@@ -1915,7 +1968,6 @@ mod tests {
         assert_eq!(value(&text, "ignis_expert_prefetches_issued_total", ""), "5");
         assert_eq!(value(&text, "ignis_expert_prefetches_used_total", ""), "4");
         assert_eq!(value(&text, "ignis_expert_bytes_moved_total", "phase=\"prefill\""), "2000");
-        assert_eq!(value(&text, "ignis_expert_residency_stall_seconds_total", ""), "0.0015");
         assert_eq!(
             value(&text, "ignis_expert_cache_slots", "class=\"down_k2\",state=\"capacity\""),
             "40"
@@ -1927,47 +1979,33 @@ mod tests {
     }
 
     #[test]
-    fn expert_residency_without_occupancy_exports_the_capacity_alone() {
-        use ignis_core::residency::{KBits, Projection};
-        let mut capacity = [0u32; KClass::COUNT];
-        capacity[KClass::new(Projection::Down, KBits::K2).index()] = 9;
-        let mut text = String::new();
-        render_expert_residency(&mut text, &ResidencyCounters::default(), &capacity, None);
-        // The 53 of the full family less the eight `in_use` series.
-        assert_eq!(samples(&text).len(), 45);
-        assert!(!text.contains("state=\"in_use\""), "{text}");
-        assert_eq!(value(&text, "ignis_expert_cache_slots", "class=\"down_k2\",state=\"capacity\""), "9");
-    }
-
-    #[test]
     fn a_load_without_flash_next_counters_renders_none_of_their_families() {
         let text = Metrics::new().render();
         assert!(!text.contains("ignis_expert_"), "{text}");
         assert!(!text.contains("ignis_ngram_"), "{text}");
     }
 
+    /// A Flash-Next reading, with figures in every family.
+    fn flash_next_reading() -> FlashNextCounters {
+        use ignis_core::residency::{KBits, Projection};
+        let gate_up_k4 = KClass::new(Projection::GateUp, KBits::K4).index();
+        let mut reading = FlashNextCounters::default();
+        reading.residency.hits[gate_up_k4][Phase::Decode.index()] = 21;
+        reading.residency.misses[gate_up_k4][Phase::Decode.index()] = 4;
+        reading.residency.bytes_moved = [3_000, 0];
+        reading.residency.stall_nanos = 9;
+        reading.slots_capacity[gate_up_k4] = 64;
+        reading.slots_in_use[gate_up_k4] = 33;
+        reading.ngram = NgramCounters { rows: 320, hot_rows: 300, file_rows: 20, reads: 7, read_bytes: 28_672 };
+        reading
+    }
+
     #[test]
     fn a_flash_next_load_appends_its_counters_after_the_whole_27b_exposition() {
-        use ignis_core::flash_next_counters::{FlashNextCounterCell, FlashNextCounters};
-        use ignis_core::ngram_table::NgramCounters;
-        use ignis_core::residency::{KBits, Projection};
-
         let metrics = Metrics::new();
         metrics.record_accepted();
         let without = metrics.render();
-
-        let cell = Arc::new(FlashNextCounterCell::default());
-        metrics.set_flash_next(Arc::clone(&cell));
-
-        let gate_up_k4 = KClass::new(Projection::GateUp, KBits::K4);
-        let mut reading = FlashNextCounters::default();
-        reading.residency.hits[gate_up_k4.index()][Phase::Decode.index()] = 21;
-        reading.residency.misses[gate_up_k4.index()][Phase::Decode.index()] = 4;
-        reading.residency.bytes_moved = [3_000, 0];
-        reading.slots_capacity[gate_up_k4.index()] = 64;
-        reading.slots_in_use = Some([0, 0, 0, 33, 0, 0, 0, 0]);
-        reading.ngram = NgramCounters { rows: 320, hot_rows: 300, reads: 7, read_bytes: 28_672 };
-        cell.publish(&reading);
+        metrics.set_flash_next(Some(&flash_next_reading()));
         let with = metrics.render();
 
         // Byte-identical up to the end of what a 27B load renders.
@@ -1981,7 +2019,6 @@ mod tests {
                 ("ignis_expert_prefetches_issued_total", "counter"),
                 ("ignis_expert_prefetches_used_total", "counter"),
                 ("ignis_expert_bytes_moved_total", "counter"),
-                ("ignis_expert_residency_stall_seconds_total", "counter"),
                 ("ignis_expert_cache_slots", "gauge"),
                 ("ignis_ngram_rows_total", "counter"),
                 ("ignis_ngram_reads_total", "counter"),
@@ -2007,27 +2044,23 @@ mod tests {
         assert_eq!(value(&with, "ignis_ngram_rows_total", "source=\"file\""), "20");
         assert_eq!(value(&with, "ignis_ngram_reads_total", ""), "7");
         assert_eq!(value(&with, "ignis_ngram_read_bytes_total", ""), "28672");
-        // 53 residency series and 4 n-gram ones, nothing else added.
-        assert_eq!(samples(&with).len(), samples(&without).len() + 57);
+        // 52 residency series and 4 n-gram ones, nothing else added.
+        assert_eq!(samples(&with).len(), samples(&without).len() + 56);
     }
 
     #[test]
-    fn a_flash_next_loads_reservations_carry_its_counters_to_the_exposition() {
-        let cell = Arc::new(ignis_core::flash_next_counters::FlashNextCounterCell::default());
+    fn a_load_that_has_no_counters_any_more_renders_the_27b_exposition_again() {
         let metrics = Metrics::new();
-        metrics.set_load_reservations(LoadReservations {
-            lines: ignis_core::VramLines::default(),
-            budget_bytes: 0,
-            kv_pool_pages: 0,
-            kv_page_bytes: 0,
-            kv_ram_arena_bytes: 0,
-            retained_slots: 0,
-            retained_host_slots: 0,
-            retained_host_bytes: 0,
-            flash_next: Some(Arc::clone(&cell)),
-        });
+        let without = metrics.render();
+        metrics.set_flash_next(Some(&flash_next_reading()));
+        assert_ne!(metrics.render(), without);
+        // A reload onto a model without them: no dead model's families.
+        metrics.set_flash_next(None);
+        assert_eq!(metrics.render(), without);
+        // And a new Flash-Next load replaces every figure.
+        metrics.set_flash_next(Some(&FlashNextCounters::default()));
         let text = metrics.render();
+        assert_eq!(value(&text, "ignis_expert_cache_hits_total", "class=\"gate_up_k4\",phase=\"decode\""), "0");
         assert_eq!(value(&text, "ignis_ngram_reads_total", ""), "0");
-        assert_eq!(value(&text, "ignis_expert_prefetches_used_total", ""), "0");
     }
 }

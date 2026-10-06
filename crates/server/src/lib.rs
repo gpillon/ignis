@@ -269,8 +269,13 @@ impl Server {
     /// once, before the first request. Without `--metrics` there is nothing
     /// to write them into and the call does nothing; a load that built no
     /// plan (the placeholder path) never makes it.
-    pub fn with_load_reservations(self, reserved: metrics::LoadReservations) -> Self {
+    pub fn with_load_reservations(self, mut reserved: metrics::LoadReservations) -> Self {
         if let Some(metrics) = &self.metrics {
+            // GitHub #301, #302: a Flash-Next load's counter source is not a
+            // reservation; the telemetry consumer reads it at every tick.
+            if let Some(source) = reserved.flash_next.take() {
+                self.engine.install_counter_source(Some(source));
+            }
             metrics.set_load_reservations(reserved);
         }
         self
