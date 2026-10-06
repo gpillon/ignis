@@ -38,7 +38,8 @@ use std::path::PathBuf;
 use ignis_artifact::packer::ARTIFACT_FILE_NAME;
 use ignis_core::flash_next::EngineOptions;
 use ignis_core::gpu_profile;
-use ignis_core::{BlobIdentity, DecodeParams, KvFormat};
+use ignis_artifact::Reader;
+use ignis_core::{ArtifactHash, BlobIdentity, DecodeParams, KvFormat};
 use ignis_runtime::{DecodeLane, FlashNextLeaf, FlashNextModel, FlashNextSequence, StepLeaf, KV_PAGE_TOKENS};
 
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
@@ -50,9 +51,13 @@ const DECODED: usize = 8;
 const DEVICE_SLOT: u32 = 0;
 const HOST_SLOTS: [u32; 2] = [1, 2];
 
-fn leaf(kv_format: KvFormat) -> Option<FlashNextLeaf> {
+fn artifact_path() -> PathBuf {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from);
-    let path = dir.join(ARTIFACT_FILE_NAME);
+    dir.join(ARTIFACT_FILE_NAME)
+}
+
+fn leaf(kv_format: KvFormat) -> Option<FlashNextLeaf> {
+    let path = artifact_path();
     if !path.exists() {
         gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display()));
         return None;
@@ -235,6 +240,11 @@ fn reuse_is_bit_exact(kv_format: KvFormat) {
     // drafter, Flash-Next's own blob layout -- which the 27B's refuses.
     let identity = leaf.blob_identity();
     assert_eq!((identity.kv_format, identity.drafter, identity.layout_version), (kv_format, None, 0x101));
+    // The leaf drops its map of the file after open (GitHub #306) and keeps
+    // the hash it read then.
+    let reader = Reader::open(&artifact_path()).expect("open the artifact");
+    assert_eq!(identity.artifact, ArtifactHash::from_bytes(reader.content_hash()), "the artifact's own hash");
+    drop(reader);
     let a_27b_blob = BlobIdentity { layout_version: 5, ..identity };
     assert!(identity.accepts(&a_27b_blob).is_err(), "a 27B-layout blob is refused");
 

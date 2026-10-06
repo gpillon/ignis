@@ -107,7 +107,10 @@ pub struct FlashNextLeaf {
     geometry: FlashNextGeometry,
     config: ModelConfig,
     options: EngineOptions,
-    reader: Reader,
+    /// The artifact's content hash, read at open. The leaf keeps no
+    /// `Reader`: its map of the whole 71.8 GB file made every n-gram row
+    /// read wait in NTFS for the one before it (~0.15 ms a read).
+    artifact_hash: ArtifactHash,
     /// The weight arena and the device, freed together (`DeviceWeights`).
     weights: DeviceWeights,
 }
@@ -144,6 +147,10 @@ impl FlashNextLeaf {
             0 => None,
             bytes => Some(HostArena::create(bytes)?),
         };
+        let artifact_hash = ArtifactHash::from_bytes(reader.content_hash());
+        // Unmapped here: everything after the load reads the file through
+        // its own handles (the n-gram table, nothing else).
+        drop(reader);
         Ok(Self {
             counters,
             arena,
@@ -154,7 +161,7 @@ impl FlashNextLeaf {
             geometry,
             config,
             options,
-            reader,
+            artifact_hash,
             weights,
         })
     }
@@ -406,7 +413,7 @@ impl StepLeaf for FlashNextLeaf {
     /// drafter. A 27B blob differs in the artifact and the version both.
     fn blob_identity(&self) -> BlobIdentity {
         BlobIdentity::of_load(
-            ArtifactHash::from_bytes(self.reader.content_hash()),
+            self.artifact_hash,
             self.options.kv_format,
             None,
             self.layout_version.get().copied().unwrap_or(0),
