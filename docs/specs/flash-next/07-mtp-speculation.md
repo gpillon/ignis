@@ -602,6 +602,62 @@ served expert cache.
 - The clone lanes are a proxy for the verify: phase C's c(w) is the number
   of record.
 
+## Phases C-D as built (2026-10-06)
+
+Code: `kernel/src/flash_next/{verify,speculative,mtp}.{h,cu}`, `bind_mtp`
+(`bind.cu`), `ignis_artifact::flash_next::mtp`, `ignis_core::flash_next_mtp`.
+Where the build departs from the text above:
+
+- **k adapts to a row budget by width, not per round.** A round of w lanes
+  verifies `k = min(draft_tokens, budget / w - 1)` drafts per lane
+  (`draft_row_budget`, 0 = the decode route's 8; `flash_next_window`); a
+  width whose k is 0 runs the one-token round. One pass graph and one commit
+  graph per width. `--spec mtp` defaults to 2 draft tokens (phase A's
+  projection), `--draft-tokens` forces at most k, `--draft-rows` names the
+  budget, `--spec off` turns it off; MTP is on by default with the companion
+  present.
+- **The round is two graphs with the host between them**: the pass (save,
+  record-mode trunk, head, accept) and, after the host's stop cut, the commit
+  (fold, then the head's drafting, then the restore). The cut is not on the
+  device.
+- **GDN rollback** is the vendored replay record in the pass and our fold in
+  the commit, whose per-token step is the vendored `recurrent_bf16_body` in
+  Fold mode -- the step the decode snapshot runs, so the folded state is bit
+  for bit what c one-token rounds leave (leaf test
+  `test_flash_next_verify.cu`). The conv taps are rebuilt from the recorded
+  conv inputs.
+- **The rest is saved, not recorded**: the pass saves each lane's indexer
+  tails, n-gram conv columns, hq ring words and the ring rows its positions
+  overwrite; the commit rebuilds the tails from the saved tail and the raw
+  keys the indexer copies out, the n-gram conv as tail9(saved || inputs) (the
+  inputs are the last columns of the post-pass state, since k + 1 <= 9), and
+  restores the rejected positions' ring rows and words -- a rejected column
+  is a column never drafted, which the whole-model test checks bit for bit
+  on the next step's logits.
+- **MTP entries are stored at p**, not p + 1: entry (S_p, t[p+1]) is written
+  once t[p+1] is known -- a prefill chunk's from the span's next id (the
+  span's last from the token just drawn), a one-token round's from the token
+  it drew, the verify commit's from the licensed tokens -- so the head's
+  frontier is always the sequence's and no stack outlives a round. There is
+  no continuation-stack section: a restored or claimed sequence runs one
+  round at extent 0, which drafts. A claim of a prefix whose last entry was
+  built from the publisher's own next token is the known gap (the claimant's
+  first entry past the prefix is right, the prefix's last one is the
+  publisher's): an acceptance cost, never a different text.
+- **Drafts are the head's argmax at every temperature.** The vendored accept
+  treats a draft as a one-hot proposal, which is distribution-preserving for
+  an argmax drafter; no draft RNG.
+- **The head's chained steps write past the frontier** (up to 2k positions),
+  so on an MTP load the pass saves and the commit restores ring rows over 2k
+  positions, and the commit restores the indexer tails after the chain.
+- **Drafts reach the host** through `ignis_decode_options::out_drafts`
+  (`LaneVerifyRun::next_drafts`), because the n-gram rows of a round's
+  columns are hashed on the host before it.
+- **Observability**: `ignis_speculative_{rounds,drafted_tokens,
+  accepted_tokens}_total` and `ignis_speculative_position_{drafted,
+  accepted}_total{position}` on /metrics, and a Speculation card on the
+  Monitor.
+
 ## Out of Scope
 
 - **Adaptive draft width:** a measured follow-up, after AC6.
