@@ -236,7 +236,7 @@ Implication 2 asked what fills the time between `cudaStreamSynchronize` returnin
   - Kernel frames stay unresolved.
 - `dump1.py` and `dump2.py` print one round's raw events.
 - Context switches set the times; the samples only name what runs. On Windows a switch-in carries the stack the thread waited in, and readying another thread also records a stack. So in windows under ~100 µs, sample counts are not time.
-- Node tracing inflates the `cudaGraphLaunch` call to 1,669 µs (0.42-0.46 ms without it) and the period to 14.4 ms. The client ITL p50 is 13.5-13.6 ms in this capture and 12.0-12.5 ms without a profiler. The gap itself is in line with the untraced captures above: 2.07 ms mean here, 1.49-1.98 ms there.
+- Node tracing inflates the `cudaGraphLaunch` call to 1,669 µs (0.42-0.46 ms without it) and the period to 14.4 ms. The two completed requests ran at 13.5-13.6 ms ITL p50 with nsys attached; the window covers at most the tail of the second (the request open at its end was cut). Without a profiler the ITL is 12.0-12.5 ms. The gap itself is in line with the untraced captures above: 2.07 ms mean here, 1.49-1.98 ms there.
 
 **Per round, decode thread, mean of 416 rounds (µs).**
 
@@ -253,13 +253,16 @@ Implication 2 asked what fills the time between `cudaStreamSynchronize` returnin
 - **Without file reads there is no gap.** The 4 rounds whose rows were all hot have a 64 µs gap; the 27B's is 44 µs.
 - In the gap, the decode thread waits nowhere outside `collect_and_gather`.
 - Sampling readback, the residency mirror, the detokenizer/SSE and telemetry do not show on the decode thread in the gap. Token emission is the `drain_tokens` hand-off above.
-- The gap follows the read count. A round makes 10.4 file reads on average (0-16, bimodal at 7-8 and 13-14), ~4.2 KB each (`fn-gm` counters).
-  - Rounds with 3-8 reads have a gap of 1,232-1,602 µs.
-  - Rounds with 9-16 reads have a gap of 2,329-2,611 µs.
+- **The gap follows the read count.** A read is counted as one reader I/O wait.
+  - A round makes 12.4 file reads on average, the same as the decode thread's wakes. The count runs 0-18, bimodal at 8 and 15-16.
+  - A read is ~4.2 KB (`fn-gm` counters).
+  - Rounds with 8 reads (136 of them) have a 1,404 µs gap. Rounds with 15 or 16 reads (217) have 2,450 and 2,629 µs.
+  - Fit: gap ≈ 192 µs + 152 µs per read (R² 0.84).
 
-**The reads serialize below the pool.**
-- **Concurrency adds no throughput.** One read alone takes 114 µs (p50), like the emulation's 0.11 ms. With 2, 3 or 4 in flight a read takes 385, 434 or 457 µs. The four workers keep 2.3 reads in flight on average, but the reads complete about one at a time.
-- **The readers wait on an executive resource.** Of the 10.4 reads per round, 9.6 wait in nsys's `Resource` state inside `NtReadFile` (412 µs mean), under `Ntfs.sys` and `FLTMGR.SYS`. Only 0.8 per round wait as plain I/O (102 µs mean).
+**The reads run one at a time, below the pool.**
+- **A read's own I/O is fast.** Its I/O wait is 105 µs mean, like the emulation's 0.11 ms per read.
+- **Nearly every read first waits on an executive resource.** 11.4 of the 12.4 reads per round wait in nsys's `Resource` state inside `NtReadFile`, 410 µs mean, under `Ntfs.sys` and `FLTMGR.SYS`. Every read but about the first in a round waits for the one before it.
+- The four workers issue 2-4 reads at once, yet the reads complete ~150 µs apart (the fit's slope).
 - Reader time on the queue `Mutex<Receiver>` is idle time between rounds, as designed; it is not on the path.
 
 **Cause: the artifact's memory map.**
@@ -277,7 +280,7 @@ Implication 2 asked what fills the time between `cudaStreamSynchronize` returnin
 | mapped, unbuffered, after the buffered arm | 2,286 | 2,336 |
 | unmapped again, unbuffered | 313 | 344 |
 
-- **Mapped, the unbuffered gather is 3.7-7.5 times slower**: 96-190 µs per read, which brackets the engine's ~140-180. Unmapping restores 0.31 ms.
+- **Mapped, the unbuffered gather is 3.7-7.5 times slower**: 96-190 µs per read, which brackets the engine's ~150. Unmapping restores 0.31 ms.
 - The slowdown grows after the buffered arm. This suggests the cost scales with the file's cached pages, and the server's map is warm from the load. This is not isolated.
 - What NTFS does on this path (which resource it takes, and why reads wait for it) is not traced: the kernel frames are unsymbolized.
 
@@ -285,11 +288,11 @@ Implication 2 asked what fills the time between `cudaStreamSynchronize` returnin
 1. **Unmap the artifact after load: about −1.4 to −1.6 ms (~+12-14% tok/s).**
    - Keep the content hash and drop the `Reader` at the end of `FlashNextLeaf::open`.
    - Check that no other handle keeps the file mapped or cached. The residency fill and the table's hot-row load run only at load.
-   - Expected result: the gather runs at the emulation's ~0.3 ms for 10-12 reads.
+   - Expected result: the gather runs at the emulation's ~0.3 ms for 12 reads.
    - Verify with the same admin capture: the reader waits leave `Resource`, and the gap falls to ~0.4 ms.
 2. **One wake per gather: −0.1 to −0.2 ms once fix 1 lands.** Today the 12.4 park/wake cycles (~27 µs each, with the readied-to-running latency) overlap the reads. Once the reads are fast, the cycles are as long as the reads. The fix: the last reader to finish wakes the decode thread once, with a countdown.
-3. **All reads in flight at once: up to −0.15 ms after fix 1.** One overlapped submit, or a worker per read, instead of 4 workers taking 3-4 waves.
-4. **Fewer file reads.** In `fn-gm` (prefill plus 1,800 tokens), the 1 GiB hot cache served 24% of rows: 13,871 of 56,848. Each read saved is worth ~0.1 ms after fix 1 and 0.14-0.18 ms before it. A larger hot set costs host RAM.
+3. **All reads in flight at once: up to −0.15 ms after fix 1.** One overlapped submit, or a worker per read, instead of 4 workers taking 2-4 waves.
+4. **Fewer file reads.** In `fn-gm` (prefill plus 1,800 tokens), the 1 GiB hot cache served 24% of rows: 13,871 of 56,848. Each read saved is worth ~0.1 ms after fix 1 and ~0.15 ms before it. A larger hot set costs host RAM.
 5. **Staging: −0.05 to −0.1 ms.** Replace the 6 pageable copies (112 µs here, 80 µs in the graph-level capture) with one pinned buffer and one copy, or with memcpy nodes in the graph.
 6. **`cudaGraphLaunch`: 0.42-0.46 ms untraced.** Fewer graph nodes shrink it (implication 2).
 7. The 79 µs before the gather (token hand-off, hash, plan, sends) is not worth taking on.
