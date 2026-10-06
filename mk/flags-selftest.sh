@@ -47,6 +47,12 @@ lacks "default" "$out" "--draft-rows"
 out="$(flags MODEL=flash-next SPEC=off)"
 has "SPEC=off" "$out" "--spec off"
 
+# The server refuses a window beside --spec off, so the 27B's default
+# DRAFT_TOKENS=7 must not ride along when SPEC=off turns speculation off.
+out="$(flags SPEC=off)"
+has "27B SPEC=off" "$out" "--spec off"
+lacks "27B SPEC=off" "$out" "--draft-tokens"
+
 if [ "$failed" -ne 0 ]; then
     printf 'flags-selftest: %d failure(s)\n' "$failed" >&2
     exit 1

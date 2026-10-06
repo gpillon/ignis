@@ -98,7 +98,7 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(filter 1,$(VISION)),--vision $(if $(VISION_MAX_TOKENS),--vision-max-tokens $(VISION_MAX_TOKENS))) \
   $(if $(ROPE_SCALING),--rope-scaling $(ROPE_SCALING)) \
   $(if $(REQUEST_TIMEOUT),--request-timeout $(REQUEST_TIMEOUT)) \
-  $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--draft-head $(DRAFT_HEAD)))   $(if $(DRAFT_ROWS),--draft-rows $(DRAFT_ROWS))
+  $(if $(SPEC),--spec $(SPEC) $(if $(filter-out off,$(SPEC)),$(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--draft-head $(DRAFT_HEAD))))   $(if $(DRAFT_ROWS),--draft-rows $(DRAFT_ROWS))
 SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(SERVED_MODEL),--model $(SERVED_MODEL)) \

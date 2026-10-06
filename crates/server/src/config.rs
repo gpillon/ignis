@@ -538,7 +538,20 @@ pub fn resolve(
     };
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation_off = non_empty(spec.clone().or_else(|| env("IGNIS_SPEC"))).is_some_and(|s| s.trim() == "off");
-    let speculation = if speculation_off { None } else { resolve_speculation(spec, draft_tokens, draft_head, &env)? };
+    let speculation = if speculation_off {
+        // `--spec off` has nothing to size or to score with: a window or a head
+        // named beside it was meant for a backend, so it is refused, not dropped.
+        for (flag, var, value) in
+            [("--draft-tokens", "IGNIS_DRAFT_TOKENS", &draft_tokens), ("--draft-head", "IGNIS_DRAFT_HEAD", &draft_head)]
+        {
+            if let Some(raw) = non_empty(value.clone().or_else(|| env(var))) {
+                return Err(ConfigError(format!("`{flag} {raw}` has nothing to configure under `--spec off`")));
+            }
+        }
+        None
+    } else {
+        resolve_speculation(spec, draft_tokens, draft_head, &env)?
+    };
     let draft_rows = non_empty(draft_rows.or_else(|| env("IGNIS_DRAFT_ROWS")))
         .map(|raw| {
             raw.trim()
@@ -865,6 +878,11 @@ fn resolve_speculation(
         .map(|raw| ProposalHead::parse(&raw).map_err(|e| ConfigError(format!("`--draft-head`: {e}"))))
         .transpose()?
         .unwrap_or_default();
+    // The MTP head proposes from its own logits: there is no second head to
+    // choose, so naming the shortlist would be silently ignored.
+    if backend == SpeculativeBackend::Mtp && proposal_head != ProposalHead::Full {
+        return Err(ConfigError("`--draft-head`: `--spec mtp` has no proposal head to choose".to_owned()));
+    }
     let Some(raw) = draft_tokens else {
         // GitHub #307: Flash-Next's head has a measured default window.
         if backend == SpeculativeBackend::Mtp {
@@ -2310,6 +2328,26 @@ mod tests {
         let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--draft-head", "tiny"]);
         let err = resolve(&a, no_env).expect_err("unknown head");
         assert!(err.0.contains("--draft-head") && err.0.contains("tiny"), "{}", err.0);
+    }
+
+    #[test]
+    fn mtp_takes_no_proposal_head_and_spec_off_takes_no_draft_options() {
+        let a = args(&["--spec", "mtp", "--draft-head", "shortlist"]);
+        let err = resolve(&a, no_env).expect_err("mtp has one head");
+        assert!(err.0.contains("--draft-head") && err.0.contains("mtp"), "{}", err.0);
+        let a = args(&["--spec", "mtp", "--draft-tokens", "2", "--draft-head", "shortlist"]);
+        assert!(resolve(&a, no_env).is_err());
+        let a = args(&["--spec", "mtp", "--draft-head", "full"]);
+        assert!(resolve(&a, no_env).is_ok(), "naming the only head is harmless");
+
+        let err = resolve(&args(&["--spec", "off", "--draft-tokens", "7"]), no_env).expect_err("dropped window");
+        assert!(err.0.contains("--draft-tokens") && err.0.contains("off"), "{}", err.0);
+        let err = resolve(&args(&["--spec", "off", "--draft-head", "shortlist"]), no_env).expect_err("dropped head");
+        assert!(err.0.contains("--draft-head"), "{}", err.0);
+        let env = env_map(&[("IGNIS_SPEC", "off"), ("IGNIS_DRAFT_TOKENS", "3")]);
+        assert!(resolve(&[], env).is_err());
+        let config = expect_config(resolve(&args(&["--spec", "off"]), no_env).expect("off alone"));
+        assert!(config.speculation.is_none());
     }
 
     #[test]
