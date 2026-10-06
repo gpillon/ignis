@@ -365,6 +365,36 @@ At one lane, greedy, the ITL falls by 2.3 ms per token: 1.0 + 1.0 + 0.3.
 
 Raw material in `.scratch/dec2-306/` (rate logs, the builds' exes, `trace.sh`, `prompt_greedy.json`) and `.scratch/fn-decode-prof-306/` (`dec2-*`, `g-*` captures: never commit the `.nsys-rep`).
 
+## KV format: BF16 against hq-e8-2b (2026-10-06, dec2)
+
+hq-e8-2b stays the default. This section measures what BF16 KV would cost a decode at the same flags.
+
+**Setup.**
+- One exe for both formats: the `5490c26` build. Flags as `rate.sh`, plus `--metrics`.
+- `.scratch/dec2-306/kv.sh` runs one greedy lane for ~70 s, then three lanes with three different greedy prompts for ~100 s. Three distinct texts, so the lanes do not share their experts as the identical greedy lanes above do.
+- Hit rate and bytes per token are deltas of `/metrics` over each phase (`ignis_expert_cache_*_total`, `ignis_expert_bytes_moved_total`, `ignis_decoded_tokens_total`). The plan line is the load's `ignis.runtime.flash_next_plan` log event.
+- The VRAM budget follows the VRAM free at load (the desktop's use varied by ~0.8 GB between runs), so the budget line differs by up to 0.5 GB.
+
+**At `--max-context 131072` (the default), BF16 does not load.** The 3-lane pool would take ~10.8 GB and leave the expert cache 8.0 GB, below its 12 GB floor. hq-e8-2b: pool 2.05 GB, expert cache 16.14 GB.
+
+**At `--max-context 32768`, both load:**
+
+| | hq-e8-2b | BF16 |
+|---|---:|---:|
+| plan: KV pool / expert cache / budget (GB) | 0.81 / 16.58 / 26.25 | 2.84 / 15.03 / 26.74 |
+| 1 lane: tok/s (requests 1-4) | 98.3 / 96.0 / 96.8 / 97.8 | 93.5 / 94.1 / 93.9 / 94.4 |
+| 1 lane: ITL p50 | 10.0 ms | 10.15-10.47 ms |
+| 1 lane: decode hit rate, MB moved per token | 97.45%, 59.6 | 96.40%, 73.6 |
+| 3 distinct lanes: tok/s per lane (first requests), aggregate | 38.3, 114.8 | 32.0, 96.1 |
+| 3 distinct lanes: ITL p50 | 25.2-25.4 ms | 30.5 ms |
+| 3 distinct lanes: decode hit rate, MB moved per token | 91.63%, 80.6 | 88.63%, 101.7 |
+
+- **BF16 costs ~3% at one lane and 16% at three.** The BF16 pool takes 2.0 GB more VRAM; the expert cache gets 1.55 GB less. The hit rate drops by 1 to 3 points, and every token moves 14-21 MB more over the link.
+- Inferred, not separated: at contexts under 2K, most of the loss is the smaller expert cache, not attention's reads, which BF16 makes larger.
+- **Prefill against decode picks** (mtpA's `flash_next_mtp_phase_a divergence`, recorded in [MTP phase A](2026-10-06-flash-next-mtp-phase-a.md), three prompts, 1,533 positions per format): hq-e8-2b differs at 201 (13.1%, max margin 3.6 logits), BF16 at 74 (4.8%, max 0.875). Not re-run here: the dec2 commits leave a decode's numbers bit for bit as they were.
+
+Raw material in `.scratch/dec2-306/`: `kv.sh`, `kv_summary.py`, `kv*.server.log`, `kv*.m{0,1,2}.txt`, `kv*.lane*.jsonl`.
+
 ## Follow-ups
 
 Status lives in https://github.com/gpillon/ignis/issues/306.
@@ -372,3 +402,4 @@ Status lives in https://github.com/gpillon/ignis/issues/306.
 - Shorten the residency prefetch branch, now the longest overlap (78-324 µs of exposed prefetch per round): fold `rank_lookahead` into `resolve_prefetch`, and test the candidates' residency in parallel rather than one at a time.
 - Host-gap fixes 2, 3 and 5 (one wake per gather, every read in flight at once, one pinned staging copy): ~0.05-0.2 ms each, worth a dedicated A/B on the greedy prompt.
 - A wider `router_select` (3.5 µs per layer on one CTA), and implication 4 (demand copies, ~1.0-1.35 ms per round).
+- BF16 KV at long contexts: it needs a shorter `--max-context` (32K loads, 131K does not), or a smaller expert-cache floor.
