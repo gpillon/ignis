@@ -97,12 +97,13 @@ pub fn mtp_identity() -> ArtifactIdentity {
 }
 
 /// Which container a work tree packs into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Family {
     /// The model: frontend, globals, the n-gram unit, the layers.
     Main,
-    /// The MTP head's companion (layout.md §13): the one unit `mtp/`.
-    Mtp,
+    /// The MTP head's companion (layout.md §13): the one unit `mtp/`,
+    /// pinned to the main container `pair_main`.
+    Mtp { pair_main: PathBuf },
 }
 
 /// What one [`pack`] call is asked to do.
@@ -125,9 +126,6 @@ pub struct PackOptions {
     /// `dry-run` or a fixture's `fixture` only when asked for).
     pub accept_status: Vec<String>,
     pub family: Family,
-    /// The main container an [`Family::Mtp`] companion belongs to (required
-    /// there, refused for the main family).
-    pub pair_main: Option<PathBuf>,
 }
 
 impl PackOptions {
@@ -143,7 +141,6 @@ impl PackOptions {
             delete_batch_bytes: DEFAULT_DELETE_BATCH_BYTES,
             accept_status: vec!["complete".into()],
             family: Family::Main,
-            pair_main: None,
         }
     }
 
@@ -153,8 +150,7 @@ impl PackOptions {
         Self {
             identity: mtp_identity(),
             header_bytes: MTP_HEADER_BYTES,
-            family: Family::Mtp,
-            pair_main: Some(pair_main),
+            family: Family::Mtp { pair_main },
             ..Self::new(work_dir, artifact, geometry)
         }
     }
@@ -195,10 +191,10 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// The units of `family` in container order.
-pub fn family_units(family: Family, layers: usize) -> Vec<String> {
+pub fn family_units(family: &Family, layers: usize) -> Vec<String> {
     match family {
         Family::Main => unit_names(layers),
-        Family::Mtp => vec!["mtp".into()],
+        Family::Mtp { .. } => vec!["mtp".into()],
     }
 }
 
@@ -225,12 +221,10 @@ struct PackState {
 pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<PackOutcome> {
     let _lock = lock(&options.artifact)?;
     let state_file = state_path(&options.artifact);
-    let units = family_units(options.family, options.geometry.layers);
-    let pair = match (options.family, &options.pair_main) {
-        (Family::Mtp, Some(main)) => Some(pair_record(main)?),
-        (Family::Mtp, None) => return Err(fail("an MTP companion needs the main container it belongs to")),
-        (Family::Main, Some(_)) => return Err(fail("only an MTP companion is paired with a main container")),
-        (Family::Main, None) => None,
+    let units = family_units(&options.family, options.geometry.layers);
+    let pair = match &options.family {
+        Family::Mtp { pair_main } => Some(pair_record(pair_main)?),
+        Family::Main => None,
     };
 
     let mut state = if state_file.exists() {
@@ -1162,15 +1156,15 @@ fn pair_record(main: &Path) -> Result<Value> {
     }))
 }
 
-/// A `converter.json` that names its main container must name this one:
-/// the converter calibrated the head on the file it names, and hashed it.
+/// The companion's `converter.json` names its main container, and it must
+/// be this one: the converter calibrated the head on the file it names,
+/// and hashed it.
 fn check_pair_file(converter: &Value, pair: &Value) -> Result<()> {
+    let ours = pair["file"].as_str().unwrap_or_default();
     match converter.pointer("/pair/main/file").and_then(Value::as_str) {
-        Some(named) if Some(named) != pair["file"].as_str() => Err(fail(format!(
-            "converter.json pairs the head with {named}, this run with {}",
-            pair["file"]
-        ))),
-        _ => Ok(()),
+        Some(named) if named == ours => Ok(()),
+        Some(named) => Err(fail(format!("converter.json pairs the head with {named}, this run with {ours}"))),
+        None => Err(fail("converter.json does not name the head's main container (pair.main.file)")),
     }
 }
 
@@ -1602,23 +1596,21 @@ mod tests {
     }
 
     #[test]
-    fn an_mtp_companion_is_refused_unpaired_or_paired_with_another_container() {
+    fn an_mtp_companion_is_refused_when_its_converter_names_another_main_container_or_none() {
         let main = mtp_tree("mtp-refused");
         let tree = &main.tree;
-        let unpaired = PackOptions { pair_main: None, ..tree.mtp_pack_options(main.path.clone()) };
-        let err = pack(&unpaired, &mut quiet()).unwrap_err().to_string();
-        assert!(err.contains("needs the main container"), "{err}");
-        let paired_main = PackOptions { pair_main: Some(main.path.clone()), ..tree.pack_options() };
-        let err = pack(&paired_main, &mut quiet()).unwrap_err().to_string();
-        assert!(err.contains("only an MTP companion"), "{err}");
-
-        // The converter calibrated on another main container.
         let converter = tree.mtp_work_dir().join("converter.json");
         let mut record = read_json(&converter).unwrap();
         record["pair"]["main"]["file"] = json!("another-v2.ninfer");
         std::fs::write(&converter, record.to_string()).unwrap();
         let err = pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
-        assert!(err.contains("pairs the head with another-v2.ninfer"), "{err}");
+        assert!(err.contains("pairs the head with another-v2.ninfer, this run with qwen3_8_flash_next_fixture-v2.ninfer"),
+                "{err}");
+
+        record["pair"]["main"].as_object_mut().unwrap().remove("file");
+        std::fs::write(&converter, record.to_string()).unwrap();
+        let err = pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains("does not name the head's main container"), "{err}");
         assert!(tree.mtp_work_dir().join("mtp").exists(), "nothing is consumed");
     }
 

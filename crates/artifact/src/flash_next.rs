@@ -422,15 +422,12 @@ pub fn mtp_entries(g: &FlashNextGeometry) -> Vec<Entry> {
             .map(|e| renamed(e, "", MTP_PREFIX)),
     );
     let attention_layer = g.full_attention_interval - 1;
-    let without_ngram = FlashNextGeometry {
-        ple_layer: usize::MAX,
-        ..g.clone()
-    };
     let from = format!("layers.{attention_layer}.");
     let to = format!("{MTP_PREFIX}layers.0.");
     entries.extend(
-        layer_entries(&without_ngram, attention_layer)
+        layer_entries(g, attention_layer)
             .into_iter()
+            .filter(|e| !e.name.starts_with(&format!("{from}ple.")))
             .map(|e| renamed(e, &from, &to)),
     );
     entries

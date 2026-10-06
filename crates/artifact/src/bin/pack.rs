@@ -32,7 +32,7 @@
 use std::path::PathBuf;
 
 use ignis_artifact::flash_next::FlashNextGeometry;
-use ignis_artifact::packer::{pack, PackOptions, PackOutcome, ARTIFACT_FILE_NAME, MTP_ARTIFACT_FILE_NAME};
+use ignis_artifact::packer::{pack, Family, PackOptions, PackOutcome, ARTIFACT_FILE_NAME, MTP_ARTIFACT_FILE_NAME};
 
 const USAGE: &str = "usage: ignis-artifact-pack --work <dir> [--out <artifact.ninfer>] [--layers N] \
                      [--experts N] [--header-mib N] [--accept-status STATUS] [--keep-work] \
@@ -49,7 +49,7 @@ fn main() {
     let mut keep_work = false;
     let mut weights_id = None;
     let mut geometry = FlashNextGeometry::qwen38_flash_next();
-    let mut mtp = false;
+    let mut family = None;
     let mut pair_main = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -72,13 +72,7 @@ fn main() {
                     _ => usage_error("--geometry takes qwen3.8-flash-next or fixture"),
                 }
             }
-            "--family" => {
-                mtp = match args.next().as_deref() {
-                    Some("main") => false,
-                    Some("mtp") => true,
-                    _ => usage_error("--family takes main or mtp"),
-                }
-            }
+            "--family" => family = args.next(),
             "--pair-main" => pair_main = args.next().map(PathBuf::from),
             other => usage_error(&format!("unknown argument: {other}")),
         }
@@ -86,10 +80,20 @@ fn main() {
     let Some(work_dir) = work else {
         usage_error("--work is required");
     };
+    let family = match (family.as_deref(), pair_main) {
+        (None | Some("main"), None) => Family::Main,
+        (Some("mtp"), Some(pair_main)) => Family::Mtp { pair_main },
+        (Some("mtp"), None) => usage_error("--family mtp needs --pair-main"),
+        (None | Some("main"), Some(_)) => usage_error("--pair-main is for --family mtp"),
+        _ => usage_error("--family takes main or mtp"),
+    };
     let artifact = match out {
         Some(out) => out,
         None => match work_dir.parent() {
-            Some(model_dir) => model_dir.join(if mtp { MTP_ARTIFACT_FILE_NAME } else { ARTIFACT_FILE_NAME }),
+            Some(model_dir) => model_dir.join(match family {
+                Family::Main => ARTIFACT_FILE_NAME,
+                Family::Mtp { .. } => MTP_ARTIFACT_FILE_NAME,
+            }),
             None => usage_error("--work has no parent directory: pass --out"),
         },
     };
@@ -100,11 +104,9 @@ fn main() {
         geometry.experts = experts;
     }
 
-    let mut options = match (mtp, pair_main) {
-        (true, Some(main)) => PackOptions::mtp(work_dir, artifact, geometry, main),
-        (true, None) => usage_error("--family mtp needs --pair-main"),
-        (false, Some(_)) => usage_error("--pair-main is for --family mtp"),
-        (false, None) => PackOptions::new(work_dir, artifact, geometry),
+    let mut options = match family {
+        Family::Mtp { pair_main } => PackOptions::mtp(work_dir, artifact, geometry, pair_main),
+        Family::Main => PackOptions::new(work_dir, artifact, geometry),
     };
     if let Some(mib) = header_mib {
         options.header_bytes = match mib.checked_mul(1 << 20) {
