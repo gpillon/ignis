@@ -82,8 +82,9 @@ is the next candidate.
 
 ## Attempt 2026-10-06 (opt)
 
-This was a limited attempt: two kernel experiments on the ticket kernel, both measured in one
-GPU session with the first ticket kernel (v1, `1dbfc2b`) re-measured alongside them. Logs:
+Plan item 2 was v2 (`086d1c5`), which measured 29.8 us and was reverted in `1dbfc2b`. This was a
+limited attempt at the other levers: two kernel experiments on the ticket kernel, both measured
+in one GPU session with the first ticket kernel (v1, `1dbfc2b`) re-measured alongside them. Logs:
 `.scratch/opt/{v1,e1,e2,e2n}-bench.log`. The sources are in `.scratch/opt/{e1f,e2,e2n}/`.
 
 - **E1, fewer round trips per unit.** The call's slots are read into shared memory once. The
@@ -108,18 +109,19 @@ both were reverted and v1 stays.
 
 - **The round trips are not where the L2-resident time goes.** Taking them out (E1) leaves the
   L2-resident time where it was: 23.0 us against 22.4 us.
-- **One gate/up wave helps in the L2 and hurts from DRAM.** E2 cuts at most 0.5 us with the
-  weights in the L2 and is 3.7 us slower with them in DRAM. With every gate/up unit's tiles
-  requested at once (10 MB), every unit waits for the tail of the whole transfer. In v1, the
-  second wave's tiles stream in while the first wave multiplies. The L2-resident diagnostic
-  cannot show this.
+- **One gate/up wave is about even in the L2 and slower from DRAM.** E2 cuts at most 0.5 us with
+  the weights in the L2 and is 3.7 us slower with them in DRAM; the L2-resident diagnostic did
+  not predict that. The next-unit prefetch is not the cause: E2n (29.8 us) is as slow as E2. The
+  cause is not isolated. Candidates are the order in which DRAM delivers a 10 MB first wave
+  (v1's second wave streams in while its first wave multiplies), the first wave's units being
+  40% longer, and the wider A rows. E1's 2.4 us DRAM-side loss is from one run and is not
+  isolated either.
 - **The next unit's weights cannot be held in registers.** Refilling each consumed word with the
   next unit's word (40 registers carried across units) compiles badly: ptxas moves the refills
   to the end of the loop and spills 748 B. This variant was not measured.
 - **Compare only within one run.** v1's 2- and 3-token figures here are 38.0 / 52.5 us, against
   44.1 / 57.1 us in session 2.
 
-Acceptance 6 stays open. At one token the floor depends on the order in which DRAM delivers the
-bytes as much as on the launch's structure. Gate/up tiles have to arrive before the down tiles,
-and each unit has to consume its tiles as they arrive. A launch that only requests more bytes
-earlier makes things worse.
+Acceptance 6 stays open. v1's L2-resident 22 us is still unexplained, and per-unit round trips
+are not it. The next step is a phase trace of v1 (port 086d1c5's `moe_trace.h`), from DRAM and
+from the L2, before another restructuring.
