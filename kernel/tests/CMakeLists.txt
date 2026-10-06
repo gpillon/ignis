@@ -335,6 +335,18 @@ target_compile_definitions(ignis_hq_codec_kv_rows_test PRIVATE
 target_link_libraries(ignis_hq_codec_kv_rows_test PRIVATE ignis_vendor)
 add_test(NAME ignis_hq_codec_kv_rows_test COMMAND ignis_hq_codec_kv_rows_test)
 
+# Spec flash-next/04 acceptance 7 (GitHub #302): the same measurement on real
+# Flash-Next KV rows (kernel/tests/fixtures/hq_kv_rows_flash_next.bin, captured
+# by crates/core/tests/flash_next_kv_fixture_capture_gpu.rs: 2 KV heads, QSA
+# layers 3/19/35/47), held to the tolerances derived from that fixture
+# (IGNIS_HQ_KV_FLASH_NEXT selects them in the test file).
+add_executable(ignis_hq_codec_kv_rows_flash_next_test test_hq_codec_kv_rows.cu)
+target_compile_definitions(ignis_hq_codec_kv_rows_flash_next_test PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_flash_next.bin"
+  IGNIS_HQ_KV_FLASH_NEXT=1)
+target_link_libraries(ignis_hq_codec_kv_rows_flash_next_test PRIVATE ignis_vendor)
+add_test(NAME ignis_hq_codec_kv_rows_flash_next_test COMMAND ignis_hq_codec_kv_rows_flash_next_test)
+
 # GitHub #268 (spec runtime/09): OURS -- the hq-e8-2b verify attention kernel
 # timed alone at the engine's real launch, over code planes encoded from the
 # same committed fixture rows, plus a hash of its partials so two builds can
