@@ -190,7 +190,7 @@ above.
 2. As the owner, I want every candidate input convention scored in one pass, the wrong ones shown near chance, so that the chosen one is a measurement and not a guess.
 3. As the owner, I want a pre-registered GO / NO-GO on the projected one-lane speedup, so that the build starts only when the numbers say it pays.
 4. As the owner, I want the 71.8 GB container untouched and the head shipped as a companion container pinned to it, so that nobody re-downloads the model to get the head.
-5. As the owner, I want a load without `--speculative mtp` to bind nothing of the head, so that today's VRAM plan and graphs are what spec-off runs.
+5. As the owner, I want a load with speculation off (`--spec off`, or no companion beside the artifact) to bind nothing of the head, so that today's VRAM plan and graphs are what spec-off runs.
 6. As the owner, I want speculation chosen at load with a fixed draft width, so that the serving profile is a flag and the graph count stays small.
 7. As the owner, I want greedy spec-on to emit the spec-off tokens, up to the documented near-tie rule, so that one test is the oracle for verify, accept, commit and rollback together.
 8. As the owner, I want sampling at temperature > 0 to stay distribution-preserving with the seed-only RNG, so that a request's output depends on its own seed alone, as on the 27B.
@@ -331,10 +331,14 @@ honour the same mask.
 - the sampling branch is accept with p_target / p_draft and resample from
   the residual, using the stateless RNG keyed by seed, position and purpose.
 
-At temperature > 0 each draft token is *sampled* from the head's processed
-distribution, with the seeded RNG under its own purpose key. That same
-distribution is what the accept rule divides by. An argmax draft under the
-sampling accept would not preserve the target distribution.
+At temperature > 0 the build keeps the head's argmax as the draft (see "Phases
+C-D as built"). The accept rule treats a draft as a one-hot proposal: accept
+with probability p_target(draft), and on rejection resample from the target
+with the draft's mass removed. That is exact for any draft, argmax included,
+so no draft RNG is needed. (The first plan, sampling each draft from the
+head's distribution under its own purpose key and dividing by that
+distribution, would also have been exact, and costs an RNG and a second
+distribution for nothing.)
 
 **The fake drafter.** Phase C ships with three drafters selectable in tests:
 - replay of a recorded spec-off greedy run (all accepted);
@@ -493,7 +497,8 @@ record layouts or copy order.
      pessimistic bound, and AC3 re-projects with the measured c.
 2. **Phase B.** The companion container:
    - holds the 31 tensors in the stated formats, bound only with
-     `--speculative mtp`;
+     MTP, which is on by default when the companion is beside the artifact and
+     off under `--spec off`;
    - its identity check refuses a different main container;
    - `convert.py verify` decodes its experts bit-identical.
    - The quantized head's α₁ is within 0.03 of the BF16 head's on phase A's
@@ -513,8 +518,9 @@ record layouts or copy order.
    - `request_done` carries rounds / drafted / accepted. The acceptance
      counters are exported and on the Monitor.
 5. **Load and plan.**
-   - Without `--speculative mtp` nothing of the head is bound, and the plan
-     and graphs are today's.
+   - With speculation off (`--spec off`, or no companion beside the artifact)
+     nothing of the head is bound, and the plan and graphs are today's. MTP is
+     on by default with the companion, so a plain start binds the head.
    - With it, the plan prints the head's lines. Process plus desktop stays
      ≤ 29 GB at three lanes.
    - The leaf's reported VRAM matches the Rust arithmetic.
@@ -633,7 +639,9 @@ Where the build departs from the text above:
   inputs are the last columns of the post-pass state, since k + 1 <= 9), and
   restores the rejected positions' ring rows and words -- a rejected column
   is a column never drafted, which the whole-model test checks bit for bit
-  on the next step's logits.
+  on the next step's logits. "Bit for bit" holds for BF16 KV only: under
+  hq-e8-2b a verify round is a different grouping of positions than the
+  one-token rounds, so spec on equals spec off up to the near-tie rule.
 - **MTP entries are stored at p**, not p + 1: entry (S_p, t[p+1]) is written
   once t[p+1] is known -- a prefill chunk's from the span's next id (the
   span's last from the token just drawn), a one-token round's from the token
@@ -645,8 +653,9 @@ Where the build departs from the text above:
   first entry past the prefix is right, the prefix's last one is the
   publisher's): an acceptance cost, never a different text.
 - **Drafts are the head's argmax at every temperature.** The vendored accept
-  treats a draft as a one-hot proposal, which is distribution-preserving for
-  an argmax drafter; no draft RNG.
+  treats a draft as a one-hot proposal (accept with p_target(draft), resample
+  from the target with the draft's mass removed), which is exactly
+  distribution-preserving for any draft, argmax included; no draft RNG.
 - **The head's chained steps write past the frontier** (up to 2k positions),
   so on an MTP load the pass saves and the commit restores ring rows over 2k
   positions, and the commit restores the indexer tails after the chain.
