@@ -21,6 +21,15 @@ use super::references::{ReferenceSet, TopRow};
 /// Acceptance 8's floor.
 pub const MMLU_FLOOR: f64 = 0.71;
 
+/// An artifact the owner accepted although its own quantized reference
+/// misses [`MMLU_FLOOR`], named by how many questions that reference answers
+/// right: the figure the decision was taken on. At that artifact acceptance 8
+/// holds the engine to the reference instead of the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedFloorMiss {
+    pub quantized_correct: usize,
+}
+
 /// The reference-set `source` of the windows that carry questions.
 pub const QUESTION_SOURCE: &str = "chunks.json";
 
@@ -224,6 +233,34 @@ pub struct MmluReport {
     /// More lost than gained against BF16 at p ≤ 0.05 (the converter's own
     /// second condition, reported beside the floor).
     pub significantly_below_bf16: bool,
+    /// More lost than gained against the quantized reference at p ≤ 0.05:
+    /// the engine, not the artifact, costing answers.
+    pub significantly_below_quantized: bool,
+}
+
+impl MmluReport {
+    /// The questions the quantized reference answers right.
+    pub fn quantized_correct(&self) -> usize {
+        (self.quantized_accuracy * self.n as f64).round() as usize
+    }
+
+    /// Whether `accepted` names this artifact's own miss of the floor.
+    pub fn floor_miss_accepted(&self, accepted: Option<AcceptedFloorMiss>) -> bool {
+        accepted.is_some_and(|a| a.quantized_correct == self.quantized_correct())
+            && self.quantized_accuracy < MMLU_FLOOR
+    }
+
+    /// Acceptance 8: the floor, or -- at an artifact whose miss `accepted`
+    /// names -- not significantly below the quantized reference. Any other
+    /// artifact, one with a different reference figure included, is held
+    /// to the floor.
+    pub fn verdict(&self, accepted: Option<AcceptedFloorMiss>) -> bool {
+        if self.floor_miss_accepted(accepted) {
+            !self.significantly_below_quantized
+        } else {
+            self.pass
+        }
+    }
 }
 
 /// Judges an engine's answers against the stored streams' answers, all in
@@ -240,6 +277,7 @@ pub fn judge(set: &MmluSet, engine: &[u8], bf16: &[u8], quantized: &[u8]) -> Res
     }
     let (engine_ok, bf16_ok, quantized_ok) = (set.correct(engine), set.correct(bf16), set.correct(quantized));
     let vs_bf16 = paired(&bf16_ok, &engine_ok);
+    let vs_quantized = paired(&quantized_ok, &engine_ok);
     let accuracy = accuracy(&engine_ok);
     Ok(MmluReport {
         n,
@@ -247,8 +285,9 @@ pub fn judge(set: &MmluSet, engine: &[u8], bf16: &[u8], quantized: &[u8]) -> Res
         bf16_accuracy: self::accuracy(&bf16_ok),
         quantized_accuracy: self::accuracy(&quantized_ok),
         vs_bf16,
-        vs_quantized: paired(&quantized_ok, &engine_ok),
+        vs_quantized,
         pass: accuracy >= MMLU_FLOOR,
         significantly_below_bf16: vs_bf16.lost > vs_bf16.gained && vs_bf16.p <= 0.05,
+        significantly_below_quantized: vs_quantized.lost > vs_quantized.gained && vs_quantized.p <= 0.05,
     })
 }

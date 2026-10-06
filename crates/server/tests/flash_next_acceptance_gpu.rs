@@ -8,7 +8,8 @@
 //!   (acceptance 5) and the 8192-token windows, the sparse QSA path
 //!   (acceptance 6), each within `max(1.1 q, q + 0.01)` of the converter's
 //!   quantization-only figure; the MMLU-Pro proxy at least 71%, paired
-//!   against the BF16 and quantized answers (acceptance 8).
+//!   against the BF16 and quantized answers (acceptance 8) -- at this
+//!   artifact, the owner's accepted miss below ([`ACCEPTED_MMLU_MISS`]).
 //! - On hq-e8-2b, the serving default: the same per-domain KLD, reported
 //!   beside the BF16 figures (acceptance 7), not judged.
 //!
@@ -29,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 use ignis_artifact::packer::{ARTIFACT_FILE_NAME, sidecar_path};
 use ignis_bench::flash_next::kld::{self, DomainVerdict};
+use ignis_bench::flash_next::mmlu::AcceptedFloorMiss;
 use ignis_bench::flash_next::references::{ConverterRecord, ReferenceSet};
 use ignis_bench::flash_next::{RowSink, SpanLogits, run_acceptance, run_set};
 use ignis_core::KvFormat;
@@ -37,6 +39,16 @@ use ignis_core::gpu_profile;
 
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 const CHUNKS: &str = "F:/ai/opencode/inference/.scratch/flash-next-compression-2026-10-03/real/ood/chunks.json";
+
+/// Acceptance 8's floor is missed by the artifact itself: its quantized
+/// reference (the converter's torch run) answers 197 of the 281 questions,
+/// 70.11%, three short of 71%. The owner accepted the 2.5-bit artifact
+/// knowing that (2026-10-06: "ok a 2.5 bit se è solo MMLU" -- fine at 2.5
+/// bits if only MMLU misses). So at this artifact the floor is reported as the artifact's accepted miss, and the
+/// engine is held to the reference instead: not significantly below it
+/// (McNemar, more lost than gained at p <= 0.05 fails). A re-converted
+/// artifact with any other figure is held to the floor again.
+const ACCEPTED_MMLU_MISS: Option<AcceptedFloorMiss> = Some(AcceptedFloorMiss { quantized_correct: 197 });
 
 /// The scorers' view of the engine.
 struct Engine(FlashNextEngine);
@@ -94,7 +106,7 @@ fn acceptance_4_to_8_on_bf16_kv_and_the_hq_kld_beside_it() {
         let Some(mut engine) = load(&dir, KvFormat::Bf16) else { return };
         run_acceptance(&mut engine, &references, &record, &chunks).unwrap_or_else(|e| panic!("BF16 KV: {e}"))
     };
-    eprintln!("BF16 KV:\n{}", acceptance.render());
+    eprintln!("BF16 KV:\n{}", acceptance.render_with(ACCEPTED_MMLU_MISS));
 
     let (hq_2048, hq_8192) = {
         let Some(mut engine) = load(&dir, KvFormat::HqE8_2b) else { return };
@@ -108,5 +120,9 @@ fn acceptance_4_to_8_on_bf16_kv_and_the_hq_kld_beside_it() {
     print_kld("hq-e8-2b KV, 2048-token windows (acceptance 7, reported)", &hq_2048);
     print_kld("hq-e8-2b KV, 8192-token windows (acceptance 7, reported)", &hq_8192);
 
-    assert!(acceptance.pass(), "Flash-Next acceptance 4-6 and 8 on BF16 KV:\n{}", acceptance.render());
+    assert!(
+        acceptance.pass_with(ACCEPTED_MMLU_MISS),
+        "Flash-Next acceptance 4-6 and 8 on BF16 KV:\n{}",
+        acceptance.render_with(ACCEPTED_MMLU_MISS)
+    );
 }

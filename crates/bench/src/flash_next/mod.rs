@@ -33,7 +33,7 @@ use std::path::Path;
 use crate::oracle::Fixture;
 use g1::G1Run;
 use kld::{DenseRow, DomainVerdict, KldReport, KldTally};
-use mmlu::{MmluReport, MmluSet};
+use mmlu::{AcceptedFloorMiss, MmluReport, MmluSet};
 use references::{ConverterRecord, ReferenceSet};
 
 /// Where an engine hands its rows: `(first_row, rows)`.
@@ -203,13 +203,24 @@ pub struct Acceptance {
 
 impl Acceptance {
     pub fn pass(&self) -> bool {
+        self.pass_with(None)
+    }
+
+    /// [`Self::pass`], acceptance 8 judged by [`MmluReport::verdict`] with
+    /// the owner's accepted floor miss, if any.
+    pub fn pass_with(&self, accepted: Option<AcceptedFloorMiss>) -> bool {
         self.g1.pass
             && self.kld_2048.iter().chain(&self.kld_8192).all(|v| v.pass)
-            && self.mmlu.pass
+            && self.mmlu.verdict(accepted)
     }
 
     /// The verdicts as plain text: every domain, every G1 mismatch.
     pub fn render(&self) -> String {
+        self.render_with(None)
+    }
+
+    /// [`Self::render`], with acceptance 8 as [`Self::pass_with`] judges it.
+    pub fn render_with(&self, accepted: Option<AcceptedFloorMiss>) -> String {
         let verdict = |pass: bool| if pass { "pass" } else { "FAIL" };
         let mut out = String::new();
         let compared: usize = self.g1.results.iter().map(|r| r.compared).sum();
@@ -245,26 +256,34 @@ impl Acceptance {
             }
         }
         let m = &self.mmlu;
+        let floor = if m.pass {
+            "pass"
+        } else if m.floor_miss_accepted(accepted) {
+            "missed by the artifact itself, accepted by the owner; judged against the quantized reference"
+        } else {
+            "FAIL"
+        };
         let _ = writeln!(
             out,
-            "MMLU-Pro proxy (acceptance 8): {:.2}% of {} (BF16 {:.2}%, quantized {:.2}%), floor 71%: {}",
+            "MMLU-Pro proxy (acceptance 8): {:.2}% of {} (BF16 {:.2}%, quantized {:.2}%), floor 71%: {floor}",
             100.0 * m.accuracy,
             m.n,
             100.0 * m.bf16_accuracy,
             100.0 * m.quantized_accuracy,
-            verdict(m.pass)
         );
         let _ = writeln!(
             out,
-            "  vs BF16: lost {} gained {} p {:.4}{}; vs quantized: lost {} gained {} p {:.4}",
+            "  vs BF16: lost {} gained {} p {:.4}{}; vs quantized: lost {} gained {} p {:.4}{}",
             m.vs_bf16.lost,
             m.vs_bf16.gained,
             m.vs_bf16.p,
             if m.significantly_below_bf16 { " (significantly below)" } else { "" },
             m.vs_quantized.lost,
             m.vs_quantized.gained,
-            m.vs_quantized.p
+            m.vs_quantized.p,
+            if m.significantly_below_quantized { " (significantly below)" } else { "" },
         );
+        let _ = writeln!(out, "acceptance 8: {}", verdict(m.verdict(accepted)));
         out
     }
 }

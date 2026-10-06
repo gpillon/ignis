@@ -602,3 +602,41 @@ fn the_quantized_model_through_the_seam_meets_its_own_figures_and_a_noisy_engine
     assert!(text.contains("FAIL"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Acceptance 8 at an artifact whose own quantized reference misses the
+/// floor and which the owner accepted so (2026-10-06): the engine is held to
+/// that reference, and only at the artifact the decision names.
+#[test]
+fn an_accepted_floor_miss_holds_the_engine_to_the_quantized_reference() {
+    let report = |quantized_correct: usize, lost: usize, gained: usize| {
+        let vs_quantized = mmlu::Paired { lost, gained, p: mmlu::mcnemar_p(lost, gained) };
+        mmlu::MmluReport {
+            n: 281,
+            accuracy: (quantized_correct + gained - lost) as f64 / 281.0,
+            bf16_accuracy: 207.0 / 281.0,
+            quantized_accuracy: quantized_correct as f64 / 281.0,
+            vs_bf16: mmlu::Paired { lost: 17, gained: 7, p: mmlu::mcnemar_p(17, 7) },
+            vs_quantized,
+            pass: (quantized_correct + gained - lost) as f64 / 281.0 >= mmlu::MMLU_FLOOR,
+            significantly_below_bf16: false,
+            significantly_below_quantized: lost > gained && vs_quantized.p <= 0.05,
+        }
+    };
+    let accepted = Some(mmlu::AcceptedFloorMiss { quantized_correct: 197 });
+
+    // This artifact (197 of 281 = 70.11%), the engine even with it.
+    let even = report(197, 5, 5);
+    assert_eq!(even.quantized_correct(), 197);
+    assert!(!even.verdict(None), "without the decision the floor stands");
+    assert!(even.verdict(accepted));
+    // The engine losing answers the reference has: an engine regression.
+    let below = report(197, 20, 3);
+    assert!(below.significantly_below_quantized);
+    assert!(!below.verdict(accepted));
+    // Another artifact below the floor is not the one the owner accepted.
+    assert!(!report(190, 2, 2).verdict(accepted));
+    // An artifact at the floor is held to it.
+    let at_floor = report(205, 10, 0);
+    assert!(!at_floor.floor_miss_accepted(accepted));
+    assert_eq!(at_floor.verdict(accepted), at_floor.pass);
+}
