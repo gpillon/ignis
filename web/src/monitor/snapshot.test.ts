@@ -109,8 +109,9 @@ describe("readSnapshot", () => {
     const moved = readSnapshot(parseExposition(IGNIS_EXPOSITION));
     // 8 plain counters, 3 reject reasons, 24 retained series, 3 skips, then
     // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 2
-    // n-gram rows, 2 reads, and 2 histogram counts.
-    expect(counterValues(empty)).toHaveLength(80);
+    // n-gram rows, 2 reads, the 3 speculative totals (GitHub #307), and 2
+    // histogram counts.
+    expect(counterValues(empty)).toHaveLength(83);
     expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
     const flashNext = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
     expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(80);
@@ -141,6 +142,29 @@ describe("readSnapshot", () => {
     expect(experts.slots.down_k2).toEqual({ capacity: 3000, inUse: 2999 });
     expect(experts.slots.down_k4).toEqual({ capacity: 0, inUse: 0 });
     expect(s.ngram).toEqual({ rows: { hot: 190_000, file: 10_000 }, reads: 6000, readBytes: 24_576_000 });
+  });
+
+  // GitHub #307: the speculative family, once a request that ran verify rounds ended.
+  it("reads the speculative counters, per draft position, all in the contract", () => {
+    const spec = [
+      "ignis_speculative_rounds_total 10",
+      "ignis_speculative_drafted_tokens_total 20",
+      "ignis_speculative_accepted_tokens_total 15",
+      ...Array.from({ length: 7 }, (_, j) => `ignis_speculative_position_drafted_total{position="${j + 1}"} ${j < 2 ? 10 : 0}`),
+      ...Array.from({ length: 7 }, (_, j) => `ignis_speculative_position_accepted_total{position="${j + 1}"} ${[8, 7][j] ?? 0}`),
+    ].join("\n");
+    const s = readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}${spec}\n`));
+    expect(s.unknown).toEqual([]);
+    expect(s.speculation).toEqual({
+      rounds: 10,
+      drafted: 20,
+      accepted: 15,
+      positionDrafted: [10, 10, 0, 0, 0, 0, 0],
+      positionAccepted: [8, 7, 0, 0, 0, 0, 0],
+    });
+    expect(readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION)).speculation).toBeNull();
+    const stray = readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}${spec}\nignis_speculative_position_drafted_total{position="8"} 1\n`));
+    expect(stray.unknown).toEqual([{ name: "ignis_speculative_position_drafted_total", labels: { position: "8" }, value: 1 }]);
   });
 
   it("reads the slots' capacity alone from a server without occupancy", () => {

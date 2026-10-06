@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assessHealth, deriveDashboard, deriveMemory, type HealthInput, headerPulse, TOKENS_PER_KV_PAGE } from "./derive.ts";
+import { assessHealth, deriveDashboard, deriveMemory, deriveSpeculation, type HealthInput, headerPulse, TOKENS_PER_KV_PAGE } from "./derive.ts";
 import type { Point } from "./history.ts";
 import { parseExposition } from "./exposition.ts";
 import { FLASH_NEXT_EXPOSITION } from "./fixture.ts";
@@ -300,5 +300,29 @@ describe("assessHealth", () => {
       "8 waiting for a lane",
       "25% of finished requests cancelled",
     ]);
+  });
+});
+
+// GitHub #307: acceptance is read over the window, overall and per draft position.
+describe("deriveSpeculation", () => {
+  const spec = (rounds: number, drafted: number, accepted: number, at1: [number, number], at2: [number, number]) => ({
+    rounds,
+    drafted,
+    accepted,
+    positionDrafted: [at1[0], at2[0], 0, 0, 0, 0, 0],
+    positionAccepted: [at1[1], at2[1], 0, 0, 0, 0, 0],
+  });
+
+  it("reads acceptance, tokens per round and each position's share over the window", () => {
+    const points = [at(0, { speculation: spec(100, 200, 120, [100, 70], [100, 50]) }), at(60_000, { speculation: spec(110, 220, 135, [110, 78], [110, 57]) })];
+    const s = deriveSpeculation(points, 0);
+    expect(s.rounds).toEqual({ total: 110, window: 10 });
+    expect(s.acceptance).toBeCloseTo(15 / 20);
+    expect(s.tokensPerRound).toBeCloseTo(25 / 10);
+    expect(s.byPosition.slice(0, 3)).toEqual([0.8, 0.7, null]);
+  });
+
+  it("is absent from the dashboard until a verify round ran", () => {
+    expect(deriveDashboard([at(0, {})], 60_000)!.speculation).toBeNull();
   });
 });
