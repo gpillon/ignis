@@ -788,6 +788,9 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
         // once either way.
         const int32_t block_first = (chunk - 1) / kSpanLogitRows * kSpanLogitRows;
         const int32_t block_rows = chunk - block_first;
+        // Its own scope: the MTP head's entries below reuse the arena (the copies out of the block
+        // are ordered before them on the stream).
+        auto draw_scope = model->scratch->scope();
         auto *block = static_cast<unsigned char *>(
             model->scratch->alloc_bytes(static_cast<std::size_t>(kSpanLogitRows) * vocab * sizeof(std::uint16_t)).data);
         if (fn_head(g, fn.weights->final_mixer, fn.weights->head, residual_row(block_first), block_rows, block,
