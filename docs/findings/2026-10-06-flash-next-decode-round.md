@@ -167,7 +167,7 @@ Targets ranked by estimated gain per token at one lane, from the 15.7 ms period.
 - Per-kernel costs come from the node capture: +4.6% over the graph replay.
 - The n-gram read time is an emulation with .NET unbuffered reads, not the engine's `ReadPool`.
 - The decode rate drifts between runs (60.6-63.7 tok/s here, 65.3 in the earlier finding) with the expert cache's size and state.
-- The gains above are estimates from these timings and the kernels' byte counts. Items 1, 2 (the host gap's fix 1), 3 and 5 (the shared expert and the combine) were since implemented and measured (attempts below); item 4 was not.
+- The gains above are estimates from these timings and the kernels' byte counts. Item 1, item 2's fix 1, item 3's move of the lookahead off the critical path (not a parallel resolve) and item 5's shared expert and combine were since implemented and measured (attempts below); item 4 was not.
 
 Raw material in the `flash-next` worktree (untracked), `.scratch/fn-decode-prof-306/`:
 - the `.nsys-rep` captures (they embed the process environment: never commit them) and their sqlite exports;
@@ -332,9 +332,9 @@ At one lane, greedy, the ITL falls by 2.3 ms per token: 1.0 + 1.0 + 0.3.
 **1. The artifact is unmapped after load (`bcbe7a2`), host-gap fix 1.**
 - `FlashNextLeaf` keeps the content hash and drops its `Reader` at the end of `open`. The n-gram table reads through its own handle; nothing else needed the map.
 - A graph-level capture (`dec2-unmap-graph`, 484 rounds) puts the host's work between `cudaStreamSynchronize` returning and the next CUDA call at **470 µs** mean (p50 516, p90 673), against 1.49-1.98 ms in the captures above. Sync returns → next `cudaGraphLaunch`: 558 µs.
-- The ITL fell 1.0 ms, under the −1.4 to −1.6 predicted. The prediction started from the admin capture's 2.07 ms gap, which its tracing inflated.
+- The ITL fell 1.0 ms, under the −1.4 to −1.6 predicted. Inferred: the prediction started from the admin capture's 2.07 ms gap, which its tracing inflated.
 - `flash_next_reuse_gpu` now checks the blob identity's artifact hash against the file's own (2/2 pass).
-- Fixes 2, 3 and 5 of the host-gap list were not tried. At a predicted 0.05-0.2 ms each, they would sit inside the noise of one served run. They remain the next host-side items.
+- Fixes 2, 3 and 5 of the host-gap list were not tried. At a predicted 0.05-0.2 ms each, they would sit inside the noise of one served run.
 
 **2. The resolve split in two, its lookahead beside the experts (`c857585`), implication 3.**
 - `resolve_demand` (hits, misses and their copy jobs) stays on the layer's stream. `resolve_prefetch` (the lookahead's candidates) runs on residency's prefetch stream. The stream forks right after the demand resolve, and carries the next layer's router and `rank_lookahead` too.
@@ -343,7 +343,7 @@ At one lane, greedy, the ITL falls by 2.3 ms per token: 1.0 + 1.0 + 0.3.
 - Run back to back on one stream, the two kernels are the old step. `ignis_residency_step` and `_ranked` still run them that way.
 - In situ: `resolve_demand` takes **5.5 µs** per layer (264 µs per round), against `resolve`'s 20.8 µs (1,000 µs). `resolve_prefetch` takes 17.9 µs and `rank_lookahead` 10.3 µs, both on the branch.
 - Node-level span: 10.22 ms (the hcmix build: 11.24 ms; different windows).
-- The branch's copy now starts after ~34 µs of router, rank and resolve, not right after the demand copy. Exposed prefetch rose from 43 to 324 µs per round in this window (78 µs in the step 3 window). Shortening the branch is what is left to take there: fold the rank into `resolve_prefetch`, and test candidates' residency in parallel.
+- The branch's copy now starts after ~34 µs of router, rank and resolve, not right after the demand copy. Exposed prefetch rose from 43 to 324 µs per round in this window (78 µs in the step 3 window).
 - "Parallelize the resolve" beyond the split was not done: the half left on the critical path is 5.5 µs.
 - `ignis_residency_resolve_bench`, synthetic and miss-heavy, at one lane: whole step 118.0 µs, demand half 32.8 µs.
 - Correctness: the residency trace CTest replays the policy model's fixture as split steps too, eagerly and through 31 captured rounds (`ignis_kernel_residency_split_test`, `_graph_split_test`). The whole-step modes, `expert_residency_gpu` (617 steps), `flash_next_forward_gpu` 3/3 (G1 102/102) and `flash_next_reuse_gpu` 2/2 pass.
@@ -352,11 +352,10 @@ At one lane, greedy, the ITL falls by 2.3 ms per token: 1.0 + 1.0 + 0.3.
 - The forward forks a stream of its own after the MoE mix and runs the shared expert there. The combine joins it.
 - At decode widths the combine spreads each row over ten CTAs. Each CTA computes the token's gate with the same reduction, so the bits do not change: the CTest checks three decode-width rows against a 4096-row call.
 - Node-level span: 10.22 → 9.54 ms. Combine: 5.97 → 4.8 µs per layer.
-- Served, the gain is 0.3 ms per token, under the −0.8 to −1.0 predicted for the whole of implication 5. The shared expert's FP8 GEMVs now share bandwidth with the router and the routed experts.
+- Served, the gain is 0.3 ms per token, under the −0.8 to −1.0 predicted for the whole of implication 5. Inferred, not measured: the shared expert's FP8 GEMVs now share bandwidth with the router and the routed experts.
 - Tried and dropped: the GDN layer's small projections on the same side branch, beside its qkv projection.
   - With z, a and b on the branch, the span went 9.54 → 9.58 ms.
-  - With a and b only, a greedy A/B gave 9.75 → 9.72 ms. The GDN kernels' node-sum grew by ~600 µs: GEMVs run concurrently stretch each other.
-- Not tried: a wider `router_select` (3.5 µs per layer at one CTA).
+  - With a and b only, a greedy A/B gave 9.75 → 9.72 ms. The GDN kernels' node-sum grew by ~600 µs; inferred: GEMVs run concurrently stretch each other.
 - Correctness: `flash_next_forward_gpu` 3/3 (G1 102/102; the same arbitrary-id flips as before: 3 wider at one lane, 3 + 1 near-tie at three). The `moe_shared_combine` and `moe_block` CTests pass.
 
 **Limits.**
@@ -365,3 +364,11 @@ At one lane, greedy, the ITL falls by 2.3 ms per token: 1.0 + 1.0 + 0.3.
 - The node-level spans of steps 2 and 3 come from windows with different expert misses (demand copies 1.0-1.35 ms per round).
 
 Raw material in `.scratch/dec2-306/` (rate logs, the builds' exes, `trace.sh`, `prompt_greedy.json`) and `.scratch/fn-decode-prof-306/` (`dec2-*`, `g-*` captures: never commit the `.nsys-rep`).
+
+## Follow-ups
+
+Status lives in https://github.com/gpillon/ignis/issues/306.
+
+- Shorten the residency prefetch branch, now the longest overlap (78-324 µs of exposed prefetch per round): fold `rank_lookahead` into `resolve_prefetch`, and test the candidates' residency in parallel rather than one at a time.
+- Host-gap fixes 2, 3 and 5 (one wake per gather, every read in flight at once, one pinned staging copy): ~0.05-0.2 ms each, worth a dedicated A/B on the greedy prompt.
+- A wider `router_select` (3.5 µs per layer on one CTA), and implication 4 (demand copies, ~1.0-1.35 ms per round).
