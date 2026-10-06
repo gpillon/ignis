@@ -118,6 +118,7 @@ The pool is 37.8 GB and the cache 20.6 GB, so 17.2 GB is not resident. At the li
 - Decode hit rate 94.8%, prefill 93.8%.
 
 **Memory.**
+- **Default changed after this measurement (9695309):** `make ... MODEL=flash-next` now passes `--vram-headroom-bytes 4G` (process + desktop ≤ 32.6 − 4 GB, under AC10's 29 GB) and `--kv-host-pool-bytes 2G`. The budget below was the old default (free − 1G); at the new one the expert cache is ~3 GB smaller (~17.6 GB instead of 20.6), so the decode hit rate and tok/s in this finding were taken with a larger cache than the default now gives. Not re-measured.
 - **VRAM plan** (`ignis.runtime.flash_next_plan`):
 
   | line | bytes |

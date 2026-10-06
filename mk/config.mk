@@ -47,8 +47,9 @@ ifeq ($(MODEL_FAMILY),flash-next)
   KV_HOST_POOL_BYTES ?= 2G
   # The budget is free VRAM minus this headroom, so the process plus the
   # desktop ends at 32.6 GB - 4 GB, under spec flash-next/04 AC10's 29 GB,
-  # whatever the desktop holds; the expert cache takes the rest of it.
-  VRAM_HEADROOM ?= 4G
+  # whatever the desktop holds; the expert cache takes the rest of it. A named
+  # VRAM_BUDGET wins: the server refuses a budget and a headroom together.
+  VRAM_HEADROOM ?= $(if $(VRAM_BUDGET),,4G)
 endif
 
 # The .ninfer container (used with CUDA=1 only). See README "Models".
