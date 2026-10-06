@@ -43,9 +43,6 @@ use ignis_core::flash_next::{EngineOptions, FlashNextEngine};
 use ignis_core::gpu_profile;
 
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
-/// A near-tie: below this many logits apart, two routes may pick
-/// differently.
-const NEAR_TIE: f32 = 0.125;
 
 fn model_dir() -> PathBuf {
     std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from)
@@ -69,6 +66,34 @@ fn engine() -> Option<FlashNextEngine> {
 
 fn bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
+}
+
+/// One BF16 ulp at `x`'s magnitude: BF16 keeps 8 significant bits, so the
+/// ulp is 2^(exponent - 7) -- 0.125 for a logit in [16, 32), 0.0625 in
+/// [8, 16).
+fn bf16_ulp(x: f32) -> f32 {
+    let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
+    2f32.powi(exponent - 7)
+}
+
+/// A near-tie: the row's top two logits at most one BF16 ulp apart at the
+/// top logit's magnitude, where two routes may pick differently. The logits
+/// are rounded to BF16, so one ulp is the smallest nonzero gap a row can
+/// show, and the decode and prefill routes differ by summation order (the
+/// 27B measured route drift up to 0.75 logits): a flip across one ulp is
+/// rounding, not a different computation. Anything wider is.
+fn near_tie(top: f32, margin: f32) -> bool {
+    margin <= bf16_ulp(top)
+}
+
+#[test]
+fn one_bf16_ulp_at_the_top_logit_is_a_near_tie_and_two_are_not() {
+    assert_eq!(bf16_ulp(20.0), 0.125);
+    assert_eq!(bf16_ulp(-12.5), 0.0625);
+    assert_eq!(bf16_ulp(32.0), 0.25);
+    assert!(near_tie(20.0, 0.0) && near_tie(20.0, 0.125));
+    assert!(!near_tie(20.0, 0.25));
+    assert!(!near_tie(12.5, 0.125));
 }
 
 /// Argmax of one BF16 row, and its margin over the runner-up.
@@ -153,7 +178,7 @@ fn a_span_is_deterministic_and_decode_agrees_with_prefill() {
                     // summation order, a wide gap is a different computation.
                     let gap = bf16(row[best as usize]) - bf16(row[token as usize]);
                     println!("  lane {lane} position {i}: decode {token}, prefill {best}, margin {margin}, gap {gap}");
-                    if margin < NEAR_TIE {
+                    if near_tie(bf16(row[best as usize]), margin) {
                         near_ties += 1;
                     } else {
                         disagree += 1;
@@ -219,7 +244,7 @@ fn on_the_g1_prompts_decode_agrees_with_prefill() {
                     if best != token {
                         let gap = bf16(row[best as usize]) - bf16(row[token as usize]);
                         flips.push((i, token, best, margin, gap));
-                        if margin >= NEAR_TIE {
+                        if !near_tie(bf16(row[best as usize]), margin) {
                             far += 1;
                         }
                     }
