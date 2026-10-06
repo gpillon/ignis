@@ -98,7 +98,7 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(filter 1,$(VISION)),--vision $(if $(VISION_MAX_TOKENS),--vision-max-tokens $(VISION_MAX_TOKENS))) \
   $(if $(ROPE_SCALING),--rope-scaling $(ROPE_SCALING)) \
   $(if $(REQUEST_TIMEOUT),--request-timeout $(REQUEST_TIMEOUT)) \
-  $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--draft-head $(DRAFT_HEAD)))
+  $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--draft-head $(DRAFT_HEAD))) \n  $(if $(DRAFT_ROWS),--draft-rows $(DRAFT_ROWS))
 SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(SERVED_MODEL),--model $(SERVED_MODEL)) \
@@ -179,7 +179,7 @@ config: ## Print the resolved knobs and paths
 	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(Prometheus: $(METRICS_URL)/metrics; Playground: /ui/metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(off))"
 	@echo "ARTIFACT        $(ARTIFACT)"
 	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image),off)"
-	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),rest of the VRAM budget) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD))) rope=$(or $(ROPE_SCALING),none)"
+	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),rest of the VRAM budget) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),$(if $(filter flash-next,$(MODEL_FAMILY)),default (mtp with its companion),off))$(if $(SPEC),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD)))$(if $(DRAFT_ROWS), rows=$(DRAFT_ROWS)) rope=$(or $(ROPE_SCALING),none)"
 	@echo "VISION (CUDA=1) $(if $(filter 1,$(VISION)),on  max_tokens=$(or $(VISION_MAX_TOKENS),(server default)),off  (image parts are refused with vision_disabled))"
 	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1G))) retained_device=$(or $(RETAINED_DEVICE),(server default: 0)) retained_host=$(or $(RETAINED_HOST),(server default: two per lane))"
 	@echo "MODEL           $(MODEL_FAMILY)  $(if $(filter flash-next,$(MODEL_FAMILY)),(Qwen3.8-Flash-Next as $(SERVED_MODEL); its 3 lanes / prefetch width 16 / 1G n-gram hot rows are not server flags yet),$(if $(SERVED_MODEL),(Qwen3.8-27B served as $(SERVED_MODEL)),(Qwen3.8-27B under the server's default id)))"

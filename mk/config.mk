@@ -36,11 +36,17 @@ ifeq ($(MODEL_FAMILY),flash-next)
   ARTIFACT ?= F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_trellis_a25-v2.ninfer
   # 128K tokens per lane under hq-e8-2b, inside the checkpoint's 262,144
   # trained positions (so no YaRN); 8192-token prefill chunks amortize a
-  # chunk's expert transfer (spec flash-next/03); no speculation, no vision.
+  # chunk's expert transfer (spec flash-next/03); no vision. Speculation is
+  # the server's default: the MTP head on when its companion container is
+  # beside the artifact (spec flash-next/07). SPEC=off turns it off; SPEC=mtp
+  # DRAFT_TOKENS=k forces at most k drafts per lane; DRAFT_ROWS=r is the row
+  # budget that cuts k as lanes join (empty: the decode route's 8).
   MAX_CONTEXT ?= 131072
   ROPE_SCALING ?= none
   PREFILL_CHUNK ?= 8192
   SPEC ?=
+  DRAFT_TOKENS ?=
+  DRAFT_ROWS ?=
   VISION ?=
   # The KV-RAM arena spec flash-next/05 sizes for Flash-Next: the 38 GB of
   # pinned experts leave no room for the 27B's 8G (the host plan refuses it).
