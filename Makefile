@@ -98,7 +98,7 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(filter 1,$(VISION)),--vision $(if $(VISION_MAX_TOKENS),--vision-max-tokens $(VISION_MAX_TOKENS))) \
   $(if $(ROPE_SCALING),--rope-scaling $(ROPE_SCALING)) \
   $(if $(REQUEST_TIMEOUT),--request-timeout $(REQUEST_TIMEOUT)) \
-  $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--draft-head $(DRAFT_HEAD))) \n  $(if $(DRAFT_ROWS),--draft-rows $(DRAFT_ROWS))
+  $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--draft-head $(DRAFT_HEAD)))   $(if $(DRAFT_ROWS),--draft-rows $(DRAFT_ROWS))
 SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(SERVED_MODEL),--model $(SERVED_MODEL)) \
@@ -545,3 +545,7 @@ clean-runtime: ## Remove the background server's pid file and logs
 distclean: clean-web clean-kernel clean-runtime ## Everything: cargo clean + web deps + kernel build
 	$(CARGO) clean
 	rm -rf web/node_modules
+
+.PHONY: flags-selftest
+flags-selftest: ## Test the engine-flag plumbing -- the speculation knobs arrive as real arguments
+	@bash mk/flags-selftest.sh
