@@ -6,9 +6,10 @@
 //   the n-gram embedding (its layer only), the attention mix, GDN or (the indexer's selection,
 //   then QSA attention), the inject; the MoE mix, this layer's router, the residency step's
 //   demand half, the routed experts (the decode route for a round, the prefill route for a
-//   chunk), the shared expert, the combine, the inject -- and beside the experts, on the branch
-//   residency forks, the next layer's router on the same input (the lookahead residency ranks)
-//   and the step's prefetch half;
+//   chunk), the combine, the inject -- and beside them, the shared expert on a branch of its
+//   own (forked after the mix, joined at the combine) and, on the branch residency forks, the
+//   next layer's router on the same input (the lookahead residency ranks) and the step's
+//   prefetch half;
 // then the head (the final mixer and lm_head) on the rows that are drawn from.
 //
 // A chunk is one lane of up to prefill_chunk_tokens tokens, run eagerly out of the handle's
@@ -245,31 +246,53 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
     if (fn_hc_mix(g, layer.mlp_hc, residual, rows, x, inj, scratch, stream) != 0) {
       return fail(where + " MoE mix", fn_last_error());
     }
+    // The shared expert reads only `x`: it runs on a branch of its own beside the router,
+    // residency and the routed experts, joined before the combine -- and on every failure before
+    // it, so no return leaves the branch open.
+    if (cudaEventRecord(fn.shared_fork, stream) != cudaSuccess ||
+        cudaStreamWaitEvent(fn.shared_stream, fn.shared_fork, 0) != cudaSuccess) {
+      return fail(where + " shared expert fork", cudaGetErrorString(cudaGetLastError()));
+    }
+    auto *shared = static_cast<float *>(fn.shared_out->p);
+    const int32_t shared_rc = ignis_moe_shared_expert(layer.moe.shared_gate, layer.moe.shared_up,
+                                                      layer.moe.shared_down, x, static_cast<uint32_t>(rows),
+                                                      fn.shared_h->p, shared, fn.shared_stream);
+    const std::string shared_error = shared_rc != 0 ? ignis_moe_last_error() : "";
+    if (cudaEventRecord(fn.shared_done, fn.shared_stream) != cudaSuccess) {
+      return fail(where + " shared expert join", cudaGetErrorString(cudaGetLastError()));
+    }
+    const auto fail_joined = [&](const std::string &what, const char *detail) {
+      (void)cudaStreamWaitEvent(stream, fn.shared_done, 0);
+      return fail(what, detail);
+    };
+    if (shared_rc != 0) {
+      return fail_joined(where + " shared expert", shared_error.c_str());
+    }
     auto *ids = static_cast<int32_t *>(fn.router_ids->p);
     auto *weights = static_cast<float *>(fn.router_weights->p);
     if (ignis_moe_router(x, static_cast<uint32_t>(rows), layer.moe.router, ids, weights,
                          static_cast<float *>(fn.router_logits->p), stream) != 0) {
-      return fail(where + " router", ignis_moe_last_error());
+      return fail_joined(where + " router", ignis_moe_last_error());
     }
     // The step's demand half on the layer's stream; its lookahead -- the next layer's router on
     // this input, which only the prefetch reads -- on the branch it forks, beside the experts.
     void *branch = nullptr;
     if (ignis_residency_step_demand(fn.residency, static_cast<uint32_t>(l), phase, ids, static_cast<uint32_t>(rows),
                                     stream, l + 1 < g.layers ? &branch : nullptr) != 0) {
-      return fail(where + " expert residency", ignis_residency_last_error());
+      return fail_joined(where + " expert residency", ignis_residency_last_error());
     }
     if (branch != nullptr) {
       if (ignis_moe_router(x, static_cast<uint32_t>(rows), w.layers[static_cast<std::size_t>(l + 1)].moe.router,
                            static_cast<int32_t *>(fn.lookahead_ids->p), static_cast<float *>(fn.lookahead_weights->p),
                            static_cast<float *>(fn.lookahead_logits->p), branch) != 0) {
-        return fail(where + " lookahead router", ignis_moe_last_error());
+        return fail_joined(where + " lookahead router", ignis_moe_last_error());
       }
       if (cudaEventRecord(fn.lookahead_read, static_cast<cudaStream_t>(branch)) != cudaSuccess) {
-        return fail(where + " lookahead event", cudaGetErrorString(cudaGetLastError()));
+        return fail_joined(where + " lookahead event", cudaGetErrorString(cudaGetLastError()));
       }
       if (ignis_residency_step_prefetch(fn.residency, static_cast<const float *>(fn.lookahead_logits->p),
                                         static_cast<uint32_t>(rows)) != 0) {
-        return fail(where + " expert prefetch", ignis_residency_last_error());
+        return fail_joined(where + " expert prefetch", ignis_residency_last_error());
       }
     }
     const ignis_moe_slot *slots = ignis_residency_slot_table(fn.residency, static_cast<uint32_t>(l));
@@ -284,15 +307,15 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
     const auto fail_moe = [&](const std::string &what) {
       const std::string detail = ignis_moe_last_error();
       (void)cudaMemsetAsync(acc, 0, static_cast<std::size_t>(rows) * g.hidden * sizeof(int64_t), stream);
-      return fail(where + what, detail.c_str());
+      return fail_joined(where + what, detail.c_str());
     };
     if (experts != 0) {
       return fail_moe(" experts");
     }
-    auto *shared = static_cast<float *>(fn.shared_out->p);
-    if (ignis_moe_shared_expert(layer.moe.shared_gate, layer.moe.shared_up, layer.moe.shared_down, x,
-                                static_cast<uint32_t>(rows), fn.shared_h->p, shared, stream) != 0) {
-      return fail_moe(" shared expert");
+    if (cudaStreamWaitEvent(stream, fn.shared_done, 0) != cudaSuccess) {
+      const std::string detail = cudaGetErrorString(cudaGetLastError());
+      (void)cudaMemsetAsync(acc, 0, static_cast<std::size_t>(rows) * g.hidden * sizeof(int64_t), stream);
+      return fail(where + " shared expert join", detail.c_str());
     }
     if (ignis_moe_combine(acc, shared, x, layer.moe.shared_expert_gate, static_cast<uint32_t>(rows), y, stream) != 0) {
       return fail_moe(" MoE combine");
@@ -364,6 +387,9 @@ int32_t FlashNextModel::rows() const {
 FlashNextModel::FlashNextModel() = default;
 FlashNextModel::~FlashNextModel() {
   if (lookahead_read != nullptr) cudaEventDestroy(lookahead_read);
+  if (shared_done != nullptr) cudaEventDestroy(shared_done);
+  if (shared_fork != nullptr) cudaEventDestroy(shared_fork);
+  if (shared_stream != nullptr) cudaStreamDestroy(shared_stream);
 }
 
 std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, uint64_t count,
@@ -470,6 +496,21 @@ int32_t finish_load(ignis_model &model, std::string *error) {
   if (!check_cuda(cudaEventCreateWithFlags(&fn.lookahead_read, cudaEventDisableTiming), "the lookahead event",
                   error)) {
     fn.lookahead_read = nullptr;
+    return -1;
+  }
+  if (!check_cuda(cudaStreamCreateWithFlags(&fn.shared_stream, cudaStreamNonBlocking), "the shared expert stream",
+                  error)) {
+    fn.shared_stream = nullptr;
+    return -1;
+  }
+  if (!check_cuda(cudaEventCreateWithFlags(&fn.shared_fork, cudaEventDisableTiming), "the shared expert fork",
+                  error)) {
+    fn.shared_fork = nullptr;
+    return -1;
+  }
+  if (!check_cuda(cudaEventCreateWithFlags(&fn.shared_done, cudaEventDisableTiming), "the shared expert join",
+                  error)) {
+    fn.shared_done = nullptr;
     return -1;
   }
   try {

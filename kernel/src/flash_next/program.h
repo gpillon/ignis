@@ -101,6 +101,11 @@ struct FlashNextModel {
   // Recorded on residency's lookahead branch once the lookahead router has read `x`; the
   // layer's stream waits on it before the next sublayer's mix rewrites `x`.
   cudaEvent_t lookahead_read = nullptr;
+  // The shared expert's branch: forked from the layer's stream after the MoE mix, joined before
+  // the combine.
+  cudaStream_t shared_stream = nullptr;
+  cudaEvent_t shared_fork = nullptr;
+  cudaEvent_t shared_done = nullptr;
 
   // The lane-state views of the pool the decode graphs were captured
   // against (a replay reads these addresses): one indexer section per
