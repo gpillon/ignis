@@ -40,7 +40,10 @@ pub struct FlashNextCounterCell {
     slots_capacity: [AtomicU64; KClass::COUNT],
     /// `NO_OCCUPANCY` for a reading without it.
     slots_in_use: [AtomicU64; KClass::COUNT],
-    ngram_rows: AtomicU64,
+    /// The rows the file served, not all rows: each series a reader sees
+    /// then only grows, where a total read beside the hot rows could, mid
+    /// publish, put fewer rows than before on the file.
+    ngram_file_rows: AtomicU64,
     ngram_hot_rows: AtomicU64,
     ngram_reads: AtomicU64,
     ngram_read_bytes: AtomicU64,
@@ -62,7 +65,7 @@ impl Default for FlashNextCounterCell {
             stall_nanos: AtomicU64::new(0),
             slots_capacity: Default::default(),
             slots_in_use: std::array::from_fn(|_| AtomicU64::new(NO_OCCUPANCY)),
-            ngram_rows: AtomicU64::new(0),
+            ngram_file_rows: AtomicU64::new(0),
             ngram_hot_rows: AtomicU64::new(0),
             ngram_reads: AtomicU64::new(0),
             ngram_read_bytes: AtomicU64::new(0),
@@ -93,7 +96,7 @@ impl FlashNextCounterCell {
         }
         store(&self.stall_nanos, r.stall_nanos);
         let n = &counters.ngram;
-        store(&self.ngram_rows, n.rows);
+        store(&self.ngram_file_rows, n.rows.saturating_sub(n.hot_rows));
         store(&self.ngram_hot_rows, n.hot_rows);
         store(&self.ngram_reads, n.reads);
         store(&self.ngram_read_bytes, n.read_bytes);
@@ -103,6 +106,7 @@ impl FlashNextCounterCell {
     pub fn read(&self) -> FlashNextCounters {
         let load = |cell: &AtomicU64| cell.load(Ordering::Relaxed);
         let in_use = self.slots_in_use.each_ref().map(load);
+        let hot_rows = load(&self.ngram_hot_rows);
         FlashNextCounters {
             residency: ResidencyCounters {
                 hits: self.hits.each_ref().map(|phases| phases.each_ref().map(load)),
@@ -115,8 +119,8 @@ impl FlashNextCounterCell {
             slots_capacity: self.slots_capacity.each_ref().map(|c| load(c) as u32),
             slots_in_use: (!in_use.contains(&NO_OCCUPANCY)).then(|| in_use.map(|c| c as u32)),
             ngram: NgramCounters {
-                rows: load(&self.ngram_rows),
-                hot_rows: load(&self.ngram_hot_rows),
+                rows: load(&self.ngram_file_rows) + hot_rows,
+                hot_rows,
                 reads: load(&self.ngram_reads),
                 read_bytes: load(&self.ngram_read_bytes),
             },
