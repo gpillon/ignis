@@ -208,7 +208,7 @@ Per op at one row in the microbenchmark (node-traced):
 - before: norm 5.9, `mix_down` 12.0, activation 0.7, `mix_up` 4.2, `block_inject` 9.0, reduce 10.2 µs;
 - after: norm 2.6, down 4.6, up + reduce 5.0 µs.
 
-Correctness: the HC CTest now has FP8 arms beside the BF16 ones, rows 1/3/8/9/1100, the final mixer, and a replay check. It passes on both the old and the new kernels; a deliberately broken decode route fails it. `flash_next_forward_gpu` passes 3/3 on `e04d800`:
+Correctness: the HC CTest now has FP8 arms beside the BF16 ones (and one projection of each format), rows 1/3/8/9/1027/1100, the final mixer, and a replay check. The arms of `38119ea` (BF16 and FP8, rows 1-1100) passed on the old kernels too, and a deliberately broken decode route fails them; the mixed-format arms, the 1027-row arm and the refusals came later and ran on the new code only. `flash_next_forward_gpu` passes 3/3 on `e04d800`:
 - G1 agreement is 102/102;
 - decode equals prefill on G1 real text, 0 flips in 224 tokens;
 - decode is deterministic, and a graph replays what eager computes.
