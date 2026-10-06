@@ -134,6 +134,7 @@ mod ffi {
         ) -> i32;
         pub fn ignis_residency_join(r: *mut RawResidency, stream: *mut c_void) -> i32;
         pub fn ignis_residency_read_counters(r: *mut RawResidency, out: *mut RawCounters) -> i32;
+        pub fn ignis_residency_read_occupancy(r: *mut RawResidency, out: *mut u32) -> i32;
         pub fn ignis_residency_last_report(
             r: *mut RawResidency,
             layer: u32,
@@ -345,6 +346,14 @@ impl DeviceResidency {
             bytes_moved: raw.bytes_moved,
             stall_nanos: raw.stall_nanos,
         })
+    }
+
+    /// Slots holding a projection, per class in `KClass::index` order (the
+    /// policy model's `occupancy`); waits for the device.
+    pub fn slots_in_use(&self) -> Result<[u32; KClass::COUNT], String> {
+        let mut out = [0u32; KClass::COUNT];
+        check(unsafe { ffi::ignis_residency_read_occupancy(self.raw.as_ptr(), out.as_mut_ptr()) })?;
+        Ok(out)
     }
 
     /// The outcome of the last step of `layer`, every list sorted into key

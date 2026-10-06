@@ -307,6 +307,7 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaMemcpy(table.data(), ignis_residency_slot_table(r, 0), keys * sizeof(ignis_moe_slot),
                        cudaMemcpyDeviceToHost));
     std::set<const void *> used;
+    uint32_t in_pools[IGNIS_RESIDENCY_CLASSES] = {};
     for (uint32_t key = 0; key < keys; ++key) {
       const ignis_moe_slot &e = table[key];
       if (e.record == nullptr) {
@@ -322,12 +323,21 @@ int main(int argc, char **argv) {
                            (p - pool) % f.record_bytes[c] == 0;
       const bool in_ring = ring != nullptr && p >= ring && p + f.record_bytes[c] <= ring + layout.ring_bytes;
       check(in_pool || in_ring, at + ": key " + std::to_string(key) + " points outside its class pool and the ring");
+      if (in_pool) ++in_pools[c];
       check(used.insert(e.record).second, at + ": two entries share " + std::to_string(reinterpret_cast<uintptr_t>(e.record)));
       const uint64_t b = f.record_bytes[c];
       record.resize(b);
       CUDA_OK(cudaMemcpy(record.data(), e.record, b, cudaMemcpyDeviceToHost));
       check(std::memcmp(record.data(), host + offsets[key], b) == 0,
             at + ": key " + std::to_string(key) + " does not hold its record");
+    }
+    // The occupancy readout counts what the slot table holds in the pools.
+    uint32_t occupancy[IGNIS_RESIDENCY_CLASSES];
+    RES_OK(ignis_residency_read_occupancy(r, occupancy));
+    for (uint32_t c = 0; c < IGNIS_RESIDENCY_CLASSES; ++c) {
+      check(occupancy[c] == in_pools[c], at + ": class " + std::to_string(c) + " reads " +
+                                             std::to_string(occupancy[c]) + " slots in use, the table holds " +
+                                             std::to_string(in_pools[c]));
     }
     if (s == nullptr || s->expect.status != 0) return;
     // Selected: live now.

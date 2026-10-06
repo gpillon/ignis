@@ -153,6 +153,11 @@ struct ignis_residency_counters {
 };
 int32_t ignis_residency_read_counters(struct ignis_residency *r, struct ignis_residency_counters *out);
 
+/* Slots holding a projection, per class (`out[class]`, the order of `capacity`), warm start
+ * included; a filled slot stays filled, an eviction hands it on. Waits for residency's work,
+ * like ignis_residency_read_counters. */
+int32_t ignis_residency_read_occupancy(struct ignis_residency *r, uint32_t out[IGNIS_RESIDENCY_CLASSES]);
+
 /* The outcome of the last step of `layer` (needs `report` at creation; tests: a captured round
  * leaves one per layer). `status` is 0, 1 + the class a
  * decode step was refused for (its misses outnumber the class's free and unpinned slots; the

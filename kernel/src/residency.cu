@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -893,6 +894,14 @@ int32_t ignis_residency_read_counters(ignis_residency *r, ignis_residency_counte
   if (r == nullptr || out == nullptr) return fail("residency: counters arguments");
   RESIDENCY_CUDA(cudaDeviceSynchronize());
   RESIDENCY_CUDA(cudaMemcpy(out, r->dev.counters, sizeof(*out), cudaMemcpyDeviceToHost));
+  return 0;
+}
+
+int32_t ignis_residency_read_occupancy(ignis_residency *r, uint32_t out[IGNIS_RESIDENCY_CLASSES]) {
+  if (r == nullptr || out == nullptr) return fail("residency: occupancy arguments");
+  RESIDENCY_CUDA(cudaDeviceSynchronize());
+  const char *used = reinterpret_cast<const char *>(r->dev.st) + offsetof(State, used);
+  RESIDENCY_CUDA(cudaMemcpy(out, used, sizeof(State::used), cudaMemcpyDeviceToHost));
   return 0;
 }
 

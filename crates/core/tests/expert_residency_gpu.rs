@@ -165,6 +165,7 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
             .flat_map(|(l, e)| Projection::ALL.map(|p| ProjectionId::new(l, e, p)))
             .collect();
         assert_eq!(gpu.warm_start(&warm).expect("warm start"), model.warm_start(&warm), "seed {seed}");
+        assert_eq!(gpu.slots_in_use().expect("occupancy"), model.occupancy(), "seed {seed}: warm occupancy");
 
         for round in 0..30 {
             let prefill = round % 4 == 3;
@@ -273,6 +274,7 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
                     }
                     Err(e) => panic!("{at}: {e}"),
                 }
+                assert_eq!(gpu.slots_in_use().expect("occupancy"), model.occupancy(), "{at}: occupancy");
                 steps_run += 1;
             }
         }
