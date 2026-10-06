@@ -25,6 +25,17 @@ def test_the_pre_registered_projection_is_the_spec_table():
     assert phase_a.project([0.3] * 4, cost)["verdict"] == "NO-GO"
 
 
+def test_a_repeat_table_reads_each_width_against_its_own_group():
+    cell = lambda texts, w, ms: {"texts": texts, "lanes": len(texts), "width": w, "time": {"median_ms": ms}}
+    cost = {"cells": [cell([0], 1, 10.0), cell([0], 2, 13.0), cell([0], 1, 12.0),
+                      cell([5], 1, 20.0), cell([5], 2, 21.0), cell([5], 1, 20.0),
+                      cell([1, 2], 1, 30.0), cell([1, 2], 2, 40.0)]}
+    table = phase_a.round_table(cost)
+    assert table[(1, 1)] == 15.5                      # mean of the groups' width-1 rounds (11, 20)
+    assert table[(1, 2)] == 15.5 + (2.0 + 1.0) / 2    # mean increment over each group's own base
+    assert table[(2, 2)] == 40.0
+
+
 def test_wilson_brackets_the_rate():
     p, lo, hi = phase_a.wilson(1000, 700)
     assert p == 0.7 and lo < 0.7 < hi and hi - lo < 0.06

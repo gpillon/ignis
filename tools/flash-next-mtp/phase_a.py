@@ -325,10 +325,33 @@ def tau(alphas, k):
     return total
 
 
+def round_table(cost):
+    """{(lanes, width): round ms} from the example's cost.json (one consecutive cell per shape)
+    or cost_repeat.json (text groups, widths interleaved, width 1 first and last): there a
+    width's round is its lane count's mean width-1 round plus the mean over groups of the
+    width's increment over its own group's width-1 rounds."""
+    cells = cost["cells"]
+    if "shape" in cells[0]:
+        return {(c["lanes"], c["width"]): c["time"]["median_ms"] for c in cells if c["shape"] == "consecutive"}
+    groups = {}
+    for c in cells:
+        groups.setdefault(tuple(c["texts"]), []).append(c)
+    base, inc = {}, {}
+    for texts, cs in groups.items():
+        b = float(np.mean([c["time"]["median_ms"] for c in cs if c["width"] == 1]))
+        base.setdefault(len(texts), []).append(b)
+        for c in cs:
+            if c["width"] > 1:
+                inc.setdefault((len(texts), c["width"]), []).append(c["time"]["median_ms"] - b)
+    table = {(L, 1): float(np.mean(b)) for L, b in base.items()}
+    table.update({(L, w): table[(L, 1)] + float(np.mean(d)) for (L, w), d in inc.items()})
+    return table
+
+
 def project(alphas, cost):
     """The pre-registered one-lane verdict, and the speedup at 1/2/3 lanes from measured rounds."""
     pre = {k: tau(alphas, k) * R1_MS / (R1_MS + k * C_MS + k * D_MS) for k in (1, 2, 3)}
-    rounds = {(c["lanes"], c["width"]): c["time"]["median_ms"] for c in cost["cells"] if c["shape"] == "consecutive"}
+    rounds = round_table(cost)
     lanes = {}
     for L in (1, 2, 3):
         base = rounds[(L, 1)]

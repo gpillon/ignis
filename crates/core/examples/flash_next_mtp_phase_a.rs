@@ -175,18 +175,54 @@ fn cost(out: &Path) -> Result<(), String> {
     write_bytes(&out.join("cost.json"), serde_json::to_string_pretty(&json).unwrap().as_bytes())
 }
 
+/// The consecutive shape again, widths interleaved per text group and the
+/// width-1 round measured first and last, so a cell's cost is read against
+/// its own group's spec-off round and the drift between them shows:
+/// `cost_repeat.json`.
+fn cost_repeat(out: &Path) -> Result<(), String> {
+    let short: Vec<Vec<u32>> = PROMPTS
+        .iter()
+        .filter(|p| p.4 == SHORT_PROMPT)
+        .map(|&(name, ..)| read_u32s(&out.join(name).with_extension("tokens.u32")))
+        .collect::<Result<_, _>>()?;
+    let mut engine = load(8, 4096)?;
+    let groups: [(&[usize], &[usize]); 6] = [
+        (&[0], &[1, 2, 3, 4, 5, 1]),
+        (&[6], &[1, 2, 3, 4, 5, 1]),
+        (&[8], &[1, 2, 3, 4, 5, 1]),
+        (&[2], &[1, 2, 3, 4, 5, 1]),
+        (&[0, 6], &[1, 2, 3, 4, 1]),
+        (&[8, 2, 4], &[1, 2, 1]),
+    ];
+    let mut cells = Vec::new();
+    for (texts, widths) in groups {
+        engine.generate_timed(&[short[texts[0]][..SHORT_PROMPT].to_vec()], 32)?;
+        for (order, &width) in widths.iter().enumerate() {
+            let prompts: Vec<Vec<u32>> =
+                texts.iter().flat_map(|&t| (0..width).map(move |j| (t, j))).map(|(t, j)| short[t][..SHORT_PROMPT + j].to_vec()).collect();
+            let (_, times) = engine.generate_timed(&prompts, ROUNDS)?;
+            let cell = serde_json::json!({ "texts": texts, "order": order, "lanes": texts.len(), "width": width, "rows": texts.len() * width, "time": summary(&times) });
+            eprintln!("{cell}");
+            cells.push(cell);
+        }
+    }
+    let json = serde_json::json!({ "cells": cells, "expert_cache_bytes": EXPERT_CACHE_BYTES, "rounds": ROUNDS, "warmup_rounds": WARMUP_ROUNDS });
+    write_bytes(&out.join("cost_repeat.json"), serde_json::to_string_pretty(&json).unwrap().as_bytes())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, out) = match args.as_slice() {
         [_, mode, out] => (mode.as_str(), PathBuf::from(out)),
         _ => {
-            eprintln!("usage: flash_next_mtp_phase_a corpus|cost <out-dir>");
+            eprintln!("usage: flash_next_mtp_phase_a corpus|cost|cost-repeat <out-dir>");
             std::process::exit(2);
         }
     };
     let result = fs::create_dir_all(&out).map_err(|e| e.to_string()).and_then(|()| match mode {
         "corpus" => corpus(&out),
         "cost" => cost(&out),
+        "cost-repeat" => cost_repeat(&out),
         other => Err(format!("unknown mode {other}")),
     });
     if let Err(e) = result {
