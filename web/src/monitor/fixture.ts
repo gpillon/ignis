@@ -206,9 +206,6 @@ ignis_expert_prefetches_used_total 720
 # TYPE ignis_expert_bytes_moved_total counter
 ignis_expert_bytes_moved_total{phase="decode"} 6000000000
 ignis_expert_bytes_moved_total{phase="prefill"} 9000000000
-# HELP ignis_expert_residency_stall_seconds_total Time the expert kernels waited on residency to bring their projections in.
-# TYPE ignis_expert_residency_stall_seconds_total counter
-ignis_expert_residency_stall_seconds_total 0
 # HELP ignis_expert_cache_slots VRAM expert cache slots per K class: capacity reserved at load, and in use.
 # TYPE ignis_expert_cache_slots gauge
 ignis_expert_cache_slots{class="gate_up_k2",state="capacity"} 3000

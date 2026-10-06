@@ -111,7 +111,6 @@ export type ExpertResidency = {
   prefetchIssued: number | null;
   prefetchUsed: number | null;
   bytesMoved: Record<ExpertPhase, number | null>;
-  stallSeconds: number | null;
   /** Slots per class: reserved at load, and holding a projection now (null from a server without occupancy). */
   slots: Record<ExpertClass, { capacity: number | null; inUse: number | null }>;
 };
@@ -186,7 +185,6 @@ const EXPERT_FAMILIES = {
   prefetchIssued: "ignis_expert_prefetches_issued_total",
   prefetchUsed: "ignis_expert_prefetches_used_total",
   bytesMoved: "ignis_expert_bytes_moved_total",
-  stall: "ignis_expert_residency_stall_seconds_total",
   slots: "ignis_expert_cache_slots",
 } as const;
 
@@ -304,7 +302,6 @@ export function readSnapshot({ families }: Exposition): Snapshot {
       prefetchIssued: valueOf(EXPERT_FAMILIES.prefetchIssued),
       prefetchUsed: valueOf(EXPERT_FAMILIES.prefetchUsed),
       bytesMoved: { decode: valueOf(EXPERT_FAMILIES.bytesMoved, ["phase", "decode"]), prefill: valueOf(EXPERT_FAMILIES.bytesMoved, ["phase", "prefill"]) },
-      stallSeconds: valueOf(EXPERT_FAMILIES.stall),
       slots: Object.fromEntries(
         EXPERT_CLASSES.map((cls) => [
           cls,
@@ -387,7 +384,6 @@ export function counterValues(s: Snapshot): (number | null)[] {
     s.experts?.prefetchIssued ?? null,
     s.experts?.prefetchUsed ?? null,
     ...EXPERT_PHASES.map((phase) => s.experts?.bytesMoved[phase] ?? null),
-    s.experts?.stallSeconds ?? null,
     ...NGRAM_SOURCES.map((source) => s.ngram?.rows[source] ?? null),
     s.ngram?.reads ?? null,
     s.ngram?.readBytes ?? null,

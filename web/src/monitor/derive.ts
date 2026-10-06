@@ -131,7 +131,6 @@ export type Experts = {
   bytesPerSec: number | null;
   bytesPerSecSeries: Values;
   bytesMoved: Tally;
-  stallSeconds: Tally;
   prefetch: { issued: Tally; used: Tally };
   /** Each K class: its slots, and its hits and misses over both phases. */
   classes: { cls: ExpertClass; slots: Meter; hits: Tally; misses: Tally }[];
@@ -406,7 +405,6 @@ export function deriveExperts(points: Point[], since: number): Experts {
     bytesPerSec: bytesRate.at(-1) ?? null,
     bytesPerSecSeries: bytesRate,
     bytesMoved: tally(bytes),
-    stallSeconds: tally((s) => s.experts?.stallSeconds ?? null),
     prefetch: { issued: tally((s) => s.experts?.prefetchIssued ?? null), used: tally((s) => s.experts?.prefetchUsed ?? null) },
     classes: EXPERT_CLASSES.map((cls) => {
       const slots = last.experts?.slots[cls] ?? { capacity: null, inUse: null };

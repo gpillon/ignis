@@ -973,9 +973,10 @@ function TallyCell({ tally }: { tally: { total: number | null; window: number | 
 
 /**
  * Flash-Next's expert residency (GitHub #301, spec flash-next/03 story 7):
- * the decode hit rate, the misses each token cost, the PCIe traffic and the
- * kernels' wait — what tells a slow turn caused by misses from one caused by
- * compute — then each K class's slots against their capacity.
+ * the decode hit rate, the misses each token cost and the PCIe traffic —
+ * what tells a slow turn caused by misses from one caused by compute — then
+ * each K class's slots against their capacity. The kernels' wait is not
+ * drawn: the device does not time it yet, so the server exports none.
  */
 function ExpertsCard({ experts, chart, win }: { experts: Experts; chart: ChartFrame; win: string }) {
   const { issued, used } = experts.prefetch;
@@ -992,10 +993,9 @@ function ExpertsCard({ experts, chart, win }: { experts: Experts; chart: ChartFr
         items={[
           ["Prefill hit rate", asShare(experts.prefillHitShare)],
           ["Prefetches used", `${formatCount(used.window)} of ${formatCount(issued.window)}`],
-          ["Kernels waited", formatSeconds(experts.stallSeconds.window)],
+          [`Copied in, last ${win}`, formatBytes(experts.bytesMoved.window)],
         ]}
       />
-      {experts.stallSeconds.total === 0 && <p className="text-[11px] text-ash">The wait reads zero while residency does not time it on the device.</p>}
       <TimeChart
         label="Expert bytes copied in per second"
         {...chart}

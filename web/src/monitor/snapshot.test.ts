@@ -108,12 +108,12 @@ describe("readSnapshot", () => {
     const empty = emptySnapshot();
     const moved = readSnapshot(parseExposition(IGNIS_EXPOSITION));
     // 8 plain counters, 3 reject reasons, 24 retained series, 3 skips, then
-    // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 1
-    // stall, 2 n-gram rows, 2 reads, and 2 histogram counts.
-    expect(counterValues(empty)).toHaveLength(81);
+    // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 2
+    // n-gram rows, 2 reads, and 2 histogram counts.
+    expect(counterValues(empty)).toHaveLength(80);
     expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
     const flashNext = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
-    expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(81);
+    expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(80);
     // The slots are gauges: occupancy falls on no restart.
     expect(counterValues(flashNext)).not.toContain(2999);
     expect(counterValues(moved)).toContain(41_200);
@@ -138,7 +138,6 @@ describe("readSnapshot", () => {
     expect(experts.prefetchIssued).toBe(900);
     expect(experts.prefetchUsed).toBe(720);
     expect(experts.bytesMoved).toEqual({ decode: 6_000_000_000, prefill: 9_000_000_000 });
-    expect(experts.stallSeconds).toBe(0);
     expect(experts.slots.down_k2).toEqual({ capacity: 3000, inUse: 2999 });
     expect(experts.slots.down_k4).toEqual({ capacity: 0, inUse: 0 });
     expect(s.ngram).toEqual({ rows: { hot: 190_000, file: 10_000 }, reads: 6000, readBytes: 24_576_000 });
