@@ -139,3 +139,43 @@ def test_the_summary_pairs_the_quantized_hits_with_phase_as():
     assert s["code"]["texts"] == 1 and s["all"]["positions"] == 8
     mean, half = s["all"]["alpha1_bf16_minus_quantized"]
     assert mean == pytest.approx(1 / 8) and half > 0
+
+
+def test_the_moe_inputs_are_each_entrys_own_in_chunk_order(tmp_path):
+    """Entry p of a chunk is built from (stack p, token p + 1); its MoE input and routing are the
+    head layer's over the chunk causally, whatever the batch split, chunk after chunk."""
+    import mtp
+    import phase_a
+    import test_mtp
+    cfg, ref, head32 = test_mtp.build()
+    weights = {"layers.0." + k: v for k, v in ref.state_dict().items()}
+    weights.update({"hyper_connection_mixer." + k: v for k, v in head32.mixer.state_dict().items()})
+    weights.update({"fc_hidden.weight": head32.fc_hidden, "fc_embedding.weight": head32.fc_embedding,
+                    "pre_fc_norm_hidden.weight": head32.norm_hidden,
+                    "pre_fc_norm_embedding.weight": head32.norm_embedding})
+    head = mtp.Head(cfg, weights, head32.embed, head32.lm_head, dtype=torch.bfloat16)
+    np.random.seed(1)
+    torch.manual_seed(1)
+    width = cfg.hc_count * cfg.hidden_size
+    chunks = []
+    for name, n in (("c000", 7), ("c001", 5)):
+        np.random.randint(0, cfg.vocab_size, n).astype("<u4").tofile(tmp_path / f"{name}.tokens.u32")
+        torch.randn(n, width).bfloat16().view(torch.int16).numpy().tofile(tmp_path / f"{name}.stacks.bf16")
+        chunks.append({"name": name, "tokens": n})
+    X, ridx, rw = ch._moe_inputs(head, str(tmp_path), chunks, "cpu", batch=4)
+    assert X.shape == (6 + 4, cfg.hidden_size)
+    assert ridx.shape == rw.shape == (10, cfg.num_experts_per_tok)
+
+    want = []
+    cap = {}
+    hook = head.layer.mlp.register_forward_pre_hook(lambda m, a: cap.__setitem__("x", a[0]))
+    with torch.no_grad():
+        for c in chunks:
+            tok = torch.from_numpy(np.fromfile(tmp_path / f"{c['name']}.tokens.u32", np.uint32).astype(np.int64))
+            S = phase_a.to_bf16(np.fromfile(tmp_path / f"{c['name']}.stacks.bf16", np.uint16).reshape(-1, width), "cpu")
+            Xe = head.combine(S[:-1], tok[1:], "a", "a")
+            head.window(head.entries(Xe, torch.arange(len(tok) - 1)), None, "dense")
+            head.first_step(torch.arange(len(tok) - 1))
+            want.append(cap["x"][0])
+    hook.remove()
+    assert torch.equal(X, torch.cat(want))

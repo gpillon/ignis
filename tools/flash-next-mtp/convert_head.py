@@ -151,15 +151,16 @@ def _moe_inputs(head, calib, chunks, dev, batch=1024):
     hooks = [head.layer.mlp.register_forward_pre_hook(lambda m, args: cap.__setitem__("x", args[0])),
              head.layer.mlp.gate.register_forward_hook(lambda m, args, o: cap.__setitem__("r", o))]
     xs, ri, rw = [], [], []
+    width = head.S * head.H
     try:
         with torch.no_grad():
             for c in chunks:
                 base = os.path.join(calib, c["name"])
                 tokens = np.fromfile(base + ".tokens.u32", np.uint32).astype(np.int64)
                 stacks = np.fromfile(base + ".stacks.bf16", np.uint16)
-                if stacks.size != len(tokens) * WIDTH:
-                    raise RuntimeError(f"{base}.stacks.bf16 holds {stacks.size} values, want {len(tokens)} x {WIDTH}")
-                S = phase_a.to_bf16(stacks.reshape(len(tokens), WIDTH), dev)
+                if stacks.size != len(tokens) * width:
+                    raise RuntimeError(f"{base}.stacks.bf16 holds {stacks.size} values, want {len(tokens)} x {width}")
+                S = phase_a.to_bf16(stacks.reshape(len(tokens), width), dev)
                 E = phase_a.entries(head, S, torch.from_numpy(tokens).to(dev), "a", "a")
                 head.window(E, None, "dense")
                 n = len(tokens) - 1
