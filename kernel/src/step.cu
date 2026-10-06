@@ -2511,8 +2511,16 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
       model->sampling_single_out->bytes + model->sampling_decode_configs->bytes +
       model->sampling_decode_positions->bytes + model->sampling_decode_out->bytes +
       model->sampling_decode_logits->bytes + model->sampling_workspace->capacity() +
-      model->decode_graph_scratch->capacity() + model->decode_graph_token_ids->bytes +
-      model->decode_graph_slots->bytes;
+      model->decode_graph_scratch->capacity();
+  // GitHub #302: a Flash-Next model stages its decode graphs' token ids and
+  // slots in its own buffers (`FlashNextModel::token_ids`, `slots`, counted
+  // in its activations below), so these two are the 27B's alone.
+  if (model->decode_graph_token_ids != nullptr) {
+    out_stats->vram_bytes += model->decode_graph_token_ids->bytes;
+  }
+  if (model->decode_graph_slots != nullptr) {
+    out_stats->vram_bytes += model->decode_graph_slots->bytes;
+  }
   if (model->decode_rope_positions != nullptr) {
     out_stats->vram_bytes += model->decode_rope_positions->bytes;
   }
