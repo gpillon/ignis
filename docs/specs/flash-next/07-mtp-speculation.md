@@ -2,7 +2,8 @@
 
 GitHub: #306 (item 12; master #298).
 
-**Status: draft for the owner (study, 2026-10-06).** Nothing here is built.
+**Status: draft for the owner (study, 2026-10-06).** Phase A is measured:
+**GO** (see "Phase A result (2026-10-06)"). Nothing else is built.
 *(proposed)* marks the agent's proposals, which the owner may veto. The open
 questions are listed at the end.
 
@@ -144,6 +145,9 @@ logits = lm_head(mtp.hyper_connection_mixer(S'_p))                     draft for
 | C-chain | **a** the next step's stack is the MTP block's own pre-mixer stack `S'_p` (ExLlamaV3); **b** the post-mixer state, repeated ×4 as the trunk does with its embedding | a |
 | C-idx | above 2051 tokens the MTP's QSA selects blocks with **a** its own indexer, or **b** the trunk's layer-47 selection (the 2026-09-28 survey says "reuses the QSA indices") | a: the weights exist. Below 2051 tokens attention is dense and the question does not arise. |
 | pos | the RoPE position fed to the entry built from (S_p, t[p+1]): **p** (ninfer's `position_begin = chunk_begin`, vLLM's EAGLE convention) or **p+1** | p. RoPE is relative, so a constant offset changes nothing in dense attention. It moves only the indexer's 4-token block boundaries, i.e. only C-idx a above 2051 tokens. Where the entry is *stored* is a different question, settled by prefix sharing (below). |
+
+Phase A decided every row: comb **a**, norm **a**, chain **a**; C-idx and pos
+are moot for acceptance (see "Phase A result (2026-10-06)").
 
 The config field `mtp.hybrid: True` is not interpreted by any code read here.
 If phase A finds a convention with high acceptance, it is moot.
@@ -496,6 +500,80 @@ record layouts or copy order.
 8. `cargo test` passes workspace-wide, and
    `cargo check --workspace --features cuda --tests` is clean. The Flash-Next
    GPU tests and the 27B GPU profile are green on a free 5090.
+
+## Phase A result (2026-10-06)
+
+Finding: `docs/findings/2026-10-06-flash-next-mtp-phase-a.md`.
+
+**How it was measured.**
+- The trunk states come from a test-only tap of the final pre-mixer stack
+  (`residual-tap`, `kernel/include/ignis_fn_residual_tap.h`).
+  - The texts are 16 prompts from the converter's reference windows: 12 of
+    1,536 tokens (code, Python, prose, English, chat), plus the code and the
+    prose document at 8,192 and 24,576 tokens.
+  - Each prompt was continued by 512 greedy decode tokens, then re-prefilled
+    with the tap armed (`crates/core/examples/flash_next_mtp_phase_a.rs`).
+  - The trunk's mixer and BF16 `lm_head` over the tapped stacks reproduce
+    the engine's pick at 97.8% of rows, every miss a near-tie ≤ 0.625
+    logits.
+- The head is the BF16 checkpoint's, fetched by range (7.76 GB with the
+  trunk's embed, head and mixer), run on transformers' own layer
+  (`tools/flash-next-mtp/`).
+- Drafts are scored against the text's own greedy tokens, which makes the
+  chained α_j exact. All conventions ran on the same 8,192 generated
+  positions.
+
+**Conventions:**
+
+| id | result |
+|---|---|
+| C-comb | **a**: α₁ 0.828. b (streams averaged) 0.604-0.647, −0.22 ± 0.01 paired |
+| C-norm | **a** (grouped): +0.025 ± 0.006 over b (one norm over 10,240) |
+| C-chain | **a** (the block's own pre-mixer stack): α₂ / α₃ / α₄ = 0.800 / 0.811 / 0.821; b (post-mixer ×4) 0.748 / 0.727 / 0.732 |
+| C-idx | the head's own indexer equals dense attention at 8K and 24K (α₁ −0.001 ± 0.003), so b (the trunk's layer-47 selection, not measured) cannot gain |
+| pos | moot: the block offset by one entry gives identical α |
+
+**Acceptance (comb a, norm a, chain a):**
+- α₁..α₄ = **0.828 / 0.800 / 0.811 / 0.821**.
+- Code: 0.858 / 0.838 / 0.847 / 0.847. Prose: 0.799 / 0.758 / 0.768 / 0.787.
+- Long (8K and 24K): 0.825 / 0.780 / 0.778 / 0.781.
+- τ = 1.83 / 2.49 / 3.03 / 3.47 at k = 1 / 2 / 3 / 4.
+
+**Verdict (Acceptance 1): GO.** The pre-registered one-lane projection (R₁
+15.3 ms, c 3.8 ms, d 0.9 ms) is 1.40× at k = 1, 1.54× at k = 2 and 1.58× at
+k = 3, against the 1.20× bar.
+
+**Marginal verify-column cost c.** It was measured with decode rounds whose
+lanes hold one text at consecutive positions: the tokens and experts a
+verify of w columns runs, in a tight loop on a load of 8 lanes with the
+served expert cache.
+
+| lanes | spec-off round | c per column (k = 1 / 2 / 3) | projected speedup (k = 1 / 2 / 3) |
+|---|---:|---|---|
+| 1 | 11.7 ms | 2.0 / 2.0 / 2.6 ms | 1.47× / 1.67× / 1.59× (k = 4: 1.64×) |
+| 2 | 18.5-21.0 ms | 7.8-8.7 / 8.3-9.0 / 6.6-10.4 ms (two rows each) | 1.25× / 1.25-1.28× / 1.16-1.37× |
+| 3 | 27.4-40.8 ms | 6.9-14.6 ms (three rows), k = 1 only | 1.17-1.54× |
+
+- The three-lane proxy's 3.8 ms overstated the one-lane column by ~2×.
+- At two and three lanes a column is two or three rows of other texts'
+  experts. The three-lane cells mostly measure which three texts share the
+  expert cache (two passes: 27.4 and 40.8 ms spec-off).
+- The decode route caps a round at 8 rows (`IGNIS_MOE_DECODE_MAX_TOKENS`,
+  the GDN and QSA lane caps). A per-round row budget within today's kernels
+  is therefore k ≤ 7 at one lane (this spec stops at 3), k ≤ 3 at two and
+  k = 1 at three.
+- The measured spec-off round (10.9-12.1 ms at one lane, 2K context) is
+  below the 15.3 ms above: it is a tight loop on HEAD 1166102, after the
+  HC-mix work.
+
+**Caveats** (finding §Caveats):
+- The quantized head may lose up to 0.03 α₁ (AC2).
+- The states are the prefill route's. On the generated text the prefill's
+  pick differs from the decode's token at 7.1% of positions, mostly
+  near-ties.
+- d = 0.9 ms is still the estimate.
+- The clone lanes are a proxy for the verify: phase C's c(w) is the number
+  of record.
 
 ## Out of Scope
 
