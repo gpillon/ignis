@@ -668,7 +668,9 @@ add_test(NAME ignis_kernel_flash_next_embed_head_test COMMAND ignis_kernel_flash
 # The QSA attention sublayer (kernel/src/flash_next/qsa.cu, qsa_dense.cu) on paged K/V of both
 # formats: the norms and rope, the dense kernel against fp64, the whole sublayer in prefill and in
 # graph-captured decode, hq-e8-2b within a bound derived from its measured codec error. GPU.
-foreach(name IN ITEMS gdn qsa)
+# GitHub #306: the forward's side branch (kernel/src/flash_next/side_branch.h) orders its work
+# before the join, and a failed op on it still leaves a capture that ends once joined. GPU.
+foreach(name IN ITEMS gdn qsa side_branch)
   add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
   target_include_directories(ignis_kernel_flash_next_${name}_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)

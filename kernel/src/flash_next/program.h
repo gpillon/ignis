@@ -20,6 +20,7 @@
 
 #include "flash_next_internal.h"
 #include "mtp.h"
+#include "side_branch.h"
 
 #include "ignis_model.h"
 #include "ignis_moe.h"
@@ -122,9 +123,7 @@ struct FlashNextModel {
   cudaEvent_t lookahead_read = nullptr;
   // The shared expert's branch: forked from the layer's stream after the MoE mix, joined before
   // the combine.
-  cudaStream_t shared_stream = nullptr;
-  cudaEvent_t shared_fork = nullptr;
-  cudaEvent_t shared_done = nullptr;
+  SideBranch shared_branch;
 
   // The lane-state views of the pool the decode graphs were captured
   // against (a replay reads these addresses): one indexer section per

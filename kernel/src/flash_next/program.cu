@@ -279,27 +279,26 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
     if (fn_hc_mix(g, layer.mlp_hc, residual, rows, x, inj, scratch, stream) != 0) {
       return fail(where + " MoE mix", fn_last_error());
     }
-    // The shared expert reads only `x`: it runs on a branch of its own beside the router,
-    // residency and the routed experts, joined before the combine -- and on every failure before
-    // it, so no return leaves the branch open.
-    if (cudaEventRecord(fn.shared_fork, stream) != cudaSuccess ||
-        cudaStreamWaitEvent(fn.shared_stream, fn.shared_fork, 0) != cudaSuccess) {
-      return fail(where + " shared expert fork", cudaGetErrorString(cudaGetLastError()));
-    }
+    // The shared expert reads only `x`: it runs on a branch of its own (side_branch.h) beside the
+    // router, residency and the routed experts, joined before the combine. Every failure after
+    // the fork joins that branch and residency's lookahead branch first, so no return leaves
+    // either open (a capture would then fail to end) or `x` still being read.
     auto *shared = static_cast<float *>(fn.shared_out->p);
-    const int32_t shared_rc = ignis_moe_shared_expert(layer.moe.shared_gate, layer.moe.shared_up,
-                                                      layer.moe.shared_down, x, static_cast<uint32_t>(rows),
-                                                      fn.shared_h->p, shared, fn.shared_stream);
-    const std::string shared_error = shared_rc != 0 ? ignis_moe_last_error() : "";
-    if (cudaEventRecord(fn.shared_done, fn.shared_stream) != cudaSuccess) {
-      return fail(where + " shared expert join", cudaGetErrorString(cudaGetLastError()));
-    }
+    std::string branch_error;
+    const int32_t shared_rc = run_beside(
+        fn.shared_branch, stream,
+        [&](cudaStream_t side) {
+          return ignis_moe_shared_expert(layer.moe.shared_gate, layer.moe.shared_up, layer.moe.shared_down, x,
+                                         static_cast<uint32_t>(rows), fn.shared_h->p, shared, side);
+        },
+        &branch_error);
     const auto fail_joined = [&](const std::string &what, const char *detail) {
-      (void)cudaStreamWaitEvent(stream, fn.shared_done, 0);
+      (void)join_side(fn.shared_branch, stream);
+      (void)ignis_residency_join(fn.residency, stream);
       return fail(what, detail);
     };
     if (shared_rc != 0) {
-      return fail_joined(where + " shared expert", shared_error.c_str());
+      return fail_joined(where + " shared expert", branch_error.empty() ? ignis_moe_last_error() : branch_error.c_str());
     }
     auto *ids = static_cast<int32_t *>(fn.router_ids->p);
     auto *weights = static_cast<float *>(fn.router_weights->p);
@@ -337,21 +336,18 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
             : ignis_moe_experts_prefill(x, static_cast<uint32_t>(rows), ids, weights, slots, &workspace, acc, stream);
     // The routed accumulator must be zero on every op's entry (ignis_moe.h); a failure before
     // the combine re-zeroes what the experts added, or the next call would add into it.
-    const auto fail_moe = [&](const std::string &what) {
-      const std::string detail = ignis_moe_last_error();
+    const auto fail_moe = [&](const std::string &what, const std::string &detail) {
       (void)cudaMemsetAsync(acc, 0, static_cast<std::size_t>(rows) * g.hidden * sizeof(int64_t), stream);
       return fail_joined(where + what, detail.c_str());
     };
     if (experts != 0) {
-      return fail_moe(" experts");
+      return fail_moe(" experts", ignis_moe_last_error());
     }
-    if (cudaStreamWaitEvent(stream, fn.shared_done, 0) != cudaSuccess) {
-      const std::string detail = cudaGetErrorString(cudaGetLastError());
-      (void)cudaMemsetAsync(acc, 0, static_cast<std::size_t>(rows) * g.hidden * sizeof(int64_t), stream);
-      return fail(where + " shared expert join", detail.c_str());
+    if (!join_side(fn.shared_branch, stream)) {
+      return fail_moe(" shared expert join", cudaGetErrorString(cudaGetLastError()));
     }
     if (ignis_moe_combine(acc, shared, x, layer.moe.shared_expert_gate, static_cast<uint32_t>(rows), y, stream) != 0) {
-      return fail_moe(" MoE combine");
+      return fail_moe(" MoE combine", ignis_moe_last_error());
     }
     // The next sublayer's mix rewrites `x`: the lookahead router must have read it.
     if (branch != nullptr && cudaStreamWaitEvent(stream, fn.lookahead_read, 0) != cudaSuccess) {
@@ -445,9 +441,7 @@ int32_t FlashNextModel::rows() const {
 FlashNextModel::FlashNextModel() = default;
 FlashNextModel::~FlashNextModel() {
   if (lookahead_read != nullptr) cudaEventDestroy(lookahead_read);
-  if (shared_done != nullptr) cudaEventDestroy(shared_done);
-  if (shared_fork != nullptr) cudaEventDestroy(shared_fork);
-  if (shared_stream != nullptr) cudaStreamDestroy(shared_stream);
+  shared_branch.destroy();
 }
 
 std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, uint64_t count,
@@ -595,19 +589,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     fn.lookahead_read = nullptr;
     return -1;
   }
-  if (!check_cuda(cudaStreamCreateWithFlags(&fn.shared_stream, cudaStreamNonBlocking), "the shared expert stream",
-                  error)) {
-    fn.shared_stream = nullptr;
-    return -1;
-  }
-  if (!check_cuda(cudaEventCreateWithFlags(&fn.shared_fork, cudaEventDisableTiming), "the shared expert fork",
-                  error)) {
-    fn.shared_fork = nullptr;
-    return -1;
-  }
-  if (!check_cuda(cudaEventCreateWithFlags(&fn.shared_done, cudaEventDisableTiming), "the shared expert join",
-                  error)) {
-    fn.shared_done = nullptr;
+  if (!fn.shared_branch.create(error)) {
     return -1;
   }
   try {
