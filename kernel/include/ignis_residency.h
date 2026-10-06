@@ -37,10 +37,10 @@
  * demand copy run on the caller's stream; prefetch copies run on a stream residency owns,
  * forked from the caller's stream after the demand copy and joined back at the start of the
  * next step (a split step forks after its demand resolve and runs its prefetch resolve there
- * too; its prefetch copy still waits for the demand copy). A step with a lookahead therefore leaves a fork open until the next step, so call
- * `ignis_residency_join` on the stream (a) before beginning a capture, (b) before ending a
- * capture that stops after such a step, and (c) before launching a captured graph after eager
- * steps. A full forward needs none of it: its last layer has no lookahead and joins the one
+ * too; its prefetch copy still waits for the demand copy). A step with a lookahead therefore
+ * leaves a fork open until the next step, so call `ignis_residency_join` on the stream (a)
+ * before beginning a capture, (b) before ending a capture that stops after such a step, and (c)
+ * before launching a captured graph after eager steps. A full forward needs none of it: its last layer has no lookahead and joins the one
  * before.
  *
  * Return 0 on success, -1 on a refused argument or a CUDA error; the reason is in
@@ -149,7 +149,8 @@ int32_t ignis_residency_step_ranked(struct ignis_residency *r, uint32_t layer, u
  * after them before rewriting it. The next step, or `ignis_residency_join`, joins the branch
  * (also when the caller never called a prefetch half). Unlike the whole step, a ranked lookahead
  * with an id outside [0, experts) does not refuse the step: the demand half stands, nothing is
- * prefetched and the report's status is IGNIS_RESIDENCY_STATUS_INVALID. */
+ * prefetched, and the report's status is IGNIS_RESIDENCY_STATUS_INVALID over the demand half's
+ * lists and bytes (the only report whose status is not 0 and whose step changed something). */
 int32_t ignis_residency_step_demand(struct ignis_residency *r, uint32_t layer, uint32_t phase,
                                     const int32_t *ids, uint32_t tokens, void *stream,
                                     void **lookahead_stream);
@@ -200,7 +201,8 @@ int32_t ignis_residency_set_mirror(struct ignis_residency *r, struct ignis_resid
  * decode step was refused for (its misses outnumber the class's free and unpinned slots; the
  * step changed nothing, so its missing projections stay ABSENT and an expert op run on it
  * traps), or
- * IGNIS_RESIDENCY_STATUS_INVALID for an expert id outside [0, experts). The six lists -- hits,
+ * IGNIS_RESIDENCY_STATUS_INVALID for an expert id outside [0, experts) (the step changed nothing,
+ * but for a split step's lookahead: see ignis_residency_step_demand). The six lists -- hits,
  * prefetch hits, misses, evictions, prefetches, dropped -- go to `entries`, list `l` at
  * `entries + l * capacity`, each entry a key with bit 31 set for a staging admission (misses,
  * prefetches); hits, prefetch hits and misses are in key order, the rest in processing order.

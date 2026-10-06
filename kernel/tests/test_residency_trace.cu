@@ -16,8 +16,12 @@
 // captured once per token count and replayed with new ids in the same buffers: decode residency
 // is graph-capturable across the layer steps of a round (spec acceptance 3); the rest runs
 // eagerly. Each layer's outcome is read from its own report. `split` (alone or after `graph`)
-// runs every step as ignis_residency_step_demand plus, on the stream it forks,
-// ignis_residency_step_prefetch_ranked: the split step's outcomes are the whole step's.
+// runs every step as ignis_residency_step_demand plus, on the stream it forks, a prefetch half:
+// ignis_residency_step_prefetch on logits that rank as the fixture's lookahead where a row of it
+// can be written so (an eager step whose rows hold `width` distinct ids), else
+// ignis_residency_step_prefetch_ranked. The split step's outcomes are the whole step's.
+// Every mode then checks that a whole step at the last layer ignores its lookahead, as the policy
+// does, out-of-range ids included.
 // Same no-SKIP_RETURN_CODE rule as every GPU test here (ADR 0006).
 
 #include "ignis_residency.h"
@@ -282,6 +286,10 @@ int main(int argc, char **argv) {
   int32_t *d_ids = nullptr, *d_look = nullptr;
   CUDA_OK(cudaMalloc(&d_ids, static_cast<size_t>(max_rows) * f.top_k * 4));
   CUDA_OK(cudaMalloc(&d_look, static_cast<size_t>(max_rows) * std::max(f.width, 1u) * 4));
+  float *d_logits = nullptr;
+  CUDA_OK(cudaMalloc(&d_logits, static_cast<size_t>(max_rows) * f.experts * 4));
+  std::vector<float> logits;  // host staging of d_logits, alive across the async copy
+  uint32_t logits_steps = 0;
   std::map<uint32_t, Round> rounds;  // by token count
 
   const uint32_t capacity = 4 * f.experts;
@@ -420,18 +428,52 @@ int main(int argc, char **argv) {
     return true;
   };
 
-  // One step, whole or split (the prefetch half on the stream the demand half forked).
+  // Logits whose ranking (BF16, ties to the lower id) is `host` row by row, when every row's
+  // first `width` entries are distinct ids: the listed ids at width, width - 1, ..., 1, every
+  // other expert at -8.
+  auto as_logits = [&](const std::vector<int32_t> &host, uint32_t rows, uint32_t stride) {
+    if (stride != f.width || f.width == 0) return false;
+    for (uint32_t row = 0; row < rows; ++row) {
+      for (uint32_t j = 0; j < f.width; ++j) {
+        const int32_t e = host[static_cast<size_t>(row) * stride + j];
+        if (e < 0 || static_cast<uint32_t>(e) >= f.experts) return false;
+        for (uint32_t i = 0; i < j; ++i) {
+          if (host[static_cast<size_t>(row) * stride + i] == e) return false;
+        }
+      }
+    }
+    logits.assign(static_cast<size_t>(rows) * f.experts, -8.0f);
+    for (uint32_t row = 0; row < rows; ++row) {
+      for (uint32_t j = 0; j < f.width; ++j) {
+        logits[static_cast<size_t>(row) * f.experts + host[static_cast<size_t>(row) * stride + j]] =
+            static_cast<float>(f.width - j);
+      }
+    }
+    CUDA_OK(cudaMemcpyAsync(d_logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice, stream));
+    return true;
+  };
+
+  // One step, whole or split (the prefetch half on the stream the demand half forked). `host`,
+  // the lookahead's host copy, lets an eager split step take the logits variant.
   auto run_step = [&](uint32_t layer, uint32_t phase, const int32_t *ids, uint32_t tokens,
-                      const int32_t *look, uint32_t rows, uint32_t stride) {
+                      const int32_t *look, uint32_t rows, uint32_t stride,
+                      const std::vector<int32_t> *host = nullptr) {
     if (!split_mode) {
       RES_OK(ignis_residency_step_ranked(r, layer, phase, ids, tokens, look, rows, stride, stream));
       return;
     }
+    const bool from_logits = look != nullptr && host != nullptr && layer + 1 < f.layers &&
+                             as_logits(*host, rows, stride);
     void *side = nullptr;
     RES_OK(ignis_residency_step_demand(r, layer, phase, ids, tokens, stream, look ? &side : nullptr));
     check((side != nullptr) == (look != nullptr && layer + 1 < f.layers),
           "split: a branch opens exactly when the step looks ahead");
-    if (side != nullptr) RES_OK(ignis_residency_step_prefetch_ranked(r, look, rows, stride));
+    if (side != nullptr && from_logits) {
+      RES_OK(ignis_residency_step_prefetch(r, d_logits, rows));
+      ++logits_steps;
+    } else if (side != nullptr) {
+      RES_OK(ignis_residency_step_prefetch_ranked(r, look, rows, stride));
+    }
   };
 
   // A capture that fails after a step with a lookahead (ended without the join, so its fork is
@@ -511,7 +553,7 @@ int main(int argc, char **argv) {
     if (has_look) {
       CUDA_OK(cudaMemcpyAsync(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice, stream));
     }
-    run_step(s.layer, s.phase, d_ids, s.tokens, has_look ? d_look : nullptr, s.rows, s.stride);
+    run_step(s.layer, s.phase, d_ids, s.tokens, has_look ? d_look : nullptr, s.rows, s.stride, &s.lookahead);
     RES_OK(ignis_residency_join(r, stream));
     CUDA_OK(cudaStreamSynchronize(stream));
     compare(si);
@@ -523,7 +565,7 @@ int main(int argc, char **argv) {
 
   ignis_residency_counters counters{};
   RES_OK(ignis_residency_read_counters(r, &counters));
-  const uint64_t moved = counters.bytes_moved[0] + counters.bytes_moved[1];
+  uint64_t moved = counters.bytes_moved[0] + counters.bytes_moved[1];
   check(moved == total_bytes, "counters: bytes moved " + std::to_string(moved) + ", the trace " + std::to_string(total_bytes));
   check(counters.prefetch_used == total_prefetch_hits, "counters: prefetches used");
   check(counters.prefetch_issued == total_prefetches, "counters: prefetches issued");
@@ -549,6 +591,44 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaStreamSynchronize(stream));
     check(ignis_residency_step_prefetch_ranked(r, d_look, 1, f.width) != 0,
           "the join closes the branch");
+
+    std::printf("split: %u prefetch halves from logits\n", logits_steps);
+    check(logits_steps > 0, "split: some prefetch halves ran from logits");
+
+    // A split step's ranked lookahead with an id outside [0, experts): the demand half stands,
+    // nothing is prefetched, and the report says INVALID over the demand half's lists.
+    std::set<int32_t> distinct(first.begin(), first.end());
+    std::vector<int32_t> bad(f.width, static_cast<int32_t>(f.experts));
+    CUDA_OK(cudaMemcpy(d_look, bad.data(), bad.size() * 4, cudaMemcpyHostToDevice));
+    RES_OK(ignis_residency_step_demand(r, 0, IGNIS_RESIDENCY_PREFILL, d_ids, 1, stream, &side));
+    RES_OK(ignis_residency_step_prefetch_ranked(r, d_look, 1, f.width));
+    RES_OK(ignis_residency_join(r, stream));
+    CUDA_OK(cudaStreamSynchronize(stream));
+    ignis_residency_report head{};
+    RES_OK(ignis_residency_last_report(r, 0, &head, entries.data(), capacity));
+    check(head.status == IGNIS_RESIDENCY_STATUS_INVALID, "split: an out-of-range lookahead id reports INVALID");
+    check(head.count[2] + head.count[0] == 2 * distinct.size() && head.count[4] == 0 && head.count[5] == 0,
+          "split: the INVALID report holds the demand half's hits and misses, and no prefetch");
+  }
+
+  // The last layer has no next layer: a whole step there ignores its lookahead, as the policy
+  // does, an out-of-range id included (a prefill step, so no class refuses it).
+  {
+    const std::vector<int32_t> first(f.steps[0].ids.begin(), f.steps[0].ids.begin() + f.top_k);
+    const std::vector<int32_t> bad(f.width, static_cast<int32_t>(f.experts));
+    CUDA_OK(cudaMemcpy(d_ids, first.data(), first.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_look, bad.data(), bad.size() * 4, cudaMemcpyHostToDevice));
+    RES_OK(ignis_residency_step_ranked(r, f.layers - 1, IGNIS_RESIDENCY_PREFILL, d_ids, 1, d_look, 1, f.width,
+                                       stream));
+    RES_OK(ignis_residency_join(r, stream));
+    CUDA_OK(cudaStreamSynchronize(stream));
+    ignis_residency_report head{};
+    RES_OK(ignis_residency_last_report(r, f.layers - 1, &head, entries.data(), capacity));
+    check(head.status == 0, "a last-layer step ignores its lookahead, out-of-range ids included (status " +
+                                std::to_string(head.status) + ")");
+    // That step wrote the mirror: the totals the after-free check compares it with.
+    RES_OK(ignis_residency_read_counters(r, &counters));
+    moved = counters.bytes_moved[0] + counters.bytes_moved[1];
   }
 
   for (auto &[k, round] : rounds) {
@@ -558,6 +638,7 @@ int main(int argc, char **argv) {
   }
   cudaFree(d_ids);
   cudaFree(d_look);
+  cudaFree(d_logits);
   cudaStreamDestroy(stream);
   ignis_residency_free(r);
   // Unregistered by free, still the caller's: the last step's totals stay readable.

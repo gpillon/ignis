@@ -961,7 +961,10 @@ int32_t ignis_residency_step_ranked(ignis_residency *r, uint32_t layer, uint32_t
   if (ignis_residency_join(r, stream) != 0) return -1;
   r->stepped = true;
   const bool look = lookahead != nullptr && layer + 1 < d.layers && d.lookahead_width > 0;
-  resolve_demand<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, lookahead, rows, stride);
+  // Validated with the selection only when there is a next layer to look at: the last layer's
+  // lookahead is ignored, as the policy ignores it.
+  resolve_demand<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, look ? lookahead : nullptr,
+                                        look ? rows : 0, look ? stride : 0);
   RESIDENCY_CUDA(cudaGetLastError());
   if (look) {
     resolve_prefetch<<<1, kThreads, 0, s>>>(r->dev, layer, phase, lookahead, rows, stride);
