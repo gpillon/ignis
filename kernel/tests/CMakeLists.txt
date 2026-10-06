@@ -725,3 +725,6 @@ foreach(name IN ITEMS sparse_attention sparse_attention_hq)
   target_link_libraries(ignis_kernel_flash_next_${name}_test PRIVATE ignis_kernel ignis_vendor)
   add_test(NAME ignis_kernel_flash_next_${name}_test COMMAND ignis_kernel_flash_next_${name}_test)
 endforeach()
+# Spec flash-next/04 acceptance 7: the hq route against the BF16 route on real Flash-Next KV rows.
+target_compile_definitions(ignis_kernel_flash_next_sparse_attention_hq_test PRIVATE
+  IGNIS_HQ_KV_FLASH_NEXT_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_flash_next.bin")
