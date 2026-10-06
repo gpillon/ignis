@@ -2,10 +2,30 @@
 
 GitHub: #306 (item 12; master #298).
 
-**Status: draft for the owner (study, 2026-10-06).** Phase A is measured:
-**GO** (see "Phase A result (2026-10-06)"). Nothing else is built.
-*(proposed)* marks the agent's proposals, which the owner may veto. The open
-questions are listed at the end.
+**Status: approved for implementation (owner, 2026-10-06).** Phase A is
+measured: **GO** (see "Phase A result (2026-10-06)"). Every *(proposed)* item
+below is decided unless the owner decisions here say otherwise; they answer the
+open questions at the end.
+
+## Owner decisions (2026-10-06)
+
+- **Head conventions:** the ones Phase A measured best — comb a, norm a, chain
+  a (the trunk's four streams fed separately, each normed on its own; every
+  later draft fed the head's own pre-mixer 4-stream output); the head's own
+  indexer.
+- **Container:** a companion container beside the main artifact for now; a
+  later phase merges the head into one artifact.
+- **MTP experts at 3.0 bits** per weight (mean, allocation as for the trunk),
+  calibrated on the trunk's own calibration corpus with the trunk states from
+  Phase A's tap; non-experts FP8 as the trunk.
+- **Draft width:** by default `k` adapts per round to a row budget over the
+  active lanes (decode route ≤ 8 rows; Phase A: k = 2 at 1 lane, 1-2 at 2,
+  1 at 3); a server option forces a fixed `k` (e.g. always 3) and another turns
+  MTP off. MTP is **on by default** for Flash-Next.
+- **KV format:** hq-e8-2b stays Flash-Next's serving default; `--kv-format bf16`
+  stays available. The difference (decode tok/s, expert hit rate, prefill ≠
+  decode flips) is measured and reported.
+- **One ticket** carries phases B-D with numbered acceptance criteria.
 
 Sources:
 - the checkpoint's MTP tensors (31, names and shapes from
