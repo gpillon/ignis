@@ -70,3 +70,8 @@ required-features = ["cuda"]
 [[example]]
 name = "flash_next_mtp_phase_a"
 required-features = ["cuda", "residual-tap"]
+# Spec flash-next/07 phase B: the tapped trunk states over the calibration
+# corpus that the MTP head's expert Hessians are computed from.
+[[example]]
+name = "flash_next_mtp_calibration"
+required-features = ["cuda", "residual-tap"]
