@@ -66,11 +66,11 @@ estimate or its spec floor.
 | 2.1K | 2 | 106.3 / 106.1 | — | — |
 | 2.1K | 3 | **131.2 / 129.5** | 130 | 186 |
 | 31.6K | 1 | 60.9 | — | — |
-| 31.6K | 3 | 131.8 (17.4 s overlap, 2,300 tokens) | — | — |
+| 31.6K | 3 | 131.8 (17.4 s overlap, 2,300 tokens; these lanes resumed retained prefixes, TTFT 0.5-0.7 s) | — | — |
 | 122.8K | 1 | 63.3 | — | — |
 
 - Decode-phase expert-cache hit rate: 99.0-99.2% in every cell except the one-lane 32K cell (97.5%).
-- PCIe traffic per decode token (`ignis_expert_bytes_moved_total{phase="decode"}` / tokens): **31 MB at one lane**, 19-23 MB at three lanes. The replay predicted 96.5% hits and 23.8 + 39.2 MB/token at one lane.
+- PCIe traffic per decode token (`ignis_expert_bytes_moved_total{phase="decode"}` / tokens): **31 MB at one lane** at 2K and 54 MB in the one-lane 32K cell (the cell whose hit rate dipped: long context costs link bandwidth, not decode rate), 19-23 MB at three lanes. The replay predicted 96.5% hits and 23.8 + 39.2 MB/token at one lane.
 - The 27B on the README's harness, which is different (speculative decoding with DFlash2, which Flash-Next does not have): 367 tok/s at one lane on coding prompts, 167 tok/s on free prose, 1,065 tok/s aggregate over eight lanes.
 
 **Time to first token.**
