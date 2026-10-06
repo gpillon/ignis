@@ -6,7 +6,7 @@
     ignis-artifact-pack --family mtp --work <work-mtp> --pair-main <main .ninfer>
     python convert_head.py verify --artifact <companion> --main <main .ninfer> --lock-owner <name>
     python convert_head.py alpha --artifact <companion> --corpus <phase A corpus> --bf16 <phase A alpha.json>
-                                 --out <json> --lock-owner <name>
+                                 --out <json> --lock-owner <name> [--trunk bf16|main --main <main .ninfer>]
 
 `chunks` writes the trunk's calibration corpus (the converter's own, in its order) as one token
 file per chunk, its `valid` tokens only, and `chunks.json`. The engine prefills every chunk with
@@ -17,14 +17,16 @@ the BF16 head layer causally over each chunk (prototype `mtp.Head`, dense: a chu
 tokens) and keeps the MoE sublayer's inputs and routing. Then it runs the trunk converter's own
 expert step on them, unchanged (`pipeline.Conversion._convert_experts`: g^2-weighted Hessians,
 shrink, the zero-token fallback, the four-K sweep, the allocation at --budget, the records), writes
-the non-experts in the trunk's encodings, decodes the written records (the self-check samples and
-the MoE error on the test chunks) and writes converter.json (layout.md §13.5). The packer then
-assembles the companion and pins it to the main container.
+the non-experts in the trunk's encodings, decodes the written records (the sha256 of every decoded
+projection and the MoE error on the test chunks) and writes converter.json (layout.md §13.5). Only
+the head is fetched: the token embedding is the main container's. The packer then assembles the
+companion and pins it to the main container.
 
-`verify` decodes the sampled projections from the packed companion's bytes against the sha256 the
-run recorded, and checks the main container's whole-file sha256. `alpha` scores the quantized head
-on phase A's texts exactly as phase A scored the BF16 one (comb a, norm a, chain a; dense, and the
-head's own indexer on the long texts) and pairs its draft-1 hits with phase A's.
+`verify` decodes every projection from the packed companion's bytes against the sha256 the run
+recorded, and checks the main container's whole-file sha256. `alpha` scores the quantized head on
+phase A's texts exactly as phase A scored the BF16 one (comb a, norm a, chain a; dense, and the
+head's own indexer on the long texts), pairs its draft-1 hits with phase A's and writes AC2's
+verdict into the companion's sidecar.
 """
 import argparse
 import hashlib
@@ -55,7 +57,6 @@ LAYER_PREFIX = "mtp.layers.0."
 # trunk layer's (layout.md §13.4).
 MTP_LAYER = 48
 WIDTH = 4 * 2560
-BF16_ALPHA = [0.828, 0.800, 0.811, 0.821]
 HEAD = {"comb": "a", "norm": "a", "chain": "a", "idx": "own"}
 EXPERTS = ("layers.0.mlp.experts.gate_up_proj", "layers.0.mlp.experts.down_proj")
 
@@ -82,7 +83,7 @@ def export_chunks(chunks, out):
         ids.tofile(os.path.join(out, f"{name}.tokens.u32"))
         rows.append({"name": name, "tokens": int(len(ids)), "kind": c["kind"], "cal": bool(c["cal"]),
                      "test": bool(c["test"]), "source": c["source"]})
-    manifest = {"chunks": rows, "width": WIDTH}
+    manifest = {"chunks": rows}
     layout.write_json_atomic(os.path.join(out, "chunks.json"), manifest)
     return manifest
 
@@ -177,13 +178,61 @@ def _moe_inputs(head, calib, chunks, dev, batch=1024):
     return torch.cat(xs), torch.cat(ri), torch.cat(rw)
 
 
+def check_inputs(calib, chunks, main):
+    """Everything the GPU work reads, before it starts: the main container, the tap's record of
+    the container its states came from, and every chunk's stacks at its size. Returns tap.json."""
+    if not os.path.isfile(main):
+        raise RuntimeError(f"the main container {main} does not exist")
+    tap_path = os.path.join(calib, "tap.json")
+    if not os.path.isfile(tap_path):
+        raise RuntimeError(f"{tap_path} is missing: the engine example has not finished the tap")
+    tap = json.load(open(tap_path))
+    tapped = os.path.join(tap["model_dir"], tap["artifact"])
+    if not os.path.isfile(tapped) or not os.path.samefile(tapped, main):
+        raise RuntimeError(f"the states were tapped from {tapped}, the head is paired with {main}")
+    for c in chunks:
+        path = os.path.join(calib, c["name"] + ".stacks.bf16")
+        want = c["tokens"] * WIDTH * 2
+        if not os.path.isfile(path) or os.path.getsize(path) != want:
+            raise RuntimeError(f"{path} is missing or not {want} bytes")
+    return tap
+
+
+def container_tensor(c, name, device="cpu"):
+    """A non-expert tensor of a packed container as the bf16 weight it stands for: FP8 decoded
+    (code * scale, rounded to bf16, layout.md §6.1), BF16 copied."""
+    import torch
+    import fp8
+    o = c.objects[name]
+    raw = _payload(c, o)
+    if o["format"] == "FP8_E4M3FN_ROW_BF16S":
+        return fp8.decode(raw, o["shape"], device)
+    if o["format"] == "BF16":
+        return torch.frombuffer(raw, dtype=torch.bfloat16).reshape(o["shape"]).clone().to(device)
+    raise ValueError(f"{name}: {o['format']} is not a non-expert format")
+
+
+def decode_hashes(gq, dq, k2):
+    """sha256 of every decoded projection's bf16 (out, in) bytes, as layout.md §9's samples are."""
+    import torch
+    out = []
+    for e in range(gq.shape[0]):
+        for proj, w in (("gu", gq[e]), ("dn", dq[e])):
+            out.append({"class": f"{proj}-{k2[proj][e] / 2:g}", "proj": proj, "k2": k2[proj][e], "expert": e,
+                        "sha256": hashlib.sha256(w.cpu().view(torch.int16).numpy().tobytes()).hexdigest()})
+    return out
+
+
 def cmd_run(a):
     import torch
+    import container
     import fetch
     import finish
     import nonexpert
     import preflight
     import mtp
+    chunks = json.load(open(os.path.join(a.calib, "chunks.json")))["chunks"]
+    tap = check_inputs(a.calib, chunks, a.main)
     preflight.check_gpu(a.lock_owner)
     preflight.cap_vram(a.vram_gb)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -193,18 +242,25 @@ def cmd_run(a):
     d = os.path.join(a.work, "mtp")
     os.makedirs(d, exist_ok=True)
     os.makedirs(os.path.join(a.work, "state"), exist_ok=True)
-    chunks = json.load(open(os.path.join(a.calib, "chunks.json")))["chunks"]
 
     # The main container's whole-file sha256, read beside the GPU work.
     main_sha = {}
-    hasher = threading.Thread(target=lambda: main_sha.update(sha=layout.file_digest(a.main)), daemon=True)
+
+    def digest():
+        try:
+            main_sha["sha"] = layout.file_digest(a.main)
+        except BaseException as e:
+            main_sha["error"] = e
+    hasher = threading.Thread(target=digest, daemon=True)
     hasher.start()
 
+    # Only the head is fetched; the token embedding is the main container's, as the engine
+    # serves it (FP8 decoded).
     ta = time.time()
     src = fetch.Source(a.hub)
     text = src._json_cached("config.json")["text_config"]
     weights = src.load(PREFIX)
-    embed = src.get("model.language_model.embed_tokens.weight")
+    embed = container_tensor(container.Container(a.main), "embed_tokens.weight")
     tm["fetch"] = time.time() - ta
     if len(weights) != 31:
         raise RuntimeError(f"the checkpoint has {len(weights)} mtp.* tensors, the contract 31")
@@ -235,16 +291,19 @@ def cmd_run(a):
     torch.cuda.empty_cache()
 
     ta = time.time()
-    gq, dq, sample, _ = shim._decode_experts(d, MTP_LAYER, True)
+    gq, dq, _, _ = shim._decode_experts(d, MTP_LAYER, False)
+    hashes = decode_hashes(gq, dq, rec["k2"])
     tm["decode"] = time.time() - ta
     err = {"layer": 0}         # _moe_error looks up the trunk's run 6 / run 8 baselines, none apply here
     shim._moe_error(head.layer.mlp.experts, gq, dq, moe, err)
     del gq, dq, moe
+
+    hasher.join()
+    if "error" in main_sha:
+        raise RuntimeError(f"hashing {a.main} failed: {main_sha['error']}")
     experts_bin = {"bytes": os.path.getsize(os.path.join(d, "experts.bin")),
                    "sha256": layout.file_digest(os.path.join(d, "experts.bin"))}
     layout.mark_done(d, {"experts.bin": experts_bin["sha256"]})
-
-    hasher.join()
     import importlib.metadata as md
     budget_ok = all(rec["rates"][p] <= a.budget + 1e-9 for p in ("gu", "dn"))
     n_cal, n_test = int(cal.sum()), int(test.sum())
@@ -268,11 +327,10 @@ def cmd_run(a):
                                  "shrunk 5% toward the layer H, down 5% toward I; an expert with no calibration "
                                  "entry takes the layer H (gate/up) and its all-entry activation moment (down)",
                       "hessian_fallback": rec.get("hessian_fallback", [])},
-        "calibration": {"source": "engine residual tap", "artifact": os.path.basename(a.main),
-                        "kv_format": "hq-e8-2b", "chunks": sum(c["cal"] for c in chunks), "entries": n_cal,
-                        "test_chunks": sum(c["test"] for c in chunks), "test_entries": n_test, "steps": [1],
-                        "chunks_manifest_sha256": hashlib.sha256(
-                            open(os.path.join(a.calib, "chunks.json"), "rb").read()).hexdigest()},
+        "calibration": {"source": "engine residual tap", "artifact": tap["artifact"], "kv_format": tap["kv_format"],
+                        "embed_tokens": "the main container's (FP8 decoded)",
+                        "chunks": sum(c["cal"] for c in chunks), "entries": n_cal,
+                        "test_chunks": sum(c["test"] for c in chunks), "test_entries": n_test, "steps": [1]},
         "k_map": {p: rec["k2"][p] for p in ("gu", "dn")},
         "k_hist": {p: dict(zip(("2", "2.5", "3", "4"), rec["k_hist"][p])) for p in ("gu", "dn")},
         "rates": {**rec["rates"], **{f"{p}_stored": rec["stored_rates"][p] for p in ("gu", "dn")}},
@@ -280,18 +338,19 @@ def cmd_run(a):
         "expert_traffic": rec["expert_traffic"],
         "curve_db": rec["curve_db"],
         "unrouted": rec["unrouted"],
-        "moe_error_db": {"db": err["moe_db"], "rel": err["moe_rel_err"], "per_kind_db": err["moe_db_kind"]},
+        "moe_error_db": {"db": err["moe_db"], "per_kind_db": err["moe_db_kind"]},
         "experts_bin": experts_bin,
-        "decode_sha256": [{k: v for k, v in s.items() if k != "layer"} for s in sample],
-        "self_check": {"work_files": "decode_sha256 decoded from experts.bin as written",
+        "decode_sha256": hashes,
+        "self_check": {"work_files": "decode_sha256: every projection decoded from experts.bin as written",
                        "container": "convert_head.py verify, after packing"},
         "time_s": {"total": time.time() - t0, **dict(tm)},
     }
     layout.write_json_atomic(os.path.join(a.work, "converter.json"), record)
     print(f"MTP experts: rates gu/dn {rec['rates']['gu']:.4f}/{rec['rates']['dn']:.4f} (budget {a.budget}), "
           f"K hist gu {rec['k_hist']['gu']} dn {rec['k_hist']['dn']}, MoE {err['moe_db']:.2f} dB "
-          f"{ {k: round(v, 2) for k, v in err['moe_db_kind'].items()} }, fallback {len(record['quantizer']['hessian_fallback'])}, "
-          f"{n_cal} calibration entries, {time.time() - t0:.0f} s")
+          f"{ {k: round(v, 2) for k, v in err['moe_db_kind'].items()} }, "
+          f"fallback {len(record['quantizer']['hessian_fallback'])}, {n_cal} calibration entries, "
+          f"{time.time() - t0:.0f} s")
     return 0 if budget_ok else 3
 
 
@@ -316,26 +375,16 @@ def expert_record(c, expert, proj):
 
 def quantized_head_weights(path, dev):
     """The head's weights as the companion stores them, without the `mtp.` prefix: experts
-    decoded by the trellis oracle, FP8 decoded (code * scale, rounded to bf16), BF16 copied."""
+    decoded by the trellis oracle, the non-experts by `container_tensor`."""
     import torch
     import container
-    import fp8
     import trellis
+    from pipeline import E, HID, I
     c = container.Container(path)
-    out = {}
-    for name, o in c.objects.items():
-        if ".mlp.experts." in name:
-            continue
-        raw = _payload(c, o)
-        if o["format"].startswith("FP8"):
-            t = fp8.decode(raw, o["shape"])
-        else:
-            t = torch.frombuffer(raw, dtype=torch.bfloat16).reshape(o["shape"]).clone()
-        out[name[len(PREFIX):]] = t
-    n = sum(1 for k in c.objects if ".mlp.experts." in k) // 2
-    gu = torch.empty((n, 1280, 2560), dtype=torch.bfloat16, device=dev)
-    dn = torch.empty((n, 2560, 640), dtype=torch.bfloat16, device=dev)
-    for e in range(n):
+    out = {name[len(PREFIX):]: container_tensor(c, name) for name in c.objects if ".mlp.experts." not in name}
+    gu = torch.empty((E, 2 * I, HID), dtype=torch.bfloat16, device=dev)
+    dn = torch.empty((E, HID, I), dtype=torch.bfloat16, device=dev)
+    for e in range(E):
         for proj, dst in (("gu", gu), ("dn", dn)):
             k2, rec = expert_record(c, e, proj)
             dst[e] = trellis.decode(rec, k2, proj, dev).to(torch.bfloat16)
@@ -355,21 +404,23 @@ def cmd_verify(a):
     for s in side["decode_sha256"]:
         k2, rec = expert_record(c, s["expert"], s["proj"])
         w = trellis.decode(rec, k2, s["proj"], "cuda").to(torch.bfloat16)
-        if hashlib.sha256(w.cpu().view(torch.int16).numpy().tobytes()).hexdigest() != s["sha256"]:
+        if k2 != s["k2"] or hashlib.sha256(w.cpu().view(torch.int16).numpy().tobytes()).hexdigest() != s["sha256"]:
             bad.append(f"{s['class']} expert {s['expert']}")
-    main_ok = None
-    if a.main:
-        main_ok = layout.file_digest(a.main) == side["pair"]["main"]["file_sha256"]
+    main_ok = layout.file_digest(a.main) == side["pair"]["main"]["file_sha256"]
     result = {"artifact": a.artifact, "projections_checked": len(side["decode_sha256"]),
               "bit_identical": not bad, "mismatches": bad, "main_file_sha256_matches": main_ok}
     layout.write_json_atomic(a.artifact + ".verify.json", result)
     print(json.dumps(result))
-    return 0 if not bad and main_ok is not False else 3
+    return 0 if not bad and main_ok else 3
 
 
 # ---------------------------------------------------------------------------------- acceptance
 def cmd_alpha(a):
+    """The quantized head on phase A's texts. --trunk bf16 keeps phase A's BF16 embed_tokens and
+    lm_head (fetched), so the difference to phase A is the head's quantization alone (AC2);
+    --trunk main takes them from the main container (FP8), as the engine serves them."""
     import torch
+    import container
     import fetch
     import mtp
     import phase_a
@@ -381,13 +432,16 @@ def cmd_alpha(a):
     weights = quantized_head_weights(a.artifact, dev)
     src = fetch.Source(a.hub)
     text = src._json_cached("config.json")["text_config"]
-    embed = src.get("model.language_model.embed_tokens.weight")
-    lm_head = src.get("lm_head.weight")
+    if a.trunk == "bf16":
+        embed, lm_head = src.get("model.language_model.embed_tokens.weight"), src.get("lm_head.weight")
+    else:
+        main = container.Container(a.main)
+        embed, lm_head = container_tensor(main, "embed_tokens.weight"), container_tensor(main, "lm_head.weight")
     head = mtp.Head(mtp.layer_config(text), weights, embed, lm_head, device=dev)
     del weights, embed, lm_head
     print(f"quantized head loaded in {time.time() - t0:.0f} s", flush=True)
     bf16 = json.load(open(a.bf16))["texts"]
-    results = {"texts": {}}
+    results = {"trunk": a.trunk, "texts": {}}
     for t, tokens, stacks, picks in phase_a.texts(a.corpus):
         name, prompt = t["name"], t["prompt_tokens"]
         long = len(tokens) > 2051
@@ -407,8 +461,26 @@ def cmd_alpha(a):
         torch.cuda.empty_cache()
     results["summary"] = summarize(results, bf16)
     layout.write_json_atomic(a.out, results)
-    print(json.dumps(results["summary"], indent=1))
-    return 0
+    acceptance = verdict(results["summary"], a.trunk)
+    sidecar = a.artifact + ".conversion.json"
+    side = json.load(open(sidecar))
+    side["acceptance" if a.trunk == "bf16" else "acceptance_served"] = acceptance
+    layout.write_json_atomic(sidecar, side)
+    print(json.dumps(acceptance, indent=1))
+    return 0 if acceptance["pass"] else 3
+
+
+def verdict(summary, trunk, limit=0.03):
+    """AC2: the quantized head's alpha_1 within `limit` of the BF16 head's on phase A's windows
+    (dense, every text)."""
+    s = summary["aa-dense"]["all"]
+    delta = s["alpha1_bf16_minus_quantized"]
+    return {"trunk": trunk, "alpha_bf16": s["alpha_bf16"], "alpha_quantized": s["alpha_quantized"],
+            "delta_alpha1": delta, "limit": limit, "pass": delta[0] <= limit,
+            "windows": "spec 07 phase A's 16 texts, comb a, norm a, chain a, dense",
+            "by_class": {k: {"alpha_quantized": v["alpha_quantized"], "alpha_bf16": v["alpha_bf16"]}
+                         for k, v in summary["aa-dense"].items()},
+            "index_long": summary.get("aa-index0", {}).get("all")}
 
 
 def summarize(results, bf16):
@@ -454,7 +526,7 @@ def main(argv=None):
     r.set_defaults(fn=cmd_run)
     v = sub.add_parser("verify", help="after packing: decode the sampled projections from the companion")
     v.add_argument("--artifact", required=True)
-    v.add_argument("--main", default=None, help="also check the main container's whole-file sha256")
+    v.add_argument("--main", required=True, help="the main container: its whole-file sha256 is checked")
     v.add_argument("--lock-owner", required=True)
     v.set_defaults(fn=cmd_verify)
     q = sub.add_parser("alpha", help="the quantized head's acceptance on phase A's texts")
@@ -464,6 +536,9 @@ def main(argv=None):
     q.add_argument("--out", required=True)
     q.add_argument("--lock-owner", required=True)
     q.add_argument("--hub", default=hub)
+    q.add_argument("--trunk", choices=("bf16", "main"), default="bf16",
+                   help="embed_tokens and lm_head: phase A's BF16 (AC2) or the main container's (served)")
+    q.add_argument("--main", default="F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_trellis_a25-v2.ninfer")
     q.set_defaults(fn=cmd_alpha)
     a = ap.parse_args(argv)
     return a.fn(a)

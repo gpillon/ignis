@@ -166,9 +166,10 @@ def test_the_moe_inputs_are_each_entrys_own_in_chunk_order(tmp_path):
     assert X.shape == (6 + 4, cfg.hidden_size)
     assert ridx.shape == rw.shape == (10, cfg.num_experts_per_tok)
 
-    want = []
+    want, want_r = [], []
     cap = {}
-    hook = head.layer.mlp.register_forward_pre_hook(lambda m, a: cap.__setitem__("x", a[0]))
+    hooks = [head.layer.mlp.register_forward_pre_hook(lambda m, a: cap.__setitem__("x", a[0])),
+             head.layer.mlp.gate.register_forward_hook(lambda m, a, o: cap.__setitem__("r", o))]
     with torch.no_grad():
         for c in chunks:
             tok = torch.from_numpy(np.fromfile(tmp_path / f"{c['name']}.tokens.u32", np.uint32).astype(np.int64))
@@ -177,5 +178,106 @@ def test_the_moe_inputs_are_each_entrys_own_in_chunk_order(tmp_path):
             head.window(head.entries(Xe, torch.arange(len(tok) - 1)), None, "dense")
             head.first_step(torch.arange(len(tok) - 1))
             want.append(cap["x"][0])
-    hook.remove()
+            want_r.append(cap["r"])
+    for h in hooks:
+        h.remove()
     assert torch.equal(X, torch.cat(want))
+    assert torch.equal(ridx, torch.cat([r[2] for r in want_r]))
+    assert torch.equal(rw, torch.cat([r[1].float() for r in want_r]))
+
+
+def test_the_shim_carries_every_attribute_the_trunks_expert_step_reads(tmp_path):
+    """A later change to the trunk converter's expert step that reads another attribute of its
+    Conversion fails here, not mid-run on the GPU."""
+    import inspect
+    import re
+    from pipeline import Conversion
+    cal = np.array([True, False])
+    shim = ch._shim("cpu", 3.0, str(tmp_path), cal, ~cal, np.zeros(1, np.int64), ["code"])
+    for f in ("_convert_experts", "_fallback_hessians", "_decode_experts", "_moe_error"):
+        for attr in set(re.findall(r"self\.(\w+)", inspect.getsource(getattr(Conversion, f)))):
+            assert hasattr(shim, attr), f"{f} reads self.{attr}"
+    assert shim.args.budget == 3.0
+
+
+def test_the_inputs_are_checked_before_any_gpu_work(tmp_path):
+    main = tmp_path / "model" / "main-v2.ninfer"
+    main.parent.mkdir()
+    main.write_bytes(b"main")
+    calib = tmp_path / "calib"
+    m = ch.export_chunks(_chunks()[:2], str(calib))
+    with pytest.raises(RuntimeError, match="tap.json is missing"):
+        ch.check_inputs(str(calib), m["chunks"], str(main))
+    tap = {"model_dir": str(main.parent), "artifact": "other-v2.ninfer", "kv_format": "hq-e8-2b", "chunks": 2}
+    (calib / "tap.json").write_text(json.dumps(tap))
+    with pytest.raises(RuntimeError, match="tapped from"):
+        ch.check_inputs(str(calib), m["chunks"], str(main))
+    (calib / "tap.json").write_text(json.dumps({**tap, "artifact": main.name}))
+    with pytest.raises(RuntimeError, match="c000.stacks.bf16 is missing"):
+        ch.check_inputs(str(calib), m["chunks"], str(main))
+    for c in m["chunks"]:
+        (calib / f"{c['name']}.stacks.bf16").write_bytes(bytes(c["tokens"] * ch.WIDTH * 2))
+    assert ch.check_inputs(str(calib), m["chunks"], str(main))["kv_format"] == "hq-e8-2b"
+    with pytest.raises(RuntimeError, match="does not exist"):
+        ch.check_inputs(str(calib), m["chunks"], str(tmp_path / "gone.ninfer"))
+
+
+def _write_container(path, tensors, records):
+    """A minimal v2 container (the reader's framing): tensors {name: (format, shape, bytes)} then
+    expert records {(expert, proj): (k2, record)} under the companion's names."""
+    import struct
+    import container
+    objects, payload = [], b""
+
+    def put(name, fmt, shape, layout_name, body):
+        nonlocal payload
+        payload += bytes(-len(payload) % 4096)
+        objects.append({"name": name, "kind": "tensor", "shape": list(shape), "format": fmt, "layout": layout_name,
+                        "offset": len(payload), "bytes": len(body)})
+        payload += body
+    for name, (fmt, shape, body) in tensors.items():
+        put(name, fmt, shape, "row-scale-v1" if fmt.startswith("FP8") else "contiguous-le-v1", body)
+    for (e, p), (k2, rec) in records.items():
+        i, o = layout.SHAPES[p]
+        fmt = {v: k for k, v in container.K2_OF_FORMAT.items()}[k2]
+        put(f"mtp.layers.0.mlp.experts.{e}.{container.PROJ_NAME[p]}", fmt, (o, i), "trellis-tile16-v1",
+            layout.record_payload(p, k2, rec))
+    js = json.dumps({"identity": {"model_id": "qwen3.8-flash-next-mtp", "weights_id": "w"}, "objects": objects}).encode()
+    head = container.MAGIC + struct.pack("<Q", len(js)) + js
+    path.write_bytes(head + bytes(-len(head) % 4096) + payload)
+
+
+def test_the_companions_tensors_and_records_come_back_from_its_bytes(tmp_path):
+    import container
+    import fp8
+    from test_layout import fake_record
+    torch.manual_seed(0)
+    w = torch.randn(32, 64)
+    norm = torch.randn(64).bfloat16()
+    recs = {(0, "gu"): (6, fake_record("gu", 6, 1)), (0, "dn"): (5, fake_record("dn", 5, 2))}
+    _write_container(tmp_path / "c.ninfer", {
+        "mtp.fc_hidden.weight": ("FP8_E4M3FN_ROW_BF16S", (32, 64), fp8.encode(w)),
+        "mtp.pre_fc_norm_embedding.weight": ("BF16", (64,), norm.view(torch.int16).numpy().tobytes())}, recs)
+    c = container.Container(str(tmp_path / "c.ninfer"))
+    assert torch.equal(ch.container_tensor(c, "mtp.fc_hidden.weight"), fp8.decode(fp8.encode(w), (32, 64)))
+    assert torch.equal(ch.container_tensor(c, "mtp.pre_fc_norm_embedding.weight"), norm)
+    for (e, p), (k2, want) in recs.items():
+        got_k2, got = ch.expert_record(c, e, p)
+        assert got_k2 == k2
+        for name in ("trellis", "suh", "svh"):
+            assert np.array_equal(got[name].view(np.uint8), want[name].view(np.uint8))
+
+
+def test_every_decoded_projection_is_hashed_by_class():
+    gq, dq = torch.zeros(2, 4, 3, dtype=torch.bfloat16), torch.ones(2, 3, 2, dtype=torch.bfloat16)
+    h = ch.decode_hashes(gq, dq, {"gu": [5, 8], "dn": [4, 6]})
+    assert [(x["expert"], x["class"]) for x in h] == [(0, "gu-2.5"), (0, "dn-2"), (1, "gu-4"), (1, "dn-3")]
+    assert h[0]["sha256"] == h[2]["sha256"] != h[1]["sha256"]
+
+
+def test_ac2_passes_within_three_hundredths_of_alpha_1():
+    def summary(delta):
+        return {"aa-dense": {"all": {"alpha_bf16": [0.83], "alpha_quantized": [0.83 - delta],
+                                     "alpha1_bf16_minus_quantized": [delta, 0.01]}}}
+    assert ch.verdict(summary(0.02), "bf16")["pass"]
+    assert not ch.verdict(summary(0.031), "bf16")["pass"]

@@ -528,7 +528,8 @@ F:/ai/models/Qwen3.8-Flash-Next-ignis/
   - compares `model_id`, `weights_id` and `content_hash` with the opened main container's
     (`content_hash` is `ignis_artifact::Reader::content_hash` as lowercase hex: the
     directory hash the Flash-Next leaf already computes at load for its retained state);
-  - refuses a mismatch **by name**: the field, the recorded value, the main container's value.
+  - refuses a mismatch **by name**: the field, the recorded value, the main container's value;
+    a companion without its sidecar, or a sidecar without `pair.main`, is refused the same way.
 - `file_sha256` (the whole 71.8 GB file) is the strict record. The head converter's verify
   checks it offline (§13.6); a load never does, since hashing 71.8 GB per start is not a
   price a compatibility check may charge (`content_hash`'s own rationale).
@@ -574,8 +575,13 @@ so exactly the trunk's choice for the same tensor (all names end in `.weight`):
     corpus (the 224 calibration chunks of `corpus_manifest.json`, each chunk's `valid`
     tokens) with the residual tap (`crates/core/src/residual_tap.rs`) armed.
   - Entry p is built from the tapped pre-mixer stack `S_p` and token p+1 by spec 07's
-    convention (comb a, norm a). The BF16 head layer runs each chunk causally (dense:
-    a chunk is ≤ 2051 entries).
+    convention (comb a, norm a), with the main container's token embedding (FP8 decoded,
+    as served): only `mtp.*` is fetched from the checkpoint. The BF16 head layer runs
+    each chunk causally, dense: a chunk of ≤ 2,048 tokens gives ≤ 2,047 entries, under
+    the 2,051-token threshold where the indexer starts to select.
+  - The tap records what the states came from (`tap.json`: the container, its directory,
+    the KV format); the converter refuses states tapped from another file than the main
+    container it pairs the head with.
   - The MoE sublayer's inputs and router top-10 over those entries feed the trunk's rule:
     g²-weighted Hessians per expert, shrink 0.05 toward the layer H (gate/up) and the
     identity (down), and the zero-token fallback (the layer H; the down activations' second
@@ -610,7 +616,9 @@ The converter writes the rest, `pair.main.file` and `pair.main.file_sha256` incl
   "versions": {"exllamav3": "1.5.3", "transformers": "5.17.0", "torch": "...", "python": "..."},
   "quantizer": {"codebook": "mul1", "apply_out_scales": true, "K_set": [2, 2.5, 3, 4], "budget_bits": 3.0,
                 "hessian": "...", "batch": 32, "hessian_fallback": [expert ids]},
+  "verdict": "PASS",                                               // the rates within the budget
   "calibration": {"source": "engine residual tap", "artifact": "<main file>", "kv_format": "hq-e8-2b",
+                  "embed_tokens": "the main container's (FP8 decoded)",
                   "chunks": 224, "entries": n, "test_chunks": 66, "test_entries": n, "steps": [1]},
   "k_map": {"gu": [k2 x 512], "dn": [k2 x 512]},
   "k_hist": {"gu": {"2": n, "2.5": n, "3": n, "4": n}, "dn": {...}},
@@ -618,12 +626,16 @@ The converter writes the rest, `pair.main.file` and `pair.main.file_sha256` incl
   "k_classes": [{"class": "gu-3", "k2": 6, "projections": n, "record_bytes": 1236992, "selections": n,
                  "traffic_share": ...}],
   "expert_traffic": [n x 512],                                      // calibration selections per expert
+  "curve_db": {"gu": [4 x dB], "dn": [...]}, "unrouted": {"gu": n, "dn": n},   // the K sweep, as layer.json's
   "moe_error_db": {"db": ..., "per_kind_db": {"<kind>": ...}},
   "experts_bin": {"bytes": n, "sha256": "..."},
-  "decode_sha256": [{"class": "gu-3", "expert": e, "sha256": "..."}],   // §9's rule, one layer
-  "self_check": {"work_files": {...}, "container": "verify, after packing"},
-  "acceptance": {"alpha_bf16": [0.828, 0.800, 0.811, 0.821], "alpha_quantized": [...],
-                 "delta_alpha1": ..., "windows": "spec 07 phase A's 16 texts"},
+  "decode_sha256": [{"class": "gu-3", "proj": "gu", "k2": 6, "expert": e, "sha256": "..."}],  // all 1024
+  "self_check": {"work_files": "...", "container": "..."},
+  // written by the head converter's alpha step, after packing (the packer keeps the key):
+  "acceptance": {"trunk": "bf16", "alpha_bf16": [0.828, 0.800, 0.811, 0.821], "alpha_quantized": [...],
+                 "delta_alpha1": [mean, 95% half-width], "limit": 0.03, "pass": true,
+                 "windows": "spec 07 phase A's 16 texts", "by_class": {...}, "index_long": {...}},
+  "acceptance_served": {...},              // the same with the main container's FP8 embed and lm_head
   "time_s": {...}
 }
 ```
@@ -632,8 +644,10 @@ The converter writes the rest, `pair.main.file` and `pair.main.file_sha256` incl
 
 - The packer refuses a `tensors.json` name outside `mtp.`, an `experts.idx` out of its class
   sizes (§4) and a unit whose `DONE` does not match, as for the main container.
-- The head converter's verify, after packing: the sampled expert projections decoded from
-  the companion's bytes equal `decode_sha256` bit for bit, and `pair.main.file_sha256`
-  equals the main container's file.
+- The head converter's verify, after packing: all 1024 expert projections decoded from the
+  companion's bytes equal `decode_sha256` bit for bit, and `pair.main.file_sha256` equals
+  the main container's file.
+- AC2 (spec 07): with phase A's BF16 embedding and output head, the quantized head's α₁ on
+  phase A's texts is within 0.03 of the BF16 head's (`acceptance.pass`).
 - The binder (spec 07's Rust seam) checks the identity and the pair pin of §13.2, and every
   one of the 1053 objects with its format and shape, nothing more (ADR 0002).
