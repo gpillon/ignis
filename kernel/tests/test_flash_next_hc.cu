@@ -251,10 +251,18 @@ void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, const ch
   check(x2 == x && (!with_inject || std::memcmp(inj2.data(), inj.data(), inj.size() * 4) == 0),
         label + ": a second run gives the same bits");
 
-  // Check a spread of rows (all of them when few): the reference is slow.
+  // Check a spread of rows (all of them when few) and the last three (a
+  // narrow last wave takes the decode route): the reference is slow.
+  std::vector<int> checked;
+  for (int row = 0; row < rows; row += rows > 16 ? 137 : 1) {
+    checked.push_back(row);
+  }
+  for (int row = std::max(checked.back() + 1, rows - 3); row < rows; ++row) {
+    checked.push_back(row);
+  }
   double worst = 0.0;
   int bad = 0;
-  for (int row = 0; row < rows; row += rows > 16 ? 137 : 1) {
+  for (int row : checked) {
     std::vector<double> rx, rterms, rinj;
     reference_mix(w, hidden, row, with_inject, rx, rterms, rinj);
     double rms = 0.0;
@@ -342,7 +350,7 @@ int main() {
                 ignis::flash_next::WeightFormat::Fp8RowScale};
 
   ninfer::DeviceArena scratch(64u << 20);
-  for (int rows : {1, 3, 8, 9, 1100}) {
+  for (int rows : {1, 3, 8, 9, 1027, 1100}) {
     mix_case(w, dw, "BF16", rows, true, scratch);
     mix_case(w8, dw8, "FP8", rows, true, scratch);
   }
@@ -350,8 +358,22 @@ int main() {
     mix_case(w, dw, "BF16", rows, false, scratch);
     mix_case(w8, dw8, "FP8", rows, false, scratch);
   }
+  // A part re-converted to BF16 (linear.cu): one projection of each format.
+  Weights w8_down = w8;
+  w8_down.up = w.up;
+  ignis::flash_next::HcWeights dw8_down = dw8;
+  dw8_down.mix_up = dw.mix_up;
+  Weights w8_up = w;
+  w8_up.up = w8.up;
+  ignis::flash_next::HcWeights dw8_up = dw;
+  dw8_up.mix_up = dw8.mix_up;
+  for (int rows : {1, 3, 9}) {
+    mix_case(w8_down, dw8_down, "FP8 down, BF16 up", rows, true, scratch);
+    mix_case(w8_up, dw8_up, "BF16 down, FP8 up", rows, true, scratch);
+  }
 
-  // What the norm cannot hold is refused by name, not computed wrong.
+  // What the norm cannot hold, and projections whose shape is not the
+  // geometry's, are refused by name, not computed wrong.
   {
     ignis::flash_next::Geometry g;
     g.streams = kStreams;
@@ -371,6 +393,10 @@ int main() {
     misaligned.block_inject = static_cast<const char *>(dw.block_inject) + 2;
     check(ignis::flash_next::fn_hc_mix(g, misaligned, d_out, 1, d_out, d_inj, scratch, nullptr) != 0,
           "a block-inject weight off 16 bytes is refused");
+    ignis::flash_next::HcWeights reshaped = dw;
+    reshaped.mix_up.cols = kRank + 16;
+    check(ignis::flash_next::fn_hc_mix(g, reshaped, d_out, 1, d_out, d_inj, scratch, nullptr) != 0,
+          "a mix_up of another rank than the geometry's is refused");
     cuda_ok(cudaDeviceSynchronize(), "sync");
     cudaFree(d_out);
     cudaFree(d_inj);

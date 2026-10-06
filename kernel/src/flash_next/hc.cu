@@ -490,6 +490,15 @@ int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int
                  std::to_string(kNormSpan * kThreads) + " wide)");
     return -1;
   }
+  // The decode route indexes both projections by the geometry, the prefill
+  // route by the Linear's own shape: they must be one shape.
+  if (w.mix_down.rows != g.hc_rank || w.mix_down.cols != g.residual_width() || w.mix_up.rows != g.residual_width() ||
+      w.mix_up.cols != g.hc_rank) {
+    fn_set_error("fn_hc_mix: mix_down [" + std::to_string(w.mix_down.rows) + "," + std::to_string(w.mix_down.cols) +
+                 "] / mix_up [" + std::to_string(w.mix_up.rows) + "," + std::to_string(w.mix_up.cols) +
+                 "] are not [rank, streams * hidden] / [streams * hidden, rank]");
+    return -1;
+  }
   const bool with_inject = w.block_inject != nullptr && inj != nullptr;
   if (with_inject && !aligned16(w.block_inject)) {
     fn_set_error("fn_hc_mix: the block-inject weight must be 16-byte aligned");
