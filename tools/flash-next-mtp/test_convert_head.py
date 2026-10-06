@@ -281,3 +281,26 @@ def test_ac2_passes_within_three_hundredths_of_alpha_1():
                                      "alpha1_bf16_minus_quantized": [delta, 0.01]}}}
     assert ch.verdict(summary(0.02), "bf16")["pass"]
     assert not ch.verdict(summary(0.031), "bf16")["pass"]
+
+
+def test_the_quantized_head_puts_every_decoded_projection_in_its_fused_slot(tmp_path):
+    """Expert e's decoded gate/up and down land at row e of the checkpoint's fused tensors; the
+    non-experts come back under their names without the prefix."""
+    import fp8
+    from test_layout import fake_record
+    recs = {(e, p): (k2, fake_record(p, k2, 10 * e + k2)) for e in range(2) for p, k2 in (("gu", 6), ("dn", 5))}
+    w = torch.randn(16, 32)
+    _write_container(tmp_path / "c.ninfer", {"mtp.fc_hidden.weight": ("FP8_E4M3FN_ROW_BF16S", (16, 32), fp8.encode(w))},
+                     recs)
+
+    def decode(rec, k2, proj, dev):        # a stand-in for the CUDA oracle: tags the record
+        i, o = layout.SHAPES[proj]
+        return torch.full((o, i), float(rec["suh"][0]) + k2)
+    out = ch.quantized_head_weights(str(tmp_path / "c.ninfer"), "cpu", decode)
+    assert set(out) == {"fc_hidden.weight", *ch.EXPERTS}
+    gu, dn = out[ch.EXPERTS[0]], out[ch.EXPERTS[1]]
+    assert gu.shape == (2, 1280, 2560) and dn.shape == (2, 2560, 640)
+    for e in range(2):
+        for p, t in (("gu", gu), ("dn", dn)):
+            k2, rec = recs[(e, p)]
+            assert torch.all(t[e] == torch.tensor(float(rec["suh"][0]) + k2).bfloat16())

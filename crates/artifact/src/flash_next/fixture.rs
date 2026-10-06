@@ -99,8 +99,11 @@ impl WorkTree {
     }
 
     /// Write the MTP unit (its non-expert tensors, its expert files, `DONE`)
-    /// and its `converter.json`, naming `main_file` as the main container.
-    pub fn write_mtp(&self, main_file: &str) -> Result<()> {
+    /// and its `converter.json`, recording `main` (its name and SHA-256) as
+    /// the main container.
+    pub fn write_mtp(&self, main: &Path) -> Result<()> {
+        let main_file = main.file_name().and_then(|n| n.to_str()).ok_or_else(|| fail("main has no file name"))?;
+        let main_sha256 = hex_digest(&std::fs::read(main).map_err(io(main))?);
         let dir = self.mtp_work_dir().join("mtp");
         std::fs::create_dir_all(&dir).map_err(io(&dir))?;
         write_tensors(&dir, &mtp_entries(&self.geometry))?;
@@ -112,7 +115,7 @@ impl WorkTree {
             "schema": "flash-next-mtp-converter-v1",
             "status": "complete",
             "source": {"repo": "fixture", "revision": "fixture"},
-            "pair": {"main": {"file": main_file, "file_sha256": "fixture"}},
+            "pair": {"main": {"file": main_file, "file_sha256": main_sha256}},
             "experts_bin": {"bytes": experts.len(), "sha256": hex_digest(&experts)},
         });
         write(&self.mtp_work_dir().join("converter.json"), record.to_string().as_bytes())

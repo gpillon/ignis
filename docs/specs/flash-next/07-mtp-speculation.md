@@ -257,10 +257,13 @@ above.
   - It is pinned to the main container by `weights_id` and the main
     container's sha256, recorded in its conversion JSON. The binder refuses a
     mismatch by name.
-  - *Departure (layout.md §13.2):* the load compares `model_id`,
-    `weights_id` and `Reader::content_hash` (the directory hash the leaf
-    already computes); the whole-file sha256 is checked offline only, since
-    hashing 71.8 GB per start is not a price a load check may charge.
+  - *As built (layout.md §13.2):* the sidecar records the main container's
+    `model_id`, `weights_id`, `Reader::content_hash` and whole-file sha256.
+    The packer refuses a companion whose converter calibrated on a main
+    container with another sha256; the load compares `model_id`,
+    `weights_id` and `content_hash` (the directory hash the leaf already
+    computes) and refuses a mismatch or a missing sidecar by name. The load
+    does not re-hash 71.8 GB; verify does, offline.
   - Appending to the main container would make it a re-conversion
     (layout.md: any change is). It would also change the identity the owner
     accepted and force a 71.8 GB re-download for a ~0.9 GB head.

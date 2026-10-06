@@ -302,7 +302,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
             )));
         }
         if let Some(pair) = &pair {
-            check_pair_file(&read_json(&converter)?, pair)?;
+            check_pair(&read_json(&converter)?, pair)?;
         }
     }
     if options.keep_work && !state.finished {
@@ -1139,13 +1139,18 @@ fn remove_file(path: &Path) -> Result<()> {
 
 /// What an MTP companion records of its main container (layout.md §13.5
 /// `pair.main`), read from the container itself: `content_hash` is
-/// [`Reader::content_hash`], the hash the binder compares at load.
+/// [`Reader::content_hash`], the hash the binder compares at load, and
+/// `file_sha256` the whole file's (one pass over it, at pack time only).
 fn pair_record(main: &Path) -> Result<Value> {
     let reader = Reader::open(main)?;
     let file = main
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| fail(format!("{} has no file name", main.display())))?;
+    let mut hasher = Sha256::new();
+    let handle = File::open(main).map_err(|e| fail(format!("open {}: {e}", main.display())))?;
+    std::io::copy(&mut BufReader::with_capacity(8 << 20, handle), &mut hasher)
+        .map_err(|e| fail(format!("read {}: {e}", main.display())))?;
     Ok(json!({
         "file": file,
         "model_id": reader.identity().model_id,
@@ -1153,18 +1158,22 @@ fn pair_record(main: &Path) -> Result<Value> {
         "bytes": reader.file_bytes(),
         "objects": reader.objects().len(),
         "content_hash": hex(&reader.content_hash()),
+        "file_sha256": hex(&hasher.finalize()),
     }))
 }
 
-/// The companion's `converter.json` names its main container, and it must
-/// be this one: the converter calibrated the head on the file it names,
-/// and hashed it.
-fn check_pair_file(converter: &Value, pair: &Value) -> Result<()> {
-    let ours = pair["file"].as_str().unwrap_or_default();
-    match converter.pointer("/pair/main/file").and_then(Value::as_str) {
-        Some(named) if named == ours => Ok(()),
-        Some(named) => Err(fail(format!("converter.json pairs the head with {named}, this run with {ours}"))),
-        None => Err(fail("converter.json does not name the head's main container (pair.main.file)")),
+/// The companion's `converter.json` records the main container the head was
+/// calibrated on (its whole-file SHA-256), and it must be the one this run
+/// pins: the hashes are compared, not the names.
+fn check_pair(converter: &Value, pair: &Value) -> Result<()> {
+    let ours = pair["file_sha256"].as_str().unwrap_or_default();
+    match converter.pointer("/pair/main/file_sha256").and_then(Value::as_str) {
+        Some(theirs) if theirs == ours => Ok(()),
+        Some(theirs) => Err(fail(format!(
+            "converter.json calibrated the head on a main container with SHA-256 {theirs}; {} has {ours}",
+            pair["file"].as_str().unwrap_or_default()
+        ))),
+        None => Err(fail("converter.json does not record the head's main container (pair.main.file_sha256)")),
     }
 }
 
@@ -1545,8 +1554,7 @@ mod tests {
     /// naming it.
     fn mtp_tree(tag: &str) -> fixture::FixtureArtifact {
         let main = fixture::build(tag).unwrap();
-        let file = main.path.file_name().unwrap().to_str().unwrap().to_owned();
-        main.tree.write_mtp(&file).unwrap();
+        main.tree.write_mtp(&main.path).unwrap();
         main
     }
 
@@ -1589,28 +1597,28 @@ mod tests {
         assert_eq!(pinned["weights_id"], reader.identity().weights_id);
         assert_eq!(pinned["bytes"], reader.file_bytes());
         assert_eq!(pinned["objects"], reader.objects().len());
-        assert_eq!(pinned["file_sha256"], "fixture", "the converter's own fields are kept");
+        assert_eq!(pinned["file_sha256"], hex(&Sha256::digest(std::fs::read(&main.path).unwrap())));
+        assert_eq!(pinned["file"], main.path.file_name().unwrap().to_str().unwrap());
         assert_eq!(record["schema"], "flash-next-mtp-converter-v1");
         assert_eq!((record["artifact"]["bytes"].as_u64(), record["objects"]["count"].as_u64()),
                    (Some(file_bytes), Some(object_count as u64)));
     }
 
     #[test]
-    fn an_mtp_companion_is_refused_when_its_converter_names_another_main_container_or_none() {
+    fn an_mtp_companion_is_refused_when_its_converter_records_another_main_container_or_none() {
         let main = mtp_tree("mtp-refused");
         let tree = &main.tree;
         let converter = tree.mtp_work_dir().join("converter.json");
         let mut record = read_json(&converter).unwrap();
-        record["pair"]["main"]["file"] = json!("another-v2.ninfer");
+        record["pair"]["main"]["file_sha256"] = json!("00".repeat(32));
         std::fs::write(&converter, record.to_string()).unwrap();
         let err = pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
-        assert!(err.contains("pairs the head with another-v2.ninfer, this run with qwen3_8_flash_next_fixture-v2.ninfer"),
-                "{err}");
+        assert!(err.contains(&format!("a main container with SHA-256 {}", "00".repeat(32))), "{err}");
 
-        record["pair"]["main"].as_object_mut().unwrap().remove("file");
+        record["pair"]["main"].as_object_mut().unwrap().remove("file_sha256");
         std::fs::write(&converter, record.to_string()).unwrap();
         let err = pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
-        assert!(err.contains("does not name the head's main container"), "{err}");
+        assert!(err.contains("does not record the head's main container"), "{err}");
         assert!(tree.mtp_work_dir().join("mtp").exists(), "nothing is consumed");
     }
 

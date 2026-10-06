@@ -68,8 +68,7 @@ fn the_pack_binary_waits_then_finishes_a_work_tree_beside_it() {
 #[test]
 fn the_pack_binary_packs_an_mtp_companion_beside_its_work_tree() {
     let main = fixture::build("pack-binary-mtp").unwrap();
-    let file = main.path.file_name().unwrap().to_str().unwrap().to_owned();
-    main.tree.write_mtp(&file).unwrap();
+    main.tree.write_mtp(&main.path).unwrap();
     let run = |pair: bool| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ignis-artifact-pack"));
         command.arg("--work").arg(main.tree.mtp_work_dir()).args(["--geometry", "fixture", "--family", "mtp"]);

@@ -373,22 +373,26 @@ def expert_record(c, expert, proj):
     return k2, layout.read_record(c.path, entry)
 
 
-def quantized_head_weights(path, dev):
+def quantized_head_weights(path, dev, decode=None):
     """The head's weights as the companion stores them, without the `mtp.` prefix: experts
-    decoded by the trellis oracle, the non-experts by `container_tensor`."""
+    decoded by `decode(record, k2, proj, dev)` (the trellis oracle, layout.md §3) into the
+    checkpoint's fused [experts, out, in] tensors, the non-experts by `container_tensor`."""
     import torch
     import container
     import trellis
-    from pipeline import E, HID, I
+    decode = decode or trellis.decode
     c = container.Container(path)
     out = {name[len(PREFIX):]: container_tensor(c, name) for name in c.objects if ".mlp.experts." not in name}
-    gu = torch.empty((E, 2 * I, HID), dtype=torch.bfloat16, device=dev)
-    dn = torch.empty((E, HID, I), dtype=torch.bfloat16, device=dev)
-    for e in range(E):
-        for proj, dst in (("gu", gu), ("dn", dn)):
+    n = sum(".mlp.experts." in name for name in c.objects) // 2
+    fused = {}
+    for proj in ("gu", "dn"):
+        i, o = layout.SHAPES[proj]
+        fused[proj] = torch.empty((n, o, i), dtype=torch.bfloat16, device=dev)
+    for e in range(n):
+        for proj in ("gu", "dn"):
             k2, rec = expert_record(c, e, proj)
-            dst[e] = trellis.decode(rec, k2, proj, dev).to(torch.bfloat16)
-    out[EXPERTS[0]], out[EXPERTS[1]] = gu, dn
+            fused[proj][e] = decode(rec, k2, proj, dev).to(torch.bfloat16)
+    out[EXPERTS[0]], out[EXPERTS[1]] = fused["gu"], fused["dn"]
     return out
 
 

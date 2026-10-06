@@ -523,19 +523,25 @@ F:/ai/models/Qwen3.8-Flash-Next-ignis/
   The `model_id` differs from the main container's on purpose: a load handed the companion
   as a model is refused at the identity check, not deep in the bind.
 - **The pair pin.** The companion belongs to exactly one main container. Its sidecar records
-  that container (§13.5 `pair.main`). The loader that binds the head (with
-  `--speculative mtp` only), before it reads any byte of the head:
-  - compares `model_id`, `weights_id` and `content_hash` with the opened main container's
-    (`content_hash` is `ignis_artifact::Reader::content_hash` as lowercase hex: the
-    directory hash the Flash-Next leaf already computes at load for its retained state);
-  - refuses a mismatch **by name**: the field, the recorded value, the main container's value;
-    a companion without its sidecar, or a sidecar without `pair.main`, is refused the same way.
-- `file_sha256` (the whole 71.8 GB file) is the strict record. The head converter's verify
-  checks it offline (§13.6); a load never does, since hashing 71.8 GB per start is not a
-  price a compatibility check may charge (`content_hash`'s own rationale).
-- The known limit is `content_hash`'s: a re-quantization that kept every name, format,
-  shape and offset of the main container passes the load check. A mismatched pair costs
-  acceptance, never correctness: the verify round decides every token.
+  that container (§13.5 `pair.main`): `model_id`, `weights_id`, `content_hash` and the whole
+  file's `file_sha256`. Hashes are compared, never file names:
+  - **At pack time** the converter has recorded the `file_sha256` of the main container it
+    calibrated on; the packer hashes the main container it is pointed at and refuses a
+    different or missing value. It writes `model_id`, `weights_id`, `bytes`, `objects`,
+    `content_hash` and `file_sha256` from that container.
+  - **At load** the loader that binds the head (with `--speculative mtp` only), before it
+    reads any byte of the head, compares `model_id`, `weights_id` and `content_hash` with
+    the opened main container's (`content_hash` is `ignis_artifact::Reader::content_hash` as
+    lowercase hex: the directory hash the Flash-Next leaf already computes at load for its
+    retained state). It refuses a mismatch **by name**: the field, the recorded value, the
+    main container's value. A companion without its sidecar, or a sidecar without
+    `pair.main`, is refused the same way.
+  - **Offline** the head converter's verify re-hashes the main container's file (§13.6).
+- A load does not hash the 71.8 GB file: that is not a price a compatibility check may charge
+  (`content_hash`'s own rationale). The load check's known limit is therefore
+  `content_hash`'s: a re-quantization that kept every name, format, shape and offset of the
+  main container passes it. A mismatched pair costs acceptance, never correctness: the verify
+  round decides every token.
 
 ### 13.3 Objects
 
@@ -596,9 +602,9 @@ so exactly the trunk's choice for the same tensor (all names end in `.weight`):
 
 `<companion>.conversion.json` is `work-mtp/converter.json` merged with the packer's keys
 (`recipe_id`, `artifact.bytes`, `objects.count`, as in §9). The packer is pointed at the main
-container, opens it with the reader and writes `pair.main`'s `model_id`, `weights_id`,
-`bytes`, `objects` and `content_hash` itself (Rust computes the hash the binder compares).
-The converter writes the rest, `pair.main.file` and `pair.main.file_sha256` included:
+container, opens it with the reader and writes `pair.main`'s fields itself (Rust computes the
+`content_hash` the binder compares), after checking its `file_sha256` against the
+converter's (§13.2). The converter writes the rest:
 
 ```jsonc
 {
@@ -643,7 +649,8 @@ The converter writes the rest, `pair.main.file` and `pair.main.file_sha256` incl
 ### 13.6 Checks
 
 - The packer refuses a `tensors.json` name outside `mtp.`, an `experts.idx` out of its class
-  sizes (§4) and a unit whose `DONE` does not match, as for the main container.
+  sizes (§4) and a unit whose `DONE` does not match, as for the main container, and a
+  `converter.json` whose `pair.main.file_sha256` is missing or is not the main container's.
 - The head converter's verify, after packing: all 1024 expert projections decoded from the
   companion's bytes equal `decode_sha256` bit for bit, and `pair.main.file_sha256` equals
   the main container's file.
