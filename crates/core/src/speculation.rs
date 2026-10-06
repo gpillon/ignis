@@ -137,6 +137,17 @@ pub fn flash_next_window(draft_tokens: u32, row_budget: u32, lanes: u32) -> u32 
     }
 }
 
+/// The largest window at most `window` whose round still fits `room`, the
+/// positions the tightest lane has left before its sequence's capacity (or the
+/// load's context): a verify round writes `2 * window` positions under MTP,
+/// `window + 1` otherwise (the kernel's `written_positions`). 0 means not even
+/// a one-draft round fits and the lane runs a plain step, as the 27B clamps its
+/// draft near the end of its extent.
+pub fn flash_next_window_within(window: u32, mtp: bool, room: u64) -> u32 {
+    let fits = if mtp { room / 2 } else { room.saturating_sub(1) };
+    u64::from(window).min(fits) as u32
+}
+
 /// A Flash-Next load's speculation (spec flash-next/07): its backend
 /// ([`SpeculativeBackend::Mtp`], or [`SpeculativeBackend::VerifyOnly`] for a
 /// test's fake drafter), the most drafts a lane verifies per round, and the
@@ -416,6 +427,29 @@ mod tests {
     /// Spec flash-next/07: k adapts to the row budget as lanes join -- the
     /// decode route's 8 rows give a 2-draft load k = 2 at one and two lanes
     /// and k = 1 at three (phase A's widths), and no draft past four lanes.
+    #[test]
+    fn a_window_shrinks_to_the_room_a_lane_has_left() {
+        // MTP writes 2k positions, verify-only k + 1.
+        assert_eq!(flash_next_window_within(3, true, 100), 3);
+        assert_eq!(flash_next_window_within(3, true, 6), 3, "exactly 2k fits");
+        assert_eq!(flash_next_window_within(3, true, 5), 2);
+        assert_eq!(flash_next_window_within(3, true, 1), 0, "no room for a draft: a plain step");
+        assert_eq!(flash_next_window_within(3, false, 4), 3, "exactly k + 1 fits");
+        assert_eq!(flash_next_window_within(3, false, 3), 2);
+        assert_eq!(flash_next_window_within(3, false, 1), 0);
+        assert_eq!(flash_next_window_within(3, false, 0), 0, "a full lane never underflows");
+        for mtp in [false, true] {
+            for window in 0..=7 {
+                for room in 0..=20u64 {
+                    let k = flash_next_window_within(window, mtp, room);
+                    assert!(k <= window);
+                    let written = if mtp { 2 * k } else { k + 1 };
+                    assert!(k == 0 || u64::from(written) <= room, "k={k} mtp={mtp} room={room}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_flash_next_window_fits_the_row_budget() {
         let widths = |draft, budget| (1..=8).map(|lanes| flash_next_window(draft, budget, lanes)).collect::<Vec<_>>();

@@ -35,7 +35,7 @@ use ignis_core::ngram_table::NgramTable;
 use ignis_core::residency::device::DeviceResidency;
 use ignis_core::residency::ResidencyMirror;
 use ignis_core::seq::{ArenaBuffer, HostArena, PinnedAllocError, Seq, SeqCheckpoint, SeqPool, SeqPrefix};
-use ignis_core::speculation::SpeculativeBackend;
+use ignis_core::speculation::{flash_next_window_within, SpeculativeBackend};
 use ignis_core::step;
 use ignis_core::types::{DecodeParams, SpecCounters, TokenId};
 use ignis_core::{ArtifactHash, BlobIdentity};
@@ -573,11 +573,19 @@ impl StepLeaf for FlashNextLeaf {
         if let Some(speculation) = self.options.speculation {
             let window = speculation.window(sequences.len() as u32);
             let mtp = speculation.backend() == SpeculativeBackend::Mtp;
-            let written = u64::from(if mtp { 2 * window } else { window + 1 });
-            let room = |s: &&mut FlashNextSequence| {
-                s.seq.stats().position + written <= u64::from(self.options.max_context_tokens)
-            };
-            if window > 0 && lanes.iter().all(|lane| lane.permitted.is_empty()) && sequences.iter().all(room) {
+            // The kernel's room is the sequence's own token capacity as well as the
+            // load's context: near the end of either, the window shrinks to what
+            // the tightest lane can write (0: a plain step), never a hard error.
+            let room = sequences
+                .iter()
+                .map(|s| {
+                    let stats = s.seq.stats();
+                    stats.token_capacity.min(u64::from(self.options.max_context_tokens)).saturating_sub(stats.position)
+                })
+                .min()
+                .unwrap_or(0);
+            let window = flash_next_window_within(window, mtp, room);
+            if window > 0 && lanes.iter().all(|lane| lane.permitted.is_empty()) {
                 return self.verify(model, sequences, lanes, window);
             }
         }
