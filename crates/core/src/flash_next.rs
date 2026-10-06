@@ -354,6 +354,12 @@ impl FlashNextEngine {
         self.graphs_ready
     }
 
+    /// Bit `w - 1` set when the verify round of `w` lanes replays its pass
+    /// and commit graphs (spec flash-next/07); 0 without speculation.
+    pub fn verify_graphs_ready(&self) -> Result<u32, String> {
+        crate::step::program_stats(&self.model, &self.pool).map(|stats| stats.verify_graph_ready_mask)
+    }
+
     /// Why a width's graph did not capture (the leaf's last capture error),
     /// when one did not.
     pub fn graph_error(&self) -> Option<&str> {

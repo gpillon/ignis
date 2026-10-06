@@ -4,7 +4,7 @@
 //! verify round's marginal column cost c(w) with a fake drafter.
 //!
 //! ```text
-//! flash_next_mtp_bench off|mtp|columns [--kv-format hq-e8-2b|bf16] [--draft-tokens k] [--draft-rows r]
+//! flash_next_mtp_bench off|mtp|columns [--kv-format hq-e8-2b|bf16] [--draft-tokens k] [--draft-rows r] [--sets n] [--expert-cache-gb g]
 //! ```
 //!
 //! - **off**: today's one-token rounds (no speculation bound).
@@ -17,7 +17,7 @@
 //!
 //! Prompts: the converter's reference windows (the allowlisted corpus, spec
 //! 01) -- two code and two prose windows of 1,536 tokens, and the code and
-//! prose documents at 24,576 (one lane each); `TOKENS` greedy tokens each.
+//! prose documents at 24,576 (one lane each); `TOKENS` greedy tokens each (`IGNIS_BENCH_TOKENS`).
 //! The rounds' wall time includes the host's n-gram staging, as a serving
 //! loop pays it; the first `WARMUP` rounds are dropped. Machine-local
 //! (`IGNIS_FLASH_NEXT_DIR`), needs the GPU lock and ~38 GB of free RAM.
@@ -33,6 +33,10 @@ const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 const EXPERT_CACHE_BYTES: u64 = 16_000_000_000;
 const TOKENS: usize = 256;
 const WARMUP: usize = 4;
+
+fn tokens() -> usize {
+    std::env::var("IGNIS_BENCH_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(TOKENS)
+}
 
 fn model_dir() -> PathBuf {
     std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from)
@@ -91,7 +95,7 @@ impl Measured {
 
 fn run(engine: &mut FlashNextEngine, prompts: &[Vec<u32>], oracle: Option<&[Vec<u32>]>) -> Result<Measured, String> {
     if engine.options().speculation.is_none() {
-        let (tokens, times) = engine.generate_timed(prompts, TOKENS)?;
+        let (tokens, times) = engine.generate_timed(prompts, tokens())?;
         let rounds = times.iter().map(|_| vec![LaneRound { extent: 0, committed: 1 }; prompts.len()]).collect();
         return Ok(Measured { tokens, rounds, times });
     }
@@ -102,7 +106,7 @@ fn run(engine: &mut FlashNextEngine, prompts: &[Vec<u32>], oracle: Option<&[Vec<
     };
     let run = engine.generate_speculative(
         prompts,
-        TOKENS,
+        tokens(),
         oracle.map(|_| &mut drafter as &mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>),
     )?;
     Ok(Measured { tokens: run.tokens, rounds: run.rounds, times: run.times })
@@ -128,12 +132,19 @@ fn main() -> Result<(), String> {
     let options = EngineOptions {
         max_context_tokens: 32 * 1024,
         kv_format,
-        expert_cache_bytes: EXPERT_CACHE_BYTES,
+        expert_cache_bytes: flag("--expert-cache-gb")
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(EXPERT_CACHE_BYTES, |gb| (gb * 1e9) as u64),
         speculation,
         ..EngineOptions::default()
     };
     let mut engine = FlashNextEngine::load(&model_dir(), options)?;
-    println!("mode {mode} kv {kv_format:?} draft tokens {draft_tokens} rows {draft_rows} graphs {:#b}", engine.graphs_ready());
+    println!(
+        "mode {mode} kv {kv_format:?} draft tokens {draft_tokens} rows {draft_rows} graphs {:#b} verify graphs {:#b} {:?}",
+        engine.graphs_ready(),
+        engine.verify_graphs_ready()?,
+        ignis_core::step::last_decode_graph_error()
+    );
     let short = [
         ("code", prompt("test2048", 0, 1536)?),
         ("code", prompt("test2048", 32, 1536)?),
@@ -151,11 +162,27 @@ fn main() -> Result<(), String> {
     for (name, p) in &long {
         sets.push((format!("1 lane {name}"), vec![p.clone()]));
     }
+    if let Some(n) = flag("--sets").and_then(|v| v.parse::<usize>().ok()) {
+        sets.truncate(n);
+    }
     for (name, prompts) in &sets {
         // The oracle drafter needs the spec-off text: a draft-free verify run of the same load.
         let oracle =
             if mode == "columns" { Some(run(&mut engine, prompts, Some(&vec![Vec::new(); prompts.len()]))?.tokens) } else { None };
+        let before = engine.residency().counters()?;
         let m = run(&mut engine, prompts, oracle.as_deref())?;
+        let after = engine.residency().counters()?;
+        let decode = |c: &ignis_core::residency::ResidencyCounters| -> (u64, u64) {
+            (c.hits.iter().map(|h| h[0]).sum(), c.misses.iter().map(|m| m[0]).sum())
+        };
+        let ((h0, m0), (h1, m1)) = (decode(&before), decode(&after));
+        let rounds = m.rounds.len() as f64;
+        println!(
+            "  decode residency: {:.1} hits, {:.1} misses, {:.2} MB moved per round",
+            (h1 - h0) as f64 / rounds,
+            (m1 - m0) as f64 / rounds,
+            (after.bytes_moved[0] - before.bytes_moved[0]) as f64 / rounds / 1e6
+        );
         let (alpha, extents) = m.acceptance();
         let alpha: Vec<String> = alpha
             .iter()

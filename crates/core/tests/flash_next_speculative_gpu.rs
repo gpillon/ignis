@@ -82,6 +82,13 @@ fn engine_with(kv_format: KvFormat, backend: SpeculativeBackend) -> Option<Flash
     }
 }
 
+/// Every width's bit: at `DRAFT_TOKENS` under the default 8-row budget each
+/// width of the default lanes drafts at least one token, so each captures
+/// its verify pass and commit graphs.
+fn every_width_verifies() -> u32 {
+    (1u32 << ignis_core::flash_next::DEFAULT_DECODE_LANES) - 1
+}
+
 /// The converter's G1 prompts (real text), or None with a skip.
 fn g1_prompts() -> Option<Vec<Vec<u32>>> {
     let refs = model_dir().join("references").join("g1_flash_next.json");
@@ -264,6 +271,12 @@ fn a_rejected_draft_is_a_draft_never_made_on_every_state_component() {
     for kv_format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
         let Some(mut engine) = engine(kv_format) else { return };
         assert_ne!(engine.graphs_ready(), 0, "{kv_format:?}: no round graph captured: {:?}", engine.graph_error());
+        assert_eq!(
+            engine.verify_graphs_ready(),
+            Ok(every_width_verifies()),
+            "{kv_format:?}: a verify graph did not capture: {:?}",
+            engine.graph_error()
+        );
         exercise(&mut engine, kv_format, &g1[..1], &format!("{kv_format:?} one lane, dense"));
         exercise(&mut engine, kv_format, &g1[..3], &format!("{kv_format:?} three lanes, dense"));
         exercise(&mut engine, kv_format, std::slice::from_ref(&long), &format!("{kv_format:?} one lane, sparse"));
@@ -302,6 +315,12 @@ fn the_mtp_head_drafts_and_the_text_is_kept() {
     let long = long_prompt(&g1);
     for kv_format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
         let Some(mut engine) = engine_with(kv_format, SpeculativeBackend::Mtp) else { return };
+        assert_eq!(
+            engine.verify_graphs_ready(),
+            Ok(every_width_verifies()),
+            "{kv_format:?}: an MTP verify graph did not capture: {:?}",
+            engine.graph_error()
+        );
         for (prompts, what) in [
             (g1[..1].to_vec(), format!("{kv_format:?} MTP one lane, dense")),
             (g1[..3].to_vec(), format!("{kv_format:?} MTP three lanes, dense")),
