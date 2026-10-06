@@ -27,6 +27,7 @@
 #include "indexer.h"
 #include "qsa.h"
 #include "qsa_sparse.h"
+#include "verify.h"
 
 #include "ignis_fn_residual_tap.h"
 #include "ignis_fp8_linear.h"
@@ -57,12 +58,16 @@ std::size_t aligned(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 // time, their logits in the chunk's scratch, then copied out.
 constexpr int32_t kSpanLogitRows = 32;
 
+}  // namespace
+
 // The KV positions a decode round's indexer and attention are sized for: the context, past the
 // dense threshold so a round is never dense (flash_next_internal.h: a decode graph's selection is
 // always written).
 int32_t decode_max_visible(const FlashNextModel &fn) {
   return std::max<int32_t>(static_cast<int32_t>(fn.max_context_tokens), fn.g.dense_threshold() + 1);
 }
+
+namespace {
 
 // The ops' peak in the arena over one call of `rows` rows, `tokens` per lane, at most
 // `max_visible` visible positions. The ops run one after another, each in its own scope; only
@@ -87,15 +92,28 @@ std::size_t call_scratch_bytes(const Geometry &g, int32_t kv_format, int32_t row
   return peak + 4096;
 }
 
+int32_t attention_layers(const FlashNextModel &fn) {
+  int32_t n = 0;
+  for (const LayerWeights &layer : fn.weights->layers) n += layer.attention ? 1 : 0;
+  return n;
+}
+
+int32_t gdn_layers(const FlashNextModel &fn) {
+  return static_cast<int32_t>(fn.weights->layers.size()) - attention_layers(fn);
+}
+
 Sizes plan_sizes(const FlashNextModel &fn) {
   const Geometry &g = fn.g;
   Sizes s;
   const auto chunk = static_cast<int32_t>(fn.prefill_chunk_tokens);
   const auto lanes = static_cast<int32_t>(fn.decode_lanes);
+  // A decode call's rows: a round's lanes, or a verify round's columns (whose hq rows are the
+  // listed ones, as a round's: sized as one-token rows).
+  const auto decode_rows = static_cast<int32_t>(fn.decode_rows);
   s.prefill_scratch = call_scratch_bytes(g, fn.kv_format, chunk, chunk, static_cast<int32_t>(fn.max_context_tokens),
                                          /*span_head=*/true);
-  s.decode_scratch = call_scratch_bytes(g, fn.kv_format, lanes, 1, decode_max_visible(fn), /*span_head=*/false) +
-                     fn_head_scratch_bytes(g, lanes);
+  s.decode_scratch = call_scratch_bytes(g, fn.kv_format, decode_rows, 1, decode_max_visible(fn), /*span_head=*/false) +
+                     fn_head_scratch_bytes(g, decode_rows);
   const auto rows = static_cast<std::size_t>(fn.rows());
   s.activations = aligned(rows * g.residual_width() * 2) + 2 * aligned(rows * g.hidden * 2) +
                   aligned(rows * g.streams * sizeof(float)) + aligned(rows * sizeof(int32_t)) +
@@ -104,12 +122,17 @@ Sizes plan_sizes(const FlashNextModel &fn) {
   const std::size_t router = aligned(rows * g.experts_per_token * sizeof(int32_t)) +
                              aligned(rows * g.experts_per_token * sizeof(float)) +
                              aligned(rows * g.experts * sizeof(float));
-  s.moe = aligned(ignis_moe_workspace_bytes(fn.decode_lanes, fn.prefill_chunk_tokens)) +
+  s.moe = aligned(ignis_moe_workspace_bytes(fn.decode_rows, fn.prefill_chunk_tokens)) +
           aligned(rows * g.hidden * sizeof(int64_t)) + 2 * router +
           aligned(rows * g.shared_intermediate * sizeof(__nv_bfloat16)) + aligned(rows * g.hidden * sizeof(float));
   s.sampling_logits = static_cast<std::size_t>(g.vocab) * IGNIS_DECODE_MAX_BATCH * sizeof(std::uint16_t);
   s.sampling_workspace =
       std::max<std::size_t>(ninfer::ops::sampling_workspace_capacity_bytes(g.vocab, 1, IGNIS_DECODE_MAX_BATCH), 256);
+  if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    s.verify = verify::plan(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
+                            attention_layers(fn), gdn_layers(fn))
+                   .total();
+  }
   return s;
 }
 
@@ -137,12 +160,6 @@ std::string geometry_refusal(const Geometry &g) {
   return {};
 }
 
-// The lanes' state sections the ops read, from the pool the call runs on.
-struct Views {
-  std::vector<IndexerLayerState> indexer;
-  Context ctx;
-};
-
 std::string pool_refusal(const FlashNextModel &fn, const ignis_seq_pool &pool) {
   const Geometry &g = fn.g;
   int32_t attention = 0;
@@ -163,6 +180,8 @@ std::string pool_refusal(const FlashNextModel &fn, const ignis_seq_pool &pool) {
   return {};
 }
 
+}  // namespace
+
 Views views_of(const FlashNextModel &fn, ignis_seq_pool *pool) {
   Views v;
   for (int32_t layer = 0; layer < pool->kv_num_layers; ++layer) {
@@ -181,11 +200,15 @@ Views views_of(const FlashNextModel &fn, ignis_seq_pool *pool) {
   return v;
 }
 
+namespace {
+
 bool check_cuda(cudaError_t err, const std::string &what, std::string *error) {
   if (err == cudaSuccess) return true;
   *error = what + " failed: " + cudaGetErrorString(err);
   return false;
 }
+
+}  // namespace
 
 // The call's whole forward to the final residual: embed, every layer. `phase` is residency's.
 int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint32_t phase,
@@ -296,7 +319,7 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
       }
     }
     const ignis_moe_slot *slots = ignis_residency_slot_table(fn.residency, static_cast<uint32_t>(l));
-    ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_lanes, fn.prefill_chunk_tokens};
+    ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
     auto *acc = static_cast<int64_t *>(fn.moe_acc->p);
     const int32_t experts =
         phase == IGNIS_RESIDENCY_DECODE
@@ -341,6 +364,8 @@ void advance_frontiers(ignis_seq *seq, uint32_t tokens) {
   for (auto &frontier : seq->gdn_positions) frontier += tokens;
 }
 
+namespace {
+
 float bf16_to_f32(std::uint16_t bits) {
   const std::uint32_t widened = static_cast<std::uint32_t>(bits) << 16;
   float value;
@@ -381,7 +406,7 @@ uint32_t max_decode_lanes() {
 }
 
 int32_t FlashNextModel::rows() const {
-  return static_cast<int32_t>(std::max(prefill_chunk_tokens, decode_lanes));
+  return static_cast<int32_t>(std::max(prefill_chunk_tokens, decode_rows));
 }
 
 FlashNextModel::FlashNextModel() = default;
@@ -403,6 +428,12 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
   fn->max_context_tokens = max_context_tokens;
   fn->decode_lanes = options != nullptr && options->decode_lanes != 0 ? options->decode_lanes : kDefaultDecodeLanes;
   fn->residency = options != nullptr ? options->residency : nullptr;
+  if (options != nullptr) {
+    fn->speculative_backend = options->speculative_backend;
+    fn->draft_tokens = options->draft_tokens;
+    fn->draft_row_budget = options->draft_row_budget;
+  }
+  fn->decode_rows = fn->decode_lanes;
   if (fn->decode_lanes > max_decode_lanes()) {
     *error = "decode_lanes " + std::to_string(fn->decode_lanes) + " is more than the " +
              std::to_string(max_decode_lanes()) + " a Flash-Next round serves";
@@ -423,6 +454,20 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
     *error = "Qwen3.8-Flash-Next's program does not run this geometry (its weights bind): " + why;
     return nullptr;
   }
+  // Spec flash-next/07: the verify round, with a test's drafts (VERIFY_ONLY) or the MTP head's.
+  if (fn->speculative_backend == IGNIS_SPECULATIVE_MTP) {
+    *error = "the MTP head's companion weights are not bound by this load";
+    return nullptr;
+  }
+  if (fn->speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    if (const std::string why = verify::refusal(fn->g, fn->decode_lanes, fn->draft_tokens, fn->draft_row_budget,
+                                                attention_layers(*fn), gdn_layers(*fn));
+        !why.empty()) {
+      *error = "Qwen3.8-Flash-Next's verify round: " + why;
+      return nullptr;
+    }
+    fn->decode_rows = verify::decode_rows(fn->decode_lanes, fn->draft_tokens, fn->draft_row_budget);
+  }
   try {
     fn->rope = ninfer::ops::rope_linear_frequencies(static_cast<float>(topology.rope_theta),
                                                     static_cast<int>(topology.rotary_dim));
@@ -440,6 +485,7 @@ ignis_model_reservations reservations(const FlashNextModel &fn) {
   out.sampling_bytes = sampling_staging_bytes(fn.sizes);
   out.decode_graph_bytes = fn.sizes.decode_scratch;
   out.activation_bytes = fn.sizes.activations + fn.sizes.moe;
+  out.verify_round_bytes = fn.sizes.verify;
   return out;
 }
 
@@ -467,6 +513,7 @@ ignis_model_reservations reserved(const ignis_model &model) {
                              &fn.shared_h, &fn.shared_out}) {
     out.activation_bytes += bytes(*buffer);
   }
+  out.verify_round_bytes = fn.verify != nullptr ? fn.verify->device_bytes() : 0;
   return out;
 }
 
@@ -547,7 +594,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     fn.slots = buffer(lanes * sizeof(int32_t));
     fn.positions = buffer(lanes * sizeof(int32_t));
     fn.ngram_rows = buffer(rows * g.ngram_heads * g.ngram_row_bytes());
-    fn.moe_workspace = buffer(ignis_moe_workspace_bytes(fn.decode_lanes, fn.prefill_chunk_tokens));
+    fn.moe_workspace = buffer(ignis_moe_workspace_bytes(fn.decode_rows, fn.prefill_chunk_tokens));
     fn.moe_acc = buffer(rows * g.hidden * sizeof(int64_t));
     fn.router_ids = buffer(rows * g.experts_per_token * sizeof(int32_t));
     fn.router_weights = buffer(rows * g.experts_per_token * sizeof(float));
@@ -561,7 +608,15 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     *error = std::string("Flash-Next's reservations: ") + e.what();
     return -1;
   }
-  ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_lanes, fn.prefill_chunk_tokens};
+  if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    fn.verify = verify::create(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
+                               attention_layers(fn), gdn_layers(fn), error);
+    if (fn.verify == nullptr) {
+      *error = "Flash-Next's verify round: " + *error;
+      return -1;
+    }
+  }
+  ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
   if (ignis_moe_workspace_init(&workspace, static_cast<int64_t *>(fn.moe_acc->p), model.stream) != 0) {
     *error = std::string("ignis_moe_workspace_init: ") + ignis_moe_last_error();
     return -1;
@@ -795,13 +850,15 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   if (options == nullptr || options->size != sizeof(ignis_decode_options)) {
     return refuse("a Flash-Next round needs its options: the lanes' n-gram rows");
   }
-  if (options->speculative_window != 0 || options->drafts != nullptr) {
-    return refuse("Qwen3.8-Flash-Next has no speculative decoding");
-  }
   if (options->ngram_rows == nullptr) return refuse("a Flash-Next round needs the lanes' n-gram rows");
   if (const std::string why = pool_refusal(fn, *pool); !why.empty()) return refuse(why);
   if (fn.captured_pool != nullptr && fn.captured_pool != pool) {
     return refuse("the round's pool is not the one its graphs were captured against");
+  }
+  // Spec flash-next/07: a speculative window is the verify round (speculative.cu).
+  if (options->speculative_window != 0 || options->drafts != nullptr) {
+    if (fn.verify == nullptr) return refuse("this Flash-Next load has no speculative decoding");
+    return program_verify(model, pool, sequences, batch_size, sampling, out_token_ids, options);
   }
 
   const auto width = static_cast<uint32_t>(batch_size);
@@ -983,8 +1040,19 @@ int32_t capture_decode_graphs(ignis_model *model, ignis_seq_pool *pool, uint32_t
       *error = "ignis_decode_graph_capture: width " + std::to_string(width) + ": " + failure;
     }
   }
+  // Spec flash-next/07: the verify round's pass and commit graphs, after the rounds'.
+  if (fn.verify != nullptr) {
+    std::string failure;
+    (void)capture_verify_graphs(model, pool, &failure);
+    if (!failure.empty()) *error = "ignis_decode_graph_capture: " + failure;
+  }
   fn.captured_pool = pool;
   return 0;
+}
+
+uint32_t verify_ready_mask(const ignis_model &model) {
+  const FlashNextModel &fn = *model.flash_next;
+  return fn.verify != nullptr ? fn.verify->ready_mask() : 0;
 }
 
 }  // namespace ignis::flash_next

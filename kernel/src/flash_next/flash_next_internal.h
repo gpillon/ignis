@@ -260,6 +260,33 @@ struct NgramWeights {
 };
 
 // ---------------------------------------------------------------------------
+// A verify call (spec flash-next/07 phase C, verify.h): `lanes` lanes of `tokens` = k + 1 columns
+// each -- the anchor, then the drafts -- at positions[l] .. positions[l] + k, none of them
+// committed yet. What the ops do differently on it, and where they record what the commit needs:
+// - fn_gdn_layer leaves the lanes' recurrent state and conv taps as they are: its recurrence is the
+//   vendored replay record (columns from valid_columns[l] on are no transition), and the layer's
+//   raw k, v, {g, beta} and conv inputs land in its records below;
+// - fn_indexer_select copies the call's raw keys -- its tail and pooled blocks advance in place --
+//   to indexer_keys;
+// - fn_qsa_attention decodes every column's listed hq rows, never a lane's visible rows.
+// Rows are lane-major throughout: row = lane * tokens + column.
+struct VerifyRecords {
+  const int32_t *valid_columns = nullptr;  // DEVICE [lanes]: extent + 1, in [1, tokens]
+  // GDN layer `ordinal`'s records start at these + ordinal * gdn_layer_bytes: key BF16
+  // [rows][16][128], value BF16 [rows][48][128], {g, beta} fp32 pairs [rows][48], conv inputs BF16
+  // [rows][10240] (the vendored replay record's layouts, and our fold's).
+  void *gdn_key = nullptr;
+  void *gdn_value = nullptr;
+  void *gdn_gate = nullptr;
+  void *gdn_conv = nullptr;
+  std::size_t gdn_layer_bytes = 0;
+  // Attention layer `ordinal`'s raw indexer keys, BF16 [rows][indexer_head_dim], at indexer_keys +
+  // ordinal * indexer_layer_bytes.
+  void *indexer_keys = nullptr;
+  std::size_t indexer_layer_bytes = 0;
+};
+
+// ---------------------------------------------------------------------------
 // A call's sequences.
 struct Batch {
   int32_t lanes = 0;   // sequences in the call
@@ -275,6 +302,8 @@ struct Batch {
   // dense); in decode the graph's own bound, so a decode call never branches
   // on it.
   int32_t max_visible = 0;
+  // HOST: a verify call's records (above), or null for every other call.
+  const VerifyRecords *verify = nullptr;
   int32_t rows() const { return lanes * tokens; }
 };
 

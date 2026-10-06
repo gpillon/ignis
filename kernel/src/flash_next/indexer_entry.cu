@@ -33,6 +33,22 @@ int32_t fn_indexer_select(const Context &ctx, int32_t attn_ordinal, const Indexe
   const int32_t qk_cols = (g.indexer_heads + g.indexer_kv_heads) * g.indexer_head_dim;
   void *qk = scratch.alloc_bytes(static_cast<size_t>(batch.rows()) * qk_cols * sizeof(__nv_bfloat16)).data;
   if (fn_linear(w.qk_proj, x, batch.rows(), qk, false, scratch, stream) != 0) return -1;
+  // A verify call's raw keys: its tail and pooled blocks advance in place, and the commit rebuilds
+  // the tail of the frontier it keeps from these (verify.h).
+  if (batch.verify != nullptr) {
+    const std::size_t element = 2;  // BF16
+    const std::size_t key_bytes = static_cast<std::size_t>(g.indexer_kv_heads) * g.indexer_head_dim * element;
+    const auto *keys = static_cast<const unsigned char *>(qk) +
+                       static_cast<std::size_t>(g.indexer_heads) * g.indexer_head_dim * element;
+    void *record = static_cast<unsigned char *>(batch.verify->indexer_keys) +
+                   static_cast<std::size_t>(attn_ordinal) * batch.verify->indexer_layer_bytes;
+    if (cudaMemcpy2DAsync(record, key_bytes, keys, static_cast<std::size_t>(qk_cols) * element, key_bytes,
+                          static_cast<std::size_t>(batch.rows()), cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+      fn_set_error(std::string("fn_indexer_select: recording the verify keys: ") +
+                   cudaGetErrorString(cudaGetLastError()));
+      return -1;
+    }
+  }
 
   ix::Paged paged;
   paged.block_tables = static_cast<const int32_t *>(ctx.pool->kv_pool.block_tables().data);

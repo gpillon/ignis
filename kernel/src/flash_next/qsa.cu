@@ -275,6 +275,9 @@ int32_t run(const Geometry &g, const Kv &kv, const indexer::Rope &rope, const Qs
   if (batch.tokens == 1 && batch.lanes > kMaxDecodeLanes) {
     return fail("a decode call is at most " + std::to_string(kMaxDecodeLanes) + " lanes");
   }
+  if (batch.verify != nullptr && rows > kMaxDecodeLanes) {
+    return fail("a verify call is at most " + std::to_string(kMaxDecodeLanes) + " rows");
+  }
   const bool hq = kv.kv_format == IGNIS_KV_FORMAT_HQ_E8_2B;
 
   try {
@@ -316,7 +319,9 @@ int32_t run(const Geometry &g, const Kv &kv, const indexer::Rope &rope, const Qs
       src.residual_v = kv.residual_v;
       src.ring_valid = kv.ring;
       sparse::Status st = nullptr;
-      if (!selection.dense && batch.tokens == 1) {
+      // A decode or verify call decodes its rows' listed tokens; a prefill chunk its lane's visible
+      // rows, once for all its rows.
+      if (!selection.dense && (batch.tokens == 1 || batch.verify != nullptr)) {
         const std::size_t bytes = sparse::listed_hq_bytes(g, rows);
         auto *kd = static_cast<__nv_bfloat16 *>(scratch.alloc_bytes(bytes).data);
         auto *vd = static_cast<__nv_bfloat16 *>(scratch.alloc_bytes(bytes).data);

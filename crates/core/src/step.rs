@@ -1256,6 +1256,44 @@ pub fn decode_program_verify_runs(
     lanes: &[VerifyLane<'_>],
     window: u32,
 ) -> Result<Vec<LaneVerifyRun>, String> {
+    verify_round(model, pool, sequences, lanes, window, std::ptr::null())
+}
+
+/// GitHub #307 (spec flash-next/07): one Flash-Next verify round at the
+/// width's `window` ([`crate::speculation::flash_next_window`]), each lane's
+/// drafts its own (a test's fake drafter; empty: extent 0), with every
+/// lane's n-gram table rows for its `window + 1` columns -- the anchor, its
+/// drafts, then anything (the anchor again) up to the window --
+/// `[lanes][window + 1][16][90]`, hashed on the lane's context as if the
+/// columns were committed in order.
+pub fn decode_flash_next_verify(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[VerifyLane<'_>],
+    window: u32,
+    ngram_rows: &[u8],
+) -> Result<Vec<LaneVerifyRun>, String> {
+    let columns = window as usize + 1;
+    if ngram_rows.len() != sequences.len() * columns * flash_next_ngram_token_bytes() {
+        return Err(format!(
+            "decode_flash_next_verify: {} n-gram row bytes for {} lanes of {columns} columns of {} bytes",
+            ngram_rows.len(),
+            sequences.len(),
+            flash_next_ngram_token_bytes()
+        ));
+    }
+    verify_round(model, pool, sequences, lanes, window, ngram_rows.as_ptr())
+}
+
+fn verify_round(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[VerifyLane<'_>],
+    window: u32,
+    ngram_rows: *const u8,
+) -> Result<Vec<LaneVerifyRun>, String> {
     if lanes.len() != sequences.len() {
         return Err(format!(
             "decode_program_verify: {} lanes for {} sequences",
@@ -1316,7 +1354,7 @@ pub fn decode_program_verify_runs(
         // GitHub #242: a verify round refuses a permitted set outright, so
         // there is no probability for it to report.
         out_permitted_probs: std::ptr::null_mut(),
-        ngram_rows: std::ptr::null(),
+        ngram_rows,
     };
     let rc = unsafe {
         ffi::ignis_program_decode(

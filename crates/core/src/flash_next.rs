@@ -20,6 +20,7 @@ use ignis_artifact::{materialize, CudaDevice, Device, MaterializedArtifact, Read
 use crate::compute::ModelConfig;
 use crate::kv_format::KvFormat;
 use crate::model_load::{load_flash_next, plan_flash_next_reservations, IgnisModelReservations, Model};
+use crate::ngram::NgramContext;
 use crate::ngram_table::{NgramTable, NgramTableOptions};
 use crate::residency::device::{DeviceResidency, ResidencyDesc};
 use crate::residency::load::{catalog, fill_expert_pool, pool_layout};
@@ -28,7 +29,10 @@ use crate::residency::{
     residency_table_bytes, warm_start_order, ExpertCacheRequest, ExpertTraffic, KClass,
 };
 use crate::seq::{SeqPool, SeqPoolBudget};
-use crate::step::{capture_decode_graphs, decode_flash_next, prefill_flash_next, SamplingParams};
+use crate::speculation::FlashNextSpeculation;
+use crate::step::{
+    capture_decode_graphs, decode_flash_next, decode_flash_next_verify, prefill_flash_next, SamplingParams, VerifyLane,
+};
 
 /// The prefetch lookahead residency ranks per lane: the next layer's top 16.
 pub const LOOKAHEAD_WIDTH: u32 = 16;
@@ -58,6 +62,9 @@ pub struct EngineOptions {
     /// The KV-RAM arena this load pins for its host tier
     /// (`--kv-host-pool-bytes`); 0 creates none.
     pub kv_ram_arena_bytes: u64,
+    /// Speculative decoding (spec flash-next/07): the verify round at the
+    /// load's windows; `None` runs one-token rounds only.
+    pub speculation: Option<FlashNextSpeculation>,
 }
 
 impl EngineOptions {
@@ -120,6 +127,7 @@ impl Default for EngineOptions {
             retained_device_slots: 0,
             retained_host_slots: 0,
             kv_ram_arena_bytes: 0,
+            speculation: None,
         }
     }
 }
@@ -253,6 +261,7 @@ impl FlashNextEngine {
             options.max_context_tokens,
             options.kv_format,
             options.decode_lanes,
+            options.speculation,
         )?;
 
         let weights = DeviceWeights::place(&reader, &plan)?;
@@ -268,6 +277,7 @@ impl FlashNextEngine {
             options.kv_format,
             options.decode_lanes,
             &residency,
+            options.speculation,
         )?;
         // The pool is planned against what is free before it is created, so a
         // context the card cannot hold is a refusal naming it, not an
@@ -511,6 +521,177 @@ impl FlashNextEngine {
         }
         Ok((out, times))
     }
+
+    /// Greedy generation of `count` tokens after each prompt with the
+    /// load's speculation (spec flash-next/07), on lanes of one prompt each.
+    /// Every round, `drafter(lane, emitted, window)` proposes the lane's
+    /// drafts (at most `window`, the width's; empty: extent 0); a round of
+    /// width 0's window, or whose lanes cannot all fit the window's columns,
+    /// runs as a one-token round.
+    pub fn generate_speculative(
+        &self,
+        prompts: &[Vec<u32>],
+        count: usize,
+        drafter: &mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>,
+    ) -> Result<SpeculativeRun<'_>, String> {
+        let speculation = self.options.speculation.ok_or("this engine was loaded without speculation")?;
+        if prompts.is_empty() || prompts.len() > self.options.decode_lanes as usize {
+            return Err(format!("{} prompts on {} lanes", prompts.len(), self.options.decode_lanes));
+        }
+        let mut seqs = Vec::with_capacity(prompts.len());
+        let mut contexts = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            let mut seq = self.pool.alloc(self.options.max_context_tokens)?;
+            let mut context = self.table.new_context();
+            let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
+            self.table.stage(&mut context, prompt, &mut rows)?;
+            let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], &rows, None, None)?;
+            seqs.push(seq);
+            contexts.push(context);
+        }
+        let mut out = vec![Vec::with_capacity(count); prompts.len()];
+        let mut rounds = Vec::new();
+        let mut times = Vec::new();
+        let context_tokens = self.table.new_context().recent().len();
+        loop {
+            let active: Vec<usize> = (0..prompts.len()).filter(|&i| out[i].len() < count).collect();
+            if active.is_empty() {
+                break;
+            }
+            let began = std::time::Instant::now();
+            let width = active.len() as u32;
+            let window = speculation.window(width);
+            let anchors: Vec<u32> = active
+                .iter()
+                .map(|&i| seqs[i].pending_token().map(|t| t as u32).ok_or("a lane has no pending token"))
+                .collect::<Result<_, _>>()?;
+            let fits = active
+                .iter()
+                .all(|&i| seqs[i].stats().position + u64::from(window) < u64::from(self.options.max_context_tokens));
+            let mut round = Vec::with_capacity(active.len());
+            if window == 0 || !fits {
+                let mut rows = vec![0u8; active.len() * self.table.token_bytes()];
+                let mut lane_contexts: Vec<NgramContext> = active.iter().map(|&i| contexts[i].clone()).collect();
+                {
+                    let mut batch: Vec<(&mut NgramContext, &[u32])> = lane_contexts
+                        .iter_mut()
+                        .zip(&anchors)
+                        .map(|(c, t)| (c, std::slice::from_ref(t)))
+                        .collect();
+                    self.table.begin_batch(&mut batch)?.finish(&mut rows)?;
+                }
+                let mut handles: Vec<_> =
+                    seqs.iter_mut().enumerate().filter(|(i, _)| active.contains(i)).map(|(_, s)| s).collect();
+                let greedy = vec![(SamplingParams::greedy(), &[][..]); handles.len()];
+                let emitted = decode_flash_next(&self.model, &self.pool, &mut handles, &greedy, &rows)?;
+                for ((&lane, (token, _)), context) in active.iter().zip(emitted).zip(lane_contexts) {
+                    out[lane].push(token as u32);
+                    contexts[lane] = context;
+                    round.push(LaneRound { extent: 0, committed: 1 });
+                }
+            } else {
+                let columns = window as usize + 1;
+                let drafts: Vec<Vec<i32>> = active
+                    .iter()
+                    .map(|&i| {
+                        let mut proposed = drafter(i, &out[i], window);
+                        proposed.truncate(window as usize);
+                        proposed.into_iter().map(|t| t as i32).collect()
+                    })
+                    .collect();
+                // Each lane's columns hashed as if committed in order: the
+                // anchor, its drafts, then the anchor again up to the window.
+                let column_tokens: Vec<Vec<u32>> = (0..active.len())
+                    .map(|a| {
+                        let mut tokens = vec![anchors[a]];
+                        tokens.extend(drafts[a].iter().map(|&t| t as u32));
+                        tokens.resize(columns, anchors[a]);
+                        tokens
+                    })
+                    .collect();
+                let mut rows = vec![0u8; active.len() * columns * self.table.token_bytes()];
+                {
+                    let mut scratch: Vec<NgramContext> = active.iter().map(|&i| contexts[i].clone()).collect();
+                    let mut batch: Vec<(&mut NgramContext, &[u32])> =
+                        scratch.iter_mut().zip(&column_tokens).map(|(c, t)| (c, &t[..])).collect();
+                    self.table.begin_batch(&mut batch)?.finish(&mut rows)?;
+                }
+                let lanes: Vec<VerifyLane<'_>> = active
+                    .iter()
+                    .zip(&drafts)
+                    .map(|(&i, d)| VerifyLane {
+                        sampling: SamplingParams::greedy(),
+                        remaining_tokens: (count - out[i].len()) as u32,
+                        stop_ids: &[],
+                        drafts: d,
+                    })
+                    .collect();
+                let mut handles: Vec<_> =
+                    seqs.iter_mut().enumerate().filter(|(i, _)| active.contains(i)).map(|(_, s)| s).collect();
+                let runs = decode_flash_next_verify(&self.model, &self.pool, &mut handles, &lanes, window, &rows)?;
+                for (&lane, run) in active.iter().zip(runs) {
+                    let committed: Vec<u32> = run.tokens.iter().map(|&t| t as u32).collect();
+                    // The context after the run: its last tokens.
+                    let mut history = contexts[lane].recent().to_vec();
+                    history.extend_from_slice(&committed);
+                    contexts[lane] =
+                        NgramContext::from_recent(self.table.hasher(), &history[history.len() - context_tokens..])?;
+                    round.push(LaneRound { extent: run.extent, committed: committed.len() as u32 });
+                    out[lane].extend_from_slice(&committed);
+                }
+            }
+            times.push(began.elapsed());
+            rounds.push(round);
+        }
+        Ok(SpeculativeRun { tokens: out, rounds, times, sequences: seqs, contexts })
+    }
+
+    /// The logits after one more token on a sequence `generate_speculative`
+    /// left standing: its pending token prefilled at its frontier, through
+    /// every state section the next step reads (spec flash-next/07's probe
+    /// of "the state a later step reads"). Moves the sequence one token on.
+    pub fn probe_logits(&self, seq: &mut crate::seq::Seq<'_>, context: &mut NgramContext) -> Result<Vec<f32>, String> {
+        let pending = seq.pending_token().ok_or("the sequence has no pending token")?;
+        let mut rows = vec![0u8; self.table.token_bytes()];
+        self.table.stage(context, &[pending as u32], &mut rows)?;
+        let mut logits = vec![0f32; self.vocab()];
+        let position = seq.stats().position;
+        prefill_flash_next(
+            &self.model,
+            &self.pool,
+            seq,
+            &[pending],
+            position,
+            SamplingParams::greedy(),
+            &[],
+            &rows,
+            None,
+            Some(&mut logits),
+        )?;
+        Ok(logits)
+    }
+}
+
+/// One lane's share of a speculative round ([`FlashNextEngine::generate_speculative`]):
+/// the drafts it verified (its extent; 0 in a one-token round) and the tokens
+/// it committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneRound {
+    pub extent: u32,
+    pub committed: u32,
+}
+
+/// What [`FlashNextEngine::generate_speculative`] produced: each lane's
+/// tokens, every round's lanes (the lanes still generating, in prompt order)
+/// and wall time, and the lanes' sequences, standing after their last
+/// committed token with their next one pending.
+pub struct SpeculativeRun<'p> {
+    pub tokens: Vec<Vec<u32>>,
+    pub rounds: Vec<Vec<LaneRound>>,
+    pub times: Vec<std::time::Duration>,
+    pub sequences: Vec<crate::seq::Seq<'p>>,
+    pub contexts: Vec<NgramContext>,
 }
 
 /// What [`FlashNextEngine::tapped_span`] captured: `stacks` is BF16 bits

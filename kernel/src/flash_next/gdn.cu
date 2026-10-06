@@ -48,10 +48,11 @@ __device__ __forceinline__ float round_bf16(float v) { return __bfloat162float(_
 // kConvChunk tokens); the output goes straight to the recurrence's q [rows][2048] | k [rows][2048]
 // | v [rows][6144]. The taps (the pool's [slot][3][channels], oldest first) are read and then
 // rewritten by the chunk-0 thread alone: no other thread of the lane reads them, since a chunk
-// past the first starts kConvChunk >= 3 tokens in.
+// past the first starts kConvChunk >= 3 tokens in. A verify call (keep_taps) reads them and
+// leaves them: the commit's fold writes the taps of the columns it keeps.
 __global__ void conv_kernel(const __nv_bfloat16 *__restrict__ qkv, const __nv_bfloat16 *__restrict__ weight,
                             __nv_bfloat16 *__restrict__ taps, const int32_t *__restrict__ slots, int32_t slot_count,
-                            int32_t tokens, int32_t chunks, __nv_bfloat16 *__restrict__ q,
+                            int32_t tokens, int32_t chunks, bool keep_taps, __nv_bfloat16 *__restrict__ q,
                             __nv_bfloat16 *__restrict__ k, __nv_bfloat16 *__restrict__ v) {
   const int32_t c = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (c >= kConvChannels) return;
@@ -99,7 +100,7 @@ __global__ void conv_kernel(const __nv_bfloat16 *__restrict__ qkv, const __nv_bf
     u[1] = u[2];
     u[2] = xt;
   }
-  if (chunk == 0) {
+  if (chunk == 0 && !keep_taps) {
     for (int32_t j = 0; j < kConvStateTaps; ++j) {
       const int32_t t = tokens - kConvStateTaps + j;
       const float value = t >= 0 ? __bfloat162float(x[static_cast<int64_t>(t) * kConvChannels]) : old[kConvStateTaps + t];
@@ -215,18 +216,29 @@ const char *check_geometry(const Geometry &g) {
 }
 
 int32_t run(const Geometry &g, const State &state, const GdnWeights &w, const Batch &batch,
-            const void *x, void *y, ninfer::DeviceArena &scratch, cudaStream_t stream) {
+            const void *x, void *y, ninfer::DeviceArena &scratch, cudaStream_t stream, int32_t ordinal) {
   if (const char *why = check_geometry(g)) {
     fn_set_error(why);
     return -1;
   }
   const int32_t rows = batch.rows();
   const bool per_lane = batch.tokens == 1;
+  const VerifyRecords *record = batch.verify;
   if (rows <= 0 || batch.slots == nullptr) {
     fn_set_error("gdn: an empty batch, or no slots");
     return -1;
   }
-  if (per_lane ? batch.lanes > kMaxLanes : batch.lanes != 1) {
+  if (record != nullptr) {
+    // A verify call: the vendored replay record's domain.
+    if (batch.lanes > kMaxLanes || batch.tokens < kMinRecordColumns || batch.tokens > kMaxRecordColumns ||
+        record->valid_columns == nullptr || record->gdn_key == nullptr) {
+      fn_set_error("gdn: a verify call is 1.." + std::to_string(kMaxLanes) + " lanes of " +
+                   std::to_string(kMinRecordColumns) + ".." + std::to_string(kMaxRecordColumns) +
+                   " columns with its records (got " + std::to_string(batch.lanes) + " x " +
+                   std::to_string(batch.tokens) + ")");
+      return -1;
+    }
+  } else if (per_lane ? batch.lanes > kMaxLanes : batch.lanes != 1) {
     fn_set_error("gdn: a call is 1.." + std::to_string(kMaxLanes) +
                  " lanes of one token, or one lane of several (got " + std::to_string(batch.lanes) + " x " +
                  std::to_string(batch.tokens) + ")");
@@ -270,11 +282,18 @@ int32_t run(const Geometry &g, const State &state, const GdnWeights &w, const Ba
     gating_kernel<<<(gates + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         a, b, static_cast<const __nv_bfloat16 *>(w.a_log), static_cast<const __nv_bfloat16 *>(w.dt_bias), gf,
         beta, gates);
+    // A verify call's conv inputs, before the recurrence's output overwrites qkv: the fold's taps.
+    if (record != nullptr &&
+        cudaMemcpyAsync(static_cast<unsigned char *>(record->gdn_conv) + static_cast<std::size_t>(ordinal) * record->gdn_layer_bytes,
+                        qkv, r * kConvChannels * 2, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+      fn_set_error(std::string("gdn: recording the conv inputs failed: ") + cudaGetErrorString(cudaGetLastError()));
+      return -1;
+    }
     const int32_t chunks = (batch.tokens + kConvChunk - 1) / kConvChunk;
     const dim3 conv_grid((kConvChannels + kThreads - 1) / kThreads, static_cast<unsigned>(batch.lanes * chunks));
     conv_kernel<<<conv_grid, kThreads, 0, stream>>>(qkv, static_cast<const __nv_bfloat16 *>(w.conv),
                                                      static_cast<__nv_bfloat16 *>(state.conv), batch.slots,
-                                                     state.slots, batch.tokens, chunks, q, k, v);
+                                                     state.slots, batch.tokens, chunks, record != nullptr, q, k, v);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
       fn_set_error(std::string("gdn: launch failed: ") + cudaGetErrorString(err));
@@ -282,7 +301,29 @@ int32_t run(const Geometry &g, const State &state, const GdnWeights &w, const Ba
     }
 
     const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    if (per_lane) {
+    if (record != nullptr) {
+      // Every lane's k + 1 columns from its slot's state, which stays as it is; the transitions'
+      // raw inputs go to the layer's records for the commit's fold.
+      const auto layer_at = [&](void *plane) {
+        return static_cast<unsigned char *>(plane) + static_cast<std::size_t>(ordinal) * record->gdn_layer_bytes;
+      };
+      const int32_t t = batch.tokens;
+      const int32_t lanes = batch.lanes;
+      ninfer::Tensor states(state.recurrent, ninfer::DType::FP32, {kHeadDim, kHeadDim, kValueHeads, state.slots});
+      ninfer::Tensor key_record(layer_at(record->gdn_key), ninfer::DType::BF16, {kHeadDim, kQkHeads, t, lanes});
+      ninfer::Tensor value_record(layer_at(record->gdn_value), ninfer::DType::BF16, {kHeadDim, kValueHeads, t, lanes});
+      ninfer::Tensor gate_record(layer_at(record->gdn_gate), ninfer::DType::FP32, {2, kValueHeads, t, lanes});
+      ninfer::Tensor out(qkv, ninfer::DType::BF16, {kHeadDim, kValueHeads, t, lanes});
+      ninfer::ops::gated_delta_net_replay_record(
+          ninfer::Tensor(q, ninfer::DType::BF16, {kHeadDim, kQkHeads, t, lanes}),
+          ninfer::Tensor(k, ninfer::DType::BF16, {kHeadDim, kQkHeads, t, lanes}),
+          ninfer::Tensor(v, ninfer::DType::BF16, {kHeadDim, kValueHeads, t, lanes}),
+          ninfer::Tensor(gf, ninfer::DType::FP32, {kValueHeads, t, lanes, 1}),
+          ninfer::Tensor(beta, ninfer::DType::FP32, {kValueHeads, t, lanes, 1}), scale, states,
+          ninfer::Tensor(const_cast<int32_t *>(record->valid_columns), ninfer::DType::I32, {lanes, 1, 1, 1}),
+          ninfer::Tensor(const_cast<int32_t *>(batch.slots), ninfer::DType::I32, {lanes, 1, 1, 1}), key_record,
+          value_record, gate_record, out, stream);
+    } else if (per_lane) {
       const ninfer::Tensor lane_slots(const_cast<int32_t *>(batch.slots), ninfer::DType::I32,
                                       {batch.lanes, 1, 1, 1});
       ninfer::Tensor states(state.recurrent, ninfer::DType::FP32, {kHeadDim, kHeadDim, kValueHeads, state.slots});
@@ -359,7 +400,7 @@ int32_t fn_gdn_layer(const Context &ctx, int32_t gdn_ordinal, const GdnWeights &
     fn_set_error(std::string("fn_gdn_layer: GDN layer ") + std::to_string(gdn_ordinal) + ": " + e.what());
     return -1;
   }
-  return gdn::run(ctx.g, state, w, batch, x, y, scratch, stream);
+  return gdn::run(ctx.g, state, w, batch, x, y, scratch, stream, gdn_ordinal);
 }
 
 std::size_t fn_gdn_layer_scratch_bytes(const Geometry &g, int32_t rows) {

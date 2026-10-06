@@ -254,6 +254,7 @@ impl StepLeaf for FlashNextLeaf {
             o.kv_format,
             o.decode_lanes,
             &self.residency,
+            o.speculation,
         )
         .map_err(|e| leaf_error("model load", e))?;
         let pool =

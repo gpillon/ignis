@@ -517,6 +517,7 @@ pub fn flash_next_scheduler(
         shape.max_context,
         shape.kv_format,
         lanes,
+        None,
     )?;
     let config = ModelConfig::flash_next_from(&geometry);
     // The options the leaf loads with, but for the expert cache, which is

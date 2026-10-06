@@ -39,6 +39,9 @@ struct ignis_seq;
 namespace ignis::flash_next {
 
 struct Weights;
+namespace verify {
+struct State;
+}
 
 // The decode lanes a load serves when its options name none (spec 04: three
 // agents), and the most it may name: the MoE decode route's and the GDN
@@ -55,6 +58,7 @@ struct Sizes {
   std::size_t moe = 0;              // ignis_moe_plan's total and a second router line (the lookahead)
   std::size_t sampling_logits = 0;  // [IGNIS_DECODE_MAX_BATCH][vocab] BF16
   std::size_t sampling_workspace = 0;
+  std::size_t verify = 0;           // the verify round's buffers (verify.h), 0 without speculation
 };
 
 struct FlashNextModel {
@@ -67,9 +71,17 @@ struct FlashNextModel {
   ninfer::ops::RopeFrequencies rope{};
   // Borrowed: the caller's residency outlives the model (ignis_model.h).
   ignis_residency *residency = nullptr;
+  // Speculation (spec flash-next/07): the load's backend (enum ignis_speculative_backend), its
+  // draft tokens and row budget, and the verify round's buffers (verify.h; null without).
+  int32_t speculative_backend = 0;
+  uint32_t draft_tokens = 0;
+  uint32_t draft_row_budget = 0;
+  std::unique_ptr<verify::State> verify;
+  // The decode route's widest call: a round's lanes, or a verify round's rows (verify::decode_rows).
+  uint32_t decode_rows = 0;
   Sizes sizes;
 
-  // The rows every activation buffer holds: a chunk's, or a round's lanes.
+  // The rows every activation buffer holds: a chunk's, or a round's widest call.
   int32_t rows() const;
 
   // Activations, token-major (flash_next_internal.h), each at a stable
@@ -145,5 +157,30 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
 // for good (it stays eager). *error names the last width that failed.
 int32_t capture_decode_graphs(ignis_model *model, ignis_seq_pool *pool, uint32_t *out_ready_mask,
                               std::string *error);
+
+// The program's steps the verify round (speculative.cu) shares.
+// The lanes' state sections the ops read, from the pool a call runs on.
+struct Views {
+  std::vector<IndexerLayerState> indexer;
+  Context ctx;
+};
+Views views_of(const FlashNextModel &fn, ignis_seq_pool *pool);
+// The KV positions a decode round's indexer and attention are sized for.
+int32_t decode_max_visible(const FlashNextModel &fn);
+// The call's whole forward to the final residual: embed, every layer. `phase` is residency's.
+int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint32_t phase,
+                ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error);
+// Every per-layer frontier of the sequence moves with its program frontier.
+void advance_frontiers(ignis_seq *seq, uint32_t tokens);
+
+// The verify round (spec flash-next/07, speculative.cu): ignis_program_decode with a speculative
+// window on a load with one, after program_decode's own checks.
+int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *const *sequences,
+                       uint64_t batch_size, const ignis_sampling_params *sampling, int32_t *out_token_ids,
+                       const ignis_decode_options *options);
+// Its pass and commit graphs per width that verifies; a width that fails stays eager.
+int32_t capture_verify_graphs(ignis_model *model, ignis_seq_pool *pool, std::string *error);
+// ignis_program_stats' verify_graph_ready_mask.
+uint32_t verify_ready_mask(const ignis_model &model);
 
 }  // namespace ignis::flash_next

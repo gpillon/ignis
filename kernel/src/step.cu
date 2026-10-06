@@ -2565,6 +2565,10 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
       verify_ready_mask |= (1u << (width - 1));
     }
   }
+  // GitHub #307: Flash-Next keeps its own verify round (kernel/src/flash_next/verify.h).
+  if (model->flash_next) {
+    verify_ready_mask = ignis::flash_next::verify_ready_mask(*model);
+  }
   out_stats->decode_graph_ready_mask = ready_mask;
   out_stats->verify_graph_ready_mask = verify_ready_mask;
   return 0;

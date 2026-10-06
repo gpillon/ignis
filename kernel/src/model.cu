@@ -1023,6 +1023,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   uint32_t vision_item_max_tokens = 0;
   uint64_t vision_embedding_pool_request = 0;
   uint32_t attention_text_max_keys = 0;
+  uint32_t draft_row_budget = 0;
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
@@ -1040,6 +1041,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     rope_scaling.beta_fast = options->rope_scaling_beta_fast;
     rope_scaling.beta_slow = options->rope_scaling_beta_slow;
     attention_text_max_keys = options->attention_text_max_keys;
+    draft_row_budget = options->draft_row_budget;
   }
   // GitHub #227: a scaling that cannot build a table is refused by name --
   // the alternative is a load that silently rotates at a different one.
@@ -1070,7 +1072,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   }
   if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
       speculative_backend != IGNIS_SPECULATIVE_DFLASH2 &&
-      speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY) {
+      speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY && speculative_backend != IGNIS_SPECULATIVE_MTP) {
     set_error("ignis_model_load: speculative_backend " + std::to_string(speculative_backend) +
               " is not an ignis_speculative_backend");
     return nullptr;
@@ -1111,9 +1113,14 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // no drafter, vision tower or attention readouts. Its decode lanes and its
   // residency are its options alone.
   if (flash_next) {
-    if (speculative_backend != IGNIS_SPECULATIVE_NONE || vision_max_tokens != 0 ||
-        attention_text_max_keys != 0) {
-      set_error("ignis_model_load: Qwen3.8-Flash-Next has no speculative decoding, vision or attention readouts");
+    if (vision_max_tokens != 0 || attention_text_max_keys != 0) {
+      set_error("ignis_model_load: Qwen3.8-Flash-Next has no vision or attention readouts");
+      return nullptr;
+    }
+    // GitHub #307 (spec flash-next/07): MTP, or the verify round alone for a
+    // test's drafts; DFlash2 is the 27B's.
+    if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+      set_error("ignis_model_load: DFlash2 is the 27B's drafter; Qwen3.8-Flash-Next drafts with its MTP head");
       return nullptr;
     }
     std::string error;
@@ -1127,8 +1134,13 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     model->flash_next.reset(program.release());
     return model;
   }
-  if (options != nullptr && (options->decode_lanes != 0 || options->residency != nullptr)) {
-    set_error("ignis_model_load: decode_lanes and residency are Qwen3.8-Flash-Next's options");
+  if (options != nullptr && (options->decode_lanes != 0 || options->residency != nullptr ||
+                             options->draft_row_budget != 0)) {
+    set_error("ignis_model_load: decode_lanes, residency and draft_row_budget are Qwen3.8-Flash-Next's options");
+    return nullptr;
+  }
+  if (speculative_backend == IGNIS_SPECULATIVE_MTP) {
+    set_error("ignis_model_load: MTP is Qwen3.8-Flash-Next's draft head; the 27B drafts with DFlash2");
     return nullptr;
   }
 
