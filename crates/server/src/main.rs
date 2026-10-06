@@ -292,6 +292,8 @@ async fn main() {
         retained_interactive_ttl_secs: _,
         instruction_policy,
         speculation: _,
+        speculation_off: _,
+        draft_rows: _,
         vision,
         // GitHub #227: read through `EngineShape` above, like the other
         // load-shape knobs.
@@ -463,17 +465,6 @@ async fn main() {
                 exit_after_flush(&logging_handle, 1);
             }
         };
-        // GitHub #302: Flash-Next has no drafter; a flag asking for one is
-        // refused rather than ignored.
-        #[cfg(feature = "cuda")]
-        if family == ModelFamily::FlashNext && engine_shape.speculation.is_some() {
-            tracing::error!(
-                name: "ignis.config.unsupported",
-                model = family.name(),
-                "Qwen3.8-Flash-Next has no speculative decoding: drop --spec -- refusing to start"
-            );
-            exit_after_flush(&logging_handle, 1);
-        }
 
         // The thinking budget's forced close (2026-09-24), in this model's
         // own tokens. A tokenizer that splits `</think>` leaves every budget

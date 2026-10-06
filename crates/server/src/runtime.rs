@@ -57,8 +57,14 @@ pub struct EngineShape {
     /// priority (`--retained-interactive-ttl`, GitHub #190).
     pub retained_interactive_ttl: std::time::Duration,
     /// Speculative decoding (`--spec`/`--draft-tokens`, P5-02 GitHub #150):
-    /// `None` binds nothing of the drafter.
+    /// `None` binds nothing of the drafter -- on Flash-Next, unless its MTP
+    /// head is on by default ([`flash_next_speculation`]).
     pub speculation: Option<ignis_core::Speculation>,
+    /// `--spec off` (GitHub #307): no speculation, the default one included.
+    pub speculation_off: bool,
+    /// Flash-Next's draft row budget (`--draft-rows`, GitHub #307); 0 = the
+    /// decode route's 8 rows.
+    pub draft_rows: u32,
     /// Vision (`--vision`/`--vision-max-tokens`, GitHub #177): `None` binds
     /// and reserves nothing of the vision tower.
     pub vision: Option<ignis_core::Vision>,
@@ -88,6 +94,8 @@ impl Default for EngineShape {
             retained_host_named: false,
             retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
             speculation: None,
+            speculation_off: false,
+            draft_rows: 0,
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
         }
@@ -111,10 +119,33 @@ impl From<&crate::config::Config> for EngineShape {
                 config.retained_interactive_ttl_secs,
             )),
             speculation: config.speculation,
+            speculation_off: config.speculation_off,
+            draft_rows: config.draft_rows.unwrap_or(0),
             vision: config.vision,
             rope_scaling: config.rope_scaling,
         }
     }
+}
+
+/// A Flash-Next load's speculation (spec flash-next/07): its MTP head, on by
+/// default when the companion `companion_present`, at the operator's draft
+/// tokens or the default, cut by the row budget; none under `--spec off`, or
+/// with no companion and nothing asked. The served-model check refused any
+/// other backend before this.
+pub fn flash_next_speculation(
+    shape: &EngineShape,
+    companion_present: bool,
+) -> Result<Option<ignis_core::speculation::FlashNextSpeculation>, String> {
+    use ignis_core::speculation::{FlashNextSpeculation, FLASH_NEXT_DEFAULT_DRAFT_TOKENS};
+    if shape.speculation_off {
+        return Ok(None);
+    }
+    let draft_tokens = match shape.speculation {
+        Some(speculation) => speculation.draft_tokens(),
+        None if companion_present => FLASH_NEXT_DEFAULT_DRAFT_TOKENS,
+        None => return Ok(None),
+    };
+    FlashNextSpeculation::new(ignis_core::SpeculativeBackend::Mtp, draft_tokens, shape.draft_rows).map(Some)
 }
 
 impl EngineShape {
@@ -510,6 +541,24 @@ pub fn flash_next_scheduler(
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
     let geometry = FlashNextGeometry::qwen38_flash_next();
     let plan = flash_next::bind(&reader, &geometry).map_err(|e| format!("bind the Flash-Next artifact: {e:?}"))?;
+    // Spec flash-next/07: the MTP head, its companion pinned to this container and bound for the
+    // plan (its weights are a line of their own, taken from the expert cache).
+    let companion = artifact_path.parent().map(ignis_core::flash_next_mtp::companion_path);
+    let speculation = flash_next_speculation(&shape, companion.as_ref().is_some_and(|path| path.exists()))?;
+    let mtp_plan = match (speculation, &companion) {
+        (Some(_), Some(path)) => {
+            let sidecar = ignis_artifact::packer::sidecar_path(path);
+            let text = std::fs::read(&sidecar).map_err(|e| format!("the MTP head: read {}: {e}", sidecar.display()))?;
+            let sidecar: serde_json::Value =
+                serde_json::from_slice(&text).map_err(|e| format!("the MTP head: {}: {e}", sidecar.display()))?;
+            flash_next::mtp::check_pair(&sidecar, &reader).map_err(|e| e.to_string())?;
+            let companion_reader =
+                Reader::open(path).map_err(|e| format!("the MTP head: open {}: {e}", path.display()))?;
+            Some(flash_next::mtp::bind(&companion_reader, &geometry).map_err(|e| format!("bind the MTP head: {e}"))?)
+        }
+        (Some(_), None) => return Err("the MTP head: the artifact path has no directory".to_string()),
+        (None, _) => None,
+    };
     let reserved = ignis_core::model_load::plan_flash_next_reservations(
         &plan,
         &geometry,
@@ -517,8 +566,8 @@ pub fn flash_next_scheduler(
         shape.max_context,
         shape.kv_format,
         lanes,
-        None,
-        None,
+        speculation,
+        mtp_plan.as_ref(),
     )?;
     let config = ModelConfig::flash_next_from(&geometry);
     // The options the leaf loads with, but for the expert cache, which is
@@ -533,6 +582,7 @@ pub fn flash_next_scheduler(
         retained_device_slots: shape.retained_device_slots,
         retained_host_slots: shape.retained_host_slots,
         kv_ram_arena_bytes: shape.host_pool_bytes,
+        speculation,
         ..EngineOptions::default()
     };
     let pool_plan = SeqPool::plan(&config, &options.pool_budget(), options.pool_backend())?;
@@ -546,11 +596,12 @@ pub fn flash_next_scheduler(
             u64::from(LOOKAHEAD_WIDTH),
         );
     let lines = ignis_core::VramLines {
-        weights: plan.plan.device_capacity_bytes,
+        weights: plan.plan.device_capacity_bytes + mtp_plan.as_ref().map_or(0, |p| p.plan.device_capacity_bytes),
         cuda_context: ignis_runtime::CUDA_CONTEXT_BYTES,
         workspace: reserved.workspace_bytes + reserved.activation_bytes,
         sampling: reserved.sampling_bytes,
         decode_graph: reserved.decode_graph_bytes,
+        verify_round: reserved.verify_round_bytes,
         lane_state: pool_plan.lane_state_bytes + pool_plan.indexer_bytes + pool_plan.ngram_conv_bytes,
         retained_slots: pool_plan.retained_state_bytes,
         hq_residual_window: pool_plan.hq_residual_bytes,
@@ -574,6 +625,12 @@ pub fn flash_next_scheduler(
         residency_fixed_bytes = residency_fixed,
         expert_cache_bytes,
         lanes,
+        verify_round_bytes = lines.verify_round,
+        speculation = %speculation.map_or_else(
+            || "off".to_owned(),
+            |s| format!("mtp draft tokens {} rows {} (k at 1/2/3 lanes: {}/{}/{})", s.draft_tokens(), s.row_budget(),
+                        s.window(1), s.window(2), s.window(3))
+        ),
         "flash-next vram plan"
     );
     options.expert_cache_bytes = expert_cache_bytes;
@@ -797,6 +854,26 @@ mod tests {
         assert_eq!(off.for_family(ModelFamily::FlashNext).retained_host_slots, 0, "reuse off retains nothing");
     }
 
+    /// GitHub #307: Flash-Next's MTP head is on by default with its
+    /// companion present, at the default draft tokens and the operator's row
+    /// budget; `--spec off` and an absent companion turn it off; a named
+    /// window is the operator's.
+    #[test]
+    fn flash_next_speculation_is_on_by_default_with_its_companion() {
+        use ignis_core::speculation::FLASH_NEXT_DEFAULT_DRAFT_TOKENS;
+        let shape = EngineShape { draft_rows: 6, ..EngineShape::default() };
+        let on = flash_next_speculation(&shape, true).unwrap().expect("on by default");
+        assert_eq!((on.draft_tokens(), on.row_budget()), (FLASH_NEXT_DEFAULT_DRAFT_TOKENS, 6));
+        assert_eq!(flash_next_speculation(&shape, false).unwrap(), None, "no companion, nothing asked");
+        let off = EngineShape { speculation_off: true, ..shape };
+        assert_eq!(flash_next_speculation(&off, true).unwrap(), None);
+        let named = EngineShape {
+            speculation: Some(ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Mtp, 3).unwrap()),
+            ..shape
+        };
+        assert_eq!(flash_next_speculation(&named, true).unwrap().map(|s| s.draft_tokens()), Some(3));
+    }
+
     #[test]
     fn the_operator_prefill_chunk_reaches_the_scheduler_config() {
         let shape = EngineShape {
@@ -812,6 +889,8 @@ mod tests {
             retained_host_named: true,
             retained_interactive_ttl: std::time::Duration::from_secs(60),
             speculation: None,
+            speculation_off: false,
+            draft_rows: 0,
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
         };

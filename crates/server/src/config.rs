@@ -80,6 +80,7 @@ use ignis_core::compute::ModelFamily;
 /// desktop and every other process on the card (GitHub #210).
 pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, Speculation, SpeculativeBackend};
+use ignis_core::speculation::{FLASH_NEXT_DEFAULT_DRAFT_TOKENS, FLASH_NEXT_VERIFY_ROWS};
 
 pub use ignis_core::{MAX_YARN_FACTOR, RopeScaling};
 pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision};
@@ -173,8 +174,17 @@ pub struct Config {
     /// GitHub #209).
     pub instruction_policy: InstructionPolicy,
     /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
-    /// GitHub #150). `None` loads nothing of the drafter.
+    /// GitHub #150). `None` loads nothing of the drafter -- but for a
+    /// Flash-Next artifact, whose MTP head is on by default when its
+    /// companion is present (spec flash-next/07) unless `--spec off`.
     pub speculation: Option<Speculation>,
+    /// `--spec off` / `IGNIS_SPEC=off`: no speculation, the default one
+    /// included (GitHub #307).
+    pub speculation_off: bool,
+    /// Flash-Next's draft row budget (`--draft-rows` / `IGNIS_DRAFT_ROWS`,
+    /// GitHub #307): a round of w lanes verifies min(draft tokens, rows / w
+    /// - 1) drafts per lane. `None`: the decode route's 8 rows.
+    pub draft_rows: Option<u32>,
     /// Vision, chosen at load (`--vision`/`--vision-max-tokens`, GitHub #177).
     /// `None` binds and reserves nothing of the vision tower.
     pub vision: Option<Vision>,
@@ -373,6 +383,7 @@ pub fn resolve(
     let mut request_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
+    let mut draft_rows = None;
     let mut draft_head = None;
     let mut vision = false;
     let mut vision_max_tokens = None;
@@ -423,6 +434,7 @@ pub fn resolve(
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
+            "--draft-rows" => draft_rows = Some(take_value(args, &mut i, flag)?),
             "--draft-head" => draft_head = Some(take_value(args, &mut i, flag)?),
             "--rope-scaling" => rope_scaling = Some(take_value(args, &mut i, flag)?),
             "--vision" => vision = true,
@@ -525,7 +537,19 @@ pub fn resolve(
         )?,
     };
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
-    let speculation = resolve_speculation(spec, draft_tokens, draft_head, &env)?;
+    let speculation_off = non_empty(spec.clone().or_else(|| env("IGNIS_SPEC"))).is_some_and(|s| s.trim() == "off");
+    let speculation = if speculation_off { None } else { resolve_speculation(spec, draft_tokens, draft_head, &env)? };
+    let draft_rows = non_empty(draft_rows.or_else(|| env("IGNIS_DRAFT_ROWS")))
+        .map(|raw| {
+            raw.trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&rows| rows <= FLASH_NEXT_VERIFY_ROWS && rows != 1)
+                .ok_or_else(|| {
+                    ConfigError(format!("`--draft-rows` must be 0 or in 2..{FLASH_NEXT_VERIFY_ROWS}, got `{raw}`"))
+                })
+        })
+        .transpose()?;
     let vision = resolve_vision(vision, vision_max_tokens, vision_embedding_pool_mib, &env)?;
     let rope_scaling = resolve_rope_scaling(rope_scaling, &env)?;
     // GitHub #195 lifted #178's refusal of the two together: the drafter
@@ -593,6 +617,8 @@ pub fn resolve(
         retained_interactive_ttl_secs,
         instruction_policy,
         speculation,
+        speculation_off,
+        draft_rows,
         vision,
         rope_scaling,
         media,
@@ -840,6 +866,10 @@ fn resolve_speculation(
         .transpose()?
         .unwrap_or_default();
     let Some(raw) = draft_tokens else {
+        // GitHub #307: Flash-Next's head has a measured default window.
+        if backend == SpeculativeBackend::Mtp {
+            return Ok(Some(Speculation::new(backend, FLASH_NEXT_DEFAULT_DRAFT_TOKENS).expect("in range")));
+        }
         return Err(ConfigError(format!(
             "`--spec {}` requires `--draft-tokens N` (N in 1..{MAX_DRAFT_TOKENS})",
             backend.as_str()
@@ -871,12 +901,16 @@ pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, 
             family.name()
         )));
     }
-    if let Some(speculation) = config.speculation.filter(|_| !family.speculates()) {
+    if let Some(speculation) = config.speculation.filter(|s| s.backend() != family.drafter()) {
         return Err(ConfigError(format!(
-            "`--spec {}`: {} has no speculative decoding",
+            "`--spec {}`: {} drafts with {}",
             speculation.backend().as_str(),
-            family.name()
+            family.name(),
+            family.drafter().as_str()
         )));
+    }
+    if let Some(rows) = config.draft_rows.filter(|_| family != ModelFamily::FlashNext) {
+        return Err(ConfigError(format!("`--draft-rows {rows}`: {} has no draft row budget", family.name())));
     }
     if config.vision.is_some() && !family.takes_images() {
         return Err(ConfigError(format!("`--vision`: {} takes no images", family.name())));
@@ -2206,10 +2240,34 @@ mod tests {
 
     #[test]
     fn an_unknown_speculative_backend_is_refused_naming_dflash2() {
-        let a = args(&["--spec", "mtp", "--draft-tokens", "3"]);
+        let a = args(&["--spec", "eagle", "--draft-tokens", "3"]);
         let err = resolve(&a, no_env).expect_err("unknown backend");
-        assert!(err.0.contains("--spec") && err.0.contains("mtp"), "{}", err.0);
-        assert!(err.0.contains("dflash2"), "{}", err.0);
+        assert!(err.0.contains("--spec") && err.0.contains("eagle"), "{}", err.0);
+        assert!(err.0.contains("dflash2") && err.0.contains("mtp"), "{}", err.0);
+    }
+
+    /// GitHub #307: Flash-Next's head takes a default window, a forced one,
+    /// a row budget, and `--spec off`.
+    #[test]
+    fn spec_mtp_spec_off_and_draft_rows_parse() {
+        let config = expect_config(resolve(&args(&["--spec", "mtp"]), no_env).expect("resolve"));
+        assert_eq!(
+            config.speculation,
+            Some(Speculation::new(SpeculativeBackend::Mtp, FLASH_NEXT_DEFAULT_DRAFT_TOKENS).unwrap())
+        );
+        let forced = expect_config(
+            resolve(&args(&["--spec", "mtp", "--draft-tokens", "3", "--draft-rows", "6"]), no_env).expect("resolve"),
+        );
+        assert_eq!(forced.speculation, Some(Speculation::new(SpeculativeBackend::Mtp, 3).unwrap()));
+        assert_eq!(forced.draft_rows, Some(6));
+        let off = expect_config(resolve(&args(&["--spec", "off"]), no_env).expect("resolve"));
+        assert!(off.speculation_off && off.speculation.is_none());
+        let default = expect_config(resolve(&args(&[]), no_env).expect("resolve"));
+        assert!(!default.speculation_off && default.draft_rows.is_none());
+        for raw in ["1", "9", "rows"] {
+            let err = resolve(&args(&["--draft-rows", raw]), no_env).expect_err("bad budget");
+            assert!(err.0.contains("--draft-rows") && err.0.contains(raw), "{}", err.0);
+        }
     }
 
     #[test]
@@ -2309,8 +2367,13 @@ mod tests {
         let spec = expect_config(
             resolve(&args(&["--spec", "dflash2", "--draft-tokens", "7"]), no_env).expect("resolve"),
         );
-        let err = served_model_for(&spec, ModelFamily::FlashNext).expect_err("no speculation");
+        let err = served_model_for(&spec, ModelFamily::FlashNext).expect_err("the 27B's drafter");
         assert!(err.0.contains("--spec dflash2") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+        assert!(err.0.contains("drafts with mtp"), "{}", err.0);
+        let mtp = expect_config(resolve(&args(&["--spec", "mtp", "--draft-rows", "6"]), no_env).expect("resolve"));
+        assert!(served_model_for(&mtp, ModelFamily::FlashNext).is_ok(), "Flash-Next drafts with mtp");
+        let err = served_model_for(&mtp, ModelFamily::Qwen38_27b).expect_err("Flash-Next's head");
+        assert!(err.0.contains("--spec mtp") && err.0.contains("drafts with dflash2"), "{}", err.0);
         let vision = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
         let err = served_model_for(&vision, ModelFamily::FlashNext).expect_err("no vision");
         assert!(err.0.contains("--vision") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
