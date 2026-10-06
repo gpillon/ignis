@@ -670,7 +670,9 @@ add_test(NAME ignis_kernel_flash_next_embed_head_test COMMAND ignis_kernel_flash
 # graph-captured decode, hq-e8-2b within a bound derived from its measured codec error. GPU.
 # GitHub #306: the forward's side branch (kernel/src/flash_next/side_branch.h) orders its work
 # before the join, and a failed op on it still leaves a capture that ends once joined. GPU.
-foreach(name IN ITEMS gdn qsa side_branch)
+# GitHub #307 (spec flash-next/07 phase C): the verify round's GDN half -- the replay record and our fold of
+# the first c records against c one-token rounds over the same columns, bit for bit. GPU.
+foreach(name IN ITEMS gdn qsa side_branch verify)
   add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
   target_include_directories(ignis_kernel_flash_next_${name}_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
