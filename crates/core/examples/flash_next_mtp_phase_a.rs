@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ignis_core::flash_next::{EngineOptions, FlashNextEngine};
+use ignis_core::kv_format::KvFormat;
 
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 const EXPERT_CACHE_BYTES: u64 = 17_000_000_000;
@@ -210,12 +211,47 @@ fn cost_repeat(out: &Path) -> Result<(), String> {
     write_bytes(&out.join("cost_repeat.json"), serde_json::to_string_pretty(&json).unwrap().as_bytes())
 }
 
+/// Prefill vs decode on the engine's own greedy text, hq-e8-2b KV against
+/// BF16 KV in one session: three prompts continued by 512 greedy tokens per
+/// format, then the span's prefill pick after each generated token held to
+/// the decode's next token. `divergence.json`.
+fn divergence(out: &Path) -> Result<(), String> {
+    let names = ["code7", "prose2", "prose3"];
+    let prompts: Vec<Vec<u32>> = PROMPTS
+        .iter()
+        .filter(|p| names.contains(&p.0))
+        .map(|&(_, _, set, window, len)| prompt_tokens(set, window, len))
+        .collect::<Result<_, _>>()?;
+    let mut cells = Vec::new();
+    for (label, kv_format) in [("hq-e8-2b", KvFormat::HqE8_2b), ("bf16", KvFormat::Bf16)] {
+        let options = EngineOptions {
+            decode_lanes: 3,
+            max_context_tokens: 4096,
+            expert_cache_bytes: EXPERT_CACHE_BYTES,
+            kv_format,
+            ..EngineOptions::default()
+        };
+        let mut engine = FlashNextEngine::load(&model_dir(), options)?;
+        let generated = engine.generate(&prompts, GENERATED)?;
+        for ((name, prompt), continuation) in names.iter().zip(&prompts).zip(generated) {
+            let text = [prompt.as_slice(), &continuation].concat();
+            let span = engine.tapped_span(&text)?;
+            let margins: Vec<f32> =
+                (prompt.len()..text.len() - 1).filter(|&p| span.argmax[p] != text[p + 1]).map(|p| span.margin[p]).collect();
+            let positions = text.len() - 1 - prompt.len();
+            eprintln!("{label} {name}: {} of {positions} differ", margins.len());
+            cells.push(serde_json::json!({ "kv_format": label, "text": name, "positions": positions, "differ": margins.len(), "margins": margins }));
+        }
+    }
+    write_bytes(&out.join("divergence.json"), serde_json::to_string_pretty(&serde_json::json!({ "cells": cells })).unwrap().as_bytes())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, out) = match args.as_slice() {
         [_, mode, out] => (mode.as_str(), PathBuf::from(out)),
         _ => {
-            eprintln!("usage: flash_next_mtp_phase_a corpus|cost|cost-repeat <out-dir>");
+            eprintln!("usage: flash_next_mtp_phase_a corpus|cost|cost-repeat|divergence <out-dir>");
             std::process::exit(2);
         }
     };
@@ -223,6 +259,7 @@ fn main() {
         "corpus" => corpus(&out),
         "cost" => cost(&out),
         "cost-repeat" => cost_repeat(&out),
+        "divergence" => divergence(&out),
         other => Err(format!("unknown mode {other}")),
     });
     if let Err(e) = result {

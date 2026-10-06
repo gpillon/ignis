@@ -163,8 +163,21 @@ k × 0.9 ms)):
   verify runs the decode route.
   - On the generated text the prefill's pick differs from the decode's token
     at 581 of 8,176 positions (7.1%; median margin 0.375 logits, 10% above
-    1.1, max 3.6). That rate is itself worth knowing: the forward test's G1
-    prompts saw none at shorter context.
+    1.1, max 3.6). The forward test's G1 prompts saw none at shorter
+    context.
+  - **Most of it is the hq-e8-2b codec.** The same three prompts (code7,
+    prose2, prose3), continued and compared in one session under each KV
+    format (`flash_next_mtp_phase_a divergence`):
+
+    | KV | picks that differ | median margin | max | > 1 logit |
+    |---|---:|---:|---:|---:|
+    | hq-e8-2b | 201 / 1,533 (13.1%) | 0.375 | 3.6 | 22 |
+    | BF16 | 74 / 1,533 (4.8%) | 0.25 | 0.875 | 0 |
+
+    A decode round reads codec'd rows where a prefill chunk attends to fresh
+    BF16 K/V, which accounts for the wide flips. What BF16 leaves is
+    low-margin flips (all < 0.9 logits) between the two routes' summation
+    orders, not a route bug's signature.
   - α₁ against the prefill pick instead of the text is 0.84 (0.83 against
     the text), so the effect on α is small.
 - **Round harness.** The round costs come from a tight loop (no scheduler)
