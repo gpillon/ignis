@@ -658,6 +658,30 @@ Where the build departs from the text above:
   accepted}_total{position}` on /metrics, and a Speculation card on the
   Monitor.
 
+## Phase B result (2026-10-06)
+
+The companion is `qwen3_8_flash_next_mtp_3p0-v2.ninfer` (1053 objects, 1,037,905,920 bytes),
+beside the main container. Its contract is layout.md §13; the run record is its sidecar.
+
+- **Calibration.** The served engine (hq-e8-2b) tapped its states over the trunk's corpus:
+  290 chunks in 794 s, 453,005 calibration entries and 131,912 test entries. All 512 experts
+  were routed (no zero-token fallback).
+- **Experts at 3.0 b.** Rates gu 2.9992 and dn 3.0000 (stored 3.0005 / 3.0088). K histogram
+  gu 62 / 110 / 233 / 107, dn 47 / 120 / 254 / 91 at K = 2 / 2.5 / 3 / 4. The conversion
+  took 922 s.
+- **MoE error −17.26 dB** on the test entries. It is −19 to −22 dB on chat, code, prose,
+  math, it, zh, en, py and mmlu, and −12.8 / −12.9 dB on de / ja, which have no
+  calibration chunk in the trunk's corpus.
+- **Verify.** All 1024 projections decoded from the companion are bit-identical to the
+  run's; the main container's file sha256 matches.
+- **AC2: PASS.** On phase A's 16 texts (comb a, norm a, chain a, dense), with phase A's
+  BF16 embedding and output head:
+  - α₁..α₄ = 0.826 / 0.800 / 0.805 / 0.828 vs the BF16 head's 0.828 / 0.800 / 0.811 / 0.821;
+  - Δα₁ = 0.0023 ± 0.0026 (paired, 8,192 positions), against the 0.03 bar.
+- **Served** (the main container's FP8 embedding and head): 0.826 / 0.801 / 0.804 / 0.828,
+  Δα₁ 0.0023 ± 0.0029.
+- **Long texts, the head's own indexer:** α₁ 0.821, Δ 0.005 ± 0.005.
+
 ## Out of Scope
 
 - **Adaptive draft width:** a measured follow-up, after AC6.
