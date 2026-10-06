@@ -167,9 +167,57 @@ Targets ranked by estimated gain per token at one lane, from the 15.7 ms period.
 - Per-kernel costs come from the node capture: +4.6% over the graph replay.
 - The n-gram read time is an emulation with .NET unbuffered reads, not the engine's `ReadPool`.
 - The decode rate drifts between runs (60.6-63.7 tok/s here, 65.3 in the earlier finding) with the expert cache's size and state.
-- The gains above are estimates from these timings and the kernels' byte counts. None was implemented or measured.
+- The gains above are estimates from these timings and the kernels' byte counts. Item 1 was since implemented and measured (attempt below); the others were not.
 
 Raw material in the `flash-next` worktree (untracked), `.scratch/fn-decode-prof-306/`:
 - the `.nsys-rep` captures (they embed the process environment: never commit them) and their sqlite exports;
 - `fn-node.report*.txt`, `fn-gm.metrics.*.txt`, `fn-gm.client.jsonl`;
 - the scripts named above.
+
+## Attempt 2026-10-06 (hcmix)
+
+Implication 1, the HC mix: `38119ea` and `e04d800` on `fn-perf-306`. At decode widths a mix is now three launches, each spread over the card:
+- **`hc_norm`**: one CTA per (stream, row) instead of one per row. It also computes the 4-output block-inject matvec as per-stream partials, so the single-CTA `bf16_gemv` is gone on every route. Each thread issues its loads before the reduce and sums squares in the old order, so `normed` is bit-identical to before.
+- **`hc_down_split`**: `mix_down` split by stream over 40 × 4 = 160 CTAs, into fp32 partials.
+- **`hc_up_reduce`**: `mix_up` and the stream reduce in one 160-CTA kernel. Each CTA rebuilds the activation from the down partials; one CTA also writes the injection weights from the norm's partials.
+
+This route takes up to 8 rows and 4 streams, with BF16 or FP8 projections. Wider calls (prefill) keep `fn_linear` for both projections, with the new norm and inject. Every BF16 rounding of the module stays where it was; only fp32 summation order changes. Partials are summed in a fixed order, so a replay gives the same bits.
+
+**Setup.**
+- "Before" is the release build this finding measured. It was built at 09:59, before `d83bb3e`'s merge commit; nothing on the decode path changed in between.
+- Served rates come from `.scratch/hcmix-306/rate.sh`: the server flags above, no profiler, 1,800-token generations of the same prompt. One client runs for ~70 s, then three concurrent clients for ~100 s. A request's rate runs from its 50th token to its last.
+- Node-level figures come from `trace.sh` + `analyze.py node2` (the mix now ends at `hc_up_reduce`), 278 rounds.
+- The microbenchmark is `ignis_kernel_flash_next_hc_bench`: FP8 `mix_down`/`mix_up` cycled over 24 weight sets so they stream from DRAM, 48 calls in a graph, the median replay per call.
+
+| | before | after (`e04d800`) |
+|---|---:|---:|
+| HC mix, node-sum per round | 5,176 µs | **1,660 µs** |
+| one mix, in situ (node-level) | 53 µs, 6 kernels | 17.1 µs: norm 6.3, down 5.1, up + reduce 5.8 |
+| node-level round span | 14.22 ms | 11.24 ms |
+| served, 1 lane, tok/s (requests 1/2/3) | 63.9 / 63.7 / 64.1 | **78.6 / 78.5 / 80.5** |
+| served, 1 lane, ITL p50 | 15.4-15.5 ms | 12.0-12.5 ms |
+| served, 3 lanes, tok/s per lane (requests 1/2/3) | 38.8 / 36.7 / 33.6 | 45.3 / 43.4 / 43.9 |
+| served, 3 lanes, aggregate (first requests) | 116.4 | **136.0** |
+
+| microbenchmark, µs per mix | 1 row | 2 | 3 | 8 | 256 | 2048 |
+|---|---:|---:|---:|---:|---:|---:|
+| before | 42.7 | 47.9 | 59.5 | 105.6 | 544 | 1,266 |
+| after | 14.0 | 15.7 | 17.9 | 27.4 | 346 | 839 |
+
+Per op at one row in the microbenchmark (node-traced):
+- before: norm 5.9, `mix_down` 12.0, activation 0.7, `mix_up` 4.2, `block_inject` 9.0, reduce 10.2 µs;
+- after: norm 2.6, down 4.6, up + reduce 5.0 µs.
+
+Correctness: the HC CTest now has FP8 arms beside the BF16 ones, rows 1/3/8/9/1100, the final mixer, and a replay check. It passes on both the old and the new kernels; a deliberately broken decode route fails it. `flash_next_forward_gpu` passes 3/3 on `e04d800`:
+- G1 agreement is 102/102;
+- decode equals prefill on G1 real text, 0 flips in 224 tokens;
+- decode is deterministic, and a graph replays what eager computes.
+
+The reported arbitrary-id flips (3 wider at one lane, 3 + 1 near-tie at three) are in the range the test's header records.
+
+- **The one-lane ITL fell by 3.2 ms per token**, inside the −2.8 to −3.7 ms estimated above.
+- **In situ the norm costs more than in the microbenchmark.** The first version (`38119ea`) took 12.7 µs per `hc_norm` in the served round against 4.2 µs in the microbenchmark: its strided loop waited on one load per element. At that version the mix was 2,297 µs per round, one lane ran 78.5 / 75.4 / 79.4 tok/s, and three lanes 127.8 aggregate. `e04d800` issues every load before the reduce: 6.3 µs in situ, 2.6 in the microbenchmark. The remaining in-situ gap is not isolated. Candidates are the residual the inject wrote just before, and the concurrent prefetch copy.
+- **Three-lane rates fall request over request inside one run, in both builds**, so compare request ordinals, not runs. Within a build, one-lane rates vary by up to 4 tok/s across requests.
+- The mix is now 1.66 ms of an 11.24 ms node-level round. The next items by size are residency bookkeeping (implication 3) and the host gap (implication 2).
+
+Raw material in `.scratch/hcmix-306/`: `rate.sh` with its logs (`before`, `after`, `after2`), the bench outputs and captures, `after-node` / `after2-node` (`.nsys-rep`: never commit them), and `kern.py`.
