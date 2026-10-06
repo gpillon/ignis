@@ -4,10 +4,11 @@
 // One forward, for a prefill chunk and a decode round alike: embed the call's ids into every
 // hyper-connection stream, then per decoder layer
 //   the n-gram embedding (its layer only), the attention mix, GDN or (the indexer's selection,
-//   then QSA attention), the inject; the MoE mix, this layer's router, the next layer's router
-//   on the same input (the lookahead residency ranks), the residency step, the routed experts
-//   (the decode route for a round, the prefill route for a chunk), the shared expert, the
-//   combine, the inject;
+//   then QSA attention), the inject; the MoE mix, this layer's router, the residency step's
+//   demand half, the routed experts (the decode route for a round, the prefill route for a
+//   chunk), the shared expert, the combine, the inject -- and beside the experts, on the branch
+//   residency forks, the next layer's router on the same input (the lookahead residency ranks)
+//   and the step's prefetch half;
 // then the head (the final mixer and lm_head) on the rows that are drawn from.
 //
 // A chunk is one lane of up to prefill_chunk_tokens tokens, run eagerly out of the handle's
@@ -250,18 +251,26 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
                          static_cast<float *>(fn.router_logits->p), stream) != 0) {
       return fail(where + " router", ignis_moe_last_error());
     }
-    const float *lookahead = nullptr;
-    if (l + 1 < g.layers) {
+    // The step's demand half on the layer's stream; its lookahead -- the next layer's router on
+    // this input, which only the prefetch reads -- on the branch it forks, beside the experts.
+    void *branch = nullptr;
+    if (ignis_residency_step_demand(fn.residency, static_cast<uint32_t>(l), phase, ids, static_cast<uint32_t>(rows),
+                                    stream, l + 1 < g.layers ? &branch : nullptr) != 0) {
+      return fail(where + " expert residency", ignis_residency_last_error());
+    }
+    if (branch != nullptr) {
       if (ignis_moe_router(x, static_cast<uint32_t>(rows), w.layers[static_cast<std::size_t>(l + 1)].moe.router,
                            static_cast<int32_t *>(fn.lookahead_ids->p), static_cast<float *>(fn.lookahead_weights->p),
-                           static_cast<float *>(fn.lookahead_logits->p), stream) != 0) {
+                           static_cast<float *>(fn.lookahead_logits->p), branch) != 0) {
         return fail(where + " lookahead router", ignis_moe_last_error());
       }
-      lookahead = static_cast<const float *>(fn.lookahead_logits->p);
-    }
-    if (ignis_residency_step(fn.residency, static_cast<uint32_t>(l), phase, ids, static_cast<uint32_t>(rows),
-                             lookahead, stream) != 0) {
-      return fail(where + " expert residency", ignis_residency_last_error());
+      if (cudaEventRecord(fn.lookahead_read, static_cast<cudaStream_t>(branch)) != cudaSuccess) {
+        return fail(where + " lookahead event", cudaGetErrorString(cudaGetLastError()));
+      }
+      if (ignis_residency_step_prefetch(fn.residency, static_cast<const float *>(fn.lookahead_logits->p),
+                                        static_cast<uint32_t>(rows)) != 0) {
+        return fail(where + " expert prefetch", ignis_residency_last_error());
+      }
     }
     const ignis_moe_slot *slots = ignis_residency_slot_table(fn.residency, static_cast<uint32_t>(l));
     ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_lanes, fn.prefill_chunk_tokens};
@@ -287,6 +296,10 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
     }
     if (ignis_moe_combine(acc, shared, x, layer.moe.shared_expert_gate, static_cast<uint32_t>(rows), y, stream) != 0) {
       return fail_moe(" MoE combine");
+    }
+    // The next sublayer's mix rewrites `x`: the lookahead router must have read it.
+    if (branch != nullptr && cudaStreamWaitEvent(stream, fn.lookahead_read, 0) != cudaSuccess) {
+      return fail(where + " lookahead join", cudaGetErrorString(cudaGetLastError()));
     }
     if (fn_hc_inject(g, y, inj, rows, residual, stream) != 0) {
       return fail(where + " MoE inject", fn_last_error());
@@ -349,7 +362,9 @@ int32_t FlashNextModel::rows() const {
 }
 
 FlashNextModel::FlashNextModel() = default;
-FlashNextModel::~FlashNextModel() = default;
+FlashNextModel::~FlashNextModel() {
+  if (lookahead_read != nullptr) cudaEventDestroy(lookahead_read);
+}
 
 std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, uint64_t count,
                                            const ignis_topology &topology, uint32_t prefill_chunk_tokens,
@@ -450,6 +465,11 @@ int32_t finish_load(ignis_model &model, std::string *error) {
   }
   if (!check_cuda(cudaStreamCreate(&model.stream), "cudaStreamCreate", error)) {
     model.stream = nullptr;
+    return -1;
+  }
+  if (!check_cuda(cudaEventCreateWithFlags(&fn.lookahead_read, cudaEventDisableTiming), "the lookahead event",
+                  error)) {
+    fn.lookahead_read = nullptr;
     return -1;
   }
   try {

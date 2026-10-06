@@ -7,7 +7,9 @@
 // warm-up, steady-state decode rounds of 1 and 3 lanes walk the 48 layers with a skewed
 // selection (most experts drawn from a hot quarter) and a W = 16 lookahead, and one 4096-token
 // prefill chunk walks them once. Prints the median device time per layer step (event pairs
-// around ignis_residency_step_ranked, prefetch join included).
+// around ignis_residency_step_ranked, prefetch join included), and for decode the split step's
+// demand half alone (ignis_residency_step_demand: what the expert op waits for; the prefetch
+// half runs on the branch it forks).
 //
 //   ignis_residency_resolve_bench [--rounds 64]
 
@@ -107,7 +109,7 @@ int main(int argc, char **argv) {
     }
   };
 
-  auto run = [&](uint32_t rows, uint32_t phase, int n_rounds, bool timed) {
+  auto run = [&](uint32_t rows, uint32_t phase, int n_rounds, bool timed, bool split = false) {
     std::vector<double> times;
     std::vector<int32_t> ids, look;
     for (int round = 0; round < n_rounds; ++round) {
@@ -116,11 +118,20 @@ int main(int argc, char **argv) {
         CUDA_OK(cudaMemcpyAsync(d_ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice, s));
         CUDA_OK(cudaMemcpyAsync(d_look, look.data(), look.size() * 4, cudaMemcpyHostToDevice, s));
         CUDA_OK(cudaEventRecord(a, s));
-        RES_OK(ignis_residency_step_ranked(r, layer, phase, d_ids, rows,
-                                           layer + 1 < kLayers ? d_look : nullptr, rows, kWidth, s));
-        RES_OK(ignis_residency_join(r, s));
-        CUDA_OK(cudaEventRecord(b, s));
-        CUDA_OK(cudaEventSynchronize(b));
+        if (split) {
+          void *side = nullptr;
+          RES_OK(ignis_residency_step_demand(r, layer, phase, d_ids, rows, s, &side));
+          CUDA_OK(cudaEventRecord(b, s));
+          if (side != nullptr) RES_OK(ignis_residency_step_prefetch_ranked(r, d_look, rows, kWidth));
+          RES_OK(ignis_residency_join(r, s));
+          CUDA_OK(cudaStreamSynchronize(s));
+        } else {
+          RES_OK(ignis_residency_step_ranked(r, layer, phase, d_ids, rows,
+                                             layer + 1 < kLayers ? d_look : nullptr, rows, kWidth, s));
+          RES_OK(ignis_residency_join(r, s));
+          CUDA_OK(cudaEventRecord(b, s));
+          CUDA_OK(cudaEventSynchronize(b));
+        }
         float ms = 0;
         CUDA_OK(cudaEventElapsedTime(&ms, a, b));
         if (timed) times.push_back(ms * 1000.0);
@@ -134,6 +145,9 @@ int main(int argc, char **argv) {
     const auto t = run(lanes, IGNIS_RESIDENCY_DECODE, rounds, true);
     std::printf("decode, %u lane(s): %.1f us per layer step (median of %zu), %.2f ms per token over %u layers\n",
                 lanes, median(t), t.size(), median(t) * kLayers / 1000.0, kLayers);
+    const auto h = run(lanes, IGNIS_RESIDENCY_DECODE, rounds, true, true);
+    std::printf("decode, %u lane(s), split: %.1f us per demand half (median of %zu), %.2f ms per token\n", lanes,
+                median(h), h.size(), median(h) * kLayers / 1000.0);
   }
   const auto p = run(4096, IGNIS_RESIDENCY_PREFILL, 1, true);
   std::printf("prefill, 4096 tokens: %.1f us per layer step (median of %zu)\n", median(p), p.size());

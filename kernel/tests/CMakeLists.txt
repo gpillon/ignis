@@ -693,6 +693,8 @@ target_compile_definitions(ignis_kernel_residency_trace_test PRIVATE
 target_link_libraries(ignis_kernel_residency_trace_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_residency_trace_test COMMAND ignis_kernel_residency_trace_test)
 add_test(NAME ignis_kernel_residency_graph_test COMMAND ignis_kernel_residency_trace_test graph)
+add_test(NAME ignis_kernel_residency_split_test COMMAND ignis_kernel_residency_trace_test split)
+add_test(NAME ignis_kernel_residency_graph_split_test COMMAND ignis_kernel_residency_trace_test graph split)
 
 # GitHub #302 (spec flash-next/04, slice S4): OURS -- the n-gram embedding's device side
 # (kernel/src/flash_next/ngram.cu) at the real geometry, against transformers'

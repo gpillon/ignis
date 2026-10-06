@@ -1,12 +1,15 @@
 // ignis kernel leaf: Flash-Next's expert residency, the device side -- OURS (see
 // kernel/include/ignis_residency.h; the policy is crates/core/src/residency/policy.rs).
 //
-// One layer step is two launches on the caller's stream and one on residency's own:
-//   resolve  one CTA: classify the selection, stamp hits, place misses (free slot, else the
-//            LRU victim in decode, else the staging ring in prefill), place the lookahead's
-//            prefetches, write the slot table and two copy-job lists;
-//   copy     a small grid copying the demand jobs from the mapped host pool into their slots;
-//   copy     the same over the prefetch jobs, on the prefetch stream, beside the expert op.
+// One layer step is these launches, on the caller's stream unless named:
+//   resolve_demand    one CTA: classify the selection, stamp hits, place misses (free slot,
+//                     else the LRU victim in decode, else the staging ring in prefill), write
+//                     the slot table and the demand copy jobs;
+//   resolve_prefetch  one CTA: place the lookahead's prefetches and their copy jobs -- on the
+//                     caller's stream in a whole step, on the prefetch stream in a split one;
+//   copy              a small grid copying the demand jobs from the mapped host pool;
+//   copy              the same over the prefetch jobs, on the prefetch stream, beside the
+//                     expert op, after the demand copy.
 // Everything the resolve decides lives in device memory, so the host never waits on it.
 
 #include "ignis_residency.h"
@@ -92,6 +95,11 @@ struct State {
   // holds this step's lookahead only when the last step was another layer; after a step of the
   // same layer (a restarted forward) it holds that step's own, released, entries.
   uint32_t last_layer;
+  // What a step's demand half leaves its prefetch half (resolve_prefetch): the refusal, the
+  // report's list counts and the bytes the demand half moved.
+  uint32_t step_status;
+  uint32_t step_count[kLists];
+  unsigned long long step_moved;
 };
 
 // Everything the kernels read, by value.
@@ -220,21 +228,24 @@ __device__ void stage(const Dev &d, uint32_t key, uint32_t h, uint32_t layer, Jo
 
 using BlockScan = cub::BlockScan<uint32_t, kThreads>;
 
+// A step is two kernels: resolve_demand classifies the selection and places its misses (what
+// the expert op waits for); resolve_prefetch then takes the lookahead's candidates. Run back to
+// back they are the policy's one step. Split, the prefetch half runs on residency's prefetch
+// stream beside the expert op: its candidates never evict a projection the step selected (the
+// demand half stamped them `now`), so it changes nothing the op reads.
 __global__ void __launch_bounds__(kThreads)
-    resolve(Dev d, uint32_t layer, uint32_t phase, const int32_t *ids, uint32_t tokens,
-            const int32_t *lookahead, uint32_t rows, uint32_t stride) {
+    resolve_demand(Dev d, uint32_t layer, uint32_t phase, const int32_t *ids, uint32_t tokens,
+                   const int32_t *lookahead, uint32_t rows, uint32_t stride) {
   __shared__ uint32_t s_sel[IGNIS_MOE_EXPERTS / 32];
-  __shared__ uint32_t s_pos[IGNIS_MOE_EXPERTS];
   __shared__ uint32_t s_list[kMaxKeysPerLayer];
   __shared__ uint32_t s_need[kClasses], s_pinned[kClasses], s_hits[kClasses];
   __shared__ unsigned long long s_scratch[32];
-  __shared__ uint32_t s_status, s_n, s_prefetch_hits, s_n_cand;
+  __shared__ uint32_t s_status, s_n, s_prefetch_hits;
   __shared__ BlockScan::TempStorage s_scan;
 
   const uint32_t t = threadIdx.x;
   const uint32_t E = d.experts, nk = 2 * E;
   const bool decode = phase == IGNIS_RESIDENCY_DECODE;
-  const bool look = lookahead != nullptr && layer + 1 < d.layers && d.width > 0;
   State *st = d.st;
   Report *report = d.report != nullptr ? d.report + layer : nullptr;
   uint32_t *entries =
@@ -242,12 +253,11 @@ __global__ void __launch_bounds__(kThreads)
   const bool repeat = st->last_layer == layer;
 
   if (t < IGNIS_MOE_EXPERTS / 32) s_sel[t] = 0;
-  if (t < IGNIS_MOE_EXPERTS) s_pos[t] = kNone;
   if (t < kClasses) s_need[t] = s_pinned[t] = s_hits[t] = 0;
-  if (t == 0) s_status = s_n = s_prefetch_hits = s_n_cand = 0;
+  if (t == 0) s_status = s_n = s_prefetch_hits = 0;
   __syncthreads();
 
-  // 1. The selection, and the lookahead's first-occurrence rank positions, validated before
+  // 1. The selection, and the lookahead when the step was given it whole, validated before
   //    anything changes.
   for (uint32_t i = t; i < tokens * kTopK; i += blockDim.x) {
     const int32_t e = ids[i];
@@ -257,7 +267,7 @@ __global__ void __launch_bounds__(kThreads)
       atomicOr(&s_sel[e >> 5], 1u << (e & 31));
     }
   }
-  if (look) {
+  if (lookahead != nullptr) {
     for (uint32_t row = t; row < rows; row += blockDim.x) {
       uint32_t rank = 0;
       for (uint32_t j = 0; j < stride && rank < d.width; ++j) {
@@ -267,7 +277,6 @@ __global__ void __launch_bounds__(kThreads)
           s_status = IGNIS_RESIDENCY_STATUS_INVALID;
           break;
         }
-        atomicMin(&s_pos[e], rank * rows + row);
         ++rank;
       }
     }
@@ -279,7 +288,10 @@ __global__ void __launch_bounds__(kThreads)
       for (uint32_t l = 0; l < kLists; ++l) report->count[l] = 0;
       report->bytes_moved = 0;
     }
-    if (t == 0) st->n_demand = st->n_prefetch = 0;
+    if (t == 0) {
+      st->n_demand = st->n_prefetch = 0;
+      st->step_status = s_status;
+    }
     return;
   }
 
@@ -318,7 +330,10 @@ __global__ void __launch_bounds__(kThreads)
       for (uint32_t l = 0; l < kLists; ++l) report->count[l] = 0;
       report->bytes_moved = 0;
     }
-    if (t == 0) st->n_demand = st->n_prefetch = 0;
+    if (t == 0) {
+      st->n_demand = st->n_prefetch = 0;
+      st->step_status = s_status;
+    }
     return;
   }
 
@@ -379,7 +394,7 @@ __global__ void __launch_bounds__(kThreads)
   // Per-step tallies, kept by thread 0.
   uint32_t count[kLists] = {0, 0, 0, 0, 0, 0};
   unsigned long long moved = 0;
-  uint32_t n_demand = 0, n_prefetch = 0;
+  uint32_t n_demand = 0;
 
   // 6. Misses, in key order: a free slot, else the LRU victim (decode) or the ring (prefill).
   const uint32_t n_miss = s_n;
@@ -404,77 +419,138 @@ __global__ void __launch_bounds__(kThreads)
     __syncthreads();
   }
 
-  // 7. The lookahead: candidates in rank order, both projections of each.
-  if (look) {
-    if (t < E && s_pos[t] != kNone) {
-      uint32_t order = 0;
-      for (uint32_t e = 0; e < E; ++e) order += s_pos[e] < s_pos[t];
-      s_list[2 * order] = (layer + 1) * nk + 2 * t;
-      s_list[2 * order + 1] = (layer + 1) * nk + 2 * t + 1;
-      atomicAdd(&s_n_cand, 1u);
-    }
-    __syncthreads();
-    const uint32_t n_cand = 2 * s_n_cand;
-    unsigned long long spent = 0;
-    for (uint32_t i = 0; i < n_cand; ++i) {
-      const uint32_t k = s_list[i];
-      // Block-uniform reads: the entries were last written before a barrier.
-      const bool skip = d.slot_of[k] >= 0 || (d.flags[k] & kStaged);
-      if (skip) continue;
-      const uint32_t kc = d.cls[k];
-      const unsigned long long bytes = d.record_bytes[kc];
-      if (decode && d.budget != IGNIS_RESIDENCY_NO_BUDGET && spent + bytes > d.budget) {
-        if (t == 0) report_push(d, entries, kDropped, &count[kDropped], k);
-        __syncthreads();
-        continue;
-      }
-      const bool room = st->used[kc] < d.capacity[kc];
-      int32_t slot = -1;
-      if (decode || room) slot = find_slot(d, kc, now, decode, s_scratch);
-      if (t == 0) {
-        if (slot >= 0) {
-          place(d, k, kc, slot, now, true, d.prefetch, &n_prefetch, entries, count);
-          report_push(d, entries, kPrefetches, &count[kPrefetches], k);
-        } else if (!decode) {
-          stage(d, k, (layer + 1) & 1, layer + 1, d.prefetch, &n_prefetch);
-          report_push(d, entries, kPrefetches, &count[kPrefetches], k | IGNIS_RESIDENCY_STAGING_BIT);
-        } else {
-          report_push(d, entries, kDropped, &count[kDropped], k);
-        }
-        if (slot >= 0 || !decode) {
-          ++d.counters->prefetch_issued;
-          moved += bytes;
-        }
-      }
-      if (slot >= 0 || !decode) spent += bytes;
-      __syncthreads();
-    }
-  }
-
-  // 8. Tallies.
+  // 7. Tallies; the prefetch half, if one follows, adds its own.
   if (t < kClasses && s_hits[t] != 0) atomicAdd(&d.counters->hits[t][phase], s_hits[t]);
   if (t == 0) {
     d.counters->prefetch_used += s_prefetch_hits;
     d.counters->bytes_moved[phase] += moved;
     st->n_demand = n_demand;
-    st->n_prefetch = n_prefetch;
+    count[kHits] = 0;
+    count[kPrefetchHits] = s_prefetch_hits;
+    for (uint32_t k = 0; k < kClasses; ++k) count[kHits] += s_hits[k];
+    st->step_status = 0;
+    for (uint32_t l = 0; l < kLists; ++l) st->step_count[l] = count[l];
+    st->step_moved = moved;
     if (report != nullptr) {
       report->status = 0;
-      count[kHits] = 0;
-      count[kPrefetchHits] = s_prefetch_hits;
-      for (uint32_t k = 0; k < kClasses; ++k) count[kHits] += s_hits[k];
       for (uint32_t l = 0; l < kLists; ++l) report->count[l] = count[l];
       report->bytes_moved = moved;
     }
   }
 
-  // 9. The host mirror, at the last layer of a step: the totals, each word stored whole.
+  // 8. The host mirror, at the last layer of a step (it has no lookahead, so no prefetch half):
+  //    the totals, each word stored whole.
   if (d.mirror != nullptr && layer + 1 == d.layers) {
     __syncthreads();
     const unsigned long long *from = reinterpret_cast<const unsigned long long *>(d.counters);
     unsigned long long *to = reinterpret_cast<unsigned long long *>(&d.mirror->counters);
     for (uint32_t i = t; i < sizeof(Counters) / 8; i += blockDim.x) to[i] = from[i];
     if (t < kClasses) d.mirror->in_use[t] = st->used[t];
+  }
+}
+
+// The step's lookahead (`layer` + 1 < layers): candidates in rank order, both projections of
+// each, prefetched within the decode budget. Nothing when the demand half refused the step. A
+// lookahead the demand half did not validate (the split step) with an id outside [0, experts)
+// prefetches nothing and reports IGNIS_RESIDENCY_STATUS_INVALID; the demand half stands.
+__global__ void __launch_bounds__(kThreads)
+    resolve_prefetch(Dev d, uint32_t layer, uint32_t phase, const int32_t *lookahead,
+                     uint32_t rows, uint32_t stride) {
+  __shared__ uint32_t s_pos[IGNIS_MOE_EXPERTS];
+  __shared__ uint32_t s_list[kMaxKeysPerLayer];
+  __shared__ unsigned long long s_scratch[32];
+  __shared__ uint32_t s_status, s_n_cand;
+
+  const uint32_t t = threadIdx.x;
+  const uint32_t E = d.experts, nk = 2 * E;
+  const bool decode = phase == IGNIS_RESIDENCY_DECODE;
+  State *st = d.st;
+  if (st->step_status != 0) return;
+  Report *report = d.report != nullptr ? d.report + layer : nullptr;
+  uint32_t *entries =
+      d.report_entries != nullptr ? d.report_entries + layer * kLists * 4 * d.experts : nullptr;
+
+  if (t < IGNIS_MOE_EXPERTS) s_pos[t] = kNone;
+  if (t == 0) s_status = s_n_cand = 0;
+  __syncthreads();
+
+  // The candidates' first-occurrence rank positions.
+  for (uint32_t row = t; row < rows; row += blockDim.x) {
+    uint32_t rank = 0;
+    for (uint32_t j = 0; j < stride && rank < d.width; ++j) {
+      const int32_t e = lookahead[static_cast<unsigned long long>(row) * stride + j];
+      if (e < 0) continue;
+      if (static_cast<uint32_t>(e) >= E) {
+        s_status = IGNIS_RESIDENCY_STATUS_INVALID;
+        break;
+      }
+      atomicMin(&s_pos[e], rank * rows + row);
+      ++rank;
+    }
+  }
+  __syncthreads();
+  if (s_status != 0) {
+    if (t == 0 && report != nullptr) report->status = s_status;
+    return;
+  }
+
+  const unsigned long long now = st->clock;  // the demand half's commit
+  uint32_t count[kLists];
+  for (uint32_t l = 0; l < kLists; ++l) count[l] = st->step_count[l];
+  unsigned long long moved = 0;
+  uint32_t n_prefetch = 0;
+
+  if (t < E && s_pos[t] != kNone) {
+    uint32_t order = 0;
+    for (uint32_t e = 0; e < E; ++e) order += s_pos[e] < s_pos[t];
+    s_list[2 * order] = (layer + 1) * nk + 2 * t;
+    s_list[2 * order + 1] = (layer + 1) * nk + 2 * t + 1;
+    atomicAdd(&s_n_cand, 1u);
+  }
+  __syncthreads();
+  const uint32_t n_cand = 2 * s_n_cand;
+  unsigned long long spent = 0;
+  for (uint32_t i = 0; i < n_cand; ++i) {
+    const uint32_t k = s_list[i];
+    // Block-uniform reads: the entries were last written before a barrier.
+    const bool skip = d.slot_of[k] >= 0 || (d.flags[k] & kStaged);
+    if (skip) continue;
+    const uint32_t kc = d.cls[k];
+    const unsigned long long bytes = d.record_bytes[kc];
+    if (decode && d.budget != IGNIS_RESIDENCY_NO_BUDGET && spent + bytes > d.budget) {
+      if (t == 0) report_push(d, entries, kDropped, &count[kDropped], k);
+      __syncthreads();
+      continue;
+    }
+    const bool room = st->used[kc] < d.capacity[kc];
+    int32_t slot = -1;
+    if (decode || room) slot = find_slot(d, kc, now, decode, s_scratch);
+    if (t == 0) {
+      if (slot >= 0) {
+        place(d, k, kc, slot, now, true, d.prefetch, &n_prefetch, entries, count);
+        report_push(d, entries, kPrefetches, &count[kPrefetches], k);
+      } else if (!decode) {
+        stage(d, k, (layer + 1) & 1, layer + 1, d.prefetch, &n_prefetch);
+        report_push(d, entries, kPrefetches, &count[kPrefetches], k | IGNIS_RESIDENCY_STAGING_BIT);
+      } else {
+        report_push(d, entries, kDropped, &count[kDropped], k);
+      }
+      if (slot >= 0 || !decode) {
+        ++d.counters->prefetch_issued;
+        moved += bytes;
+      }
+    }
+    if (slot >= 0 || !decode) spent += bytes;
+    __syncthreads();
+  }
+
+  if (t == 0) {
+    d.counters->bytes_moved[phase] += moved;
+    st->n_prefetch = n_prefetch;
+    if (report != nullptr) {
+      for (uint32_t l = 0; l < kLists; ++l) report->count[l] = count[l];
+      report->bytes_moved = st->step_moved + moved;
+    }
   }
 }
 
@@ -611,8 +687,15 @@ struct ignis_residency {
   Carve layout{};
   Dev dev{};
   cudaStream_t prefetch_stream = nullptr;
-  cudaEvent_t fork = nullptr, join = nullptr;
+  // fork: the demand resolve (split) or copy (whole) is done; demanded: the demand copy is (a
+  // split step's prefetch copy waits on it, so the two never share the link); join: the
+  // prefetch branch is.
+  cudaEvent_t fork = nullptr, demanded = nullptr, join = nullptr;
   bool forked = false;
+  // A split step's open branch: its layer and phase, and whether its join is recorded yet.
+  bool branch_open = false;
+  bool join_recorded = false;
+  uint32_t branch_layer = 0, branch_phase = 0;
   bool stepped = false;
   ignis_residency_mirror *mirror_host = nullptr;  // registered by ignis_residency_set_mirror
 };
@@ -752,6 +835,7 @@ int32_t ignis_residency_create(const ignis_residency_desc *desc, const uint8_t *
   e = cudaStreamCreateWithFlags(&r->prefetch_stream, cudaStreamNonBlocking);
   if (e != cudaSuccess) return cleanup(fail(std::string("residency: the prefetch stream: ") + cudaGetErrorString(e)));
   e = cudaEventCreateWithFlags(&r->fork, cudaEventDisableTiming);
+  if (e == cudaSuccess) e = cudaEventCreateWithFlags(&r->demanded, cudaEventDisableTiming);
   if (e == cudaSuccess) e = cudaEventCreateWithFlags(&r->join, cudaEventDisableTiming);
   if (e != cudaSuccess) return cleanup(fail(std::string("residency: the fork/join events: ") + cudaGetErrorString(e)));
   *out = r;
@@ -762,6 +846,7 @@ void ignis_residency_free(ignis_residency *r) {
   if (r == nullptr) return;
   cudaDeviceSynchronize();
   if (r->join) cudaEventDestroy(r->join);
+  if (r->demanded) cudaEventDestroy(r->demanded);
   if (r->fork) cudaEventDestroy(r->fork);
   if (r->prefetch_stream) cudaStreamDestroy(r->prefetch_stream);
   if (r->mirror_host) cudaHostUnregister(r->mirror_host);
@@ -848,6 +933,13 @@ int32_t ignis_residency_join(ignis_residency *r, void *stream) {
   // wait fails; its copies never ran, so there is nothing left to join, and every later step
   // must not fail on it again.
   r->forked = false;
+  r->branch_open = false;
+  if (!r->join_recorded) {
+    // A split step whose caller never took its prefetch half: the branch holds only what the
+    // caller put on it.
+    r->join_recorded = true;
+    RESIDENCY_CUDA(cudaEventRecord(r->join, r->prefetch_stream));
+  }
   RESIDENCY_CUDA(cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), r->join, 0));
   return 0;
 }
@@ -868,11 +960,15 @@ int32_t ignis_residency_step_ranked(ignis_residency *r, uint32_t layer, uint32_t
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (ignis_residency_join(r, stream) != 0) return -1;
   r->stepped = true;
-  resolve<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, lookahead, rows, stride);
+  const bool look = lookahead != nullptr && layer + 1 < d.layers && d.lookahead_width > 0;
+  resolve_demand<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, lookahead, rows, stride);
   RESIDENCY_CUDA(cudaGetLastError());
+  if (look) {
+    resolve_prefetch<<<1, kThreads, 0, s>>>(r->dev, layer, phase, lookahead, rows, stride);
+    RESIDENCY_CUDA(cudaGetLastError());
+  }
   copy_jobs<<<d.copy_blocks, 256, 0, s>>>(r->dev.demand, &r->dev.st->n_demand);
   RESIDENCY_CUDA(cudaGetLastError());
-  const bool look = lookahead != nullptr && layer + 1 < d.layers && d.lookahead_width > 0;
   if (look) {
     RESIDENCY_CUDA(cudaEventRecord(r->fork, s));
     RESIDENCY_CUDA(cudaStreamWaitEvent(r->prefetch_stream, r->fork, 0));
@@ -880,8 +976,80 @@ int32_t ignis_residency_step_ranked(ignis_residency *r, uint32_t layer, uint32_t
     RESIDENCY_CUDA(cudaGetLastError());
     RESIDENCY_CUDA(cudaEventRecord(r->join, r->prefetch_stream));
     r->forked = true;
+    r->join_recorded = true;
   }
   return 0;
+}
+
+int32_t ignis_residency_step_demand(ignis_residency *r, uint32_t layer, uint32_t phase,
+                                    const int32_t *ids, uint32_t tokens, void *stream,
+                                    void **lookahead_stream) {
+  if (r == nullptr) return fail("residency: no residency");
+  const ignis_residency_desc &d = r->desc;
+  if (lookahead_stream != nullptr) *lookahead_stream = nullptr;
+  if (layer >= d.layers) return fail("residency: layer " + std::to_string(layer) + " is out of range");
+  if (phase != IGNIS_RESIDENCY_DECODE && phase != IGNIS_RESIDENCY_PREFILL) return fail("residency: phase must be decode or prefill");
+  if (ids == nullptr || tokens == 0 || tokens > d.max_tokens) {
+    return fail("residency: a step takes 1.." + std::to_string(d.max_tokens) + " rows of ids");
+  }
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  if (ignis_residency_join(r, stream) != 0) return -1;
+  r->stepped = true;
+  const bool look = lookahead_stream != nullptr && layer + 1 < d.layers && d.lookahead_width > 0;
+  resolve_demand<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, nullptr, 0, 0);
+  RESIDENCY_CUDA(cudaGetLastError());
+  if (look) {
+    RESIDENCY_CUDA(cudaEventRecord(r->fork, s));
+    RESIDENCY_CUDA(cudaStreamWaitEvent(r->prefetch_stream, r->fork, 0));
+    r->forked = true;
+    r->join_recorded = false;
+  }
+  copy_jobs<<<d.copy_blocks, 256, 0, s>>>(r->dev.demand, &r->dev.st->n_demand);
+  RESIDENCY_CUDA(cudaGetLastError());
+  if (look) {
+    RESIDENCY_CUDA(cudaEventRecord(r->demanded, s));
+    r->branch_open = true;
+    r->branch_layer = layer;
+    r->branch_phase = phase;
+    *lookahead_stream = r->prefetch_stream;
+  }
+  return 0;
+}
+
+int32_t ignis_residency_step_prefetch_ranked(ignis_residency *r, const int32_t *lookahead,
+                                             uint32_t rows, uint32_t stride) {
+  if (r == nullptr) return fail("residency: no residency");
+  const ignis_residency_desc &d = r->desc;
+  if (!r->branch_open) return fail("residency: no split step's lookahead branch is open");
+  if (lookahead == nullptr || rows == 0 || rows > d.max_tokens || stride == 0) {
+    return fail("residency: a lookahead takes 1.." + std::to_string(d.max_tokens) + " rows of a non-zero stride");
+  }
+  r->branch_open = false;
+  const cudaStream_t p = r->prefetch_stream;
+  resolve_prefetch<<<1, kThreads, 0, p>>>(r->dev, r->branch_layer, r->branch_phase, lookahead, rows, stride);
+  RESIDENCY_CUDA(cudaGetLastError());
+  RESIDENCY_CUDA(cudaStreamWaitEvent(p, r->demanded, 0));
+  copy_jobs<<<d.copy_blocks, 256, 0, p>>>(r->dev.prefetch, &r->dev.st->n_prefetch);
+  RESIDENCY_CUDA(cudaGetLastError());
+  RESIDENCY_CUDA(cudaEventRecord(r->join, p));
+  r->join_recorded = true;
+  return 0;
+}
+
+int32_t ignis_residency_step_prefetch(ignis_residency *r, const float *lookahead_logits, uint32_t tokens) {
+  if (r == nullptr) return fail("residency: no residency");
+  const ignis_residency_desc &d = r->desc;
+  if (!r->branch_open) return fail("residency: no split step's lookahead branch is open");
+  if (lookahead_logits == nullptr || tokens == 0 || tokens > d.max_tokens) {
+    return fail("residency: a lookahead takes 1.." + std::to_string(d.max_tokens) + " rows of logits");
+  }
+  int32_t *ranked = reinterpret_cast<int32_t *>(r->tables + r->layout.ranked);
+  const uint32_t threads = 256;
+  const uint32_t blocks = (tokens * 32 + threads - 1) / threads;
+  rank_lookahead<<<blocks, threads, 0, r->prefetch_stream>>>(lookahead_logits, tokens, d.experts,
+                                                            d.lookahead_width, ranked);
+  RESIDENCY_CUDA(cudaGetLastError());
+  return ignis_residency_step_prefetch_ranked(r, ranked, tokens, d.lookahead_width);
 }
 
 int32_t ignis_residency_step(ignis_residency *r, uint32_t layer, uint32_t phase, const int32_t *ids,

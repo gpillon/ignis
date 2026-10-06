@@ -15,7 +15,9 @@
 // `graph` runs every whole decode round (all layers in order, one token count) as one CUDA graph,
 // captured once per token count and replayed with new ids in the same buffers: decode residency
 // is graph-capturable across the layer steps of a round (spec acceptance 3); the rest runs
-// eagerly. Each layer's outcome is read from its own report.
+// eagerly. Each layer's outcome is read from its own report. `split` (alone or after `graph`)
+// runs every step as ignis_residency_step_demand plus, on the stream it forks,
+// ignis_residency_step_prefetch_ranked: the split step's outcomes are the whole step's.
 // Same no-SKIP_RETURN_CODE rule as every GPU test here (ADR 0006).
 
 #include "ignis_residency.h"
@@ -193,7 +195,11 @@ struct Round {
 }  // namespace
 
 int main(int argc, char **argv) {
-  const bool graph_mode = argc > 1 && std::string(argv[1]) == "graph";
+  bool graph_mode = false, split_mode = false;
+  for (int i = 1; i < argc; ++i) {
+    graph_mode = graph_mode || std::string(argv[i]) == "graph";
+    split_mode = split_mode || std::string(argv[i]) == "split";
+  }
   const Fixture f = load(IGNIS_RESIDENCY_FIXTURE_PATH);
   const uint32_t nk = f.experts * 2;
   const uint64_t keys = static_cast<uint64_t>(f.layers) * nk;
@@ -231,11 +237,11 @@ int main(int argc, char **argv) {
   desc.report = 1;
   ignis_residency_plan plan{};
   RES_OK(ignis_residency_plan_bytes(&desc, &plan));
-  std::printf("residency: %u layers x %u experts, %u steps, plan %llu B (pools %llu, staging %llu, tables %llu)%s\n",
+  std::printf("residency: %u layers x %u experts, %u steps, plan %llu B (pools %llu, staging %llu, tables %llu)%s%s\n",
               f.layers, f.experts, static_cast<unsigned>(f.steps.size()),
               static_cast<unsigned long long>(plan.total), static_cast<unsigned long long>(plan.pools),
               static_cast<unsigned long long>(plan.staging), static_cast<unsigned long long>(plan.tables),
-              graph_mode ? ", whole decode rounds as CUDA graphs" : "");
+              graph_mode ? ", whole decode rounds as CUDA graphs" : "", split_mode ? ", split steps" : "");
 
   ignis_residency *r = nullptr;
   RES_OK(ignis_residency_create(&desc, f.k2.data(), offsets.data(), &r));
@@ -414,6 +420,20 @@ int main(int argc, char **argv) {
     return true;
   };
 
+  // One step, whole or split (the prefetch half on the stream the demand half forked).
+  auto run_step = [&](uint32_t layer, uint32_t phase, const int32_t *ids, uint32_t tokens,
+                      const int32_t *look, uint32_t rows, uint32_t stride) {
+    if (!split_mode) {
+      RES_OK(ignis_residency_step_ranked(r, layer, phase, ids, tokens, look, rows, stride, stream));
+      return;
+    }
+    void *side = nullptr;
+    RES_OK(ignis_residency_step_demand(r, layer, phase, ids, tokens, stream, look ? &side : nullptr));
+    check((side != nullptr) == (look != nullptr && layer + 1 < f.layers),
+          "split: a branch opens exactly when the step looks ahead");
+    if (side != nullptr) RES_OK(ignis_residency_step_prefetch_ranked(r, look, rows, stride));
+  };
+
   // A capture that fails after a step with a lookahead (ended without the join, so its fork is
   // unjoined) leaves residency able to step: the join reports the dead capture's event once and
   // forgets it, and the fixture then replays from its first step as if nothing had happened --
@@ -424,7 +444,7 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaMemcpy(d_ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice));
     CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    RES_OK(ignis_residency_step_ranked(r, s.layer, s.phase, d_ids, s.tokens, d_look, s.rows, s.stride, stream));
+    run_step(s.layer, s.phase, d_ids, s.tokens, d_look, s.rows, s.stride);
     cudaGraph_t g = nullptr;
     const cudaError_t ended = cudaStreamEndCapture(stream, &g);
     check(ended != cudaSuccess, "a capture with an unjoined prefetch fork must fail to end");
@@ -458,9 +478,8 @@ int main(int argc, char **argv) {
         cudaGraph_t g = nullptr;
         CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
         for (uint32_t l = 0; l < f.layers; ++l) {
-          RES_OK(ignis_residency_step_ranked(r, l, IGNIS_RESIDENCY_DECODE, round.ids[l], tokens,
-                                             round.lookahead[l], round.lookahead[l] ? tokens : 0,
-                                             round.lookahead[l] ? f.width : 0, stream));
+          run_step(l, IGNIS_RESIDENCY_DECODE, round.ids[l], tokens, round.lookahead[l],
+                   round.lookahead[l] ? tokens : 0, round.lookahead[l] ? f.width : 0);
         }
         RES_OK(ignis_residency_join(r, stream));
         CUDA_OK(cudaStreamEndCapture(stream, &g));
@@ -492,8 +511,7 @@ int main(int argc, char **argv) {
     if (has_look) {
       CUDA_OK(cudaMemcpyAsync(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice, stream));
     }
-    RES_OK(ignis_residency_step_ranked(r, s.layer, s.phase, d_ids, s.tokens, has_look ? d_look : nullptr,
-                                       s.rows, s.stride, stream));
+    run_step(s.layer, s.phase, d_ids, s.tokens, has_look ? d_look : nullptr, s.rows, s.stride);
     RES_OK(ignis_residency_join(r, stream));
     CUDA_OK(cudaStreamSynchronize(stream));
     compare(si);
@@ -517,6 +535,22 @@ int main(int argc, char **argv) {
   }
   if (graph_mode) check(graph_rounds > 2, "graph mode replayed too few captured rounds");
 
+  if (split_mode) {
+    // A prefetch half needs its demand half's open branch; a branch the caller never took a
+    // prefetch half on still joins.
+    check(ignis_residency_step_prefetch_ranked(r, d_look, 1, f.width) != 0,
+          "a prefetch half with no open branch must be refused");
+    const std::vector<int32_t> first(f.steps[0].ids.begin(), f.steps[0].ids.begin() + f.top_k);
+    CUDA_OK(cudaMemcpy(d_ids, first.data(), first.size() * 4, cudaMemcpyHostToDevice));
+    void *side = nullptr;
+    RES_OK(ignis_residency_step_demand(r, 0, IGNIS_RESIDENCY_DECODE, d_ids, 1, stream, &side));
+    check(side != nullptr, "a split step of layer 0 opens a branch");
+    RES_OK(ignis_residency_join(r, stream));
+    CUDA_OK(cudaStreamSynchronize(stream));
+    check(ignis_residency_step_prefetch_ranked(r, d_look, 1, f.width) != 0,
+          "the join closes the branch");
+  }
+
   for (auto &[k, round] : rounds) {
     if (round.exec) cudaGraphExecDestroy(round.exec);
     for (auto *p : round.ids) cudaFree(p);
@@ -536,7 +570,8 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;
   }
-  std::printf("residency trace: %zu steps equal the policy model%s (warm start admitted %u, %u captured rounds)\n",
-              f.steps.size(), graph_mode ? " through graphs" : "", admitted, graph_rounds);
+  std::printf("residency trace: %zu steps equal the policy model%s%s (warm start admitted %u, %u captured rounds)\n",
+              f.steps.size(), graph_mode ? " through graphs" : "", split_mode ? " as split steps" : "", admitted,
+              graph_rounds);
   return 0;
 }

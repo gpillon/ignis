@@ -26,6 +26,8 @@
 #include "ignis_step.h"
 #include "../model_internal.h"
 
+#include <cuda_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -96,6 +98,9 @@ struct FlashNextModel {
   std::unique_ptr<ninfer::DeviceBuffer> lookahead_logits;
   std::unique_ptr<ninfer::DeviceBuffer> shared_h;
   std::unique_ptr<ninfer::DeviceBuffer> shared_out;
+  // Recorded on residency's lookahead branch once the lookahead router has read `x`; the
+  // layer's stream waits on it before the next sublayer's mix rewrites `x`.
+  cudaEvent_t lookahead_read = nullptr;
 
   // The lane-state views of the pool the decode graphs were captured
   // against (a replay reads these addresses): one indexer section per
