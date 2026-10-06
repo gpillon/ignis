@@ -8,6 +8,9 @@
 //! and the packer assembles the container through the crate's writer. The
 //! payload bytes are a pattern of the object's name ([`pattern`]), so a test
 //! can tell every object's bytes apart; nothing in them decodes.
+//!
+//! The same tree can hold the MTP head's work unit (`mtp/`, layout.md §13),
+//! packed into a companion container of its own.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,8 +19,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    expert_name, global_entries, layer_entries, record_bytes, Entry, FlashNextGeometry,
-    Projection, ShapeRule, TrellisK, FRONTEND_FILES,
+    expert_name, global_entries, layer_entries, mtp_entries, mtp_expert_name, record_bytes, Entry,
+    FlashNextGeometry, Projection, ShapeRule, TrellisK, FRONTEND_FILES,
 };
 use crate::packer::{pack, PackOptions, PackOutcome};
 use crate::{fail, tensor_encoded_size, Result};
@@ -76,6 +79,48 @@ impl WorkTree {
         options.header_bytes = 1 << 20;
         options.delete_batch_bytes = 1;
         options
+    }
+
+    /// The MTP head converter's work tree (layout.md §13.1).
+    pub fn mtp_work_dir(&self) -> PathBuf {
+        self.root.join("work-mtp")
+    }
+
+    pub fn mtp_artifact_path(&self) -> PathBuf {
+        self.root.join("qwen3_8_flash_next_mtp_fixture-v2.ninfer")
+    }
+
+    /// The packer options for the MTP companion, paired with `main`.
+    pub fn mtp_pack_options(&self, main: PathBuf) -> PackOptions {
+        let mut options =
+            PackOptions::mtp(self.mtp_work_dir(), self.mtp_artifact_path(), self.geometry.clone(), main);
+        options.delete_batch_bytes = 1;
+        options
+    }
+
+    /// Write the MTP unit (its non-expert tensors, its expert files, `DONE`)
+    /// and its `converter.json`, naming `main_file` as the main container.
+    pub fn write_mtp(&self, main_file: &str) -> Result<()> {
+        let dir = self.mtp_work_dir().join("mtp");
+        std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+        write_tensors(&dir, &mtp_entries(&self.geometry))?;
+        let (experts, index) = experts_files(&self.geometry, 0, mtp_expert_name);
+        write(&dir.join("experts.bin"), &experts)?;
+        write(&dir.join("experts.idx"), &index)?;
+        mark_done(&dir)?;
+        let record = json!({
+            "schema": "flash-next-mtp-converter-v1",
+            "status": "complete",
+            "source": {"repo": "fixture", "revision": "fixture"},
+            "pair": {"main": {"file": main_file, "file_sha256": "fixture"}},
+            "experts_bin": {"bytes": experts.len(), "sha256": hex_digest(&experts)},
+        });
+        write(&self.mtp_work_dir().join("converter.json"), record.to_string().as_bytes())
+    }
+
+    /// Mark the MTP unit complete again (after a test edited it).
+    pub fn mark_mtp_done(&self) -> Result<()> {
+        mark_done(&self.mtp_work_dir().join("mtp"))
     }
 
     /// Write every unit and `converter.json`.
@@ -146,7 +191,8 @@ impl WorkTree {
                     .and_then(|n| n.parse().ok())
                     .ok_or_else(|| fail(format!("unknown unit {unit}")))?;
                 write_tensors(&dir, &layer_entries(g, layer))?;
-                let (experts, index) = experts_files(g, layer);
+                let (experts, index) =
+                    experts_files(g, layer, |expert, projection| expert_name(layer, expert, projection));
                 write(&dir.join("experts.bin"), &experts)?;
                 write(&dir.join("experts.idx"), &index)?;
             }
@@ -177,7 +223,8 @@ impl WorkTree {
     pub fn write_converter_json(&self) -> Result<()> {
         let experts_bin: Vec<Value> = (0..self.geometry.layers)
             .map(|layer| {
-                let (experts, _) = experts_files(&self.geometry, layer);
+                let (experts, _) =
+                    experts_files(&self.geometry, layer, |expert, projection| expert_name(layer, expert, projection));
                 json!({"layer": layer, "bytes": experts.len(), "sha256": hex_digest(&experts)})
             })
             .collect();
@@ -222,8 +269,13 @@ pub fn build_from(tree: WorkTree) -> Result<FixtureArtifact> {
 }
 
 /// A layer's `experts.bin` and `experts.idx` (layout.md §4): every
-/// record in index order, each the pattern of its object name.
-fn experts_files(g: &FlashNextGeometry, layer: usize) -> (Vec<u8>, Vec<u8>) {
+/// record in index order (K from [`fixture_k`] at `layer`), each the
+/// pattern of its object name.
+fn experts_files(
+    g: &FlashNextGeometry,
+    layer: usize,
+    name: impl Fn(u64, Projection) -> String,
+) -> (Vec<u8>, Vec<u8>) {
     let mut experts = Vec::new();
     let mut index = Vec::new();
     for expert in 0..g.experts {
@@ -235,7 +287,7 @@ fn experts_files(g: &FlashNextGeometry, layer: usize) -> (Vec<u8>, Vec<u8>) {
             index.push(k.k2());
             index.extend_from_slice(&(bytes as u32).to_le_bytes());
             index.extend_from_slice(&(experts.len() as u64).to_le_bytes());
-            experts.extend(pattern(&expert_name(layer, expert, projection), bytes));
+            experts.extend(pattern(&name(expert, projection), bytes));
         }
     }
     (experts, index)

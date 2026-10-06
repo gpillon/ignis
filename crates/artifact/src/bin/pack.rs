@@ -7,6 +7,7 @@
 //!                       [--layers N] [--experts N] [--header-mib N]
 //!                       [--accept-status STATUS] [--keep-work] [--weights-id ID]
 //!                       [--geometry qwen3.8-flash-next|fixture]
+//!                       [--family main|mtp --pair-main <main.ninfer>]
 //!
 //! Run it after the converter ends (`work/converter.json` with status
 //! `complete`; until then it waits and deletes nothing). It appends every
@@ -21,15 +22,22 @@
 //! reduced tree, and `--keep-work` deletes nothing (refused without room for
 //! two copies). Exit status: 0 when the container is finished, 3 when it
 //! waits, 1 on error.
+//!
+//! `--family mtp` packs the MTP head's companion container (layout.md §13)
+//! from the head converter's work tree (its one unit `mtp/`), pinned to the
+//! main container `--pair-main`; `--out` then defaults to
+//! `<work>/../qwen3_8_flash_next_mtp_3p0-v2.ninfer`, the identity and the
+//! 1 MiB header are the companion's.
 
 use std::path::PathBuf;
 
 use ignis_artifact::flash_next::FlashNextGeometry;
-use ignis_artifact::packer::{pack, PackOptions, PackOutcome, ARTIFACT_FILE_NAME};
+use ignis_artifact::packer::{pack, PackOptions, PackOutcome, ARTIFACT_FILE_NAME, MTP_ARTIFACT_FILE_NAME};
 
 const USAGE: &str = "usage: ignis-artifact-pack --work <dir> [--out <artifact.ninfer>] [--layers N] \
                      [--experts N] [--header-mib N] [--accept-status STATUS] [--keep-work] \
-                     [--weights-id ID] [--geometry qwen3.8-flash-next|fixture]";
+                     [--weights-id ID] [--geometry qwen3.8-flash-next|fixture] \
+                     [--family main|mtp --pair-main <main.ninfer>]";
 
 fn main() {
     let mut work = None;
@@ -41,6 +49,8 @@ fn main() {
     let mut keep_work = false;
     let mut weights_id = None;
     let mut geometry = FlashNextGeometry::qwen38_flash_next();
+    let mut mtp = false;
+    let mut pair_main = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -62,6 +72,14 @@ fn main() {
                     _ => usage_error("--geometry takes qwen3.8-flash-next or fixture"),
                 }
             }
+            "--family" => {
+                mtp = match args.next().as_deref() {
+                    Some("main") => false,
+                    Some("mtp") => true,
+                    _ => usage_error("--family takes main or mtp"),
+                }
+            }
+            "--pair-main" => pair_main = args.next().map(PathBuf::from),
             other => usage_error(&format!("unknown argument: {other}")),
         }
     }
@@ -71,7 +89,7 @@ fn main() {
     let artifact = match out {
         Some(out) => out,
         None => match work_dir.parent() {
-            Some(model_dir) => model_dir.join(ARTIFACT_FILE_NAME),
+            Some(model_dir) => model_dir.join(if mtp { MTP_ARTIFACT_FILE_NAME } else { ARTIFACT_FILE_NAME }),
             None => usage_error("--work has no parent directory: pass --out"),
         },
     };
@@ -82,7 +100,12 @@ fn main() {
         geometry.experts = experts;
     }
 
-    let mut options = PackOptions::new(work_dir, artifact, geometry);
+    let mut options = match (mtp, pair_main) {
+        (true, Some(main)) => PackOptions::mtp(work_dir, artifact, geometry, main),
+        (true, None) => usage_error("--family mtp needs --pair-main"),
+        (false, Some(_)) => usage_error("--pair-main is for --family mtp"),
+        (false, None) => PackOptions::new(work_dir, artifact, geometry),
+    };
     if let Some(mib) = header_mib {
         options.header_bytes = match mib.checked_mul(1 << 20) {
             Some(bytes) => bytes,
