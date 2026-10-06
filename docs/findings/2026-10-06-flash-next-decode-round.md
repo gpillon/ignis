@@ -87,7 +87,7 @@ By layer kind (node sums; the HC mix and inject are charged to the sublayer they
 | `hc_norm` | **1 × 256** | 9.5 | RMS norm of the 4 × 2560 residual streams |
 | `fp8_gemv_kernel` | 40 × 256 | 12.1 | `mix_down`, 10240 → 320 (3.3 MB) |
 | `hc_down_activation` | 2 × 256 | 0.8 | |
-| `fp8_gemv_kernel` | 320 × 256 | 4.4 | `mix_up`, 320 → 10240 (3.3 MB) |
+| `fp8_gemv_kernel` | 1280 × 256 | 4.4 | `mix_up`, 320 → 10240 (3.3 MB) |
 | `bf16_gemv` | **1 × 256** | 16.3 | `block_inject`, 10240 → 4 (82 KB) |
 | `hc_reduce` | **1 × 256** | 10.5 | |
 
@@ -105,7 +105,7 @@ A mix reads ~6.6 MB of weights, ~3.7 µs at the card's bandwidth.
 | `router_select_kernel` | 1 × 256 | 3.5 | 0.33 ms |
 | MoE `combine_kernel` | 1 × 256 | 5.8 | 0.28 ms |
 
-Together they take **5.57 ms of the 13.6 ms replay** on one SM of 170. The 6-CTA FP8 GEMVs (the GDN b/a projections, 4.0 µs each, 72 per round) add 0.29 ms.
+Together they take **5.57 ms of the 14.22 ms node-level round (39%)** on one SM of 170. The 6-CTA FP8 GEMVs (the GDN b/a projections, 4.0 µs each, 72 per round) add 0.29 ms.
 
 **Expert copies.**
 - Every MoE layer launches two `copy_jobs`:
@@ -126,7 +126,7 @@ Together they take **5.57 ms of the 13.6 ms replay** on one SM of 170. The 6-CTA
 Observed:
 
 1. **A one-lane round is 13.6 ms of device replay plus 2.1-2.65 ms of device idle between replays.** The replay runs at 22% of DRAM bandwidth with 33% of SMs active. It is latency-bound: 1,774 nodes, 1,200 of them under 10 µs.
-2. **Single-CTA kernels hold 5.57 ms of the replay (41%).** The HC mix holds 5.18 ms (36%); three of its six kernels run on one CTA, and a fourth (`mix_down`) runs on 40 CTAs.
+2. **Single-CTA kernels hold 5.57 ms of the 14.22 ms node-level round (39%).** The HC mix holds 5.18 ms (36%); three of its six kernels run on one CTA, and a fourth (`mix_down`) runs on 40 CTAs.
 3. **Expert residency costs 2.7 ms per round on the critical path:**
    - `resolve` (1 CTA, 20.8 µs × 48) plus `rank_lookahead` (1 CTA, 9.1 µs × 47): 1.43 ms;
    - exposed demand copies: 1.27 ms.
