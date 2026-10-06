@@ -255,10 +255,12 @@ impl StepLeaf for FlashNextLeaf {
             o.decode_lanes,
             &self.residency,
             o.speculation,
+            None,
         )
         .map_err(|e| leaf_error("model load", e))?;
         let pool =
-            SeqPool::create(&self.config, &o.pool_budget()).map_err(|e| leaf_error("seq pool create", e))?;
+            SeqPool::create_with_speculation(&self.config, &o.pool_budget(), o.pool_backend())
+                .map_err(|e| leaf_error("seq pool create", e))?;
         let _ = self.layout_version.set(pool.snapshot_format_version());
         if o.capture_graphs {
             let capture = step::capture_decode_graphs(&model, &pool).map_err(|e| leaf_error("graph capture", e))?;

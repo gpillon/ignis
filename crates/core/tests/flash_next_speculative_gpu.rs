@@ -57,12 +57,20 @@ fn model_dir() -> PathBuf {
 }
 
 fn engine(kv_format: KvFormat) -> Option<FlashNextEngine> {
+    engine_with(kv_format, SpeculativeBackend::VerifyOnly)
+}
+
+fn engine_with(kv_format: KvFormat, backend: SpeculativeBackend) -> Option<FlashNextEngine> {
     let dir = model_dir();
     if !dir.join(ARTIFACT_FILE_NAME).exists() {
         gpu_profile::skip_or_fail(&format!("no Flash-Next artifact in {}", dir.display()));
         return None;
     }
-    let speculation = FlashNextSpeculation::new(SpeculativeBackend::VerifyOnly, DRAFT_TOKENS, 0).expect("valid");
+    if backend == SpeculativeBackend::Mtp && !ignis_core::flash_next_mtp::companion_path(&dir).exists() {
+        gpu_profile::skip_or_fail(&format!("no MTP companion in {}", dir.display()));
+        return None;
+    }
+    let speculation = FlashNextSpeculation::new(backend, DRAFT_TOKENS, 0).expect("valid");
     let options =
         EngineOptions { max_context_tokens: 8192, kv_format, speculation: Some(speculation), ..EngineOptions::default() };
     match FlashNextEngine::load(&dir, options) {
@@ -116,7 +124,7 @@ struct Outcome {
     probes: Vec<Vec<f32>>,
 }
 
-fn run(engine: &FlashNextEngine, prompts: &[Vec<u32>], drafter: &mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>) -> Outcome {
+fn run(engine: &FlashNextEngine, prompts: &[Vec<u32>], drafter: Option<&mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>>) -> Outcome {
     let mut run = engine
         .generate_speculative(prompts, TOKENS, drafter)
         .unwrap_or_else(|e| panic!("generate_speculative on {} lanes: {e}", prompts.len()));
@@ -186,25 +194,33 @@ fn exercise(engine: &mut FlashNextEngine, kv_format: KvFormat, prompts: &[Vec<u3
     let lanes = prompts.len() as u32;
     let window = engine.options().speculation.expect("speculation").window(lanes);
     assert!(window > 0, "{what}: a width that verifies");
-    let none = run(engine, prompts, &mut |_, _, _| Vec::new());
+    let none = run(engine, prompts, Some(&mut |_, _, _| Vec::new()));
     for round in &none.rounds {
         assert!(round.iter().all(|l| l.extent == 0 && l.committed == 1), "{what}: none committed a draft");
     }
-    let reject = run(engine, prompts, &mut |_, _, w| vec![REJECTED; w as usize]);
+    let reject = run(engine, prompts, Some(&mut |_, _, w| vec![REJECTED; w as usize]));
     let mut seed = 0x9e37_79b9_u32;
-    let random = run(engine, prompts, &mut |_, _, w| {
-        (0..w)
-            .map(|_| {
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                1000 + seed % 60_000
-            })
-            .collect()
-    });
+    let random = run(
+        engine,
+        prompts,
+        Some(&mut |_, _, w| {
+            (0..w)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    1000 + seed % 60_000
+                })
+                .collect()
+        }),
+    );
     let reference = none.tokens.clone();
-    let oracle = run(engine, prompts, &mut |lane, emitted, w| {
-        let next = emitted.len() + 1;
-        reference[lane][next.min(TOKENS)..(next + w as usize).min(TOKENS)].to_vec()
-    });
+    let oracle = run(
+        engine,
+        prompts,
+        Some(&mut |lane, emitted, w| {
+            let next = emitted.len() + 1;
+            reference[lane][next.min(TOKENS)..(next + w as usize).min(TOKENS)].to_vec()
+        }),
+    );
 
     for (name, outcome) in [("reject", &reject), ("random", &random)] {
         assert_eq!(outcome.tokens, none.tokens, "{what}: the {name} drafter committed other text than none");
@@ -251,6 +267,66 @@ fn a_rejected_draft_is_a_draft_never_made_on_every_state_component() {
         exercise(&mut engine, kv_format, &g1[..1], &format!("{kv_format:?} one lane, dense"));
         exercise(&mut engine, kv_format, &g1[..3], &format!("{kv_format:?} three lanes, dense"));
         exercise(&mut engine, kv_format, std::slice::from_ref(&long), &format!("{kv_format:?} one lane, sparse"));
+        drop(engine);
+    }
+}
+
+/// Each draft position's acceptance over `rounds`: of the rounds that
+/// verified a draft at position j with every draft before it accepted, the
+/// share that accepted it too (a run cut by its budget counts as far as it
+/// committed).
+fn acceptance(rounds: &[Vec<LaneRound>]) -> Vec<(u32, u32)> {
+    let mut at = vec![(0u32, 0u32); DRAFT_TOKENS as usize];
+    for lane in rounds.iter().flatten() {
+        let accepted = lane.committed - 1;
+        for j in 0..lane.extent.min(accepted + 1) {
+            at[j as usize].1 += 1;
+            if j < accepted {
+                at[j as usize].0 += 1;
+            }
+        }
+    }
+    at
+}
+
+/// Spec flash-next/07 phase D: the MTP head drafts every round from its
+/// own entries (prefill's, then each round's alignment and chain), and the
+/// verify round keeps the text -- bit for bit what the same load commits
+/// without drafts in BF16 KV (a draft-free run of the same load: the trunk
+/// never sees the head), up to the near-tie rule under hq-e8-2b and against
+/// spec-off. Prints each draft position's acceptance.
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact and its MTP companion"]
+fn the_mtp_head_drafts_and_the_text_is_kept() {
+    let Some(g1) = g1_prompts() else { return };
+    let long = long_prompt(&g1);
+    for kv_format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
+        let Some(mut engine) = engine_with(kv_format, SpeculativeBackend::Mtp) else { return };
+        for (prompts, what) in [
+            (g1[..1].to_vec(), format!("{kv_format:?} MTP one lane, dense")),
+            (g1[..3].to_vec(), format!("{kv_format:?} MTP three lanes, dense")),
+            (vec![long.clone()], format!("{kv_format:?} MTP one lane, sparse")),
+        ] {
+            let none = run(&engine, &prompts, Some(&mut |_, _, _| Vec::new()));
+            let head = run(&engine, &prompts, None);
+            let alpha = acceptance(&head.rounds);
+            let tokens: u32 = head.rounds.iter().flatten().map(|l| l.committed).sum();
+            println!(
+                "{what}: {} rounds for {tokens} tokens, acceptance per position (accepted/reached) {alpha:?}",
+                head.rounds.len()
+            );
+            assert!(alpha[0].0 > 0, "{what}: the head's first drafts were never accepted: {alpha:?}");
+            if kv_format == KvFormat::Bf16 {
+                assert_eq!(head.tokens, none.tokens, "{what}: the head's drafts changed the committed text");
+                for (lane, (p, q)) in head.probes.iter().zip(&none.probes).enumerate() {
+                    assert_eq!(same_bits(p, q), 0, "{what}: lane {lane}'s state after the head's rounds is not none's");
+                }
+            } else {
+                assert_near_tie(&mut engine, &prompts, &none.tokens, &head.tokens, &format!("{what} head vs none"));
+            }
+            let off = engine.generate(&prompts, TOKENS).unwrap_or_else(|e| panic!("{what}: spec-off generate: {e}"));
+            assert_near_tie(&mut engine, &prompts, &off, &head.tokens, &format!("{what} spec-on vs spec-off"));
+        }
         drop(engine);
     }
 }

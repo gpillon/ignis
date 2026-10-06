@@ -29,7 +29,7 @@ use crate::residency::{
     residency_table_bytes, warm_start_order, ExpertCacheRequest, ExpertTraffic, KClass,
 };
 use crate::seq::{SeqPool, SeqPoolBudget};
-use crate::speculation::FlashNextSpeculation;
+use crate::speculation::{FlashNextSpeculation, SpeculativeBackend};
 use crate::step::{
     capture_decode_graphs, decode_flash_next, decode_flash_next_verify, prefill_flash_next, SamplingParams, VerifyLane,
 };
@@ -78,6 +78,12 @@ impl EngineOptions {
         self
     }
 
+    /// The speculative backend the pool is built for: an MTP load's head is
+    /// one more attention section of it; nothing else changes the pool.
+    pub fn pool_backend(&self) -> Option<SpeculativeBackend> {
+        self.speculation.map(|s| s.backend()).filter(|&b| b == SpeculativeBackend::Mtp)
+    }
+
     /// Every retained slot, device and host: the scheduler's slot indices,
     /// the device ones first.
     pub fn retained_slots(&self) -> u32 {
@@ -104,8 +110,12 @@ impl EngineOptions {
 /// and the indexer and n-gram sections (the indexer's keys, 768 bytes per
 /// token of context, are part of the context's price, not the KV line
 /// alone). The host retained slots are host memory, in none of these.
-pub fn pool_device_bytes(config: &ModelConfig, budget: &SeqPoolBudget) -> Result<u64, String> {
-    let plan = SeqPool::plan(config, budget, None)?;
+pub fn pool_device_bytes(
+    config: &ModelConfig,
+    budget: &SeqPoolBudget,
+    backend: Option<SpeculativeBackend>,
+) -> Result<u64, String> {
+    let plan = SeqPool::plan(config, budget, backend)?;
     Ok(plan.kv_bytes
         + plan.lane_state_bytes
         + plan.retained_state_bytes
@@ -235,6 +245,8 @@ impl Drop for DeviceWeights {
 pub struct FlashNextEngine {
     model: Model,
     pool: SeqPool,
+    // An MTP load's head (spec flash-next/07): the model points into it.
+    _mtp: Option<crate::flash_next_mtp::MtpHead>,
     residency: DeviceResidency,
     table: NgramTable,
     _weights: DeviceWeights,
@@ -254,6 +266,16 @@ impl FlashNextEngine {
         let geometry = FlashNextGeometry::qwen38_flash_next();
         let plan = flash_next::bind(&reader, &geometry).map_err(|e| format!("bind the Flash-Next artifact: {e:?}"))?;
         let config = ModelConfig::flash_next_from(&geometry);
+        // Spec flash-next/07: the head's companion, pinned to this container before any byte of it
+        // is read.
+        let mtp = match options.pool_backend() {
+            Some(_) => Some(crate::flash_next_mtp::MtpHead::load(
+                &crate::flash_next_mtp::companion_path(dir),
+                &reader,
+                &geometry,
+            )?),
+            None => None,
+        };
         let planned = plan_flash_next_reservations(
             &plan,
             &geometry,
@@ -262,6 +284,7 @@ impl FlashNextEngine {
             options.kv_format,
             options.decode_lanes,
             options.speculation,
+            mtp.as_ref().map(|head| head.plan()),
         )?;
 
         let weights = DeviceWeights::place(&reader, &plan)?;
@@ -278,12 +301,13 @@ impl FlashNextEngine {
             options.decode_lanes,
             &residency,
             options.speculation,
+            mtp.as_ref(),
         )?;
         // The pool is planned against what is free before it is created, so a
         // context the card cannot hold is a refusal naming it, not an
         // allocation failure.
         let budget = options.pool_budget();
-        let pool_bytes = pool_device_bytes(&config, &budget)?;
+        let pool_bytes = pool_device_bytes(&config, &budget, options.pool_backend())?;
         let free = weights.device().free_bytes().unwrap_or(u64::MAX);
         if pool_bytes > free {
             return Err(format!(
@@ -293,7 +317,7 @@ impl FlashNextEngine {
                 options.decode_lanes, options.max_context_tokens
             ));
         }
-        let pool = SeqPool::create(&config, &budget)?;
+        let pool = SeqPool::create_with_speculation(&config, &budget, options.pool_backend())?;
         let (graphs_ready, graph_error) = if options.capture_graphs {
             let capture = capture_decode_graphs(&model, &pool)?;
             let mask = (1..=options.decode_lanes).filter(|&w| capture.is_ready(w)).fold(0, |mask, w| mask | 1 << (w - 1));
@@ -305,6 +329,7 @@ impl FlashNextEngine {
         Ok(Self {
             model,
             pool,
+            _mtp: mtp,
             residency,
             table,
             _weights: weights,
@@ -525,14 +550,16 @@ impl FlashNextEngine {
     /// Greedy generation of `count` tokens after each prompt with the
     /// load's speculation (spec flash-next/07), on lanes of one prompt each.
     /// Every round, `drafter(lane, emitted, window)` proposes the lane's
-    /// drafts (at most `window`, the width's; empty: extent 0); a round of
-    /// width 0's window, or whose lanes cannot all fit the window's columns,
-    /// runs as a one-token round.
+    /// drafts (at most `window`, the width's; empty: extent 0); with no
+    /// drafter an MTP load verifies its head's own, made at the end of the
+    /// lane's last round (a verify-only load then verifies none). A round of
+    /// window 0, or whose lanes cannot all fit the positions it writes, runs
+    /// as a one-token round.
     pub fn generate_speculative(
         &self,
         prompts: &[Vec<u32>],
         count: usize,
-        drafter: &mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>,
+        mut drafter: Option<&mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>>,
     ) -> Result<SpeculativeRun<'_>, String> {
         let speculation = self.options.speculation.ok_or("this engine was loaded without speculation")?;
         if prompts.is_empty() || prompts.len() > self.options.decode_lanes as usize {
@@ -554,6 +581,9 @@ impl FlashNextEngine {
         let mut rounds = Vec::new();
         let mut times = Vec::new();
         let context_tokens = self.table.new_context().recent().len();
+        let mtp = speculation.backend() == SpeculativeBackend::Mtp;
+        // An MTP load's drafts for each lane's next round: none after a prefill or a one-token round.
+        let mut head_drafts: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
         loop {
             let active: Vec<usize> = (0..prompts.len()).filter(|&i| out[i].len() < count).collect();
             if active.is_empty() {
@@ -566,9 +596,10 @@ impl FlashNextEngine {
                 .iter()
                 .map(|&i| seqs[i].pending_token().map(|t| t as u32).ok_or("a lane has no pending token"))
                 .collect::<Result<_, _>>()?;
+            let written = if mtp { 2 * window } else { window + 1 };
             let fits = active
                 .iter()
-                .all(|&i| seqs[i].stats().position + u64::from(window) < u64::from(self.options.max_context_tokens));
+                .all(|&i| seqs[i].stats().position + u64::from(written) <= u64::from(self.options.max_context_tokens));
             let mut round = Vec::with_capacity(active.len());
             if window == 0 || !fits {
                 let mut rows = vec![0u8; active.len() * self.table.token_bytes()];
@@ -588,6 +619,7 @@ impl FlashNextEngine {
                 for ((&lane, (token, _)), context) in active.iter().zip(emitted).zip(lane_contexts) {
                     out[lane].push(token as u32);
                     contexts[lane] = context;
+                    head_drafts[lane].clear();
                     round.push(LaneRound { extent: 0, committed: 1 });
                 }
             } else {
@@ -595,7 +627,11 @@ impl FlashNextEngine {
                 let drafts: Vec<Vec<i32>> = active
                     .iter()
                     .map(|&i| {
-                        let mut proposed = drafter(i, &out[i], window);
+                        let head = std::mem::take(&mut head_drafts[i]);
+                        let mut proposed = match drafter.as_mut() {
+                            Some(drafter) => drafter(i, &out[i], window),
+                            None => head,
+                        };
                         proposed.truncate(window as usize);
                         proposed.into_iter().map(|t| t as i32).collect()
                     })
@@ -639,6 +675,7 @@ impl FlashNextEngine {
                         NgramContext::from_recent(self.table.hasher(), &history[history.len() - context_tokens..])?;
                     round.push(LaneRound { extent: run.extent, committed: committed.len() as u32 });
                     out[lane].extend_from_slice(&committed);
+                    head_drafts[lane] = run.next_drafts.iter().map(|&t| t as u32).collect();
                 }
             }
             times.push(began.elapsed());

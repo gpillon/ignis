@@ -30,6 +30,7 @@ use crate::binder::{Binder, MaterializationPlan, ObjectHandle};
 use crate::{fail, NumericFormat, Object, Reader, ResourceEncoding, Result, StorageLayout};
 
 pub mod fixture;
+pub mod mtp;
 
 /// The container identity's `model_id` for every Flash-Next artifact.
 pub const MODEL_ID: &str = "qwen3.8-flash-next";

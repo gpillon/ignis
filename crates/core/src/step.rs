@@ -87,8 +87,12 @@ pub(crate) mod ffi {
         /// thing that is not the host reading logits (ADR 0034).
         pub out_permitted_probs: *mut f32,
         /// GitHub #302: each lane's n-gram table rows on a Flash-Next load,
-        /// host `[batch][16][90]`; null on the 27B.
+        /// host `[batch][16][90]` (a verify round: `[batch][window + 1]
+        /// [16][90]`); null on the 27B.
         pub ngram_rows: *const u8,
+        /// GitHub #307: a Flash-Next MTP load's drafts for each lane's next
+        /// round, `[batch][window]`; null asks for nothing.
+        pub out_drafts: *mut i32,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -943,6 +947,7 @@ pub fn decode_flash_next(
         out_extents: std::ptr::null_mut(),
         out_permitted_probs: probabilities.as_mut_ptr(),
         ngram_rows: ngram_rows.as_ptr(),
+        out_drafts: std::ptr::null_mut(),
     };
     let mut tokens = vec![-1; handles.len()];
     let rc = unsafe {
@@ -1189,6 +1194,7 @@ pub fn decode_program_batch_permitted(
         out_extents: std::ptr::null_mut(),
         out_permitted_probs: probabilities.as_mut_ptr(),
         ngram_rows: std::ptr::null(),
+        out_drafts: std::ptr::null_mut(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -1241,6 +1247,10 @@ pub fn decode_program_verify(
 pub struct LaneVerifyRun {
     pub tokens: Vec<i32>,
     pub extent: u32,
+    /// GitHub #307: on a Flash-Next load with the MTP head, the drafts the
+    /// head made for the lane's next round, at the frontier this run left it
+    /// at (`window` of them); empty on any other load.
+    pub next_drafts: Vec<i32>,
 }
 
 /// [`decode_program_verify`], reporting each lane's extent with its run.
@@ -1341,6 +1351,7 @@ fn verify_round(
     let mut tokens = vec![-1i32; handles.len() * (width + 1)];
     let mut committed = vec![0i32; handles.len()];
     let mut extents = vec![0u32; handles.len()];
+    let mut next_drafts = vec![-1i32; handles.len() * width];
     // No proposal on any lane is a null seam: every lane at extent 0 under a
     // caller-fed load, the drafter's own proposals under DFlash2.
     let proposes = lanes.iter().any(|lane| !lane.drafts.is_empty());
@@ -1355,6 +1366,7 @@ fn verify_round(
         // there is no probability for it to report.
         out_permitted_probs: std::ptr::null_mut(),
         ngram_rows,
+        out_drafts: next_drafts.as_mut_ptr(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -1376,9 +1388,11 @@ fn verify_round(
         .enumerate()
         .map(|(index, (&count, &extent))| {
             let start = index * (width + 1);
+            let drafts = &next_drafts[index * width..(index + 1) * width];
             LaneVerifyRun {
                 tokens: tokens[start..start + count as usize].to_vec(),
                 extent,
+                next_drafts: if drafts.iter().all(|&d| d >= 0) { drafts.to_vec() } else { Vec::new() },
             }
         })
         .collect())

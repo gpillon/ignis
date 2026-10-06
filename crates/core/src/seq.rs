@@ -555,10 +555,17 @@ fn pool_spec(
         gdn_value_heads: cfg.gdn_value_heads as u32,
         gdn_head_dim: cfg.gdn_head_dim as u32,
         vocab: cfg.vocab as u32,
-        speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
+        // Flash-Next's MTP head keeps no drafter window: its state is the
+        // attention section below.
+        speculative_backend: speculative_backend
+            .filter(|&b| b != crate::SpeculativeBackend::Mtp)
+            .map_or(0, |b| b.abi_code()),
         retained_slot_count: budget.retained_slot_count,
         retained_host_slot_count: budget.retained_host_slot_count,
-        kv_num_layers: cfg.attention_layer_count() as u32,
+        // GitHub #307: an MTP load's head is one more attention layer of the
+        // pool -- its KV, indexer and hq window carried like the trunk's.
+        kv_num_layers: cfg.attention_layer_count() as u32
+            + u32::from(speculative_backend == Some(crate::SpeculativeBackend::Mtp)),
         indexer_key_dim: cfg.indexer.map_or(0, |i| (i.kv_heads * i.head_dim) as u32),
         indexer_compress_tokens: cfg.indexer.map_or(0, |i| i.compress_ratio as u32),
         ngram_conv_columns: cfg.ngram.map_or(0, |n| n.conv_state_tokens() as u32),
@@ -1653,6 +1660,9 @@ mod tests {
         assert_eq!(pool_spec(&ModelConfig::qwen38_27b(), &budget, None).kv_num_layers, 16);
         let flash = pool_spec(&ModelConfig::qwen38_flash_next(), &budget, None);
         assert_eq!((flash.kv_num_layers, flash.num_kv_heads, flash.head_dim), (12, 2, 256));
+        // Spec flash-next/07: the MTP head's attention section, and no drafter window.
+        let mtp = pool_spec(&ModelConfig::qwen38_flash_next(), &budget, Some(crate::SpeculativeBackend::Mtp));
+        assert_eq!((mtp.kv_num_layers, mtp.speculative_backend), (13, 0));
         assert_eq!((flash.gdn_num_layers, flash.gdn_value_heads), (36, 48));
     }
 

@@ -76,11 +76,89 @@ int32_t run_pass(ignis_model *model, FlashNextModel &fn, const Context &ctx, con
                         stream, error);
 }
 
-int32_t run_commit(ignis_model *model, FlashNextModel &fn, const verify::Sections &sections, uint32_t width,
-                   std::string *error) {
-  return verify::commit(*fn.verify, sections, fn.g, width, fn.verify->window(width),
-                        static_cast<const int32_t *>(fn.slots->p), static_cast<const int32_t *>(fn.positions->p),
-                        model->stream, error);
+// The MTP head's drafting between the fold and the restore (spec flash-next/07 phase D): the
+// alignment over the pass's stacks and licensed tokens -- entry p + j from the stack at p + j and
+// t[p + j + 1] = licensed[j], the committed ones kept -- then each lane's first draft from its last
+// committed column's S', then k - 1 chained steps, each from the previous step's S' and draft at
+// the next position past the frontier.
+int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, uint32_t width, std::string *error) {
+  verify::State &state = *fn.verify;
+  const uint32_t window = state.window(width);
+  const auto lanes = static_cast<int32_t>(width);
+  const auto columns = static_cast<int32_t>(window + 1);
+  const auto k = static_cast<int32_t>(window);
+  cudaStream_t stream = model->stream;
+  ninfer::DeviceArena &scratch = *model->decode_graph_scratch;
+  auto scope = scratch.scope();
+  Batch batch;
+  batch.lanes = lanes;
+  batch.tokens = columns;
+  batch.slots = static_cast<const int32_t *>(fn.slots->p);
+  batch.positions = static_cast<const int32_t *>(fn.positions->p);
+  batch.max_visible = decode_max_visible(fn);
+  batch.verify = &state.records;
+  auto *picks = static_cast<int32_t *>(state.picks->p);
+  auto *chain_tokens = static_cast<int32_t *>(state.chain_tokens->p);
+  auto *drafts = static_cast<int32_t *>(state.drafts_out->p);
+  void *logits = model->sampling_decode_logits->p;
+  const auto head = [&](int32_t rows, int32_t *out) {
+    if (fn_head(fn.g, fn.mtp->mixer, fn.weights->head, fn.residual->p, rows, logits, scratch, stream) != 0) {
+      *error = std::string("the MTP head's logits: ") + fn_last_error();
+      return -1;
+    }
+    if (mtp::argmax(fn.g, logits, rows, out, stream) != 0) {
+      *error = fn_last_error();
+      return -1;
+    }
+    return 0;
+  };
+  if (mtp_entries(fn, ctx, batch, static_cast<const int32_t *>(state.licensed->p), scratch, stream, error) != 0 ||
+      head(lanes * columns, picks) != 0) {
+    return -1;
+  }
+  if (mtp::first_drafts(fn.g, picks, fn.residual->p, static_cast<const int32_t *>(state.commit->p), lanes, columns, k,
+                        drafts, chain_tokens, state.chain_stack->p, stream) != 0) {
+    *error = fn_last_error();
+    return -1;
+  }
+  const std::size_t stack_bytes = static_cast<std::size_t>(lanes) * fn.g.residual_width() * 2;
+  for (int32_t step = 1; step < k; ++step) {
+    Batch chain;
+    chain.lanes = lanes;
+    chain.tokens = 1;
+    chain.slots = batch.slots;
+    chain.positions = static_cast<const int32_t *>(state.chain_positions->p) + (step - 1) * lanes;
+    chain.max_visible = batch.max_visible;
+    if (cudaMemcpyAsync(fn.residual->p, state.chain_stack->p, stack_bytes, cudaMemcpyDeviceToDevice, stream) !=
+        cudaSuccess) {
+      *error = std::string("the MTP chain's stacks: ") + cudaGetErrorString(cudaGetLastError());
+      return -1;
+    }
+    if (mtp_entries(fn, ctx, chain, chain_tokens, scratch, stream, error) != 0 || head(lanes, chain_tokens) != 0) {
+      return -1;
+    }
+    if (step + 1 < k && cudaMemcpyAsync(state.chain_stack->p, fn.residual->p, stack_bytes, cudaMemcpyDeviceToDevice,
+                                        stream) != cudaSuccess) {
+      *error = std::string("the MTP chain's stacks: ") + cudaGetErrorString(cudaGetLastError());
+      return -1;
+    }
+    if (mtp::append_drafts(chain_tokens, lanes, k, step, drafts, stream) != 0) {
+      *error = fn_last_error();
+      return -1;
+    }
+  }
+  return 0;
+}
+
+int32_t run_commit(ignis_model *model, FlashNextModel &fn, const Context &ctx, const verify::Sections &sections,
+                   uint32_t width, std::string *error) {
+  const verify::State &state = *fn.verify;
+  const uint32_t window = state.window(width);
+  const auto *slots = static_cast<const int32_t *>(fn.slots->p);
+  if (verify::fold(state, sections, width, window, slots, model->stream, error) != 0) return -1;
+  if (fn.mtp != nullptr && run_drafts(model, fn, ctx, width, error) != 0) return -1;
+  return verify::restore(state, sections, fn.g, width, window, slots, static_cast<const int32_t *>(fn.positions->p),
+                         model->stream, error);
 }
 
 // Begins a capture, runs `body`, ends it and instantiates. A failure leaves *exec null.
@@ -131,7 +209,7 @@ int32_t capture_verify_graphs(ignis_model *model, ignis_seq_pool *pool, std::str
         capture(stream, fn, &state.pass_exec[at], &failure,
                 [&] { return run_pass(model, fn, views.ctx, sections, width, &failure); }) &&
         capture(stream, fn, &state.commit_exec[at], &failure,
-                [&] { return run_commit(model, fn, sections, width, &failure); });
+                [&] { return run_commit(model, fn, views.ctx, sections, width, &failure); });
     state.ready[at] = ok;
     if (!ok) *error = "width " + std::to_string(width) + " verify: " + failure;
   }
@@ -156,6 +234,9 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
                   std::to_string(width) + " lanes runs on this load (" + std::to_string(k) + ")");
   }
   if (options->out_committed_counts == nullptr) return refuse("out_committed_counts is null for a verify round");
+  // On an MTP load the head drafts each lane's next round at the end of this one (out_drafts);
+  // the caller hands them back as this round's drafts, having hashed their n-gram rows.
+  const bool mtp = fn.mtp != nullptr;
   const uint32_t columns = k + 1;
   const auto rows = static_cast<std::size_t>(width) * columns;
 
@@ -167,10 +248,12 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
     const std::string at = " at index " + std::to_string(i);
     if (seq == nullptr || seq->pending_token < 0) return refuse("sequence is null or was not prefilled" + at);
     if (!ignis_seq_belongs_to(*pool, *seq)) return refuse("the sequence was not drawn from this pool" + at);
-    // Every column writes its position, drafted or not: the whole window must fit.
+    // Every column writes its position, drafted or not, and the head's chain past them: the whole
+    // window must fit.
     const uint64_t room = std::min<uint64_t>(ignis_seq_token_capacity(*seq), fn.max_context_tokens);
-    if (seq->position + columns > room) {
-      return refuse("the lane has no room for a verify round's " + std::to_string(columns) + " columns" + at +
+    const uint32_t written = verify::written_positions(k, mtp);
+    if (seq->position + written > room) {
+      return refuse("the lane has no room for the " + std::to_string(written) + " positions a verify round writes" + at +
                     "; run it in a one-token round");
     }
     const ignis_sampling_params &lane = sampling[i];
@@ -271,13 +354,25 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
     for (int32_t j = 0; j < c; ++j) out_token_ids[i * columns + j] = run_at(j);
   }
 
-  // The commit.
+  // The commit, and on an MTP load the next round's drafts: the head's chain runs at the positions
+  // past each lane's new frontier.
   ok = stage(state.commit->p, committed.data(), lane_bytes, "the committed counts");
+  std::vector<int32_t> next_drafts(mtp ? static_cast<std::size_t>(width) * k : 0, -1);
+  if (ok && mtp && k > 1) {
+    std::vector<int32_t> chain(static_cast<std::size_t>(k - 1) * width);
+    for (uint32_t step = 1; step < k; ++step) {
+      for (uint64_t i = 0; i < batch_size; ++i) chain[(step - 1) * width + i] = positions[i] + committed[i] - 1 + step;
+    }
+    ok = stage(state.chain_positions->p, chain.data(), chain.size() * sizeof(int32_t), "the chain's positions");
+  }
   if (ok && use_graph) {
     ok = check_cuda(cudaGraphLaunch(state.commit_exec[at], stream), "cudaGraphLaunch(verify commit)", &error);
   } else if (ok) {
-    ok = run_commit(model, fn, sections, width, &error) == 0;
+    ok = run_commit(model, fn, views.ctx, sections, width, &error) == 0;
   }
+  ok = ok && (!mtp || check_cuda(cudaMemcpyAsync(next_drafts.data(), state.drafts_out->p,
+                                                 next_drafts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream),
+                                 "reading the drafts", &error));
   ok = ok && check_cuda(cudaStreamSynchronize(stream), "the commit's synchronize", &error);
   if (!ok) return fail(error);
 
@@ -313,6 +408,9 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   for (uint64_t i = 0; i < batch_size; ++i) {
     sequences[i]->pending_token = pending[i];
     advance_frontiers(sequences[i], static_cast<uint32_t>(committed[i]));
+    if (options->out_drafts != nullptr) {
+      for (uint32_t j = 0; j < k; ++j) options->out_drafts[i * k + j] = mtp ? next_drafts[i * k + j] : -1;
+    }
     options->out_committed_counts[i] = committed[i];
     if (options->out_extents != nullptr) options->out_extents[i] = static_cast<uint32_t>(extents[i]);
     if (options->out_permitted_probs != nullptr) options->out_permitted_probs[i] = 0.0F;

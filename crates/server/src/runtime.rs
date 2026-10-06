@@ -518,6 +518,7 @@ pub fn flash_next_scheduler(
         shape.kv_format,
         lanes,
         None,
+        None,
     )?;
     let config = ModelConfig::flash_next_from(&geometry);
     // The options the leaf loads with, but for the expert cache, which is
@@ -534,7 +535,7 @@ pub fn flash_next_scheduler(
         kv_ram_arena_bytes: shape.host_pool_bytes,
         ..EngineOptions::default()
     };
-    let pool_plan = SeqPool::plan(&config, &options.pool_budget(), None)?;
+    let pool_plan = SeqPool::plan(&config, &options.pool_budget(), options.pool_backend())?;
     let cat = catalog(&plan.experts)?;
     let max_tokens = shape.prefill_chunk.max(lanes);
     let residency_fixed = prefill_staging_ring_bytes(&cat)

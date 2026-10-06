@@ -25,6 +25,13 @@
 // What needs no commit: KV rows and pooled indexer blocks at positions past the new frontier sit
 // where nothing reads them until the frontier reaches them again, and that append rewrites them
 // (positions are never read past a lane's frontier); residency is a cache.
+//
+// On an MTP load (phase D, mtp.h) the commit also drafts the next round, between the fold and the
+// restore: the head's alignment over the pass's k + 1 stacks and licensed tokens (its entries at
+// the columns' own positions, the committed ones kept), then k - 1 chained steps from each lane's
+// last committed column, past its frontier. The head's attention section is one more attention
+// layer of the pool, saved and restored with the trunk's -- its ring rows over the chain's
+// positions too, so a lane's saved range is 2k positions there.
 
 #pragma once
 
@@ -64,6 +71,10 @@ uint32_t window_for(uint32_t draft_tokens, uint32_t row_budget, uint32_t lanes);
 // The decode route's widest call on a load: its plain rounds' lanes, or a verify round's rows.
 uint32_t decode_rows(uint32_t decode_lanes, uint32_t draft_tokens, uint32_t row_budget);
 
+// The positions past a lane's frontier a round of window k writes: its k + 1 columns, and on an MTP
+// load the head's chained steps up to 2k.
+uint32_t written_positions(uint32_t window, bool mtp);
+
 // Every device byte a load with a draft window keeps for its rounds (ADR 0030), by line.
 struct Plan {
   std::size_t staging = 0;   // per-round inputs and the accept's outputs
@@ -74,7 +85,7 @@ struct Plan {
   std::size_t total() const { return staging + accept + gdn_records + indexer_records + saved; }
 };
 Plan plan(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
-          int32_t attention_layers, int32_t gdn_layers);
+          int32_t attention_layers, int32_t gdn_layers, bool mtp);
 
 // The round's buffers, at stable addresses (a captured graph replays them). Allocated once at load.
 struct State {
@@ -83,6 +94,7 @@ struct State {
   uint32_t lanes = 0;  // the load's decode lanes
   int32_t attention_layers = 0;
   int32_t gdn_layers = 0;
+  bool mtp = false;
   Plan sizes;
 
   // Host-staged per round: I32 [lanes] each, drafts I32 [lanes][k] (lane-major, the accept's [k, B]).
@@ -98,6 +110,14 @@ struct State {
   std::unique_ptr<ninfer::DeviceBuffer> licensed_counts;
   std::unique_ptr<ninfer::DeviceBuffer> accepted;
   std::unique_ptr<ninfer::DeviceArena> accept_workspace;
+  // An MTP load's drafting (mtp.h), null otherwise: the head's picks per row I32 [rows], each
+  // lane's chain token I32 [lanes] and stack BF16 [lanes][streams * hidden], the chain's positions
+  // I32 [k - 1][lanes] (host-staged with the commit counts) and the drafts out I32 [lanes][k].
+  std::unique_ptr<ninfer::DeviceBuffer> picks;
+  std::unique_ptr<ninfer::DeviceBuffer> chain_tokens;
+  std::unique_ptr<ninfer::DeviceBuffer> chain_stack;
+  std::unique_ptr<ninfer::DeviceBuffer> chain_positions;
+  std::unique_ptr<ninfer::DeviceBuffer> drafts_out;
 
   // The records the ops write (flash_next_internal.h VerifyRecords) and what the pass saves.
   std::unique_ptr<ninfer::DeviceBuffer> gdn_records;
@@ -125,11 +145,11 @@ struct State {
 // Why a load of these options cannot run the verify round, or empty: what bind refuses before any
 // allocation, so a plan and a load refuse alike.
 std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
-                    int32_t attention_layers, int32_t gdn_layers);
+                    int32_t attention_layers, int32_t gdn_layers, bool mtp);
 
 // Allocates the state for a load (`lanes` decode lanes), or null and *error.
 std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens,
-                              uint32_t row_budget, int32_t attention_layers, int32_t gdn_layers,
+                              uint32_t row_budget, int32_t attention_layers, int32_t gdn_layers, bool mtp,
                               std::string *error);
 
 // The lane-state addresses the save, restore and fold kernels read and write: one pool's sections.
@@ -161,9 +181,12 @@ int32_t save(const State &state, const Sections &sections, const Geometry &g, ui
 int32_t accept(State &state, const Geometry &g, uint32_t lanes, uint32_t window, const void *logits,
                const void *configs, cudaStream_t stream, std::string *error);
 
-// The commit, with each lane's committed column count in `state.commit` (DEVICE [lanes], 1..window+1).
+// The commit, with each lane's committed column count in `state.commit` (DEVICE [lanes], 1..window+1),
+// in two halves an MTP load drafts between: the GDN fold, then the restore of everything else.
 // Graph-safe.
-int32_t commit(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
-               const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error);
+int32_t fold(const State &state, const Sections &sections, uint32_t lanes, uint32_t window, const int32_t *slots,
+             cudaStream_t stream, std::string *error);
+int32_t restore(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
+                const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error);
 
 }  // namespace ignis::flash_next::verify

@@ -26,6 +26,7 @@
 #include "hc.h"
 #include "indexer.h"
 #include "qsa.h"
+#include "mtp.h"
 #include "qsa_sparse.h"
 #include "verify.h"
 
@@ -102,6 +103,9 @@ int32_t gdn_layers(const FlashNextModel &fn) {
   return static_cast<int32_t>(fn.weights->layers.size()) - attention_layers(fn);
 }
 
+// The pool's attention sections: the trunk's, and an MTP load's head one past them.
+int32_t attention_sections(const FlashNextModel &fn) { return attention_layers(fn) + (fn.mtp != nullptr ? 1 : 0); }
+
 Sizes plan_sizes(const FlashNextModel &fn) {
   const Geometry &g = fn.g;
   Sizes s;
@@ -130,8 +134,15 @@ Sizes plan_sizes(const FlashNextModel &fn) {
       std::max<std::size_t>(ninfer::ops::sampling_workspace_capacity_bytes(g.vocab, 1, IGNIS_DECODE_MAX_BATCH), 256);
   if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
     s.verify = verify::plan(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
-                            attention_layers(fn), gdn_layers(fn))
+                            attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr)
                    .total();
+  }
+  if (fn.mtp != nullptr) {
+    // The head's entries' tokens and its expert slot table; its combine beside the layer's ops.
+    s.activations += aligned(rows * sizeof(int32_t)) +
+                     aligned(static_cast<std::size_t>(g.experts) * 2 * sizeof(ignis_moe_slot));
+    s.prefill_scratch = std::max(s.prefill_scratch, mtp::combine_scratch_bytes(g, chunk) + 4096);
+    s.decode_scratch = std::max(s.decode_scratch, mtp::combine_scratch_bytes(g, decode_rows) + 4096);
   }
   return s;
 }
@@ -162,8 +173,7 @@ std::string geometry_refusal(const Geometry &g) {
 
 std::string pool_refusal(const FlashNextModel &fn, const ignis_seq_pool &pool) {
   const Geometry &g = fn.g;
-  int32_t attention = 0;
-  for (const LayerWeights &layer : fn.weights->layers) attention += layer.attention ? 1 : 0;
+  const int32_t attention = attention_sections(fn);
   if (pool.kv_format != fn.kv_format) return "the pool's KV format is not this load's";
   if (pool.kv_num_layers != attention || pool.kv_num_kv_heads != g.kv_heads || pool.kv_head_dim != g.head_dim) {
     return "the pool's KV planes are not this model's attention layers";
@@ -364,6 +374,29 @@ void advance_frontiers(ignis_seq *seq, uint32_t tokens) {
   for (auto &frontier : seq->gdn_positions) frontier += tokens;
 }
 
+int32_t mtp_entries(FlashNextModel &fn, const Context &ctx, const Batch &batch, const int32_t *tokens,
+                    ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error) {
+  mtp::Buffers b;
+  b.residual = fn.residual->p;
+  b.x = fn.x->p;
+  b.y = fn.y->p;
+  b.inj = static_cast<float *>(fn.injections->p);
+  b.workspace = ignis_moe_workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
+  b.acc = static_cast<int64_t *>(fn.moe_acc->p);
+  b.router_ids = static_cast<int32_t *>(fn.router_ids->p);
+  b.router_weights = static_cast<float *>(fn.router_weights->p);
+  b.router_logits = static_cast<float *>(fn.router_logits->p);
+  b.shared_h = fn.shared_h->p;
+  b.shared_out = static_cast<float *>(fn.shared_out->p);
+  if (mtp::combine(fn.g, *fn.mtp, fn.weights->embed, tokens, batch, b, scratch, stream) != 0 ||
+      mtp::layer(ctx, attention_layers(fn), *fn.mtp, static_cast<const ignis_moe_slot *>(fn.mtp_slots->p), batch, b,
+                 scratch, stream) != 0) {
+    *error = std::string("the MTP head: ") + fn_last_error();
+    return -1;
+  }
+  return 0;
+}
+
 namespace {
 
 float bf16_to_f32(std::uint16_t bits) {
@@ -445,9 +478,30 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
   }
   // The binder first: a set of descriptors is right or wrong whatever the
   // geometry, and a caller learns which before learning whether this
-  // program runs the geometry.
-  fn->weights = bind_flash_next(tensors, count, topology, error);
+  // program runs the geometry. An MTP load's head tensors (`mtp.*`) bind on
+  // their own; on any other load they are the trunk binder's extras.
+  const bool mtp = fn->speculative_backend == IGNIS_SPECULATIVE_MTP;
+  std::vector<ignis_bound_tensor> trunk, head;
+  for (uint64_t i = 0; i < count; ++i) {
+    const bool is_head = mtp && tensors[i].name != nullptr && std::strncmp(tensors[i].name, "mtp.", 4) == 0;
+    (is_head ? head : trunk).push_back(tensors[i]);
+  }
+  fn->weights = bind_flash_next(trunk.data(), trunk.size(), topology, error);
   if (fn->weights == nullptr) {
+    return nullptr;
+  }
+  if (mtp) {
+    fn->mtp = bind_mtp(head.data(), head.size(), topology, error);
+    if (fn->mtp == nullptr) {
+      *error = "the MTP head: " + *error;
+      return nullptr;
+    }
+    if (options->mtp_expert_slots != nullptr) {
+      const auto entries = static_cast<std::size_t>(Geometry::from(topology).experts) * 2;
+      fn->mtp_slot_table.assign(options->mtp_expert_slots, options->mtp_expert_slots + entries);
+    }
+  } else if (options != nullptr && options->mtp_expert_slots != nullptr) {
+    *error = "mtp_expert_slots without the MTP backend";
     return nullptr;
   }
   if (const std::string why = geometry_refusal(fn->g); !why.empty()) {
@@ -455,13 +509,9 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
     return nullptr;
   }
   // Spec flash-next/07: the verify round, with a test's drafts (VERIFY_ONLY) or the MTP head's.
-  if (fn->speculative_backend == IGNIS_SPECULATIVE_MTP) {
-    *error = "the MTP head's companion weights are not bound by this load";
-    return nullptr;
-  }
   if (fn->speculative_backend != IGNIS_SPECULATIVE_NONE) {
     if (const std::string why = verify::refusal(fn->g, fn->decode_lanes, fn->draft_tokens, fn->draft_row_budget,
-                                                attention_layers(*fn), gdn_layers(*fn));
+                                                attention_sections(*fn), gdn_layers(*fn), mtp);
         !why.empty()) {
       *error = "Qwen3.8-Flash-Next's verify round: " + why;
       return nullptr;
@@ -510,7 +560,7 @@ ignis_model_reservations reserved(const ignis_model &model) {
   for (const auto *buffer : {&fn.residual, &fn.x, &fn.y, &fn.injections, &fn.token_ids, &fn.slots, &fn.positions,
                              &fn.ngram_rows, &fn.moe_workspace, &fn.moe_acc, &fn.router_ids, &fn.router_weights,
                              &fn.router_logits, &fn.lookahead_ids, &fn.lookahead_weights, &fn.lookahead_logits,
-                             &fn.shared_h, &fn.shared_out}) {
+                             &fn.shared_h, &fn.shared_out, &fn.mtp_tokens, &fn.mtp_slots}) {
     out.activation_bytes += bytes(*buffer);
   }
   out.verify_round_bytes = fn.verify != nullptr ? fn.verify->device_bytes() : 0;
@@ -610,9 +660,37 @@ int32_t finish_load(ignis_model &model, std::string *error) {
   }
   if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
     fn.verify = verify::create(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
-                               attention_layers(fn), gdn_layers(fn), error);
+                               attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr, error);
     if (fn.verify == nullptr) {
       *error = "Flash-Next's verify round: " + *error;
+      return -1;
+    }
+  }
+  if (fn.mtp != nullptr) {
+    // The head's experts are all resident: every slot names a record and a K class.
+    if (fn.mtp_slot_table.size() != static_cast<std::size_t>(g.experts) * 2) {
+      *error = "an MTP load needs its expert slot table (ignis_model_load_options.mtp_expert_slots)";
+      return -1;
+    }
+    for (std::size_t i = 0; i < fn.mtp_slot_table.size(); ++i) {
+      const ignis_moe_slot &slot = fn.mtp_slot_table[i];
+      if (slot.record == nullptr || (slot.k2 != 4 && slot.k2 != 5 && slot.k2 != 6 && slot.k2 != 8)) {
+        *error = "the MTP head's expert slot " + std::to_string(i) + " names no record or no K class";
+        return -1;
+      }
+    }
+    try {
+      const auto rows = static_cast<std::size_t>(fn.rows());
+      fn.mtp_tokens = std::make_unique<ninfer::DeviceBuffer>(aligned(rows * sizeof(int32_t)));
+      fn.mtp_slots =
+          std::make_unique<ninfer::DeviceBuffer>(aligned(fn.mtp_slot_table.size() * sizeof(ignis_moe_slot)));
+    } catch (const std::exception &e) {
+      *error = std::string("the MTP head's reservations: ") + e.what();
+      return -1;
+    }
+    if (!check_cuda(cudaMemcpy(fn.mtp_slots->p, fn.mtp_slot_table.data(),
+                               fn.mtp_slot_table.size() * sizeof(ignis_moe_slot), cudaMemcpyHostToDevice),
+                    "uploading the MTP head's slot table", error)) {
       return -1;
     }
   }
@@ -751,6 +829,30 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
           }
         }
       }
+      // Spec flash-next/07: the MTP head's entries for the chunk's positions, entry p from the
+      // trunk's stack at p and token p + 1 -- the span's next id, or at the span's last position
+      // the token just drawn -- so the head's frontier is the sequence's.
+      if (fn.mtp != nullptr) {
+        auto *next = static_cast<int32_t *>(fn.mtp_tokens->p);
+        const bool staged =
+            (chunk == 1 || check_cuda(cudaMemcpyAsync(next, token_ids + offset + 1, (chunk - 1) * sizeof(int32_t),
+                                                      cudaMemcpyHostToDevice, stream),
+                                      "staging the head's tokens", &error)) &&
+            (last ? check_cuda(cudaMemcpyAsync(next + chunk - 1, model->sampling_single_out->p, sizeof(int32_t),
+                                               cudaMemcpyDeviceToDevice, stream),
+                               "staging the drawn token", &error)
+                  : check_cuda(cudaMemcpyAsync(next + chunk - 1, token_ids + offset + chunk, sizeof(int32_t),
+                                               cudaMemcpyHostToDevice, stream),
+                               "staging the next chunk's token", &error));
+        if (!staged) return false;
+        Batch batch;
+        batch.lanes = 1;
+        batch.tokens = chunk;
+        batch.slots = static_cast<const int32_t *>(fn.slots->p);
+        batch.positions = static_cast<const int32_t *>(fn.positions->p);
+        batch.max_visible = position + chunk;
+        if (mtp_entries(fn, views.ctx, batch, next, *model->scratch, stream, &error) != 0) return false;
+      }
       return check_cuda(cudaStreamSynchronize(stream), "the chunk's synchronize", &error);
     }();
     if (!ok) {
@@ -824,6 +926,14 @@ int32_t run_round(ignis_model *model, FlashNextModel &fn, const Context &ctx, ui
                         positions_tensor, ninfer::ops::kSamplePurposeDecode, *model->sampling_workspace, stream);
   } catch (const std::exception &e) {
     *error = std::string("the draw: ") + e.what();
+    return -1;
+  }
+  // Spec flash-next/07: on an MTP load every committed position gets its head entry, this round's
+  // from its stack and the token it drew; it drafts nothing (the next verify round runs at
+  // extent 0 and drafts).
+  if (fn.mtp != nullptr &&
+      mtp_entries(fn, ctx, batch, static_cast<const int32_t *>(model->sampling_decode_out->p), scratch, stream, error) !=
+          0) {
     return -1;
   }
   return 0;

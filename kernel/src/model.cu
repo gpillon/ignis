@@ -1135,8 +1135,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     return model;
   }
   if (options != nullptr && (options->decode_lanes != 0 || options->residency != nullptr ||
-                             options->draft_row_budget != 0)) {
-    set_error("ignis_model_load: decode_lanes, residency and draft_row_budget are Qwen3.8-Flash-Next's options");
+                             options->draft_row_budget != 0 || options->mtp_expert_slots != nullptr)) {
+    set_error("ignis_model_load: decode_lanes, residency, draft_row_budget and mtp_expert_slots are "
+              "Qwen3.8-Flash-Next's options");
     return nullptr;
   }
   if (speculative_backend == IGNIS_SPECULATIVE_MTP) {

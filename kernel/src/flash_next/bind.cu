@@ -243,4 +243,35 @@ std::unique_ptr<Weights> bind_flash_next(const ignis_bound_tensor *tensors, uint
   return w;
 }
 
+std::unique_ptr<MtpWeights> bind_mtp(const ignis_bound_tensor *tensors, uint64_t count,
+                                     const ignis_topology &topology, std::string *error) {
+  std::string scratch_error;
+  if (error == nullptr) {
+    error = &scratch_error;
+  }
+  Schema s(tensors, count, error);
+  const Geometry g = Geometry::from(topology);
+  if (const std::string fault = geometry_fault(g); !fault.empty()) {
+    s.fail("not a Flash-Next topology: " + fault);
+    return nullptr;
+  }
+  if (!s.index(count)) {
+    return nullptr;
+  }
+  auto w = std::make_unique<MtpWeights>();
+  const std::string p = "mtp.layers.0.";
+  w->layer.attention = true;
+  if (!s.linear("mtp.fc_embedding.weight", g.hidden, g.hidden, w->fc_embedding) ||
+      !s.linear("mtp.fc_hidden.weight", g.hidden, g.hidden, w->fc_hidden) ||
+      !s.bf16("mtp.pre_fc_norm_embedding.weight", {g.hidden}, w->norm_embedding) ||
+      !s.bf16("mtp.pre_fc_norm_hidden.weight", {g.residual_width()}, w->norm_hidden) ||
+      !bind_hc(s, "mtp.hyper_connection_mixer", g, /*inject=*/false, w->mixer) ||
+      !bind_hc(s, p + "attn_hyper_connection", g, true, w->layer.attn_hc) ||
+      !bind_hc(s, p + "mlp_hyper_connection", g, true, w->layer.mlp_hc) || !bind_qsa(s, p, g, w->layer.qsa) ||
+      !bind_moe(s, p, g, w->layer.moe) || !s.no_extras()) {
+    return nullptr;
+  }
+  return w;
+}
+
 }  // namespace ignis::flash_next

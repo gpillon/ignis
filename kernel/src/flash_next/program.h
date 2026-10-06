@@ -19,6 +19,7 @@
 #pragma once
 
 #include "flash_next_internal.h"
+#include "mtp.h"
 
 #include "ignis_model.h"
 #include "ignis_moe.h"
@@ -79,6 +80,12 @@ struct FlashNextModel {
   std::unique_ptr<verify::State> verify;
   // The decode route's widest call: a round's lanes, or a verify round's rows (verify::decode_rows).
   uint32_t decode_rows = 0;
+  // An MTP load's head (spec flash-next/07 phase D): its weights, its expert slot table (host until
+  // the load uploads it), and the tokens of the entries a call writes (I32 [rows]).
+  std::unique_ptr<MtpWeights> mtp;
+  std::vector<ignis_moe_slot> mtp_slot_table;
+  std::unique_ptr<ninfer::DeviceBuffer> mtp_slots;
+  std::unique_ptr<ninfer::DeviceBuffer> mtp_tokens;
   Sizes sizes;
 
   // The rows every activation buffer holds: a chunk's, or a round's widest call.
@@ -172,6 +179,11 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
                 ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error);
 // Every per-layer frontier of the sequence moves with its program frontier.
 void advance_frontiers(ignis_seq *seq, uint32_t tokens);
+// The MTP head's entries for a call's rows (spec flash-next/07): entry r from the stack the trunk
+// (or the head's previous step) left in the residual and tokens[r] (DEVICE), at the batch's
+// positions, in the head's own attention section; S' is left in the residual.
+int32_t mtp_entries(FlashNextModel &fn, const Context &ctx, const Batch &batch, const int32_t *tokens,
+                    ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error);
 
 // The verify round (spec flash-next/07, speculative.cu): ignis_program_decode with a speculative
 // window on a load with one, after program_decode's own checks.

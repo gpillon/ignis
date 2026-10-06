@@ -65,6 +65,15 @@ uint32_t max_columns_of(uint32_t lanes, uint32_t draft_tokens, uint32_t row_budg
   }
   return columns;
 }
+// The positions a lane's saved ring rows cover, at the widest window.
+uint32_t max_ring_columns_of(uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget, bool mtp) {
+  uint32_t columns = 0;
+  for (uint32_t w = 1; w <= lanes; ++w) {
+    const uint32_t k = window_for(draft_tokens, row_budget, w);
+    if (k != 0) columns = std::max(columns, written_positions(k, mtp));
+  }
+  return columns;
+}
 
 // One GDN layer's records at `rows` rows, plane by plane.
 struct GdnRecordLayout {
@@ -115,7 +124,7 @@ struct SaveArgs {
   uint32_t *words;
   __nv_bfloat16 *rows;
   int32_t lanes;
-  int32_t columns;      // this width's k + 1
+  int32_t columns;      // the positions this width's round writes past the frontier
   int32_t row_columns;  // the rows section's columns per lane
   int32_t tail_elements;
   int32_t ngram_elements;
@@ -188,7 +197,8 @@ struct RestoreArgs {
   int32_t key_dim;
   int32_t compress;
   int32_t lanes;
-  int32_t columns;
+  int32_t columns;       // this width's k + 1: the recorded keys' columns per lane
+  int32_t ring_columns;  // the positions its saved ring rows cover
   int32_t row_columns;
   int32_t tail_elements;
   int32_t ngram_columns;
@@ -254,8 +264,8 @@ __global__ void restore_ring_kernel(RestoreArgs a) {
     }
     a.s.ring[static_cast<int64_t>(slot) * kRingWords + word] = bits;
   }
-  const int32_t layer = unit / (a.columns * 2);
-  const int32_t column = (unit / 2) % a.columns;
+  const int32_t layer = unit / (a.ring_columns * 2);
+  const int32_t column = (unit / 2) % a.ring_columns;
   if (column < c) return;
   const bool role_v = (unit & 1) != 0;
   const int32_t head = static_cast<int32_t>(threadIdx.x) / 32;
@@ -400,6 +410,8 @@ bool launched(const char *what, std::string *error) {
 
 }  // namespace
 
+uint32_t written_positions(uint32_t window, bool mtp) { return mtp ? 2 * window : window + 1; }
+
 uint32_t window_for(uint32_t draft_tokens, uint32_t row_budget, uint32_t lanes) {
   if (draft_tokens == 0 || lanes == 0) return 0;
   const uint32_t budget = row_budget == 0 || row_budget > kMaxRows ? kMaxRows : row_budget;
@@ -412,28 +424,36 @@ uint32_t decode_rows(uint32_t decode_lanes, uint32_t draft_tokens, uint32_t row_
 }
 
 Plan plan(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
-          int32_t attention_layers, int32_t gdn_layers) {
+          int32_t attention_layers, int32_t gdn_layers, bool mtp) {
   Plan p;
   const uint32_t rows = max_rows_of(lanes, draft_tokens, row_budget);
-  const uint32_t columns = max_columns_of(lanes, draft_tokens, row_budget);
+  const uint32_t ring_columns = max_ring_columns_of(lanes, draft_tokens, row_budget, mtp);
   if (rows == 0) return p;
   const std::size_t lane_i32 = aligned(static_cast<std::size_t>(lanes) * sizeof(int32_t));
-  p.staging = 7 * lane_i32 + aligned(static_cast<std::size_t>(lanes) * draft_tokens * sizeof(int32_t)) +
-              2 * aligned(static_cast<std::size_t>(rows) * sizeof(int32_t));
+  const std::size_t drafts = aligned(static_cast<std::size_t>(lanes) * draft_tokens * sizeof(int32_t));
+  p.staging = 7 * lane_i32 + drafts + 2 * aligned(static_cast<std::size_t>(rows) * sizeof(int32_t));
+  if (mtp) {
+    // picks, chain tokens, chain stacks, chain positions, drafts out.
+    p.staging += aligned(static_cast<std::size_t>(rows) * sizeof(int32_t)) + lane_i32 +
+                 aligned(static_cast<std::size_t>(lanes) * g.residual_width() * 2) +
+                 aligned(static_cast<std::size_t>(lanes) * std::max<uint32_t>(draft_tokens - 1, 1) * sizeof(int32_t)) +
+                 drafts;
+  }
   p.accept = aligned(ninfer::ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                  g.vocab, 1, static_cast<int32_t>(draft_tokens), 1, static_cast<int32_t>(lanes))) +
              256;
   p.gdn_records = static_cast<std::size_t>(gdn_layers) * gdn_layout(rows).layer();
   p.indexer_records = static_cast<std::size_t>(attention_layers) *
                       aligned(static_cast<std::size_t>(rows) * g.indexer_kv_heads * g.indexer_head_dim * sizeof(__nv_bfloat16));
-  p.saved = saved_layout(g, kv_format, lanes, columns, attention_layers).bytes();
+  p.saved = saved_layout(g, kv_format, lanes, ring_columns, attention_layers).bytes();
   return p;
 }
 
 std::size_t State::device_bytes() const {
   std::size_t bytes = accept_workspace != nullptr ? accept_workspace->capacity() : 0;
   for (const auto *buffer : {&valid_columns, &extents, &lengths, &anchors, &drafts, &commit, &target_tokens, &licensed,
-                             &licensed_counts, &accepted, &gdn_records, &indexer_records, &saved}) {
+                             &licensed_counts, &accepted, &gdn_records, &indexer_records, &saved, &picks,
+                             &chain_tokens, &chain_stack, &chain_positions, &drafts_out}) {
     bytes += *buffer != nullptr ? (*buffer)->bytes : 0;
   }
   return bytes;
@@ -455,7 +475,8 @@ State::~State() {
 }
 
 std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
-                    int32_t attention_layers, int32_t gdn_layers) {
+                    int32_t attention_layers, int32_t gdn_layers, bool mtp) {
+  (void)mtp;
   if (draft_tokens == 0 || draft_tokens > kMaxWindow) {
     return "a draft window of " + std::to_string(draft_tokens) + " tokens (1.." + std::to_string(kMaxWindow) + ")";
   }
@@ -484,9 +505,10 @@ std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, ui
 }
 
 std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens,
-                              uint32_t row_budget, int32_t attention_layers, int32_t gdn_layers,
+                              uint32_t row_budget, int32_t attention_layers, int32_t gdn_layers, bool mtp,
                               std::string *error) {
-  if (std::string why = refusal(g, lanes, draft_tokens, row_budget, attention_layers, gdn_layers); !why.empty()) {
+  if (std::string why = refusal(g, lanes, draft_tokens, row_budget, attention_layers, gdn_layers, mtp);
+      !why.empty()) {
     *error = why;
     return nullptr;
   }
@@ -496,7 +518,8 @@ std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lan
   st->lanes = lanes;
   st->attention_layers = attention_layers;
   st->gdn_layers = gdn_layers;
-  st->sizes = plan(g, kv_format, lanes, draft_tokens, row_budget, attention_layers, gdn_layers);
+  st->mtp = mtp;
+  st->sizes = plan(g, kv_format, lanes, draft_tokens, row_budget, attention_layers, gdn_layers, mtp);
   const uint32_t rows = max_rows_of(lanes, draft_tokens, row_budget);
   try {
     const auto buffer = [](std::size_t bytes) { return std::make_unique<ninfer::DeviceBuffer>(aligned(bytes)); };
@@ -515,6 +538,14 @@ std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lan
     st->gdn_records = buffer(st->sizes.gdn_records);
     st->indexer_records = buffer(st->sizes.indexer_records);
     st->saved = buffer(st->sizes.saved);
+    if (mtp) {
+      st->picks = buffer(static_cast<std::size_t>(rows) * sizeof(int32_t));
+      st->chain_tokens = buffer(lane_i32);
+      st->chain_stack = buffer(static_cast<std::size_t>(lanes) * g.residual_width() * 2);
+      st->chain_positions = buffer(static_cast<std::size_t>(lanes) * std::max<uint32_t>(draft_tokens - 1, 1) *
+                                   sizeof(int32_t));
+      st->drafts_out = buffer(static_cast<std::size_t>(lanes) * draft_tokens * sizeof(int32_t));
+    }
   } catch (const std::exception &e) {
     *error = std::string("the verify round's reservations: ") + e.what();
     return nullptr;
@@ -577,9 +608,10 @@ bool sections_of(const ignis_seq_pool &pool, const Geometry &g, int32_t gdn_laye
 
 int32_t save(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
              const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
-  const uint32_t row_columns = max_columns_of(state.lanes, state.draft_tokens, state.row_budget);
+  const uint32_t row_columns = max_ring_columns_of(state.lanes, state.draft_tokens, state.row_budget, state.mtp);
   const SavedLayout layout = saved_layout(g, sections.ring != nullptr ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16,
                                           state.lanes, row_columns, sections.attention_layers);
+  const auto ring_columns = static_cast<int32_t>(written_positions(window, state.mtp));
   auto *saved = static_cast<unsigned char *>(state.saved->p);
   SaveArgs a{sections,
              slots,
@@ -589,7 +621,7 @@ int32_t save(const State &state, const Sections &sections, const Geometry &g, ui
              reinterpret_cast<uint32_t *>(saved + layout.tails + layout.ngram),
              reinterpret_cast<__nv_bfloat16 *>(saved + layout.tails + layout.ngram + layout.words),
              static_cast<int32_t>(lanes),
-             static_cast<int32_t>(window + 1),
+             ring_columns,
              static_cast<int32_t>(row_columns),
              layout.tail_elements,
              layout.ngram_elements};
@@ -599,7 +631,7 @@ int32_t save(const State &state, const Sections &sections, const Geometry &g, ui
   save_ngram_kernel<<<dim3(32, n), kThreads, 0, stream>>>(a);
   if (!launched("verify save: n-gram conv", error)) return -1;
   if (sections.ring != nullptr) {
-    const auto units = static_cast<unsigned>(sections.attention_layers * static_cast<int32_t>(window + 1) * 2);
+    const auto units = static_cast<unsigned>(sections.attention_layers * ring_columns * 2);
     save_ring_kernel<<<dim3(units, n), RingGeometry::KVHeads * 32, 0, stream>>>(a);
     if (!launched("verify save: hq ring", error)) return -1;
   }
@@ -637,16 +669,8 @@ int32_t accept(State &state, const Geometry &g, uint32_t lanes, uint32_t window,
   return 0;
 }
 
-int32_t commit(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
-               const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
-  const uint32_t row_columns = max_columns_of(state.lanes, state.draft_tokens, state.row_budget);
-  const SavedLayout layout = saved_layout(g, sections.ring != nullptr ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16,
-                                          state.lanes, row_columns, sections.attention_layers);
-  const auto *saved = static_cast<const unsigned char *>(state.saved->p);
-  const auto *commit_counts = static_cast<const int32_t *>(state.commit->p);
-  const auto n = static_cast<unsigned>(lanes);
-  const auto columns = static_cast<int32_t>(window + 1);
-
+int32_t fold(const State &state, const Sections &sections, uint32_t lanes, uint32_t window, const int32_t *slots,
+             cudaStream_t stream, std::string *error) {
   FoldArgs f{};
   for (int32_t l = 0; l < sections.gdn_layers; ++l) {
     f.recurrent[l] = sections.recurrent[l];
@@ -658,17 +682,26 @@ int32_t commit(const State &state, const Sections &sections, const Geometry &g, 
   f.conv_record = static_cast<const __nv_bfloat16 *>(state.records.gdn_conv);
   f.record_layer_bytes = static_cast<int64_t>(state.records.gdn_layer_bytes);
   f.slots = slots;
-  f.commit = commit_counts;
-  f.width = columns;
-  const dim3 fold_grid(static_cast<unsigned>(gdn::kValueHeads), n,
+  f.commit = static_cast<const int32_t *>(state.commit->p);
+  f.width = static_cast<int32_t>(window + 1);
+  const dim3 fold_grid(static_cast<unsigned>(gdn::kValueHeads), static_cast<unsigned>(lanes),
                        static_cast<unsigned>(sections.gdn_layers * (gd::kStateDim / gd::kBlockDv)));
   fold_kernel<<<fold_grid, dim3(ninfer::ops::kWarpSize, gd::kNumWarps, 1), 0, stream>>>(f);
-  if (!launched("verify commit: GDN fold", error)) return -1;
+  return launched("verify commit: GDN fold", error) ? 0 : -1;
+}
 
+int32_t restore(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
+                const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
+  const uint32_t row_columns = max_ring_columns_of(state.lanes, state.draft_tokens, state.row_budget, state.mtp);
+  const SavedLayout layout = saved_layout(g, sections.ring != nullptr ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16,
+                                          state.lanes, row_columns, sections.attention_layers);
+  const auto *saved = static_cast<const unsigned char *>(state.saved->p);
+  const auto n = static_cast<unsigned>(lanes);
+  const auto ring_columns = static_cast<int32_t>(written_positions(window, state.mtp));
   RestoreArgs r{sections,
                 slots,
                 positions,
-                commit_counts,
+                static_cast<const int32_t *>(state.commit->p),
                 reinterpret_cast<const __nv_bfloat16 *>(saved),
                 reinterpret_cast<const __nv_bfloat16 *>(saved + layout.tails),
                 reinterpret_cast<const uint32_t *>(saved + layout.tails + layout.ngram),
@@ -678,7 +711,8 @@ int32_t commit(const State &state, const Sections &sections, const Geometry &g, 
                 g.indexer_head_dim,
                 g.compress_ratio,
                 static_cast<int32_t>(lanes),
-                columns,
+                static_cast<int32_t>(window + 1),
+                ring_columns,
                 static_cast<int32_t>(row_columns),
                 layout.tail_elements,
                 sections.ngram_columns,
@@ -690,7 +724,7 @@ int32_t commit(const State &state, const Sections &sections, const Geometry &g, 
                          stream>>>(r);
   if (!launched("verify commit: n-gram conv", error)) return -1;
   if (sections.ring != nullptr) {
-    const auto units = static_cast<unsigned>(sections.attention_layers * columns * 2);
+    const auto units = static_cast<unsigned>(sections.attention_layers * ring_columns * 2);
     restore_ring_kernel<<<dim3(units, n), RingGeometry::KVHeads * 32, 0, stream>>>(r);
     if (!launched("verify commit: hq ring", error)) return -1;
   }
