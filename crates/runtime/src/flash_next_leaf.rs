@@ -25,9 +25,9 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use ignis_artifact::flash_next::{self, FlashNextGeometry, FlashNextPlan};
-use ignis_artifact::{materialize, CudaDevice, Device, MaterializedArtifact, Reader};
+use ignis_artifact::{Device, Reader};
 use ignis_core::compute::ModelConfig;
-use ignis_core::flash_next::{build_residency, EngineOptions};
+use ignis_core::flash_next::{build_residency, DeviceWeights, EngineOptions};
 use ignis_core::flash_next_counters::FlashNextCounterSource;
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::ngram::NgramContext;
@@ -107,9 +107,9 @@ pub struct FlashNextLeaf {
     geometry: FlashNextGeometry,
     config: ModelConfig,
     options: EngineOptions,
-    artifact: MaterializedArtifact,
     reader: Reader,
-    device: CudaDevice,
+    /// The weight arena and the device, freed together (`DeviceWeights`).
+    weights: DeviceWeights,
 }
 
 // Raw FFI handles with no synchronization of their own: sound for the same
@@ -131,8 +131,7 @@ impl FlashNextLeaf {
         let geometry = FlashNextGeometry::qwen38_flash_next();
         let plan = flash_next::bind(&reader, &geometry).map_err(|e| format!("bind the Flash-Next artifact: {e:?}"))?;
         let config = ModelConfig::flash_next_from(&geometry);
-        let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
-        let artifact = materialize(&reader, &plan.plan, &mut device, None).map_err(|e| format!("materialize: {e}"))?;
+        let weights = DeviceWeights::place(&reader, &plan)?;
         let mut residency = build_residency(path, &plan, &options)?;
         // Before the first step, and so before any graph captures one: the
         // last layer of every step writes the totals into host memory.
@@ -155,9 +154,8 @@ impl FlashNextLeaf {
             geometry,
             config,
             options,
-            artifact,
             reader,
-            device,
+            weights,
         })
     }
 
@@ -243,7 +241,7 @@ impl StepLeaf for FlashNextLeaf {
         let model = model_load::load_flash_next(
             &self.plan,
             &self.geometry,
-            &self.artifact,
+            self.weights.artifact(),
             o.prefill_chunk_tokens,
             o.max_context_tokens,
             o.kv_format,
@@ -282,7 +280,7 @@ impl StepLeaf for FlashNextLeaf {
             last_step_micros: program.last_step_micros,
             kernel_count: program.kernel_count,
             graph_launches: program.graph_launches,
-            free_vram_bytes: self.device.free_bytes().unwrap_or(0),
+            free_vram_bytes: self.weights.device().free_bytes().unwrap_or(0),
             reserved: ReservedBytes {
                 workspace: reserved.workspace_bytes + reserved.activation_bytes,
                 sampling: reserved.sampling_bytes,

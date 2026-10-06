@@ -188,6 +188,39 @@ pub fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOption
     Ok(residency)
 }
 
+/// The artifact's non-expert tensors placed on the device, and the device
+/// they live on. Dropping it frees the weight arena: `MaterializedArtifact`
+/// has no `Drop` of its own, since its release needs the device that placed
+/// it, and without this every load in a process left its ~5 GB of weights
+/// behind (the fourth load of `flash_next_forward_gpu` ran out of VRAM).
+pub struct DeviceWeights {
+    artifact: MaterializedArtifact,
+    device: CudaDevice,
+}
+
+impl DeviceWeights {
+    /// Place the device tensors of `plan` on device 0.
+    pub fn place(reader: &Reader, plan: &FlashNextPlan) -> Result<Self, String> {
+        let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
+        let artifact = materialize(reader, &plan.plan, &mut device, None).map_err(|e| format!("materialize: {e}"))?;
+        Ok(Self { artifact, device })
+    }
+
+    pub fn artifact(&self) -> &MaterializedArtifact {
+        &self.artifact
+    }
+
+    pub fn device(&self) -> &CudaDevice {
+        &self.device
+    }
+}
+
+impl Drop for DeviceWeights {
+    fn drop(&mut self) {
+        let _ = self.artifact.release_arena(&mut self.device);
+    }
+}
+
 /// A loaded Flash-Next model and everything it runs on. Field order is drop
 /// order: the model goes before the pool it captured graphs against, the
 /// residency and device weights it borrows, and the device they live on.
@@ -196,8 +229,7 @@ pub struct FlashNextEngine {
     pool: SeqPool,
     residency: DeviceResidency,
     table: NgramTable,
-    _artifact: MaterializedArtifact,
-    _device: CudaDevice,
+    _weights: DeviceWeights,
     config: ModelConfig,
     options: EngineOptions,
     graphs_ready: u32,
@@ -223,16 +255,14 @@ impl FlashNextEngine {
             options.decode_lanes,
         )?;
 
-        let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
-        let artifact =
-            materialize(&reader, &plan.plan, &mut device, None).map_err(|e| format!("materialize: {e}"))?;
+        let weights = DeviceWeights::place(&reader, &plan)?;
         let residency = build_residency(&path, &plan, &options)?;
         let ngram = config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?;
         let table = NgramTable::from_artifact(&path, &reader, &plan, ngram, options.ngram)?;
         let model = load_flash_next(
             &plan,
             &geometry,
-            &artifact,
+            weights.artifact(),
             options.prefill_chunk_tokens,
             options.max_context_tokens,
             options.kv_format,
@@ -244,7 +274,7 @@ impl FlashNextEngine {
         // allocation failure.
         let budget = options.pool_budget();
         let pool_bytes = pool_device_bytes(&config, &budget)?;
-        let free = device.free_bytes().unwrap_or(u64::MAX);
+        let free = weights.device().free_bytes().unwrap_or(u64::MAX);
         if pool_bytes > free {
             return Err(format!(
                 "the sequence pool of {} lanes of {} tokens needs {pool_bytes} bytes (KV, lane state, the \
@@ -267,8 +297,7 @@ impl FlashNextEngine {
             pool,
             residency,
             table,
-            _artifact: artifact,
-            _device: device,
+            _weights: weights,
             config,
             options,
             graphs_ready,
