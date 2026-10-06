@@ -26,6 +26,7 @@
 #include "qsa.h"
 #include "qsa_sparse.h"
 
+#include "ignis_fn_residual_tap.h"
 #include "ignis_fp8_linear.h"
 #include "ignis_seq_internal.h"
 #include "../permitted_tokens.h"
@@ -573,6 +574,12 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
       batch.positions = static_cast<const int32_t *>(fn.positions->p);
       batch.max_visible = position + chunk;
       if (forward(fn, views.ctx, batch, IGNIS_RESIDENCY_PREFILL, *model->scratch, stream, &error) != 0) {
+        return false;
+      }
+      // Test-only residual-stack tap (kernel/include/ignis_fn_residual_tap.h): one flag load when
+      // disarmed.
+      if (ignis_fn_residual_tap_record(position, chunk, g.residual_width(), fn.residual->p, stream) != 0) {
+        error = ignis_fn_residual_tap_last_error();
         return false;
       }
       const auto residual_row = [&](int32_t row) {

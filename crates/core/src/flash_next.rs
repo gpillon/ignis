@@ -426,10 +426,54 @@ impl FlashNextEngine {
         Ok(seq)
     }
 
+    /// `tokens` prefilled from position 0 on a fresh sequence with the
+    /// residual-stack tap armed (spec flash-next/07 phase A): every
+    /// position's final pre-mixer stack, and the engine's own greedy pick
+    /// after it with that row's margin -- what the MTP head is fed and what a
+    /// verify would accept, from one prefill.
+    #[cfg(feature = "residual-tap")]
+    pub fn tapped_span(&mut self, tokens: &[u32]) -> Result<TappedSpan, String> {
+        let geometry = FlashNextGeometry::qwen38_flash_next();
+        let width = (geometry.hc_streams * geometry.hidden) as usize;
+        let vocab = self.vocab();
+        let mut argmax = Vec::with_capacity(tokens.len());
+        let mut margin = Vec::with_capacity(tokens.len());
+        let (result, stacks, written) = crate::residual_tap::with_residual_tap(0, tokens.len(), width, || {
+            self.span_logits(tokens, &mut |_, rows| {
+                for row in rows.chunks_exact(vocab) {
+                    let (best, gap) = top_with_margin(row);
+                    argmax.push(best);
+                    margin.push(gap);
+                }
+                Ok(())
+            })
+        })?;
+        result?;
+        if written != tokens.len() || argmax.len() != tokens.len() {
+            return Err(format!(
+                "the tap wrote {written} rows and the span {} picks for {} tokens",
+                argmax.len(),
+                tokens.len()
+            ));
+        }
+        Ok(TappedSpan { width, stacks, argmax, margin })
+    }
+
     /// Greedy generation of `count` tokens after `prompt`, on lanes of one
     /// prompt each (all of them at once: one round of `prompts.len()` lanes
     /// per token).
     pub fn generate(&mut self, prompts: &[Vec<u32>], count: usize) -> Result<Vec<Vec<u32>>, String> {
+        self.generate_timed(prompts, count).map(|(tokens, _)| tokens)
+    }
+
+    /// [`generate`](Self::generate), with each round's wall time: the host's
+    /// n-gram staging of the round's tokens plus the round itself, as a
+    /// serving loop pays it (spec flash-next/07 phase A's cost per row).
+    pub fn generate_timed(
+        &mut self,
+        prompts: &[Vec<u32>],
+        count: usize,
+    ) -> Result<(Vec<Vec<u32>>, Vec<std::time::Duration>), String> {
         if prompts.is_empty() || prompts.len() > self.options.decode_lanes as usize {
             return Err(format!("{} prompts on {} lanes", prompts.len(), self.options.decode_lanes));
         }
@@ -446,8 +490,10 @@ impl FlashNextEngine {
             contexts.push(context);
         }
         let mut out = vec![Vec::with_capacity(count); prompts.len()];
+        let mut times = Vec::with_capacity(count);
         let mut rows = vec![0u8; prompts.len() * self.table.token_bytes()];
         for _ in 0..count {
+            let began = std::time::Instant::now();
             let pending: Vec<[u32; 1]> = seqs
                 .iter()
                 .map(|seq| seq.pending_token().map(|t| [t as u32]).ok_or("a lane has no pending token"))
@@ -458,17 +504,62 @@ impl FlashNextEngine {
             let mut handles: Vec<_> = seqs.iter_mut().collect();
             let greedy = vec![(SamplingParams::greedy(), &[][..]); handles.len()];
             let emitted = decode_flash_next(&self.model, &self.pool, &mut handles, &greedy, &rows)?;
+            times.push(began.elapsed());
             for (lane, (token, _)) in emitted.into_iter().enumerate() {
                 out[lane].push(token as u32);
             }
         }
-        Ok(out)
+        Ok((out, times))
     }
+}
+
+/// What [`FlashNextEngine::tapped_span`] captured: `stacks` is BF16 bits
+/// `[tokens][width]`, stream-major (`width` = streams x hidden); `argmax[p]`
+/// is the greedy pick after position p and `margin[p]` its lead over the
+/// runner-up, in logits.
+#[cfg(feature = "residual-tap")]
+pub struct TappedSpan {
+    pub width: usize,
+    pub stacks: Vec<u16>,
+    pub argmax: Vec<u32>,
+    pub margin: Vec<f32>,
+}
+
+/// One BF16 row's argmax (the lowest id among equals) and its lead over the
+/// runner-up.
+#[cfg_attr(not(feature = "residual-tap"), allow(dead_code))]
+fn top_with_margin(row: &[u16]) -> (u32, f32) {
+    let (mut best, mut first, mut second) = (0u32, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (id, &bits) in row.iter().enumerate() {
+        let v = f32::from_bits(u32::from(bits) << 16);
+        if v > first {
+            second = first;
+            first = v;
+            best = id as u32;
+        } else if v > second {
+            second = v;
+        }
+    }
+    (best, first - second)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bf16(v: f32) -> u16 {
+        (v.to_bits() >> 16) as u16
+    }
+
+    /// The pick is the first of equal maxima, and the margin is the lead over
+    /// the runner-up (zero on a tie).
+    #[test]
+    fn the_span_pick_is_the_first_maximum_with_its_lead() {
+        let row: Vec<u16> = [1.0, 3.0, -2.0, 2.5].iter().map(|&v| bf16(v)).collect();
+        assert_eq!(top_with_margin(&row), (1, 0.5));
+        let tie: Vec<u16> = [3.0, 1.0, 3.0].iter().map(|&v| bf16(v)).collect();
+        assert_eq!(top_with_margin(&tie), (0, 0.0));
+    }
 
     /// The sidecar's `expert_traffic`, layer after layer, as the residency's
     /// split reads it; none without a sidecar or the section.

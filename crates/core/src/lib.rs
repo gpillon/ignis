@@ -64,6 +64,8 @@ pub mod prefix;
 pub mod constrained;
 pub mod request;
 pub mod residency;
+#[cfg(all(feature = "cuda", feature = "residual-tap"))]
+pub mod residual_tap;
 pub mod retained_slot;
 pub mod rope_scaling;
 pub mod scheduler;
