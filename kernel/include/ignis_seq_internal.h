@@ -38,9 +38,12 @@ inline constexpr int32_t kIgnisGdnConvKernel = 4;
  * op's slot stride is `channels * 3`, so the pool must carry 3 taps. */
 inline constexpr int32_t kIgnisGdnConvStateWidth = kIgnisGdnConvKernel - 1;
 
-/* The Qwen 3.8 text backbone has one full-attention layer every four layers:
- * 3, 7, ..., 63. Each keeps independent K/V history, so the paged pool owns
- * one K/V-plane pair and one frontier per GQA layer. */
+/* The most attention layers a pool holds: the Qwen 3.8-27B backbone's, one
+ * every four layers (3, 7, ..., 63). Each keeps independent K/V history, so
+ * the paged pool owns one K/V-plane pair and one frontier per attention
+ * layer -- `ignis_seq_pool::kv_num_layers` of them (Flash-Next's are 12),
+ * this being the capacity of a sequence's frontier array and of a blob's
+ * progress image. */
 inline constexpr int32_t kIgnisGqaLayerCount = 16;
 
 /* The other 48 of the 64 backbone layers: 0, 1, 2, 4, 5, 6, 8, ... Each keeps
@@ -122,6 +125,14 @@ inline std::size_t ignis_kv_plane_index(int32_t kv_format, int32_t gqa_layer,
          static_cast<std::size_t>(within);
 }
 
+struct ignis_seq_pool;
+/* GitHub #302: why a sequence of `pool` cannot be snapshotted, restored,
+ * captured as a checkpoint or published as a prefix, or nullptr. Since
+ * GitHub #303 the section table carries Flash-Next's indexer and n-gram
+ * sections, and no pool is refused; the seam stays, so a section a pool
+ * holds and the table does not list has one place to say so. */
+const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool);
+
 struct ignis_seq_pool {
   ninfer::DeviceArena kv_arena;
   ninfer::PagedKVPool kv_pool;
@@ -136,6 +147,9 @@ struct ignis_seq_pool {
    * extent is the codec's row budget, not head_dim. */
   std::int32_t kv_head_dim     = 0;
   std::int32_t kv_num_kv_heads = 0;
+  /* The attention layers the pool stores K/V for (GitHub #302): the spec's
+   * `kv_num_layers`, at most kIgnisGqaLayerCount. */
+  std::int32_t kv_num_layers = 0;
   /* Lane slots only, `0..slot_count`: the retained slots past them are never
    * listed here (GitHub #211). */
   std::vector<std::int32_t> free_slots;
@@ -233,6 +247,55 @@ struct ignis_seq_pool {
 
   bool has_hq_residual() const { return hq_residual != nullptr; }
 
+  /* GitHub #302: Flash-Next's QSA indexer section, every attention layer's:
+   * its complete blocks' keys beside the KV pages,
+   * [layer][physical page][64 / compress][key_dim] BF16, then the
+   * incomplete block's raw keys per state slot,
+   * [layer][slot][compress - 1][key_dim] BF16. Null without an indexer. */
+  std::unique_ptr<ninfer::DeviceBuffer> indexer_state;
+  std::int32_t indexer_key_dim = 0;
+  std::int32_t indexer_compress_tokens = 0;
+  std::uint64_t indexer_block_layer_bytes = 0;
+  std::uint64_t indexer_tail_slot_bytes = 0;
+  std::int32_t indexer_slots = 0;
+  bool has_indexer() const { return indexer_state != nullptr; }
+  void *indexer_block_keys(std::int32_t attention_layer) const {
+    return static_cast<unsigned char *>(indexer_state->p) +
+           static_cast<std::uint64_t>(attention_layer) * indexer_block_layer_bytes;
+  }
+  void *indexer_tail_keys(std::int32_t attention_layer) const {
+    return static_cast<unsigned char *>(indexer_state->p) +
+           static_cast<std::uint64_t>(kv_num_layers) * indexer_block_layer_bytes +
+           static_cast<std::uint64_t>(attention_layer) * indexer_slots * indexer_tail_slot_bytes;
+  }
+  /* GitHub #303: one physical page's block keys in one attention layer, and
+   * where they sit. */
+  std::uint64_t indexer_page_bytes() const {
+    return static_cast<std::uint64_t>(ninfer::kPagedKVPageSize / indexer_compress_tokens) *
+           static_cast<std::uint64_t>(indexer_key_dim) * 2u;
+  }
+  void *indexer_page_keys(std::int32_t attention_layer, std::int32_t page) const {
+    return static_cast<unsigned char *>(indexer_block_keys(attention_layer)) +
+           static_cast<std::uint64_t>(page) * indexer_page_bytes();
+  }
+  /* GitHub #303: one slot's indexer tail in one attention layer, and its n-gram
+   * conv columns. */
+  void *indexer_slot_tail(std::int32_t attention_layer, std::int32_t slot) const {
+    return static_cast<unsigned char *>(indexer_tail_keys(attention_layer)) +
+           static_cast<std::uint64_t>(slot) * indexer_tail_slot_bytes;
+  }
+  void *ngram_slot_conv(std::int32_t slot) const {
+    return static_cast<unsigned char *>(ngram_conv->p) + static_cast<std::uint64_t>(slot) * ngram_conv_slot_bytes;
+  }
+
+  /* GitHub #302: Flash-Next's n-gram conv state, [slot][columns][channels]
+   * BF16, oldest column first. Null without an n-gram embedding. */
+  std::unique_ptr<ninfer::DeviceBuffer> ngram_conv;
+  std::uint64_t ngram_conv_slot_bytes = 0;
+  bool has_ngram_conv() const { return ngram_conv != nullptr; }
+
+  bool has_flash_next_sections() const { return has_indexer() || has_ngram_conv(); }
+
   // One (layer, slot) side plane: every KV head's 544 rows.
   std::uint64_t hq_residual_plane_bytes() const {
     return static_cast<std::uint64_t>(kIgnisHqHeadDim) * static_cast<std::uint64_t>(kv_num_kv_heads) *
@@ -263,7 +326,7 @@ struct ignis_seq_pool {
   // alike: every layer's K plane, then every layer's V plane, then its ring
   // words. 0 on a BF16 pool.
   std::uint64_t hq_residual_slot_bytes() const {
-    return has_hq_residual() ? 2u * kIgnisGqaLayerCount * hq_residual_plane_bytes() +
+    return has_hq_residual() ? 2u * static_cast<std::uint32_t>(kv_num_layers) * hq_residual_plane_bytes() +
                                    kIgnisHqRingWords * sizeof(std::uint32_t)
                              : 0;
   }

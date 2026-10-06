@@ -156,3 +156,82 @@ ignis_request_duration_seconds_bucket{le="+Inf"} 30
 ignis_request_duration_seconds_sum 210.75
 ignis_request_duration_seconds_count 30
 `;
+
+// A Flash-Next load's scrape (GitHub #301, #302): the same exposition with
+// the expert residency and n-gram families after it, where `render()` writes
+// them. Decode: 10,000 hits and 1,000 misses over four classes in use.
+export const FLASH_NEXT_EXPOSITION = `${IGNIS_EXPOSITION}# HELP ignis_expert_cache_hits_total Selected expert projections already resident in the VRAM expert cache, or staged for their layer, by K class and phase.
+# TYPE ignis_expert_cache_hits_total counter
+ignis_expert_cache_hits_total{class="gate_up_k2",phase="decode"} 4000
+ignis_expert_cache_hits_total{class="gate_up_k2",phase="prefill"} 1200
+ignis_expert_cache_hits_total{class="gate_up_k2_5",phase="decode"} 0
+ignis_expert_cache_hits_total{class="gate_up_k2_5",phase="prefill"} 0
+ignis_expert_cache_hits_total{class="gate_up_k3",phase="decode"} 0
+ignis_expert_cache_hits_total{class="gate_up_k3",phase="prefill"} 0
+ignis_expert_cache_hits_total{class="gate_up_k4",phase="decode"} 500
+ignis_expert_cache_hits_total{class="gate_up_k4",phase="prefill"} 300
+ignis_expert_cache_hits_total{class="down_k2",phase="decode"} 4000
+ignis_expert_cache_hits_total{class="down_k2",phase="prefill"} 1200
+ignis_expert_cache_hits_total{class="down_k2_5",phase="decode"} 0
+ignis_expert_cache_hits_total{class="down_k2_5",phase="prefill"} 0
+ignis_expert_cache_hits_total{class="down_k3",phase="decode"} 1500
+ignis_expert_cache_hits_total{class="down_k3",phase="prefill"} 0
+ignis_expert_cache_hits_total{class="down_k4",phase="decode"} 0
+ignis_expert_cache_hits_total{class="down_k4",phase="prefill"} 0
+# HELP ignis_expert_cache_misses_total Selected expert projections copied in from the pinned host pool by their own step, by K class and phase.
+# TYPE ignis_expert_cache_misses_total counter
+ignis_expert_cache_misses_total{class="gate_up_k2",phase="decode"} 300
+ignis_expert_cache_misses_total{class="gate_up_k2",phase="prefill"} 800
+ignis_expert_cache_misses_total{class="gate_up_k2_5",phase="decode"} 0
+ignis_expert_cache_misses_total{class="gate_up_k2_5",phase="prefill"} 0
+ignis_expert_cache_misses_total{class="gate_up_k3",phase="decode"} 0
+ignis_expert_cache_misses_total{class="gate_up_k3",phase="prefill"} 0
+ignis_expert_cache_misses_total{class="gate_up_k4",phase="decode"} 100
+ignis_expert_cache_misses_total{class="gate_up_k4",phase="prefill"} 40
+ignis_expert_cache_misses_total{class="down_k2",phase="decode"} 300
+ignis_expert_cache_misses_total{class="down_k2",phase="prefill"} 800
+ignis_expert_cache_misses_total{class="down_k2_5",phase="decode"} 0
+ignis_expert_cache_misses_total{class="down_k2_5",phase="prefill"} 0
+ignis_expert_cache_misses_total{class="down_k3",phase="decode"} 300
+ignis_expert_cache_misses_total{class="down_k3",phase="prefill"} 0
+ignis_expert_cache_misses_total{class="down_k4",phase="decode"} 0
+ignis_expert_cache_misses_total{class="down_k4",phase="prefill"} 0
+# HELP ignis_expert_prefetches_issued_total Expert projections copied ahead for the next layer by the router lookahead.
+# TYPE ignis_expert_prefetches_issued_total counter
+ignis_expert_prefetches_issued_total 900
+# HELP ignis_expert_prefetches_used_total Prefetched expert projections at their first use, whenever it comes.
+# TYPE ignis_expert_prefetches_used_total counter
+ignis_expert_prefetches_used_total 720
+# HELP ignis_expert_bytes_moved_total Bytes of expert projections copied host-to-device, misses and prefetches, by phase.
+# TYPE ignis_expert_bytes_moved_total counter
+ignis_expert_bytes_moved_total{phase="decode"} 6000000000
+ignis_expert_bytes_moved_total{phase="prefill"} 9000000000
+# HELP ignis_expert_cache_slots VRAM expert cache slots per K class: capacity reserved at load, and in use.
+# TYPE ignis_expert_cache_slots gauge
+ignis_expert_cache_slots{class="gate_up_k2",state="capacity"} 3000
+ignis_expert_cache_slots{class="gate_up_k2",state="in_use"} 3000
+ignis_expert_cache_slots{class="gate_up_k2_5",state="capacity"} 0
+ignis_expert_cache_slots{class="gate_up_k2_5",state="in_use"} 0
+ignis_expert_cache_slots{class="gate_up_k3",state="capacity"} 0
+ignis_expert_cache_slots{class="gate_up_k3",state="in_use"} 0
+ignis_expert_cache_slots{class="gate_up_k4",state="capacity"} 400
+ignis_expert_cache_slots{class="gate_up_k4",state="in_use"} 250
+ignis_expert_cache_slots{class="down_k2",state="capacity"} 3000
+ignis_expert_cache_slots{class="down_k2",state="in_use"} 2999
+ignis_expert_cache_slots{class="down_k2_5",state="capacity"} 0
+ignis_expert_cache_slots{class="down_k2_5",state="in_use"} 0
+ignis_expert_cache_slots{class="down_k3",state="capacity"} 1200
+ignis_expert_cache_slots{class="down_k3",state="in_use"} 1200
+ignis_expert_cache_slots{class="down_k4",state="capacity"} 0
+ignis_expert_cache_slots{class="down_k4",state="in_use"} 0
+# HELP ignis_ngram_rows_total N-gram embedding rows staged for prefill spans and decode rounds, by source: the RAM hot-row cache or the artifact file.
+# TYPE ignis_ngram_rows_total counter
+ignis_ngram_rows_total{source="hot"} 190000
+ignis_ngram_rows_total{source="file"} 10000
+# HELP ignis_ngram_reads_total Reads issued to the artifact file for n-gram rows the hot-row cache did not hold.
+# TYPE ignis_ngram_reads_total counter
+ignis_ngram_reads_total 6000
+# HELP ignis_ngram_read_bytes_total Bytes of the n-gram reads issued to the artifact file.
+# TYPE ignis_ngram_read_bytes_total counter
+ignis_ngram_read_bytes_total 24576000
+`;

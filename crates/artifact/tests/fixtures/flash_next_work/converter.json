@@ -1,0 +1,58 @@
+{
+ "schema": "flash-next-converter-v1",
+ "status": "fixture",
+ "layers": 2,
+ "experts": 8,
+ "table_rows": 1000,
+ "geometry": "fixture",
+ "k_map": {
+  "layers": [
+   {
+    "layer": 0,
+    "gu": [
+     4,
+     5,
+     6,
+     8,
+     4,
+     5,
+     6,
+     8
+    ],
+    "dn": [
+     5,
+     6,
+     8,
+     4,
+     5,
+     6,
+     8,
+     4
+    ]
+   },
+   {
+    "layer": 1,
+    "gu": [
+     5,
+     6,
+     8,
+     4,
+     5,
+     6,
+     8,
+     4
+    ],
+    "dn": [
+     6,
+     8,
+     4,
+     5,
+     6,
+     8,
+     4,
+     5
+    ]
+   }
+  ]
+ }
+}

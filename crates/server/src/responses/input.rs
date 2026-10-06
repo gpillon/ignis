@@ -15,7 +15,7 @@ use crate::api::{self, SamplingRequestFields};
 use crate::decoder::OutputDecoder;
 use crate::engine::RequestNotes;
 use crate::responses::events::{wire_number, ResponseEvents, ResponseObject};
-use crate::template::{check_content_parts, check_roles, ChatMessage, FunctionIn, MessageContent, ToolCallIn};
+use crate::template::{check_roles, ChatMessage, FunctionIn, MessageContent, ToolCallIn};
 use crate::thinking::ThinkingRequestFields;
 use crate::toolcall::ToolSchemas;
 use crate::Server;
@@ -212,7 +212,7 @@ pub(crate) async fn prepare(
         return Err(api::bad_request_param("input must not be empty", "input"));
     }
     check_roles(&messages).map_err(api::template_rejection)?;
-    check_content_parts(&messages, server.media.is_some()).map_err(api::content_rejection)?;
+    server.check_content_parts(&messages).map_err(api::content_rejection)?;
 
     let effort = req.reasoning_effort.clone().or_else(|| {
         req.reasoning.as_ref().and_then(|r| r.get("effort")).filter(|e| !e.is_null()).cloned()

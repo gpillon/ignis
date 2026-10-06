@@ -74,6 +74,7 @@ pub const MAX_VISION_EMBEDDING_POOL_MIB: u64 = 64 * 1024;
 pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUNK_ALIGNMENT};
 
 pub use ignis_core::{KvFormat, VramMode};
+use ignis_core::compute::ModelFamily;
 
 /// `--vram-headroom-bytes`' default: what a derived VRAM budget leaves to the
 /// desktop and every other process on the card (GitHub #210).
@@ -88,6 +89,10 @@ pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub model: String,
+    /// Whether the operator named [`Config::model`] (`--model` /
+    /// `IGNIS_MODEL`). Unnamed, a load is served under its own model's id
+    /// ([`served_model_for`]), not the 27B's default.
+    pub model_named: bool,
     pub bind: String,
     pub artifact: Option<PathBuf>,
     /// May the server fetch [`Config::model`] when no artifact is on disk
@@ -154,6 +159,10 @@ pub struct Config {
     /// prompt reuse off unless named.
     pub retained_device_slots: u32,
     pub retained_host_slots: u32,
+    /// Whether the operator named [`Config::retained_host_slots`]
+    /// (`--retained-host` / `IGNIS_RETAINED_HOST`). Unnamed, a Flash-Next
+    /// load takes its own default (spec flash-next/05), not the 27B's.
+    pub retained_host_named: bool,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority after its conversation last used it, in seconds
     /// (`--retained-interactive-ttl`, GitHub #190). Past it the entry ranks as
@@ -439,9 +448,9 @@ pub fn resolve(
         i += 1;
     }
 
-    let model = model
-        .or_else(|| env("IGNIS_MODEL"))
-        .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+    let model = model.or_else(|| env("IGNIS_MODEL"));
+    let model_named = model.is_some();
+    let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_owned());
     let bind = bind
         .or_else(|| env("IGNIS_BIND"))
         .unwrap_or_else(|| DEFAULT_BIND.to_owned());
@@ -490,6 +499,7 @@ pub fn resolve(
         ("--retained-device", "IGNIS_RETAINED_DEVICE"),
         if prompt_reuse { DEFAULT_RETAINED_DEVICE_SLOTS } else { 0 },
     )?;
+    let retained_host_named = non_empty(retained_host.clone().or_else(|| env("IGNIS_RETAINED_HOST"))).is_some();
     let retained_host_slots = resolve_retained_count(
         retained_host,
         &env,
@@ -556,6 +566,7 @@ pub fn resolve(
 
     Ok(ConfigOutcome::Config(Config {
         model,
+        model_named,
         bind,
         artifact,
         model_download: resolve_model_download(model_download, &env)?,
@@ -578,6 +589,7 @@ pub fn resolve(
         prompt_reuse,
         retained_device_slots,
         retained_host_slots,
+        retained_host_named,
         retained_interactive_ttl_secs,
         instruction_policy,
         speculation,
@@ -839,6 +851,37 @@ fn resolve_speculation(
     Speculation::new(backend, n)
         .map(|s| Some(s.with_proposal_head(proposal_head)))
         .map_err(|_| out_of_range())
+}
+
+/// The one place the loaded model's family meets the start options (spec
+/// flash-next/04): the family is the artifact's, so a start option chosen
+/// for the other model is refused by name rather than served around.
+///
+/// Returns the id the load is served under: the operator's, or with none
+/// named, the model's own ([`ModelFamily::model_id`], which the 27B's
+/// default already is). Refused: a named id that is the other model's, and
+/// on a model without them, speculation and vision.
+pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, ConfigError> {
+    if config.model_named
+        && ModelFamily::of_model_id(&config.model).is_some_and(|named| named != family)
+    {
+        return Err(ConfigError(format!(
+            "`--model {}` names another model than the artifact's, which is {}",
+            config.model,
+            family.name()
+        )));
+    }
+    if let Some(speculation) = config.speculation.filter(|_| !family.speculates()) {
+        return Err(ConfigError(format!(
+            "`--spec {}`: {} has no speculative decoding",
+            speculation.backend().as_str(),
+            family.name()
+        )));
+    }
+    if config.vision.is_some() && !family.takes_images() {
+        return Err(ConfigError(format!("`--vision`: {} takes no images", family.name())));
+    }
+    Ok(if config.model_named { config.model.clone() } else { family.model_id().to_owned() })
 }
 
 /// Parse a `u32` count for `flag`, naming the flag, `unit`, and the
@@ -1971,6 +2014,22 @@ mod tests {
     }
 
     #[test]
+    fn the_config_records_whether_the_host_retained_count_was_named() {
+        // Spec flash-next/05: an unnamed count is the 27B's default here and
+        // Flash-Next's own once the artifact names its model, so the config
+        // keeps which of the two it is.
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert!(!config.retained_host_named);
+        let config = expect_config(resolve(&args(&["--retained-device", "2"]), no_env).expect("resolve"));
+        assert!(!config.retained_host_named, "the device count names nothing of the host's");
+        let config = expect_config(resolve(&args(&["--retained-host", "16"]), no_env).expect("resolve"));
+        assert!(config.retained_host_named, "named at the 27B's default value is still named");
+        let env = env_map(&[("IGNIS_RETAINED_HOST", "3")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert!(config.retained_host_named, "the env var names it too");
+    }
+
+    #[test]
     fn the_removed_retained_slots_flag_is_an_error_naming_both_kinds() {
         // GitHub #281: a start script still passing the one count is told
         // which two replaced it, rather than silently getting the defaults.
@@ -2240,6 +2299,58 @@ mod tests {
         assert!(err.0.contains("--rope-scaling"), "{}", err.0);
         let err = resolve(&args(&["--rope-scaling", "linear"]), no_env).expect_err("bad shape");
         assert!(err.0.contains("--rope-scaling"), "{}", err.0);
+    }
+
+    // ── the loaded model's family (spec flash-next/04, GitHub #302) ───────
+
+    #[test]
+    fn flash_next_refuses_speculation_and_vision_at_start_naming_itself() {
+        use ignis_core::compute::ModelFamily;
+        let spec = expect_config(
+            resolve(&args(&["--spec", "dflash2", "--draft-tokens", "7"]), no_env).expect("resolve"),
+        );
+        let err = served_model_for(&spec, ModelFamily::FlashNext).expect_err("no speculation");
+        assert!(err.0.contains("--spec dflash2") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+        let vision = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
+        let err = served_model_for(&vision, ModelFamily::FlashNext).expect_err("no vision");
+        assert!(err.0.contains("--vision") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+    }
+
+    #[test]
+    fn the_27b_takes_every_start_option_it_took_before() {
+        use ignis_core::compute::ModelFamily;
+        let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--vision"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(served_model_for(&config, ModelFamily::Qwen38_27b), Ok(DEFAULT_MODEL.to_owned()));
+    }
+
+    /// With no `--model`, a load is served under its own model's id: the
+    /// artifact's family decides, not the 27B's default.
+    #[test]
+    fn an_unnamed_served_id_is_the_loaded_models_own() {
+        use ignis_core::compute::ModelFamily;
+        let plain = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(served_model_for(&plain, ModelFamily::FlashNext), Ok("qwen3.8-flash-next".to_owned()));
+        assert_eq!(served_model_for(&plain, ModelFamily::Qwen38_27b), Ok("qwen3.8-27b".to_owned()));
+    }
+
+    /// A served id that names the other model is refused at start, whether
+    /// the flag or the environment named it: the artifact decides the model,
+    /// and a client must never be told it talks to one while the other
+    /// answers. Any other id is the operator's to choose.
+    #[test]
+    fn a_served_id_naming_the_other_model_is_refused_at_start() {
+        use ignis_core::compute::ModelFamily;
+        let named = |id: &'static str| expect_config(resolve(&args(&["--model", id]), no_env).expect("resolve"));
+        let err = served_model_for(&named("qwen3.8-flash-next"), ModelFamily::Qwen38_27b).expect_err("27B artifact");
+        assert!(err.0.contains("qwen3.8-flash-next") && err.0.contains("Qwen3.8-27B"), "{}", err.0);
+        let err = served_model_for(&named("qwen3.8-27b"), ModelFamily::FlashNext).expect_err("Flash-Next artifact");
+        assert!(err.0.contains("qwen3.8-27b") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+        let env = env_map(&[("IGNIS_MODEL", "qwen3.8-flash-next")]);
+        let from_env = expect_config(resolve(&[], env).expect("resolve"));
+        assert!(served_model_for(&from_env, ModelFamily::Qwen38_27b).is_err(), "the env form too");
+        assert_eq!(served_model_for(&named("my-id"), ModelFamily::FlashNext), Ok("my-id".to_owned()));
+        assert_eq!(served_model_for(&named("qwen3.8-27b"), ModelFamily::Qwen38_27b), Ok("qwen3.8-27b".to_owned()));
     }
 
     // ── vision as a load option (GitHub #177) ─────────────────────────────

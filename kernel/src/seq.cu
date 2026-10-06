@@ -132,6 +132,30 @@ void zero_dflash2_lane(ignis_seq_pool &pool, std::int32_t slot) {
   }
 }
 
+// GitHub #302: a slot's Flash-Next tails and n-gram conv columns, zeroed so
+// nothing of its previous occupant is read as this sequence's history.
+void zero_flash_next_slot(ignis_seq_pool &pool, std::int32_t slot) {
+  if (pool.has_indexer()) {
+    for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+      void *tail = static_cast<unsigned char *>(pool.indexer_tail_keys(layer)) +
+                   static_cast<std::uint64_t>(slot) * pool.indexer_tail_slot_bytes;
+      const cudaError_t err = cudaMemset(tail, 0, pool.indexer_tail_slot_bytes);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemset(indexer tail) failed: ") + cudaGetErrorString(err));
+      }
+    }
+  }
+  if (pool.has_ngram_conv()) {
+    const cudaError_t err =
+        cudaMemset(static_cast<unsigned char *>(pool.ngram_conv->p) +
+                       static_cast<std::uint64_t>(slot) * pool.ngram_conv_slot_bytes,
+                   0, pool.ngram_conv_slot_bytes);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemset(n-gram conv state) failed: ") + cudaGetErrorString(err));
+    }
+  }
+}
+
 // ---- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
 
 // Why a restore target cannot already hold shared history, or nullptr if it
@@ -179,16 +203,17 @@ void ignis_seq_copy_hq_residual(const ignis_seq_pool &pool, std::int32_t slot, v
   auto *image               = static_cast<unsigned char *>(host);
   for (const bool role_v : {false, true}) {
     void *device        = pool.hq_residual_plane(role_v, 0, slot);
-    unsigned char *here = image + (role_v ? kIgnisGqaLayerCount * plane : 0);
+    const auto layers   = static_cast<std::size_t>(pool.kv_num_layers);
+    unsigned char *here = image + (role_v ? layers * plane : 0);
     const cudaError_t err =
-        to_host ? cudaMemcpy2DAsync(here, plane, device, pitch, plane, kIgnisGqaLayerCount, kind, nullptr)
-                : cudaMemcpy2DAsync(device, pitch, here, plane, plane, kIgnisGqaLayerCount, kind, nullptr);
+        to_host ? cudaMemcpy2DAsync(here, plane, device, pitch, plane, layers, kind, nullptr)
+                : cudaMemcpy2DAsync(device, pitch, here, plane, plane, layers, kind, nullptr);
     if (err != cudaSuccess) {
       throw std::runtime_error(std::string("cudaMemcpy2DAsync(hq residual ") +
                                (role_v ? "v" : "k") + ") failed: " + cudaGetErrorString(err));
     }
   }
-  unsigned char *ring    = image + 2 * kIgnisGqaLayerCount * plane;
+  unsigned char *ring    = image + 2 * static_cast<std::size_t>(pool.kv_num_layers) * plane;
   const std::size_t ring_bytes = kIgnisHqRingWords * sizeof(std::uint32_t);
   checked_memcpy_async(to_host ? static_cast<void *>(ring) : static_cast<void *>(pool.hq_ring_words(slot)),
                        to_host ? static_cast<const void *>(pool.hq_ring_words(slot)) : ring, ring_bytes,
@@ -203,7 +228,8 @@ void ignis_seq_zero_hq_residual(ignis_seq_pool &pool, std::int32_t slot) {
   const std::size_t pitch = pool.hq_residual_layer_pitch();
   for (const bool role_v : {false, true}) {
     const cudaError_t err =
-        cudaMemset2D(pool.hq_residual_plane(role_v, 0, slot), pitch, 0, plane, kIgnisGqaLayerCount);
+        cudaMemset2D(pool.hq_residual_plane(role_v, 0, slot), pitch, 0, plane,
+                     static_cast<std::size_t>(pool.kv_num_layers));
     if (err != cudaSuccess) {
       throw std::runtime_error(std::string("cudaMemset2D(hq residual) failed: ") +
                                cudaGetErrorString(err));
@@ -240,6 +266,46 @@ void pack_logical_pages(const ignis_seq_pool &pool, const ignis_seq &seq, std::u
   }
   pages.resize(count);
   ignis_seq_pack_pages_to_host(pool, pages, dst);
+}
+
+// The physical pages of `seq`'s first `count` logical pages: its prefix
+// chain's, then its own (GitHub #303: what the indexer keys are packed by).
+std::vector<std::int32_t> logical_page_ids(const ignis_seq &seq, std::uint32_t count) {
+  std::vector<std::int32_t> pages = ignis_seq_prefix_chain_page_ids(seq.prefix);
+  const auto own = seq.kv.page_ids();
+  pages.insert(pages.end(), own.begin(), own.end());
+  if (count > pages.size()) {
+    throw std::logic_error("snapshot extent exceeds the sequence's logical pages");
+  }
+  pages.resize(count);
+  return pages;
+}
+
+// GitHub #303: `pages`' indexer keys, every attention layer, into a blob's
+// IGNIS_SEQ_SECTION_INDEXER_KEYS payload at `dst` (layer by layer, page by
+// page), or back out of one.
+void pack_indexer_keys_to_host(const ignis_seq_pool &pool, const std::vector<std::int32_t> &pages,
+                               unsigned char *dst) {
+  const std::size_t bytes = static_cast<std::size_t>(pool.indexer_page_bytes());
+  for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+    for (const std::int32_t page : pages) {
+      checked_memcpy_async(dst, pool.indexer_page_keys(layer, page), bytes, cudaMemcpyDeviceToHost,
+                           "indexer keys");
+      dst += bytes;
+    }
+  }
+}
+
+void unpack_indexer_keys_from_host(const ignis_seq_pool &pool, const std::vector<std::int32_t> &pages,
+                                   const unsigned char *src) {
+  const std::size_t bytes = static_cast<std::size_t>(pool.indexer_page_bytes());
+  for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+    for (const std::int32_t page : pages) {
+      checked_memcpy_async(pool.indexer_page_keys(layer, page), const_cast<unsigned char *>(src), bytes,
+                           cudaMemcpyHostToDevice, "indexer keys");
+      src += bytes;
+    }
+  }
 }
 
 // Write pool slot `slot`'s payload of the device-resident CLONE section
@@ -279,6 +345,18 @@ bool pack_slot_section_to_host(const ignis_seq_pool &pool, std::int32_t slot,
   case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
     ignis_seq_copy_hq_residual(pool, slot, at, cudaMemcpyDeviceToHost);
     return true;
+  case IGNIS_SEQ_SECTION_INDEXER_TAIL:
+    // GitHub #303: every attention layer's tail of the slot, in layer order.
+    for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+      checked_memcpy_async(at + static_cast<std::uint64_t>(layer) * pool.indexer_tail_slot_bytes,
+                           pool.indexer_slot_tail(layer, slot), static_cast<std::size_t>(pool.indexer_tail_slot_bytes),
+                           cudaMemcpyDeviceToHost, "indexer tail");
+    }
+    return true;
+  case IGNIS_SEQ_SECTION_NGRAM_CONV:
+    checked_memcpy_async(at, pool.ngram_slot_conv(slot), static_cast<std::size_t>(section.bytes),
+                         cudaMemcpyDeviceToHost, "n-gram conv state");
+    return true;
   default:
     return false;
   }
@@ -317,6 +395,18 @@ bool unpack_slot_section_from_host(ignis_seq_pool &pool, std::int32_t slot,
     // whatever sequence held that slot before (the reference's
     // program_impl.h:1126 records the bug a restore without this is).
     ignis_seq_copy_hq_residual(pool, slot, const_cast<unsigned char *>(at), cudaMemcpyHostToDevice);
+    return true;
+  case IGNIS_SEQ_SECTION_INDEXER_TAIL:
+    for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+      checked_memcpy_async(pool.indexer_slot_tail(layer, slot),
+                           const_cast<unsigned char *>(at) + static_cast<std::uint64_t>(layer) * pool.indexer_tail_slot_bytes,
+                           static_cast<std::size_t>(pool.indexer_tail_slot_bytes), cudaMemcpyHostToDevice,
+                           "indexer tail");
+    }
+    return true;
+  case IGNIS_SEQ_SECTION_NGRAM_CONV:
+    checked_memcpy_async(pool.ngram_slot_conv(slot), const_cast<unsigned char *>(at),
+                         static_cast<std::size_t>(section.bytes), cudaMemcpyHostToDevice, "n-gram conv state");
     return true;
   default:
     return false;
@@ -452,6 +542,9 @@ void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_s
     case IGNIS_SEQ_SECTION_KV_PAGES:
       ignis_seq_pack_pages_to_host(pool, history, at);
       break;
+    case IGNIS_SEQ_SECTION_INDEXER_KEYS:
+      pack_indexer_keys_to_host(pool, history, at);
+      break;
     case IGNIS_SEQ_SECTION_PROGRESS:
       std::memcpy(at, &progress, sizeof(progress));
       break;
@@ -509,9 +602,9 @@ std::string snapshot_refusal(const ignis_seq_pool &pool, const ignis_seq &seq,
   if (header.magic != kIgnisSeqSnapshotMagic) {
     return "buffer is not an ignis sequence snapshot (bad magic)";
   }
-  if (header.format_version != kIgnisSeqSnapshotFormatVersion) {
+  if (header.format_version != ignis_seq_snapshot_format_version_of(pool)) {
     return "snapshot format version " + std::to_string(header.format_version) +
-           ", this leaf writes and accepts " + std::to_string(kIgnisSeqSnapshotFormatVersion);
+           ", this pool writes and accepts " + std::to_string(ignis_seq_snapshot_format_version_of(pool));
   }
   if (header.header_bytes != sizeof(ignis_seq_snapshot_header) ||
       header.section_record_bytes != sizeof(ignis_seq_section)) {
@@ -594,6 +687,32 @@ bool validate_pool_spec(const struct ignis_seq_pool_spec &spec, const std::strin
               " is not an ignis_kv_format");
     return false;
   }
+  // GitHub #302: the attention layers are the topology's (16 on the 27B, 12
+  // on Flash-Next), within what a sequence's frontier array holds.
+  if (spec.kv_num_layers == 0 || spec.kv_num_layers > static_cast<std::uint32_t>(kIgnisGqaLayerCount)) {
+    set_error(fn + ": kv_num_layers " + std::to_string(spec.kv_num_layers) + " is not in 1.." +
+              std::to_string(kIgnisGqaLayerCount));
+    return false;
+  }
+  // GitHub #302: Flash-Next's sections, each all or nothing.
+  const bool indexer = spec.indexer_key_dim != 0 || spec.indexer_compress_tokens != 0;
+  if (indexer && (spec.indexer_key_dim == 0 || spec.indexer_key_dim % 8 != 0 ||
+                  spec.indexer_compress_tokens < 2 ||
+                  ninfer::kPagedKVPageSize % spec.indexer_compress_tokens != 0)) {
+    set_error(fn + ": indexer_key_dim " + std::to_string(spec.indexer_key_dim) +
+              " and indexer_compress_tokens " + std::to_string(spec.indexer_compress_tokens) +
+              " are not a key width (a positive multiple of 8) and a block that divides the " +
+              std::to_string(ninfer::kPagedKVPageSize) + "-token page");
+    return false;
+  }
+  const bool ngram = spec.ngram_conv_columns != 0 || spec.ngram_conv_channels != 0;
+  if (ngram && (spec.ngram_conv_columns == 0 || spec.ngram_conv_channels == 0)) {
+    set_error(fn + ": ngram_conv_columns " + std::to_string(spec.ngram_conv_columns) +
+              " and ngram_conv_channels " + std::to_string(spec.ngram_conv_channels) +
+              " are both set or both 0");
+    return false;
+  }
+
   // The codec's row budget is defined for a 256-dimension row only
   // (kHqHeadDim); a pool of any other head_dim would plan planes the hq
   // append path cannot write.
@@ -633,6 +752,14 @@ struct PoolLayout {
    * their V planes, then their ring words, in one buffer. 0 on a BF16 pool. */
   std::size_t hq_residual_bytes = 0;
   std::size_t hq_residual_plane_bytes = 0;
+  /* GitHub #302: Flash-Next's indexer section -- every attention layer's
+   * block keys (per physical page), then every layer's tails (per state
+   * slot) -- and its n-gram conv state (per state slot). 0 without them. */
+  std::uint64_t indexer_block_layer_bytes = 0;
+  std::uint64_t indexer_tail_slot_bytes = 0;
+  std::size_t indexer_bytes = 0;
+  std::uint64_t ngram_conv_slot_bytes = 0;
+  std::size_t ngram_conv_bytes = 0;
 };
 
 // Every slot the state arenas hold: the lanes, then the device retained slots
@@ -661,8 +788,8 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   // selects its own run (`ignis_kv_plane_index`), so a layer's K/V history
   // never aliases another layer's pages.
   kv_spec.planes.reserve(static_cast<std::size_t>(ignis_kv_planes_per_layer(spec.kv_format)) *
-                         kIgnisGqaLayerCount);
-  for (int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+                         spec.kv_num_layers);
+  for (std::uint32_t layer = 0; layer < spec.kv_num_layers; ++layer) {
     push_layer_planes(kv_spec, spec.kv_format, spec.num_kv_heads, spec.head_dim);
   }
   out.kv_layout     = ninfer::plan_paged_kv_pool(kv_builder, kv_spec);
@@ -717,10 +844,24 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   if (spec.kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
     out.hq_residual_plane_bytes = static_cast<std::size_t>(kIgnisHqHeadDim) * spec.num_kv_heads *
                                   kIgnisHqResidualRows * sizeof(std::uint16_t);
-    const std::size_t planes = static_cast<std::size_t>(kIgnisGqaLayerCount) * state_slots;
+    const std::size_t planes = static_cast<std::size_t>(spec.kv_num_layers) * state_slots;
     out.hq_residual_bytes = 2 * planes * out.hq_residual_plane_bytes +
                             static_cast<std::size_t>(state_slots) * kIgnisHqRingWords *
                                 sizeof(std::uint32_t);
+  }
+  // GitHub #302: Flash-Next's sections, BF16 throughout.
+  if (spec.indexer_key_dim != 0) {
+    const std::uint64_t key_bytes = static_cast<std::uint64_t>(spec.indexer_key_dim) * 2u;
+    out.indexer_block_layer_bytes = static_cast<std::uint64_t>(spec.kv_page_group_count) *
+                                    (ninfer::kPagedKVPageSize / spec.indexer_compress_tokens) * key_bytes;
+    out.indexer_tail_slot_bytes = (spec.indexer_compress_tokens - 1u) * key_bytes;
+    out.indexer_bytes = static_cast<std::size_t>(spec.kv_num_layers) *
+                        (out.indexer_block_layer_bytes + state_slots * out.indexer_tail_slot_bytes);
+  }
+  if (spec.ngram_conv_columns != 0) {
+    out.ngram_conv_slot_bytes = static_cast<std::uint64_t>(spec.ngram_conv_columns) *
+                                spec.ngram_conv_channels * 2u;
+    out.ngram_conv_bytes = static_cast<std::size_t>(state_slots * out.ngram_conv_slot_bytes);
   }
   return out;
 }
@@ -769,8 +910,15 @@ std::uint64_t host_image_stride(const PoolLayout &layout, const struct ignis_seq
     stride += aligned(cyclic_lane_bytes(layout.dflash2_window_layout));
   }
   if (layout.hq_residual_plane_bytes != 0) {
-    stride += aligned(2u * kIgnisGqaLayerCount * layout.hq_residual_plane_bytes +
+    stride += aligned(2u * spec.kv_num_layers * layout.hq_residual_plane_bytes +
                       kIgnisHqRingWords * sizeof(std::uint32_t));
+  }
+  // GitHub #303: Flash-Next's slot sections, in table order.
+  if (layout.indexer_tail_slot_bytes != 0) {
+    stride += aligned(static_cast<std::uint64_t>(spec.kv_num_layers) * layout.indexer_tail_slot_bytes);
+  }
+  if (layout.ngram_conv_slot_bytes != 0) {
+    stride += aligned(layout.ngram_conv_slot_bytes);
   }
   return stride;
 }
@@ -797,6 +945,8 @@ extern "C" int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
     out->retained_state_bytes = spec->retained_slot_count * layout.slot_state_bytes;
     out->hq_residual_bytes = layout.hq_residual_bytes;
     out->retained_host_bytes = spec->retained_host_slot_count * host_image_stride(layout, *spec);
+    out->indexer_bytes = layout.indexer_bytes;
+    out->ngram_conv_bytes = layout.ngram_conv_bytes;
     return 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_seq_pool_plan: ") + e.what());
@@ -827,6 +977,7 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     pool->kv_format       = spec->kv_format;
     pool->kv_head_dim     = static_cast<std::int32_t>(spec->head_dim);
     pool->kv_num_kv_heads = static_cast<std::int32_t>(spec->num_kv_heads);
+    pool->kv_num_layers   = static_cast<std::int32_t>(spec->kv_num_layers);
 
     if (layout.dflash2) {
       pool->dflash2_arena = std::make_unique<ninfer::DeviceArena>(layout.dflash2_bytes);
@@ -847,7 +998,7 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
 
     if (layout.hq_residual_bytes != 0) {
       const std::size_t planes =
-          static_cast<std::size_t>(kIgnisGqaLayerCount) * state_slot_count(*spec);
+          static_cast<std::size_t>(spec->kv_num_layers) * state_slot_count(*spec);
       pool->hq_residual = std::make_unique<ninfer::DeviceBuffer>(layout.hq_residual_bytes);
       // Zeroed once here and per slot at every alloc: no bit is set and no
       // side row holds anything until an append writes it.
@@ -861,6 +1012,24 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
       if (pool->hq_residual_plane_bytes() != layout.hq_residual_plane_bytes) {
         throw std::logic_error("the hq residual plane the pool addresses is not the one it planned");
       }
+    }
+
+    // GitHub #302: Flash-Next's sections. Zeroed once here and a slot's
+    // tails and conv columns again at every alloc; a page's block keys are
+    // written before any read of them (a block is read once complete).
+    if (layout.indexer_bytes != 0) {
+      pool->indexer_state = std::make_unique<ninfer::DeviceBuffer>(layout.indexer_bytes);
+      pool->indexer_state->fill(0);
+      pool->indexer_key_dim = static_cast<std::int32_t>(spec->indexer_key_dim);
+      pool->indexer_compress_tokens = static_cast<std::int32_t>(spec->indexer_compress_tokens);
+      pool->indexer_block_layer_bytes = layout.indexer_block_layer_bytes;
+      pool->indexer_tail_slot_bytes = layout.indexer_tail_slot_bytes;
+      pool->indexer_slots = static_cast<std::int32_t>(state_slot_count(*spec));
+    }
+    if (layout.ngram_conv_bytes != 0) {
+      pool->ngram_conv = std::make_unique<ninfer::DeviceBuffer>(layout.ngram_conv_bytes);
+      pool->ngram_conv->fill(0);
+      pool->ngram_conv_slot_bytes = layout.ngram_conv_slot_bytes;
     }
 
     // GitHub #281: the host retained slots' pinned block, reserved whole
@@ -935,7 +1104,14 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
   // GitHub #281: host memory, in none of the device lines above.
   out_stats->retained_host_slot_count = pool->retained_slot_count - pool->retained_device_slot_count;
   out_stats->retained_host_bytes      = pool->retained_host.bytes;
+  out_stats->indexer_bytes    = pool->has_indexer() ? pool->indexer_state->bytes : 0;
+  out_stats->ngram_conv_bytes = pool->has_ngram_conv() ? pool->ngram_conv->bytes : 0;
   return 0;
+}
+
+const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool) {
+  (void)pool;
+  return nullptr;
 }
 
 extern "C" void ignis_seq_pool_free(struct ignis_seq_pool *pool) {
@@ -997,6 +1173,7 @@ extern "C" int32_t ignis_seq_alloc(struct ignis_seq_pool *pool, uint32_t context
     // an exact row -- neither a ring bit, which names no position, nor a sink
     // row, which the kernels read with no bit at all.
     ignis_seq_zero_hq_residual(*pool, slot);
+    zero_flash_next_slot(*pool, slot);
     seq->slot = slot;
 
     pool->free_slots.pop_back();
@@ -1044,8 +1221,16 @@ extern "C" int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq
   return 0;
 }
 
+extern "C" int32_t ignis_seq_pending_token(const struct ignis_seq *seq) {
+  return seq == nullptr ? -1 : seq->pending_token;
+}
+
 extern "C" uint32_t ignis_seq_snapshot_format_version(void) {
   return kIgnisSeqSnapshotFormatVersion;
+}
+
+extern "C" uint32_t ignis_seq_pool_snapshot_format_version(const struct ignis_seq_pool *pool) {
+  return pool == nullptr ? 0 : ignis_seq_snapshot_format_version_of(*pool);
 }
 
 extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
@@ -1059,6 +1244,10 @@ extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
   }
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_snapshot_size: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    set_error(std::string("ignis_seq_snapshot_size: ") + refusal);
     return -1;
   }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
@@ -1086,6 +1275,10 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
   }
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_snapshot: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    set_error(std::string("ignis_seq_snapshot: ") + refusal);
     return -1;
   }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
@@ -1122,6 +1315,9 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
       switch (section.kind) {
       case IGNIS_SEQ_SECTION_KV_PAGES:
         pack_logical_pages(*pool, *seq, pages, at);
+        break;
+      case IGNIS_SEQ_SECTION_INDEXER_KEYS:
+        pack_indexer_keys_to_host(*pool, logical_page_ids(*seq, pages), at);
         break;
       case IGNIS_SEQ_SECTION_PROGRESS: {
         const ignis_seq_progress_image image = ignis_seq_progress_of(*seq);
@@ -1162,6 +1358,10 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
   }
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_restore: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    set_error(std::string("ignis_seq_restore: ") + refusal);
     return -1;
   }
   if (const char *refusal = shared_prefix_refusal(*seq)) {
@@ -1215,6 +1415,15 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
                                                      header.kv_page_count, header.kv_page_count,
                                                      nullptr);
         break;
+      case IGNIS_SEQ_SECTION_INDEXER_KEYS: {
+        // The target owns its history (a restore refuses a shared prefix),
+        // so its logical pages are its own allocation's first pages.
+        std::vector<std::int32_t> own;
+        const auto ids = seq->kv.page_ids();
+        own.assign(ids.begin(), ids.begin() + header.kv_page_count);
+        unpack_indexer_keys_from_host(*pool, own, at);
+        break;
+      }
       case IGNIS_SEQ_SECTION_PROGRESS:
         std::memcpy(&image, at, sizeof(image));
         break;
@@ -1376,7 +1585,7 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
       for (const bool role_v : {false, true}) {
         const cudaError_t err = cudaMemcpy2DAsync(
             pool.hq_residual_plane(role_v, 0, dst), pitch, pool.hq_residual_plane(role_v, 0, src),
-            pitch, plane, kIgnisGqaLayerCount, cudaMemcpyDeviceToDevice, nullptr);
+            pitch, plane, static_cast<std::size_t>(pool.kv_num_layers), cudaMemcpyDeviceToDevice, nullptr);
         if (err != cudaSuccess) {
           throw std::runtime_error(std::string("cudaMemcpy2DAsync(") + what +
                                    ", slot to slot) failed: " + cudaGetErrorString(err));
@@ -1386,6 +1595,22 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
            kIgnisHqRingWords * sizeof(std::uint32_t), what);
       break;
     }
+    case IGNIS_SEQ_SECTION_INDEXER_TAIL: {
+      // GitHub #303: one 2D copy, a slot's tail in every attention layer.
+      const std::size_t pitch = static_cast<std::size_t>(pool.indexer_slots) * pool.indexer_tail_slot_bytes;
+      const cudaError_t err = cudaMemcpy2DAsync(
+          pool.indexer_slot_tail(0, dst), pitch, pool.indexer_slot_tail(0, src), pitch,
+          static_cast<std::size_t>(pool.indexer_tail_slot_bytes), static_cast<std::size_t>(pool.kv_num_layers),
+          cudaMemcpyDeviceToDevice, nullptr);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpy2DAsync(") + what + ", slot to slot) failed: " +
+                                 cudaGetErrorString(err));
+      }
+      break;
+    }
+    case IGNIS_SEQ_SECTION_NGRAM_CONV:
+      copy(pool.ngram_slot_conv(dst), pool.ngram_slot_conv(src), static_cast<std::size_t>(section.bytes), what);
+      break;
     default:
       throw std::logic_error(std::string("state section ") + what +
                              " has no slot-to-slot copy implementation");
@@ -1636,6 +1861,117 @@ extern "C" void ignis_host_pinned_free(void *ptr) {
     // A free has nowhere to return a code, and the arena refuses a pointer it
     // never handed out rather than corrupting its own free list.
     std::fprintf(stderr, "ignis_host_pinned_free: %s\n", e.what());
+  }
+}
+
+// ---- an owned KV-RAM arena (GitHub #303) -----------------------------------
+
+struct ignis_host_arena {
+  explicit ignis_host_arena(std::size_t bytes) : arena(bytes) {}
+  std::mutex mutex;
+  ninfer::HostPinnedArena arena;
+};
+
+extern "C" int32_t ignis_host_arena_create(uint64_t bytes, struct ignis_host_arena **out) {
+  if (out == nullptr) {
+    set_error("ignis_host_arena_create: null out");
+    return -1;
+  }
+  *out = nullptr;
+  if (bytes == 0) {
+    set_error("ignis_host_arena_create: bytes must be positive (a disabled tier creates no arena)");
+    return -1;
+  }
+  try {
+    *out = new ignis_host_arena(static_cast<std::size_t>(bytes));
+  } catch (const std::exception &e) {
+    set_error("ignis_host_arena_create: pinning " + std::to_string(bytes) +
+              " bytes of KV-RAM failed: " + e.what());
+    return -1;
+  }
+  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_ARENA, true, bytes);
+  return 0;
+}
+
+extern "C" void ignis_host_arena_free(struct ignis_host_arena *arena) {
+  if (arena == nullptr) {
+    return;
+  }
+  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_ARENA, false, 0);
+  delete arena;
+}
+
+extern "C" int32_t ignis_host_arena_stats(struct ignis_host_arena *arena, uint64_t *out_capacity,
+                                          uint64_t *out_used) {
+  if (arena == nullptr || out_capacity == nullptr || out_used == nullptr) {
+    set_error("ignis_host_arena_stats: null argument");
+    return -1;
+  }
+  const std::lock_guard<std::mutex> guard(arena->mutex);
+  *out_capacity = static_cast<uint64_t>(arena->arena.capacity());
+  *out_used     = static_cast<uint64_t>(arena->arena.used());
+  return 0;
+}
+
+extern "C" int32_t ignis_host_arena_can_alloc(struct ignis_host_arena *arena, uint64_t bytes,
+                                              int32_t *out_fits) {
+  if (arena == nullptr || out_fits == nullptr) {
+    set_error("ignis_host_arena_can_alloc: null argument");
+    return -1;
+  }
+  *out_fits = 0;
+  if (bytes == 0) {
+    set_error("ignis_host_arena_can_alloc: bytes must be positive");
+    return -1;
+  }
+  const std::lock_guard<std::mutex> guard(arena->mutex);
+  try {
+    *out_fits = arena->arena.can_alloc(static_cast<std::size_t>(bytes)) ? 1 : 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_host_arena_can_alloc: ") + e.what());
+    return -1;
+  }
+  return 0;
+}
+
+extern "C" int32_t ignis_host_arena_alloc(struct ignis_host_arena *arena, uint64_t bytes,
+                                          void **out_ptr) {
+  if (arena == nullptr || out_ptr == nullptr) {
+    set_error("ignis_host_arena_alloc: null argument");
+    return -1;
+  }
+  *out_ptr = nullptr;
+  if (bytes == 0) {
+    set_error("ignis_host_arena_alloc: bytes must be positive");
+    return -1;
+  }
+  const std::lock_guard<std::mutex> guard(arena->mutex);
+  void *ptr = nullptr;
+  try {
+    ptr = arena->arena.try_alloc(static_cast<std::size_t>(bytes));
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_host_arena_alloc: ") + e.what());
+    return -1;
+  }
+  if (ptr == nullptr) {
+    set_error("ignis_host_arena_alloc: no free span of " + std::to_string(bytes) + " bytes in the " +
+              std::to_string(arena->arena.capacity()) + "-byte KV-RAM arena (" +
+              std::to_string(arena->arena.used()) + " bytes held)");
+    return IGNIS_SEQ_ERR_NO_HOST_ROOM;
+  }
+  *out_ptr = ptr;
+  return 0;
+}
+
+extern "C" void ignis_host_arena_release(struct ignis_host_arena *arena, void *ptr) {
+  if (arena == nullptr || ptr == nullptr) {
+    return;
+  }
+  const std::lock_guard<std::mutex> guard(arena->mutex);
+  try {
+    arena->arena.free(ptr);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "ignis_host_arena_release: %s\n", e.what());
   }
 }
 

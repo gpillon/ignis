@@ -21,7 +21,10 @@
 // it. The path is resolved from IGNIS_HQ_KV_FIXTURE_PATH, a compile
 // definition kernel/tests/CMakeLists.txt sets from
 // CMAKE_CURRENT_SOURCE_DIR -- never a relative path, which would depend on
-// whatever directory CTest happens to run from.
+// whatever directory CTest happens to run from. A second registration,
+// ignis_hq_codec_kv_rows_flash_next_test, runs the same measurement on real
+// Flash-Next rows (hq_kv_rows_flash_next.bin, spec flash-next/04 acceptance
+// 7), IGNIS_HQ_KV_FLASH_NEXT selecting the tolerances derived from them.
 //
 // Uses the engine's REAL rotation (hq_engine_sign / hq_engine_signs_fill,
 // not the vendored oracle's random per-run sign vector) and REAL per-row
@@ -841,10 +844,27 @@ int main() {
     // a different corpus, different signs, different seeding) or from any
     // other test (GitHub #96 is the project's own record of what copying a
     // tolerance costs).
+#ifdef IGNIS_HQ_KV_FLASH_NEXT
+    // Spec flash-next/04 acceptance 7: measured 2026-10-06 on
+    // kernel/tests/fixtures/hq_kv_rows_flash_next.bin (its provenance names
+    // the prompt and the bin_sha256), 8 groups (KV layer ordinals 0/4/8/11,
+    // model layers 3/19/35/47, x K/V), 512 real captured rows per group:
+    //   worst per-group median relative L2 error: 0.370397 (layer 11, K)
+    //   worst per-group max relative L2 error:    0.768519 (layer 11, K)
+    //   min per-group original-frame cosine:      0.932612 (layer 0, V)
+    //   min per-group SNR:                        8.27 dB  (layer 0, V)
+    // The same margins as the 27B's below, from Flash-Next's own figures;
+    // they land on the same bounds but the SNR floor, which is 0.1 dB lower.
+    constexpr double kMaxGroupMedianRelL2 = 0.45;
+    constexpr double kMaxGroupMaxRelL2    = 0.90;
+    constexpr double kMinGroupCosine      = 0.91;
+    constexpr double kMinGroupSnrDb       = 6.4;
+#else
     constexpr double kMaxGroupMedianRelL2 = 0.45;
     constexpr double kMaxGroupMaxRelL2    = 0.90;
     constexpr double kMinGroupCosine      = 0.91;
     constexpr double kMinGroupSnrDb       = 6.5;
+#endif
     check(worst_group_median <= kMaxGroupMedianRelL2,
          "worst per-group median relative L2 error exceeded the measured tolerance");
     check(worst_group_max <= kMaxGroupMaxRelL2,

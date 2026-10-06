@@ -1,0 +1,3 @@
+# The converter writes these bytes and its DONE files record their SHA-256:
+# git must store and check them out verbatim on every OS.
+* -text

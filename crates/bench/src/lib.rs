@@ -64,10 +64,17 @@
 //! correctness oracle: the canary suite run against a spec-on and a
 //! spec-off endpoint, compared token-for-token for exact equality (not a
 //! tolerance floor like `oracle` — any divergence is the bug).
+//!
+//! Flash-Next's acceptance scorers (`flash_next`, spec flash-next/04
+//! acceptance 4-6 and 8) judge an engine's teacher-forced logits against the
+//! converter's reference recordings: the top-64 KLD per domain, the MMLU-Pro
+//! proxy and the G1 run on the expected-argmax column, through one seam
+//! (`flash_next::SpanLogits`).
 
 pub mod canary;
 pub mod client;
 pub mod equivalence;
+pub mod flash_next;
 pub mod g2;
 pub mod g3;
 pub mod g3_gate;

@@ -1,0 +1,286 @@
+{
+ "tensors": [
+  {
+   "name": "layers.0.linear_attn.dt_bias",
+   "file": "linear_attn.dt_bias.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "451f7ad2debdde09eb155e43ec7ae7a4413ddcfd476e6f5d92308d3427713ef4",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.linear_attn.A_log",
+   "file": "linear_attn.A_log.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "e446e872ffe5cf8aa0fb68feb68a66187d7d4d296860818d8baeb822611b0276",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.linear_attn.conv1d.weight",
+   "file": "linear_attn.conv1d.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    256,
+    1,
+    4
+   ],
+   "bytes": 2048,
+   "sha256": "15bc155240881f0d08ac60b5cafbde9ccdf1f611037546f7ff08516aea2347ba",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.linear_attn.norm.weight",
+   "file": "linear_attn.norm.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "0b7e118c35ddf8220dfb3e9ff58f817cf8da2be674fd2c1da9b1fc190de3b83b",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.linear_attn.out_proj.weight",
+   "file": "linear_attn.out_proj.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    256,
+    128
+   ],
+   "bytes": 33280,
+   "sha256": "4c51d1866b0da7dbb222818a125d37a8813d34e1da83feaacc2341804495cb2e",
+   "fp8_measured_by_study": true
+  },
+  {
+   "name": "layers.0.linear_attn.in_proj_qkv.weight",
+   "file": "linear_attn.in_proj_qkv.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    256,
+    256
+   ],
+   "bytes": 66048,
+   "sha256": "5206d1faf268ef7ad4a1a23d7ff43b830b4dc9eec064578e2e8cda2a842fc89a",
+   "fp8_measured_by_study": true
+  },
+  {
+   "name": "layers.0.linear_attn.in_proj_z.weight",
+   "file": "linear_attn.in_proj_z.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    128,
+    256
+   ],
+   "bytes": 33024,
+   "sha256": "25d4d62bcabd7748727e2077068d5488d17034d4f4124bc7494d5c3518e181ed",
+   "fp8_measured_by_study": true
+  },
+  {
+   "name": "layers.0.linear_attn.in_proj_b.weight",
+   "file": "linear_attn.in_proj_b.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    256
+   ],
+   "bytes": 2048,
+   "sha256": "2fe7d895efe2c9722f028fae563e26cbf8cb80115971a6c7e57f5bfd508f50ac",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.linear_attn.in_proj_a.weight",
+   "file": "linear_attn.in_proj_a.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    256
+   ],
+   "bytes": 2048,
+   "sha256": "738d5a1dbadfc6e80b8f570eb3ea41b6e3d33ab893c830fa80234d4628deee69",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.mlp.gate.weight",
+   "file": "mlp.gate.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    256
+   ],
+   "bytes": 4096,
+   "sha256": "e5c9545d5b9b3e6d4fcff3950296f8dd22410cd91a4d65c7cb13f3cefcf7245b",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.mlp.shared_expert.gate_proj.weight",
+   "file": "mlp.shared_expert.gate_proj.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    128,
+    256
+   ],
+   "bytes": 33024,
+   "sha256": "9f30af4adedc0a601eb6f7afb3a19209115fa82dd4bb3bb9c3e76698def12290",
+   "fp8_measured_by_study": true
+  },
+  {
+   "name": "layers.0.mlp.shared_expert.up_proj.weight",
+   "file": "mlp.shared_expert.up_proj.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    128,
+    256
+   ],
+   "bytes": 33024,
+   "sha256": "6e9d9c3596484270c08766821379fbb27aeded71ba981a3f10a2479447aad88a",
+   "fp8_measured_by_study": true
+  },
+  {
+   "name": "layers.0.mlp.shared_expert.down_proj.weight",
+   "file": "mlp.shared_expert.down_proj.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    256,
+    128
+   ],
+   "bytes": 33280,
+   "sha256": "7945a453af662e2da19143308411ed92bf2756e0dde0117edae620928322e6ca",
+   "fp8_measured_by_study": true
+  },
+  {
+   "name": "layers.0.mlp.shared_expert_gate.weight",
+   "file": "mlp.shared_expert_gate.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    1,
+    256
+   ],
+   "bytes": 512,
+   "sha256": "3eccb269cd05d3ca67a452fcbc3b0686c59489c5a7702fdde56db0d04b1902c7",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.attn_hyper_connection.hc_norm.weight",
+   "file": "attn_hyper_connection.hc_norm.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    1024
+   ],
+   "bytes": 2048,
+   "sha256": "c50c06a500635240e7708d8e6dc8b12d69c519392febfd1a29587b1b6411e73d",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.attn_hyper_connection.input_mix_weight_down.weight",
+   "file": "attn_hyper_connection.input_mix_weight_down.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    32,
+    1024
+   ],
+   "bytes": 32832,
+   "sha256": "030a9e1b1204f9dbc8641cae71c4b6877cc9a5003beb14a705f1af2c707df699",
+   "fp8_measured_by_study": false
+  },
+  {
+   "name": "layers.0.attn_hyper_connection.input_mix_weight_up.weight",
+   "file": "attn_hyper_connection.input_mix_weight_up.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    1024,
+    32
+   ],
+   "bytes": 34816,
+   "sha256": "30b63ab2ef8bee843b05108e5bafd034b714c1e2d30193d1a9c53f2b5955077f",
+   "fp8_measured_by_study": false
+  },
+  {
+   "name": "layers.0.attn_hyper_connection.block_inject_weight.weight",
+   "file": "attn_hyper_connection.block_inject_weight.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    1024
+   ],
+   "bytes": 8192,
+   "sha256": "621a3048fba886444377a8cf48219956ee0593c5d9600fce746dc56dd77c7ade",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.mlp_hyper_connection.hc_norm.weight",
+   "file": "mlp_hyper_connection.hc_norm.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    1024
+   ],
+   "bytes": 2048,
+   "sha256": "a1555817d2377a0a49afd0afeabc0bdbbe59166313608347f59bba45df583ea0",
+   "fp8_measured_by_study": null
+  },
+  {
+   "name": "layers.0.mlp_hyper_connection.input_mix_weight_down.weight",
+   "file": "mlp_hyper_connection.input_mix_weight_down.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    32,
+    1024
+   ],
+   "bytes": 32832,
+   "sha256": "201d30ea0f8819501650cc372be6c9367ff9056040b864773685265e17ce74f4",
+   "fp8_measured_by_study": false
+  },
+  {
+   "name": "layers.0.mlp_hyper_connection.input_mix_weight_up.weight",
+   "file": "mlp_hyper_connection.input_mix_weight_up.weight.bin",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    1024,
+    32
+   ],
+   "bytes": 34816,
+   "sha256": "772588eb25067f81e9de498a156c8ed523e158e6ce99904e6c53abb52913b962",
+   "fp8_measured_by_study": false
+  },
+  {
+   "name": "layers.0.mlp_hyper_connection.block_inject_weight.weight",
+   "file": "mlp_hyper_connection.block_inject_weight.weight.bin",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    1024
+   ],
+   "bytes": 8192,
+   "sha256": "5992dc69183a53ed2aa10b7e43972039312873a1117949a54fd98d7cca10b2eb",
+   "fp8_measured_by_study": null
+  }
+ ]
+}

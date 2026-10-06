@@ -1,0 +1,32 @@
+{
+ "files": {
+  "chat_template.jinja": {
+   "bytes": 3,
+   "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+  },
+  "config.json": {
+   "bytes": 2049,
+   "sha256": "dea4f325ccce048dd44390c92f7633237db70a2f9ea8dbfe40cdf90b2495835e"
+  },
+  "generation_config.json": {
+   "bytes": 3,
+   "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+  },
+  "preprocessor_config.json": {
+   "bytes": 3,
+   "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+  },
+  "tokenizer.json": {
+   "bytes": 3,
+   "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+  },
+  "tokenizer_config.json": {
+   "bytes": 3,
+   "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+  },
+  "video_preprocessor_config.json": {
+   "bytes": 3,
+   "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+  }
+ }
+}

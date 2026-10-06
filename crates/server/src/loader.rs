@@ -57,6 +57,14 @@ pub fn load_artifact_with_report(reader: &Reader, report: &ChecksumReport) -> Re
     FrontendSet::from_reader(reader)
 }
 
+/// The model `artifact` holds (ADR 0043): the family its container
+/// identity's `model_id` names, or `None` for an artifact of neither model
+/// (a test fixture), which is served as the 27B always was.
+pub fn artifact_family(artifact: &Path) -> Result<Option<ignis_core::compute::ModelFamily>> {
+    let reader = Reader::open(artifact)?;
+    Ok(ignis_core::compute::ModelFamily::of_model_id(&reader.identity().model_id))
+}
+
 /// The sidecar next to `artifact` (the full artifact file name plus one
 /// of [`SIDECAR_SUFFIXES` — the reference tooling's naming, the graft
 /// record winning over the conversion record when both exist), when one
@@ -212,6 +220,16 @@ mod tests {
         assert!(message.contains("dflash2/foo"), "{message}");
         assert!(message.contains("dflash2/absent"), "{message}");
         assert!(message.contains("file size"), "{message}");
+    }
+
+    #[test]
+    fn an_artifact_of_neither_model_names_no_family() {
+        // The fixture container's identity is neither `qwen3.8-27b` nor
+        // `qwen3.8-flash-next` (ModelFamily::of_model_id holds the two).
+        let (fixture, _payload) = frontend_fixture("family-none");
+        assert_eq!(artifact_family(&fixture.path).expect("open fixture"), None);
+        let missing = fixture.path.with_file_name("no-such-artifact.ninfer");
+        assert!(artifact_family(&missing).is_err(), "an unreadable artifact is an error, not a family");
     }
 
     #[test]

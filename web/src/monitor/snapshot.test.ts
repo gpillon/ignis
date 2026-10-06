@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseExposition } from "./exposition.ts";
-import { IGNIS_EXPOSITION } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION } from "./fixture.ts";
 import { emptySnapshot, readSnapshot, counterValues, RETAINED_FAMILY_KEYS } from "./snapshot.ts";
 
 describe("readSnapshot", () => {
@@ -107,12 +107,57 @@ describe("readSnapshot", () => {
   it("counts the retained counters towards a restart, and the memory gauges not", () => {
     const empty = emptySnapshot();
     const moved = readSnapshot(parseExposition(IGNIS_EXPOSITION));
-    // 8 plain counters, 3 reject reasons, 24 retained series, 3 skips, 2 histogram counts.
-    expect(counterValues(empty)).toHaveLength(40);
+    // 8 plain counters, 3 reject reasons, 24 retained series, 3 skips, then
+    // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 2
+    // n-gram rows, 2 reads, and 2 histogram counts.
+    expect(counterValues(empty)).toHaveLength(80);
     expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
+    const flashNext = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
+    expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(80);
+    // The slots are gauges: occupancy falls on no restart.
+    expect(counterValues(flashNext)).not.toContain(2999);
     expect(counterValues(moved)).toContain(41_200);
     expect(counterValues(moved)).toContain(12);
     expect(counterValues(moved)).not.toContain(31_138_512_896);
+  });
+
+  it("reads a 27B load as having neither an expert cache nor an n-gram table", () => {
+    const s = readSnapshot(parseExposition(IGNIS_EXPOSITION));
+    expect(s.experts).toBeNull();
+    expect(s.ngram).toBeNull();
+  });
+
+  it("reads a Flash-Next load's expert residency and n-gram families, all in the contract", () => {
+    const s = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
+    expect(s.unknown).toEqual([]);
+    expect(s.accepted).toBe(42);
+    const experts = s.experts!;
+    expect(experts.hits.gate_up_k2).toEqual({ decode: 4000, prefill: 1200 });
+    expect(experts.hits.down_k2_5).toEqual({ decode: 0, prefill: 0 });
+    expect(experts.misses.down_k3).toEqual({ decode: 300, prefill: 0 });
+    expect(experts.prefetchIssued).toBe(900);
+    expect(experts.prefetchUsed).toBe(720);
+    expect(experts.bytesMoved).toEqual({ decode: 6_000_000_000, prefill: 9_000_000_000 });
+    expect(experts.slots.down_k2).toEqual({ capacity: 3000, inUse: 2999 });
+    expect(experts.slots.down_k4).toEqual({ capacity: 0, inUse: 0 });
+    expect(s.ngram).toEqual({ rows: { hot: 190_000, file: 10_000 }, reads: 6000, readBytes: 24_576_000 });
+  });
+
+  it("reads the slots' capacity alone from a server without occupancy", () => {
+    const text = FLASH_NEXT_EXPOSITION.split("\n")
+      .filter((line) => !line.includes('state="in_use"}'))
+      .join("\n");
+    const s = readSnapshot(parseExposition(text));
+    expect(s.experts?.slots.gate_up_k4).toEqual({ capacity: 400, inUse: null });
+  });
+
+  it("lists an expert class or n-gram source the contract does not name", () => {
+    const text = `${FLASH_NEXT_EXPOSITION}ignis_expert_cache_hits_total{class="up_k8",phase="decode"} 1\nignis_ngram_rows_total{source="disk"} 2\n`;
+    const s = readSnapshot(parseExposition(text));
+    expect(s.unknown).toEqual([
+      { name: "ignis_expert_cache_hits_total", labels: { class: "up_k8", phase: "decode" }, value: 1 },
+      { name: "ignis_ngram_rows_total", labels: { source: "disk" }, value: 2 },
+    ]);
   });
 
   it("lists series outside the contract instead of dropping them", () => {

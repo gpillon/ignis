@@ -250,6 +250,7 @@ ignis_seq_pool_spec pool_spec(int32_t kv_format, std::uint32_t max_context, std:
   // A small GDN/vocab geometry: this test never steps a layer, it only needs
   // the pool to build.
   spec.gdn_num_layers    = 2;
+  spec.kv_num_layers = kIgnisGqaLayerCount;
   spec.gdn_conv_channels = 6;
   spec.gdn_value_heads   = 2;
   spec.gdn_head_dim      = 4;

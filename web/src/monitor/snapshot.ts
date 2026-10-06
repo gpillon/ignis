@@ -82,6 +82,46 @@ export type Memory = {
   slotSkips: Record<SlotSkipReason, number | null>;
 };
 
+/**
+ * Flash-Next's eight K classes of expert projection (GitHub #301), in the
+ * order the server writes them: the `class` label's whole vocabulary.
+ */
+export const EXPERT_CLASSES = ["gate_up_k2", "gate_up_k2_5", "gate_up_k3", "gate_up_k4", "down_k2", "down_k2_5", "down_k3", "down_k4"] as const;
+export type ExpertClass = (typeof EXPERT_CLASSES)[number];
+
+/** The step an expert projection was selected by. */
+export const EXPERT_PHASES = ["decode", "prefill"] as const;
+export type ExpertPhase = (typeof EXPERT_PHASES)[number];
+
+/** Where an n-gram row came from: the RAM hot-row cache, or the artifact file (GitHub #302). */
+export const NGRAM_SOURCES = ["hot", "file"] as const;
+export type NgramSource = (typeof NGRAM_SOURCES)[number];
+
+/** One expert-cache family: a count per K class and phase. */
+export type ClassPhaseMatrix = Record<ExpertClass, Record<ExpertPhase, number | null>>;
+
+/**
+ * Flash-Next's expert residency (GitHub #301, ADR 0017's amendment of
+ * 2026-10-05): what the VRAM expert cache served, what it copied in, and
+ * its slots. Only a Flash-Next load exports it.
+ */
+export type ExpertResidency = {
+  hits: ClassPhaseMatrix;
+  misses: ClassPhaseMatrix;
+  prefetchIssued: number | null;
+  prefetchUsed: number | null;
+  bytesMoved: Record<ExpertPhase, number | null>;
+  /** Slots per class: reserved at load, and holding a projection now (null from a server without occupancy). */
+  slots: Record<ExpertClass, { capacity: number | null; inUse: number | null }>;
+};
+
+/** Flash-Next's n-gram rows (GitHub #302): staged by source, and the file reads behind them. */
+export type Ngram = {
+  rows: Record<NgramSource, number | null>;
+  reads: number | null;
+  readBytes: number | null;
+};
+
 /** A histogram: upper bounds in seconds ending in +Inf, their cumulative counts, the sum and the count. */
 export type Histogram = { bounds: number[]; cumulative: number[]; sum: number; count: number };
 
@@ -104,6 +144,10 @@ export type Snapshot = {
   /** The six retained-state families, each split by tier and kind (GitHub #190, #216). */
   retained: Record<RetainedFamily, RetainedMatrix>;
   memory: Memory;
+  /** Null on a load without an expert cache: a 27B load. */
+  experts: ExpertResidency | null;
+  /** Null on a load without an n-gram table: a 27B load. */
+  ngram: Ngram | null;
   ttft: Histogram | null;
   duration: Histogram | null;
   unknown: Sample[];
@@ -134,6 +178,23 @@ const MEMORY_GAUGES = {
   kvPoolUsedPages: "ignis_kv_pool_used_pages",
 } as const;
 
+/** The expert residency families (GitHub #301). */
+const EXPERT_FAMILIES = {
+  hits: "ignis_expert_cache_hits_total",
+  misses: "ignis_expert_cache_misses_total",
+  prefetchIssued: "ignis_expert_prefetches_issued_total",
+  prefetchUsed: "ignis_expert_prefetches_used_total",
+  bytesMoved: "ignis_expert_bytes_moved_total",
+  slots: "ignis_expert_cache_slots",
+} as const;
+
+/** The n-gram families (GitHub #302). */
+const NGRAM_FAMILIES = {
+  rows: "ignis_ngram_rows_total",
+  reads: "ignis_ngram_reads_total",
+  readBytes: "ignis_ngram_read_bytes_total",
+} as const;
+
 /** The typed primitives a decision's question asks for (GitHub #241, ADR 0034). */
 export const DECISION_TYPES = ["noul", "choice", "score"] as const;
 export type DecisionType = (typeof DECISION_TYPES)[number];
@@ -154,6 +215,8 @@ const KNOWN = new Set<string>([
   ...Object.values(MEMORY_GAUGES),
   ...Object.values(RETAINED_HOST),
   ...Object.values(RETAINED_FAMILIES),
+  ...Object.values(EXPERT_FAMILIES),
+  ...Object.values(NGRAM_FAMILIES),
 ]);
 
 const emptyMatrix = (): RetainedMatrix =>
@@ -185,11 +248,16 @@ export function emptySnapshot(): Snapshot {
       retainedHost: { slots: null, bytes: null },
       slotSkips: Object.fromEntries(SLOT_SKIP_REASONS.map((reason) => [reason, null])) as Record<SlotSkipReason, number | null>,
     },
+    experts: null,
+    ngram: null,
     ttft: null,
     duration: null,
     unknown: [],
   };
 }
+
+const classPhaseMatrix = (read: (cls: ExpertClass, phase: ExpertPhase) => number | null): ClassPhaseMatrix =>
+  Object.fromEntries(EXPERT_CLASSES.map((cls) => [cls, Object.fromEntries(EXPERT_PHASES.map((phase) => [phase, read(cls, phase)]))])) as ClassPhaseMatrix;
 
 export function readSnapshot({ families }: Exposition): Snapshot {
   const samples = (name: string) => families.get(name)?.samples ?? [];
@@ -223,6 +291,32 @@ export function readSnapshot({ families }: Exposition): Snapshot {
   };
   mem.retainedHost = { slots: valueOf(RETAINED_HOST.slots), bytes: valueOf(RETAINED_HOST.bytes) };
   for (const reason of SLOT_SKIP_REASONS) mem.slotSkips[reason] = valueOf("ignis_retained_slot_skips_total", ["reason", reason]);
+
+  // Flash-Next's families, all or nothing per table: a 27B load renders none.
+  if (families.has(EXPERT_FAMILIES.hits)) {
+    const byLabels = (name: string, labels: Record<string, string>) =>
+      samples(name).find((s) => Object.entries(labels).every(([k, v]) => s.labels[k] === v))?.value ?? null;
+    snap.experts = {
+      hits: classPhaseMatrix((cls, phase) => byLabels(EXPERT_FAMILIES.hits, { class: cls, phase })),
+      misses: classPhaseMatrix((cls, phase) => byLabels(EXPERT_FAMILIES.misses, { class: cls, phase })),
+      prefetchIssued: valueOf(EXPERT_FAMILIES.prefetchIssued),
+      prefetchUsed: valueOf(EXPERT_FAMILIES.prefetchUsed),
+      bytesMoved: { decode: valueOf(EXPERT_FAMILIES.bytesMoved, ["phase", "decode"]), prefill: valueOf(EXPERT_FAMILIES.bytesMoved, ["phase", "prefill"]) },
+      slots: Object.fromEntries(
+        EXPERT_CLASSES.map((cls) => [
+          cls,
+          { capacity: byLabels(EXPERT_FAMILIES.slots, { class: cls, state: "capacity" }), inUse: byLabels(EXPERT_FAMILIES.slots, { class: cls, state: "in_use" }) },
+        ]),
+      ) as ExpertResidency["slots"],
+    };
+  }
+  if (families.has(NGRAM_FAMILIES.rows)) {
+    snap.ngram = {
+      rows: { hot: valueOf(NGRAM_FAMILIES.rows, ["source", "hot"]), file: valueOf(NGRAM_FAMILIES.rows, ["source", "file"]) },
+      reads: valueOf(NGRAM_FAMILIES.reads),
+      readBytes: valueOf(NGRAM_FAMILIES.readBytes),
+    };
+  }
 
   snap.ttft = readHistogram(samples("ignis_request_ttft_seconds"), "ignis_request_ttft_seconds");
   snap.duration = readHistogram(samples("ignis_request_duration_seconds"), "ignis_request_duration_seconds");
@@ -260,6 +354,15 @@ function inContract(family: string, s: Sample): boolean {
       return s.labels.state === "capacity" || s.labels.state === "in_use";
     case "ignis_retained_slot_skips_total":
       return oneOf(SLOT_SKIP_REASONS, s.labels.reason);
+    case EXPERT_FAMILIES.hits:
+    case EXPERT_FAMILIES.misses:
+      return oneOf(EXPERT_CLASSES, s.labels.class) && oneOf(EXPERT_PHASES, s.labels.phase) && Object.keys(s.labels).length === 2;
+    case EXPERT_FAMILIES.bytesMoved:
+      return oneOf(EXPERT_PHASES, s.labels.phase) && Object.keys(s.labels).length === 1;
+    case EXPERT_FAMILIES.slots:
+      return oneOf(EXPERT_CLASSES, s.labels.class) && (s.labels.state === "capacity" || s.labels.state === "in_use") && Object.keys(s.labels).length === 2;
+    case NGRAM_FAMILIES.rows:
+      return oneOf(NGRAM_SOURCES, s.labels.source) && Object.keys(s.labels).length === 1;
     default:
       return Object.keys(s.labels).length === 0;
   }
@@ -277,6 +380,13 @@ export function counterValues(s: Snapshot): (number | null)[] {
     ...REJECT_REASONS.map((r) => s.rejected[r]),
     ...RETAINED_FAMILY_KEYS.flatMap((key) => RETAINED_TIERS.flatMap((tier) => RETAINED_KINDS.map((kind) => s.retained[key][tier][kind]))),
     ...SLOT_SKIP_REASONS.map((reason) => s.memory.slotSkips[reason]),
+    ...EXPERT_CLASSES.flatMap((cls) => EXPERT_PHASES.flatMap((phase) => [s.experts?.hits[cls][phase] ?? null, s.experts?.misses[cls][phase] ?? null])),
+    s.experts?.prefetchIssued ?? null,
+    s.experts?.prefetchUsed ?? null,
+    ...EXPERT_PHASES.map((phase) => s.experts?.bytesMoved[phase] ?? null),
+    ...NGRAM_SOURCES.map((source) => s.ngram?.rows[source] ?? null),
+    s.ngram?.reads ?? null,
+    s.ngram?.readBytes ?? null,
     s.ttft?.count ?? null,
     s.duration?.count ?? null,
   ];

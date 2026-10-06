@@ -21,6 +21,7 @@
 #ifndef IGNIS_MODEL_H
 #define IGNIS_MODEL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -81,10 +82,65 @@ struct ignis_bound_tensor {
   float input_scale_divisor;
 };
 
-/* The Qwen 3.8-27B text topology: layer kinds, head/rotary geometry, GDN
- * state widths, vocab, and the RMSNorm epsilon (ADR 0009 -- one source for
- * the leaf's per-layer op sequence and sequence-state geometry, not
- * guesses). */
+/* The model a topology describes (ADR 0043: two models, one loaded at a
+ * time; mirrors crates/core/src/compute.rs `ModelFamily`). */
+enum ignis_model_family {
+  IGNIS_MODEL_FAMILY_QWEN38_27B = 0,
+  /* Qwen3.8-Flash-Next (spec flash-next/04, GitHub #302). Its program is
+   * not built yet: a load of it is refused by name. */
+  IGNIS_MODEL_FAMILY_FLASH_NEXT = 1,
+};
+
+/* Flash-Next's blocks (GitHub #302), each all zero in a topology without
+ * it -- the 27B has none of them. Mirrors crates/core/src/compute.rs. */
+
+/* The MoE block of every layer: `experts_per_token` of `num_experts` routed
+ * SwiGLU experts of `expert_intermediate`, and a shared expert. */
+struct ignis_moe_topology {
+  uint64_t num_experts;
+  uint64_t experts_per_token;
+  uint64_t expert_intermediate;
+  uint64_t shared_expert_intermediate;
+};
+
+/* The hyper-connections: `streams` residual streams of `hidden` per token,
+ * mixed through a rank-`rank` gate. */
+struct ignis_hyper_topology {
+  uint64_t streams;
+  uint64_t rank;
+};
+
+/* The QSA indexer of every attention layer: `heads` query heads of
+ * `head_dim` over `kv_heads` compressed key heads, one key per
+ * `compress_ratio` tokens, `budget / compress_ratio` blocks selected. */
+struct ignis_indexer_topology {
+  uint64_t heads;
+  uint64_t head_dim;
+  uint64_t kv_heads;
+  uint64_t compress_ratio;
+  uint64_t budget;
+};
+
+/* The device side of the n-gram embedding (its hashing is the host's): 2- to
+ * `ngram_size`-grams of `heads_per_ngram` heads, concatenated to
+ * `embed_dim`, a causal conv of `conv_kernel` at dilation `ngram_size`,
+ * added to decoder layer `layer`'s input. */
+struct ignis_ngram_topology {
+  uint64_t ngram_size;
+  uint64_t heads_per_ngram;
+  uint64_t embed_dim;
+  uint64_t conv_kernel;
+  uint64_t layer;
+};
+
+/* The text topology: layer kinds, head/rotary geometry, GDN state widths,
+ * vocab, and the RMSNorm epsilon (ADR 0009 -- one source for the leaf's
+ * per-layer op sequence and sequence-state geometry, not guesses), and the
+ * blocks of the model `family` names.
+ *
+ * Rust binding: crates/core/src/compute.rs `IgnisTopology` (keep 1:1). The
+ * struct has no `size` field, so both sides pin its layout (the asserts
+ * below, and the Rust test beside the binding). */
 struct ignis_topology {
   uint32_t num_layers;
   const int32_t *layer_kinds; /* enum ignis_layer_kind[num_layers] */
@@ -97,16 +153,54 @@ struct ignis_topology {
   double rope_theta;
   uint64_t gdn_state_rows;
   uint64_t gdn_state_cols;
+  /* The GDN layers: exactly the layer_kinds entries that are
+   * IGNIS_LAYER_GDN. Not the GDN value-head count (`gdn_value_heads`). */
   uint64_t gdn_num_layers;
   uint64_t gdn_q_width;
   uint64_t gdn_z_width;
   uint64_t gdn_ab_width;
   uint64_t ffn_intermediate;
   float rms_norm_eps;
+  int32_t family; /* enum ignis_model_family */
+  /* The GDN value heads (GitHub #302): the length of a GDN layer's
+   * `gdn/a_log` and `gdn/dt_bias`, and the recurrence's head count. 48 on
+   * the 27B, as its GDN layers are; 48 on Flash-Next, whose GDN layers are
+   * 36. */
+  uint64_t gdn_value_heads;
+  /* One GDN value (and key) head's width: gdn_state_rows is
+   * gdn_value_heads x gdn_head_dim, and the gated norm is this wide. The
+   * recurrence runs 128; a load with GDN layers refuses another. */
+  uint64_t gdn_head_dim;
+  /* The GDN causal conv's kernel width (`linear_conv_kernel_dim`); the conv
+   * runs 4, and a load with GDN layers refuses another. */
+  uint64_t gdn_conv_kernel;
+  struct ignis_moe_topology moe;
+  struct ignis_hyper_topology hyper;
+  struct ignis_indexer_topology indexer;
+  struct ignis_ngram_topology ngram;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(struct ignis_topology) == 288,
+              "ignis_topology drifted from crates/core/src/compute.rs IgnisTopology");
+static_assert(offsetof(struct ignis_topology, rms_norm_eps) == 128 &&
+                  offsetof(struct ignis_topology, family) == 132 &&
+                  offsetof(struct ignis_topology, gdn_value_heads) == 136 &&
+                  offsetof(struct ignis_topology, gdn_head_dim) == 144 &&
+                  offsetof(struct ignis_topology, gdn_conv_kernel) == 152 &&
+                  offsetof(struct ignis_topology, moe) == 160 &&
+                  offsetof(struct ignis_topology, hyper) == 192 &&
+                  offsetof(struct ignis_topology, indexer) == 208 &&
+                  offsetof(struct ignis_topology, ngram) == 248,
+              "ignis_topology's field offsets drifted from crates/core/src/compute.rs IgnisTopology");
+#endif
 
 /* Opaque loaded-model handle. Never dereferenced across the boundary. */
 struct ignis_model;
+
+/* A Flash-Next load's expert residency (ignis_residency.h), created and
+ * filled by the caller before the load. */
+struct ignis_residency;
 
 /* The speculative backend a load selects (P5-02, GitHub #150, spec 05).
  * Speculation is engine residency, fixed for the life of the load. */
@@ -197,6 +291,15 @@ struct ignis_model_load_options {
    * most one vision item's span, as before. The caller passes the ceiling
    * its calibration measured (`LOCATE_MAX_KEYS`); capped by the context. */
   uint32_t attention_text_max_keys;
+  /* GitHub #302: Flash-Next's decode lanes -- the widest decode round, and
+   * the round graphs' widths 1..decode_lanes; the MoE workspace and the
+   * expert residency are sized by it. 0 = 3. At most 8. 0 on the 27B. */
+  uint32_t decode_lanes;
+  /* GitHub #302: Flash-Next's expert residency, BORROWED: the caller keeps
+   * it alive until ignis_model_free has returned, and frees it after. A
+   * Flash-Next load needs one; ignis_model_plan_reservations does not read
+   * it. NULL on the 27B. */
+  struct ignis_residency *residency;
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many
@@ -230,6 +333,12 @@ struct ignis_model_reservations {
   /* The DFlash2 drafter's feature taps, append counts and round scratch; 0
    * without the drafter. */
   uint64_t drafter_round_bytes;
+  /* GitHub #302: Flash-Next's activations outside the workspace -- the
+   * hyper-connection residual, the sublayer input and output, the call's
+   * staged inputs (ids, slots, positions, n-gram rows) -- and its MoE
+   * block's workspace, accumulator, router and shared-expert buffers. 0 on
+   * the 27B, whose activations live in its workspace. */
+  uint64_t activation_bytes;
 };
 
 struct ignis_model_stats {
@@ -303,7 +412,13 @@ int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors, 
  * Returns 0 and a handle in `*out_model` on success. Returns -1 (no model
  * produced; see ignis_model_last_error) on a null argument, a duplicate
  * name, a missing or extra bound tensor, a tensor whose shape does not
- * match the one `topology` implies, an invalid `prefill_chunk_tokens` /
+ * match the one `topology` implies, an inconsistent `topology` (an unknown
+ * layer kind, a GDN layer count other than its GDN layer kinds',
+ * `gdn_state_rows` other than `gdn_value_heads x gdn_head_dim`, a GDN head dim
+ * or conv kernel the GDN ops do not run, an unknown family, a Flash-Next
+ * block in a 27B topology), a Flash-Next load without its residency or with
+ * a geometry its program does not run (GitHub #302), an invalid
+ * `prefill_chunk_tokens` /
  * `max_context_tokens` / `kv_format` / `options`, or a chunk width whose
  * scratch reservation does not fit the device's free memory -- a load is
  * all-or-nothing. */

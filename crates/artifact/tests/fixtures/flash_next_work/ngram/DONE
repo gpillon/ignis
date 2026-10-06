@@ -1,0 +1,24 @@
+{
+ "files": {
+  "hot_rows.json": {
+   "bytes": 104,
+   "sha256": "bcd1df4f3de0b358e1480a7c75561a59ea44acc21412b075126a7b6186235892"
+  },
+  "hot_rows.u32": {
+   "bytes": 400,
+   "sha256": "f921c206a3e187b54289c88a32c79c87b775d59b37b9fb687aa37312ddeaebff"
+  },
+  "layer_multipliers.i64": {
+   "bytes": 24,
+   "sha256": "f5a9e21994203979e4f07882ac21a86d88556f0f5a436677c35e1923dfa61127"
+  },
+  "ngram_heads_offsets.i64": {
+   "bytes": 16,
+   "sha256": "5f33fe57d21e7e492fae46266a0416dfeb3333e8735d17647ce5862df07b83ca"
+  },
+  "ngram_heads_vocab_sizes.i64": {
+   "bytes": 16,
+   "sha256": "6ae4da10c202f653d46c7a26e5646f6de429dad9104cf0ebc000381887a81f30"
+  }
+ }
+}

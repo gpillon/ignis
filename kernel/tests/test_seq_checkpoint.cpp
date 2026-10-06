@@ -229,6 +229,7 @@ ignis_seq_pool_spec small_spec(int32_t kv_format = IGNIS_KV_FORMAT_BF16) {
   spec.max_context_tokens  = 384; // pages_for_tokens(384) == 6
   spec.slot_count          = 4;
   spec.gdn_num_layers      = 2;
+  spec.kv_num_layers = kIgnisGqaLayerCount;
   spec.gdn_conv_channels   = 6;
   spec.gdn_value_heads     = 2;
   spec.gdn_head_dim        = 4;

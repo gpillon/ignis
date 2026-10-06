@@ -20,6 +20,8 @@
 #include "layer_internal.h"
 #include "model_internal.h"
 #include "permitted_tokens.h"
+#include "step_internal.h"
+#include "flash_next/program.h"
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
@@ -1347,6 +1349,10 @@ extern "C" int32_t ignis_prefill(struct ignis_model *model, const int32_t *token
     set_error("ignis_prefill: out_token_id is null");
     return -1;
   }
+  if (model != nullptr && model->flash_next) {
+    set_error("ignis_prefill: the degenerate program is Qwen 3.8-27B's");
+    return -1;
+  }
   if (!validate_common(model, token_ids, num_tokens, sampling, skip_layers)) {
     return -1;
   }
@@ -1363,6 +1369,10 @@ extern "C" int32_t ignis_decode(struct ignis_model *model, const int32_t *token_
                                 int32_t *out_token_ids, float *out_logits) {
   if (out_token_ids == nullptr) {
     set_error("ignis_decode: out_token_ids is null");
+    return -1;
+  }
+  if (model != nullptr && model->flash_next) {
+    set_error("ignis_decode: the degenerate program is Qwen 3.8-27B's");
     return -1;
   }
   if (!validate_common(model, token_ids, batch_size, sampling, skip_layers)) {
@@ -1392,6 +1402,11 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                                            const struct ignis_sampling_params *sampling,
                                            const struct ignis_prefill_options *options,
                                            float *out_logits) {
+  // GitHub #302: a Flash-Next load runs its own program.
+  if (model != nullptr && model->flash_next) {
+    return ignis::flash_next::program_prefill(model, pool, seq, token_ids, num_tokens, start_position,
+                                              sampling, options, out_logits);
+  }
   if (!validate_program(model, pool, seq, token_ids, num_tokens, sampling)) {
     return -1;
   }
@@ -2119,6 +2134,11 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
                                           const struct ignis_sampling_params *sampling,
                                           int32_t *out_token_ids,
                                           const struct ignis_decode_options *options) {
+  // GitHub #302: a Flash-Next load runs its own program.
+  if (model != nullptr && model->flash_next) {
+    return ignis::flash_next::program_decode(model, pool, sequences, batch_size, sampling, out_token_ids,
+                                             options);
+  }
   if (model == nullptr || pool == nullptr || sequences == nullptr || sampling == nullptr ||
       out_token_ids == nullptr || batch_size == 0) {
     set_error("ignis_program_decode: null argument or empty batch");
@@ -2491,8 +2511,16 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
       model->sampling_single_out->bytes + model->sampling_decode_configs->bytes +
       model->sampling_decode_positions->bytes + model->sampling_decode_out->bytes +
       model->sampling_decode_logits->bytes + model->sampling_workspace->capacity() +
-      model->decode_graph_scratch->capacity() + model->decode_graph_token_ids->bytes +
-      model->decode_graph_slots->bytes;
+      model->decode_graph_scratch->capacity();
+  // GitHub #302: a Flash-Next model stages its decode graphs' token ids and
+  // slots in its own buffers (`FlashNextModel::token_ids`, `slots`, counted
+  // in its activations below), so these two are the 27B's alone.
+  if (model->decode_graph_token_ids != nullptr) {
+    out_stats->vram_bytes += model->decode_graph_token_ids->bytes;
+  }
+  if (model->decode_graph_slots != nullptr) {
+    out_stats->vram_bytes += model->decode_graph_slots->bytes;
+  }
   if (model->decode_rope_positions != nullptr) {
     out_stats->vram_bytes += model->decode_rope_positions->bytes;
   }
@@ -2513,6 +2541,17 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model->vision_pool.buffer != nullptr) {
     out_stats->vram_bytes += model->vision_pool.buffer->bytes;
   }
+  // GitHub #302: Flash-Next's activations and MoE buffers, and its pool's
+  // indexer and n-gram sections.
+  if (model->flash_next) {
+    out_stats->vram_bytes += ignis::flash_next::reserved(*model).activation_bytes;
+  }
+  if (pool->has_indexer()) {
+    out_stats->vram_bytes += pool->indexer_state->bytes;
+  }
+  if (pool->has_ngram_conv()) {
+    out_stats->vram_bytes += pool->ngram_conv->bytes;
+  }
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
   out_stats->graph_launches = model->last_step_graph_launches;
@@ -2530,3 +2569,34 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   out_stats->verify_graph_ready_mask = verify_ready_mask;
   return 0;
 }
+
+// GitHub #302: the program pieces Flash-Next's program shares
+// (step_internal.h), the 27B's own above.
+namespace ignis::step {
+
+void set_error(std::string message) {
+  ::set_error(std::move(message));
+}
+
+bool sampling_size_ok(const ignis_sampling_params &sampling) {
+  return ::sampling_size_ok(sampling);
+}
+
+bool unconstrained(const ignis_sampling_params &sampling) {
+  return ::unconstrained(sampling);
+}
+
+ninfer::ops::SamplingConfig to_sampling_config(const ignis_sampling_params &abi,
+                                               std::int32_t *token_counts) {
+  return ::to_sampling_config(abi, token_counts);
+}
+
+int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
+                      const ninfer::Tensor &logits, const ignis_sampling_params &sampling,
+                      std::int32_t purpose, std::int32_t position, int32_t *out_token_id,
+                      float *out_permitted_prob) {
+  return ::sample_single(model, pool, seq, logits, sampling, purpose, position, out_token_id,
+                         out_permitted_prob);
+}
+
+}  // namespace ignis::step

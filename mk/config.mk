@@ -22,6 +22,36 @@ METRICS ?= 0
 # The metrics listener (--metrics-bind). Empty = the server's 127.0.0.1:9464.
 METRICS_BIND ?=
 
+# The model (ADR 0043, spec flash-next/04): one per process, chosen at start.
+# MODEL=flash-next serves Qwen3.8-Flash-Next from its own artifact, as
+# qwen3.8-flash-next, with the defaults below (each still a knob). MODEL=27b,
+# or empty, is Qwen3.8-27B, the default. Any other value is the 27B served
+# under that id (--model), as before.
+MODEL ?=
+# The family MODEL selects, decided here once: every other place reads this.
+# The server still checks it against the artifact's own at start, and refuses
+# a served id that names the other model.
+MODEL_FAMILY := $(if $(filter flash-next,$(MODEL)),flash-next,27b)
+ifeq ($(MODEL_FAMILY),flash-next)
+  ARTIFACT ?= F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_trellis_a25-v2.ninfer
+  # 128K tokens per lane under hq-e8-2b, inside the checkpoint's 262,144
+  # trained positions (so no YaRN); 8192-token prefill chunks amortize a
+  # chunk's expert transfer (spec flash-next/03); no speculation, no vision.
+  MAX_CONTEXT ?= 131072
+  ROPE_SCALING ?= none
+  PREFILL_CHUNK ?= 8192
+  SPEC ?=
+  VISION ?=
+  # The KV-RAM arena spec flash-next/05 sizes for Flash-Next: the 38 GB of
+  # pinned experts leave no room for the 27B's 8G (the host plan refuses it).
+  KV_HOST_POOL_BYTES ?= 2G
+  # The budget is free VRAM minus this headroom, so the process plus the
+  # desktop ends at 32.6 GB - 4 GB, under spec flash-next/04 AC10's 29 GB,
+  # whatever the desktop holds; the expert cache takes the rest of it. A named
+  # VRAM_BUDGET wins: the server refuses a budget and a headroom together.
+  VRAM_HEADROOM ?= $(if $(VRAM_BUDGET),,4G)
+endif
+
 # The .ninfer container (used with CUDA=1 only). See README "Models".
 # UNCENSORED=1 takes the huihui-abliterated twin of the default image from the
 # same directory instead: the same container with the 70 matrices the
@@ -37,7 +67,6 @@ endif
 
 # Server settings. Empty = the server's own default.
 BIND ?= 127.0.0.1:8000
-MODEL ?=
 LOG_LEVEL ?=
 LOG_FORMAT ?=
 # The key /v1 requires (--api-key). Empty = no key; auto = the server

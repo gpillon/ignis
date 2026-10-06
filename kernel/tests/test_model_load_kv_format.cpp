@@ -45,13 +45,13 @@ void check(bool ok, const std::string &label) {
 }
 
 // The smallest topology that gets past every argument check ahead of the
-// kv_format one: no layers (so `layer_kinds` may be null), one GDN layer so
-// the `gdn_state_rows % gdn_num_layers` check divides.
+// kv_format one: no layers (so `layer_kinds` may be null, and no GDN layer --
+// the layer count the leaf checks against the layer kinds, GitHub #302).
 ignis_topology minimal_topology() {
   ignis_topology topology{};
   topology.num_layers     = 0;
   topology.layer_kinds    = nullptr;
-  topology.gdn_num_layers = 1;
+  topology.gdn_num_layers = 0;
   return topology;
 }
 

@@ -198,7 +198,33 @@ struct ignis_seq_pool_spec {
    * a claim from one cross PCIe, synchronized; the object's KV pages stay in
    * the device pool either way. 0 reserves none. */
   uint32_t retained_host_slot_count;
+  /* The attention layers whose K/V the pool stores, one plane run each (the
+   * topology's attention-layer count, GitHub #302): 16 on Qwen 3.8-27B, 12
+   * on Flash-Next. 1..16; the hq-e8-2b residual window and a blob's
+   * geometry follow it. */
+  uint32_t kv_num_layers;
+  /* Flash-Next's QSA indexer section (GitHub #302), one per attention
+   * layer, or 0 and 0 for none (the 27B): the BF16 elements of one
+   * compressed block key, and the tokens a block compresses (a divisor of
+   * the 64-token KV page). Complete blocks' keys live beside the KV pages,
+   * `64 / indexer_compress_tokens` per physical page; the incomplete
+   * block's raw keys, up to `indexer_compress_tokens - 1`, per slot. */
+  uint32_t indexer_key_dim;
+  uint32_t indexer_compress_tokens;
+  /* Flash-Next's n-gram embedding conv state (GitHub #302), per slot: its
+   * past input columns of `ngram_conv_channels` BF16 each, or 0 and 0 for
+   * none. */
+  uint32_t ngram_conv_columns;
+  uint32_t ngram_conv_channels;
+  /* A pool with either section holds no retained slot and takes no
+   * snapshot, clone or prefix: those carry the sections the table in
+   * ignis_seq_sections.h lists, and these are not in it yet (spec
+   * flash-next/05). */
 };
+#ifdef __cplusplus
+static_assert(sizeof(struct ignis_seq_pool_spec) == 76,
+              "ignis_seq_pool_spec drifted from crates/core/src/seq.rs IgnisSeqPoolSpec");
+#endif
 
 struct ignis_seq_pool_stats {
   uint32_t kv_page_group_count;
@@ -245,6 +271,10 @@ struct ignis_seq_pool_stats {
    * above. */
   uint32_t retained_host_slot_count;
   uint64_t retained_host_bytes;
+  /* Flash-Next's sections (GitHub #302), 0 without them: the indexer's
+   * block keys and tails, and the n-gram conv state. */
+  uint64_t indexer_bytes;
+  uint64_t ngram_conv_bytes;
 };
 
 /* What a pool built from a spec occupies, planned without building it
@@ -264,6 +294,10 @@ struct ignis_seq_pool_plan {
   /* = ignis_seq_pool_stats::retained_host_bytes of the built pool (GitHub
    * #281): pinned host memory, not device. */
   uint64_t retained_host_bytes;
+  /* = ignis_seq_pool_stats::indexer_bytes and ::ngram_conv_bytes of the
+   * built pool (GitHub #302). */
+  uint64_t indexer_bytes;
+  uint64_t ngram_conv_bytes;
 };
 
 struct ignis_seq_stats {
@@ -328,6 +362,12 @@ void ignis_seq_release(struct ignis_seq_pool *pool, struct ignis_seq *seq);
  * argument. */
 int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq_stats *out_stats);
 
+/* The token the sequence's next decode round consumes and emits -- the
+ * successor its prefill or its last round drew -- or -1 for a null sequence
+ * or one not prefilled yet (GitHub #302: a Flash-Next round needs each
+ * lane's n-gram rows for it, hashed on the host before the round). */
+int32_t ignis_seq_pending_token(const struct ignis_seq *seq);
+
 /* --- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
  *
  * On ADR 0016: it rules that "later phases add fields, not parameters and
@@ -350,6 +390,11 @@ int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq_stats *out
  * ignis_seq_restore, never reinterpreted, so a caller that persists blobs
  * across builds records this alongside them. */
 uint32_t ignis_seq_snapshot_format_version(void);
+
+/* The blob layout version `pool` writes and accepts (GitHub #303): per model
+ * family -- the 27B's above, or Flash-Next's own numbering for a pool with
+ * its indexer and n-gram sections. 0 for a null pool. */
+uint32_t ignis_seq_pool_snapshot_format_version(const struct ignis_seq_pool *pool);
 
 /* Bytes ignis_seq_snapshot would write for `seq` as it stands now.
  *
@@ -789,6 +834,36 @@ int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr);
  * reported on stderr and ignored, since a free has nowhere to return a
  * code. */
 void ignis_host_pinned_free(void *ptr);
+
+/* --- an owned KV-RAM arena (GitHub #303, spec flash-next/05) -------------
+ *
+ * The same first-fit pinned arena, owned by whoever creates it rather than
+ * held by the process: a Flash-Next model instance pins its own and frees it
+ * on its drop path, so nothing of its host tier outlives the model (spec
+ * flash-next/05's no-singleton rule; the process-wide arena above stays the
+ * 27B's). Each arena has its own lock, so a blob may be released from any
+ * thread. */
+struct ignis_host_arena;
+
+/* Pin an arena of `bytes` (positive). Returns 0 and the arena in `out`;
+ * -1 on a null `out`, a `bytes` of 0, or a pinned allocation the host
+ * refuses (see ignis_seq_last_error). */
+int32_t ignis_host_arena_create(uint64_t bytes, struct ignis_host_arena **out);
+
+/* Release the arena and its pinned memory. Every region taken from it must
+ * already be released. NULL is a no-op. */
+void ignis_host_arena_free(struct ignis_host_arena *arena);
+
+/* ignis_host_pinned_pool_stats, ignis_host_pinned_can_alloc,
+ * ignis_host_pinned_alloc and ignis_host_pinned_free, for one arena: the
+ * same codes, IGNIS_SEQ_ERR_NO_HOST_ROOM included. A null arena is -1 (and
+ * a no-op for the release). */
+int32_t ignis_host_arena_stats(struct ignis_host_arena *arena, uint64_t *out_capacity,
+                               uint64_t *out_used);
+int32_t ignis_host_arena_can_alloc(struct ignis_host_arena *arena, uint64_t bytes,
+                                   int32_t *out_fits);
+int32_t ignis_host_arena_alloc(struct ignis_host_arena *arena, uint64_t bytes, void **out_ptr);
+void ignis_host_arena_release(struct ignis_host_arena *arena, void *ptr);
 
 /* The message from the most recent failing call on this thread
  * (thread-local; overwritten by the next call; empty string if none failed

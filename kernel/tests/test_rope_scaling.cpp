@@ -122,7 +122,7 @@ ignis_topology no_layer_topology() {
   topology.hidden = 5120;
   topology.vocab = 248320;
   topology.ffn_intermediate = 17408;
-  topology.gdn_num_layers = 1;
+  topology.gdn_num_layers = 0;
   return topology;
 }
 

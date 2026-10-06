@@ -269,3 +269,35 @@ on the card at a time.
 - The FP8 linear (spec 04) and the expert GEMM share the epilogue conventions
   (fp32 accumulate, BF16 out). Keep them consistent so the combine can fuse
   later.
+
+## Departures (2026-10-05, implementation of #300)
+
+Recorded where the built ops differ from the text above, with the reason; the coordinator
+accepted each.
+
+- **Router rounding.** The logits accumulate in fp32 and are then rounded to BF16, and the
+  routing weights are rounded to BF16 after the softmax over the ten, because that is what the
+  checkpoint's transformers router does (measured by
+  `kernel/tests/fixtures/flash_next/record.py`: BF16 logits, ties kept at the lower index,
+  BF16 weights). Selection therefore follows the oracle, including its ties.
+- **FP16 tensor cores, not BF16.** The decoded trellis weight is exact in fp16 (it is
+  `reconstruct`'s fp16 value) but not in BF16, so the expert MMAs run in fp16. Activations enter
+  as BF16, are rotated in fp32 and scaled per row by a power of two into fp16 range for the
+  operand, and the scale is undone exactly in the epilogue.
+- **Fixed-point accumulation.** The routed experts' cross-unit and cross-expert sums go through
+  an int64 accumulator with 32 fractional bits instead of fp32 partials, so the result is exact
+  and independent of the order atomics land in (Acceptance 5's determinism). A contribution that
+  is not finite, or too large for the format, traps.
+- **The slot trap is always on**, not only in debug builds: a selected projection with no record,
+  or an expert id outside [0, 512), stops the kernel in every build. Residency writes an absent
+  entry (record NULL) when it evicts, never a stale address.
+- **Decode serves 1 to 8 tokens** in its one launch (the spec asks for 1 to 3); the workspace's
+  decode regions are sized from the load's lane count.
+- **The FP8 row-scale linear** (spec 04's op) is hosted in the MoE leaf
+  (`kernel/include/ignis_fp8_linear.h`) because the shared expert needed it first; it takes the
+  container's BF16 row scales (`FP8_E4M3FN_ROW_BF16S`, layout.md §6.1), not fp32 ones.
+- **Small prefill groups** take a narrow tile layout (one m16 block, all eight warps along the
+  columns) inside the same launch rather than a separate kernel.
+- **The decode floor** (Acceptance 6, 50% of the DRAM roofline) is not met: 33.5% at one token
+  (`docs/findings/2026-10-05-moe-decode-is-structure-bound.md`). Its check is the opt-in
+  `ignis_kernel_moe_bench --check-floor`, not a CTest, while the criterion is open.

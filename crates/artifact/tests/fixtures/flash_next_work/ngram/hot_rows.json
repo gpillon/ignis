@@ -1,0 +1,8 @@
+{
+ "rows": 100,
+ "bytes": 9000,
+ "table_rows": 1000,
+ "row_bytes": 90,
+ "shards": 2,
+ "complete": true
+}

@@ -53,6 +53,10 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct IgnisSeq([u8; 1]);
 
+    /// Opaque owned KV-RAM arena (GitHub #303).
+    #[repr(C)]
+    pub struct IgnisHostArena([u8; 1]);
+
     /// Opaque shared-prefix handle (P4-10, GitHub #126).
     #[repr(C)]
     pub struct IgnisSeqPrefix([u8; 1]);
@@ -89,6 +93,17 @@ pub(crate) mod ffi {
         /// Host retained slots after them (GitHub #281): their images in one
         /// pinned host block reserved at pool create.
         pub retained_host_slot_count: u32,
+        /// The attention layers the pool stores K/V for (GitHub #302): the
+        /// topology's attention-layer count.
+        pub kv_num_layers: u32,
+        /// Flash-Next's indexer section (GitHub #302): one compressed key's
+        /// BF16 elements and the tokens a block compresses; 0 and 0 for none.
+        pub indexer_key_dim: u32,
+        pub indexer_compress_tokens: u32,
+        /// Flash-Next's n-gram conv state (GitHub #302): columns and
+        /// channels per slot; 0 and 0 for none.
+        pub ngram_conv_columns: u32,
+        pub ngram_conv_channels: u32,
     }
 
     /// 1:1 with `struct ignis_seq_pool_stats`.
@@ -127,6 +142,10 @@ pub(crate) mod ffi {
         /// block -- host memory, in none of the device lines above.
         pub retained_host_slot_count: u32,
         pub retained_host_bytes: u64,
+        /// Flash-Next's sections (GitHub #302): the indexer's block keys
+        /// and tails, and the n-gram conv state; 0 without them.
+        pub indexer_bytes: u64,
+        pub ngram_conv_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_seq_pool_plan` (GitHub #210): what a pool
@@ -143,6 +162,9 @@ pub(crate) mod ffi {
         pub hq_residual_bytes: u64,
         /// The host retained slots' pinned block (GitHub #281).
         pub retained_host_bytes: u64,
+        /// Flash-Next's indexer and n-gram sections (GitHub #302).
+        pub indexer_bytes: u64,
+        pub ngram_conv_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_alloc_count` (GitHub #211).
@@ -221,8 +243,10 @@ pub(crate) mod ffi {
         pub fn ignis_seq_release(pool: *mut IgnisSeqPool, seq: *mut IgnisSeq);
 
         pub fn ignis_seq_stats(seq: *const IgnisSeq, out_stats: *mut IgnisSeqStats) -> i32;
+        pub fn ignis_seq_pending_token(seq: *const IgnisSeq) -> i32;
 
         pub fn ignis_seq_snapshot_format_version() -> u32;
+        pub fn ignis_seq_pool_snapshot_format_version(pool: *const IgnisSeqPool) -> u32;
 
         pub fn ignis_seq_snapshot_size(
             pool: *const IgnisSeqPool,
@@ -366,6 +390,19 @@ pub(crate) mod ffi {
         /// Return a region [`ignis_host_pinned_alloc`] gave out to the
         /// arena. NULL is a no-op.
         pub fn ignis_host_pinned_free(ptr: *mut c_void);
+
+        /// An owned KV-RAM arena (GitHub #303): the process-wide arena's
+        /// calls, for one arena its creator frees. `bytes` must be positive.
+        pub fn ignis_host_arena_create(bytes: u64, out: *mut *mut IgnisHostArena) -> i32;
+        pub fn ignis_host_arena_free(arena: *mut IgnisHostArena);
+        pub fn ignis_host_arena_stats(
+            arena: *mut IgnisHostArena,
+            out_capacity: *mut u64,
+            out_used: *mut u64,
+        ) -> i32;
+        pub fn ignis_host_arena_can_alloc(arena: *mut IgnisHostArena, bytes: u64, out_fits: *mut i32) -> i32;
+        pub fn ignis_host_arena_alloc(arena: *mut IgnisHostArena, bytes: u64, out_ptr: *mut *mut c_void) -> i32;
+        pub fn ignis_host_arena_release(arena: *mut IgnisHostArena, ptr: *mut c_void);
     }
 
     // Test-only diagnostic seam (`kernel/include/ignis_kv_capture.h`,
@@ -521,6 +558,11 @@ fn pool_spec(
         speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
         retained_slot_count: budget.retained_slot_count,
         retained_host_slot_count: budget.retained_host_slot_count,
+        kv_num_layers: cfg.attention_layer_count() as u32,
+        indexer_key_dim: cfg.indexer.map_or(0, |i| (i.kv_heads * i.head_dim) as u32),
+        indexer_compress_tokens: cfg.indexer.map_or(0, |i| i.compress_ratio as u32),
+        ngram_conv_columns: cfg.ngram.map_or(0, |n| n.conv_state_tokens() as u32),
+        ngram_conv_channels: cfg.ngram.map_or(0, |_| cfg.residual_width() as u32),
     }
 }
 
@@ -601,6 +643,14 @@ impl SeqPool {
             return Err(last_error());
         }
         Ok(plan)
+    }
+
+    /// The snapshot blob format version this pool writes and accepts: the
+    /// 27B layout's [`snapshot_format_version`], or Flash-Next's own when
+    /// the pool carries its indexer and n-gram sections (spec flash-next/05).
+    /// A blob identity names this one, so a blob never crosses families.
+    pub fn snapshot_format_version(&self) -> u32 {
+        unsafe { ffi::ignis_seq_pool_snapshot_format_version(self.handle) }
     }
 
     /// Pool-wide geometry + live usage.
@@ -992,6 +1042,14 @@ impl<'a> Seq<'a> {
         let rc = unsafe { ffi::ignis_seq_stats(self.handle, &mut stats) };
         assert_eq!(rc, 0, "ignis_seq_stats: null handle (unreachable — Seq always holds one)");
         stats
+    }
+
+    /// The token this sequence's next decode round consumes and emits,
+    /// or `None` before its prefill (GitHub #302: the host hashes its n-gram
+    /// rows before the round).
+    pub fn pending_token(&self) -> Option<i32> {
+        let token = unsafe { ffi::ignis_seq_pending_token(self.handle) };
+        (token >= 0).then_some(token)
     }
 
     /// Bytes a snapshot of this sequence costs **as it stands now** (ADR
@@ -1440,9 +1498,182 @@ impl Drop for PinnedBuffer {
 // handle in this module.
 unsafe impl Send for PinnedBuffer {}
 
+/// A KV-RAM arena its owner holds (GitHub #303, spec flash-next/05): the
+/// same first-fit pinned region as [`HostPinnedPool`], pinned once at load,
+/// but owned by one model instance and freed when the last thing holding it
+/// drops, rather than held by the process. Flash-Next's host tier lives in
+/// one, so nothing of it outlives the model (spec flash-next/05's
+/// no-singleton rule).
+///
+/// Shared by `Arc`: every [`ArenaBuffer`] taken from it holds the arena, so
+/// a blob can never outlive the region it sits in, whatever order the maps
+/// holding them drop in.
+#[derive(Debug)]
+pub struct HostArena {
+    handle: *mut ffi::IgnisHostArena,
+}
+
+// The leaf's arena takes its own lock on every call, so it may be used and
+// freed into from any thread.
+unsafe impl Send for HostArena {}
+unsafe impl Sync for HostArena {}
+
+impl HostArena {
+    /// Pin `bytes` (positive). The error names the size and the flag that
+    /// sets it, as [`HostPinnedPool::create`]'s does.
+    pub fn create(bytes: u64) -> Result<std::sync::Arc<Self>, String> {
+        let mut handle = std::ptr::null_mut();
+        let rc = unsafe { ffi::ignis_host_arena_create(bytes, &mut handle) };
+        if rc != 0 || handle.is_null() {
+            return Err(format!(
+                "KV-RAM arena of {bytes} bytes: {} \
+                 (--kv-host-pool-bytes sets this size; 0 disables the tier)",
+                last_error()
+            ));
+        }
+        Ok(std::sync::Arc::new(Self { handle }))
+    }
+
+    /// The arena's capacity and the bytes its live blobs hold (what they
+    /// asked for, as [`host_pool_stats`] counts).
+    pub fn stats(&self) -> (u64, u64) {
+        let (mut capacity, mut used) = (0u64, 0u64);
+        let rc = unsafe { ffi::ignis_host_arena_stats(self.handle, &mut capacity, &mut used) };
+        assert_eq!(rc, 0, "ignis_host_arena_stats: no argument is null");
+        (capacity, used)
+    }
+
+    /// Whether a blob of `bytes` would find a free span right now: `false`
+    /// when the arena is full or fragmented, and for a `bytes` of 0.
+    pub fn fits(&self, bytes: u64) -> bool {
+        let mut fits = 0i32;
+        let rc = unsafe { ffi::ignis_host_arena_can_alloc(self.handle, bytes, &mut fits) };
+        rc == 0 && fits != 0
+    }
+
+    /// Place `bytes` in the arena, not zeroed (a snapshot overwrites every
+    /// byte before it is read back).
+    pub fn alloc(self: &std::sync::Arc<Self>, bytes: u64) -> Result<ArenaBuffer, PinnedAllocError> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { ffi::ignis_host_arena_alloc(self.handle, bytes, &mut ptr) };
+        if rc == NO_HOST_ROOM {
+            return Err(PinnedAllocError::NoRoom);
+        }
+        if rc != 0 || ptr.is_null() {
+            return Err(PinnedAllocError::Failed(last_error()));
+        }
+        Ok(ArenaBuffer { arena: std::sync::Arc::clone(self), ptr, len: bytes as usize })
+    }
+}
+
+impl Drop for HostArena {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_host_arena_free(self.handle) };
+    }
+}
+
+/// A span of a [`HostArena`], released to it on drop. Holds the arena, so
+/// the region outlives the buffer.
+pub struct ArenaBuffer {
+    arena: std::sync::Arc<HostArena>,
+    ptr: *mut c_void,
+    len: usize,
+}
+
+impl std::ops::Deref for ArenaBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // Safety: `ptr` is a live span of `len` bytes of `arena`, which this
+        // buffer keeps alive; released only in `Drop`.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for ArenaBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // Safety: see `Deref` above; `&mut self` guarantees exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
+    }
+}
+
+impl AsRef<[u8]> for ArenaBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsMut<[u8]> for ArenaBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
+impl Drop for ArenaBuffer {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_host_arena_release(self.arena.handle, self.ptr) };
+    }
+}
+
+// `Send` as `PinnedBuffer`: one owner at a time, and the arena it returns to
+// takes its own lock.
+unsafe impl Send for ArenaBuffer {}
+
 // A `Seq` is moved into the scheduler's `Mutex`-guarded live-sequence map
 // (never accessed from more than one thread at a time — the engine drives
 // every `Compute` call under its own single-owner lock, mirroring
 // `SeqPool`'s documented single-thread-driver contract above) but never
 // shared by reference across threads, so only `Send` is asserted.
 unsafe impl Send for Seq<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compute::ModelConfig;
+
+    /// `struct ignis_seq_pool_spec` has no `size` field: both sides pin it
+    /// (`kernel/include/ignis_seq.h` static_asserts the same 60 bytes).
+    #[test]
+    fn the_pool_spec_mirror_is_the_leafs_size() {
+        assert_eq!(std::mem::size_of::<ffi::IgnisSeqPoolSpec>(), 76);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisSeqPoolSpec, kv_num_layers), 56);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisSeqPoolSpec, ngram_conv_channels), 72);
+    }
+
+    /// GitHub #302: a pool holds the K/V of the topology's attention layers.
+    #[test]
+    fn a_pool_stores_the_topologys_attention_layers() {
+        let budget = SeqPoolBudget {
+            kv_format: crate::KvFormat::HqE8_2b,
+            kv_page_group_count: 8,
+            max_context_tokens: 512,
+            slot_count: 3,
+            retained_slot_count: 0,
+            retained_host_slot_count: 0,
+        };
+        assert_eq!(pool_spec(&ModelConfig::qwen38_27b(), &budget, None).kv_num_layers, 16);
+        let flash = pool_spec(&ModelConfig::qwen38_flash_next(), &budget, None);
+        assert_eq!((flash.kv_num_layers, flash.num_kv_heads, flash.head_dim), (12, 2, 256));
+        assert_eq!((flash.gdn_num_layers, flash.gdn_value_heads), (36, 48));
+    }
+
+    /// GitHub #302: a Flash-Next pool carries the indexer's 128-wide keys of
+    /// 4-token blocks and the n-gram conv's 9 columns of 4 x 2560; the 27B's
+    /// carries neither.
+    #[test]
+    fn a_flash_next_pool_carries_the_indexer_and_ngram_sections() {
+        let budget = SeqPoolBudget {
+            kv_format: crate::KvFormat::HqE8_2b,
+            kv_page_group_count: 8,
+            max_context_tokens: 512,
+            slot_count: 3,
+            retained_slot_count: 0,
+            retained_host_slot_count: 0,
+        };
+        let flash = pool_spec(&ModelConfig::qwen38_flash_next(), &budget, None);
+        assert_eq!((flash.indexer_key_dim, flash.indexer_compress_tokens), (128, 4));
+        assert_eq!((flash.ngram_conv_columns, flash.ngram_conv_channels), (9, 10_240));
+        let dense = pool_spec(&ModelConfig::qwen38_27b(), &budget, None);
+        assert_eq!((dense.indexer_key_dim, dense.indexer_compress_tokens), (0, 0));
+        assert_eq!((dense.ngram_conv_columns, dense.ngram_conv_channels), (0, 0));
+    }
+}

@@ -86,6 +86,9 @@ pub(crate) mod ffi {
         /// summed from has to come from somewhere, and this is the cheapest
         /// thing that is not the host reading logits (ADR 0034).
         pub out_permitted_probs: *mut f32,
+        /// GitHub #302: each lane's n-gram table rows on a Flash-Next load,
+        /// host `[batch][16][90]`; null on the 27B.
+        pub ngram_rows: *const u8,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -150,6 +153,9 @@ pub(crate) mod ffi {
         /// host, `[attention_set_count][attention_key_count]`, or null. With
         /// rows the grid's columns may be 0 and the neighbours null.
         pub out_attention_set_rows: *mut f32,
+        /// GitHub #302: the span's n-gram table rows on a Flash-Next load,
+        /// host `[num_tokens][16][90]`; null on the 27B.
+        pub ngram_rows: *const u8,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -607,6 +613,7 @@ impl PrefillRoute {
             out_attention_set_neighbours: std::ptr::null_mut(),
             out_span_logits: std::ptr::null_mut(),
             out_attention_set_rows: std::ptr::null_mut(),
+            ngram_rows: std::ptr::null(),
         }
     }
 }
@@ -806,6 +813,153 @@ pub fn prefill_program_span_logits(
         return Err(last_error());
     }
     Ok(())
+}
+
+/// GitHub #302: one token's n-gram table rows on Flash-Next, as the leaf
+/// reads them: 16 heads of 90-byte INT4 rows (layout.md 7.1), 1,440 bytes.
+pub fn flash_next_ngram_token_bytes() -> usize {
+    let ngram = crate::compute::ModelConfig::qwen38_flash_next().ngram.expect("Flash-Next has the n-gram embedding");
+    let head_dim = ngram.head_dim() as usize;
+    ngram.heads() as usize * (head_dim / 2 + head_dim / 32 * 2)
+}
+
+/// GitHub #302: one span of a Flash-Next sequence, its last position's
+/// successor drawn under `sampling` (restricted to `permitted` when it is
+/// not empty), with the span's n-gram table rows (`ngram_rows`:
+/// `[token_ids.len()][16][90]`, as `NgramTable::begin(..).finish(..)` stages
+/// them) and, with `out_span_logits`, the BF16 logits of every position
+/// (`[token_ids.len()][vocab]`, as [`prefill_program_span_logits`]); with
+/// `out_logits`, the last position's logits as floats. Returns the drawn
+/// token's probability within its permitted set (0 without one).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_flash_next(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    sampling: SamplingParams,
+    permitted: &[i32],
+    ngram_rows: &[u8],
+    out_span_logits: Option<&mut [u16]>,
+    out_logits: Option<&mut [f32]>,
+) -> Result<f32, String> {
+    // Exact lengths: the leaf reads and writes these buffers by the span's
+    // own count, never by the slices' (no over-read or over-write in C).
+    let vocab = crate::compute::ModelConfig::qwen38_flash_next().vocab as usize;
+    if token_ids.is_empty() || ngram_rows.len() != token_ids.len() * flash_next_ngram_token_bytes() {
+        return Err(format!(
+            "prefill_flash_next: {} n-gram row bytes for {} tokens of {} bytes",
+            ngram_rows.len(),
+            token_ids.len(),
+            flash_next_ngram_token_bytes()
+        ));
+    }
+    if let Some(rows) = &out_span_logits {
+        if rows.len() != token_ids.len() * vocab {
+            return Err(format!(
+                "prefill_flash_next: {} span logits for {} tokens of {vocab} columns",
+                rows.len(),
+                token_ids.len()
+            ));
+        }
+    }
+    if let Some(row) = &out_logits {
+        if row.len() < vocab {
+            return Err(format!("prefill_flash_next: a logits row of {} for {vocab} columns", row.len()));
+        }
+    }
+    let mut probability = 0.0f32;
+    let span_logits = match out_span_logits {
+        Some(rows) => rows.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+    let options = ffi::IgnisPrefillOptions {
+        out_span_logits: span_logits,
+        out_permitted_prob: &mut probability,
+        ngram_rows: ngram_rows.as_ptr(),
+        ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
+    };
+    let params = permitted_params("prefill_flash_next", sampling, permitted)?;
+    let logits = match out_logits {
+        Some(row) => row.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &params,
+            &options,
+            logits,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(probability)
+}
+
+/// GitHub #302: one Flash-Next decode round, each lane drawn under its own
+/// sampling parameters and permitted set (`lanes`, parallel to
+/// `sequences`), with each lane's n-gram table rows for the token it
+/// consumes (`ngram_rows`: `[sequences.len()][16][90]`, its pending token's
+/// rows). Returns each lane's emitted token and its probability within its
+/// permitted set (0 without one).
+pub fn decode_flash_next(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[(SamplingParams, &[i32])],
+    ngram_rows: &[u8],
+) -> Result<Vec<(i32, f32)>, String> {
+    if lanes.len() != sequences.len() {
+        return Err(format!("decode_flash_next: {} lanes' sampling for {} sequences", lanes.len(), sequences.len()));
+    }
+    if ngram_rows.len() != sequences.len() * flash_next_ngram_token_bytes() {
+        return Err(format!(
+            "decode_flash_next: {} n-gram row bytes for {} lanes of {} bytes",
+            ngram_rows.len(),
+            sequences.len(),
+            flash_next_ngram_token_bytes()
+        ));
+    }
+    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    let params = lanes
+        .iter()
+        .map(|(sampling, permitted)| permitted_params("decode_flash_next", *sampling, permitted))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut probabilities = vec![0.0f32; handles.len()];
+    let options = ffi::IgnisDecodeOptions {
+        size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
+        speculative_window: 0,
+        drafts: std::ptr::null(),
+        draft_counts: std::ptr::null(),
+        out_committed_counts: std::ptr::null_mut(),
+        out_extents: std::ptr::null_mut(),
+        out_permitted_probs: probabilities.as_mut_ptr(),
+        ngram_rows: ngram_rows.as_ptr(),
+    };
+    let mut tokens = vec![-1; handles.len()];
+    let rc = unsafe {
+        ffi::ignis_program_decode(
+            model.handle(),
+            pool.handle(),
+            handles.as_mut_ptr(),
+            handles.len() as u64,
+            params.as_ptr(),
+            tokens.as_mut_ptr(),
+            &options,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(tokens.into_iter().zip(probabilities).collect())
 }
 
 /// Emit one greedy token for each sequence and prepare the following round.
@@ -1034,6 +1188,7 @@ pub fn decode_program_batch_permitted(
         out_committed_counts: std::ptr::null_mut(),
         out_extents: std::ptr::null_mut(),
         out_permitted_probs: probabilities.as_mut_ptr(),
+        ngram_rows: std::ptr::null(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -1161,6 +1316,7 @@ pub fn decode_program_verify_runs(
         // GitHub #242: a verify round refuses a permitted set outright, so
         // there is no probability for it to report.
         out_permitted_probs: std::ptr::null_mut(),
+        ngram_rows: std::ptr::null(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(

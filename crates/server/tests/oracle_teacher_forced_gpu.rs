@@ -50,7 +50,7 @@ use ignis_core::step::prefill_program;
 
 use ignis_bench::oracle::{
     Fixture, G1_AGREEMENT_FLOOR, TeacherForcedResult, meets_g1_floor,
-    overall_teacher_forced_agreement, score_teacher_forced,
+    overall_teacher_forced_agreement, score_canary,
 };
 
 use ignis_server::artifact_template::ArtifactTemplateProvider;
@@ -140,10 +140,17 @@ fn teacher_forced_canary_agreement_meets_the_g1_floor() {
     let mut results: Vec<TeacherForcedResult> = Vec::with_capacity(fixture.prompts.len());
 
     for canary in &fixture.prompts {
-        let prompt_tokens: Vec<i32> = provider
-            .apply_chat_template(&[ChatMessage::text("user", canary.prompt.clone())], &thinking, &[])
+        // A fixture that recorded its rendered prompt (Flash-Next's,
+        // docs/specs/flash-next/layout.md §11) is fed exactly that; the 27B's
+        // canary text is rendered with the artifact's template.
+        let prompt_tokens: Vec<i32> = canary
+            .prompt_tokens(|text| {
+                provider
+                    .apply_chat_template(&[ChatMessage::text("user", text.to_string())], &thinking, &[])
+                    .map(|rendered| rendered.tokens)
+                    .map_err(|e| format!("{e:?}"))
+            })
             .expect("render canary prompt")
-            .tokens
             .into_iter()
             .map(|id| i32::try_from(id).expect("token id fits i32"))
             .collect();
@@ -225,7 +232,10 @@ fn teacher_forced_canary_agreement_meets_the_g1_floor() {
             position += 1;
         }
 
-        let result = score_teacher_forced(&canary.id, &canary.token_ids, &predictions, FIRST_N);
+        // Scored against the fixture's expected-argmax column when it has one
+        // (spec flash-next/04), else against the fed tokens, as ADR 0014 scores.
+        let result = score_canary(canary, &predictions, FIRST_N)
+            .unwrap_or_else(|e| panic!("{}: {e}", canary.id));
         for m in &result.mismatches {
             eprintln!(
                 "G1 {} position {}: mismatch -- ours={:?} oracle={}",

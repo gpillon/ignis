@@ -16,6 +16,10 @@ tracing = { workspace = true }
 # (`tools/locate-sets/compress.py`), with Python's leftmost-first semantics.
 # Already in the lock through `tracing-subscriber`.
 regex = "1"
+# The Flash-Next artifact's sidecar (`<artifact>.conversion.json`, GitHub
+# #302): the converter's calibration expert traffic the residency's pools
+# are split by. Already a dependency of ignis-artifact.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
@@ -23,7 +27,6 @@ tracing-subscriber = { workspace = true }
 # committed hq-e8-2b KV row fixture, never a production dependency (same
 # version crates/bench already pins for its own oracle/trace hashing).
 sha2 = "0.10"
-serde_json = { workspace = true }
 
 [features]
 # Forwards to the artifact crate's `cuda` feature (the VRAM materialization

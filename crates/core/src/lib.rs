@@ -37,6 +37,9 @@ pub mod checkpoint;
 pub mod compute;
 pub mod concrete;
 pub mod decision;
+#[cfg(feature = "cuda")]
+pub mod flash_next;
+pub mod flash_next_counters;
 pub mod gdn;
 #[cfg(feature = "cuda")]
 pub mod gdn_layer;
@@ -52,10 +55,15 @@ pub mod locate;
 pub mod mock;
 #[cfg(feature = "cuda")]
 pub mod model_load;
+#[cfg(feature = "cuda")]
+pub mod moe;
+pub mod ngram;
+pub mod ngram_table;
 pub mod pointing;
 pub mod prefix;
 pub mod constrained;
 pub mod request;
+pub mod residency;
 pub mod retained_slot;
 pub mod rope_scaling;
 pub mod scheduler;
@@ -92,7 +100,7 @@ pub use kv_format::{
     DEFAULT_KV_POOL_BYTES, KV_PAGE_TOKENS, KvBudgetTooSmall, KvFormat, KvGeometry, KvPlaneDtype,
     KvPlaneSpec, KvPoolPlan, auto_kv_pool_bytes, plan_kv_pool, plan_kv_pool_for_context,
 };
-pub use mock::MockCompute;
+pub use mock::{MockCompute, MockSections};
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
 pub use retained_slot::{

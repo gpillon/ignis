@@ -1,0 +1,12 @@
+{
+ "files": {
+  "shard_000.int4": {
+   "bytes": 45000,
+   "sha256": "153a8046cc7e3bf3834de3f58aa43011e537a6714e2bc72bcfbf3a8e6a98e7a5"
+  },
+  "shard_001.int4": {
+   "bytes": 45000,
+   "sha256": "db33ef052458a356c69dbaf384e130c1048a8cf58830eb34610fc23c3a16f415"
+  }
+ }
+}

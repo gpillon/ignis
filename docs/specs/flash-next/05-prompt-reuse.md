@@ -35,6 +35,31 @@ GitHub, not open questions.
   transformers modeling code at the ticket's start; they are checks, not open
   decisions.
 
+## Departures (2026-10-05, implementation)
+
+Found while building the leaf side (#303); the coordinator may veto.
+
+- **The n-gram id context is stored, 8 bytes of it.** Story 17 and "The
+  n-gram embedding across a claim" say no id context is stored, because a
+  claim's first tokens can be hashed from the prompt's own preceding tokens.
+  That holds for a claim, but the leaf's seam hands a claim no preceding
+  tokens, and a live sequence evicted to KV-RAM and restored has no prompt
+  to hash from at all. So the leaf keeps each sequence's context (its last
+  two token ids) beside its pool state: a prefix and a checkpoint keep the
+  context at their end, and every blob carries it in a 256-byte block before
+  the pool's bytes. The content match still guarantees it equals what the
+  prompt would give; the claim's bit-exactness test checks it.
+- **The indexer tail is an image section, not part of a KV tail page** (the
+  section table above already says so): only complete blocks' keys ride the
+  pages.
+- **The KV-RAM arena is the model instance's own** (`HostArena`, the same
+  first-fit pinned region as the 27B's process-wide one), created at load and
+  freed when its last blob and the leaf have gone; the 27B keeps the
+  process-wide arena unchanged.
+- **Retained pages are pool lines.** The pool holds one KV page per retained
+  slot beside every lane's whole context, as the 27B's (a checkpoint keeps the
+  page its opener ends inside).
+
 ## Problem Statement
 
 On Flash-Next a prefill is bound by PCIe, not by compute. Every chunk streams
@@ -68,14 +93,22 @@ What changes is the state, and the memory it has to fit in.
 **The mutable image of a Flash-Next sequence** is what a checkpoint copies
 beyond its shared KV pages:
 
-| section | size per sequence |
+| section | bytes per sequence |
 |---|---|
-| GDN recurrent state: 36 layers × 48 V heads × 128 × 128, fp32 | 108 MiB |
-| GDN conv taps: 36 layers, 3 taps × 10,240 channels | ~2-4 MiB |
-| n-gram embedding conv state: the last 9 positions (kernel 4, dilation 3) × 2560 | ~45 KiB |
-| penalty-count row (vocab 248,320) | ~1 MiB |
-| hq-e8-2b residual window: 12 layers × 2 KV heads, the 27B's window length | ~12.75 MiB |
-| **total** | **≈ 124 MiB** |
+| GDN recurrent state: 36 layers × 48 V heads × 128 × 128, fp32 | 113,246,208 (108 MiB) |
+| GDN conv taps: 36 layers, 3 BF16 taps × 10,240 channels | 2,211,840 (2.11 MiB) |
+| n-gram embedding conv state: the last 9 positions (kernel 4, dilation 3) × 4 streams × 2560, BF16 | 184,320 (180 KiB) |
+| QSA indexer tail: 12 layers × up to 3 raw BF16 keys of 128 (the incomplete compression block) | 9,216 |
+| hq-e8-2b residual window: 12 layers × 2 KV heads × 544 rows × 256, both roles, BF16, plus 16 ring words | 13,369,408 (12.75 MiB) |
+| penalty-count row (vocab 248,320), int32 | 993,280 (0.95 MiB) |
+| **total** | **130,014,272 (123.99 MiB)** |
+
+Derived from the topology by `ModelConfig::state_image` and checked by its CPU
+test (#303). A slot lays each section out from a 256-byte boundary, so one holds
+130,014,464 bytes. The n-gram conv runs over the PLE output of all four
+hyper-connection streams, hence 4 × 2560 channels, not 2560. The indexer tail is
+per-slot state that a claim copies with the image; only complete blocks' keys
+ride the KV pages.
 
 The 27B's image is 221.8 MiB (187.8 MiB plus a 34 MiB residual window). The
 hyper-connection streams carry nothing across tokens, so they add nothing.
@@ -180,8 +213,9 @@ drafter section, because Flash-Next runs without speculation.
 **The QSA indexer section is paged like KV.**
 - Complete compressed-key blocks live in pages that are shared by refcount
   under a checkpoint or a retained prefix.
-- The partial tail (tokens of an incomplete compression block, and the tail of
-  its page) is copied with the KV tail page.
+- The tail page's complete blocks are copied with the KV tail page. The raw
+  keys of the incomplete compression block are per-slot state, the image's
+  indexer tail, and a claim copies them with the image.
 - A publish point needs no alignment to the compression block. The copied tail
   carries what the next block needs.
 
@@ -349,10 +383,13 @@ mismatched blob does. They never check copy order or internal table layouts.
 - The ~124 MiB image is three fifths of the 27B's, mostly because Flash-Next
   has 36 GDN layers to the 27B's 48 and no drafter window. Host slots therefore
   cost less here than on the 27B, while the RAM they compete with is scarcer.
-- Section sizes still to verify against the modeling code when the ticket
-  starts:
-  - the conv-tap storage dtype;
-  - the indexer key dtype and its compression of the tail block;
-  - the n-gram convolution's exact receptive field.
+- Section sizes verified against the modeling code when the ticket started
+  (#303):
+  - the conv taps are stored BF16, as on the 27B;
+  - the indexer keys are BF16; a block is pooled once its 4 raw keys exist, so
+    the up-to-3 raw keys of the incomplete block are per-slot state in the
+    image, not a page's tail;
+  - the n-gram convolution's receptive field is 9 past positions (kernel 4,
+    dilation 3) over 4 streams × 2560 channels.
 
-  The acceptance tests then check the derived values.
+  The CPU test checks the derived values.

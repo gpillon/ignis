@@ -170,6 +170,7 @@ int main() {
   spec.max_context_tokens  = 128; // pages_for_tokens(128) == 2
   spec.slot_count          = 3;
   spec.gdn_num_layers      = 2;
+  spec.kv_num_layers = kIgnisGqaLayerCount;
   spec.gdn_conv_channels   = 6;
   spec.gdn_value_heads     = 2;
   spec.gdn_head_dim        = 4;

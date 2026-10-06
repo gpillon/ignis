@@ -274,6 +274,11 @@ struct ignis_prefill_options {
    * then no neighbour is gathered. The set's argmax and peaks are still
    * written, and still say the set was read whole. Appended (ADR 0016). */
   float *out_attention_set_rows;
+  /* GitHub #302: a Flash-Next span's n-gram table rows, host
+   * `[num_tokens][16][90]` as ignis_core::ngram_table stages them (each
+   * token's 16 heads' INT4 rows, layout.md section 7.1) -- required on a
+   * Flash-Next load, NULL on the 27B. */
+  const uint8_t *ngram_rows;
 };
 
 /* The most heads a readout may bring whole rows back for (GitHub #275): the
@@ -440,6 +445,11 @@ const char *ignis_decode_graph_last_error(void);
  * unchanged per-token loop. After a chunked prefill, `seq`'s state is
  * exactly what the per-token route would have left.
  *
+ * GitHub #302: on a Flash-Next load a chunk that fails does NOT leave `seq`
+ * at its pre-chunk state -- its GDN, indexer and n-gram sections advance in
+ * place layer by layer -- so the error says the sequence is not usable past
+ * it, and the caller releases it (the request fails) rather than retrying.
+ *
  * On a model loaded with IGNIS_SPECULATIVE_DFLASH2 (P5-03, GitHub #152) the
  * chunked route also taps the target's layer 5/19/33/47/61 outputs for the
  * span's last min(2048, num_tokens) positions into chunk-scoped scratch --
@@ -510,6 +520,10 @@ struct ignis_decode_options {
    * `ignis_sampling_params::permitted_ids`. Filled only for the anchor, so a
    * verify round reports the anchor's and says nothing about its drafts. */
   float *out_permitted_probs; /* [batch_size], or NULL */
+  /* GitHub #302: on a Flash-Next load, each lane's n-gram table rows for the
+   * token this round consumes (its pending token), host `[batch_size][16]
+   * [90]` -- required there, NULL on the 27B. */
+  const uint8_t *ngram_rows;
 };
 
 /* Complete one decode round for a batch of sequence handles.  Each output is

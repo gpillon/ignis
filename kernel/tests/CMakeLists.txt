@@ -335,6 +335,18 @@ target_compile_definitions(ignis_hq_codec_kv_rows_test PRIVATE
 target_link_libraries(ignis_hq_codec_kv_rows_test PRIVATE ignis_vendor)
 add_test(NAME ignis_hq_codec_kv_rows_test COMMAND ignis_hq_codec_kv_rows_test)
 
+# Spec flash-next/04 acceptance 7 (GitHub #302): the same measurement on real
+# Flash-Next KV rows (kernel/tests/fixtures/hq_kv_rows_flash_next.bin, captured
+# by crates/core/tests/flash_next_kv_fixture_capture_gpu.rs: 2 KV heads, QSA
+# layers 3/19/35/47), held to the tolerances derived from that fixture
+# (IGNIS_HQ_KV_FLASH_NEXT selects them in the test file).
+add_executable(ignis_hq_codec_kv_rows_flash_next_test test_hq_codec_kv_rows.cu)
+target_compile_definitions(ignis_hq_codec_kv_rows_flash_next_test PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_flash_next.bin"
+  IGNIS_HQ_KV_FLASH_NEXT=1)
+target_link_libraries(ignis_hq_codec_kv_rows_flash_next_test PRIVATE ignis_vendor)
+add_test(NAME ignis_hq_codec_kv_rows_flash_next_test COMMAND ignis_hq_codec_kv_rows_flash_next_test)
+
 # GitHub #268 (spec runtime/09): OURS -- the hq-e8-2b verify attention kernel
 # timed alone at the engine's real launch, over code planes encoded from the
 # same committed fixture rows, plus a hash of its partials so two builds can
@@ -554,3 +566,165 @@ add_test(NAME ignis_kernel_seq_prefix_test COMMAND ignis_kernel_seq_prefix_test)
 add_executable(ignis_kernel_seq_checkpoint_test test_seq_checkpoint.cpp)
 target_link_libraries(ignis_kernel_seq_checkpoint_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_seq_checkpoint_test COMMAND ignis_kernel_seq_checkpoint_test)
+
+# --- Flash-Next MoE ops (spec flash-next/02, GitHub #300): OURS -------------------------------
+#
+# Every op in kernel/include/ignis_moe.h is our own implementation (ADR 0043). The fixtures
+# under fixtures/flash_next/ were recorded once from exllamav3's `reconstruct` and the
+# checkpoint's transformers router by fixtures/flash_next/record.py; the tests read them through
+# an absolute path baked in at configure time. Same no-SKIP_RETURN_CODE rule as every other GPU
+# test here (ADR 0006).
+set(IGNIS_FLASH_NEXT_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next")
+foreach(name IN ITEMS trellis_decode moe_router moe_experts fp8_linear moe_shared_combine moe_block
+                     moe_prepare)
+  add_executable(ignis_kernel_${name}_test test_${name}.cu)
+  target_compile_definitions(ignis_kernel_${name}_test PRIVATE
+    IGNIS_FLASH_NEXT_FIXTURE_DIR="${IGNIS_FLASH_NEXT_FIXTURE_DIR}")
+  target_link_libraries(ignis_kernel_${name}_test PRIVATE ignis_kernel ignis_vendor)
+  add_test(NAME ignis_kernel_${name}_test COMMAND ignis_kernel_${name}_test)
+endforeach()
+# What the expert kernels trap on rather than read as weights or store as a finite wrong answer:
+# a selected slot with no record, an expert id outside [0, 512), a non-finite contribution. A
+# trap kills the context, so each condition runs in its own process.
+add_executable(ignis_kernel_moe_slot_trap_test test_moe_slot_trap.cu)
+target_link_libraries(ignis_kernel_moe_slot_trap_test PRIVATE ignis_kernel ignis_vendor)
+foreach(mode IN ITEMS decode prefill decode-id prefill-id decode-nan decode-clusters decode-id-clusters
+                     decode-nan-clusters)
+  add_test(NAME ignis_kernel_moe_slot_trap_${mode}_test COMMAND ignis_kernel_moe_slot_trap_test ${mode})
+endforeach()
+# The decode route's second implementation (IGNIS_MOE_DECODE_CLUSTERS, one thread-block cluster
+# per expert) held to the same tests as the default.
+foreach(name IN ITEMS moe_experts moe_block)
+  add_test(NAME ignis_kernel_${name}_clusters_test COMMAND ignis_kernel_${name}_test clusters)
+endforeach()
+# The MoE microbenchmark: a report of every op's achieved bandwidth or throughput. The spec's
+# decode floor (one-token routed decode >= 50% of the DRAM roofline) is its one pass/fail,
+# opt-in with --check-floor; it is a tool and NOT a CTest while that floor is open, so the stage
+# stays green for everyone else. Timing wants the card to itself.
+add_executable(ignis_kernel_moe_bench bench_moe.cu)
+target_link_libraries(ignis_kernel_moe_bench PRIVATE ignis_kernel ignis_vendor)
+
+# GitHub #302 (spec flash-next/04): OURS -- the GDN layer count and value-head count as two
+# topology numbers at the binder. Host-only (every arm fails at binding), like the other
+# model-load option tests above.
+add_executable(ignis_kernel_model_load_gdn_geometry_test test_model_load_gdn_geometry.cpp)
+target_link_libraries(ignis_kernel_model_load_gdn_geometry_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_model_load_gdn_geometry_test COMMAND ignis_kernel_model_load_gdn_geometry_test)
+
+# GitHub #302 (spec flash-next/04): OURS -- the Flash-Next program's internal
+# contract (kernel/src/flash_next/flash_next_internal.h), its geometry read off
+# the topology. Host-only; reaches into kernel/src for the leaf-internal header.
+add_executable(ignis_kernel_flash_next_contract_test test_flash_next_contract.cpp)
+target_include_directories(ignis_kernel_flash_next_contract_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_contract_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_contract_test COMMAND ignis_kernel_flash_next_contract_test)
+# A sequence pool of the topology's attention layers (kv_num_layers), planned
+# without building it. Host-only.
+add_executable(ignis_kernel_seq_pool_layers_test test_seq_pool_layers.cpp)
+target_link_libraries(ignis_kernel_seq_pool_layers_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_pool_layers_test COMMAND ignis_kernel_seq_pool_layers_test)
+# GitHub #302: a pool with Flash-Next's indexer and n-gram sections holds them,
+# zeroes a slot's for its next sequence, and refuses every snapshot and clone
+# by name. GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_seq_flash_next_sections_test test_seq_flash_next_sections.cpp)
+target_link_libraries(ignis_kernel_seq_flash_next_sections_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_flash_next_sections_test COMMAND ignis_kernel_seq_flash_next_sections_test)
+# The Flash-Next binder (kernel/src/flash_next/bind.cu) at the real 48-layer
+# schema: binds, places, refuses by name. Host-only.
+add_executable(ignis_kernel_flash_next_bind_test test_flash_next_bind.cpp)
+target_include_directories(ignis_kernel_flash_next_bind_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_bind_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_bind_test COMMAND ignis_kernel_flash_next_bind_test)
+# fn_linear (kernel/src/flash_next/linear.cu): the BF16 route against fp64 at the
+# program's shapes, both routes, and the FP8 routing. GPU.
+add_executable(ignis_kernel_flash_next_linear_test test_flash_next_linear.cu)
+target_include_directories(ignis_kernel_flash_next_linear_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_linear_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_linear_test COMMAND ignis_kernel_flash_next_linear_test)
+# The hyper-connection mix and inject (kernel/src/flash_next/hc.cu) against a
+# BF16-rounding fp64 reference of the checkpoint's module. GPU.
+add_executable(ignis_kernel_flash_next_hc_test test_flash_next_hc.cu)
+target_include_directories(ignis_kernel_flash_next_hc_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_hc_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_hc_test COMMAND ignis_kernel_flash_next_hc_test)
+# The token embedding and the head (kernel/src/flash_next/embed_head.cu). GPU.
+add_executable(ignis_kernel_flash_next_embed_head_test test_flash_next_embed_head.cu)
+target_include_directories(ignis_kernel_flash_next_embed_head_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_embed_head_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_embed_head_test COMMAND ignis_kernel_flash_next_embed_head_test)
+# Slice S2 (kern): the GDN layer core (kernel/src/flash_next/gdn.cu) at the real geometry against
+# an fp64 restatement of the checkpoint's Qwen4ExpTextGatedDeltaNet: prefill chunks, decode lanes
+# eager and as a replayed graph, state carry and slot isolation. GPU.
+# The QSA attention sublayer (kernel/src/flash_next/qsa.cu, qsa_dense.cu) on paged K/V of both
+# formats: the norms and rope, the dense kernel against fp64, the whole sublayer in prefill and in
+# graph-captured decode, hq-e8-2b within a bound derived from its measured codec error. GPU.
+foreach(name IN ITEMS gdn qsa)
+  add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
+  target_include_directories(ignis_kernel_flash_next_${name}_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+  target_link_libraries(ignis_kernel_flash_next_${name}_test PRIVATE ignis_kernel ignis_vendor)
+  add_test(NAME ignis_kernel_flash_next_${name}_test COMMAND ignis_kernel_flash_next_${name}_test)
+endforeach()
+
+# GitHub #301 (spec flash-next/03): OURS -- the expert residency miss path measured (copy
+# engine against SM-driven copies from mapped pinned memory). A timing is a finding, not a
+# pass/fail, so a tool and NOT registered with CTest. CUDA runtime only.
+add_executable(ignis_expert_miss_path_bench bench_expert_miss_path.cu)
+target_link_libraries(ignis_expert_miss_path_bench PRIVATE CUDA::cudart)
+
+# GitHub #301 (spec flash-next/03): OURS -- expert residency's device side replayed against the
+# CPU policy model's outcomes (fixtures/residency/trace_v1.txt, written by
+# crates/core/tests/expert_residency_fixture.rs): outcomes, copies and slot-table invariants, once
+# eagerly and once with the decode steps as captured CUDA graphs. Same no-SKIP_RETURN_CODE rule as
+# every GPU test here (ADR 0006).
+add_executable(ignis_kernel_residency_trace_test test_residency_trace.cu)
+target_compile_definitions(ignis_kernel_residency_trace_test PRIVATE
+  IGNIS_RESIDENCY_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/residency/trace_v1.txt")
+target_link_libraries(ignis_kernel_residency_trace_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_residency_trace_test COMMAND ignis_kernel_residency_trace_test)
+add_test(NAME ignis_kernel_residency_graph_test COMMAND ignis_kernel_residency_trace_test graph)
+
+# GitHub #302 (spec flash-next/04, slice S4): OURS -- the n-gram embedding's device side
+# (kernel/src/flash_next/ngram.cu) at the real geometry, against transformers'
+# Qwen4ExpTextPLELayer recorded by fixtures/flash_next_ngram/record.py: one shot, chunked prefill
+# and decode, three lanes, a call spanning two windows, a reused slot. `--host-only` runs the
+# host model's check alone (no CUDA). GPU.
+add_executable(ignis_kernel_flash_next_ngram_test test_flash_next_ngram.cu)
+target_include_directories(ignis_kernel_flash_next_ngram_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(ignis_kernel_flash_next_ngram_test PRIVATE
+  IGNIS_FLASH_NEXT_NGRAM_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_ngram")
+target_link_libraries(ignis_kernel_flash_next_ngram_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_ngram_test COMMAND ignis_kernel_flash_next_ngram_test)
+# The resolve's cost per layer step at Flash-Next's geometry (48 x 512, real pool capacities,
+# 4 KiB records so PCIe is not what it times). A timing is a finding, not a pass/fail: a tool,
+# NOT registered with CTest.
+add_executable(ignis_residency_resolve_bench bench_residency_resolve.cu)
+target_link_libraries(ignis_residency_resolve_bench PRIVATE ignis_kernel ignis_vendor)
+
+# GitHub #302 (spec flash-next/04, slice S3): OURS -- the QSA indexer and the sparse attention.
+# The indexer's stages (kernel/src/flash_next/indexer.cu) at the real geometry against the
+# checkpoint's own Qwen4ExpTextQSAIndexer, recorded once on CPU by
+# fixtures/flash_next_indexer/record_indexer.py: chunks that split blocks, two-lane decode, a
+# one-shot replay, documented score ties, a graph-captured decode. The sparse attention
+# (kernel/src/flash_next/qsa_sparse.cu) against fp64 attention masked to each row's selected
+# tokens, over BF16 pages and over hq-e8-2b rows decoded with the vendored codec. GPU, same
+# no-SKIP_RETURN_CODE rule (ADR 0006).
+add_executable(ignis_kernel_flash_next_indexer_test test_flash_next_indexer.cu)
+target_compile_definitions(ignis_kernel_flash_next_indexer_test PRIVATE
+  IGNIS_FLASH_NEXT_INDEXER_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_indexer/indexer_ref.bin")
+target_link_libraries(ignis_kernel_flash_next_indexer_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_indexer_test COMMAND ignis_kernel_flash_next_indexer_test)
+foreach(name IN ITEMS sparse_attention sparse_attention_hq)
+  add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
+  target_link_libraries(ignis_kernel_flash_next_${name}_test PRIVATE ignis_kernel ignis_vendor)
+  add_test(NAME ignis_kernel_flash_next_${name}_test COMMAND ignis_kernel_flash_next_${name}_test)
+endforeach()
+# Spec flash-next/04 acceptance 7: the hq route against the BF16 route on real Flash-Next KV rows.
+target_compile_definitions(ignis_kernel_flash_next_sparse_attention_hq_test PRIVATE
+  IGNIS_HQ_KV_FLASH_NEXT_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_flash_next.bin")

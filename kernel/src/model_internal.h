@@ -142,6 +142,16 @@ struct VisionWeights {
 
 struct ignis_media_embedding;
 
+// GitHub #302: a Flash-Next load's program (kernel/src/flash_next/
+// program.h), complete only there; its deleter is defined beside it so this
+// header need not see the type.
+namespace ignis::flash_next {
+struct FlashNextModel;
+struct FlashNextModelDeleter {
+  void operator()(FlashNextModel *model) const;
+};
+}  // namespace ignis::flash_next
+
 // GitHub #243: the media embedding pool -- one device reservation carved
 // into fixed-width column pages.
 //
@@ -479,6 +489,11 @@ struct ignis_model {
   // `draft_tokens > 0`. Its traversal runs out of `decode_graph_scratch`,
   // which a windowed load sizes for `k+1` columns per lane instead of one.
   std::unique_ptr<IgnisVerifyRound> verify;
+  // GitHub #302: set on a Flash-Next load, whose program the step ABI's
+  // entry points dispatch to. It shares this handle's stream, both scratch
+  // arenas, the sampling staging, the decode staging and the decode graphs;
+  // none of the 27B's fields above it is bound.
+  std::unique_ptr<ignis::flash_next::FlashNextModel, ignis::flash_next::FlashNextModelDeleter> flash_next;
 };
 
 // GitHub #178: a media embedding -- the `[hidden, columns]` BF16 encoder

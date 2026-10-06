@@ -1,0 +1,95 @@
+{
+  "checksums": {
+    "down_k2": {
+      "checksum": "e218a3545e86f667",
+      "stream": 9201
+    },
+    "down_k2p5": {
+      "checksum": "e02f5172aba2b45d",
+      "stream": 9251
+    },
+    "down_k3": {
+      "checksum": "e28d9b58b454799d",
+      "stream": 9301
+    },
+    "down_k4": {
+      "checksum": "e229c9aaaa56ffe4",
+      "stream": 9401
+    },
+    "gate_up_k2": {
+      "checksum": "c4cc11f832babce5",
+      "stream": 9200
+    },
+    "gate_up_k2p5": {
+      "checksum": "c40017bf7a4bbea5",
+      "stream": 9250
+    },
+    "gate_up_k3": {
+      "checksum": "c38a65ad5eed80e0",
+      "stream": 9300
+    },
+    "gate_up_k4": {
+      "checksum": "c25351ef1e7533ed",
+      "stream": 9400
+    }
+  },
+  "date_utc": "2026-10-04T22:55:31Z",
+  "device": "NVIDIA GeForce RTX 5090",
+  "exllamav3": "1.5.3",
+  "recorded_by": "kernel/tests/fixtures/flash_next/record.py",
+  "router": {
+    "dtypes": {
+      "activations": "bfloat16",
+      "logits": "torch.bfloat16",
+      "softmax": "float32 over all 512",
+      "weight": "bfloat16",
+      "weights_out": "torch.bfloat16"
+    },
+    "file": "router_ref.bin",
+    "logits_equal_bf16_of_fp32_accumulation": 0.9997762441635132,
+    "logits_equal_bf16_of_fp64_accumulation": 0.99981689453125,
+    "lower_index_rule_same_order_as_torch": 126,
+    "lower_index_rule_same_set_as_torch": 192,
+    "module": "transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextTopKRouter",
+    "softmax_over_ten_bf16_equal_to_torch_weights": 1.0,
+    "tokens": 192,
+    "tokens_with_any_tie_in_top11": 128,
+    "tokens_with_bf16_tie_at_10th_11th": 25
+  },
+  "torch": "2.13.0+cu130",
+  "transformers": "5.17.0",
+  "trellis": {
+    "k2": {
+      "file": "trellis_k2.bin",
+      "shape_in_out": [
+        256,
+        128
+      ],
+      "y64_vs_exllamav3_forward_max_rel": 0.0006238701138042937
+    },
+    "k2p5": {
+      "file": "trellis_k2p5.bin",
+      "shape_in_out": [
+        256,
+        128
+      ],
+      "y64_vs_exllamav3_forward_max_rel": 0.0006043404636633365
+    },
+    "k3": {
+      "file": "trellis_k3.bin",
+      "shape_in_out": [
+        256,
+        128
+      ],
+      "y64_vs_exllamav3_forward_max_rel": 0.00044437091155885116
+    },
+    "k4": {
+      "file": "trellis_k4.bin",
+      "shape_in_out": [
+        256,
+        128
+      ],
+      "y64_vs_exllamav3_forward_max_rel": 0.0006169888229838244
+    }
+  }
+}

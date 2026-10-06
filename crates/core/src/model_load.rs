@@ -21,12 +21,13 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
+use ignis_artifact::flash_next::{self, FlashNextGeometry, FlashNextPlan};
 use ignis_artifact::{
     model_scope_27b_with, DraftModule, InventoryEntry, MaterializationPlan, MaterializedArtifact,
     ModelScope, NumericFormat, ObjectHandle, Reader, StorageLayout,
 };
 
-use crate::compute::{LayerKind, ModelConfig};
+use crate::compute::ModelConfig;
 use crate::kv_format::KvFormat;
 use crate::rope_scaling::RopeScaling;
 use crate::speculation::{ProposalHead, SpeculativeBackend, Speculation};
@@ -34,6 +35,8 @@ use crate::vision::Vision;
 
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
+
+    use crate::compute::IgnisTopology;
 
     /// Opaque loaded-model handle (`kernel/include/ignis_model.h`).
     ///
@@ -62,28 +65,6 @@ pub(crate) mod ffi {
         pub input_scale_divisor: f32,
     }
 
-    /// 1:1 with `struct ignis_topology`.
-    #[repr(C)]
-    pub struct IgnisTopology {
-        pub num_layers: u32,
-        pub layer_kinds: *const i32,
-        pub hidden: u64,
-        pub vocab: u64,
-        pub num_q_heads: u64,
-        pub num_kv_heads: u64,
-        pub head_dim: u64,
-        pub rotary_dim: u64,
-        pub rope_theta: f64,
-        pub gdn_state_rows: u64,
-        pub gdn_state_cols: u64,
-        pub gdn_num_layers: u64,
-        pub gdn_q_width: u64,
-        pub gdn_z_width: u64,
-        pub gdn_ab_width: u64,
-        pub ffn_intermediate: u64,
-        pub rms_norm_eps: f32,
-    }
-
     /// 1:1 with `struct ignis_model_load_options` (ADR 0016: `size` first).
     /// `PartialEq` without `Eq`: the four rope scalars below are floats.
     #[repr(C)]
@@ -109,6 +90,12 @@ pub(crate) mod ffi {
         /// readout reads, and so the room the load reserves for one; 0 =
         /// none.
         pub attention_text_max_keys: u32,
+        /// GitHub #302: Flash-Next's decode lanes (0 = 3, at most 8); 0 on
+        /// the 27B.
+        pub decode_lanes: u32,
+        /// GitHub #302: Flash-Next's expert residency, borrowed for the
+        /// model's life (`ignis_residency`); null on the 27B.
+        pub residency: *mut std::ffi::c_void,
     }
 
     /// 1:1 with `struct ignis_model_reservations` (GitHub #210): every
@@ -123,6 +110,9 @@ pub(crate) mod ffi {
         pub decode_graph_bytes: u64,
         pub verify_round_bytes: u64,
         pub drafter_round_bytes: u64,
+        /// GitHub #302: Flash-Next's activations and MoE buffers outside the
+        /// workspace; 0 on the 27B.
+        pub activation_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_model_stats`.
@@ -214,6 +204,13 @@ fn qtype_code(format: NumericFormat) -> i32 {
         NumericFormat::I32 => 6,
         NumericFormat::Nvfp4 => 7,
         NumericFormat::Fp8E4M3FnRowBf16S => 8,
+        // Flash-Next formats are not bound by the 27B loader.
+        NumericFormat::I64
+        | NumericFormat::Q4G32F16S
+        | NumericFormat::TrellisMul1K2
+        | NumericFormat::TrellisMul1K2p5
+        | NumericFormat::TrellisMul1K3
+        | NumericFormat::TrellisMul1K4 => -1,
     }
 }
 
@@ -224,6 +221,8 @@ fn layout_code(layout: StorageLayout) -> i32 {
         StorageLayout::ContiguousLeV1 => 1,
         StorageLayout::BlockScaleK16M128x4V1 => 2,
         StorageLayout::RowScaleV1 => 3,
+        // Flash-Next layouts are not bound by the 27B loader.
+        StorageLayout::TrellisTile16V1 | StorageLayout::RowInterleavedV1 => -1,
     }
 }
 
@@ -343,6 +342,8 @@ fn load_options(
             rope_scaling_beta_slow: rope_scaling.beta_slow(),
             vision_item_max_tokens: vision.map_or(0, |v| v.item_max_tokens()),
             attention_text_max_keys: text_keys,
+            decode_lanes: 0,
+            residency: std::ptr::null_mut(),
         }
     })
 }
@@ -527,40 +528,6 @@ fn build_bound_tensors(
     Ok((names, tensors))
 }
 
-/// The Qwen 3.8-27B topology descriptor (ADR 0009: one source for the
-/// leaf's per-layer schema, not guesses). `layer_kinds_buf` is the backing
-/// storage for the returned descriptor's pointer -- keep it alive for as
-/// long as the descriptor is used.
-fn qwen38_27b_topology(layer_kinds_buf: &mut Vec<i32>) -> ffi::IgnisTopology {
-    let cfg = ModelConfig::qwen38_27b();
-    layer_kinds_buf.clear();
-    layer_kinds_buf.extend(cfg.layer_kinds.iter().map(|kind| match kind {
-        LayerKind::Gdn => 0,
-        LayerKind::Gqa => 1,
-    }));
-    ffi::IgnisTopology {
-        num_layers: cfg.num_layers as u32,
-        layer_kinds: layer_kinds_buf.as_ptr(),
-        hidden: cfg.hidden,
-        vocab: cfg.vocab,
-        num_q_heads: cfg.num_q_heads,
-        num_kv_heads: cfg.num_kv_heads,
-        head_dim: cfg.head_dim,
-        rotary_dim: cfg.rotary_dim,
-        rope_theta: cfg.rope_theta,
-        gdn_state_rows: cfg.gdn_state_rows,
-        gdn_state_cols: cfg.gdn_state_cols,
-        gdn_num_layers: cfg.gdn_num_layers,
-        gdn_q_width: cfg.gdn_q_width,
-        gdn_z_width: cfg.gdn_z_width,
-        gdn_ab_width: cfg.gdn_ab_width,
-        ffn_intermediate: cfg.ffn_intermediate,
-        // The Qwen 3.8-27B text config's RMSNorm epsilon (the reference's
-        // `TextConfig::rms_epsilon`, `qwen3_6_27b/impl/config.h`).
-        rms_norm_eps: 1.0e-6,
-    }
-}
-
 /// Load the Qwen 3.8-27B text model from a device-materialized artifact
 /// (P1-17): build the bound-tensor + topology descriptors and call
 /// `ignis_model_load`. `handles` must be the handles [`ignis_artifact::bind_text_scope_27b`]
@@ -662,8 +629,7 @@ pub fn load_qwen38_27b_with_options(
         model_scope(speculation, vision),
         device_placement(artifact),
     )?;
-    let mut layer_kinds_buf = Vec::new();
-    let topology = qwen38_27b_topology(&mut layer_kinds_buf);
+    let topology = ModelConfig::qwen38_27b().topology_abi();
     let options = load_options(speculation, vision, rope_scaling, text_readout_keys(reader));
 
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
@@ -671,7 +637,7 @@ pub fn load_qwen38_27b_with_options(
         ffi::ignis_model_load(
             tensors.as_ptr(),
             tensors.len() as u64,
-            &topology,
+            topology.raw(),
             prefill_chunk_tokens,
             max_context_tokens,
             kv_format.abi_code(),
@@ -713,8 +679,7 @@ pub fn plan_qwen38_27b_reservations(
         model_scope(speculation, vision),
         planned_placement(plan),
     )?;
-    let mut layer_kinds_buf = Vec::new();
-    let topology = qwen38_27b_topology(&mut layer_kinds_buf);
+    let topology = ModelConfig::qwen38_27b().topology_abi();
     let options = load_options(speculation, vision, rope_scaling, text_readout_keys(reader));
 
     let mut reservations = IgnisModelReservations::default();
@@ -722,13 +687,181 @@ pub fn plan_qwen38_27b_reservations(
         ffi::ignis_model_plan_reservations(
             tensors.as_ptr(),
             tensors.len() as u64,
-            &topology,
+            topology.raw(),
             prefill_chunk_tokens,
             max_context_tokens,
             kv_format.abi_code(),
             options
                 .as_ref()
                 .map_or(std::ptr::null(), |o| o as *const ffi::IgnisModelLoadOptions),
+            &mut reservations,
+        )
+    };
+    if rc != 0 {
+        let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
+        return Err(message.to_string_lossy().into_owned());
+    }
+    Ok(reservations)
+}
+
+// ---------------------------------------------------------------------------
+// Flash-Next (spec flash-next/04, GitHub #302, ADR 0043)
+// ---------------------------------------------------------------------------
+
+/// The bound-tensor descriptors of a Flash-Next artifact's device tensors
+/// (every non-expert tensor of `ignis_artifact::flash_next`'s inventory whose
+/// role is the device), at the addresses `placement` gives, with the names
+/// the leaf's binder (`kernel/src/flash_next/bind.cu`) reads. The experts are
+/// residency's and the n-gram objects the host's: none of them crosses.
+fn build_flash_next_bound_tensors(
+    fn_plan: &FlashNextPlan,
+    geometry: &FlashNextGeometry,
+    placement: impl Fn(ObjectHandle) -> Result<(u64, *const c_void), String>,
+) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
+    let mut entries = flash_next::global_entries(geometry);
+    for layer in 0..geometry.layers {
+        entries.extend(flash_next::layer_entries(geometry, layer));
+    }
+    let mut names = Vec::with_capacity(entries.len());
+    let mut tensors = Vec::with_capacity(entries.len());
+    for entry in entries.iter().filter(|entry| entry.role == flash_next::Role::Device) {
+        let handle = *fn_plan
+            .handles
+            .get(&entry.name)
+            .ok_or_else(|| format!("{}: not bound by the Flash-Next plan", entry.name))?;
+        let flash_next::ShapeRule::Exact(dims) = &entry.shape else {
+            return Err(format!("{}: a device tensor has an exact shape", entry.name));
+        };
+        if dims.len() > 4 {
+            return Err(format!("{}: rank {} exceeds the ABI's rank-4 shape", entry.name, dims.len()));
+        }
+        let mut shape = [1i32; 4];
+        for (dst, &dim) in shape.iter_mut().zip(dims.iter()) {
+            *dst = i32::try_from(dim).map_err(|_| format!("{}: dimension {dim} overflows i32", entry.name))?;
+        }
+        let (bytes, qdata) = placement(handle)?;
+        let name = CString::new(entry.name.as_str()).map_err(|e| e.to_string())?;
+        tensors.push(ffi::IgnisBoundTensor {
+            name: name.as_ptr(),
+            qtype: qtype_code(entry.format),
+            layout: layout_code(entry.layout),
+            qdata,
+            qhigh: std::ptr::null(),
+            scales: std::ptr::null(),
+            bytes,
+            shape,
+            padded_shape: shape,
+            ndim: dims.len() as u32,
+            weight_scale_divisor: 0.0,
+            input_scale_divisor: 0.0,
+        });
+        names.push(name);
+    }
+    Ok((names, tensors))
+}
+
+/// A Flash-Next load's options: its decode lanes and its borrowed residency
+/// (null when only planning); nothing of the 27B's.
+fn flash_next_options(decode_lanes: u32, residency: *mut c_void) -> ffi::IgnisModelLoadOptions {
+    ffi::IgnisModelLoadOptions {
+        size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
+        speculative_backend: 0,
+        draft_tokens: 0,
+        vision_max_tokens: 0,
+        vision_embedding_pool_bytes: 0,
+        rope_scaling_factor: 0.0,
+        rope_scaling_temperature: 0.0,
+        rope_scaling_beta_fast: 0.0,
+        rope_scaling_beta_slow: 0.0,
+        vision_item_max_tokens: 0,
+        attention_text_max_keys: 0,
+        decode_lanes,
+        residency,
+    }
+}
+
+/// Load a Flash-Next artifact whose non-expert tensors `artifact` holds on
+/// the device (`fn_plan` and `geometry` as
+/// [`ignis_artifact::flash_next::bind`] took them), with `decode_lanes`
+/// decode lanes and the expert residency it borrows. The returned model
+/// must be dropped before `residency` and `artifact` (GitHub #302).
+#[allow(clippy::too_many_arguments)]
+pub fn load_flash_next(
+    fn_plan: &FlashNextPlan,
+    geometry: &FlashNextGeometry,
+    artifact: &MaterializedArtifact,
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+    decode_lanes: u32,
+    residency: &crate::residency::device::DeviceResidency,
+) -> Result<Model, String> {
+    validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
+    let placement = |handle: ObjectHandle| {
+        let view = artifact.device_view(handle).map_err(|e| e.to_string())?;
+        Ok((view.bytes, view.base as *const c_void))
+    };
+    let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
+    let topology = ModelConfig::flash_next_from(geometry).topology_abi();
+    let options = flash_next_options(decode_lanes, residency.as_raw());
+    let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
+    let rc = unsafe {
+        ffi::ignis_model_load(
+            tensors.as_ptr(),
+            tensors.len() as u64,
+            topology.raw(),
+            prefill_chunk_tokens,
+            max_context_tokens,
+            kv_format.abi_code(),
+            &options,
+            &mut handle,
+        )
+    };
+    if rc != 0 || handle.is_null() {
+        let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
+        return Err(message.to_string_lossy().into_owned());
+    }
+    Ok(Model { handle })
+}
+
+/// What a load of a Flash-Next artifact would reserve beside the weights,
+/// asked before the weights are on the device: `fn_plan` is what
+/// [`ignis_artifact::flash_next::bind`] returned for `reader` and
+/// `geometry`. The topology is the geometry's
+/// ([`ModelConfig::flash_next_from`]). The leaf binds the descriptors
+/// first and then checks the geometry its program runs, so a reduced
+/// fixture's refusal still says its descriptors bind.
+pub fn plan_flash_next_reservations(
+    fn_plan: &FlashNextPlan,
+    geometry: &FlashNextGeometry,
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+    decode_lanes: u32,
+) -> Result<IgnisModelReservations, String> {
+    validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
+    let placement = |handle: ObjectHandle| {
+        fn_plan
+            .plan
+            .device_objects
+            .iter()
+            .find(|placed| placed.handle == handle)
+            .map(|placed| (placed.bytes, std::ptr::null()))
+            .ok_or_else(|| "a Flash-Next tensor is not a device object of the plan".to_string())
+    };
+    let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
+    let topology = ModelConfig::flash_next_from(geometry).topology_abi();
+    let options = flash_next_options(decode_lanes, std::ptr::null_mut());
+    let mut reservations = IgnisModelReservations::default();
+    let rc = unsafe {
+        ffi::ignis_model_plan_reservations(
+            tensors.as_ptr(),
+            tensors.len() as u64,
+            topology.raw(),
+            prefill_chunk_tokens,
+            max_context_tokens,
+            kv_format.abi_code(),
+            &options,
             &mut reservations,
         )
     };
@@ -748,6 +881,23 @@ pub fn plan_qwen38_27b_reservations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub #302: the descriptors this loader builds for the artifact
+    /// crate's Flash-Next fixture artifact (packed from its converter work
+    /// tree) and the leaf's binder agree: every one binds. The fixture is a
+    /// small geometry (hidden 256), which the program's specialized ops do
+    /// not run, so the leaf refuses it -- after binding, and saying so.
+    #[test]
+    fn a_flash_next_fixture_artifacts_descriptors_bind_in_the_leaf() {
+        let tree = flash_next::fixture::WorkTree::new("model-load-bind").expect("work tree");
+        tree.write_all().expect("write the work tree");
+        ignis_artifact::packer::pack(&tree.pack_options(), &mut |_| {}).expect("pack");
+        let reader = Reader::open(&tree.artifact_path()).expect("open the fixture artifact");
+        let fn_plan = flash_next::bind(&reader, &tree.geometry).expect("bind the fixture artifact");
+        let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, 128, 1024, KvFormat::HqE8_2b, 3)
+            .expect_err("the fixture's geometry is not one the program runs");
+        assert!(err.contains("does not run this geometry (its weights bind)"), "{err}");
+    }
 
     #[test]
     fn validate_prefill_config_accepts_the_default_chunk() {
@@ -790,6 +940,7 @@ mod tests {
         assert_eq!(qtype_code(NumericFormat::I32), 6);
         assert_eq!(qtype_code(NumericFormat::Nvfp4), 7);
         assert_eq!(qtype_code(NumericFormat::Fp8E4M3FnRowBf16S), 8);
+        assert_eq!(qtype_code(NumericFormat::TrellisMul1K2p5), -1, "no 27B QType");
     }
 
     #[test]
@@ -799,6 +950,7 @@ mod tests {
         assert_eq!(layout_code(StorageLayout::ContiguousLeV1), 1);
         assert_eq!(layout_code(StorageLayout::BlockScaleK16M128x4V1), 2);
         assert_eq!(layout_code(StorageLayout::RowScaleV1), 3);
+        assert_eq!(layout_code(StorageLayout::TrellisTile16V1), -1, "no 27B QuantLayout");
     }
 
     #[test]
@@ -931,9 +1083,14 @@ mod tests {
         // scalars, the uint32 vision item bound and (GitHub #275) the uint32
         // text readout's keys, which fill what was the struct's padding --
         // so the size did not move (ADR 0041 records why that is accepted).
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 48);
-        // uint64 x 3, then (GitHub #210) the six uint64 reservation lines.
-        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 72);
+        // GitHub #302: then the uint32 decode lanes, padding, and the
+        // residency pointer.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 64);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, decode_lanes), 48);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, residency), 56);
+        // uint64 x 3, then (GitHub #210) the six uint64 reservation lines and
+        // (GitHub #302) the seventh, Flash-Next's activations.
+        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 80);
     }
 
     #[test]

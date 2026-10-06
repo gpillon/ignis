@@ -28,6 +28,15 @@ use ignis_core::{
     SchedulerConfig, Speculation, SpeculativeBackend,
 };
 
+/// What the mock charges a KV-RAM blob: one nominal byte in this suite's own
+/// run; Flash-Next's image and per-token bytes when `flash_next_reuse.rs`
+/// mounts it (spec flash-next/05), which is why every mock and every KV-RAM
+/// capacity below goes through it.
+#[allow(dead_code)]
+fn sections() -> ignis_core::MockSections {
+    ignis_core::MockSections::NOMINAL
+}
+
 const MODEL: &str = "qwen3.8-27b";
 /// The default scheduler's KV page, in tokens.
 const PAGE: u32 = 16;
@@ -89,7 +98,7 @@ fn scheduler(compute: Arc<MockCompute>, config: SchedulerConfig) -> ConcreteSche
 fn config() -> SchedulerConfig {
     SchedulerConfig {
         model: MODEL.into(),
-        ..SchedulerConfig::default()
+        ..crate::sections().scale(SchedulerConfig::default())
     }
 }
 
@@ -134,7 +143,7 @@ fn chunk_widths(compute: &MockCompute, request: RequestId) -> Vec<usize> {
 
 #[test]
 fn turn_n_plus_1_reuses_turn_n_prompt_checkpoint() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
 
     let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
@@ -185,7 +194,7 @@ fn a_claim_does_not_consume_the_checkpoint() {
     // one after another, long after the request that captured the entry
     // finished. The entry is still there at the end of all of them: a claim
     // copies, it never takes.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -229,7 +238,7 @@ fn a_claim_does_not_consume_the_checkpoint() {
 
 #[test]
 fn a_prompt_that_diverges_before_the_opener_reuses_nothing() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -260,7 +269,7 @@ fn the_prefill_is_cut_at_the_publish_point_and_again_at_the_opener() {
     // prefix is published at a chunk boundary (ADR 0024). The opener is at
     // most one page past the publish point, so the second cut costs one short
     // chunk and only on the tick that takes the checkpoint.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -290,7 +299,7 @@ fn a_page_aligned_opener_is_captured_on_the_publish_chunk() {
     // publish chunk: the backend publishes the prefix and captures against
     // it in one call. Without this the aligned prompts would be the only
     // ones that silently never retain anything.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched
         .submit(input(tokens(1, 40), Some(2 * PAGE), 4), RequestClass::Interactive)
@@ -336,7 +345,7 @@ fn the_chunk_that_captures_is_always_greedy() {
     // parameters, whose leaf branch has no sampling side effect at all. So
     // the capture is only ever asked for from an intermediate chunk, and the
     // row it captures has never been written.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let stochastic = RequestInput {
         params: DecodeParams {
@@ -392,7 +401,7 @@ fn an_opener_at_the_very_end_of_the_prompt_captures_nothing() {
     // rather than captured from — and the next turn loses nothing it could
     // have had, since a checkpoint at the prompt's end is the point ADR 0029
     // rejected in the first place.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched
         .submit(input(tokens(1, 40), Some(40), 4), RequestClass::Interactive)
@@ -412,7 +421,7 @@ fn a_prompt_with_no_reported_opener_captures_nothing() {
     // or a byte offset that does not tokenize to an exact prefix. No
     // checkpoint is taken, rather than one taken at a point the tokenizer
     // disagrees about.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched
         .submit(input(tokens(1, 40), None, 4), RequestClass::Interactive)
@@ -430,7 +439,7 @@ fn a_prompt_with_no_reported_opener_captures_nothing() {
 fn a_prompt_shorter_than_one_page_captures_nothing() {
     // There is no whole page under the opener to hang the checkpoint's
     // history on, so nothing is retained — and the request pays nothing.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched
         .submit(input(tokens(1, 12), Some(9), 4), RequestClass::Interactive)
@@ -449,7 +458,7 @@ fn a_checkpoint_claimant_publishes_a_chained_head_and_captures_its_own() {
     // which it warmed itself, over the two it claimed — and from there its
     // opener falls inside a page it alone writes, which is exactly what the
     // capture demands.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -500,7 +509,7 @@ fn the_cached_prefix_covers_exactly_the_head_the_backend_published() {
     //
     // A 40-token prompt whose opener ends at 30: two whole pages of prompt,
     // but only one whole page below the opener.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let first = sched
         .submit(input(tokens(1, 40), Some(30), 4), RequestClass::Interactive)
@@ -562,7 +571,7 @@ fn a_tool_loop_keeps_two_checkpoints_and_discards_the_superseded_one() {
     // along. Nothing between them is a real user message, so each supersedes
     // what it claimed — and a conversation that ran all day would still be
     // holding exactly two entries: its turn opener and its latest.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     // The user's one message ends 5 tokens in; everything after it is the
     // assistant calling tools and the tools answering.
@@ -632,7 +641,7 @@ fn a_new_user_message_reuses_the_turn_opener_and_retires_the_turn() {
     // turn-opening one is the only thing left that does. What the new turn
     // captures then opens a turn of its own, and the whole previous turn —
     // its opener and its latest alike — is retired in one go.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let it1 = sched
         .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
@@ -692,7 +701,7 @@ fn a_sibling_prefix_claimant_chains_past_it_and_captures_its_own() {
     // instead of at a previous turn's head. The shape here is the same, and
     // it is the shape that decides whether a request with a block prefix can
     // still leave a prompt checkpoint at all.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     // Request A publishes a 2-page head (its own opener floors there).
     let a = sched
@@ -749,7 +758,7 @@ fn an_opener_inside_the_shared_page_captures_without_a_chained_publish() {
     // opener floors to the *same* page as the entry it claimed, so there is
     // no page to publish and #186's capture path already worked. The lineage
     // has to come out the same either way.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     sched
         .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
@@ -795,7 +804,7 @@ fn a_prompt_that_ends_at_the_checkpoint_prefills_nothing_at_all() {
     // that *is* the retained head. The claim alone puts the sequence where
     // its prompt ends — position, pending token and all — so there is no span
     // left to warm, and the job that builds the sequence carries no tokens.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -827,7 +836,7 @@ fn a_backend_that_declines_the_capture_retains_nothing() {
     // pool, a sequence the leaf will not capture. The chunk lands normally,
     // the request is none the wiser, and the ledger records no entry, so the
     // scheduler and the device never disagree about what exists.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     compute.refuse_capture(n);
@@ -843,7 +852,7 @@ fn a_backend_that_declines_the_capture_retains_nothing() {
 
 #[test]
 fn prompt_reuse_off_captures_and_reuses_nothing() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig {
@@ -876,7 +885,7 @@ fn prompt_reuse_off_captures_and_reuses_nothing() {
 fn cancel_after_the_capture_keeps_the_checkpoint() {
     // "As a client whose request was cancelled mid-decode, I want the prompt
     // checkpoint kept, so that the client's retry hits" (spec, story 8).
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     sched.advance(); // the publish chunk
@@ -900,7 +909,7 @@ fn cancel_after_the_capture_keeps_the_checkpoint() {
 fn cancel_before_the_capture_leaves_none() {
     // No partial checkpoints: a request cancelled before it reached its
     // opener leaves nothing behind, however far its prefill had got.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), config());
     let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     sched.advance(); // the publish chunk only — the opener is not reached yet
@@ -929,14 +938,14 @@ fn tight_pool(prompt_reuse: bool) -> SchedulerConfig {
         kv_capacity_pages: 8,
         kv_page_tokens: PAGE,
         prompt_reuse,
-        ..SchedulerConfig::default()
+        ..crate::sections().scale(SchedulerConfig::default())
     }
 }
 
 /// Run turn N to completion, then the `hungry` request that needs the whole
 /// KV pool, and report every event the second one's admission produced.
 fn retained_then_hungry(prompt_reuse: bool) -> (Vec<SchedEvent>, Arc<MockCompute>, u32) {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), tight_pool(prompt_reuse));
     sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -1028,7 +1037,7 @@ fn a_prefix_a_live_request_stands_on_is_not_given_up_for_nothing() {
     // checkpoint in the pool and still not fit. The pool must come through
     // the pressure intact, and the request must go to the eviction machinery
     // instead, which is what that machinery is for.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), tight_pool(true));
     sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -1143,7 +1152,7 @@ fn the_retained_pool_holds_the_identity_the_backend_reports() {
 
 #[test]
 fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), tight_pool(true));
     let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -1189,7 +1198,7 @@ fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
 
 #[test]
 fn a_kv_ram_match_clearing_the_floor_restores_without_shared_page_accounting() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute,
         SchedulerConfig {
@@ -1197,7 +1206,7 @@ fn a_kv_ram_match_clearing_the_floor_restores_without_shared_page_accounting() {
             max_sequence_tokens: 1280,
             kv_capacity_pages: 80,
             kv_page_tokens: PAGE,
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
     );
     let history = tokens(1, 1100);

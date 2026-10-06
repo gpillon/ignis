@@ -31,6 +31,47 @@ GitHub, not open questions.
   projections and is a plan line.
 - The trace replay uses the routing traces spec 01 records.
 
+## Departures (2026-10-05, measured)
+
+Accepted by the coordinator under the owner's rule that the method the data
+favours is the default. Evidence:
+`docs/findings/2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md`
+and `docs/findings/2026-10-05-expert-residency-replayed-on-the-study-s-routing.md`.
+
+- **Miss path: device-resident.** An SM-driven copy from mapped pinned memory
+  reaches 88-112% of the copy engine with 8-16 blocks; the 80% rule picks the
+  device LRU and the copy kernel.
+- **Pool split: as one LRU would hold the cache, not by raw traffic share.**
+  Each class's pool is its expected occupancy under a single LRU of the
+  cache's size, computed at load from the sidecar's per-expert traffic (the
+  Che approximation). Pools proportional to traffic starved the K = 2 classes
+  and cost 1.48x the simulated residency at three lanes (13.5 against
+  9.1 ms per round); the occupancy split costs 1.23x (11.15 ms) and matches
+  one lane (3.77 against 3.8 ms). The rest of the gap is the partition
+  itself: a single byte-LRU on the same routing costs 9.07 ms. The known
+  route to 1.0x, not needed for acceptance 5, is a byte-LRU across classes
+  (a larger slot hosting a smaller projection, or periodic rebalancing).
+- **Prefetch on a per-step byte budget (a load option).** Unbudgeted, W = 16
+  moves 72.5 MB per token at one lane and 295 MB per round at three: 7.2 and
+  29 ms of link per 6-7 ms round. A decode step's prefetches are taken in
+  rank order (every lane's best expert first) and a candidate that would pass
+  the budget is skipped. The default is one layer's share of the round at the
+  measured link bandwidth (6 ms at one lane, +0.5 ms per lane, 12 GB/s),
+  never below the largest class's projection: one lane then hits 96.5% with
+  2.37 ms of demand misses where no prefetch costs 3.77 ms. A prefill streams
+  its lookahead whole.
+- **W counts experts**, each bringing both its projections: the router ranks
+  experts, and the study's 62/77/81% recall is per expert.
+- **The staging ring holds two of the heaviest layer's projections**, the
+  most a chunk can touch in a layer, so it cannot overflow (about 1.6 GB at
+  2.5 bits).
+- **Units.** The 6 GB host margin and the 12 GB cache floor are GiB, as every
+  plan line of the repo is (`--vram-headroom-bytes` defaults to 1 GiB).
+- **The printed hit-rate expectation** (user story 3) is the per-class LRU's
+  expected hit rate from calibration rates alone. It sees no locality: 73.8%
+  at 21.5 GB where the replay measures 94.5%, so it compares plans, it does
+  not predict tok/s.
+
 ## Problem Statement
 
 The expert kernels (spec 02) need the selected experts in VRAM, and VRAM holds

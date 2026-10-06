@@ -25,13 +25,17 @@ pub mod binding;
 pub mod binder;
 pub mod checksum;
 pub mod device;
+pub mod direct;
 pub mod fixture;
+pub mod flash_next;
 pub mod frontend;
 pub mod inventory;
 pub mod materializer;
 pub mod normalize;
+pub mod packer;
 pub mod f64_reference;
 pub mod vision;
+pub mod writer;
 
 /// FFI declarations for the kernel leaf's device surface (feature `cuda`
 /// only — the default build is pure Rust).
@@ -45,12 +49,14 @@ pub mod kv_budget;
 
 pub use binding::{Binding, Bf16View, Nvfp4View};
 pub use binder::{
-    Binder, DevicePlacement, HostPlacement, MaterializationPlan, ObjectHandle,
+    Binder, DevicePlacement, ExpertPoolPlacement, HostPlacement, MaterializationPlan, ObjectHandle,
+    StreamedPlacement,
 };
 pub use checksum::{
     verify, ChecksumReport, GraftedSource, Nvfp4Record, ObjectCheck, Outcome, Sidecar,
 };
 pub use device::{CpuDevice, Device, DeviceBuffer};
+pub use direct::{AlignedBuffer, DirectReader};
 #[cfg(feature = "cuda")]
 pub use device::CudaDevice;
 #[cfg(feature = "cuda")]
@@ -60,6 +66,7 @@ pub use frontend::{
     FRONTEND_RESOURCES, FrontendSet,
     MessageContent, ReasoningEffort, Role, ThinkingCapabilities, ToolCall, Tokenizer,
 };
+pub use writer::{directory_json, ContainerWriter, WriterState};
 pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};
 pub use normalize::{normalize_tensor, NormalizedTensor};
 pub use inventory::{
@@ -152,6 +159,12 @@ const V1_MAGIC: [u8; 8] = *b"NINFER\x00\x01";
 // ---------------------------------------------------------------------------
 
 /// Persistent numeric formats (the closed v2 registry).
+///
+/// The last six are Flash-Next's (spec flash-next/01, layout.md): the
+/// n-gram hash buffers' I64, the n-gram table's INT4, and the expert
+/// projections' trellis at each K (ADR 0044) — K is part of the format
+/// because the closed directory entry has no other place for it, and the
+/// stored size, which the reader checks, depends on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NumericFormat {
     Bf16,
@@ -163,6 +176,15 @@ pub enum NumericFormat {
     W8G32F16S,
     Nvfp4,
     Fp8E4M3FnRowBf16S,
+    /// Little-endian two's-complement 64-bit integers.
+    I64,
+    /// 4-bit codes (value = nibble − 8) with one fp16 scale per 32 values.
+    Q4G32F16S,
+    /// ExLlamaV3's trellis, mul1 codebook, at K = 2, 2.5, 3, 4 bits.
+    TrellisMul1K2,
+    TrellisMul1K2p5,
+    TrellisMul1K3,
+    TrellisMul1K4,
 }
 
 impl NumericFormat {
@@ -177,6 +199,23 @@ impl NumericFormat {
             Self::W8G32F16S => "W8G32_F16S",
             Self::Nvfp4 => "NVFP4",
             Self::Fp8E4M3FnRowBf16S => "FP8_E4M3FN_ROW_BF16S",
+            Self::I64 => "I64",
+            Self::Q4G32F16S => "Q4G32_F16S",
+            Self::TrellisMul1K2 => "TRELLIS_MUL1_K2",
+            Self::TrellisMul1K2p5 => "TRELLIS_MUL1_K2P5",
+            Self::TrellisMul1K3 => "TRELLIS_MUL1_K3",
+            Self::TrellisMul1K4 => "TRELLIS_MUL1_K4",
+        }
+    }
+
+    /// `2·K` for a trellis format (4, 5, 6, 8), `None` for any other.
+    pub fn trellis_k2(self) -> Option<u64> {
+        match self {
+            Self::TrellisMul1K2 => Some(4),
+            Self::TrellisMul1K2p5 => Some(5),
+            Self::TrellisMul1K3 => Some(6),
+            Self::TrellisMul1K4 => Some(8),
+            _ => None,
         }
     }
 
@@ -191,6 +230,12 @@ impl NumericFormat {
             "W8G32_F16S" => Self::W8G32F16S,
             "NVFP4" => Self::Nvfp4,
             "FP8_E4M3FN_ROW_BF16S" => Self::Fp8E4M3FnRowBf16S,
+            "I64" => Self::I64,
+            "Q4G32_F16S" => Self::Q4G32F16S,
+            "TRELLIS_MUL1_K2" => Self::TrellisMul1K2,
+            "TRELLIS_MUL1_K2P5" => Self::TrellisMul1K2p5,
+            "TRELLIS_MUL1_K3" => Self::TrellisMul1K3,
+            "TRELLIS_MUL1_K4" => Self::TrellisMul1K4,
             other => return Err(fail(format!("unknown tensor format: {other}"))),
         })
     }
@@ -203,6 +248,12 @@ pub enum StorageLayout {
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
     RowScaleV1,
+    /// One Flash-Next expert projection: trellis plane, `suh`, `svh`, zero
+    /// padding to 4096 ([`trellis_geometry`]).
+    TrellisTile16V1,
+    /// Fixed-stride rows, each its codes then its scales: row `r` is one
+    /// read at `r · stride` ([`row_interleaved_geometry`]).
+    RowInterleavedV1,
 }
 
 impl StorageLayout {
@@ -212,6 +263,8 @@ impl StorageLayout {
             Self::RowSplitK128V1 => "row-split-k128-v1",
             Self::BlockScaleK16M128x4V1 => "blockscale-k16-m128x4-v1",
             Self::RowScaleV1 => "row-scale-v1",
+            Self::TrellisTile16V1 => "trellis-tile16-v1",
+            Self::RowInterleavedV1 => "row-interleaved-v1",
         }
     }
 
@@ -221,6 +274,8 @@ impl StorageLayout {
             "row-split-k128-v1" => Self::RowSplitK128V1,
             "blockscale-k16-m128x4-v1" => Self::BlockScaleK16M128x4V1,
             "row-scale-v1" => Self::RowScaleV1,
+            "trellis-tile16-v1" => Self::TrellisTile16V1,
+            "row-interleaved-v1" => Self::RowInterleavedV1,
             other => return Err(fail(format!("unknown tensor layout: {other}"))),
         })
     }
@@ -247,9 +302,17 @@ impl ResourceEncoding {
     }
 }
 
-/// File alignment for a tensor layout (all tensor layouts align to 256 B).
-pub fn tensor_alignment(_layout: StorageLayout) -> u64 {
-    TENSOR_ALIGNMENT
+/// File alignment for a tensor layout: 256 B, except the two Flash-Next
+/// layouts read by direct I/O straight from the file (an expert projection
+/// is one 4096-aligned copy, the n-gram table's rows are read in place).
+pub fn tensor_alignment(layout: StorageLayout) -> u64 {
+    match layout {
+        StorageLayout::TrellisTile16V1 | StorageLayout::RowInterleavedV1 => DIRECT_IO_ALIGNMENT,
+        StorageLayout::ContiguousLeV1
+        | StorageLayout::RowSplitK128V1
+        | StorageLayout::BlockScaleK16M128x4V1
+        | StorageLayout::RowScaleV1 => TENSOR_ALIGNMENT,
+    }
 }
 
 /// File alignment for a resource encoding (raw bytes align to 1 B).
@@ -304,6 +367,40 @@ pub struct RowScaleGeometry {
     pub encoded_bytes: u64,
 }
 
+/// Geometry of a `trellis-tile16-v1` expert projection (layout.md §3).
+///
+/// The shape is `[out, in]` like every other layout's; the bytes are
+/// ExLlamaV3's tensors bit for bit: the trellis (`in·out·K/8` bytes, int16
+/// `(in/16, out/16, 16·K)`), `suh` (`in` fp16), `svh` (`out` fp16), then
+/// zeros to the next multiple of 4096 — so the size depends on the shape
+/// and K alone, and every record starts where a direct read can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrellisGeometry {
+    pub rows: u64,
+    pub columns: u64,
+    /// `2·K`.
+    pub k2: u64,
+    pub trellis_bytes: u64,
+    pub suh_offset: u64,
+    pub svh_offset: u64,
+    /// Trellis + scales, before the padding.
+    pub data_bytes: u64,
+    pub encoded_bytes: u64,
+}
+
+/// Geometry of a `row-interleaved-v1` (Q4G32_F16S) payload: `rows` rows of
+/// `columns / 2` code bytes (value `2j` in byte `j`'s low nibble) followed
+/// by `columns / 32` fp16 scales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowInterleavedGeometry {
+    pub rows: u64,
+    pub columns: u64,
+    /// Offset of a row's scales inside the row.
+    pub scale_offset: u64,
+    pub row_bytes: u64,
+    pub encoded_bytes: u64,
+}
+
 /// (group_size, base_bytes_per_group, high_bytes_per_group) per quantized
 /// format for `row-split-k128-v1`.
 fn quant_geometry(format: NumericFormat) -> Result<(u64, u64, u64)> {
@@ -323,7 +420,8 @@ fn direct_word_bytes(format: NumericFormat) -> Result<u64> {
     Ok(match format {
         NumericFormat::Bf16 => 2,
         NumericFormat::Fp32 | NumericFormat::I32 => 4,
-        _ => return Err(fail("contiguous-le-v1 requires BF16, FP32, or I32")),
+        NumericFormat::I64 => 8,
+        _ => return Err(fail("contiguous-le-v1 requires BF16, FP32, I32, or I64")),
     })
 }
 
@@ -370,7 +468,72 @@ pub fn tensor_encoded_size(
         StorageLayout::RowScaleV1 => {
             Ok(row_scale_geometry(format, shape)?.encoded_bytes)
         }
+        StorageLayout::TrellisTile16V1 => Ok(trellis_geometry(format, shape)?.encoded_bytes),
+        StorageLayout::RowInterleavedV1 => {
+            Ok(row_interleaved_geometry(format, shape)?.encoded_bytes)
+        }
     }
+}
+
+/// Geometry of a `trellis-tile16-v1` payload for a (format, shape) tensor.
+///
+/// Requires a trellis format and a positive rank-two `[out, in]` shape
+/// whose dimensions are multiples of 128 (the 16×16 tiles, and the 128-wide
+/// Hadamard rotation on both sides).
+pub fn trellis_geometry(format: NumericFormat, shape: &[u64]) -> Result<TrellisGeometry> {
+    let k2 = format
+        .trellis_k2()
+        .ok_or_else(|| fail("trellis-tile16-v1 requires a TRELLIS format"))?;
+    require_rank2("trellis-tile16-v1", shape)?;
+    let (rows, columns) = (shape[0], shape[1]);
+    if rows % 128 != 0 || columns % 128 != 0 {
+        return Err(fail("trellis-tile16-v1 requires both dimensions divisible by 128"));
+    }
+    let elements = checked_mul(rows, columns, "trellis element count")?;
+    // 16·K int16 words per 256-weight tile: elements · 2K / 16 bytes.
+    let trellis_bytes = checked_mul(elements / 16, k2, "trellis plane bytes")?;
+    let suh_offset = trellis_bytes;
+    let svh_offset = checked_add(suh_offset, checked_mul(columns, 2, "suh bytes")?, "svh offset")?;
+    let data_bytes = checked_add(svh_offset, checked_mul(rows, 2, "svh bytes")?, "trellis data bytes")?;
+    let encoded_bytes = align_up(data_bytes, DIRECT_IO_ALIGNMENT, "trellis record bytes")?;
+    Ok(TrellisGeometry {
+        rows,
+        columns,
+        k2,
+        trellis_bytes,
+        suh_offset,
+        svh_offset,
+        data_bytes,
+        encoded_bytes,
+    })
+}
+
+/// Geometry of a `row-interleaved-v1` payload for a (format, shape) tensor.
+///
+/// Requires Q4G32_F16S and a positive rank-two shape whose column count is
+/// a multiple of 32.
+pub fn row_interleaved_geometry(
+    format: NumericFormat,
+    shape: &[u64],
+) -> Result<RowInterleavedGeometry> {
+    if format != NumericFormat::Q4G32F16S {
+        return Err(fail("row-interleaved-v1 requires Q4G32_F16S"));
+    }
+    require_rank2("row-interleaved-v1", shape)?;
+    let (rows, columns) = (shape[0], shape[1]);
+    if columns % 32 != 0 {
+        return Err(fail("row-interleaved-v1 requires a column count divisible by 32"));
+    }
+    let scale_offset = columns / 2;
+    let row_bytes = scale_offset + columns / 32 * 2;
+    let encoded_bytes = checked_mul(rows, row_bytes, "row-interleaved tensor encoded size")?;
+    Ok(RowInterleavedGeometry {
+        rows,
+        columns,
+        scale_offset,
+        row_bytes,
+        encoded_bytes,
+    })
 }
 
 /// Geometry of a `row-split-k128-v1` payload for a (format, shape) tensor.
@@ -1360,11 +1523,91 @@ mod tests {
     }
 
     #[test]
+    fn trellis_records_have_the_converters_eight_class_sizes() {
+        // layout.md §3's class table: (shape [out, in], k2) -> record bytes.
+        let gate_up = [1280u64, 2560];
+        let down = [2560u64, 640];
+        let classes = [
+            (gate_up, NumericFormat::TrellisMul1K2, 819_200, 826_880, 827_392),
+            (gate_up, NumericFormat::TrellisMul1K2p5, 1_024_000, 1_031_680, 1_032_192),
+            (gate_up, NumericFormat::TrellisMul1K3, 1_228_800, 1_236_480, 1_236_992),
+            (gate_up, NumericFormat::TrellisMul1K4, 1_638_400, 1_646_080, 1_646_592),
+            (down, NumericFormat::TrellisMul1K2, 409_600, 416_000, 417_792),
+            (down, NumericFormat::TrellisMul1K2p5, 512_000, 518_400, 520_192),
+            (down, NumericFormat::TrellisMul1K3, 614_400, 620_800, 622_592),
+            (down, NumericFormat::TrellisMul1K4, 819_200, 825_600, 827_392),
+        ];
+        for (shape, format, trellis, data, record) in classes {
+            let g = trellis_geometry(format, &shape).unwrap();
+            assert_eq!((g.trellis_bytes, g.data_bytes, g.encoded_bytes), (trellis, data, record), "{format:?} {shape:?}");
+            assert_eq!(g.suh_offset, trellis);
+            assert_eq!(g.svh_offset, trellis + 2 * shape[1], "suh holds one fp16 per input channel");
+            assert_eq!(
+                tensor_encoded_size(StorageLayout::TrellisTile16V1, format, &shape).unwrap(),
+                record
+            );
+        }
+        assert_eq!(tensor_alignment(StorageLayout::TrellisTile16V1), 4096);
+    }
+
+    #[test]
+    fn an_ngram_table_row_is_ninety_bytes() {
+        // layout.md §7.1: 160 values -> 80 code bytes + 5 fp16 scales.
+        let g = row_interleaved_geometry(NumericFormat::Q4G32F16S, &[320_001_536, 160]).unwrap();
+        assert_eq!(g.scale_offset, 80);
+        assert_eq!(g.row_bytes, 90);
+        assert_eq!(g.encoded_bytes, 28_800_138_240);
+        assert_eq!(tensor_alignment(StorageLayout::RowInterleavedV1), 4096);
+        assert_eq!(
+            tensor_encoded_size(StorageLayout::ContiguousLeV1, NumericFormat::I64, &[16]).unwrap(),
+            128
+        );
+    }
+
+    #[test]
+    fn the_flash_next_codes_round_trip_through_their_names() {
+        for format in [
+            NumericFormat::I64,
+            NumericFormat::Q4G32F16S,
+            NumericFormat::TrellisMul1K2,
+            NumericFormat::TrellisMul1K2p5,
+            NumericFormat::TrellisMul1K3,
+            NumericFormat::TrellisMul1K4,
+        ] {
+            assert_eq!(NumericFormat::parse(format.name()).unwrap(), format);
+        }
+        for layout in [StorageLayout::TrellisTile16V1, StorageLayout::RowInterleavedV1] {
+            assert_eq!(StorageLayout::parse(layout.name()).unwrap(), layout);
+        }
+    }
+
+    #[test]
+    fn a_trellis_record_off_a_4096_boundary_is_rejected() {
+        // 256-aligned (enough for every 27B layout) but not 4096-aligned.
+        let record = 20_480u64; // [256, 256] at K = 2, padded
+        let directory = dir_with(&format!(
+            r#"{{"name":"t/x","kind":"tensor","shape":[4,8],"format":"BF16",
+                 "layout":"contiguous-le-v1","offset":0,"bytes":64}},
+               {{"name":"e/0","kind":"tensor","shape":[256,256],"format":"TRELLIS_MUL1_K2",
+                 "layout":"trellis-tile16-v1","offset":256,"bytes":{record}}}"#
+        ));
+        let file = build_artifact(&directory, &vec![0u8; 256 + record as usize]);
+        with_artifact_file("trellis-misaligned", &file, |path| {
+            let err = Reader::open(path).unwrap_err().to_string();
+            assert!(err.contains("e/0 is not 4096-byte aligned"), "{err}");
+        });
+    }
+
+    #[test]
     fn geometry_rejects_bad_combos() {
         assert!(block_scale_geometry(NumericFormat::Bf16, &[128, 64]).is_err());
         assert!(block_scale_geometry(NumericFormat::Nvfp4, &[64, 64]).is_err());
         assert!(row_scale_geometry(NumericFormat::Bf16, &[256, 512]).is_err());
         assert!(row_split_geometry(NumericFormat::Bf16, &[128, 128]).is_err());
+        assert!(trellis_geometry(NumericFormat::Bf16, &[256, 256]).is_err());
+        assert!(trellis_geometry(NumericFormat::TrellisMul1K2, &[256, 192]).is_err());
+        assert!(row_interleaved_geometry(NumericFormat::Q4G64F16S, &[10, 160]).is_err());
+        assert!(row_interleaved_geometry(NumericFormat::Q4G32F16S, &[10, 100]).is_err());
     }
 
     // -- reader round trip ---------------------------------------------------
@@ -1417,6 +1660,27 @@ mod tests {
                 dst,
                 &reader.mapped_bytes()[payload_offset as usize..(payload_offset + 4096) as usize]
             );
+        });
+    }
+
+    #[test]
+    fn a_directory_padded_with_trailing_spaces_reads_as_the_same_directory() {
+        // The streaming writer reserves the header region before it knows
+        // the directory and pads the JSON it writes there with spaces: JSON
+        // allows trailing whitespace, and `json_bytes` then covers the whole
+        // reservation.
+        let directory = dir_with(
+            r#"{"name":"t/x","kind":"tensor","shape":[4,8],"format":"BF16",
+                 "layout":"contiguous-le-v1","offset":0,"bytes":64}"#,
+        );
+        let padded = format!("{directory}{}", " ".repeat(8192 - directory.len()));
+        let file = build_artifact(&padded, &[0xA5u8; 64]);
+        with_artifact_file("padded-directory", &file, |path| {
+            let reader = Reader::open(path).expect("a space-padded directory parses");
+            assert_eq!(reader.objects().len(), 1);
+            // 16-byte prefix + 8192 bytes of JSON, rounded up to 4096.
+            assert_eq!(reader.payload_offset(), 12288);
+            assert_eq!(reader.payload("t/x").unwrap().data, &[0xA5u8; 64]);
         });
     }
 

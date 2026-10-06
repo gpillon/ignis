@@ -23,6 +23,15 @@ use ignis_core::host::{RetainedBlob, Tier};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
+/// What the mock charges a KV-RAM blob: one nominal byte in this suite's own
+/// run; Flash-Next's image and per-token bytes when `flash_next_reuse.rs`
+/// mounts it (spec flash-next/05), which is why every mock and every KV-RAM
+/// capacity below goes through it.
+#[allow(dead_code)]
+fn sections() -> ignis_core::MockSections {
+    ignis_core::MockSections::NOMINAL
+}
+
 const MODEL: &str = "qwen3.8-27b";
 const PAGE: u32 = 16;
 
@@ -61,8 +70,8 @@ fn tight(host: u64) -> SchedulerConfig {
         max_sequence_tokens: 1280,
         kv_capacity_pages: 80 + 1,
         kv_page_tokens: PAGE,
-        host_capacity_bytes: host,
-        ..SchedulerConfig::default()
+        host_capacity_bytes: crate::sections().capacity_for(host, 1280),
+        ..crate::sections().scale(SchedulerConfig::default())
     }
 }
 
@@ -193,7 +202,7 @@ fn occupancy_reports_both_pools_and_empties_when_nothing_is_retained() {
     // reuse off nothing is left behind, so the pool must come back to zero on
     // the very step that releases the last request — there is no later one:
     // the server sends no tick while the scheduler is idle.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig { prompt_reuse: false, retained_slots: 0, ..tight(4) },
         compute.clone(),
@@ -219,12 +228,16 @@ fn occupancy_reports_the_kv_ram_arena_a_spill_filled() {
     // snapshots and retained blobs together. Nothing else in the process
     // knows the figure, which is why ADR 0030 takes it off the scheduler
     // rather than by asking the leaf.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(2), compute.clone());
     assert_eq!(sched.occupancy().kv_ram_used_bytes, 0, "nothing spilled yet");
 
     turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Agent);
-    assert_eq!(sched.occupancy().kv_ram_used_bytes, 1, "the blob is charged to the arena");
+    assert_eq!(
+        sched.occupancy().kv_ram_used_bytes,
+        crate::sections().blob_bytes(1150),
+        "the blob is charged to the arena"
+    );
     assert_eq!(
         sched.occupancy().kv_ram_used_bytes,
         sched.host().used_bytes(),
@@ -258,7 +271,7 @@ fn occupancy_reports_the_kv_ram_arena_a_spill_filled() {
 
 #[test]
 fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_going() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
 
     let n = sched.submit(with_block(turn_at(1)), RequestClass::Interactive).unwrap();
@@ -352,7 +365,7 @@ fn a_kv_ram_claimant_with_no_opener_to_capture_at_pays_no_chunk_split() {
     // What it would publish is a head over history it restored, which only
     // earns a split when a checkpoint is captured there — the rule a device
     // claimant's chained publish already follows.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
     turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
 
@@ -381,7 +394,7 @@ fn a_kv_ram_claimant_with_no_opener_to_capture_at_pays_no_chunk_split() {
 
 #[test]
 fn nothing_crosses_to_kv_ram_while_the_device_has_room() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     // Room means retained slots too (GitHub #215): a conversation of two turns
     // holds four — two links of its chain and its two checkpoints — so three
     // of them need twelve.
@@ -389,7 +402,7 @@ fn nothing_crosses_to_kv_ram_while_the_device_has_room() {
         SchedulerConfig {
             model: MODEL.into(),
             retained_slots: 12,
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
         compute.clone(),
     );
@@ -416,12 +429,12 @@ fn nothing_crosses_to_kv_ram_while_the_device_has_room() {
 
 #[test]
 fn a_retained_agent_checkpoint_is_discarded_before_an_evicted_interactive_sequence() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(2), compute.clone());
 
     let agent_turn = turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Agent);
     assert_eq!(compute.spilled_checkpoints(), vec![agent_turn]);
-    assert_eq!(sched.host().used_bytes(), 1, "KV-RAM: the Agent blob");
+    assert_eq!(sched.host().used_bytes(), crate::sections().blob_bytes(1150), "KV-RAM: the Agent blob");
 
     // Eight Interactive requests hold every lane; two more Interactive heads
     // each take one by snapshotting a lane holder into KV-RAM. The second
@@ -463,7 +476,7 @@ fn a_retained_agent_checkpoint_is_discarded_before_an_evicted_interactive_sequen
 
 #[test]
 fn a_spill_never_displaces_a_higher_ranked_entry_until_it_has_sat_idle_past_the_ttl() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let (clock, elapsed) = manual_clock();
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
@@ -514,7 +527,7 @@ fn a_spill_never_displaces_a_higher_ranked_entry_until_it_has_sat_idle_past_the_
 
 #[test]
 fn a_spill_the_leaf_fails_discards_only_the_victim() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
     let kept = turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Agent);
 
@@ -533,7 +546,7 @@ fn a_spill_the_leaf_fails_discards_only_the_victim() {
 
 #[test]
 fn prompt_reuse_without_a_kv_ram_budget_discards_what_the_device_gives_up() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(0), compute.clone());
     let turn = turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
 
@@ -546,7 +559,7 @@ fn prompt_reuse_without_a_kv_ram_budget_discards_what_the_device_gives_up() {
 
 #[test]
 fn a_kv_ram_restore_is_promoted_only_when_it_lands() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
     turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
     let blob = RetainedBlob::Checkpoint(sched.checkpoint_pool().entries()[0].id);
@@ -575,7 +588,7 @@ fn a_kv_ram_restore_is_promoted_only_when_it_lands() {
 
 #[test]
 fn a_request_cancelled_before_its_kv_ram_restore_lands_lets_the_blob_go() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
     turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
     let blob = RetainedBlob::Checkpoint(sched.checkpoint_pool().entries()[0].id);
@@ -596,7 +609,7 @@ fn a_request_cancelled_before_its_kv_ram_restore_lands_lets_the_blob_go() {
 
 #[test]
 fn a_first_turn_misses_every_configured_tier_once() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut with_kv_ram = ConcreteScheduler::with_config(tight(4), compute.clone());
     with_kv_ram.submit(turn_at(1), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut with_kv_ram);
@@ -617,7 +630,7 @@ fn a_first_turn_misses_every_configured_tier_once() {
         );
     }
 
-    let mut device_only = ConcreteScheduler::with_config(tight(0), Arc::new(MockCompute::new()));
+    let mut device_only = ConcreteScheduler::with_config(tight(0), Arc::new(MockCompute::with_sections(crate::sections())));
     device_only.submit(turn_at(1), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut device_only);
     assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::Device), 1);
@@ -630,11 +643,11 @@ fn a_first_turn_misses_every_configured_tier_once() {
 
 #[test]
 fn a_superseded_checkpoint_is_reported_as_a_discard_from_its_tier() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
-            ..SchedulerConfig::default()
+            ..crate::sections().scale(SchedulerConfig::default())
         },
         compute.clone(),
     );
@@ -702,7 +715,7 @@ fn widths(compute: &MockCompute, request: RequestId) -> Vec<usize> {
 
 #[test]
 fn a_burst_block_the_device_gave_up_comes_back_once_and_the_burst_shares_it() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(8), compute.clone());
 
     let first = sched.submit(subagent(10_000), RequestClass::Agent).unwrap();
@@ -754,7 +767,7 @@ fn a_burst_block_the_device_gave_up_comes_back_once_and_the_burst_shares_it() {
 #[test]
 fn a_block_short_of_the_restore_floor_stays_in_kv_ram() {
     // Four pages cost less to prefill than to bring across the bus.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(8), compute.clone());
     let small = |question| RequestInput {
         system_block_tokens: Some(BLOCK),
@@ -778,7 +791,7 @@ fn a_block_short_of_the_restore_floor_stays_in_kv_ram() {
 fn a_subagent_block_in_kv_ram_gives_way_to_the_main_conversation() {
     // One blob fits. The burst's block is an Agent's bet; the main
     // conversation's checkpoint outranks it.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(tight(1), compute.clone());
     let first = sched.submit(subagent(10_000), RequestClass::Agent).unwrap();
     run_to_idle(&mut sched);

@@ -59,6 +59,16 @@
  * version-4 drafter blob lists one section more than this leaf's table. */
 inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 5;
 
+/* GitHub #303 (spec flash-next/05): a Flash-Next pool's blobs number their
+ * own layout, per model family -- family 1 in the high byte, its version in
+ * the low -- so a blob of one family is never read as the other's whatever
+ * either side's version is. 1: the 27B's sections plus the indexer's keys,
+ * its tail and the n-gram conv state. The Flash-Next leaf (Rust,
+ * flash_next_leaf.rs) puts its n-gram hashing context in a 256-byte block
+ * before these bytes and names this version in its blob identity: changing
+ * that block bumps it. */
+inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersionFlashNext = 0x101;
+
 /* 'IGNISSNP' little-endian: the first thing a restore checks, so a foreign
  * buffer is refused before any of its fields are believed. */
 inline constexpr std::uint64_t kIgnisSeqSnapshotMagic = 0x504E5353494E4749ULL;
@@ -113,7 +123,20 @@ enum ignis_seq_section_kind {
    * page-indexed, which is why it is a CLONE section rather than riding the
    * shareable KV pages -- a claimant or a restored sequence addresses its
    * own slot row, never the one the image was taken from. */
-  IGNIS_SEQ_SECTION_HQ_RESIDUAL = 7
+  IGNIS_SEQ_SECTION_HQ_RESIDUAL = 7,
+  /* GitHub #303 (spec flash-next/05): the QSA indexer's complete blocks'
+   * keys, paged like the KV -- every attention layer's keys of the
+   * `kv_page_count` pages, layer by layer, page by page in the sequence's
+   * logical order. SHAREABLE: a block key is written once, when the block
+   * completes, and a claimant of a prefix reads its pages' keys in place. */
+  IGNIS_SEQ_SECTION_INDEXER_KEYS = 8,
+  /* GitHub #303: the indexer's incomplete block -- its raw keys, up to
+   * compress - 1 per attention layer -- slot-indexed, so CLONE, carried
+   * with the image (spec flash-next/05). */
+  IGNIS_SEQ_SECTION_INDEXER_TAIL = 9,
+  /* GitHub #303: the n-gram embedding's dilated conv state, its past input
+   * columns: CLONE, rewritten every step. */
+  IGNIS_SEQ_SECTION_NGRAM_CONV = 10
 };
 
 /* How a second sequence may come to hold a section (ADR 0024).
@@ -148,10 +171,22 @@ struct ignis_seq_section {
 inline constexpr std::size_t kIgnisSeqSectionCount = 5;
 inline constexpr std::size_t kIgnisSeqDflash2SectionCount = 1;
 inline constexpr std::size_t kIgnisSeqHqResidualSectionCount = 1;
+/* GitHub #303: the indexer's keys and tail, and the n-gram conv state. */
+inline constexpr std::size_t kIgnisSeqIndexerSectionCount = 2;
+inline constexpr std::size_t kIgnisSeqNgramSectionCount = 1;
 
 inline std::size_t ignis_seq_section_count(const ignis_seq_pool &pool) {
   return kIgnisSeqSectionCount + (pool.has_dflash2() ? kIgnisSeqDflash2SectionCount : 0) +
-         (pool.has_hq_residual() ? kIgnisSeqHqResidualSectionCount : 0);
+         (pool.has_hq_residual() ? kIgnisSeqHqResidualSectionCount : 0) +
+         (pool.has_indexer() ? kIgnisSeqIndexerSectionCount : 0) +
+         (pool.has_ngram_conv() ? kIgnisSeqNgramSectionCount : 0);
+}
+
+/* The blob layout version a pool of this family writes and accepts (GitHub
+ * #303): the 27B's, or Flash-Next's own numbering. */
+inline std::uint32_t ignis_seq_snapshot_format_version_of(const ignis_seq_pool &pool) {
+  return pool.has_flash_next_sections() ? kIgnisSeqSnapshotFormatVersionFlashNext
+                                        : kIgnisSeqSnapshotFormatVersion;
 }
 
 /* The progress scalars, as the IGNIS_SEQ_SECTION_PROGRESS payload. Fixed
@@ -306,7 +341,7 @@ inline ignis_seq_snapshot_geometry ignis_seq_snapshot_geometry_of(const ignis_se
   geometry.kv_head_dim     = static_cast<std::uint32_t>(pool.kv_head_dim);
   geometry.kv_page_size    = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
   geometry.kv_plane_count  = static_cast<std::uint32_t>(pool.kv_pool.plane_count());
-  geometry.gqa_layer_count = static_cast<std::uint32_t>(kIgnisGqaLayerCount);
+  geometry.gqa_layer_count = static_cast<std::uint32_t>(pool.kv_num_layers);
   geometry.kv_page_bytes   = pool.kv_page_bytes;
   geometry.gdn_num_layers  = gdn.layers;
   geometry.gdn_conv_channels        = static_cast<std::uint32_t>(gdn.conv_channels);
@@ -444,6 +479,12 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
   // step a restored sequence takes, so each must be cloned per sequence.
   push(IGNIS_SEQ_SECTION_KV_PAGES, IGNIS_SEQ_SECTION_SHAREABLE,
        ninfer::paged_kv_host_image_bytes(pool.kv_pool, kv_page_count));
+  // GitHub #303: the indexer's block keys ride with the KV pages they sit
+  // beside, and are shared the same way.
+  if (pool.has_indexer()) {
+    push(IGNIS_SEQ_SECTION_INDEXER_KEYS, IGNIS_SEQ_SECTION_SHAREABLE,
+         static_cast<std::uint64_t>(pool.kv_num_layers) * kv_page_count * pool.indexer_page_bytes());
+  }
   push(IGNIS_SEQ_SECTION_GDN_CONV, IGNIS_SEQ_SECTION_CLONE,
        pool.gdn_pool.conv_host_image_bytes());
   push(IGNIS_SEQ_SECTION_GDN_RECURRENT, IGNIS_SEQ_SECTION_CLONE,
@@ -469,6 +510,17 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
   if (pool.has_hq_residual()) {
     push(IGNIS_SEQ_SECTION_HQ_RESIDUAL, IGNIS_SEQ_SECTION_CLONE, pool.hq_residual_slot_bytes());
   }
+  // GitHub #303 (spec flash-next/05): Flash-Next's slot state. Consistent
+  // with the sections above at a completed chunk boundary: the chunk that
+  // appends a token's raw key and its conv column is the one the program's
+  // synchronize confirms (kernel/src/flash_next/program.cu).
+  if (pool.has_indexer()) {
+    push(IGNIS_SEQ_SECTION_INDEXER_TAIL, IGNIS_SEQ_SECTION_CLONE,
+         static_cast<std::uint64_t>(pool.kv_num_layers) * pool.indexer_tail_slot_bytes);
+  }
+  if (pool.has_ngram_conv()) {
+    push(IGNIS_SEQ_SECTION_NGRAM_CONV, IGNIS_SEQ_SECTION_CLONE, pool.ngram_conv_slot_bytes);
+  }
   push(IGNIS_SEQ_SECTION_PROGRESS, IGNIS_SEQ_SECTION_CLONE, sizeof(ignis_seq_progress_image));
   assert(sections.size() == ignis_seq_section_count(pool) &&
          "ignis_seq_section_count has drifted from the table above");
@@ -478,11 +530,20 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
   // first payload across an alignment boundary, and a drafter pool's blob
   // would outgrow a plain one's by more than its lane (P5-03, GitHub #152).
   // The unused records' bytes are zeroed like any other gap.
+  // GitHub #303: the Flash-Next sections' records fit the same aligned
+  // room (128 + 10 x 24 bytes still round to 512), so a 27B blob's payload
+  // starts where it always did.
   std::uint64_t cursor = ignis_seq_align_up(
-      sizeof(ignis_seq_snapshot_header) + (kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount +
-                                           kIgnisSeqHqResidualSectionCount) *
-                                              sizeof(ignis_seq_section),
+      sizeof(ignis_seq_snapshot_header) +
+          (kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount + kIgnisSeqHqResidualSectionCount +
+           kIgnisSeqIndexerSectionCount + kIgnisSeqNgramSectionCount) *
+              sizeof(ignis_seq_section),
       kIgnisSeqSectionAlign);
+  static_assert((sizeof(ignis_seq_snapshot_header) + 7 * sizeof(ignis_seq_section) + kIgnisSeqSectionAlign - 1) /
+                        kIgnisSeqSectionAlign ==
+                    (sizeof(ignis_seq_snapshot_header) + 10 * sizeof(ignis_seq_section) + kIgnisSeqSectionAlign - 1) /
+                        kIgnisSeqSectionAlign,
+                "the Flash-Next records moved a 27B blob's first payload");
   for (ignis_seq_section &section : sections) {
     section.offset = cursor;
     cursor = ignis_seq_align_up(cursor + section.bytes, kIgnisSeqSectionAlign);
@@ -521,6 +582,12 @@ inline const char *ignis_seq_section_name(std::int32_t kind) {
     return "dflash_window";
   case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
     return "hq_residual";
+  case IGNIS_SEQ_SECTION_INDEXER_KEYS:
+    return "indexer_keys";
+  case IGNIS_SEQ_SECTION_INDEXER_TAIL:
+    return "indexer_tail";
+  case IGNIS_SEQ_SECTION_NGRAM_CONV:
+    return "ngram_conv";
   default:
     return "unknown";
   }
@@ -533,7 +600,7 @@ ignis_seq_snapshot_header_for(const ignis_seq_pool &pool, std::uint32_t kv_page_
                               const std::vector<ignis_seq_section> &sections) {
   ignis_seq_snapshot_header header{};
   header.magic                = kIgnisSeqSnapshotMagic;
-  header.format_version       = kIgnisSeqSnapshotFormatVersion;
+  header.format_version       = ignis_seq_snapshot_format_version_of(pool);
   header.header_bytes         = static_cast<std::uint32_t>(sizeof(ignis_seq_snapshot_header));
   header.section_record_bytes = static_cast<std::uint32_t>(sizeof(ignis_seq_section));
   header.section_count        = static_cast<std::uint32_t>(sections.size());
