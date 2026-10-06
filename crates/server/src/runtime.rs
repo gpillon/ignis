@@ -460,6 +460,7 @@ pub fn cuda_scheduler_with_thinking_close(
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
         retained_host_bytes: reservations.retained_host_bytes,
+        flash_next: None,
     };
     Ok((sched, reserved))
 }
@@ -611,6 +612,9 @@ pub fn flash_next_scheduler(
     }
     drop(reader);
     let leaf = FlashNextLeaf::open(artifact_path, options)?;
+    // GitHub #301, #302: the exposition reads the leaf's counters through
+    // their cell, never through the leaf, which drops with its model.
+    let counters = leaf.counters();
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
     let stats = model.stats().map_err(|e| format!("runtime stats: {e:?}"))?;
     let capacity_pages = stats.kv_page_count;
@@ -636,6 +640,7 @@ pub fn flash_next_scheduler(
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
         retained_host_bytes: pool_plan.retained_host_bytes,
+        flash_next: Some(counters),
     };
     Ok((sched, reserved))
 }

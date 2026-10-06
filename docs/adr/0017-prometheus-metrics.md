@@ -87,6 +87,18 @@ the inference path names an exposition. Fixed labels: `class` the eight K-class
 spellings (`gate_up_k2` … `down_k4`), `phase=decode|prefill`,
 `state=capacity|in_use`; zeros exported. Only a Flash-Next load has an expert
 cache: a 27B load never renders them.
+Amended 2026-10-06 (#302, spec flash-next/04): three families for Flash-Next's
+**n-gram rows**, `ignis_ngram_rows_total{source=hot|file}`,
+`ignis_ngram_reads_total` and `ignis_ngram_read_bytes_total`, the table's last
+three rows. The leaf reads residency's counters and occupancy off the device
+after every step, and the n-gram table's on the host, into an atomics cell
+(`ignis_core::flash_next_counters`) that the projection holds and a scrape
+reads. Like #190's lifecycle facts, the reading is taken identically with
+metrics off and on: the leaf does not know whether anything reads the cell,
+so enabling metrics adds nothing to the inference path. Every Flash-Next
+family renders after all the others: a 27B load's exposition is the same
+bytes it was. An `in_use` series is absent, not zero, from a reading without
+occupancy.
 
 ## Context
 
@@ -261,6 +273,9 @@ The initial stable metric contract is:
 | `ignis_expert_bytes_moved_total` | counter | `phase=decode\|prefill` | Flash-Next: bytes of expert projections copied host-to-device, misses and prefetches (#301) |
 | `ignis_expert_residency_stall_seconds_total` | counter | none | Flash-Next: time the expert kernels waited on residency (#301) |
 | `ignis_expert_cache_slots` | gauge | `class`, `state=capacity\|in_use` | Flash-Next: VRAM expert cache slots per K class, reserved at load and in use (#301) |
+| `ignis_ngram_rows_total` | counter | `source=hot\|file` | Flash-Next: n-gram embedding rows staged for prefill spans and decode rounds, from the RAM hot-row cache or the artifact file (#302). A hot-row hit rate is `source="hot"` over the sum |
+| `ignis_ngram_reads_total` | counter | none | Flash-Next: reads issued to the artifact file for rows the hot-row cache did not hold (#302) |
+| `ignis_ngram_read_bytes_total` | counter | none | Flash-Next: bytes of those reads (#302) |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
 reserved lines (eleven, twelve since #257 added `hq_residual_window`), the budget, the KV pool's pages and page bytes, the
