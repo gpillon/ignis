@@ -75,3 +75,8 @@ required-features = ["cuda", "residual-tap"]
 [[example]]
 name = "flash_next_mtp_calibration"
 required-features = ["cuda", "residual-tap"]
+# Spec flash-next/07's measurement: tok/s at one to three lanes, speculation
+# off against the MTP head, and the verify round's column cost.
+[[example]]
+name = "flash_next_mtp_bench"
+required-features = ["cuda"]
