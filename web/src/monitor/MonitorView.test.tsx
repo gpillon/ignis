@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { IGNIS_EXPOSITION } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION } from "./fixture.ts";
 import { MonitorView } from "./MonitorView.tsx";
 import { applyScrape, initialMonitor } from "./scrape.ts";
 
@@ -95,6 +95,28 @@ describe("MonitorView", () => {
     expect(html).toContain("this load has none of it to give");
     expect(html).toContain("this load hands out none");
     expect(html).not.toContain("this scrape carries no bound to read it against");
+  });
+
+  it("draws a Flash-Next load's expert residency and n-gram rows, and a 27B load's neither", () => {
+    const now = Date.now();
+    // Ten seconds on: 900 decode hits and 100 misses, 50 tokens decoded.
+    const later = FLASH_NEXT_EXPOSITION.replace('ignis_expert_cache_hits_total{class="gate_up_k2",phase="decode"} 4000', 'ignis_expert_cache_hits_total{class="gate_up_k2",phase="decode"} 4900')
+      .replace('ignis_expert_cache_misses_total{class="down_k3",phase="decode"} 300', 'ignis_expert_cache_misses_total{class="down_k3",phase="decode"} 400')
+      .replace("ignis_decoded_tokens_total 12400", "ignis_decoded_tokens_total 12450");
+    const flashNext = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: FLASH_NEXT_EXPOSITION }, now - 10_000, 3), { kind: "ok", text: later }, now, 4);
+    const html = renderToStaticMarkup(<MonitorView state={flashNext} />);
+    expect(html).toContain('aria-label="Expert residency"');
+    expect(html).toContain('aria-label="N-gram rows"');
+    expect(html).toContain("90%");
+    expect(html).toContain("gate_up_k4");
+    // 2,999 of 3,000 down_k2 slots, both terms.
+    expect(html).toContain("2,999");
+    expect(html).not.toContain("not in ADR 0017");
+
+    const dense = applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2);
+    const html27b = renderToStaticMarkup(<MonitorView state={dense} />);
+    expect(html27b).not.toContain('aria-label="Expert residency"');
+    expect(html27b).not.toContain('aria-label="N-gram rows"');
   });
 
   it("says when the key is wanted instead of drawing charts", () => {

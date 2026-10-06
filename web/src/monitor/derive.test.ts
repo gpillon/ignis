@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { assessHealth, deriveDashboard, deriveMemory, type HealthInput, headerPulse, TOKENS_PER_KV_PAGE } from "./derive.ts";
 import type { Point } from "./history.ts";
-import { emptySnapshot, type Memory as MemorySeries, type Snapshot } from "./snapshot.ts";
+import { parseExposition } from "./exposition.ts";
+import { FLASH_NEXT_EXPOSITION } from "./fixture.ts";
+import { EXPERT_CLASSES, emptySnapshot, type Memory as MemorySeries, readSnapshot, type Snapshot } from "./snapshot.ts";
 
 const at = (ms: number, over: Partial<Snapshot>): Point => ({ at: ms, snap: { ...emptySnapshot(), ...over }, scrapeMs: 1 });
 const h = (le1: number, inf: number) => ({ bounds: [1, 2, Infinity], cumulative: [le1, inf, inf], sum: inf, count: inf });
@@ -100,6 +102,56 @@ describe("deriveDashboard", () => {
   });
 });
 
+
+describe("deriveDashboard on a Flash-Next load", () => {
+  // Ten seconds apart: 900 decode hits and 100 decode misses over 50 decoded
+  // tokens, 50 MB copied in, 800 n-gram rows of which 760 from RAM.
+  const first = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
+  const second = structuredClone(first);
+  second.decodedTokens = 12_450;
+  second.experts!.hits.gate_up_k2.decode = 4900;
+  second.experts!.misses.down_k3.decode = 400;
+  second.experts!.bytesMoved = { decode: 6_040_000_000, prefill: 9_010_000_000 };
+  second.experts!.stallSeconds = 0.25;
+  second.experts!.prefetchIssued = 920;
+  second.experts!.prefetchUsed = 735;
+  second.experts!.slots.gate_up_k4.inUse = 260;
+  second.ngram = { rows: { hot: 190_760, file: 10_040 }, reads: 6008, readBytes: 24_608_768 };
+  const points: Point[] = [
+    { at: 0, snap: first, scrapeMs: 1 },
+    { at: 10_000, snap: second, scrapeMs: 1 },
+  ];
+
+  it("reads the residency figures the owner diagnoses a slow turn by", () => {
+    const experts = deriveDashboard(points, 60_000)!.experts!;
+    expect(experts.decodeHitShare).toBeCloseTo(0.9);
+    expect(experts.prefillHitShare).toBeNull();
+    expect(experts.missesPerToken).toBeCloseTo(2);
+    expect(experts.bytesPerSec).toBeCloseTo(5_000_000);
+    expect(experts.bytesMoved).toEqual({ total: 15_050_000_000, window: 50_000_000 });
+    expect(experts.stallSeconds).toEqual({ total: 0.25, window: 0.25 });
+    expect(experts.prefetch).toEqual({ issued: { total: 920, window: 20 }, used: { total: 735, window: 15 } });
+    const gateUpK4 = experts.classes.find((c) => c.cls === "gate_up_k4")!;
+    expect(gateUpK4.slots).toMatchObject({ used: 260, capacity: 400, share: 0.65 });
+    expect(gateUpK4.hits).toEqual({ total: 800, window: 0 });
+    expect(experts.classes.map((c) => c.cls)).toEqual(EXPERT_CLASSES);
+  });
+
+  it("reads the n-gram rows by source and the file reads behind them", () => {
+    const ngram = deriveDashboard(points, 60_000)!.ngram!;
+    expect(ngram.hotShare).toBeCloseTo(0.95);
+    expect(ngram.rows).toEqual({ total: 200_800, window: 800 });
+    expect(ngram.reads).toEqual({ total: 6008, window: 8 });
+    expect(ngram.readBytes).toEqual({ total: 24_608_768, window: 32_768 });
+    expect(ngram.readBytesPerSec).toBeCloseTo(3276.8);
+  });
+
+  it("has neither on a 27B load", () => {
+    const dash = deriveDashboard([at(0, {}), at(10_000, { accepted: 1 })], 60_000)!;
+    expect(dash.experts).toBeNull();
+    expect(dash.ngram).toBeNull();
+  });
+});
 
 describe("deriveMemory", () => {
   const memoryAt = (ms: number, over: Partial<MemorySeries>, retained?: Snapshot["retained"]): Point => {

@@ -9,10 +9,12 @@ import {
   EVICTION_TIERS,
   type EvictionTierName,
   type Evictions,
+  type Experts,
   type HealthLevel,
   type Latency,
   type Memory,
   type Meter,
+  type Ngram,
   RATE_SPAN_MS,
   TOKENS_PER_KV_PAGE,
   TREND_SPAN_MS,
@@ -250,6 +252,14 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
       </div>
 
       <RetainedCard memory={dash.memory} win={win} />
+
+      {/* GitHub #301, #302: only a Flash-Next load has an expert cache and an n-gram table. */}
+      {(dash.experts || dash.ngram) && (
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[2fr_1fr]">
+          {dash.experts && <ExpertsCard experts={dash.experts} chart={chart} win={win} />}
+          {dash.ngram && <NgramCard ngram={dash.ngram} chart={chart} win={win} />}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Card title="Prefix reuse" subtitle="Prompt tokens skipped through a sibling's prefix">
@@ -944,6 +954,119 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
         shows KV-RAM at zero, and a load with prompt reuse off shows every column at zero. A column shows a zero whether the load reported one or reported
         nothing at all: the server emits all twenty-four series on every scrape, so an absent one means an older server, not an idle tier.
       </p>
+    </Card>
+  );
+}
+
+/** A share of one, as the page writes every share. */
+const asShare = (share: number | null) => formatShare(share, 1);
+
+/** A tally's total, with its window gain beside it when it moved. */
+function TallyCell({ tally }: { tally: { total: number | null; window: number | null } }) {
+  return (
+    <>
+      <span className="font-display font-semibold">{formatCount(tally.total ?? 0)}</span>
+      {tally.window ? <span className="ml-1.5 text-[11px] text-ash">+{formatCount(tally.window)}</span> : null}
+    </>
+  );
+}
+
+/**
+ * Flash-Next's expert residency (GitHub #301, spec flash-next/03 story 7):
+ * the decode hit rate, the misses each token cost, the PCIe traffic and the
+ * kernels' wait — what tells a slow turn caused by misses from one caused by
+ * compute — then each K class's slots against their capacity.
+ */
+function ExpertsCard({ experts, chart, win }: { experts: Experts; chart: ChartFrame; win: string }) {
+  const { issued, used } = experts.prefetch;
+  return (
+    <Card title="Expert residency" subtitle={`The VRAM expert cache and what it copied in · last ${win}`}>
+      <Figures
+        items={[
+          ["Decode hit rate", asShare(experts.decodeHitShare)],
+          ["Misses per token", formatNumber(experts.missesPerToken)],
+          ["Host to device", `${formatBytes(experts.bytesPerSec)}/s`],
+        ]}
+      />
+      <Figures
+        items={[
+          ["Prefill hit rate", asShare(experts.prefillHitShare)],
+          ["Prefetches used", `${formatCount(used.window)} of ${formatCount(issued.window)}`],
+          ["Kernels waited", formatSeconds(experts.stallSeconds.window)],
+        ]}
+      />
+      {experts.stallSeconds.total === 0 && <p className="text-[11px] text-ash">The wait reads zero while residency does not time it on the device.</p>}
+      <TimeChart
+        label="Expert bytes copied in per second"
+        {...chart}
+        area
+        height={120}
+        format={(v) => `${formatBytes(v)}/s`}
+        series={[{ key: "experts", label: "Bytes/s", color: "var(--series-2)", values: experts.bytesPerSecSeries }]}
+      />
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-[13px]">
+          <thead>
+            <tr className="border-b border-line text-left text-ash">
+              <th className="py-1.5 pr-4 font-display font-medium">K class</th>
+              <th className="py-1.5 pr-4 text-right font-display font-medium">Slots in use</th>
+              <th className="py-1.5 pr-4 text-right font-display font-medium">Hits</th>
+              <th className="py-1.5 pr-4 text-right font-display font-medium">Misses</th>
+            </tr>
+          </thead>
+          <tbody>
+            {experts.classes.map(({ cls, slots, hits, misses }) => (
+              <tr key={cls} className="border-b border-line/50">
+                <td className="py-1.5 pr-4 font-display font-semibold">{cls}</td>
+                <td className="py-1.5 pr-4 text-right tabular-nums">
+                  <span className="font-display font-semibold">{formatCount(slots.used)}</span>
+                  <span className="text-ash"> / {formatCount(slots.capacity)}</span>
+                </td>
+                <td className="py-1.5 pr-4 text-right tabular-nums">
+                  <TallyCell tally={hits} />
+                </td>
+                <td className="py-1.5 pr-4 text-right tabular-nums">
+                  <TallyCell tally={misses} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-[11px] text-ash">
+        Hits and misses count selected projections over both phases since start, the window's gain beside them. A slot in use stays in use: an eviction
+        hands it to the next projection, so a full pool is the steady state, and the hit rate says whether it holds the right ones.
+      </p>
+    </Card>
+  );
+}
+
+/** Flash-Next's n-gram rows (GitHub #302): where the rows came from, and what reading the rest from the file cost. */
+function NgramCard({ ngram, chart, win }: { ngram: Ngram; chart: ChartFrame; win: string }) {
+  return (
+    <Card title="N-gram rows" subtitle={`Embedding rows staged, from RAM or the artifact file · last ${win}`}>
+      <Figures
+        items={[
+          ["From RAM", asShare(ngram.hotShare)],
+          ["Rows", formatCount(ngram.rows.window)],
+          ["File reads", formatCount(ngram.reads.window)],
+        ]}
+      />
+      <Figures
+        items={[
+          ["Read now", `${formatBytes(ngram.readBytesPerSec)}/s`],
+          [`Read, last ${win}`, formatBytes(ngram.readBytes.window)],
+          ["Read since start", formatBytes(ngram.readBytes.total)],
+        ]}
+      />
+      <TimeChart
+        label="N-gram bytes read from the file per second"
+        {...chart}
+        area
+        height={120}
+        format={(v) => `${formatBytes(v)}/s`}
+        series={[{ key: "ngram", label: "Bytes/s", color: "var(--series-3)", values: ngram.readBytesPerSecSeries }]}
+      />
     </Card>
   );
 }

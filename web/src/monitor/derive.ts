@@ -2,6 +2,10 @@ import { formatCount, formatSeconds, formatShare, formatWindow } from "./format.
 import { type CounterPick, increaseOver, type Point, rollingRate, windowHistogram } from "./history.ts";
 import { histogramMean, histogramQuantile } from "./quantile.ts";
 import {
+  EXPERT_CLASSES,
+  EXPERT_PHASES,
+  type ExpertClass,
+  type ExpertPhase,
   emptySnapshot,
   type Histogram,
   REJECT_REASONS,
@@ -111,6 +115,40 @@ export type Memory = {
   retained: Record<RetainedFamily, Record<RetainedTier, Record<RetainedKind, Tally>>>;
 };
 
+/**
+ * Flash-Next's expert residency over the window (GitHub #301, spec
+ * flash-next/03 story 7): what tells a slow turn caused by misses from one
+ * caused by compute. Shares and rates are computed here from the counters,
+ * since the server exports no ratio.
+ */
+export type Experts = {
+  /** Decode hits over decode hits plus misses, gained over the window; null without a selection. */
+  decodeHitShare: number | null;
+  prefillHitShare: number | null;
+  /** Decode misses over the tokens decoded in the window. */
+  missesPerToken: number | null;
+  /** Host-to-device bytes per second, both phases, RATE_SPAN_MS rolling. */
+  bytesPerSec: number | null;
+  bytesPerSecSeries: Values;
+  bytesMoved: Tally;
+  stallSeconds: Tally;
+  prefetch: { issued: Tally; used: Tally };
+  /** Each K class: its slots, and its hits and misses over both phases. */
+  classes: { cls: ExpertClass; slots: Meter; hits: Tally; misses: Tally }[];
+};
+
+/** Flash-Next's n-gram rows over the window (GitHub #302). */
+export type Ngram = {
+  rows: Tally;
+  /** Rows the RAM hot-row cache held, over all rows staged in the window. */
+  hotShare: number | null;
+  reads: Tally;
+  readBytes: Tally;
+  /** Bytes read from the artifact file per second, RATE_SPAN_MS rolling. */
+  readBytesPerSec: number | null;
+  readBytesPerSecSeries: Values;
+};
+
 export type HealthLevel = "idle" | "healthy" | "busy" | "saturated";
 /** The verdict: its level, what it rests on in a phrase, and the facts behind it. */
 export type Health = { level: HealthLevel; summary: string; notes: string[] };
@@ -144,6 +182,10 @@ export type Dashboard = {
   duration: Latency;
   scrapeMsSeries: Values;
   memory: Memory;
+  /** Null on a load without an expert cache: a 27B load. */
+  experts: Experts | null;
+  /** Null on a load without an n-gram table: a 27B load. */
+  ngram: Ngram | null;
   health: Health;
 };
 
@@ -315,6 +357,8 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     duration: latency((s) => s.duration),
     scrapeMsSeries: points.map((p) => p.scrapeMs),
     memory: deriveMemory(points, from),
+    experts: last.experts ? deriveExperts(points, from) : null,
+    ngram: last.ngram ? deriveNgram(points, from) : null,
     health: { level: "idle", summary: "", notes: [] },
   };
   dash.health = assessHealth({
@@ -332,6 +376,72 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
   return dash;
 }
 
+
+/** A part over its whole, null for an empty or unknown whole. */
+const shareOf = (part: number | null, whole: number | null): number | null => (part !== null && whole !== null && whole > 0 ? part / whole : null);
+
+/** One expert-cache family summed over the classes, for one phase or both. */
+function expertSum(s: Snapshot, family: "hits" | "misses", phases: readonly ExpertPhase[]): number | null {
+  const experts = s.experts;
+  return experts ? sumKnown(EXPERT_CLASSES.flatMap((cls) => phases.map((phase) => experts[family][cls][phase]))) : null;
+}
+
+/** The residency panel's figures (GitHub #301): the window's gains, read off the counters. */
+export function deriveExperts(points: Point[], since: number): Experts {
+  const last = points.at(-1)?.snap ?? emptySnapshot();
+  const inWindow = points.filter((p) => p.at >= since);
+  const tally = (pick: CounterPick): Tally => ({ total: pick(last), window: increaseOver(points, pick, since) });
+  const share = (phase: ExpertPhase) => {
+    const hits = increaseOver(points, (s) => expertSum(s, "hits", [phase]), since);
+    const misses = increaseOver(points, (s) => expertSum(s, "misses", [phase]), since);
+    return shareOf(hits, hits !== null && misses !== null ? hits + misses : null);
+  };
+  const bytes: CounterPick = (s) => (s.experts ? sumKnown(EXPERT_PHASES.map((phase) => s.experts!.bytesMoved[phase])) : null);
+  const bytesRate = rollingRate(points, bytes, RATE_SPAN_MS);
+  const decodeMisses = increaseOver(points, (s) => expertSum(s, "misses", ["decode"]), since);
+  return {
+    decodeHitShare: share("decode"),
+    prefillHitShare: share("prefill"),
+    missesPerToken: shareOf(decodeMisses, increaseOver(points, (s) => s.decodedTokens, since)),
+    bytesPerSec: bytesRate.at(-1) ?? null,
+    bytesPerSecSeries: bytesRate,
+    bytesMoved: tally(bytes),
+    stallSeconds: tally((s) => s.experts?.stallSeconds ?? null),
+    prefetch: { issued: tally((s) => s.experts?.prefetchIssued ?? null), used: tally((s) => s.experts?.prefetchUsed ?? null) },
+    classes: EXPERT_CLASSES.map((cls) => {
+      const slots = last.experts?.slots[cls] ?? { capacity: null, inUse: null };
+      const both = (family: "hits" | "misses"): CounterPick => (s) => (s.experts ? sumKnown(EXPERT_PHASES.map((phase) => s.experts![family][cls][phase])) : null);
+      return {
+        cls,
+        slots: {
+          used: slots.inUse,
+          capacity: slots.capacity,
+          share: shareOf(slots.inUse, slots.capacity),
+          series: inWindow.map((p) => p.snap.experts?.slots[cls].inUse ?? null),
+        },
+        hits: tally(both("hits")),
+        misses: tally(both("misses")),
+      };
+    }),
+  };
+}
+
+/** The n-gram panel's figures (GitHub #302). */
+export function deriveNgram(points: Point[], since: number): Ngram {
+  const last = points.at(-1)?.snap ?? emptySnapshot();
+  const tally = (pick: CounterPick): Tally => ({ total: pick(last), window: increaseOver(points, pick, since) });
+  const rows = tally((s) => (s.ngram ? sumKnown([s.ngram.rows.hot, s.ngram.rows.file]) : null));
+  const hot = increaseOver(points, (s) => s.ngram?.rows.hot ?? null, since);
+  const readBytesRate = rollingRate(points, (s) => s.ngram?.readBytes ?? null, RATE_SPAN_MS);
+  return {
+    rows,
+    hotShare: shareOf(hot, rows.window),
+    reads: tally((s) => s.ngram?.reads ?? null),
+    readBytes: tally((s) => s.ngram?.readBytes ?? null),
+    readBytesPerSec: readBytesRate.at(-1) ?? null,
+    readBytesPerSecSeries: readBytesRate,
+  };
+}
 
 /**
  * The memory panel's figures (GitHub #217, ADR 0030 §Observability): the
