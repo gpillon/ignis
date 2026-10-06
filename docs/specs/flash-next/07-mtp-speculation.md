@@ -143,16 +143,22 @@ logits = lm_head(mtp.hyper_connection_mixer(S'_p))                     draft for
 | C-norm | **a** grouped RMSNorm, one group per stream; **b** one RMSNorm over all 10240 | a: every other `[10240]` norm in the model (`hc_norm`, the PLE norms) is grouped with group size 2560 |
 | C-chain | **a** the next step's stack is the MTP block's own pre-mixer stack `S'_p` (ExLlamaV3); **b** the post-mixer state, repeated ×4 as the trunk does with its embedding | a |
 | C-idx | above 2051 tokens the MTP's QSA selects blocks with **a** its own indexer, or **b** the trunk's layer-47 selection (the 2026-09-28 survey says "reuses the QSA indices") | a: the weights exist. Below 2051 tokens attention is dense and the question does not arise. |
-| pos | the MTP entry built from (S_p, t[p+1]) sits at position **p** (ninfer's `position_begin = chunk_begin`, vLLM's EAGLE convention) or **p+1** | p. RoPE is relative, so a constant offset changes nothing in dense attention. It moves only the indexer's 4-token block boundaries, i.e. only C-idx a above 2051 tokens. |
+| pos | the RoPE position fed to the entry built from (S_p, t[p+1]): **p** (ninfer's `position_begin = chunk_begin`, vLLM's EAGLE convention) or **p+1** | p. RoPE is relative, so a constant offset changes nothing in dense attention. It moves only the indexer's 4-token block boundaries, i.e. only C-idx a above 2051 tokens. Where the entry is *stored* is a different question, settled by prefix sharing (below). |
 
 The config field `mtp.hybrid: True` is not interpreted by any code read here.
 If phase A finds a convention with high acceptance, it is moot.
 
-**The MTP's KV is sequence state.** Each position p < P−1 of a prompt has an
-MTP entry built from (S_p, t[p+1]). The prefill computes these after the
-trunk, chunk by chunk: one extra layer of 49, so ~2% of prefill. The last
-prompt position waits for the first generated token: the first decode round
-writes it (ninfer's `final_column_uses_generated_token`).
+**The MTP's KV is sequence state.** The entry built from (S_p, t[p+1]) is
+stored at index p+1, the token that completes it *(proposed)*. A prefix's MTP
+entries are then a function of its own tokens, so they share by refcount
+exactly like KV.
+
+A prompt of P tokens gets entries 1..P−1 in prefill, after the trunk, chunk
+by chunk: one extra layer of 49, so ~2% of prefill. Entry P needs the first
+generated token, so the first decode round writes it (ninfer's
+`final_column_uses_generated_token`). Above 2051 tokens the MTP indexer's
+blocks follow the storage index; phase A's long windows check the RoPE row
+above.
 
 ## User Stories
 
@@ -267,6 +273,11 @@ graphs, as today's three):
 A lane whose budget or context is short runs at a smaller extent, down to 0
 (a plain step), inside the same graph, as runtime spec 05 does.
 
+The graph always runs k+1 columns per lane. The extent is a per-lane mask of
+valid columns (the record op's `valid_columns`), not a narrower width: the
+vendored record op refuses widths below 2. The n-gram gather and the indexer
+honour the same mask.
+
 **State components:**
 
 | component | during verify | commit (A accepted, A+1 committed) | reuse |
@@ -289,8 +300,10 @@ A lane whose budget or context is short runs at a smaller extent, down to 0
 - the sampling branch is accept with p_target / p_draft and resample from
   the residual, using the stateless RNG keyed by seed, position and purpose.
 
-The draft distribution the sampling branch needs is the head's softmax at
-the same processed params.
+At temperature > 0 each draft token is *sampled* from the head's processed
+distribution, with the seeded RNG under its own purpose key. That same
+distribution is what the accept rule divides by. An argmax draft under the
+sampling accept would not preserve the target distribution.
 
 **The fake drafter.** Phase C ships with three drafters selectable in tests:
 - replay of a recorded spec-off greedy run (all accepted);
@@ -304,21 +317,26 @@ Together they exercise every A in 0..k on every component.
 - **In the round's graph** (ninfer's shape, our code):
   - after commit, the MTP alignment pass runs over the A+1 committed columns.
     The stacks are the verify's own `S`; the tokens are the committed ones
-    shifted by one, the last being the bonus token. It writes MTP KV at
-    f..f+A.
+    shifted by one, the last being the bonus token. It writes the MTP
+    entries at indices f+1..f+A+1.
   - The draft from its last column is draft₁.
   - Then k−1 autoregressive steps chain per C-chain. They write MTP KV past
     the frontier, as scratch that the next alignment overwrites.
   - Cost: k MTP passes and k head calls per round.
 - **The MTP's KV and indexer** are a 13th QSA section of the paged pool:
-  352 B/token, +8.3% on today's 4,224. Snapshot, claim, KV-RAM and clone
+  352 B/token, +8.3% on today's 4,224. The KV is in the trunk's format. Under
+  hq-e8-2b it has its own residual window, with the same W + k_max rule as
+  the trunk's. Snapshot, claim, KV-RAM and clone
   carry it like the trunk's KV (ADR 0024, spec 05). The blob version bumps.
 - **The continuation stack** (the trunk's `S` at the last committed position,
-  20 KB per lane) is a new image section. A claimed prefix of length L carries
-  MTP entries < L−1 only, because entry L−1 needs t[L], the claimer's own
-  first token. So the claimer's prefill starts its MTP alignment one column
-  back, from the stored stack. The same section bootstraps a restored live
-  sequence: its first round runs at extent 0 and drafts from it.
+  20 KB per lane) is a new image section.
+  - A published prefix of length L holds MTP entries 1..L−1, so its pages
+    share like KV.
+  - Entry L needs t[L], the claimer's own first token. The claimer's prefill
+    writes it into its own tail page from the stored stack, then continues
+    as usual.
+  - The same section bootstraps a restored live sequence: its first round
+    runs at extent 0 and drafts from it.
 - **MTP experts are resident,** bound at load outside the expert cache. A
   draft step's 10 experts are 15.4 MB, and a miss puts ~124 µs per expert on
   the draft's critical path.
@@ -440,6 +458,8 @@ record layouts or copy order.
      α ≥ ~0.56 at k = 1 or ~0.59 at k = 2.
    - Otherwise **NO-GO**: the finding is kept, phases B-D are not built, and
      the follow-up is proposed to the owner.
+   - The 1.20× bar sits below AC6's 1.25× on purpose: c = 3.8 ms is the
+     pessimistic bound, and AC3 re-projects with the measured c.
 2. **Phase B.** The companion container:
    - holds the 31 tensors in the stated formats, bound only with
      `--speculative mtp`;
@@ -453,6 +473,8 @@ record layouts or copy order.
      both KV formats.
    - Every state component has its leaf test (Testing).
    - c(w) is measured and recorded in the finding.
+   - The one-lane projection is redone with the measured c(w). If it falls
+     under 1.25×, phase D stops and the owner decides.
 4. **Phase D.**
    - MTP drafts in the round's graph.
    - Greedy equality holds as in AC3, and the sampling check passes.
@@ -528,6 +550,8 @@ record layouts or copy order.
 
   This spec keeps the round shape, the alignment and the continuation
   state, at Flash-Next's state and in our code. It defers the controller.
+  ninfer's bench targets (`target_mtp_round_bench.cpp`, `mtp_pack_bench.cu`)
+  were read at header level only.
 - Prerequisite to `ready-for-agent`: the owner's answers below.
 
 ## Open questions for the owner
