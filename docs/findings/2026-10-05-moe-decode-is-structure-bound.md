@@ -79,3 +79,47 @@ ticket route stays the default (`ignis_moe_workspace::decode_route`); the cluste
 tested on both routes, for the shapes where experts outnumber what one wave of tickets covers.
 Plan item 2 (the gate/up reduction folded into the down units, cp.async-staged unit weights)
 is the next candidate.
+
+## Attempt 2026-10-06 (opt)
+
+This was a limited attempt: two kernel experiments on the ticket kernel, both measured in one
+GPU session with the first ticket kernel (v1, `1dbfc2b`) re-measured alongside them. Logs:
+`.scratch/opt/{v1,e1,e2,e2n}-bench.log`. The sources are in `.scratch/opt/{e1f,e2,e2n}/`.
+
+- **E1, fewer round trips per unit.** The call's slots are read into shared memory once. The
+  first ticket is taken before routing setup. svh is loaded alongside the other loads, and one
+  fence before `h_ready` is dropped. Each warp L2-prefetches its tiles of the CTA's next unit
+  while it multiplies.
+- **E2, all gate/up work in one wave.** E1 plus, up to four tokens, three gate/up k-splits of
+  896/896/768 inputs instead of four of 640, so one token has 300 gate/up units for the 340
+  resident CTAs. The extra 8-16 tiles of a wide unit are L2-prefetched and loaded into the
+  registers the first tiles free.
+- **E2n** is E2 without the next-unit prefetch.
+
+| kernel | 1 token | 2 tokens | 3 tokens | L2-resident, 1 token | streaming read |
+|---|---|---|---|---|---|
+| v1 (unchanged) | 26.1 us, 32.8% | 38.0 us, 45.1% | 52.5 us, 49.0% | 22.4 us | 1,655 GB/s |
+| E1 | 28.5 us, 30.0% | 38.0 us, 45.1% | 54.5 us, 47.2% | 23.0 us | 1,560 GB/s |
+| E2 | 30.1 us, 28.5% | 43.3 us, 39.7% | 56.6 us, 45.5% | 21.9 us | 1,468 GB/s |
+| E2n | 29.8 us, 28.7% | 40.6 us, 42.2% | 53.9 us, 47.7% | 22.3 us | 1,655 GB/s |
+
+Every MoE/trellis/fp8 CTest passed on E1 (17/17). Neither experiment is faster than v1, so
+both were reverted and v1 stays.
+
+- **The round trips are not where the L2-resident time goes.** Taking them out (E1) leaves the
+  L2-resident time where it was: 23.0 us against 22.4 us.
+- **One gate/up wave helps in the L2 and hurts from DRAM.** E2 cuts at most 0.5 us with the
+  weights in the L2 and is 3.7 us slower with them in DRAM. With every gate/up unit's tiles
+  requested at once (10 MB), every unit waits for the tail of the whole transfer. In v1, the
+  second wave's tiles stream in while the first wave multiplies. The L2-resident diagnostic
+  cannot show this.
+- **The next unit's weights cannot be held in registers.** Refilling each consumed word with the
+  next unit's word (40 registers carried across units) compiles badly: ptxas moves the refills
+  to the end of the loop and spills 748 B. This variant was not measured.
+- **Compare only within one run.** v1's 2- and 3-token figures here are 38.0 / 52.5 us, against
+  44.1 / 57.1 us in session 2.
+
+Acceptance 6 stays open. At one token the floor depends on the order in which DRAM delivers the
+bytes as much as on the launch's structure. Gate/up tiles have to arrive before the down tiles,
+and each unit has to consume its tiles as they arrive. A launch that only requests more bytes
+earlier makes things worse.
