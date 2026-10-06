@@ -138,7 +138,7 @@ Observed:
 
 Inferred (not measured):
 
-- The n-gram gather plausibly accounts for ~0.3-0.4 ms of the host gap (emulated, not traced). The other ~1.1-1.6 ms is unattributed.
+- The n-gram gather plausibly accounts for ~0.3-0.4 ms of the host gap (emulated, not traced). The other ~1.1-1.6 ms is unattributed. (Since measured: the gather is nearly all of the gap. See "Host gap, named" at the end.)
   - These captures have no CPU samples: `--sample=process-tree` needs administrative rights on Windows and silently records nothing without them (tested).
   - The candidates are the Flash-Next scheduler loop, token emission and detokenization, and the leaf's per-round allocations.
 - The simulation's ~6 ms step assumed bandwidth-bound kernels. At one lane the step is dominated by per-kernel latency and serial bookkeeping instead.
@@ -163,7 +163,7 @@ Targets ranked by estimated gain per token at one lane, from the 15.7 ms period.
 ## Limits and unknowns
 
 - One lane, contexts of ~0.2-2K, one prompt family. No repeats beyond three captures of one build, but the per-round figures agree within ~5% across the two graph-level captures.
-- The host gap's composition is inferred. Only its total and the `cudaGraphLaunch` share are measured.
+- The host gap's composition is inferred. Only its total and the `cudaGraphLaunch` share are measured. (It was named later, in "Host gap, named" at the end.)
 - Per-kernel costs come from the node capture: +4.6% over the graph replay.
 - The n-gram read time is an emulation with .NET unbuffered reads, not the engine's `ReadPool`.
 - The decode rate drifts between runs (60.6-63.7 tok/s here, 65.3 in the earlier finding) with the expert cache's size and state.
@@ -221,3 +221,87 @@ The reported arbitrary-id flips (3 wider at one lane, 3 + 1 near-tie at three) a
 - The mix is now 1.66 ms of an 11.24 ms node-level round. The next items by size are residency bookkeeping (implication 3) and the host gap (implication 2).
 
 Raw material in `.scratch/hcmix-306/`: `rate.sh` with its logs (`before`, `after`, `after2`), the bench outputs and captures, `after-node` / `after2-node` (`.nsys-rep`: never commit them), and `kern.py`.
+
+## Host gap, named (2026-10-06, admin capture)
+
+Implication 2 asked what fills the time between `cudaStreamSynchronize` returning and the next round's first CUDA call. **It is the n-gram row gather.** The rows come from unbuffered reads of the artifact, and those reads run one at a time in the file system because the leaf keeps the whole artifact memory-mapped.
+
+**Setup.**
+- `trace_admin.sh`, run by the owner from an elevated shell: `--sample=process-tree --sampling-frequency=8000 --cpuctxsw=process-tree --cuda-graph-trace=node`.
+- The build is the `fn-perf-306` release build of 17:02, with the HC mix fix.
+- The window is 6 s of steady one-lane decode at +150 s: 416 rounds.
+- `hostgap.py` cuts the decode thread (`ignis-model`) into gap windows (sync returns → next CUDA call). It times them from context switches, and times the `ngram-read-*` workers' waits the same way.
+- `symres.py` resolves symbols offline with dbghelp, against a frozen copy of the exe and PDB.
+  - The module base `0x7ff6ac340000` is inferred: 160 of 160 sampled return addresses follow a call instruction at that base.
+  - Kernel frames stay unresolved.
+- `dump1.py` and `dump2.py` print one round's raw events.
+- Context switches set the times; the samples only name what runs. On Windows a switch-in carries the stack the thread waited in, and readying another thread also records a stack. So in windows under ~100 µs, sample counts are not time.
+- Node tracing inflates the `cudaGraphLaunch` call to 1,669 µs (0.42-0.46 ms without it) and the period to 14.4 ms. The client ITL p50 is 13.5-13.6 ms in this capture and 12.0-12.5 ms without a profiler. The gap itself is in line with the untraced captures above: 2.07 ms mean here, 1.49-1.98 ms there.
+
+**Per round, decode thread, mean of 416 rounds (µs).**
+
+| segment | µs | what runs |
+|---|---:|---|
+| sync returns → decode thread parks | 79 | `drain_tokens` hands the token to a tokio worker (a condvar notify). `NgramTable::begin_batch` hashes, runs `plan_gather` and sends one `mpsc` job per read, each send waking a reader. |
+| parked in `PendingRows::finish` → `collect_and_gather` | **1,805** | 12.4 `Thread::park` → `ZwWaitForAlertByThreadId` waits, one per read result. This includes 172 µs of readied-to-running latency. |
+| on-CPU between those waits | 163 | take one result, park again |
+| last wake → first CUDA call | 21 | row gather into staging, `decode_flash_next` setup |
+| **gap** | **2,068** | p10 1,245, p50 2,241, p90 2,816 |
+| then 6 staging `cudaMemcpyAsync` (pageable, 4-1,440 B) | 112 | |
+| then `cudaGraphLaunch` | 1,669 | node-traced; 420-460 untraced |
+
+- **Without file reads there is no gap.** The 4 rounds whose rows were all hot have a 64 µs gap; the 27B's is 44 µs.
+- In the gap, the decode thread waits nowhere outside `collect_and_gather`.
+- Sampling readback, the residency mirror, the detokenizer/SSE and telemetry do not show on the decode thread in the gap. Token emission is the `drain_tokens` hand-off above.
+- The gap follows the read count. A round makes 10.4 file reads on average (0-16, bimodal at 7-8 and 13-14), ~4.2 KB each (`fn-gm` counters).
+  - Rounds with 3-8 reads have a gap of 1,232-1,602 µs.
+  - Rounds with 9-16 reads have a gap of 2,329-2,611 µs.
+
+**The reads serialize below the pool.**
+- **Concurrency adds no throughput.** One read alone takes 114 µs (p50), like the emulation's 0.11 ms. With 2, 3 or 4 in flight a read takes 385, 434 or 457 µs. The four workers keep 2.3 reads in flight on average, but the reads complete about one at a time.
+- **The readers wait on an executive resource.** Of the 10.4 reads per round, 9.6 wait in nsys's `Resource` state inside `NtReadFile` (412 µs mean), under `Ntfs.sys` and `FLTMGR.SYS`. Only 0.8 per round wait as plain I/O (102 µs mean).
+- Reader time on the queue `Mutex<Receiver>` is idle time between rounds, as designed; it is not on the path.
+
+**Cause: the artifact's memory map.**
+- `FlashNextLeaf` holds the 71.8 GB artifact mapped for its whole lifetime (`Reader` → `Mmap::map`). After `open`, it uses the map only for `content_hash()`.
+- An emulation reproduces the slowdown. Setup:
+  - `ngram_reads_ab.ps1` is `ngram_reads.ps1` plus a flags parameter: 12 random 4 KiB reads over 4 threads, 400 rounds per arm.
+  - `mmap_hold.py` maps the artifact read-only from a second process.
+  - No server was running.
+
+| arm, in run order | p50 µs per 12-read gather | mean |
+|---|---:|---:|
+| unmapped, unbuffered (as the engine) | 304 | 321 |
+| mapped, unbuffered | 1,149 | 1,174 |
+| mapped, buffered | 631 | 651 |
+| mapped, unbuffered, after the buffered arm | 2,286 | 2,336 |
+| unmapped again, unbuffered | 313 | 344 |
+
+- **Mapped, the unbuffered gather is 3.7-7.5 times slower**: 96-190 µs per read, which brackets the engine's ~140-180. Unmapping restores 0.31 ms.
+- The slowdown grows after the buffered arm. This suggests the cost scales with the file's cached pages, and the server's map is warm from the load. This is not isolated.
+- What NTFS does on this path (which resource it takes, and why reads wait for it) is not traced: the kernel frames are unsymbolized.
+
+**Fixes, ranked.** Gains are per token at one lane, from the ~12.3 ms ITL. They overlap and do not simply add.
+1. **Unmap the artifact after load: about −1.4 to −1.6 ms (~+12-14% tok/s).**
+   - Keep the content hash and drop the `Reader` at the end of `FlashNextLeaf::open`.
+   - Check that no other handle keeps the file mapped or cached. The residency fill and the table's hot-row load run only at load.
+   - Expected result: the gather runs at the emulation's ~0.3 ms for 10-12 reads.
+   - Verify with the same admin capture: the reader waits leave `Resource`, and the gap falls to ~0.4 ms.
+2. **One wake per gather: −0.1 to −0.2 ms once fix 1 lands.** Today the 12.4 park/wake cycles (~27 µs each, with the readied-to-running latency) overlap the reads. Once the reads are fast, the cycles are as long as the reads. The fix: the last reader to finish wakes the decode thread once, with a countdown.
+3. **All reads in flight at once: up to −0.15 ms after fix 1.** One overlapped submit, or a worker per read, instead of 4 workers taking 3-4 waves.
+4. **Fewer file reads.** In `fn-gm` (prefill plus 1,800 tokens), the 1 GiB hot cache served 24% of rows: 13,871 of 56,848. Each read saved is worth ~0.1 ms after fix 1 and 0.14-0.18 ms before it. A larger hot set costs host RAM.
+5. **Staging: −0.05 to −0.1 ms.** Replace the 6 pageable copies (112 µs here, 80 µs in the graph-level capture) with one pinned buffer and one copy, or with memcpy nodes in the graph.
+6. **`cudaGraphLaunch`: 0.42-0.46 ms untraced.** Fewer graph nodes shrink it (implication 2).
+7. The 79 µs before the gather (token hand-off, hash, plan, sends) is not worth taking on.
+
+The rows depend on the drawn token, so the gather cannot move off the path as it stands. With drafted tokens (MTP), a draft's rows could be fetched during the replay.
+
+**Limits.**
+- One capture: one lane, one prompt.
+- The ETW switch stacks and 8 kHz sampling add overhead to every switch: 12 per round on the decode thread, and several per read on the readers.
+- The A/B ran outside the engine, through .NET `FileStream`. The engine gain from unmapping is a prediction until fix 1 is measured.
+- The wait states are nsys's labels (`Resource`, `AlertByThreadId`, `NonBlocked`).
+
+Raw material in `.scratch/fn-decode-prof-306/` (untracked):
+- `fn-admin.nsys-rep` and its sqlite export: they embed the environment, never commit them.
+- `hostgap.py`, `symres.py`, `dump1.py`, `dump2.py`, `ngram_reads_ab.ps1`, `mmap_hold.py`.
