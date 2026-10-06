@@ -651,6 +651,11 @@ target_include_directories(ignis_kernel_flash_next_hc_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_flash_next_hc_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_hc_test COMMAND ignis_kernel_flash_next_hc_test)
+# Its microbenchmark at the model's geometry and formats (GitHub #306): a tool, NOT a CTest.
+add_executable(ignis_kernel_flash_next_hc_bench bench_flash_next_hc.cu)
+target_include_directories(ignis_kernel_flash_next_hc_bench
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_hc_bench PRIVATE ignis_kernel ignis_vendor)
 # The token embedding and the head (kernel/src/flash_next/embed_head.cu). GPU.
 add_executable(ignis_kernel_flash_next_embed_head_test test_flash_next_embed_head.cu)
 target_include_directories(ignis_kernel_flash_next_embed_head_test
