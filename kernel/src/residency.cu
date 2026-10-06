@@ -119,6 +119,7 @@ struct Dev {
   Counters *counters;
   Report *report;            // [layers], NULL without a report
   uint32_t *report_entries;  // [layers][kLists][4 * experts]
+  ignis_residency_mirror *mirror;  // mapped host memory, or NULL
 };
 
 
@@ -466,6 +467,15 @@ __global__ void __launch_bounds__(kThreads)
       report->bytes_moved = moved;
     }
   }
+
+  // 9. The host mirror, at the last layer of a step: the totals, each word stored whole.
+  if (d.mirror != nullptr && layer + 1 == d.layers) {
+    __syncthreads();
+    const unsigned long long *from = reinterpret_cast<const unsigned long long *>(d.counters);
+    unsigned long long *to = reinterpret_cast<unsigned long long *>(&d.mirror->counters);
+    for (uint32_t i = t; i < sizeof(Counters) / 8; i += blockDim.x) to[i] = from[i];
+    if (t < kClasses) d.mirror->in_use[t] = st->used[t];
+  }
 }
 
 // Copies every queued job: all blocks walk the jobs in order and share each one.
@@ -604,6 +614,7 @@ struct ignis_residency {
   cudaEvent_t fork = nullptr, join = nullptr;
   bool forked = false;
   bool stepped = false;
+  ignis_residency_mirror *mirror_host = nullptr;  // registered by ignis_residency_set_mirror
 };
 
 extern "C" {
@@ -753,6 +764,7 @@ void ignis_residency_free(ignis_residency *r) {
   if (r->join) cudaEventDestroy(r->join);
   if (r->fork) cudaEventDestroy(r->fork);
   if (r->prefetch_stream) cudaStreamDestroy(r->prefetch_stream);
+  if (r->mirror_host) cudaHostUnregister(r->mirror_host);
   if (r->tables) cudaFree(r->tables);
   if (r->ring) cudaFree(r->ring);
   for (uint32_t k = 0; k < kClasses; ++k) {
@@ -894,6 +906,22 @@ int32_t ignis_residency_read_counters(ignis_residency *r, ignis_residency_counte
   if (r == nullptr || out == nullptr) return fail("residency: counters arguments");
   RESIDENCY_CUDA(cudaDeviceSynchronize());
   RESIDENCY_CUDA(cudaMemcpy(out, r->dev.counters, sizeof(*out), cudaMemcpyDeviceToHost));
+  return 0;
+}
+
+int32_t ignis_residency_set_mirror(ignis_residency *r, ignis_residency_mirror *host) {
+  if (r == nullptr || host == nullptr) return fail("residency: mirror arguments");
+  if (r->stepped) return fail("residency: the mirror comes before the first step");
+  if (r->mirror_host != nullptr) return fail("residency: already mirrored");
+  RESIDENCY_CUDA(cudaDeviceSynchronize());
+  RESIDENCY_CUDA(cudaHostRegister(host, sizeof(*host), cudaHostRegisterMapped));
+  r->mirror_host = host;
+  void *dev = nullptr;
+  RESIDENCY_CUDA(cudaHostGetDevicePointer(&dev, host, 0));
+  RESIDENCY_CUDA(cudaMemcpy(&host->counters, r->dev.counters, sizeof(host->counters), cudaMemcpyDeviceToHost));
+  const char *used = reinterpret_cast<const char *>(r->dev.st) + offsetof(State, used);
+  RESIDENCY_CUDA(cudaMemcpy(host->in_use, used, sizeof(State::used), cudaMemcpyDeviceToHost));
+  r->dev.mirror = static_cast<ignis_residency_mirror *>(dev);
   return 0;
 }
 

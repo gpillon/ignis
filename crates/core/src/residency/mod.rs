@@ -75,7 +75,7 @@ pub mod policy;
 
 pub use class::{CatalogMismatch, ExpertCatalog, KBits, KClass, Projection, ProjectionId};
 pub use host_memory::available_physical_bytes;
-pub use counters::ResidencyCounters;
+pub use counters::{ResidencyCounters, ResidencyMirror};
 pub use plan::{
     ClassPool, EXPERT_CACHE_FLOOR_BYTES, ExpertCachePlan, ExpertCachePlanError,
     ExpertCacheRequest, ExpertTraffic, HOST_MARGIN_BYTES, HOST_PLAN_LINES, HostPlan, HostPlanError,

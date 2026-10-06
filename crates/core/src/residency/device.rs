@@ -16,9 +16,10 @@
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use super::class::{ExpertCatalog, KClass, Projection, ProjectionId};
-use super::counters::ResidencyCounters;
+use super::counters::{ResidencyCounters, ResidencyMirror, MIRROR_BYTES};
 use super::policy::{Admission, Phase};
 use crate::moe::MoeSlot;
 
@@ -135,6 +136,7 @@ mod ffi {
         pub fn ignis_residency_join(r: *mut RawResidency, stream: *mut c_void) -> i32;
         pub fn ignis_residency_read_counters(r: *mut RawResidency, out: *mut RawCounters) -> i32;
         pub fn ignis_residency_read_occupancy(r: *mut RawResidency, out: *mut u32) -> i32;
+        pub fn ignis_residency_set_mirror(r: *mut RawResidency, host: *mut c_void) -> i32;
         pub fn ignis_residency_last_report(
             r: *mut RawResidency,
             layer: u32,
@@ -215,7 +217,14 @@ pub struct DeviceReport {
 pub struct DeviceResidency {
     raw: NonNull<RawResidency>,
     desc: ResidencyDesc,
+    /// Kept past the free, which unregisters it, so its readers never see
+    /// freed memory.
+    mirror: Option<Arc<ResidencyMirror>>,
 }
+
+// The mirror is `struct ignis_residency_mirror`: the counters, then the
+// slots in use.
+const _: () = assert!(MIRROR_BYTES == std::mem::size_of::<RawCounters>() + KClass::COUNT * 4);
 
 // The handle is used from one thread at a time; the leaf has no thread
 // affinity beyond the CUDA context.
@@ -234,7 +243,20 @@ impl DeviceResidency {
         Ok(Self {
             raw: NonNull::new(raw).ok_or_else(|| "residency: created nothing".to_owned())?,
             desc: *desc,
+            mirror: None,
         })
+    }
+
+    /// Mirror the counts and the slots in use into `mirror`, for a host
+    /// reader to read with no CUDA call; before the first step.
+    pub fn mirror(&mut self, mirror: Arc<ResidencyMirror>) -> Result<(), String> {
+        if self.mirror.is_some() {
+            return Err("residency: already mirrored".to_owned());
+        }
+        let status = unsafe { ffi::ignis_residency_set_mirror(self.raw.as_ptr(), mirror.as_mut_ptr()) };
+        // Kept whatever the outcome: a call that failed may have registered it.
+        self.mirror = Some(mirror);
+        check(status)
     }
 
     pub fn desc(&self) -> &ResidencyDesc {

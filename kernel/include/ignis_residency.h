@@ -158,6 +158,20 @@ int32_t ignis_residency_read_counters(struct ignis_residency *r, struct ignis_re
  * like ignis_residency_read_counters. */
 int32_t ignis_residency_read_occupancy(struct ignis_residency *r, uint32_t out[IGNIS_RESIDENCY_CLASSES]);
 
+/* The counters and the slots in use, mirrored in host memory a host reader reads with no CUDA
+ * call and no wait. */
+struct ignis_residency_mirror {
+  struct ignis_residency_counters counters;
+  uint32_t in_use[IGNIS_RESIDENCY_CLASSES];
+};
+
+/* Mirrors into `host`, which the caller owns and keeps past ignis_residency_free: the call
+ * page-locks and maps it (free unregisters it) and fills it with what residency holds now, the
+ * warm start included; from then on the last layer of every step that runs writes the totals
+ * there, each 8-byte counter whole, so every value a reader sees only grows. A refused step
+ * writes nothing. Only before the first step: a captured graph keeps the step's arguments. */
+int32_t ignis_residency_set_mirror(struct ignis_residency *r, struct ignis_residency_mirror *host);
+
 /* The outcome of the last step of `layer` (needs `report` at creation; tests: a captured round
  * leaves one per layer). `status` is 0, 1 + the class a
  * decode step was refused for (its misses outnumber the class's free and unpinned slots; the

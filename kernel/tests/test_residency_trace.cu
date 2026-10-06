@@ -246,6 +246,28 @@ int main(int argc, char **argv) {
   }
   uint32_t admitted = 0;
   RES_OK(ignis_residency_warm_start(r, f.warm.data(), static_cast<uint32_t>(f.warm.size()), &admitted));
+  // The host mirror, on a page of its own: read with no call, held to the readouts below.
+  alignas(4096) static unsigned char mirror_page[4096];
+  auto *mirror = reinterpret_cast<volatile ignis_residency_mirror *>(mirror_page);
+  RES_OK(ignis_residency_set_mirror(r, reinterpret_cast<ignis_residency_mirror *>(mirror_page)));
+  auto check_mirror = [&](const std::string &at) {
+    ignis_residency_counters want{};
+    RES_OK(ignis_residency_read_counters(r, &want));
+    uint32_t occupancy[IGNIS_RESIDENCY_CLASSES];
+    RES_OK(ignis_residency_read_occupancy(r, occupancy));
+    const volatile uint64_t *got = reinterpret_cast<const volatile uint64_t *>(&mirror->counters);
+    const uint64_t *wanted = reinterpret_cast<const uint64_t *>(&want);
+    for (size_t i = 0; i < sizeof(want) / 8; ++i) {
+      check(got[i] == wanted[i], at + ": mirror counter word " + std::to_string(i) + " reads " +
+                                     std::to_string(got[i]) + ", the device " + std::to_string(wanted[i]));
+    }
+    for (uint32_t c = 0; c < IGNIS_RESIDENCY_CLASSES; ++c) {
+      check(mirror->in_use[c] == occupancy[c], at + ": mirror class " + std::to_string(c) + " reads " +
+                                                   std::to_string(mirror->in_use[c]) + " slots in use, the device " +
+                                                   std::to_string(occupancy[c]));
+    }
+  };
+  check_mirror("the mirror after the warm start");
   ignis_residency_layout layout{};
   RES_OK(ignis_residency_get_layout(r, &layout));
 
@@ -458,6 +480,7 @@ int main(int argc, char **argv) {
       CUDA_OK(cudaStreamSynchronize(stream));
       for (uint32_t l = 0; l < f.layers; ++l) compare(si + l);
       check_table("round from step " + std::to_string(si), nullptr);
+      if (f.steps[si + f.layers - 1].expect.status == 0) check_mirror("round from step " + std::to_string(si));
       remember_staging(f.steps[si + f.layers - 1]);
       ++graph_rounds;
       si += f.layers;
@@ -475,6 +498,7 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaStreamSynchronize(stream));
     compare(si);
     check_table("step " + std::to_string(si) + " (layer " + std::to_string(s.layer) + ")", &s);
+    if (s.layer + 1 == f.layers && s.expect.status == 0) check_mirror("step " + std::to_string(si));
     remember_staging(s);
     ++si;
   }
@@ -502,6 +526,12 @@ int main(int argc, char **argv) {
   cudaFree(d_look);
   cudaStreamDestroy(stream);
   ignis_residency_free(r);
+  // Unregistered by free, still the caller's: the last step's totals stay readable.
+  if (f.steps.back().layer + 1 == f.layers && f.steps.back().expect.status == 0) {
+    const uint64_t final_moved = mirror->counters.bytes_moved[0] + mirror->counters.bytes_moved[1];
+    check(final_moved == moved, "the mirror after free: bytes moved " + std::to_string(final_moved) +
+                                    ", the device " + std::to_string(moved));
+  }
   if (g_failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;
