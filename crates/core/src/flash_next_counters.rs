@@ -1,16 +1,16 @@
 //! What a Flash-Next load counts beside the scheduler (GitHub #301, #302):
 //! its expert residency ([`ResidencyCounters`], the K-class pools' slots)
 //! and its n-gram table ([`NgramCounters`]). The leaf, which alone may read
-//! the device, publishes them into a [`FlashNextCounterCell`] after its
-//! steps; the server's exposition reads the cell at scrape time (ADR 0017).
+//! the device, publishes them into a [`FlashNextCounterCell`] after every
+//! step, whoever reads it; a reader on another thread reads the cell when it
+//! likes. Facts only, as [`ResidencyCounters`]: nothing here knows who reads.
 //!
-//! Atomics, no lock: a scrape never makes a step wait, and a step never
-//! makes a scrape wait. A read therefore takes each series on its own, not
-//! one consistent cut of all of them, as `Metrics` reads its own. The cell
-//! holds numbers only, so an exposition that outlives the model holds none
-//! of the model's resources.
+//! Atomics, no lock: a reader never makes a step wait, and a step never
+//! makes a reader wait. A read therefore takes each series on its own, not
+//! one consistent cut of all of them. The cell holds numbers only, so a
+//! reader that outlives the model holds none of the model's resources.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ngram_table::NgramCounters;
 use crate::residency::{KClass, ResidencyCounters};
@@ -27,12 +27,10 @@ pub struct FlashNextCounters {
     pub ngram: NgramCounters,
 }
 
-/// [`FlashNextCounters`] as atomics, written by the leaf and read by the
-/// exposition. `watched` says someone reads it: the leaf reads the device
-/// only for a watched cell, so a load without `--metrics` pays nothing.
+/// [`FlashNextCounters`] as atomics, written by the leaf after every step
+/// and read by whoever holds the cell.
 #[derive(Debug)]
 pub struct FlashNextCounterCell {
-    watched: AtomicBool,
     hits: [[AtomicU64; 2]; KClass::COUNT],
     misses: [[AtomicU64; 2]; KClass::COUNT],
     prefetch_issued: AtomicU64,
@@ -53,10 +51,9 @@ pub struct FlashNextCounterCell {
 const NO_OCCUPANCY: u64 = u64::MAX;
 
 impl Default for FlashNextCounterCell {
-    /// Unwatched, every count zero, no occupancy.
+    /// Every count zero, no occupancy.
     fn default() -> Self {
         Self {
-            watched: AtomicBool::new(false),
             hits: Default::default(),
             misses: Default::default(),
             prefetch_issued: AtomicU64::new(0),
@@ -74,15 +71,6 @@ impl Default for FlashNextCounterCell {
 }
 
 impl FlashNextCounterCell {
-    /// Someone reads this cell from now on (the server, with `--metrics`).
-    pub fn watch(&self) {
-        self.watched.store(true, Ordering::Relaxed);
-    }
-
-    pub fn is_watched(&self) -> bool {
-        self.watched.load(Ordering::Relaxed)
-    }
-
     /// Replace every series with `counters`'.
     pub fn publish(&self, counters: &FlashNextCounters) {
         let store = |cell: &AtomicU64, value: u64| cell.store(value, Ordering::Relaxed);
@@ -142,12 +130,9 @@ mod tests {
     use crate::residency::{KBits, Projection};
 
     #[test]
-    fn a_published_snapshot_reads_back_whole_and_a_new_cell_reads_zeros_unwatched() {
+    fn a_published_snapshot_reads_back_whole_and_a_new_cell_reads_zeros() {
         let cell = FlashNextCounterCell::default();
         assert_eq!(cell.read(), FlashNextCounters::default());
-        assert!(!cell.is_watched());
-        cell.watch();
-        assert!(cell.is_watched());
 
         let down_k3 = KClass::new(Projection::Down, KBits::K3);
         let mut counters = FlashNextCounters::default();
