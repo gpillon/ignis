@@ -42,6 +42,13 @@ ifeq ($(MODEL_FAMILY),flash-next)
   PREFILL_CHUNK ?= 8192
   SPEC ?=
   VISION ?=
+  # The KV-RAM arena spec flash-next/05 sizes for Flash-Next: the 38 GB of
+  # pinned experts leave no room for the 27B's 8G (the host plan refuses it).
+  KV_HOST_POOL_BYTES ?= 2G
+  # The budget is free VRAM minus this headroom, so the process plus the
+  # desktop ends at 32.6 GB - 4 GB, under spec flash-next/04 AC10's 29 GB,
+  # whatever the desktop holds; the expert cache takes the rest of it.
+  VRAM_HEADROOM ?= 4G
 endif
 
 # The .ninfer container (used with CUDA=1 only). See README "Models".
