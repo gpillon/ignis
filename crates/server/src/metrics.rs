@@ -444,6 +444,14 @@ pub struct Metrics {
     /// server/08). Absent from the exposition until the first one, like the
     /// decision family.
     thinking_forced_closes: AtomicU64,
+    /// Speculative decoding (P5-06's request counters, GitHub #307): verify
+    /// rounds, drafts verified and drafts committed, and per draft position
+    /// how many rounds proposed it and committed it.
+    spec_rounds: AtomicU64,
+    spec_drafted: AtomicU64,
+    spec_accepted: AtomicU64,
+    spec_drafted_at: [AtomicU64; ignis_core::types::DRAFT_POSITIONS],
+    spec_accepted_at: [AtomicU64; ignis_core::types::DRAFT_POSITIONS],
     /// Per [`TokenizeRoute::ALL`] (GitHub #285). Absent from the exposition
     /// until one of them moves. Counts calls, not requests of the lifecycle
     /// above: a counting route never enters the scheduler.
@@ -583,6 +591,11 @@ impl Metrics {
             decisions: Default::default(),
             answer_mass: Ratio::new(&ANSWER_MASS_BOUNDS),
             thinking_forced_closes: AtomicU64::new(0),
+            spec_rounds: AtomicU64::new(0),
+            spec_drafted: AtomicU64::new(0),
+            spec_accepted: AtomicU64::new(0),
+            spec_drafted_at: std::array::from_fn(|_| AtomicU64::new(0)),
+            spec_accepted_at: std::array::from_fn(|_| AtomicU64::new(0)),
             tokenize_calls: Default::default(),
             locates: Default::default(),
             responses_sockets: AtomicU64::new(0),
@@ -656,6 +669,20 @@ impl Metrics {
         // `ALL` lists the primitives in declaration order, so a primitive's
         // discriminant is its slot.
         self.decisions[primitive as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request that ran verify rounds ended: its speculative counters
+    /// (GitHub #307), the request log's `spec.*` summed across requests.
+    pub(crate) fn record_speculation(&self, spec: &ignis_core::types::SpecCounters) {
+        self.spec_rounds.fetch_add(u64::from(spec.rounds), Ordering::Relaxed);
+        self.spec_drafted.fetch_add(u64::from(spec.drafted), Ordering::Relaxed);
+        self.spec_accepted.fetch_add(u64::from(spec.accepted), Ordering::Relaxed);
+        for (series, &n) in self.spec_drafted_at.iter().zip(&spec.drafted_at) {
+            series.fetch_add(u64::from(n), Ordering::Relaxed);
+        }
+        for (series, &n) in self.spec_accepted_at.iter().zip(&spec.accepted_at) {
+            series.fetch_add(u64::from(n), Ordering::Relaxed);
+        }
     }
 
     /// A completed request's thinking budget forced the model's close (spec
@@ -1087,6 +1114,39 @@ impl Metrics {
             );
             let _ = writeln!(out, "ignis_thinking_forced_closes_total {forced}");
         }
+        // GitHub #307: speculative decoding, absent until a request that ran
+        // verify rounds ends (a load without speculation exports nothing of
+        // it). Acceptance is accepted / drafted; per position, a draft at
+        // position p counts in `drafted` when a round proposed it and in
+        // `accepted` when the round committed it too.
+        let rounds = read(&self.spec_rounds);
+        if rounds > 0 {
+            for (name, help, series) in [
+                ("ignis_speculative_rounds_total", "Verify rounds run.", &self.spec_rounds),
+                ("ignis_speculative_drafted_tokens_total", "Draft tokens verified.", &self.spec_drafted),
+                ("ignis_speculative_accepted_tokens_total", "Draft tokens committed.", &self.spec_accepted),
+            ] {
+                declare(&mut out, name, "counter", help);
+                let _ = writeln!(out, "{name} {}", read(series));
+            }
+            for (name, help, family) in [
+                (
+                    "ignis_speculative_position_drafted_total",
+                    "Verify rounds that proposed a draft at the position.",
+                    &self.spec_drafted_at,
+                ),
+                (
+                    "ignis_speculative_position_accepted_total",
+                    "Verify rounds that committed the draft at the position.",
+                    &self.spec_accepted_at,
+                ),
+            ] {
+                declare(&mut out, name, "counter", help);
+                for (j, series) in family.iter().enumerate() {
+                    let _ = writeln!(out, "{name}{{position=\"{}\"}} {}", j + 1, read(series));
+                }
+            }
+        }
         // GitHub #285: absent until the first call, for the decision
         // family's reason.
         if self.tokenize_calls.iter().map(read).sum::<u64>() > 0 {
@@ -1341,6 +1401,35 @@ mod tests {
         ));
         assert!(text.contains("ignis_locates_total{kind=\"records\",method=\"vote\",compression=\"none\",found=\"unmeasured\"} 1"));
         assert!(text.contains("ignis_locates_total{kind=\"prose\",method=\"shortlist\",compression=\"none\",found=\"false\"} 0"));
+    }
+
+    /// GitHub #307: the speculative family is absent until a request that
+    /// ran verify rounds ends, then sums the requests' counters.
+    #[test]
+    fn the_speculative_counters_sum_the_requests_verify_rounds() {
+        let metrics = Metrics::new();
+        assert!(!metrics.render().contains("ignis_speculative_rounds_total"));
+        let spec = ignis_core::types::SpecCounters::round(3, 2) + ignis_core::types::SpecCounters::round(3, 0);
+        metrics.record_speculation(&spec);
+        metrics.record_speculation(&ignis_core::types::SpecCounters::round(1, 1));
+        let text = metrics.render();
+        declared_once(
+            &text,
+            &[
+                ("ignis_speculative_rounds_total", "counter"),
+                ("ignis_speculative_drafted_tokens_total", "counter"),
+                ("ignis_speculative_accepted_tokens_total", "counter"),
+                ("ignis_speculative_position_drafted_total", "counter"),
+                ("ignis_speculative_position_accepted_total", "counter"),
+            ],
+        );
+        assert_eq!(value(&text, "ignis_speculative_rounds_total", ""), "3");
+        assert_eq!(value(&text, "ignis_speculative_drafted_tokens_total", ""), "7");
+        assert_eq!(value(&text, "ignis_speculative_accepted_tokens_total", ""), "3");
+        assert_eq!(value(&text, "ignis_speculative_position_drafted_total", "position=\"1\""), "3");
+        assert_eq!(value(&text, "ignis_speculative_position_accepted_total", "position=\"1\""), "2");
+        assert_eq!(value(&text, "ignis_speculative_position_accepted_total", "position=\"2\""), "1");
+        assert_eq!(value(&text, "ignis_speculative_position_drafted_total", "position=\"3\""), "2");
     }
 
     #[test]

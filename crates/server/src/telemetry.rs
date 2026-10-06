@@ -437,6 +437,9 @@ impl Telemetry {
         thinking: Option<BudgetOutcome>,
     ) {
         if let Some(metrics) = &self.metrics {
+            if let Some(spec) = spec.as_ref() {
+                metrics.record_speculation(spec);
+            }
             match self.recently_cancelled.iter().position(|&c| c == id) {
                 // Already counted as cancelled (see `recently_cancelled`).
                 Some(i) => {
