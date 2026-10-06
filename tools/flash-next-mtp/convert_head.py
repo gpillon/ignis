@@ -223,6 +223,24 @@ def decode_hashes(gq, dq, k2):
     return out
 
 
+def _experts_step(shim, layer, X, ridx, rw, d, tm):
+    """The trunk converter's expert step on the head's MoE inputs, then the decode of what it wrote:
+    its record, the MoE error and every decoded projection's sha256. Without autograd, as the
+    trunk's pass runs it (the layer's parameters require grad)."""
+    import torch
+    with torch.no_grad():
+        rec = {"layer": MTP_LAYER}
+        moe = shim._convert_experts(MTP_LAYER, layer, X, ridx, rw, d, rec, tm)
+        torch.cuda.empty_cache()
+        ta = time.time()
+        gq, dq, _, _ = shim._decode_experts(d, MTP_LAYER, False)
+        hashes = decode_hashes(gq, dq, rec["k2"])
+        tm["decode"] = time.time() - ta
+        err = {"layer": 0}     # _moe_error looks up the trunk's run 6 / run 8 baselines, none apply here
+        shim._moe_error(layer.mlp.experts, gq, dq, moe, err)
+    return rec, err, hashes
+
+
 def cmd_run(a):
     import torch
     import container
@@ -284,19 +302,10 @@ def cmd_run(a):
     if X.shape[0] != len(cal):
         raise RuntimeError(f"{X.shape[0]} entries, the chunks give {len(cal)}")
     tm["moe_inputs"] = time.time() - ta
+    head.embed = None          # the combine is done; the experts step needs the layer only
     shim = _shim(dev, a.budget, a.work, cal, test, kind, kinds)
-    rec = {"layer": MTP_LAYER}
-    moe = shim._convert_experts(MTP_LAYER, head.layer, X, ridx, rw, d, rec, tm)
+    rec, err, hashes = _experts_step(shim, head.layer, X, ridx, rw, d, tm)
     del X, ridx, rw
-    torch.cuda.empty_cache()
-
-    ta = time.time()
-    gq, dq, _, _ = shim._decode_experts(d, MTP_LAYER, False)
-    hashes = decode_hashes(gq, dq, rec["k2"])
-    tm["decode"] = time.time() - ta
-    err = {"layer": 0}         # _moe_error looks up the trunk's run 6 / run 8 baselines, none apply here
-    shim._moe_error(head.layer.mlp.experts, gq, dq, moe, err)
-    del gq, dq, moe
 
     hasher.join()
     if "error" in main_sha:

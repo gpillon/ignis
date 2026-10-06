@@ -304,3 +304,30 @@ def test_the_quantized_head_puts_every_decoded_projection_in_its_fused_slot(tmp_
         for p, t in (("gu", gu), ("dn", dn)):
             k2, rec = recs[(e, p)]
             assert torch.all(t[e] == torch.tensor(float(rec["suh"][0]) + k2).bfloat16())
+
+
+def test_the_experts_step_runs_without_autograd():
+    """The head layer's parameters require grad: outside no_grad the trunk's expert step would keep
+    every expert's activations for a backward pass (the 2026-10-06 run died of it, out of VRAM)."""
+    seen = []
+
+    class Shim:
+        def _convert_experts(self, L, layer, X, ridx, rw, d, rec, tm):
+            seen.append(torch.is_grad_enabled())
+            rec["k2"] = {"gu": [4], "dn": [4]}
+            return {}
+
+        def _decode_experts(self, d, L, convert):
+            seen.append(torch.is_grad_enabled())
+            return torch.zeros(1, 2, 2), torch.zeros(1, 2, 2), [], []
+
+        def _moe_error(self, experts, gq, dq, m, rec):
+            seen.append(torch.is_grad_enabled())
+            rec.update(moe_db=-20.0)
+
+    layer = torch.nn.Module()
+    layer.mlp = torch.nn.Module()
+    layer.mlp.experts = torch.nn.Linear(2, 2)
+    rec, err, hashes = ch._experts_step(Shim(), layer, None, None, None, "d", {})
+    assert seen == [False, False, False] and torch.is_grad_enabled()
+    assert err["moe_db"] == -20.0 and [h["class"] for h in hashes] == ["gu-2", "dn-2"]
