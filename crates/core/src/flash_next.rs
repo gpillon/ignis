@@ -379,6 +379,24 @@ impl FlashNextEngine {
         Ok(logits)
     }
 
+    /// `tokens` prefilled from position 0 on a fresh sequence, returned so a
+    /// test can read its K/V rows back (`Seq::capture_kv_rows_for_test`):
+    /// the real-row fixture of spec flash-next/04 acceptance 7. One prefill
+    /// call, so at most one chunk.
+    #[cfg(feature = "kv-capture")]
+    pub fn prefill_for_kv_capture(&mut self, tokens: &[u32]) -> Result<crate::seq::Seq<'_>, String> {
+        if tokens.len() > self.options.prefill_chunk_tokens as usize {
+            return Err(format!("{} tokens past the load's {}-token chunk", tokens.len(), self.options.prefill_chunk_tokens));
+        }
+        let mut seq = self.pool.alloc(self.options.max_context_tokens)?;
+        let mut context = self.table.new_context();
+        let mut rows = vec![0u8; tokens.len() * self.table.token_bytes()];
+        self.table.stage(&mut context, tokens, &mut rows)?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], &rows, None, None)?;
+        Ok(seq)
+    }
+
     /// Greedy generation of `count` tokens after `prompt`, on lanes of one
     /// prompt each (all of them at once: one round of `prompts.len()` lanes
     /// per token).

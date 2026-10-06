@@ -41,3 +41,26 @@ fn hq_kv_fixture_bin_matches_its_provenance_sha256() {
          never one alone"
     );
 }
+
+/// The same check for the Flash-Next rows (spec flash-next/04 acceptance 7),
+/// recorded by `flash_next_kv_fixture_capture_gpu.rs`.
+#[test]
+fn flash_next_kv_fixture_bin_matches_its_provenance_sha256() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/tests/fixtures");
+    let bin_path = dir.join("hq_kv_rows_flash_next.bin");
+    let provenance_path = dir.join("hq_kv_rows_flash_next.provenance.json");
+    let bin_bytes = fs::read(&bin_path).unwrap_or_else(|e| panic!("read {}: {e}", bin_path.display()));
+    let provenance_text = fs::read_to_string(&provenance_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", provenance_path.display()));
+    let provenance: serde_json::Value = serde_json::from_str(&provenance_text)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", provenance_path.display()));
+    let recorded_sha256 = provenance["bin_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{} has no string \"bin_sha256\" field", provenance_path.display()));
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bin_bytes)),
+        recorded_sha256,
+        "kernel/tests/fixtures/hq_kv_rows_flash_next.bin does not match the SHA-256 in its provenance -- \
+         re-run flash_next_kv_fixture_capture_gpu.rs to regenerate both files together"
+    );
+}
