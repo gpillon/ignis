@@ -351,6 +351,31 @@ int main() {
     mix_case(w8, dw8, "FP8", rows, false, scratch);
   }
 
+  // What the norm cannot hold is refused by name, not computed wrong.
+  {
+    ignis::flash_next::Geometry g;
+    g.streams = kStreams;
+    g.hc_rank = kRank;
+    g.rms_norm_eps = static_cast<float>(kEps);
+    void *d_out = nullptr;
+    float *d_inj = nullptr;
+    cuda_ok(cudaMalloc(&d_out, static_cast<std::size_t>(kWidth) * 2), "cudaMalloc out");
+    cuda_ok(cudaMalloc(&d_inj, kStreams * 4), "cudaMalloc inj");
+    for (int hidden : {2564, 4104}) {
+      g.hidden = hidden;
+      check(ignis::flash_next::fn_hc_mix(g, dw, d_out, 1, d_out, d_inj, scratch, nullptr) != 0,
+            "a stream width of " + std::to_string(hidden) + " is refused");
+    }
+    g.hidden = kHidden;
+    ignis::flash_next::HcWeights misaligned = dw;
+    misaligned.block_inject = static_cast<const char *>(dw.block_inject) + 2;
+    check(ignis::flash_next::fn_hc_mix(g, misaligned, d_out, 1, d_out, d_inj, scratch, nullptr) != 0,
+          "a block-inject weight off 16 bytes is refused");
+    cuda_ok(cudaDeviceSynchronize(), "sync");
+    cudaFree(d_out);
+    cudaFree(d_inj);
+  }
+
   if (g_failed != 0) {
     std::fprintf(stderr, "flash-next hyper-connection test: %d check(s) failed\n", g_failed);
     return 1;

@@ -35,8 +35,11 @@ namespace {
 constexpr int32_t kWaveRows = 1024;
 constexpr int32_t kThreads = 256;
 constexpr int32_t kWarps = kThreads / 32;
-// The norm's per-stream inject partials hold one accumulator per stream.
+// The norm's per-stream inject partials hold one accumulator per stream, and
+// a norm thread holds up to kNormSpan elements of its stream (registers, and
+// the row in shared memory): streams of up to kNormSpan * kThreads.
 constexpr int32_t kMaxStreams = 8;
+constexpr int32_t kNormSpan = 16;
 // The decode route: its row ceiling, the stream count its lane map is built
 // for, and the rank its activation (fp32, every row) fits in shared memory.
 constexpr int32_t kDecodeRows = 8;
@@ -105,42 +108,64 @@ const __nv_bfloat16 *fp8_scales(const Linear &w) {
 // normed[r] = grouped RMSNorm of hidden[r], (1 + w), one CTA per (stream,
 // row); with block-inject weights, part[r][s][j] = the inject matvec's output
 // j over stream s's columns only (inject_weight sums the streams).
+// Thread t holds elements t, t + kThreads, ... and sums their squares in that
+// order (the strided loop's order). Its loads are all issued before the
+// reduce, and the inject dot reads the normed row back from shared memory in
+// 16-byte vectors: two memory round trips per CTA, not one per element.
 __global__ void hc_norm(const __nv_bfloat16 *__restrict__ hidden, const __nv_bfloat16 *__restrict__ w,
                         const __nv_bfloat16 *__restrict__ inject, __nv_bfloat16 *__restrict__ normed,
                         float *__restrict__ part, int32_t streams, int32_t width, float eps) {
   __shared__ float partial[kWarps];
   __shared__ float partials[kMaxStreams][kWarps];
+  __shared__ __align__(16) __nv_bfloat16 row_normed[kNormSpan * kThreads];
+  const int32_t tid = static_cast<int32_t>(threadIdx.x);
   const int32_t s = static_cast<int32_t>(blockIdx.x);
   const std::int64_t row = blockIdx.y;
   const std::int64_t base = (row * streams + s) * width;
+  float v[kNormSpan];
+  float scale[kNormSpan];
+#pragma unroll
+  for (int32_t j = 0; j < kNormSpan; ++j) {
+    const int32_t i = tid + j * kThreads;
+    v[j] = i < width ? __bfloat162float(hidden[base + i]) : 0.0F;
+    scale[j] = i < width ? 1.0F + __bfloat162float(w[s * width + i]) : 0.0F;
+  }
   float squares = 0.0F;
-  for (int32_t i = static_cast<int32_t>(threadIdx.x); i < width; i += kThreads) {
-    const float v = __bfloat162float(hidden[base + i]);
-    squares = fmaf(v, v, squares);
+#pragma unroll
+  for (int32_t j = 0; j < kNormSpan; ++j) {
+    if (tid + j * kThreads < width) {
+      squares = fmaf(v[j], v[j], squares);
+    }
   }
   const float inv = rsqrtf(block_sum(squares, partial) / static_cast<float>(width) + eps);
-  float dots[kMaxStreams] = {};
-  const std::int64_t inject_stride = static_cast<std::int64_t>(streams) * width;
-  for (int32_t i = static_cast<int32_t>(threadIdx.x); i < width; i += kThreads) {
-    const float v = __bfloat162float(hidden[base + i]) * inv;
-    const float scale = 1.0F + __bfloat162float(w[s * width + i]);
-    const __nv_bfloat16 n = __float2bfloat16(v * scale);
-    normed[base + i] = n;
-    if (inject != nullptr) {
-      const float nf = __bfloat162float(n);
 #pragma unroll
-      for (int32_t j = 0; j < kMaxStreams; ++j) {
-        if (j < streams) {
-          dots[j] = fmaf(__bfloat162float(inject[j * inject_stride + s * width + i]), nf, dots[j]);
-        }
-      }
+  for (int32_t j = 0; j < kNormSpan; ++j) {
+    const int32_t i = tid + j * kThreads;
+    if (i < width) {
+      const __nv_bfloat16 n = __float2bfloat16(v[j] * inv * scale[j]);
+      normed[base + i] = n;
+      row_normed[i] = n;
     }
   }
   if (inject == nullptr) {
     return;
   }
-  const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32;
-  const int32_t lane = static_cast<int32_t>(threadIdx.x) % 32;
+  __syncthreads();
+  float dots[kMaxStreams] = {};
+  const std::int64_t inject_stride = static_cast<std::int64_t>(streams) * width;
+#pragma unroll 2
+  for (int32_t c = tid; c < width / 8; c += kThreads) {
+    const uint4 nv = reinterpret_cast<const uint4 *>(row_normed)[c];
+#pragma unroll
+    for (int32_t j = 0; j < kMaxStreams; ++j) {
+      if (j < streams) {
+        const auto *wr = reinterpret_cast<const uint4 *>(inject + j * inject_stride + s * width);
+        dots[j] = dot8(__ldg(wr + c), nv, dots[j]);
+      }
+    }
+  }
+  const int32_t warp = tid / 32;
+  const int32_t lane = tid % 32;
 #pragma unroll
   for (int32_t j = 0; j < kMaxStreams; ++j) {
     if (j < streams) {
@@ -458,12 +483,18 @@ int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int
     fn_set_error("fn_hc_mix: null operand or no rows");
     return -1;
   }
-  if (g.streams <= 0 || g.streams > kMaxStreams) {
-    fn_set_error("fn_hc_mix: " + std::to_string(g.streams) + " streams (1.." + std::to_string(kMaxStreams) +
-                 " supported)");
+  if (g.streams <= 0 || g.streams > kMaxStreams || g.hidden <= 0 || g.hidden % 8 != 0 ||
+      g.hidden > kNormSpan * kThreads) {
+    fn_set_error("fn_hc_mix: " + std::to_string(g.streams) + " streams of " + std::to_string(g.hidden) +
+                 " (supported: 1.." + std::to_string(kMaxStreams) + " streams, a multiple of 8 up to " +
+                 std::to_string(kNormSpan * kThreads) + " wide)");
     return -1;
   }
   const bool with_inject = w.block_inject != nullptr && inj != nullptr;
+  if (with_inject && !aligned16(w.block_inject)) {
+    fn_set_error("fn_hc_mix: the block-inject weight must be 16-byte aligned");
+    return -1;
+  }
   const int32_t width = g.residual_width();
   auto scope = scratch.scope();
   const int32_t wave = std::min(rows, kWaveRows);
