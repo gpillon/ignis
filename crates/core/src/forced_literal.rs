@@ -42,10 +42,18 @@
 //!
 //! A close the budget forced leaves no unseen token — its own tokens were
 //! forced up to the literal's first draw — so the literal starts there,
-//! with its first token. And when the model writes the literal's first token
-//! itself after the close, before forcing could start (a speculative round
-//! that committed `</think>` and the opener together), nothing is forced:
-//! the request is already writing what the literal would have.
+//! with its first token.
+//!
+//! # When the model opens the call itself
+//!
+//! A speculative round may commit `</think>` and the start of the model's
+//! own call together. The literal's first **common** tokens are the ones
+//! every call writes alike — for the tool-call opener `<tool_call>`, `\n`,
+//! `<`, `function`, before the name — so a model that stopped inside them is
+//! continued: the token after its last one, unseen, is taken to be the
+//! literal's next, and forcing resumes at the one after that. A model that
+//! wrote all of them, or wrote something else after `<tool_call>`, is left
+//! alone: the name, or whatever it wrote, is its own.
 
 use std::sync::Arc;
 
@@ -58,8 +66,9 @@ enum ForcedStart {
     /// At the generation's first token.
     Generation,
     /// Right after the reasoning block closes at `think_end`, the block's
-    /// closing marker.
-    AfterReasoning { think_end: TokenId },
+    /// closing marker. The literal's first `common` tokens are the ones
+    /// every call writes alike (module docs).
+    AfterReasoning { think_end: TokenId, common: usize },
 }
 
 /// The tokens a request is made to generate, and where they start.
@@ -81,13 +90,17 @@ impl ForcedLiteral {
     }
 
     /// A literal forced right after the reasoning block closes at
-    /// `think_end`. Refused without a second token, which is the joiner a
-    /// close by the model itself needs (module docs).
-    pub fn after_reasoning(tokens: Vec<TokenId>, think_end: TokenId) -> Result<Self, String> {
+    /// `think_end`, whose first `common` tokens every call writes alike.
+    /// Refused without a second token, which is the joiner a close by the
+    /// model itself needs, and with `common` past the literal (module docs).
+    pub fn after_reasoning(tokens: Vec<TokenId>, think_end: TokenId, common: usize) -> Result<Self, String> {
         if tokens.len() < 2 {
             return Err("a literal forced after the reasoning block needs a second token to join on".to_owned());
         }
-        Ok(Self { tokens: tokens.into(), start: ForcedStart::AfterReasoning { think_end } })
+        if common > tokens.len() {
+            return Err(format!("{common} common tokens in a literal of {}", tokens.len()));
+        }
+        Ok(Self { tokens: tokens.into(), start: ForcedStart::AfterReasoning { think_end, common } })
     }
 
     /// The set the prefill's draw is restricted to: the literal's first
@@ -106,14 +119,15 @@ enum Phase {
     /// The block is open: nothing is forced.
     #[default]
     Reasoning,
-    /// The block has closed and forcing has not started.
-    Closed,
-    /// Forcing started with the draw for output index `from`. `joined`: the
-    /// run opens with the joiner, the token before it having been drawn
-    /// unseen; `unseen_opened`: that token was the literal's first.
-    Forcing { from: u32, joined: bool, unseen_opened: bool },
-    /// The model wrote the literal's first token itself after the close:
-    /// nothing is forced.
+    /// The block has closed and forcing has not started. `matched`: how many
+    /// of the literal's tokens the model has written itself since, in order.
+    Closed { matched: usize },
+    /// Forcing started with the draw for output index `from`, at literal
+    /// index `at`. `joined`: the run opens with the joiner instead, the
+    /// token before it having been drawn unseen; `unseen_opened`: that token
+    /// was the literal's first.
+    Forcing { from: u32, at: usize, joined: bool, unseen_opened: bool },
+    /// The model is writing the call itself: nothing is forced.
     Released,
 }
 
@@ -130,20 +144,20 @@ impl ForcedState {
     /// The permitted set for the draw this round makes, for a request that
     /// has emitted `emitted` tokens — or `None` to draw freely.
     ///
-    /// `budget` is the set the thinking budget forces this round, which
-    /// wins: the budget only forces inside the reasoning block, and nothing
-    /// of the literal is due before the block has closed.
+    /// `budget` is the set the thinking budget forces this round, and wins:
+    /// the budget only forces inside the reasoning block, and nothing of the
+    /// literal is due before the block has closed.
     pub fn permitted(
         &mut self,
         literal: &ForcedLiteral,
         emitted: u32,
-        budget: Option<&PermittedSet>,
+        budget: Option<PermittedSet>,
     ) -> Option<PermittedSet> {
         let set = match budget {
-            Some(_) => None,
+            Some(budget) => Some(budget),
             None => self.step(literal, emitted + 1),
         };
-        self.last_draw_forced = budget.or(set.as_ref()).is_some_and(|set| set.len() == 1);
+        self.last_draw_forced = set.as_ref().is_some_and(|set| set.len() == 1);
         set
     }
 
@@ -151,13 +165,21 @@ impl ForcedState {
         let at = match (literal.start, self.phase) {
             (ForcedStart::Generation, _) => draw as usize,
             (_, Phase::Reasoning | Phase::Released) => return None,
-            (_, Phase::Closed) => {
+            // Nothing of the call yet: the joiner after an unseen token, the
+            // first token after a seen one.
+            (_, Phase::Closed { matched: 0 }) => {
                 let joined = !self.last_draw_forced;
-                self.phase = Phase::Forcing { from: draw, joined, unseen_opened: false };
+                self.phase = Phase::Forcing { from: draw, at: 0, joined, unseen_opened: false };
                 if joined { 1 } else { 0 }
             }
-            (_, Phase::Forcing { from, joined, unseen_opened }) => match (joined, draw.checked_sub(from)? as usize) {
-                (false, step) => step,
+            // The model's own call, stopped inside the common tokens: the
+            // unseen token after it is the literal's next.
+            (_, Phase::Closed { matched }) => {
+                self.phase = Phase::Forcing { from: draw, at: matched + 1, joined: false, unseen_opened: false };
+                matched + 1
+            }
+            (_, Phase::Forcing { from, at, joined, unseen_opened }) => match (joined, draw.checked_sub(from)? as usize) {
+                (false, step) => at + step,
                 (true, 0) => 1,
                 // The joiner was the literal's second token: after an
                 // unseen first, the run resumes at its third.
@@ -171,17 +193,25 @@ impl ForcedState {
     /// Record the token emitted at `index` (0-based over the request's
     /// output).
     pub fn commit(&mut self, literal: &ForcedLiteral, index: u32, token: TokenId) {
-        let ForcedStart::AfterReasoning { think_end } = literal.start else {
+        let ForcedStart::AfterReasoning { think_end, common } = literal.start else {
             return;
         };
-        match &mut self.phase {
-            phase @ Phase::Reasoning if token == think_end => *phase = Phase::Closed,
-            phase @ Phase::Closed if token == literal.tokens[0] => *phase = Phase::Released,
-            Phase::Forcing { from, joined: true, unseen_opened } if index + 1 == *from => {
-                *unseen_opened = token == literal.tokens[0];
+        self.phase = match self.phase {
+            Phase::Reasoning if token == think_end => Phase::Closed { matched: 0 },
+            Phase::Closed { matched } => match (matched, token == literal.tokens[matched]) {
+                (0, false) => Phase::Closed { matched: 0 },
+                // Written past the common tokens, or something else after
+                // its own `<tool_call>`: the call is its own.
+                (_, true) if matched + 1 >= common => Phase::Released,
+                (_, true) => Phase::Closed { matched: matched + 1 },
+                (_, false) => Phase::Released,
+            },
+            // The unseen token before the joiner, now seen.
+            Phase::Forcing { from, at, joined: true, .. } if index + 1 == from => {
+                Phase::Forcing { from, at, joined: true, unseen_opened: token == literal.tokens[0] }
             }
-            _ => {}
-        }
+            phase => phase,
+        };
     }
 }
 
@@ -211,7 +241,7 @@ mod tests {
         for _ in 0..rounds {
             let emitted = out.len() as u32;
             let budget = budget(emitted + 1).map(|token| PermittedSet::from([token]));
-            let set = state.permitted(literal, emitted, budget.as_ref()).or(budget);
+            let set = state.permitted(literal, emitted, budget);
             state.commit(literal, emitted, pending);
             out.push(pending);
             pending = match set {
@@ -227,10 +257,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_literal_and_one_with_no_joiner_are_refused() {
+    fn an_empty_literal_one_with_no_joiner_and_common_tokens_past_it_are_refused() {
         assert!(ForcedLiteral::at_generation(Vec::new()).is_err());
-        assert!(ForcedLiteral::after_reasoning(vec![OPEN], END).is_err());
-        assert!(ForcedLiteral::after_reasoning(OPENER.to_vec(), END).is_ok());
+        assert!(ForcedLiteral::after_reasoning(vec![OPEN], END, 1).is_err());
+        assert!(ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 5).is_err());
+        assert!(ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 4).is_ok());
     }
 
     #[test]
@@ -243,7 +274,7 @@ mod tests {
 
     #[test]
     fn after_reasoning_nothing_is_forced_while_the_block_is_open() {
-        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END).unwrap();
+        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 4).unwrap();
         assert_eq!(literal.prefill_step(), None);
         assert!(run(&literal, |_| 5, free, 12).iter().all(|&t| t == 5));
     }
@@ -253,7 +284,7 @@ mod tests {
         // The model closes at 3 and writes `\n\n` (7) at 4, drawn in the
         // round that emitted the close: unseen. The joiner comes next, then
         // the whole literal, then the model again.
-        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END).unwrap();
+        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 4).unwrap();
         let out = run(&literal, |i| match i { 3 => END, 4 => 7, _ => 5 }, free, 12);
         assert_eq!(out, vec![5, 5, 5, END, 7, NL, OPEN, NL, 52, 53, 5, 5]);
     }
@@ -262,7 +293,7 @@ mod tests {
     fn an_unseen_token_that_opened_the_literal_is_not_opened_again() {
         // The model writes `<tool_call>` itself at 4, the token nobody saw:
         // the joiner is its line break, and the literal resumes at `<`.
-        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END).unwrap();
+        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 4).unwrap();
         let out = run(&literal, |i| match i { 3 => END, 4 => OPEN, _ => 5 }, free, 10);
         assert_eq!(out, vec![5, 5, 5, END, OPEN, NL, 52, 53, 5, 5]);
         assert_eq!(out.iter().filter(|&&t| t == OPEN).count(), 1);
@@ -272,23 +303,41 @@ mod tests {
     fn a_close_the_budget_forced_is_followed_by_the_literal_with_no_joiner() {
         // The budget forces `</think>`, `\n\n` (7) for draws 4 and 5: the
         // token before the literal's first draw was forced, so seen.
-        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END).unwrap();
+        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 4).unwrap();
         let budget = |draw: u32| match draw { 4 => Some(END), 5 => Some(7), _ => None };
         let out = run(&literal, |_| 5, budget, 12);
         assert_eq!(out, vec![5, 5, 5, 5, END, 7, OPEN, NL, 52, 53, 5, 5]);
     }
 
-    #[test]
-    fn the_models_own_opener_before_forcing_starts_releases_the_literal() {
-        // One speculative round committed `</think>` and `<tool_call>`
-        // together; the state sees them in order before its next set.
-        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END).unwrap();
+    /// One speculative round's tokens, committed in order before the next
+    /// round asks for a set.
+    fn one_round(literal: &ForcedLiteral, tokens: &[TokenId]) -> ForcedState {
         let mut state = ForcedState::default();
-        assert_eq!(state.permitted(&literal, 0, None), None);
-        for (index, token) in [5, END, 7, OPEN, NL].into_iter().enumerate() {
-            state.commit(&literal, index as u32, token);
+        assert_eq!(state.permitted(literal, 0, None), None);
+        for (index, &token) in tokens.iter().enumerate() {
+            state.commit(literal, index as u32, token);
         }
-        assert!((5..20).all(|emitted| state.permitted(&literal, emitted, None).is_none()));
+        state
+    }
+
+    #[test]
+    fn the_models_own_call_stopped_inside_the_common_tokens_is_continued() {
+        // `</think>`, `\n\n`, `<tool_call>`, `\n` in one round: the unseen
+        // token after them is the `<` every call writes next, so the draw
+        // after it is the literal's `function`, and then it is spent.
+        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 4).unwrap();
+        let mut state = one_round(&literal, &[5, END, 7, OPEN, NL]);
+        assert_eq!(state.permitted(&literal, 5, None).as_deref(), Some(&[53][..]));
+        assert_eq!(state.permitted(&literal, 6, None), None);
+    }
+
+    #[test]
+    fn the_models_own_call_past_the_common_tokens_or_off_the_dialect_is_its_own() {
+        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 4).unwrap();
+        for tokens in [&[END, 7, OPEN, NL, 52, 53][..], &[END, OPEN, 77][..]] {
+            let mut state = one_round(&literal, tokens);
+            assert!((6..20).all(|emitted| state.permitted(&literal, emitted, None).is_none()), "{tokens:?}");
+        }
     }
 
     #[test]
@@ -296,6 +345,6 @@ mod tests {
         let literal = ForcedLiteral::at_generation(OPENER.to_vec()).unwrap();
         let mut state = ForcedState::default();
         let budget = PermittedSet::from([END]);
-        assert_eq!(state.permitted(&literal, 0, Some(&budget)), None);
+        assert_eq!(state.permitted(&literal, 0, Some(budget.clone())), Some(budget));
     }
 }

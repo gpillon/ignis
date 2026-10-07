@@ -119,7 +119,7 @@ fn after_reasoning_the_models_own_close_is_followed_by_the_joiner_and_then_the_l
     let mock = Arc::new(MockCompute::with_runs(&[4]));
     let think_end = mock.token_for(0, 2);
     let mut sched = scheduler(mock.clone(), None);
-    let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), think_end).unwrap();
+    let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), think_end, 4).unwrap();
     let id = submit(&mut sched, input(20, None, Some(literal)));
     let out = run(&mut sched, id);
     let model = |step| mock.token_for(id, step);
@@ -141,23 +141,44 @@ fn an_unseen_token_that_opened_the_call_is_not_opened_twice() {
     let think_end = mock.token_for(0, 3);
     let open = mock.token_for(0, 4);
     let mut sched = scheduler(mock.clone(), None);
-    let literal = ForcedLiteral::after_reasoning(vec![open, NL, 902, 903], think_end).unwrap();
+    let literal = ForcedLiteral::after_reasoning(vec![open, NL, 902, 903], think_end, 4).unwrap();
     let id = submit(&mut sched, input(20, None, Some(literal)));
     let out = run(&mut sched, id);
     assert_eq!(&out[3..8], &[think_end, open, NL, 902, 903][..], "{out:?}");
     assert_eq!(out.iter().filter(|&&t| t == open).count(), 1);
 }
 
+/// A speculative run commits `</think>` and the model's own `<tool_call>`
+/// together, ending there. The name is not the model's yet: the unseen
+/// token after it is the `\n` every call writes next, and the literal
+/// resumes after that — `<`, `function`, and here the name, which is what
+/// keeps a named call on the tool asked for.
 #[test]
-fn the_models_own_opener_committed_with_its_close_is_never_forced() {
+fn the_models_own_opener_committed_with_its_close_is_continued_to_the_name() {
     let mock = Arc::new(MockCompute::with_runs(&[4]));
     let think_end = mock.token_for(0, 2);
     let open = mock.token_for(0, 3);
     let mut sched = scheduler(mock.clone(), None);
-    let literal = ForcedLiteral::after_reasoning(vec![open, NL, 902, 903], think_end).unwrap();
+    // `<tool_call>`, `\n`, `<`, `function` are common; 904 is the name.
+    let literal = ForcedLiteral::after_reasoning(vec![open, NL, 902, 903, 904], think_end, 4).unwrap();
     let id = submit(&mut sched, input(20, None, Some(literal)));
     let out = run(&mut sched, id);
-    assert_eq!(out.len(), 20);
+    assert_eq!(&out[2..8], &[think_end, open, mock.token_for(id, 4), 902, 903, 904][..], "{out:?}");
+    assert_eq!(out.len(), 20, "released after the name");
+    assert_eq!(forced_rounds(&mock), vec![vec![902], vec![903], vec![904]]);
+}
+
+/// A run that committed the common tokens and went on into a name of its
+/// own is left alone: forcing another name into it would write neither.
+#[test]
+fn the_models_own_call_past_the_common_tokens_is_never_forced() {
+    let mock = Arc::new(MockCompute::with_runs(&[8]));
+    let think_end = mock.token_for(0, 2);
+    let common: Vec<TokenId> = (3..7).map(|step| mock.token_for(0, step)).collect();
+    let mut sched = scheduler(mock.clone(), None);
+    let literal = ForcedLiteral::after_reasoning([&common[..], &[904]].concat(), think_end, 4).unwrap();
+    let id = submit(&mut sched, input(20, None, Some(literal)));
+    assert_eq!(run(&mut sched, id).len(), 20);
     assert!(forced_rounds(&mock).is_empty(), "nothing forced");
 }
 
@@ -170,7 +191,7 @@ fn a_close_the_budget_forced_is_followed_by_the_literal_with_no_joiner_between()
     let mock = Arc::new(MockCompute::new());
     let close = ThinkingClose::new(CLOSE.to_vec(), THINK_END).unwrap();
     let mut sched = scheduler(mock.clone(), Some(close));
-    let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), THINK_END).unwrap();
+    let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), THINK_END, 4).unwrap();
     let id = submit(&mut sched, input(ANSWER_RESERVE + 6, Some(6), Some(literal)));
     let out = run(&mut sched, id);
     assert_eq!(&out[7..14], &[800, THINK_END, 800, OPEN, NL, 902, 903][..], "{:?}", &out[..16]);
@@ -190,7 +211,7 @@ fn a_literal_drawn_by_the_prefill_leaves_the_prompt_a_token_to_prefill() {
     let at_generation = input(20, None, Some(ForcedLiteral::at_generation(OPENER.to_vec()).unwrap()));
     assert_eq!(at_generation.prefill_tail(), 1);
     assert_eq!((at_generation.reuse_reach(), at_generation.publish_reach()), (2, 2));
-    let after = input(20, None, Some(ForcedLiteral::after_reasoning(OPENER.to_vec(), THINK_END).unwrap()));
+    let after = input(20, None, Some(ForcedLiteral::after_reasoning(OPENER.to_vec(), THINK_END, 4).unwrap()));
     assert_eq!(after.prefill_tail(), 0);
     assert_eq!((after.reuse_reach(), after.publish_reach()), (3, 3));
 }

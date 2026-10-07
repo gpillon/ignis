@@ -304,8 +304,18 @@ impl RequestInput {
     /// the generation (GitHub #286). Either must be left a token to prefill,
     /// for the reason [`RequestInput::reuse_reach`] gives.
     pub fn draws_forced_at_prefill(&self) -> bool {
-        self.is_constrained()
-            || self.forced_literal.as_deref().is_some_and(|literal| literal.prefill_step().is_some())
+        self.prefill_permitted().is_some()
+    }
+
+    /// The set this request's prefill draws its first generated token from:
+    /// a constrained decode's first step, or a forced literal's first token
+    /// when it starts at the generation (GitHub #286); `None` for a free
+    /// draw, which is every other request's.
+    pub fn prefill_permitted(&self) -> Option<crate::constrained::PermittedSet> {
+        match &self.constrained {
+            Some(schedule) => schedule.step(0),
+            None => self.forced_literal.as_deref().and_then(crate::forced_literal::ForcedLiteral::prefill_step),
+        }
     }
 
     /// How many leading prompt tokens this request may **match** retained

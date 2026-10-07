@@ -3159,16 +3159,10 @@ impl Scheduler for ConcreteScheduler {
                     // guarantees the chunk is not empty. A forced literal
                     // that starts at the generation (GitHub #286) puts its
                     // first token here for the same reason.
-                    permitted: (start + take >= r.input.tokens.len() as u32)
-                        .then(|| match &r.input.constrained {
-                            Some(schedule) => schedule.step(0),
-                            None => r
-                                .input
-                                .forced_literal
-                                .as_deref()
-                                .and_then(crate::forced_literal::ForcedLiteral::prefill_step),
-                        })
-                        .flatten(),
+                    permitted: r
+                        .input
+                        .prefill_permitted()
+                        .filter(|_| start + take >= r.input.tokens.len() as u32),
                     // GitHub #260: the attention readout, on the same chunk
                     // and for the same reason as the readout — its query is
                     // the prompt's last position. `prefill_tail` is what
@@ -3633,7 +3627,7 @@ impl Scheduler for ConcreteScheduler {
                         .as_deref()
                         .and_then(|close| r.thinking.permitted(r.input.params.thinking_budget, close, r.tokens));
                     match r.input.forced_literal.as_deref() {
-                        Some(literal) => r.forced_state.permitted(literal, r.tokens, budget.as_ref()).or(budget),
+                        Some(literal) => r.forced_state.permitted(literal, r.tokens, budget),
                         None => budget,
                     }
                 })

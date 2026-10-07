@@ -928,16 +928,19 @@ const REQUIRED_OPENING: &str = "<tool_call>\n<function";
 /// whole opening encoded at once so the name merges as the model would
 /// write it. With thinking off it is forced from the generation's first
 /// token; with it on (`thinking`, as the template starts the generation),
-/// right after the reasoning block closes, by the model or by the thinking budget — thinking is on by
-/// default and OpenAI-SDK clients never turn it off, so that is where an
-/// agent's `"required"` lands.
+/// right after the reasoning block closes, by the model or by the thinking
+/// budget — thinking is on by default and OpenAI-SDK clients never turn it
+/// off, so that is where an agent's `"required"` lands.
 ///
 /// Refused rather than dropped, since a constraint quietly dropped is a
 /// wrong answer that looks like a right one: a template that cannot encode
 /// the opening; with thinking on, a tokenizer whose `</think>` is not one
 /// token or whose opening does not start `<tool_call>`, `\n`; and a `cap` —
 /// the request's generation cap and the field that set it — shorter than
-/// the opening.
+/// the opening. With thinking on the reasoning spends the same cap, and how
+/// much of it is not knowable here: the thinking budget's answer reserve is
+/// what keeps room for the call, and a request with no budget may reason
+/// to its cap and end `length` with no call.
 pub(crate) fn forced_tool_call(
     server: &Server,
     choice: &ToolChoice,
@@ -978,11 +981,15 @@ pub(crate) fn forced_tool_call(
         true => {
             // The scheduler sees the block close by its one `</think>`
             // token, and after a close it could not see coming it joins on
-            // the opening's second token, the `\n` after `<tool_call>`.
+            // the opening's second token, the `\n` after `<tool_call>`. The
+            // tokens before the name are the ones every call writes alike: a
+            // call the model opened itself and stopped inside them is
+            // continued to the name.
             let think_end = encode(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1).map(|ids| ids[0]);
             let joins = encode("<tool_call>\n").is_some_and(|ids| ids.len() == 2 && tokens.starts_with(&ids));
+            let common = encode(REQUIRED_OPENING).filter(|ids| tokens.starts_with(ids)).map_or(1, |ids| ids.len());
             match think_end.filter(|_| joins) {
-                Some(think_end) => ignis_core::forced_literal::ForcedLiteral::after_reasoning(tokens, think_end),
+                Some(think_end) => ignis_core::forced_literal::ForcedLiteral::after_reasoning(tokens, think_end, common),
                 None => {
                     return Err(unsupported(
                         "with thinking on, a call is forced after the reasoning block closes, and this tokenizer has no single-token </think> and <tool_call> to force it by; send enable_thinking: false",
