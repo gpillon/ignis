@@ -61,6 +61,10 @@ fn engine(kv_format: KvFormat) -> Option<FlashNextEngine> {
 }
 
 fn engine_with(kv_format: KvFormat, backend: SpeculativeBackend) -> Option<FlashNextEngine> {
+    engine_with_context(kv_format, backend, 8192)
+}
+
+fn engine_with_context(kv_format: KvFormat, backend: SpeculativeBackend, max_context_tokens: u32) -> Option<FlashNextEngine> {
     let dir = model_dir();
     if !dir.join(ARTIFACT_FILE_NAME).exists() {
         gpu_profile::skip_or_fail(&format!("no Flash-Next artifact in {}", dir.display()));
@@ -72,7 +76,7 @@ fn engine_with(kv_format: KvFormat, backend: SpeculativeBackend) -> Option<Flash
     }
     let speculation = FlashNextSpeculation::new(backend, DRAFT_TOKENS, 0).expect("valid");
     let options =
-        EngineOptions { max_context_tokens: 8192, kv_format, speculation: Some(speculation), ..EngineOptions::default() };
+        EngineOptions { max_context_tokens, kv_format, speculation: Some(speculation), ..EngineOptions::default() };
     match FlashNextEngine::load(&dir, options) {
         Ok(engine) => Some(engine),
         Err(e) => {
@@ -348,4 +352,39 @@ fn the_mtp_head_drafts_and_the_text_is_kept() {
         }
         drop(engine);
     }
+}
+
+/// GitHub #307 (2c87e4c): the last prefill chunk's draw block has its own
+/// arena scope, so the MTP head's entries after it reuse the arena within the
+/// prefill scratch the plan sized (the arena is exactly that size and throws
+/// past it). The load is cut to a long hq prompt of whole chunks, so the last
+/// chunk is exactly the plan's chunk size and the head's attention peaks at
+/// nearly the plan's attention term, the case the draw block's 16 MiB would
+/// stack on. Measured on the real artifact at this size (arena peak after the
+/// last chunk, plan 323_309_568): 305_332_224 without the scope, so the
+/// scope's margin here is the 18 MB the plan keeps over the head's own peak,
+/// and this guard does not go red without 2c87e4c; it holds the full-chunk
+/// MTP prefill inside the plan (a bad_alloc fails the generate).
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact and its MTP companion"]
+fn the_mtp_heads_entries_after_a_full_chunks_draw_fit_the_planned_arena() {
+    let Some(g1) = g1_prompts() else { return };
+    let chunk = EngineOptions::default().prefill_chunk_tokens as usize;
+    let prompt_tokens = 40 * chunk;
+    // A page (64) multiple past the prompt: room for the generated tokens.
+    let Some(engine) =
+        engine_with_context(KvFormat::HqE8_2b, SpeculativeBackend::Mtp, (prompt_tokens + 2 * 64) as u32)
+    else {
+        return;
+    };
+    assert_eq!(engine.options().prefill_chunk_tokens as usize, chunk);
+    let mut prompt = Vec::new();
+    while prompt.len() < prompt_tokens {
+        for p in &g1 {
+            prompt.extend_from_slice(p);
+        }
+    }
+    prompt.truncate(prompt_tokens);
+    let head = run(&engine, &[prompt], None);
+    assert_eq!(head.tokens[0].len(), TOKENS, "the full-chunk prompt generated through the head");
 }
