@@ -656,6 +656,23 @@ int main() {
       keys_equal = std::equal(key.begin(), key.end(), keys_after_4098.begin() + static_cast<std::size_t>(bk) * kHd);
     }
     check(keys_equal, "fn_indexer_select: the pool's layer-1 block keys differ from the stages'");
+    // A verify call wider than its records is refused by name before it writes them (#307).
+    {
+      fn::VerifyRecords records;
+      records.rows = 1;
+      fn::Batch b;
+      b.lanes = 1;
+      b.tokens = 2;
+      b.slots = d.slots.as<int32_t>();
+      b.positions = d.positions.as<int32_t>();
+      b.max_visible = 4098;
+      b.verify = &records;
+      ninfer::DeviceArena unused(256);
+      fn::Selection out{d.tok_b.as<int32_t>(), d.cnt_b.as<int32_t>()};
+      check(fn::fn_indexer_select(ctx, 1, wts, b, d.xin.p, out, unused, d.stream) != 0 &&
+                std::string(fn::fn_last_error()).find("2 rows overruns its records' 1") != std::string::npos,
+            "fn_indexer_select: a verify call of 2 rows on records of 1 must be refused by name");
+    }
     ignis_seq_release(pool, seq);
     ignis_seq_pool_free(pool);
   }

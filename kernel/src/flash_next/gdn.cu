@@ -231,11 +231,11 @@ int32_t run(const Geometry &g, const State &state, const GdnWeights &w, const Ba
   if (record != nullptr) {
     // A verify call: the vendored replay record's domain.
     if (batch.lanes > kMaxLanes || batch.tokens < kMinRecordColumns || batch.tokens > kMaxRecordColumns ||
-        record->valid_columns == nullptr || record->gdn_key == nullptr) {
+        record->valid_columns == nullptr || record->gdn_key == nullptr || rows > record->rows) {
       fn_set_error("gdn: a verify call is 1.." + std::to_string(kMaxLanes) + " lanes of " +
                    std::to_string(kMinRecordColumns) + ".." + std::to_string(kMaxRecordColumns) +
-                   " columns with its records (got " + std::to_string(batch.lanes) + " x " +
-                   std::to_string(batch.tokens) + ")");
+                   " columns with its records, in their " + std::to_string(record->rows) + " rows (got " +
+                   std::to_string(batch.lanes) + " x " + std::to_string(batch.tokens) + ")");
       return -1;
     }
   } else if (per_lane ? batch.lanes > kMaxLanes : batch.lanes != 1) {

@@ -173,6 +173,10 @@ struct Sections {
 bool sections_of(const ignis_seq_pool &pool, const Geometry &g, int32_t gdn_layers, Sections *out,
                  std::string *error);
 
+// Every step below refuses, by name and before it launches anything, a call its state was not sized
+// for: more lanes than the load's, a window past its widest (window(1)), or more rows than its
+// records hold. (The ops that write the records refuse the last too: VerifyRecords::rows.)
+
 // The pass's first step: every lane's state the forward advances in place, into `state.saved`.
 // `slots`, `positions`: DEVICE [lanes] (the round's staged rows). Graph-safe.
 int32_t save(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
