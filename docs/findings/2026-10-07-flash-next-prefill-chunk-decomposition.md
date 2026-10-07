@@ -154,7 +154,9 @@ Flash-Next prefills at ~2.2-2.8K tokens/s (a 34K prompt in ~15 s at 4 n-gram rea
   | expert-cache hit rate | 97.0% | 96.5% |
   | experts moved per token | 66.5 MB | 73.7 MB |
 
-  In the quiet pair, 12288 costs 2.5% of one-lane decode (mean of the reps: 95.9 against 98.4 tok/s).
+  - Two costs are measured, and repeat leg to leg: the hit rate falls 0.5 points, and the experts moved per decode token rise 11%.
+  - The tok/s difference is not resolved. The two 8192 legs differ by 11%, and all four legs drift upward in run order. The quiet pair's −2.5% (95.9 against 98.4 tok/s) sits inside that spread.
+  - The first pair also shows that one-lane decode on this box moves with other agents' CPU builds.
 
 Raw data: `.scratch/fn-prefill-2026-10-07/` in the `flash-next` worktree (untracked):
 - `report/`, `nsys/`: `prefill.jsonl`, `client.jsonl`, `server.log`, `residency.json`, metrics;
@@ -176,7 +178,7 @@ Observed:
      - 0.52-0.56 s at this default with width 16 ([the agent turn tail finding](2026-10-07-flash-next-agent-turn-tail.md));
      - 0.41-0.54 s at this default with width 10, here.
 2. **The stream is per traversal, not per token.**
-   - A 512-960-token traversal touches 66-76% of the experts per layer and moves 15.9-18.5 GB. An 8192-token one touches 89-93% and moves 21.2-21.9 GB: 16x the tokens for 1.2-1.3x the bytes.
+   - A 512-960-token traversal touches 66-76% of the experts per layer and moves 15.9-18.5 GB. An 8192-token one touches 89-93% and moves 21.2-21.9 GB: 16x the tokens for 1.2-1.4x the bytes.
    - A 33-63-token piece still moves 6-9 GB.
    - So a prompt's time is set by how many traversals it has, not by its length:
      - a 9.2K prompt is four traversals: 2.17 + 1.55 + 0.53 + 0.04 s on the card;
@@ -187,7 +189,7 @@ Observed:
 6. **The link is Gen 3 x16** because the host's lanes are Gen 3 (i9-10900K). The card supports Gen 5.
 7. **A 12288-token chunk cuts TTFT 27-30% at ~9K and 10-11% at ~30K, at zero code.**
    - It folds a ~9K prompt's second chunk into the first, and a 30K prompt runs three chunks instead of four.
-   - The expert cache pays: 0.85 GB less, hit rate 97.0 → 96.5%, one-lane decode −2.5%.
+   - The expert cache pays 0.85 GB. The decode hit rate falls from 97.0 to 96.5%, and the experts moved per decode token rise 11%. The effect on one-lane tok/s is within the legs' run-to-run spread (11%), not resolved.
    - 16384 does not fit at 262K x 3 lanes: the cache would fall under its 12 GiB floor.
 
 Inferred:
@@ -207,7 +209,7 @@ The ranked levers, ranked by gain, then confidence, then cost. Gains are against
 
 | # | lever | estimated gain | basis | cost |
 |---:|---|---|---|---|
-| 1 | **`--prefill-chunk 12288`** at 262K x 3 lanes (16384 is refused; up to ~15360 should fit, not measured) | **9K −1.3-1.5 s (−27-30%), 30K −1.1 s (−10-11%)** | **measured** | Zero code. The expert cache gives 0.85 GB: hit rate −0.5 points, one-lane decode −2.5% (measured). The decode lanes' gap during a prefill grows to one 12288-token chunk, ~2.7-2.8 s plus its gather (inferred). |
+| 1 | **`--prefill-chunk 12288`** at 262K x 3 lanes (16384 is refused; up to ~15360 should fit, not measured) | **9K −1.3-1.5 s (−27-30%), 30K −1.1 s (−10-11%)** | **measured** | Zero code. The expert cache gives 0.85 GB. Measured: decode hit rate −0.5 points, decode bytes per token +11%. One-lane tok/s is not resolved: −2.5% in the quiet pair, inside an 11% leg-to-leg spread. The decode lanes' gap during a prefill grows to one 12288-token chunk, ~2.7-2.8 s plus its gather (inferred). |
 | 2 | **Fewer streams per prompt: layer-major chunk groups.** Run every chunk of a group through layer *l* before layer *l*+1, so each layer's experts stream once per group, not once per chunk. | 30K: the four chunks move ~24 GB instead of 85.8 and take ~6.6 s on the card instead of 8.5 (their compute, 6.5 s, hides one stream), **TTFT −1.9 s (−19%)**. 9K: its 960-token chunk drops from 1.55 s to its ~0.3 s of compute, **−1.2 s (−25%)** | inferred from measured compute, bytes and the 98% chunk-to-chunk overlap | Large: the forward loop turns layers-outer. The KV, indexer and GDN state are already per layer and causal, so the order is legal. The group's residual stream (20 KB/token, 0.5 GB for 4 x 8192) is paid from the expert cache. The group is one block for the decode lanes unless rounds interleave. |
 | 3 | **Balanced chunk split**: cut a span into equal chunks instead of full chunks plus a remainder. The 5120-5312-token remainder is copy-bound: 1.93-2.34 s, as long as a full chunk. | 30K: ~−0.6-0.8 s at 8192 or 12288 | inferred from the measured compute and copy per chunk | Scheduler only. Chunk ends may need page alignment. |
 | 4 | **Fold the publish-point piece** into the traversal before it: a pages-only chained prefix, ADR 0029 amendment, [the agent turn tail finding](2026-10-07-flash-next-agent-turn-tail.md) follow-up 1 | **−0.46-0.74 s on every prompt**, cold or reused: −5-6% at 30K, −10-15% at 9K | measured cost of the piece | A spec 05 / ADR 0029 change. The opener piece (37-43 ms) is not worth folding. |
@@ -221,7 +223,7 @@ The ranked levers, ranked by gain, then confidence, then cost. Gains are against
   - Skipping small experts changes the output.
   - Copy/compute overlap as a whole is already 75% hidden (item 7 is what is left).
   - Narrower chunks multiply the streams: [the prefill chunk finding](2026-10-07-flash-next-prefill-chunk-and-decode-share.md) measured 2048 at 1.86x the TTFT.
-- **The owner's constraint holds for every item.** None shrinks the KV pool. Items 1, 2 and 7 take their VRAM from the expert cache, which costs the decode hit rate: 0.85 GB cost 2.5% of one-lane decode in item 1.
+- **The owner's constraint holds for every item.** None shrinks the KV pool. Items 1, 2 and 7 take their VRAM from the expert cache, which costs the decode hit rate: 0.85 GB cost 0.5 points of hit rate and +11% decode bytes in item 1.
 - **The items compose.**
   - Items 2-4 remove or merge traversals, and stack on item 1.
   - At 12288 (item 1), a full chunk spends 2.70-2.80 s on the card for ~1.85 s of copies (22.6-23.1 GB at ~12.3 GB/s). Its compute is therefore the larger term (inferred, not profiled), so kernel work (item 9) starts to pay on full chunks.
@@ -234,7 +236,7 @@ The ranked levers, ranked by gain, then confidence, then cost. Gains are against
 - **The levers are estimates.**
   - Item 1 is measured on five prompts.
   - Items 2, 3 and 5 are inferred.
-  - Item 1's decode cost was measured at one lane only, not at 2-3 lanes.
+  - Item 1's decode cost was measured at one lane only, not at 2-3 lanes. Its tok/s effect is unresolved.
   - Item 2's group activations, its interaction with the decode share, and its gap for the decode lanes are not designed.
   - Item 4's saving assumes the folded piece adds its ~10 ms of compute and no stream.
 - **The gather varies with the text:** 12-55K file rows per 8192 tokens. Why the small spans' gathers took 16-24 ms in load A and 1-5 ms in load B is not known.
