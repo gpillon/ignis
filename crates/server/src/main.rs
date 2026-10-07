@@ -282,6 +282,7 @@ async fn main() {
         reasoning_effort: default_reasoning_effort,
         thinking_budget: default_thinking_budget,
         prefill_chunk: _,
+        decode_share_percent: _,
         max_context,
         kv_format: _,
         kv_pool_bytes: _,

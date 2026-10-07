@@ -444,6 +444,13 @@ When output names a domain concept, use the term as defined here.
   concurrent on the GPU: the two take turns, so a long prefill costs the
   decode lanes one chunk of latency instead of the whole span. The scheduler
   drives it by passing one chunk per prefill call.
+- **Decode share** — the part of the model's time decoding lanes keep while a
+  prompt prefills (`--decode-share`, in percent). After a chunk that took `t`,
+  the next chunk waits until the lanes have decoded for `t * s / (1 - s)`; with
+  no lane decoding it runs at once. 0 is one decode round per chunk (ADR 0018,
+  the 27B's); Flash-Next, whose chunk runs for seconds, holds chunks by
+  default (GitHub #306). It bounds the lanes' rate during a prefill, not the
+  gap a single chunk leaves: only the chunk width moves that.
 - **True prefill/decode overlap** — prefill and decode resident on the GPU at
   the same time, on separate streams, contending for SMs. Distinct from
   **prefill/decode interleaving** and deliberately not built: the north-star

@@ -30,6 +30,9 @@ pub fn scheduler<L: StepLeaf>(
 pub struct EngineShape {
     /// The prefill chunk width, in tokens (a nonzero multiple of 128).
     pub prefill_chunk: u32,
+    /// The decode share, in percent (`--decode-share`, GitHub #306); `None`
+    /// takes the family's ([`EngineShape::for_family`]), and the 27B's is 0.
+    pub decode_share_percent: Option<u32>,
     /// The maximum per-sequence context, in tokens.
     pub max_context: u32,
     /// The KV storage format the load runs on (`--kv-format`, GitHub #122).
@@ -81,6 +84,7 @@ impl Default for EngineShape {
     fn default() -> Self {
         Self {
             prefill_chunk: ignis_runtime::DEFAULT_PREFILL_CHUNK,
+            decode_share_percent: None,
             max_context: ignis_runtime::DEFAULT_MAX_CONTEXT,
             kv_format: ignis_core::KvFormat::default(),
             kv_pool_bytes: None,
@@ -106,6 +110,7 @@ impl From<&crate::config::Config> for EngineShape {
     fn from(config: &crate::config::Config) -> Self {
         Self {
             prefill_chunk: config.prefill_chunk,
+            decode_share_percent: config.decode_share_percent,
             max_context: config.max_context,
             kv_format: config.kv_format,
             kv_pool_bytes: config.kv_pool_bytes,
@@ -162,10 +167,12 @@ impl EngineShape {
     /// 27B's before the artifact named its model. A named count, or reuse
     /// off, is left as it is.
     pub fn for_family(self, family: ignis_core::compute::ModelFamily) -> Self {
+        // GitHub #306: and so is an unnamed decode share.
+        let decode_share_percent = Some(self.decode_share_percent.unwrap_or(family.default_decode_share_percent()));
         if self.retained_host_named || !self.prompt_reuse {
-            return self;
+            return Self { decode_share_percent, ..self };
         }
-        Self { retained_host_slots: family.default_retained_host_slots(), ..self }
+        Self { retained_host_slots: family.default_retained_host_slots(), decode_share_percent, ..self }
     }
 }
 
@@ -183,6 +190,7 @@ fn scheduler_config_for_shape(
         kv_capacity_pages: capacity_pages,
         host_capacity_bytes: shape.host_pool_bytes,
         serving_chunk_tokens: shape.prefill_chunk,
+        decode_share: f64::from(shape.decode_share_percent.unwrap_or(0)) / 100.0,
         prompt_reuse: shape.prompt_reuse,
         // GitHub #215: the same count the leaf's pool reserved, so every slot
         // the scheduler hands out is one the pool holds -- both kinds, the
@@ -850,6 +858,24 @@ mod tests {
     }
 
     #[test]
+    fn a_flash_next_load_takes_its_family_decode_share_unless_one_is_named() {
+        // GitHub #306: a Flash-Next chunk runs for seconds, the 27B's for
+        // ~110 ms (ADR 0018), so only Flash-Next holds chunks for its lanes.
+        use ignis_core::compute::ModelFamily;
+        let unnamed = EngineShape::default();
+        let flash = unnamed.for_family(ModelFamily::FlashNext);
+        assert_eq!(flash.decode_share_percent, Some(ModelFamily::FlashNext.default_decode_share_percent()));
+        assert!(ModelFamily::FlashNext.default_decode_share_percent() > 0);
+        assert_eq!(ModelFamily::Qwen38_27b.default_decode_share_percent(), 0);
+        let off = EngineShape { prompt_reuse: false, ..unnamed };
+        assert_eq!(off.for_family(ModelFamily::FlashNext).decode_share_percent, flash.decode_share_percent);
+        let named = EngineShape { decode_share_percent: Some(0), ..unnamed };
+        assert_eq!(named.for_family(ModelFamily::FlashNext).decode_share_percent, Some(0), "a named share stands");
+        let config = scheduler_config_for_shape("m".into(), unnamed, 16, 64);
+        assert_eq!(config.decode_share, 0.0, "unresolved, one round per chunk");
+    }
+
+    #[test]
     fn a_flash_next_load_keeps_eight_host_retained_slots_unless_one_is_named() {
         // Spec flash-next/05: host 8, device 0 and a 2 GiB arena by default.
         use ignis_core::compute::ModelFamily;
@@ -890,6 +916,7 @@ mod tests {
     fn the_operator_prefill_chunk_reaches_the_scheduler_config() {
         let shape = EngineShape {
             prefill_chunk: 512,
+            decode_share_percent: Some(25),
             max_context: 65_536,
             kv_format: ignis_core::KvFormat::Bf16,
             kv_pool_bytes: Some(8 * 1024 * 1024 * 1024),
@@ -910,6 +937,8 @@ mod tests {
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
 
         assert_eq!(config.serving_chunk_tokens, 512);
+        // GitHub #306: and the decode share, as a fraction.
+        assert_eq!(config.decode_share, 0.25);
         // GitHub #186: the reuse knobs reach the scheduler too -- and the
         // retained slots as the count the leaf's pool reserves (GitHub #215),
         // both kinds in one pool (GitHub #281).
