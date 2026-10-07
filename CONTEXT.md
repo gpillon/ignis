@@ -681,6 +681,15 @@ When output names a domain concept, use the term as defined here.
   pick it. A run's draws, in order, are its **trace**. The first token of a
   run is drawn by its **prefill**, not by its first decode round, because a
   round returns the token the previous call made ready.
+- **Forced literal** — tokens a request is made to generate, one **permitted
+  set** of one per round, after which it is **released** and generates
+  freely: not a **schedule**, which ends its run when spent. `tool_choice:
+  "required"` or a named function forces the opening of a tool call this way
+  (GitHub #286), from the first token with thinking off and right after the
+  reasoning block with it on; the thinking budget's forced close is the same
+  shape. After a `</think>` the model wrote itself, the first forced token is
+  the literal's second, its **joiner** (the `\n` after `<tool_call>`): the
+  token before it was drawn unseen, and may itself have opened the call.
 - **Answer mass** — how much of the whole next-token distribution the answer
   tokens hold, `exp(logsumexp(answer logits) - logsumexp(all logits))`. It is
   what says whether a restricted softmax is reading the model or renormalizing

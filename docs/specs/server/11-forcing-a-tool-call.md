@@ -77,6 +77,10 @@ answer — or it may mean the feature this spec should build is "force the
 call *after* `</think>`", which is a different mechanism (see Further
 Notes). Decide that before implementing.
 
+**Decided (2026-10-07): force after `</think>`.** Built that way; see
+[As built: departures](#as-built-departures-2026-10-07) at the end, which
+override the sections between here and there where they disagree.
+
 ## User Stories
 
 1. As an agent that has already decided a tool must run, I want
@@ -278,3 +282,58 @@ from the body, and guessing it would change what the model reads.
   free token. Making that work means either accepting one free token
   between the close and the opener, or a leaf that can re-draw. Neither is
   in this spec.
+
+## As built: departures (2026-10-07)
+
+What was built differs from the sections above in these points, and these
+win where the two disagree.
+
+1. **Thinking on forces after the block instead of refusing.** With thinking
+   resolved on, `"required"` and a named function are forced right after the
+   reasoning block closes, by the model's own `</think>` or by the thinking
+   budget's forced close; with it off, from the first token as specified.
+   Why: thinking is on by default and no OpenAI-SDK client turns it off, so
+   the exclusion would have made `tool_choice: "required"` from Codex,
+   qwen-code or opencode a `400` every time, which is the feature not
+   shipping for the clients that send it. "Think, then certainly call" is
+   also what an agent wants: the forcing changes what the model may draw
+   after its reasoning, never the prompt it reads. The 400 survives only
+   where the mechanism cannot work: a tokenizer whose `</think>` or
+   `<tool_call>` is not a single token (`code: tool_choice_unsupported`,
+   naming `enable_thinking: false`).
+2. **The one free token after a natural close is accepted, and joined on.**
+   The round that commits the model's `</think>` has already drawn the next
+   token freely (a speculative round may commit several), so the first forced
+   draw follows a token nobody saw. If that token was `<tool_call>` itself,
+   forcing `<tool_call>` again would open the call twice and it would not
+   parse. So the first token forced after a natural close is the opening's
+   *second*, `\n` (id 198), the **joiner**: right after `<tool_call>`,
+   harmless after anything else (content's leading newlines are trimmed).
+   The opening then resumes at `<` when the unseen token was `<tool_call>`,
+   and from `<tool_call>` otherwise. After a close the budget forced there is
+   no unseen token, so no joiner. When the model commits `<tool_call>` itself
+   after its close before forcing can start, nothing is forced.
+3. **`"required"` forces `<tool_call>\n<function`, not `<tool_call>\n`.** The
+   27B tokenizer writes the opening as `<tool_call>` `\n` `<` `function`
+   and then merges the `=` into the name (`=read`, `=get`; `=` `shell` when
+   it does not). `<function=` is therefore not a step boundary, and stopping
+   before the `=` keeps every forced id one the model writes itself; it also
+   rules out a call written in another dialect. The prefix check this spec
+   asks for passes on all six recorded calls (`tool_choice_real_tokenizer.rs`).
+   A named function forces the whole `<tool_call>\n<function=NAME>\n`, encoded
+   in one call so the name merges as the model's would.
+4. **The forced literal carries its own `</think>` id** (`ForcedLiteral::
+   after_reasoning`), so detecting the close does not depend on the
+   scheduler's thinking-budget close being configured.
+5. **Not built: `ignis_forced_tool_calls_total`.** The outcome (closed or not)
+   is known only where each of the four answer paths resolves its
+   `finish_reason`; a forced call that never closes is still dropped whole and
+   ends with the ordinary `finish_reason`.
+
+**Known gaps.** A named function under speculation: when one round commits
+`</think>` and the model's own `<tool_call>` together, nothing is forced, and
+the model may name a different tool than the one asked for. Prose the model
+writes before the forced opening after a natural close (at most the tokens a
+speculative round commits past its `</think>`) reaches `content`; no fragment
+of the opening does. And the budget's forced close still says "without
+calling any more tools" before a forced call.
