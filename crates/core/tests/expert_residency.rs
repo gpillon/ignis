@@ -86,6 +86,7 @@ fn model(capacity: [u32; 8], prefetch_width: usize) -> ResidencyModel {
         PolicyConfig {
             capacity,
             prefetch_width,
+            prefill_prefetch_width: prefetch_width,
             prefetch_budget_bytes: None,
         },
     )
@@ -234,12 +235,44 @@ fn the_prefetch_width_takes_the_top_of_each_lane_s_ranking() {
 }
 
 #[test]
+fn a_prefill_step_takes_its_own_width_of_each_ranking() {
+    let widths = |prefetch_width, prefill_prefetch_width| {
+        ResidencyModel::new(
+            small_catalog(),
+            PolicyConfig {
+                capacity: ROOMY,
+                prefetch_width,
+                prefill_prefetch_width,
+                prefetch_budget_bytes: None,
+            },
+        )
+    };
+    let experts = |step: &StepOutcome| step.prefetches.iter().map(|(p, _)| p.expert).collect::<Vec<_>>();
+    let a: &[u16] = &[2, 3];
+    let b: &[u16] = &[1, 2];
+    // A round takes two of each ranking; a chunk, with the same lookahead,
+    // only its own width's one.
+    let round = widths(2, 1).step(&LayerStep::decode(0, &[0]).lookahead(&[a, b])).expect("step");
+    assert_eq!(experts(&round), vec![1, 1, 2, 2, 3, 3]);
+    let chunk = widths(2, 1).step(&LayerStep::prefill(0, &[0]).lookahead(&[a, b])).expect("step");
+    assert_eq!(experts(&chunk), vec![1, 1, 2, 2]);
+    // Past its width a ranking is not read, so an id there is not refused.
+    let past: &[u16] = &[2, 9];
+    let chunk = widths(2, 1).step(&LayerStep::prefill(0, &[0]).lookahead(&[past])).expect("step");
+    assert_eq!(experts(&chunk), vec![2, 2]);
+    // A width of zero is no lookahead at all.
+    let chunk = widths(2, 0).step(&LayerStep::prefill(0, &[0]).lookahead(&[a, b])).expect("step");
+    assert!(chunk.prefetches.is_empty());
+}
+
+#[test]
 fn a_decode_step_s_prefetches_keep_to_its_budget_best_ranked_first() {
     let mut m = ResidencyModel::new(
         small_catalog(),
         PolicyConfig {
             capacity: ROOMY,
             prefetch_width: 16,
+            prefill_prefetch_width: 16,
             prefetch_budget_bytes: Some(500),
         },
     );
@@ -492,6 +525,7 @@ fn over_random_traces_the_model_keeps_every_promise_of_its_contract() {
             PolicyConfig {
                 capacity,
                 prefetch_width: WIDTH,
+                prefill_prefetch_width: WIDTH - 1,
                 prefetch_budget_bytes: None,
             },
         );
@@ -568,6 +602,7 @@ fn the_same_trace_gives_the_same_sequence_every_time() {
             PolicyConfig {
                 capacity,
                 prefetch_width: WIDTH,
+                prefill_prefetch_width: WIDTH - 1,
                 prefetch_budget_bytes: None,
             },
         );
@@ -590,6 +625,7 @@ fn decode_without_prefetch_is_a_plain_per_class_lru() {
             PolicyConfig {
                 capacity,
                 prefetch_width: 0,
+                prefill_prefetch_width: 0,
                 prefetch_budget_bytes: None,
             },
         );

@@ -89,7 +89,7 @@ struct Step {
 };
 
 struct Fixture {
-  uint32_t layers = 0, experts = 0, top_k = 0, width = 0;
+  uint32_t layers = 0, experts = 0, top_k = 0, width = 0, prefill_width = 0;
   uint64_t record_bytes[8] = {};
   uint32_t capacity[8] = {};
   uint64_t budget = 0;
@@ -117,6 +117,10 @@ Fixture load(const char *path) {
   int version = 0;
   expect_word(in, "ignis-residency-fixture");
   in >> version;
+  if (version != 2) {
+    std::fprintf(stderr, "fixture: version %d, this test reads 2\n", version);
+    std::exit(1);
+  }
   expect_word(in, "layers");
   in >> f.layers;
   expect_word(in, "experts");
@@ -129,6 +133,8 @@ Fixture load(const char *path) {
   for (auto &c : f.capacity) in >> c;
   expect_word(in, "width");
   in >> f.width;
+  expect_word(in, "prefill_width");
+  in >> f.prefill_width;
   expect_word(in, "budget");
   in >> f.budget;
   expect_word(in, "k2");
@@ -236,6 +242,7 @@ int main(int argc, char **argv) {
   }
   desc.max_tokens = max_rows;
   desc.lookahead_width = f.width;
+  desc.prefill_lookahead_width = f.prefill_width;
   desc.prefetch_budget_bytes = f.budget;
   desc.staging_half_bytes = heaviest;
   desc.host_pool_bytes = pool_bytes;
@@ -709,6 +716,7 @@ int main(int argc, char **argv) {
     d2.capacity[0] = d2.capacity[4] = 12;  // gate/up and down at K = 2
     d2.max_tokens = 1;
     d2.lookahead_width = 2;
+    d2.prefill_lookahead_width = 2;
     d2.prefetch_budget_bytes = IGNIS_RESIDENCY_NO_BUDGET;
     d2.staging_half_bytes = 2 * kE * 4096;
     d2.host_pool_bytes = 2 * 2 * kE * 4096;

@@ -24,7 +24,8 @@
 //!      class, else the **staging ring**. A staged projection is never an
 //!      entry of the pool, so a prefill evicts nothing;
 //! 5. with a lookahead, takes the first `prefetch_width` experts of each
-//!    lane's ranking for the next layer, both projections of each — the
+//!    lane's ranking for the next layer (`prefill_prefetch_width` for a
+//!    prefill), both projections of each — the
 //!    **candidates**, in **rank order**: every lane's first expert, then
 //!    every lane's second, …, gate/up before down, a repeat kept where it
 //!    first appears — skips what is resident or staged, and admits the rest
@@ -103,13 +104,18 @@ pub enum Admission {
     Staging,
 }
 
-/// The pools' shape: slots per class and the lookahead width.
+/// The pools' shape: slots per class and the lookahead widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyConfig {
     /// Slots per class, indexed like [`KClass::ALL`].
     pub capacity: [u32; KClass::COUNT],
     /// Experts taken from the top of each lane's lookahead ranking.
     pub prefetch_width: usize,
+    /// The same for each token of a prefill chunk. A chunk streams its
+    /// lookahead unbudgeted, so every rank past what the next router selects
+    /// is link time the chunk waits on: Flash-Next takes the router's own
+    /// top-k there (GitHub #306).
+    pub prefill_prefetch_width: usize,
     /// The most a decode step may prefetch, in bytes; `None`: no limit. The
     /// link is shared with the step's own misses, so a prefetch only pays
     /// while it fits beside the step's compute (the study's window: one
@@ -344,9 +350,13 @@ impl ResidencyModel {
             check(expert)?;
         }
         let next_layer = (layer + 1 < self.catalog.layers()).then_some(layer + 1);
+        let width = match step.phase {
+            Phase::Decode => self.config.prefetch_width,
+            Phase::Prefill => self.config.prefill_prefetch_width,
+        };
         if next_layer.is_some() {
             for lane in step.lookahead {
-                for &expert in lane.iter().take(self.config.prefetch_width) {
+                for &expert in lane.iter().take(width) {
                     check(expert)?;
                 }
             }
@@ -354,7 +364,7 @@ impl ResidencyModel {
 
         let selected = projections_of(layer, step.selected.iter().copied());
         let candidates = match next_layer {
-            Some(next) => ranked_candidates(next, step.lookahead, self.config.prefetch_width),
+            Some(next) => ranked_candidates(next, step.lookahead, width),
             None => Vec::new(),
         };
         let (mut hits, mut misses) = (Vec::new(), Vec::new());

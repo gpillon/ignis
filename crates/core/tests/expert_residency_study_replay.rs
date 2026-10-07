@@ -208,6 +208,7 @@ fn warm_model(study: &Study, prefetch_width: usize, prefetch_budget_bytes: Optio
         PolicyConfig {
             capacity: cache_plan(study).capacity(),
             prefetch_width,
+            prefill_prefetch_width: prefetch_width,
             prefetch_budget_bytes,
         },
     );

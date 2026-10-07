@@ -42,6 +42,7 @@ pub struct ResidencyDesc {
     pub record_bytes: [u64; KClass::COUNT],
     pub max_tokens: u32,
     pub lookahead_width: u32,
+    pub prefill_lookahead_width: u32,
     pub prefetch_budget_bytes: u64,
     pub staging_half_bytes: u64,
     pub host_pool_bytes: u64,

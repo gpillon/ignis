@@ -15,7 +15,8 @@
  * class, else (decode) the unpinned slot with the smallest (stamp, key), else (prefill) the
  * staging ring; the next layer's lookahead candidates, rank-ordered, are prefetched the same way,
  * a decode prefetch held to a per-step byte budget (a candidate that would pass it is skipped)
- * and dropped when no slot is unpinned. A key is (layer * experts + expert) * 2 + projection;
+ * and dropped when no slot is unpinned, a prefill step's taken unbudgeted to its own width. A
+ * key is (layer * experts + expert) * 2 + projection;
  * it is also the entry's index in the concatenated slot tables. kernel/tests/
  * test_residency_trace.cu holds this implementation to the policy model's outcomes.
  *
@@ -71,6 +72,7 @@ struct ignis_residency_desc {
   uint64_t record_bytes[IGNIS_RESIDENCY_CLASSES];    /* one record, a multiple of 16 */
   uint32_t max_tokens;          /* most tokens a step serves: decode lanes or the prefill chunk */
   uint32_t lookahead_width;     /* W: experts taken from each lookahead row; 0 = none */
+  uint32_t prefill_lookahead_width; /* the same for a prefill step's rows (<= W); 0 = none */
   uint64_t prefetch_budget_bytes; /* per decode step, or IGNIS_RESIDENCY_NO_BUDGET */
   uint64_t staging_half_bytes;  /* one half of the prefill staging ring (>= the heaviest layer;
                                  * a multiple of 16) */
@@ -122,14 +124,16 @@ int32_t ignis_residency_warm_start(struct ignis_residency *r, const uint32_t *ke
  * (decode: one row per lane; prefill: one per token of the chunk). `lookahead_logits` is the
  * next layer's router applied to this layer's MoE input, device fp32 `[tokens][experts]` (the
  * `logits` scratch of ignis_moe_router), or NULL for none (the last layer, or no prefetch):
- * residency ranks each row's top `lookahead_width` experts itself, as the router ranks (logits
- * rounded to BF16, ties to the lower id). `phase` is IGNIS_RESIDENCY_DECODE or _PREFILL. */
+ * residency ranks each row's top `lookahead_width` experts itself (`prefill_lookahead_width` in
+ * a prefill step; its width throughout below), as the router ranks (logits rounded to BF16,
+ * ties to the lower id). A step whose width is 0 has no lookahead. `phase` is
+ * IGNIS_RESIDENCY_DECODE or _PREFILL. */
 int32_t ignis_residency_step(struct ignis_residency *r, uint32_t layer, uint32_t phase,
                              const int32_t *ids, uint32_t tokens,
                              const float *lookahead_logits, void *stream);
 
 /* The same step with the lookahead already ranked: device int32 `[rows][stride]`, best first,
- * -1 for a hole; each row's first `lookahead_width` non-negative entries count. Candidates are
+ * -1 for a hole; each row's first width (the step's) non-negative entries count. Candidates are
  * taken in rank order: every row's first, then every row's second, ..., a repeat kept where it
  * first appears. NULL for none. */
 int32_t ignis_residency_step_ranked(struct ignis_residency *r, uint32_t layer, uint32_t phase,
