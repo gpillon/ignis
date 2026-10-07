@@ -817,43 +817,55 @@ pub(crate) fn with_thinking_budget(
     ))
 }
 
-/// The two `tool_choice` values this template has a lever for (GitHub
-/// #132). `"required"` and the named-function object form parse but are
-/// rejected outright ([`parse_tool_choice`]) rather than represented here
-/// — there is nothing a resolved value of this type could do with them,
-/// since this text-instruction template has no way to *force* a call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolChoice {
-    /// The model decides (the default, and the only thing a text
-    /// instruction template can actually offer beyond "don't call").
+/// What `tool_choice` asks of a request (GitHub #132, #286).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolChoice {
+    /// The model decides (the default).
     Auto,
     /// The model is never told tools exist at all.
     None,
+    /// The model must call one of the tools; it chooses which. Forced by
+    /// [`forced_tool_call`].
+    Required,
+    /// The model must call this function. Forced by [`forced_tool_call`].
+    Function(String),
 }
 
-/// Parse `tool_choice`'s wire value: `"auto"` (default) or `"none"`.
-/// `"required"` and the named-function object form are a 400 explaining
-/// why, not a silently-ignored field (same posture as an unsupported
-/// `reasoning_effort`, GitHub #68).
+/// Parse `tool_choice`'s wire value: `"auto"` (default), `"none"`,
+/// `"required"`, or a named function — chat's `{"type": "function",
+/// "function": {"name": ...}}` or the Responses API's `{"type": "function",
+/// "name": ...}`. Anything else is a 400 naming the field, not a value
+/// silently read as `"auto"`.
 fn parse_tool_choice(tool_choice: Option<JsonValue>) -> Result<ToolChoice, Response> {
-    match tool_choice {
-        None => Ok(ToolChoice::Auto),
-        Some(JsonValue::String(s)) if s == "auto" => Ok(ToolChoice::Auto),
-        Some(JsonValue::String(s)) if s == "none" => Ok(ToolChoice::None),
-        Some(JsonValue::String(s)) if s == "required" => Err(bad_request(
-            "tool_choice: \"required\" is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\" (forcing a call is GitHub #286)",
-        )),
-        Some(JsonValue::Object(_)) => Err(bad_request(
-            "tool_choice naming a specific function is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\" (forcing a call is GitHub #286)",
-        )),
-        Some(other) => Err(bad_request(&format!(
-            "tool_choice must be \"auto\" or \"none\", got {other}"
-        ))),
+    let refused = |got: &JsonValue| {
+        bad_request_param(
+            &format!(
+                "tool_choice must be \"auto\", \"none\", \"required\" or {{\"type\": \"function\", \"function\": {{\"name\": ...}}}}, got {got}"
+            ),
+            "tool_choice",
+        )
+    };
+    let Some(value) = tool_choice else {
+        return Ok(ToolChoice::Auto);
+    };
+    match &value {
+        JsonValue::String(s) if s == "auto" => Ok(ToolChoice::Auto),
+        JsonValue::String(s) if s == "none" => Ok(ToolChoice::None),
+        JsonValue::String(s) if s == "required" => Ok(ToolChoice::Required),
+        JsonValue::Object(object) if object.get("type").and_then(JsonValue::as_str) == Some("function") => object
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .or_else(|| object.get("name"))
+            .and_then(JsonValue::as_str)
+            .filter(|name| !name.is_empty())
+            .map(|name| ToolChoice::Function(name.to_owned()))
+            .ok_or_else(|| refused(&value)),
+        _ => Err(refused(&value)),
     }
 }
 
 /// Validate and resolve `tools` + `tool_choice` (GitHub #132) into the
-/// tools slice that actually reaches the template.
+/// tools slice that actually reaches the template, and the [`ToolChoice`].
 ///
 /// Each `tools` entry must be `{"type": "function", "function": {"name":
 /// <non-empty string>, ...}}` — anything else is a 400 naming the entry
@@ -862,11 +874,12 @@ fn parse_tool_choice(tool_choice: Option<JsonValue>) -> Result<ToolChoice, Respo
 /// only to the template and the model — except the two defaults the
 /// reference fills in ([`normalize_tool`]). [`ToolChoice::None`] discards
 /// the validated tools — the template never sees them, so the model is
-/// never told tools exist.
+/// never told tools exist. `"required"` with no tools, and a function that
+/// is not one of them, are a 400: there is nothing to force a call to.
 pub(crate) fn resolve_tools(
     tools: Option<Vec<JsonValue>>,
     tool_choice: Option<JsonValue>,
-) -> Result<Vec<JsonValue>, Response> {
+) -> Result<(Vec<JsonValue>, ToolChoice), Response> {
     let mut tools = tools.unwrap_or_default();
     tools.iter_mut().for_each(normalize_tool);
     for (index, tool) in tools.iter().enumerate() {
@@ -882,10 +895,104 @@ pub(crate) fn resolve_tools(
             )));
         }
     }
-    match parse_tool_choice(tool_choice)? {
-        ToolChoice::Auto => Ok(tools),
-        ToolChoice::None => Ok(Vec::new()),
+    let choice = parse_tool_choice(tool_choice)?;
+    match &choice {
+        ToolChoice::None => return Ok((Vec::new(), choice)),
+        ToolChoice::Required if tools.is_empty() => {
+            return Err(bad_request_param(
+                "tool_choice: \"required\" needs at least one tool in tools to call",
+                "tool_choice",
+            ));
+        }
+        ToolChoice::Function(name) if !tools.iter().any(|tool| tool["function"]["name"] == name.as_str()) => {
+            return Err(bad_request_param(
+                &format!("tool_choice names the function {name}, which is not one of this request's tools"),
+                "tool_choice",
+            ));
+        }
+        _ => {}
     }
+    Ok((tools, choice))
+}
+
+/// The opening `"required"` forces (spec server/11): the call and its
+/// function tag up to the name. It stops before the `=`, which this
+/// tokenizer merges into the name's first token (`=read`, `=get`): a step
+/// boundary there would split a token the model writes whole.
+const REQUIRED_OPENING: &str = "<tool_call>\n<function";
+
+/// The **forced literal** `tool_choice` asks for (GitHub #286, spec
+/// server/11), or `None` for `"auto"` and `"none"`.
+///
+/// `"required"` forces [`REQUIRED_OPENING`] and leaves the name to the
+/// model; a named function forces `<tool_call>\n<function=NAME>\n`, the
+/// whole opening encoded at once so the name merges as the model would
+/// write it. With thinking off it is forced from the generation's first
+/// token; with it on (`starts_in_reasoning`), right after the reasoning
+/// block closes, by the model or by the thinking budget — thinking is on by
+/// default and OpenAI-SDK clients never turn it off, so that is where an
+/// agent's `"required"` lands.
+///
+/// Refused rather than dropped, since a constraint quietly dropped is a
+/// wrong answer that looks like a right one: a template that cannot encode
+/// the opening; with thinking on, a tokenizer whose `</think>` is not one
+/// token or whose opening does not start `<tool_call>`, `\n`; and a `cap` —
+/// the request's generation cap and the field that set it — shorter than
+/// the opening.
+pub(crate) fn forced_tool_call(
+    server: &Server,
+    choice: &ToolChoice,
+    starts_in_reasoning: bool,
+    cap: Option<(u32, &str)>,
+) -> Result<Option<Arc<ignis_core::forced_literal::ForcedLiteral>>, Response> {
+    let opening = match choice {
+        ToolChoice::Auto | ToolChoice::None => return Ok(None),
+        ToolChoice::Required => REQUIRED_OPENING.to_owned(),
+        ToolChoice::Function(name) => format!("<tool_call>\n<function={name}>\n"),
+    };
+    let unsupported = |message: &str| {
+        error_response_naming(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "tool_choice_unsupported",
+            message,
+            Some("tool_choice"),
+        )
+    };
+    let encode = |text: &str| server.template.encode_literal(text).filter(|ids| !ids.is_empty());
+    let Some(tokens) = encode(&opening) else {
+        return Err(unsupported(
+            "this server's template cannot encode a tool call's opening, so it cannot force a call; use tool_choice \"auto\"",
+        ));
+    };
+    if let Some((cap, field)) = cap.filter(|&(cap, _)| (cap as usize) < tokens.len()) {
+        return Err(bad_request_param(
+            &format!(
+                "{field} ({cap}) is shorter than the {} tokens a forced call opens with, so the call could never be written",
+                tokens.len()
+            ),
+            field,
+        ));
+    }
+    let literal = match starts_in_reasoning {
+        false => ignis_core::forced_literal::ForcedLiteral::at_generation(tokens),
+        true => {
+            // The scheduler sees the block close by its one `</think>`
+            // token, and after a close it could not see coming it joins on
+            // the opening's second token, the `\n` after `<tool_call>`.
+            let think_end = encode("</think>").filter(|ids| ids.len() == 1).map(|ids| ids[0]);
+            let joins = encode("<tool_call>\n").is_some_and(|ids| ids.len() == 2 && tokens.starts_with(&ids));
+            match think_end.filter(|_| joins) {
+                Some(think_end) => ignis_core::forced_literal::ForcedLiteral::after_reasoning(tokens, think_end),
+                None => {
+                    return Err(unsupported(
+                        "with thinking on, a call is forced after the reasoning block closes, and this tokenizer has no single-token </think> and <tool_call> to force it by; send enable_thinking: false",
+                    ));
+                }
+            }
+        }
+    };
+    literal.map(|literal| Some(Arc::new(literal))).map_err(|message| unsupported(&message))
 }
 
 /// The reference's tool normalization (GitHub #172, ninfer
@@ -1265,8 +1372,10 @@ struct ChatCompletionsRequest {
     /// The tool definitions (GitHub #132) — opaque JSON, validated
     /// shallowly and passed to the template as-is (`resolve_tools`).
     tools: Option<Vec<JsonValue>>,
-    /// `"auto"` (default) or `"none"`; anything else is a 400
-    /// (`resolve_tools`) — this template has no lever to *force* a call.
+    /// `"auto"` (default), `"none"`, `"required"`, or `{"type": "function",
+    /// "function": {"name": ...}}` naming one of `tools`. The last two
+    /// force the call's opening (GitHub #286): from the first token with
+    /// thinking off, right after the reasoning block with it on.
     tool_choice: Option<JsonValue>,
     /// The Lane tag (GitHub #120, `CONTEXT.md`): an ignis extension, not an
     /// OpenAI parameter (the way `top_k` went in at #101). `"interactive"`
@@ -1305,7 +1414,7 @@ struct StreamOptions {
 
 `stream: false` answers one JSON body. `stream: true` answers `text/event-stream`: one `data:` line per chunk in the `chat.completion.chunk` shape, a final chunk carrying `finish_reason` and an empty `delta`, then a literal `data: [DONE]` line. With `stream_options.include_usage: true` a usage-only chunk (empty `choices`) precedes it. A request the engine could not run ends instead with one `{\"error\": {message, type, code}}` chunk (type and code `engine_error`) and then `[DONE]`: the status is already 200 by then.
 
-Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text.
+Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why.
 
 `max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.",
     request_body = ChatCompletionsRequest,
@@ -1372,8 +1481,17 @@ async fn chat_completions(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
-    let tools = match resolve_tools(req.tools, req.tool_choice) {
-        Ok(tools) => tools,
+    let (tools, tool_choice) = match resolve_tools(req.tools, req.tool_choice) {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
+    let cap_field = match req.max_completion_tokens {
+        Some(_) => "max_completion_tokens",
+        None => "max_tokens",
+    };
+    let forced = match forced_tool_call(&server, &tool_choice, starts_in_reasoning, max_tokens.map(|cap| (cap, cap_field))) {
+        Ok(forced) => forced,
         Err(response) => return response,
     };
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
@@ -1381,11 +1499,12 @@ async fn chat_completions(
         Err(message) => return bad_request(&message),
     };
     let schemas = ToolSchemas::from_tools(&tools);
-    let (input, model, prompt_tokens, media) =
+    let (mut input, model, prompt_tokens, media) =
         match prepare_request(&server, model, &req.messages, params, &thinking, &tools).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
+    input.forced_literal = forced;
     let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped };
     let (request_id, mut stream) = match server.engine.submit_with_notes(input, class, notes).await {
         Ok(x) => x,
@@ -1399,7 +1518,6 @@ async fn chat_completions(
     let id = format!("chatcmpl-{request_id}");
     let created = now();
 
-    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
     if req.stream {
         // The SSE response: the request's event stream wrapped in the
         // `chat.completion.chunk` shape (a `[DONE]` marker terminates).
@@ -2797,7 +2915,7 @@ mod tests {
     fn a_tool_gets_the_references_default_parameters_and_strict() {
         let sent = serde_json::json!({"type": "function", "function": {"name": "a", "parameters": null}});
         assert_eq!(
-            resolve_tools(Some(vec![sent]), None).unwrap(),
+            resolve_tools(Some(vec![sent]), None).unwrap().0,
             vec![serde_json::json!({"type": "function", "function": {
                 "name": "a", "parameters": {"type": "object", "properties": {}}, "strict": false
             }})]
@@ -2806,13 +2924,13 @@ mod tests {
 
     #[test]
     fn no_tools_and_no_tool_choice_resolves_to_empty() {
-        assert_eq!(resolve_tools(None, None).unwrap(), Vec::<JsonValue>::new());
+        assert_eq!(resolve_tools(None, None).unwrap(), (Vec::<JsonValue>::new(), ToolChoice::Auto));
     }
 
     #[test]
     fn well_formed_tools_pass_through_unchanged() {
         let tools = vec![tool("a"), tool("b")];
-        assert_eq!(resolve_tools(Some(tools.clone()), None).unwrap(), tools);
+        assert_eq!(resolve_tools(Some(tools.clone()), None).unwrap().0, tools);
     }
 
     #[test]
@@ -2831,7 +2949,7 @@ mod tests {
     #[test]
     fn tool_choice_none_drops_validated_tools() {
         let tools = vec![tool("a")];
-        let resolved = resolve_tools(Some(tools), Some(serde_json::json!("none"))).unwrap();
+        let (resolved, _) = resolve_tools(Some(tools), Some(serde_json::json!("none"))).unwrap();
         assert!(resolved.is_empty());
     }
 
@@ -2839,19 +2957,37 @@ mod tests {
     fn tool_choice_auto_keeps_tools() {
         let tools = vec![tool("a")];
         let resolved =
-            resolve_tools(Some(tools.clone()), Some(serde_json::json!("auto"))).unwrap();
+            resolve_tools(Some(tools.clone()), Some(serde_json::json!("auto"))).unwrap().0;
         assert_eq!(resolved, tools);
     }
 
+    /// GitHub #286: `"required"` and a named function resolve to what is
+    /// forced, in chat's shape and the Responses API's.
     #[test]
-    fn tool_choice_required_is_rejected() {
+    fn tool_choice_required_and_a_named_function_resolve() {
+        let tools = vec![tool("a"), tool("b")];
+        let required = resolve_tools(Some(tools.clone()), Some(serde_json::json!("required")));
+        assert_eq!(required.unwrap(), (tools.clone(), ToolChoice::Required));
+        for choice in [
+            serde_json::json!({"type": "function", "function": {"name": "b"}}),
+            serde_json::json!({"type": "function", "name": "b"}),
+        ] {
+            let named = resolve_tools(Some(tools.clone()), Some(choice)).unwrap();
+            assert_eq!(named, (tools.clone(), ToolChoice::Function("b".into())));
+        }
+    }
+
+    #[test]
+    fn tool_choice_required_with_no_tools_is_rejected() {
         assert!(resolve_tools(None, Some(serde_json::json!("required"))).is_err());
     }
 
     #[test]
-    fn tool_choice_naming_a_function_object_is_rejected() {
-        let choice = serde_json::json!({"type": "function", "function": {"name": "a"}});
-        assert!(resolve_tools(None, Some(choice)).is_err());
+    fn tool_choice_naming_a_function_that_is_not_a_tool_is_rejected() {
+        let choice = serde_json::json!({"type": "function", "function": {"name": "c"}});
+        assert!(resolve_tools(Some(vec![tool("a")]), Some(choice)).is_err());
+        let nameless = serde_json::json!({"type": "function", "function": {}});
+        assert!(resolve_tools(Some(vec![tool("a")]), Some(nameless)).is_err());
     }
 
     #[test]
