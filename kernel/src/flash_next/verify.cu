@@ -443,7 +443,7 @@ bool launched(const char *what, std::string *error) {
 // Whether a call of `lanes` lanes at window k fits what `state` was sized for -- its records'
 // rows, its saved lanes and widest window's ring rows, its accept's drafts -- else *error.
 bool fits(const State &state, uint32_t lanes, uint32_t window, const char *what, std::string *error) {
-  const uint32_t rows = max_rows_of(state.lanes, state.draft_tokens, state.row_budget);
+  const auto rows = static_cast<uint32_t>(state.records.rows);
   const uint32_t widest = state.window(1);
   if (lanes >= 1 && lanes <= state.lanes && window >= 1 && window <= widest && lanes * (window + 1) <= rows) {
     return true;

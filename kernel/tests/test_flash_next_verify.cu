@@ -17,7 +17,7 @@
 //
 // restore_head: an MTP load's two attention sections (the trunk's, then the head's) in a
 // three-slot pool, two lanes at windows k = 2 and 3, each lane committing c = 1 or k (both ways
-// round), BF16 and hq-e8-2b. The pass's save, then every section overwritten (what the pass and the
+// round, then every column, k + 1, beside 1), BF16 and hq-e8-2b. The pass's save, then every section overwritten (what the pass and the
 // head's alignment write), then restore_head. Checked, bit for bit, against the state the save saw
 // and the recorded indexer keys: the head's indexer tail of each lane's new frontier p + c, its
 // ring words (the saved ones plus the committed positions' bits) and the side rows of the rejected
@@ -25,9 +25,12 @@
 // the n-gram conv, slot 1 -- as the overwrite left it. The lanes' frontiers differ mod 4 (the tail
 // takes saved and recorded keys) and one lane's columns wrap the ring.
 //
-// refusals: a call wider than its state's records (3 lanes x 4 columns against 8 rows), more
-// lanes than the load's, or a window past its widest is refused by name before anything is written
-// -- by every verify step and by the GDN layer's record call.
+// refusals: a call wider than its state's records (3 lanes x 4 columns against 8 rows, on a
+// three-lane load and on a two-lane one), more lanes than the load's, or a window past its widest is
+// refused by name before anything is written -- by every verify step and by the GDN layer's record
+// call.
+//
+// ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
 #include "flash_next/gdn.h"
 #include "flash_next/verify.h"
@@ -333,7 +336,7 @@ void restore_head_arm(const fn::Geometry &g, bool hq, uint32_t k, const std::vec
   // A call past the load's lanes is refused before it writes anything.
   check(fn::verify::restore_head(*state, pool.sections, g, kLanes + 1, k, d_slots.as<int32_t>(),
                                  d_positions.as<int32_t>(), stream, &error) != 0 &&
-            error.find("overrun") != std::string::npos,
+            error.find("columns overrun this load's round") != std::string::npos,
         name + ": restore_head refuses three lanes on a two-lane load by name");
 }
 
@@ -542,6 +545,17 @@ int main() {
       refused("fold of " + call, fn::verify::fold(*state, sections, lanes, window, slots, stream, &error));
       refused("restore of " + call, fn::verify::restore(*state, sections, g, lanes, window, slots, slots, stream, &error));
     }
+    // On a three-lane load three lanes are the load's and a window of 3 its widest (one lane's):
+    // 3 x 4 columns are refused on the rows alone.
+    auto three = fn::verify::create(g, IGNIS_KV_FORMAT_BF16, 3, kColumns - 1, 0, 1, 1, false, &error);
+    check(three != nullptr && three->window(1) == kColumns - 1 && three->window(3) == 1,
+          "a three-lane load drafts 3 at one lane and 1 at three: " + error);
+    if (three != nullptr) {
+      refused("fold of 3 lanes at a window of 3 on a three-lane load",
+              fn::verify::fold(*three, sections, 3, kColumns - 1, slots, stream, &error));
+      refused("save of 3 lanes at a window of 3 on a three-lane load",
+              fn::verify::save(*three, sections, g, 3, kColumns - 1, slots, slots, stream, &error));
+    }
     MOE_CUDA(cudaStreamSynchronize(stream));
     check(pool.conv_bytes() == conv0 && pool.state_bytes() == state0, "a refused call writes nothing");
   }
@@ -551,6 +565,7 @@ int main() {
       const auto c = static_cast<int32_t>(k);
       restore_head_arm(g, hq, k, {1, c}, stream);
       restore_head_arm(g, hq, k, {c, 1}, stream);
+      restore_head_arm(g, hq, k, {c + 1, 1}, stream);
     }
   }
 

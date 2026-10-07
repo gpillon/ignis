@@ -368,19 +368,20 @@ launch shapes.
   - the sparse prefill route, past `dense_threshold()`: visible rows decoded
     by position, then each row's selection on the sparse kernel.
 
-  Every output is held to three checks:
-  - within the derived fp64 bound over the rows its route read;
-  - within the BF16 output plus the codec's measured effect (fp64 over the
-    rows hq read minus fp64 over the BF16 rows) plus both bounds;
-  - in aggregate, the route distance minus that effect is at most 2^-7
-    relative RMS.
+  Every output is held within the derived fp64 bound over the rows its route
+  read. AC7's tolerance, hq within the BF16 output plus the codec's measured
+  effect (fp64 over the rows hq read minus fp64 over the BF16 rows) plus both
+  bounds, follows from the hq and BF16 outputs' own bound checks by the
+  triangle inequality, and is asserted as stated. The check
+  that stands on its own is the aggregate one: the route distance minus that
+  effect is at most 2^-7 relative RMS.
 
-  The derived bound first took BF16 rounding as 2^-9. On real rows the
+  The derived bound first took BF16 rounding as 2^-9, true only at the top of
+  a binade; round-to-nearest is 2^-8 relative at worst. On real rows the
   attention is peaked and the output's own rounding dominates, so the BF16
-  route itself exceeded that bound on 75 of 18,432 elements, by up to 1.56×.
-  BF16 round-to-nearest is 2^-8 relative at worst. With 2^-8, every element
-  of every route is within the bound (worst ratios: decode 0.75 hq / 0.80
-  BF16, dense 0.51 / 0.52, sparse prefill 0.74 / 0.80). So the bound is the
-  derivation corrected, not a margin fitted to the data. The dense kernel normalizes by the fp32 sum of
-  its unrounded weights, so its weight rounding is bounded by 2^-8 Σ w|v|,
-  not the centred form.
+  route itself exceeded the 2^-9 bound. With 2^-8 every element of every
+  route is within it, with room (the test prints the worst ratio each run,
+  and its comment holds the figures). So the bound is the derivation
+  corrected, not a margin fitted to the data. The dense kernel normalizes by
+  the fp32 sum of its unrounded weights, so its weight rounding is bounded by
+  2^-8 Σ w|v|, not the centred form.

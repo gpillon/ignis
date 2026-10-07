@@ -124,7 +124,7 @@ inline RowFn exact_rows(const Pages &pg) {
 // The rows are the ones the kernel reads (for hq KV: its decoded scratch, downloaded).
 // GitHub #306 item 8: BF16's rounding was first taken as 2^-9, which holds only at the top of a
 // binade. On real Flash-Next rows (spec 04 AC7) the attention is peaked, so the output's own
-// rounding dominates the bound, and the BF16 route itself passed that one on 75 of 18432 elements
+// rounding dominates the bound, and the BF16 route itself exceeded that one on 75 of 18432 elements
 // by up to 1.56x; at 2^-8 every element of every route is within it (the real-row arms print the
 // worst ratio).
 struct Reference {
