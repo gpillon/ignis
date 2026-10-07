@@ -79,7 +79,7 @@ pub const MAX_VISION_EMBEDDING_POOL_MIB: u64 = 64 * 1024;
 // to be kept in sync by hand across the crate boundary.
 pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUNK_ALIGNMENT};
 
-pub use ignis_core::{KvFormat, VramMode};
+pub use ignis_core::{KvFormat, KvPoolSize, VramMode};
 use ignis_core::compute::ModelFamily;
 
 /// `--vram-headroom-bytes`' default: what a derived VRAM budget leaves to the
@@ -148,20 +148,24 @@ pub struct Config {
     /// The KV storage format this load runs on (ADR 0022, GitHub #122),
     /// fixed for the life of the load.
     pub kv_format: KvFormat,
-    /// The paged-KV pool budget, in **bytes** (`--kv-pool-bytes`). Never in
-    /// tokens: what the budget is worth in tokens is derived from
-    /// [`Config::kv_format`] and reported at load. Named, it is never smaller
-    /// than one full context, since a pool the per-sequence cap cannot fit
-    /// inside would admit a request the leaf can never allocate. `None` (the
-    /// default) gives the pool whatever the VRAM plan leaves once every other
-    /// reservation is placed (GitHub #210); the plan refuses a start where
-    /// that is less than one full context.
-    pub kv_pool_bytes: Option<u64>,
+    /// The KV pool the operator named (`--kv-pool-bytes`, ADR 0045): a byte
+    /// count, or a token count (`512Ktok`). Only parsed here: the load's plan,
+    /// which knows the model's bytes per token, turns it into pages and
+    /// refuses one smaller than a full context and a page per retained slot.
+    /// `None` (the default) takes the KV pool policy's size: the rest of the
+    /// VRAM budget when every weight is on the device, 524,288 tokens when
+    /// experts stream.
+    pub kv_pool: Option<KvPoolSize>,
     /// How the load's **VRAM budget** is chosen (GitHub #210, ADR 0030):
     /// derived from `--vram-headroom-bytes` (the default, with
     /// [`DEFAULT_VRAM_HEADROOM_BYTES`]) or named by `--vram-budget-bytes`,
     /// with `--allow-vram-oversubscription` only beside the latter.
     pub vram: VramMode,
+    /// Start Flash-Next with an expert cache below its 12 GiB floor, with a
+    /// warning (`--allow-expert-cache-below-floor` /
+    /// `IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR`, ADR 0045). The 27B, which has
+    /// no expert cache, refuses it.
+    pub allow_expert_cache_below_floor: bool,
     /// The KV-RAM host tier's budget, in bytes (P4-07, GitHub #125): pinned
     /// host memory for evicted (suspended) request snapshots. `0` disables
     /// the tier (admission refuses instead of evicting once the resident
@@ -401,6 +405,7 @@ pub fn resolve(
     let mut vram_headroom_bytes = None;
     let mut vram_budget_bytes = None;
     let mut allow_vram_oversubscription = false;
+    let mut allow_expert_cache_below_floor = false;
     let mut prompt_reuse = None;
     let mut retained_pool_bytes = None;
     let mut retained_slots = None;
@@ -452,6 +457,7 @@ pub fn resolve(
             "--vram-headroom-bytes" => vram_headroom_bytes = Some(take_value(args, &mut i, flag)?),
             "--vram-budget-bytes" => vram_budget_bytes = Some(take_value(args, &mut i, flag)?),
             "--allow-vram-oversubscription" => allow_vram_oversubscription = true,
+            "--allow-expert-cache-below-floor" => allow_expert_cache_below_floor = true,
             "--prompt-reuse" => prompt_reuse = Some(take_value(args, &mut i, flag)?),
             "--retained-pool-bytes" => {
                 retained_pool_bytes = Some(take_value(args, &mut i, flag)?)
@@ -531,17 +537,16 @@ pub fn resolve(
     let decode_share_percent = resolve_decode_share(decode_share, &env)?;
     let max_context = resolve_max_context(max_context, &env)?;
     let default_max_tokens = resolve_default_max_tokens(default_max_tokens, &env)?;
-    // The format is resolved before the budget, because what a budget is
-    // worth in tokens — and so what the auto default has to be — depends on
-    // it (GitHub #122).
     let kv_format = resolve_kv_format(kv_format, &env)?;
-    let kv_pool_bytes = resolve_kv_pool_bytes(kv_pool_bytes, &env, kv_format, max_context)?;
+    let kv_pool = resolve_kv_pool(kv_pool_bytes, &env)?;
     let vram = resolve_vram(
         vram_headroom_bytes,
         vram_budget_bytes,
         allow_vram_oversubscription,
         &env,
     )?;
+    let allow_expert_cache_below_floor = allow_expert_cache_below_floor
+        || resolve_switch_env(&env, "IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR")?;
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let prompt_reuse = resolve_prompt_reuse(prompt_reuse, &env)?;
     refuse_retained_pool_bytes(retained_pool_bytes, &env)?;
@@ -681,8 +686,9 @@ pub fn resolve(
         max_context,
         default_max_tokens,
         kv_format,
-        kv_pool_bytes,
+        kv_pool,
         vram,
+        allow_expert_cache_below_floor,
         host_pool_bytes,
         prompt_reuse,
         retained_device_slots,
@@ -1044,6 +1050,12 @@ pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, 
             ignis_core::N_DECODE_LANES
         )));
     }
+    if config.allow_expert_cache_below_floor && family != ModelFamily::FlashNext {
+        return Err(ConfigError(format!(
+            "`--allow-expert-cache-below-floor`: {} has no expert cache",
+            family.name()
+        )));
+    }
     if let Some(budget) = config.ngram_hot_bytes.filter(|_| family != ModelFamily::FlashNext) {
         return Err(ConfigError(format!("`--ngram-hot-bytes {budget}`: {} has no n-gram table", family.name())));
     }
@@ -1184,31 +1196,56 @@ fn parse_bytes(flag: &str, raw: &str) -> Result<u64, ConfigError> {
         .ok_or_else(bad)
 }
 
-/// `--kv-pool-bytes` / `IGNIS_KV_POOL_BYTES`, or `None`: the VRAM plan gives
-/// the pool the rest (GitHub #210).
+/// `--kv-pool-bytes` / `IGNIS_KV_POOL_BYTES`, or `None`: the KV pool
+/// policy's size (ADR 0045). A byte count as [`parse_bytes`] reads one, or a
+/// token count: `<n>tok`, `<n>Ktok`, `<n>Mtok`, the multipliers binary
+/// (`512Ktok` is 524,288 tokens).
 ///
-/// An explicit budget is *not* raised to fit the context: if the operator
-/// names one too small, that is a usage error caught here, before any
-/// loader work — silently overriding an explicit number would make the flag
-/// a suggestion.
-fn resolve_kv_pool_bytes(
+/// Only parsed. What a byte count is worth in tokens depends on the model,
+/// which is not known yet, so the load's plan -- not this config -- refuses
+/// a pool smaller than one full context and a page per retained slot. It
+/// never raises one: silently overriding an explicit number would make the
+/// flag a suggestion.
+fn resolve_kv_pool(
     flag: Option<String>,
     env: &impl Fn(&str) -> Option<String>,
-    format: KvFormat,
-    max_context: u32,
-) -> Result<Option<u64>, ConfigError> {
+) -> Result<Option<KvPoolSize>, ConfigError> {
     let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_KV_POOL_BYTES"))) else {
         return Ok(None);
     };
-    let bytes = parse_bytes("--kv-pool-bytes", &raw)?;
-    ignis_core::plan_kv_pool_for_context(
-        format,
-        ignis_core::KvGeometry::qwen38_27b(),
-        bytes,
-        max_context,
-    )
-    .map_err(|e| ConfigError(format!("`--kv-pool-bytes`: {e}")))?;
-    Ok(Some(bytes))
+    let text = raw.trim();
+    let lower = text.to_ascii_lowercase();
+    let Some(count) = lower.strip_suffix("tok") else {
+        return parse_bytes("--kv-pool-bytes", &raw).map(|bytes| Some(KvPoolSize::Bytes(bytes)));
+    };
+    let bad = || ConfigError(format!("`--kv-pool-bytes` expects a byte count or <n>[K|M]tok, got `{raw}`"));
+    let (digits, multiplier) = match count.as_bytes().last() {
+        Some(b'k') => (&count[..count.len() - 1], 1024),
+        Some(b'm') => (&count[..count.len() - 1], 1024 * 1024),
+        _ => (count, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .map(|tokens| Some(KvPoolSize::Tokens(tokens)))
+        .ok_or_else(bad)
+}
+
+/// A switch's environment variable (`true`/`false`, `on`/`off`, `1`/`0`),
+/// off when unset: the flag that sets it is a bare `--name`.
+fn resolve_switch_env(env: &impl Fn(&str) -> Option<String>, var: &str) -> Result<bool, ConfigError> {
+    match non_empty(env(var)) {
+        None => Ok(false),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" => Ok(true),
+            "0" | "false" | "off" => Ok(false),
+            _ => Err(ConfigError(format!("`{var}` must be true or false, got `{raw}`"))),
+        },
+    }
 }
 
 /// The VRAM budget's mode (GitHub #210, ADR 0030): `--vram-headroom-bytes` /
@@ -1479,10 +1516,11 @@ fn help_text() -> String {
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
          \x20       --default-max-tokens <n|0> env: IGNIS_DEFAULT_MAX_TOKENS (default: {DEFAULT_MAX_TOKENS}; the max_tokens of a request that sends none, its reasoning included, never past what its prompt leaves of --max-context; an explicit cap always wins; 0 = none, up to the context)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
-         \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: the rest of the VRAM budget; accepts a K/M/G suffix)\n\
+         \x20       --kv-pool-bytes <bytes|tokens> env: IGNIS_KV_POOL_BYTES (default: the KV pool policy's -- the rest of the VRAM budget when every weight is on the device, as on the 27B; 524,288 tokens shared by the lanes when Flash-Next's experts stream, the rest to the expert cache; a byte count with an optional K/M/G suffix, or tokens as <n>tok, <n>Ktok or <n>Mtok; refused below one --max-context sequence and a page per retained slot)\n\
          \x20       --vram-headroom-bytes <b> env: IGNIS_VRAM_HEADROOM_BYTES (default: {default_vram_headroom_gib} GiB; the VRAM budget is the memory free at start minus this; not with --vram-budget-bytes)\n\
          \x20       --vram-budget-bytes <b>   env: IGNIS_VRAM_BUDGET_BYTES (default: unset — derived; the device memory the whole process may hold, weights included; refused above free memory)\n\
          \x20       --allow-vram-oversubscription env: IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION (default: off; needs --vram-budget-bytes; start above free memory with a warning)\n\
+         \x20       --allow-expert-cache-below-floor env: IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR (default: off; Flash-Next only: start with an expert cache below its 12 GiB floor, with a warning -- decode slows sharply below it; the 27B refuses it)\n\
          \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle and the figure Windows reports as its shared GPU memory; 0 disables the host KV-RAM tier)\n\
          \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused, and no prefix is shared unless --retained-device or --retained-host gives slots for it)\n\
          \x20       --retained-device <n>     env: IGNIS_RETAINED_DEVICE (default: {DEFAULT_RETAINED_DEVICE_SLOTS}; retained slots in VRAM, reserved in the VRAM plan and handed out first; 0 with --prompt-reuse off, where a count shares heads between live siblings only)\n\
@@ -1494,7 +1532,7 @@ fn help_text() -> String {
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2 on the 27B, mtp on Flash-Next with its companion container beside the artifact, off)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (1..{MAX_DRAFT_TOKENS}; required with --spec dflash2; with --spec mtp the most drafts a lane verifies, default {FLASH_NEXT_DEFAULT_DRAFT_TOKENS})\n\
          \x20       --draft-rows <n>          env: IGNIS_DRAFT_ROWS     (Flash-Next mtp only; default: 0 = {FLASH_NEXT_VERIFY_ROWS}; rows a verify round takes across lanes, 0 or 2..{FLASH_NEXT_VERIFY_ROWS}; 3 drafts at one lane only)\n\
-         \x20       --decode-lanes <n>        env: IGNIS_DECODE_LANES   (default: 3; Flash-Next only, 1..={n_decode_lanes}; the sequences it decodes at once, each with its own whole context in the KV pool; fewer lanes leave the expert cache more VRAM; the 27B serves a fixed {n_decode_lanes} lanes and refuses it)\n\
+         \x20       --decode-lanes <n>        env: IGNIS_DECODE_LANES   (default: 3; Flash-Next only, 1..={n_decode_lanes}; the sequences it decodes at once, sharing the KV pool; one lane leaves the expert cache more VRAM -- its pool is one context, where two lanes or more share 524,288 tokens; the 27B serves a fixed {n_decode_lanes} lanes and refuses it)\n\
          \x20       --draft-head <head>       env: IGNIS_DRAFT_HEAD     (default: full; needs --spec; full = the drafter proposes with the target's output head, shortlist = with the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM)\n\
          \x20       --rope-scaling <spec>     env: IGNIS_ROPE_SCALING   (default: none; `yarn:F[,t=..][,bf=..][,bs=..]` rescales the checkpoint's trained 262144-position envelope, F in (1, {MAX_YARN_FACTOR}])\n\
          \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
@@ -1585,7 +1623,8 @@ mod tests {
         assert_eq!(config.prefill_chunk, DEFAULT_PREFILL_CHUNK);
         assert_eq!(config.max_context, DEFAULT_MAX_CONTEXT);
         assert_eq!(config.kv_format, KvFormat::HqE8_2b);
-        assert_eq!(config.kv_pool_bytes, None, "the rest of the VRAM budget");
+        assert_eq!(config.kv_pool, None, "the KV pool policy's size");
+        assert!(!config.allow_expert_cache_below_floor);
         assert_eq!(
             config.vram,
             VramMode::Derived { headroom_bytes: DEFAULT_VRAM_HEADROOM_BYTES }
@@ -1811,9 +1850,9 @@ mod tests {
             "the default per-sequence context ({}) must admit a 32K prompt plus a generation budget",
             config.max_context
         );
-        // The pool is the rest of the VRAM budget, which the load's plan
-        // refuses when it cannot hold one such sequence (GitHub #210).
-        assert_eq!(config.kv_pool_bytes, None);
+        // The pool is the policy's, which the load's plan refuses when it
+        // cannot hold one such sequence (GitHub #210, ADR 0045).
+        assert_eq!(config.kv_pool, None);
     }
 
     #[test]
@@ -1941,7 +1980,7 @@ mod tests {
             let a = args(&["--kv-format", format, "--max-context", &context.to_string()]);
             let config = expect_config(resolve(&a, no_env).expect("resolve"));
             assert_eq!(config.max_context, context);
-            assert_eq!(config.kv_pool_bytes, None, "{format} at {context}");
+            assert_eq!(config.kv_pool, None, "{format} at {context}");
         }
     }
 
@@ -1993,8 +2032,10 @@ mod tests {
             expect_config(resolve(&a, no_env).expect("resolve"))
         };
         let (bf16, hq) = (named("bf16"), named("hq-e8-2b"));
-        assert_eq!(bf16.kv_pool_bytes, hq.kv_pool_bytes);
-        let bytes = hq.kv_pool_bytes.expect("named");
+        assert_eq!(bf16.kv_pool, hq.kv_pool);
+        let Some(KvPoolSize::Bytes(bytes)) = hq.kv_pool else {
+            panic!("named in bytes: {:?}", hq.kv_pool);
+        };
         let bf16_capacity = ignis_core::plan_kv_pool(bf16.kv_format, geometry, bytes).token_capacity;
         let hq_capacity = ignis_core::plan_kv_pool(hq.kv_format, geometry, bytes).token_capacity;
         assert!(hq_capacity > bf16_capacity * 7, "{hq_capacity} vs {bf16_capacity}");
@@ -2006,59 +2047,113 @@ mod tests {
     fn a_named_pool_budget_resolves_from_the_flag_and_the_env() {
         let config =
             expect_config(resolve(&args(&["--kv-pool-bytes", "8G"]), no_env).expect("resolve"));
-        assert_eq!(config.kv_pool_bytes, Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(config.kv_pool, Some(KvPoolSize::Bytes(8 * 1024 * 1024 * 1024)));
 
         let env = env_map(&[("IGNIS_KV_POOL_BYTES", "6144MiB")]);
         let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.kv_pool_bytes, Some(6144 * 1024 * 1024));
+        assert_eq!(config.kv_pool, Some(KvPoolSize::Bytes(6144 * 1024 * 1024)));
 
         // A bare count is still a byte count.
         let config = expect_config(
             resolve(&args(&["--kv-pool-bytes", "4294967296"]), no_env).expect("resolve"),
         );
-        assert_eq!(config.kv_pool_bytes, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(config.kv_pool, Some(KvPoolSize::Bytes(4 * 1024 * 1024 * 1024)));
     }
 
     #[test]
-    fn a_pool_budget_too_small_for_the_context_is_refused_before_any_loader_work() {
-        // 1 MiB cannot hold a 40,960-token sequence in either format. The
-        // message has to name the budget, the format and the capacity it
-        // bought, so the operator can see which of the three to change --
-        // and it names whichever format is actually in force, which is why
-        // both are asked here.
-        for format in ["bf16", "hq-e8-2b"] {
-            let err = resolve(&args(&["--kv-pool-bytes", "1M", "--kv-format", format]), no_env)
-                .expect_err("a budget this small");
-            assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0);
-            assert!(err.0.contains(format), "{}", err.0);
-            assert!(err.0.contains("40960"), "{}", err.0);
+    fn a_named_pool_takes_a_token_count_with_binary_multipliers() {
+        // ADR 0045 (AC 5): the quantity the owner decides in, the same
+        // context on either model and either format.
+        for (raw, tokens) in [
+            ("512Ktok", 524_288),
+            ("2Mtok", 2 * 1024 * 1024),
+            ("1000tok", 1_000),
+            ("512ktok", 524_288),
+            (" 64Ktok ", 65_536),
+        ] {
+            let config = expect_config(resolve(&args(&["--kv-pool-bytes", raw]), no_env).expect(raw));
+            assert_eq!(config.kv_pool, Some(KvPoolSize::Tokens(tokens)), "{raw}");
         }
+        // The env var takes the same spellings, and the flag wins over it.
+        let env = env_map(&[("IGNIS_KV_POOL_BYTES", "512Ktok")]);
+        assert_eq!(expect_config(resolve(&[], &env).expect("env")).kv_pool, Some(KvPoolSize::Tokens(524_288)));
+        let flag = expect_config(resolve(&args(&["--kv-pool-bytes", "4G"]), &env).expect("flag"));
+        assert_eq!(flag.kv_pool, Some(KvPoolSize::Bytes(4 << 30)));
     }
 
     #[test]
-    fn a_budget_big_enough_only_under_hq_is_accepted_only_under_hq() {
-        // 512 MiB holds a 40,960-token sequence under hq (378 MB) and not
-        // under BF16 (2.5 GiB) — the format decides whether the load starts.
-        let too_small_for_bf16 = args(&["--kv-pool-bytes", "512M", "--kv-format", "bf16"]);
-        assert!(resolve(&too_small_for_bf16, no_env).is_err());
-
-        let under_hq = args(&["--kv-pool-bytes", "512M", "--kv-format", "hq-e8-2b"]);
-        let config = expect_config(resolve(&under_hq, no_env).expect("resolve"));
-        assert_eq!(config.kv_pool_bytes, Some(512 * 1024 * 1024));
+    fn the_config_only_parses_a_pool_and_the_plan_judges_it() {
+        // ADR 0045: the 27B-geometry check that refused a pool too small for
+        // the context here is gone -- a byte count is a different context on
+        // each model, and only the load knows which. Now pinned: the config
+        // accepts it in either format, and the plan refuses it below one
+        // context and a page per retained slot (`vram.rs`'s
+        // `a_named_pool_below_one_context_refuses_*`).
+        for format in ["bf16", "hq-e8-2b"] {
+            let config = expect_config(
+                resolve(&args(&["--kv-pool-bytes", "1M", "--kv-format", format]), no_env)
+                    .expect("parsed, not judged"),
+            );
+            assert_eq!(config.kv_pool, Some(KvPoolSize::Bytes(1 << 20)));
+        }
+        // What the plan will make of 512 MiB on the 27B at the default
+        // context: under hq it buys more than one context and the retained
+        // slots' pages, under BF16 not -- the format still decides.
+        let geometry = ignis_core::KvGeometry::qwen38_27b();
+        let floor = DEFAULT_MAX_CONTEXT.div_ceil(64) + DEFAULT_RETAINED_HOST_SLOTS + DEFAULT_RETAINED_DEVICE_SLOTS;
+        let pages = |format: KvFormat| KvPoolSize::Bytes(512 << 20).pages(format.page_bytes(geometry));
+        assert!(pages(KvFormat::HqE8_2b) >= floor, "{} vs {floor}", pages(KvFormat::HqE8_2b));
+        assert!(pages(KvFormat::Bf16) < floor, "{} vs {floor}", pages(KvFormat::Bf16));
     }
 
     #[test]
     fn a_malformed_pool_budget_is_a_usage_error() {
-        for raw in ["", "4 GiB please", "-1", "4TB", "G"] {
+        for raw in ["", "4 GiB please", "-1", "4TB", "G", "tok", "Ktok", "4Gtok", "1.5Ktok", "-1tok", "12 tok"] {
             let a = args(&["--kv-pool-bytes", raw]);
             match resolve(&a, no_env) {
                 // An empty value falls through to the auto default, the
                 // same as every other flag here (`non_empty`).
                 Ok(_) if raw.is_empty() => {}
-                Ok(_) => panic!("`{raw}` must not parse as a byte count"),
+                Ok(_) => panic!("`{raw}` must not parse as a byte or token count"),
                 Err(err) => assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0),
             }
         }
+    }
+
+    /// ADR 0045 (AC 6): `--allow-expert-cache-below-floor` is Flash-Next's;
+    /// off by default, on from the flag or the environment, and refused on
+    /// the 27B, which has no expert cache.
+    #[test]
+    fn the_expert_cache_floor_opt_in_parses_and_refuses_the_27b() {
+        let default = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert!(!default.allow_expert_cache_below_floor);
+        let flag = expect_config(resolve(&args(&["--allow-expert-cache-below-floor"]), no_env).expect("flag"));
+        assert!(flag.allow_expert_cache_below_floor);
+        for (raw, on) in [("true", true), ("1", true), ("off", false)] {
+            let env = move |key: &str| (key == "IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR").then(|| raw.to_owned());
+            assert_eq!(expect_config(resolve(&[], env).expect(raw)).allow_expert_cache_below_floor, on, "{raw}");
+        }
+        let err = resolve(&[], env_map(&[("IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR", "maybe")])).expect_err("bad");
+        assert!(err.0.contains("IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR"), "{}", err.0);
+        assert!(served_model_for(&flag, ModelFamily::FlashNext).is_ok());
+        assert!(served_model_for(&default, ModelFamily::Qwen38_27b).is_ok());
+        let err = served_model_for(&flag, ModelFamily::Qwen38_27b).expect_err("no expert cache");
+        assert!(err.0.contains("--allow-expert-cache-below-floor") && err.0.contains("27B"), "{}", err.0);
+    }
+
+    #[test]
+    fn the_help_says_lanes_share_the_pool_and_names_the_new_spellings() {
+        // AC 40 (P1): a lane no longer holds its own whole context.
+        let ConfigOutcome::Help(help) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
+            panic!("--help is help");
+        };
+        let lanes = help.lines().find(|l| l.contains("--decode-lanes")).expect("a --decode-lanes line");
+        assert!(!lanes.contains("whole context"), "{lanes}");
+        assert!(lanes.contains("sharing the KV pool"), "{lanes}");
+        let pool = help.lines().find(|l| l.contains("--kv-pool-bytes")).expect("a --kv-pool-bytes line");
+        assert!(pool.contains("Ktok") && pool.contains("524,288"), "{pool}");
+        let floor = help.lines().find(|l| l.contains("--allow-expert-cache-below-floor")).expect("a floor line");
+        assert!(floor.contains("IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR") && floor.contains("12 GiB"), "{floor}");
     }
 
     // ── the VRAM budget (GitHub #210, ADR 0030) ──────────────────────────

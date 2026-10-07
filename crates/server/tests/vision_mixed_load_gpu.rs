@@ -141,7 +141,7 @@ fn harness() -> Option<Harness> {
         prefill_chunk: PREFILL_CHUNK,
         max_context: MAX_CONTEXT,
         kv_format: KvFormat::HqE8_2b,
-        kv_pool_bytes: Some(one_context_pool_bytes()),
+        kv_pool: Some(ignis_core::KvPoolSize::Bytes(one_context_pool_bytes())),
         prompt_reuse: true,
         retained_device_slots: RETAINED_SLOTS,
         retained_host_slots: 0,

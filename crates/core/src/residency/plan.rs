@@ -243,6 +243,10 @@ pub struct ExpertCacheRequest<'a> {
     pub table_bytes: u64,
     /// [`EXPERT_CACHE_FLOOR_BYTES`] for a real load.
     pub floor_bytes: u64,
+    /// `--allow-expert-cache-below-floor` (ADR 0045): a cache below the floor
+    /// is planned anyway, flagged [`ExpertCachePlan::below_floor`] for the
+    /// load's warning, instead of refused. The class minimum still refuses.
+    pub allow_below_floor: bool,
     /// The artifact's experts: slot bytes and projections per class.
     pub catalog: &'a ExpertCatalog,
     /// The sidecar's calibration traffic over `catalog`'s experts.
@@ -276,6 +280,9 @@ pub struct ExpertCachePlan {
     /// study's routing at 21.5 GB it reads 73.8% where the replay measures
     /// 94.5%, so read it as a floor and compare plans by it, not tok/s.
     pub expected_hit_rate: f64,
+    /// The cache is below the request's floor, planned only because the
+    /// operator allowed it (`--allow-expert-cache-below-floor`).
+    pub below_floor: bool,
 }
 
 impl std::fmt::Display for ExpertCachePlan {
@@ -374,9 +381,10 @@ impl std::fmt::Display for ExpertCachePlanError {
             "the VRAM expert cache would get {cache_bytes} bytes, below its {floor_bytes}-byte \
              floor: the {budget_bytes}-byte VRAM budget holds {planned_bytes} for the weights, \
              workspaces, graphs and KV pool, {staging_ring_bytes} for the prefill staging ring \
-             and {table_bytes} for residency's tables; shrink the KV pool (a shorter \
-             --max-context or fewer lanes), the prefill chunk, or --vram-headroom-bytes, or \
-             close what holds VRAM on the desktop"
+             and {table_bytes} for residency's tables; shrink the KV pool (a smaller \
+             --kv-pool-bytes, or a shorter --max-context at one lane), the prefill chunk, or \
+             --vram-headroom-bytes, or close what holds VRAM on the desktop; \
+             --allow-expert-cache-below-floor starts anyway, with decode slower than the floor's"
         )
     }
 }
@@ -407,7 +415,8 @@ pub fn plan_expert_cache(
         .saturating_sub(request.planned_bytes)
         .saturating_sub(request.staging_ring_bytes)
         .saturating_sub(request.table_bytes);
-    if cache < request.floor_bytes {
+    let below_floor = cache < request.floor_bytes;
+    if below_floor && !request.allow_below_floor {
         return Err(ExpertCachePlanError::BelowFloor {
             cache_bytes: cache,
             floor_bytes: request.floor_bytes,
@@ -464,6 +473,7 @@ pub fn plan_expert_cache(
         staging_ring_bytes: request.staging_ring_bytes,
         table_bytes: request.table_bytes,
         expected_hit_rate: expected_hit_rate(catalog, request.traffic, &slots),
+        below_floor,
     })
 }
 

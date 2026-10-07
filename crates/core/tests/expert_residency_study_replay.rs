@@ -194,6 +194,7 @@ fn cache_plan(study: &Study) -> ExpertCachePlan {
         staging_ring_bytes: ring,
         table_bytes: tables,
         floor_bytes: 0,
+        allow_below_floor: false,
         catalog,
         traffic: &study.traffic,
         min_slots: min_slots_per_class(3, TOP_K as u32, DEFAULT_PREFETCH_WIDTH as u32),
