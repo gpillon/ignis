@@ -665,7 +665,133 @@ void check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(bool dflash2
   ignis_seq_pool_free(pool);
 }
 
-// ---- 6. every refusal refuses, and costs nothing -------------------------
+// ---- 6. a capture hands the pages below the opener over (GitHub #306) -----
+//
+// ADR 0029 as amended 2026-10-07: a sequence whose whole pages below the
+// opener are not yet a prefix -- one standing on nothing, or on a prefix that
+// stops short of the opener's page -- is no longer refused. The capture hands
+// those pages to a **pages-only link** over whatever the sequence stands on,
+// and the sequence goes on as it was: the same physical pages below the
+// floor, its own first page a fresh one carrying the opener's partial page,
+// and not one byte of its state moved. The link has no image, so it is never
+// claimed on its own, and no handle: the sequence and the checkpoint hold it.
+
+// A sequence standing at `opener` over `shared` pages of an imaged prefix (or
+// none), its own pages up to the opener patterned. `*out_prefix` receives the
+// publish handle when `shared` is not 0.
+ignis_seq *standing_at(ignis_seq_pool *pool, std::uint32_t shared, std::uint32_t opener,
+                       ignis_seq_prefix **out_prefix, const char *label) {
+  ignis_seq *seq = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &seq), 0, label);
+  if (shared != 0) {
+    set_frontier(*seq, shared * kPageTokens);
+    dirty_state(*pool, *seq, shared, 0x31u);
+    expect_rc(ignis_seq_prefix_publish(pool, seq, shared * kPageTokens, kPrefixSlot, out_prefix), 0, label);
+  }
+  set_frontier(*seq, opener);
+  seq->pending_token = 4242;
+  dirty_state(*pool, *seq, (opener + kPageTokens - 1) / kPageTokens - shared, 0x41u);
+  return seq;
+}
+
+void check_a_capture_hands_the_pages_below_over_as_a_link(int32_t kv_format, std::uint32_t shared,
+                                                          std::uint32_t opener) {
+  const ignis_seq_pool_spec spec = small_spec(kv_format);
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "link: pool create");
+  struct ignis_seq_pool_stats empty{};
+  expect_rc(ignis_seq_pool_stats(pool, &empty), 0, "link: pool stats empty");
+
+  ignis_seq_prefix *prefix = nullptr;
+  ignis_seq *seq           = standing_at(pool, shared, opener, &prefix, "link: the capturing sequence");
+  const std::uint32_t below   = opener / kPageTokens;
+  const bool partial          = opener % kPageTokens != 0;
+  const std::uint32_t covered = below + (partial ? 1 : 0);
+  const std::vector<std::int32_t> row_before = row_of(*pool, seq->slot, 6);
+  std::vector<std::vector<unsigned char>> history;
+  for (std::uint32_t page = 0; page < covered; ++page) {
+    history.push_back(page_image_of(*pool, row_before[page]));
+  }
+  const std::vector<unsigned char> state = mutable_image_of(*pool, seq->slot);
+  struct ignis_seq_pool_stats before{};
+  expect_rc(ignis_seq_pool_stats(pool, &before), 0, "link: pool stats before");
+
+  ignis_seq_checkpoint *checkpoint = nullptr;
+  expect_rc(ignis_seq_checkpoint_capture(pool, seq, opener, kCheckpointSlot, &checkpoint), 0,
+            "link: a capture over pages that are not yet a prefix");
+  if (checkpoint == nullptr) {
+    ignis_seq_release(pool, seq);
+    ignis_seq_prefix_release(pool, prefix);
+    ignis_seq_pool_free(pool);
+    return;
+  }
+
+  ignis_seq_prefix *link = seq->prefix;
+  expect(link != nullptr && seq->shared_pages == below,
+         "link: every whole page below the opener is a prefix's now");
+  expect(link != nullptr && link->retained_slot < 0 && link->parent == prefix,
+         "link: a pages-only link, over what the sequence stood on");
+  expect(link != nullptr && link->refcount == 2,
+         "link: held by the sequence and the checkpoint -- there is no handle");
+  expect(link != nullptr && link->kv.mapped_page_count() == below - shared,
+         "link: and it owns the pages the sequence warmed past what it shared");
+  const std::vector<std::int32_t> row_after = row_of(*pool, seq->slot, 6);
+  expect(std::equal(row_before.begin(), row_before.begin() + below, row_after.begin()),
+         "link: the pages below the floor are handed over in place, not copied");
+  for (std::uint32_t page = 0; page < covered; ++page) {
+    expect(page_image_of(*pool, row_after[page]) == history[page],
+           "link: and every page of the history reads as it did -- the opener's partial page in "
+           "the sequence's new first page");
+  }
+  expect(mutable_image_of(*pool, seq->slot) == state && seq->position == opener &&
+             seq->pending_token == 4242,
+         "link: the capturing sequence's state is untouched");
+  struct ignis_seq_pool_stats after{};
+  expect_rc(ignis_seq_pool_stats(pool, &after), 0, "link: pool stats after");
+  expect(after.kv_free_pages == before.kv_free_pages - (partial ? 1 : 0),
+         "link: the handover is balanced -- the checkpoint's tail page is all the capture takes");
+  const struct ignis_seq_checkpoint_stats stats = stats_of(checkpoint, "link: stats");
+  expect(stats.pages == below && stats.tokens == opener, "link: the checkpoint stands on the whole chain");
+
+  ignis_seq *refused = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, link, &refused), -1,
+            "link: a link is never claimed on its own -- there is no state at its end");
+
+  // The sequence goes on, writing its own page; a claimant of the checkpoint
+  // still stands exactly where the capture stood.
+  set_frontier(*seq, opener + 17);
+  dirty_state(*pool, *seq, 1, 0x99u);
+  ignis_seq *claimant = nullptr;
+  expect_rc(ignis_seq_alloc_from_checkpoint(pool, kContext, checkpoint, &claimant), 0, "link: claim");
+  if (claimant != nullptr) {
+    const std::vector<std::int32_t> claimant_row = row_of(*pool, claimant->slot, 6);
+    expect(std::equal(row_before.begin(), row_before.begin() + below, claimant_row.begin()),
+           "link: the claimant addresses the chain's physical pages");
+    for (std::uint32_t page = 0; page < covered; ++page) {
+      expect(page_image_of(*pool, claimant_row[page]) == history[page],
+             "link: and reads the capture's history, the partial page included");
+    }
+    expect(mutable_image_of(*pool, claimant->slot) == state && claimant->position == opener,
+           "link: with the state at the opener");
+    ignis_seq_release(pool, claimant);
+  }
+
+  // The request ends and the publish handle goes: the checkpoint alone holds
+  // the chain, and its release returns every page.
+  ignis_seq_release(pool, seq);
+  ignis_seq_prefix_release(pool, prefix);
+  struct ignis_seq_pool_stats retained{};
+  expect_rc(ignis_seq_pool_stats(pool, &retained), 0, "link: pool stats retained");
+  expect(retained.kv_free_pages == empty.kv_free_pages - below - (partial ? 1 : 0),
+         "link: the checkpoint holds the chain's pages and its tail page, nothing else");
+  ignis_seq_checkpoint_release(pool, checkpoint);
+  struct ignis_seq_pool_stats released{};
+  expect_rc(ignis_seq_pool_stats(pool, &released), 0, "link: pool stats released");
+  expect(released.kv_free_pages == empty.kv_free_pages, "link: the last holder returns every page");
+  ignis_seq_pool_free(pool);
+}
+
+// ---- 7. every refusal refuses, and costs nothing -------------------------
 
 void check_refusals() {
   const ignis_seq_pool_spec spec = small_spec();
@@ -676,14 +802,14 @@ void check_refusals() {
   expect_rc(ignis_seq_checkpoint_capture(nullptr, nullptr, kOpener, kCheckpointSlot, &out), -1,
             "refuse: null arguments");
 
-  // A sequence with no shared prefix under it: the opener would fall inside a
-  // page nothing else owns, but the whole pages below it are nobody's to
-  // share, so there is no checkpoint to build.
+  // A sequence standing on nothing, its opener inside its first page: there
+  // is no whole page below the opener for a checkpoint to hold (GitHub #306
+  // hands the pages below over, and there are none).
   ignis_seq *bare = nullptr;
   expect_rc(ignis_seq_alloc(pool, kContext, &bare), 0, "refuse: alloc bare");
-  set_frontier(*bare, kOpener);
-  expect_rc(ignis_seq_checkpoint_capture(pool, bare, kOpener, kCheckpointSlot, &out), -1,
-            "refuse: a sequence holding no shared prefix");
+  set_frontier(*bare, 40);
+  expect_rc(ignis_seq_checkpoint_capture(pool, bare, 40, kCheckpointSlot, &out), -1,
+            "refuse: an opener in the first page of a sequence holding no shared prefix");
   expect(out == nullptr, "refuse: and hands back no handle");
 
   ignis_seq_prefix *prefix = nullptr;
@@ -702,12 +828,12 @@ void check_refusals() {
             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY, "refuse: a mid-chunk sequence");
   publisher->gqa_positions[0] = gqa0;
 
-  // An opener whose whole pages are not the ones this sequence shares: the
-  // #187 lineage case — a request that resumed from an earlier checkpoint and
-  // prefilled past it. Its own first page is not the opener's.
-  set_frontier(*publisher, 4 * kPageTokens + 8);
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, 4 * kPageTokens + 8, kCheckpointSlot, &out), -1,
-            "refuse: an opener outside the sequence's own first page");
+  // An opener inside the pages the sequence shares: its partial page is one
+  // other holders own, so there is no page of its own to copy (the case of a
+  // claim reaching past its opener's page).
+  set_frontier(*publisher, kPrefix - 8);
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kPrefix - 8, kCheckpointSlot, &out), -1,
+            "refuse: an opener inside the shared pages");
   set_frontier(*publisher, kOpener);
 
   // GitHub #215: a slot out of range, or one the prefix under it holds.
@@ -750,6 +876,14 @@ void run_all() {
   check_materialized_blob_outlives_every_device_handle(true);
   check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(false);
   check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(true);
+  // GitHub #306, in both formats: a sequence standing on nothing, one on a
+  // prefix two pages short of its opener's page (#187's lineage case), and
+  // an opener on a page boundary, which has no partial page to carry.
+  for (const int32_t format : {IGNIS_KV_FORMAT_BF16, IGNIS_KV_FORMAT_HQ_E8_2B}) {
+    check_a_capture_hands_the_pages_below_over_as_a_link(format, 0, kOpener);
+    check_a_capture_hands_the_pages_below_over_as_a_link(format, 2, 4 * kPageTokens + 8);
+    check_a_capture_hands_the_pages_below_over_as_a_link(format, 0, 3 * kPageTokens);
+  }
   check_refusals();
 }
 

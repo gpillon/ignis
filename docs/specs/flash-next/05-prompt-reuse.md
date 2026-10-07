@@ -56,14 +56,17 @@ Found while building the leaf side (#303); the coordinator may veto.
   first-fit pinned region as the 27B's process-wide one), created at load and
   freed when its last blob and the leaf have gone; the 27B keeps the
   process-wide arena unchanged.
-- **Acceptance 6 is not met (2026-10-07, #306).** A reused turn with a ~9K
-  history and a ~1K tail starts in 1.86 s at the median, against 1.6 s. The
-  30K history was not run, and it can only add to the tail. The tail is
-  copy-bound and runs three traversals, cut at the publish point and at the
-  opener, each re-streaming its experts. The publish-point piece costs
-  ~0.35 s at a median width (inferred from the spread of turn 2's TTFT), so a
-  pages-only chained prefix, which would drop that cut, is the lever left
-  (`docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
+- **The opener's page rides the capture (2026-10-07, #306, ADR 0029 as
+  amended, owner decision).** Flash-Next does not publish the generation
+  opener's page floor as a chained prefix at a cut of its own: the checkpoint
+  capture hands those pages over as a **pages-only link** (no image, no
+  retained slot, never claimed), so a reused turn's tail runs two traversals
+  instead of three. "ADR 0029 applies unchanged" and the out-of-scope
+  "changing ADR 0029's policy" no longer hold for this one point; the 27B
+  keeps the imaged prefix. Acceptance 3's split control is `[…, opener)`,
+  `[opener, end)` accordingly. What acceptance 6 measures today is in the
+  findings (`docs/findings/2026-10-07-flash-next-agent-turn-tail.md` and the
+  one it links), not here.
 - **Retained pages are pool lines.** The pool holds one KV page per retained
   slot beside every lane's whole context, as the 27B's (a checkpoint keeps the
   page its opener ends inside).

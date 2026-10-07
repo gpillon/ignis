@@ -106,6 +106,31 @@ template <typename Work> double timed(Work &&work) {
 
 } // namespace
 
+void ignis_seq_hand_over_head(ignis_seq_pool &pool, ignis_seq &seq, ignis_seq_prefix &entry,
+                              std::uint32_t own) {
+  const std::uint32_t tail = seq.kv.page_entitlement() - own;
+  ninfer::PagedKVAllocation shared = std::move(seq.kv);
+  shared.unbind_row();
+  // Every page past the head goes back to the pool, and the tail reservation
+  // immediately takes as many: the history in them is the caller's to keep.
+  shared.trim_pages(own);
+  shared.set_page_entitlement(own);
+  entry.kv = std::move(shared);
+  // GitHub #187: the sequence's reference on the head it was standing on
+  // *moves* to the entry. It is not taken afresh -- from here the sequence
+  // reaches the parent through this entry, so the chain keeps exactly one
+  // reference per link and the pages under it are still charged once.
+  entry.parent = seq.prefix;
+
+  seq.kv = pool.kv_pool.reserve(tail);
+  seq.kv.materialize_pages(tail);
+  pool.kv_pool.zero_pages(seq.kv.page_ids());
+  seq.kv.bind_row(seq.slot);
+  seq.prefix = &entry;
+  seq.shared_pages += own;
+  publish_shared_row(pool, seq);
+}
+
 void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix) {
   // GitHub #187: a loop rather than one step, because a chained entry holds
   // its parent's reference. Letting go of the child may let go of the parent,
@@ -222,30 +247,12 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     timed([&] { ignis_seq_capture_state(*pool, *seq, retained_slot, entry->progress); });
 
     // From here the steps are balanced against each other and cannot fail:
-    // the tail entitlement handed back below is exactly the one re-reserved,
-    // and the row released is exactly the one re-bound.
-    ninfer::PagedKVAllocation shared = std::move(seq->kv);
-    shared.unbind_row();
-    // The publisher has written exactly `prefix_tokens`, so every page past
-    // the prefix is still the zeroed page `ignis_seq_alloc` materialized --
-    // trimming them loses no history, and hands back the pages the tail
-    // reservation immediately takes.
-    shared.trim_pages(own);
-    shared.set_page_entitlement(own);
-    entry->kv = std::move(shared);
-    // GitHub #187: the sequence's reference on the head it was standing on
-    // *moves* to the entry. It is not taken afresh -- from here the sequence
-    // reaches the parent through this entry, so the chain keeps exactly one
-    // reference per link and the pages under it are still charged once.
-    entry->parent = seq->prefix;
-
-    seq->kv = pool->kv_pool.reserve(tail);
-    seq->kv.materialize_pages(tail);
-    pool->kv_pool.zero_pages(seq->kv.page_ids());
-    seq->kv.bind_row(seq->slot);
-    seq->prefix       = entry.get();
-    seq->shared_pages = pages;
-    publish_shared_row(*pool, *seq);
+    // the tail entitlement handed back is exactly the one re-reserved, and
+    // the row released is exactly the one re-bound. The publisher has written
+    // exactly `prefix_tokens`, so every page past the prefix is still the
+    // zeroed page `ignis_seq_alloc` materialized -- trimming them loses no
+    // history.
+    ignis_seq_hand_over_head(*pool, *seq, *entry, own);
 
     entry->retained_slot                 = static_cast<std::int32_t>(retained_slot);
     pool->retained_held[retained_slot]   = true;

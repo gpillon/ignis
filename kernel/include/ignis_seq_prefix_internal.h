@@ -80,7 +80,10 @@ struct ignis_seq_prefix {
    * the publish until the publish handle is released -- nothing can claim the
    * prefix without that handle, so its image is unreachable from then on and
    * the slot goes back, while the pages live on under the sequences still
-   * standing on them. -1 once released. */
+   * standing on them. -1 once released, and from the start for a
+   * **pages-only link** (GitHub #306): the pages below a generation opener,
+   * handed over by a checkpoint capture with no image and no handle, held by
+   * the sequence and the checkpoint standing on them. */
   std::int32_t retained_slot = -1;
   /* What that image occupies: one slot's state and its hq residual window,
    * `ignis_seq_pool::retained_image_bytes`. */
@@ -178,6 +181,22 @@ inline void ignis_seq_clone_state(ignis_seq_pool &pool, std::uint32_t retained_s
   ignis_seq_copy_slot_state(pool, ignis_seq_retained_pool_slot(pool, retained_slot), seq.slot);
   ignis_seq_apply_progress(seq, progress);
 }
+
+/* Hand the first `own` pages of `seq`'s own allocation to `entry`, a prefix
+ * chained over whatever `seq` stands on (GitHub #187), and give `seq` a fresh
+ * zeroed reservation for the rest, its block-table row rewritten over the
+ * chain. The pages handed over stay where they are; every page past them goes
+ * back to the pool and as many are reserved again, so what they held is the
+ * caller's to have kept. `entry` takes `seq`'s reference on its old head;
+ * its own refcount is the caller's to set.
+ *
+ * A prefix publish calls this with nothing past its head written (GitHub
+ * #126); a checkpoint capture handing the pages below its opener over as a
+ * pages-only link (GitHub #306) copies the opener's partial page back after.
+ * The caller has checked that `own` leaves `seq` a page of its own. Defined in
+ * kernel/src/seq_prefix.cu; throws only on a failed device call. */
+void ignis_seq_hand_over_head(ignis_seq_pool &pool, ignis_seq &seq, ignis_seq_prefix &entry,
+                              std::uint32_t own);
 
 /* Drop one reference to `prefix`, destroying it -- and returning its pages to
  * the pool it was published from -- when the last holder lets go. A null

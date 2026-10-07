@@ -629,16 +629,22 @@ struct ignis_seq_checkpoint_stats {
 
 /* Capture `seq`'s state at `opener_tokens` as a prompt checkpoint.
  *
- * `seq` must already hold a shared prefix whose pages are exactly the whole
- * pages below `opener_tokens` -- that is what puts the opener inside a page
- * `seq` alone writes, and it is why the caller publishes the prefix at
- * `floor(opener / page) * page` and captures here. `opener_tokens` must be
+ * The whole pages below `opener_tokens` must be a prefix's for the
+ * checkpoint to stand on -- that is what puts the opener inside a page `seq`
+ * alone writes. Those `seq` holds as its own (it stands on no prefix, or on
+ * one stopping short of the opener's page) this call hands to a **pages-only
+ * link** chained over what `seq` stands on (GitHub #306, ADR 0029 as amended
+ * 2026-10-07): no image, no handle, held by `seq` and by the checkpoint. A
+ * caller that published an imaged prefix at `floor(opener / page) * page`
+ * first (GitHub #187) has nothing handed over. `opener_tokens` must be
  * exactly where `seq` stands, at a chunk boundary, for the same reason a
  * prefix is published where the publisher stands: what a claimant receives
  * is the state *there*.
  *
- * `seq` is left completely unchanged, including its reservation and its
- * block-table row. The checkpoint takes one reference to the prefix under
+ * `seq`'s state is left unchanged, and so are its reservation and its
+ * block-table row unless pages were handed over: then the row addresses the
+ * same pages below the floor and a fresh page holding the same bytes for the
+ * opener's. The checkpoint takes one reference to the prefix under
  * it, so it outlives `seq`. Its mutable state goes into retained slot
  * `retained_slot`, which the caller chose and which must hold no other
  * image, and the partial page into one page of the pool (GitHub #215): the
@@ -646,8 +652,8 @@ struct ignis_seq_checkpoint_stats {
  *
  * Returns 0 and a handle in `*out_checkpoint`, released with
  * ignis_seq_checkpoint_release. Returns -1 (see ignis_seq_last_error) on a
- * null argument, a sequence that is not `pool`'s, a sequence holding no
- * shared prefix, an `opener_tokens` whose whole pages are not that prefix's,
+ * null argument, a sequence that is not `pool`'s, an opener inside the first
+ * page of a sequence holding no shared prefix or inside the pages it shares,
  * a retained slot out of range or still held, no KV page for the partial
  * page, or a failed device copy; IGNIS_SEQ_ERR_NOT_AT_BOUNDARY when `seq` is
  * mid-chunk or its frontier is not `opener_tokens`. Nothing is held or

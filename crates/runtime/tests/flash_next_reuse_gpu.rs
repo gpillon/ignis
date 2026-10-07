@@ -19,6 +19,10 @@
 //!   republished from its blob (the KV-RAM path back to the device); and a
 //!   live sequence snapshotted mid-decode, restored, and decoded on.
 //!
+//! Then the shape Flash-Next serves since GitHub #306: no prefix published at
+//! the opener's page floor, the capture handing those pages over as a
+//! pages-only link (`the_opener_s_page_rides_the_capture`).
+//!
 //! The reference runs twice, first on a cold expert cache and last on a warm
 //! one: the two must agree too, so neither the claim nor where an expert
 //! sits in the cache changes a result (spec flash-next/05, "Determinism").
@@ -232,6 +236,87 @@ fn history_reuses_exactly(run: &Run<'_>, history: usize, salt: u32) {
     assert_eq!(used, 0, "{label}: every blob went back to the {capacity}-byte arena");
 }
 
+/// GitHub #306 (ADR 0029 as amended 2026-10-07): the shape Flash-Next now
+/// serves. Turn N prefills its history to the opener in one call -- no cut at
+/// the opener's page floor -- and the capture hands the whole pages below the
+/// opener over as a pages-only link. The split control is two spans,
+/// `[0, opener)` and `[opener, end)`, and against it:
+///
+/// - the capturing sequence goes on exactly as if it had captured nothing:
+///   the handover moves who owns its pages, never what they hold;
+/// - the checkpoint claimed from a host and a device slot (the second capture
+///   stands on the link the first one made), and restored from KV-RAM;
+/// - turn N+1, claiming it, captures at its own opener -- a link chained over
+///   the link -- and a claimant of *that* continues as its own split control
+///   does, `[0, opener)`, `[opener, opener')`, `[opener', end)`.
+///
+/// Where the two-span control and the three-span one above part company is
+/// printed, not asserted: that is the chunking effect (ADR 0029).
+fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32) {
+    assert_ne!(history % KV_PAGE_TOKENS as usize, 0, "the opener ends inside a page");
+    let (leaf, model) = (run.leaf, run.model);
+    let tokens = prompt(history, salt);
+    let new = prompt(NEW_TOKENS, salt + 1);
+    let label = format!("history {history}, the page rides the capture");
+
+    let reference = |run: &Run<'_>| {
+        let mut seq = run.fresh();
+        run.prefill(&mut seq, &tokens, 0);
+        run.finish(seq, &new, history)
+    };
+    let cold = reference(run);
+    assert!(cold.logits.iter().all(|&b| f32::from_bits(b).is_finite()), "{label}: finite logits");
+
+    let mut turn = run.fresh();
+    run.prefill(&mut turn, &tokens, 0);
+    let on_host = leaf.capture_checkpoint(model, &mut turn, history as u32, HOST_SLOTS[1]).expect("capture (host)");
+    let on_device = leaf.capture_checkpoint(model, &mut turn, history as u32, DEVICE_SLOT).expect("capture (device)");
+    assert_eq!(run.finish(turn, &new, history), cold, "{label}: the capturing sequence goes on as if it had not captured");
+
+    for (slot, checkpoint) in [("host", &on_host), ("device", &on_device)] {
+        let (seq, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, checkpoint).expect("claim");
+        assert_eq!(run.finish(seq, &new, history), cold, "{label}: the checkpoint claimed from a {slot} slot");
+    }
+    let bytes = leaf.checkpoint_snapshot_bytes(model, &on_host).expect("checkpoint blob size");
+    let blob = run.blob(bytes, |dst| leaf.checkpoint_snapshot_into(model, &on_host, dst));
+    let mut seq = run.fresh();
+    leaf.restore_sequence(model, &mut seq, &blob).expect("restore the checkpoint blob");
+    drop(blob);
+    assert_eq!(run.finish(seq, &new, history), cold, "{label}: the checkpoint restored from KV-RAM");
+
+    // Turn N+1: its own opener 10 tokens before the end of `new`, so its
+    // capture ends inside a page and hands over the pages it warmed.
+    let opener = history + NEW_TOKENS - 10;
+    let next = prompt(NEW_TOKENS, salt + 2);
+    let (mut turn, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &on_device).expect("turn N+1 claims");
+    drop((on_host, on_device));
+    run.prefill(&mut turn, &new[..NEW_TOKENS - 10], history);
+    let second = leaf.capture_checkpoint(model, &mut turn, opener as u32, HOST_SLOTS[1]).expect("turn N+1 captures");
+    leaf.release_sequence(model, turn);
+    let mut control = run.fresh();
+    run.prefill(&mut control, &tokens, 0);
+    run.prefill(&mut control, &new[..NEW_TOKENS - 10], history);
+    let control = run.finish(control, &next, opener);
+    let (seq, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &second).expect("turn N+2 claims");
+    drop(second);
+    assert_eq!(run.finish(seq, &next, opener), control, "{label}: a checkpoint on a link over a link");
+
+    // Information, not a failure (ADR 0029): the three-span split this shape
+    // replaced, against the two-span one it serves.
+    let whole = history / KV_PAGE_TOKENS as usize * KV_PAGE_TOKENS as usize;
+    let mut three = run.fresh();
+    run.prefill(&mut three, &tokens[..whole], 0);
+    run.prefill(&mut three, &tokens[whole..], whole);
+    let three = run.finish(three, &new, history);
+    let first_token_apart = three.tokens.iter().zip(&cold.tokens).position(|(a, b)| a != b);
+    println!(
+        "{label}: two spans against three -- logits {}, first decoded token apart: {first_token_apart:?}",
+        if three.logits == cold.logits { "identical" } else { "differ" }
+    );
+    let (capacity, used) = leaf.kv_ram_arena_stats();
+    assert_eq!(used, 0, "{label}: every blob went back to the {capacity}-byte arena");
+}
+
 fn reuse_is_bit_exact(kv_format: KvFormat) {
     let Some(leaf) = leaf(kv_format) else { return };
     let model = leaf.load_model().expect("load the model");
@@ -251,6 +336,8 @@ fn reuse_is_bit_exact(kv_format: KvFormat) {
     let run = Run { leaf: &leaf, model: &model };
     history_reuses_exactly(&run, 1500, 11);
     history_reuses_exactly(&run, 9000, 23);
+    the_opener_s_page_rides_the_capture(&run, 1500, 31);
+    the_opener_s_page_rides_the_capture(&run, 9000, 41);
     leaf.release_model(model);
 }
 

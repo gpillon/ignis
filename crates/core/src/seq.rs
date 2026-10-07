@@ -1194,24 +1194,25 @@ impl<'a> Seq<'a> {
     /// checkpoint** (GitHub #186, ADR 0029), so a later request whose prompt
     /// extends this one's resumes there instead of prefilling it again.
     ///
-    /// The sequence must already hold a shared prefix whose pages are
-    /// exactly the whole pages below the opener, and must stand exactly at
-    /// `opener_tokens`, at a chunk boundary. The state goes into retained slot
-    /// `retained_slot` (GitHub #215), which must hold no other image, and the
-    /// page the opener ends inside into one page of the pool: nothing is
-    /// allocated. The capture reads the sequence
-    /// and changes nothing about it — not its reservation, not its
-    /// block-table row — so it goes on prefilling and decoding as if it had
+    /// The sequence must stand exactly at `opener_tokens`, at a chunk
+    /// boundary. The whole pages below the opener it holds as its own -- past
+    /// whatever prefix it stands on -- are handed to a **pages-only link**
+    /// chained over that prefix (GitHub #306, ADR 0029 as amended 2026-10-07):
+    /// no image, no handle, held by the sequence and the checkpoint. The state
+    /// goes into retained slot `retained_slot` (GitHub #215), which must hold
+    /// no other image, and the page the opener ends inside into one page of the
+    /// pool: nothing is allocated. The capture changes nothing of the
+    /// sequence's state -- at most who owns the pages below its opener, never
+    /// what they hold -- so it goes on prefilling and decoding as if it had
     /// not been asked, and a request cancelled after this keeps its
     /// checkpoint.
     ///
     /// The returned checkpoint borrows the **pool**, not this sequence: it
     /// outlives the request that captured it, which is the whole point.
     ///
-    /// `Err` on a sequence holding no shared prefix, an opener whose whole
-    /// pages are not that prefix's (a request that itself resumed from an
-    /// earlier checkpoint — GitHub #187's lineage work), a position that is
-    /// not the opener ([`NOT_AT_BOUNDARY`]), or a device allocation failure.
+    /// `Err` on an opener inside the first page of a sequence holding no
+    /// shared prefix, or inside the pages it shares, a position that is not
+    /// the opener ([`NOT_AT_BOUNDARY`]), or a device allocation failure.
     /// Nothing is allocated or changed on any failure: a refused capture
     /// costs the caller nothing, which is what lets it be treated as a bet.
     pub fn capture_checkpoint(
