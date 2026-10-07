@@ -26,6 +26,12 @@
 //! reads them back from the residual ring, so there it is held to the
 //! near-tie rule instead.
 //!
+//! The MTP head's drafts obey the same rule: its alignment runs over all
+//! k + 1 columns, the rejected ones included, and leaves rows in the head's
+//! own section (its hq ring slots, its indexer tail) that its chain steps
+//! past the frontier must not read, so none and reject leave the head
+//! proposing the same drafts bit for bit, in both KV formats.
+//!
 //! Spec-on against spec-off (one-token rounds, the plain decode graphs) is
 //! held to the near-tie rule: the verify pass runs k + 1 columns per lane
 //! through other kernel shapes (attention splits, the indexer's prefill
@@ -91,6 +97,18 @@ fn engine_with_context(kv_format: KvFormat, backend: SpeculativeBackend, max_con
 /// its verify pass and commit graphs.
 fn every_width_verifies() -> u32 {
     (1u32 << ignis_core::flash_next::DEFAULT_DECODE_LANES) - 1
+}
+
+/// The first `len` tokens of reference set `set` (real text), or None with a
+/// skip.
+fn reference(set: &str, len: usize) -> Option<Vec<u32>> {
+    let path = model_dir().join("references").join(set).join("tokens.u32");
+    let Ok(bytes) = std::fs::read(&path) else {
+        gpu_profile::skip_or_fail(&format!("no reference tokens at {}", path.display()));
+        return None;
+    };
+    let tokens: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    Some(tokens.get(..len).expect("the reference set holds the prompt").to_vec())
 }
 
 /// The converter's G1 prompts (real text), or None with a skip.
@@ -387,4 +405,48 @@ fn the_mtp_heads_entries_after_a_full_chunks_draw_fit_the_planned_arena() {
     prompt.truncate(prompt_tokens);
     let head = run(&engine, &[prompt], None);
     assert_eq!(head.tokens[0].len(), TOKENS, "the full-chunk prompt generated through the head");
+}
+
+/// GitHub #307: the MTP head drafts from the committed text only. A verify
+/// round's head writes its alignment at every column; under hq-e8-2b a
+/// chain step at q read the rejected columns' ring rows as positions
+/// q - 512 + i (a ring slot carries no position), and in both formats it
+/// pooled a block from the alignment's indexer tail. Two drafters that commit
+/// the same text -- none (extent 0) and reject (every draft rejected) -- must
+/// leave the head proposing the same drafts, bit for bit, every round. The
+/// prompts are past the ring (1,536 tokens, dense: every visible row read)
+/// and past the dense threshold (3,072, the indexer's sparse selection).
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact and its MTP companion"]
+fn the_heads_drafts_never_read_a_rejected_column() {
+    const HEAD_TOKENS: usize = 64;
+    let (Some(dense), Some(sparse)) = (reference("test2048", 1536), reference("long8192", 3072)) else { return };
+    for kv_format in [KvFormat::HqE8_2b, KvFormat::Bf16] {
+        let Some(engine) = engine_with(kv_format, SpeculativeBackend::Mtp) else { return };
+        for (prompt, what) in [(&dense, "dense, 1536 tokens"), (&sparse, "sparse, 3072 tokens")] {
+            let what = format!("{kv_format:?} {what}");
+            let prompts = vec![prompt.clone()];
+            let mut none = |_: usize, _: &[u32], _: u32| Vec::new();
+            let mut reject = |_: usize, _: &[u32], window: u32| vec![REJECTED; window as usize];
+            let a = engine
+                .generate_speculative(&prompts, HEAD_TOKENS, Some(&mut none))
+                .unwrap_or_else(|e| panic!("{what}: none: {e}"));
+            let b = engine
+                .generate_speculative(&prompts, HEAD_TOKENS, Some(&mut reject))
+                .unwrap_or_else(|e| panic!("{what}: reject: {e}"));
+            assert_eq!(a.tokens, b.tokens, "{what}: none and reject committed different text");
+            assert!(a.rounds.iter().chain(&b.rounds).flatten().all(|l| l.committed == 1), "{what}: a round committed a draft");
+            assert!(a.head_drafts.iter().flatten().all(|d| d.len() == DRAFT_TOKENS as usize), "{what}: a round made no drafts");
+            let differ: Vec<usize> = (0..a.head_drafts.len()).filter(|&r| a.head_drafts[r] != b.head_drafts[r]).collect();
+            assert!(
+                differ.is_empty(),
+                "{what}: the head drafted differently after {} of {} rounds (first at round {}: {:?} vs {:?})",
+                differ.len(),
+                a.head_drafts.len(),
+                differ[0],
+                a.head_drafts[differ[0]],
+                b.head_drafts[differ[0]]
+            );
+        }
+    }
 }

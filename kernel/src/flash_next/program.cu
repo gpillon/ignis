@@ -506,7 +506,7 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
   // Spec flash-next/07: the verify round, with a test's drafts (VERIFY_ONLY) or the MTP head's.
   if (fn->speculative_backend != IGNIS_SPECULATIVE_NONE) {
     if (const std::string why = verify::refusal(fn->g, fn->decode_lanes, fn->draft_tokens, fn->draft_row_budget,
-                                                attention_sections(*fn), gdn_layers(*fn), mtp);
+                                                attention_sections(*fn), gdn_layers(*fn));
         !why.empty()) {
       *error = "Qwen3.8-Flash-Next's verify round: " + why;
       return nullptr;

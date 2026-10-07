@@ -31,7 +31,9 @@
 // the columns' own positions, the committed ones kept), then k - 1 chained steps from each lane's
 // last committed column, past its frontier. The head's attention section is one more attention
 // layer of the pool, saved and restored with the trunk's -- its ring rows over the chain's
-// positions too, so a lane's saved range is 2k positions there.
+// positions too, so a lane's saved range is 2k positions there. Between the alignment and the
+// chain the head's own section goes back to the new frontier (restore_head): the alignment wrote
+// it at the rejected columns too, and a chain step reads it.
 
 #pragma once
 
@@ -145,7 +147,7 @@ struct State {
 // Why a load of these options cannot run the verify round, or empty: what bind refuses before any
 // allocation, so a plan and a load refuse alike.
 std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
-                    int32_t attention_layers, int32_t gdn_layers, bool mtp);
+                    int32_t attention_layers, int32_t gdn_layers);
 
 // Allocates the state for a load (`lanes` decode lanes), or null and *error.
 std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens,
@@ -188,5 +190,14 @@ int32_t fold(const State &state, const Sections &sections, uint32_t lanes, uint3
              cudaStream_t stream, std::string *error);
 int32_t restore(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
                 const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error);
+
+// An MTP load's drafting, between the head's alignment and its chain: the head's section (the
+// pool's last attention section) at each lane's new frontier -- its indexer tail, and under
+// hq-e8-2b the ring words and the ring rows of the alignment's rejected columns. Without it a
+// chain step at q reads a rejected column's ring row as position q - 512 + i (a ring slot carries
+// no position) and pools a block from the alignment's tail. The restore after the chain puts the
+// section back again, over the chain's positions too. Graph-safe.
+int32_t restore_head(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
+                     const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error);
 
 }  // namespace ignis::flash_next::verify
