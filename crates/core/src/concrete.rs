@@ -572,10 +572,13 @@ impl ConcreteScheduler {
     }
 
     /// GitHub #306: hold the next prefill chunk for the decode share of the
-    /// time the one that started at `began` took.
-    fn hold_prefill(&mut self, began: Instant) {
+    /// time the one that started at `began` took -- unless it was every
+    /// request's last, when the next chunk is a newcomer's and the hold ends.
+    fn hold_prefill(&mut self, began: Instant, last_chunk: bool) {
         let share = self.config.decode_share;
-        if share > 0.0 {
+        if last_chunk {
+            self.prefill_held_until = None;
+        } else if share > 0.0 {
             let now = self.now();
             let took = now.saturating_duration_since(began);
             self.prefill_held_until = Some(now + took.mul_f64(share / (1.0 - share)));
@@ -3218,7 +3221,11 @@ impl Scheduler for ConcreteScheduler {
         if !jobs.is_empty() {
             let began = self.now();
             let result = self.compute.prefill_step(&jobs);
-            self.hold_prefill(began);
+            let last_chunk = batch
+                .iter()
+                .zip(&jobs)
+                .all(|(&i, job)| job.start_position as usize + job.tokens.len() >= self.requests[i].input.tokens.len());
+            self.hold_prefill(began, last_chunk);
             match result {
                 Ok(outcomes) => {
                     // One outcome per job, in order (GitHub #192). A backend

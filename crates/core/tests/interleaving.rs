@@ -554,10 +554,36 @@ fn a_decode_share_holds_the_next_chunk_until_the_decoding_lanes_have_had_their_s
 
     let calls = compute.calls.lock().unwrap().clone();
     let between: Vec<usize> = calls.split('P').map(str::len).collect();
-    // The filler's chunk, then the long prompt's four: four holds between
-    // five chunks.
+    // The filler's chunk, then the long prompt's four. The filler's prompt
+    // ends in that one chunk, so nothing holds after it; the long prompt's
+    // first three chunks are each followed by a hold.
     assert_eq!(between.len(), 6, "{calls}");
-    assert_eq!(&between[1..5], &[100, 100, 100, 100], "rounds between chunks: {calls}");
+    assert_eq!(&between[1..5], &[1, 100, 100, 100], "rounds between chunks: {calls}");
+}
+
+#[test]
+fn a_decode_share_does_not_hold_a_newcomer_behind_a_prompts_last_chunk() {
+    // GitHub #306: the hold exists to give the decoding lanes time between
+    // chunks of one prompt. After a prompt's LAST chunk the next request is
+    // a newcomer (an agent swarm's turn boundary), and making it wait for
+    // lanes that already had a round gains nothing.
+    let (mut sched, compute) = timed_sched(0.5);
+    sched.submit(input(&[1], 1000), RequestClass::Agent).unwrap();
+    sched.advance();
+    let long = sched
+        .submit(input(&(1..=8).collect::<Vec<_>>(), 1), RequestClass::Agent)
+        .unwrap();
+    let newcomer = sched.submit(input(&[1, 2, 3, 4], 1), RequestClass::Agent).unwrap();
+    while sched.request_state(newcomer) != Some(RequestState::Done) {
+        sched.advance();
+    }
+    assert_eq!(sched.request_state(long), Some(RequestState::Done));
+
+    let calls = compute.calls.lock().unwrap().clone();
+    let between: Vec<usize> = calls.split('P').map(str::len).collect();
+    // filler | long 1 | long 2 (its last) | newcomer: the only hold is the
+    // one between the long prompt's two chunks.
+    assert_eq!(&between[1..4], &[1, 100, 1], "rounds between chunks: {calls}");
 }
 
 #[test]

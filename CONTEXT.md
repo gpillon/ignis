@@ -446,8 +446,10 @@ When output names a domain concept, use the term as defined here.
   drives it by passing one chunk per prefill call.
 - **Decode share** — the part of the model's time decoding lanes keep while a
   prompt prefills (`--decode-share`, in percent). After a chunk that took `t`,
-  the next chunk waits until the lanes have decoded for `t * s / (1 - s)`; with
-  no lane decoding it runs at once. 0 is one decode round per chunk (ADR 0018,
+  the next chunk of the same prompt waits until `t * s / (1 - s)` of wall time
+  has passed with the lanes decoding; with no lane decoding it runs at once, and
+  after a prompt's last chunk nothing waits, so a newcomer queued behind it
+  starts at once. 0 is one decode round per chunk (ADR 0018,
   the 27B's); Flash-Next, whose chunk runs for seconds, holds chunks by
   default (GitHub #306). It bounds the lanes' rate during a prefill, not the
   gap a single chunk leaves: only the chunk width moves that.
