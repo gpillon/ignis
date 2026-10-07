@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAgo, formatBound, formatBytes, formatCount, formatNumber, formatOffset, formatSeconds, formatShare, niceScale } from "./format.ts";
+import { formatAgo, formatBound, formatBytes, formatCount, formatMs, formatNumber, formatOffset, formatSeconds, formatShare, niceScale } from "./format.ts";
 
 describe("monitor formatting", () => {
   it("compacts counts", () => {
@@ -27,6 +27,13 @@ describe("monitor formatting", () => {
     expect(formatNumber(0.25)).toBe("0.25");
     expect(formatNumber(4.54)).toBe("4.5");
     expect(formatNumber(43.2)).toBe("43");
+  });
+
+  it("writes short spans in milliseconds", () => {
+    expect(formatMs(0.35)).toBe("0.35 ms");
+    expect(formatMs(2.114)).toBe("2.1 ms");
+    expect(formatMs(43.2)).toBe("43 ms");
+    expect(formatMs(null)).toBe("—");
   });
 
   it("writes latencies from milliseconds to minutes", () => {

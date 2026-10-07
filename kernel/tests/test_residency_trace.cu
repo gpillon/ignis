@@ -12,8 +12,8 @@
 //     or into the staging ring, no two entries share a slot, an evicted projection is ABSENT,
 //     and a staged projection is ABSENT again once a step of another layer has run;
 //   - at the end, the counters add up to the trace;
-//   - the stall: a step (or captured round) whose misses were copied in adds to its phase's
-//     stall_nanos, one with no miss adds nothing, and neither touches the other phase.
+//   - the stall: a step (or captured round) with no miss adds nothing to stall_nanos, none touches
+//     the other phase, and the copying steps' additions are each phase's whole stall, above 0.
 // `graph` runs every whole decode round (all layers in order, one token count) as one CUDA graph,
 // captured once per token count and replayed with new ids in the same buffers: decode residency
 // is graph-capturable across the layer steps of a round (spec acceptance 3); the rest runs
@@ -304,8 +304,11 @@ int main(int argc, char **argv) {
   uint64_t want_hits[8][2] = {}, want_misses[8][2] = {};
   uint32_t graph_rounds = 0;
 
-  // The stall: what steps `from`..`to` (one phase) added to stall_nanos, against their misses.
-  uint64_t stall_seen[2] = {}, stall_steps[2] = {}, stall_min = UINT64_MAX;
+  // The stall: what steps `from`..`to` (one phase) added to stall_nanos, against their misses. A
+  // copying step must add something only where %globaltimer ticks finer than its copy (the 5090
+  // reads ~1.6 us for a 4 KB one); elsewhere it may read 0, so a coarse tick is reported, and
+  // only each phase's total must grow.
+  uint64_t stall_seen[2] = {}, stall_steps[2] = {}, stall_min = UINT64_MAX, stall_zero = 0;
   auto stall_now = [&](uint64_t out[2]) {
     ignis_residency_counters c{};
     RES_OK(ignis_residency_read_counters(r, &c));
@@ -321,7 +324,7 @@ int main(int argc, char **argv) {
     const uint64_t added = after[phase] - before[phase];
     check(after[1 - phase] == before[1 - phase], at + ": the stall of the other phase moved");
     if (copied) {
-      check(added > 0, at + ": misses were copied in and the stall did not grow");
+      if (added == 0) ++stall_zero;
       stall_min = std::min(stall_min, added);
       stall_seen[phase] += added;
       ++stall_steps[phase];
@@ -613,9 +616,12 @@ int main(int argc, char **argv) {
   check(counters.stall_nanos[0] == stall_seen[0] && counters.stall_nanos[1] == stall_seen[1],
         "counters: the stall is what the steps added");
   check(stall_steps[0] > 0 && stall_steps[1] > 0, "the trace copies misses in both phases");
-  std::printf("stall: decode %.1f us over %llu copying steps, prefill %.1f us over %llu, smallest %llu ns\n",
+  check(stall_seen[0] > 0 && stall_seen[1] > 0, "the copies of each phase add up to some stall");
+  std::printf("stall: decode %.1f us over %llu copying steps, prefill %.1f us over %llu, smallest %llu ns%s\n",
               stall_seen[0] / 1e3, static_cast<unsigned long long>(stall_steps[0]), stall_seen[1] / 1e3,
-              static_cast<unsigned long long>(stall_steps[1]), static_cast<unsigned long long>(stall_min));
+              static_cast<unsigned long long>(stall_steps[1]), static_cast<unsigned long long>(stall_min),
+              stall_zero ? (" -- " + std::to_string(stall_zero) + " copying steps read 0 ns: a coarse %globaltimer").c_str()
+                         : "");
 
   if (split_mode) {
     // A prefetch half needs its demand half's open branch; a branch the caller never took a

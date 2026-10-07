@@ -410,18 +410,19 @@ How long does a decode wait on expert misses, how much of that could the lookahe
 - **One greedy lane: 2.11 ms per token**, 21% of the 10.0 ms ITL.
 - **Three distinct lanes: 6.4 ms per token**, ~19 ms of a ~30 ms round (64%). The link carries ~104 MB per token there: three-lane decode is bound by the misses.
 - The stall counts the demand copies only. A prefetch still copying when the next layer's step starts holds that step at its join too; that wait is not in it, and it is what the budget rows below trade against.
+- Against dec2's 1.0-1.35 ms of demand copies per one-lane round (131K, 16.14 GB of cache), this config's smaller cache copies for 2.1 ms.
 
-| session: leg (build) | 1 lane tok/s | 1 lane: hit, misses / prefetched / used per token, stall per token | 3 lanes: aggregate | 3 lanes: hit, misses / prefetched / used per token, stall per token |
+| session: leg (build) | 1 lane tok/s | 1 lane: hit, misses / prefetched / used per token, stall per token (= per round) | 3 lanes: aggregate | 3 lanes: hit, misses / prefetched / used per token, stall per token (per round) |
 |---|---|---|---|---|
 | 1: base (`c658fa7`) | 93.2-94.2 (first: 83.3, cold cache) | 96.24%, 36.1 / 79.0 / 35.6, — | 96.6 | 88.38%, 106.2 / 41.0 / 27.6, — |
-| 2: stall metric (`63d4eb4`) | 93.6-93.9 | 96.22%, 36.2 / 79.1 / 35.7, 2.11 ms | 97.1 | 88.36%, 106.3 / 40.8 / 27.7, 6.37 ms |
-| 3: (a) rank folded into the resolve | 93.6-93.9 | 96.22%, 36.3 / 79.2 / 35.7, 2.11 ms | 97.2 | 88.37%, 106.3 / 40.8 / 27.7, 6.39 ms |
-| 3: (a) + (b) parallel residency test | 93.9-94.6 | 96.22%, 36.3 / 79.2 / 35.7, 2.12 ms | 96.0 | 88.31%, 107.1 / 41.2 / 27.8, 6.43 ms |
-| 4: stall metric again | 93.6-93.9 | 96.22%, 36.3 / 79.2 / 35.7, 2.12 ms | 96.1 | 88.32%, 106.7 / 41.0 / 27.6, 6.43 ms |
-| 4: (a) + (b), budget × 1.5 (2.63 MB) | 84.6-86.0 | 96.55%, 33.1 / 100.0 / 44.6, 1.94 ms | **98.4** | 89.15%, 99.1 / 56.6 / 38.9, 5.98 ms |
-| 5: stall metric | 92.2-92.4 | 96.16%, 36.9 / 84.2 / 39.4, 2.16 ms | 93.6 | 88.19%, 107.8 / 42.7 / 29.1, 6.54 ms |
-| 5: (b) alone (`96b3c51`) | 93.1-93.7 | 96.16%, 36.9 / 84.2 / 39.4, 2.14 ms | 93.8 | 88.20%, 107.8 / 42.7 / 29.1, 6.54 ms |
-| 5: (a) + (b), budget × 0.67 (1.17 MB) | **95.2-95.4** | 95.68%, 41.5 / 52.7 / 25.7, 2.37 ms | 90.7 | 87.50%, 114.3 / 26.6 / 18.5, 6.92 ms |
+| 2: stall metric (`63d4eb4`) | 93.6-93.9 | 96.22%, 36.2 / 79.1 / 35.7, 2.11 ms | 97.1 | 88.36%, 106.3 / 40.8 / 27.7, 6.37 ms (19.1 ms) |
+| 3: (a) rank folded into the resolve | 93.6-93.9 | 96.22%, 36.3 / 79.2 / 35.7, 2.11 ms | 97.2 | 88.37%, 106.3 / 40.8 / 27.7, 6.39 ms (19.2 ms) |
+| 3: (a) + (b) parallel residency test | 93.9-94.6 | 96.22%, 36.3 / 79.2 / 35.7, 2.12 ms | 96.0 | 88.31%, 107.1 / 41.2 / 27.8, 6.43 ms (19.3 ms) |
+| 4: stall metric again | 93.6-93.9 | 96.22%, 36.3 / 79.2 / 35.7, 2.12 ms | 96.1 | 88.32%, 106.7 / 41.0 / 27.6, 6.43 ms (19.3 ms) |
+| 4: (a) + (b), budget × 1.5 (2.63 MB) | 84.6-86.0 | 96.55%, 33.1 / 100.0 / 44.6, 1.94 ms | **98.4** | 89.15%, 99.1 / 56.6 / 38.9, 5.98 ms (17.9 ms) |
+| 5: stall metric | 92.2-92.4 | 96.16%, 36.9 / 84.2 / 39.4, 2.16 ms | 93.6 | 88.19%, 107.8 / 42.7 / 29.1, 6.54 ms (19.6 ms) |
+| 5: (b) alone (`96b3c51`) | 93.1-93.7 | 96.16%, 36.9 / 84.2 / 39.4, 2.14 ms | 93.8 | 88.20%, 107.8 / 42.7 / 29.1, 6.54 ms (19.6 ms) |
+| 5: (a) + (b), budget × 0.67 (1.17 MB) | **95.2-95.4** | 95.68%, 41.5 / 52.7 / 25.7, 2.37 ms | 90.7 | 87.50%, 114.3 / 26.6 / 18.5, 6.92 ms (20.8 ms) |
 
 **What the lookahead could have covered.** A diagnostic build (`.scratch/la41/diag.patch` on `63d4eb4`, not committed) marks each next-layer key the lookahead saw and classifies every decode miss at its step: dropped by the budget, ranked in the top 16 and still missed, ranked 16-31 (the ranking widened to 32 for this), or beyond. Its flag writes cost 2.9% at one lane (91.1 tok/s); its counts are of the same traffic as the stall build's.
 
@@ -465,6 +466,7 @@ Raw material in the `flash-next` worktree, `.scratch/la41/`: `rate.sh`, `summary
 Status lives in https://github.com/gpillon/ignis/issues/306.
 
 - A per-step decode prefetch budget keyed to the lookahead rows (~1.17 MB at one row, ~+0.72 MB per further row; "Demand copies and the lookahead" above): +2% at one lane and +2.4% at three, each measured on its own scaled default. Bracket it first (× 0.5 at one lane, × 2 at three); it needs the descriptor and `PolicyConfig` to carry the per-row term, and spec 03's replay acceptance (one-lane hit rate ≥ 96%) revisited, since a smaller one-lane budget wins while hitting less.
+- Time the join wait too (spec 03 story 7: a turn slowed by an unfinished prefetch now reads as compute). Not cheap with the mirror pattern: the step must know when its own stream reached the join, which needs a timestamp written by the kernel before it (the router, another module), an extra launch per layer on the critical path, or a device-side wait in place of the event join.
 - Prefetch precision is what is left once the budget is right: 45% of one-lane prefetches are used, and 36% of one-lane demand bytes rank beyond the lookahead's top 32.
 - Host-gap fixes 2, 3 and 5 (one wake per gather, every read in flight at once, one pinned staging copy): ~0.05-0.2 ms each, worth a dedicated A/B on the greedy prompt.
 - A wider `router_select` (3.5 µs per layer on one CTA).

@@ -20,7 +20,7 @@ import {
   TOKENS_PER_KV_PAGE,
   TREND_SPAN_MS,
 } from "./derive.ts";
-import { formatAgo, formatBound, formatBytes, formatCount, formatNumber, formatSeconds, formatShare, formatWindow } from "./format.ts";
+import { formatAgo, formatBound, formatBytes, formatCount, formatMs, formatNumber, formatSeconds, formatShare, formatWindow } from "./format.ts";
 import { bucketCounts } from "./quantile.ts";
 import type { MonitorState } from "./scrape.ts";
 import {
@@ -1017,7 +1017,7 @@ function ExpertsCard({ experts, chart, win }: { experts: Experts; chart: ChartFr
       />
       <Figures
         items={[
-          ["Stall per token", experts.stallPerToken === null ? formatNumber(null) : `${formatNumber(experts.stallPerToken * 1000)} ms`],
+          ["Stall per token", formatMs(experts.stallPerToken === null ? null : experts.stallPerToken * 1000)],
           ["Waiting on copies", asShare(experts.stallShare)],
           [`Stalled, last ${win}`, formatSeconds(experts.stall.window)],
         ]}

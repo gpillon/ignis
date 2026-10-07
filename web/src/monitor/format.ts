@@ -45,6 +45,11 @@ export function formatBytes(bytes: number | null): string {
   return `${text} ${unit}`;
 }
 
+/** A short span in milliseconds, with the decimals its size deserves: `0.35 ms`, `2.1 ms`, `43 ms`. */
+export function formatMs(ms: number | null): string {
+  return ms === null || !Number.isFinite(ms) ? DASH : `${formatNumber(ms)} ms`;
+}
+
 /** `850 ms`, `2.40 s`, `12.5 s`, `1m 12s`. */
 export function formatSeconds(s: number | null): string {
   if (s === null || !Number.isFinite(s)) return DASH;

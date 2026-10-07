@@ -132,6 +132,14 @@ When output names a domain concept, use the term as defined here.
   in use, replaced least-recently-used; a plan line at load.
 - **Router lookahead** — the next layer's router applied to this layer's MoE
   input to prefetch its likely experts into the cache.
+- **Demand copy** — a step's copy of the projections it selected that the
+  expert cache did not hold (its misses), on the layer's stream: the expert
+  op waits for it. A **prefetch** copy runs beside the op instead, for the
+  next layer.
+- **Stall** — the device time the expert ops waited on their steps' demand
+  copies, per phase (ADR 0017). The wait for a previous step's unfinished
+  prefetch is not in it.
+  _Avoid_: residency wait (for the stall alone).
 - **QSA layer** — Flash-Next's attention layer: GQA 24 query / 2 KV heads of
   256 with an **indexer** that, above 2051 tokens, selects the key blocks the
   attention reads (sparse); dense below.

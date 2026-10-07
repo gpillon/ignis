@@ -1,6 +1,6 @@
 //! What expert residency counts (spec flash-next/03): hits and misses per
 //! class and phase, prefetches issued and used, bytes moved, the time the
-//! expert kernels waited, from the first step on. Facts only: the server's
+//! expert kernels waited on their demand copies, from the first step on. Facts only: the server's
 //! exposition names and renders them (ADR 0017), and nothing here knows it
 //! exists.
 
@@ -26,11 +26,11 @@ pub struct ResidencyCounters {
     pub prefetch_used: u64,
     /// Bytes copied host-to-device, misses and prefetches, by phase.
     pub bytes_moved: [u64; 2],
-    /// Time the expert kernels waited on residency, by phase: the device
-    /// time of the demand copies, each from its first block's start to its
-    /// last block's end (a step with no miss copies nothing and adds
-    /// nothing). The device times it; the CPU policy model has no clock and
-    /// leaves it at zero.
+    /// Time the expert kernels waited on their steps' demand copies, by
+    /// phase: each copy from its first block's start to its last block's
+    /// end (a step with no miss copies nothing and adds nothing). The wait
+    /// for a previous step's unfinished prefetch is not in it. The device
+    /// times it; the CPU policy model has no clock and leaves it at zero.
     pub stall_nanos: [u64; 2],
 }
 
