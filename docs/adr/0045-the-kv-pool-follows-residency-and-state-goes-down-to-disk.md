@@ -101,7 +101,10 @@ clone), GitHub #205 (the owner's Tier 2 header decision and its RoPE comment).
 **The existing flag, honoured on both models and both branches, with a token
 form *(agent proposal)*.**
 
-- Named, it replaces the policy's size.
+- Named, it replaces the policy's size. On the offloaded branch it replaces the
+  default. On the resident branch it replaces the minimum pool in the
+  residency test and becomes the pool, and the rest of the budget is left
+  unused, as a named pool leaves it on the 27B today.
 - It accepts `<n>tok`, with `K`/`M` as binary multipliers: `512Ktok` is 524,288
   tokens. `IGNIS_KV_POOL_BYTES` takes the same spellings. A bare count or a
   `K`/`M`/`G` suffix stays bytes.

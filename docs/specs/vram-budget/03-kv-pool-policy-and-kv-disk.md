@@ -239,8 +239,10 @@ compute, and its drop path frees them.
    - The flag wins over `IGNIS_KV_POOL_BYTES`.
    - A malformed value is refused at config, naming the flag. The config no
      longer validates against the 27B's geometry.
-   - On Flash-Next a named pool replaces the default on both branches, and is
-     checked against Flash-Next's own per-token cost at the plan.
+   - On Flash-Next a named pool is checked against Flash-Next's own per-token
+     cost at the plan. Offloaded, it replaces the default. Resident, it
+     replaces the minimum pool in the residency test and becomes the pool, and
+     the rest of the budget stays unused, as on the 27B.
    - `512Ktok` gives an 8,192-page pool on either model.
 6. **The floor opt-in.**
    - Below 12 GiB the start is refused by default, and the message names
@@ -311,7 +313,9 @@ compute, and its drop path frees them.
 ### KV-disk: file format and integrity
 
 13. **The file format.** A file is a 4 KiB header page, written last, followed
-    by the blob's windows. The header carries:
+    by the blob's windows. The last window is padded to `DIRECT_IO_ALIGNMENT`
+    for the unbuffered write, and the header holds the true length. The header
+    carries:
     - the served model id;
     - the blob identity: structural artifact hash, KV format, layout version,
       drafter presence and window;
@@ -400,8 +404,17 @@ compute, and its drop path frees them.
     cannot explain a difference (finding 2026-09-14, batched decode width
     drift).
 
-    A second leg uses a small KV-RAM arena: A goes to KV-RAM, a third request
-    C demotes it to disk, and the same equality holds.
+    A second leg runs at `--decode-lanes 3`, so that three requests fit under
+    the in-flight cap, with a small KV-RAM arena that holds one blob. A and B
+    are tagged `agent` and C `interactive`:
+    - B evicts A into KV-RAM.
+    - C evicts B, which demotes A from KV-RAM to disk to make room.
+    - C runs alone to completion. Then B (from KV-RAM) and A (from disk) come
+      back one at a time, since the pool holds one context, and each finishes
+      alone.
+
+    Every round is still at width 1. A's tokens equal its lone run's, and B's
+    equal B's.
 22. **The 27B: the same overflow.** The test of 21 runs on the 27B with
     `--kv-disk-bytes` named: the mechanism is generic.
 23. **Contention on F:, measured.** On Flash-Next, force a ≥ 1 GB spill to disk
