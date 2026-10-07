@@ -131,7 +131,7 @@ Inferred:
   - compute: dense FP8 linears 35%, routed experts 34%;
   - copy-bound short chunks.
 
-  Link/compute overlap is not a lever: ≤ 0.15 s per full chunk.
+  Link/compute overlap is not a lever: ≤ 0.15 s per full chunk. (At the later 262K x 3-lane default this no longer holds: see [the prefill chunk decomposition](2026-10-07-flash-next-prefill-chunk-decomposition.md).)
 - **Item 4 (stall).** The decode share bounds the lanes' rate during a prefill. Bounding the *gap* below one chunk's wall time needs decode rounds inside a chunk, which ADR 0018 deferred:
   - option 1: a leaf sub-step that runs a chunk's layers in slices and returns between them;
   - option 2: true overlap.
