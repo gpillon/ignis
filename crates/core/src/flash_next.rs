@@ -38,11 +38,9 @@ use crate::step::{
 pub const LOOKAHEAD_WIDTH: u32 = 16;
 
 /// The lookahead residency ranks per token of a prefill chunk: the next
-/// router's own top-k. A chunk streams its lookahead unbudgeted, so every rank
-/// past what that router selects is link time the chunk waits on; at 16 a
-/// reused agent turn's ~1K-token tail took 0.28 s longer and a cold 8.7K
-/// prompt 0.47 s (GitHub #306, `docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
-pub const PREFILL_LOOKAHEAD_WIDTH: u32 = 10;
+/// router's own top-k, since a chunk streams it unbudgeted (GitHub #306,
+/// `docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
+pub const PREFILL_LOOKAHEAD_WIDTH: u32 = crate::moe::TOP_K;
 
 /// The decode lanes a Flash-Next load serves by default (spec flash-next/04:
 /// three agents); the leaf's own default for a load option of 0.

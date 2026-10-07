@@ -136,6 +136,11 @@ struct Dev {
   ignis_residency_mirror *mirror;  // mapped host memory, or NULL
 };
 
+// A step's lookahead width: a prefill step's own, else the decode width (the host's width_of).
+__device__ __forceinline__ uint32_t width_of(const Dev &d, uint32_t phase) {
+  return phase == IGNIS_RESIDENCY_PREFILL ? d.prefill_width : d.width;
+}
+
 
 // ---- block-wide helpers (every thread calls them) ----------------------------------------------
 
@@ -274,7 +279,7 @@ __global__ void __launch_bounds__(kThreads)
     }
   }
   if (lookahead != nullptr) {
-    const uint32_t width = decode ? d.width : d.prefill_width;
+    const uint32_t width = width_of(d, phase);
     for (uint32_t row = t; row < rows; row += blockDim.x) {
       uint32_t rank = 0;
       for (uint32_t j = 0; j < stride && rank < width; ++j) {
@@ -484,7 +489,7 @@ __global__ void __launch_bounds__(kThreads)
   __syncthreads();
 
   // The candidates' first-occurrence rank positions.
-  const uint32_t width = decode ? d.width : d.prefill_width;
+  const uint32_t width = width_of(d, phase);
   for (uint32_t row = t; row < rows; row += blockDim.x) {
     uint32_t rank = 0;
     for (uint32_t j = 0; j < stride && rank < width; ++j) {
@@ -661,7 +666,7 @@ constexpr uint64_t kAlign = 256;
 
 uint64_t round_up(uint64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
-// A step's lookahead width: a prefill step's own, else the decode width.
+// A step's lookahead width: a prefill step's own, else the decode width (the kernels' width_of).
 uint32_t width_of(const ignis_residency_desc &d, uint32_t phase) {
   return phase == IGNIS_RESIDENCY_PREFILL ? d.prefill_lookahead_width : d.lookahead_width;
 }

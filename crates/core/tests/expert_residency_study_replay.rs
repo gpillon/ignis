@@ -309,8 +309,9 @@ fn decode(
 }
 
 /// One prefill chunk over `tokens` of `chunks`, one step per layer, the
-/// lookahead (top-W of every token) included. `scan` false admits it with
-/// plain LRU instead, as a decode step would.
+/// lookahead (every token's top-k, Flash-Next's prefill width since #306)
+/// included. `scan` false admits it with plain LRU instead, as a decode step
+/// would.
 fn prefill(model: &mut ResidencyModel, tokens: &[(&Chunk, usize)], scan: bool) -> u64 {
     let (layers, experts) = (model.catalog().layers(), model.catalog().experts());
     let union = |pick: &dyn Fn(&Chunk, usize) -> Vec<u16>| {
@@ -326,10 +327,10 @@ fn prefill(model: &mut ResidencyModel, tokens: &[(&Chunk, usize)], scan: bool) -
     for layer in 0..usize::from(layers) {
         let selected = union(&|c, t| c.selected(t, layer));
         let out = if scan {
-            // Every token's top-W, as one-expert "lanes": the same union the
+            // Every token's top-k, as one-expert "lanes": the same union the
             // model would take from one ranking per token, built once.
             let ahead = if layer + 1 < usize::from(layers) {
-                union(&|c, t| c.lookahead(t, layer, DEFAULT_PREFETCH_WIDTH))
+                union(&|c, t| c.lookahead(t, layer, TOP_K))
             } else {
                 Vec::new()
             };

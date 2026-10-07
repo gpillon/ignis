@@ -50,6 +50,7 @@
 #ifndef IGNIS_RESIDENCY_H
 #define IGNIS_RESIDENCY_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "ignis_moe.h"
@@ -80,6 +81,14 @@ struct ignis_residency_desc {
   uint32_t copy_blocks;         /* the copy kernel's grid; 0 = 16 */
   uint32_t report;              /* 1: keep each step's outcome for ignis_residency_last_report */
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(struct ignis_residency_desc) == 152 &&
+                  offsetof(struct ignis_residency_desc, prefill_lookahead_width) == 112 &&
+                  offsetof(struct ignis_residency_desc, prefetch_budget_bytes) == 120 &&
+                  offsetof(struct ignis_residency_desc, copy_blocks) == 144,
+              "ignis_residency_desc drifted from crates/core/src/residency/device.rs ResidencyDesc");
+#endif
 
 /* The device bytes a residency of `desc` reserves at load (ADR 0030 plan lines), each part
  * rounded up to 256 bytes: the class pools, the staging ring, and everything else (slot tables,

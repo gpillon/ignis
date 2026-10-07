@@ -3,7 +3,9 @@
 //! implements (spec flash-next/03, acceptance 4, GitHub #301).
 //!
 //! - The leaf's own plan line for the tables stays within the CPU plan's
-//!   upper bound (host arithmetic, no GPU: runs with `--features cuda`).
+//!   upper bound, its descriptor refuses a prefill width past the decode
+//!   width, and its layout is the Rust mirror's (host arithmetic, no GPU:
+//!   runs with `--features cuda`).
 //! - On random traces -- decode of one to three lanes, prefill chunks, a
 //!   lookahead with holes, a budget or none, a warm start, refused steps,
 //!   forwards restarted at a layer --
@@ -59,6 +61,39 @@ fn the_leaf_s_tables_line_stays_within_the_cpu_plan_s_upper_bound() {
     assert_eq!(plan.pools, pools);
     assert_eq!(plan.staging, round(1_600_000_000));
     assert_eq!(plan.total, plan.pools + plan.staging + plan.tables);
+}
+
+#[test]
+fn a_prefill_width_past_the_decode_width_is_refused_by_name() {
+    // The ranked lookahead's scratch is sized for the decode width.
+    let desc = ResidencyDesc {
+        layers: 2,
+        experts: 16,
+        capacity: [4; 8],
+        record_bytes: [4096; 8],
+        max_tokens: 4,
+        lookahead_width: 3,
+        prefill_lookahead_width: 4,
+        prefetch_budget_bytes: NO_BUDGET,
+        staging_half_bytes: 4096 * 32,
+        host_pool_bytes: 4096 * 64,
+        copy_blocks: 4,
+        report: 0,
+    };
+    let refused = device::plan_bytes(&desc).expect_err("a prefill width past the decode width");
+    assert!(refused.contains("prefill_lookahead_width exceeds lookahead_width"), "{refused}");
+    device::plan_bytes(&ResidencyDesc { prefill_lookahead_width: 3, ..desc }).expect("equal widths");
+}
+
+/// `struct ignis_residency_desc` has no `size` field, so both sides pin its
+/// layout: kernel/include/ignis_residency.h static_asserts the same.
+#[test]
+fn the_residency_descriptor_is_the_leaf_s_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(offset_of!(ResidencyDesc, prefill_lookahead_width), 112);
+    assert_eq!(offset_of!(ResidencyDesc, prefetch_budget_bytes), 120);
+    assert_eq!(offset_of!(ResidencyDesc, copy_blocks), 144);
+    assert_eq!(size_of::<ResidencyDesc>(), 152);
 }
 
 struct Rng(u64);
