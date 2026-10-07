@@ -434,7 +434,10 @@ at load, P2-01/#83), not the KV pool, which is a flat ~1.2 GiB in every row.
 ## Follow-ups
 
 - Criterion 2 of #92: the survey of directions, and the CUDA-graph spike —
-  not covered by this finding.
+  not covered by this finding. Rescoped on 2026-10-07 and answered on current
+  `main` by [27B prefill chunk width](2026-10-07-27b-prefill-chunk-width.md):
+  the default stays 1,024, and a CUDA-graph prefill chunk is not worth it on
+  current evidence.
 - `.scratch/issue-92/DECOMPOSITION.md` is the working writeup this finding
   consolidates, linked from the #92 comments; keep it as the raw-material
   trail rather than duplicating it here.
