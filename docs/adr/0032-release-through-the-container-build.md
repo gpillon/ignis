@@ -62,7 +62,8 @@ development machine.
 
 **A tag is only cut on a pipeline already green.** Every push to `main` or a
 `ci/**` branch runs the tests and both builds and publishes nothing — that is
-the dry run. A `v*` tag publishes, and its version must equal
+the dry run (amended 2026-10-07 below: a push to `main` now publishes a
+development build). A `v*` tag publishes, and its version must equal
 `workspace.package.version` (and `web/package.json`'s), or the run fails
 before building anything. A tag's run is never cancelled by the concurrency
 group.
@@ -78,6 +79,33 @@ GB, so it is mounted; the driver is injected by the container runtime.
 `IGNIS_ARTIFACT` is deliberately not defaulted — unset, the server starts on
 the CPU mock (ADR 0006), which makes running the image a smoke test on its
 own.
+
+## Amendment (2026-10-07, owner decision): main publishes a development build
+
+A push to `main` (and a `workflow_dispatch` run on `main`) now publishes, in
+addition to running the tests and both builds. It is **not a release**.
+
+- The runtime image is pushed as `ghcr.io/gpillon/ignis:develop`, and only that
+  tag: never `latest`, never a version. No per-commit tags — they would pile
+  up in GHCR with nothing to prune them; the commit is in the image's
+  `org.opencontainers.image.revision` label and in the prerelease body.
+- A rolling GitHub prerelease, tag `develop`, holds the Linux tarball, the
+  Windows zip and their `.sha256`. The `prerelease` job (needs `version`,
+  `linux`, `windows`; `contents: write` for that job only) deletes the old
+  release and its tag and creates both again at the run's commit, with
+  `--prerelease --latest=false`, so it is never the repository's "latest".
+  Delete-and-recreate rather than force-moving the tag: the release can never
+  hold a mix of two runs' files. The tag is pushed by `GITHUB_TOKEN`, which
+  starts no workflow, and `develop` does not match `v*.*.*`.
+- The window: the main concurrency group cancels an older run, and a run
+  cancelled between the delete and the end of the upload leaves no `develop`
+  release (or one missing assets) until the next main run recreates it. Nothing
+  depends on it.
+- On main and `ci/**` the archives are named `ignis-develop-<sha7>-…` and
+  `ignis-ci-<sha7>-…` instead of `ignis-v<version>-…`; a `v*` tag release is
+  unchanged. `ci/**` still publishes nothing.
+- A `v*` tag release is unchanged: same image tags, same `release` job, same
+  body.
 
 ## Considered Options
 

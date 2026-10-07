@@ -1,9 +1,17 @@
 # Build ignis for Windows and Linux (x86_64, CUDA/SM120a), build the
-# linux/amd64 container image, and, on a v* tag, publish all three.
+# linux/amd64 container image, and publish all three: a release on a v* tag, a
+# development build on a push to main.
 #
-# A push to main or to a ci/** branch runs the same tests and builds and
-# publishes nothing: that is the dry run for a release, so a tag is only ever
-# cut on a pipeline already known to be green.
+#   v*.*.* tag   the release: image tagged <version> + <major>.<minor> +
+#                latest, and a GitHub release with the archives.
+#   main         a development build, NOT a release (ADR 0032, amended
+#                2026-10-07): the image tagged `develop` only, and a rolling
+#                GitHub prerelease whose tag `develop` is moved to the run's
+#                commit on every run. Never `latest`, never a version tag. A
+#                workflow_dispatch run on main publishes the same way.
+#   ci/**        the same tests and builds and publishes nothing: the dry run
+#                for a release, so a tag is only ever cut on a pipeline
+#                already known to be green.
 #
 # Nothing builds before the tests pass. The `test` job runs the CPU-only
 # suite on both hosts -- `cargo test` never touches the GPU on its own
@@ -32,7 +40,8 @@ on:
 permissions:
   contents: read
 
-# A tag's run is never cancelled: it is the one that publishes.
+# A tag's run is never cancelled: it is the one that publishes a release. Main
+# runs cancel each other, so `develop` only ever follows the newest push.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -49,6 +58,9 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       is_release: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      # What the archives are named after: v<version> for a release, and for
+      # anything else a name that cannot be mistaken for one.
+      label: ${{ steps.resolve.outputs.label }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +85,10 @@ jobs:
               exit 1
             fi
             echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+            echo "label=v$tag_version" >> "$GITHUB_OUTPUT"
           else
+            if [ "${GITHUB_REF}" = refs/heads/main ]; then prefix=develop; else prefix=ci; fi
+            echo "label=${prefix}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
             echo "version=${cargo_version}+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
@@ -184,7 +199,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -199,6 +214,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=develop,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build the Linux binaries
         uses: docker/build-push-action@v6
@@ -248,7 +264,7 @@ jobs:
           file: ./Containerfile
           target: runtime
           platforms: linux/amd64
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          push: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=linux-cuda
@@ -257,7 +273,7 @@ jobs:
             KERNEL_BUILD_JOBS=3
 
       - name: Image published
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
         run: |
           echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -268,7 +284,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="ignis-v${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu"
+          name="ignis-${{ needs.version.outputs.label }}-x86_64-unknown-linux-gnu"
           mv out/linux "$name"
           chmod +x "$name"/ignis-server "$name"/ignis-bench "$name"/ignis-artifact-inspect
           tar -czf "$name.tar.gz" "$name"
@@ -278,7 +294,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
-          path: ignis-v*-x86_64-unknown-linux-gnu.tar.gz*
+          path: ignis-*-x86_64-unknown-linux-gnu.tar.gz*
           if-no-files-found: error
 
   windows:
@@ -416,7 +432,7 @@ jobs:
           CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
         run: |
           set -euo pipefail
-          name="ignis-v${{ needs.version.outputs.version }}-x86_64-pc-windows-msvc"
+          name="ignis-${{ needs.version.outputs.label }}-x86_64-pc-windows-msvc"
           mkdir "$name"
           cp target/x86_64-pc-windows-msvc/release/ignis-server.exe "$name"/
           cp target/x86_64-pc-windows-msvc/release/ignis-bench.exe "$name"/
@@ -456,7 +472,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
-          path: ignis-v*-x86_64-pc-windows-msvc.zip*
+          path: ignis-*-x86_64-pc-windows-msvc.zip*
           if-no-files-found: error
 
   # Both hosts, or no release.
@@ -520,3 +536,74 @@ jobs:
 
             Apache-2.0 (`LICENSE`, `NOTICE`); the vendored reference ops keep
             their own terms (`NOTICE-kernel`).
+
+  # The rolling development build. One prerelease, tag `develop`, moved to the
+  # commit of the newest main run: delete the old release and its tag, then
+  # create both again at this commit. Simpler than force-moving a tag under a
+  # release that keeps its old assets, and the result cannot mix two runs'
+  # files.
+  #
+  # The window is the few seconds between the two `gh` calls, plus the asset
+  # upload. A run cancelled there (the concurrency group cancels main runs)
+  # leaves no `develop` release, or one with some assets missing, until the
+  # next main run recreates it; nothing else reads it. A tag pushed with
+  # GITHUB_TOKEN starts no workflow, and `develop` does not match `v*.*.*`
+  # anyway, so this cannot retrigger the pipeline.
+  #
+  # `--latest=false` and `--prerelease`: this is never the repository's
+  # "latest" release, which stays the newest v* tag.
+  prerelease:
+    needs: [version, linux, windows]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-x86_64"
+          merge-multiple: true
+          path: dist
+
+      - name: What will be published
+        run: ls -l dist
+
+      - name: Move the develop prerelease to this commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          ## ignis development build
+
+          Commit `__SHA__` on `main`. **This is a development build, not a
+          release**: it is rebuilt on every push to `main`, replaces the
+          previous one, and has had no release checks. Releases are the `v*`
+          tags.
+
+          ### Container image (linux/amd64)
+
+          ```
+          podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
+            -v /path/to/models:/models:ro \
+            -e IGNIS_ARTIFACT=/models/<name>.ninfer \
+            ghcr.io/__REPO__:develop
+          ```
+
+          (`docker`: `--gpus all` in place of `--device`.) The archives below
+          come from the same build. SM120a (RTX 5090 / Blackwell consumer)
+          only.
+          EOF
+          sed -i "s|__SHA__|${GITHUB_SHA}|; s|__REPO__|${GITHUB_REPOSITORY}|" notes.md
+          gh release delete develop --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          # A `develop` tag left without its release (made by hand, or a run
+          # cut short) would win over --target below: drop it too.
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/develop" > /dev/null 2>&1 || true
+          gh release create develop dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "develop (${GITHUB_SHA::7})" \
+            --notes-file notes.md \
+            --prerelease \
+            --latest=false

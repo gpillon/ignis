@@ -28,6 +28,12 @@ out/
 ignis-v*/
 ignis-v*.tar.gz*
 ignis-v*.zip*
+ignis-develop-*/
+ignis-develop-*.tar.gz*
+ignis-develop-*.zip*
+ignis-ci-*/
+ignis-ci-*.tar.gz*
+ignis-ci-*.zip*
 
 # Logs (ignis-server.log alone is ~270 MB) and profiler captures, which embed
 # the profiled process's environment.
