@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn a_default_table_keeps_sixteen_reads_in_flight() {
+    fn a_default_table_reads_with_sixteen_threads() {
         // GitHub #306: an 8192-token Flash-Next chunk gathers ~46K file reads
         // before the card can start; four readers took ~1.2 s of it with the
         // GPU idle, sixteen take the chunk's TTFT from 3.7 to 2.9 s.

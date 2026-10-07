@@ -64,6 +64,10 @@ The [2026-10-06 finding](2026-10-06-flash-next-on-the-5090.md) measured an 8K TT
 - One-chunk prompt (~8,150 tokens), median of 13 requests:
   - 3.72 s at 4 n-gram reader threads;
   - **2.87 s at 16**, with the same reads per request (46.5K reads, 196 MB). Same source, one load each (`.scratch/prefill306/ttft-ng{4,16}.*`).
+- Decode at one lane on the same two binaries (`fnperf.py decode`, ~205-token prompt, 3 x 1000 tokens each):
+  - 87.6-88.4 tok/s at 4 reader threads;
+  - **102.4-105.5 tok/s at 16**, with the same expert traffic (51-58 MB per token, hit rate 97.7-98.0%);
+  - the short prompt's TTFT falls from 1.60-1.68 s to 1.27-1.33 s.
 
 **How the scheduler interleaves.**
 - Flash-Next runs the 27B's `ConcreteScheduler`. Each `advance()` runs at most one prefill chunk, then one decode round for every running lane (ADR 0018, K = 1).
@@ -97,13 +101,13 @@ Observed:
 1. **An 8192-token chunk is compute-bound, and its expert stream already overlaps compute.**
    - 89% of the copy time runs under compute. Only 0.13-0.15 s of the 1.9 s chunk is copy alone, and the card is never idle inside the chunk.
    - Compute is 0.21 ms per token, within the study's bound (0.77-1.3 s per 4K).
-   - The 2026-10-06 inference ("compute ~3x the bound, or no overlap") no longer holds. Its 8K TTFT of 6.9-8.5 s came before the decode-round fixes: the hyper-connection mix, and the n-gram reads that the artifact's memory map serialized.
+   - The 2026-10-06 inference ("compute ~3x the bound, or no overlap") no longer holds.
 2. **About 40% of a chunk's wall time was the host n-gram gather, with the card idle.**
    - At 4 reader threads the gather took ~1.2-1.3 s per 8192 tokens.
    - 16 threads take a one-chunk TTFT from 3.72 to 2.87 s (−23%). Committed in adec4d4.
+   - The same change speeds up decode: one lane goes from 88 to 102-105 tok/s. A round's ~12 row reads now run one deep instead of three.
 3. **A short chunk is copy-bound.**
    - A 536-token chunk costs ~1 s, of which ~0.9 s is copies with little compute to hide under. Per-chunk transfer is nearly constant (spec 03).
-   - This is the cost of the reused agent turn's 1.1K tail in item 5 (2.45 s).
 4. **With one round per chunk, the lanes fall to ~1 tok/s during a long prefill.** The longest gap is one chunk's wall time: 3.2 s at 8192 tokens.
 5. **The decode share sets the lanes' rate during a prefill, and the TTFT pays exactly the hold.**
    - At 25%: 16-18 tok/s, TTFT ×1.3 (formula ×1.33).
@@ -115,6 +119,8 @@ Observed:
 
 Inferred:
 
+- **Why the 2026-10-06 8K TTFT was 6.9-8.5 s.** The drop to ~4.3 s is observed; its cause is not bisected. The candidates are the fixes in between: the hyper-connection mix, and the n-gram reads that the artifact's memory map serialized ([decode round finding](2026-10-06-flash-next-decode-round.md)).
+- **Item 5's reused turn.** Its 1.1K-token tail (2.45 s) plausibly pays the same copy-bound cost as the 536-token tail here. Not measured on that turn.
 - **Choosing the default.** A long prefill and the decoding lanes share one card, so any share moves time from one to the other. 50% halves the lanes' rate rather than stopping them, and doubles the TTFT at worst, and only while lanes decode. With the agents' short tool-call generations, the decoding agents finish sooner. The prefilling agent finishes no later than the sum of the two jobs' work.
 - **TTFT at 16 readers.** Each 8192 chunk should lose ~0.9 s of gather, so 34K should land near ~11.5 s. Not measured.
 
@@ -137,9 +143,8 @@ Inferred:
 - **One capture**, one prompt family (synthetic word lists), warm cache. The share and chunk cells have two reps each.
 - **Hidden copies are not free.** Copy kernels hidden under compute still share SMs and PCIe with it. How much the copies slow the compute they overlap is not separated: that needs a fully cached chunk, which this card cannot hold.
 - **Per-chunk bytes** come from a window delta split by copy time, not from a per-chunk counter.
-- **Not measured at 16 reader threads:**
-  - the 34K TTFT;
-  - decode tok/s (decode gathers ~12 rows per round and should not regress).
+- **Not measured at 16 reader threads:** the 34K TTFT, and decode at more than one lane.
+- **The hold follows every chunk, a request's last one included.** That request is a decoding lane from then on, so a newcomer's first chunk queued behind a long prompt can wait up to `t * s / (1 - s)` while only that one lane decodes. This is the case an agent swarm hits at every turn boundary; it was not measured.
 - **The gap at share > 0** is one chunk's wall time in every cell. The 25% and 50% defaults were compared on one scenario: two lanes decoding throughout one long prompt.
 
 ## Follow-ups
@@ -147,4 +152,4 @@ Inferred:
 - Rounds inside a chunk, to bound the gap: a leaf sub-step over layer slices. Prefill activations live in `fn.residual/x/y`, which the decode graph also uses, so the decode round would need buffers of its own. Residency's ring halves are tagged per layer.
 - Pipeline the n-gram gather: gather chunk k+1's rows while chunk k is on the card (the scheduler knows the next span).
 - Short chunks: stage only what a small chunk's own router selects (the lookahead stages each row's top 16, more than the top 10 used), or fold a short tail into the previous chunk when the width allows.
-- Re-measure the 34K TTFT and the decode rate at 16 reader threads.
+- Re-measure the 34K TTFT, and decode at 2-3 lanes, at 16 reader threads.
