@@ -45,6 +45,20 @@ describe("MonitorView", () => {
     expect(html).toContain("Live");
   });
 
+  it("names the expert cache and the residency, and no longer says the rest is the KV pool's (GitHub #306)", () => {
+    const text = IGNIS_EXPOSITION.replace('line="residency"} 0', 'line="residency"} 134217728').replace('ignis_vram_budget_bytes 31138512896', 'ignis_vram_budget_bytes 42949672960').replace('line="expert_cache"} 0', 'line="expert_cache"} 8589934592');
+    const state = applyScrape(initialMonitor(), { kind: "ok", text }, Date.now(), 3);
+    const html = renderToStaticMarkup(<MonitorView state={state} />);
+    expect(html).toContain("Expert cache");
+    expect(html).toContain("Residency");
+    expect(html.replace(/<!-- -->/g, "")).toContain("sized by context and lanes");
+    expect(html.replace(/<!-- -->/g, "")).not.toContain("left for the KV pool");
+    // The 27B's plan, with no expert cache, keeps saying it.
+    const plain = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, Date.now(), 3)} />);
+    expect(plain.replace(/<!-- -->/g, "")).toContain("left for the KV pool");
+    expect(plain).not.toContain("Expert cache");
+  });
+
   it("reads the memory panel's live figures against the constants that bound them", () => {
     const now = Date.now();
     const state = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now - 5_000, 3), { kind: "ok", text: later }, now, 4);

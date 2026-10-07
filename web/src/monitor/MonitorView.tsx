@@ -666,6 +666,8 @@ const LINE_LABEL: Record<VramLine, string> = {
   retained_slots: "Retained slots",
   hq_residual_window: "hq residual window",
   residual: "Residual",
+  residency: "Residency",
+  expert_cache: "Expert cache",
 };
 
 const FAMILY_LABEL: Record<RetainedFamily, string> = {
@@ -743,9 +745,14 @@ function PlanCard({ memory }: { memory: Memory }) {
               reserved of a {formatBytes(budget)} budget ·{" "}
               {memory.oversubscribed
                 ? `${formatBytes(Math.abs(memory.spareBytes ?? 0))} over it`
-                : `${formatBytes(memory.kvRoomBytes)} left for the KV pool${
-                    memory.kvPool.tokens === null ? "" : ` (${formatCount(memory.kvPool.tokens)} tokens)`
-                  }`}
+                : memory.expertCacheBytes > 0
+                  ? // Flash-Next sizes its pool by context and lanes; the expert cache takes whatever that leaves.
+                    `${formatBytes(memory.kvRoomBytes)} for the KV pool${
+                      memory.kvPool.tokens === null ? "" : ` (${formatCount(memory.kvPool.tokens)} tokens)`
+                    }, sized by context and lanes; the expert cache took the rest`
+                  : `${formatBytes(memory.kvRoomBytes)} left for the KV pool${
+                      memory.kvPool.tokens === null ? "" : ` (${formatCount(memory.kvPool.tokens)} tokens)`
+                    }`}
             </span>
           </div>
           <div className="flex h-3 gap-px bg-line/40" aria-hidden>

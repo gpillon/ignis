@@ -493,6 +493,8 @@ pub fn cuda_scheduler_with_thinking_close(
         budget_bytes: vram.budget_bytes,
         kv_pool_pages: capacity_pages,
         kv_page_bytes: stats.kv_page_bytes,
+        residency_bytes: 0,
+        expert_cache_bytes: 0,
         kv_ram_arena_bytes: shape.host_pool_bytes,
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
@@ -715,6 +717,8 @@ pub fn flash_next_scheduler_with_ngram_cache(
         budget_bytes,
         kv_pool_pages: capacity_pages,
         kv_page_bytes: stats.kv_page_bytes,
+        residency_bytes: residency_fixed,
+        expert_cache_bytes,
         kv_ram_arena_bytes: shape.host_pool_bytes,
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
@@ -911,11 +915,11 @@ mod tests {
             speculation: None,
             speculation_off: false,
             draft_rows: 0,
+            decode_lanes: 0,
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
         };
 
-            decode_lanes: 0,
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
 
         assert_eq!(config.serving_chunk_tokens, 512);

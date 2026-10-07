@@ -24,6 +24,9 @@ import {
   type VramLine,
 } from "./snapshot.ts";
 
+/** The two plan lines only a Flash-Next load has (GitHub #306). */
+const FLASH_NEXT_LINES: readonly VramLine[] = ["residency", "expert_cache"];
+
 // Everything the Monitor shows, derived from the scrape history for one
 // window: counter gains and rates, scheduler load, latency quantiles and
 // their trend, and a plain-words verdict on how the server is doing.
@@ -87,7 +90,7 @@ export type Memory = {
   /** Whether this load laid a plan out at all — the placeholder load has none. */
   planned: boolean;
   budgetBytes: number | null;
-  /** The plan's twelve lines, in plan order. */
+  /** The plan's twelve lines in plan order, then Flash-Next's residency and expert cache. */
   lines: { line: VramLine; bytes: number | null }[];
   /**
    * The twelve lines added up, or null when the scrape does not carry all
@@ -95,6 +98,8 @@ export type Memory = {
    * left beside it, and the server writes the twelve together or not at all.
    */
   linesBytes: number | null;
+  /** The expert cache's bytes: 0 on a load without one (the 27B), where the room left is all the KV pool's. */
+  expertCacheBytes: number;
   /** The budget less the lines: the room the plan left the KV pool. Negative on an oversubscribed load. */
   kvRoomBytes: number | null;
   /** The pool the room bought: its pages, one page, the two multiplied, and the tokens those pages hold. */
@@ -505,7 +510,9 @@ export function deriveMemory(points: Point[], since: number): Memory {
   const tally = (pick: CounterPick): Tally => ({ total: pick(last), window: increaseOver(points, pick, since) });
 
   const lines = VRAM_LINES.map((line) => ({ line, bytes: mem.reserved[line] }));
-  const linesBytes = lines.every((l) => l.bytes !== null) ? sumKnown(lines.map((l) => l.bytes)) : null;
+  // The twelve plan lines come together or not at all; Flash-Next's two (GitHub
+  // #306) are absent from a server that predates them, and count as 0 then.
+  const linesBytes = lines.filter((l) => !FLASH_NEXT_LINES.includes(l.line)).every((l) => l.bytes !== null) ? sumKnown(lines.map((l) => l.bytes)) : null;
   const kvPoolBytes = mem.kvPoolPages !== null && mem.kvPageBytes !== null ? mem.kvPoolPages * mem.kvPageBytes : null;
   const kvPoolTokens = mem.kvPoolPages === null ? null : mem.kvPoolPages * TOKENS_PER_KV_PAGE;
   const byReason = Object.fromEntries(
@@ -517,6 +524,7 @@ export function deriveMemory(points: Point[], since: number): Memory {
     budgetBytes: mem.budgetBytes,
     lines,
     linesBytes,
+    expertCacheBytes: mem.reserved.expert_cache ?? 0,
     kvRoomBytes: mem.budgetBytes !== null && linesBytes !== null ? mem.budgetBytes - linesBytes : null,
     kvPool: { pages: mem.kvPoolPages, pageBytes: mem.kvPageBytes, bytes: kvPoolBytes, tokens: kvPoolTokens },
     spareBytes: mem.budgetBytes === null || linesBytes === null ? null : mem.budgetBytes - linesBytes - (kvPoolBytes ?? 0),

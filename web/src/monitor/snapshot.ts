@@ -16,7 +16,9 @@ export const REJECT_REASONS = ["full", "unknown_model", "oversized"] as const;
 export type RejectReason = (typeof REJECT_REASONS)[number];
 
 /**
- * The plan's twelve lines, in the order `VramLines::entries()` lays them out
+ * The plan's twelve lines, then Flash-Next's two (GitHub #306: `residency`,
+ * the expert residency's fixed bytes, and `expert_cache`, the VRAM cache of
+ * experts; 0 on the 27B, absent from a server that predates them), in the order `VramLines::entries()` lays them out
  * — which is the order the load itself reserves them in, so the panel reads
  * down the plan rather than down an alphabet.
  */
@@ -33,6 +35,8 @@ export const VRAM_LINES = [
   "retained_slots",
   "hq_residual_window",
   "residual",
+  "residency",
+  "expert_cache",
 ] as const;
 export type VramLine = (typeof VRAM_LINES)[number];
 
