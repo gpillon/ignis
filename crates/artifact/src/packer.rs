@@ -210,6 +210,7 @@ pub fn unit_names(layers: usize) -> Vec<String> {
 struct PackState {
     layers: usize,
     units_done: Vec<String>,
+    ngram_source_digest: Option<String>,
     finished: bool,
     writer: WriterState,
 }
@@ -268,6 +269,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
         let state = PackState {
             layers: options.geometry.layers,
             units_done: Vec::new(),
+            ngram_source_digest: None,
             finished: false,
             writer: writer.state().clone(),
         };
@@ -326,7 +328,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
     if state.finished {
         let reader = Reader::open(&options.artifact)?;
         let converter_merged =
-            write_sidecar(&options.artifact, &options.work_dir, reader.file_bytes(), reader.objects().len(), pair.as_ref())?;
+            write_sidecar(&options.artifact, &options.work_dir, reader.file_bytes(), reader.objects().len(), pair.as_ref(), state.ngram_source_digest.as_deref())?;
         return Ok(PackOutcome::Finished {
             file_bytes: reader.file_bytes(),
             object_count: reader.objects().len(),
@@ -364,6 +366,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
         append_unit(&mut writer, &mut state, &state_file, &plan, options)?;
 
         writer.sync()?;
+        if unit == "ngram" { state.ngram_source_digest = Some(ngram_source_digest(&plan)); }
         state.units_done.push(unit.clone());
         state.writer = writer.state().clone();
         write_state(&state_file, &state)?;
@@ -391,7 +394,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
         )));
     }
     let converter_merged =
-        write_sidecar(&options.artifact, &options.work_dir, file_bytes, object_count, pair.as_ref())?;
+        write_sidecar(&options.artifact, &options.work_dir, file_bytes, object_count, pair.as_ref(), state.ngram_source_digest.as_deref())?;
     state.finished = true;
     write_state(&state_file, &state)?;
     progress(&format!("finished: {object_count} objects, {file_bytes} bytes"));
@@ -447,6 +450,24 @@ struct UnitPlan {
     dir: PathBuf,
     files: Vec<UnitFile>,
     objects: Vec<Planned>,
+}
+
+/// Composite content identity: ordered object descriptions and verified DONE
+/// digests with slice boundaries. No second pass over the 29 GB table.
+fn ngram_source_digest(plan: &UnitPlan) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"ignis-ngram-source-v1");
+    for object in &plan.objects {
+        hash.update((object.name.len() as u64).to_le_bytes());
+        hash.update(object.name.as_bytes());
+        hash.update(format!("{:?}", object.spec).as_bytes());
+        for slice in &object.slices {
+            hash.update(plan.files[slice.file].sha256.as_bytes());
+            hash.update(slice.offset.to_le_bytes());
+            hash.update(slice.len.to_le_bytes());
+        }
+    }
+    hex(&hash.finalize())
 }
 
 impl UnitPlan {
@@ -1092,6 +1113,7 @@ fn read_state(path: &Path) -> Result<PackState> {
     Ok(PackState {
         layers,
         units_done,
+        ngram_source_digest: value.get("ngram_source_digest").and_then(Value::as_str).map(str::to_owned),
         finished,
         writer,
     })
@@ -1101,6 +1123,7 @@ fn write_state(path: &Path, state: &PackState) -> Result<()> {
     let value = json!({
         "layers": state.layers,
         "units_done": state.units_done,
+        "ngram_source_digest": state.ngram_source_digest,
         "finished": state.finished,
         "writer": state.writer.to_value(),
     });
@@ -1187,6 +1210,7 @@ fn write_sidecar(
     file_bytes: u64,
     object_count: usize,
     pair: Option<&Value>,
+    ngram_source_digest: Option<&str>,
 ) -> Result<bool> {
     let path = sidecar_path(artifact);
     let mut root = if path.exists() {
@@ -1234,6 +1258,9 @@ fn write_sidecar(
             .ok_or_else(|| fail("sidecar member pair.main is not an object"))?
             .extend(fields.clone());
     }
+    if let Some(digest) = ngram_source_digest {
+        root.insert("ngram_cache_source".into(), json!({"schema": 1, "digest": digest}));
+    }
     let text = serde_json::to_string_pretty(&Value::Object(root))
         .map_err(|e| fail(format!("serialize sidecar: {e}")))?;
     write_atomically(&path, text.as_bytes())?;
@@ -1246,6 +1273,17 @@ mod tests {
     use crate::flash_next::fixture::{self, WorkTree};
     use crate::Sidecar;
 
+    #[test]
+    fn ngram_digest_tracks_content_order_and_slice_boundaries() {
+        let mut plan = UnitPlan::new(PathBuf::from("unused"));
+        plan.files.push(UnitFile { path: PathBuf::from("unused"), bytes: 10, sha256: "01".repeat(32) });
+        plan.objects.push(Planned { name: "table".into(), spec: Spec::Resource { bytes: 10 }, slices: vec![Slice { file: 0, offset: 0, len: 10 }] });
+        let first=ngram_source_digest(&plan);
+        assert_eq!(first.len(),64); assert_eq!(first,ngram_source_digest(&plan));
+        plan.files[0].sha256="02".repeat(32); assert_ne!(first,ngram_source_digest(&plan));
+        plan.files[0].sha256="01".repeat(32); plan.objects[0].slices[0].offset=1;
+        assert_ne!(first,ngram_source_digest(&plan));
+    }
     fn quiet() -> impl FnMut(&str) {
         |_: &str| {}
     }
@@ -1297,9 +1335,15 @@ mod tests {
         assert_eq!(object_count, 99);
         assert_eq!(std::fs::read(tree.artifact_path()).unwrap(), reference_container());
 
-        // Running again after the end changes nothing.
+        let record = read_json(&sidecar_path(&tree.artifact_path())).unwrap();
+        let digest = record["ngram_cache_source"]["digest"].as_str().unwrap().to_owned();
+        assert_eq!(digest.len(), 64);
+        let reference = fixture::build("digest-reference").unwrap();
+        assert_eq!(read_json(&sidecar_path(&reference.path)).unwrap()["ngram_cache_source"]["digest"], digest);
+        // Running again after the end preserves both bytes and the source digest.
         finished(pack(&tree.pack_options(), &mut quiet()).unwrap());
         assert_eq!(std::fs::read(tree.artifact_path()).unwrap(), reference_container());
+        assert_eq!(read_json(&sidecar_path(&tree.artifact_path())).unwrap()["ngram_cache_source"]["digest"], digest);
     }
 
     #[test]

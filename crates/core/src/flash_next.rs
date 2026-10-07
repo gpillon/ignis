@@ -51,6 +51,8 @@ pub struct EngineOptions {
     /// The VRAM expert cache, split into the eight K-class pools.
     pub expert_cache_bytes: u64,
     pub ngram: NgramTableOptions,
+    /// Persist the selected n-gram hot rows between process loads.
+    pub ngram_cache: crate::ngram_cache::PersistenceOptions,
     /// Capture the decode rounds' graphs after the pool exists.
     pub capture_graphs: bool,
     /// Prompt reuse's retained slots (spec flash-next/05): on the device
@@ -133,6 +135,7 @@ impl Default for EngineOptions {
             decode_lanes: DEFAULT_DECODE_LANES,
             expert_cache_bytes: 12 << 30,
             ngram: NgramTableOptions::default(),
+            ngram_cache: crate::ngram_cache::PersistenceOptions::default(),
             capture_graphs: true,
             retained_device_slots: 0,
             retained_host_slots: 0,
@@ -290,7 +293,9 @@ impl FlashNextEngine {
         let weights = DeviceWeights::place(&reader, &plan)?;
         let residency = build_residency(&path, &plan, &options)?;
         let ngram = config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?;
-        let table = NgramTable::from_artifact(&path, &reader, &plan, ngram, options.ngram)?;
+        let table = NgramTable::from_cached_artifact(
+            &path, reader, &plan, ngram, options.ngram, &options.ngram_cache,
+        )?;
         let model = load_flash_next(
             &plan,
             &geometry,
