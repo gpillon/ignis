@@ -268,7 +268,8 @@ had already paid the encode.
 
 - `--vision-max-tokens` semantics: either wire the budget into the resize's
   `max_pixels` so it shrinks, or keep it a refusal cap and say so in `--help`.
-  [GitHub #248](https://github.com/gpillon/ignis/issues/248).
+  [GitHub #248](https://github.com/gpillon/ignis/issues/248). Resolved 2026-10-07 (4a31ebf): the budget
+  now shrinks the image; this section records the behaviour as measured that day.
 - An identical repeat request re-prefills all 16,404 tokens (2.26 s) where the
   reference serves it from its prefix cache in 60 ms. Not diagnosed; it may be
   what the turn-opening capture rule is supposed to do for a single-turn
