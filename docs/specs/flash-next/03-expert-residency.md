@@ -60,6 +60,14 @@ and `docs/findings/2026-10-05-expert-residency-replayed-on-the-study-s-routing.m
   never below the largest class's projection: one lane then hits 96.5% with
   2.37 ms of demand misses where no prefetch costs 3.77 ms. A prefill streams
   its lookahead whole.
+- **A prefill's lookahead has its own width, the router's top-k (2026-10-07,
+  #306).** Unbudgeted, W = 16 per token over-streams: 26-31% of a reused agent
+  turn's prefetched projections were never read. At 10 (Flash-Next's
+  `PREFILL_LOOKAHEAD_WIDTH`) the turn's ~1K-token tail moves 14% fewer bytes
+  and starts 0.26 s sooner (2.12 → 1.86 s), and a cold 8.5K prompt 0.48 s
+  sooner. At 0 the bytes fall further, but a long chunk loses its overlap and
+  the cold prompt is 0.4 s slower than at 16. Decode keeps W = 16 under its
+  budget (`docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
 - **W counts experts**, each bringing both its projections: the router ranks
   experts, and the study's 62/77/81% recall is per expert.
 - **The staging ring holds two of the heaviest layer's projections**, the

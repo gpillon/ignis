@@ -176,7 +176,7 @@ Observed:
    - About 0.8 ms per token, plus a fixed ~1.5 s per chunk.
    - The fixed part matches the ~17 GB of non-resident experts that each chunk moves over a 12.5 GB/s link.
    - A 4.5K prompt takes 4.4 s against the study's 2.65 s (4K, cold), and 32K takes 25.7 s.
-4. **Prompt reuse works and is worth 11.5x on an agent turn** (2.45 s against 28.2 s). Even so, it **misses spec 05 AC6's 1.6 s**: the 1.1K-token tail is still one prefill chunk, and it pays the same expert stream as a cold 1K prompt (2.1-2.7 s).
+4. **Prompt reuse works and is worth 11.5x on an agent turn** (2.45 s against 28.2 s). Even so, it **misses spec 05 AC6's 1.6 s**: the 1.1K-token tail is still one prefill chunk, and it pays the same expert stream as a cold 1K prompt (2.1-2.7 s). (Since measured, 2026-10-07: the tail is three traversals, each re-streaming its experts, and a prefill lookahead at the router's top-k takes a ~9K-history turn from 2.12 to 1.86 s; AC6 still not met: [the agent turn tail finding](2026-10-07-flash-next-agent-turn-tail.md).)
 5. **Spec 05 AC7 passes.** The other lanes' decode hit rate after a reused turn is +0.26 points from before it (bound: within 2).
 6. **A prefill chunk stalls the other lanes' decode.** At 32K, two lanes fell to 4.5 and 8.2 tok/s while a third lane prefilled. In the swarm, per-lane decode fell to 10-19 tok/s. An 8192-token chunk runs ~7 s and the decode rounds wait for it. (Since measured, 2026-10-07: ~3.2 s per chunk, one round per chunk, lanes at ~1 tok/s; the decode share now gives them half: [the prefill chunk finding](2026-10-07-flash-next-prefill-chunk-and-decode-share.md).)
 7. **Spec 04 AC10 misses the 29 GB bound.**
