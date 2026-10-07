@@ -5,8 +5,9 @@
 // linear: gate/up with the SwiGLU epilogue (h in BF16, as the linear's activations are), then
 // down into fp32. The combine adds it, gated by sigmoid(x . w_gate) over the BF16
 // shared_expert_gate, to the routed experts' fixed-point sum, rounds once to BF16, and zeroes the
-// accumulator it read for the next call. One CTA per token; the gate's dot product is a fixed
-// block reduction, so the result is deterministic.
+// accumulator it read for the next call. One CTA per token -- at decode widths one per slice of a
+// token's row, each computing the token's gate itself; the gate's dot product is a fixed block
+// reduction in every CTA, so the result is deterministic and the same at every width.
 
 #include "moe_common.cuh"
 
@@ -17,6 +18,9 @@ namespace ignis_moe {
 namespace {
 
 constexpr int kCombineThreads = 256;
+// A decode-width call spreads each row over this many CTAs (one element per thread).
+constexpr int kCombineSlices = kHidden / kCombineThreads;
+static_assert(kCombineSlices * kCombineThreads == kHidden, "a slice is one element per thread");
 
 __global__ void __launch_bounds__(kCombineThreads) combine_kernel(long long *__restrict__ acc, const float *__restrict__ shared,
                                                                   const __nv_bfloat16 *__restrict__ x,
@@ -44,7 +48,9 @@ __global__ void __launch_bounds__(kCombineThreads) combine_kernel(long long *__r
   long long *ar = acc + static_cast<size_t>(t) * kHidden;
   const float *sr = shared + static_cast<size_t>(t) * kHidden;
   __nv_bfloat16 *orow = out + static_cast<size_t>(t) * kHidden;
-  for (int k = threadIdx.x; k < kHidden; k += kCombineThreads) {
+  const int span = kHidden / gridDim.y;
+  const int end = (blockIdx.y + 1) * span;
+  for (int k = blockIdx.y * span + threadIdx.x; k < end; k += kCombineThreads) {
     const float routed = from_fixed(ar[k]);
     orow[k] = __float2bfloat16_rn(fmaf(g, sr[k], routed));
     ar[k] = 0;
@@ -70,7 +76,8 @@ extern "C" int32_t ignis_moe_combine(int64_t *acc, const float *shared, const vo
   }
   if (tokens == 0) return fail("ignis_moe_combine: tokens must be at least 1");
   if (require_prepared("ignis_moe_combine", nullptr) != 0) return -1;
-  combine_kernel<<<tokens, kCombineThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+  const dim3 grid(tokens, tokens <= IGNIS_MOE_DECODE_MAX_TOKENS ? kCombineSlices : 1);
+  combine_kernel<<<grid, kCombineThreads, 0, static_cast<cudaStream_t>(stream)>>>(
       reinterpret_cast<long long *>(acc), shared, static_cast<const __nv_bfloat16 *>(x),
       static_cast<const __nv_bfloat16 *>(w_gate), static_cast<__nv_bfloat16 *>(out));
   return check_launch("ignis_moe_combine");

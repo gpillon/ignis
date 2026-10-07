@@ -316,8 +316,28 @@ int main() {
     vision.size = sizeof(vision);
     vision.vision_max_tokens = 8192;
     const std::string refused = plan(&vision);
-    check(refused.find("Qwen3.8-Flash-Next has no speculative decoding, vision") != std::string::npos,
+    check(refused.find("Qwen3.8-Flash-Next has no vision or attention readouts") != std::string::npos,
           "vision on a Flash-Next load is refused by name: got \"" + refused + "\"");
+    // GitHub #307 (spec flash-next/07): Flash-Next drafts with its MTP head; the 27B's drafter is
+    // refused by name, and so is a row budget no verify round fits.
+    ignis_model_load_options dflash2{};
+    dflash2.size = sizeof(dflash2);
+    dflash2.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
+    dflash2.draft_tokens = 3;
+    const std::string not_ours = plan(&dflash2);
+    check(not_ours.find("DFlash2 is the 27B's drafter") != std::string::npos,
+          "DFlash2 on a Flash-Next load is refused by name: got \"" + not_ours + "\"");
+    ignis_model_load_options verify_only{};
+    verify_only.size = sizeof(verify_only);
+    verify_only.speculative_backend = IGNIS_SPECULATIVE_VERIFY_ONLY;
+    verify_only.draft_tokens = 3;
+    const std::string verified = plan(&verify_only);
+    check(verified == "(planned)" && out.verify_round_bytes > 0,
+          "a verify-only Flash-Next load plans its verify round's line: got \"" + verified + "\"");
+    verify_only.draft_row_budget = 1;
+    const std::string narrow = plan(&verify_only);
+    check(narrow.find("row budget of 1") != std::string::npos,
+          "a row budget that leaves one lane no draft is refused by name: got \"" + narrow + "\"");
     tensors.pop_back();
     const std::string missing = plan(nullptr);
     check(missing.find("bind_flash_next: missing bound tensor") != std::string::npos,

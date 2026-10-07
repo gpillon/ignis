@@ -35,8 +35,9 @@ use ignis_core::ngram_table::NgramTable;
 use ignis_core::residency::device::DeviceResidency;
 use ignis_core::residency::ResidencyMirror;
 use ignis_core::seq::{ArenaBuffer, HostArena, PinnedAllocError, Seq, SeqCheckpoint, SeqPool, SeqPrefix};
+use ignis_core::speculation::{flash_next_window_within, SpeculativeBackend};
 use ignis_core::step;
-use ignis_core::types::{DecodeParams, TokenId};
+use ignis_core::types::{DecodeParams, SpecCounters, TokenId};
 use ignis_core::{ArtifactHash, BlobIdentity};
 
 use crate::{AttentionRead, DecodeLane, LaneRun, ReservedBytes, RuntimeStats, StepLeaf};
@@ -76,6 +77,11 @@ pub struct FlashNextModel {
 pub struct FlashNextSequence {
     seq: Seq<'static>,
     context: NgramContext,
+    /// Spec flash-next/07: the MTP head's drafts for this sequence's next
+    /// verify round, made at the end of its last one; empty after anything
+    /// else moved it (a prefill, a one-token round), so that round runs at
+    /// extent 0 and drafts again.
+    drafts: Vec<u32>,
 }
 
 /// A shared prefix and the n-gram context at its end, which a claimant
@@ -107,7 +113,13 @@ pub struct FlashNextLeaf {
     geometry: FlashNextGeometry,
     config: ModelConfig,
     options: EngineOptions,
-    reader: Reader,
+    /// The artifact's content hash, read at open. The leaf keeps no
+    /// `Reader`: its map of the whole 71.8 GB file made every n-gram row
+    /// read wait in NTFS for the one before it (~0.15 ms a read).
+    artifact_hash: ArtifactHash,
+    /// An MTP load's head (spec flash-next/07), its companion pinned to this
+    /// artifact at open; the model points into it.
+    mtp: Option<ignis_core::flash_next_mtp::MtpHead>,
     /// The weight arena and the device, freed together (`DeviceWeights`).
     weights: DeviceWeights,
 }
@@ -144,6 +156,21 @@ impl FlashNextLeaf {
             0 => None,
             bytes => Some(HostArena::create(bytes)?),
         };
+        let artifact_hash = ArtifactHash::from_bytes(reader.content_hash());
+        let mtp = match options.pool_backend() {
+            Some(_) => {
+                let dir = path.parent().ok_or("the artifact path has no directory")?;
+                Some(ignis_core::flash_next_mtp::MtpHead::load(
+                    &ignis_core::flash_next_mtp::companion_path(dir),
+                    &reader,
+                    &geometry,
+                )?)
+            }
+            None => None,
+        };
+        // Unmapped here: everything after the load reads the file through
+        // its own handles (the n-gram table, nothing else).
+        drop(reader);
         Ok(Self {
             counters,
             arena,
@@ -154,7 +181,8 @@ impl FlashNextLeaf {
             geometry,
             config,
             options,
-            reader,
+            artifact_hash,
+            mtp,
             weights,
         })
     }
@@ -182,6 +210,81 @@ impl FlashNextLeaf {
     /// without one.
     pub fn kv_ram_arena_stats(&self) -> (u64, u64) {
         self.arena.as_ref().map_or((0, 0), |arena| arena.stats())
+    }
+
+    /// A verify round at `window` (spec flash-next/07): each lane's drafts
+    /// the head made at the end of its last round (none after anything else
+    /// moved it: extent 0), every column's n-gram rows hashed on the lane's
+    /// context as if its anchor and drafts were committed in order, and each
+    /// lane's context moved past its committed run.
+    fn verify(
+        &self,
+        model: &FlashNextModel,
+        sequences: &mut [&mut FlashNextSequence],
+        lanes: &[DecodeLane<'_>],
+        window: u32,
+    ) -> Result<Vec<LaneRun>, i32> {
+        let columns = window as usize + 1;
+        let mut drafts: Vec<Vec<i32>> = Vec::with_capacity(sequences.len());
+        let mut column_tokens: Vec<Vec<u32>> = Vec::with_capacity(sequences.len());
+        for sequence in sequences.iter() {
+            let anchor = sequence
+                .seq
+                .pending_token()
+                .ok_or(())
+                .map_err(|()| leaf_error("decode", "a lane was not prefilled".to_string()))? as u32;
+            let proposed: Vec<u32> = sequence.drafts.iter().take(window as usize).copied().collect();
+            let mut tokens = vec![anchor];
+            tokens.extend_from_slice(&proposed);
+            tokens.resize(columns, anchor);
+            drafts.push(proposed.iter().map(|&t| t as i32).collect());
+            column_tokens.push(tokens);
+        }
+        let mut rows = vec![0u8; sequences.len() * columns * self.table.token_bytes()];
+        {
+            let mut scratch: Vec<NgramContext> = sequences.iter().map(|s| s.context.clone()).collect();
+            let mut batch: Vec<(&mut NgramContext, &[u32])> =
+                scratch.iter_mut().zip(&column_tokens).map(|(c, t)| (c, &t[..])).collect();
+            self.table
+                .begin_batch(&mut batch)
+                .and_then(|pending| pending.finish(&mut rows))
+                .map_err(|e| leaf_error("n-gram rows", e))?;
+        }
+        let stop_ids: Vec<Vec<i32>> =
+            lanes.iter().map(|lane| lane.stop_ids.iter().map(|&id| id as i32).collect()).collect();
+        let verify: Vec<step::VerifyLane<'_>> = lanes
+            .iter()
+            .zip(&stop_ids)
+            .zip(&drafts)
+            .map(|((lane, stops), proposed)| step::VerifyLane {
+                sampling: sampling_params(lane.params),
+                remaining_tokens: lane.remaining_tokens,
+                stop_ids: stops,
+                drafts: proposed,
+            })
+            .collect();
+        let mut seqs: Vec<&mut Seq<'static>> = sequences.iter_mut().map(|s| &mut s.seq).collect();
+        let runs = step::decode_flash_next_verify(&model.model, &model.pool, &mut seqs, &verify, window, &rows)
+            .map_err(|e| leaf_error("decode", e))?;
+        let context_tokens = self.table.new_context().recent().len();
+        let mut out = Vec::with_capacity(runs.len());
+        for (sequence, run) in sequences.iter_mut().zip(runs) {
+            let committed: Vec<u32> = run.tokens.iter().map(|&t| t as u32).collect();
+            let mut history = sequence.context.recent().to_vec();
+            history.extend_from_slice(&committed);
+            sequence.context = NgramContext::from_recent(self.table.hasher(), &history[history.len() - context_tokens..])
+                .map_err(|e| leaf_error("n-gram context", e))?;
+            sequence.drafts = run.next_drafts.iter().map(|&t| t as u32).collect();
+            // Committed drafts: the run past its anchor, which a stop cut may
+            // leave shorter than what the target accepted.
+            let accepted = (committed.len() as u32).saturating_sub(1).min(run.extent);
+            out.push(LaneRun {
+                tokens: committed,
+                spec: Some(SpecCounters::round(run.extent, accepted)),
+                drawn_probability: None,
+            });
+        }
+        Ok(out)
     }
 
     fn rows_for(&self, context: &mut NgramContext, tokens: &[u32]) -> Result<Vec<u8>, String> {
@@ -247,10 +350,13 @@ impl StepLeaf for FlashNextLeaf {
             o.kv_format,
             o.decode_lanes,
             &self.residency,
+            o.speculation,
+            self.mtp.as_ref(),
         )
         .map_err(|e| leaf_error("model load", e))?;
         let pool =
-            SeqPool::create(&self.config, &o.pool_budget()).map_err(|e| leaf_error("seq pool create", e))?;
+            SeqPool::create_with_speculation(&self.config, &o.pool_budget(), o.pool_backend())
+                .map_err(|e| leaf_error("seq pool create", e))?;
         let _ = self.layout_version.set(pool.snapshot_format_version());
         if o.capture_graphs {
             let capture = step::capture_decode_graphs(&model, &pool).map_err(|e| leaf_error("graph capture", e))?;
@@ -302,7 +408,7 @@ impl StepLeaf for FlashNextLeaf {
         let seq = model.pool.alloc(context_tokens).map_err(|e| leaf_error("seq alloc", e))?;
         // Safety: as CudaLeaf's -- `RuntimeCompute` releases every live
         // sequence before its `Arc<Model<L>>` (and so the pool) can drop.
-        Ok(FlashNextSequence { seq: unsafe { seq.into_static() }, context: self.table.new_context() })
+        Ok(FlashNextSequence { seq: unsafe { seq.into_static() }, context: self.table.new_context(), drafts: Vec::new() })
     }
 
     fn release_sequence(&self, _model: &Self::Model, _sequence: Self::Sequence) {}
@@ -318,7 +424,7 @@ impl StepLeaf for FlashNextLeaf {
             .alloc_shared(context_tokens, &prefix.prefix)
             .map_err(|e| leaf_error("shared sequence alloc", e))?;
         // Safety: as `allocate_sequence`'s.
-        Ok(FlashNextSequence { seq: unsafe { seq.into_static() }, context: prefix.context.clone() })
+        Ok(FlashNextSequence { seq: unsafe { seq.into_static() }, context: prefix.context.clone(), drafts: Vec::new() })
     }
 
     fn publish_prefix(
@@ -366,7 +472,11 @@ impl StepLeaf for FlashNextLeaf {
         // The leaf's own measure of the claim, as CudaLeaf reports it.
         let micros = checkpoint.checkpoint.stats().last_claim_micros;
         // Safety: as `allocate_sequence`'s.
-        let sequence = FlashNextSequence { seq: unsafe { seq.into_static() }, context: checkpoint.context.clone() };
+        let sequence = FlashNextSequence {
+            seq: unsafe { seq.into_static() },
+            context: checkpoint.context.clone(),
+            drafts: Vec::new(),
+        };
         Ok((sequence, micros.round().max(0.0) as u64))
     }
 
@@ -406,7 +516,7 @@ impl StepLeaf for FlashNextLeaf {
     /// drafter. A 27B blob differs in the artifact and the version both.
     fn blob_identity(&self) -> BlobIdentity {
         BlobIdentity::of_load(
-            ArtifactHash::from_bytes(self.reader.content_hash()),
+            self.artifact_hash,
             self.options.kv_format,
             None,
             self.layout_version.get().copied().unwrap_or(0),
@@ -447,6 +557,7 @@ impl StepLeaf for FlashNextLeaf {
         )
         .map_err(|e| leaf_error("prefill", e))?;
         sequence.context = context;
+        sequence.drafts.clear();
         Ok(drawn)
     }
 
@@ -456,6 +567,28 @@ impl StepLeaf for FlashNextLeaf {
         sequences: &mut [&mut Self::Sequence],
         lanes: &[DecodeLane<'_>],
     ) -> Result<Vec<LaneRun>, i32> {
+        // Spec flash-next/07: a speculative load verifies at its width's
+        // window, unless a lane is constrained (a draft knows nothing of a
+        // set) or has no room for the positions the round writes.
+        if let Some(speculation) = self.options.speculation {
+            let window = speculation.window(sequences.len() as u32);
+            let mtp = speculation.backend() == SpeculativeBackend::Mtp;
+            // The kernel's room is the sequence's own token capacity as well as the
+            // load's context: near the end of either, the window shrinks to what
+            // the tightest lane can write (0: a plain step), never a hard error.
+            let room = sequences
+                .iter()
+                .map(|s| {
+                    let stats = s.seq.stats();
+                    stats.token_capacity.min(u64::from(self.options.max_context_tokens)).saturating_sub(stats.position)
+                })
+                .min()
+                .unwrap_or(0);
+            let window = flash_next_window_within(window, mtp, room);
+            if window > 0 && lanes.iter().all(|lane| lane.permitted.is_empty()) {
+                return self.verify(model, sequences, lanes, window);
+            }
+        }
         // Each lane's pending token, hashed on its own context: the rows the
         // round's n-gram embedding reads for the token it consumes.
         let pending: Vec<[u32; 1]> = sequences
@@ -484,6 +617,7 @@ impl StepLeaf for FlashNextLeaf {
             .map_err(|e| leaf_error("decode", e))?;
         for (sequence, context) in sequences.iter_mut().zip(contexts) {
             sequence.context = context;
+            sequence.drafts.clear();
         }
         Ok(drawn
             .into_iter()
@@ -523,6 +657,7 @@ impl StepLeaf for FlashNextLeaf {
         let (context, blob) = self.read_context(src).map_err(|e| leaf_error("restore", e))?;
         sequence.seq.restore(blob).map_err(|e| leaf_error("restore", e.to_string()))?;
         sequence.context = context;
+        sequence.drafts.clear();
         Ok(())
     }
 }

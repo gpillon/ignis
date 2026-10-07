@@ -522,8 +522,18 @@ struct ignis_decode_options {
   float *out_permitted_probs; /* [batch_size], or NULL */
   /* GitHub #302: on a Flash-Next load, each lane's n-gram table rows for the
    * token this round consumes (its pending token), host `[batch_size][16]
-   * [90]` -- required there, NULL on the 27B. */
+   * [90]` -- required there, NULL on the 27B. GitHub #307: a Flash-Next
+   * verify round's are every column's, `[batch_size][speculative_window + 1]
+   * [16][90]`, hashed on the lane's context as if its anchor and drafts were
+   * committed in order. */
   const uint8_t *ngram_rows;
+  /* GitHub #307 (spec flash-next/07): on a Flash-Next load with the MTP
+   * head, a verify round's drafts for each lane's NEXT round, made by the
+   * head at the lane's new frontier: `[batch_size][speculative_window]`,
+   * lane i's from i * speculative_window. The caller hands them back as that
+   * round's `drafts` (they hold only while the lane stands where this round
+   * left it). -1 on any other load. NULL asks for nothing. */
+  int32_t *out_drafts;
 };
 
 /* Complete one decode round for a batch of sequence handles.  Each output is

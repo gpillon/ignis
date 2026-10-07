@@ -15,6 +15,7 @@ import {
   type Memory,
   type Meter,
   type Ngram,
+  type Speculation,
   RATE_SPAN_MS,
   TOKENS_PER_KV_PAGE,
   TREND_SPAN_MS,
@@ -252,6 +253,9 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
       </div>
 
       <RetainedCard memory={dash.memory} win={win} />
+
+      {/* GitHub #307: only once a verify round ran -- a load without speculation shows nothing of it. */}
+      {dash.speculation && <SpeculationCard speculation={dash.speculation} win={win} />}
 
       {/* GitHub #301, #302: only a Flash-Next load has an expert cache and an n-gram table. */}
       {(dash.experts || dash.ngram) && (
@@ -1037,6 +1041,26 @@ function ExpertsCard({ experts, chart, win }: { experts: Experts; chart: ChartFr
         Hits and misses count selected projections over both phases since start, the window's gain beside them. A slot in use stays in use: an eviction
         hands it to the next projection, so a full pool is the steady state, and the hit rate says whether it holds the right ones.
       </p>
+    </Card>
+  );
+}
+
+/** Speculative decoding (GitHub #307): how many drafts the verify rounds kept, overall and by draft position. */
+function SpeculationCard({ speculation, win }: { speculation: Speculation; win: string }) {
+  const positions = speculation.byPosition
+    .map((share, j) => [`Draft ${j + 1}`, asShare(share)] as [string, string])
+    .filter((_, j) => speculation.byPosition[j] !== null);
+  return (
+    <Card title="Speculation" subtitle={`Drafts the verify rounds committed · last ${win}`}>
+      <Figures
+        items={[
+          ["Acceptance", asShare(speculation.acceptance)],
+          ["Tokens per round", speculation.tokensPerRound === null ? "-" : speculation.tokensPerRound.toFixed(2)],
+          ["Rounds", formatCount(speculation.rounds.window)],
+          ["Drafts committed", formatCount(speculation.accepted.window)],
+        ]}
+      />
+      {positions.length > 0 && <Figures items={positions} />}
     </Card>
   );
 }

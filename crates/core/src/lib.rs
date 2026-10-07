@@ -39,6 +39,8 @@ pub mod concrete;
 pub mod decision;
 #[cfg(feature = "cuda")]
 pub mod flash_next;
+#[cfg(feature = "cuda")]
+pub mod flash_next_mtp;
 pub mod flash_next_counters;
 pub mod gdn;
 #[cfg(feature = "cuda")]
@@ -64,6 +66,8 @@ pub mod prefix;
 pub mod constrained;
 pub mod request;
 pub mod residency;
+#[cfg(all(feature = "cuda", feature = "residual-tap"))]
+pub mod residual_tap;
 pub mod retained_slot;
 pub mod rope_scaling;
 pub mod scheduler;

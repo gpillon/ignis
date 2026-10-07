@@ -30,9 +30,17 @@ use crate::binder::{Binder, MaterializationPlan, ObjectHandle};
 use crate::{fail, NumericFormat, Object, Reader, ResourceEncoding, Result, StorageLayout};
 
 pub mod fixture;
+pub mod mtp;
 
 /// The container identity's `model_id` for every Flash-Next artifact.
 pub const MODEL_ID: &str = "qwen3.8-flash-next";
+
+/// The MTP companion container's `model_id` (layout.md §13.2): never the
+/// main container's, so neither binds as the other.
+pub const MTP_MODEL_ID: &str = "qwen3.8-flash-next-mtp";
+
+/// The MTP head's names keep the checkpoint's own prefix (layout.md §13.3).
+pub const MTP_PREFIX: &str = "mtp.";
 
 /// The frontend resources the converter copies from the checkpoint
 /// (layout.md §8): the 27B's six plus the model config.
@@ -261,6 +269,11 @@ pub fn expert_name(layer: usize, expert: u64, projection: Projection) -> String 
     format!("layers.{layer}.mlp.experts.{expert}.{}", projection.suffix())
 }
 
+/// An MTP expert projection's object name (layout.md §13.3).
+pub fn mtp_expert_name(expert: u64, projection: Projection) -> String {
+    format!("{MTP_PREFIX}layers.0.mlp.experts.{expert}.{}", projection.suffix())
+}
+
 /// The bytes one expert projection of `projection`'s shape stores at `k`:
 /// its trellis, its channel scales, the padding to 4096.
 pub fn record_bytes(geometry: &FlashNextGeometry, projection: Projection, k: TrellisK) -> u64 {
@@ -386,6 +399,39 @@ pub fn ngram_entries(g: &FlashNextGeometry) -> Vec<Entry> {
         host_vector(format!("{prefix}.ngram_heads_offsets"), NumericFormat::I64, ShapeRule::Exact(vec![g.ngram_heads()])),
         host_vector(format!("{prefix}.ngram_embedding.hot_rows"), NumericFormat::I32, ShapeRule::AnyVector),
     ]
+}
+
+/// The MTP head's non-expert tensors (layout.md §13.3): the combine, the
+/// head's own mixer, and its one layer under `mtp.layers.0.`, which is a
+/// trunk attention layer without the n-gram block. Each is the trunk's
+/// entry for the same tensor, so the formats are the trunk's rule.
+pub fn mtp_entries(g: &FlashNextGeometry) -> Vec<Entry> {
+    let mut entries = vec![
+        linear(format!("{MTP_PREFIX}fc_embedding.weight"), g.hidden, g.hidden),
+        linear(format!("{MTP_PREFIX}fc_hidden.weight"), g.hidden, g.hidden),
+        bf16(format!("{MTP_PREFIX}pre_fc_norm_embedding.weight"), &[g.hidden]),
+        bf16(format!("{MTP_PREFIX}pre_fc_norm_hidden.weight"), &[g.hc_width()]),
+    ];
+    let renamed = |mut entry: Entry, from: &str, to: &str| {
+        entry.name = format!("{to}{}", &entry.name[from.len()..]);
+        entry
+    };
+    entries.extend(
+        global_entries(g)
+            .into_iter()
+            .filter(|e| e.name.starts_with("hyper_connection_mixer."))
+            .map(|e| renamed(e, "", MTP_PREFIX)),
+    );
+    let attention_layer = g.full_attention_interval - 1;
+    let from = format!("layers.{attention_layer}.");
+    let to = format!("{MTP_PREFIX}layers.0.");
+    entries.extend(
+        layer_entries(g, attention_layer)
+            .into_iter()
+            .filter(|e| !e.name.starts_with(&format!("{from}ple.")))
+            .map(|e| renamed(e, &from, &to)),
+    );
+    entries
 }
 
 /// A layer's non-expert tensors, in the order the inventory lists them
@@ -830,6 +876,60 @@ mod tests {
         three_layers.layers = 3;
         let err = bind(&reader, &three_layers).unwrap_err().to_string();
         assert!(err.contains("required artifact object is missing: layers.2."), "{err}");
+    }
+
+    /// The MTP head's 29 non-expert tensors are the checkpoint's own `mtp.*`
+    /// names (its 31 tensors less the two fused expert tensors), 16 FP8 and
+    /// 13 BF16 by the trunk's rule (layout.md §13.3).
+    #[test]
+    fn the_mtp_inventory_is_the_checkpoints_head_in_the_trunks_formats() {
+        let g = FlashNextGeometry::qwen38_flash_next();
+        let entries = mtp_entries(&g);
+        let fp8 = [
+            ("mtp.fc_embedding.weight", [2560, 2560]),
+            ("mtp.fc_hidden.weight", [2560, 2560]),
+            ("mtp.hyper_connection_mixer.input_mix_weight_down.weight", [320, 10240]),
+            ("mtp.hyper_connection_mixer.input_mix_weight_up.weight", [10240, 320]),
+            ("mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight", [320, 10240]),
+            ("mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight", [10240, 320]),
+            ("mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight", [320, 10240]),
+            ("mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight", [10240, 320]),
+            ("mtp.layers.0.self_attn.q_proj.weight", [12288, 2560]),
+            ("mtp.layers.0.self_attn.k_proj.weight", [512, 2560]),
+            ("mtp.layers.0.self_attn.v_proj.weight", [512, 2560]),
+            ("mtp.layers.0.self_attn.o_proj.weight", [2560, 6144]),
+            ("mtp.layers.0.self_attn.indexer.index_qk_proj.weight", [640, 2560]),
+            ("mtp.layers.0.mlp.shared_expert.gate_proj.weight", [640, 2560]),
+            ("mtp.layers.0.mlp.shared_expert.up_proj.weight", [640, 2560]),
+            ("mtp.layers.0.mlp.shared_expert.down_proj.weight", [2560, 640]),
+        ];
+        let bf16: [(&str, &[u64]); 13] = [
+            ("mtp.pre_fc_norm_embedding.weight", &[2560]),
+            ("mtp.pre_fc_norm_hidden.weight", &[10240]),
+            ("mtp.hyper_connection_mixer.hc_norm.weight", &[10240]),
+            ("mtp.layers.0.attn_hyper_connection.hc_norm.weight", &[10240]),
+            ("mtp.layers.0.mlp_hyper_connection.hc_norm.weight", &[10240]),
+            ("mtp.layers.0.attn_hyper_connection.block_inject_weight.weight", &[4, 10240]),
+            ("mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight", &[4, 10240]),
+            ("mtp.layers.0.self_attn.q_norm.weight", &[256]),
+            ("mtp.layers.0.self_attn.k_norm.weight", &[256]),
+            ("mtp.layers.0.self_attn.indexer.q_layernorm.weight", &[128]),
+            ("mtp.layers.0.self_attn.indexer.k_layernorm.weight", &[128]),
+            ("mtp.layers.0.mlp.gate.weight", &[512, 2560]),
+            ("mtp.layers.0.mlp.shared_expert_gate.weight", &[1, 2560]),
+        ];
+        assert_eq!(entries.len(), fp8.len() + bf16.len());
+        let find = |name: &str| entries.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} missing"));
+        for (name, shape) in fp8 {
+            let e = find(name);
+            assert_eq!((e.format, &e.shape), (NumericFormat::Fp8E4M3FnRowBf16S, &ShapeRule::Exact(shape.to_vec())), "{name}");
+        }
+        for (name, shape) in bf16 {
+            let e = find(name);
+            assert_eq!((e.format, &e.shape), (NumericFormat::Bf16, &ShapeRule::Exact(shape.to_vec())), "{name}");
+        }
+        assert!(entries.iter().all(|e| e.role == Role::Device));
+        assert_eq!(mtp_expert_name(511, Projection::Down), "mtp.layers.0.mlp.experts.511.down_proj");
     }
 
     #[test]

@@ -72,6 +72,10 @@ pub enum SpeculativeBackend {
     /// [`crate::step::decode_program_verify`] -- the seam a test's fake
     /// drafter fills. Not an operator spelling: [`Self::parse`] refuses it.
     VerifyOnly,
+    /// Qwen3.8-Flash-Next's own draft head, the checkpoint's MTP layer
+    /// (spec flash-next/07, GitHub #307), bound from its companion container.
+    /// Flash-Next's backend only: the 27B keeps DFlash2.
+    Mtp,
 }
 
 impl SpeculativeBackend {
@@ -80,7 +84,8 @@ impl SpeculativeBackend {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
             "dflash2" => Ok(Self::Dflash2),
-            other => Err(format!("unknown speculative backend `{other}` (expected dflash2)")),
+            "mtp" => Ok(Self::Mtp),
+            other => Err(format!("unknown speculative backend `{other}` (expected dflash2 or mtp)")),
         }
     }
 
@@ -88,6 +93,7 @@ impl SpeculativeBackend {
         match self {
             Self::Dflash2 => "dflash2",
             Self::VerifyOnly => "verify-only",
+            Self::Mtp => "mtp",
         }
     }
 
@@ -97,7 +103,95 @@ impl SpeculativeBackend {
         match self {
             Self::Dflash2 => 1,
             Self::VerifyOnly => 2,
+            Self::Mtp => 3,
         }
+    }
+}
+
+/// The most rows a Flash-Next verify round carries (`lanes * (k + 1)`): the
+/// MoE decode route's, the GDN replay record's and the QSA listed decode's
+/// bound (`verify::kMaxRows`, `kernel/src/flash_next/verify.h`).
+pub const FLASH_NEXT_VERIFY_ROWS: u32 = 8;
+
+/// The draft tokens a Flash-Next MTP load verifies per lane at most when
+/// the operator names none (`--spec mtp` alone): phase A's best one-lane
+/// projection at the measured column cost (spec flash-next/07), cut by the
+/// row budget as lanes join.
+pub const FLASH_NEXT_DEFAULT_DRAFT_TOKENS: u32 = 2;
+
+/// The window a Flash-Next round of `lanes` lanes verifies at (spec
+/// flash-next/07): the load's draft tokens, cut so that `lanes * (k + 1)`
+/// stays within the row budget (0, or past [`FLASH_NEXT_VERIFY_ROWS`]: that
+/// bound). 0 means that width runs a one-token round. The leaf's
+/// `verify::window_for` is the same rule; a round asks it for this window.
+pub fn flash_next_window(draft_tokens: u32, row_budget: u32, lanes: u32) -> u32 {
+    if draft_tokens == 0 || lanes == 0 {
+        return 0;
+    }
+    let budget = if row_budget == 0 || row_budget > FLASH_NEXT_VERIFY_ROWS { FLASH_NEXT_VERIFY_ROWS } else { row_budget };
+    let columns = budget / lanes;
+    if columns <= 1 {
+        0
+    } else {
+        draft_tokens.min(columns - 1)
+    }
+}
+
+/// The largest window at most `window` whose round still fits `room`, the
+/// positions the tightest lane has left before its sequence's capacity (or the
+/// load's context): a verify round writes `2 * window` positions under MTP,
+/// `window + 1` otherwise (the kernel's `written_positions`). 0 means not even
+/// a one-draft round fits and the lane runs a plain step, as the 27B clamps its
+/// draft near the end of its extent.
+pub fn flash_next_window_within(window: u32, mtp: bool, room: u64) -> u32 {
+    let fits = if mtp { room / 2 } else { room.saturating_sub(1) };
+    u64::from(window).min(fits) as u32
+}
+
+/// A Flash-Next load's speculation (spec flash-next/07): its backend
+/// ([`SpeculativeBackend::Mtp`], or [`SpeculativeBackend::VerifyOnly`] for a
+/// test's fake drafter), the most drafts a lane verifies per round, and the
+/// row budget that cuts them as lanes join ([`flash_next_window`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashNextSpeculation {
+    backend: SpeculativeBackend,
+    draft_tokens: u32,
+    row_budget: u32,
+}
+
+impl FlashNextSpeculation {
+    /// `draft_tokens` in `1..=MAX_DRAFT_TOKENS`, a row budget of 0 (the
+    /// bound) or 2..=bound; DFlash2 is the 27B's.
+    pub fn new(backend: SpeculativeBackend, draft_tokens: u32, row_budget: u32) -> Result<Self, String> {
+        if backend == SpeculativeBackend::Dflash2 {
+            return Err("DFlash2 is the 27B's drafter; Qwen3.8-Flash-Next drafts with mtp".to_string());
+        }
+        if !(1..=MAX_DRAFT_TOKENS).contains(&draft_tokens) {
+            return Err(format!("draft tokens must be in 1..{MAX_DRAFT_TOKENS}, got {draft_tokens}"));
+        }
+        if row_budget > FLASH_NEXT_VERIFY_ROWS || row_budget == 1 {
+            return Err(format!(
+                "a draft row budget of {row_budget}: 0 (the decode route's {FLASH_NEXT_VERIFY_ROWS}) or 2..{FLASH_NEXT_VERIFY_ROWS}"
+            ));
+        }
+        Ok(Self { backend, draft_tokens, row_budget })
+    }
+
+    pub fn backend(&self) -> SpeculativeBackend {
+        self.backend
+    }
+
+    pub fn draft_tokens(&self) -> u32 {
+        self.draft_tokens
+    }
+
+    pub fn row_budget(&self) -> u32 {
+        self.row_budget
+    }
+
+    /// The window a round of `lanes` lanes verifies at.
+    pub fn window(&self, lanes: u32) -> u32 {
+        flash_next_window(self.draft_tokens, self.row_budget, lanes)
     }
 }
 
@@ -194,7 +288,7 @@ impl Speculation {
     /// [`SpeculativeBackend::VerifyOnly`], which binds no drafter.
     pub fn window_pool_bytes(&self, slot_count: u32) -> u64 {
         match self.backend {
-            SpeculativeBackend::VerifyOnly => 0,
+            SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
             SpeculativeBackend::Dflash2 => {
                 let bf16 = 2;
                 let per_slot = DFLASH2_LAYERS
@@ -217,7 +311,7 @@ impl Speculation {
     pub fn prefill_scratch_bytes(&self, prefill_chunk_tokens: u32) -> u64 {
         match self.backend {
             // No drafter bound, nothing tapped (P5-04, GitHub #153).
-            SpeculativeBackend::VerifyOnly => 0,
+            SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
             SpeculativeBackend::Dflash2 => {
                 let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
                 let i32 = |elements: u64| (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
@@ -245,8 +339,9 @@ impl Speculation {
     /// forward calls into.
     pub fn round_scratch_bytes(&self) -> u64 {
         match self.backend {
-            // The fake drafter proposes from the host: nothing to reserve.
-            SpeculativeBackend::VerifyOnly => 0,
+            // The fake drafter proposes from the host: nothing to reserve
+            // (Flash-Next's MTP sizes its own, spec flash-next/07).
+            SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
             SpeculativeBackend::Dflash2 => {
                 let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
                 let wide = |elements: u64| (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
@@ -316,13 +411,79 @@ mod tests {
     }
 
     #[test]
-    fn only_dflash2_parses() {
+    fn only_dflash2_and_mtp_parse() {
         assert_eq!(SpeculativeBackend::parse("dflash2"), Ok(SpeculativeBackend::Dflash2));
+        assert_eq!(SpeculativeBackend::parse("mtp"), Ok(SpeculativeBackend::Mtp));
+        assert_eq!(SpeculativeBackend::Mtp.abi_code(), 3);
+        assert_eq!(SpeculativeBackend::Mtp.as_str(), "mtp");
         // The verify-only backend is an internal seam (P5-04, GitHub #153),
         // never an operator spelling.
-        for bad in ["mtp", "dflash", "DFLASH2", "", "verify-only"] {
+        for bad in ["MTP", "dflash", "DFLASH2", "", "verify-only"] {
             let err = SpeculativeBackend::parse(bad).expect_err("not a backend");
-            assert!(err.contains("dflash2"), "{err}");
+            assert!(err.contains("dflash2") && err.contains("mtp"), "{err}");
+        }
+    }
+
+    /// Spec flash-next/07: k adapts to the row budget as lanes join -- the
+    /// decode route's 8 rows give a 2-draft load k = 2 at one and two lanes
+    /// and k = 1 at three (phase A's widths), and no draft past four lanes.
+    #[test]
+    fn a_window_shrinks_to_the_room_a_lane_has_left() {
+        // MTP writes 2k positions, verify-only k + 1.
+        assert_eq!(flash_next_window_within(3, true, 100), 3);
+        assert_eq!(flash_next_window_within(3, true, 6), 3, "exactly 2k fits");
+        assert_eq!(flash_next_window_within(3, true, 5), 2);
+        assert_eq!(flash_next_window_within(3, true, 1), 0, "no room for a draft: a plain step");
+        assert_eq!(flash_next_window_within(3, false, 4), 3, "exactly k + 1 fits");
+        assert_eq!(flash_next_window_within(3, false, 3), 2);
+        assert_eq!(flash_next_window_within(3, false, 1), 0);
+        assert_eq!(flash_next_window_within(3, false, 0), 0, "a full lane never underflows");
+        for mtp in [false, true] {
+            for window in 0..=7 {
+                for room in 0..=20u64 {
+                    let k = flash_next_window_within(window, mtp, room);
+                    assert!(k <= window);
+                    let written = if mtp { 2 * k } else { k + 1 };
+                    assert!(k == 0 || u64::from(written) <= room, "k={k} mtp={mtp} room={room}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_flash_next_window_fits_the_row_budget() {
+        let widths = |draft, budget| (1..=8).map(|lanes| flash_next_window(draft, budget, lanes)).collect::<Vec<_>>();
+        assert_eq!(widths(2, 0), [2, 2, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(widths(3, 8), [3, 3, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(widths(7, 0), [7, 3, 1, 1, 0, 0, 0, 0]);
+        // A budget of 6 rows: one lane k = 5 at most, two lanes 2, three 1.
+        assert_eq!(widths(7, 6), [5, 2, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(widths(1, 2), [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(flash_next_window(0, 8, 1), 0, "no draft tokens, no window");
+        // Every window fits the bound.
+        for draft in 1..=MAX_DRAFT_TOKENS {
+            for budget in 0..=FLASH_NEXT_VERIFY_ROWS {
+                for lanes in 1..=8 {
+                    let k = flash_next_window(draft, budget, lanes);
+                    assert!(k <= draft && (k == 0 || lanes * (k + 1) <= FLASH_NEXT_VERIFY_ROWS), "{draft} {budget} {lanes}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flash_next_speculation_refuses_dflash2_and_out_of_range_options() {
+        let spec = FlashNextSpeculation::new(SpeculativeBackend::Mtp, 3, 6).expect("valid");
+        assert_eq!((spec.window(1), spec.window(2), spec.window(3)), (3, 2, 1));
+        let err = FlashNextSpeculation::new(SpeculativeBackend::Dflash2, 3, 0).expect_err("the 27B's drafter");
+        assert!(err.contains("DFlash2") && err.contains("mtp"), "{err}");
+        for draft in [0, 8] {
+            let err = FlashNextSpeculation::new(SpeculativeBackend::Mtp, draft, 0).expect_err("out of range");
+            assert!(err.contains("1..7"), "{err}");
+        }
+        for budget in [1, 9] {
+            let err = FlashNextSpeculation::new(SpeculativeBackend::VerifyOnly, 2, budget).expect_err("bad budget");
+            assert!(err.contains(&budget.to_string()) && err.contains("2..8"), "{err}");
         }
     }
 

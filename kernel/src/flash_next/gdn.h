@@ -48,6 +48,9 @@ inline constexpr int32_t kConvChannels = 2 * kKeyWidth + kValueWidth;  // 10240
 inline constexpr int32_t kConvStateTaps = kConvKernel - 1;       // 3
 // The vendored snapshot forms take at most this many lanes at one token each.
 inline constexpr int32_t kMaxLanes = 8;
+// A verify call's columns per lane: the vendored replay record's domain.
+inline constexpr int32_t kMinRecordColumns = 2;
+inline constexpr int32_t kMaxRecordColumns = 16;
 
 // One GDN layer's lane states, every slot (the seq pool's gdn_pool layer, or a test's buffers).
 struct State {
@@ -61,7 +64,8 @@ const char *check_geometry(const Geometry &g);
 
 // y = the layer core of x for the batch, advancing the lanes' states at batch.slots. x, y: BF16
 // [rows][hidden]. 0, or -1 with fn_set_error.
+// `ordinal` is the layer's GDN ordinal: where a verify call's records go (Batch::verify).
 int32_t run(const Geometry &g, const State &state, const GdnWeights &w, const Batch &batch,
-            const void *x, void *y, ninfer::DeviceArena &scratch, cudaStream_t stream);
+            const void *x, void *y, ninfer::DeviceArena &scratch, cudaStream_t stream, int32_t ordinal = 0);
 
 }  // namespace ignis::flash_next::gdn

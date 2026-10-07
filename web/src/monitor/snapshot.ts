@@ -97,6 +97,22 @@ export type ExpertPhase = (typeof EXPERT_PHASES)[number];
 export const NGRAM_SOURCES = ["hot", "file"] as const;
 export type NgramSource = (typeof NGRAM_SOURCES)[number];
 
+/** The draft positions a verify round can carry (MAX_DRAFT_TOKENS): the per-position families' labels "1".."7". */
+export const DRAFT_POSITIONS = 7;
+
+/**
+ * Speculative decoding (GitHub #307): verify rounds, drafts verified and
+ * committed, and per draft position how many rounds proposed it and committed
+ * it. Absent until a request that ran verify rounds ended.
+ */
+export type Speculation = {
+  rounds: number | null;
+  drafted: number | null;
+  accepted: number | null;
+  positionDrafted: (number | null)[];
+  positionAccepted: (number | null)[];
+};
+
 /** One expert-cache family: a count per K class and phase. */
 export type ClassPhaseMatrix = Record<ExpertClass, Record<ExpertPhase, number | null>>;
 
@@ -148,6 +164,8 @@ export type Snapshot = {
   experts: ExpertResidency | null;
   /** Null on a load without an n-gram table: a 27B load. */
   ngram: Ngram | null;
+  /** Null until a request that ran verify rounds ended, or on a load without speculation. */
+  speculation: Speculation | null;
   ttft: Histogram | null;
   duration: Histogram | null;
   unknown: Sample[];
@@ -195,6 +213,15 @@ const NGRAM_FAMILIES = {
   readBytes: "ignis_ngram_read_bytes_total",
 } as const;
 
+/** The speculative families (GitHub #307). */
+const SPEC_FAMILIES = {
+  rounds: "ignis_speculative_rounds_total",
+  drafted: "ignis_speculative_drafted_tokens_total",
+  accepted: "ignis_speculative_accepted_tokens_total",
+  positionDrafted: "ignis_speculative_position_drafted_total",
+  positionAccepted: "ignis_speculative_position_accepted_total",
+} as const;
+
 /** The typed primitives a decision's question asks for (GitHub #241, ADR 0034). */
 export const DECISION_TYPES = ["noul", "choice", "score"] as const;
 export type DecisionType = (typeof DECISION_TYPES)[number];
@@ -217,6 +244,7 @@ const KNOWN = new Set<string>([
   ...Object.values(RETAINED_FAMILIES),
   ...Object.values(EXPERT_FAMILIES),
   ...Object.values(NGRAM_FAMILIES),
+  ...Object.values(SPEC_FAMILIES),
 ]);
 
 const emptyMatrix = (): RetainedMatrix =>
@@ -250,6 +278,7 @@ export function emptySnapshot(): Snapshot {
     },
     experts: null,
     ngram: null,
+    speculation: null,
     ttft: null,
     duration: null,
     unknown: [],
@@ -318,6 +347,18 @@ export function readSnapshot({ families }: Exposition): Snapshot {
     };
   }
 
+  if (families.has(SPEC_FAMILIES.rounds)) {
+    const positions = (family: string) =>
+      Array.from({ length: DRAFT_POSITIONS }, (_, j) => valueOf(family, ["position", String(j + 1)]));
+    snap.speculation = {
+      rounds: valueOf(SPEC_FAMILIES.rounds),
+      drafted: valueOf(SPEC_FAMILIES.drafted),
+      accepted: valueOf(SPEC_FAMILIES.accepted),
+      positionDrafted: positions(SPEC_FAMILIES.positionDrafted),
+      positionAccepted: positions(SPEC_FAMILIES.positionAccepted),
+    };
+  }
+
   snap.ttft = readHistogram(samples("ignis_request_ttft_seconds"), "ignis_request_ttft_seconds");
   snap.duration = readHistogram(samples("ignis_request_duration_seconds"), "ignis_request_duration_seconds");
   snap.unknown = [...families.values()].flatMap((f) => f.samples.filter((s) => !inContract(f.name, s)));
@@ -363,6 +404,11 @@ function inContract(family: string, s: Sample): boolean {
       return oneOf(EXPERT_CLASSES, s.labels.class) && (s.labels.state === "capacity" || s.labels.state === "in_use") && Object.keys(s.labels).length === 2;
     case NGRAM_FAMILIES.rows:
       return oneOf(NGRAM_SOURCES, s.labels.source) && Object.keys(s.labels).length === 1;
+    case SPEC_FAMILIES.positionDrafted:
+    case SPEC_FAMILIES.positionAccepted: {
+      const position = Number(s.labels.position);
+      return Number.isInteger(position) && position >= 1 && position <= DRAFT_POSITIONS && Object.keys(s.labels).length === 1;
+    }
     default:
       return Object.keys(s.labels).length === 0;
   }
@@ -387,6 +433,9 @@ export function counterValues(s: Snapshot): (number | null)[] {
     ...NGRAM_SOURCES.map((source) => s.ngram?.rows[source] ?? null),
     s.ngram?.reads ?? null,
     s.ngram?.readBytes ?? null,
+    s.speculation?.rounds ?? null,
+    s.speculation?.drafted ?? null,
+    s.speculation?.accepted ?? null,
     s.ttft?.count ?? null,
     s.duration?.count ?? null,
   ];

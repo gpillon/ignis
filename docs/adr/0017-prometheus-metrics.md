@@ -286,6 +286,11 @@ The initial stable metric contract is:
 | `ignis_ngram_rows_total` | counter | `source=hot\|file` | Flash-Next: n-gram embedding rows staged for prefill spans and decode rounds, from the RAM hot-row cache or the artifact file (#302). A hot-row hit rate is `source="hot"` over the sum |
 | `ignis_ngram_reads_total` | counter | none | Flash-Next: reads issued to the artifact file for rows the hot-row cache did not hold (#302) |
 | `ignis_ngram_read_bytes_total` | counter | none | Flash-Next: bytes of those reads (#302) |
+| `ignis_speculative_rounds_total` | counter | none | Verify rounds run on requests that ended, summed (#307). **Absent until a request that ran one ends** |
+| `ignis_speculative_drafted_tokens_total` | counter | none | Draft tokens those rounds verified (#307). Acceptance is accepted over drafted. **Absent until the first round** |
+| `ignis_speculative_accepted_tokens_total` | counter | none | Draft tokens those rounds committed (#307). **Absent until the first round** |
+| `ignis_speculative_position_drafted_total` | counter | `position=1..k` | Rounds that proposed a draft at that position of the window (#307). **Absent until the first round** |
+| `ignis_speculative_position_accepted_total` | counter | `position=1..k` | Rounds that committed the draft at that position (#307). **Absent until the first round** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
 reserved lines (eleven, twelve since #257 added `hq_residual_window`), the budget, the KV pool's pages and page bytes, the
@@ -293,8 +298,8 @@ pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
 capacity and use, and the retained-slot skips. Every one is bytes, pages or
 slots; no percentage is exported.
 
-**The decision family is absent when it is zero (#241)**, and so is the
-forced-close counter (#265), for the same reason: a load whose traffic never
+**The decision family is absent when it is zero (#241)**, and so are the
+forced-close counter (#265) and the speculative family (#307), for the same reason: a load whose traffic never
 reaches its thinking budget is a normal one. Every other series is exported
 from the first scrape, zeros included, because a zero is a reading. A decision's are not exported until a
 decision has been served, and that is this ADR's other rule — *only

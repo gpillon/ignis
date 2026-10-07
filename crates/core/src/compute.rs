@@ -803,9 +803,13 @@ impl ModelFamily {
         self == ModelFamily::Qwen38_27b
     }
 
-    /// Whether the model has a speculative backend (the DFlash2 drafter).
-    pub fn speculates(self) -> bool {
-        self == ModelFamily::Qwen38_27b
+    /// The model's speculative backend: the 27B's DFlash2 drafter, or
+    /// Flash-Next's own MTP head (spec flash-next/07).
+    pub fn drafter(self) -> crate::SpeculativeBackend {
+        match self {
+            ModelFamily::Qwen38_27b => crate::SpeculativeBackend::Dflash2,
+            ModelFamily::FlashNext => crate::SpeculativeBackend::Mtp,
+        }
     }
 
     /// The model's name, as a refusal names it to a client.
@@ -1316,14 +1320,17 @@ mod tests {
     }
 
     /// What each model can serve beyond text: Flash-Next has no vision
-    /// tower, no readouts and no speculative decoding (spec flash-next/04,
-    /// Out of Scope).
+    /// tower and no readouts (spec flash-next/04, Out of Scope), and drafts
+    /// with its own MTP head where the 27B drafts with DFlash2 (spec
+    /// flash-next/07).
     #[test]
     fn flash_next_serves_text_only() {
         let dense = ModelFamily::Qwen38_27b;
-        assert!(dense.takes_images() && dense.serves_readouts() && dense.speculates());
+        assert!(dense.takes_images() && dense.serves_readouts());
+        assert_eq!(dense.drafter(), crate::SpeculativeBackend::Dflash2);
         let flash = ModelFamily::FlashNext;
-        assert!(!flash.takes_images() && !flash.serves_readouts() && !flash.speculates());
+        assert!(!flash.takes_images() && !flash.serves_readouts());
+        assert_eq!(flash.drafter(), crate::SpeculativeBackend::Mtp);
     }
 
     const MIB: u64 = 1024 * 1024;

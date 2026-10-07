@@ -140,6 +140,15 @@ When output names a domain concept, use the term as defined here.
 - **N-gram table** — Flash-Next's hashed n-gram embedding table (320M rows,
   INT4), a **host-streamed** object: read row by row from NVMe through a RAM
   hot-row cache, never materialized on the device.
+- **MTP head** — the checkpoint's own one-layer draft head (spec
+  `flash-next/07`): it combines the trunk's pre-mixer streams with the next
+  token's embedding and drafts the token after it.
+- **Companion container** — a small `.ninfer` beside the main one that holds
+  only the MTP head (layout.md §13), with its own identity; bound only when
+  MTP is on.
+- **Pair pin** — the companion's record of the one main container it belongs
+  to (`model_id`, `weights_id`, content hash), checked at load; a mismatched
+  pair is refused by name.
 
 ## Weights & artifact
 

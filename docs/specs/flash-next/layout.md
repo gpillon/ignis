@@ -30,6 +30,7 @@ F:/ai/models/Qwen3.8-Flash-Next-ignis/
   traces/                       routing traces per domain (§12)
   report.txt                    the plain end-of-run report
   convert.log                   one progress line per layer
+  qwen3_8_flash_next_mtp_3p0-v2.ninfer (+ .conversion.json), work-mtp/   the MTP companion (§13)
 ```
 
 - The container's identity is `model_id` `qwen3.8-flash-next`, `weights_id`
@@ -229,7 +230,8 @@ The FP8 parts the study did not measure are measured in the pass: the FP8-only s
 quantized stream's, the head's FP8 cost is isolated, and an FP8-only KLD above 0.01 on
 any domain is flagged in the report. Moving a part to BF16 is a re-conversion.
 
-Not converted: `model.visual.*` (vision is out of this spec), `mtp.*` (out of scope).
+Not converted: `model.visual.*` (vision is out of this spec). `mtp.*` goes to the companion
+container (§13), never to this one.
 
 ### 6.3 Files
 
@@ -490,3 +492,169 @@ the test chunks'), so a replay keys a chunk by (set, index) and resets its state
 chunk boundary. Residency takes the first W (default 16) lookahead ids, and its pool sizes
 and warm-start order from `converter.json`'s `k_map`, `k_classes[].record_bytes` and
 `expert_traffic`.
+
+## 13. The MTP companion container (spec 07, phase B)
+
+The checkpoint's MTP head (31 `mtp.*` tensors, 5.21 GB BF16) is converted into a **second,
+small container beside the main one**. The main container is never touched: appending to it
+would be a re-conversion (this document's rule) and would change the identity the owner
+accepted. A later phase of spec 07 merges the two.
+
+### 13.1 Files
+
+```
+F:/ai/models/Qwen3.8-Flash-Next-ignis/
+  qwen3_8_flash_next_mtp_3p0-v2.ninfer                   the companion container (the packer's)
+  qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json   its sidecar (§13.5)
+  work-mtp/                                              the head converter's work tree, consumed by the packer
+    converter.json                                       the converter half of the sidecar
+    mtp/                                                 the one unit: tensors.json + its files, experts.bin, experts.idx, DONE
+    state/                                               the head converter's own records (never read by the packer)
+```
+
+- One unit, `mtp/`, under the §2 completion protocol, packed like a layer directory:
+  `tensors.json` objects first, then the 1024 expert records in index order.
+- The packer is the same binary in a companion mode; its header reservation is 1 MiB (the
+  directory is ~0.2 MB), not the main container's 64 MiB.
+
+### 13.2 Identity and the pair pin
+
+- `model_id` **`qwen3.8-flash-next-mtp`**, `weights_id` **`mtp-trellis-a30-fp8rows-de4b8e4`**.
+  The `model_id` differs from the main container's on purpose: a load handed the companion
+  as a model is refused at the identity check, not deep in the bind.
+- **The pair pin.** The companion belongs to exactly one main container. Its sidecar records
+  that container (§13.5 `pair.main`): `model_id`, `weights_id`, `content_hash` and the whole
+  file's `file_sha256`. Hashes are compared, never file names:
+  - **At pack time** the converter has recorded the `file_sha256` of the main container it
+    calibrated on; the packer hashes the main container it is pointed at and refuses a
+    different or missing value. It writes `model_id`, `weights_id`, `bytes`, `objects`,
+    `content_hash` and `file_sha256` from that container.
+  - **At load** the loader that binds the head (with `--speculative mtp` only), before it
+    reads any byte of the head, compares `model_id`, `weights_id` and `content_hash` with
+    the opened main container's (`content_hash` is `ignis_artifact::Reader::content_hash` as
+    lowercase hex: the directory hash the Flash-Next leaf already computes at load for its
+    retained state). It refuses a mismatch **by name**: the field, the recorded value, the
+    main container's value. A companion without its sidecar, or a sidecar without
+    `pair.main`, is refused the same way.
+  - **Offline** the head converter's verify re-hashes the main container's file (§13.6).
+- A load does not hash the 71.8 GB file: that is not a price a compatibility check may charge
+  (`content_hash`'s own rationale). The load check's known limit is therefore
+  `content_hash`'s: a re-quantization that kept every name, format, shape and offset of the
+  main container passes it. A mismatched pair costs acceptance, never correctness: the verify
+  round decides every token.
+
+### 13.3 Objects
+
+Every name is the checkpoint's own, **verbatim, `mtp.` prefix kept** (there is no
+`model.language_model.` prefix to strip). The 31 checkpoint tensors become **1053 objects**:
+29 non-expert tensors and 1024 expert projections.
+
+**Expert projections** (§3 and §4 unchanged). The fused checkpoint tensors
+`mtp.layers.0.mlp.experts.gate_up_proj` `[512, 1280, 2560]` and `.down_proj` `[512, 2560, 640]`
+become `mtp.layers.0.mlp.experts.{E}.gate_up_proj` `[1280, 2560]` and
+`mtp.layers.0.mlp.experts.{E}.down_proj` `[2560, 640]`, E = 0..511:
+- the trunk's record format, the same format codes `TRELLIS_MUL1_K2/K2P5/K3/K4`, the same
+  eight K classes and record bytes, layout `trellis-tile16-v1`, 4096-aligned;
+- `experts.idx` and `experts.bin` are §4's files for this one layer.
+
+**Non-expert tensors**: the §6.1 encodings, chosen by §6.2's rule on the layer-local name,
+so exactly the trunk's choice for the same tensor (all names end in `.weight`):
+
+| format | tensors |
+|---|---|
+| FP8 row-scale (16) | `mtp.fc_embedding` [2560,2560], `mtp.fc_hidden` [2560,2560]; `mtp.hyper_connection_mixer.input_mix_weight_down` [320,10240] and `_up` [10240,320]; the same pair for `mtp.layers.0.attn_hyper_connection` and `mtp.layers.0.mlp_hyper_connection`; `mtp.layers.0.self_attn.q_proj` [12288,2560], `k_proj` [512,2560], `v_proj` [512,2560], `o_proj` [2560,6144], `self_attn.indexer.index_qk_proj` [640,2560]; `mtp.layers.0.mlp.shared_expert.gate_proj` [640,2560], `up_proj` [640,2560], `down_proj` [2560,640] |
+| BF16 (13) | `mtp.pre_fc_norm_embedding` [2560], `mtp.pre_fc_norm_hidden` [10240] (4 groups of 2560, one per stream); the `hc_norm` [10240] of `mtp.hyper_connection_mixer`, `mtp.layers.0.attn_hyper_connection` and `mtp.layers.0.mlp_hyper_connection`; the two `block_inject_weight` [4,10240]; `mtp.layers.0.self_attn.q_norm`, `k_norm` [256]; `self_attn.indexer.q_layernorm`, `k_layernorm` [128]; the router `mtp.layers.0.mlp.gate` [512,2560]; `mtp.layers.0.mlp.shared_expert_gate` [1,2560] |
+
+- The token embedding and the output head are not in the companion: the head uses the main
+  container's `embed_tokens.weight` and `lm_head.weight` (the config's
+  `mtp_use_dedicated_embeddings: False`; the checkpoint has no `mtp.embed_tokens` or
+  `mtp.lm_head`).
+- Sizes: non-experts ~91 MB; experts ~0.95 GB at the 3.0-bit mean.
+
+### 13.4 Experts: budget and calibration
+
+- **Budget 3.0** bits per weight (owner, 2026-10-06). §5's rate: the mean over the 512
+  experts is **≤ 3.0 separately for `gu` and for `dn`**, K ∈ {2, 2.5, 3, 4}. The trunk's
+  Lagrangian allocation, quantizer and settings (§3) are unchanged.
+- **Hessians from the engine's states.**
+  - The served engine (the main container, hq-e8-2b KV) prefills the trunk's calibration
+    corpus (the 224 calibration chunks of `corpus_manifest.json`, each chunk's `valid`
+    tokens) with the residual tap (`crates/core/src/residual_tap.rs`) armed.
+  - Entry p is built from the tapped pre-mixer stack `S_p` and token p+1 by spec 07's
+    convention (comb a, norm a), with the main container's token embedding (FP8 decoded,
+    as served): only `mtp.*` is fetched from the checkpoint. The BF16 head layer runs
+    each chunk causally, dense: a chunk of ≤ 2,048 tokens gives ≤ 2,047 entries, under
+    the 2,051-token threshold where the indexer starts to select.
+  - The tap records what the states came from (`tap.json`: the container, its directory,
+    the KV format); the converter refuses states tapped from another file than the main
+    container it pairs the head with.
+  - The MoE sublayer's inputs and router top-10 over those entries feed the trunk's rule:
+    g²-weighted Hessians per expert, shrink 0.05 toward the layer H (gate/up) and the
+    identity (down), and the zero-token fallback (the layer H; the down activations' second
+    moment over the first 64K calibration tokens).
+  - First-step entries only (draft 1): a chained draft's input is not in the calibration.
+- **Error.** The MoE error on the entries of the 66 test chunks, as §9's `moe_error_db`
+  (there is no run 6 / run 8 baseline for this layer).
+- **Seeds:** `48 · 10000 + 1000 · proj + e` (proj 0 = gu, 1 = dn): the trunk's rule at
+  layer index 48, so no MTP seed equals a trunk layer's.
+
+### 13.5 The sidecar
+
+`<companion>.conversion.json` is `work-mtp/converter.json` merged with the packer's keys
+(`recipe_id`, `artifact.bytes`, `objects.count`, as in §9). The packer is pointed at the main
+container, opens it with the reader and writes `pair.main`'s fields itself (Rust computes the
+`content_hash` the binder compares), after checking its `file_sha256` against the
+converter's (§13.2). The converter writes the rest:
+
+```jsonc
+{
+  "schema": "flash-next-mtp-converter-v1",
+  "status": "complete",
+  "source": {"repo": "Qwen/Qwen3.8-Flash-Next", "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+             "tensors": 31, "prefix": "mtp."},
+  "pair": {"main": {"file": "qwen3_8_flash_next_trellis_a25-v2.ninfer",
+                    "model_id": "qwen3.8-flash-next", "weights_id": "trellis-a25-fp8rows-q4g32-de4b8e4",
+                    "bytes": 71760711680, "objects": 50231,
+                    "content_hash": "<64 hex: Reader::content_hash>",
+                    "file_sha256": "<64 hex: offline check only>"}},
+  "head": {"comb": "a", "norm": "a", "chain": "a", "idx": "own"},   // spec 07's phase A conventions
+  "converter": {"commit": "...", "dirty": false, "command": "<argv>", "seed_rule": "48*10000 + 1000*proj + e"},
+  "versions": {"exllamav3": "1.5.3", "transformers": "5.17.0", "torch": "...", "python": "..."},
+  "quantizer": {"codebook": "mul1", "apply_out_scales": true, "K_set": [2, 2.5, 3, 4], "budget_bits": 3.0,
+                "hessian": "...", "batch": 32, "hessian_fallback": [expert ids]},
+  "verdict": "PASS",                                               // the rates within the budget
+  "calibration": {"source": "engine residual tap", "artifact": "<main file>", "kv_format": "hq-e8-2b",
+                  "embed_tokens": "the main container's (FP8 decoded)",
+                  "chunks": 224, "entries": n, "test_chunks": 66, "test_entries": n, "steps": [1]},
+  "k_map": {"gu": [k2 x 512], "dn": [k2 x 512]},
+  "k_hist": {"gu": {"2": n, "2.5": n, "3": n, "4": n}, "dn": {...}},
+  "rates": {"gu": ..., "dn": ..., "gu_stored": ..., "dn_stored": ...},
+  "k_classes": [{"class": "gu-3", "k2": 6, "projections": n, "record_bytes": 1236992, "selections": n,
+                 "traffic_share": ...}],
+  "expert_traffic": [n x 512],                                      // calibration selections per expert
+  "curve_db": {"gu": [4 x dB], "dn": [...]}, "unrouted": {"gu": n, "dn": n},   // the K sweep, as layer.json's
+  "moe_error_db": {"db": ..., "per_kind_db": {"<kind>": ...}},
+  "experts_bin": {"bytes": n, "sha256": "..."},
+  "decode_sha256": [{"class": "gu-3", "proj": "gu", "k2": 6, "expert": e, "sha256": "..."}],  // all 1024
+  "self_check": {"work_files": "...", "container": "..."},
+  // written by the head converter's alpha step, after packing (the packer keeps the key):
+  "acceptance": {"trunk": "bf16", "alpha_bf16": [0.828, 0.800, 0.811, 0.821], "alpha_quantized": [...],
+                 "delta_alpha1": [mean, 95% half-width], "limit": 0.03, "pass": true,
+                 "windows": "spec 07 phase A's 16 texts", "by_class": {...}, "index_long": {...}},
+  "acceptance_served": {...},              // the same with the main container's FP8 embed and lm_head
+  "time_s": {...}
+}
+```
+
+### 13.6 Checks
+
+- The packer refuses a `tensors.json` name outside `mtp.`, an `experts.idx` out of its class
+  sizes (§4) and a unit whose `DONE` does not match, as for the main container, and a
+  `converter.json` whose `pair.main.file_sha256` is missing or is not the main container's.
+- The head converter's verify, after packing: all 1024 expert projections decoded from the
+  companion's bytes equal `decode_sha256` bit for bit, and `pair.main.file_sha256` equals
+  the main container's file.
+- AC2 (spec 07): with phase A's BF16 embedding and output head, the quantized head's α₁ on
+  phase A's texts is within 0.03 of the BF16 head's (`acceptance.pass`).
+- The binder (spec 07's Rust seam) checks the identity and the pair pin of §13.2, and every
+  one of the 1053 objects with its format and shape, nothing more (ADR 0002).

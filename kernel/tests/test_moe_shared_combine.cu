@@ -10,7 +10,8 @@
 //   combine   acc * 2^-32 + sigmoid(x . w_gate) * shared, rounded once to BF16, against fp64:
 //             within BF16's half ulp (at most 2^-8 relative) plus the fp32 terms (the gate's dot product bound times
 //             |shared|, one rounding each of the conversion and the fma). The accumulator reads
-//             back as zero.
+//             back as zero. A decode-width call (each row spread over several CTAs) gives a
+//             token the same bits as a wide one.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
@@ -122,6 +123,19 @@ void combine_arm(int tokens) {
   }
   std::printf("  combine x %4d tokens: %d outputs over bound\n", tokens, bad);
   check(bad == 0, "combine within bound of fp64 (" + std::to_string(tokens) + " tokens)");
+
+  if (tokens > IGNIS_MOE_DECODE_MAX_TOKENS) {
+    const int few = 3;
+    upload(da, acc);
+    DeviceBytes dfew(static_cast<std::size_t>(few) * H * 2);
+    MOE_RC(ignis_moe_combine(da.as<int64_t>(), ds.as<float>(), dx.p, dwg.p, few, dfew.p, nullptr));
+    MOE_CUDA(cudaDeviceSynchronize());
+    const auto narrow = download<uint16_t>(dfew.p, static_cast<std::size_t>(few) * H);
+    int differ = 0;
+    for (std::size_t i = 0; i < narrow.size(); ++i) differ += narrow[i] != out[i];
+    std::printf("  combine x %4d tokens at decode width: %d outputs differ from the wide call\n", few, differ);
+    check(differ == 0, "a decode-width combine gives the wide call's bits");
+  }
 }
 
 }  // namespace

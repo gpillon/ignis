@@ -4,10 +4,12 @@
 // One forward, for a prefill chunk and a decode round alike: embed the call's ids into every
 // hyper-connection stream, then per decoder layer
 //   the n-gram embedding (its layer only), the attention mix, GDN or (the indexer's selection,
-//   then QSA attention), the inject; the MoE mix, this layer's router, the next layer's router
-//   on the same input (the lookahead residency ranks), the residency step, the routed experts
-//   (the decode route for a round, the prefill route for a chunk), the shared expert, the
-//   combine, the inject;
+//   then QSA attention), the inject; the MoE mix, this layer's router, the residency step's
+//   demand half, the routed experts (the decode route for a round, the prefill route for a
+//   chunk), the combine, the inject -- and beside them, the shared expert on a branch of its
+//   own (forked after the mix, joined at the combine) and, on the branch residency forks, the
+//   next layer's router on the same input (the lookahead residency ranks) and the step's
+//   prefetch half;
 // then the head (the final mixer and lm_head) on the rows that are drawn from.
 //
 // A chunk is one lane of up to prefill_chunk_tokens tokens, run eagerly out of the handle's
@@ -24,8 +26,11 @@
 #include "hc.h"
 #include "indexer.h"
 #include "qsa.h"
+#include "mtp.h"
 #include "qsa_sparse.h"
+#include "verify.h"
 
+#include "ignis_fn_residual_tap.h"
 #include "ignis_fp8_linear.h"
 #include "ignis_seq_internal.h"
 #include "../permitted_tokens.h"
@@ -54,12 +59,16 @@ std::size_t aligned(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 // time, their logits in the chunk's scratch, then copied out.
 constexpr int32_t kSpanLogitRows = 32;
 
+}  // namespace
+
 // The KV positions a decode round's indexer and attention are sized for: the context, past the
 // dense threshold so a round is never dense (flash_next_internal.h: a decode graph's selection is
 // always written).
 int32_t decode_max_visible(const FlashNextModel &fn) {
   return std::max<int32_t>(static_cast<int32_t>(fn.max_context_tokens), fn.g.dense_threshold() + 1);
 }
+
+namespace {
 
 // The ops' peak in the arena over one call of `rows` rows, `tokens` per lane, at most
 // `max_visible` visible positions. The ops run one after another, each in its own scope; only
@@ -84,15 +93,31 @@ std::size_t call_scratch_bytes(const Geometry &g, int32_t kv_format, int32_t row
   return peak + 4096;
 }
 
+int32_t attention_layers(const FlashNextModel &fn) {
+  int32_t n = 0;
+  for (const LayerWeights &layer : fn.weights->layers) n += layer.attention ? 1 : 0;
+  return n;
+}
+
+int32_t gdn_layers(const FlashNextModel &fn) {
+  return static_cast<int32_t>(fn.weights->layers.size()) - attention_layers(fn);
+}
+
+// The pool's attention sections: the trunk's, and an MTP load's head one past them.
+int32_t attention_sections(const FlashNextModel &fn) { return attention_layers(fn) + (fn.mtp != nullptr ? 1 : 0); }
+
 Sizes plan_sizes(const FlashNextModel &fn) {
   const Geometry &g = fn.g;
   Sizes s;
   const auto chunk = static_cast<int32_t>(fn.prefill_chunk_tokens);
   const auto lanes = static_cast<int32_t>(fn.decode_lanes);
+  // A decode call's rows: a round's lanes, or a verify round's columns (whose hq rows are the
+  // listed ones, as a round's: sized as one-token rows).
+  const auto decode_rows = static_cast<int32_t>(fn.decode_rows);
   s.prefill_scratch = call_scratch_bytes(g, fn.kv_format, chunk, chunk, static_cast<int32_t>(fn.max_context_tokens),
                                          /*span_head=*/true);
-  s.decode_scratch = call_scratch_bytes(g, fn.kv_format, lanes, 1, decode_max_visible(fn), /*span_head=*/false) +
-                     fn_head_scratch_bytes(g, lanes);
+  s.decode_scratch = call_scratch_bytes(g, fn.kv_format, decode_rows, 1, decode_max_visible(fn), /*span_head=*/false) +
+                     fn_head_scratch_bytes(g, decode_rows);
   const auto rows = static_cast<std::size_t>(fn.rows());
   s.activations = aligned(rows * g.residual_width() * 2) + 2 * aligned(rows * g.hidden * 2) +
                   aligned(rows * g.streams * sizeof(float)) + aligned(rows * sizeof(int32_t)) +
@@ -101,12 +126,24 @@ Sizes plan_sizes(const FlashNextModel &fn) {
   const std::size_t router = aligned(rows * g.experts_per_token * sizeof(int32_t)) +
                              aligned(rows * g.experts_per_token * sizeof(float)) +
                              aligned(rows * g.experts * sizeof(float));
-  s.moe = aligned(ignis_moe_workspace_bytes(fn.decode_lanes, fn.prefill_chunk_tokens)) +
+  s.moe = aligned(ignis_moe_workspace_bytes(fn.decode_rows, fn.prefill_chunk_tokens)) +
           aligned(rows * g.hidden * sizeof(int64_t)) + 2 * router +
           aligned(rows * g.shared_intermediate * sizeof(__nv_bfloat16)) + aligned(rows * g.hidden * sizeof(float));
   s.sampling_logits = static_cast<std::size_t>(g.vocab) * IGNIS_DECODE_MAX_BATCH * sizeof(std::uint16_t);
   s.sampling_workspace =
       std::max<std::size_t>(ninfer::ops::sampling_workspace_capacity_bytes(g.vocab, 1, IGNIS_DECODE_MAX_BATCH), 256);
+  if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    s.verify = verify::plan(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
+                            attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr)
+                   .total();
+  }
+  if (fn.mtp != nullptr) {
+    // The head's entries' tokens and its expert slot table; its combine beside the layer's ops.
+    s.activations += aligned(rows * sizeof(int32_t)) +
+                     aligned(static_cast<std::size_t>(g.experts) * 2 * sizeof(ignis_moe_slot));
+    s.prefill_scratch = std::max(s.prefill_scratch, mtp::combine_scratch_bytes(g, chunk) + 4096);
+    s.decode_scratch = std::max(s.decode_scratch, mtp::combine_scratch_bytes(g, decode_rows) + 4096);
+  }
   return s;
 }
 
@@ -134,16 +171,9 @@ std::string geometry_refusal(const Geometry &g) {
   return {};
 }
 
-// The lanes' state sections the ops read, from the pool the call runs on.
-struct Views {
-  std::vector<IndexerLayerState> indexer;
-  Context ctx;
-};
-
 std::string pool_refusal(const FlashNextModel &fn, const ignis_seq_pool &pool) {
   const Geometry &g = fn.g;
-  int32_t attention = 0;
-  for (const LayerWeights &layer : fn.weights->layers) attention += layer.attention ? 1 : 0;
+  const int32_t attention = attention_sections(fn);
   if (pool.kv_format != fn.kv_format) return "the pool's KV format is not this load's";
   if (pool.kv_num_layers != attention || pool.kv_num_kv_heads != g.kv_heads || pool.kv_head_dim != g.head_dim) {
     return "the pool's KV planes are not this model's attention layers";
@@ -159,6 +189,8 @@ std::string pool_refusal(const FlashNextModel &fn, const ignis_seq_pool &pool) {
   if (pool.vocab != g.vocab) return "the pool's penalty rows are not this model's vocab";
   return {};
 }
+
+}  // namespace
 
 Views views_of(const FlashNextModel &fn, ignis_seq_pool *pool) {
   Views v;
@@ -178,11 +210,15 @@ Views views_of(const FlashNextModel &fn, ignis_seq_pool *pool) {
   return v;
 }
 
+namespace {
+
 bool check_cuda(cudaError_t err, const std::string &what, std::string *error) {
   if (err == cudaSuccess) return true;
   *error = what + " failed: " + cudaGetErrorString(err);
   return false;
 }
+
+}  // namespace
 
 // The call's whole forward to the final residual: embed, every layer. `phase` is residency's.
 int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint32_t phase,
@@ -243,27 +279,56 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
     if (fn_hc_mix(g, layer.mlp_hc, residual, rows, x, inj, scratch, stream) != 0) {
       return fail(where + " MoE mix", fn_last_error());
     }
+    // The shared expert reads only `x`: it runs on a branch of its own (side_branch.h) beside the
+    // router, residency and the routed experts, joined before the combine. Every failure after
+    // the fork joins that branch and residency's lookahead branch first, so no return leaves
+    // either open (a capture would then fail to end) or `x` still being read.
+    auto *shared = static_cast<float *>(fn.shared_out->p);
+    std::string branch_error;
+    const int32_t shared_rc = run_beside(
+        fn.shared_branch, stream,
+        [&](cudaStream_t side) {
+          return ignis_moe_shared_expert(layer.moe.shared_gate, layer.moe.shared_up, layer.moe.shared_down, x,
+                                         static_cast<uint32_t>(rows), fn.shared_h->p, shared, side);
+        },
+        &branch_error);
+    const auto fail_joined = [&](const std::string &what, const char *detail) {
+      (void)join_side(fn.shared_branch, stream);
+      (void)ignis_residency_join(fn.residency, stream);
+      return fail(what, detail);
+    };
+    if (shared_rc != 0) {
+      return fail_joined(where + " shared expert", branch_error.empty() ? ignis_moe_last_error() : branch_error.c_str());
+    }
     auto *ids = static_cast<int32_t *>(fn.router_ids->p);
     auto *weights = static_cast<float *>(fn.router_weights->p);
     if (ignis_moe_router(x, static_cast<uint32_t>(rows), layer.moe.router, ids, weights,
                          static_cast<float *>(fn.router_logits->p), stream) != 0) {
-      return fail(where + " router", ignis_moe_last_error());
+      return fail_joined(where + " router", ignis_moe_last_error());
     }
-    const float *lookahead = nullptr;
-    if (l + 1 < g.layers) {
+    // The step's demand half on the layer's stream; its lookahead -- the next layer's router on
+    // this input, which only the prefetch reads -- on the branch it forks, beside the experts.
+    void *branch = nullptr;
+    if (ignis_residency_step_demand(fn.residency, static_cast<uint32_t>(l), phase, ids, static_cast<uint32_t>(rows),
+                                    stream, l + 1 < g.layers ? &branch : nullptr) != 0) {
+      return fail_joined(where + " expert residency", ignis_residency_last_error());
+    }
+    if (branch != nullptr) {
       if (ignis_moe_router(x, static_cast<uint32_t>(rows), w.layers[static_cast<std::size_t>(l + 1)].moe.router,
                            static_cast<int32_t *>(fn.lookahead_ids->p), static_cast<float *>(fn.lookahead_weights->p),
-                           static_cast<float *>(fn.lookahead_logits->p), stream) != 0) {
-        return fail(where + " lookahead router", ignis_moe_last_error());
+                           static_cast<float *>(fn.lookahead_logits->p), branch) != 0) {
+        return fail_joined(where + " lookahead router", ignis_moe_last_error());
       }
-      lookahead = static_cast<const float *>(fn.lookahead_logits->p);
-    }
-    if (ignis_residency_step(fn.residency, static_cast<uint32_t>(l), phase, ids, static_cast<uint32_t>(rows),
-                             lookahead, stream) != 0) {
-      return fail(where + " expert residency", ignis_residency_last_error());
+      if (cudaEventRecord(fn.lookahead_read, static_cast<cudaStream_t>(branch)) != cudaSuccess) {
+        return fail_joined(where + " lookahead event", cudaGetErrorString(cudaGetLastError()));
+      }
+      if (ignis_residency_step_prefetch(fn.residency, static_cast<const float *>(fn.lookahead_logits->p),
+                                        static_cast<uint32_t>(rows)) != 0) {
+        return fail_joined(where + " expert prefetch", ignis_residency_last_error());
+      }
     }
     const ignis_moe_slot *slots = ignis_residency_slot_table(fn.residency, static_cast<uint32_t>(l));
-    ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_lanes, fn.prefill_chunk_tokens};
+    ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
     auto *acc = static_cast<int64_t *>(fn.moe_acc->p);
     const int32_t experts =
         phase == IGNIS_RESIDENCY_DECODE
@@ -271,21 +336,22 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
             : ignis_moe_experts_prefill(x, static_cast<uint32_t>(rows), ids, weights, slots, &workspace, acc, stream);
     // The routed accumulator must be zero on every op's entry (ignis_moe.h); a failure before
     // the combine re-zeroes what the experts added, or the next call would add into it.
-    const auto fail_moe = [&](const std::string &what) {
-      const std::string detail = ignis_moe_last_error();
+    const auto fail_moe = [&](const std::string &what, const std::string &detail) {
       (void)cudaMemsetAsync(acc, 0, static_cast<std::size_t>(rows) * g.hidden * sizeof(int64_t), stream);
-      return fail(where + what, detail.c_str());
+      return fail_joined(where + what, detail.c_str());
     };
     if (experts != 0) {
-      return fail_moe(" experts");
+      return fail_moe(" experts", ignis_moe_last_error());
     }
-    auto *shared = static_cast<float *>(fn.shared_out->p);
-    if (ignis_moe_shared_expert(layer.moe.shared_gate, layer.moe.shared_up, layer.moe.shared_down, x,
-                                static_cast<uint32_t>(rows), fn.shared_h->p, shared, stream) != 0) {
-      return fail_moe(" shared expert");
+    if (!join_side(fn.shared_branch, stream)) {
+      return fail_moe(" shared expert join", cudaGetErrorString(cudaGetLastError()));
     }
     if (ignis_moe_combine(acc, shared, x, layer.moe.shared_expert_gate, static_cast<uint32_t>(rows), y, stream) != 0) {
-      return fail_moe(" MoE combine");
+      return fail_moe(" MoE combine", ignis_moe_last_error());
+    }
+    // The next sublayer's mix rewrites `x`: the lookahead router must have read it.
+    if (branch != nullptr && cudaStreamWaitEvent(stream, fn.lookahead_read, 0) != cudaSuccess) {
+      return fail(where + " lookahead join", cudaGetErrorString(cudaGetLastError()));
     }
     if (fn_hc_inject(g, y, inj, rows, residual, stream) != 0) {
       return fail(where + " MoE inject", fn_last_error());
@@ -303,6 +369,31 @@ void advance_frontiers(ignis_seq *seq, uint32_t tokens) {
   for (auto &frontier : seq->gqa_positions) frontier += tokens;
   for (auto &frontier : seq->gdn_positions) frontier += tokens;
 }
+
+int32_t mtp_entries(FlashNextModel &fn, const Context &ctx, const Batch &batch, const int32_t *tokens,
+                    ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error) {
+  mtp::Buffers b;
+  b.residual = fn.residual->p;
+  b.x = fn.x->p;
+  b.y = fn.y->p;
+  b.inj = static_cast<float *>(fn.injections->p);
+  b.workspace = ignis_moe_workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
+  b.acc = static_cast<int64_t *>(fn.moe_acc->p);
+  b.router_ids = static_cast<int32_t *>(fn.router_ids->p);
+  b.router_weights = static_cast<float *>(fn.router_weights->p);
+  b.router_logits = static_cast<float *>(fn.router_logits->p);
+  b.shared_h = fn.shared_h->p;
+  b.shared_out = static_cast<float *>(fn.shared_out->p);
+  if (mtp::combine(fn.g, *fn.mtp, fn.weights->embed, tokens, batch, b, scratch, stream) != 0 ||
+      mtp::layer(ctx, attention_layers(fn), *fn.mtp, static_cast<const ignis_moe_slot *>(fn.mtp_slots->p), batch, b,
+                 scratch, stream) != 0) {
+    *error = std::string("the MTP head: ") + fn_last_error();
+    return -1;
+  }
+  return 0;
+}
+
+namespace {
 
 float bf16_to_f32(std::uint16_t bits) {
   const std::uint32_t widened = static_cast<std::uint32_t>(bits) << 16;
@@ -344,11 +435,14 @@ uint32_t max_decode_lanes() {
 }
 
 int32_t FlashNextModel::rows() const {
-  return static_cast<int32_t>(std::max(prefill_chunk_tokens, decode_lanes));
+  return static_cast<int32_t>(std::max(prefill_chunk_tokens, decode_rows));
 }
 
 FlashNextModel::FlashNextModel() = default;
-FlashNextModel::~FlashNextModel() = default;
+FlashNextModel::~FlashNextModel() {
+  if (lookahead_read != nullptr) cudaEventDestroy(lookahead_read);
+  shared_branch.destroy();
+}
 
 std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, uint64_t count,
                                            const ignis_topology &topology, uint32_t prefill_chunk_tokens,
@@ -361,6 +455,12 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
   fn->max_context_tokens = max_context_tokens;
   fn->decode_lanes = options != nullptr && options->decode_lanes != 0 ? options->decode_lanes : kDefaultDecodeLanes;
   fn->residency = options != nullptr ? options->residency : nullptr;
+  if (options != nullptr) {
+    fn->speculative_backend = options->speculative_backend;
+    fn->draft_tokens = options->draft_tokens;
+    fn->draft_row_budget = options->draft_row_budget;
+  }
+  fn->decode_rows = fn->decode_lanes;
   if (fn->decode_lanes > max_decode_lanes()) {
     *error = "decode_lanes " + std::to_string(fn->decode_lanes) + " is more than the " +
              std::to_string(max_decode_lanes()) + " a Flash-Next round serves";
@@ -372,14 +472,45 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
   }
   // The binder first: a set of descriptors is right or wrong whatever the
   // geometry, and a caller learns which before learning whether this
-  // program runs the geometry.
-  fn->weights = bind_flash_next(tensors, count, topology, error);
+  // program runs the geometry. An MTP load's head tensors (`mtp.*`) bind on
+  // their own; on any other load they are the trunk binder's extras.
+  const bool mtp = fn->speculative_backend == IGNIS_SPECULATIVE_MTP;
+  std::vector<ignis_bound_tensor> trunk, head;
+  for (uint64_t i = 0; i < count; ++i) {
+    const bool is_head = mtp && tensors[i].name != nullptr && std::strncmp(tensors[i].name, "mtp.", 4) == 0;
+    (is_head ? head : trunk).push_back(tensors[i]);
+  }
+  fn->weights = bind_flash_next(trunk.data(), trunk.size(), topology, error);
   if (fn->weights == nullptr) {
+    return nullptr;
+  }
+  if (mtp) {
+    fn->mtp = bind_mtp(head.data(), head.size(), topology, error);
+    if (fn->mtp == nullptr) {
+      *error = "the MTP head: " + *error;
+      return nullptr;
+    }
+    if (options->mtp_expert_slots != nullptr) {
+      const auto entries = static_cast<std::size_t>(Geometry::from(topology).experts) * 2;
+      fn->mtp_slot_table.assign(options->mtp_expert_slots, options->mtp_expert_slots + entries);
+    }
+  } else if (options != nullptr && options->mtp_expert_slots != nullptr) {
+    *error = "mtp_expert_slots without the MTP backend";
     return nullptr;
   }
   if (const std::string why = geometry_refusal(fn->g); !why.empty()) {
     *error = "Qwen3.8-Flash-Next's program does not run this geometry (its weights bind): " + why;
     return nullptr;
+  }
+  // Spec flash-next/07: the verify round, with a test's drafts (VERIFY_ONLY) or the MTP head's.
+  if (fn->speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    if (const std::string why = verify::refusal(fn->g, fn->decode_lanes, fn->draft_tokens, fn->draft_row_budget,
+                                                attention_sections(*fn), gdn_layers(*fn), mtp);
+        !why.empty()) {
+      *error = "Qwen3.8-Flash-Next's verify round: " + why;
+      return nullptr;
+    }
+    fn->decode_rows = verify::decode_rows(fn->decode_lanes, fn->draft_tokens, fn->draft_row_budget);
   }
   try {
     fn->rope = ninfer::ops::rope_linear_frequencies(static_cast<float>(topology.rope_theta),
@@ -398,6 +529,7 @@ ignis_model_reservations reservations(const FlashNextModel &fn) {
   out.sampling_bytes = sampling_staging_bytes(fn.sizes);
   out.decode_graph_bytes = fn.sizes.decode_scratch;
   out.activation_bytes = fn.sizes.activations + fn.sizes.moe;
+  out.verify_round_bytes = fn.sizes.verify;
   return out;
 }
 
@@ -422,9 +554,10 @@ ignis_model_reservations reserved(const ignis_model &model) {
   for (const auto *buffer : {&fn.residual, &fn.x, &fn.y, &fn.injections, &fn.token_ids, &fn.slots, &fn.positions,
                              &fn.ngram_rows, &fn.moe_workspace, &fn.moe_acc, &fn.router_ids, &fn.router_weights,
                              &fn.router_logits, &fn.lookahead_ids, &fn.lookahead_weights, &fn.lookahead_logits,
-                             &fn.shared_h, &fn.shared_out}) {
+                             &fn.shared_h, &fn.shared_out, &fn.mtp_tokens, &fn.mtp_slots}) {
     out.activation_bytes += bytes(*buffer);
   }
+  out.verify_round_bytes = fn.verify != nullptr ? fn.verify->device_bytes() : 0;
   return out;
 }
 
@@ -449,6 +582,14 @@ int32_t finish_load(ignis_model &model, std::string *error) {
   }
   if (!check_cuda(cudaStreamCreate(&model.stream), "cudaStreamCreate", error)) {
     model.stream = nullptr;
+    return -1;
+  }
+  if (!check_cuda(cudaEventCreateWithFlags(&fn.lookahead_read, cudaEventDisableTiming), "the lookahead event",
+                  error)) {
+    fn.lookahead_read = nullptr;
+    return -1;
+  }
+  if (!fn.shared_branch.create(error)) {
     return -1;
   }
   try {
@@ -485,7 +626,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     fn.slots = buffer(lanes * sizeof(int32_t));
     fn.positions = buffer(lanes * sizeof(int32_t));
     fn.ngram_rows = buffer(rows * g.ngram_heads * g.ngram_row_bytes());
-    fn.moe_workspace = buffer(ignis_moe_workspace_bytes(fn.decode_lanes, fn.prefill_chunk_tokens));
+    fn.moe_workspace = buffer(ignis_moe_workspace_bytes(fn.decode_rows, fn.prefill_chunk_tokens));
     fn.moe_acc = buffer(rows * g.hidden * sizeof(int64_t));
     fn.router_ids = buffer(rows * g.experts_per_token * sizeof(int32_t));
     fn.router_weights = buffer(rows * g.experts_per_token * sizeof(float));
@@ -499,7 +640,43 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     *error = std::string("Flash-Next's reservations: ") + e.what();
     return -1;
   }
-  ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_lanes, fn.prefill_chunk_tokens};
+  if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    fn.verify = verify::create(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
+                               attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr, error);
+    if (fn.verify == nullptr) {
+      *error = "Flash-Next's verify round: " + *error;
+      return -1;
+    }
+  }
+  if (fn.mtp != nullptr) {
+    // The head's experts are all resident: every slot names a record and a K class.
+    if (fn.mtp_slot_table.size() != static_cast<std::size_t>(g.experts) * 2) {
+      *error = "an MTP load needs its expert slot table (ignis_model_load_options.mtp_expert_slots)";
+      return -1;
+    }
+    for (std::size_t i = 0; i < fn.mtp_slot_table.size(); ++i) {
+      const ignis_moe_slot &slot = fn.mtp_slot_table[i];
+      if (slot.record == nullptr || (slot.k2 != 4 && slot.k2 != 5 && slot.k2 != 6 && slot.k2 != 8)) {
+        *error = "the MTP head's expert slot " + std::to_string(i) + " names no record or no K class";
+        return -1;
+      }
+    }
+    try {
+      const auto rows = static_cast<std::size_t>(fn.rows());
+      fn.mtp_tokens = std::make_unique<ninfer::DeviceBuffer>(aligned(rows * sizeof(int32_t)));
+      fn.mtp_slots =
+          std::make_unique<ninfer::DeviceBuffer>(aligned(fn.mtp_slot_table.size() * sizeof(ignis_moe_slot)));
+    } catch (const std::exception &e) {
+      *error = std::string("the MTP head's reservations: ") + e.what();
+      return -1;
+    }
+    if (!check_cuda(cudaMemcpy(fn.mtp_slots->p, fn.mtp_slot_table.data(),
+                               fn.mtp_slot_table.size() * sizeof(ignis_moe_slot), cudaMemcpyHostToDevice),
+                    "uploading the MTP head's slot table", error)) {
+      return -1;
+    }
+  }
+  ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
   if (ignis_moe_workspace_init(&workspace, static_cast<int64_t *>(fn.moe_acc->p), model.stream) != 0) {
     *error = std::string("ignis_moe_workspace_init: ") + ignis_moe_last_error();
     return -1;
@@ -575,6 +752,12 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
       if (forward(fn, views.ctx, batch, IGNIS_RESIDENCY_PREFILL, *model->scratch, stream, &error) != 0) {
         return false;
       }
+      // Test-only residual-stack tap (kernel/include/ignis_fn_residual_tap.h): one flag load when
+      // disarmed.
+      if (ignis_fn_residual_tap_record(position, chunk, g.residual_width(), fn.residual->p, stream) != 0) {
+        error = ignis_fn_residual_tap_last_error();
+        return false;
+      }
       const auto residual_row = [&](int32_t row) {
         return static_cast<const unsigned char *>(fn.residual->p) +
                static_cast<std::size_t>(row) * g.residual_width() * sizeof(__nv_bfloat16);
@@ -605,6 +788,9 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
         // once either way.
         const int32_t block_first = (chunk - 1) / kSpanLogitRows * kSpanLogitRows;
         const int32_t block_rows = chunk - block_first;
+        // Its own scope: the MTP head's entries below reuse the arena (the copies out of the block
+        // are ordered before them on the stream).
+        auto draw_scope = model->scratch->scope();
         auto *block = static_cast<unsigned char *>(
             model->scratch->alloc_bytes(static_cast<std::size_t>(kSpanLogitRows) * vocab * sizeof(std::uint16_t)).data);
         if (fn_head(g, fn.weights->final_mixer, fn.weights->head, residual_row(block_first), block_rows, block,
@@ -627,6 +813,30 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
             return false;
           }
         }
+      }
+      // Spec flash-next/07: the MTP head's entries for the chunk's positions, entry p from the
+      // trunk's stack at p and token p + 1 -- the span's next id, or at the span's last position
+      // the token just drawn -- so the head's frontier is the sequence's.
+      if (fn.mtp != nullptr) {
+        auto *next = static_cast<int32_t *>(fn.mtp_tokens->p);
+        const bool staged =
+            (chunk == 1 || check_cuda(cudaMemcpyAsync(next, token_ids + offset + 1, (chunk - 1) * sizeof(int32_t),
+                                                      cudaMemcpyHostToDevice, stream),
+                                      "staging the head's tokens", &error)) &&
+            (last ? check_cuda(cudaMemcpyAsync(next + chunk - 1, model->sampling_single_out->p, sizeof(int32_t),
+                                               cudaMemcpyDeviceToDevice, stream),
+                               "staging the drawn token", &error)
+                  : check_cuda(cudaMemcpyAsync(next + chunk - 1, token_ids + offset + chunk, sizeof(int32_t),
+                                               cudaMemcpyHostToDevice, stream),
+                               "staging the next chunk's token", &error));
+        if (!staged) return false;
+        Batch batch;
+        batch.lanes = 1;
+        batch.tokens = chunk;
+        batch.slots = static_cast<const int32_t *>(fn.slots->p);
+        batch.positions = static_cast<const int32_t *>(fn.positions->p);
+        batch.max_visible = position + chunk;
+        if (mtp_entries(fn, views.ctx, batch, next, *model->scratch, stream, &error) != 0) return false;
       }
       return check_cuda(cudaStreamSynchronize(stream), "the chunk's synchronize", &error);
     }();
@@ -703,6 +913,14 @@ int32_t run_round(ignis_model *model, FlashNextModel &fn, const Context &ctx, ui
     *error = std::string("the draw: ") + e.what();
     return -1;
   }
+  // Spec flash-next/07: on an MTP load every committed position gets its head entry, this round's
+  // from its stack and the token it drew; it drafts nothing (the next verify round runs at
+  // extent 0 and drafts).
+  if (fn.mtp != nullptr &&
+      mtp_entries(fn, ctx, batch, static_cast<const int32_t *>(model->sampling_decode_out->p), scratch, stream, error) !=
+          0) {
+    return -1;
+  }
   return 0;
 }
 
@@ -727,13 +945,15 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   if (options == nullptr || options->size != sizeof(ignis_decode_options)) {
     return refuse("a Flash-Next round needs its options: the lanes' n-gram rows");
   }
-  if (options->speculative_window != 0 || options->drafts != nullptr) {
-    return refuse("Qwen3.8-Flash-Next has no speculative decoding");
-  }
   if (options->ngram_rows == nullptr) return refuse("a Flash-Next round needs the lanes' n-gram rows");
   if (const std::string why = pool_refusal(fn, *pool); !why.empty()) return refuse(why);
   if (fn.captured_pool != nullptr && fn.captured_pool != pool) {
     return refuse("the round's pool is not the one its graphs were captured against");
+  }
+  // Spec flash-next/07: a speculative window is the verify round (speculative.cu).
+  if (options->speculative_window != 0 || options->drafts != nullptr) {
+    if (fn.verify == nullptr) return refuse("this Flash-Next load has no speculative decoding");
+    return program_verify(model, pool, sequences, batch_size, sampling, out_token_ids, options);
   }
 
   const auto width = static_cast<uint32_t>(batch_size);
@@ -915,8 +1135,19 @@ int32_t capture_decode_graphs(ignis_model *model, ignis_seq_pool *pool, uint32_t
       *error = "ignis_decode_graph_capture: width " + std::to_string(width) + ": " + failure;
     }
   }
+  // Spec flash-next/07: the verify round's pass and commit graphs, after the rounds'.
+  if (fn.verify != nullptr) {
+    std::string failure;
+    (void)capture_verify_graphs(model, pool, &failure);
+    if (!failure.empty()) *error = "ignis_decode_graph_capture: " + failure;
+  }
   fn.captured_pool = pool;
   return 0;
+}
+
+uint32_t verify_ready_mask(const ignis_model &model) {
+  const FlashNextModel &fn = *model.flash_next;
+  return fn.verify != nullptr ? fn.verify->ready_mask() : 0;
 }
 
 }  // namespace ignis::flash_next

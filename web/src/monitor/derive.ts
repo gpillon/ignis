@@ -2,6 +2,7 @@ import { formatCount, formatSeconds, formatShare, formatWindow } from "./format.
 import { type CounterPick, increaseOver, type Point, rollingRate, windowHistogram } from "./history.ts";
 import { histogramMean, histogramQuantile } from "./quantile.ts";
 import {
+  DRAFT_POSITIONS,
   EXPERT_CLASSES,
   EXPERT_PHASES,
   type ExpertClass,
@@ -148,6 +149,19 @@ export type Ngram = {
   readBytesPerSecSeries: Values;
 };
 
+/** Speculative decoding over the window (GitHub #307). */
+export type Speculation = {
+  rounds: Tally;
+  drafted: Tally;
+  accepted: Tally;
+  /** Drafts committed over drafts verified, in the window. */
+  acceptance: number | null;
+  /** Tokens a verify round committed on average in the window: its anchor plus its accepted drafts. */
+  tokensPerRound: number | null;
+  /** Per draft position (1 first): rounds that committed it over rounds that proposed it, in the window. */
+  byPosition: (number | null)[];
+};
+
 export type HealthLevel = "idle" | "healthy" | "busy" | "saturated";
 /** The verdict: its level, what it rests on in a phrase, and the facts behind it. */
 export type Health = { level: HealthLevel; summary: string; notes: string[] };
@@ -185,6 +199,8 @@ export type Dashboard = {
   experts: Experts | null;
   /** Null on a load without an n-gram table: a 27B load. */
   ngram: Ngram | null;
+  /** Null until a verify round ran: a load without speculation. */
+  speculation: Speculation | null;
   health: Health;
 };
 
@@ -358,6 +374,7 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     memory: deriveMemory(points, from),
     experts: last.experts ? deriveExperts(points, from) : null,
     ngram: last.ngram ? deriveNgram(points, from) : null,
+    speculation: last.speculation ? deriveSpeculation(points, from) : null,
     health: { level: "idle", summary: "", notes: [] },
   };
   dash.health = assessHealth({
@@ -438,6 +455,30 @@ export function deriveNgram(points: Point[], since: number): Ngram {
     readBytes: tally((s) => s.ngram?.readBytes ?? null),
     readBytesPerSec: readBytesRate.at(-1) ?? null,
     readBytesPerSecSeries: readBytesRate,
+  };
+}
+
+/** The speculation panel's figures (GitHub #307): acceptance over the window, overall and per draft position. */
+export function deriveSpeculation(points: Point[], since: number): Speculation {
+  const last = points.at(-1)?.snap ?? emptySnapshot();
+  const tally = (pick: CounterPick): Tally => ({ total: pick(last), window: increaseOver(points, pick, since) });
+  const rounds = tally((s) => s.speculation?.rounds ?? null);
+  const drafted = tally((s) => s.speculation?.drafted ?? null);
+  const accepted = tally((s) => s.speculation?.accepted ?? null);
+  const byPosition = Array.from({ length: DRAFT_POSITIONS }, (_, j) =>
+    shareOf(
+      increaseOver(points, (s) => s.speculation?.positionAccepted[j] ?? null, since),
+      increaseOver(points, (s) => s.speculation?.positionDrafted[j] ?? null, since),
+    ),
+  );
+  return {
+    rounds,
+    drafted,
+    accepted,
+    acceptance: shareOf(accepted.window, drafted.window),
+    tokensPerRound:
+      rounds.window !== null && accepted.window !== null && rounds.window > 0 ? (rounds.window + accepted.window) / rounds.window : null,
+    byPosition,
   };
 }
 

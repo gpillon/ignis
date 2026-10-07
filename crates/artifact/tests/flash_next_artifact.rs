@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Command;
 
 use ignis_artifact::flash_next::{self, fixture, FlashNextGeometry};
-use ignis_artifact::packer::ARTIFACT_FILE_NAME;
+use ignis_artifact::packer::{ARTIFACT_FILE_NAME, MTP_ARTIFACT_FILE_NAME};
 use ignis_artifact::{verify, Reader, Sidecar};
 
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
@@ -63,6 +63,32 @@ fn the_pack_binary_waits_then_finishes_a_work_tree_beside_it() {
     let artifact = tree.work_dir().parent().unwrap().join(ARTIFACT_FILE_NAME);
     let reader = Reader::open(&artifact).unwrap();
     flash_next::bind(&reader, &FlashNextGeometry::fixture()).expect("the packed tree binds");
+}
+
+#[test]
+fn the_pack_binary_packs_an_mtp_companion_beside_its_work_tree() {
+    let main = fixture::build("pack-binary-mtp").unwrap();
+    main.tree.write_mtp(&main.path).unwrap();
+    let run = |pair: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ignis-artifact-pack"));
+        command.arg("--work").arg(main.tree.mtp_work_dir()).args(["--geometry", "fixture", "--family", "mtp"]);
+        if pair {
+            command.arg("--pair-main").arg(&main.path);
+        }
+        command.output().unwrap()
+    };
+    let unpaired = run(false);
+    assert_eq!(unpaired.status.code(), Some(2), "{}", String::from_utf8_lossy(&unpaired.stderr));
+    assert!(String::from_utf8_lossy(&unpaired.stderr).contains("--family mtp needs --pair-main"));
+
+    let done = run(true);
+    let stdout = String::from_utf8_lossy(&done.stdout);
+    assert!(done.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&done.stderr));
+    // --out defaults to the companion's name beside work-mtp/, with its identity.
+    let companion = main.tree.mtp_work_dir().parent().unwrap().join(MTP_ARTIFACT_FILE_NAME);
+    let reader = Reader::open(&companion).unwrap();
+    assert_eq!(reader.identity(), &ignis_artifact::packer::mtp_identity());
+    assert!(reader.find("mtp.fc_hidden.weight").is_some());
 }
 
 /// The real artifact, when present: the reader parses it, the binder

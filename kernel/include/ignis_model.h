@@ -201,6 +201,8 @@ struct ignis_model;
 /* A Flash-Next load's expert residency (ignis_residency.h), created and
  * filled by the caller before the load. */
 struct ignis_residency;
+/* One expert projection's slot (ignis_moe.h). */
+struct ignis_moe_slot;
 
 /* The speculative backend a load selects (P5-02, GitHub #150, spec 05).
  * Speculation is engine residency, fixed for the life of the load. */
@@ -217,6 +219,11 @@ enum ignis_speculative_backend {
    * drafter fills, and what proves accept, rollback and fold before the real
    * drafter is wired in (P5-05). Not an operator-facing backend. */
   IGNIS_SPECULATIVE_VERIFY_ONLY = 2,
+  /* GitHub #307 (spec flash-next/07): Qwen3.8-Flash-Next's own MTP draft
+   * head, from its companion container. Flash-Next's only drafter: a 27B
+   * load refuses it, as a Flash-Next load refuses DFLASH2. Flash-Next takes
+   * VERIFY_ONLY too, with its drafts per call. */
+  IGNIS_SPECULATIVE_MTP = 3,
 };
 
 /* The widest DFlash2 draft window a load accepts. */
@@ -300,6 +307,20 @@ struct ignis_model_load_options {
    * Flash-Next load needs one; ignis_model_plan_reservations does not read
    * it. NULL on the 27B. */
   struct ignis_residency *residency;
+  /* GitHub #307 (spec flash-next/07): Flash-Next's draft row budget. A round
+   * of w lanes verifies at k = min(draft_tokens, budget / w - 1) drafts per
+   * lane -- its `speculative_window` -- and a width whose k is 0 runs today's
+   * one-token round; one verify graph pair per width is captured at its k.
+   * 0 = the decode route's 8 rows, else 2..8. 0 on the 27B. */
+  uint32_t draft_row_budget;
+  /* GitHub #307: under IGNIS_SPECULATIVE_MTP, the MTP head's expert slot
+   * table -- host [512 * 2] entries indexed expert * 2 + projection
+   * (ignis_moe.h), every record a device pointer into weights the caller
+   * keeps alive until ignis_model_free has returned; copied at load (a plan
+   * does not read it). The head's 29 other tensors arrive among `tensors`,
+   * named `mtp.*` (the companion container's, docs/specs/flash-next/
+   * layout.md section 13). NULL otherwise. */
+  const struct ignis_moe_slot *mtp_expert_slots;
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many

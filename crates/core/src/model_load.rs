@@ -30,7 +30,7 @@ use ignis_artifact::{
 use crate::compute::ModelConfig;
 use crate::kv_format::KvFormat;
 use crate::rope_scaling::RopeScaling;
-use crate::speculation::{ProposalHead, SpeculativeBackend, Speculation};
+use crate::speculation::{FlashNextSpeculation, ProposalHead, SpeculativeBackend, Speculation};
 use crate::vision::Vision;
 
 pub(crate) mod ffi {
@@ -50,6 +50,7 @@ pub(crate) mod ffi {
 
     /// 1:1 with `struct ignis_bound_tensor`.
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct IgnisBoundTensor {
         pub name: *const c_char,
         pub qtype: i32,
@@ -96,6 +97,23 @@ pub(crate) mod ffi {
         /// GitHub #302: Flash-Next's expert residency, borrowed for the
         /// model's life (`ignis_residency`); null on the 27B.
         pub residency: *mut std::ffi::c_void,
+        /// GitHub #307: Flash-Next's draft row budget (spec flash-next/07,
+        /// [`crate::speculation::flash_next_window`]); 0 = the decode
+        /// route's 8 rows, and 0 on the 27B.
+        pub draft_row_budget: u32,
+        /// GitHub #307: the MTP head's expert slot table under the MTP
+        /// backend (host `[512 * 2]` [`IgnisMoeSlot`]s), null otherwise.
+        pub mtp_expert_slots: *const IgnisMoeSlot,
+    }
+
+    /// 1:1 with `struct ignis_moe_slot` (`kernel/include/ignis_moe.h`): an
+    /// expert projection's device record and its K class as 2K.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct IgnisMoeSlot {
+        pub record: *const std::ffi::c_void,
+        pub k2: u32,
+        pub reserved: u32,
     }
 
     /// 1:1 with `struct ignis_model_reservations` (GitHub #210): every
@@ -289,8 +307,9 @@ pub fn draft_module(speculation: Option<Speculation>) -> Option<DraftModule> {
             ProposalHead::Shortlist => DraftModule::Dflash2ShortlistHead,
         }),
         // The verify substrate binds no drafter (P5-04, GitHub #153): the
-        // text scope alone.
-        SpeculativeBackend::VerifyOnly => None,
+        // text scope alone. MTP is Flash-Next's (spec flash-next/07): its
+        // head comes from a companion container, never from this module.
+        SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => None,
     })
 }
 
@@ -344,6 +363,8 @@ fn load_options(
             attention_text_max_keys: text_keys,
             decode_lanes: 0,
             residency: std::ptr::null_mut(),
+            draft_row_budget: 0,
+            mtp_expert_slots: std::ptr::null(),
         }
     })
 }
@@ -722,13 +743,19 @@ fn build_flash_next_bound_tensors(
     for layer in 0..geometry.layers {
         entries.extend(flash_next::layer_entries(geometry, layer));
     }
+    bound_tensors(&entries, &fn_plan.handles, placement)
+}
+
+/// The descriptors of `entries`' device tensors, each placed through `placement`.
+fn bound_tensors(
+    entries: &[flash_next::Entry],
+    handles: &std::collections::BTreeMap<String, ObjectHandle>,
+    placement: impl Fn(ObjectHandle) -> Result<(u64, *const c_void), String>,
+) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
     let mut names = Vec::with_capacity(entries.len());
     let mut tensors = Vec::with_capacity(entries.len());
     for entry in entries.iter().filter(|entry| entry.role == flash_next::Role::Device) {
-        let handle = *fn_plan
-            .handles
-            .get(&entry.name)
-            .ok_or_else(|| format!("{}: not bound by the Flash-Next plan", entry.name))?;
+        let handle = *handles.get(&entry.name).ok_or_else(|| format!("{}: not bound by the Flash-Next plan", entry.name))?;
         let flash_next::ShapeRule::Exact(dims) = &entry.shape else {
             return Err(format!("{}: a device tensor has an exact shape", entry.name));
         };
@@ -760,13 +787,28 @@ fn build_flash_next_bound_tensors(
     Ok((names, tensors))
 }
 
-/// A Flash-Next load's options: its decode lanes and its borrowed residency
-/// (null when only planning); nothing of the 27B's.
-fn flash_next_options(decode_lanes: u32, residency: *mut c_void) -> ffi::IgnisModelLoadOptions {
+/// The MTP head's 29 non-expert descriptors (layout.md §13.3), each placed
+/// through `placement`: what an MTP load hands the leaf beside the trunk's.
+pub fn mtp_bound_tensors(
+    plan: &ignis_artifact::flash_next::mtp::MtpPlan,
+    geometry: &FlashNextGeometry,
+    placement: impl Fn(ObjectHandle) -> Result<(u64, *const c_void), String>,
+) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
+    bound_tensors(&flash_next::mtp_entries(geometry), &plan.handles, placement)
+}
+
+/// A Flash-Next load's options: its decode lanes, its borrowed residency
+/// (null when only planning) and its speculation (spec flash-next/07);
+/// nothing of the 27B's.
+fn flash_next_options(
+    decode_lanes: u32,
+    residency: *mut c_void,
+    speculation: Option<FlashNextSpeculation>,
+) -> ffi::IgnisModelLoadOptions {
     ffi::IgnisModelLoadOptions {
         size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
-        speculative_backend: 0,
-        draft_tokens: 0,
+        speculative_backend: speculation.map_or(0, |s| s.backend().abi_code()),
+        draft_tokens: speculation.map_or(0, |s| s.draft_tokens()),
         vision_max_tokens: 0,
         vision_embedding_pool_bytes: 0,
         rope_scaling_factor: 0.0,
@@ -777,14 +819,17 @@ fn flash_next_options(decode_lanes: u32, residency: *mut c_void) -> ffi::IgnisMo
         attention_text_max_keys: 0,
         decode_lanes,
         residency,
+        draft_row_budget: speculation.map_or(0, |s| s.row_budget()),
+        mtp_expert_slots: std::ptr::null(),
     }
 }
 
 /// Load a Flash-Next artifact whose non-expert tensors `artifact` holds on
 /// the device (`fn_plan` and `geometry` as
 /// [`ignis_artifact::flash_next::bind`] took them), with `decode_lanes`
-/// decode lanes and the expert residency it borrows. The returned model
-/// must be dropped before `residency` and `artifact` (GitHub #302).
+/// decode lanes, the expert residency it borrows and its speculation (spec
+/// flash-next/07; `None`: today's rounds only). The returned model must be
+/// dropped before `residency` and `artifact` (GitHub #302).
 #[allow(clippy::too_many_arguments)]
 pub fn load_flash_next(
     fn_plan: &FlashNextPlan,
@@ -795,6 +840,8 @@ pub fn load_flash_next(
     kv_format: KvFormat,
     decode_lanes: u32,
     residency: &crate::residency::device::DeviceResidency,
+    speculation: Option<FlashNextSpeculation>,
+    mtp: Option<&crate::flash_next_mtp::MtpHead>,
 ) -> Result<Model, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let placement = |handle: ObjectHandle| {
@@ -803,7 +850,13 @@ pub fn load_flash_next(
     };
     let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
     let topology = ModelConfig::flash_next_from(geometry).topology_abi();
-    let options = flash_next_options(decode_lanes, residency.as_raw());
+    let mut options = flash_next_options(decode_lanes, residency.as_raw(), speculation);
+    // Spec flash-next/07: the MTP head's tensors beside the trunk's, and its expert slots.
+    let mut tensors = tensors;
+    if let Some(head) = mtp {
+        tensors.extend_from_slice(head.bound_tensors());
+        options.mtp_expert_slots = head.slots().as_ptr();
+    }
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
         ffi::ignis_model_load(
@@ -838,6 +891,8 @@ pub fn plan_flash_next_reservations(
     max_context_tokens: u32,
     kv_format: KvFormat,
     decode_lanes: u32,
+    speculation: Option<FlashNextSpeculation>,
+    mtp: Option<&ignis_artifact::flash_next::mtp::MtpPlan>,
 ) -> Result<IgnisModelReservations, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let placement = |handle: ObjectHandle| {
@@ -849,9 +904,22 @@ pub fn plan_flash_next_reservations(
             .map(|placed| (placed.bytes, std::ptr::null()))
             .ok_or_else(|| "a Flash-Next tensor is not a device object of the plan".to_string())
     };
-    let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
+    let (_names, mut tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
+    // Spec flash-next/07: the MTP head's descriptors, placed nowhere yet (a plan reads no data).
+    let (_head_names, head) = match mtp {
+        Some(plan) => mtp_bound_tensors(plan, geometry, |handle| {
+            plan.plan
+                .device_objects
+                .iter()
+                .find(|placed| placed.handle == handle)
+                .map(|placed| (placed.bytes, std::ptr::null()))
+                .ok_or_else(|| "an MTP tensor is not a device object of its plan".to_string())
+        })?,
+        None => (Vec::new(), Vec::new()),
+    };
+    tensors.extend(head);
     let topology = ModelConfig::flash_next_from(geometry).topology_abi();
-    let options = flash_next_options(decode_lanes, std::ptr::null_mut());
+    let options = flash_next_options(decode_lanes, std::ptr::null_mut(), speculation);
     let mut reservations = IgnisModelReservations::default();
     let rc = unsafe {
         ffi::ignis_model_plan_reservations(
@@ -894,7 +962,7 @@ mod tests {
         ignis_artifact::packer::pack(&tree.pack_options(), &mut |_| {}).expect("pack");
         let reader = Reader::open(&tree.artifact_path()).expect("open the fixture artifact");
         let fn_plan = flash_next::bind(&reader, &tree.geometry).expect("bind the fixture artifact");
-        let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, 128, 1024, KvFormat::HqE8_2b, 3)
+        let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, 128, 1024, KvFormat::HqE8_2b, 3, None, None)
             .expect_err("the fixture's geometry is not one the program runs");
         assert!(err.contains("does not run this geometry (its weights bind)"), "{err}");
     }
@@ -1084,10 +1152,13 @@ mod tests {
         // text readout's keys, which fill what was the struct's padding --
         // so the size did not move (ADR 0041 records why that is accepted).
         // GitHub #302: then the uint32 decode lanes, padding, and the
-        // residency pointer.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 64);
+        // residency pointer; GitHub #307: the uint32 draft row budget,
+        // padding, and the MTP head's slot table pointer.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 80);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, decode_lanes), 48);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, residency), 56);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, draft_row_budget), 64);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, mtp_expert_slots), 72);
         // uint64 x 3, then (GitHub #210) the six uint64 reservation lines and
         // (GitHub #302) the seventh, Flash-Next's activations.
         assert_eq!(std::mem::size_of::<IgnisModelStats>(), 80);

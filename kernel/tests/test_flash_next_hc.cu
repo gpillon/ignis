@@ -15,8 +15,12 @@
 //   7.7e-2 against the result, reproduced on the CPU by fp32 against fp64
 //   accumulation, which measured 6.4e-3 against the terms);
 // - the final mixer (no inject weights) the same;
-// - the inject, given the same weights, bit for bit.
-// Rows 1, 3 (decode lanes) and 1100 (past one 1024-row wave).
+// - the inject, given the same weights, bit for bit;
+// - a mix replayed gives the same bits (partials are summed in a fixed order).
+// mix_down / mix_up in both stored formats: BF16, and FP8 row-scale as the
+// artifact stores them (the reference's weights are then scale * e4m3(code)).
+// Rows 1, 3, 8 (decode lanes, up to the decode route's ceiling), 9 (the first
+// row count past it) and 1100 (past one 1024-row wave).
 //
 // GPU test (ADR 0006): no SKIP_RETURN_CODE, a missing device fails.
 
@@ -24,6 +28,7 @@
 
 #include "ignis_fp8_linear.h"
 
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -86,6 +91,45 @@ std::vector<uint16_t> random_bf16(std::size_t n, double scale, uint32_t seed) {
   return out;
 }
 
+double e4m3_value(uint8_t code) {
+  const int sign = (code & 0x80) ? -1 : 1;
+  const int exponent = (code >> 3) & 0xF;
+  const int mantissa = code & 0x7;
+  if (exponent == 0) {
+    return sign * std::ldexp(mantissa / 8.0, -6);
+  }
+  return sign * std::ldexp(1.0 + mantissa / 8.0, exponent - 7);
+}
+
+// An FP8 row-scale payload (layout.md 6.1) of uniform values in +-`scale`:
+// codes [rows][cols], then BF16 scales at the next multiple of 256 bytes.
+// `value` gets each weight as the reference reads it, scale * e4m3(code).
+std::vector<uint8_t> fp8_payload(int rows, int cols, double scale, uint32_t seed, std::vector<double> &value) {
+  const std::size_t codes = static_cast<std::size_t>(rows) * cols;
+  const std::size_t scales_at = (codes + 255) / 256 * 256;
+  std::vector<uint8_t> payload(scales_at + static_cast<std::size_t>(rows) * 2, 0);
+  value.assign(codes, 0.0);
+  for (int r = 0; r < rows; ++r) {
+    const uint16_t bits = bf16_bits(scale / 448.0 * (0.75 + static_cast<double>(lcg(seed) % 64) / 128.0));
+    std::memcpy(&payload[scales_at + static_cast<std::size_t>(r) * 2], &bits, 2);
+    for (int c = 0; c < cols; ++c) {
+      const double u = static_cast<double>(lcg(seed) >> 8) / 16777216.0 * 2.0 - 1.0;
+      const std::size_t i = static_cast<std::size_t>(r) * cols + c;
+      payload[i] = __nv_cvt_float_to_fp8(static_cast<float>(u * 448.0), __NV_SATFINITE, __NV_E4M3);
+      value[i] = e4m3_value(payload[i]) * bf16_value(bits);
+    }
+  }
+  return payload;
+}
+
+std::vector<double> bf16_values(const std::vector<uint16_t> &bits) {
+  std::vector<double> out(bits.size());
+  for (std::size_t i = 0; i < bits.size(); ++i) {
+    out[i] = bf16_value(bits[i]);
+  }
+  return out;
+}
+
 template <typename T>
 T *upload(const std::vector<T> &host) {
   T *dev = nullptr;
@@ -100,8 +144,11 @@ constexpr int kWidth = kStreams * kHidden;
 constexpr int kRank = 320;
 constexpr double kEps = 1e-6;
 
+// The reference's weights: hc_norm and block_inject BF16, mix_down / mix_up as
+// the device's format decodes them.
 struct Weights {
-  std::vector<uint16_t> norm, down, up, inject;
+  std::vector<uint16_t> norm, inject;
+  std::vector<double> down, up;
 };
 
 // The BF16 module, in fp64 between its roundings.
@@ -126,7 +173,7 @@ void reference_mix(const Weights &w, const std::vector<uint16_t> &hidden, int ro
   for (int k = 0; k < kRank; ++k) {
     double d = 0.0;
     for (int i = 0; i < kWidth; ++i) {
-      d += bf16_value(w.down[static_cast<std::size_t>(k) * kWidth + i]) * normed[i];
+      d += w.down[static_cast<std::size_t>(k) * kWidth + i] * normed[i];
     }
     const double scaled = bf(bf(d) / kStreams);
     act[k] = bf(scaled / (1.0 + std::exp(-scaled)));
@@ -140,7 +187,7 @@ void reference_mix(const Weights &w, const std::vector<uint16_t> &hidden, int ro
       const int i = s * kHidden + h;
       double u = 0.0;
       for (int k = 0; k < kRank; ++k) {
-        u += bf16_value(w.up[static_cast<std::size_t>(i) * kRank + k]) * act[k];
+        u += w.up[static_cast<std::size_t>(i) * kRank + k] * act[k];
       }
       const double m = bf(1.0 / (1.0 + std::exp(-bf(u))));
       sum += bf(m * normed[i]);
@@ -162,9 +209,9 @@ void reference_mix(const Weights &w, const std::vector<uint16_t> &hidden, int ro
   }
 }
 
-void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, int rows, bool with_inject,
-              ninfer::DeviceArena &scratch) {
-  const std::string label = std::string(with_inject ? "mix" : "final mixer") + ", " +
+void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, const char *format, int rows,
+              bool with_inject, ninfer::DeviceArena &scratch) {
+  const std::string label = std::string(with_inject ? "mix" : "final mixer") + " (" + format + "), " +
                             std::to_string(rows) + " rows";
   const auto hidden = random_bf16(static_cast<std::size_t>(rows) * kWidth, 2.0, 0x4C0U + rows);
   auto *d_hidden = upload(hidden);
@@ -192,10 +239,30 @@ void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, int rows
   cuda_ok(cudaMemcpy(x.data(), d_x, x.size() * 2, cudaMemcpyDeviceToHost), "download x");
   cuda_ok(cudaMemcpy(inj.data(), d_inj, inj.size() * 4, cudaMemcpyDeviceToHost), "download inj");
 
-  // Check a spread of rows (all of them when few): the reference is slow.
+  // Replayed, the same bits.
+  check(ignis::flash_next::fn_hc_mix(g, weights, d_hidden, rows, d_x, with_inject ? d_inj : nullptr,
+                                     scratch, nullptr) == 0,
+        label + ": runs again: " + ignis::flash_next::fn_last_error());
+  cuda_ok(cudaDeviceSynchronize(), "sync");
+  std::vector<uint16_t> x2(x.size());
+  std::vector<float> inj2(inj.size());
+  cuda_ok(cudaMemcpy(x2.data(), d_x, x2.size() * 2, cudaMemcpyDeviceToHost), "download x");
+  cuda_ok(cudaMemcpy(inj2.data(), d_inj, inj2.size() * 4, cudaMemcpyDeviceToHost), "download inj");
+  check(x2 == x && (!with_inject || std::memcmp(inj2.data(), inj.data(), inj.size() * 4) == 0),
+        label + ": a second run gives the same bits");
+
+  // Check a spread of rows (all of them when few) and the last three (a
+  // narrow last wave takes the decode route): the reference is slow.
+  std::vector<int> checked;
+  for (int row = 0; row < rows; row += rows > 16 ? 137 : 1) {
+    checked.push_back(row);
+  }
+  for (int row = std::max(checked.back() + 1, rows - 3); row < rows; ++row) {
+    checked.push_back(row);
+  }
   double worst = 0.0;
   int bad = 0;
-  for (int row = 0; row < rows; row += rows > 8 ? 137 : 1) {
+  for (int row : checked) {
     std::vector<double> rx, rterms, rinj;
     reference_mix(w, hidden, row, with_inject, rx, rterms, rinj);
     double rms = 0.0;
@@ -263,20 +330,77 @@ int main() {
   }
   Weights w;
   w.norm = random_bf16(kWidth, 0.2, 1);
-  w.down = random_bf16(static_cast<std::size_t>(kRank) * kWidth, 0.02, 2);
-  w.up = random_bf16(static_cast<std::size_t>(kWidth) * kRank, 0.1, 3);
+  const auto down = random_bf16(static_cast<std::size_t>(kRank) * kWidth, 0.02, 2);
+  const auto up = random_bf16(static_cast<std::size_t>(kWidth) * kRank, 0.1, 3);
+  w.down = bf16_values(down);
+  w.up = bf16_values(up);
   w.inject = random_bf16(static_cast<std::size_t>(kStreams) * kWidth, 0.02, 4);
   ignis::flash_next::HcWeights dw;
   dw.hc_norm = upload(w.norm);
-  dw.mix_down = {upload(w.down), kRank, kWidth, ignis::flash_next::WeightFormat::Bf16};
-  dw.mix_up = {upload(w.up), kWidth, kRank, ignis::flash_next::WeightFormat::Bf16};
+  dw.mix_down = {upload(down), kRank, kWidth, ignis::flash_next::WeightFormat::Bf16};
+  dw.mix_up = {upload(up), kWidth, kRank, ignis::flash_next::WeightFormat::Bf16};
   dw.block_inject = upload(w.inject);
 
+  // The artifact's formats: FP8 row-scale mix_down / mix_up.
+  Weights w8 = w;
+  ignis::flash_next::HcWeights dw8 = dw;
+  dw8.mix_down = {upload(fp8_payload(kRank, kWidth, 0.03, 5, w8.down)), kRank, kWidth,
+                  ignis::flash_next::WeightFormat::Fp8RowScale};
+  dw8.mix_up = {upload(fp8_payload(kWidth, kRank, 0.15, 6, w8.up)), kWidth, kRank,
+                ignis::flash_next::WeightFormat::Fp8RowScale};
+
   ninfer::DeviceArena scratch(64u << 20);
-  for (int rows : {1, 3, 1100}) {
-    mix_case(w, dw, rows, true, scratch);
+  for (int rows : {1, 3, 8, 9, 1027, 1100}) {
+    mix_case(w, dw, "BF16", rows, true, scratch);
+    mix_case(w8, dw8, "FP8", rows, true, scratch);
   }
-  mix_case(w, dw, 3, false, scratch);
+  for (int rows : {1, 3, 9}) {
+    mix_case(w, dw, "BF16", rows, false, scratch);
+    mix_case(w8, dw8, "FP8", rows, false, scratch);
+  }
+  // A part re-converted to BF16 (linear.cu): one projection of each format.
+  Weights w8_down = w8;
+  w8_down.up = w.up;
+  ignis::flash_next::HcWeights dw8_down = dw8;
+  dw8_down.mix_up = dw.mix_up;
+  Weights w8_up = w;
+  w8_up.up = w8.up;
+  ignis::flash_next::HcWeights dw8_up = dw;
+  dw8_up.mix_up = dw8.mix_up;
+  for (int rows : {1, 3, 9}) {
+    mix_case(w8_down, dw8_down, "FP8 down, BF16 up", rows, true, scratch);
+    mix_case(w8_up, dw8_up, "BF16 down, FP8 up", rows, true, scratch);
+  }
+
+  // What the norm cannot hold, and projections whose shape is not the
+  // geometry's, are refused by name, not computed wrong.
+  {
+    ignis::flash_next::Geometry g;
+    g.streams = kStreams;
+    g.hc_rank = kRank;
+    g.rms_norm_eps = static_cast<float>(kEps);
+    void *d_out = nullptr;
+    float *d_inj = nullptr;
+    cuda_ok(cudaMalloc(&d_out, static_cast<std::size_t>(kWidth) * 2), "cudaMalloc out");
+    cuda_ok(cudaMalloc(&d_inj, kStreams * 4), "cudaMalloc inj");
+    for (int hidden : {2564, 4104}) {
+      g.hidden = hidden;
+      check(ignis::flash_next::fn_hc_mix(g, dw, d_out, 1, d_out, d_inj, scratch, nullptr) != 0,
+            "a stream width of " + std::to_string(hidden) + " is refused");
+    }
+    g.hidden = kHidden;
+    ignis::flash_next::HcWeights misaligned = dw;
+    misaligned.block_inject = static_cast<const char *>(dw.block_inject) + 2;
+    check(ignis::flash_next::fn_hc_mix(g, misaligned, d_out, 1, d_out, d_inj, scratch, nullptr) != 0,
+          "a block-inject weight off 16 bytes is refused");
+    ignis::flash_next::HcWeights reshaped = dw;
+    reshaped.mix_up.cols = kRank + 16;
+    check(ignis::flash_next::fn_hc_mix(g, reshaped, d_out, 1, d_out, d_inj, scratch, nullptr) != 0,
+          "a mix_up of another rank than the geometry's is refused");
+    cuda_ok(cudaDeviceSynchronize(), "sync");
+    cudaFree(d_out);
+    cudaFree(d_inj);
+  }
 
   if (g_failed != 0) {
     std::fprintf(stderr, "flash-next hyper-connection test: %d check(s) failed\n", g_failed);

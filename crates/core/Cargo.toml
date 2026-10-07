@@ -52,8 +52,31 @@ kv-capture = []
 # production build; the only production-side trace is the disarmed flag
 # check in `run_gqa_layer`.
 attn-tap = []
+# Test-only Flash-Next residual-stack tap (kernel/include/ignis_fn_residual_tap.h,
+# not part of the public flat C ABI): gates `residual_tap` and
+# `FlashNextEngine::tapped_span`, which copy the trunk's final pre-mixer stack
+# of every prefill position to the host, so spec flash-next/07 phase A can feed
+# the checkpoint's MTP head the engine's own states. Never enabled in a
+# production build; the only production-side trace is the disarmed flag check
+# in the Flash-Next prefill.
+residual-tap = []
 # The KLD measurement's engine side (2026-09-24): every position's logits
 # for a set of token windows, via `step::prefill_program_span_logits`.
 [[example]]
 name = "span_logits"
+required-features = ["cuda"]
+# Spec flash-next/07 phase A's engine side: the tapped trunk states the MTP
+# prototype reads, and the decode round's cost per row.
+[[example]]
+name = "flash_next_mtp_phase_a"
+required-features = ["cuda", "residual-tap"]
+# Spec flash-next/07 phase B: the tapped trunk states over the calibration
+# corpus that the MTP head's expert Hessians are computed from.
+[[example]]
+name = "flash_next_mtp_calibration"
+required-features = ["cuda", "residual-tap"]
+# Spec flash-next/07's measurement: tok/s at one to three lanes, speculation
+# off against the MTP head, and the verify round's column cost.
+[[example]]
+name = "flash_next_mtp_bench"
 required-features = ["cuda"]

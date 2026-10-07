@@ -35,6 +35,11 @@
 //! invariants `Sidecar::load` requires (`recipe_id`, `artifact.bytes`,
 //! `objects.count`) merged with `converter.json`'s fields; a later run
 //! merges a `converter.json` written after the container was finished.
+//!
+//! The same mechanics pack the MTP head's companion container
+//! ([`Family::Mtp`], layout.md §13): one unit, `mtp/`, and a sidecar that
+//! pins the main container it belongs to (`pair.main`, read from the main
+//! container itself, so its hash is the one the binder computes).
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -44,7 +49,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::flash_next::{expert_name, FlashNextGeometry, Projection, TrellisK};
+use crate::flash_next::{
+    expert_name, mtp_expert_name, FlashNextGeometry, Projection, TrellisK, MTP_MODEL_ID, MTP_PREFIX,
+};
 use crate::writer::{entry_json_bytes, ContainerWriter, WriterState};
 use crate::{
     fail, require_string, tensor_encoded_size, ArtifactIdentity, NumericFormat, Object, Reader,
@@ -63,6 +70,13 @@ pub const DEFAULT_DELETE_BATCH_BYTES: u64 = 1 << 30;
 /// (layout.md §1; the packer's default `--out`).
 pub const ARTIFACT_FILE_NAME: &str = "qwen3_8_flash_next_trellis_a25-v2.ninfer";
 
+/// The MTP companion container's file name, beside the main one
+/// (layout.md §13.1).
+pub const MTP_ARTIFACT_FILE_NAME: &str = "qwen3_8_flash_next_mtp_3p0-v2.ninfer";
+
+/// The companion's header reservation: its directory is ~0.2 MB.
+pub const MTP_HEADER_BYTES: u64 = 1 << 20;
+
 /// Room a `keep_work` run leaves free beyond its second copy.
 const KEEP_WORK_MARGIN_BYTES: u64 = 2 << 30;
 
@@ -72,6 +86,24 @@ pub fn default_identity() -> ArtifactIdentity {
         model_id: crate::flash_next::MODEL_ID.into(),
         weights_id: "trellis-a25-fp8rows-q4g32-de4b8e4".into(),
     }
+}
+
+/// The MTP companion container's identity (layout.md §13.2).
+pub fn mtp_identity() -> ArtifactIdentity {
+    ArtifactIdentity {
+        model_id: MTP_MODEL_ID.into(),
+        weights_id: "mtp-trellis-a30-fp8rows-de4b8e4".into(),
+    }
+}
+
+/// Which container a work tree packs into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Family {
+    /// The model: frontend, globals, the n-gram unit, the layers.
+    Main,
+    /// The MTP head's companion (layout.md §13): the one unit `mtp/`,
+    /// pinned to the main container `pair_main`.
+    Mtp { pair_main: PathBuf },
 }
 
 /// What one [`pack`] call is asked to do.
@@ -93,6 +125,7 @@ pub struct PackOptions {
     /// The `converter.json` statuses to pack (`complete`; a dry run's
     /// `dry-run` or a fixture's `fixture` only when asked for).
     pub accept_status: Vec<String>,
+    pub family: Family,
 }
 
 impl PackOptions {
@@ -107,6 +140,18 @@ impl PackOptions {
             keep_work: false,
             delete_batch_bytes: DEFAULT_DELETE_BATCH_BYTES,
             accept_status: vec!["complete".into()],
+            family: Family::Main,
+        }
+    }
+
+    /// The defaults for an MTP companion: `work_dir` → `artifact`, pinned to
+    /// the main container `pair_main`.
+    pub fn mtp(work_dir: PathBuf, artifact: PathBuf, geometry: FlashNextGeometry, pair_main: PathBuf) -> Self {
+        Self {
+            identity: mtp_identity(),
+            header_bytes: MTP_HEADER_BYTES,
+            family: Family::Mtp { pair_main },
+            ..Self::new(work_dir, artifact, geometry)
         }
     }
 }
@@ -145,7 +190,15 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The units in container order.
+/// The units of `family` in container order.
+pub fn family_units(family: &Family, layers: usize) -> Vec<String> {
+    match family {
+        Family::Main => unit_names(layers),
+        Family::Mtp { .. } => vec!["mtp".into()],
+    }
+}
+
+/// The main container's units in container order.
 pub fn unit_names(layers: usize) -> Vec<String> {
     let mut units: Vec<String> = ["frontend", "global", "ngram"].map(String::from).to_vec();
     units.extend((0..layers).map(|layer| format!("layers/L{layer:02}")));
@@ -168,7 +221,11 @@ struct PackState {
 pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<PackOutcome> {
     let _lock = lock(&options.artifact)?;
     let state_file = state_path(&options.artifact);
-    let units = unit_names(options.geometry.layers);
+    let units = family_units(&options.family, options.geometry.layers);
+    let pair = match &options.family {
+        Family::Mtp { pair_main } => Some(pair_record(pair_main)?),
+        Family::Main => None,
+    };
 
     let mut state = if state_file.exists() {
         let state = read_state(&state_file)?;
@@ -244,6 +301,9 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
                 options.accept_status
             )));
         }
+        if let Some(pair) = &pair {
+            check_pair(&read_json(&converter)?, pair)?;
+        }
     }
     if options.keep_work && !state.finished {
         let mut needed = 0u64;
@@ -266,7 +326,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
     if state.finished {
         let reader = Reader::open(&options.artifact)?;
         let converter_merged =
-            write_sidecar(&options.artifact, &options.work_dir, reader.file_bytes(), reader.objects().len())?;
+            write_sidecar(&options.artifact, &options.work_dir, reader.file_bytes(), reader.objects().len(), pair.as_ref())?;
         return Ok(PackOutcome::Finished {
             file_bytes: reader.file_bytes(),
             object_count: reader.objects().len(),
@@ -330,7 +390,8 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
             reader.file_bytes()
         )));
     }
-    let converter_merged = write_sidecar(&options.artifact, &options.work_dir, file_bytes, object_count)?;
+    let converter_merged =
+        write_sidecar(&options.artifact, &options.work_dir, file_bytes, object_count, pair.as_ref())?;
     state.finished = true;
     write_state(&state_file, &state)?;
     progress(&format!("finished: {object_count} objects, {file_bytes} bytes"));
@@ -523,6 +584,10 @@ fn plan_unit(work_dir: &Path, unit: &str, geometry: &FlashNextGeometry) -> Resul
             }
         }
         "global" => plan_tensors_json(&mut plan, &done, None)?,
+        "mtp" => {
+            plan_tensors_json(&mut plan, &done, Some(MTP_PREFIX))?;
+            plan_experts(&mut plan, &done, geometry, mtp_expert_name)?;
+        }
         "ngram" => {
             if !plan_ngram(&mut plan, &done, geometry)? {
                 return Ok(None);
@@ -533,16 +598,17 @@ fn plan_unit(work_dir: &Path, unit: &str, geometry: &FlashNextGeometry) -> Resul
                 .strip_prefix("layers/L")
                 .and_then(|n| n.parse().ok())
                 .ok_or_else(|| fail(format!("unknown unit {unit}")))?;
-            plan_tensors_json(&mut plan, &done, Some(layer))?;
-            plan_experts(&mut plan, &done, geometry, layer)?;
+            plan_tensors_json(&mut plan, &done, Some(&format!("layers.{layer}.")))?;
+            plan_experts(&mut plan, &done, geometry, |expert, projection| expert_name(layer, expert, projection))?;
         }
     }
     Ok(Some(plan))
 }
 
 /// The tensors a `tensors.json` lists (layout.md §6.3), each whole in its
-/// file, under its own name.
-fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, layer: Option<usize>) -> Result<()> {
+/// file, under its own name, which must start with `prefix` when one is
+/// given (a layer's `layers.{L}.`, the MTP head's `mtp.`).
+fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, prefix: Option<&str>) -> Result<()> {
     if !done.contains_key("tensors.json") {
         return Err(fail(format!("{}'s DONE does not list tensors.json", plan.dir.display())));
     }
@@ -554,9 +620,9 @@ fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, layer: Option<usize>) -> 
         .ok_or_else(|| fail(format!("{} has no tensors array", path.display())))?;
     for entry in tensors {
         let name = require_string(&entry["name"], "tensor name")?.to_owned();
-        if let Some(layer) = layer {
-            if !name.starts_with(&format!("layers.{layer}.")) {
-                return Err(fail(format!("{} lists {name}, not a layer {layer} tensor", path.display())));
+        if let Some(prefix) = prefix {
+            if !name.starts_with(prefix) {
+                return Err(fail(format!("{} lists {name}, outside {prefix}", path.display())));
             }
         }
         let file = require_string(&entry["file"], "tensor file")?;
@@ -583,8 +649,13 @@ fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, layer: Option<usize>) -> 
 }
 
 /// A layer's expert projections: `experts.bin` sliced by `experts.idx`
-/// (layout.md §4), one tensor per projection.
-fn plan_experts(plan: &mut UnitPlan, done: &Done, geometry: &FlashNextGeometry, layer: usize) -> Result<()> {
+/// (layout.md §4), one tensor per projection, named by `name`.
+fn plan_experts(
+    plan: &mut UnitPlan,
+    done: &Done,
+    geometry: &FlashNextGeometry,
+    name: impl Fn(u64, Projection) -> String,
+) -> Result<()> {
     if !done.contains_key("experts.idx") {
         return Err(fail(format!("{}'s DONE does not list experts.idx", plan.dir.display())));
     }
@@ -625,7 +696,7 @@ fn plan_experts(plan: &mut UnitPlan, done: &Done, geometry: &FlashNextGeometry, 
             )));
         }
         plan.objects.push(Planned {
-            name: expert_name(layer, u64::from(expert), expected),
+            name: name(u64::from(expert), expected),
             spec: Spec::Tensor {
                 format: k.format(),
                 layout: StorageLayout::TrellisTile16V1,
@@ -1066,10 +1137,57 @@ fn remove_file(path: &Path) -> Result<()> {
     }
 }
 
+/// What an MTP companion records of its main container (layout.md §13.5
+/// `pair.main`), read from the container itself: `content_hash` is
+/// [`Reader::content_hash`], the hash the binder compares at load, and
+/// `file_sha256` the whole file's (one pass over it, at pack time only).
+fn pair_record(main: &Path) -> Result<Value> {
+    let reader = Reader::open(main)?;
+    let file = main
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| fail(format!("{} has no file name", main.display())))?;
+    let mut hasher = Sha256::new();
+    let handle = File::open(main).map_err(|e| fail(format!("open {}: {e}", main.display())))?;
+    std::io::copy(&mut BufReader::with_capacity(8 << 20, handle), &mut hasher)
+        .map_err(|e| fail(format!("read {}: {e}", main.display())))?;
+    Ok(json!({
+        "file": file,
+        "model_id": reader.identity().model_id,
+        "weights_id": reader.identity().weights_id,
+        "bytes": reader.file_bytes(),
+        "objects": reader.objects().len(),
+        "content_hash": hex(&reader.content_hash()),
+        "file_sha256": hex(&hasher.finalize()),
+    }))
+}
+
+/// The companion's `converter.json` records the main container the head was
+/// calibrated on (its whole-file SHA-256), and it must be the one this run
+/// pins: the hashes are compared, not the names.
+fn check_pair(converter: &Value, pair: &Value) -> Result<()> {
+    let ours = pair["file_sha256"].as_str().unwrap_or_default();
+    match converter.pointer("/pair/main/file_sha256").and_then(Value::as_str) {
+        Some(theirs) if theirs == ours => Ok(()),
+        Some(theirs) => Err(fail(format!(
+            "converter.json calibrated the head on a main container with SHA-256 {theirs}; {} has {ours}",
+            pair["file"].as_str().unwrap_or_default()
+        ))),
+        None => Err(fail("converter.json does not record the head's main container (pair.main.file_sha256)")),
+    }
+}
+
 /// Write the sidecar: its existing keys, then `converter.json`'s (when the
-/// converter has written it), then the whole-file invariants. Returns
-/// whether `converter.json` was merged.
-fn write_sidecar(artifact: &Path, work_dir: &Path, file_bytes: u64, object_count: usize) -> Result<bool> {
+/// converter has written it), then the whole-file invariants and, for an
+/// MTP companion, `pair.main`'s fields read from the main container.
+/// Returns whether `converter.json` was merged.
+fn write_sidecar(
+    artifact: &Path,
+    work_dir: &Path,
+    file_bytes: u64,
+    object_count: usize,
+    pair: Option<&Value>,
+) -> Result<bool> {
     let path = sidecar_path(artifact);
     let mut root = if path.exists() {
         match read_json(&path)? {
@@ -1103,6 +1221,18 @@ fn write_sidecar(artifact: &Path, work_dir: &Path, file_bytes: u64, object_count
             .as_object_mut()
             .ok_or_else(|| fail(format!("sidecar member {key} is not an object")))?;
         map.insert(member.into(), json!(value));
+    }
+    if let Some(Value::Object(fields)) = pair {
+        let pair = root
+            .entry("pair")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| fail("sidecar member pair is not an object"))?;
+        pair.entry("main")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| fail("sidecar member pair.main is not an object"))?
+            .extend(fields.clone());
     }
     let text = serde_json::to_string_pretty(&Value::Object(root))
         .map_err(|e| fail(format!("serialize sidecar: {e}")))?;
@@ -1418,5 +1548,91 @@ mod tests {
         finished(pack(&tree.pack_options(), &mut quiet()).unwrap());
         // The lock file stays for the next packer to lock.
         assert!(with_suffix(&tree.artifact_path(), ".pack.lock").exists());
+    }
+
+    /// The main fixture container and, in its tree, the MTP head's work unit
+    /// naming it.
+    fn mtp_tree(tag: &str) -> fixture::FixtureArtifact {
+        let main = fixture::build(tag).unwrap();
+        main.tree.write_mtp(&main.path).unwrap();
+        main
+    }
+
+    #[test]
+    fn an_mtp_companion_holds_the_heads_objects_and_pins_its_main_container() {
+        let main = mtp_tree("mtp-pack");
+        let tree = &main.tree;
+        let (file_bytes, object_count, merged) =
+            finished(pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap());
+        assert!(merged);
+        assert!(!tree.mtp_work_dir().join("mtp").exists(), "the unit is deleted once appended");
+
+        let g = &tree.geometry;
+        let companion = Reader::open(&tree.mtp_artifact_path()).unwrap();
+        assert_eq!(companion.identity(), &mtp_identity());
+        let entries = crate::flash_next::mtp_entries(g);
+        assert_eq!(object_count, entries.len() + 2 * g.experts as usize);
+        for entry in &entries {
+            let Some(Object::Tensor(t)) = companion.find(&entry.name) else {
+                panic!("{} is missing", entry.name)
+            };
+            assert_eq!((t.format, t.layout), (entry.format, entry.layout), "{}", entry.name);
+        }
+        for expert in 0..g.experts {
+            for projection in Projection::ALL {
+                let name = mtp_expert_name(expert, projection);
+                let Some(Object::Tensor(t)) = companion.find(&name) else { panic!("{name} is missing") };
+                assert_eq!(t.shape, g.projection_shape(projection).to_vec(), "{name}");
+                assert_eq!(t.layout, StorageLayout::TrellisTile16V1, "{name}");
+            }
+        }
+
+        // pair.main is the main container as the reader sees it, beside what
+        // the converter recorded of it.
+        let reader = Reader::open(&main.path).unwrap();
+        let record = read_json(&sidecar_path(&tree.mtp_artifact_path())).unwrap();
+        let pinned = &record["pair"]["main"];
+        assert_eq!(pinned["content_hash"], hex(&reader.content_hash()));
+        assert_eq!(pinned["model_id"], reader.identity().model_id);
+        assert_eq!(pinned["weights_id"], reader.identity().weights_id);
+        assert_eq!(pinned["bytes"], reader.file_bytes());
+        assert_eq!(pinned["objects"], reader.objects().len());
+        assert_eq!(pinned["file_sha256"], hex(&Sha256::digest(std::fs::read(&main.path).unwrap())));
+        assert_eq!(pinned["file"], main.path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(record["schema"], "flash-next-mtp-converter-v1");
+        assert_eq!((record["artifact"]["bytes"].as_u64(), record["objects"]["count"].as_u64()),
+                   (Some(file_bytes), Some(object_count as u64)));
+    }
+
+    #[test]
+    fn an_mtp_companion_is_refused_when_its_converter_records_another_main_container_or_none() {
+        let main = mtp_tree("mtp-refused");
+        let tree = &main.tree;
+        let converter = tree.mtp_work_dir().join("converter.json");
+        let mut record = read_json(&converter).unwrap();
+        record["pair"]["main"]["file_sha256"] = json!("00".repeat(32));
+        std::fs::write(&converter, record.to_string()).unwrap();
+        let err = pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains(&format!("a main container with SHA-256 {}", "00".repeat(32))), "{err}");
+
+        record["pair"]["main"].as_object_mut().unwrap().remove("file_sha256");
+        std::fs::write(&converter, record.to_string()).unwrap();
+        let err = pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains("does not record the head's main container"), "{err}");
+        assert!(tree.mtp_work_dir().join("mtp").exists(), "nothing is consumed");
+    }
+
+    #[test]
+    fn an_mtp_unit_naming_a_tensor_outside_the_head_is_refused() {
+        let main = mtp_tree("mtp-stray");
+        let tree = &main.tree;
+        let unit = tree.mtp_work_dir().join("mtp");
+        let listing = unit.join("tensors.json");
+        let text = std::fs::read_to_string(&listing).unwrap();
+        std::fs::write(&listing, text.replacen("mtp.fc_hidden.weight\"", "fc_hidden.weight\"", 1)).unwrap();
+        std::fs::remove_file(unit.join("DONE")).unwrap();
+        tree.mark_mtp_done().unwrap();
+        let err = pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains("lists fc_hidden.weight, outside mtp."), "{err}");
     }
 }
