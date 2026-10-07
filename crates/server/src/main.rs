@@ -183,7 +183,7 @@ fn cuda_scheduler(
             artifact_path,
             model.into(),
             eos,
-            shape,
+            shape.with_family_decode_share(ModelFamily::Qwen38_27b),
             thinking_close,
         ),
     };
