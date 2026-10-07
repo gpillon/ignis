@@ -171,7 +171,7 @@ always-current table; this one is a copy.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--max-context <tokens>` | `IGNIS_MAX_CONTEXT` | `40960` | Max per-sequence context (prompt + generation). The KV pool must be able to hold one of them or the load is refused. |
+| `--max-context <tokens>` | `IGNIS_MAX_CONTEXT` | `40960` | Max per-sequence context (prompt + generation). The KV pool must be able to hold one of them or the load is refused. On the 27B the attention bounds it too: at most 524,288 on `bf16`, 1,048,576 on `hq-e8-2b`; past that the start is refused. Flash-Next has no such bound. |
 | `--prefill-chunk <tokens>` | `IGNIS_PREFILL_CHUNK` | `1024` | The prefill chunk width, a nonzero multiple of 128. The program's prefill scratch is reserved for it at load. |
 | `--decode-lanes <n>` | `IGNIS_DECODE_LANES` | `3` | Flash-Next only, `1..=8`: the sequences decoded at once. Each lane holds a whole `--max-context` in the KV pool, so fewer lanes leave the expert cache more of the VRAM budget (and a lone user decodes at one lane either way). The 27B serves a fixed 8 lanes and refuses the flag. `make MODEL=flash-next` runs 3 lanes at 262,144 tokens each (the checkpoint's trained positions); the `make` knob is `LANES`. |
 | `--decode-share <percent>` | `IGNIS_DECODE_SHARE` | the model's: `0` on the 27B, `50` on Flash-Next | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next waits until they have decoded for `t * s / (1 - s)`, and nothing waits when no lane decodes. It trades the prefilling request's TTFT (x2 at 50, only while lanes decode) for the lanes' rate (half instead of ~1 tok/s on Flash-Next). |
