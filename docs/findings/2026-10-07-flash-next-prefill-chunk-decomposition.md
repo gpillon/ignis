@@ -193,7 +193,9 @@ Observed:
 3. **The cache saves ~40% of each chunk's expert bytes**: 14.0-14.4 of 34-35 GB touched. Every chunk reads 96-99% of the cache.
 4. **The compute splits** into dense FP8 linears 36%, routed experts 34%, QSA 9%, routers 6%, hyper-connections 6% and GDN 4%. Synchronization and host gaps inside a chunk are 4-6 ms.
 5. **The n-gram gather is 8-15% of TTFT**: 0.18-0.62 s per 8192 tokens, serialized before each chunk with the card idle. It grows with the rows the hot cache misses: 12-55K file rows (11-51K reads, 48-216 MB) per chunk, depending on the text.
-6. **The link is Gen 3 x16** because the host's lanes are Gen 3 (i9-10900K). The card supports Gen 5.
+6. **The link is Gen 3 x16 because of the host, not the card.**
+   - `nvidia-smi --query-gpu=pcie.link.gen.gpumax,pcie.link.gen.hostmax,pcie.link.width.current --format=csv` reports GPU max 5, host max 3, width x16.
+   - The CPU is an i9-10900K (Comet Lake, PCIe 3.0 only) on a Z490 board (ROG Maximus XII Formula). That board reaches Gen 4 only with an 11th-gen CPU.
 7. **A 12288-token chunk cuts TTFT 27-30% at ~9K and 10-11% at ~30K, at zero code.**
    - It folds a ~9K prompt's second chunk into the first, and a 30K prompt runs three chunks instead of four.
    - It takes 0.85 GB from the expert cache; the decode cost is in the 12288 evidence above.
@@ -217,7 +219,9 @@ Inferred:
 
 ## Implications
 
-The ranked levers: software first, by gain, then confidence, then cost; the hardware lever last. Gains are against the 8192 default at Gen 3, for the 30K prompt (10.2-10.9 s) and the ~9K prompt (4.7-5.0 s):
+The ranked levers: software first, by gain, then confidence, then cost; the hardware lever last. Gains are against the 8192 default at Gen 3, for the 30K prompt (10.2-10.9 s) and the ~9K prompt (4.7-5.0 s).
+
+The ranking is for this host. Every copy-bound number here is a Gen 3 x16 number. A Gen 4 host would roughly double the link, so ~2x on the copy buckets; Gen 5 ~4x (inferred). That would make full chunks compute-bound and shrink every item that saves copies (1-4, 6, 7); the gather (item 5) and kernel work (item 8) would become larger shares.
 
 | # | lever | estimated gain | basis | cost |
 |---:|---|---|---|---|
@@ -258,6 +262,7 @@ The ranked levers: software first, by gain, then confidence, then cost; the hard
   - item 4's saving is inferred (the piece's cost is measured), and item 7's time is inferred (its bytes are measured);
   - item 2's group activations, its interaction with the decode share, and its gap for the decode lanes are not designed.
 - **The gather varies with the text:** 12-55K file rows per 8192 tokens. Why the small spans' gathers took 16-24 ms in load A and 1-5 ms in load B is not known.
+- **Every copy-bound number is a Gen 3 x16 number.** This includes the copies' 11.7-12.3 GB/s, the exposed copies, the copy-bound tail traversals, the overlap bound and the lever gains. How they scale on a Gen 4 (~2x) or Gen 5 (~4x) host is inferred, not measured.
 - **The owner's figures** (34K in ~15 s, an 8192 chunk in ~2.9 s) were word-list prompts at 4 n-gram readers. This finding's real text at 16 readers gives 10.2-10.9 s for ~30K; a 34K prompt adds one more traversal.
 
 ## Follow-ups
@@ -269,4 +274,4 @@ Ranked, not filed:
 4. Pages-only chained prefix (item 4): already follow-up 1 of [the agent turn tail finding](2026-10-07-flash-next-agent-turn-tail.md); it also cuts every cold prompt.
 5. Gather pipelining and a deeper read queue (item 5).
 6. A balanced chunk split in the scheduler (item 6), once item 1 is decided.
-7. For the owner: the link is Gen 3 because of the host's CPU (item H).
+7. For the owner: the link is Gen 3 because of the host's CPU, an i9-10900K on a Z490 board (item H). An 11th-gen CPU on the same board would give Gen 4.
