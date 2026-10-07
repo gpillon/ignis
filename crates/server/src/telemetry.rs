@@ -918,6 +918,12 @@ impl Telemetry {
             thinking_budget = thinking.outcome.map(|t| t.budget),
             thinking_forced = thinking.outcome.map(|t| t.forced_at.is_some()),
             thinking_forced_at = thinking.outcome.and_then(|t| t.forced_at),
+            // Where `</think>` came, or `thinking_closed: false` for a turn
+            // that ended with its block open -- a client then shows the whole
+            // output as reasoning. That tells a model that never closed from
+            // a split that missed the close (#306).
+            thinking_closed = thinking.outcome.map(|t| t.closed_at.is_some()),
+            thinking_closed_at = thinking.outcome.and_then(|t| t.closed_at),
             thinking_budget_dropped = thinking.dropped_by_max.then_some("max"),
             "request done"
         );

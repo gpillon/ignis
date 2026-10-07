@@ -57,6 +57,10 @@ pub struct BudgetOutcome {
     /// the close was not forced (the model closed its block itself, or never
     /// reached the budget).
     pub forced_at: Option<u32>,
+    /// The output index of the block's `</think>` -- the model's own or the
+    /// forced one -- or `None` when the request ended with its block still
+    /// open: everything it emitted is reasoning, and no answer follows.
+    pub closed_at: Option<u32>,
 }
 
 /// The model's own way to close a reasoning block: the tokens forced, in
@@ -100,8 +104,9 @@ impl ThinkingClose {
 /// One request's progress against its budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BudgetState {
-    /// The request has emitted its reasoning block's closing marker.
-    closed: bool,
+    /// The output index of the reasoning block's closing marker, once the
+    /// request has emitted it.
+    closed_at: Option<u32>,
     /// The emitted-token index the close's first token is drawn for, once
     /// forcing has started.
     forced_from: Option<u32>,
@@ -120,7 +125,7 @@ impl BudgetState {
         let draw = emitted + 1;
         let from = match self.forced_from {
             Some(from) => from,
-            None if !self.closed && emitted >= budget => {
+            None if self.closed_at.is_none() && emitted >= budget => {
                 self.forced_from = Some(draw);
                 draw
             }
@@ -133,10 +138,10 @@ impl BudgetState {
     /// Record the token emitted at `index` (0-based over the request's
     /// output).
     pub fn commit(&mut self, close: &ThinkingClose, index: u32, token: TokenId) {
-        if token != close.think_end || self.closed {
+        if token != close.think_end || self.closed_at.is_some() {
             return;
         }
-        self.closed = true;
+        self.closed_at = Some(index);
         // A natural close before the forced one: stop forcing.
         if let Some(from) = self.forced_from {
             if (index as usize) < from as usize + close.think_end_at {
@@ -156,6 +161,12 @@ impl BudgetState {
     pub fn forced_at(&self) -> Option<u32> {
         self.forced_from
     }
+
+    /// The output index of the block's `</think>`, natural or forced; `None`
+    /// while the block is open.
+    pub fn closed_at(&self) -> Option<u32> {
+        self.closed_at
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +178,24 @@ mod tests {
     fn close() -> ThinkingClose {
         // "\n\n", "hand", "off", "</think>", "\n\n"
         ThinkingClose::new(vec![10, 11, 12, END, 10], END).unwrap()
+    }
+
+    /// The close's index is recorded where `</think>` was emitted, and a
+    /// request that never emits it reports none: its whole output was
+    /// reasoning (the turn a client shows as thinking only).
+    #[test]
+    fn closed_at_is_where_the_block_closed_and_none_when_it_never_did() {
+        let close = close();
+        let mut closed = BudgetState::default();
+        for (index, token) in [1, 2, END, 3, END].into_iter().enumerate() {
+            closed.commit(&close, index as u32, token);
+        }
+        assert_eq!(closed.closed_at(), Some(2), "the first close counts");
+        let mut open = BudgetState::default();
+        for (index, token) in [1, 2, 3].into_iter().enumerate() {
+            open.commit(&close, index as u32, token);
+        }
+        assert_eq!(open.closed_at(), None);
     }
 
     /// Drive a request round by round: each round emits the token the

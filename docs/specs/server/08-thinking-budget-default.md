@@ -210,6 +210,11 @@ Where the build departs from, or pins down, the text above:
   exactly when a budget was in effect, so a request with none carries
   neither. `thinking_forced_at` appears only when the close was forced, and
   `thinking_budget_dropped="max"` only when `max` discarded a budget.
+  `thinking_closed` (with a budget, as `thinking_forced`) says whether the
+  block's `</think>` came at all, and `thinking_closed_at` where: a turn that
+  ended with its block open (`thinking_closed=false`) is one a client shows
+  as reasoning only, which tells a model that never closed from a split that
+  missed the close (#306, 2026-10-07).
 - **The counter** is `ignis_thinking_forced_closes_total` (ADR 0017's table).
 - **A malformed `thinking_budget`** is a 400 with `error.param =
   "thinking_budget"`, the envelope's first use of OpenAI's `param` field.

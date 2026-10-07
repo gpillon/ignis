@@ -1826,6 +1826,7 @@ impl ConcreteScheduler {
                 .map(|budget| crate::thinking_budget::BudgetOutcome {
                     budget,
                     forced_at: r.thinking.forced_at(),
+                    closed_at: r.thinking.closed_at(),
                 })
         };
         let (request_id, tokens) = self.release_request(idx);

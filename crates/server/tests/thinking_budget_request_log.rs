@@ -121,6 +121,9 @@ async fn a_forced_close_is_on_the_done_line_with_its_budget_and_where_it_began()
     assert_eq!(line["thinking_budget"], 3, "{line}");
     assert_eq!(line["thinking_forced"], true, "{line}");
     assert_eq!(line["thinking_forced_at"], 4, "{line}");
+    // The forced close's `</think>` closed the block: an answer follows.
+    assert_eq!(line["thinking_closed"], true, "{line}");
+    assert!(line["thinking_closed_at"].as_u64().is_some_and(|at| at > 4), "{line}");
     assert!(line.get("thinking_budget_dropped").is_none(), "{line}");
 }
 
@@ -132,7 +135,10 @@ async fn a_budget_that_never_bit_is_on_the_done_line_as_not_forced() {
     let line = &done_lines(&sink, 1).await[0];
     assert_eq!(line["thinking_budget"], 8192, "{line}");
     assert_eq!(line["thinking_forced"], false, "{line}");
-    assert_eq!(thinking_keys(line), ["thinking_budget", "thinking_forced"], "{line}");
+    // The mock never writes `</think>`: the turn ended with its block open,
+    // so a client shows the whole output as reasoning, and the line says so.
+    assert_eq!(line["thinking_closed"], false, "{line}");
+    assert_eq!(thinking_keys(line), ["thinking_budget", "thinking_closed", "thinking_forced"], "{line}");
 }
 
 #[tokio::test]

@@ -122,7 +122,8 @@ fn a_spent_budget_forces_the_close_once_and_then_generates_freely() {
     assert_eq!(forced, vec![1; CLOSE.len()]);
     // The finish event says so: the budget it ran under, and the tokens it
     // had emitted when the close began.
-    assert_eq!(thinking, Some(BudgetOutcome { budget: 10, forced_at: Some(13) }));
+    // The forced close puts `</think>` two tokens in (CLOSE[2]).
+    assert_eq!(thinking, Some(BudgetOutcome { budget: 10, forced_at: Some(13), closed_at: Some(15) }));
 }
 
 #[test]
@@ -150,7 +151,7 @@ fn a_budget_that_would_crowd_out_the_answer_is_clamped_below_the_request() {
     let id = submit(&mut sched, Some(10), ANSWER_RESERVE + 6);
     let (out, thinking) = run(&mut sched, id);
     assert_eq!(close_at(&out), vec![7]);
-    assert_eq!(thinking, Some(BudgetOutcome { budget: 6, forced_at: Some(7) }));
+    assert_eq!(thinking, Some(BudgetOutcome { budget: 6, forced_at: Some(7), closed_at: Some(9) }));
 }
 
 #[test]
@@ -189,5 +190,6 @@ fn a_natural_close_before_the_budget_reports_the_budget_but_no_forced_close() {
     let (out, thinking) = run(&mut sched, id);
     assert_eq!(out[2], think_end);
     assert!(mock.decode_calls().iter().flatten().all(|job| job.permitted.is_none()));
-    assert_eq!(thinking, Some(BudgetOutcome { budget: 10, forced_at: None }));
+    // The model closed its block itself, at the token it emitted third.
+    assert_eq!(thinking, Some(BudgetOutcome { budget: 10, forced_at: None, closed_at: Some(2) }));
 }
