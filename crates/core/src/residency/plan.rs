@@ -110,7 +110,7 @@ impl std::fmt::Display for HostPlanError {
             write!(f, "{}{name} {bytes}", if i == 0 { "" } else { ", " })?;
         }
         let remedy = match *crossing_line {
-            "ngram_hot_rows" => "load fewer n-gram hot rows, or free memory",
+            "ngram_hot_rows" => "load fewer n-gram hot rows (--ngram-hot-bytes), or free memory",
             "staging" => "give the load smaller staging buffers, or free memory",
             "retained_host_slots" => {
                 "give prompt reuse fewer host retained slots (--retained-host), or free memory"
@@ -164,9 +164,8 @@ pub fn plan_host(request: &HostPlanRequest) -> Result<HostPlan, HostPlanError> {
 /// other line. `request.ngram_hot_rows_bytes` is not read, so a line no
 /// larger than this is one [`plan_host`] accepts.
 pub fn ngram_hot_rows_room(request: &HostPlanRequest) -> u64 {
-    let others = host_lines(request)
+    let others = host_lines(&HostPlanRequest { ngram_hot_rows_bytes: 0, ..*request })
         .iter()
-        .filter(|(name, _)| *name != "ngram_hot_rows")
         .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes));
     request
         .available_physical_bytes

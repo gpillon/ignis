@@ -89,10 +89,15 @@ impl Default for HotBudget {
 }
 
 impl std::fmt::Display for HotBudget {
+    /// As an operator writes it: `auto`, or the bytes in the largest of
+    /// `G`/`M`/`K` that divides them (`512M`, not 536870912).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Bytes(bytes) => write!(f, "{bytes}"),
-            Self::Auto => f.write_str("auto"),
+        let Self::Bytes(bytes) = *self else {
+            return f.write_str("auto");
+        };
+        match [(30, "G"), (20, "M"), (10, "K")].into_iter().find(|&(shift, _)| bytes != 0 && bytes % (1 << shift) == 0) {
+            Some((shift, unit)) => write!(f, "{}{unit}", bytes >> shift),
+            None => write!(f, "{bytes}"),
         }
     }
 }
@@ -107,6 +112,24 @@ impl HotBudget {
             (Self::Bytes(bytes), _) => bytes,
             (Self::Auto, Some(room)) => footprint.auto_budget(room),
             (Self::Auto, None) => DEFAULT_HOT_BYTES,
+        }
+    }
+
+    /// What a load says when this budget does not do what it reads as:
+    /// `auto` with no room measured (it takes the default), or a size named
+    /// past the hot list and short of the whole table (the cache holds the
+    /// list: no ranking says which other rows to add). `None` otherwise,
+    /// the default included.
+    pub fn warning(self, footprint: &TableFootprint, room_measured: bool) -> Option<&'static str> {
+        match self {
+            Self::Auto if !room_measured => {
+                Some("the host's available memory is unreadable: --ngram-hot-bytes auto holds the 1 GiB default")
+            }
+            Self::Bytes(bytes) if self != Self::default() && footprint.line_bytes(bytes) < bytes => Some(
+                "--ngram-hot-bytes is past the hot list and short of the whole table: the cache holds the list, \
+                 as no ranking says which other rows to add",
+            ),
+            _ => None,
         }
     }
 }
@@ -162,14 +185,16 @@ impl TableFootprint {
     }
 
     /// The budget `auto` takes when the host plan leaves the line `room`
-    /// bytes: the whole table when it fits; else the whole hot list when it
-    /// fits; else `room` rounded down to whole GiB, never below the 1 GiB
-    /// default, which the plan then refuses where it would refuse the
-    /// default. So a cache never holds more than `room` unless the default
-    /// would too, and the rows it selects -- the persistent cache file's
-    /// identity -- change only when free RAM crosses one of these steps,
-    /// not with every start's few megabytes.
+    /// bytes, of which it first leaves [`AUTO_LOAD_HEADROOM_BYTES`] to the
+    /// load itself: the whole table when it fits; else the whole hot list
+    /// when it fits; else the rest rounded down to whole GiB, never below
+    /// the 1 GiB default, which the plan then refuses where it would refuse
+    /// the default. So a cache never takes more than the default unless the
+    /// plan has room for it and its load, and the rows it selects -- the
+    /// persistent cache file's identity -- change only when free RAM crosses
+    /// one of these steps, not with every start's few megabytes.
     pub fn auto_budget(&self, room: u64) -> u64 {
+        let room = room.saturating_sub(AUTO_LOAD_HEADROOM_BYTES);
         if room >= self.whole_table_bytes() {
             return self.whole_table_bytes();
         }
@@ -182,6 +207,13 @@ impl TableFootprint {
 
 /// What an `auto` budget short of the whole hot list is rounded down to.
 const AUTO_STEP_BYTES: u64 = 1 << 30;
+
+/// What `auto` leaves of its room for the load, which holds more than the
+/// cache while it runs: a whole table's scan, two HOT_LOAD_SPAN_BYTES spans
+/// of reads in flight; the hot list's, one span and the 8-byte ids of the
+/// rows it loads (125 MB for the real list's 15.6M). Past the load the
+/// cache is all that stays, so the plan's line does not carry it.
+pub const AUTO_LOAD_HEADROOM_BYTES: u64 = 256 << 20;
 
 /// Rows gathered so far, by source: plain counters the server reads and exposes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -868,6 +900,16 @@ mod tests {
         }
         assert_eq!(all.counters().reads, 0);
         assert_eq!(none.counters().hot_rows, 0);
+    }
+
+    #[test]
+    fn the_auto_headroom_covers_what_a_load_holds_beside_the_cache() {
+        // A whole table's scan: two spans of reads in flight.
+        assert!(AUTO_LOAD_HEADROOM_BYTES >= 2 * HOT_LOAD_SPAN_BYTES);
+        // The hot list's load: one span, and the 8-byte ids of every row it
+        // loads, for a list at the converter's 2 GiB cap (layout.md 7.3).
+        let capped_list_rows = (2u64 << 30) / 90;
+        assert!(AUTO_LOAD_HEADROOM_BYTES >= HOT_LOAD_SPAN_BYTES + capped_list_rows * 8);
     }
 
     #[test]

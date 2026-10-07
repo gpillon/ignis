@@ -247,17 +247,19 @@ are the head of that ranking that fits the budget. What a budget holds:
   them.
 - **Past the ranking and short of the whole table:** the whole ranking and no
   more. Nothing says which other rows are worth the RAM, so `4G` holds what
-  `2G` holds.
+  `2G` holds; the start warns that it does (`ignis.runtime.ngram_hot_budget`)
+  and the plan charges the ranking, not the size named.
 - **The whole table (`27G` or more: 28.8 GB is 26.8 GiB):** every row, loaded
   at start by one sequential read of the table, and no step reads the NVMe again
   (`ignis_ngram_reads_total` stays at 0). It takes as long as reading 28.8 GB
   from the artifact's disk, and that load is never written to a cache file:
   the artifact already is its copy on disk.
 
-`auto` picks among those: the whole table when the host plan has room for it,
-otherwise the whole ranking when it fits, otherwise the room rounded down to
-whole GiB and never below the 1 GiB default, which the plan then refuses
-exactly where it would refuse the default. So `auto` never refuses a start the
+`auto` picks among those, from what the host plan leaves after its other
+lines and the 6 GiB margin, less 256 MiB for the load's own reads: the whole
+table when that holds it, otherwise the whole ranking when it fits, otherwise
+the rest rounded down to whole GiB and never below the 1 GiB default, which
+the plan then refuses exactly where it would refuse the default. So `auto` never refuses a start the
 default would make, and the rows it picks, which key the cache file, change
 only when free RAM crosses one of those steps rather than at every start. The
 host plan (`ignis.runtime.flash_next_host_plan`) logs the budget as named

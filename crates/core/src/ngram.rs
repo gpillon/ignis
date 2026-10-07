@@ -249,7 +249,7 @@ impl TableLayout {
 }
 
 /// The bytes of the cache's index per hot row: its row id.
-pub const HOT_ROW_INDEX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
+pub(crate) const HOT_ROW_INDEX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 
 /// The RAM hot-row cache: the head of the artifact's hot list (rows ranked
 /// most frequent first) that fits a byte budget, its index included. Slot
@@ -341,7 +341,7 @@ impl HotRows {
 
 /// The ranked rows a budget of `budget_bytes` holds: each costs its bytes and
 /// its index entry.
-pub fn ranked_capacity(budget_bytes: u64, row_bytes: u64) -> u64 {
+pub(crate) fn ranked_capacity(budget_bytes: u64, row_bytes: u64) -> u64 {
     budget_bytes / (row_bytes + HOT_ROW_INDEX_BYTES)
 }
 

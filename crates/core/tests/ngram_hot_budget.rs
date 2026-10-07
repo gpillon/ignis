@@ -6,7 +6,7 @@
 //! 90 bytes, a hot list of 15,642,665 rows) and the host plan measured on the
 //! 5090 box (`docs/findings/2026-10-06-flash-next-on-the-5090.md`).
 
-use ignis_core::ngram_table::{HotBudget, TableFootprint, DEFAULT_HOT_BYTES};
+use ignis_core::ngram_table::{HotBudget, TableFootprint, AUTO_LOAD_HEADROOM_BYTES, DEFAULT_HOT_BYTES};
 use ignis_core::residency::{ngram_hot_rows_room, plan_host, HostPlanRequest, HOST_MARGIN_BYTES};
 
 const GIB: u64 = 1 << 30;
@@ -58,26 +58,29 @@ fn the_plan_line_is_the_budget_capped_at_what_the_table_can_hold() {
 
 #[test]
 fn auto_takes_the_whole_table_else_the_hot_list_else_whole_gib_never_below_the_default() {
+    // Each step needs its bytes and the load's headroom.
     let whole = FLASH_NEXT.whole_table_bytes();
     let ranked = FLASH_NEXT.ranked_bytes();
+    let load = AUTO_LOAD_HEADROOM_BYTES;
     for (room, budget) in [
         (0, DEFAULT_HOT_BYTES),
         (GIB - 1, DEFAULT_HOT_BYTES),
-        (GIB, GIB),
-        (ranked - 1, GIB),
-        (ranked, ranked),
+        (GIB, DEFAULT_HOT_BYTES),
+        (ranked, DEFAULT_HOT_BYTES),
+        (ranked + load - 1, DEFAULT_HOT_BYTES),
+        (ranked + load, ranked),
         (20 * GIB, ranked),
-        (whole - 1, ranked),
-        (whole, whole),
+        (whole + load - 1, ranked),
+        (whole + load, whole),
         (u64::MAX, whole),
     ] {
         assert_eq!(FLASH_NEXT.auto_budget(room), budget, "room {room}");
     }
     // A hot list at the converter's 2 GiB cap: the whole GiB below it count.
     let long = TableFootprint { ranked_rows: (2 * GIB) / 90, ..FLASH_NEXT };
-    assert_eq!(long.auto_budget(2 * GIB + 5), 2 * GIB);
-    assert_eq!(long.auto_budget(2 * GIB - 1), GIB);
-    assert_eq!(long.auto_budget(long.ranked_bytes()), long.ranked_bytes());
+    assert_eq!(long.auto_budget(2 * GIB + load + 5), 2 * GIB);
+    assert_eq!(long.auto_budget(2 * GIB + load - 1), GIB);
+    assert_eq!(long.auto_budget(long.ranked_bytes() + load), long.ranked_bytes());
 }
 
 #[test]
@@ -87,7 +90,39 @@ fn a_named_budget_is_used_as_named_and_an_unmeasured_auto_is_the_default() {
     assert_eq!(HotBudget::Bytes(0).resolve(&FLASH_NEXT, Some(64 * GIB)), 0);
     assert_eq!(HotBudget::Auto.resolve(&FLASH_NEXT, None), DEFAULT_HOT_BYTES);
     assert_eq!(HotBudget::Auto.resolve(&FLASH_NEXT, Some(64 * GIB)), FLASH_NEXT.whole_table_bytes());
-    assert_eq!((HotBudget::Auto.to_string(), HotBudget::Bytes(GIB).to_string()), ("auto".into(), GIB.to_string()));
+}
+
+#[test]
+fn a_named_size_past_the_hot_list_warns_that_the_cache_holds_the_list() {
+    let past = HotBudget::Bytes(4 * GIB).warning(&FLASH_NEXT, true).expect("4G holds the 1.37 GiB list");
+    assert!(past.contains("--ngram-hot-bytes") && past.contains("holds the list"), "{past}");
+    assert!(HotBudget::Bytes(FLASH_NEXT.whole_table_bytes() - 1).warning(&FLASH_NEXT, true).is_some());
+    for quiet in [HotBudget::default(), HotBudget::Bytes(GIB / 2), HotBudget::Bytes(FLASH_NEXT.ranked_bytes())] {
+        assert_eq!(quiet.warning(&FLASH_NEXT, true), None, "{quiet}");
+    }
+    assert_eq!(HotBudget::Bytes(FLASH_NEXT.whole_table_bytes()).warning(&FLASH_NEXT, true), None);
+    // The default never warns, even over a hot list smaller than 1 GiB.
+    let short = TableFootprint { ranked_rows: 1_000, ..FLASH_NEXT };
+    assert_eq!(HotBudget::default().warning(&short, true), None);
+    // Auto never lands past the list, and says so when it cannot measure.
+    assert_eq!(HotBudget::Auto.warning(&FLASH_NEXT, true), None);
+    let unmeasured = HotBudget::Auto.warning(&FLASH_NEXT, false).expect("auto with no room");
+    assert!(unmeasured.contains("unreadable") && unmeasured.contains("1 GiB"), "{unmeasured}");
+}
+
+#[test]
+fn a_budget_prints_as_an_operator_writes_it() {
+    for (budget, text) in [
+        (HotBudget::Auto, "auto"),
+        (HotBudget::default(), "1G"),
+        (HotBudget::Bytes(512 << 20), "512M"),
+        (HotBudget::Bytes(1536 << 20), "1536M"),
+        (HotBudget::Bytes(5 << 10), "5K"),
+        (HotBudget::Bytes(1000), "1000"),
+        (HotBudget::Bytes(0), "0"),
+    ] {
+        assert_eq!(budget.to_string(), text);
+    }
 }
 
 #[test]
@@ -117,6 +152,10 @@ fn auto_never_refuses_a_start_the_default_would_make() {
         let by_auto = plan_host(&HostPlanRequest { ngram_hot_rows_bytes: auto_line, ..host(available) });
         starts.0 += u32::from(by_default.is_ok());
         starts.1 += u32::from(by_auto.is_ok());
+        if auto_line > default_line {
+            // More than the default only with room for its load as well.
+            assert!(auto_line + AUTO_LOAD_HEADROOM_BYTES <= room, "available {available}: {auto_line} of {room}");
+        }
         if by_default.is_ok() {
             assert!(by_auto.is_ok(), "available {available}: auto takes {auto_line} of a {room}-byte room");
             assert!(auto_line >= default_line, "available {available}: auto holds less than the default");
