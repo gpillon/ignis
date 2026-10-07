@@ -5,6 +5,10 @@
 Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
 `docs/specs/runtime/04-reference-feature-floor.md`. Extends ADR 0004 (the
 full admission state machine in v1) to the tier below the GPU.
+Amended 2026-10-07 by ADR 0045: the priority reaches one tier further down.
+On a load with KV-disk, leaving KV-RAM is a move to the disk, and leaving the
+disk follows KV-RAM's order. An evicted live sequence is then never discarded
+to make room.
 
 ## Context
 

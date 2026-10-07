@@ -5,6 +5,10 @@
 Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
 `docs/specs/runtime/04-reference-feature-floor.md`. Applies ADR 0009
 (step-level device-resident ABI) to the two features that move sequence state.
+Amended 2026-10-07 by ADR 0045: a transfer may move a blob a window at a time,
+through the options struct this ADR reserved for "a partial extent". KV-disk
+moves blobs in 32 MiB windows. The blob's bytes are unchanged, and a null
+options pointer is the whole-blob call.
 
 ## Context
 

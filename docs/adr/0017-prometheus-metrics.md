@@ -120,6 +120,14 @@ other residency counts. Only the demand copies count, so a step with no miss
 adds nothing; the prefetch copies on residency's own stream, and a step's wait
 for the previous one's, are not in it. Seconds, rendered exactly from the
 device's nanoseconds.
+Amended 2026-10-07 by ADR 0045 (its rows land with spec `vram-budget/03`): the
+reserved `tier="disk"` becomes an exported value of the six retained-state
+families on a load with KV-disk. Three disk families join them:
+`ignis_kv_disk_bytes{state}`, `ignis_kv_disk_spills_total{from}` and
+`ignis_kv_disk_failures_total{op}`. The `disk` series and the three families
+render only on such a load.
+`ignis_kv_cache_evictions_total` and `ignis_kv_ram_evictions_total` keep their
+meanings.
 
 ## Context
 

@@ -9,6 +9,8 @@ Clarified by ADR 0030 (2026-09-17): the device pool of retained images below
 is physical — **retained slots** reserved at load, holding every shared
 prefix image as well as checkpoint images — not a byte ledger over
 request-time allocations.
+**Amended 2026-10-07 by ADR 0045**: Tier 2 (KV-disk) is built — see the
+amendment at the end.
 
 ## Context
 
@@ -390,3 +392,25 @@ Considered and rejected:
   (spec flash-next/05 acceptance 2).
 - **A checkpoint that owns those pages itself.** The same ownership in a second
   structure; the prefix chain already walks, materializes and releases links.
+
+## Amendment (2026-10-07) — Tier 2 is built (ADR 0045)
+
+The Decision's "Three residency tiers, Tier 2 prepared" is superseded: KV-disk
+is built (ADR 0045, spec `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`).
+
+- **What KV-RAM gives up goes to the disk** instead of nowhere, and a device
+  victim KV-RAM cannot take goes straight there. A blob comes back from the
+  disk to the device directly, never through KV-RAM.
+- **Retained state ranks on the disk as it does in KV-RAM**, and a spill
+  displaces only what ranks below it. With the tier on, an evicted live
+  sequence is never discarded to make room.
+- **The disk's restore floor is the model's**: 8,192 tokens on Flash-Next and
+  16,384 on the 27B, measured against the best match on the device and in
+  KV-RAM. KV-RAM's stays 1,024.
+- **A claim from the disk never consumes**: a retained blob's file stays after
+  its restore, as a KV-RAM blob stays in the arena.
+- **The identity built here is what each file's header carries**, widened by
+  GitHub #205: the served model id, the sidecar's payload digest when there is
+  one, and the RoPE scaling. v1 still reuses nothing across a restart, and the
+  tier is wiped, so "meant to outlive a server restart" is not yet true. The
+  header is what would make it so without a format change.

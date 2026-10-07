@@ -38,6 +38,8 @@ projections, so a prefill's scan-resistant stream cannot overflow it) and
 `residency_tables`. The expert cache is split into eight K-class pools at
 load and nothing is allocated while serving. A 27B load's plan is unchanged.
 Lines and arithmetic: `crates/core/src/residency/plan.rs`.
+**Amended 2026-10-07 by ADR 0045** (spec `vram-budget/03`): the KV pool line
+follows the **KV pool policy** — see the amendment at the end.
 
 ## Context
 
@@ -386,3 +388,29 @@ checkpoint hits). Meanwhile the eight slots and their residual window held
 - **Supersedes** this ADR's "The count is `--retained-slots`, default
   `N_DECODE_LANES`" and the consequence that retained slots are
   sequence-pool slots: the device ones still are, the host ones are not.
+
+## Amendment (2026-10-07) — the KV pool policy (ADR 0045)
+
+Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
+
+- **Layout item 7, "the KV pool, which takes the rest", holds for a resident
+  load only**: the 27B, and Flash-Next on a card that holds every expert.
+- **Flash-Next with streamed experts reserves its pool first.** The pool is
+  524,288 tokens, at most every lane's whole context, and never below the
+  floor. The expert cache then takes the rest. This replaces the 2026-10-05
+  amendment's pool "sized from the per-lane context", and it is the same
+  `plan_vram` call for both models.
+- **The floor is unchanged and now binds both models**: one `--max-context`
+  sequence plus one page per retained slot.
+- **`--kv-pool-bytes` is honoured on both models** and accepts a token form
+  (`512Ktok`). The pages are still derived from the format.
+- **The expert cache's 12 GiB floor gains an opt-in,
+  `--allow-expert-cache-below-floor`**, on this ADR's
+  `--allow-vram-oversubscription` pattern: the start proceeds with a WARN. The
+  class-minimum refusal is not overridable.
+- **"Serving allocates nothing" holds for KV-disk too.** Its 64 MiB of pinned
+  staging is reserved at load, as a host-plan line on Flash-Next. Its files are
+  disk, not memory, and no plan line counts them.
+- **§Observability gains the disk gauge**
+  `ignis_kv_disk_bytes{state="capacity"|"used"}`, beside the KV-RAM arena's. It
+  renders only on a load with the tier.

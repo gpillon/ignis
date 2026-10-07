@@ -72,6 +72,15 @@ When output names a domain concept, use the term as defined here.
   other systems fail the allocation. ignis refuses it unless the operator
   explicitly accepts it for an explicit budget.
   _Avoid_: shared memory, spill (a spill is KV-RAM's).
+- **KV pool policy** — how a load sizes its KV pool, chosen by whether every
+  weight is on the device (ADR 0045). **Resident** — the 27B, and Flash-Next on
+  a card that holds every expert — the pool takes the rest of the **VRAM
+  budget**. **Offloaded** — Flash-Next with its experts streaming, as on the
+  5090 — the pool is reserved first and the **expert cache** takes the rest.
+  That reserved pool is 524,288 tokens, at most every lane's whole context, and
+  never less than one `--max-context` sequence plus a page per retained slot.
+  Either way the lanes share the pool: a lane costs its state, not a context.
+  `--kv-pool-bytes` names the pool on both models, in bytes or in tokens.
 - **Trained position envelope** — the 262,144 rotary positions the checkpoint
   was trained over. Not a limit the engine enforces: a sequence past it is
   served (the attention envelope reaches 1,048,576 keys under hq-e8-2b), it is
@@ -129,7 +138,10 @@ When output names a domain concept, use the term as defined here.
 - **Expert pool** — every expert projection, in pinned host RAM for the life of
   the load.
 - **Expert cache** — the fixed-size VRAM slot pools that hold the projections
-  in use, replaced least-recently-used; a plan line at load.
+  in use, replaced least-recently-used; a plan line at load. It takes what the
+  **KV pool policy** leaves. Below its 12 GiB floor the start is refused,
+  unless the operator accepts it with `--allow-expert-cache-below-floor`
+  (ADR 0045).
 - **Router lookahead** — the next layer's router applied to this layer's MoE
   input to prefetch its likely experts into the cache.
 - **Demand copy** — a step's copy of the projections it selected that the
@@ -193,8 +205,9 @@ When output names a domain concept, use the term as defined here.
 - **KV format** — which of the two KV cache formats a load runs: **hq-e8-2b**,
   the serving default from G4, or **BF16**, retained as the format every
   correctness oracle runs against. A model-load option, fixed for the life of
-  the load; the pool is sized by a byte budget and its token capacity is
-  *derived* from the format rather than configured (ADR 0022). The CLI default
+  the load. The pool is sized by the **KV pool policy**, or named in bytes or
+  in tokens, and its pages are *derived* from the format either way (ADR 0022,
+  ADR 0045). The CLI default
   is `hq-e8-2b` since #123 wired its prefill and decode attention routes and
   captured its decode graphs; a correctness oracle asks for `bf16` by name.
 
@@ -285,9 +298,16 @@ When output names a domain concept, use the term as defined here.
   (probation → protected), and
   written only at a **chunk boundary**. State reaches it lazily — only when the
   device is about to discard it, never as a copy of what is still resident.
-- **KV-disk** — Tier 2: the disk tier below KV-RAM, meant to outlive a server
-  restart. Prepared, not built: its existence is why a blob's identity must
-  name the model and layout it was taken under rather than a request.
+- **KV-disk** — Tier 2: the disk tier below KV-RAM (ADR 0045). It takes what
+  KV-RAM gives up, instead of discarding it, and a device victim KV-RAM cannot
+  take. A blob comes back from it straight to the device, never through
+  KV-RAM. It holds one file per blob in a directory the process owns, under a
+  byte budget that is a ceiling, not a reservation. Files are written only from
+  a **snapshot point**, a window at a time, and the model thread never waits on
+  the disk. With it on, an evicted live sequence is never discarded to make
+  room. Nothing on it outlives the process: v1 wipes it. Each file's header
+  still names the model, layout and RoPE scaling it was taken under, so that a
+  later version could keep it. On by default for Flash-Next; off for the 27B.
 - **Prompt checkpoint** — the whole-sequence state of a request at its
   generation opener, the point where the rendered prompt hands over to the
   model, retained after the request ends so a later request whose prompt
@@ -430,6 +450,10 @@ When output names a domain concept, use the term as defined here.
   only what ranks below it. On the device, retained state
   goes before any of it. Protection
   outranks class only where something is actively being served (ADR 0023).
+  On a load with **KV-disk**, leaving KV-RAM is a move to the disk, and leaving
+  the disk follows the KV-RAM order again. An evicted live sequence is then
+  never discarded to make room: when no tier has room, the request that needed
+  it waits (ADR 0045).
 - **Chunked prefill** — prefilling a prompt span through the span+position
   prefill call in **prefill chunks** rather than one token at a time. The
   leaf knows how to loop over a span of any length; it is no longer the only
