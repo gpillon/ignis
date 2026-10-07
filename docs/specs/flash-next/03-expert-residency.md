@@ -55,11 +55,38 @@ and `docs/findings/2026-10-05-expert-residency-replayed-on-the-study-s-routing.m
   moves 72.5 MB per token at one lane and 295 MB per round at three: 7.2 and
   29 ms of link per 6-7 ms round. A decode step's prefetches are taken in
   rank order (every lane's best expert first) and a candidate that would pass
-  the budget is skipped. The default is one layer's share of the round at the
-  measured link bandwidth (6 ms at one lane, +0.5 ms per lane, 12 GB/s),
-  never below the largest class's projection: one lane then hits 96.5% with
-  2.37 ms of demand misses where no prefetch costs 3.77 ms. A prefill streams
-  its lookahead whole.
+  the budget is skipped. A prefill streams its lookahead whole. The first
+  default was one layer's share of the round at the link's bandwidth (6 ms
+  at one lane, +0.5 ms per lane, 12 GB/s), never below the largest class's
+  projection: the study replay then hit 96.5% at one lane with 2.37 ms of
+  demand misses where no prefetch costs 3.77 ms.
+- **The decode budget follows the step's rows (2026-10-07, #306, owner
+  decision).** At the 262K x 3-lane default no fixed budget served best at
+  both ends (`docs/findings/2026-10-06-flash-next-decode-round.md`): 0.67x
+  the 1.75 MB a step then got was faster at one lane, 1.5x at three. A
+  decode step's budget is now `PrefetchBudget` (policy model) /
+  `prefetch_budget_bytes` + `prefetch_budget_row_bytes` (leaf): 1,172,500 B
+  at one row and 726,250 B more per further row, the line through those two
+  points (`default_prefetch_budget`). Rows are the step's lookahead rows: the
+  lanes decoding now, or a verify round's columns, never the configured
+  lane count. There is no floor: at one row a gate/up projection at K >= 3
+  (1.24-1.65 MB) is never prefetched. Served A-B-A-B against the old rule:
+  one greedy lane 95.2-97.7 tok/s against 92.5-95.6 (+2-3%), three distinct
+  lanes 97.8-100.3 against 98.7-99.4 on the undisturbed windows (neutral),
+  with 4-7% less stall. The budget reserves no VRAM: prefetches land in the
+  class pools' own slots.
+  The study replay scores this rule at 95.9% at one lane (95.8% at three,
+  where the old default replayed 95.3%), so acceptance's one-lane line in
+  `the_lookahead_turns_most_remaining_misses_into_hits` is 95.5%, not 96%:
+  the served gain is measured, and the replay's hit rate is a proxy that
+  scores every prefetch as hidden, which served one-lane decode
+  contradicts. Two bounds of the same test move with it: the one-lane
+  demand cost holds at 0.8 of the simulation's 3.8 ms, not 0.75 (2.90 ms
+  against 2.37 under the old rule), and the link-fit check takes the served
+  round's compute, its ITL less its stall (7.9 ms at one lane, 10.9 at
+  three), in place of the simulation's 6-7 ms step, which three rows'
+  15.75 ms of link exceeded by 0.7 ms. Unbudgeted, three lanes (29 ms) still
+  fail it.
 - **A prefill's lookahead has its own width, the router's top-k (2026-10-07,
   #306).** Unbudgeted, W = 16 per token over-streams: 26-33% of a reused agent
   turn's prefetched projections were never read. At 10 (Flash-Next's

@@ -444,11 +444,11 @@ How long does a decode wait on expert misses, how much of that could the lookahe
 
 **(b) Every candidate's residency read at once (`96b3c51`): kept.** The walk read each candidate's slot and flags with a dependent global load, one at a time. They are now read in parallel into shared flags before the walk. A prefetch that evicts a later candidate clears that candidate's flag, so it is copied again at its turn, as the policy walks them. A CPU model test and a CTest scenario pin that case; the CTest fails without the flag patch. One lane: +0.6 tok/s on (a) (session 3) and +1.1 alone (92.3 → 93.4, session 5). Three lanes: within noise.
 
-**(c) The budget: no single value is better at both ends; the default is unchanged.**
+**(c) The budget: no single value is better at both ends; the default was unchanged here** (a budget that follows the rows replaced it next, below).
 - × 0.67 (1.17 MB a step): +2% at one lane (95.3 against (b)'s 93.4), −3.3% at three (90.7 against 93.8).
 - × 1.5 (2.63 MB): −9% at one lane (85.2 against 93.8), +2.4% at three (98.4 against 96.1).
 - At one lane the prefetch copy follows the demand copy on the same link and must end before the next layer's join, inside ~165 µs of compute. A smaller budget raises the stall (2.14 → 2.37 ms) and still wins: less prefetch is exposed at the join. At three lanes the misses saturate the link and 68% of prefetches are used, so prefetched bytes displace demand bytes and a larger budget pays.
-- A per-step budget keyed to the step's lookahead rows (~1.17 MB at one row, ~+0.72 MB per further row) would take both gains. It was not built here:
+- A per-step budget keyed to the step's lookahead rows (~1.17 MB at one row, ~+0.72 MB per further row) would take both gains. It was not built here (it was next, "The budget follows the rows" below):
   - it changes the residency descriptor's ABI, the policy model's `PolicyConfig` and `plan.rs`'s default;
   - and spec 03's study replay rejects its one-row value: `the_lookahead_turns_most_remaining_misses_into_hits` asserts a one-lane hit rate of at least 96%, and those two budgets replay at 95.9%. That replay scores prefetches as hidden, which served decode contradicts above.
 - Wider W was not tried: by the coverage table it moves nothing while the budget binds.
@@ -461,11 +461,42 @@ How long does a decode wait on expert misses, how much of that could the lookahe
 
 Raw material in the `flash-next` worktree, `.scratch/la41/`: `rate.sh`, `summary.py`, per leg `*.server.log`, `*.m{0,1,2}.txt` and `*.lane*.jsonl`, `diag.patch` (the coverage counters), `lever-a.patch`, `lever-ab.patch`. The harness is also in the main checkout's `.scratch/flash-next-306-307/harness/lookahead41/`.
 
+## The budget follows the rows (2026-10-07, fn-budget-306)
+
+Does a decode prefetch budget that follows the step's rows take (c)'s one-lane gain without its three-lane loss? Owner decision of 2026-10-07: build it, and hold spec 03's replay at a 95.5% one-lane hit rate instead of 96%.
+
+**The rule.** A decode step's budget is 1,172,500 B at one row and 726,250 B more per further row: the line through (c)'s two winners, 0.67x and 1.5x the old 1.75 MB (`default_prefetch_budget`, `crates/core/src/residency/plan.rs`). The policy model's `PrefetchBudget` and the leaf (`prefetch_budget_bytes` + `prefetch_budget_row_bytes`) take the rows from the step's lookahead. A decode graph is captured per width, so the rows are the lanes decoding now (a verify round's columns with MTP), not the configured lanes. There is no floor, so at one row a gate/up projection at K >= 3 (1.24-1.65 MB) is never prefetched; the old rule's floor of one such projection is what (c)'s 0.67x leg went below. The budget reserves no VRAM: prefetches land in the class pools' own slots.
+
+**Setup.**
+- Branch `fn-budget-306` from `4a31ebf` (main, with lookahead41's (b) and the stall metric). Base: `4a31ebf`. New: the branch.
+- `make config MODEL=flash-next`'s flags plus `--metrics`, but `--kv-host-pool-bytes 512M` for both builds: the host had ~47-48 GB available, under the 2G config's ~48.5 GB.
+- `.scratch/fnb/rate.sh` is `la41/rate.sh` with its own ports. One GPU lock hold, legs in A-B-A-B order (base1, new1, base2, new2), no builds of ours during it.
+- The trace CTests pass in all four modes on a regenerated fixture (format 3, the budget growing 12 → 20 → 28 KiB over one to three lanes). `expert_residency_gpu` gives the random traces a per-row term and passes: 617 steps equal on the device and in the model.
+
+| leg | 1 lane tok/s (per request) | 1 lane: hit, misses / prefetched / used per token, MB, stall per token | 3 lanes: aggregate, request 1 / request 2 | 3 lanes: hit, misses / prefetched / used per token, MB, stall per token |
+|---|---|---|---|---|
+| base1 | 94.2, 94.8, 92.5, 93.2 | 96.34%, 35.2 / 76.9 / 34.8, 74.4 MB, 2.10 ms | 98.7 / *93.1* | 88.65%, 103.6 / 39.5 / 27.2, 101.5 MB, 6.44 ms |
+| new1 | *91.3*, 95.2, 96.2, 95.3 | 95.86%, 39.7 / 47.4 / 22.4, 58.7 MB, 2.38 ms | *89.4* / 97.8 | 89.46%, 96.4 / 55.3 / 38.4, 108.8 MB, 6.20 ms |
+| base2 | 94.9, 95.1, 93.6, 95.6 | 96.34%, 35.1 / 76.9 / 34.8, 74.3 MB, 2.09 ms | 99.2 / 99.4 | 88.70%, 103.4 / 39.6 / 27.3, 101.3 MB, 6.22 ms |
+| new2 | 97.6, 97.7, 97.7, 97.7 | 95.87%, 39.7 / 47.3 / 22.4, 58.6 MB, 2.25 ms | 100.3 / 100.3 | 89.47%, 96.3 / 55.3 / 38.4, 108.8 MB, 5.78 ms |
+
+The greedy prompts make both builds route the same tokens, so the traffic columns repeat within a build to a tenth. The italic windows are slow on every lane at once, in two separate wall-clock windows (19:23 and 19:28), one per build: an outside disturbance, not the budget, whose traffic for the leg matches its twin.
+
+- **One lane: +2-3%.** 95.2-97.7 against 92.5-95.6 tok/s (new1's first request excepted), the ITL's median 9.5 against 10.0 ms. It hits less (95.9 against 96.3%) and stalls more (2.25-2.38 against 2.09-2.10 ms), and still wins, as (c)'s 0.67x leg did: it moves 21% fewer bytes, and less prefetch is still copying at the next layer's join.
+- **Three lanes: neutral.** 97.8-100.3 against 98.7-99.4 on the undisturbed windows; by pair, 97.8 against 98.7 and 100.3 against 99.4. The three-row budget hits 0.8 points more and stalls 4-7% less, but moves 7% more bytes. (c)'s +2.4% at three was against a slower base (96.1) and does not reappear.
+- The study replay moves with the rule: 95.9% at one lane (old rule 96.5%), 95.8% at three (95.3%). Demand cost 2.90 ms at one lane (2.37), 8.05 at three (9.01); link 4.69 ms per round at one lane (5.25), 15.75 at three (13.58). Three bounds of `the_lookahead_turns_most_remaining_misses_into_hits` moved: the hit rate to 95.5% (owner), the one-lane demand cost to 0.8 of the simulation's 3.8 ms, and the link-fit check's step from the simulation's 6/7 ms to the served round's compute (ITL less stall: 7.9 ms at one lane, 10.9 at three), which unbudgeted three lanes (29 ms) still fail.
+
+**Limits.**
+- Two legs per build, one prompt family, greedy, contexts under 2K, `--kv-host-pool-bytes 512M`.
+- Rows of two (a lane joining or leaving) and MTP's verify rounds (four rows at one lane: 3.35 MB) take the line between and past the measured points, unmeasured.
+
+Raw material in the `fn-budget-306` worktree, `.scratch/fnb/`: `rate.sh`, `session.sh`, `summary2.py`, per leg `*.server.log`, `*.m{0,1,2}.txt`, `*.lane*.jsonl`, the replay logs `replay-old.log` and `replay-new2.log`.
+
 ## Follow-ups
 
 Status lives in https://github.com/gpillon/ignis/issues/306.
 
-- A per-step decode prefetch budget keyed to the lookahead rows (~1.17 MB at one row, ~+0.72 MB per further row; "Demand copies and the lookahead" above): +2% at one lane and +2.4% at three, each measured on its own scaled default. Bracket it first (× 0.5 at one lane, × 2 at three); it needs the descriptor and `PolicyConfig` to carry the per-row term, and spec 03's replay acceptance (one-lane hit rate ≥ 96%) revisited, since a smaller one-lane budget wins while hitting less.
+- The rows-scaled budget's points are (c)'s brackets, not its optimum: × 0.5 at one lane and × 2 at three are untried, and three lanes did not move at 1.5x. Measure MTP's verify rounds (four rows at one lane) against it before tuning past them.
 - Time the join wait too (spec 03 story 7: a turn slowed by an unfinished prefetch now reads as compute). Not cheap with the mirror pattern: the step must know when its own stream reached the join, which needs a timestamp written by the kernel before it (the router, another module), an extra launch per layer on the critical path, or a device-side wait in place of the event join.
 - Prefetch precision is what is left once the budget is right: 45% of one-lane prefetches are used, and 36% of one-lane demand bytes rank beyond the lookahead's top 32.
 - Host-gap fixes 2, 3 and 5 (one wake per gather, every read in flight at once, one pinned staging copy): ~0.05-0.2 ms each, worth a dedicated A/B on the greedy prompt.
