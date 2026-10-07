@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-10-06
-- Last verified: 2026-10-06
+- Last verified: 2026-10-07
 - Scope: Flash-Next speculative decoding (spec flash-next/07 phases C-D): the verify round's and the MTP head's correctness on the card, tok/s at one to three lanes against spec-off, the expert traffic per round
 - Related: https://github.com/gpillon/ignis/issues/307, [spec 07](../specs/flash-next/07-mtp-speculation.md), [MTP phase A](2026-10-06-flash-next-mtp-phase-a.md), [Flash-Next decode round](2026-10-06-flash-next-decode-round.md), [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md)
 - Superseded by: none
@@ -86,6 +86,30 @@ code window (k = 3: 34.8 ms a round, of which the head's drafting is 2.2 ms).
   13.9). The projection built on it (1.5-1.7×) did not hold.
 - AC6 is **not met**: one lane gains 1.02-1.30× (mean ~1.16×), two and three
   lanes lose unless drafting is off there.
+
+## The head's chain read rejected columns (2026-10-07)
+
+The head's chain steps ran before the commit's restore, so they read the
+alignment's rejected columns from the head's own section: under hq-e8-2b as
+ring rows of positions q − 512 + i (a ring slot carries no position), and in
+both formats through the indexer tail a completed block pools from. Fixed by
+`verify::restore_head` before the chain (spec 07, as built). Before the fix,
+none and reject drafters committing the same text left the head drafting
+differently on 1 of 64 rounds (hq, 1,536-token prompt; the test
+`the_heads_drafts_never_read_a_rejected_column`). Bench, k = 3, one lane,
+256 tokens after each 1,536-token window, tok/s and acceptance per position:
+
+| window | hq before | hq after | BF16 after |
+|---|---|---|---|
+| code | 79.8, .761/.848/.786 | 83.1, .730/.846/.818 | 94.3, .872/.866/.879 |
+| code | 72.7, .805/.826/.719 | 78.3, .857/.792/.719 | 83.0, .889/.778/.836 |
+| prose | 77.9, .607/.541/.487 | 87.3, .621/.494/.432 | 83.2, .598/.589/.372 |
+| prose | 68.2, .585/.421/.500 | 77.4, .636/.494/.474 | 82.5, .661/.538/.381 |
+
+The four windows took 432 rounds before and 425 after (BF16: 405), and the
+same acceptance measured 84.6/77.1/87.7/73.4 tok/s on 2026-10-06, so the
+gain is within run-to-run noise: **nil**. The fix is correct but buys no
+speed, and hq's lower code acceptance against BF16 is not this defect.
 
 ## Follow-ups
 

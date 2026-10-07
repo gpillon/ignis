@@ -664,6 +664,16 @@ Where the build departs from the text above:
 - **The head's chained steps write past the frontier** (up to 2k positions),
   so on an MTP load the pass saves and the commit restores ring rows over 2k
   positions, and the commit restores the indexer tails after the chain.
+- **The chain reads the head's section at the new frontier** (2026-10-07):
+  the alignment writes it at every column, the rejected ones included, and a
+  chain step at q read their hq ring rows as positions q − 512 + i (a ring
+  slot carries no position) and pooled a completed indexer block from the
+  alignment's tail. `verify::restore_head` puts the head's tail, ring words
+  and rejected ring rows back between the alignment and the chain, from what
+  the pass saved. Running the drafts after the restore could not fix it (the
+  alignment is part of the drafting, and the chain's own writes would then
+  outlive the round); position tags would change the vendored ring. Measured
+  (finding 2026-10-07): acceptance and tok/s unchanged within noise.
 - **Drafts reach the host** through `ignis_decode_options::out_drafts`
   (`LaneVerifyRun::next_drafts`), because the n-gram rows of a round's
   columns are hashed on the host before it.
