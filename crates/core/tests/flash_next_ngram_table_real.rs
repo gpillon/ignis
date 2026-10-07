@@ -8,6 +8,12 @@
 //! binder hands over, the stored hash buffers, the hot list within the 1 GiB
 //! default -- checks the stored buffers are the ones the checkpoint's config
 //! derives, stages a prompt, and compares every row with the file's bytes.
+//!
+//! Ignored: loading the hot rows reads ~1 GiB out of the 29 GB table, a
+//! minute or more on every `cargo test`. Run it after a conversion or a
+//! change to the table's loader:
+//! `cargo test -p ignis-core --test flash_next_ngram_table_real -- --ignored`
+//! (the GPU profile's `--ignored` leg runs it too).
 
 use std::path::Path;
 use std::time::Instant;
@@ -22,6 +28,7 @@ use ignis_core::ngram_table::{NgramTable, NgramTableOptions};
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 
 #[test]
+#[ignore = "loads ~1 GiB of hot rows from the real 29 GB n-gram table: run after a conversion or a loader change"]
 fn the_real_table_stages_a_prompts_rows_from_cache_and_nvme() {
     let path = Path::new(MODEL_DIR).join(ARTIFACT_FILE_NAME);
     if !path.exists() {
