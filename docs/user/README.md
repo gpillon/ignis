@@ -197,6 +197,34 @@ hold one full context refuses the start.
 | `--retained-host <n>` | `IGNIS_RETAINED_HOST` | two per decode lane (16); `0` with `--prompt-reuse off` | Retained slots in one pinned host block reserved at start, ~222 MiB each at the default load (3.5 GiB for 16): no VRAM, so the KV pool gets it; a capture and a claim each cost a PCIe copy (~15–19 ms). Both kinds hold the images of retained checkpoints and shared prefixes. When none is free, retained state gives one up — checkpoints before prefixes, `agent` before `interactive`, then least recently used; when nothing can, the publish or capture is skipped. `--retained-slots` was replaced by these two and now refuses the start. |
 | `--retained-interactive-ttl <secs>` | `IGNIS_RETAINED_INTERACTIVE_TTL` | `300` | Idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's. Needs `--prompt-reuse on`. |
 
+### Flash-Next n-gram startup cache
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--persist-ngram-cache <true\|false>` | `IGNIS_PERSIST_NGRAM_CACHE` | `true` | Keep a compact copy of the selected Flash-Next hot rows on disk. `false` reads and writes no persistent n-gram cache. |
+| `--persist-ngram-cache-path <auto\|dir>` | `IGNIS_PERSIST_NGRAM_CACHE_PATH` | `auto` | Cache directory. An explicit relative directory is relative to the server's working directory. |
+
+`auto` uses `%LOCALAPPDATA%\ignis\cache\ngram` on Windows, and
+`$XDG_CACHE_HOME/ignis/ngram` on Linux (when XDG_CACHE_HOME is absolute),
+otherwise `$HOME/.cache/ignis/ngram`. The directory is created on a cache miss.
+
+The first load gathers the normal hot rows and saves them; subsequent loads
+read the compact file and validate its SHA-256 checksum. Loading still closes
+the artifact mapping before any hot-row reads, even with persistence disabled.
+A changed artifact path, file stamp, table layout, selected row order/count,
+or cache format produces a different key. New packs also record a content
+identity assembled from the n-gram source files' verified SHA-256 digests.
+Legacy artifacts work without repacking: they use the filesystem stamp and
+descriptors. Deliberately changing source bytes while preserving those stamps
+and the source digest requires separate artifact verification.
+
+Corruption, an unavailable cache directory, a concurrent writer or a failed
+write falls back to the normal artifact load. Publication is atomic and uses
+an OS lock; interrupted writes are never accepted as complete cache files.
+The cache is disposable and does not change the model artifact. With the
+default 1 GiB hot-row RAM budget a compact file is about 980 MiB; old keys are
+not automatically removed. This cache is separate from prompt/KV reuse.
+
 ### Vision
 
 | Flag | Env | Default | Meaning |

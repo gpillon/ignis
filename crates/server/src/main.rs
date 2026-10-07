@@ -150,6 +150,7 @@ fn cuda_scheduler(
     vision_item_bound: Option<u64>,
     thinking_close: Option<std::sync::Arc<ignis_core::thinking_budget::ThinkingClose>>,
     logging_handle: &ignis_logging::LoggingHandle,
+    ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
 ) -> (Box<dyn Scheduler>, ignis_server::metrics::LoadReservations) {
     let eos = match frontend.eos_token_id() {
         Some(eos) => eos,
@@ -176,7 +177,7 @@ fn cuda_scheduler(
     // GitHub #302: a Flash-Next artifact runs its own program and leaf.
     let loaded = match family {
         ModelFamily::FlashNext => {
-            ignis_server::runtime::flash_next_scheduler(artifact_path, model.into(), eos, shape, thinking_close)
+            ignis_server::runtime::flash_next_scheduler_with_ngram_cache(artifact_path, model.into(), eos, shape, thinking_close, ngram_cache)
         }
         ModelFamily::Qwen38_27b => ignis_server::runtime::cuda_scheduler_with_thinking_close(
             artifact_path,
@@ -276,6 +277,7 @@ async fn main() {
         artifact,
         model_download,
         model_download_path,
+        ngram_cache,
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
         thinking_budget: default_thinking_budget,
@@ -305,6 +307,8 @@ async fn main() {
         api_key,
         expose,
     } = config;
+    #[cfg(not(feature = "cuda"))]
+    let _ = ngram_cache;
     let api_key = match api_key {
         None => None,
         Some(ignis_server::config::ApiKeySetting::Fixed(key)) => Some(key),
@@ -516,6 +520,7 @@ async fn main() {
                 item_bound,
                 thinking_close,
                 &logging_handle,
+                ngram_cache,
             );
             // GitHub #216: what the plan reserved leaves the load here, so
             // the exposition can name it. The placeholder path below builds

@@ -150,12 +150,6 @@ impl FlashNextLeaf {
         let mirror = Arc::new(ResidencyMirror::new());
         residency.mirror(Arc::clone(&mirror))?;
         let ngram = config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?;
-        let table = NgramTable::from_artifact(path, &reader, &plan, ngram, options.ngram)?;
-        let counters = Arc::new(FlashNextCounterSource::new(mirror, residency.desc().capacity, table.counts()));
-        let arena = match options.kv_ram_arena_bytes {
-            0 => None,
-            bytes => Some(HostArena::create(bytes)?),
-        };
         let artifact_hash = ArtifactHash::from_bytes(reader.content_hash());
         let mtp = match options.pool_backend() {
             Some(_) => {
@@ -168,9 +162,14 @@ impl FlashNextLeaf {
             }
             None => None,
         };
-        // Unmapped here: everything after the load reads the file through
-        // its own handles (the n-gram table, nothing else).
-        drop(reader);
+        let table = NgramTable::from_cached_artifact(
+            path, reader, &plan, ngram, options.ngram, &options.ngram_cache,
+        )?;
+        let counters = Arc::new(FlashNextCounterSource::new(mirror, residency.desc().capacity, table.counts()));
+        let arena = match options.kv_ram_arena_bytes {
+            0 => None,
+            bytes => Some(HostArena::create(bytes)?),
+        };
         Ok(Self {
             counters,
             arena,

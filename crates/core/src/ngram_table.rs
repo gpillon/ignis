@@ -214,6 +214,17 @@ impl NgramTable {
         ranked_hot: &[u64],
         options: NgramTableOptions,
     ) -> Result<Self, String> {
+        let mut table = Self::open_unloaded(path, layout, hasher, ranked_hot, options)?;
+        table.hot_data = table.load_hot_rows()?;
+        Ok(table)
+    }
+    fn open_unloaded(
+        path: &Path,
+        layout: TableLayout,
+        hasher: NgramHasher,
+        ranked_hot: &[u64],
+        options: NgramTableOptions,
+    ) -> Result<Self, String> {
         if layout.rows < hasher.padded_table_rows() {
             return Err(format!(
                 "the table holds {} rows, the hash ranges reach {}",
@@ -223,7 +234,7 @@ impl NgramTable {
         }
         let policy = ReadPolicy { alignment: DIRECT_IO_ALIGNMENT, max_read_bytes: options.max_read_bytes };
         let hot = HotRows::from_ranked(ranked_hot, options.hot_bytes, layout.row_bytes)?;
-        let mut table = Self {
+        let table = Self {
             hasher,
             hot,
             hot_data: Vec::new(),
@@ -232,13 +243,38 @@ impl NgramTable {
             pool: ReadPool::new(path, options.read_threads)?,
             counts: Arc::default(),
         };
-        table.hot_data = table.load_hot_rows()?;
         Ok(table)
     }
-
     /// Open the table of a bound Flash-Next artifact (spec flash-next/01):
     /// its host-streamed range, its hash buffers and its hot list.
     pub fn from_artifact(
+        path: &Path,
+        reader: &Reader,
+        bound: &FlashNextPlan,
+        geometry: NgramGeometry,
+        options: NgramTableOptions,
+    ) -> Result<Self, String> {
+        let mut table = Self::prepare_from_artifact(path, reader, bound, geometry, options)?;
+        table.hot_data = table.load_hot_rows()?;
+        Ok(table)
+    }
+    /// Close the artifact mapping before loading or restoring the hot rows.
+    pub fn from_cached_artifact(
+        path: &Path, reader: Reader, bound: &FlashNextPlan, geometry: NgramGeometry,
+        options: NgramTableOptions, persistence: &crate::ngram_cache::PersistenceOptions,
+    ) -> Result<Self, String> {
+        let mut table = Self::prepare_from_artifact(path, &reader, bound, geometry, options)?;
+        let key = if persistence.enabled {
+            crate::ngram_cache::identity(path, reader.content_hash(),
+                &[table.layout.base_offset, table.layout.row_stride, table.layout.row_bytes, table.layout.rows],
+                table.hot.rows())
+        } else { Err("disabled".into()) };
+        drop(reader);
+        let len = table.hot.len().checked_mul(table.row_bytes()).ok_or("hot cache size overflow")?;
+        table.hot_data = crate::ngram_cache::load_or_build(persistence, key, len, || table.load_hot_rows())?;
+        Ok(table)
+    }
+    fn prepare_from_artifact(
         path: &Path,
         reader: &Reader,
         bound: &FlashNextPlan,
@@ -280,7 +316,7 @@ impl NgramTable {
             .map(|row| u64::try_from(row).map_err(|_| format!("hot row {row} is negative")))
             .collect::<Result<Vec<u64>, String>>()?;
         let hasher = NgramHasher::new(geometry, buffers)?;
-        Self::open(path, layout, hasher, &ranked, options)
+        Self::open_unloaded(path, layout, hasher, &ranked, options)
     }
 
     pub fn hasher(&self) -> &NgramHasher {
@@ -694,7 +730,38 @@ mod tests {
             NgramTable::from_artifact(&artifact.path, &reader, &bound, geometry, options(3 * 94)).unwrap();
         assert_eq!(table.hot_rows(), 3);
         assert_eq!(table.token_bytes(), 2 * 90);
-
+        let unmapped = NgramTable::from_cached_artifact(
+            &artifact.path,
+            Reader::open(&artifact.path).unwrap(),
+            &bound,
+            geometry,
+            options(3 * 94),
+            &crate::ngram_cache::PersistenceOptions { enabled: false, path: None },
+        )
+        .unwrap();
+        assert_eq!(unmapped.hot_data, table.hot_data, "early unmapping preserves all cached bytes");
+        let cache_path = artifact.path.with_extension("ngram-test-cache");
+        let persistence = crate::ngram_cache::PersistenceOptions { enabled: true, path: Some(cache_path.clone()) };
+        for budget in [3 * 94, 3 * 94, 2 * 94] {
+            let cached = NgramTable::from_cached_artifact(
+                &artifact.path, Reader::open(&artifact.path).unwrap(), &bound, geometry, options(budget), &persistence,
+            ).unwrap();
+            assert_eq!(cached.hot_data, table.hot_data[..cached.hot_rows() * 90]);
+            let selected = [0, 3, 17, 491, 499, 999, 17];
+            let mut restored = vec![0u8; selected.len() * 90];
+            let mut expected = restored.clone();
+            cached.begin_rows(&selected).unwrap().finish(&mut restored).unwrap();
+            table.begin_rows(&selected).unwrap().finish(&mut expected).unwrap();
+            assert_eq!(restored, expected, "restored hot rows and cold gathers agree");
+        }
+        assert_eq!(std::fs::read_dir(&cache_path).unwrap().filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|ext| ext == "bin")).count(), 2);
+        std::fs::remove_dir_all(cache_path).unwrap();
+        let selected = [0, 3, 17, 491, 499, 999, 17];
+        let mut cold = vec![0u8; selected.len() * 90];
+        let mut early = cold.clone();
+        table.begin_rows(&selected).unwrap().finish(&mut cold).unwrap();
+        unmapped.begin_rows(&selected).unwrap().finish(&mut early).unwrap();
+        assert_eq!(cold, early, "cache hits, direct reads, boundary and duplicate rows agree");
         let tokens = [100u32, 2_000, 248_044, 31, 31, 77_777];
         let mut staged = vec![0u8; tokens.len() * table.token_bytes()];
         table.stage(&mut table.new_context(), &tokens, &mut staged).unwrap();

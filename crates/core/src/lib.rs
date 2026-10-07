@@ -61,6 +61,7 @@ pub mod model_load;
 pub mod moe;
 pub mod ngram;
 pub mod ngram_table;
+pub mod ngram_cache;
 pub mod pointing;
 pub mod prefix;
 pub mod constrained;

@@ -20,13 +20,11 @@ regex = "1"
 # #302): the converter's calibration expert traffic the residency's pools
 # are split by. Already a dependency of ignis-artifact.
 serde_json = { workspace = true }
+# Persistent n-gram cache identity and payload checksums.
+sha2 = "0.10"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-# Fixture integrity only (crates/core/tests/hq_kv_fixture_*): hashing the
-# committed hq-e8-2b KV row fixture, never a production dependency (same
-# version crates/bench already pins for its own oracle/trace hashing).
-sha2 = "0.10"
 
 [features]
 # Forwards to the artifact crate's `cuda` feature (the VRAM materialization

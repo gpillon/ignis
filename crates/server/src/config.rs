@@ -108,6 +108,7 @@ pub struct Config {
     /// #234). Flat, one file per model: the artifact and its sidecar keep
     /// the names the repo publishes them under.
     pub model_download_path: PathBuf,
+    pub ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
     pub enable_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The server-wide thinking budget (`--thinking-budget` /
@@ -394,6 +395,8 @@ pub fn resolve(
     let mut ui = None;
     let mut model_download = None;
     let mut model_download_path = None;
+    let mut persist_ngram_cache = None;
+    let mut persist_ngram_cache_path = None;
     let mut metrics_on = false;
     let mut metrics_bind = None;
     let mut api_key = None;
@@ -451,6 +454,8 @@ pub fn resolve(
             "--model-download-path" => {
                 model_download_path = Some(take_value(args, &mut i, flag)?)
             }
+            "--persist-ngram-cache" => persist_ngram_cache = Some(take_value(args, &mut i, flag)?),
+            "--persist-ngram-cache-path" => persist_ngram_cache_path = Some(take_value(args, &mut i, flag)?),
             "--metrics" => metrics_on = true,
             "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
             "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
@@ -601,11 +606,22 @@ pub fn resolve(
         (_, api_key) => api_key,
     };
 
+    let raw = persist_ngram_cache.or_else(|| env("IGNIS_PERSIST_NGRAM_CACHE")).unwrap_or_else(|| "true".into());
+    let enabled = match raw.trim() {
+        "true" => true, "false" => false,
+        _ => return Err(ConfigError(format!("`--persist-ngram-cache` must be true or false, got `{raw}`"))),
+    };
+    let raw_path = persist_ngram_cache_path.or_else(|| env("IGNIS_PERSIST_NGRAM_CACHE_PATH")).unwrap_or_else(|| "auto".into());
+    if raw_path.is_empty() { return Err(ConfigError("`--persist-ngram-cache-path` cannot be empty".into())); }
+    let ngram_cache = ignis_core::ngram_cache::PersistenceOptions {
+        enabled, path: (raw_path != "auto").then(|| PathBuf::from(raw_path)),
+    };
     Ok(ConfigOutcome::Config(Config {
         model,
         model_named,
         bind,
         artifact,
+        ngram_cache,
         model_download: resolve_model_download(model_download, &env)?,
         model_download_path: non_empty(
             model_download_path.or_else(|| env("IGNIS_MODEL_DOWNLOAD_PATH")),
@@ -1308,6 +1324,8 @@ fn help_text() -> String {
          \x20   -a, --artifact <path>         env: IGNIS_ARTIFACT      (default: unset — the model is looked for under --model-download-path, and fetched when it is not there)\n\
          \x20       --model-download / --no-model-download env: IGNIS_MODEL_DOWNLOAD (default: on; fetch a missing model — asked first when stdin is a terminal, downloaded straight away when it is not; off keeps the placeholder template)\n\
          \x20       --model-download-path <dir> env: IGNIS_MODEL_DOWNLOAD_PATH (default: {DEFAULT_MODEL_DOWNLOAD_PATH}; where a fetched model lands, and where one fetched earlier is found)\n\
+         \x20       --persist-ngram-cache <true|false> env: IGNIS_PERSIST_NGRAM_CACHE (default: true; persist Flash-Next hot rows)\n\
+         \x20       --persist-ngram-cache-path <auto|dir> env: IGNIS_PERSIST_NGRAM_CACHE_PATH (default: auto; Windows LOCALAPPDATA/ignis/cache/ngram, Linux XDG_CACHE_HOME/ignis/ngram or HOME/.cache/ignis/ngram)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --thinking-budget <n|off> env: IGNIS_THINKING_BUDGET  (default: {DEFAULT_THINKING_BUDGET}; reasoning tokens before the model's close is forced, off = no budget; a request's thinking_budget overrides it, 0 = none)\n\
@@ -1375,6 +1393,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ngram_cache_defaults_flags_env_and_invalid_values() {
+        let default=expect_config(resolve(&[],no_env).unwrap());
+        assert!(default.ngram_cache.enabled); assert_eq!(default.ngram_cache.path,None);
+        let env=env_map(&[("IGNIS_PERSIST_NGRAM_CACHE","false"),("IGNIS_PERSIST_NGRAM_CACHE_PATH","custom")]);
+        let config=expect_config(resolve(&[],&env).unwrap());
+        assert!(!config.ngram_cache.enabled); assert_eq!(config.ngram_cache.path,Some(PathBuf::from("custom")));
+        let config=expect_config(resolve(&args(&["--persist-ngram-cache","true","--persist-ngram-cache-path","auto"]),env).unwrap());
+        assert!(config.ngram_cache.enabled); assert_eq!(config.ngram_cache.path,None);
+        for flags in [vec!["--persist-ngram-cache","yes"],vec!["--persist-ngram-cache"],vec!["--persist-ngram-cache-path"],vec!["--persist-ngram-cache-path",""]] {
+            assert!(resolve(&args(&flags),no_env).is_err());
+        }
+    }
     #[test]
     fn no_args_no_env_falls_back_to_defaults() {
         let config = expect_config(resolve(&[], no_env).expect("resolve"));

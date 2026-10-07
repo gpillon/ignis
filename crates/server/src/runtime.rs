@@ -516,6 +516,15 @@ pub fn flash_next_scheduler(
     shape: EngineShape,
     thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
+    flash_next_scheduler_with_ngram_cache(artifact_path, model_id, eos, shape, thinking_close, Default::default())
+}
+
+#[cfg(feature = "cuda")]
+pub fn flash_next_scheduler_with_ngram_cache(
+    artifact_path: &std::path::Path, model_id: String, eos: TokenId, shape: EngineShape,
+    thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
+    ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
+) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
     use ignis_artifact::flash_next::{self, FlashNextGeometry};
     use ignis_artifact::{CudaDevice, Reader};
     use ignis_core::compute::ModelConfig;
@@ -574,6 +583,7 @@ pub fn flash_next_scheduler(
     // what the plan below leaves: one budget for the pool the plan charges
     // and the pool the leaf builds.
     let mut options = EngineOptions {
+        ngram_cache,
         prefill_chunk_tokens: shape.prefill_chunk,
         max_context_tokens: shape.max_context,
         kv_format: shape.kv_format,
