@@ -34,15 +34,20 @@ MODEL ?=
 MODEL_FAMILY := $(if $(filter flash-next,$(MODEL)),flash-next,27b)
 ifeq ($(MODEL_FAMILY),flash-next)
   ARTIFACT ?= F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_trellis_a25-v2.ninfer
-  # 128K tokens per lane under hq-e8-2b, inside the checkpoint's 262,144
-  # trained positions (so no YaRN); 8192-token prefill chunks amortize a
+  # 262,144 tokens per lane under hq-e8-2b, the checkpoint's whole trained
+  # envelope (so no YaRN): the user always keeps that context, and speed
+  # never takes VRAM from the KV pool (LANES, below, is the one that trades); 8192-token prefill chunks amortize a
   # chunk's expert transfer (spec flash-next/03); no vision. No speculation
   # by default: on the 5090 the MTP head is PCIe-bound (finding 2026-10-07).
   # SPEC=mtp turns it on, its companion container beside the artifact (spec
   # flash-next/07); DRAFT_TOKENS=k forces at most k drafts per lane;
   # DRAFT_ROWS=r is the row budget that cuts k as lanes join (empty: the
   # decode route's 8; 3 drafts at one lane only).
-  MAX_CONTEXT ?= 131072
+  MAX_CONTEXT ?= 262144
+  # The decode lanes (--decode-lanes, 1..8): the sequences decoded at once,
+  # each with a whole context in the KV pool. Fewer lanes leave the expert
+  # cache more of the VRAM budget.
+  LANES ?= 3
   ROPE_SCALING ?= none
   PREFILL_CHUNK ?= 8192
   SPEC ?=

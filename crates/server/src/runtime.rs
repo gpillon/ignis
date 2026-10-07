@@ -65,6 +65,9 @@ pub struct EngineShape {
     /// Flash-Next's draft row budget (`--draft-rows`, GitHub #307); 0 = the
     /// decode route's 8 rows.
     pub draft_rows: u32,
+    /// Flash-Next's decode lanes (`--decode-lanes`, GitHub #306); 0 = the
+    /// engine's default.
+    pub decode_lanes: u32,
     /// Vision (`--vision`/`--vision-max-tokens`, GitHub #177): `None` binds
     /// and reserves nothing of the vision tower.
     pub vision: Option<ignis_core::Vision>,
@@ -96,6 +99,7 @@ impl Default for EngineShape {
             speculation: None,
             speculation_off: false,
             draft_rows: 0,
+            decode_lanes: 0,
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
         }
@@ -121,6 +125,7 @@ impl From<&crate::config::Config> for EngineShape {
             speculation: config.speculation,
             speculation_off: config.speculation_off,
             draft_rows: config.draft_rows.unwrap_or(0),
+            decode_lanes: config.decode_lanes.unwrap_or(0),
             vision: config.vision,
             rope_scaling: config.rope_scaling,
         }
@@ -539,7 +544,10 @@ pub fn flash_next_scheduler_with_ngram_cache(
     use ignis_runtime::{FlashNextLeaf, KV_PAGE_TOKENS};
 
     let shape = shape.for_family(ignis_core::compute::ModelFamily::FlashNext);
-    let lanes = ignis_core::flash_next::DEFAULT_DECODE_LANES;
+    let lanes = match shape.decode_lanes {
+        0 => ignis_core::flash_next::DEFAULT_DECODE_LANES,
+        lanes => lanes,
+    };
     let (free_at_start_bytes, _) = CudaDevice::nvml_memory(0)
         .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
     let budget_bytes = match shape.vram {
@@ -907,6 +915,7 @@ mod tests {
             rope_scaling: ignis_core::RopeScaling::NONE,
         };
 
+            decode_lanes: 0,
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
 
         assert_eq!(config.serving_chunk_tokens, 512);

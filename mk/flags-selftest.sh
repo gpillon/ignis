@@ -41,8 +41,16 @@ has "SPEC=mtp" "$out" "--draft-tokens 3"
 has "SPEC=mtp" "$out" "--draft-rows 6"
 
 out="$(flags MODEL=flash-next)"
+has "default" "$out" "--decode-lanes 3"
+has "default" "$out" "--max-context 262144"
 lacks "default" "$out" "--spec"
 lacks "default" "$out" "--draft-rows"
+
+out="$(flags MODEL=flash-next LANES=1)"
+has "LANES=1" "$out" "--decode-lanes 1"
+
+out="$(flags)"
+lacks "27B" "$out" "--decode-lanes"
 
 out="$(flags MODEL=flash-next SPEC=off)"
 has "SPEC=off" "$out" "--spec off"
