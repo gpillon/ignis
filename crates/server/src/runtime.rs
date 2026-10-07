@@ -718,6 +718,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
             planned_bytes = host.total_bytes,
             left_bytes = host.left_bytes,
             ngram_hot_budget = %shape.ngram_hot,
+            ngram_hot_budget_bytes = options.ngram.hot_bytes,
             ngram_hot_rows_bytes,
             ngram_whole_table = footprint.is_whole(options.ngram.hot_bytes),
             retained_host_slots = options.retained_host_slots,
