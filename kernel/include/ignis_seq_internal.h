@@ -429,6 +429,11 @@ struct ignis_seq {
   // without the prefix's own definition.
   ignis_seq_prefix *prefix  = nullptr;
   std::uint32_t shared_pages = 0;
+  // The pages-only link this sequence's checkpoint capture lent its first
+  // own pages to (GitHub #306), or null. The pages stay in `kv`, and in the
+  // block-table row, until ignis_seq_release hands them over; one reference
+  // to the link is held until then.
+  ignis_seq_prefix *lent_to = nullptr;
 };
 
 /* Whether `seq` was actually drawn from `pool`.

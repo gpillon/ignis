@@ -31,15 +31,15 @@
 //     the page this copies. A sequence that resumed from an earlier point and
 //     prefilled past it satisfies this by publishing a **chained** prefix at
 //     its own opener's page floor first (GitHub #187, ignis_seq_prefix_publish),
-//     or -- since GitHub #306 -- by letting the capture hand those pages to a
+//     or -- since GitHub #306 -- by letting the capture lend those pages to a
 //     **pages-only link** itself, which spares the prefill its cut at the
 //     floor. Either way a conversation's every turn, and every iteration of an
 //     agent's tool loop, leaves a checkpoint of its own.
-//   * a capture changes nothing about the sequence's state, and a refused
-//     one changes nothing at all. It is a bet the caller may lose, and a lost
-//     bet must cost nothing. What a successful one may change is who owns the
-//     pages below the opener -- never what they hold; once that handover has
-//     begun only a failed device call can stop it, as for a publish.
+//   * a capture changes nothing about the sequence, including on failure. It
+//     is a bet the caller may lose, and a lost bet must cost nothing. A
+//     successful one may lend the pages below the opener to a link: they stay
+//     in the sequence's allocation and row, and move to the link only when the
+//     sequence is released (ignis_seq_settle_loan), by host bookkeeping alone.
 
 #include "ignis_seq.h"
 #include "ignis_seq_checkpoint_internal.h"
@@ -49,6 +49,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -75,9 +76,12 @@ template <typename Work> double timed(Work &&work) {
   return elapsed.count();
 }
 
+// The fault armed by ignis_seq_inject_capture_fault, if any.
+std::atomic<bool> g_capture_fault{false};
+
 bool checkpoint_belongs_to(const ignis_seq_pool &pool,
                            const ignis_seq_checkpoint &checkpoint) {
-  return checkpoint.prefix != nullptr && checkpoint.prefix->kv.belongs_to(pool.kv_pool);
+  return checkpoint.prefix != nullptr && ignis_seq_prefix_belongs_to(*checkpoint.prefix, pool);
 }
 
 // The pool page holding the checkpoint's copy of its partial page, or -1 for
@@ -87,6 +91,14 @@ std::int32_t tail_page_of(const ignis_seq_checkpoint &checkpoint) {
 }
 
 } // namespace
+
+void ignis_seq_inject_capture_fault() { g_capture_fault.store(true); }
+
+void ignis_seq_capture_fault_point() {
+  if (g_capture_fault.exchange(false)) {
+    throw std::runtime_error("a fault injected at the commit point (test seam)");
+  }
+}
 
 extern "C" int32_t
 ignis_seq_checkpoint_snapshot_size(const struct ignis_seq_pool *pool,
@@ -167,7 +179,12 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
   }
   const auto page_size      = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
   const std::uint32_t below = opener_tokens / page_size;
-  if (seq->prefix == nullptr && below == 0) {
+  // GitHub #306: pages already lent to a link (an earlier capture at this
+  // opener) are a prefix's as far as a claimant is concerned.
+  const std::uint32_t lent =
+      seq->lent_to == nullptr ? 0 : static_cast<std::uint32_t>(seq->lent_to->lent.size());
+  const std::uint32_t covered = seq->shared_pages + lent;
+  if (seq->prefix == nullptr && covered == 0 && below == 0) {
     ignis_seq_set_last_error(
         "ignis_seq_checkpoint_capture: sequence slot " + std::to_string(seq->slot) +
         " holds no shared prefix and the opener is inside its first page, so there is no whole "
@@ -189,14 +206,20 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
         "generation opener");
     return IGNIS_SEQ_ERR_NOT_AT_BOUNDARY;
   }
-  if (below < seq->shared_pages) {
-    // The opener lies inside pages other holders share: the page it ends
+  if (below < covered) {
+    // The opener lies inside pages a prefix already holds: the page it ends
     // inside is not this sequence's to copy, and no later write of it is.
     ignis_seq_set_last_error(
         "ignis_seq_checkpoint_capture: the " + std::to_string(opener_tokens) +
         "-token opener covers " + std::to_string(below) + " whole pages, but sequence slot " +
-        std::to_string(seq->slot) + " shares " + std::to_string(seq->shared_pages) +
-        "; the opener must not fall inside the pages it shares");
+        std::to_string(seq->slot) + " has " + std::to_string(covered) +
+        " in a prefix already; the opener must not fall inside them");
+    return -1;
+  }
+  if (lent != 0 && below != covered) {
+    ignis_seq_set_last_error("ignis_seq_checkpoint_capture: sequence slot " +
+                             std::to_string(seq->slot) +
+                             " has lent pages to a link already, and lends once");
     return -1;
   }
   // The whole pages below the opener must be a prefix's before a checkpoint
@@ -210,14 +233,16 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
   // GitHub #187 made it true by publishing a chained prefix at the opener's
   // page floor first, at a chunk cut of its own. GitHub #306 (ADR 0029 as
   // amended 2026-10-07) makes it true here, at the opener: the `handed` pages
-  // between what the sequence shares and the opener's floor go to a
+  // between what the sequence shares and the opener's floor are **lent** to a
   // **pages-only link** chained over its head -- no image, since no sequence
-  // stands at its end, and no handle, since nothing claims it on its own.
-  const std::uint32_t handed = below - seq->shared_pages;
-  if (seq->kv.mapped_page_count() <= handed) {
+  // stands at its end, and no handle, since nothing claims it on its own. They
+  // stay where they are, in the sequence's allocation and row, until the
+  // sequence is released and the link takes them (ignis_seq_settle_loan).
+  const std::uint32_t handed = below - covered;
+  if (seq->kv.mapped_page_count() <= lent + handed) {
     ignis_seq_set_last_error("ignis_seq_checkpoint_capture: sequence slot " +
                              std::to_string(seq->slot) + " maps no page of its own past the " +
-                             std::to_string(handed) + " whole pages below the opener");
+                             std::to_string(below) + " whole pages below the opener");
     return -1;
   }
   if (const std::string refusal = ignis_seq_retained_slot_refusal(*pool, retained_slot);
@@ -236,8 +261,8 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
 
   try {
     // Every fallible step happens first, against the entry's own page and a
-    // slot nothing holds. The sequence is only read until they are done, so a
-    // failure -- a copy, a synchronize -- leaves it exactly as it was, the
+    // slot nothing holds, while the sequence is only read. A failure -- a
+    // copy, a synchronize, an allocation -- leaves it exactly as it was, the
     // page goes back with the entry, and the caller simply did not get a
     // checkpoint.
     auto entry         = std::make_unique<ignis_seq_checkpoint>();
@@ -248,39 +273,41 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
       entry->tail.materialize_pages(1);
       entry->image_bytes += ignis_seq_checkpoint_page_bytes(*pool);
     }
+    std::unique_ptr<ignis_seq_prefix> link;
+    if (handed != 0) {
+      link           = std::make_unique<ignis_seq_prefix>();
+      link->tokens   = below * page_size;
+      const auto own = seq->kv.page_ids();
+      link->lent.assign(own.begin(), own.begin() + handed);
+    }
 
     // The page the opener ends inside: the sequence's own first page past the
-    // ones about to be handed over.
-    const std::int32_t own_page = seq->kv.page_ids()[handed];
+    // whole pages below the opener.
+    const std::int32_t own_page = seq->kv.page_ids()[lent + handed];
     timed([&] {
       ignis_seq_capture_state(*pool, *seq, retained_slot, entry->progress);
       if (partial) {
         ignis_seq_copy_kv_page(*pool, own_page, tail_page_of(*entry));
       }
     });
+    ignis_seq_capture_fault_point();
 
-    // GitHub #306: the handover, balanced like a publish's. Everything above
-    // could fail and cost nothing; from here only a failed device call can,
-    // and that leaves the context unusable for every sequence -- the standard
-    // a publish's handover has always had. The link is a raw pointer for that
-    // reason: once the sequence stands on it, an unwind must not free it.
-    if (handed != 0) {
-      auto *link     = new ignis_seq_prefix();
-      link->tokens   = below * page_size;
-      link->refcount = 1; // the sequence standing on it; the checkpoint's is taken below
-      ignis_seq_hand_over_head(*pool, *seq, *link, handed);
-      // The opener's partial page went back to the pool with the rest past
-      // the floor, so the copy just taken is written into the sequence's new
-      // first page: from here it reads exactly the history it read before.
-      if (partial) {
-        timed([&] { ignis_seq_copy_kv_page(*pool, tail_page_of(*entry), seq->kv.page_ids()[0]); });
+    // The commit point: nothing below can fail. The link takes a reference of
+    // its own on the head the sequence stands on (the sequence keeps its own),
+    // and the sequence, as lender, holds the link until it hands the pages
+    // over. The checkpoint takes one reference to whatever holds the whole
+    // pages below the opener: that reference, not the pages themselves, is
+    // what outlives the request that warmed them.
+    if (link != nullptr) {
+      link->lender = seq;
+      link->parent = seq->prefix;
+      if (link->parent != nullptr) {
+        ++link->parent->refcount;
       }
+      link->refcount = 1;
+      seq->lent_to   = link.release();
     }
-
-    // The checkpoint takes one reference to the prefix under it: that
-    // reference, not the pages themselves, is what outlives the request that
-    // warmed them.
-    entry->prefix = seq->prefix;
+    entry->prefix = seq->lent_to != nullptr ? seq->lent_to : seq->prefix;
     ++entry->prefix->refcount;
     entry->retained_slot               = static_cast<std::int32_t>(retained_slot);
     pool->retained_held[retained_slot] = true;
@@ -349,7 +376,7 @@ extern "C" void ignis_seq_checkpoint_release(struct ignis_seq_pool *pool,
     return;
   }
   if (pool != nullptr && checkpoint->prefix != nullptr &&
-      !checkpoint->prefix->kv.belongs_to(pool->kv_pool)) {
+      !ignis_seq_prefix_belongs_to(*checkpoint->prefix, *pool)) {
     ignis_seq_set_last_error("ignis_seq_checkpoint_release: the checkpoint was not captured from "
                              "this pool; nothing was released");
     return;

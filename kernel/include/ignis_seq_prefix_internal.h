@@ -37,6 +37,7 @@
 #include "core/arena.h"
 
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -82,9 +83,15 @@ struct ignis_seq_prefix {
    * the slot goes back, while the pages live on under the sequences still
    * standing on them. -1 once released, and from the start for a
    * **pages-only link** (GitHub #306): the pages below a generation opener,
-   * handed over by a checkpoint capture with no image and no handle, held by
-   * the sequence and the checkpoint standing on them. */
+   * handed over by a checkpoint capture with no image and no handle. */
   std::int32_t retained_slot = -1;
+  /* A pages-only link's pages while they are still on loan (GitHub #306):
+   * the capturing sequence that owns them, and their physical ids -- its first
+   * own pages. The capture moves nothing, so it cannot fail half-way; the
+   * lender hands them over (`kv` takes them) when it is released
+   * (ignis_seq_settle_loan), and both are empty from then on. */
+  ignis_seq *lender = nullptr;
+  std::vector<std::int32_t> lent;
   /* What that image occupies: one slot's state and its hq residual window,
    * `ignis_seq_pool::retained_image_bytes`. */
   std::uint64_t image_bytes = 0;
@@ -97,7 +104,8 @@ struct ignis_seq_prefix {
    * claimant's first write land on a page it owns. */
   std::uint32_t tokens = 0;
   /* Live holders: the publisher's handle, every claiming sequence, and a
-   * chained child (GitHub #187). */
+   * chained child (GitHub #187) -- and a pages-only link's lender, until it
+   * hands the pages over (GitHub #306). */
   std::uint32_t refcount = 0;
   /* What the clone actually cost, rather than what it was assumed to cost
    * (ADR 0024). Reported through ignis_seq_prefix_stats. */
@@ -105,17 +113,32 @@ struct ignis_seq_prefix {
   double last_clone_micros       = 0.0;
 };
 
+/* The physical pages `prefix` holds itself, in block-table order: its own
+ * allocation's, or -- for a pages-only link still on loan (GitHub #306) --
+ * the ones its lender owns until it is released. Every walk of a chain reads
+ * a link's pages through this. */
+inline std::span<const std::int32_t> ignis_seq_prefix_own_page_ids(const ignis_seq_prefix &prefix) {
+  return prefix.lender != nullptr ? std::span<const std::int32_t>(prefix.lent) : prefix.kv.page_ids();
+}
+
+/* Whether `prefix`'s pages are `pool`'s: its allocation's pool, or its
+ * lender's while the pages are on loan (GitHub #306). */
+inline bool ignis_seq_prefix_belongs_to(const ignis_seq_prefix &prefix, const ignis_seq_pool &pool) {
+  return prefix.lender != nullptr ? ignis_seq_belongs_to(pool, *prefix.lender)
+                                  : prefix.kv.valid() && prefix.kv.belongs_to(pool.kv_pool);
+}
+
 /* The KV pages the head `prefix` covers: its own and every ancestor's
  * (GitHub #187).
  *
  * This is what a claimant shares and what `ignis_seq::shared_pages` counts —
  * "how much history is warm", which the chain answers together. Who gives
  * which page back is a different question, answered by each link's own
- * `kv.mapped_page_count()`. */
+ * pages. */
 inline std::uint32_t ignis_seq_prefix_total_pages(const ignis_seq_prefix &prefix) {
   std::uint32_t pages = 0;
   for (const ignis_seq_prefix *at = &prefix; at != nullptr; at = at->parent) {
-    pages += at->kv.mapped_page_count();
+    pages += static_cast<std::uint32_t>(ignis_seq_prefix_own_page_ids(*at).size());
   }
   return pages;
 }
@@ -182,21 +205,13 @@ inline void ignis_seq_clone_state(ignis_seq_pool &pool, std::uint32_t retained_s
   ignis_seq_apply_progress(seq, progress);
 }
 
-/* Hand the first `own` pages of `seq`'s own allocation to `entry`, a prefix
- * chained over whatever `seq` stands on (GitHub #187), and give `seq` a fresh
- * zeroed reservation for the rest, its block-table row rewritten over the
- * chain. The pages handed over stay where they are; every page past them goes
- * back to the pool and as many are reserved again, so what they held is the
- * caller's to have kept. `entry` takes `seq`'s reference on its old head;
- * its own refcount is the caller's to set.
- *
- * A prefix publish calls this with nothing past its head written (GitHub
- * #126); a checkpoint capture handing the pages below its opener over as a
- * pages-only link (GitHub #306) copies the opener's partial page back after.
- * The caller has checked that `own` leaves `seq` a page of its own. Defined in
- * kernel/src/seq_prefix.cu; throws only on a failed device call. */
-void ignis_seq_hand_over_head(ignis_seq_pool &pool, ignis_seq &seq, ignis_seq_prefix &entry,
-                              std::uint32_t own);
+/* Settle `seq`'s loan, if it has one (GitHub #306): the pages-only link it
+ * lent its first own pages to takes them into its own allocation -- the rest
+ * of `seq`'s go back to the pool with `seq` -- and `seq` drops its reference
+ * to the link. Host bookkeeping only, so it cannot fail: ignis_seq_release
+ * calls it first, before anything else of `seq` goes. Defined in
+ * kernel/src/seq_prefix.cu. */
+void ignis_seq_settle_loan(ignis_seq &seq);
 
 /* Drop one reference to `prefix`, destroying it -- and returning its pages to
  * the pool it was published from -- when the last holder lets go. A null

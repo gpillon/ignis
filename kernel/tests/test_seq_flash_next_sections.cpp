@@ -260,10 +260,11 @@ int main() {
 
   ignis_seq_checkpoint_release(pool, checkpoint);
 
-  // --- GitHub #306: a capture standing on nothing hands page 0 over ---------
-  // The pages below the opener become a pages-only link; the sequence's new
-  // first page carries the opener's partial page, block keys included, and a
-  // claimant of the checkpoint reads both pages' keys and the opener's state.
+  // --- GitHub #306: a capture standing on nothing lends page 0 -------------
+  // The pages below the opener are lent to a pages-only link and stay where
+  // they are; a claimant of the checkpoint reads both pages' keys -- the
+  // partial page's through its copy -- and the opener's state, and the link
+  // takes page 0 when the sequence is released.
   struct ignis_seq_pool_stats before_g{};
   check(ignis_seq_pool_stats(pool, &before_g) == 0, "stats before G");
   ignis_seq *g = nullptr;
@@ -280,9 +281,10 @@ int main() {
   check(ignis_seq_checkpoint_capture(pool, g, 100, 1, &handed) == 0,
         std::string("capture at 100 over a page that is no prefix yet: ") + ignis_seq_last_error());
   if (handed != nullptr) {
-    const std::vector<int32_t> g_after = pages_of(*g, 2);
-    check(g_after[0] == g_pages[0] && g->shared_pages == 1, "page 0 is a link's now, in place");
-    check(keys_of(*pool, g_after) == g_keys, "the sequence's new first page carries the partial page's block keys");
+    check(g->lent_to != nullptr && g->lent_to->lent.size() == 1 && g->lent_to->lent[0] == g_pages[0] &&
+              g->shared_pages == 0 && pages_of(*g, 2) == g_pages,
+          "page 0 is lent to a link, and the sequence's pages are where they were");
+    check(keys_of(*pool, g_pages) == g_keys, "with their block keys");
     check(state_of(*pool, g->slot).tails == g_state.tails && state_of(*pool, g->slot).conv == g_state.conv,
           "and its tails and conv state are untouched");
     ignis_seq *h = nullptr;
@@ -299,7 +301,8 @@ int main() {
   ignis_seq_release(pool, g);
   struct ignis_seq_pool_stats after_g{};
   check(ignis_seq_pool_stats(pool, &after_g) == 0, "stats after G");
-  check(after_g.kv_free_pages == before_g.kv_free_pages, "the link went with its last holder, and every page came back");
+  check(after_g.kv_free_pages == before_g.kv_free_pages,
+        "the link took page 0 from its lender and went with its last holder: every page came back");
 
   ignis_seq_release(pool, a);
   ignis_seq_prefix_release(pool, prefix);

@@ -1300,23 +1300,42 @@ impl ConcreteScheduler {
         true
     }
 
+    /// Whether a member of `batch` before the `n`th sits at the same point `at`
+    /// over the same content as it does: P4-10's one publisher per head
+    /// (GitHub #126, #193) and one capture per content (GitHub #306). A
+    /// prompt is keyed only when the points collide, which is rare, rather
+    /// than for every request on every tick its point is nonzero.
+    fn taken_earlier(&self, batch: &[usize], points: &[u32], n: usize, at: u32) -> bool {
+        let head_key = |i: usize| {
+            let media = media_keys(&self.requests[i].input);
+            PromptContent::new(&self.requests[i].input.tokens, &media).key_at(at)
+        };
+        let mut earlier = (0..n).filter(|&m| points[m] == at).peekable();
+        earlier.peek().is_some() && {
+            let head = head_key(batch[n]);
+            earlier.any(|m| head_key(batch[m]) == head)
+        }
+    }
+
     /// Record the **pages-only link** request `idx`'s capture at `opener`
     /// handed over, if it handed one over (ADR 0029 as amended 2026-10-07,
     /// GitHub #306), and answer whether the checkpoint has something to stand
     /// on.
     ///
-    /// The leaf chains exactly when the opener's whole pages reach past what
+    /// The leaf lends exactly when the opener's whole pages reach past what
     /// the sequence shares (`seq_checkpoint.cu`), so this asks the same of the
-    /// request rather than being told. The one place the two may count it
+    /// request rather than being told; the leaf's link takes the pages when
+    /// the sequence is released, and the charge moves here at once -- the same
+    /// pages either way. The one place the two may count it
     /// differently is after an earlier publish this cache declined: the leaf's
     /// link then stands on that prefix and this one covers its pages too, and
     /// the pages still come back together, when the link drops. Like an
     /// imaged publish's registration
     /// it only moves the charge: the link owns those pages from here, and the
-    /// request's own reservation shrinks by them. `false` is a link this cache
-    /// cannot record -- its parent gone -- and the caller then drops the
-    /// checkpoint the leaf built over it; the link itself goes with the
-    /// sequence still standing on it.
+    /// request's own reservation shrinks by them. `false` would be a link this
+    /// cache cannot record, which the request standing on its parent makes
+    /// unreachable; the caller then drops the checkpoint the leaf built over
+    /// it, and the link goes with its lender.
     fn register_link(&mut self, idx: usize, opener: u32) -> bool {
         let page_tokens = self.config.kv_page_tokens;
         let r = &self.requests[idx];
@@ -1333,7 +1352,10 @@ impl ConcreteScheduler {
                 r.resources.kv_pages = r.resources.kv_pages.saturating_sub(pages);
                 true
             }
-            None => false,
+            None => {
+                debug_assert!(false, "a link over the entry its request stands on always registers");
+                false
+            }
         }
     }
 
@@ -2629,13 +2651,15 @@ impl Scheduler for ConcreteScheduler {
         //
         // The competition is temporary, and GitHub #187 ends it by
         // **chaining** the publish rather than by weakening the
-        // capture. `seq_checkpoint.cu:125`'s
-        // `below != seq->shared_pages` stays, and must: a checkpoint
-        // holds exactly one copied tail page and its capture takes
-        // `seq->kv.page_ids()[0]`, so with the opener pages above the
-        // block the copied page would not be the opener's at all and
-        // the pages between would have no holder — which is the
-        // defect #186 fixed in `565d634`. What #187 removes instead is
+        // capture. The capture's demand that the whole pages below the
+        // opener be a prefix's stays, and must: a checkpoint holds
+        // exactly one copied tail page, so with the opener pages above
+        // the block the copied page would not be the opener's at all
+        // and the pages between would have no holder — which is the
+        // defect #186 fixed in `565d634`. (GitHub #306 satisfies it a
+        // second way on Flash-Next: the capture lends those pages to a
+        // pages-only link itself, `Request::link_at_capture`.) What #187
+        // removes instead is
         // `seq_prefix.cu:129`'s `seq->prefix != nullptr`, so a
         // sequence standing on the block publishes a *second* prefix
         // over the head it warmed itself, taking over the reference it
@@ -3007,24 +3031,10 @@ impl Scheduler for ConcreteScheduler {
         // earlier one's, which is rare, rather than for every request on
         // every tick its point is nonzero.
         let mut publish_points: Vec<u32> = {
-            let head_key = |i: usize, at: u32| {
-                let media = media_keys(&self.requests[i].input);
-                PromptContent::new(&self.requests[i].input.tokens, &media).key_at(at)
-            };
             let mut points: Vec<u32> = Vec::with_capacity(batch.len());
             for (n, &i) in batch.iter().enumerate() {
                 let at = self.requests[i].publish_point(self.config.kv_page_tokens);
-                let taken = at > 0 && {
-                    let mut earlier = batch[..n]
-                        .iter()
-                        .enumerate()
-                        .filter(|&(m, _)| points[m] == at)
-                        .peekable();
-                    earlier.peek().is_some() && {
-                        let head = head_key(i, at);
-                        earlier.any(|(_, &j)| head_key(j, at) == head)
-                    }
-                };
+                let taken = at > 0 && self.taken_earlier(&batch, &points, n, at);
                 points.push(if taken { 0 } else { at });
             }
             points
@@ -3121,23 +3131,13 @@ impl Scheduler for ConcreteScheduler {
         // page rides the capture there is no publish at the floor for P4-10's
         // one-publisher rule (above) to keep a second identical prompt from
         // capturing too, so the same rule is applied to the captures: the
-        // first takes it, the rest prefill uncut. Keyed only on a collision,
-        // as the publish points are.
+        // first takes it, the rest prefill uncut.
         for n in 0..batch.len() {
             let at = capture_points[n];
-            if at == 0 || !self.requests[batch[n]].link_at_capture {
-                continue;
-            }
-            let head_key = |i: usize| {
-                let media = media_keys(&self.requests[i].input);
-                PromptContent::new(&self.requests[i].input.tokens, &media).key_at(at)
-            };
-            let mut earlier = (0..n).filter(|&m| capture_points[m] == at).peekable();
-            let taken = earlier.peek().is_some() && {
-                let head = head_key(batch[n]);
-                earlier.any(|m| head_key(batch[m]) == head)
-            };
-            if taken {
+            if at > 0
+                && self.requests[batch[n]].link_at_capture
+                && self.taken_earlier(&batch, &capture_points, n, at)
+            {
                 capture_points[n] = 0;
             }
         }

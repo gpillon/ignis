@@ -438,9 +438,9 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// the same reason [`StepLeaf::publish_prefix`] is called on its own: what
     /// a claimant receives is the state *there*. `sequence`'s state is left
     /// exactly as it was, including on failure — a capture is a bet, and a
-    /// lost bet costs the request nothing. A successful one hands the whole
+    /// lost bet costs the request nothing. A successful one may lend the whole
     /// pages below the opener the sequence holds as its own to a pages-only
-    /// link (GitHub #306) -- who owns them changes, never what they hold.
+    /// link (GitHub #306), which takes them when the sequence is released.
     fn capture_checkpoint(
         &self,
         _model: &Self::Model,

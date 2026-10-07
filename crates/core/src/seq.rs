@@ -1196,16 +1196,16 @@ impl<'a> Seq<'a> {
     ///
     /// The sequence must stand exactly at `opener_tokens`, at a chunk
     /// boundary. The whole pages below the opener it holds as its own -- past
-    /// whatever prefix it stands on -- are handed to a **pages-only link**
+    /// whatever prefix it stands on -- are lent to a **pages-only link**
     /// chained over that prefix (GitHub #306, ADR 0029 as amended 2026-10-07):
-    /// no image, no handle, held by the sequence and the checkpoint. The state
+    /// no image, no handle, held by the sequence and the checkpoint, and the
+    /// link's own once the sequence is released. The state
     /// goes into retained slot `retained_slot` (GitHub #215), which must hold
     /// no other image, and the page the opener ends inside into one page of the
-    /// pool: nothing is allocated. The capture changes nothing of the
-    /// sequence's state -- at most who owns the pages below its opener, never
-    /// what they hold -- so it goes on prefilling and decoding as if it had
-    /// not been asked, and a request cancelled after this keeps its
-    /// checkpoint.
+    /// pool: nothing is allocated. The capture changes nothing about the
+    /// sequence -- not its reservation, not its block-table row -- so it goes
+    /// on prefilling and decoding as if it had not been asked, and a request
+    /// cancelled after this keeps its checkpoint.
     ///
     /// The returned checkpoint borrows the **pool**, not this sequence: it
     /// outlives the request that captured it, which is the whole point.
@@ -1213,10 +1213,8 @@ impl<'a> Seq<'a> {
     /// `Err` on an opener inside the first page of a sequence holding no
     /// shared prefix, or inside the pages it shares, a position that is not
     /// the opener ([`NOT_AT_BOUNDARY`]), or a device allocation failure.
-    /// Nothing is allocated or changed on any of those: a refused capture
+    /// Nothing is allocated or changed on any failure: a refused capture
     /// costs the caller nothing, which is what lets it be treated as a bet.
-    /// Once pages are being handed over only a failed device call can fail
-    /// it, and that leaves the context unusable.
     pub fn capture_checkpoint(
         &mut self,
         opener_tokens: u32,

@@ -340,17 +340,23 @@ subagent matches the system block.
 
 **On a model that asks for it — Flash-Next — the opener's page is published by
 the capture, as a pages-only link.** At the chunk that lands on the generation
-opener, the leaf hands the whole pages between what the sequence already shares
+opener, the leaf lends the whole pages between what the sequence already shares
 and the opener's page floor to a chained prefix that carries no image, then
 captures the checkpoint over it. The prefill is cut once, at the opener.
+
+- **The capture moves nothing.** The lent pages stay in the sequence's
+  allocation and block-table row; the link takes them, by host bookkeeping
+  alone, when the sequence is released. A capture that fails has therefore
+  changed nothing, as before. The scheduler moves their charge to the link at
+  the capture: the same pages, counted once.
 
 - **A pages-only link is never claimed.** No sequence stands at its end, so it
   has no state to hand over: the scheduler never matches it, and the leaf
   refuses a shared claim of it. A prompt diverging below the opener resumes from
   the link below it or the system block.
 - **It has no handle and takes no retained slot.** Its holders are the sequence
-  standing on it, the checkpoint over it, the checkpoint's claimants and the
-  links later chained over it; it goes with the last of them.
+  that lent it its pages, the checkpoint over it, the checkpoint's claimants
+  and the links later chained over it; it goes with the last of them.
 - **It exists only with a checkpoint.** A capture the scheduler declines (no
   retained slot, no spare page, an identical checkpoint already held) publishes
   nothing at the floor. Two identical prompts in one batch no longer meet at a
@@ -367,9 +373,8 @@ captures the checkpoint over it. The prefill is cut once, at the opener.
 
 **Exactness.** A reused request is bit-exact against a cold prefill split at
 the same boundaries, which are now `[…, opener)` and `[opener, end)`. The
-capturing request goes on exactly as if it had published nothing: the handover
-moves page ownership and copies the opener's partial page into the sequence's
-new first page, and touches no state. Its outputs differ from the three-way
+capturing request goes on exactly as if it had published nothing: the loan
+touches neither its pages nor its state. Its outputs differ from the three-way
 split's only by the chunking effect the Consequences already record.
 
 Considered and rejected:

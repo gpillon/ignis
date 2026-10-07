@@ -462,7 +462,10 @@ impl Request {
     /// It is the generation opener the frontend reported, and it is offered
     /// only when the opener falls inside the request's **own first KV page**
     /// — that is, when the whole pages under it are exactly the shared prefix
-    /// the request already holds. That is not a formality: what a later
+    /// the request already holds — or, where the opener's page rides the
+    /// capture ([`Request::link_at_capture`], GitHub #306), when the capture
+    /// can lend the pages between to a pages-only link itself (the branch
+    /// below). That is not a formality: what a later
     /// claimant shares is those whole pages, and what it copies is the partial
     /// tail page, which has to be a page the publisher owns rather than one
     /// other holders are also writing.

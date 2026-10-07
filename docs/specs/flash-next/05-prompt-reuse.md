@@ -197,7 +197,8 @@ default device slot count is zero, so the expert cache gives up nothing.
   and the generation opener: `/v1/decide` and its boundaries are not served on
   Flash-Next (spec 04).
 
-Nothing in this spec changes the scheduler's reuse policy. It adds Flash-Next's
+Nothing in this spec changes the scheduler's reuse policy but one point: where
+the opener's page is published (Departures, 2026-10-07). It adds Flash-Next's
 state to the mechanisms the policy drives.
 
 **The Flash-Next mutable image.** The snapshot sections ADR 0024 defines,
@@ -351,7 +352,7 @@ mismatched blob does. They never check copy order or internal table layouts.
 ## Acceptance
 
 1. Flash-Next's mutable image (GDN fp32 state for 36 layers × 48 heads, conv taps, n-gram conv state, hq residual window, penalty row, position, last token) and its paged sections (KV in either format, indexer compressed keys) are derived from the topology. Their sizes are printed at load and checked by a CPU test.
-2. ADR 0029's reuse works on Flash-Next unchanged: prompt checkpoints at the generation opener, a retained prefix at the system block, lineage with at most two checkpoints, non-consuming claims, first victim on the device, KV-RAM spill and restore with the restore floor. `--prompt-reuse off` disables it.
+2. ADR 0029's reuse works on Flash-Next, with its 2026-10-07 amendment (the opener's page is lent to a pages-only link by the capture instead of published at a cut of its own): prompt checkpoints at the generation opener, a retained prefix at the system block, lineage with at most two checkpoints, non-consuming claims, first victim on the device, KV-RAM spill and restore with the restore floor. `--prompt-reuse off` disables it.
 3. A reused request is bit-exact (tokens and logits) against a cold prefill split at the same boundary: from the device and from KV-RAM, with a cold and a warm expert cache, in BF16 and in hq-e8-2b KV, for a dense-regime and a sparse-regime history. A retained-prefix claim and a blob round trip continue exactly.
 4. Retained slots default to host (proposed 8) with device 0. The KV-RAM arena defaults to a stated size (proposed 2 GiB). Both are host-plan lines, and the load refuses with the line to shrink named when the plan leaves less than spec 03's margin. No VRAM is taken from the expert cache unless device slots are asked for.
 5. A 27B blob is refused under Flash-Next and a Flash-Next blob under the 27B, by identity.

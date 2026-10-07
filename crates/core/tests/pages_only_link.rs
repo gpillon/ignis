@@ -374,3 +374,26 @@ fn a_checkpoint_on_a_link_goes_to_kv_ram_and_its_restorer_leaves_one_of_its_own(
     let events = run_to_idle(&mut sched);
     assert_eq!(reuses(&events, n2), vec![(ReuseSource::Device, 1140)], "on the device, over the root link");
 }
+
+#[test]
+fn a_page_aligned_opener_lends_its_whole_pages_and_copies_none() {
+    // An opener on a page boundary ends inside no page: the one cut is the
+    // opener's, the link holds every page below it, and the checkpoint keeps
+    // no tail page of its own.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+    let n = sched
+        .submit(input(tokens(1, 40), Some(2 * PAGE), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(chunk_widths(&compute, n), vec![32, 8], "cut once, at the opener on the page boundary");
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+    assert_eq!(sched.prefix_pinned_pages(), 2, "the link holds both pages below the opener");
+    assert_eq!(sched.retained_tail_pages(), 0, "and the checkpoint copies no page");
+
+    let later = sched
+        .submit(input([tokens(1, 32), tokens(600, 28)].concat(), Some(57), 4), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, later), vec![(ReuseSource::Device, 32)]);
+}

@@ -250,8 +250,11 @@ fn history_reuses_exactly(run: &Run<'_>, history: usize, salt: u32) {
 ///   the link -- and both it and a claimant of *that* continue as its own
 ///   split control does, `[0, opener)`, `[opener, opener')`, `[opener', end)`.
 ///
-/// Where the two-span control and the three-span one above part company is
-/// printed, not asserted: that is the chunking effect (ADR 0029).
+/// The reference runs first and again at the end: at 1,500 tokens it is the
+/// first thing a fresh load computes, so the two are a cold and a warm expert
+/// cache (spec flash-next/05 acceptance 3). Where the two-span control and the
+/// three-span one above part company is printed, not asserted: that is the
+/// chunking effect (ADR 0029).
 fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32) {
     assert_ne!(history % KV_PAGE_TOKENS as usize, 0, "the opener ends inside a page");
     let (leaf, model) = (run.leaf, run.model);
@@ -313,6 +316,8 @@ fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32)
         "{label}: two spans against three -- logits {}, first decoded token apart: {first_token_apart:?}",
         if three.logits == cold.logits { "identical" } else { "differ" }
     );
+    // And the reference again, on the cache all of the above warmed.
+    assert_eq!(reference(run), cold, "{label}: a warm expert cache computes what a cold one did");
     let (capacity, used) = leaf.kv_ram_arena_stats();
     assert_eq!(used, 0, "{label}: every blob went back to the {capacity}-byte arena");
 }
@@ -334,9 +339,11 @@ fn reuse_is_bit_exact(kv_format: KvFormat) {
     assert!(identity.accepts(&a_27b_blob).is_err(), "a 27B-layout blob is refused");
 
     let run = Run { leaf: &leaf, model: &model };
+    // First, on the cold expert cache a fresh load has: the shape Flash-Next
+    // serves checks its reference there and again on the cache it warmed.
+    the_opener_s_page_rides_the_capture(&run, 1500, 31);
     history_reuses_exactly(&run, 1500, 11);
     history_reuses_exactly(&run, 9000, 23);
-    the_opener_s_page_rides_the_capture(&run, 1500, 31);
     the_opener_s_page_rides_the_capture(&run, 9000, 41);
     leaf.release_model(model);
 }

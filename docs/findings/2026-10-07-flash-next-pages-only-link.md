@@ -1,4 +1,4 @@
-# A pages-only link at the opener's page cuts a reused Flash-Next agent turn by 0.34-0.36 s and meets spec 05 acceptance 6 at the median
+# A pages-only link at the opener's page cuts a reused Flash-Next agent turn by 0.34-0.49 s and puts spec 05 acceptance 6 on its threshold
 
 - Kind: experiment
 - Status: current
@@ -63,22 +63,38 @@
 
 A cold turn 1 at ~9K ran 3 chunks before wherever its opener's floor fell on the serving chunk's edge.
 
+**The final code, in a later and noisier window** (21:10-21:30). The review moved the handover to a loan: the capture lends the pages and the link takes them when the sequence is released, so the device work of 3b1be3b's handover (a memset of the tail reservation, a page copy back) is gone. Same harness, one load per leg:
+
+| leg | turn 2 TTFT median (range) | GB per tail | turn 3 TTFT | cold turn 1 TTFT |
+|---|---|---:|---:|---:|
+| ~9K, final | 1.585 s (1.55-1.67) | 15.70 | 0.88 s | 4.12 s |
+| ~9K, 3b1be3b's binary (control) | 1.608 s (1.51-1.66) | 15.71 | 0.88 s | 4.16 s |
+| ~9K, final | 1.490 s (1.41-1.52) | 15.71 | 0.82 s | 3.82 s |
+| 30K, final | 1.598 s (1.49-1.80) | 15.78 | 0.90 s | 10.40 s |
+| 30K, before | 2.092 s (1.84-2.17) | 20.27 | 1.23 s | 11.37 s |
+
+- The same binary ran 1.46 s at ~9K in the first window and 1.61 s in this one, and the cold turn 1, which this change barely touches, moved with it: legs drift by about ±0.1 s between windows.
+- At 30K four of the final code's eight conversations are over 1.6 s: 1.621, 1.632, 1.749, 1.804 s.
+- Chunks per request in the final code's legs: turn 2 and turn 3 two, a cold turn 1 three, as above.
+
 **Exactness** (GPU profile, `IGNIS_GPU_PROFILE=1`):
 - `crates/runtime/tests/flash_next_reuse_gpu.rs`, BF16 and hq-e8-2b, histories of 1,500 and 9,000 tokens: the new shape is bit-exact (last logits and eight greedy tokens) against the two-span split control `[0, opener)`, `[opener, end)` for:
   - the capturing sequence, going on after its pages were handed over;
   - the checkpoint claimed from a host and from a device retained slot;
   - the checkpoint restored from KV-RAM;
-  - turn N+1, claiming it and handing its own pages over: it goes on as its split control does, and so does a claimant of its checkpoint, on a link chained over a link.
+  - turn N+1, claiming it and handing its own pages over: it goes on as its split control does, and so does a claimant of its checkpoint, on a link chained over a link;
+  - at 1,500 tokens, the reference run first on the fresh load's cold expert cache and again at the end on the warm one: the same bits.
+- `crates/server/tests/flash_next_serving_gpu.rs`, the scheduler the server builds for Flash-Next (the switch on): a second turn resumes from the first's checkpoint, 2,500 tokens, on the device.
 - Recorded as information (ADR 0029): the two-span control against the three-span one it replaces. Logits differ in all four runs. The first greedy token parts at index 1 (BF16) and 0 (hq-e8-2b) at 1,500 tokens, and never at 9,000. The prompts are synthetic token ids.
-- The leaf: `ignis_kernel_seq_checkpoint_test` (a handover from no prefix, from a two-page prefix, at a page-aligned opener; both formats; device and host slots), `seq_flash_next_sections` (the partial page's indexer keys carried), `seq_prefix`, `seq_snapshot`, `seq_alloc`.
+- The leaf: `ignis_kernel_seq_checkpoint_test` (a loan from no prefix, from a two-page prefix, at a page-aligned opener; a second capture standing on the loan; both formats; device and host slots; a fault injected at the capture's commit point, for a loan, a capture on a loan and a capture on a prefix, leaves the sequence, its row, its state and the pool unchanged), `seq_flash_next_sections` (the partial page's indexer keys), `seq_prefix`, `seq_snapshot`, `seq_alloc`.
 - The 27B, whose scheduler never hands pages over but whose prefix publish now goes through the same handover code: `prompt_checkpoint_gpu`, `prefix_reuse_gpu` and `retained_prefix_gpu` green.
 
 ## Finding
 
 Observed:
 
-1. **Dropping the floor's traversal saves 0.34 s** at the median of a ~9K-history reused turn (1.80 → 1.46 s) and **0.36 s at 30K** (1.94 → 1.58 s). The agent-turn-tail finding had inferred ~0.35 s.
-2. **Spec 05 acceptance 6 is met at the median, with no margin**: 1.58 s against 1.6 s at 30K, and three conversations of eight at 1.607-1.620 s. At ~9K the slowest is 1.52 s.
+1. **Dropping the floor's traversal saves 0.34 s** at the median of a ~9K-history reused turn (1.80 → 1.46 s) and **0.36-0.49 s at 30K** (1.94 → 1.58 s in one window, 2.09 → 1.60 s in another). The agent-turn-tail finding had inferred ~0.35 s.
+2. **Spec 05 acceptance 6 sits on its threshold.** At 30K the median is 1.58 s in the first window and 1.598 s with the final code in the later one, against 1.6 s; three and four conversations of eight are over it. At ~9K the medians are 1.46-1.61 s.
 3. **The tail moves 21% fewer expert bytes**: 19.5 → 15.4 GB.
 4. **Turn 3 gains 0.24-0.27 s and the cold turn 1 gains 0.23-0.37 s.** Their prefills were cut at the opener's floor too.
 5. **Reuse stays bit-exact** against a cold prefill split at the new boundaries, and the 27B's reuse GPU tests are unchanged.
@@ -90,7 +106,7 @@ Inferred:
 
 ## Implications
 
-- **Acceptance 6 holds by 20 ms at 30K.** Anything that adds to the tail's copies breaks it again. The levers left are the prefill-width sweep (agent-turn-tail follow-up 2) and the 4-token opener piece (~50-70 ms).
+- **Acceptance 6 holds by 2-20 ms at 30K, inside the ±0.1 s windows drift by.** Anything that adds to the tail's copies breaks it. The levers left are the prefill-width sweep (agent-turn-tail follow-up 2) and the 4-token opener piece (~50-70 ms).
 - **A pages-only link takes no retained slot.** A turn now holds one of Flash-Next's eight host slots instead of two, and skips one ~124 MiB image copy. Neither was measured separately.
 - **The 27B keeps the imaged prefix** (ADR 0029 amendment). The same switch would save its ~19 ms traversal and a retained slot per turn. Unmeasured: a candidate for the measured-better-is-default rule.
 
@@ -98,8 +114,9 @@ Inferred:
 
 - One harness: README-word prompts, thinking off, no swarm. At 30K, one leg per side.
 - `--prompt-reuse off` was not run. The cold turn 1 (10.2-10.5 s at 29-30K tokens) stands in for the reuse-off number acceptance 6 asks for.
-- Acceptance 6's three-agent swarm replay was not run.
-- *Before* is this tree with the family switch off, not main's binary.
+- Acceptance 6's three-agent swarm replay was not run (skipped by the coordinator's decision).
+- Windows drift by about ±0.1 s: the same binary measured 1.46 and 1.61 s at ~9K an hour apart. Each comparison above is between legs of one window.
+- *Before* is this tree with the family switch off, not main's binary. The first window's numbers are 3b1be3b's binary; the final code's are in the later window only.
 - No profile was taken: the traversal counts are the request log's chunk counts, not a trace.
 
 ## Follow-ups
