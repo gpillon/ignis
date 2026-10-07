@@ -11,18 +11,18 @@
 //!
 //! The trace covers decode rounds of one to three lanes with a lookahead,
 //! prefill chunks with a lookahead (the rank-interleaved first-occurrence
-//! order over tokens), a prefetch budget that bites, a warm start, steps the
-//! model refuses (a class that cannot hold its selection), and forwards
-//! restarted at a layer (the same layer twice in a row, in decode and in
-//! prefill).
+//! order over tokens), a prefetch budget that bites and grows with a round's
+//! rows, a warm start, steps the model refuses (a class that cannot hold its
+//! selection), and forwards restarted at a layer (the same layer twice in a
+//! row, in decode and in prefill).
 //!
 //! Format, whitespace-separated, one record per line:
 //! ```text
-//! ignis-residency-fixture 2
+//! ignis-residency-fixture 3
 //! layers <L> experts <E> top_k <10>
 //! record_bytes <8 values, KClass order>
 //! capacity <8 values>
-//! width <W> prefill_width <a prefill step's W> budget <bytes, 18446744073709551615 = none>
+//! width <W> prefill_width <a prefill step's W> budget_one_row <a one-row decode step's bytes, 18446744073709551615 = none> budget_per_row <bytes per further row>
 //! k2 <L * E * 2 values, key order>
 //! warm <n> <keys, hottest first>
 //! steps <n>
@@ -42,8 +42,8 @@
 use std::fmt::Write as _;
 
 use ignis_core::residency::{
-    Admission, ExpertCatalog, KBits, KClass, LayerStep, PolicyConfig, Projection, ProjectionId,
-    ResidencyModel, StepError,
+    Admission, ExpertCatalog, KBits, KClass, LayerStep, PolicyConfig, PrefetchBudget, Projection,
+    ProjectionId, ResidencyModel, StepError,
 };
 
 const LAYERS: u16 = 4;
@@ -57,7 +57,9 @@ const RECORD_BYTES: [u64; 8] = [4096, 8192, 12288, 16384, 4096, 4096, 8192, 8192
 /// Tight enough to evict, and for the down K4 class tight enough that a
 /// three-lane round can be refused.
 const CAPACITY: [u32; 8] = [40, 36, 36, 30, 44, 34, 34, 8];
-const BUDGET: u64 = 20_480;
+/// A one-lane round's prefetch budget and what each further lane adds
+/// (GitHub #306): 12, 20 and 28 KiB at one, two and three lanes.
+const BUDGET: PrefetchBudget = PrefetchBudget { one_row_bytes: 12_288, per_row_bytes: 8_192 };
 
 struct Rng(u64);
 
@@ -201,7 +203,7 @@ fn fixture_text() -> String {
             capacity: CAPACITY,
             prefetch_width: WIDTH,
             prefill_prefetch_width: PREFILL_WIDTH,
-            prefetch_budget_bytes: Some(BUDGET),
+            prefetch_budget: Some(BUDGET),
         },
     );
     // A warm start from a made-up calibration ranking: the low experts of
@@ -214,12 +216,16 @@ fn fixture_text() -> String {
     let steps = trace(&mut rng, 40);
 
     let mut out = String::new();
-    let _ = writeln!(out, "ignis-residency-fixture 2");
+    let _ = writeln!(out, "ignis-residency-fixture 3");
     let _ = writeln!(out, "layers {LAYERS} experts {EXPERTS} top_k {TOP_K}");
     let line = |name: &str, values: Vec<String>| format!("{name} {}\n", values.join(" "));
     out.push_str(&line("record_bytes", RECORD_BYTES.iter().map(u64::to_string).collect()));
     out.push_str(&line("capacity", CAPACITY.iter().map(u32::to_string).collect()));
-    let _ = writeln!(out, "width {WIDTH} prefill_width {PREFILL_WIDTH} budget {BUDGET}");
+    let _ = writeln!(
+        out,
+        "width {WIDTH} prefill_width {PREFILL_WIDTH} budget_one_row {} budget_per_row {}",
+        BUDGET.one_row_bytes, BUDGET.per_row_bytes
+    );
     let mut k2 = Vec::new();
     for layer in 0..LAYERS {
         for expert in 0..EXPERTS {
@@ -238,7 +244,7 @@ fn fixture_text() -> String {
     out.push('\n');
     let _ = writeln!(out, "steps {}", steps.len());
 
-    let mut refused = 0;
+    let (mut refused, mut past_one_row) = (0, 0);
     for s in &steps {
         let _ = write!(out, "step {} {} {}", s.layer, u32::from(s.prefill), s.ids.len());
         for row in &s.ids {
@@ -287,6 +293,10 @@ fn fixture_text() -> String {
                     &o.prefetch_dropped.iter().map(|&id| key_of(id)).collect::<Vec<_>>(),
                 );
                 let _ = writeln!(out, "bytes {}", o.bytes_moved);
+                let prefetched: u64 = o.prefetches.iter().map(|&(id, _)| catalog.bytes(id)).sum();
+                if !s.prefill && !o.prefetch_dropped.is_empty() && prefetched > BUDGET.one_row_bytes {
+                    past_one_row += 1;
+                }
             }
             Err(StepError::NoEvictableSlot { class, .. }) => {
                 refused += 1;
@@ -296,6 +306,9 @@ fn fixture_text() -> String {
         }
     }
     assert!(refused > 0, "the trace must exercise a refused step");
+    // The device must take the budget from a step's rows: rounds of several
+    // lanes that the budget bit only past one lane's.
+    assert!(past_one_row > 5, "a budget that grows with the rows: {past_one_row} rounds");
     out
 }
 

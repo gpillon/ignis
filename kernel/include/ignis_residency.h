@@ -14,9 +14,9 @@
  * step stamps every selected projection with the logical clock; a miss takes a free slot of its
  * class, else (decode) the unpinned slot with the smallest (stamp, key), else (prefill) the
  * staging ring; the next layer's lookahead candidates, rank-ordered, are prefetched the same way,
- * a decode prefetch held to a per-step byte budget (a candidate that would pass it is skipped)
- * and dropped when no slot is unpinned, a prefill step's taken unbudgeted to its own width. A
- * key is (layer * experts + expert) * 2 + projection;
+ * a decode prefetch held to a per-step byte budget that grows with the step's lookahead rows (a
+ * candidate that would pass it is skipped) and dropped when no slot is unpinned, a prefill
+ * step's taken unbudgeted to its own width. A key is (layer * experts + expert) * 2 + projection;
  * it is also the entry's index in the concatenated slot tables. kernel/tests/
  * test_residency_trace.cu holds this implementation to the policy model's outcomes.
  *
@@ -63,7 +63,7 @@ extern "C" {
 #define IGNIS_RESIDENCY_CLASSES 8
 #define IGNIS_RESIDENCY_DECODE 0
 #define IGNIS_RESIDENCY_PREFILL 1
-/* `prefetch_budget_bytes` meaning "no budget". */
+/* `prefetch_budget_one_row_bytes` meaning "no budget". */
 #define IGNIS_RESIDENCY_NO_BUDGET UINT64_MAX
 
 struct ignis_residency_desc {
@@ -74,7 +74,11 @@ struct ignis_residency_desc {
   uint32_t max_tokens;          /* most tokens a step serves: decode lanes or the prefill chunk */
   uint32_t lookahead_width;     /* W: experts taken from each lookahead row; 0 = none */
   uint32_t prefill_lookahead_width; /* the same for a prefill step's rows (<= W); 0 = none */
-  uint64_t prefetch_budget_bytes; /* per decode step, or IGNIS_RESIDENCY_NO_BUDGET */
+  uint64_t prefetch_budget_one_row_bytes; /* a one-row decode step's prefetch budget, or
+                                           * IGNIS_RESIDENCY_NO_BUDGET */
+  uint64_t prefetch_budget_per_row_bytes; /* added per further row of a decode step's lookahead
+                                           * (a lane, or a verify round's column); the sum
+                                           * saturates to no budget (GitHub #306) */
   uint64_t staging_half_bytes;  /* one half of the prefill staging ring (>= the heaviest layer;
                                  * a multiple of 16) */
   uint64_t host_pool_bytes;     /* the pinned expert pool */
@@ -83,10 +87,11 @@ struct ignis_residency_desc {
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(struct ignis_residency_desc) == 152 &&
+static_assert(sizeof(struct ignis_residency_desc) == 160 &&
                   offsetof(struct ignis_residency_desc, prefill_lookahead_width) == 112 &&
-                  offsetof(struct ignis_residency_desc, prefetch_budget_bytes) == 120 &&
-                  offsetof(struct ignis_residency_desc, copy_blocks) == 144,
+                  offsetof(struct ignis_residency_desc, prefetch_budget_one_row_bytes) == 120 &&
+                  offsetof(struct ignis_residency_desc, prefetch_budget_per_row_bytes) == 128 &&
+                  offsetof(struct ignis_residency_desc, copy_blocks) == 152,
               "ignis_residency_desc drifted from crates/core/src/residency/device.rs ResidencyDesc");
 #endif
 

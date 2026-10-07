@@ -79,7 +79,7 @@ int main(int argc, char **argv) {
   desc.max_tokens = 4096;
   desc.lookahead_width = kWidth;
   desc.prefill_lookahead_width = kTopK;  // as Flash-Next loads it
-  desc.prefetch_budget_bytes = 4 * kRecord;
+  desc.prefetch_budget_one_row_bytes = 4 * kRecord;
   desc.staging_half_bytes = kExperts * 2 * kRecord;
   desc.host_pool_bytes = keys * kRecord;
   desc.copy_blocks = 16;

@@ -86,6 +86,13 @@ The budget is one layer's share of the round at 12 GB/s: 1.5 MB at one lane
 candidates from the step's own misses changed nothing measurable (2.46
 against 2.46 ms, 24.5 against 24.6 MB/token) and was dropped.
 
+**2026-10-07 (#306):** "default" here is the default as of this finding.
+Since then the default budget follows a step's rows: 1,172,500 B at one row
+and 726,250 B more per further row, with no floor. On the same replay that
+rule scores 95.9% at one lane and 95.8% at three
+([Flash-Next decode round](2026-10-06-flash-next-decode-round.md), "The
+budget follows the rows"). The conclusions above stand.
+
 **Scan resistance.** Per chunk: decode 256 tokens to settle, 256 measured,
 a 4,096-token prefill of the next two chunks, 256 measured:
 

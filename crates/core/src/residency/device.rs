@@ -20,11 +20,18 @@ use std::sync::Arc;
 
 use super::class::{ExpertCatalog, KClass, Projection, ProjectionId};
 use super::counters::{ResidencyCounters, ResidencyMirror, MIRROR_BYTES};
-use super::policy::{Admission, Phase};
+use super::policy::{Admission, Phase, PrefetchBudget};
 use crate::moe::MoeSlot;
 
-/// `prefetch_budget_bytes` meaning "no budget".
+/// `prefetch_budget_one_row_bytes` meaning "no budget".
 pub const NO_BUDGET: u64 = u64::MAX;
+
+/// The descriptor's two budget words for a policy model's budget:
+/// `prefetch_budget_one_row_bytes` and `prefetch_budget_per_row_bytes`, or
+/// [`NO_BUDGET`] and 0 for none.
+pub fn budget_words(budget: Option<PrefetchBudget>) -> (u64, u64) {
+    budget.map_or((NO_BUDGET, 0), |b| (b.one_row_bytes, b.per_row_bytes))
+}
 /// The status of a step whose ids name an expert outside the catalog.
 pub const STATUS_INVALID: u32 = 0x100;
 /// Bit 31 of a report entry: the projection went to the staging ring.
@@ -43,7 +50,10 @@ pub struct ResidencyDesc {
     pub max_tokens: u32,
     pub lookahead_width: u32,
     pub prefill_lookahead_width: u32,
-    pub prefetch_budget_bytes: u64,
+    /// A one-row decode step's prefetch budget, or [`NO_BUDGET`].
+    pub prefetch_budget_one_row_bytes: u64,
+    /// Added to it for each further row of a decode step's lookahead.
+    pub prefetch_budget_per_row_bytes: u64,
     pub staging_half_bytes: u64,
     pub host_pool_bytes: u64,
     pub copy_blocks: u32,
