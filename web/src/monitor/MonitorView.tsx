@@ -489,6 +489,9 @@ const EVICTION_TIER_LABEL: Record<EvictionTierName, { name: string; note: string
   disk: { name: "Disk", note: "not implemented" },
 };
 
+/** The VRAM row's Retained cell on a load with no device retained slots (GitHub #306). */
+const RETAINED_IN_HOST_RAM = "This load has no device retained slots: its retained state lives in host RAM";
+
 /**
  * What each tier gave up over the window (GitHub #224). One row per tier, one
  * column per kind of departure - a live sequence, retained state dropped, and
@@ -519,8 +522,9 @@ function EvictionsCard({ evictions, deviceSlots, chart, win }: { evictions: Evic
         <tbody>
           {EVICTION_TIERS.map((tier) => {
             const row = evictions[tier];
-            // A load with no device retained slots (Flash-Next: --retained-device 0) keeps its retained state in host RAM; "VRAM" would misname that row.
-            const label = tier === "vram" && deviceSlots === 0 ? { ...EVICTION_TIER_LABEL.vram, name: "Retained slots (host RAM)" } : EVICTION_TIER_LABEL[tier];
+            const label = EVICTION_TIER_LABEL[tier];
+            // A load with no device retained slots (Flash-Next: --retained-device 0) keeps its retained state in host RAM, so the VRAM row's Retained cell is host RAM's; the Live cell is still the sequences that left VRAM.
+            const retainedTitle = tier === "vram" && deviceSlots === 0 ? RETAINED_IN_HOST_RAM : undefined;
             return (
               <tr key={tier} className={row.implemented ? undefined : "text-ash/50"}>
                 <th scope="row" className="py-1 text-left font-display text-[13px] font-semibold">
@@ -528,7 +532,7 @@ function EvictionsCard({ evictions, deviceSlots, chart, win }: { evictions: Evic
                   <span className="ml-1.5 font-sans text-[10px] font-normal text-ash">{label.note}</span>
                 </th>
                 <EvictionCell counter={row.live} emphasis={tier === "ram"} />
-                <EvictionCell counter={row.retained} />
+                <EvictionCell counter={row.retained} title={retainedTitle} />
                 <EvictionCell counter={row.demoted} />
               </tr>
             );
@@ -545,11 +549,11 @@ function EvictionsCard({ evictions, deviceSlots, chart, win }: { evictions: Evic
  * An em dash where the tier has no such departure to report at all - never a
  * zero, which would read as "it did not happen" rather than "it cannot".
  */
-function EvictionCell({ counter, emphasis }: { counter: Counter | null; emphasis?: boolean }) {
+function EvictionCell({ counter, emphasis, title }: { counter: Counter | null; emphasis?: boolean; title?: string }) {
   if (!counter) return <td className="py-1 text-right text-ash/50">&mdash;</td>;
   const hot = emphasis && (counter.window ?? 0) > 0;
   return (
-    <td className="py-1 text-right tabular-nums">
+    <td className="py-1 text-right tabular-nums" title={title}>
       <span className={`font-display text-[15px] font-semibold ${hot ? "text-[var(--series-1)]" : ""}`}>{formatCount(counter.window)}</span>
       <span className="ml-1 text-[10px] text-ash">/ {formatCount(counter.total)}</span>
     </td>
