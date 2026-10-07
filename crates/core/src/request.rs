@@ -182,9 +182,10 @@ pub struct Request {
     /// `publish_tokens` is then 0.
     pub link_at_capture: bool,
     /// Whether this request's sequence lends the pages below its opener to a
-    /// pages-only link (GitHub #306): set when the backend captures -- on a
-    /// [`Request::link_at_capture`] request, or one whose backend reports a
-    /// loan -- whatever becomes of the checkpoint, since the loan lasts until
+    /// pages-only link (GitHub #306): set when the backend captures and either
+    /// side counts a loan -- a [`Request::link_at_capture`] request with pages
+    /// between what it shares and the opener's floor, or a backend reporting
+    /// one -- whatever becomes of the checkpoint, since the loan lasts until
     /// the sequence is released. The leaf refuses a lender a publish, so
     /// [`Request::publish_point`] offers none. A requeue, which starts the
     /// prompt over on a fresh sequence, clears it.

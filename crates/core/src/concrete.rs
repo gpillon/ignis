@@ -1317,6 +1317,18 @@ impl ConcreteScheduler {
         }
     }
 
+    /// The whole pages request `idx`'s capture at `opener` hands to a
+    /// pages-only link as this scheduler counts them (GitHub #306): those
+    /// between what it shares and the opener's page floor, on a
+    /// [`Request::link_at_capture`] request; 0 on any other.
+    fn link_pages(&self, idx: usize, opener: u32) -> u32 {
+        let r = &self.requests[idx];
+        match r.link_at_capture {
+            true => (opener / self.config.kv_page_tokens).saturating_sub(r.shared_pages),
+            false => 0,
+        }
+    }
+
     /// Record the **pages-only link** request `idx`'s capture at `opener`
     /// handed over, if it handed one over (ADR 0029 as amended 2026-10-07,
     /// GitHub #306), and answer whether the checkpoint has something to stand
@@ -1345,11 +1357,8 @@ impl ConcreteScheduler {
     /// lender the link and every page it holds.
     fn register_link(&mut self, idx: usize, opener: u32, leaf_lent: u32) -> bool {
         let page_tokens = self.config.kv_page_tokens;
+        let moved = self.link_pages(idx, opener);
         let r = &self.requests[idx];
-        let moved = match r.link_at_capture {
-            true => (opener / page_tokens).saturating_sub(r.shared_pages),
-            false => 0,
-        };
         if leaf_lent > moved {
             // hotpath-lint-allow: failure-only path (a capture whose loan the ledger cannot carry is released), reviewed exception (GitHub #306).
             tracing::error!(
@@ -3562,8 +3571,8 @@ impl Scheduler for ConcreteScheduler {
                             if outcome.checkpoint_captured {
                                 // GitHub #306: a loan lasts as long as the
                                 // sequence, whatever becomes of the checkpoint.
-                                let r = &mut self.requests[i];
-                                r.lender = r.link_at_capture || outcome.checkpoint_lent_pages > 0;
+                                let lent = self.link_pages(i, capture.tokens).max(outcome.checkpoint_lent_pages);
+                                self.requests[i].lender = lent > 0;
                                 // The pages-only link first, when
                                 // the capture handed one over -- it is what the
                                 // checkpoint stands on.

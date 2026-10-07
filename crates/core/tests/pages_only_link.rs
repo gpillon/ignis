@@ -402,6 +402,48 @@ fn a_lender_whose_checkpoint_is_released_publishes_nothing_either() {
     );
 }
 
+#[test]
+fn a_capture_that_lends_nothing_leaves_the_boundary_past_it() {
+    // The block's page floor is the opener's: the capture stands on the block
+    // and lends nothing, so its sequence is no lender and the boundary past
+    // the opener is cut and published as before.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            serving_chunk_tokens: 8,
+            ..config()
+        },
+        compute.clone(),
+    );
+    let n = sched
+        .submit(
+            RequestInput {
+                system_block_tokens: Some(34),
+                reuse_boundaries: vec![ReuseBoundary::retained(52)],
+                ..input(tokens(1, 60), Some(37), 4)
+            },
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(
+        job_points(&compute, n),
+        vec![
+            (8, None, None),
+            (16, None, None),
+            (24, None, None),
+            (32, Some(32), None),
+            (37, None, Some(37)),
+            (45, None, None),
+            (48, Some(48), None),
+            (56, None, None),
+            (60, None, None),
+        ],
+        "the block, the opener, and the boundary past it"
+    );
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+}
+
 // ── A leaf that lent more than this scheduler moves ─────────────────────
 //
 // The leaf decides on its own view of the sequence whether a capture lends

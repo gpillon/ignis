@@ -89,11 +89,13 @@ struct ignis_seq_prefix {
    * the capturing sequence that owns them, and their physical ids -- its first
    * own pages. The capture moves nothing, so it cannot fail half-way; the
    * lender hands them over (`kv` takes them) when it is released
-   * (ignis_seq_settle_loan), and both are empty from then on. Until then
-   * the entry points that take a publish handle -- release, snapshot, stats --
-   * refuse the link: it has none, and `kv` holds nothing yet. */
+   * (ignis_seq_settle_loan), and both are empty from then on. */
   ignis_seq *lender = nullptr;
   std::vector<std::int32_t> lent;
+  /* Whether this is a pages-only link, on loan or not (GitHub #306). It has
+   * no handle, so the entry points that take one -- release, snapshot,
+   * stats -- refuse it: every reference to it is a holder's. */
+  bool pages_only = false;
   /* What that image occupies: one slot's state and its hq residual window,
    * `ignis_seq_pool::retained_image_bytes`. */
   std::uint64_t image_bytes = 0;

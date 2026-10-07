@@ -279,6 +279,7 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
       link->tokens   = below * page_size;
       const auto own = seq->kv.page_ids();
       link->lent.assign(own.begin(), own.begin() + handed);
+      link->pages_only = true;
     }
 
     // The page the opener ends inside: the sequence's own first page past the

@@ -55,6 +55,17 @@ const DECODED: usize = 8;
 const DEVICE_SLOT: u32 = 0;
 const HOST_SLOTS: [u32; 2] = [1, 2];
 
+unsafe extern "C" {
+    /// The leaf's reason for its last refusal (`ignis_seq.h`); the adapter
+    /// reports only a code.
+    fn ignis_seq_last_error() -> *const std::ffi::c_char;
+}
+
+/// Whether the leaf's last refusal was for the sequence's loan (GitHub #306).
+fn refused_for_the_loan() -> bool {
+    unsafe { std::ffi::CStr::from_ptr(ignis_seq_last_error()) }.to_string_lossy().contains("lent")
+}
+
 fn artifact_path() -> PathBuf {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from);
     dir.join(ARTIFACT_FILE_NAME)
@@ -285,10 +296,16 @@ fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32)
     for checkpoint in [&on_host, &on_device] {
         assert_eq!(leaf.checkpoint_lent_pages(&turn, checkpoint), floor / KV_PAGE_TOKENS, "{label}: the loan, as the scheduler reads it");
     }
-    assert!(leaf.publish_prefix(model, &mut turn, floor, HOST_SLOTS[0]).is_err(), "{label}: a lender publishes nothing");
+    assert!(
+        leaf.publish_prefix(model, &mut turn, floor, HOST_SLOTS[0]).is_err() && refused_for_the_loan(),
+        "{label}: a lender publishes nothing"
+    );
     let bytes = leaf.checkpoint_snapshot_bytes(model, &on_host).expect("checkpoint blob size");
     let blob = run.blob(bytes, |dst| leaf.checkpoint_snapshot_into(model, &on_host, dst));
-    assert!(leaf.restore_sequence(model, &mut turn, &blob).is_err(), "{label}: nothing is restored into a lender");
+    assert!(
+        leaf.restore_sequence(model, &mut turn, &blob).is_err() && refused_for_the_loan(),
+        "{label}: nothing is restored into a lender"
+    );
     // A claimant standing on the link before its lender goes.
     let (early, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &on_device).expect("claim while lent");
     assert_eq!(run.finish(turn, &new, history), cold, "{label}: the capturing sequence goes on as if it had not captured");

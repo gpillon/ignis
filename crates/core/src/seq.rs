@@ -977,7 +977,7 @@ impl SeqPrefix<'_> {
         let rc = unsafe { ffi::ignis_seq_prefix_stats(self.handle, &mut stats) };
         assert_eq!(
             rc, 0,
-            "ignis_seq_prefix_stats: null handle (unreachable — SeqPrefix always holds one)"
+            "ignis_seq_prefix_stats: null handle or a pages-only link (unreachable — SeqPrefix always holds a published one)"
         );
         stats
     }

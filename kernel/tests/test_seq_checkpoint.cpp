@@ -244,6 +244,8 @@ ignis_seq_pool_spec small_spec(int32_t kv_format = IGNIS_KV_FORMAT_BF16) {
 
 constexpr std::uint32_t kPageTokens = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
 constexpr std::uint32_t kContext    = 384;
+// The pages a whole `kContext` reservation is: pages_for_tokens(384).
+constexpr std::uint32_t kContextPages = 6;
 // The shared prefix: two whole pages. The generation opener sits 40 tokens
 // into the sequence's own third page — the shape a rendered prompt has, where
 // the opener is wherever `<|im_start|>assistant\n` happens to end.
@@ -1058,7 +1060,7 @@ void expect_the_claimant_untouched(const LoanFixture &f, const ignis_seq *other,
     expect(page_image_of(*f.pool, f.claimant_row[page]) == f.history[page], label);
   }
   expect(mutable_image_of(*f.pool, f.claimant->slot) == f.state, label);
-  const std::vector<std::int32_t> theirs = row_of(*f.pool, other->slot, 6);
+  const std::vector<std::int32_t> theirs = row_of(*f.pool, other->slot, kContextPages);
   for (const std::int32_t page : f.claimant_row) {
     expect(std::find(theirs.begin(), theirs.end(), page) == theirs.end(), label);
   }
@@ -1091,12 +1093,15 @@ void check_a_claimant_outlives_its_lender(std::uint32_t shared, std::uint32_t op
              std::equal(f.lender_row.begin() + shared, f.lender_row.begin() + below,
                         f.link->kv.page_ids().begin()),
          "outlive: the link holds what was lent, for the checkpoint and the claimant");
+  ignis_seq_prefix_release(f.pool, f.link);
+  expect(f.link->refcount == 2 && last_error_names("pages-only link"),
+         "outlive: and is still no handle a caller could release");
 
   // A fresh sequence takes whatever the lender gave back and writes all of it.
   ignis_seq *fresh = nullptr;
   expect_rc(ignis_seq_alloc(f.pool, kContext, &fresh), 0, "outlive: a fresh sequence");
   if (fresh != nullptr) {
-    dirty_state(*f.pool, *fresh, 6, 0xA1u);
+    dirty_state(*f.pool, *fresh, kContextPages, 0xA1u);
     expect_the_claimant_untouched(f, fresh, "outlive: the claimant's row, history and state are its own");
   }
   release_the_loan_fixture(f, fresh, "outlive: every page came back");
@@ -1146,7 +1151,7 @@ void check_a_lender_evicted_while_lent_comes_back_whole(std::uint32_t shared, st
     expect(again == blob, "evict: the round trip is byte-exact");
     // And writing past the opener, as it goes on, touches nothing the
     // claimant reads.
-    dirty_state(*f.pool, *restored, 6, 0xB1u);
+    dirty_state(*f.pool, *restored, kContextPages, 0xB1u);
     expect_the_claimant_untouched(f, restored, "evict: the claimant's row, history and state are its own");
   }
   release_the_loan_fixture(f, restored, "evict: every page came back");
