@@ -50,6 +50,9 @@ ifeq ($(MODEL_FAMILY),flash-next)
   LANES ?= 3
   ROPE_SCALING ?= none
   PREFILL_CHUNK ?= 8192
+  # The part of the model's time decoding lanes keep while a prompt prefills
+  # (--decode-share, percent, 0-99). Empty = the server's: 50 on Flash-Next.
+  DECODE_SHARE ?=
   SPEC ?=
   DRAFT_TOKENS ?=
   DRAFT_ROWS ?=
@@ -110,6 +113,7 @@ DEVELOPER_MESSAGE_POLICY ?= inplace
 MAX_CONTEXT ?= 524288
 KV_FORMAT ?= hq-e8-2b
 PREFILL_CHUNK ?= 1024
+DECODE_SHARE ?=
 REQUEST_TIMEOUT ?= 1800
 SPEC ?= dflash2
 DRAFT_TOKENS ?= 7
