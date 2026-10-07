@@ -46,9 +46,10 @@ So a tail runs [publish − cached, opener − publish, 4] tokens, e.g. [941, 63
   |---|---:|---:|---:|---:|---:|
   | span (ms) | 128 | 237-255 | 323-394 | 472-594 | 542-665 |
 
-  Turn 2's TTFT sorts by this width, in verifyGPU's six reps and in these: 1.72-1.76 s at 1 token, 2.36-2.40 s at 63.
-- Each tail moved 18-26 GB host-to-device (`ignis_expert_bytes_moved_total{phase="prefill"}`): almost the whole non-resident pool (a 37.8 GB pool, a 14.4 GB cache at this load).
-- 26-31% of the prefetched projections were never used: 23-33K issued, 17-23K used.
+  Turn 2's TTFT grows with this width, in verifyGPU's six reps and in these: 1.72-1.76 s at 1 token, 2.36-2.40 s at 63. The first piece's width (920-1,174 tokens) adds noise: 8 tokens took 1.93 s and 10 tokens 1.86 s.
+- An 8192-token chunk of the cold turns exposed 0.52-0.56 s of its 1.74-1.75 s of copies (four in the window).
+- Each tail moved 18-26 GB host-to-device (`ignis_expert_bytes_moved_total{phase="prefill"}`). That is almost the whole non-resident pool: the server's plan lines put the pool at 37.8 GB and the cache at 14.4 GB at this load.
+- 26-33% of the prefetched projections were never used: 23-33K issued, 17-23K used.
 
 **The lever: the prefill lookahead's width.** A chunk prefetches each token's top 16 of the next router, unbudgeted, though that router selects 10. Three legs, the same eight conversations:
 
@@ -64,8 +65,10 @@ So a tail runs [publish − cached, opener − publish, 4] tokens, e.g. [941, 63
 
   Both moved the same bytes per conversation. The committed A/B gives 2.120 → 1.863 s.
 - Width 0 moves the fewest bytes. It loses the link/compute overlap, so a cold 8192-token chunk waits on its copies: the cold turn is 0.4 s slower than at 16.
-- `ignis_expert_residency_stall_seconds_total{phase="prefill"}` rises at width 10, from 0.13-0.21 s per tail to 0.23-0.36 s. It counts only demand copies, and more of the copies are demand now. The copy time the card waits on is what fell.
+- `ignis_expert_residency_stall_seconds_total{phase="prefill"}` rises at width 10, from 0.12-0.22 s per tail to 0.23-0.36 s. It counts only demand copies, and more of the copies are demand now. No profile was taken after the change.
+- Unused prefetches fall from 26-33% to 15-21% of those issued.
 - In every leg, every turn 3 claimed turn 2's checkpoint: cached = turn 2's prompt − 4.
+- Scan resistance at width 10, in the study replay (`expert_residency_study_replay`, simulated): the decode hit rate after a 4096-token prefill drops 0.3 points (bound: 2). The prefill moves 14.5 GB, against 15.1 GB at 16.
 
 ## Finding
 
@@ -76,13 +79,14 @@ Observed:
    - The publish-point piece costs more the wider it is: 0.13 s at 7 tokens, up to 0.66 s at 60 (width 16).
    - The opener piece costs ~50-70 ms.
    - On the 27B a traversal cost ~19 ms fixed ([the prompt reuse tax](2026-09-18-prompt-reuse-tax-on-short-ttft.md)). On Flash-Next it costs its expert stream, so the same cuts take up to a third of the tail. That finding's "not worth the leaf-side interior-snapshot work" does not carry over.
-3. **A width-16 prefill lookahead over-streams.**
-   - Ranks 11-16 are mostly experts the next layer never reads.
-   - Taking the router's own top-k cuts the tail's bytes by 14%, turn 2 by 0.26 s at the median, turn 3 by 0.24 s and a cold 8.5K prompt by 0.48 s.
-4. **Spec 05 acceptance 6 is not met.**
-   - 1.86 s at the median with a ~9K history, against 1.6 s: a gap of +0.26 s, down from +0.52 s on this harness.
-   - The criterion's 30K history was not run. It can only add attention and indexer work to the tail.
-   - A tail whose publish-point piece is short meets it: 1.55 s at 1 token.
+3. **A width-16 prefill lookahead over-streams.** Taking the router's own top-k cuts the tail's bytes by 14%, turn 2 by 0.26 s at the median, turn 3 by 0.24 s and a cold 8.5K prompt by 0.48 s.
+4. **Spec 05 acceptance 6 is not met** at a ~9K history: 1.86 s at the median against 1.6 s, a gap of +0.26 s, down from +0.52 s on this harness. A tail whose publish-point piece is short meets it: 1.55 s at 1 token.
+
+Inferred:
+
+- **Why width 10 wins.** Ranks 11-16 are mostly experts the next layer never reads: the unused share falls from 26-33% to 15-21%. The copy time the card waits on must have fallen, since TTFT fell while the demand stall rose.
+- **The 27B verdict does not carry over.** The [prompt reuse tax](2026-09-18-prompt-reuse-tax-on-short-ttft.md) found "not worth the leaf-side interior-snapshot work" at ~19 ms a traversal. On Flash-Next a traversal costs its expert stream, so the same cuts take up to a third of the tail.
+- **Acceptance 6 at 30K.** The criterion's 30K history was not run. A longer history can only add attention and indexer work to the tail, so it is not met there either.
 
 ## Implications
 
@@ -98,6 +102,8 @@ Observed:
 - One harness: README-word prompts, thinking off, a ~9K history, not 30K. No swarm. One host, PCIe Gen 3 x16.
 - Widths between 0 and 10 were not measured. 0 wins on short chunks (turn 3: 0.85 against 0.90 s) and loses on a cold 8192-token chunk. A width of 6-8, or one by chunk length, may sit between.
 - The profile was taken before the change only. After it, the per-traversal split is inferred from the counters.
+- Scan resistance (spec 03 acceptance 6, spec 05 acceptance 7) was re-checked at width 10 in simulation only, not on the card.
+- The n-gram gather was not separated from the ~135 ms of host time before the first traversal: the capture traced CUDA only. The [prefill chunk finding](2026-10-07-flash-next-prefill-chunk-and-decode-share.md) measured ~130 ms for a 536-token tail at 4 reader threads; the default is now 16.
 - KV-RAM arena 1 GiB instead of make's 2 GiB; no turn restored from it.
 
 ## Follow-ups

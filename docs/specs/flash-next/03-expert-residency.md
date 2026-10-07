@@ -61,7 +61,7 @@ and `docs/findings/2026-10-05-expert-residency-replayed-on-the-study-s-routing.m
   2.37 ms of demand misses where no prefetch costs 3.77 ms. A prefill streams
   its lookahead whole.
 - **A prefill's lookahead has its own width, the router's top-k (2026-10-07,
-  #306).** Unbudgeted, W = 16 per token over-streams: 26-31% of a reused agent
+  #306).** Unbudgeted, W = 16 per token over-streams: 26-33% of a reused agent
   turn's prefetched projections were never read. At 10 (Flash-Next's
   `PREFILL_LOOKAHEAD_WIDTH`) the turn's ~1K-token tail moves 14% fewer bytes
   and starts 0.26 s sooner (2.12 → 1.86 s), and a cold 8.5K prompt 0.48 s

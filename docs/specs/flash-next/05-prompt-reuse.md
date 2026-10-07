@@ -61,8 +61,8 @@ Found while building the leaf side (#303); the coordinator may veto.
   30K history was not run, and it can only add to the tail. The tail is
   copy-bound and runs three traversals, cut at the publish point and at the
   opener, each re-streaming its experts. The publish-point piece costs
-  ~0.35 s at a median width, so a pages-only chained prefix, which would drop
-  that cut, is the lever left
+  ~0.35 s at a median width (inferred from the spread of turn 2's TTFT), so a
+  pages-only chained prefix, which would drop that cut, is the lever left
   (`docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
 - **Retained pages are pool lines.** The pool holds one KV page per retained
   slot beside every lane's whole context, as the 27B's (a checkpoint keeps the
