@@ -249,15 +249,21 @@ impl TableLayout {
 }
 
 /// The bytes of the cache's index per hot row: its row id.
-const HOT_ROW_INDEX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
+pub(crate) const HOT_ROW_INDEX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 
 /// The RAM hot-row cache: the head of the artifact's hot list (rows ranked
 /// most frequent first) that fits a byte budget, its index included. Slot
 /// `s` holds row `rows()[s]`, in ascending row order, so a row's slot is a
 /// binary search and the index costs 4 bytes a row.
+///
+/// Or the whole table ([`HotRows::whole`], GitHub #306): every row, at slot
+/// = row id, with no index at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotRows {
     rows: Vec<u32>,
+    /// The table's row count when the cache holds all of it, `rows` then
+    /// empty.
+    whole: Option<u64>,
     row_bytes: u64,
 }
 
@@ -268,7 +274,7 @@ impl HotRows {
         if row_bytes == 0 {
             return Err("a hot-row cache of 0-byte rows".to_string());
         }
-        let capacity = (budget_bytes / (row_bytes + HOT_ROW_INDEX_BYTES)) as usize;
+        let capacity = ranked_capacity(budget_bytes, row_bytes) as usize;
         let mut seen = std::collections::HashSet::with_capacity(capacity.min(ranked.len()));
         let mut rows = Vec::with_capacity(capacity.min(ranked.len()));
         for &row in ranked {
@@ -281,34 +287,62 @@ impl HotRows {
             }
         }
         rows.sort_unstable();
-        Ok(Self { rows, row_bytes })
+        Ok(Self { rows, whole: None, row_bytes })
+    }
+
+    /// Every row of a table of `table_rows` rows: row `r` at slot `r`.
+    pub fn whole(table_rows: u64, row_bytes: u64) -> Result<Self, String> {
+        if row_bytes == 0 {
+            return Err("a hot-row cache of 0-byte rows".to_string());
+        }
+        usize::try_from(table_rows.checked_mul(row_bytes).ok_or("whole-table size overflow")?)
+            .map_err(|_| format!("a {table_rows}-row table does not fit this address space"))?;
+        Ok(Self { rows: Vec::new(), whole: Some(table_rows), row_bytes })
+    }
+
+    /// Whether the cache holds the whole table.
+    pub fn is_whole(&self) -> bool {
+        self.whole.is_some()
     }
 
     /// Rows held.
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.whole.map_or(self.rows.len(), |rows| rows as usize)
     }
 
     /// Whether the cache holds no row.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.len() == 0
     }
 
     /// The RAM the cache occupies: its rows and its index.
     pub fn bytes(&self) -> u64 {
-        self.rows.len() as u64 * (self.row_bytes + HOT_ROW_INDEX_BYTES)
+        match self.whole {
+            Some(rows) => rows * self.row_bytes,
+            None => self.rows.len() as u64 * (self.row_bytes + HOT_ROW_INDEX_BYTES),
+        }
     }
 
-    /// The rows held, in slot order: what the cache loads at start.
+    /// The ranked rows held, in slot order: what the cache loads at start.
+    /// Empty for a whole table, whose slots are the row ids.
     pub fn rows(&self) -> &[u32] {
         &self.rows
     }
 
     /// The slot holding `row`, if the cache holds it.
     pub fn slot(&self, row: u64) -> Option<usize> {
+        if let Some(rows) = self.whole {
+            return (row < rows).then_some(row as usize);
+        }
         let row = u32::try_from(row).ok()?;
         self.rows.binary_search(&row).ok()
     }
+}
+
+/// The ranked rows a budget of `budget_bytes` holds: each costs its bytes and
+/// its index entry.
+pub(crate) fn ranked_capacity(budget_bytes: u64, row_bytes: u64) -> u64 {
+    budget_bytes / (row_bytes + HOT_ROW_INDEX_BYTES)
 }
 
 /// How the table's file range is read: unbuffered reads start on and span

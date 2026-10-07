@@ -60,6 +60,7 @@ fn a_host_plan_below_the_margin_refuses_naming_the_line_that_crosses_it() {
     let message = err.to_string();
     for needle in [
         "ngram_hot_rows",
+        "--ngram-hot-bytes",
         &(45 * GIB).to_string(),
         &(41 * GIB).to_string(),
         &(2 * GIB).to_string(),

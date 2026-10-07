@@ -17,20 +17,25 @@
 //! admission, a decode step's right after the previous token is sampled;
 //! both finish before the graph launch. [`NgramTable::stage`] is the two
 //! chained.
+//!
+//! A budget that holds the whole table (`--ngram-hot-bytes`, GitHub #306)
+//! loads every row with one sequential scan of its file range, whatever the
+//! hot list ranks, and no step reads the file again.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use ignis_artifact::flash_next::FlashNextPlan;
 use ignis_artifact::{AlignedBuffer, DirectReader, NumericFormat, Object, Reader, DIRECT_IO_ALIGNMENT};
 
 use crate::compute::NgramGeometry;
 use crate::ngram::{
-    plan_gather, AlignedRead, GatherPlan, HotRows, NgramContext, NgramHashBuffers, NgramHasher, ReadPolicy,
-    TableLayout,
+    plan_gather, ranked_capacity, AlignedRead, GatherPlan, HotRows, NgramContext, NgramHashBuffers, NgramHasher,
+    ReadPolicy, TableLayout, HOT_ROW_INDEX_BYTES,
 };
 
 /// The RAM the hot-row cache may take, its index included (spec 04's
@@ -67,6 +72,148 @@ impl Default for NgramTableOptions {
         }
     }
 }
+
+/// The hot-row cache's budget as `--ngram-hot-bytes` names it (GitHub #306).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotBudget {
+    /// That many bytes, rows and index: [`DEFAULT_HOT_BYTES`] unless named.
+    Bytes(u64),
+    /// What the host plan leaves the line ([`TableFootprint::auto_budget`]).
+    Auto,
+}
+
+impl Default for HotBudget {
+    fn default() -> Self {
+        Self::Bytes(DEFAULT_HOT_BYTES)
+    }
+}
+
+impl std::fmt::Display for HotBudget {
+    /// As an operator writes it: `auto`, or the bytes in the largest of
+    /// `G`/`M`/`K` that divides them (`512M`, not 536870912).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self::Bytes(bytes) = *self else {
+            return f.write_str("auto");
+        };
+        match [(30, "G"), (20, "M"), (10, "K")].into_iter().find(|&(shift, _)| bytes != 0 && bytes % (1 << shift) == 0) {
+            Some((shift, unit)) => write!(f, "{}{unit}", bytes >> shift),
+            None => write!(f, "{bytes}"),
+        }
+    }
+}
+
+impl HotBudget {
+    /// The byte budget a table of `footprint` opens with: a named size as it
+    /// is, `auto` from `room`, the RAM the host plan leaves the line
+    /// ([`crate::residency::ngram_hot_rows_room`]). With no room measured
+    /// (`None`: the host's memory is unreadable) `auto` is the default.
+    pub fn resolve(self, footprint: &TableFootprint, room: Option<u64>) -> u64 {
+        match (self, room) {
+            (Self::Bytes(bytes), _) => bytes,
+            (Self::Auto, Some(room)) => footprint.auto_budget(room),
+            (Self::Auto, None) => DEFAULT_HOT_BYTES,
+        }
+    }
+
+    /// What a load says when this budget does not do what it reads as:
+    /// `auto` with no room measured (it takes the default), or a size named
+    /// past the hot list and short of the whole table (the cache holds the
+    /// list: no ranking says which other rows to add). `None` otherwise,
+    /// the default included.
+    pub fn warning(self, footprint: &TableFootprint, room_measured: bool) -> Option<&'static str> {
+        match self {
+            Self::Auto if !room_measured => {
+                Some("the host's available memory is unreadable: --ngram-hot-bytes auto holds the 1 GiB default")
+            }
+            Self::Bytes(bytes) if self != Self::default() && footprint.line_bytes(bytes) < bytes => Some(
+                "--ngram-hot-bytes is past the hot list and short of the whole table: the cache holds the list, \
+                 as no ranking says which other rows to add",
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// What a table's rows cost in RAM, read from the artifact's descriptors
+/// before anything is loaded ([`NgramTable::footprint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableFootprint {
+    pub table_rows: u64,
+    pub row_bytes: u64,
+    /// The rows the artifact's hot list ranks.
+    pub ranked_rows: u64,
+}
+
+impl TableFootprint {
+    /// The whole table in RAM: its rows, and no index (a row's slot is its
+    /// id).
+    pub fn whole_table_bytes(&self) -> u64 {
+        self.table_rows.saturating_mul(self.row_bytes)
+    }
+
+    /// The whole hot list in RAM, rows and index.
+    pub fn ranked_bytes(&self) -> u64 {
+        self.ranked_rows.saturating_mul(self.row_bytes + HOT_ROW_INDEX_BYTES)
+    }
+
+    /// Whether a cache of `budget` holds the whole table.
+    pub fn is_whole(&self, budget: u64) -> bool {
+        budget >= self.whole_table_bytes()
+    }
+
+    /// The RAM a cache opened with `budget` takes, what
+    /// [`NgramTable::hot_bytes`] reports: the whole table, or the head of the
+    /// hot list the budget holds. A budget past the list but short of the
+    /// whole table holds the list: no ranking says which other rows to add.
+    pub fn held_bytes(&self, budget: u64) -> u64 {
+        if self.is_whole(budget) {
+            return self.whole_table_bytes();
+        }
+        ranked_capacity(budget, self.row_bytes).min(self.ranked_rows) * (self.row_bytes + HOT_ROW_INDEX_BYTES)
+    }
+
+    /// The host plan's line for a cache of `budget`: the budget, but never
+    /// more than the table can hold at it -- the whole table, or past the
+    /// hot list, the list. So the default charges its 1 GiB, as it always
+    /// has, and a budget the table cannot use is not refused for RAM it
+    /// would never take.
+    pub fn line_bytes(&self, budget: u64) -> u64 {
+        if self.is_whole(budget) {
+            return self.whole_table_bytes();
+        }
+        budget.min(self.ranked_bytes())
+    }
+
+    /// The budget `auto` takes when the host plan leaves the line `room`
+    /// bytes, of which it first leaves [`AUTO_LOAD_HEADROOM_BYTES`] to the
+    /// load itself: the whole table when it fits; else the whole hot list
+    /// when it fits; else the rest rounded down to whole GiB, never below
+    /// the 1 GiB default, which the plan then refuses where it would refuse
+    /// the default. So a cache never takes more than the default unless the
+    /// plan has room for it and its load, and the rows it selects -- the
+    /// persistent cache file's identity -- change only when free RAM crosses
+    /// one of these steps, not with every start's few megabytes.
+    pub fn auto_budget(&self, room: u64) -> u64 {
+        let room = room.saturating_sub(AUTO_LOAD_HEADROOM_BYTES);
+        if room >= self.whole_table_bytes() {
+            return self.whole_table_bytes();
+        }
+        if room >= self.ranked_bytes() {
+            return self.ranked_bytes();
+        }
+        (room / AUTO_STEP_BYTES * AUTO_STEP_BYTES).max(DEFAULT_HOT_BYTES)
+    }
+}
+
+/// What an `auto` budget short of the whole hot list is rounded down to.
+const AUTO_STEP_BYTES: u64 = 1 << 30;
+
+/// What `auto` leaves of its room for the load, which holds more than the
+/// cache while it runs: a whole table's scan, two HOT_LOAD_SPAN_BYTES spans
+/// of reads in flight; the hot list's, one span and the 8-byte ids of the
+/// rows it loads (125 MB for the real list's 15.6M). Past the load the
+/// cache is all that stays, so the plan's line does not carry it.
+pub const AUTO_LOAD_HEADROOM_BYTES: u64 = 256 << 20;
 
 /// Rows gathered so far, by source: plain counters the server reads and exposes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +354,8 @@ pub struct NgramTable {
 impl NgramTable {
     /// Open the table at `layout` in the file at `path`, hashing with
     /// `hasher`, and load into RAM the head of `ranked_hot` (row ids, most
-    /// frequent first) that fits `options.hot_bytes`.
+    /// frequent first) that fits `options.hot_bytes` -- or every row, when
+    /// the budget holds the whole table.
     pub fn open(
         path: &Path,
         layout: TableLayout,
@@ -216,7 +364,9 @@ impl NgramTable {
         options: NgramTableOptions,
     ) -> Result<Self, String> {
         let mut table = Self::open_unloaded(path, layout, hasher, ranked_hot, options)?;
-        table.hot_data = table.load_hot_rows()?;
+        let started = Instant::now();
+        table.hot_data = table.load_hot_data()?;
+        table.loaded(started);
         Ok(table)
     }
     fn open_unloaded(
@@ -234,7 +384,19 @@ impl NgramTable {
             ));
         }
         let policy = ReadPolicy { alignment: DIRECT_IO_ALIGNMENT, max_read_bytes: options.max_read_bytes };
-        let hot = HotRows::from_ranked(ranked_hot, options.hot_bytes, layout.row_bytes)?;
+        let footprint =
+            TableFootprint { table_rows: layout.rows, row_bytes: layout.row_bytes, ranked_rows: ranked_hot.len() as u64 };
+        let hot = if footprint.is_whole(options.hot_bytes) {
+            if layout.row_stride != layout.row_bytes {
+                return Err(format!(
+                    "a whole-table cache scans packed rows: {}-byte rows {} bytes apart",
+                    layout.row_bytes, layout.row_stride
+                ));
+            }
+            HotRows::whole(layout.rows, layout.row_bytes)?
+        } else {
+            HotRows::from_ranked(ranked_hot, options.hot_bytes, layout.row_bytes)?
+        };
         let table = Self {
             hasher,
             hot,
@@ -256,10 +418,15 @@ impl NgramTable {
         options: NgramTableOptions,
     ) -> Result<Self, String> {
         let mut table = Self::prepare_from_artifact(path, reader, bound, geometry, options)?;
-        table.hot_data = table.load_hot_rows()?;
+        let started = Instant::now();
+        table.hot_data = table.load_hot_data()?;
+        table.loaded(started);
         Ok(table)
     }
     /// Close the artifact mapping before loading or restoring the hot rows.
+    /// A whole table is loaded from the artifact and never persisted: the
+    /// artifact is already its copy on disk, and a second one beside the
+    /// model would take as much again.
     pub fn from_cached_artifact(
         path: &Path,
         reader: Reader,
@@ -269,17 +436,36 @@ impl NgramTable {
         persistence: &crate::ngram_cache::PersistenceOptions,
     ) -> Result<Self, String> {
         let mut table = Self::prepare_from_artifact(path, &reader, bound, geometry, options)?;
-        let key = if persistence.enabled {
-            let layout = &table.layout;
-            let words = [layout.base_offset, layout.row_stride, layout.row_bytes, layout.rows];
-            crate::ngram_cache::identity(path, reader.content_hash(), &words, table.hot.rows())
+        let started = Instant::now();
+        if table.hot.is_whole() {
+            drop(reader);
+            table.hot_data = table.load_hot_data()?;
         } else {
-            Err("disabled".into())
-        };
-        drop(reader);
-        let len = table.hot.len().checked_mul(table.row_bytes()).ok_or("hot cache size overflow")?;
-        table.hot_data = crate::ngram_cache::load_or_build(persistence, path, key, len, || table.load_hot_rows())?;
+            let key = if persistence.enabled {
+                let layout = &table.layout;
+                let words = [layout.base_offset, layout.row_stride, layout.row_bytes, layout.rows];
+                crate::ngram_cache::identity(path, reader.content_hash(), &words, table.hot.rows())
+            } else {
+                Err("disabled".into())
+            };
+            drop(reader);
+            let len = table.hot.len().checked_mul(table.row_bytes()).ok_or("hot cache size overflow")?;
+            table.hot_data =
+                crate::ngram_cache::load_or_build(persistence, path, key, len, || table.load_hot_data())?;
+        }
+        table.loaded(started);
         Ok(table)
+    }
+    /// What the table of a bound Flash-Next artifact takes in RAM at each
+    /// budget, from its descriptors alone: nothing is read or loaded.
+    pub fn footprint(reader: &Reader, bound: &FlashNextPlan, geometry: NgramGeometry) -> Result<TableFootprint, String> {
+        let (prefix, layout) = artifact_layout(reader, bound, geometry)?;
+        let name = format!("{prefix}.ngram_embedding.hot_rows");
+        let ranked_rows = match reader.find(&name) {
+            Some(Object::Tensor(t)) if t.format == NumericFormat::I32 && t.shape.len() == 1 => t.shape[0],
+            _ => return Err(format!("{name} is not a {} vector", NumericFormat::I32.name())),
+        };
+        Ok(TableFootprint { table_rows: layout.rows, row_bytes: layout.row_bytes, ranked_rows })
     }
     fn prepare_from_artifact(
         path: &Path,
@@ -288,27 +474,7 @@ impl NgramTable {
         geometry: NgramGeometry,
         options: NgramTableOptions,
     ) -> Result<Self, String> {
-        let prefix = format!("layers.{}.ple.ple_embedding", geometry.layer);
-        let table_name = format!("{prefix}.ngram_embedding.weight");
-        let handle = *bound
-            .handles
-            .get(&table_name)
-            .ok_or_else(|| format!("the artifact has no {table_name}"))?;
-        let placement = bound
-            .plan
-            .streamed_objects
-            .iter()
-            .find(|p| p.handle == handle)
-            .ok_or_else(|| format!("{table_name} is not host-streamed in the plan"))?;
-        let Some(Object::Tensor(descriptor)) = reader.find(&table_name) else {
-            return Err(format!("{table_name} is not a tensor"));
-        };
-        let (rows, columns) = (descriptor.shape[0], descriptor.shape[1]);
-        let row_bytes = placement.bytes / rows;
-        if row_bytes * rows != placement.bytes || columns == 0 {
-            return Err(format!("{table_name}: {} bytes for {rows} rows", placement.bytes));
-        }
-        let layout = TableLayout { base_offset: placement.file_offset, row_stride: row_bytes, row_bytes, rows };
+        let (prefix, layout) = artifact_layout(reader, bound, geometry)?;
 
         // The container mapping (spec flash-next/01): the hash buffers are I64,
         // the hot list I32 row ids.
@@ -401,6 +567,63 @@ impl NgramTable {
         Arc::clone(&self.counts)
     }
 
+    /// The cache's bytes, read from the file: the whole table, or the hot
+    /// rows.
+    fn load_hot_data(&self) -> Result<Vec<u8>, String> {
+        if self.hot.is_whole() {
+            self.load_whole_table()
+        } else {
+            self.load_hot_rows()
+        }
+    }
+
+    /// Says what the load put in RAM and how long it took, from `started`:
+    /// a whole table is 28.8 GB read at start.
+    fn loaded(&self, started: Instant) {
+        tracing::info!(
+            name: "ignis.ngram.hot_rows",
+            hot_rows = self.hot_rows(),
+            hot_bytes = self.hot_bytes(),
+            whole_table = self.hot.is_whole(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            "n-gram hot rows in RAM"
+        );
+    }
+
+    /// Read the whole table into RAM, row `r` at slot `r`: one sequential
+    /// scan of its file range in HOT_LOAD_MAX_READ_BYTES reads, the next
+    /// HOT_LOAD_SPAN_BYTES of them in flight while the last are copied, so
+    /// the reads hold two spans beside the table whatever its size.
+    fn load_whole_table(&self) -> Result<Vec<u8>, String> {
+        let len = self.hot.bytes();
+        let mut bytes = vec![0u8; usize::try_from(len).map_err(|_| "whole-table size overflow")?];
+        let start = self.layout.base_offset;
+        let file_end = (start + len).div_ceil(DIRECT_IO_ALIGNMENT) * DIRECT_IO_ALIGNMENT;
+        let mut offset = start / DIRECT_IO_ALIGNMENT * DIRECT_IO_ALIGNMENT;
+        let mut copying: Option<(Vec<AlignedRead>, mpsc::Receiver<ReadResult>)> = None;
+        loop {
+            let reading = if offset < file_end {
+                let span_end = (offset + HOT_LOAD_SPAN_BYTES).min(file_end);
+                let reads: Vec<AlignedRead> = (offset..span_end)
+                    .step_by(HOT_LOAD_MAX_READ_BYTES as usize)
+                    .map(|at| AlignedRead { offset: at, len: HOT_LOAD_MAX_READ_BYTES.min(span_end - at) })
+                    .collect();
+                offset = span_end;
+                let results = self.pool.submit(&reads)?;
+                Some((reads, results))
+            } else {
+                None
+            };
+            if let Some((reads, results)) = copying.take() {
+                copy_scanned(&reads, results, start, &mut bytes)?;
+            }
+            match reading {
+                Some(span) => copying = Some(span),
+                None => return Ok(bytes),
+            }
+        }
+    }
+
     /// Read the hot rows from the file into their slots, with the coalescing
     /// reads the step path uses but longer, one plan per HOT_LOAD_SPAN_BYTES
     /// of the file: the rows are in ascending order, so a plan's reads lie in
@@ -424,6 +647,65 @@ impl NgramTable {
         }
         Ok(bytes)
     }
+}
+
+/// The n-gram block's object prefix in a bound Flash-Next artifact, and its
+/// table's host-streamed range.
+fn artifact_layout(
+    reader: &Reader,
+    bound: &FlashNextPlan,
+    geometry: NgramGeometry,
+) -> Result<(String, TableLayout), String> {
+    let prefix = format!("layers.{}.ple.ple_embedding", geometry.layer);
+    let table_name = format!("{prefix}.ngram_embedding.weight");
+    let handle = *bound
+        .handles
+        .get(&table_name)
+        .ok_or_else(|| format!("the artifact has no {table_name}"))?;
+    let placement = bound
+        .plan
+        .streamed_objects
+        .iter()
+        .find(|p| p.handle == handle)
+        .ok_or_else(|| format!("{table_name} is not host-streamed in the plan"))?;
+    let Some(Object::Tensor(descriptor)) = reader.find(&table_name) else {
+        return Err(format!("{table_name} is not a tensor"));
+    };
+    let (rows, columns) = (descriptor.shape[0], descriptor.shape[1]);
+    let row_bytes = placement.bytes / rows;
+    if row_bytes * rows != placement.bytes || columns == 0 {
+        return Err(format!("{table_name}: {} bytes for {rows} rows", placement.bytes));
+    }
+    let layout = TableLayout { base_offset: placement.file_offset, row_stride: row_bytes, row_bytes, rows };
+    Ok((prefix, layout))
+}
+
+/// Wait for a scan span's reads and copy what each returned of the table into
+/// `out`, the table's bytes from file offset `base`.
+fn copy_scanned(
+    reads: &[AlignedRead],
+    results: mpsc::Receiver<ReadResult>,
+    base: u64,
+    out: &mut [u8],
+) -> Result<(), String> {
+    let end = base + out.len() as u64;
+    for _ in 0..reads.len() {
+        let (index, result) = results
+            .recv()
+            .map_err(|_| "an n-gram reader thread stopped mid-scan".to_string())?;
+        let (buffer, got) = result.map_err(|e| format!("n-gram scan read {index}: {e}"))?;
+        let read = reads[index];
+        let (from, to) = (read.offset.max(base), (read.offset + read.len).min(end));
+        if from >= to {
+            continue;
+        }
+        if read.offset + (got as u64) < to {
+            return Err(format!("the file ends at {} inside the table's [{base}, {end})", read.offset + got as u64));
+        }
+        out[(from - base) as usize..(to - base) as usize]
+            .copy_from_slice(&buffer.as_slice()[(from - read.offset) as usize..(to - read.offset) as usize]);
+    }
+    Ok(())
 }
 
 /// An I64 or I32 vector of the artifact, as i64, refused unless the
@@ -621,6 +903,55 @@ mod tests {
     }
 
     #[test]
+    fn the_auto_headroom_covers_what_a_load_holds_beside_the_cache() {
+        // A whole table's scan: two spans of reads in flight.
+        assert!(AUTO_LOAD_HEADROOM_BYTES >= 2 * HOT_LOAD_SPAN_BYTES);
+        // The hot list's load: one span, and the 8-byte ids of every row it
+        // loads, for a list at the converter's 2 GiB cap (layout.md 7.3).
+        let capped_list_rows = (2u64 << 30) / 90;
+        assert!(AUTO_LOAD_HEADROOM_BYTES >= HOT_LOAD_SPAN_BYTES + capped_list_rows * 8);
+    }
+
+    #[test]
+    fn a_budget_that_holds_the_whole_table_loads_every_row_whatever_the_ranking() {
+        // GitHub #306: the hot list ranks two rows; a budget of the whole
+        // table (rows, no index) still holds all 5,000, and no gather reads.
+        let table_file = TableFile::write("whole", 5_000, 4096 + 123);
+        let whole = 5_000 * ROW_BYTES;
+        let table = NgramTable::open(&table_file.path, table_file.layout, hasher(5_000), &[3, 17], options(whole)).unwrap();
+        assert_eq!((table.hot_rows(), table.hot_bytes()), (5_000, whole));
+        let rows = [4_999u64, 0, 3, 17, 17, 2_500, 1, 4_998, 45, 46];
+        let mut out = vec![0u8; rows.len() * ROW_BYTES as usize];
+        table.begin_rows(&rows).unwrap().finish(&mut out).unwrap();
+        assert_eq!(out, expected(&rows));
+        let counters = table.counters();
+        assert_eq!((counters.reads, counters.read_bytes, counters.file_rows), (0, 0, 0), "no step reads the file");
+        assert_eq!(counters.hot_rows, rows.len() as u64);
+        // A byte short of the table, the cache is the ranked list: no
+        // ranking says which other rows the rest of the budget should hold.
+        let short = NgramTable::open(&table_file.path, table_file.layout, hasher(5_000), &[3, 17], options(whole - 1)).unwrap();
+        assert_eq!((short.hot_rows(), short.hot_bytes()), (2, 2 * 94));
+    }
+
+    #[test]
+    fn a_whole_table_scan_over_more_than_one_load_span_reads_every_byte() {
+        // ~69 MiB of rows from an unaligned base: two scan spans, the first
+        // and last reads cut at the table's ends.
+        let rows = 800_000u64;
+        let table_file = TableFile::write("whole-span", rows, 4096 + 123);
+        let table =
+            NgramTable::open(&table_file.path, table_file.layout, hasher(rows), &[], options(rows * ROW_BYTES)).unwrap();
+        assert_eq!(table.hot_rows(), rows as usize);
+        let all: Vec<u64> = (0..rows).collect();
+        assert!(table.hot_data == expected(&all), "the scan put every row at its own slot");
+        let sample = [0u64, 1, rows - 1, (64 << 20) / ROW_BYTES, (64 << 20) / ROW_BYTES + 1, 400_000];
+        let mut out = vec![0u8; sample.len() * ROW_BYTES as usize];
+        table.begin_rows(&sample).unwrap().finish(&mut out).unwrap();
+        assert_eq!(out, expected(&sample));
+        assert_eq!(table.counters().reads, 0);
+    }
+
+    #[test]
     fn a_hot_list_spread_over_more_than_one_load_span_loads_every_row() {
         // 800,000 rows of 90 bytes span ~69 MiB: more than one 64 MiB load
         // plan, with hot rows on both sides of the boundary.
@@ -798,6 +1129,74 @@ mod tests {
         let rows = reader.payload(&flash_next::ngram_table_name(&FlashNextGeometry::fixture())).unwrap().data;
         let want: Vec<u8> = ids.iter().flat_map(|&r| rows[r as usize * 90..r as usize * 90 + 90].to_vec()).collect();
         assert_eq!(staged, want, "each token's rows, in head order, as the artifact stores them");
+    }
+
+    /// The fixture artifact's n-gram block: 2 heads of 160 over its 1,000
+    /// rows.
+    fn fixture_geometry() -> NgramGeometry {
+        NgramGeometry {
+            ngram_size: 3,
+            heads_per_ngram: 1,
+            embed_dim: 320,
+            conv_kernel: 4,
+            layer: 1,
+            vocab_size_base: 490,
+            vocab_divisor: 1_000,
+            split_parts: 2,
+            seed: 0,
+            eos_token_id: 248_044,
+        }
+    }
+
+    #[test]
+    fn the_footprint_says_what_each_budget_holds_before_the_table_opens() {
+        use ignis_artifact::flash_next::{self, fixture, FlashNextGeometry};
+        let artifact = fixture::build("ngram-footprint").unwrap();
+        let reader = Reader::open(&artifact.path).unwrap();
+        let bound = flash_next::bind(&reader, &FlashNextGeometry::fixture()).unwrap();
+        let footprint = NgramTable::footprint(&reader, &bound, fixture_geometry()).unwrap();
+        assert_eq!(footprint, TableFootprint { table_rows: 1_000, row_bytes: 90, ranked_rows: 6 });
+        assert_eq!((footprint.whole_table_bytes(), footprint.ranked_bytes()), (90_000, 6 * 94));
+        // What each budget holds, known before the table opens.
+        for budget in [0, 93, 94, 3 * 94, 6 * 94, 6 * 94 + 1, 50_000, 89_999, 90_000, 1 << 30] {
+            let table = NgramTable::from_artifact(&artifact.path, &reader, &bound, fixture_geometry(), options(budget)).unwrap();
+            assert_eq!(table.hot_bytes(), footprint.held_bytes(budget), "budget {budget}");
+            assert_eq!(table.hot.is_whole(), footprint.is_whole(budget), "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn a_whole_table_is_loaded_from_the_artifact_and_never_written_beside_it() {
+        use ignis_artifact::flash_next::{self, fixture, FlashNextGeometry};
+        let artifact = fixture::build("ngram-whole").unwrap();
+        let bound = flash_next::bind(&Reader::open(&artifact.path).unwrap(), &FlashNextGeometry::fixture()).unwrap();
+        let cache = artifact.path.with_extension("ngram-whole-cache");
+        let persistence = crate::ngram_cache::PersistenceOptions {
+            enabled: true,
+            location: crate::ngram_cache::CacheLocation::Directory(cache.clone()),
+        };
+        let table = NgramTable::from_cached_artifact(
+            &artifact.path,
+            Reader::open(&artifact.path).unwrap(),
+            &bound,
+            fixture_geometry(),
+            options(90_000),
+            &persistence,
+        )
+        .unwrap();
+        assert_eq!(table.hot_rows(), 1_000, "every row, though the hot list ranks six");
+        assert!(!cache.exists(), "no cache file: the artifact is the table's copy on disk");
+        let reader = Reader::open(&artifact.path).unwrap();
+        let rows = reader.payload(&flash_next::ngram_table_name(&FlashNextGeometry::fixture())).unwrap().data;
+        assert!(table.hot_data == rows, "the scan holds the stored table byte for byte");
+        let tokens = [100u32, 2_000, 248_044, 31, 31, 77_777];
+        let mut staged = vec![0u8; tokens.len() * table.token_bytes()];
+        table.stage(&mut table.new_context(), &tokens, &mut staged).unwrap();
+        let mut ids = Vec::new();
+        table.hasher().hash(&mut table.new_context(), &tokens, &mut ids);
+        let want: Vec<u8> = ids.iter().flat_map(|&r| rows[r as usize * 90..r as usize * 90 + 90].to_vec()).collect();
+        assert_eq!(staged, want);
+        assert_eq!(table.counters().reads, 0, "no step reads the artifact");
     }
 
     #[test]

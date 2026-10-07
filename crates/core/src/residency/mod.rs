@@ -83,7 +83,7 @@ pub use plan::{
     ClassPool, EXPERT_CACHE_FLOOR_BYTES, ExpertCachePlan, ExpertCachePlanError,
     ExpertCacheRequest, ExpertTraffic, HOST_MARGIN_BYTES, HOST_PLAN_LINES, HostPlan, HostPlanError,
     HostPlanRequest, MEASURED_LINK_BYTES_PER_SECOND, TrafficMismatch,
-    default_prefetch_budget_bytes, estimated_decode_round_seconds, min_slots_per_class,
+    default_prefetch_budget_bytes, estimated_decode_round_seconds, min_slots_per_class, ngram_hot_rows_room,
     plan_expert_cache, plan_host, prefill_staging_ring_bytes, residency_table_bytes,
     warm_start_order,
 };
