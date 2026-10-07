@@ -108,6 +108,6 @@ Inferred:
 
 ## Follow-ups
 
-1. Publish the chained prefix at the opener's page floor without a state image, and drop the publish-point cut. This is a spec 05 / ADR 0029 change, worth ~0.35 s on a median reused turn.
+1. Publish the chained prefix at the opener's page floor without a state image, and drop the publish-point cut. This is a spec 05 / ADR 0029 change, worth ~0.35 s on a median reused turn. Done as ADR 0029's 2026-10-07 amendment: 0.34-0.36 s measured, [the pages-only link](2026-10-07-flash-next-pages-only-link.md).
 2. A one-hold sweep of the prefill width (6, 8), and of a width by chunk length.
-3. Acceptance 6 at the spec's 30K history once 1. lands.
+3. Acceptance 6 at the spec's 30K history once 1. lands. Measured there: 1.58 s at the median.
