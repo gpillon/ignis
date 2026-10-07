@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::decision::{Readout, argmax, log_sum_exp};
-use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, NO_HOST_ROOM};
+use crate::scheduler::{
+    Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource, DiskTarget,
+    PrefillJob, PrefillOutcome, NO_HOST_ROOM,
+};
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
 /// Recording handle onto the mock's call history (shared through the
@@ -102,6 +105,68 @@ struct Inner {
     /// The tokens each captured checkpoint covers, by publisher: what its
     /// materialized blob is sized from.
     checkpoint_tokens: HashMap<RequestId, u32>,
+    /// The fake KV-disk (spec vram-budget/03), or `None`: a backend with no
+    /// disk, which takes nothing -- every scenario that is not about the
+    /// tier.
+    disk: Option<FakeDiskState>,
+}
+
+/// A fake KV-disk's shape (spec vram-budget/03): the volume's room, and how
+/// long a transfer takes. A blob moves in `ceil(bytes / window_bytes)`
+/// windows, one every `advances_per_window` calls to
+/// [`Compute::disk_advance`] -- "a second per window" at one advance a
+/// second -- so a scenario can watch the other lanes decode while one moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FakeDisk {
+    /// The volume's room for files, in bytes ([`Compute::disk_fits`]).
+    pub room_bytes: u64,
+    pub window_bytes: u64,
+    pub advances_per_window: u32,
+}
+
+impl FakeDisk {
+    /// A disk with `room_bytes` of room, every blob one window, each window
+    /// one advance: the fastest a transfer can be and still be a transfer.
+    pub fn with_room(room_bytes: u64) -> Self {
+        Self {
+            room_bytes,
+            window_bytes: u64::MAX,
+            advances_per_window: 1,
+        }
+    }
+}
+
+/// One transfer the fake disk has under way.
+#[derive(Debug, Clone)]
+struct FakeTransfer {
+    blob: DiskBlob,
+    /// `Some(from)` for a spill, `None` for a restore.
+    from: Option<DiskSource>,
+    /// A restore's target.
+    into: Option<DiskTarget>,
+    /// The file's bytes (a spill's, once committed), and the blob's.
+    file_bytes: u64,
+    blob_bytes: u64,
+    windows_left: u64,
+    /// Advances before the next window moves.
+    wait: u32,
+}
+
+#[derive(Debug)]
+struct FakeDiskState {
+    shape: FakeDisk,
+    /// Committed files: their bytes on the volume, and the blob's own.
+    files: HashMap<DiskBlob, (u64, u64)>,
+    transfers: Vec<FakeTransfer>,
+    /// Every write fails once its first window moved (`fail_disk_writes`).
+    failing_writes: bool,
+    /// Files whose next read fails its check (`corrupt_disk_file`).
+    corrupt: std::collections::HashSet<DiskBlob>,
+    spills: Vec<(DiskBlob, DiskSource)>,
+    restores: Vec<DiskBlob>,
+    discards: Vec<DiskBlob>,
+    /// For each `disk_advance` call, the blobs that moved a window.
+    windows: Vec<Vec<DiskBlob>>,
 }
 
 /// What the mock charges a KV-RAM blob: a mutable image plus the paged bytes
@@ -310,6 +375,85 @@ impl MockCompute {
         let mock = Self::new();
         mock.inner.lock().unwrap().arena = Some(MockHostArena::new(capacity_bytes));
         mock
+    }
+
+    /// A mock with a fake KV-disk of `disk`'s shape (spec vram-budget/03).
+    pub fn with_disk(self, disk: FakeDisk) -> Self {
+        self.inner.lock().unwrap().disk = Some(FakeDiskState {
+            shape: disk,
+            files: HashMap::new(),
+            transfers: Vec::new(),
+            failing_writes: false,
+            corrupt: std::collections::HashSet::new(),
+            spills: Vec::new(),
+            restores: Vec::new(),
+            discards: Vec::new(),
+            windows: Vec::new(),
+        });
+        self
+    }
+
+    /// Make every disk write from now on fail once its first window moved
+    /// (or succeed again, with `false`): a volume that errors mid-file.
+    pub fn fail_disk_writes(&self, failing: bool) {
+        self.with_fake_disk(|disk| disk.failing_writes = failing);
+    }
+
+    /// Make the next read of `blob`'s file fail its check: a torn or corrupt
+    /// file, never restored.
+    pub fn corrupt_disk_file(&self, blob: DiskBlob) {
+        self.with_fake_disk(|disk| {
+            disk.corrupt.insert(blob);
+        });
+    }
+
+    /// The fake disk's committed files and their bytes on the volume.
+    pub fn disk_files(&self) -> HashMap<DiskBlob, u64> {
+        self.with_fake_disk(|disk| disk.files.iter().map(|(&blob, &(file, _))| (blob, file)).collect())
+    }
+
+    /// The spills the fake disk was asked for, in order.
+    pub fn disk_spills(&self) -> Vec<(DiskBlob, DiskSource)> {
+        self.with_fake_disk(|disk| disk.spills.clone())
+    }
+
+    /// The restores the fake disk was asked for, in order.
+    pub fn disk_restores(&self) -> Vec<DiskBlob> {
+        self.with_fake_disk(|disk| disk.restores.clone())
+    }
+
+    /// The files the fake disk was told to delete, in order.
+    pub fn disk_discards(&self) -> Vec<DiskBlob> {
+        self.with_fake_disk(|disk| disk.discards.clone())
+    }
+
+    /// For each `disk_advance` call so far, the blobs that moved a window.
+    pub fn disk_windows(&self) -> Vec<Vec<DiskBlob>> {
+        self.with_fake_disk(|disk| disk.windows.clone())
+    }
+
+    /// Transfers the fake disk has under way.
+    pub fn disk_transfers(&self) -> usize {
+        self.with_fake_disk(|disk| disk.transfers.len())
+    }
+
+    fn with_fake_disk<T>(&self, f: impl FnOnce(&mut FakeDiskState) -> T) -> T {
+        f(self
+            .inner
+            .lock()
+            .unwrap()
+            .disk
+            .as_mut()
+            .expect("the fake disk needs MockCompute::with_disk"))
+    }
+
+    /// A blob's bytes, as the mock prices them everywhere else.
+    fn disk_blob_bytes(&self, blob: DiskBlob) -> u64 {
+        match blob {
+            DiskBlob::Live(request) => self.live_bytes(request),
+            DiskBlob::Checkpoint(publisher) => self.checkpoint_bytes(publisher),
+            DiskBlob::Prefix(_, tokens) => self.sections.blob_bytes(tokens),
+        }
     }
 
     /// The bytes the modelled arena's live blobs hold — the figure
@@ -779,6 +923,152 @@ impl Compute for MockCompute {
 
     fn discard_snapshot(&self, request: RequestId) {
         self.free_blob(MockBlob::Live(request));
+    }
+
+    // Spec vram-budget/03: the fake disk. Files are a byte count apiece, a
+    // transfer a countdown of windows; nothing is copied, and nothing about
+    // a request's tokens depends on where its state has been -- the mock's
+    // streams are pure functions of the request, which is exactly what lets
+    // a scenario check that a moved request's output continues unbroken.
+
+    fn disk_fits(&self, bytes: u64) -> bool {
+        let g = self.inner.lock().unwrap();
+        let Some(disk) = g.disk.as_ref() else {
+            return false;
+        };
+        let held: u64 = disk.files.values().map(|&(file, _)| file).sum::<u64>()
+            + disk.transfers.iter().filter(|t| t.from.is_some()).map(|t| t.file_bytes).sum::<u64>();
+        held.saturating_add(crate::disk::disk_file_bytes(bytes)) <= disk.shape.room_bytes
+    }
+
+    fn disk_spill(&self, blob: DiskBlob, from: DiskSource, _meta: DiskBlobMeta) -> Result<u64, ComputeError> {
+        let bytes = self.disk_blob_bytes(blob);
+        let mut g = self.inner.lock().unwrap();
+        let Some(disk) = g.disk.as_mut() else {
+            return Err(ComputeError::Kernel(-1));
+        };
+        let windows = bytes.div_ceil(disk.shape.window_bytes).max(1);
+        disk.transfers.push(FakeTransfer {
+            blob,
+            from: Some(from),
+            into: None,
+            file_bytes: crate::disk::disk_file_bytes(bytes),
+            blob_bytes: bytes,
+            windows_left: windows,
+            wait: disk.shape.advances_per_window.saturating_sub(1),
+        });
+        disk.spills.push((blob, from));
+        Ok(bytes)
+    }
+
+    fn disk_restore(&self, blob: DiskBlob, into: DiskTarget) -> Result<(), ComputeError> {
+        let mut g = self.inner.lock().unwrap();
+        let Some(disk) = g.disk.as_mut() else {
+            return Err(ComputeError::Kernel(-1));
+        };
+        let Some(&(file_bytes, blob_bytes)) = disk.files.get(&blob) else {
+            return Err(ComputeError::Kernel(-1));
+        };
+        let windows = blob_bytes.div_ceil(disk.shape.window_bytes).max(1);
+        disk.transfers.push(FakeTransfer {
+            blob,
+            from: None,
+            into: Some(into),
+            file_bytes,
+            blob_bytes,
+            windows_left: windows,
+            wait: disk.shape.advances_per_window.saturating_sub(1),
+        });
+        disk.restores.push(blob);
+        Ok(())
+    }
+
+    fn disk_advance(&self) -> Vec<DiskEvent> {
+        let mut g = self.inner.lock().unwrap();
+        let Some(disk) = g.disk.as_mut() else {
+            return Vec::new();
+        };
+        let mut moved = Vec::new();
+        let mut ended = Vec::new();
+        let mut kv_ram_freed = Vec::new();
+        let per_window = disk.shape.advances_per_window.saturating_sub(1);
+        let mut keep = Vec::with_capacity(disk.transfers.len());
+        for mut t in std::mem::take(&mut disk.transfers) {
+            if t.wait > 0 {
+                t.wait -= 1;
+                keep.push(t);
+                continue;
+            }
+            moved.push(t.blob);
+            t.windows_left -= 1;
+            // A failing volume errors on the first window it is handed.
+            if t.from.is_some() && disk.failing_writes {
+                ended.push(DiskEvent {
+                    blob: t.blob,
+                    outcome: DiskOutcome::Failed { op: DiskOp::Write },
+                });
+                continue;
+            }
+            if t.windows_left > 0 {
+                t.wait = per_window;
+                keep.push(t);
+                continue;
+            }
+            let outcome = match t.from {
+                Some(from) => {
+                    disk.files.insert(t.blob, (t.file_bytes, t.blob_bytes));
+                    if from == DiskSource::KvRam {
+                        kv_ram_freed.push(t.blob);
+                    }
+                    DiskOutcome::Spilled { bytes: t.file_bytes }
+                }
+                None if disk.corrupt.remove(&t.blob) => {
+                    disk.files.remove(&t.blob);
+                    DiskOutcome::Failed { op: DiskOp::Read }
+                }
+                None => {
+                    // A live blob's file goes once it has landed; a retained
+                    // one stays, since a claim never consumes.
+                    if matches!(t.blob, DiskBlob::Live(_)) {
+                        disk.files.remove(&t.blob);
+                    }
+                    DiskOutcome::Restored { micros: 1 }
+                }
+            };
+            ended.push(DiskEvent { blob: t.blob, outcome });
+        }
+        disk.transfers = keep;
+        disk.windows.push(moved);
+        // The KV-RAM spans of the blobs written from them come back with the
+        // commit, as the real tier's do.
+        if let Some(arena) = g.arena.as_mut() {
+            for blob in kv_ram_freed {
+                arena.free(match blob {
+                    DiskBlob::Live(request) => MockBlob::Live(request),
+                    DiskBlob::Checkpoint(publisher) => MockBlob::Checkpoint(publisher),
+                    DiskBlob::Prefix(publisher, tokens) => MockBlob::Prefix(publisher, tokens),
+                });
+            }
+        }
+        ended
+    }
+
+    fn disk_discard(&self, blob: DiskBlob) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(disk) = g.disk.as_mut() {
+            disk.transfers.retain(|t| t.blob != blob);
+            disk.files.remove(&blob);
+            disk.discards.push(blob);
+        }
+    }
+
+    fn disk_abandon_restore(&self, request: RequestId) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(disk) = g.disk.as_mut() {
+            disk.transfers.retain(|t| {
+                !matches!(t.into, Some(DiskTarget::Sequence { request: r, .. }) if r == request)
+            });
+        }
     }
 }
 

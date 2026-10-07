@@ -868,6 +868,24 @@ pub enum SchedEvent {
     /// How many of the load's retained slots are held (GitHub #215), reported
     /// on the step it changed.
     RetainedSlots { in_use: u32, capacity: u32 },
+    /// A **live** snapshot was written to KV-disk (spec vram-budget/03, ADR
+    /// 0045): straight from the device (`from` [`DiskSource::Device`], a
+    /// victim KV-RAM could not take) or demoted from KV-RAM to make room
+    /// there. Reported when the file commits, the moment its source gives
+    /// its bytes up. `ignis_kv_disk_spills_total{from}` counts these; a
+    /// device-to-KV-RAM move stays [`SchedEvent::Evicted`], and retained
+    /// state moving to the disk is a [`SchedEvent::RetainedState`] spill.
+    ///
+    /// [`DiskSource::Device`]: crate::scheduler::DiskSource::Device
+    DiskSpilled {
+        request: RequestId,
+        from: crate::scheduler::DiskSource,
+    },
+    /// A KV-disk transfer failed (spec vram-budget/03): a write refused or
+    /// failed — nothing lost, the blob stays where it was — or a file that
+    /// failed its check on the way back, never restored.
+    /// `ignis_kv_disk_failures_total{op}` counts these.
+    DiskFailure { op: crate::scheduler::DiskOp },
     /// One chunked-prefill step landed for `request` (P3-01, ADR 0018;
     /// P3-06 request log): `chunk_tokens` is this chunk's width,
     /// `prefilled_tokens` the cumulative prompt tokens sent to the compute

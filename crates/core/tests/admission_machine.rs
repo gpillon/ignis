@@ -78,6 +78,8 @@ fn small_pool() -> SchedulerConfig {
         retained_slots: 16,
         retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
         thinking_close: None,
+        kv_disk_capacity_bytes: 0,
+        kv_disk_restore_floor_tokens: ignis_core::concrete::KV_DISK_RESTORE_FLOOR_TOKENS,
     }
 }
 
@@ -452,6 +454,8 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             retained_slots: 16,
             retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
             thinking_close: None,
+            kv_disk_capacity_bytes: 0,
+            kv_disk_restore_floor_tokens: ignis_core::concrete::KV_DISK_RESTORE_FLOOR_TOKENS,
         },
         compute.clone(),
     );

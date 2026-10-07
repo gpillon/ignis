@@ -339,6 +339,11 @@ pub struct HostTier {
     /// Requests proven worth retaining (restored at least once): their next
     /// capture lands directly in the protected tier.
     promoted: HashSet<RequestId>,
+    /// Entries on their way to KV-disk (spec vram-budget/03): still here and
+    /// still charged until the file commits, but nobody's victim, never
+    /// restored, never claimed -- the writer is reading their bytes.
+    moving_live: HashSet<RequestId>,
+    moving_retained: HashSet<RetainedBlob>,
 }
 
 impl HostTier {
@@ -356,7 +361,55 @@ impl HostTier {
             interactive_ttl: DEFAULT_RETAINED_INTERACTIVE_TTL,
             used_bytes: 0,
             promoted: HashSet::new(),
+            moving_live: HashSet::new(),
+            moving_retained: HashSet::new(),
         }
+    }
+
+    /// `request`'s snapshot is on its way to KV-disk (spec vram-budget/03):
+    /// out of every ranking and never restored until [`Self::end_move_live`].
+    pub fn begin_move_live(&mut self, request: RequestId) {
+        self.moving_live.insert(request);
+    }
+
+    /// The move of `request`'s snapshot ended, whichever way it went.
+    pub fn end_move_live(&mut self, request: RequestId) {
+        self.moving_live.remove(&request);
+    }
+
+    /// `blob` is on its way to KV-disk: out of every ranking, and not
+    /// claimable, until [`Self::end_move_retained`].
+    pub fn begin_move_retained(&mut self, blob: RetainedBlob) {
+        self.moving_retained.insert(blob);
+    }
+
+    /// The move of `blob` ended, whichever way it went.
+    pub fn end_move_retained(&mut self, blob: RetainedBlob) {
+        self.moving_retained.remove(&blob);
+    }
+
+    /// Whether anything is on its way to KV-disk.
+    pub fn is_moving(&self) -> bool {
+        !self.moving_live.is_empty() || !self.moving_retained.is_empty()
+    }
+
+    /// The live snapshot `request` holds here, if it does.
+    pub fn entry(&self, request: RequestId) -> Option<&HostEntry> {
+        self.probation
+            .iter()
+            .chain(self.protected.iter())
+            .find(|e| e.request == request)
+    }
+
+    /// What making room for a live snapshot would give up first, without
+    /// giving it up: [`Self::evict_for_live`]'s order -- retained state, then
+    /// the lowest live entry -- for a caller that may move it rather than
+    /// discard it (spec vram-budget/03).
+    pub fn peek_for_live(&self, now: Instant) -> Option<KvRamVictim> {
+        if let Some((_, pos)) = self.discardable(now).into_iter().next() {
+            return Some(KvRamVictim::Retained(self.retained[pos].clone()));
+        }
+        self.victim().cloned().map(KvRamVictim::Live)
     }
 
     /// The tier's host-RAM budget, in bytes.
@@ -386,7 +439,12 @@ impl HostTier {
     /// Peeks without removing.
     pub fn victim(&self) -> Option<&HostEntry> {
         let mut selected: Option<&HostEntry> = None;
-        for entry in self.probation.iter().chain(self.protected.iter()) {
+        for entry in self
+            .probation
+            .iter()
+            .chain(self.protected.iter())
+            .filter(|e| !self.moving_live.contains(&e.request))
+        {
             selected = match selected {
                 None => Some(entry),
                 Some(incumbent) if is_better_discard_victim(entry, incumbent) => Some(entry),
@@ -455,6 +513,9 @@ impl HostTier {
 
     /// The retained entry for `checkpoint`, if it is still ranked.
     pub fn retained(&self, blob: RetainedBlob) -> Option<&RetainedKvRamEntry> {
+        if self.moving_retained.contains(&blob) {
+            return None;
+        }
         self.retained
             .iter()
             .find(|e| e.blob == blob && !e.discarded)
@@ -486,7 +547,7 @@ impl HostTier {
             .retained
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.claimants == 0 && !e.discarded)
+            .filter(|(_, e)| e.claimants == 0 && !e.discarded && !self.moving_retained.contains(&e.blob))
             .map(|(pos, e)| (self.retained_rank(e, now), pos))
             .collect();
         ranked.sort();
@@ -524,6 +585,27 @@ impl HostTier {
         let mut victims = Vec::new();
         for (rank, pos) in self.discardable(now) {
             if free >= bytes || rank >= newcomer {
+                break;
+            }
+            free += self.retained[pos].bytes;
+            victims.push(self.retained[pos].blob);
+        }
+        (free >= bytes).then_some(victims)
+    }
+
+    /// Which retained entries to give up so a **live** blob of `bytes` fits,
+    /// lowest rank first, or `None` when even all of them would not make the
+    /// room (spec vram-budget/03). Every retained entry ranks below live work
+    /// (ADR 0023 as amended by 0029), so any of them may go; no live entry
+    /// ever does. Plans only; nothing changes.
+    pub fn plan_live_room(&self, bytes: u64, now: Instant) -> Option<Vec<RetainedBlob>> {
+        if bytes > self.capacity_bytes {
+            return None;
+        }
+        let mut free = self.capacity_bytes - self.used_bytes.min(self.capacity_bytes);
+        let mut victims = Vec::new();
+        for (_, pos) in self.discardable(now) {
+            if free >= bytes {
                 break;
             }
             free += self.retained[pos].bytes;
@@ -600,6 +682,9 @@ impl HostTier {
     /// A request chose `checkpoint` to restore from: hold it until the
     /// restore lands or the request lets go. `false` when it is not held.
     pub fn claim_retained(&mut self, blob: RetainedBlob) -> bool {
+        if self.moving_retained.contains(&blob) {
+            return false;
+        }
         let Some(entry) = self
             .retained
             .iter_mut()

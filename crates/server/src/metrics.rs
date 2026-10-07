@@ -22,6 +22,7 @@ use axum::Router;
 use axum::http::header;
 use axum::routing::get;
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
+use ignis_core::scheduler::{DiskOp, DiskSource};
 use ignis_core::flash_next_counters::{FlashNextCounterSource, FlashNextCounters};
 use ignis_core::ngram_table::NgramCounters;
 use ignis_core::residency::{KClass, Phase, ResidencyCounters};
@@ -61,6 +62,10 @@ pub struct LoadReservations {
     /// memory, beside the plan's lines rather than one of them.
     pub retained_host_slots: u32,
     pub retained_host_bytes: u64,
+    /// The KV-disk tier's effective budget (spec vram-budget/03), or `None`
+    /// on a load without the tier -- which then never renders a disk series,
+    /// as a 27B load never renders the expert residency's.
+    pub kv_disk_bytes: Option<u64>,
     /// Where a Flash-Next load's counters are read (GitHub #301, #302);
     /// `None` on a 27B load. Not a reservation: it rides here to reach the
     /// telemetry consumer, which reads it at every tick
@@ -442,6 +447,14 @@ pub struct Metrics {
     /// What the scheduler has occupied, republished on every tick.
     kv_pool_used_pages: AtomicU64,
     kv_ram_arena_used_bytes: AtomicU64,
+    /// KV-disk (spec vram-budget/03): 1 while the load has the tier, its
+    /// budget and what it holds, its live spills per [`DiskSource`] and its
+    /// failures per [`DiskOp`] (in their declaration order).
+    kv_disk_loaded: AtomicU64,
+    kv_disk_capacity_bytes: AtomicU64,
+    kv_disk_used_bytes: AtomicU64,
+    kv_disk_spills: [AtomicU64; 2],
+    kv_disk_failures: [AtomicU64; 2],
     ttft: Histogram,
     duration: Histogram,
     /// Per [`Primitive::ALL`] (GitHub #241). Absent from the exposition
@@ -602,6 +615,11 @@ impl Metrics {
             kv_ram_arena_capacity_bytes: AtomicU64::new(0),
             kv_pool_used_pages: AtomicU64::new(0),
             kv_ram_arena_used_bytes: AtomicU64::new(0),
+            kv_disk_loaded: AtomicU64::new(0),
+            kv_disk_capacity_bytes: AtomicU64::new(0),
+            kv_disk_used_bytes: AtomicU64::new(0),
+            kv_disk_spills: Default::default(),
+            kv_disk_failures: Default::default(),
             ttft: Histogram::new(&TTFT_BOUNDS_MS),
             duration: Histogram::new(&DURATION_BOUNDS_MS),
             decisions: Default::default(),
@@ -736,6 +754,25 @@ impl Metrics {
         self.kv_ram_evictions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A live snapshot was written to KV-disk from `from` (spec
+    /// vram-budget/03): straight from the device, or demoted from KV-RAM.
+    pub(crate) fn record_kv_disk_spill(&self, from: DiskSource) {
+        let at = match from {
+            DiskSource::Device => 0,
+            DiskSource::KvRam => 1,
+        };
+        self.kv_disk_spills[at].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A KV-disk transfer failed (spec vram-budget/03).
+    pub(crate) fn record_kv_disk_failure(&self, op: DiskOp) {
+        let at = match op {
+            DiskOp::Write => 0,
+            DiskOp::Read => 1,
+        };
+        self.kv_disk_failures[at].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A request's prefill skipped `tokens` through a sibling's prefix.
     pub(crate) fn record_prefix_reused(&self, tokens: u32) {
         self.prefix_reused_tokens.fetch_add(u64::from(tokens), Ordering::Relaxed);
@@ -789,6 +826,7 @@ impl Metrics {
     pub(crate) fn set_occupancy(&self, occupancy: ignis_core::Occupancy) {
         self.kv_pool_used_pages.store(u64::from(occupancy.kv_used_pages), Ordering::Relaxed);
         self.kv_ram_arena_used_bytes.store(occupancy.kv_ram_used_bytes, Ordering::Relaxed);
+        self.kv_disk_used_bytes.store(occupancy.kv_disk_used_bytes, Ordering::Relaxed);
     }
 
     /// What this load reserved (GitHub #216, ADR 0030): written once, by the
@@ -806,6 +844,8 @@ impl Metrics {
         self.retained_slots_capacity.store(u64::from(reserved.retained_slots), Ordering::Relaxed);
         self.retained_host_slots.store(u64::from(reserved.retained_host_slots), Ordering::Relaxed);
         self.retained_host_bytes.store(reserved.retained_host_bytes, Ordering::Relaxed);
+        self.kv_disk_loaded.store(u64::from(reserved.kv_disk_bytes.is_some()), Ordering::Relaxed);
+        self.kv_disk_capacity_bytes.store(reserved.kv_disk_bytes.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// A request's first token came `ms` after its submission.
@@ -957,7 +997,13 @@ impl Metrics {
             ),
         ] {
             declare(&mut out, name, "counter", help);
+            // Spec vram-budget/03: the disk's rows only on a load that has
+            // the tier, as its own families below.
+            let disk = read(&self.kv_disk_loaded) != 0;
             for (source, tier) in ReuseSource::ALL.iter().zip(series) {
+                if *source == ReuseSource::Disk && !disk {
+                    continue;
+                }
                 for (kind, slot) in RetainedKind::ALL.iter().zip(tier) {
                     let _ = writeln!(
                         out,
@@ -1059,6 +1105,37 @@ impl Metrics {
             declare(&mut out, name, "gauge", help);
             let _ = writeln!(out, "{name}{{state=\"capacity\"}} {}", read(capacity));
             let _ = writeln!(out, "{name}{{state=\"{used_state}\"}} {}", read(used));
+        }
+        // KV-disk (spec vram-budget/03, ADR 0045): every series from the
+        // first scrape, zeros included, on a load with the tier -- and none
+        // on a load without it.
+        if read(&self.kv_disk_loaded) != 0 {
+            declare(
+                &mut out,
+                "ignis_kv_disk_bytes",
+                "gauge",
+                "The KV-disk tier: its effective budget, and the bytes its files hold.",
+            );
+            let _ = writeln!(out, "ignis_kv_disk_bytes{{state=\"capacity\"}} {}", read(&self.kv_disk_capacity_bytes));
+            let _ = writeln!(out, "ignis_kv_disk_bytes{{state=\"used\"}} {}", read(&self.kv_disk_used_bytes));
+            declare(
+                &mut out,
+                "ignis_kv_disk_spills_total",
+                "counter",
+                "Live snapshots written to KV-disk, by the tier they came from.",
+            );
+            for (from, series) in [DiskSource::Device, DiskSource::KvRam].iter().zip(&self.kv_disk_spills) {
+                let _ = writeln!(out, "ignis_kv_disk_spills_total{{from=\"{}\"}} {}", from.as_str(), read(series));
+            }
+            declare(
+                &mut out,
+                "ignis_kv_disk_failures_total",
+                "counter",
+                "KV-disk writes refused or failed (nothing lost), and files that failed their check on the way back.",
+            );
+            for (op, series) in [DiskOp::Write, DiskOp::Read].iter().zip(&self.kv_disk_failures) {
+                let _ = writeln!(out, "ignis_kv_disk_failures_total{{op=\"{}\"}} {}", op.as_str(), read(series));
+            }
         }
         declare(
             &mut out,
@@ -1466,6 +1543,81 @@ mod tests {
         assert_eq!(value(&text, "ignis_speculative_position_drafted_total", "position=\"3\""), "2");
     }
 
+    /// A load's reservations with nothing in them but KV-disk's budget.
+    fn with_disk(kv_disk_bytes: Option<u64>) -> LoadReservations {
+        LoadReservations {
+            lines: ignis_core::VramLines::default(),
+            budget_bytes: 0,
+            kv_pool_pages: 0,
+            kv_page_bytes: 0,
+            residency_bytes: 0,
+            expert_cache_bytes: 0,
+            kv_ram_arena_bytes: 0,
+            retained_slots: 0,
+            retained_host_slots: 0,
+            retained_host_bytes: 0,
+            kv_disk_bytes,
+            flash_next: None,
+        }
+    }
+
+    /// Spec vram-budget/03 AC 38: on a load with KV-disk, its three families
+    /// and the retained families' `tier="disk"` rows render from the first
+    /// scrape, zeros included; on a load without it, none of them ever does.
+    #[test]
+    fn the_disk_tier_renders_from_the_first_scrape_only_on_a_load_that_has_it() {
+        let without = Metrics::new();
+        without.set_load_reservations(with_disk(None));
+        let text = without.render();
+        assert!(!text.contains("ignis_kv_disk_"), "{text}");
+        assert!(!text.contains("tier=\"disk\""), "{text}");
+
+        let with = Metrics::new();
+        with.set_load_reservations(with_disk(Some(16 << 30)));
+        let text = with.render();
+        declared_once(
+            &text,
+            &[
+                ("ignis_kv_disk_bytes", "gauge"),
+                ("ignis_kv_disk_spills_total", "counter"),
+                ("ignis_kv_disk_failures_total", "counter"),
+            ],
+        );
+        assert_eq!(value(&text, "ignis_kv_disk_bytes", "state=\"capacity\""), "17179869184");
+        assert_eq!(value(&text, "ignis_kv_disk_bytes", "state=\"used\""), "0");
+        for from in ["device", "kv_ram"] {
+            assert_eq!(value(&text, "ignis_kv_disk_spills_total", &format!("from=\"{from}\"")), "0");
+        }
+        for op in ["write", "read"] {
+            assert_eq!(value(&text, "ignis_kv_disk_failures_total", &format!("op=\"{op}\"")), "0");
+        }
+        for name in [
+            "ignis_retained_reused_tokens_total",
+            "ignis_retained_state_hits_total",
+            "ignis_retained_state_misses_total",
+            "ignis_retained_state_spills_total",
+            "ignis_retained_state_discards_total",
+            "ignis_retained_state_restores_total",
+        ] {
+            for kind in ["checkpoint", "prefix"] {
+                assert_eq!(value(&text, name, &format!("tier=\"disk\",kind=\"{kind}\"")), "0", "{name}");
+            }
+        }
+
+        with.record_retained_state(RetainedStateOperation::Spill, ReuseSource::Disk, RetainedKind::Checkpoint);
+        with.record_retained_reused(ReuseSource::Disk, RetainedKind::Checkpoint, 9000);
+        with.set_occupancy(ignis_core::Occupancy {
+            kv_used_pages: 0,
+            kv_pool_pages: 0,
+            kv_ram_used_bytes: 0,
+            kv_disk_used_bytes: 5 << 30,
+        });
+        let text = with.render();
+        assert_eq!(value(&text, "ignis_retained_state_spills_total", "tier=\"disk\",kind=\"checkpoint\""), "1");
+        assert_eq!(value(&text, "ignis_retained_reused_tokens_total", "tier=\"disk\",kind=\"checkpoint\""), "9000");
+        assert_eq!(value(&text, "ignis_kv_disk_bytes", "state=\"used\""), "5368709120");
+    }
+
     #[test]
     fn the_forced_close_counter_is_absent_until_a_close_is_forced() {
         let metrics = Metrics::new();
@@ -1735,6 +1887,7 @@ mod tests {
             retained_slots: 9,
             retained_host_slots: 7,
             retained_host_bytes: 7 * 232_532_224,
+            kv_disk_bytes: None,
             flash_next: None,
         });
 
@@ -1780,7 +1933,8 @@ mod tests {
             kv_used_pages: 412,
             kv_pool_pages: 1_000,
             kv_ram_used_bytes: 3 << 30,
-        });
+                kv_disk_used_bytes: 0,
+});
         metrics.set_retained_slots_in_use(4);
         metrics.record_retained_slot_skip(RetainedSkip::PublishNoSlot);
         metrics.record_retained_slot_skip(RetainedSkip::CaptureNoPage);

@@ -157,6 +157,15 @@ pub struct Request {
     /// discards it: it is the only copy of the state the request's first job
     /// is about to be built on.
     pub kv_ram_claim: Option<crate::checkpoint::CheckpointId>,
+    /// The KV-disk checkpoint this request chose and whose restore has not
+    /// landed (spec vram-budget/03): held on the disk ledger, as
+    /// [`Request::kv_ram_claim`] is in KV-RAM.
+    pub disk_claim: Option<crate::checkpoint::CheckpointId>,
+    /// Whether this request's state is moving to or from KV-disk right now
+    /// (spec vram-budget/03): a spill holding its pages until the file
+    /// commits, or a restore charged and not yet landed. Such a request is
+    /// in no prefill batch and no decode round, and nobody's victim.
+    pub moving: bool,
     /// Leading prompt tokens this request's sequence holds as its own pages
     /// because they were restored from a **materialized** blob rather than
     /// prefilled or shared (GitHub #190): a KV-RAM checkpoint, or a snapshot
@@ -255,6 +264,8 @@ impl Request {
             pending_retained_misses: crate::checkpoint::TierSet::default(),
             reuse_key_cache: crate::identity::KeyCache::default(),
             kv_ram_claim: None,
+            disk_claim: None,
+            moving: false,
             standalone_tokens: 0,
             publish_tokens: 0,
             link_at_capture: false,
@@ -713,6 +724,7 @@ impl Request {
         // GitHub #190: so is whatever a materialized blob restored — the
         // caller released the KV-RAM claim, and the sequence is gone.
         self.kv_ram_claim = None;
+        self.disk_claim = None;
         self.standalone_tokens = 0;
         // GitHub #306: and with the sequence went its loan; the fresh one
         // lends nothing.

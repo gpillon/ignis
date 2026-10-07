@@ -532,6 +532,7 @@ pub fn cuda_scheduler_with_thinking_close(
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
         retained_host_bytes: reservations.retained_host_bytes,
+        kv_disk_bytes: None,
         flash_next: None,
     };
     Ok((sched, reserved))
@@ -783,6 +784,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
         retained_host_bytes: pool_plan.retained_host_bytes,
+        kv_disk_bytes: None,
         flash_next: Some(counters),
     };
     Ok((sched, reserved))
