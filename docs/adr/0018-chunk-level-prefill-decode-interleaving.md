@@ -142,7 +142,12 @@ at 1.0-1.1 tok/s while a 34K prompt prefilled.
   chunk either: the hold is between chunks of the same prompt, so a newcomer
   queued behind it is not made to wait for lanes that already had their turn. The family default was 0 on the 27B (this
   ADR's K = 1) and 50 on Flash-Next; since #92 (2026-10-07) it is 50 on the
-  27B too, and `--decode-share 0` is this ADR's K = 1.
+  27B too, and by owner decision the same day it became **25 on both**: a
+  reader reads ~5-8 tok/s, so at 25 the decoding lanes stay fluent
+  (15.6-18.3 tok/s below) while a long prompt's TTFT under load grows ~x1.33
+  instead of ~x2 at 50. The total work is the same at any share, only who
+  waits changes, and a prompt alone is unaffected. `--decode-share 0` is this
+  ADR's K = 1; 50 splits time evenly.
 - **The Consequences above still hold for the gap.** The share moves the
   lanes' rate during a prefill, not the longest gap: that remains one chunk's
   wall time, and only the chunk width moves it.

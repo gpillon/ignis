@@ -913,25 +913,24 @@ mod tests {
     #[test]
     fn a_flash_next_load_takes_its_family_decode_share_unless_one_is_named() {
         // GitHub #306: a Flash-Next chunk runs for seconds, the 27B's for
-        // ~110 ms (ADR 0018); since #92 both default to half.
+        // ~110 ms (ADR 0018); since #92 both default to a quarter (owner decision 2026-10-07).
         use ignis_core::compute::ModelFamily;
         let unnamed = EngineShape::default();
         let flash = unnamed.for_family(ModelFamily::FlashNext);
-        assert_eq!(flash.decode_share_percent, Some(ModelFamily::FlashNext.default_decode_share_percent()));
-        assert!(ModelFamily::FlashNext.default_decode_share_percent() > 0);
-        // Owner decision after #92: the 27B keeps half its time for decoding
-        // lanes too (two lanes decode 8.9 -> 28.5 tok/s under a 32.7K prefill).
-        assert_eq!(ModelFamily::Qwen38_27b.default_decode_share_percent(), 50);
+        // Owner decision 2026-10-07 (ADR 0018's amendment): a quarter on both.
+        assert_eq!(ModelFamily::FlashNext.default_decode_share_percent(), 25);
+        assert_eq!(ModelFamily::Qwen38_27b.default_decode_share_percent(), 25);
+        assert_eq!(flash.decode_share_percent, Some(25));
         let on_27b = unnamed.with_family_decode_share(ModelFamily::Qwen38_27b);
-        assert_eq!(on_27b.decode_share_percent, Some(50), "the 27B's load reads its family's share too");
+        assert_eq!(on_27b.decode_share_percent, Some(25), "the 27B's load reads its family's share too");
         let zero_27b = EngineShape { decode_share_percent: Some(0), ..unnamed };
         assert_eq!(
             zero_27b.with_family_decode_share(ModelFamily::Qwen38_27b).decode_share_percent,
             Some(0),
             "--decode-share 0 restores one round per chunk"
         );
-        let named_27b = EngineShape { decode_share_percent: Some(30), ..unnamed };
-        assert_eq!(named_27b.with_family_decode_share(ModelFamily::Qwen38_27b).decode_share_percent, Some(30));
+        let named_27b = EngineShape { decode_share_percent: Some(50), ..unnamed };
+        assert_eq!(named_27b.with_family_decode_share(ModelFamily::Qwen38_27b).decode_share_percent, Some(50));
         let off = EngineShape { prompt_reuse: false, ..unnamed };
         assert_eq!(off.for_family(ModelFamily::FlashNext).decode_share_percent, flash.decode_share_percent);
         let named = EngineShape { decode_share_percent: Some(0), ..unnamed };

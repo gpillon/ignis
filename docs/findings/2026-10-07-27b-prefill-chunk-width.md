@@ -97,7 +97,8 @@ prompt; times in s and ms):
 **The decode share on the 27B.**
 - The 27B has `--decode-share` (#306); `ModelFamily::default_decode_share_percent`
   was 0 for it (ADR 0018's one decode round per chunk); the owner made it 50
-  after this measurement, and `--decode-share 0` restores 0.
+  after this measurement, then 25 on both models by owner decision 2026-10-07
+  (a reader reads ~5-8 tok/s), and `--decode-share 0` restores 0.
 - After a chunk that took `t`, a share `s` holds the next chunk until the
   decoding lanes have had `t * s / (1 - s)`, and only while a lane decodes
   (`hold_prefill`, `crates/core/src/concrete.rs`).

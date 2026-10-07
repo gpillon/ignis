@@ -786,14 +786,15 @@ impl ModelFamily {
 
     /// The percent of the model's time decoding lanes keep while a prompt
     /// prefills, unless the operator names one (`--decode-share`, GitHub
-    /// #306): half on both. On the 27B a ~110 ms chunk used to take one
-    /// round's turn (ADR 0018, `--decode-share 0` still does); measured in
-    /// #92 with two lanes decoding under a 32.7K prefill, half lifts them
-    /// from 8.9 to 28.5 tok/s for a long prompt's TTFT about doubling. On
-    /// Flash-Next an 8192-token chunk runs ~7 s.
+    /// #306): a quarter on both. A reader reads ~5-8 tok/s, so the decoding
+    /// lanes stay fluent (Flash-Next measured 15.6-18.3 tok/s per lane during
+    /// a 34K prefill) while a long prompt's TTFT under load grows ~x1.33
+    /// instead of ~x2 at 50. The total work is the same at any share; only
+    /// who waits changes, and a prompt alone is unaffected. `--decode-share 0`
+    /// is one decode round per chunk (ADR 0018); 50 splits time evenly.
     pub fn default_decode_share_percent(self) -> u32 {
         match self {
-            ModelFamily::Qwen38_27b | ModelFamily::FlashNext => 50,
+            ModelFamily::Qwen38_27b | ModelFamily::FlashNext => 25,
         }
     }
 

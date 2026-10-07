@@ -77,7 +77,7 @@ The [2026-10-06 finding](2026-10-06-flash-next-on-the-5090.md) measured an 8K TT
 **The decode share** (52a9990, `--decode-share`):
 - After a chunk that took `t`, the scheduler holds the next one until the decoding lanes have had `t * s / (1 - s)` of wall time.
 - It holds nothing when no lane decodes.
-- The defaults were 50 on Flash-Next and 0 on the 27B (the 27B went to 50 after #92).
+- The defaults were 50 on Flash-Next and 0 on the 27B (the 27B went to 50 after #92). The default then became 25 on both models, by owner decision 2026-10-07.
 
 **Stall A/B**:
 - Setup: one load per cell, `make config`'s flags plus the cell's `--decode-share` / `--prefill-chunk`. Two lanes stream long generations of short prompts. Once both decode, a third lane sends a distinct 34K prompt (33,966 tokens served) with `max_tokens` 8. Two reps per cell, plus the prompt alone first.
@@ -88,7 +88,7 @@ The [2026-10-06 finding](2026-10-06-flash-next-on-the-5090.md) measured an 8K TT
 |---|---:|---:|---:|---:|---:|
 | 0 / 8192 (before) | 15.4 s | 15.2-15.3 s | **1.0-1.1** (62-69) | 15-17 | 3.2-3.4 s |
 | 25 / 8192 | 15.2 s | 19.4-20.2 s | 15.6-18.3 (65-67) | 303-370 | 3.2 s |
-| **50 / 8192 (default)** | 15.7 s | **30.1-31.6 s** | **30.8-32.6** (60-69) | 974-982 | 3.2 s |
+| **50 / 8192** | 15.7 s | **30.1-31.6 s** | **30.8-32.6** (60-69) | 974-982 | 3.2 s |
 | 0 / 2048 | 28.7 s | 28.3-28.6 s | 1.0-1.1 (69-70) | 29-30 | 1.7 s |
 
 - Every cell had a 2,053,174,464-byte KV pool. The decode share takes no VRAM.
@@ -121,7 +121,7 @@ Inferred:
 
 - **Why the 2026-10-06 8K TTFT was 6.9-8.5 s.** The drop to ~4.3 s is observed; its cause is not bisected. The candidates are the fixes in between: the hyper-connection mix, and the n-gram reads that the artifact's memory map serialized ([decode round finding](2026-10-06-flash-next-decode-round.md)).
 - **Item 5's reused turn.** Its 1.1K-token tail (2.45 s) plausibly pays the same copy-bound cost as the 536-token tail here. Not measured on that turn.
-- **Choosing the default.** A long prefill and the decoding lanes share one card, so any share moves time from one to the other. 50% halves the lanes' rate rather than stopping them, and doubles the TTFT at worst, and only while lanes decode. With the agents' short tool-call generations, the decoding agents finish sooner. The prefilling agent finishes no later than the sum of the two jobs' work.
+- **Choosing the default.** (Written when the default was 50; it became 25 on both models by owner decision 2026-10-07: a reader reads ~5-8 tok/s, and 25 keeps the lanes at 15.6-18.3 tok/s for a TTFT of x1.33 instead of x2.) A long prefill and the decoding lanes share one card, so any share moves time from one to the other. 50% halves the lanes' rate rather than stopping them, and doubles the TTFT at worst, and only while lanes decode. With the agents' short tool-call generations, the decoding agents finish sooner. The prefilling agent finishes no later than the sum of the two jobs' work.
 - **TTFT at 16 readers.** Each 8192 chunk should lose ~0.9 s of gather, so 34K should land near ~11.5 s. Not measured.
 
 ## Implications
@@ -145,7 +145,7 @@ Inferred:
 - **Per-chunk bytes** come from a window delta split by copy time, not from a per-chunk counter.
 - **Not measured at 16 reader threads:** the 34K TTFT, and decode at more than one lane.
 - **The hold follows every chunk, a request's last one included.** That request is a decoding lane from then on, so a newcomer's first chunk queued behind a long prompt can wait up to `t * s / (1 - s)` while only that one lane decodes. This is the case an agent swarm hits at every turn boundary; it was not measured.
-- **The gap at share > 0** is one chunk's wall time in every cell. The 25% and 50% defaults were compared on one scenario: two lanes decoding throughout one long prompt.
+- **The gap at share > 0** is one chunk's wall time in every cell. The 25% and 50% candidate defaults were compared on one scenario: two lanes decoding throughout one long prompt.
 
 ## Follow-ups
 

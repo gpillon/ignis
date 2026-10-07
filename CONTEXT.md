@@ -459,9 +459,10 @@ When output names a domain concept, use the term as defined here.
   has passed with the lanes decoding; with no lane decoding it runs at once, and
   after a prompt's last chunk nothing waits, so a newcomer queued behind it
   starts at once. 0 is one decode round per chunk (ADR 0018); both models
-  default to 50 (GitHub #306 for Flash-Next, whose chunk runs for seconds;
-  GitHub #92 for the 27B). It bounds the lanes' rate during a prefill, not the
-  gap a single chunk leaves: only the chunk width moves that.
+  default to 25 (GitHub #306 for Flash-Next, whose chunk runs for seconds;
+  GitHub #92 for the 27B; why 25: ADR 0018's amendment). It bounds the
+  lanes' rate during a prefill, not the gap a single chunk leaves: only the
+  chunk width moves that.
 - **True prefill/decode overlap** — prefill and decode resident on the GPU at
   the same time, on separate streams, contending for SMs. Distinct from
   **prefill/decode interleaving** and deliberately not built: the north-star

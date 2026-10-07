@@ -51,7 +51,7 @@ ifeq ($(MODEL_FAMILY),flash-next)
   ROPE_SCALING ?= none
   PREFILL_CHUNK ?= 8192
   # The part of the model's time decoding lanes keep while a prompt prefills
-  # (--decode-share, percent, 0-99). Empty = the server's: 50 on both models (0 = one decode round per chunk).
+  # (--decode-share, percent, 0-99). Empty = the server's: 25 on both models (0 = one decode round per chunk).
   DECODE_SHARE ?=
   SPEC ?=
   DRAFT_TOKENS ?=

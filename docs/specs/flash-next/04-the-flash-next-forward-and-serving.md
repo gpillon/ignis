@@ -45,8 +45,8 @@ GitHub, not open questions.
 - **Defaults:** 3 lanes (`--decode-lanes`, 1..8); KV hq-e8-2b; 262,144 tokens of context per lane (the checkpoint's trained positions; owner decision 2026-10-07, GitHub #306); prefill
   chunk 8192; prefetch width 16, 10 for a prefill chunk (GitHub #306: the router's
   top-k); n-gram hot rows 1 GB (`--ngram-hot-bytes`: a size, or `auto`, see
-  below; GitHub #306); decode share 50%
-  (GitHub #306: decoding lanes keep half the time while a prompt prefills).
+  below; GitHub #306); decode share 25%
+  (GitHub #306: decoding lanes keep a quarter of the time while a prompt prefills; 50% at first, 25% by owner decision 2026-10-07).
 - The 8192-token KLD bound is 1.25× the 2048-token one.
 - The math of QSA, the indexer, the hyper-connections and the n-gram embedding is
   the transformers modeling code the study ran (installed in

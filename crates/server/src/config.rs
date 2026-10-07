@@ -1446,7 +1446,7 @@ fn help_text() -> String {
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --thinking-budget <n|off> env: IGNIS_THINKING_BUDGET  (default: {DEFAULT_THINKING_BUDGET}; reasoning tokens before the model's close is forced, off = no budget; a request's thinking_budget overrides it, 0 = none)\n\
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
-         \x20       --decode-share <percent>  env: IGNIS_DECODE_SHARE   (default: the model's, 50 on both models; 0 is one round per chunk; the percent of the time decoding lanes keep while a prompt prefills, 0-99)\n\
+         \x20       --decode-share <percent>  env: IGNIS_DECODE_SHARE   (default: the model's, 25 on both models; 0 is one round per chunk, 50 splits time evenly; the percent of the time decoding lanes keep while a prompt prefills, 0-99)\n\
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
          \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: the rest of the VRAM budget; accepts a K/M/G suffix)\n\
