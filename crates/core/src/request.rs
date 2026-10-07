@@ -148,6 +148,10 @@ pub struct Request {
     /// #190), reported when its first chunk lands. A request waiting for room
     /// looks again on every tick, so the lookup is not the place to count it.
     pub pending_retained_misses: crate::checkpoint::TierSet,
+    /// The match-key walk of this request's prompt, kept across ticks so a
+    /// request waiting for room or prefilling with nothing to claim does not
+    /// key its prompt again on every advance (GitHub #200).
+    pub reuse_key_cache: crate::identity::KeyCache,
     /// The KV-RAM checkpoint this request chose and has not yet restored from
     /// (GitHub #190). While set, the blob is claimed in KV-RAM and nothing
     /// discards it: it is the only copy of the state the request's first job
@@ -233,6 +237,7 @@ impl Request {
             reuse_source: None,
             checkpoint_captured: false,
             pending_retained_misses: crate::checkpoint::TierSet::default(),
+            reuse_key_cache: crate::identity::KeyCache::default(),
             kv_ram_claim: None,
             standalone_tokens: 0,
             publish_tokens: 0,

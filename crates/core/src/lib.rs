@@ -99,7 +99,7 @@ pub use concrete::{
 };
 pub use host::{HostEntry, HostError, HostTier, KvRamVictim, RetainedKvRamEntry, Tier};
 pub use identity::{
-    ArtifactHash, BlobHeader, BlobIdentity, IdentityField, IdentityMismatch, MATCH_KEY_VERSION,
+    ArtifactHash, BlobHeader, BlobIdentity, IdentityField, IdentityMismatch, KeyCache, MATCH_KEY_VERSION,
     MatchKey, MatchKeyChain, MediaKey, PromptContent, PromptKeys,
 };
 pub use kv_format::{

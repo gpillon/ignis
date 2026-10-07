@@ -497,6 +497,50 @@ impl<'a> PromptContent<'a> {
         }
     }
 
+    /// [`PromptContent::keys_for`] that remembers its walk in `cache`
+    /// (GitHub #200): a request that asks again on a later tick, with the
+    /// same or a few more lengths, walks only the prompt past what an
+    /// earlier call reached — nothing at all when every length was answered.
+    ///
+    /// The answer is `keys_for`'s, always. A length below the walk's reach
+    /// that was never answered (an entry shorter than any asked before)
+    /// cannot be had from a chain already past it, so the cache starts over
+    /// for that call.
+    pub fn keys_for_cached(&self, lengths: impl IntoIterator<Item = u32>, cache: &mut KeyCache) -> PromptKeys {
+        let mut lengths: Vec<u32> = lengths.into_iter().filter(|&at| at <= self.tokens()).collect();
+        lengths.sort_unstable();
+        lengths.dedup();
+        if cache.head != self.tokens() {
+            *cache = KeyCache { head: self.tokens(), ..KeyCache::default() };
+        }
+        let answered = |cache: &KeyCache, at: u32| {
+            cache.answered.binary_search_by_key(&at, |&(length, _)| length).ok()
+        };
+        if lengths.iter().any(|&at| at < cache.chain.tokens() && answered(cache, at).is_none()) {
+            *cache = KeyCache { head: self.tokens(), ..KeyCache::default() };
+        }
+        for &at in &lengths {
+            if answered(cache, at).is_some() {
+                continue;
+            }
+            for pos in cache.chain.tokens()..at {
+                while cache.item < self.media.len() && self.media[cache.item].begin == pos {
+                    cache.chain.push_media(&self.media[cache.item]);
+                    cache.item += 1;
+                }
+                cache.chain.push_token(self.tokens[pos as usize]);
+            }
+            cache.answered.push((at, cache.chain.key()));
+        }
+        PromptKeys {
+            tokens: self.tokens(),
+            keys: lengths
+                .into_iter()
+                .map(|at| (at, cache.answered[answered(cache, at).expect("answered above")].1))
+                .collect(),
+        }
+    }
+
     /// Whether a prefix of `at` tokens would end **inside** a media item's
     /// placeholder span.
     ///
@@ -509,6 +553,27 @@ impl<'a> PromptContent<'a> {
         self.media
             .iter()
             .any(|m| m.begin < at && at < m.begin + m.count)
+    }
+}
+
+/// One request's remembered key walk ([`PromptContent::keys_for_cached`],
+/// GitHub #200): the chain at the furthest length reached and the keys
+/// already answered along the way. Bound to one prompt head; asked about a
+/// head of another length it starts over.
+#[derive(Debug, Clone, Default)]
+pub struct KeyCache {
+    head: u32,
+    chain: MatchKeyChain,
+    /// Media items already absorbed into `chain`.
+    item: usize,
+    /// Ascending by length; every length is at most `chain.tokens()`.
+    answered: Vec<(u32, MatchKey)>,
+}
+
+impl KeyCache {
+    /// Prompt tokens the chain has absorbed so far — what a walk has cost.
+    pub fn walked(&self) -> u32 {
+        self.chain.tokens()
     }
 }
 
@@ -949,5 +1014,30 @@ mod tests {
         assert_eq!(BlobIdentity::UNSET.accepts(&BlobIdentity::UNSET), Ok(()));
         assert!(BlobIdentity::UNSET.accepts(&identity()).is_err());
         assert!(identity().accepts(&BlobIdentity::UNSET).is_err());
+    }
+
+    /// GitHub #200: the cached walk answers what `keys_for` answers, and a
+    /// repeat tick walks nothing.
+    #[test]
+    fn a_cached_key_walk_answers_keys_for_and_does_not_repeat() {
+        let tokens: Vec<TokenId> = (0..400).collect();
+        let items = [media(100, 20, 7)];
+        let prompt = PromptContent::new(&tokens, &items);
+        let mut cache = KeyCache::default();
+        let first = prompt.keys_for_cached([64, 128, 300], &mut cache);
+        assert_eq!(first, prompt.keys_for([64, 128, 300]));
+        assert_eq!(cache.walked(), 300);
+        // The same lengths on a later tick: no token is absorbed again.
+        assert_eq!(prompt.keys_for_cached([300, 64, 128], &mut cache), first);
+        assert_eq!(cache.walked(), 300);
+        // A longer entry walks only past the reach; a shorter new one starts over.
+        assert_eq!(prompt.keys_for_cached([64, 350], &mut cache), prompt.keys_for([64, 350]));
+        assert_eq!(cache.walked(), 350);
+        assert_eq!(prompt.keys_for_cached([10, 350], &mut cache), prompt.keys_for([10, 350]));
+        // Lengths past the prompt are dropped, as in `keys_for`.
+        assert_eq!(prompt.keys_for_cached([64, 999], &mut cache), prompt.keys_for([64, 999]));
+        // A head of another length is another prompt to the cache.
+        let head = prompt.head(200);
+        assert_eq!(head.keys_for_cached([64, 150], &mut cache), head.keys_for([64, 150]));
     }
 }
