@@ -450,6 +450,17 @@ pub trait StepLeaf: Send + Sync + 'static {
     ) -> Result<Self::Checkpoint, i32> {
         Err(-1)
     }
+    /// The whole pages `sequence` lent to a pages-only link at the capture
+    /// that took `checkpoint` (GitHub #306) -- the pages the checkpoint stands
+    /// on past those the sequence shares -- or 0 for one standing on a prefix.
+    /// What the scheduler checks the charge it moves against.
+    fn checkpoint_lent_pages(
+        &self,
+        _sequence: &Self::Sequence,
+        _checkpoint: &Self::Checkpoint,
+    ) -> u32 {
+        0
+    }
     /// Allocate one sequence that **claims `checkpoint`**: the whole pages
     /// below the opener are shared in place, the mutable state and the
     /// partial tail page are copied device-to-device, and the sequence stands
@@ -1365,6 +1376,8 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             ) {
                 Ok(checkpoint) => {
                     outcomes[index].checkpoint_captured = true;
+                    outcomes[index].checkpoint_lent_pages =
+                        self.model.leaf.checkpoint_lent_pages(&sequence.handle, &checkpoint);
                     if let Some(stale) = checkpoints.insert(request, checkpoint) {
                         // Unreachable: the scheduler captures at most one
                         // checkpoint per request. Released rather than

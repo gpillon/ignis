@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use ignis_core::checkpoint::ReuseSource;
-use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
+use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, ReuseBoundary, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
 const MODEL: &str = "qwen3.8-flash-next";
@@ -296,6 +296,131 @@ fn a_block_on_the_opener_s_floor_is_what_the_capture_stands_on() {
     assert_eq!(sched.checkpoint_pool().entry_count(), 1);
     assert_eq!(sched.prefix_pinned_pages(), 2, "one retained prefix and no link");
     assert_eq!(sched.retained_slots_in_use(), 2, "the block's image and the checkpoint's");
+}
+
+#[test]
+fn a_lender_publishes_nothing_past_its_opener() {
+    // A reuse boundary past the opener: after the capture the sequence is the
+    // link's lender, and the leaf refuses it a publish (`seq_prefix.cu`, a
+    // second owner for the lent pages) -- which the backend would turn into a
+    // failed batch. So the boundary is not cut, and nothing is published there.
+    // (An 8-token serving chunk keeps the boundary out of the opener's chunk.)
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            serving_chunk_tokens: 8,
+            ..config()
+        },
+        compute.clone(),
+    );
+    let n = sched
+        .submit(
+            RequestInput {
+                reuse_boundaries: vec![ReuseBoundary::retained(52)],
+                ..input(tokens(1, 60), Some(37), 4)
+            },
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+    let jobs: Vec<(u32, Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == n)
+        .map(|j| {
+            let end = j.start_position + j.tokens.len() as u32;
+            (end, j.publish_prefix.map(|p| p.tokens), j.capture_checkpoint.map(|c| c.tokens))
+        })
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![
+            (8, None, None),
+            (16, None, None),
+            (24, None, None),
+            (32, None, None),
+            (37, None, Some(37)),
+            (45, None, None),
+            (53, None, None),
+            (60, None, None),
+        ],
+        "the capture lends, and the boundary at 48 past it is neither cut nor published"
+    );
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+}
+
+// ── A leaf that lent more than this scheduler moves ─────────────────────
+//
+// The leaf decides on its own view of the sequence whether a capture lends
+// (`seq_checkpoint.cu`), the scheduler on its own whether to move the charge
+// (`register_link`). Pages the leaf lent and the scheduler did not move would
+// outlive the request in the leaf and go back to the pool in the ledger, and
+// admission would over-commit. So a capture whose backend reports such a loan
+// is released, not retained: once the lender goes, the link goes with it and
+// every page is back where the ledger says it is.
+
+#[test]
+fn a_27b_capture_that_lent_is_released() {
+    // The 27B moves nothing at a capture: it published the opener's floor.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            opener_page_rides_capture: false,
+            ..config()
+        },
+        compute.clone(),
+    );
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    compute.lend_at_capture(n, 1);
+    let events = run_to_idle(&mut sched);
+    assert_eq!(chunk_widths(&compute, n), vec![32, 5, 3], "the 27B's cuts: the floor, then the opener");
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0, "nothing retained");
+    assert_eq!(compute.released_checkpoints(), vec![n], "the backend's checkpoint released");
+    assert_eq!(sched.retained_slots_in_use(), 0, "its slot given back");
+    assert_eq!(sched.kv_used_pages(), 0, "and every page back in the ledger");
+    assert!(
+        events.iter().any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == n)),
+        "the request completed normally"
+    );
+}
+
+#[test]
+fn a_link_the_leaf_made_longer_than_the_scheduler_s_is_released() {
+    // Standing on the block's one-page prefix, the scheduler moves the one
+    // page between it and the opener's floor; a leaf that lent two stood on
+    // less than the scheduler thinks.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+    let n = sched
+        .submit(
+            RequestInput {
+                system_block_tokens: Some(20),
+                ..turn_n()
+            },
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    compute.lend_at_capture(n, 2);
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0, "nothing retained");
+    assert_eq!(compute.released_checkpoints(), vec![n]);
+    assert_eq!(sched.prefix_pinned_pages(), 1, "the block's retained prefix and no link");
+    assert_eq!(sched.kv_used_pages(), 1, "its one page, and nothing of the capture's");
+    assert_eq!(sched.retained_slots_in_use(), 1, "the block's image alone");
+}
+
+#[test]
+fn a_loan_the_scheduler_moved_is_retained() {
+    // The control: a loan of exactly the pages the scheduler moves.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    compute.lend_at_capture(n, 2);
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+    assert!(compute.released_checkpoints().is_empty());
+    assert_eq!(sched.prefix_pinned_pages(), 2, "the link");
 }
 
 #[test]

@@ -265,6 +265,12 @@ pub struct PrefillOutcome {
     /// only on `true`, and gives the slot back on `false`, so its ledger and
     /// the device never disagree about what exists.
     pub checkpoint_captured: bool,
+    /// The whole pages below the opener that capture lent to a pages-only
+    /// link (GitHub #306, ADR 0029 as amended 2026-10-07), as the leaf
+    /// counts them: 0 for a capture standing on a prefix. The scheduler
+    /// releases a checkpoint whose loan is larger than the charge it moves to
+    /// the link, so the ledger never frees pages the leaf still holds.
+    pub checkpoint_lent_pages: u32,
     /// The **readout** this job asked for (GitHub #237, ADR 0034), if it
     /// asked for one: the logits of its [`PrefillJob::readout`] answer
     /// tokens at the chunk's last position, the full-vocabulary log-sum-exp

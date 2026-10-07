@@ -104,6 +104,21 @@ template <typename Work> double timed(Work &&work) {
   return elapsed.count();
 }
 
+// GitHub #306: whether `prefix` is a pages-only link still on loan, refused by
+// `who` -- the entry points below that take a publish handle. A link has none:
+// its `kv` is empty until its lender is released, and every reference to it is
+// its lender's, its checkpoint's or a claimant's, so a release would drop one
+// of theirs.
+bool refuses_a_link_on_loan(const ignis_seq_prefix &prefix, const char *who) {
+  if (prefix.lender == nullptr) {
+    return false;
+  }
+  ignis_seq_set_last_error(std::string(who) + ": the prefix is a pages-only link on loan from sequence slot " +
+                           std::to_string(prefix.lender->slot) +
+                           ", which has no handle; it goes with its last holder");
+  return true;
+}
+
 } // namespace
 
 void ignis_seq_settle_loan(ignis_seq &seq) {
@@ -404,6 +419,9 @@ extern "C" void ignis_seq_prefix_release(struct ignis_seq_pool *pool,
   // it earns it here: a handle returned against one pool and released against
   // another is a caller mistake that would otherwise free pages out of a pool
   // that never lent them.
+  if (prefix != nullptr && refuses_a_link_on_loan(*prefix, "ignis_seq_prefix_release")) {
+    return;
+  }
   if (pool != nullptr && prefix != nullptr && !prefix->kv.belongs_to(pool->kv_pool)) {
     ignis_seq_set_last_error("ignis_seq_prefix_release: the prefix was not published from this "
                              "pool; nothing was released");
@@ -429,6 +447,9 @@ extern "C" int32_t ignis_seq_prefix_snapshot_size(const struct ignis_seq_pool *p
     ignis_seq_set_last_error("ignis_seq_prefix_snapshot_size: null argument");
     return -1;
   }
+  if (refuses_a_link_on_loan(*prefix, "ignis_seq_prefix_snapshot_size")) {
+    return -1;
+  }
   if (!prefix->kv.valid() || !prefix->kv.belongs_to(pool->kv_pool)) {
     ignis_seq_set_last_error(
         "ignis_seq_prefix_snapshot_size: the prefix was not published from this pool");
@@ -448,6 +469,9 @@ extern "C" int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
                                               uint64_t dst_bytes) {
   if (pool == nullptr || prefix == nullptr || dst == nullptr) {
     ignis_seq_set_last_error("ignis_seq_prefix_snapshot: null argument");
+    return -1;
+  }
+  if (refuses_a_link_on_loan(*prefix, "ignis_seq_prefix_snapshot")) {
     return -1;
   }
   if (!prefix->kv.valid() || !prefix->kv.belongs_to(pool->kv_pool)) {
@@ -474,6 +498,9 @@ extern "C" int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
 extern "C" int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
                                            struct ignis_seq_prefix_stats *out_stats) {
   if (prefix == nullptr || out_stats == nullptr) {
+    return -1;
+  }
+  if (refuses_a_link_on_loan(*prefix, "ignis_seq_prefix_stats")) {
     return -1;
   }
   out_stats->tokens = prefix->tokens;

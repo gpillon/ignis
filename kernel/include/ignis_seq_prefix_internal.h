@@ -89,7 +89,9 @@ struct ignis_seq_prefix {
    * the capturing sequence that owns them, and their physical ids -- its first
    * own pages. The capture moves nothing, so it cannot fail half-way; the
    * lender hands them over (`kv` takes them) when it is released
-   * (ignis_seq_settle_loan), and both are empty from then on. */
+   * (ignis_seq_settle_loan), and both are empty from then on. Until then
+   * the entry points that take a publish handle -- release, snapshot, stats --
+   * refuse the link: it has none, and `kv` holds nothing yet. */
   ignis_seq *lender = nullptr;
   std::vector<std::int32_t> lent;
   /* What that image occupies: one slot's state and its hq residual window,

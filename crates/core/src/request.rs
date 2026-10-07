@@ -343,6 +343,13 @@ impl Request {
     /// One function so that the chunk decomposition (where to cut) and the
     /// registration (when to publish) cannot disagree about it.
     pub fn publish_point(&self, page_tokens: u32) -> u32 {
+        // GitHub #306: a capture that rides the opener's page lent the pages
+        // below it to a pages-only link, and the leaf refuses the lender a
+        // publish -- its first own pages would get a second owner. Nothing
+        // past the opener is published.
+        if self.link_at_capture && self.checkpoint_captured {
+            return 0;
+        }
         // Pages already shared, or restored as the request's own from a
         // materialized blob: a boundary inside either is behind it.
         let shared = self
