@@ -75,7 +75,7 @@ struct Inner {
     capture_refusals: std::collections::HashSet<RequestId>,
     /// Pages the leaf reports lending at a request's next capture
     /// (`lend_at_capture`, GitHub #306); 0 for any request not named.
-    capture_loans: HashMap<RequestId, u32>,
+    capture_lent_pages: HashMap<RequestId, u32>,
     /// Requests whose next attention readout the leaf "could not read"
     /// (GitHub #260): the chunk lands and the outcome carries no scores.
     attention_refusals: std::collections::HashSet<RequestId>,
@@ -408,7 +408,7 @@ impl MockCompute {
     /// expected, which is how a leaf whose view of the sequence drifted from
     /// the scheduler's would report it.
     pub fn lend_at_capture(&self, request: RequestId, pages: u32) {
-        self.inner.lock().unwrap().capture_loans.insert(request, pages);
+        self.inner.lock().unwrap().capture_lent_pages.insert(request, pages);
     }
 
     /// Make the backend fail to read `request`'s next attention readout
@@ -553,7 +553,7 @@ impl Compute for MockCompute {
                     captured
                 },
                 checkpoint_lent_pages: match job.capture_checkpoint {
-                    Some(_) => g.capture_loans.remove(&job.request).unwrap_or(0),
+                    Some(_) => g.capture_lent_pages.remove(&job.request).unwrap_or(0),
                     None => 0,
                 },
                 // GitHub #237 / ADR 0034: the `Compute` seam now carries a

@@ -698,7 +698,7 @@ impl StepLeaf for CudaLeaf {
     }
 
     fn checkpoint_lent_pages(&self, sequence: &Self::Sequence, checkpoint: &Self::Checkpoint) -> u32 {
-        checkpoint.stats().pages.saturating_sub(sequence.stats().shared_pages)
+        checkpoint.lent_by(sequence)
     }
 
     fn allocate_sequence_from_checkpoint(

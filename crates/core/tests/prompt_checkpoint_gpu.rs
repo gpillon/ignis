@@ -311,6 +311,9 @@ fn turns_against_the_split_control(
     let checkpoint = publisher
         .capture_checkpoint(opener, 1)
         .unwrap_or_else(|e| panic!("capture: {e}"));
+    // GitHub #306: the 27B published its opener's floor, so its capture lends
+    // nothing -- what the scheduler reads it lent.
+    assert_eq!(checkpoint.lent_by(&publisher), 0, "the 27B's capture lends nothing");
     let mut kv_ram_blob = vec![
         0u8;
         usize::try_from(
@@ -550,6 +553,7 @@ fn turns_against_the_split_control(
         publish_at_2 / PAGE,
         "the second checkpoint reaches over the whole chain below its opener"
     );
+    assert_eq!(checkpoint_2.lent_by(&turn2), 0, "on the chained publish: nothing lent");
     prefill_program(
         &model,
         &pool,

@@ -278,9 +278,13 @@ fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32)
     run.prefill(&mut turn, &tokens, 0);
     let on_host = leaf.capture_checkpoint(model, &mut turn, history as u32, HOST_SLOTS[1]).expect("capture (host)");
     let on_device = leaf.capture_checkpoint(model, &mut turn, history as u32, DEVICE_SLOT).expect("capture (device)");
-    // The sequence lends the pages below its opener now: the leaf gives them
-    // no second owner, by a publish or by a restore over them.
+    // The sequence lends the pages below its opener now -- every one, standing
+    // on nothing -- and the leaf gives them no second owner, by a publish or
+    // by a restore over them.
     let floor = (history / KV_PAGE_TOKENS as usize * KV_PAGE_TOKENS as usize) as u32;
+    for checkpoint in [&on_host, &on_device] {
+        assert_eq!(leaf.checkpoint_lent_pages(&turn, checkpoint), floor / KV_PAGE_TOKENS, "{label}: the loan, as the scheduler reads it");
+    }
     assert!(leaf.publish_prefix(model, &mut turn, floor, HOST_SLOTS[0]).is_err(), "{label}: a lender publishes nothing");
     let bytes = leaf.checkpoint_snapshot_bytes(model, &on_host).expect("checkpoint blob size");
     let blob = run.blob(bytes, |dst| leaf.checkpoint_snapshot_into(model, &on_host, dst));
@@ -315,6 +319,11 @@ fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32)
     drop((on_host, on_device));
     run.prefill(&mut turn, &new[..NEW_TOKENS - 10], history);
     let second = leaf.capture_checkpoint(model, &mut turn, opener as u32, HOST_SLOTS[1]).expect("turn N+1 captures");
+    assert_eq!(
+        leaf.checkpoint_lent_pages(&turn, &second),
+        opener as u32 / KV_PAGE_TOKENS - floor / KV_PAGE_TOKENS,
+        "{label}: turn N+1 lends the pages it warmed past the link it stands on"
+    );
     assert_eq!(run.finish(turn, &next, opener), control, "{label}: turn N+1 goes on as if it had not captured");
     let (seq, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &second).expect("turn N+2 claims");
     drop(second);

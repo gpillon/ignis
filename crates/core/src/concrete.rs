@@ -1337,12 +1337,12 @@ impl ConcreteScheduler {
     /// unreachable; the caller then drops the checkpoint the leaf built over
     /// it, and the link goes with its lender.
     ///
-    /// `leaf_lent` is the leaf's own count of the pages it lent. More than this
-    /// moves -- a leaf lending for a request that moves nothing, or standing on
-    /// less than the request does -- is pages the leaf holds past the request
-    /// and the ledger frees with it, so admission would over-commit. That is
-    /// `false` too: the checkpoint goes, and with its lender the link and every
-    /// page it holds.
+    /// `leaf_lent` is the leaf's own count of the pages it lent. A loan larger
+    /// than the charge this moves -- a leaf lending for a request that moves
+    /// nothing, or standing on less than the request does -- is pages the leaf
+    /// holds past the request and the ledger frees with it, so admission would
+    /// over-commit. That is `false` too: the checkpoint goes, and with its
+    /// lender the link and every page it holds.
     fn register_link(&mut self, idx: usize, opener: u32, leaf_lent: u32) -> bool {
         let page_tokens = self.config.kv_page_tokens;
         let r = &self.requests[idx];
@@ -3560,7 +3560,11 @@ impl Scheduler for ConcreteScheduler {
                         // request is none the wiser.
                         if let Some(capture) = job.capture_checkpoint {
                             if outcome.checkpoint_captured {
-                                // GitHub #306: the pages-only link first, when
+                                // GitHub #306: a loan lasts as long as the
+                                // sequence, whatever becomes of the checkpoint.
+                                let r = &mut self.requests[i];
+                                r.lender = r.link_at_capture || outcome.checkpoint_lent_pages > 0;
+                                // The pages-only link first, when
                                 // the capture handed one over -- it is what the
                                 // checkpoint stands on.
                                 if self.register_link(i, capture.tokens, outcome.checkpoint_lent_pages) {

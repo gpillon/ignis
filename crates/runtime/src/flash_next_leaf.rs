@@ -459,7 +459,7 @@ impl StepLeaf for FlashNextLeaf {
     }
 
     fn checkpoint_lent_pages(&self, sequence: &Self::Sequence, checkpoint: &Self::Checkpoint) -> u32 {
-        checkpoint.checkpoint.stats().pages.saturating_sub(sequence.seq.stats().shared_pages)
+        checkpoint.checkpoint.lent_by(&sequence.seq)
     }
 
     fn allocate_sequence_from_checkpoint(

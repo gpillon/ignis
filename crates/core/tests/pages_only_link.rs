@@ -298,18 +298,31 @@ fn a_block_on_the_opener_s_floor_is_what_the_capture_stands_on() {
     assert_eq!(sched.retained_slots_in_use(), 2, "the block's image and the checkpoint's");
 }
 
-#[test]
-fn a_lender_publishes_nothing_past_its_opener() {
-    // A reuse boundary past the opener: after the capture the sequence is the
-    // link's lender, and the leaf refuses it a publish (`seq_prefix.cu`, a
-    // second owner for the lent pages) -- which the backend would turn into a
-    // failed batch. So the boundary is not cut, and nothing is published there.
-    // (An 8-token serving chunk keeps the boundary out of the opener's chunk.)
+/// Every prefill job dealt to `request`, as (where it ends, what it publishes,
+/// what it captures).
+fn job_points(compute: &MockCompute, request: RequestId) -> Vec<(u32, Option<u32>, Option<u32>)> {
+    compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == request)
+        .map(|j| {
+            let end = j.start_position + j.tokens.len() as u32;
+            (end, j.publish_prefix.map(|p| p.tokens), j.capture_checkpoint.map(|c| c.tokens))
+        })
+        .collect()
+}
+
+/// A 60-token prompt whose opener ends at 37 and whose reuse boundary lies past
+/// it, at 52 (48 once floored), prefilled to idle in 8-token chunks -- which
+/// keep the boundary out of the opener's chunk -- on `config`, with the
+/// backend reporting `lent` pages lent at the capture.
+fn a_boundary_past_the_opener(config: SchedulerConfig, lent: Option<u32>) -> (Arc<MockCompute>, ConcreteScheduler, RequestId) {
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             serving_chunk_tokens: 8,
-            ..config()
+            ..config
         },
         compute.clone(),
     );
@@ -322,19 +335,22 @@ fn a_lender_publishes_nothing_past_its_opener() {
             RequestClass::Interactive,
         )
         .unwrap();
+    if let Some(pages) = lent {
+        compute.lend_at_capture(n, pages);
+    }
     run_to_idle(&mut sched);
-    let jobs: Vec<(u32, Option<u32>, Option<u32>)> = compute
-        .prefill_calls()
-        .iter()
-        .flatten()
-        .filter(|j| j.request == n)
-        .map(|j| {
-            let end = j.start_position + j.tokens.len() as u32;
-            (end, j.publish_prefix.map(|p| p.tokens), j.capture_checkpoint.map(|c| c.tokens))
-        })
-        .collect();
+    (compute, sched, n)
+}
+
+#[test]
+fn a_lender_publishes_nothing_past_its_opener() {
+    // After the capture the sequence is the link's lender, and the leaf refuses
+    // it a publish (`seq_prefix.cu`, a second owner for the lent pages) --
+    // which the backend would turn into a failed batch. So the boundary past
+    // the opener is not cut, and nothing is published there.
+    let (compute, sched, n) = a_boundary_past_the_opener(config(), None);
     assert_eq!(
-        jobs,
+        job_points(&compute, n),
         vec![
             (8, None, None),
             (16, None, None),
@@ -348,6 +364,42 @@ fn a_lender_publishes_nothing_past_its_opener() {
         "the capture lends, and the boundary at 48 past it is neither cut nor published"
     );
     assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+}
+
+#[test]
+fn a_lender_whose_checkpoint_is_released_publishes_nothing_either() {
+    // The checkpoint goes (below: a loan the scheduler does not move), the
+    // loan does not: the sequence lends until it is released.
+    let (compute, sched, n) = a_boundary_past_the_opener(config(), Some(3));
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0, "the checkpoint released");
+    assert!(
+        job_points(&compute, n).iter().all(|&(end, publish, _)| end != 48 && publish.is_none()),
+        "and still nothing cut or published past the opener"
+    );
+
+    // The same on the 27B, whose capture should have lent nothing at all.
+    let (compute, sched, n) = a_boundary_past_the_opener(
+        SchedulerConfig {
+            opener_page_rides_capture: false,
+            ..config()
+        },
+        Some(1),
+    );
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0, "the 27B's checkpoint released");
+    assert_eq!(
+        job_points(&compute, n),
+        vec![
+            (8, None, None),
+            (16, None, None),
+            (24, None, None),
+            (32, Some(32), None),
+            (37, None, Some(37)),
+            (45, None, None),
+            (53, None, None),
+            (60, None, None),
+        ],
+        "the 27B's floor published, and nothing past the opener its leaf lent below"
+    );
 }
 
 // ── A leaf that lent more than this scheduler moves ─────────────────────

@@ -113,7 +113,7 @@ struct StubLeaf {
     capture_error: Option<i32>,
     /// GitHub #306: the pages the leaf reports each capture lent to a
     /// pages-only link.
-    capture_lends: u32,
+    capture_lent_pages: u32,
     /// GitHub #243: the merged columns this stub's embedding pool holds, or
     /// `None` for a pool nothing fills. A bounded stub is what proves the
     /// eviction loop, since the real refusal comes from the leaf's bytes and
@@ -142,7 +142,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
-            capture_lends: 0,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -163,7 +163,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
-            capture_lends: 0,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -178,7 +178,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
-            capture_lends: 0,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -193,7 +193,7 @@ impl StubLeaf {
             prefill_error_on_call: Some((2, code)),
             decode_error: None,
             capture_error: None,
-            capture_lends: 0,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -208,7 +208,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: Some(code),
             capture_error: None,
-            capture_lends: 0,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -382,7 +382,7 @@ impl StepLeaf for StubLeaf {
     }
 
     fn checkpoint_lent_pages(&self, _sequence: &Self::Sequence, _checkpoint: &Self::Checkpoint) -> u32 {
-        self.capture_lends
+        self.capture_lent_pages
     }
 
     fn allocate_sequence_from_checkpoint(
@@ -1389,7 +1389,7 @@ fn a_capture_that_lent_pages_the_scheduler_does_not_move_is_released() {
     // at the capture; a leaf reporting a loan would hold pages past the
     // request that the ledger frees with it, and the checkpoint is released.
     let leaf = Arc::new(StubLeaf {
-        capture_lends: 1,
+        capture_lent_pages: 1,
         ..StubLeaf::with_tokens([])
     });
     let mut scheduler = checkpoint_scheduler(leaf.clone());
