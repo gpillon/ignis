@@ -390,8 +390,9 @@ Each criterion belongs to one phase (see Phases).
       unchanged.
     - With `--default-max-tokens 0`, a request without a cap runs to the
       context.
-    - The resolved cap is in the request's `params.max_tokens` after `submit`.
-      With speculation on, a verify round never generates past it.
+    - The resolved cap is in the request's `params.max_tokens` after `submit`,
+      so it is enforced exactly as an explicit `max_tokens` is today,
+      speculation included.
     - Both models.
 
 ### KV-disk: configuration and lifecycle
