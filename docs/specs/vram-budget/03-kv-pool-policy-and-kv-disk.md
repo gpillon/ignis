@@ -1,11 +1,11 @@
-# 03 — The KV pool policy, page-wise reservations, the default `max_tokens`, and the KV-disk tier
+# 03 — The KV pool policy, the default `max_tokens`, live moves and their reservation gate, and the KV-disk tier
 
 GitHub: the ticket that links here. ADRs: 0045 (this feature, amended
 2026-10-08), 0030 (the VRAM plan it amends), 0029 (the residency tiers; Tier 2
 is built here), 0024 (the blob, now moved a window at a time), 0023 (the
 eviction priority, one tier further down, and a page shortage that takes what
 is not decoding first), 0017 (the metric contract), 0022 (pages derived from
-the format). Spec core-05 (the reservation rule it replaces). Evidence:
+the format). Spec core-05 (the reservation rule it amends). Evidence:
 [Flash-Next on the 5090](../../findings/2026-10-06-flash-next-on-the-5090.md)
 (its lanes-at-262K update), the F: disk bench (`.scratch/disk-bench/RESULTS.md`,
 untracked), GitHub #205.
@@ -26,6 +26,9 @@ untracked), GitHub #205.
   (core-05), and the pages are mapped at once. On a 524,288-token pool two
   agent requests without `max_tokens` take every page, mostly pages neither
   will ever write.
+- **Mapping pages while serving has never been measured.** Today
+  `ignis_seq_alloc` reserves, maps, binds and zeroes every page of a sequence
+  up front. Growth would put a leaf call on the decode path.
 - **A request that names no cap may generate to the end of the context.**
 - **Live work is lost when KV-RAM fills.** KV-RAM discards an evicted live
   sequence to make room, and that request re-prefills from zero.
@@ -47,11 +50,19 @@ untracked), GitHub #205.
 - **`--allow-expert-cache-below-floor` starts below the 12 GiB floor** with a
   warning.
 - **A default generation cap.** A request that names none generates at most
-  `--default-max-tokens`, 38,912 on both models; `0` is today's behaviour.
-- **Reservations grow by pages.** Admission reserves the prompt plus a
-  2,048-token step, and a lane takes the next step as it generates. When the
-  pool runs out, the lowest-ranked sequence below the requester moves down a
-  tier, mid-generation if need be, and resumes bit-exact later.
+  `--default-max-tokens`, on both models. The flag's own default is 38,912,
+  which the flag, its environment variable and the make knob change; `0` is
+  today's behaviour.
+- **Live moves.** When the pool runs out, the lowest-ranked sequence below the
+  requester moves down a tier, mid-generation if need be, and resumes
+  bit-exact later.
+- **A measurement gate, P0, then one of two reservation rules.**
+  - *Growth branch*, if growing a sequence one page at a time costs decode
+    nothing beyond noise. Admission reserves the prompt plus a 2,048-token
+    step, and a lane takes the next step as it generates.
+  - *Fixed branch* otherwise. Admission reserves the prompt plus the cap
+    (explicit, else `--default-max-tokens`), and only an admission moves a
+    sequence.
 - **Tier 2, KV-disk, below KV-RAM.**
   - A blob that KV-RAM gives up goes to disk, and so does a device victim that
     KV-RAM cannot take.
@@ -115,6 +126,9 @@ seams, the defaults, the acceptance and the phases.
     one flag to restore the old behaviour.
 22. As the owner, I want a live move to slow the other lanes' decode by no more
     than a bound I have confirmed.
+23. As the owner, I want page growth measured before it is built, and a fixed
+    reservation instead if it costs decode speed, so that concurrency is never
+    bought with tok/s.
 
 ## Defaults
 
@@ -128,11 +142,12 @@ gives the reason for each.
 | Resident test | budget ≥ fixed lines + residency's fixed lines + every expert projection + floor pool | *(agent)* |
 | `--kv-pool-bytes` | bytes, or `<n>[K\|M]tok`; honoured on both models | *(agent)* |
 | Floor opt-in | `--allow-expert-cache-below-floor`, WARN; class minimum stays a refusal | *(owner)* |
-| Default cap | `--default-max-tokens 38912` on both models, clamped to the context; `0` = up to the context | *(owner)* value and `0`, *(agent)* name |
-| Growth step | 32 pages (2,048 tokens). Admission reserves the prompt plus one step; a lane keeps at least one step of room ahead | *(owner)* growth, *(agent)* size |
+| Default cap | `--default-max-tokens`, its own default 38,912 on both models, changed by the flag, `IGNIS_DEFAULT_MAX_TOKENS` or `DEFAULT_MAX_TOKENS` on either branch; clamped to the context; `0` = up to the context | *(owner)* value, override and `0`, *(agent)* name |
+| P0 gate | growth one page at a time vs whole, A-B-A, Flash-Next and 27B, 1 and 3 lanes: growth passes at decode tok/s ≥ 99.5% of the whole legs' mean and ITL p99 ≤ the higher whole leg + the whole legs' difference | *(owner)* |
+| Reservation | growth branch: prompt + one 32-page step (2,048 tokens), at least one step of room ahead per lane; fixed branch: prompt + cap | *(owner)* the two branches, *(agent)* step size |
 | Page-shortage victim | retained state; then only what ranks below the requester (class, then submission): `Agent` first, not decoding first, latest-submitted first | *(owner)* not decoding first, never the requester; *(agent)* rank gate |
-| Entry rule | enter when free pages ≥ reservation + 4 steps for itself and each resident sequence above it; a restore never moves anything | *(agent)* |
-| Last resort | every resident sequence parked and no tier takes a victim: the lowest-ranked is re-queued, with an ERROR | *(agent)* |
+| Entry rule | a restore never moves anything; entries in rank order; growth branch: free pages ≥ reservation + 4 steps for itself and each resident sequence above it; fixed branch: the reservation fits | *(agent)* |
+| Last resort (growth branch) | every resident sequence parked and no tier takes a victim: the lowest-ranked is re-queued, with an ERROR | *(agent)* |
 | PCIe contention | move out: ITL p50 +10%; move in: ITL p50 +25%; either: max within baseline + 150 ms | *(agent)*, owner to confirm |
 | KV-disk on | Flash-Next `--kv-disk-bytes 16G`; 27B `0` | *(owner)* build, *(agent)* sizes |
 | Location | `--kv-disk-path model` (beside the artifact), `auto`, or a directory: the n-gram cache's rule | *(owner)*, confirmed 2026-10-08 |
@@ -209,45 +224,60 @@ compute, and its drop path frees them.
   - The retained match walks three tiers and applies each tier's floor.
   - `ReuseSource::Disk`.
   - With the tier on, no `KvRamVictim::Live` is ever discarded.
-- **The scheduler, page-wise reservations — `crates/core/src/concrete.rs`,
+- **The P0 spike — its own branch, never merged as is.**
+  - A minimal extend operation in `kernel/src/seq.cu`, bound in
+    `crates/core/src/seq.rs`.
+  - A switch in `RuntimeCompute` between today's whole mapping and growth one
+    page at a time: every page boundary in decode, every chunk in prefill.
+  - The A-B-A harness, and the finding.
+  - On the growth branch P3 starts from this code; on the fixed branch it is
+    dropped.
+- **The scheduler, live moves (both branches) — `crates/core/src/concrete.rs`,
   `crates/core/src/admission.rs`.**
-  - A request carries its *bound* (prompt plus cap: what `ContextExceeded` and
-    `Oversized` are decided on) apart from its *reservation*
-    (`resources.kv_pages`: what `kv_used_pages` charges).
-  - `reservation()` returns the prompt, or the claimant's tail, plus
-    `min(cap, step)`. `requeue_request`, `snapshot_and_evict`'s
-    `restore_pages` and the claim loop follow the same rule.
-  - A growth pass before each round. A lane whose room ahead is below a step
-    asks for one, highest-ranked first. A lane with room below one round's
-    largest append and no page is *parked*: a flag on the `Running` request
-    that only the decode round reads.
   - A pure page-shortage victim order in `admission.rs`, beside
     `choose_retained_lane_victim`: the rank gate, then `Agent` first, not
     decoding first, latest-submitted first. The lane-shortage order is not
     touched.
   - The entry rule, in `restore_pass` and at materialization (beside
     `fits_for_materialization`), with entries taken in rank order.
-  - The last resort, and a `Parked` fact.
+  - On the fixed branch, `reservation()` is the bound with the default cap,
+    and admission is the only trigger.
+- **The scheduler, page-wise reservations (growth branch) —
+  `crates/core/src/concrete.rs`.**
+  - A request carries its *bound* (prompt plus cap: what `ContextExceeded` and
+    `Oversized` are decided on) apart from its *reservation*
+    (`resources.kv_pages`: what `kv_used_pages` charges).
+  - `reservation()` returns the prompt, or the claimant's tail, plus
+    `min(cap, step)`. `requeue_request` and the claim loop follow the same
+    rule.
+  - `snapshot_and_evict` records the reservation the sequence held, and a
+    restore maps it again.
+  - A growth pass before each round. A lane whose room ahead is below a step
+    asks for one, highest-ranked first. A lane with room below one round's
+    largest append and no page is *parked*: a flag on the `Running` request
+    that only the decode round reads.
+  - The entry rule's four steps of room, the last resort, and a `Parked`
+    fact.
 - **The `Compute` seam — `crates/core/src/scheduler.rs`, `crates/core/src/mock.rs`.**
   - KV-disk calls: start a spill to disk, from the device or from a KV-RAM
     blob; advance in-flight transfers by at most one window each; report
     finished and failed transfers; start a restore from disk; discard a disk
     blob; ask whether a blob of N bytes fits the disk.
-  - Growth: `grow(request, context_tokens)`, refused with nothing changed when
-    the pages are not free.
+  - Growth branch: `grow(request, context_tokens)`, refused with nothing
+    changed when the pages are not free.
   - `MockCompute` implements a fake disk with configurable latency, capacity
-    and failures, and mirrors the leaf's page entitlement so that a scheduler
-    test catches the two ledgers drifting.
+    and failures. On the growth branch, it also mirrors the leaf's page
+    entitlement, so that a scheduler test catches the two ledgers drifting.
 - **The runtime — `crates/runtime/src/lib.rs`, plus a `kv_disk` module.**
   - The store: directory lifecycle and lock, file format, the two IO workers,
     the staging windows, CRC.
-  - `RuntimeCompute` implements the new seam calls: the disk calls, and
-    `grow` through `crates/core/src/seq.rs` (`Seq::grow`).
+  - `RuntimeCompute` implements the new seam calls: the disk calls and, on
+    the growth branch, `grow` through `crates/core/src/seq.rs` (`Seq::grow`).
   - `StepLeaf` gains windowed snapshot and restore: whole-sequence,
     checkpoint and prefix blobs, read or fed a window at a time on the leaf's
     transfer stream, with completion polled.
-  - Sequences are allocated at their reservation, and a restore maps the
-    blob's tokens plus a step.
+  - Growth branch: sequences are allocated at their reservation, and a
+    restore maps the reservation the sequence held when it moved.
 - **The leaf — `kernel/`.**
   - The snapshot and restore calls, for sequences, checkpoints and prefixes,
     take a transfer-options struct (ADR 0016, ADR 0024's "partial extent"):
@@ -255,14 +285,16 @@ compute, and its drop path frees them.
     whole-blob call.
   - A restore keeps a cursor. A sequence whose restore is incomplete refuses
     every step and can be released.
-  - `ignis_seq_alloc`, `ignis_seq_alloc_shared` and
+  - Growth branch only, from P0's spike:
+    `ignis_seq_alloc`, `ignis_seq_alloc_shared` and
     `ignis_seq_alloc_from_checkpoint` map the tokens they are given, which is
     now the reservation, not the bound. The block-table row stays sized for
     `max_context_tokens`.
-  - New `ignis_seq_grow(pool, seq, context_tokens)`. It raises the entitlement
-    with the vendored `PagedKVAllocation::set_page_entitlement`, maps the new
-    pages with `materialize_pages` (which publishes the block-table range),
-    and zeroes them with `zero_pages`, as `ignis_seq_alloc` does. It is called
+  - Growth branch only: a new `ignis_seq_grow(pool, seq, context_tokens)`,
+    P0's extend operation made whole. It raises the entitlement with the
+    vendored `PagedKVAllocation::set_page_entitlement`, maps the new pages
+    with `materialize_pages` (which publishes the block-table range), and
+    zeroes them with `zero_pages`, as `ignis_seq_alloc` does. It is called
     between rounds, on the model stream.
   - It refuses with nothing changed when the pages are not free, past
     `max_context_tokens`, or on a sequence with an incomplete restore.
@@ -275,9 +307,10 @@ compute, and its drop path frees them.
   `crates/server/src/telemetry.rs`, `crates/server/src/metrics.rs`, ADR 0017's
   table.**
   - New facts: a disk spill (with its source tier), a disk failure (write or
-    read), and a lane parked. The tick carries the disk's used bytes.
+    read), and on the growth branch a lane parked. The tick carries the disk's
+    used bytes.
   - The retained-state facts carry `ReuseSource::Disk`.
-  - `ignis_kv_lane_parks_total`, on every load.
+  - Growth branch: `ignis_kv_lane_parks_total`, on every load.
 - **The Playground Monitor — `web/src/monitor/`** (snapshot contract, derive,
   view, their vitest suites) and `web/mockMetrics.ts`.
 - **Make and docs.**
@@ -289,7 +322,8 @@ compute, and its drop path frees them.
 
 ## Acceptance criteria
 
-Each criterion belongs to one phase (see Phases).
+Each criterion belongs to one phase (see Phases). From AC 28 on, a criterion
+marked *(growth)* or *(fixed)* is built only on that branch of P0's gate.
 
 ### The pool policy
 
@@ -369,6 +403,10 @@ Each criterion belongs to one phase (see Phases).
     - `--default-max-tokens <n|0>` and `IGNIS_DEFAULT_MAX_TOKENS` default to
       38,912 on Flash-Next and on the 27B. The flag wins over the
       environment.
+    - 38,912 is only the default. A non-default value, 8,192, is taken from
+      each of the three spellings in turn: the flag, the environment variable,
+      and `make config DEFAULT_MAX_TOKENS=8192`, which prints the flag with
+      it. It is taken on both models.
     - A malformed value is refused at config, naming the flag. `0` means no
       default: a request without a cap runs up to the context, as today.
     - A value past `--max-context` is accepted and acts as the context.
@@ -377,6 +415,9 @@ Each criterion belongs to one phase (see Phases).
       generates at most 38,912 tokens and ends `finish_reason: "length"`.
       A `/v1/responses` request without `max_output_tokens` ends `incomplete`
       with `reason: "max_output_tokens"`.
+    - With `--default-max-tokens 8192`, the same requests stop at 8,192, on
+      both models. AC 28 tests the same value against the reservation, on
+      whichever branch P0 chose.
     - With thinking on, the reasoning tokens count inside the cap. The default
       thinking budget still forces its close at 6,144 and keeps its 2,048-token
       answer reserve.
@@ -476,7 +517,7 @@ Each criterion belongs to one phase (see Phases).
       class, then probation before protected, then least-recently-used, with
       the Interactive TTL.
     - With the tier on, no `SnapshotDropped` is ever emitted (but for the last
-      resort of AC 33).
+      resort of AC 35, growth branch).
 18. **No room.**
     - Fill every tier with live or higher-ranked state. A new request under the
       in-flight cap is then held in `Admitted`: not refused, and nothing is
@@ -550,22 +591,70 @@ Each criterion belongs to one phase (see Phases).
       each within +10% of the run without the spill.
     - The result goes in a finding.
 
-### Page-wise reservations
+### P0: the measurement gate
 
-26. **The reservation (CPU).**
-    - At admission a request reserves `ceil((prompt + min(cap, 2,048)) / 64)`
-      pages. A claimant of a shared prefix or a checkpoint reserves its tail
-      in place of the prompt.
-    - Its bound, prompt plus cap, is what `ContextExceeded` and `Oversized`
-      are decided on, as before.
-    - A request whose bound is within one step of its prompt reserves the
-      bound and never grows: a decision, a constrained decode, a
-      `max_tokens` up to 2,048.
-    - After every advance, `kv_used_pages` equals the leaf's entitled pages.
-      `MockCompute` mirrors the leaf's ledger.
-    - A request alone on a pool at the floor (retained state given up, every
-      other sequence moved) reaches its bound.
-27. **Growth and parking (CPU).**
+26. **The extend operation, as a spike.**
+    - A minimal leaf operation extends a live sequence by N pages. It
+      reserves them, maps them, publishes the block-table range, and zeroes
+      the new pages. A short pool refuses it with nothing changed.
+    - A switch picks between today's whole mapping at allocation and growth
+      one page at a time. Growth maps each page as the sequence crosses into
+      it: every 64 tokens of decode, each prefill chunk's pages before the
+      chunk.
+    - A kernel check makes the measurement compare equal work. After the same
+      prefill and decode, a sequence grown page by page holds the same KV
+      bytes as one mapped whole.
+    - Its latency is measured as host wall time, the block-table publish and
+      the zeroing included. p50 and p99 over at least 1,000 calls, for one
+      page and for one chunk's pages: 128 on Flash-Next, 16 on the 27B at its
+      1,024-token chunk.
+27. **The gate (GPU).** The card is checked free first.
+    - *Decode, A-B-A:* whole, then growth one page at a time, then whole. On
+      Flash-Next and on the 27B (its default decode route), at one and at
+      three active lanes. AC 8's harness: greedy, `ignore_eos`, 1,800 tokens,
+      `max_tokens` set. Recorded per leg: decode tok/s and ITL p99.
+    - *Prefill:* a full chunk's wall time, 8,192 tokens on Flash-Next and
+      1,024 on the 27B, A-B-A with growth per chunk. It is recorded, not part
+      of the verdict, since both branches reserve a prompt whole at admission.
+    - *Verdict (owner).* Growth passes when both hold at every lane count, on
+      both models:
+      - its decode tok/s is at least 99.5% of the mean of the two whole legs;
+      - its ITL p99 is at most the higher whole leg plus the difference
+        between the two whole legs.
+
+      Then P3 builds the growth branch. Otherwise it builds the fixed branch.
+    - The finding records every number and names the branch. P3 starts from
+      it.
+
+### Reservations
+
+ACs marked *(growth)* are built only on the growth branch, *(fixed)* only on
+the fixed branch, *(both)* on either.
+
+28. **The reservation (CPU)** *(both, each branch its bullets)*.
+    - *(both)* The bound, prompt plus cap, is what `ContextExceeded` and
+      `Oversized` are decided on, as before.
+      - With `--default-max-tokens 8192`, a request without a cap has the bound
+        prompt plus 8,192, on both models.
+      - With `0`, its bound is the whole context.
+    - *(growth)* At admission a request reserves
+      `ceil((prompt + min(cap, 2,048)) / 64)` pages. A claimant of a shared
+      prefix or a checkpoint reserves its tail in place of the prompt.
+      - A request whose bound is within one step of its prompt reserves the
+        bound and never grows: a decision, a constrained decode, a
+        `max_tokens` up to 2,048.
+      - After every advance, `kv_used_pages` equals the leaf's entitled pages.
+        `MockCompute` mirrors the leaf's ledger.
+      - A request alone on a pool at the floor (retained state given up, every
+        other sequence moved) reaches its bound.
+    - *(fixed)* At admission a request reserves its whole bound,
+      `ceil((prompt + cap) / 64)` pages, where the cap is the explicit one,
+      else the flag's value, and it never grows.
+      - Tested at the default of 38,912 and at 8,192: the reservation follows
+        the flag.
+      - With `0` it is the whole context, today's rule.
+      - With an explicit cap it is today's reservation, unchanged.
+29. **Growth and parking (CPU)** *(growth)*.
     - Before a round, a lane whose room ahead is below one step (2,048 tokens)
       is granted one more step, capped at its bound. While pages are free it
       never parks.
@@ -579,7 +668,7 @@ Each criterion belongs to one phase (see Phases).
       window), the grower keeps decoding on its room. It parks only if the room
       runs out first.
     - A cancelled parked lane releases its pages.
-28. **Kernel test: grown equals whole.**
+30. **Kernel test: grown equals whole** *(growth)*.
     - Take a sequence allocated at prompt plus one step and grown to N tokens
       with `ignis_seq_grow`, fed the same prefill and decode as one allocated
       whole at N. Its KV bytes, its block table read by logical page, and its
@@ -590,19 +679,19 @@ Each criterion belongs to one phase (see Phases).
       an incomplete restore.
     - Cover both KV formats; both models' pools; a sequence on a shared prefix
       and one from a checkpoint, whose tails grow; and a snapshot taken after
-      growth, restored into its tokens plus one step.
+      growth, restored into the reservation it held.
     - `test_seq_alloc` and `test_seq_snapshot` carry it. The whole-allocation
       tests are unchanged.
-29. **GPU: grown equals whole, both models.** A greedy request decoded at
-    width 1 with a page-wise reservation, growing at least five times, gives
-    the same tokens as on the commit before this phase. The 27B leg runs its
-    default decode route, so a verify round's append (the draft window plus
-    one) is covered by the room ahead.
+31. **GPU: grown equals whole, both models** *(growth)*. A greedy request
+    decoded at width 1 with a page-wise reservation, growing at least five
+    times, gives the same tokens as on the commit before this phase. The 27B
+    leg runs its default decode route, so a verify round's append (the draft
+    window plus one) is covered by the room ahead.
 
 ### Live moves
 
-30. **The victim of a page shortage** (pure tests in `admission.rs`, then
-    CPU).
+32. **The victim of a page shortage** *(both)* (pure tests in
+    `admission.rs`, then CPU).
     - Retained state on the device goes first, as today.
     - Then only live sequences that rank below the requester. Rank is class,
       then submission order.
@@ -613,35 +702,40 @@ Each criterion belongs to one phase (see Phases).
       lane reserved for an earlier Interactive request.
     - A lane shortage (the head's lane deal, `try_evict_for_head`) keeps
       today's order, unchanged.
-    - The case that proves the gate: an `Agent` lane's growth never moves an
-      `Interactive` sequence. It parks instead.
-31. **Triggers (CPU).**
-    - A growing lane moves AC 30's victim into KV-RAM, else KV-disk, at a
-      round or chunk boundary. A victim holding a lane resumes as `Running`; a
-      lane-less one resumes as `Prefilling` from its progress.
-    - An `Interactive` admission moves an `Agent` sequence to fit its prompt
-      plus a step.
-    - An `Agent` admission behind resident `Agent` sequences moves none of
-      them. It waits in `Admitted` and is admitted when room returns.
-    - A moved sequence's output continues unbroken on `MockCompute`: no
-      `Requeued`, and its generated count is continuous.
-32. **The entry rule (CPU).**
-    - A restore never moves anything.
-    - A moved sequence and a newcomer enter the device only when the free
-      pages cover their reservation plus four steps, for themselves and for
-      each resident live sequence that ranks above them. For a sequence that
-      can grow less than four steps, the room counted is what it can still
-      grow.
-    - Entries are taken in rank order. A moved `Agent` sequence comes back
-      before a later `Agent` newcomer, even one that would fit sooner.
-    - Take two equal-class sequences whose bounds cannot both fit, with every
-      lane advancing one token a round. Between a restore of the younger and
-      its next move, the younger advances at least three steps (6,144
-      tokens).
-    - Take the default pool (8,192 pages, 262,144-token context, three lanes),
-      with three requests generating to their bound. At most one sequence is
-      ever off the device, and it moves at most once.
-33. **Progress and the last resort (CPU).**
+    - The case that proves the gate: an `Agent` need never moves an
+      `Interactive` sequence. An `Agent` admission waits; *(growth)* an
+      `Agent` lane's growth parks.
+33. **Triggers (CPU)** *(both)*.
+    - *(both)* An `Interactive` admission moves an `Agent` sequence, mid
+      generation if need be, to fit its reservation. The victim goes into
+      KV-RAM, else KV-disk, at a round or chunk boundary. A victim holding a
+      lane resumes as `Running`; a lane-less one resumes as `Prefilling` from
+      its progress.
+    - *(both)* An `Agent` admission behind resident `Agent` sequences moves
+      none of them. It waits in `Admitted` and is admitted when room returns.
+    - *(both)* A moved sequence's output continues unbroken on `MockCompute`:
+      no `Requeued`, and its generated count is continuous.
+    - *(growth)* A growing lane moves AC 32's victim the same way.
+    - *(fixed)* Nothing but an admission ever moves a sequence.
+34. **The entry rule (CPU)** *(both, each branch its room)*.
+    - *(both)* A restore never moves anything.
+    - *(both)* Entries are taken in rank order. A moved `Agent` sequence comes
+      back before a later `Agent` newcomer, even one that would fit sooner.
+    - *(growth)* A moved sequence and a newcomer enter the device only when
+      the free pages cover their reservation plus four steps, for themselves
+      and for each resident live sequence that ranks above them. For a
+      sequence that can grow less than four steps, the room counted is what it
+      can still grow.
+    - *(growth)* Take two equal-class sequences whose bounds cannot both fit,
+      with every lane advancing one token a round. Between a restore of the
+      younger and its next move, the younger advances at least three steps
+      (6,144 tokens).
+    - *(growth)* Take the default pool (8,192 pages, 262,144-token context,
+      three lanes), with three requests generating to their bound. At most one
+      sequence is ever off the device, and it moves at most once.
+    - *(fixed)* A moved sequence and a newcomer enter when their whole
+      reservation fits.
+35. **Progress and the last resort (CPU)** *(growth, one fixed bullet)*.
     - The top-ranked live sequence never parks behind a lower-ranked one.
     - Suppose every resident live sequence is parked and no tier can take a
       victim: a fake disk refusing every write, KV-RAM full of live blobs, or
@@ -650,14 +744,22 @@ Each criterion belongs to one phase (see Phases).
     - With a disk that accepts writes, the last resort never happens.
     - A request alone on a pool at the floor grows to its bound without
       parking.
-34. **GPU: a live move resumes bit-exact, both models.** Every compared round
-    is at width 1.
-    - *At the compute seam.* A greedy sequence is reserved its prompt plus a
-      step and grows as it decodes. It is moved down mid-generation and
-      restored with its tokens plus a step: once right after a growth, once
-      mid-step, through KV-RAM and through KV-disk (windowed). Its tokens equal
-      the same request reserved whole and never moved.
-    - *Through the scheduler, with a victim that is not decoding.* Setup:
+    - *(fixed)* No sequence on the device is ever held out of a round for
+      pages.
+36. **GPU: a live move resumes bit-exact, both models** *(both, each branch
+    its legs)*. Every compared round is at width 1.
+    - *At the compute seam.* A greedy sequence is moved down mid-generation
+      and restored, through KV-RAM and through KV-disk (windowed). Its tokens
+      equal the same request never moved.
+      - *(growth)* It is reserved its prompt plus a step and grows as it
+        decodes. It is moved once right after a growth and once mid-step, and
+        restored into the reservation it held.
+      - *(fixed)* It is reserved its whole bound, and moved at two points of
+        its generation.
+    - *Through the scheduler, an admission moving a decoding victim* *(both)*:
+      AC 23's first leg.
+    - *Through the scheduler, a growth moving a victim that is not decoding*
+      *(growth)*. Setup:
       - `--decode-lanes 2`, the pool at the floor, the disk tier on.
       - A (`interactive`, a short prompt, explicit `max_tokens` with
         `ignore_eos`) decodes alone.
@@ -670,15 +772,18 @@ Each criterion belongs to one phase (see Phases).
 
 ### PCIe contention
 
-35. **GPU: a live move's PCIe contention, measured (Flash-Next).** Setup, with
-    the sizes left to the implementer and `--kv-pool-bytes` cut so that the
-    moves happen:
+37. **GPU: a live move's PCIe contention, measured (Flash-Next)** *(both)*.
+    Setup, with the sizes left to the implementer and `--kv-pool-bytes` cut so
+    that the moves happen:
     - C (`agent`) has a prompt of at least 236K tokens, so its blob is at
       least 1 GB, and decodes.
-    - A and B (`interactive`, short prompts, explicit `max_tokens` of
-      different lengths with `ignore_eos`) decode beside it.
-    - A's or B's growth moves C out (device to host) while both decode. C
-      comes back in (host to device) while at least one of them still decodes.
+    - Other lanes decode beside it: `interactive` requests with short prompts
+      and explicit `max_tokens` of different lengths, with `ignore_eos`.
+    - C is moved out (device to host) while at least one other lane decodes,
+      and comes back in (host to device) while at least one still decodes.
+    - What moves C out: *(growth)* another lane's growth; *(fixed)* the
+      admission of an `interactive` request whose reservation does not fit
+      beside C.
     - Two legs. C goes through KV-RAM, with an arena that holds its blob (the
       synchronous path). Then it goes through KV-disk, with
       `--kv-host-pool-bytes 0` (the windowed path).
@@ -686,7 +791,8 @@ Each criterion belongs to one phase (see Phases).
     Measured for each move: its bytes, duration and GB/s, and the decoding
     lanes' ITL p50 and max during it. Each is compared against a baseline
     window of the same length, at the same decode width, with no transfer in
-    flight: right after the move out, and right before the move in.
+    flight. The baseline comes from the same run where such a window exists,
+    else from a run without the move.
 
     Starting thresholds, for the owner to confirm:
     - Move out: ITL p50 within +10% of the baseline.
@@ -695,18 +801,18 @@ Each criterion belongs to one phase (see Phases).
     - Either: ITL max within the baseline's max + 150 ms. That covers one
       synchronous KV-RAM copy of a whole-context blob, ~0.1 s at ~12 GB/s.
 
-    No work is lost: A, B and C each generate their full `max_tokens`, no
+    No work is lost: every request generates its full `max_tokens`, no
     `Requeued` is emitted, and `ignis_kv_ram_evictions_total` and
     `ignis_kv_disk_failures_total{op="read"}` stay 0.
 
     The finding records these numbers and why the two directions differ. The
     expert stream moves 66-74 MB per decode token, ~6.6-7.4 GB/s of the
     link's ~12 GB/s at ~100 tok/s. A move out runs against that direction; a
-    move in shares it. The finding also records any time A or B parked.
+    move in shares it. The finding also records any time a lane parked.
 
 ### Observability, docs and the 27B
 
-36. **The KV-disk metric contract.**
+38. **The KV-disk metric contract.**
     - The six retained-state families carry `tier="disk"`, and the request log
       spells the reuse source `disk`.
     - New series: `ignis_kv_disk_bytes{state="capacity"|"used"}`,
@@ -720,7 +826,7 @@ Each criterion belongs to one phase (see Phases).
     - ADR 0017's table and its disk paragraph say so.
     - The router exposition test covers the new series. Fact traffic is the
       same with metrics off and on.
-37. **The Monitor.**
+39. **The Monitor.**
     - Its Disk row is live when the scrape carries the tier: live spills,
       retained discards, and the demotions into the disk.
     - A capacity and used bar shows the disk beside KV-RAM's.
@@ -728,7 +834,7 @@ Each criterion belongs to one phase (see Phases).
     - `assessHealth` weighs a disk read failure like a KV-RAM live drop.
     - vitest covers a fixture scrape with the tier and one without, and the
       mock simulator feeds the row.
-38. **Make and docs.** Each phase lands its own part.
+40. **Make and docs.** Each phase lands its own part.
     - **P1.**
       - Knobs `DEFAULT_MAX_TOKENS` and `ALLOW_EXPERT_CACHE_BELOW_FLOOR`.
         `make config` prints them with the pool policy and its tokens.
@@ -741,31 +847,45 @@ Each criterion belongs to one phase (see Phases).
 
         > A request that sends no `max_tokens` (nor `max_completion_tokens`,
         > nor `max_output_tokens` on `/v1/responses`) generates at most
-        > `--default-max-tokens` tokens, 38,912 by default, its reasoning
-        > included. It ends with `finish_reason: "length"` when it gets there.
-        > Before, it could generate to the end of the context. Send
-        > `max_tokens` for more, or start the server with
-        > `--default-max-tokens 0` for the old behaviour.
+        > `--default-max-tokens` tokens, its reasoning included. The flag is
+        > 38,912 unless you set it (`IGNIS_DEFAULT_MAX_TOKENS`, make
+        > `DEFAULT_MAX_TOKENS`). Such a request ends with
+        > `finish_reason: "length"` when it gets there. Before, it could
+        > generate to the end of the context. Send `max_tokens` for more, or
+        > start the server with `--default-max-tokens 0` for the old
+        > behaviour.
     - **P2.**
       - Knobs `KV_DISK_BYTES` and `KV_DISK_PATH`. `make config` prints them
         with the disk directory and budget.
       - The README documents the tier and its flags.
-    - **P3.** The README says how a request takes pages, in this sense:
+    - **P3.** The README says how a request takes pages, in the sense of the
+      branch built.
+      - *(growth)*
 
-      > A request reserves its prompt plus 2,048 tokens when it is admitted,
-      > and takes pages as it generates. When the pool runs out, the
-      > lowest-ranked sequence moves to KV-RAM or KV-disk and later resumes
-      > exactly where it stopped. No request is refused or loses work for it.
-      > A request may wait, and a lane may pause, until room returns.
-39. **The 27B at its defaults**, checked at the end of every phase.
+        > A request reserves its prompt plus 2,048 tokens when it is
+        > admitted, and takes pages as it generates. When the pool runs out,
+        > the lowest-ranked sequence moves to KV-RAM or KV-disk and later
+        > resumes exactly where it stopped. No request is refused or loses
+        > work for it. A request may wait, and a lane may pause, until room
+        > returns.
+      - *(fixed)*
+
+        > A request reserves its prompt plus its cap when it is admitted: its
+        > `max_tokens`, or `--default-max-tokens`. When a request cannot fit,
+        > a lower-ranked sequence (an `agent` one, for an `interactive`
+        > request) moves to KV-RAM or KV-disk and later resumes exactly where
+        > it stopped. Otherwise the request waits until room returns. No
+        > request is refused or loses work for it.
+41. **The 27B at its defaults**, checked at the end of every phase.
     - Config resolution is identical but for the new fields: the default cap
       at 38,912, the disk off.
     - The plan is byte-identical (AC 1).
     - No disk directory is created.
-    - Its serving changes only in that its requests take the default cap
-      (after P1) and grow their reservations (after P3).
+    - Its serving changes in only two ways. After P1, its requests take the
+      default cap, which also sizes their reservation. After P3, on the growth
+      branch, they grow their reservations.
     - The 27B GPU profile is green.
-40. **The suites are green**, at the end of every phase.
+42. **The suites are green**, at the end of every phase.
     - `cargo test` passes workspace-wide.
     - `cargo check --workspace --features cuda --tests` is clean.
     - `npm test` passes in `web/`.
@@ -784,12 +904,15 @@ Each criterion belongs to one phase (see Phases).
   it, and `submit` writes the result into `params.max_tokens`. Every entry
   point gets it (chat, responses, the Playground), and `refusal` and `submit`
   cannot disagree.
+  - `reservation()` already reads `generation_budget`. So once P1 lands, a
+    request without a cap reserves its prompt plus the flag's value: the
+    fixed branch's reservation rule, before P0 has decided anything.
 - **The disk ledger mirrors `HostTier`** (entries, owner class,
   probation/protected, use tick). The victim order is shared code, not a copy,
   so the two tiers cannot drift.
 - **Transfers are scheduler states, not blocking calls.** The KV-RAM path
   stays synchronous: it runs at ~12 GB/s and its cost is measured (ADR 0024).
-  Only disk transfers are pumped. AC 35 measures whether a synchronous live
+  Only disk transfers are pumped. AC 37 measures whether a synchronous live
   move is too long a stall.
 - **The staging is reserved at load** (ADR 0030: serving allocates nothing).
   It is a host-plan line on Flash-Next and part of the tier's open on the 27B.
@@ -797,58 +920,77 @@ Each criterion belongs to one phase (see Phases).
   disk writes straight from them.
 - **The tier's IO threads are the tier's own,** not the n-gram reader's: one
   pool per purpose, so a slow write never occupies a gather's thread.
-- **The bound and the reservation are two fields of a request.** The bound
-  decides refusals at submit and caps growth. The reservation is what the pool
-  and the leaf hold.
-- **One pass per advance, in this order.**
+- **P0 measures the worst case.** Growth one page at a time, the finest grain
+  the growth branch could ever use. The branch itself grows by 32-page steps.
+- **The page-shortage victim order is shared by both branches.** It is a pure
+  function in `admission.rs`. On the fixed branch its only caller is
+  admission.
+- **The bound and the reservation are two fields of a request** *(growth)*.
+  The bound decides refusals at submit and caps growth. The reservation is
+  what the pool and the leaf hold. On the fixed branch they are equal.
+- **One pass per advance, in this order** *(growth)*.
   1. The growth pass: resident lanes, highest-ranked first.
   2. Entries, restores and admissions alike, in rank order, under the entry
      rule.
   3. The decode round, without the parked lanes.
-- **Growth and admission share the move path.** A move is
+- **Growth and admission share the move path** *(growth)*. A move is
   `snapshot_and_evict` into KV-RAM, or P2's spill to disk. Growth is one more
   caller beside admission and the head's lane deal.
-- **Parked is a flag on a `Running` request, not a state.** It keeps its lane
-  and its pages; only the decode round reads it.
-- **The new numbers are named constants, not flags:** `KV_GROWTH_STEP_PAGES
-  = 32` and `KV_ENTRY_HEADROOM_STEPS = 4`. They become flags if the owner asks.
+- **Parked is a flag on a `Running` request, not a state** *(growth)*. It
+  keeps its lane and its pages; only the decode round reads it.
+- **The new numbers are named constants, not flags** *(growth)*:
+  `KV_GROWTH_STEP_PAGES = 32` and `KV_ENTRY_HEADROOM_STEPS = 4`. They become
+  flags if the owner asks.
 
 ## Testing Decisions
 
 - Pure plan tests in `vram.rs` and `residency/plan.rs` cover every branch,
   boundary and spelling (ACs 1-7).
-- Config resolution tests in `config.rs` cover ACs 5, 6, 10, 12 and 39.
+- Config resolution tests in `config.rs` cover ACs 5, 6, 10, 12 and 41.
 - The default cap: scheduler tests in `concrete.rs` over `MockCompute`, and
-  the HTTP tests for the three request shapes (AC 11).
+  the HTTP tests for the three request shapes (AC 11). Both the default value
+  and 8,192 are tested.
 - CPU scheduler tests in `crates/core/tests/` run over `MockCompute` with a
-  fake disk and a mirrored page ledger (ACs 17-22, 26-27, 30-33).
+  fake disk (ACs 17-22, 28, 32-35). On the growth branch they also use a
+  mirrored page ledger (ACs 28-29).
 - The page-shortage victim order is a pure function, tested key by key in
-  `admission.rs` (AC 30), as `retained_lane_is_better_victim` is.
-- Existing tests that assert a whole reservation at admission, or a
-  same-class newcomer evicting an older lane for pages, are updated to the new
-  rule, not deleted. Each says which rule it now pins.
+  `admission.rs` (AC 32), as `retained_lane_is_better_victim` is.
+- Some existing tests change to the new rule rather than being deleted, and
+  each says which rule it now pins:
+  - those where a same-class newcomer evicts an older lane for pages (both
+    branches);
+  - those that assert a whole reservation at admission (growth branch).
 - The store's unit tests run on a temp directory: the format, CRC, lock and
   margin (ACs 13-15). The free space is injected, not read from the real
   volume.
-- The kernel CTests are `test_seq_snapshot`, extended to windows (AC 16) and
-  to grown sequences, and `test_seq_alloc`, extended to growth (AC 28).
-- GPU tests are `--ignored`, under the GPU profile (ACs 8-9, 23-25, 29,
-  34-35). Their measurements go to findings, per `docs/findings/README.md`.
-- web: vitest for the snapshot, derive and view of the disk row (AC 37).
+- The kernel CTests:
+  - `test_seq_snapshot`, extended to windows (AC 16), and on the growth
+    branch to grown sequences;
+  - on the growth branch, `test_seq_alloc`, extended to growth (AC 30);
+  - P0's equal-work check (AC 26) lives on the spike branch.
+- GPU tests are `--ignored`, under the GPU profile (ACs 8-9, 23-25, 27, 31,
+  36-37). Their measurements go to findings, per `docs/findings/README.md`.
+- web: vitest for the snapshot, derive and view of the disk row (AC 39).
 
 ## Phases
 
-Three phases, each a separate agent, each ending with ACs 39 and 40. Phases
-are the coordinator's work packages, not tickets.
+Four phases, each a separate agent, each ending with ACs 41 and 42 (P0 with
+42's CPU suites only). Phases are the coordinator's work packages, not
+tickets.
 
 | Phase | Owns | Closes | Depends on |
 |---|---|---|---|
-| **P1 — the pool policy, the floor opt-in, the default cap** | `crates/core/src/vram.rs`, `crates/core/src/residency/plan.rs`, `crates/core/src/flash_next.rs`; `crates/server/src/runtime.rs` (the plan calls, the cap into `SchedulerConfig`); `crates/server/src/config.rs` (`--kv-pool-bytes` token form, `--allow-expert-cache-below-floor`, `--default-max-tokens`); `crates/core/src/concrete.rs` (only `SchedulerConfig::default_max_tokens`, `generation_budget`, the write in `submit`); `mk/config.mk`, `Makefile`; `docs/user/README.md` (its rows) | 1-11, 38 (P1), 39, 40 | nothing |
-| **P2 — Tier 2, KV-disk** | `kernel/` (windowed snapshot and restore, `test_seq_snapshot`); `crates/artifact/src/direct.rs`; `crates/runtime/src/lib.rs` and a new `kv_disk` module; `crates/core/src/{scheduler.rs, mock.rs, disk.rs (new), host.rs, concrete.rs (the chain), checkpoint.rs, prefix.rs, ngram_table.rs, types.rs}`; `crates/server/src/{telemetry.rs, metrics.rs}`; `crates/server/src/config.rs` (`--kv-disk-*` only); `crates/server/src/runtime.rs` (the store, the staging line); `web/src/monitor/`, `web/mockMetrics.ts`; ADR 0017's table; make knobs and README rows for the tier | 12-25, 36, 37, 38 (P2), 39, 40 | nothing; it can run beside P1 |
-| **P3 — page-wise reservations and live moves** | `kernel/src/seq.cu`, `kernel/src/seq_prefix.cu`, `kernel/src/seq_checkpoint.cu`, `kernel/include/ignis_seq.h` (allocation at the reservation, `ignis_seq_grow`), `test_seq_alloc`; `crates/core/src/seq.rs` (`Seq::grow`); `crates/core/src/{concrete.rs (reservation, growth, parking, entry rule, last resort), admission.rs (rank and the page-shortage order), scheduler.rs and mock.rs (`grow`, the mirrored ledger), types.rs (`Parked`)}`; `crates/runtime/src/lib.rs` (`grow`, allocation and restore at the reservation); `crates/server/src/{telemetry.rs, metrics.rs}` (`ignis_kv_lane_parks_total`); ADR 0017's row; the README paragraph | 26-35, 38 (P3), 39, 40 | P2 and P1 |
+| **P0 — the measurement gate (spike)** | A branch of its own, not merged as is: the extend operation in `kernel/src/seq.cu` and `kernel/include/ignis_seq.h`, its binding in `crates/core/src/seq.rs`, the whole/growth switch in `crates/runtime/src/lib.rs`, the A-B-A harness. Merged: only the finding, with its index row | 26, 27 | nothing; only its GPU legs need the card |
+| **P1 — the pool policy, the floor opt-in, the default cap** | `crates/core/src/vram.rs`, `crates/core/src/residency/plan.rs`, `crates/core/src/flash_next.rs`; `crates/server/src/runtime.rs` (the plan calls, the cap into `SchedulerConfig`); `crates/server/src/config.rs` (`--kv-pool-bytes` token form, `--allow-expert-cache-below-floor`, `--default-max-tokens`); `crates/core/src/concrete.rs` (only `SchedulerConfig::default_max_tokens`, `generation_budget`, the write in `submit`); `mk/config.mk`, `Makefile`; `docs/user/README.md` (its rows) | 1-11, 40 (P1), 41, 42 | nothing |
+| **P2 — Tier 2, KV-disk** | `kernel/` (windowed snapshot and restore, `test_seq_snapshot`); `crates/artifact/src/direct.rs`; `crates/runtime/src/lib.rs` and a new `kv_disk` module; `crates/core/src/{scheduler.rs, mock.rs, disk.rs (new), host.rs, concrete.rs (the chain), checkpoint.rs, prefix.rs, ngram_table.rs, types.rs}`; `crates/server/src/{telemetry.rs, metrics.rs}`; `crates/server/src/config.rs` (`--kv-disk-*` only); `crates/server/src/runtime.rs` (the store, the staging line); `web/src/monitor/`, `web/mockMetrics.ts`; ADR 0017's table; make knobs and README rows for the tier | 12-25, 38, 39, 40 (P2), 41, 42 | nothing; it can run beside P1 |
+| **P3, growth branch — page-wise reservations and live moves** | `kernel/src/seq.cu`, `kernel/src/seq_prefix.cu`, `kernel/src/seq_checkpoint.cu`, `kernel/include/ignis_seq.h` (allocation at the reservation, `ignis_seq_grow` from P0's spike), `test_seq_alloc`; `crates/core/src/seq.rs` (`Seq::grow`); `crates/core/src/{concrete.rs (reservation, growth, parking, entry rule, last resort), admission.rs (rank and the page-shortage order), scheduler.rs and mock.rs (`grow`, the mirrored ledger), types.rs (`Parked`)}`; `crates/runtime/src/lib.rs` (`grow`, allocation and restore at the reservation); `crates/server/src/{telemetry.rs, metrics.rs}` (`ignis_kv_lane_parks_total`); ADR 0017's row; the README paragraph | 28-37 (the *(growth)* and *(both)* parts), 40 (P3), 41, 42 | P0's verdict = growth; P2; P1 |
+| **P3, fixed branch — live moves** | `crates/core/src/{concrete.rs (entry rule, admission as the only trigger), admission.rs (rank and the page-shortage order)}`; no kernel change; the README paragraph | 28, 32-34, 35's fixed bullet, 36-37 (the *(fixed)* and *(both)* parts), 40 (P3), 41, 42 | P0's verdict = fixed; P2; P1 |
 
 - **P1 first slice.** The default cap (ACs 10-11, and the README text of AC
-  38) needs no GPU. It can be closed on its own before the plan work.
+  40) needs no GPU. It can be closed on its own before the plan work.
+- **P0 runs early.** Its CPU part (the operation and its equal-work check)
+  needs no card, and its GPU legs are one A-B-A per model. It can run beside
+  P1 and P2 whenever the card is free; P3 cannot start without its verdict.
 - **P1 and P2 share four files** (`config.rs`, `runtime.rs`, `mk/config.mk` with
   the `Makefile`, and the README). Each touches its own flags, functions and
   rows there, so the hunks are additive, and whichever merges second rebases.
@@ -861,13 +1003,17 @@ are the coordinator's work packages, not tickets.
   4. The wiring, the metrics and the Monitor.
   5. The GPU ACs.
 - **Why P3 follows P2.**
-  - Both rewrite `kernel/src/seq.cu`, `concrete.rs`'s eviction and restore
-    paths, and the `Compute` seam with its `MockCompute`. Run together, they
-    would conflict at every hunk.
+  - Both rewrite `concrete.rs`'s eviction and restore paths and the
+    `Compute` seam with its `MockCompute`. On the growth branch they also
+    both rewrite `kernel/src/seq.cu`. Run together, they would conflict at
+    every hunk.
   - A live move to disk needs P2's transfer states.
   - P3's CPU tests reuse P2's fake disk.
   - It follows P1 for the default cap, which its tests and AC 9's load
     assume.
+- **The fixed branch's P3 is small.** P1 already makes admission reserve the
+  prompt plus the cap. What is left is the victim order, the rank gate, the
+  entry rule and their tests.
 
 ## Out of Scope
 
@@ -878,7 +1024,7 @@ are the coordinator's work packages, not tickets.
   number. Left to the owner, unchanged on 2026-10-08.
 - **Moving sequences at a pool low-water mark** (pre-emptive). One step of
   room ahead per lane is the mitigation.
-- **Windowing the KV-RAM moves.** A follow-up if AC 35's synchronous leg
+- **Windowing the KV-RAM moves.** A follow-up if AC 37's synchronous leg
   misses its bound.
 - **Changing the lane-shortage order** (the head's lane deal).
 - **Flags for the growth step and the entry headroom.** They are named

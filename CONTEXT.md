@@ -59,27 +59,32 @@ When output names a domain concept, use the term as defined here.
   Pages are a dimension of their own: see **KV reservation**.
 - **Generation cap** — the most a request may generate, reasoning included:
   its `max_tokens` (`max_completion_tokens`, `max_output_tokens`), or else the
-  server's `--default-max-tokens` (38,912 on both models, Qwen's output length
-  for complex tasks), clamped to what the prompt leaves of `--max-context`.
+  server's `--default-max-tokens` (on both models; its own default is 38,912,
+  Qwen's output length for complex tasks, and the flag changes it), clamped to
+  what the prompt leaves of `--max-context`.
   `0` lifts the default to the context. Reaching it ends the request with
   `finish_reason: "length"`. An explicit cap past the context is refused, never
   clamped (ADR 0045).
-- **KV reservation** — the KV pages the pool has given a request: at admission
-  its prompt (the tail past a claimed **shared prefix**) plus one **growth
-  step** of 32 pages, 2,048 tokens. From its first round a lane keeps at least
-  a step of room ahead of its position, and takes the next step as it
-  generates, up to its *bound*: prompt plus **generation cap**, never past
-  `--max-context`. A submission is checked against the bound, so a request
-  alone always fits the pool. When the pool runs out, the **eviction
-  priority** moves something below the requester down a tier. A request
-  entering the device, admitted or restored, needs room for four steps for
-  itself and for every resident sequence that ranks above it. Before ADR 0045
-  a reservation was the whole bound and never grew (core-05).
+- **KV reservation** — the KV pages the pool has given a request. Its *bound*
+  is prompt plus **generation cap**, never past `--max-context`. A submission
+  is checked against the bound, so a request alone always fits the pool.
+  Which reservation rule applies is decided by a measurement, ADR 0045's P0
+  gate.
+  - If growing a sequence costs decode nothing beyond noise (growth branch),
+    the reservation at admission is its prompt (the tail past a claimed
+    **shared prefix**) plus one *growth step* of 32 pages, 2,048 tokens. From
+    its first round a lane keeps at least a step of room ahead, and takes the
+    next step as it generates, up to its bound.
+  - Otherwise (fixed branch), the reservation is the bound, from admission.
+
+  When the pool runs out, the **eviction priority** moves something below
+  the requester down a tier. Before ADR 0045, a reservation was the bound with
+  the whole context as the cap, and never grew (core-05).
   _Avoid_: allocation (the leaf's word for the mapped pages).
-- **Parked lane** — a decode lane held out of rounds because its room ahead is
-  below one round's largest append and no page can be had yet. It keeps its
-  pages and resumes at the first advance with room. It is not decoding, so a
-  higher-ranked need takes it first.
+- **Parked lane** — on the growth branch, a decode lane held out of rounds
+  because its room ahead is below one round's largest append and no page can
+  be had yet. It keeps its pages and resumes at the first advance with room.
+  It is not decoding, so a higher-ranked need takes it first.
 - **VRAM budget** — the device memory the whole ignis process may hold,
   weights included: the number Task Manager shows. Either explicit (the
   operator names it) or derived (the memory free at start minus the **VRAM
@@ -480,8 +485,8 @@ When output names a domain concept, use the term as defined here.
   never discarded to make room: when no tier has room, the request that needed
   it waits (ADR 0045).
 
-  A shortage of *pages* (a lane's growth, an admission; ADR 0045) moves only
-  what ranks below the requester. *Rank* is class, then submission order, and
+  A shortage of *pages* (an admission, and on ADR 0045's growth branch a
+  lane's growth) moves only what ranks below the requester. *Rank* is class, then submission order, and
   a moved sequence keeps its rank. Retained state goes first; then `Agent`
   before `Interactive`; then sequences not in the decode round (waiting for a
   lane, at a chunk boundary, a **parked lane**) before lane holders; then the

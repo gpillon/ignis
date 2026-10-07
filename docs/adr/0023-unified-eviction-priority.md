@@ -9,10 +9,11 @@ Amended 2026-10-07 by ADR 0045: the priority reaches one tier further down.
 On a load with KV-disk, leaving KV-RAM is a move to the disk, and leaving the
 disk follows KV-RAM's order. An evicted live sequence is then never discarded
 to make room.
-Amended 2026-10-08 by ADR 0045 (reservations grow by pages):
+Amended 2026-10-08 by ADR 0045 (live moves; reservations grow by pages if
+its P0 gate passes):
 
-- **A page shortage takes what is not decoding first.** That covers a lane's
-  growth and an admission. Sequences not in the decode round go before lane
+- **A page shortage takes what is not decoding first.** That covers an
+  admission, and on the growth branch a lane's growth. Sequences not in the decode round go before lane
   holders, within a class. This reverses the #190 amendment's lane-holder-first
   order for pages only. A lane shortage keeps it, since moving a lane-less
   request frees no lane.
