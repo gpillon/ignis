@@ -35,6 +35,10 @@ pub struct EngineShape {
     pub decode_share_percent: Option<u32>,
     /// The maximum per-sequence context, in tokens.
     pub max_context: u32,
+    /// The generation cap of a request that sends none
+    /// (`--default-max-tokens`, ADR 0045); 0 = none. A scheduler setting, not
+    /// a load option: it never reaches the leaf or a blob's identity.
+    pub default_max_tokens: u32,
     /// The KV storage format the load runs on (`--kv-format`, GitHub #122).
     pub kv_format: ignis_core::KvFormat,
     /// The paged-KV pool budget, in bytes (`--kv-pool-bytes`). `None` gives
@@ -97,6 +101,7 @@ impl Default for EngineShape {
             prefill_chunk: ignis_runtime::DEFAULT_PREFILL_CHUNK,
             decode_share_percent: None,
             max_context: ignis_runtime::DEFAULT_MAX_CONTEXT,
+            default_max_tokens: crate::config::DEFAULT_MAX_TOKENS,
             kv_format: ignis_core::KvFormat::default(),
             kv_pool_bytes: None,
             vram: ignis_core::VramMode::Derived {
@@ -126,6 +131,7 @@ impl From<&crate::config::Config> for EngineShape {
             prefill_chunk: config.prefill_chunk,
             decode_share_percent: config.decode_share_percent,
             max_context: config.max_context,
+            default_max_tokens: config.default_max_tokens,
             kv_format: config.kv_format,
             kv_pool_bytes: config.kv_pool_bytes,
             vram: config.vram,
@@ -216,6 +222,8 @@ fn scheduler_config_for_shape(
         model,
         kv_page_tokens,
         max_sequence_tokens: shape.max_context,
+        // ADR 0045: one home for the default cap, on both models' loads.
+        default_max_tokens: shape.default_max_tokens,
         kv_capacity_pages: capacity_pages,
         host_capacity_bytes: shape.host_pool_bytes,
         serving_chunk_tokens: shape.prefill_chunk,
@@ -1032,6 +1040,7 @@ mod tests {
             prefill_chunk: 512,
             decode_share_percent: Some(25),
             max_context: 65_536,
+            default_max_tokens: 8_192,
             kv_format: ignis_core::KvFormat::Bf16,
             kv_pool_bytes: Some(8 * 1024 * 1024 * 1024),
             vram: EngineShape::default().vram,
@@ -1054,6 +1063,8 @@ mod tests {
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
 
         assert_eq!(config.serving_chunk_tokens, 512);
+        // ADR 0045: and the default cap.
+        assert_eq!(config.default_max_tokens, 8_192);
         // GitHub #306: and the decode share, as a fraction.
         assert_eq!(config.decode_share, 0.25);
         // GitHub #186: the reuse knobs reach the scheduler too -- and the
@@ -1063,6 +1074,29 @@ mod tests {
         assert_eq!(config.retained_slots, 5);
         // GitHub #190: and so does the Interactive TTL.
         assert_eq!(config.retained_interactive_ttl, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_default_max_tokens_reaches_the_scheduler_on_both_models() {
+        // ADR 0045: 38,912 unless named, and a named value -- 8,192 -- on
+        // either family's load, through the one shape both build from.
+        use ignis_core::compute::ModelFamily;
+        let shape_of = |flags: &[&str]| {
+            let args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).expect("resolve")
+            else {
+                panic!("expected a runnable config");
+            };
+            EngineShape::from(&config)
+        };
+        for (flags, cap) in [(&[][..], 38_912), (&["--default-max-tokens", "8192"][..], 8_192), (&["--default-max-tokens", "0"][..], 0)] {
+            let shape = shape_of(flags);
+            let flash = shape.for_family(ModelFamily::FlashNext);
+            let qwen = shape.with_family_decode_share(ModelFamily::Qwen38_27b);
+            for (family, shape) in [("Flash-Next", flash), ("27B", qwen)] {
+                assert_eq!(scheduler_config_for_shape("m".into(), shape, 64, 1024).default_max_tokens, cap, "{family} {flags:?}");
+            }
+        }
     }
 
     #[test]

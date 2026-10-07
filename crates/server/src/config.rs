@@ -33,6 +33,12 @@ pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 /// `--thinking-budget off` turns it off.
 pub const DEFAULT_THINKING_BUDGET: u32 = 6144;
 
+/// `--default-max-tokens`' default (ADR 0045, GitHub #309): what a request
+/// that names no `max_tokens` may generate, its reasoning included, on both
+/// models -- Qwen's recommended output length for complex tasks. `0` is no
+/// default: such a request may generate to the end of the context, as before.
+pub const DEFAULT_MAX_TOKENS: u32 = 38_912;
+
 /// The default non-streaming completion timeout, in seconds (GitHub #95) —
 /// unchanged from the value `Server::new` hardcoded before this flag
 /// existed.
@@ -134,6 +140,11 @@ pub struct Config {
     /// The maximum per-sequence context, in tokens (the largest prompt +
     /// generation budget a single request may reserve).
     pub max_context: u32,
+    /// The **default `max_tokens`** (`--default-max-tokens` /
+    /// `IGNIS_DEFAULT_MAX_TOKENS`, ADR 0045): the generation cap of a request
+    /// that sends none, clamped by the scheduler to what its prompt leaves of
+    /// the context. [`DEFAULT_MAX_TOKENS`] unless named; `0` is none.
+    pub default_max_tokens: u32,
     /// The KV storage format this load runs on (ADR 0022, GitHub #122),
     /// fixed for the life of the load.
     pub kv_format: KvFormat,
@@ -383,6 +394,7 @@ pub fn resolve(
     let mut prefill_chunk = None;
     let mut decode_share = None;
     let mut max_context = None;
+    let mut default_max_tokens = None;
     let mut kv_format = None;
     let mut kv_pool_bytes = None;
     let mut host_pool_bytes = None;
@@ -433,6 +445,7 @@ pub fn resolve(
             "--prefill-chunk" => prefill_chunk = Some(take_value(args, &mut i, flag)?),
             "--decode-share" => decode_share = Some(take_value(args, &mut i, flag)?),
             "--max-context" => max_context = Some(take_value(args, &mut i, flag)?),
+            "--default-max-tokens" => default_max_tokens = Some(take_value(args, &mut i, flag)?),
             "--kv-format" => kv_format = Some(take_value(args, &mut i, flag)?),
             "--kv-pool-bytes" => kv_pool_bytes = Some(take_value(args, &mut i, flag)?),
             "--kv-host-pool-bytes" => host_pool_bytes = Some(take_value(args, &mut i, flag)?),
@@ -517,6 +530,7 @@ pub fn resolve(
     let prefill_chunk = resolve_prefill_chunk(prefill_chunk, &env)?;
     let decode_share_percent = resolve_decode_share(decode_share, &env)?;
     let max_context = resolve_max_context(max_context, &env)?;
+    let default_max_tokens = resolve_default_max_tokens(default_max_tokens, &env)?;
     // The format is resolved before the budget, because what a budget is
     // worth in tokens — and so what the auto default has to be — depends on
     // it (GitHub #122).
@@ -665,6 +679,7 @@ pub fn resolve(
         prefill_chunk,
         decode_share_percent,
         max_context,
+        default_max_tokens,
         kv_format,
         kv_pool_bytes,
         vram,
@@ -1112,6 +1127,20 @@ fn resolve_max_context(
     Ok(context)
 }
 
+/// `--default-max-tokens` / `IGNIS_DEFAULT_MAX_TOKENS` / [`DEFAULT_MAX_TOKENS`]
+/// (ADR 0045). `0` is a legal, explicit choice -- no default cap -- and a
+/// value past `--max-context` is accepted: the scheduler clamps it to what
+/// each prompt leaves, so it acts as the context.
+fn resolve_default_max_tokens(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<u32, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_DEFAULT_MAX_TOKENS"))) else {
+        return Ok(DEFAULT_MAX_TOKENS);
+    };
+    parse_count("--default-max-tokens", "token count (0 = no default)", &raw)
+}
+
 /// `--kv-format` / `IGNIS_KV_FORMAT` / [`KvFormat::default`]
 /// (`hq-e8-2b`, the serving default since GitHub #123; `bf16` is the
 /// retained oracle format an operator asks for by name).
@@ -1448,6 +1477,7 @@ fn help_text() -> String {
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
          \x20       --decode-share <percent>  env: IGNIS_DECODE_SHARE   (default: the model's, 25 on both models; 0 is one round per chunk, 50 splits time evenly; the percent of the time decoding lanes keep while a prompt prefills, 0-99)\n\
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
+         \x20       --default-max-tokens <n|0> env: IGNIS_DEFAULT_MAX_TOKENS (default: {DEFAULT_MAX_TOKENS}; the max_tokens of a request that sends none, its reasoning included, never past what its prompt leaves of --max-context; an explicit cap always wins; 0 = none, up to the context)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
          \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: the rest of the VRAM budget; accepts a K/M/G suffix)\n\
          \x20       --vram-headroom-bytes <b> env: IGNIS_VRAM_HEADROOM_BYTES (default: {default_vram_headroom_gib} GiB; the VRAM budget is the memory free at start minus this; not with --vram-budget-bytes)\n\
@@ -1853,6 +1883,53 @@ mod tests {
     fn a_zero_max_context_is_a_usage_error() {
         let err = resolve(&args(&["--max-context", "0"]), no_env).expect_err("must reject");
         assert!(err.0.contains("--max-context"), "{err}");
+    }
+
+    // ── the default max_tokens (ADR 0045, GitHub #309) ───────────────────
+
+    #[test]
+    fn the_default_max_tokens_is_38912_and_takes_a_value_from_every_spelling() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.default_max_tokens, 38_912);
+        // AC 10: a non-default value, 8,192, from the flag and from the env
+        // var in turn (make's knob: `mk/flags-selftest.sh`).
+        let a = args(&["--default-max-tokens", "8192"]);
+        assert_eq!(expect_config(resolve(&a, no_env).expect("resolve")).default_max_tokens, 8_192);
+        let env = env_map(&[("IGNIS_DEFAULT_MAX_TOKENS", "8192")]);
+        assert_eq!(expect_config(resolve(&[], &env).expect("resolve")).default_max_tokens, 8_192);
+        let a = args(&["--default-max-tokens", "4096"]);
+        assert_eq!(
+            expect_config(resolve(&a, &env).expect("resolve")).default_max_tokens,
+            4_096,
+            "the flag wins over the env var"
+        );
+        let a = args(&["--default-max-tokens", "0"]);
+        assert_eq!(expect_config(resolve(&a, no_env).expect("resolve")).default_max_tokens, 0, "0 is none");
+        // Past the context it is accepted: the scheduler clamps it to what
+        // each prompt leaves, so it acts as the context.
+        let a = args(&["--max-context", "40960", "--default-max-tokens", "1000000"]);
+        assert_eq!(expect_config(resolve(&a, no_env).expect("resolve")).default_max_tokens, 1_000_000);
+    }
+
+    #[test]
+    fn a_malformed_default_max_tokens_is_refused_naming_the_flag() {
+        for bad in ["eight", "-1", "8k", "1.5"] {
+            let err = resolve(&args(&["--default-max-tokens", bad]), no_env).expect_err(bad);
+            assert!(err.0.contains("--default-max-tokens"), "{bad}: {err}");
+        }
+        let err = resolve(&[], env_map(&[("IGNIS_DEFAULT_MAX_TOKENS", "lots")])).expect_err("env");
+        assert!(err.0.contains("--default-max-tokens"), "{err}");
+    }
+
+    #[test]
+    fn the_help_names_the_default_max_tokens_and_none() {
+        let ConfigOutcome::Help(help) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
+            panic!("--help is help");
+        };
+        let line = help.lines().find(|l| l.contains("--default-max-tokens")).expect("a help line");
+        assert!(line.contains("IGNIS_DEFAULT_MAX_TOKENS"), "{line}");
+        assert!(line.contains("default: 38912"), "{line}");
+        assert!(line.contains("0 = none"), "{line}");
     }
 
     #[test]

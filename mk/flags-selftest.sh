@@ -64,6 +64,33 @@ case "$plan" in *"decode_share=25%"*"lanes=2"*|*"lanes=2"*"decode_share=25%"*) ;
 out="$(flags MODEL=flash-next LANES=1)"
 has "LANES=1" "$out" "--decode-lanes 1"
 
+# ADR 0045: the default max_tokens, a non-default value on both models, and
+# nothing passed when the knob is empty (the server's own 38912).
+for model in "MODEL=flash-next" "MODEL=27b"; do
+    out="$(flags $model DEFAULT_MAX_TOKENS=8192)"
+    has "$model DEFAULT_MAX_TOKENS=8192" "$out" "--default-max-tokens 8192"
+    out="$(flags $model)"
+    lacks "$model default" "$out" "--default-max-tokens"
+done
+out="$(flags MODEL=flash-next ALLOW_EXPERT_CACHE_BELOW_FLOOR=1)"
+has "ALLOW_EXPERT_CACHE_BELOW_FLOOR=1" "$out" "--allow-expert-cache-below-floor"
+lacks "floor default" "$(flags MODEL=flash-next)" "--allow-expert-cache-below-floor"
+out="$(flags MODEL=flash-next KV_POOL_BYTES=512Ktok)"
+has "KV_POOL_BYTES=512Ktok" "$out" "--kv-pool-bytes 512Ktok"
+
+# The pool policy and its tokens, before the load (ADR 0045, AC 7): offloaded
+# at 524,288 on Flash-Next, 4,104 pages at one lane, the floor at 524,288 of
+# context; resident on the 27B.
+plan_of() { make config CUDA=1 "$@" 2>/dev/null | sed -n 's/^PLAN  *//p'; }
+for case in "|kv_pool=offloaded 524288 tokens" "LANES=1|kv_pool=offloaded 262656 tokens" \
+            "MAX_CONTEXT=524288|kv_pool=offloaded 524800 tokens" "KV_POOL_BYTES=512Ktok|kv_pool=512Ktok (named)"; do
+    knobs="${case%%|*}"; fact="${case#*|}"
+    plan="$(plan_of MODEL=flash-next $knobs)"
+    case "$plan" in *"$fact"*) ;; *) fail "PLAN [$knobs]: '$fact' missing from: $plan" ;; esac
+done
+engine="$(make config CUDA=1 2>/dev/null | sed -n 's/^engine (CUDA=1) //p')"
+case "$engine" in *"pool=resident"*) ;; *) fail "27B engine line: 'pool=resident' missing from: $engine" ;; esac
+
 out="$(flags)"
 lacks "27B" "$out" "--decode-lanes"
 

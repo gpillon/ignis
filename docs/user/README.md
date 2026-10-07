@@ -177,6 +177,7 @@ always-current table; this one is a copy.
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--max-context <tokens>` | `IGNIS_MAX_CONTEXT` | `40960` | Max per-sequence context (prompt + generation). The KV pool must be able to hold one of them or the load is refused. On the 27B the attention bounds it too: at most 524,288 on `bf16`, 1,048,576 on `hq-e8-2b`; past that the start is refused. Flash-Next has no such bound. |
+| `--default-max-tokens <n\|0>` | `IGNIS_DEFAULT_MAX_TOKENS` | `38912` | The `max_tokens` of a request that sends none (see [Chat completions](#chat-completions)), its reasoning included, on both models. Never more than what the prompt leaves of `--max-context`, so a long prompt is never refused for it. An explicit cap always wins. `0` = none: such a request may generate to the end of the context, as before. (`make` knob `DEFAULT_MAX_TOKENS`.) |
 | `--prefill-chunk <tokens>` | `IGNIS_PREFILL_CHUNK` | `1024` | The prefill chunk width, a nonzero multiple of 128. The program's prefill scratch is reserved for it at load. |
 | `--decode-lanes <n>` | `IGNIS_DECODE_LANES` | `3` | Flash-Next only, `1..=8`: the sequences decoded at once. Each lane holds a whole `--max-context` in the KV pool, so fewer lanes leave the expert cache more of the VRAM budget (and a lone user decodes at one lane either way). The 27B serves a fixed 8 lanes and refuses the flag. `make MODEL=flash-next` runs 3 lanes at 262,144 tokens each (the checkpoint's trained positions); the `make` knob is `LANES`. |
 | `--decode-share <percent>` | `IGNIS_DECODE_SHARE` | `25` on both models | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next chunk of the same prompt waits `t * s / (1 - s)` of wall time while they decode, and nothing waits when no lane decodes or after the prompt's last chunk. It trades the prefilling request's TTFT (about x1.33 at 25, x2 at 50, only while lanes decode) for the lanes' rate (15.6-18.3 tok/s on Flash-Next instead of ~1; why 25: [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md)). `--decode-share 0` restores one decode round per chunk, the pacing before [#92](../findings/2026-10-07-27b-prefill-chunk-width.md); 50 splits time evenly. A prompt alone is unaffected. |
@@ -421,6 +422,14 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   and because the leaf's greedy branch does not read stochastic filters or
   penalties, a non-neutral `top_p`, `top_k`, `presence_penalty` or
   `frequency_penalty` sent with it is rejected rather than ignored.
+- A request that sends no `max_tokens` (nor `max_completion_tokens`, nor
+  `max_output_tokens` on `/v1/responses`) generates at most
+  `--default-max-tokens` tokens, its reasoning included. The flag is 38,912
+  unless you set it (`IGNIS_DEFAULT_MAX_TOKENS`, make `DEFAULT_MAX_TOKENS`).
+  Such a request ends with `finish_reason: "length"` when it gets there
+  (`incomplete` with `max_output_tokens` on `/v1/responses`). Before, it could
+  generate to the end of the context. Send `max_tokens` for more, or start the
+  server with `--default-max-tokens 0` for the old behaviour.
 - `max_completion_tokens` is `max_tokens` under OpenAI's current name — the
   one the current SDKs send. Both with different values is a 400.
 - `stop` (a string, or 1 to 4 non-empty strings) ends the answer before the
