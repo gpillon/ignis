@@ -687,6 +687,78 @@ int main(int argc, char **argv) {
     check(final_moved == moved, "the mirror after free: bytes moved " + std::to_string(final_moved) +
                                     ", the device " + std::to_string(moved));
   }
+
+  // A prefetch that evicts a later candidate of the same lookahead: the candidate is no longer
+  // resident at its turn, so it is prefetched again, as the policy walks them one at a time.
+  // Two layers of 16 experts, one class per projection with 12 slots: the warm start holds
+  // layer 1's experts B (hotter) and A; a decode step of layer 0 misses ten experts, which fills
+  // both classes, and looks ahead at [X, A]. X evicts the least recent, A; A then evicts B.
+  {
+    constexpr uint32_t kE = 16, kA = 12, kB = 13, kX = 14;
+    auto key = [](uint32_t layer, uint32_t expert, uint32_t projection) { return (layer * kE + expert) * 2 + projection; };
+    ignis_residency_desc d2{};
+    d2.layers = 2;
+    d2.experts = kE;
+    for (int c = 0; c < 8; ++c) d2.record_bytes[c] = 4096;
+    d2.capacity[0] = d2.capacity[4] = 12;  // gate/up and down at K = 2
+    d2.max_tokens = 1;
+    d2.lookahead_width = 2;
+    d2.prefetch_budget_bytes = IGNIS_RESIDENCY_NO_BUDGET;
+    d2.staging_half_bytes = 2 * kE * 4096;
+    d2.host_pool_bytes = 2 * 2 * kE * 4096;
+    d2.copy_blocks = 4;
+    d2.report = 1;
+    const std::vector<uint8_t> k2(2 * 2 * kE, 4);
+    std::vector<uint64_t> offsets2(2 * 2 * kE);
+    for (size_t i = 0; i < offsets2.size(); ++i) offsets2[i] = i * 4096;
+    ignis_residency *r2 = nullptr;
+    RES_OK(ignis_residency_create(&d2, k2.data(), offsets2.data(), &r2));
+    const std::vector<uint32_t> warm = {key(1, kB, 0), key(1, kB, 1), key(1, kA, 0), key(1, kA, 1)};
+    uint32_t warmed = 0;
+    RES_OK(ignis_residency_warm_start(r2, warm.data(), static_cast<uint32_t>(warm.size()), &warmed));
+    check(warmed == 4, "eviction check: the warm start admits A and B");
+    cudaStream_t s2;
+    CUDA_OK(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
+    std::vector<int32_t> ids2(IGNIS_MOE_TOP_K);
+    for (uint32_t i = 0; i < IGNIS_MOE_TOP_K; ++i) ids2[i] = static_cast<int32_t>(i);
+    const std::vector<int32_t> look2 = {static_cast<int32_t>(kX), static_cast<int32_t>(kA)};
+    int32_t *d_ids2 = nullptr, *d_look2 = nullptr;
+    CUDA_OK(cudaMalloc(&d_ids2, ids2.size() * 4));
+    CUDA_OK(cudaMalloc(&d_look2, look2.size() * 4));
+    CUDA_OK(cudaMemcpy(d_ids2, ids2.data(), ids2.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_look2, look2.data(), look2.size() * 4, cudaMemcpyHostToDevice));
+    if (split_mode) {
+      void *side = nullptr;
+      RES_OK(ignis_residency_step_demand(r2, 0, IGNIS_RESIDENCY_DECODE, d_ids2, 1, s2, &side));
+      RES_OK(ignis_residency_step_prefetch_ranked(r2, d_look2, 1, 2));
+    } else {
+      RES_OK(ignis_residency_step_ranked(r2, 0, IGNIS_RESIDENCY_DECODE, d_ids2, 1, d_look2, 1, 2, s2));
+    }
+    RES_OK(ignis_residency_join(r2, s2));
+    CUDA_OK(cudaStreamSynchronize(s2));
+    ignis_residency_report head{};
+    std::vector<uint32_t> lists(static_cast<size_t>(IGNIS_RESIDENCY_LISTS) * 4 * kE);
+    RES_OK(ignis_residency_last_report(r2, 0, &head, lists.data(), 4 * kE));
+    auto list = [&](int l) {
+      std::set<uint32_t> out(lists.begin() + static_cast<size_t>(l) * 4 * kE,
+                             lists.begin() + static_cast<size_t>(l) * 4 * kE + head.count[l]);
+      return out;
+    };
+    check(head.status == 0, "eviction check: status " + std::to_string(head.status));
+    check(list(4) == std::set<uint32_t>{key(1, kX, 0), key(1, kX, 1), key(1, kA, 0), key(1, kA, 1)},
+          "eviction check: X and then the A it evicted are prefetched");
+    check(list(3) == std::set<uint32_t>{key(1, kA, 0), key(1, kA, 1), key(1, kB, 0), key(1, kB, 1)},
+          "eviction check: X evicts A, A evicts B");
+    std::vector<ignis_moe_slot> t2(2 * kE);
+    CUDA_OK(cudaMemcpy(t2.data(), ignis_residency_slot_table(r2, 1), t2.size() * sizeof(ignis_moe_slot),
+                       cudaMemcpyDeviceToHost));
+    check(t2[2 * kA].record != nullptr && t2[2 * kA + 1].record != nullptr, "eviction check: A is resident");
+    check(t2[2 * kB].record == nullptr && t2[2 * kB + 1].record == nullptr, "eviction check: B is ABSENT");
+    cudaFree(d_ids2);
+    cudaFree(d_look2);
+    cudaStreamDestroy(s2);
+    ignis_residency_free(r2);
+  }
   if (g_failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;
