@@ -123,11 +123,11 @@ Observed:
      traversal attends to: 101 to 170 ms across 1024's full chunks, 336 to
      570 ms at 4096, 695 to 984 ms at 8192.
    - The longest gap is 231-234 ms at 1024, 387 at 2048, 702 at 4096 and
-     1,294 at 8192 (5.6x). It is the traversal that ends at the prompt's
-     publish point, ~55 ms above the trend at 1024. That traversal also
-     captures the prompt's checkpoint into a host retained slot and, with the
-     slots full, evicts one (inferred: the 2026-09-30 capture puts these at
-     ~25 and ~30 ms).
+     1,294 at 8192 (5.6x): about 2x the gap after the prompt's first
+     traversal at every width (98-101, 174-185, 336-338 and 690-695 ms over
+     all reps and lanes). It follows the traversal
+     that ends at the prompt's publish point, ~55 ms above the full chunks'
+     trend at 1024. Why that one is longer is not measured (see Inferred).
    - The lanes' rate during the prefill falls from 8.9 tok/s (16% of their
      54.6) to 5.9, 4.3 and 3.4.
 3. **The larger gain under load is the lanes' time moving to the prompt.**
@@ -152,7 +152,12 @@ Observed:
 
 Inferred:
 
-- **Why the curve is flat.**
+- **The longest gap's excess.** The publish-point traversal also captures the
+  prompt's checkpoint into a host retained slot and, with the slots full,
+  evicts one; the 2026-09-30 capture puts those at ~25 and ~30 ms, which
+  matches the ~55 ms. Not measured here.
+- **Why the curve is flat**, a consistent reading that this sweep cannot
+  separate from per-token costs:
   - Fewer traversals save a fixed per-traversal cost of ~5 ms. The 2026-09-30
     capture, taken after the A16 route, attributes ~3.3 ms to launch gaps and
     ~1.5 ms to TMA descriptor uploads per traversal ([finding](2026-09-30-prefill-other-class.md)).
@@ -160,10 +165,6 @@ Inferred:
     gave 0.0865, 0.0903 and 0.0958 ms per token at 1024, 4096 and 8192.
   - At 8K, 1024 to 4096 saves 6 traversals (~30 ms) and adds ~31 ms of
     per-token cost (8,192 x 3.8 us). At 8192 the per-token rise wins.
-- **Width is not the 1.77x lever.** That figure was 256 against 1,024 tokens per
-  traversal. Per-token cost has plateaued at 1,024 and above. For short
-  prompts, a traversal is filled by packing several prompts into it, not by
-  widening one.
 - **CPU contention reaches the TTFT.** The eager route enqueues ~1,200 kernels
   per traversal from the host (57 ms of enqueue per 98 ms chunk in September).
   A busy CPU can push that onto the critical path. The contended leg's +17% is
@@ -219,10 +220,10 @@ calls:
 - **What does not block it:** the P2-02 / #84 failure detection. A replay is
   still followed by the chunk's one synchronize.
 
-**Verdict: no-go for now.**
-- The gain is about 5% of a cold 8K TTFT and 3.5% of a 32K one at the default
-  width. That bound is inferred from the 2026-09-30 capture, not re-captured
-  here; even September's 9.2 ms ceiling keeps it at 11% and 8%.
+**Verdict: not worth it on current evidence; bound ~5% (8K) / ~3.5% (32K) at 1024.**
+- The bound is inferred from the 2026-09-30 capture (source reading plus
+  arithmetic), not measured on this `main`; September's 9.2 ms of idle per
+  traversal, the 9.3% of criterion 1, would raise it to 11% and 8%.
 - The price is graph-safe prefill bodies for 64 layers, per-chunk attention
   updates and a vendored change.
 - The TMA part (~1.5 ms per traversal, ~1.5%) needs no graph.
@@ -232,26 +233,14 @@ calls:
 ## Implications
 
 - **Keep the 27B's default chunk at 1024** (`PREFILL_CHUNK ?= 1024`,
-  `DEFAULT_PREFILL_CHUNK = 1024`).
-  - No width is measured-better. The best, 4096, gains 3.8% of cold 32K TTFT
-    and nothing at 8K.
-  - In exchange it gives the decoding lanes 3x their longest stall (702 against
-    232 ms), half their rate during a prefill (4.3 against 8.9 tok/s), and 103K
-    fewer KV tokens.
-  - 2048 is the mildest trade: -1.4% / -2.2% TTFT for 1.7x the stall and 45K
-    tokens.
-  - 8192 is slower at 8K and keeps the plan's floor by 0.92 GB.
+  `DEFAULT_PREFILL_CHUNK = 1024`): no width is measured-better (Finding items
+  1, 2 and 4). This holds for the shape measured: one long prompt against two
+  decoding lanes that commit one token per round.
 - **The decode share, not the width, is the 27B's knob for prompt-versus-lanes
   priority.** The width moves priority as a side effect (one round per chunk)
   and lengthens the gap. The share moves priority alone, but only toward the
   lanes. Prompt-first beyond one round per chunk is what a wider chunk buys,
   through fewer chunks.
-- **Packing short prompts stays the lever behind criterion 1's 1.77x** (P4,
-  `docs/DEFERRED-DECISIONS.md` item 1). Widening one prompt's traversal past
-  1,024 is not.
-- **Cold-prefill levers elsewhere are larger than a graph.** The same 09-30
-  capture puts ~75 ms per ~5.5K request on retained-slot captures and
-  evictions, against ~38 ms of launch and TMA idle.
 
 ## Limits and unknowns
 
@@ -260,7 +249,8 @@ calls:
   - one load per width;
   - 5 samples per TTFT cell and 3 reps of the stall probe.
 
-  Run-to-run spread is known only from the 1024 bracket.
+  Run-to-run spread is known only from the 1024 bracket. The +7.2% at 8192 on
+  8K is one load's result (its 5 samples span 912.6-919.2 ms).
 - **Two decoding lanes only.** With more lanes a round costs more, so every gap
   grows by the round, and the share of time rounds take under load grows too.
 - **Speculation committed one token per round on these lanes.** With real
@@ -275,6 +265,10 @@ calls:
 - **The 8192 margin** depends on the desktop's VRAM at start: 31.17-31.21 GB
   free here.
 - **Contention:** one leg.
+- **Out of scope here:** criterion 1's 1.77x was 256 against 1,024 tokens per
+  traversal, which packing short prompts addresses and width does not; and the
+  09-30 capture's retained-slot cost (~75 ms per ~5.5K request) is a larger
+  cold-prefill lever than a graph.
 
 ## Follow-ups
 
@@ -288,8 +282,5 @@ calls:
     a 32K cold TTFT at 1024.
   - Blocked by nothing. It would be the first step of any later prefill graph,
     which it unblocks for the TMA GEMMs.
-- Owner decisions, not tickets:
-  - whether the 27B should get a non-zero decode share by default (the share-50
-    row above);
-  - whether host contention on the serving machine is common enough to revisit
-    the graph.
+- Owner decision, not a ticket: should the 27B get a non-zero default decode
+  share (the share-50 row: lanes 8.9 -> 28.5 tok/s, prompt TTFT x2 under load)?
