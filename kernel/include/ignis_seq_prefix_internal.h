@@ -92,6 +92,10 @@ struct ignis_seq_prefix {
    * (ignis_seq_settle_loan), and both are empty from then on. */
   ignis_seq *lender = nullptr;
   std::vector<std::int32_t> lent;
+  /* Whether this is a pages-only link, on loan or not (GitHub #306). It has
+   * no handle, so the entry points that take one -- release, snapshot,
+   * stats -- refuse it: every reference to it is a holder's. */
+  bool pages_only = false;
   /* What that image occupies: one slot's state and its hq residual window,
    * `ignis_seq_pool::retained_image_bytes`. */
   std::uint64_t image_bytes = 0;

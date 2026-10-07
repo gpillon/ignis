@@ -1317,6 +1317,18 @@ impl ConcreteScheduler {
         }
     }
 
+    /// The whole pages request `idx`'s capture at `opener` hands to a
+    /// pages-only link as this scheduler counts them (GitHub #306): those
+    /// between what it shares and the opener's page floor, on a
+    /// [`Request::link_at_capture`] request; 0 on any other.
+    fn link_pages(&self, idx: usize, opener: u32) -> u32 {
+        let r = &self.requests[idx];
+        match r.link_at_capture {
+            true => (opener / self.config.kv_page_tokens).saturating_sub(r.shared_pages),
+            false => 0,
+        }
+    }
+
     /// Record the **pages-only link** request `idx`'s capture at `opener`
     /// handed over, if it handed one over (ADR 0029 as amended 2026-10-07,
     /// GitHub #306), and answer whether the checkpoint has something to stand
@@ -1336,10 +1348,30 @@ impl ConcreteScheduler {
     /// cache cannot record, which the request standing on its parent makes
     /// unreachable; the caller then drops the checkpoint the leaf built over
     /// it, and the link goes with its lender.
-    fn register_link(&mut self, idx: usize, opener: u32) -> bool {
+    ///
+    /// `leaf_lent` is the leaf's own count of the pages it lent. A loan larger
+    /// than the charge this moves -- a leaf lending for a request that moves
+    /// nothing, or standing on less than the request does -- is pages the leaf
+    /// holds past the request and the ledger frees with it, so admission would
+    /// over-commit. That is `false` too: the checkpoint goes, and with its
+    /// lender the link and every page it holds.
+    fn register_link(&mut self, idx: usize, opener: u32, leaf_lent: u32) -> bool {
         let page_tokens = self.config.kv_page_tokens;
+        let moved = self.link_pages(idx, opener);
         let r = &self.requests[idx];
-        if !r.link_at_capture || opener / page_tokens <= r.shared_pages {
+        if leaf_lent > moved {
+            // hotpath-lint-allow: failure-only path (a capture whose loan the ledger cannot carry is released), reviewed exception (GitHub #306).
+            tracing::error!(
+                name: "ignis.checkpoint.loan_mismatch",
+                request_id = r.id,
+                opener,
+                leaf_lent,
+                moved,
+                "the leaf lent more pages at the capture than the scheduler moves to its link; the checkpoint is released"
+            );
+            return false;
+        }
+        if moved == 0 {
             return true;
         }
         let media = media_keys(&r.input);
@@ -3537,10 +3569,14 @@ impl Scheduler for ConcreteScheduler {
                         // request is none the wiser.
                         if let Some(capture) = job.capture_checkpoint {
                             if outcome.checkpoint_captured {
-                                // GitHub #306: the pages-only link first, when
+                                // GitHub #306: a loan lasts as long as the
+                                // sequence, whatever becomes of the checkpoint.
+                                let lent = self.link_pages(i, capture.tokens).max(outcome.checkpoint_lent_pages);
+                                self.requests[i].lender = lent > 0;
+                                // The pages-only link first, when
                                 // the capture handed one over -- it is what the
                                 // checkpoint stands on.
-                                if self.register_link(i, capture.tokens) {
+                                if self.register_link(i, capture.tokens, outcome.checkpoint_lent_pages) {
                                     self.retain_checkpoint(i, capture.tokens, &mut events);
                                 } else {
                                     self.release_checkpoint_handle(request_id);

@@ -181,6 +181,15 @@ pub struct Request {
     /// capture, for a request that can take a prompt checkpoint at all; its
     /// `publish_tokens` is then 0.
     pub link_at_capture: bool,
+    /// Whether this request's sequence lends the pages below its opener to a
+    /// pages-only link (GitHub #306): set when the backend captures and either
+    /// side counts a loan -- a [`Request::link_at_capture`] request with pages
+    /// between what it shares and the opener's floor, or a backend reporting
+    /// one -- whatever becomes of the checkpoint, since the loan lasts until
+    /// the sequence is released. The leaf refuses a lender a publish, so
+    /// [`Request::publish_point`] offers none. A requeue, which starts the
+    /// prompt over on a fresh sequence, clears it.
+    pub lender: bool,
     /// Prompt tokens already sent to the compute backend during prefill
     /// (P3-01, ADR 0018): advances by at most the scheduler's serving chunk
     /// width per `advance()`. `Prefilling` is durable and carries this as
@@ -249,6 +258,7 @@ impl Request {
             standalone_tokens: 0,
             publish_tokens: 0,
             link_at_capture: false,
+            lender: false,
             prefill_progress: 0,
             cancelled: false,
             prefill_failures: 0,
@@ -343,6 +353,13 @@ impl Request {
     /// One function so that the chunk decomposition (where to cut) and the
     /// registration (when to publish) cannot disagree about it.
     pub fn publish_point(&self, page_tokens: u32) -> u32 {
+        // GitHub #306: a capture lent the pages below the opener to a
+        // pages-only link, and the leaf refuses the lender a publish -- its
+        // first own pages would get a second owner. Nothing past the opener
+        // is published.
+        if self.lender {
+            return 0;
+        }
         // Pages already shared, or restored as the request's own from a
         // materialized blob: a boundary inside either is behind it.
         let shared = self
@@ -697,6 +714,9 @@ impl Request {
         // caller released the KV-RAM claim, and the sequence is gone.
         self.kv_ram_claim = None;
         self.standalone_tokens = 0;
+        // GitHub #306: and with the sequence went its loan; the fresh one
+        // lends nothing.
+        self.lender = false;
         // `publish_tokens` is untouched: it is a property of the prompt, not
         // of a run. With the claim gone the re-prefill is free to publish
         // that head again (P4-10, GitHub #126) — the pages it had went back
@@ -834,6 +854,20 @@ mod tests {
         assert_eq!(r.forced_state.permitted(&literal, 0, None), None, "open again: nothing forced");
         assert_eq!(r.thinking, crate::thinking_budget::BudgetState::default());
         assert!(r.thinking.permitted(Some(4), &close, 4).is_some(), "a budget spent forces the new close");
+    }
+
+    /// GitHub #306: a lender publishes nothing, and a requeue -- whose
+    /// re-prefill runs on a fresh sequence, which lends nothing -- publishes
+    /// its system block again.
+    #[test]
+    fn a_requeue_ends_the_loan() {
+        let mut r = req(0, RequestClass::Agent, RequestState::Evicted);
+        r.input.tokens = (0..100).collect();
+        r.input.system_block_tokens = Some(40);
+        r.lender = true;
+        assert_eq!(r.publish_point(16), 0, "a lender publishes nothing");
+        assert!(r.requeue());
+        assert_eq!(r.publish_point(16), 32, "the block's page floor, again");
     }
 
     #[test]

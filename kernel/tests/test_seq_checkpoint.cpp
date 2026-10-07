@@ -244,6 +244,8 @@ ignis_seq_pool_spec small_spec(int32_t kv_format = IGNIS_KV_FORMAT_BF16) {
 
 constexpr std::uint32_t kPageTokens = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
 constexpr std::uint32_t kContext    = 384;
+// The pages a whole `kContext` reservation is: pages_for_tokens(384).
+constexpr std::uint32_t kContextPages = 6;
 // The shared prefix: two whole pages. The generation opener sits 40 tokens
 // into the sequence's own third page — the shape a rendered prompt has, where
 // the opener is wherever `<|im_start|>assistant\n` happens to end.
@@ -821,6 +823,9 @@ struct Observed {
   std::vector<unsigned char> state;
   std::uint64_t position;
   ignis_seq_prefix *prefix;
+  // Its holders as well as its identity: a capture that took a reference on
+  // what the sequence stands on and then failed would leave it held forever.
+  std::uint32_t prefix_refcount;
   std::uint32_t shared_pages;
   ignis_seq_prefix *lent_to;
   std::uint32_t lent_refcount;
@@ -835,6 +840,7 @@ Observed observe(ignis_seq_pool *pool, const ignis_seq *seq, std::uint32_t retai
                   mutable_image_of(*pool, seq->slot),
                   seq->position,
                   seq->prefix,
+                  seq->prefix == nullptr ? 0 : seq->prefix->refcount,
                   seq->shared_pages,
                   seq->lent_to,
                   seq->lent_to == nullptr ? 0 : seq->lent_to->refcount,
@@ -844,9 +850,9 @@ Observed observe(ignis_seq_pool *pool, const ignis_seq *seq, std::uint32_t retai
 
 bool same(const Observed &a, const Observed &b) {
   return a.row == b.row && a.state == b.state && a.position == b.position && a.prefix == b.prefix &&
-         a.shared_pages == b.shared_pages && a.lent_to == b.lent_to &&
-         a.lent_refcount == b.lent_refcount && a.free_pages == b.free_pages &&
-         a.slot_held == b.slot_held;
+         a.prefix_refcount == b.prefix_refcount && a.shared_pages == b.shared_pages &&
+         a.lent_to == b.lent_to && a.lent_refcount == b.lent_refcount &&
+         a.free_pages == b.free_pages && a.slot_held == b.slot_held;
 }
 
 void expect_a_failed_capture_changes_nothing(ignis_seq_pool *pool, ignis_seq *seq, std::uint32_t opener,
@@ -880,6 +886,14 @@ void check_a_failed_capture_changes_nothing() {
                                           "fault: a failed capture on a loan changes nothing");
   ignis_seq_release(pool, lender);
 
+  // About to lend over a prefix, which the link would take a reference on.
+  ignis_seq_prefix *under = nullptr;
+  ignis_seq *over         = standing_at(pool, 2, 4 * kPageTokens + 8, &under, "fault: a lender over a prefix");
+  expect_a_failed_capture_changes_nothing(pool, over, 4 * kPageTokens + 8, kCheckpointSlot,
+                                          "fault: a failed capture over a prefix takes no reference on it");
+  ignis_seq_prefix_release(pool, under);
+  ignis_seq_release(pool, over);
+
   // About to stand on a prefix: the #186 shape, nothing to lend.
   ignis_seq_prefix *prefix = nullptr;
   ignis_seq *publisher     = publisher_at_opener(pool, &prefix, "fault: a publisher");
@@ -892,6 +906,255 @@ void check_a_failed_capture_changes_nothing() {
   expect_rc(ignis_seq_pool_stats(pool, &end), 0, "fault: pool stats end");
   expect(end.kv_free_pages == empty.kv_free_pages, "fault: and every page came back");
   ignis_seq_pool_free(pool);
+}
+
+// ---- 7b. a lender: what it refuses, and what outlives it (GitHub #306) -----
+//
+// Until it is released, a lender's first own pages are a link's. Nothing may
+// give them a second owner -- a publish, a restore over them -- and the link
+// is no handle a caller could release, snapshot or read. And when the lender
+// goes, a claimant standing on the link keeps addressing the very pages it
+// lent, whether the lender was released outright or evicted to a blob first.
+
+bool last_error_names(const char *what) {
+  return std::string(ignis_seq_last_error()).find(what) != std::string::npos;
+}
+
+void check_a_lender_publishes_and_restores_nothing() {
+  const ignis_seq_pool_spec spec = small_spec();
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "lender: pool create");
+
+  // An opener on a page boundary: the lender stands exactly where a publish
+  // of the pages it lent would be cut, so nothing but the loan refuses one.
+  const std::uint32_t opener = 3 * kPageTokens;
+  ignis_seq_prefix *none     = nullptr;
+  ignis_seq *lender          = standing_at(pool, 0, opener, &none, "lender: the capturing sequence");
+  ignis_seq_checkpoint *checkpoint = nullptr;
+  expect_rc(ignis_seq_checkpoint_capture(pool, lender, opener, kCheckpointSlot, &checkpoint), 0,
+            "lender: the capture lends");
+  expect(lender->lent_to != nullptr, "lender: and the sequence is a lender");
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, lender, &bytes), 0, "lender: blob size");
+  std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
+  expect_rc(ignis_seq_snapshot(pool, lender, blob.data(), bytes), 0, "lender: a blob to restore");
+
+  const Observed before   = observe(pool, lender, kPrefixSlot);
+  ignis_seq_prefix *again = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, lender, opener, kPrefixSlot, &again), -1,
+            "lender: a publish of the pages it lent is refused");
+  expect(again == nullptr && last_error_names("lent"), "lender: naming the loan");
+  expect(same(observe(pool, lender, kPrefixSlot), before),
+         "lender: and changes nothing -- the publish's retained slot is still free");
+  expect_rc(ignis_seq_restore(pool, lender, blob.data(), bytes), IGNIS_SEQ_ERR_SHARED_PREFIX,
+            "lender: a restore over the pages it lent is refused");
+  expect(last_error_names("lent"), "lender: naming the loan too");
+  expect(same(observe(pool, lender, kPrefixSlot), before), "lender: and changes nothing either");
+
+  ignis_seq_release(pool, lender);
+  ignis_seq_checkpoint_release(pool, checkpoint);
+  ignis_seq_pool_free(pool);
+}
+
+void check_a_link_on_loan_has_no_handle() {
+  const ignis_seq_pool_spec spec = small_spec();
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "no handle: pool create");
+  struct ignis_seq_pool_stats empty{};
+  expect_rc(ignis_seq_pool_stats(pool, &empty), 0, "no handle: pool stats empty");
+
+  ignis_seq_prefix *none = nullptr;
+  ignis_seq *lender      = standing_at(pool, 0, kOpener, &none, "no handle: a lender");
+  ignis_seq_checkpoint *checkpoint = nullptr;
+  expect_rc(ignis_seq_checkpoint_capture(pool, lender, kOpener, kCheckpointSlot, &checkpoint), 0,
+            "no handle: the capture lends");
+  ignis_seq_prefix *link = lender->lent_to;
+  if (link == nullptr) {
+    expect(false, "no handle: a link to try");
+    ignis_seq_release(pool, lender);
+    ignis_seq_checkpoint_release(pool, checkpoint);
+    ignis_seq_pool_free(pool);
+    return;
+  }
+  struct ignis_seq_pool_stats before{};
+  expect_rc(ignis_seq_pool_stats(pool, &before), 0, "no handle: pool stats before");
+
+  ignis_seq_prefix_release(pool, link);
+  expect(link->refcount == 2 && last_error_names("pages-only link"),
+         "no handle: a release of the link is refused, naming it");
+  ignis_seq_prefix_release(nullptr, link);
+  expect(link->refcount == 2 && last_error_names("pages-only link"),
+         "no handle: with no pool to check it against, too");
+  std::uint64_t bytes = 1;
+  expect_rc(ignis_seq_prefix_snapshot_size(pool, link, &bytes), -1, "no handle: no blob size");
+  expect(bytes == 0 && last_error_names("pages-only link"), "no handle: naming the link");
+  std::vector<unsigned char> blob(64);
+  expect_rc(ignis_seq_prefix_snapshot(pool, link, blob.data(), blob.size()), -1, "no handle: no blob");
+  expect(last_error_names("pages-only link"), "no handle: naming the link");
+  struct ignis_seq_prefix_stats stats{};
+  expect_rc(ignis_seq_prefix_stats(link, &stats), -1, "no handle: no stats");
+  expect(last_error_names("pages-only link"), "no handle: naming the link");
+  struct ignis_seq_pool_stats after{};
+  expect_rc(ignis_seq_pool_stats(pool, &after), 0, "no handle: pool stats after");
+  expect(after.kv_free_pages == before.kv_free_pages && link->lender == lender,
+         "no handle: and nothing moved");
+
+  ignis_seq_release(pool, lender);
+  ignis_seq_checkpoint_release(pool, checkpoint);
+  struct ignis_seq_pool_stats end{};
+  expect_rc(ignis_seq_pool_stats(pool, &end), 0, "no handle: pool stats end");
+  expect(end.kv_free_pages == empty.kv_free_pages, "no handle: every page came back");
+  ignis_seq_pool_free(pool);
+}
+
+// A claimant of the checkpoint over the lender's link, standing at the opener
+// with the pages it addresses and their history. `shared` pages under the
+// lender are an imaged prefix's (or none), released with the lender.
+struct LoanFixture {
+  ignis_seq_pool *pool;
+  ignis_seq_prefix *prefix;
+  ignis_seq *lender;
+  ignis_seq_checkpoint *checkpoint;
+  ignis_seq *claimant;
+  ignis_seq_prefix *link;
+  std::uint32_t free_pages;
+  std::uint32_t covered;
+  // The lender's row and the history on it, the opener's partial page
+  // included, and its state: what the claimant reads.
+  std::vector<std::int32_t> lender_row;
+  std::vector<std::vector<unsigned char>> history;
+  std::vector<unsigned char> state;
+  std::vector<std::int32_t> claimant_row;
+};
+
+LoanFixture a_claimant_on_a_loan(std::uint32_t shared, std::uint32_t opener, const char *label) {
+  const ignis_seq_pool_spec spec = small_spec(IGNIS_KV_FORMAT_HQ_E8_2B);
+  LoanFixture f{};
+  expect_rc(ignis_seq_pool_create(&spec, &f.pool), 0, label);
+  struct ignis_seq_pool_stats empty{};
+  expect_rc(ignis_seq_pool_stats(f.pool, &empty), 0, label);
+  f.free_pages = empty.kv_free_pages;
+  f.lender  = standing_at(f.pool, shared, opener, &f.prefix, label);
+  f.covered = (opener + kPageTokens - 1) / kPageTokens;
+  f.lender_row = row_of(*f.pool, f.lender->slot, f.covered);
+  for (std::uint32_t page = 0; page < f.covered; ++page) {
+    f.history.push_back(page_image_of(*f.pool, f.lender_row[page]));
+  }
+  f.state = mutable_image_of(*f.pool, f.lender->slot);
+  expect_rc(ignis_seq_checkpoint_capture(f.pool, f.lender, opener, kCheckpointSlot, &f.checkpoint), 0,
+            label);
+  f.link = f.lender->lent_to;
+  expect(f.link != nullptr, label);
+  expect_rc(ignis_seq_alloc_from_checkpoint(f.pool, kContext, f.checkpoint, &f.claimant), 0, label);
+  if (f.claimant != nullptr) {
+    f.claimant_row = row_of(*f.pool, f.claimant->slot, f.covered);
+  }
+  return f;
+}
+
+// The claimant still addresses the chain's pages, reads the lender's history
+// and its state at the opener, and no page it addresses is `other`'s.
+void expect_the_claimant_untouched(const LoanFixture &f, const ignis_seq *other, const char *label) {
+  expect(row_of(*f.pool, f.claimant->slot, f.covered) == f.claimant_row, label);
+  for (std::uint32_t page = 0; page < f.covered; ++page) {
+    expect(page_image_of(*f.pool, f.claimant_row[page]) == f.history[page], label);
+  }
+  expect(mutable_image_of(*f.pool, f.claimant->slot) == f.state, label);
+  const std::vector<std::int32_t> theirs = row_of(*f.pool, other->slot, kContextPages);
+  for (const std::int32_t page : f.claimant_row) {
+    expect(std::find(theirs.begin(), theirs.end(), page) == theirs.end(), label);
+  }
+}
+
+void release_the_loan_fixture(LoanFixture &f, ignis_seq *other, const char *label) {
+  ignis_seq_release(f.pool, other);
+  ignis_seq_release(f.pool, f.claimant);
+  ignis_seq_checkpoint_release(f.pool, f.checkpoint);
+  struct ignis_seq_pool_stats end{};
+  expect_rc(ignis_seq_pool_stats(f.pool, &end), 0, label);
+  expect(end.kv_free_pages == f.free_pages, label);
+  ignis_seq_pool_free(f.pool);
+}
+
+void check_a_claimant_outlives_its_lender(std::uint32_t shared, std::uint32_t opener) {
+  LoanFixture f = a_claimant_on_a_loan(shared, opener, "outlive: a claimant on the loan");
+  if (f.link == nullptr || f.claimant == nullptr) {
+    ignis_seq_pool_free(f.pool);
+    return;
+  }
+  const std::uint32_t below = opener / kPageTokens;
+
+  // The lender goes, and the handle on what it stood on, while the claimant
+  // stands on the link: the link takes the very pages it was lent.
+  ignis_seq_release(f.pool, f.lender);
+  ignis_seq_prefix_release(f.pool, f.prefix);
+  expect(f.link->lender == nullptr && f.link->kv.valid() && f.link->refcount == 2 &&
+             f.link->kv.page_ids().size() == below - shared &&
+             std::equal(f.lender_row.begin() + shared, f.lender_row.begin() + below,
+                        f.link->kv.page_ids().begin()),
+         "outlive: the link holds what was lent, for the checkpoint and the claimant");
+  ignis_seq_prefix_release(f.pool, f.link);
+  expect(f.link->refcount == 2 && last_error_names("pages-only link"),
+         "outlive: and is still no handle a caller could release");
+
+  // A fresh sequence takes whatever the lender gave back and writes all of it.
+  ignis_seq *fresh = nullptr;
+  expect_rc(ignis_seq_alloc(f.pool, kContext, &fresh), 0, "outlive: a fresh sequence");
+  if (fresh != nullptr) {
+    dirty_state(*f.pool, *fresh, kContextPages, 0xA1u);
+    expect_the_claimant_untouched(f, fresh, "outlive: the claimant's row, history and state are its own");
+  }
+  release_the_loan_fixture(f, fresh, "outlive: every page came back");
+}
+
+void check_a_lender_evicted_while_lent_comes_back_whole(std::uint32_t shared, std::uint32_t opener) {
+  LoanFixture f = a_claimant_on_a_loan(shared, opener, "evict: a claimant on the loan");
+  if (f.link == nullptr || f.claimant == nullptr) {
+    ignis_seq_pool_free(f.pool);
+    return;
+  }
+
+  // Evicted while lent: its blob carries the lent pages as history of its
+  // own, as the checkpoint's blob does -- the same bytes.
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(f.pool, f.lender, &bytes), 0, "evict: lender blob size");
+  std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
+  expect_rc(ignis_seq_snapshot(f.pool, f.lender, blob.data(), bytes), 0, "evict: lender blob");
+  std::uint64_t checkpoint_bytes = 0;
+  expect_rc(ignis_seq_checkpoint_snapshot_size(f.pool, f.checkpoint, &checkpoint_bytes), 0,
+            "evict: checkpoint blob size");
+  std::vector<unsigned char> reference(static_cast<std::size_t>(checkpoint_bytes));
+  expect_rc(ignis_seq_checkpoint_snapshot(f.pool, f.checkpoint, reference.data(), checkpoint_bytes), 0,
+            "evict: checkpoint blob");
+  expect(bytes == checkpoint_bytes && blob == reference,
+         "evict: the lender's blob is its whole history, lent pages included");
+
+  ignis_seq_release(f.pool, f.lender);
+  ignis_seq_prefix_release(f.pool, f.prefix);
+
+  // Restored into a fresh sequence while the claimant stands on the link:
+  // pages of its own, the same history, the same state.
+  ignis_seq *restored = nullptr;
+  expect_rc(ignis_seq_alloc(f.pool, kContext, &restored), 0, "evict: restore target");
+  if (restored != nullptr) {
+    expect_rc(ignis_seq_restore(f.pool, restored, blob.data(), bytes), 0, "evict: restore");
+    const std::vector<std::int32_t> row = row_of(*f.pool, restored->slot, f.covered);
+    for (std::uint32_t page = 0; page < f.covered; ++page) {
+      expect(page_image_of(*f.pool, row[page]) == f.history[page],
+             "evict: the restored sequence reads the lender's history");
+    }
+    expect(mutable_image_of(*f.pool, restored->slot) == f.state && restored->position == opener &&
+               restored->prefix == nullptr && restored->lent_to == nullptr,
+           "evict: from its own pages, with the lender's state, lending nothing");
+    std::vector<unsigned char> again(static_cast<std::size_t>(bytes));
+    expect_rc(ignis_seq_snapshot(f.pool, restored, again.data(), bytes), 0, "evict: re-snapshot");
+    expect(again == blob, "evict: the round trip is byte-exact");
+    // And writing past the opener, as it goes on, touches nothing the
+    // claimant reads.
+    dirty_state(*f.pool, *restored, kContextPages, 0xB1u);
+    expect_the_claimant_untouched(f, restored, "evict: the claimant's row, history and state are its own");
+  }
+  release_the_loan_fixture(f, restored, "evict: every page came back");
 }
 
 // ---- 8. every refusal refuses, and costs nothing -------------------------
@@ -988,6 +1251,16 @@ void run_all() {
     check_a_capture_lends_the_pages_below_to_a_link(format, 0, 3 * kPageTokens);
   }
   check_a_failed_capture_changes_nothing();
+  check_a_lender_publishes_and_restores_nothing();
+  check_a_link_on_loan_has_no_handle();
+  // A claimant standing on the link across its lender's release, and across
+  // its eviction and restore: a lender standing on nothing, one on a prefix,
+  // and one at a page-aligned opener, which copies no partial page.
+  check_a_claimant_outlives_its_lender(0, kOpener);
+  check_a_claimant_outlives_its_lender(2, 4 * kPageTokens + 8);
+  check_a_claimant_outlives_its_lender(0, 3 * kPageTokens);
+  check_a_lender_evicted_while_lent_comes_back_whole(0, kOpener);
+  check_a_lender_evicted_while_lent_comes_back_whole(2, 4 * kPageTokens + 8);
   check_refusals();
 }
 

@@ -55,6 +55,17 @@ const DECODED: usize = 8;
 const DEVICE_SLOT: u32 = 0;
 const HOST_SLOTS: [u32; 2] = [1, 2];
 
+unsafe extern "C" {
+    /// The leaf's reason for its last refusal (`ignis_seq.h`); the adapter
+    /// reports only a code.
+    fn ignis_seq_last_error() -> *const std::ffi::c_char;
+}
+
+/// Whether the leaf's last refusal was for the sequence's loan (GitHub #306).
+fn refused_for_the_loan() -> bool {
+    unsafe { std::ffi::CStr::from_ptr(ignis_seq_last_error()) }.to_string_lossy().contains("lent")
+}
+
 fn artifact_path() -> PathBuf {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from);
     dir.join(ARTIFACT_FILE_NAME)
@@ -243,9 +254,13 @@ fn history_reuses_exactly(run: &Run<'_>, history: usize, salt: u32) {
 /// `[0, opener)` and `[opener, end)`, and against it:
 ///
 /// - the capturing sequence goes on exactly as if it had captured nothing:
-///   the handover moves who owns its pages, never what they hold;
+///   the handover moves who owns its pages, never what they hold -- and a
+///   publish from it and a restore into it, both refused while it lends, leave
+///   it as it was;
 /// - the checkpoint claimed from a host and a device slot (the second capture
 ///   stands on the link the first one made), and restored from KV-RAM;
+/// - a claimant that stands on the link from before its lender's release to
+///   after, while the claims above take the pages the lender gave back;
 /// - turn N+1, claiming it, captures at its own opener -- a link chained over
 ///   the link -- and both it and a claimant of *that* continue as its own
 ///   split control does, `[0, opener)`, `[opener, opener')`, `[opener', end)`.
@@ -274,18 +289,40 @@ fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32)
     run.prefill(&mut turn, &tokens, 0);
     let on_host = leaf.capture_checkpoint(model, &mut turn, history as u32, HOST_SLOTS[1]).expect("capture (host)");
     let on_device = leaf.capture_checkpoint(model, &mut turn, history as u32, DEVICE_SLOT).expect("capture (device)");
+    // The sequence lends the pages below its opener now -- every one, standing
+    // on nothing -- and the leaf gives them no second owner, by a publish or
+    // by a restore over them.
+    let floor = (history / KV_PAGE_TOKENS as usize * KV_PAGE_TOKENS as usize) as u32;
+    for checkpoint in [&on_host, &on_device] {
+        assert_eq!(leaf.checkpoint_lent_pages(&turn, checkpoint), floor / KV_PAGE_TOKENS, "{label}: the loan, as the scheduler reads it");
+    }
+    assert!(
+        leaf.publish_prefix(model, &mut turn, floor, HOST_SLOTS[0]).is_err() && refused_for_the_loan(),
+        "{label}: a lender publishes nothing"
+    );
+    let bytes = leaf.checkpoint_snapshot_bytes(model, &on_host).expect("checkpoint blob size");
+    let blob = run.blob(bytes, |dst| leaf.checkpoint_snapshot_into(model, &on_host, dst));
+    assert!(
+        leaf.restore_sequence(model, &mut turn, &blob).is_err() && refused_for_the_loan(),
+        "{label}: nothing is restored into a lender"
+    );
+    // A claimant standing on the link before its lender goes.
+    let (early, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &on_device).expect("claim while lent");
     assert_eq!(run.finish(turn, &new, history), cold, "{label}: the capturing sequence goes on as if it had not captured");
 
     for (slot, checkpoint) in [("host", &on_host), ("device", &on_device)] {
         let (seq, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, checkpoint).expect("claim");
         assert_eq!(run.finish(seq, &new, history), cold, "{label}: the checkpoint claimed from a {slot} slot");
     }
-    let bytes = leaf.checkpoint_snapshot_bytes(model, &on_host).expect("checkpoint blob size");
-    let blob = run.blob(bytes, |dst| leaf.checkpoint_snapshot_into(model, &on_host, dst));
     let mut seq = run.fresh();
     leaf.restore_sequence(model, &mut seq, &blob).expect("restore the checkpoint blob");
     drop(blob);
     assert_eq!(run.finish(seq, &new, history), cold, "{label}: the checkpoint restored from KV-RAM");
+    assert_eq!(
+        run.finish(early, &new, history),
+        cold,
+        "{label}: a claimant standing on the link across its lender's release and the claims after it"
+    );
 
     // Turn N+1: its own opener 10 tokens before the end of `new`, so its
     // capture ends inside a page and hands over the pages it warmed.
@@ -299,6 +336,11 @@ fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32)
     drop((on_host, on_device));
     run.prefill(&mut turn, &new[..NEW_TOKENS - 10], history);
     let second = leaf.capture_checkpoint(model, &mut turn, opener as u32, HOST_SLOTS[1]).expect("turn N+1 captures");
+    assert_eq!(
+        leaf.checkpoint_lent_pages(&turn, &second),
+        opener as u32 / KV_PAGE_TOKENS - floor / KV_PAGE_TOKENS,
+        "{label}: turn N+1 lends the pages it warmed past the link it stands on"
+    );
     assert_eq!(run.finish(turn, &next, opener), control, "{label}: turn N+1 goes on as if it had not captured");
     let (seq, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &second).expect("turn N+2 claims");
     drop(second);

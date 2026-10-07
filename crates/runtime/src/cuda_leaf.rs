@@ -697,6 +697,10 @@ impl StepLeaf for CudaLeaf {
             .map_err(|e| leaf_error("checkpoint capture", e.to_string()))
     }
 
+    fn checkpoint_lent_pages(&self, sequence: &Self::Sequence, checkpoint: &Self::Checkpoint) -> u32 {
+        checkpoint.lent_by(sequence)
+    }
+
     fn allocate_sequence_from_checkpoint(
         &self,
         model: &Self::Model,

@@ -111,6 +111,9 @@ struct StubLeaf {
     /// pool, a sequence it will not capture — and declining must leave the
     /// batch alone.
     capture_error: Option<i32>,
+    /// GitHub #306: the pages the leaf reports each capture lent to a
+    /// pages-only link.
+    capture_lent_pages: u32,
     /// GitHub #243: the merged columns this stub's embedding pool holds, or
     /// `None` for a pool nothing fills. A bounded stub is what proves the
     /// eviction loop, since the real refusal comes from the leaf's bytes and
@@ -139,6 +142,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -159,6 +163,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -173,6 +178,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -187,6 +193,7 @@ impl StubLeaf {
             prefill_error_on_call: Some((2, code)),
             decode_error: None,
             capture_error: None,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -201,6 +208,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: Some(code),
             capture_error: None,
+            capture_lent_pages: 0,
             media_pool_columns: None,
         }
     }
@@ -371,6 +379,10 @@ impl StepLeaf for StubLeaf {
         calls.checkpoints_captured.push(opener_tokens);
         calls.capture_slots.push(retained_slot);
         Ok(opener_tokens)
+    }
+
+    fn checkpoint_lent_pages(&self, _sequence: &Self::Sequence, _checkpoint: &Self::Checkpoint) -> u32 {
+        self.capture_lent_pages
     }
 
     fn allocate_sequence_from_checkpoint(
@@ -1368,6 +1380,42 @@ fn a_declined_capture_leaves_the_batch_and_the_request_alone() {
         vec![0, 4, 6],
         "and its prompt was prefilled in full, cuts and all"
     );
+}
+
+#[test]
+fn a_capture_that_lent_pages_the_scheduler_does_not_move_is_released() {
+    // GitHub #306: the leaf's count of the pages a capture lent reaches the
+    // scheduler. This load publishes the opener's floor, so it moves nothing
+    // at the capture; a leaf reporting a loan would hold pages past the
+    // request that the ledger frees with it, and the checkpoint is released.
+    let leaf = Arc::new(StubLeaf {
+        capture_lent_pages: 1,
+        ..StubLeaf::with_tokens([])
+    });
+    let mut scheduler = checkpoint_scheduler(leaf.clone());
+    let request = scheduler
+        .submit(
+            checkpoint_input(vec![1, 2, 3, 4, 5, 6, 7, 8], Some(6)),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let mut reason = None;
+    while !scheduler.is_idle() {
+        for event in scheduler.advance() {
+            if let ignis_core::SchedEvent::Done { request: r, reason: why, .. } = event {
+                assert_eq!(r, request);
+                reason = Some(why);
+            }
+        }
+    }
+    assert!(reason.is_some_and(|why| why != FinishReason::Error), "the request completed normally");
+    let (captured, released) = {
+        let calls = leaf.calls.lock().unwrap();
+        (calls.checkpoints_captured.clone(), calls.checkpoints_released)
+    };
+    assert_eq!(captured, vec![6], "the leaf captured");
+    assert_eq!(released, 1, "and its checkpoint was released");
+    assert_eq!(scheduler.checkpoint_pool().entry_count(), 0, "nothing retained");
 }
 
 #[test]

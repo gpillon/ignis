@@ -73,6 +73,9 @@ struct Inner {
     /// decline (`refuse_capture`) — a leaf with no room in its own image
     /// pool, or a sequence it will not capture.
     capture_refusals: std::collections::HashSet<RequestId>,
+    /// Pages the leaf reports lending at a request's next capture
+    /// (`lend_at_capture`, GitHub #306); 0 for any request not named.
+    capture_lent_pages: HashMap<RequestId, u32>,
     /// Requests whose next attention readout the leaf "could not read"
     /// (GitHub #260): the chunk lands and the outcome carries no scores.
     attention_refusals: std::collections::HashSet<RequestId>,
@@ -400,6 +403,14 @@ impl MockCompute {
         self.inner.lock().unwrap().capture_refusals.insert(request);
     }
 
+    /// Make the backend report that `request`'s next capture lent `pages`
+    /// pages to a pages-only link (GitHub #306) -- whatever the scheduler
+    /// expected, which is how a leaf whose view of the sequence drifted from
+    /// the scheduler's would report it.
+    pub fn lend_at_capture(&self, request: RequestId, pages: u32) {
+        self.inner.lock().unwrap().capture_lent_pages.insert(request, pages);
+    }
+
     /// Make the backend fail to read `request`'s next attention readout
     /// (GitHub #260): the chunk lands normally and carries no scores, which
     /// is how a real leaf reports keys the layer's attention never
@@ -540,6 +551,10 @@ impl Compute for MockCompute {
                         g.checkpoint_tokens.insert(job.request, tokens);
                     }
                     captured
+                },
+                checkpoint_lent_pages: match job.capture_checkpoint {
+                    Some(_) => g.capture_lent_pages.remove(&job.request).unwrap_or(0),
+                    None => 0,
                 },
                 // GitHub #237 / ADR 0034: the `Compute` seam now carries a
                 // second kind of answer, and every CPU-only implementation

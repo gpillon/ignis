@@ -887,6 +887,15 @@ impl SeqCheckpoint<'_> {
         stats
     }
 
+    /// The whole pages below the opener `sequence` -- the sequence that
+    /// captured this checkpoint -- lent to a pages-only link (GitHub #306): the
+    /// pages the checkpoint stands on past those the sequence shares, which a
+    /// lender holds as its own until it is released. 0 for a checkpoint
+    /// standing on a prefix.
+    pub fn lent_by(&self, sequence: &Seq<'_>) -> u32 {
+        self.stats().pages.saturating_sub(sequence.stats().shared_pages)
+    }
+
     /// Bytes the checkpoint needs as a materialized whole-sequence blob in
     /// KV-RAM: shared prefix pages included, not referenced.
     pub fn snapshot_bytes(&self) -> Result<u64, SeqTransferError> {
@@ -968,7 +977,7 @@ impl SeqPrefix<'_> {
         let rc = unsafe { ffi::ignis_seq_prefix_stats(self.handle, &mut stats) };
         assert_eq!(
             rc, 0,
-            "ignis_seq_prefix_stats: null handle (unreachable — SeqPrefix always holds one)"
+            "ignis_seq_prefix_stats: null handle or a pages-only link (unreachable — SeqPrefix always holds a published one)"
         );
         stats
     }
