@@ -636,6 +636,6 @@ fn the_counters_count_hits_and_misses_by_class_and_phase_and_bytes_by_phase() {
     assert_eq!(c.prefetch_issued, 2);
     assert_eq!(c.prefetch_used, 2);
     assert_eq!(c.bytes_moved, [200 + 100 + 250 + 100, 300 + 100]);
-    assert_eq!(c.stall_nanos, 0);
+    assert_eq!(c.stall_nanos, [0, 0], "the model has no clock");
     assert_eq!(m.occupancy()[dn], 2);
 }

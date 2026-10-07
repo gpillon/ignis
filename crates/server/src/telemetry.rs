@@ -1058,12 +1058,14 @@ mod tests {
 
         let mut residency = ResidencyCounters::default();
         residency.misses[0][0] = 6;
+        residency.stall_nanos = [2_500_000, 0];
         mirror.store(&residency, &[6, 0, 0, 0, 0, 0, 0, 0]);
         ngram.record(5, 1, 1, 4096);
         telemetry.emit_interval(Occupancy::default());
         let ticked = metrics.render();
         assert!(ticked.contains("\nignis_expert_cache_misses_total{class=\"gate_up_k2\",phase=\"decode\"} 6\n"), "{ticked}");
         assert!(ticked.contains("\nignis_expert_cache_slots{class=\"gate_up_k2\",state=\"in_use\"} 6\n"), "{ticked}");
+        assert!(ticked.contains("\nignis_expert_residency_stall_seconds_total{phase=\"decode\"} 0.0025\n"), "{ticked}");
         assert!(ticked.contains("\nignis_ngram_rows_total{source=\"file\"} 1\n"), "{ticked}");
 
         telemetry.with_counter_source(None);

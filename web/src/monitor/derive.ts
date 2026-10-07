@@ -138,6 +138,12 @@ export type Experts = {
   bytesPerSecSeries: Values;
   bytesMoved: Tally;
   prefetch: { issued: Tally; used: Tally };
+  /** Decode seconds waited on demand copies over the tokens decoded in the window (GitHub #306). */
+  stallPerToken: number | null;
+  /** Seconds waited on demand copies, both phases, per second of wall time, RATE_SPAN_MS rolling. */
+  stallShare: number | null;
+  /** Seconds waited on demand copies, both phases. */
+  stall: Tally;
   /** Each K class: its slots, and its hits and misses over both phases. */
   classes: { cls: ExpertClass; slots: Meter; hits: Tally; misses: Tally }[];
 };
@@ -420,14 +426,22 @@ export function deriveExperts(points: Point[], since: number): Experts {
   const bytes: CounterPick = (s) => (s.experts ? sumKnown(EXPERT_PHASES.map((phase) => s.experts!.bytesMoved[phase])) : null);
   const bytesRate = rollingRate(points, bytes, RATE_SPAN_MS);
   const decodeMisses = increaseOver(points, (s) => expertSum(s, "misses", ["decode"]), since);
+  const decodedInWindow = increaseOver(points, (s) => s.decodedTokens, since);
+  const stall: CounterPick = (s) => (s.experts ? sumKnown(EXPERT_PHASES.map((phase) => s.experts!.stall[phase])) : null);
   return {
     decodeHitShare: share("decode"),
     prefillHitShare: share("prefill"),
-    missesPerToken: shareOf(decodeMisses, increaseOver(points, (s) => s.decodedTokens, since)),
+    missesPerToken: shareOf(decodeMisses, decodedInWindow),
     bytesPerSec: bytesRate.at(-1) ?? null,
     bytesPerSecSeries: bytesRate,
     bytesMoved: tally(bytes),
     prefetch: { issued: tally((s) => s.experts?.prefetchIssued ?? null), used: tally((s) => s.experts?.prefetchUsed ?? null) },
+    stallPerToken: shareOf(
+      increaseOver(points, (s) => s.experts?.stall.decode ?? null, since),
+      decodedInWindow,
+    ),
+    stallShare: rollingRate(points, stall, RATE_SPAN_MS).at(-1) ?? null,
+    stall: tally(stall),
     classes: EXPERT_CLASSES.map((cls) => {
       const slots = last.experts?.slots[cls] ?? { capacity: null, inUse: null };
       const both = (family: "hits" | "misses"): CounterPick => (s) => (s.experts ? sumKnown(EXPERT_PHASES.map((phase) => s.experts![family][cls][phase])) : null);

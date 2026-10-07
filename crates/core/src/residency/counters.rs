@@ -26,16 +26,19 @@ pub struct ResidencyCounters {
     pub prefetch_used: u64,
     /// Bytes copied host-to-device, misses and prefetches, by phase.
     pub bytes_moved: [u64; 2],
-    /// Time the expert kernels waited on residency. Not timed yet: the
-    /// device and the CPU policy model both leave it at zero, and nothing
-    /// exports it until the device measures it.
-    pub stall_nanos: u64,
+    /// Time the expert kernels waited on residency, by phase: the device
+    /// time of the demand copies, each from its first block's start to its
+    /// last block's end (a step with no miss copies nothing and adds
+    /// nothing). The device times it; the CPU policy model has no clock and
+    /// leaves it at zero.
+    pub stall_nanos: [u64; 2],
 }
 
 /// The counts and the slots in use as the device mirrors them into host
 /// memory (`struct ignis_residency_mirror`): a page of its own, page-locked
 /// and mapped by the residency it is handed to, which writes the totals
-/// there at the last layer of every step. A reader on any thread reads it
+/// there at the last layer of every step, and each demand copy its phase's
+/// stall. A reader on any thread reads it
 /// with no CUDA call and no wait; it outlives the residency, which only
 /// stops writing it, so a reader never holds device resources.
 pub struct ResidencyMirror {
@@ -51,12 +54,12 @@ struct MirrorCells {
     prefetch_issued: AtomicU64,
     prefetch_used: AtomicU64,
     bytes_moved: [AtomicU64; 2],
-    stall_nanos: AtomicU64,
+    stall_nanos: [AtomicU64; 2],
     in_use: [AtomicU32; KClass::COUNT],
 }
 
 /// The size of `struct ignis_residency_mirror`.
-pub const MIRROR_BYTES: usize = 37 * 8 + KClass::COUNT * 4;
+pub const MIRROR_BYTES: usize = 38 * 8 + KClass::COUNT * 4;
 const _: () = assert!(std::mem::size_of::<MirrorCells>() == MIRROR_BYTES);
 
 /// One page: what the residency page-locks.
@@ -106,7 +109,7 @@ impl ResidencyMirror {
             prefetch_issued: load(&c.prefetch_issued),
             prefetch_used: load(&c.prefetch_used),
             bytes_moved: c.bytes_moved.each_ref().map(load),
-            stall_nanos: load(&c.stall_nanos),
+            stall_nanos: c.stall_nanos.each_ref().map(load),
         }
     }
 
@@ -132,7 +135,9 @@ impl ResidencyMirror {
         for phase in 0..2 {
             store(&c.bytes_moved[phase], counters.bytes_moved[phase]);
         }
-        store(&c.stall_nanos, counters.stall_nanos);
+        for phase in 0..2 {
+            store(&c.stall_nanos[phase], counters.stall_nanos[phase]);
+        }
     }
 }
 
@@ -160,7 +165,7 @@ mod tests {
         counters.prefetch_issued = 3;
         counters.prefetch_used = 2;
         counters.bytes_moved = [10, 20];
-        counters.stall_nanos = 1;
+        counters.stall_nanos = [1, 30];
         let in_use = [1, 2, 3, 4, 5, 6, 7, 8];
         mirror.store(&counters, &in_use);
         assert_eq!(mirror.counters(), counters);

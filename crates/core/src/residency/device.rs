@@ -69,7 +69,7 @@ struct RawCounters {
     prefetch_issued: u64,
     prefetch_used: u64,
     bytes_moved: [u64; 2],
-    stall_nanos: u64,
+    stall_nanos: [u64; 2],
 }
 
 /// 1:1 with `struct ignis_residency_report`.

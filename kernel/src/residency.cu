@@ -7,7 +7,8 @@
 //                     the slot table and the demand copy jobs;
 //   resolve_prefetch  one CTA: place the lookahead's prefetches and their copy jobs -- on the
 //                     caller's stream in a whole step, on the prefetch stream in a split one;
-//   copy              a small grid copying the demand jobs from the mapped host pool;
+//   copy              a small grid copying the demand jobs from the mapped host pool, timing
+//                     itself into its phase's stall;
 //   copy              the same over the prefetch jobs, on the prefetch stream, beside the
 //                     expert op, after the demand copy.
 // Everything the resolve decides lives in device memory, so the host never waits on it.
@@ -70,7 +71,7 @@ struct Counters {
   unsigned long long prefetch_issued;
   unsigned long long prefetch_used;
   unsigned long long bytes_moved[2];
-  unsigned long long stall_nanos;
+  unsigned long long stall_nanos[2];
 };
 static_assert(sizeof(Counters) == sizeof(ignis_residency_counters), "counters mirror the ABI");
 
@@ -100,6 +101,10 @@ struct State {
   uint32_t step_status;
   uint32_t step_count[kLists];
   unsigned long long step_moved;
+  // The demand copy in flight: its blocks' earliest start (kNoSlot between copies) and how many
+  // blocks are done; its last block adds the span to the stall and resets both.
+  unsigned long long copy_start;
+  uint32_t copy_done;
 };
 
 // Everything the kernels read, by value.
@@ -554,15 +559,37 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// Copies every queued job: all blocks walk the jobs in order and share each one.
-__global__ void copy_jobs(const Job *jobs, const uint32_t *n_jobs) {
+__device__ __forceinline__ unsigned long long globaltimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// Copies every queued job: all blocks walk the jobs in order and share each one. A timed copy
+// (`stall` non-NULL: the demand copy, what the expert op waits for) adds its device time -- the
+// earliest block's start to the last block's end -- to `*stall` and stores the new total in
+// `*mirror` too, when there is one. A copy with no job takes no time.
+__global__ void copy_jobs(const Job *jobs, const uint32_t *n_jobs, State *st, unsigned long long *stall,
+                          unsigned long long *mirror) {
   const uint32_t n = *n_jobs;
+  if (n == 0) return;
+  if (stall != nullptr && threadIdx.x == 0) atomicMin(&st->copy_start, globaltimer());
   const unsigned long long tid = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   const unsigned long long threads = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
   for (uint32_t j = 0; j < n; ++j) {
     const Job job = jobs[j];
     for (unsigned long long v = tid; v < job.vectors; v += threads) job.dst[v] = job.src[v];
   }
+  if (stall == nullptr) return;
+  __syncthreads();
+  if (threadIdx.x != 0) return;
+  __threadfence();
+  if (atomicAdd(&st->copy_done, 1u) != gridDim.x - 1) return;
+  const unsigned long long start = atomicExch(&st->copy_start, kNoSlot);
+  const unsigned long long total = *stall + (globaltimer() - start);
+  *stall = total;
+  if (mirror != nullptr) *mirror = total;
+  st->copy_done = 0;
 }
 
 // Each row's top `width` experts by BF16-rounded logit, ties to the lower id, best first: the
@@ -700,6 +727,21 @@ struct ignis_residency {
   ignis_residency_mirror *mirror_host = nullptr;  // registered by ignis_residency_set_mirror
 };
 
+namespace {
+
+// The step's demand copy on `s`, timed into its phase's stall (and the mirror's).
+int32_t demand_copy(ignis_residency *r, uint32_t phase, cudaStream_t s) {
+  auto *mirror = r->dev.mirror != nullptr
+                     ? reinterpret_cast<unsigned long long *>(&r->dev.mirror->counters.stall_nanos[phase])
+                     : nullptr;
+  copy_jobs<<<r->desc.copy_blocks, 256, 0, s>>>(r->dev.demand, &r->dev.st->n_demand, r->dev.st,
+                                                &r->dev.counters->stall_nanos[phase], mirror);
+  RESIDENCY_CUDA(cudaGetLastError());
+  return 0;
+}
+
+}  // namespace
+
 extern "C" {
 
 int32_t ignis_residency_plan_bytes(const ignis_residency_desc *desc, ignis_residency_plan *plan) {
@@ -799,6 +841,7 @@ int32_t ignis_residency_create(const ignis_residency_desc *desc, const uint8_t *
   State state{};
   state.half_layer[0] = state.half_layer[1] = kNone;
   state.last_layer = kNone;
+  state.copy_start = kNoSlot;
   std::memcpy(image.data() + r->layout.state, &state, sizeof(State));
   e = cudaMemcpy(r->tables, image.data(), image.size(), cudaMemcpyHostToDevice);
   if (e != cudaSuccess) return cleanup(fail(std::string("residency: initializing the tables: ") + cudaGetErrorString(e)));
@@ -970,12 +1013,12 @@ int32_t ignis_residency_step_ranked(ignis_residency *r, uint32_t layer, uint32_t
     resolve_prefetch<<<1, kThreads, 0, s>>>(r->dev, layer, phase, lookahead, rows, stride);
     RESIDENCY_CUDA(cudaGetLastError());
   }
-  copy_jobs<<<d.copy_blocks, 256, 0, s>>>(r->dev.demand, &r->dev.st->n_demand);
-  RESIDENCY_CUDA(cudaGetLastError());
+  if (demand_copy(r, phase, s) != 0) return -1;
   if (look) {
     RESIDENCY_CUDA(cudaEventRecord(r->fork, s));
     RESIDENCY_CUDA(cudaStreamWaitEvent(r->prefetch_stream, r->fork, 0));
-    copy_jobs<<<d.copy_blocks, 256, 0, r->prefetch_stream>>>(r->dev.prefetch, &r->dev.st->n_prefetch);
+    copy_jobs<<<d.copy_blocks, 256, 0, r->prefetch_stream>>>(r->dev.prefetch, &r->dev.st->n_prefetch, r->dev.st,
+                                                            nullptr, nullptr);
     RESIDENCY_CUDA(cudaGetLastError());
     RESIDENCY_CUDA(cudaEventRecord(r->join, r->prefetch_stream));
     r->forked = true;
@@ -1007,8 +1050,7 @@ int32_t ignis_residency_step_demand(ignis_residency *r, uint32_t layer, uint32_t
     r->forked = true;
     r->join_recorded = false;
   }
-  copy_jobs<<<d.copy_blocks, 256, 0, s>>>(r->dev.demand, &r->dev.st->n_demand);
-  RESIDENCY_CUDA(cudaGetLastError());
+  if (demand_copy(r, phase, s) != 0) return -1;
   if (look) {
     RESIDENCY_CUDA(cudaEventRecord(r->demanded, s));
     r->branch_open = true;
@@ -1032,7 +1074,7 @@ int32_t ignis_residency_step_prefetch_ranked(ignis_residency *r, const int32_t *
   resolve_prefetch<<<1, kThreads, 0, p>>>(r->dev, r->branch_layer, r->branch_phase, lookahead, rows, stride);
   RESIDENCY_CUDA(cudaGetLastError());
   RESIDENCY_CUDA(cudaStreamWaitEvent(p, r->demanded, 0));
-  copy_jobs<<<d.copy_blocks, 256, 0, p>>>(r->dev.prefetch, &r->dev.st->n_prefetch);
+  copy_jobs<<<d.copy_blocks, 256, 0, p>>>(r->dev.prefetch, &r->dev.st->n_prefetch, r->dev.st, nullptr, nullptr);
   RESIDENCY_CUDA(cudaGetLastError());
   RESIDENCY_CUDA(cudaEventRecord(r->join, p));
   r->join_recorded = true;

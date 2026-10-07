@@ -993,9 +993,9 @@ function TallyCell({ tally }: { tally: { total: number | null; window: number | 
 /**
  * Flash-Next's expert residency (GitHub #301, spec flash-next/03 story 7):
  * the decode hit rate, the misses each token cost and the PCIe traffic —
- * what tells a slow turn caused by misses from one caused by compute — then
- * each K class's slots against their capacity. The kernels' wait is not
- * drawn: the device does not time it yet, so the server exports none.
+ * what tells a slow turn caused by misses from one caused by compute — the
+ * time the expert kernels waited on those copies (GitHub #306), then each K
+ * class's slots against their capacity.
  */
 function ExpertsCard({ experts, chart, win }: { experts: Experts; chart: ChartFrame; win: string }) {
   const { issued, used } = experts.prefetch;
@@ -1013,6 +1013,13 @@ function ExpertsCard({ experts, chart, win }: { experts: Experts; chart: ChartFr
           ["Prefill hit rate", asShare(experts.prefillHitShare)],
           ["Prefetches used", `${formatCount(used.window)} of ${formatCount(issued.window)}`],
           [`Copied in, last ${win}`, formatBytes(experts.bytesMoved.window)],
+        ]}
+      />
+      <Figures
+        items={[
+          ["Stall per token", experts.stallPerToken === null ? formatNumber(null) : `${formatNumber(experts.stallPerToken * 1000)} ms`],
+          ["Waiting on copies", asShare(experts.stallShare)],
+          [`Stalled, last ${win}`, formatSeconds(experts.stall.window)],
         ]}
       />
       <TimeChart

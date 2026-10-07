@@ -11,7 +11,9 @@
 //   - the slot table: every entry is ABSENT or points at a slot boundary of its own class's pool
 //     or into the staging ring, no two entries share a slot, an evicted projection is ABSENT,
 //     and a staged projection is ABSENT again once a step of another layer has run;
-//   - at the end, the counters add up to the trace.
+//   - at the end, the counters add up to the trace;
+//   - the stall: a step (or captured round) whose misses were copied in adds to its phase's
+//     stall_nanos, one with no miss adds nothing, and neither touches the other phase.
 // `graph` runs every whole decode round (all layers in order, one token count) as one CUDA graph,
 // captured once per token count and replayed with new ids in the same buffers: decode residency
 // is graph-capturable across the layer steps of a round (spec acceptance 3); the rest runs
@@ -302,6 +304,32 @@ int main(int argc, char **argv) {
   uint64_t want_hits[8][2] = {}, want_misses[8][2] = {};
   uint32_t graph_rounds = 0;
 
+  // The stall: what steps `from`..`to` (one phase) added to stall_nanos, against their misses.
+  uint64_t stall_seen[2] = {}, stall_steps[2] = {}, stall_min = UINT64_MAX;
+  auto stall_now = [&](uint64_t out[2]) {
+    ignis_residency_counters c{};
+    RES_OK(ignis_residency_read_counters(r, &c));
+    out[0] = c.stall_nanos[0];
+    out[1] = c.stall_nanos[1];
+  };
+  auto check_stall = [&](const std::string &at, size_t from, size_t to, const uint64_t before[2]) {
+    uint64_t after[2];
+    stall_now(after);
+    const uint32_t phase = f.steps[from].phase;
+    bool copied = false;
+    for (size_t i = from; i < to; ++i) copied = copied || (f.steps[i].expect.status == 0 && !f.steps[i].expect.list[2].empty());
+    const uint64_t added = after[phase] - before[phase];
+    check(after[1 - phase] == before[1 - phase], at + ": the stall of the other phase moved");
+    if (copied) {
+      check(added > 0, at + ": misses were copied in and the stall did not grow");
+      stall_min = std::min(stall_min, added);
+      stall_seen[phase] += added;
+      ++stall_steps[phase];
+    } else {
+      check(added == 0, at + ": no miss, yet the stall grew by " + std::to_string(added) + " ns");
+    }
+  };
+
   // One step's outcome against the model's.
   auto compare = [&](size_t si) {
     const Step &s = f.steps[si];
@@ -529,6 +557,8 @@ int main(int argc, char **argv) {
         CUDA_OK(cudaGraphDestroy(g));
       }
       RES_OK(ignis_residency_join(r, stream));
+      uint64_t before[2];
+      stall_now(before);
       for (uint32_t l = 0; l < f.layers; ++l) {
         const Step &s = f.steps[si + l];
         CUDA_OK(cudaMemcpyAsync(round.ids[l], s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
@@ -540,6 +570,7 @@ int main(int argc, char **argv) {
       CUDA_OK(cudaGraphLaunch(round.exec, stream));
       CUDA_OK(cudaStreamSynchronize(stream));
       for (uint32_t l = 0; l < f.layers; ++l) compare(si + l);
+      check_stall("round from step " + std::to_string(si), si, si + f.layers, before);
       check_table("round from step " + std::to_string(si), nullptr);
       if (f.steps[si + f.layers - 1].expect.status == 0) check_mirror("round from step " + std::to_string(si));
       remember_staging(f.steps[si + f.layers - 1]);
@@ -549,6 +580,8 @@ int main(int argc, char **argv) {
     }
     const Step &s = f.steps[si];
     const bool has_look = s.rows > 0;
+    uint64_t before[2];
+    stall_now(before);
     CUDA_OK(cudaMemcpyAsync(d_ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
     if (has_look) {
       CUDA_OK(cudaMemcpyAsync(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice, stream));
@@ -557,6 +590,7 @@ int main(int argc, char **argv) {
     RES_OK(ignis_residency_join(r, stream));
     CUDA_OK(cudaStreamSynchronize(stream));
     compare(si);
+    check_stall("step " + std::to_string(si), si, si + 1, before);
     check_table("step " + std::to_string(si) + " (layer " + std::to_string(s.layer) + ")", &s);
     if (s.layer + 1 == f.layers && s.expect.status == 0) check_mirror("step " + std::to_string(si));
     remember_staging(s);
@@ -576,6 +610,12 @@ int main(int argc, char **argv) {
     }
   }
   if (graph_mode) check(graph_rounds > 2, "graph mode replayed too few captured rounds");
+  check(counters.stall_nanos[0] == stall_seen[0] && counters.stall_nanos[1] == stall_seen[1],
+        "counters: the stall is what the steps added");
+  check(stall_steps[0] > 0 && stall_steps[1] > 0, "the trace copies misses in both phases");
+  std::printf("stall: decode %.1f us over %llu copying steps, prefill %.1f us over %llu, smallest %llu ns\n",
+              stall_seen[0] / 1e3, static_cast<unsigned long long>(stall_steps[0]), stall_seen[1] / 1e3,
+              static_cast<unsigned long long>(stall_steps[1]), static_cast<unsigned long long>(stall_min));
 
   if (split_mode) {
     // A prefetch half needs its demand half's open branch; a branch the caller never took a

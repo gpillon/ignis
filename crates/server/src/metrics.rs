@@ -488,6 +488,7 @@ struct FlashNextSeries {
     prefetch_issued: AtomicU64,
     prefetch_used: AtomicU64,
     bytes_moved: [AtomicU64; 2],
+    stall_nanos: [AtomicU64; 2],
     slots_capacity: [AtomicU64; KClass::COUNT],
     slots_in_use: [AtomicU64; KClass::COUNT],
     ngram_hot_rows: AtomicU64,
@@ -512,6 +513,7 @@ impl FlashNextSeries {
         store(&self.prefetch_used, r.prefetch_used);
         for phase in 0..2 {
             store(&self.bytes_moved[phase], r.bytes_moved[phase]);
+            store(&self.stall_nanos[phase], r.stall_nanos[phase]);
         }
         let n = &reading.ngram;
         store(&self.ngram_hot_rows, n.hot_rows);
@@ -531,7 +533,7 @@ impl FlashNextSeries {
                 prefetch_issued: load(&self.prefetch_issued),
                 prefetch_used: load(&self.prefetch_used),
                 bytes_moved: self.bytes_moved.each_ref().map(load),
-                stall_nanos: 0,
+                stall_nanos: self.stall_nanos.each_ref().map(load),
             },
             slots_capacity: self.slots_capacity.each_ref().map(|c| load(c) as u32),
             slots_in_use: self.slots_in_use.each_ref().map(|c| load(c) as u32),
@@ -1199,9 +1201,8 @@ impl Metrics {
 /// own units, no ratio: a decode hit rate is `hits` over `hits + misses` of
 /// `phase="decode"`. A 27B load has no expert cache and never renders these;
 /// [`Metrics::render`] renders them for a Flash-Next load, from what the
-/// telemetry consumer read. The kernels' wait (`stall_nanos`) is not
-/// exported: the device does not time it yet, and ADR 0017 exports no
-/// placeholder.
+/// telemetry consumer read. The kernels' wait is the device's own timing of
+/// its demand copies (`stall_nanos`), rendered exactly in seconds.
 pub fn render_expert_residency(
     out: &mut String,
     counters: &ResidencyCounters,
@@ -1260,6 +1261,20 @@ pub fn render_expert_residency(
             "ignis_expert_bytes_moved_total{{phase=\"{}\"}} {}",
             phase.as_str(),
             counters.bytes_moved[phase.index()]
+        );
+    }
+    declare(
+        out,
+        "ignis_expert_residency_stall_seconds_total",
+        "counter",
+        "Device time the expert kernels waited on their step's demand copies (the misses), by phase; a step with no miss adds nothing.",
+    );
+    for phase in Phase::ALL {
+        let _ = writeln!(
+            out,
+            "ignis_expert_residency_stall_seconds_total{{phase=\"{}\"}} {}",
+            phase.as_str(),
+            decimal(counters.stall_nanos[phase.index()], 1_000_000_000)
         );
     }
     declare(
@@ -2049,7 +2064,7 @@ mod tests {
         counters.prefetch_issued = 5;
         counters.prefetch_used = 4;
         counters.bytes_moved = [1_000, 2_000];
-        counters.stall_nanos = 1_500_000;
+        counters.stall_nanos = [1_500_000, 2_000_000_007];
         let mut capacity = [0u32; KClass::COUNT];
         capacity[down_k2.index()] = 40;
         let mut occupancy = [0u32; KClass::COUNT];
@@ -2065,14 +2080,17 @@ mod tests {
             ("ignis_expert_prefetches_issued_total", "counter"),
             ("ignis_expert_prefetches_used_total", "counter"),
             ("ignis_expert_bytes_moved_total", "counter"),
+            ("ignis_expert_residency_stall_seconds_total", "counter"),
             ("ignis_expert_cache_slots", "gauge"),
         ] {
             assert_eq!(text.matches(&format!("# TYPE {name} {kind}\n")).count(), 1, "{name}");
             assert_eq!(text.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
         }
-        assert_eq!(samples(&text).len(), 52);
-        // The device does not time the kernels' wait yet: no placeholder.
-        assert!(!text.contains("stall"), "{text}");
+        assert_eq!(samples(&text).len(), 54);
+        // Nanoseconds as exact seconds.
+        let stall = |phase: &str| value(&text, "ignis_expert_residency_stall_seconds_total", &format!("phase=\"{phase}\""));
+        assert_eq!(stall("decode"), "0.0015");
+        assert_eq!(stall("prefill"), "2.000000007");
         let hits = |labels: &str| value(&text, "ignis_expert_cache_hits_total", labels);
         assert_eq!(hits("class=\"down_k2\",phase=\"decode\""), "7");
         assert_eq!(hits("class=\"gate_up_k2_5\",phase=\"prefill\""), "0");
@@ -2108,7 +2126,7 @@ mod tests {
         reading.residency.hits[gate_up_k4][Phase::Decode.index()] = 21;
         reading.residency.misses[gate_up_k4][Phase::Decode.index()] = 4;
         reading.residency.bytes_moved = [3_000, 0];
-        reading.residency.stall_nanos = 9;
+        reading.residency.stall_nanos = [9, 0];
         reading.slots_capacity[gate_up_k4] = 64;
         reading.slots_in_use[gate_up_k4] = 33;
         reading.ngram = NgramCounters { rows: 320, hot_rows: 300, file_rows: 20, reads: 7, read_bytes: 28_672 };
@@ -2134,6 +2152,7 @@ mod tests {
                 ("ignis_expert_prefetches_issued_total", "counter"),
                 ("ignis_expert_prefetches_used_total", "counter"),
                 ("ignis_expert_bytes_moved_total", "counter"),
+                ("ignis_expert_residency_stall_seconds_total", "counter"),
                 ("ignis_expert_cache_slots", "gauge"),
                 ("ignis_ngram_rows_total", "counter"),
                 ("ignis_ngram_reads_total", "counter"),
@@ -2159,8 +2178,12 @@ mod tests {
         assert_eq!(value(&with, "ignis_ngram_rows_total", "source=\"file\""), "20");
         assert_eq!(value(&with, "ignis_ngram_reads_total", ""), "7");
         assert_eq!(value(&with, "ignis_ngram_read_bytes_total", ""), "28672");
-        // 52 residency series and 4 n-gram ones, nothing else added.
-        assert_eq!(samples(&with).len(), samples(&without).len() + 56);
+        assert_eq!(
+            value(&with, "ignis_expert_residency_stall_seconds_total", "phase=\"decode\""),
+            "0.000000009"
+        );
+        // 54 residency series and 4 n-gram ones, nothing else added.
+        assert_eq!(samples(&with).len(), samples(&without).len() + 58);
     }
 
     #[test]
