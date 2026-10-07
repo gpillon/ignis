@@ -30,6 +30,11 @@ with the version. The image carries the CUDA runtime but no driver: the host's
 NVIDIA driver is injected by the container runtime, and the model is mounted,
 never baked in.
 
+Every push to `main` also publishes the image as `ghcr.io/gpillon/ignis:develop`
+(and a rolling `develop` prerelease on the Releases page holding the matching
+archives). That is a development build, **not a release**: it is rebuilt on each
+push, replaced by the next one, and never tagged `latest` or with a version.
+
 ```
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
   -v /path/to/models:/models:ro \
