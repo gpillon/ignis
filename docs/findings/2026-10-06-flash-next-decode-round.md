@@ -480,7 +480,7 @@ Does a decode prefetch budget that follows the step's rows take (c)'s one-lane g
 | base2 | 94.9, 95.1, 93.6, 95.6 | 96.34%, 35.1 / 76.9 / 34.8, 74.3 MB, 2.09 ms | 99.2 / 99.4 | 88.70%, 103.4 / 39.6 / 27.3, 101.3 MB, 6.22 ms |
 | new2 | 97.6, 97.7, 97.7, 97.7 | 95.87%, 39.7 / 47.3 / 22.4, 58.6 MB, 2.25 ms | 100.3 / 100.3 | 89.47%, 96.3 / 55.3 / 38.4, 108.8 MB, 5.78 ms |
 
-The greedy prompts make both builds route the same tokens, so the traffic columns repeat within a build to a tenth. The italic windows are slow on every lane at once, in two separate wall-clock windows (19:23 and 19:28), one per build: an outside disturbance, not the budget, whose traffic for the leg matches its twin.
+The greedy prompts make both builds route the same tokens, so the traffic columns repeat within a build to a tenth. The italic windows are slow on every lane at once, in two separate wall-clock windows (19:23 and 19:28), one per build. **Inferred:** an outside disturbance, not the budget: each such leg's traffic matches its twin's, and no build ran on the host at the time; what disturbed them was not identified.
 
 - **One lane: +2-3%.** 95.2-97.7 against 92.5-95.6 tok/s (new1's first request excepted), the ITL's median 9.5 against 10.0 ms. It hits less (95.9 against 96.3%) and stalls more (2.25-2.38 against 2.09-2.10 ms), and still wins, as (c)'s 0.67x leg did: it moves 21% fewer bytes, and less prefetch is still copying at the next layer's join.
 - **Three lanes: neutral.** 97.8-100.3 against 98.7-99.4 on the undisturbed windows; by pair, 97.8 against 98.7 and 100.3 against 99.4. The three-row budget hits 0.8 points more and stalls 4-7% less, but moves 7% more bytes. (c)'s +2.4% at three was against a slower base (96.1) and does not reappear.
