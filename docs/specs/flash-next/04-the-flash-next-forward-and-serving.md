@@ -358,12 +358,15 @@ launch shapes.
   survey of 2026-10-04 (`.scratch`, untracked). The ticket's first task is to
   turn that list into topology fields.
 - **Acceptance 7 as built (GitHub #306 item 8, 2026-10-07).**
-  `test_flash_next_sparse_attention_hq` runs two routes on the real layer-3
-  K/V rows of `kernel/tests/fixtures/hq_kv_rows_flash_next.bin`, hq against
-  BF16 on identical rows, codec only:
+  `test_flash_next_sparse_attention_hq` runs the three routes on the real
+  layer-3 K/V rows of `kernel/tests/fixtures/hq_kv_rows_flash_next.bin`, hq
+  against BF16 on identical rows, codec only. The query rows are synthetic:
+  the fixture holds K/V rows only.
   - the decode route: listed rows on the sparse kernel;
   - the dense prefill route: visible rows decoded by position, then
-    `qsa::attend_dense`.
+    `qsa::attend_dense`;
+  - the sparse prefill route, past `dense_threshold()`: visible rows decoded
+    by position, then each row's selection on the sparse kernel.
 
   Every output is held to three checks:
   - within the derived fp64 bound over the rows its route read;
@@ -376,8 +379,8 @@ launch shapes.
   attention is peaked and the output's own rounding dominates, so the BF16
   route itself exceeded that bound on 75 of 18,432 elements, by up to 1.56×.
   BF16 round-to-nearest is 2^-8 relative at worst. With 2^-8, every element
-  of both routes is within the bound (worst ratios: decode 0.75 hq / 0.80
-  BF16, dense 0.51 / 0.52). So the bound is the derivation corrected, not a
-  margin fitted to the data. The dense kernel normalizes by the fp32 sum of
+  of every route is within the bound (worst ratios: decode 0.75 hq / 0.80
+  BF16, dense 0.51 / 0.52, sparse prefill 0.74 / 0.80). So the bound is the
+  derivation corrected, not a margin fitted to the data. The dense kernel normalizes by the fp32 sum of
   its unrounded weights, so its weight rounding is bounded by 2^-8 Σ w|v|,
   not the centred form.

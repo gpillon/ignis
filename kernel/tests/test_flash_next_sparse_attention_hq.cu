@@ -24,8 +24,8 @@
 //   hq vs BF16 the hq route's distance from the BF16 route on the same keys and values, and the
 //             codec's row error, printed on these synthetic rows; then asserted on real Flash-Next KV
 //             rows (kernel/tests/fixtures/hq_kv_rows_flash_next.bin, spec 04 AC7) within the codec's
-//             measured effect on them, on the decode route and on S2's dense prefill route
-//             (qsa::attend_dense over the visible rows decoded by position).
+//             measured effect on them, on all three routes: decode, S2's dense prefill
+//             (qsa::attend_dense over the visible rows decoded by position) and sparse prefill.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
@@ -390,12 +390,14 @@ int main() {
 
   // hq vs BF16 on real Flash-Next rows (spec 04 AC7): every page refilled with the K/V rows of the first
   // QSA layer (model layer 3) from kernel/tests/fixtures/hq_kv_rows_flash_next.bin, its 256 positions per
-  // head tiled over the pages, and encoded by the same vendored encoder at each row's own position. Two
-  // routes, each run hq and BF16 on the same rows, codec only (no fresh rows, no residual window: every
-  // row hq reads is a codec row, so every difference is the codec's):
+  // head tiled over the pages, and encoded by the same vendored encoder at each row's own position. The
+  // three routes, each run hq and BF16 on the same rows, codec only (no fresh rows, no residual window:
+  // every row hq reads is a codec row, so every difference is the codec's):
   //   decode  the three decode rows above: their listed rows on the sparse kernel;
   //   dense   one lane's prefill chunk of 251 rows at 1800, up to dense_threshold(): its visible rows
-  //           decoded by position, on the dense kernel (qsa_dense.cu) -- every 25th row checked.
+  //           decoded by position, on the dense kernel (qsa_dense.cu) -- every 25th row checked;
+  //   sparse prefill  one lane's 128 rows at 5000, past dense_threshold(): its visible rows decoded
+  //           by position, each row's own selection on the sparse kernel -- every 16th row checked.
   // Held, per route:
   // - each output within reference()'s per-element bound of fp64 attention over the rows the route
   //   read (hq: its scratch, downloaded; BF16: the pages), the dense kernel's form of it on the dense
@@ -410,8 +412,9 @@ int main() {
   // 2^-9 the BF16 route itself passed it on 75 of these 18432 decode outputs, by up to 1.56x.
   // Measured 2026-10-07: decode -- codec effect rel. RMS 0.1480, route distance 0.1480, 2.4e-3
   // left; worst of the bound hq 0.754, BF16 0.798; dense -- 0.1404, 0.1404, 2.4e-3 left; hq 0.508,
-  // BF16 0.517. Against the codec tolerance both routes reach 0.99 by construction: where the
-  // effect dominates, the distance is the effect and the bounds are the margin.
+  // BF16 0.517; sparse prefill -- 0.1288, 0.1288, 2.4e-3 left; hq 0.741, BF16 0.798. Against the
+  // codec tolerance every route reaches 0.99 by construction: where the effect dominates, the
+  // distance is the effect and the bounds are the margin.
   {
     const std::vector<uint16_t> real = real_layer_rows(IGNIS_HQ_KV_FLASH_NEXT_FIXTURE_PATH);
     Pages rp = pg;
@@ -563,6 +566,34 @@ int main() {
         SP_OK(fn::qsa::attend_dense(g, pages, kSlots, b, d.q.as<__nv_bfloat16>(), d.out.as<__nv_bfloat16>(), s));
       }, stream);
       routes("dense, real rows", dc, got, positional_rows(rd), base, 25, true);
+    }
+
+    // sparse prefill: one lane's chunk past dense_threshold(), each row its own selection over its
+    // visible rows -- hq decoded by position, BF16 from the pages -- on the sparse kernel.
+    {
+      constexpr int kFirst = 5000, kTokens = 128;  // 256 units: one split, no partials
+      Call sc;
+      sc.slots = {0};
+      sc.positions = {kFirst};
+      sc.tokens = kTokens;
+      sc.max_visible = kFirst + kTokens;
+      for (int r = 0; r < kTokens; ++r) sc.lists.push_back(make_list(kFirst + r, 11));
+      DeviceBytes pk(sp::visible_hq_bytes(g, sc.max_visible)), pv(sp::visible_hq_bytes(g, sc.max_visible));
+      const auto got = run(d, sc, [&](const fn::Batch &b, const fn::Selection &sel, cudaStream_t s) {
+        sp::KvSource kv;
+        SP_OK(sp::decode_visible_hq(g, rh, b, pk.as<__nv_bfloat16>(), pv.as<__nv_bfloat16>(), &kv, s));
+        SP_OK(sp::attend(g, kv, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
+      }, stream);
+      Read rd;
+      rd.k = download<uint16_t>(pk.p, sp::visible_hq_bytes(g, sc.max_visible) / 2);
+      rd.v = download<uint16_t>(pv.p, sp::visible_hq_bytes(g, sc.max_visible) / 2);
+      rows_within_ulp("sparse prefill, real rows", sc, positional_rows(rd), rcodec);
+      const sp::KvSource pages{rk.as<__nv_bfloat16>(), rv.as<__nv_bfloat16>(), dtables.as<int32_t>(), kLogicalPages,
+                               kKvHeads, sp::KvSource::Mode::Paged};
+      const auto base = run(d, sc, [&](const fn::Batch &b, const fn::Selection &sel, cudaStream_t s) {
+        SP_OK(sp::attend(g, pages, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
+      }, stream);
+      routes("sparse prefill, real rows", sc, got, positional_rows(rd), base, 16, false);
     }
   }
 
