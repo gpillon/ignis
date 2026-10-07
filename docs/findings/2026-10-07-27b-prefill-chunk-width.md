@@ -33,6 +33,8 @@ Flash-Next uses 8,192. On current `main`:
 - Card: exclusive under the GPU lock. CPU 14% mean, 25% max during the
   measured run (`typeperf`, 141 samples).
 - Order: 1024, 2048, 4096, 8192, 1024 again, then 1024 with `--decode-share 50`.
+  A later run (same day, `main` at cb6f47d, the stall probe only) added 1024
+  at the new default share of 25 (`w1024s25.stall.*`).
 
 **Per load, four readings** (scripts in `.scratch/issue-92-2026-10-07/`, driver `cell.sh`):
 
@@ -93,6 +95,7 @@ prompt; times in s and ms):
 | 4096 | 3.835 | 4.030-4.142 | 4.3 | 637.7 | 702.0 |
 | 8192 | 3.817 | 3.890-4.046 | 3.4 | 1,159.6 | 1,294.2 |
 | 1024, `--decode-share 50` | 4.036 | 7.991-8.098 | 28.5 | 144.5 | 233.3 |
+| 1024, `--decode-share 25` (later run, the new default) | 4.057 | 5.544-5.565 | 16.9-17.0 | 159.1-161.4 | 207.6 |
 
 **The decode share on the 27B.**
 - The 27B has `--decode-share` (#306); `ModelFamily::default_decode_share_percent`
