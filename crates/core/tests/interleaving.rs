@@ -35,6 +35,7 @@ fn input(tokens: &[u32], max_tokens: u32) -> RequestInput {
             ..DecodeParams::default()
         },
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }
@@ -156,6 +157,7 @@ fn only_the_final_prefill_chunk_receives_stochastic_sampling_params() {
                 tokens: (1..=10).collect(),
                 params: sampling,
                 constrained: None,
+                forced_literal: None,
                 warm_up: false,
             },
             RequestClass::Agent,

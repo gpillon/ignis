@@ -63,6 +63,7 @@ fn input(prompt: Vec<u32>, opener: Option<u32>, max: u32) -> RequestInput {
         system_block_tokens: None,
         reuse_boundaries: Vec::new(),
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }

@@ -40,6 +40,7 @@ fn input(max: u32) -> RequestInput {
             ..DecodeParams::default()
         },
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }
@@ -340,6 +341,7 @@ fn a_burst_on_one_prefix_overflows_through_materialized_snapshots_without_repref
             ..DecodeParams::default()
         },
         constrained: None,
+        forced_literal: None,
         warm_up: false,
 };
 
@@ -456,6 +458,7 @@ fn a_request_holding_a_shared_prefix_is_evicted_with_its_prefix_materialized() {
             ..DecodeParams::default()
         },
         constrained: None,
+        forced_literal: None,
         warm_up: false,
 };
 
@@ -560,6 +563,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                         ..DecodeParams::default()
                     },
                     constrained: None,
+                    forced_literal: None,
                     warm_up: false,
                 },
                 RequestClass::Interactive,
@@ -586,6 +590,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                     ..DecodeParams::default()
                 },
                 constrained: None,
+                forced_literal: None,
                 warm_up: false,
             },
             RequestClass::Interactive,
@@ -610,6 +615,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                     ..DecodeParams::default()
                 },
                 constrained: None,
+                forced_literal: None,
                 warm_up: false,
             },
             RequestClass::Agent,

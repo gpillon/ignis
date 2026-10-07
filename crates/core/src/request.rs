@@ -75,6 +75,9 @@ pub struct Request {
     /// Progress against the request's thinking budget
     /// ([`crate::types::DecodeParams::thinking_budget`]).
     pub thinking: crate::thinking_budget::BudgetState,
+    /// Progress through the request's forced literal
+    /// ([`crate::types::RequestInput::forced_literal`], GitHub #286).
+    pub forced: crate::forced_literal::ForcedState,
     /// The resources this request reserves while it holds a lane (core-05:
     /// the admission state machine's KV reservation, charged at deal and
     /// released at completion — the pool never over-allocates).
@@ -214,6 +217,7 @@ impl Request {
             attention: None,
             drawn: Vec::new(),
             thinking: crate::thinking_budget::BudgetState::default(),
+            forced: crate::forced_literal::ForcedState::default(),
             resources,
             remaining_work,
             backfill_epoch: 0,
@@ -741,6 +745,7 @@ mod tests {
             RequestInput {
                 decision: None,
                 constrained: None,
+                forced_literal: None,
                 warm_up: false,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],

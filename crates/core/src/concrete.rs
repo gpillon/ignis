@@ -2034,6 +2034,8 @@ impl ConcreteScheduler {
         // step 0 again — a constrained decode that kept it would answer with twice its
         // own digits.
         r.drawn.clear();
+        // GitHub #286: and its forced literal starts over with it.
+        r.forced = crate::forced_literal::ForcedState::default();
         let effective_max = generation_budget(&self.config, &r.input);
         r.remaining_work = effective_max as u64;
         r.backfill_class = BackfillClass::None;
@@ -3156,13 +3158,19 @@ impl Scheduler for ConcreteScheduler {
                     // chunk and for a related reason — this prefill draws the
                     // token the first decode round emits, so step 0's set
                     // belongs here and nowhere else. `reuse_reach` is what
-                    // guarantees the chunk is not empty.
-                    permitted: r
-                        .input
-                        .constrained
-                        .as_ref()
-                        .filter(|_| start + take >= r.input.tokens.len() as u32)
-                        .and_then(|schedule| schedule.step(0)),
+                    // guarantees the chunk is not empty. A forced literal
+                    // that starts at the generation (GitHub #286) puts its
+                    // first token here for the same reason.
+                    permitted: (start + take >= r.input.tokens.len() as u32)
+                        .then(|| match &r.input.constrained {
+                            Some(schedule) => schedule.step(0),
+                            None => r
+                                .input
+                                .forced_literal
+                                .as_deref()
+                                .and_then(crate::forced_literal::ForcedLiteral::prefill_step),
+                        })
+                        .flatten(),
                     // GitHub #260: the attention readout, on the same chunk
                     // and for the same reason as the readout — its query is
                     // the prompt's last position. `prefill_tail` is what
@@ -3610,16 +3618,26 @@ impl Scheduler for ConcreteScheduler {
             // The thinking budget's forced close (2026-09-24): a set only
             // for a request past its budget with its block still open. A
             // constrained decode's own schedule wins; the server never
-            // sets both.
+            // sets both. A forced literal (GitHub #286) is asked every round
+            // it exists, the budget's rounds included: it waits for the
+            // budget's close and needs to know whether the last draw was
+            // forced.
             let forced: Vec<Option<crate::constrained::PermittedSet>> = to_decode
                 .iter()
                 .map(|&i| {
-                    let close = self.config.thinking_close.as_deref()?;
                     let r = &mut self.requests[i];
                     if r.input.constrained.is_some() {
                         return None;
                     }
-                    r.thinking.permitted(r.input.params.thinking_budget, close, r.tokens)
+                    let budget = self
+                        .config
+                        .thinking_close
+                        .as_deref()
+                        .and_then(|close| r.thinking.permitted(r.input.params.thinking_budget, close, r.tokens));
+                    match r.input.forced_literal.as_deref() {
+                        Some(literal) => r.forced.permitted(literal, r.tokens, budget.as_ref()).or(budget),
+                        None => budget,
+                    }
                 })
                 .collect();
             let jobs: Vec<DecodeJob> = to_decode
@@ -3702,6 +3720,10 @@ impl Scheduler for ConcreteScheduler {
                             if let Some(close) = self.config.thinking_close.as_deref() {
                                 let index = self.requests[i].tokens;
                                 self.requests[i].thinking.commit(close, index, token);
+                            }
+                            let r = &mut self.requests[i];
+                            if let Some(literal) = r.input.forced_literal.as_deref() {
+                                r.forced.commit(literal, r.tokens, token);
                             }
                             self.requests[i].tokens += 1;
                             // Service-work decay (core-05): one quantum per

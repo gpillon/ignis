@@ -115,6 +115,7 @@ fn request_input(rendered: RenderedPrompt) -> RequestInput {
         system_block_tokens: rendered.system_block_tokens,
         reuse_boundaries: Vec::new(),
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }

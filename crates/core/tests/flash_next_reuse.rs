@@ -107,6 +107,7 @@ fn turn() -> RequestInput {
         system_block_tokens: None,
         reuse_boundaries: Vec::new(),
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }

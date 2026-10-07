@@ -127,6 +127,7 @@ fn locate_input(
             set: Some(SetQuery::rows(calibration.heads)),
         })),
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     };
     (input, span)

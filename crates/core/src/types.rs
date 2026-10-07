@@ -159,6 +159,16 @@ pub struct RequestInput {
     /// They are the two halves of ADR 0034, and a request is one or the
     /// other.
     pub constrained: Option<std::sync::Arc<crate::constrained::Schedule>>,
+    /// The **forced literal** this request generates first (GitHub #286,
+    /// spec server/11), or `None` for every request that does not force
+    /// one: tokens forced one per round, at the generation's first token or
+    /// right after the reasoning block, after which the request generates
+    /// freely ([`crate::forced_literal`]). The opening of a tool call is
+    /// what `tool_choice` forces this way.
+    ///
+    /// Never set together with [`RequestInput::constrained`], whose schedule
+    /// owns every draw of its run.
+    pub forced_literal: Option<std::sync::Arc<crate::forced_literal::ForcedLiteral>>,
     /// Whether this request is a **warm-up** (GitHub #282, the Responses
     /// WebSocket mode's `generate: false`): like a decision it ends where its
     /// prefill ends and generates nothing; unlike one it reads nothing out,
@@ -275,7 +285,7 @@ impl RequestInput {
     pub fn prefill_tail(&self) -> usize {
         if self.attention().is_some() {
             crate::pointing::ATTENTION_MIN_CHUNK_TOKENS as usize
-        } else if self.is_decision() || self.is_constrained() || self.multimodal.is_some() {
+        } else if self.is_decision() || self.draws_forced_at_prefill() || self.multimodal.is_some() {
             1
         } else {
             0
@@ -287,6 +297,15 @@ impl RequestInput {
     /// drawn from that step's permitted set.
     pub fn is_constrained(&self) -> bool {
         self.constrained.is_some()
+    }
+
+    /// Whether this request's prefill draws its first token from a permitted
+    /// set: a **constrained decode**, or a **forced literal** that starts at
+    /// the generation (GitHub #286). Either must be left a token to prefill,
+    /// for the reason [`RequestInput::reuse_reach`] gives.
+    pub fn draws_forced_at_prefill(&self) -> bool {
+        self.is_constrained()
+            || self.forced_literal.as_deref().is_some_and(|literal| literal.prefill_step().is_some())
     }
 
     /// How many leading prompt tokens this request may **match** retained
@@ -307,7 +326,9 @@ impl RequestInput {
     /// chunk with nothing to prefill draws nothing and the run would begin
     /// with whatever the claimed state left pending — a free token in the
     /// middle of forced text, which is the failure
-    /// `crates/core/tests/permitted_decode_gpu.rs` was written after.
+    /// `crates/core/tests/permitted_decode_gpu.rs` was written after. So is
+    /// a **forced literal** that starts at the generation (GitHub #286),
+    /// whose first token is drawn the same way.
     ///
     /// Whether an entry *could* have covered the whole prompt depends on the
     /// chat template, which is exactly why this does not: the 27B's appends
@@ -341,8 +362,14 @@ impl RequestInput {
     /// entry no decision could ever match, and — through the capture that
     /// rides a page-aligned publish — a prompt checkpoint covering the whole
     /// prompt.
+    ///
+    /// A forced literal that starts at the generation (GitHub #286) is in it
+    /// for a reason of its own: a prefix published over its whole prompt
+    /// would carry the token its prefill drew under the literal's first set,
+    /// and hand that forced `<tool_call>` to the next request that claimed
+    /// the prompt whole and never asked for a call.
     pub fn publish_reach(&self) -> usize {
-        match self.is_decision() || self.is_constrained() {
+        match self.is_decision() || self.draws_forced_at_prefill() {
             true => self.tokens.len().saturating_sub(self.prefill_tail()),
             false => self.tokens.len(),
         }
