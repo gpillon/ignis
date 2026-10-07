@@ -124,3 +124,26 @@ Three options:
 - The scheduler acquires a second reason to be woken that is not a command:
   a request mid-prefill. `model_thread_loop` already ticks while anything is
   in flight, so this is a state question, not a threading change.
+
+## Amendment (2026-10-07) — the decode share (#306)
+
+Flash-Next breaks the "one decode round per chunk" premise. Its 8192-token
+chunk takes ~3.2 s of wall time (a ~1.3 s host n-gram gather, then ~1.9 s on
+the card), against the 27B's ~110 ms. One round per chunk left the other lanes
+at 1.0-1.1 tok/s while a 34K prompt prefilled.
+
+- **K becomes time-based, and stays 1 on the 27B.** The **decode share** `s`
+  (`--decode-share`, in percent) holds the next chunk until the decoding lanes
+  have had `t * s / (1 - s)` of wall time after a chunk that took `t`. With no
+  lane decoding, nothing is held. The family default is 0 on the 27B (this
+  ADR's K = 1, unchanged) and 50 on Flash-Next.
+- **The Consequences above still hold for the gap.** The share moves the
+  lanes' rate during a prefill, not the longest gap: that remains one chunk's
+  wall time, and only the chunk width moves it.
+- Measured on the 5090, 34K prompt with two decoding lanes: share 0 gives the
+  lanes 1.0-1.1 tok/s and the prompt a 15.2-15.3 s TTFT; share 25 gives
+  15.6-18.3 tok/s at 19.4-20.2 s; share 50 gives 30.8-32.6 tok/s at
+  30.1-31.6 s. The longest gap was 3.2 s in all three. A 2048-token chunk
+  instead halves the gap (1.7 s) but leaves the lanes at ~1 tok/s and costs
+  28.3-28.7 s of TTFT even with nobody decoding
+  ([finding](../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).

@@ -178,7 +178,7 @@ Observed:
    - A 4.5K prompt takes 4.4 s against the study's 2.65 s (4K, cold), and 32K takes 25.7 s.
 4. **Prompt reuse works and is worth 11.5x on an agent turn** (2.45 s against 28.2 s). Even so, it **misses spec 05 AC6's 1.6 s**: the 1.1K-token tail is still one prefill chunk, and it pays the same expert stream as a cold 1K prompt (2.1-2.7 s).
 5. **Spec 05 AC7 passes.** The other lanes' decode hit rate after a reused turn is +0.26 points from before it (bound: within 2).
-6. **A prefill chunk stalls the other lanes' decode.** At 32K, two lanes fell to 4.5 and 8.2 tok/s while a third lane prefilled. In the swarm, per-lane decode fell to 10-19 tok/s. An 8192-token chunk runs ~7 s and the decode rounds wait for it.
+6. **A prefill chunk stalls the other lanes' decode.** At 32K, two lanes fell to 4.5 and 8.2 tok/s while a third lane prefilled. In the swarm, per-lane decode fell to 10-19 tok/s. An 8192-token chunk runs ~7 s and the decode rounds wait for it. (Since measured, 2026-10-07: ~3.2 s per chunk, one round per chunk, lanes at ~1 tok/s; the decode share now gives them half: [the prefill chunk finding](2026-10-07-flash-next-prefill-chunk-and-decode-share.md).)
 7. **Spec 04 AC10 misses the 29 GB bound.**
    - Peak card use is 31.2 GiB with the desktop. The plan gives the expert cache everything left of a 31.5 GB budget (card − 1 GiB headroom).
    - Nothing is allocated while serving.
@@ -202,6 +202,7 @@ Inferred (not measured):
 - **Why prefill is short of the study.**
   - The study modelled max(link, compute) with compute at 0.77-1.3 s per 4K.
   - Measured, an 8K chunk spends ~7 s beyond its ~1.3 s link term. Compute is therefore ~3x the study's pessimistic bound, or the link and compute do not overlap, or both.
+  - Since measured (2026-10-07, after the decode-round fixes): neither holds. An 8192-token chunk is 1.9 s on the card with 89% of its copies under compute (0.21 ms/token), plus ~1.3 s of host n-gram gather before it; see [the prefill chunk finding](2026-10-07-flash-next-prefill-chunk-and-decode-share.md).
 - **Why a reload is slow.**
   - Every load is cold here. The 37.8 GB pinned pool plus the desktop leave the page cache ≤ ~14 GB of the 63.8 GB, so a 71.8 GB artifact cannot stay cached between loads.
   - The disk is not the limit either: 43 GB at 1.64 GB/s is ~26 s. ~85 s of the 112 s is spent in the load path itself (pinning, staging or repacking the pool; not separated here).
