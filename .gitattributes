@@ -12,3 +12,8 @@ Makefile text eol=lf
 # the Containerfile's build stage). A CRLF checkout on a Windows worktree that
 # is then copied into a container dies with a CR in every command name.
 *.sh text eol=lf
+
+# Text fixtures a test compares byte for byte (expert_residency_fixture.rs
+# reads trace_v1.txt and compares it with the policy model's LF output): a
+# CRLF checkout on a Windows runner (core.autocrlf=true) breaks the equality.
+kernel/tests/fixtures/residency/*.txt text eol=lf
