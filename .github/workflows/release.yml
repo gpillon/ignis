@@ -597,6 +597,9 @@ jobs:
           EOF
           sed -i "s|__SHA__|${GITHUB_SHA}|; s|__REPO__|${GITHUB_REPOSITORY}|" notes.md
           gh release delete develop --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          # A `develop` tag left without its release (made by hand, or a run
+          # cut short) would win over --target below: drop it too.
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/develop" > /dev/null 2>&1 || true
           gh release create develop dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
