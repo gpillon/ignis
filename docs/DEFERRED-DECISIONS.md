@@ -184,7 +184,12 @@ p95: the p95 floor under a prefill is one chunk time plus one decode round.
 
 ### 10. Raising K, the decode rounds per prefill chunk, above 1
 
-**Deferred to:** turned only if the C=4 cell fails.
+**Status (2026-10-07, GitHub #306):** no longer deferred for Flash-Next,
+which turned it as a time-based **decode share** (`--decode-share`, 50 by
+default there; ADR 0018's amendment). It stays deferred on the 27B, where
+K = 1 (share 0) ships and the C=4 cell below is still the trigger.
+
+**Deferred to (27B):** turned only if the C=4 cell fails.
 
 K=1 ships. The session first claimed K cannot move p95 at all; that was
 overstated and corrected. The exact behaviour: per cycle a lane sees `K-1`

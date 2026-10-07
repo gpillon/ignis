@@ -174,7 +174,7 @@ always-current table; this one is a copy.
 | `--max-context <tokens>` | `IGNIS_MAX_CONTEXT` | `40960` | Max per-sequence context (prompt + generation). The KV pool must be able to hold one of them or the load is refused. On the 27B the attention bounds it too: at most 524,288 on `bf16`, 1,048,576 on `hq-e8-2b`; past that the start is refused. Flash-Next has no such bound. |
 | `--prefill-chunk <tokens>` | `IGNIS_PREFILL_CHUNK` | `1024` | The prefill chunk width, a nonzero multiple of 128. The program's prefill scratch is reserved for it at load. |
 | `--decode-lanes <n>` | `IGNIS_DECODE_LANES` | `3` | Flash-Next only, `1..=8`: the sequences decoded at once. Each lane holds a whole `--max-context` in the KV pool, so fewer lanes leave the expert cache more of the VRAM budget (and a lone user decodes at one lane either way). The 27B serves a fixed 8 lanes and refuses the flag. `make MODEL=flash-next` runs 3 lanes at 262,144 tokens each (the checkpoint's trained positions); the `make` knob is `LANES`. |
-| `--decode-share <percent>` | `IGNIS_DECODE_SHARE` | the model's: `0` on the 27B, `50` on Flash-Next | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next waits until they have decoded for `t * s / (1 - s)`, and nothing waits when no lane decodes. It trades the prefilling request's TTFT (x2 at 50, only while lanes decode) for the lanes' rate (half instead of ~1 tok/s on Flash-Next). |
+| `--decode-share <percent>` | `IGNIS_DECODE_SHARE` | the model's: `0` on the 27B, `50` on Flash-Next | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next chunk of the same prompt waits `t * s / (1 - s)` of wall time while they decode, and nothing waits when no lane decodes or after the prompt's last chunk. It trades the prefilling request's TTFT (x2 at 50, only while lanes decode) for the lanes' rate (half instead of ~1 tok/s on Flash-Next). |
 | `--kv-format <fmt>` | `IGNIS_KV_FORMAT` | `hq-e8-2b` | `hq-e8-2b` (serving) or `bf16` (retained; the format every correctness oracle runs against — [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md)). Decides what a pool byte budget is worth in tokens. |
 | `--kv-pool-bytes <bytes>` | `IGNIS_KV_POOL_BYTES` | the rest of the VRAM budget | The paged-KV pool budget (accepts `K`/`M`/`G`). Too small for `--max-context`, or past the VRAM budget, fails the load by name. |
 | `--kv-host-pool-bytes <bytes>` | `IGNIS_KV_HOST_POOL_BYTES` | `2G` | The KV-RAM host tier. Page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle — and the figure Windows reports as shared GPU memory. `0` disables the host tier. (`make` sets `8G`.) |
@@ -262,6 +262,22 @@ The cache is disposable and does not change the model artifact. With the
 default 1 GiB hot-row RAM budget a compact file is about 980 MiB. Saving a new
 key removes the same artifact's older cache files in that directory, so one
 file per artifact remains. This cache is separate from prompt/KV reuse.
+
+### Host RAM for Flash-Next
+
+Serving Flash-Next needs about **46-48 GB of available RAM**: 38 GB of pinned
+experts, 1 GB of n-gram hot rows, ~0.5 GB of staging, ~1 GB of retained host
+slots, the 2 GiB KV-RAM arena and the 6 GB margin the load refuses to dip into
+(it never lets reuse push Windows into paging). A load below that is refused
+naming the plan line to shrink. The knobs that lower it, with what each costs:
+
+| Knob (`make`) | Flag | Saves | Costs |
+|---|---|---|---|
+| `RETAINED_HOST` | `--retained-host <n>` | ~125 MiB per slot below the default 8 | Fewer retained prompt checkpoints and shared prefixes: a returning agent or a subagent sharing a system block prefills what no slot kept. `0` retains nothing on the host. |
+| `KV_HOST_POOL_BYTES` | `--kv-host-pool-bytes <n>` | up to the 2 GiB arena (`0` turns it off) | The KV-RAM tier holds fewer suspended requests: under VRAM pressure a request that cannot be parked there is evicted and prefilled again. |
+| n-gram hot rows | none yet | up to 1 GB | The 1 GiB hot-row budget is not a server flag today, so nothing lowers it. |
+
+Check `make config MODEL=flash-next` for the lines a start will use.
 
 ### Vision
 

@@ -415,7 +415,7 @@ fn the_mtp_heads_entries_after_a_full_chunks_draw_fit_the_planned_arena() {
 /// the same text -- none (extent 0) and reject (every draft rejected) -- must
 /// leave the head proposing the same drafts, bit for bit, every round. The
 /// prompts are past the ring (1,536 tokens, dense: every visible row read)
-/// and past the dense threshold (3,072, the indexer's sparse selection).
+/// and past the dense threshold (2,051 visible tokens, the indexer's sparse selection; 3,072 is past it).
 #[test]
 #[ignore = "GPU profile only: the real Flash-Next artifact and its MTP companion"]
 fn the_heads_drafts_never_read_a_rejected_column() {

@@ -198,7 +198,7 @@ struct RestoreArgs {
   int32_t compress;
   int32_t lanes;
   int32_t columns;       // this width's k + 1: the recorded keys' columns per lane
-  int32_t ring_columns;  // the positions its saved ring rows cover
+  int32_t ring_columns;  // the ring-row columns restored per lane: the verify's written positions, the head's window + 1
   int32_t layer_base;    // the first attention section restored
   int32_t row_columns;
   int32_t tail_elements;

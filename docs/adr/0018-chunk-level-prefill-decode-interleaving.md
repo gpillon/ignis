@@ -6,6 +6,9 @@ Accepted (2026-09-09, grilling session for GitHub #64 / G3). Builds on ADR
 0009 (step-level device-resident ABI) and ADR 0016 (extensible per-call
 options). Does not amend either.
 
+**Amended by #306** (2026-10-07): the decode share, for Flash-Next's
+seconds-long chunk. See the amendment at the end.
+
 Sources: `docs/ROADMAP.md` phase 3, `docs/REVIEW-2026-09-05.md` §6.
 
 ## Context
@@ -135,7 +138,9 @@ at 1.0-1.1 tok/s while a 34K prompt prefilled.
 - **K becomes time-based, and stays 1 on the 27B.** The **decode share** `s`
   (`--decode-share`, in percent) holds the next chunk until the decoding lanes
   have had `t * s / (1 - s)` of wall time after a chunk that took `t`. With no
-  lane decoding, nothing is held. The family default is 0 on the 27B (this
+  lane decoding, nothing is held, and nothing is held after a prompt's last
+  chunk either: the hold is between chunks of the same prompt, so a newcomer
+  queued behind it is not made to wait for lanes that already had their turn. The family default is 0 on the 27B (this
   ADR's K = 1, unchanged) and 50 on Flash-Next.
 - **The Consequences above still hold for the gap.** The share moves the
   lanes' rate during a prefill, not the longest gap: that remains one chunk's
