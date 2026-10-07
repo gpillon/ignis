@@ -96,7 +96,8 @@ both formats through the indexer tail a completed block pools from. Fixed by
 `verify::restore_head` before the chain (spec 07, as built). Before the fix,
 none and reject drafters committing the same text left the head drafting
 differently on 1 of 64 rounds (hq, 1,536-token prompt; the test
-`the_heads_drafts_never_read_a_rejected_column`). Bench, k = 3, one lane,
+`the_heads_drafts_never_read_a_rejected_column` stopped there, so the
+indexer-tail half rests on reading the code, not on an observed failure). Bench, k = 3, one lane,
 256 tokens after each 1,536-token window, tok/s and acceptance per position:
 
 | window | hq before | hq after | BF16 after |
