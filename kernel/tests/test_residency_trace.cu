@@ -92,7 +92,7 @@ struct Fixture {
   uint32_t layers = 0, experts = 0, top_k = 0, width = 0, prefill_width = 0;
   uint64_t record_bytes[8] = {};
   uint32_t capacity[8] = {};
-  uint64_t budget = 0;
+  uint64_t budget = 0, budget_row = 0;
   std::vector<uint8_t> k2;
   std::vector<uint32_t> warm;
   std::vector<Step> steps;
@@ -117,8 +117,8 @@ Fixture load(const char *path) {
   int version = 0;
   expect_word(in, "ignis-residency-fixture");
   in >> version;
-  if (version != 2) {
-    std::fprintf(stderr, "fixture: version %d, this test reads 2\n", version);
+  if (version != 3) {
+    std::fprintf(stderr, "fixture: version %d, this test reads 3\n", version);
     std::exit(1);
   }
   expect_word(in, "layers");
@@ -137,6 +137,8 @@ Fixture load(const char *path) {
   in >> f.prefill_width;
   expect_word(in, "budget");
   in >> f.budget;
+  expect_word(in, "budget_row");
+  in >> f.budget_row;
   expect_word(in, "k2");
   f.k2.resize(static_cast<size_t>(f.layers) * f.experts * 2);
   for (auto &k : f.k2) {
@@ -244,6 +246,7 @@ int main(int argc, char **argv) {
   desc.lookahead_width = f.width;
   desc.prefill_lookahead_width = f.prefill_width;
   desc.prefetch_budget_bytes = f.budget;
+  desc.prefetch_budget_row_bytes = f.budget_row;
   desc.staging_half_bytes = heaviest;
   desc.host_pool_bytes = pool_bytes;
   desc.copy_blocks = 8;

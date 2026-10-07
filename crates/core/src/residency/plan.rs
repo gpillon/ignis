@@ -13,6 +13,7 @@
 //! every refusal is pinned on the CPU.
 
 use super::class::{ExpertCatalog, KClass, Projection, ProjectionId};
+use super::policy::PrefetchBudget;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -573,29 +574,25 @@ pub fn min_slots_per_class(lanes: u32, top_k: u32, prefetch_width: u32) -> u32 {
     lanes * (top_k + prefetch_width)
 }
 
-/// The host-to-device link residency copies over, as measured on this host
-/// (`docs/findings/2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md`:
-/// 12-13 GB/s by either path, the PCIe Gen 3 x16 cap).
-pub const MEASURED_LINK_BYTES_PER_SECOND: f64 = 12.0e9;
+/// The decode prefetch budgets that served Flash-Next best at one lane and
+/// at three, at the 262K x 3-lane default (GitHub #306,
+/// `docs/findings/2026-10-06-flash-next-decode-round.md`): 0.67x and 1.5x
+/// the 1.75 MB the earlier rule gave every step. One lane gains from less,
+/// since less prefetch is still copying at the next layer's join; three
+/// lanes' misses saturate the link, and a larger budget's prefetches
+/// displace demand bytes.
+pub const MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES: u64 = 1_172_500;
+pub const MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES: u64 = 2_625_000;
 
-/// A decode round's time before residency, as the study simulated it: 6 ms
-/// at one lane, 0.5 ms more per further lane. An estimate anchored to the
-/// 27B, until the GPU replay measures Flash-Next's own.
-pub fn estimated_decode_round_seconds(lanes: u32) -> f64 {
-    6.0e-3 + 0.5e-3 * f64::from(lanes.saturating_sub(1))
-}
-
-/// The default decode prefetch budget (a load option): one layer's share of
-/// the round at the link's bandwidth — the time a prefetch issued beside
-/// layer L's experts has before layer L+1 reads it — and never less than
-/// one projection of the largest class, which a smaller budget could never
-/// prefetch. Unbudgeted, a W = 16 lookahead asks the link for more than the
-/// round lasts.
-pub fn default_prefetch_budget_bytes(lanes: u32, catalog: &ExpertCatalog) -> u64 {
-    let window = estimated_decode_round_seconds(lanes) / f64::from(catalog.layers().max(1))
-        * MEASURED_LINK_BYTES_PER_SECOND;
-    let largest = KClass::ALL.iter().map(|&c| catalog.slot_bytes(c)).max().unwrap_or(0);
-    (window as u64).max(largest)
+/// The default decode prefetch budget: the line through the two measured
+/// points (1,172,500 B at one row, 726,250 B more per further row), so it
+/// follows the rows each step decodes — the lanes decoding now, or a verify
+/// round's columns — not the lanes configured. No floor: at one row a
+/// gate/up projection at K >= 3 (1.24-1.65 MB) is never prefetched, which
+/// served faster than the old floor of one such projection.
+pub fn default_prefetch_budget() -> PrefetchBudget {
+    let per_row = (MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES - MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES) / 2;
+    PrefetchBudget { one_row_bytes: MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES, per_row_bytes: per_row }
 }
 
 /// The prefill staging ring: two layers, each as large as the heaviest

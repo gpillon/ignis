@@ -43,7 +43,11 @@ pub struct ResidencyDesc {
     pub max_tokens: u32,
     pub lookahead_width: u32,
     pub prefill_lookahead_width: u32,
+    /// A one-row decode step's prefetch budget, or [`NO_BUDGET`].
     pub prefetch_budget_bytes: u64,
+    /// Added to it for each further row of a decode step's lookahead
+    /// ([`PrefetchBudget`](super::PrefetchBudget)'s `per_row_bytes`).
+    pub prefetch_budget_row_bytes: u64,
     pub staging_half_bytes: u64,
     pub host_pool_bytes: u64,
     pub copy_blocks: u32,

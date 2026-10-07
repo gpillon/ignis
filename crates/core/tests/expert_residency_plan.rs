@@ -5,7 +5,8 @@
 
 use ignis_core::residency::{
     ExpertCachePlanError, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, HOST_MARGIN_BYTES,
-    HostPlanError, HostPlanRequest, KBits, Projection, ProjectionId, default_prefetch_budget_bytes,
+    HostPlanError, HostPlanRequest, KBits, MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES,
+    MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES, Projection, ProjectionId, default_prefetch_budget,
     min_slots_per_class, plan_expert_cache, plan_host, prefill_staging_ring_bytes,
     residency_table_bytes, warm_start_order,
 };
@@ -247,18 +248,19 @@ fn the_spec_s_floor_is_twelve_gib() {
 }
 
 #[test]
-fn the_default_prefetch_budget_is_one_layer_s_share_of_the_round_at_the_link_s_speed() {
-    // 6 ms a round at one lane, 7 at three, over 48 layers at 12 GB/s.
-    let small = |largest: u64| {
-        let mut slot_bytes = [100u64; 8];
-        slot_bytes[3] = largest;
-        ExpertCatalog::new(48, 1, vec![(KBits::K2, KBits::K2); 48], slot_bytes).expect("catalog")
-    };
-    assert_eq!(default_prefetch_budget_bytes(1, &small(100)), 1_500_000);
-    assert_eq!(default_prefetch_budget_bytes(3, &small(100)), 1_750_000);
-    // Never below one projection of the largest class: spec 01's gate/up at
-    // K = 4 (1,646,592 B) is larger than one lane's window.
-    assert_eq!(default_prefetch_budget_bytes(1, &small(1_646_592)), 1_646_592);
+fn the_default_prefetch_budget_is_the_line_through_the_budgets_that_served_best() {
+    // GitHub #306: what served Flash-Next best at one lane and at three, a
+    // step's budget following its rows in between and past them.
+    let budget = default_prefetch_budget();
+    assert_eq!(budget.bytes_for(1), MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES);
+    assert_eq!(budget.bytes_for(3), MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES);
+    assert_eq!((budget.one_row_bytes, budget.per_row_bytes), (1_172_500, 726_250));
+    assert_eq!(budget.bytes_for(2), 1_898_750);
+    // A verify round of one lane and three drafts decodes four rows.
+    assert_eq!(budget.bytes_for(4), 3_351_250);
+    // No floor: one row's budget is below one gate/up projection at K = 4
+    // (spec 01's 1,646,592 B), which then is never prefetched at one lane.
+    assert!(budget.bytes_for(1) < 1_646_592);
 }
 
 #[test]

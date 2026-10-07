@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 
 use ignis_core::residency::{
     DEFAULT_PREFETCH_WIDTH, ExpertCachePlan, ExpertCacheRequest, ExpertCatalog, ExpertTraffic,
-    KBits, KClass, LayerStep, PolicyConfig, Projection, ResidencyModel,
-    default_prefetch_budget_bytes, min_slots_per_class, plan_expert_cache,
+    KBits, KClass, LayerStep, PolicyConfig, PrefetchBudget, Projection, ResidencyModel,
+    default_prefetch_budget, min_slots_per_class, plan_expert_cache,
     prefill_staging_ring_bytes, residency_table_bytes, warm_start_order,
 };
 
@@ -202,23 +202,18 @@ fn cache_plan(study: &Study) -> ExpertCachePlan {
 }
 
 /// A warm-started model on [`cache_plan`]'s pools.
-fn warm_model(study: &Study, prefetch_width: usize, prefetch_budget_bytes: Option<u64>) -> ResidencyModel {
+fn warm_model(study: &Study, prefetch_width: usize, prefetch_budget: Option<PrefetchBudget>) -> ResidencyModel {
     let mut model = ResidencyModel::new(
         study.catalog.clone(),
         PolicyConfig {
             capacity: cache_plan(study).capacity(),
             prefetch_width,
             prefill_prefetch_width: prefetch_width,
-            prefetch_budget_bytes,
+            prefetch_budget,
         },
     );
     model.warm_start(&warm_start_order(&study.traffic));
     model
-}
-
-/// The plan's default decode prefetch budget at `lanes`.
-fn default_budget(study: &Study, lanes: u32) -> Option<u64> {
-    Some(default_prefetch_budget_bytes(lanes, &study.catalog))
 }
 
 #[derive(Default, Clone, Copy)]
@@ -381,9 +376,9 @@ fn study() -> Option<&'static Study> {
 fn decode_replay(
     study: &Study,
     width: usize,
-    budgets: [Option<u64>; 2],
+    budget: Option<PrefetchBudget>,
 ) -> (Vec<(String, f64)>, Tally, Tally) {
-    let warm = warm_model(study, width, budgets[0]);
+    let warm = warm_model(study, width, budget);
     let mut by_domain: Vec<(String, Vec<f64>)> = Vec::new();
     let mut one = Tally::default();
     for chunk in &study.chunks {
@@ -396,7 +391,6 @@ fn decode_replay(
         }
         one.add(&lane[0]);
     }
-    let warm = warm_model(study, width, budgets[1]);
     let mut lanes3 = [Tally::default(); 3];
     for group in study.chunks.chunks(3).filter(|g| g.len() == 3) {
         let mut model = warm.clone();
@@ -449,7 +443,7 @@ fn report(label: &str, rates: &[(String, f64)], one: &Tally, three: &Tally) {
 #[test]
 fn decode_on_real_routing_matches_the_simulation() {
     let Some(study) = study() else { return };
-    let (rates, one, three) = decode_replay(study, 0, [None; 2]);
+    let (rates, one, three) = decode_replay(study, 0, None);
     println!("{}", cache_plan(study));
     report("W = 0", &rates, &one, &three);
     for (domain, simulated) in SIMULATED {
@@ -465,24 +459,34 @@ fn decode_on_real_routing_matches_the_simulation() {
 
 /// The router lookahead at W = 16 turns most of the remaining misses into
 /// prefetch hits. Unbudgeted it moves more bytes than the link carries in a
-/// step (reported, not asserted); held to the plan's default budget, the
-/// link fits.
+/// step (reported, not asserted); held to the plan's default budget, which
+/// follows each step's rows, the link fits.
 /// The cost printed is the demand misses alone, prefetches taken as hidden
 /// behind compute: whether they are is a timing question for the GPU replay.
 #[test]
 fn the_lookahead_turns_most_remaining_misses_into_hits() {
     let Some(study) = study() else { return };
-    let (rates, one, three) = decode_replay(study, DEFAULT_PREFETCH_WIDTH, [None; 2]);
+    let (rates, one, three) = decode_replay(study, DEFAULT_PREFETCH_WIDTH, None);
     report("W = 16, no budget", &rates, &one, &three);
-    let budgets = [default_budget(study, 1), default_budget(study, 3)];
-    let (rates, one, three) = decode_replay(study, DEFAULT_PREFETCH_WIDTH, budgets);
+    let (rates, one, three) = decode_replay(study, DEFAULT_PREFETCH_WIDTH, Some(default_prefetch_budget()));
     report("W = 16, default budget", &rates, &one, &three);
     // Without the lookahead the same replay hits ~94.5% at ~3.8 ms a round.
-    assert!(one.rate() >= 0.96, "{:.3}", one.rate());
-    assert!(one.cost() <= SIMULATED_COST[0] * 0.75, "{:.2} ms", one.cost() * 1e3);
+    // GitHub #306 (2026-10-07): the budget that follows the rows replays at
+    // 95.9% and 2.90 ms at one lane, where the old one replayed 96.5% and
+    // 2.37 ms, and serves one lane faster (its smaller one-row budget leaves
+    // less prefetch copying at the next layer's join). The served gain is
+    // measured; these are proxies that score every prefetch as hidden. So
+    // the hit rate holds at 95.5% (owner), the demand cost at 0.8 of the
+    // simulation's.
+    assert!(one.rate() >= 0.955, "{:.3}", one.rate());
+    assert!(one.cost() <= SIMULATED_COST[0] * 0.8, "{:.2} ms", one.cost() * 1e3);
     // Within the budget, the link carries a round's bytes in the time of
-    // the simulation's step plus the demand misses' own wait.
-    for (t, step) in [(&one, 6e-3), (&three, 7e-3)] {
+    // the round's compute plus the demand misses' own wait. The compute is
+    // the served round's, its ITL less its stall at the 262K x 3-lane
+    // default (`docs/findings/2026-10-06-flash-next-decode-round.md`):
+    // 10.0 - 2.1 ms at one lane, 30 - 19.1 at three. Unbudgeted, three
+    // lanes ask for 29 ms of link and fail it.
+    for (t, step) in [(&one, 7.9e-3), (&three, 10.9e-3)] {
         assert!(t.moved_per_round() / BANDWIDTH <= step + t.cost(), "{:.2} ms", t.moved_per_round() / BANDWIDTH * 1e3);
     }
 }
@@ -491,7 +495,7 @@ fn the_lookahead_turns_most_remaining_misses_into_hits() {
 /// (pre), a 4096-token prefill of the next two chunks, 256 measured (post).
 /// Returns the pre and post tallies and the bytes the prefills moved.
 fn scan_replay(study: &Study, width: usize, scan: bool, every: usize) -> (Tally, Tally, u64) {
-    let budget = if width > 0 { default_budget(study, 1) } else { None };
+    let budget = (width > 0).then(default_prefetch_budget);
     let warm = warm_model(study, width, budget);
     let n = study.chunks.len();
     let (mut pre, mut post, mut moved, mut runs) = (Tally::default(), Tally::default(), 0u64, 0u64);

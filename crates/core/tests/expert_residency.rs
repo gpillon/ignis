@@ -76,7 +76,7 @@ fn a_k_map_of_the_wrong_length_is_refused() {
 // ---- the policy model -------------------------------------------------------
 
 use ignis_core::residency::{
-    Admission, LayerStep, PolicyConfig, ResidencyModel, StepError, StepOutcome,
+    Admission, LayerStep, PolicyConfig, PrefetchBudget, ResidencyModel, StepError, StepOutcome,
 };
 
 /// Capacity per class, indexed like `KClass::ALL`.
@@ -87,7 +87,7 @@ fn model(capacity: [u32; 8], prefetch_width: usize) -> ResidencyModel {
             capacity,
             prefetch_width,
             prefill_prefetch_width: prefetch_width,
-            prefetch_budget_bytes: None,
+            prefetch_budget: None,
         },
     )
 }
@@ -243,7 +243,7 @@ fn a_prefill_step_takes_its_own_width_of_each_ranking() {
                 capacity: ROOMY,
                 prefetch_width,
                 prefill_prefetch_width,
-                prefetch_budget_bytes: None,
+                prefetch_budget: None,
             },
         )
     };
@@ -273,7 +273,7 @@ fn a_decode_step_s_prefetches_keep_to_its_budget_best_ranked_first() {
             capacity: ROOMY,
             prefetch_width: 16,
             prefill_prefetch_width: 16,
-            prefetch_budget_bytes: Some(500),
+            prefetch_budget: Some(PrefetchBudget::flat(500)),
         },
     );
     let lane: &[u16] = &[2, 3];
@@ -296,6 +296,43 @@ fn a_decode_step_s_prefetches_keep_to_its_budget_best_ranked_first() {
     let step = m.step(&LayerStep::prefill(0, &[1]).lookahead(&[&[3, 0][..]])).expect("step");
     assert_eq!(step.prefetches.len(), 3);
     assert!(step.prefetch_dropped.is_empty());
+}
+
+#[test]
+fn a_decode_step_s_budget_follows_the_rows_it_decodes() {
+    // GitHub #306: one row's budget, and more per further row (a lane, or a
+    // verify round's column). The other lanes rank nothing, so every step
+    // below has the same candidates in the same order: expert 2's gate/up
+    // (300 B) and down (100 B), then expert 3's gate/up (400 B) and down
+    // (100 B).
+    let budget = PrefetchBudget { one_row_bytes: 400, per_row_bytes: 300 };
+    let dropped = |lanes: &[&[u16]]| {
+        let mut m = ResidencyModel::new(
+            small_catalog(),
+            PolicyConfig {
+                capacity: ROOMY,
+                prefetch_width: 16,
+                prefill_prefetch_width: 16,
+                prefetch_budget: Some(budget),
+            },
+        );
+        m.step(&LayerStep::decode(0, &[0]).lookahead(lanes)).expect("step").prefetch_dropped
+    };
+    let (ranked, none): (&[u16], &[u16]) = (&[2, 3], &[]);
+    // One row, 400 B: expert 2 whole, nothing of expert 3.
+    assert_eq!(dropped(&[ranked]), vec![gate_up(1, 3), down(1, 3)]);
+    // Two rows, 700 B: expert 3's down fits beside expert 2, its gate/up does not.
+    assert_eq!(dropped(&[ranked, none]), vec![gate_up(1, 3)]);
+    // Three rows, 1000 B: all of it.
+    assert!(dropped(&[ranked, none, none]).is_empty());
+    // A step with no lookahead rows has one row's; the sum saturates, as the
+    // device's does.
+    assert_eq!(budget.bytes_for(0), 400);
+    assert_eq!(budget.bytes_for(3), 1000);
+    let huge = PrefetchBudget { one_row_bytes: u64::MAX - 1, per_row_bytes: 2 };
+    assert_eq!(huge.bytes_for(2), u64::MAX);
+    assert_eq!(PrefetchBudget { per_row_bytes: u64::MAX, ..budget }.bytes_for(3), u64::MAX);
+    assert_eq!(PrefetchBudget::flat(500).bytes_for(8), 500);
 }
 
 #[test]
@@ -526,7 +563,7 @@ fn over_random_traces_the_model_keeps_every_promise_of_its_contract() {
                 capacity,
                 prefetch_width: WIDTH,
                 prefill_prefetch_width: WIDTH - 1,
-                prefetch_budget_bytes: None,
+                prefetch_budget: None,
             },
         );
         let trace = random_trace(&mut rng, 60);
@@ -603,7 +640,7 @@ fn the_same_trace_gives_the_same_sequence_every_time() {
                 capacity,
                 prefetch_width: WIDTH,
                 prefill_prefetch_width: WIDTH - 1,
-                prefetch_budget_bytes: None,
+                prefetch_budget: None,
             },
         );
         trace.iter().map(|s| run(&mut m, s)).collect::<Vec<_>>()
@@ -626,7 +663,7 @@ fn decode_without_prefetch_is_a_plain_per_class_lru() {
                 capacity,
                 prefetch_width: 0,
                 prefill_prefetch_width: 0,
-                prefetch_budget_bytes: None,
+                prefetch_budget: None,
             },
         );
         let mut lists: Vec<Vec<ProjectionId>> = vec![Vec::new(); 8];

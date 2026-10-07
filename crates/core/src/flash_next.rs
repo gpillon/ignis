@@ -25,7 +25,7 @@ use crate::ngram_table::{NgramTable, NgramTableOptions};
 use crate::residency::device::{DeviceResidency, ResidencyDesc};
 use crate::residency::load::{catalog, fill_expert_pool, pool_layout};
 use crate::residency::{
-    default_prefetch_budget_bytes, min_slots_per_class, plan_expert_cache, prefill_staging_ring_bytes,
+    default_prefetch_budget, min_slots_per_class, plan_expert_cache, prefill_staging_ring_bytes,
     residency_table_bytes, warm_start_order, ExpertCacheRequest, ExpertTraffic, KClass,
 };
 use crate::seq::{SeqPool, SeqPoolBudget};
@@ -194,6 +194,7 @@ pub fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOption
         min_slots: min_slots_per_class(options.decode_lanes, 10, LOOKAHEAD_WIDTH),
     })
     .map_err(|e| e.to_string())?;
+    let budget = default_prefetch_budget();
     let desc = ResidencyDesc {
         layers: layers as u32,
         experts: experts as u32,
@@ -202,7 +203,8 @@ pub fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOption
         max_tokens,
         lookahead_width: LOOKAHEAD_WIDTH,
         prefill_lookahead_width: PREFILL_LOOKAHEAD_WIDTH,
-        prefetch_budget_bytes: default_prefetch_budget_bytes(options.decode_lanes, &cat),
+        prefetch_budget_bytes: budget.one_row_bytes,
+        prefetch_budget_row_bytes: budget.per_row_bytes,
         staging_half_bytes: staging_ring / 2,
         host_pool_bytes: layout.bytes,
         copy_blocks: 16,

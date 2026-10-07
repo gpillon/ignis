@@ -31,9 +31,10 @@
 //!    first appears — skips what is resident or staged, and admits the rest
 //!    in that order the same way, except that a decode prefetch is
 //!    **dropped**, not an error, when no victim is available or when it
-//!    would take the step's prefetches past `prefetch_budget_bytes` (the
-//!    walk then goes on down the rank for one that fits; decode only — a
-//!    prefill streams its lookahead whole);
+//!    would take the step's prefetches past its [`PrefetchBudget`], which
+//!    grows with the step's lookahead rows (the walk then goes on down the
+//!    rank for one that fits; decode only — a prefill streams its
+//!    lookahead whole);
 //! 6. releases this layer's staged projections: the expert kernel has run.
 //!
 //! **Victim:** of a class's resident projections not stamped by the current
@@ -116,11 +117,36 @@ pub struct PolicyConfig {
     /// is link time the chunk waits on: Flash-Next takes the router's own
     /// top-k there (GitHub #306).
     pub prefill_prefetch_width: usize,
-    /// The most a decode step may prefetch, in bytes; `None`: no limit. The
-    /// link is shared with the step's own misses, so a prefetch only pays
-    /// while it fits beside the step's compute (the study's window: one
-    /// layer's compute time at the link's bandwidth).
-    pub prefetch_budget_bytes: Option<u64>,
+    /// The most a decode step may prefetch, by the rows it decodes; `None`:
+    /// no limit. The link is shared with the step's own misses, so a
+    /// prefetch only pays while it is done by the next layer's step.
+    pub prefetch_budget: Option<PrefetchBudget>,
+}
+
+/// A decode step's prefetch budget, which follows the rows the step decodes
+/// (its lookahead's rows: one per lane, or per column of a verify round):
+/// `one_row_bytes` at one row, `per_row_bytes` more for each further row.
+/// One lane's prefetch must end inside the next layer's compute, while
+/// three lanes' misses saturate the link and their prefetches displace
+/// demand bytes (GitHub #306).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefetchBudget {
+    pub one_row_bytes: u64,
+    pub per_row_bytes: u64,
+}
+
+impl PrefetchBudget {
+    /// The same budget at every row count.
+    pub const fn flat(bytes: u64) -> Self {
+        Self { one_row_bytes: bytes, per_row_bytes: 0 }
+    }
+
+    /// A step of `rows` rows' budget, saturating as the device's does; a
+    /// step with no rows has one row's.
+    pub fn bytes_for(&self, rows: usize) -> u64 {
+        let further = rows.saturating_sub(1) as u64;
+        self.one_row_bytes.saturating_add(self.per_row_bytes.saturating_mul(further))
+    }
 }
 
 /// One layer step of a routing trace.
@@ -422,7 +448,7 @@ impl ResidencyModel {
         }
 
         let budget = match step.phase {
-            Phase::Decode => self.config.prefetch_budget_bytes,
+            Phase::Decode => self.config.prefetch_budget.map(|b| b.bytes_for(step.lookahead.len())),
             Phase::Prefill => None,
         };
         let mut spent = 0u64;

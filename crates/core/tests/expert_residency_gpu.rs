@@ -27,8 +27,8 @@ use ignis_artifact::{CudaDevice, Device, DeviceBuffer};
 use ignis_core::gpu_profile;
 use ignis_core::residency::device::{self, DeviceResidency, NO_BUDGET, ResidencyDesc};
 use ignis_core::residency::{
-    ExpertCatalog, KBits, KClass, LayerStep, Phase, PolicyConfig, ProjectionId, Projection,
-    ResidencyModel, StepError, residency_table_bytes,
+    ExpertCatalog, KBits, KClass, LayerStep, Phase, PolicyConfig, PrefetchBudget, ProjectionId,
+    Projection, ResidencyModel, StepError, residency_table_bytes,
 };
 
 const TOP_K: usize = 10;
@@ -47,6 +47,7 @@ fn the_leaf_s_tables_line_stays_within_the_cpu_plan_s_upper_bound() {
         lookahead_width: 16,
         prefill_lookahead_width: 10,
         prefetch_budget_bytes: NO_BUDGET,
+        prefetch_budget_row_bytes: 0,
         staging_half_bytes: 800_000_000,
         host_pool_bytes: 38_000_000_000,
         copy_blocks: 16,
@@ -75,6 +76,7 @@ fn a_prefill_width_past_the_decode_width_is_refused_by_name() {
         lookahead_width: 3,
         prefill_lookahead_width: 4,
         prefetch_budget_bytes: NO_BUDGET,
+        prefetch_budget_row_bytes: 0,
         staging_half_bytes: 4096 * 32,
         host_pool_bytes: 4096 * 64,
         copy_blocks: 4,
@@ -92,8 +94,9 @@ fn the_residency_descriptor_is_the_leaf_s_layout() {
     use std::mem::{offset_of, size_of};
     assert_eq!(offset_of!(ResidencyDesc, prefill_lookahead_width), 112);
     assert_eq!(offset_of!(ResidencyDesc, prefetch_budget_bytes), 120);
-    assert_eq!(offset_of!(ResidencyDesc, copy_blocks), 144);
-    assert_eq!(size_of::<ResidencyDesc>(), 152);
+    assert_eq!(offset_of!(ResidencyDesc, prefetch_budget_row_bytes), 128);
+    assert_eq!(offset_of!(ResidencyDesc, copy_blocks), 152);
+    assert_eq!(size_of::<ResidencyDesc>(), 160);
 }
 
 struct Rng(u64);
@@ -168,10 +171,14 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
             .collect();
         let catalog = ExpertCatalog::new(LAYERS, EXPERTS, map, record_bytes).expect("catalog");
         let capacity: [u32; 8] = std::array::from_fn(|_| 6 + rng.below(20) as u32);
-        let budget = if seed % 2 == 0 { Some(10_000 + rng.below(30_000)) } else { None };
+        // Even seeds budget the decode steps, by their rows on two of the three (GitHub #306).
+        let budget = (seed % 2 == 0).then(|| PrefetchBudget {
+            one_row_bytes: 10_000 + rng.below(30_000),
+            per_row_bytes: if seed == 0 { 0 } else { 2_000 + rng.below(10_000) },
+        });
         let mut model = ResidencyModel::new(
             catalog.clone(),
-            PolicyConfig { capacity, prefetch_width: WIDTH, prefill_prefetch_width: PREFILL_WIDTH, prefetch_budget_bytes: budget },
+            PolicyConfig { capacity, prefetch_width: WIDTH, prefill_prefetch_width: PREFILL_WIDTH, prefetch_budget: budget },
         );
         let (k2, offsets, pool_bytes) = device::packed_layout(&catalog);
         let heaviest = (0..LAYERS).map(|l| catalog.layer_bytes(l)).max().unwrap();
@@ -183,7 +190,8 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
             max_tokens: MAX_ROWS as u32,
             lookahead_width: WIDTH as u32,
             prefill_lookahead_width: PREFILL_WIDTH as u32,
-            prefetch_budget_bytes: budget.unwrap_or(NO_BUDGET),
+            prefetch_budget_bytes: budget.map_or(NO_BUDGET, |b| b.one_row_bytes),
+            prefetch_budget_row_bytes: budget.map_or(0, |b| b.per_row_bytes),
             staging_half_bytes: heaviest,
             host_pool_bytes: pool_bytes,
             copy_blocks: 4,

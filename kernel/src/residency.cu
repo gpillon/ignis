@@ -113,7 +113,7 @@ struct Dev {
   uint32_t layers, experts, width, prefill_width;  // a decode and a prefill step's lookahead width
   uint32_t capacity[kClasses];
   unsigned long long record_bytes[kClasses];
-  unsigned long long budget;
+  unsigned long long budget, budget_row;  // a one-row decode step's, and per further row
   unsigned long long half_bytes;
   const uint8_t *cls;        // [keys] class of each projection
   const uint8_t *k2;         // [keys]
@@ -139,6 +139,16 @@ struct Dev {
 // A step's lookahead width: a prefill step's own, else the decode width (the host's width_of).
 __device__ __forceinline__ uint32_t width_of(const Dev &d, uint32_t phase) {
   return phase == IGNIS_RESIDENCY_PREFILL ? d.prefill_width : d.width;
+}
+
+// A decode step's prefetch budget for its `rows` lookahead rows (the host's PrefetchBudget::
+// bytes_for): one row's, and budget_row more per further row, saturating; no rows is one row's.
+__device__ __forceinline__ unsigned long long budget_of(const Dev &d, uint32_t rows) {
+  const unsigned long long further = rows > 0 ? rows - 1 : 0;
+  if (further > 0 && d.budget_row > (IGNIS_RESIDENCY_NO_BUDGET - d.budget) / further) {
+    return IGNIS_RESIDENCY_NO_BUDGET;
+  }
+  return d.budget + d.budget_row * further;
 }
 
 
@@ -531,13 +541,14 @@ __global__ void __launch_bounds__(kThreads)
   }
   __syncthreads();
   const uint32_t n_cand = 2 * s_n_cand;
+  const unsigned long long budget = budget_of(d, rows);
   unsigned long long spent = 0;
   for (uint32_t i = 0; i < n_cand; ++i) {
     if (s_skip[i]) continue;  // block-uniform: last written before a barrier
     const uint32_t k = s_list[i];
     const uint32_t kc = d.cls[k];
     const unsigned long long bytes = d.record_bytes[kc];
-    if (decode && d.budget != IGNIS_RESIDENCY_NO_BUDGET && spent + bytes > d.budget) {
+    if (decode && budget != IGNIS_RESIDENCY_NO_BUDGET && spent + bytes > budget) {
       if (t == 0) report_push(d, entries, kDropped, &count[kDropped], k);
       __syncthreads();
       continue;
@@ -894,6 +905,7 @@ int32_t ignis_residency_create(const ignis_residency_desc *desc, const uint8_t *
     v.stamp[k] = reinterpret_cast<unsigned long long *>(r->tables + r->layout.stamp[k]);
   }
   v.budget = d.prefetch_budget_bytes;
+  v.budget_row = d.prefetch_budget_row_bytes;
   v.half_bytes = d.staging_half_bytes;
   v.cls = r->tables + r->layout.cls;
   v.k2 = r->tables + r->layout.k2;

@@ -52,11 +52,12 @@
 //!   expert kernel follows. Prefetch jobs run on a second captured stream
 //!   beside the expert kernel and join before the next resolve. They are
 //!   taken in rank order (every lane's best expert first) and held to a
-//!   per-step byte budget, a candidate that would pass it skipped: the
-//!   default ([`default_prefetch_budget_bytes`]) is one layer's share of the
-//!   round at the link's bandwidth, since unbudgeted W = 16 asks the link for
-//!   more than a decode step lasts (7.2 ms of transfers per 6 ms step at one
-//!   lane, 29 at three, on the study's routing). A prefill step takes no
+//!   per-step byte budget, a candidate that would pass it skipped, since
+//!   unbudgeted W = 16 asks the link for more than a decode step lasts
+//!   (7.2 ms of transfers per 6 ms step at one lane, 29 at three, on the
+//!   study's routing). The budget grows with the step's rows: the default
+//!   ([`default_prefetch_budget`]) is the line through what served best at
+//!   one lane and at three. A prefill step takes no
 //!   budget and its own width of each token's ranking
 //!   (`prefill_lookahead_width`: the router's top-k on Flash-Next, since
 //!   every rank past it is link time a chunk waits on). Launch shapes are
@@ -82,12 +83,12 @@ pub use counters::{ResidencyCounters, ResidencyMirror};
 pub use plan::{
     ClassPool, EXPERT_CACHE_FLOOR_BYTES, ExpertCachePlan, ExpertCachePlanError,
     ExpertCacheRequest, ExpertTraffic, HOST_MARGIN_BYTES, HOST_PLAN_LINES, HostPlan, HostPlanError,
-    HostPlanRequest, MEASURED_LINK_BYTES_PER_SECOND, TrafficMismatch,
-    default_prefetch_budget_bytes, estimated_decode_round_seconds, min_slots_per_class, ngram_hot_rows_room,
+    HostPlanRequest, MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES, MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES,
+    TrafficMismatch, default_prefetch_budget, min_slots_per_class, ngram_hot_rows_room,
     plan_expert_cache, plan_host, prefill_staging_ring_bytes, residency_table_bytes,
     warm_start_order,
 };
 pub use policy::{
-    Admission, DEFAULT_PREFETCH_WIDTH, LayerStep, Phase, PolicyConfig, ResidencyModel, StepError,
-    StepOutcome,
+    Admission, DEFAULT_PREFETCH_WIDTH, LayerStep, Phase, PolicyConfig, PrefetchBudget, ResidencyModel,
+    StepError, StepOutcome,
 };
