@@ -37,6 +37,11 @@ use crate::step::{
 /// The prefetch lookahead residency ranks per lane: the next layer's top 16.
 pub const LOOKAHEAD_WIDTH: u32 = 16;
 
+/// The lookahead residency ranks per token of a prefill chunk: the next
+/// router's own top-k, since a chunk streams it unbudgeted (GitHub #306,
+/// `docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
+pub const PREFILL_LOOKAHEAD_WIDTH: u32 = crate::moe::TOP_K;
+
 /// The decode lanes a Flash-Next load serves by default (spec flash-next/04:
 /// three agents); the leaf's own default for a load option of 0.
 pub const DEFAULT_DECODE_LANES: u32 = 3;
@@ -196,6 +201,7 @@ pub fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOption
         record_bytes: std::array::from_fn(|i| cat.slot_bytes(KClass::ALL[i])),
         max_tokens,
         lookahead_width: LOOKAHEAD_WIDTH,
+        prefill_lookahead_width: PREFILL_LOOKAHEAD_WIDTH,
         prefetch_budget_bytes: default_prefetch_budget_bytes(options.decode_lanes, &cat),
         staging_half_bytes: staging_ring / 2,
         host_pool_bytes: layout.bytes,

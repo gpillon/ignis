@@ -18,11 +18,11 @@
 //!
 //! Format, whitespace-separated, one record per line:
 //! ```text
-//! ignis-residency-fixture 1
+//! ignis-residency-fixture 2
 //! layers <L> experts <E> top_k <10>
 //! record_bytes <8 values, KClass order>
 //! capacity <8 values>
-//! width <W> budget <bytes, 18446744073709551615 = none>
+//! width <W> prefill_width <a prefill step's W> budget <bytes, 18446744073709551615 = none>
 //! k2 <L * E * 2 values, key order>
 //! warm <n> <keys, hottest first>
 //! steps <n>
@@ -50,6 +50,8 @@ const LAYERS: u16 = 4;
 const EXPERTS: u16 = 64;
 const TOP_K: usize = 10;
 const WIDTH: usize = 4;
+/// Narrower than [`WIDTH`], so the GPU is held to a prefill step's own width.
+const PREFILL_WIDTH: usize = 3;
 /// Small records keep the GPU test's pools tiny: gate/up 1-4 pages, down 1-2.
 const RECORD_BYTES: [u64; 8] = [4096, 8192, 12288, 16384, 4096, 4096, 8192, 8192];
 /// Tight enough to evict, and for the down K4 class tight enough that a
@@ -198,6 +200,7 @@ fn fixture_text() -> String {
         PolicyConfig {
             capacity: CAPACITY,
             prefetch_width: WIDTH,
+            prefill_prefetch_width: PREFILL_WIDTH,
             prefetch_budget_bytes: Some(BUDGET),
         },
     );
@@ -211,12 +214,12 @@ fn fixture_text() -> String {
     let steps = trace(&mut rng, 40);
 
     let mut out = String::new();
-    let _ = writeln!(out, "ignis-residency-fixture 1");
+    let _ = writeln!(out, "ignis-residency-fixture 2");
     let _ = writeln!(out, "layers {LAYERS} experts {EXPERTS} top_k {TOP_K}");
     let line = |name: &str, values: Vec<String>| format!("{name} {}\n", values.join(" "));
     out.push_str(&line("record_bytes", RECORD_BYTES.iter().map(u64::to_string).collect()));
     out.push_str(&line("capacity", CAPACITY.iter().map(u32::to_string).collect()));
-    let _ = writeln!(out, "width {WIDTH} budget {BUDGET}");
+    let _ = writeln!(out, "width {WIDTH} prefill_width {PREFILL_WIDTH} budget {BUDGET}");
     let mut k2 = Vec::new();
     for layer in 0..LAYERS {
         for expert in 0..EXPERTS {

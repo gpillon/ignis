@@ -110,7 +110,7 @@ struct State {
 
 // Everything the kernels read, by value.
 struct Dev {
-  uint32_t layers, experts, width;
+  uint32_t layers, experts, width, prefill_width;  // a decode and a prefill step's lookahead width
   uint32_t capacity[kClasses];
   unsigned long long record_bytes[kClasses];
   unsigned long long budget;
@@ -135,6 +135,11 @@ struct Dev {
   uint32_t *report_entries;  // [layers][kLists][4 * experts]
   ignis_residency_mirror *mirror;  // mapped host memory, or NULL
 };
+
+// A step's lookahead width: a prefill step's own, else the decode width (the host's width_of).
+__device__ __forceinline__ uint32_t width_of(const Dev &d, uint32_t phase) {
+  return phase == IGNIS_RESIDENCY_PREFILL ? d.prefill_width : d.width;
+}
 
 
 // ---- block-wide helpers (every thread calls them) ----------------------------------------------
@@ -274,9 +279,10 @@ __global__ void __launch_bounds__(kThreads)
     }
   }
   if (lookahead != nullptr) {
+    const uint32_t width = width_of(d, phase);
     for (uint32_t row = t; row < rows; row += blockDim.x) {
       uint32_t rank = 0;
-      for (uint32_t j = 0; j < stride && rank < d.width; ++j) {
+      for (uint32_t j = 0; j < stride && rank < width; ++j) {
         const int32_t e = lookahead[static_cast<unsigned long long>(row) * stride + j];
         if (e < 0) continue;
         if (static_cast<uint32_t>(e) >= E) {
@@ -483,9 +489,10 @@ __global__ void __launch_bounds__(kThreads)
   __syncthreads();
 
   // The candidates' first-occurrence rank positions.
+  const uint32_t width = width_of(d, phase);
   for (uint32_t row = t; row < rows; row += blockDim.x) {
     uint32_t rank = 0;
-    for (uint32_t j = 0; j < stride && rank < d.width; ++j) {
+    for (uint32_t j = 0; j < stride && rank < width; ++j) {
       const int32_t e = lookahead[static_cast<unsigned long long>(row) * stride + j];
       if (e < 0) continue;
       if (static_cast<uint32_t>(e) >= E) {
@@ -659,6 +666,11 @@ constexpr uint64_t kAlign = 256;
 
 uint64_t round_up(uint64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
+// A step's lookahead width: a prefill step's own, else the decode width (the kernels' width_of).
+uint32_t width_of(const ignis_residency_desc &d, uint32_t phase) {
+  return phase == IGNIS_RESIDENCY_PREFILL ? d.prefill_lookahead_width : d.lookahead_width;
+}
+
 // The device buffers besides pools and ring, in carve order: (bytes, element alignment).
 struct Carve {
   uint64_t cls, k2, host_off, slot_of, flags, table, owner[kClasses], stamp[kClasses],
@@ -715,6 +727,10 @@ int32_t check_desc(const ignis_residency_desc *d) {
     return fail("residency: staging_half_bytes must be a multiple of 16 (the copies store 16-byte units)");
   }
   if (d->lookahead_width > IGNIS_MOE_EXPERTS) return fail("residency: lookahead_width exceeds the experts");
+  if (d->prefill_lookahead_width > d->lookahead_width) {
+    // The ranked lookahead's scratch is sized for lookahead_width rows' worth.
+    return fail("residency: prefill_lookahead_width exceeds lookahead_width");
+  }
   if (d->copy_blocks > 1024) return fail("residency: copy_blocks must be at most 1024");
   return 0;
 }
@@ -869,6 +885,7 @@ int32_t ignis_residency_create(const ignis_residency_desc *desc, const uint8_t *
   v.layers = d.layers;
   v.experts = d.experts;
   v.width = d.lookahead_width;
+  v.prefill_width = d.prefill_lookahead_width;
   for (uint32_t k = 0; k < kClasses; ++k) {
     v.capacity[k] = d.capacity[k];
     v.record_bytes[k] = d.record_bytes[k];
@@ -1022,7 +1039,7 @@ int32_t ignis_residency_step_ranked(ignis_residency *r, uint32_t layer, uint32_t
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (ignis_residency_join(r, stream) != 0) return -1;
   r->stepped = true;
-  const bool look = lookahead != nullptr && layer + 1 < d.layers && d.lookahead_width > 0;
+  const bool look = lookahead != nullptr && layer + 1 < d.layers && width_of(d, phase) > 0;
   // Validated with the selection only when there is a next layer to look at: the last layer's
   // lookahead is ignored, as the policy ignores it.
   resolve_demand<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, look ? lookahead : nullptr,
@@ -1059,7 +1076,7 @@ int32_t ignis_residency_step_demand(ignis_residency *r, uint32_t layer, uint32_t
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (ignis_residency_join(r, stream) != 0) return -1;
   r->stepped = true;
-  const bool look = lookahead_stream != nullptr && layer + 1 < d.layers && d.lookahead_width > 0;
+  const bool look = lookahead_stream != nullptr && layer + 1 < d.layers && width_of(d, phase) > 0;
   resolve_demand<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, nullptr, 0, 0);
   RESIDENCY_CUDA(cudaGetLastError());
   if (look) {
@@ -1109,17 +1126,19 @@ int32_t ignis_residency_step_prefetch(ignis_residency *r, const float *lookahead
   int32_t *ranked = reinterpret_cast<int32_t *>(r->tables + r->layout.ranked);
   const uint32_t threads = 256;
   const uint32_t blocks = (tokens * 32 + threads - 1) / threads;
+  const uint32_t width = width_of(d, r->branch_phase);
   rank_lookahead<<<blocks, threads, 0, r->prefetch_stream>>>(lookahead_logits, tokens, d.experts,
-                                                            d.lookahead_width, ranked);
+                                                            width, ranked);
   RESIDENCY_CUDA(cudaGetLastError());
-  return ignis_residency_step_prefetch_ranked(r, ranked, tokens, d.lookahead_width);
+  return ignis_residency_step_prefetch_ranked(r, ranked, tokens, width);
 }
 
 int32_t ignis_residency_step(ignis_residency *r, uint32_t layer, uint32_t phase, const int32_t *ids,
                              uint32_t tokens, const float *lookahead_logits, void *stream) {
   if (r == nullptr) return fail("residency: no residency");
   const ignis_residency_desc &d = r->desc;
-  const bool look = lookahead_logits != nullptr && layer + 1 < d.layers && d.lookahead_width > 0;
+  const uint32_t width = width_of(d, phase);
+  const bool look = lookahead_logits != nullptr && layer + 1 < d.layers && width > 0;
   if (!look) return ignis_residency_step_ranked(r, layer, phase, ids, tokens, nullptr, 0, 0, stream);
   if (tokens == 0 || tokens > d.max_tokens) {
     return fail("residency: a step takes 1.." + std::to_string(d.max_tokens) + " rows of ids");
@@ -1128,9 +1147,9 @@ int32_t ignis_residency_step(ignis_residency *r, uint32_t layer, uint32_t phase,
   const uint32_t threads = 256;
   const uint32_t blocks = (tokens * 32 + threads - 1) / threads;
   rank_lookahead<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-      lookahead_logits, tokens, d.experts, d.lookahead_width, ranked);
+      lookahead_logits, tokens, d.experts, width, ranked);
   RESIDENCY_CUDA(cudaGetLastError());
-  return ignis_residency_step_ranked(r, layer, phase, ids, tokens, ranked, tokens, d.lookahead_width, stream);
+  return ignis_residency_step_ranked(r, layer, phase, ids, tokens, ranked, tokens, width, stream);
 }
 
 int32_t ignis_residency_read_counters(ignis_residency *r, ignis_residency_counters *out) {

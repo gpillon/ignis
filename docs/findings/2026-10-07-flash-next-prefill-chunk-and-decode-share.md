@@ -151,5 +151,5 @@ Inferred:
 
 - Rounds inside a chunk, to bound the gap: a leaf sub-step over layer slices. Prefill activations live in `fn.residual/x/y`, which the decode graph also uses, so the decode round would need buffers of its own. Residency's ring halves are tagged per layer.
 - Pipeline the n-gram gather: gather chunk k+1's rows while chunk k is on the card (the scheduler knows the next span).
-- Short chunks: stage only what a small chunk's own router selects (the lookahead stages each row's top 16, more than the top 10 used), or fold a short tail into the previous chunk when the width allows.
+- Short chunks: stage only what a small chunk's own router selects (the lookahead stages each row's top 16, more than the top 10 used), or fold a short tail into the previous chunk when the width allows. (Done 2026-10-07 for the width: a chunk's lookahead is now the router's top 10, and at the 262K x 3-lane default an 8192-token chunk had 0.52-0.56 s of copies exposed, not 0.13-0.15: [the agent turn tail finding](2026-10-07-flash-next-agent-turn-tail.md).)
 - Re-measure the 34K TTFT, and decode at 2-3 lanes, at 16 reader threads.

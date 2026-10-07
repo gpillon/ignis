@@ -43,7 +43,8 @@ GitHub, not open questions.
   Flash-Next artifact in `F:/ai/models/Qwen3.8-Flash-Next-ignis/` and the
   Flash-Next defaults below. `make config` prints them.
 - **Defaults:** 3 lanes (`--decode-lanes`, 1..8); KV hq-e8-2b; 262,144 tokens of context per lane (the checkpoint's trained positions; owner decision 2026-10-07, GitHub #306); prefill
-  chunk 8192; prefetch width 16; n-gram hot rows 1 GB; decode share 50%
+  chunk 8192; prefetch width 16, 10 for a prefill chunk (GitHub #306: the router's
+  top-k); n-gram hot rows 1 GB; decode share 50%
   (GitHub #306: decoding lanes keep half the time while a prompt prefills).
 - The 8192-token KLD bound is 1.25× the 2048-token one.
 - The math of QSA, the indexer, the hyper-connections and the n-gram embedding is

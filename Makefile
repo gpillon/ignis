@@ -183,7 +183,7 @@ config: ## Print the resolved knobs and paths
 	@echo "PLAN            $(if $(filter flash-next,$(MODEL_FAMILY)),lanes=$(LANES) context/lane=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) prefill_chunk=$(or $(PREFILL_CHUNK),default) decode_share=$(if $(DECODE_SHARE),$(DECODE_SHARE)%,50% (default)) retained_host=$(or $(RETAINED_HOST),8 (Flash-Next default)) kv_ram_arena=$(or $(KV_HOST_POOL_BYTES),default),(Flash-Next only: the plan is the server's for the 27B))"
 	@echo "VISION (CUDA=1) $(if $(filter 1,$(VISION)),on  max_tokens=$(or $(VISION_MAX_TOKENS),(server default)),off  (image parts are refused with vision_disabled))"
 	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1G))) retained_device=$(or $(RETAINED_DEVICE),(server default: 0)) retained_host=$(or $(RETAINED_HOST),(server default: two per lane))"
-	@echo "MODEL           $(MODEL_FAMILY)  $(if $(filter flash-next,$(MODEL_FAMILY)),(Qwen3.8-Flash-Next as $(SERVED_MODEL); lanes=$(LANES); its prefetch width 16 / 1G n-gram hot rows are not server flags yet),$(if $(SERVED_MODEL),(Qwen3.8-27B served as $(SERVED_MODEL)),(Qwen3.8-27B under the server's default id)))"
+	@echo "MODEL           $(MODEL_FAMILY)  $(if $(filter flash-next,$(MODEL_FAMILY)),(Qwen3.8-Flash-Next as $(SERVED_MODEL); lanes=$(LANES); its prefetch width 16, 10 in prefill / 1G n-gram hot rows are not server flags yet),$(if $(SERVED_MODEL),(Qwen3.8-27B served as $(SERVED_MODEL)),(Qwen3.8-27B under the server's default id)))"
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"
 	@echo "LOG_FORMAT      $(or $(LOG_FORMAT),(server default))"

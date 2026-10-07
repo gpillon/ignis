@@ -3,7 +3,9 @@
 //! implements (spec flash-next/03, acceptance 4, GitHub #301).
 //!
 //! - The leaf's own plan line for the tables stays within the CPU plan's
-//!   upper bound (host arithmetic, no GPU: runs with `--features cuda`).
+//!   upper bound, its descriptor refuses a prefill width past the decode
+//!   width, and its layout is the Rust mirror's (host arithmetic, no GPU:
+//!   runs with `--features cuda`).
 //! - On random traces -- decode of one to three lanes, prefill chunks, a
 //!   lookahead with holes, a budget or none, a warm start, refused steps,
 //!   forwards restarted at a layer --
@@ -43,6 +45,7 @@ fn the_leaf_s_tables_line_stays_within_the_cpu_plan_s_upper_bound() {
         record_bytes,
         max_tokens: 8192,
         lookahead_width: 16,
+        prefill_lookahead_width: 10,
         prefetch_budget_bytes: NO_BUDGET,
         staging_half_bytes: 800_000_000,
         host_pool_bytes: 38_000_000_000,
@@ -58,6 +61,39 @@ fn the_leaf_s_tables_line_stays_within_the_cpu_plan_s_upper_bound() {
     assert_eq!(plan.pools, pools);
     assert_eq!(plan.staging, round(1_600_000_000));
     assert_eq!(plan.total, plan.pools + plan.staging + plan.tables);
+}
+
+#[test]
+fn a_prefill_width_past_the_decode_width_is_refused_by_name() {
+    // The ranked lookahead's scratch is sized for the decode width.
+    let desc = ResidencyDesc {
+        layers: 2,
+        experts: 16,
+        capacity: [4; 8],
+        record_bytes: [4096; 8],
+        max_tokens: 4,
+        lookahead_width: 3,
+        prefill_lookahead_width: 4,
+        prefetch_budget_bytes: NO_BUDGET,
+        staging_half_bytes: 4096 * 32,
+        host_pool_bytes: 4096 * 64,
+        copy_blocks: 4,
+        report: 0,
+    };
+    let refused = device::plan_bytes(&desc).expect_err("a prefill width past the decode width");
+    assert!(refused.contains("prefill_lookahead_width exceeds lookahead_width"), "{refused}");
+    device::plan_bytes(&ResidencyDesc { prefill_lookahead_width: 3, ..desc }).expect("equal widths");
+}
+
+/// `struct ignis_residency_desc` has no `size` field, so both sides pin its
+/// layout: kernel/include/ignis_residency.h static_asserts the same.
+#[test]
+fn the_residency_descriptor_is_the_leaf_s_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(offset_of!(ResidencyDesc, prefill_lookahead_width), 112);
+    assert_eq!(offset_of!(ResidencyDesc, prefetch_budget_bytes), 120);
+    assert_eq!(offset_of!(ResidencyDesc, copy_blocks), 144);
+    assert_eq!(size_of::<ResidencyDesc>(), 152);
 }
 
 struct Rng(u64);
@@ -117,6 +153,8 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
     const LAYERS: u16 = 3;
     const EXPERTS: u16 = 32;
     const WIDTH: usize = 3;
+    // A chunk's own, narrower width: the device must take it from the same rankings.
+    const PREFILL_WIDTH: usize = 2;
     const MAX_ROWS: usize = 8;
     let record_bytes = [4096, 8192, 8192, 12288, 4096, 4096, 8192, 8192];
     let ids_buf = dev.allocate((MAX_ROWS * TOP_K * 4) as u64).expect("ids");
@@ -133,7 +171,7 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
         let budget = if seed % 2 == 0 { Some(10_000 + rng.below(30_000)) } else { None };
         let mut model = ResidencyModel::new(
             catalog.clone(),
-            PolicyConfig { capacity, prefetch_width: WIDTH, prefetch_budget_bytes: budget },
+            PolicyConfig { capacity, prefetch_width: WIDTH, prefill_prefetch_width: PREFILL_WIDTH, prefetch_budget_bytes: budget },
         );
         let (k2, offsets, pool_bytes) = device::packed_layout(&catalog);
         let heaviest = (0..LAYERS).map(|l| catalog.layer_bytes(l)).max().unwrap();
@@ -144,6 +182,7 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
             record_bytes,
             max_tokens: MAX_ROWS as u32,
             lookahead_width: WIDTH as u32,
+            prefill_lookahead_width: PREFILL_WIDTH as u32,
             prefetch_budget_bytes: budget.unwrap_or(NO_BUDGET),
             staging_half_bytes: heaviest,
             host_pool_bytes: pool_bytes,

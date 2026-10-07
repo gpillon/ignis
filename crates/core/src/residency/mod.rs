@@ -56,8 +56,11 @@
 //!   default ([`default_prefetch_budget_bytes`]) is one layer's share of the
 //!   round at the link's bandwidth, since unbudgeted W = 16 asks the link for
 //!   more than a decode step lasts (7.2 ms of transfers per 6 ms step at one
-//!   lane, 29 at three, on the study's routing). Launch shapes are fixed;
-//!   the job count lives in device memory.
+//!   lane, 29 at three, on the study's routing). A prefill step takes no
+//!   budget and its own width of each token's ranking
+//!   (`prefill_lookahead_width`: the router's top-k on Flash-Next, since
+//!   every rank past it is link time a chunk waits on). Launch shapes are
+//!   fixed; the job count lives in device memory.
 //! - **Tested against this module:** the GPU replay drives resolve and copy
 //!   with recorded traces and reads back each step's hits, misses and
 //!   evictions, which must equal [`StepOutcome`]'s.

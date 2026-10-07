@@ -23,7 +23,7 @@
 // can be written so (an eager step whose rows hold `width` distinct ids), else
 // ignis_residency_step_prefetch_ranked. The split step's outcomes are the whole step's.
 // Every mode then checks that a whole step at the last layer ignores its lookahead, as the policy
-// does, out-of-range ids included.
+// does, out-of-range ids included, and that a prefill width of 0 is no lookahead.
 // Same no-SKIP_RETURN_CODE rule as every GPU test here (ADR 0006).
 
 #include "ignis_residency.h"
@@ -89,7 +89,7 @@ struct Step {
 };
 
 struct Fixture {
-  uint32_t layers = 0, experts = 0, top_k = 0, width = 0;
+  uint32_t layers = 0, experts = 0, top_k = 0, width = 0, prefill_width = 0;
   uint64_t record_bytes[8] = {};
   uint32_t capacity[8] = {};
   uint64_t budget = 0;
@@ -117,6 +117,10 @@ Fixture load(const char *path) {
   int version = 0;
   expect_word(in, "ignis-residency-fixture");
   in >> version;
+  if (version != 2) {
+    std::fprintf(stderr, "fixture: version %d, this test reads 2\n", version);
+    std::exit(1);
+  }
   expect_word(in, "layers");
   in >> f.layers;
   expect_word(in, "experts");
@@ -129,6 +133,8 @@ Fixture load(const char *path) {
   for (auto &c : f.capacity) in >> c;
   expect_word(in, "width");
   in >> f.width;
+  expect_word(in, "prefill_width");
+  in >> f.prefill_width;
   expect_word(in, "budget");
   in >> f.budget;
   expect_word(in, "k2");
@@ -236,6 +242,7 @@ int main(int argc, char **argv) {
   }
   desc.max_tokens = max_rows;
   desc.lookahead_width = f.width;
+  desc.prefill_lookahead_width = f.prefill_width;
   desc.prefetch_budget_bytes = f.budget;
   desc.staging_half_bytes = heaviest;
   desc.host_pool_bytes = pool_bytes;
@@ -497,7 +504,8 @@ int main(int argc, char **argv) {
                              as_logits(*host, rows, stride);
     void *side = nullptr;
     RES_OK(ignis_residency_step_demand(r, layer, phase, ids, tokens, stream, look ? &side : nullptr));
-    check((side != nullptr) == (look != nullptr && layer + 1 < f.layers),
+    const uint32_t width = phase == IGNIS_RESIDENCY_PREFILL ? f.prefill_width : f.width;
+    check((side != nullptr) == (look != nullptr && layer + 1 < f.layers && width > 0),
           "split: a branch opens exactly when the step looks ahead");
     if (side != nullptr && from_logits) {
       RES_OK(ignis_residency_step_prefetch(r, d_logits, rows));
@@ -709,6 +717,7 @@ int main(int argc, char **argv) {
     d2.capacity[0] = d2.capacity[4] = 12;  // gate/up and down at K = 2
     d2.max_tokens = 1;
     d2.lookahead_width = 2;
+    d2.prefill_lookahead_width = 2;
     d2.prefetch_budget_bytes = IGNIS_RESIDENCY_NO_BUDGET;
     d2.staging_half_bytes = 2 * kE * 4096;
     d2.host_pool_bytes = 2 * 2 * kE * 4096;
@@ -760,6 +769,29 @@ int main(int argc, char **argv) {
                        cudaMemcpyDeviceToHost));
     check(t2[2 * kA].record != nullptr && t2[2 * kA + 1].record != nullptr, "eviction check: A is resident");
     check(t2[2 * kB].record == nullptr && t2[2 * kB + 1].record == nullptr, "eviction check: B is ABSENT");
+
+    // A prefill width of 0 is no lookahead: a prefill step opens no branch and prefetches nothing
+    // from a whole step's lookahead, while a decode step of the same residency still looks ahead.
+    {
+      ignis_residency_desc d3 = d2;
+      d3.prefill_lookahead_width = 0;
+      ignis_residency *r3 = nullptr;
+      RES_OK(ignis_residency_create(&d3, k2.data(), offsets2.data(), &r3));
+      void *side = nullptr;
+      RES_OK(ignis_residency_step_demand(r3, 0, IGNIS_RESIDENCY_PREFILL, d_ids2, 1, s2, &side));
+      check(side == nullptr, "a prefill width of 0 opens no lookahead branch");
+      RES_OK(ignis_residency_step_ranked(r3, 0, IGNIS_RESIDENCY_PREFILL, d_ids2, 1, d_look2, 1, 2, s2));
+      RES_OK(ignis_residency_join(r3, s2));
+      CUDA_OK(cudaStreamSynchronize(s2));
+      ignis_residency_report h3{};
+      RES_OK(ignis_residency_last_report(r3, 0, &h3, lists.data(), 4 * kE));
+      check(h3.status == 0 && h3.count[4] == 0, "a prefill width of 0 prefetches nothing");
+      RES_OK(ignis_residency_step_demand(r3, 0, IGNIS_RESIDENCY_DECODE, d_ids2, 1, s2, &side));
+      check(side != nullptr, "a decode step of the same residency still looks ahead");
+      RES_OK(ignis_residency_join(r3, s2));
+      CUDA_OK(cudaStreamSynchronize(s2));
+      ignis_residency_free(r3);
+    }
     cudaFree(d_ids2);
     cudaFree(d_look2);
     cudaStreamDestroy(s2);
