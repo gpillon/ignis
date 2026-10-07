@@ -230,6 +230,20 @@ Inferred (not measured):
   - The 27B's numbers come from the README's harness, which runs speculation, and were not re-measured.
 - **Inferences.** The decode-step and prefill decompositions above are inferences from counters and earlier findings. No profile of a decode round, a prefill chunk or the load was taken.
 
+## Update 2026-10-07: lanes at 262K context (GitHub #306)
+
+Flash-Next's default is now 262,144 tokens per lane (the checkpoint's trained positions) and `--decode-lanes N` (`make` knob `LANES`, default 3) sets the lane count. Both runs: release build of `fn-lanes-262k`, hq-e8-2b, `--max-context 262144`, `--prefill-chunk 8192`, default `--vram-headroom-bytes 4G`, MTP off, one lane decoding the greedy prompt (1,800 tokens, `ignore_eos`) back to back for 90 s, 5 requests each, no other process on the card.
+
+| `--decode-lanes` | KV pool | expert cache | decode tok/s (5 requests) | ITL p50 | decode hit rate |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 3.46 GiB (786K tokens) | 13.38 GiB | 85.3-89.5 (89 typical) | 10.5 ms | 96.25% (8.32M hits, 0.32M misses) |
+| 1 | 1.15 GiB (262K tokens) | 15.74 GiB | 98.5-99.3 | 9.5 ms | 97.55% (8.43M hits, 0.21M misses) |
+
+- One lane gives the expert cache 2.36 GiB more (the pool shrinks by 2.31 GiB; the program line moves by 13 MB), and a lone user decodes **11% faster** (99 against 89 tok/s) with a hit rate 1.3 points higher: the misses fall by a third.
+- Three lanes still keep the whole 262,144 tokens per lane. Taking lanes away is the only knob that moves VRAM from the pool to the cache, and it does not touch any lane's context.
+- The earlier 99.0 tok/s at one lane (#306) is the `--decode-lanes 1` figure, so the lanes=3 default costs a lone user about 10 tok/s.
+- Not measured: three lanes decoding at once at 262K (the aggregate), and the load's RAM headroom beyond the 46 GB the host plan needs.
+
 ## Follow-ups
 
 The coordinator opens these as issues:
