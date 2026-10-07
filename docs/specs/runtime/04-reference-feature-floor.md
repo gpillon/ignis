@@ -297,7 +297,9 @@ same load.
 - The exact-key side store: built only if long-context retrieval under hq comes
   back short.
 - Warmup / readiness split: a follow-up ticket, filed and tracked, gating
-  nothing in G4.
+  nothing in G4. Done (#129): a loaded model runs one two-token request
+  before the API admits work; `/v1` answers 503 `server_not_ready` until
+  then and `ignis.process.ready` logs `warm_up_ms`.
 - A third request class: waits for a workload that has one.
 - Speculative decoding (phase 5); vision (past G5).
 

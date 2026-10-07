@@ -8,7 +8,9 @@
 # Still to do (each is a hook below that fails with a clear message today):
 #   - background server control: pid file + setsid/nohup and a /v1/models
 #     readiness loop (the Windows version is mk/windows/server.ps1), and the
-#     run-ui/dev-ui process group on top of it
+#     run-ui/dev-ui process group on top of it. The loop must wait for a 200
+#     (curl -f), not any answer: /v1 answers 503 while the warm-up runs
+#     (GitHub #129)
 #   - scripts/gpu-profile.sh, the three-stage explicit GPU test profile
 #     (scripts/gpu-profile.ps1's counterpart), which writes the marker
 #     ignis_core::gpu_profile reads

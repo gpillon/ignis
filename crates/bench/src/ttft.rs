@@ -589,6 +589,10 @@ pub fn load_corpus(path: &Path) -> Result<Vec<u32>, String> {
 /// decode/encode round-trip drifts too far — the cell fails with a clear
 /// message instead of falling back to the word-growth path or, worse,
 /// measuring a length it does not claim.
+///
+/// A target longer than the bank **tiles** it: the window wraps, so a cell
+/// deeper than the corpus repeats it (length fills, content does not grow),
+/// and the prompts of one cell start `bank / count` ids apart.
 pub fn generate_cell_prompts_from_corpus(
     template: &dyn PromptTemplate,
     corpus: &[u32],

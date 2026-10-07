@@ -290,7 +290,7 @@ pub(crate) async fn prepare(
     Ok(Prepared {
         input,
         class,
-        notes: RequestNotes { media, thinking_budget_dropped: budget_dropped },
+        notes: RequestNotes { media, thinking_budget_dropped: budget_dropped, ..RequestNotes::default() },
         items,
         start: ResponseStart {
             response,

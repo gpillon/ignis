@@ -87,7 +87,10 @@ pub fn router(state: Arc<Server>) -> Router {
     let mut router = v1
         // Only the `/v1` routes above: the Playground's static pages, and
         // the API reference merged below, stay reachable without a key.
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))
+        // Outermost (GitHub #129): a keyed server's readiness probe, which
+        // sends no key, must see 503 until the warm-up has run, not a 401.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_ready));
     // The body cap, enforced before JSON parsing: wider with `--vision`,
     // which takes images inline as base64 data URIs (GitHub #179), than for
     // a text-only load, which only ever carries a prompt (GitHub #230).
@@ -228,6 +231,24 @@ impl<B> MakeSpan<B> for RootSpanMaker {
 /// header on a WebSocket, and this is OpenAI's Realtime convention for it.
 /// The entry is read here and never selected back to the client
 /// (`crate::responses::socket`).
+/// 503 `server_not_ready` on every `/v1` route until the first traversal
+/// has run (GitHub #129, [`Server::warm_up`]). Outside the key layer, so a
+/// probe with no key still reads the state (it says nothing else); a
+/// preflight passes. `Retry-After` tells a client when to ask again.
+async fn require_ready(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
+    if server.is_ready() || req.method() == axum::http::Method::OPTIONS {
+        return next.run(req).await;
+    }
+    let mut res = error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        "server_not_ready",
+        "the model is loaded but the first traversal (decode graph capture) has not finished; retry shortly",
+    );
+    res.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+    res
+}
+
 async fn require_api_key(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let Some(key) = &server.api_key else {
         return next.run(req).await;
@@ -1510,7 +1531,7 @@ async fn chat_completions(
             Err(response) => return response,
         };
     input.forced_literal = forced;
-    let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped };
+    let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped, ..RequestNotes::default() };
     let (request_id, mut stream) = match server.engine.submit_with_notes(input, class, notes).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),

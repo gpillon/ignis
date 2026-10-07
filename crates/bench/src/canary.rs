@@ -241,7 +241,7 @@ pub fn run_canaries(ep: &dyn Endpoint) -> Vec<CanaryResult> {
                 prompt: c.prompt.to_string(),
                 max_tokens: CANARY_MAX_TOKENS,
                 stream: false,
-                include_usage: false,
+                include_usage: true,
                 enable_thinking: None,
                 images: Vec::new(),
             };
