@@ -318,7 +318,7 @@ launch shapes.
 8. MMLU-Pro proxy ≥ 71% on the 281 questions, paired against BF16 (73.7%) and spec 01's torch result.
 9. Decode ≥ 70 tok/s on one lane and ≥ 130 tok/s total on three lanes (≤ 2K prompt, 256 generated, warm cache, planned cache size), with hq-e8-2b KV, reported against the simulation's 102 / 186. TTFT is reported for cold 2K, 8K and 32K prompts.
 10. Peak VRAM with the desktop is ≤ 29 GB, and nothing is allocated while serving. Three lanes at the default context fit the plan.
-11. Chat completions and the Responses API (streaming, tools, thinking) work on Flash-Next. Images, `/v1/decide` and speculation get a 400 naming the model. `/v1/models` names the loaded model.
+11. Chat completions and the Responses API (streaming, tools, thinking) work on Flash-Next. Images and `/v1/decide` get a 400 naming the model. Speculation is the MTP head's alone, and off unless `--spec mtp` names it (spec 07): `--spec dflash2` is refused at start naming the model ("Flash-Next drafts with mtp"), and `--spec mtp` without the head's companion container beside the artifact fails the start. `/v1/models` names the loaded model.
 12. Residency and n-gram metrics are exported and shown on the Monitor. No process-wide singleton is added, and the model's resources are freed by its drop path.
 13. `cargo test` passes workspace-wide, and `cargo check --workspace --features cuda --tests` is clean. The Flash-Next GPU tests and the 27B GPU profile are green on a free 5090.
 
