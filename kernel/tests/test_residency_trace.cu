@@ -92,7 +92,7 @@ struct Fixture {
   uint32_t layers = 0, experts = 0, top_k = 0, width = 0, prefill_width = 0;
   uint64_t record_bytes[8] = {};
   uint32_t capacity[8] = {};
-  uint64_t budget = 0, budget_row = 0;
+  uint64_t budget_one_row = 0, budget_per_row = 0;
   std::vector<uint8_t> k2;
   std::vector<uint32_t> warm;
   std::vector<Step> steps;
@@ -135,10 +135,10 @@ Fixture load(const char *path) {
   in >> f.width;
   expect_word(in, "prefill_width");
   in >> f.prefill_width;
-  expect_word(in, "budget");
-  in >> f.budget;
-  expect_word(in, "budget_row");
-  in >> f.budget_row;
+  expect_word(in, "budget_one_row");
+  in >> f.budget_one_row;
+  expect_word(in, "budget_per_row");
+  in >> f.budget_per_row;
   expect_word(in, "k2");
   f.k2.resize(static_cast<size_t>(f.layers) * f.experts * 2);
   for (auto &k : f.k2) {
@@ -245,8 +245,8 @@ int main(int argc, char **argv) {
   desc.max_tokens = max_rows;
   desc.lookahead_width = f.width;
   desc.prefill_lookahead_width = f.prefill_width;
-  desc.prefetch_budget_bytes = f.budget;
-  desc.prefetch_budget_row_bytes = f.budget_row;
+  desc.prefetch_budget_one_row_bytes = f.budget_one_row;
+  desc.prefetch_budget_per_row_bytes = f.budget_per_row;
   desc.staging_half_bytes = heaviest;
   desc.host_pool_bytes = pool_bytes;
   desc.copy_blocks = 8;
@@ -721,7 +721,7 @@ int main(int argc, char **argv) {
     d2.max_tokens = 1;
     d2.lookahead_width = 2;
     d2.prefill_lookahead_width = 2;
-    d2.prefetch_budget_bytes = IGNIS_RESIDENCY_NO_BUDGET;
+    d2.prefetch_budget_one_row_bytes = IGNIS_RESIDENCY_NO_BUDGET;
     d2.staging_half_bytes = 2 * kE * 4096;
     d2.host_pool_bytes = 2 * 2 * kE * 4096;
     d2.copy_blocks = 4;
@@ -794,6 +794,47 @@ int main(int argc, char **argv) {
       RES_OK(ignis_residency_join(r3, s2));
       CUDA_OK(cudaStreamSynchronize(s2));
       ignis_residency_free(r3);
+    }
+
+    // A decode step's budget follows its rows and saturates (GitHub #306): at one row, 4096 B
+    // take X's gate/up alone; a second row (all holes) adds UINT64_MAX, which saturates to no
+    // budget rather than wrapping below one projection, so the same candidates all go.
+    {
+      ignis_residency_desc d4 = d2;
+      d4.max_tokens = 2;
+      d4.prefetch_budget_one_row_bytes = 4096;
+      d4.prefetch_budget_per_row_bytes = UINT64_MAX;
+      std::vector<int32_t> ids4(2 * IGNIS_MOE_TOP_K);
+      for (size_t i = 0; i < ids4.size(); ++i) ids4[i] = static_cast<int32_t>(i % IGNIS_MOE_TOP_K);
+      const std::vector<int32_t> look4 = {static_cast<int32_t>(kX), static_cast<int32_t>(kA), -1, -1};
+      int32_t *d_ids4 = nullptr, *d_look4 = nullptr;
+      CUDA_OK(cudaMalloc(&d_ids4, ids4.size() * 4));
+      CUDA_OK(cudaMalloc(&d_look4, look4.size() * 4));
+      CUDA_OK(cudaMemcpy(d_ids4, ids4.data(), ids4.size() * 4, cudaMemcpyHostToDevice));
+      CUDA_OK(cudaMemcpy(d_look4, look4.data(), look4.size() * 4, cudaMemcpyHostToDevice));
+      for (const uint32_t rows : {1u, 2u}) {
+        ignis_residency *r4 = nullptr;
+        RES_OK(ignis_residency_create(&d4, k2.data(), offsets2.data(), &r4));
+        if (split_mode) {
+          void *side = nullptr;
+          RES_OK(ignis_residency_step_demand(r4, 0, IGNIS_RESIDENCY_DECODE, d_ids4, rows, s2, &side));
+          RES_OK(ignis_residency_step_prefetch_ranked(r4, d_look4, rows, 2));
+        } else {
+          RES_OK(ignis_residency_step_ranked(r4, 0, IGNIS_RESIDENCY_DECODE, d_ids4, rows, d_look4, rows, 2, s2));
+        }
+        RES_OK(ignis_residency_join(r4, s2));
+        CUDA_OK(cudaStreamSynchronize(s2));
+        ignis_residency_report h4{};
+        RES_OK(ignis_residency_last_report(r4, 0, &h4, lists.data(), 4 * kE));
+        const uint32_t want = rows == 1 ? 1 : 4;
+        check(h4.status == 0 && h4.count[4] == want && h4.count[5] == 4 - want,
+              "the budget at " + std::to_string(rows) + " row(s): " + std::to_string(h4.count[4]) +
+                  " prefetched, " + std::to_string(h4.count[5]) + " dropped, want " + std::to_string(want) +
+                  " and " + std::to_string(4 - want));
+        ignis_residency_free(r4);
+      }
+      cudaFree(d_ids4);
+      cudaFree(d_look4);
     }
     cudaFree(d_ids2);
     cudaFree(d_look2);

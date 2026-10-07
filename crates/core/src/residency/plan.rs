@@ -574,14 +574,15 @@ pub fn min_slots_per_class(lanes: u32, top_k: u32, prefetch_width: u32) -> u32 {
     lanes * (top_k + prefetch_width)
 }
 
-/// The decode prefetch budgets that served Flash-Next best at one lane and
-/// at three, at the 262K x 3-lane default (GitHub #306,
-/// `docs/findings/2026-10-06-flash-next-decode-round.md`): 0.67x and 1.5x
-/// the 1.75 MB the earlier rule gave every step. One lane gains from less,
-/// since less prefetch is still copying at the next layer's join; three
-/// lanes' misses saturate the link, and a larger budget's prefetches
-/// displace demand bytes.
+/// The decode prefetch budget that served Flash-Next best at one lane, at
+/// the 262K x 3-lane default (GitHub #306,
+/// `docs/findings/2026-10-06-flash-next-decode-round.md`): 0.67x the
+/// 1.75 MB the earlier rule gave every step. Less prefetch is then still
+/// copying at the next layer's join.
 pub const MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES: u64 = 1_172_500;
+
+/// The same at three lanes: 1.5x the 1.75 MB. Three lanes' misses saturate
+/// the link, and a larger budget's prefetches displace demand bytes.
 pub const MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES: u64 = 2_625_000;
 
 /// The default decode prefetch budget: the line through the two measured

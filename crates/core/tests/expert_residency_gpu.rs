@@ -46,8 +46,8 @@ fn the_leaf_s_tables_line_stays_within_the_cpu_plan_s_upper_bound() {
         max_tokens: 8192,
         lookahead_width: 16,
         prefill_lookahead_width: 10,
-        prefetch_budget_bytes: NO_BUDGET,
-        prefetch_budget_row_bytes: 0,
+        prefetch_budget_one_row_bytes: NO_BUDGET,
+        prefetch_budget_per_row_bytes: 0,
         staging_half_bytes: 800_000_000,
         host_pool_bytes: 38_000_000_000,
         copy_blocks: 16,
@@ -75,8 +75,8 @@ fn a_prefill_width_past_the_decode_width_is_refused_by_name() {
         max_tokens: 4,
         lookahead_width: 3,
         prefill_lookahead_width: 4,
-        prefetch_budget_bytes: NO_BUDGET,
-        prefetch_budget_row_bytes: 0,
+        prefetch_budget_one_row_bytes: NO_BUDGET,
+        prefetch_budget_per_row_bytes: 0,
         staging_half_bytes: 4096 * 32,
         host_pool_bytes: 4096 * 64,
         copy_blocks: 4,
@@ -93,10 +93,17 @@ fn a_prefill_width_past_the_decode_width_is_refused_by_name() {
 fn the_residency_descriptor_is_the_leaf_s_layout() {
     use std::mem::{offset_of, size_of};
     assert_eq!(offset_of!(ResidencyDesc, prefill_lookahead_width), 112);
-    assert_eq!(offset_of!(ResidencyDesc, prefetch_budget_bytes), 120);
-    assert_eq!(offset_of!(ResidencyDesc, prefetch_budget_row_bytes), 128);
+    assert_eq!(offset_of!(ResidencyDesc, prefetch_budget_one_row_bytes), 120);
+    assert_eq!(offset_of!(ResidencyDesc, prefetch_budget_per_row_bytes), 128);
     assert_eq!(offset_of!(ResidencyDesc, copy_blocks), 152);
     assert_eq!(size_of::<ResidencyDesc>(), 160);
+}
+
+#[test]
+fn a_policy_budget_becomes_the_descriptor_s_two_words() {
+    assert_eq!(device::budget_words(None), (NO_BUDGET, 0));
+    let budget = PrefetchBudget { one_row_bytes: 1_172_500, per_row_bytes: 726_250 };
+    assert_eq!(device::budget_words(Some(budget)), (1_172_500, 726_250));
 }
 
 struct Rng(u64);
@@ -182,6 +189,7 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
         );
         let (k2, offsets, pool_bytes) = device::packed_layout(&catalog);
         let heaviest = (0..LAYERS).map(|l| catalog.layer_bytes(l)).max().unwrap();
+        let (one_row, per_row) = device::budget_words(budget);
         let desc = ResidencyDesc {
             layers: u32::from(LAYERS),
             experts: u32::from(EXPERTS),
@@ -190,8 +198,8 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
             max_tokens: MAX_ROWS as u32,
             lookahead_width: WIDTH as u32,
             prefill_lookahead_width: PREFILL_WIDTH as u32,
-            prefetch_budget_bytes: budget.map_or(NO_BUDGET, |b| b.one_row_bytes),
-            prefetch_budget_row_bytes: budget.map_or(0, |b| b.per_row_bytes),
+            prefetch_budget_one_row_bytes: one_row,
+            prefetch_budget_per_row_bytes: per_row,
             staging_half_bytes: heaviest,
             host_pool_bytes: pool_bytes,
             copy_blocks: 4,

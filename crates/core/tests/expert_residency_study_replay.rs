@@ -466,29 +466,32 @@ fn decode_on_real_routing_matches_the_simulation() {
 #[test]
 fn the_lookahead_turns_most_remaining_misses_into_hits() {
     let Some(study) = study() else { return };
-    let (rates, one, three) = decode_replay(study, DEFAULT_PREFETCH_WIDTH, None);
-    report("W = 16, no budget", &rates, &one, &three);
+    let (rates, one_open, three_open) = decode_replay(study, DEFAULT_PREFETCH_WIDTH, None);
+    report("W = 16, no budget", &rates, &one_open, &three_open);
     let (rates, one, three) = decode_replay(study, DEFAULT_PREFETCH_WIDTH, Some(default_prefetch_budget()));
     report("W = 16, default budget", &rates, &one, &three);
     // Without the lookahead the same replay hits ~94.5% at ~3.8 ms a round.
-    // GitHub #306 (2026-10-07): the budget that follows the rows replays at
-    // 95.9% and 2.90 ms at one lane, where the old one replayed 96.5% and
-    // 2.37 ms, and serves one lane faster (its smaller one-row budget leaves
-    // less prefetch copying at the next layer's join). The served gain is
-    // measured; these are proxies that score every prefetch as hidden. So
-    // the hit rate holds at 95.5% (owner), the demand cost at 0.8 of the
-    // simulation's.
+    // GitHub #306 (2026-10-07, owner and coordinator): the budget that
+    // follows the rows replays at 95.9% and 2.90 ms at one lane, where the
+    // old one replayed 96.5% and 2.37 ms, and serves one lane faster (its
+    // smaller one-row budget leaves less prefetch copying at the next
+    // layer's join). The served gain is measured; these are proxies that
+    // score every prefetch as hidden. So the hit rate holds at 95.5% (was
+    // 96%), the demand cost at 0.8 of the simulation's (was 0.75).
     assert!(one.rate() >= 0.955, "{:.3}", one.rate());
     assert!(one.cost() <= SIMULATED_COST[0] * 0.8, "{:.2} ms", one.cost() * 1e3);
     // Within the budget, the link carries a round's bytes in the time of
-    // the round's compute plus the demand misses' own wait. The compute is
-    // the served round's, its ITL less its stall at the 262K x 3-lane
-    // default (`docs/findings/2026-10-06-flash-next-decode-round.md`):
-    // 10.0 - 2.1 ms at one lane, 30 - 19.1 at three. Unbudgeted, three
-    // lanes ask for 29 ms of link and fail it.
-    for (t, step) in [(&one, 7.9e-3), (&three, 10.9e-3)] {
-        assert!(t.moved_per_round() / BANDWIDTH <= step + t.cost(), "{:.2} ms", t.moved_per_round() / BANDWIDTH * 1e3);
+    // the round's compute plus the demand misses' own wait: the simulation's
+    // 6 ms step at one lane; at three, the served round's compute, its ITL
+    // less its stall at the 262K x 3-lane default, 30 - 19.1 ms
+    // (`docs/findings/2026-10-06-flash-next-decode-round.md`), in place of
+    // the simulation's 7 ms, which three rows' 15.75 ms of link exceed by
+    // 0.7 ms. Unbudgeted, three lanes' 29 ms still fail it.
+    let fits = |t: &Tally, step: f64| t.moved_per_round() / BANDWIDTH <= step + t.cost();
+    for (t, step) in [(&one, 6e-3), (&three, 10.9e-3)] {
+        assert!(fits(t, step), "{:.2} ms", t.moved_per_round() / BANDWIDTH * 1e3);
     }
+    assert!(!fits(&three_open, 10.9e-3), "{:.2} ms", three_open.moved_per_round() / BANDWIDTH * 1e3);
 }
 
 /// Per chunk (every `every`-th): decode 256 tokens to settle, 256 measured

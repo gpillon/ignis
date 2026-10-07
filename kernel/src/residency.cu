@@ -113,7 +113,7 @@ struct Dev {
   uint32_t layers, experts, width, prefill_width;  // a decode and a prefill step's lookahead width
   uint32_t capacity[kClasses];
   unsigned long long record_bytes[kClasses];
-  unsigned long long budget, budget_row;  // a one-row decode step's, and per further row
+  unsigned long long budget_one_row, budget_per_row;  // a decode step's prefetch budget
   unsigned long long half_bytes;
   const uint8_t *cls;        // [keys] class of each projection
   const uint8_t *k2;         // [keys]
@@ -142,13 +142,14 @@ __device__ __forceinline__ uint32_t width_of(const Dev &d, uint32_t phase) {
 }
 
 // A decode step's prefetch budget for its `rows` lookahead rows (the host's PrefetchBudget::
-// bytes_for): one row's, and budget_row more per further row, saturating; no rows is one row's.
+// bytes_for): one row's, and budget_per_row more per further row, saturating to no budget; no
+// rows is one row's.
 __device__ __forceinline__ unsigned long long budget_of(const Dev &d, uint32_t rows) {
   const unsigned long long further = rows > 0 ? rows - 1 : 0;
-  if (further > 0 && d.budget_row > (IGNIS_RESIDENCY_NO_BUDGET - d.budget) / further) {
+  if (further > 0 && d.budget_per_row > (IGNIS_RESIDENCY_NO_BUDGET - d.budget_one_row) / further) {
     return IGNIS_RESIDENCY_NO_BUDGET;
   }
-  return d.budget + d.budget_row * further;
+  return d.budget_one_row + d.budget_per_row * further;
 }
 
 
@@ -904,8 +905,8 @@ int32_t ignis_residency_create(const ignis_residency_desc *desc, const uint8_t *
     v.owner[k] = reinterpret_cast<uint32_t *>(r->tables + r->layout.owner[k]);
     v.stamp[k] = reinterpret_cast<unsigned long long *>(r->tables + r->layout.stamp[k]);
   }
-  v.budget = d.prefetch_budget_bytes;
-  v.budget_row = d.prefetch_budget_row_bytes;
+  v.budget_one_row = d.prefetch_budget_one_row_bytes;
+  v.budget_per_row = d.prefetch_budget_per_row_bytes;
   v.half_bytes = d.staging_half_bytes;
   v.cls = r->tables + r->layout.cls;
   v.k2 = r->tables + r->layout.k2;

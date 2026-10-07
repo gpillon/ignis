@@ -22,7 +22,7 @@
 //! layers <L> experts <E> top_k <10>
 //! record_bytes <8 values, KClass order>
 //! capacity <8 values>
-//! width <W> prefill_width <a prefill step's W> budget <a one-row decode step's bytes, 18446744073709551615 = none> budget_row <bytes per further row>
+//! width <W> prefill_width <a prefill step's W> budget_one_row <a one-row decode step's bytes, 18446744073709551615 = none> budget_per_row <bytes per further row>
 //! k2 <L * E * 2 values, key order>
 //! warm <n> <keys, hottest first>
 //! steps <n>
@@ -223,7 +223,7 @@ fn fixture_text() -> String {
     out.push_str(&line("capacity", CAPACITY.iter().map(u32::to_string).collect()));
     let _ = writeln!(
         out,
-        "width {WIDTH} prefill_width {PREFILL_WIDTH} budget {} budget_row {}",
+        "width {WIDTH} prefill_width {PREFILL_WIDTH} budget_one_row {} budget_per_row {}",
         BUDGET.one_row_bytes, BUDGET.per_row_bytes
     );
     let mut k2 = Vec::new();
