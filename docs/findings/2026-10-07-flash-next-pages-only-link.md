@@ -29,6 +29,7 @@
   - ~9K history (`W1` 4100 words): before, after, after, before.
   - 30K history (`W1` 14500 words, 29.2-30.1K-token turn 1): after, then before.
 - Scripts: `.scratch/ab/ab.sh` in the `fn-reuse-0029` worktree, and the main checkout's `.scratch/flash-next-306-307/harness/shorttail/` (`tail.py`, `summ.py`).
+  `tail.py`'s `chunks` field assumes three pieces, so it is wrong for the after legs; the chunk counts below are the server's.
 
 **~9K history** (medians; per leg: before 1.798 and 1.802 s, after 1.460 and 1.466 s):
 
@@ -51,6 +52,16 @@
 
 - Three of the eight after-conversations are over 1.6 s: 1.607, 1.611 and 1.620 s.
 - Every turn 3 claimed turn 2's checkpoint.
+
+**Traversals, from the request log** (`ignis.request.admitted`'s `prefill_chunks_consumed`, every conversation of the first leg of each side):
+
+| turn | ~9K before | ~9K after | 30K before | 30K after |
+|---|---:|---:|---:|---:|
+| 1 (cold) | 3-4 | 3 | 6 | 5 |
+| 2 (the reused tail) | 3 | 2 | 3 | 2 |
+| 3 | 3 | 2 | 3 | 2 |
+
+A cold turn 1 at ~9K ran 3 chunks before wherever its opener's floor fell on the serving chunk's edge.
 
 **Exactness** (GPU profile, `IGNIS_GPU_PROFILE=1`):
 - `crates/runtime/tests/flash_next_reuse_gpu.rs`, BF16 and hq-e8-2b, histories of 1,500 and 9,000 tokens: the new shape is bit-exact (last logits and eight greedy tokens) against the two-span split control `[0, opener)`, `[opener, end)` for:
@@ -89,7 +100,7 @@ Inferred:
 - `--prompt-reuse off` was not run. The cold turn 1 (10.2-10.5 s at 29-30K tokens) stands in for the reuse-off number acceptance 6 asks for.
 - Acceptance 6's three-agent swarm replay was not run.
 - *Before* is this tree with the family switch off, not main's binary.
-- No profile was taken. The traversal count follows from the design and the job shapes, and the bytes agree with it.
+- No profile was taken: the traversal counts are the request log's chunk counts, not a trace.
 
 ## Follow-ups
 
