@@ -10,23 +10,66 @@ const MAGIC: &[u8; 8] = b"IGNGRAM1";
 const HEADER_BYTES: u64 = 80;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Where the cache file lives (`--persist-ngram-cache-path`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CacheLocation {
+    /// Beside the artifact, on the disk that already holds the model
+    /// (`model`, the default).
+    #[default]
+    Model,
+    /// The operating system's per-user cache directory (`auto`).
+    Auto,
+    /// A directory the operator names.
+    Directory(PathBuf),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistenceOptions {
     pub enabled: bool,
-    /// None means the operating system's per-user cache directory (`auto`).
-    pub path: Option<PathBuf>,
+    pub location: CacheLocation,
 }
 impl Default for PersistenceOptions {
     fn default() -> Self {
-        Self { enabled: true, path: None }
+        Self { enabled: true, location: CacheLocation::Model }
     }
 }
 impl PersistenceOptions {
-    pub fn directory(&self) -> Result<PathBuf, String> {
-        if let Some(path) = &self.path {
-            return Ok(path.clone());
+    /// The cache directory for `artifact`.
+    pub fn directory(&self, artifact: &Path) -> Result<PathBuf, String> {
+        match &self.location {
+            CacheLocation::Model => Ok(model_directory(artifact)),
+            CacheLocation::Auto => auto_directory(cfg!(windows), |key| std::env::var_os(key).map(PathBuf::from)),
+            CacheLocation::Directory(path) => Ok(path.clone()),
         }
-        auto_directory(cfg!(windows), |key| std::env::var_os(key).map(PathBuf::from))
+    }
+}
+fn model_directory(artifact: &Path) -> PathBuf {
+    match artifact.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+/// The cache files of `artifact` share its stem, so a new identity's file
+/// can replace the old ones: `<stem>.ngram-<first 16 hex of the key>.bin`.
+fn file_prefix(artifact: &Path) -> String {
+    let stem = artifact.file_stem().map_or_else(|| "artifact".into(), |s| s.to_string_lossy().into_owned());
+    format!("{stem}.ngram-")
+}
+/// Removes `artifact`'s other cache files in `dir` once `keep` is published:
+/// a changed budget, artifact or layout leaves its predecessor unreadable,
+/// and a 1 GB file per change would only fill the disk.
+fn prune(dir: &Path, artifact: &Path, keep: &Path) {
+    let prefix = file_prefix(artifact);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path != keep && name.starts_with(&prefix) && name.ends_with(".bin") {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::info!(path = %path.display(), "stale n-gram cache removed"),
+                Err(error) => tracing::warn!(%error, path = %path.display(), "stale n-gram cache not removed"),
+            }
+        }
     }
 }
 fn auto_directory(windows: bool, env: impl Fn(&str) -> Option<PathBuf>) -> Result<PathBuf, String> {
@@ -126,6 +169,7 @@ fn publish(path: &Path, key: &[u8; 32], bytes: &[u8]) -> Result<(), String> {
 
 pub(crate) fn load_or_build(
     options: &PersistenceOptions,
+    artifact: &Path,
     key: Result<[u8; 32], String>,
     len: usize,
     build: impl FnOnce() -> Result<Vec<u8>, String>,
@@ -133,7 +177,7 @@ pub(crate) fn load_or_build(
     if !options.enabled || len == 0 {
         return build();
     }
-    let location = key.and_then(|key| options.directory().map(|dir| (dir, key)));
+    let location = key.and_then(|key| options.directory(artifact).map(|dir| (dir, key)));
     let (dir, key) = match location {
         Ok(location) => location,
         Err(error) => {
@@ -141,8 +185,8 @@ pub(crate) fn load_or_build(
             return build();
         }
     };
-    let name: String = key.iter().map(|b| format!("{b:02x}")).collect();
-    let path = dir.join(format!("{name}.bin"));
+    let hex: String = key[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("{}{hex}.bin", file_prefix(artifact)));
     match read(&path, &key, len) {
         Ok(bytes) => {
             tracing::info!(path = %path.display(), "n-gram cache hit");
@@ -182,7 +226,10 @@ pub(crate) fn load_or_build(
     }
     if lock.is_some() {
         match publish(&path, &key, &bytes) {
-            Ok(()) => tracing::info!(path = %path.display(), bytes = len, "n-gram cache saved"),
+            Ok(()) => {
+                tracing::info!(path = %path.display(), bytes = len, "n-gram cache saved");
+                prune(&dir, artifact, &path);
+            }
             Err(error) => tracing::warn!(%error, "n-gram cache write failed; using loaded rows"),
         }
     }
@@ -228,45 +275,73 @@ mod tests {
         assert!(auto_directory(true, |_| None).is_err());
     }
     #[test]
+    fn the_default_location_is_beside_the_model() {
+        let model = PersistenceOptions::default();
+        assert_eq!(model.location, CacheLocation::Model);
+        assert_eq!(model.directory(Path::new("models/flash/model.ninfer")).unwrap(), PathBuf::from("models/flash"));
+        assert_eq!(model.directory(Path::new("model.ninfer")).unwrap(), PathBuf::from("."));
+        let named = PersistenceOptions { enabled: true, location: CacheLocation::Directory(PathBuf::from("elsewhere")) };
+        assert_eq!(named.directory(Path::new("models/model.ninfer")).unwrap(), PathBuf::from("elsewhere"));
+    }
+    #[test]
+    fn a_saved_cache_replaces_the_same_artifacts_older_files() {
+        let temp = Temp::new();
+        let artifact = temp.0.join("model.ninfer");
+        let stale = temp.0.join("model.ngram-00000000000000aa.bin");
+        let other = temp.0.join("other.ngram-00000000000000bb.bin");
+        std::fs::write(&stale, b"old").unwrap();
+        std::fs::write(&other, b"other model").unwrap();
+        let options = PersistenceOptions { enabled: true, location: CacheLocation::Model };
+        assert_eq!(load_or_build(&options, &artifact, Ok([3; 32]), 4, || Ok(vec![9; 4])).unwrap(), vec![9; 4]);
+        assert!(temp.0.join(format!("model.ngram-{}.bin", "03".repeat(8))).exists(), "saved beside the model");
+        assert!(!stale.exists(), "the same artifact's older cache is removed");
+        assert!(other.exists(), "another artifact's cache is not");
+    }
+    #[test]
     fn hit_corruption_truncation_and_version_rebuild() {
         let temp = Temp::new();
-        let options = PersistenceOptions { enabled: true, path: Some(temp.0.clone()) };
+        let artifact = temp.0.join("model.ninfer");
+        let options = PersistenceOptions { enabled: true, location: CacheLocation::Directory(temp.0.clone()) };
         let key = [3; 32];
         let data = vec![7; 100];
-        assert_eq!(load_or_build(&options, Ok(key), 100, || Ok(data.clone())).unwrap(), data);
-        assert_eq!(load_or_build(&options, Ok(key), 100, || panic!("cache hit must not read source")).unwrap(), data);
-        let path = temp.0.join(format!("{}.bin", "03".repeat(32)));
+        assert_eq!(load_or_build(&options, &artifact, Ok(key), 100, || Ok(data.clone())).unwrap(), data);
+        assert_eq!(
+            load_or_build(&options, &artifact, Ok(key), 100, || panic!("cache hit must not read source")).unwrap(),
+            data
+        );
+        let path = temp.0.join(format!("model.ngram-{}.bin", "03".repeat(8)));
         for bad in [vec![0; 180], vec![0; 12], {
             let mut b = std::fs::read(&path).unwrap();
             b[100] ^= 1;
             b
         }] {
             std::fs::write(&path, bad).unwrap();
-            assert_eq!(load_or_build(&options, Ok(key), 100, || Ok(data.clone())).unwrap(), data);
+            assert_eq!(load_or_build(&options, &artifact, Ok(key), 100, || Ok(data.clone())).unwrap(), data);
         }
         assert_eq!(read(&path, &key, 100).unwrap(), data);
     }
     #[test]
     fn disabled_unwritable_and_busy_fall_back() {
         let temp = Temp::new();
+        let artifact = temp.0.join("model.ninfer");
         let path = temp.0.join("absent");
-        let options = PersistenceOptions { enabled: false, path: Some(path.clone()) };
-        load_or_build(&options, Err("no identity".into()), 1, || Ok(vec![1])).unwrap();
+        let options = PersistenceOptions { enabled: false, location: CacheLocation::Directory(path.clone()) };
+        load_or_build(&options, &artifact, Err("no identity".into()), 1, || Ok(vec![1])).unwrap();
         assert!(!path.exists());
         std::fs::write(&path, b"file").unwrap();
-        let options = PersistenceOptions { enabled: true, path: Some(path) };
-        assert_eq!(load_or_build(&options, Ok([0; 32]), 1, || Ok(vec![1])).unwrap(), vec![1]);
-        let options = PersistenceOptions { enabled: true, path: Some(temp.0.clone()) };
+        let options = PersistenceOptions { enabled: true, location: CacheLocation::Directory(path) };
+        assert_eq!(load_or_build(&options, &artifact, Ok([0; 32]), 1, || Ok(vec![1])).unwrap(), vec![1]);
+        let options = PersistenceOptions { enabled: true, location: CacheLocation::Directory(temp.0.clone()) };
         let held = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(temp.0.join(format!("{}.lock", "00".repeat(32))))
+            .open(temp.0.join(format!("model.ngram-{}.lock", "00".repeat(8))))
             .unwrap();
         held.try_lock().unwrap();
-        assert_eq!(load_or_build(&options, Ok([0; 32]), 1, || Ok(vec![2])).unwrap(), vec![2]);
-        assert!(!temp.0.join(format!("{}.bin", "00".repeat(32))).exists());
+        assert_eq!(load_or_build(&options, &artifact, Ok([0; 32]), 1, || Ok(vec![2])).unwrap(), vec![2]);
+        assert!(!temp.0.join(format!("model.ngram-{}.bin", "00".repeat(8))).exists());
     }
     #[test]
     fn changed_source_rows_layout_and_digest_invalidate() {

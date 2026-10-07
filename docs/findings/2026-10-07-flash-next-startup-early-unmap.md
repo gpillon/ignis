@@ -173,6 +173,14 @@ Evidence: `.scratch/cache-build-final.log`, focused cache/packer/table logs,
 `.scratch/cache-workspace-tests.log` and `.scratch/cache-workspace-summary.json`.
 No changes were merged or committed into the original worktree.
 
+## Integration (owner, 2026-10-07)
+
+The cache now defaults to the artifact's own directory (`model`), on the disk
+that holds the model: `auto` (the OS per-user cache, on Windows the system
+drive) stays available, as does a named directory. Saving a new key removes
+the same artifact's older files there, so a budget change or a repack leaves
+one ~1 GB file, not one per key. The timings above were taken under `auto`.
+
 ## Integration cleanup
 
 Removed the experimental CUDA build override, `[LOAD-PROBE]` instrumentation,

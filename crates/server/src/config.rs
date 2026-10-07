@@ -108,6 +108,9 @@ pub struct Config {
     /// #234). Flat, one file per model: the artifact and its sidecar keep
     /// the names the repo publishes them under.
     pub model_download_path: PathBuf,
+    /// Flash-Next's n-gram hot-row cache between loads
+    /// (`--persist-ngram-cache` / `--persist-ngram-cache-path`): on, beside
+    /// the model, unless the operator says otherwise.
     pub ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
     pub enable_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -606,16 +609,7 @@ pub fn resolve(
         (_, api_key) => api_key,
     };
 
-    let raw = persist_ngram_cache.or_else(|| env("IGNIS_PERSIST_NGRAM_CACHE")).unwrap_or_else(|| "true".into());
-    let enabled = match raw.trim() {
-        "true" => true, "false" => false,
-        _ => return Err(ConfigError(format!("`--persist-ngram-cache` must be true or false, got `{raw}`"))),
-    };
-    let raw_path = persist_ngram_cache_path.or_else(|| env("IGNIS_PERSIST_NGRAM_CACHE_PATH")).unwrap_or_else(|| "auto".into());
-    if raw_path.is_empty() { return Err(ConfigError("`--persist-ngram-cache-path` cannot be empty".into())); }
-    let ngram_cache = ignis_core::ngram_cache::PersistenceOptions {
-        enabled, path: (raw_path != "auto").then(|| PathBuf::from(raw_path)),
-    };
+    let ngram_cache = resolve_ngram_cache(persist_ngram_cache, persist_ngram_cache_path, &env)?;
     Ok(ConfigOutcome::Config(Config {
         model,
         model_named,
@@ -680,6 +674,32 @@ fn resolve_ui(
             "`IGNIS_UI` must be true or false, got `{raw}`"
         ))),
     }
+}
+
+/// `--persist-ngram-cache` / `IGNIS_PERSIST_NGRAM_CACHE` (`true` or
+/// `false`, default `true`) and `--persist-ngram-cache-path` /
+/// `IGNIS_PERSIST_NGRAM_CACHE_PATH`: `model` (the default) puts the cache
+/// beside the artifact, `auto` in the OS per-user cache directory, anything
+/// else is that directory.
+fn resolve_ngram_cache(
+    flag: Option<String>,
+    path_flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<ignis_core::ngram_cache::PersistenceOptions, ConfigError> {
+    use ignis_core::ngram_cache::{CacheLocation, PersistenceOptions};
+    let raw = flag.or_else(|| env("IGNIS_PERSIST_NGRAM_CACHE")).unwrap_or_else(|| "true".into());
+    let enabled = match raw.trim() {
+        "true" => true,
+        "false" => false,
+        _ => return Err(ConfigError(format!("`--persist-ngram-cache` must be true or false, got `{raw}`"))),
+    };
+    let location = match path_flag.or_else(|| env("IGNIS_PERSIST_NGRAM_CACHE_PATH")).as_deref() {
+        None | Some("model") => CacheLocation::Model,
+        Some("auto") => CacheLocation::Auto,
+        Some("") => return Err(ConfigError("`--persist-ngram-cache-path` cannot be empty".into())),
+        Some(dir) => CacheLocation::Directory(PathBuf::from(dir)),
+    };
+    Ok(PersistenceOptions { enabled, location })
 }
 
 /// `--model-download` / `--no-model-download` / `IGNIS_MODEL_DOWNLOAD`
@@ -1325,7 +1345,7 @@ fn help_text() -> String {
          \x20       --model-download / --no-model-download env: IGNIS_MODEL_DOWNLOAD (default: on; fetch a missing model — asked first when stdin is a terminal, downloaded straight away when it is not; off keeps the placeholder template)\n\
          \x20       --model-download-path <dir> env: IGNIS_MODEL_DOWNLOAD_PATH (default: {DEFAULT_MODEL_DOWNLOAD_PATH}; where a fetched model lands, and where one fetched earlier is found)\n\
          \x20       --persist-ngram-cache <true|false> env: IGNIS_PERSIST_NGRAM_CACHE (default: true; persist Flash-Next hot rows)\n\
-         \x20       --persist-ngram-cache-path <auto|dir> env: IGNIS_PERSIST_NGRAM_CACHE_PATH (default: auto; Windows LOCALAPPDATA/ignis/cache/ngram, Linux XDG_CACHE_HOME/ignis/ngram or HOME/.cache/ignis/ngram)\n\
+         \x20       --persist-ngram-cache-path <model|auto|dir> env: IGNIS_PERSIST_NGRAM_CACHE_PATH (default: model, beside the artifact; auto: Windows LOCALAPPDATA/ignis/cache/ngram, Linux XDG_CACHE_HOME/ignis/ngram or HOME/.cache/ignis/ngram)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --thinking-budget <n|off> env: IGNIS_THINKING_BUDGET  (default: {DEFAULT_THINKING_BUDGET}; reasoning tokens before the model's close is forced, off = no budget; a request's thinking_budget overrides it, 0 = none)\n\
@@ -1393,17 +1413,36 @@ mod tests {
         }
     }
 
+    /// The n-gram cache is on and beside the model by default; `model`
+    /// says so explicitly, `auto` is the OS cache directory, anything else a
+    /// directory; flags win over the environment; bad values are refused.
     #[test]
     fn ngram_cache_defaults_flags_env_and_invalid_values() {
-        let default=expect_config(resolve(&[],no_env).unwrap());
-        assert!(default.ngram_cache.enabled); assert_eq!(default.ngram_cache.path,None);
-        let env=env_map(&[("IGNIS_PERSIST_NGRAM_CACHE","false"),("IGNIS_PERSIST_NGRAM_CACHE_PATH","custom")]);
-        let config=expect_config(resolve(&[],&env).unwrap());
-        assert!(!config.ngram_cache.enabled); assert_eq!(config.ngram_cache.path,Some(PathBuf::from("custom")));
-        let config=expect_config(resolve(&args(&["--persist-ngram-cache","true","--persist-ngram-cache-path","auto"]),env).unwrap());
-        assert!(config.ngram_cache.enabled); assert_eq!(config.ngram_cache.path,None);
-        for flags in [vec!["--persist-ngram-cache","yes"],vec!["--persist-ngram-cache"],vec!["--persist-ngram-cache-path"],vec!["--persist-ngram-cache-path",""]] {
-            assert!(resolve(&args(&flags),no_env).is_err());
+        use ignis_core::ngram_cache::CacheLocation;
+        let default = expect_config(resolve(&[], no_env).unwrap());
+        assert!(default.ngram_cache.enabled);
+        assert_eq!(default.ngram_cache.location, CacheLocation::Model);
+
+        let env = env_map(&[("IGNIS_PERSIST_NGRAM_CACHE", "false"), ("IGNIS_PERSIST_NGRAM_CACHE_PATH", "custom")]);
+        let config = expect_config(resolve(&[], &env).unwrap());
+        assert!(!config.ngram_cache.enabled);
+        assert_eq!(config.ngram_cache.location, CacheLocation::Directory(PathBuf::from("custom")));
+
+        let flags = args(&["--persist-ngram-cache", "true", "--persist-ngram-cache-path", "auto"]);
+        let config = expect_config(resolve(&flags, &env).unwrap());
+        assert!(config.ngram_cache.enabled);
+        assert_eq!(config.ngram_cache.location, CacheLocation::Auto);
+
+        let config = expect_config(resolve(&args(&["--persist-ngram-cache-path", "model"]), &env).unwrap());
+        assert_eq!(config.ngram_cache.location, CacheLocation::Model);
+
+        for flags in [
+            vec!["--persist-ngram-cache", "yes"],
+            vec!["--persist-ngram-cache"],
+            vec!["--persist-ngram-cache-path"],
+            vec!["--persist-ngram-cache-path", ""],
+        ] {
+            assert!(resolve(&args(&flags), no_env).is_err(), "{flags:?}");
         }
     }
     #[test]

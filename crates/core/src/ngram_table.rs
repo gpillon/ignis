@@ -260,18 +260,24 @@ impl NgramTable {
     }
     /// Close the artifact mapping before loading or restoring the hot rows.
     pub fn from_cached_artifact(
-        path: &Path, reader: Reader, bound: &FlashNextPlan, geometry: NgramGeometry,
-        options: NgramTableOptions, persistence: &crate::ngram_cache::PersistenceOptions,
+        path: &Path,
+        reader: Reader,
+        bound: &FlashNextPlan,
+        geometry: NgramGeometry,
+        options: NgramTableOptions,
+        persistence: &crate::ngram_cache::PersistenceOptions,
     ) -> Result<Self, String> {
         let mut table = Self::prepare_from_artifact(path, &reader, bound, geometry, options)?;
         let key = if persistence.enabled {
-            crate::ngram_cache::identity(path, reader.content_hash(),
-                &[table.layout.base_offset, table.layout.row_stride, table.layout.row_bytes, table.layout.rows],
-                table.hot.rows())
-        } else { Err("disabled".into()) };
+            let layout = &table.layout;
+            let words = [layout.base_offset, layout.row_stride, layout.row_bytes, layout.rows];
+            crate::ngram_cache::identity(path, reader.content_hash(), &words, table.hot.rows())
+        } else {
+            Err("disabled".into())
+        };
         drop(reader);
         let len = table.hot.len().checked_mul(table.row_bytes()).ok_or("hot cache size overflow")?;
-        table.hot_data = crate::ngram_cache::load_or_build(persistence, key, len, || table.load_hot_rows())?;
+        table.hot_data = crate::ngram_cache::load_or_build(persistence, path, key, len, || table.load_hot_rows())?;
         Ok(table)
     }
     fn prepare_from_artifact(
@@ -736,16 +742,25 @@ mod tests {
             &bound,
             geometry,
             options(3 * 94),
-            &crate::ngram_cache::PersistenceOptions { enabled: false, path: None },
+            &crate::ngram_cache::PersistenceOptions { enabled: false, location: crate::ngram_cache::CacheLocation::Model },
         )
         .unwrap();
         assert_eq!(unmapped.hot_data, table.hot_data, "early unmapping preserves all cached bytes");
         let cache_path = artifact.path.with_extension("ngram-test-cache");
-        let persistence = crate::ngram_cache::PersistenceOptions { enabled: true, path: Some(cache_path.clone()) };
+        let persistence = crate::ngram_cache::PersistenceOptions {
+            enabled: true,
+            location: crate::ngram_cache::CacheLocation::Directory(cache_path.clone()),
+        };
         for budget in [3 * 94, 3 * 94, 2 * 94] {
             let cached = NgramTable::from_cached_artifact(
-                &artifact.path, Reader::open(&artifact.path).unwrap(), &bound, geometry, options(budget), &persistence,
-            ).unwrap();
+                &artifact.path,
+                Reader::open(&artifact.path).unwrap(),
+                &bound,
+                geometry,
+                options(budget),
+                &persistence,
+            )
+            .unwrap();
             assert_eq!(cached.hot_data, table.hot_data[..cached.hot_rows() * 90]);
             let selected = [0, 3, 17, 491, 499, 999, 17];
             let mut restored = vec![0u8; selected.len() * 90];
@@ -754,7 +769,11 @@ mod tests {
             table.begin_rows(&selected).unwrap().finish(&mut expected).unwrap();
             assert_eq!(restored, expected, "restored hot rows and cold gathers agree");
         }
-        assert_eq!(std::fs::read_dir(&cache_path).unwrap().filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|ext| ext == "bin")).count(), 2);
+        let saved = std::fs::read_dir(&cache_path)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|ext| ext == "bin"))
+            .count();
+        assert_eq!(saved, 1, "the 2-row budget's cache replaced the 3-row one");
         std::fs::remove_dir_all(cache_path).unwrap();
         let selected = [0, 3, 17, 491, 499, 999, 17];
         let mut cold = vec![0u8; selected.len() * 90];
