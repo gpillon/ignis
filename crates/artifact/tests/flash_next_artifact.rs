@@ -91,15 +91,14 @@ fn the_pack_binary_packs_an_mtp_companion_beside_its_work_tree() {
     assert!(reader.find("mtp.fc_hidden.weight").is_some());
 }
 
-/// The real artifact, when present: the reader parses it, the binder
-/// consumes every object, the sidecar invariants hold, and every layer's
-/// expert bytes are the converter's `experts.bin`.
-#[test]
-fn real_flash_next_artifact_binds_every_object() {
+/// The real artifact's path, or `None` (with the reason printed) when this
+/// machine has none -- a CI runner, or a conversion still in progress. A
+/// conversion recorded complete with no artifact is a failure, not a skip.
+fn real_artifact_path() -> Option<std::path::PathBuf> {
     let model_dir = Path::new(MODEL_DIR);
     if !model_dir.exists() {
         eprintln!("skip: {MODEL_DIR} does not exist");
-        return;
+        return None;
     }
     let path = model_dir.join(ARTIFACT_FILE_NAME);
     if !path.exists() {
@@ -116,8 +115,17 @@ fn real_flash_next_artifact_binds_every_object() {
             model_dir.join("work").display()
         );
         eprintln!("skip: the conversion in {MODEL_DIR} has not completed");
-        return;
+        return None;
     }
+    Some(path)
+}
+
+/// The real artifact, when present: the reader parses it, the binder
+/// consumes every object and the sidecar invariants hold. Seconds: nothing
+/// here reads the 71.8 GB of payload.
+#[test]
+fn real_flash_next_artifact_binds_every_object() {
+    let Some(path) = real_artifact_path() else { return };
     let reader = Reader::open(&path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let geometry = FlashNextGeometry::qwen38_flash_next();
     let bound = flash_next::bind(&reader, &geometry)
@@ -131,6 +139,21 @@ fn real_flash_next_artifact_binds_every_object() {
     let sidecar = Sidecar::load(Path::new(&sidecar_path))
         .unwrap_or_else(|e| panic!("load {sidecar_path}: {e}"));
     assert!(verify(&reader, &sidecar).unwrap().is_clean(), "file size and object count hold");
+}
+
+/// Every layer's expert bytes in the real artifact are the converter's
+/// `experts.bin`. Ignored: it hashes tens of GB, minutes on every
+/// `cargo test`. Run it after a conversion or a repack:
+/// `cargo test -p ignis-artifact --test flash_next_artifact -- --ignored`
+/// (the GPU profile's `--ignored` leg runs it too).
+#[test]
+#[ignore = "hashes every expert byte of the real 71.8 GB artifact: run after a conversion or repack"]
+fn real_flash_next_expert_bytes_are_the_converters() {
+    let Some(path) = real_artifact_path() else { return };
+    let reader = Reader::open(&path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let bound = flash_next::bind(&reader, &FlashNextGeometry::qwen38_flash_next())
+        .unwrap_or_else(|e| panic!("bind {}: {e}", path.display()));
+    let sidecar_path = format!("{}.conversion.json", path.display());
     let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
     assert_eq!(
         flash_next::check_experts_sha256(&reader, &bound.experts, &record).unwrap(),
