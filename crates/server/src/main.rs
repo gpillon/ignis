@@ -278,6 +278,9 @@ async fn main() {
         model_download,
         model_download_path,
         ngram_cache,
+        // GitHub #306: read through `EngineShape`, like the other load-shape
+        // knobs.
+        ngram_hot_bytes: _,
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
         thinking_budget: default_thinking_budget,

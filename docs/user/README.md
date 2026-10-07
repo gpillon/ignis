@@ -235,8 +235,35 @@ hold one full context refuses the start.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
+| `--ngram-hot-bytes <bytes\|auto>` | `IGNIS_NGRAM_HOT_BYTES` | `1G` | The Flash-Next n-gram rows held in RAM, index included (accepts `K`/`M`/`G`; `0` holds none). Every other row is read from the artifact on NVMe when a step needs it. `auto`: what the host plan leaves after its other lines and the 6 GiB margin (below). The 27B has no n-gram table and refuses the flag. (`make` knob `NGRAM_HOT_BYTES`.) |
 | `--persist-ngram-cache <true\|false>` | `IGNIS_PERSIST_NGRAM_CACHE` | `true` | Keep a compact copy of the selected Flash-Next hot rows on disk. `false` reads and writes no persistent n-gram cache. |
 | `--persist-ngram-cache-path <model\|auto\|dir>` | `IGNIS_PERSIST_NGRAM_CACHE_PATH` | `model` | Cache directory. `model` is the artifact's own directory, on the disk that already holds the model. An explicit relative directory is relative to the server's working directory. |
+
+The table is 28.8 GB (320,001,536 rows of 90 bytes); the artifact ranks its
+15,642,665 most frequent rows (1.37 GiB with their index), and the hot rows
+are the head of that ranking that fits the budget. What a budget holds:
+
+- **Up to 1.37 GiB:** that many ranked rows. The default 1 GiB holds 11.4M of
+  them.
+- **Past the ranking and short of the whole table:** the whole ranking and no
+  more. Nothing says which other rows are worth the RAM, so `4G` holds what
+  `2G` holds.
+- **The whole table (`27G` or more; 28.8 GB is 26.8 GiB):** every row, loaded at start by one
+  sequential read of the table, and no step reads the NVMe again
+  (`ignis_ngram_reads_total` stays at 0). It takes as long as reading 28.8 GB
+  from the artifact's disk, and that load is never written to a cache file:
+  the artifact already is its copy on disk.
+
+`auto` picks among those: the whole table when the host plan has room for it,
+otherwise the whole ranking when it fits, otherwise the room rounded down to
+whole GiB and never below the 1 GiB default, which the plan then refuses
+exactly where it would refuse the default. So `auto` never refuses a start the
+default would make, and the rows it picks, which key the cache file, change
+only when free RAM crosses one of those steps rather than at every start. The
+host plan (`ignis.runtime.flash_next_host_plan`) logs the budget it resolved
+(`ngram_hot_budget`) and what the table will hold (`ngram_hot_rows_bytes`);
+`ignis.ngram.hot_rows` logs the rows loaded and how long the load took
+(`duration_ms`).
 
 `model` writes `<artifact stem>.ngram-<key>.bin` beside the artifact. `auto`
 uses `%LOCALAPPDATA%\ignis\cache\ngram` on Windows, and
@@ -275,9 +302,14 @@ naming the plan line to shrink. The knobs that lower it, with what each costs:
 |---|---|---|---|
 | `RETAINED_HOST` | `--retained-host <n>` | ~125 MiB per slot below the default 8 | Fewer retained prompt checkpoints and shared prefixes: a returning agent or a subagent sharing a system block prefills what no slot kept. `0` retains nothing on the host. |
 | `KV_HOST_POOL_BYTES` | `--kv-host-pool-bytes <n>` | up to the 2 GiB arena (`0` turns it off) | The KV-RAM tier holds fewer suspended requests: under VRAM pressure a request that cannot be parked there is evicted and prefilled again. |
-| n-gram hot rows | none yet | up to 1 GB | The 1 GiB hot-row budget is not a server flag today, so nothing lowers it. |
+| `NGRAM_HOT_BYTES` | `--ngram-hot-bytes <n>` | up to the 1 GiB default (`0` holds none) | Each n-gram row not held in RAM is read from NVMe when a step needs it: more reads per token, and slower prefill. |
 
 Check `make config MODEL=flash-next` for the lines a start will use.
+
+A host with RAM to spare can go the other way: `--ngram-hot-bytes auto`
+(`make MODEL=flash-next NGRAM_HOT_BYTES=auto`) gives the hot rows what the
+plan leaves, and with about 28 GB more available than the figure above
+(~75 GB) it holds the whole table and the NVMe is out of the decode path.
 
 ### Vision
 

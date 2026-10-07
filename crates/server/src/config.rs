@@ -112,6 +112,11 @@ pub struct Config {
     /// (`--persist-ngram-cache` / `--persist-ngram-cache-path`): on, beside
     /// the model, unless the operator says otherwise.
     pub ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
+    /// Flash-Next's n-gram hot-row budget (`--ngram-hot-bytes` /
+    /// `IGNIS_NGRAM_HOT_BYTES`, GitHub #306): a size, or `auto` for what the
+    /// host plan leaves. `None`: the 1 GiB default. The 27B has no n-gram
+    /// table and refuses it.
+    pub ngram_hot_bytes: Option<ignis_core::ngram_table::HotBudget>,
     pub enable_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The server-wide thinking budget (`--thinking-budget` /
@@ -409,6 +414,7 @@ pub fn resolve(
     let mut model_download_path = None;
     let mut persist_ngram_cache = None;
     let mut persist_ngram_cache_path = None;
+    let mut ngram_hot_bytes = None;
     let mut metrics_on = false;
     let mut metrics_bind = None;
     let mut api_key = None;
@@ -470,6 +476,7 @@ pub fn resolve(
             }
             "--persist-ngram-cache" => persist_ngram_cache = Some(take_value(args, &mut i, flag)?),
             "--persist-ngram-cache-path" => persist_ngram_cache_path = Some(take_value(args, &mut i, flag)?),
+            "--ngram-hot-bytes" => ngram_hot_bytes = Some(take_value(args, &mut i, flag)?),
             "--metrics" => metrics_on = true,
             "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
             "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
@@ -636,12 +643,14 @@ pub fn resolve(
     };
 
     let ngram_cache = resolve_ngram_cache(persist_ngram_cache, persist_ngram_cache_path, &env)?;
+    let ngram_hot_bytes = resolve_ngram_hot_bytes(ngram_hot_bytes, &env)?;
     Ok(ConfigOutcome::Config(Config {
         model,
         model_named,
         bind,
         artifact,
         ngram_cache,
+        ngram_hot_bytes,
         model_download: resolve_model_download(model_download, &env)?,
         model_download_path: non_empty(
             model_download_path.or_else(|| env("IGNIS_MODEL_DOWNLOAD_PATH")),
@@ -728,6 +737,25 @@ fn resolve_ngram_cache(
         Some(dir) => CacheLocation::Directory(PathBuf::from(dir)),
     };
     Ok(PersistenceOptions { enabled, location })
+}
+
+/// `--ngram-hot-bytes` / `IGNIS_NGRAM_HOT_BYTES` (GitHub #306): a byte count
+/// (`parse_bytes`'s suffixes; `0` holds no hot row) or `auto`. Unnamed is
+/// `None`, the 1 GiB default.
+fn resolve_ngram_hot_bytes(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<ignis_core::ngram_table::HotBudget>, ConfigError> {
+    use ignis_core::ngram_table::HotBudget;
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_NGRAM_HOT_BYTES"))) else {
+        return Ok(None);
+    };
+    if raw.trim() == "auto" {
+        return Ok(Some(HotBudget::Auto));
+    }
+    parse_bytes("--ngram-hot-bytes", &raw)
+        .map(|bytes| Some(HotBudget::Bytes(bytes)))
+        .map_err(|_| ConfigError(format!("`--ngram-hot-bytes` expects a byte count or auto, got `{raw}`")))
 }
 
 /// `--model-download` / `--no-model-download` / `IGNIS_MODEL_DOWNLOAD`
@@ -1000,6 +1028,9 @@ pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, 
             family.name(),
             ignis_core::N_DECODE_LANES
         )));
+    }
+    if let Some(budget) = config.ngram_hot_bytes.filter(|_| family != ModelFamily::FlashNext) {
+        return Err(ConfigError(format!("`--ngram-hot-bytes {budget}`: {} has no n-gram table", family.name())));
     }
     // Flash-Next attends with its own QSA, not the GQA op, so only the 27B
     // is bound by the GQA envelope (GitHub #228).
@@ -1396,6 +1427,7 @@ fn help_text() -> String {
     let n_decode_lanes = ignis_core::N_DECODE_LANES;
     let default_vram_headroom_gib = DEFAULT_VRAM_HEADROOM_BYTES / (1024 * 1024 * 1024);
     let default_host_pool_gib = DEFAULT_HOST_POOL_BYTES / (1024 * 1024 * 1024);
+    let default_ngram_hot_gib = ignis_core::ngram_table::DEFAULT_HOT_BYTES / (1024 * 1024 * 1024);
     format!(
         "ignis-server: the OpenAI-compatible HTTP entrypoint\n\
          \n\
@@ -1409,6 +1441,7 @@ fn help_text() -> String {
          \x20       --model-download-path <dir> env: IGNIS_MODEL_DOWNLOAD_PATH (default: {DEFAULT_MODEL_DOWNLOAD_PATH}; where a fetched model lands, and where one fetched earlier is found)\n\
          \x20       --persist-ngram-cache <true|false> env: IGNIS_PERSIST_NGRAM_CACHE (default: true; persist Flash-Next hot rows)\n\
          \x20       --persist-ngram-cache-path <model|auto|dir> env: IGNIS_PERSIST_NGRAM_CACHE_PATH (default: model, beside the artifact; auto: Windows LOCALAPPDATA/ignis/cache/ngram, Linux XDG_CACHE_HOME/ignis/ngram or HOME/.cache/ignis/ngram)\n\
+         \x20       --ngram-hot-bytes <b|auto> env: IGNIS_NGRAM_HOT_BYTES (default: {default_ngram_hot_gib} GiB; Flash-Next only: the n-gram rows held in RAM, every other row read from NVMe when a step needs it; accepts a K/M/G suffix; auto = what the host plan leaves after its other lines and the 6 GiB margin, the whole ~29 GB table when that fits, never below the default; a budget that holds the whole table reads no row from NVMe and writes no cache file)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --thinking-budget <n|off> env: IGNIS_THINKING_BUDGET  (default: {DEFAULT_THINKING_BUDGET}; reasoning tokens before the model's close is forced, off = no budget; a request's thinking_budget overrides it, 0 = none)\n\
@@ -2621,6 +2654,45 @@ mod tests {
         assert!(served_model_for(&flag, ModelFamily::FlashNext).is_ok());
         let err = served_model_for(&flag, ModelFamily::Qwen38_27b).expect_err("a fixed lane count");
         assert!(err.0.contains("--decode-lanes 1") && err.0.contains("fixed"), "{}", err.0);
+    }
+
+    /// `--ngram-hot-bytes` (GitHub #306): unnamed is `None`, the 1 GiB
+    /// default the load always had; a size or `auto`, from the flag or the
+    /// environment, the flag winning; anything else is refused, and so is
+    /// any value on the 27B, which has no n-gram table.
+    #[test]
+    fn ngram_hot_bytes_parse_and_refuse_the_27b() {
+        use ignis_core::ngram_table::HotBudget;
+        let default = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(default.ngram_hot_bytes, None);
+        for (raw, budget) in [("4G", HotBudget::Bytes(4 << 30)), ("auto", HotBudget::Auto), ("0", HotBudget::Bytes(0))] {
+            let config = expect_config(resolve(&args(&["--ngram-hot-bytes", raw]), no_env).expect("resolve"));
+            assert_eq!(config.ngram_hot_bytes, Some(budget), "{raw}");
+        }
+        let env = env_map(&[("IGNIS_NGRAM_HOT_BYTES", "auto")]);
+        assert_eq!(expect_config(resolve(&[], &env).expect("resolve")).ngram_hot_bytes, Some(HotBudget::Auto));
+        let flag = expect_config(resolve(&args(&["--ngram-hot-bytes", "512M"]), &env).expect("resolve"));
+        assert_eq!(flag.ngram_hot_bytes, Some(HotBudget::Bytes(512 << 20)), "the flag wins over the env");
+        for raw in ["lots", "-1", "auto2"] {
+            let err = resolve(&args(&["--ngram-hot-bytes", raw]), no_env).expect_err("not a budget");
+            assert!(err.0.contains("--ngram-hot-bytes") && err.0.contains("auto") && err.0.contains(raw), "{}", err.0);
+        }
+        assert!(resolve(&args(&["--ngram-hot-bytes"]), no_env).is_err());
+        assert!(served_model_for(&flag, ModelFamily::FlashNext).is_ok());
+        assert!(served_model_for(&default, ModelFamily::Qwen38_27b).is_ok());
+        let err = served_model_for(&flag, ModelFamily::Qwen38_27b).expect_err("no n-gram table");
+        assert!(err.0.contains(&format!("--ngram-hot-bytes {}", 512 << 20)) && err.0.contains("n-gram"), "{}", err.0);
+    }
+
+    #[test]
+    fn help_lists_the_ngram_hot_bytes_flag_with_its_default_and_auto() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
+            panic!("expected Help");
+        };
+        let line = text.lines().find(|l| l.contains("--ngram-hot-bytes")).expect("help documents --ngram-hot-bytes");
+        for needle in ["IGNIS_NGRAM_HOT_BYTES", "default: 1 GiB", "auto", "whole"] {
+            assert!(line.contains(needle), "{needle} missing: {line}");
+        }
     }
 
     #[test]

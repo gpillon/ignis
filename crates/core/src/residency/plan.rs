@@ -159,6 +159,21 @@ pub fn plan_host(request: &HostPlanRequest) -> Result<HostPlan, HostPlanError> {
     })
 }
 
+/// What the host plan leaves its n-gram hot-row line (`--ngram-hot-bytes
+/// auto`, GitHub #306): the available memory past the margin and every
+/// other line. `request.ngram_hot_rows_bytes` is not read, so a line no
+/// larger than this is one [`plan_host`] accepts.
+pub fn ngram_hot_rows_room(request: &HostPlanRequest) -> u64 {
+    let others = host_lines(request)
+        .iter()
+        .filter(|(name, _)| *name != "ngram_hot_rows")
+        .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes));
+    request
+        .available_physical_bytes
+        .saturating_sub(HOST_MARGIN_BYTES)
+        .saturating_sub(others)
+}
+
 /// The sidecar's `expert_traffic`: calibration selections per (layer,
 /// expert), layer-major, checked against the catalog it describes. Both the
 /// pool split and the warm start read it.

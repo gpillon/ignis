@@ -178,6 +178,30 @@ fn the_hot_set_is_the_ranked_lists_head_within_the_budget() {
 }
 
 #[test]
+fn a_whole_table_cache_serves_every_row_from_its_own_slot_and_plans_no_read() {
+    // A budget that holds the whole table (GitHub #306): every row is in RAM
+    // at slot = row id, whatever the ranking held, and costs no index.
+    let table = Table::write("whole", 2000, 1000, ROW_BYTES);
+    let hot = HotRows::whole(table.layout.rows, ROW_BYTES).expect("whole table");
+    assert!(hot.is_whole());
+    assert_eq!(hot.len(), 2000);
+    assert_eq!(hot.bytes(), 2000 * ROW_BYTES, "a whole table needs no index");
+    let straddling = straddling_row(&table.layout);
+    let rows = [1999, 0, 7, 7, 1000, straddling, 1998];
+    let plan = plan_gather(&rows, &hot, &table.layout, POLICY).expect("plan");
+    assert!(plan.reads.is_empty(), "{:?}", plan.reads);
+    for (source, &row) in plan.sources.iter().zip(&rows) {
+        assert_eq!(*source, RowSource::Hot { slot: row as usize });
+    }
+    let every_row: Vec<u8> = (0..2000).flat_map(row_content).collect();
+    let mut out = vec![0u8; rows.len() * ROW_BYTES as usize];
+    plan.gather(&every_row, &[], &mut out).expect("gather");
+    assert_rows(&out, &rows);
+    // The table's bounds still hold.
+    assert!(plan_gather(&[2000], &hot, &table.layout, POLICY).is_err());
+}
+
+#[test]
 fn loading_the_hot_rows_is_a_gather_of_its_own() {
     // The cache's rows are read from the table at load with the same plan,
     // in slot order.

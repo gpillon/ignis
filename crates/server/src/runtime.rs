@@ -78,6 +78,10 @@ pub struct EngineShape {
     /// [`ignis_core::RopeScaling::NONE`] is the linear one, a YaRN factor
     /// rescales the checkpoint's trained position envelope.
     pub rope_scaling: ignis_core::RopeScaling,
+    /// Flash-Next's n-gram hot-row budget (`--ngram-hot-bytes`, GitHub
+    /// #306): 1 GiB unless named; `auto` is resolved against the host plan
+    /// at load.
+    pub ngram_hot: ignis_core::ngram_table::HotBudget,
 }
 
 impl Default for EngineShape {
@@ -106,6 +110,7 @@ impl Default for EngineShape {
             decode_lanes: 0,
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
+            ngram_hot: ignis_core::ngram_table::HotBudget::default(),
         }
     }
 }
@@ -133,6 +138,7 @@ impl From<&crate::config::Config> for EngineShape {
             decode_lanes: config.decode_lanes.unwrap_or(0),
             vision: config.vision,
             rope_scaling: config.rope_scaling,
+            ngram_hot: config.ngram_hot_bytes.unwrap_or_default(),
         }
     }
 }
@@ -554,9 +560,10 @@ pub fn flash_next_scheduler_with_ngram_cache(
     use ignis_core::compute::ModelConfig;
     use ignis_core::flash_next::{EngineOptions, LOOKAHEAD_WIDTH};
     use ignis_core::residency::load::{catalog, pool_layout};
+    use ignis_core::ngram_table::{HotBudget, NgramTable};
     use ignis_core::residency::{
-        available_physical_bytes, plan_host, prefill_staging_ring_bytes, residency_table_bytes, HostPlanRequest,
-        EXPERT_CACHE_FLOOR_BYTES,
+        available_physical_bytes, ngram_hot_rows_room, plan_host, prefill_staging_ring_bytes, residency_table_bytes,
+        HostPlanRequest, EXPERT_CACHE_FLOOR_BYTES,
     };
     use ignis_core::seq::SeqPool;
     use ignis_runtime::{FlashNextLeaf, KV_PAGE_TOKENS};
@@ -684,26 +691,46 @@ pub fn flash_next_scheduler_with_ngram_cache(
     // The host plan (spec flash-next/03), measured before the first pinned
     // allocation: the expert pool and the n-gram hot rows must leave the
     // margin, or the start is refused naming the line that crosses it.
-    if let Some(available) = available_physical_bytes() {
-        let host = plan_host(&HostPlanRequest {
-            available_physical_bytes: available,
-            expert_pool_bytes: pool_layout(&plan.experts).bytes,
-            ngram_hot_rows_bytes: options.ngram.hot_bytes,
-            staging_bytes: 0,
-            retained_host_slots_bytes: pool_plan.retained_host_bytes,
-            kv_ram_arena_bytes: options.kv_ram_arena_bytes,
-        })
-        .map_err(|e| e.to_string())?;
+    let footprint = NgramTable::footprint(
+        &reader,
+        &plan,
+        config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?,
+    )?;
+    let mut host_request = available_physical_bytes().map(|available| HostPlanRequest {
+        available_physical_bytes: available,
+        expert_pool_bytes: pool_layout(&plan.experts).bytes,
+        ngram_hot_rows_bytes: 0,
+        staging_bytes: 0,
+        retained_host_slots_bytes: pool_plan.retained_host_bytes,
+        kv_ram_arena_bytes: options.kv_ram_arena_bytes,
+    });
+    // GitHub #306: `--ngram-hot-bytes` as named, or `auto` from the room the
+    // other lines leave; the line charges what the table will hold.
+    options.ngram.hot_bytes = shape.ngram_hot.resolve(&footprint, host_request.as_ref().map(ngram_hot_rows_room));
+    let ngram_hot_rows_bytes = footprint.held_bytes(options.ngram.hot_bytes);
+    if let Some(request) = host_request.as_mut() {
+        request.ngram_hot_rows_bytes = ngram_hot_rows_bytes;
+        let host = plan_host(request).map_err(|e| e.to_string())?;
         // hotpath-lint-allow: one line per model load.
         tracing::info!(
             name: "ignis.runtime.flash_next_host_plan",
-            available_bytes = available,
+            available_bytes = request.available_physical_bytes,
             planned_bytes = host.total_bytes,
             left_bytes = host.left_bytes,
+            ngram_hot_budget = %shape.ngram_hot,
+            ngram_hot_rows_bytes,
+            ngram_whole_table = footprint.is_whole(options.ngram.hot_bytes),
             retained_host_slots = options.retained_host_slots,
             retained_host_bytes = pool_plan.retained_host_bytes,
             kv_ram_arena_bytes = options.kv_ram_arena_bytes,
             "flash-next host plan"
+        );
+    } else if shape.ngram_hot == HotBudget::Auto {
+        // hotpath-lint-allow: one line per model load.
+        tracing::warn!(
+            name: "ignis.runtime.flash_next_host_plan",
+            ngram_hot_rows_bytes,
+            "the host's available memory is unreadable: --ngram-hot-bytes auto holds the 1 GiB default"
         );
     }
     drop(reader);
@@ -937,6 +964,22 @@ mod tests {
     }
 
     #[test]
+    fn the_ngram_hot_budget_reaches_the_engine_shape_and_defaults_to_1_gib() {
+        use ignis_core::ngram_table::{HotBudget, DEFAULT_HOT_BYTES};
+        let shape_of = |flags: &[&str]| {
+            let args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).expect("resolve")
+            else {
+                panic!("expected a runnable config");
+            };
+            EngineShape::from(&config).ngram_hot
+        };
+        assert_eq!(shape_of(&[]), HotBudget::Bytes(DEFAULT_HOT_BYTES));
+        assert_eq!(shape_of(&["--ngram-hot-bytes", "auto"]), HotBudget::Auto);
+        assert_eq!(shape_of(&["--ngram-hot-bytes", "32G"]), HotBudget::Bytes(32 << 30));
+    }
+
+    #[test]
     fn the_operator_prefill_chunk_reaches_the_scheduler_config() {
         let shape = EngineShape {
             prefill_chunk: 512,
@@ -957,6 +1000,7 @@ mod tests {
             decode_lanes: 0,
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
+            ngram_hot: ignis_core::ngram_table::HotBudget::Auto,
         };
 
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);

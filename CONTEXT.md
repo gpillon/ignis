@@ -147,7 +147,8 @@ When output names a domain concept, use the term as defined here.
   each sublayer reading a learned mix and writing back through a gated residual.
 - **N-gram table** — Flash-Next's hashed n-gram embedding table (320M rows,
   INT4), a **host-streamed** object: read row by row from NVMe through a RAM
-  hot-row cache, never materialized on the device.
+  hot-row cache (or held whole in RAM when the hot-row budget covers it),
+  never materialized on the device.
 - **MTP head** — the checkpoint's own one-layer draft head (spec
   `flash-next/07`): it combines the trunk's pre-mixer streams with the next
   token's embedding and drafts the token after it.
