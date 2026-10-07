@@ -208,7 +208,9 @@ on a 5090 that is the better setting for most uses. Before turning it on:
   These figures leave out the 1.1 GB the head takes from the expert cache,
   so the served cost at several lanes is a little higher.
 - **Use it** when one user or one agent works at a time: `--spec mtp
-  --draft-rows 3`. **Leave it off** when several agents decode together.
+  --draft-rows 3`, or serve a single lane outright (`make MODEL=flash-next
+  LANES=1 SPEC=mtp`), which also gives the expert cache ~2.4 GB the other
+  lanes' KV would hold. **Leave it off** when several agents decode together.
 - A card that holds every expert in VRAM (96 GB) copies none over PCIe,
   which is where MTP should pay most. It is not measured there yet.
 
