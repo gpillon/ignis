@@ -552,7 +552,8 @@ async fn main() {
                 Server::new(engine, Box::new(provider.with_vision(processor))).with_media(Arc::new(acquirer))
             }
         };
-        server.with_family(family)
+        // GitHub #129: a loaded model is ready only after its first traversal.
+        server.with_family(family).with_warm_up()
     } else {
         // Why there is no artifact was said once, with its reason, where the
         // decision was made (`ignis.model.placeholder_template` above).

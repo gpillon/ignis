@@ -319,6 +319,15 @@ refusal that names the real limit — the context — rather than a byte count.
 matching status: 400 bad request, 404 unknown model, 413 oversized request, 503
 engine full, 504 the engine did not finish in the timeout.
 
+**Readiness.** A loaded model is not served the moment it is on the GPU: the
+server first runs one two-token request through the scheduler so the decode
+graphs are captured, and until that is done every `/v1` route answers `503`
+with code `server_not_ready` and `Retry-After: 1` (a preflight and `/v1/docs`
+still answer). The `ignis.process.ready` log event, with `warm_up_ms`, marks
+the moment it admits requests; `make start` waits for it, since it waits for
+`/v1/models` to answer. The warm-up is one request in the counters, and the
+CPU mock, which has nothing to capture, is ready at once.
+
 ### Chat completions
 
 Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,

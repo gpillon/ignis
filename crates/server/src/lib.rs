@@ -136,7 +136,20 @@ pub struct Server {
     /// readouts: an image or a `/v1/decide` request to it is refused naming
     /// it (spec flash-next/04). The 27B by default.
     pub family: ignis_core::compute::ModelFamily,
+    /// Whether the load has run its first traversal (GitHub #129). `true`
+    /// unless [`Server::with_warm_up`] held it back: every `/v1` route
+    /// answers 503 `server_not_ready` until it flips, so no request pays the
+    /// decode-graph capture on its first token. Shared by every clone, like
+    /// the engine.
+    pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// The one token the warm-up prompts with: id 1 exists in every vocabulary
+/// this server loads, and what the model says to it is discarded.
+const WARM_UP_TOKEN: ignis_core::TokenId = 1;
+
+/// How long the warm-up may take: the first decode captures its graphs.
+const WARM_UP_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl Server {
     /// A server over `engine`'s scheduler with the given template provider.
@@ -163,7 +176,75 @@ impl Server {
             wall_clock: std::sync::Arc::new(telemetry::SystemClock),
             seedless_seed: None,
             family: ignis_core::compute::ModelFamily::Qwen38_27b,
+            ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
+    }
+
+    /// Hold the API back until [`Server::warm_up`] has run (GitHub #129):
+    /// the serve loops run it before the first `/v1` request is admitted.
+    /// Without this a server is ready as constructed (the mock, the tests).
+    pub fn with_warm_up(self) -> Self {
+        self.ready.store(false, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    /// Whether the `/v1` routes admit requests.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The first traversal (GitHub #129): one two-token request through the
+    /// scheduler, so the prefill and decode kernels have run and the decode
+    /// graphs are captured before a client's request needs them, then the
+    /// API is marked ready and `ignis.process.ready` says how long it took.
+    /// A warm-up that does not complete is an error and leaves the server
+    /// not ready: better refused than silently cold.
+    pub async fn warm_up(&self) -> Result<Duration, String> {
+        let started = std::time::Instant::now();
+        let input = ignis_core::RequestInput {
+            decision: None,
+            constrained: None,
+            forced_literal: None,
+            warm_up: false,
+            multimodal: None,
+            opener_tokens: None,
+            user_turn_tokens: None,
+            system_block_tokens: None,
+            reuse_boundaries: Vec::new(),
+            model: self.engine.model_id(),
+            tokens: vec![WARM_UP_TOKEN],
+            params: ignis_core::DecodeParams { max_tokens: Some(2), ..ignis_core::DecodeParams::default() },
+        };
+        let (_, mut events) = self
+            .engine
+            .submit(input, ignis_core::RequestClass::Interactive)
+            .await
+            .map_err(|err| format!("the warm-up request was refused: {err:?}"))?;
+        engine::collect_completion(&mut events, WARM_UP_TIMEOUT)
+            .await
+            .map_err(|err| format!("the warm-up request did not complete: {err:?}"))?;
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        let took = started.elapsed();
+        tracing::info!(
+            name: "ignis.process.ready",
+            warm_up_ms = took.as_millis() as u64,
+            "first traversal done: the API admits requests"
+        );
+        Ok(took)
+    }
+
+    /// Run [`Server::warm_up`] now if the API is held back, on its own task
+    /// so the listener is already answering (503) meanwhile.
+    fn spawn_warm_up(&self) {
+        if self.is_ready() {
+            return;
+        }
+        let server = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = server.warm_up().await {
+                tracing::error!(name: "ignis.process.warm_up_failed", %error, "still not ready");
+            }
+        });
     }
 
     /// Serve `family` (see [`Server::family`]).
@@ -358,6 +439,7 @@ impl Server {
         use std::future::IntoFuture;
 
         let app = self.app();
+        self.spawn_warm_up();
         let (metrics_listener, metrics_app) = match (metrics_listener, self.metrics_app()) {
             (None, _) => {
                 return axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
