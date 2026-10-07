@@ -5,7 +5,7 @@
 - Observed: 2026-10-07
 - Last verified: 2026-10-07
 - Scope: serving / 27B prefill chunk width, prefill/decode interleaving (decode share), VRAM plan; kernel / CUDA-graph prefill feasibility
-- Related: [#92](https://github.com/gpillon/ignis/issues/92) (criteria 2-4), [Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md) (criterion 1), [The prefill "other" class](2026-09-30-prefill-other-class.md), [Decode round anatomy](2026-09-18-decode-round-anatomy.md), [Flash-Next prefill chunk and the decode share](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md), [ADR 0019](../adr/0019-decode-cuda-graph-slot-indirection.md), [ADR 0037](../adr/0037-a-vendored-file-may-carry-a-correctness-patch.md), [#272](https://github.com/gpillon/ignis/issues/272), `.scratch/issue-92-2026-10-07/`
+- Related: [#92](https://github.com/gpillon/ignis/issues/92) (criteria 2-4), [Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md) (criterion 1), [The prefill "other" class](2026-09-30-prefill-other-class.md), [Decode round anatomy](2026-09-18-decode-round-anatomy.md), [Flash-Next prefill chunk and the decode share](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md), [ADR 0019](../adr/0019-decode-cuda-graph-slot-indirection.md), [ADR 0020](../adr/0020-batch-wide-decode-round.md), [ADR 0037](../adr/0037-a-vendored-file-may-carry-a-correctness-patch.md), [#272](https://github.com/gpillon/ignis/issues/272), `.scratch/issue-92-2026-10-07/`
 - Superseded by: none
 
 ## Question
@@ -113,18 +113,28 @@ Observed:
    - At 32K: 2048 saves 2.2%, 4096 saves 3.8%, 8192 saves 3.5%.
    - At 8K: 2048 saves 1.4%, 4096 nothing, and 8192 costs 7.2%.
    - The two 1024 legs, first and last, agree within 0.1% at 8K and 0.2% at
-     32K, so the differences are real but small.
+     32K, so the differences are real but small. 8192's 8K loss shows in the
+     server's own admission-to-first-token durations too (890-921 ms against
+     831-852 at 1024).
 2. **The decoding lanes pay in proportion to the width.**
-   - With the 27B's share of 0, each chunk is followed by exactly one round. A
-     lane's longest gap is therefore one chunk plus a round: 231-234 ms at 1024,
-     387 at 2048, 702 at 4096 and 1,294 at 8192 (5.6x).
+   - With the 27B's share of 0, each traversal is followed by exactly one
+     round, so a lane sees one long gap per traversal: 34 at 1024, 10 at 4096,
+     6 at 8192 (one rep, `stall.jsonl`). Each gap grows with the prefix the
+     traversal attends to: 101 to 170 ms across 1024's full chunks, 336 to
+     570 ms at 4096, 695 to 984 ms at 8192.
+   - The longest gap is 231-234 ms at 1024, 387 at 2048, 702 at 4096 and
+     1,294 at 8192 (5.6x). It is the traversal that ends at the prompt's
+     publish point, ~55 ms above the trend at 1024. That traversal also
+     captures the prompt's checkpoint into a host retained slot and, with the
+     slots full, evicts one (inferred: the 2026-09-30 capture puts these at
+     ~25 and ~30 ms).
    - The lanes' rate during the prefill falls from 8.9 tok/s (16% of their
      54.6) to 5.9, 4.3 and 3.4.
 3. **The larger gain under load is the lanes' time moving to the prompt.**
    - With two lanes decoding, the prompt's TTFT falls 8% at 2048, 12% at 4096
      and 15% at 8192 against 1024's 4.66 s.
    - Under load the prompt pays about one 18-25 ms round per traversal: 0.62 s
-     over 1024's 34 traversals, 0.15 s over 8192's 6. A wider chunk means fewer
+     over 1024's 34 traversals, 0.13-0.15 s over 8192's 6. A wider chunk means fewer
      traversals, so fewer rounds; prefill itself is no faster than in item 1.
 4. **The wider workspace comes out of the KV pool.**
    - It grows by 412 MB, 951 MB and 1,851 MB. The pool loses 44,736, 103,424
@@ -160,6 +170,9 @@ Inferred:
   one observation of it.
 
 ### CUDA-graph prefill (criterion 3)
+
+Inferred throughout: a reading of the code named below plus arithmetic on
+the 2026-09-30 and 2026-09-18 captures. Nothing here was built or measured.
 
 **The bound.**
 - ~4.75 ms of fixed idle per traversal at 1024 (launch gaps plus TMA uploads),
@@ -208,7 +221,8 @@ calls:
 
 **Verdict: no-go for now.**
 - The gain is about 5% of a cold 8K TTFT and 3.5% of a 32K one at the default
-  width.
+  width. That bound is inferred from the 2026-09-30 capture, not re-captured
+  here; even September's 9.2 ms ceiling keeps it at 11% and 8%.
 - The price is graph-safe prefill bodies for 64 layers, per-chunk attention
   updates and a vendored change.
 - The TMA part (~1.5 ms per traversal, ~1.5%) needs no graph.
@@ -255,8 +269,9 @@ calls:
 - **The per-traversal costs are not re-captured.** The ~4.75 ms comes from a
   2026-09-30 nsys capture (~5.5K prompt, width 1024). The flat 8K curve agrees
   with ~5 ms, but cannot separate it from per-token costs.
-- **Widths not tried:** 512, 1536, 3072. Neither was a long-prompt mix with
-  more than one concurrent prefill.
+- **Widths not tried:** 512, 1536, 3072.
+- **Load shapes not tried:** a mix of long prompts, or more than one
+  concurrent prefill.
 - **The 8192 margin** depends on the desktop's VRAM at start: 31.17-31.21 GB
   free here.
 - **Contention:** one leg.
