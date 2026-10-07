@@ -28,7 +28,7 @@
 - Legs: one load each, back to back, the same prompts in every leg.
   - ~9K history (`W1` 4100 words): before, after, after, before.
   - 30K history (`W1` 14500 words, 29.2-30.1K-token turn 1): after, then before.
-- Scripts: `.scratch/ab/ab.sh` in the `fn-reuse-0029` worktree, and the main checkout's `.scratch/flash-next-306-307/harness/shorttail/` (`tail.py`, `summ.py`).
+- Scripts: an A/B driver (`.scratch/ab/ab.sh`) in the `fn-reuse-0029` worktree, and the main checkout's `.scratch/flash-next-306-307/harness/shorttail/` (`tail.py`, `summ.py`). The driver and these legs' raw client/server logs were deleted with the worktree after the merge; the numbers below are as recorded at the time.
   `tail.py`'s `chunks` field assumes three pieces, so it is wrong for the after legs; the chunk counts below are the server's.
 
 **~9K history** (medians; per leg: before 1.798 and 1.802 s, after 1.460 and 1.466 s):
