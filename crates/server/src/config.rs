@@ -174,9 +174,8 @@ pub struct Config {
     /// GitHub #209).
     pub instruction_policy: InstructionPolicy,
     /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
-    /// GitHub #150). `None` loads nothing of the drafter -- but for a
-    /// Flash-Next artifact, whose MTP head is on by default when its
-    /// companion is present (spec flash-next/07) unless `--spec off`.
+    /// GitHub #150). `None` loads nothing of the drafter; Flash-Next's MTP
+    /// head too is off unless `--spec mtp` names it (spec flash-next/07).
     pub speculation: Option<Speculation>,
     /// `--spec off` / `IGNIS_SPEC=off`: no speculation, the default one
     /// included (GitHub #307).

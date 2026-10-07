@@ -21,7 +21,11 @@ open questions at the end.
 - **Draft width:** by default `k` adapts per round to a row budget over the
   active lanes (decode route ≤ 8 rows; Phase A: k = 2 at 1 lane, 1-2 at 2,
   1 at 3); a server option forces a fixed `k` (e.g. always 3) and another turns
-  MTP off. MTP is **on by default** for Flash-Next.
+  MTP off. MTP is **off by default** for Flash-Next and `--spec mtp` turns it
+  on (owner, 2026-10-07, after the bench: PCIe-bound on the 5090 at 1.02-1.30x
+  one lane and slower at two and three, finding
+  `2026-10-07-flash-next-mtp-speculation-is-pcie-bound.md`; it replaces the
+  earlier "on by default").
 - **KV format:** hq-e8-2b stays Flash-Next's serving default; `--kv-format bf16`
   stays available. The difference (decode tok/s, expert hit rate, prefill ≠
   decode flips) is measured and reported.
@@ -497,8 +501,8 @@ record layouts or copy order.
      pessimistic bound, and AC3 re-projects with the measured c.
 2. **Phase B.** The companion container:
    - holds the 31 tensors in the stated formats, bound only with
-     MTP, which is on by default when the companion is beside the artifact and
-     off under `--spec off`;
+     MTP, which `--spec mtp` turns on with the companion beside the artifact
+     (off by default, owner 2026-10-07);
    - its identity check refuses a different main container;
    - `convert.py verify` decodes its experts bit-identical.
    - The quantized head's α₁ is within 0.03 of the BF16 head's on phase A's
@@ -620,8 +624,9 @@ Where the build departs from the text above:
   width whose k is 0 runs the one-token round. One pass graph and one commit
   graph per width. `--spec mtp` defaults to 2 draft tokens (phase A's
   projection), `--draft-tokens` forces at most k, `--draft-rows` names the
-  budget, `--spec off` turns it off; MTP is on by default with the companion
-  present.
+  budget, `--spec off` turns it off. MTP is off unless `--spec mtp` names it
+  (owner, 2026-10-07), and a named head without its companion refuses the
+  load.
 - **The round is two graphs with the host between them**: the pass (save,
   record-mode trunk, head, accept) and, after the host's stop cut, the commit
   (fold, then the head's drafting, then the restore). The cut is not on the

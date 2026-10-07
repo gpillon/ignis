@@ -114,9 +114,9 @@ impl SpeculativeBackend {
 pub const FLASH_NEXT_VERIFY_ROWS: u32 = 8;
 
 /// The draft tokens a Flash-Next MTP load verifies per lane at most when
-/// the operator names none (`--spec mtp` alone, or the default on with the
-/// companion present): phase A's best one-lane projection at the measured
-/// column cost (spec flash-next/07), cut by the row budget as lanes join.
+/// the operator names none (`--spec mtp` alone): phase A's best one-lane
+/// projection at the measured column cost (spec flash-next/07), cut by the
+/// row budget as lanes join.
 pub const FLASH_NEXT_DEFAULT_DRAFT_TOKENS: u32 = 2;
 
 /// The window a Flash-Next round of `lanes` lanes verifies at (spec

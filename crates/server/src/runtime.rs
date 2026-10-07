@@ -127,25 +127,26 @@ impl From<&crate::config::Config> for EngineShape {
     }
 }
 
-/// A Flash-Next load's speculation (spec flash-next/07): its MTP head, on by
-/// default when the companion `companion_present`, at the operator's draft
-/// tokens or the default, cut by the row budget; none under `--spec off`, or
-/// with no companion and nothing asked. The served-model check refused any
-/// other backend before this.
+/// A Flash-Next load's speculation (spec flash-next/07): its MTP head only
+/// when `--spec mtp` names it -- off by default, the owner's call after the
+/// head measured PCIe-bound on the 5090 (finding 2026-10-07) -- at the
+/// operator's draft tokens, cut by the row budget. A named head needs its
+/// companion (`companion_present`). The served-model check refused any other
+/// backend before this.
 pub fn flash_next_speculation(
     shape: &EngineShape,
     companion_present: bool,
 ) -> Result<Option<ignis_core::speculation::FlashNextSpeculation>, String> {
-    use ignis_core::speculation::{FlashNextSpeculation, FLASH_NEXT_DEFAULT_DRAFT_TOKENS};
-    if shape.speculation_off {
+    use ignis_core::speculation::FlashNextSpeculation;
+    let Some(speculation) = shape.speculation.filter(|_| !shape.speculation_off) else {
         return Ok(None);
-    }
-    let draft_tokens = match shape.speculation {
-        Some(speculation) => speculation.draft_tokens(),
-        None if companion_present => FLASH_NEXT_DEFAULT_DRAFT_TOKENS,
-        None => return Ok(None),
     };
-    FlashNextSpeculation::new(ignis_core::SpeculativeBackend::Mtp, draft_tokens, shape.draft_rows).map(Some)
+    if !companion_present {
+        return Err("--spec mtp: the MTP head's companion container is not beside the artifact (spec flash-next/07)"
+            .to_string());
+    }
+    FlashNextSpeculation::new(ignis_core::SpeculativeBackend::Mtp, speculation.draft_tokens(), shape.draft_rows)
+        .map(Some)
 }
 
 impl EngineShape {
@@ -854,24 +855,25 @@ mod tests {
         assert_eq!(off.for_family(ModelFamily::FlashNext).retained_host_slots, 0, "reuse off retains nothing");
     }
 
-    /// GitHub #307: Flash-Next's MTP head is on by default with its
-    /// companion present, at the default draft tokens and the operator's row
-    /// budget; `--spec off` and an absent companion turn it off; a named
-    /// window is the operator's.
+    /// GitHub #307: Flash-Next's MTP head is off by default -- the owner's
+    /// call after the bench found it PCIe-bound on the 5090 (finding
+    /// 2026-10-07). `--spec mtp` turns it on at its draft tokens and the
+    /// operator's row budget, and refuses a load without the companion.
     #[test]
-    fn flash_next_speculation_is_on_by_default_with_its_companion() {
-        use ignis_core::speculation::FLASH_NEXT_DEFAULT_DRAFT_TOKENS;
+    fn flash_next_speculation_is_off_unless_named() {
         let shape = EngineShape { draft_rows: 6, ..EngineShape::default() };
-        let on = flash_next_speculation(&shape, true).unwrap().expect("on by default");
-        assert_eq!((on.draft_tokens(), on.row_budget()), (FLASH_NEXT_DEFAULT_DRAFT_TOKENS, 6));
-        assert_eq!(flash_next_speculation(&shape, false).unwrap(), None, "no companion, nothing asked");
-        let off = EngineShape { speculation_off: true, ..shape };
-        assert_eq!(flash_next_speculation(&off, true).unwrap(), None);
+        assert_eq!(flash_next_speculation(&shape, true).unwrap(), None, "off by default, companion or not");
+        assert_eq!(flash_next_speculation(&shape, false).unwrap(), None);
         let named = EngineShape {
             speculation: Some(ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Mtp, 3).unwrap()),
             ..shape
         };
-        assert_eq!(flash_next_speculation(&named, true).unwrap().map(|s| s.draft_tokens()), Some(3));
+        let on = flash_next_speculation(&named, true).unwrap().expect("--spec mtp turns it on");
+        assert_eq!((on.draft_tokens(), on.row_budget()), (3, 6));
+        let missing = flash_next_speculation(&named, false).unwrap_err();
+        assert!(missing.contains("companion"), "{missing}");
+        let off = EngineShape { speculation_off: true, ..named };
+        assert_eq!(flash_next_speculation(&off, true).unwrap(), None);
     }
 
     #[test]

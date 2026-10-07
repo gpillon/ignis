@@ -90,7 +90,10 @@ code window (k = 3: 34.8 ms a round, of which the head's drafting is 2.2 ms).
 ## Follow-ups
 
 - The owner's call (spec 07: under 1.25× phase D stops and the owner
-  decides): MTP on by default with a 3-row budget (one lane only), or off.
+  decides), made 2026-10-07: MTP is off by default and `--spec mtp` turns it
+  on. A card that holds every expert in VRAM (no PCIe misses, phase A's
+  setting) is where it should pay; measure it there before changing the
+  default.
 - The lever is the expert traffic, not the verify round: a larger expert
   cache (the bench's 16 GB is the served default's size), a hit rate the
   verify rows' experts help (a prefetch budget that scales with the round's
