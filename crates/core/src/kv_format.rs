@@ -144,7 +144,27 @@ pub enum KvFormat {
     HqE8_2b,
 }
 
+/// Most visible keys the vendored GQA attention serves on a linear (BF16)
+/// cache: `kGqaAttentionMaximumLinearVisibleKeys` in
+/// `kernel/vendor/include/ninfer/ops/gqa_attention.h`. A context past it is
+/// refused by the reference at plan time (GitHub #228).
+pub const GQA_MAX_LINEAR_VISIBLE_KEYS: u32 = 524_288;
+
+/// Most visible keys the GQA attention serves at all, reachable only with
+/// the `hq-e8-2b` cache: `kGqaAttentionMaximumVisibleKeys` in the same
+/// header.
+pub const GQA_MAX_VISIBLE_KEYS: u32 = 1_048_576;
+
 impl KvFormat {
+    /// The longest `--max-context` the 27B's GQA attention envelope admits
+    /// on this cache format (GitHub #228).
+    pub fn gqa_max_context(&self) -> u32 {
+        match self {
+            Self::Bf16 => GQA_MAX_LINEAR_VISIBLE_KEYS,
+            Self::HqE8_2b => GQA_MAX_VISIBLE_KEYS,
+        }
+    }
+
     /// The spelling the CLI, the logs and the load report use.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -537,5 +557,25 @@ mod tests {
         // serves in and the G4 gate measures; BF16 is retained and is what
         // every correctness oracle asks for by name.
         assert_eq!(KvFormat::default(), KvFormat::HqE8_2b);
+    }
+
+    /// The mirrored envelope constants are the vendored header's (GitHub
+    /// #228): a vendor bump that moves them fails here, not at serving time.
+    #[test]
+    fn the_gqa_envelope_constants_match_the_vendored_header() {
+        let header = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernel/vendor/include/ninfer/ops/gqa_attention.h"
+        ))
+        .expect("vendored header");
+        let value = |name: &str| -> u32 {
+            let at = header.find(&format!("{name} =")).unwrap_or_else(|| panic!("{name} in header"));
+            let rest = &header[at + name.len() + 2..];
+            rest[..rest.find(';').expect("terminator")].trim().parse().expect("number")
+        };
+        assert_eq!(GQA_MAX_LINEAR_VISIBLE_KEYS, value("kGqaAttentionMaximumLinearVisibleKeys"));
+        assert_eq!(GQA_MAX_VISIBLE_KEYS, value("kGqaAttentionMaximumVisibleKeys"));
+        assert_eq!(KvFormat::Bf16.gqa_max_context(), GQA_MAX_LINEAR_VISIBLE_KEYS);
+        assert_eq!(KvFormat::HqE8_2b.gqa_max_context(), GQA_MAX_VISIBLE_KEYS);
     }
 }

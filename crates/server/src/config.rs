@@ -1001,6 +1001,16 @@ pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, 
             ignis_core::N_DECODE_LANES
         )));
     }
+    // Flash-Next attends with its own QSA, not the GQA op, so only the 27B
+    // is bound by the GQA envelope (GitHub #228).
+    if family == ModelFamily::Qwen38_27b && config.max_context > config.kv_format.gqa_max_context() {
+        return Err(ConfigError(format!(
+            "`--max-context {}`: the 27B's attention serves at most {} keys on `{}`",
+            config.max_context,
+            config.kv_format.gqa_max_context(),
+            config.kv_format.as_str()
+        )));
+    }
     if config.vision.is_some() && !family.takes_images() {
         return Err(ConfigError(format!("`--vision`: {} takes no images", family.name())));
     }
@@ -2571,6 +2581,26 @@ mod tests {
         let vision = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
         let err = served_model_for(&vision, ModelFamily::FlashNext).expect_err("no vision");
         assert!(err.0.contains("--vision") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+    }
+
+    /// GitHub #228: the 27B's GQA envelope bounds `--max-context` per KV
+    /// format; Flash-Next's QSA is not bound by it.
+    #[test]
+    fn max_context_past_the_gqa_envelope_is_refused_for_the_27b_only() {
+        use ignis_core::compute::ModelFamily;
+        let cfg = |ctx: &str, fmt: &str| {
+            expect_config(
+                resolve(&args(&["--max-context", ctx, "--kv-format", fmt, "--kv-pool-bytes", "64G"]), no_env)
+                    .expect("resolve"),
+            )
+        };
+        assert!(served_model_for(&cfg("524288", "bf16"), ModelFamily::Qwen38_27b).is_ok());
+        let err = served_model_for(&cfg("524289", "bf16"), ModelFamily::Qwen38_27b).expect_err("past linear");
+        assert!(err.0.contains("--max-context") && err.0.contains("524288") && err.0.contains("bf16"), "{}", err.0);
+        assert!(served_model_for(&cfg("1048576", "hq-e8-2b"), ModelFamily::Qwen38_27b).is_ok());
+        let err = served_model_for(&cfg("1048577", "hq-e8-2b"), ModelFamily::Qwen38_27b).expect_err("past absolute");
+        assert!(err.0.contains("1048576"), "{}", err.0);
+        assert!(served_model_for(&cfg("1048577", "hq-e8-2b"), ModelFamily::FlashNext).is_ok());
     }
 
     /// GitHub #306: `--decode-lanes` is Flash-Next's, 1 to the engine's 8.

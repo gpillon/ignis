@@ -312,6 +312,15 @@ fn lands_on(start: u32, take: u32, point: u32) -> bool {
     point > start && point - start <= take
 }
 
+/// The capture point `at` a chunk of `take` tokens from `start` may take: `at`
+/// itself, or 0 when `held` says the checkpoint pool already holds that
+/// content (GitHub #189). `held` walks the prompt's match chain, so it is
+/// asked only when the chunk lands on `at` — a point further along (or behind)
+/// is left as it is and judged on the chunk that reaches it (GitHub #197).
+fn capture_unless_held(start: u32, take: u32, at: u32, held: impl FnOnce() -> bool) -> u32 {
+    if lands_on(start, take, at) && held() { 0 } else { at }
+}
+
 /// The tokens `input` may generate (GitHub #166): its `max_tokens`, or —
 /// absent that — whatever the per-sequence limit leaves after the prompt.
 ///
@@ -1128,8 +1137,10 @@ impl ConcreteScheduler {
     /// tail token its every decode round would rotate at `position + 0`. A
     /// checkpoint is held to it too: its own capture leaves a tail, but a
     /// *claimant's* prompt can end exactly at another request's opener.
-    fn reuse_keys(&self, i: usize) -> PromptKeys {
-        let input = &self.requests[i].input;
+    fn reuse_keys(&mut self, i: usize) -> PromptKeys {
+        let lengths: Vec<u32> = self.checkpoints.match_lengths().chain(self.prefix.match_lengths()).collect();
+        let request = &mut self.requests[i];
+        let input = &request.input;
         let media = media_keys(input);
         let prompt = PromptContent::new(&input.tokens, &media);
         // GitHub #238: trimming the *walk* rather than the claim is what
@@ -1139,9 +1150,9 @@ impl ConcreteScheduler {
         // `reuse_reach` is where both reasons for stopping a token short
         // now live.
         let reach = input.reuse_reach() as u32;
-        prompt
-            .head(reach)
-            .keys_for(self.checkpoints.match_lengths().chain(self.prefix.match_lengths()))
+        // GitHub #200: the walk is remembered per request, so a request that
+        // asks again next tick walks only past what it has already keyed.
+        prompt.head(reach).keys_for_cached(lengths, &mut request.reuse_key_cache)
     }
 
     /// Bring spilled prefix `id` back onto the device as a retained prefix
@@ -3024,18 +3035,15 @@ impl Scheduler for ConcreteScheduler {
                     // their content, so the duplicate check is over the key —
                     // and the key is what the entry will carry anyway.
                     //
-                    // Known cost, filed as a follow-up rather than fixed here:
-                    // the chain is walked to `at` on every advance a capture is
-                    // possible on, not only on the chunk that lands on it — a
-                    // claimant whose opener floors to `shared_pages` pays it
-                    // every tick. The narrowing is to evaluate this only while
-                    // `start < at <= start + take`, and the `take` it has to
-                    // test is the **pre-cut** one: the cut below is computed
-                    // *from* this answer, so testing the cut width would make
-                    // the guard true by construction.
-                    let media = media_keys(&r.input);
-                    let head = PromptContent::new(&r.input.tokens, &media).key_at(at);
-                    if self.checkpoints.holds(head) { 0 } else { at }
+                    // GitHub #197: asked only on the chunk that lands on `at`.
+                    // The `take` tested is the **pre-cut** one: the cut below
+                    // is computed *from* this answer, so testing the cut
+                    // width would make the guard true by construction.
+                    capture_unless_held(r.prefill_progress, chunk_take(r, self.config.serving_chunk_tokens), at, || {
+                        let media = media_keys(&r.input);
+                        let head = PromptContent::new(&r.input.tokens, &media).key_at(at);
+                        self.checkpoints.holds(head)
+                    })
                 })
                 .collect()
         };
@@ -3902,6 +3910,29 @@ mod tests {
     use crate::gdn::GdnState;
     use crate::host::{HostEntry, ResumePhase, RetainedKvRamEntry, Tier};
     use crate::mock::MockCompute;
+
+    /// GitHub #197: the duplicate check walks the prompt only on the chunk
+    /// that lands on the capture point, judged on the chunk's pre-cut width.
+    #[test]
+    fn the_capture_duplicate_check_runs_only_on_the_landing_chunk() {
+        let asked = std::cell::Cell::new(0);
+        let held = |answer: bool| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                answer
+            }
+        };
+        // Not reached yet (100 > 0 + 64), already behind (50 <= 64): not asked,
+        // and the point is left as it is.
+        assert_eq!(capture_unless_held(0, 64, 100, held(true)), 100);
+        assert_eq!(capture_unless_held(64, 64, 50, held(true)), 50);
+        assert_eq!(asked.get(), 0);
+        // Reached: asked once, and a held checkpoint drops the point.
+        assert_eq!(capture_unless_held(64, 64, 128, held(true)), 0);
+        assert_eq!(capture_unless_held(64, 64, 128, held(false)), 128);
+        assert_eq!(asked.get(), 2);
+    }
 
     /// A live snapshot of `bytes`, captured by `owner` at tick `tick`. The
     /// fields the host tier's own order reads are the only ones that matter

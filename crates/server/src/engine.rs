@@ -1294,6 +1294,16 @@ mod tests {
     /// two, and returns every fact the model thread sent — plus the
     /// exposition of `metrics` once the consumer has drained, if installed.
     async fn model_thread_facts(metrics: Option<Arc<Metrics>>) -> (Vec<String>, Option<String>) {
+        model_thread_facts_with_scraper_delay(metrics, Duration::ZERO).await
+    }
+
+    /// [`model_thread_facts`] with the scraper thread held `scraper_delay`
+    /// before its first render: the loaded-machine schedule where the
+    /// workload would otherwise finish first (GitHub #233).
+    async fn model_thread_facts_with_scraper_delay(
+        metrics: Option<Arc<Metrics>>,
+        scraper_delay: Duration,
+    ) -> (Vec<String>, Option<String>) {
         let scheduler = ConcreteScheduler::with_config(
             SchedulerConfig {
                 model: "test-model".into(),
@@ -1334,6 +1344,7 @@ mod tests {
             let (metrics, scraping, scraped) =
                 (Arc::clone(metrics), Arc::clone(&scraping), Arc::clone(&scraped));
             std::thread::spawn(move || {
+                std::thread::sleep(scraper_delay);
                 let mut scrapes = 0u64;
                 while scraping.load(std::sync::atomic::Ordering::Relaxed) {
                     assert!(metrics.render().ends_with('\n'));
@@ -1387,6 +1398,19 @@ mod tests {
             assert!(scraper.join().expect("the scraper never panics") > 0);
         }
         (seen, metrics.map(|metrics| metrics.render()))
+    }
+
+    /// GitHub #233: the test's one timing dependence was the scraper thread
+    /// being scheduled before the workload ended; when a loaded machine ran
+    /// the workload first, `scrapes > 0` failed once in a workspace run. The
+    /// workload now waits for the first render, so a scraper that starts late
+    /// (reproduced here with a sleep, not stress) still renders alongside it.
+    #[tokio::test]
+    async fn a_scraper_that_starts_late_still_renders_alongside_the_workload() {
+        let (facts, exposition) =
+            model_thread_facts_with_scraper_delay(Some(Arc::new(Metrics::new())), Duration::from_millis(200)).await;
+        assert!(facts.iter().any(|fact| fact.starts_with("routed Done")), "{facts:?}");
+        assert!(exposition.is_some());
     }
 
     /// GitHub #89 / ADR 0017: enabling metrics changes nothing the model
