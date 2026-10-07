@@ -56,6 +56,30 @@ When output names a domain concept, use the term as defined here.
   **prefill/decode interleaving**, not by this term (ADR 0018).
 - **Admission state machine** — the fairness machinery (protection, backfill class,
   temporal credit, frontier distance) deciding which request gets which lane.
+  Pages are a dimension of their own: see **KV reservation**.
+- **Generation cap** — the most a request may generate, reasoning included:
+  its `max_tokens` (`max_completion_tokens`, `max_output_tokens`), or else the
+  server's `--default-max-tokens` (38,912 on both models, Qwen's output length
+  for complex tasks), clamped to what the prompt leaves of `--max-context`.
+  `0` lifts the default to the context. Reaching it ends the request with
+  `finish_reason: "length"`. An explicit cap past the context is refused, never
+  clamped (ADR 0045).
+- **KV reservation** — the KV pages the pool has given a request: at admission
+  its prompt (the tail past a claimed **shared prefix**) plus one **growth
+  step** of 32 pages, 2,048 tokens. From its first round a lane keeps at least
+  a step of room ahead of its position, and takes the next step as it
+  generates, up to its *bound*: prompt plus **generation cap**, never past
+  `--max-context`. A submission is checked against the bound, so a request
+  alone always fits the pool. When the pool runs out, the **eviction
+  priority** moves something below the requester down a tier. A request
+  entering the device, admitted or restored, needs room for four steps for
+  itself and for every resident sequence that ranks above it. Before ADR 0045
+  a reservation was the whole bound and never grew (core-05).
+  _Avoid_: allocation (the leaf's word for the mapped pages).
+- **Parked lane** — a decode lane held out of rounds because its room ahead is
+  below one round's largest append and no page can be had yet. It keeps its
+  pages and resumes at the first advance with room. It is not decoding, so a
+  higher-ranked need takes it first.
 - **VRAM budget** — the device memory the whole ignis process may hold,
   weights included: the number Task Manager shows. Either explicit (the
   operator names it) or derived (the memory free at start minus the **VRAM
@@ -79,7 +103,8 @@ When output names a domain concept, use the term as defined here.
   5090 — the pool is reserved first and the **expert cache** takes the rest.
   That reserved pool is 524,288 tokens, at most every lane's whole context, and
   never less than one `--max-context` sequence plus a page per retained slot.
-  Either way the lanes share the pool: a lane costs its state, not a context.
+  Either way the lanes share the pool: a lane costs its state, not a context,
+  and a request the pages it has used (**KV reservation**).
   `--kv-pool-bytes` names the pool on both models, in bytes or in tokens.
 - **Trained position envelope** — the 262,144 rotary positions the checkpoint
   was trained over. Not a limit the engine enforces: a sequence past it is
@@ -454,6 +479,15 @@ When output names a domain concept, use the term as defined here.
   the disk follows the KV-RAM order again. An evicted live sequence is then
   never discarded to make room: when no tier has room, the request that needed
   it waits (ADR 0045).
+
+  A shortage of *pages* (a lane's growth, an admission; ADR 0045) moves only
+  what ranks below the requester. *Rank* is class, then submission order, and
+  a moved sequence keeps its rank. Retained state goes first; then `Agent`
+  before `Interactive`; then sequences not in the decode round (waiting for a
+  lane, at a chunk boundary, a **parked lane**) before lane holders; then the
+  latest-submitted. A need never takes its requester or anything ranked above
+  it: it waits, or its lane parks. A shortage of *lanes* keeps the lane holder
+  first.
 - **Chunked prefill** — prefilling a prompt span through the span+position
   prefill call in **prefill chunks** rather than one token at a time. The
   leaf knows how to loop over a span of any length; it is no longer the only

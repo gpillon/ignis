@@ -9,8 +9,25 @@ defaults the owner confirms or changes; the others are the owner's. Spec:
 `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
 **Amends ADR 0030** (the KV pool line, the expert cache floor), **ADR 0029**
 (Tier 2 is built), **ADR 0024** (a transfer may move a window at a time),
-**ADR 0023** (the eviction priority reaches one tier further down) and
-**ADR 0017** (`tier="disk"` is exported on a load that has the tier).
+**ADR 0023** (the eviction priority reaches one tier further down; a page
+shortage takes what is not decoding first), **ADR 0017** (`tier="disk"` is
+exported on a load that has the tier) and **spec core-05** (a reservation
+grows).
+
+**Amended 2026-10-08 (owner).** Four decisions replace the open point this ADR
+first left to the owner (two whole-context reservations fill the default
+pool):
+
+- Reservations grow by pages, and a live sequence moves down a tier
+  mid-generation and resumes bit-exact. Built now, in the same spec.
+- A server default `max_tokens` of 38,912 on both models, `0` for today's
+  behaviour.
+- The KV-disk location follows the n-gram cache's rule (confirmed).
+- A PCIe contention criterion for a live move.
+
+Kept: the in-flight cap, refusals at plan time, and the spec's F: contention
+thresholds as starting values. The numbers in the new sections marked
+*(agent proposal)* are for the owner to confirm.
 
 Sources: [Flash-Next on the 5090](../findings/2026-10-06-flash-next-on-the-5090.md)
 (its 2026-10-07 update: lanes at 262K), the F: disk bench
@@ -60,6 +77,27 @@ clone), GitHub #205 (the owner's Tier 2 header decision and its RoPE comment).
     ([the agent turn tail](../findings/2026-10-07-flash-next-agent-turn-tail.md)).
 - **The n-gram table reads its rows from the same NVMe** while a prompt
   prefills (#306).
+- **A reservation is whole and never grows** (spec core-05). At admission a
+  request reserves `ceil((prompt + effective_max) / 64)` pages, and without a
+  `max_tokens` `effective_max` is what the prompt leaves of `--max-context`.
+  The leaf maps every page at `ignis_seq_alloc`.
+  - The vendored allocator already separates the two: `PagedKVPool` counts an
+    entitlement (`can_reserve`, `set_page_entitlement`) apart from the pages
+    it maps (`materialize_pages`). Each block-table row is already sized for
+    `--max-context`.
+- **The 27B already moves live sequences.** `snapshot_and_evict` snapshots a
+  decode lane (`ResumePhase::Running`) or a resident lane-less request
+  (`ResumePhase::Prefilling`) into KV-RAM, and `restore_pass` brings it back.
+  Today it runs only when an admission needs pages or a prefilled head needs
+  a lane. A lane holder goes before a lane-less request (ADR 0023, #190). Every decode lane carries the same use
+  tick, so least-recently-used reduces to lane id.
+- **PCIe is full duplex, and the expert stream uses one direction.** At
+  ~100 tok/s Flash-Next moves 66-74 MB per decode token host to device, that
+  is ~6.6-7.4 GB/s of the link's ~12 GB/s. A sequence moving out (device to
+  host) runs against the opposite direction; a sequence moving in shares the
+  experts' direction.
+- **Qwen recommends 38,912 tokens of output** for complex tasks, reasoning
+  included.
 
 ## Decision
 
@@ -88,13 +126,154 @@ clone), GitHub #205 (the owner's Tier 2 header decision and its RoPE comment).
     load's expert cache does not shrink.
   - The floor wins, so `--max-context 524288` starts instead of being refused.
 - **The pool is shared by the lanes and paged** (64-token pages on both
-  models, as today). A lane now costs its state, not a context.
-- **Reservations are unchanged.** At admission a request reserves its prompt
-  plus its `max_tokens`, or the whole `--max-context` without one (core-05:
-  a reservation never grows). `--max-context` bounds every request.
+  models, as today). A lane now costs its state, not a context, and a request
+  costs the pages it has used, not the ones it might (below).
+- **`--max-context` bounds every request.**
 - **Invariant:** the pool holds one `--max-context` sequence and one page per
   retained slot (ADR 0030's floor, now on both models). A smaller pool refuses
   the start, naming the knobs.
+
+### Reservations grow by pages, and a live sequence moves down a tier
+
+**A request reserves what it has used plus a step, and takes pages as it
+generates. When the pool runs out, the lowest-ranked sequence moves down a
+tier and later resumes where it stopped: no work lost, never a 503 (owner,
+2026-10-08).** Both models, one mechanism.
+
+- **The bound and the reservation are two numbers.**
+  - The *bound* is the prompt plus the request's generation cap (below),
+    never past `--max-context`. A submission is still refused against it:
+    `ContextExceeded` past the context, `Oversized` past the pool alone.
+    Because the pool holds one `--max-context` sequence beside the retained
+    pages, **a sequence alone always fits**: with retained state given up and
+    every other sequence moved, any one bound fits.
+  - The *reservation* is what the pool has given the request. At admission it
+    is the prompt (the tail past a claimed prefix, as today) plus **one
+    growth step**.
+- **The growth step is 32 pages, 2,048 tokens, on both models** *(agent
+  proposal)*.
+  - From its first round a decode lane keeps **at least one step of room
+    ahead** of its position. When its room drops below a step, it asks for one
+    more, capped at its bound.
+  - The step is small against the pool: 32 of 8,192 pages, so three lanes
+    over-reserve at most ~2.3% (two steps each).
+  - It is large against a move. A step is ~20 s of decode at ~100 tok/s, so a
+    victim's disk spill (~1 s for a whole-context Flash-Next blob) completes
+    while the lane still decodes on its room.
+  - A prompt never grows: admission reserves all of it.
+  - A request whose bound is within one step of its prompt (a decision, a
+    constrained decode, a small `max_tokens`) reserves its whole bound at
+    admission and never grows, exactly as today.
+- **A lane that runs out parks.** When its room is below one round's largest
+  append (1 token, or the draft window plus one under speculation) and no page
+  can be had yet, the lane is held out of decode rounds. It keeps its pages
+  and resumes at the first advance with room. A parked lane is not decoding,
+  so it is among the first victims of a higher-ranked need.
+- **Two triggers, both reactive** (ADR 0023: eviction runs on the refusal
+  path): a lane asking for its next step, and an admission materializing.
+  A restore never triggers a move (below).
+- **A need is met in this order.**
+  1. Free pages.
+  2. Retained state on the device, given up first (ADR 0023 as amended by
+     0029).
+  3. A live sequence that **ranks below the requester**, moved down a tier:
+     KV-RAM, else KV-disk, at a round or chunk boundary.
+     - **Rank:** class first (`Interactive` above `Agent`), then submission
+       order (earlier above later). A moved sequence keeps its rank.
+     - **Order among eligible victims:** `Agent` before `Interactive`; then
+       sequences not in the decode round before lane holders (owner: a
+       prefilled request waiting for a lane, a half-prefilled one at a chunk
+       boundary, a parked lane); then the latest-submitted.
+     - **Never** the requester, a sequence mid-transfer, or one the admission
+       machine protects (a protection donor, a lane reserved for an earlier
+       Interactive request).
+  4. Nothing left: an admission waits in the queue (as when no tier has
+     room), and a growing lane parks.
+- **Why rank gates the victim** *(agent proposal)*. "Never the requester" on
+  its own would let an `Agent` lane's growth move an `Interactive` lane. It
+  would also let two equal lanes move each other in turn.
+  - With rank, an `Agent` need never moves an `Interactive` sequence.
+  - Within a class it is first in, first out: an older sequence may move a
+    younger one, never the reverse. A newcomer of a class therefore waits
+    behind the sequences of its class already admitted, and is not placed by
+    moving one of them, as an admission does today.
+  - The top-ranked live sequence can move every other one, so it always
+    progresses, and each sequence eventually becomes the top.
+- **A lane shortage keeps today's order** (ADR 0023 as amended by #190): a
+  lane holder before a lane-less request, since moving a lane-less request
+  frees no lane. Only a shortage of pages takes what is not decoding first.
+- **Entry rule, the anti-thrash hysteresis** *(agent proposal)*.
+  - A restore never moves anything. A moved sequence comes back only into
+    free room, retained pages counted as reclaimable: `restore_pass` already
+    breaks when there is none.
+  - Restores and admissions share one rule. A sequence enters the device when
+    the free pages cover its reservation plus **four growth steps** (8,192
+    tokens), for it and for every resident live sequence that ranks above it.
+    For a sequence closer than that to its bound, the room counted is what it
+    can still grow.
+  - Entries are taken in rank order. A moved sequence therefore comes back
+    before any newcomer that ranks below it, and a stream of short newcomers
+    cannot keep it out.
+  - Why it is enough: everyone above a returning sequence can grow about four
+    steps before the pool is short again, so two equal sequences that cannot
+    both fit swap at most once per ~8,192 tokens of the younger one's
+    progress. At the default pool there is no cycle at all: 8,192 pages are
+    exactly two 262,144-token sequences, so at three lanes at most one
+    whole-context sequence is ever below the device, and it returns when one
+    of the two finishes.
+- **The last resort.** Suppose every resident live sequence is parked and no
+  tier can take a victim: the disk refuses writes, or no tier exists. Then the
+  lowest-ranked parked sequence is discarded and re-queued (re-prefill,
+  today's KV-RAM loss), with an ERROR naming the tier that refused, as a
+  `SnapshotDropped`. On a load with KV-disk and room on it, this never
+  happens.
+- **The 27B without KV-disk keeps today's guarantee, no stronger.** KV-RAM
+  still discards a live blob to take a newer victim (re-prefill). That can now
+  follow a growth as well as an admission.
+- **The leaf** *(agent proposal)*.
+  - `ignis_seq_alloc` and its two siblings (`_shared`,
+    `_from_checkpoint`) map the reservation they are given, prompt plus a
+    step, instead of the bound.
+  - A new `ignis_seq_grow(pool, seq, context_tokens)` raises the entitlement
+    (`set_page_entitlement`) and maps the new pages (`materialize_pages`),
+    zeroes them as an allocation does, and publishes the block-table range,
+    between rounds on the model stream.
+  - It refuses with the pool unchanged when the pages are not free, past
+    `--max-context`, and on a sequence whose windowed restore is incomplete.
+  - A restore maps the blob's tokens plus one step.
+  - A sequence grown step by step is byte-identical to one mapped whole.
+- **Mechanism already built.** The move is the 27B's `snapshot_and_evict`
+  (KV-RAM, synchronous) or the disk tier's windowed spill (Tier 2, below).
+  The return is `restore_pass`. Growth adds a third caller beside admission
+  and the head's lane deal.
+
+### A server default for `max_tokens`
+
+**A request that names no cap generates at most 38,912 tokens, its reasoning
+included (owner, 2026-10-08).**
+
+- `--default-max-tokens <n|0>` (`IGNIS_DEFAULT_MAX_TOKENS`, make
+  `DEFAULT_MAX_TOKENS`) *(agent proposal: the name)*. The default is 38,912
+  on both models; `0` is today's behaviour, up to the context. The flag wins
+  over the environment.
+- **It is the request's generation cap when the request sends none** of
+  `max_tokens`, `max_completion_tokens` (chat) or `max_output_tokens`
+  (`/v1/responses`).
+  - It is clamped to what the prompt leaves of `--max-context`. A long prompt
+    is never refused for it; only a prompt that fills the context alone is.
+  - Reaching it ends the request `finish_reason: "length"` (`incomplete` with
+    `max_output_tokens` on `/v1/responses`).
+  - Reasoning tokens count inside it, as they do inside `max_tokens`. The
+    default thinking budget (6,144) and its 2,048-token answer reserve sit
+    well within it.
+- **An explicit cap always wins.** An explicit cap is still bounded by
+  `--max-context`: past it, it is refused as today. `ignore_eos` still needs an
+  explicit `max_tokens`. A decision or a constrained decode keeps its own
+  budget.
+- **One home** *(agent proposal)*: `SchedulerConfig::default_max_tokens`, read
+  by `generation_budget`. Every entry point gets it, and the request's
+  `remaining_work`, which the admission machine's frontier distance reads,
+  becomes finite.
 
 ### `--kv-pool-bytes` names the pool on both models
 
@@ -154,7 +333,8 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
     off, as `--kv-host-pool-bytes 0` does KV-RAM.
   - `--kv-disk-path <model|auto|dir>` (`IGNIS_KV_DISK_PATH`), with the n-gram
     cache's `CacheLocation` semantics: beside the artifact by default, the
-    OS's per-user cache directory for `auto`, or a named directory.
+    OS's per-user cache directory for `auto`, or a named directory (owner,
+    confirmed 2026-10-08).
 - **The budget is a ceiling, not a reservation *(agent proposal)*.** Nothing
   is preallocated, unlike the KV-RAM arena.
   - At start the effective budget is `min(flag, volume free − 10 GiB)`. It is
@@ -179,7 +359,8 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
 - **When no tier has room, the request waits.** No victim is taken. The request
   that needed the room stays in the admission queue, held as `make_room`
   already holds a head, and is admitted when room frees. It is not refused,
-  there is no 503 for it, and nothing is discarded.
+  there is no 503 for it, and nothing is discarded. A growing lane in the same
+  position parks.
   - Unchanged: the in-flight cap. `max_in_flight` is the lane count, and a
     request beyond it is a 503 `engine_full`. That cap concerns lanes, not
     tiers.
@@ -260,7 +441,13 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
   - `ignis_kv_disk_spills_total{from="device"|"kv_ram"}`: live snapshots
     written to the disk;
   - `ignis_kv_disk_failures_total{op="write"|"read"}`: a refused or failed
-    write (nothing lost), or a read that failed its check.
+    write (nothing lost), or a read that failed its check;
+  - `ignis_kv_lane_parks_total`: a decode lane parked for want of a page, once
+    per entry into the parked state. It renders on every load, both models.
+- **A live move is counted where it lands.** A move into KV-RAM is
+  `ignis_kv_cache_evictions_total`, one straight to disk
+  `ignis_kv_disk_spills_total{from="device"}`, whether an admission or a
+  growth caused it.
 - **The disk families render only on a load with the tier**, zeros included.
   A load without it never renders them, as a 27B load never renders the
   expert residency families.
@@ -299,22 +486,67 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
 - **Disk on by default on the 27B.** See Defaults above.
 - **Raising the in-flight cap so that a burst beyond the lanes queues.** That
   changes HTTP backpressure, is not a tier decision, and is left to the owner.
-- **Growing reservations page by page.** It supersedes core-05 and adds
-  mid-decode eviction; a follow-up if Consequences' first point bites.
+- **Accepting two lanes (owner, rejected 2026-10-08).** With whole
+  reservations, two requests without `max_tokens` fill the default pool, and
+  the third waits on the tiers. The third lane is decode capacity the card
+  already pays for in lane state.
+- **Raising the pool default (rejected 2026-10-08).** A third whole context
+  costs the expert cache ~1.03 GiB, the trade the policy exists to undo, and
+  it still holds pages no lane writes.
+- **Only the default `max_tokens`.** It fixes the clients that send no cap,
+  and it alone would let three of them run at once on the default pool. A
+  large explicit cap, or `--default-max-tokens 0`, would still hold pages it
+  may never write.
+- **A newcomer moves an older sequence of its class (today's admission).** A
+  stream of newcomers could then keep moving a sequence that has done the
+  work. First in, first out within a class bounds that.
+- **A minimum residency after a restore.** The sequence that needs the page
+  would park behind a lower-ranked one: an inversion. The entry rule instead
+  brings a sequence back only with room for everyone above it to grow.
+- **Moving sequences at a pool low-water mark.** That is pre-emptive, which
+  ADR 0023 rules out. One step of room ahead per lane gives a disk move the
+  same time, without moving anything that nobody needs yet.
+- **Growing a page at a time.** The pool packs no better, a move's spill has
+  no time to finish, and the scheduler asks the leaf 32 times as often.
+- **Discarding a live sequence for a growing lane.** That loses work. It is
+  only the last resort, when every tier refuses.
+- **Windowing the KV-RAM moves too.** Kept synchronous for now: ~12 GB/s, and
+  a measured cost (ADR 0024). The PCIe criterion in the spec decides whether
+  a whole-blob stall is too long.
+- **Applying the default `max_tokens` in each HTTP handler.** Three surfaces
+  would each re-derive the context clamp. `generation_budget` already does it
+  once for every entry point.
 
 ## Consequences
 
-- **At the default, two whole-context reservations fill a Flash-Next pool.** A
-  request with no `max_tokens` reserves 262,144 tokens. Two such reservations
-  take all 8,192 pages, retained state's pages given up first, so a third
-  finds none. That third request evicts a lane down a tier at admission. The
-  lane comes back when a whole context fits again.
-  - Agent clients that send no `max_tokens` therefore run two lanes at once on
-    the default load, and the third goes through the tiers.
-  - A request with a `max_tokens` reserves only what it asks for, and three
-    such requests fit.
-  - **Open for the owner:** accept it; raise the default; or follow up with
-    page-by-page reservation growth.
+- **Concurrency follows what lanes use, not what they might.** Before this
+  amendment, two whole-context reservations filled the default Flash-Next
+  pool, and a third request without `max_tokens` went through the tiers.
+  - Now each request reserves its prompt plus a step. With the default cap of
+    38,912, three agent requests without `max_tokens` fit at once even as
+    whole bounds, for prompts up to ~135K tokens each.
+  - When growth does fill the pool, the youngest sequence of the lowest class
+    moves down and comes back when room returns.
+- **Behaviour change for clients that send no cap.** Such a request stops at
+  38,912 tokens with `finish_reason: "length"`; it used to run to the end of
+  the context. A client that wants more sends `max_tokens`, and an operator
+  restores the old behaviour with `--default-max-tokens 0`.
+- **A same-class newcomer waits behind the sequences already admitted.**
+  Today an admission may evict an older decode lane of the same class to make
+  room; with rank it may not. Scheduler tests that assert either a whole
+  reservation at admission or that eviction change, each to the new rule.
+- **A grower stalls only when a move outlasts its room.**
+  - A disk spill holds the victim's pages until the file commits (above),
+    ~1 s for a whole-context Flash-Next blob at 1.2-1.5 GB/s. One step of room
+    ahead covers that.
+  - A KV-RAM move is synchronous. A whole-context Flash-Next blob stalls the
+    model thread, and so every lane's round, ~0.1 s at ~12 GB/s.
+- **PCIe contention of a live move.** A move out (device to host) runs against
+  the opposite direction of the expert stream and should barely touch decode.
+  A move in shares the experts' direction: at ~100 tok/s that direction
+  already carries ~6.6-7.4 GB/s of the link's ~12 GB/s. The spec measures the
+  other lanes' inter-token latency during each, against a baseline, with
+  starting thresholds for the owner to confirm.
 - **The expert cache grows by ~1.03 GiB at three lanes** (13.38 → ~14.4 GiB).
   - At two lanes and at one, the pool is today's within 8 pages.
   - By the one-lane/three-lane slope, three lanes should decode ~4-5% faster
@@ -330,12 +562,12 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
 - **The host plan gains a 64 MiB pinned line** (`kv_disk_staging`) on a load
   with the tier.
 - **The model thread pays a few µs per window** to issue a copy and poll it.
-  The copies themselves contend for PCIe:
-  - A spill's device-to-host windows run against the opposite direction of
-    the expert stream.
-  - A restore's host-to-device windows share the expert stream's direction.
-
-  The spec measures both.
+  The copies' PCIe contention is the live-move point above: a spill's windows
+  run against the expert stream, a restore's share its direction.
+- **The 27B changes too, at its defaults.** Its requests take the default cap
+  and grow their reservations; its plan does not change. Without KV-disk (its
+  default), a live sequence moved into KV-RAM can still be discarded there
+  for a newer victim, as today.
 - **The tier's writes contend on F:** with cargo builds and with the n-gram
   reads. They happen only at eviction, and the spec measures them.
 - **Amends ADR 0024's "one call per direction".** A transfer may move a window
@@ -343,7 +575,8 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
   extent". The blob is the same bytes. ADR 0024's chained blobs
   (deduplication) are still deferred: every disk blob is materialized.
 - **`ignis_kv_ram_evictions_total` stays at zero on a load with KV-disk.** A
-  KV-RAM live victim goes to disk instead.
+  KV-RAM live victim goes to disk instead. Only the last resort, when every
+  tier refuses, counts there.
 - **v1's disk tier cannot outlive a restart or a model switch.** Phase 2's
   idea (`docs/specs/flash-next/phase2-model-switch-notes.md`) starts from the
   header this ADR already writes.

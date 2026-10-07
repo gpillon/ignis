@@ -35,3 +35,30 @@ fidelity (ADR 0004) and pinned by a doc note in `admission_machine.rs`.
 
 - The full admission state machine (protection / backfill class / temporal
   credit / frontier distance) drives lane assignment.
+
+## Amendment (2026-10-08) — a reservation grows (ADR 0045)
+
+The KV resource dimension above reserves a request's whole
+`ceil((prompt + effective_max) / kv_page_tokens)` at admission, and the
+reservation never grows. ADR 0045 (spec `vram-budget/03`, its page-wise
+reservation ACs) replaces that rule; the lane machinery above is unchanged.
+
+- **The bound is unchanged:** prompt plus `effective_max`, never past the
+  context. `ContextExceeded` and `Oversized` are still decided on it at
+  submit. `effective_max` without a `max_tokens` is now the server's default
+  cap (`--default-max-tokens`, 38,912), clamped to the context; `0` restores
+  the whole context.
+- **The reservation is smaller and grows.** At admission it is the prompt (its
+  tail past a claimed prefix) plus one growth step (32 pages). From its first
+  round a lane keeps at least one step of room ahead and takes the next step
+  as it generates, up to its bound.
+- **When pages run out**, the lowest-ranked state below the requester moves
+  down a tier, by ADR 0023 as amended 2026-10-08. When nothing can move, an
+  admission waits and a growing lane parks.
+- **Sequences enter under the entry rule.** A restore or an admission enters
+  only with room for four steps for itself and for every resident sequence
+  ranked above it.
+- **Remaining work is now finite.** The protection arithmetic and the frontier
+  distance read a request's current reservation and its
+  `remaining_work = effective_max` as before. With the default cap,
+  `remaining_work` is finite for a request that names no cap.
