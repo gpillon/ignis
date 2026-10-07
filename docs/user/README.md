@@ -176,10 +176,40 @@ always-current table; this one is a copy.
 | `--kv-format <fmt>` | `IGNIS_KV_FORMAT` | `hq-e8-2b` | `hq-e8-2b` (serving) or `bf16` (retained; the format every correctness oracle runs against — [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md)). Decides what a pool byte budget is worth in tokens. |
 | `--kv-pool-bytes <bytes>` | `IGNIS_KV_POOL_BYTES` | the rest of the VRAM budget | The paged-KV pool budget (accepts `K`/`M`/`G`). Too small for `--max-context`, or past the VRAM budget, fails the load by name. |
 | `--kv-host-pool-bytes <bytes>` | `IGNIS_KV_HOST_POOL_BYTES` | `2G` | The KV-RAM host tier. Page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle — and the figure Windows reports as shared GPU memory. `0` disables the host tier. (`make` sets `8G`.) |
-| `--spec <backend>` | `IGNIS_SPEC` | unset | Speculative decoding backend: `dflash2`, or unset for none. |
-| `--draft-tokens <n>` | `IGNIS_DRAFT_TOKENS` | — | Required with `--spec`; 1..7. |
+| `--spec <backend>` | `IGNIS_SPEC` | unset | Speculative decoding backend: `dflash2` (Qwen3.8-27B), `mtp` (Qwen3.8-Flash-Next, see [below](#flash-next-speculation-mtp)), `off`, or unset for none. |
+| `--draft-tokens <n>` | `IGNIS_DRAFT_TOKENS` | — | 1..7. Required with `--spec dflash2`; with `--spec mtp` the most drafts a lane verifies per round (default 2). |
+| `--draft-rows <n>` | `IGNIS_DRAFT_ROWS` | `0` (= 8) | Flash-Next MTP only: the rows one verify round may take across all lanes, `0` or 2..8. Each lane drafts `min(draft tokens, rows / lanes - 1)`, so `3` drafts at one lane only. (`make` knob `DRAFT_ROWS`.) |
 | `--draft-head <head>` | `IGNIS_DRAFT_HEAD` | `full` | Needs `--spec`. The head the drafter proposes with: `full` (the target's output head) or `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM). What a round accepts is still the target's choice, so the text changes only at near ties; measured on coding prompts `shortlist` accepts 7% fewer tokens per round and is slower overall ([finding](../findings/2026-09-24-upstream-quick-wins-ab.md)). (`make` knob `DRAFT_HEAD`.) |
 | `--rope-scaling <spec>` | `IGNIS_ROPE_SCALING` | none | `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]` rescales the checkpoint's trained 262,144-position envelope. `F` in (1, 64]. |
+
+### Flash-Next speculation (MTP)
+
+Qwen3.8-Flash-Next can draft with its own multi-token-prediction head
+(`--spec mtp`, `make MODEL=flash-next SPEC=mtp`). It is **off by default**, and
+on a 5090 that is the better setting for most uses. Before turning it on:
+
+- **It needs its companion container** beside the artifact
+  (`qwen3_8_flash_next_mtp_3p0-v2.ninfer`, ~1 GB). `--spec mtp` without it
+  refuses the start.
+- **It keeps the text.** Greedy output is the same as without it, up to
+  near-ties, and sampling keeps its distribution.
+- **It costs ~1.1 GB of VRAM, taken from the expert cache, not from the
+  context.** The KV pool, and so `--max-context`, is unchanged. The cost is
+  reserved at load and stays the same whatever the number of drafts: a
+  smaller `--draft-tokens` or `--draft-rows` does not give it back.
+- **It pays off at one active request, and costs at two or three.** On an
+  RTX 5090 (PCIe Gen 3, 2026-10-07): one lane runs 1.02-1.30x faster (most on
+  long prose); two and three lanes run 7-15% slower with the default row
+  budget, and 1-2% slower with `--draft-rows 3`, which drafts at one lane
+  only. Decode there is bound by the experts it copies in over PCIe, and a
+  verify round copies more of them
+  ([finding](../findings/2026-10-07-flash-next-mtp-speculation-is-pcie-bound.md)).
+  These figures leave out the 1.1 GB the head takes from the expert cache,
+  so the served cost at several lanes is a little higher.
+- **Use it** when one user or one agent works at a time: `--spec mtp
+  --draft-rows 3`. **Leave it off** when several agents decode together.
+- A card that holds every expert in VRAM (96 GB) copies none over PCIe,
+  which is where MTP should pay most. It is not measured there yet.
 
 ### VRAM budget and retained state
 

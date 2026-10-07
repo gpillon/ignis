@@ -1363,8 +1363,9 @@ fn help_text() -> String {
          \x20       --system-message-policy <p> env: IGNIS_SYSTEM_MESSAGE_POLICY (default: merge; merge = a leading run of system messages joins the system prompt, a later one is its own block in place; strict = 400 for a system message that is not first)\n\
          \x20       --developer-message-policy <p> env: IGNIS_DEVELOPER_MESSAGE_POLICY (default: inplace; inplace, into-system, after-system, one-after-system or reject; a leading developer message is the system prompt except under reject)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
-         \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
-         \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
+         \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2 on the 27B, mtp on Flash-Next with its companion container beside the artifact, off)\n\
+         \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (1..{MAX_DRAFT_TOKENS}; required with --spec dflash2; with --spec mtp the most drafts a lane verifies, default {FLASH_NEXT_DEFAULT_DRAFT_TOKENS})\n\
+         \x20       --draft-rows <n>          env: IGNIS_DRAFT_ROWS     (Flash-Next mtp only; default: 0 = {FLASH_NEXT_VERIFY_ROWS}; rows a verify round takes across lanes, 0 or 2..{FLASH_NEXT_VERIFY_ROWS}; 3 drafts at one lane only)\n\
          \x20       --draft-head <head>       env: IGNIS_DRAFT_HEAD     (default: full; needs --spec; full = the drafter proposes with the target's output head, shortlist = with the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM)\n\
          \x20       --rope-scaling <spec>     env: IGNIS_ROPE_SCALING   (default: none; `yarn:F[,t=..][,bf=..][,bs=..]` rescales the checkpoint's trained 262144-position envelope, F in (1, {MAX_YARN_FACTOR}])\n\
          \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
@@ -1612,6 +1613,20 @@ mod tests {
         assert!(line.contains("IGNIS_THINKING_BUDGET"), "{line}");
         assert!(line.contains(&format!("default: {DEFAULT_THINKING_BUDGET}")), "{line}");
         assert!(line.contains("off"), "{line}");
+    }
+
+    /// GitHub #307: the help names Flash-Next's MTP backend and its row
+    /// budget, so an operator finds them without the user docs.
+    #[test]
+    fn the_help_names_mtp_and_the_draft_row_budget() {
+        let ConfigOutcome::Help(help) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
+            panic!("--help is help");
+        };
+        let spec = help.lines().find(|l| l.contains("--spec <")).expect("a --spec line");
+        assert!(spec.contains("mtp") && spec.contains("off"), "{spec}");
+        let rows = help.lines().find(|l| l.contains("--draft-rows")).expect("a --draft-rows line");
+        assert!(rows.contains("IGNIS_DRAFT_ROWS"), "{rows}");
+        assert!(rows.contains(&format!("0 = {FLASH_NEXT_VERIFY_ROWS}")), "{rows}");
     }
 
     #[test]
