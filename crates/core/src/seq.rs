@@ -205,6 +205,17 @@ pub(crate) mod ffi {
         pub last_clone_micros: f64,
     }
 
+    /// 1:1 with `struct ignis_seq_transfer` (spec vram-budget/03): one window
+    /// of a blob, and the stream its copies go on.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct IgnisSeqTransfer {
+        pub offset: u64,
+        pub bytes: u64,
+        pub blob_bytes: u64,
+        pub stream: *mut c_void,
+    }
+
     /// 1:1 with `struct ignis_seq_checkpoint_stats` (GitHub #186).
     #[repr(C)]
     #[derive(Debug, Clone, Copy, Default)]
@@ -259,6 +270,7 @@ pub(crate) mod ffi {
             seq: *const IgnisSeq,
             dst: *mut c_void,
             dst_bytes: u64,
+            window: *const IgnisSeqTransfer,
         ) -> i32;
 
         pub fn ignis_seq_restore(
@@ -266,7 +278,13 @@ pub(crate) mod ffi {
             seq: *mut IgnisSeq,
             src: *const c_void,
             src_bytes: u64,
+            window: *const IgnisSeqTransfer,
         ) -> i32;
+
+        pub fn ignis_seq_pool_transfer_stream(pool: *const IgnisSeqPool) -> *mut c_void;
+        pub fn ignis_seq_pool_fence(pool: *mut IgnisSeqPool, stream: *mut c_void, out_fence: *mut u64) -> i32;
+        pub fn ignis_seq_pool_fence_query(pool: *mut IgnisSeqPool, fence: u64) -> i32;
+        pub fn ignis_seq_pool_fence_wait(pool: *mut IgnisSeqPool, fence: u64) -> i32;
 
         pub fn ignis_seq_prefix_publish(
             pool: *mut IgnisSeqPool,
@@ -301,6 +319,7 @@ pub(crate) mod ffi {
             prefix: *const IgnisSeqPrefix,
             dst: *mut c_void,
             dst_bytes: u64,
+            window: *const IgnisSeqTransfer,
         ) -> i32;
 
         pub fn ignis_seq_checkpoint_capture(
@@ -339,6 +358,7 @@ pub(crate) mod ffi {
             checkpoint: *const IgnisSeqCheckpoint,
             dst: *mut c_void,
             dst_bytes: u64,
+            window: *const IgnisSeqTransfer,
         ) -> i32;
 
         pub fn ignis_seq_retained_store(
@@ -777,6 +797,52 @@ impl SeqPool {
     pub(crate) fn handle(&self) -> *mut ffi::IgnisSeqPool {
         self.handle
     }
+
+    /// A fence after every window issued on this pool's transfer stream so
+    /// far (spec vram-budget/03).
+    pub fn fence(&self) -> Result<u64, String> {
+        let mut fence = 0;
+        let rc = unsafe {
+            ffi::ignis_seq_pool_fence(self.handle, ffi::ignis_seq_pool_transfer_stream(self.handle), &mut fence)
+        };
+        if rc == 0 { Ok(fence) } else { Err(last_error()) }
+    }
+
+    /// Whether `fence` has passed: every window before it landed. A passed
+    /// fence is retired, and asking again is an error. Never blocks.
+    pub fn fence_passed(&self, fence: u64) -> Result<bool, String> {
+        match unsafe { ffi::ignis_seq_pool_fence_query(self.handle, fence) } {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ => Err(last_error()),
+        }
+    }
+
+    /// Block until `fence` has passed, and retire it.
+    pub fn fence_wait(&self, fence: u64) -> Result<(), String> {
+        let rc = unsafe { ffi::ignis_seq_pool_fence_wait(self.handle, fence) };
+        if rc == 0 { Ok(()) } else { Err(last_error()) }
+    }
+}
+
+/// One window of a blob (spec vram-budget/03): `bytes` bytes from `offset`
+/// of a `blob_bytes`-byte blob. Its copies go on the pool's transfer stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub offset: u64,
+    pub bytes: u64,
+    pub blob_bytes: u64,
+}
+
+impl Window {
+    fn ffi(self, pool: *mut ffi::IgnisSeqPool) -> ffi::IgnisSeqTransfer {
+        ffi::IgnisSeqTransfer {
+            offset: self.offset,
+            bytes: self.bytes,
+            blob_bytes: self.blob_bytes,
+            stream: unsafe { ffi::ignis_seq_pool_transfer_stream(pool) },
+        }
+    }
 }
 
 /// What the leaf allocates while serving, by what made it (GitHub #211,
@@ -914,7 +980,22 @@ impl SeqCheckpoint<'_> {
                 self.handle,
                 dst.as_mut_ptr().cast(),
                 dst.len() as u64,
+                std::ptr::null(),
             )
+        };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
+    }
+
+    /// One window of [`SeqCheckpoint::snapshot_into`]'s blob into `dst`, its
+    /// copies issued on the pool's transfer stream (spec vram-budget/03).
+    ///
+    /// # Safety
+    /// `dst` is written after this returns: it must stay alive, and unread,
+    /// until a fence taken after this call ([`SeqPool::fence`]) has passed.
+    pub unsafe fn snapshot_window(&self, window: Window, dst: &mut [u8]) -> Result<(), SeqTransferError> {
+        let transfer = window.ffi(self.pool);
+        let rc = unsafe {
+            ffi::ignis_seq_checkpoint_snapshot(self.pool, self.handle, dst.as_mut_ptr().cast(), dst.len() as u64, &transfer)
         };
         if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
     }
@@ -1001,7 +1082,21 @@ impl SeqPrefix<'_> {
                 self.handle,
                 dst.as_mut_ptr().cast(),
                 dst.len() as u64,
+                std::ptr::null(),
             )
+        };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
+    }
+
+    /// One window of [`SeqPrefix::snapshot_into`]'s blob into `dst`, its
+    /// copies issued on the pool's transfer stream (spec vram-budget/03).
+    ///
+    /// # Safety
+    /// As [`SeqCheckpoint::snapshot_window`].
+    pub unsafe fn snapshot_window(&self, window: Window, dst: &mut [u8]) -> Result<(), SeqTransferError> {
+        let transfer = window.ffi(self.pool);
+        let rc = unsafe {
+            ffi::ignis_seq_prefix_snapshot(self.pool, self.handle, dst.as_mut_ptr().cast(), dst.len() as u64, &transfer)
         };
         if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
     }
@@ -1107,6 +1202,7 @@ impl<'a> Seq<'a> {
                 self.handle,
                 dst.as_mut_ptr() as *mut c_void,
                 dst.len() as u64,
+                std::ptr::null(),
             )
         };
         if rc == 0 {
@@ -1114,6 +1210,44 @@ impl<'a> Seq<'a> {
         } else {
             Err(transfer_error(rc))
         }
+    }
+
+    /// One window of [`Seq::snapshot_into`]'s blob into `dst`, its copies
+    /// issued on the pool's transfer stream and not waited for (spec
+    /// vram-budget/03). The windows of one blob, laid end to end, are the
+    /// whole call's bytes. `window.blob_bytes` is the size the caller sized
+    /// the transfer by; a sequence that has moved since is refused.
+    ///
+    /// # Safety
+    /// `dst` is written after this returns: it must stay alive, and unread,
+    /// until a fence taken after this call ([`SeqPool::fence`]) has passed.
+    /// The sequence must not be stepped before then either.
+    pub unsafe fn snapshot_window(&self, window: Window, dst: &mut [u8]) -> Result<(), SeqTransferError> {
+        let transfer = window.ffi(self.pool);
+        let rc = unsafe {
+            ffi::ignis_seq_snapshot(self.pool, self.handle, dst.as_mut_ptr() as *mut c_void, dst.len() as u64, &transfer)
+        };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
+    }
+
+    /// Feed one window of a blob into this sequence (spec vram-budget/03):
+    /// windows in order, the first at 0, `src` holding exactly the window.
+    /// The header and the section records are checked before any byte moves
+    /// ([`BAD_SNAPSHOT`](SeqTransferError::is_bad_snapshot) ends the restore
+    /// and leaves the sequence as it was); the progress scalars land with
+    /// the last window. Until then the sequence refuses every step.
+    ///
+    /// # Safety
+    /// `src` is read after this returns: it must stay alive, and unchanged,
+    /// until a fence taken after this call ([`SeqPool::fence`]) has passed --
+    /// and the sequence must not be stepped, nor released, before the last
+    /// window's has.
+    pub unsafe fn restore_window(&mut self, window: Window, src: &[u8]) -> Result<(), SeqTransferError> {
+        let transfer = window.ffi(self.pool);
+        let rc = unsafe {
+            ffi::ignis_seq_restore(self.pool, self.handle, src.as_ptr() as *const c_void, src.len() as u64, &transfer)
+        };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
     }
 
     /// [`Seq::snapshot_bytes`] then [`Seq::snapshot_into`] over a freshly
@@ -1142,6 +1276,7 @@ impl<'a> Seq<'a> {
                 self.handle,
                 src.as_ptr() as *const c_void,
                 src.len() as u64,
+                std::ptr::null(),
             )
         };
         if rc == 0 {

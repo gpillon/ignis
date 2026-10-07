@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 /* The GDN causal-conv kernel width (mirrors kernel/src/model.cu's
@@ -173,6 +174,21 @@ struct ignis_seq_pool {
     pinned_block &operator=(const pinned_block &) = delete;
     ~pinned_block();
   } retained_host;
+  /* The windowed transfer's stream and its fences (spec vram-budget/03):
+   * the stream is created with the pool, non-blocking, so neither the default
+   * stream nor the model's waits on a window the disk tier has in flight;
+   * a fence is an event recorded on it, named by an id rather than handed
+   * across the C boundary. Freed with the pool. */
+  struct transfer_lane {
+    cudaStream_t stream = nullptr;
+    std::uint64_t next_fence = 1;
+    std::unordered_map<std::uint64_t, cudaEvent_t> fences;
+    std::vector<cudaEvent_t> spare;
+    transfer_lane() = default;
+    transfer_lane(const transfer_lane &) = delete;
+    transfer_lane &operator=(const transfer_lane &) = delete;
+    ~transfer_lane();
+  } transfer;
   /* The pool slot index of the first host retained slot: past every lane and
    * every device retained slot. */
   std::int32_t first_host_retained_slot() const {
@@ -434,7 +450,29 @@ struct ignis_seq {
   // block-table row, until ignis_seq_release hands them over; one reference
   // to the link is held until then.
   ignis_seq_prefix *lent_to = nullptr;
+  // A windowed restore under way (spec vram-budget/03), or null: what has
+  // been fed, and what the blob's header said once it had all arrived. Set by
+  // the first window, cleared by the last -- or by a refusal, which leaves
+  // the sequence as it was. While set, every step, snapshot, publish and
+  // capture refuses the sequence (`ignis_seq_restore_refusal`).
+  struct restore_window {
+    std::uint64_t blob_bytes = 0;    // the whole blob, as the caller named it
+    std::uint64_t fed        = 0;    // bytes fed so far: the next window's offset
+    bool validated           = false; // the header and the records checked out
+    std::uint32_t kv_page_count = 0; // the blob's, once validated
+    std::vector<unsigned char> head;     // the header and the records, as they arrive
+    std::vector<unsigned char> progress; // the progress image, as it arrives
+  };
+  std::unique_ptr<restore_window> restoring;
 };
+
+/* Why `seq` refuses a step, a snapshot, a publish or a capture: a windowed
+ * restore not yet complete (spec vram-budget/03), or nullptr. */
+inline const char *ignis_seq_restore_refusal(const ignis_seq &seq) {
+  return seq.restoring != nullptr
+             ? "the sequence's windowed restore is incomplete (it refuses every step until its last window)"
+             : nullptr;
+}
 
 /* Whether `seq` was actually drawn from `pool`.
  *

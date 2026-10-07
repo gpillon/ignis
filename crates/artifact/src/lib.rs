@@ -56,7 +56,7 @@ pub use checksum::{
     verify, ChecksumReport, GraftedSource, Nvfp4Record, ObjectCheck, Outcome, Sidecar,
 };
 pub use device::{CpuDevice, Device, DeviceBuffer};
-pub use direct::{AlignedBuffer, DirectReader};
+pub use direct::{AlignedBuffer, DirectReader, DirectWriter};
 #[cfg(feature = "cuda")]
 pub use device::CudaDevice;
 #[cfg(feature = "cuda")]

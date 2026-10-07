@@ -823,9 +823,9 @@ void check_refusals() {
   expect_rc(ignis_seq_snapshot_size(pool, claimant, &bytes), 0,
             "materialize: size a claimant's whole-sequence snapshot");
   std::vector<unsigned char> scratch(bytes);
-  expect_rc(ignis_seq_snapshot(pool, claimant, scratch.data(), scratch.size()), 0,
+  expect_rc(ignis_seq_snapshot(pool, claimant, scratch.data(), scratch.size(), nullptr), 0,
             "materialize: snapshot a claimant including its shared head");
-  expect_rc(ignis_seq_restore(pool, claimant, scratch.data(), scratch.size()),
+  expect_rc(ignis_seq_restore(pool, claimant, scratch.data(), scratch.size(), nullptr),
             IGNIS_SEQ_ERR_SHARED_PREFIX, "refuse: a claimant is not restored into");
   // The publisher is a claimant of its own prefix and materializes too.
   expect_rc(ignis_seq_snapshot_size(pool, seq, &bytes), 0,
@@ -835,13 +835,13 @@ void check_refusals() {
   ignis_seq_release(pool, seq);
   ignis_seq *restored = nullptr;
   expect_rc(ignis_seq_alloc(pool, kContext, &restored), 0, "materialize: alloc restore target");
-  expect_rc(ignis_seq_restore(pool, restored, scratch.data(), scratch.size()), 0,
+  expect_rc(ignis_seq_restore(pool, restored, scratch.data(), scratch.size(), nullptr), 0,
             "materialize: restore without the shared handle");
   std::uint64_t restored_bytes = 0;
   expect_rc(ignis_seq_snapshot_size(pool, restored, &restored_bytes), 0,
             "materialize: size restored state");
   std::vector<unsigned char> again(restored_bytes);
-  expect_rc(ignis_seq_snapshot(pool, restored, again.data(), again.size()), 0,
+  expect_rc(ignis_seq_snapshot(pool, restored, again.data(), again.size(), nullptr), 0,
             "materialize: re-snapshot restored state");
   expect(again == scratch, "materialize: the standalone round trip is byte-exact");
   ignis_seq_release(pool, restored);
@@ -1130,11 +1130,11 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2, bool hq 
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_prefix_snapshot_size(pool, prefix, &bytes), 0, "spill: size");
   std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
-  expect_rc(ignis_seq_prefix_snapshot(pool, prefix, blob.data(), bytes), 0, "spill: snapshot");
+  expect_rc(ignis_seq_prefix_snapshot(pool, prefix, blob.data(), bytes, nullptr), 0, "spill: snapshot");
   std::uint64_t publisher_bytes = 0;
   expect_rc(ignis_seq_snapshot_size(pool, publisher, &publisher_bytes), 0, "spill: publisher size");
   std::vector<unsigned char> own(static_cast<std::size_t>(publisher_bytes));
-  expect_rc(ignis_seq_snapshot(pool, publisher, own.data(), publisher_bytes), 0,
+  expect_rc(ignis_seq_snapshot(pool, publisher, own.data(), publisher_bytes, nullptr), 0,
             "spill: publisher snapshot");
   // GitHub #194: the one word the two differ in is the rope delta, which a
   // prefix does not carry -- its publisher's is the whole prompt's.
@@ -1165,7 +1165,7 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2, bool hq 
   // Back up: restore into a fresh sequence, publish there, let it go.
   ignis_seq *carrier = nullptr;
   expect_rc(ignis_seq_alloc(pool, kPrefix + kPageTokens, &carrier), 0, "spill: alloc carrier");
-  expect_rc(ignis_seq_restore(pool, carrier, blob.data(), bytes), 0, "spill: restore");
+  expect_rc(ignis_seq_restore(pool, carrier, blob.data(), bytes, nullptr), 0, "spill: restore");
   ignis_seq_prefix *returned = nullptr;
   // Into the very slot the original held: it came back with the handle.
   expect_rc(ignis_seq_prefix_publish(pool, carrier, kPrefix, 2, &returned), 0,
@@ -1175,7 +1175,7 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2, bool hq 
   std::uint64_t again_bytes = 0;
   expect_rc(ignis_seq_prefix_snapshot_size(pool, returned, &again_bytes), 0, "spill: size again");
   std::vector<unsigned char> again(static_cast<std::size_t>(again_bytes));
-  expect_rc(ignis_seq_prefix_snapshot(pool, returned, again.data(), again_bytes), 0,
+  expect_rc(ignis_seq_prefix_snapshot(pool, returned, again.data(), again_bytes, nullptr), 0,
             "spill: snapshot again");
   expect(again == blob, "spill: the prefix that came back is the prefix that left");
 
@@ -1185,7 +1185,7 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2, bool hq 
   std::uint64_t claimant_bytes = 0;
   expect_rc(ignis_seq_snapshot_size(pool, claimant, &claimant_bytes), 0, "spill: claimant size");
   std::vector<unsigned char> claimed(static_cast<std::size_t>(claimant_bytes));
-  expect_rc(ignis_seq_snapshot(pool, claimant, claimed.data(), claimant_bytes), 0,
+  expect_rc(ignis_seq_snapshot(pool, claimant, claimed.data(), claimant_bytes, nullptr), 0,
             "spill: claimant snapshot");
   expect(claimed == blob, "spill: and stands exactly where the original's claimant stood");
 

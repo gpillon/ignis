@@ -33,6 +33,7 @@
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
 #include "ignis_seq_sections.h"
+#include "seq_window_test_common.h"
 
 #include "core/device.h"
 
@@ -189,7 +190,7 @@ std::vector<unsigned char> snapshot_of(const ignis_seq_pool &pool, const ignis_s
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_snapshot_size(&pool, &seq, &bytes), 0, label);
   std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
-  expect_rc(ignis_seq_snapshot(&pool, &seq, blob.data(), bytes), 0, label);
+  expect_rc(ignis_seq_snapshot(&pool, &seq, blob.data(), bytes, nullptr), 0, label);
   return blob;
 }
 
@@ -352,14 +353,14 @@ void check_section_table() {
 
   // A destination one byte short is refused rather than truncated.
   std::vector<unsigned char> tight(static_cast<std::size_t>(reported) - 1);
-  expect_rc(ignis_seq_snapshot(pool, seq, tight.data(), tight.size()), -1,
+  expect_rc(ignis_seq_snapshot(pool, seq, tight.data(), tight.size(), nullptr), -1,
            "table: a destination below the reported size is refused");
 
   // The blob is the same bytes whatever was in the destination before: a
   // host tier reuses its pinned regions, and the gaps between sections are
   // part of the blob's extent.
   std::vector<unsigned char> dirty(static_cast<std::size_t>(reported), 0xEE);
-  expect_rc(ignis_seq_snapshot(pool, seq, dirty.data(), dirty.size()), 0,
+  expect_rc(ignis_seq_snapshot(pool, seq, dirty.data(), dirty.size(), nullptr), 0,
            "table: snapshot into a used buffer");
   expect(dirty == blob, "table: a snapshot into a dirty buffer is byte-identical to a clean one");
 
@@ -392,7 +393,7 @@ void check_round_trip(const ignis_seq_pool_spec &spec, std::uint32_t context_tok
   expect(target->position == 0 && target->pending_token == -1 && target->rope_delta == 0,
         "round trip: a fresh sequence starts at zero");
 
-  expect_rc(ignis_seq_restore(pool, target, blob.data(), blob.size()), 0,
+  expect_rc(ignis_seq_restore(pool, target, blob.data(), blob.size(), nullptr), 0,
            "round trip: restore");
   expect(target->position == history_tokens, "round trip: the frontier is restored");
   expect(target->pending_token == pending, "round trip: the pending token is restored");
@@ -426,7 +427,7 @@ void expect_refused(ignis_seq_pool *pool, ignis_seq *target,
                     const std::vector<unsigned char> &blob, std::uint64_t src_bytes,
                     const char *label) {
   const std::vector<unsigned char> before = snapshot_of(*pool, *target, label);
-  expect_rc(ignis_seq_restore(pool, target, blob.data(), src_bytes), IGNIS_SEQ_ERR_BAD_SNAPSHOT,
+  expect_rc(ignis_seq_restore(pool, target, blob.data(), src_bytes, nullptr), IGNIS_SEQ_ERR_BAD_SNAPSHOT,
            label);
   const std::vector<unsigned char> after = snapshot_of(*pool, *target, label);
   if (before != after) {
@@ -493,7 +494,7 @@ void check_refusals() {
   }
   {
     std::vector<unsigned char> stub(sizeof(ignis_seq_snapshot_header) / 2, 0);
-    expect_rc(ignis_seq_restore(pool, target, stub.data(), stub.size()),
+    expect_rc(ignis_seq_restore(pool, target, stub.data(), stub.size(), nullptr),
              IGNIS_SEQ_ERR_BAD_SNAPSHOT, "refusals: a buffer shorter than a header");
   }
 
@@ -515,7 +516,7 @@ void check_refusals() {
   {
     ignis_seq *small = nullptr;
     expect_rc(ignis_seq_alloc(pool, 64, &small), 0, "refusals: alloc a one-page target");
-    expect_rc(ignis_seq_restore(pool, small, blob.data(), blob.size()),
+    expect_rc(ignis_seq_restore(pool, small, blob.data(), blob.size(), nullptr),
              IGNIS_SEQ_ERR_BAD_SNAPSHOT, "refusals: a target that maps fewer pages");
     expect(small->position == 0, "refusals: the too-small target is unchanged");
     ignis_seq_release(pool, small);
@@ -530,7 +531,7 @@ void check_refusals() {
     expect_rc(ignis_seq_pool_create(&wide, &wide_pool), 0, "refusals: wide pool create");
     ignis_seq *wide_seq = nullptr;
     expect_rc(ignis_seq_alloc(wide_pool, 128, &wide_seq), 0, "refusals: wide alloc");
-    expect_rc(ignis_seq_restore(wide_pool, wide_seq, blob.data(), blob.size()),
+    expect_rc(ignis_seq_restore(wide_pool, wide_seq, blob.data(), blob.size(), nullptr),
              IGNIS_SEQ_ERR_BAD_SNAPSHOT, "refusals: a foreign KV geometry");
     expect(wide_seq->position == 0, "refusals: the foreign-geometry target is unchanged");
     ignis_seq_release(wide_pool, wide_seq);
@@ -543,7 +544,7 @@ void check_refusals() {
     ignis_seq_pool *other = nullptr;
     expect_rc(ignis_seq_pool_create(&spec, &other), 0, "refusals: second pool create");
     std::vector<unsigned char> elsewhere(blob.size());
-    expect_rc(ignis_seq_snapshot(other, source, elsewhere.data(), elsewhere.size()), -1,
+    expect_rc(ignis_seq_snapshot(other, source, elsewhere.data(), elsewhere.size(), nullptr), -1,
              "refusals: a sequence from another pool");
     ignis_seq_pool_free(other);
   }
@@ -560,7 +561,7 @@ void check_refusals() {
     expect_rc(ignis_seq_snapshot_size(pool, source, &bytes), IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
              "refusals: sizing a sequence mid-chunk at a GQA layer");
     expect(bytes == 0, "refusals: a refused size query reports nothing");
-    expect_rc(ignis_seq_snapshot(pool, source, scratch.data(), scratch.size()),
+    expect_rc(ignis_seq_snapshot(pool, source, scratch.data(), scratch.size(), nullptr),
              IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
              "refusals: snapshotting a sequence mid-chunk at a GQA layer");
     source->gqa_positions[0] -= 1;
@@ -573,7 +574,7 @@ void check_refusals() {
     source->gdn_positions[0] += 1;
     expect_rc(ignis_seq_snapshot_size(pool, source, &bytes), IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
              "refusals: sizing a sequence mid-chunk at a GDN layer");
-    expect_rc(ignis_seq_snapshot(pool, source, scratch.data(), scratch.size()),
+    expect_rc(ignis_seq_snapshot(pool, source, scratch.data(), scratch.size(), nullptr),
              IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
              "refusals: snapshotting a sequence mid-chunk at a GDN layer");
     source->gdn_positions[0] -= 1;
@@ -687,7 +688,7 @@ void check_hq_window_restore_into_another_slot() {
          "hq window restore: the blob carries the source slot's window");
 
   expect(hq_window_of(*pool, target->slot) != window, "hq window restore: the target differs first");
-  expect_rc(ignis_seq_restore(pool, target, blob.data(), blob.size()), 0,
+  expect_rc(ignis_seq_restore(pool, target, blob.data(), blob.size(), nullptr), 0,
             "hq window restore: restore into the other slot");
   expect(hq_window_of(*pool, target->slot) == window,
          "hq window restore: the target's slot now holds the source's rows and bits, every byte");
@@ -777,6 +778,18 @@ void check_host_pinned_arena() {
   expect_rc(ignis_host_pinned_can_alloc(4 * block, &fits), 0, "arena: can_alloc the whole arena");
   expect(fits == 1, "arena: freed neighbours coalesce back into one span");
 
+  // Spec vram-budget/03: every span starts on a 4 KiB boundary, so the disk
+  // tier can write a blob to its file straight from the arena -- an odd-sized
+  // blob's neighbour included.
+  void *odd[2] = {nullptr, nullptr};
+  expect_rc(ignis_host_pinned_alloc(100, &odd[0]), 0, "arena: an odd-sized blob");
+  expect_rc(ignis_host_pinned_alloc(100, &odd[1]), 0, "arena: its neighbour");
+  expect(reinterpret_cast<std::uintptr_t>(odd[0]) % 4096 == 0 &&
+             reinterpret_cast<std::uintptr_t>(odd[1]) % 4096 == 0,
+         "arena: every span starts on an unbuffered-IO boundary");
+  ignis_host_pinned_free(odd[0]);
+  ignis_host_pinned_free(odd[1]);
+
   ignis_host_pinned_free(nullptr); // a no-op, must not crash
   ignis_host_pinned_pool_destroy();
   expect_rc(ignis_host_pinned_pool_stats(&capacity, &used), 0, "arena: stats after destroy");
@@ -819,12 +832,12 @@ void check_pinned_alloc() {
     ignis_host_pinned_pool_destroy();
     return;
   }
-  expect_rc(ignis_seq_snapshot(pool, source, pinned, bytes), 0, "pinned alloc: snapshot into pinned");
+  expect_rc(ignis_seq_snapshot(pool, source, pinned, bytes, nullptr), 0, "pinned alloc: snapshot into pinned");
   ignis_seq_release(pool, source);
 
   ignis_seq *target = nullptr;
   expect_rc(ignis_seq_alloc(pool, 64, &target), 0, "pinned alloc: alloc target");
-  expect_rc(ignis_seq_restore(pool, target, pinned, bytes), 0, "pinned alloc: restore from pinned");
+  expect_rc(ignis_seq_restore(pool, target, pinned, bytes, nullptr), 0, "pinned alloc: restore from pinned");
 
   const std::vector<unsigned char> restored = snapshot_of(*pool, *target, "pinned alloc: re-snapshot");
   expect(restored.size() == bytes && std::memcmp(restored.data(), pinned, bytes) == 0,
@@ -871,18 +884,18 @@ void report_transfer_cost(std::uint32_t context_tokens, const char *label, bool 
 
   // One untimed pass first: the first transfer over a fresh pinned region
   // pays page-table work that a steady-state eviction does not.
-  expect_rc(ignis_seq_snapshot(pool, seq, pinned, bytes), 0, "cost: warmup snapshot");
+  expect_rc(ignis_seq_snapshot(pool, seq, pinned, bytes, nullptr), 0, "cost: warmup snapshot");
 
   constexpr int kReps = 3;
   double snapshot_ms  = 0;
   double restore_ms   = 0;
   for (int rep = 0; rep < kReps; ++rep) {
     auto began = std::chrono::steady_clock::now();
-    expect_rc(ignis_seq_snapshot(pool, seq, pinned, bytes), 0, "cost: snapshot");
+    expect_rc(ignis_seq_snapshot(pool, seq, pinned, bytes, nullptr), 0, "cost: snapshot");
     snapshot_ms += ms_since(began);
 
     began = std::chrono::steady_clock::now();
-    expect_rc(ignis_seq_restore(pool, seq, pinned, bytes), 0, "cost: restore");
+    expect_rc(ignis_seq_restore(pool, seq, pinned, bytes, nullptr), 0, "cost: restore");
     restore_ms += ms_since(began);
   }
   snapshot_ms /= kReps;
@@ -956,7 +969,7 @@ void check_drafter_sections() {
     ignis_seq_release(verify, verify_seq);
     ignis_seq *target = nullptr;
     expect_rc(ignis_seq_alloc(verify, 128, &target), 0, "verify-only: alloc target");
-    expect_rc(ignis_seq_restore(verify, target, plain_blob.data(), plain_blob.size()), 0,
+    expect_rc(ignis_seq_restore(verify, target, plain_blob.data(), plain_blob.size(), nullptr), 0,
               "verify-only: a plain blob restores");
     ignis_seq_release(verify, target);
     ignis_seq_release(plain, plain_seq);
@@ -1037,7 +1050,7 @@ void check_drafter_sections() {
   // to its own previous position, never to the restored sequence's.
   target->dflash2_pending = true;
   target->dflash2_pending_features.assign(16, 0x5a);
-  expect_rc(ignis_seq_restore(drafter, target, blob.data(), blob.size()), 0, "drafter: restore");
+  expect_rc(ignis_seq_restore(drafter, target, blob.data(), blob.size(), nullptr), 0, "drafter: restore");
   expect(!target->dflash2_pending && target->dflash2_pending_features.empty(),
          "drafter: a restore drops the target's carried anchor taps");
   expect(lane_image_of(*drafter->dflash2_window, target->slot) == window,
@@ -1061,6 +1074,199 @@ void check_drafter_sections() {
   ignis_seq_release(plain, plain_seq);
   ignis_seq_pool_free(drafter);
   ignis_seq_pool_free(plain);
+}
+
+// ---- 7. the windowed transfer (spec vram-budget/03) ------------------------
+//
+// The disk tier moves a blob a window at a time. Whatever the window -- a
+// sector, the tier's own 32 MiB, a size that divides nothing -- the windows
+// laid end to end are the whole call's bytes, and a restore fed them window
+// by window leaves a sequence that snapshots to those bytes again.
+
+// `seq`'s blob a `window` at a time.
+std::vector<unsigned char> snapshot_in_windows(ignis_seq_pool *pool, const ignis_seq *seq, std::uint64_t total,
+                                               std::uint64_t window) {
+  return seq_take_windows(pool, total, window,
+                          [&](unsigned char *dst, std::uint64_t bytes, const ignis_seq_transfer &transfer) {
+                            return ignis_seq_snapshot(pool, seq, dst, bytes, &transfer);
+                          });
+}
+
+void check_windows_of(const ignis_seq_pool_spec &spec, std::uint32_t context_tokens,
+                      std::uint64_t history_tokens, const char *label) {
+  std::printf("windows (%s)\n", label);
+  ignis_seq_pool *pool = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "windows: pool create");
+  expect(ignis_seq_pool_transfer_stream(pool) != nullptr, "windows: the pool has its own transfer stream");
+  ignis_seq *source = nullptr;
+  expect_rc(ignis_seq_alloc(pool, context_tokens, &source), 0, "windows: alloc source");
+  give_history(*pool, *source, history_tokens, 0x3Cu);
+  const std::vector<unsigned char> whole = snapshot_of(*pool, *source, "windows: whole snapshot");
+
+  for (const std::uint64_t window : seq_window_sizes()) {
+    const std::vector<unsigned char> taken = snapshot_in_windows(pool, source, whole.size(), window);
+    expect(taken == whole, "windows: a blob taken window by window is the whole call's, byte for byte");
+
+    ignis_seq *target = nullptr;
+    expect_rc(ignis_seq_alloc(pool, context_tokens, &target), 0, "windows: alloc target");
+    expect_rc(seq_restore_windows(pool, target, whole, window), 0, "windows: a restore fed window by window");
+    expect(target->restoring == nullptr, "windows: the last window completes the restore");
+    expect(target->position == history_tokens && target->pending_token == source->pending_token,
+           "windows: the progress scalars land with the last window");
+    expect(snapshot_of(*pool, *target, "windows: re-snapshot") == whole,
+           "windows: a windowed restore is byte-identical to the source");
+    ignis_seq_release(pool, target);
+  }
+
+  // A window of the wrong blob size, or one past its end, is refused.
+  void *stream = ignis_seq_pool_transfer_stream(pool);
+  std::vector<unsigned char> scratch(4096);
+  const ignis_seq_transfer stale{0, 4096, whole.size() + 1, stream};
+  expect_rc(ignis_seq_snapshot(pool, source, scratch.data(), scratch.size(), &stale), -1,
+            "windows: a blob size that moved is refused");
+  const ignis_seq_transfer past{whole.size() - 100, 4096, whole.size(), stream};
+  expect_rc(ignis_seq_snapshot(pool, source, scratch.data(), scratch.size(), &past), -1,
+            "windows: a window past the blob's end is refused");
+
+  ignis_seq_release(pool, source);
+  ignis_seq_pool_free(pool);
+}
+
+// The materialized blobs: a sequence standing on a shared prefix, the prefix
+// itself, and a checkpoint captured on it -- each taken window by window is
+// its whole call's blob.
+void check_windows_materialized() {
+  std::printf("windows (materialized blobs)\n");
+  ignis_seq_pool_spec spec = small_spec();
+  spec.retained_slot_count = 2;
+  ignis_seq_pool *pool     = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "materialized windows: pool create");
+  ignis_seq *publisher = nullptr;
+  expect_rc(ignis_seq_alloc(pool, 128, &publisher), 0, "materialized windows: alloc publisher");
+  give_history(*pool, *publisher, 64, 0x51u);
+  ignis_seq_prefix *prefix = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, 64, 0, &prefix), 0, "materialized windows: publish");
+  ignis_seq *claimant = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, 128, prefix, &claimant), 0, "materialized windows: claim");
+  give_history(*pool, *claimant, 100, 0x52u);
+  ignis_seq_checkpoint *checkpoint = nullptr;
+  expect_rc(ignis_seq_checkpoint_capture(pool, claimant, 100, 1, &checkpoint), 0,
+            "materialized windows: capture");
+
+  const std::vector<unsigned char> claimant_blob = snapshot_of(*pool, *claimant, "materialized windows: claimant");
+  std::uint64_t prefix_bytes = 0;
+  expect_rc(ignis_seq_prefix_snapshot_size(pool, prefix, &prefix_bytes), 0, "materialized windows: prefix size");
+  std::vector<unsigned char> prefix_blob(prefix_bytes);
+  expect_rc(ignis_seq_prefix_snapshot(pool, prefix, prefix_blob.data(), prefix_bytes, nullptr), 0,
+            "materialized windows: prefix blob");
+  std::uint64_t checkpoint_bytes = 0;
+  expect_rc(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &checkpoint_bytes), 0,
+            "materialized windows: checkpoint size");
+  std::vector<unsigned char> checkpoint_blob(checkpoint_bytes);
+  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, checkpoint_blob.data(), checkpoint_bytes, nullptr), 0,
+            "materialized windows: checkpoint blob");
+
+  for (const std::uint64_t window : seq_window_sizes()) {
+    expect(snapshot_in_windows(pool, claimant, claimant_blob.size(), window) == claimant_blob,
+           "materialized windows: a sequence on a shared prefix, window by window");
+    expect(seq_take_windows(pool, prefix_bytes, window,
+                            [&](unsigned char *dst, std::uint64_t bytes, const ignis_seq_transfer &transfer) {
+                              return ignis_seq_prefix_snapshot(pool, prefix, dst, bytes, &transfer);
+                            }) == prefix_blob,
+           "materialized windows: a prefix blob, window by window");
+    expect(seq_take_windows(pool, checkpoint_bytes, window,
+                            [&](unsigned char *dst, std::uint64_t bytes, const ignis_seq_transfer &transfer) {
+                              return ignis_seq_checkpoint_snapshot(pool, checkpoint, dst, bytes, &transfer);
+                            }) == checkpoint_blob,
+           "materialized windows: a checkpoint blob, window by window");
+  }
+
+  ignis_seq_checkpoint_release(pool, checkpoint);
+  ignis_seq_release(pool, claimant);
+  ignis_seq_release(pool, publisher);
+  ignis_seq_prefix_release(pool, prefix);
+  ignis_seq_pool_free(pool);
+}
+
+// A restore part-way: the sequence refuses every step's partner here -- a
+// snapshot, a whole restore, a publish, a capture, a window out of order --
+// and releases cleanly. A refused windowed restore leaves the target as it
+// was and ends the restore.
+void check_incomplete_restore() {
+  std::printf("windows (an incomplete restore)\n");
+  ignis_seq_pool_spec spec = small_spec();
+  spec.retained_slot_count = 1;
+  ignis_seq_pool *pool     = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "incomplete: pool create");
+  struct ignis_seq_pool_stats empty{};
+  expect_rc(ignis_seq_pool_stats(pool, &empty), 0, "incomplete: stats");
+  ignis_seq *source = nullptr;
+  expect_rc(ignis_seq_alloc(pool, 128, &source), 0, "incomplete: alloc source");
+  give_history(*pool, *source, 100, 0x61u);
+  const std::vector<unsigned char> blob = snapshot_of(*pool, *source, "incomplete: snapshot");
+  ignis_seq_release(pool, source);
+
+  // Windows of 100 bytes: the header and the records arrive in pieces.
+  ignis_seq *pieces = nullptr;
+  expect_rc(ignis_seq_alloc(pool, 128, &pieces), 0, "incomplete: alloc pieces");
+  expect_rc(seq_restore_windows(pool, pieces, blob, 100), 0, "incomplete: a restore whose header arrives in pieces");
+  expect(snapshot_of(*pool, *pieces, "incomplete: pieces re-snapshot") == blob,
+         "incomplete: a header gathered over windows restores the same sequence");
+  ignis_seq_release(pool, pieces);
+
+  ignis_seq *target = nullptr;
+  expect_rc(ignis_seq_alloc(pool, 128, &target), 0, "incomplete: alloc target");
+  void *stream = ignis_seq_pool_transfer_stream(pool);
+  const ignis_seq_transfer first{0, 600, blob.size(), stream};
+  expect_rc(ignis_seq_restore(pool, target, blob.data(), 600, &first), 0, "incomplete: the first window");
+  std::uint64_t fence = 0;
+  expect_rc(ignis_seq_pool_fence(pool, stream, &fence), 0, "incomplete: fence");
+  expect_rc(ignis_seq_pool_fence_wait(pool, fence), 0, "incomplete: fence wait");
+  expect(target->restoring != nullptr && target->restoring->validated, "incomplete: under way, its header checked");
+
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, target, &bytes), -1, "incomplete: snapshot size refused");
+  std::vector<unsigned char> scratch(blob.size());
+  expect_rc(ignis_seq_snapshot(pool, target, scratch.data(), scratch.size(), nullptr), -1,
+            "incomplete: snapshot refused");
+  expect(std::string(ignis_seq_last_error()).find("incomplete") != std::string::npos,
+         "incomplete: the refusal names the incomplete restore");
+  expect_rc(ignis_seq_restore(pool, target, blob.data(), blob.size(), nullptr), -1,
+            "incomplete: a whole restore over it refused");
+  ignis_seq_prefix *prefix = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, target, 64, 0, &prefix), -1, "incomplete: publish refused");
+  ignis_seq_checkpoint *checkpoint = nullptr;
+  expect_rc(ignis_seq_checkpoint_capture(pool, target, 100, 0, &checkpoint), -1, "incomplete: capture refused");
+  expect_rc(ignis_seq_restore(pool, target, blob.data(), 600, &first), -1,
+            "incomplete: a window that does not continue the restore refused");
+  expect(target->restoring != nullptr && target->restoring->fed == 600,
+         "incomplete: a refused window leaves the restore where it was");
+
+  ignis_seq_release(pool, target);
+  struct ignis_seq_pool_stats after{};
+  expect_rc(ignis_seq_pool_stats(pool, &after), 0, "incomplete: stats after release");
+  expect(after.kv_free_pages == empty.kv_free_pages && after.free_slot_count == empty.free_slot_count,
+         "incomplete: a sequence released mid-restore gives back every page and its slot");
+
+  // A foreign first window: refused before a byte moves, the restore over.
+  ignis_seq *untouched = nullptr;
+  expect_rc(ignis_seq_alloc(pool, 128, &untouched), 0, "incomplete: alloc untouched");
+  give_history(*pool, *untouched, 64, 0x62u);
+  const std::vector<unsigned char> before = snapshot_of(*pool, *untouched, "incomplete: before");
+  std::vector<unsigned char> foreign      = blob;
+  foreign[0] ^= 0xFF;
+  const ignis_seq_transfer bad{0, foreign.size(), foreign.size(), stream};
+  expect_rc(ignis_seq_restore(pool, untouched, foreign.data(), foreign.size(), &bad), IGNIS_SEQ_ERR_BAD_SNAPSHOT,
+            "incomplete: a foreign blob's first window refused");
+  expect(untouched->restoring == nullptr, "incomplete: a refusal ends the restore");
+  expect(snapshot_of(*pool, *untouched, "incomplete: after") == before,
+         "incomplete: a refused windowed restore leaves the target as it was");
+  // The same blob, named at another size: refused by its own header.
+  const ignis_seq_transfer resized{0, 600, blob.size() + 4096, stream};
+  expect_rc(ignis_seq_restore(pool, untouched, blob.data(), 600, &resized), IGNIS_SEQ_ERR_BAD_SNAPSHOT,
+            "incomplete: a blob whose header disagrees with the transfer's size refused");
+  ignis_seq_release(pool, untouched);
+  ignis_seq_pool_free(pool);
 }
 
 } // namespace
@@ -1093,6 +1299,16 @@ int main() {
   check_host_pinned_arena();
   check_pinned_alloc();
   check_drafter_sections();
+  // Spec vram-budget/03: the windowed transfer, both KV formats, with and
+  // without the drafter's window (Flash-Next's pool is
+  // test_seq_flash_next_sections.cpp's).
+  check_windows_of(small_spec(), 128, 100, "bf16, small geometry");
+  check_windows_of(qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, 256, 2), 256, 200, "hq-e8-2b, 27B geometry");
+  check_windows_of(qwen38_27b_spec(IGNIS_KV_FORMAT_BF16, 256, 2), 256, 200, "bf16, 27B geometry");
+  check_windows_of(with_drafter(qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, 256, 2)), 256, 200,
+                   "hq-e8-2b, 27B geometry, dflash2");
+  check_windows_materialized();
+  check_incomplete_restore();
   // 128 tokens is the "short sequence" the spec prices at the snapshot's
   // floor (the GDN slot plus the conv taps and the penalty-count row);
   // 40,960 is the engine's own default context, where KV dominates. Each
