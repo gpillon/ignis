@@ -705,9 +705,10 @@ pub fn flash_next_scheduler_with_ngram_cache(
         kv_ram_arena_bytes: options.kv_ram_arena_bytes,
     });
     // GitHub #306: `--ngram-hot-bytes` as named, or `auto` from the room the
-    // other lines leave; the line charges what the table will hold.
+    // other lines leave; the line charges the budget, capped at what the
+    // table can hold at it.
     options.ngram.hot_bytes = shape.ngram_hot.resolve(&footprint, host_request.as_ref().map(ngram_hot_rows_room));
-    let ngram_hot_rows_bytes = footprint.held_bytes(options.ngram.hot_bytes);
+    let ngram_hot_rows_bytes = footprint.line_bytes(options.ngram.hot_bytes);
     if let Some(request) = host_request.as_mut() {
         request.ngram_hot_rows_bytes = ngram_hot_rows_bytes;
         let host = plan_host(request).map_err(|e| e.to_string())?;

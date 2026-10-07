@@ -261,8 +261,9 @@ exactly where it would refuse the default. So `auto` never refuses a start the
 default would make, and the rows it picks, which key the cache file, change
 only when free RAM crosses one of those steps rather than at every start. The
 host plan (`ignis.runtime.flash_next_host_plan`) logs the budget as named
-(`ngram_hot_budget`), as resolved (`ngram_hot_budget_bytes`) and what the
-table will hold (`ngram_hot_rows_bytes`);
+(`ngram_hot_budget`), as resolved (`ngram_hot_budget_bytes`) and its plan
+line (`ngram_hot_rows_bytes`: the budget, capped at what the table can hold at
+it, so `4G` is charged as the 1.37 GiB ranking);
 `ignis.ngram.hot_rows` logs the rows loaded and how long the load took
 (`duration_ms`).
 

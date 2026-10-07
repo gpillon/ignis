@@ -149,6 +149,18 @@ impl TableFootprint {
         ranked_capacity(budget, self.row_bytes).min(self.ranked_rows) * (self.row_bytes + HOT_ROW_INDEX_BYTES)
     }
 
+    /// The host plan's line for a cache of `budget`: the budget, but never
+    /// more than the table can hold at it -- the whole table, or past the
+    /// hot list, the list. So the default charges its 1 GiB, as it always
+    /// has, and a budget the table cannot use is not refused for RAM it
+    /// would never take.
+    pub fn line_bytes(&self, budget: u64) -> u64 {
+        if self.is_whole(budget) {
+            return self.whole_table_bytes();
+        }
+        budget.min(self.ranked_bytes())
+    }
+
     /// The budget `auto` takes when the host plan leaves the line `room`
     /// bytes: the whole table when it fits; else the whole hot list when it
     /// fits; else `room` rounded down to whole GiB, never below the 1 GiB
@@ -1103,7 +1115,7 @@ mod tests {
         let footprint = NgramTable::footprint(&reader, &bound, fixture_geometry()).unwrap();
         assert_eq!(footprint, TableFootprint { table_rows: 1_000, row_bytes: 90, ranked_rows: 6 });
         assert_eq!((footprint.whole_table_bytes(), footprint.ranked_bytes()), (90_000, 6 * 94));
-        // The host plan charges what the table will hold: the same figure.
+        // What each budget holds, known before the table opens.
         for budget in [0, 93, 94, 3 * 94, 6 * 94, 6 * 94 + 1, 50_000, 89_999, 90_000, 1 << 30] {
             let table = NgramTable::from_artifact(&artifact.path, &reader, &bound, fixture_geometry(), options(budget)).unwrap();
             assert_eq!(table.hot_bytes(), footprint.held_bytes(budget), "budget {budget}");

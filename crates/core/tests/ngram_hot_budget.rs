@@ -42,6 +42,21 @@ fn the_table_costs_its_rows_whole_and_its_rows_and_index_ranked() {
 }
 
 #[test]
+fn the_plan_line_is_the_budget_capped_at_what_the_table_can_hold() {
+    // The default's line is the 1 GiB it always charged, byte for byte.
+    assert_eq!(FLASH_NEXT.line_bytes(DEFAULT_HOT_BYTES), DEFAULT_HOT_BYTES);
+    // A budget past the hot list charges the list, not RAM it never uses.
+    assert_eq!(FLASH_NEXT.line_bytes(4 * GIB), FLASH_NEXT.ranked_bytes());
+    assert_eq!(FLASH_NEXT.line_bytes(FLASH_NEXT.whole_table_bytes()), FLASH_NEXT.whole_table_bytes());
+    assert_eq!(FLASH_NEXT.line_bytes(u64::MAX), FLASH_NEXT.whole_table_bytes());
+    // Never less than the cache will hold.
+    for budget in [0, 93, 94, GIB, 2 * GIB, FLASH_NEXT.whole_table_bytes() - 1, FLASH_NEXT.whole_table_bytes()] {
+        assert!(FLASH_NEXT.line_bytes(budget) >= FLASH_NEXT.held_bytes(budget), "budget {budget}");
+        assert!(FLASH_NEXT.line_bytes(budget) <= budget, "budget {budget}");
+    }
+}
+
+#[test]
 fn auto_takes_the_whole_table_else_the_hot_list_else_whole_gib_never_below_the_default() {
     let whole = FLASH_NEXT.whole_table_bytes();
     let ranked = FLASH_NEXT.ranked_bytes();
@@ -92,12 +107,12 @@ fn the_room_is_what_the_other_lines_and_the_margin_leave() {
 
 #[test]
 fn auto_never_refuses_a_start_the_default_would_make() {
-    let default_line = FLASH_NEXT.held_bytes(DEFAULT_HOT_BYTES);
+    let default_line = FLASH_NEXT.line_bytes(DEFAULT_HOT_BYTES);
     let mut starts = (0, 0);
     let mut available = 40 * GIB;
     while available <= 80 * GIB {
         let room = ngram_hot_rows_room(&host(available));
-        let auto_line = FLASH_NEXT.held_bytes(HotBudget::Auto.resolve(&FLASH_NEXT, Some(room)));
+        let auto_line = FLASH_NEXT.line_bytes(HotBudget::Auto.resolve(&FLASH_NEXT, Some(room)));
         let by_default = plan_host(&HostPlanRequest { ngram_hot_rows_bytes: default_line, ..host(available) });
         let by_auto = plan_host(&HostPlanRequest { ngram_hot_rows_bytes: auto_line, ..host(available) });
         starts.0 += u32::from(by_default.is_ok());

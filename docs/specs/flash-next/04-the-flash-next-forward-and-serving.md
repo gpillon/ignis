@@ -197,7 +197,8 @@ its value-head count fails first and then passes.
     leaves after its other lines and the 6 GiB margin -- the whole table when
     that fits, else the whole hot list when it fits, else whole GiB never
     below the 1 GB default -- so it never refuses a start the default would
-    make. The plan's line charges what the table will hold;
+    make. The plan's line charges the budget, capped at what the table can
+    hold at it (the default still charges 1 GB);
   - a budget that holds the whole table holds every row (slot = row id, no
     index), loaded by one sequential scan of the table's range whatever the
     hot list ranks; no step reads the file, and no cache file is written. A
