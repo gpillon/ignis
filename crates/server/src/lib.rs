@@ -144,8 +144,12 @@ pub struct Server {
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// The one token the warm-up prompts with: id 1 exists in every vocabulary
-/// this server loads, and what the model says to it is discarded.
+/// The one token the warm-up prompts with. Id 1 is an ordinary byte-level
+/// token (`"`) of the Qwen vocabulary both families load (248,320 entries,
+/// ids 0 and 1 the first two printable bytes), not a special token, so it
+/// needs no template and no BOS: both families' embeddings take it. What the
+/// model says to it is discarded; a prompt of one token is under a KV page,
+/// so it publishes no prefix and captures no checkpoint.
 const WARM_UP_TOKEN: ignis_core::TokenId = 1;
 
 /// How long the warm-up may take: the first decode captures its graphs.
@@ -217,7 +221,11 @@ impl Server {
         };
         let (_, mut events) = self
             .engine
-            .submit(input, ignis_core::RequestClass::Interactive)
+            .submit_with_notes(
+                input,
+                ignis_core::RequestClass::Interactive,
+                engine::RequestNotes { internal: true, ..engine::RequestNotes::default() },
+            )
             .await
             .map_err(|err| format!("the warm-up request was refused: {err:?}"))?;
         engine::collect_completion(&mut events, WARM_UP_TIMEOUT)

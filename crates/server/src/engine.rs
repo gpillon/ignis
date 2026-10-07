@@ -127,6 +127,11 @@ pub struct RequestNotes {
     /// `reasoning_effort: "max"` dropped a thinking budget that would
     /// otherwise have applied (spec server/08).
     pub thinking_budget_dropped: bool,
+    /// The server's own request (GitHub #129, the warm-up): it runs through
+    /// the scheduler like any other but is not a client's, so the telemetry
+    /// consumer drops every fact about it — no request log line, no counter,
+    /// no histogram sample.
+    pub internal: bool,
 }
 
 /// The server-side engine: a cheap, cloneable handle onto the model thread
@@ -534,7 +539,25 @@ async fn telemetry_task(
     mut facts: UnboundedReceiver<TelemetryFact>,
     counters: Arc<ArcSwap<IntervalCounters>>,
 ) {
+    // GitHub #129: the requests the server made for itself, until their `Done`.
+    let mut internal: std::collections::HashSet<RequestId> = std::collections::HashSet::new();
     while let Some(fact) = facts.recv().await {
+        match &fact {
+            TelemetryFact::Submitted(id, _, _, notes) if notes.internal => {
+                internal.insert(*id);
+                continue;
+            }
+            TelemetryFact::Routed(event) => {
+                if let Some(id) = event_request(event).filter(|id| internal.contains(id)) {
+                    if matches!(event, SchedEvent::Done { .. }) {
+                        internal.remove(&id);
+                    }
+                    continue;
+                }
+            }
+            TelemetryFact::Cancelled(id) | TelemetryFact::Stopped(id, _) if internal.remove(id) => continue,
+            _ => {}
+        }
         match fact {
             TelemetryFact::Submitted(id, prompt_tokens, class, notes) => {
                 telemetry.note_submit(id, prompt_tokens, class);

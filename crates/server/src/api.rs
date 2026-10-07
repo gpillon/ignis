@@ -1531,7 +1531,7 @@ async fn chat_completions(
             Err(response) => return response,
         };
     input.forced_literal = forced;
-    let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped };
+    let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped, ..RequestNotes::default() };
     let (request_id, mut stream) = match server.engine.submit_with_notes(input, class, notes).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),

@@ -522,3 +522,22 @@ fn prompt_reuse_off_reserves_no_slots() {
     assert!(skips(&events, a).is_empty(), "nothing asked for, nothing skipped");
     assert_eq!(chunk_widths(&compute, a), vec![40], "and nothing cut for");
 }
+
+/// GitHub #129: the server's own warm-up is one token with no opener and no
+/// system block, two tokens generated. It publishes no prefix (nothing under a
+/// page), captures no checkpoint, takes no slot, and leaves nothing to reuse.
+#[test]
+fn the_servers_warm_up_request_takes_no_retained_slot() {
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = scheduler(compute.clone(), 8);
+    let warm = sched.submit(input(vec![1], None, None, 2), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+
+    assert!(done(&events, warm));
+    assert_eq!(sched.retained_slots_in_use(), 0);
+    assert!(sched.checkpoint_pool().entries().is_empty());
+    assert!(
+        compute.prefill_calls().iter().flatten().all(|j| j.publish_prefix.is_none() && j.capture_checkpoint.is_none()),
+        "no prefill job places anything"
+    );
+}

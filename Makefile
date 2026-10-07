@@ -304,7 +304,7 @@ status: ## Is the server up? (process, pid file, /v1/models)
 	@code=$$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$(SERVER_URL)/v1/models" 2>/dev/null); \
 	case "$$code" in \
 	  200) echo "http: $(SERVER_URL) is serving";; \
-	  401) echo "http: $(SERVER_URL) is serving (API key required)";; \
+	  401) echo "http: $(SERVER_URL) is serving (API key required)";; 	  503) echo "http: $(SERVER_URL) is warming up (503 server_not_ready, GitHub #129)";; \
 	  *) echo "http: nothing answering on $(SERVER_URL)";; \
 	esac
 
