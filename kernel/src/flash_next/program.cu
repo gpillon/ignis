@@ -33,6 +33,7 @@
 #include "ignis_fn_residual_tap.h"
 #include "ignis_fp8_linear.h"
 #include "ignis_seq_internal.h"
+#include "../moe_common.cuh"
 #include "../permitted_tokens.h"
 #include "../step_internal.h"
 
@@ -656,7 +657,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     }
     for (std::size_t i = 0; i < fn.mtp_slot_table.size(); ++i) {
       const ignis_moe_slot &slot = fn.mtp_slot_table[i];
-      if (slot.record == nullptr || (slot.k2 != 4 && slot.k2 != 5 && slot.k2 != 6 && slot.k2 != 8)) {
+      if (slot.record == nullptr || !ignis_moe::valid_k2(slot.k2)) {
         *error = "the MTP head's expert slot " + std::to_string(i) + " names no record or no K class";
         return -1;
       }

@@ -97,6 +97,14 @@ impl SpeculativeBackend {
         }
     }
 
+    /// Whether the backend binds DFlash2's drafter and so reserves its
+    /// window, prefill taps and round scratch; the verify-only backend
+    /// proposes from the host and Flash-Next's MTP sizes its own (spec
+    /// flash-next/07).
+    pub fn binds_dflash2(&self) -> bool {
+        matches!(self, Self::Dflash2)
+    }
+
     /// `enum ignis_speculative_backend` (`kernel/include/ignis_model.h`);
     /// 0 is "no speculation" and is never produced by a backend.
     pub fn abi_code(&self) -> i32 {
@@ -287,19 +295,17 @@ impl Speculation {
     /// prefix clone carry it with the rest of a sequence. Zero for
     /// [`SpeculativeBackend::VerifyOnly`], which binds no drafter.
     pub fn window_pool_bytes(&self, slot_count: u32) -> u64 {
-        match self.backend {
-            SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
-            SpeculativeBackend::Dflash2 => {
-                let bf16 = 2;
-                let per_slot = DFLASH2_LAYERS
-                    * DFLASH2_WINDOW_TOKENS
-                    * DFLASH2_KV_HEADS
-                    * DFLASH2_HEAD_DIM
-                    * 2
-                    * bf16;
-                u64::from(slot_count) * per_slot
-            }
+        if !self.backend.binds_dflash2() {
+            return 0;
         }
+        let bf16 = 2;
+        let per_slot = DFLASH2_LAYERS
+            * DFLASH2_WINDOW_TOKENS
+            * DFLASH2_KV_HEADS
+            * DFLASH2_HEAD_DIM
+            * 2
+            * bf16;
+        u64::from(slot_count) * per_slot
     }
 
     /// What a `prefill_chunk_tokens`-wide chunk adds to the leaf's prefill
@@ -309,24 +315,22 @@ impl Speculation {
     /// key and value rows kept from it — each at most one window of columns
     /// wide, each rounded to the arena's alignment.
     pub fn prefill_scratch_bytes(&self, prefill_chunk_tokens: u32) -> u64 {
-        match self.backend {
-            // No drafter bound, nothing tapped (P5-04, GitHub #153).
-            SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
-            SpeculativeBackend::Dflash2 => {
-                let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
-                let i32 = |elements: u64| (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
-                let columns = u64::from(prefill_chunk_tokens).min(DFLASH2_WINDOW_TOKENS);
-                let kv_width = DFLASH2_KV_HEADS * DFLASH2_HEAD_DIM;
-                bf16(DFLASH2_FEATURE_TAPS * HIDDEN * columns)
-                    + i32(columns)
-                    + i32(1)
-                    + i32(1)
-                    + bf16(HIDDEN * columns)
-                    + bf16(HIDDEN * columns)
-                    + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
-                    + 3 * bf16(kv_width * columns)
-            }
+        // No drafter bound, nothing tapped (P5-04, GitHub #153).
+        if !self.backend.binds_dflash2() {
+            return 0;
         }
+        let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+        let i32 = |elements: u64| (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+        let columns = u64::from(prefill_chunk_tokens).min(DFLASH2_WINDOW_TOKENS);
+        let kv_width = DFLASH2_KV_HEADS * DFLASH2_HEAD_DIM;
+        bf16(DFLASH2_FEATURE_TAPS * HIDDEN * columns)
+            + i32(columns)
+            + i32(1)
+            + i32(1)
+            + bf16(HIDDEN * columns)
+            + bf16(HIDDEN * columns)
+            + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
+            + 3 * bf16(kv_width * columns)
     }
 
     /// What the drafter's verify round adds to the load under this backend
@@ -408,6 +412,18 @@ mod tests {
             assert!(err.contains("1..7"), "{err}");
             assert!(err.contains(&n.to_string()), "{err}");
         }
+    }
+
+    #[test]
+    fn only_dflash2_reserves_drafter_state() {
+        for backend in [SpeculativeBackend::VerifyOnly, SpeculativeBackend::Mtp] {
+            assert!(!backend.binds_dflash2());
+            let spec = Speculation::new(backend, 3).expect("in range");
+            assert_eq!((spec.window_pool_bytes(4), spec.prefill_scratch_bytes(1024), spec.round_scratch_bytes()), (0, 0, 0));
+        }
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 3).expect("in range");
+        assert!(SpeculativeBackend::Dflash2.binds_dflash2());
+        assert!(spec.window_pool_bytes(4) > 0 && spec.prefill_scratch_bytes(1024) > 0 && spec.round_scratch_bytes() > 0);
     }
 
     #[test]
