@@ -265,7 +265,9 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      <div className={`grid grid-cols-1 gap-4 ${dash.experts ? "lg:grid-cols-2" : "lg:grid-cols-3"}`}>
+        {/* Sibling-prefix reuse is the 27B's; Flash-Next reuses through retained checkpoints (Retained state), so its series is always 0. */}
+        {!dash.experts && (
         <Card title="Prefix reuse" subtitle="Prompt tokens skipped through a sibling's prefix">
           <Figures
             items={[
@@ -276,7 +278,8 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
           />
           <TimeChart label="Prefix tokens reused per second" {...chart} area height={120} format={formatNumber} series={[{ key: "prefix", label: "Reused tok/s", color: "var(--series-3)", values: dash.prefix.perSecSeries }]} />
         </Card>
-        <EvictionsCard evictions={dash.evictions} chart={chart} win={win} />
+        )}
+        <EvictionsCard evictions={dash.evictions} deviceSlots={dash.memory.slotHomes.deviceSlots} chart={chart} win={win} />
         <ScraperCard dash={dash} state={state} />
       </div>
 
@@ -495,7 +498,7 @@ const EVICTION_TIER_LABEL: Record<EvictionTierName, { name: string; note: string
  * The chart carries only the `live` column: it is the one that costs a request
  * its prefill, and the only one worth watching move.
  */
-function EvictionsCard({ evictions, chart, win }: { evictions: Evictions; chart: ChartFrame; win: string }) {
+function EvictionsCard({ evictions, deviceSlots, chart, win }: { evictions: Evictions; deviceSlots: number | null; chart: ChartFrame; win: string }) {
   const series = [
     { key: "vram", label: "VRAM/min", color: "var(--series-4)", values: evictions.vram.live?.perMinSeries ?? [] },
     { key: "ram", label: "RAM/min", color: "var(--series-1)", values: evictions.ram.live?.perMinSeries ?? [] },
@@ -516,7 +519,8 @@ function EvictionsCard({ evictions, chart, win }: { evictions: Evictions; chart:
         <tbody>
           {EVICTION_TIERS.map((tier) => {
             const row = evictions[tier];
-            const label = EVICTION_TIER_LABEL[tier];
+            // A load with no device retained slots (Flash-Next: --retained-device 0) keeps its retained state in host RAM; "VRAM" would misname that row.
+            const label = tier === "vram" && deviceSlots === 0 ? { ...EVICTION_TIER_LABEL.vram, name: "Retained slots (host RAM)" } : EVICTION_TIER_LABEL[tier];
             return (
               <tr key={tier} className={row.implemented ? undefined : "text-ash/50"}>
                 <th scope="row" className="py-1 text-left font-display text-[13px] font-semibold">

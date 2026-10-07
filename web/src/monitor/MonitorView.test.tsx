@@ -111,6 +111,22 @@ describe("MonitorView", () => {
     expect(html).not.toContain("this scrape carries no bound to read it against");
   });
 
+  it("hides the 27B's sibling-prefix card on Flash-Next and names the eviction row by where its retained slots live (GitHub #306)", () => {
+    const now = Date.now();
+    // Flash-Next: eight retained slots, all in pinned host RAM, none on the device.
+    const text = FLASH_NEXT_EXPOSITION.replace('ignis_retained_slots{state="capacity"} 10', 'ignis_retained_slots{state="capacity"} 8');
+    const html = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text }, now, 3)} />);
+    expect(html).not.toContain("Prefix reuse");
+    expect(html).toContain("Retained slots (host RAM)");
+    // The 27B keeps both: its prefix card, and VRAM for the two device slots it has.
+    const dense = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
+    expect(dense).toContain("Prefix reuse");
+    expect(dense).not.toContain("Retained slots (host RAM)");
+    // Flash-Next with device slots keeps the VRAM wording.
+    const withDevice = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: FLASH_NEXT_EXPOSITION }, now, 3)} />);
+    expect(withDevice).not.toContain("Retained slots (host RAM)");
+  });
+
   it("draws a Flash-Next load's expert residency and n-gram rows, and a 27B load's neither", () => {
     const now = Date.now();
     // Ten seconds on: 900 decode hits and 100 misses, 50 tokens decoded.
