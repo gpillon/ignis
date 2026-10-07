@@ -135,13 +135,23 @@ fn app(script: &[(u32, &'static str)], eos: Option<u32>) -> (axum::Router, Arc<M
 }
 
 fn app_with(script: &[(u32, &'static str)], eos: Option<u32>, tokenizer: Tokenizer) -> (axum::Router, Arc<MockCompute>) {
+    app_closing_at(1, script, eos, tokenizer)
+}
+
+/// [`app_with`], with the block closing at step `close` instead of 1.
+fn app_closing_at(
+    close: u32,
+    script: &[(u32, &'static str)],
+    eos: Option<u32>,
+    tokenizer: Tokenizer,
+) -> (axum::Router, Arc<MockCompute>) {
     let mock = Arc::new(MockCompute::new());
     if let Some(step) = eos {
         mock.eos_after(0, step);
     }
     let template = Forcing {
         script: script.iter().map(|&(step, text)| (mock.token_for(0, step), text)).collect(),
-        think_end: mock.token_for(0, 1),
+        think_end: mock.token_for(0, close),
         tokenizer,
     };
     let scheduler = ConcreteScheduler::with_config(
@@ -328,7 +338,56 @@ async fn with_thinking_on_the_call_is_forced_after_the_models_own_close() {
     }
 }
 
+/// The token after the model's own `</think>` is drawn before the close is
+/// seen, so it is the model's. When it ends the turn, the request ends
+/// there with no call (spec 11, known gaps): the forcing never got a draw.
+#[tokio::test]
+async fn an_end_of_turn_drawn_unseen_after_the_close_ends_the_request_with_no_call() {
+    let (app, _) = app(&[(0, "Nothing to do.")], Some(2));
+    let (status, body) = post(&app, "/v1/chat/completions", chat(json!("required"), true, false)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: JsonValue = serde_json::from_str(&body).unwrap();
+    assert!(v["choices"][0]["message"].get("tool_calls").is_none(), "{body}");
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    assert_no_opener_leaked(&body);
+}
+
+/// With thinking on the reasoning spends the cap the call needs too, by an
+/// amount nobody knows when the request arrives: a cap that fits the
+/// opening is accepted, and a block that never closes inside it ends
+/// `length` with no call (spec 11, departures).
+#[tokio::test]
+async fn with_thinking_on_a_block_that_spends_the_cap_ends_length_with_no_call() {
+    let (app, mock) = app_closing_at(1_000, &[], None, Tokenizer::Whole);
+    let mut request = chat(json!("required"), true, false);
+    request["max_tokens"] = json!(tokens(REQUIRED_OPENER) + 2);
+    let (status, body) = post(&app, "/v1/chat/completions", request).await;
+    assert_eq!(status, 200, "{body}");
+    let v: JsonValue = serde_json::from_str(&body).unwrap();
+    assert!(v["choices"][0]["message"].get("tool_calls").is_none(), "{body}");
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
+    assert!(mock.decode_calls().concat().iter().all(|job| job.permitted.is_none()), "never forced");
+}
+
 // ── unchanged ────────────────────────────────────────────────────────────
+
+/// Forcing changes what the model may draw, never what it reads: the
+/// prompt `"required"` or a named function prefills is the one `"auto"`
+/// prefills, with thinking off and on.
+#[tokio::test]
+async fn forcing_leaves_the_prompt_as_auto_renders_it() {
+    for thinking in [false, true] {
+        let mut prompts = Vec::new();
+        for choice in [json!("auto"), json!("required"), json!({ "type": "function", "function": { "name": "read_file" } })] {
+            let (app, mock) = app(&[], None);
+            let (status, body) = post(&app, "/v1/chat/completions", chat(choice.clone(), thinking, false)).await;
+            assert_eq!(status, 200, "{choice}: {body}");
+            prompts.push(mock.prefill_calls().concat().into_iter().flat_map(|job| job.tokens).collect::<Vec<_>>());
+        }
+        assert!(!prompts[0].is_empty());
+        assert!(prompts.iter().all(|prompt| *prompt == prompts[0]), "thinking {thinking}: {prompts:?}");
+    }
+}
 
 #[tokio::test]
 async fn auto_and_none_force_nothing() {

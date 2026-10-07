@@ -312,8 +312,13 @@ win where the two disagree.
    precedes it, as after the usual `\n\n`).
    The opening then resumes at `<` when the unseen token was `<tool_call>`,
    and from `<tool_call>` otherwise. After a close the budget forced there is
-   no unseen token, so no joiner. When the model commits `<tool_call>` itself
-   after its close before forcing can start, nothing is forced.
+   no unseen token (its close ends with forced tokens, `</think>\n\n`), so
+   no joiner. When a speculative round commits the model's own `<tool_call>`
+   with its close, a call stopped inside the tokens every call writes alike
+   (`<tool_call>` `\n` `<` `function`) is continued: the unseen token is
+   taken to be the next of them, and the forcing resumes after it — through
+   the name, for a named function. A call already past them, or off the
+   dialect after `<tool_call>`, is the model's and is left alone.
 3. **`"required"` forces `<tool_call>\n<function`, not `<tool_call>\n`.** The
    27B tokenizer writes the opening as `<tool_call>` `\n` `<` `function`
    and then merges the `=` into the name (`=read`, `=get`; `=` `shell` when
@@ -332,11 +337,19 @@ win where the two disagree.
    plumbing through all of them, a follow-up of its own. A forced call that
    never closes is still dropped whole and ends with the ordinary
    `finish_reason` (`openai_http_tool_choice.rs`).
+6. **The cap check does not count the reasoning.** With thinking on, the
+   reasoning spends the same `max_tokens` the call needs, by an amount not
+   knowable at the request; only a cap shorter than the opening is a `400`.
+   The thinking budget's answer reserve (`ANSWER_RESERVE`, spec 08) is what
+   keeps room for the call; a request with no budget may reason to its cap
+   and end `length` with no call.
 
-**Known gaps.** A named function under speculation: when one round commits
-`</think>` and the model's own `<tool_call>` together, nothing is forced, and
-the model may name a different tool than the one asked for. Prose the model
-writes before the forced opening after a natural close (the unseen token,
-and whatever a speculative round committed past its `</think>`) reaches
-`content`; no fragment of the opening does. And the budget's forced close still says "without
-calling any more tools" before a forced call.
+**Known gaps.** A named function under speculation, when one round commits
+`</think>` and the model's own call past `<function` together: nothing is
+forced, and the model may name a different tool than the one asked for.
+Prose the model writes before the forced opening after a natural close (the
+unseen token, and whatever a speculative round committed past its
+`</think>`) reaches `content`; no fragment of the opening does. When that
+unseen token is the end of the turn, the request ends there with no call.
+The budget's forced close still says "without calling any more tools" before
+a forced call.

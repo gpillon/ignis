@@ -370,7 +370,12 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   is the first thing generated. The call comes back as any other call does,
   with `finish_reason: "tool_calls"`. Naming a function that is not in
   `tools`, `"required"` with no tools, and a `max_tokens` shorter than the
-  opening are a 400.
+  opening are a 400; so is a tokenizer that cannot force the opening
+  (`tool_choice_unsupported` — with thinking on it needs `</think>` and
+  `<tool_call>` to be single tokens, and `enable_thinking: false` is the
+  way out). With thinking on the reasoning spends the same `max_tokens`: a
+  block that never closes ends `length` with no call, which the thinking
+  budget's answer reserve prevents.
 - Non-streaming returns `choices[].message.content` plus `usage`; streaming
   emits `chat.completion.chunk` SSE frames (token deltas, a final
   `finish_reason` chunk, then `[DONE]`). `usage.prompt_tokens_details.cached_tokens`

@@ -215,31 +215,8 @@ async fn tool_choice_auto_passes_tools_through() {
     assert_eq!(h.template.captured_tools()[0].len(), 1);
 }
 
-#[tokio::test]
-async fn tool_choice_required_is_a_400_naming_the_reason() {
-    let h = harness();
-    let req = serde_json::json!({
-        "messages": [{ "role": "user", "content": "hi" }],
-        "tools": [weather_tool()],
-        "tool_choice": "required"
-    });
-    let (status, body) = call(&h.app, req).await;
-    assert_eq!(status, 400, "{body}");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(v["error"]["message"].as_str().unwrap().contains("force"), "{body}");
-}
-
-#[tokio::test]
-async fn tool_choice_naming_a_specific_function_is_a_400() {
-    let h = harness();
-    let req = serde_json::json!({
-        "messages": [{ "role": "user", "content": "hi" }],
-        "tools": [weather_tool()],
-        "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
-    });
-    let (status, body) = call(&h.app, req).await;
-    assert_eq!(status, 400, "{body}");
-}
+// `"required"` and a named function are served since GitHub #286; what
+// they force, and what they refuse, is `openai_http_tool_choice.rs`'s.
 
 #[tokio::test]
 async fn an_unknown_tool_choice_string_is_a_400() {
