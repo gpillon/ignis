@@ -308,7 +308,8 @@ win where the two disagree.
    forcing `<tool_call>` again would open the call twice and it would not
    parse. So the first token forced after a natural close is the opening's
    *second*, `\n` (id 198), the **joiner**: right after `<tool_call>`,
-   harmless after anything else (content's leading newlines are trimmed).
+   and after anything else a line break in the content (trimmed when nothing
+   precedes it, as after the usual `\n\n`).
    The opening then resumes at `<` when the unseen token was `<tool_call>`,
    and from `<tool_call>` otherwise. After a close the budget forced there is
    no unseen token, so no joiner. When the model commits `<tool_call>` itself
@@ -325,15 +326,17 @@ win where the two disagree.
 4. **The forced literal carries its own `</think>` id** (`ForcedLiteral::
    after_reasoning`), so detecting the close does not depend on the
    scheduler's thinking-budget close being configured.
-5. **Not built: `ignis_forced_tool_calls_total`.** The outcome (closed or not)
-   is known only where each of the four answer paths resolves its
-   `finish_reason`; a forced call that never closes is still dropped whole and
-   ends with the ordinary `finish_reason`.
+5. **Deferred: `ignis_forced_tool_calls_total`.** Not built here: the outcome
+   (closed or not) is read where each answer path resolves its
+   `finish_reason` (chat's three, the Responses events), and the counter is
+   plumbing through all of them, a follow-up of its own. A forced call that
+   never closes is still dropped whole and ends with the ordinary
+   `finish_reason` (`openai_http_tool_choice.rs`).
 
 **Known gaps.** A named function under speculation: when one round commits
 `</think>` and the model's own `<tool_call>` together, nothing is forced, and
 the model may name a different tool than the one asked for. Prose the model
-writes before the forced opening after a natural close (at most the tokens a
-speculative round commits past its `</think>`) reaches `content`; no fragment
-of the opening does. And the budget's forced close still says "without
+writes before the forced opening after a natural close (the unseen token,
+and whatever a speculative round committed past its `</think>`) reaches
+`content`; no fragment of the opening does. And the budget's forced close still says "without
 calling any more tools" before a forced call.

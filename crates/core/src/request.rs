@@ -77,7 +77,7 @@ pub struct Request {
     pub thinking: crate::thinking_budget::BudgetState,
     /// Progress through the request's forced literal
     /// ([`crate::types::RequestInput::forced_literal`], GitHub #286).
-    pub forced: crate::forced_literal::ForcedState,
+    pub forced_state: crate::forced_literal::ForcedState,
     /// The resources this request reserves while it holds a lane (core-05:
     /// the admission state machine's KV reservation, charged at deal and
     /// released at completion — the pool never over-allocates).
@@ -217,7 +217,7 @@ impl Request {
             attention: None,
             drawn: Vec::new(),
             thinking: crate::thinking_budget::BudgetState::default(),
-            forced: crate::forced_literal::ForcedState::default(),
+            forced_state: crate::forced_literal::ForcedState::default(),
             resources,
             remaining_work,
             backfill_epoch: 0,
@@ -676,6 +676,10 @@ impl Request {
         // KV it warmed.
         self.prefill_progress = 0;
         self.prefill_failures = 0;
+        // GitHub #286: and its forced literal starts over with it — the
+        // re-prefill draws its first token again, and a block it closed
+        // before is open again.
+        self.forced_state = crate::forced_literal::ForcedState::default();
         true
     }
 
@@ -778,6 +782,20 @@ mod tests {
         let mut r = req(1, RequestClass::Agent, RequestState::Prefilling);
         assert!(!r.advance(RequestState::Running));
         assert_eq!(r.state, RequestState::Prefilling);
+    }
+
+    /// GitHub #286: a re-queued request re-prefills and generates again from
+    /// its first token, so its forced literal starts over — a block it had
+    /// closed is open again, and nothing is forced before it closes anew.
+    #[test]
+    fn a_requeue_starts_the_forced_literal_over() {
+        let literal = crate::forced_literal::ForcedLiteral::after_reasoning(vec![50, 51], 99).unwrap();
+        let mut r = req(0, RequestClass::Agent, RequestState::Evicted);
+        r.forced_state.commit(&literal, 3, 99);
+        assert_ne!(r.forced_state, crate::forced_literal::ForcedState::default(), "the block closed");
+        assert!(r.requeue());
+        assert_eq!(r.forced_state, crate::forced_literal::ForcedState::default());
+        assert_eq!(r.forced_state.permitted(&literal, 0, None), None, "open again: nothing forced");
     }
 
     #[test]

@@ -2034,8 +2034,6 @@ impl ConcreteScheduler {
         // step 0 again — a constrained decode that kept it would answer with twice its
         // own digits.
         r.drawn.clear();
-        // GitHub #286: and its forced literal starts over with it.
-        r.forced = crate::forced_literal::ForcedState::default();
         let effective_max = generation_budget(&self.config, &r.input);
         r.remaining_work = effective_max as u64;
         r.backfill_class = BackfillClass::None;
@@ -3635,7 +3633,7 @@ impl Scheduler for ConcreteScheduler {
                         .as_deref()
                         .and_then(|close| r.thinking.permitted(r.input.params.thinking_budget, close, r.tokens));
                     match r.input.forced_literal.as_deref() {
-                        Some(literal) => r.forced.permitted(literal, r.tokens, budget.as_ref()).or(budget),
+                        Some(literal) => r.forced_state.permitted(literal, r.tokens, budget.as_ref()).or(budget),
                         None => budget,
                     }
                 })
@@ -3723,7 +3721,7 @@ impl Scheduler for ConcreteScheduler {
                             }
                             let r = &mut self.requests[i];
                             if let Some(literal) = r.input.forced_literal.as_deref() {
-                                r.forced.commit(literal, r.tokens, token);
+                                r.forced_state.commit(literal, r.tokens, token);
                             }
                             self.requests[i].tokens += 1;
                             // Service-work decay (core-05): one quantum per

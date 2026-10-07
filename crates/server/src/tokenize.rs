@@ -223,7 +223,7 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
     let (tools, tool_choice) = resolve_tools(req.tools, req.tool_choice)?;
     // A forced call changes no render either, but one chat could not force
     // is refused here as it is there. The cap is a sampling field, inert.
-    forced_tool_call(server, &tool_choice, server.template.decoder_starts_in_reasoning(&thinking), None)?;
+    forced_tool_call(server, &tool_choice, &thinking, None)?;
     let (model, _) = resolve_model_and_class(req.model, None).map_err(|message| bad_request(&message))?;
     if let Some(model) = model.filter(|model| !model.is_empty() && *model != server.engine.model_id()) {
         return Err(error_response(

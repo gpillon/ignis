@@ -12,12 +12,12 @@
 //!
 //! # Where it starts
 //!
-//! [`ForcedStart::Generation`] forces the generation's first tokens. The
-//! first is drawn by the prefill ([`ForcedLiteral::prefill_step`]), for the
-//! one-round lag [`crate::constrained`] describes: a round returns the token
-//! the previous call drew and draws the next under the set it carries.
+//! [`ForcedLiteral::at_generation`] forces the generation's first tokens.
+//! The first is drawn by the prefill ([`ForcedLiteral::prefill_step`]), for
+//! the one-round lag [`crate::constrained`] describes: a round returns the
+//! token the previous call drew and draws the next under the set it carries.
 //!
-//! [`ForcedStart::AfterReasoning`] forces the tokens right after the
+//! [`ForcedLiteral::after_reasoning`] forces the tokens right after the
 //! reasoning block closes, for a request that generates with thinking on.
 //! The close may be the model's own `</think>` or the thinking budget's
 //! forced one; nothing is forced while the block is open.
@@ -33,12 +33,12 @@
 //!
 //! So the first forced token after an unseen one is the literal's
 //! **second**, its **joiner**: for the tool-call opener, the line break after
-//! `<tool_call>`, which is the right token after `<tool_call>` and harmless
-//! after anything else. The round after, the unseen token has been emitted:
-//! the literal resumes from its third token when that token was its first,
-//! and from its first otherwise. The literal's second token must be one that
-//! may follow anything; [`ForcedLiteral::after_reasoning`] refuses a literal
-//! with no second token.
+//! `<tool_call>`, which is the right token after `<tool_call>` and a line
+//! break in the text after anything else. The round after, the unseen token
+//! has been emitted: the literal resumes from its third token when that
+//! token was its first, and from its first otherwise. The literal's second
+//! token must be one that may follow anything;
+//! [`ForcedLiteral::after_reasoning`] refuses a literal with no second token.
 //!
 //! A close the budget forced leaves no unseen token — its own tokens were
 //! forced up to the literal's first draw — so the literal starts there,
@@ -54,7 +54,7 @@ use crate::types::TokenId;
 
 /// Where a [`ForcedLiteral`] starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForcedStart {
+enum ForcedStart {
     /// At the generation's first token.
     Generation,
     /// Right after the reasoning block closes at `think_end`, the block's
@@ -90,16 +90,6 @@ impl ForcedLiteral {
         Ok(Self { tokens: tokens.into(), start: ForcedStart::AfterReasoning { think_end } })
     }
 
-    /// The forced tokens, in order.
-    pub fn tokens(&self) -> &[TokenId] {
-        &self.tokens
-    }
-
-    /// Where the literal starts.
-    pub fn start(&self) -> ForcedStart {
-        self.start
-    }
-
     /// The set the prefill's draw is restricted to: the literal's first
     /// token when it starts at the generation, else `None`.
     pub fn prefill_step(&self) -> Option<PermittedSet> {
@@ -110,23 +100,27 @@ impl ForcedLiteral {
     }
 }
 
+/// Where a literal forced after the reasoning block stands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Phase {
+    /// The block is open: nothing is forced.
+    #[default]
+    Reasoning,
+    /// The block has closed and forcing has not started.
+    Closed,
+    /// Forcing started with the draw for output index `from`. `joined`: the
+    /// run opens with the joiner, the token before it having been drawn
+    /// unseen; `unseen_opened`: that token was the literal's first.
+    Forcing { from: u32, joined: bool, unseen_opened: bool },
+    /// The model wrote the literal's first token itself after the close:
+    /// nothing is forced.
+    Released,
+}
+
 /// One request's progress through its [`ForcedLiteral`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForcedState {
-    /// The output index of the reasoning block's `</think>`, once emitted.
-    closed_at: Option<u32>,
-    /// The output index the first forced token is drawn for, once forcing
-    /// has started after the close.
-    from: Option<u32>,
-    /// Whether the forced run opens with the joiner: the token before it
-    /// was drawn unseen.
-    joined: bool,
-    /// The literal index the run resumes at after the joiner: 2 when the
-    /// unseen token was the literal's first, 0 otherwise.
-    resume: usize,
-    /// Nothing more is forced: the model wrote the literal's first token
-    /// itself after the close.
-    released: bool,
+    phase: Phase,
     /// Whether the last round's draw was a single forced token, so that the
     /// token this round emits was seen when it was chosen.
     last_draw_forced: bool,
@@ -154,27 +148,22 @@ impl ForcedState {
     }
 
     fn step(&mut self, literal: &ForcedLiteral, draw: u32) -> Option<PermittedSet> {
-        let at = match literal.start {
-            ForcedStart::Generation => draw as usize,
-            ForcedStart::AfterReasoning { .. } => {
-                if self.released {
-                    return None;
-                }
-                let from = match self.from {
-                    Some(from) => from,
-                    None => {
-                        self.closed_at?;
-                        self.from = Some(draw);
-                        self.joined = !self.last_draw_forced;
-                        draw
-                    }
-                };
-                match (self.joined, (draw - from) as usize) {
-                    (false, step) => step,
-                    (true, 0) => 1,
-                    (true, step) => self.resume + step - 1,
-                }
+        let at = match (literal.start, self.phase) {
+            (ForcedStart::Generation, _) => draw as usize,
+            (_, Phase::Reasoning | Phase::Released) => return None,
+            (_, Phase::Closed) => {
+                let joined = !self.last_draw_forced;
+                self.phase = Phase::Forcing { from: draw, joined, unseen_opened: false };
+                if joined { 1 } else { 0 }
             }
+            (_, Phase::Forcing { from, joined, unseen_opened }) => match (joined, draw.checked_sub(from)? as usize) {
+                (false, step) => step,
+                (true, 0) => 1,
+                // The joiner was the literal's second token: after an
+                // unseen first, the run resumes at its third.
+                (true, step) if unseen_opened => step + 1,
+                (true, step) => step - 1,
+            },
         };
         literal.tokens.get(at).map(|&token| PermittedSet::from([token]))
     }
@@ -185,23 +174,14 @@ impl ForcedState {
         let ForcedStart::AfterReasoning { think_end } = literal.start else {
             return;
         };
-        match (self.closed_at, self.from) {
-            (None, _) if token == think_end => self.closed_at = Some(index),
-            (Some(_), None) if token == literal.tokens[0] => self.released = true,
-            // The unseen token before the joiner: when it opened the literal
-            // itself, the joiner was the literal's second token and the run
-            // resumes at its third.
-            (Some(_), Some(from)) if self.joined && index + 1 == from && token == literal.tokens[0] => {
-                self.resume = 2;
+        match &mut self.phase {
+            phase @ Phase::Reasoning if token == think_end => *phase = Phase::Closed,
+            phase @ Phase::Closed if token == literal.tokens[0] => *phase = Phase::Released,
+            Phase::Forcing { from, joined: true, unseen_opened } if index + 1 == *from => {
+                *unseen_opened = token == literal.tokens[0];
             }
             _ => {}
         }
-    }
-
-    /// The output index of the block's `</think>`; `None` while it is open,
-    /// and always for a literal that starts at the generation.
-    pub fn closed_at(&self) -> Option<u32> {
-        self.closed_at
     }
 }
 
@@ -308,7 +288,6 @@ mod tests {
         for (index, token) in [5, END, 7, OPEN, NL].into_iter().enumerate() {
             state.commit(&literal, index as u32, token);
         }
-        assert_eq!(state.closed_at(), Some(1));
         assert!((5..20).all(|emitted| state.permitted(&literal, emitted, None).is_none()));
     }
 

@@ -832,10 +832,10 @@ pub(crate) enum ToolChoice {
 }
 
 /// Parse `tool_choice`'s wire value: `"auto"` (default), `"none"`,
-/// `"required"`, or a named function — chat's `{"type": "function",
-/// "function": {"name": ...}}` or the Responses API's `{"type": "function",
-/// "name": ...}`. Anything else is a 400 naming the field, not a value
-/// silently read as `"auto"`.
+/// `"required"`, or a named function, `{"type": "function", "function":
+/// {"name": ...}}` (the Responses API's flat shape is brought to this one
+/// before it gets here). Anything else is a 400 naming the field, not a
+/// value silently read as `"auto"`.
 fn parse_tool_choice(tool_choice: Option<JsonValue>) -> Result<ToolChoice, Response> {
     let refused = |got: &JsonValue| {
         bad_request_param(
@@ -855,7 +855,6 @@ fn parse_tool_choice(tool_choice: Option<JsonValue>) -> Result<ToolChoice, Respo
         JsonValue::Object(object) if object.get("type").and_then(JsonValue::as_str) == Some("function") => object
             .get("function")
             .and_then(|function| function.get("name"))
-            .or_else(|| object.get("name"))
             .and_then(JsonValue::as_str)
             .filter(|name| !name.is_empty())
             .map(|name| ToolChoice::Function(name.to_owned()))
@@ -928,8 +927,8 @@ const REQUIRED_OPENING: &str = "<tool_call>\n<function";
 /// model; a named function forces `<tool_call>\n<function=NAME>\n`, the
 /// whole opening encoded at once so the name merges as the model would
 /// write it. With thinking off it is forced from the generation's first
-/// token; with it on (`starts_in_reasoning`), right after the reasoning
-/// block closes, by the model or by the thinking budget — thinking is on by
+/// token; with it on (`thinking`, as the template starts the generation),
+/// right after the reasoning block closes, by the model or by the thinking budget — thinking is on by
 /// default and OpenAI-SDK clients never turn it off, so that is where an
 /// agent's `"required"` lands.
 ///
@@ -942,7 +941,7 @@ const REQUIRED_OPENING: &str = "<tool_call>\n<function";
 pub(crate) fn forced_tool_call(
     server: &Server,
     choice: &ToolChoice,
-    starts_in_reasoning: bool,
+    thinking: &ThinkingOptions,
     cap: Option<(u32, &str)>,
 ) -> Result<Option<Arc<ignis_core::forced_literal::ForcedLiteral>>, Response> {
     let opening = match choice {
@@ -974,13 +973,13 @@ pub(crate) fn forced_tool_call(
             field,
         ));
     }
-    let literal = match starts_in_reasoning {
+    let literal = match server.template.decoder_starts_in_reasoning(thinking) {
         false => ignis_core::forced_literal::ForcedLiteral::at_generation(tokens),
         true => {
             // The scheduler sees the block close by its one `</think>`
             // token, and after a close it could not see coming it joins on
             // the opening's second token, the `\n` after `<tool_call>`.
-            let think_end = encode("</think>").filter(|ids| ids.len() == 1).map(|ids| ids[0]);
+            let think_end = encode(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1).map(|ids| ids[0]);
             let joins = encode("<tool_call>\n").is_some_and(|ids| ids.len() == 2 && tokens.starts_with(&ids));
             match think_end.filter(|_| joins) {
                 Some(think_end) => ignis_core::forced_literal::ForcedLiteral::after_reasoning(tokens, think_end),
@@ -1485,12 +1484,11 @@ async fn chat_completions(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
-    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
     let cap_field = match req.max_completion_tokens {
         Some(_) => "max_completion_tokens",
         None => "max_tokens",
     };
-    let forced = match forced_tool_call(&server, &tool_choice, starts_in_reasoning, max_tokens.map(|cap| (cap, cap_field))) {
+    let forced = match forced_tool_call(&server, &tool_choice, &thinking, max_tokens.map(|cap| (cap, cap_field))) {
         Ok(forced) => forced,
         Err(response) => return response,
     };
@@ -1518,6 +1516,7 @@ async fn chat_completions(
     let id = format!("chatcmpl-{request_id}");
     let created = now();
 
+    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
     if req.stream {
         // The SSE response: the request's event stream wrapped in the
         // `chat.completion.chunk` shape (a `[DONE]` marker terminates).
@@ -2962,19 +2961,18 @@ mod tests {
     }
 
     /// GitHub #286: `"required"` and a named function resolve to what is
-    /// forced, in chat's shape and the Responses API's.
+    /// forced. The Responses API's flat shape is not chat's: it is brought
+    /// to chat's before it gets here, and refused when sent to chat.
     #[test]
     fn tool_choice_required_and_a_named_function_resolve() {
         let tools = vec![tool("a"), tool("b")];
         let required = resolve_tools(Some(tools.clone()), Some(serde_json::json!("required")));
         assert_eq!(required.unwrap(), (tools.clone(), ToolChoice::Required));
-        for choice in [
-            serde_json::json!({"type": "function", "function": {"name": "b"}}),
-            serde_json::json!({"type": "function", "name": "b"}),
-        ] {
-            let named = resolve_tools(Some(tools.clone()), Some(choice)).unwrap();
-            assert_eq!(named, (tools.clone(), ToolChoice::Function("b".into())));
-        }
+        let named = serde_json::json!({"type": "function", "function": {"name": "b"}});
+        let named = resolve_tools(Some(tools.clone()), Some(named)).unwrap();
+        assert_eq!(named, (tools.clone(), ToolChoice::Function("b".into())));
+        let flat = serde_json::json!({"type": "function", "name": "b"});
+        assert!(resolve_tools(Some(tools), Some(flat)).is_err());
     }
 
     #[test]
