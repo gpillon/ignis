@@ -135,13 +135,14 @@ chunk takes ~3.2 s of wall time (a ~1.3 s host n-gram gather, then ~1.9 s on
 the card), against the 27B's ~110 ms. One round per chunk left the other lanes
 at 1.0-1.1 tok/s while a 34K prompt prefilled.
 
-- **K becomes time-based, and stays 1 on the 27B.** The **decode share** `s`
+- **K becomes time-based, and was 1 on the 27B.** The **decode share** `s`
   (`--decode-share`, in percent) holds the next chunk until the decoding lanes
   have had `t * s / (1 - s)` of wall time after a chunk that took `t`. With no
   lane decoding, nothing is held, and nothing is held after a prompt's last
   chunk either: the hold is between chunks of the same prompt, so a newcomer
-  queued behind it is not made to wait for lanes that already had their turn. The family default is 0 on the 27B (this
-  ADR's K = 1, unchanged) and 50 on Flash-Next.
+  queued behind it is not made to wait for lanes that already had their turn. The family default was 0 on the 27B (this
+  ADR's K = 1) and 50 on Flash-Next; since #92 (2026-10-07) it is 50 on the
+  27B too, and `--decode-share 0` is this ADR's K = 1.
 - **The Consequences above still hold for the gap.** The share moves the
   lanes' rate during a prefill, not the longest gap: that remains one chunk's
   wall time, and only the chunk width moves it.

@@ -77,7 +77,7 @@ The [2026-10-06 finding](2026-10-06-flash-next-on-the-5090.md) measured an 8K TT
 **The decode share** (52a9990, `--decode-share`):
 - After a chunk that took `t`, the scheduler holds the next one until the decoding lanes have had `t * s / (1 - s)` of wall time.
 - It holds nothing when no lane decodes.
-- The defaults are 50 on Flash-Next and 0 on the 27B.
+- The defaults were 50 on Flash-Next and 0 on the 27B (the 27B went to 50 after #92).
 
 **Stall A/B**:
 - Setup: one load per cell, `make config`'s flags plus the cell's `--decode-share` / `--prefill-chunk`. Two lanes stream long generations of short prompts. Once both decode, a third lane sends a distinct 34K prompt (33,966 tokens served) with `max_tokens` 8. Two reps per cell, plus the prompt alone first.

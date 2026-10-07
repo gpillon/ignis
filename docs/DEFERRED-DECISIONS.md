@@ -186,8 +186,9 @@ p95: the p95 floor under a prefill is one chunk time plus one decode round.
 
 **Status (2026-10-07, GitHub #306):** no longer deferred for Flash-Next,
 which turned it as a time-based **decode share** (`--decode-share`, 50 by
-default there; ADR 0018's amendment). It stays deferred on the 27B, where
-K = 1 (share 0) ships and the C=4 cell below is still the trigger.
+default there; ADR 0018's amendment). On the 27B the default became 50 too (#92, owner
+decision 2026-10-07); the C=4 cell below is still the trigger for raising K
+as a round count.
 
 **Deferred to (27B):** turned only if the C=4 cell fails.
 
