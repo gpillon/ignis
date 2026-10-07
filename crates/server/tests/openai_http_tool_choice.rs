@@ -314,6 +314,9 @@ async fn with_thinking_on_the_call_is_forced_after_the_models_own_close() {
             let reasoning: String =
                 chunks.iter().filter_map(|c| c["choices"][0]["delta"]["reasoning_content"].as_str()).collect();
             assert_eq!(reasoning, "Reading the file.");
+            let content: String =
+                chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
+            assert_eq!(content, "", "the unseen `\\n\\n` and the joiner are trimmed: {body}");
             assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "tool_calls", "{body}");
         } else {
             assert_eq!(the_call(&body), ("read_file".to_owned(), json!({ "path": "a.txt" })));
