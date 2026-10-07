@@ -835,6 +835,27 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// GitHub #248: `--vision-max-tokens` resizes an image onto a smaller
+    /// grid, and a point still lands where the full-size grid puts it —
+    /// the same fraction of the *source* image, whatever the grid.
+    #[test]
+    fn a_point_maps_to_source_pixels_whatever_scale_the_image_was_resized_to() {
+        // A single hot cell at (column 3 of 4, row 1 of 3) on the shrunk
+        // grid, and the same place (12..16 of 16, 4..8 of 12) on the full one.
+        let spike = |rows: usize, cols: usize, row: usize, col: usize| {
+            let mut scores = vec![0.0f32; rows * cols];
+            scores[row * cols + col] = 100.0;
+            read_head_map(&scores, rows, cols).expect("a finite map").pixels(1024, 768)
+        };
+        let (shrunk_x, shrunk_y) = spike(3, 4, 1, 3);
+        // Cell centres: (3 + 0.5) / 4 and (1 + 0.5) / 3 of the source.
+        assert!((shrunk_x - 1024.0 * 3.5 / 4.0).abs() < 1.0, "{shrunk_x}");
+        assert!((shrunk_y - 768.0 * 1.5 / 3.0).abs() < 1.0, "{shrunk_y}");
+        let (full_x, full_y) = spike(12, 16, 6, 14);
+        assert!((full_x - shrunk_x).abs() < 1024.0 / 16.0, "{full_x} vs {shrunk_x}");
+        assert!((full_y - shrunk_y).abs() < 768.0 / 12.0, "{full_y} vs {shrunk_y}");
+    }
+
     #[test]
     fn the_served_artifact_is_calibrated_to_l39_h10() {
         let head = calibrated_head(ArtifactHash::from_bytes(SERVED_NVFP4_27B));

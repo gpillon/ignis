@@ -244,8 +244,21 @@ async fn the_raw_patch_budget_accepts_exactly_its_limit_across_the_request() {
 
 #[tokio::test]
 async fn the_vision_token_budget_accepts_exactly_its_limit_across_the_request() {
-    boundary(|o, n| o.max_vision_tokens = n, 4, false).await;
+    // Two images that fit alone but not together are still refused...
     boundary(|o, n| o.max_vision_tokens = n, 8, true).await;
+}
+
+/// GitHub #248: one image over the budget is shrunk to it, not refused, and
+/// the stats keep what it would have been.
+#[tokio::test]
+async fn a_single_image_over_the_vision_token_budget_is_shrunk_to_it() {
+    let image = data_uri(&png(64, 64));
+    let mut under = limits();
+    under.max_vision_tokens = 3;
+    let acquired = acquire(&acquirer(under, MediaPolicy::new(false, 0)), &[&image]).await.unwrap();
+    assert_eq!(acquired.media.len(), 1);
+    assert_eq!((acquired.stats.vision_tokens, acquired.stats.natural_vision_tokens), (1, 4));
+    assert_eq!(acquired.media[0].source_pixels, (64, 64));
 }
 
 // ── cache, single-flight, cancellation ─────────────────────────────────────

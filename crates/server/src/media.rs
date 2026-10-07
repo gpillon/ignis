@@ -51,8 +51,12 @@ pub struct MediaRejection {
 pub struct MediaStats {
     /// Media items in the request.
     pub items: u32,
-    /// Merged vision tokens across the items.
+    /// Merged vision tokens across the items, as admitted.
     pub vision_tokens: u64,
+    /// What those tokens would be under the artifact's own pixel bounds,
+    /// without `--vision-max-tokens`: above `vision_tokens` exactly when the
+    /// budget shrank an image (GitHub #248).
+    pub natural_vision_tokens: u64,
     /// Acquired (encoded) bytes across the items.
     pub media_bytes: u64,
     /// Seconds spent decoding, resizing and packing the items this request
@@ -778,7 +782,7 @@ impl MediaAcquirer {
             .expect("hashing does not panic");
             tickets.push(self.cache.begin(digest, item, bytes, &self.preparer, &self.pool));
         }
-        let (mut raw_patches, mut vision_tokens) = (0u64, 0u64);
+        let (mut raw_patches, mut vision_tokens, mut natural_vision_tokens) = (0u64, 0u64, 0u64);
         let mut media = Vec::with_capacity(tickets.len());
         for ((item, part), ticket) in parts.iter().enumerate().zip(&tickets) {
             let result = tokio::time::timeout_at(deadline.into(), ticket.wait())
@@ -807,6 +811,7 @@ impl MediaAcquirer {
             }
             raw_patches += prepared.grid.raw_patches();
             vision_tokens += prepared.grid.vision_tokens();
+            natural_vision_tokens += prepared.natural_vision_tokens;
             if raw_patches > limits.max_raw_patches {
                 return Err(budget(Budget::RawPatches, limits.max_raw_patches, raw_patches));
             }
@@ -817,6 +822,7 @@ impl MediaAcquirer {
         }
         drop(tickets);
         stats.vision_tokens = vision_tokens;
+        stats.natural_vision_tokens = natural_vision_tokens;
         let media = media.into_iter().map(|m| Arc::try_unwrap(m).unwrap_or_else(|m| (*m).clone())).collect();
         Ok(AcquiredMedia { media, stats })
     }

@@ -186,6 +186,36 @@ async fn the_encode_time_of_a_multimodal_prefill_reaches_the_admitted_event() {
 }
 
 #[tokio::test]
+async fn an_image_over_the_vision_budget_is_admitted_shrunk_and_the_log_shows_both_sizes() {
+    let sink = Arc::new(MemorySink::new());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone())),
+    );
+    // GitHub #248: 256 x 256 is 64 merged tokens, over a budget of 16.
+    let budgeted = ProcessorOptions { max_vision_tokens: 16, ..limits() };
+    let preparer = Arc::new(Counting { inner: processor(budgeted.clone()), builds: AtomicUsize::new(0) });
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
+        Arc::new(MockCompute::new()),
+    );
+    let acquirer = MediaAcquirer::new(preparer, budgeted, MediaPolicy::new(false, 1 << 20));
+    let app = Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider))
+        .with_request_timeout(Duration::from_secs(10))
+        .with_media(Arc::new(acquirer))
+        .app();
+
+    let response = app.oneshot(image_request(&data_uri(&png(256, 256)))).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200, "an image over the budget is shrunk, not refused");
+    let _ = to_bytes(response.into_body(), usize::MAX).await;
+    nudge().await;
+
+    let admitted = admitted_attributes(&sink);
+    assert_eq!(admitted.len(), 1, "{admitted:?}");
+    assert_eq!(admitted[0]["media.vision_tokens"], 16, "{:?}", admitted[0]);
+    assert_eq!(admitted[0]["media.natural_vision_tokens"], 64, "{:?}", admitted[0]);
+}
+
+#[tokio::test]
 async fn the_same_image_sent_twice_is_a_cache_hit_on_the_admitted_event() {
     let sink = Arc::new(MemorySink::new());
     let _guard = tracing::subscriber::set_default(

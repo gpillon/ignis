@@ -111,6 +111,11 @@ pub struct PreparedMedia {
     /// rescaling rather than handing a caller a 0-999 pair and letting them
     /// get a non-square image wrong once.
     pub source_pixels: (u32, u32),
+    /// The merged tokens this image would have come out at under the
+    /// artifact's own pixel bounds, without the request budget
+    /// ([`ProcessorOptions::resize_bounds`]): equal to `grid.vision_tokens()`
+    /// unless the budget shrank the image (GitHub #248).
+    pub natural_vision_tokens: u64,
 }
 
 /// A prepared image placed in the prompt.
@@ -166,7 +171,9 @@ pub struct ProcessorOptions {
     pub max_decoded_pixels: u64,
     /// Raw patches across a request.
     pub max_raw_patches: u64,
-    /// Merged vision tokens across a request.
+    /// Merged vision tokens across a request. It also shrinks each image: no
+    /// image is resized to more tokens than this (GitHub #248), so a budget
+    /// below an image's natural size downscales it instead of refusing it.
     pub max_vision_tokens: u64,
 }
 
@@ -179,6 +186,31 @@ impl ProcessorOptions {
     /// request.
     pub fn max_item_tokens(&self) -> u64 {
         (self.max_pixels / (FACTOR * FACTOR) as u64).min(self.max_vision_tokens)
+    }
+
+    /// The pixel bounds `smart_resize` is given: the artifact's, with the
+    /// upper one lowered to the area of `max_vision_tokens` merged tokens
+    /// (`FACTOR` x `FACTOR` pixels each) when that is smaller, and the lower
+    /// one lowered with it so the pair stays valid. That is what the
+    /// reference processor does when handed a smaller `max_pixels`; at the
+    /// artifact's own bounds and the default budget it changes nothing.
+    pub fn resize_bounds(&self) -> (u64, u64) {
+        let max_pixels = self.max_pixels.min(self.max_vision_tokens.saturating_mul((FACTOR * FACTOR) as u64));
+        (self.min_pixels.min(max_pixels), max_pixels)
+    }
+
+    /// The size `smart_resize` gives an image under [`Self::resize_bounds`],
+    /// within the budget wherever any size is. The one way it can miss is the
+    /// upscale to the lower bound, which rounds each side up and so can land
+    /// past the area it aimed at: that image is resized again with no lower
+    /// bound, to its own (budget-fitting) size.
+    pub fn resize_target(&self, height: u32, width: u32) -> Result<resize::Size, resize::ResizeError> {
+        let (min_pixels, max_pixels) = self.resize_bounds();
+        let size = resize::smart_resize(height, width, min_pixels, max_pixels)?;
+        if grid_of(size).vision_tokens() > self.max_vision_tokens {
+            return resize::smart_resize(height, width, (FACTOR * FACTOR) as u64, max_pixels);
+        }
+        Ok(size)
     }
 
     /// The reference's limits with the pixel bounds read from the artifact's
@@ -316,6 +348,11 @@ impl fmt::Display for ProcessorError {
 
 impl std::error::Error for ProcessorError {}
 
+/// The patch grid of one image resized to `size`.
+fn grid_of(size: resize::Size) -> Grid {
+    Grid { t: 1, h: size.height / PATCH as u32, w: size.width / PATCH as u32 }
+}
+
 fn check_budget(budget: Budget, limit: u64, requested: u64) -> Result<(), ProcessorError> {
     if requested > limit {
         return Err(ProcessorError::BudgetExceeded { budget, limit, requested });
@@ -389,7 +426,7 @@ impl VisionProcessor {
             },
         })?;
         let (source_width, source_height) = (image.width, image.height);
-        let size = resize::smart_resize(image.height, image.width, options.min_pixels, options.max_pixels)
+        let size = options.resize_target(image.height, image.width)
             .map_err(|error| match error {
                 resize::ResizeError::AspectRatio => ProcessorError::InvalidMedia {
                     item,
@@ -399,7 +436,15 @@ impl VisionProcessor {
                     ProcessorError::InvalidConfig("invalid image resize configuration".to_owned())
                 }
             })?;
-        let grid = Grid { t: 1, h: size.height / PATCH as u32, w: size.width / PATCH as u32 };
+        let grid = grid_of(size);
+        // What the artifact's bounds alone would give, for the log: only
+        // worth the second resize when the budget moved the bounds.
+        let natural_vision_tokens = if options.resize_bounds() == (options.min_pixels, options.max_pixels) {
+            grid.vision_tokens()
+        } else {
+            resize::smart_resize(source_height, source_width, options.min_pixels, options.max_pixels)
+                .map_or(grid.vision_tokens(), |natural| grid_of(natural).vision_tokens())
+        };
         check_budget(Budget::RawPatches, options.max_raw_patches, grid.raw_patches())?;
         check_budget(Budget::VisionTokens, options.max_vision_tokens, grid.vision_tokens())?;
         // Then the item bound, which only the pixel bound can make tighter:
@@ -415,6 +460,7 @@ impl VisionProcessor {
             patches: patches::pack_patches(&resized),
             content_digest,
             encoded_bytes: bytes.len(),
+            natural_vision_tokens,
         })
     }
 
@@ -640,11 +686,13 @@ mod tests {
     fn every_budget_is_a_media_budget_exceeded_error() {
         let image = png(64, 64);
         let rendered = format!("{IMAGE_PAD}");
-        let cases: [(fn(&mut ProcessorOptions), Budget); 4] = [
+        // The vision-token budget is not here: an image over it is shrunk
+        // (GitHub #248), and only a request's total can still exceed it
+        // (`budgets_are_aggregated_across_the_request`).
+        let cases: [(fn(&mut ProcessorOptions), Budget); 3] = [
             (|o| o.max_encoded_media_bytes = 10, Budget::EncodedBytes),
             (|o| o.max_decoded_pixels = 64 * 64 - 1, Budget::DecodedPixels),
             (|o| o.max_raw_patches = 15, Budget::RawPatches),
-            (|o| o.max_vision_tokens = 3, Budget::VisionTokens),
         ];
         for (shrink, budget) in cases {
             let mut limits = options();
@@ -665,6 +713,99 @@ mod tests {
         let rendered = format!("{IMAGE_PAD} {IMAGE_PAD}");
         let error = processor.prepare(&tokenizer, &rendered, &[&image, &image], &[]).unwrap_err();
         assert_eq!(error, ProcessorError::BudgetExceeded { budget: Budget::VisionTokens, limit: 6, requested: 8 });
+    }
+
+    #[test]
+    fn an_image_over_the_vision_token_budget_is_shrunk_not_refused() {
+        // 1024 x 768 is 24 x 32 = 768 merged tokens at the pixel bound's 1,024.
+        let image = png(1024, 768);
+        let natural = {
+            let (_, processor) = processor(options());
+            processor.prepare_media(0, &image).unwrap()
+        };
+        assert_eq!((natural.grid.vision_tokens(), natural.natural_vision_tokens), (768, 768));
+        for budget in [767, 500, 100, 12, 1] {
+            let (_, processor) = processor(ProcessorOptions { max_vision_tokens: budget, ..options() });
+            let media = processor.prepare_media(0, &image).unwrap_or_else(|e| panic!("budget {budget}: {e}"));
+            let tokens = media.grid.vision_tokens();
+            assert!((1..=budget).contains(&tokens), "budget {budget}: {tokens} tokens");
+            assert_eq!(media.natural_vision_tokens, 768, "budget {budget}");
+            assert_eq!(media.source_pixels, (1024, 768), "the source size is the submitted one");
+            assert_eq!(media.patches.len() as u64, media.grid.raw_patches() * PATCH_FEATURES as u64);
+            // The aspect ratio survives to within a merged token's rounding.
+            let (h, w) = (media.grid.h as f64, media.grid.w as f64);
+            if budget >= 100 {
+                assert!((w / h - 4.0 / 3.0).abs() < 0.2, "budget {budget}: {h} x {w} patches");
+            }
+        }
+    }
+
+    #[test]
+    fn a_budget_that_does_not_bind_leaves_every_image_at_its_size() {
+        let artifact = options();
+        for (height, width) in [(64, 64), (300, 500), (768, 1024), (1000, 1000), (2000, 700)] {
+            let natural = resize::smart_resize(height, width, artifact.min_pixels, artifact.max_pixels).unwrap();
+            let target = artifact.resize_target(height, width).unwrap();
+            assert_eq!(target, natural, "{height} x {width}");
+        }
+        assert_eq!(artifact.resize_bounds(), (artifact.min_pixels, artifact.max_pixels));
+        // The artifact's real bounds and the default 32,768-token budget:
+        // the budget's area (33.5 MP) is above the 16.7 MP pixel bound.
+        let real = ProcessorOptions {
+            min_pixels: 65_536,
+            max_pixels: 16_777_216,
+            max_vision_tokens: 32_768,
+            ..options()
+        };
+        assert_eq!(real.resize_bounds(), (65_536, 16_777_216));
+        // ...while its 16,384-token item bound is the pixel bound's, as before.
+        assert_eq!(real.max_item_tokens(), 16_384);
+    }
+
+    #[test]
+    fn the_budget_lowers_the_pixel_bounds_to_its_area_and_the_floor_with_it() {
+        let artifact = ProcessorOptions { min_pixels: 65_536, max_pixels: 16_777_216, ..options() };
+        let bounds = |tokens| ProcessorOptions { max_vision_tokens: tokens, ..artifact.clone() }.resize_bounds();
+        assert_eq!(bounds(1024), (65_536, 1_048_576));
+        // Under the floor's 64 tokens the floor drops to the budget's area,
+        // so `smart_resize` never sees min > max.
+        assert_eq!(bounds(64), (65_536, 65_536));
+        assert_eq!(bounds(16), (16_384, 16_384));
+        assert_eq!(bounds(1), (1024, 1024));
+    }
+
+    #[test]
+    fn every_size_fits_every_budget_it_can() {
+        let artifact = ProcessorOptions { min_pixels: 65_536, max_pixels: 16_777_216, ..options() };
+        let sizes = [
+            (28, 28), (64, 64), (100, 100), (224, 224), (480, 640), (768, 1024), (1080, 1920),
+            (1920, 1080), (3000, 4000), (5120, 5120), (2160, 7680), (300, 4500), (4500, 300),
+        ];
+        for budget in [1u64, 2, 3, 4, 7, 16, 63, 64, 65, 100, 255, 256, 1000, 1024, 4096, 20_000] {
+            let limits = ProcessorOptions { max_vision_tokens: budget, ..artifact.clone() };
+            for (height, width) in sizes {
+                // A side is never below one merge factor, so a long thin
+                // image under a budget smaller than its aspect ratio has no
+                // size that fits; it stays a refusal (`VisionTokens`).
+                if height.max(width) as f64 / height.min(width) as f64 > budget as f64 {
+                    continue;
+                }
+                let size = limits.resize_target(height, width).unwrap_or_else(|e| panic!("{height}x{width} @ {budget}: {e:?}"));
+                let tokens = grid_of(size).vision_tokens();
+                assert!(tokens >= 1 && tokens <= budget, "{height} x {width} @ {budget}: {tokens} tokens ({size:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_image_under_a_budget_below_the_floor_is_not_refused() {
+        // The artifact's floor is 64 tokens; a 16-token budget lowers it.
+        let limits = ProcessorOptions { min_pixels: 65_536, max_pixels: 16_777_216, max_vision_tokens: 16, ..options() };
+        let (tokenizer, processor) = processor(limits);
+        let image = png(100, 100);
+        let rendered = format!("{IMAGE_PAD}");
+        let prompt = processor.prepare(&tokenizer, &rendered, &[&image], &[]).unwrap();
+        assert!(prompt.media[0].grid.vision_tokens() <= 16);
     }
 
     #[test]

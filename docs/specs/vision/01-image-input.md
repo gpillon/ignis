@@ -108,7 +108,12 @@ codes, the image's tokens counted in `usage.prompt_tokens`.
   reports it.
 - Vision envelope defaults to the reference's: 32,768 merged vision tokens
   (131,072 raw patches) per request, and the effective limit is
-  `min(max_context, envelope)`. It is a load option (`--vision-max-tokens`)
+  `min(max_context, envelope)`. An image whose natural size is past it is
+  downscaled, not refused (GitHub #248): the envelope lowers the processor's
+  `max_pixels` to its area (1,024 pixels per merged token, aspect ratio kept,
+  and the floor `min_pixels` lowered with it), as the reference does with a
+  smaller `max_pixels`; only a request whose images sum past the envelope is
+  refused. It is a load option (`--vision-max-tokens`)
   because the workspace it sizes is VRAM taken from the KV pool; the GPU
   acceptance step records the reservation at the default and the owner may
   lower it.

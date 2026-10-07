@@ -599,7 +599,7 @@ When output names a domain concept, use the term as defined here.
   a prefill chunk carries at most one of.
 - **Vision tokens** — a media item's *merged* tokens, one per 2x2 block of
   patches: the placeholder run's length, and what the per-request envelope
-  (`--vision-max-tokens`) is counted in.
+  (`--vision-max-tokens`) is counted in. The envelope also bounds each image: one over it is downscaled onto a smaller grid, not refused (#248).
 - **Media embedding** — a media item's encoder output, `[hidden, vision
   tokens]`, device-resident and leaf-owned. **Held** by a request from its
   encode until the item's last placeholder is prefilled, and **resident** in

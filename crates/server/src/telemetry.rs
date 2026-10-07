@@ -782,6 +782,7 @@ impl Telemetry {
             class = class.as_extension_str(),
             media.items = media.map(|m| m.items),
             media.vision_tokens = media.map(|m| m.vision_tokens),
+            media.natural_vision_tokens = media.map(|m| m.natural_vision_tokens),
             media.bytes = media.map(|m| m.media_bytes),
             media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
             media.cache_hits = media.map(|m| m.cache_hits),
@@ -1240,6 +1241,7 @@ mod tests {
         let media = MediaStats {
             items: 2,
             vision_tokens: 8,
+            natural_vision_tokens: 20,
             media_bytes: 4096,
             preprocess_seconds: 0.25,
             cache_hits: 1,
@@ -1262,6 +1264,7 @@ mod tests {
         let attributes = &admitted(1)["attributes"];
         assert_eq!(attributes["media.items"], 2, "{attributes}");
         assert_eq!(attributes["media.vision_tokens"], 8);
+        assert_eq!(attributes["media.natural_vision_tokens"], 20);
         assert_eq!(attributes["media.bytes"], 4096);
         assert_eq!(attributes["media.preprocess_seconds"], 0.25);
         assert_eq!(attributes["media.cache_hits"], 1);
