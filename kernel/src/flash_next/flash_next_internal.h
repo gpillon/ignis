@@ -272,6 +272,7 @@ struct NgramWeights {
 // Rows are lane-major throughout: row = lane * tokens + column.
 struct VerifyRecords {
   const int32_t *valid_columns = nullptr;  // DEVICE [lanes]: extent + 1, in [1, tokens]
+  int32_t rows = 0;                         // the rows the records hold: a call's lanes * tokens at most
   // GDN layer `ordinal`'s records start at these + ordinal * gdn_layer_bytes: key BF16
   // [rows][16][128], value BF16 [rows][48][128], {g, beta} fp32 pairs [rows][48], conv inputs BF16
   // [rows][10240] (the vendored replay record's layouts, and our fold's).

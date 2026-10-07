@@ -24,11 +24,14 @@
 //   hq vs BF16 the hq route's distance from the BF16 route on the same keys and values, and the
 //             codec's row error, printed on these synthetic rows; then asserted on real Flash-Next KV
 //             rows (kernel/tests/fixtures/hq_kv_rows_flash_next.bin, spec 04 AC7) within the codec's
-//             measured effect on them.
+//             measured effect on them, on all three routes: decode, S2's dense prefill
+//             (qsa::attend_dense over the visible rows decoded by position) and sparse prefill.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
 #include "flash_next_sparse_test_common.h"
+
+#include "../src/flash_next/qsa.h"
 
 #include "ops/kernel/hq_codec.cuh"
 
@@ -388,16 +391,30 @@ int main() {
   // hq vs BF16 on real Flash-Next rows (spec 04 AC7): every page refilled with the K/V rows of the first
   // QSA layer (model layer 3) from kernel/tests/fixtures/hq_kv_rows_flash_next.bin, its 256 positions per
   // head tiled over the pages, and encoded by the same vendored encoder at each row's own position. The
-  // hq decode route's distance from the BF16 route on the same rows is held to the codec's MEASURED
-  // effect on these rows -- fp64 attention over the codec's decoded rows minus fp64 attention over the
-  // BF16 rows: what is left after taking that effect away must be rounding, at most 2^-7 relative RMS
-  // (two routes, each a BF16 output and BF16 weights at 2^-9). Not a worst-case codec bound (0312e0b:
-  // that one grows as e^(2 max |q.dK|) and cannot fail): a route whose hq error is anything but the
-  // codec's own fails it. Each route against reference()'s per-element bound is printed, not held: on
-  // these rows both routes, the BF16 one too, pass that bound by up to ~1.7x on ~0.4% of the
-  // elements (measured 2026-10-06: 72 and 75 of 18432), a shortfall of the shared bound's model at
-  // real magnitudes, not of the hq route. Measured here: route distance rel. RMS 0.1480 against the
-  // codec's effect 0.1479, 2.5e-3 left after it.
+  // three routes, each run hq and BF16 on the same rows, codec only (no fresh rows, no residual window:
+  // every row hq reads is a codec row, so every difference is the codec's):
+  //   decode  the three decode rows above: their listed rows on the sparse kernel;
+  //   dense   one lane's prefill chunk of 251 rows at 1800, up to dense_threshold(): its visible rows
+  //           decoded by position, on the dense kernel (qsa_dense.cu) -- every 25th row checked;
+  //   sparse prefill  one lane's 128 rows at 5000, past dense_threshold(): its visible rows decoded
+  //           by position, each row's own selection on the sparse kernel -- every 16th row checked.
+  // Held, per route:
+  // - each output within reference()'s per-element bound of fp64 attention over the rows the route
+  //   read (hq: its scratch, downloaded; BF16: the pages), the dense kernel's form of it on the dense
+  //   route;
+  // - per element, hq within the BF16 output plus the codec's MEASURED effect on it -- fp64 attention
+  //   over the rows hq read minus fp64 attention over the BF16 rows -- plus both bounds: AC7's
+  //   tolerance, derived from the codec error measured on these rows;
+  // - in aggregate, what is left of the route distance after that effect is rounding, at most 2^-7
+  //   relative RMS. Not a worst-case codec bound (0312e0b: that one grows as e^(2 max |q.dK|) and
+  //   cannot fail): a route whose hq error is anything but the codec's own fails it.
+  // The per-element bound held here is reference()'s with BF16 rounding at 2^-8 (#306 item 8): at
+  // 2^-9 the BF16 route itself passed it on 75 of these 18432 decode outputs, by up to 1.56x.
+  // Measured 2026-10-07: decode -- codec effect rel. RMS 0.1480, route distance 0.1480, 2.4e-3
+  // left; worst of the bound hq 0.754, BF16 0.798; dense -- 0.1404, 0.1404, 2.4e-3 left; hq 0.508,
+  // BF16 0.517; sparse prefill -- 0.1288, 0.1288, 2.4e-3 left; hq 0.741, BF16 0.798. Against the
+  // codec tolerance every route reaches 0.99 by construction: where the effect dominates, the
+  // distance is the effect and the bounds are the margin.
   {
     const std::vector<uint16_t> real = real_layer_rows(IGNIS_HQ_KV_FLASH_NEXT_FIXTURE_PATH);
     Pages rp = pg;
@@ -439,71 +456,145 @@ int main() {
     rh.k_meta = rkm.as<uint8_t>();
     rh.v_codes = rvc.as<uint8_t>();
     rh.v_meta = rvm.as<uint8_t>();
-    const auto got = run(d, dec, listed(rh), stream);
+
+    // One route's hq output (over `hq_rows`, what it read) against its BF16 output (over the pages'
+    // rows), every `step`-th row of call `c`.
+    auto routes = [&](const std::string &what, const Call &c, const std::vector<uint16_t> &hq_out, const RowFn &hq_rows,
+                      const std::vector<uint16_t> &bf_out, int step, bool dense) {
+      double effect2 = 0.0, out2 = 0.0, diff2 = 0.0, left2 = 0.0, worst_hq = 0.0, worst_bf = 0.0, worst_tol = 0.0;
+      size_t past_hq = 0, past_bf = 0, past_tol = 0, total = 0;
+      for (int r = 0; r < static_cast<int>(c.lists.size()); r += step) {
+        const int slot = c.slots[r / c.tokens];
+        const Reference hq_ref = reference(hq_rows, q, r, slot, c.lists[r], dense);
+        const Reference bf_ref = reference(rexact, q, r, slot, c.lists[r], dense);
+        for (size_t i = 0; i < hq_ref.out.size(); ++i) {
+          const size_t at = static_cast<size_t>(r) * kQHeads * kHd + i;
+          const double h = bf16_to_f32(hq_out[at]), b = bf16_to_f32(bf_out[at]);
+          const double effect = hq_ref.out[i] - bf_ref.out[i], diff = h - b;
+          const double tol = std::fabs(effect) + hq_ref.bound[i] + bf_ref.bound[i];
+          effect2 += effect * effect;
+          out2 += bf_ref.out[i] * bf_ref.out[i];
+          diff2 += diff * diff;
+          left2 += (diff - effect) * (diff - effect);
+          past_hq += !(std::fabs(h - hq_ref.out[i]) <= hq_ref.bound[i]);
+          past_bf += !(std::fabs(b - bf_ref.out[i]) <= bf_ref.bound[i]);
+          past_tol += !(std::fabs(diff) <= tol);
+          worst_hq = std::max(worst_hq, std::fabs(h - hq_ref.out[i]) / hq_ref.bound[i]);
+          worst_bf = std::max(worst_bf, std::fabs(b - bf_ref.out[i]) / bf_ref.bound[i]);
+          worst_tol = std::max(worst_tol, std::fabs(diff) / tol);
+          ++total;
+        }
+      }
+      const double left = std::sqrt(left2 / out2);
+      std::printf("  %-28s codec effect on the fp64 output rel. RMS %.4f; route distance %.4f; left after the "
+                  "effect %.2e (limit 2^-7)\n",
+                  what.c_str(), std::sqrt(effect2 / out2), std::sqrt(diff2 / out2), left);
+      std::printf("  %-28s of the per-element bound: hq worst %.3f, BF16 worst %.3f; hq vs BF16 worst %.3f of the "
+                  "codec tolerance; %zu elements\n",
+                  what.c_str(), worst_hq, worst_bf, worst_tol, total);
+      check(past_hq == 0, what + ": " + std::to_string(past_hq) + " hq outputs past the bound of fp64 over the rows read");
+      check(past_bf == 0, what + ": " + std::to_string(past_bf) + " BF16 outputs past the bound of fp64 over the rows");
+      check(past_tol == 0, what + ": " + std::to_string(past_tol) +
+                               " hq outputs past the BF16 one plus the codec's measured effect and both bounds");
+      check(left <= 0x1p-7, what + ": the route distance is not the codec's measured effect");
+    };
+
+    // decode: the listed rows, hq through its scratch and BF16 staged by list index.
     {
+      const auto got = run(d, dec, listed(rh), stream);
       const Read rd = read_listed(dec);
       rows_within_ulp("decode, real rows", dec, listed_rows(dec, rd), rcodec);
-    }
-    // The BF16 route over the same rows, staged by list index.
-    std::vector<uint16_t> hk(sp::listed_hq_bytes(g, 3) / 2, 0), hv(hk.size(), 0);
-    double row_err2 = 0.0, row_ref2 = 0.0;
-    for (int r = 0; r < 3; ++r) {
-      for (size_t i = 0; i < dec.lists[r].size(); ++i) {
-        for (int h = 0; h < kKvHeads; ++h) {
-          const size_t at = rp.row_at(dec.slots[r], dec.lists[r][i], h);
-          const size_t dst = ((static_cast<size_t>(r) * kWidth + i) * kKvHeads + h) * kHd;
-          std::copy(&rp.k[at], &rp.k[at] + kHd, &hk[dst]);
-          std::copy(&rp.v[at], &rp.v[at] + kHd, &hv[dst]);
-          double a[kHd], b[kHd];
-          for (int role = 0; role < 2; ++role) {
-            rcodec(role, dec.slots[r], dec.lists[r][i], h, a);
-            rexact(role, dec.slots[r], dec.lists[r][i], h, b);
-            for (int dd = 0; dd < kHd; ++dd) {
-              row_err2 += (a[dd] - b[dd]) * (a[dd] - b[dd]);
-              row_ref2 += b[dd] * b[dd];
+      std::vector<uint16_t> hk(sp::listed_hq_bytes(g, 3) / 2, 0), hv(hk.size(), 0);
+      double row_err2 = 0.0, row_ref2 = 0.0;
+      for (int r = 0; r < 3; ++r) {
+        for (size_t i = 0; i < dec.lists[r].size(); ++i) {
+          for (int h = 0; h < kKvHeads; ++h) {
+            const size_t at = rp.row_at(dec.slots[r], dec.lists[r][i], h);
+            const size_t dst = ((static_cast<size_t>(r) * kWidth + i) * kKvHeads + h) * kHd;
+            std::copy(&rp.k[at], &rp.k[at] + kHd, &hk[dst]);
+            std::copy(&rp.v[at], &rp.v[at] + kHd, &hv[dst]);
+            double a[kHd], b[kHd];
+            for (int role = 0; role < 2; ++role) {
+              rcodec(role, dec.slots[r], dec.lists[r][i], h, a);
+              rexact(role, dec.slots[r], dec.lists[r][i], h, b);
+              for (int dd = 0; dd < kHd; ++dd) {
+                row_err2 += (a[dd] - b[dd]) * (a[dd] - b[dd]);
+                row_ref2 += b[dd] * b[dd];
+              }
             }
           }
         }
       }
+      DeviceBytes ek(hk.size() * 2), ev(hv.size() * 2);
+      upload(ek, hk);
+      upload(ev, hv);
+      sp::KvSource bf16;
+      bf16.k = ek.as<__nv_bfloat16>();
+      bf16.v = ev.as<__nv_bfloat16>();
+      bf16.kv_heads = kKvHeads;
+      bf16.mode = sp::KvSource::Mode::ByIndex;
+      const auto base = run(d, dec, [&](const fn::Batch &b, const fn::Selection &sel, cudaStream_t s) {
+        SP_OK(sp::attend(g, bf16, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
+      }, stream);
+      std::printf("  real layer-3 rows: codec row rel. L2 %.4f\n", std::sqrt(row_err2 / row_ref2));
+      routes("decode, real rows", dec, got, listed_rows(dec, rd), base, 1, false);
     }
-    DeviceBytes ek(hk.size() * 2), ev(hv.size() * 2);
-    upload(ek, hk);
-    upload(ev, hv);
-    sp::KvSource bf16;
-    bf16.k = ek.as<__nv_bfloat16>();
-    bf16.v = ev.as<__nv_bfloat16>();
-    bf16.kv_heads = kKvHeads;
-    bf16.mode = sp::KvSource::Mode::ByIndex;
-    const auto base = run(d, dec, [&](const fn::Batch &b, const fn::Selection &sel, cudaStream_t s) {
-      SP_OK(sp::attend(g, bf16, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
-    }, stream);
-    double effect2 = 0.0, out2 = 0.0, diff2 = 0.0, left2 = 0.0, worst_hq = 0.0, worst_bf = 0.0;
-    size_t past_hq = 0, past_bf = 0;
-    for (int r = 0; r < 3; ++r) {
-      const Reference hq_ref = reference(rcodec, q, r, dec.slots[r], dec.lists[r]);
-      const Reference bf_ref = reference(rexact, q, r, dec.slots[r], dec.lists[r]);
-      for (size_t i = 0; i < hq_ref.out.size(); ++i) {
-        const size_t at = static_cast<size_t>(r) * kQHeads * kHd + i;
-        const double hq_out = bf16_to_f32(got[at]), bf_out = bf16_to_f32(base[at]);
-        const double effect = hq_ref.out[i] - bf_ref.out[i], diff = hq_out - bf_out;
-        effect2 += effect * effect;
-        out2 += bf_ref.out[i] * bf_ref.out[i];
-        diff2 += diff * diff;
-        left2 += (diff - effect) * (diff - effect);
-        past_hq += !(std::fabs(hq_out - hq_ref.out[i]) <= hq_ref.bound[i]);
-        past_bf += !(std::fabs(bf_out - bf_ref.out[i]) <= bf_ref.bound[i]);
-        worst_hq = std::max(worst_hq, std::fabs(hq_out - hq_ref.out[i]) / hq_ref.bound[i]);
-        worst_bf = std::max(worst_bf, std::fabs(bf_out - bf_ref.out[i]) / bf_ref.bound[i]);
-      }
+
+    // dense: one lane's visible rows, hq decoded by position, BF16 from the pages.
+    {
+      constexpr int kFirst = 1800, kTokens = 251;
+      Call dc;
+      dc.slots = {0};
+      dc.positions = {kFirst};
+      dc.tokens = kTokens;
+      dc.max_visible = kFirst + kTokens;
+      for (int r = 0; r < kTokens; ++r) dc.lists.push_back(make_list(kFirst + r, 0));
+      check(dc.max_visible <= g.dense_threshold(), "dense, real rows: the chunk is within dense_threshold()");
+      DeviceBytes pk(sp::visible_hq_bytes(g, dc.max_visible)), pv(sp::visible_hq_bytes(g, dc.max_visible));
+      const auto got = run(d, dc, [&](const fn::Batch &b, const fn::Selection &, cudaStream_t s) {
+        sp::KvSource kv;
+        SP_OK(sp::decode_visible_hq(g, rh, b, pk.as<__nv_bfloat16>(), pv.as<__nv_bfloat16>(), &kv, s));
+        SP_OK(fn::qsa::attend_dense(g, kv, kSlots, b, d.q.as<__nv_bfloat16>(), d.out.as<__nv_bfloat16>(), s));
+      }, stream);
+      Read rd;
+      rd.k = download<uint16_t>(pk.p, sp::visible_hq_bytes(g, dc.max_visible) / 2);
+      rd.v = download<uint16_t>(pv.p, sp::visible_hq_bytes(g, dc.max_visible) / 2);
+      rows_within_ulp("dense, real rows", dc, positional_rows(rd), rcodec);
+      const sp::KvSource pages{rk.as<__nv_bfloat16>(), rv.as<__nv_bfloat16>(), dtables.as<int32_t>(), kLogicalPages,
+                               kKvHeads, sp::KvSource::Mode::Paged};
+      const auto base = run(d, dc, [&](const fn::Batch &b, const fn::Selection &, cudaStream_t s) {
+        SP_OK(fn::qsa::attend_dense(g, pages, kSlots, b, d.q.as<__nv_bfloat16>(), d.out.as<__nv_bfloat16>(), s));
+      }, stream);
+      routes("dense, real rows", dc, got, positional_rows(rd), base, 25, true);
     }
-    const double left = std::sqrt(left2 / out2);
-    std::printf("  hq vs BF16 route, real layer-3 rows: codec row rel. L2 %.4f; its effect on the fp64 output rel. "
-                "RMS %.4f; route distance rel. RMS %.4f; left after the effect %.2e (limit 2^-7)\n",
-                std::sqrt(row_err2 / row_ref2), std::sqrt(effect2 / out2), std::sqrt(diff2 / out2), left);
-    std::printf("  against reference()'s per-element bound (printed): hq route worst %.3f, %zu past; BF16 route "
-                "worst %.3f, %zu past, of %zu\n",
-                worst_hq, past_hq, worst_bf, past_bf, static_cast<size_t>(3) * kQHeads * kHd);
-    check(left <= 0x1p-7, "hq vs BF16 on real rows: the route distance is not the codec's measured effect");
+
+    // sparse prefill: one lane's chunk past dense_threshold(), each row its own selection over its
+    // visible rows -- hq decoded by position, BF16 from the pages -- on the sparse kernel.
+    {
+      constexpr int kFirst = 5000, kTokens = 128;  // 256 units: one split, no partials
+      Call sc;
+      sc.slots = {0};
+      sc.positions = {kFirst};
+      sc.tokens = kTokens;
+      sc.max_visible = kFirst + kTokens;
+      for (int r = 0; r < kTokens; ++r) sc.lists.push_back(make_list(kFirst + r, 11));
+      DeviceBytes pk(sp::visible_hq_bytes(g, sc.max_visible)), pv(sp::visible_hq_bytes(g, sc.max_visible));
+      const auto got = run(d, sc, [&](const fn::Batch &b, const fn::Selection &sel, cudaStream_t s) {
+        sp::KvSource kv;
+        SP_OK(sp::decode_visible_hq(g, rh, b, pk.as<__nv_bfloat16>(), pv.as<__nv_bfloat16>(), &kv, s));
+        SP_OK(sp::attend(g, kv, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
+      }, stream);
+      Read rd;
+      rd.k = download<uint16_t>(pk.p, sp::visible_hq_bytes(g, sc.max_visible) / 2);
+      rd.v = download<uint16_t>(pv.p, sp::visible_hq_bytes(g, sc.max_visible) / 2);
+      rows_within_ulp("sparse prefill, real rows", sc, positional_rows(rd), rcodec);
+      const sp::KvSource pages{rk.as<__nv_bfloat16>(), rv.as<__nv_bfloat16>(), dtables.as<int32_t>(), kLogicalPages,
+                               kKvHeads, sp::KvSource::Mode::Paged};
+      const auto base = run(d, sc, [&](const fn::Batch &b, const fn::Selection &sel, cudaStream_t s) {
+        SP_OK(sp::attend(g, pages, b, d.q.as<__nv_bfloat16>(), sel, d.out.as<__nv_bfloat16>(), d.partials.p, s));
+      }, stream);
+      routes("sparse prefill, real rows", sc, got, positional_rows(rd), base, 16, false);
+    }
   }
 
   // fresh: each lane's own token read exactly from the call's BF16 K/V.

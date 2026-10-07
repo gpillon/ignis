@@ -29,6 +29,11 @@ int32_t fn_indexer_select(const Context &ctx, int32_t attn_ordinal, const Indexe
     fn_set_error("fn_indexer_select: indexer pages hold 16 blocks of 4 tokens");
     return -1;
   }
+  if (batch.verify != nullptr && batch.rows() > batch.verify->rows) {
+    fn_set_error("fn_indexer_select: a verify call of " + std::to_string(batch.rows()) + " rows overruns its records' " +
+                 std::to_string(batch.verify->rows));
+    return -1;
+  }
   auto scope = scratch.scope();
   const int32_t qk_cols = (g.indexer_heads + g.indexer_kv_heads) * g.indexer_head_dim;
   void *qk = scratch.alloc_bytes(static_cast<size_t>(batch.rows()) * qk_cols * sizeof(__nv_bfloat16)).data;

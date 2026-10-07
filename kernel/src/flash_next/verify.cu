@@ -440,6 +440,20 @@ bool launched(const char *what, std::string *error) {
   return false;
 }
 
+// Whether a call of `lanes` lanes at window k fits what `state` was sized for -- its records'
+// rows, its saved lanes and widest window's ring rows, its accept's drafts -- else *error.
+bool fits(const State &state, uint32_t lanes, uint32_t window, const char *what, std::string *error) {
+  const auto rows = static_cast<uint32_t>(state.records.rows);
+  const uint32_t widest = state.window(1);
+  if (lanes >= 1 && lanes <= state.lanes && window >= 1 && window <= widest && lanes * (window + 1) <= rows) {
+    return true;
+  }
+  *error = std::string(what) + ": " + std::to_string(lanes) + " lanes x " + std::to_string(window + 1) +
+           " columns overrun this load's round (1.." + std::to_string(state.lanes) + " lanes, a window of 1.." +
+           std::to_string(widest) + ", " + std::to_string(rows) + " rows)";
+  return false;
+}
+
 }  // namespace
 
 uint32_t written_positions(uint32_t window, bool mtp) { return mtp ? 2 * window : window + 1; }
@@ -584,6 +598,7 @@ std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lan
   const GdnRecordLayout layout = gdn_layout(rows);
   auto *records = static_cast<unsigned char *>(st->gdn_records->p);
   st->records.valid_columns = static_cast<const int32_t *>(st->valid_columns->p);
+  st->records.rows = static_cast<int32_t>(rows);
   st->records.gdn_key = records;
   st->records.gdn_value = records + layout.key;
   st->records.gdn_gate = records + layout.key + layout.value;
@@ -639,6 +654,7 @@ bool sections_of(const ignis_seq_pool &pool, const Geometry &g, int32_t gdn_laye
 
 int32_t save(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
              const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
+  if (!fits(state, lanes, window, "verify save", error)) return -1;
   const uint32_t row_columns = max_ring_columns_of(state.lanes, state.draft_tokens, state.row_budget, state.mtp);
   const SavedLayout layout = saved_layout(g, sections.ring != nullptr ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16,
                                           state.lanes, row_columns, sections.attention_layers);
@@ -671,6 +687,7 @@ int32_t save(const State &state, const Sections &sections, const Geometry &g, ui
 
 int32_t accept(State &state, const Geometry &g, uint32_t lanes, uint32_t window, const void *logits,
                const void *configs, cudaStream_t stream, std::string *error) {
+  if (!fits(state, lanes, window, "verify accept", error)) return -1;
   const auto b = static_cast<int32_t>(lanes);
   const auto t = static_cast<int32_t>(window + 1);
   const auto k = static_cast<int32_t>(window);
@@ -702,6 +719,7 @@ int32_t accept(State &state, const Geometry &g, uint32_t lanes, uint32_t window,
 
 int32_t fold(const State &state, const Sections &sections, uint32_t lanes, uint32_t window, const int32_t *slots,
              cudaStream_t stream, std::string *error) {
+  if (!fits(state, lanes, window, "verify commit: GDN fold", error)) return -1;
   FoldArgs f{};
   for (int32_t l = 0; l < sections.gdn_layers; ++l) {
     f.recurrent[l] = sections.recurrent[l];
@@ -723,6 +741,7 @@ int32_t fold(const State &state, const Sections &sections, uint32_t lanes, uint3
 
 int32_t restore(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
                 const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
+  if (!fits(state, lanes, window, "verify commit: restore", error)) return -1;
   const auto n = static_cast<unsigned>(lanes);
   const auto ring_columns = static_cast<int32_t>(written_positions(window, state.mtp));
   const RestoreArgs r = restore_args(state, sections, g, lanes, window, slots, positions, ring_columns, 0);
@@ -746,6 +765,7 @@ int32_t restore_head(const State &state, const Sections &sections, const Geometr
     *error = "verify restore_head: this load has no MTP head";
     return -1;
   }
+  if (!fits(state, lanes, window, "verify restore_head", error)) return -1;
   const auto n = static_cast<unsigned>(lanes);
   const auto columns = static_cast<int32_t>(window + 1);
   const RestoreArgs r = restore_args(state, sections, g, lanes, window, slots, positions, columns,

@@ -109,21 +109,30 @@ inline RowFn exact_rows(const Pages &pg) {
 
 // fp64 attention of one row (all query heads) over its list, and each output's error bound.
 // - The kernel's weights are p = bf16(exp2(s - m)) for its running maximum m: the exact weight
-//   times (1 + d), |d| <= 2^-9 (BF16) + 2^-12 (exp2f and the fp32 rescales by exp2 of maxima
-//   differences, at most 65 of them); normalized by the sum of the same weights, the output moves
-//   by at most (2^-9 + 2^-12) sum_j w_j |v_j - out| (w the exact softmax).
+//   times (1 + d), |d| <= 2^-8 (BF16 rounds to nearest at 8 significant bits) + 2^-12 (exp2f and
+//   the fp32 rescales by exp2 of maxima differences, at most 65 of them). The sparse kernel
+//   normalizes by the sum of the same weights, so the output moves by at most
+//   (2^-8 + 2^-12) sum_j w_j |v_j - out| (w the exact softmax). The dense kernel (`dense`,
+//   qsa_dense.cu) normalizes by the fp32 sum of the weights before their BF16 rounding, so that
+//   rounding moves its output by up to 2^-8 sum_j w_j |v_j|, and only the rest of d by
+//   2^-12 sum_j w_j |v_j - out|.
 // - A score moves by at most e_j = 255 u sum_d |q_d k_jd| / 16 (fp32 accumulation of 256 exact
 //   products, u = 2^-24), so every weight by a factor within e^(+-2 max e_j):
 //   (e^(2 max e_j) - 1) sum_j w_j |v_j - out|.
-// - The fp32 accumulation of up to n products: n u sum_j w_j |v_j|; the BF16 rounding of the
-//   result: 2^-9 |out|.
+// - The fp32 accumulations of up to n products and of the normalizer: n u (sum_j w_j |v_j| +
+//   |out|); the BF16 rounding of the result: 2^-8 |out|.
 // The rows are the ones the kernel reads (for hq KV: its decoded scratch, downloaded).
+// GitHub #306 item 8: BF16's rounding was first taken as 2^-9, which holds only at the top of a
+// binade. On real Flash-Next rows (spec 04 AC7) the attention is peaked, so the output's own
+// rounding dominates the bound, and the BF16 route itself exceeded that one on 75 of 18432 elements
+// by up to 1.56x; at 2^-8 every element of every route is within it (the real-row arms print the
+// worst ratio).
 struct Reference {
   std::vector<double> out, bound;  // [q_heads][head_dim]
 };
 
 inline Reference reference(const RowFn &rows, const std::vector<uint16_t> &q, int row, int slot,
-                           const std::vector<int32_t> &list) {
+                           const std::vector<int32_t> &list, bool dense = false) {
   const size_t n = list.size();
   std::vector<double> k(n * kKvHeads * kHd), v(n * kKvHeads * kHd);
   for (size_t j = 0; j < n; ++j) {
@@ -171,8 +180,9 @@ inline Reference reference(const RowFn &rows, const std::vector<uint16_t> &q, in
         dev += w[j] * std::fabs(vj - out[d]);
         mag += w[j] * std::fabs(vj);
       }
-      bound[d] = (0x1p-9 + 0x1p-12 + reweight) * dev + static_cast<double>(n) * 0x1p-24 * mag +
-                 0x1p-9 * std::fabs(out[d]) + 0x1p-40;
+      const double rounding = dense ? 0x1p-8 * mag : 0x1p-8 * dev;
+      bound[d] = rounding + (0x1p-12 + reweight) * dev + static_cast<double>(n) * 0x1p-24 * (mag + std::fabs(out[d])) +
+                 0x1p-8 * std::fabs(out[d]) + 0x1p-40;
     }
   }
   return ref;

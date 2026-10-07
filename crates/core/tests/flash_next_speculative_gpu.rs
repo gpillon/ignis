@@ -30,7 +30,8 @@
 //! k + 1 columns, the rejected ones included, and leaves rows in the head's
 //! own section (its hq ring slots, its indexer tail) that its chain steps
 //! past the frontier must not read, so none and reject leave the head
-//! proposing the same drafts bit for bit, in both KV formats.
+//! proposing the same drafts bit for bit, in both KV formats, on one lane
+//! and on two.
 //!
 //! Spec-on against spec-off (one-token rounds, the plain decode graphs) is
 //! held to the near-tie rule: the verify pass runs k + 1 columns per lane
@@ -415,24 +416,33 @@ fn the_mtp_heads_entries_after_a_full_chunks_draw_fit_the_planned_arena() {
 /// the same text -- none (extent 0) and reject (every draft rejected) -- must
 /// leave the head proposing the same drafts, bit for bit, every round. The
 /// prompts are past the ring (1,536 tokens, dense: every visible row read)
-/// and past the dense threshold (2,051 visible tokens, the indexer's sparse selection; 3,072 is past it).
+/// and past the dense threshold (2,051 visible tokens, the indexer's sparse selection; 3,072 is past it),
+/// one lane each, then both as two lanes of one round (window 3 at the
+/// 8-row budget: three lanes would run at window 1, where the head's chain
+/// has no step and nothing is restored before it).
 #[test]
 #[ignore = "GPU profile only: the real Flash-Next artifact and its MTP companion"]
 fn the_heads_drafts_never_read_a_rejected_column() {
     const HEAD_TOKENS: usize = 64;
     let (Some(dense), Some(sparse)) = (reference("test2048", 1536), reference("long8192", 3072)) else { return };
+    let cases = [
+        (vec![dense.clone()], "dense, 1536 tokens"),
+        (vec![sparse.clone()], "sparse, 3072 tokens"),
+        (vec![dense, sparse], "two lanes, dense and sparse"),
+    ];
     for kv_format in [KvFormat::HqE8_2b, KvFormat::Bf16] {
         let Some(engine) = engine_with(kv_format, SpeculativeBackend::Mtp) else { return };
-        for (prompt, what) in [(&dense, "dense, 1536 tokens"), (&sparse, "sparse, 3072 tokens")] {
+        for (prompts, what) in &cases {
             let what = format!("{kv_format:?} {what}");
-            let prompts = vec![prompt.clone()];
             let mut none = |_: usize, _: &[u32], _: u32| Vec::new();
             let mut reject = |_: usize, _: &[u32], window: u32| vec![REJECTED; window as usize];
-            let a = engine
-                .generate_speculative(&prompts, HEAD_TOKENS, Some(&mut none))
+            let mut a = engine
+                .generate_speculative(prompts, HEAD_TOKENS, Some(&mut none))
                 .unwrap_or_else(|e| panic!("{what}: none: {e}"));
+            // Its lanes' slots back before the next run takes as many: the pool holds the load's three.
+            a.sequences.clear();
             let b = engine
-                .generate_speculative(&prompts, HEAD_TOKENS, Some(&mut reject))
+                .generate_speculative(prompts, HEAD_TOKENS, Some(&mut reject))
                 .unwrap_or_else(|e| panic!("{what}: reject: {e}"));
             assert_eq!(a.tokens, b.tokens, "{what}: none and reject committed different text");
             assert!(a.rounds.iter().chain(&b.rounds).flatten().all(|l| l.committed == 1), "{what}: a round committed a draft");
