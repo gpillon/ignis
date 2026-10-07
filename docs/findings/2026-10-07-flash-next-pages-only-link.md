@@ -57,7 +57,7 @@
   - the capturing sequence, going on after its pages were handed over;
   - the checkpoint claimed from a host and from a device retained slot;
   - the checkpoint restored from KV-RAM;
-  - turn N+1's own checkpoint, on a link chained over a link.
+  - turn N+1, claiming it and handing its own pages over: it goes on as its split control does, and so does a claimant of its checkpoint, on a link chained over a link.
 - Recorded as information (ADR 0029): the two-span control against the three-span one it replaces. Logits differ in all four runs. The first greedy token parts at index 1 (BF16) and 0 (hq-e8-2b) at 1,500 tokens, and never at 9,000. The prompts are synthetic token ids.
 - The leaf: `ignis_kernel_seq_checkpoint_test` (a handover from no prefix, from a two-page prefix, at a page-aligned opener; both formats; device and host slots), `seq_flash_next_sections` (the partial page's indexer keys carried), `seq_prefix`, `seq_snapshot`, `seq_alloc`.
 - The 27B, whose scheduler never hands pages over but whose prefix publish now goes through the same handover code: `prompt_checkpoint_gpu`, `prefix_reuse_gpu` and `retained_prefix_gpu` green.

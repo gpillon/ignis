@@ -657,8 +657,10 @@ struct ignis_seq_checkpoint_stats {
  * a retained slot out of range or still held, no KV page for the partial
  * page, or a failed device copy; IGNIS_SEQ_ERR_NOT_AT_BOUNDARY when `seq` is
  * mid-chunk or its frontier is not `opener_tokens`. Nothing is held or
- * changed on any failure -- a refused capture costs the caller nothing,
- * which is what lets a caller treat it as a bet it may lose. */
+ * changed on any of those -- a refused capture costs the caller nothing,
+ * which is what lets a caller treat it as a bet it may lose. Once pages are
+ * being handed over only a failed device call can fail it, which leaves the
+ * context unusable, as it does a prefix publish's handover. */
 int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, struct ignis_seq *seq,
                                       uint32_t opener_tokens, uint32_t retained_slot,
                                       struct ignis_seq_checkpoint **out_checkpoint);

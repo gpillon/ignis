@@ -247,8 +247,8 @@ fn history_reuses_exactly(run: &Run<'_>, history: usize, salt: u32) {
 /// - the checkpoint claimed from a host and a device slot (the second capture
 ///   stands on the link the first one made), and restored from KV-RAM;
 /// - turn N+1, claiming it, captures at its own opener -- a link chained over
-///   the link -- and a claimant of *that* continues as its own split control
-///   does, `[0, opener)`, `[opener, opener')`, `[opener', end)`.
+///   the link -- and both it and a claimant of *that* continue as its own
+///   split control does, `[0, opener)`, `[opener, opener')`, `[opener', end)`.
 ///
 /// Where the two-span control and the three-span one above part company is
 /// printed, not asserted: that is the chunking effect (ADR 0029).
@@ -288,15 +288,15 @@ fn the_opener_s_page_rides_the_capture(run: &Run<'_>, history: usize, salt: u32)
     // capture ends inside a page and hands over the pages it warmed.
     let opener = history + NEW_TOKENS - 10;
     let next = prompt(NEW_TOKENS, salt + 2);
-    let (mut turn, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &on_device).expect("turn N+1 claims");
-    drop((on_host, on_device));
-    run.prefill(&mut turn, &new[..NEW_TOKENS - 10], history);
-    let second = leaf.capture_checkpoint(model, &mut turn, opener as u32, HOST_SLOTS[1]).expect("turn N+1 captures");
-    leaf.release_sequence(model, turn);
     let mut control = run.fresh();
     run.prefill(&mut control, &tokens, 0);
     run.prefill(&mut control, &new[..NEW_TOKENS - 10], history);
     let control = run.finish(control, &next, opener);
+    let (mut turn, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &on_device).expect("turn N+1 claims");
+    drop((on_host, on_device));
+    run.prefill(&mut turn, &new[..NEW_TOKENS - 10], history);
+    let second = leaf.capture_checkpoint(model, &mut turn, opener as u32, HOST_SLOTS[1]).expect("turn N+1 captures");
+    assert_eq!(run.finish(turn, &next, opener), control, "{label}: turn N+1 goes on as if it had not captured");
     let (seq, _) = leaf.allocate_sequence_from_checkpoint(model, MAX_CONTEXT, &second).expect("turn N+2 claims");
     drop(second);
     assert_eq!(run.finish(seq, &next, opener), control, "{label}: a checkpoint on a link over a link");

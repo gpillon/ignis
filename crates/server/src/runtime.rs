@@ -965,6 +965,8 @@ mod tests {
                 .opener_page_rides_capture,
             "a property of the family, inert while reuse is off"
         );
+        // The 27B's load takes only the decode-share step (`main.rs`), and
+        // nothing on that path may switch it on.
         let on_27b = unnamed.with_family_decode_share(ModelFamily::Qwen38_27b);
         assert!(!scheduler_config_for_shape("m".into(), on_27b, 64, 1024).opener_page_rides_capture);
         assert!(!scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::Qwen38_27b), 64, 1024)

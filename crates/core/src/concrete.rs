@@ -1307,7 +1307,11 @@ impl ConcreteScheduler {
     ///
     /// The leaf chains exactly when the opener's whole pages reach past what
     /// the sequence shares (`seq_checkpoint.cu`), so this asks the same of the
-    /// request rather than being told. Like an imaged publish's registration
+    /// request rather than being told. The one place the two may count it
+    /// differently is after an earlier publish this cache declined: the leaf's
+    /// link then stands on that prefix and this one covers its pages too, and
+    /// the pages still come back together, when the link drops. Like an
+    /// imaged publish's registration
     /// it only moves the charge: the link owns those pages from here, and the
     /// request's own reservation shrinks by them. `false` is a link this cache
     /// cannot record -- its parent gone -- and the caller then drops the
@@ -3128,7 +3132,11 @@ impl Scheduler for ConcreteScheduler {
                 let media = media_keys(&self.requests[i].input);
                 PromptContent::new(&self.requests[i].input.tokens, &media).key_at(at)
             };
-            let taken = (0..n).any(|m| capture_points[m] == at && head_key(batch[m]) == head_key(batch[n]));
+            let mut earlier = (0..n).filter(|&m| capture_points[m] == at).peekable();
+            let taken = earlier.peek().is_some() && {
+                let head = head_key(batch[n]);
+                earlier.any(|m| head_key(batch[m]) == head)
+            };
             if taken {
                 capture_points[n] = 0;
             }

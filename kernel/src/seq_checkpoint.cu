@@ -35,10 +35,11 @@
 //     **pages-only link** itself, which spares the prefill its cut at the
 //     floor. Either way a conversation's every turn, and every iteration of an
 //     agent's tool loop, leaves a checkpoint of its own.
-//   * a capture changes nothing about the sequence's state, including on
-//     failure. It is a bet the caller may lose, and a lost bet must cost
-//     nothing. What a successful one may change is who owns the pages below
-//     the opener -- never what they hold.
+//   * a capture changes nothing about the sequence's state, and a refused
+//     one changes nothing at all. It is a bet the caller may lose, and a lost
+//     bet must cost nothing. What a successful one may change is who owns the
+//     pages below the opener -- never what they hold; once that handover has
+//     begun only a failed device call can stop it, as for a publish.
 
 #include "ignis_seq.h"
 #include "ignis_seq_checkpoint_internal.h"
@@ -258,21 +259,22 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
       }
     });
 
-    // GitHub #306: the handover, balanced like a publish's. The opener's
-    // partial page goes back to the pool with the rest past the floor, so the
-    // copy just taken is written into the sequence's new first page: from here
-    // it reads exactly the history it read before.
+    // GitHub #306: the handover, balanced like a publish's. Everything above
+    // could fail and cost nothing; from here only a failed device call can,
+    // and that leaves the context unusable for every sequence -- the standard
+    // a publish's handover has always had. The link is a raw pointer for that
+    // reason: once the sequence stands on it, an unwind must not free it.
     if (handed != 0) {
-      auto link = std::make_unique<ignis_seq_prefix>();
-      link->tokens = below * page_size;
-      ignis_seq_hand_over_head(*pool, *seq, *link, handed);
+      auto *link     = new ignis_seq_prefix();
+      link->tokens   = below * page_size;
       link->refcount = 1; // the sequence standing on it; the checkpoint's is taken below
-      seq->prefix    = link.release();
-      timed([&] {
-        if (partial) {
-          ignis_seq_copy_kv_page(*pool, tail_page_of(*entry), seq->kv.page_ids()[0]);
-        }
-      });
+      ignis_seq_hand_over_head(*pool, *seq, *link, handed);
+      // The opener's partial page went back to the pool with the rest past
+      // the floor, so the copy just taken is written into the sequence's new
+      // first page: from here it reads exactly the history it read before.
+      if (partial) {
+        timed([&] { ignis_seq_copy_kv_page(*pool, tail_page_of(*entry), seq->kv.page_ids()[0]); });
+      }
     }
 
     // The checkpoint takes one reference to the prefix under it: that

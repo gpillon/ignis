@@ -1213,8 +1213,10 @@ impl<'a> Seq<'a> {
     /// `Err` on an opener inside the first page of a sequence holding no
     /// shared prefix, or inside the pages it shares, a position that is not
     /// the opener ([`NOT_AT_BOUNDARY`]), or a device allocation failure.
-    /// Nothing is allocated or changed on any failure: a refused capture
+    /// Nothing is allocated or changed on any of those: a refused capture
     /// costs the caller nothing, which is what lets it be treated as a bet.
+    /// Once pages are being handed over only a failed device call can fail
+    /// it, and that leaves the context unusable.
     pub fn capture_checkpoint(
         &mut self,
         opener_tokens: u32,
