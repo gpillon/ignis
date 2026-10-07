@@ -157,7 +157,7 @@ again. They add no serving work of any kind.
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|hq_residual_window\|residual` | the plan's twelve lines (`hq_residual_window` since #257), the same set and spelling the `ignis.runtime.vram_plan` event carries |
+| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|hq_residual_window\|residual\|residency\|expert_cache` | the plan's twelve lines (`hq_residual_window` since #257), the same set and spelling the `ignis.runtime.vram_plan` event carries, then Flash-Next's two (#306): `residency`, the expert residency's fixed bytes (ring and tables), and `expert_cache`, the VRAM expert cache that takes the budget the weights, program, pool and residency leave (the `residency_fixed_bytes` and `expert_cache_bytes` of `ignis.runtime.flash_next_plan`). Both are 0 on the 27B, and the KV pool is no line, so the budget less every line is the pool plus its page rounding |
 | `ignis_vram_budget_bytes` | gauge | none | the budget the plan was laid out inside, derived or explicit |
 | `ignis_kv_pool_pages` | gauge | none | the pool's page count, leaf-verified at load |
 | `ignis_kv_page_bytes` | gauge | none | one page's bytes |

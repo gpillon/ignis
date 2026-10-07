@@ -42,7 +42,7 @@ GitHub, not open questions.
   `MODEL=flash-next` (default `MODEL=27b`): it sets the default `ARTIFACT` to the
   Flash-Next artifact in `F:/ai/models/Qwen3.8-Flash-Next-ignis/` and the
   Flash-Next defaults below. `make config` prints them.
-- **Defaults:** 3 lanes; KV hq-e8-2b; 128K tokens of context per lane; prefill
+- **Defaults:** 3 lanes (`--decode-lanes`, 1..8); KV hq-e8-2b; 262,144 tokens of context per lane (the checkpoint's trained positions; owner decision 2026-10-07, GitHub #306); prefill
   chunk 8192; prefetch width 16; n-gram hot rows 1 GB.
 - The 8192-token KLD bound is 1.25× the 2048-token one.
 - The math of QSA, the indexer, the hyper-connections and the n-gram embedding is
@@ -220,9 +220,9 @@ decode. It is used by every non-expert projection and by spec 02's shared expert
   - hq earns its acceptance in-house, as ADR 0022 requires: codec error on real
     Flash-Next KV rows, and the hq route against the BF16 route on identical
     keys and values, with the tolerance derived from the measured codec error.
-- Default context per lane *(proposed)*: 128K tokens with hq-e8-2b, about
-  1.4 GB for 3 lanes, up to the checkpoint's 262,144 by load option (about
-  2.7 GB). The pool is sized by a byte budget and the token capacity is derived
+- Default context per lane: 262,144 tokens with hq-e8-2b, the checkpoint's
+  trained positions (about 2.7 GB for 3 lanes; first proposed as 128K, about
+  1.4 GB; raised by the owner, GitHub #306). The pool is sized by a byte budget and the token capacity is derived
   from the format in force (ADR 0022).
 - The VRAM plan places KV before the expert cache (spec 03) and prints the trade.
 - Everything is a plan line at load (ADR 0030).

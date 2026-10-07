@@ -188,6 +188,10 @@ pub struct Config {
     /// GitHub #307): a round of w lanes verifies min(draft tokens, rows / w
     /// - 1) drafts per lane. `None`: the decode route's 8 rows.
     pub draft_rows: Option<u32>,
+    /// Flash-Next's decode lanes (`--decode-lanes` / `IGNIS_DECODE_LANES`,
+    /// GitHub #306), 1..=[`ignis_core::N_DECODE_LANES`]. `None`: the engine's
+    /// default of 3. The 27B has a fixed lane count and refuses the flag.
+    pub decode_lanes: Option<u32>,
     /// Vision, chosen at load (`--vision`/`--vision-max-tokens`, GitHub #177).
     /// `None` binds and reserves nothing of the vision tower.
     pub vision: Option<Vision>,
@@ -387,6 +391,7 @@ pub fn resolve(
     let mut spec = None;
     let mut draft_tokens = None;
     let mut draft_rows = None;
+    let mut decode_lanes = None;
     let mut draft_head = None;
     let mut vision = false;
     let mut vision_max_tokens = None;
@@ -440,6 +445,7 @@ pub fn resolve(
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
             "--draft-rows" => draft_rows = Some(take_value(args, &mut i, flag)?),
+            "--decode-lanes" => decode_lanes = Some(take_value(args, &mut i, flag)?),
             "--draft-head" => draft_head = Some(take_value(args, &mut i, flag)?),
             "--rope-scaling" => rope_scaling = Some(take_value(args, &mut i, flag)?),
             "--vision" => vision = true,
@@ -570,6 +576,20 @@ pub fn resolve(
                 })
         })
         .transpose()?;
+    let decode_lanes = non_empty(decode_lanes.or_else(|| env("IGNIS_DECODE_LANES")))
+        .map(|raw| {
+            raw.trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&lanes| (1..=ignis_core::N_DECODE_LANES as u32).contains(&lanes))
+                .ok_or_else(|| {
+                    ConfigError(format!(
+                        "`--decode-lanes` must be in 1..={}, got `{raw}`",
+                        ignis_core::N_DECODE_LANES
+                    ))
+                })
+        })
+        .transpose()?;
     let vision = resolve_vision(vision, vision_max_tokens, vision_embedding_pool_mib, &env)?;
     let rope_scaling = resolve_rope_scaling(rope_scaling, &env)?;
     // GitHub #195 lifted #178's refusal of the two together: the drafter
@@ -641,6 +661,7 @@ pub fn resolve(
         speculation,
         speculation_off,
         draft_rows,
+        decode_lanes,
         vision,
         rope_scaling,
         media,
@@ -964,6 +985,13 @@ pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, 
     }
     if let Some(rows) = config.draft_rows.filter(|_| family != ModelFamily::FlashNext) {
         return Err(ConfigError(format!("`--draft-rows {rows}`: {} has no draft row budget", family.name())));
+    }
+    if let Some(lanes) = config.decode_lanes.filter(|_| family != ModelFamily::FlashNext) {
+        return Err(ConfigError(format!(
+            "`--decode-lanes {lanes}`: {} serves a fixed {} lanes",
+            family.name(),
+            ignis_core::N_DECODE_LANES
+        )));
     }
     if config.vision.is_some() && !family.takes_images() {
         return Err(ConfigError(format!("`--vision`: {} takes no images", family.name())));
@@ -1330,6 +1358,7 @@ fn version_text() -> String {
 
 fn help_text() -> String {
     let default_kv_format = KvFormat::default().as_str();
+    let n_decode_lanes = ignis_core::N_DECODE_LANES;
     let default_vram_headroom_gib = DEFAULT_VRAM_HEADROOM_BYTES / (1024 * 1024 * 1024);
     let default_host_pool_gib = DEFAULT_HOST_POOL_BYTES / (1024 * 1024 * 1024);
     format!(
@@ -1366,6 +1395,7 @@ fn help_text() -> String {
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2 on the 27B, mtp on Flash-Next with its companion container beside the artifact, off)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (1..{MAX_DRAFT_TOKENS}; required with --spec dflash2; with --spec mtp the most drafts a lane verifies, default {FLASH_NEXT_DEFAULT_DRAFT_TOKENS})\n\
          \x20       --draft-rows <n>          env: IGNIS_DRAFT_ROWS     (Flash-Next mtp only; default: 0 = {FLASH_NEXT_VERIFY_ROWS}; rows a verify round takes across lanes, 0 or 2..{FLASH_NEXT_VERIFY_ROWS}; 3 drafts at one lane only)\n\
+         \x20       --decode-lanes <n>        env: IGNIS_DECODE_LANES   (default: 3; Flash-Next only, 1..={n_decode_lanes}; the sequences it decodes at once, each with its own whole context in the KV pool; fewer lanes leave the expert cache more VRAM; the 27B serves a fixed {n_decode_lanes} lanes and refuses it)\n\
          \x20       --draft-head <head>       env: IGNIS_DRAFT_HEAD     (default: full; needs --spec; full = the drafter proposes with the target's output head, shortlist = with the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM)\n\
          \x20       --rope-scaling <spec>     env: IGNIS_ROPE_SCALING   (default: none; `yarn:F[,t=..][,bf=..][,bs=..]` rescales the checkpoint's trained 262144-position envelope, F in (1, {MAX_YARN_FACTOR}])\n\
          \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
@@ -2499,6 +2529,26 @@ mod tests {
         let vision = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
         let err = served_model_for(&vision, ModelFamily::FlashNext).expect_err("no vision");
         assert!(err.0.contains("--vision") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+    }
+
+    /// GitHub #306: `--decode-lanes` is Flash-Next's, 1 to the engine's 8.
+    #[test]
+    fn decode_lanes_parse_bound_and_refuse_the_27b() {
+        let default = expect_config(resolve(&args(&[]), no_env).expect("resolve"));
+        assert_eq!(default.decode_lanes, None);
+        let flag = expect_config(resolve(&args(&["--decode-lanes", "1"]), no_env).expect("resolve"));
+        assert_eq!(flag.decode_lanes, Some(1));
+        let env = expect_config(
+            resolve(&args(&[]), env_map(&[("IGNIS_DECODE_LANES", "8")])).expect("resolve"),
+        );
+        assert_eq!(env.decode_lanes, Some(8));
+        for raw in ["0", "9", "-1", "many"] {
+            let err = resolve(&args(&["--decode-lanes", raw]), no_env).expect_err("bad lane count");
+            assert!(err.0.contains("--decode-lanes") && err.0.contains(raw), "{}", err.0);
+        }
+        assert!(served_model_for(&flag, ModelFamily::FlashNext).is_ok());
+        let err = served_model_for(&flag, ModelFamily::Qwen38_27b).expect_err("a fixed lane count");
+        assert!(err.0.contains("--decode-lanes 1") && err.0.contains("fixed"), "{}", err.0);
     }
 
     #[test]

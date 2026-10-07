@@ -265,7 +265,9 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      <div className={`grid grid-cols-1 gap-4 ${dash.experts ? "lg:grid-cols-2" : "lg:grid-cols-3"}`}>
+        {/* Sibling-prefix reuse is the 27B's; Flash-Next reuses through retained checkpoints (Retained state), so its series is always 0. */}
+        {!dash.experts && (
         <Card title="Prefix reuse" subtitle="Prompt tokens skipped through a sibling's prefix">
           <Figures
             items={[
@@ -276,7 +278,8 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
           />
           <TimeChart label="Prefix tokens reused per second" {...chart} area height={120} format={formatNumber} series={[{ key: "prefix", label: "Reused tok/s", color: "var(--series-3)", values: dash.prefix.perSecSeries }]} />
         </Card>
-        <EvictionsCard evictions={dash.evictions} chart={chart} win={win} />
+        )}
+        <EvictionsCard evictions={dash.evictions} deviceSlots={dash.memory.slotHomes.deviceSlots} chart={chart} win={win} />
         <ScraperCard dash={dash} state={state} />
       </div>
 
@@ -486,6 +489,9 @@ const EVICTION_TIER_LABEL: Record<EvictionTierName, { name: string; note: string
   disk: { name: "Disk", note: "not implemented" },
 };
 
+/** The VRAM row's Retained cell on a load with no device retained slots (GitHub #306). */
+const RETAINED_IN_HOST_RAM = "This load has no device retained slots: its retained state lives in host RAM";
+
 /**
  * What each tier gave up over the window (GitHub #224). One row per tier, one
  * column per kind of departure - a live sequence, retained state dropped, and
@@ -495,7 +501,7 @@ const EVICTION_TIER_LABEL: Record<EvictionTierName, { name: string; note: string
  * The chart carries only the `live` column: it is the one that costs a request
  * its prefill, and the only one worth watching move.
  */
-function EvictionsCard({ evictions, chart, win }: { evictions: Evictions; chart: ChartFrame; win: string }) {
+function EvictionsCard({ evictions, deviceSlots, chart, win }: { evictions: Evictions; deviceSlots: number | null; chart: ChartFrame; win: string }) {
   const series = [
     { key: "vram", label: "VRAM/min", color: "var(--series-4)", values: evictions.vram.live?.perMinSeries ?? [] },
     { key: "ram", label: "RAM/min", color: "var(--series-1)", values: evictions.ram.live?.perMinSeries ?? [] },
@@ -517,6 +523,8 @@ function EvictionsCard({ evictions, chart, win }: { evictions: Evictions; chart:
           {EVICTION_TIERS.map((tier) => {
             const row = evictions[tier];
             const label = EVICTION_TIER_LABEL[tier];
+            // A load with no device retained slots (Flash-Next: --retained-device 0) keeps its retained state in host RAM, so the VRAM row's Retained cell is host RAM's; the Live cell is still the sequences that left VRAM.
+            const retainedTitle = tier === "vram" && deviceSlots === 0 ? RETAINED_IN_HOST_RAM : undefined;
             return (
               <tr key={tier} className={row.implemented ? undefined : "text-ash/50"}>
                 <th scope="row" className="py-1 text-left font-display text-[13px] font-semibold">
@@ -524,7 +532,7 @@ function EvictionsCard({ evictions, chart, win }: { evictions: Evictions; chart:
                   <span className="ml-1.5 font-sans text-[10px] font-normal text-ash">{label.note}</span>
                 </th>
                 <EvictionCell counter={row.live} emphasis={tier === "ram"} />
-                <EvictionCell counter={row.retained} />
+                <EvictionCell counter={row.retained} title={retainedTitle} />
                 <EvictionCell counter={row.demoted} />
               </tr>
             );
@@ -541,11 +549,11 @@ function EvictionsCard({ evictions, chart, win }: { evictions: Evictions; chart:
  * An em dash where the tier has no such departure to report at all - never a
  * zero, which would read as "it did not happen" rather than "it cannot".
  */
-function EvictionCell({ counter, emphasis }: { counter: Counter | null; emphasis?: boolean }) {
+function EvictionCell({ counter, emphasis, title }: { counter: Counter | null; emphasis?: boolean; title?: string }) {
   if (!counter) return <td className="py-1 text-right text-ash/50">&mdash;</td>;
   const hot = emphasis && (counter.window ?? 0) > 0;
   return (
-    <td className="py-1 text-right tabular-nums">
+    <td className="py-1 text-right tabular-nums" title={title}>
       <span className={`font-display text-[15px] font-semibold ${hot ? "text-[var(--series-1)]" : ""}`}>{formatCount(counter.window)}</span>
       <span className="ml-1 text-[10px] text-ash">/ {formatCount(counter.total)}</span>
     </td>
@@ -666,6 +674,8 @@ const LINE_LABEL: Record<VramLine, string> = {
   retained_slots: "Retained slots",
   hq_residual_window: "hq residual window",
   residual: "Residual",
+  residency: "Residency",
+  expert_cache: "Expert cache",
 };
 
 const FAMILY_LABEL: Record<RetainedFamily, string> = {
@@ -743,9 +753,14 @@ function PlanCard({ memory }: { memory: Memory }) {
               reserved of a {formatBytes(budget)} budget ·{" "}
               {memory.oversubscribed
                 ? `${formatBytes(Math.abs(memory.spareBytes ?? 0))} over it`
-                : `${formatBytes(memory.kvRoomBytes)} left for the KV pool${
-                    memory.kvPool.tokens === null ? "" : ` (${formatCount(memory.kvPool.tokens)} tokens)`
-                  }`}
+                : memory.expertCacheBytes > 0
+                  ? // Flash-Next sizes its pool by context and lanes; the expert cache takes whatever that leaves.
+                    `${formatBytes(memory.kvRoomBytes)} for the KV pool${
+                      memory.kvPool.tokens === null ? "" : ` (${formatCount(memory.kvPool.tokens)} tokens)`
+                    }, sized by context and lanes; the expert cache took the rest`
+                  : `${formatBytes(memory.kvRoomBytes)} left for the KV pool${
+                      memory.kvPool.tokens === null ? "" : ` (${formatCount(memory.kvPool.tokens)} tokens)`
+                    }`}
             </span>
           </div>
           <div className="flex h-3 gap-px bg-line/40" aria-hidden>

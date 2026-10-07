@@ -46,6 +46,11 @@ pub struct LoadReservations {
     pub kv_pool_pages: u32,
     /// One KV page's bytes.
     pub kv_page_bytes: u64,
+    /// A Flash-Next load's two lines beyond [`ignis_core::VramLines`] (GitHub
+    /// #306): the expert residency's fixed bytes (ring and tables), and the
+    /// VRAM expert cache that takes what the plan leaves. 0 on a 27B load.
+    pub residency_bytes: u64,
+    pub expert_cache_bytes: u64,
     /// `--kv-host-pool-bytes`, pinned whole at start.
     pub kv_ram_arena_bytes: u64,
     /// The retained slots this load hands out — the effective count, which
@@ -427,6 +432,9 @@ pub struct Metrics {
     /// `VramLines::entries()` order, then the shapes they bound. Written once
     /// at load, and zero on a load that built no plan.
     vram_reserved: [AtomicU64; VRAM_LINE_COUNT],
+    /// Flash-Next's `residency` and `expert_cache` lines (GitHub #306), in
+    /// [`FLASH_NEXT_VRAM_LINES`] order: exported beside the plan's own.
+    flash_next_vram_reserved: [AtomicU64; 2],
     vram_budget_bytes: AtomicU64,
     kv_pool_pages: AtomicU64,
     kv_page_bytes: AtomicU64,
@@ -547,6 +555,11 @@ type RetainedFamily = [[AtomicU64; RetainedKind::ALL.len()]; ReuseSource::ALL.le
 /// than written out again here.
 const VRAM_LINE_COUNT: usize = ignis_core::VramLines::LINES;
 
+/// The two lines a Flash-Next plan has beyond [`ignis_core::VramLines`]
+/// (GitHub #306): the residency's fixed bytes, then the expert cache. Always
+/// exported, 0 on the 27B.
+const FLASH_NEXT_VRAM_LINES: [&str; 2] = ["residency", "expert_cache"];
+
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
@@ -580,6 +593,7 @@ impl Metrics {
             retained_host_slots: AtomicU64::new(0),
             retained_host_bytes: AtomicU64::new(0),
             vram_reserved: Default::default(),
+            flash_next_vram_reserved: Default::default(),
             vram_budget_bytes: AtomicU64::new(0),
             kv_pool_pages: AtomicU64::new(0),
             kv_page_bytes: AtomicU64::new(0),
@@ -781,6 +795,8 @@ impl Metrics {
         for (slot, (_, bytes)) in self.vram_reserved.iter().zip(reserved.lines.entries()) {
             slot.store(bytes, Ordering::Relaxed);
         }
+        self.flash_next_vram_reserved[0].store(reserved.residency_bytes, Ordering::Relaxed);
+        self.flash_next_vram_reserved[1].store(reserved.expert_cache_bytes, Ordering::Relaxed);
         self.vram_budget_bytes.store(reserved.budget_bytes, Ordering::Relaxed);
         self.kv_pool_pages.store(u64::from(reserved.kv_pool_pages), Ordering::Relaxed);
         self.kv_page_bytes.store(reserved.kv_page_bytes, Ordering::Relaxed);
@@ -976,6 +992,9 @@ impl Metrics {
         );
         let names = ignis_core::VramLines::default().entries();
         for ((line, _), series) in names.iter().zip(&self.vram_reserved) {
+            let _ = writeln!(out, "ignis_vram_reserved_bytes{{line=\"{line}\"}} {}", read(series));
+        }
+        for (line, series) in FLASH_NEXT_VRAM_LINES.iter().zip(&self.flash_next_vram_reserved) {
             let _ = writeln!(out, "ignis_vram_reserved_bytes{{line=\"{line}\"}} {}", read(series));
         }
         let plain_gauges = [
@@ -1695,6 +1714,8 @@ mod tests {
             budget_bytes: 30_000_000_000,
             kv_pool_pages: 5_000,
             kv_page_bytes: 1_048_576,
+            residency_bytes: 2_000_000_000,
+            expert_cache_bytes: 15_000_000_000,
             kv_ram_arena_bytes: 8 << 30,
             retained_slots: 9,
             retained_host_slots: 7,
@@ -1703,7 +1724,8 @@ mod tests {
         });
 
         let text = metrics.render();
-        // The twelve lines are the plan's, in the plan's order and spelling.
+        // The twelve lines are the plan's, in the plan's order and spelling,
+        // then Flash-Next's two (GitHub #306).
         let exported: Vec<String> = samples(&text)
             .into_iter()
             .filter(|(name, _, _)| name == "ignis_vram_reserved_bytes")
@@ -1713,8 +1735,12 @@ mod tests {
             .entries()
             .iter()
             .map(|(line, _)| format!("line=\"{line}\""))
+            .chain(["line=\"residency\"".to_owned(), "line=\"expert_cache\"".to_owned()])
             .collect();
         assert_eq!(exported, expected, "{text}");
+        assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"residency\""), "2000000000");
+        assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"expert_cache\""), "15000000000");
+        assert_eq!(value(&empty, "ignis_vram_reserved_bytes", "line=\"expert_cache\""), "0");
         assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"weights\""), "21000000000");
         assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"retained_slots\""), "1000000000");
         assert_eq!(value(&text, "ignis_vram_budget_bytes", ""), "30000000000");

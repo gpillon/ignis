@@ -44,6 +44,8 @@ describe("readSnapshot", () => {
     expect(memory.reserved.weights).toBe(17_179_869_184);
     expect(memory.reserved.media_embedding).toBe(402_653_184);
     expect(memory.reserved.residual).toBe(268_435_456);
+    expect(memory.reserved.residency).toBe(0);
+    expect(memory.reserved.expert_cache).toBe(0);
     expect(memory.budgetBytes).toBe(31_138_512_896);
     expect(memory.kvPoolPages).toBe(4032);
     expect(memory.kvPageBytes).toBe(1_835_008);
@@ -204,5 +206,22 @@ describe("readSnapshot", () => {
       { name: "ignis_scheduler_requests", labels: { state: "prefilling" }, value: 1 },
       { name: "ignis_requests_rejected_total", labels: { reason: "shutdown" }, value: 2 },
     ]);
+  });
+});
+
+describe("a Flash-Next load's two plan lines (GitHub #306)", () => {
+  it("reads the residency and the expert cache beside the plan's twelve", () => {
+    const text = IGNIS_EXPOSITION.replace('line="residency"} 0', 'line="residency"} 2147483648').replace('line="expert_cache"} 0', 'line="expert_cache"} 16106127360');
+    const { memory } = readSnapshot(parseExposition(text));
+    expect(memory.reserved.residency).toBe(2_147_483_648);
+    expect(memory.reserved.expert_cache).toBe(16_106_127_360);
+  });
+
+  it("leaves them unread on a server that predates them", () => {
+    const text = IGNIS_EXPOSITION.replace(/ignis_vram_reserved_bytes\{line="(residency|expert_cache)"\} 0\n/g, "");
+    const { memory } = readSnapshot(parseExposition(text));
+    expect(memory.reserved.residency).toBeNull();
+    expect(memory.reserved.expert_cache).toBeNull();
+    expect(memory.reserved.weights).toBe(17_179_869_184);
   });
 });

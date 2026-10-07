@@ -45,6 +45,20 @@ describe("MonitorView", () => {
     expect(html).toContain("Live");
   });
 
+  it("names the expert cache and the residency, and no longer says the rest is the KV pool's (GitHub #306)", () => {
+    const text = IGNIS_EXPOSITION.replace('line="residency"} 0', 'line="residency"} 134217728').replace('ignis_vram_budget_bytes 31138512896', 'ignis_vram_budget_bytes 42949672960').replace('line="expert_cache"} 0', 'line="expert_cache"} 8589934592');
+    const state = applyScrape(initialMonitor(), { kind: "ok", text }, Date.now(), 3);
+    const html = renderToStaticMarkup(<MonitorView state={state} />);
+    expect(html).toContain("Expert cache");
+    expect(html).toContain("Residency");
+    expect(html.replace(/<!-- -->/g, "")).toContain("sized by context and lanes");
+    expect(html.replace(/<!-- -->/g, "")).not.toContain("left for the KV pool");
+    // The 27B's plan, with no expert cache, keeps saying it.
+    const plain = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, Date.now(), 3)} />);
+    expect(plain.replace(/<!-- -->/g, "")).toContain("left for the KV pool");
+    expect(plain).not.toContain("Expert cache");
+  });
+
   it("reads the memory panel's live figures against the constants that bound them", () => {
     const now = Date.now();
     const state = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now - 5_000, 3), { kind: "ok", text: later }, now, 4);
@@ -95,6 +109,24 @@ describe("MonitorView", () => {
     expect(html).toContain("this load has none of it to give");
     expect(html).toContain("this load hands out none");
     expect(html).not.toContain("this scrape carries no bound to read it against");
+  });
+
+  it("hides the 27B's sibling-prefix card on Flash-Next and names the eviction row by where its retained slots live (GitHub #306)", () => {
+    const now = Date.now();
+    // Flash-Next: eight retained slots, all in pinned host RAM, none on the device.
+    const text = FLASH_NEXT_EXPOSITION.replace('ignis_retained_slots{state="capacity"} 10', 'ignis_retained_slots{state="capacity"} 8');
+    const html = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text }, now, 3)} />);
+    expect(html).not.toContain("Prefix reuse");
+    // The row keeps its tier name (its Live cell is sequences that left VRAM); the host-RAM note rides on the Retained cell.
+    expect(html).not.toContain("Retained slots (host RAM)");
+    expect(html).toContain("retained state lives in host RAM");
+    // The 27B keeps both: its prefix card, and VRAM for the two device slots it has.
+    const dense = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
+    expect(dense).toContain("Prefix reuse");
+    expect(dense).not.toContain("retained state lives in host RAM");
+    // Flash-Next with device slots keeps the VRAM wording.
+    const withDevice = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: FLASH_NEXT_EXPOSITION }, now, 3)} />);
+    expect(withDevice).not.toContain("retained state lives in host RAM");
   });
 
   it("draws a Flash-Next load's expert residency and n-gram rows, and a 27B load's neither", () => {

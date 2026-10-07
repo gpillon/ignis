@@ -296,6 +296,7 @@ async fn main() {
         speculation: _,
         speculation_off: _,
         draft_rows: _,
+        decode_lanes: _,
         vision,
         // GitHub #227: read through `EngineShape` above, like the other
         // load-shape knobs.

@@ -642,6 +642,8 @@ async fn labels_stay_within_the_bounded_sets() {
         "retained_slots",
         "hq_residual_window",
         "residual",
+        "residency",
+        "expert_cache",
     ];
     const TTFT_LE: &[&str] =
         &["0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60", "120", "300", "+Inf"];

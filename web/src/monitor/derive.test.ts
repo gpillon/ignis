@@ -189,6 +189,23 @@ describe("deriveMemory", () => {
     expect(m.oversubscribed).toBe(false);
   });
 
+  it("counts Flash-Next's residency and expert cache as lines, and a server without them as 0", () => {
+    const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 0])) as MemorySeries["reserved"];
+    Object.assign(reserved, { weights: 600, residency: 100, expert_cache: 500 });
+    const m = deriveMemory([memoryAt(0, { reserved, budgetBytes: 2000, kvPoolPages: 8, kvPageBytes: 100 })], 0);
+    expect(m.lines.slice(-2).map((l) => l.line)).toEqual(["residency", "expert_cache"]);
+    expect(m.linesBytes).toBe(1200);
+    expect(m.expertCacheBytes).toBe(500);
+    expect(m.kvRoomBytes).toBe(800);
+    expect(m.spareBytes).toBe(0);
+    // A server that predates the two lines exports twelve; the plan is whole all the same.
+    const old: Record<string, number | null> = { ...reserved, residency: null, expert_cache: null };
+    const o = deriveMemory([memoryAt(0, { reserved: old as MemorySeries["reserved"], budgetBytes: 2000 })], 0);
+    expect(o.planned).toBe(true);
+    expect(o.linesBytes).toBe(600);
+    expect(o.expertCacheBytes).toBe(0);
+  });
+
   it("will not add a plan up unless the scrape carries all twelve lines", () => {
     // A partial sum would understate the plan and overstate the room beside
     // it; the server writes the twelve together or not at all.
@@ -204,9 +221,9 @@ describe("deriveMemory", () => {
     // was laid out in, and the panel has to be able to say so.
     const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 100]));
     const m = deriveMemory([memoryAt(0, { reserved: reserved as MemorySeries["reserved"], budgetBytes: 900, kvPoolPages: 2, kvPageBytes: 50 })], 0);
-    expect(m.linesBytes).toBe(1200);
-    expect(m.kvRoomBytes).toBe(-300);
-    expect(m.spareBytes).toBe(-400);
+    expect(m.linesBytes).toBe(1400);
+    expect(m.kvRoomBytes).toBe(-500);
+    expect(m.spareBytes).toBe(-600);
     expect(m.oversubscribed).toBe(true);
   });
 
