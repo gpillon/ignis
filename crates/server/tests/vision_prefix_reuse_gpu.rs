@@ -99,6 +99,7 @@ fn request(provider: &ArtifactTemplateProvider, processor: &ignis_artifact::visi
     RequestInput {
         decision: None,
         constrained: None,
+        forced_literal: None,
         warm_up: false,
         model: MODEL.into(),
         tokens: rendered.tokens,

@@ -42,7 +42,8 @@ pub(crate) struct CreateResponse {
     /// description, parameters, strict}`. Any other tool type is a 400.
     #[schema(value_type = Vec<Object>)]
     tools: Option<Vec<JsonValue>>,
-    /// `"auto"` (default) or `"none"`, as on chat completions.
+    /// `"auto"` (default), `"none"`, `"required"`, or `{"type": "function",
+    /// "name": ...}` naming one of `tools`, forced as on chat completions.
     #[schema(value_type = Object)]
     tool_choice: Option<JsonValue>,
     /// Accepted; calls come back as the model writes them.
@@ -191,7 +192,7 @@ pub(crate) async fn prepare(
         .map_err(|message| api::bad_request_param(&message, "instructions"))?
         .map(str::to_owned);
     let tools = chat_tools(req.tools.as_deref().unwrap_or_default())?;
-    let tools = api::resolve_tools(Some(tools), req.tool_choice.clone())?;
+    let (tools, tool_choice) = api::resolve_tools(Some(tools), req.tool_choice.clone().map(chat_tool_choice))?;
 
     let mut items = history;
     items.extend(input_items(req.input.clone())?);
@@ -233,12 +234,16 @@ pub(crate) async fn prepare(
         .map_err(api::invalid_sampling_parameter)?;
     let (params, budget_dropped) =
         api::with_thinking_budget(server, params, req.thinking_budget.as_ref(), effort.as_ref(), &thinking)?;
+    let cap = req.max_output_tokens.map(|cap| (cap, "max_output_tokens"));
+    let forced = api::forced_tool_call(server, &tool_choice, &thinking, cap)?;
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
     let schemas = ToolSchemas::from_tools(&tools);
     let (mut input, model, mut prompt_tokens, media) =
         api::prepare_request(server, model, &messages, params, &thinking, &tools).await?;
     input.warm_up = warm_up;
+    // A warm-up generates nothing, so it has no call to force.
+    input.forced_literal = forced.filter(|_| !warm_up);
     if system_only {
         let Some(block) = input.system_block_tokens.filter(|_| input.multimodal.is_none()) else {
             return Err(api::template_rejection(crate::template::TemplateRejection {
@@ -327,6 +332,20 @@ fn chat_tools(tools: &[JsonValue]) -> Result<Vec<JsonValue>, Response> {
             Ok(json!({ "type": "function", "function": function }))
         })
         .collect()
+}
+
+/// The Responses `tool_choice` in the shape chat completions takes: a named
+/// function's `{"type": "function", "name": N}` becomes `{"type":
+/// "function", "function": {"name": N}}` (GitHub #286). Every other value is
+/// left for chat's validation, the chat shape included, as [`chat_tools`]
+/// leaves a tool already in it.
+fn chat_tool_choice(tool_choice: JsonValue) -> JsonValue {
+    match tool_choice.get("name") {
+        Some(name) if tool_choice.get("type") == Some(&json!("function")) && tool_choice.get("function").is_none() => {
+            json!({ "type": "function", "function": { "name": name } })
+        }
+        _ => tool_choice,
+    }
 }
 
 /// `input` as a list of items: a string is one user message.

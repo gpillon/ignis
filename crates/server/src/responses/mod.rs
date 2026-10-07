@@ -127,7 +127,7 @@ struct ResponseStreamEvent {
     tag = "responses",
     operation_id = "responses",
     summary = "A response, the Responses API",
-    description = "The OpenAI Responses API on the engine path chat completions uses: `instructions` as the system prompt, `input` as a string or a list of items (`message`, `function_call`, `function_call_output`, `reasoning`), function `tools` in the Responses shape, and the answer as `output` items: a `reasoning` item for the thinking channel, a `message` item for the text, one `function_call` item per tool call.
+    description = "The OpenAI Responses API on the engine path chat completions uses: `instructions` as the system prompt, `input` as a string or a list of items (`message`, `function_call`, `function_call_output`, `reasoning`), function `tools` in the Responses shape, and the answer as `output` items: a `reasoning` item for the thinking channel, a `message` item for the text, one `function_call` item per tool call. `tool_choice` is served as on chat completions: `\"required\"` and `{type: \"function\", name}` force the call's opening.
 
 `stream: true` answers `text/event-stream`, one event per `event:`/`data:` pair: `response.created`, `response.in_progress`, then per output item `response.output_item.added`, its content events (`response.reasoning_text.delta`, `response.output_text.delta`, `response.function_call_arguments.delta`, ...), `response.output_item.done`, and one terminal event (`response.completed`, `response.incomplete` on `max_output_tokens`, `response.failed`). Every event carries a `sequence_number` counting from 0. Without it the body is the terminal event's `response`.
 

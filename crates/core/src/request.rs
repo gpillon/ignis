@@ -75,6 +75,9 @@ pub struct Request {
     /// Progress against the request's thinking budget
     /// ([`crate::types::DecodeParams::thinking_budget`]).
     pub thinking: crate::thinking_budget::BudgetState,
+    /// Progress through the request's forced literal
+    /// ([`crate::types::RequestInput::forced_literal`], GitHub #286).
+    pub forced_state: crate::forced_literal::ForcedState,
     /// The resources this request reserves while it holds a lane (core-05:
     /// the admission state machine's KV reservation, charged at deal and
     /// released at completion — the pool never over-allocates).
@@ -214,6 +217,7 @@ impl Request {
             attention: None,
             drawn: Vec::new(),
             thinking: crate::thinking_budget::BudgetState::default(),
+            forced_state: crate::forced_literal::ForcedState::default(),
             resources,
             remaining_work,
             backfill_epoch: 0,
@@ -672,6 +676,12 @@ impl Request {
         // KV it warmed.
         self.prefill_progress = 0;
         self.prefill_failures = 0;
+        // GitHub #286: and so do its thinking budget and its forced literal
+        // — the re-prefill draws its first token again, and a block it
+        // closed before is open again. A budget left at its old close
+        // would never force the new block's.
+        self.thinking = crate::thinking_budget::BudgetState::default();
+        self.forced_state = crate::forced_literal::ForcedState::default();
         true
     }
 
@@ -741,6 +751,7 @@ mod tests {
             RequestInput {
                 decision: None,
                 constrained: None,
+                forced_literal: None,
                 warm_up: false,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
@@ -773,6 +784,26 @@ mod tests {
         let mut r = req(1, RequestClass::Agent, RequestState::Prefilling);
         assert!(!r.advance(RequestState::Running));
         assert_eq!(r.state, RequestState::Prefilling);
+    }
+
+    /// GitHub #286: a re-queued request re-prefills and generates again from
+    /// its first token, so its thinking budget and its forced literal start
+    /// over — a block it had closed is open again, nothing is forced before
+    /// it closes anew, and the budget can force the new block's close.
+    #[test]
+    fn a_requeue_starts_the_thinking_budget_and_the_forced_literal_over() {
+        let literal = crate::forced_literal::ForcedLiteral::after_reasoning(vec![50, 51], 99, 2).unwrap();
+        let close = crate::thinking_budget::ThinkingClose::new(vec![1, 99], 99).unwrap();
+        let mut r = req(0, RequestClass::Agent, RequestState::Evicted);
+        r.forced_state.commit(&literal, 3, 99);
+        r.thinking.commit(&close, 3, 99);
+        assert_ne!(r.forced_state, crate::forced_literal::ForcedState::default(), "the block closed");
+        assert_eq!(r.thinking.closed_at(), Some(3));
+        assert!(r.requeue());
+        assert_eq!(r.forced_state, crate::forced_literal::ForcedState::default());
+        assert_eq!(r.forced_state.permitted(&literal, 0, None), None, "open again: nothing forced");
+        assert_eq!(r.thinking, crate::thinking_budget::BudgetState::default());
+        assert!(r.thinking.permitted(Some(4), &close, 4).is_some(), "a budget spent forces the new close");
     }
 
     #[test]

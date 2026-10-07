@@ -65,6 +65,7 @@ fn input(prompt: Vec<u32>, boundaries: Vec<ReuseBoundary>) -> RequestInput {
         system_block_tokens: Some(BLOCK),
         reuse_boundaries: boundaries,
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }

@@ -96,7 +96,7 @@ error's `param` value.
 | `max_tokens` | — | as today | — |
 | **`max_completion_tokens`** | **honoured** (below) | present *and* `max_tokens` present *and* different | — |
 | **`stop`** | **honoured** (below) | not a string, or not an array of 1..=4 non-empty strings | — |
-| `tools`, `tool_choice` | — | as today (`api.rs:728`) until #286 | #286 |
+| `tools`, `tool_choice` | — | `tool_choice` other than `"auto"`, `"none"`, `"required"` or a named function among `tools`; `"required"` with no tools; a forcing value the tokenizer cannot encode, or a cap shorter than the forced opening | #286 (`required` and a named function are **honoured**: the call's opening is forced, spec server/11) |
 | `reasoning_effort` and the ignis thinking controls | — | as today | — |
 | `n` | absent, `null`, or `1` | `>= 2` | #289 |
 | `logprobs` | absent, `null`, or `false` | `true` | #288 |

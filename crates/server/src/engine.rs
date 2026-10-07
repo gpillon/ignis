@@ -820,6 +820,7 @@ mod tests {
         RequestInput {
             decision: None,
             constrained: None,
+            forced_literal: None,
             warm_up: false,
             multimodal: None,
             opener_tokens: None,

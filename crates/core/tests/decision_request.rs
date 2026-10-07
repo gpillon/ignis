@@ -52,6 +52,7 @@ fn decision(prompt: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         reuse_boundaries: Vec::new(),
         decision: Some(DecisionRead::Answers(Arc::from(ANSWERS.to_vec()))),
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }

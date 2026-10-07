@@ -97,6 +97,7 @@ fn text_input(frontend: &FrontendSet, question: &str, max_tokens: u32) -> Reques
         system_block_tokens: None,
         reuse_boundaries: Vec::new(),
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }
@@ -123,6 +124,7 @@ fn multimodal_input(frontend: &FrontendSet, parts: Vec<ContentPart>, images: &[&
         system_block_tokens: None,
         reuse_boundaries: Vec::new(),
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }

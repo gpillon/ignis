@@ -42,6 +42,7 @@ pub mod flash_next;
 #[cfg(feature = "cuda")]
 pub mod flash_next_mtp;
 pub mod flash_next_counters;
+pub mod forced_literal;
 pub mod gdn;
 #[cfg(feature = "cuda")]
 pub mod gdn_layer;

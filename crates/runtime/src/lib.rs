@@ -1609,9 +1609,15 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             if let Some(probability) = drawn_probability {
                 drawn_probabilities.insert(job.request, probability);
             }
+            // A lane handed a set runs a plain round, one token. The round
+            // after a run's last set carries none and may commit a
+            // speculative run — every forced tool-call opening ends so
+            // (GitHub #286), as the thinking budget's close does — and the
+            // probability held is its first token's, the one drawn under
+            // the set.
             debug_assert!(
-                probabilities.is_empty() || tokens.len() == 1,
-                "a constrained lane commits exactly one token, so there is one probability for it"
+                job.permitted.is_none() || tokens.len() <= 1,
+                "a lane handed a permitted set commits one token"
             );
             let eos_at = (!job.params.ignore_eos)
                 .then(|| tokens.iter().position(|&token| token == self.eos))

@@ -201,6 +201,7 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
                 set: Some(set_query.clone()),
             })),
             constrained: None,
+            forced_literal: None,
             warm_up: false,
         };
 

@@ -361,6 +361,22 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   first sequence to appear in its content, with `finish_reason: "stop"`. The
   sequence is never emitted, streaming included; it is never matched in the
   reasoning, nor inside a tool call.
+- `tool_choice` takes `"auto"` (the default), `"none"`, `"required"`, and a
+  named function (`{"type": "function", "function": {"name": "..."}}`, or
+  `{"type": "function", "name": "..."}` on the responses API). The last two
+  force the call's opening — `<tool_call>` and the function tag, with the
+  name when one is named — and the model writes the arguments. With thinking
+  on (the default) the opening is forced right after the reasoning block
+  closes, so the model still thinks first; with `enable_thinking: false` it
+  is the first thing generated. The call comes back as any other call does,
+  with `finish_reason: "tool_calls"`. Naming a function that is not in
+  `tools`, `"required"` with no tools, and a `max_tokens` shorter than the
+  opening are a 400; so is a tokenizer that cannot force the opening
+  (`tool_choice_unsupported` — with thinking on it needs `</think>` and
+  `<tool_call>` to be single tokens, and `enable_thinking: false` is the
+  way out). With thinking on the reasoning spends the same `max_tokens`: a
+  block that never closes ends `length` with no call, which the thinking
+  budget's answer reserve prevents.
 - Non-streaming returns `choices[].message.content` plus `usage`; streaming
   emits `chat.completion.chunk` SSE frames (token deltas, a final
   `finish_reason` chunk, then `[DONE]`). `usage.prompt_tokens_details.cached_tokens`

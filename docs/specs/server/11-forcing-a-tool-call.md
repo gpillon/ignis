@@ -77,6 +77,10 @@ answer — or it may mean the feature this spec should build is "force the
 call *after* `</think>`", which is a different mechanism (see Further
 Notes). Decide that before implementing.
 
+**Decided (2026-10-07): force after `</think>`.** Built that way; see
+[As built: departures](#as-built-departures-2026-10-07) at the end, which
+override the sections between here and there where they disagree.
+
 ## User Stories
 
 1. As an agent that has already decided a tool must run, I want
@@ -278,3 +282,74 @@ from the body, and guessing it would change what the model reads.
   free token. Making that work means either accepting one free token
   between the close and the opener, or a leaf that can re-draw. Neither is
   in this spec.
+
+## As built: departures (2026-10-07)
+
+What was built differs from the sections above in these points, and these
+win where the two disagree.
+
+1. **Thinking on forces after the block instead of refusing.** With thinking
+   resolved on, `"required"` and a named function are forced right after the
+   reasoning block closes, by the model's own `</think>` or by the thinking
+   budget's forced close; with it off, from the first token as specified.
+   Why: thinking is on by default and no OpenAI-SDK client turns it off, so
+   the exclusion would have made `tool_choice: "required"` from Codex,
+   qwen-code or opencode a `400` every time, which is the feature not
+   shipping for the clients that send it. "Think, then certainly call" is
+   also what an agent wants: the forcing changes what the model may draw
+   after its reasoning, never the prompt it reads. The 400 survives only
+   where the mechanism cannot work: a tokenizer whose `</think>` or
+   `<tool_call>` is not a single token (`code: tool_choice_unsupported`,
+   naming `enable_thinking: false`).
+2. **The one free token after a natural close is accepted, and joined on.**
+   The round that commits the model's `</think>` has already drawn the next
+   token freely (a speculative round may commit several), so the first forced
+   draw follows a token nobody saw. If that token was `<tool_call>` itself,
+   forcing `<tool_call>` again would open the call twice and it would not
+   parse. So the first token forced after a natural close is the opening's
+   *second*, `\n` (id 198), the **joiner**: right after `<tool_call>`,
+   and after anything else a line break in the content (trimmed when nothing
+   precedes it, as after the usual `\n\n`).
+   The opening then resumes at `<` when the unseen token was `<tool_call>`,
+   and from `<tool_call>` otherwise. After a close the budget forced there is
+   no unseen token (its close ends with forced tokens, `</think>\n\n`), so
+   no joiner. When a speculative round commits the model's own `<tool_call>`
+   with its close, a call stopped inside the tokens every call writes alike
+   (`<tool_call>` `\n` `<` `function`) is continued: the unseen token is
+   taken to be the next of them, and the forcing resumes after it — through
+   the name, for a named function. A call already past them, or off the
+   dialect after `<tool_call>`, is the model's and is left alone.
+3. **`"required"` forces `<tool_call>\n<function`, not `<tool_call>\n`.** The
+   27B tokenizer writes the opening as `<tool_call>` `\n` `<` `function`
+   and then merges the `=` into the name (`=read`, `=get`; `=` `shell` when
+   it does not). `<function=` is therefore not a step boundary, and stopping
+   before the `=` keeps every forced id one the model writes itself; it also
+   rules out a call written in another dialect. The prefix check this spec
+   asks for passes on all six recorded calls (`tool_choice_real_tokenizer.rs`).
+   A named function forces the whole `<tool_call>\n<function=NAME>\n`, encoded
+   in one call so the name merges as the model's would.
+4. **The forced literal carries its own `</think>` id** (`ForcedLiteral::
+   after_reasoning`), so detecting the close does not depend on the
+   scheduler's thinking-budget close being configured.
+5. **Deferred: `ignis_forced_tool_calls_total`.** Not built here: the outcome
+   (closed or not) is read where each answer path resolves its
+   `finish_reason` (chat's three, the Responses events), and the counter is
+   plumbing through all of them, a follow-up of its own. A forced call that
+   never closes is still dropped whole and ends with the ordinary
+   `finish_reason` (`openai_http_tool_choice.rs`).
+6. **The cap check does not count the reasoning.** With thinking on, the
+   reasoning spends the same `max_tokens` the call needs, by an amount not
+   knowable at the request; only a cap shorter than the opening is a `400`.
+   The thinking budget's answer reserve (`ANSWER_RESERVE`, spec 08) is what
+   keeps room for the call; a request with no budget may reason to its cap
+   and end `length` with no call.
+
+**Known gaps.** A named function under speculation, when one round commits
+`</think>` and the model's own call past `<function` together: nothing is
+forced, and the model may name a different tool than the one asked for.
+Prose the model writes before the forced opening after a natural close (the
+unseen token, and whatever a speculative round committed past its
+`</think>`) reaches `content`; no fragment of the opening does. When that
+unseen token is the end of the turn, the request ends there with no call.
+The budget's forced close still says "without calling any more tools" before
+a forced call.

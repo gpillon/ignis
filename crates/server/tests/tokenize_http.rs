@@ -263,7 +263,12 @@ async fn a_body_chat_would_refuse_is_refused_with_the_same_error() {
     for (name, body) in [
         ("bad reasoning_effort", json!({ "messages": [user("hi")], "reasoning_effort": "sideways" })),
         ("bad thinking_budget", json!({ "messages": [user("hi")], "thinking_budget": "many" })),
-        ("bad tool_choice", json!({ "messages": [user("hi")], "tools": [tool()], "tool_choice": "required" })),
+        ("bad tool_choice", json!({ "messages": [user("hi")], "tools": [tool()], "tool_choice": "always" })),
+        ("unknown function", json!({ "messages": [user("hi")], "tools": [tool()], "tool_choice": { "type": "function", "function": { "name": "nope" } } })),
+        (
+            "a call this tokenizer cannot force after the block",
+            json!({ "messages": [user("hi")], "tools": [tool()], "tool_choice": "required", "enable_thinking": true }),
+        ),
         ("bad tool", json!({ "messages": [user("hi")], "tools": [{ "type": "function" }] })),
         ("bad role", json!({ "messages": [{ "role": "bogus", "content": "hi" }] })),
     ] {

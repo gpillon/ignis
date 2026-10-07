@@ -756,6 +756,39 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
     );
 }
 
+/// GitHub #286: the round after a forced run's last set carries none, so a
+/// speculative leaf may commit a whole run there. The probability held from
+/// the round before is the run's *first* token's — the one that round drew
+/// under its set — and the run's length says nothing wrong. Every forced
+/// tool-call opening ends this way; the thinking budget's close did before.
+#[test]
+fn the_round_after_a_forced_run_may_commit_a_speculative_run() {
+    let leaf = Arc::new(StubLeaf::with_runs([
+        LaneRun::token(11),
+        LaneRun { tokens: vec![12, 13, 14], spec: None, drawn_probability: None },
+    ]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let forced: ignis_core::constrained::PermittedSet = vec![5].into();
+    compute
+        .prefill_step(&[PrefillJob { permitted: Some(forced.clone()), ..prefill(1, Some(8)) }])
+        .unwrap();
+    let round = |permitted: Option<ignis_core::constrained::PermittedSet>| {
+        compute
+            .decode_step(&[DecodeJob { permitted, ..job(1, DecodeParams::default(), 8) }])
+            .unwrap()
+            .remove(0)
+    };
+    assert_eq!(round(Some(forced)).tokens, vec![11], "the last forced round");
+    let released = round(None);
+    assert_eq!(released.tokens, vec![12, 13, 14]);
+    assert_eq!(
+        released.probabilities,
+        vec![STUB_PERMITTED_PROBABILITY],
+        "one probability, the first token's: the one drawn under the last set"
+    );
+}
+
 #[test]
 fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
     let leaf = Arc::new(StubLeaf::with_tokens([]));
@@ -1023,6 +1056,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
                     ..DecodeParams::default()
                 },
                 constrained: None,
+                forced_literal: None,
                 warm_up: false,
             },
             RequestClass::Interactive,
@@ -1059,6 +1093,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
                 constrained: None,
+                forced_literal: None,
                 warm_up: false,
             },
             RequestClass::Interactive,
@@ -1106,6 +1141,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
             ..DecodeParams::default()
         },
         constrained: None,
+        forced_literal: None,
         warm_up: false,
 };
     scheduler
@@ -1166,6 +1202,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
             ..DecodeParams::default()
         },
         constrained: None,
+        forced_literal: None,
         warm_up: false,
 };
     scheduler
@@ -1225,6 +1262,7 @@ fn checkpoint_input(tokens: Vec<u32>, opener: Option<u32>) -> RequestInput {
             ..DecodeParams::default()
         },
         constrained: None,
+        forced_literal: None,
         warm_up: false,
     }
 }
@@ -1518,6 +1556,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
                         ..DecodeParams::default()
                     },
                     constrained: None,
+                    forced_literal: None,
                     warm_up: false,
                 },
                 RequestClass::Agent,
@@ -1897,6 +1936,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
                 system_block_tokens: None,
                 reuse_boundaries: Vec::new(),
                 constrained: None,
+                forced_literal: None,
                 warm_up: false,
             },
             RequestClass::Agent,
