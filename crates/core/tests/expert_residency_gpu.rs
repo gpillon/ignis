@@ -278,7 +278,14 @@ fn the_device_steps_equal_the_policy_model_on_random_traces() {
                 steps_run += 1;
             }
         }
-        let counters = gpu.counters().expect("counters");
+        let mut counters = gpu.counters().expect("counters");
+        // The device times its demand copies; the model has no clock. A phase
+        // that copied a miss in waited for it, one that copied none did not.
+        for phase in [Phase::Decode, Phase::Prefill] {
+            let copied = KClass::ALL.iter().any(|c| model.counters().misses[c.index()][phase.index()] > 0);
+            assert_eq!(counters.stall_nanos[phase.index()] > 0, copied, "seed {seed}: {phase:?} stall");
+        }
+        counters.stall_nanos = [0, 0];
         assert_eq!(&counters, model.counters(), "seed {seed}: counters");
         let _ = KClass::ALL;
     }

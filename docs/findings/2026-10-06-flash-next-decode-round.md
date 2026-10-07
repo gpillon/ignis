@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-10-06
-- Last verified: 2026-10-06
+- Last verified: 2026-10-07
 - Scope: kernel / Flash-Next decode round, CUDA graph replay, expert residency on the critical path, host time between rounds
 - Related: https://github.com/gpillon/ignis/issues/306, [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md), [27B decode round host idle](2026-09-18-decode-round-host-idle.md), [MoE decode is structure-bound](2026-10-05-moe-decode-is-structure-bound.md), [expert miss path](2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md)
 - Superseded by: none
@@ -395,11 +395,79 @@ hq-e8-2b stays the default. This section measures what BF16 KV would cost a deco
 
 Raw material in `.scratch/dec2-306/`: `kv.sh`, `kv_summary.py`, `kv*.server.log`, `kv*.m{0,1,2}.txt`, `kv*.lane*.jsonl`.
 
+## Demand copies and the lookahead (2026-10-07, lookahead41)
+
+How long does a decode wait on expert misses, how much of that could the lookahead have covered, and does a shorter prefetch branch or a wider lookahead cover more? VRAM held fixed: no KV pool bytes given to the expert cache.
+
+**Setup.**
+- Branch `decode-lookahead-306` from `c658fa7` (16 n-gram readers). Server: `make config MODEL=flash-next`'s flags (hq-e8-2b, 262,144 tokens per lane, 3 lanes, `--prefill-chunk 8192`, `--vram-headroom-bytes 4G`, `--kv-host-pool-bytes 2G`, no speculation), plus `--metrics`.
+- The plan gives the expert cache 14.34-14.37 GB (KV pool 3.71 GB). The dec2 rows above ran at 131K with 16.14 GB, so their hit rates (97.45% at one lane) and copy times are not this config's.
+- `.scratch/la41/rate.sh`: one greedy lane for ~70 s (four 1,800-token requests), then three lanes with three different greedy prompts for ~100 s. Hit rate, misses, prefetches and stall are `/metrics` deltas per phase, per decoded token.
+- Session 5 ran with `--kv-host-pool-bytes 0 --retained-host 0`: other processes held host RAM, and the load needs ~48.5 GB available. That config moves the traffic (84.2 prefetched / 39.4 used per token against 79.2 / 35.7) and its base (92.3 against 93.8 tok/s), so rows compare within a session only.
+- Three-lane aggregates (first requests) vary by ~±1 tok/s between sessions with the same build (96.1-97.1).
+
+**The stall, measured (`63d4eb4`, item 9).** Each demand copy reads `%globaltimer` from its first block's start to its last block's end, and its last block adds the span to `stall_nanos[phase]` and to the mirror. Exported as `ignis_expert_residency_stall_seconds_total{phase}` (ADR 0017 amendment of 2026-10-07) and drawn on the Monitor's Expert residency card. It costs nothing measurable (93.6-93.9 against 93.2-94.2 tok/s, 97.1 against 96.6).
+- **One greedy lane: 2.11 ms per token**, 21% of the 10.0 ms ITL.
+- **Three distinct lanes: 6.4 ms per token**, ~19 ms of a ~30 ms round (64%). The link carries ~104 MB per token there: three-lane decode is bound by the misses.
+- The stall counts the demand copies only. A prefetch still copying when the next layer's step starts holds that step at its join too; that wait is not in it, and it is what the budget rows below trade against.
+- Against dec2's 1.0-1.35 ms of demand copies per one-lane round (131K, 16.14 GB of cache), this config's smaller cache copies for 2.1 ms.
+
+| session: leg (build) | 1 lane tok/s | 1 lane: hit, misses / prefetched / used per token, stall per token (= per round) | 3 lanes: aggregate | 3 lanes: hit, misses / prefetched / used per token, stall per token (per round) |
+|---|---|---|---|---|
+| 1: base (`c658fa7`) | 93.2-94.2 (first: 83.3, cold cache) | 96.24%, 36.1 / 79.0 / 35.6, — | 96.6 | 88.38%, 106.2 / 41.0 / 27.6, — |
+| 2: stall metric (`63d4eb4`) | 93.6-93.9 | 96.22%, 36.2 / 79.1 / 35.7, 2.11 ms | 97.1 | 88.36%, 106.3 / 40.8 / 27.7, 6.37 ms (19.1 ms) |
+| 3: (a) rank folded into the resolve | 93.6-93.9 | 96.22%, 36.3 / 79.2 / 35.7, 2.11 ms | 97.2 | 88.37%, 106.3 / 40.8 / 27.7, 6.39 ms (19.2 ms) |
+| 3: (a) + (b) parallel residency test | 93.9-94.6 | 96.22%, 36.3 / 79.2 / 35.7, 2.12 ms | 96.0 | 88.31%, 107.1 / 41.2 / 27.8, 6.43 ms (19.3 ms) |
+| 4: stall metric again | 93.6-93.9 | 96.22%, 36.3 / 79.2 / 35.7, 2.12 ms | 96.1 | 88.32%, 106.7 / 41.0 / 27.6, 6.43 ms (19.3 ms) |
+| 4: (a) + (b), budget × 1.5 (2.63 MB) | 84.6-86.0 | 96.55%, 33.1 / 100.0 / 44.6, 1.94 ms | **98.4** | 89.15%, 99.1 / 56.6 / 38.9, 5.98 ms (17.9 ms) |
+| 5: stall metric | 92.2-92.4 | 96.16%, 36.9 / 84.2 / 39.4, 2.16 ms | 93.6 | 88.19%, 107.8 / 42.7 / 29.1, 6.54 ms (19.6 ms) |
+| 5: (b) alone (`96b3c51`) | 93.1-93.7 | 96.16%, 36.9 / 84.2 / 39.4, 2.14 ms | 93.8 | 88.20%, 107.8 / 42.7 / 29.1, 6.54 ms (19.6 ms) |
+| 5: (a) + (b), budget × 0.67 (1.17 MB) | **95.2-95.4** | 95.68%, 41.5 / 52.7 / 25.7, 2.37 ms | 90.7 | 87.50%, 114.3 / 26.6 / 18.5, 6.92 ms (20.8 ms) |
+
+**What the lookahead could have covered.** A diagnostic build (`.scratch/la41/diag.patch` on `63d4eb4`, not committed) marks each next-layer key the lookahead saw and classifies every decode miss at its step: dropped by the budget, ranked in the top 16 and still missed, ranked 16-31 (the ranking widened to 32 for this), or beyond. Its flag writes cost 2.9% at one lane (91.1 tok/s); its counts are of the same traffic as the stall build's.
+
+| per decoded token | 1 lane | 3 lanes |
+|---|---|---|
+| demand misses | 36.3 (25.7 MB) | 106.3 (78.6 MB) |
+| in the top 16, dropped by the budget | 13.0, 9.5 MB (**37%**) | 64.3, 48.1 MB (**61%**) |
+| in the top 16, prefetched or resident, then evicted before use | 0.01 | 0.01 |
+| ranked 16-31 | 9.9, 6.9 MB (27%) | 18.9, 13.7 MB (17%) |
+| beyond rank 31 | 13.4, 9.3 MB (36%) | 23.1, 16.8 MB (21%) |
+| candidates the budget dropped | 77.7, 56.2 MB | 311, 225.6 MB |
+| prefetches used, of issued | 45% | 68% |
+
+- **The budget, not the width, binds.** With no budget, W = 16 would have covered 37% of the one-lane demand-copy time (~0.8 of 2.11 ms) and 61% at three lanes (~3.9 of 6.4 ms). W = 32 adds 27% and 17%, but only behind the same budget: the walk takes candidates in rank order and runs out of budget first, so W changes how many are dropped, not which are copied.
+- **Covering them is expensive.** Only 17% (one lane) and 21% (three) of the dropped candidates were selected at their layer: covering the one-lane 9.5 MB means copying 56 MB more per token.
+- A prefetch is essentially never evicted before its use (0.01 per token).
+
+**(a) Folding `rank_lookahead` into `resolve_prefetch`: neutral, not kept.** One warp per row ranks the logits inside the resolve, with the ranking shared with `rank_lookahead` so the bits cannot differ. The split CTests passed through it. A/B: 93.6-93.9 against 93.6-93.9 tok/s, 97.2 against 97.1. The branch's ~10 µs was not on the critical path: the prefetch copy waits for the demand copy anyway.
+
+**(b) Every candidate's residency read at once (`96b3c51`): kept.** The walk read each candidate's slot and flags with a dependent global load, one at a time. They are now read in parallel into shared flags before the walk. A prefetch that evicts a later candidate clears that candidate's flag, so it is copied again at its turn, as the policy walks them. A CPU model test and a CTest scenario pin that case; the CTest fails without the flag patch. One lane: +0.6 tok/s on (a) (session 3) and +1.1 alone (92.3 → 93.4, session 5). Three lanes: within noise.
+
+**(c) The budget: no single value is better at both ends; the default is unchanged.**
+- × 0.67 (1.17 MB a step): +2% at one lane (95.3 against (b)'s 93.4), −3.3% at three (90.7 against 93.8).
+- × 1.5 (2.63 MB): −9% at one lane (85.2 against 93.8), +2.4% at three (98.4 against 96.1).
+- At one lane the prefetch copy follows the demand copy on the same link and must end before the next layer's join, inside ~165 µs of compute. A smaller budget raises the stall (2.14 → 2.37 ms) and still wins: less prefetch is exposed at the join. At three lanes the misses saturate the link and 68% of prefetches are used, so prefetched bytes displace demand bytes and a larger budget pays.
+- A per-step budget keyed to the step's lookahead rows (~1.17 MB at one row, ~+0.72 MB per further row) would take both gains. It was not built here:
+  - it changes the residency descriptor's ABI, the policy model's `PolicyConfig` and `plan.rs`'s default;
+  - and spec 03's study replay rejects its one-row value: `the_lookahead_turns_most_remaining_misses_into_hits` asserts a one-lane hit rate of at least 96%, and those two budgets replay at 95.9%. That replay scores prefetches as hidden, which served decode contradicts above.
+- Wider W was not tried: by the coverage table it moves nothing while the budget binds.
+
+**Limits.**
+- One prompt family, greedy, contexts under 2K. One lane or three distinct lanes.
+- The budget's optimum is bracketed by two points per end; it may lie further out (× 0.5 at one lane, × 2 at three).
+- The scaled-budget legs ran on (a) + (b) builds; (a) is neutral, so they read as budget effects.
+- No node-level trace this time: the exposed prefetch is inferred from tok/s against the stall, not timed.
+
+Raw material in the `flash-next` worktree, `.scratch/la41/`: `rate.sh`, `summary.py`, per leg `*.server.log`, `*.m{0,1,2}.txt` and `*.lane*.jsonl`, `diag.patch` (the coverage counters), `lever-a.patch`, `lever-ab.patch`. The harness is also in the main checkout's `.scratch/flash-next-306-307/harness/lookahead41/`.
+
 ## Follow-ups
 
 Status lives in https://github.com/gpillon/ignis/issues/306.
 
-- Shorten the residency prefetch branch, now the longest overlap (78-324 µs of exposed prefetch per round): fold `rank_lookahead` into `resolve_prefetch`, and test the candidates' residency in parallel rather than one at a time.
+- A per-step decode prefetch budget keyed to the lookahead rows (~1.17 MB at one row, ~+0.72 MB per further row; "Demand copies and the lookahead" above): +2% at one lane and +2.4% at three, each measured on its own scaled default. Bracket it first (× 0.5 at one lane, × 2 at three); it needs the descriptor and `PolicyConfig` to carry the per-row term, and spec 03's replay acceptance (one-lane hit rate ≥ 96%) revisited, since a smaller one-lane budget wins while hitting less.
+- Time the join wait too (spec 03 story 7: a turn slowed by an unfinished prefetch now reads as compute). Not cheap with the mirror pattern: the step must know when its own stream reached the join, which needs a timestamp written by the kernel before it (the router, another module), an extra launch per layer on the critical path, or a device-side wait in place of the event join.
+- Prefetch precision is what is left once the budget is right: 45% of one-lane prefetches are used, and 36% of one-lane demand bytes rank beyond the lookahead's top 32.
 - Host-gap fixes 2, 3 and 5 (one wake per gather, every read in flight at once, one pinned staging copy): ~0.05-0.2 ms each, worth a dedicated A/B on the greedy prompt.
-- A wider `router_select` (3.5 µs per layer on one CTA), and implication 4 (demand copies, ~1.0-1.35 ms per round).
+- A wider `router_select` (3.5 µs per layer on one CTA).
 - BF16 KV at long contexts: it needs a shorter `--max-context` (32K loads, 131K does not), or a smaller expert-cache floor.

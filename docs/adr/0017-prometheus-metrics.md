@@ -110,6 +110,16 @@ projection makes two exceptions, named here:
 Every Flash-Next family renders after all the others: a 27B load's
 exposition is the same bytes it was, and a load the consumer is told has no
 source renders none of them.
+Amended 2026-10-07 (#306, spec flash-next/03 acceptance 7):
+`ignis_expert_residency_stall_seconds_total{phase=decode|prefill}` returns,
+now that the device times the wait. Each step's demand copy reads
+`%globaltimer` from its first block's start to its last block's end, and its
+last block adds the span to the phase's counter and stores the total in the
+mirror: no host sync, no extra launch, the same path to the projection as the
+other residency counts. Only the demand copies count, so a step with no miss
+adds nothing; the prefetch copies on residency's own stream, and a step's wait
+for the previous one's, are not in it. Seconds, rendered exactly from the
+device's nanoseconds.
 
 ## Context
 
@@ -282,6 +292,7 @@ The initial stable metric contract is:
 | `ignis_expert_prefetches_issued_total` | counter | none | Flash-Next: projections copied ahead for the next layer by the router lookahead (#301) |
 | `ignis_expert_prefetches_used_total` | counter | none | Flash-Next: prefetched projections at their first use, whenever it comes (#301) |
 | `ignis_expert_bytes_moved_total` | counter | `phase=decode\|prefill` | Flash-Next: bytes of expert projections copied host-to-device, misses and prefetches (#301) |
+| `ignis_expert_residency_stall_seconds_total` | counter | `phase=decode\|prefill` | Flash-Next: device time the expert kernels waited on their step's demand copies, the misses (#306). A step with no miss adds nothing; prefetch copies are not counted. Stall per token is the decode series over `ignis_decoded_tokens_total` |
 | `ignis_expert_cache_slots` | gauge | `class`, `state=capacity\|in_use` | Flash-Next: VRAM expert cache slots per K class, reserved at load and in use (#301) |
 | `ignis_ngram_rows_total` | counter | `source=hot\|file` | Flash-Next: n-gram embedding rows staged for prefill spans and decode rounds, from the RAM hot-row cache or the artifact file (#302). A hot-row hit rate is `source="hot"` over the sum |
 | `ignis_ngram_reads_total` | counter | none | Flash-Next: reads issued to the artifact file for rows the hot-row cache did not hold (#302) |

@@ -11,7 +11,9 @@
 //   - the slot table: every entry is ABSENT or points at a slot boundary of its own class's pool
 //     or into the staging ring, no two entries share a slot, an evicted projection is ABSENT,
 //     and a staged projection is ABSENT again once a step of another layer has run;
-//   - at the end, the counters add up to the trace.
+//   - at the end, the counters add up to the trace;
+//   - the stall: a step (or captured round) with no miss adds nothing to stall_nanos, none touches
+//     the other phase, and the copying steps' additions are each phase's whole stall, above 0.
 // `graph` runs every whole decode round (all layers in order, one token count) as one CUDA graph,
 // captured once per token count and replayed with new ids in the same buffers: decode residency
 // is graph-capturable across the layer steps of a round (spec acceptance 3); the rest runs
@@ -302,6 +304,35 @@ int main(int argc, char **argv) {
   uint64_t want_hits[8][2] = {}, want_misses[8][2] = {};
   uint32_t graph_rounds = 0;
 
+  // The stall: what steps `from`..`to` (one phase) added to stall_nanos, against their misses. A
+  // copying step must add something only where %globaltimer ticks finer than its copy (the 5090
+  // reads ~1.6 us for a 4 KB one); elsewhere it may read 0, so a coarse tick is reported, and
+  // only each phase's total must grow.
+  uint64_t stall_seen[2] = {}, stall_steps[2] = {}, stall_min = UINT64_MAX, stall_zero = 0;
+  auto stall_now = [&](uint64_t out[2]) {
+    ignis_residency_counters c{};
+    RES_OK(ignis_residency_read_counters(r, &c));
+    out[0] = c.stall_nanos[0];
+    out[1] = c.stall_nanos[1];
+  };
+  auto check_stall = [&](const std::string &at, size_t from, size_t to, const uint64_t before[2]) {
+    uint64_t after[2];
+    stall_now(after);
+    const uint32_t phase = f.steps[from].phase;
+    bool copied = false;
+    for (size_t i = from; i < to; ++i) copied = copied || (f.steps[i].expect.status == 0 && !f.steps[i].expect.list[2].empty());
+    const uint64_t added = after[phase] - before[phase];
+    check(after[1 - phase] == before[1 - phase], at + ": the stall of the other phase moved");
+    if (copied) {
+      if (added == 0) ++stall_zero;
+      stall_min = std::min(stall_min, added);
+      stall_seen[phase] += added;
+      ++stall_steps[phase];
+    } else {
+      check(added == 0, at + ": no miss, yet the stall grew by " + std::to_string(added) + " ns");
+    }
+  };
+
   // One step's outcome against the model's.
   auto compare = [&](size_t si) {
     const Step &s = f.steps[si];
@@ -529,6 +560,8 @@ int main(int argc, char **argv) {
         CUDA_OK(cudaGraphDestroy(g));
       }
       RES_OK(ignis_residency_join(r, stream));
+      uint64_t before[2];
+      stall_now(before);
       for (uint32_t l = 0; l < f.layers; ++l) {
         const Step &s = f.steps[si + l];
         CUDA_OK(cudaMemcpyAsync(round.ids[l], s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
@@ -540,6 +573,7 @@ int main(int argc, char **argv) {
       CUDA_OK(cudaGraphLaunch(round.exec, stream));
       CUDA_OK(cudaStreamSynchronize(stream));
       for (uint32_t l = 0; l < f.layers; ++l) compare(si + l);
+      check_stall("round from step " + std::to_string(si), si, si + f.layers, before);
       check_table("round from step " + std::to_string(si), nullptr);
       if (f.steps[si + f.layers - 1].expect.status == 0) check_mirror("round from step " + std::to_string(si));
       remember_staging(f.steps[si + f.layers - 1]);
@@ -549,6 +583,8 @@ int main(int argc, char **argv) {
     }
     const Step &s = f.steps[si];
     const bool has_look = s.rows > 0;
+    uint64_t before[2];
+    stall_now(before);
     CUDA_OK(cudaMemcpyAsync(d_ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
     if (has_look) {
       CUDA_OK(cudaMemcpyAsync(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice, stream));
@@ -557,6 +593,7 @@ int main(int argc, char **argv) {
     RES_OK(ignis_residency_join(r, stream));
     CUDA_OK(cudaStreamSynchronize(stream));
     compare(si);
+    check_stall("step " + std::to_string(si), si, si + 1, before);
     check_table("step " + std::to_string(si) + " (layer " + std::to_string(s.layer) + ")", &s);
     if (s.layer + 1 == f.layers && s.expect.status == 0) check_mirror("step " + std::to_string(si));
     remember_staging(s);
@@ -576,6 +613,15 @@ int main(int argc, char **argv) {
     }
   }
   if (graph_mode) check(graph_rounds > 2, "graph mode replayed too few captured rounds");
+  check(counters.stall_nanos[0] == stall_seen[0] && counters.stall_nanos[1] == stall_seen[1],
+        "counters: the stall is what the steps added");
+  check(stall_steps[0] > 0 && stall_steps[1] > 0, "the trace copies misses in both phases");
+  check(stall_seen[0] > 0 && stall_seen[1] > 0, "the copies of each phase add up to some stall");
+  std::printf("stall: decode %.1f us over %llu copying steps, prefill %.1f us over %llu, smallest %llu ns%s\n",
+              stall_seen[0] / 1e3, static_cast<unsigned long long>(stall_steps[0]), stall_seen[1] / 1e3,
+              static_cast<unsigned long long>(stall_steps[1]), static_cast<unsigned long long>(stall_min),
+              stall_zero ? (" -- " + std::to_string(stall_zero) + " copying steps read 0 ns: a coarse %globaltimer").c_str()
+                         : "");
 
   if (split_mode) {
     // A prefetch half needs its demand half's open branch; a branch the caller never took a
@@ -646,6 +692,78 @@ int main(int argc, char **argv) {
     const uint64_t final_moved = mirror->counters.bytes_moved[0] + mirror->counters.bytes_moved[1];
     check(final_moved == moved, "the mirror after free: bytes moved " + std::to_string(final_moved) +
                                     ", the device " + std::to_string(moved));
+  }
+
+  // A prefetch that evicts a later candidate of the same lookahead: the candidate is no longer
+  // resident at its turn, so it is prefetched again, as the policy walks them one at a time.
+  // Two layers of 16 experts, one class per projection with 12 slots: the warm start holds
+  // layer 1's experts B (hotter) and A; a decode step of layer 0 misses ten experts, which fills
+  // both classes, and looks ahead at [X, A]. X evicts the least recent, A; A then evicts B.
+  {
+    constexpr uint32_t kE = 16, kA = 12, kB = 13, kX = 14;
+    auto key = [](uint32_t layer, uint32_t expert, uint32_t projection) { return (layer * kE + expert) * 2 + projection; };
+    ignis_residency_desc d2{};
+    d2.layers = 2;
+    d2.experts = kE;
+    for (int c = 0; c < 8; ++c) d2.record_bytes[c] = 4096;
+    d2.capacity[0] = d2.capacity[4] = 12;  // gate/up and down at K = 2
+    d2.max_tokens = 1;
+    d2.lookahead_width = 2;
+    d2.prefetch_budget_bytes = IGNIS_RESIDENCY_NO_BUDGET;
+    d2.staging_half_bytes = 2 * kE * 4096;
+    d2.host_pool_bytes = 2 * 2 * kE * 4096;
+    d2.copy_blocks = 4;
+    d2.report = 1;
+    const std::vector<uint8_t> k2(2 * 2 * kE, 4);
+    std::vector<uint64_t> offsets2(2 * 2 * kE);
+    for (size_t i = 0; i < offsets2.size(); ++i) offsets2[i] = i * 4096;
+    ignis_residency *r2 = nullptr;
+    RES_OK(ignis_residency_create(&d2, k2.data(), offsets2.data(), &r2));
+    const std::vector<uint32_t> warm = {key(1, kB, 0), key(1, kB, 1), key(1, kA, 0), key(1, kA, 1)};
+    uint32_t warmed = 0;
+    RES_OK(ignis_residency_warm_start(r2, warm.data(), static_cast<uint32_t>(warm.size()), &warmed));
+    check(warmed == 4, "eviction check: the warm start admits A and B");
+    cudaStream_t s2;
+    CUDA_OK(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
+    std::vector<int32_t> ids2(IGNIS_MOE_TOP_K);
+    for (uint32_t i = 0; i < IGNIS_MOE_TOP_K; ++i) ids2[i] = static_cast<int32_t>(i);
+    const std::vector<int32_t> look2 = {static_cast<int32_t>(kX), static_cast<int32_t>(kA)};
+    int32_t *d_ids2 = nullptr, *d_look2 = nullptr;
+    CUDA_OK(cudaMalloc(&d_ids2, ids2.size() * 4));
+    CUDA_OK(cudaMalloc(&d_look2, look2.size() * 4));
+    CUDA_OK(cudaMemcpy(d_ids2, ids2.data(), ids2.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_look2, look2.data(), look2.size() * 4, cudaMemcpyHostToDevice));
+    if (split_mode) {
+      void *side = nullptr;
+      RES_OK(ignis_residency_step_demand(r2, 0, IGNIS_RESIDENCY_DECODE, d_ids2, 1, s2, &side));
+      RES_OK(ignis_residency_step_prefetch_ranked(r2, d_look2, 1, 2));
+    } else {
+      RES_OK(ignis_residency_step_ranked(r2, 0, IGNIS_RESIDENCY_DECODE, d_ids2, 1, d_look2, 1, 2, s2));
+    }
+    RES_OK(ignis_residency_join(r2, s2));
+    CUDA_OK(cudaStreamSynchronize(s2));
+    ignis_residency_report head{};
+    std::vector<uint32_t> lists(static_cast<size_t>(IGNIS_RESIDENCY_LISTS) * 4 * kE);
+    RES_OK(ignis_residency_last_report(r2, 0, &head, lists.data(), 4 * kE));
+    auto list = [&](int l) {
+      std::set<uint32_t> out(lists.begin() + static_cast<size_t>(l) * 4 * kE,
+                             lists.begin() + static_cast<size_t>(l) * 4 * kE + head.count[l]);
+      return out;
+    };
+    check(head.status == 0, "eviction check: status " + std::to_string(head.status));
+    check(list(4) == std::set<uint32_t>{key(1, kX, 0), key(1, kX, 1), key(1, kA, 0), key(1, kA, 1)},
+          "eviction check: X and then the A it evicted are prefetched");
+    check(list(3) == std::set<uint32_t>{key(1, kA, 0), key(1, kA, 1), key(1, kB, 0), key(1, kB, 1)},
+          "eviction check: X evicts A, A evicts B");
+    std::vector<ignis_moe_slot> t2(2 * kE);
+    CUDA_OK(cudaMemcpy(t2.data(), ignis_residency_slot_table(r2, 1), t2.size() * sizeof(ignis_moe_slot),
+                       cudaMemcpyDeviceToHost));
+    check(t2[2 * kA].record != nullptr && t2[2 * kA + 1].record != nullptr, "eviction check: A is resident");
+    check(t2[2 * kB].record == nullptr && t2[2 * kB + 1].record == nullptr, "eviction check: B is ABSENT");
+    cudaFree(d_ids2);
+    cudaFree(d_look2);
+    cudaStreamDestroy(s2);
+    ignis_residency_free(r2);
   }
   if (g_failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);

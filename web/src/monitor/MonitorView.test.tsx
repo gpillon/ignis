@@ -134,7 +134,8 @@ describe("MonitorView", () => {
     // Ten seconds on: 900 decode hits and 100 misses, 50 tokens decoded.
     const later = FLASH_NEXT_EXPOSITION.replace('ignis_expert_cache_hits_total{class="gate_up_k2",phase="decode"} 4000', 'ignis_expert_cache_hits_total{class="gate_up_k2",phase="decode"} 4900')
       .replace('ignis_expert_cache_misses_total{class="down_k3",phase="decode"} 300', 'ignis_expert_cache_misses_total{class="down_k3",phase="decode"} 400')
-      .replace("ignis_decoded_tokens_total 12400", "ignis_decoded_tokens_total 12450");
+      .replace("ignis_decoded_tokens_total 12400", "ignis_decoded_tokens_total 12450")
+      .replace('ignis_expert_residency_stall_seconds_total{phase="decode"} 18.6', 'ignis_expert_residency_stall_seconds_total{phase="decode"} 18.7');
     const flashNext = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: FLASH_NEXT_EXPOSITION }, now - 10_000, 3), { kind: "ok", text: later }, now, 4);
     const html = renderToStaticMarkup(<MonitorView state={flashNext} />);
     expect(html).toContain('aria-label="Expert residency"');
@@ -143,6 +144,10 @@ describe("MonitorView", () => {
     expect(html).toContain("gate_up_k4");
     // 2,999 of 3,000 down_k2 slots, both terms.
     expect(html).toContain("2,999");
+    // 0.1 s waited on demand copies over those 50 tokens and 10 s.
+    expect(html).toContain("Stall per token");
+    expect(html).toContain("2.0 ms");
+    expect(html).toContain("1.0%");
     expect(html).not.toContain("not in ADR 0017");
 
     const dense = applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2);

@@ -112,6 +112,7 @@ describe("deriveDashboard on a Flash-Next load", () => {
   second.experts!.hits.gate_up_k2.decode = 4900;
   second.experts!.misses.down_k3.decode = 400;
   second.experts!.bytesMoved = { decode: 6_040_000_000, prefill: 9_010_000_000 };
+  second.experts!.stall = { decode: 18.7, prefill: 40.25 };
   second.experts!.prefetchIssued = 920;
   second.experts!.prefetchUsed = 735;
   second.experts!.slots.gate_up_k4.inUse = 260;
@@ -129,6 +130,11 @@ describe("deriveDashboard on a Flash-Next load", () => {
     expect(experts.bytesPerSec).toBeCloseTo(5_000_000);
     expect(experts.bytesMoved).toEqual({ total: 15_050_000_000, window: 50_000_000 });
     expect(experts.prefetch).toEqual({ issued: { total: 920, window: 20 }, used: { total: 735, window: 15 } });
+    // 0.1 s of decode stall over 50 tokens and 10 s.
+    expect(experts.stallPerToken).toBeCloseTo(0.002);
+    expect(experts.stallShare).toBeCloseTo(0.01);
+    expect(experts.stall.total).toBeCloseTo(58.95);
+    expect(experts.stall.window).toBeCloseTo(0.1);
     const gateUpK4 = experts.classes.find((c) => c.cls === "gate_up_k4")!;
     expect(gateUpK4.slots).toMatchObject({ used: 260, capacity: 400, share: 0.65 });
     expect(gateUpK4.hits).toEqual({ total: 800, window: 0 });

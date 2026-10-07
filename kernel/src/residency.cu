@@ -7,7 +7,8 @@
 //                     the slot table and the demand copy jobs;
 //   resolve_prefetch  one CTA: place the lookahead's prefetches and their copy jobs -- on the
 //                     caller's stream in a whole step, on the prefetch stream in a split one;
-//   copy              a small grid copying the demand jobs from the mapped host pool;
+//   copy              a small grid copying the demand jobs from the mapped host pool, timing
+//                     itself into its phase's stall;
 //   copy              the same over the prefetch jobs, on the prefetch stream, beside the
 //                     expert op, after the demand copy.
 // Everything the resolve decides lives in device memory, so the host never waits on it.
@@ -53,6 +54,7 @@ static_assert(kMaxKeysPerLayer <= kThreads, "the resolve classifies one key per 
 constexpr uint32_t kNone = 0xFFFFFFFFu;
 constexpr uint32_t kKeyBits = 20;  // keys and slot indices fit below 2^20
 constexpr unsigned long long kNoSlot = ~0ull;
+constexpr unsigned long long kNoTime = ~0ull;  // no demand copy in flight
 constexpr uint8_t kPrefetched = 1;
 constexpr uint8_t kStaged = 2;
 constexpr uint32_t kLists = IGNIS_RESIDENCY_LISTS;
@@ -70,7 +72,7 @@ struct Counters {
   unsigned long long prefetch_issued;
   unsigned long long prefetch_used;
   unsigned long long bytes_moved[2];
-  unsigned long long stall_nanos;
+  unsigned long long stall_nanos[2];
 };
 static_assert(sizeof(Counters) == sizeof(ignis_residency_counters), "counters mirror the ABI");
 
@@ -100,6 +102,10 @@ struct State {
   uint32_t step_status;
   uint32_t step_count[kLists];
   unsigned long long step_moved;
+  // The demand copy in flight: its blocks' earliest start (kNoTime between copies) and how many
+  // blocks are done; its last block adds the span to the stall and resets both.
+  unsigned long long copy_start;
+  uint32_t copy_done;
 };
 
 // Everything the kernels read, by value.
@@ -457,7 +463,9 @@ __global__ void __launch_bounds__(kThreads)
     resolve_prefetch(Dev d, uint32_t layer, uint32_t phase, const int32_t *lookahead,
                      uint32_t rows, uint32_t stride) {
   __shared__ uint32_t s_pos[IGNIS_MOE_EXPERTS];
+  __shared__ uint32_t s_order[IGNIS_MOE_EXPERTS];  // a candidate expert's place in s_list / 2
   __shared__ uint32_t s_list[kMaxKeysPerLayer];
+  __shared__ uint8_t s_skip[kMaxKeysPerLayer];     // s_list[i] is resident or staged now
   __shared__ unsigned long long s_scratch[32];
   __shared__ uint32_t s_status, s_n_cand;
 
@@ -470,7 +478,7 @@ __global__ void __launch_bounds__(kThreads)
   uint32_t *entries =
       d.report_entries != nullptr ? d.report_entries + layer * kLists * 4 * d.experts : nullptr;
 
-  if (t < IGNIS_MOE_EXPERTS) s_pos[t] = kNone;
+  if (t < IGNIS_MOE_EXPERTS) s_pos[t] = s_order[t] = kNone;
   if (t == 0) s_status = s_n_cand = 0;
   __syncthreads();
 
@@ -500,21 +508,26 @@ __global__ void __launch_bounds__(kThreads)
   unsigned long long moved = 0;
   uint32_t n_prefetch = 0;
 
+  // Each candidate's place in rank order and, read all at once, whether its projections are
+  // resident or staged; the walk below keeps that exact, clearing a later candidate's flag when
+  // an earlier one evicts it.
   if (t < E && s_pos[t] != kNone) {
     uint32_t order = 0;
     for (uint32_t e = 0; e < E; ++e) order += s_pos[e] < s_pos[t];
-    s_list[2 * order] = (layer + 1) * nk + 2 * t;
-    s_list[2 * order + 1] = (layer + 1) * nk + 2 * t + 1;
+    s_order[t] = order;
+    for (uint32_t j = 0; j < 2; ++j) {
+      const uint32_t k = (layer + 1) * nk + 2 * t + j;
+      s_list[2 * order + j] = k;
+      s_skip[2 * order + j] = d.slot_of[k] >= 0 || (d.flags[k] & kStaged);
+    }
     atomicAdd(&s_n_cand, 1u);
   }
   __syncthreads();
   const uint32_t n_cand = 2 * s_n_cand;
   unsigned long long spent = 0;
   for (uint32_t i = 0; i < n_cand; ++i) {
+    if (s_skip[i]) continue;  // block-uniform: last written before a barrier
     const uint32_t k = s_list[i];
-    // Block-uniform reads: the entries were last written before a barrier.
-    const bool skip = d.slot_of[k] >= 0 || (d.flags[k] & kStaged);
-    if (skip) continue;
     const uint32_t kc = d.cls[k];
     const unsigned long long bytes = d.record_bytes[kc];
     if (decode && d.budget != IGNIS_RESIDENCY_NO_BUDGET && spent + bytes > d.budget) {
@@ -527,8 +540,13 @@ __global__ void __launch_bounds__(kThreads)
     if (decode || room) slot = find_slot(d, kc, now, decode, s_scratch);
     if (t == 0) {
       if (slot >= 0) {
+        const uint32_t old = d.owner[kc][slot];
         place(d, k, kc, slot, now, true, d.prefetch, &n_prefetch, entries, count);
         report_push(d, entries, kPrefetches, &count[kPrefetches], k);
+        // A later candidate it evicted is no longer resident at its turn.
+        if (old != kNone && old / nk == layer + 1 && s_order[(old % nk) >> 1] != kNone) {
+          s_skip[2 * s_order[(old % nk) >> 1] + (old & 1)] = 0;
+        }
       } else if (!decode) {
         stage(d, k, (layer + 1) & 1, layer + 1, d.prefetch, &n_prefetch);
         report_push(d, entries, kPrefetches, &count[kPrefetches], k | IGNIS_RESIDENCY_STAGING_BIT);
@@ -554,15 +572,43 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// Copies every queued job: all blocks walk the jobs in order and share each one.
-__global__ void copy_jobs(const Job *jobs, const uint32_t *n_jobs) {
-  const uint32_t n = *n_jobs;
+__device__ __forceinline__ unsigned long long globaltimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// All blocks walk the `n` jobs in order and share each one.
+__device__ void copy_all(const Job *jobs, uint32_t n) {
   const unsigned long long tid = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   const unsigned long long threads = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
   for (uint32_t j = 0; j < n; ++j) {
     const Job job = jobs[j];
     for (unsigned long long v = tid; v < job.vectors; v += threads) job.dst[v] = job.src[v];
   }
+}
+
+// Copies every queued job (the prefetch copy).
+__global__ void copy_jobs(const Job *jobs, const uint32_t *n_jobs) { copy_all(jobs, *n_jobs); }
+
+// The demand copy, what the expert op waits for: copies every queued job, then adds its device
+// time -- the earliest block's start to the last block's end -- to `*stall` and stores the new
+// total in `*mirror` too, when there is one. A copy with no job takes no time.
+__global__ void copy_jobs_timed(const Job *jobs, const uint32_t *n_jobs, State *st, unsigned long long *stall,
+                                unsigned long long *mirror) {
+  const uint32_t n = *n_jobs;
+  if (n == 0) return;
+  if (threadIdx.x == 0) atomicMin(&st->copy_start, globaltimer());
+  copy_all(jobs, n);
+  __syncthreads();
+  if (threadIdx.x != 0) return;
+  __threadfence();
+  if (atomicAdd(&st->copy_done, 1u) != gridDim.x - 1) return;
+  const unsigned long long start = atomicExch(&st->copy_start, kNoTime);
+  const unsigned long long total = *stall + (globaltimer() - start);
+  *stall = total;
+  if (mirror != nullptr) *mirror = total;
+  st->copy_done = 0;
 }
 
 // Each row's top `width` experts by BF16-rounded logit, ties to the lower id, best first: the
@@ -700,6 +746,21 @@ struct ignis_residency {
   ignis_residency_mirror *mirror_host = nullptr;  // registered by ignis_residency_set_mirror
 };
 
+namespace {
+
+// The step's demand copy on `s`, timed into its phase's stall (and the mirror's).
+int32_t demand_copy(ignis_residency *r, uint32_t phase, cudaStream_t s) {
+  auto *mirror = r->dev.mirror != nullptr
+                     ? reinterpret_cast<unsigned long long *>(&r->dev.mirror->counters.stall_nanos[phase])
+                     : nullptr;
+  copy_jobs_timed<<<r->desc.copy_blocks, 256, 0, s>>>(r->dev.demand, &r->dev.st->n_demand, r->dev.st,
+                                                &r->dev.counters->stall_nanos[phase], mirror);
+  RESIDENCY_CUDA(cudaGetLastError());
+  return 0;
+}
+
+}  // namespace
+
 extern "C" {
 
 int32_t ignis_residency_plan_bytes(const ignis_residency_desc *desc, ignis_residency_plan *plan) {
@@ -799,6 +860,7 @@ int32_t ignis_residency_create(const ignis_residency_desc *desc, const uint8_t *
   State state{};
   state.half_layer[0] = state.half_layer[1] = kNone;
   state.last_layer = kNone;
+  state.copy_start = kNoTime;
   std::memcpy(image.data() + r->layout.state, &state, sizeof(State));
   e = cudaMemcpy(r->tables, image.data(), image.size(), cudaMemcpyHostToDevice);
   if (e != cudaSuccess) return cleanup(fail(std::string("residency: initializing the tables: ") + cudaGetErrorString(e)));
@@ -970,8 +1032,7 @@ int32_t ignis_residency_step_ranked(ignis_residency *r, uint32_t layer, uint32_t
     resolve_prefetch<<<1, kThreads, 0, s>>>(r->dev, layer, phase, lookahead, rows, stride);
     RESIDENCY_CUDA(cudaGetLastError());
   }
-  copy_jobs<<<d.copy_blocks, 256, 0, s>>>(r->dev.demand, &r->dev.st->n_demand);
-  RESIDENCY_CUDA(cudaGetLastError());
+  if (demand_copy(r, phase, s) != 0) return -1;
   if (look) {
     RESIDENCY_CUDA(cudaEventRecord(r->fork, s));
     RESIDENCY_CUDA(cudaStreamWaitEvent(r->prefetch_stream, r->fork, 0));
@@ -1007,8 +1068,7 @@ int32_t ignis_residency_step_demand(ignis_residency *r, uint32_t layer, uint32_t
     r->forked = true;
     r->join_recorded = false;
   }
-  copy_jobs<<<d.copy_blocks, 256, 0, s>>>(r->dev.demand, &r->dev.st->n_demand);
-  RESIDENCY_CUDA(cudaGetLastError());
+  if (demand_copy(r, phase, s) != 0) return -1;
   if (look) {
     RESIDENCY_CUDA(cudaEventRecord(r->demanded, s));
     r->branch_open = true;

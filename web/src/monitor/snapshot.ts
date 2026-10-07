@@ -131,6 +131,8 @@ export type ExpertResidency = {
   prefetchIssued: number | null;
   prefetchUsed: number | null;
   bytesMoved: Record<ExpertPhase, number | null>;
+  /** Seconds the expert kernels waited on their demand copies (GitHub #306; null from a server that does not time them). */
+  stall: Record<ExpertPhase, number | null>;
   /** Slots per class: reserved at load, and holding a projection now (null from a server without occupancy). */
   slots: Record<ExpertClass, { capacity: number | null; inUse: number | null }>;
 };
@@ -207,6 +209,7 @@ const EXPERT_FAMILIES = {
   prefetchIssued: "ignis_expert_prefetches_issued_total",
   prefetchUsed: "ignis_expert_prefetches_used_total",
   bytesMoved: "ignis_expert_bytes_moved_total",
+  stall: "ignis_expert_residency_stall_seconds_total",
   slots: "ignis_expert_cache_slots",
 } as const;
 
@@ -335,6 +338,7 @@ export function readSnapshot({ families }: Exposition): Snapshot {
       prefetchIssued: valueOf(EXPERT_FAMILIES.prefetchIssued),
       prefetchUsed: valueOf(EXPERT_FAMILIES.prefetchUsed),
       bytesMoved: { decode: valueOf(EXPERT_FAMILIES.bytesMoved, ["phase", "decode"]), prefill: valueOf(EXPERT_FAMILIES.bytesMoved, ["phase", "prefill"]) },
+      stall: { decode: valueOf(EXPERT_FAMILIES.stall, ["phase", "decode"]), prefill: valueOf(EXPERT_FAMILIES.stall, ["phase", "prefill"]) },
       slots: Object.fromEntries(
         EXPERT_CLASSES.map((cls) => [
           cls,
@@ -403,6 +407,7 @@ function inContract(family: string, s: Sample): boolean {
     case EXPERT_FAMILIES.misses:
       return oneOf(EXPERT_CLASSES, s.labels.class) && oneOf(EXPERT_PHASES, s.labels.phase) && Object.keys(s.labels).length === 2;
     case EXPERT_FAMILIES.bytesMoved:
+    case EXPERT_FAMILIES.stall:
       return oneOf(EXPERT_PHASES, s.labels.phase) && Object.keys(s.labels).length === 1;
     case EXPERT_FAMILIES.slots:
       return oneOf(EXPERT_CLASSES, s.labels.class) && (s.labels.state === "capacity" || s.labels.state === "in_use") && Object.keys(s.labels).length === 2;
@@ -434,6 +439,7 @@ export function counterValues(s: Snapshot): (number | null)[] {
     s.experts?.prefetchIssued ?? null,
     s.experts?.prefetchUsed ?? null,
     ...EXPERT_PHASES.map((phase) => s.experts?.bytesMoved[phase] ?? null),
+    ...EXPERT_PHASES.map((phase) => s.experts?.stall[phase] ?? null),
     ...NGRAM_SOURCES.map((source) => s.ngram?.rows[source] ?? null),
     s.ngram?.reads ?? null,
     s.ngram?.readBytes ?? null,

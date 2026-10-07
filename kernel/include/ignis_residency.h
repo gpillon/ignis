@@ -166,14 +166,16 @@ int32_t ignis_residency_step_prefetch_ranked(struct ignis_residency *r, const in
 int32_t ignis_residency_join(struct ignis_residency *r, void *stream);
 
 /* What residency counted since creation, 1:1 with crates/core's ResidencyCounters; `[class]
- * [phase]`. Waits for residency's work. stall_nanos is not measured yet and stays 0. */
+ * [phase]`, `[phase]`. Waits for residency's work. `stall_nanos` is the device time of the
+ * demand copies -- what the expert op waits for -- from the first block's start to the last
+ * block's end, read off %globaltimer by the copy itself; a step with no miss adds nothing. */
 struct ignis_residency_counters {
   uint64_t hits[IGNIS_RESIDENCY_CLASSES][2];
   uint64_t misses[IGNIS_RESIDENCY_CLASSES][2];
   uint64_t prefetch_issued;
   uint64_t prefetch_used;
   uint64_t bytes_moved[2];
-  uint64_t stall_nanos;
+  uint64_t stall_nanos[2];
 };
 int32_t ignis_residency_read_counters(struct ignis_residency *r, struct ignis_residency_counters *out);
 
@@ -192,8 +194,9 @@ struct ignis_residency_mirror {
 /* Mirrors into `host`, which the caller owns and keeps past ignis_residency_free: the call
  * page-locks and maps it (free unregisters it) and fills it with what residency holds now, the
  * warm start included; from then on the last layer of every step that runs writes the totals
- * there, each 8-byte counter whole, so every value a reader sees only grows. A refused step
- * writes nothing. Only before the first step: a captured graph keeps the step's arguments. */
+ * there, and every demand copy its phase's stall, each 8-byte counter whole, so every value a
+ * reader sees only grows. A refused step writes nothing. Only before the first step: a captured
+ * graph keeps the step's arguments. */
 int32_t ignis_residency_set_mirror(struct ignis_residency *r, struct ignis_residency_mirror *host);
 
 /* The outcome of the last step of `layer` (needs `report` at creation; tests: a captured round

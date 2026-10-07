@@ -279,6 +279,24 @@ fn a_prefetch_never_evicts_the_current_step_and_is_dropped_when_nothing_else_can
 }
 
 #[test]
+fn a_candidate_an_earlier_prefetch_evicted_is_prefetched_again_at_its_turn() {
+    // GitHub #306: the device tests every candidate's residency at once and
+    // must keep this. The down pool holds three: layer 1's B (hotter) and A
+    // from the warm start, then this step's own miss. The lookahead ranks X
+    // before A; X's down evicts the least recent, A's, and A's down, no
+    // longer resident at its turn, is prefetched again in place of B's.
+    let (a, b, x) = (1, 2, 3);
+    let mut m = model(tight_downs(3), 2);
+    assert_eq!(m.warm_start(&[gate_up(1, b), down(1, b), gate_up(1, a), down(1, a)]), 4);
+    let lane: &[u16] = &[x, a];
+    let step = m.step(&LayerStep::decode(0, &[0]).lookahead(&[lane])).expect("step");
+    assert_eq!(step.evictions, vec![down(1, a), down(1, b)]);
+    let prefetched: Vec<_> = step.prefetches.iter().map(|&(id, _)| id).collect();
+    assert_eq!(prefetched, vec![down(1, a), gate_up(1, x), down(1, x)]);
+    assert!(m.is_resident(down(1, a)) && m.is_resident(gate_up(1, a)) && !m.is_resident(down(1, b)));
+}
+
+#[test]
 fn a_prefill_miss_takes_a_free_slot_first_then_the_staging_ring_and_never_evicts() {
     let mut m = model(tight_downs(3), 0);
     decode(&mut m, 0, &[0, 1]); // the decode working set: two downs
@@ -636,6 +654,6 @@ fn the_counters_count_hits_and_misses_by_class_and_phase_and_bytes_by_phase() {
     assert_eq!(c.prefetch_issued, 2);
     assert_eq!(c.prefetch_used, 2);
     assert_eq!(c.bytes_moved, [200 + 100 + 250 + 100, 300 + 100]);
-    assert_eq!(c.stall_nanos, 0);
+    assert_eq!(c.stall_nanos, [0, 0], "the model has no clock");
     assert_eq!(m.occupancy()[dn], 2);
 }
