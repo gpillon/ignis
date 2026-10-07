@@ -9,7 +9,9 @@
 //! thin wrapper over it) that records the call shape behind the `Compute`
 //! seam.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use ignis_core::types::{
@@ -17,7 +19,7 @@ use ignis_core::types::{
     SchedEvent,
 };
 use ignis_core::{
-    ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig, resolve_serving_chunk_tokens,
+    Clock, ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig, resolve_serving_chunk_tokens,
 };
 
 fn input(tokens: &[u32], max_tokens: u32) -> RequestInput {
@@ -479,4 +481,119 @@ fn resolve_serving_chunk_tokens_allows_narrowing_and_refuses_widening() {
         err.contains("1024"),
         "the refusal must name the load width: {err}"
     );
+}
+
+/// A `Compute` whose calls take time on a hand-driven clock -- a chunk
+/// `prefill_ms`, a round `decode_ms` -- and that records the call order: `P`
+/// for a prefill call, `D` for a decode round.
+struct TimedCompute {
+    inner: MockCompute,
+    elapsed_ms: Arc<AtomicU64>,
+    prefill_ms: u64,
+    decode_ms: u64,
+    calls: Mutex<String>,
+}
+
+impl Compute for TimedCompute {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        self.elapsed_ms.fetch_add(self.prefill_ms, Ordering::SeqCst);
+        self.calls.lock().unwrap().push('P');
+        self.inner.prefill_step(jobs)
+    }
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.elapsed_ms.fetch_add(self.decode_ms, Ordering::SeqCst);
+        self.calls.lock().unwrap().push('D');
+        self.inner.decode_step(jobs)
+    }
+}
+
+/// A scheduler at a 4-token chunk width and `decode_share`, over a backend
+/// whose chunk takes 1000 ms and whose round takes 10 ms of its own clock.
+fn timed_sched(decode_share: f64) -> (ConcreteScheduler, Arc<TimedCompute>) {
+    let elapsed_ms = Arc::new(AtomicU64::new(0));
+    let compute = Arc::new(TimedCompute {
+        inner: MockCompute::new(),
+        elapsed_ms: elapsed_ms.clone(),
+        prefill_ms: 1000,
+        decode_ms: 10,
+        calls: Mutex::new(String::new()),
+    });
+    let base = Instant::now();
+    let clock: Clock = Arc::new(move || base + Duration::from_millis(elapsed_ms.load(Ordering::SeqCst)));
+    let sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            serving_chunk_tokens: 4,
+            decode_share,
+            ..SchedulerConfig::default()
+        },
+        compute.clone(),
+    )
+    .with_clock(clock);
+    (sched, compute)
+}
+
+#[test]
+fn a_decode_share_holds_the_next_chunk_until_the_decoding_lanes_have_had_their_share() {
+    // GitHub #306: a Flash-Next chunk runs for seconds, so one decode round
+    // per chunk starves the other lanes. At a share of one half, every
+    // 1000 ms chunk is followed by 1000 ms of 10 ms rounds before the next
+    // chunk: 100 rounds, the one in the chunk's own advance included.
+    let (mut sched, compute) = timed_sched(0.5);
+    let filler = sched.submit(input(&[1], 1000), RequestClass::Agent).unwrap();
+    sched.advance();
+    assert_eq!(sched.request_state(filler), Some(RequestState::Running));
+    let long = sched
+        .submit(input(&(1..=16).collect::<Vec<_>>(), 1), RequestClass::Agent)
+        .unwrap();
+    while sched.request_state(long) != Some(RequestState::Done) {
+        sched.advance();
+    }
+
+    let calls = compute.calls.lock().unwrap().clone();
+    let between: Vec<usize> = calls.split('P').map(str::len).collect();
+    // The filler's chunk, then the long prompt's four: four holds between
+    // five chunks.
+    assert_eq!(between.len(), 6, "{calls}");
+    assert_eq!(&between[1..5], &[100, 100, 100, 100], "rounds between chunks: {calls}");
+}
+
+#[test]
+fn a_decode_share_holds_nothing_while_no_lane_decodes() {
+    // With nobody decoding there is no one to give time to: the chunks run
+    // back to back, as they do without a share.
+    let (mut sched, compute) = timed_sched(0.5);
+    let long = sched
+        .submit(input(&(1..=16).collect::<Vec<_>>(), 1), RequestClass::Agent)
+        .unwrap();
+    let mut advances = 0;
+    while sched.request_state(long) != Some(RequestState::Done) {
+        sched.advance();
+        advances += 1;
+    }
+    assert_eq!(advances, 4, "one chunk per advance");
+    assert!(compute.calls.lock().unwrap().starts_with("PPPP"));
+}
+
+#[test]
+fn without_a_decode_share_a_chunk_still_gets_exactly_one_round() {
+    // The default (ADR 0018's K = 1) is unchanged: one round per chunk.
+    let (mut sched, compute) = timed_sched(0.0);
+    sched.submit(input(&[1], 1000), RequestClass::Agent).unwrap();
+    sched.advance();
+    let long = sched
+        .submit(input(&(1..=16).collect::<Vec<_>>(), 1), RequestClass::Agent)
+        .unwrap();
+    while sched.request_state(long) != Some(RequestState::Done) {
+        sched.advance();
+    }
+    let calls = compute.calls.lock().unwrap().clone();
+    assert!(calls.starts_with("PDPDPDPDPD"), "{calls}");
+}
+
+#[test]
+#[should_panic(expected = "decode share")]
+fn a_decode_share_of_one_is_refused() {
+    // A share of 1 would hold every chunk for as long as any lane decodes.
+    timed_sched(1.0);
 }

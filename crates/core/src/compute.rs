@@ -784,6 +784,17 @@ impl ModelFamily {
         }
     }
 
+    /// The percent of the model's time decoding lanes keep while a prompt
+    /// prefills, unless the operator names one (`--decode-share`, GitHub
+    /// #306): 0 on the 27B, whose ~110 ms chunk takes one round's turn (ADR
+    /// 0018); half on Flash-Next, whose 8192-token chunk runs ~7 s.
+    pub fn default_decode_share_percent(self) -> u32 {
+        match self {
+            ModelFamily::Qwen38_27b => 0,
+            ModelFamily::FlashNext => 50,
+        }
+    }
+
     /// The `model_id` of this family's artifacts, and the id it is served
     /// under by default.
     pub fn model_id(self) -> &'static str {

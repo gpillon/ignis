@@ -73,11 +73,6 @@ impl MtpHead {
     pub fn plan(&self) -> &mtp::MtpPlan {
         &self.plan
     }
-
-    /// The device bytes its weights hold: the VRAM plan's line.
-    pub fn device_bytes(&self) -> u64 {
-        self.plan.plan.device_capacity_bytes
-    }
 }
 
 impl Drop for MtpHead {

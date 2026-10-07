@@ -967,6 +967,20 @@ mod tests {
         assert!(err.contains("does not run this geometry (its weights bind)"), "{err}");
     }
 
+    /// `ffi::IgnisMoeSlot` mirrors `struct ignis_moe_slot` by hand
+    /// (`kernel/include/ignis_moe.h`: `const void *record; uint32_t k2;
+    /// uint32_t reserved`); the leaf indexes a host table of them, so the
+    /// size, alignment and field offsets are pinned to the C struct's.
+    #[test]
+    fn the_moe_slot_mirror_has_the_c_structs_layout() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<ffi::IgnisMoeSlot>(), 2 * size_of::<usize>());
+        assert_eq!(align_of::<ffi::IgnisMoeSlot>(), align_of::<usize>());
+        assert_eq!(offset_of!(ffi::IgnisMoeSlot, record), 0);
+        assert_eq!(offset_of!(ffi::IgnisMoeSlot, k2), size_of::<usize>());
+        assert_eq!(offset_of!(ffi::IgnisMoeSlot, reserved), size_of::<usize>() + 4);
+    }
+
     #[test]
     fn validate_prefill_config_accepts_the_default_chunk() {
         assert!(validate_prefill_config(1024, 4096).is_ok());

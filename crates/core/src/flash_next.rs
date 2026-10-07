@@ -590,6 +590,7 @@ impl FlashNextEngine {
         }
         let mut out = vec![Vec::with_capacity(count); prompts.len()];
         let mut rounds = Vec::new();
+        let mut proposals = Vec::new();
         let mut times = Vec::new();
         let context_tokens = self.table.new_context().recent().len();
         let mtp = speculation.backend() == SpeculativeBackend::Mtp;
@@ -691,8 +692,9 @@ impl FlashNextEngine {
             }
             times.push(began.elapsed());
             rounds.push(round);
+            proposals.push(active.iter().map(|&i| head_drafts[i].clone()).collect());
         }
-        Ok(SpeculativeRun { tokens: out, rounds, times, sequences: seqs, contexts })
+        Ok(SpeculativeRun { tokens: out, rounds, head_drafts: proposals, times, sequences: seqs, contexts })
     }
 
     /// The logits after one more token on a sequence `generate_speculative`
@@ -737,6 +739,10 @@ pub struct LaneRound {
 pub struct SpeculativeRun<'p> {
     pub tokens: Vec<Vec<u32>>,
     pub rounds: Vec<Vec<LaneRound>>,
+    /// Every round's lanes' drafts the MTP head made for their next round,
+    /// whether or not a drafter overrides them (empty after a one-token round
+    /// and on a verify-only load).
+    pub head_drafts: Vec<Vec<Vec<u32>>>,
     pub times: Vec<std::time::Duration>,
     pub sequences: Vec<crate::seq::Seq<'p>>,
     pub contexts: Vec<NgramContext>,

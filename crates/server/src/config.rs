@@ -122,6 +122,10 @@ pub struct Config {
     /// The prefill chunk width, in tokens (a nonzero multiple of
     /// [`PREFILL_CHUNK_ALIGNMENT`]).
     pub prefill_chunk: u32,
+    /// The **decode share** (`--decode-share` / `IGNIS_DECODE_SHARE`, GitHub
+    /// #306): the percent of the model's time decoding lanes keep while a
+    /// prompt prefills, 0-99. `None`: the model family's own.
+    pub decode_share_percent: Option<u32>,
     /// The maximum per-sequence context, in tokens (the largest prompt +
     /// generation budget a single request may reserve).
     pub max_context: u32,
@@ -372,6 +376,7 @@ pub fn resolve(
     let mut reasoning_effort = None;
     let mut thinking_budget = None;
     let mut prefill_chunk = None;
+    let mut decode_share = None;
     let mut max_context = None;
     let mut kv_format = None;
     let mut kv_pool_bytes = None;
@@ -420,6 +425,7 @@ pub fn resolve(
             "--reasoning-effort" => reasoning_effort = Some(take_value(args, &mut i, flag)?),
             "--thinking-budget" => thinking_budget = Some(take_value(args, &mut i, flag)?),
             "--prefill-chunk" => prefill_chunk = Some(take_value(args, &mut i, flag)?),
+            "--decode-share" => decode_share = Some(take_value(args, &mut i, flag)?),
             "--max-context" => max_context = Some(take_value(args, &mut i, flag)?),
             "--kv-format" => kv_format = Some(take_value(args, &mut i, flag)?),
             "--kv-pool-bytes" => kv_pool_bytes = Some(take_value(args, &mut i, flag)?),
@@ -502,6 +508,7 @@ pub fn resolve(
     // unaligned chunk width is a usage error, never a failure discovered
     // after a ~19 GB weight upload.
     let prefill_chunk = resolve_prefill_chunk(prefill_chunk, &env)?;
+    let decode_share_percent = resolve_decode_share(decode_share, &env)?;
     let max_context = resolve_max_context(max_context, &env)?;
     // The format is resolved before the budget, because what a budget is
     // worth in tokens — and so what the auto default has to be — depends on
@@ -647,6 +654,7 @@ pub fn resolve(
         reasoning_effort,
         thinking_budget,
         prefill_chunk,
+        decode_share_percent,
         max_context,
         kv_format,
         kv_pool_bytes,
@@ -1029,6 +1037,23 @@ fn resolve_prefill_chunk(
     Ok(chunk)
 }
 
+/// `--decode-share` / `IGNIS_DECODE_SHARE` (GitHub #306): a percent below
+/// 100, or `None` for the model family's own.
+fn resolve_decode_share(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<u32>, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_DECODE_SHARE"))) else {
+        return Ok(None);
+    };
+    match parse_count("--decode-share", "percent", &raw)? {
+        percent @ 0..=99 => Ok(Some(percent)),
+        percent => Err(ConfigError(format!(
+            "`--decode-share` is a percent below 100, got {percent}"
+        ))),
+    }
+}
+
 /// `--max-context` / `IGNIS_MAX_CONTEXT` / [`DEFAULT_MAX_CONTEXT`].
 fn resolve_max_context(
     flag: Option<String>,
@@ -1378,6 +1403,7 @@ fn help_text() -> String {
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --thinking-budget <n|off> env: IGNIS_THINKING_BUDGET  (default: {DEFAULT_THINKING_BUDGET}; reasoning tokens before the model's close is forced, off = no budget; a request's thinking_budget overrides it, 0 = none)\n\
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
+         \x20       --decode-share <percent>  env: IGNIS_DECODE_SHARE   (default: the model's, 0 on the 27B; the percent of the time decoding lanes keep while a prompt prefills, 0-99)\n\
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
          \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: the rest of the VRAM budget; accepts a K/M/G suffix)\n\
@@ -1732,6 +1758,22 @@ mod tests {
         let config = expect_config(resolve(&a, env).expect("resolve"));
         assert_eq!(config.prefill_chunk, 128, "flag must win over env");
         assert_eq!(config.max_context, 8_192, "flag must win over env");
+    }
+
+    #[test]
+    fn the_decode_share_is_a_percent_below_100_and_unset_by_default() {
+        // GitHub #306: unset, the model family's own (`EngineShape::for_family`).
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.decode_share_percent, None);
+        let config = expect_config(resolve(&args(&["--decode-share", "50"]), no_env).expect("resolve"));
+        assert_eq!(config.decode_share_percent, Some(50));
+        let env = env_map(&[("IGNIS_DECODE_SHARE", "0")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.decode_share_percent, Some(0), "0 is ADR 0018's one round per chunk");
+        for bad in ["100", "150", "-1", "0.5", "half"] {
+            let err = resolve(&args(&["--decode-share", bad]), no_env).expect_err(bad);
+            assert!(err.0.contains("--decode-share"), "{bad}: {err}");
+        }
     }
 
     #[test]

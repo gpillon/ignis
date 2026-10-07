@@ -26,6 +26,12 @@
 //! reads them back from the residual ring, so there it is held to the
 //! near-tie rule instead.
 //!
+//! The MTP head's drafts obey the same rule: its alignment runs over all
+//! k + 1 columns, the rejected ones included, and leaves rows in the head's
+//! own section (its hq ring slots, its indexer tail) that its chain steps
+//! past the frontier must not read, so none and reject leave the head
+//! proposing the same drafts bit for bit, in both KV formats.
+//!
 //! Spec-on against spec-off (one-token rounds, the plain decode graphs) is
 //! held to the near-tie rule: the verify pass runs k + 1 columns per lane
 //! through other kernel shapes (attention splits, the indexer's prefill
@@ -61,6 +67,10 @@ fn engine(kv_format: KvFormat) -> Option<FlashNextEngine> {
 }
 
 fn engine_with(kv_format: KvFormat, backend: SpeculativeBackend) -> Option<FlashNextEngine> {
+    engine_with_context(kv_format, backend, 8192)
+}
+
+fn engine_with_context(kv_format: KvFormat, backend: SpeculativeBackend, max_context_tokens: u32) -> Option<FlashNextEngine> {
     let dir = model_dir();
     if !dir.join(ARTIFACT_FILE_NAME).exists() {
         gpu_profile::skip_or_fail(&format!("no Flash-Next artifact in {}", dir.display()));
@@ -72,7 +82,7 @@ fn engine_with(kv_format: KvFormat, backend: SpeculativeBackend) -> Option<Flash
     }
     let speculation = FlashNextSpeculation::new(backend, DRAFT_TOKENS, 0).expect("valid");
     let options =
-        EngineOptions { max_context_tokens: 8192, kv_format, speculation: Some(speculation), ..EngineOptions::default() };
+        EngineOptions { max_context_tokens, kv_format, speculation: Some(speculation), ..EngineOptions::default() };
     match FlashNextEngine::load(&dir, options) {
         Ok(engine) => Some(engine),
         Err(e) => {
@@ -87,6 +97,18 @@ fn engine_with(kv_format: KvFormat, backend: SpeculativeBackend) -> Option<Flash
 /// its verify pass and commit graphs.
 fn every_width_verifies() -> u32 {
     (1u32 << ignis_core::flash_next::DEFAULT_DECODE_LANES) - 1
+}
+
+/// The first `len` tokens of reference set `set` (real text), or None with a
+/// skip.
+fn reference(set: &str, len: usize) -> Option<Vec<u32>> {
+    let path = model_dir().join("references").join(set).join("tokens.u32");
+    let Ok(bytes) = std::fs::read(&path) else {
+        gpu_profile::skip_or_fail(&format!("no reference tokens at {}", path.display()));
+        return None;
+    };
+    let tokens: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    Some(tokens.get(..len).expect("the reference set holds the prompt").to_vec())
 }
 
 /// The converter's G1 prompts (real text), or None with a skip.
@@ -347,5 +369,84 @@ fn the_mtp_head_drafts_and_the_text_is_kept() {
             assert_near_tie(&mut engine, &prompts, &off, &head.tokens, &format!("{what} spec-on vs spec-off"));
         }
         drop(engine);
+    }
+}
+
+/// GitHub #307 (2c87e4c): the last prefill chunk's draw block has its own
+/// arena scope, so the MTP head's entries after it reuse the arena within the
+/// prefill scratch the plan sized (the arena is exactly that size and throws
+/// past it). The load is cut to a long hq prompt of whole chunks, so the last
+/// chunk is exactly the plan's chunk size and the head's attention peaks at
+/// nearly the plan's attention term, the case the draw block's 16 MiB would
+/// stack on. Measured on the real artifact at this size (arena peak after the
+/// last chunk, plan 323_309_568): 305_332_224 without the scope, so the
+/// scope's margin here is the 18 MB the plan keeps over the head's own peak,
+/// and this guard does not go red without 2c87e4c; it holds the full-chunk
+/// MTP prefill inside the plan (a bad_alloc fails the generate).
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact and its MTP companion"]
+fn the_mtp_heads_entries_after_a_full_chunks_draw_fit_the_planned_arena() {
+    let Some(g1) = g1_prompts() else { return };
+    let chunk = EngineOptions::default().prefill_chunk_tokens as usize;
+    let prompt_tokens = 40 * chunk;
+    // A page (64) multiple past the prompt: room for the generated tokens.
+    let Some(engine) =
+        engine_with_context(KvFormat::HqE8_2b, SpeculativeBackend::Mtp, (prompt_tokens + 2 * 64) as u32)
+    else {
+        return;
+    };
+    assert_eq!(engine.options().prefill_chunk_tokens as usize, chunk);
+    let mut prompt = Vec::new();
+    while prompt.len() < prompt_tokens {
+        for p in &g1 {
+            prompt.extend_from_slice(p);
+        }
+    }
+    prompt.truncate(prompt_tokens);
+    let head = run(&engine, &[prompt], None);
+    assert_eq!(head.tokens[0].len(), TOKENS, "the full-chunk prompt generated through the head");
+}
+
+/// GitHub #307: the MTP head drafts from the committed text only. A verify
+/// round's head writes its alignment at every column; under hq-e8-2b a
+/// chain step at q read the rejected columns' ring rows as positions
+/// q - 512 + i (a ring slot carries no position), and in both formats it
+/// pooled a block from the alignment's indexer tail. Two drafters that commit
+/// the same text -- none (extent 0) and reject (every draft rejected) -- must
+/// leave the head proposing the same drafts, bit for bit, every round. The
+/// prompts are past the ring (1,536 tokens, dense: every visible row read)
+/// and past the dense threshold (3,072, the indexer's sparse selection).
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact and its MTP companion"]
+fn the_heads_drafts_never_read_a_rejected_column() {
+    const HEAD_TOKENS: usize = 64;
+    let (Some(dense), Some(sparse)) = (reference("test2048", 1536), reference("long8192", 3072)) else { return };
+    for kv_format in [KvFormat::HqE8_2b, KvFormat::Bf16] {
+        let Some(engine) = engine_with(kv_format, SpeculativeBackend::Mtp) else { return };
+        for (prompt, what) in [(&dense, "dense, 1536 tokens"), (&sparse, "sparse, 3072 tokens")] {
+            let what = format!("{kv_format:?} {what}");
+            let prompts = vec![prompt.clone()];
+            let mut none = |_: usize, _: &[u32], _: u32| Vec::new();
+            let mut reject = |_: usize, _: &[u32], window: u32| vec![REJECTED; window as usize];
+            let a = engine
+                .generate_speculative(&prompts, HEAD_TOKENS, Some(&mut none))
+                .unwrap_or_else(|e| panic!("{what}: none: {e}"));
+            let b = engine
+                .generate_speculative(&prompts, HEAD_TOKENS, Some(&mut reject))
+                .unwrap_or_else(|e| panic!("{what}: reject: {e}"));
+            assert_eq!(a.tokens, b.tokens, "{what}: none and reject committed different text");
+            assert!(a.rounds.iter().chain(&b.rounds).flatten().all(|l| l.committed == 1), "{what}: a round committed a draft");
+            assert!(a.head_drafts.iter().flatten().all(|d| d.len() == DRAFT_TOKENS as usize), "{what}: a round made no drafts");
+            let differ: Vec<usize> = (0..a.head_drafts.len()).filter(|&r| a.head_drafts[r] != b.head_drafts[r]).collect();
+            assert!(
+                differ.is_empty(),
+                "{what}: the head drafted differently after {} of {} rounds (first at round {}: {:?} vs {:?})",
+                differ.len(),
+                a.head_drafts.len(),
+                differ[0],
+                a.head_drafts[differ[0]],
+                b.head_drafts[differ[0]]
+            );
+        }
     }
 }

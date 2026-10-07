@@ -36,8 +36,9 @@ use crate::ngram::{
 /// The RAM the hot-row cache may take, its index included (spec 04's
 /// default).
 pub const DEFAULT_HOT_BYTES: u64 = 1 << 30;
-/// Worker threads issuing the table's reads.
-pub const DEFAULT_READ_THREADS: usize = 4;
+/// Worker threads issuing the table's reads: the queue depth a prefill
+/// chunk's tens of thousands of row reads get from the NVMe (GitHub #306).
+pub const DEFAULT_READ_THREADS: usize = 16;
 /// The longest read a step issues: rows whose sectors touch share one up to
 /// this.
 pub const DEFAULT_MAX_READ_BYTES: u64 = 64 << 10;
@@ -571,6 +572,14 @@ mod tests {
 
     fn options(hot_bytes: u64) -> NgramTableOptions {
         NgramTableOptions { hot_bytes, ..NgramTableOptions::default() }
+    }
+
+    #[test]
+    fn a_default_table_reads_with_sixteen_threads() {
+        // GitHub #306: an 8192-token Flash-Next chunk gathers ~46K file reads
+        // before the card can start; four readers took ~1.2 s of it with the
+        // GPU idle, sixteen take the chunk's TTFT from 3.7 to 2.9 s.
+        assert_eq!(NgramTableOptions::default().read_threads, 16);
     }
 
     #[test]

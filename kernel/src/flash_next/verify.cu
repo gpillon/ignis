@@ -199,6 +199,7 @@ struct RestoreArgs {
   int32_t lanes;
   int32_t columns;       // this width's k + 1: the recorded keys' columns per lane
   int32_t ring_columns;  // the positions its saved ring rows cover
+  int32_t layer_base;    // the first attention section restored
   int32_t row_columns;
   int32_t tail_elements;
   int32_t ngram_columns;
@@ -209,7 +210,7 @@ struct RestoreArgs {
 // f = p + c holds the raw keys of [f / compress * compress, f): the saved tail's below p, the
 // call's recorded keys from p on.
 __global__ void restore_tails_kernel(RestoreArgs a) {
-  const int32_t layer = static_cast<int32_t>(blockIdx.x);
+  const int32_t layer = a.layer_base + static_cast<int32_t>(blockIdx.x);
   const int32_t lane = static_cast<int32_t>(blockIdx.y);
   const int32_t d = static_cast<int32_t>(threadIdx.x);
   if (d >= a.key_dim) return;
@@ -264,7 +265,7 @@ __global__ void restore_ring_kernel(RestoreArgs a) {
     }
     a.s.ring[static_cast<int64_t>(slot) * kRingWords + word] = bits;
   }
-  const int32_t layer = unit / (a.ring_columns * 2);
+  const int32_t layer = a.layer_base + unit / (a.ring_columns * 2);
   const int32_t column = (unit / 2) % a.ring_columns;
   if (column < c) return;
   const bool role_v = (unit & 1) != 0;
@@ -401,6 +402,37 @@ __global__ void __launch_bounds__(ninfer::ops::kWarpSize *gd::kNumWarps, 2) fold
   gd::recurrent_bf16_body<gd::RecurrentMode::Fold, true>(access, coord, args.width, access.active_columns(coord));
 }
 
+// What the restore kernels read, for sections [layer_base, ...) and ring rows over `ring_columns`
+// positions past each lane's frontier.
+RestoreArgs restore_args(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes,
+                         uint32_t window, const int32_t *slots, const int32_t *positions, int32_t ring_columns,
+                         int32_t layer_base) {
+  const uint32_t row_columns = max_ring_columns_of(state.lanes, state.draft_tokens, state.row_budget, state.mtp);
+  const SavedLayout layout = saved_layout(g, sections.ring != nullptr ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16,
+                                          state.lanes, row_columns, sections.attention_layers);
+  const auto *saved = static_cast<const unsigned char *>(state.saved->p);
+  return RestoreArgs{sections,
+                     slots,
+                     positions,
+                     static_cast<const int32_t *>(state.commit->p),
+                     reinterpret_cast<const __nv_bfloat16 *>(saved),
+                     reinterpret_cast<const __nv_bfloat16 *>(saved + layout.tails),
+                     reinterpret_cast<const uint32_t *>(saved + layout.tails + layout.ngram),
+                     reinterpret_cast<const __nv_bfloat16 *>(saved + layout.tails + layout.ngram + layout.words),
+                     static_cast<const __nv_bfloat16 *>(state.records.indexer_keys),
+                     static_cast<int64_t>(state.records.indexer_layer_bytes / sizeof(__nv_bfloat16)),
+                     g.indexer_head_dim,
+                     g.compress_ratio,
+                     static_cast<int32_t>(lanes),
+                     static_cast<int32_t>(window + 1),
+                     ring_columns,
+                     layer_base,
+                     static_cast<int32_t>(row_columns),
+                     layout.tail_elements,
+                     sections.ngram_columns,
+                     sections.ngram_channels};
+}
+
 bool launched(const char *what, std::string *error) {
   const cudaError_t err = cudaGetLastError();
   if (err == cudaSuccess) return true;
@@ -475,8 +507,7 @@ State::~State() {
 }
 
 std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
-                    int32_t attention_layers, int32_t gdn_layers, bool mtp) {
-  (void)mtp;
+                    int32_t attention_layers, int32_t gdn_layers) {
   if (draft_tokens == 0 || draft_tokens > kMaxWindow) {
     return "a draft window of " + std::to_string(draft_tokens) + " tokens (1.." + std::to_string(kMaxWindow) + ")";
   }
@@ -507,7 +538,7 @@ std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, ui
 std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens,
                               uint32_t row_budget, int32_t attention_layers, int32_t gdn_layers, bool mtp,
                               std::string *error) {
-  if (std::string why = refusal(g, lanes, draft_tokens, row_budget, attention_layers, gdn_layers, mtp);
+  if (std::string why = refusal(g, lanes, draft_tokens, row_budget, attention_layers, gdn_layers);
       !why.empty()) {
     *error = why;
     return nullptr;
@@ -692,31 +723,9 @@ int32_t fold(const State &state, const Sections &sections, uint32_t lanes, uint3
 
 int32_t restore(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
                 const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
-  const uint32_t row_columns = max_ring_columns_of(state.lanes, state.draft_tokens, state.row_budget, state.mtp);
-  const SavedLayout layout = saved_layout(g, sections.ring != nullptr ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16,
-                                          state.lanes, row_columns, sections.attention_layers);
-  const auto *saved = static_cast<const unsigned char *>(state.saved->p);
   const auto n = static_cast<unsigned>(lanes);
   const auto ring_columns = static_cast<int32_t>(written_positions(window, state.mtp));
-  RestoreArgs r{sections,
-                slots,
-                positions,
-                static_cast<const int32_t *>(state.commit->p),
-                reinterpret_cast<const __nv_bfloat16 *>(saved),
-                reinterpret_cast<const __nv_bfloat16 *>(saved + layout.tails),
-                reinterpret_cast<const uint32_t *>(saved + layout.tails + layout.ngram),
-                reinterpret_cast<const __nv_bfloat16 *>(saved + layout.tails + layout.ngram + layout.words),
-                static_cast<const __nv_bfloat16 *>(state.records.indexer_keys),
-                static_cast<int64_t>(state.records.indexer_layer_bytes / sizeof(__nv_bfloat16)),
-                g.indexer_head_dim,
-                g.compress_ratio,
-                static_cast<int32_t>(lanes),
-                static_cast<int32_t>(window + 1),
-                ring_columns,
-                static_cast<int32_t>(row_columns),
-                layout.tail_elements,
-                sections.ngram_columns,
-                sections.ngram_channels};
+  const RestoreArgs r = restore_args(state, sections, g, lanes, window, slots, positions, ring_columns, 0);
   restore_tails_kernel<<<dim3(static_cast<unsigned>(sections.attention_layers), n), static_cast<unsigned>(g.indexer_head_dim), 0,
                          stream>>>(r);
   if (!launched("verify commit: indexer tails", error)) return -1;
@@ -727,6 +736,25 @@ int32_t restore(const State &state, const Sections &sections, const Geometry &g,
     const auto units = static_cast<unsigned>(sections.attention_layers * ring_columns * 2);
     restore_ring_kernel<<<dim3(units, n), RingGeometry::KVHeads * 32, 0, stream>>>(r);
     if (!launched("verify commit: hq ring", error)) return -1;
+  }
+  return 0;
+}
+
+int32_t restore_head(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
+                     const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
+  if (!state.mtp) {
+    *error = "verify restore_head: this load has no MTP head";
+    return -1;
+  }
+  const auto n = static_cast<unsigned>(lanes);
+  const auto columns = static_cast<int32_t>(window + 1);
+  const RestoreArgs r = restore_args(state, sections, g, lanes, window, slots, positions, columns,
+                                     sections.attention_layers - 1);
+  restore_tails_kernel<<<dim3(1, n), static_cast<unsigned>(g.indexer_head_dim), 0, stream>>>(r);
+  if (!launched("verify drafting: the head's indexer tail", error)) return -1;
+  if (sections.ring != nullptr) {
+    restore_ring_kernel<<<dim3(static_cast<unsigned>(columns * 2), n), RingGeometry::KVHeads * 32, 0, stream>>>(r);
+    if (!launched("verify drafting: the head's hq ring", error)) return -1;
   }
   return 0;
 }

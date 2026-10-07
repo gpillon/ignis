@@ -33,6 +33,7 @@
 #include "ignis_fn_residual_tap.h"
 #include "ignis_fp8_linear.h"
 #include "ignis_seq_internal.h"
+#include "../moe_common.cuh"
 #include "../permitted_tokens.h"
 #include "../step_internal.h"
 
@@ -505,7 +506,7 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
   // Spec flash-next/07: the verify round, with a test's drafts (VERIFY_ONLY) or the MTP head's.
   if (fn->speculative_backend != IGNIS_SPECULATIVE_NONE) {
     if (const std::string why = verify::refusal(fn->g, fn->decode_lanes, fn->draft_tokens, fn->draft_row_budget,
-                                                attention_sections(*fn), gdn_layers(*fn), mtp);
+                                                attention_sections(*fn), gdn_layers(*fn));
         !why.empty()) {
       *error = "Qwen3.8-Flash-Next's verify round: " + why;
       return nullptr;
@@ -656,7 +657,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     }
     for (std::size_t i = 0; i < fn.mtp_slot_table.size(); ++i) {
       const ignis_moe_slot &slot = fn.mtp_slot_table[i];
-      if (slot.record == nullptr || (slot.k2 != 4 && slot.k2 != 5 && slot.k2 != 6 && slot.k2 != 8)) {
+      if (slot.record == nullptr || !ignis_moe::valid_k2(slot.k2)) {
         *error = "the MTP head's expert slot " + std::to_string(i) + " names no record or no K class";
         return -1;
       }

@@ -200,6 +200,12 @@ pub struct SchedulerConfig {
     /// the load width. No adaptive policy: fixed for the scheduler's
     /// lifetime.
     pub serving_chunk_tokens: u32,
+    /// The **decode share** (GitHub #306): the part of the model's time the
+    /// decoding lanes keep while a prompt prefills. After a chunk that took
+    /// `t`, the next chunk waits until they have decoded for
+    /// `t * share / (1 - share)`, unless no lane is decoding, when it runs at
+    /// once. 0 is ADR 0018's one decode round per chunk; it must be below 1.
+    pub decode_share: f64,
     /// Cross-request state reuse (GitHub #186, ADR 0029; the operator's
     /// `--prompt-reuse`). On by default. Off means exactly nothing happens:
     /// no request captures a prompt checkpoint and none claims one, so a cold
@@ -382,6 +388,7 @@ impl Default for SchedulerConfig {
             // byte flag rather than this default.
             host_capacity_bytes: (N_DECODE_LANES * (8192 / 16)) as u64,
             serving_chunk_tokens: DEFAULT_SERVING_CHUNK_TOKENS,
+            decode_share: 0.0,
             // GitHub #186: on by default (ADR 0029), with a slot per lane -- a
             // fixed test default, not the server's (`--retained-device` and
             // `--retained-host`, GitHub #281). A test that wants exhaustion
@@ -456,8 +463,11 @@ pub struct ConcreteScheduler {
     /// pool (GitHub #215), by publisher: charged to `kv_used_pages` at
     /// capture, given back with the image.
     tail_pages: Vec<RequestId>,
-    /// Wall time, for retained state's idle age (GitHub #190).
+    /// Wall time, for retained state's idle age (GitHub #190) and the
+    /// decode share's hold (GitHub #306).
     clock: Clock,
+    /// Until when the decode share holds the next prefill chunk (GitHub #306).
+    prefill_held_until: Option<Instant>,
 }
 
 impl ConcreteScheduler {
@@ -497,6 +507,11 @@ impl ConcreteScheduler {
         assert!(
             config.serving_chunk_tokens > 0,
             "the serving prefill chunk width must be non-zero"
+        );
+        assert!(
+            (0.0..1.0).contains(&config.decode_share),
+            "the decode share must be in [0, 1), got {}",
+            config.decode_share
         );
         Self {
             capacity: AdmissionResources {
@@ -540,11 +555,13 @@ impl ConcreteScheduler {
             free_lanes: (0..N_DECODE_LANES).collect(),
             last_error: None,
             clock: Arc::new(Instant::now),
+            prefill_held_until: None,
         }
     }
 
     /// Read wall time from `clock` instead of `Instant::now` (tests that need
-    /// retained state to sit idle for minutes without waiting for them).
+    /// retained state to sit idle for minutes without waiting for them, or
+    /// chunks and rounds that take time).
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
         self
@@ -552,6 +569,27 @@ impl ConcreteScheduler {
 
     fn now(&self) -> Instant {
         (self.clock)()
+    }
+
+    /// GitHub #306: hold the next prefill chunk for the decode share of the
+    /// time the one that started at `began` took.
+    fn hold_prefill(&mut self, began: Instant) {
+        let share = self.config.decode_share;
+        if share > 0.0 {
+            let now = self.now();
+            let took = now.saturating_duration_since(began);
+            self.prefill_held_until = Some(now + took.mul_f64(share / (1.0 - share)));
+        }
+    }
+
+    /// Whether the decode share holds prefill this advance: its time has not
+    /// run out and some lane is decoding to use it.
+    fn prefill_held(&self) -> bool {
+        self.prefill_held_until.is_some_and(|until| self.now() < until)
+            && self
+                .requests
+                .iter()
+                .any(|r| r.state == RequestState::Running && r.remaining_work > 0)
     }
 
     /// The KV-RAM tier, for observation.
@@ -2622,10 +2660,12 @@ impl Scheduler for ConcreteScheduler {
         // find it first; if one exists, it alone is served this tick (the
         // rest queue). Otherwise the batch is built fresh from the
         // `Admitted` queue, same as before chunking existed.
+        // GitHub #306: no chunk at all while the decode share holds it.
+        let held = self.prefill_held();
         let active = self
             .requests
             .iter()
-            .position(|r| r.state == RequestState::Prefilling && !r.prefill_complete());
+            .position(|r| !held && r.state == RequestState::Prefilling && !r.prefill_complete());
         let batch: Vec<usize> = match active {
             Some(idx) => vec![idx],
             None => {
@@ -2633,7 +2673,7 @@ impl Scheduler for ConcreteScheduler {
                     .requests
                     .iter()
                     .enumerate()
-                    .filter(|&(_, r)| r.state == RequestState::Admitted)
+                    .filter(|&(_, r)| !held && r.state == RequestState::Admitted)
                     .map(|(i, _)| i)
                     .collect();
                 b.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
@@ -3176,7 +3216,10 @@ impl Scheduler for ConcreteScheduler {
             })
             .collect();
         if !jobs.is_empty() {
-            match self.compute.prefill_step(&jobs) {
+            let began = self.now();
+            let result = self.compute.prefill_step(&jobs);
+            self.hold_prefill(began);
+            match result {
                 Ok(outcomes) => {
                     // One outcome per job, in order (GitHub #192). A backend
                     // that returns fewer would have its chunks misattributed

@@ -79,9 +79,10 @@ int32_t run_pass(ignis_model *model, FlashNextModel &fn, const Context &ctx, con
 // The MTP head's drafting between the fold and the restore (spec flash-next/07 phase D): the
 // alignment over the pass's stacks and licensed tokens -- entry p + j from the stack at p + j and
 // t[p + j + 1] = licensed[j], the committed ones kept -- then each lane's first draft from its last
-// committed column's S', then k - 1 chained steps, each from the previous step's S' and draft at
-// the next position past the frontier.
-int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, uint32_t width, std::string *error) {
+// committed column's S', the head's section back at the new frontier, then k - 1 chained steps,
+// each from the previous step's S' and draft at the next position past the frontier.
+int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, const verify::Sections &sections,
+                   uint32_t width, std::string *error) {
   verify::State &state = *fn.verify;
   const uint32_t window = state.window(width);
   const auto lanes = static_cast<int32_t>(width);
@@ -121,6 +122,9 @@ int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, u
     *error = fn_last_error();
     return -1;
   }
+  if (k > 1 && verify::restore_head(state, sections, fn.g, width, window, batch.slots, batch.positions, stream, error) != 0) {
+    return -1;
+  }
   const std::size_t stack_bytes = static_cast<std::size_t>(lanes) * fn.g.residual_width() * 2;
   for (int32_t step = 1; step < k; ++step) {
     Batch chain;
@@ -156,7 +160,7 @@ int32_t run_commit(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
   const uint32_t window = state.window(width);
   const auto *slots = static_cast<const int32_t *>(fn.slots->p);
   if (verify::fold(state, sections, width, window, slots, model->stream, error) != 0) return -1;
-  if (fn.mtp != nullptr && run_drafts(model, fn, ctx, width, error) != 0) return -1;
+  if (fn.mtp != nullptr && run_drafts(model, fn, ctx, sections, width, error) != 0) return -1;
   return verify::restore(state, sections, fn.g, width, window, slots, static_cast<const int32_t *>(fn.positions->p),
                          model->stream, error);
 }

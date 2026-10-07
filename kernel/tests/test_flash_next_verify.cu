@@ -44,7 +44,9 @@ constexpr int VW = fn::gdn::kValueWidth;
 constexpr int VH = fn::gdn::kValueHeads;
 constexpr int D = fn::gdn::kHeadDim;
 constexpr int kSlots = 4;
-constexpr int kLanes = 3;
+// Two lanes of kColumns are 8 rows: the widest round the default row budget (8) allows at a full
+// window, and so the rows the verify state's records are sized for.
+constexpr int kLanes = 2;
 constexpr int kColumns = 4;  // a window of 3 drafts
 constexpr std::size_t kConvSlotBytes = static_cast<std::size_t>(3) * C * 2;
 constexpr std::size_t kStateSlotBytes = static_cast<std::size_t>(VH) * D * D * 4;
@@ -156,8 +158,8 @@ int main() {
   auto state = fn::verify::create(g, IGNIS_KV_FORMAT_BF16, kLanes, kColumns - 1, 0, 1, 1, false, &error);
   check(state != nullptr, "verify::create: " + error);
   if (state == nullptr) return EXIT_FAILURE;
-  check(state->window(kLanes) == 1 && state->window(2) == 3 && state->window(1) == 3,
-        "the window adapts to the row budget: 3 drafts at one and two lanes, 1 at three");
+  check(state->window(kLanes) == kColumns - 1 && state->window(1) == kColumns - 1,
+        "the default row budget holds the full window of 3 drafts at one and two lanes");
   fn::verify::Sections sections;
   sections.gdn_layers = 1;
   sections.recurrent[0] = pool.recurrent.as<float>();
@@ -169,7 +171,7 @@ int main() {
   DeviceBytes d_slots(16 * 4);
   cudaStream_t stream;
   MOE_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  const int32_t slot_of[kLanes] = {2, 0, 3};
+  const int32_t slot_of[kLanes] = {2, 0};
 
   // History: five tokens per lane through a one-lane call each.
   for (int lane = 0; lane < kLanes; ++lane) {
