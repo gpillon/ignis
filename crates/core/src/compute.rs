@@ -798,6 +798,18 @@ impl ModelFamily {
         }
     }
 
+    /// Whether the generation opener's page rides the prompt-checkpoint
+    /// capture as a pages-only link (ADR 0029 as amended 2026-10-07, GitHub
+    /// #306): on Flash-Next, where the cut it saves is a traversal that
+    /// re-streams its experts -- 0.13-0.66 s of a reused agent turn. Not on the
+    /// 27B, whose cut costs ~19 ms and whose prefills keep their splits.
+    pub fn opener_page_rides_capture(self) -> bool {
+        match self {
+            ModelFamily::Qwen38_27b => false,
+            ModelFamily::FlashNext => true,
+        }
+    }
+
     /// The `model_id` of this family's artifacts, and the id it is served
     /// under by default.
     pub fn model_id(self) -> &'static str {

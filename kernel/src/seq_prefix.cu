@@ -70,7 +70,7 @@ void publish_shared_row(ignis_seq_pool &pool, const ignis_seq &seq) {
     chain.push_back(at);
   }
   for (auto link = chain.rbegin(); link != chain.rend(); ++link) {
-    const auto shared = (*link)->kv.page_ids();
+    const auto shared = ignis_seq_prefix_own_page_ids(**link);
     ids.insert(ids.end(), shared.begin(), shared.end());
   }
   const auto own = seq.kv.page_ids();
@@ -105,6 +105,26 @@ template <typename Work> double timed(Work &&work) {
 }
 
 } // namespace
+
+void ignis_seq_settle_loan(ignis_seq &seq) {
+  ignis_seq_prefix *link = seq.lent_to;
+  if (link == nullptr) {
+    return;
+  }
+  // The link's pages are this sequence's first own pages; the rest go back to
+  // the pool when the sequence is deleted. A trim and an entitlement shrink
+  // are host bookkeeping, and neither can fail on pages the sequence maps.
+  const auto pages            = static_cast<std::uint32_t>(link->lent.size());
+  ninfer::PagedKVAllocation kv = std::move(seq.kv);
+  kv.unbind_row();
+  kv.trim_pages(pages);
+  kv.set_page_entitlement(pages);
+  link->kv     = std::move(kv);
+  link->lender = nullptr;
+  link->lent.clear();
+  seq.lent_to = nullptr;
+  ignis_seq_prefix_drop_reference(link);
+}
 
 void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix) {
   // GitHub #187: a loop rather than one step, because a chained entry holds
@@ -146,6 +166,14 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
   }
   if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
     ignis_seq_set_last_error(std::string("ignis_seq_prefix_publish: ") + refusal);
+    return -1;
+  }
+  if (seq->lent_to != nullptr) {
+    // GitHub #306: its first own pages are a pages-only link's on loan, and a
+    // publish would hand them to a second owner.
+    ignis_seq_set_last_error("ignis_seq_prefix_publish: sequence slot " + std::to_string(seq->slot) +
+                             " has lent the pages below its generation opener to a checkpoint's "
+                             "link; it publishes nothing more");
     return -1;
   }
   const auto page_size = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
@@ -277,7 +305,7 @@ int32_t ignis_seq_alloc_against_prefix(struct ignis_seq_pool *pool, uint32_t con
     ignis_seq_set_last_error(std::string(who) + ": null argument");
     return -1;
   }
-  if (!prefix->kv.valid() || !prefix->kv.belongs_to(pool->kv_pool)) {
+  if (!ignis_seq_prefix_belongs_to(*prefix, *pool)) {
     ignis_seq_set_last_error(std::string(who) + ": the prefix was not published from this pool");
     return -1;
   }

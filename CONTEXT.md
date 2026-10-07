@@ -340,7 +340,17 @@ When output names a domain concept, use the term as defined here.
   page is still charged to the pool exactly once and a claimant of the chain
   shares all of it. This is what lets every iteration of a tool loop leave a
   **prompt checkpoint** instead of only the first — for as long as
-  **retained slots** can hold the chain, since every link takes one.
+  **retained slots** can hold the chain, since every link with an image takes
+  one.
+- **Pages-only link** — a **chained prefix** with no image of mutable state:
+  the whole pages between what a request shares and its generation opener's
+  page floor, handed over by the **prompt checkpoint**'s capture so that
+  something outlives the request to hold them. No request stands at its end, so
+  it is never claimed on its own; it takes no **retained slot**, and it goes
+  when nothing stands on it any more. Flash-Next publishes the opener's page
+  this way; the 27B publishes it as an ordinary chained prefix (ADR 0029,
+  amended 2026-10-07).
+  _Avoid_: imageless prefix.
 - **Retained state** — prompt checkpoints and retained prefixes: state no live
   request needs. It never costs a live request anything — on the device it is
   always the first thing to go — and in KV-RAM it is discarded before any
@@ -408,7 +418,9 @@ When output names a domain concept, use the term as defined here.
   GitHub #187 lifts the first and satisfies the second rather than waiving
   it — a request may publish a second prefix over the head it warmed itself,
   so the pages below its opener become its own chained prefix and it keeps
-  both the block and its checkpoint.
+  both the block and its checkpoint. A **pages-only link** has no publish point
+  of its own: it rides the capture at the generation opener, so a request
+  publishing one is cut once there instead of twice.
 - **Eviction priority** — the one ordering that decides what loses residency,
   expressed at two levels: leaving the GPU is eligibility and protection, then
   request class, then least-recently-used; leaving KV-RAM is **retained

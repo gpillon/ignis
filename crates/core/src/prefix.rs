@@ -138,6 +138,24 @@ pub struct PrefixEntry {
     /// publisher's completion — and why the flag lives beside the refcount
     /// rather than in a second ledger that could drift from it.
     pub retained: Option<Retention>,
+    /// A **pages-only link** (ADR 0029 as amended 2026-10-07, GitHub #306):
+    /// the pages below a request's generation opener, handed over by its
+    /// prompt-checkpoint capture with no image. No request stands at its end,
+    /// so it is never matched and never claimed, carries no state to resume
+    /// from, and the backend holds no handle on it -- it lives as long as
+    /// something stands on it.
+    pub pages_only: bool,
+}
+
+/// An entry [`PrefixCache::release`] dropped: the pages it gives back, and the
+/// request and head length the backend names its handle on it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedPrefix {
+    pub pages: u32,
+    pub publisher: RequestId,
+    pub tokens: u32,
+    /// A pages-only link: there is no backend handle to drop.
+    pub pages_only: bool,
 }
 
 /// The result of a successful claim: the entry's id, the leading prompt
@@ -246,7 +264,27 @@ impl PrefixCache {
         if length == 0 || head.splits_media(length) {
             return None; // fewer than one page, or an image cut in two
         }
-        self.insert(publisher, head.key_at(length), length, gdn, parent)
+        self.insert(publisher, head.key_at(length), length, gdn, parent, false)
+    }
+
+    /// Register a **pages-only link** (ADR 0029 as amended 2026-10-07, GitHub
+    /// #306): the whole pages of `head` past `parent`, which `publisher`'s
+    /// prompt-checkpoint capture handed over with no image. Returns its id and
+    /// its own pages, as [`PrefixCache::register`] does, and is refused the
+    /// same way when it would cover nothing its parent does not.
+    ///
+    /// Nothing else `register` asks of a head applies: the link is never
+    /// matched, so it carries no resumable GDN state, may cut a media item,
+    /// and is no duplicate of anything a prompt could claim.
+    pub fn register_link<'a>(
+        &mut self,
+        publisher: RequestId,
+        head: impl Into<PromptContent<'a>>,
+        parent: Option<PrefixId>,
+    ) -> Option<(PrefixId, u32)> {
+        let head = head.into();
+        let length = (head.tokens() / self.page_tokens) * self.page_tokens;
+        self.insert(publisher, head.key_at(length), length, &GdnState::new(), parent, true)
     }
 
     /// Register a retained prefix brought back from KV-RAM (GitHub #190) under
@@ -259,11 +297,12 @@ impl PrefixCache {
             spilled.length_tokens,
             &spilled.gdn,
             None,
+            false,
         )
     }
 
     /// [`PrefixCache::register`] once the head is named: `length` whole pages
-    /// of content `key`.
+    /// of content `key` -- a pages-only link when `pages_only`.
     fn insert(
         &mut self,
         publisher: RequestId,
@@ -271,6 +310,7 @@ impl PrefixCache {
         length: u32,
         gdn: &GdnState,
         parent: Option<PrefixId>,
+        pages_only: bool,
     ) -> Option<(PrefixId, u32)> {
         if length == 0 || length % self.page_tokens != 0 {
             return None; // fewer than one page: nothing shareable
@@ -287,13 +327,13 @@ impl PrefixCache {
         };
         // core-02: a prefix is reusable only at a recorded GDN boundary
         // (a mid-prefill position is not resumable for GDN layers).
-        if !gdn.is_valid_snapshot_point(gdn.position()) {
+        if !pages_only && !gdn.is_valid_snapshot_point(gdn.position()) {
             return None;
         }
         // A duplicate prompt (the same truncated prefix is already
         // cached): the caller claims the existing entry — no second set
         // of pages.
-        if self.find(key, length).is_some() {
+        if !pages_only && self.find(key, length).is_some() {
             return None;
         }
         let entry = PrefixEntry {
@@ -306,6 +346,7 @@ impl PrefixCache {
             gdn: gdn.clone(),
             refcount: 1, // the registrant is the first claimant
             retained: None,
+            pages_only,
         };
         let (id, pages) = (entry.id, entry.pages);
         self.next_id += 1;
@@ -327,7 +368,7 @@ impl PrefixCache {
     /// Every length an entry covers, on the device or in KV-RAM — what a
     /// prompt has to be keyed at before this cache can match it (GitHub #193).
     pub fn match_lengths(&self) -> impl Iterator<Item = u32> + '_ {
-        let device = self.entries.iter().map(|e| e.length_tokens);
+        let device = self.claimable().map(|e| e.length_tokens);
         device.chain(self.spilled.iter().map(|s| s.length_tokens))
     }
 
@@ -380,8 +421,14 @@ impl PrefixCache {
     /// What matches is the entry's **match key** at its length (GitHub
     /// #193): the prompt's token ids *and* the media items inside that head.
     fn longest_match(&self, prompt: &PromptKeys, floor: u32) -> Option<&PrefixEntry> {
-        let candidates = self.entries.iter().filter(|e| e.length_tokens > floor);
+        let candidates = self.claimable().filter(|e| e.length_tokens > floor);
         longest_keyed(prompt, candidates, |e| (e.key, e.length_tokens))
+    }
+
+    /// Every entry a prompt may match: all but the pages-only links (GitHub
+    /// #306), which have no state at their end to resume from.
+    fn claimable(&self) -> impl Iterator<Item = &PrefixEntry> {
+        self.entries.iter().filter(|e| !e.pages_only)
     }
 
     /// Take one more reference to `entry` on behalf of something that is not
@@ -587,7 +634,7 @@ impl PrefixCache {
     /// list rather than one entry because a chained entry (GitHub #187) holds
     /// its parent's reference: letting go of the child may let go of the
     /// parent, and of its parent in turn.
-    pub fn release(&mut self, entry: PrefixId) -> Vec<(u32, RequestId, u32)> {
+    pub fn release(&mut self, entry: PrefixId) -> Vec<DroppedPrefix> {
         let mut dropped = Vec::new();
         let mut at = Some(entry);
         while let Some(id) = at {
@@ -599,7 +646,12 @@ impl PrefixCache {
                 break;
             }
             let entry = self.entries.remove(pos);
-            dropped.push((entry.pages, entry.publisher, entry.length_tokens));
+            dropped.push(DroppedPrefix {
+                pages: entry.pages,
+                publisher: entry.publisher,
+                tokens: entry.length_tokens,
+                pages_only: entry.pages_only,
+            });
             // A KV-RAM copy of it stays, and is what a prompt matches now.
             for spilled in self.spilled.iter_mut().filter(|s| s.on_device == Some(entry.id)) {
                 spilled.on_device = None;
@@ -722,8 +774,7 @@ impl PrefixCache {
     /// The cached prefix with content `key` at `length` tokens (an exact,
     /// page-aligned match) already in the cache, or `None`.
     fn find(&self, key: MatchKey, length: u32) -> Option<&PrefixEntry> {
-        self.entries
-            .iter()
+        self.claimable()
             .find(|e| e.key == key && e.length_tokens == length)
     }
 }
@@ -750,6 +801,16 @@ mod tests {
     use crate::gdn::GdnState;
     use crate::identity::MediaKey;
     use crate::types::TokenId;
+
+    /// What `release` reports for an imaged entry it dropped.
+    fn gone(pages: u32, publisher: RequestId, tokens: u32) -> DroppedPrefix {
+        DroppedPrefix {
+            pages,
+            publisher,
+            tokens,
+            pages_only: false,
+        }
+    }
 
     fn retention(at: u64) -> Retention {
         Retention {
@@ -899,7 +960,7 @@ mod tests {
         // The last release drops the entry, frees its pages and names the
         // request that published them (P4-10: the backend's own handle on
         // the leaf's prefix is dropped by that id).
-        assert_eq!(cache.release(id), vec![(4, 7, 64)]);
+        assert_eq!(cache.release(id), vec![gone(4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert_eq!(cache.entry_count(), 0);
         // A dropped entry cannot be claimed or released again.
@@ -972,7 +1033,7 @@ mod tests {
         );
         assert_eq!(cache.release(id), vec![]);
         // The checkpoint is discarded last: now the pages come back.
-        assert_eq!(cache.release(id), vec![(4, 7, 64)]);
+        assert_eq!(cache.release(id), vec![gone(4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert!(!cache.retain(id), "a dropped entry cannot be retained");
         assert_eq!(cache.pages_of(id), 0);
@@ -1020,9 +1081,41 @@ mod tests {
         assert_eq!(cache.pinned_pages(), 6);
         // Request 8 completes, releasing the child: both entries drop, and
         // each names the request whose leaf prefix the backend must let go of.
-        assert_eq!(cache.release(child), vec![(2, 8, 96), (4, 7, 64)]);
+        assert_eq!(cache.release(child), vec![gone(2, 8, 96), gone(4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn a_pages_only_link_holds_pages_and_is_matched_by_nothing() {
+        // GitHub #306: request 8's capture handed the two pages past the
+        // parent over as a link. A prompt keyed at the link's length still
+        // claims only the parent -- nothing stands at the link's end -- yet
+        // the link holds its pages, charged once, until it is let go, and
+        // then names no backend handle.
+        let mut cache = PrefixCache::new(16);
+        let (parent, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        cache.claim(&cache.keys(&prompt96())).expect("request 8 claims the parent");
+        let (link, own) = cache.register_link(8, &prompt96(), Some(parent)).unwrap();
+        assert_eq!((own, cache.total_pages_of(link)), (2, 6));
+        assert_eq!(cache.pinned_pages(), 6, "one charge per page, the link's included");
+
+        let keyed_at_the_link = PromptContent::from(&prompt96()).keys_for([64, 96]);
+        assert_eq!(cache.longest_match_tokens(&keyed_at_the_link), 64, "only the parent matches");
+        assert!(cache.match_lengths().all(|length| length != 96), "and no prompt is keyed for the link");
+
+        // As any link of the chain, it took over request 8's reference on the
+        // parent: the parent's registrant going leaves it standing, and the
+        // link going takes it along.
+        assert_eq!(cache.release(parent), vec![], "the link holds the parent");
+        let link_gone = DroppedPrefix {
+            pages: 2,
+            publisher: 8,
+            tokens: 96,
+            pages_only: true,
+        };
+        assert_eq!(cache.release(link), vec![link_gone, gone(4, 7, 64)]);
+        assert_eq!(cache.pinned_pages(), 0);
     }
 
     #[test]
@@ -1101,7 +1194,7 @@ mod tests {
         assert!(cache.unretain(id), "the caller now owes one release");
         assert!(!cache.is_retained(id));
         assert!(!cache.unretain(id), "and owes it exactly once");
-        assert_eq!(cache.release(id), vec![(4, 7, 64)], "that release frees the pages");
+        assert_eq!(cache.release(id), vec![gone(4, 7, 64)], "that release frees the pages");
         assert_eq!(cache.pinned_pages(), 0);
         assert!(!cache.unretain(id), "a dropped entry is not retained");
         assert!(!cache.retain_published(id, retention(3)), "nor can it be retained again");

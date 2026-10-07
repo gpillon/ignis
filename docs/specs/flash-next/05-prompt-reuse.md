@@ -56,14 +56,17 @@ Found while building the leaf side (#303); the coordinator may veto.
   first-fit pinned region as the 27B's process-wide one), created at load and
   freed when its last blob and the leaf have gone; the 27B keeps the
   process-wide arena unchanged.
-- **Acceptance 6 is not met (2026-10-07, #306).** A reused turn with a ~9K
-  history and a ~1K tail starts in 1.86 s at the median, against 1.6 s. The
-  30K history was not run, and it can only add to the tail. The tail is
-  copy-bound and runs three traversals, cut at the publish point and at the
-  opener, each re-streaming its experts. The publish-point piece costs
-  ~0.35 s at a median width (inferred from the spread of turn 2's TTFT), so a
-  pages-only chained prefix, which would drop that cut, is the lever left
-  (`docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
+- **The opener's page rides the capture (2026-10-07, #306, ADR 0029 as
+  amended, owner decision).** Flash-Next does not publish the generation
+  opener's page floor as a chained prefix at a cut of its own: the checkpoint
+  capture hands those pages over as a **pages-only link** (no image, no
+  retained slot, never claimed), so a reused turn's tail runs two traversals
+  instead of three. "ADR 0029 applies unchanged" and the out-of-scope
+  "changing ADR 0029's policy" no longer hold for this one point; the 27B
+  keeps the imaged prefix. Acceptance 3's split control is `[…, opener)`,
+  `[opener, end)` accordingly. What acceptance 6 measures today is in the
+  findings (`docs/findings/2026-10-07-flash-next-agent-turn-tail.md` and the
+  one it links), not here.
 - **Retained pages are pool lines.** The pool holds one KV page per retained
   slot beside every lane's whole context, as the 27B's (a checkpoint keeps the
   page its opener ends inside).
@@ -194,7 +197,8 @@ default device slot count is zero, so the expert cache gives up nothing.
   and the generation opener: `/v1/decide` and its boundaries are not served on
   Flash-Next (spec 04).
 
-Nothing in this spec changes the scheduler's reuse policy. It adds Flash-Next's
+Nothing in this spec changes the scheduler's reuse policy but one point: where
+the opener's page is published (Departures, 2026-10-07). It adds Flash-Next's
 state to the mechanisms the policy drives.
 
 **The Flash-Next mutable image.** The snapshot sections ADR 0024 defines,
@@ -348,7 +352,7 @@ mismatched blob does. They never check copy order or internal table layouts.
 ## Acceptance
 
 1. Flash-Next's mutable image (GDN fp32 state for 36 layers × 48 heads, conv taps, n-gram conv state, hq residual window, penalty row, position, last token) and its paged sections (KV in either format, indexer compressed keys) are derived from the topology. Their sizes are printed at load and checked by a CPU test.
-2. ADR 0029's reuse works on Flash-Next unchanged: prompt checkpoints at the generation opener, a retained prefix at the system block, lineage with at most two checkpoints, non-consuming claims, first victim on the device, KV-RAM spill and restore with the restore floor. `--prompt-reuse off` disables it.
+2. ADR 0029's reuse works on Flash-Next, with its 2026-10-07 amendment (the opener's page is lent to a pages-only link by the capture instead of published at a cut of its own): prompt checkpoints at the generation opener, a retained prefix at the system block, lineage with at most two checkpoints, non-consuming claims, first victim on the device, KV-RAM spill and restore with the restore floor. `--prompt-reuse off` disables it.
 3. A reused request is bit-exact (tokens and logits) against a cold prefill split at the same boundary: from the device and from KV-RAM, with a cold and a warm expert cache, in BF16 and in hq-e8-2b KV, for a dense-regime and a sparse-regime history. A retained-prefix claim and a blob round trip continue exactly.
 4. Retained slots default to host (proposed 8) with device 0. The KV-RAM arena defaults to a stated size (proposed 2 GiB). Both are host-plan lines, and the load refuses with the line to shrink named when the plan leaves less than spec 03's margin. No VRAM is taken from the expert cache unless device slots are asked for.
 5. A 27B blob is refused under Flash-Next and a Flash-Next blob under the 27B, by identity.

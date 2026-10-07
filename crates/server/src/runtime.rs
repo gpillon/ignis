@@ -48,6 +48,10 @@ pub struct EngineShape {
     pub host_pool_bytes: u64,
     /// Cross-request state reuse (`--prompt-reuse`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
+    /// Whether the generation opener's page rides the checkpoint capture (ADR
+    /// 0029 as amended 2026-10-07, GitHub #306): the family's, set by
+    /// [`EngineShape::for_family`]; no flag names it.
+    pub opener_page_rides_capture: bool,
     /// The retained slots the load reserves (GitHub #215, #281, ADR 0030):
     /// in VRAM (`--retained-device`) and in the pinned host block
     /// (`--retained-host`), both 0 with prompt reuse off unless named.
@@ -100,6 +104,7 @@ impl Default for EngineShape {
             },
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
+            opener_page_rides_capture: false,
             retained_device_slots: crate::config::DEFAULT_RETAINED_DEVICE_SLOTS,
             retained_host_slots: crate::config::DEFAULT_RETAINED_HOST_SLOTS,
             retained_host_named: false,
@@ -126,6 +131,7 @@ impl From<&crate::config::Config> for EngineShape {
             vram: config.vram,
             host_pool_bytes: config.host_pool_bytes,
             prompt_reuse: config.prompt_reuse,
+            opener_page_rides_capture: false,
             retained_device_slots: config.retained_device_slots,
             retained_host_slots: config.retained_host_slots,
             retained_host_named: config.retained_host_named,
@@ -178,8 +184,12 @@ impl EngineShape {
     /// 27B's before the artifact named its model. A named count, or reuse
     /// off, is left as it is.
     pub fn for_family(self, family: ignis_core::compute::ModelFamily) -> Self {
-        // GitHub #306: and so is an unnamed decode share.
-        let this = self.with_family_decode_share(family);
+        // GitHub #306: and so is an unnamed decode share, and where the
+        // opener's page is published.
+        let this = Self {
+            opener_page_rides_capture: family.opener_page_rides_capture(),
+            ..self.with_family_decode_share(family)
+        };
         if this.retained_host_named || !this.prompt_reuse {
             return this;
         }
@@ -211,6 +221,7 @@ fn scheduler_config_for_shape(
         serving_chunk_tokens: shape.prefill_chunk,
         decode_share: f64::from(shape.decode_share_percent.unwrap_or(0)) / 100.0,
         prompt_reuse: shape.prompt_reuse,
+        opener_page_rides_capture: shape.opener_page_rides_capture,
         // GitHub #215: the same count the leaf's pool reserved, so every slot
         // the scheduler hands out is one the pool holds -- both kinds, the
         // device ones at the low indices it hands out first (GitHub #281).
@@ -940,6 +951,29 @@ mod tests {
     }
 
     #[test]
+    fn only_a_flash_next_load_lets_the_opener_s_page_ride_the_capture() {
+        // ADR 0029 as amended 2026-10-07 (GitHub #306): Flash-Next hands the
+        // pages below an opener over with its checkpoint, the 27B keeps its
+        // imaged prefix at a cut of its own.
+        use ignis_core::compute::ModelFamily;
+        let unnamed = EngineShape::default();
+        let flash = scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::FlashNext), 64, 1024);
+        assert!(flash.opener_page_rides_capture);
+        let off = EngineShape { prompt_reuse: false, ..unnamed };
+        assert!(
+            scheduler_config_for_shape("m".into(), off.for_family(ModelFamily::FlashNext), 64, 1024)
+                .opener_page_rides_capture,
+            "a property of the family, inert while reuse is off"
+        );
+        // The 27B's load takes only the decode-share step (`main.rs`), and
+        // nothing on that path may switch it on.
+        let on_27b = unnamed.with_family_decode_share(ModelFamily::Qwen38_27b);
+        assert!(!scheduler_config_for_shape("m".into(), on_27b, 64, 1024).opener_page_rides_capture);
+        assert!(!scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::Qwen38_27b), 64, 1024)
+            .opener_page_rides_capture);
+    }
+
+    #[test]
     fn a_flash_next_load_keeps_eight_host_retained_slots_unless_one_is_named() {
         // Spec flash-next/05: host 8, device 0 and a 2 GiB arena by default.
         use ignis_core::compute::ModelFamily;
@@ -1003,6 +1037,7 @@ mod tests {
             vram: EngineShape::default().vram,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: true,
+            opener_page_rides_capture: false,
             retained_device_slots: 2,
             retained_host_slots: 3,
             retained_host_named: true,

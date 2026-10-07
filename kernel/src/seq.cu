@@ -167,6 +167,11 @@ void zero_flash_next_slot(ignis_seq_pool &pool, std::int32_t slot) {
 // refcounted and read by every other claimant, and a restore would overwrite
 // their history. The way back on for such a sequence is a fresh one.
 const char *shared_prefix_refusal(const ignis_seq &seq) {
+  if (seq.lent_to != nullptr) {
+    // GitHub #306: and its first own pages are a checkpoint's link's on loan.
+    return "the target sequence lent its first pages to a checkpoint's link, which a restore "
+           "would overwrite; restore into a fresh sequence";
+  }
   if (seq.prefix == nullptr) {
     return nullptr;
   }
@@ -466,7 +471,7 @@ std::vector<std::int32_t> ignis_seq_prefix_chain_page_ids(const ignis_seq_prefix
   }
   std::vector<std::int32_t> pages;
   for (auto at = chain.rbegin(); at != chain.rend(); ++at) {
-    const auto ids = (*at)->kv.page_ids();
+    const auto ids = ignis_seq_prefix_own_page_ids(**at);
     pages.insert(pages.end(), ids.begin(), ids.end());
   }
   return pages;
@@ -1190,6 +1195,9 @@ extern "C" void ignis_seq_release(struct ignis_seq_pool *pool, struct ignis_seq 
     return;
   }
   const std::int32_t slot = seq->slot;
+  // GitHub #306: the pages it lent a checkpoint's link go to that link first,
+  // before anything of the sequence -- its allocation included -- is let go.
+  ignis_seq_settle_loan(*seq);
   // P4-10 (GitHub #126): this sequence holds one reference to its shared
   // prefix. Drop it before the handle goes, so the prefix's pages return to
   // the pool exactly when the last holder -- claimant or publisher's handle

@@ -676,9 +676,10 @@ void check_a_chained_publish_extends_a_claimed_head() {
   // generation opener are partly the entry it claimed. It publishes a
   // *chained* entry: the pages it warmed itself, over the ones it claimed.
   // That is what puts its own opener inside a page it alone writes, which is
-  // exactly what ignis_seq_checkpoint_capture demands, and it is why every
-  // iteration of an agent's tool loop can leave a checkpoint instead of only
-  // the first.
+  // what ignis_seq_checkpoint_capture demands of the pages below it -- unless
+  // it lends them to a pages-only link itself (GitHub #306) -- and it is why
+  // every iteration of an agent's tool loop can leave a checkpoint instead of
+  // only the first.
   const ignis_seq_pool_spec spec = small_spec();
   ignis_seq_pool *pool           = nullptr;
   expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "chain: pool create");

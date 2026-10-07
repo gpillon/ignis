@@ -259,6 +259,51 @@ int main() {
   ignis_seq_release(pool, f);
 
   ignis_seq_checkpoint_release(pool, checkpoint);
+
+  // --- GitHub #306: a capture standing on nothing lends page 0 -------------
+  // The pages below the opener are lent to a pages-only link and stay where
+  // they are; a claimant of the checkpoint reads both pages' keys -- the
+  // partial page's through its copy -- and the opener's state, and the link
+  // takes page 0 when the sequence is released.
+  struct ignis_seq_pool_stats before_g{};
+  check(ignis_seq_pool_stats(pool, &before_g) == 0, "stats before G");
+  ignis_seq *g = nullptr;
+  check(ignis_seq_alloc(pool, 256, &g) == 0, std::string("alloc G: ") + ignis_seq_last_error());
+  const std::vector<int32_t> g_pages = pages_of(*g, 2);
+  write_keys(*pool, g_pages[0], 0x50);
+  write_keys(*pool, g_pages[1], 0x60);
+  write_state(*pool, g->slot, 0x70);
+  stand_at(*g, 100);
+  cudaDeviceSynchronize();
+  const SlotState g_state = state_of(*pool, g->slot);
+  const std::vector<unsigned char> g_keys = keys_of(*pool, g_pages);
+  ignis_seq_checkpoint *handed = nullptr;
+  check(ignis_seq_checkpoint_capture(pool, g, 100, 1, &handed) == 0,
+        std::string("capture at 100 over a page that is no prefix yet: ") + ignis_seq_last_error());
+  if (handed != nullptr) {
+    check(g->lent_to != nullptr && g->lent_to->lent.size() == 1 && g->lent_to->lent[0] == g_pages[0] &&
+              g->shared_pages == 0 && pages_of(*g, 2) == g_pages,
+          "page 0 is lent to a link, and the sequence's pages are where they were");
+    check(keys_of(*pool, g_pages) == g_keys, "with their block keys");
+    check(state_of(*pool, g->slot).tails == g_state.tails && state_of(*pool, g->slot).conv == g_state.conv,
+          "and its tails and conv state are untouched");
+    ignis_seq *h = nullptr;
+    check(ignis_seq_alloc_from_checkpoint(pool, 256, handed, &h) == 0,
+          std::string("claim the checkpoint over the link: ") + ignis_seq_last_error());
+    if (h != nullptr) {
+      const SlotState got = state_of(*pool, h->slot);
+      check(got.tails == g_state.tails && got.conv == g_state.conv, "the claimant holds the opener's tails and conv");
+      check(keys_of(*pool, pages_of(*h, 2)) == g_keys, "and reads both pages' block keys");
+      ignis_seq_release(pool, h);
+    }
+    ignis_seq_checkpoint_release(pool, handed);
+  }
+  ignis_seq_release(pool, g);
+  struct ignis_seq_pool_stats after_g{};
+  check(ignis_seq_pool_stats(pool, &after_g) == 0, "stats after G");
+  check(after_g.kv_free_pages == before_g.kv_free_pages,
+        "the link took page 0 from its lender and went with its last holder: every page came back");
+
   ignis_seq_release(pool, a);
   ignis_seq_prefix_release(pool, prefix);
   ignis_seq_pool_free(pool);

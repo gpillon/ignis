@@ -321,3 +321,72 @@ which #238 rules out).
   share reaches the next page boundary. Measured live in
   `docs/findings/2026-09-26-decide-reuse-boundaries-live.md`: that, and each
   follower's own per-question cost, is why spec 16's `E <= 2 x D` does not hold.
+
+## Amendment (2026-10-07) — the opener's page rides the capture (#306, owner decision)
+
+The Decision publishes the generation opener's page floor as a chained prefix
+(#186, #187) and captures the prompt checkpoint over it, so a request's prefill
+is cut twice: at the floor, where the publish needs the mutable state, and at
+the opener, where the capture does. On the 27B the extra cut costs one ~19 ms
+traversal. On Flash-Next a traversal costs the expert stream it touches, and
+the piece between the floor and the opener (≤ 63 tokens) cost 0.13-0.66 s of a
+reused agent turn's 1.86 s (spec flash-next/05 acceptance 6,
+`docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
+
+That prefix is published for its **pages**. Its image is read only by a claimant
+whose prompt matches up to the floor and diverges in the ≤ 63 tokens before the
+opener: the conversation's next turn matches the checkpoint, and a burst's next
+subagent matches the system block.
+
+**On a model that asks for it — Flash-Next — the opener's page is published by
+the capture, as a pages-only link.** At the chunk that lands on the generation
+opener, the leaf lends the whole pages between what the sequence already shares
+and the opener's page floor to a chained prefix that carries no image, then
+captures the checkpoint over it. The prefill is cut once, at the opener.
+
+- **The capture moves nothing.** The lent pages stay in the sequence's
+  allocation and block-table row; the link takes them, by host bookkeeping
+  alone, when the sequence is released. A capture that fails has therefore
+  changed nothing, as before. The scheduler moves their charge to the link at
+  the capture: the same pages, counted once.
+
+- **A pages-only link is never claimed.** No sequence stands at its end, so it
+  has no state to hand over: the scheduler never matches it, and the leaf
+  refuses a shared claim of it. A prompt diverging below the opener resumes from
+  the link below it or the system block.
+- **It has no handle and takes no retained slot.** Its holders are the sequence
+  that lent it its pages, the checkpoint over it, the checkpoint's claimants
+  and the links later chained over it; it goes with the last of them.
+- **It exists only with a checkpoint.** A capture the scheduler declines (no
+  retained slot, no spare page, an identical checkpoint already held) publishes
+  nothing at the floor. Two identical prompts in one batch no longer meet at a
+  shared floor prefix (P4-10's one publisher per head), so the scheduler
+  deduplicates their captures by content instead.
+- **Reuse boundaries are unchanged.** The system block and #270's boundaries are
+  still published with their images at their own cuts. When one lands on the
+  opener's page floor the capture stands on it and chains nothing.
+- **The 27B keeps the imaged prefix at the floor** (coordinator decision for
+  #306): the cut costs it ~19 ms, and changing its splits would move its
+  outputs at near-ties without a measured reason to. The leaf mechanism is
+  shared; adopting it there is one `ModelFamily` switch plus the 27B GPU
+  tests' split controls.
+
+**Exactness.** A reused request is bit-exact against a cold prefill split at
+the same boundaries, which are now `[…, opener)` and `[opener, end)`. The
+capturing request goes on exactly as if it had published nothing: the loan
+touches neither its pages nor its state. Its outputs differ from the three-way
+split's only by the chunking effect the Consequences already record.
+
+Considered and rejected:
+
+- **A checkpoint taken mid-chunk.** The state sections agree with one another
+  only at a chunk boundary (`ignis_seq_at_chunk_boundary`); every layer would
+  have to export its state at an interior position.
+- **Publishing the floor later, from a snapshot taken at the cut.** The state
+  at the floor is gone once the chunk passes it; the pages are all that can be
+  published later, which is this amendment.
+- **Skipping the publish when the tail is short.** The checkpoint needs a holder
+  for the pages below the opener; without one the next turn loses its reuse
+  (spec flash-next/05 acceptance 2).
+- **A checkpoint that owns those pages itself.** The same ownership in a second
+  structure; the prefix chain already walks, materializes and releases links.

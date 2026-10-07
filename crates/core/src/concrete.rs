@@ -212,6 +212,15 @@ pub struct SchedulerConfig {
     /// bench measures a cold engine and a correctness oracle prefills every
     /// prompt it is given.
     pub prompt_reuse: bool,
+    /// Whether the generation opener's page **rides the capture** (ADR 0029
+    /// as amended 2026-10-07, GitHub #306; [`crate::compute::ModelFamily`]
+    /// decides it at load). On, a request that can capture a prompt checkpoint
+    /// publishes nothing at its opener's page floor: the capture hands those
+    /// pages over as a **pages-only link**, and the prefill is cut once, at the
+    /// opener. Off, they are a chained prefix with an image, published at a cut
+    /// of their own (#187) -- the 27B, whose extra traversal costs ~19 ms where
+    /// Flash-Next's costs an expert stream.
+    pub opener_page_rides_capture: bool,
     /// The load's **retained slots** (GitHub #215, #281, ADR 0030; the
     /// operator's `--retained-device` and `--retained-host` together): how
     /// many images of mutable state retained state may hold, prompt
@@ -403,6 +412,7 @@ impl Default for SchedulerConfig {
             // `--retained-host`, GitHub #281). A test that wants exhaustion
             // asks for it by setting fewer here.
             prompt_reuse: true,
+            opener_page_rides_capture: false,
             retained_slots: N_DECODE_LANES as u32,
             retained_interactive_ttl: DEFAULT_RETAINED_INTERACTIVE_TTL,
             thinking_close: None,
@@ -1290,6 +1300,65 @@ impl ConcreteScheduler {
         true
     }
 
+    /// Whether a member of `batch` before the `n`th sits at the same point `at`
+    /// over the same content as it does: P4-10's one publisher per head
+    /// (GitHub #126, #193) and one capture per content (GitHub #306). A
+    /// prompt is keyed only when the points collide, which is rare, rather
+    /// than for every request on every tick its point is nonzero.
+    fn taken_earlier(&self, batch: &[usize], points: &[u32], n: usize, at: u32) -> bool {
+        let head_key = |i: usize| {
+            let media = media_keys(&self.requests[i].input);
+            PromptContent::new(&self.requests[i].input.tokens, &media).key_at(at)
+        };
+        let mut earlier = (0..n).filter(|&m| points[m] == at).peekable();
+        earlier.peek().is_some() && {
+            let head = head_key(batch[n]);
+            earlier.any(|m| head_key(batch[m]) == head)
+        }
+    }
+
+    /// Record the **pages-only link** request `idx`'s capture at `opener`
+    /// handed over, if it handed one over (ADR 0029 as amended 2026-10-07,
+    /// GitHub #306), and answer whether the checkpoint has something to stand
+    /// on.
+    ///
+    /// The leaf lends exactly when the opener's whole pages reach past what
+    /// the sequence shares (`seq_checkpoint.cu`), so this asks the same of the
+    /// request rather than being told; the leaf's link takes the pages when
+    /// the sequence is released, and the charge moves here at once -- the same
+    /// pages either way. The one place the two may count it
+    /// differently is after an earlier publish this cache declined: the leaf's
+    /// link then stands on that prefix and this one covers its pages too, and
+    /// the pages still come back together, when the link drops. Like an
+    /// imaged publish's registration
+    /// it only moves the charge: the link owns those pages from here, and the
+    /// request's own reservation shrinks by them. `false` would be a link this
+    /// cache cannot record, which the request standing on its parent makes
+    /// unreachable; the caller then drops the checkpoint the leaf built over
+    /// it, and the link goes with its lender.
+    fn register_link(&mut self, idx: usize, opener: u32) -> bool {
+        let page_tokens = self.config.kv_page_tokens;
+        let r = &self.requests[idx];
+        if !r.link_at_capture || opener / page_tokens <= r.shared_pages {
+            return true;
+        }
+        let media = media_keys(&r.input);
+        let head = PromptContent::new(&r.input.tokens, &media).head(opener / page_tokens * page_tokens);
+        match self.prefix.register_link(r.id, head, r.prefix_entry) {
+            Some((entry, pages)) => {
+                let r = &mut self.requests[idx];
+                r.prefix_entry = Some(entry);
+                r.shared_pages += pages;
+                r.resources.kv_pages = r.resources.kv_pages.saturating_sub(pages);
+                true
+            }
+            None => {
+                debug_assert!(false, "a link over the entry its request stands on always registers");
+                false
+            }
+        }
+    }
+
     /// Record the prompt checkpoint the backend just captured for request
     /// `idx` at `at` tokens (GitHub #186, ADR 0029).
     ///
@@ -1456,15 +1525,18 @@ impl ConcreteScheduler {
         // GitHub #187: a chained entry holds its parent's reference, so one
         // release can drop a whole run of the chain — every link that drops
         // returns its own pages and its own backend handle.
-        for (freed, publisher, tokens) in self.prefix.release(entry) {
-            self.kv_used_pages = self.kv_used_pages.saturating_sub(freed);
+        for dropped in self.prefix.release(entry) {
+            self.kv_used_pages = self.kv_used_pages.saturating_sub(dropped.pages);
             // P4-10 (GitHub #126): the entry is gone from this cache, so the
             // backend's own handle on the leaf's prefix goes too. The leaf's
             // pages come back when its last *sequence* holder is released,
             // which is why this is a handle drop and not a free — but its
             // image's retained slot comes back now (GitHub #215): nothing can
-            // claim the prefix without the handle.
-            self.release_prefix_handle(publisher, tokens);
+            // claim the prefix without the handle. A pages-only link (GitHub
+            // #306) never had a handle or a slot.
+            if !dropped.pages_only {
+                self.release_prefix_handle(dropped.publisher, dropped.tokens);
+            }
         }
     }
 
@@ -2579,13 +2651,15 @@ impl Scheduler for ConcreteScheduler {
         //
         // The competition is temporary, and GitHub #187 ends it by
         // **chaining** the publish rather than by weakening the
-        // capture. `seq_checkpoint.cu:125`'s
-        // `below != seq->shared_pages` stays, and must: a checkpoint
-        // holds exactly one copied tail page and its capture takes
-        // `seq->kv.page_ids()[0]`, so with the opener pages above the
-        // block the copied page would not be the opener's at all and
-        // the pages between would have no holder — which is the
-        // defect #186 fixed in `565d634`. What #187 removes instead is
+        // capture. The capture's demand that the whole pages below the
+        // opener be a prefix's stays, and must: a checkpoint holds
+        // exactly one copied tail page, so with the opener pages above
+        // the block the copied page would not be the opener's at all
+        // and the pages between would have no holder — which is the
+        // defect #186 fixed in `565d634`. (GitHub #306 satisfies it a
+        // second way on Flash-Next: the capture lends those pages to a
+        // pages-only link itself, `Request::link_at_capture`.) What #187
+        // removes instead is
         // `seq_prefix.cu:129`'s `seq->prefix != nullptr`, so a
         // sequence standing on the block publishes a *second* prefix
         // over the head it warmed itself, taking over the reference it
@@ -2617,6 +2691,23 @@ impl Scheduler for ConcreteScheduler {
         // (`Request::publish_point` walks both in prompt order). This stays
         // the opener's page floor, and the block joins it there.
         request.publish_tokens = publish_tokens;
+        // ADR 0029 as amended 2026-10-07 (GitHub #306): where the opener's
+        // page rides the capture, a request that can capture publishes nothing
+        // at its floor -- that prefix's image would serve only a prompt parting
+        // from this one in the last page before its opener, and the cut it
+        // needs costs Flash-Next a whole expert stream. Its capture hands the
+        // pages over instead (`Request::checkpoint_point`). A decision captures
+        // nothing (below), so it keeps the floor as its siblings' head.
+        request.link_at_capture = self.config.opener_page_rides_capture
+            && self.config.prompt_reuse
+            && !request.input.is_decision()
+            && request
+                .input
+                .opener_tokens
+                .is_some_and(|opener| opener > 0 && (opener as usize) < request.input.tokens.len());
+        if request.link_at_capture {
+            request.publish_tokens = 0;
+        }
 
         // And `--prompt-reuse off` publishes at neither boundary. #188 kept
         // that by gating the block where it floored the publish point; with
@@ -2940,24 +3031,10 @@ impl Scheduler for ConcreteScheduler {
         // earlier one's, which is rare, rather than for every request on
         // every tick its point is nonzero.
         let mut publish_points: Vec<u32> = {
-            let head_key = |i: usize, at: u32| {
-                let media = media_keys(&self.requests[i].input);
-                PromptContent::new(&self.requests[i].input.tokens, &media).key_at(at)
-            };
             let mut points: Vec<u32> = Vec::with_capacity(batch.len());
             for (n, &i) in batch.iter().enumerate() {
                 let at = self.requests[i].publish_point(self.config.kv_page_tokens);
-                let taken = at > 0 && {
-                    let mut earlier = batch[..n]
-                        .iter()
-                        .enumerate()
-                        .filter(|&(m, _)| points[m] == at)
-                        .peekable();
-                    earlier.peek().is_some() && {
-                        let head = head_key(i, at);
-                        earlier.any(|(_, &j)| head_key(j, at) == head)
-                    }
-                };
+                let taken = at > 0 && self.taken_earlier(&batch, &points, n, at);
                 points.push(if taken { 0 } else { at });
             }
             points
@@ -3050,6 +3127,20 @@ impl Scheduler for ConcreteScheduler {
                 })
                 .collect()
         };
+        // GitHub #306 — one capture per content per batch. Where the opener's
+        // page rides the capture there is no publish at the floor for P4-10's
+        // one-publisher rule (above) to keep a second identical prompt from
+        // capturing too, so the same rule is applied to the captures: the
+        // first takes it, the rest prefill uncut.
+        for n in 0..batch.len() {
+            let at = capture_points[n];
+            if at > 0
+                && self.requests[batch[n]].link_at_capture
+                && self.taken_earlier(&batch, &capture_points, n, at)
+            {
+                capture_points[n] = 0;
+            }
+        }
         // GitHub #215 (ADR 0030) — a publish or a capture that lands on this
         // chunk takes a retained slot before the backend is asked for it, so
         // serving never allocates device memory for retained state. When no
@@ -3446,7 +3537,14 @@ impl Scheduler for ConcreteScheduler {
                         // request is none the wiser.
                         if let Some(capture) = job.capture_checkpoint {
                             if outcome.checkpoint_captured {
-                                self.retain_checkpoint(i, capture.tokens, &mut events);
+                                // GitHub #306: the pages-only link first, when
+                                // the capture handed one over -- it is what the
+                                // checkpoint stands on.
+                                if self.register_link(i, capture.tokens) {
+                                    self.retain_checkpoint(i, capture.tokens, &mut events);
+                                } else {
+                                    self.release_checkpoint_handle(request_id);
+                                }
                             } else {
                                 self.retained.give_back(RetainedHolder::Checkpoint {
                                     publisher: request_id,

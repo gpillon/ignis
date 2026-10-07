@@ -133,6 +133,15 @@ inline void ignis_seq_copy_kv_page(ignis_seq_pool &pool, std::int32_t src_page,
   }
 }
 
+/* A test seam (GitHub #306): arm one fault at the capture's commit point --
+ * the last moment a failure costs nothing -- so the leaf's test can prove
+ * that it does. The next ignis_seq_checkpoint_capture that reaches its commit
+ * point consumes it and fails there; later ones do not. Not part of the flat
+ * ABI. Both are defined in kernel/src/seq_checkpoint.cu. */
+void ignis_seq_inject_capture_fault();
+/* Throws once if a fault is armed (ignis_seq_inject_capture_fault). */
+void ignis_seq_capture_fault_point();
+
 /* Allocate a sequence against `prefix`, cloning the prefix's own mutable
  * image into it only when `clone_prefix_state` is set.
  *

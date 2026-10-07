@@ -26,9 +26,10 @@
 //!
 //! It then does it again one turn on (GitHub #187). Turn N+1 stands at turn
 //! N's opener with its history shared, so its *own* opener's whole pages are
-//! not the ones it shares and the leaf refuses to capture there — until it
-//! publishes a **chained** prefix at its own opener's page floor, the pages it
-//! warmed itself over the ones it claimed. The same claim then has to hold for
+//! not the ones it shares, and the 27B -- whose opener's page does not ride
+//! the capture (GitHub #306) -- publishes a **chained** prefix at its own
+//! opener's page floor first, the pages it warmed itself over the ones it
+//! claimed. The same claim then has to hold for
 //! turn N+2 standing on *that*: what it generates is what a cold prefill split
 //! at the same boundaries generates.
 //!
@@ -455,10 +456,11 @@ fn turns_against_the_split_control(
     //
     // The reuser above stands at turn N's opener with `publish_at / PAGE`
     // pages shared, and its *own* opener is further along — so the whole pages
-    // below it are not the ones it shares, and the leaf refuses to capture
-    // there. It publishes a **chained** prefix at its own opener's page floor
-    // first: the pages it warmed itself, over the ones it claimed. From there
-    // the capture is the same capture as any other.
+    // below it are not the ones it shares. The 27B's scheduler publishes a
+    // **chained** prefix at its own opener's page floor first: the pages it
+    // warmed itself, over the ones it claimed (the capture would otherwise
+    // lend them to a pages-only link, GitHub #306, which is Flash-Next's way).
+    // From there the capture is the same capture as any other.
     //
     // What must then be true is the same claim one turn on: turn N+2, standing
     // on that chained checkpoint, generates exactly what a cold prefill of its

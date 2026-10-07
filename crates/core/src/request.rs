@@ -174,6 +174,13 @@ pub struct Request {
     /// [`Request::publish_point`], which also answers whether this request
     /// publishes at all.
     pub publish_tokens: u32,
+    /// Whether this request's capture hands the whole pages below its
+    /// generation opener over as a **pages-only link** (ADR 0029 as amended
+    /// 2026-10-07, GitHub #306) instead of a chained prefix published at a cut
+    /// of its own. Set at submit, on a load whose opener's page rides the
+    /// capture, for a request that can take a prompt checkpoint at all; its
+    /// `publish_tokens` is then 0.
+    pub link_at_capture: bool,
     /// Prompt tokens already sent to the compute backend during prefill
     /// (P3-01, ADR 0018): advances by at most the scheduler's serving chunk
     /// width per `advance()`. `Prefilling` is durable and carries this as
@@ -241,6 +248,7 @@ impl Request {
             kv_ram_claim: None,
             standalone_tokens: 0,
             publish_tokens: 0,
+            link_at_capture: false,
             prefill_progress: 0,
             cancelled: false,
             prefill_failures: 0,
@@ -454,7 +462,10 @@ impl Request {
     /// It is the generation opener the frontend reported, and it is offered
     /// only when the opener falls inside the request's **own first KV page**
     /// — that is, when the whole pages under it are exactly the shared prefix
-    /// the request already holds. That is not a formality: what a later
+    /// the request already holds — or, where the opener's page rides the
+    /// capture ([`Request::link_at_capture`], GitHub #306), when the capture
+    /// can lend the pages between to a pages-only link itself (the branch
+    /// below). That is not a formality: what a later
     /// claimant shares is those whole pages, and what it copies is the partial
     /// tail page, which has to be a page the publisher owns rather than one
     /// other holders are also writing.
@@ -501,6 +512,20 @@ impl Request {
         // a chunk that had just sampled.
         if opener == 0 || opener as usize >= self.input.tokens.len() {
             return 0;
+        }
+        // ADR 0029 as amended 2026-10-07 (GitHub #306): the capture itself
+        // hands the pages between what is shared and the opener's page floor to
+        // a pages-only link, so they need not already be a prefix. What still
+        // refuses is a claim reaching past the opener's own page, and an opener
+        // in the first page of a request standing on nothing -- no whole page
+        // below it for a checkpoint to hold.
+        if self.link_at_capture {
+            let below = opener / page_tokens;
+            return if below < self.shared_pages || (below == 0 && self.prefix_entry.is_none()) {
+                0
+            } else {
+                opener
+            };
         }
         if self.prefix_entry.is_none() || opener / page_tokens != self.shared_pages {
             return 0;
