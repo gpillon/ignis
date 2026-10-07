@@ -307,7 +307,8 @@ fn send_needle_request(
         prompt,
         max_tokens: NEEDLE_MAX_TOKENS,
         stream: true,
-        include_usage: false,
+        // The needle is streamed; ask for usage like every streaming cell (GitHub #162).
+        include_usage: true,
         enable_thinking: Some(false),
         images: Vec::new(),
     };
@@ -652,6 +653,21 @@ mod tests {
         assert!(!result.passed());
         assert!(!result.retrieved);
         assert!(result.error.is_none(), "a wrong answer is not an error");
+    }
+
+    #[test]
+    fn the_needle_request_streams_with_usage() {
+        use std::sync::Mutex;
+        struct Capture(Mutex<Vec<(bool, bool)>>);
+        impl Endpoint for Capture {
+            fn complete(&self, req: &Request) -> Result<Outcome, String> {
+                self.0.lock().unwrap().push((req.stream, req.include_usage));
+                Err("captured".into())
+            }
+        }
+        let ep = Capture(Mutex::new(Vec::new()));
+        measure_needle(&ep, &MockTemplate, 200);
+        assert_eq!(*ep.0.lock().unwrap(), vec![(true, true)]);
     }
 
     #[test]

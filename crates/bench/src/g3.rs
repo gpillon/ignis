@@ -90,7 +90,7 @@ pub const C4_CONCURRENCY: usize = 4;
 pub const ITL_DECODE_PROMPT_TOKENS: u32 = 4_096;
 pub const ITL_DECODE_MAX_TOKENS: u32 = 4_032;
 pub const ITL_DECODE_LANES: usize = 4;
-const ITL_DECODE_INSTRUCTION: &str =
+pub(crate) const ITL_DECODE_INSTRUCTION: &str =
     "Produce at least 4032 tokens. Do not stop, conclude, or emit EOS earlier.";
 
 /// The fewest prefill windows the measurement window may cover before the
@@ -242,9 +242,7 @@ pub fn measure_throughput_cell_from_corpus(
     concurrency: usize,
     corpus: &[u32],
 ) -> ThroughputCell {
-    measure_throughput_cell_with(ep, prompt_tokens, max_tokens, concurrency, || {
-        generate_cell_prompts_from_corpus(template, corpus, prompt_tokens as usize, concurrency)
-    })
+    measure_throughput_cell_from_corpus_with_suffix(ep, template, prompt_tokens, max_tokens, concurrency, corpus, "")
 }
 
 /// [`measure_throughput_cell_from_corpus`] with a fixed instruction appended

@@ -94,8 +94,10 @@ impl TraceLine {
             prompt: self.prompt.clone(),
             max_tokens: self.max_tokens,
             stream: self.stream,
-            // Replay measures timing, not prefix coldness — no usage chunk.
-            include_usage: false,
+            // A replay's tok/s reads the engine's own count: a streaming
+            // engine that packs several tokens in a chunk is otherwise
+            // chunk-counted (GitHub #162).
+            include_usage: true,
             enable_thinking: None,
             images: Vec::new(),
         }
@@ -268,5 +270,6 @@ mod tests {
         assert_eq!(req.class, RequestClass::Sub);
         assert_eq!(req.max_tokens, 64);
         assert!(req.stream);
+        assert!(req.include_usage, "a replayed stream asks for the usage chunk (GitHub #162)");
     }
 }

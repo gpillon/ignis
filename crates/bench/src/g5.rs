@@ -84,7 +84,14 @@ pub fn decode_instruction(committed_tokens: u32) -> String {
 /// (#159): a run that stopped at EOS after a few verify rounds measures
 /// those rounds, not decode, and must not enter a ratio against an engine
 /// that ran the whole budget.
-fn require_committed_budget(mut cell: ThroughputCell, committed_tokens: u32) -> ThroughputCell {
+///
+/// Only a cell whose prompt carried the [`decode_instruction`] has anything to
+/// hold the engine to (`instructed`): the filler path sends none, so a short
+/// run there is the engine's own answer, not a stop the prompt forbade.
+fn require_committed_budget(mut cell: ThroughputCell, committed_tokens: u32, instructed: bool) -> ThroughputCell {
+    if !instructed {
+        return cell;
+    }
     for sample in &mut cell.samples {
         if sample.ok && !sample.void && sample.n_tokens < committed_tokens {
             sample.void = true;
@@ -96,6 +103,30 @@ fn require_committed_budget(mut cell: ThroughputCell, committed_tokens: u32) -> 
         }
     }
     cell
+}
+
+/// Refuse a bank whose per-depth windows could share a prefix: depth `i`
+/// starts `i * len / DEPTHS.len()` ids in, and a bank whose period divides
+/// that stride would make two depths open on the same ids and let the engine
+/// reuse one's prefix for the other (#162). `prove_divergence` only compares
+/// the samples *within* a cell, which at C=1 is nothing.
+fn prove_depth_offsets(corpus: &[u32]) -> Result<(), String> {
+    let start = |index: usize| index * corpus.len() / DEPTHS.len();
+    for i in 0..DEPTHS.len() {
+        for j in (i + 1)..DEPTHS.len() {
+            if corpus[start(i) % corpus.len()] == corpus[start(j) % corpus.len()] {
+                return Err(format!(
+                    "the {} and {} depth windows open on the same id (offsets {} and {} in a                      bank of {}): their prompts would share a prefix",
+                    DEPTHS[i],
+                    DEPTHS[j],
+                    start(i),
+                    start(j),
+                    corpus.len()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A G5 record: what one engine measured at the three depths, in which
@@ -236,7 +267,10 @@ pub fn measure(
     endpoint: String,
     cfg: &G5Config,
 ) -> Record {
-    let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path));
+    let corpus = cfg
+        .corpus
+        .as_ref()
+        .map(|path| load_corpus(path).and_then(|ids| prove_depth_offsets(&ids).map(|()| ids)));
     let instruction = decode_instruction(cfg.committed_tokens);
     let cells = DEPTHS
         .iter()
@@ -247,20 +281,23 @@ pub fn measure(
                 // so no two depths share a prefix the engine could reuse.
                 let mut rotated = ids.clone();
                 rotated.rotate_left(index * ids.len() / DEPTHS.len());
-                measure_throughput_cell_from_corpus_with_suffix(
-                    ep,
-                    template,
-                    depth,
+                require_committed_budget(
+                    measure_throughput_cell_from_corpus_with_suffix(
+                        ep,
+                        template,
+                        depth,
+                        cfg.committed_tokens,
+                        C1_CONCURRENCY,
+                        &rotated,
+                        &instruction,
+                    ),
                     cfg.committed_tokens,
-                    C1_CONCURRENCY,
-                    &rotated,
-                    &instruction,
+                    true,
                 )
             }
             Some(Err(error)) => failed_cell(depth, cfg.committed_tokens, error.clone()),
             None => measure_throughput_cell(ep, template, depth, cfg.committed_tokens, C1_CONCURRENCY),
         })
-        .map(|cell| require_committed_budget(cell, cfg.committed_tokens))
         .collect();
     Record {
         session: cfg.session.clone(),
@@ -413,12 +450,12 @@ mod tests {
 
     /// An endpoint that stops every request after `stop_after` tokens (the
     /// reference at its own EOS) and remembers the prompts it was sent.
-    struct StoppingEndpoint {
+    struct RecordingEndpoint {
         stop_after: Option<u32>,
         prompts: std::sync::Mutex<Vec<String>>,
     }
 
-    impl Endpoint for StoppingEndpoint {
+    impl Endpoint for RecordingEndpoint {
         fn complete(&self, req: &Request) -> Result<Outcome, String> {
             self.prompts.lock().unwrap().push(req.prompt.clone());
             let mut short = req.clone();
@@ -440,7 +477,7 @@ mod tests {
     fn a_bank_shorter_than_the_deepest_cell_is_tiled_from_a_distinct_offset_per_depth() {
         let bank: Vec<u32> = (0..65_536).map(|i| ((i * 37) % 900) as u32 + 100).collect();
         let (dir, corpus) = write_corpus_file(&bank);
-        let ep = StoppingEndpoint { stop_after: None, prompts: Default::default() };
+        let ep = RecordingEndpoint { stop_after: None, prompts: Default::default() };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
         std::fs::remove_dir_all(&dir).ok();
         assert!(record.all_cold(), "{}", record.render());
@@ -458,7 +495,7 @@ mod tests {
     #[test]
     fn every_depth_prompt_asks_for_at_least_the_committed_budget() {
         let (dir, corpus) = write_corpus_file(&corpus_bank());
-        let ep = StoppingEndpoint { stop_after: None, prompts: Default::default() };
+        let ep = RecordingEndpoint { stop_after: None, prompts: Default::default() };
         measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
         std::fs::remove_dir_all(&dir).ok();
         for prompt in ep.prompts.into_inner().unwrap() {
@@ -471,7 +508,7 @@ mod tests {
     #[test]
     fn a_sample_that_stops_short_of_the_committed_budget_is_void() {
         let (dir, corpus) = write_corpus_file(&corpus_bank());
-        let ep = StoppingEndpoint { stop_after: Some(10), prompts: Default::default() };
+        let ep = RecordingEndpoint { stop_after: Some(10), prompts: Default::default() };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
         std::fs::remove_dir_all(&dir).ok();
         assert!(!record.all_cold());
@@ -479,8 +516,45 @@ mod tests {
             let sample = &cell.samples[0];
             assert!(sample.void, "{sample:?}");
             let reason = sample.void_reason.as_deref().unwrap_or("");
-            assert!(reason.contains("10") && reason.contains("512"), "{reason}");
+            assert!(reason.contains("10") && reason.contains(&COMMITTED_TOKENS.to_string()), "{reason}");
         }
+    }
+
+    /// #162: the filler path sends no instruction, so a short run there is
+    /// not held to the committed budget.
+    #[test]
+    fn a_cell_without_the_instruction_is_not_held_to_the_committed_budget() {
+        let ep = RecordingEndpoint { stop_after: Some(10), prompts: Default::default() };
+        let cell = measure_throughput_cell(&ep, &MockTemplate, 64, 512, C1_CONCURRENCY);
+        let held = require_committed_budget(cell.clone(), 512, true);
+        assert!(held.samples.iter().all(|s| s.void), "the instructed path voids a short run");
+        let free = require_committed_budget(cell, 512, false);
+        assert!(free.samples.iter().all(|s| !s.void), "{:?}", free.samples);
+    }
+
+    /// #162: a bank whose period divides the depth stride would align two
+    /// depths; the measurement refuses it instead of reusing a prefix.
+    #[test]
+    fn a_bank_whose_period_aligns_two_depths_is_refused() {
+        // 12 ids, period 4: the starts 0, 4, 8 all land on id 100.
+        let periodic: Vec<u32> = (0..12).map(|i| 100 + (i % 4) as u32).collect();
+        assert!(prove_depth_offsets(&periodic).is_err());
+        let distinct: Vec<u32> = (0..12).map(|i| 100 + i as u32).collect();
+        assert!(prove_depth_offsets(&distinct).is_ok());
+
+        let (dir, corpus) = write_corpus_file(&periodic);
+        let ep = RecordingEndpoint { stop_after: None, prompts: Default::default() };
+        let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(record.cells.iter().all(|c| c.error.as_deref().is_some_and(|e| e.contains("share a prefix"))));
+        assert!(ep.prompts.into_inner().unwrap().is_empty(), "nothing was sent");
+    }
+
+    /// #162: the instruction the ITL lanes carry and the one G5 builds are
+    /// one text.
+    #[test]
+    fn the_g5_instruction_is_the_itl_instruction_at_its_budget() {
+        assert_eq!(decode_instruction(crate::g3::ITL_DECODE_MAX_TOKENS), crate::g3::ITL_DECODE_INSTRUCTION);
     }
 
     #[test]

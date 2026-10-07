@@ -81,13 +81,19 @@ pub enum FinishReason {
 /// The raw outcome of a single request completion.
 #[derive(Debug, Clone)]
 pub struct Outcome {
-    /// Time to first token (ms). The first generated token of *either*
+    /// Time to first token (ms), measured **per chunk**: the arrival of the
+    /// first chunk carrying text. The first generated token of *either*
     /// channel — a turn that thinks before it answers spent its prefill
     /// exactly once (GitHub #137).
     pub ttft_ms: f64,
     /// Wall-clock duration of the whole request (ms).
     pub total_ms: f64,
-    /// Number of tokens generated, **both channels together** — the thinking
+    /// Number of tokens generated, in **tokens**: the engine's own
+    /// `usage.completion_tokens` when the stream carried it (a request
+    /// with [`Request::include_usage`]) and it ran to its end, else the
+    /// **chunk** count, which undercounts an engine that packs a verify
+    /// round's run into one chunk — and is all a cancelled stream has, since
+    /// the usage chunk comes last. Both channels together — the thinking
     /// channel is decode work like any other, and a throughput cell that
     /// dropped it would read zero for a turn that answers entirely inside
     /// `<think>` (GitHub #137). [`Outcome::reasoning_tokens`] carries the
@@ -101,8 +107,10 @@ pub struct Outcome {
     /// (`delta.reasoning_content` / `message.reasoning_content`), empty when
     /// the turn did not think or thinking was disabled.
     pub reasoning_output: String,
-    /// How many of [`Outcome::n_tokens`] carried text on the reasoning
-    /// channel. It is a count of tokens, not a partition of them: a chunk
+    /// How many **chunks** carried text on the reasoning channel (the usage
+    /// figure does not split channels), so it stays in the unit of
+    /// [`Outcome::token_times_ms`] even when usage replaced
+    /// [`Outcome::n_tokens`]. It is a count of tokens, not a partition of them: a chunk
     /// that somehow carried both channels at once counts once in each, so
     /// `n_tokens - reasoning_tokens` is a lower bound on the answer tokens
     /// rather than their exact number. The server never sends such a chunk
@@ -121,8 +129,9 @@ pub struct Outcome {
     /// the engine does not report the field at all, which is not the same
     /// as a reported zero; see [`Outcome::computed_prefill_tokens`].
     pub cached_prompt_tokens: Option<u32>,
-    /// The arrival time of every generated token, in ms since the request was
-    /// sent (streaming only; empty for a non-streaming response). This is
+    /// The arrival time of every generated **chunk**, in ms since the request
+    /// was sent (one entry per chunk, so its length is the chunk count, not
+    /// [`Outcome::n_tokens`] when usage replaced it; streaming only; empty for a non-streaming response). This is
     /// what the G3 inter-token-latency cell reads: a decode lane's inter-
     /// token intervals are the consecutive differences of this series
     /// ([`crate::g3`]), sampled continuously rather than reduced to a
@@ -1066,6 +1075,37 @@ mod tests {
             Some(DEFAULT_REQUEST_TIMEOUT),
             "an unparseable value falls back to the default rather than to no deadline"
         );
+    }
+
+    /// A usage chunk that arrives after the tokens, as a stream sends it.
+    const STREAM_WITH_USAGE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[test]
+    fn a_stream_that_ran_to_its_end_reports_the_engines_own_token_count() {
+        let out = read_sse_stream(STREAM_WITH_USAGE.as_bytes(), "u", Instant::now(), &mut |_| true).unwrap();
+        assert_eq!(out.n_tokens, 9, "usage, not the 3 chunks");
+        assert_eq!(out.token_times_ms.len(), 3);
+    }
+
+    #[test]
+    fn a_cancelled_stream_keeps_the_chunk_count() {
+        // The client stops after two chunks, so the usage chunk is never
+        // read and the count is the chunks seen (GitHub #162).
+        let mut seen = 0;
+        let out = read_sse_stream(STREAM_WITH_USAGE.as_bytes(), "u", Instant::now(), &mut |_| {
+            seen += 1;
+            seen < 2
+        })
+        .unwrap();
+        assert_eq!(out.n_tokens, 2);
+        assert_eq!(out.token_times_ms.len(), 2);
+        assert_eq!(out.finish_reason, Some(FinishReason::Cancelled));
     }
 
     #[test]
