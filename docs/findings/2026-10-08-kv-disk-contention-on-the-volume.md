@@ -21,31 +21,34 @@ the spill.
 
 RTX 5090 (PCIe Gen 3 x16 on this host), the Flash-Next artifact and the
 tier's files both on F: (NVMe). Branch `kv-p2-disk` with #309 P1's pool
-policy merged locally (`kv_pool` at one 262,144-token context; P1 at
-`2c09568`), because only P1 lets the pool be cut so that a spill can be
-forced on Flash-Next. 4 decode lanes, 8,192-token prefill chunks, KV-RAM off
+policy (runs 2-3 on a local merge of P1 at `2c09568`, runs 4-5 after main's
+merge of it, `cf72ec4`): the pool cut to one 262,144-token context with
+`--kv-pool-bytes`'s token form, which is what lets a spill be forced on
+Flash-Next. 4 decode lanes, 8,192-token prefill chunks, KV-RAM off
 (the spill goes device -> disk), prompt reuse off, `--ngram-hot-bytes 0`
 (every row a gather stages is read from the artifact). A is an `agent`
 request of 210,000 prompt tokens: ~1.02 GB of state (a 130 MB image and
 4,224 bytes a token).
 
-**Decode** (`crates/server/tests/kv_disk_contention_gpu.rs`, run 3). B and C
+**Decode** (`crates/server/tests/kv_disk_contention_gpu.rs`). B and C
 (`interactive`, 2,000-token prompts) decode at width 2 alone; then again while
 A is written to the disk to make room for E. The spill window is E's arrival
 to the step A's file committed, less the step that also ran E's first chunk.
 
-| | ITL p50 | ITL p99 | gaps |
-|---|---|---|---|
-| width 2, no spill | 12.16 ms | 22.50 ms | 398 |
-| width 2, beside the 1 GB spill (626 ms) | 12.85 ms (+5.7%) | 17.53 ms | 94 |
+| run | ITL p50 alone | ITL p50 beside the spill | ITL p99 alone / beside | spill window |
+|---|---|---|---|---|
+| 3 | 12.16 ms | 12.85 ms (+5.7%) | 22.50 / 17.53 ms | 626 ms |
+| 4 | 12.21 ms | 13.20 ms (+8.1%) | 22.83 / 17.24 ms | 636 ms |
+| 5 | 12.18 ms | 12.97 ms (+6.5%) | 22.71 / 17.28 ms | 629 ms |
 
-Run 2 measured +2.9% on p50 (12.58 against 12.22 ms); its p99 counted E's
-first prefill chunk as a decode gap, which run 3's window leaves out.
+398 gaps alone and 94 beside the spill in each run. Run 2 measured +2.9% on
+p50 (12.58 against 12.22 ms); its p99 counted E's first prefill chunk as a
+decode gap, which the later runs' window leaves out.
 
 **Prefill** (same test). F (16,384 tokens, two chunks) prefilled alone took
-2,810 / 2,847 ms a chunk with 1,109 / 1,103 ms of n-gram gather; with G
-arriving to move A2 (another ~1 GB `agent`) it took 2,831 / 2,860 ms with
-1,124 / 1,117 ms of gather. In both runs neither chunk ran with the spill in
+2,790-2,860 ms a chunk with 1,092-1,116 ms of n-gram gather (runs 3-5); with
+G arriving to move A2 (another ~1 GB `agent`) it took 2,819-2,863 ms with
+1,107-1,130 ms of gather. In every run neither chunk ran with the spill in
 flight: G, the request that needs the room, waits for the prefill F holds,
 and the spill starts when F's prefill is done.
 
@@ -62,14 +65,14 @@ queued as the first gather starts.
 | behind the prefill gate | 1,159 / 1,196 ms | 1,191 / 1,213 ms | 1,949 ms (run 2) |
 | without the gate | 1,576 / 1,422 ms | 1,161 / 1,158 ms | 675 ms (run 2) |
 
-Raw samples: the main checkout's `.scratch/kv-p2/ac25-contention-run{2,3}.json`
+Raw samples: the main checkout's `.scratch/kv-p2/ac25-contention-run{2,3,4,5}.json`
 and `ac25-volume-run{1,2}.json` with their logs (run 1's `write_ms` timed the
 whole loop, not the blob; run 2's is the blob's).
 
 ## Finding
 
 - **Both bounds hold.** Two lanes decoding beside a 1 GB device -> disk
-  spill keep ITL p50 within +6% (+3% in the other run), and their p99 does
+  spill keep ITL p50 within +3% to +8% over four runs, and their p99 does
   not move up; a prefill chunk's wall time and gather are unchanged (+0.5-
   0.7%, inside run-to-run spread).
 - **A spill does not run beside a prefill chunk.** The scheduler starts a

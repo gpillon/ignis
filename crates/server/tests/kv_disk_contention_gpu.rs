@@ -281,7 +281,9 @@ fn a_one_gigabyte_spill_beside_a_prefill_and_beside_two_decoding_lanes() {
     let a2 = rig.sched.submit(input(prompt(6, A_PROMPT), 8000), RequestClass::Agent).unwrap();
     rig.until_tokens(a2, 4);
     let from = rig.mark();
-    let f = rig.sched.submit(input(prompt(5, 16_384), 1), RequestClass::Interactive).unwrap();
+    // F decodes on past its prefill, so G -- the prefill head once F's is
+    // done -- still finds A2, F and itself too many for the pool.
+    let f = rig.sched.submit(input(prompt(5, 16_384), 64), RequestClass::Interactive).unwrap();
     let g = rig.sched.submit(input(prompt(7, 40_000), 1), RequestClass::Interactive).unwrap();
     while rig.tokens_of(g) == 0 {
         assert!(!rig.sched.is_idle(), "G never ran");
