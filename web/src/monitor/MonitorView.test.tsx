@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, KV_DISK_EXPOSITION } from "./fixture.ts";
 import { MonitorView } from "./MonitorView.tsx";
 import { applyScrape, initialMonitor } from "./scrape.ts";
 
@@ -41,8 +41,22 @@ describe("MonitorView", () => {
     // GitHub #224: three tier rows, with disk present and visibly inert
     // rather than absent or showing a zero.
     for (const tier of ["VRAM", "RAM", "Disk"]) expect(html).toContain(tier);
-    expect(html).toContain("not implemented");
+    expect(html).toContain("off on this load");
+    expect(html).not.toContain("not implemented");
     expect(html).toContain("Live");
+    // No disk bar and no disk columns without the tier.
+    expect(html).not.toContain("KV-disk");
+    expect(html).not.toContain("Disk <span");
+  });
+
+  it("makes the Disk row live and draws the disk bar on a load with the KV-disk tier (spec vram-budget/03)", () => {
+    const now = Date.now();
+    const state = applyScrape(initialMonitor(), { kind: "ok", text: KV_DISK_EXPOSITION }, now, 3);
+    const html = renderToStaticMarkup(<MonitorView state={state} />).replace(/<!-- -->/g, "");
+    expect(html).not.toContain("off on this load");
+    expect(html).toContain("KV-disk");
+    expect(html).toContain("25% in use");
+    expect(html).toContain("Disk <span");
   });
 
   it("names the expert cache and the residency, and no longer says the rest is the KV pool's (GitHub #306)", () => {

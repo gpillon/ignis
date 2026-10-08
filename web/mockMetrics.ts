@@ -21,6 +21,8 @@ const KV_PAGE_BYTES = 1_835_008;
 const KV_POOL_PAGES = 4_032;
 const KV_PAGE_TOKENS = 256;
 const KV_RAM_ARENA_BYTES = 8 * 1024 ** 3;
+/** The KV-disk tier (spec vram-budget/03): this mock models a load with it, so the Disk row is live. */
+const KV_DISK_BYTES = 64 * 1024 ** 3;
 const RETAINED_SLOTS = 10;
 /** Of those, the ones in the pinned host block (GitHub #281), and one packed image's bytes. */
 const RETAINED_HOST_SLOTS = 8;
@@ -119,6 +121,8 @@ export function createMetricsSim(start = Date.now()) {
     const key = `${family}/${tier}/${kind}`;
     retained[key] = (retained[key] ?? 0) + by;
   };
+  /** The KV-disk tier: committed files (retained images), live spills by source, and refused operations. */
+  const disk = { files: 0, spills: { device: 0, kv_ram: 0 }, failures: { write: 0, read: 0 } };
   const skips: Record<string, number> = { publish_skipped_no_slot: 0, capture_skipped_no_slot: 0, capture_skipped_no_page: 0 };
   /** The slots holding an image, and how many of those were spilled to KV-RAM. */
   const slots = { inUse: 0, spilled: 0 };
@@ -133,6 +137,17 @@ export function createMetricsSim(start = Date.now()) {
     if (roll < 0.3) {
       bump("hits", "device", "checkpoint");
       bump("reusedTokens", "device", "checkpoint", 400 + Math.floor(Math.random() * 3_000));
+    } else if (roll < 0.35 && disk.files > 0) {
+      // An image brought back from disk; now and then the file is torn and the request re-prefills.
+      disk.files--;
+      if (Math.random() < 0.03) {
+        disk.failures.read++;
+        bump("misses", "disk", "checkpoint");
+      } else {
+        bump("hits", "disk", "checkpoint");
+        bump("restores", "disk", "checkpoint");
+        bump("reusedTokens", "disk", "checkpoint", 400 + Math.floor(Math.random() * 3_000));
+      }
     } else if (roll < 0.4 && slots.spilled > 0) {
       bump("hits", "kv_ram", "checkpoint");
       bump("restores", "kv_ram", "checkpoint");
@@ -164,8 +179,15 @@ export function createMetricsSim(start = Date.now()) {
       if (slots.spilled * RETAINED_BLOB_BYTES + RETAINED_BLOB_BYTES <= KV_RAM_ARENA_BYTES) {
         bump("spills", "kv_ram", kind);
         slots.spilled++;
-      } else {
+      } else if (Math.random() < 0.01) {
+        // The write is refused (margin or IO error): the image stays where it was, so it is given up.
+        disk.failures.write++;
         bump("discards", "device", kind);
+      } else if ((disk.files + 1) * RETAINED_BLOB_BYTES <= KV_DISK_BYTES) {
+        bump("spills", "disk", kind);
+        disk.files++;
+      } else {
+        bump("discards", "disk", kind);
       }
       slots.inUse--;
     }
@@ -231,8 +253,15 @@ export function createMetricsSim(start = Date.now()) {
     if (running.length === LANES && waiting.length > 2 && Math.random() < 0.004) {
       count.evictions++;
       // The tier only drops a live snapshot once it is itself full, so a drop
-      // trails an eviction rather than happening beside it (GitHub #224).
-      if (Math.random() < 0.15) count.ramDrops++;
+      // trails an eviction rather than happening beside it (GitHub #224). With
+      // the disk below, a full RAM demotes the snapshot instead of dropping it,
+      // and a sequence KV-RAM has no room for goes to disk straight from the device.
+      if (Math.random() < 0.15) {
+        if (Math.random() < 0.7) disk.spills.kv_ram++;
+        else count.ramDrops++;
+      } else if (Math.random() < 0.1) {
+        disk.spills.device++;
+      }
     }
   }
 
@@ -272,7 +301,7 @@ export function createMetricsSim(start = Date.now()) {
         declare(name, "counter", help);
         const family = name.replace(/^ignis_retained_(state_)?/, "").replace(/_total$/, "");
         const key = family === "reused_tokens" ? "reusedTokens" : family;
-        for (const tier of ["device", "kv_ram"]) {
+        for (const tier of ["device", "kv_ram", "disk"]) {
           for (const kind of ["checkpoint", "prefix"]) out.push(`${name}{tier="${tier}",kind="${kind}"} ${retained[`${key}/${tier}/${kind}`] ?? 0}`);
         }
       }
@@ -295,6 +324,12 @@ export function createMetricsSim(start = Date.now()) {
       }
       declare("ignis_kv_ram_arena_bytes", "gauge", "The pinned host KV-RAM arena: what it holds, and what is used of it.");
       out.push(`ignis_kv_ram_arena_bytes{state="capacity"} ${KV_RAM_ARENA_BYTES}`, `ignis_kv_ram_arena_bytes{state="used"} ${slots.spilled * RETAINED_BLOB_BYTES}`);
+      declare("ignis_kv_disk_bytes", "gauge", "The KV-disk tier: its effective budget, and the bytes the committed files hold.");
+      out.push(`ignis_kv_disk_bytes{state="capacity"} ${KV_DISK_BYTES}`, `ignis_kv_disk_bytes{state="used"} ${disk.files * RETAINED_BLOB_BYTES}`);
+      declare("ignis_kv_disk_spills_total", "counter", "Live sequences written into the disk tier, by where they came from.");
+      out.push(`ignis_kv_disk_spills_total{from="device"} ${disk.spills.device}`, `ignis_kv_disk_spills_total{from="kv_ram"} ${disk.spills.kv_ram}`);
+      declare("ignis_kv_disk_failures_total", "counter", "Disk operations refused, by operation.");
+      out.push(`ignis_kv_disk_failures_total{op="write"} ${disk.failures.write}`, `ignis_kv_disk_failures_total{op="read"} ${disk.failures.read}`);
       declare("ignis_retained_slots", "gauge", "Retained slots this load hands out, and how many hold an image.");
       out.push(`ignis_retained_slots{state="capacity"} ${RETAINED_SLOTS}`, `ignis_retained_slots{state="in_use"} ${slots.inUse}`);
       declare("ignis_retained_host_slots", "gauge", "Of the retained slots, those whose images live in the pinned host block.");
