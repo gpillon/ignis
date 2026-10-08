@@ -36,6 +36,17 @@
 //! so that E cannot fit beside C. Machine-local: the Flash-Next artifact
 //! (`IGNIS_FLASH_NEXT_DIR`), the tier's files under this checkout's
 //! `.scratch/kv-disk-gpu/` (or `IGNIS_KV_DISK_TEST_DIR`).
+//!
+//! The text decides the expert misses (GitHub #310): a round's misses are
+//! those of what its lanes generate, and greedy decode is not
+//! batch-invariant, so two runs whose batches differ -- a moved run and the
+//! control -- generate different text once they part. With `IGNIS_KV_P3_RAW`
+//! each run also writes what every request generated, by its prompt's seed
+//! (`ac37-<leg>-tokens.json`), and `IGNIS_AC37_FORCE=<such a file>` makes
+//! every request generate exactly that (a forced literal, one token a
+//! round): the same text whatever moves. A forced round is never a captured
+//! graph, so a forced run's ITL is not comparable with a free run's; its
+//! misses are.
 
 #![cfg(feature = "cuda")]
 
@@ -87,7 +98,7 @@ fn prompt(seed: u32, n: u32) -> Vec<u32> {
     (0..n).map(|i| 1000 + (i * 7919 + seed * 104_729) % 60_000).collect()
 }
 
-fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
+fn input(tokens: Vec<u32>, max_tokens: u32, forced: Option<Vec<u32>>) -> RequestInput {
     RequestInput {
         decision: None,
         model: MODEL.into(),
@@ -99,9 +110,22 @@ fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
         system_block_tokens: None,
         reuse_boundaries: Vec::new(),
         constrained: None,
-        forced_literal: None,
+        forced_literal: forced.map(|tokens| {
+            std::sync::Arc::new(ignis_core::forced_literal::ForcedLiteral::at_generation(tokens).expect("a forced text"))
+        }),
         warm_up: false,
     }
+}
+
+/// What `IGNIS_AC37_FORCE` names every request to generate, by its prompt's
+/// seed (GitHub #310): a run's own `ac37-<leg>-tokens.json`.
+fn forced_texts() -> HashMap<u32, Vec<u32>> {
+    let Some(path) = std::env::var_os("IGNIS_AC37_FORCE") else {
+        return HashMap::new();
+    };
+    let text = std::fs::read_to_string(&path).expect("read IGNIS_AC37_FORCE");
+    let by_seed: HashMap<String, Vec<u32>> = serde_json::from_str(&text).expect("IGNIS_AC37_FORCE is {seed: [tokens]}");
+    by_seed.into_iter().map(|(seed, tokens)| (seed.parse().expect("a seed"), tokens)).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,9 +151,49 @@ struct Rig {
     sched: ConcreteScheduler,
     steps: Vec<Step>,
     counters: Option<std::sync::Arc<ignis_core::flash_next_counters::FlashNextCounterSource>>,
+    /// Each request's prompt seed: what names it across runs, whose request
+    /// ids differ (GitHub #310).
+    seeds: HashMap<RequestId, u32>,
+    /// What each seed is made to generate (`IGNIS_AC37_FORCE`), if anything.
+    forced: HashMap<u32, Vec<u32>>,
 }
 
 impl Rig {
+    fn new(
+        sched: ConcreteScheduler,
+        counters: Option<std::sync::Arc<ignis_core::flash_next_counters::FlashNextCounterSource>>,
+    ) -> Self {
+        Self { sched, steps: Vec::new(), counters, seeds: HashMap::new(), forced: forced_texts() }
+    }
+
+    /// Submit the prompt of `seed`, `prompt_tokens` long, generating
+    /// `max_tokens` -- the forced text of `seed` when one is named.
+    fn submit(&mut self, seed: u32, prompt_tokens: u32, max_tokens: u32, class: RequestClass) -> RequestId {
+        let forced = self.forced.get(&seed).map(|tokens| {
+            assert!(tokens.len() >= max_tokens as usize, "the forced text of seed {seed} covers its max_tokens");
+            tokens[..max_tokens as usize].to_vec()
+        });
+        let id = self.sched.submit(input(prompt(seed, prompt_tokens), max_tokens, forced), class).unwrap();
+        self.seeds.insert(id, seed);
+        id
+    }
+
+    /// What every request generated, by its prompt's seed, as JSON: what
+    /// `IGNIS_AC37_FORCE` reads (GitHub #310).
+    fn write_texts(&self, path: &Path) {
+        let mut by_seed: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+        for event in self.events() {
+            if let SchedEvent::Token { request, token } = event {
+                by_seed.entry(self.seeds[request]).or_default().push(*token);
+            }
+        }
+        let rows: Vec<String> = by_seed
+            .iter()
+            .map(|(seed, tokens)| format!("\"{seed}\":{tokens:?}"))
+            .collect();
+        std::fs::write(path, format!("{{{}}}\n", rows.join(",\n"))).expect("write the generated texts");
+    }
+
     /// Every step as one JSON row -- when it ended (Unix ms), its wall time,
     /// the transfer passes' time, how many requests decoded in it, whether it
     /// ran a prefill chunk or had a move in flight, and its move and end
@@ -168,6 +232,15 @@ impl Rig {
                         _ => None,
                     })
                     .collect();
+                // GitHub #310: the step's tokens, by prompt seed.
+                let tokens: Vec<[u32; 2]> = s
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        SchedEvent::Token { request, token } => Some([self.seeds[request], *token]),
+                        _ => None,
+                    })
+                    .collect();
                 let facts: Vec<String> = s
                     .events
                     .iter()
@@ -191,7 +264,7 @@ impl Rig {
                         )
                     });
                 format!(
-                    "{{\"unix_ms\":{:.1},\"wall_ms\":{:.3},\"pump_ms\":{:.3},\"decoded\":{:?},\"prefill\":{},\"busy\":{},\"facts\":{:?},\"decode_hits\":{hits},\"decode_misses\":{misses},\"decode_stall_ms\":{:.3},\"ngram_file_rows\":{ngram},\"slots_in_use\":{in_use},\"slots_capacity\":{capacity},\"prefetch_issued\":{prefetch_issued},\"prefetch_used\":{prefetch_used}}}",
+                    "{{\"unix_ms\":{:.1},\"wall_ms\":{:.3},\"pump_ms\":{:.3},\"decoded\":{:?},\"prefill\":{},\"busy\":{},\"facts\":{:?},\"decode_hits\":{hits},\"decode_misses\":{misses},\"decode_stall_ms\":{:.3},\"ngram_file_rows\":{ngram},\"slots_in_use\":{in_use},\"slots_capacity\":{capacity},\"prefetch_issued\":{prefetch_issued},\"prefetch_used\":{prefetch_used},\"tokens\":{tokens:?}}}",
                     unix_ms(s.at),
                     ms(s.wall),
                     ms(s.pump),
@@ -500,24 +573,24 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         ));
         return None;
     }
-    let mut rig = Rig { sched, steps: Vec::new(), counters: reserved.flash_next.clone() };
+    let mut rig = Rig::new(sched, reserved.flash_next.clone());
     let interactive = RequestClass::Interactive;
 
     // ── the width-2 baseline: two lanes alone ──────────────────────────────
     let b0 = [
-        rig.sched.submit(input(prompt(20, B_PROMPT), B0_TOKENS), interactive).unwrap(),
-        rig.sched.submit(input(prompt(21, B_PROMPT), B0_TOKENS), interactive).unwrap(),
+        rig.submit(20, B_PROMPT, B0_TOKENS, interactive),
+        rig.submit(21, B_PROMPT, B0_TOKENS, interactive),
     ];
     let from = rig.mark();
     rig.to_idle();
     let width2 = rig.steady(from, rig.mark());
 
     // ── C, then B1 and B2 beside it ────────────────────────────────────────
-    let c = rig.sched.submit(input(prompt(1, C_PROMPT), C_TOKENS), RequestClass::Agent).unwrap();
+    let c = rig.submit(1, C_PROMPT, C_TOKENS, RequestClass::Agent);
     rig.until_tokens(c, 4);
     let b = [
-        rig.sched.submit(input(prompt(2, B_PROMPT), B1_TOKENS), interactive).unwrap(),
-        rig.sched.submit(input(prompt(3, B_PROMPT), B2_TOKENS), interactive).unwrap(),
+        rig.submit(2, B_PROMPT, B1_TOKENS, interactive),
+        rig.submit(3, B_PROMPT, B2_TOKENS, interactive),
     ];
     rig.until_tokens(b[0], 16);
     rig.until_tokens(b[1], 16);
@@ -526,7 +599,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
     let width3_to = rig.mark();
 
     // ── E0: an arrival that fits beside C moves nothing ────────────────────
-    let e0 = rig.sched.submit(input(prompt(4, E0_PROMPT), E_TOKENS), interactive).unwrap();
+    let e0 = rig.submit(4, E0_PROMPT, E_TOKENS, interactive);
     rig.until(|rig| rig.finished_at_length(e0));
     assert!(
         !rig.has(|e| matches!(e, SchedEvent::Evicted { .. } | SchedEvent::DiskSpilled { .. })),
@@ -541,7 +614,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
     // issues its first window as it starts, beside that step's round; the
     // disk's first is its file's.
     let from = rig.mark();
-    let e = rig.sched.submit(input(prompt(5, E_PROMPT), E_TOKENS), interactive).unwrap();
+    let e = rig.submit(5, E_PROMPT, E_TOKENS, interactive);
     let landed_out = move |ev: &SchedEvent| match tier {
         Tier::KvRam => matches!(ev, SchedEvent::Evicted { request, .. } if *request == c),
         Tier::KvDisk => matches!(ev, SchedEvent::DiskSpilled { request, from: DiskSource::Device } if *request == c),
@@ -608,8 +681,8 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
 
     // ── the baseline: two fresh lanes alone at width 2, last ───────────────
     let b9 = [
-        rig.sched.submit(input(prompt(22, B_PROMPT), B9_TOKENS), interactive).unwrap(),
-        rig.sched.submit(input(prompt(23, B_PROMPT), B9_TOKENS), interactive).unwrap(),
+        rig.submit(22, B_PROMPT, B9_TOKENS, interactive),
+        rig.submit(23, B_PROMPT, B9_TOKENS, interactive),
     ];
     let from = rig.mark();
     rig.to_idle();
@@ -662,7 +735,9 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
     let outs = rig.events().filter(|ev| matches!(ev, SchedEvent::Evicted { .. } | SchedEvent::DiskSpilled { .. })).count();
     assert_eq!(outs, 1, "C moved out once, and nothing else moved");
     if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
+        std::fs::create_dir_all(&dir).expect("the raw samples' directory");
         rig.write_timeline(&dir.join(format!("ac37-{tier:?}-steps.json")));
+        rig.write_texts(&dir.join(format!("ac37-{tier:?}-tokens.json")));
     }
     drop(rig);
     drop(blobs);
@@ -751,22 +826,22 @@ fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
             return;
         }
     };
-    let mut rig = Rig { sched, steps: Vec::new(), counters: reserved.flash_next.clone() };
+    let mut rig = Rig::new(sched, reserved.flash_next.clone());
     let interactive = RequestClass::Interactive;
-    let c = rig.sched.submit(input(prompt(1, C_PROMPT), C_TOKENS), RequestClass::Agent).unwrap();
+    let c = rig.submit(1, C_PROMPT, C_TOKENS, RequestClass::Agent);
     rig.until_tokens(c, 4);
     let b = [
-        rig.sched.submit(input(prompt(2, B_PROMPT), B1_TOKENS), interactive).unwrap(),
-        rig.sched.submit(input(prompt(3, B_PROMPT), B2_TOKENS), interactive).unwrap(),
+        rig.submit(2, B_PROMPT, B1_TOKENS, interactive),
+        rig.submit(3, B_PROMPT, B2_TOKENS, interactive),
     ];
     rig.until_tokens(b[0], 16);
     rig.until_tokens(b[1], 16);
     let width3_from = rig.mark();
     rig.until_tokens(b[0], 16 + WIDTH3_TOKENS);
     let width3_to = rig.mark();
-    let e0 = rig.sched.submit(input(prompt(4, E0_PROMPT), E_TOKENS), interactive).unwrap();
+    let e0 = rig.submit(4, E0_PROMPT, E_TOKENS, interactive);
     rig.until(|rig| rig.finished_at_length(e0));
-    let e = rig.sched.submit(input(prompt(5, E_PROMPT), E_TOKENS), interactive).unwrap();
+    let e = rig.submit(5, E_PROMPT, E_TOKENS, interactive);
     rig.until(|rig| rig.finished_at_length(e));
     let e_done = rig.mark();
     rig.until(|rig| rig.finished_at_length(b[0]));
@@ -801,6 +876,7 @@ fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
     if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
         std::fs::create_dir_all(&dir).expect("the raw samples' directory");
         rig.write_timeline(&dir.join("ac37-control-steps.json"));
+        rig.write_texts(&dir.join("ac37-control-tokens.json"));
     }
     drop(rig);
     drop(blobs);
