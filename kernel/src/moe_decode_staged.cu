@@ -64,10 +64,10 @@ namespace ignis_moe {
 namespace {
 
 constexpr int kMmaWarps = 16;
-constexpr int kAuxWarps = 4;
+constexpr int kAuxWarps = 8;
 constexpr int kAuxThreads = kAuxWarps * 32;
-constexpr int kAuxWarp0 = kMmaWarps;                   // aux warps 16..19
-constexpr int kProducerWarp = kMmaWarps + kAuxWarps;  // warps 20..23
+constexpr int kAuxWarp0 = kMmaWarps;                   // aux warps 16..23
+constexpr int kProducerWarp = kMmaWarps + kAuxWarps;  // warps 24..27
 constexpr int kProducerWarps = 4;
 constexpr int kProducerThreads = kProducerWarps * 32;
 constexpr int kThreads = (kProducerWarp + kProducerWarps) * 32;
@@ -92,7 +92,8 @@ __host__ __device__ constexpr int weight_bytes(int k2) { return kItemTiles * 16 
 
 static_assert(kMmaWarps * kGuKTiles == kItemTiles, "gate/up item shape");
 static_assert(kDnCols / 16 == 2 * kMmaWarps && kMmaWarps * 2 * kDnKTiles == kItemTiles, "down item shape");
-static_assert(kStagedMaxTokens <= kAuxWarps && kStagedMaxTokens * kTopK <= kDecodeMaxUnique, "tokens of a call");
+constexpr int kMaxUnique = kStagedMaxTokens * kTopK;  // distinct experts of a call
+static_assert(kStagedMaxTokens <= kAuxWarps && kMaxUnique <= 64, "tokens of a call");
 
 // An item's bytes past its weights: a gate/up item's suh slice and x slice, or a down item's
 // suh_down block, svh_down columns and the gate/up svh of its h block.
@@ -139,12 +140,10 @@ struct Meta {
 
 struct Shared {
   int n_unique;
-  int unique_id[kDecodeMaxUnique];
-  uint32_t unique_sel[kDecodeMaxUnique];
-  float unique_w[kDecodeMaxUnique][kDecodeMaxTokens];
-  int slot_of[kDecodeMaxTokens * kTopK];
-  int first[kDecodeMaxTokens * kTopK];
-  ignis_moe_slot slot[kStagedMaxTokens * kTopK][2];  // each distinct expert's slots, read once
+  int unique_id[kMaxUnique];
+  uint32_t unique_sel[kMaxUnique];
+  float unique_w[kMaxUnique][kStagedMaxTokens];
+  ignis_moe_slot slot[kMaxUnique][2];  // each distinct expert's slots, read once
   unsigned long long full[kSlots];   // producer -> aux, mma: the item's bytes landed
   unsigned long long empty[kSlots];  // aux, mma -> producer: the item's bytes are read
   unsigned long long a_full[2];      // aux -> mma: A buffer and meta ready
@@ -170,6 +169,26 @@ struct Params {
   long long *acc;
   unsigned long long *trace;  // kTrace only (moe_trace.h)
 };
+
+// Ticket t's item: every gate/up item first (expert-major, then h block, then k-split), then every
+// down item (expert-major, then h block, then column block). Interleaving each expert's down items
+// a few experts behind its gate/up items measured slower at 1-3 tokens (2026-10-08: 1 token 22.2-
+// 32.3 us at a lag of 8 to 2 experts against 21.3 all gate/up first): a down item taken early waits
+// on gate/up items still in flight.
+__device__ __forceinline__ void decode_ticket(int t, int n_gate_up, Header &h) {
+  if (t < n_gate_up) {
+    h.kind = kGateUp;
+    h.u = t / kGuItems;
+    h.block = t / kGuSplits % kGateUpBlocks;
+    h.sub = t % kGuSplits;
+  } else {
+    const int d = t - n_gate_up;
+    h.kind = kDown;
+    h.u = d / kDnItems;
+    h.block = d / kDnColBlocks % kGateUpBlocks;
+    h.sub = d % kDnColBlocks;
+  }
+}
 
 // ---- shared-memory barriers and copies ----------------------------------------------------------
 
@@ -226,53 +245,74 @@ __device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
   return v;
 }
 
-// The distinct experts of the call, as build_unique (moe_decode_common.cuh) leaves them, from a
-// copy of the ids and weights in shared memory: one round trip to global memory; then their
-// slots, another.
+// The distinct experts of the call, as build_unique (moe_decode_common.cuh) leaves them (only the
+// fields the staged kernel reads), and both slots of each: warp 0 holds the 10 x tokens selections
+// two to a lane, loads each one's slots right behind its id -- two dependent round trips to global
+// memory in all -- and finds first appearances with warp matches.
 __device__ void unique_experts(Shared &s, const int32_t *ids, const float *weights, const ignis_moe_slot *slots,
                                int tokens) {
-  __shared__ int32_t sid[kStagedMaxTokens * kTopK];
-  __shared__ float sw[kStagedMaxTokens * kTopK];
-  const int n = tokens * kTopK;
-  const int i = threadIdx.x;
-  if (i < n) {
-    sid[i] = ids[i];
-    sw[i] = weights[i];
-  }
-  for (int j = threadIdx.x; j < kDecodeMaxUnique * kDecodeMaxTokens; j += blockDim.x) (&s.unique_w[0][0])[j] = 0.0f;
-  if (i < kDecodeMaxUnique) s.unique_sel[i] = 0u;
+  for (int j = threadIdx.x; j < kMaxUnique * kStagedMaxTokens; j += blockDim.x) (&s.unique_w[0][0])[j] = 0.0f;
+  if (threadIdx.x < kMaxUnique) s.unique_sel[threadIdx.x] = 0u;
   __syncthreads();
-  if (i < n) {
-    const int e = sid[i];
-    int f = i;
-    for (int j = 0; j < i; ++j) {
-      if (sid[j] == e) {
-        f = j;
-        break;
-      }
+  if (threadIdx.x < 32) {
+    const int lane = threadIdx.x;
+    const int n = tokens * kTopK;  // <= 40
+    const bool v0 = lane < n, v1 = 32 + lane < n;
+    // Distinct sentinels for the empty places, so they match nothing.
+    const int e0 = v0 ? ids[lane] : -1 - lane;
+    const int e1 = v1 ? ids[32 + lane] : -100 - lane;
+    const float w0 = v0 ? weights[lane] : 0.0f;
+    const float w1 = v1 ? weights[32 + lane] : 0.0f;
+    ignis_moe_slot g0{}, d0{}, g1{}, d1{};
+    if (v0) {
+      g0 = load_slot(slots, e0, IGNIS_MOE_PROJ_GATE_UP);
+      d0 = load_slot(slots, e0, IGNIS_MOE_PROJ_DOWN);
     }
-    s.first[i] = f;
+    if (v1) {
+      g1 = load_slot(slots, e1, IGNIS_MOE_PROJ_GATE_UP);
+      d1 = load_slot(slots, e1, IGNIS_MOE_PROJ_DOWN);
+    }
+    const unsigned lt = (1u << lane) - 1u;
+    // Selection lane: its first appearance is the lowest lane holding the same id.
+    const unsigned m0 = __match_any_sync(0xFFFFFFFFu, e0);
+    const int first0 = __ffs(m0) - 1;
+    const unsigned b0 = __ballot_sync(0xFFFFFFFFu, v0 && first0 == lane);
+    const int u0 = __popc(b0 & lt);  // its distinct index, if first
+    // Selection 32 + lane: first unless one of the first 32 or a lower lane of its own half holds
+    // the same id.
+    int earlier = -1;  // the lane of the first 32 holding the same id
+    for (int k = 0; k < 32; ++k) {
+      if (__shfl_sync(0xFFFFFFFFu, e0, k) == e1 && earlier < 0) earlier = k;
+    }
+    const unsigned m1 = __match_any_sync(0xFFFFFFFFu, e1);
+    const int first1 = __ffs(m1) - 1;
+    const unsigned b1 = __ballot_sync(0xFFFFFFFFu, v1 && earlier < 0 && first1 == lane);
+    const int u1 = __popc(b0) + __popc(b1 & lt);
+    // Every selection's distinct index, from its first appearance.
+    const int s0 = __shfl_sync(0xFFFFFFFFu, u0, first0);
+    const int from_first = __shfl_sync(0xFFFFFFFFu, u0, earlier < 0 ? 0 : earlier);
+    const int from_own = __shfl_sync(0xFFFFFFFFu, u1, first1);
+    const int s1 = earlier >= 0 ? from_first : from_own;
+    if (v0 && first0 == lane) {
+      s.unique_id[u0] = e0;
+      s.slot[u0][IGNIS_MOE_PROJ_GATE_UP] = g0;
+      s.slot[u0][IGNIS_MOE_PROJ_DOWN] = d0;
+    }
+    if (v1 && earlier < 0 && first1 == lane) {
+      s.unique_id[u1] = e1;
+      s.slot[u1][IGNIS_MOE_PROJ_GATE_UP] = g1;
+      s.slot[u1][IGNIS_MOE_PROJ_DOWN] = d1;
+    }
+    if (v0) {
+      s.unique_w[s0][lane / kTopK] = w0;
+      atomicOr(&s.unique_sel[s0], 1u << (lane / kTopK));
+    }
+    if (v1) {
+      s.unique_w[s1][(32 + lane) / kTopK] = w1;
+      atomicOr(&s.unique_sel[s1], 1u << ((32 + lane) / kTopK));
+    }
+    if (lane == 0) s.n_unique = __popc(b0) + __popc(b1);
   }
-  __syncthreads();
-  if (i < n && s.first[i] == i) {
-    int slot = 0;
-    for (int j = 0; j < i; ++j) slot += s.first[j] == j;
-    s.slot_of[i] = slot;
-    s.unique_id[slot] = sid[i];
-  }
-  if (i == 0) {
-    int count = 0;
-    for (int j = 0; j < n; ++j) count += s.first[j] == j;
-    s.n_unique = count;
-  }
-  __syncthreads();
-  if (i < n) {
-    const int u = s.slot_of[s.first[i]];
-    s.unique_w[u][i / kTopK] = sw[i];
-    atomicOr(&s.unique_sel[u], 1u << (i / kTopK));
-  }
-  // Both slots of every distinct expert, read (and checked) once for the whole launch.
-  if (i < 2 * s.n_unique) s.slot[i / 2][i % 2] = load_slot(slots, s.unique_id[i / 2], i % 2);
   __syncthreads();
 }
 
@@ -360,17 +400,8 @@ __device__ void producer(Shared &s, const Params &p, char *ring, int n_gate_up, 
       h.ticket = ticket;
       if (ticket >= n_total) {
         h.kind = kEnd;
-      } else if (ticket < n_gate_up) {
-        h.kind = kGateUp;
-        h.u = ticket / kGuItems;
-        h.block = ticket / kGuSplits % kGateUpBlocks;
-        h.sub = ticket % kGuSplits;
       } else {
-        const int d = ticket - n_gate_up;
-        h.kind = kDown;
-        h.u = d / kDnItems;
-        h.block = d / kDnColBlocks % kGateUpBlocks;
-        h.sub = d % kDnColBlocks;
+        decode_ticket(ticket, n_gate_up, h);
       }
       if (h.kind != kEnd) {
         const int proj = h.kind == kGateUp ? IGNIS_MOE_PROJ_GATE_UP : IGNIS_MOE_PROJ_DOWN;
@@ -561,38 +592,50 @@ __device__ void prepare_gate_up(Meta &m, const char *extra, int tokens, __half *
   if (lane == 0) m.scale[t] = scale;
 }
 
-// The down item's operand: aux warp t < tokens reads gate and up block j's sums, rotates both,
-// applies svh and SwiGLU (h's block j), then h_j o suh_down, rotated, into A as fp16 under one
+// The down item's operand, two aux warps per token: warp 2t + 1 reads up block j's sums, rotates
+// them and applies svh, leaving them in token t's A row (as scratch); warp 2t does the same for
+// gate, applies SwiGLU (h's block j), then h_j o suh_down, rotated, into A as fp16 under one
 // power-of-two scale. The aux threads copy svh_down's 512 columns into the meta for the
 // reduction.
 __device__ void prepare_down(Meta &m, const Params &p, const char *extra, int tokens, __half *a) {
+  static_assert(2 * kStagedMaxTokens <= kAuxWarps, "two aux warps per token");
+  static_assert(128 * 4 <= kAStride * 2, "a token's up block fits its A row");
   const int lane = threadIdx.x & 31;
   const int aux = threadIdx.x - kAuxWarp0 * 32;
-  const int t = aux >> 5;
+  const int t = aux >> 6;
+  const bool up_warp = (aux >> 5) & 1;
   const Header &h = m.h;
   const __half *svh = reinterpret_cast<const __half *>(extra + kDnSvh);
   for (int i = aux; i < kDnCols; i += kAuxThreads) m.svh[i] = svh[i];
+  const __half *svh_gu = reinterpret_cast<const __half *>(extra + kDnSvhGu);
+  float *row = reinterpret_cast<float *>(a + t * kAStride);  // token t's A row, as scratch first
+  float v[4];
   if (t < tokens) {
-    const long long *sums = p.gate_up + (static_cast<size_t>(h.u) * p.cap + t) * kGateUpOut + 128 * h.block;
-    const __half *svh_gu = reinterpret_cast<const __half *>(extra + kDnSvhGu);
-    const __half *suh = reinterpret_cast<const __half *>(extra + kDnSuh);
-    float gate[4], up[4];
+    const long long *sums =
+        p.gate_up + (static_cast<size_t>(h.u) * p.cap + t) * kGateUpOut + (up_warp ? kInter : 0) + 128 * h.block;
 #pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      gate[q] = from_fixed(__ldcg(sums + 4 * lane + q));
-      up[q] = from_fixed(__ldcg(sums + kInter + 4 * lane + q));
-    }
-    warp_hadamard128(gate);
-    warp_hadamard128(up);
-    float v[4];
-    float mx = 0.0f;
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      const float g = gate[q] * __half2float(svh_gu[4 * lane + q]);
-      const float u = up[q] * __half2float(svh_gu[128 + 4 * lane + q]);
-      v[q] = silu(g) * u * __half2float(suh[4 * lane + q]);
-    }
+    for (int q = 0; q < 4; ++q) v[q] = from_fixed(__ldcg(sums + 4 * lane + q));
     warp_hadamard128(v);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) v[q] *= __half2float(svh_gu[(up_warp ? 128 : 0) + 4 * lane + q]);
+    if (up_warp) {
+#pragma unroll
+      for (int q = 0; q < 4; ++q) row[4 * lane + q] = v[q];
+    }
+  }
+  aux_sync();
+  float u[4];
+  if (t < tokens && !up_warp) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) u[q] = row[4 * lane + q];
+  }
+  aux_sync();  // the scratch is read before A overwrites it
+  if (t < tokens && !up_warp) {
+    const __half *suh = reinterpret_cast<const __half *>(extra + kDnSuh);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) v[q] = silu(v[q]) * u[q] * __half2float(suh[4 * lane + q]);
+    warp_hadamard128(v);
+    float mx = 0.0f;
 #pragma unroll
     for (int q = 0; q < 4; ++q) mx = fmaxf(mx, fabsf(v[q]));
     const float scale = fp16_operand_scale(warp_max(mx));
