@@ -983,7 +983,7 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
       <p className="text-[11px] text-ash">
         Tokens reused counts prompt tokens skipped and the two lookup rows count lookups; spills, discards and restores count images. A load that never spilled
         shows KV-RAM at zero, and a load with prompt reuse off shows every column at zero. A column shows a zero whether the load reported one or reported
-        nothing at all: the server emits all twenty-four series (thirty-six on a load with KV-disk) on every scrape, so an absent one means an older server, not an idle tier.
+        nothing at all: the server emits all twenty-four series (thirty-six on a load with the disk tier) on every scrape, so an absent one means an older server, not an idle tier.
       </p>
     </Card>
   );
