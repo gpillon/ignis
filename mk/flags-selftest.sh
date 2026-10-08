@@ -76,6 +76,19 @@ out="$(flags SPEC=off)"
 has "27B SPEC=off" "$out" "--spec off"
 lacks "27B SPEC=off" "$out" "--draft-tokens"
 
+# KV-disk (spec vram-budget/03): the knobs reach the server as named, the
+# server's defaults (16G on Flash-Next, off on the 27B) when they are not,
+# and `make config` names the budget and the directory a start will use.
+out="$(flags MODEL=flash-next KV_DISK_BYTES=8G KV_DISK_PATH=auto)"
+has "KV_DISK_*" "$out" "--kv-disk-bytes 8G"
+has "KV_DISK_*" "$out" "--kv-disk-path auto"
+out="$(flags MODEL=flash-next)"
+lacks "default" "$out" "--kv-disk"
+disk="$(make config CUDA=1 MODEL=flash-next KV_DISK_PATH=D:/kv 2>/dev/null | sed -n 's/^KV-DISK (CUDA=1) //p')"
+case "$disk" in *"budget=16G"*"dir=D:/kv/ignis-kv-disk/"*) ;; *) fail "KV-DISK: $disk" ;; esac
+disk="$(make config CUDA=1 2>/dev/null | sed -n 's/^KV-DISK (CUDA=1) //p')"
+case "$disk" in off*) ;; *) fail "27B KV-DISK is not off by default: $disk" ;; esac
+
 if [ "$failed" -ne 0 ]; then
     printf 'flags-selftest: %d failure(s)\n' "$failed" >&2
     exit 1

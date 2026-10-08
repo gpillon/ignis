@@ -274,12 +274,12 @@ The initial stable metric contract is:
 | `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
 | `ignis_kv_ram_evictions_total` | counter | none | Live host-tier snapshots dropped **out of** KV-RAM to make room; the owning request re-prefills from the start (#224) |
 | `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
-| `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Cumulative tokens skipped through retained state: a retained prefix (always `device`) or a prompt checkpoint, by the tier it came from and the kind it was |
-| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Retained state a request chose to resume from: a prompt checkpoint (not yet restored), or a retained prefix brought back from KV-RAM |
-| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Requests whose first prefill chunk landed with no checkpoint matching in a tier this load carries. **`kind=prefix` is zero by construction** — see the note below the table (#216, #222) |
-| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes written into the tier (today only `kv_ram`) |
-| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes that left the tier for nowhere |
-| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
+| `ignis_retained_reused_tokens_total` | counter | `tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix` | Cumulative tokens skipped through retained state: a retained prefix (always `device`) or a prompt checkpoint, by the tier it came from and the kind it was |
+| `ignis_retained_state_hits_total` | counter | `tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix` | Retained state a request chose to resume from: a prompt checkpoint (not yet restored), or a retained prefix brought back from KV-RAM |
+| `ignis_retained_state_misses_total` | counter | `tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix` | Requests whose first prefill chunk landed with no checkpoint matching in a tier this load carries. **`kind=`tier=device|kv_ram|disk`, `kind=checkpoint|prefix` is zero by construction** — see the note below the table (#216, #222) |
+| `ignis_retained_state_spills_total` | counter | `tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix` | Retained checkpoints and prefixes written into the tier (today only `kv_ram`) |
+| `ignis_retained_state_discards_total` | counter | `tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix` | Retained checkpoints and prefixes that left the tier for nowhere |
+| `ignis_retained_state_restores_total` | counter | `tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix`\|`tier=device|kv_ram|disk`, `kind=checkpoint|prefix` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
 | `ignis_requests_accepted_total` | counter | none | Accepted submissions |
 | `ignis_requests_completed_total` | counter | none | Completed requests |
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion |
@@ -302,6 +302,9 @@ The initial stable metric contract is:
 | `ignis_expert_bytes_moved_total` | counter | `phase=decode\|prefill` | Flash-Next: bytes of expert projections copied host-to-device, misses and prefetches (#301) |
 | `ignis_expert_residency_stall_seconds_total` | counter | `phase=decode\|prefill` | Flash-Next: device time the expert kernels waited on their step's demand copies, the misses (#306). A step with no miss adds nothing; prefetch copies are not counted. Stall per token is the decode series over `ignis_decoded_tokens_total` |
 | `ignis_expert_cache_slots` | gauge | `class`, `state=capacity\|in_use` | Flash-Next: VRAM expert cache slots per K class, reserved at load and in use (#301) |
+| `ignis_kv_disk_bytes` | gauge | `state=capacity\|used` | KV-disk (ADR 0045, spec vram-budget/03): the tier's effective budget, `min(--kv-disk-bytes, volume free - 10 GiB)` at start, and the bytes its committed files hold, headers and padding included. **Only on a load with the tier**, from its first scrape |
+| `ignis_kv_disk_spills_total` | counter | `from=device\|kv_ram` | KV-disk: live sequences written to the disk, by the tier they left -- the device when KV-RAM had no room, KV-RAM when it gave its victim down instead of dropping it. In neither eviction counter above. **Only on a load with the tier** |
+| `ignis_kv_disk_failures_total` | counter | `op=write\|read` | KV-disk: a write refused (the margin, or an IO error: the state stays where it was) and a file refused at restore (torn, corrupt, foreign, or unreadable: never restored; a live request re-prefills). **Only on a load with the tier** |
 | `ignis_ngram_rows_total` | counter | `source=hot\|file` | Flash-Next: n-gram embedding rows staged for prefill spans and decode rounds, from the RAM hot-row cache or the artifact file (#302). A hot-row hit rate is `source="hot"` over the sum |
 | `ignis_ngram_reads_total` | counter | none | Flash-Next: reads issued to the artifact file for rows the hot-row cache did not hold (#302) |
 | `ignis_ngram_read_bytes_total` | counter | none | Flash-Next: bytes of those reads (#302) |
@@ -387,7 +390,7 @@ each mean something different by it — a threshold is a property of a domain,
 not of a server. Answer mass is the server's own reading of the same prompt
 and is comparable across every caller.
 
-**Eviction is a departure from a tier, and there are five of them (#224).**
+**Eviction is a departure from a tier, and there are five of them (#224), nine on a load with KV-disk.**
 The contract names each one separately rather than summing them, because they
 cost different things:
 
@@ -398,6 +401,16 @@ cost different things:
 | Retained state is demoted device → KV-RAM | `ignis_retained_state_spills_total{tier="kv_ram"}` |
 | Retained state leaves KV-RAM for nowhere | `ignis_retained_state_discards_total{tier="kv_ram"}` |
 | A **live snapshot** is dropped out of KV-RAM | `ignis_kv_ram_evictions_total` |
+| A live sequence leaves the device for KV-disk (KV-RAM had no room) | `ignis_kv_disk_spills_total{from="device"}` |
+| A live snapshot is demoted KV-RAM → KV-disk | `ignis_kv_disk_spills_total{from="kv_ram"}` |
+| Retained state is demoted KV-RAM → KV-disk | `ignis_retained_state_spills_total{tier="disk"}` |
+| Retained state leaves KV-disk for nowhere | `ignis_retained_state_discards_total{tier="disk"}` |
+
+The last four exist on a load with KV-disk only (ADR 0045). With the tier on,
+a live sequence is never dropped for room -- it goes down a tier or its
+request waits -- so `ignis_kv_ram_evictions_total` stays at zero there; it
+keeps its meaning, as `ignis_kv_cache_evictions_total` keeps device → KV-RAM
+alone.
 
 The last is the most expensive event in the system — the request loses every
 prefilled token — and until #224 it was counted nowhere. It is projected from
@@ -406,12 +419,16 @@ it, because requeue also follows a *failed restore*, where KV-RAM evicted
 nothing. `ignis_kv_cache_evictions_total` keeps its unlabelled identity: no
 `tier` label was retro-fitted onto a stable row.
 
-**A disk tier is reserved, not exported.** `ignis_*` carries no
-`tier="disk"` label value and `ReuseSource` has no `Disk` variant. Widening
-five per-tier families and the request log's tier spelling for a tier that
-does not exist would put a permanently-zero label on the contract. The name
-`tier="disk"` is reserved here for whoever builds one; the Monitor shows a
-disk row as explicitly not implemented, fed by no metric.
+**The disk tier is exported where it exists (ADR 0045).** Until KV-disk was
+built, `tier="disk"` was reserved here and exported nowhere: a permanently-zero
+label on five per-tier families and the request log's tier spelling would
+have said nothing. Spec vram-budget/03 builds the tier, so on a load with it
+the six retained-state families carry `tier="disk"`, the request log spells
+the reuse source `disk`, and the three `ignis_kv_disk_*` families render --
+all of them from the first scrape, zeros included. A load without the tier
+(the 27B at its defaults, `--kv-disk-bytes 0`, or a volume with no room above
+the margin) renders none of them, and the Monitor's Disk row reads "off on
+this load".
 
 **The miss family is checkpoint-only, and stays that way until someone decides
 otherwise.** `ignis_retained_state_misses_total` is projected from a fact the

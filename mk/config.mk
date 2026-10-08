@@ -159,6 +159,16 @@ ROPE_SCALING ?= yarn:2
 # The KV-RAM host tier's budget (--kv-host-pool-bytes, P4-07, GitHub #125):
 # 0 disables the host tier entirely (no evict-to-RAM overflow path).
 KV_HOST_POOL_BYTES ?= 8G
+# KV-disk, the tier below KV-RAM (--kv-disk-bytes, spec vram-budget/03):
+# evicted sequences and retained prompt checkpoints kept as files and read
+# back instead of prefilled again. A ceiling the server cuts at start to the
+# volume's free space less 10 GiB; 0 turns it off. Empty = the server's: 16G
+# on Flash-Next, 0 (off) on the 27B.
+KV_DISK_BYTES ?=
+# Where KV-disk's files go (--kv-disk-path): model (beside the artifact),
+# auto (the per-user cache directory, under kv-disk) or a directory, each
+# process in its own ignis-kv-disk/<pid>-<nonce> there. Empty = model.
+KV_DISK_PATH ?=
 
 # Extra ignis-server flags, verbatim: ARGS='--kv-host-pool-bytes 0'
 ARGS ?=
