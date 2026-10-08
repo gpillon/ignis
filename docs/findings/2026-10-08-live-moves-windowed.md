@@ -85,7 +85,7 @@ expert stall and the passes, totals of misses and stall per step.
 
 The model thread's own time in the passes: p50 0.04-0.10 ms a step (1.34 ms
 with the window waited for). Width 3 after C came back, against before any
-arrival, over five KV-RAM runs and the disk run: +32.5 to +40.5% p50.
+arrival, over four KV-RAM runs and the disk run: +32.5 to +40.5% p50.
 
 **4. The control.** The same requests on a pool with room for E beside C, so
 that nothing moves (`a_long_arrival_beside_decoding_lanes_with_nothing_moved`):
@@ -131,11 +131,12 @@ Observed:
   ms. That, not the link, is the +50-58% the disk move in measured.
 - **A long arrival alone raises the misses; with a move they roughly
   double.** With nothing moved (one control run), width-3 rounds after E pay
-  +38% misses (+12% ITL). With C moved out and back (six runs), +100-110%
-  (+33-40% ITL), for the rest of C's run (~1,400 rounds here), and back to
-  normal once C has ended. One control against six moved runs, on expert
-  caches 34.6 MB apart, with a run-to-run spread of several percent: the
-  gap between them is the move's only as far as one control can say.
+  +38% misses (+12% ITL). With C moved out and back, +100-110% misses
+  (three runs counted them) and +33-40% ITL (five runs), for the rest of C's
+  run (~1,400 rounds here), and back to normal once C has ended. One control
+  against those runs, on expert caches 34.6 MB apart, with a run-to-run
+  spread of several percent: the gap between them is the move's only as far
+  as one control can say.
 
 Inferred, not measured:
 
