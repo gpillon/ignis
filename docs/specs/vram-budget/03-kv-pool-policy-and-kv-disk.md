@@ -150,6 +150,7 @@ gives the reason for each.
 | Entry rule | a restore never moves anything; entries in rank order; growth branch: free pages ≥ reservation + 4 steps for itself and each resident sequence above it; fixed branch: the reservation fits | *(agent)* |
 | Last resort (growth branch) | every resident sequence parked and no tier takes a victim: the lowest-ranked is re-queued, with an ERROR | *(agent)* |
 | PCIe contention | move out: ITL p50 +10%; move in: ITL p50 +25%; either: max within baseline + 150 ms | *(agent)*, owner to confirm |
+| Move pace (GitHub #309) | a live move goes a window at a time each way, one in flight, at most one new an advance; Flash-Next: `MOVE_IN_WINDOW_BYTES` 16 MiB onto the device (KV-RAM restores, KV-disk restore feeds), `MOVE_OUT_WINDOW_BYTES` 12 MiB off it into KV-RAM, beside the rounds; the 27B: unpaced (one window) | *(agent)*, measured by AC 37 |
 | KV-disk on | Flash-Next `--kv-disk-bytes 4G` (owner 2026-10-08: 4 GiB to start); 27B `0` | *(owner)* build, *(agent)* sizes |
 | Location | `--kv-disk-path model` (beside the artifact), `auto`, or a directory: the n-gram cache's rule | *(owner)*, confirmed 2026-10-08 |
 | Volume margin | 10 GiB, `KV_DISK_VOLUME_MARGIN_BYTES` | *(agent)* |
@@ -260,6 +261,9 @@ compute, and its drop path frees them.
   - The entry rule's four steps of room, the last resort, and a `Parked`
     fact.
 - **The `Compute` seam — `crates/core/src/scheduler.rs`, `crates/core/src/mock.rs`.**
+  - KV-RAM moves (GitHub #309, the AC 37 follow-up): start a move out or a
+    move in, which says whether it happened in the call or goes a window at a
+    time; advance the moves under way; abandon one.
   - KV-disk calls: start a spill to disk, from the device or from a KV-RAM
     blob; advance in-flight transfers by at most one window each; report
     finished and failed transfers; start a restore from disk; discard a disk
@@ -787,14 +791,20 @@ the fixed branch, *(both)* on either.
       admission of an `interactive` request whose reservation does not fit
       beside C.
     - Two legs. C goes through KV-RAM, with an arena that holds its blob (the
-      synchronous path). Then it goes through KV-disk, with
-      `--kv-host-pool-bytes 0` (the windowed path).
+      synchronous path; a window at a time since the follow-up, GitHub #309).
+      Then it goes through KV-disk, with `--kv-host-pool-bytes 0` (the
+      windowed path).
 
     Measured for each move: its bytes, duration and GB/s, and the decoding
     lanes' ITL p50 and max during it. Each is compared against a baseline
     window of the same length, at the same decode width, with no transfer in
     flight. The baseline comes from the same run where such a window exists,
-    else from a run without the move.
+    else from a run without the move. The follow-up (GitHub #309) fixes it for
+    all four moves: two fresh `interactive` lanes decoding alone at width 2
+    after everything else in the run has ended -- the card's state after C's
+    long prefill, which a baseline taken before it does not show -- a window
+    of as many steady steps as the move's; and the move's own steps count only
+    where both decoding lanes decoded in them.
 
     Starting thresholds, for the owner to confirm:
     - Move out: ITL p50 within +10% of the baseline.
@@ -912,10 +922,12 @@ the fixed branch, *(both)* on either.
 - **The disk ledger mirrors `HostTier`** (entries, owner class,
   probation/protected, use tick). The victim order is shared code, not a copy,
   so the two tiers cannot drift.
-- **Transfers are scheduler states, not blocking calls.** The KV-RAM path
-  stays synchronous: it runs at ~12 GB/s and its cost is measured (ADR 0024).
-  Only disk transfers are pumped. AC 37 measures whether a synchronous live
-  move is too long a stall.
+- **Transfers are scheduler states, not blocking calls.** Disk transfers are
+  pumped a window an advance. The KV-RAM path was first kept synchronous
+  (~12 GB/s assumed, ADR 0024), with AC 37 to measure whether its stall is too
+  long. It was, so since the follow-up (GitHub #309) a leaf with a transfer
+  stream moves through KV-RAM a window at a time too; the synchronous call
+  remains for a backend without one.
 - **The staging is reserved at load** (ADR 0030: serving allocates nothing).
   It is a host-plan line on Flash-Next and part of the tier's open on the 27B.
   The arena's spans are aligned to `DIRECT_IO_ALIGNMENT`, so that KV-RAM to
@@ -1027,7 +1039,7 @@ tickets.
 - **Moving sequences at a pool low-water mark** (pre-emptive). One step of
   room ahead per lane is the mitigation.
 - **Windowing the KV-RAM moves.** A follow-up if AC 37's synchronous leg
-  misses its bound.
+  misses its bound. It missed, and the follow-up built it (GitHub #309).
 - **Changing the lane-shortage order** (the head's lane deal).
 - **Flags for the growth step and the entry headroom.** They are named
   constants until the owner asks.

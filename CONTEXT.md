@@ -327,7 +327,9 @@ When output names a domain concept, use the term as defined here.
   room for a blob is a free *span* and not a count of free bytes — two-tier
   (probation → protected), and
   written only at a **chunk boundary**. State reaches it lazily — only when the
-  device is about to discard it, never as a copy of what is still resident.
+  device is about to discard it, never as a copy of what is still resident. A
+  **live move** into it and back goes a window at a time on the leaf's
+  transfer stream, so no decode round waits on the copy (GitHub #309).
 - **KV-disk** — Tier 2: the disk tier below KV-RAM (ADR 0045). It takes what
   KV-RAM gives up, instead of discarding it, and a device victim KV-RAM cannot
   take. A blob comes back from it straight to the device, never through
@@ -338,6 +340,13 @@ When output names a domain concept, use the term as defined here.
   room. Nothing on it outlives the process: v1 wipes it. Each file's header
   still names the model, layout and RoPE scaling it was taken under, so that a
   later version could keep it. On by default for Flash-Next; off for the 27B.
+- **Live move** — a sequence still being served, moved down a **residency
+  tier** for the room an admission ranked above it needs, and brought back
+  later to resume bit-exact where it stopped (ADR 0045). It is a transfer, not
+  a call: the sequence is in no round from its start until its last window
+  lands, keeping its pages until it has left. Flash-Next paces it — one window
+  in flight each way, a new one at most once an advance — so that it shares
+  the link with the expert stream rather than taking it (GitHub #309).
 - **Prompt checkpoint** — the whole-sequence state of a request at its
   generation opener, the point where the rendered prompt hands over to the
   model, retained after the request ends so a later request whose prompt

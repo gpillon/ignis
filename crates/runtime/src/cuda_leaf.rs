@@ -1013,6 +1013,10 @@ impl StepLeaf for CudaLeaf {
             .map_err(|e| leaf_error("restore", e.to_string()))
     }
 
+    fn windowed_transfer(&self) -> bool {
+        true
+    }
+
     fn snapshot_window(
         &self,
         _model: &Self::Model,

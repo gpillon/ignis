@@ -1,12 +1,12 @@
 # A live move's PCIe contention on Flash-Next: the windowed disk move out holds the other lanes, a move in slows them, a synchronous KV-RAM move stalls them ~0.32 s
 
 - Kind: experiment
-- Status: current
+- Status: superseded
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: serving / live moves (ADR 0045, the fixed branch), KV-RAM and KV-disk transfers, decode ITL of the other lanes on Flash-Next
 - Related: https://github.com/gpillon/ignis/issues/309, [ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), spec [vram-budget/03](../specs/vram-budget/03-kv-pool-policy-and-kv-disk.md) (AC 37), [KV-disk contention on the volume](2026-10-08-kv-disk-contention-on-the-volume.md)
-- Superseded by: none
+- Superseded by: [Live moves a window at a time](2026-10-08-live-moves-windowed.md)
 
 ## Question
 

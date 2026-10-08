@@ -765,7 +765,10 @@ pub enum SchedEvent {
     /// (sibling prefix reuse will restore it instead of re-prefilling).
     /// `snapshot_micros` is the wall time [`Compute::evict`](crate::scheduler::Compute::evict)
     /// took (GitHub #125) — the request log's own attribution of the
-    /// tier's cost, alongside [`SchedEvent::Restored::restore_micros`].
+    /// tier's cost, alongside [`SchedEvent::Restored::restore_micros`]. For a
+    /// move a window at a time (GitHub #309) it is the move's whole span,
+    /// start to landing, during which the other lanes kept decoding: not a
+    /// stall.
     Evicted {
         request: RequestId,
         snapshot_micros: u64,
@@ -776,7 +779,8 @@ pub enum SchedEvent {
     /// request restored back into `Prefilling` (P4-07, GitHub #125), which
     /// holds no lane until its prefill completes. `restore_micros` is the
     /// wall time [`Compute::restore`](crate::scheduler::Compute::restore)
-    /// took.
+    /// took -- or, for a move a window at a time (GitHub #309), its span,
+    /// start to landing.
     Restored {
         request: RequestId,
         lane: Option<LaneId>,

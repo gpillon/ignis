@@ -5,145 +5,24 @@
 //! What this holds the adapter to: a blob spilled a window at a time and
 //! read back is the same blob, its source given up only when the header
 //! commits the file; a file torn, corrupt or foreign is never restored; a
-//! spill's source keeps its bytes when the spill fails or is abandoned; and
-//! the n-gram table's prefill gathers go before the tier's IO.
+//! spill's source keeps its bytes when the spill fails or is abandoned; the
+//! n-gram table's prefill gathers go before the tier's IO; and a restore is
+//! fed onto the device in order, a slice of the move-in pace at a time
+//! (GitHub #309).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ignis_core::identity::MatchKey;
 use ignis_core::ngram_table::GatherGate;
 use ignis_core::scheduler::{DiskBlob, DiskBlobMeta, DiskOp, DiskOutcome, DiskSource, DiskTarget};
-use ignis_core::{Compute, DecodeJob, DecodeParams, PrefillJob, RequestId};
+use ignis_core::{Compute, DecodeJob, DecodeParams};
 use ignis_runtime::kv_disk::{self, DiskIdentity, DiskStore, FileHeader, HEADER_BYTES};
-use ignis_runtime::{DecodeLane, LaneRun, Model, RuntimeCompute, RuntimeStats, StepLeaf, TransferWindow};
+use ignis_runtime::{Model, RuntimeCompute, TransferPace, TransferWindow};
 
-/// The stub's blob: long enough for several 8 KiB windows, and not a whole
-/// number of them.
-const BLOB_BYTES: usize = 5 * 8192 + 1000;
-const WINDOW: u64 = 8192;
-
-#[derive(Default)]
-struct Calls {
-    released: u32,
-    snapshot_windows: Vec<TransferWindow>,
-    restore_windows: Vec<TransferWindow>,
-}
-
-/// A leaf whose sequence is its bytes: prefill fills them from the prompt,
-/// decode flips one and emits a token that hashes them all -- so two
-/// sequences that decode the same tokens hold the same bytes.
-struct ByteLeaf {
-    calls: Mutex<Calls>,
-}
-
-#[derive(Debug, Default)]
-struct ByteSeq {
-    bytes: Vec<u8>,
-}
-
-impl StepLeaf for ByteLeaf {
-    type Model = ();
-    type Sequence = ByteSeq;
-    type Prefix = ();
-    type SnapshotBuf = Vec<u8>;
-    type Media = ();
-    type Checkpoint = ();
-
-    fn load_model(&self) -> Result<(), i32> {
-        Ok(())
-    }
-    fn release_model(&self, _model: ()) {}
-    fn stats(&self, _model: &()) -> Result<RuntimeStats, i32> {
-        Ok(RuntimeStats {
-            vram_bytes: 0,
-            kv_page_tokens: 64,
-            kv_page_bytes: 0,
-            kv_page_count: 0,
-            last_step_micros: 0,
-            kernel_count: 0,
-            graph_launches: 0,
-            free_vram_bytes: 0,
-            reserved: Default::default(),
-        })
-    }
-    fn vocab(&self, _model: &()) -> u32 {
-        16
-    }
-    fn allocate_sequence(&self, _model: &(), _context_tokens: u32) -> Result<ByteSeq, i32> {
-        Ok(ByteSeq::default())
-    }
-    fn release_sequence(&self, _model: &(), _sequence: ByteSeq) {
-        self.calls.lock().unwrap().released += 1;
-    }
-    fn allocate_sequence_shared(&self, _model: &(), _context_tokens: u32, _prefix: &()) -> Result<ByteSeq, i32> {
-        Err(-1)
-    }
-    fn publish_prefix(&self, _model: &(), _sequence: &mut ByteSeq, _tokens: u32, _slot: u32) -> Result<(), i32> {
-        Err(-1)
-    }
-    fn release_prefix(&self, _model: &(), _prefix: ()) {}
-    fn prefill(
-        &self,
-        _model: &(),
-        sequence: &mut ByteSeq,
-        tokens: &[u32],
-        _start_position: u32,
-        _params: DecodeParams,
-        _permitted: &[u32],
-        _out_logits: Option<&mut [f32]>,
-        _attention: Option<&mut ignis_runtime::AttentionRead>,
-    ) -> Result<f32, i32> {
-        let seed = tokens.iter().fold(17u32, |h, &t| h.wrapping_mul(31).wrapping_add(t));
-        sequence.bytes = (0..BLOB_BYTES).map(|i| (seed as usize + i * 7 + i / 977) as u8).collect();
-        Ok(0.0)
-    }
-    fn decode(&self, _model: &(), sequences: &mut [&mut ByteSeq], _lanes: &[DecodeLane<'_>]) -> Result<Vec<LaneRun>, i32> {
-        Ok(sequences
-            .iter_mut()
-            .map(|s| {
-                // Every bit of the state is in the bytes, as a real blob
-                // holds all of a sequence: which byte flips is a function of
-                // them alone.
-                let at = crc32fast::hash(&s.bytes) as usize % s.bytes.len();
-                s.bytes[at] ^= 0x5A;
-                LaneRun::token(crc32fast::hash(&s.bytes) % 1000)
-            })
-            .collect())
-    }
-    fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Vec<u8>, i32> {
-        Ok(vec![0; bytes as usize])
-    }
-    fn snapshot_bytes(&self, _model: &(), sequence: &ByteSeq) -> Result<u64, i32> {
-        Ok(sequence.bytes.len() as u64)
-    }
-    fn snapshot_into(&self, _model: &(), sequence: &ByteSeq, dst: &mut [u8]) -> Result<(), i32> {
-        dst[..sequence.bytes.len()].copy_from_slice(&sequence.bytes);
-        Ok(())
-    }
-    fn restore_sequence(&self, _model: &(), sequence: &mut ByteSeq, src: &[u8]) -> Result<(), i32> {
-        sequence.bytes = src.to_vec();
-        Ok(())
-    }
-    fn snapshot_window(&self, _model: &(), sequence: &ByteSeq, window: TransferWindow, dst: &mut [u8]) -> Result<(), i32> {
-        if window.blob_bytes != sequence.bytes.len() as u64 {
-            return Err(-1);
-        }
-        let from = window.offset as usize;
-        dst.copy_from_slice(&sequence.bytes[from..from + window.bytes as usize]);
-        self.calls.lock().unwrap().snapshot_windows.push(window);
-        Ok(())
-    }
-    fn restore_window(&self, _model: &(), sequence: &mut ByteSeq, window: TransferWindow, src: &[u8]) -> Result<(), i32> {
-        if window.offset != sequence.bytes.len() as u64 {
-            return Err(-1);
-        }
-        sequence.bytes.extend_from_slice(src);
-        self.calls.lock().unwrap().restore_windows.push(window);
-        Ok(())
-    }
-}
+mod byte_leaf;
+use byte_leaf::{decode, prefill, ByteLeaf, BLOB_BYTES, WINDOW};
 
 fn identity() -> DiskIdentity {
     DiskIdentity {
@@ -187,8 +66,13 @@ struct Rig {
 }
 
 fn new_rig(tag: &str) -> Rig {
+    new_rig_paced(tag, TransferPace::default())
+}
+
+/// A rig whose moves onto the device are fed at `pace` (GitHub #309).
+fn new_rig_paced(tag: &str, pace: TransferPace) -> Rig {
     let location = temp_location(tag);
-    let leaf = Arc::new(ByteLeaf { calls: Mutex::default() });
+    let leaf = Arc::new(ByteLeaf::new());
     let model = Arc::new(Model::load(Arc::clone(&leaf)).unwrap());
     let gate = GatherGate::default();
     let store = DiskStore::open_with(
@@ -205,44 +89,9 @@ fn new_rig(tag: &str) -> Rig {
     let staging: Vec<ignis_runtime::StagingWindow> = (0..kv_disk::STAGING_WINDOWS)
         .map(|_| Box::new(ignis_artifact::AlignedBuffer::new(WINDOW as usize).unwrap()) as ignis_runtime::StagingWindow)
         .collect();
-    let compute = RuntimeCompute::new(model, 0).with_kv_disk(store, staging);
+    let compute = RuntimeCompute::new(model, 0).with_kv_disk(store, staging).with_transfer_pace(pace);
     let cleanup = TempDir(location.clone());
     Rig { compute, leaf, gate, location, _cleanup: cleanup }
-}
-
-fn prefill(compute: &RuntimeCompute<ByteLeaf>, request: RequestId) {
-    let job = PrefillJob {
-        request,
-        tokens: vec![1, 2, 3, 4, request as u32],
-        context_tokens: 64,
-        start_position: 0,
-        params: DecodeParams::default(),
-        shared_prefix: None,
-        publish_prefix: None,
-        checkpoint: None,
-        capture_checkpoint: None,
-        multimodal: None,
-        readout: None,
-        permitted: None,
-        attention: None,
-    };
-    compute.prefill_step(&[job]).unwrap();
-}
-
-fn decode(compute: &RuntimeCompute<ByteLeaf>, request: RequestId, rounds: u32) -> Vec<u32> {
-    let job = DecodeJob {
-        request,
-        lane: 0,
-        params: DecodeParams {
-            max_tokens: Some(10_000),
-            ..DecodeParams::default()
-        },
-        remaining_tokens: 1,
-        permitted: None,
-    };
-    (0..rounds)
-        .flat_map(|_| compute.decode_step(std::slice::from_ref(&job)).unwrap().remove(0).tokens)
-        .collect()
 }
 
 fn live_meta() -> DiskBlobMeta {
@@ -492,4 +341,94 @@ fn the_directory_goes_with_the_adapter() {
         0,
         "a clean shutdown removes the process's directory, a spill under way included"
     );
+}
+
+// ── GitHub #309: a restore's feed is paced ──────────────────────────────────
+
+/// Advance until `rig`'s leaf has been fed `windows` restore windows.
+fn until_fed(rig: &Rig, windows: usize) {
+    for _ in 0..10_000 {
+        if rig.leaf.calls.lock().unwrap().restore_windows.len() >= windows {
+            return;
+        }
+        rig.compute.disk_advance();
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    panic!("the restore never fed {windows} window(s)");
+}
+
+#[test]
+fn a_restore_is_fed_in_order_a_slice_of_the_move_in_pace_at_a_time() {
+    let pace = TransferPace { move_in_bytes: 4096, move_out_bytes: 4096 };
+    let rig = new_rig_paced("paced", pace);
+    let twin = new_rig("paced-twin");
+    for r in [&rig, &twin] {
+        prefill(&r.compute, 1);
+        decode(&r.compute, 1, 3);
+    }
+    let blob = DiskBlob::Live(1);
+    rig.compute.disk_spill(blob, DiskSource::Device, live_meta()).unwrap();
+    assert!(matches!(run(&rig.compute, blob).0, DiskOutcome::Spilled { .. }));
+    rig.compute
+        .disk_restore(blob, DiskTarget::Sequence { request: 1, context_tokens: 64 })
+        .unwrap();
+    assert!(matches!(run(&rig.compute, blob).0, DiskOutcome::Restored { .. }));
+    let fed = rig.leaf.calls.lock().unwrap().restore_windows.clone();
+    let mut next = 0;
+    for slice in &fed {
+        assert_eq!(slice.offset, next, "slices in the blob's order");
+        assert!(slice.bytes <= 4096, "no slice over the pace: {slice:?}");
+        next += slice.bytes;
+    }
+    assert_eq!(next, BLOB_BYTES as u64, "the whole blob, once");
+    assert_eq!(fed.len(), 11, "each 8 KiB window in two slices, the last 1,000 bytes in one");
+    assert_eq!(decode(&rig.compute, 1, 6), decode(&twin.compute, 1, 6), "and it is the same sequence");
+}
+
+#[test]
+fn one_slice_of_a_restore_is_on_the_link_at_a_time() {
+    let rig = new_rig_paced("one-slice", TransferPace { move_in_bytes: 4096, move_out_bytes: 4096 });
+    prefill(&rig.compute, 1);
+    let blob = DiskBlob::Live(1);
+    rig.compute.disk_spill(blob, DiskSource::Device, live_meta()).unwrap();
+    assert!(matches!(run(&rig.compute, blob).0, DiskOutcome::Spilled { .. }));
+    rig.leaf.hold_fences();
+    rig.compute
+        .disk_restore(blob, DiskTarget::Sequence { request: 1, context_tokens: 64 })
+        .unwrap();
+    until_fed(&rig, 1);
+    for _ in 0..50 {
+        assert!(rig.compute.disk_advance().is_empty());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        rig.leaf.calls.lock().unwrap().restore_windows.len(),
+        1,
+        "the next slice waits for the one on the link to land, both windows read or not"
+    );
+    rig.leaf.release_fences();
+    assert!(matches!(run(&rig.compute, blob).0, DiskOutcome::Restored { .. }));
+}
+
+#[test]
+fn a_restore_abandoned_mid_feed_gives_its_staging_back() {
+    let rig = new_rig("abandon-feed");
+    prefill(&rig.compute, 1);
+    let blob = DiskBlob::Live(1);
+    rig.compute.disk_spill(blob, DiskSource::Device, live_meta()).unwrap();
+    assert!(matches!(run(&rig.compute, blob).0, DiskOutcome::Spilled { .. }));
+    rig.leaf.hold_fences();
+    rig.compute
+        .disk_restore(blob, DiskTarget::Sequence { request: 1, context_tokens: 64 })
+        .unwrap();
+    until_fed(&rig, 1);
+    assert!(rig.compute.disk_staging_busy() > 0, "a window is on its way");
+    rig.compute.disk_discard(blob);
+    assert!(rig.leaf.calls.lock().unwrap().waits >= 1, "the slice on the link was waited for");
+    for _ in 0..200 {
+        rig.compute.disk_advance();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(rig.compute.disk_staging_busy(), 0, "every staging window came back");
+    assert!(files_in(&rig).is_empty(), "and the file went");
 }

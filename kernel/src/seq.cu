@@ -286,31 +286,43 @@ std::vector<std::int32_t> logical_page_ids(const ignis_seq &seq, std::uint32_t c
   return pages;
 }
 
-// GitHub #303: `pages`' indexer keys, every attention layer, into a blob's
-// IGNIS_SEQ_SECTION_INDEXER_KEYS payload at `dst` (layer by layer, page by
-// page), or back out of one.
-void pack_indexer_keys_to_host(const ignis_seq_pool &pool, const std::vector<std::int32_t> &pages,
-                               unsigned char *dst) {
+// GitHub #303: `pages`' indexer keys, every attention layer, as a blob's
+// IGNIS_SEQ_SECTION_INDEXER_KEYS payload lays them out (layer by layer, page
+// by page): `copy(device, payload offset, bytes)` once per run of consecutive
+// physical pages, the way the KV pack coalesces its planes. GitHub #309: a
+// copy per page was 12 x ~3,700 copies of 4 KiB for a 236K-token Flash-Next
+// blob, and they, not the link, set the synchronous KV-RAM move's 3.5 GB/s.
+template <typename Copy>
+void for_each_indexer_run(const ignis_seq_pool &pool, const std::vector<std::int32_t> &pages, Copy copy) {
   const std::size_t bytes = static_cast<std::size_t>(pool.indexer_page_bytes());
+  std::size_t offset = 0;
   for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
-    for (const std::int32_t page : pages) {
-      checked_memcpy_async(dst, pool.indexer_page_keys(layer, page), bytes, cudaMemcpyDeviceToHost,
-                           "indexer keys");
-      dst += bytes;
+    std::size_t begin = 0;
+    while (begin < pages.size()) {
+      std::size_t end = begin + 1;
+      while (end < pages.size() && pages[end] == pages[end - 1] + 1) {
+        ++end;
+      }
+      copy(pool.indexer_page_keys(layer, pages[begin]), offset, (end - begin) * bytes);
+      offset += (end - begin) * bytes;
+      begin = end;
     }
   }
 }
 
+void pack_indexer_keys_to_host(const ignis_seq_pool &pool, const std::vector<std::int32_t> &pages,
+                               unsigned char *dst) {
+  for_each_indexer_run(pool, pages, [&](void *device, std::size_t offset, std::size_t bytes) {
+    checked_memcpy_async(dst + offset, device, bytes, cudaMemcpyDeviceToHost, "indexer keys");
+  });
+}
+
 void unpack_indexer_keys_from_host(const ignis_seq_pool &pool, const std::vector<std::int32_t> &pages,
                                    const unsigned char *src) {
-  const std::size_t bytes = static_cast<std::size_t>(pool.indexer_page_bytes());
-  for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
-    for (const std::int32_t page : pages) {
-      checked_memcpy_async(pool.indexer_page_keys(layer, page), const_cast<unsigned char *>(src), bytes,
-                           cudaMemcpyHostToDevice, "indexer keys");
-      src += bytes;
-    }
-  }
+  for_each_indexer_run(pool, pages, [&](void *device, std::size_t offset, std::size_t bytes) {
+    checked_memcpy_async(device, const_cast<unsigned char *>(src) + offset, bytes, cudaMemcpyHostToDevice,
+                         "indexer keys");
+  });
 }
 
 // Write pool slot `slot`'s payload of the device-resident CLONE section
@@ -1556,6 +1568,29 @@ int32_t snapshot_window(const ignis_seq_pool &pool, const ignis_seq &seq, void *
   return 0;
 }
 
+// GitHub #309: `stream` (the transfer stream, non-blocking) after every copy
+// and memset already issued on the default stream, on the device. A sequence
+// is zeroed there when it is drawn (ignis_seq_alloc: its pages, its slot's
+// sections), asynchronously, and nothing else orders a restore's copies after
+// those memsets: a restore issued at once, while the default stream still
+// waits on earlier work, would land under them and be zeroed.
+void order_after_default_stream(cudaStream_t stream) {
+  cudaEvent_t drawn = nullptr;
+  cudaError_t err   = cudaEventCreateWithFlags(&drawn, cudaEventDisableTiming);
+  if (err == cudaSuccess) {
+    err = cudaEventRecord(drawn, nullptr);
+    if (err == cudaSuccess) {
+      err = cudaStreamWaitEvent(stream, drawn, 0);
+    }
+    // Released once the wait it was recorded for is behind the stream.
+    cudaEventDestroy(drawn);
+  }
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("ordering the restore after the default stream failed: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
 // One window of a restore (ignis_seq_restore with a window). The header and
 // the records are gathered as they arrive and checked, against the pool and
 // the target, before any byte of a section moves; a refusal ends the restore
@@ -1572,6 +1607,7 @@ int32_t restore_window(ignis_seq_pool &pool, ignis_seq &seq, const void *src, st
       set_error("ignis_seq_restore: a windowed restore starts at offset 0, not " + std::to_string(window.offset));
       return -1;
     }
+    order_after_default_stream(static_cast<cudaStream_t>(window.stream));
     seq.restoring             = std::make_unique<ignis_seq::restore_window>();
     seq.restoring->blob_bytes = window.blob_bytes;
   }
