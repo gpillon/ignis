@@ -700,3 +700,108 @@ fn a_live_move_through_kv_ram_beside_decoding_lanes() {
 fn a_live_move_through_kv_disk_beside_decoding_lanes() {
     measure(Tier::KvDisk);
 }
+
+/// The control for the rounds after a move (GitHub #309): the same requests
+/// on a pool with room for E beside C, so that nothing moves. Width-3 rounds
+/// (C, B1, B2) before any arrival and after E has ended are compared, with
+/// the expert cache's misses and its stall per round: whether what the
+/// rounds pay after a move is the move's, or the long arrival's.
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact, minutes"]
+fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
+    let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(FLASH_NEXT_DIR), PathBuf::from);
+    let path = dir.join(ARTIFACT_FILE_NAME);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
+        return;
+    }
+    let blobs = BlobDir(
+        std::env::var_os("IGNIS_KV_DISK_TEST_DIR")
+            .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/kv-disk-gpu"), PathBuf::from)
+            .join("contention-control"),
+    );
+    let _ = std::fs::remove_dir_all(&blobs.0);
+    std::fs::create_dir_all(&blobs.0).unwrap();
+    let shape = EngineShape {
+        max_context: CONTEXT,
+        prefill_chunk: CHUNK,
+        decode_lanes: 4,
+        host_pool_bytes: ARENA_BYTES,
+        prompt_reuse: false,
+        retained_device_slots: 0,
+        retained_host_slots: 0,
+        retained_host_named: true,
+        kv_disk_bytes: Some(0),
+        // A chunk more than one context: E fits beside C, B1 and B2.
+        kv_pool: Some(ignis_core::KvPoolSize::Tokens(u64::from(CONTEXT + CHUNK))),
+        ngram_hot_bytes: ignis_core::ngram_table::HotBudget::Bytes(0),
+        ..EngineShape::default()
+    };
+    let (sched, reserved) = match flash_next_scheduler_with_ngram_cache(
+        &path,
+        MODEL.into(),
+        EOS,
+        shape,
+        None,
+        ignis_core::ngram_cache::PersistenceOptions { enabled: false, ..Default::default() },
+        &CacheLocation::Directory(blobs.0.clone()),
+    ) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("load the Flash-Next scheduler for the control: {e}"));
+            return;
+        }
+    };
+    let mut rig = Rig { sched, steps: Vec::new(), counters: reserved.flash_next.clone() };
+    let interactive = RequestClass::Interactive;
+    let c = rig.sched.submit(input(prompt(1, C_PROMPT), C_TOKENS), RequestClass::Agent).unwrap();
+    rig.until_tokens(c, 4);
+    let b = [
+        rig.sched.submit(input(prompt(2, B_PROMPT), B1_TOKENS), interactive).unwrap(),
+        rig.sched.submit(input(prompt(3, B_PROMPT), B2_TOKENS), interactive).unwrap(),
+    ];
+    rig.until_tokens(b[0], 16);
+    rig.until_tokens(b[1], 16);
+    let width3_from = rig.mark();
+    rig.until_tokens(b[0], 16 + WIDTH3_TOKENS);
+    let width3_to = rig.mark();
+    let e0 = rig.sched.submit(input(prompt(4, E0_PROMPT), E_TOKENS), interactive).unwrap();
+    rig.until(|rig| rig.finished_at_length(e0));
+    let e = rig.sched.submit(input(prompt(5, E_PROMPT), E_TOKENS), interactive).unwrap();
+    rig.until(|rig| rig.finished_at_length(e));
+    let e_done = rig.mark();
+    rig.until(|rig| rig.finished_at_length(b[0]));
+    let after_to = rig.mark();
+    assert!(
+        !rig.has(|ev| matches!(ev, SchedEvent::Evicted { .. } | SchedEvent::DiskSpilled { .. })),
+        "the pool holds E beside C: nothing moved"
+    );
+    let three = [c, b[0], b[1]];
+    let phase = |from: usize, to: usize| {
+        let steps: Vec<usize> =
+            rig.steady(from, to).into_iter().filter(|&i| rig.all_decoded(&three, i)).collect();
+        let (p50, _) = stats(&rig.itl_in(&b, &steps));
+        let per_step = |f: &dyn Fn(&ignis_core::flash_next_counters::FlashNextCounters) -> u64| {
+            let total: u64 = steps
+                .iter()
+                .filter_map(|&i| Some(f(rig.steps[i].counters.as_ref()?) - f(rig.steps[i - 1].counters.as_ref()?)))
+                .sum();
+            total as f64 / steps.len().max(1) as f64
+        };
+        let misses = per_step(&|c| c.residency.misses.iter().map(|p| p[0]).sum());
+        let stall_ms = per_step(&|c| c.residency.stall_nanos[0]) / 1e6;
+        (steps.len(), p50, misses, stall_ms)
+    };
+    let before = phase(width3_from, width3_to);
+    let after = phase(e_done, after_to);
+    println!(
+        "control, nothing moved: width 3 (C, B1, B2) before any arrival: {} steps, B1's and B2's ITL p50 {:.2} ms, \
+         {:.1} decode misses and {:.2} ms of expert stall a step; after E ended: {} steps, {:.2} ms, {:.1} misses, {:.2} ms",
+        before.0, before.1, before.2, before.3, after.0, after.1, after.2, after.3
+    );
+    if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
+        std::fs::create_dir_all(&dir).expect("the raw samples' directory");
+        rig.write_timeline(&dir.join("ac37-control-steps.json"));
+    }
+    drop(rig);
+    drop(blobs);
+}

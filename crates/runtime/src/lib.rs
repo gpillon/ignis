@@ -372,9 +372,9 @@ pub const MOVE_IN_WINDOW_BYTES: u64 = 16 << 20;
 /// The window a live move off the device into KV-RAM keeps on the link
 /// (GitHub #309), one in flight at a time, at most one new one an advance,
 /// against the direction of Flash-Next's expert reads. Measured as
-/// [`MOVE_IN_WINDOW_BYTES`] is: the other lanes' ITL p50 +3-13% over four
-/// runs at this size (AC 37's starting bound is +10%), +11% at 16 MiB and
-/// +37% at 64 MiB; a 1.13 GB sequence leaves in ~1.15 s.
+/// [`MOVE_IN_WINDOW_BYTES`] is: the other lanes' ITL p50 +3 to +13% over
+/// five runs at this size (AC 37's starting bound is +10%), +11% at 16 MiB
+/// and +37% at 64 MiB; a 1.13 GB sequence leaves in ~1.15 s.
 pub const MOVE_OUT_WINDOW_BYTES: u64 = 12 << 20;
 
 /// How much a live move puts on the link per advance, each way (GitHub
