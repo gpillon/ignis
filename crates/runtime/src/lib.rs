@@ -15,6 +15,11 @@ use ignis_core::{
     TokenId,
 };
 
+mod disk_transfer;
+pub mod kv_disk;
+
+pub use disk_transfer::StagingWindow;
+
 #[cfg(feature = "cuda")]
 mod cuda_leaf;
 #[cfg(feature = "cuda")]
@@ -343,6 +348,15 @@ impl AttentionRead {
     }
 }
 
+/// One window of a blob a KV-disk transfer moves (spec vram-budget/03):
+/// `bytes` bytes from `offset` of a `blob_bytes`-byte blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferWindow {
+    pub offset: u64,
+    pub bytes: u64,
+    pub blob_bytes: u64,
+}
+
 /// The replaceable step-ABI leaf seam.
 ///
 /// The FFI implementation will map these calls to ADR 0009. Its opaque
@@ -639,6 +653,57 @@ pub trait StepLeaf: Send + Sync + 'static {
         sequence: &mut Self::Sequence,
         src: &[u8],
     ) -> Result<(), i32>;
+
+    // ── the windowed transfer (spec vram-budget/03, ADR 0045) ────────────
+    //
+    // KV-disk moves a blob a window at a time, its copies on the leaf's own
+    // transfer stream, which the model's never waits on. The defaults are a
+    // leaf with no such stream: it refuses a window, and its fences pass at
+    // once.
+
+    /// Issue `window` of [`StepLeaf::snapshot_into`]'s blob of `sequence`
+    /// into `dst` (`window.bytes` long) on the transfer stream. Nothing waits
+    /// for it: `dst` is the caller's to keep, and `sequence` unstepped, until
+    /// a fence taken after it has passed.
+    fn snapshot_window(
+        &self,
+        _model: &Self::Model,
+        _sequence: &Self::Sequence,
+        _window: TransferWindow,
+        _dst: &mut [u8],
+    ) -> Result<(), i32> {
+        Err(-1)
+    }
+
+    /// Feed `window` of a blob into `sequence` (freshly drawn from
+    /// [`StepLeaf::allocate_sequence`]): windows in order, the first at 0,
+    /// the header checked before any byte moves. `src` is the caller's to
+    /// keep until a fence taken after it has passed; the sequence refuses
+    /// every step until its last window has been fed and fenced.
+    fn restore_window(
+        &self,
+        _model: &Self::Model,
+        _sequence: &mut Self::Sequence,
+        _window: TransferWindow,
+        _src: &[u8],
+    ) -> Result<(), i32> {
+        Err(-1)
+    }
+
+    /// A fence after every window issued so far.
+    fn transfer_fence(&self, _model: &Self::Model) -> Result<u64, i32> {
+        Ok(0)
+    }
+
+    /// Whether `fence` has passed. Never blocks.
+    fn transfer_passed(&self, _model: &Self::Model, _fence: u64) -> Result<bool, i32> {
+        Ok(true)
+    }
+
+    /// Block until `fence` has passed.
+    fn transfer_wait(&self, _model: &Self::Model, _fence: u64) -> Result<(), i32> {
+        Ok(())
+    }
 }
 
 /// A loaded model whose leaf handle is released exactly once on drop.
@@ -846,6 +911,9 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// needs the room, so the next question about the same picture does not
     /// run the tower again.
     media: Mutex<MediaCache<L::Media>>,
+    /// KV-disk (spec vram-budget/03): the store, its staging and its
+    /// transfers, or `None` on a load without the tier.
+    disk: Mutex<Option<disk_transfer::DiskTier<L>>>,
     /// The probability of the token a **constrained decode** request has drawn and not
     /// yet emitted (GitHub #242), per request.
     ///
@@ -875,8 +943,18 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             retained: Mutex::new(HashMap::new()),
             spilled_prefixes: Mutex::new(HashMap::new()),
             media: Mutex::new(MediaCache::new()),
+            disk: Mutex::new(None),
             drawn: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// This adapter with the KV-disk tier (spec vram-budget/03): `store`
+    /// for its files, `staging` for the device windows crossing PCIe
+    /// ([`kv_disk::STAGING_WINDOWS`] of [`kv_disk::WINDOW_BYTES`], pinned in
+    /// serving).
+    pub fn with_kv_disk(self, store: kv_disk::DiskStore, staging: Vec<StagingWindow>) -> Self {
+        *self.disk.lock().unwrap() = Some(disk_transfer::DiskTier::new(store, staging));
+        self
     }
 
     /// Media embeddings a request is prefilling against right now (the
@@ -1795,10 +1873,42 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // `ignis_host_pinned_free` in production).
         self.evicted.lock().unwrap().remove(&request);
     }
+
+    fn disk_fits(&self, bytes: u64) -> bool {
+        self.tier_fits(bytes)
+    }
+
+    fn disk_spill(
+        &self,
+        blob: ignis_core::DiskBlob,
+        from: ignis_core::DiskSource,
+        meta: ignis_core::DiskBlobMeta,
+    ) -> Result<u64, ComputeError> {
+        self.tier_spill(blob, from, meta)
+    }
+
+    fn disk_restore(&self, blob: ignis_core::DiskBlob, into: ignis_core::DiskTarget) -> Result<(), ComputeError> {
+        self.tier_restore(blob, into)
+    }
+
+    fn disk_advance(&self) -> Vec<ignis_core::DiskEvent> {
+        self.tier_advance()
+    }
+
+    fn disk_discard(&self, blob: ignis_core::DiskBlob) {
+        self.tier_discard(blob)
+    }
+
+    fn disk_abandon_restore(&self, request: RequestId) {
+        self.tier_abandon_restore(request)
+    }
 }
 
 impl<L: StepLeaf> Drop for RuntimeCompute<L> {
     fn drop(&mut self) {
+        // The disk tier first: its transfers hold sequences, spans and
+        // staging, and its threads and directory go with it.
+        self.tier_shutdown();
         let media = std::mem::take(
             &mut self
                 .media

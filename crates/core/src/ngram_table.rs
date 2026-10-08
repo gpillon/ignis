@@ -23,7 +23,7 @@
 //! hot list ranks, and no step reads the file again.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -349,6 +349,40 @@ pub struct NgramTable {
     policy: ReadPolicy,
     pool: ReadPool,
     counts: Arc<NgramCounts>,
+    /// Prefill gathers under way (spec vram-budget/03).
+    prefill_gate: GatherGate,
+}
+
+/// The n-gram gathers a prefill has under way (spec vram-budget/03 AC 22):
+/// what KV-disk's IO threads wait on before issuing a request of their own,
+/// so a spill never slows a prompt's row reads on the volume they share. A
+/// request the tier already issued finishes its window. Decode gathers do
+/// not count: they are a few rows, and the tier keeps at most one request
+/// in flight a direction.
+#[derive(Debug, Clone, Default)]
+pub struct GatherGate(Arc<AtomicUsize>);
+
+impl GatherGate {
+    /// Whether a prefill gather is under way.
+    pub fn pending(&self) -> bool {
+        self.0.load(Ordering::Acquire) > 0
+    }
+
+    /// A gather starts; it ends when the guard drops.
+    pub fn enter(&self) -> GatherGuard {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        GatherGuard(Arc::clone(&self.0))
+    }
+}
+
+/// One prefill gather under way ([`GatherGate::enter`]).
+#[derive(Debug)]
+pub struct GatherGuard(Arc<AtomicUsize>);
+
+impl Drop for GatherGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl NgramTable {
@@ -405,6 +439,7 @@ impl NgramTable {
             policy,
             pool: ReadPool::new(path, options.read_threads)?,
             counts: Arc::default(),
+            prefill_gate: GatherGate::default(),
         };
         Ok(table)
     }
@@ -552,9 +587,17 @@ impl NgramTable {
         Ok(PendingRows { table: self, plan, results })
     }
 
-    /// [`NgramTable::begin`] then [`PendingRows::finish`].
+    /// [`NgramTable::begin`] then [`PendingRows::finish`]: a prefill's
+    /// gather, under the [`GatherGate`] KV-disk waits on.
     pub fn stage(&self, context: &mut NgramContext, tokens: &[u32], out: &mut [u8]) -> Result<(), String> {
+        let _gathering = self.prefill_gate.enter();
         self.begin(context, tokens)?.finish(out)
+    }
+
+    /// The gate a prefill's gather raises (spec vram-budget/03), for the
+    /// disk tier to wait on.
+    pub fn prefill_gate(&self) -> GatherGate {
+        self.prefill_gate.clone()
     }
 
     /// The rows gathered so far, by source.
@@ -1018,6 +1061,21 @@ mod tests {
         let mut ids = Vec::new();
         table.hasher().hash(&mut table.new_context(), &tokens, &mut ids);
         assert_eq!(whole, expected(&ids));
+    }
+
+    #[test]
+    fn a_prefill_gather_holds_the_gate_only_while_it_runs() {
+        // Spec vram-budget/03 AC 22: KV-disk waits on this before each IO of
+        // its own. Nested guards count, and the gate clears with the last.
+        let gate = GatherGate::default();
+        assert!(!gate.pending());
+        let first = gate.enter();
+        let second = gate.clone().enter();
+        assert!(gate.pending());
+        drop(first);
+        assert!(gate.pending(), "one gather is still under way");
+        drop(second);
+        assert!(!gate.pending());
     }
 
     #[test]

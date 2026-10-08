@@ -61,6 +61,18 @@ impl AlignedBuffer {
     }
 }
 
+impl AsRef<[u8]> for AlignedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsMut<[u8]> for AlignedBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         // SAFETY: allocated with this layout in `new`.
@@ -219,6 +231,47 @@ impl DirectWriter {
         }
         Ok(())
     }
+}
+
+/// The bytes free to this process on the volume holding `path` (spec
+/// vram-budget/03: the disk tier keeps its volume a margin).
+pub fn volume_free_bytes(path: &Path) -> Result<u64> {
+    volume_free(path).map_err(|e| fail(format!("free space of the volume holding {}: {e}", path.display())))
+}
+
+#[cfg(windows)]
+fn volume_free(path: &Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free_to_caller: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; the three outputs are
+    // optional, and only the first is asked for.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(free_to_caller)
+}
+
+#[cfg(unix)]
+fn volume_free(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c` is a NUL-terminated path and `stat` a zeroed statvfs the
+    // call fills.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
 #[cfg(windows)]
@@ -399,6 +452,12 @@ mod tests {
         drop(writer);
         assert_eq!(std::fs::read(&path).unwrap(), pattern(5 * 4096));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_volume_holding_a_directory_reports_its_free_bytes() {
+        let free = volume_free_bytes(&std::env::temp_dir()).unwrap();
+        assert!(free > 0, "the temp volume has room for this test's own files");
     }
 
     #[test]
