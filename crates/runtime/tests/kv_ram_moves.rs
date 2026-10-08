@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use ignis_core::scheduler::{KvRamMove, KvRamOutcome};
 use ignis_core::{Compute, RequestId};
-use ignis_runtime::{Model, RuntimeCompute, TransferPace, TransferWindow};
+use ignis_core::compute::ModelFamily;
+use ignis_runtime::{Model, RuntimeCompute, TransferPace, TransferWindow, MOVE_IN_WINDOW_BYTES, MOVE_OUT_WINDOW_BYTES};
 
 mod byte_leaf;
 use byte_leaf::{decode, prefill, ByteLeaf, BLOB_BYTES, WINDOW};
@@ -172,16 +173,20 @@ fn a_window_that_fails_ends_the_move_and_loses_nothing() {
 }
 
 #[test]
-fn a_first_window_that_fails_refuses_the_move() {
+fn a_first_window_that_fails_ends_the_move_at_the_next_advance() {
+    // As any failed window does, so the scheduler's handling of a failure is
+    // one path.
     let ((compute, leaf), _) = twins(1);
     leaf.fail_windows(true);
-    assert!(compute.kv_ram_move_out(1).is_err());
+    assert_eq!(compute.kv_ram_move_out(1).unwrap().1, KvRamMove::Started);
+    assert_eq!(run(&compute, 1), (KvRamOutcome::Failed, 1));
     assert_eq!((compute.live_sequences(), compute.evicted_sequences()), (1, 0), "nothing moved");
     leaf.fail_windows(false);
     compute.kv_ram_move_out(1).unwrap();
     assert!(matches!(run(&compute, 1).0, KvRamOutcome::Landed { .. }));
     leaf.fail_windows(true);
-    assert!(compute.kv_ram_move_in(1, 64).is_err());
+    assert_eq!(compute.kv_ram_move_in(1, 64).unwrap(), KvRamMove::Started);
+    assert_eq!(run(&compute, 1), (KvRamOutcome::Failed, 1));
     assert_eq!((compute.live_sequences(), compute.evicted_sequences()), (0, 1), "the snapshot stayed");
 }
 
@@ -223,4 +228,24 @@ fn moves_under_way_are_let_go_with_the_adapter() {
     let calls = leaf.calls.lock().unwrap();
     assert_eq!(calls.waits, 2, "each move's window on the link was waited for");
     assert_eq!(calls.released, released + 2, "1's live sequence and 2's half-built one");
+}
+
+#[test]
+fn flash_next_moves_are_paced_and_the_27bs_go_in_one_window() {
+    assert_eq!(
+        TransferPace::for_family(ModelFamily::FlashNext),
+        TransferPace { move_in_bytes: MOVE_IN_WINDOW_BYTES, move_out_bytes: MOVE_OUT_WINDOW_BYTES }
+    );
+    assert_eq!(TransferPace::for_family(ModelFamily::Qwen38_27b), TransferPace::UNPACED);
+
+    let (compute, leaf) = rig(ByteLeaf::new());
+    let compute = compute.with_transfer_pace(TransferPace::UNPACED);
+    prefill(&compute, 1);
+    compute.kv_ram_move_out(1).unwrap();
+    assert!(matches!(run(&compute, 1).0, KvRamOutcome::Landed { .. }));
+    compute.kv_ram_move_in(1, 64).unwrap();
+    assert!(matches!(run(&compute, 1).0, KvRamOutcome::Landed { .. }));
+    let whole = TransferWindow { offset: 0, bytes: BLOB_BYTES as u64, blob_bytes: BLOB_BYTES as u64 };
+    assert_eq!(windows(&leaf, true), vec![whole], "out in one window");
+    assert_eq!(windows(&leaf, false), vec![whole], "and back in one");
 }

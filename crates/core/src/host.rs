@@ -351,7 +351,7 @@ pub struct HostTier {
     /// Entries on their way back to the device, a window at a time (GitHub
     /// #309): charged there already, so out of every ranking and never a
     /// victim -- the copies are reading their bytes -- until the move ends.
-    restoring: HashSet<RequestId>,
+    restoring_live: HashSet<RequestId>,
 }
 
 impl HostTier {
@@ -372,7 +372,7 @@ impl HostTier {
             moving_live: HashSet::new(),
             moving_retained: HashSet::new(),
             landing: HashMap::new(),
-            restoring: HashSet::new(),
+            restoring_live: HashSet::new(),
         }
     }
 
@@ -398,12 +398,12 @@ impl HostTier {
     /// `request`'s snapshot is on its way back to the device (GitHub #309):
     /// out of every ranking until [`Self::end_restore`].
     pub fn begin_restore(&mut self, request: RequestId) {
-        self.restoring.insert(request);
+        self.restoring_live.insert(request);
     }
 
     /// The move of `request`'s snapshot back to the device ended.
     pub fn end_restore(&mut self, request: RequestId) {
-        self.restoring.remove(&request);
+        self.restoring_live.remove(&request);
     }
 
     /// `request`'s snapshot is on its way to KV-disk (spec vram-budget/03):
@@ -432,7 +432,7 @@ impl HostTier {
     /// back to the device (GitHub #309) -- and gives its bytes up when it
     /// lands.
     pub fn is_moving(&self) -> bool {
-        !self.moving_live.is_empty() || !self.moving_retained.is_empty() || !self.restoring.is_empty()
+        !self.moving_live.is_empty() || !self.moving_retained.is_empty() || !self.restoring_live.is_empty()
     }
 
     /// The live snapshot `request` holds here, if it does.
@@ -454,7 +454,7 @@ impl HostTier {
         self.probation
             .iter()
             .chain(self.protected.iter())
-            .filter(|e| !self.restoring.contains(&e.request))
+            .filter(|e| !self.restoring_live.contains(&e.request))
             .map(|e| (e, self.moving_live.contains(&e.request)))
     }
 
@@ -500,7 +500,7 @@ impl HostTier {
             .probation
             .iter()
             .chain(self.protected.iter())
-            .filter(|e| !self.moving_live.contains(&e.request) && !self.restoring.contains(&e.request))
+            .filter(|e| !self.moving_live.contains(&e.request) && !self.restoring_live.contains(&e.request))
         {
             selected = match selected {
                 None => Some(entry),
@@ -1280,5 +1280,47 @@ mod tests {
         assert_eq!(released.map(|e| e.blob), Some(ck(1)), "the last claimant releases it");
         assert_eq!(host.used_bytes(), 0);
         assert_eq!(host.retained_count(), 0);
+    }
+
+    // ── GitHub #309: moves through KV-RAM a window at a time ────────────────
+
+    #[test]
+    fn a_landing_holds_its_bytes_until_it_ends_and_capture_takes_them_back() {
+        let mut host = HostTier::new(10);
+        host.capture(entry(1, 4, gdn_boundary(0), 1)).unwrap();
+        host.begin_landing(2, 6);
+        assert_eq!(host.used_bytes(), 10, "the landing's bytes are KV-RAM's from its start");
+        assert!(!host.contains(2), "with no entry until it has landed");
+        assert_eq!(host.plan_live_room(1, Instant::now()), None, "and room no one else may take");
+        // It landed: the bytes are handed to its entry, nothing given up.
+        host.end_landing(2);
+        assert_eq!(host.used_bytes(), 4);
+        host.capture(entry(2, 6, gdn_boundary(0), 2)).unwrap();
+        assert_eq!(host.used_bytes(), 10);
+        assert_eq!(host.entry_count(), 2, "nothing was discarded to make the room");
+        // One that did not land gives its bytes back, once.
+        host.begin_landing(3, 5);
+        host.end_landing(3);
+        host.end_landing(3);
+        assert_eq!(host.used_bytes(), 10);
+    }
+
+    #[test]
+    fn an_entry_on_its_way_back_is_nobodys_victim_and_not_waiting_to_come_back() {
+        let mut host = HostTier::new(10);
+        host.capture(entry(1, 4, gdn_boundary(0), 1)).unwrap();
+        host.capture(entry(2, 4, gdn_boundary(0), 2)).unwrap();
+        assert!(!host.is_moving());
+        host.begin_restore(1);
+        assert!(host.is_moving(), "its bytes come back when it lands");
+        assert_eq!(host.victim().map(|e| e.request), Some(2), "the restoring entry is passed over");
+        let waiting: Vec<u64> = host.live_entries().map(|(e, _)| e.request).collect();
+        assert_eq!(waiting, vec![2], "it is charged on the device already");
+        assert!(host.entry(1).is_some(), "and still here, its bytes held");
+        assert_eq!(host.used_bytes(), 8);
+        host.end_restore(1);
+        assert!(!host.is_moving());
+        assert_eq!(host.restore(1).map(|e| e.request), Some(1));
+        assert_eq!(host.used_bytes(), 4);
     }
 }

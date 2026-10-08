@@ -52,6 +52,9 @@ struct Move<L: StepLeaf> {
     issued: u64,
     /// The fence after the window in flight, if one is.
     in_flight: Option<u64>,
+    /// A window failed as the move started: it ends, failed, at the next
+    /// advance, as one failing later would.
+    failed: bool,
     started: Instant,
     kind: Kind<L>,
 }
@@ -59,12 +62,16 @@ struct Move<L: StepLeaf> {
 /// The windowed KV-RAM moves under way in a [`RuntimeCompute`]: at most one
 /// each way, as the scheduler starts them.
 pub(crate) struct KvRamMoves<L: StepLeaf> {
-    moves: Vec<Move<L>>,
+    under_way: Vec<Move<L>>,
 }
 
 impl<L: StepLeaf> KvRamMoves<L> {
     pub(crate) fn new() -> Self {
-        Self { moves: Vec::new() }
+        Self { under_way: Vec::new() }
+    }
+
+    fn has(&self, request: RequestId) -> bool {
+        self.under_way.iter().any(|m| m.request == request)
     }
 }
 
@@ -84,7 +91,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// first window issued. Returns the blob's bytes.
     pub(crate) fn ram_move_out(&self, request: RequestId) -> Result<u64, ComputeError> {
         let mut moves = self.kv_ram.lock().unwrap();
-        if moves.moves.iter().any(|m| m.request == request) {
+        if moves.has(request) {
             return Err(ComputeError::Kernel(-1));
         }
         let blob_bytes = {
@@ -96,21 +103,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 .map_err(leaf_err)?
         };
         let span = self.model.leaf.alloc_snapshot_buf(blob_bytes).map_err(leaf_err)?;
-        moves.moves.push(Move {
-            request,
-            blob_bytes,
-            issued: 0,
-            in_flight: None,
-            started: Instant::now(),
-            kind: Kind::Out { span },
-        });
-        // The first window goes out now, beside this advance's round.
-        let at = moves.moves.len() - 1;
-        if let Pumped::Failed = self.pump_ram(&mut moves.moves[at]) {
-            let failed = moves.moves.remove(at);
-            self.end_ram_move(failed, false);
-            return Err(ComputeError::Kernel(-1));
-        }
+        self.begin_ram_move(&mut moves, request, blob_bytes, Kind::Out { span });
         Ok(blob_bytes)
     }
 
@@ -119,7 +112,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// stays where it was when this fails.
     pub(crate) fn ram_move_in(&self, request: RequestId, context_tokens: u32) -> Result<(), ComputeError> {
         let mut moves = self.kv_ram.lock().unwrap();
-        if moves.moves.iter().any(|m| m.request == request) {
+        if moves.has(request) {
             return Err(ComputeError::Kernel(-1));
         }
         let evicted = self.evicted.lock().unwrap().remove(&request).ok_or(ComputeError::Kernel(-1))?;
@@ -130,25 +123,31 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 return Err(leaf_err(code));
             }
         };
-        moves.moves.push(Move {
+        let blob_bytes = evicted.buf.as_ref().len() as u64;
+        let kind = Kind::In {
+            span: evicted.buf,
+            sequence,
+            generated: evicted.generated,
+        };
+        self.begin_ram_move(&mut moves, request, blob_bytes, kind);
+        Ok(())
+    }
+
+    /// File a move and issue its first window now, beside this advance's
+    /// round. A first window that fails ends the move at the next advance,
+    /// as any other failed window does.
+    fn begin_ram_move(&self, moves: &mut KvRamMoves<L>, request: RequestId, blob_bytes: u64, kind: Kind<L>) {
+        let mut m = Move {
             request,
-            blob_bytes: evicted.buf.as_ref().len() as u64,
+            blob_bytes,
             issued: 0,
             in_flight: None,
+            failed: false,
             started: Instant::now(),
-            kind: Kind::In {
-                span: evicted.buf,
-                sequence,
-                generated: evicted.generated,
-            },
-        });
-        let at = moves.moves.len() - 1;
-        if let Pumped::Failed = self.pump_ram(&mut moves.moves[at]) {
-            let failed = moves.moves.remove(at);
-            self.end_ram_move(failed, false);
-            return Err(ComputeError::Kernel(-1));
-        }
-        Ok(())
+            kind,
+        };
+        m.failed = matches!(self.pump_ram(&mut m), Pumped::Failed);
+        moves.under_way.push(m);
     }
 
     /// Advance every move by what has landed and at most one new window, and
@@ -157,8 +156,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         let mut moves = self.kv_ram.lock().unwrap();
         let mut events = Vec::new();
         let mut i = 0;
-        while i < moves.moves.len() {
-            let landed = match self.pump_ram(&mut moves.moves[i]) {
+        while i < moves.under_way.len() {
+            let landed = match self.pump_ram(&mut moves.under_way[i]) {
                 Pumped::Going => {
                     i += 1;
                     continue;
@@ -166,7 +165,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 Pumped::Landed => true,
                 Pumped::Failed => false,
             };
-            let ended = moves.moves.remove(i);
+            let ended = moves.under_way.remove(i);
             let request = ended.request;
             let micros = ended.started.elapsed().as_micros() as u64;
             let outcome = if self.end_ram_move(ended, landed) {
@@ -182,8 +181,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// Abandon `request`'s move once its window in flight has landed.
     pub(crate) fn ram_abandon(&self, request: RequestId) {
         let mut moves = self.kv_ram.lock().unwrap();
-        if let Some(at) = moves.moves.iter().position(|m| m.request == request) {
-            let abandoned = moves.moves.remove(at);
+        if let Some(at) = moves.under_way.iter().position(|m| m.request == request) {
+            let abandoned = moves.under_way.remove(at);
             self.end_ram_move(abandoned, false);
         }
     }
@@ -192,7 +191,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     pub(crate) fn ram_shutdown(&self) {
         // From `Drop`: a lock a panic poisoned is still the moves'.
         let mut moves = self.kv_ram.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for abandoned in std::mem::take(&mut moves.moves) {
+        for abandoned in std::mem::take(&mut moves.under_way) {
             self.end_ram_move(abandoned, false);
         }
     }
@@ -200,6 +199,9 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// Settle what has landed of `m`'s window in flight, and issue its next
     /// window when there is none.
     fn pump_ram(&self, m: &mut Move<L>) -> Pumped {
+        if m.failed {
+            return Pumped::Failed;
+        }
         if let Some(fence) = m.in_flight {
             match self.model.leaf.transfer_passed(self.model.handle(), fence) {
                 Ok(false) => return Pumped::Going,
@@ -241,17 +243,14 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                     .restore_window(self.model.handle(), sequence, window, &span.as_ref()[range])
             }
         };
-        // A fence even after a refusal: a window may have issued some of its
-        // copies before one failed, and nothing it touches is let go until
-        // they have landed.
-        let fence = self.model.leaf.transfer_fence(self.model.handle());
-        m.in_flight = fence.as_ref().ok().copied();
-        match (issued, fence) {
-            (Ok(()), Ok(_)) => {
+        let (fence, issued) = self.fence_window(issued);
+        m.in_flight = fence;
+        match issued {
+            Ok(()) => {
                 m.issued += window.bytes;
                 Pumped::Going
             }
-            (Err(code), _) | (_, Err(code)) => {
+            Err(code) => {
                 tracing::warn!(name: "ignis.kv_ram.copy_failed", code, request_id = m.request, "a KV-RAM move's window could not be issued");
                 Pumped::Failed
             }

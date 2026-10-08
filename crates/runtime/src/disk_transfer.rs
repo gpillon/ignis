@@ -866,21 +866,15 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             };
             let sequence = sequence.as_mut().expect("a restore holds its sequence until it ends");
             let issued = self.model.leaf.restore_window(self.model.handle(), sequence, slice, src);
-            // A fence even after a refusal: some of the slice's copies may
-            // have gone out, and the slot and the sequence are let go only
-            // once they have landed.
-            let fence = self.model.leaf.transfer_fence(self.model.handle());
-            let upto = fed + slice.bytes;
-            match (issued, fence) {
-                (Ok(()), Ok(fence)) => tier.transfers[i].ops[at] = Op::Feeding { index, slot, upto, fence },
-                (issued, fence) => {
-                    if let Ok(fence) = fence {
-                        tier.transfers[i].ops[at] = Op::Feeding { index, slot, upto, fence };
-                    }
-                    let code = issued.err().or(fence.err()).unwrap_or(-1);
-                    tracing::warn!(name: "ignis.kv_disk.restore_refused", code, "the leaf refused a KV-disk window");
-                    return Some(DiskOutcome::Failed { op: DiskOp::Read });
-                }
+            // The slot and the sequence are let go only once whatever the
+            // slice put on the link has landed, refused or not.
+            let (fence, issued) = self.fence_window(issued);
+            if let Some(fence) = fence {
+                tier.transfers[i].ops[at] = Op::Feeding { index, slot, upto: fed + slice.bytes, fence };
+            }
+            if let Err(code) = issued {
+                tracing::warn!(name: "ignis.kv_disk.restore_refused", code, "the leaf refused a KV-disk window");
+                return Some(DiskOutcome::Failed { op: DiskOp::Read });
             }
         }
         // One new window: read into a free slot.

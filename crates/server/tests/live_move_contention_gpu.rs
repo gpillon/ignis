@@ -61,15 +61,15 @@ const PAGE_TOKENS: u32 = 64;
 const C_PROMPT: u32 = 236_000;
 const C_TOKENS: u32 = 2_000;
 const B_PROMPT: u32 = 2_000;
-const B1_TOKENS: u32 = 1_200;
-const B2_TOKENS: u32 = 1_600;
+/// Long enough that both still decode through C's move back in.
+const B1_TOKENS: u32 = 2_000;
+const B2_TOKENS: u32 = 2_400;
 /// The width-2 baselines' lanes.
 const B0_TOKENS: u32 = 300;
 /// The baseline taken last runs longer: the moves' windows are drawn from its
 /// middle.
-const B9_TOKENS: u32 = 600;
-/// E0 fits beside C, B1 and B2 (8,256 of the 17,344 tokens they leave); its
-/// one chunk is E's first.
+const B9_TOKENS: u32 = 800;
+/// E0 fits beside C, B1 and B2 (8,256 of the 15,744 tokens they leave).
 const E0_PROMPT: u32 = CHUNK;
 /// E does not fit (18,064): C has to go.
 const E_PROMPT: u32 = 18_000;
@@ -200,6 +200,34 @@ impl Rig {
         gaps
     }
 
+    /// The gaps of `requests` whose later token lands in one of `steps`.
+    fn itl_in(&self, requests: &[RequestId], steps: &[usize]) -> Vec<Duration> {
+        steps.iter().flat_map(|&i| self.itl(requests, i, i)).collect()
+    }
+
+    /// Whether every one of `requests` decoded in step `i`: a round of that
+    /// width at least.
+    fn all_decoded(&self, requests: &[RequestId], i: usize) -> bool {
+        requests
+            .iter()
+            .all(|r| self.steps[i].events.iter().any(|e| matches!(e, SchedEvent::Token { request, .. } if request == r)))
+    }
+
+    /// The span a KV-RAM move of `request` reported landing in step `at`,
+    /// start to landing; a disk move's is read off the steps it spanned.
+    fn kv_ram_span(&self, tier: Tier, request: RequestId, at: usize) -> Option<Duration> {
+        if tier != Tier::KvRam {
+            return None;
+        }
+        self.steps[at].events.iter().find_map(|ev| match ev {
+            SchedEvent::Evicted { request: r, snapshot_micros } if *r == request => Some(Duration::from_micros(*snapshot_micros)),
+            SchedEvent::Restored { request: r, restore_micros, .. } if *r == request => {
+                Some(Duration::from_micros(*restore_micros))
+            }
+            _ => None,
+        })
+    }
+
     /// The steps in `from..to` that ran no prefill chunk and had no transfer
     /// in flight: steady decode.
     fn steady(&self, from: usize, to: usize) -> Vec<usize> {
@@ -291,11 +319,11 @@ impl Move {
     }
 }
 
-/// The pace the legs run at: `IGNIS_KV_MOVE_PACE=<in MiB>,<out MiB>`, or the
-/// load's default.
+/// The pace the legs run at: `IGNIS_KV_MOVE_PACE=<in MiB>,<out MiB>`, or
+/// Flash-Next's own.
 fn pace() -> ignis_runtime::TransferPace {
     let Ok(named) = std::env::var("IGNIS_KV_MOVE_PACE") else {
-        return ignis_runtime::TransferPace::default();
+        return ignis_runtime::TransferPace::for_family(ignis_core::compute::ModelFamily::FlashNext);
     };
     let mib: Vec<u64> = named
         .split(',')
@@ -354,7 +382,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         kv_disk_bytes: Some(kv_disk_bytes),
         kv_pool: Some(ignis_core::KvPoolSize::Tokens(u64::from(CONTEXT))),
         ngram_hot_bytes: ignis_core::ngram_table::HotBudget::Bytes(0),
-        transfer_pace: pace,
+        transfer_pace: Some(pace),
         ..EngineShape::default()
     };
     let (sched, reserved) = match flash_next_scheduler_with_ngram_cache(
@@ -439,8 +467,12 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         Tier::KvRam => start,
         Tier::KvDisk => start + 1,
     };
-    let out_steps = (first..end).collect::<Vec<_>>();
-    let out_duration = rig.steps[end].at - rig.steps[end].wall - (rig.steps[start].at - rig.steps[start].wall);
+    // The steps of the move at width 2: B1 and B2 both decoded in them.
+    let out_steps = (first..end).filter(|&i| rig.all_decoded(&b, i)).collect::<Vec<_>>();
+    assert!(out_steps.len() + 1 >= end - first, "B1 and B2 decoded through C's move out");
+    let out_duration = rig
+        .kv_ram_span(tier, c, end)
+        .unwrap_or(rig.steps[end].at - rig.steps[end].wall - (rig.steps[start].at - rig.steps[start].wall));
 
     // ── E ends: C in ───────────────────────────────────────────────────────
     // Started at the end of the step E ended in, seen landed at the top of
@@ -450,11 +482,13 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
     let e_done = rig.find(from, |ev| matches!(ev, SchedEvent::Done { request, .. } if *request == e)).unwrap();
     rig.until(|rig| rig.has(|ev| matches!(ev, SchedEvent::Restored { request, .. } if *request == c)));
     let restored = rig.find(e_done, |ev| matches!(ev, SchedEvent::Restored { request, .. } if *request == c)).unwrap();
-    let still_decoding = b.iter().filter(|&&r| !rig.finished_at_length(r)).count();
-    assert!(still_decoding >= 1, "at least one of B1 and B2 still decodes when C comes back");
+    assert!(b.iter().all(|&r| !rig.finished_at_length(r)), "B1 and B2 both still decode when C comes back");
     let in_start = (e_done..=restored).find(|&i| rig.steps[i].busy_after).expect("the move in started");
-    let in_steps = (in_start + 1..restored).collect::<Vec<_>>();
-    let in_duration = rig.steps[restored].at - rig.steps[restored].wall - rig.steps[in_start].at;
+    let in_steps = (in_start + 1..restored).filter(|&i| rig.all_decoded(&b, i)).collect::<Vec<_>>();
+    assert_eq!(in_steps.len(), restored - in_start - 1, "B1 and B2 decoded in every step of C's move in");
+    let in_duration = rig
+        .kv_ram_span(tier, c, restored)
+        .unwrap_or(rig.steps[restored].at - rig.steps[restored].wall - rig.steps[in_start].at);
     rig.to_idle();
 
     // ── the baseline: two fresh lanes alone at width 2, last ───────────────
@@ -486,7 +520,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
             bytes,
             duration,
             steps: steps.len(),
-            itl: steps.first().map_or_else(Vec::new, |&s| rig.itl(&b, s, *steps.last().unwrap())),
+            itl: rig.itl_in(&b, steps),
             baseline: rig.itl(&b9, late_first, late_last),
             early_baseline: rig.itl(&b0, early_first, early_last),
             p50_bound,

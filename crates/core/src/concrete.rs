@@ -582,7 +582,8 @@ struct RamOut {
 }
 
 /// A live sequence on its way back from KV-RAM a window at a time (GitHub
-/// #309): charged on the device and its lane held, not yet schedulable.
+/// #309): charged on the device and, if it resumes on one, its lane held;
+/// not yet schedulable.
 #[derive(Debug, Clone, Copy)]
 struct RamIn {
     request: RequestId,
@@ -2606,7 +2607,10 @@ impl ConcreteScheduler {
     /// Spec vram-budget/03: on a load with KV-disk the victim goes to KV-RAM
     /// when it can make room, waits while KV-RAM sends something to the disk
     /// for it, or goes straight to the disk when KV-RAM cannot take it at all
-    /// -- [`Moved::Started`] for either of the last two.
+    /// -- [`Moved::Started`] for either of the last two. GitHub #309: the
+    /// move into KV-RAM itself is [`Compute::kv_ram_move_out`], and a backend
+    /// that moves it a window at a time makes it [`Moved::Started`] too: the
+    /// victim leaves the device when [`Self::kv_ram_pass`] sees it land.
     fn snapshot_and_evict(
         &mut self,
         v_idx: usize,
@@ -2669,6 +2673,13 @@ impl ConcreteScheduler {
         let Ok((bytes, how)) = self.compute.kv_ram_move_out(v_id) else {
             return Moved::Nothing;
         };
+        let out = RamOut {
+            request: v_id,
+            resume_phase,
+            lane,
+            restore_pages,
+            bytes,
+        };
         if how == KvRamMove::Started {
             // GitHub #309: the blob leaves a window at a time between steps.
             // Its bytes are KV-RAM's now; the victim keeps its pages, slot
@@ -2676,38 +2687,29 @@ impl ConcreteScheduler {
             debug_assert!(self.kv_ram_out.is_none(), "one move out of the device at a time");
             self.host.begin_landing(v_id, bytes);
             self.requests[v_idx].moving = true;
-            self.kv_ram_out = Some(RamOut {
-                request: v_id,
-                resume_phase,
-                lane,
-                restore_pages,
-                bytes,
-            });
+            self.kv_ram_out = Some(out);
             return Moved::Started;
         }
         let snapshot_micros = started.elapsed().as_micros() as u64;
-        self.capture_moved_out(v_idx, resume_phase, lane, restore_pages, bytes, snapshot_micros, events);
+        self.capture_moved_out(v_idx, out, snapshot_micros, events);
         Moved::Now
     }
 
-    /// The scheduler's half of a live sequence landing in KV-RAM (GitHub
-    /// #125; #309 for one that landed a window at a time): its tier entry,
-    /// its leaving the device, and the `Evicted` fact, `snapshot_micros`
-    /// after the move started.
-    #[allow(clippy::too_many_arguments)]
-    fn capture_moved_out(
-        &mut self,
-        v_idx: usize,
-        resume_phase: ResumePhase,
-        lane: Option<LaneId>,
-        restore_pages: u32,
-        bytes: u64,
-        snapshot_micros: u64,
-        events: &mut Vec<SchedEvent>,
-    ) {
-        let (v_id, v_class, v_tokens, v_progress, v_work, v_gdn) = {
+    /// The scheduler's half of live sequence `v_idx` landing in KV-RAM
+    /// (GitHub #125; #309 for one that landed a window at a time): its tier
+    /// entry, its leaving the device, and the `Evicted` fact,
+    /// `snapshot_micros` after the move started.
+    fn capture_moved_out(&mut self, v_idx: usize, out: RamOut, snapshot_micros: u64, events: &mut Vec<SchedEvent>) {
+        let RamOut {
+            request: v_id,
+            resume_phase,
+            lane,
+            restore_pages,
+            bytes,
+        } = out;
+        let (v_class, v_tokens, v_progress, v_work, v_gdn) = {
             let v = &self.requests[v_idx];
-            (v.id, v.class, v.tokens, v.prefill_progress, v.remaining_work, v.gdn.clone())
+            (v.class, v.tokens, v.prefill_progress, v.remaining_work, v.gdn.clone())
         };
         let entry = HostEntry {
             request: v_id,
@@ -3116,7 +3118,7 @@ impl ConcreteScheduler {
                 // ranking in KV-RAM until its last window lands.
                 self.materialize(idx);
                 let lane = match victim.resume_phase {
-                    ResumePhase::Running => self.free_lanes.pop(),
+                    ResumePhase::Running => Some(self.free_lanes.pop().expect("checked non-empty above")),
                     ResumePhase::Prefilling => None,
                 };
                 self.host.begin_restore(victim.request);
@@ -3133,20 +3135,22 @@ impl ConcreteScheduler {
     /// The scheduler's half of a live sequence back on the device from
     /// KV-RAM, charged already (GitHub #125; #309 for one that came back a
     /// window at a time): its tier entry goes, promoted, and it resumes on
-    /// `lane`, or prefilling from where it stopped.
+    /// `lane` -- which a sequence moved off one holds -- or prefilling from
+    /// where it stopped.
     fn resume_moved_in(&mut self, idx: usize, lane: Option<LaneId>, restore_micros: u64, events: &mut Vec<SchedEvent>) {
         let request = self.requests[idx].id;
         let entry = self.host.restore(request).expect("the victim is a tier entry");
-        match lane {
-            Some(lane) => {
+        match (entry.resume_phase, lane) {
+            (ResumePhase::Running, Some(lane)) => {
                 self.requests[idx].restore_lane(lane);
             }
-            None => {
+            (ResumePhase::Prefilling, None) => {
                 // Resume chunking from the snapshotted boundary, not from
                 // zero.
                 self.requests[idx].prefill_progress = entry.prefill_progress;
                 self.requests[idx].restore_prefilling();
             }
+            (phase, lane) => unreachable!("a {phase:?} sequence back with lane {lane:?}"),
         }
         events.push(SchedEvent::Restored {
             request,
@@ -3180,9 +3184,7 @@ impl ConcreteScheduler {
                 };
                 self.requests[idx].moving = false;
                 match outcome {
-                    KvRamOutcome::Landed { micros } => {
-                        self.capture_moved_out(idx, out.resume_phase, out.lane, out.restore_pages, out.bytes, micros, events)
-                    }
+                    KvRamOutcome::Landed { micros } => self.capture_moved_out(idx, out, micros, events),
                     // The victim is where it was, on the device, and decodes
                     // while nothing moves; the request that wanted the room
                     // asks again after that.

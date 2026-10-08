@@ -1038,9 +1038,14 @@ impl Compute for MockCompute {
         ended
             .into_iter()
             .map(|(m, failed)| {
-                // A move in that landed gives its span back; a move out that
-                // failed never filled its own.
-                if m.out == failed {
+                // A move in that landed gives its span back, and so does a
+                // move out that failed; the others' spans stay the
+                // request's snapshot.
+                let span_goes = match (m.out, failed) {
+                    (false, false) | (true, true) => true,
+                    (false, true) | (true, false) => false,
+                };
+                if span_goes {
                     self.free_blob(MockBlob::Live(m.request));
                 }
                 KvRamEvent {

@@ -489,14 +489,14 @@ fn a_request_cancelled_mid_move_in_gives_back_its_lane_its_pages_and_its_snapsho
     let (c, b, e) = c_moves_out_for_e(&mut run);
     run.until(|run| run.done(e));
     assert!(run.sched.in_transfer(c), "C is on its way back");
-    let charged = run.sched.kv_used_pages();
+    assert_eq!(run.sched.kv_used_pages(), 30 + 24, "C charged beside B");
     assert!(run.sched.cancel(c));
     run.step();
     assert_eq!(compute.kv_ram_moves(), 0, "the move was abandoned");
     assert!(!run.sched.transfer_busy());
     assert_eq!(run.sched.host_tier().entry_count(), 0, "C's snapshot went with it");
     assert_eq!(run.sched.host_tier().used_bytes(), 0);
-    assert!(run.sched.kv_used_pages() < charged, "C's pages came back");
+    assert_eq!(run.sched.kv_used_pages(), 24, "B's pages alone, as before the move in");
     assert!(!run.restored(c));
     run.to_idle();
     assert_eq!(run.tokens(b), expected(&compute, b, B_TOKENS));
@@ -558,4 +558,32 @@ fn a_failed_move_in_prefills_the_request_again() {
     run.to_idle();
     assert!(run.done(c), "C finished all the same");
     assert_eq!(run.sched.kv_used_pages(), 0);
+}
+
+// ── room in KV-RAM while a move in is under way ─────────────────────────────
+
+#[test]
+fn a_snapshot_on_its_way_back_is_never_given_up_for_another_victim() {
+    // KV-RAM holds one blob. C's comes back from it a window at a time when
+    // E ends; meanwhile F's admission needs D off the device, and KV-RAM is
+    // full with C's blob, which the copies are reading: D cannot move, and
+    // F waits for the room rather than C losing its snapshot.
+    let compute = windowed(1);
+    let mut run = Run::new(pool(1), compute.clone());
+    let d = run.submit(live(50, 500), RequestClass::Agent); // 32 pages, outliving E
+    let c = run.submit(live(1, 380), RequestClass::Agent); // 24 pages, the youngest Agent
+    run.steps(3);
+    let e = run.submit(live(200, 156), RequestClass::Interactive); // 10 pages: C out
+    run.until(|run| run.evicted(c));
+    run.until(|run| run.done(e));
+    assert!(run.sched.in_transfer(c), "C is on its way back");
+    let f = run.submit(live(300, 156), RequestClass::Interactive); // 10 pages: D would have to go
+    run.until(|run| run.restored(c));
+    assert!(!run.evicted(d), "D did not move while C's blob filled KV-RAM");
+    assert!(!run.has(|ev| matches!(ev, SchedEvent::PrefillChunk { request, .. } if *request == f)), "F waited");
+    run.to_idle();
+    for (r, max) in [(d, 500), (c, 380), (e, 156), (f, 156)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
 }

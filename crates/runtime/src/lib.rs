@@ -362,8 +362,9 @@ pub struct TransferWindow {
 /// vram-budget/03 AC 37, GitHub #309): a restore from KV-RAM, and the feed of
 /// a restore from KV-disk. One such window is in flight at a time, and a new
 /// one goes out at most once an advance, so this is the host-to-device
-/// traffic a move adds to a decode round -- the expert stream's own
-/// direction, whose copies a decode round waits on.
+/// traffic a move adds to a decode round. On Flash-Next that is the expert
+/// stream's own direction: the window shares the link with the expert copies
+/// each layer of the round needs before it can run.
 pub const MOVE_IN_WINDOW_BYTES: u64 = 16 << 20;
 
 /// The window a live move off the device into KV-RAM keeps on the link
@@ -372,8 +373,8 @@ pub const MOVE_IN_WINDOW_BYTES: u64 = 16 << 20;
 pub const MOVE_OUT_WINDOW_BYTES: u64 = 64 << 20;
 
 /// How much a live move puts on the link per advance, each way (GitHub
-/// #309): [`MOVE_IN_WINDOW_BYTES`] and [`MOVE_OUT_WINDOW_BYTES`] unless a load
-/// names others.
+/// #309): the family's ([`TransferPace::for_family`]) unless a load names
+/// another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferPace {
     /// Host to device: a restore from KV-RAM, and a KV-disk restore's feed.
@@ -387,6 +388,23 @@ impl TransferPace {
     /// is fed in slices the leaf's own blob layout never splits badly (the
     /// Flash-Next context block is 256 bytes).
     pub const MIN_WINDOW_BYTES: u64 = 4096;
+
+    /// A move in one window each way: still off the model thread, but
+    /// nothing held back for a decode round.
+    pub const UNPACED: Self = Self {
+        move_in_bytes: u64::MAX,
+        move_out_bytes: u64::MAX,
+    };
+
+    /// `family`'s pace: [`MOVE_IN_WINDOW_BYTES`] and [`MOVE_OUT_WINDOW_BYTES`]
+    /// on Flash-Next, whose experts stream over the link a move shares;
+    /// [`Self::UNPACED`] on the 27B, whose decode rounds put nothing on it.
+    pub fn for_family(family: ignis_core::compute::ModelFamily) -> Self {
+        match family {
+            ignis_core::compute::ModelFamily::FlashNext => Self::default(),
+            ignis_core::compute::ModelFamily::Qwen38_27b => Self::UNPACED,
+        }
+    }
 
     /// `self` with each window at least [`Self::MIN_WINDOW_BYTES`].
     pub fn clamped(self) -> Self {
@@ -1022,6 +1040,16 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// The pace live moves run at.
     pub fn transfer_pace(&self) -> TransferPace {
         self.pace
+    }
+
+    /// A fence after a window `issued` on the transfer stream -- taken even
+    /// after a refusal, since some of the window's copies may have gone out
+    /// before one failed, and nothing they touch may be let go before they
+    /// have landed. The fence, when one was taken, and whether the window
+    /// and its fence both went out.
+    fn fence_window(&self, issued: Result<(), i32>) -> (Option<u64>, Result<(), i32>) {
+        let fence = self.model.leaf.transfer_fence(self.model.handle());
+        (fence.as_ref().ok().copied(), issued.and(fence.map(|_| ())))
     }
 
     /// This adapter with the KV-disk tier (spec vram-budget/03): `store`
