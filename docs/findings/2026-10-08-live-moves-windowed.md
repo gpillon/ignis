@@ -1,12 +1,12 @@
 # Live moves a window at a time: the copies cost the other lanes almost nothing; what a move in's rounds pay is expert-cache misses
 
 - Kind: experiment
-- Status: current
+- Status: superseded
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: serving / live moves (ADR 0045, fixed branch), KV-RAM and KV-disk transfers, the leaf's whole-blob snapshot, Flash-Next's expert residency during and after a move
 - Related: https://github.com/gpillon/ignis/issues/309, [ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), spec [vram-budget/03](../specs/vram-budget/03-kv-pool-policy-and-kv-disk.md) (AC 37), supersedes [live move PCIe contention](2026-10-08-live-move-pcie-contention.md)
-- Superseded by: none
+- Superseded by: [expert misses after a live move are the text's](2026-10-08-expert-misses-after-a-move-are-the-text.md)
 
 ## Question
 

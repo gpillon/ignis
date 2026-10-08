@@ -149,7 +149,8 @@ gives the reason for each.
 | Page-shortage victim | retained state; then only what ranks below the requester (class, then submission): `Agent` first, not decoding first, latest-submitted first | *(owner)* not decoding first, never the requester; *(agent)* rank gate |
 | Entry rule | a restore never moves anything; entries in rank order; growth branch: free pages ≥ reservation + 4 steps for itself and each resident sequence above it; fixed branch: the reservation fits | *(agent)* |
 | Last resort (growth branch) | every resident sequence parked and no tier takes a victim: the lowest-ranked is re-queued, with an ERROR | *(agent)* |
-| PCIe contention | move out: ITL p50 +10%; move in: ITL p50 +25%; either: max within baseline + 150 ms | *(agent)*, owner to confirm |
+| PCIe contention | move out: ITL p50 +10%; move in: +25% on a step's time outside its expert stall and transfer passes, what the transfer adds (owner, 2026-10-08, GitHub #310); either: max within baseline + 150 ms | *(agent)*, owner to confirm |
+| Rounds after a restore (GitHub #310) | against the same text unmoved, at the same tokens: rounds 10-19 after the restore (N = 10) within +10% in mean expert misses, and each 200-round window's median within +10% from the first round | *(agent)*, owner to confirm, measured by AC 43 |
 | Move pace (GitHub #309) | a live move goes a window at a time each way, one in flight, at most one new an advance; Flash-Next: `MOVE_IN_WINDOW_BYTES` 16 MiB onto the device (KV-RAM restores, KV-disk restore feeds), `MOVE_OUT_WINDOW_BYTES` 12 MiB off it (into KV-RAM, and a KV-disk spill's copies into its staging since GitHub #310), beside the rounds; the 27B: unpaced (one window) | *(agent)*, measured by AC 37 |
 | KV-disk on | Flash-Next `--kv-disk-bytes 4G` (owner 2026-10-08: 4 GiB to start); 27B `0` | *(owner)* build, *(agent)* sizes |
 | Location | `--kv-disk-path model` (beside the artifact), `auto`, or a directory: the n-gram cache's rule | *(owner)*, confirmed 2026-10-08 |
@@ -809,7 +810,12 @@ the fixed branch, *(both)* on either.
     Starting thresholds, for the owner to confirm:
     - Move out: ITL p50 within +10% of the baseline.
     - Move in: ITL p50 within +25%, since it shares the expert stream's
-      direction.
+      direction. Since GitHub #310 (owner, 2026-10-08) this bound is the
+      transfer's: the p50 of a step's time outside its expert stall and the
+      model thread's transfer passes, against the baseline's, with the raw
+      ITL printed beside it. A round's expert misses are those of what its
+      lanes generate, so a move in's raw ITL is the text's as much as the
+      move's; the rounds after a restore are AC 43's.
     - Either: ITL max within the baseline's max + 150 ms. That covers one
       synchronous KV-RAM copy of a whole-context blob, ~0.1 s at ~12 GB/s.
 
@@ -904,6 +910,45 @@ the fixed branch, *(both)* on either.
     - The phase's GPU tests are green on a free 5090, the card checked free
       first (AGENTS.md).
 
+### After a live move (GitHub #310)
+
+43. **GPU: the rounds after a restore miss what the same text misses
+    unmoved (Flash-Next)** *(fixed)*.
+    - Why a same-text control: a round's expert misses are those of what its
+      lanes generate, and greedy decode is not batch-invariant, so a moved
+      run and an unmoved one generate different text from the round their
+      batches part. The 2026-10-08 runs read that as a move doubling the
+      misses; at the same text it adds none (finding
+      [expert misses after a live move are the text's](../../findings/2026-10-08-expert-misses-after-a-move-are-the-text.md)).
+    - Setup: AC 37's KV-RAM leg, and the same requests on a pool with room
+      for E beside C, so that nothing moves. Both generate one recorded text,
+      a forced literal per request
+      (`crates/server/tests/fixtures/ac37_text.json`); any fixed text serves.
+      Both have one expert cache, within 1% (asserted): the unmoved run's
+      budget carries its extra chunk of pool, and the two loads share one
+      CUDA context held from before the first (a second load in a process
+      otherwise plans its cache the context's size smaller, which read 6%
+      more misses).
+    - Measured: from C's restore on, the width-3 rounds' (C, B1 and B2
+      decoding) decode expert misses, against the unmoved run's at the same
+      tokens, aligned by B1's token index. C is some 260 tokens further on in
+      the unmoved run; its text never repeats a token, so where in it a round
+      falls does not change what it costs.
+    - Starting bounds, for the owner to confirm. C's experts come back into
+      the cache over its first rounds: rounds 0-4 after the restore miss
+      +9 to +28% more than the unmoved run's (three pairs), rounds 5-9 +1 to
+      +7%. So:
+      - N = 10: the mean misses of rounds 10-19 after the restore are within
+        +10% of the unmoved run's over the same tokens (measured +3 to +6%);
+      - from the first round, each full window of 200 rounds' median misses
+        is within +10% (measured -1.4 to +2.5%; all 1,456 rounds +0.3%).
+
+      The rounds 0-4 and 5-9, the 50-round windows (-5.2 to +9.7%) and the
+      first 10 rounds are printed beside them.
+    - Not compared: ITL. A forced round is never a captured graph.
+    - Asserted: the two runs generated the same text, and nothing was lost
+      (AC 37's assertions).
+
 ## Implementation Decisions
 
 - **The policy is one function for both models.** Flash-Next's hand-rolled
@@ -983,7 +1028,7 @@ the fixed branch, *(both)* on either.
   - on the growth branch, `test_seq_alloc`, extended to growth (AC 30);
   - P0's equal-work check (AC 26) lives on the spike branch.
 - GPU tests are `--ignored`, under the GPU profile (ACs 8-9, 23-25, 27, 31,
-  36-37). Their measurements go to findings, per `docs/findings/README.md`.
+  36-37, 43). Their measurements go to findings, per `docs/findings/README.md`.
 - web: vitest for the snapshot, derive and view of the disk row (AC 39).
 
 ## Phases

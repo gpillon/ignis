@@ -62,11 +62,18 @@ Flash-Next blob, every lane stalled). Measured in
   Flash-Next's block keys copied a 4 KiB page at a time; they now go a run of
   pages per copy. The synchronous call remains for a backend without a
   transfer stream, and for retained state.
-- **What AC 37's move in still pays is the expert cache, not the link.** The
-  rounds around a move in miss ~3x as many experts; a long arrival alone
-  raises the misses (+38%, one control run, beside a host build), and with a move out and back they
-  roughly double for the moved sequence's remaining run. The owner decides what the move-in bound
-  measures; the residency's response to a move is a follow-up.
+- **What AC 37's move in still pays is the expert cache, not the link -- and
+  the cache pays for the text, not for the move.** The rounds around a move
+  in miss ~3x as many experts as the baseline's, but a round's misses are
+  those of what its lanes generate, and a moved run generates other text
+  than an unmoved one from the round their batches part (greedy decode is
+  not batch-invariant). Made to generate the same text, the rounds after a
+  restore miss what the unmoved run's do (GitHub #310: +0.6% over 1,400
+  rounds); the "doubling" the first runs read was one lane's text, diverse
+  in the moved run and a three-token loop in the control. The owner made
+  the move-in bound the transfer's (its rounds' time outside the expert
+  stall), and AC 43 holds the rounds after a restore to a same-text
+  unmoved run.
 
 Sources: [Flash-Next on the 5090](../findings/2026-10-06-flash-next-on-the-5090.md)
 (its 2026-10-07 update: lanes at 262K), the F: disk bench
