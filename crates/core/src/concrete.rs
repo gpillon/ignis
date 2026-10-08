@@ -2548,11 +2548,11 @@ impl ConcreteScheduler {
     /// for it, and without a disk each live victim was a request re-queued
     /// for nothing.
     fn make_host_room_for_bytes(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> KvRamRoom {
-        if self.disk.is_some() {
-            return self.make_host_room_moving(bytes, events);
-        }
         if bytes > self.host.capacity_bytes() {
             return KvRamRoom::None;
+        }
+        if self.disk.is_some() {
+            return self.make_host_room_moving(bytes, events);
         }
         while self.host.used_bytes() + bytes > self.host.capacity_bytes()
             || !self.compute.host_blob_fits(bytes)
@@ -2586,9 +2586,6 @@ impl ConcreteScheduler {
         loop {
             if self.host.used_bytes() + bytes <= self.host.capacity_bytes() && self.compute.host_blob_fits(bytes) {
                 return KvRamRoom::Made;
-            }
-            if bytes > self.host.capacity_bytes() {
-                return KvRamRoom::None;
             }
             let now = self.now();
             match self.host.peek_for_live(now) {
@@ -5589,8 +5586,9 @@ mod tests {
     /// still says no -- and still reports every departure, so a tier that
     /// emptied itself for nothing is visible rather than silent (GitHub #224).
     /// Since GitHub #310 that is a blob the tier could hold but the arena
-    /// cannot place even with every entry gone: here a move out still
-    /// landing holds the arena's second byte, which no victim order frees.
+    /// cannot place even with every entry it may give up gone: here a
+    /// snapshot on its way back to the device (#309), in no ranking, holds
+    /// the arena's second byte.
     #[test]
     fn a_refused_blob_still_reports_what_the_tier_gave_up_trying() {
         let compute = Arc::new(MockCompute::with_host_arena(4));
@@ -5601,20 +5599,17 @@ mod tests {
             },
             compute.clone(),
         );
-        // The arena reads [r1][landing][r2][r3].
-        compute.evict(1).unwrap();
-        sched.host.capture(entry(1, 1, RequestClass::Interactive, 1)).unwrap();
-        compute.evict(9).unwrap();
-        sched.host.begin_landing(9, 1);
-        for request in [2, 3] {
+        // The arena reads [r1][r9][r2][r3], r9 moving back in.
+        for request in [1, 9, 2, 3] {
             compute.evict(request).unwrap();
             sched.host.capture(entry(request, 1, RequestClass::Interactive, request)).unwrap();
         }
+        sched.host.begin_restore(9);
         let mut events = Vec::new();
 
         assert!(
             sched.make_host_room_for_bytes(3, &mut events) == KvRamRoom::None,
-            "three bytes fit the tier's four, and no hole beside the landing blob holds them"
+            "three bytes fit the tier's four, and no hole beside the snapshot moving in holds them"
         );
 
         let drops = events
@@ -5622,7 +5617,7 @@ mod tests {
             .filter(|e| matches!(e, SchedEvent::SnapshotDropped { .. }))
             .count();
         assert_eq!(drops, 3, "all three blobs left the tier: {events:?}");
-        assert_eq!(compute.host_arena_used(), 1, "only the landing blob is left in the arena");
+        assert_eq!(compute.host_arena_used(), 1, "only the snapshot moving in is left in the arena");
     }
 
     /// GitHub #310 -- this test used to pin the opposite: a blob larger than

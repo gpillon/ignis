@@ -462,6 +462,61 @@ fn one_slice_of_a_spill_is_on_the_link_at_a_time() {
     assert!(matches!(run(&rig.compute, blob).0, DiskOutcome::Spilled { .. }));
 }
 
+/// Advance until `rig`'s leaf has copied `slices` spill slices off the device.
+fn until_copied(rig: &Rig, slices: usize) {
+    for _ in 0..10_000 {
+        if rig.leaf.calls.lock().unwrap().snapshot_windows.len() >= slices {
+            return;
+        }
+        rig.compute.disk_advance();
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    panic!("the spill never copied {slices} slice(s)");
+}
+
+#[test]
+fn a_spill_abandoned_mid_window_gives_its_staging_back() {
+    let rig = new_rig_paced("spill-abandon", TransferPace { move_in_bytes: 4096, move_out_bytes: 4096 });
+    prefill(&rig.compute, 1);
+    let blob = DiskBlob::Live(1);
+    rig.compute.disk_spill(blob, DiskSource::Device, live_meta()).unwrap();
+    // The window's first slice lands at once; its second stays on the link.
+    until_copied(&rig, 1);
+    rig.leaf.hold_fences();
+    until_copied(&rig, 2);
+    let busy = rig.compute.disk_staging_busy();
+    rig.compute.disk_discard(blob);
+    let waited = rig.leaf.calls.lock().unwrap().waits;
+    rig.leaf.release_fences();
+    for _ in 0..200 {
+        rig.compute.disk_advance();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(busy > 0, "a window was half copied");
+    assert_eq!(waited, 0, "the model thread did not wait for the slice on the link");
+    assert_eq!(rig.compute.disk_staging_busy(), 0, "every staging window came back once its slice landed");
+    assert!(files_in(&rig).is_empty(), "and the file went");
+}
+
+#[test]
+fn a_spill_failing_mid_window_gives_its_staging_back() {
+    let rig = new_rig_paced("spill-fail", TransferPace { move_in_bytes: 4096, move_out_bytes: 4096 });
+    prefill(&rig.compute, 1);
+    let blob = DiskBlob::Live(1);
+    rig.compute.disk_spill(blob, DiskSource::Device, live_meta()).unwrap();
+    until_copied(&rig, 1);
+    rig.leaf.fail_windows(true);
+    let (outcome, _) = run(&rig.compute, blob);
+    rig.leaf.fail_windows(false);
+    assert!(matches!(outcome, DiskOutcome::Failed { op: DiskOp::Write }), "{outcome:?}");
+    for _ in 0..200 {
+        rig.compute.disk_advance();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(rig.compute.disk_staging_busy(), 0, "the half-copied window's slot came back");
+    assert_eq!(decode(&rig.compute, 1, 1).len(), 1, "and the sequence is still the request's");
+}
+
 #[test]
 fn a_restore_abandoned_mid_feed_gives_its_staging_back() {
     let rig = new_rig("abandon-feed");

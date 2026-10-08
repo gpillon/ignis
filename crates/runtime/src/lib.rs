@@ -392,8 +392,8 @@ pub struct TransferPace {
 
 impl TransferPace {
     /// The smallest window a pace may name: one sector, so a KV-disk window
-    /// is fed in slices the leaf's own blob layout never splits badly (the
-    /// Flash-Next context block is 256 bytes).
+    /// is fed, or copied off the device, in slices the leaf's own blob layout
+    /// never splits badly (the Flash-Next context block is 256 bytes).
     pub const MIN_WINDOW_BYTES: u64 = 4096;
 
     /// A move in one window each way: still off the model thread, but

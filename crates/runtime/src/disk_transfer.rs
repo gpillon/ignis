@@ -706,35 +706,31 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         let issued = {
             let sequences = self.sequences.lock().unwrap();
             match sequences.get(&request) {
-                Some(live) => self
-                    .model
-                    .leaf
-                    .snapshot_window(self.model.handle(), &live.handle, slice, dst)
-                    .and_then(|()| self.model.leaf.transfer_fence(self.model.handle())),
+                Some(live) => self.model.leaf.snapshot_window(self.model.handle(), &live.handle, slice, dst),
                 None => Err(-1),
             }
         };
-        match issued {
-            Ok(fence) => {
-                let copying = Op::Copying { index, slot, upto: copied + slice.bytes, fence };
-                match at {
-                    Some(at) => tier.transfers[i].ops[at] = copying,
-                    None => {
-                        tier.transfers[i].ops.push_back(copying);
-                        tier.transfers[i].issued += 1;
-                    }
+        // The slot is let go only once whatever the slice put on the link has
+        // landed, refused or not.
+        let (fence, issued) = self.fence_window(issued);
+        if let Some(fence) = fence {
+            let copying = Op::Copying { index, slot, upto: copied + slice.bytes, fence };
+            match at {
+                Some(at) => tier.transfers[i].ops[at] = copying,
+                None => {
+                    tier.transfers[i].ops.push_back(copying);
+                    tier.transfers[i].issued += 1;
                 }
-                None
             }
-            Err(code) => {
-                // A window begun gives its slot back when the transfer drains.
-                if at.is_none() {
-                    tier.slots[slot].busy = false;
-                }
-                tracing::warn!(name: "ignis.kv_disk.copy_failed", code, "a KV-disk window copy could not be issued");
-                Some(DiskOutcome::Failed { op: DiskOp::Write })
-            }
+        } else if at.is_none() {
+            // Nothing to wait for, and no window of the transfer in it.
+            tier.slots[slot].busy = false;
         }
+        if let Err(code) = issued {
+            tracing::warn!(name: "ignis.kv_disk.copy_failed", code, "a KV-disk window copy could not be issued");
+            return Some(DiskOutcome::Failed { op: DiskOp::Write });
+        }
+        None
     }
 
     /// Every window landed: queue the header page, with every CRC.
