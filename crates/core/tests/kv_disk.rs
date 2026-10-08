@@ -8,7 +8,7 @@
 //! disk, nothing live is ever discarded for room, a request waits when no
 //! tier has room, and a transfer is a few advances during which nothing else
 //! stops. That the bytes that come back are the right bytes needs the card:
-//! `crates/runtime/tests/kv_disk_gpu.rs`.
+//! `crates/server/tests/kv_disk_gpu.rs`.
 //!
 //! The mock's token streams are pure functions of the request, so a request
 //! whose state went to the disk and came back emits exactly the tokens it
