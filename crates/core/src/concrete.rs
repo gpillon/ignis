@@ -2542,9 +2542,17 @@ impl ConcreteScheduler {
     /// before -- and since its bytes are KV-RAM's until its file commits,
     /// the room is [`KvRamRoom::Coming`], not made. When nothing can move,
     /// the answer is [`KvRamRoom::None`] and nothing was discarded.
+    ///
+    /// GitHub #310: a blob larger than the whole tier is refused on either
+    /// load before anything is given up -- no victim order can make room
+    /// for it, and without a disk each live victim was a request re-queued
+    /// for nothing.
     fn make_host_room_for_bytes(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> KvRamRoom {
         if self.disk.is_some() {
             return self.make_host_room_moving(bytes, events);
+        }
+        if bytes > self.host.capacity_bytes() {
+            return KvRamRoom::None;
         }
         while self.host.used_bytes() + bytes > self.host.capacity_bytes()
             || !self.compute.host_blob_fits(bytes)
@@ -5577,25 +5585,52 @@ mod tests {
         assert_eq!(sched.host.entry_count(), 1, "and only those two left");
     }
 
-    /// The refusal path gives up *everything* and still says no — and still
-    /// reports every departure, so a tier that emptied itself for nothing is
-    /// visible rather than silent (GitHub #224).
+    /// The refusal path that is still reachable gives up *everything* and
+    /// still says no -- and still reports every departure, so a tier that
+    /// emptied itself for nothing is visible rather than silent (GitHub #224).
+    /// Since GitHub #310 that is a blob the tier could hold but the arena
+    /// cannot place even with every entry gone: here a move out still
+    /// landing holds the arena's second byte, which no victim order frees.
     #[test]
     fn a_refused_blob_still_reports_what_the_tier_gave_up_trying() {
-        let (mut sched, _compute) = three_blobs();
+        let compute = Arc::new(MockCompute::with_host_arena(4));
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                host_capacity_bytes: 4,
+                ..SchedulerConfig::default()
+            },
+            compute.clone(),
+        );
+        // The arena reads [r1][landing][r2][r3].
+        compute.evict(1).unwrap();
+        sched.host.capture(entry(1, 1, RequestClass::Interactive, 1)).unwrap();
+        compute.evict(9).unwrap();
+        sched.host.begin_landing(9, 1);
+        for request in [2, 3] {
+            compute.evict(request).unwrap();
+            sched.host.capture(entry(request, 1, RequestClass::Interactive, request)).unwrap();
+        }
         let mut events = Vec::new();
 
-        assert!(sched.make_host_room_for_bytes(5, &mut events) == KvRamRoom::None);
+        assert!(
+            sched.make_host_room_for_bytes(3, &mut events) == KvRamRoom::None,
+            "three bytes fit the tier's four, and no hole beside the landing blob holds them"
+        );
 
         let drops = events
             .iter()
             .filter(|e| matches!(e, SchedEvent::SnapshotDropped { .. }))
             .count();
         assert_eq!(drops, 3, "all three blobs left the tier: {events:?}");
+        assert_eq!(compute.host_arena_used(), 1, "only the landing blob is left in the arena");
     }
 
+    /// GitHub #310 -- this test used to pin the opposite: a blob larger than
+    /// the whole tier emptied it, re-queueing every live snapshot it held,
+    /// and was refused anyway. No victim order makes a five-byte hole in a
+    /// four-byte tier, so the blob is refused before anything is given up.
     #[test]
-    fn a_blob_no_victim_order_can_fit_leaves_the_tier_empty_and_refuses() {
+    fn a_blob_larger_than_the_whole_tier_is_refused_before_anything_is_given_up() {
         let (mut sched, compute) = three_blobs();
         let mut events = Vec::new();
 
@@ -5603,9 +5638,10 @@ mod tests {
             sched.make_host_room_for_bytes(5, &mut events) == KvRamRoom::None,
             "nothing the tier can give up makes a five-byte hole in a four-byte arena"
         );
-        assert_eq!(sched.host.entry_count(), 0, "it gave up everything trying");
-        assert_eq!(sched.host.used_bytes(), 0);
-        assert_eq!(compute.host_arena_used(), 0, "and every blob went back to the arena");
+        assert!(events.is_empty(), "nothing dropped, nothing re-queued: {events:?}");
+        assert_eq!(sched.host.entry_count(), 3, "every live snapshot is still there");
+        assert_eq!(sched.host.used_bytes(), 3);
+        assert_eq!(compute.host_arena_used(), 3, "and still in the arena");
     }
 
     /// Three spilled checkpoints of a byte each, placed in order in a
