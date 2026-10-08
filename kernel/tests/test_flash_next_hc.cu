@@ -436,8 +436,8 @@ int captured_kernels(Launch launch) {
 // first -- folded into the next mix (fn_hc_mix_after, fusion.h's Inject) against the combine, the
 // inject and the mix launched one after another: the mix's x and injection weights, the residual
 // it leaves, the combined y it stores and the accumulator it zeroes, bit for bit, each run over a
-// poisoned arena and poisoned outputs; 2 launches folded at up to three rows, 3 (4 with the
-// combine) unfolded; past three rows the switch changes nothing.
+// poisoned arena and poisoned outputs; 2 launches folded at one row, 3 (4 with the combine)
+// unfolded; past one row (the fold's ceiling) the switch changes nothing.
 void after_case(const ignis::flash_next::HcWeights &dw, const char *format, int rows, bool combine,
                 ninfer::DeviceArena &scratch) {
   namespace fn = ignis::flash_next;
@@ -538,14 +538,16 @@ void after_case(const ignis::flash_next::HcWeights &dw, const char *format, int 
   check(!combine || y[1] == y[0], label + ": the combined y is ignis_moe_combine's, bit for bit");
   const bool zeroed = std::all_of(acc_after[1].begin(), acc_after[1].end(), [](long long v) { return v == 0; });
   check(!combine || zeroed, label + ": the accumulator is zeroed for the next MoE op");
-  const int unfolded = combine ? 4 : 3;
-  if (rows <= 3) {
+  // Unfolded: the combine, the inject, and the mix's two launches (its norm fused) up to three
+  // rows, three past them. The fold takes one row only (hc.cu's kMaxFoldRows).
+  const int unfolded = (combine ? 2 : 1) + (rows <= 3 ? 2 : 3);
+  if (rows <= 1) {
     check(nodes[0] == unfolded && nodes[1] == 2,
           label + ": " + std::to_string(unfolded) + " launches unfolded, 2 folded (got " + std::to_string(nodes[0]) +
               ", " + std::to_string(nodes[1]) + ")");
   } else {
-    check(nodes[0] == nodes[1] && nodes[0] > unfolded,
-          label + ": past three rows the switch changes no launch (got " + std::to_string(nodes[0]) + ", " +
+    check(nodes[0] == unfolded && nodes[1] == unfolded,
+          label + ": past one row the switch changes no launch (got " + std::to_string(nodes[0]) + ", " +
               std::to_string(nodes[1]) + ")");
   }
   cudaFree(d_hidden);

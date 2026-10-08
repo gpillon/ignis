@@ -413,8 +413,14 @@ __device__ __forceinline__ float combine_gate(const __nv_bfloat16 *__restrict__ 
 // the normed rows hc_up_reduce reads and the inject partials, as hc_norm does.
 // With a pending inject every CTA rebuilds its stream as hc_inject_kernel (and
 // combine_kernel) would have left it, value for value; hc_up_reduce stores it.
+// The pending kind is a template parameter so the rebuild's loads stay free of
+// stores and branches: the norm issues them all before its reduce, one memory
+// round trip (a runtime branch with the combined y's store inside serialized
+// them: the folded mix ran 3.8 us slower than the inject and the mix apart).
 // Dynamic shared memory: the rows' normed stream, tokens * width BF16.
-template <bool kFp8>
+enum PendingKind : int { kNothing = 0, kInject = 1, kCombine = 2 };
+
+template <bool kFp8, int kPending>
 __global__ void hc_norm_down(const __nv_bfloat16 *__restrict__ hidden, const __nv_bfloat16 *__restrict__ w_norm,
                              const __nv_bfloat16 *__restrict__ inject, const void *__restrict__ w_down,
                              __nv_bfloat16 *__restrict__ normed, float *__restrict__ inject_part,
@@ -429,30 +435,39 @@ __global__ void hc_norm_down(const __nv_bfloat16 *__restrict__ hidden, const __n
   const bool writer = blockIdx.x == gridDim.x - 1;
   for (int32_t t = 0; t < tokens; ++t) {
     const std::int64_t base = (static_cast<std::int64_t>(t) * streams + s) * width;
-    if (p.inj == nullptr) {
+    if constexpr (kPending == kNothing) {
       norm_stream(hidden + base, w_norm + s * width, rows_normed + t * width, writer ? normed + base : nullptr, width,
                   eps, partial);
     } else {
       const std::int64_t row = static_cast<std::int64_t>(t) * width;
-      const float gate = p.acc != nullptr ? combine_gate(p.x + row, p.w_gate, width, partial, &gate_slot) : 0.0F;
-      const float injection = p.inj[t * streams + s];
-      const bool store_y = p.acc != nullptr && writer && s == 0;
+      float gate = 0.0F;
+      if constexpr (kPending == kCombine) {
+        gate = combine_gate(p.x + row, p.w_gate, width, partial, &gate_slot);
+      }
+      const float injection = __ldg(p.inj + t * streams + s);
+      // The combine's BF16 row, as combine_kernel stores it.
+      const auto combined = [&](int32_t i) {
+        return __float2bfloat16_rn(fmaf(gate, __ldg(p.shared + row + i), ignis_moe::from_fixed(__ldg(p.acc + row + i))));
+      };
       const auto load = [&](int32_t i) {
         float y;
-        if (p.acc != nullptr) {
-          const __nv_bfloat16 combined =
-              __float2bfloat16_rn(fmaf(gate, p.shared[row + i], ignis_moe::from_fixed(p.acc[row + i])));
-          if (store_y) {
-            p.y[row + i] = combined;
-          }
-          y = __bfloat162float(combined);
+        if constexpr (kPending == kCombine) {
+          y = __bfloat162float(combined(i));
         } else {
-          y = __bfloat162float(p.y[row + i]);
+          y = __bfloat162float(__ldg(p.y + row + i));
         }
         return bf(__bfloat162float(hidden[base + i]) + bf(y * injection));
       };
       norm_stream_of(load, w_norm + s * width, rows_normed + t * width, writer ? normed + base : nullptr, width, eps,
                      partial);
+      if constexpr (kPending == kCombine) {
+        // Stream 0's writer stores the combined row for hc_up_reduce, after the batch of loads.
+        if (writer && s == 0) {
+          for (int32_t i = static_cast<int32_t>(threadIdx.x); i < width; i += kThreads) {
+            p.y[row + i] = combined(i);
+          }
+        }
+      }
     }
     if (writer && inject != nullptr) {
       inject_partials(rows_normed + t * width, inject, s, streams, width,
@@ -674,9 +689,16 @@ std::size_t fn_hc_mix_scratch_bytes(const Geometry &g, int32_t rows) {
 
 namespace {
 
-// The rows the folded inject (GitHub #306, step 2) takes: the fused norm's.
+// The rows the folded inject (GitHub #306, step 2) takes: one. Every down CTA rebuilds each row
+// in turn (and recomputes each row's combine gate), so the fold wins at one row and loses from
+// two (bench_flash_next_hc --fold 1|0, 2026-10-08, us a mix, inject / inject and combine: 1 row
+// 11.48 / 13.19 folded against 11.81 / 14.56 apart; 2 rows 14.33 / 19.36 against 13.71 / 16.51;
+// 3 rows 18.66 / 25.74 against 17.81 / 20.59); past it the inject runs on its own.
+constexpr int32_t kMaxFoldRows = 1;
+
 bool folds(const Geometry &g, const HcWeights &w, int32_t rows) {
-  return decode_route(g, w, rows) && rows <= kMaxFusedRows && decode_fused() && fused(Fusion::Inject);
+  return decode_route(g, w, rows) && rows <= kMaxFoldRows && rows <= kMaxFusedRows && decode_fused() &&
+         fused(Fusion::Inject);
 }
 
 // fn_hc_mix, and, with `pending` (only where folds() holds), the inject folded in: the fused down
@@ -804,14 +826,18 @@ int32_t mix(const Geometry &g, const HcWeights &w, const void *hidden, int32_t r
         const dim3 fused_grid(down_blocks + 1, static_cast<uint32_t>(g.streams));
         const std::size_t fused_bytes = static_cast<std::size_t>(n) * g.hidden * sizeof(__nv_bfloat16);
         const auto *norm_w = static_cast<const __nv_bfloat16 *>(w.hc_norm);
+        const int kind = pending.inj == nullptr ? kNothing : pending.acc == nullptr ? kInject : kCombine;
+        const auto launch = [&](auto kernel) {
+          kernel<<<fused_grid, kThreads, fused_bytes, stream>>>(in, norm_w, block_inject, w.mix_down.data, normed,
+                                                                inject_part, down_part, g.hc_rank, g.streams, g.hidden,
+                                                                n, g.rms_norm_eps, pending);
+        };
         if (down_fp8) {
-          hc_norm_down<true><<<fused_grid, kThreads, fused_bytes, stream>>>(
-              in, norm_w, block_inject, w.mix_down.data, normed, inject_part, down_part, g.hc_rank, g.streams,
-              g.hidden, n, g.rms_norm_eps, pending);
+          launch(kind == kNothing ? hc_norm_down<true, kNothing>
+                                  : kind == kInject ? hc_norm_down<true, kInject> : hc_norm_down<true, kCombine>);
         } else {
-          hc_norm_down<false><<<fused_grid, kThreads, fused_bytes, stream>>>(
-              in, norm_w, block_inject, w.mix_down.data, normed, inject_part, down_part, g.hc_rank, g.streams,
-              g.hidden, n, g.rms_norm_eps, pending);
+          launch(kind == kNothing ? hc_norm_down<false, kNothing>
+                                  : kind == kInject ? hc_norm_down<false, kInject> : hc_norm_down<false, kCombine>);
         }
       } else if (down_fp8) {
         hc_down_split<true><<<down_grid, kThreads, 0, stream>>>(w.mix_down.data, normed, down_part, g.hc_rank,

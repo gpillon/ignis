@@ -49,8 +49,8 @@ struct PendingInject {
   bool pending() const { return inj != nullptr; }
 };
 
-// fn_hc_mix of `hidden` after `pending` is applied to it. On the fused decode route (up to three
-// rows, fusion.h's HcNorm and Inject) one down launch rebuilds each stream as the inject (and the
+// fn_hc_mix of `hidden` after `pending` is applied to it. On the fused decode route at one row
+// (fusion.h's HcNorm and Inject; past it the fold loses to the launches it saves) one down launch rebuilds each stream as the inject (and the
 // combine) would leave it and the up launch stores it, the combine's accumulator zeroed: the same
 // bits as ignis_moe_combine, fn_hc_inject and fn_hc_mix one after another, which is what runs
 // anywhere else. `inj` (this mix's) must not be `pending.inj`, nor `pending.y` the mix's x.
