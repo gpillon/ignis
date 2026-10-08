@@ -485,14 +485,18 @@ When output names a domain concept, use the term as defined here.
   never discarded to make room: when no tier has room, the request that needed
   it waits (ADR 0045).
 
-  A shortage of *pages* (an admission, and on ADR 0045's growth branch a
+  A shortage of *pages* (an admission -- resident slots count with them --
+  and on ADR 0045's growth branch a
   lane's growth) moves only what ranks below the requester. *Rank* is class, then submission order, and
   a moved sequence keeps its rank. Retained state goes first; then `Agent`
   before `Interactive`; then sequences not in the decode round (waiting for a
   lane, at a chunk boundary, a **parked lane**) before lane holders; then the
   latest-submitted. A need never takes its requester or anything ranked above
-  it: it waits, or its lane parks. A shortage of *lanes* keeps the lane holder
-  first.
+  it: it waits, or its lane parks. Entries onto the device, restores and
+  admissions alike, are taken in rank order (the *entry rule*): a newcomer
+  waits for any moved sequence that outranks it, a moved sequence takes only
+  the room beyond what the waiting entries above it need, and a restore never
+  moves anything. A shortage of *lanes* keeps the lane holder first.
 - **Chunked prefill** — prefilling a prompt span through the span+position
   prefill call in **prefill chunks** rather than one token at a time. The
   leaf knows how to loop over a span of any length; it is no longer the only

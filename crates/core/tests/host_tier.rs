@@ -16,6 +16,12 @@
 //! `MockCompute::evict` (GitHub #125) reports a nominal 1 byte per
 //! snapshot, so a byte budget here reads exactly like the old page-count
 //! one — an N-byte tier holds N snapshots.
+//!
+//! ADR 0045 (GitHub #309): a newcomer that needs a resident slot or pages
+//! moves only a sequence that ranks below it -- class, then submission
+//! order -- so each overflow request here that takes a filler's place is
+//! `Interactive` over `Agent` fillers. An `Agent` one would wait behind
+//! them (`live_moves.rs`). The head's lane deal keeps its own order.
 
 use std::sync::Arc;
 
@@ -104,8 +110,9 @@ fn evict_frees_a_blocked_head_and_restore_skips_reprefill() {
     let ev1 = sched.advance(); // step 1: the 8 fillers are prefilled + dealt
 
     // The ninth request (the overflow "head") is blocked: all eight lanes
-    // are occupied, so it cannot be dealt without freeing one.
-    let head = sched.submit(input(8), RequestClass::Agent).unwrap();
+    // are occupied, so it cannot be dealt without freeing one. Interactive,
+    // so the Agent fillers rank below it (ADR 0045).
+    let head = sched.submit(input(8), RequestClass::Interactive).unwrap();
     let ev2 = sched.advance(); // step 2: the head is blocked -> a lane is evicted
 
     // A lower-value (non-donor) lane was evicted into the host tier, and
@@ -190,7 +197,7 @@ fn a_request_cancelled_while_evicted_leaves_no_snapshot_behind() {
         sched.submit(input(8), RequestClass::Agent).unwrap();
     }
     sched.advance();
-    let head = sched.submit(input(8), RequestClass::Agent).unwrap();
+    let head = sched.submit(input(8), RequestClass::Interactive).unwrap();
     let evicted = ids_of(&sched.advance(), |e| matches!(e, SchedEvent::Evicted { .. }));
     let victim = *evicted.first().expect("the blocked head evicts a lane");
     assert!(sched.host_tier().contains(victim));
@@ -236,10 +243,11 @@ fn evictions_are_bounded_under_overflow_load() {
     sched.advance(); // step 1: the 8 fillers are dealt onto all 8 lanes
 
     // Three overflow requests: each is blocked (no free lane) and is
-    // admitted by evicting a lane into the (small) host tier.
-    let o1 = sched.submit(input(8), RequestClass::Agent).unwrap();
-    let o2 = sched.submit(input(8), RequestClass::Agent).unwrap();
-    let o3 = sched.submit(input(8), RequestClass::Agent).unwrap();
+    // admitted by evicting a lane into the (small) KV-RAM -- Interactive,
+    // so the Agent fillers rank below them (ADR 0045).
+    let o1 = sched.submit(input(8), RequestClass::Interactive).unwrap();
+    let o2 = sched.submit(input(8), RequestClass::Interactive).unwrap();
+    let o3 = sched.submit(input(8), RequestClass::Interactive).unwrap();
 
     // Run to idle, checking the tier stays bounded at every step.
     let mut events = Vec::new();
@@ -353,12 +361,14 @@ fn a_burst_on_one_prefix_overflows_through_materialized_snapshots_without_repref
             .unwrap();
         sched.advance();
     }
-    // Two unshared requests need a lane and a resident slot each.
+    // Two unshared requests need a lane and a resident slot each. They are
+    // Interactive: an Agent newcomer moves no older Agent for a resident
+    // slot (ADR 0045), and would wait for the burst instead.
     let a = sched
-        .submit(prompt((1000..1004).collect(), 8), RequestClass::Agent)
+        .submit(prompt((1000..1004).collect(), 8), RequestClass::Interactive)
         .unwrap();
     let b = sched
-        .submit(prompt((2000..2004).collect(), 4), RequestClass::Agent)
+        .submit(prompt((2000..2004).collect(), 4), RequestClass::Interactive)
         .unwrap();
     let events = run_to_idle(&mut sched);
 
@@ -475,8 +485,9 @@ fn a_request_holding_a_shared_prefix_is_evicted_with_its_prefix_materialized() {
     assert_eq!(sched.prefix_pinned_pages(), 1, "the shared page is pinned once");
 
     // A third candidate needs a resident slot, and both are held by prefix
-    // holders — one of them is snapshotted to make room.
-    let third = sched.submit(input(4), RequestClass::Agent).unwrap();
+    // holders — one of them is snapshotted to make room. Interactive, so
+    // the two Agents rank below it (ADR 0045).
+    let third = sched.submit(input(4), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut sched);
 
     let evicted: Vec<_> = events
@@ -524,56 +535,33 @@ fn a_request_holding_a_shared_prefix_is_evicted_with_its_prefix_materialized() {
 /// plain oldest-submitted, which would have picked the *older*
 /// (`Interactive`) candidate here instead.
 ///
-/// Until GitHub #190 both candidates reached this point lane-less, because
-/// the fillers' shared prefix kept them from being victims and so from giving
-/// up their lanes. Each now takes a filler's lane on arrival, so the choice is
-/// made between two lane holders; the lane-less ranking itself is
-/// `admission::tests`' `choose_resident_candidate_victim` cases.
+/// ADR 0045 (GitHub #309) puts a rank gate in front of that order: a newcomer
+/// that needs a resident slot or pages moves only what ranks below it, class
+/// then submission order. So `b` is an `Interactive` newcomer, and
+/// `interactive_a`, older and of its class, ranks above it and is never its
+/// victim; between two eligible victims the class decides first
+/// (`admission::tests::among_eligible_victims_agent_goes_before_interactive`,
+/// where the `Interactive` one is the younger). Until #309 this scenario got
+/// both candidates in by having each take a filler's lane through the head's
+/// lane deal; under the entry rule a sequence that deal moves outranks them,
+/// and they would wait for it, so the slots are the shortage instead.
 #[test]
 fn eviction_prefers_agent_over_an_older_interactive_request() {
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: "qwen3.8-27b".into(),
-            max_in_flight: 11, // 8 fillers + interactive_a + agent_a2 + b
+            max_in_flight: 3, // interactive_a + agent_a2 + b
             max_prefill_batch: 8,
-            // Exactly enough resident slots for the 8 lane-holding fillers
-            // plus both lane-less candidates — none left over for `b`.
-            resident_slot_capacity: 10,
+            // Exactly enough resident slots for both candidates — none left
+            // over for `b`.
+            resident_slot_capacity: 2,
             host_capacity_bytes: 64,
             ..SchedulerConfig::default()
         },
         Arc::new(MockCompute::new()),
     );
 
-    // Eight fillers share one 16-token prefix and occupy every lane.
-    for _ in 0..8 {
-        sched
-            .submit(
-                RequestInput {
-                    decision: None,
-                    multimodal: None,
-                    opener_tokens: None,
-                    user_turn_tokens: None,
-                    system_block_tokens: None,
-                    reuse_boundaries: Vec::new(),
-                    model: "qwen3.8-27b".into(),
-                    tokens: (1..=16).collect(),
-                    params: DecodeParams {
-                        max_tokens: Some(20),
-                        ..DecodeParams::default()
-                    },
-                    constrained: None,
-                    forced_literal: None,
-                    warm_up: false,
-                },
-                RequestClass::Interactive,
-            )
-            .unwrap();
-        sched.advance();
-    }
-
-    // `interactive_a`: submitted first (older), a unique short prompt —
-    // completes its one-chunk prefill, holds no lane, no shared prefix.
+    // `interactive_a`: submitted first (older).
     let interactive_a = sched
         .submit(
             RequestInput {
@@ -586,7 +574,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                 model: "qwen3.8-27b".into(),
                 tokens: (1000..1004).collect(),
                 params: DecodeParams {
-                    max_tokens: Some(8),
+                    max_tokens: Some(40),
                     ..DecodeParams::default()
                 },
                 constrained: None,
@@ -611,7 +599,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                 model: "qwen3.8-27b".into(),
                 tokens: (2000..2004).collect(),
                 params: DecodeParams {
-                    max_tokens: Some(8),
+                    max_tokens: Some(40),
                     ..DecodeParams::default()
                 },
                 constrained: None,
@@ -623,10 +611,9 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
         .unwrap();
     sched.advance();
 
-    // `b`: the resident-slot budget (10) is now fully spent (8 fillers +
-    // `interactive_a` + `agent_a2`) — materializing it forces an eviction
-    // between the two lane-less candidates.
-    sched.submit(input(4), RequestClass::Agent).unwrap();
+    // `b`: the resident-slot budget (2) is now fully spent — materializing it
+    // forces an eviction.
+    let b = sched.submit(input(4), RequestClass::Interactive).unwrap();
     let ev_b = sched.advance();
 
     assert!(
@@ -640,6 +627,14 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
             |e| matches!(e, SchedEvent::Evicted { request, .. } if *request == interactive_a)
         ),
         "the older Interactive candidate is not evicted while a lower-class candidate remains"
+    );
+    let rest = run_to_idle(&mut sched);
+    for request in [interactive_a, agent_a2, b] {
+        assert!(rest.iter().any(|e| matches!(e, SchedEvent::Done { request: r, .. } if *r == request)));
+    }
+    assert!(
+        rest.iter().any(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == agent_a2)),
+        "the Agent comes back from its blob"
     );
 }
 

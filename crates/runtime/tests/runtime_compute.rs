@@ -1587,32 +1587,31 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
         },
         compute,
     );
-    for token in 0..9 {
-        scheduler
-            .submit(
-                RequestInput {
-                    decision: None,
-                    multimodal: None,
-                    opener_tokens: None,
-                    user_turn_tokens: None,
-                    system_block_tokens: None,
-                    reuse_boundaries: Vec::new(),
-                    model: "stub".into(),
-                    tokens: vec![token],
-                    params: DecodeParams {
-                        max_tokens: Some(8),
-                        ..DecodeParams::default()
-                    },
-                    constrained: None,
-                    forced_literal: None,
-                    warm_up: false,
-                },
-                RequestClass::Agent,
-            )
-            .unwrap();
+    let input = |token: u32| RequestInput {
+        decision: None,
+        multimodal: None,
+        opener_tokens: None,
+        user_turn_tokens: None,
+        system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
+        model: "stub".into(),
+        tokens: vec![token],
+        params: DecodeParams {
+            max_tokens: Some(8),
+            ..DecodeParams::default()
+        },
+        constrained: None,
+        forced_literal: None,
+        warm_up: false,
+    };
+    for token in 0..8 {
+        scheduler.submit(input(token), RequestClass::Agent).unwrap();
     }
-
     scheduler.advance();
+    // The ninth takes an Agent's resident slot, so it is Interactive: a
+    // newcomer moves only what ranks below it (ADR 0045), and an Agent one
+    // would wait behind the eight.
+    scheduler.submit(input(8), RequestClass::Interactive).unwrap();
     let mut events = scheduler.advance();
 
     assert!(

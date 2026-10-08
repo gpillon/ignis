@@ -73,6 +73,11 @@
 //!    re-prefilling — when a lane frees. The tier's two-tier eviction
 //!    (probation → protected) keeps evictions bounded; a snapshot whose
 //!    GDN position is mid-prefill is rejected (core-02's boundary).
+//!    A shortage of pages or resident slots at materialization (ADR 0045,
+//!    the fixed branch: an admission is the only trigger) moves only what
+//!    ranks below the requester ([`crate::admission::choose_page_shortage_victim`]),
+//!    and moved sequences come back in rank order, ahead of any newcomer
+//!    they outrank; a restore never moves anything.
 //!
 //! Lane capacity: the scheduler holds [`N_DECODE_LANES`] (8) resident
 //! lanes and a KV page capacity (`kv_capacity_pages`, auto-sized from
@@ -126,8 +131,8 @@ use crate::checkpoint::{
     RetainedKind, RetainedStateOperation, ReuseSource, TierList,
 };
 use crate::admission::{
-    ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
-    ResidentCandidate, RetainedLaneCandidate, admission_resources_fit,
+    ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, PageShortageCandidate, ProtectionPhase,
+    Rank, ResidentCandidate, RetainedLaneCandidate, admission_resources_fit, page_shortage_victims,
     choose_resident_candidate_victim, choose_retained_lane_victim, make_admission_protection,
     persistent_backfill_is_safe, protected_head_safe_without_temporal, protection_frontier_distance,
 };
@@ -528,6 +533,34 @@ enum Spill {
     KvRam { request: RequestId },
     /// A retained blob leaving KV-RAM.
     Retained { blob: RetainedBlob },
+}
+
+/// The residency tier a moved live sequence waits in to come back (ADR
+/// 0045).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Below {
+    KvRam,
+    Disk,
+}
+
+/// A live sequence off the device, waiting to come back (ADR 0045).
+#[derive(Debug, Clone, Copy)]
+struct MovedSequence {
+    rank: Rank,
+    below: Below,
+    /// The reservation it comes back into.
+    pages: u32,
+    /// Whether it can come back now: not while it is on its way from KV-RAM
+    /// to the disk.
+    ready: bool,
+}
+
+/// The room held on the device for entries that have not come in yet (ADR
+/// 0045's entry rule): their reservations and a resident slot each.
+#[derive(Debug, Clone, Copy, Default)]
+struct EntryRoom {
+    pages: u32,
+    slots: u32,
 }
 
 /// A restore from KV-disk under way (spec vram-budget/03): charged on the
@@ -2269,6 +2302,12 @@ impl ConcreteScheduler {
         }
     }
 
+    /// Whether `request` is mid-transfer to or from KV-disk (spec
+    /// vram-budget/03): in no batch and no round until the transfer ends.
+    pub fn in_transfer(&self, request: RequestId) -> bool {
+        self.requests.iter().any(|r| r.id == request && r.moving)
+    }
+
     /// The request's prefill progress (P3-01, ADR 0018): prompt tokens
     /// already sent to the compute backend. Durable — this can hold a
     /// partial value across many `advance()` calls while the request sits
@@ -2662,22 +2701,22 @@ impl ConcreteScheduler {
     /// #125): a retained decode lane first (ADR 0004's ported policy,
     /// [`choose_retained_lane_victim`]), a resident lane-less half-prefilled
     /// request otherwise ([`Self::prefilling_eviction_candidate`]).
-    /// `exclude` is a request index this call must never pick as its own
-    /// victim (a blocked head being evaluated for its own admission — see
-    /// [`Self::try_evict_for_head`]; `None` for a fresh candidate's own
-    /// materialization gate, which can never self-select since it is still
-    /// `Admitted`, never `Prefilling`, at that point). Returns `true` when
+    /// `head` is the request index this call must never pick as its own
+    /// victim (the blocked head being evaluated for its own admission — see
+    /// [`Self::try_evict_for_head`]). Returns `true` when
     /// a victim was evicted, `false` when none remains eligible.
+    ///
+    /// The head's lane deal is this order's only caller (ADR 0045): a
+    /// shortage of pages takes [`page_shortage_victims`]'s instead.
     ///
     /// Spec vram-budget/03: [`Moved::Started`] when the victim's move takes
     /// more than this call -- the caller waits for it rather than choosing
     /// another.
-    fn evict_one_victim(&mut self, exclude: Option<usize>, events: &mut Vec<SchedEvent>) -> Moved {
-        // `exclude` (when set) is always `Prefilling` (the blocked head
-        // `try_evict_for_head` is evaluating), so it can never be a
-        // `Running`-lane candidate in the first place — nothing to guard
-        // here specifically; `Self::prefilling_eviction_candidate` is
-        // where excluding it actually matters.
+    fn evict_one_victim(&mut self, head: usize, events: &mut Vec<SchedEvent>) -> Moved {
+        // `head` is always `Prefilling` (queued for a lane), so it can never
+        // be a `Running`-lane candidate in the first place — nothing to guard
+        // here specifically; `Self::prefilling_eviction_candidate` is where
+        // excluding it actually matters.
         let candidates = self.retained_lane_candidates();
         if let Some(victim_lane) = choose_retained_lane_victim(&candidates) {
             let Some(v_idx) = self
@@ -2689,23 +2728,70 @@ impl ConcreteScheduler {
             };
             return self.snapshot_and_evict(v_idx, ResumePhase::Running, Some(victim_lane), events);
         }
-        if let Some(v_idx) = self.prefilling_eviction_candidate(exclude) {
+        if let Some(v_idx) = self.prefilling_eviction_candidate(Some(head)) {
             return self.snapshot_and_evict(v_idx, ResumePhase::Prefilling, None, events);
         }
         Moved::Nothing
     }
 
+    /// A request's **rank** (ADR 0045): its class, then its submission order.
+    fn rank_of(r: &Request) -> Rank {
+        Rank {
+            class: r.class,
+            request_id: r.id,
+        }
+    }
+
+    /// Every live, device-resident sequence but `requester`, as a shortage of
+    /// pages weighs it (ADR 0045, spec vram-budget/03 AC 32): the lane holders
+    /// and the lane-less resident ones, with what keeps each from being a
+    /// victim.
+    fn page_shortage_candidates(&self, requester: usize) -> Vec<PageShortageCandidate> {
+        let donors: &[RequestId] = self.protection.as_ref().map_or(&[], |p| &p.donor_ids);
+        self.requests
+            .iter()
+            .enumerate()
+            .filter(|&(i, r)| {
+                i != requester
+                    && (r.state == RequestState::Running || (r.state == RequestState::Prefilling && r.resident))
+            })
+            .map(|(_, r)| {
+                let decoding = r.state == RequestState::Running;
+                PageShortageCandidate {
+                    rank: Self::rank_of(r),
+                    decoding,
+                    in_transfer: r.moving,
+                    donor: donors.contains(&r.id),
+                    reserved_for_earlier_interactive: decoding && self.reserved_for_earlier_interactive(r),
+                }
+            })
+            .collect()
+    }
+
+    /// Move live sequence `victim` down a tier (ADR 0045): a lane holder
+    /// resumes on a lane, a lane-less one resumes prefilling from its
+    /// progress.
+    fn move_down(&mut self, victim: RequestId, events: &mut Vec<SchedEvent>) -> Moved {
+        let Some(v_idx) = self.requests.iter().position(|r| r.id == victim) else {
+            return Moved::Nothing;
+        };
+        match self.requests[v_idx].lane {
+            Some(lane) => self.snapshot_and_evict(v_idx, ResumePhase::Running, Some(lane), events),
+            None => self.snapshot_and_evict(v_idx, ResumePhase::Prefilling, None, events),
+        }
+    }
+
     /// Make room for `needed` additional resources on top of what is
-    /// currently charged (P4-07, GitHub #125): evicts the lowest-value
-    /// eligible victim ([`Self::evict_one_victim`]), repeatedly, until
-    /// `needed` fits alongside current usage or no evictable victim
-    /// remains. This is the admission-refusal path a fresh candidate's
-    /// *materialization* drives too — not only a blocked, already-resident
-    /// head's lane deal (see [`Self::fits_for_materialization`]'s own
-    /// caller). The caller is never itself a valid victim at this point
-    /// (see [`Self::evict_one_victim`]'s own `exclude` doc), so this never
-    /// needs one.
-    fn make_room(&mut self, needed: &AdmissionResources, events: &mut Vec<SchedEvent>) -> bool {
+    /// currently charged, for the admission of `requester` (P4-07, GitHub
+    /// #125; ADR 0045): moves the first of [`page_shortage_victims`],
+    /// repeatedly, until `needed` fits alongside current usage -- and only
+    /// while those victims, all of them moved, would make the whole room.
+    /// Otherwise nothing moves and the requester waits: what moved would
+    /// only come back into the room it left. This is the materialization
+    /// gate's path, and on the fixed branch the only one a shortage of pages
+    /// takes: a restore never comes here, and neither does the head's lane
+    /// deal ([`Self::try_evict_for_head`]), which keeps its own order.
+    fn make_room(&mut self, requester: usize, needed: &AdmissionResources, events: &mut Vec<SchedEvent>) -> bool {
         loop {
             let used = AdmissionResources {
                 lanes: N_DECODE_LANES as u32 - self.free_lanes.len() as u32,
@@ -2719,7 +2805,29 @@ impl ConcreteScheduler {
             // Spec vram-budget/03: one move at a time. While one is under
             // way the room it makes is coming, and choosing a second victim
             // would move work nobody needs moved yet.
-            if self.spilling.is_some() || self.evict_one_victim(None, events) != Moved::Now {
+            if self.spilling.is_some() {
+                return false;
+            }
+            let rank = Self::rank_of(&self.requests[requester]);
+            let victims = page_shortage_victims(rank, &self.page_shortage_candidates(requester));
+            let freed = victims
+                .iter()
+                .filter_map(|&id| self.requests.iter().find(|r| r.id == id))
+                .fold(AdmissionResources::default(), |freed, r| {
+                    freed.add(&AdmissionResources {
+                        kv_pages: r.resources.kv_pages,
+                        resident_slots: 1,
+                        ..AdmissionResources::default()
+                    })
+                });
+            let coverable = used
+                .add(needed)
+                .sub(&freed)
+                .is_none_or(|after| after.fits(&self.capacity));
+            let Some(&victim) = victims.first().filter(|_| coverable) else {
+                return false;
+            };
+            if self.move_down(victim, events) != Moved::Now {
                 return false;
             }
         }
@@ -2742,7 +2850,7 @@ impl ConcreteScheduler {
             // itself.
             // No evictable victim (all reserved / none), or one on its way
             // (spec vram-budget/03): the head waits.
-            if self.spilling.is_some() || self.evict_one_victim(Some(head_idx), events) != Moved::Now {
+            if self.spilling.is_some() || self.evict_one_victim(head_idx, events) != Moved::Now {
                 return false;
             }
             // Loop: re-check whether the head now fits.
@@ -2758,80 +2866,180 @@ impl ConcreteScheduler {
     /// normal way once its prefill completes. Either way, restoring
     /// re-materializes the request's resident-slot + KV-page charge
     /// (`Self::materialize`) before anything else, mirroring exactly what
-    /// eviction released. Restores as many evicted requests as there is
-    /// room for, in the host tier's victim order (the entries closest to
-    /// being discarded). A physical restore failure (a corrupt/foreign
+    /// eviction released. A physical restore failure (a corrupt/foreign
     /// blob, or a leaf-level error) discards the snapshot and re-prefills
     /// the request instead — the same fallback the tier's own byte-budget
     /// discard uses.
+    ///
+    /// ADR 0045's entry rule (fixed branch): moved sequences come back in
+    /// rank order, from KV-RAM and from the disk alike, each when its whole
+    /// reservation fits beside the room held for every entry that outranks
+    /// it and still waits -- a moved sequence, or an admitted newcomer not yet
+    /// on the device ([`Self::waiting_above`]). So a newcomer that moved
+    /// sequences for its room keeps it while it waits for the last move, and
+    /// a lower-ranked sequence takes only the room beyond. A restore never
+    /// moves anything: it takes free room, with retained state given up for
+    /// it when that is what makes the room. A live disk blob has no restore
+    /// floor -- it comes back whenever there is room.
     fn restore_pass(&mut self, events: &mut Vec<SchedEvent>) {
-        loop {
-            let victim = match self.host.victim() {
-                Some(v) => v.clone(),
-                None => break, // no evicted request to restore
-            };
-            if victim.resume_phase == ResumePhase::Running && self.free_lanes.is_empty() {
-                break; // no lane: leave it (retry next advance)
+        for moved in self.moved_in_rank_order() {
+            // On its way from KV-RAM to the disk: it comes back once its file
+            // commits, and its room is held for it until then.
+            if !moved.ready {
+                continue;
             }
-            // The restored request's resident slot + pages must fit the
-            // GPU pool either way.
-            if self.resident_slots_used + 1 > self.capacity.resident_slots
-                || self.kv_used_pages + victim.pages > self.capacity.kv_pages
-            {
-                break; // no room: leave it (retry next advance)
-            }
-            let idx = self
-                .requests
-                .iter()
-                .position(|r| r.id == victim.request)
-                .expect("a host-tier snapshot always maps to a request");
-            let context_tokens = sequence_tokens(&self.config, &self.requests[idx].input);
-            let started = Instant::now();
-            match self.compute.restore(victim.request, context_tokens) {
-                Ok(()) => {
-                    let restore_micros = started.elapsed().as_micros() as u64;
-                    self.host
-                        .restore(victim.request)
-                        .expect("the victim is a tier entry");
-                    // P4-07, GitHub #125: re-charges resident_slots +
-                    // kv_pages — the leaf just re-materialized exactly that
-                    // state above.
-                    self.materialize(idx);
-                    let lane = match victim.resume_phase {
-                        ResumePhase::Running => {
-                            let lane = self.free_lanes.pop().expect("checked non-empty above");
-                            self.requests[idx].restore_lane(lane);
-                            Some(lane)
-                        }
-                        ResumePhase::Prefilling => {
-                            // Resume chunking from the snapshotted boundary,
-                            // not from zero.
-                            self.requests[idx].prefill_progress = victim.prefill_progress;
-                            self.requests[idx].restore_prefilling();
-                            None
-                        }
-                    };
-                    events.push(SchedEvent::Restored {
-                        request: victim.request,
-                        lane,
-                        restore_micros,
-                    });
-                }
-                Err(_) => {
-                    // The blob could not be restored: drop it (never
-                    // promoted — it did not actually resume) and free
-                    // whatever the leaf still held for it, then re-prefill
-                    // from scratch.
-                    self.host.discard_request(victim.request);
-                    self.compute.discard_snapshot(victim.request);
-                    self.requeue_request(idx, events);
-                    // Loop: try the next victim.
-                }
+            let above = self.waiting_above(moved.rank);
+            match moved.below {
+                Below::KvRam => self.restore_from_kv_ram(moved.rank.request_id, above, events),
+                Below::Disk => self.restore_from_disk(moved.rank.request_id, above, events),
             }
         }
-        // Spec vram-budget/03: then the disk's live blobs, which have no
-        // floor -- they come back whenever there is room.
-        self.restore_from_disk(events);
+    }
+
+    /// The moved live sequences, in KV-RAM and on the disk, highest-ranked
+    /// first (ADR 0045). One on its way back from the disk is not listed: it
+    /// is charged on the device already.
+    fn moved_in_rank_order(&self) -> Vec<MovedSequence> {
+        let moved = |e: &HostEntry, below: Below, ready: bool| MovedSequence {
+            rank: Rank {
+                class: e.owner,
+                request_id: e.request,
+            },
+            below,
+            pages: e.pages,
+            ready,
+        };
+        let mut all: Vec<MovedSequence> = self
+            .host
+            .live_entries()
+            .map(|(e, to_disk)| moved(e, Below::KvRam, !to_disk))
+            .collect();
+        if let Some(disk) = self.disk.as_ref() {
+            all.extend(
+                disk.held()
+                    .live_entries()
+                    .filter(|&(_, restoring)| !restoring)
+                    .map(|(e, _)| moved(e, Below::Disk, true)),
+            );
+        }
+        all.sort_by(|a, b| Rank::entry_order(&a.rank, &b.rank));
+        all
+    }
+
+    /// Whether a moved live sequence outranks `idx`, which then waits for it
+    /// to come back (ADR 0045: entries are taken in rank order).
+    fn outranked_by_a_moved_sequence(&self, idx: usize) -> bool {
+        let rank = Self::rank_of(&self.requests[idx]);
+        self.moved_in_rank_order().iter().any(|m| m.rank.outranks(&rank))
+    }
+
+    /// The room held for the entries that outrank `rank` and still wait (ADR
+    /// 0045: entries are taken in rank order): every moved live sequence and
+    /// every admitted newcomer not yet on the device above it, a reservation
+    /// and a resident slot each.
+    fn waiting_above(&self, rank: Rank) -> EntryRoom {
+        let moved = self
+            .moved_in_rank_order()
+            .into_iter()
+            .filter(|m| m.rank.outranks(&rank))
+            .map(|m| m.pages);
+        let newcomers = self
+            .requests
+            .iter()
+            .filter(|r| {
+                r.state == RequestState::Admitted
+                    && !r.resident
+                    && !r.moving
+                    && !r.cancelled
+                    && Self::rank_of(r).outranks(&rank)
+            })
+            .map(|r| r.resources.kv_pages);
+        moved.chain(newcomers).fold(EntryRoom::default(), |room, pages| EntryRoom {
+            pages: room.pages + pages,
+            slots: room.slots + 1,
+        })
+    }
+
+    /// Whether a moved sequence's whole reservation of `pages`, and a
+    /// resident slot, fit the device now beside the room held for the
+    /// entries `above` it (ADR 0045's entry rule, fixed branch). Retained
+    /// pages count as reclaimable: they are given up when that is what makes
+    /// the room, and not otherwise. Nothing live moves.
+    fn make_entry_room(&mut self, pages: u32, above: EntryRoom, events: &mut Vec<SchedEvent>) -> bool {
+        if self.resident_slots_used + above.slots + 1 > self.capacity.resident_slots {
+            return false;
+        }
+        let pages = pages + above.pages;
+        let fits = move |s: &Self| s.kv_used_pages + pages <= s.capacity.kv_pages;
+        if fits(self) {
+            return true;
+        }
+        if self.kv_used_pages + pages > self.capacity.kv_pages + self.reclaimable_retained_pages() {
+            return false;
+        }
+        self.reclaim_retained_until(fits, events)
+    }
+
+    /// Bring `request`'s live snapshot back from KV-RAM, synchronously, when
+    /// it can enter beside the room held `above` it. A blob that fails to
+    /// restore is dropped and its request re-prefills.
+    fn restore_from_kv_ram(&mut self, request: RequestId, above: EntryRoom, events: &mut Vec<SchedEvent>) {
+        let Some(victim) = self.host.entry(request).cloned() else {
+            return;
+        };
+        if victim.resume_phase == ResumePhase::Running && self.free_lanes.is_empty() {
+            return; // no lane: leave it (retry next advance)
+        }
+        // The restored request's resident slot + pages must fit the GPU pool
+        // either way.
+        if !self.make_entry_room(victim.pages, above, events) {
+            return; // no room: leave it (retry next advance)
+        }
+        let idx = self
+            .requests
+            .iter()
+            .position(|r| r.id == victim.request)
+            .expect("a KV-RAM snapshot always maps to a request");
+        let context_tokens = sequence_tokens(&self.config, &self.requests[idx].input);
+        let started = Instant::now();
+        match self.compute.restore(victim.request, context_tokens) {
+            Ok(()) => {
+                let restore_micros = started.elapsed().as_micros() as u64;
+                self.host
+                    .restore(victim.request)
+                    .expect("the victim is a tier entry");
+                // P4-07, GitHub #125: re-charges resident_slots + kv_pages —
+                // the leaf just re-materialized exactly that state above.
+                self.materialize(idx);
+                let lane = match victim.resume_phase {
+                    ResumePhase::Running => {
+                        let lane = self.free_lanes.pop().expect("checked non-empty above");
+                        self.requests[idx].restore_lane(lane);
+                        Some(lane)
+                    }
+                    ResumePhase::Prefilling => {
+                        // Resume chunking from the snapshotted boundary, not
+                        // from zero.
+                        self.requests[idx].prefill_progress = victim.prefill_progress;
+                        self.requests[idx].restore_prefilling();
+                        None
+                    }
+                };
+                events.push(SchedEvent::Restored {
+                    request: victim.request,
+                    lane,
+                    restore_micros,
+                });
+            }
+            Err(_) => {
+                // The blob could not be restored: drop it (never promoted —
+                // it did not actually resume) and free whatever the leaf
+                // still held for it, then re-prefill from scratch.
+                self.host.discard_request(victim.request);
+                self.compute.discard_snapshot(victim.request);
+                self.requeue_request(idx, events);
+            }
+        }
     }
 }
 
@@ -3089,22 +3297,23 @@ impl ConcreteScheduler {
         }
     }
 
-    /// Bring the disk's next live blob back, when the room is there (spec
-    /// vram-budget/03 AC 19: a live blob has no floor). It is charged now --
-    /// pages, resident slot, its lane -- and schedulable when it lands.
-    fn restore_from_disk(&mut self, events: &mut Vec<SchedEvent>) {
+    /// Bring `request`'s live blob back from the disk, when the room is there
+    /// beside what is held `above` it (spec vram-budget/03 AC 19: a live blob
+    /// has no floor). It is charged now -- pages, resident slot, its lane --
+    /// and schedulable when it lands. One restore at a time: while another is
+    /// in flight it waits. A file that cannot be read loses its request's
+    /// state.
+    fn restore_from_disk(&mut self, request: RequestId, above: EntryRoom, events: &mut Vec<SchedEvent>) {
         if self.restoring.is_some() {
             return;
         }
-        let Some(victim) = self.disk.as_ref().and_then(|disk| disk.held().victim().cloned()) else {
+        let Some(victim) = self.disk.as_ref().and_then(|disk| disk.held().entry(request).cloned()) else {
             return;
         };
         if victim.resume_phase == ResumePhase::Running && self.free_lanes.is_empty() {
             return;
         }
-        if self.resident_slots_used + 1 > self.capacity.resident_slots
-            || self.kv_used_pages + victim.pages > self.capacity.kv_pages
-        {
+        if !self.make_entry_room(victim.pages, above, events) {
             return;
         }
         let Some(idx) = self.requests.iter().position(|r| r.id == victim.request) else {
@@ -3977,6 +4186,13 @@ impl Scheduler for ConcreteScheduler {
                         admitted.push(i);
                         continue;
                     }
+                    // ADR 0045: entries are taken in rank order. A moved
+                    // sequence that outranks `i` comes back first, even when
+                    // `i` would fit now -- so `i`, and everything sorted after
+                    // it, waits.
+                    if self.outranked_by_a_moved_sequence(i) {
+                        break;
+                    }
                     // GitHub #186 (ADR 0023 as amended by 0029): retained
                     // state is the first victim, so it goes back *before*
                     // anything else is considered. A live request never waits
@@ -3991,7 +4207,7 @@ impl Scheduler for ConcreteScheduler {
                             backend_pages: 0,
                             resident_slots: 1,
                         };
-                        if !self.make_room(&needed, &mut events) {
+                        if !self.make_room(i, &needed, &mut events) {
                             // No room, and none could be made: stop the
                             // batch here — `i` (and anything sorted after
                             // it) waits for a later tick.

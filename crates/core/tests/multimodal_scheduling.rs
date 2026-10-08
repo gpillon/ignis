@@ -268,12 +268,13 @@ fn an_evicted_multimodal_request_is_snapshotted_and_restored_not_reprefilled() {
         },
     );
     // Eight multimodal requests fill every resident lane; a ninth has to
-    // evict one of them.
+    // evict one of them. Interactive, so the Agent fillers rank below it
+    // (ADR 0045).
     let fillers: Vec<u64> = (0..8)
         .map(|_| sched.submit(multimodal_input(4, vec![image(1, 2)], 8), RequestClass::Agent).unwrap())
         .collect();
     sched.advance();
-    let head = sched.submit(text_input(4, 8), RequestClass::Agent).unwrap();
+    let head = sched.submit(text_input(4, 8), RequestClass::Interactive).unwrap();
     let events = sched.advance();
 
     let evicted: Vec<u64> = events
