@@ -21,6 +21,10 @@
 // artifact stores them (the reference's weights are then scale * e4m3(code)).
 // Rows 1, 3, 8 (decode lanes, up to the decode route's ceiling), 9 (the first
 // row count past it) and 1100 (past one 1024-row wave).
+// GitHub #306: the decode route's norm folded into its down launch at up to
+// three rows (fn_hc_set_decode_fused) against the three-launch route, bit for
+// bit, over a scratch arena poisoned before each run; IGNIS_FN_HC_FUSED=0 at
+// the first mix keeps three launches.
 //
 // GPU test (ADR 0006): no SKIP_RETURN_CODE, a missing device fails.
 
@@ -367,6 +371,9 @@ void fused_case(const ignis::flash_next::HcWeights &dw, const char *format, int 
   int nodes[2] = {};
   for (int fused = 0; fused < 2; ++fused) {
     ignis::flash_next::fn_hc_set_decode_fused(fused == 1);
+    // NaN everywhere a run reads or writes, so neither route can pass on what the other left.
+    cuda_ok(cudaMemset(static_cast<char *>(scratch.base()) + scratch.used(), 0xFF, scratch.capacity() - scratch.used()),
+            "poison the scratch");
     cuda_ok(cudaMemset(d_x, 0xFF, static_cast<std::size_t>(rows) * kHidden * 2), "poison x");
     cuda_ok(cudaMemset(d_inj, 0xFF, static_cast<std::size_t>(rows) * kStreams * 4), "poison inj");
     check(ignis::flash_next::fn_hc_mix(g, weights, d_hidden, rows, d_x, inj, scratch, nullptr) == 0,
@@ -431,6 +438,35 @@ int main() {
                 ignis::flash_next::WeightFormat::Fp8RowScale};
 
   ninfer::DeviceArena scratch(64u << 20);
+
+  // The switch's default is read from IGNIS_FN_HC_FUSED at the first mix: "0" keeps the norm's
+  // own launch. Then fused, so the reference arms below hold the fused route at rows 1 and 3.
+  {
+#ifdef _WIN32
+    _putenv_s("IGNIS_FN_HC_FUSED", "0");
+#else
+    setenv("IGNIS_FN_HC_FUSED", "0", 1);
+#endif
+    ignis::flash_next::Geometry g;
+    g.streams = kStreams;
+    g.hidden = kHidden;
+    g.hc_rank = kRank;
+    g.rms_norm_eps = static_cast<float>(kEps);
+    const auto hidden = random_bf16(kWidth, 2.0, 0xE5U);
+    auto *d_hidden = upload(hidden);
+    void *d_x = nullptr;
+    float *d_inj = nullptr;
+    cuda_ok(cudaMalloc(&d_x, kHidden * 2), "cudaMalloc x");
+    cuda_ok(cudaMalloc(&d_inj, kStreams * 4), "cudaMalloc inj");
+    const int nodes = kernel_nodes(g, dw8, d_hidden, 1, d_x, d_inj, scratch);
+    check(nodes == 3, "IGNIS_FN_HC_FUSED=0 at the first mix keeps three launches (got " + std::to_string(nodes) + ")");
+    ignis::flash_next::fn_hc_set_decode_fused(true);
+    check(kernel_nodes(g, dw8, d_hidden, 1, d_x, d_inj, scratch) == 2, "the switch, set, fuses the next mix");
+    cudaFree(d_hidden);
+    cudaFree(d_x);
+    cudaFree(d_inj);
+  }
+
   for (int rows : {1, 3, 8, 9, 1027, 1100}) {
     mix_case(w, dw, "BF16", rows, true, scratch);
     mix_case(w8, dw8, "FP8", rows, true, scratch);

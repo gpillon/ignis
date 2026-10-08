@@ -5,12 +5,14 @@
 // bytes (~6.6 MB of weights; GitHub #306). Every route opens with the same
 // norm: one CTA per (stream, row), which also takes the 4-output block-inject
 // matvec as per-stream partials (no single-CTA GEMV), summed in stream order
-// by whichever kernel finishes the mix. Then:
+// by whichever kernel finishes the mix -- at up to kMaxFusedRows decode rows
+// the same code runs inside the down launch instead (hc_norm_down). Then:
 // - the decode route (rows <= kDecodeRows, 4 streams): mix_down split by stream
 //   over the card, then mix_up and the stream reduce in one kernel that
 //   rebuilds the activation from the down partials in every CTA. Three
-//   launches, all wide -- two since GitHub #306's fusion study, where every
-//   down CTA runs the norm of its own stream itself (hc_norm_down);
+//   launches, all wide -- two at up to kMaxFusedRows rows since GitHub #306's
+//   fusion study, where every down CTA runs the norm of its own stream itself
+//   (hc_norm_down);
 // - the prefill route: mix_down and mix_up through fn_linear (tensor cores),
 //   the activation and the reduce on their own.
 // Both routes round to BF16 at the module's points (hc.h); they differ only in
@@ -390,8 +392,9 @@ bool decode_fused() {
   int on = g_decode_fused.load(std::memory_order_relaxed);
   if (on < 0) {
     const char *env = std::getenv("IGNIS_FN_HC_FUSED");
-    on = env != nullptr && std::strcmp(env, "0") == 0 ? 0 : 1;
-    g_decode_fused.store(on, std::memory_order_relaxed);
+    const int seeded = env != nullptr && std::strcmp(env, "0") == 0 ? 0 : 1;
+    // A switch set meanwhile (fn_hc_set_decode_fused) wins over the environment.
+    on = g_decode_fused.compare_exchange_strong(on, seeded, std::memory_order_relaxed) ? seeded : on;
   }
   return on == 1;
 }
@@ -402,6 +405,12 @@ bool decode_fused() {
 // 16.5, 4 rows 19.9 -> 20.1, 8 rows 27.7 -> 35.3); past it the norm keeps its
 // own launch.
 constexpr int32_t kMaxFusedRows = 3;
+// Its dynamic shared memory, the rows' normed stream, inside the default 48 KiB
+// with the kernel's static arrays.
+static_assert(kMaxFusedRows * kNormSpan * kThreads * sizeof(__nv_bfloat16) +
+                      (kWarps + kMaxStreams * kWarps) * sizeof(float) <=
+                  48 * 1024,
+              "the fused norm's rows outgrow the default dynamic shared memory");
 
 // The decode route's mix_up and reduce in one pass, 16 h per CTA, two per
 // warp. Every CTA first rebuilds the activation from the down partials
@@ -625,8 +634,6 @@ int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int
     auto *out = static_cast<__nv_bfloat16 *>(x) + static_cast<std::int64_t>(first) * g.hidden;
     float *out_inj = with_inject ? inj + static_cast<std::int64_t>(first) * g.streams : nullptr;
     const bool decode = decode_route(g, w, n);
-    // At most kMaxFusedRows * kNormSpan * kThreads BF16 (24 KiB): inside the default 48 KiB.
-    const std::size_t fused_bytes = static_cast<std::size_t>(n) * g.hidden * sizeof(__nv_bfloat16);
     const bool fused = decode && n <= kMaxFusedRows && decode_fused();
     if (!fused) {
       hc_norm<<<dim3(static_cast<uint32_t>(g.streams), static_cast<uint32_t>(n)), kThreads, 0, stream>>>(
@@ -644,6 +651,7 @@ int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int
       if (fused) {
         // One more CTA per stream: the normed rows' and the inject partials' writer.
         const dim3 fused_grid(down_blocks + 1, static_cast<uint32_t>(g.streams));
+        const std::size_t fused_bytes = static_cast<std::size_t>(n) * g.hidden * sizeof(__nv_bfloat16);
         const auto *norm_w = static_cast<const __nv_bfloat16 *>(w.hc_norm);
         if (down_fp8) {
           hc_norm_down<true><<<fused_grid, kThreads, fused_bytes, stream>>>(
