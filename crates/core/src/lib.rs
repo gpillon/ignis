@@ -126,7 +126,10 @@ pub use vision::{
     DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,
     VisionEnvelopeOutOfRange,
 };
-pub use vram::{VramLines, VramMode, VramPlan, VramPlanError, VramRequest, plan_vram};
+pub use vram::{
+    ExpertResidency, KvPoolPolicy, KvPoolSize, OFFLOADED_KV_POOL_TOKENS, Residency, VramLines, VramMode, VramPlan,
+    VramPlanError, VramRequest, plan_vram,
+};
 pub use types::{
     BackfillClass, ComputeError, DecisionRead, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
     RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SpecCounters, SubmitError,

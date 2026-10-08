@@ -15,10 +15,9 @@
 //!   second. C runs alone, then A and B come back and finish; nothing is
 //!   dropped or re-queued. C's tokens are its lone run's.
 //!
-//! The 27B runs both on this branch (it honours `kv_pool_bytes`). Flash-Next
-//! needs its pool cut to one context, which #309 P1's pool policy brings:
-//! until then its load holds both prompts and the overflow cannot be forced,
-//! which the test says rather than passing.
+//! Both models cut their pool to one context with `--kv-pool-bytes`'s token
+//! form (#309 P1). A load whose pool still holds both requests cannot force
+//! the overflow, and the test says so rather than passing.
 //!
 //! Machine-local artifacts (`IGNIS_ARTIFACT_27B`, `IGNIS_FLASH_NEXT_DIR`).
 //! Explicit GPU profile (ADR 0006): a missing artifact or GPU is a skip
@@ -226,14 +225,10 @@ fn shape(family: Family, max_context: u32, host_pool_bytes: u64) -> EngineShape 
         kv_disk_bytes: Some(8 << 30),
         ..EngineShape::default()
     };
+    // The pool holds exactly one context: the floor the plan accepts.
+    let base = EngineShape { kv_pool: Some(ignis_core::KvPoolSize::Tokens(u64::from(max_context))), ..base };
     match family {
-        // The pool holds exactly one context: the floor the plan accepts.
-        Family::Qwen27b => {
-            let page_bytes = base.kv_format.page_bytes(ignis_core::KvGeometry::qwen38_27b());
-            EngineShape { kv_pool_bytes: Some(u64::from(max_context.div_ceil(PAGE_TOKENS)) * page_bytes), ..base }
-        }
-        // Two lanes, the pool at its floor -- #309 P1's policy; on a tree
-        // without it the load says so (see `forced_overflow_restores_bit_exact`).
+        Family::Qwen27b => base,
         Family::FlashNext => EngineShape { decode_lanes: 2, prefill_chunk: 2048, ..base },
     }
 }
@@ -270,7 +265,7 @@ fn forced_overflow_restores_bit_exact(family: Family) -> Option<Spilled> {
     if pool_tokens(&reserved) >= both {
         gpu_profile::skip_or_fail(&format!(
             "the pool holds {} tokens, both requests' {both}: the overflow cannot be forced on this tree \
-             (Flash-Next's pool at one context is #309 P1's)",
+             (the shape names a pool of one context)",
             pool_tokens(&reserved)
         ));
         return None;
@@ -387,7 +382,7 @@ fn qwen27b_a_forced_overflow_moves_through_the_disk_bit_exact_and_kv_ram_demotes
 }
 
 #[test]
-#[ignore = "GPU profile only: the real Flash-Next artifact, and #309 P1's pool at the floor"]
+#[ignore = "GPU profile only: the real Flash-Next artifact"]
 fn flash_next_a_forced_overflow_moves_through_the_disk_bit_exact_and_kv_ram_demotes_to_it() {
     both_legs(Family::FlashNext);
 }

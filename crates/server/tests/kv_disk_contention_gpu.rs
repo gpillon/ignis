@@ -21,9 +21,9 @@
 //! no work. The figures go in a finding. `IGNIS_KV_P2_RAW` names a file the
 //! raw samples are written to as JSON.
 //!
-//! Needs Flash-Next's pool cut to one context (#309 P1): on a tree without
-//! it the load holds every request and the test says so. Machine-local:
-//! the Flash-Next artifact (`IGNIS_FLASH_NEXT_DIR`), its files on F:.
+//! The pool is cut to one context (`--kv-pool-bytes`'s token form, #309 P1)
+//! so that E cannot fit beside A. Machine-local: the Flash-Next artifact
+//! (`IGNIS_FLASH_NEXT_DIR`), its files on F:.
 
 #![cfg(feature = "cuda")]
 
@@ -174,7 +174,7 @@ fn ms(d: Duration) -> f64 {
 }
 
 #[test]
-#[ignore = "GPU profile only: the real Flash-Next artifact, #309 P1's pool at the floor, ~10 min"]
+#[ignore = "GPU profile only: the real Flash-Next artifact, ~5 min"]
 fn a_one_gigabyte_spill_beside_a_prefill_and_beside_two_decoding_lanes() {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(FLASH_NEXT_DIR), PathBuf::from);
     let path = dir.join(ARTIFACT_FILE_NAME);
@@ -199,8 +199,9 @@ fn a_one_gigabyte_spill_beside_a_prefill_and_beside_two_decoding_lanes() {
         // Uncovered: every row a prefill stages is read from the artifact.
         ngram_hot_bytes: HotBudget::Bytes(0),
         kv_disk_bytes: Some(8 << 30),
-        // The pool at one context is #309 P1's `kv_pool: Tokens(CONTEXT)`:
-        // without it the pool holds every request and the test says so.
+        // The pool at one context (#309 P1's token form): A, B, C and E
+        // cannot all fit, so E moves A.
+        kv_pool: Some(ignis_core::KvPoolSize::Tokens(u64::from(CONTEXT))),
         ..EngineShape::default()
     };
     let (sched, reserved) = match flash_next_scheduler_with_ngram_cache(
@@ -222,7 +223,7 @@ fn a_one_gigabyte_spill_beside_a_prefill_and_beside_two_decoding_lanes() {
     // A, B, C and E at once: what the pool must not hold for A to move.
     if pool >= (A_PROMPT + 400) + 2 * (2000 + 400) + (50_000 + 16) {
         gpu_profile::skip_or_fail(&format!(
-            "the pool holds {pool} tokens: the spill cannot be forced on this tree (#309 P1's pool at one context)"
+            "the pool holds {pool} tokens: the spill cannot be forced (the shape names a pool of one context)"
         ));
         return;
     }
