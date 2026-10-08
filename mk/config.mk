@@ -36,7 +36,7 @@ ifeq ($(MODEL_FAMILY),flash-next)
   ARTIFACT ?= F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_trellis_a25-v2.ninfer
   # 262,144 tokens per lane under hq-e8-2b, the checkpoint's whole trained
   # envelope (so no YaRN): the user always keeps that context, and speed
-  # never takes VRAM from the KV pool (LANES, below, is the one that trades); 8192-token prefill chunks amortize a
+  # never takes VRAM from the KV pool (LANES=1, below, is the one that trades); 8192-token prefill chunks amortize a
   # chunk's expert transfer (spec flash-next/03); no vision. No speculation
   # by default: on the 5090 the MTP head is PCIe-bound (finding 2026-10-07).
   # SPEC=mtp turns it on, its companion container beside the artifact (spec
@@ -44,9 +44,12 @@ ifeq ($(MODEL_FAMILY),flash-next)
   # DRAFT_ROWS=r is the row budget that cuts k as lanes join (empty: the
   # decode route's 8; 3 drafts at one lane only).
   MAX_CONTEXT ?= 262144
-  # The decode lanes (--decode-lanes, 1..8): the sequences decoded at once,
-  # each with a whole context in the KV pool. Fewer lanes leave the expert
-  # cache more of the VRAM budget.
+  # The decode lanes (--decode-lanes, 1..8): the sequences decoded at once.
+  # They share the KV pool (ADR 0045), reserved first: min(524,288 tokens,
+  # LANES x MAX_CONTEXT), never below one MAX_CONTEXT and a page per retained
+  # slot; the expert cache takes the rest of the budget. At 262,144 tokens one
+  # lane's pool is one context and two lanes or more share 524,288, so one
+  # lane leaves the cache ~1 GiB more.
   LANES ?= 3
   ROPE_SCALING ?= none
   PREFILL_CHUNK ?= 8192
@@ -107,6 +110,11 @@ SYSTEM_MESSAGE_POLICY ?= merge
 # conversation keeps its prefix. into-system and after-system hoist that message
 # into the head instead, and every turn then prefills from scratch, silently.
 DEVELOPER_MESSAGE_POLICY ?= inplace
+# The max_tokens of a request that sends none (--default-max-tokens, ADR
+# 0045), its reasoning included, on both models and on the CPU mock. Empty =
+# the server's 38912; 0 = none, a request may generate to the end of the
+# context. An explicit max_tokens always wins.
+DEFAULT_MAX_TOKENS ?=
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
 # Defaults: a 524288-token context -- twice the checkpoint's trained 262,144
@@ -125,7 +133,15 @@ DRAFT_TOKENS ?= 7
 # The drafter's proposal head (--draft-head): empty = the server's default
 # (full), shortlist = the artifact's Q4 head over the most frequent tokens.
 DRAFT_HEAD ?=
+# The KV pool (--kv-pool-bytes): a byte count (4G) or tokens (512Ktok), on
+# both models. Empty = the policy's (ADR 0045): the rest of the VRAM budget
+# when every weight is on the device (the 27B), 524,288 tokens when experts
+# stream (Flash-Next on a 32 GB card).
 KV_POOL_BYTES ?=
+# 1 = start Flash-Next even when its expert cache gets less than the 12 GiB
+# floor (--allow-expert-cache-below-floor), with a warning: below it decode
+# slows sharply. The 27B refuses it.
+ALLOW_EXPERT_CACHE_BELOW_FLOOR ?=
 # The VRAM budget (GitHub #210, ADR 0030). Empty = the server's default: the
 # memory free at start minus a 1G headroom. VRAM_HEADROOM derives it with
 # another headroom; VRAM_BUDGET names it (the whole process, weights

@@ -177,11 +177,12 @@ always-current table; this one is a copy.
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--max-context <tokens>` | `IGNIS_MAX_CONTEXT` | `40960` | Max per-sequence context (prompt + generation). The KV pool must be able to hold one of them or the load is refused. On the 27B the attention bounds it too: at most 524,288 on `bf16`, 1,048,576 on `hq-e8-2b`; past that the start is refused. Flash-Next has no such bound. |
+| `--default-max-tokens <n\|0>` | `IGNIS_DEFAULT_MAX_TOKENS` | `38912` | The `max_tokens` of a request that sends none (see [Chat completions](#chat-completions)), its reasoning included, on both models. Never more than what the prompt leaves of `--max-context`, so a long prompt is never refused for it. An explicit cap always wins. `0` = none: such a request may generate to the end of the context, as before. (`make` knob `DEFAULT_MAX_TOKENS`.) |
 | `--prefill-chunk <tokens>` | `IGNIS_PREFILL_CHUNK` | `1024` | The prefill chunk width, a nonzero multiple of 128. The program's prefill scratch is reserved for it at load. |
-| `--decode-lanes <n>` | `IGNIS_DECODE_LANES` | `3` | Flash-Next only, `1..=8`: the sequences decoded at once. Each lane holds a whole `--max-context` in the KV pool, so fewer lanes leave the expert cache more of the VRAM budget (and a lone user decodes at one lane either way). The 27B serves a fixed 8 lanes and refuses the flag. `make MODEL=flash-next` runs 3 lanes at 262,144 tokens each (the checkpoint's trained positions); the `make` knob is `LANES`. |
+| `--decode-lanes <n>` | `IGNIS_DECODE_LANES` | `3` | Flash-Next only, `1..=8`: the sequences decoded at once. The lanes share the KV pool ([below](#the-kv-pool)): min(524,288 tokens, lanes × `--max-context`), never below one `--max-context` sequence and a page per retained slot. At `make`'s 262,144 tokens that is one context at one lane and 524,288 tokens from two lanes on, so one lane leaves the expert cache about 1 GiB more, and further lanes cost only their state; at 131,072 tokens three lanes get 393,216. The 27B serves a fixed 8 lanes and refuses the flag. `make MODEL=flash-next` runs 3 lanes at up to 262,144 tokens each (the checkpoint's trained positions); the `make` knob is `LANES`. |
 | `--decode-share <percent>` | `IGNIS_DECODE_SHARE` | `25` on both models | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next chunk of the same prompt waits `t * s / (1 - s)` of wall time while they decode, and nothing waits when no lane decodes or after the prompt's last chunk. It trades the prefilling request's TTFT (about x1.33 at 25, x2 at 50, only while lanes decode) for the lanes' rate (15.6-18.3 tok/s on Flash-Next instead of ~1; why 25: [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md)). `--decode-share 0` restores one decode round per chunk, the pacing before [#92](../findings/2026-10-07-27b-prefill-chunk-width.md); 50 splits time evenly. A prompt alone is unaffected. |
 | `--kv-format <fmt>` | `IGNIS_KV_FORMAT` | `hq-e8-2b` | `hq-e8-2b` (serving) or `bf16` (retained; the format every correctness oracle runs against — [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md)). Decides what a pool byte budget is worth in tokens. |
-| `--kv-pool-bytes <bytes>` | `IGNIS_KV_POOL_BYTES` | the rest of the VRAM budget | The paged-KV pool budget (accepts `K`/`M`/`G`). Too small for `--max-context`, or past the VRAM budget, fails the load by name. |
+| `--kv-pool-bytes <bytes\|tokens>` | `IGNIS_KV_POOL_BYTES` | the KV pool policy's | The KV pool, on both models: a byte count (`K`/`M`/`G` suffixes) or a token count, `<n>tok`, `<n>Ktok` or `<n>Mtok` with binary multipliers (`512Ktok` is 524,288 tokens: the same context on either model and either format, where a byte count is worth a different one on each). It replaces the policy's size ([below](#the-kv-pool)). Smaller than one `--max-context` sequence plus a page per retained slot, or past the VRAM budget, fails the load by name. (`make` knob `KV_POOL_BYTES`.) |
 | `--kv-host-pool-bytes <bytes>` | `IGNIS_KV_HOST_POOL_BYTES` | `2G` | The KV-RAM host tier. Page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle — and the figure Windows reports as shared GPU memory. `0` disables the host tier. (`make` sets `8G`.) |
 | `--spec <backend>` | `IGNIS_SPEC` | unset | Speculative decoding backend: `dflash2` (Qwen3.8-27B), `mtp` (Qwen3.8-Flash-Next, see [below](#flash-next-speculation-mtp)), `off`, or unset for none. |
 | `--draft-tokens <n>` | `IGNIS_DRAFT_TOKENS` | — | 1..7. Required with `--spec dflash2`; with `--spec mtp` the most drafts a lane verifies per round (default 2). |
@@ -215,22 +216,52 @@ on a 5090 that is the better setting for most uses. Before turning it on:
   so the served cost at several lanes is a little higher.
 - **Use it** when one user or one agent works at a time: `--spec mtp
   --draft-rows 3`, or serve a single lane outright (`make MODEL=flash-next
-  LANES=1 SPEC=mtp`), which also gives the expert cache ~2.4 GB the other
-  lanes' KV would hold. **Leave it off** when several agents decode together.
+  LANES=1 SPEC=mtp`), which also gives the expert cache the ~1 GiB the shared
+  pool holds beyond one lane's context. **Leave it off** when several agents decode together.
 - A card that holds every expert in VRAM (96 GB) copies none over PCIe,
   which is where MTP should pay most. It is not measured there yet.
 
 ### VRAM budget and retained state
 
 Laid out at load and printed as the `ignis.runtime.vram_plan` event
-([ADR 0030](../adr/0030-device-memory-reserved-at-load.md)). A plan that cannot
+(`ignis.runtime.flash_next_plan` on Flash-Next,
+[ADR 0030](../adr/0030-device-memory-reserved-at-load.md)). A plan that cannot
 hold one full context refuses the start.
+
+#### The KV pool
+
+The pool is sized by whether every weight is on the device
+([ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md)),
+and the plan event says which branch it took (`kv_pool_policy`, with
+`kv_pool_pages` and `kv_pool_tokens`; `make config` prints the same before a
+start):
+
+- **Resident** — the 27B always, and Flash-Next on a card that holds every
+  expert (around 96 GB): the pool takes the rest of the VRAM budget.
+- **Offloaded** — Flash-Next on a card whose experts stream over PCIe, as on
+  a 32 GB 5090: the pool is reserved first, **524,288 tokens** shared by the
+  lanes, and the expert cache takes the rest. The pool never holds more than
+  every lane's whole context (so one lane keeps a one-context pool and the
+  larger cache) and never less than one `--max-context` sequence and a page
+  per retained slot (so a 524,288-token context starts).
+
+`--kv-pool-bytes` replaces either size. On a resident load it becomes the pool
+and the rest of the budget stays unused.
+
+Below 12 GiB the expert cache refuses the start: decode slows sharply there.
+The message names the knobs that lift it: a smaller `--kv-pool-bytes`,
+`--prefill-chunk` or `--vram-headroom-bytes`, or fewer `--retained-device`.
+`--allow-expert-cache-below-floor` starts anyway, with an
+`ignis.runtime.expert_cache_below_floor` warning carrying the cache, the floor
+and those knobs. A cache too small for one decode step's experts in every
+class is refused whatever the flag says.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--vram-headroom-bytes <b>` | `IGNIS_VRAM_HEADROOM_BYTES` | `1G` | Derives the budget: the device memory free at start minus this. Not with `--vram-budget-bytes`. |
 | `--vram-budget-bytes <b>` | `IGNIS_VRAM_BUDGET_BYTES` | derived | The device memory the whole process may hold, weights included. More than is free refuses the start. |
-| `--allow-vram-oversubscription` | `IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` | off | With `--vram-budget-bytes` only: start above free memory (or below the plan's minimum) with a warning instead of a refusal. On Windows that pages. |
+| `--allow-vram-oversubscription` | `IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` | off | With `--vram-budget-bytes` only: start above free memory (or below the plan's minimum) with a warning instead of a refusal. On Windows that pages. Both models. |
+| `--allow-expert-cache-below-floor` | `IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR` | off | Flash-Next only: start with an expert cache below its 12 GiB floor, with a warning ([above](#the-kv-pool)). The 27B, which has no expert cache, refuses it. (`make` knob `ALLOW_EXPERT_CACHE_BELOW_FLOOR=1`.) |
 | `--prompt-reuse <on\|off>` | `IGNIS_PROMPT_REUSE` | `on` | `off`: no prompt checkpoint is captured or reused, and no prefix is shared unless `--retained-device` or `--retained-host` gives slots for it. |
 | `--retained-device <n>` | `IGNIS_RETAINED_DEVICE` | `0` | Retained slots in VRAM: reserved in the VRAM plan, copied device to device (~0.3 ms), and handed out before any host slot. A card with VRAM to spare can take `--retained-device 16 --retained-host 0`. |
 | `--retained-host <n>` | `IGNIS_RETAINED_HOST` | two per decode lane (16); `0` with `--prompt-reuse off` | Retained slots in one pinned host block reserved at start, ~222 MiB each at the default load (3.5 GiB for 16): no VRAM, so the KV pool gets it; a capture and a claim each cost a PCIe copy (~15–19 ms). Both kinds hold the images of retained checkpoints and shared prefixes. When none is free, retained state gives one up — checkpoints before prefixes, `agent` before `interactive`, then least recently used; when nothing can, the publish or capture is skipped. `--retained-slots` was replaced by these two and now refuses the start. |
@@ -421,6 +452,14 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   and because the leaf's greedy branch does not read stochastic filters or
   penalties, a non-neutral `top_p`, `top_k`, `presence_penalty` or
   `frequency_penalty` sent with it is rejected rather than ignored.
+- A request that sends no `max_tokens` (nor `max_completion_tokens`, nor
+  `max_output_tokens` on `/v1/responses`) generates at most
+  `--default-max-tokens` tokens, its reasoning included. The flag is 38,912
+  unless you set it (`IGNIS_DEFAULT_MAX_TOKENS`, make `DEFAULT_MAX_TOKENS`).
+  Such a request ends with `finish_reason: "length"` when it gets there
+  (`incomplete` with `max_output_tokens` on `/v1/responses`). Before, it could
+  generate to the end of the context. Send `max_tokens` for more, or start the
+  server with `--default-max-tokens 0` for the old behaviour.
 - `max_completion_tokens` is `max_tokens` under OpenAI's current name — the
   one the current SDKs send. Both with different values is a 400.
 - `stop` (a string, or 1 to 4 non-empty strings) ends the answer before the

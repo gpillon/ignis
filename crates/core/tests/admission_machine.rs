@@ -61,6 +61,9 @@ fn small_pool() -> SchedulerConfig {
         max_prefill_batch: 8,
         kv_page_tokens: 16,
         max_sequence_tokens: 1024,
+        // ADR 0045: no default cap -- these scenarios size reservations on
+        // explicit `max_tokens` or on the whole context, the core-05 rule.
+        default_max_tokens: 0,
         kv_capacity_pages: 16,
         // P4-07, GitHub #125: generous — these scenarios exercise the
         // core-05 admission machine's lane/kv_pages dimensions in
@@ -442,6 +445,7 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             max_prefill_batch: 8,
             kv_page_tokens: 64,
             max_sequence_tokens: 1024,
+            default_max_tokens: 0,
             kv_capacity_pages: pool.block_count() as u32,
             resident_slot_capacity: 16,
             host_capacity_bytes: 0,

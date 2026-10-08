@@ -98,6 +98,99 @@ fn three_requests_generate_and_finish_on_three_lanes() {
     }
 }
 
+/// Every log record `f` emits on this thread, as JSON, beside its result.
+fn captured<T>(f: impl FnOnce() -> T) -> (Vec<serde_json::Value>, T) {
+    use tracing_subscriber::layer::SubscriberExt;
+    let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+    let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+    let out = tracing::subscriber::with_default(subscriber, f);
+    (sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect(), out)
+}
+
+/// The attributes of the one record named `name`.
+fn attributes(records: &[serde_json::Value], name: &str) -> serde_json::Value {
+    let found: Vec<_> = records.iter().filter(|r| r["event_name"] == name).collect();
+    assert_eq!(found.len(), 1, "one `{name}` in {records:?}");
+    found[0]["attributes"].clone()
+}
+
+/// ADR 0045 on the card (spec vram-budget/03 ACs 2, 6, 7): at the make
+/// default -- 262,144 tokens, three lanes, a 4 GiB headroom -- the pool is
+/// offloaded at 524,288 tokens, the leaf builds those pages, and the plan
+/// event says so; an explicit budget that leaves the expert cache below its
+/// floor is refused naming the opt-in, and with it starts and warns. The
+/// KV-RAM arena and the host retained slots are off, so the load fits a host
+/// with ~44 GB available; neither moves VRAM.
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact"]
+fn the_default_plan_is_offloaded_at_524288_tokens_and_the_floor_opt_in_warns() {
+    use ignis_core::residency::{available_physical_bytes, EXPERT_CACHE_FLOOR_BYTES};
+    let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from);
+    let path = dir.join(ARTIFACT_FILE_NAME);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
+        return;
+    }
+    let shape = EngineShape {
+        max_context: 262_144,
+        prefill_chunk: 8192,
+        decode_lanes: 3,
+        vram: ignis_core::VramMode::Derived { headroom_bytes: 4 << 30 },
+        host_pool_bytes: 0,
+        retained_host_slots: 0,
+        retained_host_named: true,
+        ..EngineShape::default()
+    };
+    let available_before = available_physical_bytes().unwrap_or(0);
+    let (records, loaded) = captured(|| flash_next_scheduler(&path, MODEL.into(), EOS, shape, None));
+    let (sched, reserved) = match loaded {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("load the Flash-Next scheduler: {e}"));
+            return;
+        }
+    };
+    let plan = attributes(&records, "ignis.runtime.flash_next_plan");
+    println!("plan: {plan}");
+    assert_eq!(plan["kv_pool_policy"], "offloaded", "{plan}");
+    assert_eq!(plan["kv_pool_pages"], 8_192, "{plan}");
+    assert_eq!(plan["kv_pool_tokens"], 524_288, "{plan}");
+    assert_eq!(reserved.kv_pool_pages, 8_192, "the leaf built the plan's pages");
+    assert_eq!(reserved.expert_cache_bytes, plan["expert_cache_bytes"].as_u64().unwrap());
+    assert!(records.iter().all(|r| r["event_name"] != "ignis.runtime.expert_cache_below_floor"));
+    let budget = plan["budget_bytes"].as_u64().unwrap();
+    let cache = plan["expert_cache_bytes"].as_u64().unwrap();
+    assert!(cache > EXPERT_CACHE_FLOOR_BYTES + (2 << 30), "the default plan's cache clears the floor: {plan}");
+    drop(sched);
+
+    // A budget 2 GiB short of what the floor needs: refused by name, before
+    // anything is pinned, unless the operator opts in.
+    let below = ignis_core::VramMode::Explicit {
+        budget_bytes: budget - (cache - EXPERT_CACHE_FLOOR_BYTES) - (2 << 30),
+        allow_oversubscription: false,
+    };
+    let refused = flash_next_scheduler(&path, MODEL.into(), EOS, EngineShape { vram: below, ..shape }, None)
+        .err()
+        .expect("below the floor without the opt-in");
+    assert!(refused.contains("--allow-expert-cache-below-floor"), "{refused}");
+    // The first load's pinned pool frees asynchronously.
+    for _ in 0..60 {
+        if available_physical_bytes().unwrap_or(0) + (1 << 30) >= available_before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let opted = EngineShape { vram: below, allow_expert_cache_below_floor: true, ..shape };
+    let (records, loaded) = captured(|| flash_next_scheduler(&path, MODEL.into(), EOS, opted, None));
+    let (_sched, reserved) = loaded.expect("the opt-in starts below the floor");
+    let warning = attributes(&records, "ignis.runtime.expert_cache_below_floor");
+    println!("warning: {warning}");
+    let below_floor = warning["expert_cache_bytes"].as_u64().unwrap();
+    assert!(below_floor < EXPERT_CACHE_FLOOR_BYTES, "{warning}");
+    assert_eq!(below_floor, reserved.expert_cache_bytes);
+    assert_eq!(warning["floor_bytes"], EXPERT_CACHE_FLOOR_BYTES);
+    assert!(warning["knobs"].as_str().unwrap().contains("--kv-pool-bytes"), "{warning}");
+}
+
 fn load(shape: EngineShape) -> Option<ConcreteScheduler> {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from);
     let path = dir.join(ARTIFACT_FILE_NAME);

@@ -166,12 +166,24 @@ pub struct SchedulerConfig {
     pub kv_page_tokens: u32,
     /// The per-sequence token limit, prompt included — the leaf's
     /// `max_context` in production (GitHub #166). A request submitted
-    /// without `max_tokens` may generate `this - prompt` tokens, reserves
-    /// `ceil(this / kv_page_tokens)` pages and is completed when it reaches
-    /// the limit (core-05: the reservation cannot grow mid-generation). A
+    /// without `max_tokens`, and with no `default_max_tokens`, may generate
+    /// `this - prompt` tokens, reserves `ceil(this / kv_page_tokens)` pages
+    /// and is completed when it reaches the limit (core-05: the reservation
+    /// cannot grow mid-generation). A
     /// request whose prompt + `max_tokens` exceeds it is refused with
     /// [`SubmitError::ContextExceeded`].
     pub max_sequence_tokens: u32,
+    /// The **default `max_tokens`** (ADR 0045, GitHub #309; the operator's
+    /// `--default-max-tokens`): what a request that names no cap may
+    /// generate, its reasoning included, clamped to what its prompt leaves of
+    /// `max_sequence_tokens`. `submit` writes it into the request's
+    /// `params.max_tokens`, so it is enforced exactly as an explicit cap is.
+    /// It also sizes the request's reservation. A decision, a constrained
+    /// decode and a prefill-only request keep their own budget. `0` is none:
+    /// such a request may generate to the end of the context. This
+    /// `Default` is 0, so a CPU test sees the old rule unless it asks; the
+    /// server's default is 38,912 (`config::DEFAULT_MAX_TOKENS`).
+    pub default_max_tokens: u32,
     /// The KV pool capacity in pages (core-05: the admission machine's
     /// resource dimension; production auto-sizes this from the pool,
     /// tests pass small values to drive contention).
@@ -331,7 +343,9 @@ fn capture_unless_held(start: u32, take: u32, at: u32, held: impl FnOnce() -> bo
 }
 
 /// The tokens `input` may generate (GitHub #166): its `max_tokens`, or —
-/// absent that — whatever the per-sequence limit leaves after the prompt.
+/// absent that — the server's default cap (ADR 0045), or with none whatever
+/// the per-sequence limit leaves after the prompt. The default never asks for
+/// more than that either: a long prompt gets what is left, never a refusal.
 ///
 /// Zero for a **decision** (GitHub #238): it generates nothing, so its
 /// whole-sequence reservation is its prompt. That is one `if` rather than a
@@ -358,11 +372,31 @@ fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
     if let Some(schedule) = &input.constrained {
         return u32::try_from(schedule.len()).unwrap_or(u32::MAX);
     }
-    input.params.max_tokens.unwrap_or_else(|| {
-        config
-            .max_sequence_tokens
-            .saturating_sub(u32::try_from(input.tokens.len()).unwrap_or(u32::MAX))
-    })
+    input
+        .params
+        .max_tokens
+        .or_else(|| default_cap(config, input))
+        .unwrap_or_else(|| context_left(config, input))
+}
+
+/// What `input`'s prompt leaves of the per-sequence limit.
+fn context_left(config: &SchedulerConfig, input: &RequestInput) -> u32 {
+    config
+        .max_sequence_tokens
+        .saturating_sub(u32::try_from(input.tokens.len()).unwrap_or(u32::MAX))
+}
+
+/// The server's default cap `input` runs under (ADR 0045), clamped to what
+/// its prompt leaves of the context: `None` when the server has none, or
+/// when the request names its own, generates nothing or follows a schedule.
+/// The one place that decides it -- [`generation_budget`] reads it, and
+/// `submit` writes it where an explicit `max_tokens` would be.
+fn default_cap(config: &SchedulerConfig, input: &RequestInput) -> Option<u32> {
+    let applies = input.params.max_tokens.is_none()
+        && config.default_max_tokens > 0
+        && !input.ends_at_prefill()
+        && !input.is_constrained();
+    applies.then(|| config.default_max_tokens.min(context_left(config, input)))
 }
 
 /// The whole-sequence reservation handed to the leaf: prompt + generation
@@ -395,6 +429,7 @@ impl Default for SchedulerConfig {
             max_prefill_batch: N_DECODE_LANES,
             kv_page_tokens: 16,
             max_sequence_tokens: 8192,
+            default_max_tokens: 0,
             // Eight full sequences fit by default: the resource dimension
             // of the admission machine is dormant unless the capacity is
             // tightened (or the pool is auto-sized smaller in production).
@@ -2621,6 +2656,13 @@ impl Scheduler for ConcreteScheduler {
         // caller asked for — which is not a shorter answer but a wrong one.
         if input.is_constrained() {
             input.params.max_tokens = None;
+        }
+        // ADR 0045: a request that names no cap runs under the server's
+        // default, written where an explicit one would be, so the scheduler's
+        // hard cap and the backend's own check read one number. Only when the
+        // default applies: with none (0) the request is left exactly as sent.
+        if let Some(cap) = default_cap(&self.config, &input) {
+            input.params.max_tokens = Some(cap);
         }
         if self.in_flight() >= self.config.max_in_flight {
             return Err(SubmitError::Full);

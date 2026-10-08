@@ -112,11 +112,13 @@ use ignis_server::{
 /// artifact is configured, or the binary was not built with
 /// `--features cuda` — the entrypoint never silently blocks startup on a
 /// missing GPU backend.
-fn mock_scheduler(model: &str) -> Box<dyn Scheduler> {
+fn mock_scheduler(model: &str, default_max_tokens: u32) -> Box<dyn Scheduler> {
     let compute: Arc<dyn Compute> = Arc::new(MockCompute::new());
     Box::new(ConcreteScheduler::with_config(
         SchedulerConfig {
             model: model.into(),
+            // ADR 0045: the operator's default cap holds on the mock too.
+            default_max_tokens,
             ..SchedulerConfig::default()
         },
         compute,
@@ -287,9 +289,11 @@ async fn main() {
         prefill_chunk: _,
         decode_share_percent: _,
         max_context,
+        default_max_tokens,
         kv_format: _,
-        kv_pool_bytes: _,
+        kv_pool: _,
         vram: _,
+        allow_expert_cache_below_floor: _,
         host_pool_bytes,
         prompt_reuse: _,
         retained_device_slots: _,
@@ -539,7 +543,7 @@ async fn main() {
                 name: "ignis.model.mock_compute",
                 "built without --features cuda — MockCompute despite --artifact/IGNIS_ARTIFACT (the templated text is real, the completions are not)"
             );
-            mock_scheduler(&model)
+            mock_scheduler(&model, default_max_tokens)
         };
 
         let engine = Engine::with_clock(scheduler, Arc::new(SystemClock));
@@ -560,7 +564,7 @@ async fn main() {
     } else {
         // Why there is no artifact was said once, with its reason, where the
         // decision was made (`ignis.model.placeholder_template` above).
-        let engine = Engine::with_clock(mock_scheduler(&model), Arc::new(SystemClock));
+        let engine = Engine::with_clock(mock_scheduler(&model, default_max_tokens), Arc::new(SystemClock));
         Server::new(engine, Box::new(SimpleTemplateProvider))
     }
     .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))

@@ -35,13 +35,21 @@ pub struct EngineShape {
     pub decode_share_percent: Option<u32>,
     /// The maximum per-sequence context, in tokens.
     pub max_context: u32,
+    /// The generation cap of a request that sends none
+    /// (`--default-max-tokens`, ADR 0045); 0 = none. A scheduler setting, not
+    /// a load option: it never reaches the leaf or a blob's identity.
+    pub default_max_tokens: u32,
     /// The KV storage format the load runs on (`--kv-format`, GitHub #122).
     pub kv_format: ignis_core::KvFormat,
-    /// The paged-KV pool budget, in bytes (`--kv-pool-bytes`). `None` gives
-    /// the pool the rest of the VRAM budget (GitHub #210).
-    pub kv_pool_bytes: Option<u64>,
+    /// The KV pool the operator named (`--kv-pool-bytes`), in bytes or
+    /// tokens. `None` takes the KV pool policy's size (ADR 0045): the rest of
+    /// the VRAM budget on a resident load, 524,288 tokens on an offloaded one.
+    pub kv_pool: Option<ignis_core::KvPoolSize>,
     /// How the load's VRAM budget is chosen (GitHub #210, ADR 0030).
     pub vram: ignis_core::VramMode,
+    /// `--allow-expert-cache-below-floor` (ADR 0045): a Flash-Next load whose
+    /// expert cache falls below its floor starts with a warning.
+    pub allow_expert_cache_below_floor: bool,
     /// The KV-RAM host tier's budget, in bytes (`--kv-host-pool-bytes`,
     /// P4-07 GitHub #125): pinned host memory for evicted (suspended)
     /// request snapshots, independent of the GPU-resident pool above.
@@ -97,11 +105,13 @@ impl Default for EngineShape {
             prefill_chunk: ignis_runtime::DEFAULT_PREFILL_CHUNK,
             decode_share_percent: None,
             max_context: ignis_runtime::DEFAULT_MAX_CONTEXT,
+            default_max_tokens: crate::config::DEFAULT_MAX_TOKENS,
             kv_format: ignis_core::KvFormat::default(),
-            kv_pool_bytes: None,
+            kv_pool: None,
             vram: ignis_core::VramMode::Derived {
                 headroom_bytes: crate::config::DEFAULT_VRAM_HEADROOM_BYTES,
             },
+            allow_expert_cache_below_floor: false,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
             opener_page_rides_capture: false,
@@ -126,9 +136,11 @@ impl From<&crate::config::Config> for EngineShape {
             prefill_chunk: config.prefill_chunk,
             decode_share_percent: config.decode_share_percent,
             max_context: config.max_context,
+            default_max_tokens: config.default_max_tokens,
             kv_format: config.kv_format,
-            kv_pool_bytes: config.kv_pool_bytes,
+            kv_pool: config.kv_pool,
             vram: config.vram,
+            allow_expert_cache_below_floor: config.allow_expert_cache_below_floor,
             host_pool_bytes: config.host_pool_bytes,
             prompt_reuse: config.prompt_reuse,
             opener_page_rides_capture: false,
@@ -216,6 +228,8 @@ fn scheduler_config_for_shape(
         model,
         kv_page_tokens,
         max_sequence_tokens: shape.max_context,
+        // ADR 0045: one home for the default cap, on both models' loads.
+        default_max_tokens: shape.default_max_tokens,
         kv_capacity_pages: capacity_pages,
         host_capacity_bytes: shape.host_pool_bytes,
         serving_chunk_tokens: shape.prefill_chunk,
@@ -295,6 +309,9 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan) {
                 residual_bytes = lines.residual,
                 kv_pool_bytes = plan.kv_pool_bytes,
                 kv_page_count = plan.kv_page_count,
+                kv_pool_policy = plan.kv_pool_policy.as_str(),
+                kv_pool_pages = plan.kv_page_count,
+                kv_pool_tokens = plan.kv_token_capacity(),
                 total_bytes = plan.total_bytes,
                 allocated_at_load_bytes = plan.total_bytes,
                 oversubscribed = plan.oversubscribed,
@@ -314,10 +331,66 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan) {
             ..
         } => vram_plan_event!(allow_oversubscription = allow_oversubscription),
     }
+    log_vram_warnings(plan);
+}
+
+/// One `ignis.runtime.vram_oversubscribed` warning per reason a plan's start
+/// proceeds anyway, on either model's load.
+pub fn log_vram_warnings(plan: &ignis_core::VramPlan) {
     for warning in &plan.warnings {
         // hotpath-lint-allow: at most two lines per model load.
         tracing::warn!(name: "ignis.runtime.vram_oversubscribed", warning = %warning, "vram oversubscribed");
     }
+}
+
+/// The startup report of a Flash-Next load's VRAM plan: one
+/// `ignis.runtime.flash_next_plan` event with the budget, the lines the load
+/// reports, the KV pool policy's branch with the pool's pages, tokens and
+/// bytes (ADR 0045), residency's fixed lines, the expert cache and the hit
+/// rate its split expects, the lanes and the speculation.
+pub fn log_flash_next_plan(plan: &ignis_core::VramPlan, expected_hit_rate: f64, lanes: u32, speculation: &str) {
+    let lines = plan.lines;
+    // hotpath-lint-allow: one line per model load.
+    tracing::info!(
+        name: "ignis.runtime.flash_next_plan",
+        budget_bytes = plan.budget_bytes,
+        weights_bytes = lines.weights,
+        program_bytes = lines.workspace + lines.sampling + lines.decode_graph,
+        pool_bytes = plan.kv_pool_bytes + lines.lane_state + lines.hq_residual_window,
+        kv_pool_policy = plan.kv_pool_policy.as_str(),
+        kv_pool_pages = plan.kv_page_count,
+        kv_pool_tokens = plan.kv_token_capacity(),
+        kv_pool_bytes = plan.kv_pool_bytes,
+        retained_device_bytes = lines.retained_slots,
+        residency_fixed_bytes = plan.residency_bytes,
+        expert_cache_bytes = plan.expert_cache_bytes,
+        expected_hit_rate,
+        oversubscribed = plan.oversubscribed,
+        lanes,
+        verify_round_bytes = lines.verify_round,
+        speculation,
+        "flash-next vram plan"
+    );
+}
+
+/// `ignis.runtime.expert_cache_below_floor` (ADR 0045): the WARN a Flash-Next
+/// load emits when `--allow-expert-cache-below-floor` started it with an
+/// expert cache below `floor_bytes` -- the cache, the floor, and the knobs
+/// that would lift it. Nothing for a cache at or above the floor.
+pub fn warn_expert_cache_below_floor(cache: &ignis_core::residency::ExpertCachePlan, floor_bytes: u64) {
+    if !cache.below_floor {
+        return;
+    }
+    // hotpath-lint-allow: one line per model load.
+    tracing::warn!(
+        name: "ignis.runtime.expert_cache_below_floor",
+        expert_cache_bytes = cache.cache_bytes,
+        floor_bytes,
+        expected_hit_rate = cache.expected_hit_rate,
+        knobs = "a smaller --kv-pool-bytes, --prefill-chunk or --vram-headroom-bytes, fewer --retained-device, \
+                 or --spec off",
+        "the expert cache is below its floor (--allow-expert-cache-below-floor): decode slows sharply below it"
+    );
 }
 
 /// The leaf the operator's [`EngineShape`] is loaded as: the last step
@@ -411,12 +484,13 @@ pub fn cuda_scheduler_with_thinking_close(
         mode: shape.vram,
         free_at_start_bytes,
         lines: vram_lines(plan.device_capacity_bytes, reservations.reserved),
-        kv_format: shape.kv_format,
-        kv_geometry: geometry,
+        kv_page_bytes: shape.kv_format.page_bytes(geometry),
         max_context_tokens: shape.max_context,
         // Every retained slot keeps one tail page, whichever kind it is.
         retained_slots: shape.retained_slots(),
-        kv_pool_bytes: shape.kv_pool_bytes,
+        kv_pool: shape.kv_pool,
+        // ADR 0045: every weight is a line, so the pool takes the rest.
+        residency: ignis_core::Residency::Resident,
         // GitHub #243: only so a refusal names the knob the operator set.
         embedding_pool_named: shape
             .vision
@@ -569,12 +643,12 @@ pub fn flash_next_scheduler_with_ngram_cache(
     use ignis_artifact::flash_next::{self, FlashNextGeometry};
     use ignis_artifact::{CudaDevice, Reader};
     use ignis_core::compute::ModelConfig;
-    use ignis_core::flash_next::{EngineOptions, LOOKAHEAD_WIDTH};
+    use ignis_core::flash_next::{class_minimum_slots, expert_traffic, EngineOptions, LOOKAHEAD_WIDTH};
     use ignis_core::residency::load::{catalog, pool_layout};
     use ignis_core::ngram_table::NgramTable;
     use ignis_core::residency::{
-        available_physical_bytes, ngram_hot_rows_room, plan_host, prefill_staging_ring_bytes, residency_table_bytes,
-        HostPlanRequest, EXPERT_CACHE_FLOOR_BYTES,
+        available_physical_bytes, ngram_hot_rows_room, plan_expert_cache, plan_host, prefill_staging_ring_bytes,
+        residency_table_bytes, ExpertCacheRequest, HostPlanRequest, EXPERT_CACHE_FLOOR_BYTES,
     };
     use ignis_core::seq::SeqPool;
     use ignis_runtime::{FlashNextLeaf, KV_PAGE_TOKENS};
@@ -586,10 +660,6 @@ pub fn flash_next_scheduler_with_ngram_cache(
     };
     let (free_at_start_bytes, _) = CudaDevice::nvml_memory(0)
         .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
-    let budget_bytes = match shape.vram {
-        ignis_core::VramMode::Derived { headroom_bytes } => free_at_start_bytes.saturating_sub(headroom_bytes),
-        ignis_core::VramMode::Explicit { budget_bytes, .. } => budget_bytes,
-    };
 
     // The plan, before anything is on the device.
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
@@ -624,9 +694,9 @@ pub fn flash_next_scheduler_with_ngram_cache(
         mtp_plan.as_ref(),
     )?;
     let config = ModelConfig::flash_next_from(&geometry);
-    // The options the leaf loads with, but for the expert cache, which is
-    // what the plan below leaves: one budget for the pool the plan charges
-    // and the pool the leaf builds.
+    // The options the leaf loads with, but for the KV pool's pages and the
+    // expert cache, which the plan below decides: one budget for the pool the
+    // plan charges and the pool the leaf builds.
     let mut options = EngineOptions {
         ngram_cache,
         prefill_chunk_tokens: shape.prefill_chunk,
@@ -640,16 +710,23 @@ pub fn flash_next_scheduler_with_ngram_cache(
         speculation,
         ..EngineOptions::default()
     };
-    let pool_plan = SeqPool::plan(&config, &options.pool_budget(), options.pool_backend())?;
+    // The sequence pool at any page count (ADR 0045): the lanes' state, the
+    // retained slots, the residual window and the n-gram state do not move
+    // with it; the arena its pages take -- KV and the indexer's keys, both
+    // paged -- is the plan's KV pool.
+    let pool_plan_at = |pages: u32| SeqPool::plan(&config, &options.pool_budget_of(pages), options.pool_backend());
+    let pool_plan = pool_plan_at(1)?;
+    let kv_arena_bytes = |pages: u32| pool_plan_at(pages).map_or(u64::MAX, |plan| plan.kv_bytes + plan.indexer_bytes);
     let cat = catalog(&plan.experts)?;
     let max_tokens = shape.prefill_chunk.max(lanes);
-    let residency_fixed = prefill_staging_ring_bytes(&cat)
-        + residency_table_bytes(
-            u64::from(cat.layers()),
-            u64::from(cat.experts()),
-            u64::from(max_tokens),
-            u64::from(LOOKAHEAD_WIDTH),
-        );
+    let staging_ring = prefill_staging_ring_bytes(&cat);
+    let tables = residency_table_bytes(
+        u64::from(cat.layers()),
+        u64::from(cat.experts()),
+        u64::from(max_tokens),
+        u64::from(LOOKAHEAD_WIDTH),
+    );
+    let residency_fixed = staging_ring + tables;
     let lines = ignis_core::VramLines {
         weights: plan.plan.device_capacity_bytes + mtp_plan.as_ref().map_or(0, |p| p.plan.device_capacity_bytes),
         cuda_context: ignis_runtime::CUDA_CONTEXT_BYTES,
@@ -657,38 +734,63 @@ pub fn flash_next_scheduler_with_ngram_cache(
         sampling: reserved.sampling_bytes,
         decode_graph: reserved.decode_graph_bytes,
         verify_round: reserved.verify_round_bytes,
-        lane_state: pool_plan.lane_state_bytes + pool_plan.indexer_bytes + pool_plan.ngram_conv_bytes,
+        lane_state: pool_plan.lane_state_bytes + pool_plan.ngram_conv_bytes,
         retained_slots: pool_plan.retained_state_bytes,
         hq_residual_window: pool_plan.hq_residual_bytes,
         ..ignis_core::VramLines::default()
     };
-    let planned = lines.total() + pool_plan.kv_bytes + residency_fixed;
-    let expert_cache_bytes = budget_bytes.saturating_sub(planned);
-    if expert_cache_bytes < EXPERT_CACHE_FLOOR_BYTES {
-        return Err(format!(
-            "the VRAM expert cache would get {expert_cache_bytes} bytes, below its {EXPERT_CACHE_FLOOR_BYTES}-byte              floor: the {budget_bytes}-byte budget holds {planned} for the weights, the program, the pool and              residency's ring and tables; shorten --max-context or --prefill-chunk, or free VRAM"
-        ));
-    }
-    // hotpath-lint-allow: one line per model load.
-    tracing::info!(
-        name: "ignis.runtime.flash_next_plan",
-        budget_bytes,
-        weights_bytes = lines.weights,
-        program_bytes = lines.workspace + lines.sampling + lines.decode_graph,
-        pool_bytes = pool_plan.kv_bytes + lines.lane_state + lines.hq_residual_window,
-        retained_device_bytes = lines.retained_slots,
-        residency_fixed_bytes = residency_fixed,
-        expert_cache_bytes,
-        lanes,
-        verify_round_bytes = lines.verify_round,
-        speculation = %speculation.map_or_else(
-            || "off".to_owned(),
-            |s| format!("mtp draft tokens {} rows {} (k at 1/2/3 lanes: {}/{}/{})", s.draft_tokens(), s.row_budget(),
-                        s.window(1), s.window(2), s.window(3))
-        ),
-        "flash-next vram plan"
+    // ADR 0045: the KV pool follows residency -- offloaded on a card that
+    // cannot hold every expert, 524,288 tokens reserved first and the rest to
+    // the expert cache; resident on one that can, the pool taking the rest.
+    // The arena reads a pool the leaf refuses to plan as one that never fits;
+    // `pool_plan` above already surfaced that refusal by name.
+    let vram = ignis_core::plan_vram(&ignis_core::VramRequest {
+        mode: shape.vram,
+        free_at_start_bytes,
+        lines,
+        kv_page_bytes: config.paged_sections(shape.kv_format).bytes_per_token() * u64::from(KV_PAGE_TOKENS),
+        max_context_tokens: shape.max_context,
+        retained_slots: options.retained_slots(),
+        kv_pool: shape.kv_pool,
+        residency: ignis_core::Residency::Experts(ignis_core::ExpertResidency {
+            expert_pool_bytes: cat.total_bytes(),
+            fixed_bytes: residency_fixed,
+            decode_lanes: lanes,
+        }),
+        embedding_pool_named: false,
+        kv_arena_bytes: &kv_arena_bytes,
+        can_page: cfg!(windows),
+    })
+    .map_err(|e| e.to_string())?;
+    let indexer_bytes = pool_plan_at(vram.kv_page_count)?.indexer_bytes;
+    // The expert cache's floor and class minimums, at plan time: what the
+    // plan left it, split by the calibration traffic as the leaf will split
+    // it. Below the floor only with --allow-expert-cache-below-floor; below
+    // a class's minimum never. The plan's total holds the cache, so that
+    // total is the budget the cache's share is read against.
+    let traffic = expert_traffic(artifact_path, &cat)?;
+    let cache = plan_expert_cache(&ExpertCacheRequest {
+        budget_bytes: vram.total_bytes,
+        planned_bytes: vram.total_bytes - vram.residency_bytes - vram.expert_cache_bytes,
+        staging_ring_bytes: staging_ring,
+        table_bytes: tables,
+        floor_bytes: EXPERT_CACHE_FLOOR_BYTES,
+        allow_below_floor: shape.allow_expert_cache_below_floor,
+        catalog: &cat,
+        traffic: &traffic,
+        min_slots: class_minimum_slots(lanes),
+    })
+    .map_err(|e| e.to_string())?;
+    log_vram_warnings(&vram);
+    warn_expert_cache_below_floor(&cache, EXPERT_CACHE_FLOOR_BYTES);
+    let speculation_text = speculation.map_or_else(
+        || "off".to_owned(),
+        |s| format!("mtp draft tokens {} rows {} (k at 1/2/3 lanes: {}/{}/{})", s.draft_tokens(), s.row_budget(),
+                    s.window(1), s.window(2), s.window(3)),
     );
-    options.expert_cache_bytes = expert_cache_bytes;
+    log_flash_next_plan(&vram, cache.expected_hit_rate, lanes, &speculation_text);
+    options.kv_pool_pages = Some(vram.kv_page_count);
+    options.expert_cache_bytes = vram.expert_cache_bytes;
     // Spec flash-next/05: what one sequence's reusable state costs, derived
     // from the topology -- the image a retained slot or a blob holds, and
     // what each token adds to the pages.
@@ -773,12 +875,15 @@ pub fn flash_next_scheduler_with_ngram_cache(
         eos,
     );
     let reserved = crate::metrics::LoadReservations {
-        lines: ignis_core::VramLines { residual: 0, ..lines },
-        budget_bytes,
+        // `/metrics` keeps the indexer's keys under the lanes' state, as
+        // before ADR 0045 moved them to the pool's pages in the plan: its
+        // KV pool is the leaf's pages of KV alone.
+        lines: ignis_core::VramLines { residual: 0, lane_state: lines.lane_state + indexer_bytes, ..lines },
+        budget_bytes: vram.budget_bytes,
         kv_pool_pages: capacity_pages,
         kv_page_bytes: stats.kv_page_bytes,
         residency_bytes: residency_fixed,
-        expert_cache_bytes,
+        expert_cache_bytes: vram.expert_cache_bytes,
         kv_ram_arena_bytes: shape.host_pool_bytes,
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
@@ -816,7 +921,10 @@ mod tests {
         let artifact = ignis_core::ArtifactHash::from_bytes([7; 32]);
         const LAYOUT: u32 = 2;
         let identity_of = |config: &crate::config::Config| {
-            let kv_pool_bytes = config.kv_pool_bytes.unwrap_or(1 << 30);
+            let kv_pool_bytes = match config.kv_pool {
+                Some(ignis_core::KvPoolSize::Bytes(bytes)) => bytes,
+                _ => 1 << 30,
+            };
             leaf_config_for_shape(EngineShape::from(config), kv_pool_bytes).blob_identity(artifact, LAYOUT)
         };
         let crate::config::ConfigOutcome::Config(base) =
@@ -841,7 +949,7 @@ mod tests {
             api_key: Some(crate::config::ApiKeySetting::Generate),
             prefill_chunk: 512,
             max_context: base.max_context / 2,
-            kv_pool_bytes: Some(8 * 1024 * 1024 * 1024),
+            kv_pool: Some(ignis_core::KvPoolSize::Bytes(8 * 1024 * 1024 * 1024)),
             vram: ignis_core::VramMode::Explicit {
                 budget_bytes: 20 * 1024 * 1024 * 1024,
                 allow_oversubscription: true,
@@ -1032,9 +1140,11 @@ mod tests {
             prefill_chunk: 512,
             decode_share_percent: Some(25),
             max_context: 65_536,
+            default_max_tokens: 8_192,
             kv_format: ignis_core::KvFormat::Bf16,
-            kv_pool_bytes: Some(8 * 1024 * 1024 * 1024),
+            kv_pool: Some(ignis_core::KvPoolSize::Tokens(512 * 1024)),
             vram: EngineShape::default().vram,
+            allow_expert_cache_below_floor: true,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: true,
             opener_page_rides_capture: false,
@@ -1054,6 +1164,8 @@ mod tests {
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
 
         assert_eq!(config.serving_chunk_tokens, 512);
+        // ADR 0045: and the default cap.
+        assert_eq!(config.default_max_tokens, 8_192);
         // GitHub #306: and the decode share, as a fraction.
         assert_eq!(config.decode_share, 0.25);
         // GitHub #186: the reuse knobs reach the scheduler too -- and the
@@ -1063,6 +1175,29 @@ mod tests {
         assert_eq!(config.retained_slots, 5);
         // GitHub #190: and so does the Interactive TTL.
         assert_eq!(config.retained_interactive_ttl, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_default_max_tokens_reaches_the_scheduler_on_both_models() {
+        // ADR 0045: 38,912 unless named, and a named value -- 8,192 -- on
+        // either family's load, through the one shape both build from.
+        use ignis_core::compute::ModelFamily;
+        let shape_of = |flags: &[&str]| {
+            let args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).expect("resolve")
+            else {
+                panic!("expected a runnable config");
+            };
+            EngineShape::from(&config)
+        };
+        for (flags, cap) in [(&[][..], 38_912), (&["--default-max-tokens", "8192"][..], 8_192), (&["--default-max-tokens", "0"][..], 0)] {
+            let shape = shape_of(flags);
+            let flash = shape.for_family(ModelFamily::FlashNext);
+            let qwen = shape.with_family_decode_share(ModelFamily::Qwen38_27b);
+            for (family, shape) in [("Flash-Next", flash), ("27B", qwen)] {
+                assert_eq!(scheduler_config_for_shape("m".into(), shape, 64, 1024).default_max_tokens, cap, "{family} {flags:?}");
+            }
+        }
     }
 
     #[test]
@@ -1168,11 +1303,11 @@ mod tests {
             mode,
             free_at_start_bytes: free,
             lines: vram_lines(17 << 30, reserved),
-            kv_format: ignis_core::KvFormat::HqE8_2b,
-            kv_geometry: ignis_core::KvGeometry::qwen38_27b(),
+            kv_page_bytes: page_bytes,
             max_context_tokens: 262_144,
             retained_slots: EngineShape::default().retained_slots(),
-            kv_pool_bytes: None,
+            kv_pool: None,
+            residency: ignis_core::Residency::Resident,
             embedding_pool_named: false,
             kv_arena_bytes: &arena,
             can_page: true,
@@ -1202,6 +1337,10 @@ mod tests {
             assert_eq!(field(&format!("{name}_bytes")), bytes, "{name}");
         }
         assert_eq!(field("kv_pool_bytes"), plan.kv_pool_bytes);
+        // ADR 0045 (AC 7): the branch the pool was sized by, and its size.
+        assert_eq!(field("kv_pool_policy"), "resident");
+        assert_eq!(field("kv_pool_pages"), plan.kv_page_count);
+        assert_eq!(field("kv_pool_tokens"), u64::from(plan.kv_page_count) * 64);
         assert_eq!(field("total_bytes"), plan.total_bytes);
         assert_eq!(
             field("allocated_at_load_bytes"),
@@ -1214,6 +1353,121 @@ mod tests {
         assert_eq!(field("retained_device_slots"), DEFAULT_RETAINED.device_slots);
         assert_eq!(field("retained_host_slots"), DEFAULT_RETAINED.host_slots);
         assert_eq!(field("retained_host_bytes"), DEFAULT_RETAINED.host_bytes);
+    }
+
+    #[test]
+    fn make_s_named_pool_tokens_use_each_model_s_own_bytes_per_token() {
+        // `make config` turns a named --kv-pool-bytes into tokens in sh
+        // (`mk/kv-pool-tokens.sh`, ADR 0045): its per-token costs are the
+        // ones the plan divides a byte count by.
+        use ignis_core::KvFormat;
+        let script = include_str!("../../../mk/kv-pool-tokens.sh");
+        let flash = ignis_core::compute::ModelConfig::qwen38_flash_next();
+        let qwen = ignis_core::KvGeometry::qwen38_27b();
+        for (case, bytes) in [
+            ("flash-next:bf16", flash.paged_sections(KvFormat::Bf16).bytes_per_token()),
+            ("flash-next:*", flash.paged_sections(KvFormat::HqE8_2b).bytes_per_token()),
+            ("27b:bf16", KvFormat::Bf16.bytes_per_token(qwen)),
+            ("*", KvFormat::HqE8_2b.bytes_per_token(qwen)),
+        ] {
+            let line = format!("{case}) per_token={bytes} ;;");
+            assert!(script.contains(&line), "`{line}` missing from mk/kv-pool-tokens.sh");
+        }
+    }
+
+    #[test]
+    fn the_flash_next_plan_event_says_which_branch_the_pool_took_and_its_size() {
+        // ADR 0045 (AC 7): `ignis.runtime.flash_next_plan` carries the policy,
+        // the pool's pages and tokens, on a plan the load's own call builds.
+        const PAGE: u64 = 4_224 * 64;
+        let arena = |pages: u32| 4_096 + u64::from(pages) * PAGE;
+        let lines = ignis_core::VramLines { weights: 5 << 30, workspace: 2 << 30, lane_state: 400 << 20, ..Default::default() };
+        let plan = ignis_core::plan_vram(&ignis_core::VramRequest {
+            mode: ignis_core::VramMode::Derived { headroom_bytes: 4 << 30 },
+            free_at_start_bytes: 31 << 30,
+            lines,
+            kv_page_bytes: PAGE,
+            max_context_tokens: 262_144,
+            retained_slots: 8,
+            kv_pool: None,
+            residency: ignis_core::Residency::Experts(ignis_core::ExpertResidency {
+                expert_pool_bytes: 37 << 30,
+                fixed_bytes: 1_500 << 20,
+                decode_lanes: 3,
+            }),
+            embedding_pool_named: false,
+            kv_arena_bytes: &arena,
+            can_page: true,
+        })
+        .expect("fits");
+        use tracing_subscriber::layer::SubscriberExt;
+        let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+        tracing::subscriber::with_default(subscriber, || log_flash_next_plan(&plan, 0.5, 3, "off"));
+        let records: Vec<serde_json::Value> =
+            sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let event = &records[0];
+        assert_eq!(event["event_name"], "ignis.runtime.flash_next_plan", "{event}");
+        let field = |name: &str| {
+            event.get(name).or_else(|| event["attributes"].get(name)).cloned().unwrap_or_else(|| panic!("no `{name}` in {event}"))
+        };
+        assert_eq!(field("kv_pool_policy"), "offloaded");
+        assert_eq!(field("kv_pool_pages"), 8_192);
+        assert_eq!(field("kv_pool_tokens"), 524_288);
+        assert_eq!(field("kv_pool_bytes"), arena(8_192));
+        assert_eq!(field("expert_cache_bytes"), plan.expert_cache_bytes);
+        assert_eq!(field("residency_fixed_bytes"), 1_500u64 << 20);
+        assert_eq!(field("budget_bytes"), 27u64 << 30);
+        assert_eq!(field("pool_bytes"), arena(8_192) + (400 << 20));
+        assert_eq!(field("lanes"), 3);
+        assert_eq!(field("oversubscribed"), false);
+    }
+
+    #[test]
+    fn a_cache_started_below_its_floor_warns_with_the_cache_the_floor_and_the_knobs() {
+        // ADR 0045 (AC 6): what `--allow-expert-cache-below-floor` buys is a
+        // start with this WARN, never a silent one.
+        use ignis_core::residency::{
+            plan_expert_cache, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, KBits, EXPERT_CACHE_FLOOR_BYTES,
+        };
+        let catalog = ExpertCatalog::new(1, 4, vec![(KBits::K4, KBits::K4); 4], [100; 8]).expect("catalog");
+        let traffic = ExpertTraffic::new(&catalog, vec![1; 4]).expect("traffic");
+        let plan = |allow_below_floor, budget_bytes| {
+            plan_expert_cache(&ExpertCacheRequest {
+                budget_bytes,
+                planned_bytes: 0,
+                staging_ring_bytes: 0,
+                table_bytes: 0,
+                floor_bytes: 1_000,
+                allow_below_floor,
+                catalog: &catalog,
+                traffic: &traffic,
+                min_slots: 0,
+            })
+            .expect("planned")
+        };
+        let capture = |cache: &ignis_core::residency::ExpertCachePlan| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+            let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+            tracing::subscriber::with_default(subscriber, || warn_expert_cache_below_floor(cache, 1_000));
+            sink.lines().iter().map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json")).collect::<Vec<_>>()
+        };
+        let records = capture(&plan(true, 600));
+        assert_eq!(records.len(), 1, "{records:?}");
+        let event = &records[0];
+        assert_eq!(event["event_name"], "ignis.runtime.expert_cache_below_floor", "{event}");
+        assert_eq!(event["severity_text"], "WARN");
+        let field = |name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
+        assert_eq!(field("expert_cache_bytes"), Some(600.into()));
+        assert_eq!(field("floor_bytes"), Some(1_000.into()));
+        let knobs = field("knobs").expect("knobs").as_str().unwrap().to_owned();
+        for knob in ["--kv-pool-bytes", "--prefill-chunk", "--vram-headroom-bytes", "--retained-device"] {
+            assert!(knobs.contains(knob), "{knob}: {knobs}");
+        }
+        assert!(capture(&plan(true, 2_000)).is_empty(), "a cache above its floor warns nothing");
+        assert_eq!(EXPERT_CACHE_FLOOR_BYTES, 12 << 30);
     }
 
     #[test]

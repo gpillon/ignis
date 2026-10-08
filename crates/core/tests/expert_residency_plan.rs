@@ -136,6 +136,7 @@ fn cache_request<'a>(catalog: &'a ExpertCatalog, traffic: &'a ExpertTraffic) -> 
         staging_ring_bytes: 500,
         table_bytes: 300,
         floor_bytes: 1_500,
+        allow_below_floor: false,
         catalog,
         traffic,
         min_slots: 0,
@@ -233,13 +234,55 @@ fn a_cache_below_its_floor_refuses_naming_what_to_shrink() {
     for needle in [
         "1000", // the cache it would get
         "1500", // the floor
+        "--kv-pool-bytes",
         "--max-context",
         "--vram-headroom-bytes",
         "prefill chunk",
+        "--retained-device",
         "desktop",
+        // ADR 0045: and the way past it.
+        "--allow-expert-cache-below-floor",
     ] {
         assert!(message.contains(needle), "{needle} missing: {message}");
     }
+}
+
+#[test]
+fn the_floor_opt_in_plans_the_cache_below_it_and_says_so() {
+    // ADR 0045 (AC 6): `--allow-expert-cache-below-floor` turns the refusal
+    // into a plan flagged for the load's warning -- the same split the cache
+    // would get at any size.
+    let (catalog, traffic) = hot_and_cold();
+    let request = ExpertCacheRequest {
+        planned_bytes: 2_000,
+        allow_below_floor: true,
+        ..cache_request(&catalog, &traffic)
+    };
+    let plan = plan_expert_cache(&request).expect("allowed below the floor");
+    assert!(plan.below_floor);
+    assert_eq!(plan.cache_bytes, 1_000);
+    assert_eq!(plan.pooled_bytes(), 1_000);
+    // Above the floor nothing is flagged, override or not.
+    for allow_below_floor in [false, true] {
+        let plan = plan_expert_cache(&ExpertCacheRequest { allow_below_floor, ..cache_request(&catalog, &traffic) })
+            .expect("fits");
+        assert!(!plan.below_floor);
+    }
+}
+
+#[test]
+fn the_class_minimum_still_refuses_with_the_floor_opt_in() {
+    let (catalog, traffic) = hot_and_cold();
+    let request = ExpertCacheRequest {
+        planned_bytes: 2_600,
+        min_slots: 3,
+        allow_below_floor: true,
+        ..cache_request(&catalog, &traffic)
+    };
+    assert!(matches!(
+        plan_expert_cache(&request),
+        Err(ExpertCachePlanError::BelowClassMinimum { cache_bytes: 400, needed_bytes: 1_200, min_slots: 3 })
+    ));
 }
 
 #[test]

@@ -26,7 +26,7 @@ use crate::residency::device::{budget_words, DeviceResidency, ResidencyDesc};
 use crate::residency::load::{catalog, fill_expert_pool, pool_layout};
 use crate::residency::{
     default_prefetch_budget, min_slots_per_class, plan_expert_cache, prefill_staging_ring_bytes,
-    residency_table_bytes, warm_start_order, ExpertCacheRequest, ExpertTraffic, KClass,
+    residency_table_bytes, warm_start_order, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, KClass,
 };
 use crate::seq::{SeqPool, SeqPoolBudget};
 use crate::speculation::{FlashNextSpeculation, SpeculativeBackend};
@@ -55,6 +55,13 @@ pub struct EngineOptions {
     pub decode_lanes: u32,
     /// The VRAM expert cache, split into the eight K-class pools.
     pub expert_cache_bytes: u64,
+    /// The KV pool's pages, shared by the lanes (ADR 0045): what the server's
+    /// VRAM plan gave the pool (`ignis_core::plan_vram`, 524,288 tokens when
+    /// experts stream). `None` is every lane's whole context and a page per
+    /// retained slot -- not a policy, but what an engine that allocates a
+    /// whole context per lane and never plans needs ([`FlashNextEngine`] and
+    /// the leaf's GPU tests).
+    pub kv_pool_pages: Option<u32>,
     pub ngram: NgramTableOptions,
     /// Persist the selected n-gram hot rows between process loads.
     pub ngram_cache: crate::ngram_cache::PersistenceOptions,
@@ -97,13 +104,21 @@ impl EngineOptions {
         self.retained_device_slots + self.retained_host_slots
     }
 
-    /// The sequence pool these options build: every lane's whole context,
-    /// plus one page per retained slot -- a checkpoint keeps the page its
-    /// opener ends inside, as on the 27B (`VramRequest::retained_slots`).
+    /// The sequence pool these options build: [`EngineOptions::kv_pool_pages`]
+    /// shared by the lanes, or with none every lane's whole context, plus one
+    /// page per retained slot -- a checkpoint keeps the page its opener ends
+    /// inside, as on the 27B (`VramRequest::retained_slots`).
     pub fn pool_budget(&self) -> SeqPoolBudget {
+        let whole_contexts = self.max_context_tokens.div_ceil(64) * self.decode_lanes + self.retained_slots();
+        self.pool_budget_of(self.kv_pool_pages.unwrap_or(whole_contexts))
+    }
+
+    /// [`EngineOptions::pool_budget`] at `pages` KV pages: what the VRAM plan
+    /// asks the pool's arena of at any size.
+    pub fn pool_budget_of(&self, pages: u32) -> SeqPoolBudget {
         SeqPoolBudget {
             kv_format: self.kv_format,
-            kv_page_group_count: self.max_context_tokens.div_ceil(64) * self.decode_lanes + self.retained_slots(),
+            kv_page_group_count: pages,
             max_context_tokens: self.max_context_tokens,
             slot_count: self.decode_lanes,
             retained_slot_count: self.retained_device_slots,
@@ -139,6 +154,7 @@ impl Default for EngineOptions {
             kv_format: KvFormat::HqE8_2b,
             decode_lanes: DEFAULT_DECODE_LANES,
             expert_cache_bytes: 12 << 30,
+            kv_pool_pages: None,
             ngram: NgramTableOptions::default(),
             ngram_cache: crate::ngram_cache::PersistenceOptions::default(),
             capture_graphs: true,
@@ -165,6 +181,21 @@ pub fn sidecar_traffic(artifact: &Path) -> Option<Vec<u64>> {
         .map(|layers| layers.concat())
 }
 
+/// The calibration traffic the expert cache is split by: the artifact's
+/// sidecar's over `catalog`, or uniform when it has none (or one for other
+/// experts).
+pub fn expert_traffic(path: &Path, catalog: &ExpertCatalog) -> Result<ExpertTraffic, String> {
+    let entries = usize::from(catalog.layers()) * usize::from(catalog.experts());
+    let counts = sidecar_traffic(path).filter(|counts| counts.len() == entries).unwrap_or_else(|| vec![1; entries]);
+    ExpertTraffic::new(catalog, counts).map_err(|e| e.to_string())
+}
+
+/// The slots every K class gets first at `lanes`: one decode step's
+/// selection and lookahead, as if all of them fell in that class.
+pub fn class_minimum_slots(lanes: u32) -> u32 {
+    min_slots_per_class(lanes, crate::moe::TOP_K, LOOKAHEAD_WIDTH)
+}
+
 /// The expert residency of the artifact at `path` bound as `plan`, for a
 /// load of `options` (spec flash-next/03): the eight K-class pools split from
 /// `expert_cache_bytes` the way one LRU over the calibration traffic would
@@ -176,10 +207,7 @@ pub fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOption
     let cat = catalog(index)?;
     let layout = pool_layout(index);
     let (layers, experts) = (u64::from(cat.layers()), u64::from(cat.experts()));
-    let counts = sidecar_traffic(path)
-        .filter(|counts| counts.len() == (layers * experts) as usize)
-        .unwrap_or_else(|| vec![1; (layers * experts) as usize]);
-    let traffic = ExpertTraffic::new(&cat, counts).map_err(|e| e.to_string())?;
+    let traffic = expert_traffic(path, &cat)?;
     let max_tokens = options.prefill_chunk_tokens.max(options.decode_lanes);
     let staging_ring = prefill_staging_ring_bytes(&cat);
     let tables = residency_table_bytes(layers, experts, u64::from(max_tokens), u64::from(LOOKAHEAD_WIDTH));
@@ -189,9 +217,10 @@ pub fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOption
         staging_ring_bytes: staging_ring,
         table_bytes: tables,
         floor_bytes: 0,
+        allow_below_floor: false,
         catalog: &cat,
         traffic: &traffic,
-        min_slots: min_slots_per_class(options.decode_lanes, 10, LOOKAHEAD_WIDTH),
+        min_slots: class_minimum_slots(options.decode_lanes),
     })
     .map_err(|e| e.to_string())?;
     let (one_row, per_row) = budget_words(Some(default_prefetch_budget()));
@@ -802,6 +831,25 @@ mod tests {
         assert_eq!(top_with_margin(&row), (1, 0.5));
         let tie: Vec<u16> = [3.0, 1.0, 3.0].iter().map(|&v| bf16(v)).collect();
         assert_eq!(top_with_margin(&tie), (0, 0.0));
+    }
+
+    /// ADR 0045: the pool is the plan's pages, shared by the lanes, whenever
+    /// the load planned them; every lane's whole context and a page per
+    /// retained slot only for an engine that never plans.
+    #[test]
+    fn the_pool_takes_the_plan_s_pages_when_the_load_planned_them() {
+        let options = EngineOptions {
+            max_context_tokens: 262_144,
+            decode_lanes: 3,
+            retained_host_slots: 8,
+            ..EngineOptions::default()
+        };
+        assert_eq!(options.pool_budget().kv_page_group_count, 3 * 4_096 + 8);
+        let planned = EngineOptions { kv_pool_pages: Some(8_192), ..options.clone() };
+        let budget = planned.pool_budget();
+        assert_eq!(budget.kv_page_group_count, 8_192);
+        assert_eq!((budget.max_context_tokens, budget.slot_count, budget.retained_host_slot_count), (262_144, 3, 8));
+        assert_eq!(planned.pool_budget_of(100).kv_page_group_count, 100);
     }
 
     /// The sidecar's `expert_traffic`, layer after layer, as the residency's

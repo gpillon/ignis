@@ -347,12 +347,20 @@ own env var, each validated before any loader work starts): `--prefill-chunk`
 40960 — a 32K prompt plus an 8K generation budget), `--kv-format` (`bf16`
 or `hq-e8-2b`, default `hq-e8-2b` since GitHub #123 wired its attention
 routes — ADR 0022's serving default) and
-`--kv-pool-bytes` (default: whatever the VRAM budget leaves, GitHub #210;
-the plan, logged as `ignis.runtime.vram_plan`, refuses a start that cannot
-hold one `--max-context` sequence). The paged-KV pool is sized in **bytes**; the
-resident-token capacity that budget buys is derived from the format and
-logged at load as `ignis.runtime.kv_pool`, so a run's KV profile is read off
-that event rather than computed from a flag.
+`--kv-pool-bytes` (default: the KV pool policy's, ADR 0045 -- the rest of the
+VRAM budget on the 27B, GitHub #210; 524,288 tokens shared by the lanes on
+Flash-Next with its experts streaming; the plan, logged as
+`ignis.runtime.vram_plan` or `ignis.runtime.flash_next_plan` with its
+`kv_pool_policy`, `kv_pool_pages` and `kv_pool_tokens`, refuses a start that
+cannot hold one `--max-context` sequence and a page per retained slot). The
+pool is named in bytes or in tokens (`512Ktok`); the plan turns either into
+pages at the model's own bytes per token (9,216 on the 27B under hq-e8-2b,
+65,536 under BF16; 4,224 on Flash-Next under hq-e8-2b, KV and indexer keys).
+On the 27B the resident-token capacity is logged at load as
+`ignis.runtime.kv_pool`, so a run's KV profile is read off the events rather
+than computed from a flag. A request that names no cap generates at most
+`--default-max-tokens` (38,912; `0` = up to the context), and a test that
+needs a request to run to the context sends `max_tokens` or that `0`.
 
 Speculation is a load option too (GitHub #150): `--spec dflash2
 --draft-tokens N` (N in 1..7, both flags or neither) binds the drafter's 66
