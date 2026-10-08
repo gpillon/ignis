@@ -249,7 +249,7 @@ file when that saves at least the restore floor (8,192 tokens on Flash-Next,
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--kv-disk-bytes <bytes>` | `IGNIS_KV_DISK_BYTES` | `16G` on Flash-Next, `0` (off) on the 27B | The tier's ceiling (accepts `K`/`M`/`G`). At start it is cut to the volume's free space less a 10 GiB margin, and printed with the directory on `ignis.kv_disk.ready`; a WARN says when it was cut, and a volume with no room above the margin starts without the tier. A write that would cross the margin is refused and the state stays where it was. `0` turns the tier off. (`make` knob `KV_DISK_BYTES`.) |
+| `--kv-disk-bytes <bytes>` | `IGNIS_KV_DISK_BYTES` | `4G` on Flash-Next (about three whole 262K-token lanes, ~1.25 GB each), `0` (off) on the 27B | The tier's ceiling (accepts `K`/`M`/`G`). At start it is cut to the volume's free space less a 10 GiB margin, and printed with the directory on `ignis.kv_disk.ready`; a WARN says when it was cut, and a volume with no room above the margin starts without the tier. A write that would cross the margin is refused and the state stays where it was. `0` turns the tier off. (`make` knob `KV_DISK_BYTES`.) |
 | `--kv-disk-path <model\|auto\|dir>` | `IGNIS_KV_DISK_PATH` | `model` | Where the files go, by the n-gram cache's rule: `model` is the artifact's own directory, `auto` is `LOCALAPPDATA/ignis/cache/kv-disk` on Windows and `XDG_CACHE_HOME/ignis/kv-disk` or `HOME/.cache/ignis/kv-disk` on Linux, anything else is that directory. (`make` knob `KV_DISK_PATH`.) |
 
 - Each process writes in its own `ignis-kv-disk/<pid>-<nonce>/` directory

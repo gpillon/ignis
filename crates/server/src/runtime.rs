@@ -203,7 +203,7 @@ impl EngineShape {
     }
 
     /// KV-disk's budget on a load of `family` (spec vram-budget/03): the
-    /// operator's, or the family's -- 16 GiB on Flash-Next, 0 (off) on the
+    /// operator's, or the family's -- 4 GiB on Flash-Next, 0 (off) on the
     /// 27B.
     pub fn kv_disk_bytes_for(&self, family: ignis_core::compute::ModelFamily) -> u64 {
         self.kv_disk_bytes.unwrap_or_else(|| ignis_runtime::kv_disk::default_bytes(family))
@@ -1158,7 +1158,7 @@ mod tests {
         assert_eq!(shape_of(&["--ngram-hot-bytes", "32G"]), HotBudget::Bytes(32 << 30));
     }
 
-    /// Spec vram-budget/03 AC 12: KV-disk is on at 16 GiB on Flash-Next and
+    /// Spec vram-budget/03 AC 12: KV-disk is on at 4 GiB on Flash-Next and
     /// off on the 27B unless named; a named budget, 0 included, is the
     /// operator's on both. The shape alone never turns the tier on: the
     /// scheduler config it builds has no disk until a store opens.
@@ -1173,7 +1173,7 @@ mod tests {
             }
         };
         let unnamed = shape_of(&[]);
-        assert_eq!(unnamed.kv_disk_bytes_for(ModelFamily::FlashNext), 16 << 30);
+        assert_eq!(unnamed.kv_disk_bytes_for(ModelFamily::FlashNext), 4 << 30);
         assert_eq!(unnamed.kv_disk_bytes_for(ModelFamily::Qwen38_27b), 0, "the 27B writes nothing at its defaults");
         let named = shape_of(&["--kv-disk-bytes", "4G"]);
         assert_eq!(named.kv_disk_bytes_for(ModelFamily::FlashNext), 4 << 30);

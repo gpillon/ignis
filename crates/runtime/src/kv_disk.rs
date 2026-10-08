@@ -80,11 +80,12 @@ const MODEL_ID_MAX: usize = 255;
 pub const MAX_WINDOWS: usize = (HEADER_BYTES - CRC_TABLE_AT - 4) / 4;
 
 /// The tier's budget when `--kv-disk-bytes` is unnamed (spec vram-budget/03):
-/// 16 GiB on Flash-Next, whose pool is smallest while its experts stream;
+/// 4 GiB on Flash-Next (owner 2026-10-08: 4 GiB to start, about three
+/// whole-context lanes), whose pool is smallest while its experts stream;
 /// off on the 27B, whose KV-RAM arena is its last tier unless named.
 pub fn default_bytes(family: ModelFamily) -> u64 {
     match family {
-        ModelFamily::FlashNext => 16 << 30,
+        ModelFamily::FlashNext => 4 << 30,
         ModelFamily::Qwen38_27b => 0,
     }
 }

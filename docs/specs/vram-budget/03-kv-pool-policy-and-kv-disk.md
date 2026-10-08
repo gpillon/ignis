@@ -69,7 +69,8 @@ untracked), GitHub #205.
   - A blob comes back from disk straight to the device.
   - With the tier on, no live work is discarded for room. When no tier has
     room, the request that needed it waits, and a growing lane parks.
-  - On by default for Flash-Next (16 GiB); off by default for the 27B.
+  - On by default for Flash-Next (owner 2026-10-08: 4 GiB to start); off by
+    default for the 27B.
 
 ADR 0045 holds the reasons and the rejected alternatives. This spec holds the
 seams, the defaults, the acceptance and the phases.
@@ -149,7 +150,7 @@ gives the reason for each.
 | Entry rule | a restore never moves anything; entries in rank order; growth branch: free pages ≥ reservation + 4 steps for itself and each resident sequence above it; fixed branch: the reservation fits | *(agent)* |
 | Last resort (growth branch) | every resident sequence parked and no tier takes a victim: the lowest-ranked is re-queued, with an ERROR | *(agent)* |
 | PCIe contention | move out: ITL p50 +10%; move in: ITL p50 +25%; either: max within baseline + 150 ms | *(agent)*, owner to confirm |
-| KV-disk on | Flash-Next `--kv-disk-bytes 16G`; 27B `0` | *(owner)* build, *(agent)* sizes |
+| KV-disk on | Flash-Next `--kv-disk-bytes 4G` (owner 2026-10-08: 4 GiB to start); 27B `0` | *(owner)* build, *(agent)* sizes |
 | Location | `--kv-disk-path model` (beside the artifact), `auto`, or a directory: the n-gram cache's rule | *(owner)*, confirmed 2026-10-08 |
 | Volume margin | 10 GiB, `KV_DISK_VOLUME_MARGIN_BYTES` | *(agent)* |
 | Placement | one file per blob, a byte ledger in eviction-priority order | *(agent)* |
@@ -439,8 +440,9 @@ marked *(growth)* or *(fixed)* is built only on that branch of P0's gate.
 ### KV-disk: configuration and lifecycle
 
 12. **Flags and defaults.**
-    - `--kv-disk-bytes` and `IGNIS_KV_DISK_BYTES` default to 16 GiB on
-      Flash-Next and `0` on the 27B; `0` turns the tier off.
+    - `--kv-disk-bytes` and `IGNIS_KV_DISK_BYTES` default to 4 GiB on
+      Flash-Next (owner 2026-10-08: 4 GiB to start) and `0` on the 27B; `0`
+      turns the tier off.
     - `--kv-disk-path` and `IGNIS_KV_DISK_PATH` take `model`, `auto` or a
       directory, resolved as `ngram_cache::CacheLocation` resolves them.
       `auto` is `LOCALAPPDATA/ignis/cache/kv-disk` on Windows, and

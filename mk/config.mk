@@ -162,7 +162,7 @@ KV_HOST_POOL_BYTES ?= 8G
 # KV-disk, the tier below KV-RAM (--kv-disk-bytes, spec vram-budget/03):
 # evicted sequences and retained prompt checkpoints kept as files and read
 # back instead of prefilled again. A ceiling the server cuts at start to the
-# volume's free space less 10 GiB; 0 turns it off. Empty = the server's: 16G
+# volume's free space less 10 GiB; 0 turns it off. Empty = the server's: 4G
 # on Flash-Next, 0 (off) on the 27B.
 KV_DISK_BYTES ?=
 # Where KV-disk's files go (--kv-disk-path): model (beside the artifact),

@@ -120,7 +120,7 @@ pub struct Config {
     /// KV-disk, Tier 2 (spec vram-budget/03): its budget in bytes
     /// (`--kv-disk-bytes` / `IGNIS_KV_DISK_BYTES`), a ceiling cut at start
     /// to the volume's free space above its 10 GiB margin. `None`: the model
-    /// family's (16 GiB on Flash-Next, 0 = off on the 27B).
+    /// family's (4 GiB on Flash-Next, 0 = off on the 27B).
     pub kv_disk_bytes: Option<u64>,
     /// Where KV-disk's files go (`--kv-disk-path` / `IGNIS_KV_DISK_PATH`):
     /// the n-gram cache's rule -- beside the model (the default), `auto`'s
@@ -1486,7 +1486,7 @@ fn help_text() -> String {
          \x20       --persist-ngram-cache <true|false> env: IGNIS_PERSIST_NGRAM_CACHE (default: true; persist Flash-Next hot rows)\n\
          \x20       --persist-ngram-cache-path <model|auto|dir> env: IGNIS_PERSIST_NGRAM_CACHE_PATH (default: model, beside the artifact; auto: Windows LOCALAPPDATA/ignis/cache/ngram, Linux XDG_CACHE_HOME/ignis/ngram or HOME/.cache/ignis/ngram)\n\
          \x20       --ngram-hot-bytes <b|auto> env: IGNIS_NGRAM_HOT_BYTES (default: {default_ngram_hot_gib} GiB; Flash-Next only: the n-gram rows held in RAM, every other row read from NVMe when a step needs it; accepts a K/M/G suffix; auto = what the host plan leaves after its other lines and the 6 GiB margin, less 256 MiB for the load, the whole ~29 GB table when that fits, never below the default; a budget that holds the whole table reads no row from NVMe and writes no cache file)\n\
-         \x20       --kv-disk-bytes <bytes>   env: IGNIS_KV_DISK_BYTES  (default: 16G on Flash-Next, 0 = off on the 27B; KV-disk, the tier below KV-RAM: evicted sequences and retained prompt checkpoints kept as files and read back instead of prefilled again; a ceiling, cut at start to the volume's free space less 10 GiB; accepts a K/M/G suffix)\n\
+         \x20       --kv-disk-bytes <bytes>   env: IGNIS_KV_DISK_BYTES  (default: 4G on Flash-Next, 0 = off on the 27B; KV-disk, the tier below KV-RAM: evicted sequences and retained prompt checkpoints kept as files and read back instead of prefilled again; a ceiling, cut at start to the volume's free space less 10 GiB; accepts a K/M/G suffix)\n\
          \x20       --kv-disk-path <model|auto|dir> env: IGNIS_KV_DISK_PATH (default: model, beside the artifact; auto: Windows LOCALAPPDATA/ignis/cache/kv-disk, Linux XDG_CACHE_HOME/ignis/kv-disk or HOME/.cache/ignis/kv-disk; the files go in an ignis-kv-disk/<pid>-<nonce> directory there, removed at shutdown, a dead process's removed at the next start)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
