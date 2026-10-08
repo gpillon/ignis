@@ -1,4 +1,4 @@
-# Live moves a window at a time: the copies cost the other lanes almost nothing; what a move in's rounds pay is expert-cache misses, which a move doubles
+# Live moves a window at a time: the copies cost the other lanes almost nothing; what a move in's rounds pay is expert-cache misses
 
 - Kind: experiment
 - Status: current
@@ -129,15 +129,18 @@ Observed:
   there with no move in flight -- from E's prefill on, with C gone -- and
   after C is back. The same holds of the disk move in, whose copies add +0.8
   ms. That, not the link, is the +50-58% the disk move in measured.
-- **A long arrival alone raises the misses; a move doubles them.** With
-  nothing moved, width-3 rounds after E pay +38% misses (+12% ITL). With C
-  moved out and back, +100-110% (+33-40% ITL), for the rest of C's run (~1,400
-  rounds here), and back to normal once C has ended.
+- **A long arrival alone raises the misses; with a move they roughly
+  double.** With nothing moved (one control run), width-3 rounds after E pay
+  +38% misses (+12% ITL). With C moved out and back (six runs), +100-110%
+  (+33-40% ITL), for the rest of C's run (~1,400 rounds here), and back to
+  normal once C has ended. One control against six moved runs, on expert
+  caches 34.6 MB apart, with a run-to-run spread of several percent: the
+  gap between them is the move's only as far as one control can say.
 
 Inferred, not measured:
 
-- What doubles the misses is in the expert residency's response to the
-  sequence leaving and coming back, not in the copies: the time outside the
+- What raises the misses past the control's is in the expert residency's
+  response to the sequence leaving and coming back, not in the copies: the time outside the
   stall is unchanged, so neither the transfers nor attention over moved pages
   pay it. Which (the cache relearning a working set larger than it, the
   lookahead's prefetches, or the routing of the restored sequence) was not
@@ -175,6 +178,7 @@ Inferred, not measured:
 
 ## Follow-ups
 
-- Why a moved-and-restored long sequence doubles the decode lanes' expert
-  misses for its remaining run (spec flash-next/03's residency, GitHub #309).
+- Why the decode lanes' expert misses roughly double while a
+  moved-and-restored long sequence runs (spec flash-next/03's residency,
+  GitHub #309): more control runs first, then the hypotheses above.
 - Pace the disk spill's device copies (sub-window slices).
