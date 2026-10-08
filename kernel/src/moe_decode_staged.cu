@@ -93,7 +93,6 @@ constexpr int kAStride = kGuSplit + 8;                     // fp16 per A row, pa
 constexpr uint32_t kGuArrivals = kGuSplits;                // gate/up items per (u, b)
 constexpr uint32_t kReaderStep = 16;                       // a down reader's count on (u, b)
 constexpr uint32_t kLastReader = kGuArrivals + (kDnColBlocks - 1) * kReaderStep;
-constexpr int kMaxWeightBytes = kItemTiles * 16 * 8;       // 32 KiB: 256 tiles at K = 4
 __host__ __device__ constexpr int weight_bytes(int k2) { return kItemTiles * 16 * k2; }
 
 static_assert(kMmaWarps * kGuKTiles == kItemTiles, "gate/up item shape");
@@ -211,19 +210,6 @@ __device__ __forceinline__ void mbar_arrive(unsigned long long *bar) {
 __device__ __forceinline__ void mbar_arrive_on_copies(unsigned long long *bar) {
   asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_addr(bar)) : "memory");
 }
-__device__ __forceinline__ bool mbar_test(unsigned long long *bar, uint32_t parity) {
-  uint32_t done;
-  asm volatile(
-      "{\n"
-      ".reg .pred p;\n"
-      "mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n"
-      "selp.u32 %0, 1, 0, p;\n"
-      "}\n"
-      : "=r"(done)
-      : "r"(smem_addr(bar)), "r"(parity)
-      : "memory");
-  return done != 0;
-}
 __device__ __forceinline__ void mbar_wait(unsigned long long *bar, uint32_t parity) {
   asm volatile(
       "{\n"
@@ -243,12 +229,6 @@ __device__ __forceinline__ void producer_sync() { asm volatile("bar.sync 2, %0;\
 template <typename Src>
 __device__ __forceinline__ void copy_chunks(char *dst, int chunks, Src src) {
   for (int i = threadIdx.x - kProducerWarp * 32; i < chunks; i += kProducerThreads) cp_async16(dst + 16 * i, src(i));
-}
-
-__device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
-  uint32_t v;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
-  return v;
 }
 
 // The distinct experts of the call, as build_unique (moe_decode_common.cuh) leaves them (only the
@@ -379,14 +359,15 @@ __device__ void stage_item(const Shared &s, const Params &p, const Header &h, ch
 // The producer warps: the first takes the tickets, keeps the in-flight limit and allocates the
 // ring; then all of them issue the item's copies.
 template <bool kTrace>
-__device__ void producer(Shared &s, const Params &p, char *ring, int n_gate_up, int n_total) {
+__device__ void producer(Shared &s, const Params &p, char *ring, int n_gate_up, int n_total, int first_ticket) {
   const int lane = threadIdx.x & 31;
   const bool lead = threadIdx.x >> 5 == kProducerWarp;
-  // The first ticket is the CTA's own; each later one is fetched an item before it is needed
-  // (lane 0 holds it until then), so the atomic's round trip overlaps an item's copies.
-  int ticket = static_cast<int>(blockIdx.x);
+  // Every ticket is taken from the counter, so only a running CTA holds one (the down items'
+  // waits rely on it). The first was taken at the launch's entry, each later one an item before
+  // it is needed (lane 0 holds it until then): the atomics' round trips overlap other work.
+  int ticket = __shfl_sync(0xFFFFFFFFu, first_ticket, 0);
   int pending = 0;
-  if (lead && lane == 0) pending = static_cast<int>(atomicAdd(&p.counters->ticket, 1u) + gridDim.x);
+  if (lead && lane == 0) pending = static_cast<int>(atomicAdd(&p.counters->ticket, 1u));
   int head = 0;    // the ring's next free byte
   int oldest = 0;  // the oldest item the consumers have not released
   for (int n = 0;; ++n) {
@@ -450,7 +431,7 @@ __device__ void producer(Shared &s, const Params &p, char *ring, int n_gate_up, 
     if (h.kind == kEnd) return;
     if (lead) {
       int fetched = 0;
-      if (lane == 0) fetched = static_cast<int>(atomicAdd(&p.counters->ticket, 1u) + gridDim.x);
+      if (lane == 0) fetched = static_cast<int>(atomicAdd(&p.counters->ticket, 1u));
       ticket = __shfl_sync(0xFFFFFFFFu, pending, 0);
       pending = fetched;
     }
@@ -692,7 +673,11 @@ __device__ void reduce_item(const Shared &s, const Meta &m, const Params &p, con
   // This reader read block j's sums in its prepare: counted now, off the operand's path. The
   // fifth reader zeroes the sums and the count for the next call.
   __shared__ uint32_t before;
-  if (aux == 0) before = atomicAdd(&p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block], kReaderStep);
+  if (aux == 0) {
+    __threadfence();  // this reader's loads of the sums before its count, for the fifth reader's zeroing
+    before = atomicAdd(&p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block], kReaderStep);
+    __threadfence();
+  }
   aux_sync();
   if (before == kLastReader) {
     for (int i = aux; i < tokens * 256; i += kAuxThreads) {
@@ -801,6 +786,8 @@ __global__ void __launch_bounds__(kThreads, 1) experts_decode_staged_kernel(Para
     mbar_init(&s.o_full, kMmaWarps);
     mbar_init(&s.o_empty, kAuxWarps);
   }
+  int first_ticket = 0;
+  if (threadIdx.x == kProducerWarp * 32) first_ticket = static_cast<int>(atomicAdd(&p.counters->ticket, 1u));
   unique_experts(s, p.ids, p.weights, p.slots, p.tokens);  // ends with __syncthreads
   const int n_gate_up = s.n_unique * kGuItems;
   const int n_total = n_gate_up + s.n_unique * kDnItems;
@@ -809,7 +796,7 @@ __global__ void __launch_bounds__(kThreads, 1) experts_decode_staged_kernel(Para
     if constexpr (kTrace) {
       if (threadIdx.x == kProducerWarp * 32) trace_cta(p.trace)[1] = global_ns();
     }
-    producer<kTrace>(s, p, ring, n_gate_up, n_total);
+    producer<kTrace>(s, p, ring, n_gate_up, n_total, first_ticket);
   } else if (warp >= kAuxWarp0) {
     aux_role<kTrace>(s, p, ring, abufs, abuf_stride, out);
   } else {

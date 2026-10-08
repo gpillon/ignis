@@ -147,10 +147,12 @@ extern "C" int32_t ignis_moe_prepare(void) {
   if (err != cudaSuccess) return fail(std::string("ignis_moe_prepare: ") + cudaGetErrorString(err));
   if (device < 0 || device >= kMaxDevices) return fail("ignis_moe_prepare: device id out of range");
   int grid = 0, staged_grid = 0;
-  if (ignis_fp8_linear_prepare() != 0 || prepare_router() != 0 || prepare_prefill() != 0 || prepare_decode(&grid) != 0 ||
-      prepare_decode_staged(&staged_grid) != 0) {
+  if (ignis_fp8_linear_prepare() != 0 || prepare_router() != 0 || prepare_prefill() != 0 || prepare_decode(&grid) != 0) {
     return -1;
   }
+  // A device the staged kernel does not fit (its shared memory) runs the register kernel on the
+  // tickets route at every width.
+  if (prepare_decode_staged(&staged_grid) != 0) staged_grid = 0;
   int cluster_size = 0;
   prepare_decode_clusters(&cluster_size);
   g_cluster_size[device].store(cluster_size);

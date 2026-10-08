@@ -7,12 +7,12 @@
 // sums one 128-input block of h, the output Hadamard taken per block and the five blocks added in
 // fixed point (the register kernel runs one fp32 chain over all 640). Each fp16 operand scale is a
 // power of two under either kernel, only the range it is taken over changes, so the gate/up
-// operands are the same bits and the gate/up sums differ by fp32 rounding, ~1e-7. That difference
-// reaches the output through one place: h's fp16 operand for down, where it flips the rounding of
-// a few of h's 640 entries by one ulp (2^-11), each flip moving the token's output by about
-// 2^-11 / sqrt(640) ~ 2e-5 of its norm. So the kernels agree to a few 1e-5 -- in discrete steps:
-// an expert with no flipped entry agrees to ~1e-6 -- an order below the fp64 bound both are held
-// to (test_moe_experts: 2e-3).
+// operands are the same bits. Two differences remain: the fp32 partial sums of both projections
+// round differently, ~1e-6 of an output; and the gate/up sums' ~1e-7 difference flips the fp16
+// rounding of a few of h's 640 entries (down's operand) by one ulp (2^-11), each flip moving the
+// token's output by about 2^-11 / sqrt(640) ~ 2e-5 of its norm. So the kernels agree to a few
+// 1e-5 -- in discrete steps: an expert with no flipped entry agrees to ~1e-6 -- an order below
+// the fp64 bound both are held to (test_moe_experts: 2e-3).
 //
 //   per expert  ten experts covering every K class of both projections, one token, each alone
 //               (a one-hot routing weight): staged against registers, and both against fp64;
@@ -20,7 +20,11 @@
 //   wide        5 and 8 tokens on the tickets route take the register kernel: bit for bit;
 //   determinism the staged call twice, with the records in other slots, and replayed twice from a
 //               CUDA graph: every accumulator bit equal. Every call above runs on one workspace
-//               in sequence, so each also proves the previous one left it as it found it.
+//               in sequence, so each also proves the previous one left it as it found it;
+//   trace       the traced launch (ignis_moe_experts_decode_trace) of either kernel computes the
+//               untraced launch's bits and stamps every work unit once;
+//   alignment   the staged kernel refuses an x that is not 16-byte aligned; the register kernel
+//               takes it.
 //
 // Asserted: relative L2 <= 2e-4 and max <= 1e-3 of the token's largest output between the
 // kernels (ten flipped entries at the worst); the measured figures are printed. ADR 0006 /
@@ -29,6 +33,8 @@
 #include "ignis_moe.h"
 #include "moe_experts_common.h"
 #include "moe_fixture.h"
+
+#include "../src/moe_trace.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -209,6 +215,57 @@ void determinism_arm(Workspace &w, ExpertSet &set) {
   std::printf("  determinism (1 and 3 tokens): rerun, other slots and two graph replays bit for bit\n");
 }
 
+// The diagnostic launch: on both kernels the traced call adds the untraced call's bits, and every
+// work unit leaves exactly one record (75 items per distinct expert staged, 60 units registers).
+void trace_arm(Workspace &w, const ExpertSet &set) {
+  DeviceBytes trace(IGNIS_MOE_TRACE_BYTES);
+  for (uint32_t route : {IGNIS_MOE_DECODE_TICKETS, IGNIS_MOE_DECODE_REGISTERS}) {
+    for (int tokens : {1, 3}) {
+      const Call c(tokens, 980 + tokens);
+      const std::set<int32_t> distinct(c.ids.begin(), c.ids.end());
+      const std::vector<int64_t> plain = run(w, set, c, tokens, route);
+      ignis_moe_workspace ws = w.ws;
+      ws.decode_route = route;
+      MOE_CUDA(cudaMemset(w.acc.p, 0, static_cast<std::size_t>(tokens) * kH * 8));
+      MOE_CUDA(cudaMemset(trace.p, 0, trace.bytes));
+      MOE_RC(ignis_moe_experts_decode_trace(c.dx.p, tokens, c.dids.as<int32_t>(), c.dw.as<float>(),
+                                            set.d_slots.as<ignis_moe_slot>(), &ws, w.acc.as<int64_t>(),
+                                            trace.as<unsigned long long>(), nullptr));
+      MOE_CUDA(cudaDeviceSynchronize());
+      const std::string what = std::string(route == IGNIS_MOE_DECODE_TICKETS ? "staged" : "registers") + ", " +
+                               std::to_string(tokens) + " token(s)";
+      check(download<int64_t>(w.acc.p, static_cast<std::size_t>(tokens) * kH) == plain,
+            what + ": the traced launch adds the untraced launch's bits");
+      const std::vector<unsigned long long> r = download<unsigned long long>(trace.p, trace.bytes / 8);
+      std::size_t units = 0;
+      for (int u = 0; u < IGNIS_MOE_TRACE_UNITS; ++u) units += r[static_cast<std::size_t>(u) * IGNIS_MOE_TRACE_WORDS + 2] != 0;
+      const std::size_t want = distinct.size() * (route == IGNIS_MOE_DECODE_TICKETS ? 75 : 60);
+      check(units == want, what + ": " + std::to_string(units) + " unit records, " + std::to_string(want) + " work units");
+    }
+  }
+  std::printf("  trace: both kernels' traced launches equal their untraced bits and record every unit once\n");
+}
+
+// The staged kernel copies x 16 bytes at a time and refuses an x off that alignment; the register
+// kernel reads it an element at a time and takes it.
+void alignment_arm(Workspace &w, const ExpertSet &set) {
+  const Call c(2, 990);
+  const char *shifted = static_cast<const char *>(c.dx.p) + 2;  // token 0 from its second element
+  ignis_moe_workspace ws = w.ws;
+  check(ignis_moe_experts_decode(shifted, 1, c.dids.as<int32_t>(), c.dw.as<float>(), set.d_slots.as<ignis_moe_slot>(), &ws,
+                                 w.acc.as<int64_t>(), nullptr) == -1 &&
+            std::string(ignis_moe_last_error()).find("16-byte aligned") != std::string::npos,
+        "staged: an x off 16-byte alignment is refused");
+  ws.decode_route = IGNIS_MOE_DECODE_REGISTERS;
+  MOE_CUDA(cudaMemset(w.acc.p, 0, kH * 8));
+  check(ignis_moe_experts_decode(shifted, 1, c.dids.as<int32_t>(), c.dw.as<float>(), set.d_slots.as<ignis_moe_slot>(), &ws,
+                                 w.acc.as<int64_t>(), nullptr) == 0,
+        "registers: an x off 16-byte alignment is taken");
+  MOE_CUDA(cudaDeviceSynchronize());
+  MOE_CUDA(cudaMemset(w.acc.p, 0, kH * 8));
+  std::printf("  alignment: the staged kernel refuses an x off 16 bytes, the register kernel takes it\n");
+}
+
 }  // namespace
 
 int main() {
@@ -223,6 +280,8 @@ int main() {
   per_expert_arm(w, set);
   per_call_arm(w, set);
   determinism_arm(w, set);
+  trace_arm(w, set);
+  alignment_arm(w, set);
   if (g_failed != 0) {
     std::fprintf(stderr, "test_moe_decode_routes: %d failure(s)\n", g_failed);
     return 1;

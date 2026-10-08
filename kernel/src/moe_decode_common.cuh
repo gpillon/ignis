@@ -15,6 +15,12 @@ namespace ignis_moe {
 // route takes the register kernel (moe_decode.cu).
 constexpr int kStagedMaxTokens = 4;
 
+__device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
+  uint32_t v;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+
 // The distinct experts of the call in order of first appearance (token-major, rank order),
 // with each token's routing weight for them and the mask of tokens that selected them, into the
 // kernel's shared state `s`, which has n_unique, unique_id[kDecodeMaxUnique],

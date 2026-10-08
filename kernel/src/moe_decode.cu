@@ -69,12 +69,6 @@ struct Shared {
   __half a[kDecodeMaxTokens][kAStride];
 };
 
-__device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
-  uint32_t v;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
-  return v;
-}
-
 // Rotate `tokens` rows of 640 inputs (input `in(t, k)` times suh[k]) into s.a as fp16, each
 // row scaled by its own power of two (s.scale) so its largest entry sits in [2^13, 2^14).
 template <typename In>
@@ -475,7 +469,7 @@ int32_t experts_decode(const char *op, const void *x, uint32_t tokens, const int
   p.h = reinterpret_cast<float *>(ws + l.decode_h);
   p.acc = reinterpret_cast<long long *>(acc);
   p.trace = trace;
-  if (workspace->decode_route == IGNIS_MOE_DECODE_TICKETS && p.tokens <= kStagedMaxTokens) {
+  if (workspace->decode_route == IGNIS_MOE_DECODE_TICKETS && p.tokens <= kStagedMaxTokens && launch.staged_grid > 0) {
     // The staged kernel copies x 16 bytes at a time.
     if ((reinterpret_cast<uintptr_t>(x) & 15) != 0) return fail(std::string(op) + ": x must be 16-byte aligned");
     if (trace != nullptr && launch.staged_grid > IGNIS_MOE_TRACE_CTAS) {

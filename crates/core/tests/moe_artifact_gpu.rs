@@ -23,7 +23,7 @@
 //!   recorded selection, compared on the routed fixed-point accumulator. They differ only by
 //!   where fp32 partial sums round, which reaches the output by flipping the fp16 rounding of a
 //!   few of h's entries by one ulp (`test_moe_decode_routes`): relative L2 <= 2e-4 and max <=
-//!   1e-3 of the token's largest output.
+//!   1e-3 of the token's largest output; the staged kernel run twice gives the same bits.
 //!
 //! The bound, per token: relative L2 error <= 1.5e-2. The reference runs the decoded weights
 //! rounded to BF16 (2^-9 relative per weight) and BF16 activations between its stages; the
@@ -485,9 +485,11 @@ fn decode_kernels_agree_on_real_weights() {
             check(format!("L{layer} expert {} (k2 {k2}/{k2_down}) alone", rec_ids[r]), &staged, &registers, &mut worst_expert);
             compared.0 += 1;
         }
-        // Calls of 1 to 4 tokens with their recorded selection.
+        // Calls of 1 to 4 tokens with their recorded selection; the staged kernel twice, bit for bit.
         for tokens in 1..=4 {
             let Some(staged) = routed(&mut dev, tokens, &rec_w[..tokens * K], moe::DECODE_TICKETS) else { return };
+            let Some(again) = routed(&mut dev, tokens, &rec_w[..tokens * K], moe::DECODE_TICKETS) else { return };
+            assert_eq!(staged, again, "L{layer} call of {tokens} token(s): the staged kernel run twice differs");
             let Some(registers) = routed(&mut dev, tokens, &rec_w[..tokens * K], moe::DECODE_REGISTERS) else { return };
             check(format!("L{layer} call of {tokens} token(s)"), &staged, &registers, &mut worst_call);
             compared.1 += 1;
