@@ -356,13 +356,22 @@ one lane, then three lanes for 100 s. Each round one timing hold.
 | B5 | 109.4 / 93.2 / 104.7 | **9.81** | 2.52 ms | 16.17 GB | 114.3 / 114.3 |
 | A6 | 100.9 / 87.2 / 96.2 | 10.59 | 2.55 ms | 16.09 GB | 108.4 / 113.2 |
 | B6 | 103.9 / 87.6 / 104.2 | **10.21** | 2.63 ms | 16.12 GB | 110.7 / 113.3 |
+| *round 3: the final commit (`254420a`: round 2's code plus the review fixes and the n-gram one-wake)* | | | | | |
+| A7 | 102.6 / 85.8 / 96.9 | 10.57 | 2.55 ms | 16.09 GB | 113.5 / 113.3 |
+| B7 | 110.4 / 93.4 / 104.4 | **9.78** | 2.52 ms | 16.13 GB | 112.8 / 109.8 |
+| A8 | 104.1 / 87.7 / 98.0 | 10.40 | 2.49 ms | 16.16 GB | 114.7 / 113.9 |
+| B8 | 111.9 / 90.8 / 103.5 | **9.87** | 2.55 ms | 16.15 GB | 112.8 / 113.6 |
 
 - **One lane: -0.62 ms per token, +6.2% tok/s (round 2).** B4-B6 9.81-10.21 ms
   (mean 9.97) against A4-A6 10.50-10.68 (mean 10.59); pair by pair -0.80, -0.69
   and -0.38 ms, B6 with 0.08 ms more stall than A6. Per text, the means of B4-B6
   against A4-A6: story +5.2%, essay +5.6%, diary +8.1%.
-- **Three lanes: neutral (round 2).** B 110.7-114.3 tok/s against A 108.4-114.9,
-  means 113.0 and 112.9, at equal stalls (4.53-4.66 ms per token). Round 1's
+- **Round 3, the final commit: -0.66 ms, +6.7% tok/s.** B7/B8 9.78-9.87 ms against
+  A7/A8 10.40-10.57: the review fixes and the n-gram one-wake keep round 2's gain
+  (the one-wake's own share is inside the noise).
+- **Three lanes: within noise.** Round 2 B 110.7-114.3 tok/s against A
+  108.4-114.9 (means 113.0 and 112.9), round 3 B 109.8-113.6 against A
+  113.3-114.7 (B7 with 0.13 ms more stall a token); over both rounds -0.5%. Round 1's
   -1.2% (B 108.2-108.9 against A 109.3-110.3, every B leg below every A leg) was
   the first fold at three rows, which the bench shows 1.4x slower than not
   folding: limiting the fold to one row took it away.
@@ -374,11 +383,12 @@ one lane, then three lanes for 100 s. Each round one timing hold.
   `main`, so the switches isolate the steps as intended.
 - Round 2's host had 0.4-0.6 GB more expert cache than round 1's (the desktop
   held less VRAM), hence the lower stalls (2.5 against 2.7 ms) in both arms.
-- All requests of all 14 legs generated the same text.
+- All requests of all 18 legs generated the same text.
 
 **Per kernel** (`perkernel.py`, `dissect.py`): one node-level capture of the
-new round (`n1new2`: round 2's B binary, `fn-study/rate`'s `prompt_greedy` at
-one lane, 3 s from +90 s, `--cuda-graph-trace=node`, 304 complete rounds) and,
+new round (`n1new2`: round 2's B binary, `54bd7c7`, which differs from the final
+commit by the review fixes (bit-identical) and the host's n-gram one-wake;
+`fn-study/rate`'s `prompt_greedy` at one lane, 3 s from +90 s, `--cuda-graph-trace=node`, 304 complete rounds) and,
 for a like-for-like base, the same capture of A (`n1base`, 254 rounds; `n1new`
 is round 1's binary). Node durations summed per round, traced (node tracing
 stretches small kernels: the step-1 study scaled its table by 0.93).
@@ -428,9 +438,11 @@ Observed:
 4. **The fold has a row ceiling.** Serial per-row work in every CTA wins at 1-3
    rows and loses from 4 (8 rows: 27.7 -> 35.1 µs).
 5. **Steps 1-7 together, all bit-exact, take a one-lane token from `main`'s
-   10.59 ms to 9.97 (-0.62 ms, +6.2% tok/s) and leave three lanes neutral** (round 2: three legs an arm, every text identical to `main`'s,
-   G1 102/102, the forward and serving GPU tests green). The batch removes 512 of
-   1,531 graph nodes. Per kernel (traced): the HC mix and its folded inject and
+   10.59 ms to 9.97 (-0.62 ms, +6.2% tok/s; the final commit 10.49 to 9.83,
+   -0.66 ms, +6.7%) and leave three lanes within noise** (rounds 2 and 3, every
+   text identical to `main`'s, G1 102/102, the forward and serving GPU tests
+   green). The batch removes 512 of 1,531 graph nodes. Per kernel (traced): the
+   HC mix and its folded inject and
    combine -525 us a round, the select inside residency's resolve -300 (-127 on
    the main chain), the score's staging -202, GDN's grouped projections and
    gating -63, QSA's grouped projections and gate +6.
