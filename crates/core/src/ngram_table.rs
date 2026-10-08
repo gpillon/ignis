@@ -11,7 +11,8 @@
 //!
 //! A gather is two calls so the NVMe latency overlaps other work:
 //! [`NgramTable::begin`] hashes the tokens, plans and submits the reads and
-//! returns at once; [`PendingRows::finish`] waits for them and copies every
+//! returns at once; [`PendingRows::finish`] waits for them -- woken once, by
+//! the last read to land (GitHub #306) -- and copies every
 //! row into the caller's staging buffer — the model instance's pinned buffer,
 //! which the step uploads with its inputs. A prompt's rows begin at
 //! admission, a decode step's right after the previous token is sampled;
@@ -25,7 +26,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -274,14 +275,74 @@ impl NgramCounts {
     }
 }
 
-/// One read's result: its index in the plan, its buffer and the bytes that
-/// arrived (fewer than asked only at the end of the file).
-type ReadResult = (usize, Result<(AlignedBuffer, usize), String>);
+/// One read's outcome: its buffer and the bytes that arrived (fewer than
+/// asked only at the end of the file).
+type ReadOutcome = Result<(AlignedBuffer, usize), String>;
+
+/// One submission's outcomes, filled by the readers in any order. The last
+/// reader to finish wakes the waiter, once: a decode step's gather wakes its
+/// thread once, not once per read (GitHub #306, the decode round's host-gap
+/// fix 2).
+struct Submission {
+    state: Mutex<SubmissionState>,
+    done: Condvar,
+}
+
+struct SubmissionState {
+    outcomes: Vec<Option<ReadOutcome>>,
+    remaining: usize,
+}
+
+/// The waiting side of a submission.
+struct Results(Arc<Submission>);
+
+impl Results {
+    /// Every read's outcome, in submission order, once all have arrived.
+    fn wait(self) -> Vec<ReadOutcome> {
+        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.remaining > 0 {
+            state = self.0.done.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+        state.outcomes.drain(..).map(|outcome| outcome.expect("every read reported")).collect()
+    }
+}
+
+/// A read's place in its submission. Dropped undelivered -- its reader
+/// stopped, or the pool closed with the job queued -- it reports an error, so
+/// the waiter never waits for a read nobody runs.
+struct Reply {
+    submission: Arc<Submission>,
+    index: usize,
+    delivered: bool,
+}
+
+impl Reply {
+    fn deliver(mut self, outcome: ReadOutcome) {
+        self.store(outcome);
+    }
+
+    fn store(&mut self, outcome: ReadOutcome) {
+        self.delivered = true;
+        let mut state = self.submission.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.outcomes[self.index] = Some(outcome);
+        state.remaining -= 1;
+        if state.remaining == 0 {
+            self.submission.done.notify_one();
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        if !self.delivered {
+            self.store(Err("the n-gram reader threads have stopped".to_string()));
+        }
+    }
+}
 
 struct Job {
-    index: usize,
     read: AlignedRead,
-    reply: mpsc::Sender<ReadResult>,
+    reply: Reply,
 }
 
 /// Worker threads, each with its own unbuffered handle, running reads.
@@ -311,16 +372,14 @@ impl ReadPool {
                         Ok(queue) => queue.recv(),
                         Err(_) => return,
                     };
-                    let Ok(job) = job else { return };
-                    let result = AlignedBuffer::new(job.read.len as usize)
+                    let Ok(Job { read, reply }) = job else { return };
+                    let result = AlignedBuffer::new(read.len as usize)
                         .and_then(|mut buffer| {
-                            let got = reader.read_at(job.read.offset, buffer.as_mut_slice())?;
+                            let got = reader.read_at(read.offset, buffer.as_mut_slice())?;
                             Ok((buffer, got))
                         })
                         .map_err(|e| e.to_string());
-                    // The receiver may have given up (an error elsewhere in
-                    // its gather): nothing to deliver to.
-                    let _ = job.reply.send((job.index, result));
+                    reply.deliver(result);
                 })
                 .map_err(|e| format!("spawn an n-gram reader thread: {e}"))?;
             workers.push(handle);
@@ -328,16 +387,21 @@ impl ReadPool {
         Ok(Self { jobs: Some(jobs), workers, unbuffered })
     }
 
-    /// Queue `reads`; their results arrive on the returned receiver, in any
-    /// order, tagged with their index.
-    fn submit(&self, reads: &[AlignedRead]) -> Result<mpsc::Receiver<ReadResult>, String> {
-        let (reply, results) = mpsc::channel();
+    /// Queue `reads`; [`Results::wait`] returns their outcomes in this order.
+    fn submit(&self, reads: &[AlignedRead]) -> Result<Results, String> {
+        let submission = Arc::new(Submission {
+            state: Mutex::new(SubmissionState {
+                outcomes: (0..reads.len()).map(|_| None).collect(),
+                remaining: reads.len(),
+            }),
+            done: Condvar::new(),
+        });
         let jobs = self.jobs.as_ref().expect("the pool's queue lives as long as the pool");
         for (index, &read) in reads.iter().enumerate() {
-            jobs.send(Job { index, read, reply: reply.clone() })
-                .map_err(|_| "the n-gram reader threads have stopped".to_string())?;
+            let reply = Reply { submission: Arc::clone(&submission), index, delivered: false };
+            jobs.send(Job { read, reply }).map_err(|_| "the n-gram reader threads have stopped".to_string())?;
         }
-        Ok(results)
+        Ok(Results(submission))
     }
 }
 
@@ -659,7 +723,7 @@ impl NgramTable {
         let start = self.layout.base_offset;
         let file_end = (start + len).div_ceil(DIRECT_IO_ALIGNMENT) * DIRECT_IO_ALIGNMENT;
         let mut offset = start / DIRECT_IO_ALIGNMENT * DIRECT_IO_ALIGNMENT;
-        let mut copying: Option<(Vec<AlignedRead>, mpsc::Receiver<ReadResult>)> = None;
+        let mut copying: Option<(Vec<AlignedRead>, Results)> = None;
         loop {
             let reading = if offset < file_end {
                 let span_end = (offset + HOT_LOAD_SPAN_BYTES).min(file_end);
@@ -743,16 +807,13 @@ fn artifact_layout(
 /// `out`, the table's bytes from file offset `base`.
 fn copy_scanned(
     reads: &[AlignedRead],
-    results: mpsc::Receiver<ReadResult>,
+    results: Results,
     base: u64,
     out: &mut [u8],
 ) -> Result<(), String> {
     let end = base + out.len() as u64;
-    for _ in 0..reads.len() {
-        let (index, result) = results
-            .recv()
-            .map_err(|_| "an n-gram reader thread stopped mid-scan".to_string())?;
-        let (buffer, got) = result.map_err(|e| format!("n-gram scan read {index}: {e}"))?;
+    for (index, outcome) in results.wait().into_iter().enumerate() {
+        let (buffer, got) = outcome.map_err(|e| format!("n-gram scan read {index}: {e}"))?;
         let read = reads[index];
         let (from, to) = (read.offset.max(base), (read.offset + read.len).min(end));
         if from >= to {
@@ -794,7 +855,7 @@ fn integer_vector(reader: &Reader, name: &str, format: NumericFormat) -> Result<
 pub struct PendingRows<'a> {
     table: &'a NgramTable,
     plan: GatherPlan,
-    results: mpsc::Receiver<ReadResult>,
+    results: Results,
 }
 
 impl PendingRows<'_> {
@@ -822,24 +883,17 @@ impl PendingRows<'_> {
 /// Wait for every read of `plan` and gather its rows into `out`.
 fn collect_and_gather(
     plan: &GatherPlan,
-    results: mpsc::Receiver<ReadResult>,
+    results: Results,
     hot: &[u8],
     out: &mut [u8],
 ) -> Result<(), String> {
-    let mut buffers: Vec<Option<(AlignedBuffer, usize)>> = (0..plan.reads.len()).map(|_| None).collect();
-    for _ in 0..plan.reads.len() {
-        let (index, result) = results
-            .recv()
-            .map_err(|_| "an n-gram reader thread stopped mid-gather".to_string())?;
-        buffers[index] = Some(result.map_err(|e| format!("n-gram read {index}: {e}"))?);
-    }
-    let reads: Vec<&[u8]> = buffers
-        .iter()
-        .map(|b| {
-            let (buffer, got) = b.as_ref().expect("every read reported");
-            &buffer.as_slice()[..*got]
-        })
-        .collect();
+    let buffers = results
+        .wait()
+        .into_iter()
+        .enumerate()
+        .map(|(index, outcome)| outcome.map_err(|e| format!("n-gram read {index}: {e}")))
+        .collect::<Result<Vec<_>, String>>()?;
+    let reads: Vec<&[u8]> = buffers.iter().map(|(buffer, got)| &buffer.as_slice()[..*got]).collect();
     plan.gather(hot, &reads, out)
 }
 
@@ -921,6 +975,32 @@ mod tests {
         // before the card can start; four readers took ~1.2 s of it with the
         // GPU idle, sixteen take the chunk's TTFT from 3.7 to 2.9 s.
         assert_eq!(NgramTableOptions::default().read_threads, 16);
+    }
+
+    #[test]
+    fn a_submission_waits_for_every_read_in_its_order_and_reports_one_nobody_ran() {
+        // GitHub #306: the waiter wakes once, when the last read lands, and
+        // gets the outcomes in submission order whatever order they landed in;
+        // a read dropped undelivered (its reader stopped) is an error, not a
+        // wait that never ends.
+        let submission = Arc::new(Submission {
+            state: Mutex::new(SubmissionState { outcomes: (0..3).map(|_| None).collect(), remaining: 3 }),
+            done: Condvar::new(),
+        });
+        let reply = |index| Reply { submission: Arc::clone(&submission), index, delivered: false };
+        let (first, second, third) = (reply(0), reply(1), reply(2));
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            first.deliver(Ok((AlignedBuffer::new(4096).unwrap(), 7)));
+        });
+        third.deliver(Ok((AlignedBuffer::new(4096).unwrap(), 9)));
+        drop(second);
+        let outcomes = Results(submission).wait();
+        late.join().unwrap();
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(outcomes[0].as_ref().map(|(_, got)| *got), Ok(7));
+        assert!(outcomes[1].as_ref().is_err_and(|e| e.contains("stopped")));
+        assert_eq!(outcomes[2].as_ref().map(|(_, got)| *got), Ok(9));
     }
 
     #[test]
