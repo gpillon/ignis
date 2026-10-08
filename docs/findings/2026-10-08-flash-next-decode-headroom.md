@@ -245,11 +245,12 @@ The ranking, each with its estimated gain (inferred) at one and three lanes:
    (filtered 20 -> oracle).
 3. **CPU cold experts: park.** At one lane **~0%**: a token misses 0.68
    projections per layer and the CPU is no faster than the link for one
-   expert. At three lanes, as a second channel beside the link at ~1x its
-   speed, the stall could halve: **at most +37%** (27.5 -> 20 ms per round)
-   before a per-layer GPU-to-CPU handshake inside the graph (unmeasured; at
-   the 2026-10-05 host-orchestrated round trip of 57 µs per layer it costs
-   2.7 ms per round, leaving ~+21%), before the CPU competes with the n-gram
+   expert. At three lanes, as a second channel beside the link at 1.0-1.3x
+   its time per expert (the p50s above), the stall could fall by 43-50%:
+   **+31-37%** (27.5 -> 20-21 ms per round) before a per-layer GPU-to-CPU
+   handshake inside the graph (unmeasured; at the 2026-10-05
+   host-orchestrated round trip of 57 µs per layer it costs 2.7 ms per
+   round, leaving ~+16-21%), before the CPU competes with the n-gram
    gather's readers and the server's threads for the ten cores it needs
    spinning, and before the re-misses of experts it computed without caching.
    Large engineering cost, three-lane only.
@@ -262,6 +263,11 @@ The ranking, each with its estimated gain (inferred) at one and three lanes:
   real text is harder at one lane).
 - The replay is teacher-forced routing with no timing: its prefetches are
   hidden by assumption, and the tok/s column applies served stall ratios.
+- The one-lane ratios are measured on text the served harness does not
+  resemble (73.8 against 51.6 MB per token): on the repeated greedy text,
+  whose working set is already resident, the predictor's gains may be
+  smaller, the recall step's most. Three lanes do not carry this (replay and
+  served agree within 6%).
 - The kernel row includes the prefetch joins the stall metric cannot see;
   the ~3 ms DRAM floor comes from one capture of an older build and is a
   bound, not a target.
