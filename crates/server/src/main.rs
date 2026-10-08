@@ -151,6 +151,7 @@ fn cuda_scheduler(
     thinking_close: Option<std::sync::Arc<ignis_core::thinking_budget::ThinkingClose>>,
     logging_handle: &ignis_logging::LoggingHandle,
     ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
+    kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
 ) -> (Box<dyn Scheduler>, ignis_server::metrics::LoadReservations) {
     let eos = match frontend.eos_token_id() {
         Some(eos) => eos,
@@ -177,7 +178,15 @@ fn cuda_scheduler(
     // GitHub #302: a Flash-Next artifact runs its own program and leaf.
     let loaded = match family {
         ModelFamily::FlashNext => {
-            ignis_server::runtime::flash_next_scheduler_with_ngram_cache(artifact_path, model.into(), eos, shape, thinking_close, ngram_cache)
+            ignis_server::runtime::flash_next_scheduler_with_ngram_cache(
+                artifact_path,
+                model.into(),
+                eos,
+                shape,
+                thinking_close,
+                ngram_cache,
+                kv_disk_location,
+            )
         }
         ModelFamily::Qwen38_27b => ignis_server::runtime::cuda_scheduler_with_thinking_close(
             artifact_path,
@@ -185,6 +194,7 @@ fn cuda_scheduler(
             eos,
             shape.with_family_decode_share(ModelFamily::Qwen38_27b),
             thinking_close,
+            kv_disk_location,
         ),
     };
     match loaded {
@@ -281,6 +291,10 @@ async fn main() {
         // GitHub #306: read through `EngineShape`, like the other load-shape
         // knobs.
         ngram_hot_bytes: _,
+        // Spec vram-budget/03: the budget through `EngineShape`, the
+        // location handed to the loader.
+        kv_disk_bytes: _,
+        kv_disk_location,
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
         thinking_budget: default_thinking_budget,
@@ -313,7 +327,7 @@ async fn main() {
         expose,
     } = config;
     #[cfg(not(feature = "cuda"))]
-    let _ = ngram_cache;
+    let _ = (ngram_cache, kv_disk_location);
     let api_key = match api_key {
         None => None,
         Some(ignis_server::config::ApiKeySetting::Fixed(key)) => Some(key),
@@ -526,6 +540,7 @@ async fn main() {
                 thinking_close,
                 &logging_handle,
                 ngram_cache,
+                &kv_disk_location,
             );
             // GitHub #216: what the plan reserved leaves the load here, so
             // the exposition can name it. The placeholder path below builds

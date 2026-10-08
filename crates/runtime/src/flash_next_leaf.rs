@@ -31,16 +31,16 @@ use ignis_core::flash_next::{build_residency, DeviceWeights, EngineOptions};
 use ignis_core::flash_next_counters::FlashNextCounterSource;
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::ngram::NgramContext;
-use ignis_core::ngram_table::NgramTable;
+use ignis_core::ngram_table::{GatherGate, NgramTable};
 use ignis_core::residency::device::DeviceResidency;
 use ignis_core::residency::ResidencyMirror;
-use ignis_core::seq::{ArenaBuffer, HostArena, PinnedAllocError, Seq, SeqCheckpoint, SeqPool, SeqPrefix};
+use ignis_core::seq::{ArenaBuffer, HostArena, PinnedAllocError, Seq, SeqCheckpoint, SeqPool, SeqPrefix, Window};
 use ignis_core::speculation::{flash_next_window_within, SpeculativeBackend};
 use ignis_core::step;
 use ignis_core::types::{DecodeParams, SpecCounters, TokenId};
 use ignis_core::{ArtifactHash, BlobIdentity};
 
-use crate::{AttentionRead, DecodeLane, LaneRun, ReservedBytes, RuntimeStats, StepLeaf};
+use crate::{AttentionRead, DecodeLane, LaneRun, ReservedBytes, RuntimeStats, StepLeaf, TransferWindow};
 
 /// The block before the pool's bytes in a Flash-Next blob: the n-gram
 /// context's token count and tokens, `u32` little-endian, zero-padded to
@@ -192,6 +192,12 @@ impl FlashNextLeaf {
         Arc::clone(&self.counters)
     }
 
+    /// The gate a prefill's n-gram gather raises, which KV-disk's IO threads
+    /// wait on (spec vram-budget/03): the table's reads go first.
+    pub fn prefill_gate(&self) -> GatherGate {
+        self.table.prefill_gate()
+    }
+
     /// The decode lanes the load serves: the scheduler's resident lanes.
     pub fn decode_lanes(&self) -> u32 {
         self.options.decode_lanes
@@ -311,6 +317,19 @@ impl FlashNextLeaf {
             word.copy_from_slice(&token.to_le_bytes());
         }
         Ok(rest)
+    }
+
+    /// The part of a blob window that is the pool's: the window less the
+    /// context block, in the pool blob's own offsets; `None` for a window
+    /// inside the block.
+    fn pool_window(window: TransferWindow) -> Option<Window> {
+        let block = CONTEXT_BLOCK_BYTES as u64;
+        let end = window.offset + window.bytes;
+        if end <= block {
+            return None;
+        }
+        let offset = window.offset.max(block);
+        Some(Window { offset: offset - block, bytes: end - offset, blob_bytes: window.blob_bytes - block })
     }
 
     /// The context in the block at the head of `src`, and the pool's blob
@@ -662,5 +681,103 @@ impl StepLeaf for FlashNextLeaf {
         sequence.context = context;
         sequence.drafts.clear();
         Ok(())
+    }
+
+    fn snapshot_window(
+        &self,
+        _model: &Self::Model,
+        sequence: &Self::Sequence,
+        window: TransferWindow,
+        dst: &mut [u8],
+    ) -> Result<(), i32> {
+        // The context block is host memory: written here, now.
+        let mut dst = dst;
+        let block = CONTEXT_BLOCK_BYTES as u64;
+        if window.offset < block {
+            let mut bytes = [0u8; CONTEXT_BLOCK_BYTES];
+            Self::write_context(&sequence.context, &mut bytes)?;
+            let take = ((window.offset + window.bytes).min(block) - window.offset) as usize;
+            let (head, rest) = std::mem::take(&mut dst).split_at_mut(take);
+            head.copy_from_slice(&bytes[window.offset as usize..][..take]);
+            dst = rest;
+        }
+        let Some(pool) = Self::pool_window(window) else {
+            return Ok(());
+        };
+        // SAFETY: the disk tier keeps `dst` alive and unread, and the
+        // sequence unstepped, until a fence taken after this has passed.
+        unsafe { sequence.seq.snapshot_window(pool, dst) }.map_err(|e| leaf_error("snapshot window", e.to_string()))
+    }
+
+    fn restore_window(
+        &self,
+        _model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        window: TransferWindow,
+        src: &[u8],
+    ) -> Result<(), i32> {
+        // The first window carries the whole context block (a window is far
+        // larger than it): read, checked and taken before any pool byte
+        // moves. The sequence refuses every step until its last window has
+        // landed, so its context changing first is never seen.
+        let mut src = src;
+        if window.offset == 0 {
+            let (context, rest) = self.read_context(src).map_err(|e| leaf_error("restore window", e))?;
+            sequence.context = context;
+            sequence.drafts.clear();
+            src = rest;
+        } else if window.offset < CONTEXT_BLOCK_BYTES as u64 {
+            return Err(leaf_error("restore window", format!("a window at {} splits the context block", window.offset)));
+        }
+        let Some(pool) = Self::pool_window(window) else {
+            return Ok(());
+        };
+        // SAFETY: as `snapshot_window`, for `src` and the sequence.
+        unsafe { sequence.seq.restore_window(pool, src) }.map_err(|e| leaf_error("restore window", e.to_string()))
+    }
+
+    fn transfer_fence(&self, model: &Self::Model) -> Result<u64, i32> {
+        model.pool.fence().map_err(|e| leaf_error("transfer fence", e))
+    }
+
+    fn transfer_passed(&self, model: &Self::Model, fence: u64) -> Result<bool, i32> {
+        model.pool.fence_passed(fence).map_err(|e| leaf_error("transfer fence", e))
+    }
+
+    fn transfer_wait(&self, model: &Self::Model, fence: u64) -> Result<(), i32> {
+        model.pool.fence_wait(fence).map_err(|e| leaf_error("transfer fence", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec vram-budget/03: a blob window less the context block is the
+    /// pool's window at the pool blob's own offsets, so the pool's windows
+    /// run in order from 0 and cover its blob exactly once.
+    #[test]
+    fn a_blob_window_maps_to_the_pool_window_past_the_context_block() {
+        let blob_bytes = CONTEXT_BLOCK_BYTES as u64 + 10_000;
+        let window = |offset, bytes| TransferWindow { offset, bytes, blob_bytes };
+        let pool = |offset, bytes| Window { offset, bytes, blob_bytes: 10_000 };
+        assert_eq!(FlashNextLeaf::pool_window(window(0, 4096)), Some(pool(0, 4096 - 256)));
+        assert_eq!(FlashNextLeaf::pool_window(window(4096, 4096)), Some(pool(4096 - 256, 4096)));
+        assert_eq!(FlashNextLeaf::pool_window(window(0, 256)), None, "the block alone");
+        assert_eq!(FlashNextLeaf::pool_window(window(100, 200)), Some(pool(0, 44)));
+        // Windows of any size tile the pool blob in order.
+        for size in [300u64, 4096, 7000, blob_bytes] {
+            let mut next = 0;
+            let mut offset = 0;
+            while offset < blob_bytes {
+                let bytes = size.min(blob_bytes - offset);
+                if let Some(p) = FlashNextLeaf::pool_window(window(offset, bytes)) {
+                    assert_eq!(p.offset, next, "size {size}");
+                    next += p.bytes;
+                }
+                offset += bytes;
+            }
+            assert_eq!(next, 10_000, "size {size}");
+        }
     }
 }

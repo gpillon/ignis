@@ -27,7 +27,7 @@ use ignis_artifact::{
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::seq::{
     HostPinnedPool, PinnedAllocError, PinnedBuffer, Seq, SeqCheckpoint, SeqPool, SeqPoolBudget,
-    SeqPrefix,
+    SeqPrefix, Window,
     snapshot_format_version,
 };
 use ignis_core::step;
@@ -40,6 +40,7 @@ use ignis_core::vision::MediaItem;
 
 use crate::{
     AttentionRead, DecodeLane, LaneRun, MultimodalSpan, ReservedBytes, RuntimeStats, StepLeaf,
+    TransferWindow,
 };
 
 /// Sizing knobs for the leaf's sequence-state pool and program scratch.
@@ -1010,6 +1011,52 @@ impl StepLeaf for CudaLeaf {
         sequence
             .restore(src)
             .map_err(|e| leaf_error("restore", e.to_string()))
+    }
+
+    fn snapshot_window(
+        &self,
+        _model: &Self::Model,
+        sequence: &Self::Sequence,
+        window: TransferWindow,
+        dst: &mut [u8],
+    ) -> Result<(), i32> {
+        // SAFETY: the disk tier keeps `dst` alive and unread, and the
+        // sequence unstepped, until a fence taken after this has passed.
+        unsafe { sequence.snapshot_window(seq_window(window), dst) }
+            .map_err(|e| leaf_error("snapshot window", e.to_string()))
+    }
+
+    fn restore_window(
+        &self,
+        _model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        window: TransferWindow,
+        src: &[u8],
+    ) -> Result<(), i32> {
+        // SAFETY: as `snapshot_window`, for `src` and the sequence.
+        unsafe { sequence.restore_window(seq_window(window), src) }
+            .map_err(|e| leaf_error("restore window", e.to_string()))
+    }
+
+    fn transfer_fence(&self, model: &Self::Model) -> Result<u64, i32> {
+        model.pool.fence().map_err(|e| leaf_error("transfer fence", e))
+    }
+
+    fn transfer_passed(&self, model: &Self::Model, fence: u64) -> Result<bool, i32> {
+        model.pool.fence_passed(fence).map_err(|e| leaf_error("transfer fence", e))
+    }
+
+    fn transfer_wait(&self, model: &Self::Model, fence: u64) -> Result<(), i32> {
+        model.pool.fence_wait(fence).map_err(|e| leaf_error("transfer fence", e))
+    }
+}
+
+/// A KV-disk window as the seq ABI's.
+pub(crate) fn seq_window(window: TransferWindow) -> Window {
+    Window {
+        offset: window.offset,
+        bytes: window.bytes,
+        blob_bytes: window.blob_bytes,
     }
 }
 

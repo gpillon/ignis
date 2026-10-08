@@ -117,6 +117,15 @@ pub struct Config {
     /// host plan leaves. `None`: the 1 GiB default. The 27B has no n-gram
     /// table and refuses it.
     pub ngram_hot_bytes: Option<ignis_core::ngram_table::HotBudget>,
+    /// KV-disk, Tier 2 (spec vram-budget/03): its budget in bytes
+    /// (`--kv-disk-bytes` / `IGNIS_KV_DISK_BYTES`), a ceiling cut at start
+    /// to the volume's free space above its 10 GiB margin. `None`: the model
+    /// family's (16 GiB on Flash-Next, 0 = off on the 27B).
+    pub kv_disk_bytes: Option<u64>,
+    /// Where KV-disk's files go (`--kv-disk-path` / `IGNIS_KV_DISK_PATH`):
+    /// the n-gram cache's rule -- beside the model (the default), `auto`'s
+    /// per-user cache directory under `kv-disk`, or a named directory.
+    pub kv_disk_location: ignis_core::ngram_cache::CacheLocation,
     pub enable_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The server-wide thinking budget (`--thinking-budget` /
@@ -415,6 +424,8 @@ pub fn resolve(
     let mut persist_ngram_cache = None;
     let mut persist_ngram_cache_path = None;
     let mut ngram_hot_bytes = None;
+    let mut kv_disk_bytes = None;
+    let mut kv_disk_path = None;
     let mut metrics_on = false;
     let mut metrics_bind = None;
     let mut api_key = None;
@@ -477,6 +488,8 @@ pub fn resolve(
             "--persist-ngram-cache" => persist_ngram_cache = Some(take_value(args, &mut i, flag)?),
             "--persist-ngram-cache-path" => persist_ngram_cache_path = Some(take_value(args, &mut i, flag)?),
             "--ngram-hot-bytes" => ngram_hot_bytes = Some(take_value(args, &mut i, flag)?),
+            "--kv-disk-bytes" => kv_disk_bytes = Some(take_value(args, &mut i, flag)?),
+            "--kv-disk-path" => kv_disk_path = Some(take_value(args, &mut i, flag)?),
             "--metrics" => metrics_on = true,
             "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
             "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
@@ -644,6 +657,8 @@ pub fn resolve(
 
     let ngram_cache = resolve_ngram_cache(persist_ngram_cache, persist_ngram_cache_path, &env)?;
     let ngram_hot_bytes = resolve_ngram_hot_bytes(ngram_hot_bytes, &env)?;
+    let kv_disk_bytes = resolve_kv_disk_bytes(kv_disk_bytes, &env)?;
+    let kv_disk_location = resolve_kv_disk_path(kv_disk_path, &env)?;
     Ok(ConfigOutcome::Config(Config {
         model,
         model_named,
@@ -651,6 +666,8 @@ pub fn resolve(
         artifact,
         ngram_cache,
         ngram_hot_bytes,
+        kv_disk_bytes,
+        kv_disk_location,
         model_download: resolve_model_download(model_download, &env)?,
         model_download_path: non_empty(
             model_download_path.or_else(|| env("IGNIS_MODEL_DOWNLOAD_PATH")),
@@ -737,6 +754,33 @@ fn resolve_ngram_cache(
         Some(dir) => CacheLocation::Directory(PathBuf::from(dir)),
     };
     Ok(PersistenceOptions { enabled, location })
+}
+
+/// `--kv-disk-bytes` / `IGNIS_KV_DISK_BYTES` (spec vram-budget/03): a byte
+/// count (`parse_bytes`'s suffixes), `0` for no tier. Unnamed is `None`, the
+/// model family's.
+fn resolve_kv_disk_bytes(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<u64>, ConfigError> {
+    non_empty(flag.or_else(|| env("IGNIS_KV_DISK_BYTES")))
+        .map(|raw| parse_bytes("--kv-disk-bytes", &raw))
+        .transpose()
+}
+
+/// `--kv-disk-path` / `IGNIS_KV_DISK_PATH` (spec vram-budget/03): the
+/// n-gram cache's rule -- `model` (the default), `auto`, or a directory.
+fn resolve_kv_disk_path(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<ignis_core::ngram_cache::CacheLocation, ConfigError> {
+    use ignis_core::ngram_cache::CacheLocation;
+    Ok(match flag.or_else(|| env("IGNIS_KV_DISK_PATH")).as_deref() {
+        None | Some("model") => CacheLocation::Model,
+        Some("auto") => CacheLocation::Auto,
+        Some("") => return Err(ConfigError("`--kv-disk-path` cannot be empty".into())),
+        Some(dir) => CacheLocation::Directory(PathBuf::from(dir)),
+    })
 }
 
 /// `--ngram-hot-bytes` / `IGNIS_NGRAM_HOT_BYTES` (GitHub #306): a byte count
@@ -1442,6 +1486,8 @@ fn help_text() -> String {
          \x20       --persist-ngram-cache <true|false> env: IGNIS_PERSIST_NGRAM_CACHE (default: true; persist Flash-Next hot rows)\n\
          \x20       --persist-ngram-cache-path <model|auto|dir> env: IGNIS_PERSIST_NGRAM_CACHE_PATH (default: model, beside the artifact; auto: Windows LOCALAPPDATA/ignis/cache/ngram, Linux XDG_CACHE_HOME/ignis/ngram or HOME/.cache/ignis/ngram)\n\
          \x20       --ngram-hot-bytes <b|auto> env: IGNIS_NGRAM_HOT_BYTES (default: {default_ngram_hot_gib} GiB; Flash-Next only: the n-gram rows held in RAM, every other row read from NVMe when a step needs it; accepts a K/M/G suffix; auto = what the host plan leaves after its other lines and the 6 GiB margin, less 256 MiB for the load, the whole ~29 GB table when that fits, never below the default; a budget that holds the whole table reads no row from NVMe and writes no cache file)\n\
+         \x20       --kv-disk-bytes <bytes>   env: IGNIS_KV_DISK_BYTES  (default: 16G on Flash-Next, 0 = off on the 27B; KV-disk, the tier below KV-RAM: evicted sequences and retained prompt checkpoints kept as files and read back instead of prefilled again; a ceiling, cut at start to the volume's free space less 10 GiB; accepts a K/M/G suffix)\n\
+         \x20       --kv-disk-path <model|auto|dir> env: IGNIS_KV_DISK_PATH (default: model, beside the artifact; auto: Windows LOCALAPPDATA/ignis/cache/kv-disk, Linux XDG_CACHE_HOME/ignis/kv-disk or HOME/.cache/ignis/kv-disk; the files go in an ignis-kv-disk/<pid>-<nonce> directory there, removed at shutdown, a dead process's removed at the next start)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --thinking-budget <n|off> env: IGNIS_THINKING_BUDGET  (default: {DEFAULT_THINKING_BUDGET}; reasoning tokens before the model's close is forced, off = no budget; a request's thinking_budget overrides it, 0 = none)\n\
@@ -1543,6 +1589,42 @@ mod tests {
         ] {
             assert!(resolve(&args(&flags), no_env).is_err(), "{flags:?}");
         }
+    }
+
+    /// KV-disk (spec vram-budget/03): unnamed is the family's budget and
+    /// beside the model; a size or `0`, `model`, `auto` or a directory by
+    /// flag or environment, the flag winning; a bad size or an empty path is
+    /// refused.
+    #[test]
+    fn kv_disk_defaults_flags_env_and_invalid_values() {
+        use ignis_core::ngram_cache::CacheLocation;
+        let default = expect_config(resolve(&[], no_env).unwrap());
+        assert_eq!(default.kv_disk_bytes, None, "the family's");
+        assert_eq!(default.kv_disk_location, CacheLocation::Model);
+
+        let env = env_map(&[("IGNIS_KV_DISK_BYTES", "8G"), ("IGNIS_KV_DISK_PATH", "auto")]);
+        let config = expect_config(resolve(&[], &env).unwrap());
+        assert_eq!(config.kv_disk_bytes, Some(8 << 30));
+        assert_eq!(config.kv_disk_location, CacheLocation::Auto);
+
+        let flags = args(&["--kv-disk-bytes", "0", "--kv-disk-path", "D:/kv"]);
+        let config = expect_config(resolve(&flags, &env).unwrap());
+        assert_eq!(config.kv_disk_bytes, Some(0), "0 is off, and the flag wins");
+        assert_eq!(config.kv_disk_location, CacheLocation::Directory(PathBuf::from("D:/kv")));
+
+        let config = expect_config(resolve(&args(&["--kv-disk-path", "model"]), &env).unwrap());
+        assert_eq!(config.kv_disk_location, CacheLocation::Model);
+
+        for flags in [
+            vec!["--kv-disk-bytes", "lots"],
+            vec!["--kv-disk-bytes"],
+            vec!["--kv-disk-path"],
+            vec!["--kv-disk-path", ""],
+        ] {
+            assert!(resolve(&args(&flags), no_env).is_err(), "{flags:?}");
+        }
+        assert!(resolve(&[], &env_map(&[("IGNIS_KV_DISK_BYTES", "-1")])).is_err());
+        assert!(help_text().contains("--kv-disk-bytes") && help_text().contains("--kv-disk-path"));
     }
     #[test]
     fn no_args_no_env_falls_back_to_defaults() {

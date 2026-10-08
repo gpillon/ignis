@@ -36,9 +36,17 @@ impl Default for PersistenceOptions {
 impl PersistenceOptions {
     /// The cache directory for `artifact`.
     pub fn directory(&self, artifact: &Path) -> Result<PathBuf, String> {
-        match &self.location {
+        self.location.directory(artifact, "ngram")
+    }
+}
+impl CacheLocation {
+    /// The directory this location names for `artifact`: beside it, the
+    /// named one, or `auto`'s per-user cache directory under `name` (`ngram`;
+    /// KV-disk's `kv-disk`, spec vram-budget/03, which takes this rule).
+    pub fn directory(&self, artifact: &Path, name: &str) -> Result<PathBuf, String> {
+        match self {
             CacheLocation::Model => Ok(model_directory(artifact)),
-            CacheLocation::Auto => auto_directory(cfg!(windows), |key| std::env::var_os(key).map(PathBuf::from)),
+            CacheLocation::Auto => auto_directory(cfg!(windows), name, |key| std::env::var_os(key).map(PathBuf::from)),
             CacheLocation::Directory(path) => Ok(path.clone()),
         }
     }
@@ -72,7 +80,7 @@ fn prune(dir: &Path, artifact: &Path, keep: &Path) {
         }
     }
 }
-fn auto_directory(windows: bool, env: impl Fn(&str) -> Option<PathBuf>) -> Result<PathBuf, String> {
+fn auto_directory(windows: bool, name: &str, env: impl Fn(&str) -> Option<PathBuf>) -> Result<PathBuf, String> {
     let nonempty = |key| env(key).filter(|p| !p.as_os_str().is_empty());
     let base = if windows {
         nonempty("LOCALAPPDATA").ok_or("LOCALAPPDATA is unset")?
@@ -82,7 +90,7 @@ fn auto_directory(windows: bool, env: impl Fn(&str) -> Option<PathBuf>) -> Resul
             .or_else(|| nonempty("HOME").map(|p| p.join(".cache")))
             .ok_or("XDG_CACHE_HOME and HOME are unset")?
     };
-    Ok(if windows { base.join("ignis/cache/ngram") } else { base.join("ignis/ngram") })
+    Ok(if windows { base.join("ignis/cache").join(name) } else { base.join("ignis").join(name) })
 }
 
 /// Identity includes the source's filesystem stamp even when the packer has
@@ -259,20 +267,32 @@ mod tests {
     #[test]
     fn auto_paths_for_both_platforms() {
         assert_eq!(
-            auto_directory(true, |k| (k == "LOCALAPPDATA").then(|| PathBuf::from("local"))).unwrap(),
+            auto_directory(true, "ngram", |k| (k == "LOCALAPPDATA").then(|| PathBuf::from("local"))).unwrap(),
             PathBuf::from("local/ignis/cache/ngram")
+        );
+        assert_eq!(
+            auto_directory(true, "kv-disk", |k| (k == "LOCALAPPDATA").then(|| PathBuf::from("local"))).unwrap(),
+            PathBuf::from("local/ignis/cache/kv-disk")
         );
         // Linux's cache base already includes `.cache`; its Ignis path does not add `cache`.
         assert_eq!(
-            auto_directory(false, |k| (k == "HOME").then(|| PathBuf::from("home"))).unwrap(),
+            auto_directory(false, "ngram", |k| (k == "HOME").then(|| PathBuf::from("home"))).unwrap(),
             PathBuf::from("home/.cache/ignis/ngram")
+        );
+        assert_eq!(
+            auto_directory(false, "kv-disk", |k| (k == "HOME").then(|| PathBuf::from("home"))).unwrap(),
+            PathBuf::from("home/.cache/ignis/kv-disk")
         );
         let abs = std::env::temp_dir();
         assert_eq!(
-            auto_directory(false, |k| (k == "XDG_CACHE_HOME").then(|| abs.clone())).unwrap(),
+            auto_directory(false, "ngram", |k| (k == "XDG_CACHE_HOME").then(|| abs.clone())).unwrap(),
             abs.join("ignis/ngram")
         );
-        assert!(auto_directory(true, |_| None).is_err());
+        assert_eq!(
+            auto_directory(false, "kv-disk", |k| (k == "XDG_CACHE_HOME").then(|| abs.clone())).unwrap(),
+            abs.join("ignis/kv-disk")
+        );
+        assert!(auto_directory(true, "ngram", |_| None).is_err());
     }
     #[test]
     fn the_default_location_is_beside_the_model() {

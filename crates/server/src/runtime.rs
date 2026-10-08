@@ -86,6 +86,10 @@ pub struct EngineShape {
     /// #306): 1 GiB unless named; `auto` is resolved against the host plan
     /// at load.
     pub ngram_hot_bytes: ignis_core::ngram_table::HotBudget,
+    /// KV-disk's budget (`--kv-disk-bytes`, spec vram-budget/03); `None`
+    /// takes the family's ([`EngineShape::kv_disk_bytes_for`]). Where its
+    /// files go is not a shape's: the loader is handed it.
+    pub kv_disk_bytes: Option<u64>,
 }
 
 impl Default for EngineShape {
@@ -116,6 +120,7 @@ impl Default for EngineShape {
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
             ngram_hot_bytes: ignis_core::ngram_table::HotBudget::default(),
+            kv_disk_bytes: None,
         }
     }
 }
@@ -145,6 +150,7 @@ impl From<&crate::config::Config> for EngineShape {
             vision: config.vision,
             rope_scaling: config.rope_scaling,
             ngram_hot_bytes: config.ngram_hot_bytes.unwrap_or_default(),
+            kv_disk_bytes: config.kv_disk_bytes,
         }
     }
 }
@@ -196,6 +202,13 @@ impl EngineShape {
         Self { retained_host_slots: family.default_retained_host_slots(), ..this }
     }
 
+    /// KV-disk's budget on a load of `family` (spec vram-budget/03): the
+    /// operator's, or the family's -- 16 GiB on Flash-Next, 0 (off) on the
+    /// 27B.
+    pub fn kv_disk_bytes_for(&self, family: ignis_core::compute::ModelFamily) -> u64 {
+        self.kv_disk_bytes.unwrap_or_else(|| ignis_runtime::kv_disk::default_bytes(family))
+    }
+
     /// This shape with the decode share the operator did not name taken from
     /// `family` (GitHub #306): the one step of [`EngineShape::for_family`]
     /// the 27B's load takes too, its retained slots being the config's.
@@ -203,6 +216,86 @@ impl EngineShape {
         let decode_share_percent = Some(self.decode_share_percent.unwrap_or(family.default_decode_share_percent()));
         Self { decode_share_percent, ..self }
     }
+}
+
+/// What a load needs to open KV-disk, Tier 2 (spec vram-budget/03).
+#[cfg(feature = "cuda")]
+struct KvDiskLoad<'a> {
+    artifact_path: &'a std::path::Path,
+    model_id: &'a str,
+    location: &'a ignis_core::ngram_cache::CacheLocation,
+    /// The budget the operator or the family named; 0 opens nothing.
+    bytes: u64,
+    rope_scaling: ignis_core::RopeScaling,
+    /// What the tier's IO threads wait on: Flash-Next's prefill gathers.
+    gate: ignis_core::ngram_table::GatherGate,
+    restore_floor_tokens: u32,
+}
+
+/// [`scheduler`], with KV-disk when `disk` names a budget and its volume has
+/// room above the margin (spec vram-budget/03): the store under the load's
+/// identity, its two staging windows pinned now (serving allocates nothing,
+/// ADR 0030), and the scheduler's ledger sized to the store's effective
+/// budget. A location the tier cannot open, or a volume with no room, leaves
+/// the load without the tier and says so: it is a cache, and never refuses a
+/// start. The second value is the tier's budget, `None` without it.
+#[cfg(feature = "cuda")]
+fn scheduler_with_kv_disk<L: StepLeaf>(
+    config: SchedulerConfig,
+    model: Arc<Model<L>>,
+    eos: TokenId,
+    disk: KvDiskLoad<'_>,
+) -> Result<(ConcreteScheduler, Option<u64>), String> {
+    use ignis_runtime::kv_disk::{self, DiskIdentity, DiskStore};
+
+    let compute = RuntimeCompute::new(model, eos);
+    let store = if disk.bytes == 0 {
+        None
+    } else {
+        let opened = disk.location.directory(disk.artifact_path, "kv-disk").and_then(|location| {
+            let identity = DiskIdentity::of_load(
+                disk.model_id,
+                &ignis_core::Compute::blob_identity(&compute),
+                disk.rope_scaling,
+                kv_disk::sidecar_sha256(disk.artifact_path),
+            );
+            DiskStore::open_on_volume(&location, disk.bytes, identity, disk.gate)
+                .map_err(|e| format!("{}: {e}", location.display()))
+        });
+        match opened {
+            Ok(store) => store,
+            Err(error) => {
+                // hotpath-lint-allow: one line per model load.
+                tracing::warn!(
+                    name: "ignis.kv_disk.off",
+                    %error,
+                    "the KV-disk directory cannot be opened: the load goes on without the tier"
+                );
+                None
+            }
+        }
+    };
+    let Some(store) = store else {
+        return Ok((ConcreteScheduler::with_config(config, Arc::new(compute)), None));
+    };
+    let budget_bytes = store.budget_bytes();
+    let arena = ignis_core::seq::HostArena::create(kv_disk::STAGING_BYTES)
+        .map_err(|e| format!("KV-disk staging: {e}; --kv-disk-bytes 0 turns the tier off"))?;
+    let staging = (0..kv_disk::STAGING_WINDOWS)
+        .map(|_| {
+            arena
+                .alloc(kv_disk::WINDOW_BYTES)
+                .map(|window| Box::new(window) as ignis_runtime::StagingWindow)
+                .map_err(|e| format!("KV-disk staging: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let config = SchedulerConfig {
+        kv_disk_capacity_bytes: budget_bytes,
+        kv_disk_restore_floor_tokens: disk.restore_floor_tokens,
+        ..config
+    };
+    let compute = compute.with_kv_disk(store, staging);
+    Ok((ConcreteScheduler::with_config(config, Arc::new(compute)), Some(budget_bytes)))
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -369,7 +462,7 @@ pub fn cuda_scheduler(
     eos: TokenId,
     shape: EngineShape,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
-    cuda_scheduler_with_thinking_close(artifact_path, model_id, eos, shape, None)
+    cuda_scheduler_with_thinking_close(artifact_path, model_id, eos, shape, None, &Default::default())
 }
 
 /// [`cuda_scheduler`], with the model's close sequence the thinking budget
@@ -382,6 +475,7 @@ pub fn cuda_scheduler_with_thinking_close(
     eos: TokenId,
     shape: EngineShape,
     thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
+    kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
     use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
     use ignis_runtime::{CudaLeaf, KV_PAGE_TOKENS};
@@ -507,14 +601,25 @@ pub fn cuda_scheduler_with_thinking_close(
         );
     }
 
-    let sched = scheduler(
+    let family = ignis_core::compute::ModelFamily::Qwen38_27b;
+    let kv_disk = KvDiskLoad {
+        artifact_path,
+        model_id: &model_id,
+        location: kv_disk_location,
+        bytes: shape.kv_disk_bytes_for(family),
+        rope_scaling: shape.rope_scaling,
+        gate: Default::default(),
+        restore_floor_tokens: ignis_runtime::kv_disk::restore_floor_tokens(family),
+    };
+    let (sched, kv_disk_bytes) = scheduler_with_kv_disk(
         SchedulerConfig {
             thinking_close,
-            ..scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages)
+            ..scheduler_config_for_shape(model_id.clone(), shape, KV_PAGE_TOKENS, capacity_pages)
         },
         model,
         eos,
-    );
+        kv_disk,
+    )?;
     // GitHub #216 (ADR 0030 §Observability): the plan was a value this
     // function built, read once and dropped. What it reserved outlives it
     // now, so an operator can read it off `/metrics` instead of off the one
@@ -532,7 +637,7 @@ pub fn cuda_scheduler_with_thinking_close(
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
         retained_host_bytes: reservations.retained_host_bytes,
-        kv_disk_bytes: None,
+        kv_disk_bytes,
         flash_next: None,
     };
     Ok((sched, reserved))
@@ -558,7 +663,15 @@ pub fn flash_next_scheduler(
     shape: EngineShape,
     thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
-    flash_next_scheduler_with_ngram_cache(artifact_path, model_id, eos, shape, thinking_close, Default::default())
+    flash_next_scheduler_with_ngram_cache(
+        artifact_path,
+        model_id,
+        eos,
+        shape,
+        thinking_close,
+        Default::default(),
+        &Default::default(),
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -566,6 +679,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
     artifact_path: &std::path::Path, model_id: String, eos: TokenId, shape: EngineShape,
     thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
     ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
+    kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
     use ignis_artifact::flash_next::{self, FlashNextGeometry};
     use ignis_artifact::{CudaDevice, Reader};
@@ -708,11 +822,15 @@ pub fn flash_next_scheduler_with_ngram_cache(
         &plan,
         config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?,
     )?;
+    // Spec vram-budget/03: KV-disk's two pinned windows are the plan's
+    // staging line when the tier is named.
+    let kv_disk_bytes = shape.kv_disk_bytes_for(ignis_core::compute::ModelFamily::FlashNext);
+    let kv_disk_staging_bytes = if kv_disk_bytes > 0 { ignis_runtime::kv_disk::STAGING_BYTES } else { 0 };
     let mut host_request = available_physical_bytes().map(|available| HostPlanRequest {
         available_physical_bytes: available,
         expert_pool_bytes: pool_layout(&plan.experts).bytes,
         ngram_hot_rows_bytes: 0,
-        staging_bytes: 0,
+        staging_bytes: kv_disk_staging_bytes,
         retained_host_slots_bytes: pool_plan.retained_host_bytes,
         kv_ram_arena_bytes: options.kv_ram_arena_bytes,
     });
@@ -748,6 +866,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
             retained_host_slots = options.retained_host_slots,
             retained_host_bytes = pool_plan.retained_host_bytes,
             kv_ram_arena_bytes = options.kv_ram_arena_bytes,
+            kv_disk_staging_bytes,
             "flash-next host plan"
         );
     }
@@ -757,22 +876,33 @@ pub fn flash_next_scheduler_with_ngram_cache(
     // through their source, never through the leaf, which drops with its
     // model.
     let counters = leaf.counter_source();
+    let gate = leaf.prefill_gate();
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
     let stats = model.stats().map_err(|e| format!("runtime stats: {e:?}"))?;
     let capacity_pages = stats.kv_page_count;
     // The 27B's reuse configuration (prompt reuse, retained slots, the
-    // KV-RAM tier's bytes), over this load's lanes.
-    let sched = scheduler(
+    // KV-RAM tier's bytes), over this load's lanes, and KV-disk below it.
+    let kv_disk = KvDiskLoad {
+        artifact_path,
+        model_id: &model_id,
+        location: kv_disk_location,
+        bytes: kv_disk_bytes,
+        rope_scaling: shape.rope_scaling,
+        gate,
+        restore_floor_tokens: ignis_runtime::kv_disk::restore_floor_tokens(ignis_core::compute::ModelFamily::FlashNext),
+    };
+    let (sched, kv_disk_bytes) = scheduler_with_kv_disk(
         SchedulerConfig {
             max_in_flight: lanes as usize,
             max_prefill_batch: lanes as usize,
             resident_slot_capacity: lanes,
             thinking_close,
-            ..scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages)
+            ..scheduler_config_for_shape(model_id.clone(), shape, KV_PAGE_TOKENS, capacity_pages)
         },
         model,
         eos,
-    );
+        kv_disk,
+    )?;
     let reserved = crate::metrics::LoadReservations {
         lines: ignis_core::VramLines { residual: 0, ..lines },
         budget_bytes,
@@ -784,7 +914,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
         retained_slots: sched.retained_slot_count(),
         retained_host_slots: shape.retained_host_slots,
         retained_host_bytes: pool_plan.retained_host_bytes,
-        kv_disk_bytes: None,
+        kv_disk_bytes,
         flash_next: Some(counters),
     };
     Ok((sched, reserved))
@@ -1028,6 +1158,32 @@ mod tests {
         assert_eq!(shape_of(&["--ngram-hot-bytes", "32G"]), HotBudget::Bytes(32 << 30));
     }
 
+    /// Spec vram-budget/03 AC 12: KV-disk is on at 16 GiB on Flash-Next and
+    /// off on the 27B unless named; a named budget, 0 included, is the
+    /// operator's on both. The shape alone never turns the tier on: the
+    /// scheduler config it builds has no disk until a store opens.
+    #[test]
+    fn the_kv_disk_budget_is_the_family_default_unless_named() {
+        use ignis_core::compute::ModelFamily;
+        let shape_of = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            match crate::config::resolve(&argv, |_| None).expect("resolve") {
+                crate::config::ConfigOutcome::Config(config) => EngineShape::from(&config),
+                _ => panic!("a config"),
+            }
+        };
+        let unnamed = shape_of(&[]);
+        assert_eq!(unnamed.kv_disk_bytes_for(ModelFamily::FlashNext), 16 << 30);
+        assert_eq!(unnamed.kv_disk_bytes_for(ModelFamily::Qwen38_27b), 0, "the 27B writes nothing at its defaults");
+        let named = shape_of(&["--kv-disk-bytes", "4G"]);
+        assert_eq!(named.kv_disk_bytes_for(ModelFamily::FlashNext), 4 << 30);
+        assert_eq!(named.kv_disk_bytes_for(ModelFamily::Qwen38_27b), 4 << 30);
+        let off = shape_of(&["--kv-disk-bytes", "0"]);
+        assert_eq!(off.kv_disk_bytes_for(ModelFamily::FlashNext), 0);
+        let config = scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::FlashNext), 64, 1024);
+        assert_eq!(config.kv_disk_capacity_bytes, 0);
+    }
+
     #[test]
     fn the_operator_prefill_chunk_reaches_the_scheduler_config() {
         let shape = EngineShape {
@@ -1051,6 +1207,7 @@ mod tests {
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
             ngram_hot_bytes: ignis_core::ngram_table::HotBudget::Auto,
+            kv_disk_bytes: None,
         };
 
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);

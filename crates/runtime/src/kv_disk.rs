@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use ignis_artifact::{DirectReader, DirectWriter};
 use ignis_core::BlobIdentity;
+use ignis_core::compute::ModelFamily;
 use ignis_core::ngram_table::GatherGate;
 use ignis_core::scheduler::DiskBlob;
 
@@ -77,6 +78,26 @@ const CRC_TABLE_AT: usize = 512;
 const MODEL_ID_MAX: usize = 255;
 /// The most windows a header page has room for: 895 x 32 MiB, ~28 GiB.
 pub const MAX_WINDOWS: usize = (HEADER_BYTES - CRC_TABLE_AT - 4) / 4;
+
+/// The tier's budget when `--kv-disk-bytes` is unnamed (spec vram-budget/03):
+/// 16 GiB on Flash-Next, whose pool is smallest while its experts stream;
+/// off on the 27B, whose KV-RAM arena is its last tier unless named.
+pub fn default_bytes(family: ModelFamily) -> u64 {
+    match family {
+        ModelFamily::FlashNext => 16 << 30,
+        ModelFamily::Qwen38_27b => 0,
+    }
+}
+
+/// The fewest tokens a disk restore must save over the tier above it to be
+/// taken (spec vram-budget/03): a read of a short prefix costs more than its
+/// prefill. Flash-Next's prefill is the slower, so its floor is the lower.
+pub fn restore_floor_tokens(family: ModelFamily) -> u32 {
+    match family {
+        ModelFamily::FlashNext => 8_192,
+        ModelFamily::Qwen38_27b => 16_384,
+    }
+}
 
 /// The tier's effective budget (spec vram-budget/03 AC 14): the flag, or
 /// what the volume has free above its margin, whichever is smaller. Zero is
@@ -692,6 +713,20 @@ impl DiskStore {
         free: FreeBytes,
     ) -> io::Result<Option<Self>> {
         Self::open_with(location, flag_bytes, identity, gate, free, WINDOW_BYTES, VOLUME_MARGIN_BYTES)
+    }
+
+    /// [`DiskStore::open`] for a load: the volume's free space read through
+    /// `location` each time it is asked.
+    pub fn open_on_volume(
+        location: &Path,
+        flag_bytes: u64,
+        identity: DiskIdentity,
+        gate: GatherGate,
+    ) -> io::Result<Option<Self>> {
+        let at = location.to_path_buf();
+        let free: FreeBytes =
+            Box::new(move || ignis_artifact::volume_free_bytes(&at).map_err(|e| io::Error::other(e.to_string())));
+        Self::open(location, flag_bytes, identity, gate, free)
     }
 
     /// [`DiskStore::open`] with the window and the margin named (tests).
