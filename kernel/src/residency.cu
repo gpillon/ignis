@@ -4,7 +4,8 @@
 // One layer step is these launches, on the caller's stream unless named:
 //   resolve_demand    one CTA: classify the selection, stamp hits, place misses (free slot,
 //                     else the LRU victim in decode, else the staging ring in prefill), write
-//                     the slot table and the demand copy jobs;
+//                     the slot table and the demand copy jobs -- after making the selection
+//                     from the router's logits itself in a routed step (GitHub #306);
 //   resolve_prefetch  one CTA: place the lookahead's prefetches and their copy jobs -- on the
 //                     caller's stream in a whole step, on the prefetch stream in a split one;
 //   copy              a small grid copying the demand jobs from the mapped host pool, timing
@@ -14,6 +15,8 @@
 // Everything the resolve decides lives in device memory, so the host never waits on it.
 
 #include "ignis_residency.h"
+
+#include "moe_router_select.cuh"
 
 #include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
@@ -254,10 +257,11 @@ using BlockScan = cub::BlockScan<uint32_t, kThreads>;
 // the expert op waits for); resolve_prefetch then takes the lookahead's candidates. Run back to
 // back they are the policy's one step. Split, the prefetch half runs on residency's prefetch
 // stream beside the expert op: its candidates never evict a projection the step selected (the
-// demand half stamped them `now`), so it changes nothing the op reads.
-__global__ void __launch_bounds__(kThreads)
-    resolve_demand(Dev d, uint32_t layer, uint32_t phase, const int32_t *ids, uint32_t tokens,
-                   const int32_t *lookahead, uint32_t rows, uint32_t stride) {
+// demand half stamped them `now`), so it changes nothing the op reads. The demand half's body is
+// a device function: resolve_demand_routed (GitHub #306) runs it after the router's selection.
+__device__ __forceinline__ void resolve_demand_step(const Dev &d, uint32_t layer, uint32_t phase, const int32_t *ids,
+                                                    uint32_t tokens, const int32_t *lookahead, uint32_t rows,
+                                                    uint32_t stride) {
   __shared__ uint32_t s_sel[IGNIS_MOE_EXPERTS / 32];
   __shared__ uint32_t s_list[kMaxKeysPerLayer];
   __shared__ uint32_t s_need[kClasses], s_pinned[kClasses], s_hits[kClasses];
@@ -470,6 +474,29 @@ __global__ void __launch_bounds__(kThreads)
     for (uint32_t i = t; i < sizeof(Counters) / 8; i += blockDim.x) to[i] = from[i];
     if (t < kClasses) d.mirror->in_use[t] = st->used[t];
   }
+}
+
+__global__ void __launch_bounds__(kThreads)
+    resolve_demand(Dev d, uint32_t layer, uint32_t phase, const int32_t *ids, uint32_t tokens,
+                   const int32_t *lookahead, uint32_t rows, uint32_t stride) {
+  resolve_demand_step(d, layer, phase, ids, tokens, lookahead, rows, stride);
+}
+
+// GitHub #306, step 5: the router's selection and the demand half in one launch. Each warp
+// selects tokens from the router's logits as the router's own select launch does
+// (moe_router_select.cuh: the same ids and weights, bit for bit), the CTA meets, and the demand
+// half resolves the selection it just wrote. A programmatic dependent of the logits launch: it
+// waits for the logits here, before reading anything.
+__global__ void __launch_bounds__(kThreads)
+    resolve_demand_routed(Dev d, uint32_t layer, uint32_t phase, const float *logits, int32_t *ids, float *weights,
+                          uint32_t tokens) {
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  const uint32_t warps = blockDim.x >> 5;
+  for (uint32_t row = threadIdx.x >> 5; row < tokens; row += warps) {
+    ignis_moe_select::select_token(logits, static_cast<int>(row), static_cast<int>(threadIdx.x & 31), ids, weights);
+  }
+  __syncthreads();
+  resolve_demand_step(d, layer, phase, ids, tokens, nullptr, 0, 0);
 }
 
 // The step's lookahead (`layer` + 1 < layers): candidates in rank order, both projections of
@@ -1075,9 +1102,14 @@ int32_t ignis_residency_step_ranked(ignis_residency *r, uint32_t layer, uint32_t
   return 0;
 }
 
-int32_t ignis_residency_step_demand(ignis_residency *r, uint32_t layer, uint32_t phase,
-                                    const int32_t *ids, uint32_t tokens, void *stream,
-                                    void **lookahead_stream) {
+}  // extern "C"
+
+namespace {
+
+// The split step's demand half: the resolve `logits` names (resolve_demand_routed from the
+// router's logits, else resolve_demand of `ids`), then the fork and the demand copy.
+int32_t step_demand(ignis_residency *r, uint32_t layer, uint32_t phase, const float *logits, int32_t *ids,
+                    float *weights, uint32_t tokens, void *stream, void **lookahead_stream) {
   if (r == nullptr) return fail("residency: no residency");
   const ignis_residency_desc &d = r->desc;
   if (lookahead_stream != nullptr) *lookahead_stream = nullptr;
@@ -1090,7 +1122,21 @@ int32_t ignis_residency_step_demand(ignis_residency *r, uint32_t layer, uint32_t
   if (ignis_residency_join(r, stream) != 0) return -1;
   r->stepped = true;
   const bool look = lookahead_stream != nullptr && layer + 1 < d.layers && width_of(d, phase) > 0;
-  resolve_demand<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, nullptr, 0, 0);
+  if (logits != nullptr) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(1);
+    cfg.blockDim = dim3(kThreads);
+    cfg.stream = s;
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    RESIDENCY_CUDA(cudaLaunchKernelEx(&cfg, resolve_demand_routed, r->dev, layer, phase, logits, ids, weights,
+                                      tokens));
+  } else {
+    resolve_demand<<<1, kThreads, 0, s>>>(r->dev, layer, phase, ids, tokens, nullptr, 0, 0);
+  }
   RESIDENCY_CUDA(cudaGetLastError());
   if (look) {
     RESIDENCY_CUDA(cudaEventRecord(r->fork, s));
@@ -1107,6 +1153,27 @@ int32_t ignis_residency_step_demand(ignis_residency *r, uint32_t layer, uint32_t
     *lookahead_stream = r->prefetch_stream;
   }
   return 0;
+}
+
+}  // namespace
+
+extern "C" {
+
+int32_t ignis_residency_step_demand(ignis_residency *r, uint32_t layer, uint32_t phase,
+                                    const int32_t *ids, uint32_t tokens, void *stream,
+                                    void **lookahead_stream) {
+  return step_demand(r, layer, phase, nullptr, const_cast<int32_t *>(ids), nullptr, tokens, stream,
+                     lookahead_stream);
+}
+
+int32_t ignis_residency_step_demand_routed(ignis_residency *r, uint32_t layer, uint32_t phase, const float *logits,
+                                           int32_t *ids, float *weights, uint32_t tokens, void *stream,
+                                           void **lookahead_stream) {
+  if (lookahead_stream != nullptr) *lookahead_stream = nullptr;
+  if (logits == nullptr || weights == nullptr) {
+    return fail("residency: a routed step takes the router's logits and writes its ids and weights");
+  }
+  return step_demand(r, layer, phase, logits, ids, weights, tokens, stream, lookahead_stream);
 }
 
 int32_t ignis_residency_step_prefetch_ranked(ignis_residency *r, const int32_t *lookahead,

@@ -1,6 +1,7 @@
 // ignis kernel leaf: Flash-Next's MoE router -- OURS (kernel/include/ignis_moe.h).
 //
-// Two launches, both graph-capturable and allocation-free:
+// Two launches, both graph-capturable and allocation-free (ignis_moe_router_logits is the first
+// alone; residency's routed demand step runs the second's per-token selection itself):
 //
 //   logits   grid (token tiles of 16, expert groups). A CTA stages its tokens' BF16 rows in
 //            shared memory; each warp takes whole experts, each lane a fixed set of 80 of the
@@ -23,6 +24,7 @@
 // Wide calls use groups of 32 so each token tile is staged fewer times.
 
 #include "moe_common.cuh"
+#include "moe_router_select.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -84,24 +86,8 @@ __global__ void router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int to
   }
 }
 
-// The ordering key of a logit: its BF16 value (fp32 rounded to nearest even, as the
-// checkpoint's router returns it; NaN as -inf; -0 as +0, which compares equal) mapped
-// monotonically onto an unsigned 16-bit number, then 511 - expert -- so a larger key is a larger
-// value or, on equal values, the lower expert. Every key is above 0, the mark of a taken one.
-__device__ __forceinline__ uint32_t pick_key(float logit, int expert) {
-  float v = isnan(logit) ? -INFINITY : logit;
-  if (v == 0.0f) v = 0.0f;
-  uint32_t b = __bfloat16_as_ushort(__float2bfloat16_rn(v));
-  b = (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u);
-  return (b << 16) | static_cast<uint32_t>(kExperts - 1 - expert);
-}
-
-__device__ __forceinline__ float key_value(uint32_t key) {
-  const uint32_t b = key >> 16;
-  const uint16_t bits = static_cast<uint16_t>((b & 0x8000u) ? (b & 0x7FFFu) : (~b & 0xFFFFu));
-  return __bfloat162float(__ushort_as_bfloat16(bits));
-}
-
+// One warp per token: moe_router_select.cuh's select_token, which residency's routed demand step
+// (GitHub #306) runs too.
 __global__ void router_select_kernel(const float *__restrict__ logits, int tokens,
                                      int32_t *__restrict__ ids, float *__restrict__ weights) {
   // Launched as a programmatic dependent of the logits kernel: wait for its results here.
@@ -109,38 +95,7 @@ __global__ void router_select_kernel(const float *__restrict__ logits, int token
   const int lane = threadIdx.x & 31;
   const int t = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   if (t >= tokens) return;
-  constexpr int kPerLane = kExperts / 32;
-  uint32_t keys[kPerLane];
-#pragma unroll
-  for (int i = 0; i < kPerLane; ++i) {
-    keys[i] = pick_key(logits[static_cast<size_t>(t) * kExperts + i * 32 + lane], i * 32 + lane);
-  }
-  float chosen[kTopK];
-#pragma unroll
-  for (int r = 0; r < kTopK; ++r) {
-    uint32_t best = 0;
-#pragma unroll
-    for (int i = 0; i < kPerLane; ++i) best = max(best, keys[i]);
-    const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, best);
-    // Keys are distinct (they carry the expert), so only the owner's matches.
-#pragma unroll
-    for (int i = 0; i < kPerLane; ++i) keys[i] = keys[i] == top ? 0u : keys[i];
-    chosen[r] = key_value(top);
-    if (lane == 0) ids[static_cast<size_t>(t) * kTopK + r] = kExperts - 1 - static_cast<int>(top & 0xFFFFu);
-  }
-  if (lane == 0) {
-    float e[kTopK];
-    float sum = 0.0f;
-#pragma unroll
-    for (int r = 0; r < kTopK; ++r) {
-      e[r] = expf(chosen[r] - chosen[0]);
-      sum += e[r];
-    }
-#pragma unroll
-    for (int r = 0; r < kTopK; ++r) {
-      weights[static_cast<size_t>(t) * kTopK + r] = __bfloat162float(__float2bfloat16_rn(e[r] / sum));
-    }
-  }
+  ignis_moe_select::select_token(logits, t, lane, ids, weights);
 }
 
 }  // namespace
@@ -156,30 +111,42 @@ int32_t prepare_router() {
 
 using namespace ignis_moe;
 
-extern "C" int32_t ignis_moe_router(const void *x, uint32_t tokens, const void *w_router,
-                                    int32_t *ids, float *weights, float *logits, void *stream) {
-  if (x == nullptr || w_router == nullptr || ids == nullptr || weights == nullptr) {
-    return fail("ignis_moe_router: NULL pointer");
-  }
-  if (logits == nullptr) {
-    return fail("ignis_moe_router: the fp32 logits buffer [tokens][512] is required");
-  }
-  if (tokens == 0) return fail("ignis_moe_router: tokens must be at least 1");
+namespace {
+
+// The logits launch, after the checks both entry points make.
+int32_t router_logits(const char *op, const void *x, uint32_t tokens, const void *w_router, float *logits,
+                      cudaStream_t s) {
+  if (x == nullptr || w_router == nullptr) return fail(std::string(op) + ": NULL pointer");
+  if (logits == nullptr) return fail(std::string(op) + ": the fp32 logits buffer [tokens][512] is required");
+  if (tokens == 0) return fail(std::string(op) + ": tokens must be at least 1");
   if ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w_router)) & 15) {
-    return fail("ignis_moe_router: x and w_router must be 16-byte aligned");
+    return fail(std::string(op) + ": x and w_router must be 16-byte aligned");
   }
-  const cudaStream_t s = static_cast<cudaStream_t>(stream);
   const int experts_per_cta = tokens <= kTokenTile ? 4 : 32;
   const int threads = experts_per_cta == 4 ? 128 : 256;
   const dim3 grid((tokens + kTokenTile - 1) / kTokenTile, kExperts / experts_per_cta);
   const int rows = tokens < static_cast<uint32_t>(kTokenTile) ? static_cast<int>(tokens) : kTokenTile;
   const size_t smem = static_cast<size_t>(rows) * kHidden * 2;
-  if (require_prepared("ignis_moe_router", nullptr) != 0) return -1;
+  if (require_prepared(op, nullptr) != 0) return -1;
   router_logits_kernel<<<grid, threads, smem, s>>>(static_cast<const __nv_bfloat16 *>(x),
                                                    static_cast<int>(tokens),
                                                    static_cast<const __nv_bfloat16 *>(w_router),
                                                    experts_per_cta, logits);
-  if (check_launch("ignis_moe_router (logits)") != 0) return -1;
+  return check_launch((std::string(op) + " (logits)").c_str());
+}
+
+}  // namespace
+
+extern "C" int32_t ignis_moe_router_logits(const void *x, uint32_t tokens, const void *w_router, float *logits,
+                                           void *stream) {
+  return router_logits("ignis_moe_router_logits", x, tokens, w_router, logits, static_cast<cudaStream_t>(stream));
+}
+
+extern "C" int32_t ignis_moe_router(const void *x, uint32_t tokens, const void *w_router,
+                                    int32_t *ids, float *weights, float *logits, void *stream) {
+  if (ids == nullptr || weights == nullptr) return fail("ignis_moe_router: NULL pointer");
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  if (router_logits("ignis_moe_router", x, tokens, w_router, logits, s) != 0) return -1;
   const int warps = 8;
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3((tokens + warps - 1) / warps);

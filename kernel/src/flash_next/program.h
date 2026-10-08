@@ -97,7 +97,7 @@ struct FlashNextModel {
   std::unique_ptr<ninfer::DeviceBuffer> residual;    // BF16 [rows][streams * hidden]
   std::unique_ptr<ninfer::DeviceBuffer> x;           // BF16 [rows][hidden]: a sublayer's input
   std::unique_ptr<ninfer::DeviceBuffer> y;           // BF16 [rows][hidden]: its output
-  std::unique_ptr<ninfer::DeviceBuffer> injections;  // fp32 [rows][streams]
+  std::unique_ptr<ninfer::DeviceBuffer> injections;  // fp32 [2][rows][streams]: two mixes' (forward)
   // A call's inputs, staged by the host before the forward: token ids
   // [rows], each lane's slot and first position [lanes], and the n-gram
   // table rows [rows][ngram_heads][ngram_row_bytes].
@@ -105,6 +105,9 @@ struct FlashNextModel {
   std::unique_ptr<ninfer::DeviceBuffer> slots;
   std::unique_ptr<ninfer::DeviceBuffer> positions;
   std::unique_ptr<ninfer::DeviceBuffer> ngram_rows;
+  // A decode round's inputs on the host, page-locked (GitHub #306, step 7): its copies to the
+  // buffers above are then queued without a staging pass through the driver's own.
+  std::unique_ptr<ninfer::PinnedHostBuffer> round_inputs;
   // The MoE block (kern's ignis_moe.h): its workspace and routed
   // accumulator, this layer's router outputs and the next layer's (the
   // lookahead residency ranks), and the shared expert's buffers.
