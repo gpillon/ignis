@@ -51,8 +51,10 @@ Flash-Next blob, every lane stalled). Measured in
   instead of retrying the same copy every advance.
 - **The pace *(agent proposal)*:** one window in flight each way, a new one at
   most once an advance; on Flash-Next 16 MiB onto the device (KV-RAM restores
-  and the KV-disk restore's feed alike) and 12 MiB off it into KV-RAM,
-  `MOVE_IN_WINDOW_BYTES` and `MOVE_OUT_WINDOW_BYTES`, constants, not flags. At
+  and the KV-disk restore's feed alike) and 12 MiB off it (into KV-RAM, and
+  since GitHub #310 the KV-disk spill's copies into its staging, a 32 MiB
+  file window in slices), `MOVE_IN_WINDOW_BYTES` and `MOVE_OUT_WINDOW_BYTES`,
+  constants, not flags. At
   that pace the copies leave a round's time outside its expert stall where it
   was. The 27B moves unpaced (one window): its decode puts nothing on the
   link.

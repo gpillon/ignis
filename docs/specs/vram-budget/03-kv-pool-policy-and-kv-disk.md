@@ -150,7 +150,7 @@ gives the reason for each.
 | Entry rule | a restore never moves anything; entries in rank order; growth branch: free pages ≥ reservation + 4 steps for itself and each resident sequence above it; fixed branch: the reservation fits | *(agent)* |
 | Last resort (growth branch) | every resident sequence parked and no tier takes a victim: the lowest-ranked is re-queued, with an ERROR | *(agent)* |
 | PCIe contention | move out: ITL p50 +10%; move in: ITL p50 +25%; either: max within baseline + 150 ms | *(agent)*, owner to confirm |
-| Move pace (GitHub #309) | a live move goes a window at a time each way, one in flight, at most one new an advance; Flash-Next: `MOVE_IN_WINDOW_BYTES` 16 MiB onto the device (KV-RAM restores, KV-disk restore feeds), `MOVE_OUT_WINDOW_BYTES` 12 MiB off it into KV-RAM, beside the rounds; the 27B: unpaced (one window) | *(agent)*, measured by AC 37 |
+| Move pace (GitHub #309) | a live move goes a window at a time each way, one in flight, at most one new an advance; Flash-Next: `MOVE_IN_WINDOW_BYTES` 16 MiB onto the device (KV-RAM restores, KV-disk restore feeds), `MOVE_OUT_WINDOW_BYTES` 12 MiB off it (into KV-RAM, and a KV-disk spill's copies into its staging since GitHub #310), beside the rounds; the 27B: unpaced (one window) | *(agent)*, measured by AC 37 |
 | KV-disk on | Flash-Next `--kv-disk-bytes 4G` (owner 2026-10-08: 4 GiB to start); 27B `0` | *(owner)* build, *(agent)* sizes |
 | Location | `--kv-disk-path model` (beside the artifact), `auto`, or a directory: the n-gram cache's rule | *(owner)*, confirmed 2026-10-08 |
 | Volume margin | 10 GiB, `KV_DISK_VOLUME_MARGIN_BYTES` | *(agent)* |

@@ -369,9 +369,10 @@ pub struct TransferWindow {
 /// sequence comes back in ~1.3 s.
 pub const MOVE_IN_WINDOW_BYTES: u64 = 16 << 20;
 
-/// The window a live move off the device into KV-RAM keeps on the link
-/// (GitHub #309), one in flight at a time, at most one new one an advance,
-/// against the direction of Flash-Next's expert reads. Measured as
+/// The window a live move off the device keeps on the link -- into KV-RAM
+/// (GitHub #309), and a KV-disk spill's copies into its staging (#310) --
+/// one in flight at a time, at most one new one an advance, against the
+/// direction of Flash-Next's expert reads. Measured as
 /// [`MOVE_IN_WINDOW_BYTES`] is: the other lanes' ITL p50 +3 to +13% over
 /// five runs at this size (AC 37's starting bound is +10%), +11% at 16 MiB
 /// and +37% at 64 MiB; a 1.13 GB sequence leaves in ~1.15 s.
@@ -384,7 +385,8 @@ pub const MOVE_OUT_WINDOW_BYTES: u64 = 12 << 20;
 pub struct TransferPace {
     /// Host to device: a restore from KV-RAM, and a KV-disk restore's feed.
     pub move_in_bytes: u64,
-    /// Device to host: a move into KV-RAM.
+    /// Device to host: a move into KV-RAM, and a KV-disk spill's copies
+    /// off the device.
     pub move_out_bytes: u64,
 }
 

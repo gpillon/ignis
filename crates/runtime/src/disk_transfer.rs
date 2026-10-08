@@ -7,11 +7,14 @@
 //! on the leaf's transfer stream and an IO request on the store's threads,
 //! each polled -- never waited for -- on the model thread.
 //!
-//! - **A spill from the device** copies window `i` into a staging slot (D2H),
-//!   and once its fence has passed hands the slot to the writer, which takes
-//!   the window's CRC and writes it; the other slot meanwhile takes the next
-//!   window. The sequence is untouched until the header page -- written last,
-//!   with every window's CRC -- commits the file; only then is it released.
+//! - **A spill from the device** copies window `i` into a staging slot (D2H)
+//!   in slices of the move-out pace
+//!   ([`TransferPace::move_out_bytes`](crate::TransferPace::move_out_bytes),
+//!   GitHub #310), one on the link at a time, and once its last slice's fence
+//!   has passed hands the slot to the writer, which takes the window's CRC
+//!   and writes it; the other slot meanwhile takes the next window. The
+//!   sequence is untouched until the header page -- written last, with every
+//!   window's CRC -- commits the file; only then is it released.
 //! - **A spill from KV-RAM** writes straight from the blob's span (aligned,
 //!   since the arena places blobs on 4 KiB boundaries), and the span is the
 //!   transfer's until the commit, which frees it.
@@ -65,8 +68,12 @@ pub(crate) struct DiskFile {
 
 /// One window of a transfer, in flight.
 enum Op {
-    /// A spill window copied from the device into `slot`, until `fence`.
-    Copying { index: usize, slot: usize, fence: u64 },
+    /// A slice of a spill window, its bytes up to `upto`, copied from the
+    /// device into `slot`, until `fence`.
+    Copying { index: usize, slot: usize, upto: u64, fence: u64 },
+    /// A spill window copied into `slot` up to `upto`, the rest of it still
+    /// on the device.
+    Copied { index: usize, slot: usize, upto: u64 },
     /// A spill window being written (from `slot`, or straight from the
     /// transfer's own KV-RAM span).
     Writing { index: usize, slot: Option<usize>, ticket: Ticket },
@@ -460,11 +467,12 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                             .transfer_passed(self.model.handle(), *fence)
                             .unwrap_or(true),
                         Op::Writing { ticket, .. } | Op::Reading { ticket, .. } => ticket.poll().is_some(),
-                        Op::Read { .. } => true,
+                        Op::Read { .. } | Op::Copied { .. } => true,
                     };
                     if finished {
                         let slot = match op {
                             Op::Copying { slot, .. }
+                            | Op::Copied { slot, .. }
                             | Op::Reading { slot, .. }
                             | Op::Read { slot, .. }
                             | Op::Feeding { slot, .. } => Some(*slot),
@@ -530,9 +538,12 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         let ops = std::mem::take(&mut tier.transfers[i].ops);
         for op in ops {
             match op {
-                Op::Copying { index, slot, fence } => {
+                Op::Copying { index, slot, upto, fence } => {
                     match self.model.leaf.transfer_passed(self.model.handle(), fence) {
-                        Ok(false) => keep.push_back(Op::Copying { index, slot, fence }),
+                        Ok(false) => keep.push_back(Op::Copying { index, slot, upto, fence }),
+                        Ok(true) if upto < tier.transfers[i].window(index, window_bytes).bytes => {
+                            keep.push_back(Op::Copied { index, slot, upto });
+                        }
                         Ok(true) => {
                             let window = tier.transfers[i].window(index, window_bytes);
                             let bytes = Bytes {
@@ -553,7 +564,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                         }
                         Err(_) => {
                             failed = true;
-                            keep.push_back(Op::Copying { index, slot, fence });
+                            keep.push_back(Op::Copying { index, slot, upto, fence });
                         }
                     }
                 }
@@ -600,46 +611,20 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             return self.write_header(tier, i);
         }
 
+        let from = match &transfer.kind {
+            Kind::Spill { from, .. } => *from,
+            Kind::Restore { .. } => unreachable!("a spill"),
+        };
+        if matches!(from, DiskSource::Device) {
+            return self.copy_spill_slice(tier, i);
+        }
+
         // One new window.
         if transfer.issued < transfer.windows {
             let index = transfer.issued;
             let window = transfer.window(index, window_bytes);
-            let from = match &transfer.kind {
-                Kind::Spill { from, .. } => *from,
-                Kind::Restore { .. } => unreachable!("a spill"),
-            };
             match from {
-                DiskSource::Device => {
-                    let Some(slot) = tier.free_slot() else {
-                        return None;
-                    };
-                    let DiskBlob::Live(request) = tier.transfers[i].blob else {
-                        unreachable!("only a live sequence spills from the device");
-                    };
-                    let dst = &mut tier.slots[slot].buffer.as_mut().as_mut()[..window.bytes as usize];
-                    let issued = {
-                        let sequences = self.sequences.lock().unwrap();
-                        match sequences.get(&request) {
-                            Some(live) => self
-                                .model
-                                .leaf
-                                .snapshot_window(self.model.handle(), &live.handle, window, dst)
-                                .and_then(|()| self.model.leaf.transfer_fence(self.model.handle())),
-                            None => Err(-1),
-                        }
-                    };
-                    match issued {
-                        Ok(fence) => {
-                            tier.transfers[i].ops.push_back(Op::Copying { index, slot, fence });
-                            tier.transfers[i].issued += 1;
-                        }
-                        Err(code) => {
-                            tier.slots[slot].busy = false;
-                            tracing::warn!(name: "ignis.kv_disk.copy_failed", code, "a KV-disk window copy could not be issued");
-                            return Some(DiskOutcome::Failed { op: DiskOp::Write });
-                        }
-                    }
-                }
+                DiskSource::Device => unreachable!("copied off the device a slice at a time"),
                 DiskSource::KvRam => {
                     let (src_ptr, aligned_src) = {
                         let Kind::Spill { source: Some(buf), .. } = &tier.transfers[i].kind else {
@@ -678,6 +663,78 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             }
         }
         None
+    }
+
+    /// A spill from the device puts one slice of the move-out pace on the
+    /// link at a time, at most one new an advance (GitHub #310, as a move
+    /// into KV-RAM does since #309): the rest of a window begun, else the
+    /// next window into a free staging slot. A window goes to the writer
+    /// only once its last slice has landed.
+    fn copy_spill_slice(&self, tier: &mut DiskTier<L>, i: usize) -> Option<DiskOutcome> {
+        let window_bytes = tier.store.window_bytes;
+        let transfer = &tier.transfers[i];
+        if transfer.ops.iter().any(|op| matches!(op, Op::Copying { .. })) {
+            return None;
+        }
+        let begun = transfer.ops.iter().position(|op| matches!(op, Op::Copied { .. }));
+        let (at, index, slot, copied) = match begun {
+            Some(at) => {
+                let Op::Copied { index, slot, upto } = transfer.ops[at] else {
+                    unreachable!("found as a window begun");
+                };
+                (Some(at), index, slot, upto)
+            }
+            None if transfer.issued < transfer.windows => {
+                let index = transfer.issued;
+                let Some(slot) = tier.free_slot() else {
+                    return None;
+                };
+                (None, index, slot, 0)
+            }
+            None => return None,
+        };
+        let DiskBlob::Live(request) = tier.transfers[i].blob else {
+            unreachable!("only a live sequence spills from the device");
+        };
+        let window = tier.transfers[i].window(index, window_bytes);
+        let slice = TransferWindow {
+            offset: window.offset + copied,
+            bytes: self.pace.move_out_bytes.min(window.bytes - copied),
+            blob_bytes: window.blob_bytes,
+        };
+        let dst = &mut tier.slots[slot].buffer.as_mut().as_mut()[copied as usize..(copied + slice.bytes) as usize];
+        let issued = {
+            let sequences = self.sequences.lock().unwrap();
+            match sequences.get(&request) {
+                Some(live) => self
+                    .model
+                    .leaf
+                    .snapshot_window(self.model.handle(), &live.handle, slice, dst)
+                    .and_then(|()| self.model.leaf.transfer_fence(self.model.handle())),
+                None => Err(-1),
+            }
+        };
+        match issued {
+            Ok(fence) => {
+                let copying = Op::Copying { index, slot, upto: copied + slice.bytes, fence };
+                match at {
+                    Some(at) => tier.transfers[i].ops[at] = copying,
+                    None => {
+                        tier.transfers[i].ops.push_back(copying);
+                        tier.transfers[i].issued += 1;
+                    }
+                }
+                None
+            }
+            Err(code) => {
+                // A window begun gives its slot back when the transfer drains.
+                if at.is_none() {
+                    tier.slots[slot].busy = false;
+                }
+                tracing::warn!(name: "ignis.kv_disk.copy_failed", code, "a KV-disk window copy could not be issued");
+                Some(DiskOutcome::Failed { op: DiskOp::Write })
+            }
+        }
     }
 
     /// Every window landed: queue the header page, with every CRC.
