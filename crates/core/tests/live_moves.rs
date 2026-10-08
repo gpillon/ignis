@@ -75,8 +75,8 @@ fn pool(host: u64) -> SchedulerConfig {
 /// Every event of a run, the advance each one came in, and a check run on
 /// every advance: no sequence on the device is ever held out of a round for
 /// pages (AC 35, fixed bullet). A request `Running` before an advance and
-/// still `Running` after it, that did not leave the device in it, emitted a
-/// token in it.
+/// still `Running` after it, that did not leave the device in it and is not
+/// mid-transfer to or from the disk, emitted a token in it.
 struct Run {
     sched: ConcreteScheduler,
     tracked: Vec<RequestId>,
@@ -100,14 +100,14 @@ impl Run {
             .tracked
             .iter()
             .copied()
-            .filter(|&r| self.sched.request_state(r) == Some(RequestState::Running))
+            .filter(|&r| self.sched.request_state(r) == Some(RequestState::Running) && !self.sched.in_transfer(r))
             .collect();
         let out = self.sched.advance();
         for r in running {
             let left = out.iter().any(|e| {
                 matches!(e, SchedEvent::Evicted { request, .. } | SchedEvent::DiskSpilled { request, .. } if *request == r)
             });
-            if self.sched.request_state(r) == Some(RequestState::Running) && !left {
+            if self.sched.request_state(r) == Some(RequestState::Running) && !self.sched.in_transfer(r) && !left {
                 assert!(
                     out.iter().any(|e| matches!(e, SchedEvent::Token { request, .. } if *request == r)),
                     "request {r} stayed on its lane through advance {} and decoded nothing",
@@ -138,6 +138,7 @@ impl Run {
     fn until(&mut self, mut done: impl FnMut(&Self) -> bool) {
         while !done(self) {
             assert!(!self.sched.is_idle(), "the run went idle first");
+            assert!(self.advances < 100_000, "the run never got there");
             self.step();
         }
     }
@@ -380,7 +381,7 @@ fn an_agent_need_never_moves_an_interactive_sequence_nor_a_newer_interactive_an_
 }
 
 #[test]
-fn an_older_interactive_newcomer_moves_the_youngest_agent_first() {
+fn an_interactive_newcomer_moves_the_youngest_agent_first() {
     // Two Agents decode; an Interactive needs one of them out: the
     // latest-submitted goes, the older stays and keeps decoding.
     let compute = Arc::new(MockCompute::new());
@@ -460,22 +461,126 @@ fn a_restore_never_moves_anything_and_waits_for_its_whole_reservation() {
 
 #[test]
 fn restores_are_taken_in_rank_order() {
-    // Two Agents moved out by one Interactive need: the older comes back
-    // first, and the younger only once it fits beside it.
+    // Two Agents moved out by one Interactive need. While it runs, the room
+    // it leaves would take the younger and not the older: the younger waits
+    // all the same, and comes back with the older once there is room for
+    // both.
     let compute = Arc::new(MockCompute::new());
     let mut run = Run::new(ConcreteScheduler::with_config(pool(4), compute.clone()));
-    let older = run.submit(live(1, 380), RequestClass::Agent); // 24 pages
+    let older = run.submit(live(1, 600), RequestClass::Agent); // 38 pages
     let younger = run.submit(live(100, 380), RequestClass::Agent); // 24 pages
     run.steps(3);
-    let i = run.submit(live(200, 760), RequestClass::Interactive); // 48 pages: both out
+    let i = run.submit(live(200, 600), RequestClass::Interactive); // 38 pages: both out
     run.step();
     assert!(run.evicted(older) && run.evicted(younger));
+    while !run.done(i) {
+        assert_eq!(
+            run.state(younger),
+            Some(RequestState::Evicted),
+            "the 26 pages beside I would take the younger, which waits for the older"
+        );
+        run.step();
+    }
     run.to_idle();
     let at = |r: RequestId| run.first(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == r));
     assert!(at(older).is_some() && at(older) <= at(younger), "the older Agent came back first");
-    for (r, max) in [(older, 380), (younger, 380), (i, 760)] {
+    for (r, max) in [(older, 600), (younger, 380), (i, 600)] {
         assert_eq!(run.tokens(r), expected(&compute, r, max));
     }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn rank_order_holds_across_kv_ram_and_the_disk() {
+    // The older Agent's blob is too large for KV-RAM and goes to the disk;
+    // the younger's lands in KV-RAM, a synchronous restore away. While the
+    // Interactive need runs, the younger would fit and the older would not:
+    // the younger waits for the older, whichever tier each is in.
+    let compute = Arc::new(
+        MockCompute::with_sections(MockSections { image_bytes: 0, bytes_per_token: 1 })
+            .with_disk(FakeDisk::with_room(1 << 30)),
+    );
+    let mut run = Run::new(ConcreteScheduler::with_config(
+        SchedulerConfig {
+            host_capacity_bytes: 100,
+            kv_disk_capacity_bytes: 4 * disk_file_bytes(1_000),
+            ..pool(0)
+        },
+        compute.clone(),
+    ));
+    let older = run.submit(input(tokens(1, 300), Some(300)), RequestClass::Agent); // 38 pages, a ~300-byte blob
+    let younger = run.submit(live(1_000, 380), RequestClass::Agent); // 24 pages, a ~10-byte blob
+    run.steps(3);
+    let i = run.submit(live(2_000, 600), RequestClass::Interactive); // 38 pages: both out
+    run.until(|run| run.has(|e| matches!(e, SchedEvent::DiskSpilled { request, .. } if *request == older)));
+    assert!(run.evicted(younger), "the younger went to KV-RAM");
+    while !run.done(i) {
+        assert_eq!(run.state(younger), Some(RequestState::Evicted), "the younger waits for the older");
+        run.step();
+    }
+    run.to_idle();
+    for (r, max) in [(older, 300), (younger, 380), (i, 600)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max));
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_victim_already_on_the_disk_does_not_come_back_into_the_room_it_left() {
+    // An Interactive need two Agents have to leave, one spill at a time. The
+    // first is on the disk while the second's spill runs: its pages are free,
+    // and it would fit back into them, but the need it left for outranks it.
+    // Without that, the two would trade places on the disk forever.
+    let compute = Arc::new(MockCompute::new().with_disk(FakeDisk::with_room(1 << 30)));
+    let mut run = Run::new(ConcreteScheduler::with_config(
+        SchedulerConfig { kv_disk_capacity_bytes: 4 * disk_file_bytes(1), ..pool(0) },
+        compute.clone(),
+    ));
+    let a1 = run.submit(live(1, 380), RequestClass::Agent); // 24 pages
+    let a2 = run.submit(live(100, 380), RequestClass::Agent); // 24 pages
+    run.steps(3);
+    let i = run.submit(live(200, 700), RequestClass::Interactive); // 44 pages: both out
+    run.until(|run| run.has(|e| matches!(e, SchedEvent::PrefillChunk { request, .. } if *request == i)));
+    let entered = run.first(|e| matches!(e, SchedEvent::PrefillChunk { request, .. } if *request == i)).unwrap();
+    for a in [a1, a2] {
+        assert!(
+            run.has(|e| matches!(e, SchedEvent::DiskSpilled { request, .. } if *request == a)),
+            "{a} went to the disk"
+        );
+        assert!(
+            !run.has(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == a)),
+            "{a} did not come back before I entered (advance {entered})"
+        );
+    }
+    run.to_idle();
+    let spills = run.events.iter().filter(|(_, e)| matches!(e, SchedEvent::DiskSpilled { .. })).count();
+    assert_eq!(spills, 2, "each went to the disk once");
+    for (r, max) in [(a1, 380), (a2, 380), (i, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max));
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_need_the_eligible_victims_cannot_cover_moves_nothing() {
+    // An older Interactive and an Agent hold 57 of 64 pages. A newer
+    // Interactive needs 38: the Agent's 19 and the 7 free fall short, and the
+    // older Interactive ranks above it. Nothing moves -- the Agent would only
+    // come back into its own room -- and the newcomer waits for the older one
+    // to finish.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(pool(4), compute.clone()));
+    let j = run.submit(live(1, 600), RequestClass::Interactive); // 38 pages
+    let a = run.submit(live(100, 300), RequestClass::Agent); // 19 pages
+    run.steps(3);
+    let i = run.submit(live(200, 600), RequestClass::Interactive); // 38 pages
+    run.until(|run| run.done(j));
+    assert!(!run.moved_any(), "nothing moved for a need it could not meet");
+    run.to_idle();
+    for (r, max) in [(j, 600), (a, 300), (i, 600)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max));
+    }
+    assert!(!run.moved_any());
     run.assert_no_work_lost();
 }
 

@@ -243,7 +243,7 @@ fn evictions_are_bounded_under_overflow_load() {
     sched.advance(); // step 1: the 8 fillers are dealt onto all 8 lanes
 
     // Three overflow requests: each is blocked (no free lane) and is
-    // admitted by evicting a lane into the (small) host tier -- Interactive,
+    // admitted by evicting a lane into the (small) KV-RAM -- Interactive,
     // so the Agent fillers rank below them (ADR 0045).
     let o1 = sched.submit(input(8), RequestClass::Interactive).unwrap();
     let o2 = sched.submit(input(8), RequestClass::Interactive).unwrap();

@@ -402,8 +402,10 @@ impl HostTier {
     }
 
     /// Every live snapshot held here, in no particular order, with whether it
-    /// is on its way to KV-disk (ADR 0045: entries onto the device are taken
-    /// in rank order, which is not this tier's discard order).
+    /// is moving ([`Self::begin_move_live`]): on KV-RAM's ledger, on its way
+    /// to KV-disk; on KV-disk's, on its way back to the device. ADR 0045:
+    /// entries onto the device are taken in rank order, which is not this
+    /// tier's discard order.
     pub fn live_entries(&self) -> impl Iterator<Item = (&HostEntry, bool)> {
         self.probation
             .iter()

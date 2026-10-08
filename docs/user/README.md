@@ -252,12 +252,13 @@ A request reserves its prompt plus its cap when it is admitted: its
 `max_tokens`, or `--default-max-tokens`. When a request cannot fit, a
 lower-ranked sequence (an `agent` one, for an `interactive` request) moves to
 KV-RAM or [KV-disk](#kv-disk) and later resumes exactly where it stopped.
-Otherwise the request waits until room returns. No request is refused or loses
-work for it. Rank is the class, then the order of arrival: an `agent` request
-never moves an `interactive` one, nor an older `agent` one, and a sequence that
-moved comes back before anything that arrived after it. Without KV-disk (the
-27B's default) KV-RAM can still give a moved sequence up for a newer one, and
-that request is prefilled again, as before.
+Otherwise the request waits until room returns. No request is refused for it,
+and with KV-disk on (Flash-Next's default) none loses work for it; without it
+(the 27B's default) KV-RAM can still give a moved sequence up for a newer one,
+which is then prefilled again, as before. Rank is the class, then the order of
+arrival: an `agent` request never moves an `interactive` one, nor an older
+`agent` one, and a sequence that moved comes back before anything that ranks
+below it.
 
 Below 12 GiB the expert cache refuses the start: decode slows sharply there.
 The message names the knobs that lift it: a smaller `--kv-pool-bytes`,

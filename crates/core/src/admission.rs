@@ -575,27 +575,39 @@ pub fn page_shortage_is_better_victim(candidate: &PageShortageCandidate, incumbe
     candidate.rank.request_id > incumbent.rank.request_id
 }
 
-/// The sequence a shortage of pages for `requester` moves down a tier, or
-/// `None` when nothing ranked below it may go: the requester then waits.
-/// Never the requester, nor one in transfer, a donor or a reserved lane.
+/// Every sequence a shortage of pages for `requester` may move down a tier,
+/// the first victim first: what ranks below it, never the requester, nor one
+/// in transfer, a donor or a reserved lane. Empty when nothing may go: the
+/// requester then waits.
+#[must_use]
+pub fn page_shortage_victims(requester: Rank, candidates: &[PageShortageCandidate]) -> Vec<RequestId> {
+    let mut eligible: Vec<&PageShortageCandidate> = candidates
+        .iter()
+        .filter(|c| {
+            c.rank.request_id != requester.request_id
+                && requester.outranks(&c.rank)
+                && !c.in_transfer
+                && !c.donor
+                && !c.reserved_for_earlier_interactive
+        })
+        .collect();
+    eligible.sort_by(|a, b| {
+        if page_shortage_is_better_victim(a, b) {
+            std::cmp::Ordering::Less
+        } else if page_shortage_is_better_victim(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    eligible.into_iter().map(|c| c.rank.request_id).collect()
+}
+
+/// The sequence a shortage of pages for `requester` moves down a tier first,
+/// [`page_shortage_victims`]'s head.
 #[must_use]
 pub fn choose_page_shortage_victim(requester: Rank, candidates: &[PageShortageCandidate]) -> Option<RequestId> {
-    let mut selected: Option<&PageShortageCandidate> = None;
-    for candidate in candidates {
-        if candidate.rank.request_id == requester.request_id
-            || !requester.outranks(&candidate.rank)
-            || candidate.in_transfer
-            || candidate.donor
-            || candidate.reserved_for_earlier_interactive
-        {
-            continue;
-        }
-        match selected {
-            Some(incumbent) if !page_shortage_is_better_victim(candidate, incumbent) => {}
-            _ => selected = Some(candidate),
-        }
-    }
-    selected.map(|c| c.rank.request_id)
+    page_shortage_victims(requester, candidates).first().copied()
 }
 
 #[cfg(test)]
@@ -1043,6 +1055,24 @@ mod tests {
             choose_page_shortage_victim(requester, &with_one),
             Some(2),
             "the one candidate left, though it would rank last among them all"
+        );
+    }
+
+    #[test]
+    fn the_victims_come_in_the_order_they_would_be_taken() {
+        let candidates = [
+            resident(RequestClass::Interactive, 12, true),
+            resident(RequestClass::Agent, 3, true),
+            resident(RequestClass::Interactive, 2, false),
+            resident(RequestClass::Agent, 5, false),
+            resident(RequestClass::Agent, 7, true),
+            PageShortageCandidate { donor: true, ..resident(RequestClass::Agent, 9, false) },
+        ];
+        assert_eq!(
+            page_shortage_victims(rank(RequestClass::Interactive, 10), &candidates),
+            vec![5, 7, 3, 12],
+            "Agents, the one not decoding first, then the latest; the younger Interactive last; \
+             never the older Interactive nor the donor"
         );
     }
 
