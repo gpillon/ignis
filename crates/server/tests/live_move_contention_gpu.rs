@@ -24,8 +24,10 @@
 //! printed beside it.
 //!
 //! Starting thresholds, for the owner to confirm (printed, not asserted): move
-//! out ITL p50 within +10 %, move in within +25 %, either one's max within the
-//! baseline's max + 150 ms. Asserted: each move happened through its tier, and
+//! out ITL p50 within +10 %; move in within +25 %, read since GitHub #310 on a
+//! step's time outside its expert stall and transfer passes -- what the
+//! transfer adds (owner, 2026-10-08), the raw ITL printed beside it; either
+//! one's max within the baseline's max + 150 ms. Asserted: each move happened through its tier, and
 //! no work was lost -- every request generates its full `max_tokens`, no
 //! `Requeued`, no dropped snapshot, no disk failure. `IGNIS_KV_P3_RAW` names a
 //! directory the raw samples are written to, one JSON file a leg.
@@ -46,7 +48,9 @@
 //! every request generate exactly that (a forced literal, one token a
 //! round): the same text whatever moves. A forced round is never a captured
 //! graph, so a forced run's ITL is not comparable with a free run's; its
-//! misses are.
+//! misses are. AC 43's test forces both of its runs to a committed text
+//! (`tests/fixtures/ac37_text.json`). `IGNIS_AC37_NO_ARRIVALS=1` runs the
+//! control without E0 and E.
 
 #![cfg(feature = "cuda")]
 
@@ -117,16 +121,26 @@ fn input(tokens: Vec<u32>, max_tokens: u32, forced: Option<Vec<u32>>) -> Request
     }
 }
 
-/// What `IGNIS_AC37_FORCE` names every request to generate, by its prompt's
-/// seed (GitHub #310): a run's own `ac37-<leg>-tokens.json`.
-fn forced_texts() -> HashMap<u32, Vec<u32>> {
-    let Some(path) = std::env::var_os("IGNIS_AC37_FORCE") else {
-        return HashMap::new();
-    };
-    let text = std::fs::read_to_string(&path).expect("read IGNIS_AC37_FORCE");
-    let by_seed: HashMap<String, Vec<u32>> = serde_json::from_str(&text).expect("IGNIS_AC37_FORCE is {seed: [tokens]}");
+/// What every request generates, by its prompt's seed (GitHub #310).
+type Texts = HashMap<u32, Vec<u32>>;
+
+/// `{seed: [tokens]}`, as [`Rig::write_texts`] writes it.
+fn read_texts(path: &Path) -> Texts {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let by_seed: HashMap<String, Vec<u32>> = serde_json::from_str(&text).expect("a text file is {seed: [tokens]}");
     by_seed.into_iter().map(|(seed, tokens)| (seed.parse().expect("a seed"), tokens)).collect()
 }
+
+/// What `IGNIS_AC37_FORCE` names every request to generate: a run's own
+/// `ac37-<leg>-tokens.json`. None named, the requests generate freely.
+fn forced_from_env() -> Texts {
+    std::env::var_os("IGNIS_AC37_FORCE").map_or_else(HashMap::new, |path| read_texts(Path::new(&path)))
+}
+
+/// The text AC 43 forces both of its runs to (GitHub #310): what the KV-RAM
+/// leg generated freely on 2026-10-08. Any fixed text serves -- the two runs
+/// only have to generate the same one.
+const AC43_TEXT: &str = "tests/fixtures/ac37_text.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
@@ -154,44 +168,93 @@ struct Rig {
     /// Each request's prompt seed: what names it across runs, whose request
     /// ids differ (GitHub #310).
     seeds: HashMap<RequestId, u32>,
-    /// What each seed is made to generate (`IGNIS_AC37_FORCE`), if anything.
-    forced: HashMap<u32, Vec<u32>>,
+    /// What each seed is made to generate, if anything.
+    forced: Texts,
 }
 
 impl Rig {
     fn new(
         sched: ConcreteScheduler,
         counters: Option<std::sync::Arc<ignis_core::flash_next_counters::FlashNextCounterSource>>,
+        forced: Texts,
     ) -> Self {
-        Self { sched, steps: Vec::new(), counters, seeds: HashMap::new(), forced: forced_texts() }
+        Self { sched, steps: Vec::new(), counters, seeds: HashMap::new(), forced }
     }
 
     /// Submit the prompt of `seed`, `prompt_tokens` long, generating
-    /// `max_tokens` -- the forced text of `seed` when one is named.
+    /// `max_tokens` -- the forced text of `seed` when one is named: as much
+    /// of it as there is, the rest generated freely.
     fn submit(&mut self, seed: u32, prompt_tokens: u32, max_tokens: u32, class: RequestClass) -> RequestId {
-        let forced = self.forced.get(&seed).map(|tokens| {
-            assert!(tokens.len() >= max_tokens as usize, "the forced text of seed {seed} covers its max_tokens");
-            tokens[..max_tokens as usize].to_vec()
-        });
+        let forced = self
+            .forced
+            .get(&seed)
+            .map(|tokens| tokens[..tokens.len().min(max_tokens as usize)].to_vec());
         let id = self.sched.submit(input(prompt(seed, prompt_tokens), max_tokens, forced), class).unwrap();
         self.seeds.insert(id, seed);
         id
     }
 
-    /// What every request generated, by its prompt's seed, as JSON: what
-    /// `IGNIS_AC37_FORCE` reads (GitHub #310).
-    fn write_texts(&self, path: &Path) {
+    /// What every request generated, by its prompt's seed.
+    fn texts(&self) -> std::collections::BTreeMap<u32, Vec<u32>> {
         let mut by_seed: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
         for event in self.events() {
             if let SchedEvent::Token { request, token } = event {
                 by_seed.entry(self.seeds[request]).or_default().push(*token);
             }
         }
-        let rows: Vec<String> = by_seed
+        by_seed
+    }
+
+    /// [`Self::texts`] as JSON: what `IGNIS_AC37_FORCE` reads (GitHub #310).
+    fn write_texts(&self, path: &Path) {
+        let rows: Vec<String> = self
+            .texts()
             .iter()
             .map(|(seed, tokens)| format!("\"{seed}\":{tokens:?}"))
             .collect();
         std::fs::write(path, format!("{{{}}}\n", rows.join(",\n"))).expect("write the generated texts");
+    }
+
+    /// Step `i`'s decode expert misses and stall: differences of the load's
+    /// totals, `None` without the counters.
+    fn residency(&self, i: usize) -> Option<(u64, Duration)> {
+        let totals = |c: &ignis_core::flash_next_counters::FlashNextCounters| {
+            (c.residency.misses.iter().map(|p| p[0]).sum::<u64>(), c.residency.stall_nanos[0])
+        };
+        let now = totals(self.steps[i].counters.as_ref()?);
+        let before = if i == 0 { (0, 0) } else { totals(self.steps[i - 1].counters.as_ref()?) };
+        Some((now.0 - before.0, Duration::from_nanos(now.1 - before.1)))
+    }
+
+    /// Step `i`'s wall time outside its decode expert stall and its transfer
+    /// passes: what a move's copies could add to a round (GitHub #309), and
+    /// what AC 37's move-in bound reads since #310.
+    fn outside_stall(&self, i: usize) -> Duration {
+        let stall = self.residency(i).map_or(Duration::ZERO, |(_, stall)| stall);
+        self.steps[i].wall.saturating_sub(stall).saturating_sub(self.steps[i].pump)
+    }
+
+    /// The steady steps of `from..to` in which every one of `three` decoded,
+    /// each with how many tokens `b1` had generated by its end and its decode
+    /// expert misses (GitHub #310): the rounds AC 43 compares, by B1's token.
+    fn rounds(&self, three: &[RequestId], b1: RequestId, from: usize, to: usize) -> Vec<Round> {
+        let mut b1_tokens = 0;
+        let mut rounds = Vec::new();
+        for i in 0..to {
+            b1_tokens += self.steps[i]
+                .events
+                .iter()
+                .filter(|e| matches!(e, SchedEvent::Token { request, .. } if *request == b1))
+                .count();
+            let steady = !self.steps[i].events.iter().any(|e| matches!(e, SchedEvent::PrefillChunk { .. }))
+                && !self.steps[i].busy_after;
+            if i >= from && steady && self.all_decoded(three, i) {
+                if let Some((misses, _)) = self.residency(i) {
+                    rounds.push(Round { b1_tokens, misses });
+                }
+            }
+        }
+        rounds
     }
 
     /// Every step as one JSON row -- when it ended (Unix ms), its wall time,
@@ -425,7 +488,21 @@ struct Move {
     /// The model thread's time in the transfer passes, each of the move's
     /// steps: the host side of what the move costs a round.
     pump: Vec<Duration>,
+    /// Each of the move's steps outside its expert stall and its transfer
+    /// passes ([`Rig::outside_stall`]), and the baseline's steps alike.
+    outside: Vec<Duration>,
+    baseline_outside: Vec<Duration>,
+    /// What the p50 bound reads (GitHub #310): the ITL, or -- for a move in,
+    /// whose rounds' expert misses are the text's (AC 43) -- the step time
+    /// outside the expert stall, which is what the transfer adds.
+    bound_on: BoundOn,
     p50_bound: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundOn {
+    Itl,
+    OutsideStall,
 }
 
 impl Move {
@@ -437,10 +514,16 @@ impl Move {
         let (p50, max) = stats(&self.itl);
         let (b50, bmax) = stats(&self.baseline);
         let (e50, emax) = stats(&self.early_baseline);
-        let p50_ok = p50 <= b50 * (1.0 + self.p50_bound);
+        let (o50, _) = stats(&self.outside);
+        let (bo50, _) = stats(&self.baseline_outside);
+        let verdict = |ok: bool, on: BoundOn| match (on == self.bound_on, ok) {
+            (false, _) => format!("bound on {:?}", self.bound_on),
+            (true, true) => format!("bound +{:.0} %: within", self.p50_bound * 100.0),
+            (true, false) => format!("bound +{:.0} %: OVER", self.p50_bound * 100.0),
+        };
         let max_ok = max <= bmax + 150.0;
         println!(
-            "{leg:?} {}: {} bytes in {:.1} ms ({:.2} GB/s) over {} step(s); ITL p50 {p50:.2} ms vs {b50:.2} ms ({:+.1} %, bound +{:.0} %: {}), \
+            "{leg:?} {}: {} bytes in {:.1} ms ({:.2} GB/s) over {} step(s); ITL p50 {p50:.2} ms vs {b50:.2} ms ({:+.1} %, {}), \
              max {max:.2} ms vs {bmax:.2} ms ({:+.1} ms, bound +150 ms: {}); {} gaps against {} (B1' and B2' at width 2, taken last); \
              against the pair taken first: p50 {:+.1} % (vs {e50:.2} ms), max {:+.1} ms (vs {emax:.2} ms)",
             self.name,
@@ -449,14 +532,19 @@ impl Move {
             self.gbps(),
             self.steps,
             (p50 / b50 - 1.0) * 100.0,
-            self.p50_bound * 100.0,
-            if p50_ok { "within" } else { "OVER" },
+            verdict(p50 <= b50 * (1.0 + self.p50_bound), BoundOn::Itl),
             max - bmax,
             if max_ok { "within" } else { "OVER" },
             self.itl.len(),
             self.baseline.len(),
             (p50 / e50 - 1.0) * 100.0,
             max - emax,
+        );
+        println!(
+            "{leg:?} {}: a step outside its expert stall and transfer passes, p50 {o50:.2} ms vs {bo50:.2} ms ({:+.1} %, {})",
+            self.name,
+            (o50 / bo50 - 1.0) * 100.0,
+            verdict(o50 <= bo50 * (1.0 + self.p50_bound), BoundOn::OutsideStall),
         );
         let (pump50, pump_max) = stats(&self.pump);
         println!(
@@ -468,7 +556,7 @@ impl Move {
     fn json(&self, pace: ignis_runtime::TransferPace) -> String {
         let list = |v: &[Duration]| v.iter().map(|d| format!("{:.3}", ms(*d))).collect::<Vec<_>>().join(",");
         format!(
-            "{{\"move\":\"{}\",\"pace_in_bytes\":{},\"pace_out_bytes\":{},\"bytes\":{},\"duration_ms\":{:.3},\"gb_per_s\":{:.3},\"steps\":{},\"itl_ms\":[{}],\"baseline\":\"B1' and B2' alone at width 2, taken last\",\"baseline_itl_ms\":[{}],\"early_baseline_itl_ms\":[{}],\"pump_ms\":[{}]}}",
+            "{{\"move\":\"{}\",\"pace_in_bytes\":{},\"pace_out_bytes\":{},\"bytes\":{},\"duration_ms\":{:.3},\"gb_per_s\":{:.3},\"steps\":{},\"itl_ms\":[{}],\"baseline\":\"B1' and B2' alone at width 2, taken last\",\"baseline_itl_ms\":[{}],\"early_baseline_itl_ms\":[{}],\"pump_ms\":[{}],\"outside_stall_ms\":[{}],\"baseline_outside_stall_ms\":[{}]}}",
             self.name,
             pace.move_in_bytes,
             pace.move_out_bytes,
@@ -480,6 +568,8 @@ impl Move {
             list(&self.baseline),
             list(&self.early_baseline),
             list(&self.pump),
+            list(&self.outside),
+            list(&self.baseline_outside),
         )
     }
 }
@@ -517,7 +607,23 @@ impl Drop for BlobDir {
     }
 }
 
-fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
+/// One width-3 round (C, B1 and B2 decoding): how many tokens B1 had
+/// generated by its end, and its decode expert misses (GitHub #310).
+#[derive(Debug, Clone, Copy)]
+struct Round {
+    b1_tokens: usize,
+    misses: u64,
+}
+
+/// What a leg measured: its moves, its width-3 rounds after C came back, and
+/// the text every request generated.
+struct Leg {
+    moves: Vec<Move>,
+    after_restore: Vec<Round>,
+    texts: std::collections::BTreeMap<u32, Vec<u32>>,
+}
+
+fn leg(tier: Tier, pace: ignis_runtime::TransferPace, forced: Texts) -> Option<Leg> {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(FLASH_NEXT_DIR), PathBuf::from);
     let path = dir.join(ARTIFACT_FILE_NAME);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
@@ -573,7 +679,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         ));
         return None;
     }
-    let mut rig = Rig::new(sched, reserved.flash_next.clone());
+    let mut rig = Rig::new(sched, reserved.flash_next.clone(), forced);
     let interactive = RequestClass::Interactive;
 
     // ── the width-2 baseline: two lanes alone ──────────────────────────────
@@ -660,9 +766,10 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         .unwrap_or(rig.steps[restored].at - rig.steps[restored].wall - rig.steps[in_start].at);
     rig.to_idle();
 
-    // ── width 3 before any arrival and after C is back (GitHub #309: whether
-    //    what the rounds of the move in cost is the move's, or the state the
-    //    arrivals left behind) ─────────────────────────────────────────────
+    // ── width 3 before any arrival and after C is back, for the record:
+    //    the two are at other tokens, and what the lanes generate decides
+    //    their expert misses (GitHub #310) -- AC 43 compares the rounds after
+    //    the restore with the same text unmoved ─────────────────────────────
     let three = [c, b[0], b[1]];
     let width3_steps = |from: usize, to: usize| {
         rig.steady(from, to).into_iter().filter(|&i| rig.all_decoded(&three, i)).collect::<Vec<_>>()
@@ -673,11 +780,11 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
     let (after50, _) = stats(&rig.itl_in(&b, &after));
     println!(
         "{tier:?} width 3 (C, B1, B2), B1's and B2's ITL p50: {before50:.2} ms over {} steps before any arrival, \
-         {after50:.2} ms over {} steps after C came back ({:+.1} %)",
+         {after50:.2} ms over {} steps after C came back -- other tokens, not the move's cost (AC 43)",
         before.len(),
         after.len(),
-        (after50 / before50 - 1.0) * 100.0
     );
+    let after_restore = rig.rounds(&three, b[0], restored + 1, rig.mark());
 
     // ── the baseline: two fresh lanes alone at width 2, last ───────────────
     let b9 = [
@@ -699,7 +806,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         early_itl.len(),
         late_itl.len()
     );
-    let measured = |name, bytes, duration, steps: &[usize], p50_bound| {
+    let measured = |name, bytes, duration, steps: &[usize], bound_on, p50_bound| {
         let n = steps.len().max(1);
         let (late_first, late_last) = window(&late, n);
         let (early_first, early_last) = window(&width2, n.min(width2.len()));
@@ -712,6 +819,13 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
             baseline: rig.itl(&b9, late_first, late_last),
             early_baseline: rig.itl(&b0, early_first, early_last),
             pump: steps.iter().map(|&i| rig.steps[i].pump).collect(),
+            outside: steps.iter().map(|&i| rig.outside_stall(i)).collect(),
+            baseline_outside: late
+                .iter()
+                .filter(|&&i| (late_first..=late_last).contains(&i))
+                .map(|&i| rig.outside_stall(i))
+                .collect(),
+            bound_on,
             p50_bound,
         }
     };
@@ -719,9 +833,12 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         Tier::KvRam => ("move out (device -> KV-RAM)", "move in (KV-RAM -> device)"),
         Tier::KvDisk => ("move out (device -> KV-disk)", "move in (KV-disk -> device)"),
     };
+    // GitHub #310 (owner, 2026-10-08): the move-in bound is the transfer's,
+    // what its copies add to a round outside the expert stall; the rounds'
+    // misses are the text's (AC 43).
     let moves = vec![
-        measured(out_name, bytes, out_duration, &out_steps, 0.10),
-        measured(in_name, bytes, in_duration, &in_steps, 0.25),
+        measured(out_name, bytes, out_duration, &out_steps, BoundOn::Itl, 0.10),
+        measured(in_name, bytes, in_duration, &in_steps, BoundOn::OutsideStall, 0.25),
     ];
 
     // ── no work lost ───────────────────────────────────────────────────────
@@ -739,14 +856,15 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         rig.write_timeline(&dir.join(format!("ac37-{tier:?}-steps.json")));
         rig.write_texts(&dir.join(format!("ac37-{tier:?}-tokens.json")));
     }
+    let texts = rig.texts();
     drop(rig);
     drop(blobs);
-    Some(moves)
+    Some(Leg { moves, after_restore, texts })
 }
 
 fn measure(tier: Tier) {
     let pace = pace();
-    let Some(moves) = leg(tier, pace) else {
+    let Some(Leg { moves, .. }) = leg(tier, pace, forced_from_env()) else {
         return;
     };
     for m in &moves {
@@ -776,18 +894,24 @@ fn a_live_move_through_kv_disk_beside_decoding_lanes() {
     measure(Tier::KvDisk);
 }
 
+/// What the control measured: its width-3 rounds, all of them, and the text
+/// every request generated (GitHub #310).
+struct Control {
+    rounds: Vec<Round>,
+    texts: std::collections::BTreeMap<u32, Vec<u32>>,
+}
+
 /// The control for the rounds after a move (GitHub #309): the same requests
 /// on a pool with room for E beside C, so that nothing moves. Width-3 rounds
 /// (C, B1, B2) before any arrival and after E has ended are compared, with
-/// the expert cache's misses and its stall per round: whether what the
-/// rounds pay after a move is the move's, or the long arrival's.
-#[test]
-#[ignore = "GPU profile only: the real Flash-Next artifact, minutes"]
-fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
+/// the expert cache's misses and its stall per round. Without `arrivals`
+/// neither E0 nor E is sent (GitHub #310): what the rounds after them cost
+/// without the long arrival's prefill.
+fn control(forced: Texts, arrivals: bool) -> Option<Control> {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(FLASH_NEXT_DIR), PathBuf::from);
     let path = dir.join(ARTIFACT_FILE_NAME);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
-        return;
+        return None;
     }
     let blobs = BlobDir(
         std::env::var_os("IGNIS_KV_DISK_TEST_DIR")
@@ -823,10 +947,10 @@ fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
         Ok(loaded) => loaded,
         Err(e) => {
             gpu_profile::skip_or_fail(&format!("load the Flash-Next scheduler for the control: {e}"));
-            return;
+            return None;
         }
     };
-    let mut rig = Rig::new(sched, reserved.flash_next.clone());
+    let mut rig = Rig::new(sched, reserved.flash_next.clone(), forced);
     let interactive = RequestClass::Interactive;
     let c = rig.submit(1, C_PROMPT, C_TOKENS, RequestClass::Agent);
     rig.until_tokens(c, 4);
@@ -839,10 +963,12 @@ fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
     let width3_from = rig.mark();
     rig.until_tokens(b[0], 16 + WIDTH3_TOKENS);
     let width3_to = rig.mark();
-    let e0 = rig.submit(4, E0_PROMPT, E_TOKENS, interactive);
-    rig.until(|rig| rig.finished_at_length(e0));
-    let e = rig.submit(5, E_PROMPT, E_TOKENS, interactive);
-    rig.until(|rig| rig.finished_at_length(e));
+    if arrivals {
+        let e0 = rig.submit(4, E0_PROMPT, E_TOKENS, interactive);
+        rig.until(|rig| rig.finished_at_length(e0));
+        let e = rig.submit(5, E_PROMPT, E_TOKENS, interactive);
+        rig.until(|rig| rig.finished_at_length(e));
+    }
     let e_done = rig.mark();
     rig.until(|rig| rig.finished_at_length(b[0]));
     let after_to = rig.mark();
@@ -869,15 +995,134 @@ fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
     let before = phase(width3_from, width3_to);
     let after = phase(e_done, after_to);
     println!(
-        "control, nothing moved: width 3 (C, B1, B2) before any arrival: {} steps, B1's and B2's ITL p50 {:.2} ms, \
+        "control, nothing moved{}: width 3 (C, B1, B2) before any arrival: {} steps, B1's and B2's ITL p50 {:.2} ms, \
          {:.1} decode misses and {:.2} ms of expert stall a step; after E ended: {} steps, {:.2} ms, {:.1} misses, {:.2} ms",
-        before.0, before.1, before.2, before.3, after.0, after.1, after.2, after.3
+        if arrivals { "" } else { ", no arrivals (\"after E\": the same rounds on)" },
+        before.0,
+        before.1,
+        before.2,
+        before.3,
+        after.0,
+        after.1,
+        after.2,
+        after.3
     );
     if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
         std::fs::create_dir_all(&dir).expect("the raw samples' directory");
         rig.write_timeline(&dir.join("ac37-control-steps.json"));
         rig.write_texts(&dir.join("ac37-control-tokens.json"));
     }
+    let rounds = rig.rounds(&three, b[0], 0, after_to);
+    let texts = rig.texts();
     drop(rig);
     drop(blobs);
+    Some(Control { rounds, texts })
+}
+
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact, minutes"]
+fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
+    // `IGNIS_AC37_NO_ARRIVALS=1`: the same run without E0 and E (GitHub #310).
+    let arrivals = std::env::var_os("IGNIS_AC37_NO_ARRIVALS").is_none();
+    let _ = control(forced_from_env(), arrivals);
+}
+
+/// The median misses of `rounds`, `NaN` when there are none.
+fn median_misses(rounds: &[u64]) -> f64 {
+    let mut v = rounds.to_vec();
+    v.sort_unstable();
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v[(v.len() - 1) / 2] as f64
+}
+
+/// AC 43 (spec vram-budget/03, GitHub #310): the rounds after a restore miss
+/// what the same text misses unmoved.
+///
+/// A round's expert misses are those of what its lanes generate, and the
+/// moved leg and its control generate different text once their batches
+/// differ (greedy decode is not batch-invariant). So both are made to
+/// generate one recorded text ([`AC43_TEXT`], or `IGNIS_AC37_FORCE`): the
+/// KV-RAM leg of AC 37, and the control with E0 and E arriving and nothing
+/// moved. The width-3 rounds after C's restore are compared with the
+/// control's at the same tokens -- aligned by B1's token index; C is some
+/// 260 tokens further on in the control, which its text (a token never
+/// repeated) does not make a different cost. Starting bound, for the owner
+/// to confirm (printed, not asserted): from the first round after the
+/// restore, each window of 200 rounds' median misses within +10% of the
+/// control's over the same tokens. Asserted: the two runs generated the
+/// same text, and no work was lost (AC 37's leg asserts it). A forced round
+/// is never a captured graph, so the runs' ITL are not compared.
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact, ~8 minutes"]
+fn the_rounds_after_a_restore_miss_what_the_same_text_misses_unmoved() {
+    let text = match std::env::var_os("IGNIS_AC37_FORCE") {
+        Some(_) => forced_from_env(),
+        None => read_texts(&Path::new(env!("CARGO_MANIFEST_DIR")).join(AC43_TEXT)),
+    };
+    for (seed, max_tokens) in [(1, C_TOKENS), (2, B1_TOKENS), (3, B2_TOKENS)] {
+        assert!(
+            text.get(&seed).is_some_and(|t| t.len() >= max_tokens as usize),
+            "the text covers every compared lane's max_tokens (seed {seed})"
+        );
+    }
+    let Some(moved) = leg(Tier::KvRam, pace(), text.clone()) else {
+        return;
+    };
+    let Some(unmoved) = control(text, true) else {
+        return;
+    };
+    for m in &moved.moves {
+        m.print(Tier::KvRam);
+    }
+    for seed in [1, 2, 3] {
+        let (a, b) = (&moved.texts[&seed], &unmoved.texts[&seed]);
+        let n = a.len().min(b.len());
+        assert_eq!(a[..n], b[..n], "seed {seed} generated the same text in both runs");
+    }
+    let unmoved_at: HashMap<usize, u64> = unmoved.rounds.iter().map(|r| (r.b1_tokens, r.misses)).collect();
+    let pairs: Vec<(u64, u64)> = moved
+        .after_restore
+        .iter()
+        .filter_map(|r| Some((r.misses, *unmoved_at.get(&r.b1_tokens)?)))
+        .collect();
+    assert!(pairs.len() >= 200, "{} width-3 rounds after the restore met the control's tokens", pairs.len());
+    let windows = |size: usize| {
+        pairs
+            .chunks(size)
+            .filter(|w| w.len() == size)
+            .map(|w| {
+                let moved = median_misses(&w.iter().map(|p| p.0).collect::<Vec<_>>());
+                let unmoved = median_misses(&w.iter().map(|p| p.1).collect::<Vec<_>>());
+                (moved, unmoved, (moved / unmoved - 1.0) * 100.0)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (first10, _) = pairs.split_at(10);
+    println!(
+        "AC 43: the first 10 rounds after the restore, misses a round, moved / the same text unmoved: {:?}",
+        first10
+    );
+    for (size, bound) in [(50, None), (200, Some(10.0))] {
+        let w = windows(size);
+        let worst = w.iter().map(|x| x.2).fold(f64::NEG_INFINITY, f64::max);
+        let listed: Vec<String> = w.iter().map(|(m, u, d)| format!("{m:.0}/{u:.0} ({d:+.1} %)")).collect();
+        println!(
+            "AC 43: {}-round windows from the restore on, median misses moved/unmoved: {}; worst {worst:+.1} %{}",
+            size,
+            listed.join(", "),
+            bound.map_or(String::new(), |b| format!(
+                ", bound +{b:.0} % from the first window: {}",
+                if worst <= b { "within" } else { "OVER" }
+            )),
+        );
+    }
+    let all_moved = median_misses(&pairs.iter().map(|p| p.0).collect::<Vec<_>>());
+    let all_unmoved = median_misses(&pairs.iter().map(|p| p.1).collect::<Vec<_>>());
+    println!(
+        "AC 43: all {} rounds after the restore: median misses {all_moved:.0} moved, {all_unmoved:.0} unmoved ({:+.1} %)",
+        pairs.len(),
+        (all_moved / all_unmoved - 1.0) * 100.0
+    );
 }
