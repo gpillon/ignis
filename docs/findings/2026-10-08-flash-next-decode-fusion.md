@@ -38,9 +38,15 @@ between `4a84693` and `cddc29b` (this study's base) touches `kernel/`,
 then charges every instant of every round to the main-chain node(s) running;
 when only side-branch nodes run (the shared expert, the lookahead router and
 rank/resolve, the prefetch copy) the instant is "exposed branch", and when
-nothing runs it is a gap charged to the next main node. Floors are each class's
-weight and state bytes at 1.79 TB/s (activations ignored; FP8 = 1 byte per
-weight; the GDN recurrent state is read and written, 6.3 MB per layer).
+nothing runs it is a gap charged to the next main node.
+
+**Floors** are each class's weight and state bytes at 1.79 TB/s, activations
+ignored, FP8 one byte per weight. `anatomy.py` computes them for the linears,
+the mixes, the router and the experts (15.3 MB per layer at the study's K mix);
+three were added by hand: the GDN recurrent state, read and written (6.3 MB a
+layer, 127 µs), the n-gram projections (18 µs) and the head's final mix (4 µs).
+The side branch's own floors are off the critical path and not in the total:
+the shared expert 4.9 MB a layer (132 µs a round), the lookahead router 69 µs.
 
 Node tracing stretches the kernels: the replay span is 9.39 ms with 1.68 ms of
 demand copies, so 7.71 ms of kernels, gaps and exposed branch work, against the
@@ -49,15 +55,15 @@ untraced 9.85 - 1.84 - 0.87 = 7.14 ms. The "scaled" column multiplies by
 
 | class (per round) | nodes | traced µs | scaled µs | floor µs | above floor |
 |---|---:|---:|---:|---:|---:|
-| HC mix (96 mixes: norm, down, up + reduce) | 288 | 1,664 | 1,541 | 360 | **1,181** |
-| HC inject (96) | 96 | 100 | 93 | 0 | 93 |
-| routed experts (48) | 48 | 1,413 | 1,308 | 410 | **898** |
+| HC mix (96 mixes: norm, down, up + reduce) | 288 | 1,643 | 1,521 | 356 | **1,165** |
+| HC inject (96) | 96 | 101 | 93 | 0 | 93 |
+| routed experts (48) | 48 | 1,416 | 1,310 | 410 | **900** |
 | MoE router on the main stream (logits + select) | 96 | 185 | 172 | 70 | 102 |
 | residency `resolve_demand` (1 CTA) | 48 | 254 | 235 | 0 | 235 |
-| MoE combine | 48 | 233 | 215 | 0 | 215 |
-| GDN qkv / z / out GEMVs (FP8) | 108 | 1,452 | 1,344 | 1,160 | 184 |
-| GDN a / b GEMVs (48 rows, 6 CTAs each) | 72 | 286 | 265 | 5 | 260 |
-| GDN conv, gating, recurrence, gated norm | 144 | 289 | 267 | 127 | 140 |
+| MoE combine | 48 | 234 | 217 | 0 | 217 |
+| GDN qkv / z / out GEMVs (FP8) | 108 | 1,463 | 1,354 | 1,160 | 194 |
+| GDN a / b GEMVs (48 rows, 6 CTAs each) | 72 | 288 | 267 | 5 | 262 |
+| GDN conv, gating, recurrence, gated norm | 144 | 290 | 269 | 127 | 142 |
 | QSA q / o GEMVs | 24 | 394 | 364 | 316 | 48 |
 | QSA k / v GEMVs | 24 | 99 | 92 | 18 | 74 |
 | QSA indexer projection + 4 small kernels | 60 | 108 | 100 | 11 | 89 |
@@ -65,39 +71,58 @@ untraced 9.85 - 1.84 - 0.87 = 7.14 ms. The "scaled" column multiplies by
 | QSA attention chain (prepare, hq rows, append, attend, combine, gate) | 72 | 293 | 271 | 0 | 271 |
 | n-gram add (layer 1) | 5 | 37 | 34 | 18 | 16 |
 | embed + head (final mix, GEMV, sampling) | 7 | 402 | 372 | 359 | 13 |
-| side branch exposed (shared expert, lookahead, prefetch copy) | - | 138 | 128 | - | 128 |
-| gaps between nodes | - | 58 | 53 | - | 53 |
-| **kernels** | 1,200 main + 330 branch | 7,715 | **7,141** | **2,854** | **4,287** |
+| side branch exposed (shared expert, lookahead, prefetch copy) | - | 139 | 129 | - | 129 |
+| gaps between nodes | - | 58 | 54 | - | 54 |
+| **kernels** | 1,200 main + 331 branch | 7,715 | **7,141** | **2,850** | **4,291** |
 | demand copies (untraced stall timer) | 48 | 1,679 | 1,840 | - | - |
 | device idle between replays (untraced) | - | - | 870 | - | - |
 | **token** | | | **9,850** | | |
 
 - **The gaps are not the cost.** A graph replay starts each node 0.1 µs after
   its dependency; gaps sum to 58 µs a round. The 4.3 ms above the floor is
-  *inside* nodes: ~1,200 main-chain launches, most of them a few µs of fixed
-  launch, ramp and tail around little or no traffic (`resolve_demand` 5.3 µs and
-  `router_select` 3.8 µs on one CTA, the a/b GEMVs 4 µs each for 0.07 µs of
-  bytes, `hc_inject` 1.0 µs, `gating` 1.1 µs).
-- **The large GEMVs are near their floor** (qkv 17.5 µs for 26.2 MB, 84%; the
-  head 378 µs for 636 MB, 94%): 0.23 ms above floor in all.
+  *inside* the ~1,200 main-chain launches.
+- **Per-launch fixed cost, quantified.** The smallest nodes, with no traffic to
+  speak of, take 0.95-1.15 µs (`hc_inject` 1.05, `gating` 1.08, `gated_norm`
+  1.15, `append_tail` 0.95, `select` 0.96 mean per call;
+  `.scratch/fusion/names-n1lane.txt`): about 1 µs is the bare cost of a launch in
+  a replay, ~1.2 ms over 1,200 launches. The rest above the floor is serial
+  latency inside small kernels: single-CTA reductions and dependent loads
+  (`resolve_demand` 5.3 µs and `router_select` 3.8 µs on one CTA, the a/b
+  GEMVs 4 µs each for 0.07 µs of bytes, `hc_norm` 6.3 µs on four CTAs).
+- **The large GEMVs are near their floor** (qkv 17.7 µs for 26.2 MB, 83%; the
+  head 378 µs for 636 MB, 94%): 0.26 ms above floor in all.
 - **The QSA indexer's `score_kernel` launches 1,024 CTAs** (its grid is sized for
   the graph's 262,144-token bound) of which at this ~2K context ~8 have blocks
   to score; it still takes 25.8 µs a layer. Why the empty CTAs cost that much
   was not isolated.
-- Grouped, the 4.29 ms above the floor: the HC mix and inject 1.27 ms (30%), the
+- Grouped, the 4.29 ms above the floor: the HC mix and inject 1.26 ms (29%), the
   routed experts 0.90 (21%), the QSA small kernels 0.72 (17%), the MoE routing,
   residency and combine 0.55 (13%), the GDN small kernels 0.40 (9%), the large
-  GEMVs 0.23 (6%), exposed branch work and gaps 0.18 (4%).
-- `cudaGraphLaunch` submits the 1,531 nodes in 0.42-0.46 ms untraced (2026-10-06);
-  it is part of the 0.87 ms between replays, with the host's sync return,
-  n-gram gather and staging.
+  GEMVs and head 0.26 (6%), exposed branch work, gaps and the n-gram add 0.20
+  (5%).
+- `cudaGraphLaunch` submitted the 2026-10-06 round's 1,774 nodes in 0.42-0.46 ms
+  untraced (~0.25 µs a node); today's 1,531 nodes were not timed untraced. The
+  submission is part of the 0.87 ms between replays, with the host's sync
+  return, n-gram gather and staging.
 
-At three lanes (`n3lane`, same tool, 74 rounds, the trace stretched the round
-from 27.5 to 39.2 ms) the demand copies hold 21.1 of 34.6 ms traced and every
-kernel class grows less than the lane count (HC mix 1.98 ms, experts 2.47,
-GDN core 1.09): three lanes stay link-bound, as the headroom finding says.
+At three lanes (`n3lane`, same tool, 74 rounds; node tracing stretched the round
+from 27.5 to 39.2 ms) the demand copies hold 21.1 of 34.6 ms traced. The HC mix
+(1.66 -> 1.98 ms) and the experts (1.41 -> 2.47) grow far less than the lane
+count, the GDN core (0.29 -> 1.09) and `resolve_demand` (0.25 -> 0.88) about
+as much. Three lanes stay link-bound, as the headroom finding says.
 
 ### 2. The prototype: the HC norm folded into its down launch
+
+**Why this bucket.** The HC mix is the largest class above its floor (1.17 ms),
+and within it `hc_norm` is the one node that can go without a grid-wide
+dependency: it normalizes each stream separately, and each down CTA owns one
+stream. Folding `hc_up_reduce` too would need every down partial before any up
+output, a grid-wide barrier that costs about the launch it removes and needs all
+CTAs co-resident while the side branch holds SMs; the routed experts (0.90 ms)
+are a kernel design problem with two failed restructurings
+([2026-10-05](2026-10-05-moe-decode-is-structure-bound.md)), not a merge.
+`hc_norm` held 6.27 µs a mix in situ, 609 µs traced per round over its 97 mixes
+(0.56 ms scaled; `.scratch/fusion/names-n1lane.txt`).
 
 **What changed** (`kernel/src/flash_next/hc.cu`, ours under ADR 0043; no
 vendored file). A decode-route mix was three launches: `hc_norm` (one CTA per
@@ -110,51 +135,63 @@ code (`norm_stream`, the same strided square sum and block reduce), then takes
 order); the 41st CTA of each stream writes the normed rows `hc_up_reduce` reads
 and the inject partials (`inject_partials`, `hc_norm`'s code). Every value is
 computed by the same code in the same order as before, so the mix's bits do not
-change. `IGNIS_FN_HC_FUSED=0` at load restores the three launches
-(`fn_hc_set_decode_fused` for tests).
+change. The switch is on by default; `IGNIS_FN_HC_FUSED=0` at load restores the
+three launches (`fn_hc_set_decode_fused` for tests), process-wide.
 
 **The microbenchmark** (`ignis_kernel_flash_next_hc_bench --fused 0|1`, FP8
 weights cycled over 24 sets so they stream from DRAM, 48 mixes per graph, median
-replay per mix, two runs each, agreeing to 0.1 µs):
+replay per mix; two runs each agree to 0.1 µs, `.scratch/fusion/hcbench2.log`;
+rows 4, 5 and 8 fused from a build with the row ceiling raised to 8,
+`hcbench-ceiling8.log`):
 
 | rows | 1 | 2 | 3 | 4 | 5 | 8 |
 |---|---:|---:|---:|---:|---:|---:|
-| three launches, µs per mix | 14.19 | 15.87 | 18.07 | 19.88 | 21.57 | 27.74 |
-| fused, µs per mix | **10.63** | 12.52 | 16.53 | 20.11 | 23.68 | 35.26 |
+| three launches, µs per mix | 14.25 | 15.82 | 18.10 | 19.85 | 21.76 | 27.65 |
+| fused, µs per mix | **10.65** | 12.50 | 16.65 | 20.13 | 23.79 | 35.12 |
 
 Every down CTA normalizes each row in turn, so the fused launch loses past three
 rows; the route takes it at up to three (the default decode lanes) and keeps
 three launches past that (MTP verify rounds, wider loads).
 
 **Correctness.**
-- CTest (`test_flash_next_hc.cu`, new arm): fused against three launches on
-  rows 1, 2, 3, 4, 8 and 9, BF16 and FP8 projections and both mixed formats, with
-  and without the inject: `x` and the injection weights equal bit for bit, and a
-  captured mix is 2 kernel nodes fused and 3 unfused at up to three rows, the
-  same count either way past them. Red first: with the switch stubbed, 24 checks
-  failed (the launch counts). A deliberately wrong fused norm (`eps * 2` in the
-  FP8 launch) fails the bit checks. The fp64-reference arms, which now run the
-  fused route at rows 1 and 3, pass as before.
-- `flash_next_forward_gpu` under the GPU profile, fused route on: 3/3, G1
-  102/102, decode equals prefill on G1 real text (0 flips in 224 tokens), the
-  arbitrary-id flips the test's header records and 2026-10-06 measured (3 wider
-  at one lane, 3 + 1 near-tie at three), graph replay equal to eager.
-- `flash_next_serving_gpu` did not run: its fixed load shape (prompt reuse, the
-  2 GiB KV-RAM arena) needs ~48.5 GB of host RAM and the host had 45.4 GB
-  available; it refused at the host plan, before any kernel. The served legs
-  below run the same scheduler, prefill chunks and one- and three-lane rounds
-  through the HTTP server.
+- CTest (`test_flash_next_hc.cu`, new arm; `.scratch/fusion/hc-ctest.log`):
+  fused against three launches on rows 1, 2, 3, 4, 8 and 9, BF16 and FP8
+  projections and both mixed formats, with and without the inject, each run over
+  a scratch arena poisoned with NaN: `x` and the injection weights equal bit for
+  bit, and a captured mix is 2 kernel nodes fused and 3 unfused at up to three
+  rows, the same count either way past them. `IGNIS_FN_HC_FUSED=0` at the first
+  mix keeps three launches. The fp64-reference arms run the fused route at rows
+  1 and 3 and pass as before.
+- The test's power: red first with the switch stubbed (24 launch-count failures,
+  at rows 1-3 and 8, the arm's row ceiling then; run interactively, not logged);
+  a fused norm with `eps * 2` fails the bit checks (interactive); a fused launch
+  whose writer CTA writes no normed rows, and one whose down CTAs write no
+  partials, fail 33 checks each, 18 of them the new arm's
+  (`hc-ctest-mutA.log`, `hc-ctest-mutB.log`).
+- `flash_next_forward_gpu` under the GPU profile, fused route on
+  (`.scratch/fusion/forward-gpu.log`): 3/3, G1 102/102, decode equals prefill on
+  G1 real text (0 flips in 224 tokens), the arbitrary-id flips the test's header
+  records and 2026-10-06 measured (3 wider at one lane, 3 + 1 near-tie at
+  three), graph replay equal to eager.
+- **`flash_next_serving_gpu` did not run** (`.scratch/fusion/serving-gpu.log`):
+  its fixed load shapes need 38.9-42.1 GB of host RAM plus the plan's 6 GiB
+  margin, and the host had 45.4 GB available; all three tests refused at the
+  host plan, before any kernel. The served legs below run the same scheduler,
+  prefill chunks and one- and three-lane rounds through the HTTP server, but not
+  what that test adds (a second turn resumed from a checkpoint, retained slots).
 - Served: every leg below generated the same text, request for request
   (SHA-256 of the streamed content, one lane and three).
 
 **Served A-B-A.** `.scratch/fusion/aba/rate.sh`: the release build of this
-branch, `fn-study/rate`'s flags (`make config MODEL=flash-next` plus
+branch at `cff4ee1` (the review fixes after it touch no kernel path),
+`fn-study/rate`'s flags (`make config MODEL=flash-next` plus
 `--kv-host-pool-bytes 0 --retained-host 0 --metrics`), one exe, the switch by
 environment. One lane: the three distinct greedy prompts one after another
 (1,800 tokens each: a story, a compilers essay, a travel diary; not one text
 repeated, which flattered the cache in the earlier harness). Then the three
-prompts as three concurrent lanes for 100 s. Six legs in two GPU lock holds, in
-the order A1 B1 A2 | B2 A3 B3; A = three launches, B = fused.
+prompts as three concurrent lanes for 100 s (each lane runs its prompt twice,
+alike in both arms). Six legs in two GPU lock holds, in the order A1 B1 A2 |
+B2 A3 B3; A = three launches, B = fused.
 
 | leg | 1 lane tok/s (story / essay / diary) | 1 lane ms per token, pooled | stall per token | expert cache | 3 lanes aggregate (req 1 / req 2) |
 |---|---|---:|---:|---:|---|
@@ -166,19 +203,20 @@ the order A1 B1 A2 | B2 A3 B3; A = three launches, B = fused.
 | B3 | 100.9 / 86.1 / 97.2 | 10.61 | 2.92 ms | **15.32 GB** | 102.6 / 103.5 |
 
 - **One lane: -0.47 ms per token, +4.5%.** B1 and B2 10.35-10.38 ms against A2
-  and A3 10.81-10.85, the same on each text (+3.9 to +5.2%). A1, the session's
-  first leg, ran slow with a higher stall on the same traffic (the testing
-  runbook's cold machine) and is left out. B3 loaded with 0.22 GB less expert
-  cache (the desktop held more VRAM at its load): 1.6 more misses and +0.14 ms
-  of stall per token, which accounts for half its smaller gain (-0.22 ms).
+  and A3 10.81-10.85; per text +3.9 to +4.9% (B1/B2 against A2/A3). A1, the
+  session's first leg, ran 0.84 ms slower than A2/A3 on the same traffic, 0.18
+  ms of it a higher stall and the rest unexplained (the testing runbook's cold
+  first leg); it is left out. B3 loaded with 0.22 GB less expert cache (the
+  desktop held more VRAM at its load): 1.6 more misses and +0.14 ms of stall per
+  token, about half of its smaller gain (-0.22 ms).
 - **Three lanes: neutral.** Aggregates 102.6-108.4 tok/s in both arms, following
   each leg's stall (5.0-5.3 ms per token), as a link-bound round does; the
-  microbenchmark's 1.6 µs per mix at three rows (~0.15 ms of a 27.5 ms round) is
+  microbenchmark's 1.5 µs per mix at three rows (~0.15 ms of a 27.5 ms round) is
   below this harness's resolution.
-- **The traced node time predicted it.** `hc_norm` held 6.3 µs a mix in situ
-  (0.61 ms traced, 0.57 scaled, over 97 mixes); the fused launch gives back 0.47
-  ms of it. The microbenchmark's 3.6 µs a mix (0.35 ms) under-predicts: in situ
-  the norm was the slower part, as 2026-10-06 also found.
+- **The removed node predicted it.** `hc_norm` held 0.56 ms (scaled) a round in
+  situ; the fused launch gives back 0.47 ms of it. The microbenchmark's 3.6 µs a
+  mix (0.35 ms) under-predicts: in situ the norm was the slower part, as
+  2026-10-06 also found.
 - These texts are harder than the headroom study's repeated one (hit rate 95.2
   against 96.6%, 65 against 52 MB a token), so the base is 92.5 tok/s, not 101.5.
 
@@ -188,42 +226,61 @@ Observed:
 
 1. **The one-lane round's kernels are 7.14 ms against a 2.85 ms bandwidth floor;
    the 4.29 ms above it is inside ~1,200 main-chain launches, not between
-   them** (58 µs of gaps a round). The HC mix and inject hold 1.27 ms of it, the
-   routed experts 0.90, the QSA small kernels 0.72 (the indexer's 1,024-CTA
-   `score_kernel` alone 0.29), the MoE routing, residency and combine 0.55, the
-   GDN small kernels 0.40; the large GEMVs run at 84-94% of bandwidth.
+   them** (58 µs of gaps a round). About 1 µs a launch is bare launch cost; the
+   rest is serial latency inside small kernels. The HC mix and inject hold 1.26
+   ms of it, the routed experts 0.90, the QSA small kernels 0.72 (the indexer's
+   1,024-CTA `score_kernel` alone 0.29), the MoE routing, residency and combine
+   0.55, the GDN small kernels 0.40; the large GEMVs run at 83-94% of bandwidth.
 2. **Folding the HC norm into the mix's down launch removes 97 launches a round
    and 0.47 ms per one-lane token (+4.5%), bit for bit** (the CTest, the forward
-   test, and identical served texts), neutral at three lanes.
-3. **A fused launch pays back about what the removed node held in situ** (0.47
-   of 0.57 ms): the node-level anatomy is a usable predictor for the next
-   merges; the microbenchmark is not (it under-predicted by a third).
-4. **Fusion has a row ceiling.** Folding serial per-row work into every CTA wins
-   at 1-3 rows and loses from 4 (8 rows: 27.7 -> 35.3 µs).
+   test, identical served texts), neutral at three lanes. The serving GPU test
+   could not run on this host's free RAM.
+3. **The fused launch gave back 0.47 of the 0.56 ms the removed node held in
+   situ**; the microbenchmark predicted 0.35.
+4. **The fold has a row ceiling.** Serial per-row work in every CTA wins at 1-3
+   rows and loses from 4 (8 rows: 27.7 -> 35.1 µs).
 
-Inferred: see Implications; every figure there is an estimate from the anatomy
-table and finding 3, not a measurement.
+Inferred:
+
+- From finding 3, one merge: the node-level anatomy predicts a merge's gain to
+  ~80% where the removed node's time is mostly fixed cost; the microbenchmark
+  does not. A merge that moves real work into another kernel (the combine, the
+  score) may pay back less.
+- Everything under Implications is an estimate from the anatomy table and that
+  ratio, not a measurement.
+
+**The prototype stays on the branch** (`fusion`), not merged: it is clean,
+tested and a clear one-lane win, but the serving GPU test has not run on it
+(it needs a host with ~48.5 GB of RAM available, or the test's shapes made to
+fit), and the switch is a process-wide environment variable where the leaf's
+route choices are load options (`ignis_moe_workspace.decode_route`). Since the
+fused route's bits equal the three launches', merging it can simply drop the
+switch.
 
 ## Implications
 
 ### The fusion plan
 
 Ordered by risk; one-lane gains estimated as each merge's removed in-situ node
-time at finding 3's ~80% pay-back (inferred). "Bits" says whether the merge
-keeps the reduction order (bit-exact) or not. None touches a vendored file
-except where named; `hc.cu`, `fp8_linear.cu`, `moe_*.cu`, `residency.cu`,
-`gdn.cu`, `qsa*.cu` and `indexer.cu` are ours (ADR 0043).
+time at ~80% pay-back (inferred, one data point). "Bits" says whether the merge
+keeps the reduction order. Where it does not, the gates' tolerances apply: the
+forward test holds decode to prefill except at near-ties (one BF16 ulp at the
+top logit) and G1 at 100% on real text, the MoE block test holds the routed sum
+to 1.5e-2 relative L2 against the recording (`moe_artifact_gpu`), and the HC
+CTest's fp64 arms to 2^-6 of the stream terms. None of the steps touches a
+vendored file except where named; `hc.cu`, `fp8_linear.cu`, `moe_*.cu`,
+`residency.cu`, `gdn.cu`, `qsa*.cu` and `indexer.cu` are ours (ADR 0043).
 
 | step | what merges | est. one lane | bits | effort, risk |
 |---|---|---:|---|---|
 | 1 | HC norm into the down launch (**this prototype**) | **-0.47 ms, measured** | exact | done |
 | 2 | the inject (and after MoE the combine) into the next mix's down launch: each down CTA rebuilds its stream as `residual + bf16(y * inj)`, with the residual and the injection weights double-buffered so no CTA reads what another writes; `hc_up_reduce` writes the new residual | -0.25 ms (inject 0.09 + combine 0.20) | exact (same expressions) | medium: crosses `ignis_moe_combine`'s zeroing contract and the n-gram add at layer 1 |
 | 3 | `score_kernel` over the visible blocks only (a grid sized to the card, striding to the row's block count, read on the device) | -0.25 ms at short context, less at long | exact (same per-block dot) | small; first explain the 25.8 µs of mostly empty CTAs with a microbenchmark |
-| 4 | GDN: a and b in the z GEMV's launch (one grouped FP8 GEMV, a row segment table), gating into conv | -0.25 ms | exact (row-wise) | small-medium; `fp8_gemv_kernel` is ours. The recurrence is vendored (`kernel/vendor/.../gated_delta_net/recurrent.cu`): merging the gated norm or the conv into it is an ADR 0031 patch, not counted here |
+| 4 | GDN: a and b in the z GEMV's launch (one grouped FP8 GEMV, a row segment table), gating into conv | -0.25 ms | exact (row-wise) | small-medium; `fp8_gemv_kernel` is ours. The recurrence is vendored (`kernel/vendor/src/ops/linear_attention/gated_delta_net/recurrent.cu`): merging the gated norm or the conv into it is an ADR 0031 patch, not counted here |
 | 5 | MoE routing: `router_select` and `resolve_demand` in one single-CTA launch, the select taken by `router_logits`' last CTA | -0.2 ms | exact | medium: crosses the residency ABI (`ignis_residency_step_demand`) |
 | 6 | QSA: k and v in one launch, `append_hq` into `hq_rows`, `gate` into the combine | -0.1 ms | exact | small |
-| 7 | launch structure: ~470 fewer nodes after 1-6 (`cudaGraphLaunch` ~0.3 µs a node: -0.13 ms); the next round's graph launched before its token is known, its first node waiting on a device flag the host sets after staging (submission off the path: up to -0.4 ms); host-gap fixes 2, 3 and 5 of 2026-10-06 (-0.1) | -0.4 to -0.6 ms | exact | medium; the device-side wait is new to the leaf |
-| 8 | the routed-experts kernel from ~29 to ~18 µs a layer | -0.5 ms | order changes (split-K) unless designed not to | high: two restructurings failed (2026-10-05/06); a design question, not a merge |
+| 7 | launch structure: ~470 fewer nodes after 1-6 (at ~0.25 µs a node: -0.12 ms); the next round's graph launched before its token is known, its first node waiting on a device flag the host sets after staging (submission off the path: up to -0.4 ms); host-gap fixes 2, 3 and 5 of 2026-10-06 (-0.1) | -0.4 to -0.6 ms | exact | medium; the device-side wait is new to the leaf |
+| 8 | the routed-experts kernel from ~29 to ~18 µs a layer | -0.5 ms | order changes (split-K) unless designed not to; then the MoE test's 1.5e-2 and the forward test's near-tie rule | high: two restructurings failed (2026-10-05/06); a design question, not a merge |
 
 A persistent per-layer or per-round kernel ("megakernel") is the end state of
 steps 1-7; it is not proposed as a first step (the side branches, the residency
@@ -264,22 +321,29 @@ copies and 1,531 heterogeneous nodes make it a rewrite).
 - The served A-B-A: two clean legs per arm at one lane (B3 on a smaller cache),
   one session, contexts under 2K, greedy prose. Three-lane noise (~4%) hides
   anything under ~2%.
-- Every step after 1 is an estimate; finding 3's pay-back ratio comes from one
-  merge. Step 8 has no design.
+- `flash_next_serving_gpu` was not run on the fused route (host RAM); the GPU
+  profile as a whole was not run, only the HC CTest and `flash_next_forward_gpu`.
+- Every step after 1 is an estimate; the pay-back ratio comes from one merge,
+  and steps 2, 3 and 5 move work rather than only remove a launch. Step 8 has no
+  design.
 - `score_kernel`'s cost with ~1,016 empty CTAs is not explained.
 
 Raw material, untracked, in the main checkout's `.scratch/fusion/`:
-`anatomy.py` (`python anatomy.py <capture.sqlite> [lanes]`), `anatomy-n1lane.txt`,
-`anatomy-n3lane.txt` (the captures are the headroom study's
-`.scratch/fn-study/link/n{1,3}lane.sqlite`: they embed the environment, never
-commit them), `hcbench.log`, `aba/` (`rate.sh`, `seq_client.py`, the leg logs,
-`/metrics` snapshots and per-request records with text hashes, `aba-summary.txt`,
-`aba2-summary.txt`), `forward-gpu.log`, `serving-gpu.log`.
+`anatomy.py` (`python anatomy.py <capture.sqlite> [lanes]`), `names.py`,
+`anatomy-n1lane.txt`, `anatomy-n3lane.txt`, `names-n1lane.txt` (the captures are
+the headroom study's `.scratch/fn-study/link/n{1,3}lane.sqlite`: they embed the
+environment, never commit them), `hcbench.log`, `hcbench2.log`,
+`hcbench-ceiling8.log`, `hc-ctest.log`, `hc-ctest-mutA.log`, `hc-ctest-mutB.log`,
+`mutate.py`, `forward-gpu.log`, `serving-gpu.log`, `aba/` (`rate.sh`,
+`seq_client.py`, the legs' server logs, `/metrics` snapshots and per-request
+records with text hashes, `aba-summary.txt`, `aba2-summary.txt`).
 
 ## Follow-ups
 
 - Status in https://github.com/gpillon/ignis/issues/306: steps 2-7 are the
   decode-headroom kernel and launch items, in the order above.
+- Before merging step 1: `flash_next_serving_gpu` on a host with the RAM it
+  needs, and the switch dropped or made a load option.
 - `score_kernel`'s empty-CTA cost: a microbenchmark before step 3.
 - The experts kernel (step 8) needs a design that keeps 340 CTAs busy at one
   token without the second wave; the 2026-10-05 finding's phase trace is still
