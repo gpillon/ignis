@@ -3,13 +3,17 @@
 //
 // ignis_moe_experts_decode_trace runs a decode route's kernel instantiated with %globaltimer
 // stamps (nanoseconds, comparable across SMs). The trace holds IGNIS_MOE_TRACE_UNITS unit
-// records, then one record per CTA of the launch, each IGNIS_MOE_TRACE_WORDS u64:
-//   unit (at its ticket):  0 (SM id << 32) | CTA   1 kind (0 gate/up, 1 down) | u << 8 | block << 16 | split << 24
-//                          2 begin   3 ready (the unit's operands in place: gate/up its rotated
-//                          activations; down h, after the wait, rotated)   4 multiplied
-//                          5 end (sums added and the arrival counted; for the eighth gate/up
-//                          arrival, after it published h)   6 down: ns waiting for h; gate/up: 1
-//                          on the arrival that ran the SwiGLU   7 0
+// records, then one record per CTA of the launch, each IGNIS_MOE_TRACE_WORDS u64. Words 0 and 1
+// of a unit are (SM id << 32) | CTA and kind (0 gate/up, 1 down) | u << 8 | block << 16 | split
+// << 24; the rest depend on the kernel:
+//   register kernel (moe_decode.cu)  2 begin   3 ready (gate/up: its rotated activations; down:
+//       h, after the wait, rotated)   4 multiplied   5 end (sums added and the arrival counted;
+//       for the eighth gate/up arrival, after it published h)   6 down: ns waiting for h;
+//       gate/up: 1 on the arrival that ran the SwiGLU
+//   staged kernel (moe_decode_staged.cu)  2 the mma warps start waiting for the item's operand
+//       3 operand and stage ready   4 multiplied   5 sums left in the output buffer   6 ns the aux
+//       warps waited for the stage   7 the producer issued the copies   8, 9 the aux warps'
+//       prepare   10, 11 their reduction
 //   CTA (at IGNIS_MOE_TRACE_UNITS + blockIdx.x):  0 entry   1 first ticket known   2 exit   3 SM id
 // Ticket order is the route's own; a record left zero was not reached.
 #ifndef IGNIS_MOE_TRACE_H
@@ -19,7 +23,7 @@
 
 #include <stdint.h>
 
-#define IGNIS_MOE_TRACE_WORDS 8
+#define IGNIS_MOE_TRACE_WORDS 12
 // Units of the largest decode call (8 tokens, 80 distinct experts, 40 gate/up + 20 down units
 // each, at the finest split any route uses: room for 4x that).
 #define IGNIS_MOE_TRACE_UNITS (4 * 80 * 60)
@@ -64,6 +68,7 @@ struct UnitStamps {
   unsigned long long begin = 0, ready = 0, mma = 0, end = 0, extra = 0;
 };
 
+// The register kernel's record of one unit.
 __device__ __forceinline__ void trace_unit(unsigned long long *trace, int ticket, int kind, int u, int block, int split,
                                            const UnitStamps &st) {
   if (threadIdx.x != 0 || ticket >= kTraceUnits) return;
@@ -76,7 +81,6 @@ __device__ __forceinline__ void trace_unit(unsigned long long *trace, int ticket
   r[4] = st.mma;
   r[5] = st.end;
   r[6] = st.extra;
-  r[7] = 0;
 }
 
 __device__ __forceinline__ unsigned long long *trace_cta(unsigned long long *trace) {

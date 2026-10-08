@@ -5,43 +5,47 @@
 //
 // The register ticket kernel (moe_decode.cu) holds a unit's weights in registers, so a CTA asks
 // DRAM for its next unit only after it has multiplied the current one: the card reads in waves
-// with the bus idle between them, and every unit pays its operand loads and rotation in full
-// before it multiplies. Here one CTA per SM runs two roles:
+// with the bus idle between them, and every unit pays its operand loads, its rotation and its
+// reduction in full on the warps that multiply. Here one CTA per SM runs three roles, each on
+// its own warps, handing work items along through shared memory:
 //
 //   producer  one warp takes the work items by ticket (one ahead), reads their slots and issues
-//             every byte an item needs -- its trellis tiles, its channel scales, its activations
-//             or the gate/up sums it consumes -- as cp.async copies into one of two stages of
-//             shared memory, then signals the stage's `full` barrier; it refills a stage as soon
-//             as the compute warps release it, so the next item's bytes are in flight while the
-//             current one is multiplied.
-//   compute   sixteen warps take the stages in order: prepare the item's fp16 operand from the
-//             stage, decode the trellis tiles from shared memory straight into m16n8k16 B
-//             fragments (16 tiles per warp), release the stage, and add the item's result.
+//             every byte an item needs from the record -- its trellis tiles and channel scales --
+//             and the tokens' inputs, as cp.async copies into one of two stages; the stage's
+//             `full` barrier completes when they land. It refills a stage as soon as the other
+//             roles release it, so the next item's bytes are in flight while one is multiplied.
+//   aux       four warps prepare each item's fp16 operand from its stage into one of two A
+//             buffers (`a_full`), and reduce the previous item's result from the output buffer
+//             (`o_full`, then `o_empty`): the sums, the fences and the arrival counts.
+//   mma       sixteen warps decode the trellis tiles from the stage straight into m16n8k16 B
+//             fragments, 16 tiles per warp, and leave the raw sums in the output buffer. They
+//             wait on nothing but their operands.
 //
 // Work items, 256 tiles (65,536 weights) each, all gate/up items first, then all down items:
 //
 //   gate/up (expert u, block b in 0..4, k-split s in 0..9)
-//       gate block b and up block b (256 columns, one 16-column tile per warp) over the inputs
-//       256 s .. 256 s + 255: the tokens' inputs times suh, the 128-wide Hadamard, one
-//       power-of-two scale per token into fp16; the pre-rotation sums go into the int64
-//       fixed-point gate/up accumulator, and the item counts one arrival on (u, b).
+//       gate block b and up block b (256 columns, one 16-column tile per mma warp) over the
+//       inputs 256 s .. 256 s + 255: the tokens' inputs times suh, the 128-wide Hadamard, one
+//       power-of-two scale per token into fp16. The aux warps add the pre-rotation sums into the
+//       int64 fixed-point gate/up accumulator and count one arrival on (u, b).
 //   down (expert u, h block j in 0..4, column block c in 0..4)
-//       its producer waits for (u, j)'s ten arrivals and stages gate and up block j's sums; the
-//       compute warps rotate both, apply svh and SwiGLU (h's block j), rotate h_j o suh_down into
-//       fp16, multiply the block's 8 k-tiles against 512 down columns (two tiles per warp), apply
-//       the output Hadamard per 128 columns, svh and each selecting token's routing weight, and
-//       add the result into the fixed-point output accumulator. Each of h block j's five readers
-//       adds 16 to (u, j)'s counter once it has its copy; the fifth zeroes the block's sums and
-//       the counter.
+//       its producer waits for (u, j)'s ten arrivals; the aux warps read gate and up block j's
+//       sums, rotate both, apply svh and SwiGLU (h's block j), rotate h_j o suh_down into fp16;
+//       the mma warps multiply the block's 8 k-tiles against 512 down columns (two tiles per
+//       warp); the aux warps apply the output Hadamard per 128 columns, svh and each selecting
+//       token's routing weight, and add the result into the fixed-point output accumulator. Each
+//       of h block j's five readers adds 16 to (u, j)'s counter once it has read the sums; the
+//       fifth zeroes them and the counter.
 //
 // The reduction is order-independent where it crosses items (integer sums) and fixed inside an
 // item, so the result is deterministic. Against the register kernel only where partial sums
 // round differs: the gate/up k-split is 256 inputs instead of 640 (an fp32 MMA chain of 16
 // k-tiles instead of 40 before the conversion to fixed point), and down is summed over h's five
 // blocks in fixed point instead of in one fp32 chain over 640 inputs, the output Hadamard taken
-// per block (it is linear). Each fp16 operand rounds as before: the scale is a power of two, now
-// per 256 (gate/up) or 128 (down) inputs instead of per 640, which moves no rounding of a normal
-// number.
+// per block (it is linear). Each fp16 operand scale is a power of two, now per 256 (gate/up) or
+// 128 (down) inputs instead of per 640, which moves no rounding of a normal number; the ~1e-7
+// difference in the gate/up sums reaches the output only by flipping the fp16 rounding of a few
+// of h's entries (test_moe_decode_routes).
 //
 // Deadlock-free: a CTA takes tickets in increasing order and works them in order, every gate/up
 // ticket precedes every down ticket, and nothing a gate/up item does waits on another CTA -- so
@@ -59,9 +63,12 @@
 namespace ignis_moe {
 namespace {
 
-constexpr int kComputeWarps = 16;
-constexpr int kComputeThreads = kComputeWarps * 32;
-constexpr int kThreads = kComputeThreads + 32;  // + the producer warp
+constexpr int kMmaWarps = 16;
+constexpr int kAuxWarps = 4;
+constexpr int kAuxThreads = kAuxWarps * 32;
+constexpr int kAuxWarp0 = kMmaWarps;                   // aux warps 16..19
+constexpr int kProducerWarp = kMmaWarps + kAuxWarps;  // warp 20
+constexpr int kThreads = (kProducerWarp + 1) * 32;
 constexpr int kStages = 2;
 constexpr int kItemTiles = 256;
 constexpr int kGuSplit = 256;                              // gate/up item inputs
@@ -78,28 +85,28 @@ constexpr uint32_t kReaderStep = 16;                       // a down reader's co
 constexpr uint32_t kLastReader = kGuArrivals + (kDnColBlocks - 1) * kReaderStep;
 constexpr int kMaxWeightBytes = kItemTiles * 16 * 8;       // 32 KiB: 256 tiles at K = 4
 
-static_assert(kGuKTiles * 16 == kGuSplit && kComputeWarps * kGuKTiles == kItemTiles, "gate/up item shape");
-static_assert(kDnCols / 16 == 2 * kComputeWarps && kComputeWarps * 2 * kDnKTiles == kItemTiles, "down item shape");
-static_assert(kStagedMaxTokens * kTopK <= kDecodeMaxUnique, "unique experts of a call");
+static_assert(kMmaWarps * kGuKTiles == kItemTiles, "gate/up item shape");
+static_assert(kDnCols / 16 == 2 * kMmaWarps && kMmaWarps * 2 * kDnKTiles == kItemTiles, "down item shape");
+static_assert(kStagedMaxTokens <= kAuxWarps && kStagedMaxTokens * kTopK <= kDecodeMaxUnique, "tokens of a call");
 
-// Bytes past the weights in a stage: a gate/up item's suh slice and x slice, or a down item's
-// gate and up sums, suh_down block, svh_down columns and the gate/up svh of its h block.
-__host__ __device__ constexpr int stage_extra_bytes(int tokens) { return 2048 * tokens + 1792; }
+// A stage's bytes past the weights: a gate/up item's suh slice and x slice, or a down item's
+// suh_down block, svh_down columns and the gate/up svh of its h block.
+constexpr int kGuSuh = 0;  // fp16 [256], then x bf16 [tokens][256]
+constexpr int kGuX = 512;
+constexpr int kDnSuh = 0;    // fp16 [128]
+constexpr int kDnSvh = 256;  // fp16 [512]
+constexpr int kDnSvhGu = 256 + 1024;  // fp16 [gate 128 | up 128]
+__host__ __device__ constexpr int stage_extra_bytes(int tokens) {
+  return 512 + 512 * tokens > kDnSvhGu + 512 ? 512 + 512 * tokens : kDnSvhGu + 512;
+}
 __host__ __device__ constexpr int stage_bytes(int tokens) {
   return (kMaxWeightBytes + stage_extra_bytes(tokens) + 127) / 128 * 128;
 }
-// Dynamic shared memory of a launch for `tokens`: the stages and A. (A down item's fp32 output
-// exchange reuses its own stage's weights once they are multiplied.)
+__host__ __device__ constexpr int abuf_bytes(int tokens) { return (tokens * kAStride * 2 + 127) / 128 * 128; }
+// Dynamic shared memory of a launch for `tokens`: the stages, two A buffers and the output buffer.
 __host__ __device__ constexpr int dynamic_bytes(int tokens) {
-  return kStages * stage_bytes(tokens) + (tokens * kAStride * 2 + 127) / 128 * 128;
+  return kStages * stage_bytes(tokens) + 2 * abuf_bytes(tokens) + tokens * kDnCols * 4;
 }
-
-// Offsets inside a stage's extras.
-constexpr int kGuSuh = 0;  // fp16 [256]; x bf16 [tokens][256] follows at 512
-constexpr int kGuX = 512;
-__host__ __device__ constexpr int dn_suh(int tokens) { return 2048 * tokens; }  // sums int64 [tokens][256] first
-__host__ __device__ constexpr int dn_svh(int tokens) { return 2048 * tokens + 256; }
-__host__ __device__ constexpr int dn_svh_gu(int tokens) { return 2048 * tokens + 256 + 1024; }
 
 enum Kind : int { kGateUp = 0, kDown = 1, kEnd = 2 };
 
@@ -113,6 +120,16 @@ struct Header {
   unsigned long long issued;  // kTrace: when the producer issued the copies
 };
 
+// What the aux warps' prepare leaves beside an item's A buffer for the mma warps and for its own
+// reduction later: the header, each token's operand scale and, for a down item, svh_down's 512
+// columns (its stage is released before the reduction).
+struct Meta {
+  Header h;
+  float scale[kStagedMaxTokens];
+  uint32_t reader_before;  // down: the counter (u, j) held before this reader's 16
+  alignas(16) __half svh[kDnCols];
+};
+
 struct Shared {
   int n_unique;
   int unique_id[kDecodeMaxUnique];
@@ -120,10 +137,13 @@ struct Shared {
   float unique_w[kDecodeMaxUnique][kDecodeMaxTokens];
   int slot_of[kDecodeMaxTokens * kTopK];
   int first[kDecodeMaxTokens * kTopK];
-  unsigned long long full[kStages];
-  unsigned long long empty[kStages];
+  unsigned long long full[kStages];   // producer -> aux, mma: the stage's bytes landed
+  unsigned long long empty[kStages];  // aux, mma -> producer: the stage is read
+  unsigned long long a_full[2];       // aux -> mma: A buffer and meta ready
+  unsigned long long o_full;          // mma -> aux: the output buffer holds an item's sums
+  unsigned long long o_empty;         // aux -> mma: the output buffer is read
   Header header[kStages];
-  float scale[kStagedMaxTokens];
+  Meta meta[2];
 };
 
 // The card's per-block shared-memory ceiling (sm_120: 99 KiB) holds the widest launch.
@@ -157,6 +177,19 @@ __device__ __forceinline__ void mbar_arrive(unsigned long long *bar) {
 __device__ __forceinline__ void mbar_arrive_on_copies(unsigned long long *bar) {
   asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_addr(bar)) : "memory");
 }
+__device__ __forceinline__ bool mbar_test(unsigned long long *bar, uint32_t parity) {
+  uint32_t done;
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+      "selp.u32 %0, 1, 0, p;\n"
+      "}\n"
+      : "=r"(done)
+      : "r"(smem_addr(bar)), "r"(parity)
+      : "memory");
+  return done != 0;
+}
 __device__ __forceinline__ void mbar_wait(unsigned long long *bar, uint32_t parity) {
   asm volatile(
       "{\n"
@@ -168,10 +201,8 @@ __device__ __forceinline__ void mbar_wait(unsigned long long *bar, uint32_t pari
       "r"(parity)
       : "memory");
 }
-// The compute warps' own barrier (the producer warp never joins it).
-__device__ __forceinline__ void compute_sync() {
-  asm volatile("bar.sync 1, %0;\n" ::"n"(kComputeThreads) : "memory");
-}
+// The aux warps' own barrier.
+__device__ __forceinline__ void aux_sync() { asm volatile("bar.sync 1, %0;\n" ::"n"(kAuxThreads) : "memory"); }
 
 __device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
   uint32_t v;
@@ -186,9 +217,55 @@ __device__ __forceinline__ void copy_chunks(char *dst, int chunks, Src src) {
   for (int i = lane; i < chunks; i += 32) cp_async16(dst + 16 * i, src(i));
 }
 
+// The distinct experts of the call, as build_unique (moe_decode_common.cuh) leaves them, from a
+// copy of the ids and weights in shared memory: one round trip to global memory.
+__device__ void unique_experts(Shared &s, const int32_t *ids, const float *weights, int tokens) {
+  __shared__ int32_t sid[kStagedMaxTokens * kTopK];
+  __shared__ float sw[kStagedMaxTokens * kTopK];
+  const int n = tokens * kTopK;
+  const int i = threadIdx.x;
+  if (i < n) {
+    sid[i] = ids[i];
+    sw[i] = weights[i];
+  }
+  for (int j = threadIdx.x; j < kDecodeMaxUnique * kDecodeMaxTokens; j += blockDim.x) (&s.unique_w[0][0])[j] = 0.0f;
+  if (i < kDecodeMaxUnique) s.unique_sel[i] = 0u;
+  __syncthreads();
+  if (i < n) {
+    const int e = sid[i];
+    int f = i;
+    for (int j = 0; j < i; ++j) {
+      if (sid[j] == e) {
+        f = j;
+        break;
+      }
+    }
+    s.first[i] = f;
+  }
+  __syncthreads();
+  if (i < n && s.first[i] == i) {
+    int slot = 0;
+    for (int j = 0; j < i; ++j) slot += s.first[j] == j;
+    s.slot_of[i] = slot;
+    s.unique_id[slot] = sid[i];
+  }
+  if (i == 0) {
+    int count = 0;
+    for (int j = 0; j < n; ++j) count += s.first[j] == j;
+    s.n_unique = count;
+  }
+  __syncthreads();
+  if (i < n) {
+    const int u = s.slot_of[s.first[i]];
+    s.unique_w[u][i / kTopK] = sw[i];
+    atomicOr(&s.unique_sel[u], 1u << (i / kTopK));
+  }
+  __syncthreads();
+}
+
 // ---- the producer ---------------------------------------------------------------------------
 
-// Stage item `h` (its header already filled in) for `tokens` tokens: the weights and extras.
+// Stage item `h` for `tokens` tokens: the weights and the stage's extras.
 template <int K2>
 __device__ void stage_item(const Shared &s, const Params &p, const Header &h, char *stage) {
   constexpr int tile_bytes = 16 * K2;
@@ -227,17 +304,11 @@ __device__ void stage_item(const Shared &s, const Params &p, const Header &h, ch
       const int tile = (h.block * kDnKTiles + r) * (kHidden / 16) + 32 * h.sub;
       return rec + static_cast<size_t>(tile) * tile_bytes + 16 * off;
     });
-    // Block j's gate and up sums: int64 [tokens][gate 128 | up 128].
-    copy_chunks(extra, tokens * 2 * 128 * 8 / 16, [&](int i) {
-      const int t = i / 128, half = i / 64 % 2, off = i % 64;
-      const long long *row = p.gate_up + (static_cast<size_t>(h.u) * p.cap + t) * kGateUpOut;
-      return reinterpret_cast<const char *>(row + half * kInter + 128 * h.block) + 16 * off;
-    });
     const char *suh = reinterpret_cast<const char *>(planes.suh + 128 * h.block);
-    copy_chunks(extra + dn_suh(tokens), 128 * 2 / 16, [&](int i) { return suh + 16 * i; });
+    copy_chunks(extra + kDnSuh, 128 * 2 / 16, [&](int i) { return suh + 16 * i; });
     const char *svh = reinterpret_cast<const char *>(planes.svh + kDnCols * h.sub);
-    copy_chunks(extra + dn_svh(tokens), kDnCols * 2 / 16, [&](int i) { return svh + 16 * i; });
-    copy_chunks(extra + dn_svh_gu(tokens), 2 * 128 * 2 / 16, [&](int i) {
+    copy_chunks(extra + kDnSvh, kDnCols * 2 / 16, [&](int i) { return svh + 16 * i; });
+    copy_chunks(extra + kDnSvhGu, 2 * 128 * 2 / 16, [&](int i) {
       const int half = i / 16, off = i % 16;
       return reinterpret_cast<const char *>(gu_planes.svh + half * kInter + 128 * h.block) + 16 * off;
     });
@@ -254,7 +325,13 @@ __device__ void producer(Shared &s, const Params &p, char *stages, int stage_str
   if (lane == 0) pending = static_cast<int>(atomicAdd(&p.counters->ticket, 1u) + gridDim.x);
   for (int n = 0;; ++n) {
     const int st = n % kStages;
-    if (n >= kStages) mbar_wait(&s.empty[st], static_cast<uint32_t>((n / kStages - 1) & 1));
+    if (n >= kStages) {
+      mbar_wait(&s.empty[st], static_cast<uint32_t>((n / kStages - 1) & 1));
+    } else if (n == 1) {
+      // Every SM asks for its first item alone, so the card's first bytes are each SM's first
+      // item rather than half of two; one item per SM in flight still fills the bus.
+      mbar_wait(&s.full[0], 0u);
+    }
     Header h{};
     h.ticket = ticket;
     if (ticket >= n_total) {
@@ -299,10 +376,10 @@ __device__ void producer(Shared &s, const Params &p, char *stages, int stage_str
   }
 }
 
-// ---- the compute warps ----------------------------------------------------------------------
+// ---- the mma warps --------------------------------------------------------------------------
 
-// acc[n] += A(tokens x 16 kt) . W(16 kt x 16) for the warp's column tiles, kt k-tiles from row
-// `kt0` of A; tile (r, n) of the stage at word (r * row_tiles + col[n]) * tile_words.
+// acc[n] += A(tokens x 16 KT) . W(16 KT x 16) for the warp's column tiles; tile (r, n) of the
+// stage at word (r * row_tiles + col[n]) * tile_words.
 template <int K2, int NT, int KT>
 __device__ __forceinline__ void mma_stage(const uint32_t *stage, int row_tiles, const int (&col)[NT], const __half *a,
                                           int tokens, float (&acc)[NT][2][4]) {
@@ -330,59 +407,141 @@ __device__ __forceinline__ void mma_stage(const uint32_t *stage, int row_tiles, 
   }
 }
 
-// The gate/up item's operand: warp t < tokens rotates its token's 256 inputs (x o suh, two
-// 128-wide Hadamards) and writes them into A as fp16 under one power-of-two scale.
-__device__ void prepare_gate_up(Shared &s, const char *extra, int tokens, __half *a) {
+// The warp's raw sums of its column tiles into the output buffer, row-major [tokens][cols].
+template <int NT>
+__device__ __forceinline__ void store_sums(float *out, int cols, const int (&col)[NT], int tokens, const float (&acc)[NT][2][4]) {
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  if (warp < tokens) {
-    const int t = warp;
-    const __half *suh = reinterpret_cast<const __half *>(extra + kGuSuh);
-    const __nv_bfloat16 *x = reinterpret_cast<const __nv_bfloat16 *>(extra + kGuX) + t * kGuSplit;
-    float v[2][4];
-    float m = 0.0f;
+  const int g = lane >> 2;
+  const int c = lane & 3;
+  if (g < tokens) {
 #pragma unroll
-    for (int blk = 0; blk < 2; ++blk) {
+    for (int n = 0; n < NT; ++n) {
 #pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const int k = blk * 128 + 4 * lane + q;
-        v[blk][q] = __bfloat162float(x[k]) * __half2float(suh[k]);
+      for (int hf = 0; hf < 2; ++hf) {
+        const int cc = col[n] * 16 + hf * 8 + 2 * c;
+        *reinterpret_cast<float2 *>(&out[g * cols + cc]) = make_float2(acc[n][hf][0], acc[n][hf][1]);
       }
-      warp_hadamard128(v[blk]);
-#pragma unroll
-      for (int q = 0; q < 4; ++q) m = fmaxf(m, fabsf(v[blk][q]));
     }
-    const float scale = fp16_operand_scale(warp_max(m));
-#pragma unroll
-    for (int blk = 0; blk < 2; ++blk) {
-#pragma unroll
-      for (int q = 0; q < 4; ++q) a[t * kAStride + blk * 128 + 4 * lane + q] = __float2half_rn(v[blk][q] * scale);
-    }
-    if (lane == 0) s.scale[t] = scale;
   }
 }
 
-// The down item's operand: warp t < tokens reads gate and up block j's sums, rotates both,
-// applies svh and SwiGLU (h's block j), then h_j o suh_down, rotated, into A as fp16 under one
-// power-of-two scale.
-__device__ void prepare_down(Shared &s, const char *extra, int tokens, __half *a) {
+template <bool kTrace>
+__device__ void mma_role(Shared &s, const Params &p, char *stages, int stage_stride, char *abufs, int abuf_stride,
+                         float *out) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  if (warp < tokens) {
-    const int t = warp;
-    const long long *sums = reinterpret_cast<const long long *>(extra) + t * 256;
-    const __half *svh_gu = reinterpret_cast<const __half *>(extra + dn_svh_gu(tokens));
-    const __half *suh = reinterpret_cast<const __half *>(extra + dn_suh(tokens));
+  const int tokens = p.tokens;
+  for (int n = 0;; ++n) {
+    const int st = n % kStages;
+    const int b = n & 1;
+    UnitStamps stamps;
+    if constexpr (kTrace) stamps.begin = global_ns();
+    mbar_wait(&s.a_full[b], static_cast<uint32_t>((n >> 1) & 1));
+    const Header h = s.meta[b].h;
+    if (h.kind == kEnd) break;
+    mbar_wait(&s.full[st], static_cast<uint32_t>((n / kStages) & 1));  // done: orders the stage's bytes
+    if constexpr (kTrace) stamps.ready = global_ns();
+    const uint32_t *stage = reinterpret_cast<const uint32_t *>(stages + static_cast<size_t>(st) * stage_stride);
+    const __half *a = reinterpret_cast<const __half *>(abufs + b * abuf_stride);
+    dispatch_k2(static_cast<uint32_t>(h.k2), [&](auto k2) {
+      constexpr int K2 = decltype(k2)::value;
+      if (h.kind == kGateUp) {
+        float acc[1][2][4] = {};
+        const int col[1] = {warp};
+        mma_stage<K2, 1, kGuKTiles>(stage, 16, col, a, tokens, acc);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&s.empty[st]);
+        if constexpr (kTrace) stamps.mma = global_ns();
+        if (n > 0) mbar_wait(&s.o_empty, static_cast<uint32_t>((n - 1) & 1));
+        store_sums<1>(out, 256, col, tokens, acc);
+      } else {
+        float acc[2][2][4] = {};
+        const int col[2] = {warp, warp + kMmaWarps};
+        mma_stage<K2, 2, kDnKTiles>(stage, 2 * kMmaWarps, col, a, tokens, acc);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&s.empty[st]);
+        if constexpr (kTrace) stamps.mma = global_ns();
+        if (n > 0) mbar_wait(&s.o_empty, static_cast<uint32_t>((n - 1) & 1));
+        store_sums<2>(out, kDnCols, col, tokens, acc);
+      }
+    });
+    __syncwarp();
+    if (lane == 0) mbar_arrive(&s.o_full);
+    if constexpr (kTrace) {
+      if (threadIdx.x == 0 && h.ticket < kTraceUnits) {
+        stamps.end = global_ns();
+        stamps.extra = 0;
+        unsigned long long *r = p.trace + static_cast<size_t>(h.ticket) * kTraceWords;
+        r[0] = (static_cast<unsigned long long>(sm_id()) << 32) | blockIdx.x;
+        r[1] = static_cast<unsigned long long>(h.kind) | static_cast<unsigned long long>(h.u) << 8 |
+               static_cast<unsigned long long>(h.block) << 16 | static_cast<unsigned long long>(h.sub) << 24;
+        r[2] = stamps.begin;
+        r[3] = stamps.ready;
+        r[4] = stamps.mma;
+        r[5] = stamps.end;
+        r[7] = h.issued;
+      }
+    }
+  }
+}
+
+// ---- the aux warps --------------------------------------------------------------------------
+
+// The gate/up item's operand: aux warp t < tokens rotates its token's 256 inputs (x o suh, two
+// 128-wide Hadamards) and writes them into A as fp16 under one power-of-two scale.
+__device__ void prepare_gate_up(Meta &m, const char *extra, int tokens, __half *a) {
+  const int lane = threadIdx.x & 31;
+  const int t = (threadIdx.x >> 5) - kAuxWarp0;
+  if (t >= tokens) return;
+  const __half *suh = reinterpret_cast<const __half *>(extra + kGuSuh);
+  const __nv_bfloat16 *x = reinterpret_cast<const __nv_bfloat16 *>(extra + kGuX) + t * kGuSplit;
+  float v[2][4];
+  float mx = 0.0f;
+#pragma unroll
+  for (int blk = 0; blk < 2; ++blk) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const int k = blk * 128 + 4 * lane + q;
+      v[blk][q] = __bfloat162float(x[k]) * __half2float(suh[k]);
+    }
+    warp_hadamard128(v[blk]);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) mx = fmaxf(mx, fabsf(v[blk][q]));
+  }
+  const float scale = fp16_operand_scale(warp_max(mx));
+#pragma unroll
+  for (int blk = 0; blk < 2; ++blk) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) a[t * kAStride + blk * 128 + 4 * lane + q] = __float2half_rn(v[blk][q] * scale);
+  }
+  if (lane == 0) m.scale[t] = scale;
+}
+
+// The down item's operand: aux warp t < tokens reads gate and up block j's sums, rotates both,
+// applies svh and SwiGLU (h's block j), then h_j o suh_down, rotated, into A as fp16 under one
+// power-of-two scale. The aux threads copy svh_down's 512 columns into the meta for the
+// reduction, and count this reader on (u, j) once the sums are read.
+__device__ void prepare_down(Meta &m, const Params &p, const char *extra, int tokens, __half *a) {
+  const int lane = threadIdx.x & 31;
+  const int aux = threadIdx.x - kAuxWarp0 * 32;
+  const int t = aux >> 5;
+  const Header &h = m.h;
+  const __half *svh = reinterpret_cast<const __half *>(extra + kDnSvh);
+  for (int i = aux; i < kDnCols; i += kAuxThreads) m.svh[i] = svh[i];
+  if (t < tokens) {
+    const long long *sums = p.gate_up + (static_cast<size_t>(h.u) * p.cap + t) * kGateUpOut + 128 * h.block;
+    const __half *svh_gu = reinterpret_cast<const __half *>(extra + kDnSvhGu);
+    const __half *suh = reinterpret_cast<const __half *>(extra + kDnSuh);
     float gate[4], up[4];
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
-      gate[q] = from_fixed(sums[4 * lane + q]);
-      up[q] = from_fixed(sums[128 + 4 * lane + q]);
+      gate[q] = from_fixed(__ldcg(sums + 4 * lane + q));
+      up[q] = from_fixed(__ldcg(sums + kInter + 4 * lane + q));
     }
     warp_hadamard128(gate);
     warp_hadamard128(up);
     float v[4];
-    float m = 0.0f;
+    float mx = 0.0f;
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
       const float g = gate[q] * __half2float(svh_gu[4 * lane + q]);
@@ -391,166 +550,170 @@ __device__ void prepare_down(Shared &s, const char *extra, int tokens, __half *a
     }
     warp_hadamard128(v);
 #pragma unroll
-    for (int q = 0; q < 4; ++q) m = fmaxf(m, fabsf(v[q]));
-    const float scale = fp16_operand_scale(warp_max(m));
+    for (int q = 0; q < 4; ++q) mx = fmaxf(mx, fabsf(v[q]));
+    const float scale = fp16_operand_scale(warp_max(mx));
 #pragma unroll
     for (int q = 0; q < 4; ++q) a[t * kAStride + 4 * lane + q] = __float2half_rn(v[q] * scale);
-    if (lane == 0) s.scale[t] = scale;
+    if (lane == 0) m.scale[t] = scale;
   }
+  aux_sync();  // every reading warp has its values
+  if (aux == 0) m.reader_before = atomicAdd(&p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block], kReaderStep);
 }
 
-template <int K2>
-__device__ void gate_up_item(Shared &s, const Params &p, const Header &h, const char *stage, __half *a,
-                             unsigned long long *empty, UnitStamps &st, bool trace) {
+// Item `m`'s reduction from the output buffer.
+__device__ void reduce_item(const Shared &s, const Meta &m, const Params &p, const float *out) {
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
+  const int aux = threadIdx.x - kAuxWarp0 * 32;
+  const int warp = aux >> 5;
   const int tokens = p.tokens;
-  prepare_gate_up(s, stage + kMaxWeightBytes, tokens, a);
-  compute_sync();
-  if (trace) st.ready = global_ns();
-  float acc[1][2][4] = {};
-  const int col[1] = {warp};
-  mma_stage<K2, 1, kGuKTiles>(reinterpret_cast<const uint32_t *>(stage), 2 * 8, col, a, tokens, acc);
-  __syncwarp();
-  if (lane == 0) mbar_arrive(empty);  // the stage is free for the producer
-  if (trace) st.mma = global_ns();
-  const int g = lane >> 2;
-  const int c = lane & 3;
-  if (g < tokens) {
-    const float inv = 1.0f / s.scale[g];
-    const int col0 = (warp < 8 ? 128 * h.block + 16 * warp : kInter + 128 * h.block + 16 * (warp - 8)) + 2 * c;
-    long long *dst = p.gate_up + (static_cast<size_t>(h.u) * p.cap + g) * kGateUpOut + col0;
-#pragma unroll
-    for (int hf = 0; hf < 2; ++hf) {
-      add_fixed(dst + hf * 8, acc[0][hf][0] * inv);
-      add_fixed(dst + hf * 8 + 1, acc[0][hf][1] * inv);
+  const Header &h = m.h;
+  if (h.kind == kGateUp) {
+    // 256 pre-rotation sums per token: columns c < 128 are gate block b's, the rest up's.
+    for (int i = aux; i < tokens * 256; i += kAuxThreads) {
+      const int t = i / 256, c = i % 256;
+      const int col = (c < 128 ? 0 : kInter) + 128 * h.block + (c & 127);
+      const float inv = 1.0f / m.scale[t];
+      add_fixed(p.gate_up + (static_cast<size_t>(h.u) * p.cap + t) * kGateUpOut + col, out[t * 256 + c] * inv);
     }
+    __threadfence();
+    aux_sync();
+    if (aux == 0) atomicAdd(&p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block], 1u);
+    return;
   }
-  __threadfence();
-  compute_sync();
-  if (threadIdx.x == 0) atomicAdd(&p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block], 1u);
-}
-
-template <int K2>
-__device__ void down_item(Shared &s, const Params &p, const Header &h, char *stage, __half *a,
-                          unsigned long long *empty, UnitStamps &st, bool trace) {
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int tokens = p.tokens;
-  uint32_t *count = &p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block];
-  // This reader has its copy of the block's sums (the stage is full): count it now, read the
-  // count after the multiply.
-  uint32_t before = 0;
-  if (threadIdx.x == 0) before = atomicAdd(count, kReaderStep);
-  prepare_down(s, stage + kMaxWeightBytes, tokens, a);
-  compute_sync();
-  if (trace) st.ready = global_ns();
-  float acc[2][2][4] = {};
-  const int col[2] = {warp, warp + kComputeWarps};
-  mma_stage<K2, 2, kDnKTiles>(reinterpret_cast<const uint32_t *>(stage), 2 * kComputeWarps, col, a, tokens, acc);
-  if (trace) st.mma = global_ns();
-  // The pre-rotation sums are exchanged through the stage's weights, multiplied by every warp now;
-  // the stage goes back to the producer once they and its svh_down have been read.
-  compute_sync();
-  float *y = reinterpret_cast<float *>(stage);
-  const __half *svh = reinterpret_cast<const __half *>(stage + kMaxWeightBytes + dn_svh(tokens));
-  const int g = lane >> 2;
-  const int c = lane & 3;
-  if (g < tokens) {
-    const float inv = 1.0f / s.scale[g];
+  // Down: the output rotation per 128 columns, warp-strided over (token, block) for every token
+  // that selected u.
+  for (int task = warp; task < 4 * tokens; task += kAuxWarps) {
+    const int t = task / 4;
+    const int blk = task % 4;
+    if (!(s.unique_sel[h.u] >> t & 1u)) continue;
+    float v[4];
+    const float inv = 1.0f / m.scale[t];
 #pragma unroll
-    for (int n = 0; n < 2; ++n) {
+    for (int q = 0; q < 4; ++q) v[q] = out[t * kDnCols + blk * 128 + 4 * lane + q] * inv;
+    warp_hadamard128(v);
+    const float wt = s.unique_w[h.u][t];
 #pragma unroll
-      for (int hf = 0; hf < 2; ++hf) {
-        const int cc = col[n] * 16 + hf * 8 + 2 * c;
-        y[g * kDnCols + cc] = acc[n][hf][0] * inv;
-        y[g * kDnCols + cc + 1] = acc[n][hf][1] * inv;
-      }
-    }
-  }
-  compute_sync();
-  // Output rotation per 128 columns: warp (t, block) for every token that selected u.
-  if (warp < 4 * tokens) {
-    const int t = warp / 4;
-    const int blk = warp % 4;
-    if (s.unique_sel[h.u] >> t & 1u) {
-      float v[4];
-#pragma unroll
-      for (int q = 0; q < 4; ++q) v[q] = y[t * kDnCols + blk * 128 + 4 * lane + q];
-      warp_hadamard128(v);
-      const float wt = s.unique_w[h.u][t];
-#pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const int cc = blk * 128 + 4 * lane + q;
-        add_fixed(p.acc + static_cast<size_t>(t) * kHidden + kDnCols * h.sub + cc,
-                  wt * (v[q] * __half2float(svh[cc])));
-      }
+    for (int q = 0; q < 4; ++q) {
+      const int cc = blk * 128 + 4 * lane + q;
+      add_fixed(p.acc + static_cast<size_t>(t) * kHidden + kDnCols * h.sub + cc, wt * (v[q] * __half2float(m.svh[cc])));
     }
   }
   // The fifth reader of h block j zeroes its sums and the count for the next call.
-  if (warp == 0) {
-    before = __shfl_sync(0xFFFFFFFFu, before, 0);
-    if (before == kLastReader) {
-      for (int i = lane; i < tokens * 256; i += 32) {
-        const int t = i / 256, j = i % 256;
-        p.gate_up[(static_cast<size_t>(h.u) * p.cap + t) * kGateUpOut + (j < 128 ? 0 : kInter) + 128 * h.block + j % 128] = 0;
-      }
-      if (lane == 0) *count = 0u;
+  if (m.reader_before == kLastReader) {
+    for (int i = aux; i < tokens * 256; i += kAuxThreads) {
+      const int t = i / 256, c = i % 256;
+      p.gate_up[(static_cast<size_t>(h.u) * p.cap + t) * kGateUpOut + (c < 128 ? 0 : kInter) + 128 * h.block + (c & 127)] = 0;
+    }
+    if (aux == 0) p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block] = 0u;
+  }
+}
+
+// Item n - 1's reduction, once the mma warps have left its sums; then the output buffer is free.
+template <bool kTrace>
+__device__ void reduce_previous(Shared &s, const Params &p, int n, const float *out, unsigned long long *rec) {
+  mbar_wait(&s.o_full, static_cast<uint32_t>((n - 1) & 1));
+  unsigned long long t0 = 0;
+  if constexpr (kTrace) t0 = global_ns();
+  reduce_item(s, s.meta[(n - 1) & 1], p, out);
+  aux_sync();
+  if ((threadIdx.x & 31) == 0) mbar_arrive(&s.o_empty);
+  if constexpr (kTrace) {
+    if (threadIdx.x == kAuxWarp0 * 32 && rec != nullptr) {
+      rec[10] = t0;
+      rec[11] = global_ns();
     }
   }
-  compute_sync();
-  if (lane == 0) mbar_arrive(empty);
+}
+
+// Each item n: prepare it while the mma warps multiply item n - 1, then reduce item n - 1. When
+// item n's stage is not yet full the reduction goes first: a down item's producer may be waiting
+// for the very arrival that reduction counts.
+template <bool kTrace>
+__device__ void aux_role(Shared &s, const Params &p, char *stages, int stage_stride, char *abufs, int abuf_stride,
+                         const float *out) {
+  __shared__ int reduce_first;
+  const int lane = threadIdx.x & 31;
+  const int aux = threadIdx.x - kAuxWarp0 * 32;
+  const int tokens = p.tokens;
+  unsigned long long *rec = nullptr;  // kTrace: item n - 1's record
+  for (int n = 0;; ++n) {
+    const int st = n % kStages;
+    const int b = n & 1;
+    const uint32_t parity = static_cast<uint32_t>((n / kStages) & 1);
+    Meta &m = s.meta[b];
+    if (aux == 0) reduce_first = n > 0 && !mbar_test(&s.full[st], parity);
+    aux_sync();
+    const bool early = reduce_first != 0;
+    if (early) reduce_previous<kTrace>(s, p, n, out, rec);
+    // Prepare item n.
+    unsigned long long t_wait = 0, t_prep = 0;
+    if constexpr (kTrace) t_wait = global_ns();
+    mbar_wait(&s.full[st], parity);
+    if constexpr (kTrace) t_prep = global_ns();
+    const Header h = s.header[st];
+    if (aux == 0) m.h = h;
+    aux_sync();
+    const char *extra = stages + static_cast<size_t>(st) * stage_stride + kMaxWeightBytes;
+    __half *a = reinterpret_cast<__half *>(abufs + b * abuf_stride);
+    if (h.kind == kGateUp) {
+      prepare_gate_up(m, extra, tokens, a);
+    } else if (h.kind == kDown) {
+      prepare_down(m, p, extra, tokens, a);
+    }
+    aux_sync();
+    if (lane == 0) {
+      mbar_arrive(&s.a_full[b]);
+      if (h.kind != kEnd) mbar_arrive(&s.empty[st]);
+    }
+    if constexpr (kTrace) {
+      if (aux == 0 && h.kind != kEnd && h.ticket < kTraceUnits) {
+        unsigned long long *r = p.trace + static_cast<size_t>(h.ticket) * kTraceWords;
+        r[6] = t_prep - t_wait;
+        r[8] = t_prep;
+        r[9] = global_ns();
+      }
+    }
+    if (n > 0 && !early) reduce_previous<kTrace>(s, p, n, out, rec);
+    if constexpr (kTrace) {
+      rec = h.kind != kEnd && h.ticket < kTraceUnits ? p.trace + static_cast<size_t>(h.ticket) * kTraceWords : nullptr;
+    }
+    if (h.kind == kEnd) return;
+  }
 }
 
 template <bool kTrace>
 __global__ void __launch_bounds__(kThreads, 1) experts_decode_staged_kernel(Params p, int stage_stride) {
   __shared__ Shared s;
   extern __shared__ __align__(128) char dyn[];
+  const int abuf_stride = abuf_bytes(p.tokens);
   char *stages = dyn;
-  __half *a = reinterpret_cast<__half *>(dyn + kStages * stage_stride);
+  char *abufs = dyn + kStages * stage_stride;
+  float *out = reinterpret_cast<float *>(abufs + 2 * abuf_stride);
   if constexpr (kTrace) {
     if (threadIdx.x == 0) trace_cta(p.trace)[0] = global_ns();
   }
   if (threadIdx.x == 0) {
     for (int i = 0; i < kStages; ++i) {
-      mbar_init(&s.full[i], 33);  // the producer's 32 lanes' copies + its lane 0's header
-      mbar_init(&s.empty[i], kComputeWarps);
+      mbar_init(&s.full[i], 33);                   // the producer's 32 lanes' copies + its lane 0's header
+      mbar_init(&s.empty[i], kMmaWarps + kAuxWarps);  // every mma and aux warp has read the stage
     }
+    for (int i = 0; i < 2; ++i) mbar_init(&s.a_full[i], kAuxWarps);
+    mbar_init(&s.o_full, kMmaWarps);
+    mbar_init(&s.o_empty, kAuxWarps);
   }
-  build_unique(s, p.ids, p.weights, p.tokens);  // ends with __syncthreads
+  unique_experts(s, p.ids, p.weights, p.tokens);  // ends with __syncthreads
   const int n_gate_up = s.n_unique * kGuItems;
   const int n_total = n_gate_up + s.n_unique * kDnItems;
   const int warp = threadIdx.x >> 5;
-  if (warp == kComputeWarps) {
+  if (warp == kProducerWarp) {
     if constexpr (kTrace) {
       if ((threadIdx.x & 31) == 0) trace_cta(p.trace)[1] = global_ns();
     }
     producer<kTrace>(s, p, stages, stage_stride, n_gate_up, n_total);
+  } else if (warp >= kAuxWarp0) {
+    aux_role<kTrace>(s, p, stages, stage_stride, abufs, abuf_stride, out);
   } else {
-    for (int n = 0;; ++n) {
-      const int st = n % kStages;
-      UnitStamps stamps;
-      if constexpr (kTrace) stamps.begin = global_ns();
-      mbar_wait(&s.full[st], static_cast<uint32_t>((n / kStages) & 1));
-      const Header h = s.header[st];
-      if (h.kind == kEnd) break;
-      if constexpr (kTrace) stamps.extra = global_ns() - stamps.begin;
-      char *stage = stages + static_cast<size_t>(st) * stage_stride;
-      dispatch_k2(static_cast<uint32_t>(h.k2), [&](auto k2) {
-        if (h.kind == kGateUp) {
-          gate_up_item<decltype(k2)::value>(s, p, h, stage, a, &s.empty[st], stamps, kTrace);
-        } else {
-          down_item<decltype(k2)::value>(s, p, h, stage, a, &s.empty[st], stamps, kTrace);
-        }
-      });
-      if constexpr (kTrace) {
-        stamps.end = global_ns();
-        if (threadIdx.x == 0 && h.ticket < kTraceUnits) {
-          trace_unit(p.trace, h.ticket, h.kind, h.u, h.block, h.sub, stamps);
-          p.trace[static_cast<size_t>(h.ticket) * kTraceWords + 7] = h.issued;
-        }
-      }
-    }
+    mma_role<kTrace>(s, p, stages, stage_stride, abufs, abuf_stride, out);
   }
   __syncthreads();
   // The last CTA out leaves the ticket counter as it found it, so the launch replays.

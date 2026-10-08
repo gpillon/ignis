@@ -149,25 +149,28 @@ std::vector<int32_t> make_calls(int calls, int tokens, int pool_size, int window
 }
 
 // One traced call's records (moe_trace.h), reduced: the launch's span from the first CTA's entry,
-// and per unit kind the phase lengths and when the units ran.
+// and per unit kind the phase lengths and when the units ran. Words 2-5 are the multiplying
+// warps' (begin, ready, multiplied, end) under both kernels; `staged` reads the staged kernel's
+// aux stamps (words 6, 8-11), the register kernel's word 6 is a down unit's h wait.
 struct CallTrace {
+  bool staged = false;
   double span = 0.0;           // first CTA entry to last CTA exit, us
   double setup = 0.0;          // median CTA: entry to its first ticket, us
   double entry_skew = 0.0;     // first to last CTA entry, us
   int units[2] = {0, 0};
   double ready[2] = {0, 0}, mma[2] = {0, 0}, post[2] = {0, 0};  // medians, us
+  double prep[2] = {0, 0}, reduce[2] = {0, 0};                   // staged: the aux warps' medians, us
   double first_begin[2] = {0, 0}, last_end[2] = {0, 0};          // from the first entry, us
-  double swiglu_post = 0.0;    // median mma-to-end of the gate/up arrivals that ran the SwiGLU
-  double wait_median = 0.0, wait_max = 0.0;  // register kernel: down units' h wait; staged: every item's stage wait
-  double issue_to_data = 0.0;  // staged: median from the producer's copies to the stage full
+  double swiglu_post = 0.0;    // register kernel: median mma-to-end of the arrivals that ran the SwiGLU
+  double wait_median = 0.0, wait_max = 0.0;  // register kernel: down units' h wait; staged: the aux warps' stage wait
   double mma_busy = 0.0;       // sum of units' multiply phases / (CTAs x span)
-  double unit_busy = 0.0;      // sum of units' whole lengths / (CTAs x span)
-  double wait_share = 0.0;     // sum of the waits / (CTAs x span)
+  double pre_share = 0.0;      // sum of units' begin-to-ready / (CTAs x span)
+  double wait_share = 0.0;     // register kernel: h waits / (CTAs x span); staged: aux busy / (CTAs x span)
   // Per distinct expert (index u): first gate/up begin, last gate/up end, h complete (the last
   // gate/up end, the route's own arrival making h whole), first down begin, last down end.
   std::vector<std::array<double, 5>> chain;
-  // 1-us bins from the first entry: mean units in each phase (0 pre, 1 multiply, 2 post, 3
-  // waiting: for h, or for the stage) and CTAs alive.
+  // 1-us bins from the first entry: mean units in each phase (0 pre, 1 multiply, 2 post, 3 the
+  // register kernel's h wait or the staged kernel's aux work) and CTAs alive.
   std::vector<std::array<double, 5>> bins;
 };
 
@@ -177,11 +180,10 @@ double median_of(std::vector<double> v) {
   return v[v.size() / 2];
 }
 
-// `staged`: the staged kernel's records, whose word 6 is every item's stage wait and word 7 when
-// its producer issued the copies; the register kernel's word 6 is a down unit's h wait.
 CallTrace reduce_trace(const std::vector<unsigned long long> &r, bool staged) {
   constexpr int W = IGNIS_MOE_TRACE_WORDS;
   CallTrace c;
+  c.staged = staged;
   unsigned long long t0 = ~0ull, t1 = 0, last_entry = 0;
   std::vector<double> setups;
   int ctas = 0;
@@ -209,21 +211,22 @@ CallTrace reduce_trace(const std::vector<unsigned long long> &r, bool staged) {
     const unsigned long long *e = &r[static_cast<std::size_t>(IGNIS_MOE_TRACE_UNITS + i) * W];
     if (e[0] != 0) spread((e[0] - t0) * 1e-3, (e[2] - t0) * 1e-3, 4);
   }
-  std::vector<double> ready[2], mma[2], post[2], swiglu, wait, issue;
-  double busy = 0.0, whole = 0.0, waited = 0.0;
+  auto at = [&](unsigned long long v) { return (static_cast<double>(v) - static_cast<double>(t0)) * 1e-3; };
+  std::vector<double> ready[2], mma[2], post[2], prep[2], reduce[2], swiglu, wait;
+  double busy = 0.0, pre = 0.0, waited = 0.0;
   c.first_begin[0] = c.first_begin[1] = 1e30;
   for (int u = 0; u < IGNIS_MOE_TRACE_UNITS; ++u) {
     const unsigned long long *e = &r[static_cast<std::size_t>(u) * W];
     if (e[2] == 0) continue;
     const int kind = static_cast<int>(e[1] & 0xFF);
     const int expert = static_cast<int>(e[1] >> 8 & 0xFF);
-    const double b = (e[2] - t0) * 1e-3, rd = (e[3] - t0) * 1e-3, m = (e[4] - t0) * 1e-3, en = (e[5] - t0) * 1e-3;
+    const double b = at(e[2]), rd = at(e[3]), m = at(e[4]), en = at(e[5]);
     ++c.units[kind];
     ready[kind].push_back(rd - b);
     mma[kind].push_back(m - rd);
     post[kind].push_back(en - m);
     busy += m - rd;
-    whole += en - b;
+    pre += rd - b;
     if (static_cast<int>(c.chain.size()) <= expert) c.chain.resize(expert + 1, {1e30, 0.0, 0.0, 1e30, 0.0});
     std::array<double, 5> &ch = c.chain[expert];
     if (kind == 0) {
@@ -236,31 +239,43 @@ CallTrace reduce_trace(const std::vector<unsigned long long> &r, bool staged) {
     }
     c.first_begin[kind] = std::min(c.first_begin[kind], b);
     c.last_end[kind] = std::max(c.last_end[kind], en);
-    if (!staged && kind == 0 && e[6] == 1) swiglu.push_back(en - m);
-    if (staged && e[7] != 0) issue.push_back(b + e[6] * 1e-3 - (e[7] - t0) * 1e-3);
-    if (staged || kind == 1) {
-      const double w = e[6] * 1e-3;
-      waited += w;
-      wait.push_back(w);
-      spread(b, b + w, 3);
-      spread(b + w, rd, 0);
-    } else {
-      spread(b, rd, 0);
-    }
+    spread(b, rd, 0);
     spread(rd, m, 1);
     spread(m, en, 2);
+    if (staged) {
+      wait.push_back(e[6] * 1e-3);
+      if (e[8] != 0) {
+        prep[kind].push_back(at(e[9]) - at(e[8]));
+        spread(at(e[8]), at(e[9]), 3);
+        waited += at(e[9]) - at(e[8]);
+      }
+      if (e[10] != 0) {
+        reduce[kind].push_back(at(e[11]) - at(e[10]));
+        spread(at(e[10]), at(e[11]), 3);
+        waited += at(e[11]) - at(e[10]);
+      }
+    } else {
+      if (kind == 0 && e[6] == 1) swiglu.push_back(en - m);
+      if (kind == 1) {
+        const double w = e[6] * 1e-3;
+        waited += w;
+        wait.push_back(w);
+        spread(b, b + w, 3);
+      }
+    }
   }
   for (int k = 0; k < 2; ++k) {
     c.ready[k] = median_of(ready[k]);
     c.mma[k] = median_of(mma[k]);
     c.post[k] = median_of(post[k]);
+    c.prep[k] = median_of(prep[k]);
+    c.reduce[k] = median_of(reduce[k]);
   }
   c.swiglu_post = median_of(swiglu);
   c.wait_median = median_of(wait);
-  c.issue_to_data = median_of(issue);
   c.wait_max = wait.empty() ? 0.0 : *std::max_element(wait.begin(), wait.end());
   c.mma_busy = ctas > 0 ? busy / (ctas * c.span) : 0.0;
-  c.unit_busy = ctas > 0 ? whole / (ctas * c.span) : 0.0;
+  c.pre_share = ctas > 0 ? pre / (ctas * c.span) : 0.0;
   c.wait_share = ctas > 0 ? waited / (ctas * c.span) : 0.0;
   return c;
 }
@@ -269,26 +284,30 @@ void print_trace(const char *what, int tokens, std::vector<CallTrace> calls) {
   std::sort(calls.begin(), calls.end(), [](const CallTrace &a, const CallTrace &b) { return a.span < b.span; });
   const CallTrace &m = calls[calls.size() / 2];
   std::printf("  trace, %d token(s), %s: median call of %zu: span %.1f us (spans %.1f..%.1f); CTA entry skew %.1f, "
-              "entry to first ticket %.2f us; multiply phases fill %.0f%% of CTA time\n",
-              tokens, what, calls.size(), m.span, calls.front().span, calls.back().span, m.entry_skew, m.setup,
-              100.0 * m.mma_busy);
-  std::printf("    gate/up %d units: begin to ready %.2f, multiply %.2f, to end %.2f us (medians), SwiGLU arrivals to end "
-              "%.2f; first begins %.1f, last ends %.1f us\n",
-              m.units[0], m.ready[0], m.mma[0], m.post[0], m.swiglu_post, m.first_begin[0], m.last_end[0]);
-  std::printf("    down %d units: begin to ready %.2f, multiply %.2f, to end %.2f us (medians); first begins %.1f, last "
-              "ends %.1f us\n",
-              m.units[1], m.ready[1], m.mma[1], m.post[1], m.first_begin[1], m.last_end[1]);
-  std::printf("    waiting (%s): median %.2f, max %.2f us%s",
-              m.issue_to_data > 0.0 ? "every item for its stage" : "down units for h", m.wait_median, m.wait_max,
-              m.issue_to_data > 0.0 ? "" : "\n");
-  if (m.issue_to_data > 0.0) std::printf("; producer copies to stage full %.2f us (median)\n", m.issue_to_data);
-  std::printf("    CTA time: in units %.0f%% (multiply %.0f%%, waiting %.0f%%), outside any unit %.0f%%\n",
-              100.0 * m.unit_busy, 100.0 * m.mma_busy, 100.0 * m.wait_share, 100.0 * (1.0 - m.unit_busy));
+              "entry to first ticket %.2f us\n",
+              tokens, what, calls.size(), m.span, calls.front().span, calls.back().span, m.entry_skew, m.setup);
+  const char *pre = m.staged ? "waiting for the operand" : "begin to ready";
+  for (int k = 0; k < 2; ++k) {
+    std::printf("    %s %d units: %s %.2f, multiply %.2f, to end %.2f us", k == 0 ? "gate/up" : "down", m.units[k], pre,
+                m.ready[k], m.mma[k], m.post[k]);
+    if (m.staged) std::printf("; aux prepare %.2f, reduce %.2f us", m.prep[k], m.reduce[k]);
+    if (!m.staged && k == 0) std::printf(", SwiGLU arrivals to end %.2f", m.swiglu_post);
+    std::printf(" (medians); first begins %.1f, last ends %.1f us\n", m.first_begin[k], m.last_end[k]);
+  }
+  if (m.staged) {
+    std::printf("    aux warps' stage wait: median %.2f, max %.2f us\n", m.wait_median, m.wait_max);
+    std::printf("    CTA time: mma warps multiplying %.0f%%, waiting for an operand %.0f%%; aux warps busy %.0f%%\n",
+                100.0 * m.mma_busy, 100.0 * m.pre_share, 100.0 * m.wait_share);
+  } else {
+    std::printf("    waiting (down units for h): median %.2f, max %.2f us\n", m.wait_median, m.wait_max);
+    std::printf("    CTA time: multiplying %.0f%%, begin to ready %.0f%%, waiting for h %.0f%%\n", 100.0 * m.mma_busy,
+                100.0 * m.pre_share, 100.0 * m.wait_share);
+  }
   std::printf("    per expert (us from the first entry): gate/up first begin .. last end | down first begin .. last end\n");
   for (std::size_t u = 0; u < m.chain.size(); ++u) {
     std::printf("      u%-2zu %5.1f .. %5.1f | %5.1f .. %5.1f\n", u, m.chain[u][0], m.chain[u][1], m.chain[u][3], m.chain[u][4]);
   }
-  std::printf("    us  | units: pre  multiply  post  h-wait | CTAs alive\n");
+  std::printf("    us  | units: pre  multiply  post  %s | CTAs alive\n", m.staged ? "aux" : "h-wait");
   for (std::size_t b = 0; b < m.bins.size(); ++b) {
     std::printf("    %3zu | %10.1f %9.1f %5.1f %7.1f | %5.0f\n", b, m.bins[b][0], m.bins[b][1], m.bins[b][2], m.bins[b][3],
                 m.bins[b][4]);
