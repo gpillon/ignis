@@ -30,11 +30,16 @@
 using namespace moe_test;
 
 int main(int argc, char **argv) {
-  // A "-clusters" suffix runs a decode mode on the clusters route.
+  // A "-clusters" suffix runs a decode mode on the clusters route, "-registers" on the register
+  // ticket kernel; without one, the tickets route (its staged kernel at these 2 tokens).
   std::string mode = argc > 1 ? argv[1] : "decode";
-  const std::string suffix = "-clusters";
-  const bool clusters = mode.size() > suffix.size() && mode.compare(mode.size() - suffix.size(), suffix.size(), suffix) == 0;
-  if (clusters) mode.resize(mode.size() - suffix.size());
+  auto strip = [&](const std::string &suffix) {
+    const bool has = mode.size() > suffix.size() && mode.compare(mode.size() - suffix.size(), suffix.size(), suffix) == 0;
+    if (has) mode.resize(mode.size() - suffix.size());
+    return has;
+  };
+  const bool clusters = strip("-clusters");
+  const bool registers = strip("-registers");
   const bool prefill = mode.rfind("prefill", 0) == 0;
   const bool bad_id = mode.find("-id") != std::string::npos;
   const bool nan = mode == "decode-nan";
@@ -73,8 +78,10 @@ int main(int argc, char **argv) {
   upload(dids, ids);
   upload(dw, w);
   upload(dslots, slots);
-  const ignis_moe_workspace ws{wsb.p, IGNIS_MOE_DECODE_MAX_TOKENS, max_tokens,
-                               clusters ? IGNIS_MOE_DECODE_CLUSTERS : IGNIS_MOE_DECODE_TICKETS};
+  const uint32_t route = clusters    ? IGNIS_MOE_DECODE_CLUSTERS
+                         : registers ? IGNIS_MOE_DECODE_REGISTERS
+                                     : IGNIS_MOE_DECODE_TICKETS;
+  const ignis_moe_workspace ws{wsb.p, IGNIS_MOE_DECODE_MAX_TOKENS, max_tokens, route};
   MOE_RC(ignis_moe_workspace_init(&ws, acc.as<int64_t>(), nullptr));
   MOE_CUDA(cudaDeviceSynchronize());
   if (clusters && ignis_moe_decode_cluster_size() == 0) {

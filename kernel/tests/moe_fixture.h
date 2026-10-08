@@ -55,11 +55,16 @@ inline void check(bool ok, const std::string &what) {
   } while (0)
 
 // The decode route a test's workspace takes: "clusters" among its arguments selects
-// IGNIS_MOE_DECODE_CLUSTERS (the device prepared first, so its cluster size is known); a device
-// that runs no decode cluster fails the test rather than skipping it.
+// IGNIS_MOE_DECODE_CLUSTERS (the device prepared first, so its cluster size is known; a device
+// that runs no decode cluster fails the test rather than skipping it), "registers"
+// IGNIS_MOE_DECODE_REGISTERS, neither IGNIS_MOE_DECODE_TICKETS.
 inline uint32_t decode_route_arg(int argc, char **argv) {
-  bool clusters = false;
-  for (int i = 1; i < argc; ++i) clusters = clusters || std::string(argv[i]) == "clusters";
+  bool clusters = false, registers = false;
+  for (int i = 1; i < argc; ++i) {
+    clusters = clusters || std::string(argv[i]) == "clusters";
+    registers = registers || std::string(argv[i]) == "registers";
+  }
+  if (registers) return IGNIS_MOE_DECODE_REGISTERS;
   if (!clusters) return IGNIS_MOE_DECODE_TICKETS;
   MOE_RC(ignis_moe_prepare());
   if (ignis_moe_decode_cluster_size() == 0) {
@@ -70,8 +75,8 @@ inline uint32_t decode_route_arg(int argc, char **argv) {
 }
 
 inline std::string decode_route_name(uint32_t route) {
-  return route == IGNIS_MOE_DECODE_CLUSTERS ? "clusters of " + std::to_string(ignis_moe_decode_cluster_size()) + " CTAs"
-                                            : std::string("tickets");
+  if (route == IGNIS_MOE_DECODE_CLUSTERS) return "clusters of " + std::to_string(ignis_moe_decode_cluster_size()) + " CTAs";
+  return route == IGNIS_MOE_DECODE_REGISTERS ? std::string("registers") : std::string("tickets (staged to 4 tokens)");
 }
 
 struct DeviceBytes {

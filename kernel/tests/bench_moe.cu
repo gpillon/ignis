@@ -6,7 +6,10 @@
 // the study's K mix. It is a tool, not a CTest, while that floor is an open criterion (2026-10-05:
 // 33.5%), so the leaf's CTest stage stays usable; run it by hand on a free card:
 //
-//   kernel/build/tests/ignis_kernel_moe_bench.exe [--check-floor]
+//   kernel/build/tests/ignis_kernel_moe_bench.exe [--check-floor] [--decode-only] [--trace]
+//
+// --decode-only measures the routed decode routes alone; --trace adds each route's phase trace
+// (moe_trace.h): the 1- and 3-token launch from DRAM and from the L2, stamped per unit.
 //
 // The roofline is the device's theoretical DRAM bandwidth (memory clock x bus width x 2, from
 // the device attributes); a sustained read measured by a plain streaming kernel is printed beside
@@ -21,7 +24,10 @@
 #include "moe_experts_common.h"
 #include "moe_fixture.h"
 
+#include "../src/moe_trace.h"
+
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -142,10 +148,166 @@ std::vector<int32_t> make_calls(int calls, int tokens, int pool_size, int window
   return ids;
 }
 
+// One traced call's records (moe_trace.h), reduced: the launch's span from the first CTA's entry,
+// and per unit kind the phase lengths and when the units ran.
+struct CallTrace {
+  double span = 0.0;           // first CTA entry to last CTA exit, us
+  double setup = 0.0;          // median CTA: entry to its first ticket, us
+  double entry_skew = 0.0;     // first to last CTA entry, us
+  int units[2] = {0, 0};
+  double ready[2] = {0, 0}, mma[2] = {0, 0}, post[2] = {0, 0};  // medians, us
+  double first_begin[2] = {0, 0}, last_end[2] = {0, 0};          // from the first entry, us
+  double swiglu_post = 0.0;    // median mma-to-end of the gate/up arrivals that ran the SwiGLU
+  double wait_median = 0.0, wait_max = 0.0;  // register kernel: down units' h wait; staged: every item's stage wait
+  double issue_to_data = 0.0;  // staged: median from the producer's copies to the stage full
+  double mma_busy = 0.0;       // sum of units' multiply phases / (CTAs x span)
+  double unit_busy = 0.0;      // sum of units' whole lengths / (CTAs x span)
+  double wait_share = 0.0;     // sum of the waits / (CTAs x span)
+  // Per distinct expert (index u): first gate/up begin, last gate/up end, h complete (the last
+  // gate/up end, the route's own arrival making h whole), first down begin, last down end.
+  std::vector<std::array<double, 5>> chain;
+  // 1-us bins from the first entry: mean units in each phase (0 pre, 1 multiply, 2 post, 3
+  // waiting: for h, or for the stage) and CTAs alive.
+  std::vector<std::array<double, 5>> bins;
+};
+
+double median_of(std::vector<double> v) {
+  if (v.empty()) return 0.0;
+  std::sort(v.begin(), v.end());
+  return v[v.size() / 2];
+}
+
+// `staged`: the staged kernel's records, whose word 6 is every item's stage wait and word 7 when
+// its producer issued the copies; the register kernel's word 6 is a down unit's h wait.
+CallTrace reduce_trace(const std::vector<unsigned long long> &r, bool staged) {
+  constexpr int W = IGNIS_MOE_TRACE_WORDS;
+  CallTrace c;
+  unsigned long long t0 = ~0ull, t1 = 0, last_entry = 0;
+  std::vector<double> setups;
+  int ctas = 0;
+  for (int i = 0; i < IGNIS_MOE_TRACE_CTAS; ++i) {
+    const unsigned long long *e = &r[static_cast<std::size_t>(IGNIS_MOE_TRACE_UNITS + i) * W];
+    if (e[0] == 0) continue;
+    ++ctas;
+    t0 = std::min(t0, e[0]);
+    last_entry = std::max(last_entry, e[0]);
+    t1 = std::max(t1, e[2]);
+    setups.push_back((e[1] - e[0]) * 1e-3);
+  }
+  c.span = (t1 - t0) * 1e-3;
+  c.setup = median_of(setups);
+  c.entry_skew = (last_entry - t0) * 1e-3;
+  const int nbins = static_cast<int>(c.span) + 1;
+  c.bins.assign(nbins, {0, 0, 0, 0, 0});
+  auto spread = [&](double a, double b, int col) {  // add interval [a, b) us to the bins
+    for (int bin = std::max(0, static_cast<int>(a)); bin < nbins && bin < b; ++bin) {
+      const double lo = std::max(a, static_cast<double>(bin)), hi = std::min(b, bin + 1.0);
+      if (hi > lo) c.bins[bin][col] += hi - lo;
+    }
+  };
+  for (int i = 0; i < IGNIS_MOE_TRACE_CTAS; ++i) {
+    const unsigned long long *e = &r[static_cast<std::size_t>(IGNIS_MOE_TRACE_UNITS + i) * W];
+    if (e[0] != 0) spread((e[0] - t0) * 1e-3, (e[2] - t0) * 1e-3, 4);
+  }
+  std::vector<double> ready[2], mma[2], post[2], swiglu, wait, issue;
+  double busy = 0.0, whole = 0.0, waited = 0.0;
+  c.first_begin[0] = c.first_begin[1] = 1e30;
+  for (int u = 0; u < IGNIS_MOE_TRACE_UNITS; ++u) {
+    const unsigned long long *e = &r[static_cast<std::size_t>(u) * W];
+    if (e[2] == 0) continue;
+    const int kind = static_cast<int>(e[1] & 0xFF);
+    const int expert = static_cast<int>(e[1] >> 8 & 0xFF);
+    const double b = (e[2] - t0) * 1e-3, rd = (e[3] - t0) * 1e-3, m = (e[4] - t0) * 1e-3, en = (e[5] - t0) * 1e-3;
+    ++c.units[kind];
+    ready[kind].push_back(rd - b);
+    mma[kind].push_back(m - rd);
+    post[kind].push_back(en - m);
+    busy += m - rd;
+    whole += en - b;
+    if (static_cast<int>(c.chain.size()) <= expert) c.chain.resize(expert + 1, {1e30, 0.0, 0.0, 1e30, 0.0});
+    std::array<double, 5> &ch = c.chain[expert];
+    if (kind == 0) {
+      ch[0] = std::min(ch[0], b);
+      ch[1] = std::max(ch[1], en);
+      ch[2] = std::max(ch[2], en);
+    } else {
+      ch[3] = std::min(ch[3], b);
+      ch[4] = std::max(ch[4], en);
+    }
+    c.first_begin[kind] = std::min(c.first_begin[kind], b);
+    c.last_end[kind] = std::max(c.last_end[kind], en);
+    if (!staged && kind == 0 && e[6] == 1) swiglu.push_back(en - m);
+    if (staged && e[7] != 0) issue.push_back(b + e[6] * 1e-3 - (e[7] - t0) * 1e-3);
+    if (staged || kind == 1) {
+      const double w = e[6] * 1e-3;
+      waited += w;
+      wait.push_back(w);
+      spread(b, b + w, 3);
+      spread(b + w, rd, 0);
+    } else {
+      spread(b, rd, 0);
+    }
+    spread(rd, m, 1);
+    spread(m, en, 2);
+  }
+  for (int k = 0; k < 2; ++k) {
+    c.ready[k] = median_of(ready[k]);
+    c.mma[k] = median_of(mma[k]);
+    c.post[k] = median_of(post[k]);
+  }
+  c.swiglu_post = median_of(swiglu);
+  c.wait_median = median_of(wait);
+  c.issue_to_data = median_of(issue);
+  c.wait_max = wait.empty() ? 0.0 : *std::max_element(wait.begin(), wait.end());
+  c.mma_busy = ctas > 0 ? busy / (ctas * c.span) : 0.0;
+  c.unit_busy = ctas > 0 ? whole / (ctas * c.span) : 0.0;
+  c.wait_share = ctas > 0 ? waited / (ctas * c.span) : 0.0;
+  return c;
+}
+
+void print_trace(const char *what, int tokens, std::vector<CallTrace> calls) {
+  std::sort(calls.begin(), calls.end(), [](const CallTrace &a, const CallTrace &b) { return a.span < b.span; });
+  const CallTrace &m = calls[calls.size() / 2];
+  std::printf("  trace, %d token(s), %s: median call of %zu: span %.1f us (spans %.1f..%.1f); CTA entry skew %.1f, "
+              "entry to first ticket %.2f us; multiply phases fill %.0f%% of CTA time\n",
+              tokens, what, calls.size(), m.span, calls.front().span, calls.back().span, m.entry_skew, m.setup,
+              100.0 * m.mma_busy);
+  std::printf("    gate/up %d units: begin to ready %.2f, multiply %.2f, to end %.2f us (medians), SwiGLU arrivals to end "
+              "%.2f; first begins %.1f, last ends %.1f us\n",
+              m.units[0], m.ready[0], m.mma[0], m.post[0], m.swiglu_post, m.first_begin[0], m.last_end[0]);
+  std::printf("    down %d units: begin to ready %.2f, multiply %.2f, to end %.2f us (medians); first begins %.1f, last "
+              "ends %.1f us\n",
+              m.units[1], m.ready[1], m.mma[1], m.post[1], m.first_begin[1], m.last_end[1]);
+  std::printf("    waiting (%s): median %.2f, max %.2f us%s",
+              m.issue_to_data > 0.0 ? "every item for its stage" : "down units for h", m.wait_median, m.wait_max,
+              m.issue_to_data > 0.0 ? "" : "\n");
+  if (m.issue_to_data > 0.0) std::printf("; producer copies to stage full %.2f us (median)\n", m.issue_to_data);
+  std::printf("    CTA time: in units %.0f%% (multiply %.0f%%, waiting %.0f%%), outside any unit %.0f%%\n",
+              100.0 * m.unit_busy, 100.0 * m.mma_busy, 100.0 * m.wait_share, 100.0 * (1.0 - m.unit_busy));
+  std::printf("    per expert (us from the first entry): gate/up first begin .. last end | down first begin .. last end\n");
+  for (std::size_t u = 0; u < m.chain.size(); ++u) {
+    std::printf("      u%-2zu %5.1f .. %5.1f | %5.1f .. %5.1f\n", u, m.chain[u][0], m.chain[u][1], m.chain[u][3], m.chain[u][4]);
+  }
+  std::printf("    us  | units: pre  multiply  post  h-wait | CTAs alive\n");
+  for (std::size_t b = 0; b < m.bins.size(); ++b) {
+    std::printf("    %3zu | %10.1f %9.1f %5.1f %7.1f | %5.0f\n", b, m.bins[b][0], m.bins[b][1], m.bins[b][2], m.bins[b][3],
+                m.bins[b][4]);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
-  const bool check_floor = argc > 1 && std::string(argv[1]) == "--check-floor";
+  bool check_floor = false, decode_only = false, traced = false;
+  std::string only_route;  // --route registers|tickets|clusters: that decode route alone
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    check_floor = check_floor || a == "--check-floor";
+    decode_only = decode_only || a == "--decode-only";
+    traced = traced || a == "--trace";
+    if (a == "--route" && i + 1 < argc) only_route = argv[++i];
+  }
+  std::setvbuf(stdout, nullptr, _IONBF, 0);  // every line out as it is printed, even if a launch dies
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
   cudaDeviceProp prop{};
@@ -204,22 +366,21 @@ int main(int argc, char **argv) {
     return 1e3 * ms / (calls * replays);
   };
 
-  // Both decode routes (the workspace's decode_route); the floor counts as met if one meets it.
+  // Every decode route (the workspace's decode_route), in one process so they compare; the floor
+  // counts as met if one meets it.
   bool floor_ok = false;
-  std::vector<uint32_t> routes = {IGNIS_MOE_DECODE_TICKETS};
+  std::vector<uint32_t> routes = {IGNIS_MOE_DECODE_REGISTERS, IGNIS_MOE_DECODE_TICKETS};
   if (ignis_moe_decode_cluster_size() > 0) {
     routes.push_back(IGNIS_MOE_DECODE_CLUSTERS);
   } else {
     std::printf("  (this device runs no decode cluster: the clusters route is not measured)\n");
   }
   for (const uint32_t route : routes) {
+    const char *names[] = {"tickets", "clusters", "registers"};
+    if (!only_route.empty() && only_route != names[route]) continue;
     ignis_moe_workspace wsr = ws;
     wsr.decode_route = route;
-    if (route == IGNIS_MOE_DECODE_TICKETS) {
-      std::printf("  decode route: tickets\n");
-    } else {
-      std::printf("  decode route: clusters of %d CTAs\n", ignis_moe_decode_cluster_size());
-    }
+    std::printf("  decode route: %s\n", decode_route_name(route).c_str());
     for (int tokens : {1, 2, 3}) {
       const int calls = 320;
       const std::vector<int32_t> ids = make_calls(calls, tokens, kPool);
@@ -285,10 +446,57 @@ int main(int argc, char **argv) {
       }
     }
 
+    // The phase trace: a graph of 64 calls as the timing above runs them, eight of them traced
+    // (each into its own buffer), replayed once to warm up and once more to read.
+    if (traced && route != IGNIS_MOE_DECODE_CLUSTERS) {
+      for (int tokens : {1, 3}) {
+        for (int windows : {0, 1}) {
+          const int calls = 64, first = 40, n_traced = 8;
+          const std::vector<int32_t> ids = make_calls(calls, tokens, kPool, windows);
+          std::vector<float> w(ids.size(), 0.1f);
+          DeviceBytes dids(ids.size() * 4), dw(w.size() * 4), tr(static_cast<std::size_t>(n_traced) * IGNIS_MOE_TRACE_BYTES);
+          upload(dids, ids);
+          upload(dw, w);
+          auto launch = [&](int c, cudaStream_t st) {
+            const int32_t *i = dids.as<int32_t>() + static_cast<std::size_t>(c) * tokens * kTop;
+            const float *wt = dw.as<float>() + static_cast<std::size_t>(c) * tokens * kTop;
+            if (c >= first && c < first + n_traced) {
+              auto *buf = reinterpret_cast<unsigned long long *>(static_cast<char *>(tr.p) +
+                                                                 static_cast<std::size_t>(c - first) * IGNIS_MOE_TRACE_BYTES);
+              MOE_CUDA(cudaMemsetAsync(buf, 0, IGNIS_MOE_TRACE_BYTES, st));
+              MOE_RC(ignis_moe_experts_decode_trace(dx.p, tokens, i, wt, d_slots.as<ignis_moe_slot>(), &wsr, acc.as<int64_t>(),
+                                                    buf, st));
+            } else {
+              MOE_RC(ignis_moe_experts_decode(dx.p, tokens, i, wt, d_slots.as<ignis_moe_slot>(), &wsr, acc.as<int64_t>(), st));
+            }
+          };
+          for (int c = 0; c < 4; ++c) launch(c, bench_stream);
+          MOE_CUDA(cudaStreamSynchronize(bench_stream));
+          cudaGraph_t graph;
+          cudaGraphExec_t exec;
+          MOE_CUDA(cudaStreamBeginCapture(bench_stream, cudaStreamCaptureModeGlobal));
+          for (int c = 0; c < calls; ++c) launch(c, bench_stream);
+          MOE_CUDA(cudaStreamEndCapture(bench_stream, &graph));
+          MOE_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+          MOE_CUDA(cudaGraphLaunch(exec, bench_stream));
+          MOE_CUDA(cudaGraphLaunch(exec, bench_stream));
+          MOE_CUDA(cudaStreamSynchronize(bench_stream));
+          std::vector<CallTrace> reduced;
+          for (int t = 0; t < n_traced; ++t) {
+            reduced.push_back(reduce_trace(download<unsigned long long>(
+                static_cast<char *>(tr.p) + static_cast<std::size_t>(t) * IGNIS_MOE_TRACE_BYTES, IGNIS_MOE_TRACE_BYTES / 8),
+                route == IGNIS_MOE_DECODE_TICKETS && tokens <= 4));
+          }
+          print_trace(windows == 1 ? "experts in the L2" : "experts from DRAM", tokens, reduced);
+          MOE_CUDA(cudaGraphExecDestroy(exec));
+          MOE_CUDA(cudaGraphDestroy(graph));
+        }
+      }
+    }
   }
 
   // The other ops, each over copies that together exceed the L2 so the weights come from DRAM.
-  {
+  if (!decode_only) {
     // Router at decode: 32 router weights (2.6 MB each).
     const int copies = 32;
     const std::size_t wbytes = static_cast<std::size_t>(kE) * kH * 2;
@@ -304,7 +512,7 @@ int main(int argc, char **argv) {
                   100.0 * gbs / roof);
     }
   }
-  {
+  if (!decode_only) {
     // Shared expert at decode: 32 copies of its three FP8 matrices (4.9 MB a set).
     const int copies = 32;
     const std::size_t gu_bytes = static_cast<std::size_t>(kI) * kH + 256 + kI * 2;  // codes, pad, scales
@@ -331,7 +539,7 @@ int main(int argc, char **argv) {
     });
     std::printf("  combine, 1 token: %.1f us\n", us);
   }
-  {
+  if (!decode_only) {
     // Prefill, 2048 tokens: routed experts over the pool (uniform routing, ~64 rows per expert),
     // and the shared expert's FP8 linears; TFLOP/s against the BF16/FP16 dense tensor peak.
     const int tokens = 2048;

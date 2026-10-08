@@ -109,12 +109,20 @@ int32_t ignis_moe_prepare(void);
  *
  * `decode_route` picks the decode kernel of the model instance that owns the workspace -- one
  * contract, held to the same fp64 bounds -- and is chosen with it, at load:
- *   IGNIS_MOE_DECODE_TICKETS   (0) one persistent launch of work units taken by ticket;
+ *   IGNIS_MOE_DECODE_TICKETS   (0) one persistent launch of work items taken by ticket: up to 4
+ *                                  tokens, one CTA per SM whose producer warp streams each item's
+ *                                  weights into shared memory ahead of its compute warps
+ *                                  (GitHub #306); past 4 tokens, the register kernel below;
  *   IGNIS_MOE_DECODE_CLUSTERS  (1) one thread-block cluster per selected expert, its reductions
- *                                  in distributed shared memory (needs no workspace regions).
- * A captured graph keeps the kernel it was captured with. */
+ *                                  in distributed shared memory (needs no workspace regions);
+ *   IGNIS_MOE_DECODE_REGISTERS (2) the tickets route before #306, at every width: work units that
+ *                                  hold their weights in registers, two CTAs per SM.
+ * The routes differ only in where partial sums are rounded (fp32 inside a work item, exact fixed
+ * point across items), within the same fp64 bounds. A captured graph keeps the kernel it was
+ * captured with. */
 #define IGNIS_MOE_DECODE_TICKETS 0
 #define IGNIS_MOE_DECODE_CLUSTERS 1
+#define IGNIS_MOE_DECODE_REGISTERS 2
 struct ignis_moe_workspace {
   void *base;
   uint32_t decode_tokens;

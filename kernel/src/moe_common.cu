@@ -27,6 +27,7 @@ int32_t fail(const std::string &message) {
 namespace {
 constexpr int kMaxDevices = 64;
 std::atomic<int> g_decode_grid[kMaxDevices];     // 0 until the device is prepared
+std::atomic<int> g_staged_grid[kMaxDevices];
 std::atomic<int> g_cluster_size[kMaxDevices];    // 0: the device runs no decode cluster
 }  // namespace
 
@@ -42,6 +43,7 @@ int32_t require_prepared(const char *op, DecodeLaunch *decode) {
   }
   if (decode != nullptr) {
     decode->grid = grid;
+    decode->staged_grid = g_staged_grid[device].load();
     decode->cluster_size = g_cluster_size[device].load();
   }
   return 0;
@@ -144,13 +146,15 @@ extern "C" int32_t ignis_moe_prepare(void) {
   cudaError_t err = cudaGetDevice(&device);
   if (err != cudaSuccess) return fail(std::string("ignis_moe_prepare: ") + cudaGetErrorString(err));
   if (device < 0 || device >= kMaxDevices) return fail("ignis_moe_prepare: device id out of range");
-  int grid = 0;
-  if (ignis_fp8_linear_prepare() != 0 || prepare_router() != 0 || prepare_prefill() != 0 || prepare_decode(&grid) != 0) {
+  int grid = 0, staged_grid = 0;
+  if (ignis_fp8_linear_prepare() != 0 || prepare_router() != 0 || prepare_prefill() != 0 || prepare_decode(&grid) != 0 ||
+      prepare_decode_staged(&staged_grid) != 0) {
     return -1;
   }
   int cluster_size = 0;
   prepare_decode_clusters(&cluster_size);
   g_cluster_size[device].store(cluster_size);
+  g_staged_grid[device].store(staged_grid);
   g_decode_grid[device].store(grid);
   return 0;
 }

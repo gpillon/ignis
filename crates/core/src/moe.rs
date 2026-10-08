@@ -31,10 +31,12 @@ pub const PROJ_GATE_UP: u32 = 0;
 pub const PROJ_DOWN: u32 = 1;
 
 /// The decode route of a workspace (`MoeWorkspace::decode_route`, `IGNIS_MOE_DECODE_*`): one
-/// persistent launch of work units taken by ticket, or one thread-block cluster per selected
-/// expert.
+/// persistent launch of work items taken by ticket (up to 4 tokens streamed through shared
+/// memory, GitHub #306), one thread-block cluster per selected expert, or the ticket launch
+/// before #306 whose units hold their weights in registers.
 pub const DECODE_TICKETS: u32 = 0;
 pub const DECODE_CLUSTERS: u32 = 1;
+pub const DECODE_REGISTERS: u32 = 2;
 
 /// One slot-table entry, 1:1 with `struct ignis_moe_slot`: the device address of an expert
 /// projection's record (layout.md §3) and its bit width as `k2 = 2 K`. A layer's table is
