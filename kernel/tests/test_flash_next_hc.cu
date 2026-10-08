@@ -315,6 +315,87 @@ void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, const ch
   cudaFree(d_inj);
 }
 
+// The kernel nodes one fn_hc_mix call captures into a graph.
+int kernel_nodes(const ignis::flash_next::Geometry &g, const ignis::flash_next::HcWeights &w, const void *hidden,
+                 int rows, void *x, float *inj, ninfer::DeviceArena &scratch) {
+  cudaStream_t stream = nullptr;
+  cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+  cudaGraph_t graph = nullptr;
+  cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+  const int32_t rc = ignis::flash_next::fn_hc_mix(g, w, hidden, rows, x, inj, scratch, stream);
+  cuda_ok(cudaStreamEndCapture(stream, &graph), "end capture");
+  std::size_t count = 0;
+  cuda_ok(cudaGraphGetNodes(graph, nullptr, &count), "cudaGraphGetNodes");
+  std::vector<cudaGraphNode_t> nodes(count);
+  cuda_ok(cudaGraphGetNodes(graph, nodes.data(), &count), "cudaGraphGetNodes");
+  int kernels = 0;
+  for (cudaGraphNode_t node : nodes) {
+    cudaGraphNodeType type;
+    cuda_ok(cudaGraphNodeGetType(node, &type), "cudaGraphNodeGetType");
+    kernels += type == cudaGraphNodeTypeKernel ? 1 : 0;
+  }
+  cuda_ok(cudaGraphDestroy(graph), "cudaGraphDestroy");
+  cuda_ok(cudaStreamDestroy(stream), "cudaStreamDestroy");
+  return rc == 0 ? kernels : -1;
+}
+
+// GitHub #306 (fusion study): the decode route with its norm folded into the down projection
+// (fn_hc_set_decode_fused) gives the three-launch route's bits, in two launches at up to three
+// rows; past three rows the switch changes nothing.
+void fused_case(const ignis::flash_next::HcWeights &dw, const char *format, int rows, bool with_inject,
+                ninfer::DeviceArena &scratch) {
+  const std::string label = std::string("fused norm, ") + (with_inject ? "mix" : "final mixer") + " (" + format +
+                            "), " + std::to_string(rows) + " rows";
+  const auto hidden = random_bf16(static_cast<std::size_t>(rows) * kWidth, 2.0, 0xF05U + rows);
+  auto *d_hidden = upload(hidden);
+  void *d_x = nullptr;
+  float *d_inj = nullptr;
+  cuda_ok(cudaMalloc(&d_x, static_cast<std::size_t>(rows) * kHidden * 2), "cudaMalloc x");
+  cuda_ok(cudaMalloc(&d_inj, static_cast<std::size_t>(rows) * kStreams * 4), "cudaMalloc inj");
+  ignis::flash_next::Geometry g;
+  g.streams = kStreams;
+  g.hidden = kHidden;
+  g.hc_rank = kRank;
+  g.rms_norm_eps = static_cast<float>(kEps);
+  ignis::flash_next::HcWeights weights = dw;
+  if (!with_inject) {
+    weights.block_inject = nullptr;
+  }
+  float *inj = with_inject ? d_inj : nullptr;
+  std::vector<uint16_t> x[2];
+  std::vector<float> injections[2];
+  int nodes[2] = {};
+  for (int fused = 0; fused < 2; ++fused) {
+    ignis::flash_next::fn_hc_set_decode_fused(fused == 1);
+    cuda_ok(cudaMemset(d_x, 0xFF, static_cast<std::size_t>(rows) * kHidden * 2), "poison x");
+    cuda_ok(cudaMemset(d_inj, 0xFF, static_cast<std::size_t>(rows) * kStreams * 4), "poison inj");
+    check(ignis::flash_next::fn_hc_mix(g, weights, d_hidden, rows, d_x, inj, scratch, nullptr) == 0,
+          label + ": runs: " + ignis::flash_next::fn_last_error());
+    cuda_ok(cudaDeviceSynchronize(), "sync");
+    x[fused].resize(static_cast<std::size_t>(rows) * kHidden);
+    injections[fused].resize(static_cast<std::size_t>(rows) * kStreams);
+    cuda_ok(cudaMemcpy(x[fused].data(), d_x, x[fused].size() * 2, cudaMemcpyDeviceToHost), "download x");
+    cuda_ok(cudaMemcpy(injections[fused].data(), d_inj, injections[fused].size() * 4, cudaMemcpyDeviceToHost),
+            "download inj");
+    nodes[fused] = kernel_nodes(g, weights, d_hidden, rows, d_x, inj, scratch);
+  }
+  ignis::flash_next::fn_hc_set_decode_fused(true);
+  check(x[1] == x[0], label + ": x is the three-launch route's, bit for bit");
+  check(!with_inject || std::memcmp(injections[1].data(), injections[0].data(), injections[0].size() * 4) == 0,
+        label + ": the injection weights are the three-launch route's, bit for bit");
+  if (rows <= 3) {
+    check(nodes[0] == 3 && nodes[1] == 2, label + ": 3 launches unfused, 2 fused (got " + std::to_string(nodes[0]) +
+                                              ", " + std::to_string(nodes[1]) + ")");
+  } else {
+    check(nodes[0] == nodes[1] && nodes[0] >= 3,
+          label + ": past three rows the switch changes no launch (got " + std::to_string(nodes[0]) + ", " +
+              std::to_string(nodes[1]) + ")");
+  }
+  cudaFree(d_hidden);
+  cudaFree(d_x);
+  cudaFree(d_inj);
+}
+
 }  // namespace
 
 int main() {
@@ -370,6 +451,14 @@ int main() {
   for (int rows : {1, 3, 9}) {
     mix_case(w8_down, dw8_down, "FP8 down, BF16 up", rows, true, scratch);
     mix_case(w8_up, dw8_up, "BF16 down, FP8 up", rows, true, scratch);
+  }
+  for (int rows : {1, 2, 3, 4, 8, 9}) {
+    for (bool with_inject : {true, false}) {
+      fused_case(dw, "BF16", rows, with_inject, scratch);
+      fused_case(dw8, "FP8", rows, with_inject, scratch);
+    }
+    fused_case(dw8_down, "FP8 down, BF16 up", rows, true, scratch);
+    fused_case(dw8_up, "BF16 down, FP8 up", rows, true, scratch);
   }
 
   // What the norm cannot hold, and projections whose shape is not the

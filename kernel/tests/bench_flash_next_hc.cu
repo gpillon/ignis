@@ -4,14 +4,15 @@
 // The real weight formats (FP8 row-scale mix_down / mix_up, BF16 hc_norm and block_inject) at
 // 4 streams of 2560, rank 320. For each row count, `--calls` mixes (and, separately, injects)
 // are captured into one CUDA graph, as the decode round replays them; the graph is replayed
-// after a warm-up and the median replay is divided by the calls. Decode lanes (1, 2, 3, 8) and
+// after a warm-up and the median replay is divided by the calls. Decode lanes (1-5, 8) and
 // prefill chunks (256, 2048: two 1024-row waves). The calls cycle through `--sets` distinct
 // weight sets (~6.6 MB each, 24 by default: more than the L2 holds), so the weights stream from
 // DRAM as the round's 97 distinct mixes do. Timing wants the card to itself.
 //
-//   ignis_kernel_flash_next_hc_bench [--calls 48] [--replays 20] [--sets 24] [--rows N]
+//   ignis_kernel_flash_next_hc_bench [--calls 48] [--replays 20] [--sets 24] [--rows N] [--fused 0|1]
 //
-// --rows times one row count only (for a per-kernel profile of one shape).
+// --rows times one row count only (for a per-kernel profile of one shape). --fused 0 times the
+// decode route with its norm in a launch of its own (fn_hc_set_decode_fused; GitHub #306).
 
 #include "flash_next/hc.h"
 
@@ -136,6 +137,8 @@ int main(int argc, char **argv) {
       sets = std::max(1, std::atoi(argv[i + 1]));
     } else if (std::strcmp(argv[i], "--rows") == 0) {
       only_rows = std::atoi(argv[i + 1]);
+    } else if (std::strcmp(argv[i], "--fused") == 0) {
+      ignis::flash_next::fn_hc_set_decode_fused(std::atoi(argv[i + 1]) != 0);
     }
   }
   if (ignis_fp8_linear_prepare() != 0) {
@@ -162,7 +165,7 @@ int main(int argc, char **argv) {
   std::printf("flash-next HC mix, 4 x 2560 streams, rank 320, FP8 mix_down/mix_up; %d calls per graph over %d weight sets\n",
               calls, sets);
   std::printf("%6s %12s %12s %12s %14s\n", "rows", "mix us", "final us", "inject us", "mix us / row");
-  for (int rows : {1, 2, 3, 8, 256, 2048}) {
+  for (int rows : {1, 2, 3, 4, 5, 8, 256, 2048}) {
     if (only_rows > 0 && rows != only_rows) {
       continue;
     }

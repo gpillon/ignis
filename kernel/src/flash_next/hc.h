@@ -25,6 +25,12 @@ int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int
                   float *inj, ninfer::DeviceArena &scratch, cudaStream_t stream);
 std::size_t fn_hc_mix_scratch_bytes(const Geometry &g, int32_t rows);
 
+// The decode route's norm folded into its mix_down launch (GitHub #306, the fusion study): two
+// launches per mix of up to three rows instead of three, the same bits. Read when a mix is
+// launched (a decode graph
+// keeps the route it was captured with); on unless IGNIS_FN_HC_FUSED=0 is set at the first mix.
+void fn_hc_set_decode_fused(bool on);
+
 // hidden_s += y * inj_s for every stream, in place, in BF16 (each product and
 // each sum rounded, as the reference's bf16 ops do).
 int32_t fn_hc_inject(const Geometry &g, const void *y, const float *inj, int32_t rows, void *hidden,
