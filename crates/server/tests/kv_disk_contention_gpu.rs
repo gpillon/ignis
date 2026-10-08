@@ -5,10 +5,12 @@
 //! two lanes decode, each against the same work without the spill.
 //!
 //! - **Prefill.** F (16,384 tokens, two chunks) prefills alone; then again
-//!   while A (an `agent` of ~210K tokens, ~1 GB of state) is written to the
-//!   disk to make room for G. Each chunk's wall time (the advance that ran
-//!   it) and its n-gram gather time are recorded; a chunk counts as "under
-//!   the spill" only when the spill was in flight on both sides of it.
+//!   with G arriving to move A2 (another ~1 GB `agent`) to the disk. Each
+//!   chunk's wall time (the advance that ran it) and its n-gram gather time
+//!   are recorded, and whether the spill was in flight on both sides of it:
+//!   G waits for the prefill F holds, so none is (2026-10-08). The volume's
+//!   share of a chunk is measured by `ignis-runtime`'s
+//!   `kv_disk_volume_contention`.
 //! - **Decode.** B and C (`interactive`) decode at width 2 alone; then again
 //!   while A is written to the disk to make room for E. Their inter-token
 //!   latencies over the spill window give p50 and p99.
@@ -187,7 +189,8 @@ fn a_one_gigabyte_spill_beside_a_prefill_and_beside_two_decoding_lanes() {
     let shape = EngineShape {
         max_context: CONTEXT,
         prefill_chunk: CHUNK,
-        decode_lanes: 3,
+        // Four in flight: A, B and C, and the arrival that moves A.
+        decode_lanes: 4,
         host_pool_bytes: 0,
         prompt_reuse: false,
         retained_device_slots: 0,
@@ -196,6 +199,8 @@ fn a_one_gigabyte_spill_beside_a_prefill_and_beside_two_decoding_lanes() {
         // Uncovered: every row a prefill stages is read from the artifact.
         ngram_hot_bytes: HotBudget::Bytes(0),
         kv_disk_bytes: Some(8 << 30),
+        // The pool at one context is #309 P1's `kv_pool: Tokens(CONTEXT)`:
+        // without it the pool holds every request and the test says so.
         ..EngineShape::default()
     };
     let (sched, reserved) = match flash_next_scheduler_with_ngram_cache(
@@ -245,28 +250,43 @@ fn a_one_gigabyte_spill_beside_a_prefill_and_beside_two_decoding_lanes() {
     while rig.spilled_at(from, a).is_none() {
         rig.step();
     }
+    // The spill's window: from E's arrival to the step its file committed
+    // in, less a step that also ran a prefill chunk -- E's first starts in
+    // the step that gave it the room, and its seconds are E's, not the
+    // spill's.
     let spilled_at = rig.spilled_at(from, a).unwrap();
-    let spill_window = rig.steps[spilled_at].at - rig.steps[from].at;
+    let decode_only = |s: &Step| !s.events.iter().any(|e| matches!(e, SchedEvent::PrefillChunk { .. }));
+    let spill_window: Duration = rig.steps[from..=spilled_at].iter().filter(|s| decode_only(s)).map(|s| s.wall).sum();
     let spill_itl = {
-        let window = &rig.steps[from..=spilled_at];
-        let first = window.first().map(|s| s.at).unwrap();
-        let last = window.last().map(|s| s.at).unwrap();
-        rig.itl(from, &[b, c], |s| s.at >= first && s.at <= last)
+        let (first, last) = (rig.steps[from].at, rig.steps[spilled_at].at);
+        rig.itl(from, &[b, c], |s| s.at >= first && s.at <= last && decode_only(s))
     };
     rig.to_idle();
     assert!(rig.tokens_of(e) > 0, "E ran once A was on the disk");
 
-    // ── prefill: F alone, then beside A's spill ───────────────────────────
+    // ── prefill: F alone, then with G arriving to move A2 ─────────────────
+    // What the run records is whether any of F's chunks ran with the spill
+    // in flight: G, the arrival that needs the room, waits for the prefill
+    // F holds, so the spill starts only once F's prefill is done. The
+    // volume's share of a chunk -- its n-gram gather beside the tier's
+    // writes -- is `ignis-runtime`'s `kv_disk_volume_contention`.
     let from = rig.mark();
     let f0 = rig.sched.submit(input(prompt(5, 16_384), 1), RequestClass::Interactive).unwrap();
     rig.to_idle();
     let baseline_chunks = rig.chunks(from, f0);
 
-    let a2 = rig.sched.submit(input(prompt(6, A_PROMPT), 400), RequestClass::Agent).unwrap();
+    // A2's budget outlasts F's prefill, so it is still on the device when G
+    // needs the room; it is cancelled once G is done.
+    let a2 = rig.sched.submit(input(prompt(6, A_PROMPT), 8000), RequestClass::Agent).unwrap();
     rig.until_tokens(a2, 4);
     let from = rig.mark();
     let f = rig.sched.submit(input(prompt(5, 16_384), 1), RequestClass::Interactive).unwrap();
     let g = rig.sched.submit(input(prompt(7, 40_000), 1), RequestClass::Interactive).unwrap();
+    while rig.tokens_of(g) == 0 {
+        assert!(!rig.sched.is_idle(), "G never ran");
+        rig.step();
+    }
+    rig.sched.cancel(a2);
     rig.to_idle();
     let spill_chunks = rig.chunks(from, f);
     let a2_spilled = rig.spilled_at(from, a2).is_some();
@@ -309,7 +329,7 @@ fn a_one_gigabyte_spill_beside_a_prefill_and_beside_two_decoding_lanes() {
     drop(rig);
     let _ = std::fs::remove_dir_all(&blobs);
     assert!(!lost, "a spill lost work");
-    assert!(a2_spilled, "A went to the disk beside F's prefill");
-    assert!(!under.is_empty(), "a chunk of F ran with the spill in flight");
+    assert!(a2_spilled, "A2 went to the disk to make room for G");
+    println!("F's chunks with A2's spill in flight: {}", under.len());
     assert!(!spill_itl.is_empty(), "B and C decoded during A's spill");
 }
