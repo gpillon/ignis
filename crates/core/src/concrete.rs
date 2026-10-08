@@ -372,15 +372,31 @@ fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
     if let Some(schedule) = &input.constrained {
         return u32::try_from(schedule.len()).unwrap_or(u32::MAX);
     }
-    input.params.max_tokens.unwrap_or_else(|| {
-        let left = config
-            .max_sequence_tokens
-            .saturating_sub(u32::try_from(input.tokens.len()).unwrap_or(u32::MAX));
-        match config.default_max_tokens {
-            0 => left,
-            cap => cap.min(left),
-        }
-    })
+    input
+        .params
+        .max_tokens
+        .or_else(|| default_cap(config, input))
+        .unwrap_or_else(|| context_left(config, input))
+}
+
+/// What `input`'s prompt leaves of the per-sequence limit.
+fn context_left(config: &SchedulerConfig, input: &RequestInput) -> u32 {
+    config
+        .max_sequence_tokens
+        .saturating_sub(u32::try_from(input.tokens.len()).unwrap_or(u32::MAX))
+}
+
+/// The server's default cap `input` runs under (ADR 0045), clamped to what
+/// its prompt leaves of the context: `None` when the server has none, or
+/// when the request names its own, generates nothing or follows a schedule.
+/// The one place that decides it -- [`generation_budget`] reads it, and
+/// `submit` writes it where an explicit `max_tokens` would be.
+fn default_cap(config: &SchedulerConfig, input: &RequestInput) -> Option<u32> {
+    let applies = input.params.max_tokens.is_none()
+        && config.default_max_tokens > 0
+        && !input.ends_at_prefill()
+        && !input.is_constrained();
+    applies.then(|| config.default_max_tokens.min(context_left(config, input)))
 }
 
 /// The whole-sequence reservation handed to the leaf: prompt + generation
@@ -2645,12 +2661,8 @@ impl Scheduler for ConcreteScheduler {
         // default, written where an explicit one would be, so the scheduler's
         // hard cap and the backend's own check read one number. Only when the
         // default applies: with none (0) the request is left exactly as sent.
-        if input.params.max_tokens.is_none()
-            && self.config.default_max_tokens > 0
-            && !input.ends_at_prefill()
-            && !input.is_constrained()
-        {
-            input.params.max_tokens = Some(generation_budget(&self.config, &input));
+        if let Some(cap) = default_cap(&self.config, &input) {
+            input.params.max_tokens = Some(cap);
         }
         if self.in_flight() >= self.config.max_in_flight {
             return Err(SubmitError::Full);

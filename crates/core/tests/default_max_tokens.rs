@@ -231,7 +231,7 @@ fn reasoning_counts_inside_the_default_and_the_budget_keeps_its_answer_reserve()
 }
 
 #[test]
-fn a_decision_and_a_constrained_decode_keep_their_own_budget() {
+fn a_decision_a_warm_up_and_a_constrained_decode_keep_their_own_budget() {
     // A decision generates nothing: no cap is written, and it reserves its
     // prompt alone -- here a pool of one page holds it.
     let mock = Arc::new(MockCompute::new());
@@ -250,6 +250,27 @@ fn a_decision_and_a_constrained_decode_keep_their_own_budget() {
     decision.opener_tokens = Some(10);
     decision.decision = Some(DecisionRead::Answers(Arc::from(vec![32, 33])));
     let id = sched.submit(decision, RequestClass::Agent).expect("a decision fits its prompt's page");
+    let (generated, _, _) = run(&mut sched, id);
+    assert_eq!(generated, 0);
+    assert_eq!(backend_cap(&mock, id), None);
+
+    // A warm-up, the other prefill-only request (GitHub #282): no cap
+    // written, nothing generated, its prompt the whole reservation.
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            kv_page_tokens: 64,
+            max_sequence_tokens: CONTEXT,
+            kv_capacity_pages: 1,
+            default_max_tokens: DEFAULT_CAP,
+            ..SchedulerConfig::default()
+        },
+        mock.clone(),
+    );
+    let mut warm_up = request(10, None);
+    warm_up.warm_up = true;
+    let id = sched.submit(warm_up, RequestClass::Interactive).expect("a warm-up fits its prompt's page");
     let (generated, _, _) = run(&mut sched, id);
     assert_eq!(generated, 0);
     assert_eq!(backend_cap(&mock, id), None);

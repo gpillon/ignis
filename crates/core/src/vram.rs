@@ -74,8 +74,9 @@ impl std::fmt::Display for KvPoolSize {
 /// Where a load's weights live, which decides its [`KvPoolPolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Residency {
-    /// Every weight is a line of the plan (the 27B): always resident.
-    Whole,
+    /// Every weight is a line of the plan (the 27B): **Resident** by
+    /// construction.
+    Resident,
     /// A model whose experts the device may or may not hold (Flash-Next).
     Experts(ExpertResidency),
 }
@@ -228,7 +229,7 @@ pub struct VramRequest<'a> {
     /// `--kv-pool-bytes`, when the operator named it, in bytes or tokens: it
     /// replaces the policy's size (ADR 0045). `None` takes the policy's.
     pub kv_pool: Option<KvPoolSize>,
-    /// Whether every weight is a line ([`Residency::Whole`]) or the load has
+    /// Whether every weight is a line ([`Residency::Resident`]) or the load has
     /// experts the budget may not hold.
     pub residency: Residency,
     /// Whether the operator named `--vision-embedding-pool-mib` (GitHub
@@ -257,11 +258,11 @@ pub struct VramPlan {
     /// The KV pool's device bytes (planes and block tables).
     pub kv_pool_bytes: u64,
     /// Residency's fixed lines ([`ExpertResidency::fixed_bytes`]); 0 on a
-    /// [`Residency::Whole`] load.
+    /// [`Residency::Resident`] load.
     pub residency_bytes: u64,
     /// The VRAM expert cache: every expert projection on the resident
     /// branch, the rest of the budget on the offloaded one; 0 on a
-    /// [`Residency::Whole`] load.
+    /// [`Residency::Resident`] load.
     pub expert_cache_bytes: u64,
     /// Every line, the KV pool, and residency's lines with the expert cache:
     /// what the process holds after load.
@@ -466,7 +467,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
     // the floor asks for -- the 27B by construction -- else offloaded.
     // Offloaded, the pool's default comes with the branch.
     let (policy, residency_bytes, experts_bytes, offloaded_pages) = match request.residency {
-        Residency::Whole => (KvPoolPolicy::Resident, 0, 0, None),
+        Residency::Resident => (KvPoolPolicy::Resident, 0, 0, None),
         Residency::Experts(experts) => {
             let pool = arena(named_pages.unwrap_or(min_pages));
             let resident = fixed
@@ -519,7 +520,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
     // Resident, the cache holds every projection (a named pool leaves the
     // rest of the budget unused, as on the 27B); offloaded, it takes the rest.
     let expert_cache_bytes = match (request.residency, policy) {
-        (Residency::Whole, _) => 0,
+        (Residency::Resident, _) => 0,
         (Residency::Experts(_), KvPoolPolicy::Resident) => experts_bytes,
         (Residency::Experts(_), KvPoolPolicy::Offloaded) => {
             budget.saturating_sub(held.saturating_add(kv_pool_bytes))
@@ -627,7 +628,7 @@ mod tests {
             max_context_tokens: 262_144,
             retained_slots: SLOTS,
             kv_pool: None,
-            residency: Residency::Whole,
+            residency: Residency::Resident,
             embedding_pool_named: false,
             kv_arena_bytes: &arena,
             can_page: true,
@@ -977,7 +978,7 @@ mod tests {
     fn a_named_pool_below_one_context_refuses_naming_the_knobs_and_the_bytes_per_token() {
         // AC 4, on either model: a whole context, but no page for the
         // retained slots.
-        for residency in [flash_next(3).residency, Residency::Whole] {
+        for residency in [flash_next(3).residency, Residency::Resident] {
             let request = VramRequest {
                 kv_pool: Some(KvPoolSize::Tokens(262_144)),
                 residency,

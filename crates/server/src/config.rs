@@ -1532,7 +1532,7 @@ fn help_text() -> String {
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2 on the 27B, mtp on Flash-Next with its companion container beside the artifact, off)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (1..{MAX_DRAFT_TOKENS}; required with --spec dflash2; with --spec mtp the most drafts a lane verifies, default {FLASH_NEXT_DEFAULT_DRAFT_TOKENS})\n\
          \x20       --draft-rows <n>          env: IGNIS_DRAFT_ROWS     (Flash-Next mtp only; default: 0 = {FLASH_NEXT_VERIFY_ROWS}; rows a verify round takes across lanes, 0 or 2..{FLASH_NEXT_VERIFY_ROWS}; 3 drafts at one lane only)\n\
-         \x20       --decode-lanes <n>        env: IGNIS_DECODE_LANES   (default: 3; Flash-Next only, 1..={n_decode_lanes}; the sequences it decodes at once, sharing the KV pool -- 524,288 tokens, never more than every lane's context: at 262,144 tokens one lane's pool is half that, and leaves the expert cache more VRAM; the 27B serves a fixed {n_decode_lanes} lanes and refuses it)\n\
+         \x20       --decode-lanes <n>        env: IGNIS_DECODE_LANES   (default: 3; Flash-Next only, 1..={n_decode_lanes}; the sequences it decodes at once, sharing the KV pool -- min(524,288 tokens, lanes x --max-context), never below one --max-context and a page per retained slot: at 262,144 tokens one lane's pool is one context and two lanes or more share 524,288, so one lane leaves the expert cache more VRAM; the 27B serves a fixed {n_decode_lanes} lanes and refuses it)\n\
          \x20       --draft-head <head>       env: IGNIS_DRAFT_HEAD     (default: full; needs --spec; full = the drafter proposes with the target's output head, shortlist = with the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM)\n\
          \x20       --rope-scaling <spec>     env: IGNIS_ROPE_SCALING   (default: none; `yarn:F[,t=..][,bf=..][,bs=..]` rescales the checkpoint's trained 262144-position envelope, F in (1, {MAX_YARN_FACTOR}])\n\
          \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
@@ -2150,6 +2150,7 @@ mod tests {
         let lanes = help.lines().find(|l| l.contains("--decode-lanes")).expect("a --decode-lanes line");
         assert!(!lanes.contains("whole context"), "{lanes}");
         assert!(lanes.contains("sharing the KV pool"), "{lanes}");
+        assert!(lanes.contains("min(524,288 tokens, lanes x --max-context)") && lanes.contains("retained slot"), "{lanes}");
         let pool = help.lines().find(|l| l.contains("--kv-pool-bytes")).expect("a --kv-pool-bytes line");
         assert!(pool.contains("Ktok") && pool.contains("524,288"), "{pool}");
         let floor = help.lines().find(|l| l.contains("--allow-expert-cache-below-floor")).expect("a floor line");

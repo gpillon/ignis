@@ -83,13 +83,20 @@ has "KV_POOL_BYTES=512Ktok" "$out" "--kv-pool-bytes 512Ktok"
 # context; resident on the 27B.
 plan_of() { make config CUDA=1 "$@" 2>/dev/null | sed -n 's/^PLAN  *//p'; }
 for case in "|kv_pool=offloaded 524288 tokens" "LANES=1|kv_pool=offloaded 262656 tokens" \
-            "MAX_CONTEXT=524288|kv_pool=offloaded 524800 tokens" "KV_POOL_BYTES=512Ktok|kv_pool=offloaded 512Ktok (named)"; do
+            "MAX_CONTEXT=524288|kv_pool=offloaded 524800 tokens" "KV_POOL_BYTES=512Ktok|kv_pool=offloaded 512Ktok (named, 524288 tokens)" "KV_POOL_BYTES=4G|kv_pool=offloaded 4G (named, 1016768 tokens)"; do
     knobs="${case%%|*}"; fact="${case#*|}"
     plan="$(plan_of MODEL=flash-next $knobs)"
     case "$plan" in *"$fact"*) ;; *) fail "PLAN [$knobs]: '$fact' missing from: $plan" ;; esac
 done
 engine="$(make config CUDA=1 2>/dev/null | sed -n 's/^engine (CUDA=1) //p')"
 case "$engine" in *"pool=resident"*) ;; *) fail "27B engine line: 'pool=resident' missing from: $engine" ;; esac
+# A named byte count is worth its model's own tokens: 4 GiB under hq-e8-2b on
+# the 27B, 7,281 pages (GitHub #139's figure), and under BF16 1,024.
+for case in "|pool=resident 4G (named, 465984 tokens)" "KV_FORMAT=bf16|pool=resident 4G (named, 65536 tokens)"; do
+    knobs="${case%%|*}"; fact="${case#*|}"
+    engine="$(make config CUDA=1 KV_POOL_BYTES=4G $knobs 2>/dev/null | sed -n 's/^engine (CUDA=1) //p')"
+    case "$engine" in *"$fact"*) ;; *) fail "27B engine line [$knobs]: '$fact' missing from: $engine" ;; esac
+done
 
 out="$(flags)"
 lacks "27B" "$out" "--decode-lanes"

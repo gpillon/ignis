@@ -45,9 +45,11 @@ ifeq ($(MODEL_FAMILY),flash-next)
   # decode route's 8; 3 drafts at one lane only).
   MAX_CONTEXT ?= 262144
   # The decode lanes (--decode-lanes, 1..8): the sequences decoded at once.
-  # They share the KV pool (ADR 0045): 524,288 tokens reserved first, capped
-  # at every lane's context, the rest of the budget to the expert cache. So
-  # one lane leaves the cache more VRAM; two or more share the same pool.
+  # They share the KV pool (ADR 0045), reserved first: min(524,288 tokens,
+  # LANES x MAX_CONTEXT), never below one MAX_CONTEXT and a page per retained
+  # slot; the expert cache takes the rest of the budget. At 262,144 tokens one
+  # lane's pool is one context and two lanes or more share 524,288, so one
+  # lane leaves the cache ~1 GiB more.
   LANES ?= 3
   ROPE_SCALING ?= none
   PREFILL_CHUNK ?= 8192
