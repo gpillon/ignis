@@ -28,6 +28,11 @@
 //!   the last still-active frozen donor; a temporal candidate is only
 //!   admissible while its own service work stays within it.
 //!
+//! Beside the port, ignis's own **page-shortage order** (ADR 0045):
+//! [`choose_page_shortage_victim`] moves only what ranks below the requester
+//! ([`Rank`]), where the head's lane deal keeps
+//! [`choose_retained_lane_victim`]'s order.
+//!
 //! Everything here is a pure value policy (no scheduler state): the
 //! concrete scheduler (`concrete.rs`) drives it per advance. The
 //! boundary-capture selection of the KV-RAM host tier (the reference's
@@ -499,6 +504,100 @@ pub fn choose_resident_candidate_victim(candidates: &[ResidentCandidate]) -> Opt
     selected.map(|c| c.request_id)
 }
 
+/// A live sequence's **rank** (ADR 0045, spec vram-budget/03 AC 32): class
+/// first, then submission order. A moved sequence keeps its rank. A page
+/// shortage moves only what ranks below the requester, and entries onto the
+/// device, restores and admissions alike, are taken in rank order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rank {
+    /// The request's class: `Interactive` ranks above `Agent`.
+    pub class: RequestClass,
+    /// Its id, which is its submission order: earlier ranks above later.
+    pub request_id: RequestId,
+}
+
+impl Rank {
+    /// Whether `self` ranks above `other`.
+    #[must_use]
+    pub fn outranks(&self, other: &Rank) -> bool {
+        match (self.class, other.class) {
+            (RequestClass::Interactive, RequestClass::Agent) => true,
+            (RequestClass::Agent, RequestClass::Interactive) => false,
+            _ => self.request_id < other.request_id,
+        }
+    }
+
+    /// The order entries are taken in: the higher-ranked first.
+    #[must_use]
+    pub fn entry_order(a: &Rank, b: &Rank) -> std::cmp::Ordering {
+        if a.outranks(b) {
+            std::cmp::Ordering::Less
+        } else if b.outranks(a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
+/// One live, device-resident sequence as a shortage of **pages** weighs it
+/// (ADR 0045, spec vram-budget/03 AC 32). Retained state is not a candidate:
+/// it is given up before any of these is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageShortageCandidate {
+    /// Its rank.
+    pub rank: Rank,
+    /// In the decode round: it holds a lane. One waiting for a lane, at a
+    /// chunk boundary or parked is not, and goes first.
+    pub decoding: bool,
+    /// On its way to or from a tier below the device: never a victim.
+    pub in_transfer: bool,
+    /// A donor of the open protection (ADR 0004): never a victim.
+    pub donor: bool,
+    /// A lane reserved for an earlier-queued Interactive request's exact
+    /// reusable state: never a victim.
+    pub reserved_for_earlier_interactive: bool,
+}
+
+/// Whether `candidate` goes before `incumbent` when pages are short: `Agent`
+/// before `Interactive`, then not decoding before a lane holder, then the
+/// latest-submitted. The lane shortage's order
+/// ([`retained_lane_is_better_victim`]) is a different one: there a lane
+/// holder goes first, since moving a lane-less sequence frees no lane.
+#[must_use]
+pub fn page_shortage_is_better_victim(candidate: &PageShortageCandidate, incumbent: &PageShortageCandidate) -> bool {
+    if candidate.rank.class != incumbent.rank.class {
+        return candidate.rank.class == RequestClass::Agent;
+    }
+    if candidate.decoding != incumbent.decoding {
+        return !candidate.decoding;
+    }
+    candidate.rank.request_id > incumbent.rank.request_id
+}
+
+/// The sequence a shortage of pages for `requester` moves down a tier, or
+/// `None` when nothing ranked below it may go: the requester then waits.
+/// Never the requester, nor one in transfer, a donor or a reserved lane.
+#[must_use]
+pub fn choose_page_shortage_victim(requester: Rank, candidates: &[PageShortageCandidate]) -> Option<RequestId> {
+    let mut selected: Option<&PageShortageCandidate> = None;
+    for candidate in candidates {
+        if candidate.rank.request_id == requester.request_id
+            || !requester.outranks(&candidate.rank)
+            || candidate.in_transfer
+            || candidate.donor
+            || candidate.reserved_for_earlier_interactive
+        {
+            continue;
+        }
+        match selected {
+            Some(incumbent) if !page_shortage_is_better_victim(candidate, incumbent) => {}
+            _ => selected = Some(candidate),
+        }
+    }
+    selected.map(|c| c.rank.request_id)
+}
+
 #[cfg(test)]
 mod tests {
     //! The dedicated invariant tests (ADR 0004: "each invariant gets a
@@ -840,6 +939,130 @@ mod tests {
             choose_resident_candidate_victim(&candidates),
             Some(2),
             "an Agent candidate is a better victim than Interactive, oldest-submitted first"
+        );
+    }
+
+    // ── ADR 0045, spec vram-budget/03 AC 32: the page shortage's victim ─────
+
+    fn rank(class: RequestClass, request_id: RequestId) -> Rank {
+        Rank { class, request_id }
+    }
+
+    fn resident(class: RequestClass, request_id: RequestId, decoding: bool) -> PageShortageCandidate {
+        PageShortageCandidate {
+            rank: rank(class, request_id),
+            decoding,
+            in_transfer: false,
+            donor: false,
+            reserved_for_earlier_interactive: false,
+        }
+    }
+
+    #[test]
+    fn rank_is_class_then_submission_order() {
+        let interactive_late = rank(RequestClass::Interactive, 9);
+        let agent_early = rank(RequestClass::Agent, 1);
+        assert!(interactive_late.outranks(&agent_early), "class first: Interactive above Agent");
+        assert!(!agent_early.outranks(&interactive_late));
+        assert!(rank(RequestClass::Agent, 1).outranks(&rank(RequestClass::Agent, 2)), "then earlier above later");
+        assert!(!rank(RequestClass::Agent, 2).outranks(&rank(RequestClass::Agent, 1)));
+        assert!(!agent_early.outranks(&agent_early), "nothing outranks itself");
+    }
+
+    #[test]
+    fn a_page_shortage_takes_only_what_ranks_below_the_requester() {
+        let candidates = [
+            resident(RequestClass::Interactive, 2, true),
+            resident(RequestClass::Agent, 3, true),
+            resident(RequestClass::Interactive, 12, true),
+        ];
+        // An Interactive requester: the Agent first, then a younger
+        // Interactive; never an older one.
+        let requester = rank(RequestClass::Interactive, 10);
+        assert_eq!(choose_page_shortage_victim(requester, &candidates), Some(3));
+        assert_eq!(choose_page_shortage_victim(requester, &candidates[..1]), None, "an older Interactive ranks above it");
+        assert_eq!(choose_page_shortage_victim(requester, &[candidates[0], candidates[2]]), Some(12));
+    }
+
+    #[test]
+    fn an_agent_need_never_moves_an_interactive_sequence_nor_an_older_agent() {
+        let candidates = [
+            resident(RequestClass::Interactive, 20, false),
+            resident(RequestClass::Agent, 4, false),
+            resident(RequestClass::Interactive, 30, true),
+        ];
+        assert_eq!(
+            choose_page_shortage_victim(rank(RequestClass::Agent, 9), &candidates),
+            None,
+            "an Agent admission behind these waits"
+        );
+        // A younger Agent ranks below it.
+        let with_younger = [candidates[0], candidates[1], candidates[2], resident(RequestClass::Agent, 11, true)];
+        assert_eq!(choose_page_shortage_victim(rank(RequestClass::Agent, 9), &with_younger), Some(11));
+    }
+
+    #[test]
+    fn among_eligible_victims_agent_goes_before_interactive() {
+        // The Interactive is younger and not even decoding: class still wins.
+        let candidates = [resident(RequestClass::Interactive, 12, false), resident(RequestClass::Agent, 3, true)];
+        assert_eq!(choose_page_shortage_victim(rank(RequestClass::Interactive, 10), &candidates), Some(3));
+    }
+
+    #[test]
+    fn within_a_class_a_sequence_not_decoding_goes_before_a_lane_holder() {
+        // The lane holder is the younger one: not decoding still wins.
+        let candidates = [resident(RequestClass::Agent, 5, true), resident(RequestClass::Agent, 3, false)];
+        assert_eq!(choose_page_shortage_victim(rank(RequestClass::Interactive, 10), &candidates), Some(3));
+    }
+
+    #[test]
+    fn then_the_latest_submitted_goes_first() {
+        let candidates = [
+            resident(RequestClass::Agent, 3, true),
+            resident(RequestClass::Agent, 7, true),
+            resident(RequestClass::Agent, 5, true),
+        ];
+        assert_eq!(choose_page_shortage_victim(rank(RequestClass::Interactive, 10), &candidates), Some(7));
+        let lane_less = [resident(RequestClass::Agent, 4, false), resident(RequestClass::Agent, 6, false)];
+        assert_eq!(choose_page_shortage_victim(rank(RequestClass::Interactive, 10), &lane_less), Some(6));
+    }
+
+    #[test]
+    fn never_the_requester_one_in_transfer_a_donor_or_a_reserved_lane() {
+        let requester = rank(RequestClass::Interactive, 10);
+        let excluded = [
+            // The requester's own rank, were it ever among the candidates.
+            PageShortageCandidate { rank: requester, ..resident(RequestClass::Interactive, 10, false) },
+            PageShortageCandidate { in_transfer: true, ..resident(RequestClass::Agent, 7, false) },
+            PageShortageCandidate { donor: true, ..resident(RequestClass::Agent, 6, true) },
+            PageShortageCandidate { reserved_for_earlier_interactive: true, ..resident(RequestClass::Agent, 5, true) },
+        ];
+        assert_eq!(choose_page_shortage_victim(requester, &excluded), None);
+        let with_one = [excluded[0], excluded[1], excluded[2], excluded[3], resident(RequestClass::Agent, 2, true)];
+        assert_eq!(
+            choose_page_shortage_victim(requester, &with_one),
+            Some(2),
+            "the one candidate left, though it would rank last among them all"
+        );
+    }
+
+    #[test]
+    fn entries_sort_in_rank_order() {
+        let mut ranks = vec![
+            rank(RequestClass::Agent, 2),
+            rank(RequestClass::Interactive, 9),
+            rank(RequestClass::Agent, 1),
+            rank(RequestClass::Interactive, 4),
+        ];
+        ranks.sort_by(Rank::entry_order);
+        assert_eq!(
+            ranks,
+            vec![
+                rank(RequestClass::Interactive, 4),
+                rank(RequestClass::Interactive, 9),
+                rank(RequestClass::Agent, 1),
+                rank(RequestClass::Agent, 2),
+            ]
         );
     }
 

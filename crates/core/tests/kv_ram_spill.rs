@@ -230,7 +230,15 @@ fn occupancy_reports_the_kv_ram_arena_a_spill_filled() {
     // knows the figure, which is why ADR 0030 takes it off the scheduler
     // rather than by asking the leaf.
     let compute = Arc::new(MockCompute::with_sections(crate::sections()));
-    let mut sched = ConcreteScheduler::with_config(tight(2), compute.clone());
+    // KV-RAM of one blob, and a resident slot for every request: the lanes
+    // are the shortage, and the head's lane deal keeps its own order. A slot
+    // shortage would be ADR 0045's rank gate, where an Interactive newcomer
+    // moves no older Interactive; and a second head would wait for the
+    // first one's victim, which outranks it, to come back.
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig { resident_slot_capacity: 16, ..tight(1) },
+        compute.clone(),
+    );
     assert_eq!(sched.occupancy().kv_ram_used_bytes, 0, "nothing spilled yet");
 
     turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Agent);
@@ -254,12 +262,10 @@ fn occupancy_reports_the_kv_ram_arena_a_spill_filled() {
             .unwrap();
     }
     sched.advance();
-    for i in 0..2 {
-        sched
-            .submit(input(tokens(400_000 + i * 10, 4), None, 4), RequestClass::Interactive)
-            .unwrap();
-        sched.advance();
-    }
+    sched
+        .submit(input(tokens(400_000, 4), None, 4), RequestClass::Interactive)
+        .unwrap();
+    sched.advance();
     assert_eq!(sched.host().retained_count(), 0, "the pressure took the blob");
     assert_eq!(
         sched.occupancy().kv_ram_used_bytes,
@@ -431,34 +437,39 @@ fn nothing_crosses_to_kv_ram_while_the_device_has_room() {
 #[test]
 fn a_retained_agent_checkpoint_is_discarded_before_an_evicted_interactive_sequence() {
     let compute = Arc::new(MockCompute::with_sections(crate::sections()));
-    let mut sched = ConcreteScheduler::with_config(tight(2), compute.clone());
+    // KV-RAM of one blob, and a resident slot for every request: the lanes
+    // are the shortage, and the head's lane deal keeps its own order. A slot
+    // shortage would be ADR 0045's rank gate, where an Interactive newcomer
+    // moves no older Interactive; and a second head would wait for the
+    // first one's victim, which outranks it, to come back.
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig { resident_slot_capacity: 16, ..tight(1) },
+        compute.clone(),
+    );
 
     let agent_turn = turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Agent);
     assert_eq!(compute.spilled_checkpoints(), vec![agent_turn]);
     assert_eq!(sched.host().used_bytes(), crate::sections().blob_bytes(1150), "KV-RAM: the Agent blob");
 
-    // Eight Interactive requests hold every lane; two more Interactive heads
-    // each take one by snapshotting a lane holder into KV-RAM. The second
-    // snapshot does not fit next to the first *and* the blob.
+    // Eight Interactive requests hold every lane; one more Interactive head
+    // takes one by snapshotting a lane holder into KV-RAM. The snapshot does
+    // not fit next to the blob.
     for i in 0..8 {
         sched
             .submit(input(tokens(300_000 + i * 10, 4), None, 60), RequestClass::Interactive)
             .unwrap();
     }
     sched.advance();
-    let mut events = Vec::new();
-    for i in 0..2 {
-        sched
-            .submit(input(tokens(400_000 + i * 10, 4), None, 4), RequestClass::Interactive)
-            .unwrap();
-        events.extend(sched.advance());
-    }
+    sched
+        .submit(input(tokens(400_000, 4), None, 4), RequestClass::Interactive)
+        .unwrap();
+    let events = sched.advance();
 
     let evicted = events
         .iter()
         .filter(|e| matches!(e, SchedEvent::Evicted { .. }))
         .count();
-    assert_eq!(evicted, 2, "both heads went through the host tier");
+    assert_eq!(evicted, 1, "the head went through the host tier");
     assert_eq!(
         count(&events, RetainedStateOperation::Discard, ReuseSource::KvRam),
         1,
