@@ -78,6 +78,7 @@ restore, against the unmoved run at the same B1 token:
 | free moved run vs the control forced to its text | 340 vs 338, +0.6% (1,409 rounds) | -2 to +5% | -4 to +6% (run 2) |
 | forced moved run vs that control | 337 vs 338, -0.3% (1,455) | | -8 to +7% |
 | AC 43's test (both forced, one process, caches +0.05% apart) | 356 vs 355, +0.3% (1,456) | -1.4 to +2.5% | -5.2 to +9.7% |
+| AC 43's test on a second text, the free control's (caches -0.71% apart) | 257 vs 260, -1.2% (1,452) | -3.9 to +3.3% | -9.1 to +10.5% |
 
 The forced control's rounds before any arrival missed what the free
 control's did (175.9 and 175.9: the same text up to there), and the forced
@@ -85,13 +86,17 @@ moved run what the free one did (305-367 against 304-379 per 200 of B1's
 tokens): forcing changes the route, not the misses.
 
 The first rounds after the restore, mean misses a round against the unmoved
-run at the same tokens, the three pairs in the table's order:
+run at the same tokens, the four same-text pairs in the table's order:
 
 | rounds after the restore | 0-4 | 5-9 | 10-19 | 20-49 | 50-99 |
 |---|---|---|---|---|---|
 | free moved vs forced control | +28% | +4% | +6% | -2% | -2% |
 | forced moved vs forced control | +9% | +1% | +3% | -2% | -2% |
 | AC 43's test | +21% | +7% | +3% | -3% | -2% |
+| AC 43's test, second text | +32% | +8% | +10% | 0% | -5% |
+
+Ten rounds are too few to read: windows of ten spread -14 to +16% either way
+well after the restore.
 
 A first AC 43 run measured -4.8%: its second load (the control) planned an
 expert cache 2.3% smaller (23,176 slots against 23,721 alone), because the
@@ -125,10 +130,11 @@ Observed:
 
 - **A move adds no expert misses.** Made to generate the same text, the
   rounds after a 236K-token sequence's restore miss what the unmoved run's
-  rounds miss at the same tokens: +0.6%, -0.3% and +0.3% over three pairs,
-  every 200-round window within -2 to +5%, from the first round after the
-  restore -- but for its first rounds: rounds 0-4 miss +9 to +28% more,
-  rounds 5-9 +1 to +7%, and from round 10 the two are level.
+  rounds miss at the same tokens: +0.6%, -0.3%, +0.3% and -1.2% over four
+  pairs on two texts, every 200-round window within -4 to +5%, from the
+  first round after the restore -- but for its first rounds: rounds 0-4
+  miss +9 to +32% more, rounds 5-9 +1 to +8%, rounds 10-19 +3 to +10%, and
+  from round 20 the two are level (-3 to 0% over rounds 20-49).
 - **Nor does the long arrival.** The same text with and without E0 and E
   misses alike from the round E ended on (+0.6%). The rise from before the
   arrivals to after them -- +38% on the control's own text, +89% on the
@@ -158,8 +164,8 @@ Inferred, not measured:
 
 - The first rounds' extra misses are C's own experts coming back into a
   cache that dropped them while C was away (~30-75 misses a round for five
-  rounds: some 10-15 ms of stall in all, at the ~50 µs a miss these rounds
-  stall).
+  rounds, fewer for the next fifteen: some 10-20 ms of stall in all, at the
+  ~50 µs a miss these rounds stall).
 - C's text, which never repeats a token, costs most of a width-3 round's
   misses: ~166 a round with B1 and B2 early in their texts, against ~25 for
   a fresh pair at width 2.
@@ -177,9 +183,9 @@ Inferred, not measured:
   cost.
 - AC 43 holds the rounds after a restore to the same text unmoved (a
   committed text, `crates/server/tests/fixtures/ac37_text.json`): rounds
-  10-19 within +10% in mean misses (N = 10), and each full 200-round
+  20-49 within +10% in mean misses (N = 20), and each full 200-round
   window's median within +10% from the first round. Re-warming the restored
-  sequence's experts could take the first rounds' ~10-15 ms; not worth a
+  sequence's experts could take the first rounds' ~10-20 ms; not worth a
   mechanism at that size.
 - Any comparison whose cost depends on what lanes generate needs the same
   text on both sides; a free control is another text once the batches part,
@@ -187,8 +193,8 @@ Inferred, not measured:
 
 ## Limits and unknowns
 
-- One host, one scenario, synthetic prompts whose texts include loops; three
-  same-text pairs.
+- One host, one scenario, synthetic prompts whose texts include loops; four
+  same-text pairs over two texts.
 - A forced run takes the eager route; its misses matched the free run's on
   the same text, its ITL is not a serving number.
 - Whether the move in's copies slow the expert copies they share the link

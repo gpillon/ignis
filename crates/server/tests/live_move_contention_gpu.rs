@@ -1082,9 +1082,10 @@ fn median_misses(misses: &[u64]) -> f64 {
 /// 260 tokens further on in the control, which its text (a token never
 /// repeated) does not make a different cost. Starting bounds, for the owner
 /// to confirm (printed, not asserted): C's experts come back into the cache
-/// over its first rounds, so by the 10th round after the restore (N = 10)
-/// the mean misses of rounds 10-19 are within +10% of the control's over the
-/// same tokens; and from the first round, each full window of 200 rounds'
+/// over its first rounds, so from the 20th round after the restore (N = 20)
+/// the mean misses of rounds 20-49 are within +10% of the control's over the
+/// same tokens (ten rounds are too few to judge: they spread +-15% either
+/// way); and from the first round, each full window of 200 rounds'
 /// median misses is within +10%. Asserted: the two runs generated the
 /// same text, and no work was lost (AC 37's leg asserts it). A forced round
 /// is never a captured graph, so the runs' ITL are not compared.
@@ -1160,12 +1161,13 @@ fn the_rounds_after_a_restore_miss_what_the_same_text_misses_unmoved() {
         let (moved, unmoved) = rounds.iter().fold((0u64, 0u64), |(m, u), p| (m + p.0, u + p.1));
         (moved as f64 / unmoved as f64 - 1.0) * 100.0
     };
-    let settled = mean_gap(&pairs[10..20]);
+    let settled = mean_gap(&pairs[20..50]);
     println!(
         "AC 43: the rounds after the restore, mean misses moved against the same text unmoved: rounds 0-4 {:+.1} %, \
-         5-9 {:+.1} %, 10-19 {settled:+.1} % (N = 10, bound +10 %: {}); the first 10, each: {:?}",
+         5-9 {:+.1} %, 10-19 {:+.1} %, 20-49 {settled:+.1} % (N = 20, bound +10 %: {}); the first 10, each: {:?}",
         mean_gap(&pairs[..5]),
         mean_gap(&pairs[5..10]),
+        mean_gap(&pairs[10..20]),
         if settled <= 10.0 { "within" } else { "OVER" },
         &pairs[..10]
     );

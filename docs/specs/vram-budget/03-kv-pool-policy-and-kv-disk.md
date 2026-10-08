@@ -150,7 +150,7 @@ gives the reason for each.
 | Entry rule | a restore never moves anything; entries in rank order; growth branch: free pages ≥ reservation + 4 steps for itself and each resident sequence above it; fixed branch: the reservation fits | *(agent)* |
 | Last resort (growth branch) | every resident sequence parked and no tier takes a victim: the lowest-ranked is re-queued, with an ERROR | *(agent)* |
 | PCIe contention | move out: ITL p50 +10%; move in: +25% on a step's time outside its expert stall and transfer passes, what the transfer adds (owner, 2026-10-08, GitHub #310); either: max within baseline + 150 ms | *(agent)*, owner to confirm |
-| Rounds after a restore (GitHub #310) | against the same text unmoved, at the same tokens: rounds 10-19 after the restore (N = 10) within +10% in mean expert misses, and each 200-round window's median within +10% from the first round | *(agent)*, owner to confirm, measured by AC 43 |
+| Rounds after a restore (GitHub #310) | against the same text unmoved, at the same tokens: rounds 20-49 after the restore (N = 20) within +10% in mean expert misses, and each 200-round window's median within +10% from the first round | *(agent)*, owner to confirm, measured by AC 43 |
 | Move pace (GitHub #309) | a live move goes a window at a time each way, one in flight, at most one new an advance; Flash-Next: `MOVE_IN_WINDOW_BYTES` 16 MiB onto the device (KV-RAM restores, KV-disk restore feeds), `MOVE_OUT_WINDOW_BYTES` 12 MiB off it (into KV-RAM, and a KV-disk spill's copies into its staging since GitHub #310), beside the rounds; the 27B: unpaced (one window) | *(agent)*, measured by AC 37 |
 | KV-disk on | Flash-Next `--kv-disk-bytes 4G` (owner 2026-10-08: 4 GiB to start); 27B `0` | *(owner)* build, *(agent)* sizes |
 | Location | `--kv-disk-path model` (beside the artifact), `auto`, or a directory: the n-gram cache's rule | *(owner)*, confirmed 2026-10-08 |
@@ -936,15 +936,17 @@ the fixed branch, *(both)* on either.
       falls does not change what it costs.
     - Starting bounds, for the owner to confirm. C's experts come back into
       the cache over its first rounds: rounds 0-4 after the restore miss
-      +9 to +28% more than the unmoved run's (three pairs), rounds 5-9 +1 to
-      +7%. So:
-      - N = 10: the mean misses of rounds 10-19 after the restore are within
-        +10% of the unmoved run's over the same tokens (measured +3 to +6%);
+      +9 to +32% more than the unmoved run's (four pairs, two texts), rounds
+      5-9 +1 to +8%, rounds 10-19 +3 to +10% -- where ten rounds already
+      spread +-15% either way. So:
+      - N = 20: the mean misses of rounds 20-49 after the restore are within
+        +10% of the unmoved run's over the same tokens (measured -3 to 0%);
       - from the first round, each full window of 200 rounds' median misses
-        is within +10% (measured -1.4 to +2.5%; all 1,456 rounds +0.3%).
+        is within +10% (measured -3.9 to +3.3% over two texts; all rounds
+        +0.3% and -1.2%).
 
-      The rounds 0-4 and 5-9, the 50-round windows (-5.2 to +9.7%) and the
-      first 10 rounds are printed beside them.
+      The rounds 0-4, 5-9 and 10-19, the 50-round windows and the first 10
+      rounds are printed beside them.
     - Not compared: ITL. A forced round is never a captured graph.
     - Asserted: the two runs generated the same text, and nothing was lost
       (AC 37's assertions).
