@@ -237,9 +237,22 @@ pub struct NgramCounts {
     file_rows: AtomicU64,
     reads: AtomicU64,
     read_bytes: AtomicU64,
+    /// Wall time prefill gathers took, in nanoseconds (spec vram-budget/03
+    /// AC 25: what KV-disk's writes on the same volume may cost them).
+    prefill_gather_nanos: AtomicU64,
 }
 
 impl NgramCounts {
+    /// One prefill gather's wall time.
+    pub fn record_prefill_gather(&self, elapsed: std::time::Duration) {
+        self.prefill_gather_nanos.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// The wall time prefill gathers have taken so far.
+    pub fn prefill_gather_nanos(&self) -> u64 {
+        self.prefill_gather_nanos.load(Ordering::Relaxed)
+    }
+
     /// One gather's rows by source, and the reads behind them.
     pub fn record(&self, hot_rows: u64, file_rows: u64, reads: u64, read_bytes: u64) {
         self.hot_rows.fetch_add(hot_rows, Ordering::Relaxed);
@@ -591,7 +604,10 @@ impl NgramTable {
     /// gather, under the [`GatherGate`] KV-disk waits on.
     pub fn stage(&self, context: &mut NgramContext, tokens: &[u32], out: &mut [u8]) -> Result<(), String> {
         let _gathering = self.prefill_gate.enter();
-        self.begin(context, tokens)?.finish(out)
+        let started = std::time::Instant::now();
+        let staged = self.begin(context, tokens).and_then(|rows| rows.finish(out));
+        self.counts.record_prefill_gather(started.elapsed());
+        staged
     }
 
     /// The gate a prefill's gather raises (spec vram-budget/03), for the
@@ -1082,6 +1098,7 @@ mod tests {
     fn a_decode_step_stages_every_lanes_token_lane_major() {
         let table_file = TableFile::write("lanes", 1_000, 4096);
         let table = NgramTable::open(&table_file.path, table_file.layout, hasher(1_000), &[5, 50], options(1 << 16)).unwrap();
+        assert_eq!(table.counts().prefill_gather_nanos(), 0);
         let prompts: [&[u32]; 3] = [&[1, 2, 3], &[9, 7], &[4]];
         let next = [21u32, 22, 23];
         // Each sequence alone: its prompt, then its next token.
@@ -1094,6 +1111,8 @@ mod tests {
             table.stage(&mut context, &[token], &mut step).unwrap();
             alone.push(step);
         }
+        // Spec vram-budget/03 AC 25: a staged gather's wall time is counted.
+        assert!(table.counts().prefill_gather_nanos() > 0);
         // The three prompts admitted, then one decode step for all lanes.
         let mut contexts: Vec<NgramContext> = (0..3).map(|_| table.new_context()).collect();
         for (context, prompt) in contexts.iter_mut().zip(prompts) {

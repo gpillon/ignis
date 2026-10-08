@@ -54,6 +54,12 @@ impl FlashNextCounterSource {
             ngram: self.ngram.read(),
         }
     }
+
+    /// The wall time the table's prefill gathers have taken, in nanoseconds
+    /// (spec vram-budget/03 AC 25).
+    pub fn ngram_prefill_gather_nanos(&self) -> u64 {
+        self.ngram.prefill_gather_nanos()
+    }
 }
 
 #[cfg(test)]
