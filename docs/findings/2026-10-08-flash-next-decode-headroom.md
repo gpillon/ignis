@@ -1,10 +1,10 @@
-# Flash-Next decode headroom: one lane is kernel-bound, three lanes are link-bound, and neither a perfect predictor at today's budget nor CPU experts changes that much
+# Flash-Next decode headroom: one lane is kernel-bound with the link 44% busy, three lanes and prefill are link-bound, and neither a perfect predictor at today's budget nor CPU experts changes that much
 
 - Kind: experiment
 - Status: current
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
-- Scope: serving / Flash-Next decode round at the 262K x 3-lane default; core / expert residency prediction (the router lookahead, the prefetch budget); a CPU path for routed experts
+- Scope: serving / Flash-Next decode round at the 262K x 3-lane default, the PCIe link's timeline in decode and prefill; core / expert residency prediction (the router lookahead, the prefetch budget); a CPU path for routed experts
 - Related: https://github.com/gpillon/ignis/issues/306, [Flash-Next decode round](2026-10-06-flash-next-decode-round.md), [KV pool follows residency](2026-10-08-flash-next-kv-pool-follows-residency.md), [Expert residency replayed on the study's routing](2026-10-05-expert-residency-replayed-on-the-study-s-routing.md), [An SM-driven copy matches the copy engine](2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md), [MoE decode is structure-bound](2026-10-05-moe-decode-is-structure-bound.md), [spec flash-next/03](../specs/flash-next/03-expert-residency.md)
 - Superseded by: none
 
@@ -21,6 +21,13 @@ structure? Three numbers decide it:
 2. how much of the expert stall a perfect predictor would remove at the same
    prefetch budget and cache, and how good today's predictor is;
 3. what one routed expert costs on the CPU against copying it over the link.
+
+Added the same day (the owner, after the Monitor showed ~8 GB/s on a ~12 GB/s
+link): is the link limited by bandwidth or latency, or used inefficiently? For
+decode at one and three lanes and for one prefill chunk: how busy the link is
+over time, what each copy achieves and how large copies are, where the idle
+gaps sit, how much copy time is on the critical path, and what the Monitor's
+rate averages over (section 4).
 
 ## Evidence
 
@@ -177,6 +184,91 @@ expert's 1.53 MB mean at 12.3 GB/s = **124 µs**):
   measured: the gather path is slow because AVX2 gathers are slow on this CPU
   under its microcode (the Downfall / GDS mitigation).
 
+### 4. The PCIe link's timeline
+
+**How residency copies.** No copy engine: per layer step a demand copy
+(`copy_jobs_timed`, 16 blocks, its stream's next node is the expert op) and a
+prefetch copy (`copy_jobs`, 16 blocks, on residency's stream after the demand
+copy, joined by the next step) read the mapped host pool with SM loads
+(`kernel/src/residency.cu`). Each kernel walks its jobs, one per projection
+(0.42-1.65 MB), back to back; a step with nothing to copy launches the kernel
+anyway and it returns at once. The two copies of a step never overlap: 0 µs of
+"demand and prefetch at once" in every capture.
+
+**Setup.** Two sources, labelled in every row:
+- *untraced*: the rate run of section 1. The demand copies' bytes are the
+  per-class miss counters times the record size, the rest of
+  `ignis_expert_bytes_moved_total` is prefetch, and the stall timer gives the
+  demand copies' device time (`link/split.py`);
+- *traced*: three node-level Nsight Systems windows on the same binary and
+  flags (`--cuda-graph-trace=node`, 3 s of one-lane and of three-lane decode,
+  6 s around a cold 9,191-token prompt: an 8,192-token chunk, then a
+  999-token tail), read by `link/link.py`. Node tracing perturbs the link:
+  the one-lane round grows from 9.85 to 11.68 ms and its copies run at
+  11.2-11.6 GB/s; the three-lane round from 27.5 to 39.2 ms, its copies at
+  9.2-9.8 GB/s (the stall timer itself reads 10.3 GB/s in that window). The
+  traced rows are used for where things sit and in what order, not for rates.
+  The prefill window opened ~0.75 s into the chunk: it holds the chunk's last
+  1.43 s (32 of 48 layers) and the whole tail.
+
+| | 1 lane (per token) | 3 lanes (per round) | prefill (8,192-token chunk) |
+|---|---|---|---|
+| bytes: demand + prefetch (untraced) | 22.1 + 29.6 MB | 178.8 + 113.7 MB | 21.2-21.9 GB per chunk (2026-10-07); this 9,191-token prompt 3.53 + 34.22 GB |
+| demand copy rate while it runs (stall timer, untraced) | **12.0 GB/s** | **11.9 GB/s** | **12.4 GB/s** |
+| link busy (bytes / rate, untraced) | **4.3 ms of 9.85 (44%)** | **24.6 ms of 27.5 (89%)** | 74% of the traced window (80% over the 2026-10-07 chunks) |
+| of it on the critical path (demand) | 1.84 ms (43% of link time) | 15.0 ms (61%) | 4% of the window |
+| prefetch running with no compute anywhere (traced) | 0.04 ms per round (1.6% of prefetch) | 2.4 ms per round (21%) | 198 ms of 1.43 s (14%), ~6.2 ms per layer |
+| average over the phase (what a rate meter sees) | 5.2 GB/s | 10.6 GB/s | 9.0 GB/s over the prompt's 4.19 s TTFT |
+| active copy kernels per unit (traced) | 13.5 demand (1.36 MB each) + 35.4 prefetch (0.82 MB) | 43.5 demand (4.5 MB) + 47 prefetch (2.4 MB) | 48 demand (~23 MB) + 47 prefetch (~0.4 GB, ~31 ms each) |
+| projections per token (untraced) | 32.7 demand (0.67 MB mean) + 46.5 prefetched | 81.7 (0.73 MB) + 56.5 | 0.72 MB mean |
+| empty copy kernels (traced) | 46 per round, 77 µs | 4.5, 6 µs | 0 |
+
+Copy durations (traced, one lane): demand p10/p50/p90 38 / 106 / 230 µs,
+modes at 20-40 µs (one 2-bit down projection, 0.42 MB) and 100-120 µs (a
+whole 2-bit expert, 1.25 MB); prefetch 46 / 71 / 88 µs, almost all one
+projection, which is what the one-row budget (1.17 MB) admits. The
+2026-10-05 bench put the link's ceiling for this kernel at 12.2-12.4 GB/s on
+batched copies (9.6-11.1 GB/s for a single 0.5-1 MiB copy).
+
+**Where the link idles (traced, shares of the link-idle time).**
+- *One lane* (link idle 56% untraced): under the attention sublayers' dense
+  FP8 linears, HC mixes and attention kernels 53%, with nothing on the device
+  31% (between replays, and node-trace gaps), under side-stream work (the
+  lookahead branch's router, rank and resolve, the shared expert) 14%. Every
+  copy issues 0.1 µs after the node it depends on (the resolve, or the demand
+  copy); `resolve_demand` runs 9.7 µs before each active demand copy, after
+  the router's select by 0.1 µs. The idle is not waiting: within the budget
+  there is nothing left to copy, and the next layer's misses are unknown
+  until its router runs. Prefetches end before the next step; it never waits
+  at its join.
+- *Three lanes* (link idle 11% untraced): between replays (most of the
+  traced "device idle") and, per layer, the next step's `resolve_demand`
+  (20 µs mean), which starts **59 µs** after its router's select because the
+  step first joins the previous layer's still-running prefetch copy: the link
+  is serial, so the prefetch delays the next demand copy. Gaps between busy
+  spans: 90 per round, p50 8.5 µs.
+- *Prefill chunk* (link idle 26% of the window): **69% of it while the routed
+  experts run**. The prefetch copy of each layer, ready when its
+  `resolve_prefetch` and the demand copy end, starts **5.9 ms later** (p50
+  6.1 ms), within 0.2 ms of the end of `prefill_gate_up_kernel` or
+  `prefill_down_kernel`, its only dependencies (the demand copy's event and
+  its resolve) long met: its 16 blocks wait for SMs the expert kernels hold.
+  The next layer then waits for that late copy at its join (5.3 ms on average
+  from its router's select to its `resolve_demand`), which is the 14% exposed
+  prefetch. The other 23% of the idle is with nothing on the device.
+
+**The Monitor's rate.** The Expert residency card's "Host to device" figure
+and its Bytes/s chart are `ignis_expert_bytes_moved_total` (decode +
+prefill) gained over a rolling
+**30 s** span (`RATE_SPAN_MS`, `web/src/monitor/derive.ts`), from scrapes
+every 2-5 s (`web/src/monitor/scrape.ts`), so it is a wall-clock mean that
+includes idle seconds and mixes phases. The server re-reads the device's
+counters after every scheduler step (`crates/server/src/engine.rs`: a decode
+round, or a whole prefill chunk), so the series lags by at most one step.
+Against the averages above: one decoding lane alone reads ~5.2 GB/s, three ~10.6 GB/s, a cold prompt ~9 GB/s; ~8 GB/s
+is a mix of these, or of one of them with idle time, while each copy runs at
+~12 GB/s.
+
 ## Finding
 
 Observed:
@@ -196,6 +288,34 @@ Observed:
 5. **One expert costs the CPU about what the link costs it**: 112-132 µs on all
    ten cores pinned and spinning, against 124 µs of copy; 0.94-1.0 ms on one
    core. The decode is exact and the block is within the GPU test's bound.
+6. **Every copy runs at the link's rate** (demand copies 11.9-12.4 GB/s by the
+   device's own timer, against a 12.2-12.4 GB/s ceiling), and per-copy
+   overhead is not measurable beyond ~1%: copies issue 0.1 µs after their
+   dependency, and the one-lane round's 46 empty copy kernels cost ~77 µs
+   (~35 of them, ~60 µs, on the critical path). Many small copies are not
+   the problem.
+7. **One-lane decode is not bandwidth-bound**: the link is busy 44% of a token
+   and averages 5.2 GB/s. What it costs is order, not rate: the 1.84 ms of
+   demand copies sit on the critical path because a miss is known only after
+   its own layer's router; the idle link is the budget and the predictor
+   having nothing more to send.
+8. **Three-lane decode is bandwidth-bound**: the link is busy 89% of a round
+   (10.6 GB/s average); the rest is between replays and the per-layer resolve
+   that waits for the previous prefetch to finish.
+9. **A prefill chunk is link- and compute-bound in equal measure** (21-22 GB at
+   ~12.3 GB/s against ~1.7-1.8 s of compute, 2026-10-07), but the link idles
+   26% of the window because the SM-driven prefetch copy cannot start while
+   the routed-expert kernels hold every SM: it starts ~6 ms per layer late,
+   and the next layer waits ~6 ms for it.
+
+Inferred, the link: letting each prefill prefetch copy start when it is
+ready (a higher-priority prefetch stream, or SMs held back for the copy, so
+its blocks take the next free SM slots instead of the end of the expert
+kernel) would remove up to the exposed ~6 ms per layer, **~0.3 s of a
+~2.2 s chunk (~13% of each full 8K chunk; less of a TTFT that also holds
+short, copy-bound traversals)**, with the link then ~90% busy.
+Decode at one lane has no link headroom to buy by itself; at three lanes the
+recoverable idle is at most the 11%, most of it between replays.
 
 Inferred (tok/s from the 2026-10-08 A-B-A calibration, where the mean round
 moved one for one with the stall: 0.40 ms per token against a 0.41 ms stall
@@ -256,6 +376,11 @@ The ranking, each with its estimated gain (inferred) at one and three lanes:
    Large engineering cost, three-lane only.
 4. **Nothing**: 101.5 tok/s at one lane, 109.1 aggregate at three.
 
+For prefill, outside this ranking: run the prefetch copy beside the expert
+kernels (stream priority or reserved SMs) for ~13% of a cold chunk (inferred
+above), a small change next to the layer-major chunk groups the 2026-10-07
+decomposition estimated at ~19% for 30K prompts.
+
 ## Limits and unknowns
 
 - One served run per configuration, greedy prose prompts, contexts under 2K;
@@ -283,6 +408,16 @@ The ranking, each with its estimated gain (inferred) at one and three lanes:
   verdict, unless it beats the link by a wide margin.
 - A learned predictor and a lookahead two layers ahead were not evaluated:
   the traces carry only layer L's ranking for layer L+1.
+- The link figures' busy fractions and rates come from counters and the
+  device's stall timer (untraced); the prefetch copies' rate is taken equal
+  to the demand copies' (in the one-lane trace they ran within 3% of each
+  other). Where the idle sits comes from node-level traces, which inflate the
+  rounds (+19% one lane, +43% three) and slow the copies (to 9.2-11.6 GB/s):
+  the three-lane shares in particular are indicative.
+- The prefill copy's wait for SMs is inferred from timing (its start lands
+  within 0.2 ms of the expert kernels' ends, ~6 ms after its dependencies)
+  and from the code (no other dependency); no stream priority or SM
+  reservation was tried. One prompt, one chunk's last 32 layers.
 
 Raw material, untracked, in the main checkout's `.scratch/fn-study/`:
 - `oracle-replay.patch` (the replay test's study variant, run as
@@ -296,7 +431,10 @@ Raw material, untracked, in the main checkout's `.scratch/fn-study/`:
   `cpu-bench-L24-sliced.log`, `cpu-bench-L24-final.log`;
 - `rate/` (`rate.sh`, `trace.sh`, `analyze.py`, `summary.py`, the `main1.*`
   logs and metrics, the `g1lane` / `g3lane` captures: the `.nsys-rep` and
-  `.sqlite` embed the environment, never commit them).
+  `.sqlite` embed the environment, never commit them);
+- `link/` (`trace.sh`, `link.py`, `split.py`, `prefill_client.py`, the
+  `n1lane` / `n3lane` / `nprefill` captures, never committed, their
+  `*.link.txt` reports and per-second metrics).
 
 ## Follow-ups
 
@@ -305,3 +443,5 @@ Raw material, untracked, in the main checkout's `.scratch/fn-study/`:
 - A confidence filter for the router lookahead (implication 2) has no issue
   yet: what it would read (the router's logit margin, the candidate's rank,
   its recent use) is a design question for a spec.
+- The prefill prefetch copy's priority (or reserved SMs) has no issue yet: an
+  A/B of a cold 8K and 30K TTFT would size it.
