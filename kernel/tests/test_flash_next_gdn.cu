@@ -11,7 +11,9 @@
 // lane's final state, the untouched slots and every call's scratch peak (against
 // fn_gdn_layer_scratch_bytes) are checked. The convolution weight is the artifact's
 // [channels][4] (conv1d.weight), random per tap, so a tap-major read cannot pass. Then
-// fn_gdn_layer itself on a seq pool: its layer and slot, and its refusals.
+// fn_gdn_layer itself on a seq pool: its layer and slot, and its refusals. And (GitHub #306) the
+// fused route -- one grouped projection launch, the gating inside the convolution's -- against
+// the five launches, bit for bit, at decode and prefill shapes.
 //
 // Tolerance: the layer's output inherits the vendored recurrence's own criterion (relative L2
 // 4.1e-3, gross 5.5e-3 of the largest reference; vendor/tests/ops/test_gated_delta_net.cpp),
@@ -21,6 +23,7 @@
 // (the BF16 projections) within the rounding of the FP8 linear's fp32 accumulation bound, almost
 // all of them exact.
 
+#include "flash_next/fusion.h"
 #include "flash_next/gdn.h"
 
 #include "flash_next_s2_test_common.h"
@@ -211,6 +214,27 @@ struct Device {
     return s;
   }
 };
+
+// The kernel nodes `launch()` captures on `stream`, or -1 when it fails.
+template <class Launch>
+int captured_kernels(cudaStream_t stream, Launch launch) {
+  cudaGraph_t graph = nullptr;
+  MOE_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  const int32_t rc = launch();
+  MOE_CUDA(cudaStreamEndCapture(stream, &graph));
+  std::size_t count = 0;
+  MOE_CUDA(cudaGraphGetNodes(graph, nullptr, &count));
+  std::vector<cudaGraphNode_t> nodes(count);
+  MOE_CUDA(cudaGraphGetNodes(graph, nodes.data(), &count));
+  int kernels = 0;
+  for (cudaGraphNode_t node : nodes) {
+    cudaGraphNodeType type;
+    MOE_CUDA(cudaGraphNodeGetType(node, &type));
+    kernels += type == cudaGraphNodeTypeKernel ? 1 : 0;
+  }
+  MOE_CUDA(cudaGraphDestroy(graph));
+  return rc == 0 ? kernels : -1;
+}
 
 fn::Geometry geometry() {
   fn::Geometry g;
@@ -440,6 +464,70 @@ int main() {
           "fn_gdn_layer: a context without a seq pool is refused by name");
     ignis_seq_release(pool, seq);
     ignis_seq_pool_free(pool);
+  }
+
+  // GitHub #306, step 4 (fusion.h's Gdn): the four projections in one grouped GEMV launch and the
+  // gating inside the convolution's launch, against the five launches, bit for bit -- the output
+  // and every slot's conv taps and recurrent state, each run from the same state over a poisoned
+  // arena -- for 1, 3 and 5 decode lanes and one-lane prefills of 6 tokens (grouped) and 70 (past
+  // the GEMV's 8 rows: only the gating moves). Fused, a call captures 4 fewer kernels (1 past 8 rows).
+  {
+    const std::size_t conv_bytes = dev.conv.bytes, rec_bytes = dev.recurrent.bytes;
+    const std::vector<uint8_t> conv0 = download<uint8_t>(dev.conv.p, conv_bytes);
+    const std::vector<uint8_t> rec0 = download<uint8_t>(dev.recurrent.p, rec_bytes);
+    struct Shape {
+      std::vector<int32_t> slots;
+      int tokens;
+    };
+    const Shape shapes[] = {{{3}, 1}, {{3, 0, 4}, 1}, {{4, 3, 2, 1, 0}, 1}, {{0}, 6}, {{4}, 70}};
+    for (const Shape &shape : shapes) {
+      const int lanes_n = static_cast<int>(shape.slots.size());
+      const int rows = lanes_n * shape.tokens;
+      const std::string name = "fused GDN, " + std::to_string(lanes_n) + " lane(s) of " + std::to_string(shape.tokens);
+      std::vector<uint16_t> x;
+      for (int r = 0; r < rows; ++r) {
+        const std::vector<uint16_t> xt = token_input(9, 1000 + r);
+        x.insert(x.end(), xt.begin(), xt.end());
+      }
+      upload(d_x, x);
+      upload(d_slots, shape.slots);
+      MOE_CUDA(cudaDeviceSynchronize());
+      fn::Batch batch;
+      batch.lanes = lanes_n;
+      batch.tokens = shape.tokens;
+      batch.slots = d_slots.as<int32_t>();
+      std::vector<uint16_t> y[2];
+      std::vector<uint8_t> conv_after[2], rec_after[2];
+      int kernels[2] = {};
+      for (int fused = 0; fused < 2; ++fused) {
+        fn::set_fused(fn::Fusion::Gdn, fused == 1);
+        upload(dev.conv, conv0);
+        upload(dev.recurrent, rec0);
+        MOE_CUDA(cudaMemset(arena.base(), 0xFF, arena.capacity()));
+        MOE_CUDA(cudaMemset(d_y.p, 0xFF, d_y.bytes));
+        MOE_CUDA(cudaDeviceSynchronize());
+        FN_RC(fn::gdn::run(g, dev.state(), wv, batch, d_x.p, d_y.p, arena, stream));
+        MOE_CUDA(cudaStreamSynchronize(stream));
+        y[fused] = download<uint16_t>(d_y.p, static_cast<std::size_t>(rows) * H);
+        conv_after[fused] = download<uint8_t>(dev.conv.p, conv_bytes);
+        rec_after[fused] = download<uint8_t>(dev.recurrent.p, rec_bytes);
+        kernels[fused] = captured_kernels(stream, [&] { return fn::gdn::run(g, dev.state(), wv, batch, d_x.p, d_y.p, arena, stream); });
+      }
+      fn::set_fused(fn::Fusion::Gdn, true);
+      const bool finite = std::all_of(y[0].begin(), y[0].end(), [](uint16_t v) { return (v & 0x7F80U) != 0x7F80U; });
+      check(finite, name + ": the five-launch output is finite (the comparison has power)");
+      check(y[1] == y[0], name + ": the output is the five-launch route's, bit for bit");
+      check(conv_after[1] == conv_after[0] && conv_after[0] != conv0,
+            name + ": the conv taps are the five-launch route's, bit for bit");
+      check(rec_after[1] == rec_after[0] && rec_after[0] != rec0,
+            name + ": the recurrent state is the five-launch route's, bit for bit");
+      const int fewer = rows <= 8 ? 4 : 1;
+      check(kernels[0] - kernels[1] == fewer, name + ": " + std::to_string(fewer) + " fewer kernels fused (got " +
+                                                  std::to_string(kernels[0]) + " and " + std::to_string(kernels[1]) +
+                                                  ")");
+    }
+    upload(dev.conv, conv0);
+    upload(dev.recurrent, rec0);
   }
 
   // Refusals by name.

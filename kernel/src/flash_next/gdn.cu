@@ -4,7 +4,10 @@
 // Kernels here: the causal convolution (written into q | k | v directly), the gating (g, beta
 // from the BF16 projections and the layer's BF16 A_log and dt_bias), the sigmoid-gated norm, and
 // the copy of one slot's recurrent state between the pool and a scratch image. Everything else is
-// fn_linear and the vendored recurrence.
+// fn_linear and the vendored recurrence. Since GitHub #306's fusion (step 4, fusion.h's Gdn) a
+// call of up to 8 rows takes its four FP8 input projections in one grouped GEMV launch
+// (ignis_fp8_linear_grouped) and the convolution's launch takes the gating: the same code per
+// output, so the same bits, in two launches instead of five.
 //
 // The convolution is ours rather than the vendored causal_conv1d_silu: that op reads its weight
 // tap-major ([4][channels], the 27B artifact's gdn/convolution), while Flash-Next's artifact keeps
@@ -20,6 +23,9 @@
 
 #include "gdn.h"
 
+#include "fusion.h"
+
+#include "ignis_fp8_linear.h"
 #include "ignis_seq_internal.h"
 
 #include "ninfer/ops/gated_delta_net.h"
@@ -39,8 +45,35 @@ namespace {
 
 constexpr int32_t kThreads = 256;
 constexpr int32_t kConvChunk = 64;  // tokens one convolution thread walks
+constexpr int32_t kGroupedRows = 8;  // the grouped projection's ceiling: the FP8 GEMV route's
 
 __device__ __forceinline__ float round_bf16(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+
+// g = -exp(A_log) * softplus(a + dt_bias) in fp32 (torch's softplus: x past 20 is x itself) and
+// beta = sigmoid(b) rounded to BF16, as the checkpoint's b.sigmoid() is; element i of
+// [rows][kValueHeads] each.
+__device__ __forceinline__ void gate_one(const __nv_bfloat16 *__restrict__ a, const __nv_bfloat16 *__restrict__ b,
+                                         const __nv_bfloat16 *__restrict__ a_log,
+                                         const __nv_bfloat16 *__restrict__ dt_bias, float *__restrict__ g,
+                                         float *__restrict__ beta, int32_t i) {
+  const int32_t h = i % kValueHeads;
+  const float x = __bfloat162float(a[i]) + __bfloat162float(dt_bias[h]);
+  const float softplus = x > 20.0F ? x : log1pf(expf(x));
+  g[i] = -expf(__bfloat162float(a_log[h])) * softplus;
+  const float sig = 1.0F / (1.0F + expf(-__bfloat162float(b[i])));
+  beta[i] = round_bf16(sig);
+}
+
+// The gating's operands when the convolution takes it (GitHub #306, step 4): CTA (0, y) of the
+// convolution's grid gates the rows of its (lane, chunk) with gate_one. Null `a`: not taken.
+struct ConvGating {
+  const __nv_bfloat16 *a = nullptr;
+  const __nv_bfloat16 *b = nullptr;
+  const __nv_bfloat16 *a_log = nullptr;
+  const __nv_bfloat16 *dt_bias = nullptr;
+  float *g = nullptr;
+  float *beta = nullptr;
+};
 
 // The checkpoint's causal_conv1d_fn / causal_conv1d_update with SiLU: per channel c and token t,
 // bf16(silu(bf16(sum_j w[c][j] u[t - 3 + j]))) over u = the lane's three taps then its tokens --
@@ -53,11 +86,18 @@ __device__ __forceinline__ float round_bf16(float v) { return __bfloat162float(_
 __global__ void conv_kernel(const __nv_bfloat16 *__restrict__ qkv, const __nv_bfloat16 *__restrict__ weight,
                             __nv_bfloat16 *__restrict__ taps, const int32_t *__restrict__ slots, int32_t slot_count,
                             int32_t tokens, int32_t chunks, bool keep_taps, __nv_bfloat16 *__restrict__ q,
-                            __nv_bfloat16 *__restrict__ k, __nv_bfloat16 *__restrict__ v) {
-  const int32_t c = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (c >= kConvChannels) return;
+                            __nv_bfloat16 *__restrict__ k, __nv_bfloat16 *__restrict__ v, ConvGating gating) {
   const int32_t lane = static_cast<int32_t>(blockIdx.y) / chunks;
   const int32_t chunk = static_cast<int32_t>(blockIdx.y) % chunks;
+  if (gating.a != nullptr && blockIdx.x == 0) {
+    const int32_t first = (lane * tokens + chunk * kConvChunk) * kValueHeads;
+    const int32_t end = (lane * tokens + min(tokens, (chunk + 1) * kConvChunk)) * kValueHeads;
+    for (int32_t i = first + static_cast<int32_t>(threadIdx.x); i < end; i += static_cast<int32_t>(blockDim.x)) {
+      gate_one(gating.a, gating.b, gating.a_log, gating.dt_bias, gating.g, gating.beta, i);
+    }
+  }
+  const int32_t c = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (c >= kConvChannels) return;
   const int32_t slot = slots[lane];
   if (slot < 0 || slot >= slot_count) __trap();
   __nv_bfloat16 *tap = taps + static_cast<int64_t>(slot) * kConvStateTaps * kConvChannels + c;
@@ -109,20 +149,14 @@ __global__ void conv_kernel(const __nv_bfloat16 *__restrict__ qkv, const __nv_bf
   }
 }
 
-// g = -exp(A_log) * softplus(a + dt_bias) in fp32 (torch's softplus: x past 20 is x itself) and
-// beta = sigmoid(b) rounded to BF16, as the checkpoint's b.sigmoid() is; [rows][kValueHeads] each.
+// The gating on its own: gate_one over [rows][kValueHeads].
 __global__ void gating_kernel(const __nv_bfloat16 *__restrict__ a, const __nv_bfloat16 *__restrict__ b,
                               const __nv_bfloat16 *__restrict__ a_log,
                               const __nv_bfloat16 *__restrict__ dt_bias, float *__restrict__ g,
                               float *__restrict__ beta, int32_t n) {
   const int32_t i = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (i >= n) return;
-  const int32_t h = i % kValueHeads;
-  const float x = __bfloat162float(a[i]) + __bfloat162float(dt_bias[h]);
-  const float softplus = x > 20.0F ? x : log1pf(expf(x));
-  g[i] = -expf(__bfloat162float(a_log[h])) * softplus;
-  const float sig = 1.0F / (1.0F + expf(-__bfloat162float(b[i])));
-  beta[i] = round_bf16(sig);
+  gate_one(a, b, a_log, dt_bias, g, beta, i);
 }
 
 // The checkpoint's Qwen4ExpTextRMSNormGated with a sigmoid gate, one warp per (token, value
@@ -272,16 +306,37 @@ int32_t run(const Geometry &g, const State &state, const GdnWeights &w, const Ba
     __nv_bfloat16 *k = q + r * kKeyWidth;
     __nv_bfloat16 *v = k + r * kKeyWidth;
 
-    if (fn_linear(w.in_proj_qkv, x, rows, qkv, false, scratch, stream) != 0 ||
-        fn_linear(w.in_proj_z, x, rows, z, false, scratch, stream) != 0 ||
-        fn_linear(w.in_proj_a, x, rows, a, false, scratch, stream) != 0 ||
-        fn_linear(w.in_proj_b, x, rows, b, false, scratch, stream) != 0) {
+    // GitHub #306, step 4: the four projections of x in one grouped GEMV launch when all four are
+    // FP8 and the call is a GEMV's width, and the gating inside the convolution's launch.
+    const bool fusion = fused(Fusion::Gdn);
+    const auto fp8 = [](const Linear &l) { return l.format == WeightFormat::Fp8RowScale; };
+    if (fusion && rows <= kGroupedRows && fp8(w.in_proj_qkv) && fp8(w.in_proj_z) && fp8(w.in_proj_a) &&
+        fp8(w.in_proj_b)) {
+      const ignis_fp8_segment segments[4] = {{w.in_proj_qkv.data, static_cast<uint32_t>(kConvChannels), qkv},
+                                             {w.in_proj_z.data, static_cast<uint32_t>(kValueWidth), z},
+                                             {w.in_proj_a.data, static_cast<uint32_t>(kValueHeads), a},
+                                             {w.in_proj_b.data, static_cast<uint32_t>(kValueHeads), b}};
+      if (ignis_fp8_linear_grouped(segments, 4, static_cast<uint32_t>(g.hidden), x, static_cast<uint32_t>(rows), 0,
+                                   stream) != 0) {
+        fn_set_error(std::string("gdn: the grouped projections: ") + ignis_fp8_linear_last_error());
+        return -1;
+      }
+    } else if (fn_linear(w.in_proj_qkv, x, rows, qkv, false, scratch, stream) != 0 ||
+               fn_linear(w.in_proj_z, x, rows, z, false, scratch, stream) != 0 ||
+               fn_linear(w.in_proj_a, x, rows, a, false, scratch, stream) != 0 ||
+               fn_linear(w.in_proj_b, x, rows, b, false, scratch, stream) != 0) {
       return -1;
     }
-    const int32_t gates = rows * kValueHeads;
-    gating_kernel<<<(gates + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        a, b, static_cast<const __nv_bfloat16 *>(w.a_log), static_cast<const __nv_bfloat16 *>(w.dt_bias), gf,
-        beta, gates);
+    ConvGating gating;
+    if (fusion) {
+      gating = ConvGating{a, b, static_cast<const __nv_bfloat16 *>(w.a_log), static_cast<const __nv_bfloat16 *>(w.dt_bias),
+                          gf, beta};
+    } else {
+      const int32_t gates = rows * kValueHeads;
+      gating_kernel<<<(gates + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+          a, b, static_cast<const __nv_bfloat16 *>(w.a_log), static_cast<const __nv_bfloat16 *>(w.dt_bias), gf,
+          beta, gates);
+    }
     // A verify call's conv inputs, before the recurrence's output overwrites qkv: the fold's taps.
     if (record != nullptr &&
         cudaMemcpyAsync(static_cast<unsigned char *>(record->gdn_conv) + static_cast<std::size_t>(ordinal) * record->gdn_layer_bytes,
@@ -293,7 +348,8 @@ int32_t run(const Geometry &g, const State &state, const GdnWeights &w, const Ba
     const dim3 conv_grid((kConvChannels + kThreads - 1) / kThreads, static_cast<unsigned>(batch.lanes * chunks));
     conv_kernel<<<conv_grid, kThreads, 0, stream>>>(qkv, static_cast<const __nv_bfloat16 *>(w.conv),
                                                      static_cast<__nv_bfloat16 *>(state.conv), batch.slots,
-                                                     state.slots, batch.tokens, chunks, record != nullptr, q, k, v);
+                                                     state.slots, batch.tokens, chunks, record != nullptr, q, k, v,
+                                                     gating);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
       fn_set_error(std::string("gdn: launch failed: ") + cudaGetErrorString(err));

@@ -1,7 +1,11 @@
 // ignis kernel leaf -- the Flash-Next QSA attention sublayer (spec flash-next/04, GitHub #302,
 // slice S2): OURS (ADR 0043), no port claim. See qsa.h for the oracle and the call's order. This
 // file: the norms + rope, the K/V append in both formats, the gate, and fn_qsa_attention; the
-// dense attention kernel is qsa_dense.cu.
+// dense attention kernel is qsa_dense.cu. Since GitHub #306's fusion (step 6, fusion.h's Qsa) a
+// call of up to 8 rows takes q, k and v in one grouped GEMV launch and a split sparse call's
+// combine takes the gate. The append stays a launch of its own: under hq-e8-2b it must follow the
+// listed-row decode (it rewrites the residual-window slot of position - kGqaHqRecentKeys, which
+// that decode may read: #258), and under BF16 precede the attention (which reads its page).
 //
 // The hq-e8-2b append encodes each row with the vendored codec device functions (hq_codec.cuh:
 // the engine sign diagonal, hq_encode_row_warp with the (kv head, position, role) dither seed)
@@ -12,6 +16,9 @@
 
 #include "qsa.h"
 
+#include "fusion.h"
+
+#include "ignis_fp8_linear.h"
 #include "ignis_seq_internal.h"
 
 #include "ninfer/ops/gqa_attention.h"
@@ -124,6 +131,7 @@ __global__ void append_bf16_kernel(AppendArgs a) {
 }
 
 constexpr int kHqWarps = 8;
+constexpr int32_t kGroupedRows = 8;  // the grouped projection's ceiling: the FP8 GEMV route's
 
 // The vendored residual-row addressing at Flash-Next's KV head count.
 struct HqGeometry {
@@ -288,9 +296,21 @@ int32_t run(const Geometry &g, const Kv &kv, const indexer::Rope &rope, const Qs
     auto *v = static_cast<__nv_bfloat16 *>(scratch.alloc_bytes(r * kKvWidth).data);
     auto *q = static_cast<__nv_bfloat16 *>(scratch.alloc_bytes(r * kOutWidth).data);
     auto *out = static_cast<__nv_bfloat16 *>(scratch.alloc_bytes(r * kOutWidth).data);
-    if (fn_linear(w.q_proj, x, rows, qg, false, scratch, stream) != 0 ||
-        fn_linear(w.k_proj, x, rows, k, false, scratch, stream) != 0 ||
-        fn_linear(w.v_proj, x, rows, v, false, scratch, stream) != 0) {
+    // GitHub #306, step 6: the three projections of x in one grouped GEMV launch when all three are
+    // FP8 and the call is a GEMV's width; a split call's combine takes the output gate.
+    const bool fusion = fused(Fusion::Qsa);
+    const auto fp8 = [](const Linear &l) { return l.format == WeightFormat::Fp8RowScale; };
+    if (fusion && rows <= kGroupedRows && fp8(w.q_proj) && fp8(w.k_proj) && fp8(w.v_proj)) {
+      const ignis_fp8_segment segments[3] = {{w.q_proj.data, static_cast<uint32_t>(kQProjWidth), qg},
+                                             {w.k_proj.data, static_cast<uint32_t>(kKvWidth), k},
+                                             {w.v_proj.data, static_cast<uint32_t>(kKvWidth), v}};
+      if (ignis_fp8_linear_grouped(segments, 3, static_cast<uint32_t>(g.hidden), x, static_cast<uint32_t>(rows), 0,
+                                   stream) != 0) {
+        return fail(std::string("the grouped projections: ") + ignis_fp8_linear_last_error());
+      }
+    } else if (fn_linear(w.q_proj, x, rows, qg, false, scratch, stream) != 0 ||
+               fn_linear(w.k_proj, x, rows, k, false, scratch, stream) != 0 ||
+               fn_linear(w.v_proj, x, rows, v, false, scratch, stream) != 0) {
       return -1;
     }
     if (const Status st = prepare(g, rope, w.q_norm, w.k_norm, batch, qg, q, k, stream)) return fail(st);
@@ -336,16 +356,21 @@ int32_t run(const Geometry &g, const Kv &kv, const indexer::Rope &rope, const Qs
     }
     if (const Status st = append(g, kv, batch, k, v, stream)) return fail(st);
 
+    bool gated = false;
     if (selection.dense) {
       if (const Status st = attend_dense(g, source, kv.slots, batch, q, out, stream)) return fail(st);
     } else {
       const std::size_t partials = sparse::partial_bytes(g, rows);
       void *partial = partials == 0 ? nullptr : scratch.alloc_bytes(partials).data;
-      if (const sparse::Status st = sparse::attend(g, source, batch, q, selection, out, partial, stream)) {
+      gated = fusion && sparse::splits_for(g, rows) > 1;
+      if (const sparse::Status st =
+              sparse::attend(g, source, batch, q, selection, out, partial, stream, gated ? qg : nullptr)) {
         return fail(st);
       }
     }
-    if (const Status st = gate(batch, qg, out, stream)) return fail(st);
+    if (!gated) {
+      if (const Status st = gate(batch, qg, out, stream)) return fail(st);
+    }
     return fn_linear(w.o_proj, out, rows, y, false, scratch, stream);
   } catch (const std::exception &e) {
     return fail(e.what());

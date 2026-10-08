@@ -35,10 +35,14 @@
 // - fn_indexer_select, the program's entry point, on a real seq pool with indexer sections
 //   (attention layer 1 of 2, its arena exactly fn_indexer_select_scratch_bytes): a dense chunk
 //   [0, 2000) sets Selection::dense, then the sparse chunk [2000, 4096) selects what the stages'
-//   one-shot run selected, and the pool's layer-1 section holds the stages' block keys.
+//   one-shot run selected, and the pool's layer-1 section holds the stages' block keys;
+// - GitHub #306: the decode score's own kernel (16-byte key staging, a capped grid striding over
+//   the visible blocks) gives the unfused kernel's scores bit for bit (synthetic keys, up to
+//   75,001 blocks a row).
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
+#include "../src/flash_next/fusion.h"
 #include "../src/flash_next/indexer.h"
 
 #include "ignis_moe.h"
@@ -717,6 +721,83 @@ int main() {
     std::printf("  mutation, query roped one position late: %zu of %zu values past the element bound\n",
                 mutated.violations, mutated.total);
     check(mutated.violations > 0, "mutation arm: the element check misses a query roped one position late");
+  }
+
+  // GitHub #306, step 3 (fusion.h's Score): a decode call's score by score_decode_kernel (each
+  // key staged in 16-byte loads behind one page lookup, at most 1,024 CTAs a row striding over
+  // the row's visible blocks) against score_kernel<1, 1>'s CTA per 64 blocks of the bound. A bound
+  // of 524,288 tokens (2,048 CTAs a row unfused) and three lanes of 1, 512 and 75,001 blocks (past
+  // 1,024 x 64: the stride), on a permuted page table: every score row bit for bit, columns past a
+  // row's blocks left alone by both; the captured grids 2,048 and 1,024 wide, different kernels.
+  {
+    constexpr int kLanes = 3;
+    constexpr int32_t kBound = 524288;
+    constexpr int kMaxBlocks = kBound / 4;
+    const std::vector<int32_t> lane_position = {4, 2050, 300003};
+    const int logical = 300004 / 64 + 1;
+    const int physical = kLanes * logical;
+    std::vector<int32_t> table(static_cast<std::size_t>(kLanes) * logical);
+    for (int i = 0; i < physical; ++i) table[i] = static_cast<int32_t>((static_cast<int64_t>(i) * 7919) % physical);
+    std::vector<uint16_t> keys(static_cast<std::size_t>(physical) * ix::kBlocksPerPage * kHd);
+    for (std::size_t i = 0; i < keys.size(); ++i) keys[i] = f32_to_bf16(hash_uniform(0x5C0, i, 1.0F));
+    std::vector<uint16_t> queries(static_cast<std::size_t>(kLanes) * kHeads * kHd);
+    for (std::size_t i = 0; i < queries.size(); ++i) queries[i] = f32_to_bf16(hash_uniform(0x5C1, i, 1.0F));
+    DeviceBytes d_table(table.size() * 4), d_keys(keys.size() * 2), d_q(queries.size() * 2);
+    DeviceBytes d_slots3(kLanes * 4), d_pos3(kLanes * 4), d_scores(static_cast<std::size_t>(kLanes) * kMaxBlocks * 4);
+    upload(d_table, table);
+    upload(d_keys, keys);
+    upload(d_q, queries);
+    upload(d_slots3, std::vector<int32_t>{0, 1, 2});
+    upload(d_pos3, lane_position);
+    ix::Paged paged;
+    paged.block_tables = d_table.as<int32_t>();
+    paged.logical_pages = logical;
+    paged.block_keys = d_keys.as<__nv_bfloat16>();
+    fn::Batch b;
+    b.lanes = kLanes;
+    b.tokens = 1;
+    b.slots = d_slots3.as<int32_t>();
+    b.positions = d_pos3.as<int32_t>();
+    b.max_visible = kBound;
+    std::vector<uint32_t> scores[2];
+    unsigned grid[2] = {};
+    void *func[2] = {};
+    for (int fused = 0; fused < 2; ++fused) {
+      fn::set_fused(fn::Fusion::Score, fused == 1);
+      MOE_CUDA(cudaMemset(d_scores.p, 0xFF, d_scores.bytes));
+      IX_OK(ix::score(g, paged, b, 0, kLanes, d_q.as<__nv_bfloat16>(), kMaxBlocks, d_scores.as<float>(), kMaxBlocks,
+                      d.stream));
+      MOE_CUDA(cudaStreamSynchronize(d.stream));
+      scores[fused] = download<uint32_t>(d_scores.p, static_cast<std::size_t>(kLanes) * kMaxBlocks);
+      cudaGraph_t graph = nullptr;
+      MOE_CUDA(cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal));
+      const ix::Status st = ix::score(g, paged, b, 0, kLanes, d_q.as<__nv_bfloat16>(), kMaxBlocks,
+                                      d_scores.as<float>(), kMaxBlocks, d.stream);
+      MOE_CUDA(cudaStreamEndCapture(d.stream, &graph));
+      IX_OK(st);
+      std::size_t count = 1;
+      cudaGraphNode_t node = nullptr;
+      MOE_CUDA(cudaGraphGetNodes(graph, &node, &count));
+      cudaKernelNodeParams params{};
+      MOE_CUDA(cudaGraphKernelNodeGetParams(node, &params));
+      grid[fused] = params.gridDim.x;
+      func[fused] = params.func;
+      MOE_CUDA(cudaGraphDestroy(graph));
+    }
+    fn::set_fused(fn::Fusion::Score, true);
+    bool finite = true;
+    for (int r = 0; r < kLanes; ++r) {
+      const int blocks = (lane_position[r] + 1) / 4;
+      for (int c = 0; c < kMaxBlocks; ++c) {
+        const uint32_t v = scores[0][static_cast<std::size_t>(r) * kMaxBlocks + c];
+        finite = finite && (c < blocks ? (v & 0x7F800000U) != 0x7F800000U : v == 0xFFFFFFFFU);
+      }
+    }
+    check(finite, "score over the visible blocks: the unfused scores are finite where visible, untouched past");
+    check(scores[1] == scores[0], "score over the visible blocks: every score row the unfused kernel's, bit for bit");
+    check(grid[0] == kMaxBlocks / 64 && grid[1] == 1024 && func[0] != func[1],
+          "score over the visible blocks: grids of 2,048 and 1,024 CTAs a row, two kernels (got " +
+              std::to_string(grid[0]) + ", " + std::to_string(grid[1]) + ")");
   }
 
   std::printf("  %d recorded rows checked; scores within %.2f of their derived bounds; queries %zu / %zu bit-exact, "

@@ -5,6 +5,8 @@
 //            GDN gating rows, narrower than a tile) at 1, 3, 8 tokens (GEMV route) and 9..2048
 //            (tensor-core route), fp32 and BF16 outputs, against fp64.
 //   swiglu   the shared expert's gate/up pair, silu(g) * u in BF16, against fp64.
+//   grouped  (GitHub #306) GDN's four projections in one grouped GEMV launch against one linear
+//            each, bit for bit, 1..8 tokens; and its refusals.
 //
 // Tolerance: E4M3 x BF16 products are exact in fp32, so the error is fp32 accumulation, bounded
 // by (cols / 8 + 64) u sum|terms| (fp8_test_common.h), plus the output's own rounding: one fp32
@@ -15,12 +17,14 @@
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
 #include "fp8_test_common.h"
+#include "ignis_fp8_linear.h"
 #include "ignis_moe.h"
 #include "moe_fixture.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -120,6 +124,53 @@ void swiglu_arm(int tokens) {
   check(bad == 0, "fp8 swiglu x " + std::to_string(tokens) + " within bound of fp64");
 }
 
+// GitHub #306: the grouped GEMV (ignis_fp8_linear_grouped) against one ignis_fp8_linear call per
+// segment, bit for bit -- GDN's four projections of one input at Flash-Next's shapes, every
+// output poisoned first -- and what it refuses.
+void grouped_arm(int tokens, bool f32_out) {
+  const int cols = IGNIS_MOE_HIDDEN;
+  const int shapes[4] = {10240, 6144, 48, 48};
+  const std::size_t out_bytes = f32_out ? 4 : 2;
+  std::vector<uint16_t> x(static_cast<std::size_t>(tokens) * cols);
+  for (std::size_t i = 0; i < x.size(); ++i) x[i] = f32_to_bf16(hash_uniform(79, i, 2.0f));
+  DeviceBytes dx(x.size() * 2);
+  upload(dx, x);
+  std::vector<std::unique_ptr<DeviceBytes>> w, y_one, y_grouped;
+  ignis_fp8_segment segments[4];
+  for (int i = 0; i < 4; ++i) {
+    const Fp8Matrix m = make_fp8(static_cast<uint32_t>(4000 + i), shapes[i], cols, 0.004f);
+    w.push_back(std::make_unique<DeviceBytes>(m.payload.size()));
+    upload(*w.back(), m.payload);
+    for (auto *ys : {&y_one, &y_grouped}) {
+      ys->push_back(std::make_unique<DeviceBytes>(static_cast<std::size_t>(tokens) * shapes[i] * out_bytes));
+      MOE_CUDA(cudaMemset(ys->back()->p, 0xFF, ys->back()->bytes));
+    }
+    MOE_RC(ignis_fp8_linear(w[i]->p, shapes[i], cols, dx.p, tokens, y_one[i]->p, f32_out ? 1 : 0, nullptr));
+    segments[i] = ignis_fp8_segment{w[i]->p, static_cast<uint32_t>(shapes[i]), y_grouped[i]->p};
+  }
+  MOE_RC(ignis_fp8_linear_grouped(segments, 4, cols, dx.p, tokens, f32_out ? 1 : 0, nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  bool same = true;
+  for (int i = 0; i < 4; ++i) {
+    same = same && download<uint8_t>(y_grouped[i]->p, y_grouped[i]->bytes) ==
+                       download<uint8_t>(y_one[i]->p, y_one[i]->bytes);
+  }
+  check(same, "fp8 grouped GEMV x " + std::to_string(tokens) + (f32_out ? " (fp32)" : " (bf16)") +
+                  ": every segment is its own linear's, bit for bit");
+  if (tokens == 1) {
+    check(ignis_fp8_linear_grouped(segments, 4, cols, dx.p, 9, 0, nullptr) != 0, "fp8 grouped GEMV: 9 tokens refused");
+    check(ignis_fp8_linear_grouped(segments, 5, cols, dx.p, 1, 0, nullptr) != 0, "fp8 grouped GEMV: 5 segments refused");
+    ignis_fp8_segment odd = segments[2];
+    odd.rows = 40;
+    check(ignis_fp8_linear_grouped(&odd, 1, cols, dx.p, 1, 0, nullptr) != 0,
+          "fp8 grouped GEMV: rows off a multiple of 16 refused");
+    odd = segments[2];
+    odd.weight = static_cast<const char *>(segments[2].weight) + 8;
+    check(ignis_fp8_linear_grouped(&odd, 1, cols, dx.p, 1, 0, nullptr) != 0,
+          "fp8 grouped GEMV: a weight off 16 bytes refused");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -131,6 +182,7 @@ int main() {
   for (int tokens : {1, 8, 129, 1000}) linear_arm(2560, 640, tokens, true);
   for (int tokens : {2, 300}) linear_arm(48, 2560, tokens, false);
   for (int tokens : {1, 3, 8, 64, 1024}) swiglu_arm(tokens);
+  for (int tokens : {1, 2, 3, 5, 8}) grouped_arm(tokens, tokens == 3);
   if (g_failed != 0) {
     std::fprintf(stderr, "test_fp8_linear: %d failure(s)\n", g_failed);
     return 1;
