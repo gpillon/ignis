@@ -110,7 +110,7 @@ int32_t ignis_moe_prepare(void);
  * `decode_route` picks the decode kernel of the model instance that owns the workspace -- one
  * contract, held to the same fp64 bounds -- and is chosen with it, at load:
  *   IGNIS_MOE_DECODE_TICKETS   (0) one persistent launch of work items taken by ticket: up to 4
- *                                  tokens, one CTA per SM whose producer warp streams each item's
+ *                                  tokens, one CTA per SM whose producer warps stream each item's
  *                                  weights into shared memory ahead of its compute warps
  *                                  (GitHub #306); past 4 tokens, the register kernel below;
  *   IGNIS_MOE_DECODE_CLUSTERS  (1) one thread-block cluster per selected expert, its reductions

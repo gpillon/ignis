@@ -6,20 +6,25 @@
 // The register ticket kernel (moe_decode.cu) holds a unit's weights in registers, so a CTA asks
 // DRAM for its next unit only after it has multiplied the current one: the card reads in waves
 // with the bus idle between them, and every unit pays its operand loads, its rotation and its
-// reduction in full on the warps that multiply. Here one CTA per SM runs three roles, each on
-// its own warps, handing work items along through shared memory:
+// reduction in full on the warps that multiply (docs/findings/2026-10-08-flash-next-routed-
+// experts-staged.md). Here one CTA per SM runs three roles, each on its own warps, handing work
+// items along through shared memory:
 //
-//   producer  one warp takes the work items by ticket (one ahead), reads their slots and issues
-//             every byte an item needs from the record -- its trellis tiles and channel scales --
-//             and the tokens' inputs, as cp.async copies into one of two stages; the stage's
-//             `full` barrier completes when they land. It refills a stage as soon as the other
-//             roles release it, so the next item's bytes are in flight while one is multiplied.
-//   aux       four warps prepare each item's fp16 operand from its stage into one of two A
-//             buffers (`a_full`), and reduce the previous item's result from the output buffer
-//             (`o_full`, then `o_empty`): the sums, the fences and the arrival counts.
-//   mma       sixteen warps decode the trellis tiles from the stage straight into m16n8k16 B
+//   producer  four warps: the first takes the work items by ticket (one ahead), keeps at most
+//             two items' copies in flight -- the first item alone -- and places each item in a
+//             78 KiB ring of shared memory by its own size (four items at most), waiting for
+//             every live item it would overwrite; then all four issue the item's bytes as
+//             16-byte cp.async copies (its trellis tiles and channel scales, and for gate/up the
+//             tokens' inputs), which complete the item's `full` barrier as they land.
+//   aux       eight warps prepare each item's fp16 operand into one of two A buffers (`a_full`),
+//             and reduce the previous item's result from the output buffer (`o_full`, then
+//             `o_empty`): the sums, the fences and the arrival counts.
+//   mma       sixteen warps decode the trellis tiles from the ring straight into m16n8k16 B
 //             fragments, 16 tiles per warp, and leave the raw sums in the output buffer. They
 //             wait on nothing but their operands.
+//
+// Before the roles start, warp 0 finds the call's distinct experts with warp matches and reads
+// each one's two slots once, right behind its id.
 //
 // Work items, 256 tiles (65,536 weights) each, all gate/up items first, then all down items:
 //
@@ -29,13 +34,13 @@
 //       power-of-two scale per token into fp16. The aux warps add the pre-rotation sums into the
 //       int64 fixed-point gate/up accumulator and count one arrival on (u, b).
 //   down (expert u, h block j in 0..4, column block c in 0..4)
-//       its producer waits for (u, j)'s ten arrivals; the aux warps read gate and up block j's
-//       sums, rotate both, apply svh and SwiGLU (h's block j), rotate h_j o suh_down into fp16;
-//       the mma warps multiply the block's 8 k-tiles against 512 down columns (two tiles per
-//       warp); the aux warps apply the output Hadamard per 128 columns, svh and each selecting
-//       token's routing weight, and add the result into the fixed-point output accumulator. Each
-//       of h block j's five readers adds 16 to (u, j)'s counter once it has read the sums; the
-//       fifth zeroes them and the counter.
+//       once (u, j) has its ten arrivals the aux warps read gate and up block j's sums, rotate
+//       both, apply svh and SwiGLU (h's block j), rotate h_j o suh_down into fp16; the mma warps
+//       multiply the block's 8 k-tiles against 512 down columns (two tiles per warp); the aux
+//       warps apply the output Hadamard per 128 columns, svh and each selecting token's routing
+//       weight, and add the result into the fixed-point output accumulator. Each of h block j's
+//       five readers adds 16 to (u, j)'s counter after reading the sums; the fifth zeroes them
+//       and the counter.
 //
 // The reduction is order-independent where it crosses items (integer sums) and fixed inside an
 // item, so the result is deterministic. Against the register kernel only where partial sums
@@ -49,8 +54,9 @@
 //
 // Deadlock-free: a CTA takes tickets in increasing order and works them in order, every gate/up
 // ticket precedes every down ticket, and nothing a gate/up item does waits on another CTA -- so
-// a down item's producer waits only on gate/up items held by running CTAs that reach them
-// first. The last CTA out resets the ticket counter, so the launch replays from a CUDA graph.
+// a down item waits only on gate/up items held by running CTAs that reach them first; within a
+// CTA the aux warps reduce the previous item before waiting on a down item's arrivals. The last
+// CTA out resets the ticket counter, so the launch replays from a CUDA graph.
 
 #include "moe_decode_common.cuh"
 #include "moe_trace.h"
@@ -131,7 +137,7 @@ struct Header {
 
 // What the aux warps' prepare leaves beside an item's A buffer for the mma warps and for its own
 // reduction later: the header, each token's operand scale and, for a down item, svh_down's 512
-// columns (its stage is released before the reduction).
+// columns (its bytes in the ring are released before the reduction).
 struct Meta {
   Header h;
   float scale[kStagedMaxTokens];
@@ -455,7 +461,7 @@ __device__ void producer(Shared &s, const Params &p, char *ring, int n_gate_up, 
 // ---- the mma warps --------------------------------------------------------------------------
 
 // acc[n] += A(tokens x 16 KT) . W(16 KT x 16) for the warp's column tiles; tile (r, n) of the
-// stage at word (r * row_tiles + col[n]) * tile_words.
+// item's bytes at word (r * row_tiles + col[n]) * tile_words.
 template <int K2, int NT, int KT>
 __device__ __forceinline__ void mma_stage(const uint32_t *stage, int row_tiles, const int (&col)[NT], const __half *a,
                                           int tokens, float (&acc)[NT][2][4]) {
