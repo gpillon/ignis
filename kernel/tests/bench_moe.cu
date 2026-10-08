@@ -7,9 +7,13 @@
 // 33.5%), so the leaf's CTest stage stays usable; run it by hand on a free card:
 //
 //   kernel/build/tests/ignis_kernel_moe_bench.exe [--check-floor] [--decode-only] [--trace]
+//       [--route registers|tickets|clusters] [--pool <file>]
 //
 // --decode-only measures the routed decode routes alone; --trace adds each route's phase trace
-// (moe_trace.h): the 1- and 3-token launch from DRAM and from the L2, stamped per unit.
+// (moe_trace.h): the 1- and 3-token launch from DRAM and from the L2, stamped per unit; --route
+// keeps one route; --pool times the routes on one layer's real expert records instead of the
+// synthetic pool (crates/artifact/examples/dump_expert_pool.rs writes the file; the diagnostics
+// below keep their synthetic pools).
 //
 // The roofline is the device's theoretical DRAM bandwidth (memory clock x bus width x 2, from
 // the device attributes); a sustained read measured by a plain streaming kernel is printed beside
@@ -30,7 +34,10 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -135,6 +142,73 @@ std::unique_ptr<Pool> make_pool(int size, uint32_t uniform_k2) {
   return pool;
 }
 
+// A pool of real expert records, one layer of the artifact as dump_expert_pool wrote it
+// (crates/artifact/examples/dump_expert_pool.rs): expert ids 0..n-1 at that layer's K mix.
+std::unique_ptr<Pool> load_pool(const std::string &path, int *layer) {
+  FILE *f = std::fopen(path.c_str(), "rb");
+  if (f == nullptr) {
+    std::fprintf(stderr, "FATAL: cannot open the pool file %s\n", path.c_str());
+    std::exit(EXIT_FAILURE);
+  }
+  auto read = [&](void *dst, std::size_t n) {
+    if (std::fread(dst, 1, n, f) != n) {
+      std::fprintf(stderr, "FATAL: %s is truncated\n", path.c_str());
+      std::exit(EXIT_FAILURE);
+    }
+  };
+  char magic[8];
+  uint32_t lay = 0, n = 0;
+  read(magic, 8);
+  read(&lay, 4);
+  read(&n, 4);
+  if (std::memcmp(magic, "IGNMOEP1", 8) != 0 || n == 0 || n > static_cast<uint32_t>(kE)) {
+    std::fprintf(stderr, "FATAL: %s is not an expert pool file\n", path.c_str());
+    std::exit(EXIT_FAILURE);
+  }
+  struct Rec {
+    uint32_t k2 = 0;
+    std::vector<uint8_t> bytes;
+  };
+  std::vector<Rec> recs(2 * static_cast<std::size_t>(n));
+  std::size_t total = 0;
+  for (uint32_t e = 0; e < n; ++e) {
+    uint32_t id = 0;
+    read(&id, 4);
+    if (id != e) {
+      std::fprintf(stderr, "FATAL: %s lists expert %u at position %u\n", path.c_str(), id, e);
+      std::exit(EXIT_FAILURE);
+    }
+    for (int p = 0; p < 2; ++p) {
+      uint64_t bytes = 0;
+      Rec &r = recs[2 * e + p];
+      read(&r.k2, 4);
+      read(&bytes, 8);
+      r.bytes.resize(bytes);
+      read(r.bytes.data(), bytes);
+      total += (bytes + 15) / 16 * 16;
+    }
+  }
+  std::fclose(f);
+  auto pool = std::make_unique<Pool>(total);
+  pool->size = static_cast<int>(n);
+  pool->slots.assign(static_cast<std::size_t>(kE) * 2, ignis_moe_slot{nullptr, 0, 0});
+  std::size_t at = 0;
+  for (uint32_t e = 0; e < n; ++e) {
+    uint64_t data = 0;
+    for (int p = 0; p < 2; ++p) {
+      const Rec &r = recs[2 * e + p];
+      MOE_CUDA(cudaMemcpy(static_cast<char *>(pool->buffer.p) + at, r.bytes.data(), r.bytes.size(), cudaMemcpyHostToDevice));
+      pool->slots[e * 2 + p] = {static_cast<char *>(pool->buffer.p) + at, r.k2, 0};
+      at += (r.bytes.size() + 15) / 16 * 16;
+      const uint64_t in = p == 0 ? kH : kI, out = p == 0 ? 2 * kI : kH;
+      data += in * out / 16 * r.k2 + 2 * (in + out);  // trellis and channel scales, no padding
+    }
+    pool->data_bytes.push_back(data);
+  }
+  *layer = static_cast<int>(lay);
+  return pool;
+}
+
 // `calls` routings of `tokens` tokens, each call's 10 * tokens experts distinct and taken from a
 // window of the pool that the next several calls (well past the L2) do not touch; `windows` = 1
 // routes every call to the same experts, which then live in the L2.
@@ -160,6 +234,10 @@ struct CallTrace {
   int units[2] = {0, 0};
   double ready[2] = {0, 0}, mma[2] = {0, 0}, post[2] = {0, 0};  // medians, us
   double prep[2] = {0, 0}, reduce[2] = {0, 0};                   // staged: the aux warps' medians, us
+  // Staged: the producer's medians -- waiting for its in-flight limit, for ring space, issuing
+  // the copies -- and the copies' landing (issued to the aux warps seeing the item, over items
+  // the aux warps waited for), us.
+  double prod_flight = 0.0, prod_ring = 0.0, prod_issue = 0.0, landing = 0.0, issue_kind[2] = {0, 0};
   double first_begin[2] = {0, 0}, last_end[2] = {0, 0};          // from the first entry, us
   double swiglu_post = 0.0;    // register kernel: median mma-to-end of the arrivals that ran the SwiGLU
   double wait_median = 0.0, wait_max = 0.0;  // register kernel: down units' h wait; staged: the aux warps' stage wait
@@ -212,7 +290,7 @@ CallTrace reduce_trace(const std::vector<unsigned long long> &r, bool staged) {
     if (e[0] != 0) spread((e[0] - t0) * 1e-3, (e[2] - t0) * 1e-3, 4);
   }
   auto at = [&](unsigned long long v) { return (static_cast<double>(v) - static_cast<double>(t0)) * 1e-3; };
-  std::vector<double> ready[2], mma[2], post[2], prep[2], reduce[2], swiglu, wait;
+  std::vector<double> ready[2], mma[2], post[2], prep[2], reduce[2], swiglu, wait, flight, ring, issue, land, issue_by[2];
   double busy = 0.0, pre = 0.0, waited = 0.0;
   c.first_begin[0] = c.first_begin[1] = 1e30;
   for (int u = 0; u < IGNIS_MOE_TRACE_UNITS; ++u) {
@@ -244,6 +322,13 @@ CallTrace reduce_trace(const std::vector<unsigned long long> &r, bool staged) {
     spread(m, en, 2);
     if (staged) {
       wait.push_back(e[6] * 1e-3);
+      if (e[12] != 0) {
+        flight.push_back(at(e[13]) - at(e[12]));
+        ring.push_back(at(e[14]) - at(e[13]));
+        issue.push_back(at(e[15]) - at(e[14]));
+        issue_by[kind].push_back(at(e[15]) - at(e[14]));
+        if (kind == 0 && e[6] * 1e-3 > 0.1 && e[8] != 0) land.push_back(at(e[8]) - at(e[15]));
+      }
       if (e[8] != 0) {
         prep[kind].push_back(at(e[9]) - at(e[8]));
         spread(at(e[8]), at(e[9]), 3);
@@ -271,6 +356,14 @@ CallTrace reduce_trace(const std::vector<unsigned long long> &r, bool staged) {
     c.prep[k] = median_of(prep[k]);
     c.reduce[k] = median_of(reduce[k]);
   }
+  {
+    c.prod_flight = median_of(flight);
+    c.prod_ring = median_of(ring);
+    c.prod_issue = median_of(issue);
+    c.issue_kind[0] = median_of(issue_by[0]);
+    c.issue_kind[1] = median_of(issue_by[1]);
+    c.landing = median_of(land);
+  }
   c.swiglu_post = median_of(swiglu);
   c.wait_median = median_of(wait);
   c.wait_max = wait.empty() ? 0.0 : *std::max_element(wait.begin(), wait.end());
@@ -295,7 +388,10 @@ void print_trace(const char *what, int tokens, std::vector<CallTrace> calls) {
     std::printf(" (medians); first begins %.1f, last ends %.1f us\n", m.first_begin[k], m.last_end[k]);
   }
   if (m.staged) {
-    std::printf("    aux warps' stage wait: median %.2f, max %.2f us\n", m.wait_median, m.wait_max);
+    std::printf("    aux warps' stage wait: median %.2f, max %.2f us; producer: in-flight wait %.2f, ring wait %.2f, issue "
+                "%.2f (gate/up %.2f, down %.2f) us; copies issued to seen (gate/up items waited for) %.2f us (medians)\n",
+                m.wait_median, m.wait_max, m.prod_flight, m.prod_ring, m.prod_issue, m.issue_kind[0], m.issue_kind[1],
+                m.landing);
     std::printf("    CTA time: mma warps multiplying %.0f%%, waiting for an operand %.0f%%; aux warps busy %.0f%%\n",
                 100.0 * m.mma_busy, 100.0 * m.pre_share, 100.0 * m.wait_share);
   } else {
@@ -319,12 +415,14 @@ void print_trace(const char *what, int tokens, std::vector<CallTrace> calls) {
 int main(int argc, char **argv) {
   bool check_floor = false, decode_only = false, traced = false;
   std::string only_route;  // --route registers|tickets|clusters: that decode route alone
+  std::string pool_path;   // --pool <file>: real expert records (dump_expert_pool) for the routes
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     check_floor = check_floor || a == "--check-floor";
     decode_only = decode_only || a == "--decode-only";
     traced = traced || a == "--trace";
     if (a == "--route" && i + 1 < argc) only_route = argv[++i];
+    if (a == "--pool" && i + 1 < argc) pool_path = argv[++i];
   }
   std::setvbuf(stdout, nullptr, _IONBF, 0);  // every line out as it is printed, even if a launch dies
   int devices = 0;
@@ -336,16 +434,22 @@ int main(int argc, char **argv) {
   std::printf("MoE microbenchmark on %s: DRAM roofline %.0f GB/s (theoretical), streaming read %.0f GB/s (%.0f%%), L2 %d MB\n",
               prop.name, roof, sustained, 100.0 * sustained / roof, prop.l2CacheSize >> 20);
 
-  const auto pool = make_pool(kPool, 0);
+  int real_layer = -1;
+  const auto pool = pool_path.empty() ? make_pool(kPool, 0) : load_pool(pool_path, &real_layer);
+  const int pool_size = pool->size;
   {
-    const int gu_counts[4] = {221, 114, 165, 12};
-    const int dn_counts[4] = {233, 106, 159, 14};
     double gk = 0.0, dk = 0.0;
-    for (int i = 0; i < kPool; ++i) {
-      gk += mix_k2(i, gu_counts) / 2.0;
-      dk += mix_k2(i * 7 + 1, dn_counts) / 2.0;
+    for (int i = 0; i < pool_size; ++i) {
+      gk += pool->slots[i * 2 + IGNIS_MOE_PROJ_GATE_UP].k2 / 2.0;
+      dk += pool->slots[i * 2 + IGNIS_MOE_PROJ_DOWN].k2 / 2.0;
     }
-    std::printf("  pool: %d experts, mean K gate/up %.3f, down %.3f (study: 2.48 / 2.47)\n", kPool, gk / kPool, dk / kPool);
+    if (real_layer >= 0) {
+      std::printf("  pool: layer %d of the artifact, %d experts, mean K gate/up %.3f, down %.3f\n", real_layer, pool_size,
+                  gk / pool_size, dk / pool_size);
+    } else {
+      std::printf("  pool: %d synthetic experts, mean K gate/up %.3f, down %.3f (study: 2.48 / 2.47)\n", pool_size,
+                  gk / pool_size, dk / pool_size);
+    }
   }
   DeviceBytes d_slots(pool->slots.size() * sizeof(ignis_moe_slot));
   upload(d_slots, pool->slots);
@@ -402,7 +506,7 @@ int main(int argc, char **argv) {
     std::printf("  decode route: %s\n", decode_route_name(route).c_str());
     for (int tokens : {1, 2, 3}) {
       const int calls = 320;
-      const std::vector<int32_t> ids = make_calls(calls, tokens, kPool);
+      const std::vector<int32_t> ids = make_calls(calls, tokens, pool_size);
       std::vector<float> w(ids.size(), 0.1f);
       DeviceBytes dids(ids.size() * 4), dw(w.size() * 4);
       upload(dids, ids);
@@ -471,7 +575,7 @@ int main(int argc, char **argv) {
       for (int tokens : {1, 3}) {
         for (int windows : {0, 1}) {
           const int calls = 64, first = 40, n_traced = 8;
-          const std::vector<int32_t> ids = make_calls(calls, tokens, kPool, windows);
+          const std::vector<int32_t> ids = make_calls(calls, tokens, pool_size, windows);
           std::vector<float> w(ids.size(), 0.1f);
           DeviceBytes dids(ids.size() * 4), dw(w.size() * 4), tr(static_cast<std::size_t>(n_traced) * IGNIS_MOE_TRACE_BYTES);
           upload(dids, ids);
@@ -569,7 +673,7 @@ int main(int argc, char **argv) {
     const std::vector<uint16_t> px = make_tokens(tokens, 32, 2.0f);
     std::vector<int32_t> ids(static_cast<std::size_t>(tokens) * kTop);
     for (int t = 0; t < tokens; ++t) {
-      for (int r = 0; r < kTop; ++r) ids[static_cast<std::size_t>(t) * kTop + r] = (t * 37 + r * 32) % kPool;
+      for (int r = 0; r < kTop; ++r) ids[static_cast<std::size_t>(t) * kTop + r] = (t * 37 + r * 32) % pool_size;
     }
     std::vector<float> w(ids.size(), 0.1f);
     DeviceBytes dpx(px.size() * 2), dids(ids.size() * 4), dw(w.size() * 4);

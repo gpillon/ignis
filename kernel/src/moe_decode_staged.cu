@@ -67,9 +67,13 @@ constexpr int kMmaWarps = 16;
 constexpr int kAuxWarps = 4;
 constexpr int kAuxThreads = kAuxWarps * 32;
 constexpr int kAuxWarp0 = kMmaWarps;                   // aux warps 16..19
-constexpr int kProducerWarp = kMmaWarps + kAuxWarps;  // warp 20
-constexpr int kThreads = (kProducerWarp + 1) * 32;
-constexpr int kStages = 2;
+constexpr int kProducerWarp = kMmaWarps + kAuxWarps;  // warps 20..23
+constexpr int kProducerWarps = 4;
+constexpr int kProducerThreads = kProducerWarps * 32;
+constexpr int kThreads = (kProducerWarp + kProducerWarps) * 32;
+constexpr int kSlots = 4;      // items staged at once
+constexpr int kInFlight = 2;   // items whose copies may be in flight at once
+constexpr int kRingBytes = 78 * 1024;
 constexpr int kItemTiles = 256;
 constexpr int kGuSplit = 256;                              // gate/up item inputs
 constexpr int kGuSplits = kHidden / kGuSplit;              // 10
@@ -84,29 +88,31 @@ constexpr uint32_t kGuArrivals = kGuSplits;                // gate/up items per 
 constexpr uint32_t kReaderStep = 16;                       // a down reader's count on (u, b)
 constexpr uint32_t kLastReader = kGuArrivals + (kDnColBlocks - 1) * kReaderStep;
 constexpr int kMaxWeightBytes = kItemTiles * 16 * 8;       // 32 KiB: 256 tiles at K = 4
+__host__ __device__ constexpr int weight_bytes(int k2) { return kItemTiles * 16 * k2; }
 
 static_assert(kMmaWarps * kGuKTiles == kItemTiles, "gate/up item shape");
 static_assert(kDnCols / 16 == 2 * kMmaWarps && kMmaWarps * 2 * kDnKTiles == kItemTiles, "down item shape");
 static_assert(kStagedMaxTokens <= kAuxWarps && kStagedMaxTokens * kTopK <= kDecodeMaxUnique, "tokens of a call");
 
-// A stage's bytes past the weights: a gate/up item's suh slice and x slice, or a down item's
+// An item's bytes past its weights: a gate/up item's suh slice and x slice, or a down item's
 // suh_down block, svh_down columns and the gate/up svh of its h block.
 constexpr int kGuSuh = 0;  // fp16 [256], then x bf16 [tokens][256]
 constexpr int kGuX = 512;
 constexpr int kDnSuh = 0;    // fp16 [128]
 constexpr int kDnSvh = 256;  // fp16 [512]
 constexpr int kDnSvhGu = 256 + 1024;  // fp16 [gate 128 | up 128]
-__host__ __device__ constexpr int stage_extra_bytes(int tokens) {
-  return 512 + 512 * tokens > kDnSvhGu + 512 ? 512 + 512 * tokens : kDnSvhGu + 512;
-}
-__host__ __device__ constexpr int stage_bytes(int tokens) {
-  return (kMaxWeightBytes + stage_extra_bytes(tokens) + 127) / 128 * 128;
+// An item's footprint in the staging ring.
+__host__ __device__ constexpr int item_bytes(int k2, bool gate_up, int tokens) {
+  return (weight_bytes(k2) + (gate_up ? kGuX + 512 * tokens : kDnSvhGu + 512) + 127) / 128 * 128;
 }
 __host__ __device__ constexpr int abuf_bytes(int tokens) { return (tokens * kAStride * 2 + 127) / 128 * 128; }
-// Dynamic shared memory of a launch for `tokens`: the stages, two A buffers and the output buffer.
+// Dynamic shared memory of a launch for `tokens`: the ring, two A buffers and the output buffer.
 __host__ __device__ constexpr int dynamic_bytes(int tokens) {
-  return kStages * stage_bytes(tokens) + 2 * abuf_bytes(tokens) + tokens * kDnCols * 4;
+  return kRingBytes + 2 * abuf_bytes(tokens) + tokens * kDnCols * 4;
 }
+static_assert(item_bytes(8, false, kStagedMaxTokens) <= kRingBytes / 2 &&
+                  item_bytes(8, true, kStagedMaxTokens) <= kRingBytes / 2,
+              "two of the largest items fit the ring");
 
 enum Kind : int { kGateUp = 0, kDown = 1, kEnd = 2 };
 
@@ -117,6 +123,8 @@ struct Header {
   int block;  // gate/up: b; down: the h block j
   int sub;    // gate/up: the k-split s; down: the column block c
   int k2;
+  int off;    // its bytes in the ring: [off, off + size)
+  int size;
   unsigned long long issued;  // kTrace: when the producer issued the copies
 };
 
@@ -126,7 +134,6 @@ struct Header {
 struct Meta {
   Header h;
   float scale[kStagedMaxTokens];
-  uint32_t reader_before;  // down: the counter (u, j) held before this reader's 16
   alignas(16) __half svh[kDnCols];
 };
 
@@ -137,12 +144,14 @@ struct Shared {
   float unique_w[kDecodeMaxUnique][kDecodeMaxTokens];
   int slot_of[kDecodeMaxTokens * kTopK];
   int first[kDecodeMaxTokens * kTopK];
-  unsigned long long full[kStages];   // producer -> aux, mma: the stage's bytes landed
-  unsigned long long empty[kStages];  // aux, mma -> producer: the stage is read
-  unsigned long long a_full[2];       // aux -> mma: A buffer and meta ready
-  unsigned long long o_full;          // mma -> aux: the output buffer holds an item's sums
-  unsigned long long o_empty;         // aux -> mma: the output buffer is read
-  Header header[kStages];
+  ignis_moe_slot slot[kStagedMaxTokens * kTopK][2];  // each distinct expert's slots, read once
+  unsigned long long full[kSlots];   // producer -> aux, mma: the item's bytes landed
+  unsigned long long empty[kSlots];  // aux, mma -> producer: the item's bytes are read
+  unsigned long long a_full[2];      // aux -> mma: A buffer and meta ready
+  unsigned long long o_full;         // mma -> aux: the output buffer holds an item's sums
+  unsigned long long o_empty;        // aux -> mma: the output buffer is read
+  int arrived;                       // aux: the down item's h block is whole
+  Header header[kSlots];
   Meta meta[2];
 };
 
@@ -201,8 +210,15 @@ __device__ __forceinline__ void mbar_wait(unsigned long long *bar, uint32_t pari
       "r"(parity)
       : "memory");
 }
-// The aux warps' own barrier.
+// The aux warps' own barrier, and the producer warps'.
 __device__ __forceinline__ void aux_sync() { asm volatile("bar.sync 1, %0;\n" ::"n"(kAuxThreads) : "memory"); }
+__device__ __forceinline__ void producer_sync() { asm volatile("bar.sync 2, %0;\n" ::"n"(kProducerThreads) : "memory"); }
+
+// `chunks` 16-byte copies spread over the producer warps' threads: chunk i from src(i) to dst + 16 i.
+template <typename Src>
+__device__ __forceinline__ void copy_chunks(char *dst, int chunks, Src src) {
+  for (int i = threadIdx.x - kProducerWarp * 32; i < chunks; i += kProducerThreads) cp_async16(dst + 16 * i, src(i));
+}
 
 __device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
   uint32_t v;
@@ -210,16 +226,11 @@ __device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
   return v;
 }
 
-// `chunks` 16-byte copies, lane-strided: chunk i from src(i) to dst + 16 i.
-template <typename Src>
-__device__ __forceinline__ void copy_chunks(char *dst, int chunks, Src src) {
-  const int lane = threadIdx.x & 31;
-  for (int i = lane; i < chunks; i += 32) cp_async16(dst + 16 * i, src(i));
-}
-
 // The distinct experts of the call, as build_unique (moe_decode_common.cuh) leaves them, from a
-// copy of the ids and weights in shared memory: one round trip to global memory.
-__device__ void unique_experts(Shared &s, const int32_t *ids, const float *weights, int tokens) {
+// copy of the ids and weights in shared memory: one round trip to global memory; then their
+// slots, another.
+__device__ void unique_experts(Shared &s, const int32_t *ids, const float *weights, const ignis_moe_slot *slots,
+                               int tokens) {
   __shared__ int32_t sid[kStagedMaxTokens * kTopK];
   __shared__ float sw[kStagedMaxTokens * kTopK];
   const int n = tokens * kTopK;
@@ -260,19 +271,23 @@ __device__ void unique_experts(Shared &s, const int32_t *ids, const float *weigh
     s.unique_w[u][i / kTopK] = sw[i];
     atomicOr(&s.unique_sel[u], 1u << (i / kTopK));
   }
+  // Both slots of every distinct expert, read (and checked) once for the whole launch.
+  if (i < 2 * s.n_unique) s.slot[i / 2][i % 2] = load_slot(slots, s.unique_id[i / 2], i % 2);
   __syncthreads();
 }
 
 // ---- the producer ---------------------------------------------------------------------------
 
-// Stage item `h` for `tokens` tokens: the weights and the stage's extras.
+// Stage item `h` for `tokens` tokens -- the weights, then the item's extras -- as 16-byte copies
+// spread over the producer warps (a few hundred bytes per contiguous run: one bulk copy per run
+// costs the copy engine more than the threads' own copies).
 template <int K2>
 __device__ void stage_item(const Shared &s, const Params &p, const Header &h, char *stage) {
   constexpr int tile_bytes = 16 * K2;
   const int tokens = p.tokens;
-  char *extra = stage + kMaxWeightBytes;
+  char *extra = stage + weight_bytes(K2);
   if (h.kind == kGateUp) {
-    const ignis_moe_slot slot = load_slot(p.slots, s.unique_id[h.u], IGNIS_MOE_PROJ_GATE_UP);
+    const ignis_moe_slot slot = s.slot[h.u][IGNIS_MOE_PROJ_GATE_UP];
     const char *rec = static_cast<const char *>(slot.record);
     const RecordPlanes planes = record_planes(slot, kHidden, kGateUpOut, K2);
     // 16 rows (k-tiles), each two runs of 8 tiles: gate block b, then up block b.
@@ -292,8 +307,8 @@ __device__ void stage_item(const Shared &s, const Params &p, const Header &h, ch
       return reinterpret_cast<const char *>(p.x + static_cast<size_t>(t) * kHidden + h.sub * kGuSplit) + 16 * off;
     });
   } else {
-    const ignis_moe_slot gu = load_slot(p.slots, s.unique_id[h.u], IGNIS_MOE_PROJ_GATE_UP);
-    const ignis_moe_slot dn = load_slot(p.slots, s.unique_id[h.u], IGNIS_MOE_PROJ_DOWN);
+    const ignis_moe_slot gu = s.slot[h.u][IGNIS_MOE_PROJ_GATE_UP];
+    const ignis_moe_slot dn = s.slot[h.u][IGNIS_MOE_PROJ_DOWN];
     const char *rec = static_cast<const char *>(dn.record);
     const RecordPlanes planes = record_planes(dn, kInter, kHidden, K2);
     const RecordPlanes gu_planes = record_planes(gu, kHidden, kGateUpOut, gu.k2);
@@ -315,64 +330,94 @@ __device__ void stage_item(const Shared &s, const Params &p, const Header &h, ch
   }
 }
 
+// The producer warps: the first takes the tickets, keeps the in-flight limit and allocates the
+// ring; then all of them issue the item's copies.
 template <bool kTrace>
-__device__ void producer(Shared &s, const Params &p, char *stages, int stage_stride, int n_gate_up, int n_total) {
+__device__ void producer(Shared &s, const Params &p, char *ring, int n_gate_up, int n_total) {
   const int lane = threadIdx.x & 31;
+  const bool lead = threadIdx.x >> 5 == kProducerWarp;
   // The first ticket is the CTA's own; each later one is fetched an item before it is needed
   // (lane 0 holds it until then), so the atomic's round trip overlaps an item's copies.
   int ticket = static_cast<int>(blockIdx.x);
   int pending = 0;
-  if (lane == 0) pending = static_cast<int>(atomicAdd(&p.counters->ticket, 1u) + gridDim.x);
+  if (lead && lane == 0) pending = static_cast<int>(atomicAdd(&p.counters->ticket, 1u) + gridDim.x);
+  int head = 0;    // the ring's next free byte
+  int oldest = 0;  // the oldest item the consumers have not released
   for (int n = 0;; ++n) {
-    const int st = n % kStages;
-    if (n >= kStages) {
-      mbar_wait(&s.empty[st], static_cast<uint32_t>((n / kStages - 1) & 1));
-    } else if (n == 1) {
-      // Every SM asks for its first item alone, so the card's first bytes are each SM's first
-      // item rather than half of two; one item per SM in flight still fills the bus.
-      mbar_wait(&s.full[0], 0u);
-    }
-    Header h{};
-    h.ticket = ticket;
-    if (ticket >= n_total) {
-      h.kind = kEnd;
-    } else if (ticket < n_gate_up) {
-      h.kind = kGateUp;
-      h.u = ticket / kGuItems;
-      h.block = ticket / kGuSplits % kGateUpBlocks;
-      h.sub = ticket % kGuSplits;
-    } else {
-      const int d = ticket - n_gate_up;
-      h.kind = kDown;
-      h.u = d / kDnItems;
-      h.block = d / kDnColBlocks % kGateUpBlocks;
-      h.sub = d % kDnColBlocks;
-    }
-    if (h.kind != kEnd) {
-      const int proj = h.kind == kGateUp ? IGNIS_MOE_PROJ_GATE_UP : IGNIS_MOE_PROJ_DOWN;
-      h.k2 = static_cast<int>(load_slot(p.slots, s.unique_id[h.u], proj).k2);
-      if (h.kind == kDown) {
-        // h block j is whole once its ten gate/up items have arrived.
-        if (lane == 0) {
-          const uint32_t *count = &p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block];
-          while (ld_acquire(count) < kGuArrivals) __nanosleep(32);
-        }
-        __syncwarp();
+    const int slot = n % kSlots;
+    unsigned long long t_begin = 0, t_flight = 0;
+    if (lead) {
+      if constexpr (kTrace) t_begin = global_ns();
+      // At most kInFlight items' copies in flight; the first item alone, so every SM's first
+      // bytes land first.
+      if (n == 1) {
+        mbar_wait(&s.full[0], 0u);
+      } else if (n >= kInFlight) {
+        mbar_wait(&s.full[(n - kInFlight) % kSlots], static_cast<uint32_t>(((n - kInFlight) / kSlots) & 1));
       }
+      if constexpr (kTrace) t_flight = global_ns();
+      Header h{};
+      h.ticket = ticket;
+      if (ticket >= n_total) {
+        h.kind = kEnd;
+      } else if (ticket < n_gate_up) {
+        h.kind = kGateUp;
+        h.u = ticket / kGuItems;
+        h.block = ticket / kGuSplits % kGateUpBlocks;
+        h.sub = ticket % kGuSplits;
+      } else {
+        const int d = ticket - n_gate_up;
+        h.kind = kDown;
+        h.u = d / kDnItems;
+        h.block = d / kDnColBlocks % kGateUpBlocks;
+        h.sub = d % kDnColBlocks;
+      }
+      if (h.kind != kEnd) {
+        const int proj = h.kind == kGateUp ? IGNIS_MOE_PROJ_GATE_UP : IGNIS_MOE_PROJ_DOWN;
+        h.k2 = static_cast<int>(s.slot[h.u][proj].k2);
+        h.size = item_bytes(h.k2, h.kind == kGateUp, p.tokens);
+        h.off = head + h.size > kRingBytes ? 0 : head;
+      }
+      // Wait for the slot's previous item and for every live item whose bytes the new one would
+      // overwrite -- a wrap to the ring's start can land on younger items than the oldest -- and,
+      // since the consumers release in order, for every item older than those.
+      int last = n - kSlots;
+      for (int m = oldest; m < n; ++m) {
+        const Header &o = s.header[m % kSlots];
+        if (h.kind != kEnd && h.off < o.off + o.size && o.off < h.off + h.size) last = m;
+      }
+      for (; oldest <= last; ++oldest) {
+        mbar_wait(&s.empty[oldest % kSlots], static_cast<uint32_t>((oldest / kSlots) & 1));
+      }
+      if (h.kind != kEnd) head = h.off + h.size;
       if constexpr (kTrace) h.issued = global_ns();
-      char *stage = stages + static_cast<size_t>(st) * stage_stride;
-      dispatch_k2(static_cast<uint32_t>(h.k2), [&](auto k2) { stage_item<decltype(k2)::value>(s, p, h, stage); });
+      __syncwarp();
+      if (lane == 0) s.header[slot] = h;
     }
-    if (lane == 0) {
-      s.header[st] = h;
-      mbar_arrive(&s.full[st]);
+    producer_sync();  // the item's header is every producer thread's to read
+    const Header h = s.header[slot];
+    if (h.kind != kEnd) {
+      dispatch_k2(static_cast<uint32_t>(h.k2), [&](auto k2) { stage_item<decltype(k2)::value>(s, p, h, ring + h.off); });
     }
-    mbar_arrive_on_copies(&s.full[st]);
+    if (lead && lane == 0) mbar_arrive(&s.full[slot]);
+    mbar_arrive_on_copies(&s.full[slot]);
+    if constexpr (kTrace) {
+      if (lead && lane == 0 && h.kind != kEnd && h.ticket < kTraceUnits) {
+        unsigned long long *r = p.trace + static_cast<size_t>(h.ticket) * kTraceWords;
+        r[12] = t_begin;
+        r[13] = t_flight;
+        r[14] = h.issued;
+        r[15] = global_ns();
+      }
+    }
     if (h.kind == kEnd) return;
-    int fetched = 0;
-    if (lane == 0) fetched = static_cast<int>(atomicAdd(&p.counters->ticket, 1u) + gridDim.x);
-    ticket = __shfl_sync(0xFFFFFFFFu, pending, 0);
-    pending = fetched;
+    if (lead) {
+      int fetched = 0;
+      if (lane == 0) fetched = static_cast<int>(atomicAdd(&p.counters->ticket, 1u) + gridDim.x);
+      ticket = __shfl_sync(0xFFFFFFFFu, pending, 0);
+      pending = fetched;
+    }
+    producer_sync();  // the header slot is read before the lead reuses it
   }
 }
 
@@ -426,22 +471,21 @@ __device__ __forceinline__ void store_sums(float *out, int cols, const int (&col
 }
 
 template <bool kTrace>
-__device__ void mma_role(Shared &s, const Params &p, char *stages, int stage_stride, char *abufs, int abuf_stride,
-                         float *out) {
+__device__ void mma_role(Shared &s, const Params &p, const char *ring, char *abufs, int abuf_stride, float *out) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tokens = p.tokens;
   for (int n = 0;; ++n) {
-    const int st = n % kStages;
+    const int st = n % kSlots;
     const int b = n & 1;
     UnitStamps stamps;
     if constexpr (kTrace) stamps.begin = global_ns();
     mbar_wait(&s.a_full[b], static_cast<uint32_t>((n >> 1) & 1));
     const Header h = s.meta[b].h;
     if (h.kind == kEnd) break;
-    mbar_wait(&s.full[st], static_cast<uint32_t>((n / kStages) & 1));  // done: orders the stage's bytes
+    mbar_wait(&s.full[st], static_cast<uint32_t>((n / kSlots) & 1));  // done: orders the item's bytes
     if constexpr (kTrace) stamps.ready = global_ns();
-    const uint32_t *stage = reinterpret_cast<const uint32_t *>(stages + static_cast<size_t>(st) * stage_stride);
+    const uint32_t *stage = reinterpret_cast<const uint32_t *>(ring + h.off);
     const __half *a = reinterpret_cast<const __half *>(abufs + b * abuf_stride);
     dispatch_k2(static_cast<uint32_t>(h.k2), [&](auto k2) {
       constexpr int K2 = decltype(k2)::value;
@@ -520,7 +564,7 @@ __device__ void prepare_gate_up(Meta &m, const char *extra, int tokens, __half *
 // The down item's operand: aux warp t < tokens reads gate and up block j's sums, rotates both,
 // applies svh and SwiGLU (h's block j), then h_j o suh_down, rotated, into A as fp16 under one
 // power-of-two scale. The aux threads copy svh_down's 512 columns into the meta for the
-// reduction, and count this reader on (u, j) once the sums are read.
+// reduction.
 __device__ void prepare_down(Meta &m, const Params &p, const char *extra, int tokens, __half *a) {
   const int lane = threadIdx.x & 31;
   const int aux = threadIdx.x - kAuxWarp0 * 32;
@@ -556,8 +600,6 @@ __device__ void prepare_down(Meta &m, const Params &p, const char *extra, int to
     for (int q = 0; q < 4; ++q) a[t * kAStride + 4 * lane + q] = __float2half_rn(v[q] * scale);
     if (lane == 0) m.scale[t] = scale;
   }
-  aux_sync();  // every reading warp has its values
-  if (aux == 0) m.reader_before = atomicAdd(&p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block], kReaderStep);
 }
 
 // Item `m`'s reduction from the output buffer.
@@ -598,8 +640,12 @@ __device__ void reduce_item(const Shared &s, const Meta &m, const Params &p, con
       add_fixed(p.acc + static_cast<size_t>(t) * kHidden + kDnCols * h.sub + cc, wt * (v[q] * __half2float(m.svh[cc])));
     }
   }
-  // The fifth reader of h block j zeroes its sums and the count for the next call.
-  if (m.reader_before == kLastReader) {
+  // This reader read block j's sums in its prepare: counted now, off the operand's path. The
+  // fifth reader zeroes the sums and the count for the next call.
+  __shared__ uint32_t before;
+  if (aux == 0) before = atomicAdd(&p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block], kReaderStep);
+  aux_sync();
+  if (before == kLastReader) {
     for (int i = aux; i < tokens * 256; i += kAuxThreads) {
       const int t = i / 256, c = i % 256;
       p.gate_up[(static_cast<size_t>(h.u) * p.cap + t) * kGateUpOut + (c < 128 ? 0 : kInter) + 128 * h.block + (c & 127)] = 0;
@@ -625,35 +671,40 @@ __device__ void reduce_previous(Shared &s, const Params &p, int n, const float *
   }
 }
 
-// Each item n: prepare it while the mma warps multiply item n - 1, then reduce item n - 1. When
-// item n's stage is not yet full the reduction goes first: a down item's producer may be waiting
-// for the very arrival that reduction counts.
+// Each item n: prepare it while the mma warps multiply item n - 1, then reduce item n - 1. A down
+// item's h block must be whole first: while it is not, the reduction of item n - 1 goes first --
+// its arrival may be one of the ten the block waits for.
 template <bool kTrace>
-__device__ void aux_role(Shared &s, const Params &p, char *stages, int stage_stride, char *abufs, int abuf_stride,
-                         const float *out) {
-  __shared__ int reduce_first;
+__device__ void aux_role(Shared &s, const Params &p, const char *ring, char *abufs, int abuf_stride, const float *out) {
   const int lane = threadIdx.x & 31;
   const int aux = threadIdx.x - kAuxWarp0 * 32;
   const int tokens = p.tokens;
   unsigned long long *rec = nullptr;  // kTrace: item n - 1's record
   for (int n = 0;; ++n) {
-    const int st = n % kStages;
+    const int st = n % kSlots;
     const int b = n & 1;
-    const uint32_t parity = static_cast<uint32_t>((n / kStages) & 1);
     Meta &m = s.meta[b];
-    if (aux == 0) reduce_first = n > 0 && !mbar_test(&s.full[st], parity);
-    aux_sync();
-    const bool early = reduce_first != 0;
-    if (early) reduce_previous<kTrace>(s, p, n, out, rec);
-    // Prepare item n.
     unsigned long long t_wait = 0, t_prep = 0;
     if constexpr (kTrace) t_wait = global_ns();
-    mbar_wait(&s.full[st], parity);
-    if constexpr (kTrace) t_prep = global_ns();
+    mbar_wait(&s.full[st], static_cast<uint32_t>((n / kSlots) & 1));
     const Header h = s.header[st];
+    bool reduced = n == 0;
+    if (h.kind == kDown) {
+      const uint32_t *count = &p.counters->gate_up_arrivals[h.u * kGateUpBlocks + h.block];
+      if (aux == 0) s.arrived = ld_acquire(count) >= kGuArrivals;
+      aux_sync();
+      if (!s.arrived) {
+        if (!reduced) reduce_previous<kTrace>(s, p, n, out, rec);
+        reduced = true;
+        if (aux == 0) {
+          while (ld_acquire(count) < kGuArrivals) __nanosleep(32);
+        }
+      }
+    }
+    if constexpr (kTrace) t_prep = global_ns();
     if (aux == 0) m.h = h;
     aux_sync();
-    const char *extra = stages + static_cast<size_t>(st) * stage_stride + kMaxWeightBytes;
+    const char *extra = ring + h.off + weight_bytes(h.k2);
     __half *a = reinterpret_cast<__half *>(abufs + b * abuf_stride);
     if (h.kind == kGateUp) {
       prepare_gate_up(m, extra, tokens, a);
@@ -673,7 +724,7 @@ __device__ void aux_role(Shared &s, const Params &p, char *stages, int stage_str
         r[9] = global_ns();
       }
     }
-    if (n > 0 && !early) reduce_previous<kTrace>(s, p, n, out, rec);
+    if (!reduced) reduce_previous<kTrace>(s, p, n, out, rec);
     if constexpr (kTrace) {
       rec = h.kind != kEnd && h.ticket < kTraceUnits ? p.trace + static_cast<size_t>(h.ticket) * kTraceWords : nullptr;
     }
@@ -682,38 +733,38 @@ __device__ void aux_role(Shared &s, const Params &p, char *stages, int stage_str
 }
 
 template <bool kTrace>
-__global__ void __launch_bounds__(kThreads, 1) experts_decode_staged_kernel(Params p, int stage_stride) {
+__global__ void __launch_bounds__(kThreads, 1) experts_decode_staged_kernel(Params p) {
   __shared__ Shared s;
   extern __shared__ __align__(128) char dyn[];
   const int abuf_stride = abuf_bytes(p.tokens);
-  char *stages = dyn;
-  char *abufs = dyn + kStages * stage_stride;
+  char *ring = dyn;
+  char *abufs = dyn + kRingBytes;
   float *out = reinterpret_cast<float *>(abufs + 2 * abuf_stride);
   if constexpr (kTrace) {
     if (threadIdx.x == 0) trace_cta(p.trace)[0] = global_ns();
   }
   if (threadIdx.x == 0) {
-    for (int i = 0; i < kStages; ++i) {
-      mbar_init(&s.full[i], 33);                   // the producer's 32 lanes' copies + its lane 0's header
-      mbar_init(&s.empty[i], kMmaWarps + kAuxWarps);  // every mma and aux warp has read the stage
+    for (int i = 0; i < kSlots; ++i) {
+      mbar_init(&s.full[i], kProducerThreads + 1);  // each producer thread's copies + the header
+      mbar_init(&s.empty[i], kMmaWarps + kAuxWarps);  // every mma and aux warp has read the item
     }
     for (int i = 0; i < 2; ++i) mbar_init(&s.a_full[i], kAuxWarps);
     mbar_init(&s.o_full, kMmaWarps);
     mbar_init(&s.o_empty, kAuxWarps);
   }
-  unique_experts(s, p.ids, p.weights, p.tokens);  // ends with __syncthreads
+  unique_experts(s, p.ids, p.weights, p.slots, p.tokens);  // ends with __syncthreads
   const int n_gate_up = s.n_unique * kGuItems;
   const int n_total = n_gate_up + s.n_unique * kDnItems;
   const int warp = threadIdx.x >> 5;
-  if (warp == kProducerWarp) {
+  if (warp >= kProducerWarp) {
     if constexpr (kTrace) {
-      if ((threadIdx.x & 31) == 0) trace_cta(p.trace)[1] = global_ns();
+      if (threadIdx.x == kProducerWarp * 32) trace_cta(p.trace)[1] = global_ns();
     }
-    producer<kTrace>(s, p, stages, stage_stride, n_gate_up, n_total);
+    producer<kTrace>(s, p, ring, n_gate_up, n_total);
   } else if (warp >= kAuxWarp0) {
-    aux_role<kTrace>(s, p, stages, stage_stride, abufs, abuf_stride, out);
+    aux_role<kTrace>(s, p, ring, abufs, abuf_stride, out);
   } else {
-    mma_role<kTrace>(s, p, stages, stage_stride, abufs, abuf_stride, out);
+    mma_role<kTrace>(s, p, ring, abufs, abuf_stride, out);
   }
   __syncthreads();
   // The last CTA out leaves the ticket counter as it found it, so the launch replays.
@@ -767,12 +818,11 @@ int32_t decode_staged(int grid, const __nv_bfloat16 *x, int tokens, const int32_
   p.gate_up = gate_up;
   p.acc = acc;
   p.trace = trace;
-  const int stride = stage_bytes(tokens);
   const int bytes = dynamic_bytes(tokens);
   if (trace != nullptr) {
-    experts_decode_staged_kernel<true><<<grid, kThreads, bytes, stream>>>(p, stride);
+    experts_decode_staged_kernel<true><<<grid, kThreads, bytes, stream>>>(p);
   } else {
-    experts_decode_staged_kernel<false><<<grid, kThreads, bytes, stream>>>(p, stride);
+    experts_decode_staged_kernel<false><<<grid, kThreads, bytes, stream>>>(p);
   }
   return check_launch("ignis_moe_experts_decode (staged)");
 }

@@ -13,7 +13,8 @@
 //   staged kernel (moe_decode_staged.cu)  2 the mma warps start waiting for the item's operand
 //       3 operand and stage ready   4 multiplied   5 sums left in the output buffer   6 ns the aux
 //       warps waited for the stage   7 the producer issued the copies   8, 9 the aux warps'
-//       prepare   10, 11 their reduction
+//       prepare   10, 11 their reduction   12 the producer took the item up   13 its in-flight
+//       wait over   14 its ring wait over   15 its copies issued
 //   CTA (at IGNIS_MOE_TRACE_UNITS + blockIdx.x):  0 entry   1 first ticket known   2 exit   3 SM id
 // Ticket order is the route's own; a record left zero was not reached.
 #ifndef IGNIS_MOE_TRACE_H
@@ -23,7 +24,7 @@
 
 #include <stdint.h>
 
-#define IGNIS_MOE_TRACE_WORDS 12
+#define IGNIS_MOE_TRACE_WORDS 16
 // Units of the largest decode call (8 tokens, 80 distinct experts, 40 gate/up + 20 down units
 // each, at the finest split any route uses: room for 4x that).
 #define IGNIS_MOE_TRACE_UNITS (4 * 80 * 60)
