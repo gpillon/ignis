@@ -687,6 +687,9 @@ pub struct ConcreteScheduler {
     /// Whether the tier is turning writes away; a refusal is logged and
     /// counted once per entry into this state, not once per attempt.
     disk_refusing: bool,
+    /// The model thread's wall time in the last advance's transfer passes
+    /// (GitHub #309): what pumping the moves cost it, apart from the link.
+    transfer_pass_micros: u64,
 }
 
 impl ConcreteScheduler {
@@ -769,6 +772,7 @@ impl ConcreteScheduler {
             disk_writes_paused_until: None,
             moves_out_paused_until: None,
             disk_refusing: false,
+            transfer_pass_micros: 0,
             config,
             compute,
             next_id: 0,
@@ -822,6 +826,13 @@ impl ConcreteScheduler {
     /// through KV-RAM a window at a time (GitHub #309).
     pub fn transfer_busy(&self) -> bool {
         self.disk_busy() || self.kv_ram_out.is_some() || self.kv_ram_in.is_some()
+    }
+
+    /// The model thread's wall time in the last advance's transfer passes --
+    /// polling the copies and IO under way, issuing the next windows,
+    /// settling what ended (GitHub #309, test and measurement observability).
+    pub fn transfer_pass_micros(&self) -> u64 {
+        self.transfer_pass_micros
     }
 
     /// Whether a move off the device is under way: one at a time, and the
@@ -4128,8 +4139,10 @@ impl Scheduler for ConcreteScheduler {
         // Spec vram-budget/03: KV-disk moves a window per transfer per
         // advance, and settles what ended -- before anything below decides
         // what fits. So do the windowed moves through KV-RAM (GitHub #309).
+        let pumped = Instant::now();
         self.disk_pass(&mut events);
         self.kv_ram_pass(&mut events);
+        self.transfer_pass_micros = pumped.elapsed().as_micros() as u64;
 
         // Phase 1 — chunked, interleaved prefill (P3-01, ADR 0018): at
         // most one `prefill_step` call this tick. Exactly one request may

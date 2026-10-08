@@ -362,15 +362,20 @@ pub struct TransferWindow {
 /// vram-budget/03 AC 37, GitHub #309): a restore from KV-RAM, and the feed of
 /// a restore from KV-disk. One such window is in flight at a time, and a new
 /// one goes out at most once an advance, so this is the host-to-device
-/// traffic a move adds to a decode round. On Flash-Next that is the expert
-/// stream's own direction: the window shares the link with the expert copies
-/// each layer of the round needs before it can run.
+/// traffic a move adds to a decode round -- on Flash-Next, the direction its
+/// expert misses are read in. Measured beside two decoding lanes (finding
+/// 2026-10-08, live moves windowed): at this size the rounds' time outside
+/// their expert stall did not move (10.5 against 10.6 ms), and a 1.13 GB
+/// sequence comes back in ~1.3 s.
 pub const MOVE_IN_WINDOW_BYTES: u64 = 16 << 20;
 
 /// The window a live move off the device into KV-RAM keeps on the link
-/// (GitHub #309), one in flight at a time, at most one new one an advance.
-/// It runs against the expert stream's direction.
-pub const MOVE_OUT_WINDOW_BYTES: u64 = 64 << 20;
+/// (GitHub #309), one in flight at a time, at most one new one an advance,
+/// against the direction of Flash-Next's expert reads. Measured as
+/// [`MOVE_IN_WINDOW_BYTES`] is: the other lanes' ITL p50 +3-13% over four
+/// runs at this size (AC 37's starting bound is +10%), +11% at 16 MiB and
+/// +37% at 64 MiB; a 1.13 GB sequence leaves in ~1.15 s.
+pub const MOVE_OUT_WINDOW_BYTES: u64 = 12 << 20;
 
 /// How much a live move puts on the link per advance, each way (GitHub
 /// #309): the family's ([`TransferPace::for_family`]) unless a load names

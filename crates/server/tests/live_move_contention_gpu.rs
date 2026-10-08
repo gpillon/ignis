@@ -117,14 +117,95 @@ struct Step {
     at: Instant,
     events: Vec<SchedEvent>,
     busy_after: bool,
+    /// The model thread's time in the advance's transfer passes.
+    pump: Duration,
+    /// The load's expert residency and n-gram counts after the step.
+    counters: Option<ignis_core::flash_next_counters::FlashNextCounters>,
 }
 
 struct Rig {
     sched: ConcreteScheduler,
     steps: Vec<Step>,
+    counters: Option<std::sync::Arc<ignis_core::flash_next_counters::FlashNextCounterSource>>,
 }
 
 impl Rig {
+    /// Every step as one JSON row -- when it ended (Unix ms), its wall time,
+    /// the transfer passes' time, how many requests decoded in it, whether it
+    /// ran a prefill chunk or had a move in flight, and its move and end
+    /// facts -- to set beside a GPU sampler's log (GitHub #309).
+    fn write_timeline(&self, path: &Path) {
+        let (now_instant, now_unix) = (Instant::now(), std::time::SystemTime::now());
+        let unix_ms = |at: Instant| {
+            let ago = now_instant - at;
+            (now_unix - ago).duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1e3)
+        };
+        // Decode's expert hits, misses and demand-copy stall, and the
+        // n-gram file reads, in the step: each a difference of totals.
+        let decode = |c: &ignis_core::flash_next_counters::FlashNextCounters| {
+            let r = &c.residency;
+            (
+                r.hits.iter().map(|p| p[0]).sum::<u64>(),
+                r.misses.iter().map(|p| p[0]).sum::<u64>(),
+                r.stall_nanos[0],
+                c.ngram.file_rows,
+            )
+        };
+        let mut previous = (0, 0, 0, 0);
+        let rows: Vec<String> = self
+            .steps
+            .iter()
+            .map(|s| {
+                let now = s.counters.as_ref().map_or(previous, decode);
+                let (hits, misses, stall, ngram) =
+                    (now.0 - previous.0, now.1 - previous.1, now.2 - previous.2, now.3 - previous.3);
+                previous = now;
+                let decoded: std::collections::BTreeSet<RequestId> = s
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        SchedEvent::Token { request, .. } => Some(*request),
+                        _ => None,
+                    })
+                    .collect();
+                let facts: Vec<String> = s
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        SchedEvent::Evicted { request, .. } => Some(format!("evicted {request}")),
+                        SchedEvent::Restored { request, .. } => Some(format!("restored {request}")),
+                        SchedEvent::DiskSpilled { request, .. } => Some(format!("spilled {request}")),
+                        SchedEvent::Done { request, .. } => Some(format!("done {request}")),
+                        _ => None,
+                    })
+                    .collect();
+                // The cache's occupancy and the prefetches' totals, as they
+                // stand after the step.
+                let (in_use, capacity, prefetch_issued, prefetch_used) =
+                    s.counters.as_ref().map_or((0, 0, 0, 0), |c| {
+                        (
+                            c.slots_in_use.iter().map(|&n| u64::from(n)).sum::<u64>(),
+                            c.slots_capacity.iter().map(|&n| u64::from(n)).sum::<u64>(),
+                            c.residency.prefetch_issued,
+                            c.residency.prefetch_used,
+                        )
+                    });
+                format!(
+                    "{{\"unix_ms\":{:.1},\"wall_ms\":{:.3},\"pump_ms\":{:.3},\"decoded\":{:?},\"prefill\":{},\"busy\":{},\"facts\":{:?},\"decode_hits\":{hits},\"decode_misses\":{misses},\"decode_stall_ms\":{:.3},\"ngram_file_rows\":{ngram},\"slots_in_use\":{in_use},\"slots_capacity\":{capacity},\"prefetch_issued\":{prefetch_issued},\"prefetch_used\":{prefetch_used}}}",
+                    unix_ms(s.at),
+                    ms(s.wall),
+                    ms(s.pump),
+                    decoded.iter().collect::<Vec<_>>(),
+                    s.events.iter().any(|e| matches!(e, SchedEvent::PrefillChunk { .. })),
+                    s.busy_after,
+                    facts,
+                    stall as f64 / 1e6
+                )
+            })
+            .collect();
+        std::fs::write(path, format!("[\n{}\n]\n", rows.join(",\n"))).expect("write the step timeline");
+    }
+
     fn step(&mut self) {
         let started = Instant::now();
         let events = self.sched.advance();
@@ -133,7 +214,9 @@ impl Rig {
             panic!("the leaf failed a step: {error}");
         }
         let busy_after = self.sched.transfer_busy();
-        self.steps.push(Step { wall, at: Instant::now(), events, busy_after });
+        let pump = Duration::from_micros(self.sched.transfer_pass_micros());
+        let counters = self.counters.as_ref().map(|source| source.read());
+        self.steps.push(Step { wall, at: Instant::now(), events, busy_after, pump, counters });
     }
 
     fn to_idle(&mut self) {
@@ -266,6 +349,9 @@ struct Move {
     baseline: Vec<Duration>,
     /// The same pair's window before C arrived, for reference.
     early_baseline: Vec<Duration>,
+    /// The model thread's time in the transfer passes, each of the move's
+    /// steps: the host side of what the move costs a round.
+    pump: Vec<Duration>,
     p50_bound: f64,
 }
 
@@ -299,12 +385,17 @@ impl Move {
             (p50 / e50 - 1.0) * 100.0,
             max - emax,
         );
+        let (pump50, pump_max) = stats(&self.pump);
+        println!(
+            "{leg:?} {}: the model thread's own time in the transfer passes, a step: p50 {:.3} ms, max {:.3} ms",
+            self.name, pump50, pump_max
+        );
     }
 
     fn json(&self, pace: ignis_runtime::TransferPace) -> String {
         let list = |v: &[Duration]| v.iter().map(|d| format!("{:.3}", ms(*d))).collect::<Vec<_>>().join(",");
         format!(
-            "{{\"move\":\"{}\",\"pace_in_bytes\":{},\"pace_out_bytes\":{},\"bytes\":{},\"duration_ms\":{:.3},\"gb_per_s\":{:.3},\"steps\":{},\"itl_ms\":[{}],\"baseline\":\"B1' and B2' alone at width 2, taken last\",\"baseline_itl_ms\":[{}],\"early_baseline_itl_ms\":[{}]}}",
+            "{{\"move\":\"{}\",\"pace_in_bytes\":{},\"pace_out_bytes\":{},\"bytes\":{},\"duration_ms\":{:.3},\"gb_per_s\":{:.3},\"steps\":{},\"itl_ms\":[{}],\"baseline\":\"B1' and B2' alone at width 2, taken last\",\"baseline_itl_ms\":[{}],\"early_baseline_itl_ms\":[{}],\"pump_ms\":[{}]}}",
             self.name,
             pace.move_in_bytes,
             pace.move_out_bytes,
@@ -315,6 +406,7 @@ impl Move {
             list(&self.itl),
             list(&self.baseline),
             list(&self.early_baseline),
+            list(&self.pump),
         )
     }
 }
@@ -408,7 +500,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         ));
         return None;
     }
-    let mut rig = Rig { sched, steps: Vec::new() };
+    let mut rig = Rig { sched, steps: Vec::new(), counters: reserved.flash_next.clone() };
     let interactive = RequestClass::Interactive;
 
     // ── the width-2 baseline: two lanes alone ──────────────────────────────
@@ -429,7 +521,9 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
     ];
     rig.until_tokens(b[0], 16);
     rig.until_tokens(b[1], 16);
+    let width3_from = rig.mark();
     rig.until_tokens(b[0], 16 + WIDTH3_TOKENS);
+    let width3_to = rig.mark();
 
     // ── E0: an arrival that fits beside C moves nothing ────────────────────
     let e0 = rig.sched.submit(input(prompt(4, E0_PROMPT), E_TOKENS), interactive).unwrap();
@@ -493,6 +587,25 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
         .unwrap_or(rig.steps[restored].at - rig.steps[restored].wall - rig.steps[in_start].at);
     rig.to_idle();
 
+    // ── width 3 before any arrival and after C is back (GitHub #309: whether
+    //    what the rounds of the move in cost is the move's, or the state the
+    //    arrivals left behind) ─────────────────────────────────────────────
+    let three = [c, b[0], b[1]];
+    let width3_steps = |from: usize, to: usize| {
+        rig.steady(from, to).into_iter().filter(|&i| rig.all_decoded(&three, i)).collect::<Vec<_>>()
+    };
+    let before = width3_steps(width3_from, width3_to);
+    let after = width3_steps(restored + 1, rig.mark());
+    let (before50, _) = stats(&rig.itl_in(&b, &before));
+    let (after50, _) = stats(&rig.itl_in(&b, &after));
+    println!(
+        "{tier:?} width 3 (C, B1, B2), B1's and B2's ITL p50: {before50:.2} ms over {} steps before any arrival, \
+         {after50:.2} ms over {} steps after C came back ({:+.1} %)",
+        before.len(),
+        after.len(),
+        (after50 / before50 - 1.0) * 100.0
+    );
+
     // ── the baseline: two fresh lanes alone at width 2, last ───────────────
     let b9 = [
         rig.sched.submit(input(prompt(22, B_PROMPT), B9_TOKENS), interactive).unwrap(),
@@ -525,6 +638,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
             itl: rig.itl_in(&b, steps),
             baseline: rig.itl(&b9, late_first, late_last),
             early_baseline: rig.itl(&b0, early_first, early_last),
+            pump: steps.iter().map(|&i| rig.steps[i].pump).collect(),
             p50_bound,
         }
     };
@@ -547,6 +661,9 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
     assert!(!rig.has(|ev| matches!(ev, SchedEvent::DiskFailure { .. })), "no disk failure");
     let outs = rig.events().filter(|ev| matches!(ev, SchedEvent::Evicted { .. } | SchedEvent::DiskSpilled { .. })).count();
     assert_eq!(outs, 1, "C moved out once, and nothing else moved");
+    if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
+        rig.write_timeline(&dir.join(format!("ac37-{tier:?}-steps.json")));
+    }
     drop(rig);
     drop(blobs);
     Some(moves)
@@ -563,7 +680,11 @@ fn measure(tier: Tier) {
     if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
         std::fs::create_dir_all(&dir).expect("the raw samples' directory");
         let json = format!("[{}]\n", moves.iter().map(|m| m.json(pace)).collect::<Vec<_>>().join(","));
-        let name = format!("ac37-{tier:?}-in{}-out{}.json", pace.move_in_bytes >> 20, pace.move_out_bytes >> 20);
+        let name = format!(
+            "ac37-{tier:?}-in{}-out{}.json",
+            pace.move_in_bytes >> 20,
+            pace.move_out_bytes >> 20
+        );
         std::fs::write(dir.join(name), json).expect("write the raw samples");
     }
 }
