@@ -510,8 +510,9 @@ impl Telemetry {
 
     /// A request was evicted to the host tier: bump the eviction counter
     /// and emit the `evicted` line (GitHub #125) — the snapshot's wall time
-    /// (`snapshot_micros`), so the tier's cost is attributable from the
-    /// request log alone, without a second run.
+    /// (`snapshot_micros`; a windowed move's span, GitHub #309), so the
+    /// tier's cost is attributable from the request log alone, without a
+    /// second run.
     pub fn on_evicted(&mut self, id: RequestId, snapshot_micros: u64) {
         self.kv_evictions = self.kv_evictions.saturating_add(1);
         if let Some(metrics) = &self.metrics {
@@ -615,8 +616,9 @@ impl Telemetry {
 
     /// A request was restored from the host tier onto a decode lane: emit
     /// the `restored` line (GitHub #125) — the restore's wall time
-    /// (`restore_micros`), the other half of the tier's own cost
-    /// attribution alongside [`Telemetry::on_evicted`].
+    /// (`restore_micros`; a windowed move's span, GitHub #309), the other
+    /// half of the tier's own cost attribution alongside
+    /// [`Telemetry::on_evicted`].
     pub fn on_restored(&mut self, id: RequestId, restore_micros: u64) {
         self.emit_restored(id, restore_micros);
     }

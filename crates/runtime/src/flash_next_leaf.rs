@@ -683,6 +683,10 @@ impl StepLeaf for FlashNextLeaf {
         Ok(())
     }
 
+    fn windowed_transfer(&self) -> bool {
+        true
+    }
+
     fn snapshot_window(
         &self,
         _model: &Self::Model,

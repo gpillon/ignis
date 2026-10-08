@@ -147,7 +147,8 @@ use crate::request::Request;
 use crate::retained_slot::{RetainedHolder, RetainedSkip, RetainedSlotLedger};
 use crate::scheduler::{
     CheckpointClaim, Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome,
-    DiskSource, DiskTarget, Occupancy, PrefillJob, PrefillOutcome, RetainedAt, Scheduler, SharedPrefixClaim,
+    DiskSource, DiskTarget, KvRamEvent, KvRamMove, KvRamOutcome, Occupancy, PrefillJob, PrefillOutcome, RetainedAt,
+    Scheduler, SharedPrefixClaim,
 };
 use crate::types::{
     BackfillClass, BoundaryLifetime, ComputeError, DecisionRead, DecodeParams, EngineMode,
@@ -482,6 +483,11 @@ pub const KV_DISK_RESTORE_FLOOR_TOKENS: u32 = 16_384;
 /// step while the request that wanted the room waits.
 pub const KV_DISK_WRITE_BACKOFF: Duration = Duration::from_secs(1);
 
+/// How long no live sequence moves off the device after a windowed move into
+/// KV-RAM failed (GitHub #309): the victim decodes meanwhile, rather than
+/// starting the same failing copy again in the advance it failed in.
+pub const KV_RAM_MOVE_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Whether a victim moved, and how (spec vram-budget/03).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Moved {
@@ -561,6 +567,26 @@ struct MovedSequence {
 struct EntryRoom {
     pages: u32,
     slots: u32,
+}
+
+/// A live sequence on its way into KV-RAM a window at a time (GitHub #309):
+/// it keeps its pages, its resident slot and its lane, and is in no round,
+/// until the last window lands; its blob's bytes are KV-RAM's from the start.
+#[derive(Debug, Clone, Copy)]
+struct RamOut {
+    request: RequestId,
+    resume_phase: ResumePhase,
+    lane: Option<LaneId>,
+    restore_pages: u32,
+    bytes: u64,
+}
+
+/// A live sequence on its way back from KV-RAM a window at a time (GitHub
+/// #309): charged on the device and its lane held, not yet schedulable.
+#[derive(Debug, Clone, Copy)]
+struct RamIn {
+    request: RequestId,
+    lane: Option<LaneId>,
 }
 
 /// A restore from KV-disk under way (spec vram-budget/03): charged on the
@@ -647,8 +673,16 @@ pub struct ConcreteScheduler {
     /// 0045: one request per direction), by the blob each moves.
     spilling: Option<(DiskBlob, Spill)>,
     restoring: Option<(DiskBlob, Restore)>,
+    /// The live move into KV-RAM and the one out of it under way, a window
+    /// at a time (GitHub #309): at most one each way, and none into the
+    /// device beside a restore from the disk.
+    kv_ram_out: Option<RamOut>,
+    kv_ram_in: Option<RamIn>,
     /// Until when the tier takes no new write, after one failed.
     disk_writes_paused_until: Option<Instant>,
+    /// Until when no live sequence moves off the device, after a windowed
+    /// move into KV-RAM failed.
+    moves_out_paused_until: Option<Instant>,
     /// Whether the tier is turning writes away; a refusal is logged and
     /// counted once per entry into this state, not once per attempt.
     disk_refusing: bool,
@@ -729,7 +763,10 @@ impl ConcreteScheduler {
                 .then(|| DiskTier::new(config.kv_disk_capacity_bytes, config.retained_interactive_ttl)),
             spilling: None,
             restoring: None,
+            kv_ram_out: None,
+            kv_ram_in: None,
             disk_writes_paused_until: None,
+            moves_out_paused_until: None,
             disk_refusing: false,
             config,
             compute,
@@ -778,6 +815,25 @@ impl ConcreteScheduler {
     /// Whether a KV-disk transfer is under way (tests).
     pub fn disk_busy(&self) -> bool {
         self.spilling.is_some() || self.restoring.is_some()
+    }
+
+    /// Whether any move is under way: a KV-disk transfer, or a live move
+    /// through KV-RAM a window at a time (GitHub #309).
+    pub fn transfer_busy(&self) -> bool {
+        self.disk_busy() || self.kv_ram_out.is_some() || self.kv_ram_in.is_some()
+    }
+
+    /// Whether a move off the device is under way: one at a time, and the
+    /// room it makes is coming (spec vram-budget/03).
+    fn moving_out(&self) -> bool {
+        self.spilling.is_some() || self.kv_ram_out.is_some()
+    }
+
+    /// Whether a move onto the device is under way, from KV-RAM or from the
+    /// disk: one at a time, so that two of them never share the link beside
+    /// the expert stream (GitHub #309).
+    fn moving_in(&self) -> bool {
+        self.restoring.is_some() || self.kv_ram_in.is_some()
     }
 
     /// Read wall time from `clock` instead of `Instant::now` (tests that need
@@ -2122,8 +2178,10 @@ impl ConcreteScheduler {
         self.requests[idx].abort();
         // Spec vram-budget/03: a transfer the request was in ends with it --
         // abandoned at the backend, its file deleted, the disk ledger's
-        // charge lifted -- before the backend releases the sequence.
+        // charge lifted -- before the backend releases the sequence. So does
+        // a windowed move through KV-RAM (GitHub #309).
         self.abandon_disk_transfer(idx);
+        self.abandon_kv_ram_move(idx);
         self.compute.release(request_id);
         // A request cancelled while evicted takes its snapshot out of the
         // host tier and frees its pinned blob: left there, the next restore
@@ -2556,18 +2614,9 @@ impl ConcreteScheduler {
         lane: Option<LaneId>,
         events: &mut Vec<SchedEvent>,
     ) -> Moved {
-        let (v_id, v_class, v_pages, v_tokens, v_progress, v_work, v_gdn, v_prefix) = {
+        let (v_id, v_pages, v_gdn, v_prefix) = {
             let v = &self.requests[v_idx];
-            (
-                v.id,
-                v.class,
-                v.resources.kv_pages,
-                v.tokens,
-                v.prefill_progress,
-                v.remaining_work,
-                v.gdn.clone(),
-                v.prefix_entry,
-            )
+            (v.id, v.resources.kv_pages, v.gdn.clone(), v.prefix_entry)
         };
         // GitHub #190: a request holding a shared prefix is snapshotted with
         // the prefix's pages materialized into its blob, so it comes back as a
@@ -2599,6 +2648,11 @@ impl ConcreteScheduler {
             Ok(bytes) => bytes,
             Err(_) => return Moved::Nothing, // refused (unreachable per the boundary note above)
         };
+        // GitHub #309: a copy off the device just failed. Nothing moves for a
+        // moment -- nor gives anything up to make room for a move.
+        if self.moves_out_paused_until.is_some_and(|until| self.now() < until) {
+            return Moved::Nothing;
+        }
         // Make room in the host tier (re-queueing any discarded snapshot).
         match self.make_host_room_for_bytes(bytes, events) {
             KvRamRoom::Made => {}
@@ -2610,12 +2664,51 @@ impl ConcreteScheduler {
         // Snapshot to pinned host memory and release the GPU sequence (its
         // KV pages, GDN slot and conv taps) — nothing else runs between the
         // size query above and this call on this single-threaded scheduler,
-        // so `evict` cannot fail where `snapshot_size` just succeeded.
+        // so the move cannot fail where `snapshot_size` just succeeded.
         let started = Instant::now();
-        let Ok(bytes) = self.compute.evict(v_id) else {
+        let Ok((bytes, how)) = self.compute.kv_ram_move_out(v_id) else {
             return Moved::Nothing;
         };
+        if how == KvRamMove::Started {
+            // GitHub #309: the blob leaves a window at a time between steps.
+            // Its bytes are KV-RAM's now; the victim keeps its pages, slot
+            // and lane, in no round, until the last window lands.
+            debug_assert!(self.kv_ram_out.is_none(), "one move out of the device at a time");
+            self.host.begin_landing(v_id, bytes);
+            self.requests[v_idx].moving = true;
+            self.kv_ram_out = Some(RamOut {
+                request: v_id,
+                resume_phase,
+                lane,
+                restore_pages,
+                bytes,
+            });
+            return Moved::Started;
+        }
         let snapshot_micros = started.elapsed().as_micros() as u64;
+        self.capture_moved_out(v_idx, resume_phase, lane, restore_pages, bytes, snapshot_micros, events);
+        Moved::Now
+    }
+
+    /// The scheduler's half of a live sequence landing in KV-RAM (GitHub
+    /// #125; #309 for one that landed a window at a time): its tier entry,
+    /// its leaving the device, and the `Evicted` fact, `snapshot_micros`
+    /// after the move started.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_moved_out(
+        &mut self,
+        v_idx: usize,
+        resume_phase: ResumePhase,
+        lane: Option<LaneId>,
+        restore_pages: u32,
+        bytes: u64,
+        snapshot_micros: u64,
+        events: &mut Vec<SchedEvent>,
+    ) {
+        let (v_id, v_class, v_tokens, v_progress, v_work, v_gdn) = {
+            let v = &self.requests[v_idx];
+            (v.id, v.class, v.tokens, v.prefill_progress, v.remaining_work, v.gdn.clone())
+        };
         let entry = HostEntry {
             request: v_id,
             resume_phase,
@@ -2641,7 +2734,6 @@ impl ConcreteScheduler {
             request: v_id,
             snapshot_micros,
         });
-        Moved::Now
     }
 
     /// The scheduler's half of a victim leaving the device, wherever it went
@@ -2805,7 +2897,7 @@ impl ConcreteScheduler {
             // Spec vram-budget/03: one move at a time. While one is under
             // way the room it makes is coming, and choosing a second victim
             // would move work nobody needs moved yet.
-            if self.spilling.is_some() {
+            if self.moving_out() {
                 return false;
             }
             let rank = Self::rank_of(&self.requests[requester]);
@@ -2850,7 +2942,7 @@ impl ConcreteScheduler {
             // itself.
             // No evictable victim (all reserved / none), or one on its way
             // (spec vram-budget/03): the head waits.
-            if self.spilling.is_some() || self.evict_one_victim(head_idx, events) != Moved::Now {
+            if self.moving_out() || self.evict_one_victim(head_idx, events) != Moved::Now {
                 return false;
             }
             // Loop: re-check whether the head now fits.
@@ -2980,10 +3072,15 @@ impl ConcreteScheduler {
         self.reclaim_retained_until(fits, events)
     }
 
-    /// Bring `request`'s live snapshot back from KV-RAM, synchronously, when
-    /// it can enter beside the room held `above` it. A blob that fails to
-    /// restore is dropped and its request re-prefills.
+    /// Bring `request`'s live snapshot back from KV-RAM when it can enter
+    /// beside the room held `above` it: in the call, or a window at a time
+    /// (GitHub #309), charged now -- pages, resident slot, its lane -- and
+    /// schedulable when it lands. One move onto the device at a time. A blob
+    /// that fails to restore is dropped and its request re-prefills.
     fn restore_from_kv_ram(&mut self, request: RequestId, above: EntryRoom, events: &mut Vec<SchedEvent>) {
+        if self.moving_in() {
+            return;
+        }
         let Some(victim) = self.host.entry(request).cloned() else {
             return;
         };
@@ -3002,43 +3099,138 @@ impl ConcreteScheduler {
             .expect("a KV-RAM snapshot always maps to a request");
         let context_tokens = sequence_tokens(&self.config, &self.requests[idx].input);
         let started = Instant::now();
-        match self.compute.restore(victim.request, context_tokens) {
-            Ok(()) => {
+        match self.compute.kv_ram_move_in(victim.request, context_tokens) {
+            Ok(KvRamMove::Done) => {
                 let restore_micros = started.elapsed().as_micros() as u64;
-                self.host
-                    .restore(victim.request)
-                    .expect("the victim is a tier entry");
                 // P4-07, GitHub #125: re-charges resident_slots + kv_pages —
                 // the leaf just re-materialized exactly that state above.
                 self.materialize(idx);
                 let lane = match victim.resume_phase {
-                    ResumePhase::Running => {
-                        let lane = self.free_lanes.pop().expect("checked non-empty above");
-                        self.requests[idx].restore_lane(lane);
-                        Some(lane)
-                    }
-                    ResumePhase::Prefilling => {
-                        // Resume chunking from the snapshotted boundary, not
-                        // from zero.
-                        self.requests[idx].prefill_progress = victim.prefill_progress;
-                        self.requests[idx].restore_prefilling();
-                        None
-                    }
+                    ResumePhase::Running => Some(self.free_lanes.pop().expect("checked non-empty above")),
+                    ResumePhase::Prefilling => None,
                 };
-                events.push(SchedEvent::Restored {
+                self.resume_moved_in(idx, lane, restore_micros, events);
+            }
+            Ok(KvRamMove::Started) => {
+                // GitHub #309: charged now, its lane held; out of every
+                // ranking in KV-RAM until its last window lands.
+                self.materialize(idx);
+                let lane = match victim.resume_phase {
+                    ResumePhase::Running => self.free_lanes.pop(),
+                    ResumePhase::Prefilling => None,
+                };
+                self.host.begin_restore(victim.request);
+                self.requests[idx].moving = true;
+                self.kv_ram_in = Some(RamIn {
                     request: victim.request,
                     lane,
-                    restore_micros,
                 });
             }
-            Err(_) => {
-                // The blob could not be restored: drop it (never promoted —
-                // it did not actually resume) and free whatever the leaf
-                // still held for it, then re-prefill from scratch.
-                self.host.discard_request(victim.request);
-                self.compute.discard_snapshot(victim.request);
-                self.requeue_request(idx, events);
+            Err(_) => self.lose_kv_ram_snapshot(idx, events),
+        }
+    }
+
+    /// The scheduler's half of a live sequence back on the device from
+    /// KV-RAM, charged already (GitHub #125; #309 for one that came back a
+    /// window at a time): its tier entry goes, promoted, and it resumes on
+    /// `lane`, or prefilling from where it stopped.
+    fn resume_moved_in(&mut self, idx: usize, lane: Option<LaneId>, restore_micros: u64, events: &mut Vec<SchedEvent>) {
+        let request = self.requests[idx].id;
+        let entry = self.host.restore(request).expect("the victim is a tier entry");
+        match lane {
+            Some(lane) => {
+                self.requests[idx].restore_lane(lane);
             }
+            None => {
+                // Resume chunking from the snapshotted boundary, not from
+                // zero.
+                self.requests[idx].prefill_progress = entry.prefill_progress;
+                self.requests[idx].restore_prefilling();
+            }
+        }
+        events.push(SchedEvent::Restored {
+            request,
+            lane,
+            restore_micros,
+        });
+    }
+
+    /// A KV-RAM snapshot that could not be restored: drop it (never promoted
+    /// — it did not actually resume) and free whatever the leaf still held
+    /// for it, then re-prefill from scratch.
+    fn lose_kv_ram_snapshot(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
+        let request = self.requests[idx].id;
+        self.host.discard_request(request);
+        self.compute.discard_snapshot(request);
+        self.requeue_request(idx, events);
+    }
+
+    /// Settle the windowed KV-RAM moves that ended since the last advance
+    /// (GitHub #309).
+    fn kv_ram_pass(&mut self, events: &mut Vec<SchedEvent>) {
+        if self.kv_ram_out.is_none() && self.kv_ram_in.is_none() {
+            return;
+        }
+        for KvRamEvent { request, outcome } in self.compute.kv_ram_advance() {
+            if let Some(out) = self.kv_ram_out.filter(|m| m.request == request) {
+                self.kv_ram_out = None;
+                self.host.end_landing(request);
+                let Some(idx) = self.requests.iter().position(|r| r.id == request) else {
+                    continue;
+                };
+                self.requests[idx].moving = false;
+                match outcome {
+                    KvRamOutcome::Landed { micros } => {
+                        self.capture_moved_out(idx, out.resume_phase, out.lane, out.restore_pages, out.bytes, micros, events)
+                    }
+                    // The victim is where it was, on the device, and decodes
+                    // while nothing moves; the request that wanted the room
+                    // asks again after that.
+                    KvRamOutcome::Failed => self.moves_out_paused_until = Some(self.now() + KV_RAM_MOVE_BACKOFF),
+                }
+            } else if let Some(ram_in) = self.kv_ram_in.filter(|m| m.request == request) {
+                self.kv_ram_in = None;
+                self.host.end_restore(request);
+                let Some(idx) = self.requests.iter().position(|r| r.id == request) else {
+                    continue;
+                };
+                self.requests[idx].moving = false;
+                match outcome {
+                    KvRamOutcome::Landed { micros } => self.resume_moved_in(idx, ram_in.lane, micros, events),
+                    KvRamOutcome::Failed => {
+                        if let Some(lane) = ram_in.lane {
+                            self.free_lanes.push(lane);
+                        }
+                        self.unmaterialize(idx);
+                        self.lose_kv_ram_snapshot(idx, events);
+                    }
+                }
+            }
+            // Anything else is a move this scheduler already abandoned.
+        }
+    }
+
+    /// The scheduler's half of a windowed KV-RAM move `idx` is in, when the
+    /// request goes (GitHub #309): abandoned at the backend once its copy in
+    /// flight has landed, the ledgers as they were before the move. The
+    /// caller releases the request's charges, its sequence and its snapshot
+    /// as for any other.
+    fn abandon_kv_ram_move(&mut self, idx: usize) {
+        let request = self.requests[idx].id;
+        if self.kv_ram_out.is_some_and(|m| m.request == request) {
+            self.compute.kv_ram_abandon(request);
+            self.host.end_landing(request);
+            self.kv_ram_out = None;
+            self.requests[idx].moving = false;
+        }
+        if let Some(ram_in) = self.kv_ram_in.filter(|m| m.request == request) {
+            self.compute.kv_ram_abandon(request);
+            self.host.end_restore(request);
+            if let Some(lane) = ram_in.lane {
+                self.free_lanes.push(lane);
+            }
+            self.kv_ram_in = None;
+            self.requests[idx].moving = false;
         }
     }
 }
@@ -3304,7 +3496,7 @@ impl ConcreteScheduler {
     /// in flight it waits. A file that cannot be read loses its request's
     /// state.
     fn restore_from_disk(&mut self, request: RequestId, above: EntryRoom, events: &mut Vec<SchedEvent>) {
-        if self.restoring.is_some() {
+        if self.moving_in() {
             return;
         }
         let Some(victim) = self.disk.as_ref().and_then(|disk| disk.held().entry(request).cloned()) else {
@@ -3343,7 +3535,7 @@ impl ConcreteScheduler {
     /// Bring claimant `idx`'s disk checkpoint back into its own sequence,
     /// charged now (the gate in `advance` made the room).
     fn restore_checkpoint_from_disk(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
-        if self.restoring.is_some() {
+        if self.moving_in() {
             return;
         }
         let (request, publisher, checkpoint) = {
@@ -3933,8 +4125,9 @@ impl Scheduler for ConcreteScheduler {
 
         // Spec vram-budget/03: KV-disk moves a window per transfer per
         // advance, and settles what ended -- before anything below decides
-        // what fits.
+        // what fits. So do the windowed moves through KV-RAM (GitHub #309).
         self.disk_pass(&mut events);
+        self.kv_ram_pass(&mut events);
 
         // Phase 1 — chunked, interleaved prefill (P3-01, ADR 0018): at
         // most one `prefill_step` call this tick. Exactly one request may

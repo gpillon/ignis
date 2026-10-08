@@ -17,8 +17,12 @@
 //!   transfer's until the commit, which frees it.
 //! - **A restore** allocates its sequence at once (the scheduler charged it),
 //!   reads and checks the header page, then reads each window into a slot,
-//!   checks its CRC and feeds it to the leaf's windowed restore. A refused
-//!   header or window ends it before that window's bytes reach the device.
+//!   checks its CRC and feeds it to the leaf's windowed restore -- in window
+//!   order, whichever read lands first, and in slices of the move-in pace
+//!   ([`TransferPace::move_in_bytes`](crate::TransferPace::move_in_bytes),
+//!   GitHub #309), one in flight, so a decode round shares the link with at
+//!   most one slice. A refused header or window ends it before that window's
+//!   bytes reach the device.
 //!
 //! A transfer that ends any other way than committing is **drained** before
 //! anything it touches is let go: its copies' fences and its IO requests'
@@ -68,8 +72,12 @@ enum Op {
     Writing { index: usize, slot: Option<usize>, ticket: Ticket },
     /// A restore window being read into `slot`.
     Reading { index: usize, slot: usize, ticket: Ticket },
-    /// A restore window copied from `slot` to the device, until `fence`.
-    Feeding { slot: usize, fence: u64 },
+    /// A restore window read and checked in `slot`, its first `fed` bytes on
+    /// their way to the device.
+    Read { index: usize, slot: usize, fed: u64 },
+    /// A slice of a restore window, its bytes up to `upto`, copied from
+    /// `slot` to the device, until `fence`.
+    Feeding { index: usize, slot: usize, upto: u64, fence: u64 },
 }
 
 enum Kind<L: StepLeaf> {
@@ -175,6 +183,16 @@ fn leaf_err(code: i32) -> ComputeError {
 }
 
 impl<L: StepLeaf> RuntimeCompute<L> {
+    /// The staging windows KV-disk transfers hold right now (the CPU-stub
+    /// observation point for their lifetime).
+    pub fn disk_staging_busy(&self) -> usize {
+        self.disk
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |tier| tier.slots.iter().filter(|slot| slot.busy).count())
+    }
+
     pub(crate) fn tier_fits(&self, bytes: u64) -> bool {
         let tier = self.disk.lock().unwrap();
         let Some(tier) = tier.as_ref() else {
@@ -409,12 +427,14 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     fn abandon(&self, tier: &mut DiskTier<L>, mut transfer: Transfer<L>, delete_file: bool) {
         transfer.delete_file = delete_file;
         if let Kind::Restore { sequence, .. } = &mut transfer.kind {
-            for op in transfer.ops.iter() {
-                if let Op::Feeding { fence, .. } = op {
-                    let _ = self.model.leaf.transfer_wait(self.model.handle(), *fence);
+            // A fed slice's slot is let go with the rest, once the copy that
+            // reads it has landed.
+            for op in transfer.ops.iter_mut() {
+                if let Op::Feeding { index, slot, upto, fence } = *op {
+                    let _ = self.model.leaf.transfer_wait(self.model.handle(), fence);
+                    *op = Op::Read { index, slot, fed: upto };
                 }
             }
-            transfer.ops.retain(|op| !matches!(op, Op::Feeding { .. }));
             if let Some(sequence) = sequence.take() {
                 self.release_sequence(sequence);
             }
@@ -440,12 +460,14 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                             .transfer_passed(self.model.handle(), *fence)
                             .unwrap_or(true),
                         Op::Writing { ticket, .. } | Op::Reading { ticket, .. } => ticket.poll().is_some(),
+                        Op::Read { .. } => true,
                     };
                     if finished {
                         let slot = match op {
-                            Op::Copying { slot, .. } | Op::Reading { slot, .. } | Op::Feeding { slot, .. } => {
-                                Some(*slot)
-                            }
+                            Op::Copying { slot, .. }
+                            | Op::Reading { slot, .. }
+                            | Op::Read { slot, .. }
+                            | Op::Feeding { slot, .. } => Some(*slot),
                             Op::Writing { slot, .. } => *slot,
                         };
                         if let Some(slot) = slot {
@@ -769,8 +791,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             }
         }
 
-        // What has landed: reads into checked windows fed to the device,
-        // copies into freed slots.
+        // What has landed: reads into checked windows, slices of them onto
+        // the device.
         let mut keep = VecDeque::new();
         let ops = std::mem::take(&mut tier.transfers[i].ops);
         let mut outcome = None;
@@ -787,9 +809,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                         outcome = Some(self.refuse(kv_disk::Refusal::Io(error)));
                     }
                     Some(Ok(crc)) => {
-                        let window = tier.transfers[i].window(index, window_bytes);
-                        let (expected_crc, sequence) = match &mut tier.transfers[i].kind {
-                            Kind::Restore { expected, sequence, .. } => (expected.crcs[index], sequence),
+                        let expected_crc = match &tier.transfers[i].kind {
+                            Kind::Restore { expected, .. } => expected.crcs[index],
                             Kind::Spill { .. } => unreachable!("a restore"),
                         };
                         if crc != expected_crc {
@@ -797,31 +818,18 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                             outcome = Some(self.refuse(kv_disk::Refusal::CorruptWindow(index)));
                             continue;
                         }
-                        let src = &tier.slots[slot].buffer.as_mut().as_mut()[..window.bytes as usize];
-                        let sequence = sequence.as_mut().expect("a restore holds its sequence until it ends");
-                        let fed = self
-                            .model
-                            .leaf
-                            .restore_window(self.model.handle(), sequence, window, src)
-                            .and_then(|()| self.model.leaf.transfer_fence(self.model.handle()));
-                        match fed {
-                            Ok(fence) => keep.push_back(Op::Feeding { slot, fence }),
-                            Err(code) => {
-                                tier.slots[slot].busy = false;
-                                tracing::warn!(name: "ignis.kv_disk.restore_refused", code, "the leaf refused a KV-disk window");
-                                outcome = Some(DiskOutcome::Failed { op: DiskOp::Read });
-                            }
-                        }
+                        keep.push_back(Op::Read { index, slot, fed: 0 });
                     }
                 },
-                Op::Feeding { slot, fence } => match self.model.leaf.transfer_passed(self.model.handle(), fence) {
-                    Ok(false) => keep.push_back(Op::Feeding { slot, fence }),
-                    Ok(true) => {
+                Op::Feeding { index, slot, upto, fence } => match self.model.leaf.transfer_passed(self.model.handle(), fence) {
+                    Ok(false) => keep.push_back(Op::Feeding { index, slot, upto, fence }),
+                    Ok(true) if upto == tier.transfers[i].window(index, window_bytes).bytes => {
                         tier.slots[slot].busy = false;
                         tier.transfers[i].landed += 1;
                     }
+                    Ok(true) => keep.push_back(Op::Read { index, slot, fed: upto }),
                     Err(_) => {
-                        keep.push_back(Op::Feeding { slot, fence });
+                        keep.push_back(Op::Feeding { index, slot, upto, fence });
                         outcome = Some(DiskOutcome::Failed { op: DiskOp::Read });
                     }
                 },
@@ -836,7 +844,47 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         if transfer.landed == transfer.windows {
             return Some(self.land_restore(tier, i));
         }
+
+        // One slice onto the device, while none is in flight: of the next
+        // window in order, once it has been read and checked.
+        let next = transfer.landed;
+        let feeding = transfer.ops.iter().any(|op| matches!(op, Op::Feeding { .. }));
+        let ready = transfer.ops.iter().position(|op| matches!(op, Op::Read { index, .. } if *index == next));
+        if let (false, Some(at)) = (feeding, ready) {
+            let Op::Read { index, slot, fed } = tier.transfers[i].ops[at] else {
+                unreachable!("found as a read window");
+            };
+            let window = tier.transfers[i].window(index, window_bytes);
+            let slice = TransferWindow {
+                offset: window.offset + fed,
+                bytes: self.pace.move_in_bytes.min(window.bytes - fed),
+                blob_bytes: window.blob_bytes,
+            };
+            let src = &tier.slots[slot].buffer.as_mut().as_mut()[fed as usize..(fed + slice.bytes) as usize];
+            let Kind::Restore { sequence, .. } = &mut tier.transfers[i].kind else {
+                unreachable!("a restore");
+            };
+            let sequence = sequence.as_mut().expect("a restore holds its sequence until it ends");
+            let issued = self.model.leaf.restore_window(self.model.handle(), sequence, slice, src);
+            // A fence even after a refusal: some of the slice's copies may
+            // have gone out, and the slot and the sequence are let go only
+            // once they have landed.
+            let fence = self.model.leaf.transfer_fence(self.model.handle());
+            let upto = fed + slice.bytes;
+            match (issued, fence) {
+                (Ok(()), Ok(fence)) => tier.transfers[i].ops[at] = Op::Feeding { index, slot, upto, fence },
+                (issued, fence) => {
+                    if let Ok(fence) = fence {
+                        tier.transfers[i].ops[at] = Op::Feeding { index, slot, upto, fence };
+                    }
+                    let code = issued.err().or(fence.err()).unwrap_or(-1);
+                    tracing::warn!(name: "ignis.kv_disk.restore_refused", code, "the leaf refused a KV-disk window");
+                    return Some(DiskOutcome::Failed { op: DiskOp::Read });
+                }
+            }
+        }
         // One new window: read into a free slot.
+        let transfer = &tier.transfers[i];
         if transfer.issued < transfer.windows {
             let index = transfer.issued;
             let window = transfer.window(index, window_bytes);

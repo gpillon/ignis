@@ -17,6 +17,7 @@ use ignis_core::{
 
 mod disk_transfer;
 pub mod kv_disk;
+mod kv_ram_transfer;
 
 pub use disk_transfer::StagingWindow;
 
@@ -357,6 +358,54 @@ pub struct TransferWindow {
     pub blob_bytes: u64,
 }
 
+/// The window a live move onto the device keeps on the link (spec
+/// vram-budget/03 AC 37, GitHub #309): a restore from KV-RAM, and the feed of
+/// a restore from KV-disk. One such window is in flight at a time, and a new
+/// one goes out at most once an advance, so this is the host-to-device
+/// traffic a move adds to a decode round -- the expert stream's own
+/// direction, whose copies a decode round waits on.
+pub const MOVE_IN_WINDOW_BYTES: u64 = 16 << 20;
+
+/// The window a live move off the device into KV-RAM keeps on the link
+/// (GitHub #309), one in flight at a time, at most one new one an advance.
+/// It runs against the expert stream's direction.
+pub const MOVE_OUT_WINDOW_BYTES: u64 = 64 << 20;
+
+/// How much a live move puts on the link per advance, each way (GitHub
+/// #309): [`MOVE_IN_WINDOW_BYTES`] and [`MOVE_OUT_WINDOW_BYTES`] unless a load
+/// names others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferPace {
+    /// Host to device: a restore from KV-RAM, and a KV-disk restore's feed.
+    pub move_in_bytes: u64,
+    /// Device to host: a move into KV-RAM.
+    pub move_out_bytes: u64,
+}
+
+impl TransferPace {
+    /// The smallest window a pace may name: one sector, so a KV-disk window
+    /// is fed in slices the leaf's own blob layout never splits badly (the
+    /// Flash-Next context block is 256 bytes).
+    pub const MIN_WINDOW_BYTES: u64 = 4096;
+
+    /// `self` with each window at least [`Self::MIN_WINDOW_BYTES`].
+    pub fn clamped(self) -> Self {
+        Self {
+            move_in_bytes: self.move_in_bytes.max(Self::MIN_WINDOW_BYTES),
+            move_out_bytes: self.move_out_bytes.max(Self::MIN_WINDOW_BYTES),
+        }
+    }
+}
+
+impl Default for TransferPace {
+    fn default() -> Self {
+        Self {
+            move_in_bytes: MOVE_IN_WINDOW_BYTES,
+            move_out_bytes: MOVE_OUT_WINDOW_BYTES,
+        }
+    }
+}
+
 /// The replaceable step-ABI leaf seam.
 ///
 /// The FFI implementation will map these calls to ADR 0009. Its opaque
@@ -661,6 +710,14 @@ pub trait StepLeaf: Send + Sync + 'static {
     // leaf with no such stream: it refuses a window, and its fences pass at
     // once.
 
+    /// Whether this leaf has the transfer stream this section describes. A
+    /// leaf that does moves live sequences through KV-RAM a window at a time
+    /// too (GitHub #309); one that does not moves them in one call
+    /// ([`StepLeaf::snapshot_into`], [`StepLeaf::restore_sequence`]).
+    fn windowed_transfer(&self) -> bool {
+        false
+    }
+
     /// Issue `window` of [`StepLeaf::snapshot_into`]'s blob of `sequence`
     /// into `dst` (`window.bytes` long) on the transfer stream. Nothing waits
     /// for it: `dst` is the caller's to keep, and `sequence` unstepped, until
@@ -914,6 +971,10 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// KV-disk (spec vram-budget/03): the store, its staging and its
     /// transfers, or `None` on a load without the tier.
     disk: Mutex<Option<disk_transfer::DiskTier<L>>>,
+    /// Live moves through KV-RAM a window at a time (GitHub #309).
+    kv_ram: Mutex<kv_ram_transfer::KvRamMoves<L>>,
+    /// The windows a live move keeps on the link, each way (GitHub #309).
+    pace: TransferPace,
     /// The probability of the token a **constrained decode** request has drawn and not
     /// yet emitted (GitHub #242), per request.
     ///
@@ -944,8 +1005,23 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             spilled_prefixes: Mutex::new(HashMap::new()),
             media: Mutex::new(MediaCache::new()),
             disk: Mutex::new(None),
+            kv_ram: Mutex::new(kv_ram_transfer::KvRamMoves::new()),
+            pace: TransferPace::default(),
             drawn: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// This adapter with live moves paced at `pace` (GitHub #309) instead of
+    /// [`TransferPace::default`], each window at least
+    /// [`TransferPace::MIN_WINDOW_BYTES`].
+    pub fn with_transfer_pace(mut self, pace: TransferPace) -> Self {
+        self.pace = pace.clamped();
+        self
+    }
+
+    /// The pace live moves run at.
+    pub fn transfer_pace(&self) -> TransferPace {
+        self.pace
     }
 
     /// This adapter with the KV-disk tier (spec vram-budget/03): `store`
@@ -1874,6 +1950,31 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         self.evicted.lock().unwrap().remove(&request);
     }
 
+    // GitHub #309: a leaf with a transfer stream moves live sequences
+    // through KV-RAM a window at a time; one without moves them in one call.
+
+    fn kv_ram_move_out(&self, request: RequestId) -> Result<(u64, ignis_core::KvRamMove), ComputeError> {
+        if !self.model.leaf.windowed_transfer() {
+            return self.evict(request).map(|bytes| (bytes, ignis_core::KvRamMove::Done));
+        }
+        self.ram_move_out(request).map(|bytes| (bytes, ignis_core::KvRamMove::Started))
+    }
+
+    fn kv_ram_move_in(&self, request: RequestId, context_tokens: u32) -> Result<ignis_core::KvRamMove, ComputeError> {
+        if !self.model.leaf.windowed_transfer() {
+            return self.restore(request, context_tokens).map(|()| ignis_core::KvRamMove::Done);
+        }
+        self.ram_move_in(request, context_tokens).map(|()| ignis_core::KvRamMove::Started)
+    }
+
+    fn kv_ram_advance(&self) -> Vec<ignis_core::KvRamEvent> {
+        self.ram_advance()
+    }
+
+    fn kv_ram_abandon(&self, request: RequestId) {
+        self.ram_abandon(request);
+    }
+
     fn disk_fits(&self, bytes: u64) -> bool {
         self.tier_fits(bytes)
     }
@@ -1907,8 +2008,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 impl<L: StepLeaf> Drop for RuntimeCompute<L> {
     fn drop(&mut self) {
         // The disk tier first: its transfers hold sequences, spans and
-        // staging, and its threads and directory go with it.
+        // staging, and its threads and directory go with it. Then the moves
+        // through KV-RAM, which hold sequences and spans too (GitHub #309).
         self.tier_shutdown();
+        self.ram_shutdown();
         let media = std::mem::take(
             &mut self
                 .media

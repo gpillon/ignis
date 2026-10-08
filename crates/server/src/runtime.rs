@@ -98,6 +98,10 @@ pub struct EngineShape {
     /// takes the family's ([`EngineShape::kv_disk_bytes_for`]). Where its
     /// files go is not a shape's: the loader is handed it.
     pub kv_disk_bytes: Option<u64>,
+    /// The windows a live move keeps on the link, each way (GitHub #309).
+    /// No flag names it: the named constants are the policy, and a
+    /// measurement harness sets another.
+    pub transfer_pace: ignis_runtime::TransferPace,
 }
 
 impl Default for EngineShape {
@@ -131,6 +135,7 @@ impl Default for EngineShape {
             rope_scaling: ignis_core::RopeScaling::NONE,
             ngram_hot_bytes: ignis_core::ngram_table::HotBudget::default(),
             kv_disk_bytes: None,
+            transfer_pace: ignis_runtime::TransferPace::default(),
         }
     }
 }
@@ -163,6 +168,7 @@ impl From<&crate::config::Config> for EngineShape {
             rope_scaling: config.rope_scaling,
             ngram_hot_bytes: config.ngram_hot_bytes.unwrap_or_default(),
             kv_disk_bytes: config.kv_disk_bytes,
+            transfer_pace: ignis_runtime::TransferPace::default(),
         }
     }
 }
@@ -242,6 +248,9 @@ struct KvDiskLoad<'a> {
     /// What the tier's IO threads wait on: Flash-Next's prefill gathers.
     gate: ignis_core::ngram_table::GatherGate,
     restore_floor_tokens: u32,
+    /// The pace of every live move, through KV-RAM and the disk alike
+    /// (GitHub #309).
+    pace: ignis_runtime::TransferPace,
 }
 
 /// [`scheduler`], with KV-disk when `disk` names a budget and its volume has
@@ -260,7 +269,7 @@ fn scheduler_with_kv_disk<L: StepLeaf>(
 ) -> Result<(ConcreteScheduler, Option<u64>), String> {
     use ignis_runtime::kv_disk::{self, DiskIdentity, DiskStore};
 
-    let compute = RuntimeCompute::new(model, eos);
+    let compute = RuntimeCompute::new(model, eos).with_transfer_pace(disk.pace);
     let store = if disk.bytes == 0 {
         None
     } else {
@@ -684,6 +693,7 @@ pub fn cuda_scheduler_with_thinking_close(
         rope_scaling: shape.rope_scaling,
         gate: Default::default(),
         restore_floor_tokens: ignis_runtime::kv_disk::restore_floor_tokens(family),
+        pace: shape.transfer_pace,
     };
     let (sched, kv_disk_bytes) = scheduler_with_kv_disk(
         SchedulerConfig {
@@ -992,6 +1002,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
         rope_scaling: shape.rope_scaling,
         gate,
         restore_floor_tokens: ignis_runtime::kv_disk::restore_floor_tokens(ignis_core::compute::ModelFamily::FlashNext),
+        pace: shape.transfer_pace,
     };
     let (sched, kv_disk_bytes) = scheduler_with_kv_disk(
         SchedulerConfig {
@@ -1318,6 +1329,7 @@ mod tests {
             rope_scaling: ignis_core::RopeScaling::NONE,
             ngram_hot_bytes: ignis_core::ngram_table::HotBudget::Auto,
             kv_disk_bytes: None,
+            transfer_pace: ignis_runtime::TransferPace::default(),
         };
 
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
