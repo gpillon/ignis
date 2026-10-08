@@ -24,6 +24,7 @@
 #include "ignis_seq_internal.h"
 #include "ignis_seq_prefix_internal.h"
 #include "ignis_seq_sections.h"
+#include "seq_window_test_common.h"
 
 #include <cuda_runtime.h>
 
@@ -225,13 +226,13 @@ int main() {
   uint64_t bytes = 0;
   check(ignis_seq_snapshot_size(pool, a, &bytes) == 0, std::string("snapshot size: ") + ignis_seq_last_error());
   std::vector<unsigned char> blob(bytes);
-  check(ignis_seq_snapshot(pool, a, blob.data(), blob.size()) == 0, std::string("snapshot: ") + ignis_seq_last_error());
+  check(ignis_seq_snapshot(pool, a, blob.data(), blob.size(), nullptr) == 0, std::string("snapshot: ") + ignis_seq_last_error());
   ignis_seq_snapshot_header header{};
   std::memcpy(&header, blob.data(), sizeof(header));
   check(header.format_version == kIgnisSeqSnapshotFormatVersionFlashNext, "the blob names Flash-Next's layout");
   ignis_seq *e = nullptr;
   check(ignis_seq_alloc(pool, 256, &e) == 0, std::string("alloc E: ") + ignis_seq_last_error());
-  check(ignis_seq_restore(pool, e, blob.data(), blob.size()) == 0, std::string("restore: ") + ignis_seq_last_error());
+  check(ignis_seq_restore(pool, e, blob.data(), blob.size(), nullptr) == 0, std::string("restore: ") + ignis_seq_last_error());
   {
     const SlotState got = state_of(*pool, e->slot);
     check(got.tails == at_opener.tails && got.conv == at_opener.conv, "the restored tails and conv state are A's");
@@ -245,11 +246,11 @@ int main() {
   check(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &ckpt_bytes) == 0,
         std::string("checkpoint blob size: ") + ignis_seq_last_error());
   std::vector<unsigned char> ckpt_blob(ckpt_bytes);
-  check(ignis_seq_checkpoint_snapshot(pool, checkpoint, ckpt_blob.data(), ckpt_blob.size()) == 0,
+  check(ignis_seq_checkpoint_snapshot(pool, checkpoint, ckpt_blob.data(), ckpt_blob.size(), nullptr) == 0,
         std::string("checkpoint blob: ") + ignis_seq_last_error());
   ignis_seq *f = nullptr;
   check(ignis_seq_alloc(pool, 256, &f) == 0, std::string("alloc F: ") + ignis_seq_last_error());
-  check(ignis_seq_restore(pool, f, ckpt_blob.data(), ckpt_blob.size()) == 0,
+  check(ignis_seq_restore(pool, f, ckpt_blob.data(), ckpt_blob.size(), nullptr) == 0,
         std::string("restore the checkpoint blob: ") + ignis_seq_last_error());
   {
     const SlotState got = state_of(*pool, f->slot);
@@ -257,6 +258,52 @@ int main() {
     check(keys_of(*pool, pages_of(*f, 2)) == a_keys, "and both pages' block keys");
   }
   ignis_seq_release(pool, f);
+
+  // --- spec vram-budget/03: the same blobs a window at a time ----------------
+  // A standing on the prefix, the prefix itself (its image in the device
+  // retained slot) and the checkpoint (in the host one): windows laid end to
+  // end are the whole calls' bytes, and a restore fed window by window gives
+  // the sequence the whole restore gave.
+  uint64_t prefix_bytes = 0;
+  check(ignis_seq_prefix_snapshot_size(pool, prefix, &prefix_bytes) == 0,
+        std::string("prefix blob size: ") + ignis_seq_last_error());
+  std::vector<unsigned char> prefix_blob(prefix_bytes);
+  check(ignis_seq_prefix_snapshot(pool, prefix, prefix_blob.data(), prefix_blob.size(), nullptr) == 0,
+        std::string("prefix blob: ") + ignis_seq_last_error());
+  for (const uint64_t window : seq_window_sizes()) {
+    const std::string at = " (window " + std::to_string(window) + ")";
+    check(seq_take_windows(pool, blob.size(), window,
+                           [&](unsigned char *dst, uint64_t n, const ignis_seq_transfer &t) {
+                             return ignis_seq_snapshot(pool, a, dst, n, &t);
+                           }) == blob,
+          "a sequence on a prefix, window by window" + at);
+    check(seq_take_windows(pool, prefix_blob.size(), window,
+                           [&](unsigned char *dst, uint64_t n, const ignis_seq_transfer &t) {
+                             return ignis_seq_prefix_snapshot(pool, prefix, dst, n, &t);
+                           }) == prefix_blob,
+          "a prefix blob, window by window" + at);
+    check(seq_take_windows(pool, ckpt_blob.size(), window,
+                           [&](unsigned char *dst, uint64_t n, const ignis_seq_transfer &t) {
+                             return ignis_seq_checkpoint_snapshot(pool, checkpoint, dst, n, &t);
+                           }) == ckpt_blob,
+          "a checkpoint blob from a host retained slot, window by window" + at);
+    ignis_seq *w = nullptr;
+    check(ignis_seq_alloc(pool, 256, &w) == 0, std::string("alloc W: ") + ignis_seq_last_error());
+    check(seq_restore_windows(pool, w, blob, window) == 0,
+          std::string("a restore fed window by window") + at + ": " + ignis_seq_last_error());
+    {
+      const SlotState got = state_of(*pool, w->slot);
+      check(got.tails == at_opener.tails && got.conv == at_opener.conv, "the windowed restore's tails and conv" + at);
+      check(keys_of(*pool, pages_of(*w, 2)) == a_keys, "the windowed restore's block keys" + at);
+      check(w->position == 100 && w->restoring == nullptr, "the windowed restore stands at 100, complete" + at);
+      uint64_t again_bytes = 0;
+      check(ignis_seq_snapshot_size(pool, w, &again_bytes) == 0 && again_bytes == blob.size(), "same size" + at);
+      std::vector<unsigned char> again(again_bytes);
+      check(ignis_seq_snapshot(pool, w, again.data(), again.size(), nullptr) == 0 && again == blob,
+            "the windowed restore snapshots to the source's bytes" + at);
+    }
+    ignis_seq_release(pool, w);
+  }
 
   ignis_seq_checkpoint_release(pool, checkpoint);
 

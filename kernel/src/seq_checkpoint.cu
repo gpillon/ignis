@@ -128,7 +128,8 @@ ignis_seq_checkpoint_snapshot_size(const struct ignis_seq_pool *pool,
 
 extern "C" int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *pool,
                                                    const struct ignis_seq_checkpoint *checkpoint,
-                                                   void *dst, uint64_t dst_bytes) {
+                                                   void *dst, uint64_t dst_bytes,
+                                                   const struct ignis_seq_transfer *window) {
   if (pool == nullptr || checkpoint == nullptr || dst == nullptr) {
     ignis_seq_set_last_error("ignis_seq_checkpoint_snapshot: null argument");
     return -1;
@@ -142,6 +143,14 @@ extern "C" int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *po
     // The prefix chain's whole pages, then the opener's partial page from the
     // checkpoint's own copy -- the layout a sequence standing at the opener
     // would have packed. A checkpoint on a page boundary has no partial page.
+    if (window != nullptr) {
+      ignis_seq_write_materialized_window(*pool, checkpoint->prefix, tail_page_of(*checkpoint),
+                                          static_cast<std::uint32_t>(checkpoint->retained_slot),
+                                          checkpoint->progress,
+                                          ninfer::pages_for_tokens(checkpoint->tokens), dst, dst_bytes,
+                                          *window);
+      return 0;
+    }
     ignis_seq_write_materialized_blob(*pool, checkpoint->prefix, tail_page_of(*checkpoint),
                                       static_cast<std::uint32_t>(checkpoint->retained_slot),
                                       checkpoint->progress,
@@ -170,6 +179,10 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
     return -1;
   }
   if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    ignis_seq_set_last_error(std::string("ignis_seq_checkpoint_capture: ") + refusal);
+    return -1;
+  }
+  if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
     ignis_seq_set_last_error(std::string("ignis_seq_checkpoint_capture: ") + refusal);
     return -1;
   }

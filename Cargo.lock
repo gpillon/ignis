@@ -1080,6 +1080,7 @@ dependencies = [
 name = "ignis-runtime"
 version = "0.5.0"
 dependencies = [
+ "crc32fast",
  "ignis-artifact",
  "ignis-core",
  "ignis-logging",

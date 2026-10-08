@@ -368,6 +368,53 @@ int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq_stats *out
  * lane's n-gram rows for it, hashed on the host before the round). */
 int32_t ignis_seq_pending_token(const struct ignis_seq *seq);
 
+/* --- the windowed transfer (spec vram-budget/03, ADR 0045) ----------------
+ *
+ * ADR 0024's "partial extent": a blob moved a window at a time, so that the
+ * disk tier (KV-disk) can carry it through a two-window pinned staging and
+ * the model never waits on a copy. ignis_seq_snapshot, ignis_seq_restore,
+ * ignis_seq_checkpoint_snapshot and ignis_seq_prefix_snapshot take one of
+ * these; a NULL pointer is the whole-blob call they always were.
+ *
+ * The bytes are the blob's: windows laid end to end are the whole call's
+ * blob, byte for byte, whatever their size. A window's copies are *issued*
+ * on `stream` and the call returns: the caller fences the stream
+ * (ignis_seq_pool_fence) before it reads a snapshot window or reuses a
+ * restore window's source. */
+struct ignis_seq_transfer {
+  /* The window: `bytes` bytes of the blob from `offset`. offset + bytes must
+   * not pass the blob's size. */
+  uint64_t offset;
+  uint64_t bytes;
+  /* The whole blob's size. A restore refuses a blob whose own header says
+   * otherwise (the whole call checks `src_bytes` the same way); a snapshot
+   * refuses one whose size has changed since the caller asked. */
+  uint64_t blob_bytes;
+  /* The cudaStream_t the copies go on -- the pool's own
+   * (ignis_seq_pool_transfer_stream) for a transfer the model must not wait
+   * on. NULL is the default stream. */
+  void *stream;
+};
+
+/* The pool's transfer stream, as `ignis_seq_transfer::stream` takes it:
+ * created with the pool and non-blocking, so neither the default stream nor
+ * the model's waits on a window in flight. NULL for a null pool. */
+void *ignis_seq_pool_transfer_stream(const struct ignis_seq_pool *pool);
+
+/* A fence after everything issued on `stream` so far: 0 and its id in
+ * `*out_fence`, -1 on a null argument or a failed event record. */
+int32_t ignis_seq_pool_fence(struct ignis_seq_pool *pool, void *stream, uint64_t *out_fence);
+
+/* Whether `fence` has passed: 1 once every copy before it landed (the fence
+ * is then retired and its id means nothing more), 0 while one has not, -1
+ * for an unknown fence or a failed copy (see ignis_seq_last_error). Never
+ * blocks. */
+int32_t ignis_seq_pool_fence_query(struct ignis_seq_pool *pool, uint64_t fence);
+
+/* Block until `fence` has passed and retire it: 0, or -1 as above. For a
+ * caller that must not let go of memory a copy still touches. */
+int32_t ignis_seq_pool_fence_wait(struct ignis_seq_pool *pool, uint64_t fence);
+
 /* --- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
  *
  * On ADR 0016: it rules that "later phases add fields, not parameters and
@@ -431,8 +478,13 @@ int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool, const struct 
  * A sequence that claims a shared prefix is materialized into one standalone
  * blob: its leading shared pages are copied alongside its own written pages
  * (GitHub #190). */
+/* With a `window` (spec vram-budget/03): `dst` receives that window of the
+ * blob, `dst_bytes` at least its length, the copies issued on its stream and
+ * not synchronized. The sequence must not move until the caller has fenced
+ * the last window; a sequence that has, or whose size differs from
+ * `window->blob_bytes`, is refused. */
 int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
-                            void *dst, uint64_t dst_bytes);
+                            void *dst, uint64_t dst_bytes, const struct ignis_seq_transfer *window);
 
 /* Restore a sequence from a blob ignis_seq_snapshot wrote.
  *
@@ -449,8 +501,20 @@ int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool, const struct ignis
  * a null argument, a sequence that is not `pool`'s, or a failed device copy;
  * IGNIS_SEQ_ERR_SHARED_PREFIX for a target that claims a shared prefix, whose
  * leading pages are not its own to overwrite (P4-10, GitHub #126). */
+/* With a `window` (spec vram-budget/03): `src` holds that window of the blob
+ * and `src_bytes` is its length. Windows come in order, the first at offset
+ * 0, each starting where the last ended. The header and the section records
+ * are checked, as above and against `window->blob_bytes`, before any byte
+ * reaches the device; a refusal leaves `seq` as it was and ends the restore.
+ * Each window's copies are issued on its stream and not synchronized, and
+ * its source must stay put until the caller has fenced them. The progress
+ * scalars are applied with the last window.
+ *
+ * Until that last window, the restore is **incomplete**: every step, a
+ * snapshot, a publish and a capture refuse the sequence, and
+ * ignis_seq_release frees it (fence its copies first). */
 int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_seq *seq, const void *src,
-                           uint64_t src_bytes);
+                           uint64_t src_bytes, const struct ignis_seq_transfer *window);
 
 /* --- device prefix reuse (P4-10, GitHub #126, ADR 0024) ------------------
  *
@@ -572,13 +636,14 @@ int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
  * The prefix is read and stays claimable. Restoring the blob into a fresh
  * sequence and publishing there gives the prefix back to the device.
  * Returns 0; -1 on a null argument, a prefix that is not `pool`'s, a short
- * `dst_bytes`, or a failed device copy (see ignis_seq_last_error). */
+ * `dst_bytes`, or a failed device copy (see ignis_seq_last_error). A
+ * `window` takes that window of the blob, as ignis_seq_snapshot does. */
 int32_t ignis_seq_prefix_snapshot_size(const struct ignis_seq_pool *pool,
                                         const struct ignis_seq_prefix *prefix,
                                         uint64_t *out_bytes);
 int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
                                    const struct ignis_seq_prefix *prefix, void *dst,
-                                   uint64_t dst_bytes);
+                                   uint64_t dst_bytes, const struct ignis_seq_transfer *window);
 
 /* --- prompt checkpoints (GitHub #186, ADR 0029) ---------------------------
  *
@@ -702,13 +767,14 @@ int32_t ignis_seq_checkpoint_stats(const struct ignis_seq_checkpoint *checkpoint
 
 /* Materialize a retained checkpoint as the same opaque whole-sequence blob
  * ignis_seq_snapshot writes. Shared-prefix pages are copied into the blob;
- * the checkpoint is read-only and remains claimable after either call. */
+ * the checkpoint is read-only and remains claimable after either call. A
+ * `window` takes that window of the blob, as ignis_seq_snapshot does. */
 int32_t ignis_seq_checkpoint_snapshot_size(const struct ignis_seq_pool *pool,
                                             const struct ignis_seq_checkpoint *checkpoint,
                                             uint64_t *out_bytes);
 int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *pool,
                                        const struct ignis_seq_checkpoint *checkpoint, void *dst,
-                                       uint64_t dst_bytes);
+                                       uint64_t dst_bytes, const struct ignis_seq_transfer *window);
 
 /* --- retained slots (GitHub #211, ADR 0030) -------------------------------
  *

@@ -9,6 +9,10 @@ license.workspace = true
 ignis-core = { path = "../core" }
 ignis-artifact = { path = "../artifact" }
 tracing = { workspace = true }
+# KV-disk (spec vram-budget/03, ADR 0045): a CRC32 per window and per header,
+# which keeps pace with a 3 GB/s read where SHA-256 would not. Already in the
+# lock through `png`/`flate2`.
+crc32fast = "1.5"
 
 [dev-dependencies]
 # Only for `cuda_leaf.rs`'s `leaf_error` unit test (GitHub #80): asserts the

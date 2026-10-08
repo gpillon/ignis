@@ -252,6 +252,7 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
     const std::string at = " at index " + std::to_string(i);
     if (seq == nullptr || seq->pending_token < 0) return refuse("sequence is null or was not prefilled" + at);
     if (!ignis_seq_belongs_to(*pool, *seq)) return refuse("the sequence was not drawn from this pool" + at);
+    if (const char *why = ignis_seq_restore_refusal(*seq)) return refuse(why + at);
     // Every column writes its position, drafted or not, and the head's chain past them: the whole
     // window must fit.
     const uint64_t room = std::min<uint64_t>(ignis_seq_token_capacity(*seq), fn.max_context_tokens);

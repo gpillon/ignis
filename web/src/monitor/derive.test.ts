@@ -73,8 +73,55 @@ describe("deriveDashboard", () => {
     expect(ev.ram.retained).toMatchObject({ total: 2, window: 2 });
     expect(ev.ram.demoted).toBeNull();
 
-    // No disk tier exists, so every column is absent rather than zero.
+    // No disk tier on this load, so every column is absent rather than zero.
     expect(ev.disk).toEqual({ tier: "disk", implemented: false, live: null, retained: null, demoted: null });
+  });
+
+  // Spec vram-budget/03: with the KV-disk tier the disk row reads arrivals
+  // into it, and the rows above add what left them for it.
+  it("feeds the disk row, and the VRAM and RAM rows, on a load with the KV-disk tier", () => {
+    const snap = (over: { evictions: number; ramEvictions: number; spills: [number, number]; retained: [number, number, number]; failures?: number }): Partial<Snapshot> => {
+      const r = emptySnapshot().retained;
+      r.discards.disk.checkpoint = over.retained[0];
+      r.discards.disk.prefix = 1;
+      r.spills.disk.checkpoint = over.retained[1];
+      r.spills.disk.prefix = over.retained[2];
+      r.spills.kv_ram.checkpoint = 0;
+      return {
+        kvEvictions: over.evictions,
+        kvRamEvictions: over.ramEvictions,
+        retained: r,
+        kvDisk: { capacity: 1000, used: 250, spills: { device: over.spills[0], kv_ram: over.spills[1] }, failures: { write: 0, read: over.failures ?? 0 } },
+      };
+    };
+    const points = [
+      at(0, snap({ evictions: 10, ramEvictions: 1, spills: [1, 2], retained: [0, 0, 0] })),
+      at(60_000, snap({ evictions: 12, ramEvictions: 1, spills: [4, 7], retained: [3, 4, 2] })),
+    ];
+    const ev = deriveDashboard(points, 60_000)!.evictions;
+
+    expect(ev.disk.implemented).toBe(true);
+    expect(ev.disk.live).toMatchObject({ total: 11, window: 8 });
+    expect(ev.disk.retained).toMatchObject({ total: 4, window: 3 });
+    expect(ev.disk.demoted).toMatchObject({ total: 6, window: 6 });
+    // A live sequence that went device -> disk left VRAM as well.
+    expect(ev.vram.live).toMatchObject({ total: 16, window: 5 });
+    // RAM's demotion is the retained spills into the disk plus the live snapshots demoted to it.
+    expect(ev.ram.demoted).toMatchObject({ total: 6 + 7, window: 6 + 5 });
+  });
+
+  it("keeps the VRAM and RAM rows as they were on a load without the tier", () => {
+    const points = [at(0, { kvEvictions: 1 }), at(60_000, { kvEvictions: 3 })];
+    const ev = deriveDashboard(points, 60_000)!.evictions;
+    expect(ev.vram.live).toMatchObject({ total: 3, window: 2 });
+    expect(ev.ram.demoted).toBeNull();
+    expect(ev.disk.implemented).toBe(false);
+  });
+
+  it("meters the disk against its budget only when the tier exists", () => {
+    const kvDisk = { capacity: 1000, used: 250, spills: { device: 0, kv_ram: 0 }, failures: { write: 0, read: 0 } };
+    expect(deriveMemory([at(0, { kvDisk })], 0).diskInUse).toMatchObject({ used: 250, capacity: 1000, share: 0.25 });
+    expect(deriveMemory([at(0, {})], 0).diskInUse).toBeNull();
   });
 
   // A server too old to export the new series leaves the RAM row blank rather
@@ -256,6 +303,7 @@ describe("deriveMemory", () => {
     const matrix = (device: [number, number], kvRam: [number, number]) => ({
       device: { checkpoint: device[0], prefix: device[1] },
       kv_ram: { checkpoint: kvRam[0], prefix: kvRam[1] },
+      disk: { checkpoint: null, prefix: null },
     });
     const empty = emptySnapshot().retained;
     const before = { ...empty, spills: matrix([0, 0], [2, 1]) };
@@ -284,6 +332,7 @@ describe("assessHealth", () => {
     rejected: { full: 0, unknown_model: 0, oversized: 0 },
     evictions: 0,
     ramDrops: 0,
+    diskReadFailures: 0,
     ttftP95: null,
   };
 
@@ -311,6 +360,16 @@ describe("assessHealth", () => {
     expect(dropped.level).toBe("saturated");
     expect(dropped.summary).toBe("3 snapshots dropped from host RAM in the last 5 min");
     expect(dropped.notes).toContain("3 snapshots dropped from host RAM: re-prefilled from the start");
+  });
+
+  // Spec vram-budget/03: a file refused at restore costs the request its
+  // prefill, like a snapshot dropped from RAM.
+  it("weighs a disk read failure like a RAM drop", () => {
+    const failed = assessHealth({ ...quiet, running: 2, diskReadFailures: 2 });
+    expect(failed.level).toBe("saturated");
+    expect(failed.summary).toBe("2 KV-disk files refused at restore in the last 5 min");
+    expect(failed.notes).toContain("2 KV-disk files refused at restore: re-prefilled from the start");
+    expect(assessHealth({ ...quiet, running: 2, diskReadFailures: 0 }).level).toBe("healthy");
   });
 
   it("is saturated when requests are turned away as full, and says why in notes", () => {

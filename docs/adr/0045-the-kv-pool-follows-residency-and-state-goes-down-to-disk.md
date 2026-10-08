@@ -393,7 +393,8 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
 
 - **Generic.** Both models share one mechanism under the `Compute` seam.
 - **Defaults *(agent proposal)*.** On for Flash-Next at 16 GiB; it holds about
-  13 whole-context lanes or about 65 conversations of 30K tokens. Off for the
+  13 whole-context lanes or about 65 conversations of 30K tokens. Owner
+  2026-10-08: 4 GiB to start (about three whole-context lanes). Off for the
   27B, for four reasons:
   - its RAM is not taken by experts, and make gives it an 8 GiB KV-RAM arena;
   - its prefill runs ~8-9.6K tokens/s, so a crossing from disk pays only

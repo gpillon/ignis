@@ -88,30 +88,34 @@ pub type LineageId = u64;
 /// Where a request's reused state came from — the `reuse_source` field of the
 /// request log (spec §12).
 ///
-/// `Device` is Tier 0 (the checkpoint's pages and image never left the card)
-/// and `KvRam` is Tier 1, which #190 fills. A request that reused nothing
-/// reports no source at all, which is why "none" is the absence of this value
-/// rather than a variant of it.
+/// `Device` is Tier 0 (the checkpoint's pages and image never left the card),
+/// `KvRam` is Tier 1, which #190 fills, and `Disk` is Tier 2 (ADR 0045). A
+/// request that reused nothing reports no source at all, which is why "none"
+/// is the absence of this value rather than a variant of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReuseSource {
     /// Tier 0: the checkpoint was still resident on the device.
     Device,
     /// Tier 1: the checkpoint came back from KV-RAM (GitHub #190).
     KvRam,
+    /// Tier 2: the checkpoint came back from KV-disk (spec vram-budget/03).
+    Disk,
 }
 
 impl ReuseSource {
     /// Every tier ignis can name, cheapest first — the order
     /// [`ReuseSource::index`] numbers them in, so a per-tier table is an
     /// array rather than a branch at every site that reads it.
-    pub const ALL: [ReuseSource; 2] = [ReuseSource::Device, ReuseSource::KvRam];
+    pub const ALL: [ReuseSource; 3] = [ReuseSource::Device, ReuseSource::KvRam, ReuseSource::Disk];
 
-    /// The request log's wire spelling (`device` / `kv_ram`). The gate spec
-    /// maps these onto ninfer's `vram_resident` / `host_ram`.
+    /// The request log's wire spelling (`device` / `kv_ram` / `disk`). The
+    /// gate spec maps the first two onto ninfer's `vram_resident` /
+    /// `host_ram`.
     pub fn as_str(self) -> &'static str {
         match self {
             ReuseSource::Device => "device",
             ReuseSource::KvRam => "kv_ram",
+            ReuseSource::Disk => "disk",
         }
     }
 
@@ -120,6 +124,7 @@ impl ReuseSource {
         match self {
             ReuseSource::Device => 0,
             ReuseSource::KvRam => 1,
+            ReuseSource::Disk => 2,
         }
     }
 }
@@ -1356,9 +1361,14 @@ mod tests {
     }
 
     #[test]
-    fn reuse_source_spells_the_two_tiers() {
+    fn reuse_source_spells_the_three_tiers() {
         assert_eq!(ReuseSource::Device.as_str(), "device");
         assert_eq!(ReuseSource::KvRam.as_str(), "kv_ram");
+        // Spec vram-budget/03 AC 38: the request log spells KV-disk `disk`.
+        assert_eq!(ReuseSource::Disk.as_str(), "disk");
+        for (index, source) in ReuseSource::ALL.into_iter().enumerate() {
+            assert_eq!(source.index(), index, "ALL is in index order");
+        }
     }
 
     // ── GitHub #189: identity, the media slot, and the tier list ─────────

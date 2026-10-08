@@ -1066,6 +1066,15 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
       pool->free_slots.push_back(static_cast<std::int32_t>(i));
     }
 
+    // Spec vram-budget/03: the windowed transfer's own stream, non-blocking
+    // so the model's never waits on it.
+    if (const cudaError_t err = cudaStreamCreateWithFlags(&pool->transfer.stream, cudaStreamNonBlocking);
+        err != cudaSuccess) {
+      pool->transfer.stream = nullptr;
+      throw std::runtime_error(std::string("cudaStreamCreateWithFlags(transfer) failed: ") +
+                               cudaGetErrorString(err));
+    }
+
     *out_pool = pool.release();
     return 0;
   } catch (const std::exception &e) {
@@ -1233,6 +1242,531 @@ extern "C" int32_t ignis_seq_pending_token(const struct ignis_seq *seq) {
   return seq == nullptr ? -1 : seq->pending_token;
 }
 
+// ---- the windowed transfer (spec vram-budget/03, ADR 0045) ----------------
+//
+// A blob a window at a time. The whole-blob calls above walk the sections and
+// let each packer write its own; a window cannot, because a packer writes
+// all of its section or none. So the blob is described here as runs --
+// stretches of it, each one contiguous in device memory, or host bytes (the
+// header and records, the progress image, a host retained slot's image) --
+// and a window copies the runs it meets, clipped. The runs mirror the
+// packers above section by section; test_seq_snapshot.cpp holds every
+// window size to the whole call's bytes, which is what keeps the two from
+// drifting.
+
+namespace {
+
+// One stretch of a blob and where its bytes live: device memory, or host
+// bytes. A stretch no run covers is a gap the blob carries as zeros.
+struct blob_run {
+  std::uint64_t offset   = 0;
+  std::uint64_t bytes    = 0;
+  unsigned char *device  = nullptr;
+  unsigned char *host    = nullptr;
+};
+
+// The runs of one blob that meet the window [lo, hi), in offset order --
+// built for the window alone, so a window costs what its own bytes cost and
+// not what the whole sequence does.
+class window_runs {
+public:
+  window_runs(std::uint64_t lo, std::uint64_t hi) : lo_(lo), hi_(hi) {}
+
+  std::uint64_t lo() const { return lo_; }
+  std::uint64_t hi() const { return hi_; }
+
+  bool meets(std::uint64_t offset, std::uint64_t bytes) const {
+    return bytes != 0 && offset < hi_ && offset + bytes > lo_;
+  }
+
+  // Device bytes; a run that continues the last one in the blob and in
+  // memory both extends it, so consecutive pages are one copy.
+  void device(std::uint64_t offset, const void *at, std::uint64_t bytes) {
+    if (!meets(offset, bytes)) {
+      return;
+    }
+    auto *p = static_cast<unsigned char *>(const_cast<void *>(at));
+    if (!runs_.empty()) {
+      blob_run &last = runs_.back();
+      if (offset < last.offset + last.bytes) {
+        throw std::logic_error("blob runs out of order");
+      }
+      if (last.device != nullptr && last.offset + last.bytes == offset && last.device + last.bytes == p) {
+        last.bytes += bytes;
+        return;
+      }
+    }
+    runs_.push_back({offset, bytes, p, nullptr});
+  }
+
+  void host(std::uint64_t offset, unsigned char *at, std::uint64_t bytes) {
+    if (!meets(offset, bytes)) {
+      return;
+    }
+    if (!runs_.empty() && offset < runs_.back().offset + runs_.back().bytes) {
+      throw std::logic_error("blob runs out of order");
+    }
+    runs_.push_back({offset, bytes, nullptr, at});
+  }
+
+  // A snapshot window into `dst`, which holds [lo, hi): device runs are
+  // issued on `stream`, host runs copied now, and every byte no run covers
+  // zeroed -- the gaps the whole call zeroes too.
+  void copy_out(unsigned char *dst, cudaStream_t stream) const {
+    std::uint64_t cursor = lo_;
+    for (const blob_run &run : runs_) {
+      const std::uint64_t from = std::max(run.offset, lo_);
+      const std::uint64_t to   = std::min(run.offset + run.bytes, hi_);
+      if (from > cursor) {
+        std::memset(dst + (cursor - lo_), 0, static_cast<std::size_t>(from - cursor));
+      }
+      unsigned char *out = dst + (from - lo_);
+      const std::size_t bytes = static_cast<std::size_t>(to - from);
+      if (run.device != nullptr) {
+        const cudaError_t err =
+            cudaMemcpyAsync(out, run.device + (from - run.offset), bytes, cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemcpyAsync(snapshot window) failed: ") +
+                                   cudaGetErrorString(err));
+        }
+      } else {
+        std::memcpy(out, run.host + (from - run.offset), bytes);
+      }
+      cursor = to;
+    }
+    if (hi_ > cursor) {
+      std::memset(dst + (cursor - lo_), 0, static_cast<std::size_t>(hi_ - cursor));
+    }
+  }
+
+  // A restore window from `src`, which holds [lo, hi): device runs issued on
+  // `stream`, host runs copied into their host bytes now. A gap is read from
+  // nowhere.
+  void copy_in(const unsigned char *src, cudaStream_t stream) const {
+    for (const blob_run &run : runs_) {
+      const std::uint64_t from = std::max(run.offset, lo_);
+      const std::uint64_t to   = std::min(run.offset + run.bytes, hi_);
+      const unsigned char *in  = src + (from - lo_);
+      const std::size_t bytes  = static_cast<std::size_t>(to - from);
+      if (run.device != nullptr) {
+        const cudaError_t err = cudaMemcpyAsync(run.device + (from - run.offset), in, bytes,
+                                                cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemcpyAsync(restore window) failed: ") +
+                                   cudaGetErrorString(err));
+        }
+      } else {
+        std::memcpy(run.host + (from - run.offset), in, bytes);
+      }
+    }
+  }
+
+private:
+  std::uint64_t lo_;
+  std::uint64_t hi_;
+  std::vector<blob_run> runs_;
+};
+
+// The runs of a section laid out page by page, `bytes` per page, from
+// `offset`, that meet `out`'s window: page `i` of `pages` at `at(i)`.
+template <typename At>
+void page_runs(window_runs &out, std::uint64_t offset, std::uint64_t bytes, std::size_t count, At at) {
+  if (bytes == 0 || !out.meets(offset, bytes * count)) {
+    return;
+  }
+  const std::uint64_t first = out.lo() > offset ? (out.lo() - offset) / bytes : 0;
+  const std::uint64_t last  = std::min<std::uint64_t>(count, (out.hi() - offset + bytes - 1) / bytes);
+  for (std::uint64_t i = first; i < last; ++i) {
+    out.device(offset + i * bytes, at(static_cast<std::size_t>(i)), bytes);
+  }
+}
+
+// Pool slot `slot`'s payload of the device-resident CLONE section `section`,
+// as runs: pack_slot_section_to_host's layout, stretch by stretch.
+void slot_section_runs(const ignis_seq_pool &pool, std::int32_t slot, const ignis_seq_section &section,
+                       window_runs &out) {
+  std::uint64_t at = section.offset;
+  switch (section.kind) {
+  case IGNIS_SEQ_SECTION_GDN_CONV: {
+    const std::uint64_t bytes = pool.gdn_pool.conv_slot_bytes();
+    for (std::uint32_t layer = 0; layer < pool.gdn_pool.layer_count(); ++layer) {
+      out.device(at + layer * bytes, pool.gdn_pool.conv_slot(layer, slot).data, bytes);
+    }
+    return;
+  }
+  case IGNIS_SEQ_SECTION_GDN_RECURRENT: {
+    const std::uint64_t bytes = pool.gdn_pool.recurrent_slot_bytes();
+    for (std::uint32_t layer = 0; layer < pool.gdn_pool.layer_count(); ++layer) {
+      out.device(at + layer * bytes, pool.gdn_pool.recurrent_slot(layer, slot).data, bytes);
+    }
+    return;
+  }
+  case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
+    out.device(at, pool.token_counts_for(slot), section.bytes);
+    return;
+  case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+    for (std::uint32_t layer = 0; layer < pool.dflash2_window->layer_count(); ++layer) {
+      const ninfer::CyclicKVCacheLayerView view = pool.dflash2_window->layer_view(layer);
+      for (const ninfer::Tensor *plane : {&view.k, &view.v}) {
+        const ninfer::Tensor lane = plane->slice(3, slot, 1);
+        out.device(at, lane.data, lane.bytes());
+        at += lane.bytes();
+      }
+    }
+    return;
+  case IGNIS_SEQ_SECTION_HQ_RESIDUAL: {
+    const std::uint64_t plane = pool.hq_residual_plane_bytes();
+    for (const bool role_v : {false, true}) {
+      for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+        out.device(at, pool.hq_residual_plane(role_v, layer, slot), plane);
+        at += plane;
+      }
+    }
+    out.device(at, pool.hq_ring_words(slot), kIgnisHqRingWords * sizeof(std::uint32_t));
+    return;
+  }
+  case IGNIS_SEQ_SECTION_INDEXER_TAIL:
+    for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+      out.device(at + static_cast<std::uint64_t>(layer) * pool.indexer_tail_slot_bytes,
+                 pool.indexer_slot_tail(layer, slot), pool.indexer_tail_slot_bytes);
+    }
+    return;
+  case IGNIS_SEQ_SECTION_NGRAM_CONV:
+    out.device(at, pool.ngram_slot_conv(slot), section.bytes);
+    return;
+  default:
+    // ADR 0024's "carried by all or by none": a section the table lists and
+    // this does not is a loud failure, not a window of zeros.
+    throw std::logic_error(std::string("state section ") + ignis_seq_section_name(section.kind) +
+                           " has no windowed transfer");
+  }
+}
+
+// The runs of a blob laid out by `sections` over `pages` (in logical order)
+// and pool slot `slot`'s state -- a host retained slot's packed image when
+// `slot` is one -- that meet `out`'s window. `head` (the header and the
+// records; null on a restore, which takes them apart before building runs)
+// and `progress` are host bytes the caller keeps alive.
+void blob_runs(const ignis_seq_pool &pool, const std::vector<ignis_seq_section> &sections,
+               const std::vector<std::int32_t> &pages, std::int32_t slot, unsigned char *head,
+               std::uint64_t head_bytes, unsigned char *progress, window_runs &out) {
+  if (head != nullptr) {
+    out.host(0, head, head_bytes);
+  }
+  const bool host_slot = pool.is_host_retained(slot);
+  const std::vector<ignis_seq_section> image =
+      host_slot ? ignis_seq_prefix_clone_layout(pool) : std::vector<ignis_seq_section>{};
+  for (const ignis_seq_section &section : sections) {
+    if (!out.meets(section.offset, section.bytes)) {
+      continue;
+    }
+    switch (section.kind) {
+    case IGNIS_SEQ_SECTION_KV_PAGES: {
+      if (pool.kv_pool.plane_order() != ninfer::PagedKVPlaneOrder::PageMajor) {
+        throw std::logic_error("a windowed transfer requires a PageMajor KV pool");
+      }
+      std::uint64_t at = section.offset;
+      for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
+        const ninfer::Tensor &plane = pool.kv_pool.plane(plane_index);
+        const auto bytes            = static_cast<std::uint64_t>(plane.nb[3]);
+        const auto *base            = static_cast<const unsigned char *>(plane.data);
+        page_runs(out, at, bytes, pages.size(),
+                  [&](std::size_t i) { return base + static_cast<std::int64_t>(pages[i]) * plane.nb[3]; });
+        at += bytes * pages.size();
+      }
+      break;
+    }
+    case IGNIS_SEQ_SECTION_INDEXER_KEYS: {
+      const std::uint64_t bytes = pool.indexer_page_bytes();
+      for (std::int32_t layer = 0; layer < pool.kv_num_layers; ++layer) {
+        page_runs(out, section.offset + static_cast<std::uint64_t>(layer) * pages.size() * bytes, bytes,
+                  pages.size(), [&](std::size_t i) { return pool.indexer_page_keys(layer, pages[i]); });
+      }
+      break;
+    }
+    case IGNIS_SEQ_SECTION_PROGRESS:
+      out.host(section.offset, progress, section.bytes);
+      break;
+    default:
+      if (host_slot) {
+        const ignis_seq_section *placed = nullptr;
+        for (const ignis_seq_section &candidate : image) {
+          if (candidate.kind == section.kind) {
+            placed = &candidate;
+          }
+        }
+        if (placed == nullptr || placed->bytes != section.bytes) {
+          throw std::logic_error(std::string("state section ") + ignis_seq_section_name(section.kind) +
+                                 " is not in the host image as the blob lays it out");
+        }
+        out.host(section.offset, pool.retained_host_image(slot) + placed->offset, section.bytes);
+        break;
+      }
+      slot_section_runs(pool, slot, section, out);
+      break;
+    }
+  }
+}
+
+// The header and the records of a blob of `sections`, as its first bytes.
+std::vector<unsigned char> blob_head(const ignis_seq_snapshot_header &header,
+                                     const std::vector<ignis_seq_section> &sections) {
+  std::vector<unsigned char> head(sizeof(header) + sections.size() * sizeof(ignis_seq_section));
+  std::memcpy(head.data(), &header, sizeof(header));
+  std::memcpy(head.data() + sizeof(header), sections.data(), sections.size() * sizeof(ignis_seq_section));
+  return head;
+}
+
+// Why `window` cannot be a window of a `total`-byte blob into a
+// `buffer_bytes`-byte buffer, or an empty string.
+std::string window_refusal(const ignis_seq_transfer &window, std::uint64_t total, std::uint64_t buffer_bytes) {
+  if (window.blob_bytes != total) {
+    return "the blob is " + std::to_string(total) + " bytes, the transfer names " +
+           std::to_string(window.blob_bytes);
+  }
+  if (window.offset > total || window.bytes > total - window.offset) {
+    return "the window " + std::to_string(window.offset) + "+" + std::to_string(window.bytes) +
+           " runs past the " + std::to_string(total) + "-byte blob";
+  }
+  if (buffer_bytes < window.bytes) {
+    return "the buffer holds " + std::to_string(buffer_bytes) + " bytes, the window is " +
+           std::to_string(window.bytes);
+  }
+  return {};
+}
+
+// One window of a live sequence's blob into `dst` (ignis_seq_snapshot with a
+// window): the whole call's bytes, the KV pages materialized as it
+// materializes them.
+int32_t snapshot_window(const ignis_seq_pool &pool, const ignis_seq &seq, void *dst, std::uint64_t dst_bytes,
+                        const ignis_seq_transfer &window) {
+  const std::uint32_t pages                     = ignis_seq_snapshot_page_count(seq);
+  const std::vector<ignis_seq_section> sections = ignis_seq_section_table(pool, pages);
+  const ignis_seq_snapshot_header header        = ignis_seq_snapshot_header_for(pool, pages, sections);
+  if (const std::string refusal = window_refusal(window, header.total_bytes, dst_bytes); !refusal.empty()) {
+    set_error("ignis_seq_snapshot: " + refusal);
+    return -1;
+  }
+  std::vector<unsigned char> head = blob_head(header, sections);
+  ignis_seq_progress_image progress = ignis_seq_progress_of(seq);
+  window_runs runs(window.offset, window.offset + window.bytes);
+  blob_runs(pool, sections, logical_page_ids(seq, pages), seq.slot, head.data(), head.size(),
+            reinterpret_cast<unsigned char *>(&progress), runs);
+  runs.copy_out(static_cast<unsigned char *>(dst), static_cast<cudaStream_t>(window.stream));
+  return 0;
+}
+
+// One window of a restore (ignis_seq_restore with a window). The header and
+// the records are gathered as they arrive and checked, against the pool and
+// the target, before any byte of a section moves; a refusal ends the restore
+// and leaves `seq` as it was.
+int32_t restore_window(ignis_seq_pool &pool, ignis_seq &seq, const void *src, std::uint64_t src_bytes,
+                       const ignis_seq_transfer &window) {
+  if (src_bytes != window.bytes) {
+    set_error("ignis_seq_restore: the source holds " + std::to_string(src_bytes) + " bytes, the window is " +
+              std::to_string(window.bytes));
+    return -1;
+  }
+  if (seq.restoring == nullptr) {
+    if (window.offset != 0) {
+      set_error("ignis_seq_restore: a windowed restore starts at offset 0, not " + std::to_string(window.offset));
+      return -1;
+    }
+    seq.restoring             = std::make_unique<ignis_seq::restore_window>();
+    seq.restoring->blob_bytes = window.blob_bytes;
+  }
+  ignis_seq::restore_window &state = *seq.restoring;
+  if (window.offset != state.fed || window.blob_bytes != state.blob_bytes ||
+      window.bytes > state.blob_bytes - state.fed) {
+    set_error("ignis_seq_restore: the window " + std::to_string(window.offset) + "+" +
+              std::to_string(window.bytes) + " does not continue the restore at " + std::to_string(state.fed) +
+              " of " + std::to_string(state.blob_bytes) + " bytes");
+    return -1;
+  }
+  const auto *in = static_cast<const unsigned char *>(src);
+  const auto refuse = [&](const std::string &why) {
+    seq.restoring.reset();
+    set_error("ignis_seq_restore: " + why + "; the target sequence is unchanged");
+    return IGNIS_SEQ_ERR_BAD_SNAPSHOT;
+  };
+
+  // The header, then the records it counts: the blob's first bytes, which
+  // no section's payload starts inside. Until they are checked every byte fed
+  // is one of them, so `head` holds exactly what has been fed.
+  if (!state.validated) {
+    const std::uint64_t end = window.offset + window.bytes;
+    const auto gather = [&](std::uint64_t upto) {
+      const std::uint64_t have = state.head.size();
+      const std::uint64_t to   = std::min(upto, end);
+      if (to > have) {
+        const unsigned char *from = in + (have - window.offset);
+        state.head.insert(state.head.end(), from, from + (to - have));
+      }
+    };
+    gather(sizeof(ignis_seq_snapshot_header));
+    if (state.head.size() >= sizeof(ignis_seq_snapshot_header)) {
+      ignis_seq_snapshot_header header{};
+      std::memcpy(&header, state.head.data(), sizeof(header));
+      // A header that misstates its record size lists none here, which the
+      // check below refuses by size; one counting more than the blob holds
+      // allocates nothing.
+      const std::uint64_t records =
+          header.section_record_bytes == sizeof(ignis_seq_section) ? header.section_count : 0;
+      const std::uint64_t want = sizeof(ignis_seq_snapshot_header) + records * sizeof(ignis_seq_section);
+      if (want > state.blob_bytes) {
+        return refuse("snapshot header counts " + std::to_string(header.section_count) +
+                      " sections, more than its " + std::to_string(state.blob_bytes) + " bytes hold");
+      }
+      gather(want);
+      if (state.head.size() >= want) {
+        std::vector<ignis_seq_section> listed(static_cast<std::size_t>(records));
+        std::memcpy(listed.data(), state.head.data() + sizeof(header), listed.size() * sizeof(ignis_seq_section));
+        const std::string refusal = snapshot_refusal(pool, seq, header, listed, state.blob_bytes);
+        if (!refusal.empty()) {
+          return refuse(refusal);
+        }
+        state.validated     = true;
+        state.kv_page_count = header.kv_page_count;
+        state.progress.assign(sizeof(ignis_seq_progress_image), 0);
+      }
+    }
+  }
+
+  if (state.validated) {
+    const std::vector<ignis_seq_section> sections = ignis_seq_section_table(pool, state.kv_page_count);
+    const auto own = seq.kv.page_ids();
+    const std::vector<std::int32_t> pages(own.begin(), own.begin() + state.kv_page_count);
+    window_runs runs(window.offset, window.offset + window.bytes);
+    blob_runs(pool, sections, pages, seq.slot, nullptr, 0, state.progress.data(), runs);
+    runs.copy_in(in, static_cast<cudaStream_t>(window.stream));
+  }
+  state.fed += window.bytes;
+  if (state.fed == state.blob_bytes) {
+    if (!state.validated) {
+      return refuse("the blob ended before its header and records did");
+    }
+    ignis_seq_progress_image progress{};
+    std::memcpy(&progress, state.progress.data(), sizeof(progress));
+    seq.restoring.reset();
+    ignis_seq_apply_progress(seq, progress);
+  }
+  return 0;
+}
+
+} // namespace
+
+// One window of the blob ignis_seq_write_materialized_blob writes (spec
+// vram-budget/03): the same history and the same retained slot, as runs.
+void ignis_seq_write_materialized_window(const ignis_seq_pool &pool, const ignis_seq_prefix *chain,
+                                         std::int32_t tail_page, std::uint32_t retained_slot,
+                                         const ignis_seq_progress_image &progress, std::uint32_t pages,
+                                         void *dst, std::uint64_t dst_bytes, const ignis_seq_transfer &window) {
+  const std::vector<ignis_seq_section> sections = ignis_seq_section_table(pool, pages);
+  const ignis_seq_snapshot_header header        = ignis_seq_snapshot_header_for(pool, pages, sections);
+  if (const std::string refusal = window_refusal(window, header.total_bytes, dst_bytes); !refusal.empty()) {
+    throw std::invalid_argument(refusal);
+  }
+  if (retained_slot >= pool.retained_slot_count) {
+    throw std::logic_error("materialization names retained slot " + std::to_string(retained_slot) +
+                           " of a pool holding " + std::to_string(pool.retained_slot_count));
+  }
+  std::vector<std::int32_t> history = ignis_seq_prefix_chain_page_ids(chain);
+  if (tail_page >= 0) {
+    history.push_back(tail_page);
+  }
+  if (pages != history.size()) {
+    throw std::logic_error("materialization extent does not match the chain and its tail");
+  }
+  std::vector<unsigned char> head = blob_head(header, sections);
+  ignis_seq_progress_image image  = progress;
+  window_runs runs(window.offset, window.offset + window.bytes);
+  blob_runs(pool, sections, history, ignis_seq_retained_pool_slot(pool, retained_slot), head.data(), head.size(),
+            reinterpret_cast<unsigned char *>(&image), runs);
+  runs.copy_out(static_cast<unsigned char *>(dst), static_cast<cudaStream_t>(window.stream));
+}
+
+ignis_seq_pool::transfer_lane::~transfer_lane() {
+  for (const auto &fence : fences) {
+    cudaEventDestroy(fence.second);
+  }
+  for (cudaEvent_t event : spare) {
+    cudaEventDestroy(event);
+  }
+  if (stream != nullptr) {
+    cudaStreamDestroy(stream);
+  }
+}
+
+extern "C" void *ignis_seq_pool_transfer_stream(const struct ignis_seq_pool *pool) {
+  return pool == nullptr ? nullptr : static_cast<void *>(pool->transfer.stream);
+}
+
+extern "C" int32_t ignis_seq_pool_fence(struct ignis_seq_pool *pool, void *stream, uint64_t *out_fence) {
+  if (out_fence != nullptr) {
+    *out_fence = 0;
+  }
+  if (pool == nullptr || out_fence == nullptr) {
+    set_error("ignis_seq_pool_fence: null argument");
+    return -1;
+  }
+  cudaEvent_t event = nullptr;
+  if (!pool->transfer.spare.empty()) {
+    event = pool->transfer.spare.back();
+    pool->transfer.spare.pop_back();
+  } else if (const cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+             err != cudaSuccess) {
+    set_error(std::string("ignis_seq_pool_fence: cudaEventCreateWithFlags failed: ") + cudaGetErrorString(err));
+    return -1;
+  }
+  if (const cudaError_t err = cudaEventRecord(event, static_cast<cudaStream_t>(stream)); err != cudaSuccess) {
+    pool->transfer.spare.push_back(event);
+    set_error(std::string("ignis_seq_pool_fence: cudaEventRecord failed: ") + cudaGetErrorString(err));
+    return -1;
+  }
+  const std::uint64_t id = pool->transfer.next_fence++;
+  pool->transfer.fences.emplace(id, event);
+  *out_fence = id;
+  return 0;
+}
+
+namespace {
+
+// Retire `fence` after `err`, its event's answer: 1 or 0 for the caller, or
+// -1 with the error set.
+int32_t settle_fence(ignis_seq_pool &pool, std::uint64_t fence, cudaError_t err, const char *fn) {
+  if (err == cudaErrorNotReady) {
+    return 0;
+  }
+  auto found = pool.transfer.fences.find(fence);
+  pool.transfer.spare.push_back(found->second);
+  pool.transfer.fences.erase(found);
+  if (err != cudaSuccess) {
+    set_error(std::string(fn) + ": a transfer copy failed: " + cudaGetErrorString(err));
+    return -1;
+  }
+  return 1;
+}
+
+} // namespace
+
+extern "C" int32_t ignis_seq_pool_fence_query(struct ignis_seq_pool *pool, uint64_t fence) {
+  if (pool == nullptr || pool->transfer.fences.count(fence) == 0) {
+    set_error("ignis_seq_pool_fence_query: unknown fence " + std::to_string(fence));
+    return -1;
+  }
+  return settle_fence(*pool, fence, cudaEventQuery(pool->transfer.fences.at(fence)), "ignis_seq_pool_fence_query");
+}
+
+extern "C" int32_t ignis_seq_pool_fence_wait(struct ignis_seq_pool *pool, uint64_t fence) {
+  if (pool == nullptr || pool->transfer.fences.count(fence) == 0) {
+    set_error("ignis_seq_pool_fence_wait: unknown fence " + std::to_string(fence));
+    return -1;
+  }
+  const int32_t rc =
+      settle_fence(*pool, fence, cudaEventSynchronize(pool->transfer.fences.at(fence)), "ignis_seq_pool_fence_wait");
+  return rc == 1 ? 0 : -1;
+}
+
 extern "C" uint32_t ignis_seq_snapshot_format_version(void) {
   return kIgnisSeqSnapshotFormatVersion;
 }
@@ -1258,6 +1792,10 @@ extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
     set_error(std::string("ignis_seq_snapshot_size: ") + refusal);
     return -1;
   }
+  if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
+    set_error(std::string("ignis_seq_snapshot_size: ") + refusal);
+    return -1;
+  }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
     set_error("ignis_seq_snapshot_size: sequence slot " + std::to_string(seq->slot) +
               " is mid-chunk (program frontier " + std::to_string(seq->position) +
@@ -1276,7 +1814,7 @@ extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
 
 extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
                                        const struct ignis_seq *seq, void *dst,
-                                       uint64_t dst_bytes) {
+                                       uint64_t dst_bytes, const struct ignis_seq_transfer *window) {
   if (pool == nullptr || seq == nullptr || dst == nullptr) {
     set_error("ignis_seq_snapshot: null argument");
     return -1;
@@ -1289,11 +1827,23 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
     set_error(std::string("ignis_seq_snapshot: ") + refusal);
     return -1;
   }
+  if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
+    set_error(std::string("ignis_seq_snapshot: ") + refusal);
+    return -1;
+  }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
     set_error("ignis_seq_snapshot: sequence slot " + std::to_string(seq->slot) +
               " is mid-chunk (program frontier " + std::to_string(seq->position) +
               "); its state sections are not consistent with one another");
     return IGNIS_SEQ_ERR_NOT_AT_BOUNDARY;
+  }
+  if (window != nullptr) {
+    try {
+      return snapshot_window(*pool, *seq, dst, dst_bytes, *window);
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_seq_snapshot: ") + e.what());
+      return -1;
+    }
   }
 
   // Every copy below runs on the default stream and is confirmed by this
@@ -1359,7 +1909,8 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
 }
 
 extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_seq *seq,
-                                      const void *src, uint64_t src_bytes) {
+                                      const void *src, uint64_t src_bytes,
+                                      const struct ignis_seq_transfer *window) {
   if (pool == nullptr || seq == nullptr || src == nullptr) {
     set_error("ignis_seq_restore: null argument");
     return -1;
@@ -1376,6 +1927,20 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
     set_error(std::string("ignis_seq_restore: ") + refusal +
               "; the target sequence is unchanged");
     return IGNIS_SEQ_ERR_SHARED_PREFIX;
+  }
+  if (window != nullptr) {
+    try {
+      return restore_window(*pool, *seq, src, src_bytes, *window);
+    } catch (const std::exception &e) {
+      // A copy that failed to issue leaves the sequence half written: the
+      // restore is over, and the caller releases what it was building.
+      set_error(std::string("ignis_seq_restore: ") + e.what());
+      return -1;
+    }
+  }
+  if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
+    set_error(std::string("ignis_seq_restore: ") + refusal);
+    return -1;
   }
   if (src_bytes < sizeof(ignis_seq_snapshot_header)) {
     set_error("ignis_seq_restore: " + std::to_string(src_bytes) +
@@ -1738,6 +2303,13 @@ extern "C" int32_t ignis_alloc_counts(int32_t kind, struct ignis_alloc_count *ou
 
 // ---- the KV-RAM arena (GitHub #213, ADR 0030) ----------------------------
 
+// Every blob span starts on an unbuffered-IO boundary (spec vram-budget/03):
+// the disk tier writes a KV-RAM blob to its file straight from the arena, and
+// an unbuffered write must start on one. 4 KiB, the sector multiple
+// `ignis_artifact::DIRECT_IO_ALIGNMENT` names on the Rust side; the vendored
+// arena's own default is 256.
+constexpr std::size_t kIgnisHostSpanAlign = 4096;
+
 namespace {
 
 // The one pinned region the host tier places every blob in. Process-wide
@@ -1813,7 +2385,7 @@ extern "C" int32_t ignis_host_pinned_can_alloc(uint64_t bytes, int32_t *out_fits
     return 0;
   }
   try {
-    *out_fits = g_host_pool->can_alloc(static_cast<std::size_t>(bytes)) ? 1 : 0;
+    *out_fits = g_host_pool->can_alloc(static_cast<std::size_t>(bytes), kIgnisHostSpanAlign) ? 1 : 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_host_pinned_can_alloc: ") + e.what());
     return -1;
@@ -1839,7 +2411,7 @@ extern "C" int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr) {
   }
   void *ptr = nullptr;
   try {
-    ptr = g_host_pool->try_alloc(static_cast<std::size_t>(bytes));
+    ptr = g_host_pool->try_alloc(static_cast<std::size_t>(bytes), kIgnisHostSpanAlign);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_host_pinned_alloc: ") + e.what());
     return -1;
@@ -1934,7 +2506,7 @@ extern "C" int32_t ignis_host_arena_can_alloc(struct ignis_host_arena *arena, ui
   }
   const std::lock_guard<std::mutex> guard(arena->mutex);
   try {
-    *out_fits = arena->arena.can_alloc(static_cast<std::size_t>(bytes)) ? 1 : 0;
+    *out_fits = arena->arena.can_alloc(static_cast<std::size_t>(bytes), kIgnisHostSpanAlign) ? 1 : 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_host_arena_can_alloc: ") + e.what());
     return -1;
@@ -1956,7 +2528,7 @@ extern "C" int32_t ignis_host_arena_alloc(struct ignis_host_arena *arena, uint64
   const std::lock_guard<std::mutex> guard(arena->mutex);
   void *ptr = nullptr;
   try {
-    ptr = arena->arena.try_alloc(static_cast<std::size_t>(bytes));
+    ptr = arena->arena.try_alloc(static_cast<std::size_t>(bytes), kIgnisHostSpanAlign);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_host_arena_alloc: ") + e.what());
     return -1;

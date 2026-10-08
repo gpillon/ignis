@@ -403,6 +403,102 @@ impl DecodeOutcome {
 /// path is the same one every other failed spill takes.
 pub const NO_HOST_ROOM: i32 = -6;
 
+/// A blob the KV-disk tier moves (spec vram-budget/03, ADR 0045): an evicted
+/// live sequence, named by its request, or retained state, named as the
+/// backend names it on the device and in KV-RAM — a checkpoint by its
+/// publisher, a prefix by its publisher and its length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiskBlob {
+    Live(RequestId),
+    Checkpoint(RequestId),
+    Prefix(RequestId, u32),
+}
+
+/// Where a spill to KV-disk reads its blob from (spec vram-budget/03). The
+/// source keeps the bytes until the file commits: a device victim its pages,
+/// a KV-RAM blob its span. So a write that fails leaves the blob where it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskSource {
+    /// A live sequence on the device, copied a window at a time.
+    Device,
+    /// A blob KV-RAM holds, written straight from its span.
+    KvRam,
+}
+
+impl DiskSource {
+    /// The wire spelling (`device` / `kv_ram`): `ignis_kv_disk_spills_total`'s
+    /// `from` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiskSource::Device => "device",
+            DiskSource::KvRam => "kv_ram",
+        }
+    }
+}
+
+/// Which way a KV-disk transfer that failed was going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskOp {
+    /// A spill refused or failed: nothing was lost, the blob is where it was.
+    Write,
+    /// A file that failed its check (torn, corrupt or foreign) or its read:
+    /// never restored.
+    Read,
+}
+
+impl DiskOp {
+    /// The wire spelling (`write` / `read`): `ignis_kv_disk_failures_total`'s
+    /// `op` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiskOp::Write => "write",
+            DiskOp::Read => "read",
+        }
+    }
+}
+
+/// What a KV-disk file says about the blob in it beyond the load's identity
+/// (ADR 0045, GitHub #205): the content it covers — a retained blob's match
+/// key, the empty key for a live sequence nothing can match — and the prompt
+/// tokens behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskBlobMeta {
+    pub key: crate::identity::MatchKey,
+    pub tokens: u32,
+}
+
+/// Where a restore from KV-disk lands. Never KV-RAM: a blob comes back from
+/// the disk straight to the device (ADR 0045).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskTarget {
+    /// A fresh sequence for `request`, reserving `context_tokens`: a live
+    /// sequence's own, or a checkpoint claimant's, which resumes there.
+    Sequence { request: RequestId, context_tokens: u32 },
+    /// The blob's prefix, published again under its own name with its image
+    /// in retained slot `slot`.
+    Prefix { slot: u32 },
+}
+
+/// How a KV-disk transfer ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskOutcome {
+    /// The file committed (its header written last), holding `bytes` of the
+    /// volume. The source has given its bytes up.
+    Spilled { bytes: u64 },
+    /// The blob is on the device, `micros` after the restore started.
+    Restored { micros: u64 },
+    /// It did not happen. A write leaves the blob where it was; a read leaves
+    /// nothing on the device, and the file is gone.
+    Failed { op: DiskOp },
+}
+
+/// One KV-disk transfer that ended, as [`Compute::disk_advance`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskEvent {
+    pub blob: DiskBlob,
+    pub outcome: DiskOutcome,
+}
+
 /// The [`ComputeError::Kernel`] code a backend reports when a job asked for
 /// a [`PrefillJob::readout`] on a chunk that carries no tokens (GitHub
 /// #237): no forward pass runs, so there are no logits at that position to
@@ -615,6 +711,53 @@ pub trait Compute: Send + Sync {
 
     /// Free a spilled prefix's blob.
     fn discard_spilled_prefix(&self, _publisher: RequestId, _tokens: u32) {}
+
+    // ── KV-disk, Tier 2 (spec vram-budget/03, ADR 0045) ─────────────────
+    //
+    // The tier's policy — what it holds, what goes first, when a request
+    // waits — is the scheduler's, over `crate::disk::DiskTier`, testable on a
+    // CPU like KV-RAM's. These calls are where it meets the files. A transfer
+    // is never one call: it is started, then advanced a window at a time by
+    // `disk_advance` between steps, so the model thread waits on neither the
+    // disk nor a copy. The defaults are a backend with no disk, which takes
+    // nothing.
+
+    /// Whether the volume can take a file holding a blob of `bytes` now:
+    /// room above its margin, and a store not refusing writes. The tier's own
+    /// byte budget is the scheduler's ledger, not this.
+    fn disk_fits(&self, _bytes: u64) -> bool {
+        false
+    }
+
+    /// Start writing `blob` to a file of its own from `from`, the header
+    /// naming `meta`. Returns the blob's length, which the file's header
+    /// records. Nothing is given up yet: the source keeps its bytes until
+    /// [`Compute::disk_advance`] reports the spill.
+    fn disk_spill(&self, _blob: DiskBlob, _from: DiskSource, _meta: DiskBlobMeta) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Start bringing `blob` back from its file into `into`. A live blob's
+    /// file goes once it has landed; a retained blob's stays, since a claim
+    /// never consumes (ADR 0029). A [`DiskTarget::Sequence`] allocates its
+    /// sequence now, at the reservation the scheduler has charged.
+    fn disk_restore(&self, _blob: DiskBlob, _into: DiskTarget) -> Result<(), ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Advance every transfer under way by at most one window, and report
+    /// the ones that ended.
+    fn disk_advance(&self) -> Vec<DiskEvent> {
+        Vec::new()
+    }
+
+    /// Delete `blob`'s file, abandoning any transfer of it under way: a
+    /// spill's source keeps its bytes, a restore's half-built sequence goes.
+    fn disk_discard(&self, _blob: DiskBlob) {}
+
+    /// Abandon the restore into `request` under way, leaving the file it
+    /// reads: a checkpoint claimant cancelled before its state landed.
+    fn disk_abandon_restore(&self, _request: RequestId) {}
 }
 
 /// The engine's scheduling interface — what the server drives.
@@ -727,4 +870,7 @@ pub struct Occupancy {
     /// The host KV-RAM tier's bytes in use: live snapshots and retained
     /// blobs together.
     pub kv_ram_used_bytes: u64,
+    /// The KV-disk tier's bytes in use, files being written included (spec
+    /// vram-budget/03); 0 on a load without the tier.
+    pub kv_disk_used_bytes: u64,
 }

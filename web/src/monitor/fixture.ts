@@ -241,3 +241,23 @@ ignis_ngram_reads_total 6000
 # TYPE ignis_ngram_read_bytes_total counter
 ignis_ngram_read_bytes_total 24576000
 `;
+
+// A load with the KV-disk tier (spec vram-budget/03, ADR 0017): the 27B-shaped
+// exposition plus the disk families and the `tier="disk"` retained rows, which
+// the server renders from the first scrape (zeros included) and only then.
+export const KV_DISK_EXPOSITION = `${IGNIS_EXPOSITION.replace(
+  /(ignis_retained_(?:state_)?\w+_total)\{tier="kv_ram",kind="prefix"\} (\d+)\n/g,
+  (row, name) => `${row}${name}{tier="disk",kind="checkpoint"} ${name.includes("discards") ? 3 : name.includes("spills") ? 4 : 0}\n${name}{tier="disk",kind="prefix"} ${name.includes("discards") ? 1 : name.includes("spills") ? 2 : 0}\n`,
+)}# HELP ignis_kv_disk_bytes The KV-disk tier: its effective budget, and the bytes the committed files hold.
+# TYPE ignis_kv_disk_bytes gauge
+ignis_kv_disk_bytes{state="capacity"} 107374182400
+ignis_kv_disk_bytes{state="used"} 26843545600
+# HELP ignis_kv_disk_spills_total Live sequences written into the disk tier, by where they came from.
+# TYPE ignis_kv_disk_spills_total counter
+ignis_kv_disk_spills_total{from="device"} 5
+ignis_kv_disk_spills_total{from="kv_ram"} 7
+# HELP ignis_kv_disk_failures_total Disk operations refused, by operation.
+# TYPE ignis_kv_disk_failures_total counter
+ignis_kv_disk_failures_total{op="write"} 1
+ignis_kv_disk_failures_total{op="read"} 0
+`;

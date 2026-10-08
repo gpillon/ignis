@@ -131,17 +131,18 @@ use crate::admission::{
     choose_resident_candidate_victim, choose_retained_lane_victim, make_admission_protection,
     persistent_backfill_is_safe, protected_head_safe_without_temporal, protection_frontier_distance,
 };
+use crate::disk::{DiskTier, disk_file_bytes};
 use crate::host::{
     DEFAULT_RETAINED_INTERACTIVE_TTL, HostEntry, HostTier, KvRamVictim, ResumePhase, RetainedBlob,
     RetainedKvRamEntry, Tier,
 };
-use crate::identity::{MediaKey, PromptContent, PromptKeys};
+use crate::identity::{MatchKey, MediaKey, PromptContent, PromptKeys};
 use crate::prefix::{PrefixCache, PrefixId, Retention, SpilledPrefixId};
 use crate::request::Request;
 use crate::retained_slot::{RetainedHolder, RetainedSkip, RetainedSlotLedger};
 use crate::scheduler::{
-    CheckpointClaim, Compute, DecodeJob, DecodeOutcome, Occupancy, PrefillJob, PrefillOutcome,
-    RetainedAt, Scheduler, SharedPrefixClaim,
+    CheckpointClaim, Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome,
+    DiskSource, DiskTarget, Occupancy, PrefillJob, PrefillOutcome, RetainedAt, Scheduler, SharedPrefixClaim,
 };
 use crate::types::{
     BackfillClass, BoundaryLifetime, ComputeError, DecisionRead, DecodeParams, EngineMode,
@@ -254,6 +255,15 @@ pub struct SchedulerConfig {
     /// thinking budget forces once spent (2026-09-24,
     /// [`crate::thinking_budget`]). `None` makes every budget inert.
     pub thinking_close: Option<Arc<crate::thinking_budget::ThinkingClose>>,
+    /// The KV-disk tier's byte budget (spec vram-budget/03, ADR 0045): the
+    /// load's effective one, `min(--kv-disk-bytes, volume free - margin)`.
+    /// 0 is no tier, and then the scheduler takes exactly the paths it took
+    /// before the tier existed.
+    pub kv_disk_capacity_bytes: u64,
+    /// The prompt tokens a retained match on KV-disk must reuse beyond the
+    /// best match above it (the family's restore floor,
+    /// [`crate::compute::ModelFamily::kv_disk_restore_floor_tokens`]).
+    pub kv_disk_restore_floor_tokens: u32,
 }
 
 /// The wall clock the scheduler reads (GitHub #190): `Instant::now` in
@@ -451,8 +461,83 @@ impl Default for SchedulerConfig {
             retained_slots: N_DECODE_LANES as u32,
             retained_interactive_ttl: DEFAULT_RETAINED_INTERACTIVE_TTL,
             thinking_close: None,
+            kv_disk_capacity_bytes: 0,
+            kv_disk_restore_floor_tokens: KV_DISK_RESTORE_FLOOR_TOKENS,
         }
     }
+}
+
+/// KV-disk's restore floor where no family names one (spec vram-budget/03):
+/// the 27B's, the larger of the two, since a load whose prefill speed is
+/// unknown should take the cautious one.
+pub const KV_DISK_RESTORE_FLOOR_TOKENS: u32 = 16_384;
+
+/// How long the disk tier takes no new write after one failed (spec
+/// vram-budget/03): a volume that just errored is not asked again on every
+/// step while the request that wanted the room waits.
+pub const KV_DISK_WRITE_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Whether a victim moved, and how (spec vram-budget/03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Moved {
+    /// It left the device in this call (into KV-RAM, synchronously).
+    Now,
+    /// A move is under way (to the disk, or KV-RAM making room by sending
+    /// something there): the room comes on a later advance, and the request
+    /// that needed it waits for it.
+    Started,
+    /// Nothing could move.
+    Nothing,
+}
+
+/// Whether KV-RAM can take a live snapshot (spec vram-budget/03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvRamRoom {
+    /// It can, now.
+    Made,
+    /// Not yet: something is on its way from KV-RAM to the disk.
+    Coming,
+    /// It cannot.
+    None,
+}
+
+/// Whether a blob KV-RAM gives up went to the disk (spec vram-budget/03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Demotion {
+    /// Its file is being written; KV-RAM keeps it until the file commits.
+    Started,
+    /// The disk is writing another file.
+    Busy,
+    /// The disk cannot take it.
+    Refused,
+}
+
+/// A spill to KV-disk under way, the scheduler's half (spec vram-budget/03):
+/// what the backend's report of it ending settles.
+#[derive(Debug, Clone, Copy)]
+enum Spill {
+    /// A live sequence leaving the device straight for the disk. It keeps its
+    /// pages, its resident slot and its lane until the file commits.
+    Device {
+        request: RequestId,
+        resume_phase: ResumePhase,
+        lane: Option<LaneId>,
+        restore_pages: u32,
+    },
+    /// A live snapshot leaving KV-RAM, which keeps it until the file commits.
+    KvRam { request: RequestId },
+    /// A retained blob leaving KV-RAM.
+    Retained { blob: RetainedBlob },
+}
+
+/// A restore from KV-disk under way (spec vram-budget/03): charged on the
+/// device, not yet schedulable.
+#[derive(Debug, Clone, Copy)]
+enum Restore {
+    /// A live sequence coming back, its lane already held.
+    Live { request: RequestId, lane: Option<LaneId> },
+    /// A checkpoint coming back into its claimant's own sequence.
+    Checkpoint { request: RequestId, checkpoint: crate::checkpoint::CheckpointId },
 }
 
 /// The concrete N=8 resident-lane scheduler (v1). See the module docs
@@ -522,6 +607,18 @@ pub struct ConcreteScheduler {
     clock: Clock,
     /// Until when the decode share holds the next prefill chunk (GitHub #306).
     prefill_held_until: Option<Instant>,
+    // ── KV-disk, Tier 2 (spec vram-budget/03, ADR 0045) ─────────────────
+    /// The disk tier's ledger, or `None` on a load without it.
+    disk: Option<DiskTier>,
+    /// The one spill and the one restore the tier keeps in flight (ADR
+    /// 0045: one request per direction), by the blob each moves.
+    spilling: Option<(DiskBlob, Spill)>,
+    restoring: Option<(DiskBlob, Restore)>,
+    /// Until when the tier takes no new write, after one failed.
+    disk_writes_paused_until: Option<Instant>,
+    /// Whether the tier is turning writes away; a refusal is logged and
+    /// counted once per entry into this state, not once per attempt.
+    disk_refusing: bool,
 }
 
 impl ConcreteScheduler {
@@ -594,14 +691,13 @@ impl ConcreteScheduler {
             retained: RetainedSlotLedger::new(config.retained_slots),
             reported_slots: 0,
             tail_pages: Vec::new(),
-            checkpoints: CheckpointPool::with_tiers(
-                compute.blob_identity(),
-                if config.prompt_reuse && config.host_capacity_bytes > 0 {
-                    TierList::device_and_kv_ram()
-                } else {
-                    TierList::device_only()
-                },
-            ),
+            checkpoints: CheckpointPool::with_tiers(compute.blob_identity(), Self::tier_list(&config)),
+            disk: (config.kv_disk_capacity_bytes > 0)
+                .then(|| DiskTier::new(config.kv_disk_capacity_bytes, config.retained_interactive_ttl)),
+            spilling: None,
+            restoring: None,
+            disk_writes_paused_until: None,
+            disk_refusing: false,
             config,
             compute,
             next_id: 0,
@@ -611,6 +707,44 @@ impl ConcreteScheduler {
             clock: Arc::new(Instant::now),
             prefill_held_until: None,
         }
+    }
+
+    /// The residency tiers retained state lives across: the device, then
+    /// KV-RAM when it has room, then KV-disk when the load has the tier (spec
+    /// vram-budget/03), each below the first with its restore floor. None
+    /// below the device with prompt reuse off.
+    fn tier_list(config: &SchedulerConfig) -> TierList {
+        if !config.prompt_reuse {
+            return TierList::device_only();
+        }
+        let mut tiers = vec![crate::checkpoint::ResidencyTier {
+            source: ReuseSource::Device,
+            restore_floor_tokens: 0,
+        }];
+        if config.host_capacity_bytes > 0 {
+            tiers.push(crate::checkpoint::ResidencyTier {
+                source: ReuseSource::KvRam,
+                restore_floor_tokens: KV_RAM_RESTORE_FLOOR_TOKENS,
+            });
+        }
+        if config.kv_disk_capacity_bytes > 0 {
+            tiers.push(crate::checkpoint::ResidencyTier {
+                source: ReuseSource::Disk,
+                restore_floor_tokens: config.kv_disk_restore_floor_tokens.max(1),
+            });
+        }
+        TierList::new(tiers)
+    }
+
+    /// The KV-disk tier's ledger (spec vram-budget/03), or `None` on a load
+    /// without it (telemetry / tests).
+    pub fn disk_tier(&self) -> Option<&DiskTier> {
+        self.disk.as_ref()
+    }
+
+    /// Whether a KV-disk transfer is under way (tests).
+    pub fn disk_busy(&self) -> bool {
+        self.spilling.is_some() || self.restoring.is_some()
     }
 
     /// Read wall time from `clock` instead of `Instant::now` (tests that need
@@ -992,6 +1126,17 @@ impl ConcreteScheduler {
                     self.compute.release_checkpoint(blob.publisher);
                 }
             }
+            // Spec vram-budget/03: its file goes, or -- claimed by a request
+            // whose restore has not landed -- goes when that claim lets go.
+            ReuseSource::Disk => {
+                let freed = self
+                    .disk
+                    .as_mut()
+                    .and_then(|disk| disk.held_mut().discard_retained(RetainedBlob::Checkpoint(entry.id)));
+                if let Some(blob) = freed {
+                    self.compute.disk_discard(DiskBlob::Checkpoint(blob.publisher));
+                }
+            }
         }
     }
 
@@ -1055,6 +1200,16 @@ impl ConcreteScheduler {
             return false;
         };
         for victim in victims {
+            // Spec vram-budget/03: with KV-disk the victim leaves for the
+            // disk instead of for nowhere. Its bytes are KV-RAM's until its
+            // file commits, so the newcomer has no room now: it is the bet
+            // given up, which retained state may always be (ADR 0029), and
+            // the next spill finds the room. A disk busy with another
+            // transfer keeps the victim for a later demotion the same way;
+            // only one the disk refuses goes for nowhere.
+            if self.demote_retained(victim, events) != Demotion::Refused {
+                return false;
+            }
             self.discard_kv_ram_blob(victim, events);
         }
         while !self.compute.host_blob_fits(bytes) {
@@ -1062,6 +1217,9 @@ impl ConcreteScheduler {
             let Some(blob) = self.host.next_retained_victim_below(owner, used_at, now) else {
                 return false;
             };
+            if self.demote_retained(blob, events) != Demotion::Refused {
+                return false;
+            }
             // Out of the tier first, then freed at the backend: the pair
             // `make_host_room_for_bytes` uses for the same job, and what
             // makes this loop shrink the tier on every turn.
@@ -1797,7 +1955,7 @@ impl ConcreteScheduler {
             .requests
             .iter()
             .enumerate()
-            .filter(|&(_, r)| r.state == RequestState::Prefilling && r.prefill_complete())
+            .filter(|&(_, r)| r.state == RequestState::Prefilling && r.prefill_complete() && !r.moving)
             .map(|(i, _)| i)
             .collect();
         queue.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
@@ -1929,6 +2087,10 @@ impl ConcreteScheduler {
             (r.lane, r.id, r.tokens, r.prefix_entry)
         };
         self.requests[idx].abort();
+        // Spec vram-budget/03: a transfer the request was in ends with it --
+        // abandoned at the backend, its file deleted, the disk ledger's
+        // charge lifted -- before the backend releases the sequence.
+        self.abandon_disk_transfer(idx);
         self.compute.release(request_id);
         // A request cancelled while evicted takes its snapshot out of the
         // host tier and frees its pinned blob: left there, the next restore
@@ -1936,7 +2098,14 @@ impl ConcreteScheduler {
         if self.host.discard_request(request_id).is_some() {
             self.compute.discard_snapshot(request_id);
         }
+        // So does one whose snapshot is on the disk.
+        if let Some(disk) = self.disk.as_mut()
+            && disk.held_mut().discard_request(request_id).is_some()
+        {
+            self.compute.disk_discard(DiskBlob::Live(request_id));
+        }
         self.release_kv_ram_claim(idx, false);
+        self.release_disk_claim(idx, false);
         if let Some(lane) = lane {
             self.free_lanes.push(lane);
         }
@@ -2140,7 +2309,7 @@ impl ConcreteScheduler {
             .unwrap_or_default();
         self.requests
             .iter()
-            .filter(|r| r.state == RequestState::Running)
+            .filter(|r| r.state == RequestState::Running && !r.moving)
             .filter(|r| !donors.contains(&r.id))
             .map(|r| RetainedLaneCandidate {
                 lane: r.lane.expect("a running request holds a lane"),
@@ -2178,6 +2347,7 @@ impl ConcreteScheduler {
                 Some(*i) != exclude
                     && r.state == RequestState::Prefilling
                     && r.resident
+                    && !r.moving
             })
             .map(|(_, r)| ResidentCandidate { request_id: r.id, owner: r.class })
             .collect();
@@ -2214,6 +2384,7 @@ impl ConcreteScheduler {
         // GitHub #190: a KV-RAM blob it never restored from is not its to hold
         // across a fresh prefill.
         self.release_kv_ram_claim(idx, false);
+        self.release_disk_claim(idx, false);
         let r = &mut self.requests[idx];
         // core-07: capture the shared-prefix claim (the `requeue()` below
         // resets it; a re-queued request re-prefills from the start and
@@ -2255,7 +2426,17 @@ impl ConcreteScheduler {
     /// [`Compute::host_blob_fits`] is what knows the difference, and the same
     /// victim order runs for a fragmented arena as for a full budget — down
     /// to an empty tier, whose `false` is how the evict does not happen.
-    fn make_host_room_for_bytes(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> bool {
+    ///
+    /// Spec vram-budget/03: on a load with KV-disk nothing live leaves KV-RAM
+    /// for nowhere. A victim is moved to the disk instead -- live always,
+    /// retained when it outranks the disk's lowest file, else discarded as
+    /// before -- and since its bytes are KV-RAM's until its file commits,
+    /// the room is [`KvRamRoom::Coming`], not made. When nothing can move,
+    /// the answer is [`KvRamRoom::None`] and nothing was discarded.
+    fn make_host_room_for_bytes(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> KvRamRoom {
+        if self.disk.is_some() {
+            return self.make_host_room_moving(bytes, events);
+        }
         while self.host.used_bytes() + bytes > self.host.capacity_bytes()
             || !self.compute.host_blob_fits(bytes)
         {
@@ -2277,10 +2458,39 @@ impl ConcreteScheduler {
                         self.requeue_request(idx, events);
                     }
                 }
-                None => return false, // the tier is empty (nothing to evict)
+                None => return KvRamRoom::None, // the tier is empty (nothing to evict)
             }
         }
-        true
+        KvRamRoom::Made
+    }
+
+    /// [`Self::make_host_room_for_bytes`] on a load with KV-disk.
+    fn make_host_room_moving(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> KvRamRoom {
+        loop {
+            if self.host.used_bytes() + bytes <= self.host.capacity_bytes() && self.compute.host_blob_fits(bytes) {
+                return KvRamRoom::Made;
+            }
+            if bytes > self.host.capacity_bytes() {
+                return KvRamRoom::None;
+            }
+            let now = self.now();
+            match self.host.peek_for_live(now) {
+                None if self.host.is_moving() => return KvRamRoom::Coming,
+                None => return KvRamRoom::None,
+                Some(KvRamVictim::Retained(entry)) => match self.demote_retained(entry.blob, events) {
+                    Demotion::Started | Demotion::Busy => return KvRamRoom::Coming,
+                    Demotion::Refused => {
+                        if let Some(entry) = self.host.discard_retained(entry.blob) {
+                            self.forget_kv_ram_blob(entry, events);
+                        }
+                    }
+                },
+                Some(KvRamVictim::Live(entry)) => match self.demote_live(entry.request, events) {
+                    Demotion::Started | Demotion::Busy => return KvRamRoom::Coming,
+                    Demotion::Refused => return KvRamRoom::None,
+                },
+            }
+        }
     }
 
     /// Snapshot `v_idx` to the host tier and release its GPU-resident state
@@ -2295,13 +2505,18 @@ impl ConcreteScheduler {
     /// construction for either caller — a host-tier byte budget that
     /// cannot be freed, or a leaf-level failure) — the caller leaves the
     /// candidate exactly as it was.
+    ///
+    /// Spec vram-budget/03: on a load with KV-disk the victim goes to KV-RAM
+    /// when it can make room, waits while KV-RAM sends something to the disk
+    /// for it, or goes straight to the disk when KV-RAM cannot take it at all
+    /// -- [`Moved::Started`] for either of the last two.
     fn snapshot_and_evict(
         &mut self,
         v_idx: usize,
         resume_phase: ResumePhase,
         lane: Option<LaneId>,
         events: &mut Vec<SchedEvent>,
-    ) -> bool {
+    ) -> Moved {
         let (v_id, v_class, v_pages, v_tokens, v_progress, v_work, v_gdn, v_prefix) = {
             let v = &self.requests[v_idx];
             (
@@ -2333,7 +2548,7 @@ impl ConcreteScheduler {
         // construction rather than by timing, the same invariant the
         // leaf's own `NOT_AT_BOUNDARY` refusal exists for.
         if !v_gdn.is_valid_snapshot_point(v_gdn.position()) {
-            return false;
+            return Moved::Nothing;
         }
         // Query the real snapshot size *before* moving or releasing
         // anything (`Compute::snapshot_size` is a cheap, non-destructive
@@ -2343,11 +2558,15 @@ impl ConcreteScheduler {
         // than releasing its GPU state for nothing.
         let bytes = match self.compute.snapshot_size(v_id) {
             Ok(bytes) => bytes,
-            Err(_) => return false, // refused (unreachable per the boundary note above)
+            Err(_) => return Moved::Nothing, // refused (unreachable per the boundary note above)
         };
         // Make room in the host tier (re-queueing any discarded snapshot).
-        if !self.make_host_room_for_bytes(bytes, events) {
-            return false; // the host tier cannot hold the snapshot
+        match self.make_host_room_for_bytes(bytes, events) {
+            KvRamRoom::Made => {}
+            KvRamRoom::Coming => return Moved::Started,
+            KvRamRoom::None => {
+                return self.spill_to_disk(v_idx, resume_phase, lane, restore_pages, bytes, events);
+            }
         }
         // Snapshot to pinned host memory and release the GPU sequence (its
         // KV pages, GDN slot and conv taps) — nothing else runs between the
@@ -2355,7 +2574,7 @@ impl ConcreteScheduler {
         // so `evict` cannot fail where `snapshot_size` just succeeded.
         let started = Instant::now();
         let Ok(bytes) = self.compute.evict(v_id) else {
-            return false;
+            return Moved::Nothing;
         };
         let snapshot_micros = started.elapsed().as_micros() as u64;
         let entry = HostEntry {
@@ -2378,6 +2597,22 @@ impl ConcreteScheduler {
         self.host
             .capture(entry)
             .expect("room was made for `bytes` and the boundary was already checked");
+        self.leave_device(v_idx, resume_phase, lane, restore_pages);
+        events.push(SchedEvent::Evicted {
+            request: v_id,
+            snapshot_micros,
+        });
+        Moved::Now
+    }
+
+    /// The scheduler's half of a victim leaving the device, wherever it went
+    /// (GitHub #125; spec vram-budget/03): its lifecycle, its lane, its
+    /// charges and its prefix claim.
+    fn leave_device(&mut self, v_idx: usize, resume_phase: ResumePhase, lane: Option<LaneId>, restore_pages: u32) {
+        let (v_id, v_progress, v_prefix) = {
+            let v = &self.requests[v_idx];
+            (v.id, v.prefill_progress, v.prefix_entry)
+        };
         match resume_phase {
             ResumePhase::Running => {
                 self.requests[v_idx].evict();
@@ -2421,11 +2656,6 @@ impl ConcreteScheduler {
         if self.protection.as_ref().map(|p| p.head_request_id) == Some(v_id) {
             self.protection = None;
         }
-        events.push(SchedEvent::Evicted {
-            request: v_id,
-            snapshot_micros,
-        });
-        true
     }
 
     /// Evict the single lowest-value eligible victim (core-06, GitHub
@@ -2438,7 +2668,11 @@ impl ConcreteScheduler {
     /// materialization gate, which can never self-select since it is still
     /// `Admitted`, never `Prefilling`, at that point). Returns `true` when
     /// a victim was evicted, `false` when none remains eligible.
-    fn evict_one_victim(&mut self, exclude: Option<usize>, events: &mut Vec<SchedEvent>) -> bool {
+    ///
+    /// Spec vram-budget/03: [`Moved::Started`] when the victim's move takes
+    /// more than this call -- the caller waits for it rather than choosing
+    /// another.
+    fn evict_one_victim(&mut self, exclude: Option<usize>, events: &mut Vec<SchedEvent>) -> Moved {
         // `exclude` (when set) is always `Prefilling` (the blocked head
         // `try_evict_for_head` is evaluating), so it can never be a
         // `Running`-lane candidate in the first place — nothing to guard
@@ -2451,14 +2685,14 @@ impl ConcreteScheduler {
                 .iter()
                 .position(|r| r.lane == Some(victim_lane))
             else {
-                return false;
+                return Moved::Nothing;
             };
             return self.snapshot_and_evict(v_idx, ResumePhase::Running, Some(victim_lane), events);
         }
         if let Some(v_idx) = self.prefilling_eviction_candidate(exclude) {
             return self.snapshot_and_evict(v_idx, ResumePhase::Prefilling, None, events);
         }
-        false
+        Moved::Nothing
     }
 
     /// Make room for `needed` additional resources on top of what is
@@ -2482,7 +2716,10 @@ impl ConcreteScheduler {
             if used.add(needed).fits(&self.capacity) {
                 return true;
             }
-            if !self.evict_one_victim(None, events) {
+            // Spec vram-budget/03: one move at a time. While one is under
+            // way the room it makes is coming, and choosing a second victim
+            // would move work nobody needs moved yet.
+            if self.spilling.is_some() || self.evict_one_victim(None, events) != Moved::Now {
                 return false;
             }
         }
@@ -2503,8 +2740,10 @@ impl ConcreteScheduler {
             // matches `prefilling_eviction_candidate`'s own filter —
             // excluded here so the head is never evicted to make room for
             // itself.
-            if !self.evict_one_victim(Some(head_idx), events) {
-                return false; // no evictable victim (all reserved / none)
+            // No evictable victim (all reserved / none), or one on its way
+            // (spec vram-budget/03): the head waits.
+            if self.spilling.is_some() || self.evict_one_victim(Some(head_idx), events) != Moved::Now {
+                return false;
             }
             // Loop: re-check whether the head now fits.
         }
@@ -2588,6 +2827,656 @@ impl ConcreteScheduler {
                     self.requeue_request(idx, events);
                     // Loop: try the next victim.
                 }
+            }
+        }
+        // Spec vram-budget/03: then the disk's live blobs, which have no
+        // floor -- they come back whenever there is room.
+        self.restore_from_disk(events);
+    }
+}
+
+// ── KV-disk, Tier 2 (spec vram-budget/03, ADR 0045) ─────────────────────
+//
+// The tier is two transfers at most -- one spill, one restore (ADR 0045: one
+// request per direction) -- each started by the chain above and advanced a
+// window at a time by `disk_pass`, which settles what ended at the top of the
+// next advance. Everything in between is a request marked `moving`: in no
+// batch, no round, nobody's victim, its charges where they were.
+
+impl ConcreteScheduler {
+    /// `m`, if a request can claim it now: a KV-RAM blob on its way to the
+    /// disk is out of reach until its file commits (spec vram-budget/03).
+    fn claimable(&self, m: Option<crate::checkpoint::CheckpointMatch>) -> Option<crate::checkpoint::CheckpointMatch> {
+        m.filter(|m| match m.source {
+            ReuseSource::Device => true,
+            ReuseSource::KvRam => self.host.retained(RetainedBlob::Checkpoint(m.id)).is_some(),
+            ReuseSource::Disk => self
+                .disk
+                .as_ref()
+                .is_some_and(|disk| disk.held().retained(RetainedBlob::Checkpoint(m.id)).is_some()),
+        })
+    }
+
+    /// Whether the tier takes no new write right now, after one failed.
+    fn disk_writes_paused(&self) -> bool {
+        self.disk_writes_paused_until.is_some_and(|until| self.now() < until)
+    }
+
+    /// The volume turned a write away: its margin, or a store refusing.
+    /// Counted and logged once per entry into the refusing state, not once
+    /// per attempt -- a request waiting for room asks on every advance.
+    fn refuse_disk_write(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) {
+        if self.disk_refusing {
+            return;
+        }
+        self.disk_refusing = true;
+        events.push(SchedEvent::DiskFailure { op: DiskOp::Write });
+        // hotpath-lint-allow: once per entry into the refusing state, never per step (spec vram-budget/03 AC 14).
+        tracing::warn!(
+            name: "ignis.kv_disk.write_refused",
+            bytes,
+            "KV-disk refused a write: the volume would cross its margin, or the store is refusing"
+        );
+    }
+
+    /// Room on the disk for a live blob of `bytes`: retained files given up
+    /// for it, the volume asked. `false` (nothing given up) when the ledger
+    /// cannot make the room out of retained files, or the volume refuses.
+    fn make_disk_room_for_live(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> bool {
+        let now = self.now();
+        let Some(victims) = self
+            .disk
+            .as_ref()
+            .and_then(|disk| disk.plan_live_room(disk_file_bytes(bytes), now))
+        else {
+            return false;
+        };
+        if !self.compute.disk_fits(bytes) {
+            self.refuse_disk_write(bytes, events);
+            return false;
+        }
+        for blob in victims {
+            self.forget_disk_blob(blob, events);
+        }
+        true
+    }
+
+    /// Start a spill and record it: the ledger charges its file from now.
+    fn start_spill(
+        &mut self,
+        blob: DiskBlob,
+        from: DiskSource,
+        meta: DiskBlobMeta,
+        spill: Spill,
+    ) -> bool {
+        let Ok(blob_bytes) = self.compute.disk_spill(blob, from, meta) else {
+            return false;
+        };
+        if let Some(disk) = self.disk.as_mut() {
+            disk.begin_landing(blob, disk_file_bytes(blob_bytes));
+        }
+        self.disk_refusing = false;
+        self.spilling = Some((blob, spill));
+        true
+    }
+
+    /// Send device victim `v_idx` straight to the disk: KV-RAM cannot take
+    /// it (no arena, a blob larger than it, nothing in it that can move).
+    /// The victim keeps its pages, slot and lane until the file commits.
+    fn spill_to_disk(
+        &mut self,
+        v_idx: usize,
+        resume_phase: ResumePhase,
+        lane: Option<LaneId>,
+        restore_pages: u32,
+        bytes: u64,
+        events: &mut Vec<SchedEvent>,
+    ) -> Moved {
+        if self.disk.is_none() || self.disk_writes_paused() {
+            return Moved::Nothing;
+        }
+        if self.spilling.is_some() {
+            return Moved::Started;
+        }
+        if !self.make_disk_room_for_live(bytes, events) {
+            return Moved::Nothing;
+        }
+        let (request, tokens) = {
+            let v = &self.requests[v_idx];
+            (v.id, v.gdn.position() as u32)
+        };
+        let meta = DiskBlobMeta {
+            key: MatchKey::empty(),
+            tokens,
+        };
+        let spill = Spill::Device {
+            request,
+            resume_phase,
+            lane,
+            restore_pages,
+        };
+        if !self.start_spill(DiskBlob::Live(request), DiskSource::Device, meta, spill) {
+            return Moved::Nothing;
+        }
+        self.requests[v_idx].moving = true;
+        Moved::Started
+    }
+
+    /// Move KV-RAM's live snapshot of `request` to the disk, to make room in
+    /// KV-RAM for a device victim. Never discarded: when the disk cannot take
+    /// it, it stays.
+    fn demote_live(&mut self, request: RequestId, events: &mut Vec<SchedEvent>) -> Demotion {
+        if self.disk_writes_paused() {
+            return Demotion::Refused;
+        }
+        if self.spilling.is_some() {
+            return Demotion::Busy;
+        }
+        let Some((bytes, tokens)) = self.host.entry(request).map(|e| (e.bytes, e.gdn.position() as u32)) else {
+            return Demotion::Refused;
+        };
+        if !self.make_disk_room_for_live(bytes, events) {
+            return Demotion::Refused;
+        }
+        let meta = DiskBlobMeta {
+            key: MatchKey::empty(),
+            tokens,
+        };
+        if !self.start_spill(DiskBlob::Live(request), DiskSource::KvRam, meta, Spill::KvRam { request }) {
+            return Demotion::Refused;
+        }
+        self.host.begin_move_live(request);
+        if let Some(idx) = self.requests.iter().position(|r| r.id == request) {
+            self.requests[idx].moving = true;
+        }
+        Demotion::Started
+    }
+
+    /// Move KV-RAM's retained `blob` to the disk, when it outranks the
+    /// disk's lowest file: `Refused` otherwise, and the caller discards it as
+    /// it always did. A prefix is not moved: nothing would bring it back
+    /// (spec vram-budget/03 builds the return of checkpoints).
+    fn demote_retained(&mut self, blob: RetainedBlob, events: &mut Vec<SchedEvent>) -> Demotion {
+        if self.disk.is_none()
+            || self.checkpoints.tiers().rank(ReuseSource::Disk).is_none()
+            || self.disk_writes_paused()
+        {
+            return Demotion::Refused;
+        }
+        if self.spilling.is_some() {
+            return Demotion::Busy;
+        }
+        let RetainedBlob::Checkpoint(id) = blob else {
+            return Demotion::Refused;
+        };
+        let Some(entry) = self.host.retained(blob).cloned() else {
+            return Demotion::Refused;
+        };
+        let Some((key, tokens)) = self
+            .checkpoints
+            .entries()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (e.key, e.tokens))
+        else {
+            return Demotion::Refused;
+        };
+        let now = self.now();
+        let Some(victims) = self.disk.as_ref().and_then(|disk| {
+            disk.plan_retained_room(disk_file_bytes(entry.bytes), entry.owner, entry.used_at, now)
+        }) else {
+            return Demotion::Refused;
+        };
+        if !self.compute.disk_fits(entry.bytes) {
+            self.refuse_disk_write(entry.bytes, events);
+            return Demotion::Refused;
+        }
+        for victim in victims {
+            self.forget_disk_blob(victim, events);
+        }
+        let meta = DiskBlobMeta { key, tokens };
+        if !self.start_spill(DiskBlob::Checkpoint(entry.publisher), DiskSource::KvRam, meta, Spill::Retained { blob }) {
+            return Demotion::Refused;
+        }
+        self.host.begin_move_retained(blob);
+        Demotion::Started
+    }
+
+    /// Delete the retained disk file `blob` to make room, and what names it.
+    fn forget_disk_blob(&mut self, blob: RetainedBlob, events: &mut Vec<SchedEvent>) {
+        let Some(entry) = self.disk.as_mut().and_then(|disk| disk.held_mut().discard_retained(blob)) else {
+            return;
+        };
+        self.forget_disk_entry(entry, events);
+    }
+
+    /// A retained disk entry already out of the ledger: drop what names it,
+    /// delete its file, report the discard.
+    fn forget_disk_entry(&mut self, entry: RetainedKvRamEntry, events: &mut Vec<SchedEvent>) {
+        let kind = entry.blob.kind();
+        match entry.blob {
+            RetainedBlob::Checkpoint(id) => {
+                self.checkpoints.discard(id);
+                self.compute.disk_discard(DiskBlob::Checkpoint(entry.publisher));
+            }
+            RetainedBlob::Prefix(id) => {
+                if let Some(spilled) = self.prefix.forget_spilled(id) {
+                    self.compute
+                        .disk_discard(DiskBlob::Prefix(spilled.publisher, spilled.length_tokens));
+                }
+            }
+        }
+        events.push(SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Discard,
+            source: ReuseSource::Disk,
+            kind,
+        });
+    }
+
+    /// Let go of `idx`'s claim on a disk checkpoint, if it holds one;
+    /// `restored` says whether the restore landed, which promotes the file.
+    fn release_disk_claim(&mut self, idx: usize, restored: bool) {
+        let Some(checkpoint) = self.requests[idx].disk_claim.take() else {
+            return;
+        };
+        let restored_at = restored.then(|| self.now());
+        let freed = self.disk.as_mut().and_then(|disk| {
+            disk.held_mut()
+                .release_retained_claim(RetainedBlob::Checkpoint(checkpoint), restored_at)
+        });
+        if let Some(blob) = freed {
+            self.compute.disk_discard(DiskBlob::Checkpoint(blob.publisher));
+        }
+    }
+
+    /// Bring the disk's next live blob back, when the room is there (spec
+    /// vram-budget/03 AC 19: a live blob has no floor). It is charged now --
+    /// pages, resident slot, its lane -- and schedulable when it lands.
+    fn restore_from_disk(&mut self, events: &mut Vec<SchedEvent>) {
+        if self.restoring.is_some() {
+            return;
+        }
+        let Some(victim) = self.disk.as_ref().and_then(|disk| disk.held().victim().cloned()) else {
+            return;
+        };
+        if victim.resume_phase == ResumePhase::Running && self.free_lanes.is_empty() {
+            return;
+        }
+        if self.resident_slots_used + 1 > self.capacity.resident_slots
+            || self.kv_used_pages + victim.pages > self.capacity.kv_pages
+        {
+            return;
+        }
+        let Some(idx) = self.requests.iter().position(|r| r.id == victim.request) else {
+            return;
+        };
+        let context_tokens = sequence_tokens(&self.config, &self.requests[idx].input);
+        let into = DiskTarget::Sequence {
+            request: victim.request,
+            context_tokens,
+        };
+        if self.compute.disk_restore(DiskBlob::Live(victim.request), into).is_err() {
+            self.lose_live_disk_blob(idx, events);
+            return;
+        }
+        let lane = match victim.resume_phase {
+            ResumePhase::Running => self.free_lanes.pop(),
+            ResumePhase::Prefilling => None,
+        };
+        self.materialize(idx);
+        self.requests[idx].moving = true;
+        if let Some(disk) = self.disk.as_mut() {
+            disk.held_mut().begin_move_live(victim.request);
+        }
+        self.restoring = Some((DiskBlob::Live(victim.request), Restore::Live { request: victim.request, lane }));
+    }
+
+    /// Bring claimant `idx`'s disk checkpoint back into its own sequence,
+    /// charged now (the gate in `advance` made the room).
+    fn restore_checkpoint_from_disk(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
+        if self.restoring.is_some() {
+            return;
+        }
+        let (request, publisher, checkpoint) = {
+            let r = &self.requests[idx];
+            match (r.checkpoint_publisher, r.disk_claim) {
+                (Some(publisher), Some(checkpoint)) => (r.id, publisher, checkpoint),
+                _ => return,
+            }
+        };
+        let into = DiskTarget::Sequence {
+            request,
+            context_tokens: sequence_tokens(&self.config, &self.requests[idx].input),
+        };
+        if self.compute.disk_restore(DiskBlob::Checkpoint(publisher), into).is_err() {
+            self.lose_disk_checkpoint(idx, checkpoint, events);
+            return;
+        }
+        self.materialize(idx);
+        self.requests[idx].moving = true;
+        self.restoring = Some((DiskBlob::Checkpoint(publisher), Restore::Checkpoint { request, checkpoint }));
+    }
+
+    /// The scheduler's half of a transfer `idx` is in, when the request goes
+    /// (spec vram-budget/03 AC 21): abandoned at the backend, its file
+    /// deleted, the ledgers as they were before the transfer. The caller
+    /// releases the request's charges as for any other.
+    fn abandon_disk_transfer(&mut self, idx: usize) {
+        let request = self.requests[idx].id;
+        if let Some((blob, spill)) = self.spilling {
+            let mine = match spill {
+                Spill::Device { request: r, lane, .. } => {
+                    // Its lane is still the request's own; the release
+                    // gives it back.
+                    let _ = lane;
+                    r == request
+                }
+                Spill::KvRam { request: r } => r == request,
+                Spill::Retained { .. } => false,
+            };
+            if mine {
+                self.compute.disk_discard(blob);
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.end_landing(blob);
+                }
+                self.host.end_move_live(request);
+                self.spilling = None;
+            }
+        }
+        if let Some((blob, restore)) = self.restoring {
+            match restore {
+                Restore::Live { request: r, lane } if r == request => {
+                    self.compute.disk_discard(blob);
+                    if let Some(disk) = self.disk.as_mut() {
+                        disk.held_mut().end_move_live(request);
+                    }
+                    if let Some(lane) = lane {
+                        self.free_lanes.push(lane);
+                    }
+                    self.restoring = None;
+                }
+                Restore::Checkpoint { request: r, .. } if r == request => {
+                    // The file is a retained one, and stays: the claim lets
+                    // go of it below, with the request.
+                    self.compute.disk_abandon_restore(request);
+                    self.restoring = None;
+                }
+                _ => {}
+            }
+        }
+        self.requests[idx].moving = false;
+    }
+
+    /// A live blob whose file cannot be read back (a torn, corrupt or foreign
+    /// file, or a refused read): never restored. Its request re-prefills, with
+    /// an ERROR (spec vram-budget/03 AC 15).
+    fn lose_live_disk_blob(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
+        let request = self.requests[idx].id;
+        if let Some(disk) = self.disk.as_mut() {
+            disk.held_mut().end_move_live(request);
+            disk.held_mut().discard_request(request);
+        }
+        self.compute.disk_discard(DiskBlob::Live(request));
+        events.push(SchedEvent::DiskFailure { op: DiskOp::Read });
+        // hotpath-lint-allow: failure-only path (a disk file that failed its check), reviewed exception (spec vram-budget/03 AC 15).
+        tracing::error!(
+            name: "ignis.kv_disk.read_refused",
+            request_id = request,
+            "a live KV-disk blob failed its check and is not restored; the request prefills again"
+        );
+        self.requeue_request(idx, events);
+    }
+
+    /// A disk checkpoint whose file cannot be read back: discarded, and its
+    /// claimant starts over -- it looks again on the next advance, and
+    /// prefills what nothing else holds (spec vram-budget/03 AC 15).
+    fn lose_disk_checkpoint(&mut self, idx: usize, checkpoint: crate::checkpoint::CheckpointId, events: &mut Vec<SchedEvent>) {
+        self.release_disk_claim(idx, false);
+        if let Some(entry) = self.checkpoints.discard(checkpoint) {
+            self.discard_checkpoint(entry, events);
+        }
+        events.push(SchedEvent::DiskFailure { op: DiskOp::Read });
+        // hotpath-lint-allow: failure-only path (a disk file that failed its check), reviewed exception (spec vram-budget/03 AC 15).
+        tracing::error!(
+            name: "ignis.kv_disk.read_refused",
+            request_id = self.requests[idx].id,
+            checkpoint,
+            "a retained KV-disk checkpoint failed its check and is discarded"
+        );
+        self.unmaterialize(idx);
+        let full_pages = u64::from(sequence_tokens(&self.config, &self.requests[idx].input))
+            .div_ceil(self.config.kv_page_tokens as u64) as u32;
+        let r = &mut self.requests[idx];
+        r.moving = false;
+        r.checkpoint_publisher = None;
+        r.checkpoint_entry = None;
+        r.checkpoint_tokens = 0;
+        r.reuse_source = None;
+        r.standalone_tokens = 0;
+        r.prefill_progress = 0;
+        r.gdn = crate::gdn::GdnState::new();
+        r.resources.kv_pages = full_pages;
+    }
+
+    /// Settle what the disk tier's transfers did since the last advance.
+    fn disk_pass(&mut self, events: &mut Vec<SchedEvent>) {
+        if self.disk.is_none() {
+            return;
+        }
+        for event in self.compute.disk_advance() {
+            self.disk_event(event, events);
+        }
+    }
+
+    fn disk_event(&mut self, event: DiskEvent, events: &mut Vec<SchedEvent>) {
+        if let Some((blob, spill)) = self.spilling
+            && blob == event.blob
+        {
+            self.spilling = None;
+            if let Some(disk) = self.disk.as_mut() {
+                disk.end_landing(blob);
+            }
+            match event.outcome {
+                DiskOutcome::Spilled { bytes } => self.spilled(spill, bytes, events),
+                _ => self.spill_failed(spill, events),
+            }
+            return;
+        }
+        if let Some((blob, restore)) = self.restoring
+            && blob == event.blob
+        {
+            self.restoring = None;
+            match event.outcome {
+                DiskOutcome::Restored { micros } => self.restored(restore, micros, events),
+                _ => self.restore_failed(restore, events),
+            }
+        }
+        // Anything else is a transfer this scheduler already abandoned.
+    }
+
+    /// A spill's file committed: its source gives its bytes up, and the
+    /// ledger holds the file.
+    fn spilled(&mut self, spill: Spill, bytes: u64, events: &mut Vec<SchedEvent>) {
+        let tick = self.tick;
+        match spill {
+            Spill::Device {
+                request,
+                resume_phase,
+                lane,
+                restore_pages,
+            } => {
+                let Some(idx) = self.requests.iter().position(|r| r.id == request) else {
+                    return;
+                };
+                let entry = {
+                    let r = &self.requests[idx];
+                    HostEntry {
+                        request,
+                        resume_phase,
+                        lane,
+                        owner: r.class,
+                        pages: restore_pages,
+                        bytes,
+                        tokens: r.tokens,
+                        prefill_progress: r.prefill_progress,
+                        remaining_work: r.remaining_work,
+                        gdn: r.gdn.clone(),
+                        tier: Tier::Probation,
+                        use_tick: tick,
+                    }
+                };
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.commit_live(entry)
+                        .expect("the spill's room was made when it started, and its charge just lifted");
+                }
+                self.requests[idx].moving = false;
+                self.leave_device(idx, resume_phase, lane, restore_pages);
+                events.push(SchedEvent::DiskSpilled {
+                    request,
+                    from: DiskSource::Device,
+                });
+            }
+            Spill::KvRam { request } => {
+                self.host.end_move_live(request);
+                let Some(mut entry) = self.host.discard_request(request) else {
+                    return;
+                };
+                entry.bytes = bytes;
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.commit_live(entry)
+                        .expect("the spill's room was made when it started, and its charge just lifted");
+                }
+                if let Some(idx) = self.requests.iter().position(|r| r.id == request) {
+                    self.requests[idx].moving = false;
+                }
+                events.push(SchedEvent::DiskSpilled {
+                    request,
+                    from: DiskSource::KvRam,
+                });
+            }
+            Spill::Retained { blob } => {
+                self.host.end_move_retained(blob);
+                let Some(mut entry) = self.host.discard_retained(blob) else {
+                    return;
+                };
+                entry.bytes = bytes;
+                if let RetainedBlob::Checkpoint(id) = blob {
+                    let _ = self.checkpoints.move_to_tier(id, ReuseSource::Disk);
+                }
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.commit_retained(entry)
+                        .expect("the spill's room was made when it started, and its charge just lifted");
+                }
+                events.push(SchedEvent::RetainedState {
+                    operation: RetainedStateOperation::Spill,
+                    source: ReuseSource::Disk,
+                    kind: blob.kind(),
+                });
+            }
+        }
+    }
+
+    /// A spill failed: nothing was lost, the blob is where it was, and the
+    /// tier takes no new write for a moment (spec vram-budget/03 AC 20).
+    fn spill_failed(&mut self, spill: Spill, events: &mut Vec<SchedEvent>) {
+        match spill {
+            Spill::Device { request, .. } => {
+                if let Some(idx) = self.requests.iter().position(|r| r.id == request) {
+                    self.requests[idx].moving = false;
+                }
+            }
+            Spill::KvRam { request } => {
+                self.host.end_move_live(request);
+                if let Some(idx) = self.requests.iter().position(|r| r.id == request) {
+                    self.requests[idx].moving = false;
+                }
+            }
+            Spill::Retained { blob } => self.host.end_move_retained(blob),
+        }
+        self.disk_writes_paused_until = Some(self.now() + KV_DISK_WRITE_BACKOFF);
+        events.push(SchedEvent::DiskFailure { op: DiskOp::Write });
+        // hotpath-lint-allow: failure-only path (a disk write that failed), reviewed exception (spec vram-budget/03 AC 14).
+        tracing::warn!(
+            name: "ignis.kv_disk.write_failed",
+            "a KV-disk write failed; the blob stays where it was"
+        );
+    }
+
+    /// A restore landed: the request is schedulable again.
+    fn restored(&mut self, restore: Restore, micros: u64, events: &mut Vec<SchedEvent>) {
+        match restore {
+            Restore::Live { request, lane } => {
+                let Some(idx) = self.requests.iter().position(|r| r.id == request) else {
+                    return;
+                };
+                let entry = self.disk.as_mut().and_then(|disk| {
+                    disk.held_mut().end_move_live(request);
+                    disk.held_mut().restore(request)
+                });
+                self.requests[idx].moving = false;
+                match lane {
+                    Some(lane) => {
+                        self.requests[idx].restore_lane(lane);
+                    }
+                    None => {
+                        if let Some(entry) = entry {
+                            self.requests[idx].prefill_progress = entry.prefill_progress;
+                        }
+                        self.requests[idx].restore_prefilling();
+                    }
+                }
+                events.push(SchedEvent::Restored {
+                    request,
+                    lane,
+                    restore_micros: micros,
+                });
+            }
+            Restore::Checkpoint { request, .. } => {
+                let Some(idx) = self.requests.iter().position(|r| r.id == request) else {
+                    return;
+                };
+                self.release_disk_claim(idx, true);
+                let tokens = self.requests[idx].checkpoint_tokens;
+                let r = &mut self.requests[idx];
+                r.moving = false;
+                // The sequence stands at the opener already: its first job
+                // carries no claim, only its tail.
+                r.checkpoint_publisher = None;
+                events.push(SchedEvent::StateReused {
+                    request,
+                    source: ReuseSource::Disk,
+                    tokens,
+                    restore_micros: micros,
+                    kind: RetainedKind::Checkpoint,
+                });
+                events.push(SchedEvent::RetainedState {
+                    operation: RetainedStateOperation::Restore,
+                    source: ReuseSource::Disk,
+                    kind: RetainedKind::Checkpoint,
+                });
+            }
+        }
+    }
+
+    /// A restore failed its check: never restored.
+    fn restore_failed(&mut self, restore: Restore, events: &mut Vec<SchedEvent>) {
+        match restore {
+            Restore::Live { request, lane } => {
+                let Some(idx) = self.requests.iter().position(|r| r.id == request) else {
+                    return;
+                };
+                if let Some(lane) = lane {
+                    self.free_lanes.push(lane);
+                }
+                self.unmaterialize(idx);
+                self.requests[idx].moving = false;
+                self.lose_live_disk_blob(idx, events);
+            }
+            Restore::Checkpoint { request, checkpoint } => {
+                let Some(idx) = self.requests.iter().position(|r| r.id == request) else {
+                    return;
+                };
+                self.lose_disk_checkpoint(idx, checkpoint, events);
             }
         }
     }
@@ -2833,6 +3722,11 @@ impl Scheduler for ConcreteScheduler {
             self.release_request(idx);
         }
 
+        // Spec vram-budget/03: KV-disk moves a window per transfer per
+        // advance, and settles what ended -- before anything below decides
+        // what fits.
+        self.disk_pass(&mut events);
+
         // Phase 1 — chunked, interleaved prefill (P3-01, ADR 0018): at
         // most one `prefill_step` call this tick. Exactly one request may
         // hold multi-tick (device-resident) prefill progress at a time —
@@ -2844,7 +3738,7 @@ impl Scheduler for ConcreteScheduler {
         let active = self
             .requests
             .iter()
-            .position(|r| !held && r.state == RequestState::Prefilling && !r.prefill_complete());
+            .position(|r| !held && r.state == RequestState::Prefilling && !r.prefill_complete() && !r.moving);
         let batch: Vec<usize> = match active {
             Some(idx) => vec![idx],
             None => {
@@ -2852,7 +3746,7 @@ impl Scheduler for ConcreteScheduler {
                     .requests
                     .iter()
                     .enumerate()
-                    .filter(|&(_, r)| !held && r.state == RequestState::Admitted)
+                    .filter(|&(_, r)| !held && r.state == RequestState::Admitted && !r.moving)
                     .map(|(i, _)| i)
                     .collect();
                 b.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
@@ -2876,8 +3770,11 @@ impl Scheduler for ConcreteScheduler {
                     // at completion).
                     // GitHub #190: a KV-RAM claimant holds no prefix, so the
                     // checkpoint claim is what says it already chose.
+                    // Spec vram-budget/03: and one whose state came back from
+                    // the disk already stands on its own sequence.
                     if self.requests[i].prefix_entry.is_some()
                         || self.requests[i].checkpoint_publisher.is_some()
+                        || self.requests[i].resident
                     {
                         continue;
                     }
@@ -2899,7 +3796,7 @@ impl Scheduler for ConcreteScheduler {
                     let mut device_prefix = self
                         .prefix
                         .longest_match_tokens(&keys);
-                    let mut retained = self.checkpoints.select(&lookup, device_prefix);
+                    let mut retained = self.claimable(self.checkpoints.select(&lookup, device_prefix));
                     // GitHub #190: a retained prefix only KV-RAM still holds
                     // comes back to the device when it beats every device
                     // reuse by the restore floor and every KV-RAM checkpoint
@@ -2921,7 +3818,7 @@ impl Scheduler for ConcreteScheduler {
                             && self.return_prefix(spilled, &mut events)
                         {
                             device_prefix = length;
-                            retained = self.checkpoints.select(&lookup, device_prefix);
+                            retained = self.claimable(self.checkpoints.select(&lookup, device_prefix));
                         }
                     }
                     let floor = retained.as_ref().map_or(0, |m| m.tokens);
@@ -2971,13 +3868,23 @@ impl Scheduler for ConcreteScheduler {
                         let now = self.now();
                         self.checkpoints.record_claim(m.id, self.tick, now);
                         let on_device = m.source == ReuseSource::Device;
-                        if on_device {
-                            self.prefix.retain(m.prefix);
-                        } else {
+                        match m.source {
+                            ReuseSource::Device => {
+                                self.prefix.retain(m.prefix);
+                            }
                             // GitHub #190: held until the restore lands, so
                             // nothing discards the only copy in between.
-                            let held = self.host.claim_retained(RetainedBlob::Checkpoint(m.id));
-                            debug_assert!(held, "a KV-RAM match is a held KV-RAM blob");
+                            ReuseSource::KvRam => {
+                                let held = self.host.claim_retained(RetainedBlob::Checkpoint(m.id));
+                                debug_assert!(held, "a KV-RAM match is a held KV-RAM blob");
+                            }
+                            // Spec vram-budget/03: and a disk file the same way.
+                            ReuseSource::Disk => {
+                                let held = self.disk.as_mut().is_some_and(|disk| {
+                                    disk.held_mut().claim_retained(RetainedBlob::Checkpoint(m.id))
+                                });
+                                debug_assert!(held, "a disk match is a held disk file");
+                            }
                         }
                         events.push(SchedEvent::RetainedState {
                             operation: RetainedStateOperation::Hit,
@@ -2987,7 +3894,10 @@ impl Scheduler for ConcreteScheduler {
                         let r = &mut self.requests[i];
                         r.prefix_entry = on_device.then_some(m.prefix);
                         if !on_device {
-                            r.kv_ram_claim = Some(m.id);
+                            match m.source {
+                                ReuseSource::Disk => r.disk_claim = Some(m.id),
+                                _ => r.kv_ram_claim = Some(m.id),
+                            }
                             r.standalone_tokens = m.tokens;
                         }
                         r.checkpoint_publisher = Some(m.publisher);
@@ -3060,6 +3970,13 @@ impl Scheduler for ConcreteScheduler {
                 // earlier chunk's failure unmaterialized it.
                 let mut admitted = Vec::with_capacity(b.len());
                 for i in b {
+                    // Spec vram-budget/03: a checkpoint claimant whose state
+                    // came back from the disk is charged already, its
+                    // sequence built; this is its first chunk.
+                    if self.requests[i].resident {
+                        admitted.push(i);
+                        continue;
+                    }
                     // GitHub #186 (ADR 0023 as amended by 0029): retained
                     // state is the first victim, so it goes back *before*
                     // anything else is considered. A live request never waits
@@ -3080,6 +3997,13 @@ impl Scheduler for ConcreteScheduler {
                             // it) waits for a later tick.
                             break;
                         }
+                    }
+                    // Spec vram-budget/03: a disk checkpoint comes back into
+                    // the claimant's own sequence first, over the advances
+                    // that takes; its first chunk runs once it has landed.
+                    if self.requests[i].disk_claim.is_some() {
+                        self.restore_checkpoint_from_disk(i, &mut events);
+                        continue;
                     }
                     self.materialize(i);
                     admitted.push(i);
@@ -3762,6 +4686,7 @@ impl Scheduler for ConcreteScheduler {
                 r.state == RequestState::Prefilling
                     && r.prefill_complete()
                     && r.input.ends_at_prefill()
+                    && !r.moving
             })
             .map(|(i, _)| i)
             .collect();
@@ -3825,7 +4750,7 @@ impl Scheduler for ConcreteScheduler {
             .requests
             .iter()
             .enumerate()
-            .filter_map(|(i, r)| (r.state == RequestState::Running).then_some(i))
+            .filter_map(|(i, r)| (r.state == RequestState::Running && !r.moving).then_some(i))
             .collect();
         running.sort_by_key(|&i| self.requests[i].lane);
         for &i in &running {
@@ -4078,6 +5003,7 @@ impl Scheduler for ConcreteScheduler {
             kv_used_pages: self.kv_used_pages,
             kv_pool_pages: self.capacity.kv_pages,
             kv_ram_used_bytes: self.host.used_bytes(),
+            kv_disk_used_bytes: self.disk.as_ref().map_or(0, DiskTier::used_bytes),
         }
     }
 
@@ -4177,7 +5103,7 @@ mod tests {
         let mut events = Vec::new();
 
         assert!(
-            sched.make_host_room_for_bytes(2, &mut events),
+            sched.make_host_room_for_bytes(2, &mut events) == KvRamRoom::Made,
             "two of the four bytes can be freed"
         );
 
@@ -4210,7 +5136,7 @@ mod tests {
         let (mut sched, _compute) = three_blobs();
         let mut events = Vec::new();
 
-        assert!(sched.make_host_room_for_bytes(2, &mut events));
+        assert!(sched.make_host_room_for_bytes(2, &mut events) == KvRamRoom::Made);
 
         let dropped: Vec<RequestId> = events
             .iter()
@@ -4235,7 +5161,7 @@ mod tests {
         let (mut sched, _compute) = three_blobs();
         let mut events = Vec::new();
 
-        assert!(!sched.make_host_room_for_bytes(5, &mut events));
+        assert!(sched.make_host_room_for_bytes(5, &mut events) == KvRamRoom::None);
 
         let drops = events
             .iter()
@@ -4250,7 +5176,7 @@ mod tests {
         let mut events = Vec::new();
 
         assert!(
-            !sched.make_host_room_for_bytes(5, &mut events),
+            sched.make_host_room_for_bytes(5, &mut events) == KvRamRoom::None,
             "nothing the tier can give up makes a five-byte hole in a four-byte arena"
         );
         assert_eq!(sched.host.entry_count(), 0, "it gave up everything trying");

@@ -37,6 +37,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
+use ignis_core::scheduler::{DiskOp, DiskSource};
 use ignis_core::flash_next_counters::FlashNextCounterSource;
 use ignis_core::thinking_budget::BudgetOutcome;
 use ignis_core::{
@@ -650,6 +651,34 @@ impl Telemetry {
         self.emit_dropped(id);
     }
 
+    /// A live snapshot was written to KV-disk (spec vram-budget/03): straight
+    /// from the device, or demoted from KV-RAM. Counted in
+    /// `ignis_kv_disk_spills_total{from}` -- never in the two KV-RAM eviction
+    /// counters, whose meanings stay theirs -- and logged as the `spilled`
+    /// line, so a request's trip through the tiers reads from the request log
+    /// alone, as its `evicted` and `restored` lines already make it.
+    pub fn on_disk_spilled(&mut self, id: RequestId, from: DiskSource) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_kv_disk_spill(from);
+        }
+        let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        tracing::info!(
+            name: "ignis.request.spilled",
+            request_id = id,
+            from = from.as_str(),
+            "written to the KV-disk tier"
+        );
+    }
+
+    /// A KV-disk transfer failed (spec vram-budget/03). Not a request-log
+    /// line: a refused write belongs to no request, and a refused read is
+    /// already an ERROR on the model thread naming its request.
+    pub fn on_disk_failure(&mut self, op: DiskOp) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_kv_disk_failure(op);
+        }
+    }
+
     pub fn on_requeued(&mut self, id: RequestId) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = 0;
@@ -1088,7 +1117,8 @@ mod tests {
             kv_used_pages: 64,
             kv_pool_pages: 256,
             kv_ram_used_bytes: 1 << 30,
-        });
+                kv_disk_used_bytes: 0,
+});
         let busy = metrics.render();
         assert!(busy.contains("\nignis_kv_pool_used_pages 64\n"), "{busy}");
         assert!(busy.contains("\nignis_kv_ram_arena_bytes{state=\"used\"} 1073741824\n"), "{busy}");
@@ -1098,7 +1128,8 @@ mod tests {
             kv_used_pages: 0,
             kv_pool_pages: 256,
             kv_ram_used_bytes: 0,
-        });
+                kv_disk_used_bytes: 0,
+});
         let idle = metrics.render();
         assert!(idle.contains("\nignis_kv_pool_used_pages 0\n"), "{idle}");
         assert!(idle.contains("\nignis_kv_ram_arena_bytes{state=\"used\"} 0\n"), "{idle}");
@@ -1778,6 +1809,61 @@ mod tests {
         for line in ["ignis_kv_cache_evictions_total 1", "ignis_kv_ram_evictions_total 1"] {
             assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
         }
+    }
+
+    /// Spec vram-budget/03 AC 38: a live snapshot written to KV-disk is
+    /// counted where it lands, by where it came from -- and in neither of the
+    /// two KV-RAM eviction counters, whose meanings stay theirs. A failure is
+    /// counted by its direction.
+    #[test]
+    fn a_disk_spill_counts_where_it_lands_and_in_neither_kv_ram_counter() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.set_load_reservations(crate::metrics::LoadReservations {
+            lines: ignis_core::VramLines::default(),
+            budget_bytes: 0,
+            kv_pool_pages: 0,
+            kv_page_bytes: 0,
+            residency_bytes: 0,
+            expert_cache_bytes: 0,
+            kv_ram_arena_bytes: 0,
+            retained_slots: 0,
+            retained_host_slots: 0,
+            retained_host_bytes: 0,
+            kv_disk_bytes: Some(16 << 30),
+            flash_next: None,
+        });
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Agent);
+            telemetry.on_admitted(1, 0);
+            telemetry.on_disk_spilled(1, DiskSource::Device);
+            telemetry.on_disk_spilled(2, DiskSource::KvRam);
+            telemetry.on_disk_spilled(3, DiskSource::KvRam);
+            telemetry.on_disk_failure(DiskOp::Write);
+            telemetry.on_disk_failure(DiskOp::Read);
+            telemetry.on_disk_failure(DiskOp::Read);
+        });
+        let text = metrics.render();
+        for line in [
+            "ignis_kv_disk_spills_total{from=\"device\"} 1",
+            "ignis_kv_disk_spills_total{from=\"kv_ram\"} 2",
+            "ignis_kv_disk_failures_total{op=\"write\"} 1",
+            "ignis_kv_disk_failures_total{op=\"read\"} 2",
+            "ignis_kv_cache_evictions_total 0",
+            "ignis_kv_ram_evictions_total 0",
+        ] {
+            assert!(text.contains(&format!("
+{line}
+")), "no `{line}` in:
+{text}");
+        }
+        let spilled = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.spilled")
+            .expect("a `spilled` line");
+        assert_eq!(spilled["attributes"]["request_id"], 1);
+        assert_eq!(spilled["attributes"]["from"], "device");
     }
 
     /// GitHub #224 — and the drop is in the request log too, for the reason

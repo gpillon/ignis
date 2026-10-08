@@ -374,12 +374,12 @@ void check_a_page_aligned_opener_takes_no_page() {
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &bytes), 0, "aligned: size");
   std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
-  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes), 0,
+  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes, nullptr), 0,
             "aligned: snapshot");
   std::uint64_t own_bytes = 0;
   expect_rc(ignis_seq_snapshot_size(pool, claimant, &own_bytes), 0, "aligned: claimant size");
   std::vector<unsigned char> own(static_cast<std::size_t>(own_bytes));
-  expect_rc(ignis_seq_snapshot(pool, claimant, own.data(), own_bytes), 0, "aligned: claimant snapshot");
+  expect_rc(ignis_seq_snapshot(pool, claimant, own.data(), own_bytes, nullptr), 0, "aligned: claimant snapshot");
   expect(own == blob, "aligned: the checkpoint's blob is its claimant's, standing on it");
 
   ignis_seq_release(pool, claimant);
@@ -566,7 +566,7 @@ void check_materialized_blob_outlives_every_device_handle(bool dflash2) {
   expect_rc(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &bytes), 0,
             "materialize: size");
   std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
-  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes), 0,
+  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes, nullptr), 0,
             "materialize: snapshot");
 
   // The host blob, not a prefix/checkpoint handle, is now the only retained
@@ -578,13 +578,13 @@ void check_materialized_blob_outlives_every_device_handle(bool dflash2) {
 
   ignis_seq *restored = nullptr;
   expect_rc(ignis_seq_alloc(pool, kContext, &restored), 0, "materialize: target");
-  expect_rc(ignis_seq_restore(pool, restored, blob.data(), bytes), 0,
+  expect_rc(ignis_seq_restore(pool, restored, blob.data(), bytes, nullptr), 0,
             "materialize: restore after handles released");
   std::uint64_t restored_bytes = 0;
   expect_rc(ignis_seq_snapshot_size(pool, restored, &restored_bytes), 0,
             "materialize: restored size");
   std::vector<unsigned char> round_trip(static_cast<std::size_t>(restored_bytes));
-  expect_rc(ignis_seq_snapshot(pool, restored, round_trip.data(), restored_bytes), 0,
+  expect_rc(ignis_seq_snapshot(pool, restored, round_trip.data(), restored_bytes, nullptr), 0,
             "materialize: restored snapshot");
   expect(restored_bytes == bytes && round_trip == blob,
          "materialize: restored state is byte-identical to the spilled blob");
@@ -638,13 +638,13 @@ void check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(bool dflash2
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &bytes), 0, "chain blob: size");
   std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
-  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes), 0,
+  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes, nullptr), 0,
             "chain blob: snapshot the checkpoint");
 
   std::uint64_t own_bytes = 0;
   expect_rc(ignis_seq_snapshot_size(pool, turn2, &own_bytes), 0, "chain blob: sequence size");
   std::vector<unsigned char> own(static_cast<std::size_t>(own_bytes));
-  expect_rc(ignis_seq_snapshot(pool, turn2, own.data(), own_bytes), 0,
+  expect_rc(ignis_seq_snapshot(pool, turn2, own.data(), own_bytes, nullptr), 0,
             "chain blob: snapshot the capturing sequence");
   expect(own_bytes == bytes && own == blob,
          "chain blob: the checkpoint's blob is the capturing sequence's own, link for link");
@@ -657,10 +657,10 @@ void check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(bool dflash2
   ignis_seq_release(pool, turn1);
   ignis_seq *restored = nullptr;
   expect_rc(ignis_seq_alloc(pool, kContext, &restored), 0, "chain blob: restore target");
-  expect_rc(ignis_seq_restore(pool, restored, blob.data(), bytes), 0,
+  expect_rc(ignis_seq_restore(pool, restored, blob.data(), bytes, nullptr), 0,
             "chain blob: restore with every link released");
   std::vector<unsigned char> again(static_cast<std::size_t>(bytes));
-  expect_rc(ignis_seq_snapshot(pool, restored, again.data(), bytes), 0,
+  expect_rc(ignis_seq_snapshot(pool, restored, again.data(), bytes, nullptr), 0,
             "chain blob: re-snapshot the restored sequence");
   expect(again == blob, "chain blob: the round trip is byte-exact");
   ignis_seq_release(pool, restored);
@@ -937,7 +937,7 @@ void check_a_lender_publishes_and_restores_nothing() {
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_snapshot_size(pool, lender, &bytes), 0, "lender: blob size");
   std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
-  expect_rc(ignis_seq_snapshot(pool, lender, blob.data(), bytes), 0, "lender: a blob to restore");
+  expect_rc(ignis_seq_snapshot(pool, lender, blob.data(), bytes, nullptr), 0, "lender: a blob to restore");
 
   const Observed before   = observe(pool, lender, kPrefixSlot);
   ignis_seq_prefix *again = nullptr;
@@ -946,7 +946,7 @@ void check_a_lender_publishes_and_restores_nothing() {
   expect(again == nullptr && last_error_names("lent"), "lender: naming the loan");
   expect(same(observe(pool, lender, kPrefixSlot), before),
          "lender: and changes nothing -- the publish's retained slot is still free");
-  expect_rc(ignis_seq_restore(pool, lender, blob.data(), bytes), IGNIS_SEQ_ERR_SHARED_PREFIX,
+  expect_rc(ignis_seq_restore(pool, lender, blob.data(), bytes, nullptr), IGNIS_SEQ_ERR_SHARED_PREFIX,
             "lender: a restore over the pages it lent is refused");
   expect(last_error_names("lent"), "lender: naming the loan too");
   expect(same(observe(pool, lender, kPrefixSlot), before), "lender: and changes nothing either");
@@ -989,7 +989,7 @@ void check_a_link_on_loan_has_no_handle() {
   expect_rc(ignis_seq_prefix_snapshot_size(pool, link, &bytes), -1, "no handle: no blob size");
   expect(bytes == 0 && last_error_names("pages-only link"), "no handle: naming the link");
   std::vector<unsigned char> blob(64);
-  expect_rc(ignis_seq_prefix_snapshot(pool, link, blob.data(), blob.size()), -1, "no handle: no blob");
+  expect_rc(ignis_seq_prefix_snapshot(pool, link, blob.data(), blob.size(), nullptr), -1, "no handle: no blob");
   expect(last_error_names("pages-only link"), "no handle: naming the link");
   struct ignis_seq_prefix_stats stats{};
   expect_rc(ignis_seq_prefix_stats(link, &stats), -1, "no handle: no stats");
@@ -1119,12 +1119,12 @@ void check_a_lender_evicted_while_lent_comes_back_whole(std::uint32_t shared, st
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_snapshot_size(f.pool, f.lender, &bytes), 0, "evict: lender blob size");
   std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
-  expect_rc(ignis_seq_snapshot(f.pool, f.lender, blob.data(), bytes), 0, "evict: lender blob");
+  expect_rc(ignis_seq_snapshot(f.pool, f.lender, blob.data(), bytes, nullptr), 0, "evict: lender blob");
   std::uint64_t checkpoint_bytes = 0;
   expect_rc(ignis_seq_checkpoint_snapshot_size(f.pool, f.checkpoint, &checkpoint_bytes), 0,
             "evict: checkpoint blob size");
   std::vector<unsigned char> reference(static_cast<std::size_t>(checkpoint_bytes));
-  expect_rc(ignis_seq_checkpoint_snapshot(f.pool, f.checkpoint, reference.data(), checkpoint_bytes), 0,
+  expect_rc(ignis_seq_checkpoint_snapshot(f.pool, f.checkpoint, reference.data(), checkpoint_bytes, nullptr), 0,
             "evict: checkpoint blob");
   expect(bytes == checkpoint_bytes && blob == reference,
          "evict: the lender's blob is its whole history, lent pages included");
@@ -1137,7 +1137,7 @@ void check_a_lender_evicted_while_lent_comes_back_whole(std::uint32_t shared, st
   ignis_seq *restored = nullptr;
   expect_rc(ignis_seq_alloc(f.pool, kContext, &restored), 0, "evict: restore target");
   if (restored != nullptr) {
-    expect_rc(ignis_seq_restore(f.pool, restored, blob.data(), bytes), 0, "evict: restore");
+    expect_rc(ignis_seq_restore(f.pool, restored, blob.data(), bytes, nullptr), 0, "evict: restore");
     const std::vector<std::int32_t> row = row_of(*f.pool, restored->slot, f.covered);
     for (std::uint32_t page = 0; page < f.covered; ++page) {
       expect(page_image_of(*f.pool, row[page]) == f.history[page],
@@ -1147,7 +1147,7 @@ void check_a_lender_evicted_while_lent_comes_back_whole(std::uint32_t shared, st
                restored->prefix == nullptr && restored->lent_to == nullptr,
            "evict: from its own pages, with the lender's state, lending nothing");
     std::vector<unsigned char> again(static_cast<std::size_t>(bytes));
-    expect_rc(ignis_seq_snapshot(f.pool, restored, again.data(), bytes), 0, "evict: re-snapshot");
+    expect_rc(ignis_seq_snapshot(f.pool, restored, again.data(), bytes, nullptr), 0, "evict: re-snapshot");
     expect(again == blob, "evict: the round trip is byte-exact");
     // And writing past the opener, as it goes on, touches nothing the
     // claimant reads.

@@ -61,6 +61,18 @@ impl AlignedBuffer {
     }
 }
 
+impl AsRef<[u8]> for AlignedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsMut<[u8]> for AlignedBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         // SAFETY: allocated with this layout in `new`.
@@ -148,6 +160,131 @@ impl DirectReader {
 
 /// The most one read system call is asked for (see `read_chunked`).
 const MAX_READ_CHUNK: usize = 1 << 30;
+
+/// A write handle for positional unbuffered writes: [`DirectReader`]'s twin,
+/// for the disk tier's blob files (KV-disk, spec vram-budget/03).
+///
+/// It creates its file — never opens one that exists, so a write can only
+/// land in a file this handle made — and writes at explicit offsets, so the
+/// tier's writer thread can lay a blob's windows down and its header last.
+/// The rules are [`DirectReader`]'s: offset, length and buffer address on a
+/// [`DIRECT_IO_ALIGNMENT`] boundary.
+pub struct DirectWriter {
+    file: File,
+    unbuffered: bool,
+}
+
+impl DirectWriter {
+    /// Create `path`, which must not exist, for unbuffered writes.
+    pub fn create(path: &Path) -> Result<Self> {
+        let create = |flags: Option<u32>| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            if let Some(flags) = flags {
+                set_flags(&mut options, flags);
+            }
+            options.open(path)
+        };
+        match create(Some(UNBUFFERED_FLAG)) {
+            Ok(file) => Ok(Self { file, unbuffered: true }),
+            Err(e) if refuses_unbuffered(&e) => Ok(Self {
+                file: create(None).map_err(|e| fail(format!("create {}: {e}", path.display())))?,
+                unbuffered: false,
+            }),
+            Err(e) => Err(fail(format!("create {} unbuffered: {e}", path.display()))),
+        }
+    }
+
+    /// Whether writes bypass the page cache.
+    pub fn is_unbuffered(&self) -> bool {
+        self.unbuffered
+    }
+
+    /// Write all of `buf` at `offset`. Offset, length and address must be
+    /// [`DIRECT_IO_ALIGNMENT`]-aligned.
+    pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        let align = DIRECT_IO_ALIGNMENT as usize;
+        if !offset.is_multiple_of(DIRECT_IO_ALIGNMENT)
+            || !buf.len().is_multiple_of(align)
+            || !(buf.as_ptr() as usize).is_multiple_of(align)
+        {
+            return Err(fail(format!(
+                "direct write of {} bytes at {offset} is not {align}-byte aligned",
+                buf.len()
+            )));
+        }
+        self.write_chunked(offset, buf, MAX_READ_CHUNK)
+    }
+
+    /// The write loop, at most `chunk` bytes per system call (one Windows
+    /// WriteFile moves at most 4 GiB - 1 bytes, as a read does).
+    fn write_chunked(&self, offset: u64, buf: &[u8], chunk: usize) -> Result<()> {
+        let mut total = 0usize;
+        while total < buf.len() {
+            let end = buf.len().min(total + chunk);
+            match write_at(&self.file, offset + total as u64, &buf[total..end]) {
+                Ok(0) => return Err(fail(format!("direct write at {}: the volume took nothing", offset + total as u64))),
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(fail(format!("direct write at {}: {e}", offset + total as u64))),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The bytes free to this process on the volume holding `path` (spec
+/// vram-budget/03: the disk tier keeps its volume a margin).
+pub fn volume_free_bytes(path: &Path) -> Result<u64> {
+    volume_free(path).map_err(|e| fail(format!("free space of the volume holding {}: {e}", path.display())))
+}
+
+#[cfg(windows)]
+fn volume_free(path: &Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free_to_caller: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; the three outputs are
+    // optional, and only the first is asked for.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(free_to_caller)
+}
+
+#[cfg(unix)]
+fn volume_free(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c` is a NUL-terminated path and `stat` a zeroed statvfs the
+    // call fills.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(windows)]
+fn write_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
+
+#[cfg(unix)]
+fn write_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
 
 #[cfg(windows)]
 const UNBUFFERED_FLAG: u32 = windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
@@ -253,6 +390,74 @@ mod tests {
         assert!(reader.read_at(0, &mut buf.as_mut_slice()[1..4096]).is_err());
         drop(reader);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("ignis-direct-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn positional_writes_land_where_they_are_aimed_and_read_back() {
+        let path = temp_path("write");
+        let writer = DirectWriter::create(&path).unwrap();
+        let mut first = AlignedBuffer::new(8192).unwrap();
+        first.as_mut_slice().copy_from_slice(&pattern(8192));
+        let mut header = AlignedBuffer::new(4096).unwrap();
+        header.as_mut_slice().copy_from_slice(&pattern(4096 + 8192)[8192..]);
+        // The body first, the header page last: the order the disk tier writes in.
+        writer.write_at(4096, first.as_slice()).unwrap();
+        writer.write_at(0, header.as_slice()).unwrap();
+        drop(writer);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 3 * 4096);
+        assert_eq!(&bytes[..4096], header.as_slice());
+        assert_eq!(&bytes[4096..], first.as_slice());
+        let reader = DirectReader::open(&path).unwrap();
+        let mut back = AlignedBuffer::new(8192).unwrap();
+        assert_eq!(reader.read_at(4096, back.as_mut_slice()).unwrap(), 8192);
+        assert_eq!(back.as_slice(), first.as_slice());
+        drop(reader);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_writer_never_opens_a_file_that_exists() {
+        let path = temp_file("exists", &pattern(4096));
+        assert!(DirectWriter::create(&path).is_err(), "a write can only land in a file the handle made");
+        assert_eq!(std::fs::read(&path).unwrap(), pattern(4096), "and the file is left alone");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_unaligned_write_is_refused() {
+        let path = temp_path("unaligned-write");
+        let writer = DirectWriter::create(&path).unwrap();
+        let buf = AlignedBuffer::new(8192).unwrap();
+        assert!(writer.write_at(100, &buf.as_slice()[..4096]).is_err());
+        assert!(writer.write_at(0, &buf.as_slice()[..100]).is_err());
+        assert!(writer.write_at(0, &buf.as_slice()[1..4097]).is_err());
+        drop(writer);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_write_longer_than_one_chunk_is_issued_in_chunks() {
+        let path = temp_path("write-chunks");
+        let writer = DirectWriter::create(&path).unwrap();
+        let mut buf = AlignedBuffer::new(5 * 4096).unwrap();
+        buf.as_mut_slice().copy_from_slice(&pattern(5 * 4096));
+        writer.write_chunked(0, buf.as_slice(), 4096).unwrap();
+        drop(writer);
+        assert_eq!(std::fs::read(&path).unwrap(), pattern(5 * 4096));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_volume_holding_a_directory_reports_its_free_bytes() {
+        let free = volume_free_bytes(&std::env::temp_dir()).unwrap();
+        assert!(free > 0, "the temp volume has room for this test's own files");
     }
 
     #[test]

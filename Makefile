@@ -84,6 +84,11 @@ SERVER_URL := http://$(BIND)
 UNCENSORED_REPO := gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer
 # The server's own default when METRICS_BIND is empty (DEFAULT_METRICS_BIND).
 METRICS_URL := http://$(or $(METRICS_BIND),127.0.0.1:9464)
+# KV-disk as a start will get it (spec vram-budget/03): the budget the server
+# takes, and the directory its per-process directories go in, resolved the
+# way --kv-disk-path is.
+KV_DISK_BUDGET = $(or $(KV_DISK_BYTES),$(if $(filter flash-next,$(MODEL_FAMILY)),4G,0))
+KV_DISK_LOCATION = $(strip $(if $(filter auto,$(KV_DISK_PATH)),$(if $(filter windows,$(HOST_OS)),$(subst \,/,$(LOCALAPPDATA))/ignis/cache/kv-disk,$(or $(XDG_CACHE_HOME),$(HOME)/.cache)/ignis/kv-disk),$(if $(filter-out model,$(KV_DISK_PATH)),$(KV_DISK_PATH),$(patsubst %/,%,$(dir $(ARTIFACT))))))
 SERVER_PID := $(RUNTIME_DIR)/ignis-server.pid
 SERVER_LOG := $(RUNTIME_DIR)/ignis-server.log
 
@@ -94,6 +99,7 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(KV_POOL_BYTES),--kv-pool-bytes $(KV_POOL_BYTES))   $(if $(VRAM_HEADROOM),--vram-headroom-bytes $(VRAM_HEADROOM))   $(if $(VRAM_BUDGET),--vram-budget-bytes $(VRAM_BUDGET))   $(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)),--allow-vram-oversubscription) \
   $(if $(filter 1,$(ALLOW_EXPERT_CACHE_BELOW_FLOOR)),--allow-expert-cache-below-floor) \
   $(if $(KV_HOST_POOL_BYTES),--kv-host-pool-bytes $(KV_HOST_POOL_BYTES))   $(if $(NGRAM_HOT_BYTES),--ngram-hot-bytes $(NGRAM_HOT_BYTES)) \
+  $(if $(KV_DISK_BYTES),--kv-disk-bytes $(KV_DISK_BYTES))   $(if $(KV_DISK_PATH),--kv-disk-path $(KV_DISK_PATH)) \
   $(if $(RETAINED_DEVICE),--retained-device $(RETAINED_DEVICE)) \
   $(if $(RETAINED_HOST),--retained-host $(RETAINED_HOST)) \
   $(if $(filter 1,$(VISION)),--vision $(if $(VISION_MAX_TOKENS),--vision-max-tokens $(VISION_MAX_TOKENS))) \
@@ -195,6 +201,7 @@ config: ## Print the resolved knobs and paths
 	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image),off)"
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(KV_POOL_PLAN) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),$(if $(filter flash-next,$(MODEL_FAMILY)),off (SPEC=mtp turns the MTP head on),off))$(if $(SPEC),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD)))$(if $(DRAFT_ROWS), rows=$(DRAFT_ROWS)) rope=$(or $(ROPE_SCALING),none)"
 	@echo "PLAN            $(if $(filter flash-next,$(MODEL_FAMILY)),lanes=$(LANES) context/lane=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) prefill_chunk=$(or $(PREFILL_CHUNK),default) decode_share=$(if $(DECODE_SHARE),$(DECODE_SHARE)%,25% (default)) retained_host=$(or $(RETAINED_HOST),8 (Flash-Next default)) kv_ram_arena=$(or $(KV_HOST_POOL_BYTES),default) kv_pool=$(KV_POOL_PLAN) expert_cache_floor=$(if $(filter 1,$(ALLOW_EXPERT_CACHE_BELOW_FLOOR)),12G (below it allowed with a warning),12G (refused below)) ngram_hot=$(or $(NGRAM_HOT_BYTES),1G (default; auto = what the host plan leaves)),(Flash-Next only: the plan is the server's for the 27B))"
+	@echo "KV-DISK (CUDA=1) $(if $(filter 0,$(KV_DISK_BUDGET)),off$(if $(KV_DISK_BYTES),, (the 27B's default; KV_DISK_BYTES=4G turns it on)),budget=$(KV_DISK_BUDGET) (cut at start to the volume's free space less 10 GiB) dir=$(KV_DISK_LOCATION)/ignis-kv-disk/<pid>-<nonce>)"
 	@echo "VISION (CUDA=1) $(if $(filter 1,$(VISION)),on  max_tokens=$(or $(VISION_MAX_TOKENS),(server default)),off  (image parts are refused with vision_disabled))"
 	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1G))) retained_device=$(or $(RETAINED_DEVICE),(server default: 0)) retained_host=$(or $(RETAINED_HOST),(server default: two per lane))"
 	@echo "MODEL           $(MODEL_FAMILY)  $(if $(filter flash-next,$(MODEL_FAMILY)),(Qwen3.8-Flash-Next as $(SERVED_MODEL); lanes=$(LANES); its prefetch width 16, 10 in prefill is not a server flag yet),$(if $(SERVED_MODEL),(Qwen3.8-27B served as $(SERVED_MODEL)),(Qwen3.8-27B under the server's default id)))"

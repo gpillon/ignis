@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseExposition } from "./exposition.ts";
-import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, KV_DISK_EXPOSITION } from "./fixture.ts";
 import { emptySnapshot, readSnapshot, counterValues, RETAINED_FAMILY_KEYS } from "./snapshot.ts";
 
 describe("readSnapshot", () => {
@@ -57,18 +57,44 @@ describe("readSnapshot", () => {
     expect(memory.slotSkips).toEqual({ publish_skipped_no_slot: 12, capture_skipped_no_slot: 5, capture_skipped_no_page: 1 });
   });
 
+  it("reads the KV-disk tier when the scrape carries it, and leaves it null when not (spec vram-budget/03)", () => {
+    const s = readSnapshot(parseExposition(KV_DISK_EXPOSITION));
+    expect(s.kvDisk).toEqual({ capacity: 107_374_182_400, used: 26_843_545_600, spills: { device: 5, kv_ram: 7 }, failures: { write: 1, read: 0 } });
+    expect(s.retained.spills.disk).toEqual({ checkpoint: 4, prefix: 2 });
+    expect(s.retained.discards.disk).toEqual({ checkpoint: 3, prefix: 1 });
+    expect(s.unknown).toEqual([]);
+
+    const without = readSnapshot(parseExposition(IGNIS_EXPOSITION));
+    expect(without.kvDisk).toBeNull();
+    // A tier with no series stays null, never zero.
+    expect(without.retained.spills.disk).toEqual({ checkpoint: null, prefix: null });
+  });
+
+  it("flags a disk series with a label the contract does not name", () => {
+    const text = `${KV_DISK_EXPOSITION}ignis_kv_disk_spills_total{from="tape"} 1
+ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
+`;
+    expect(readSnapshot(parseExposition(text)).unknown.map((x) => x.labels.from ?? x.labels.tier)).toEqual(["tape", "tape"]);
+  });
+
+  it("moves the restart fingerprint when a disk counter moves", () => {
+    const a = readSnapshot(parseExposition(KV_DISK_EXPOSITION));
+    const b = readSnapshot(parseExposition(KV_DISK_EXPOSITION.replace('op="read"} 0', 'op="read"} 2')));
+    expect(counterValues(a)).not.toEqual(counterValues(b));
+  });
+
   it("reads all six retained-state families in both tiers and both kinds", () => {
     const { retained } = readSnapshot(parseExposition(IGNIS_EXPOSITION));
     expect(RETAINED_FAMILY_KEYS).toEqual(["reusedTokens", "hits", "misses", "spills", "discards", "restores"]);
-    // All twenty-four series the server writes, read against the fixture's own figures.
+    // All twenty-four series the server writes (the disk rows are null: a load without the tier writes none), read against the fixture's own figures.
     expect(retained).toEqual({
-      reusedTokens: { device: { checkpoint: 41_200, prefix: 9800 }, kv_ram: { checkpoint: 6400, prefix: 0 } },
-      hits: { device: { checkpoint: 18, prefix: 7 }, kv_ram: { checkpoint: 3, prefix: 0 } },
+      reusedTokens: { device: { checkpoint: 41_200, prefix: 9800 }, kv_ram: { checkpoint: 6400, prefix: 0 }, disk: { checkpoint: null, prefix: null } },
+      hits: { device: { checkpoint: 18, prefix: 7 }, kv_ram: { checkpoint: 3, prefix: 0 }, disk: { checkpoint: null, prefix: null } },
       // Checkpoint-only by construction: the prefix walk raises no miss (#222).
-      misses: { device: { checkpoint: 11, prefix: 0 }, kv_ram: { checkpoint: 5, prefix: 0 } },
-      spills: { device: { checkpoint: 0, prefix: 0 }, kv_ram: { checkpoint: 6, prefix: 2 } },
-      discards: { device: { checkpoint: 4, prefix: 9 }, kv_ram: { checkpoint: 1, prefix: 0 } },
-      restores: { device: { checkpoint: 0, prefix: 0 }, kv_ram: { checkpoint: 3, prefix: 1 } },
+      misses: { device: { checkpoint: 11, prefix: 0 }, kv_ram: { checkpoint: 5, prefix: 0 }, disk: { checkpoint: null, prefix: null } },
+      spills: { device: { checkpoint: 0, prefix: 0 }, kv_ram: { checkpoint: 6, prefix: 2 }, disk: { checkpoint: null, prefix: null } },
+      discards: { device: { checkpoint: 4, prefix: 9 }, kv_ram: { checkpoint: 1, prefix: 0 }, disk: { checkpoint: null, prefix: null } },
+      restores: { device: { checkpoint: 0, prefix: 0 }, kv_ram: { checkpoint: 3, prefix: 1 }, disk: { checkpoint: null, prefix: null } },
     });
   });
 
@@ -109,11 +135,11 @@ describe("readSnapshot", () => {
   it("counts the retained counters towards a restart, and the memory gauges not", () => {
     const empty = emptySnapshot();
     const moved = readSnapshot(parseExposition(IGNIS_EXPOSITION));
-    // 8 plain counters, 3 reject reasons, 24 retained series, 3 skips, then
+    // 8 plain counters, 3 reject reasons, 36 retained series (disk's 12 null without the tier), 3 skips, 4 KV-disk, then
     // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 2
     // stall (GitHub #306), 2 n-gram rows, 2 reads, the 3 speculative totals
     // (GitHub #307), and 2 histogram counts.
-    expect(counterValues(empty)).toHaveLength(85);
+    expect(counterValues(empty)).toHaveLength(101);
     expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
     const flashNext = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
     expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(82);

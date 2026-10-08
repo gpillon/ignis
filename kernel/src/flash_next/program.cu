@@ -702,6 +702,7 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
   if (const std::string why = prefill_options_refusal(options, span_ok); !why.empty()) return refuse(why);
   if (const std::string why = pool_refusal(fn, *pool); !why.empty()) return refuse(why);
   if (!ignis_seq_belongs_to(*pool, *seq)) return refuse("the sequence was not drawn from this pool");
+  if (const char *why = ignis_seq_restore_refusal(*seq)) return refuse(why);
   if (seq->position != start_position) return refuse("start_position does not match the sequence frontier");
   if (num_tokens > ignis_seq_token_capacity(*seq) - seq->position) {
     return refuse("span exceeds the sequence KV capacity");
@@ -968,6 +969,7 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
     const std::string at = " at index " + std::to_string(i);
     if (seq == nullptr || seq->pending_token < 0) return refuse("sequence is null or was not prefilled" + at);
     if (!ignis_seq_belongs_to(*pool, *seq)) return refuse("the sequence was not drawn from this pool" + at);
+    if (const char *why = ignis_seq_restore_refusal(*seq)) return refuse(why + at);
     if (seq->position >= ignis_seq_token_capacity(*seq) || seq->position >= fn.max_context_tokens) {
       return refuse("sequence reached its KV capacity" + at);
     }

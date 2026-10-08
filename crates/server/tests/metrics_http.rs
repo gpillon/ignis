@@ -688,6 +688,69 @@ async fn labels_stay_within_the_bounded_sets() {
     }
 }
 
+// ── KV-disk (spec vram-budget/03 AC 38) ─────────────────────────────────────
+
+#[tokio::test]
+async fn a_load_with_kv_disk_exports_the_tier_from_the_first_scrape_within_bounded_labels() {
+    let compute = Arc::new(MockCompute::new().with_disk(ignis_core::FakeDisk::with_room(1 << 30)));
+    let config = SchedulerConfig {
+        model: MODEL.into(),
+        kv_disk_capacity_bytes: 16 << 30,
+        ..SchedulerConfig::default()
+    };
+    let server = server_with(config, compute).with_metrics().with_load_reservations(
+        ignis_server::metrics::LoadReservations {
+            lines: ignis_core::VramLines::default(),
+            budget_bytes: 0,
+            kv_pool_pages: 0,
+            kv_page_bytes: 0,
+            residency_bytes: 0,
+            expert_cache_bytes: 0,
+            kv_ram_arena_bytes: 0,
+            retained_slots: 0,
+            retained_host_slots: 0,
+            retained_host_bytes: 0,
+            kv_disk_bytes: Some(16 << 30),
+            flash_next: None,
+        },
+    );
+    let (api, metrics) = apps(server);
+    let first = scrape(&metrics).await;
+    assert_eq!(value(&first, "ignis_kv_disk_bytes", Some("capacity")), 16 << 30);
+    assert_eq!(value(&first, "ignis_kv_disk_bytes", Some("used")), 0);
+    assert_eq!(labelled(&first, "ignis_kv_disk_spills_total", "from", "device"), 0);
+    assert_eq!(labelled(&first, "ignis_kv_disk_failures_total", "op", "read"), 0);
+
+    complete(&api, 2).await;
+    let text = scrape_until(&metrics, |t| value(t, "ignis_requests_completed_total", None) == 1).await;
+    for (name, labels, _) in samples(&text) {
+        let allowed: &[(&str, &[&str])] = match name.as_str() {
+            "ignis_kv_disk_bytes" => &[("state", &["capacity", "used"])],
+            "ignis_kv_disk_spills_total" => &[("from", &["device", "kv_ram"])],
+            "ignis_kv_disk_failures_total" => &[("op", &["write", "read"])],
+            name if name.starts_with("ignis_retained_state_") || name == "ignis_retained_reused_tokens_total" => {
+                &[("tier", &["device", "kv_ram", "disk"]), ("kind", &["checkpoint", "prefix"])]
+            }
+            _ => continue,
+        };
+        assert_eq!(labels.len(), allowed.len(), "{name} {labels:?}");
+        for (key, value) in &labels {
+            let (_, values) = allowed
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("{name} carries an unbounded label `{key}`"));
+            assert!(values.contains(&value.as_str()), "{name}{{{key}={value}}}");
+        }
+    }
+    assert!(
+        samples(&text)
+            .iter()
+            .any(|(name, labels, _)| name == "ignis_retained_state_spills_total"
+                && labels.iter().any(|(k, v)| k == "tier" && v == "disk")),
+        "the retained families carry the disk's rows on a load with the tier"
+    );
+}
+
 // ── the thinking budget (spec server/08) ────────────────────────────────────
 
 /// A thinking chat completion with room for a budget above the answer

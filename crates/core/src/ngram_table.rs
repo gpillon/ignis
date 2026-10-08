@@ -23,7 +23,7 @@
 //! hot list ranks, and no step reads the file again.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -237,9 +237,22 @@ pub struct NgramCounts {
     file_rows: AtomicU64,
     reads: AtomicU64,
     read_bytes: AtomicU64,
+    /// Wall time prefill gathers took, in nanoseconds (spec vram-budget/03
+    /// AC 25: what KV-disk's writes on the same volume may cost them).
+    prefill_gather_nanos: AtomicU64,
 }
 
 impl NgramCounts {
+    /// One prefill gather's wall time.
+    pub fn record_prefill_gather(&self, elapsed: std::time::Duration) {
+        self.prefill_gather_nanos.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// The wall time prefill gathers have taken so far.
+    pub fn prefill_gather_nanos(&self) -> u64 {
+        self.prefill_gather_nanos.load(Ordering::Relaxed)
+    }
+
     /// One gather's rows by source, and the reads behind them.
     pub fn record(&self, hot_rows: u64, file_rows: u64, reads: u64, read_bytes: u64) {
         self.hot_rows.fetch_add(hot_rows, Ordering::Relaxed);
@@ -349,6 +362,40 @@ pub struct NgramTable {
     policy: ReadPolicy,
     pool: ReadPool,
     counts: Arc<NgramCounts>,
+    /// Prefill gathers under way (spec vram-budget/03).
+    prefill_gate: GatherGate,
+}
+
+/// The n-gram gathers a prefill has under way (spec vram-budget/03 AC 22):
+/// what KV-disk's IO threads wait on before issuing a request of their own,
+/// so a spill never slows a prompt's row reads on the volume they share. A
+/// request the tier already issued finishes its window. Decode gathers do
+/// not count: they are a few rows, and the tier keeps at most one request
+/// in flight a direction.
+#[derive(Debug, Clone, Default)]
+pub struct GatherGate(Arc<AtomicUsize>);
+
+impl GatherGate {
+    /// Whether a prefill gather is under way.
+    pub fn pending(&self) -> bool {
+        self.0.load(Ordering::Acquire) > 0
+    }
+
+    /// A gather starts; it ends when the guard drops.
+    pub fn enter(&self) -> GatherGuard {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        GatherGuard(Arc::clone(&self.0))
+    }
+}
+
+/// One prefill gather under way ([`GatherGate::enter`]).
+#[derive(Debug)]
+pub struct GatherGuard(Arc<AtomicUsize>);
+
+impl Drop for GatherGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl NgramTable {
@@ -405,6 +452,7 @@ impl NgramTable {
             policy,
             pool: ReadPool::new(path, options.read_threads)?,
             counts: Arc::default(),
+            prefill_gate: GatherGate::default(),
         };
         Ok(table)
     }
@@ -552,9 +600,20 @@ impl NgramTable {
         Ok(PendingRows { table: self, plan, results })
     }
 
-    /// [`NgramTable::begin`] then [`PendingRows::finish`].
+    /// [`NgramTable::begin`] then [`PendingRows::finish`]: a prefill's
+    /// gather, under the [`GatherGate`] KV-disk waits on.
     pub fn stage(&self, context: &mut NgramContext, tokens: &[u32], out: &mut [u8]) -> Result<(), String> {
-        self.begin(context, tokens)?.finish(out)
+        let _gathering = self.prefill_gate.enter();
+        let started = std::time::Instant::now();
+        let staged = self.begin(context, tokens).and_then(|rows| rows.finish(out));
+        self.counts.record_prefill_gather(started.elapsed());
+        staged
+    }
+
+    /// The gate a prefill's gather raises (spec vram-budget/03), for the
+    /// disk tier to wait on.
+    pub fn prefill_gate(&self) -> GatherGate {
+        self.prefill_gate.clone()
     }
 
     /// The rows gathered so far, by source.
@@ -1021,9 +1080,25 @@ mod tests {
     }
 
     #[test]
+    fn a_prefill_gather_holds_the_gate_only_while_it_runs() {
+        // Spec vram-budget/03 AC 22: KV-disk waits on this before each IO of
+        // its own. Nested guards count, and the gate clears with the last.
+        let gate = GatherGate::default();
+        assert!(!gate.pending());
+        let first = gate.enter();
+        let second = gate.clone().enter();
+        assert!(gate.pending());
+        drop(first);
+        assert!(gate.pending(), "one gather is still under way");
+        drop(second);
+        assert!(!gate.pending());
+    }
+
+    #[test]
     fn a_decode_step_stages_every_lanes_token_lane_major() {
         let table_file = TableFile::write("lanes", 1_000, 4096);
         let table = NgramTable::open(&table_file.path, table_file.layout, hasher(1_000), &[5, 50], options(1 << 16)).unwrap();
+        assert_eq!(table.counts().prefill_gather_nanos(), 0);
         let prompts: [&[u32]; 3] = [&[1, 2, 3], &[9, 7], &[4]];
         let next = [21u32, 22, 23];
         // Each sequence alone: its prompt, then its next token.
@@ -1036,6 +1111,8 @@ mod tests {
             table.stage(&mut context, &[token], &mut step).unwrap();
             alone.push(step);
         }
+        // Spec vram-budget/03 AC 25: a staged gather's wall time is counted.
+        assert!(table.counts().prefill_gather_nanos() > 0);
         // The three prompts admitted, then one decode step for all lanes.
         let mut contexts: Vec<NgramContext> = (0..3).map(|_| table.new_context()).collect();
         for (context, prompt) in contexts.iter_mut().zip(prompts) {

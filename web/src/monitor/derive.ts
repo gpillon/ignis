@@ -9,6 +9,8 @@ import {
   type ExpertPhase,
   emptySnapshot,
   type Histogram,
+  KV_DISK_SPILL_SOURCES,
+  type KvDiskSpillSource,
   REJECT_REASONS,
   type RejectReason,
   RETAINED_FAMILY_KEYS,
@@ -110,6 +112,8 @@ export type Memory = {
   oversubscribed: boolean;
   pagesInUse: Meter;
   arenaInUse: Meter;
+  /** The KV-disk tier's bytes against its budget (spec vram-budget/03); null on a load without the tier. */
+  diskInUse: Meter | null;
   slotsInUse: Meter;
   /**
    * Where the retained slots live (GitHub #281): how many in the pinned host
@@ -236,11 +240,12 @@ export type EvictionTierName = (typeof EVICTION_TIERS)[number];
  *   is how the tier below fills up.
  *
  * A column is `null` when the tier has no such departure to report — and every
- * column is `null` on a tier that does not exist (`implemented: false`).
+ * column is `null` on a tier that does not exist (`implemented: false`: the
+ * disk row on a load without the KV-disk tier, spec vram-budget/03).
  */
 export type TierEvictions = {
   tier: EvictionTierName;
-  /** False when no metric feeds this row because the tier is not built yet. */
+  /** False when no metric feeds this row because this load has no such tier. */
   implemented: boolean;
   live: Counter | null;
   retained: Counter | null;
@@ -256,6 +261,10 @@ function sumKnown(values: (number | null)[]): number | null {
 }
 
 const totalRejected: CounterPick = (s) => sumKnown(REJECT_REASONS.map((r) => s.rejected[r]));
+
+/** The live sequences written into the disk tier, from the device and from KV-RAM (spec vram-budget/03). */
+const diskSpills = (s: Snapshot, source?: KvDiskSpillSource): number | null =>
+  s.kvDisk ? sumKnown(KV_DISK_SPILL_SOURCES.filter((from) => !source || from === source).map((from) => s.kvDisk!.spills[from])) : null;
 
 /** One retained-state family's figure for a tier, over both kinds (GitHub #224). */
 function retainedAt(s: Snapshot, family: RetainedFamily, tier: RetainedTier): number | null {
@@ -357,27 +366,43 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
       // Out of VRAM: a live sequence snapshotted to RAM, retained state
       // dropped outright, and retained state spilled down to RAM — a spill is
       // recorded *into* `kv_ram`, and arriving there is the same act as
-      // leaving the device.
+      // leaving the device. With the KV-disk tier, a live sequence written
+      // straight to disk left the device too (spec vram-budget/03).
       vram: {
         tier: "vram",
         implemented: true,
-        live: counter((s) => s.kvEvictions),
+        live: counter((s) => (s.kvDisk ? sumKnown([s.kvEvictions, diskSpills(s, "device")]) : s.kvEvictions)),
         retained: counter((s) => retainedAt(s, "discards", "device")),
         demoted: counter((s) => retainedAt(s, "spills", "kv_ram")),
       },
       // Out of RAM: a live snapshot dropped to make room (the request loses
-      // every prefilled token), and retained blobs forgotten. Nothing is
-      // demoted below RAM, because there is no tier below it yet.
+      // every prefilled token), and retained blobs forgotten. With the
+      // KV-disk tier below it, retained state spilled into the disk and live
+      // snapshots demoted to it left RAM and survived; without, nothing is
+      // demoted because there is no tier below RAM.
       ram: {
         tier: "ram",
         implemented: true,
         live: counter((s) => s.kvRamEvictions),
         retained: counter((s) => retainedAt(s, "discards", "kv_ram")),
-        demoted: null,
+        demoted: last.kvDisk ? counter((s) => sumKnown([retainedAt(s, "spills", "disk"), diskSpills(s, "kv_ram")])) : null,
       },
-      // Reserved, never fed (ADR 0017): no disk tier exists, and the panel
-      // says so rather than showing a zero that could be mistaken for one.
-      disk: { tier: "disk", implemented: false, live: null, retained: null, demoted: null },
+      // The disk has nothing below it, so its row reads arrivals into the tier
+      // where the rows above read departures: `live` is the live sequences
+      // spilled into it (either source), `demoted` the retained state spilled
+      // into it, and `retained` the retained state it discarded (spec
+      // vram-budget/03). On a load without the tier the series are absent and
+      // the row stays inert, so the panel does not show a zero for a tier
+      // that is off (ADR 0017).
+      disk: last.kvDisk
+        ? {
+            tier: "disk",
+            implemented: true,
+            live: counter((s) => diskSpills(s)),
+            retained: counter((s) => retainedAt(s, "discards", "disk")),
+            demoted: counter((s) => retainedAt(s, "spills", "disk")),
+          }
+        : { tier: "disk", implemented: false, live: null, retained: null, demoted: null },
     },
     ttft: latency((s) => s.ttft),
     duration: latency((s) => s.duration),
@@ -398,6 +423,7 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     rejected: { full: byReason.full.window, unknown_model: byReason.unknown_model.window, oversized: byReason.oversized.window },
     evictions: dash.evictions.vram.live?.window ?? null,
     ramDrops: dash.evictions.ram.live?.window ?? null,
+    diskReadFailures: increaseOver(points, (s) => s.kvDisk?.failures.read ?? null, from),
     ttftP95: dash.ttft.p95,
   });
   return dash;
@@ -545,6 +571,7 @@ export function deriveMemory(points: Point[], since: number): Memory {
     oversubscribed: mem.budgetBytes !== null && linesBytes !== null && linesBytes + (kvPoolBytes ?? 0) > mem.budgetBytes,
     pagesInUse: meter(mem.kvPoolUsedPages, mem.kvPoolPages, (s) => s.memory.kvPoolUsedPages),
     arenaInUse: meter(mem.kvRamArena.used, mem.kvRamArena.capacity, (s) => s.memory.kvRamArena.used),
+    diskInUse: last.kvDisk ? meter(last.kvDisk.used, last.kvDisk.capacity, (s) => s.kvDisk?.used ?? null) : null,
     slotsInUse: meter(mem.retainedSlots.inUse, mem.retainedSlots.capacity, (s) => s.memory.retainedSlots.inUse),
     slotHomes: {
       hostSlots: mem.retainedHost.slots,
@@ -583,6 +610,8 @@ export type HealthInput = {
   evictions: number | null;
   /** Live snapshots dropped out of RAM in the window: their work is gone (GitHub #224). */
   ramDrops: number | null;
+  /** Disk files refused at restore in the window: torn, corrupt or foreign, so a live request re-prefilled (spec vram-budget/03). */
+  diskReadFailures: number | null;
   ttftP95: number | null;
 };
 
@@ -608,16 +637,25 @@ export function assessHealth(h: HealthInput): Health {
   // A RAM drop outranks a VRAM eviction: the evicted request keeps its work in
   // host RAM, the dropped one re-prefills from zero (GitHub #224).
   if (n(h.ramDrops)) notes.push(`${plural(n(h.ramDrops), "snapshot")} dropped from host RAM: re-prefilled from the start`);
+  // A disk read failure costs what a RAM drop does: the request re-prefills.
+  if (n(h.diskReadFailures)) notes.push(`${plural(n(h.diskReadFailures), "KV-disk file")} refused at restore: re-prefilled from the start`);
   if (n(h.cancelled) >= 2 && n(h.cancelled) / finished >= 0.2) notes.push(`${formatShare(n(h.cancelled), finished)} of finished requests cancelled`);
   if (slow) notes.push(`p95 time to first token ${formatSeconds(h.ttftP95)}`);
 
   if (full) return { level: "saturated", summary: `${plural(full, "request")} turned away in the last ${win}`, notes };
   // A dropped snapshot is lost work, so it saturates where an eviction only
-  // makes the server busy (GitHub #224).
+  // makes the server busy (GitHub #224); so is a disk file refused at restore.
   if (n(h.ramDrops)) {
     return {
       level: "saturated",
       summary: `${plural(n(h.ramDrops), "snapshot")} dropped from host RAM in the last ${win}`,
+      notes,
+    };
+  }
+  if (n(h.diskReadFailures)) {
+    return {
+      level: "saturated",
+      summary: `${plural(n(h.diskReadFailures), "KV-disk file")} refused at restore in the last ${win}`,
       notes,
     };
   }

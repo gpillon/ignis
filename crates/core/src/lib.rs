@@ -37,6 +37,7 @@ pub mod checkpoint;
 pub mod compute;
 pub mod concrete;
 pub mod decision;
+pub mod disk;
 #[cfg(feature = "cuda")]
 pub mod flash_next;
 #[cfg(feature = "cuda")]
@@ -106,14 +107,15 @@ pub use kv_format::{
     DEFAULT_KV_POOL_BYTES, KV_PAGE_TOKENS, KvBudgetTooSmall, KvFormat, KvGeometry, KvPlaneDtype,
     KvPlaneSpec, KvPoolPlan, auto_kv_pool_bytes, plan_kv_pool, plan_kv_pool_for_context,
 };
-pub use mock::{MockCompute, MockSections};
+pub use mock::{FakeDisk, MockCompute, MockSections};
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
 pub use retained_slot::{
     NotTaken, RetainedHolder, RetainedSkip, RetainedSlot, RetainedSlotLedger, RetainedSlots,
 };
 pub use scheduler::{
-    Compute, DecodeJob, DecodeOutcome, Occupancy, PrefillJob, PrefillOutcome, RetainedAt, Scheduler,
+    Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource,
+    DiskTarget, Occupancy, PrefillJob, PrefillOutcome, RetainedAt, Scheduler,
 };
 pub use rope_scaling::{
     DEFAULT_YARN_BETA_FAST, DEFAULT_YARN_BETA_SLOW, DEFAULT_YARN_TEMPERATURE,

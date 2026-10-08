@@ -183,6 +183,10 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     ignis_seq_set_last_error(std::string("ignis_seq_prefix_publish: ") + refusal);
     return -1;
   }
+  if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
+    ignis_seq_set_last_error(std::string("ignis_seq_prefix_publish: ") + refusal);
+    return -1;
+  }
   if (seq->lent_to != nullptr) {
     // GitHub #306: its first own pages are a pages-only link's on loan, and a
     // publish would hand them to a second owner.
@@ -466,7 +470,8 @@ extern "C" int32_t ignis_seq_prefix_snapshot_size(const struct ignis_seq_pool *p
 
 extern "C" int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
                                               const struct ignis_seq_prefix *prefix, void *dst,
-                                              uint64_t dst_bytes) {
+                                              uint64_t dst_bytes,
+                                              const struct ignis_seq_transfer *window) {
   if (pool == nullptr || prefix == nullptr || dst == nullptr) {
     ignis_seq_set_last_error("ignis_seq_prefix_snapshot: null argument");
     return -1;
@@ -484,6 +489,13 @@ extern "C" int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
     return -1;
   }
   try {
+    if (window != nullptr) {
+      ignis_seq_write_materialized_window(*pool, prefix, -1,
+                                          static_cast<std::uint32_t>(prefix->retained_slot),
+                                          prefix->progress, ignis_seq_prefix_total_pages(*prefix), dst,
+                                          dst_bytes, *window);
+      return 0;
+    }
     ignis_seq_write_materialized_blob(*pool, prefix, -1,
                                       static_cast<std::uint32_t>(prefix->retained_slot),
                                       prefix->progress, ignis_seq_prefix_total_pages(*prefix), dst,

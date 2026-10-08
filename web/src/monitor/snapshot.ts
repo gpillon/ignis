@@ -40,8 +40,12 @@ export const VRAM_LINES = [
 ] as const;
 export type VramLine = (typeof VRAM_LINES)[number];
 
-/** Where retained state lives: on the device, or spilled to the pinned host arena. */
-export const RETAINED_TIERS = ["device", "kv_ram"] as const;
+/**
+ * Where retained state lives: on the device, spilled to the pinned host arena,
+ * or written to disk. The disk rows exist only on a load with the KV-disk tier
+ * (spec vram-budget/03): a scrape without them leaves that tier `null`.
+ */
+export const RETAINED_TIERS = ["device", "kv_ram", "disk"] as const;
 export type RetainedTier = (typeof RETAINED_TIERS)[number];
 
 /** What was retained: a prompt checkpoint, or a shared prefix (GitHub #216). */
@@ -63,6 +67,27 @@ export const RETAINED_FAMILY_KEYS = Object.keys(RETAINED_FAMILIES) as RetainedFa
 /** Why a publish or a capture left no reuse behind (ADR 0030 §Observability). */
 export const SLOT_SKIP_REASONS = ["publish_skipped_no_slot", "capture_skipped_no_slot", "capture_skipped_no_page"] as const;
 export type SlotSkipReason = (typeof SLOT_SKIP_REASONS)[number];
+
+/** How a live sequence reached the disk tier: straight from the device, or demoted from KV-RAM. */
+export const KV_DISK_SPILL_SOURCES = ["device", "kv_ram"] as const;
+export type KvDiskSpillSource = (typeof KV_DISK_SPILL_SOURCES)[number];
+
+/** The KV-disk operations that can be refused: a write (margin or IO error), or a restore read (torn, corrupt, foreign file). */
+export const KV_DISK_OPS = ["write", "read"] as const;
+export type KvDiskOp = (typeof KV_DISK_OPS)[number];
+
+/**
+ * The KV-disk tier (spec vram-budget/03, ADR 0017): its budget and what the
+ * committed files hold, the live sequences spilled into it and the operations
+ * it refused. Null on a load without the tier, where the server renders none
+ * of these series.
+ */
+export type KvDisk = {
+  capacity: number | null;
+  used: number | null;
+  spills: Record<KvDiskSpillSource, number | null>;
+  failures: Record<KvDiskOp, number | null>;
+};
 
 /** One retained-state family: a count per tier and kind. */
 export type RetainedMatrix = Record<RetainedTier, Record<RetainedKind, number | null>>;
@@ -165,6 +190,8 @@ export type Snapshot = {
   prefixReusedTokens: number | null;
   /** The six retained-state families, each split by tier and kind (GitHub #190, #216). */
   retained: Record<RetainedFamily, RetainedMatrix>;
+  /** The KV-disk tier (spec vram-budget/03); null on a load without it. */
+  kvDisk: KvDisk | null;
   memory: Memory;
   /** Null on a load without an expert cache: a 27B load. */
   experts: ExpertResidency | null;
@@ -243,6 +270,9 @@ const KNOWN = new Set<string>([
   "ignis_request_duration_seconds",
   "ignis_vram_reserved_bytes",
   "ignis_kv_ram_arena_bytes",
+  "ignis_kv_disk_bytes",
+  "ignis_kv_disk_spills_total",
+  "ignis_kv_disk_failures_total",
   "ignis_retained_slots",
   "ignis_retained_slot_skips_total",
   ...Object.values(COUNTERS),
@@ -272,6 +302,7 @@ export function emptySnapshot(): Snapshot {
     kvRamEvictions: null,
     prefixReusedTokens: null,
     retained: Object.fromEntries(RETAINED_FAMILY_KEYS.map((key) => [key, emptyMatrix()])) as Snapshot["retained"],
+    kvDisk: null,
     memory: {
       reserved: Object.fromEntries(VRAM_LINES.map((line) => [line, null])) as Record<VramLine, number | null>,
       budgetBytes: null,
@@ -327,6 +358,16 @@ export function readSnapshot({ families }: Exposition): Snapshot {
   };
   mem.retainedHost = { slots: valueOf(RETAINED_HOST.slots), bytes: valueOf(RETAINED_HOST.bytes) };
   for (const reason of SLOT_SKIP_REASONS) mem.slotSkips[reason] = valueOf("ignis_retained_slot_skips_total", ["reason", reason]);
+
+  // The KV-disk tier, all or nothing: a load with it renders its series from the first scrape, a load without renders none.
+  if (families.has("ignis_kv_disk_bytes")) {
+    snap.kvDisk = {
+      capacity: valueOf("ignis_kv_disk_bytes", ["state", "capacity"]),
+      used: valueOf("ignis_kv_disk_bytes", ["state", "used"]),
+      spills: { device: valueOf("ignis_kv_disk_spills_total", ["from", "device"]), kv_ram: valueOf("ignis_kv_disk_spills_total", ["from", "kv_ram"]) },
+      failures: { write: valueOf("ignis_kv_disk_failures_total", ["op", "write"]), read: valueOf("ignis_kv_disk_failures_total", ["op", "read"]) },
+    };
+  }
 
   // Flash-Next's families, all or nothing per table: a 27B load renders none.
   if (families.has(EXPERT_FAMILIES.hits)) {
@@ -399,6 +440,12 @@ function inContract(family: string, s: Sample): boolean {
       return oneOf(VRAM_LINES, s.labels.line);
     case "ignis_kv_ram_arena_bytes":
       return s.labels.state === "capacity" || s.labels.state === "used";
+    case "ignis_kv_disk_bytes":
+      return s.labels.state === "capacity" || s.labels.state === "used";
+    case "ignis_kv_disk_spills_total":
+      return oneOf(KV_DISK_SPILL_SOURCES, s.labels.from) && Object.keys(s.labels).length === 1;
+    case "ignis_kv_disk_failures_total":
+      return oneOf(KV_DISK_OPS, s.labels.op) && Object.keys(s.labels).length === 1;
     case "ignis_retained_slots":
       return s.labels.state === "capacity" || s.labels.state === "in_use";
     case "ignis_retained_slot_skips_total":
@@ -435,6 +482,8 @@ export function counterValues(s: Snapshot): (number | null)[] {
     ...REJECT_REASONS.map((r) => s.rejected[r]),
     ...RETAINED_FAMILY_KEYS.flatMap((key) => RETAINED_TIERS.flatMap((tier) => RETAINED_KINDS.map((kind) => s.retained[key][tier][kind]))),
     ...SLOT_SKIP_REASONS.map((reason) => s.memory.slotSkips[reason]),
+    ...KV_DISK_SPILL_SOURCES.map((source) => s.kvDisk?.spills[source] ?? null),
+    ...KV_DISK_OPS.map((op) => s.kvDisk?.failures[op] ?? null),
     ...EXPERT_CLASSES.flatMap((cls) => EXPERT_PHASES.flatMap((phase) => [s.experts?.hits[cls][phase] ?? null, s.experts?.misses[cls][phase] ?? null])),
     s.experts?.prefetchIssued ?? null,
     s.experts?.prefetchUsed ?? null,

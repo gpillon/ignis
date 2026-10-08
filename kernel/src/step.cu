@@ -1410,6 +1410,10 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   if (!validate_program(model, pool, seq, token_ids, num_tokens, sampling)) {
     return -1;
   }
+  if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
+    set_error(std::string("ignis_program_prefill: ") + refusal);
+    return -1;
+  }
   if (!dflash2_matches_load(model, pool, "ignis_program_prefill")) {
     return -1;
   }
@@ -1773,6 +1777,10 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       ignis_seq *seq = sequences[i];
       if (seq == nullptr || seq->pending_token < 0) {
         set_error("ignis_program_decode: sequence is null or was not prefilled");
+        return -1;
+      }
+      if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
+        set_error(std::string("ignis_program_decode: ") + refusal);
         return -1;
       }
       const uint64_t capacity = ignis_seq_token_capacity(*seq);
@@ -2224,6 +2232,10 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       ignis_seq *seq = sequences[i];
       if (seq == nullptr || seq->pending_token < 0) {
         set_error("ignis_program_decode: sequence is null or was not prefilled");
+        return -1;
+      }
+      if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
+        set_error(std::string("ignis_program_decode: ") + refusal);
         return -1;
       }
       if (seq->position >= ignis_seq_token_capacity(*seq)) {

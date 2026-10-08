@@ -272,4 +272,14 @@ void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_s
                                        const ignis_seq_progress_image &progress,
                                        std::uint32_t pages, void *dst, std::uint64_t dst_bytes);
 
+/* One window of the blob above (spec vram-budget/03): `dst` receives
+ * `window`'s bytes of it, the device copies issued on its stream and not
+ * synchronized. Defined in kernel/src/seq.cu beside the runs it is built of.
+ * Throws as the whole call does, and on a window that does not fit the blob
+ * or `dst_bytes`. */
+void ignis_seq_write_materialized_window(const ignis_seq_pool &pool, const ignis_seq_prefix *chain,
+                                         std::int32_t tail_page, std::uint32_t retained_slot,
+                                         const ignis_seq_progress_image &progress, std::uint32_t pages,
+                                         void *dst, std::uint64_t dst_bytes, const ignis_seq_transfer &window);
+
 #endif /* IGNIS_SEQ_PREFIX_INTERNAL_H */

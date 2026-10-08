@@ -486,8 +486,11 @@ function ReasonBars({ byReason }: { byReason: Dashboard["rejected"]["byReason"] 
 const EVICTION_TIER_LABEL: Record<EvictionTierName, { name: string; note: string }> = {
   vram: { name: "VRAM", note: "work survives in host RAM" },
   ram: { name: "RAM", note: "work is lost, the request re-prefills" },
-  disk: { name: "Disk", note: "not implemented" },
+  disk: { name: "Disk", note: "arrivals into the tier, nothing below it" },
 };
+
+/** The disk row's note on a load without the KV-disk tier (spec vram-budget/03). */
+const DISK_OFF_NOTE = "off on this load";
 
 /** The VRAM row's Retained cell on a load with no device retained slots (GitHub #306). */
 const RETAINED_IN_HOST_RAM = "This load has no device retained slots: its retained state lives in host RAM";
@@ -529,7 +532,7 @@ function EvictionsCard({ evictions, deviceSlots, chart, win }: { evictions: Evic
               <tr key={tier} className={row.implemented ? undefined : "text-ash/50"}>
                 <th scope="row" className="py-1 text-left font-display text-[13px] font-semibold">
                   {label.name}
-                  <span className="ml-1.5 font-sans text-[10px] font-normal text-ash">{label.note}</span>
+                  <span className="ml-1.5 font-sans text-[10px] font-normal text-ash">{row.implemented ? label.note : tier === "disk" ? DISK_OFF_NOTE : label.note}</span>
                 </th>
                 <EvictionCell counter={row.live} emphasis={tier === "ram"} />
                 <EvictionCell counter={row.retained} title={retainedTitle} />
@@ -687,7 +690,7 @@ const FAMILY_LABEL: Record<RetainedFamily, string> = {
   restores: "Restores",
 };
 
-const TIER_LABEL: Record<RetainedTier, string> = { device: "Device", kv_ram: "KV-RAM" };
+const TIER_LABEL: Record<RetainedTier, string> = { device: "Device", kv_ram: "KV-RAM", disk: "Disk" };
 const KIND_LABEL: Record<RetainedKind, string> = { checkpoint: "Checkpoint", prefix: "Prefix" };
 
 const SKIP_LABEL: Record<SlotSkipReason, string> = {
@@ -876,6 +879,11 @@ function OccupancyCard({ memory, win }: { memory: Memory; win: string }) {
         <MeterRow label="KV-RAM arena" meter={memory.arenaInUse} format={formatBytes} color="var(--series-2)" aside="pinned host memory, whole at start">
           <Sparkline values={memory.arenaInUse.series} color="var(--series-2)" height={30} />
         </MeterRow>
+        {memory.diskInUse && (
+          <MeterRow label="KV-disk" meter={memory.diskInUse} format={formatBytes} color="var(--series-3)" aside="bytes the committed files hold, against the tier's budget">
+            <Sparkline values={memory.diskInUse.series} color="var(--series-3)" height={30} />
+          </MeterRow>
+        )}
         <MeterRow
           label="Retained slots"
           meter={memory.slotsInUse}
@@ -919,7 +927,10 @@ function OccupancyCard({ memory, win }: { memory: Memory; win: string }) {
  * back, so they are never summed into one figure here.
  */
 function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
-  const columns = RETAINED_TIERS.flatMap((tier) => RETAINED_KINDS.map((kind) => ({ tier, kind, key: `${tier}/${kind}` })));
+  // The disk columns exist only on a load with the KV-disk tier (spec vram-budget/03).
+  const columns = RETAINED_TIERS.filter((tier) => tier !== "disk" || memory.diskInUse !== null).flatMap((tier) =>
+    RETAINED_KINDS.map((kind) => ({ tier, kind, key: `${tier}/${kind}` })),
+  );
   return (
     <Card title="Retained state" subtitle={`What reuse held, moved and gave up · gains over the last ${win}`}>
       <div className="overflow-x-auto">
@@ -941,7 +952,8 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
                 {columns.map((c) => {
                   const cell = memory.retained[family][c.tier][c.kind];
                   // A zero where the meters above would show a dash: `render()`
-                  // writes all twenty-four of these on every scrape, so an
+                  // writes all twenty-four of these (thirty-six with KV-disk)
+                  // on every scrape, so an
                   // absent one means a server older than #216, not an idle
                   // tier — and reading it as zero is the truthful thing.
                   // The prefix walk raises no miss at all, so this series is
@@ -971,7 +983,7 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
       <p className="text-[11px] text-ash">
         Tokens reused counts prompt tokens skipped and the two lookup rows count lookups; spills, discards and restores count images. A load that never spilled
         shows KV-RAM at zero, and a load with prompt reuse off shows every column at zero. A column shows a zero whether the load reported one or reported
-        nothing at all: the server emits all twenty-four series on every scrape, so an absent one means an older server, not an idle tier.
+        nothing at all: the server emits all twenty-four series (thirty-six on a load with the disk tier) on every scrape, so an absent one means an older server, not an idle tier.
       </p>
     </Card>
   );

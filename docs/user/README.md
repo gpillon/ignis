@@ -267,6 +267,40 @@ class is refused whatever the flag says.
 | `--retained-host <n>` | `IGNIS_RETAINED_HOST` | two per decode lane (16); `0` with `--prompt-reuse off` | Retained slots in one pinned host block reserved at start, ~222 MiB each at the default load (3.5 GiB for 16): no VRAM, so the KV pool gets it; a capture and a claim each cost a PCIe copy (~15–19 ms). Both kinds hold the images of retained checkpoints and shared prefixes. When none is free, retained state gives one up — checkpoints before prefixes, `agent` before `interactive`, then least recently used; when nothing can, the publish or capture is skipped. `--retained-slots` was replaced by these two and now refuses the start. |
 | `--retained-interactive-ttl <secs>` | `IGNIS_RETAINED_INTERACTIVE_TTL` | `300` | Idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's. Needs `--prompt-reuse on`. |
 
+### KV-disk
+
+The tier below KV-RAM ([ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md)):
+when a sequence has to leave the device and KV-RAM has no room for it, or
+KV-RAM needs room for a newer one, its state is written to a file instead of
+being dropped, and read back when its turn comes -- exactly where it stopped,
+with no token re-prefilled. Retained prompt checkpoints KV-RAM gives up go
+there too, and a later request on the same conversation restores from the
+file when that saves at least the restore floor (8,192 tokens on Flash-Next,
+16,384 on the 27B) over re-prefilling.
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--kv-disk-bytes <bytes>` | `IGNIS_KV_DISK_BYTES` | `4G` on Flash-Next (about three whole 262K-token lanes, ~1.25 GB each), `0` (off) on the 27B | The tier's ceiling (accepts `K`/`M`/`G`). At start it is cut to the volume's free space less a 10 GiB margin, and printed with the directory on `ignis.kv_disk.ready`; a WARN says when it was cut, and a volume with no room above the margin starts without the tier. A write that would cross the margin is refused and the state stays where it was. `0` turns the tier off. (`make` knob `KV_DISK_BYTES`.) |
+| `--kv-disk-path <model\|auto\|dir>` | `IGNIS_KV_DISK_PATH` | `model` | Where the files go, by the n-gram cache's rule: `model` is the artifact's own directory, `auto` is `LOCALAPPDATA/ignis/cache/kv-disk` on Windows and `XDG_CACHE_HOME/ignis/kv-disk` or `HOME/.cache/ignis/kv-disk` on Linux, anything else is that directory. (`make` knob `KV_DISK_PATH`.) |
+
+- Each process writes in its own `ignis-kv-disk/<pid>-<nonce>/` directory
+  there, locked for its life, and removes it at shutdown; a dead process's
+  directory is removed at the next start. Nothing is reused across a restart,
+  and two servers on one location never touch each other's files.
+- One file per state, written with unbuffered IO in 32 MiB windows through
+  64 MiB of pinned staging reserved at load, on two IO threads of its own. A
+  file's header is written last, with a CRC32 per window: a file torn by a
+  crash, corrupted, or written by another load is never restored. A live
+  request whose file is refused is prefilled again from its tokens.
+- The model thread never waits on the disk: a move is a few steps during
+  which the other lanes keep decoding, and a Flash-Next prefill's n-gram
+  reads go before the tier's.
+- When the device, KV-RAM and the disk are all full of live work, a new
+  request waits in the queue until room returns: nothing is refused or loses
+  work for it (the in-flight cap's 503 is unchanged).
+- With `--metrics` the tier is `tier="disk"` on the retained-state series and
+  `ignis_kv_disk_*` (bytes, spills, failures); the Monitor shows a Disk row.
+
 ### Flash-Next n-gram startup cache
 
 | Flag | Env | Default | Meaning |
@@ -333,7 +367,8 @@ file per artifact remains. This cache is separate from prompt/KV reuse.
 ### Host RAM for Flash-Next
 
 Serving Flash-Next needs about **46-48 GB of available RAM**: 38 GB of pinned
-experts, 1 GB of n-gram hot rows, ~0.5 GB of staging, ~1 GB of retained host
+experts, 1 GB of n-gram hot rows, ~0.5 GB of staging (KV-disk's 64 MiB
+included: `--kv-disk-bytes 0` drops it), ~1 GB of retained host
 slots, the 2 GiB KV-RAM arena and the 6 GB margin the load refuses to dip into
 (it never lets reuse push Windows into paging). A load below that is refused
 naming the plan line to shrink. The knobs that lower it, with what each costs:
@@ -878,7 +913,9 @@ With `CUDA=1` the server starts with `MAX_CONTEXT=524288` and
 and the YaRN table that stretches the envelope to match (the gate legs ran at
 `MAX_CONTEXT=262144 ROPE_SCALING=none`) -- `KV_FORMAT=hq-e8-2b`,
 `SPEC=dflash2` with
-`DRAFT_TOKENS=7`, `KV_HOST_POOL_BYTES=8G`, `REQUEST_TIMEOUT=1800`. `SPEC=` turns
+`DRAFT_TOKENS=7`, `KV_HOST_POOL_BYTES=8G`, `REQUEST_TIMEOUT=1800`.
+`KV_DISK_BYTES` and `KV_DISK_PATH` set [KV-disk](#kv-disk) (`make config`
+prints its budget and directory). `SPEC=` turns
 speculation off. `VISION=1` loads the tower; `UNCENSORED=1` loads
 [the uncensored variant](#the-uncensored-variant) in place of the default
 image; `ROPE_SCALING=yarn:4` rescales the

@@ -522,10 +522,12 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         | SchedEvent::PrefixReused { request, .. }
         | SchedEvent::StateReused { request, .. }
         | SchedEvent::PrefillChunk { request, .. }
-        | SchedEvent::RetainedSlotSkipped { request, .. } => Some(*request),
+        | SchedEvent::RetainedSlotSkipped { request, .. }
+        | SchedEvent::DiskSpilled { request, .. } => Some(*request),
         SchedEvent::Protected { .. }
         | SchedEvent::RetainedState { .. }
-        | SchedEvent::RetainedSlots { .. } => None,
+        | SchedEvent::RetainedSlots { .. }
+        | SchedEvent::DiskFailure { .. } => None,
     }
 }
 
@@ -582,6 +584,8 @@ async fn telemetry_task(
                 } => telemetry.on_restored(request, restore_micros),
                 SchedEvent::Requeued { request } => telemetry.on_requeued(request),
                 SchedEvent::SnapshotDropped { request } => telemetry.on_snapshot_dropped(request),
+                SchedEvent::DiskSpilled { request, from } => telemetry.on_disk_spilled(request, from),
+                SchedEvent::DiskFailure { op } => telemetry.on_disk_failure(op),
                 SchedEvent::Done {
                     request,
                     tokens,
