@@ -131,7 +131,6 @@ __global__ void append_bf16_kernel(AppendArgs a) {
 }
 
 constexpr int kHqWarps = 8;
-constexpr int32_t kGroupedRows = 8;  // the grouped projection's ceiling: the FP8 GEMV route's
 
 // The vendored residual-row addressing at Flash-Next's KV head count.
 struct HqGeometry {
@@ -300,7 +299,7 @@ int32_t run(const Geometry &g, const Kv &kv, const indexer::Rope &rope, const Qs
     // FP8 and the call is a GEMV's width; a split call's combine takes the output gate.
     const bool fusion = fused(Fusion::Qsa);
     const auto fp8 = [](const Linear &l) { return l.format == WeightFormat::Fp8RowScale; };
-    if (fusion && rows <= kGroupedRows && fp8(w.q_proj) && fp8(w.k_proj) && fp8(w.v_proj)) {
+    if (fusion && rows <= IGNIS_FP8_GEMV_MAX_TOKENS && fp8(w.q_proj) && fp8(w.k_proj) && fp8(w.v_proj)) {
       const ignis_fp8_segment segments[3] = {{w.q_proj.data, static_cast<uint32_t>(kQProjWidth), qg},
                                              {w.k_proj.data, static_cast<uint32_t>(kKvWidth), k},
                                              {w.v_proj.data, static_cast<uint32_t>(kKvWidth), v}};

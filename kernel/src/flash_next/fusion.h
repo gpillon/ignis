@@ -14,13 +14,13 @@
 namespace ignis::flash_next {
 
 enum class Fusion : int32_t {
-  HcNorm,   // step 1: the HC norm inside the mix's down launch      IGNIS_FN_HC_FUSED
-  Inject,   // step 2: the pending inject (and combine) in the next mix  IGNIS_FN_INJECT_FUSED
-  Score,    // step 3: the indexer score over the visible blocks only    IGNIS_FN_SCORE_FUSED
-  Gdn,      // step 4: one grouped GEMV for qkv, z, a, b; gating in conv IGNIS_FN_GDN_FUSED
-  Route,    // step 5: router select and residency's demand resolve  IGNIS_FN_ROUTE_FUSED
-  Qsa,      // step 6: one grouped GEMV for q, k, v; the gate in the combine  IGNIS_FN_QSA_FUSED
-  Staging,  // step 7: a round's inputs staged in one pinned copy        IGNIS_FN_STAGING_FUSED
+  HcNorm,   // step 1: the HC norm inside the mix's down launch (1-3 rows)     IGNIS_FN_HC_FUSED
+  Inject,   // step 2: the pending inject (and combine) in the next mix (1 row) IGNIS_FN_INJECT_FUSED
+  Score,    // step 3: the decode score's keys staged in 16-byte loads         IGNIS_FN_SCORE_FUSED
+  Gdn,      // step 4: one grouped GEMV for qkv, z, a, b; the gating in conv   IGNIS_FN_GDN_FUSED
+  Route,    // step 5: the router's select inside residency's demand resolve   IGNIS_FN_ROUTE_FUSED
+  Qsa,      // step 6: one grouped GEMV for q, k, v; the gate in the combine   IGNIS_FN_QSA_FUSED
+  Staging,  // step 7: a round's input copies from page-locked memory          IGNIS_FN_STAGING_FUSED
   kCount
 };
 

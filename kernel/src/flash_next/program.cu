@@ -12,8 +12,8 @@
 //   prefetch half;
 // then the head (the final mixer and lm_head) on the rows that are drawn from. Since GitHub #306's
 // decode fusion (fusion.h) each inject -- the MoE's with its combine -- is handed to the next mix,
-// which on a decode round applies it inside its own first launch, and a round's selection is made
-// inside residency's demand launch.
+// which on a one-lane decode round applies it inside its own first launch, and a round's selection
+// is made inside residency's demand launch.
 //
 // A chunk is one lane of up to prefill_chunk_tokens tokens, run eagerly out of the handle's
 // scratch arena, its frontiers advanced once the chunk's work is confirmed complete. A round is
@@ -1125,7 +1125,11 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
         check_cuda(cudaMemcpyAsync(model->sampling_decode_permitted_counts->p, src_counts, lane_bytes,
                                    cudaMemcpyHostToDevice, stream),
                    "staging the permitted counts", &error)));
-  if (!staged) return refuse(error);
+  if (!staged) {
+    // Copies queued before the failure may still read round_inputs, which the next round rewrites.
+    (void)cudaStreamSynchronize(stream);
+    return refuse(error);
+  }
 
   // A constrained round runs eagerly: its mask sits between the head and the draw, as the 27B's.
   const bool use_graph = model->decode_graph_ready[width - 1] && !constrained;

@@ -29,7 +29,7 @@
 
 #include "fusion.h"
 
-#include "../moe_common.cuh"
+#include "../moe_combine.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -379,31 +379,9 @@ struct PendingArgs {
   const __nv_bfloat16 *w_gate = nullptr;
 };
 
-// The MoE combine's gate of one row, by the whole CTA: sigmoid(x . w_gate) as
-// ignis_moe_combine's CTA computes it -- each thread's strided fmaf chain, the
-// warp butterfly, the warps' partials summed in order by thread 0 -- broadcast
-// through `slot`. (Both run kThreads == 256 threads, so the chains are the same.)
-__device__ __forceinline__ float combine_gate(const __nv_bfloat16 *__restrict__ x, const __nv_bfloat16 *__restrict__ w,
-                                              int32_t width, float *partial, float *slot) {
-  float dot = 0.0F;
-  for (int32_t k = static_cast<int32_t>(threadIdx.x); k < width; k += kThreads) {
-    dot = fmaf(__bfloat162float(x[k]), __bfloat162float(w[k]), dot);
-  }
-  dot = warp_sum(dot);
-  if ((threadIdx.x & 31) == 0) {
-    partial[threadIdx.x >> 5] = dot;
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    float sum = 0.0F;
-    for (int32_t w8 = 0; w8 < kWarps; ++w8) {
-      sum += partial[w8];
-    }
-    *slot = 1.0F / (1.0F + expf(-sum));
-  }
-  __syncthreads();
-  return *slot;
-}
+// The folded combine runs ignis_moe_combine's own gate and value (moe_combine.cuh), whose
+// reduction order is written for the CTA this kernel launches.
+static_assert(kThreads == ignis_moe::kCombineThreads, "the folded combine's gate needs the combine's CTA");
 
 // The decode route's norm and mix_down in one launch (GitHub #306, the fusion
 // study). CTA (b, s) of the down split first normalizes stream s of every row
@@ -420,7 +398,7 @@ __device__ __forceinline__ float combine_gate(const __nv_bfloat16 *__restrict__ 
 // Dynamic shared memory: the rows' normed stream, tokens * width BF16.
 enum PendingKind : int { kNothing = 0, kInject = 1, kCombine = 2 };
 
-template <bool kFp8, int kPending>
+template <bool kFp8, PendingKind kPending>
 __global__ void hc_norm_down(const __nv_bfloat16 *__restrict__ hidden, const __nv_bfloat16 *__restrict__ w_norm,
                              const __nv_bfloat16 *__restrict__ inject, const void *__restrict__ w_down,
                              __nv_bfloat16 *__restrict__ normed, float *__restrict__ inject_part,
@@ -442,12 +420,12 @@ __global__ void hc_norm_down(const __nv_bfloat16 *__restrict__ hidden, const __n
       const std::int64_t row = static_cast<std::int64_t>(t) * width;
       float gate = 0.0F;
       if constexpr (kPending == kCombine) {
-        gate = combine_gate(p.x + row, p.w_gate, width, partial, &gate_slot);
+        gate = ignis_moe::combine_gate(p.x + row, p.w_gate, partial, &gate_slot);
       }
       const float injection = __ldg(p.inj + t * streams + s);
       // The combine's BF16 row, as combine_kernel stores it.
       const auto combined = [&](int32_t i) {
-        return __float2bfloat16_rn(fmaf(gate, __ldg(p.shared + row + i), ignis_moe::from_fixed(__ldg(p.acc + row + i))));
+        return ignis_moe::combine_value(gate, __ldg(p.shared + row + i), __ldg(p.acc + row + i));
       };
       const auto load = [&](int32_t i) {
         float y;
@@ -479,6 +457,13 @@ __global__ void hc_norm_down(const __nv_bfloat16 *__restrict__ hidden, const __n
   }
   __syncthreads();
   down_split<kFp8, true>(w_down, rows_normed, width, down_part, rank, streams, width, tokens, s);
+}
+
+// The fused down kernel of a weight format for a pending kind.
+template <bool kFp8>
+decltype(&hc_norm_down<kFp8, kNothing>) norm_down_kernel(PendingKind kind) {
+  return kind == kNothing ? hc_norm_down<kFp8, kNothing>
+                          : kind == kInject ? hc_norm_down<kFp8, kInject> : hc_norm_down<kFp8, kCombine>;
 }
 
 // The decode route folds the norm into its down launch unless switched off (fusion.h,
@@ -738,9 +723,10 @@ int32_t fn_hc_mix_after(const Geometry &g, const HcWeights &w, const PendingInje
     return fn_hc_mix(g, w, hidden, rows, x, inj, scratch, stream);
   }
   if (pending.y == nullptr || pending.inj == inj || pending.y == x || pending.y == hidden ||
-      (pending.acc != nullptr && (pending.shared == nullptr || pending.x == nullptr || pending.w_gate == nullptr))) {
-    fn_set_error("fn_hc_mix_after: a pending inject needs y and the combine's operands, and its injection weights "
-                 "and y apart from the mix's outputs");
+      (pending.acc != nullptr && (pending.shared == nullptr || pending.x == nullptr || pending.w_gate == nullptr ||
+                                  g.hidden != IGNIS_MOE_HIDDEN))) {
+    fn_set_error("fn_hc_mix_after: a pending inject needs y and the combine's operands (at the MoE's hidden width), "
+                 "and its injection weights and y apart from the mix's outputs");
     return -1;
   }
   PendingArgs p;
@@ -826,19 +812,11 @@ int32_t mix(const Geometry &g, const HcWeights &w, const void *hidden, int32_t r
         const dim3 fused_grid(down_blocks + 1, static_cast<uint32_t>(g.streams));
         const std::size_t fused_bytes = static_cast<std::size_t>(n) * g.hidden * sizeof(__nv_bfloat16);
         const auto *norm_w = static_cast<const __nv_bfloat16 *>(w.hc_norm);
-        const int kind = pending.inj == nullptr ? kNothing : pending.acc == nullptr ? kInject : kCombine;
-        const auto launch = [&](auto kernel) {
-          kernel<<<fused_grid, kThreads, fused_bytes, stream>>>(in, norm_w, block_inject, w.mix_down.data, normed,
-                                                                inject_part, down_part, g.hc_rank, g.streams, g.hidden,
-                                                                n, g.rms_norm_eps, pending);
-        };
-        if (down_fp8) {
-          launch(kind == kNothing ? hc_norm_down<true, kNothing>
-                                  : kind == kInject ? hc_norm_down<true, kInject> : hc_norm_down<true, kCombine>);
-        } else {
-          launch(kind == kNothing ? hc_norm_down<false, kNothing>
-                                  : kind == kInject ? hc_norm_down<false, kInject> : hc_norm_down<false, kCombine>);
-        }
+        const PendingKind kind = pending.inj == nullptr ? kNothing : pending.acc == nullptr ? kInject : kCombine;
+        const auto kernel = down_fp8 ? norm_down_kernel<true>(kind) : norm_down_kernel<false>(kind);
+        kernel<<<fused_grid, kThreads, fused_bytes, stream>>>(in, norm_w, block_inject, w.mix_down.data, normed,
+                                                              inject_part, down_part, g.hc_rank, g.streams, g.hidden, n,
+                                                              g.rms_norm_eps, pending);
       } else if (down_fp8) {
         hc_down_split<true><<<down_grid, kThreads, 0, stream>>>(w.mix_down.data, normed, down_part, g.hc_rank,
                                                                  g.streams, g.hidden, n);

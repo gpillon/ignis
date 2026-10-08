@@ -4,10 +4,10 @@
 // Kernels here: the causal convolution (written into q | k | v directly), the gating (g, beta
 // from the BF16 projections and the layer's BF16 A_log and dt_bias), the sigmoid-gated norm, and
 // the copy of one slot's recurrent state between the pool and a scratch image. Everything else is
-// fn_linear and the vendored recurrence. Since GitHub #306's fusion (step 4, fusion.h's Gdn) a
-// call of up to 8 rows takes its four FP8 input projections in one grouped GEMV launch
-// (ignis_fp8_linear_grouped) and the convolution's launch takes the gating: the same code per
-// output, so the same bits, in two launches instead of five.
+// fn_linear and the vendored recurrence. Since GitHub #306's fusion (step 4, fusion.h's Gdn) the
+// convolution's launch takes the gating at every width, and a call of up to 8 rows takes its four
+// FP8 input projections in one grouped GEMV launch (ignis_fp8_linear_grouped): the same code per
+// output, so the same bits, in two launches instead of five at decode widths.
 //
 // The convolution is ours rather than the vendored causal_conv1d_silu: that op reads its weight
 // tap-major ([4][channels], the 27B artifact's gdn/convolution), while Flash-Next's artifact keeps
@@ -45,7 +45,6 @@ namespace {
 
 constexpr int32_t kThreads = 256;
 constexpr int32_t kConvChunk = 64;  // tokens one convolution thread walks
-constexpr int32_t kGroupedRows = 8;  // the grouped projection's ceiling: the FP8 GEMV route's
 
 __device__ __forceinline__ float round_bf16(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
@@ -310,7 +309,7 @@ int32_t run(const Geometry &g, const State &state, const GdnWeights &w, const Ba
     // FP8 and the call is a GEMV's width, and the gating inside the convolution's launch.
     const bool fusion = fused(Fusion::Gdn);
     const auto fp8 = [](const Linear &l) { return l.format == WeightFormat::Fp8RowScale; };
-    if (fusion && rows <= kGroupedRows && fp8(w.in_proj_qkv) && fp8(w.in_proj_z) && fp8(w.in_proj_a) &&
+    if (fusion && rows <= IGNIS_FP8_GEMV_MAX_TOKENS && fp8(w.in_proj_qkv) && fp8(w.in_proj_z) && fp8(w.in_proj_a) &&
         fp8(w.in_proj_b)) {
       const ignis_fp8_segment segments[4] = {{w.in_proj_qkv.data, static_cast<uint32_t>(kConvChannels), qkv},
                                              {w.in_proj_z.data, static_cast<uint32_t>(kValueWidth), z},

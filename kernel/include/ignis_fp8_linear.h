@@ -38,8 +38,10 @@ int32_t ignis_fp8_linear_swiglu(const void *gate, const void *up, uint32_t rows,
 /* GitHub #306: several FP8 row-scale linears of one input in one launch -- a decode round's
  * projections of the same x. Segment i is `weight` [rows][cols] written to its `y` exactly as
  * ignis_fp8_linear would write it (the same GEMV code for each output row, so the same bits). The
- * GEMV route only: 1..8 tokens, at most IGNIS_FP8_MAX_SEGMENTS segments, every `rows` a positive
- * multiple of 16, every weight and x 16-byte aligned, every y 8-byte aligned. */
+ * GEMV route only: 1..IGNIS_FP8_GEMV_MAX_TOKENS tokens, at most IGNIS_FP8_MAX_SEGMENTS segments,
+ * every `rows` a positive multiple of 16, every weight and x 16-byte aligned, every y 8-byte
+ * aligned. */
+#define IGNIS_FP8_GEMV_MAX_TOKENS 8
 #define IGNIS_FP8_MAX_SEGMENTS 4
 typedef struct ignis_fp8_segment {
   const void *weight;

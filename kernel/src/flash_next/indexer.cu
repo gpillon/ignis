@@ -270,7 +270,8 @@ __global__ void __launch_bounds__(kBlocksPerScoreCta)
   uint32_t *qs = smem + kBlocksPerScoreCta * kKeyPitchWords;  // [heads][64]
   constexpr int32_t kKeyVectors = kHeadDim * 2 / 16;          // 16-byte loads per key
   const int32_t local = static_cast<int32_t>(blockIdx.y);
-  const int32_t blocks = (row_position(r, local) + 1) / kCompress;
+  // A row's scores end at the stride, whatever its position says.
+  const int32_t blocks = min((row_position(r, local) + 1) / kCompress, score_stride);
   const int32_t first = static_cast<int32_t>(blockIdx.x) * kBlocksPerScoreCta;
   if (first >= blocks) return;
   const int32_t slot = r.slots[row_seq(r, local)];

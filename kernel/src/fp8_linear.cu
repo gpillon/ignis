@@ -28,7 +28,7 @@
 namespace ignis_moe {
 namespace {
 
-constexpr int kGemvMaxTokens = 8;
+constexpr int kGemvMaxTokens = IGNIS_FP8_GEMV_MAX_TOKENS;
 
 __host__ __device__ inline size_t scale_offset(uint32_t rows, uint32_t cols) {
   return (static_cast<size_t>(rows) * cols + 255) / 256 * 256;
