@@ -474,14 +474,11 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
                 .saturating_add(experts.expert_pool_bytes)
                 .saturating_add(pool)
                 <= budget;
-            match resident {
-                true => (KvPoolPolicy::Resident, experts.fixed_bytes, experts.expert_pool_bytes, None),
-                false => (
-                    KvPoolPolicy::Offloaded,
-                    experts.fixed_bytes,
-                    0,
-                    Some(offloaded_default_pages(request.max_context_tokens, experts.decode_lanes, min_pages)),
-                ),
+            if resident {
+                (KvPoolPolicy::Resident, experts.fixed_bytes, experts.expert_pool_bytes, None)
+            } else {
+                let pages = offloaded_default_pages(request.max_context_tokens, experts.decode_lanes, min_pages);
+                (KvPoolPolicy::Offloaded, experts.fixed_bytes, 0, Some(pages))
             }
         }
     };

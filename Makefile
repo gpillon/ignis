@@ -121,7 +121,7 @@ FN_CONTEXT_TOKENS = ((($(or $(MAX_CONTEXT),40960)+63)/64*64))
 FN_LANE_TOKENS = ($(or $(LANES),3)*$(FN_CONTEXT_TOKENS))
 FN_DEFAULT_TOKENS = ($(FN_LANE_TOKENS)<524288?$(FN_LANE_TOKENS):524288)
 FN_FLOOR_TOKENS = ($(FN_CONTEXT_TOKENS)+64*($(or $(RETAINED_HOST),8)+$(or $(RETAINED_DEVICE),0)))
-KV_POOL_PLAN = $(if $(KV_POOL_BYTES),$(KV_POOL_BYTES) (named),$(if $(filter flash-next,$(MODEL_FAMILY)),offloaded $$(( $(FN_DEFAULT_TOKENS)>$(FN_FLOOR_TOKENS)?$(FN_DEFAULT_TOKENS):$(FN_FLOOR_TOKENS) )) tokens,resident (the rest of the VRAM budget)))
+KV_POOL_PLAN = $(if $(KV_POOL_BYTES),$(if $(filter flash-next,$(MODEL_FAMILY)),offloaded,resident) $(KV_POOL_BYTES) (named),$(if $(filter flash-next,$(MODEL_FAMILY)),offloaded $$(( $(FN_DEFAULT_TOKENS)>$(FN_FLOOR_TOKENS)?$(FN_DEFAULT_TOKENS):$(FN_FLOOR_TOKENS) )) tokens,resident (the rest of the VRAM budget)))
 SERVER_ENV = $(if $(LOG_LEVEL),IGNIS_LOG_LEVEL=$(LOG_LEVEL)) $(if $(LOG_FORMAT),IGNIS_LOG_FORMAT=$(LOG_FORMAT))
 # The served id: Flash-Next's own, none for the 27B (the server's default), or
 # the id MODEL names (mk/config.mk).

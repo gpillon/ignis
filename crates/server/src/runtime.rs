@@ -343,6 +343,26 @@ pub fn log_vram_warnings(plan: &ignis_core::VramPlan) {
     }
 }
 
+/// `ignis.runtime.expert_cache_below_floor` (ADR 0045): the WARN a Flash-Next
+/// load emits when `--allow-expert-cache-below-floor` started it with an
+/// expert cache below `floor_bytes` -- the cache, the floor, and the knobs
+/// that would lift it. Nothing for a cache at or above the floor.
+pub fn warn_expert_cache_below_floor(cache: &ignis_core::residency::ExpertCachePlan, floor_bytes: u64) {
+    if !cache.below_floor {
+        return;
+    }
+    // hotpath-lint-allow: one line per model load.
+    tracing::warn!(
+        name: "ignis.runtime.expert_cache_below_floor",
+        expert_cache_bytes = cache.cache_bytes,
+        floor_bytes,
+        expected_hit_rate = cache.expected_hit_rate,
+        knobs = "a smaller --kv-pool-bytes, --prefill-chunk or --vram-headroom-bytes, fewer --retained-device, \
+                 or --spec off",
+        "the expert cache is below its floor (--allow-expert-cache-below-floor): decode slows sharply below it"
+    );
+}
+
 /// The leaf the operator's [`EngineShape`] is loaded as: the last step
 /// before a device exists, and the whole of what `ignis-runtime` is told
 /// about the operator's flags.
@@ -732,18 +752,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
     })
     .map_err(|e| e.to_string())?;
     log_vram_warnings(&vram);
-    if cache.below_floor {
-        // hotpath-lint-allow: one line per model load.
-        tracing::warn!(
-            name: "ignis.runtime.expert_cache_below_floor",
-            expert_cache_bytes = cache.cache_bytes,
-            floor_bytes = EXPERT_CACHE_FLOOR_BYTES,
-            expected_hit_rate = cache.expected_hit_rate,
-            knobs = "a smaller --kv-pool-bytes, --prefill-chunk or --vram-headroom-bytes, fewer --retained-device, \
-                     or --spec off",
-            "the expert cache is below its floor (--allow-expert-cache-below-floor): decode slows sharply below it"
-        );
-    }
+    warn_expert_cache_below_floor(&cache, EXPERT_CACHE_FLOOR_BYTES);
     // hotpath-lint-allow: one line per model load.
     tracing::info!(
         name: "ignis.runtime.flash_next_plan",
@@ -1333,6 +1342,52 @@ mod tests {
         assert_eq!(field("retained_device_slots"), DEFAULT_RETAINED.device_slots);
         assert_eq!(field("retained_host_slots"), DEFAULT_RETAINED.host_slots);
         assert_eq!(field("retained_host_bytes"), DEFAULT_RETAINED.host_bytes);
+    }
+
+    #[test]
+    fn a_cache_started_below_its_floor_warns_with_the_cache_the_floor_and_the_knobs() {
+        // ADR 0045 (AC 6): what `--allow-expert-cache-below-floor` buys is a
+        // start with this WARN, never a silent one.
+        use ignis_core::residency::{
+            plan_expert_cache, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, KBits, EXPERT_CACHE_FLOOR_BYTES,
+        };
+        let catalog = ExpertCatalog::new(1, 4, vec![(KBits::K4, KBits::K4); 4], [100; 8]).expect("catalog");
+        let traffic = ExpertTraffic::new(&catalog, vec![1; 4]).expect("traffic");
+        let plan = |allow_below_floor, budget_bytes| {
+            plan_expert_cache(&ExpertCacheRequest {
+                budget_bytes,
+                planned_bytes: 0,
+                staging_ring_bytes: 0,
+                table_bytes: 0,
+                floor_bytes: 1_000,
+                allow_below_floor,
+                catalog: &catalog,
+                traffic: &traffic,
+                min_slots: 0,
+            })
+            .expect("planned")
+        };
+        let capture = |cache: &ignis_core::residency::ExpertCachePlan| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+            let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+            tracing::subscriber::with_default(subscriber, || warn_expert_cache_below_floor(cache, 1_000));
+            sink.lines().iter().map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json")).collect::<Vec<_>>()
+        };
+        let records = capture(&plan(true, 600));
+        assert_eq!(records.len(), 1, "{records:?}");
+        let event = &records[0];
+        assert_eq!(event["event_name"], "ignis.runtime.expert_cache_below_floor", "{event}");
+        assert_eq!(event["severity_text"], "WARN");
+        let field = |name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
+        assert_eq!(field("expert_cache_bytes"), Some(600.into()));
+        assert_eq!(field("floor_bytes"), Some(1_000.into()));
+        let knobs = field("knobs").expect("knobs").as_str().unwrap().to_owned();
+        for knob in ["--kv-pool-bytes", "--prefill-chunk", "--vram-headroom-bytes", "--retained-device"] {
+            assert!(knobs.contains(knob), "{knob}: {knobs}");
+        }
+        assert!(capture(&plan(true, 2_000)).is_empty(), "a cache above its floor warns nothing");
+        assert_eq!(EXPERT_CACHE_FLOOR_BYTES, 12 << 30);
     }
 
     #[test]

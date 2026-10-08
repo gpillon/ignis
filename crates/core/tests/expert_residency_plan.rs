@@ -238,6 +238,7 @@ fn a_cache_below_its_floor_refuses_naming_what_to_shrink() {
         "--max-context",
         "--vram-headroom-bytes",
         "prefill chunk",
+        "--retained-device",
         "desktop",
         // ADR 0045: and the way past it.
         "--allow-expert-cache-below-floor",

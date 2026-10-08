@@ -83,7 +83,7 @@ has "KV_POOL_BYTES=512Ktok" "$out" "--kv-pool-bytes 512Ktok"
 # context; resident on the 27B.
 plan_of() { make config CUDA=1 "$@" 2>/dev/null | sed -n 's/^PLAN  *//p'; }
 for case in "|kv_pool=offloaded 524288 tokens" "LANES=1|kv_pool=offloaded 262656 tokens" \
-            "MAX_CONTEXT=524288|kv_pool=offloaded 524800 tokens" "KV_POOL_BYTES=512Ktok|kv_pool=512Ktok (named)"; do
+            "MAX_CONTEXT=524288|kv_pool=offloaded 524800 tokens" "KV_POOL_BYTES=512Ktok|kv_pool=offloaded 512Ktok (named)"; do
     knobs="${case%%|*}"; fact="${case#*|}"
     plan="$(plan_of MODEL=flash-next $knobs)"
     case "$plan" in *"$fact"*) ;; *) fail "PLAN [$knobs]: '$fact' missing from: $plan" ;; esac

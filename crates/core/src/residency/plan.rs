@@ -382,8 +382,8 @@ impl std::fmt::Display for ExpertCachePlanError {
              floor: the {budget_bytes}-byte VRAM budget holds {planned_bytes} for the weights, \
              workspaces, graphs and KV pool, {staging_ring_bytes} for the prefill staging ring \
              and {table_bytes} for residency's tables; shrink the KV pool (a smaller \
-             --kv-pool-bytes, or a shorter --max-context at one lane), the prefill chunk, or \
-             --vram-headroom-bytes, or close what holds VRAM on the desktop; \
+             --kv-pool-bytes, or a shorter --max-context at one lane), the prefill chunk, \
+             --vram-headroom-bytes or --retained-device, or close what holds VRAM on the desktop; \
              --allow-expert-cache-below-floor starts anyway, with decode slower than the floor's"
         )
     }
