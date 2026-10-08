@@ -97,6 +97,9 @@ const WIDTH3_TOKENS: usize = 160;
 /// without them, as AC 25's harness does: a gather reads its rows from the
 /// artifact.
 const ARENA_BYTES: u64 = 1200 << 20;
+/// A Flash-Next token's KV bytes under hq-e8-2b, its indexer keys included:
+/// what the control's chunk of extra pool costs the expert cache.
+const TOKEN_BYTES: u64 = 4224;
 
 fn prompt(seed: u32, n: u32) -> Vec<u32> {
     (0..n).map(|i| 1000 + (i * 7919 + seed * 104_729) % 60_000).collect()
@@ -621,6 +624,7 @@ struct Leg {
     moves: Vec<Move>,
     after_restore: Vec<Round>,
     texts: std::collections::BTreeMap<u32, Vec<u32>>,
+    expert_cache_bytes: u64,
 }
 
 fn leg(tier: Tier, pace: ignis_runtime::TransferPace, forced: Texts) -> Option<Leg> {
@@ -679,6 +683,8 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace, forced: Texts) -> Option<L
         ));
         return None;
     }
+    println!("expert cache: {} bytes", reserved.expert_cache_bytes);
+    let expert_cache_bytes = reserved.expert_cache_bytes;
     let mut rig = Rig::new(sched, reserved.flash_next.clone(), forced);
     let interactive = RequestClass::Interactive;
 
@@ -859,7 +865,7 @@ fn leg(tier: Tier, pace: ignis_runtime::TransferPace, forced: Texts) -> Option<L
     let texts = rig.texts();
     drop(rig);
     drop(blobs);
-    Some(Leg { moves, after_restore, texts })
+    Some(Leg { moves, after_restore, texts, expert_cache_bytes })
 }
 
 fn measure(tier: Tier) {
@@ -899,6 +905,7 @@ fn a_live_move_through_kv_disk_beside_decoding_lanes() {
 struct Control {
     rounds: Vec<Round>,
     texts: std::collections::BTreeMap<u32, Vec<u32>>,
+    expert_cache_bytes: u64,
 }
 
 /// The control for the rounds after a move (GitHub #309): the same requests
@@ -932,6 +939,11 @@ fn control(forced: Texts, arrivals: bool) -> Option<Control> {
         kv_disk_bytes: Some(0),
         // A chunk more than one context: E fits beside C, B1 and B2.
         kv_pool: Some(ignis_core::KvPoolSize::Tokens(u64::from(CONTEXT + CHUNK))),
+        // And a chunk more budget for it, so that the expert cache -- what
+        // a round's misses depend on -- is the leg's (GitHub #310).
+        vram: ignis_core::VramMode::Derived {
+            headroom_bytes: ignis_server::config::DEFAULT_VRAM_HEADROOM_BYTES - u64::from(CHUNK) * TOKEN_BYTES,
+        },
         ngram_hot_bytes: ignis_core::ngram_table::HotBudget::Bytes(0),
         ..EngineShape::default()
     };
@@ -950,6 +962,8 @@ fn control(forced: Texts, arrivals: bool) -> Option<Control> {
             return None;
         }
     };
+    println!("expert cache: {} bytes", reserved.expert_cache_bytes);
+    let expert_cache_bytes = reserved.expert_cache_bytes;
     let mut rig = Rig::new(sched, reserved.flash_next.clone(), forced);
     let interactive = RequestClass::Interactive;
     let c = rig.submit(1, C_PROMPT, C_TOKENS, RequestClass::Agent);
@@ -1016,7 +1030,7 @@ fn control(forced: Texts, arrivals: bool) -> Option<Control> {
     let texts = rig.texts();
     drop(rig);
     drop(blobs);
-    Some(Control { rounds, texts })
+    Some(Control { rounds, texts, expert_cache_bytes })
 }
 
 #[test]
@@ -1067,6 +1081,17 @@ fn the_rounds_after_a_restore_miss_what_the_same_text_misses_unmoved() {
             "the text covers every compared lane's max_tokens (seed {seed})"
         );
     }
+    // The two loads share one CUDA context, held from before the first:
+    // each reads the device's free memory with it already counted, so the
+    // second's expert cache is not the context's size smaller than the
+    // first's (the control's misses were 6% higher for it before this).
+    let _context = match ignis_artifact::CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("CUDA device: {e}"));
+            return;
+        }
+    };
     let Some(moved) = leg(Tier::KvRam, pace(), text.clone()) else {
         return;
     };
@@ -1076,6 +1101,12 @@ fn the_rounds_after_a_restore_miss_what_the_same_text_misses_unmoved() {
     for m in &moved.moves {
         m.print(Tier::KvRam);
     }
+    println!(
+        "AC 43: expert cache {} bytes moved, {} unmoved ({:+.2} %)",
+        moved.expert_cache_bytes,
+        unmoved.expert_cache_bytes,
+        (unmoved.expert_cache_bytes as f64 / moved.expert_cache_bytes as f64 - 1.0) * 100.0
+    );
     for seed in [1, 2, 3] {
         let (a, b) = (&moved.texts[&seed], &unmoved.texts[&seed]);
         let n = a.len().min(b.len());
