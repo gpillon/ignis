@@ -952,7 +952,8 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
                 {columns.map((c) => {
                   const cell = memory.retained[family][c.tier][c.kind];
                   // A zero where the meters above would show a dash: `render()`
-                  // writes all twenty-four of these on every scrape, so an
+                  // writes all twenty-four of these (thirty-six with KV-disk)
+                  // on every scrape, so an
                   // absent one means a server older than #216, not an idle
                   // tier — and reading it as zero is the truthful thing.
                   // The prefix walk raises no miss at all, so this series is
@@ -982,7 +983,7 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
       <p className="text-[11px] text-ash">
         Tokens reused counts prompt tokens skipped and the two lookup rows count lookups; spills, discards and restores count images. A load that never spilled
         shows KV-RAM at zero, and a load with prompt reuse off shows every column at zero. A column shows a zero whether the load reported one or reported
-        nothing at all: the server emits all twenty-four series on every scrape, so an absent one means an older server, not an idle tier.
+        nothing at all: the server emits all twenty-four series (thirty-six on a load with KV-disk) on every scrape, so an absent one means an older server, not an idle tier.
       </p>
     </Card>
   );
