@@ -833,6 +833,25 @@ mod tests {
         assert_eq!(top_with_margin(&tie), (0, 0.0));
     }
 
+    /// ADR 0045: the pool is the plan's pages, shared by the lanes, whenever
+    /// the load planned them; every lane's whole context and a page per
+    /// retained slot only for an engine that never plans.
+    #[test]
+    fn the_pool_takes_the_plan_s_pages_when_the_load_planned_them() {
+        let options = EngineOptions {
+            max_context_tokens: 262_144,
+            decode_lanes: 3,
+            retained_host_slots: 8,
+            ..EngineOptions::default()
+        };
+        assert_eq!(options.pool_budget().kv_page_group_count, 3 * 4_096 + 8);
+        let planned = EngineOptions { kv_pool_pages: Some(8_192), ..options.clone() };
+        let budget = planned.pool_budget();
+        assert_eq!(budget.kv_page_group_count, 8_192);
+        assert_eq!((budget.max_context_tokens, budget.slot_count, budget.retained_host_slot_count), (262_144, 3, 8));
+        assert_eq!(planned.pool_budget_of(100).kv_page_group_count, 100);
+    }
+
     /// The sidecar's `expert_traffic`, layer after layer, as the residency's
     /// split reads it; none without a sidecar or the section.
     #[test]
