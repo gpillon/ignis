@@ -28,10 +28,13 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -108,17 +111,9 @@ std::vector<int32_t> pages_of(const ignis_seq &seq, uint32_t count) {
   return pages;
 }
 
-}  // namespace
-
-int main() {
-  int devices = 0;
-  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-    std::fprintf(stderr, "FATAL: no CUDA device\n");
-    return 1;
-  }
-
-  // Flash-Next's geometry at a small scale: 12 attention layers of 2 KV heads,
-  // 2 GDN layers, 16 pages, 3 lanes, a device retained slot and a host one.
+// Flash-Next's geometry at a small scale: 12 attention layers of 2 KV heads,
+// 2 GDN layers, 16 pages, 3 lanes, a device retained slot and a host one.
+ignis_seq_pool_spec small_flash_next_spec() {
   ignis_seq_pool_spec spec{};
   spec.num_kv_heads = 2;
   spec.head_dim = 256;
@@ -138,6 +133,231 @@ int main() {
   spec.ngram_conv_channels = 10240;
   spec.retained_slot_count = 1;
   spec.retained_host_slot_count = 1;
+  return spec;
+}
+
+double ms_since(std::chrono::steady_clock::time_point began) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+}
+
+// GitHub #309: the whole calls copy a sequence's block keys one run of
+// consecutive physical pages at a time. A sequence whose pages are two runs
+// -- the allocator found no free run of four -- snapshots to the bytes its
+// windows take, and restores into another such sequence with every page's
+// keys.
+void check_runs_with_a_gap() {
+  ignis_seq_pool_spec spec = small_flash_next_spec();
+  spec.kv_page_group_count = 8;
+  spec.slot_count = 6;
+  spec.retained_slot_count = 0;
+  spec.retained_host_slot_count = 0;
+  ignis_seq_pool *pool = nullptr;
+  if (ignis_seq_pool_create(&spec, &pool) != 0) {
+    check(false, std::string("gap: pool create: ") + ignis_seq_last_error());
+    return;
+  }
+  // Four two-page sequences fill the pool; letting the first and the third go
+  // leaves pages {0, 1} and {4, 5} free, and no run of four.
+  ignis_seq *pairs[4] = {};
+  for (ignis_seq *&s : pairs) {
+    check(ignis_seq_alloc(pool, 128, &s) == 0, std::string("gap: alloc a pair: ") + ignis_seq_last_error());
+  }
+  ignis_seq_release(pool, pairs[0]);
+  ignis_seq_release(pool, pairs[2]);
+  ignis_seq *t = nullptr;
+  check(ignis_seq_alloc(pool, 256, &t) == 0, std::string("gap: alloc T: ") + ignis_seq_last_error());
+  if (t == nullptr) {
+    ignis_seq_pool_free(pool);
+    return;
+  }
+  const std::vector<int32_t> t_pages = pages_of(*t, 4);
+  check(t_pages[1] + 1 != t_pages[2], "T's pages are two runs");
+  for (std::size_t i = 0; i < t_pages.size(); ++i) {
+    write_keys(*pool, t_pages[i], static_cast<unsigned char>(0x11 * (i + 1)));
+  }
+  write_state(*pool, t->slot, 0x33);
+  stand_at(*t, 256);
+  cudaDeviceSynchronize();
+  const std::vector<unsigned char> t_keys = keys_of(*pool, t_pages);
+
+  uint64_t bytes = 0;
+  check(ignis_seq_snapshot_size(pool, t, &bytes) == 0, std::string("gap: size: ") + ignis_seq_last_error());
+  std::vector<unsigned char> blob(bytes);
+  check(ignis_seq_snapshot(pool, t, blob.data(), blob.size(), nullptr) == 0,
+        std::string("gap: snapshot: ") + ignis_seq_last_error());
+  for (const uint64_t window : seq_window_sizes()) {
+    check(seq_take_windows(pool, blob.size(), window,
+                           [&](unsigned char *dst, uint64_t n, const ignis_seq_transfer &w) {
+                             return ignis_seq_snapshot(pool, t, dst, n, &w);
+                           }) == blob,
+          "gap: the whole call's bytes are the windows' (window " + std::to_string(window) + ")");
+  }
+
+  // The other two pairs go: {2, 3} and {6, 7} free, two runs again.
+  ignis_seq_release(pool, pairs[1]);
+  ignis_seq_release(pool, pairs[3]);
+  ignis_seq *u = nullptr;
+  check(ignis_seq_alloc(pool, 256, &u) == 0, std::string("gap: alloc U: ") + ignis_seq_last_error());
+  if (u != nullptr) {
+    const std::vector<int32_t> u_pages = pages_of(*u, 4);
+    check(u_pages[1] + 1 != u_pages[2], "U's pages are two runs");
+    check(ignis_seq_restore(pool, u, blob.data(), blob.size(), nullptr) == 0,
+          std::string("gap: restore: ") + ignis_seq_last_error());
+    check(keys_of(*pool, u_pages) == t_keys, "gap: every page's block keys come back, run by run");
+    ignis_seq_release(pool, u);
+  }
+  ignis_seq_release(pool, t);
+  ignis_seq_pool_free(pool);
+}
+
+// GitHub #309: a windowed restore's copies run on the transfer stream, which
+// is non-blocking, while its sequence was zeroed on the default stream when it
+// was drawn. Keep the default stream busy past the draw, and the restore has
+// to wait for the zeroing rather than land under it.
+void check_restore_lands_after_the_draw(ignis_seq_pool *pool, const std::vector<unsigned char> &blob,
+                                        const std::vector<unsigned char> &keys) {
+  check(cudaLaunchHostFunc(
+            nullptr, [](void *) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); }, nullptr) ==
+            cudaSuccess,
+        "a busy default stream");
+  ignis_seq *r = nullptr;
+  check(ignis_seq_alloc(pool, 256, &r) == 0, std::string("alloc R behind the busy stream: ") + ignis_seq_last_error());
+  if (r == nullptr) {
+    return;
+  }
+  check(seq_restore_windows(pool, r, blob, 32ull << 20) == 0,
+        std::string("restore R at once: ") + ignis_seq_last_error());
+  cudaDeviceSynchronize();
+  check(keys_of(*pool, pages_of(*r, 2)) == keys, "the restore landed after the draw's zeroing, not under it");
+  std::vector<unsigned char> again(blob.size());
+  check(ignis_seq_snapshot(pool, r, again.data(), again.size(), nullptr) == 0 && again == blob,
+        "and the restored sequence snapshots to the source's bytes");
+  ignis_seq_release(pool, r);
+}
+
+// GitHub #309: what a live move of a 236,000-token sequence costs at
+// Flash-Next's real geometry, each way, measured rather than assumed (spec
+// vram-budget/03 AC 37). Printed, not asserted: the whole calls, the windowed
+// calls in one window and in 16 MiB ones, the per-page copies the block keys
+// took before they were coalesced, and the link itself.
+void report_transfer_cost() {
+  constexpr uint32_t kTokens = 236000;
+  ignis_seq_pool_spec spec = small_flash_next_spec();
+  spec.kv_page_group_count = (kTokens + 63) / 64;
+  spec.max_context_tokens = spec.kv_page_group_count * 64;
+  spec.slot_count = 1;
+  spec.gdn_num_layers = 36;
+  spec.vocab = 248320;
+  spec.retained_slot_count = 0;
+  spec.retained_host_slot_count = 0;
+  ignis_seq_pool *pool = nullptr;
+  if (ignis_seq_pool_create(&spec, &pool) != 0) {
+    check(false, std::string("cost: pool create: ") + ignis_seq_last_error());
+    return;
+  }
+  ignis_seq *seq = nullptr;
+  check(ignis_seq_alloc(pool, kTokens, &seq) == 0, std::string("cost: alloc: ") + ignis_seq_last_error());
+  if (seq == nullptr) {
+    ignis_seq_pool_free(pool);
+    return;
+  }
+  stand_at(*seq, kTokens);
+  uint64_t bytes = 0;
+  check(ignis_seq_snapshot_size(pool, seq, &bytes) == 0, std::string("cost: size: ") + ignis_seq_last_error());
+  unsigned char *pinned = nullptr;
+  if (cudaMallocHost(reinterpret_cast<void **>(&pinned), bytes) != cudaSuccess) {
+    check(false, "cost: cudaMallocHost");
+    ignis_seq_release(pool, seq);
+    ignis_seq_pool_free(pool);
+    return;
+  }
+  void *stream = ignis_seq_pool_transfer_stream(pool);
+  const auto fenced = [&] {
+    uint64_t fence = 0;
+    return ignis_seq_pool_fence(pool, stream, &fence) == 0 && ignis_seq_pool_fence_wait(pool, fence) == 0;
+  };
+  const auto windowed_out = [&](uint64_t window) {
+    bool ok = true;
+    for (uint64_t at = 0; at < bytes; at += window) {
+      const ignis_seq_transfer t{at, std::min(window, bytes - at), bytes, stream};
+      ok = ok && ignis_seq_snapshot(pool, seq, pinned + at, t.bytes, &t) == 0;
+    }
+    return ok && fenced();
+  };
+  const auto windowed_in = [&](uint64_t window) {
+    bool ok = true;
+    for (uint64_t at = 0; at < bytes; at += window) {
+      const ignis_seq_transfer t{at, std::min(window, bytes - at), bytes, stream};
+      ok = ok && ignis_seq_restore(pool, seq, pinned + at, t.bytes, &t) == 0;
+    }
+    return ok && fenced();
+  };
+  // One untimed pass: a fresh pinned region pays page-table work first.
+  check(ignis_seq_snapshot(pool, seq, pinned, bytes, nullptr) == 0, "cost: warm-up snapshot");
+  constexpr int kReps = 3;
+  const auto timed = [&](const char *what, auto &&call) {
+    double total = 0;
+    for (int rep = 0; rep < kReps; ++rep) {
+      const auto began = std::chrono::steady_clock::now();
+      check(call(), std::string("cost: ") + what + ": " + ignis_seq_last_error());
+      total += ms_since(began);
+    }
+    const double ms = total / kReps;
+    std::printf("  %-34s %8.1f ms  %5.2f GB/s\n", what, ms, static_cast<double>(bytes) / (ms * 1e6));
+  };
+  std::printf("transfer cost at Flash-Next's geometry, %u tokens, hq-e8-2b: %llu B\n", kTokens,
+              static_cast<unsigned long long>(bytes));
+  timed("whole snapshot (device -> host)", [&] { return ignis_seq_snapshot(pool, seq, pinned, bytes, nullptr) == 0; });
+  timed("whole restore (host -> device)", [&] { return ignis_seq_restore(pool, seq, pinned, bytes, nullptr) == 0; });
+  timed("windowed snapshot, one window", [&] { return windowed_out(bytes); });
+  timed("windowed snapshot, 16 MiB windows", [&] { return windowed_out(16ull << 20); });
+  timed("windowed restore, one window", [&] { return windowed_in(bytes); });
+  timed("windowed restore, 16 MiB windows", [&] { return windowed_in(16ull << 20); });
+
+  // The block keys as the whole calls copied them before #309: one 4 KiB
+  // copy per page per attention layer, on the default stream.
+  const std::size_t page_bytes = pool->indexer_page_bytes();
+  const auto pages = seq->kv.page_ids();
+  const auto began = std::chrono::steady_clock::now();
+  std::size_t copies = 0;
+  for (int32_t layer = 0; layer < pool->kv_num_layers; ++layer) {
+    for (const int32_t page : pages) {
+      cudaMemcpyAsync(pinned + copies * page_bytes, pool->indexer_page_keys(layer, page), page_bytes,
+                      cudaMemcpyDeviceToHost, nullptr);
+      ++copies;
+    }
+  }
+  check(cudaStreamSynchronize(nullptr) == cudaSuccess, "cost: per-page copies");
+  const double per_page_ms = ms_since(began);
+  std::printf("  the block keys a page at a time: %zu copies of %zu B, %.1f ms (%.2f us each)\n", copies, page_bytes,
+              per_page_ms, per_page_ms * 1e3 / static_cast<double>(copies));
+
+  // The link: one copy of the same bytes from one device buffer.
+  void *device = nullptr;
+  if (cudaMalloc(&device, bytes) == cudaSuccess) {
+    timed("one cudaMemcpy, device -> host", [&] {
+      return cudaMemcpy(pinned, device, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+    });
+    timed("one cudaMemcpy, host -> device", [&] {
+      return cudaMemcpy(device, pinned, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    });
+    cudaFree(device);
+  }
+  cudaFreeHost(pinned);
+  ignis_seq_release(pool, seq);
+  ignis_seq_pool_free(pool);
+}
+
+}  // namespace
+
+int main() {
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::fprintf(stderr, "FATAL: no CUDA device\n");
+    return 1;
+  }
+
+  ignis_seq_pool_spec spec = small_flash_next_spec();
 
   struct ignis_seq_pool_plan plan{};
   check(ignis_seq_pool_plan(&spec, &plan) == 0, std::string("plans: ") + ignis_seq_last_error());
@@ -304,6 +524,7 @@ int main() {
     }
     ignis_seq_release(pool, w);
   }
+  check_restore_lands_after_the_draw(pool, blob, a_keys);
 
   ignis_seq_checkpoint_release(pool, checkpoint);
 
@@ -354,6 +575,9 @@ int main() {
   ignis_seq_release(pool, a);
   ignis_seq_prefix_release(pool, prefix);
   ignis_seq_pool_free(pool);
+
+  check_runs_with_a_gap();
+  report_transfer_cost();
   if (g_failed != 0) {
     std::fprintf(stderr, "seq flash-next sections test: %d check(s) failed\n", g_failed);
     return 1;

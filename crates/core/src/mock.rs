@@ -19,7 +19,7 @@ use std::time::Duration;
 use crate::decision::{Readout, argmax, log_sum_exp};
 use crate::scheduler::{
     Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource, DiskTarget,
-    PrefillJob, PrefillOutcome, NO_HOST_ROOM,
+    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, NO_HOST_ROOM,
 };
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
@@ -109,6 +109,31 @@ struct Inner {
     /// disk, which takes nothing -- every scenario that is not about the
     /// tier.
     disk: Option<FakeDiskState>,
+    /// Live moves through KV-RAM a window at a time (GitHub #309), or `None`:
+    /// moves in one call, the default.
+    ram: Option<FakeRamState>,
+}
+
+/// How the mock moves a live sequence through KV-RAM a window at a time
+/// (GitHub #309): each move ends `advances` calls to
+/// [`Compute::kv_ram_advance`] after it started.
+#[derive(Debug, Default)]
+struct FakeRamState {
+    advances: u32,
+    moves: Vec<FakeRamMove>,
+    /// Every move from now on fails when it would have landed
+    /// (`fail_kv_ram_moves`).
+    failing: bool,
+    /// Every move started, in order: the request and whether it went out.
+    started: Vec<(RequestId, bool)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FakeRamMove {
+    request: RequestId,
+    out: bool,
+    /// Advances left before it ends.
+    left: u32,
 }
 
 /// A fake KV-disk's shape (spec vram-budget/03): the volume's room, and how
@@ -391,6 +416,44 @@ impl MockCompute {
             windows: Vec::new(),
         });
         self
+    }
+
+    /// A mock that moves live sequences through KV-RAM a window at a time
+    /// (GitHub #309), as the real adapter does: a move ends `advances` calls
+    /// to [`Compute::kv_ram_advance`] after it started, at least one.
+    pub fn with_windowed_kv_ram(self, advances: u32) -> Self {
+        self.inner.lock().unwrap().ram = Some(FakeRamState {
+            advances: advances.max(1),
+            ..FakeRamState::default()
+        });
+        self
+    }
+
+    /// Make every windowed KV-RAM move from now on fail when it would have
+    /// landed (or land again, with `false`): a copy that errored.
+    pub fn fail_kv_ram_moves(&self, failing: bool) {
+        self.with_fake_ram(|ram| ram.failing = failing);
+    }
+
+    /// The windowed KV-RAM moves under way.
+    pub fn kv_ram_moves(&self) -> usize {
+        self.with_fake_ram(|ram| ram.moves.len())
+    }
+
+    /// Every windowed KV-RAM move started so far, in order: the request, and
+    /// whether it moved off the device.
+    pub fn kv_ram_moves_started(&self) -> Vec<(RequestId, bool)> {
+        self.with_fake_ram(|ram| ram.started.clone())
+    }
+
+    fn with_fake_ram<T>(&self, f: impl FnOnce(&mut FakeRamState) -> T) -> T {
+        f(self
+            .inner
+            .lock()
+            .unwrap()
+            .ram
+            .as_mut()
+            .expect("windowed KV-RAM moves need MockCompute::with_windowed_kv_ram"))
     }
 
     /// Make every disk write from now on fail once its first window moved
@@ -925,6 +988,90 @@ impl Compute for MockCompute {
         self.free_blob(MockBlob::Live(request));
     }
 
+    // GitHub #309: a windowed move takes its span at the start -- the blob
+    // is placed then -- and gives it back when a move in lands or a move out
+    // fails. Nothing is copied: the mock's streams are pure functions of the
+    // request, wherever its state has been.
+
+    fn kv_ram_move_out(&self, request: RequestId) -> Result<(u64, KvRamMove), ComputeError> {
+        let windowed = self.inner.lock().unwrap().ram.as_ref().map(|ram| ram.advances);
+        let bytes = self.evict(request)?;
+        let Some(advances) = windowed else {
+            return Ok((bytes, KvRamMove::Done));
+        };
+        self.with_fake_ram(|ram| {
+            ram.moves.push(FakeRamMove { request, out: true, left: advances });
+            ram.started.push((request, true));
+        });
+        Ok((bytes, KvRamMove::Started))
+    }
+
+    fn kv_ram_move_in(&self, request: RequestId, context_tokens: u32) -> Result<KvRamMove, ComputeError> {
+        let windowed = self.inner.lock().unwrap().ram.as_ref().map(|ram| ram.advances);
+        let Some(advances) = windowed else {
+            return self.restore(request, context_tokens).map(|()| KvRamMove::Done);
+        };
+        self.with_fake_ram(|ram| {
+            ram.moves.push(FakeRamMove { request, out: false, left: advances });
+            ram.started.push((request, false));
+        });
+        Ok(KvRamMove::Started)
+    }
+
+    fn kv_ram_advance(&self) -> Vec<KvRamEvent> {
+        let ended: Vec<(FakeRamMove, bool)> = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(ram) = g.ram.as_mut() else {
+                return Vec::new();
+            };
+            let failing = ram.failing;
+            let mut ended = Vec::new();
+            ram.moves.retain_mut(|m| {
+                m.left -= 1;
+                if m.left == 0 {
+                    ended.push((*m, failing));
+                }
+                m.left > 0
+            });
+            ended
+        };
+        ended
+            .into_iter()
+            .map(|(m, failed)| {
+                // A move in that landed gives its span back, and so does a
+                // move out that failed; the others' spans stay the
+                // request's snapshot.
+                let span_goes = match (m.out, failed) {
+                    (false, false) | (true, true) => true,
+                    (false, true) | (true, false) => false,
+                };
+                if span_goes {
+                    self.free_blob(MockBlob::Live(m.request));
+                }
+                KvRamEvent {
+                    request: m.request,
+                    outcome: if failed { KvRamOutcome::Failed } else { KvRamOutcome::Landed { micros: 0 } },
+                }
+            })
+            .collect()
+    }
+
+    fn kv_ram_abandon(&self, request: RequestId) {
+        let abandoned = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(ram) = g.ram.as_mut() else {
+                return;
+            };
+            let at = ram.moves.iter().position(|m| m.request == request);
+            at.map(|at| ram.moves.remove(at))
+        };
+        // A move out's span goes with it; a move in leaves the snapshot for
+        // the caller to discard.
+        if abandoned.is_some_and(|m| m.out) {
+            self.free_blob(MockBlob::Live(request));
+        }
+    }
+
     // Spec vram-budget/03: the fake disk. Files are a byte count apiece, a
     // transfer a countdown of windows; nothing is copied, and nothing about
     // a request's tokens depends on where its state has been -- the mock's
@@ -1357,6 +1504,22 @@ impl Compute for GatedCompute {
 
     fn discard_snapshot(&self, request: RequestId) {
         self.inner.discard_snapshot(request);
+    }
+
+    fn kv_ram_move_out(&self, request: RequestId) -> Result<(u64, KvRamMove), ComputeError> {
+        self.inner.kv_ram_move_out(request)
+    }
+
+    fn kv_ram_move_in(&self, request: RequestId, context_tokens: u32) -> Result<KvRamMove, ComputeError> {
+        self.inner.kv_ram_move_in(request, context_tokens)
+    }
+
+    fn kv_ram_advance(&self) -> Vec<KvRamEvent> {
+        self.inner.kv_ram_advance()
+    }
+
+    fn kv_ram_abandon(&self, request: RequestId) {
+        self.inner.kv_ram_abandon(request);
     }
 
     fn release_checkpoint(&self, publisher: RequestId) {

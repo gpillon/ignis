@@ -14,7 +14,8 @@
 //! width 1 (finding 2026-09-14: batched decode width drift).
 //!
 //! - **KV-RAM leg.** The disk tier off and an arena that holds A's blob: each
-//!   move is the synchronous snapshot and restore.
+//!   move goes a window at a time between rounds, into the arena and back
+//!   (GitHub #309; the synchronous snapshot and restore before it).
 //! - **KV-disk leg.** No arena: each move is a windowed spill to a file and a
 //!   windowed read back.
 //!
@@ -212,8 +213,8 @@ impl Run {
             let last: Vec<&SchedEvent> =
                 self.events.iter().map(|(_, e)| e).filter(|e| !matches!(e, SchedEvent::Token { .. })).rev().take(12).collect();
             panic!(
-                "the run never settled: disk busy {}, KV pages {}, the last events (newest first) {last:?}",
-                sched.disk_busy(),
+                "the run never settled: a move under way {}, KV pages {}, the last events (newest first) {last:?}",
+                sched.transfer_busy(),
                 sched.kv_used_pages()
             );
         }

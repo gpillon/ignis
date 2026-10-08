@@ -499,6 +499,41 @@ pub struct DiskEvent {
     pub outcome: DiskOutcome,
 }
 
+/// How a live move into or out of KV-RAM stood when it started (spec
+/// vram-budget/03 AC 37, GitHub #309).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvRamMove {
+    /// It happened in the call: the sequence left the device, or is back on
+    /// it ([`Compute::evict`] / [`Compute::restore`]'s way).
+    Done,
+    /// It moves a window at a time between steps, and
+    /// [`Compute::kv_ram_advance`] reports its end. Until then a move out's
+    /// sequence keeps its pages on the device, and a move in's is being
+    /// built: neither may be stepped.
+    Started,
+}
+
+/// How a windowed KV-RAM move ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvRamOutcome {
+    /// Every window landed, `micros` after the move started: a move out's
+    /// blob is in KV-RAM and its sequence released; a move in's sequence is
+    /// the request's.
+    Landed { micros: u64 },
+    /// A copy failed. A move out leaves its sequence on the device and keeps
+    /// no blob; a move in leaves nothing on the device and its blob where it
+    /// was, as a refused [`Compute::restore`] does.
+    Failed,
+}
+
+/// One windowed KV-RAM move that ended, as [`Compute::kv_ram_advance`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvRamEvent {
+    pub request: RequestId,
+    pub outcome: KvRamOutcome,
+}
+
 /// The [`ComputeError::Kernel`] code a backend reports when a job asked for
 /// a [`PrefillJob::readout`] on a chunk that carries no tokens (GitHub
 /// #237): no forward pass runs, so there are no logits at that position to
@@ -625,6 +660,40 @@ pub trait Compute: Send + Sync {
     /// frees the pinned buffer. The request re-prefills from scratch later.
     /// A request with no pending snapshot is a no-op.
     fn discard_snapshot(&self, _request: RequestId) {}
+
+    // ── Live moves through KV-RAM (spec vram-budget/03 AC 37, GitHub #309) ─
+    //
+    // The scheduler moves a live sequence into and out of KV-RAM through
+    // these two calls. A backend either moves it in the call -- the
+    // defaults, through `evict` and `restore` -- or a window at a time on the
+    // leaf's transfer stream, pumped by `kv_ram_advance` between steps like a
+    // KV-disk transfer, so that no decode round waits on a whole-blob copy.
+
+    /// Start moving live `request` off the device into KV-RAM, which has room
+    /// for it. Returns the blob's bytes, held in KV-RAM from now on, and
+    /// whether the move is done.
+    fn kv_ram_move_out(&self, request: RequestId) -> Result<(u64, KvRamMove), ComputeError> {
+        self.evict(request).map(|bytes| (bytes, KvRamMove::Done))
+    }
+
+    /// Start bringing `request`'s snapshot back from KV-RAM into a sequence
+    /// reserving `context_tokens`, drawn now. `Err` leaves the snapshot where
+    /// it was, as [`Compute::restore`]'s does.
+    fn kv_ram_move_in(&self, request: RequestId, context_tokens: u32) -> Result<KvRamMove, ComputeError> {
+        self.restore(request, context_tokens).map(|()| KvRamMove::Done)
+    }
+
+    /// Advance every windowed KV-RAM move under way, and report the ones that
+    /// ended.
+    fn kv_ram_advance(&self) -> Vec<KvRamEvent> {
+        Vec::new()
+    }
+
+    /// Abandon `request`'s windowed move, once the copy in flight has landed:
+    /// a move out frees the span it was writing and leaves the sequence
+    /// live; a move in releases the sequence it was building and leaves the
+    /// snapshot where it was.
+    fn kv_ram_abandon(&self, _request: RequestId) {}
 
     // ── Prompt checkpoints on the device (GitHub #186, ADR 0029) ─────────
     //

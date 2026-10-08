@@ -8,24 +8,20 @@
 //! the fixed branch only an admission moves anything -- and when E ends, C
 //! comes back while B1 and B2 still decode. Two legs:
 //!
-//! - **KV-RAM**: an arena that holds C's blob, the synchronous snapshot and
-//!   restore;
+//! - **KV-RAM**: an arena that holds C's blob, moved a window at a time
+//!   between steps (GitHub #309; synchronous before it);
 //! - **KV-disk**: no arena, the windowed spill and read back.
 //!
 //! Measured for each move: its bytes, duration and GB/s, and B1's and B2's
-//! inter-token latency (p50 and max) over the steps it spanned, each against a
-//! baseline window of the same number of steps at the same decode width with
-//! no transfer in flight, from the same run:
-//!
-//! - a disk move runs between steps while B1 and B2 decode at width 2 (C,
-//!   mid-transfer, is in no round): its baseline is B1' and B2' decoding alone
-//!   at width 2 before C arrives;
-//! - a KV-RAM move out happens inside the step that also runs E's first
-//!   prefill chunk: its baseline is the step that ran the first chunk -- the
-//!   same 8,192 tokens -- of E0, an `interactive` arrival that fits beside C
-//!   and moves nothing;
-//! - a KV-RAM move in happens at the end of the step E ends in: its baseline
-//!   is the width-3 decode of C, B1 and B2 before any arrival.
+//! inter-token latency (p50 and max) over the steps its windows were on the
+//! link -- B1 and B2 decoding at width 2, C mid-move in no round, E waiting
+//! for the room or ended. The baseline (GitHub #309, the same for all four
+//! moves): **B1' and B2', two fresh `interactive` lanes decoding alone at
+//! width 2 after everything else has ended**, a window of as many steady
+//! steps as the move's from the middle of their run -- the card's state after
+//! C's 236K-token prefill, which a baseline taken before it does not show
+//! (the 2026-10-08 finding). The width-2 pair taken before C arrives is
+//! printed beside it.
 //!
 //! Starting thresholds, for the owner to confirm (printed, not asserted): move
 //! out ITL p50 within +10 %, move in within +25 %, either one's max within the
@@ -33,6 +29,8 @@
 //! no work was lost -- every request generates its full `max_tokens`, no
 //! `Requeued`, no dropped snapshot, no disk failure. `IGNIS_KV_P3_RAW` names a
 //! directory the raw samples are written to, one JSON file a leg.
+//! `IGNIS_KV_MOVE_PACE=<in MiB>,<out MiB>` runs the load at another pace than
+//! `ignis_runtime::TransferPace::default()`.
 //!
 //! The pool is cut to one context (`--kv-pool-bytes`'s token form, #309 P1)
 //! so that E cannot fit beside C. Machine-local: the Flash-Next artifact
@@ -63,18 +61,20 @@ const PAGE_TOKENS: u32 = 64;
 const C_PROMPT: u32 = 236_000;
 const C_TOKENS: u32 = 2_000;
 const B_PROMPT: u32 = 2_000;
-const B1_TOKENS: u32 = 1_200;
-const B2_TOKENS: u32 = 1_600;
-/// The width-2 baseline's lanes.
+/// Long enough that both still decode through C's move back in.
+const B1_TOKENS: u32 = 2_000;
+const B2_TOKENS: u32 = 2_400;
+/// The width-2 baselines' lanes.
 const B0_TOKENS: u32 = 300;
-/// E0 fits beside C, B1 and B2 (8,256 of the 17,344 tokens they leave); its
-/// one chunk is E's first.
+/// The baseline taken last runs longer: the moves' windows are drawn from its
+/// middle.
+const B9_TOKENS: u32 = 800;
+/// E0 fits beside C, B1 and B2 (8,256 of the 15,744 tokens they leave).
 const E0_PROMPT: u32 = CHUNK;
 /// E does not fit (18,064): C has to go.
 const E_PROMPT: u32 = 18_000;
 const E_TOKENS: u32 = 64;
-/// B1 and B2 decode this many tokens at width 3 before any arrival: the
-/// KV-RAM move in's baseline.
+/// B1 and B2 decode this many tokens beside C before any arrival.
 const WIDTH3_TOKENS: usize = 160;
 /// The KV-RAM leg's arena: C's blob is ~1.13 GB. On this host's ~45.9 GB of
 /// available RAM the plan takes it only without the n-gram hot rows (37.8 GB
@@ -111,20 +111,101 @@ enum Tier {
 }
 
 /// One advance: its wall time, when it returned, its events, and whether a
-/// disk transfer was in flight when it returned.
+/// move was in flight when it returned.
 struct Step {
     wall: Duration,
     at: Instant,
     events: Vec<SchedEvent>,
     busy_after: bool,
+    /// The model thread's time in the advance's transfer passes.
+    pump: Duration,
+    /// The load's expert residency and n-gram counts after the step.
+    counters: Option<ignis_core::flash_next_counters::FlashNextCounters>,
 }
 
 struct Rig {
     sched: ConcreteScheduler,
     steps: Vec<Step>,
+    counters: Option<std::sync::Arc<ignis_core::flash_next_counters::FlashNextCounterSource>>,
 }
 
 impl Rig {
+    /// Every step as one JSON row -- when it ended (Unix ms), its wall time,
+    /// the transfer passes' time, how many requests decoded in it, whether it
+    /// ran a prefill chunk or had a move in flight, and its move and end
+    /// facts -- to set beside a GPU sampler's log (GitHub #309).
+    fn write_timeline(&self, path: &Path) {
+        let (now_instant, now_unix) = (Instant::now(), std::time::SystemTime::now());
+        let unix_ms = |at: Instant| {
+            let ago = now_instant - at;
+            (now_unix - ago).duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1e3)
+        };
+        // Decode's expert hits, misses and demand-copy stall, and the
+        // n-gram file reads, in the step: each a difference of totals.
+        let decode = |c: &ignis_core::flash_next_counters::FlashNextCounters| {
+            let r = &c.residency;
+            (
+                r.hits.iter().map(|p| p[0]).sum::<u64>(),
+                r.misses.iter().map(|p| p[0]).sum::<u64>(),
+                r.stall_nanos[0],
+                c.ngram.file_rows,
+            )
+        };
+        let mut previous = (0, 0, 0, 0);
+        let rows: Vec<String> = self
+            .steps
+            .iter()
+            .map(|s| {
+                let now = s.counters.as_ref().map_or(previous, decode);
+                let (hits, misses, stall, ngram) =
+                    (now.0 - previous.0, now.1 - previous.1, now.2 - previous.2, now.3 - previous.3);
+                previous = now;
+                let decoded: std::collections::BTreeSet<RequestId> = s
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        SchedEvent::Token { request, .. } => Some(*request),
+                        _ => None,
+                    })
+                    .collect();
+                let facts: Vec<String> = s
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        SchedEvent::Evicted { request, .. } => Some(format!("evicted {request}")),
+                        SchedEvent::Restored { request, .. } => Some(format!("restored {request}")),
+                        SchedEvent::DiskSpilled { request, .. } => Some(format!("spilled {request}")),
+                        SchedEvent::Done { request, .. } => Some(format!("done {request}")),
+                        _ => None,
+                    })
+                    .collect();
+                // The cache's occupancy and the prefetches' totals, as they
+                // stand after the step.
+                let (in_use, capacity, prefetch_issued, prefetch_used) =
+                    s.counters.as_ref().map_or((0, 0, 0, 0), |c| {
+                        (
+                            c.slots_in_use.iter().map(|&n| u64::from(n)).sum::<u64>(),
+                            c.slots_capacity.iter().map(|&n| u64::from(n)).sum::<u64>(),
+                            c.residency.prefetch_issued,
+                            c.residency.prefetch_used,
+                        )
+                    });
+                format!(
+                    "{{\"unix_ms\":{:.1},\"wall_ms\":{:.3},\"pump_ms\":{:.3},\"decoded\":{:?},\"prefill\":{},\"busy\":{},\"facts\":{:?},\"decode_hits\":{hits},\"decode_misses\":{misses},\"decode_stall_ms\":{:.3},\"ngram_file_rows\":{ngram},\"slots_in_use\":{in_use},\"slots_capacity\":{capacity},\"prefetch_issued\":{prefetch_issued},\"prefetch_used\":{prefetch_used}}}",
+                    unix_ms(s.at),
+                    ms(s.wall),
+                    ms(s.pump),
+                    decoded.iter().collect::<Vec<_>>(),
+                    s.events.iter().any(|e| matches!(e, SchedEvent::PrefillChunk { .. })),
+                    s.busy_after,
+                    facts,
+                    stall as f64 / 1e6
+                )
+            })
+            .collect();
+        std::fs::write(path, format!("[\n{}\n]\n", rows.join(",\n"))).expect("write the step timeline");
+    }
+
     fn step(&mut self) {
         let started = Instant::now();
         let events = self.sched.advance();
@@ -132,8 +213,10 @@ impl Rig {
         if let Some(error) = self.sched.last_error() {
             panic!("the leaf failed a step: {error}");
         }
-        let busy_after = self.sched.disk_busy();
-        self.steps.push(Step { wall, at: Instant::now(), events, busy_after });
+        let busy_after = self.sched.transfer_busy();
+        let pump = Duration::from_micros(self.sched.transfer_pass_micros());
+        let counters = self.counters.as_ref().map(|source| source.read());
+        self.steps.push(Step { wall, at: Instant::now(), events, busy_after, pump, counters });
     }
 
     fn to_idle(&mut self) {
@@ -200,6 +283,34 @@ impl Rig {
         gaps
     }
 
+    /// The gaps of `requests` whose later token lands in one of `steps`.
+    fn itl_in(&self, requests: &[RequestId], steps: &[usize]) -> Vec<Duration> {
+        steps.iter().flat_map(|&i| self.itl(requests, i, i)).collect()
+    }
+
+    /// Whether every one of `requests` decoded in step `i`: a round of that
+    /// width at least.
+    fn all_decoded(&self, requests: &[RequestId], i: usize) -> bool {
+        requests
+            .iter()
+            .all(|r| self.steps[i].events.iter().any(|e| matches!(e, SchedEvent::Token { request, .. } if request == r)))
+    }
+
+    /// The span a KV-RAM move of `request` reported landing in step `at`,
+    /// start to landing; a disk move's is read off the steps it spanned.
+    fn kv_ram_span(&self, tier: Tier, request: RequestId, at: usize) -> Option<Duration> {
+        if tier != Tier::KvRam {
+            return None;
+        }
+        self.steps[at].events.iter().find_map(|ev| match ev {
+            SchedEvent::Evicted { request: r, snapshot_micros } if *r == request => Some(Duration::from_micros(*snapshot_micros)),
+            SchedEvent::Restored { request: r, restore_micros, .. } if *r == request => {
+                Some(Duration::from_micros(*restore_micros))
+            }
+            _ => None,
+        })
+    }
+
     /// The steps in `from..to` that ran no prefill chunk and had no transfer
     /// in flight: steady decode.
     fn steady(&self, from: usize, to: usize) -> Vec<usize> {
@@ -233,11 +344,14 @@ struct Move {
     duration: Duration,
     steps: usize,
     itl: Vec<Duration>,
+    /// B1' and B2' alone at width 2 after everything else ended, as many
+    /// steps as the move's: the baseline.
     baseline: Vec<Duration>,
-    baseline_label: &'static str,
-    /// The width-2 baseline taken again at the end of the run, for a disk
-    /// move.
-    late_baseline: Option<Vec<Duration>>,
+    /// The same pair's window before C arrived, for reference.
+    early_baseline: Vec<Duration>,
+    /// The model thread's time in the transfer passes, each of the move's
+    /// steps: the host side of what the move costs a round.
+    pump: Vec<Duration>,
     p50_bound: f64,
 }
 
@@ -249,11 +363,13 @@ impl Move {
     fn print(&self, leg: Tier) {
         let (p50, max) = stats(&self.itl);
         let (b50, bmax) = stats(&self.baseline);
+        let (e50, emax) = stats(&self.early_baseline);
         let p50_ok = p50 <= b50 * (1.0 + self.p50_bound);
         let max_ok = max <= bmax + 150.0;
         println!(
             "{leg:?} {}: {} bytes in {:.1} ms ({:.2} GB/s) over {} step(s); ITL p50 {p50:.2} ms vs {b50:.2} ms ({:+.1} %, bound +{:.0} %: {}), \
-             max {max:.2} ms vs {bmax:.2} ms ({:+.1} ms, bound +150 ms: {}); {} gaps against {} ({})",
+             max {max:.2} ms vs {bmax:.2} ms ({:+.1} ms, bound +150 ms: {}); {} gaps against {} (B1' and B2' at width 2, taken last); \
+             against the pair taken first: p50 {:+.1} % (vs {e50:.2} ms), max {:+.1} ms (vs {emax:.2} ms)",
             self.name,
             self.bytes,
             ms(self.duration),
@@ -266,34 +382,47 @@ impl Move {
             if max_ok { "within" } else { "OVER" },
             self.itl.len(),
             self.baseline.len(),
-            self.baseline_label,
+            (p50 / e50 - 1.0) * 100.0,
+            max - emax,
         );
-        if let Some(late) = &self.late_baseline {
-            let (l50, lmax) = stats(late);
-            println!(
-                "{leg:?} {}: against the width-2 baseline taken last, ITL p50 {:+.1} % (vs {l50:.2} ms), max {:+.1} ms (vs {lmax:.2} ms)",
-                self.name,
-                (p50 / l50 - 1.0) * 100.0,
-                max - lmax,
-            );
-        }
+        let (pump50, pump_max) = stats(&self.pump);
+        println!(
+            "{leg:?} {}: the model thread's own time in the transfer passes, a step: p50 {:.3} ms, max {:.3} ms",
+            self.name, pump50, pump_max
+        );
     }
 
-    fn json(&self) -> String {
+    fn json(&self, pace: ignis_runtime::TransferPace) -> String {
         let list = |v: &[Duration]| v.iter().map(|d| format!("{:.3}", ms(*d))).collect::<Vec<_>>().join(",");
         format!(
-            "{{\"move\":\"{}\",\"bytes\":{},\"duration_ms\":{:.3},\"gb_per_s\":{:.3},\"steps\":{},\"itl_ms\":[{}],\"baseline\":\"{}\",\"baseline_itl_ms\":[{}],\"late_baseline_itl_ms\":[{}]}}",
+            "{{\"move\":\"{}\",\"pace_in_bytes\":{},\"pace_out_bytes\":{},\"bytes\":{},\"duration_ms\":{:.3},\"gb_per_s\":{:.3},\"steps\":{},\"itl_ms\":[{}],\"baseline\":\"B1' and B2' alone at width 2, taken last\",\"baseline_itl_ms\":[{}],\"early_baseline_itl_ms\":[{}],\"pump_ms\":[{}]}}",
             self.name,
+            pace.move_in_bytes,
+            pace.move_out_bytes,
             self.bytes,
             ms(self.duration),
             self.gbps(),
             self.steps,
             list(&self.itl),
-            self.baseline_label,
             list(&self.baseline),
-            self.late_baseline.as_deref().map_or_else(String::new, list)
+            list(&self.early_baseline),
+            list(&self.pump),
         )
     }
+}
+
+/// The pace the legs run at: `IGNIS_KV_MOVE_PACE=<in MiB>,<out MiB>`, or
+/// Flash-Next's own.
+fn pace() -> ignis_runtime::TransferPace {
+    let Ok(named) = std::env::var("IGNIS_KV_MOVE_PACE") else {
+        return ignis_runtime::TransferPace::for_family(ignis_core::compute::ModelFamily::FlashNext);
+    };
+    let mib: Vec<u64> = named
+        .split(',')
+        .map(|v| v.trim().parse::<u64>().expect("IGNIS_KV_MOVE_PACE is <in MiB>,<out MiB>") << 20)
+        .collect();
+    assert_eq!(mib.len(), 2, "IGNIS_KV_MOVE_PACE is <in MiB>,<out MiB>");
+    ignis_runtime::TransferPace { move_in_bytes: mib[0], move_out_bytes: mib[1] }
 }
 
 /// `n` consecutive steady steps out of `steady`, taken from its middle: a
@@ -315,7 +444,7 @@ impl Drop for BlobDir {
     }
 }
 
-fn leg(tier: Tier) -> Option<Vec<Move>> {
+fn leg(tier: Tier, pace: ignis_runtime::TransferPace) -> Option<Vec<Move>> {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(FLASH_NEXT_DIR), PathBuf::from);
     let path = dir.join(ARTIFACT_FILE_NAME);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
@@ -345,6 +474,7 @@ fn leg(tier: Tier) -> Option<Vec<Move>> {
         kv_disk_bytes: Some(kv_disk_bytes),
         kv_pool: Some(ignis_core::KvPoolSize::Tokens(u64::from(CONTEXT))),
         ngram_hot_bytes: ignis_core::ngram_table::HotBudget::Bytes(0),
+        transfer_pace: Some(pace),
         ..EngineShape::default()
     };
     let (sched, reserved) = match flash_next_scheduler_with_ngram_cache(
@@ -370,7 +500,7 @@ fn leg(tier: Tier) -> Option<Vec<Move>> {
         ));
         return None;
     }
-    let mut rig = Rig { sched, steps: Vec::new() };
+    let mut rig = Rig { sched, steps: Vec::new(), counters: reserved.flash_next.clone() };
     let interactive = RequestClass::Interactive;
 
     // ── the width-2 baseline: two lanes alone ──────────────────────────────
@@ -391,141 +521,95 @@ fn leg(tier: Tier) -> Option<Vec<Move>> {
     ];
     rig.until_tokens(b[0], 16);
     rig.until_tokens(b[1], 16);
-    let from = rig.mark();
+    let width3_from = rig.mark();
     rig.until_tokens(b[0], 16 + WIDTH3_TOKENS);
-    let width3 = rig.steady(from, rig.mark());
+    let width3_to = rig.mark();
 
-    // ── E0: an arrival that fits, its first chunk the baseline of a move in a
-    //    chunk's step ───────────────────────────────────────────────────────
-    let from = rig.mark();
+    // ── E0: an arrival that fits beside C moves nothing ────────────────────
     let e0 = rig.sched.submit(input(prompt(4, E0_PROMPT), E_TOKENS), interactive).unwrap();
     rig.until(|rig| rig.finished_at_length(e0));
-    let e0_chunk = rig
-        .find(from, |e| matches!(e, SchedEvent::PrefillChunk { request, .. } if *request == e0))
-        .expect("E0 prefilled");
     assert!(
         !rig.has(|e| matches!(e, SchedEvent::Evicted { .. } | SchedEvent::DiskSpilled { .. })),
         "E0 fits beside C: nothing moved for it"
     );
 
     // ── E: C out ───────────────────────────────────────────────────────────
+    // Both tiers alike: started in the step E's admission ran in, and seen
+    // landed at the top of the step that also runs E's first chunk -- whose
+    // seconds are E's, not the move's. The steps between are the move's: B1
+    // and B2 at width 2, C in no round, a window on the link. A KV-RAM move
+    // issues its first window as it starts, beside that step's round; the
+    // disk's first is its file's.
     let from = rig.mark();
     let e = rig.sched.submit(input(prompt(5, E_PROMPT), E_TOKENS), interactive).unwrap();
-    let mut moves = Vec::new();
-    match tier {
-        Tier::KvRam => {
-            rig.until(|rig| rig.has(|ev| matches!(ev, SchedEvent::Evicted { request, .. } if *request == c)));
-            let at = rig.find(from, |ev| matches!(ev, SchedEvent::Evicted { request, .. } if *request == c)).unwrap();
-            let micros = rig.steps[at]
-                .events
-                .iter()
-                .find_map(|ev| match ev {
-                    SchedEvent::Evicted { request, snapshot_micros } if *request == c => Some(*snapshot_micros),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(
-                rig.steps[at].events.iter().any(|ev| matches!(ev, SchedEvent::PrefillChunk { request, .. } if *request == e)),
-                "the step that moved C ran E's first chunk"
-            );
-            let bytes = rig.sched.host_tier().entry(c).expect("C's snapshot is in KV-RAM").bytes;
-            moves.push(Move {
-                name: "move out (device -> KV-RAM)",
-                bytes,
-                duration: Duration::from_micros(micros),
-                steps: 1,
-                itl: rig.itl(&b, at, at),
-                baseline: rig.itl(&b, e0_chunk, e0_chunk),
-                baseline_label: "E0's first-chunk step, no move",
-                late_baseline: None,
-                p50_bound: 0.10,
-            });
-        }
-        Tier::KvDisk => {
-            rig.until(|rig| {
-                rig.has(|ev| matches!(ev, SchedEvent::DiskSpilled { request, from: DiskSource::Device } if *request == c))
-            });
-            let start = (from..rig.mark()).find(|&i| rig.steps[i].busy_after).expect("the spill started");
-            let end = rig
-                .find(from, |ev| matches!(ev, SchedEvent::DiskSpilled { request, .. } if *request == c))
-                .unwrap();
-            let bytes = rig.sched.disk_tier().expect("the tier").used_bytes();
-            let started_at = rig.steps[start].at - rig.steps[start].wall;
-            // The steps after the one that started it, up to the one before
-            // its commit was seen: that one also runs E's first chunk, whose
-            // seconds are E's, not the move's.
-            let n = (end - 1 - start).max(1);
-            let (b_first, b_last) = window(&width2, n);
-            moves.push(Move {
-                name: "move out (device -> KV-disk)",
-                bytes,
-                duration: rig.steps[end].at - rig.steps[end].wall - started_at,
-                steps: n,
-                itl: rig.itl(&b, start + 1, start + n),
-                baseline: rig.itl(&b0, b_first, b_last),
-                baseline_label: "B1' and B2' alone at width 2",
-                late_baseline: None,
-                p50_bound: 0.10,
-            });
-        }
-    }
+    let landed_out = move |ev: &SchedEvent| match tier {
+        Tier::KvRam => matches!(ev, SchedEvent::Evicted { request, .. } if *request == c),
+        Tier::KvDisk => matches!(ev, SchedEvent::DiskSpilled { request, from: DiskSource::Device } if *request == c),
+    };
+    rig.until(|rig| rig.has(landed_out));
+    let start = (from..rig.mark()).find(|&i| rig.steps[i].busy_after).expect("the move out started");
+    let end = rig.find(from, landed_out).unwrap();
+    assert!(
+        rig.steps[end].events.iter().any(|ev| matches!(ev, SchedEvent::PrefillChunk { request, .. } if *request == e)),
+        "E took the room in the step C's move landed in"
+    );
+    let bytes = match tier {
+        Tier::KvRam => rig.sched.host_tier().entry(c).expect("C's snapshot is in KV-RAM").bytes,
+        Tier::KvDisk => rig.sched.disk_tier().expect("the tier").used_bytes(),
+    };
+    let first = match tier {
+        Tier::KvRam => start,
+        Tier::KvDisk => start + 1,
+    };
+    // The steps of the move at width 2: B1 and B2 both decoded in them.
+    let out_steps = (first..end).filter(|&i| rig.all_decoded(&b, i)).collect::<Vec<_>>();
+    assert!(!out_steps.is_empty(), "B1 and B2 decoded beside C's move out");
+    println!("{tier:?} move out: {} of its {} steps at width 2", out_steps.len(), end - first);
+    let out_duration = rig
+        .kv_ram_span(tier, c, end)
+        .unwrap_or(rig.steps[end].at - rig.steps[end].wall - (rig.steps[start].at - rig.steps[start].wall));
 
     // ── E ends: C in ───────────────────────────────────────────────────────
+    // Started at the end of the step E ended in, seen landed at the top of
+    // the step that restored C, which then decodes in it at width 3: the
+    // steps between are the move's.
     rig.until(|rig| rig.finished_at_length(e));
     let e_done = rig.find(from, |ev| matches!(ev, SchedEvent::Done { request, .. } if *request == e)).unwrap();
     rig.until(|rig| rig.has(|ev| matches!(ev, SchedEvent::Restored { request, .. } if *request == c)));
     let restored = rig.find(e_done, |ev| matches!(ev, SchedEvent::Restored { request, .. } if *request == c)).unwrap();
-    let still_decoding = b.iter().filter(|&&r| !rig.finished_at_length(r)).count();
-    assert!(still_decoding >= 1, "at least one of B1 and B2 still decodes when C comes back");
-    match tier {
-        Tier::KvRam => {
-            let micros = rig.steps[restored]
-                .events
-                .iter()
-                .find_map(|ev| match ev {
-                    SchedEvent::Restored { request, restore_micros, .. } if *request == c => Some(*restore_micros),
-                    _ => None,
-                })
-                .unwrap();
-            let (b_first, b_last) = window(&width3, 1);
-            moves.push(Move {
-                name: "move in (KV-RAM -> device)",
-                bytes: moves[0].bytes,
-                duration: Duration::from_micros(micros),
-                steps: 1,
-                itl: rig.itl(&b, restored, restored),
-                baseline: rig.itl(&b, b_first, b_last),
-                baseline_label: "C, B1 and B2 at width 3",
-                late_baseline: None,
-                p50_bound: 0.25,
-            });
-        }
-        Tier::KvDisk => {
-            // Started at the end of the step E ended in, seen landed at the
-            // top of the step that restored C.
-            let start = (e_done..=restored).find(|&i| rig.steps[i].busy_after).expect("the restore started");
-            let n = (restored - start).max(1);
-            let (b_first, b_last) = window(&width2, n);
-            moves.push(Move {
-                name: "move in (KV-disk -> device)",
-                bytes: moves[0].bytes,
-                duration: rig.steps[restored].at - rig.steps[restored].wall - rig.steps[start].at,
-                steps: n,
-                itl: rig.itl(&b, start + 1, start + n),
-                baseline: rig.itl(&b0, b_first, b_last),
-                baseline_label: "B1' and B2' alone at width 2",
-                late_baseline: None,
-                p50_bound: 0.25,
-            });
-        }
-    }
+    assert!(b.iter().all(|&r| !rig.finished_at_length(r)), "B1 and B2 both still decode when C comes back");
+    let in_start = (e_done..=restored).find(|&i| rig.steps[i].busy_after).expect("the move in started");
+    let in_steps = (in_start + 1..restored).filter(|&i| rig.all_decoded(&b, i)).collect::<Vec<_>>();
+    assert!(!in_steps.is_empty(), "B1 and B2 decoded beside C's move in");
+    println!("{tier:?} move in: {} of its {} steps at width 2", in_steps.len(), restored - in_start - 1);
+    let in_duration = rig
+        .kv_ram_span(tier, c, restored)
+        .unwrap_or(rig.steps[restored].at - rig.steps[restored].wall - rig.steps[in_start].at);
     rig.to_idle();
 
-    // ── the width-2 baseline again, last: whether the first one, taken
-    //    before C's prefill, stands for the card's state during the moves ──
+    // ── width 3 before any arrival and after C is back (GitHub #309: whether
+    //    what the rounds of the move in cost is the move's, or the state the
+    //    arrivals left behind) ─────────────────────────────────────────────
+    let three = [c, b[0], b[1]];
+    let width3_steps = |from: usize, to: usize| {
+        rig.steady(from, to).into_iter().filter(|&i| rig.all_decoded(&three, i)).collect::<Vec<_>>()
+    };
+    let before = width3_steps(width3_from, width3_to);
+    let after = width3_steps(restored + 1, rig.mark());
+    let (before50, _) = stats(&rig.itl_in(&b, &before));
+    let (after50, _) = stats(&rig.itl_in(&b, &after));
+    println!(
+        "{tier:?} width 3 (C, B1, B2), B1's and B2's ITL p50: {before50:.2} ms over {} steps before any arrival, \
+         {after50:.2} ms over {} steps after C came back ({:+.1} %)",
+        before.len(),
+        after.len(),
+        (after50 / before50 - 1.0) * 100.0
+    );
+
+    // ── the baseline: two fresh lanes alone at width 2, last ───────────────
     let b9 = [
-        rig.sched.submit(input(prompt(22, B_PROMPT), B0_TOKENS), interactive).unwrap(),
-        rig.sched.submit(input(prompt(23, B_PROMPT), B0_TOKENS), interactive).unwrap(),
+        rig.sched.submit(input(prompt(22, B_PROMPT), B9_TOKENS), interactive).unwrap(),
+        rig.sched.submit(input(prompt(23, B_PROMPT), B9_TOKENS), interactive).unwrap(),
     ];
     let from = rig.mark();
     rig.to_idle();
@@ -535,17 +619,40 @@ fn leg(tier: Tier) -> Option<Vec<Move>> {
     let early_itl = rig.itl(&b0, width2[0], *width2.last().unwrap());
     let (early50, early_max) = stats(&early_itl);
     println!(
-        "{tier:?} width-2 baselines: first ITL p50 {early50:.2} ms max {early_max:.2} ms ({} gaps), \
+        "{tier:?} at pace in {} MiB, out {} MiB; width-2 baselines: first ITL p50 {early50:.2} ms max {early_max:.2} ms ({} gaps), \
          last p50 {late50:.2} ms max {late_max:.2} ms ({} gaps)",
+        pace.move_in_bytes >> 20,
+        pace.move_out_bytes >> 20,
         early_itl.len(),
         late_itl.len()
     );
-    for m in moves.iter_mut().filter(|m| m.baseline_label.contains("width 2")) {
-        m.late_baseline = Some(late_itl.clone());
-    }
+    let measured = |name, bytes, duration, steps: &[usize], p50_bound| {
+        let n = steps.len().max(1);
+        let (late_first, late_last) = window(&late, n);
+        let (early_first, early_last) = window(&width2, n.min(width2.len()));
+        Move {
+            name,
+            bytes,
+            duration,
+            steps: steps.len(),
+            itl: rig.itl_in(&b, steps),
+            baseline: rig.itl(&b9, late_first, late_last),
+            early_baseline: rig.itl(&b0, early_first, early_last),
+            pump: steps.iter().map(|&i| rig.steps[i].pump).collect(),
+            p50_bound,
+        }
+    };
+    let (out_name, in_name) = match tier {
+        Tier::KvRam => ("move out (device -> KV-RAM)", "move in (KV-RAM -> device)"),
+        Tier::KvDisk => ("move out (device -> KV-disk)", "move in (KV-disk -> device)"),
+    };
+    let moves = vec![
+        measured(out_name, bytes, out_duration, &out_steps, 0.10),
+        measured(in_name, bytes, in_duration, &in_steps, 0.25),
+    ];
 
     // ── no work lost ───────────────────────────────────────────────────────
-    for (r, n) in [(c, C_TOKENS), (b[0], B1_TOKENS), (b[1], B2_TOKENS), (e0, E_TOKENS), (e, E_TOKENS), (b9[0], B0_TOKENS)] {
+    for (r, n) in [(c, C_TOKENS), (b[0], B1_TOKENS), (b[1], B2_TOKENS), (e0, E_TOKENS), (e, E_TOKENS), (b9[0], B9_TOKENS)] {
         assert!(rig.finished_at_length(r), "{r} generated its full max_tokens");
         assert_eq!(rig.tokens_of(r), n as usize);
     }
@@ -554,13 +661,17 @@ fn leg(tier: Tier) -> Option<Vec<Move>> {
     assert!(!rig.has(|ev| matches!(ev, SchedEvent::DiskFailure { .. })), "no disk failure");
     let outs = rig.events().filter(|ev| matches!(ev, SchedEvent::Evicted { .. } | SchedEvent::DiskSpilled { .. })).count();
     assert_eq!(outs, 1, "C moved out once, and nothing else moved");
+    if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
+        rig.write_timeline(&dir.join(format!("ac37-{tier:?}-steps.json")));
+    }
     drop(rig);
     drop(blobs);
     Some(moves)
 }
 
 fn measure(tier: Tier) {
-    let Some(moves) = leg(tier) else {
+    let pace = pace();
+    let Some(moves) = leg(tier, pace) else {
         return;
     };
     for m in &moves {
@@ -568,8 +679,13 @@ fn measure(tier: Tier) {
     }
     if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
         std::fs::create_dir_all(&dir).expect("the raw samples' directory");
-        let json = format!("[{}]\n", moves.iter().map(Move::json).collect::<Vec<_>>().join(","));
-        std::fs::write(dir.join(format!("ac37-{tier:?}.json")), json).expect("write the raw samples");
+        let json = format!("[{}]\n", moves.iter().map(|m| m.json(pace)).collect::<Vec<_>>().join(","));
+        let name = format!(
+            "ac37-{tier:?}-in{}-out{}.json",
+            pace.move_in_bytes >> 20,
+            pace.move_out_bytes >> 20
+        );
+        std::fs::write(dir.join(name), json).expect("write the raw samples");
     }
 }
 
@@ -583,4 +699,109 @@ fn a_live_move_through_kv_ram_beside_decoding_lanes() {
 #[ignore = "GPU profile only: the real Flash-Next artifact, minutes"]
 fn a_live_move_through_kv_disk_beside_decoding_lanes() {
     measure(Tier::KvDisk);
+}
+
+/// The control for the rounds after a move (GitHub #309): the same requests
+/// on a pool with room for E beside C, so that nothing moves. Width-3 rounds
+/// (C, B1, B2) before any arrival and after E has ended are compared, with
+/// the expert cache's misses and its stall per round: whether what the
+/// rounds pay after a move is the move's, or the long arrival's.
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact, minutes"]
+fn a_long_arrival_beside_decoding_lanes_with_nothing_moved() {
+    let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(FLASH_NEXT_DIR), PathBuf::from);
+    let path = dir.join(ARTIFACT_FILE_NAME);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
+        return;
+    }
+    let blobs = BlobDir(
+        std::env::var_os("IGNIS_KV_DISK_TEST_DIR")
+            .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/kv-disk-gpu"), PathBuf::from)
+            .join("contention-control"),
+    );
+    let _ = std::fs::remove_dir_all(&blobs.0);
+    std::fs::create_dir_all(&blobs.0).unwrap();
+    let shape = EngineShape {
+        max_context: CONTEXT,
+        prefill_chunk: CHUNK,
+        decode_lanes: 4,
+        host_pool_bytes: ARENA_BYTES,
+        prompt_reuse: false,
+        retained_device_slots: 0,
+        retained_host_slots: 0,
+        retained_host_named: true,
+        kv_disk_bytes: Some(0),
+        // A chunk more than one context: E fits beside C, B1 and B2.
+        kv_pool: Some(ignis_core::KvPoolSize::Tokens(u64::from(CONTEXT + CHUNK))),
+        ngram_hot_bytes: ignis_core::ngram_table::HotBudget::Bytes(0),
+        ..EngineShape::default()
+    };
+    let (sched, reserved) = match flash_next_scheduler_with_ngram_cache(
+        &path,
+        MODEL.into(),
+        EOS,
+        shape,
+        None,
+        ignis_core::ngram_cache::PersistenceOptions { enabled: false, ..Default::default() },
+        &CacheLocation::Directory(blobs.0.clone()),
+    ) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("load the Flash-Next scheduler for the control: {e}"));
+            return;
+        }
+    };
+    let mut rig = Rig { sched, steps: Vec::new(), counters: reserved.flash_next.clone() };
+    let interactive = RequestClass::Interactive;
+    let c = rig.sched.submit(input(prompt(1, C_PROMPT), C_TOKENS), RequestClass::Agent).unwrap();
+    rig.until_tokens(c, 4);
+    let b = [
+        rig.sched.submit(input(prompt(2, B_PROMPT), B1_TOKENS), interactive).unwrap(),
+        rig.sched.submit(input(prompt(3, B_PROMPT), B2_TOKENS), interactive).unwrap(),
+    ];
+    rig.until_tokens(b[0], 16);
+    rig.until_tokens(b[1], 16);
+    let width3_from = rig.mark();
+    rig.until_tokens(b[0], 16 + WIDTH3_TOKENS);
+    let width3_to = rig.mark();
+    let e0 = rig.sched.submit(input(prompt(4, E0_PROMPT), E_TOKENS), interactive).unwrap();
+    rig.until(|rig| rig.finished_at_length(e0));
+    let e = rig.sched.submit(input(prompt(5, E_PROMPT), E_TOKENS), interactive).unwrap();
+    rig.until(|rig| rig.finished_at_length(e));
+    let e_done = rig.mark();
+    rig.until(|rig| rig.finished_at_length(b[0]));
+    let after_to = rig.mark();
+    assert!(
+        !rig.has(|ev| matches!(ev, SchedEvent::Evicted { .. } | SchedEvent::DiskSpilled { .. })),
+        "the pool holds E beside C: nothing moved"
+    );
+    let three = [c, b[0], b[1]];
+    let phase = |from: usize, to: usize| {
+        let steps: Vec<usize> =
+            rig.steady(from, to).into_iter().filter(|&i| rig.all_decoded(&three, i)).collect();
+        let (p50, _) = stats(&rig.itl_in(&b, &steps));
+        let per_step = |f: &dyn Fn(&ignis_core::flash_next_counters::FlashNextCounters) -> u64| {
+            let total: u64 = steps
+                .iter()
+                .filter_map(|&i| Some(f(rig.steps[i].counters.as_ref()?) - f(rig.steps[i - 1].counters.as_ref()?)))
+                .sum();
+            total as f64 / steps.len().max(1) as f64
+        };
+        let misses = per_step(&|c| c.residency.misses.iter().map(|p| p[0]).sum());
+        let stall_ms = per_step(&|c| c.residency.stall_nanos[0]) / 1e6;
+        (steps.len(), p50, misses, stall_ms)
+    };
+    let before = phase(width3_from, width3_to);
+    let after = phase(e_done, after_to);
+    println!(
+        "control, nothing moved: width 3 (C, B1, B2) before any arrival: {} steps, B1's and B2's ITL p50 {:.2} ms, \
+         {:.1} decode misses and {:.2} ms of expert stall a step; after E ended: {} steps, {:.2} ms, {:.1} misses, {:.2} ms",
+        before.0, before.1, before.2, before.3, after.0, after.1, after.2, after.3
+    );
+    if let Some(dir) = std::env::var_os("IGNIS_KV_P3_RAW").map(PathBuf::from) {
+        std::fs::create_dir_all(&dir).expect("the raw samples' directory");
+        rig.write_timeline(&dir.join("ac37-control-steps.json"));
+    }
+    drop(rig);
+    drop(blobs);
 }

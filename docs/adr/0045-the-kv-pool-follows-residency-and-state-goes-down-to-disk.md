@@ -33,6 +33,39 @@ Kept: the in-flight cap, refusals at plan time, and the spec's F: contention
 thresholds as starting values. The numbers in the new sections marked
 *(agent proposal)* are for the owner to confirm.
 
+**Amended 2026-10-08 (GitHub #309, AC 37's follow-up).** The synchronous
+KV-RAM move missed AC 37's max bound both ways (~0.32 s for a 1.13 GB
+Flash-Next blob, every lane stalled). Measured in
+[live moves a window at a time](../findings/2026-10-08-live-moves-windowed.md):
+
+- **KV-RAM moves go a window at a time**, as KV-disk's do, on a leaf with a
+  transfer stream (both leaves). A move out copies the sequence straight into
+  its arena span; the victim keeps its pages, its resident slot and its lane,
+  in no round, until the last window lands, and only then is released. A move
+  in draws its sequence at the start, charged, and is schedulable once its
+  last window lands. A cancel abandons the move after its window in flight.
+  The model thread pays ~0.1 ms a step for it.
+- **One move each way at a time, and none onto the device beside a disk
+  restore** -- a disk restore and a KV-RAM one never share the link. A failed
+  move off the device pauses moves off it for a second, so the victim decodes
+  instead of retrying the same copy every advance.
+- **The pace *(agent proposal)*:** one window in flight each way, a new one at
+  most once an advance; on Flash-Next 16 MiB onto the device (KV-RAM restores
+  and the KV-disk restore's feed alike) and 12 MiB off it into KV-RAM,
+  `MOVE_IN_WINDOW_BYTES` and `MOVE_OUT_WINDOW_BYTES`, constants, not flags. At
+  that pace the copies leave a round's time outside its expert stall where it
+  was. The 27B moves unpaced (one window): its decode puts nothing on the
+  link.
+- **The whole-blob copy runs at the link's speed.** Its 3.5 GB/s was
+  Flash-Next's block keys copied a 4 KiB page at a time; they now go a run of
+  pages per copy. The synchronous call remains for a backend without a
+  transfer stream, and for retained state.
+- **What AC 37's move in still pays is the expert cache, not the link.** The
+  rounds around a move in miss ~3x as many experts; a long arrival alone
+  raises the misses (+38%, one control run, beside a host build), and with a move out and back they
+  roughly double for the moved sequence's remaining run. The owner decides what the move-in bound
+  measures; the residency's response to a move is a follow-up.
+
 Sources: [Flash-Next on the 5090](../findings/2026-10-06-flash-next-on-the-5090.md)
 (its 2026-10-07 update: lanes at 262K), the F: disk bench
 (`.scratch/disk-bench/RESULTS.md`, 2026-09-29; untracked, local to the owner's
@@ -229,8 +262,8 @@ grow page by page (owner). Both models, one mechanism.
   still discards a live blob to take a newer victim (re-prefill). On the
   growth branch, that can now follow a growth as well as an admission.
 - **Mechanism already built.** The move is the 27B's `snapshot_and_evict`
-  (KV-RAM, synchronous) or the disk tier's windowed spill (Tier 2, below).
-  The return is `restore_pass`.
+  (KV-RAM; a window at a time since AC 37's follow-up) or the disk tier's
+  windowed spill (Tier 2, below). The return is `restore_pass`.
 
 #### The growth branch: P0 passes
 
@@ -475,7 +508,8 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
   - **The n-gram table goes first.** While a prefill's n-gram gather is
     pending, the tier issues no new request; one already issued finishes its
     window. Decode gathers do not hold the tier: they are small, and the tier
-    keeps at most one request in flight per direction.
+    keeps at most one request in flight per direction (and, since AC 37's
+    follow-up, no restore beside a KV-RAM move onto the device).
 - **Restart *(agent proposal)*.** v1 reuses nothing across a restart. Each
   process writes into its own directory and holds a lock in it. At start, any
   directory whose lock is free (its owner is gone) is removed; at a clean
@@ -592,9 +626,12 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
   time to finish, and the scheduler asks the leaf 32 times as often.
 - **Discarding a live sequence for a growing lane.** That loses work. It is
   only the last resort, when every tier refuses.
-- **Windowing the KV-RAM moves too.** Kept synchronous for now: ~12 GB/s, and
-  a measured cost (ADR 0024). The PCIe criterion in the spec decides whether
-  a whole-blob stall is too long.
+- **Keeping the KV-RAM moves synchronous** (this ADR's first version: ~12
+  GB/s assumed, ADR 0024). AC 37 measured the stall at ~0.32 s a move, every
+  lane held; the amendment above windows them.
+- **A move in's window waited for between rounds** (AC 37's follow-up, tried).
+  It costs the window's copy time on every round and saved nothing measurable
+  beside it.
 - **Applying the default `max_tokens` in each HTTP handler.** Three surfaces
   would each re-derive the context clamp. `generation_budget` already does it
   once for every entry point.
@@ -628,8 +665,9 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
   - A disk spill holds the victim's pages until the file commits (above),
     ~1 s for a whole-context Flash-Next blob at 1.2-1.5 GB/s. One step of room
     ahead covers that.
-  - A KV-RAM move is synchronous. A whole-context Flash-Next blob stalls the
-    model thread, and so every lane's round, ~0.1 s at ~12 GB/s.
+  - A KV-RAM move holds the victim's pages until its last window lands
+    (since AC 37's follow-up): ~1.15 s out of the device for a whole-context
+    Flash-Next blob at the pace, ~1.3 s back in.
 - **PCIe contention of a live move.** A move out (device to host) runs against
   the opposite direction of the expert stream and should barely touch decode.
   A move in shares the experts' direction: at ~100 tok/s that direction

@@ -252,7 +252,10 @@ A request reserves its prompt plus its cap when it is admitted: its
 `max_tokens`, or `--default-max-tokens`. When a request cannot fit, a
 lower-ranked sequence (an `agent` one, for an `interactive` request) moves to
 KV-RAM or [KV-disk](#kv-disk) and later resumes exactly where it stopped.
-Otherwise the request waits until room returns. No request is refused for it,
+The move goes a window at a time between decode rounds, so the other
+requests keep generating while it happens, and the request that needed the
+room starts once the move has landed (on Flash-Next, about a second for a
+whole-context sequence). Otherwise the request waits until room returns. No request is refused for it,
 and with KV-disk on (Flash-Next's default) none loses work for it; without it
 (the 27B's default) KV-RAM can still give a moved sequence up for a newer one,
 which is then prefilled again, as before. Rank is the class, then the order of
