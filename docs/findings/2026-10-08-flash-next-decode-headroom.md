@@ -217,7 +217,7 @@ anyway and it returns at once. The two copies of a step never overlap: 0 µs of
 | demand copy rate while it runs (stall timer, untraced) | **12.0 GB/s** | **11.9 GB/s** | **12.4 GB/s** |
 | link busy (bytes / rate, untraced) | **4.3 ms of 9.85 (44%)** | **24.6 ms of 27.5 (89%)** | 74% of the traced window (80% over the 2026-10-07 chunks) |
 | of it on the critical path (demand) | 1.84 ms (43% of link time) | 15.0 ms (61%) | 4% of the window |
-| prefetch running with no compute anywhere (traced) | 0.04 ms per round (1.6% of prefetch) | 2.4 ms per round (21%) | 198 ms of 1.43 s (14%), ~6.2 ms per layer |
+| prefetch running with no compute anywhere (traced) | 0.04 ms per round (1.6% of prefetch) | 2.4 ms per round (21%; indicative, the trace stretched this round 43%) | 198 ms of 1.43 s (14%), ~6.2 ms per layer |
 | average over the phase (what a rate meter sees) | 5.2 GB/s | 10.6 GB/s | 9.0 GB/s over the prompt's 4.19 s TTFT |
 | active copy kernels per unit (traced) | 13.5 demand (1.36 MB each) + 35.4 prefetch (0.82 MB) | 43.5 demand (4.5 MB) + 47 prefetch (2.4 MB) | 48 demand (~23 MB) + 47 prefetch (~0.4 GB, ~31 ms each) |
 | projections per token (untraced) | 32.7 demand (0.67 MB mean) + 46.5 prefetched | 81.7 (0.73 MB) + 56.5 | 0.72 MB mean |
@@ -241,18 +241,23 @@ batched copies (9.6-11.1 GB/s for a single 0.5-1 MiB copy).
   there is nothing left to copy, and the next layer's misses are unknown
   until its router runs. Prefetches end before the next step; it never waits
   at its join.
-- *Three lanes* (link idle 11% untraced): between replays (most of the
-  traced "device idle") and, per layer, the next step's `resolve_demand`
-  (20 µs mean), which starts **59 µs** after its router's select because the
-  step first joins the previous layer's still-running prefetch copy: the link
-  is serial, so the prefetch delays the next demand copy. Gaps between busy
-  spans: 90 per round, p50 8.5 µs.
+- *Three lanes* (link idle 11% untraced, 2.9 ms per round): between replays
+  (1.2 ms per round in the graph-level capture of section 1) and, per layer,
+  the next step's `resolve_demand`, which in the node trace runs 20 µs and
+  starts 59 µs after its router's select because the step first joins the
+  previous layer's still-running prefetch copy: the link is serial, so the
+  prefetch delays the next demand copy. Those traced figures are stretched;
+  the untraced bound is the idle left after the replays' gap, **at most
+  ~1.7 ms per round (~35 µs per layer)** for the resolve and the join wait
+  together. Gaps between busy spans (traced): 90 per round, p50 8.5 µs.
 - *Prefill chunk* (link idle 26% of the window): **69% of it while the routed
   experts run**. The prefetch copy of each layer, ready when its
   `resolve_prefetch` and the demand copy end, starts **5.9 ms later** (p50
   6.1 ms), within 0.2 ms of the end of `prefill_gate_up_kernel` or
   `prefill_down_kernel`, its only dependencies (the demand copy's event and
-  its resolve) long met: its 16 blocks wait for SMs the expert kernels hold.
+  its resolve) long met, and not behind its own stream's previous copy,
+  which ended ~12 ms earlier: its 16 blocks wait for SMs the expert kernels
+  hold.
   The next layer then waits for that late copy at its join (5.3 ms on average
   from its router's select to its `resolve_demand`), which is the 14% exposed
   prefetch. The other 23% of the idle is with nothing on the device.
@@ -264,7 +269,9 @@ prefill) gained over a rolling
 every 2-5 s (`web/src/monitor/scrape.ts`), so it is a wall-clock mean that
 includes idle seconds and mixes phases. The server re-reads the device's
 counters after every scheduler step (`crates/server/src/engine.rs`: a decode
-round, or a whole prefill chunk), so the series lags by at most one step.
+round, or a whole prefill chunk), so the series lags by at most one step:
+~10-30 ms in decode, up to ~2 s during a prefill chunk, which the 30 s span
+absorbs.
 Against the averages above: one decoding lane alone reads ~5.2 GB/s, three ~10.6 GB/s, a cold prompt ~9 GB/s; ~8 GB/s
 is a mix of these, or of one of them with idle time, while each copy runs at
 ~12 GB/s.
@@ -300,10 +307,12 @@ Observed:
    its own layer's router; the idle link is the budget and the predictor
    having nothing more to send.
 8. **Three-lane decode is bandwidth-bound**: the link is busy 89% of a round
-   (10.6 GB/s average); the rest is between replays and the per-layer resolve
-   that waits for the previous prefetch to finish.
+   (10.6 GB/s average); the rest is between replays (~1.2 ms) and at most
+   ~1.7 ms per round of resolves and joins waiting for the previous prefetch
+   to finish.
 9. **A prefill chunk is link- and compute-bound in equal measure** (21-22 GB at
-   ~12.3 GB/s against ~1.7-1.8 s of compute, 2026-10-07), but the link idles
+   ~12.3 GB/s against ~1.7-1.8 s of compute, within ~5% of each other,
+   2026-10-07), but the link idles
    26% of the window because the SM-driven prefetch copy cannot start while
    the routed-expert kernels hold every SM: it starts ~6 ms per layer late,
    and the next layer waits ~6 ms for it.
@@ -311,9 +320,11 @@ Observed:
 Inferred, the link: letting each prefill prefetch copy start when it is
 ready (a higher-priority prefetch stream, or SMs held back for the copy, so
 its blocks take the next free SM slots instead of the end of the expert
-kernel) would remove up to the exposed ~6 ms per layer, **~0.3 s of a
-~2.2 s chunk (~13% of each full 8K chunk; less of a TTFT that also holds
-short, copy-bound traversals)**, with the link then ~90% busy.
+kernel) would remove up to the exposed prefetch: ~6.2 ms per layer in this
+window's last 32 layers, 0.41-0.54 s per chunk in the 2026-10-07 chunks, so
+**~0.3-0.4 s of a ~2.2 s chunk (13-20% of each full 8K chunk**, depending on
+which layers a window holds; less of a TTFT that also holds short,
+copy-bound traversals), with the link then ~90% busy or more.
 Decode at one lane has no link headroom to buy by itself; at three lanes the
 recoverable idle is at most the 11%, most of it between replays.
 
@@ -377,8 +388,8 @@ The ranking, each with its estimated gain (inferred) at one and three lanes:
 4. **Nothing**: 101.5 tok/s at one lane, 109.1 aggregate at three.
 
 For prefill, outside this ranking: run the prefetch copy beside the expert
-kernels (stream priority or reserved SMs) for ~13% of a cold chunk (inferred
-above), a small change next to the layer-major chunk groups the 2026-10-07
+kernels (stream priority or reserved SMs) for 13-20% of a full chunk
+(inferred above), a small change next to the layer-major chunk groups the 2026-10-07
 decomposition estimated at ~19% for 30K prompts.
 
 ## Limits and unknowns
