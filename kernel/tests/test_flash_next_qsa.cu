@@ -20,6 +20,8 @@
 //               chunk wider than the ring.
 //   entry       fn_qsa_attention itself on seq pools of both formats: bit-identical to qsa::run,
 //               its K/V in its own attention layer's planes and window only, its refusals.
+//   fused       (GitHub #306) the grouped q/k/v projection and the gate in the split combine
+//               against the unfused launches, bit for bit: output and store, both formats.
 //
 // Bounds. Attention on the same q and K/V: the probabilities are rounded to BF16 for the value
 // product while the normalizer is their fp32 sum, and the output is rounded once, so
@@ -35,6 +37,7 @@
 // ulps of a small output after cancellation: the check allows 2^-6 of the head row's largest
 // value, and requires 99% of the values bit-exact.
 
+#include "flash_next/fusion.h"
 #include "flash_next/qsa.h"
 
 #include "flash_next_s2_test_common.h"
@@ -787,6 +790,110 @@ int main() {
   for (int f = 0; f < 2; ++f) {
     MOE_CUDA(cudaGraphExecDestroy(graphs[f]));
     MOE_CUDA(cudaGraphDestroy(captured[f]));
+  }
+
+  // GitHub #306, step 6 (fusion.h's Qsa): q, k and v in one grouped GEMV launch and the gate in
+  // the split combine, against the three projections and the gate on their own: the output and
+  // every plane of the store (pages, metadata, residual window, ring) bit for bit, both formats,
+  // one lane and three, each run from the same store over a poisoned arena; 3 kernels fewer. The
+  // store is put back after, so the calls below see it as the rounds above left it.
+  {
+    const auto planes_of = [](const Store &s) {
+      std::vector<std::vector<uint8_t>> out;
+      for (const auto *p : {&s.k, &s.v, &s.k_meta, &s.v_meta, &s.res_k, &s.res_v, &s.ring}) {
+        out.push_back(*p ? download<uint8_t>((*p)->p, (*p)->bytes) : std::vector<uint8_t>{});
+      }
+      return out;
+    };
+    const auto put_back = [](const Store &s, const std::vector<std::vector<uint8_t>> &planes) {
+      std::size_t i = 0;
+      for (const auto *p : {&s.k, &s.v, &s.k_meta, &s.v_meta, &s.res_k, &s.res_v, &s.ring}) {
+        if (*p) upload(**p, planes[i]);
+        ++i;
+      }
+      MOE_CUDA(cudaDeviceSynchronize());
+    };
+    const auto kernels_of = [&](const auto &launch) {
+      cudaGraph_t graph = nullptr;
+      MOE_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+      const int32_t rc = launch();
+      MOE_CUDA(cudaStreamEndCapture(stream, &graph));
+      std::size_t count = 0;
+      MOE_CUDA(cudaGraphGetNodes(graph, nullptr, &count));
+      std::vector<cudaGraphNode_t> nodes(count);
+      MOE_CUDA(cudaGraphGetNodes(graph, nodes.data(), &count));
+      int kernels = 0;
+      for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        MOE_CUDA(cudaGraphNodeGetType(node, &type));
+        kernels += type == cudaGraphNodeTypeKernel ? 1 : 0;
+      }
+      MOE_CUDA(cudaGraphDestroy(graph));
+      return rc == 0 ? kernels : -1;
+    };
+    for (const std::vector<int> &lanes : {std::vector<int>{1}, std::vector<int>{2, 0, 1}}) {
+      const int rows = static_cast<int>(lanes.size());
+      const auto lists = lists_for(lanes);
+      std::vector<uint16_t> x;
+      std::vector<int32_t> slots, firsts, tok(static_cast<std::size_t>(rows) * kWidth, -1), counts(rows);
+      for (int r = 0; r < rows; ++r) {
+        const int lane = lanes[r];
+        const std::vector<uint16_t> xt = token_input(lane, frontier[lane]);
+        x.insert(x.end(), xt.begin(), xt.end());
+        slots.push_back(slot_of[lane]);
+        firsts.push_back(frontier[lane]);
+        std::copy(lists[r].begin(), lists[r].end(), tok.begin() + static_cast<std::size_t>(r) * kWidth);
+        counts[r] = static_cast<int32_t>(lists[r].size());
+      }
+      upload(d_x, x);
+      upload(d_slots, slots);
+      upload(d_positions, firsts);
+      upload(d_sel_tokens, tok);
+      upload(d_sel_counts, counts);
+      MOE_CUDA(cudaDeviceSynchronize());
+      fn::Batch batch;
+      batch.lanes = rows;
+      batch.tokens = 1;
+      batch.slots = d_slots.as<int32_t>();
+      batch.positions = d_positions.as<int32_t>();
+      batch.max_visible = 4096;
+      fn::Selection selection;
+      selection.tokens = d_sel_tokens.as<int32_t>();
+      selection.counts = d_sel_counts.as<int32_t>();
+      for (int f = 0; f < 2; ++f) {
+        const Store &store = f == 0 ? bf16_store : hq_store;
+        const qsa::Kv &kv = f == 0 ? kv_bf16 : kv_hq;
+        const std::string name = std::string("fused QSA (") + (f == 0 ? "bf16" : "hq-e8-2b") + "), " +
+                                 std::to_string(rows) + " lane(s)";
+        const auto before = planes_of(store);
+        std::vector<uint16_t> y[2];
+        std::vector<std::vector<uint8_t>> after[2];
+        int kernels[2] = {};
+        for (int fused = 0; fused < 2; ++fused) {
+          fn::set_fused(fn::Fusion::Qsa, fused == 1);
+          put_back(store, before);
+          MOE_CUDA(cudaMemset(arena.base(), 0xFF, arena.capacity()));
+          MOE_CUDA(cudaMemset(d_y_bf16.p, 0xFF, d_y_bf16.bytes));
+          MOE_CUDA(cudaDeviceSynchronize());
+          FN_RC(qsa::run(g, kv, ix_rope, wv, batch, d_x.p, selection, d_y_bf16.p, arena, stream));
+          MOE_CUDA(cudaStreamSynchronize(stream));
+          y[fused] = download<uint16_t>(d_y_bf16.p, static_cast<std::size_t>(rows) * H);
+          after[fused] = planes_of(store);
+          kernels[fused] = kernels_of([&] {
+            return qsa::run(g, kv, ix_rope, wv, batch, d_x.p, selection, d_y_bf16.p, arena, stream);
+          });
+        }
+        fn::set_fused(fn::Fusion::Qsa, true);
+        put_back(store, before);
+        const bool finite =
+            std::all_of(y[0].begin(), y[0].end(), [](uint16_t v) { return (v & 0x7F80U) != 0x7F80U; });
+        check(finite, name + ": the unfused output is finite (the comparison has power)");
+        check(y[1] == y[0], name + ": the output is the unfused route's, bit for bit");
+        check(after[1] == after[0] && after[0] != before, name + ": the store is the unfused route's, bit for bit");
+        check(kernels[0] - kernels[1] == 3, name + ": 3 kernels fewer fused (got " + std::to_string(kernels[0]) +
+                                                " and " + std::to_string(kernels[1]) + ")");
+      }
+    }
   }
 
   // A prefill chunk past dense_threshold: every row its own selection, on S3's sparse route.

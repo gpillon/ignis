@@ -117,9 +117,13 @@ int32_t splits_for(const Geometry &g, int32_t rows);
 
 // q: BF16 [rows][q_heads][head_dim] (normed, roped); out: BF16 [rows][q_heads][head_dim].
 // selection must not be dense. `partials` holds splits_for > 1's partial results
-// (partial_bytes), else may be null.
+// (partial_bytes), else may be null. With `gate` (QSA's qg, [rows][q_heads][2][head_dim], the gate
+// its second half) a split call's combine also applies the attention's output gate, as qsa's gate
+// op does (out = bf16(out * bf16(sigmoid(gate)))) -- GitHub #306, step 6; a call of one split
+// refuses it.
 Status attend(const Geometry &g, const KvSource &kv, const Batch &batch, const __nv_bfloat16 *q,
-              const Selection &selection, __nv_bfloat16 *out, void *partials, cudaStream_t stream);
+              const Selection &selection, __nv_bfloat16 *out, void *partials, cudaStream_t stream,
+              const __nv_bfloat16 *gate = nullptr);
 std::size_t partial_bytes(const Geometry &g, int32_t rows);
 
 }  // namespace ignis::flash_next::sparse

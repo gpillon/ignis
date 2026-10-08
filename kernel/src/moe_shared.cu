@@ -9,6 +9,7 @@
 // token's row, each computing the token's gate itself; the gate's dot product is a fixed block
 // reduction in every CTA, so the result is deterministic and the same at every width.
 
+#include "moe_combine.cuh"
 #include "moe_common.cuh"
 
 #include <cuda_bf16.h>
@@ -17,11 +18,12 @@
 namespace ignis_moe {
 namespace {
 
-constexpr int kCombineThreads = 256;
 // A decode-width call spreads each row over this many CTAs (one element per thread).
 constexpr int kCombineSlices = kHidden / kCombineThreads;
 static_assert(kCombineSlices * kCombineThreads == kHidden, "a slice is one element per thread");
 
+// The gate and the value are moe_combine.cuh's, which the hyper-connection mix's folded combine
+// runs too (GitHub #306).
 __global__ void __launch_bounds__(kCombineThreads) combine_kernel(long long *__restrict__ acc, const float *__restrict__ shared,
                                                                   const __nv_bfloat16 *__restrict__ x,
                                                                   const __nv_bfloat16 *__restrict__ w_gate,
@@ -29,30 +31,14 @@ __global__ void __launch_bounds__(kCombineThreads) combine_kernel(long long *__r
   __shared__ float partial[kCombineThreads / 32];
   __shared__ float gate;
   const int t = blockIdx.x;
-  const __nv_bfloat16 *xr = x + static_cast<size_t>(t) * kHidden;
-  float dot = 0.0f;
-  for (int k = threadIdx.x; k < kHidden; k += kCombineThreads) {
-    dot = fmaf(__bfloat162float(xr[k]), __bfloat162float(w_gate[k]), dot);
-  }
-  dot = warp_sum(dot);
-  if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = dot;
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    float s = 0.0f;
-#pragma unroll
-    for (int w = 0; w < kCombineThreads / 32; ++w) s += partial[w];
-    gate = 1.0f / (1.0f + expf(-s));
-  }
-  __syncthreads();
-  const float g = gate;
+  const float g = combine_gate(x + static_cast<size_t>(t) * kHidden, w_gate, partial, &gate);
   long long *ar = acc + static_cast<size_t>(t) * kHidden;
   const float *sr = shared + static_cast<size_t>(t) * kHidden;
   __nv_bfloat16 *orow = out + static_cast<size_t>(t) * kHidden;
   const int span = kHidden / gridDim.y;
   const int end = (blockIdx.y + 1) * span;
   for (int k = blockIdx.y * span + threadIdx.x; k < end; k += kCombineThreads) {
-    const float routed = from_fixed(ar[k]);
-    orow[k] = __float2bfloat16_rn(fmaf(g, sr[k], routed));
+    orow[k] = combine_value(g, sr[k], ar[k]);
     ar[k] = 0;
   }
 }

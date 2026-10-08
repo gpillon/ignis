@@ -28,7 +28,7 @@
 namespace ignis_moe {
 namespace {
 
-constexpr int kGemvMaxTokens = 8;
+constexpr int kGemvMaxTokens = IGNIS_FP8_GEMV_MAX_TOKENS;
 
 __host__ __device__ inline size_t scale_offset(uint32_t rows, uint32_t cols) {
   return (static_cast<size_t>(rows) * cols + 255) / 256 * 256;
@@ -95,6 +95,23 @@ __device__ __forceinline__ void gemv_row(const uint8_t *row, const __nv_bfloat16
   for (int t = 0; t < kGemvMaxTokens; ++t) acc[t] = warp_sum(acc[t]);
 }
 
+// y[t][r] = scale * acc[t] (fp32 or BF16) of a `rows`-row output, lane t writing token t.
+__device__ __forceinline__ void store_scaled(const float (&acc)[kGemvMaxTokens], float scale, void *y, int rows,
+                                             int r, int tokens, int y_f32) {
+  const int lane = threadIdx.x & 31;
+  if (lane < tokens) {
+    float v = 0.0f;
+#pragma unroll
+    for (int t = 0; t < kGemvMaxTokens; ++t) v = t == lane ? acc[t] * scale : v;
+    const size_t at = static_cast<size_t>(lane) * rows + r;
+    if (y_f32) {
+      static_cast<float *>(y)[at] = v;
+    } else {
+      static_cast<__nv_bfloat16 *>(y)[at] = __float2bfloat16_rn(v);
+    }
+  }
+}
+
 // MODE 0: y[t][r] = scale[r] * acc (fp32 or BF16). MODE 1: h[t][r] = silu(gate) * up in BF16.
 template <int MODE>
 __global__ void fp8_gemv_kernel(const __nv_bfloat16 *__restrict__ x, int tokens, int rows, int cols,
@@ -106,17 +123,7 @@ __global__ void fp8_gemv_kernel(const __nv_bfloat16 *__restrict__ x, int tokens,
   gemv_row(w0.codes + static_cast<size_t>(r) * cols, x, tokens, cols, a0);
   const float s0 = __bfloat162float(w0.scales[r]);
   if (MODE == 0) {
-    if (lane < tokens) {
-      float v = 0.0f;
-#pragma unroll
-      for (int t = 0; t < kGemvMaxTokens; ++t) v = t == lane ? a0[t] * s0 : v;
-      const size_t at = static_cast<size_t>(lane) * rows + r;
-      if (y_f32) {
-        static_cast<float *>(y)[at] = v;
-      } else {
-        static_cast<__nv_bfloat16 *>(y)[at] = __float2bfloat16_rn(v);
-      }
-    }
+    store_scaled(a0, s0, y, rows, r, tokens, y_f32);
   } else {
     float a1[kGemvMaxTokens];
     gemv_row(w1.codes + static_cast<size_t>(r) * cols, x, tokens, cols, a1);
@@ -131,6 +138,28 @@ __global__ void fp8_gemv_kernel(const __nv_bfloat16 *__restrict__ x, int tokens,
       static_cast<__nv_bfloat16 *>(y)[static_cast<size_t>(lane) * rows + r] = __float2bfloat16_rn(silu(g) * u);
     }
   }
+}
+
+// The grouped GEMV (GitHub #306): the segments' rows one after another, a warp per row as
+// fp8_gemv_kernel<0> takes them; a row's sum and store are that kernel's, so its bits are.
+struct Segments {
+  Fp8Weight w[IGNIS_FP8_MAX_SEGMENTS];
+  int first[IGNIS_FP8_MAX_SEGMENTS + 1];  // the segments' first rows in the launch; first[count] = all
+  void *y[IGNIS_FP8_MAX_SEGMENTS];
+  int count;
+};
+
+__global__ void fp8_gemv_grouped_kernel(const __nv_bfloat16 *__restrict__ x, int tokens, int cols, Segments s,
+                                        int y_f32) {
+  const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (row >= s.first[s.count]) return;
+  int i = 0;
+  while (row >= s.first[i + 1]) ++i;
+  const int r = row - s.first[i];
+  const int rows = s.first[i + 1] - s.first[i];
+  float a0[kGemvMaxTokens];
+  gemv_row(s.w[i].codes + static_cast<size_t>(r) * cols, x, tokens, cols, a0);
+  store_scaled(a0, __bfloat162float(s.w[i].scales[r]), s.y[i], rows, r, tokens, y_f32);
 }
 
 // ---- MMA route ------------------------------------------------------------------------------
@@ -376,6 +405,40 @@ extern "C" int32_t ignis_fp8_linear(const void *weight, uint32_t rows, uint32_t 
   }
   const Fp8Weight w = fp8_weight(weight, rows, cols);
   return launch<0>("ignis_fp8_linear", w, w, rows, cols, x, tokens, y, y_f32, static_cast<cudaStream_t>(stream));
+}
+
+extern "C" int32_t ignis_fp8_linear_grouped(const ignis_fp8_segment *segments, uint32_t count, uint32_t cols,
+                                            const void *x, uint32_t tokens, uint32_t y_f32, void *stream) {
+  if (segments == nullptr || x == nullptr) return fail("ignis_fp8_linear_grouped: NULL pointer");
+  if (count == 0 || count > IGNIS_FP8_MAX_SEGMENTS) {
+    return fail("ignis_fp8_linear_grouped: 1.." + std::to_string(IGNIS_FP8_MAX_SEGMENTS) + " segments");
+  }
+  if (tokens == 0 || tokens > static_cast<uint32_t>(kGemvMaxTokens)) {
+    return fail("ignis_fp8_linear_grouped: the GEMV route's 1.." + std::to_string(kGemvMaxTokens) + " tokens");
+  }
+  if (reinterpret_cast<uintptr_t>(x) & 15) return fail("ignis_fp8_linear_grouped: x must be 16-byte aligned");
+  Segments s{};
+  s.count = static_cast<int>(count);
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const ignis_fp8_segment &seg = segments[i];
+    if (seg.weight == nullptr || seg.y == nullptr) return fail("ignis_fp8_linear_grouped: NULL pointer");
+    if (validate("ignis_fp8_linear_grouped", seg.rows, cols, tokens, seg.y) != 0) return -1;
+    if (reinterpret_cast<uintptr_t>(seg.weight) & 15) {
+      return fail("ignis_fp8_linear_grouped: every weight must be 16-byte aligned");
+    }
+    s.w[i] = fp8_weight(seg.weight, seg.rows, cols);
+    s.y[i] = seg.y;
+    s.first[i] = static_cast<int>(total);
+    total += seg.rows;
+  }
+  s.first[count] = static_cast<int>(total);
+  if (require_fp8_prepared("ignis_fp8_linear_grouped") != 0) return -1;
+  const int warps = 8;
+  fp8_gemv_grouped_kernel<<<(total + warps - 1) / warps, warps * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const __nv_bfloat16 *>(x), static_cast<int>(tokens), static_cast<int>(cols), s,
+      static_cast<int>(y_f32));
+  return check_launch("ignis_fp8_linear_grouped");
 }
 
 extern "C" int32_t ignis_fp8_linear_swiglu(const void *gate, const void *up, uint32_t rows, uint32_t cols,

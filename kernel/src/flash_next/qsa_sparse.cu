@@ -247,8 +247,10 @@ __global__ void __launch_bounds__(kThreads) attend_kernel(AttendArgs a) {
   }
 }
 
+// With `gate`, the output gate of qsa.cu's gate_kernel on the combined value: the same two
+// roundings, so the same bits as combining, then gating in a launch of its own.
 __global__ void combine_kernel(const float *partial_o, const float2 *partial_ml, int32_t kv_heads, int32_t splits,
-                               int32_t q_heads, __nv_bfloat16 *out) {
+                               int32_t q_heads, __nv_bfloat16 *out, const __nv_bfloat16 *gate) {
   const int row = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
   const int kvh = h / kGroup, r = h % kGroup;
   const size_t first = (static_cast<size_t>(row) * kv_heads + kvh) * splits;
@@ -262,7 +264,14 @@ __global__ void combine_kernel(const float *partial_o, const float2 *partial_ml,
     num += w * partial_o[((first + s) * kGroup + r) * kHeadDim + d];
     den += w * ml.y;
   }
-  out[(static_cast<size_t>(row) * q_heads + h) * kHeadDim + d] = __float2bfloat16_rn(den > 0.0F ? num / den : 0.0F);
+  const size_t row_head = static_cast<size_t>(row) * q_heads + h;
+  __nv_bfloat16 o = __float2bfloat16_rn(den > 0.0F ? num / den : 0.0F);
+  if (gate != nullptr) {
+    const float sig = __bfloat162float(
+        __float2bfloat16_rn(1.0F / (1.0F + expf(-__bfloat162float(gate[row_head * 2 * kHeadDim + kHeadDim + d])))));
+    o = __float2bfloat16_rn(__bfloat162float(o) * sig);
+  }
+  out[row_head * kHeadDim + d] = o;
 }
 
 constexpr int kHqThreads = 128;
@@ -409,7 +418,8 @@ std::size_t partial_bytes(const Geometry &g, int32_t rows) {
 }
 
 Status attend(const Geometry &g, const KvSource &kv, const Batch &batch, const __nv_bfloat16 *q,
-              const Selection &selection, __nv_bfloat16 *out, void *partials, cudaStream_t stream) {
+              const Selection &selection, __nv_bfloat16 *out, void *partials, cudaStream_t stream,
+              const __nv_bfloat16 *gate) {
   if (const Status st = check_geometry(g)) return st;
   if (selection.dense) return "sparse attention: the selection is dense";
   if (kv.kv_heads != g.kv_heads) return "sparse attention: KV source head count is not the topology's";
@@ -420,6 +430,7 @@ Status attend(const Geometry &g, const KvSource &kv, const Batch &batch, const _
   if (rows <= 0) return nullptr;
   const int32_t splits = splits_for(g, rows);
   if (splits > 1 && partials == nullptr) return "sparse attention: split call without partials";
+  if (splits <= 1 && gate != nullptr) return "sparse attention: the output gate rides a split call's combine";
   const int32_t width = g.selection_width();
   const int32_t tiles_per_split = ((width + kTileTokens - 1) / kTileTokens + splits - 1) / splits;
   AttendArgs a{};
@@ -444,7 +455,7 @@ Status attend(const Geometry &g, const KvSource &kv, const Batch &batch, const _
   if (const Status st = launched("sparse attention: attend launch failed")) return st;
   if (splits > 1) {
     combine_kernel<<<dim3(rows, g.q_heads), kHeadDim, 0, stream>>>(a.partial_o, a.partial_ml, g.kv_heads, splits,
-                                                                   g.q_heads, out);
+                                                                   g.q_heads, out, gate);
     return launched("sparse attention: combine launch failed");
   }
   return nullptr;

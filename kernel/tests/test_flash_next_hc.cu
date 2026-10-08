@@ -21,12 +21,21 @@
 // artifact stores them (the reference's weights are then scale * e4m3(code)).
 // Rows 1, 3, 8 (decode lanes, up to the decode route's ceiling), 9 (the first
 // row count past it) and 1100 (past one 1024-row wave).
+// GitHub #306: the decode route's norm folded into its down launch at up to
+// three rows (fn_hc_set_decode_fused) against the three-launch route, bit for
+// bit, over a scratch arena poisoned before each run; IGNIS_FN_HC_FUSED=0 at
+// the first mix keeps three launches. And the previous sublayer's inject (and
+// combine) folded into the next mix (fn_hc_mix_after) against the combine, the
+// inject and the mix one after another: x, the injection weights, the residual,
+// the combined y and the zeroed accumulator, bit for bit (after_case).
 //
 // GPU test (ADR 0006): no SKIP_RETURN_CODE, a missing device fails.
 
+#include "flash_next/fusion.h"
 #include "flash_next/hc.h"
 
 #include "ignis_fp8_linear.h"
+#include "ignis_moe.h"
 
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -315,6 +324,243 @@ void mix_case(const Weights &w, const ignis::flash_next::HcWeights &dw, const ch
   cudaFree(d_inj);
 }
 
+// The kernel nodes one fn_hc_mix call captures into a graph.
+int kernel_nodes(const ignis::flash_next::Geometry &g, const ignis::flash_next::HcWeights &w, const void *hidden,
+                 int rows, void *x, float *inj, ninfer::DeviceArena &scratch) {
+  cudaStream_t stream = nullptr;
+  cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+  cudaGraph_t graph = nullptr;
+  cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+  const int32_t rc = ignis::flash_next::fn_hc_mix(g, w, hidden, rows, x, inj, scratch, stream);
+  cuda_ok(cudaStreamEndCapture(stream, &graph), "end capture");
+  std::size_t count = 0;
+  cuda_ok(cudaGraphGetNodes(graph, nullptr, &count), "cudaGraphGetNodes");
+  std::vector<cudaGraphNode_t> nodes(count);
+  cuda_ok(cudaGraphGetNodes(graph, nodes.data(), &count), "cudaGraphGetNodes");
+  int kernels = 0;
+  for (cudaGraphNode_t node : nodes) {
+    cudaGraphNodeType type;
+    cuda_ok(cudaGraphNodeGetType(node, &type), "cudaGraphNodeGetType");
+    kernels += type == cudaGraphNodeTypeKernel ? 1 : 0;
+  }
+  cuda_ok(cudaGraphDestroy(graph), "cudaGraphDestroy");
+  cuda_ok(cudaStreamDestroy(stream), "cudaStreamDestroy");
+  return rc == 0 ? kernels : -1;
+}
+
+// GitHub #306 (fusion study): the decode route with its norm folded into the down projection
+// (fn_hc_set_decode_fused) gives the three-launch route's bits, in two launches at up to three
+// rows; past three rows the switch changes nothing.
+void fused_case(const ignis::flash_next::HcWeights &dw, const char *format, int rows, bool with_inject,
+                ninfer::DeviceArena &scratch) {
+  const std::string label = std::string("fused norm, ") + (with_inject ? "mix" : "final mixer") + " (" + format +
+                            "), " + std::to_string(rows) + " rows";
+  const auto hidden = random_bf16(static_cast<std::size_t>(rows) * kWidth, 2.0, 0xF05U + rows);
+  auto *d_hidden = upload(hidden);
+  void *d_x = nullptr;
+  float *d_inj = nullptr;
+  cuda_ok(cudaMalloc(&d_x, static_cast<std::size_t>(rows) * kHidden * 2), "cudaMalloc x");
+  cuda_ok(cudaMalloc(&d_inj, static_cast<std::size_t>(rows) * kStreams * 4), "cudaMalloc inj");
+  ignis::flash_next::Geometry g;
+  g.streams = kStreams;
+  g.hidden = kHidden;
+  g.hc_rank = kRank;
+  g.rms_norm_eps = static_cast<float>(kEps);
+  ignis::flash_next::HcWeights weights = dw;
+  if (!with_inject) {
+    weights.block_inject = nullptr;
+  }
+  float *inj = with_inject ? d_inj : nullptr;
+  std::vector<uint16_t> x[2];
+  std::vector<float> injections[2];
+  int nodes[2] = {};
+  for (int fused = 0; fused < 2; ++fused) {
+    ignis::flash_next::fn_hc_set_decode_fused(fused == 1);
+    // NaN everywhere a run reads or writes, so neither route can pass on what the other left.
+    cuda_ok(cudaMemset(static_cast<char *>(scratch.base()) + scratch.used(), 0xFF, scratch.capacity() - scratch.used()),
+            "poison the scratch");
+    cuda_ok(cudaMemset(d_x, 0xFF, static_cast<std::size_t>(rows) * kHidden * 2), "poison x");
+    cuda_ok(cudaMemset(d_inj, 0xFF, static_cast<std::size_t>(rows) * kStreams * 4), "poison inj");
+    check(ignis::flash_next::fn_hc_mix(g, weights, d_hidden, rows, d_x, inj, scratch, nullptr) == 0,
+          label + ": runs: " + ignis::flash_next::fn_last_error());
+    cuda_ok(cudaDeviceSynchronize(), "sync");
+    x[fused].resize(static_cast<std::size_t>(rows) * kHidden);
+    injections[fused].resize(static_cast<std::size_t>(rows) * kStreams);
+    cuda_ok(cudaMemcpy(x[fused].data(), d_x, x[fused].size() * 2, cudaMemcpyDeviceToHost), "download x");
+    cuda_ok(cudaMemcpy(injections[fused].data(), d_inj, injections[fused].size() * 4, cudaMemcpyDeviceToHost),
+            "download inj");
+    nodes[fused] = kernel_nodes(g, weights, d_hidden, rows, d_x, inj, scratch);
+  }
+  ignis::flash_next::fn_hc_set_decode_fused(true);
+  check(x[1] == x[0], label + ": x is the three-launch route's, bit for bit");
+  check(!with_inject || std::memcmp(injections[1].data(), injections[0].data(), injections[0].size() * 4) == 0,
+        label + ": the injection weights are the three-launch route's, bit for bit");
+  if (rows <= 3) {
+    check(nodes[0] == 3 && nodes[1] == 2, label + ": 3 launches unfused, 2 fused (got " + std::to_string(nodes[0]) +
+                                              ", " + std::to_string(nodes[1]) + ")");
+  } else {
+    check(nodes[0] == nodes[1] && nodes[0] >= 3,
+          label + ": past three rows the switch changes no launch (got " + std::to_string(nodes[0]) + ", " +
+              std::to_string(nodes[1]) + ")");
+  }
+  cudaFree(d_hidden);
+  cudaFree(d_x);
+  cudaFree(d_inj);
+}
+
+// The kernel nodes `launch(stream)` captures into a graph, or -1 when it fails.
+template <class Launch>
+int captured_kernels(Launch launch) {
+  cudaStream_t stream = nullptr;
+  cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+  cudaGraph_t graph = nullptr;
+  cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+  const int32_t rc = launch(stream);
+  cuda_ok(cudaStreamEndCapture(stream, &graph), "end capture");
+  std::size_t count = 0;
+  cuda_ok(cudaGraphGetNodes(graph, nullptr, &count), "cudaGraphGetNodes");
+  std::vector<cudaGraphNode_t> nodes(count);
+  cuda_ok(cudaGraphGetNodes(graph, nodes.data(), &count), "cudaGraphGetNodes");
+  int kernels = 0;
+  for (cudaGraphNode_t node : nodes) {
+    cudaGraphNodeType type;
+    cuda_ok(cudaGraphNodeGetType(node, &type), "cudaGraphNodeGetType");
+    kernels += type == cudaGraphNodeTypeKernel ? 1 : 0;
+  }
+  cuda_ok(cudaGraphDestroy(graph), "cudaGraphDestroy");
+  cuda_ok(cudaStreamDestroy(stream), "cudaStreamDestroy");
+  return rc == 0 ? kernels : -1;
+}
+
+// GitHub #306, step 2: the previous sublayer's inject -- with `combine`, the MoE's, its combine
+// first -- folded into the next mix (fn_hc_mix_after, fusion.h's Inject) against the combine, the
+// inject and the mix launched one after another: the mix's x and injection weights, the residual
+// it leaves, the combined y it stores and the accumulator it zeroes, bit for bit, each run over a
+// poisoned arena and poisoned outputs; 2 launches folded at one row, 3 (4 with the combine)
+// unfolded; past one row (the fold's ceiling) the switch changes nothing.
+void after_case(const ignis::flash_next::HcWeights &dw, const char *format, int rows, bool combine,
+                ninfer::DeviceArena &scratch) {
+  namespace fn = ignis::flash_next;
+  const std::string label = std::string("folded ") + (combine ? "combine and inject" : "inject") + " (" + format +
+                            "), " + std::to_string(rows) + " rows";
+  const std::size_t residual_n = static_cast<std::size_t>(rows) * kWidth;
+  const std::size_t row_n = static_cast<std::size_t>(rows) * kHidden;
+  const auto hidden = random_bf16(residual_n, 2.0, 0xAF0U + rows);
+  const auto y_in = random_bf16(row_n, 1.0, 0xAF1U + rows);
+  std::vector<float> inj_prev(static_cast<std::size_t>(rows) * kStreams);
+  uint32_t seed = 0xAF2U + rows;
+  for (auto &v : inj_prev) {
+    v = static_cast<float>(bf(2.0 * static_cast<double>(lcg(seed) >> 8) / 16777216.0));
+  }
+  // The combine's operands: a routed sum in the experts' fixed point (2^-32 units), the shared
+  // expert's fp32 output, the MoE mix's x and the gate weight.
+  std::vector<long long> acc(row_n);
+  std::vector<float> shared(row_n);
+  for (std::size_t i = 0; i < row_n; ++i) {
+    const double routed = static_cast<double>(lcg(seed) >> 8) / 16777216.0 * 4.0 - 2.0;
+    acc[i] = static_cast<long long>(std::llround(routed * 4294967296.0));
+    shared[i] = static_cast<float>(static_cast<double>(lcg(seed) >> 8) / 16777216.0 * 2.0 - 1.0);
+  }
+  const auto combine_x = random_bf16(row_n, 1.0, 0xAF3U + rows);
+  const auto w_gate = random_bf16(kHidden, 0.05, 0xAF4U);
+  auto *d_hidden = upload(hidden);
+  auto *d_y = upload(y_in);
+  auto *d_inj_prev = upload(inj_prev);
+  auto *d_acc = upload(acc);
+  auto *d_shared = upload(shared);
+  auto *d_cx = upload(combine_x);
+  auto *d_gate = upload(w_gate);
+  void *d_x = nullptr;
+  float *d_inj = nullptr;
+  cuda_ok(cudaMalloc(&d_x, row_n * 2), "cudaMalloc x");
+  cuda_ok(cudaMalloc(&d_inj, static_cast<std::size_t>(rows) * kStreams * 4), "cudaMalloc inj");
+  fn::Geometry g;
+  g.streams = kStreams;
+  g.hidden = kHidden;
+  g.hc_rank = kRank;
+  g.rms_norm_eps = static_cast<float>(kEps);
+  fn::PendingInject pending;
+  pending.y = d_y;
+  pending.inj = d_inj_prev;
+  if (combine) {
+    pending.acc = reinterpret_cast<int64_t *>(d_acc);
+    pending.shared = d_shared;
+    pending.x = d_cx;
+    pending.w_gate = d_gate;
+  }
+  // Every run starts from the same operands: the residual and the accumulator are rewritten,
+  // y (with a combine) poisoned.
+  const auto reset = [&] {
+    cuda_ok(cudaMemcpy(d_hidden, hidden.data(), residual_n * 2, cudaMemcpyHostToDevice), "reset hidden");
+    cuda_ok(cudaMemcpy(d_acc, acc.data(), row_n * 8, cudaMemcpyHostToDevice), "reset acc");
+    if (combine) {
+      cuda_ok(cudaMemset(d_y, 0xFF, row_n * 2), "poison y");
+    } else {
+      cuda_ok(cudaMemcpy(d_y, y_in.data(), row_n * 2, cudaMemcpyHostToDevice), "reset y");
+    }
+  };
+  std::vector<uint16_t> x[2], residual[2], y[2];
+  std::vector<float> injections[2];
+  std::vector<long long> acc_after[2];
+  int nodes[2] = {};
+  for (int folded = 0; folded < 2; ++folded) {
+    fn::set_fused(fn::Fusion::Inject, folded == 1);
+    reset();
+    cuda_ok(cudaMemset(static_cast<char *>(scratch.base()) + scratch.used(), 0xFF, scratch.capacity() - scratch.used()),
+            "poison the scratch");
+    cuda_ok(cudaMemset(d_x, 0xFF, row_n * 2), "poison x");
+    cuda_ok(cudaMemset(d_inj, 0xFF, static_cast<std::size_t>(rows) * kStreams * 4), "poison inj");
+    check(fn::fn_hc_mix_after(g, dw, pending, d_hidden, rows, d_x, d_inj, scratch, nullptr) == 0,
+          label + ": runs: " + fn::fn_last_error());
+    cuda_ok(cudaDeviceSynchronize(), "sync");
+    x[folded].resize(row_n);
+    residual[folded].resize(residual_n);
+    y[folded].resize(row_n);
+    injections[folded].resize(static_cast<std::size_t>(rows) * kStreams);
+    acc_after[folded].resize(row_n);
+    cuda_ok(cudaMemcpy(x[folded].data(), d_x, row_n * 2, cudaMemcpyDeviceToHost), "download x");
+    cuda_ok(cudaMemcpy(residual[folded].data(), d_hidden, residual_n * 2, cudaMemcpyDeviceToHost), "download hidden");
+    cuda_ok(cudaMemcpy(y[folded].data(), d_y, row_n * 2, cudaMemcpyDeviceToHost), "download y");
+    cuda_ok(cudaMemcpy(injections[folded].data(), d_inj, injections[folded].size() * 4, cudaMemcpyDeviceToHost),
+            "download inj");
+    cuda_ok(cudaMemcpy(acc_after[folded].data(), d_acc, row_n * 8, cudaMemcpyDeviceToHost), "download acc");
+    reset();
+    nodes[folded] = captured_kernels([&](cudaStream_t stream) {
+      return fn::fn_hc_mix_after(g, dw, pending, d_hidden, rows, d_x, d_inj, scratch, stream);
+    });
+  }
+  fn::set_fused(fn::Fusion::Inject, true);
+  check(residual[0] != hidden, label + ": the unfolded route moved the residual (the comparison has power)");
+  check(x[1] == x[0], label + ": x is the unfolded route's, bit for bit");
+  check(std::memcmp(injections[1].data(), injections[0].data(), injections[0].size() * 4) == 0,
+        label + ": the injection weights are the unfolded route's, bit for bit");
+  check(residual[1] == residual[0], label + ": the residual is the unfolded route's, bit for bit");
+  check(!combine || y[1] == y[0], label + ": the combined y is ignis_moe_combine's, bit for bit");
+  const bool zeroed = std::all_of(acc_after[1].begin(), acc_after[1].end(), [](long long v) { return v == 0; });
+  check(!combine || zeroed, label + ": the accumulator is zeroed for the next MoE op");
+  // Unfolded: the combine, the inject, and the mix's two launches (its norm fused) up to three
+  // rows, three past them. The fold takes one row only (hc.cu's kMaxFoldRows).
+  const int unfolded = (combine ? 2 : 1) + (rows <= 3 ? 2 : 3);
+  if (rows <= 1) {
+    check(nodes[0] == unfolded && nodes[1] == 2,
+          label + ": " + std::to_string(unfolded) + " launches unfolded, 2 folded (got " + std::to_string(nodes[0]) +
+              ", " + std::to_string(nodes[1]) + ")");
+  } else {
+    check(nodes[0] == unfolded && nodes[1] == unfolded,
+          label + ": past one row the switch changes no launch (got " + std::to_string(nodes[0]) + ", " +
+              std::to_string(nodes[1]) + ")");
+  }
+  cudaFree(d_hidden);
+  cudaFree(d_y);
+  cudaFree(d_inj_prev);
+  cudaFree(d_acc);
+  cudaFree(d_shared);
+  cudaFree(d_cx);
+  cudaFree(d_gate);
+  cudaFree(d_x);
+  cudaFree(d_inj);
+}
+
 }  // namespace
 
 int main() {
@@ -326,6 +572,11 @@ int main() {
   }
   if (ignis_fp8_linear_prepare() != 0) {
     std::fprintf(stderr, "FATAL: ignis_fp8_linear_prepare: %s\n", ignis_fp8_linear_last_error());
+    return 1;
+  }
+  // The folded combine's unfolded route runs ignis_moe_combine.
+  if (ignis_moe_prepare() != 0) {
+    std::fprintf(stderr, "FATAL: ignis_moe_prepare: %s\n", ignis_moe_last_error());
     return 1;
   }
   Weights w;
@@ -350,6 +601,57 @@ int main() {
                 ignis::flash_next::WeightFormat::Fp8RowScale};
 
   ninfer::DeviceArena scratch(64u << 20);
+
+  // Every fusion switch (fusion.h) is seeded from the environment at its first read:
+  // IGNIS_FN_FUSION=0 turns all of them off; set_fused turns one back on.
+  {
+#ifdef _WIN32
+    _putenv_s("IGNIS_FN_FUSION", "0");
+#else
+    setenv("IGNIS_FN_FUSION", "0", 1);
+#endif
+    namespace fn = ignis::flash_next;
+    bool all_off = true;
+    for (int f = 1; f < static_cast<int>(fn::Fusion::kCount); ++f) all_off = all_off && !fn::fused(static_cast<fn::Fusion>(f));
+    check(all_off, "IGNIS_FN_FUSION=0 at the first read turns every fusion off");
+    for (int f = 1; f < static_cast<int>(fn::Fusion::kCount); ++f) fn::set_fused(static_cast<fn::Fusion>(f), true);
+    bool all_on = true;
+    for (int f = 1; f < static_cast<int>(fn::Fusion::kCount); ++f) all_on = all_on && fn::fused(static_cast<fn::Fusion>(f));
+    check(all_on, "set_fused turns a fusion back on over the environment");
+#ifdef _WIN32
+    _putenv_s("IGNIS_FN_FUSION", "");
+#else
+    unsetenv("IGNIS_FN_FUSION");
+#endif
+  }
+  // The switch's default is read from IGNIS_FN_HC_FUSED at the first mix: "0" keeps the norm's
+  // own launch. Then fused, so the reference arms below hold the fused route at rows 1 and 3.
+  {
+#ifdef _WIN32
+    _putenv_s("IGNIS_FN_HC_FUSED", "0");
+#else
+    setenv("IGNIS_FN_HC_FUSED", "0", 1);
+#endif
+    ignis::flash_next::Geometry g;
+    g.streams = kStreams;
+    g.hidden = kHidden;
+    g.hc_rank = kRank;
+    g.rms_norm_eps = static_cast<float>(kEps);
+    const auto hidden = random_bf16(kWidth, 2.0, 0xE5U);
+    auto *d_hidden = upload(hidden);
+    void *d_x = nullptr;
+    float *d_inj = nullptr;
+    cuda_ok(cudaMalloc(&d_x, kHidden * 2), "cudaMalloc x");
+    cuda_ok(cudaMalloc(&d_inj, kStreams * 4), "cudaMalloc inj");
+    const int nodes = kernel_nodes(g, dw8, d_hidden, 1, d_x, d_inj, scratch);
+    check(nodes == 3, "IGNIS_FN_HC_FUSED=0 at the first mix keeps three launches (got " + std::to_string(nodes) + ")");
+    ignis::flash_next::fn_hc_set_decode_fused(true);
+    check(kernel_nodes(g, dw8, d_hidden, 1, d_x, d_inj, scratch) == 2, "the switch, set, fuses the next mix");
+    cudaFree(d_hidden);
+    cudaFree(d_x);
+    cudaFree(d_inj);
+  }
+
   for (int rows : {1, 3, 8, 9, 1027, 1100}) {
     mix_case(w, dw, "BF16", rows, true, scratch);
     mix_case(w8, dw8, "FP8", rows, true, scratch);
@@ -370,6 +672,20 @@ int main() {
   for (int rows : {1, 3, 9}) {
     mix_case(w8_down, dw8_down, "FP8 down, BF16 up", rows, true, scratch);
     mix_case(w8_up, dw8_up, "BF16 down, FP8 up", rows, true, scratch);
+  }
+  for (int rows : {1, 2, 3, 4, 8, 9}) {
+    for (bool with_inject : {true, false}) {
+      fused_case(dw, "BF16", rows, with_inject, scratch);
+      fused_case(dw8, "FP8", rows, with_inject, scratch);
+    }
+    fused_case(dw8_down, "FP8 down, BF16 up", rows, true, scratch);
+    fused_case(dw8_up, "BF16 down, FP8 up", rows, true, scratch);
+  }
+  for (int rows : {1, 2, 3, 4, 8}) {
+    for (bool combine : {false, true}) {
+      after_case(dw8, "FP8", rows, combine, scratch);
+      after_case(dw, "BF16", rows, combine, scratch);
+    }
   }
 
   // What the norm cannot hold, and projections whose shape is not the
