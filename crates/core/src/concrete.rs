@@ -1169,8 +1169,10 @@ impl ConcreteScheduler {
             // disk instead of for nowhere. Its bytes are KV-RAM's until its
             // file commits, so the newcomer has no room now: it is the bet
             // given up, which retained state may always be (ADR 0029), and
-            // the next spill finds the room.
-            if self.demote_retained(victim, events) == Demotion::Started {
+            // the next spill finds the room. A disk busy with another
+            // transfer keeps the victim for a later demotion the same way;
+            // only one the disk refuses goes for nowhere.
+            if self.demote_retained(victim, events) != Demotion::Refused {
                 return false;
             }
             self.discard_kv_ram_blob(victim, events);
@@ -1180,7 +1182,7 @@ impl ConcreteScheduler {
             let Some(blob) = self.host.next_retained_victim_below(owner, used_at, now) else {
                 return false;
             };
-            if self.demote_retained(blob, events) == Demotion::Started {
+            if self.demote_retained(blob, events) != Demotion::Refused {
                 return false;
             }
             // Out of the tier first, then freed at the backend: the pair

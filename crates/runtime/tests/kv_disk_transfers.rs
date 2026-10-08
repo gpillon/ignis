@@ -436,8 +436,11 @@ fn a_header_naming_another_load_is_never_restored() {
 
 // ── a spill that does not happen leaves its source as it was ────────────────
 
+/// AC 21: a spill the scheduler discards mid-write (its request was
+/// cancelled) deletes its file and frees the KV-RAM span it was writing
+/// from: nothing is put back under a request that is gone.
 #[test]
-fn an_abandoned_spill_deletes_its_file_and_leaves_its_source_where_it_was() {
+fn a_discarded_spill_deletes_its_file_and_frees_its_source() {
     let rig = new_rig("abandon");
     prefill(&rig.compute, 1);
     decode(&rig.compute, 1, 2);
@@ -451,7 +454,7 @@ fn an_abandoned_spill_deletes_its_file_and_leaves_its_source_where_it_was() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(files_in(&rig).is_empty(), "its file is deleted once its writes drained");
-    rig.compute.restore(1, 64).expect("the KV-RAM blob is back where it was");
+    assert!(rig.compute.restore(1, 64).is_err(), "the KV-RAM span went with the discard, not back to the map");
 }
 
 // ── AC 22: the n-gram table goes first ──────────────────────────────────────

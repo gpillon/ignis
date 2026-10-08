@@ -427,7 +427,12 @@ fn the_other_lanes_keep_decoding_while_a_victim_spills_and_while_it_comes_back()
     // window lands.
     let mut restore_started = false;
     let mut landed = false;
+    let mut decoded_beside_the_restore = 0;
     for _ in 0..5_000 {
+        let running: Vec<RequestId> = [lanes[0], lanes[1], requester]
+            .into_iter()
+            .filter(|&r| sched.request_state(r) == Some(RequestState::Running))
+            .collect();
         let out = sched.advance();
         landed |= restored(&out, victim);
         if !restore_started && compute.disk_restores().contains(&DiskBlob::Live(victim)) {
@@ -438,6 +443,10 @@ fn the_other_lanes_keep_decoding_while_a_victim_spills_and_while_it_comes_back()
                 tokens_of(&out, victim).is_empty(),
                 "a restoring request is not scheduled before its last window lands"
             );
+            for r in running.into_iter().filter(|&r| !done(&out, r)) {
+                assert_eq!(tokens_of(&out, r).len(), 1, "request {r} decodes on every advance of the restore");
+                decoded_beside_the_restore += 1;
+            }
         }
         events.extend(out);
         if sched.is_idle() {
@@ -452,6 +461,7 @@ fn the_other_lanes_keep_decoding_while_a_victim_spills_and_while_it_comes_back()
         compute.disk_restores(),
         [lanes[0], lanes[1], victim, requester].map(|r| done(&events, r))
     );
+    assert!(decoded_beside_the_restore > 0, "another request decoded while the victim came back");
     assert_eq!(tokens_of(&events, victim), expected_stream(&compute, victim, 500));
     for r in [lanes[0], lanes[1], victim, requester] {
         assert!(done(&events, r), "request {r} finished");
@@ -534,6 +544,40 @@ fn a_request_cancelled_mid_spill_releases_its_pages_and_its_file_goes() {
     assert!(!has(&out, |e| matches!(e, SchedEvent::DiskSpilled { .. })));
     let events = run_to_idle(&mut sched);
     assert!(done(&events, requester), "the requester gets the room");
+}
+
+#[test]
+fn a_request_cancelled_while_kv_ram_demotes_it_lets_go_of_its_blob_and_its_file() {
+    // AC 21 on the KV-RAM leg: the demotion writes from the request's own
+    // KV-RAM blob, which the cancel must free -- never leave behind, nor put
+    // back under a request that is gone.
+    let disk = FakeDisk { room_bytes: 1 << 30, window_bytes: u64::MAX, advances_per_window: 4 };
+    let compute = Arc::new(MockCompute::with_host_arena(1).with_disk(disk));
+    let mut sched = ConcreteScheduler::with_config(pool(1, 4), compute.clone());
+    let a = sched.submit(live(1, 380), RequestClass::Agent).unwrap();
+    let b = sched.submit(live(100, 380), RequestClass::Agent).unwrap();
+    for _ in 0..3 {
+        sched.advance();
+    }
+    let c = sched.submit(live(200, 700), RequestClass::Interactive).unwrap();
+    let mut guard = 0;
+    let demoted = loop {
+        if let Some((DiskBlob::Live(r), _)) = compute.disk_spills().into_iter().find(|(_, from)| *from == DiskSource::KvRam) {
+            break r;
+        }
+        sched.advance();
+        guard += 1;
+        assert!(guard < 5_000, "nothing was demoted");
+    };
+    assert!(sched.disk_busy(), "the demotion is under way");
+    assert!(sched.cancel(demoted));
+    let events = run_to_idle(&mut sched);
+    assert!(compute.disk_discards().contains(&DiskBlob::Live(demoted)), "its file is deleted");
+    assert_eq!(compute.host_arena_used(), 0, "its KV-RAM blob went with it");
+    assert_eq!(sched.disk_tier().unwrap().used_bytes(), 0);
+    for r in [a, b, c].into_iter().filter(|&r| r != demoted) {
+        assert!(done(&events, r), "request {r} finished");
+    }
 }
 
 #[test]

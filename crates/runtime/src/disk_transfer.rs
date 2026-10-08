@@ -107,6 +107,11 @@ struct Transfer<L: StepLeaf> {
     /// Whether a drained transfer's file goes too: not for an abandoned
     /// checkpoint claim, whose file is a retained one.
     delete_file: bool,
+    /// Whether a drained spill's KV-RAM span goes back where it came from:
+    /// yes for a spill that failed (the scheduler keeps its victim there), no
+    /// for one the scheduler discarded (its request ended), whose span is
+    /// let go with it.
+    return_source: bool,
 }
 
 impl<L: StepLeaf> Transfer<L> {
@@ -255,6 +260,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 header: None,
             },
             delete_file: true,
+            return_source: true,
         });
         Ok(blob_bytes)
     }
@@ -331,6 +337,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             // A live blob's file goes once it has landed, or failed; a
             // retained one's stays (a claim never consumes).
             delete_file: matches!(blob, DiskBlob::Live(_)),
+            return_source: true,
         });
         Ok(())
     }
@@ -368,7 +375,11 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             return;
         };
         if let Some(at) = tier.transfers.iter().position(|t| t.blob == blob) {
-            let transfer = tier.transfers.remove(at);
+            let mut transfer = tier.transfers.remove(at);
+            // The scheduler has forgotten the blob: a KV-RAM span the spill
+            // was writing from is freed once its writes drain, never put
+            // back under a request that is gone.
+            transfer.return_source = false;
             self.abandon(tier, transfer, true);
         }
         if let Some(file) = tier.files.remove(&blob) {
@@ -413,8 +424,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     }
 
     /// Let go of what drained transfers held once their ops are done: their
-    /// slots, a spill's KV-RAM span (back where it came from), a restore's
-    /// sequence, and the file.
+    /// slots, a spill's KV-RAM span (back where it came from after a
+    /// failure, freed after a discard), a restore's sequence, and the file.
     fn drain(&self, tier: &mut DiskTier<L>) {
         let mut i = 0;
         while i < tier.draining.len() {
@@ -460,7 +471,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 Kind::Spill { writer, source, generated, .. } => {
                     // The handle goes before the delete is queued behind it.
                     drop(writer);
-                    if let Some(buf) = source {
+                    // A discarded spill's span drops here, back to the arena.
+                    if let Some(buf) = source.filter(|_| transfer.return_source) {
                         self.put_back(transfer.blob, buf, generated);
                     }
                 }
@@ -884,7 +896,9 @@ impl<L: StepLeaf> RuntimeCompute<L> {
 
     /// Everything the tier holds, let go of at shutdown: waits are fine here.
     pub(crate) fn tier_shutdown(&self) {
-        let Some(mut tier) = self.disk.lock().unwrap().take() else {
+        // From `Drop`: a lock a panic poisoned is still the tier's, and
+        // panicking again here would abort.
+        let Some(mut tier) = self.disk.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else {
             return;
         };
         for transfer in std::mem::take(&mut tier.transfers) {
