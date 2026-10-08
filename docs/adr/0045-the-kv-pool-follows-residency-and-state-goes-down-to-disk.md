@@ -62,7 +62,7 @@ Flash-Next blob, every lane stalled). Measured in
   transfer stream, and for retained state.
 - **What AC 37's move in still pays is the expert cache, not the link.** The
   rounds around a move in miss ~3x as many experts; a long arrival alone
-  raises the misses (+38%, one control), and with a move out and back they
+  raises the misses (+38%, one control run, beside a host build), and with a move out and back they
   roughly double for the moved sequence's remaining run. The owner decides what the move-in bound
   measures; the residency's response to a move is a follow-up.
 

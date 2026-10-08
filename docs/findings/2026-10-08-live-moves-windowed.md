@@ -95,6 +95,10 @@ that nothing moves (`a_long_arrival_beside_decoding_lanes_with_nothing_moved`):
 | before any arrival | 24.56 ms | 184 | 10.74 ms |
 | after E ended | 27.48 ms (+12%) | 254 (+38%) | 13.95 ms |
 
+The run (14:53-14:57) shared the host with another agent's full kernel
+build (cmake/nvcc, ~14:52-15:04) through both of its phases; no such load
+is known beside the moved runs.
+
 **5. No paging.** nvidia-smi and the WDDM counters once a second through a
 KV-RAM leg: device memory 31.1-31.4 GB of 32.6 GB, flat; shared usage flat at
 ~37.4 GB (the pinned expert pool); SM clock 2.86-2.91 GHz throughout. In the
@@ -135,8 +139,8 @@ Observed:
   (three runs counted them) and +33-40% ITL (five runs), for the rest of C's
   run (~1,400 rounds here), and back to normal once C has ended. One control
   against those runs, on expert caches 34.6 MB apart, with a run-to-run
-  spread of several percent: the gap between them is the move's only as far
-  as one control can say.
+  spread of several percent, run beside a kernel build on the host: the gap
+  between them is the move's only as far as that one control can say.
 
 Inferred, not measured:
 
@@ -171,8 +175,11 @@ Inferred, not measured:
 
 - One host, one scenario, one to five runs a cell; the move-out p50 spreads
   +3 to +13% at one pace, so a single run is not a verdict.
-- The control is one run, and its pool is one chunk larger (34.6 MB less
-  expert cache).
+- The control is one run, its pool is one chunk larger (34.6 MB less
+  expert cache), and it ran beside a kernel build on the host: its ITLs are
+  not comparable with the moved runs', and how far the build moved its
+  misses (the lookahead's prefetches race the rounds) was not measured. A
+  rerun on a quiet host comes before any residency work.
 - AC 36 holds a moved sequence's tokens bit-exact at 4,400-token contexts and
   ~150-270 MB blobs; a 236K-token sequence's tokens across a move were not
   compared with an unmoved run at the same batch composition.
