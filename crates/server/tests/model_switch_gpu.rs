@@ -38,8 +38,22 @@ const MODEL_FLASH_NEXT: &str = "qwen3.8-flash-next";
 
 /// The start options both models load with: the defaults, at a context both
 /// serve, so the measurement is of the switch rather than of a large pool.
+///
+/// Flash-Next's host plan (expert pool, n-gram hot rows, prompt reuse's
+/// retained slots and KV-RAM arena) is what the host plan check
+/// (`crates/core/src/residency/plan.rs`) sizes against free physical memory;
+/// the expert pool alone (~35 GiB) is not a knob, and the KV-RAM arena is
+/// what this test's own assertions pin on the 27B side (`host_pool_stats`),
+/// so neither is touched. `--ngram-hot-bytes` is Flash-Next-only and this
+/// same config starts the 27B first (a switch, not a start, is what drops a
+/// target-incompatible flag -- `config::fit_to_family`), so it cannot be
+/// named here at all. Prompt reuse's retained slots are not part of what is
+/// measured here (it is the switch's wall time and the 27B's arena, not
+/// Flash-Next's reuse), so they are zeroed to leave the host plan's margin
+/// check a little more room on a machine running other things at the same
+/// time.
 fn options() -> ignis_server::config::Config {
-    let args: Vec<String> = ["--max-context", "16384"].map(String::from).to_vec();
+    let args: Vec<String> = ["--max-context", "16384", "--retained-host", "0"].map(String::from).to_vec();
     match ignis_server::config::resolve(&args, |_| None).expect("the options resolve") {
         ignis_server::config::ConfigOutcome::Config(config) => config,
         _ => unreachable!("flags without --help are a config"),
