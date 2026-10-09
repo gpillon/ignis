@@ -490,34 +490,50 @@ flags were enough once there was a little more free RAM at run time besides.
 
 ## Implicit switch: a request's `model` field (added 2026-10-10)
 
-Trying this end to end against a real client (opencode) exposed a gap this
-spec didn't cover: the `model` field on `/v1/chat/completions` (and every
-other endpoint that carries one) was never checked against the loaded
-model at all — only its `@<lane>` class suffix is read
-(`split_model_lane`, `crates/server/src/api.rs:570`). Naming the other
-model does nothing; the active model answers regardless, silently. The
-owner's ask: let naming the other model *do* something — switch to it —
-behind a flag, and only once every request already on the current model is
-drained, accepting nothing else meanwhile.
+Trying this end to end against a real client (opencode) raised the
+question, and a closer read of the code (correcting an earlier guess in
+this conversation, checked against `crates/core/src/concrete.rs:3938-3955`)
+found the field is **not** ignored: a `model` naming anything other than
+the loaded one is already refused today, on every path that submits to the
+engine — `ConcreteScheduler::refusal`/`submit` return
+`SubmitError::UnknownModel`, which `/v1/chat/completions` and
+`/v1/responses` both turn into `404 model_not_found`
+(`crates/server/src/api.rs:1166`, shared by both through
+`prepare_request`/`request_input`), and `/v1/decide` refuses the same
+mismatch itself, earlier and in its own 422 shape, before any of that
+(`crates/server/src/decide.rs:2526-2532`). `request_input`
+(`crates/server/src/api.rs:419-421`) is what makes an **absent** `model`
+harmless: empty or unset defaults to `server.active().engine.model_id()`
+before this check ever runs, so only a request that *names* the other
+model hits it. Nothing here was a silent no-op; it is a working refusal
+with nothing behind it to do instead.
+
+The owner's ask stands regardless: let naming the other model *do*
+something — switch to it — behind a flag, and only once every request
+already on the current model is drained, accepting nothing else
+meanwhile. Concretely, this turns an unconditional refusal into a
+conditional one: refuse exactly as today when switching is off or the name
+is unknown, trigger a switch and then proceed when it is on and known.
 
 ### The rule
 
-A request whose `model` (after stripping the lane suffix) names a model
-other than the one currently `Serving`:
+A request whose `model` (after stripping the lane suffix, and only when
+it is present and non-empty — `request_input`'s existing default-to-active
+rule is unchanged) names a model other than the one currently `Serving`:
 
 - `--allow-model-switch` (default **true**, env `IGNIS_ALLOW_MODEL_SWITCH`)
-  off, or the named model unknown to this server: refused, not silently
-  served by the wrong model — `404 model_not_found` naming the id and (if
-  the flag is off) that implicit switching is disabled. This closes a real
-  gap: today every model name is accepted and ignored, which looks like the
-  field is honoured when it never was (the #284 field table's own
-  "honoured or refused" rule, applied here for the first time to `model`
-  itself rather than its suffix).
+  off, or the named model unknown to this server: refused exactly as
+  today — `404 model_not_found` on chat/responses, `/v1/decide`'s own 422 —
+  with nothing new to build for this half; the existing checks above are
+  the implementation.
 - Flag on and the model is known: this request **triggers** a switch to it,
   reusing `model_switch::switch` exactly as `POST /v1/models/switch` does —
   same gate, same drain (`--switch-drain-timeout`), same teardown-then-load
   ordering, same rollback on failure. Nothing about the switch mechanism
-  itself is new; only who may start one is wider.
+  itself is new; only who may start one is wider. Once the switch lands,
+  `server.active()` names the new model, and the request falls through to
+  exactly the code path it would have taken had it always matched — no new
+  "success" path to build either, only the trigger in front of it.
 
 ### What "known to this server" means: `--known-model <id>=<path>`
 
