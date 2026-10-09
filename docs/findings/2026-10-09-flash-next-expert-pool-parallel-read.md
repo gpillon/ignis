@@ -30,9 +30,7 @@ CUDA touched. The probe fills a fresh `vec![0u8; pool_bytes]` from a
 sequential baseline (one handle, the original algorithm) and from a
 parallel variant (N handles, layers round-robined, each worker reading its
 own disjoint byte range of the pool). Host: i9-10900K, 20 logical CPUs,
-model on an NVMe drive (`F:`), PCIe Gen 3 (see
-[host PCIe Gen 3](ignis-host-pcie-gen3.md) in memory — unrelated to this
-read path, same drive).
+model on an NVMe drive (`F:`).
 
 Pool size: 48 layers x 512 experts/layer, **35.20 GiB** (37,795,446,784
 bytes) — the host pool holds every expert for the life of the load, not a
