@@ -49,6 +49,7 @@ fn options() -> ignis_server::config::Config {
 #[test]
 #[ignore = "GPU profile only: the real 27B and Flash-Next artifacts, and the card exclusively"]
 fn the_27b_and_flash_next_switch_back_and_forth_on_one_process() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
     let artifact_27b = std::env::var("IGNIS_ARTIFACT_27B").unwrap_or_else(|_| ARTIFACT_27B.to_owned());
     let flash_next_dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(FLASH_NEXT_DIR), PathBuf::from);
     let flash_next = flash_next_dir.join(ARTIFACT_FILE_NAME);
