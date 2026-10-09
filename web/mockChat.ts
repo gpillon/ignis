@@ -5,7 +5,7 @@
 // Development only, like the rest of the mock.
 
 /** The mock's `--thinking-budget`, the default ignis ships. */
-export const MOCK_DEFAULT_THINKING_BUDGET = 6144;
+export const MOCK_DEFAULT_THINKING_BUDGET = 32768;
 
 const U32_MAX = 4_294_967_295;
 

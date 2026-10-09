@@ -182,9 +182,9 @@ fn the_reservation_follows_the_default() {
 
 #[test]
 fn reasoning_counts_inside_the_default_and_the_budget_keeps_its_answer_reserve() {
-    // The server's default thinking budget, 6,144, well inside the default
-    // cap: its close is still forced at 6,144, and the reasoning before it is
-    // part of the 38,912 the request generates in all.
+    // A budget well inside the default cap (6,144, the server default until
+    // 2026-10-09): its close is still forced at 6,144, and the reasoning
+    // before it is part of the 38,912 the request generates in all.
     let mock = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
@@ -228,6 +228,35 @@ fn reasoning_counts_inside_the_default_and_the_budget_keeps_its_answer_reserve()
     let id = sched.submit(input, RequestClass::Interactive).expect("admitted");
     let (_, _, thinking) = run(&mut sched, id);
     assert_eq!(thinking.map(|t| t.budget), Some(6));
+
+    // The server default since 2026-10-09, 32,768, sits inside the default
+    // cap less the reserve (36,864): a turn that never closes on its own is
+    // forced closed at 32,768 and answers in the rest of its 38,912.
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            kv_page_tokens: 64,
+            max_sequence_tokens: CONTEXT,
+            kv_capacity_pages: CONTEXT / 64,
+            default_max_tokens: DEFAULT_CAP,
+            thinking_close: Some(Arc::new(ThinkingClose::new(CLOSE.to_vec(), THINK_END).expect("close"))),
+            ..SchedulerConfig::default()
+        },
+        mock,
+    );
+    let mut input = request(100, None);
+    input.params.thinking_budget = Some(32_768);
+    let id = sched.submit(input, RequestClass::Interactive).expect("admitted");
+    let (generated, reason, thinking) = run(&mut sched, id);
+    assert_eq!(generated, DEFAULT_CAP);
+    assert_eq!(reason, FinishReason::Length);
+    let budget = 32_768;
+    assert!(budget <= DEFAULT_CAP - ANSWER_RESERVE, "inside the cap less the reserve: not clamped");
+    assert_eq!(
+        thinking,
+        Some(BudgetOutcome { budget, forced_at: Some(budget + 1), closed_at: Some(budget + 3) })
+    );
 }
 
 #[test]
