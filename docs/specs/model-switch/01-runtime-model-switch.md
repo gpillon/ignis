@@ -426,3 +426,39 @@ Where the implementation departs from the sections above, and why.
   keeps the text-only cap after switching to the 27B. Moot today — a switch
   only enables vision when the start flags named it, and Flash-Next refuses
   to start with them.
+
+### The GPU profile, run (2026-10-10)
+
+`model_switch_gpu.rs` ran on the owner's machine (RTX 5090, 64 GB RAM, ~45
+GB free at run time) against the real artifacts, replacing AC 16's
+estimate:
+
+| | wall time | breakdown |
+|---|---|---|
+| 27B cold start | 9.22s | — |
+| 27B → Flash-Next | 33.41s | teardown 246ms, load 31,918ms, warm-up 76ms |
+| Flash-Next → 27B | 12.94s | drain 0ms, teardown 3,743ms, load 8,459ms, warm-up 179ms |
+
+All three host-pool-arena assertions passed: pinned (2,147,483,648 bytes)
+while the 27B served, `0` immediately after the switch to Flash-Next, pinned
+again after the switch back — the direct proof that the teardown ran before
+the next load's create, in both directions. Load dominates both directions,
+as expected; the switch's own overhead (drain + teardown + warm-up) is low
+hundreds of ms on the 27B side and under 350ms on the Flash-Next side.
+
+**The first attempt failed for a reason worth recording.** Flash-Next's
+host plan (`crates/core/src/residency/plan.rs`) needs the expert pool
+(~35.2 GiB, not a knob) plus n-gram hot rows (1 GiB default), prompt reuse's
+retained host slots (~1 GiB default) and its KV-RAM arena (2 GiB), plus the
+6 GiB paging margin — around 48 GiB total — checked against physical memory
+free at that instant. With ~37-45 GiB free (this machine runs other
+sessions/applications too), the first two attempts refused with
+`HostPlanError::BelowMargin` naming `expert_pool` as the crossing line, and
+the switch correctly rolled back to the 27B each time (AC 9, proven on real
+hardware, not just the mock). The fix was not a code change: the test's
+`options()` now sends `--retained-host 0`, an existing flag, saving ~1 GiB
+without touching anything the test asserts (the arena stays at its default
+for the 27B-side assertions; the expert pool cannot be shrunk). No change
+to `HOST_MARGIN_BYTES` or the check itself — the margin did its job both
+times, naming exactly what to shrink or what to free, and the owner's own
+flags were enough once there was a little more free RAM at run time besides.
