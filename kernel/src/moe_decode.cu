@@ -1,5 +1,7 @@
 // ignis kernel leaf: Flash-Next's routed experts for 1..8 decode tokens, in ONE launch for all
-// experts and all four K -- OURS (kernel/include/ignis_moe.h).
+// experts and all four K -- OURS (kernel/include/ignis_moe.h): the register kernel, the whole of
+// IGNIS_MOE_DECODE_REGISTERS and the tickets route past the staged kernel's 4 tokens
+// (moe_decode_staged.cu); ignis_moe_experts_decode's dispatch lives here.
 //
 // The launch is a persistent grid (two CTAs per SM) that takes work units by ticket from a
 // counter in the workspace, each CTA one ticket ahead of the unit it is running. Every unit is
@@ -30,8 +32,13 @@
 // Deterministic by construction: every floating-point sum inside a unit has a fixed order, the
 // cross-unit sums are integer, and nothing reads the slot address except to load from it. The
 // last CTA out resets the counters, so the launch replays from a CUDA graph.
+//
+// The <kTrace> instantiation stamps each unit's phases with the global timer into a trace buffer
+// (ignis_moe_experts_decode_trace, moe_trace.h) for the microbenchmark; production launches the
+// other one.
 
 #include "moe_decode_common.cuh"
+#include "moe_trace.h"
 #include "trellis_decode.cuh"
 
 #include <cuda_bf16.h>
@@ -61,12 +68,6 @@ struct Shared {
   float xh[kDecodeMaxTokens][kSplitK];  // rotated rows; the epilogues' scratch afterwards
   __half a[kDecodeMaxTokens][kAStride];
 };
-
-__device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
-  uint32_t v;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
-  return v;
-}
 
 // Rotate `tokens` rows of 640 inputs (input `in(t, k)` times suh[k]) into s.a as fp16, each
 // row scaled by its own power of two (s.scale) so its largest entry sits in [2^13, 2^14).
@@ -154,10 +155,13 @@ struct Params {
   long long *gate_up;  // int64 [unique][cap][1280], fixed point, zero between calls
   float *h;            // f32 [unique][cap][640]
   long long *acc;
+  unsigned long long *trace;  // kTrace only (moe_trace.h)
 };
 
-template <int K2>
-__device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int split, const ignis_moe_slot &slot) {
+template <int K2, bool kTrace>
+__device__ void gate_up_unit(Shared &s, const Params &p, int ticket, int u, int cb, int split, const ignis_moe_slot &slot) {
+  UnitStamps st;
+  if constexpr (kTrace) st.begin = global_ns();
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tokens = p.tokens;
@@ -175,8 +179,10 @@ __device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int spli
   prepare_a(s, tokens, suh + k0, [&](int t, int k) {
     return __bfloat162float(p.x[static_cast<size_t>(t) * kHidden + k0 + k]);
   });
+  if constexpr (kTrace) st.ready = global_ns();
   float acc[2][4] = {};
   mma_tiles<K2>(s, tokens, w, acc);
+  if constexpr (kTrace) st.mma = global_ns();
 
   const int g = lane >> 2;
   const int c = lane & 3;
@@ -197,7 +203,13 @@ __device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int spli
     s.is_last = before == 2 * kDecodeSplits - 1;
   }
   __syncthreads();
-  if (!s.is_last) return;
+  if (!s.is_last) {
+    if constexpr (kTrace) {
+      st.end = global_ns();
+      trace_unit(p.trace, ticket, 0, u, cb, split, st);
+    }
+    return;
+  }
 
   // Eighth arrival for (u, b): read gate and up back, rotate, scale, SwiGLU; zero what was read.
   __threadfence();
@@ -237,10 +249,17 @@ __device__ void gate_up_unit(Shared &s, const Params &p, int u, int cb, int spli
     __threadfence();
     atomicAdd(&p.counters->h_ready[u], 1u);
   }
+  if constexpr (kTrace) {
+    st.end = global_ns();
+    st.extra = 1;
+    trace_unit(p.trace, ticket, 0, u, cb, split, st);
+  }
 }
 
-template <int K2>
-__device__ void down_unit(Shared &s, const Params &p, int u, int cb, const ignis_moe_slot &slot) {
+template <int K2, bool kTrace>
+__device__ void down_unit(Shared &s, const Params &p, int ticket, int u, int cb, const ignis_moe_slot &slot) {
+  UnitStamps st;
+  if constexpr (kTrace) st.begin = global_ns();
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tokens = p.tokens;
@@ -255,13 +274,18 @@ __device__ void down_unit(Shared &s, const Params &p, int u, int cb, const ignis
   uint32_t w[kKTiles];
   load_tiles<K2>(trellis + static_cast<size_t>(8 * cb + warp) * words, tiles_n * words, w);
   if (threadIdx.x == 0) {
+    unsigned long long w0 = 0;
+    if constexpr (kTrace) w0 = global_ns();
     while (ld_acquire(&p.counters->h_ready[u]) < static_cast<uint32_t>(kGateUpBlocks)) __nanosleep(64);
+    if constexpr (kTrace) st.extra = global_ns() - w0;
   }
   __syncthreads();
   const float *h = p.h + static_cast<size_t>(u) * p.cap * kInter;
   prepare_a(s, tokens, suh, [&](int t, int k) { return __ldcg(h + static_cast<size_t>(t) * kInter + k); });
+  if constexpr (kTrace) st.ready = global_ns();
   float acc[2][4] = {};
   mma_tiles<K2>(s, tokens, w, acc);
+  if constexpr (kTrace) st.mma = global_ns();
 
   float(*y)[128] = reinterpret_cast<float(*)[128]>(&s.xh[0][0]);
   const int g = lane >> 2;
@@ -291,10 +315,18 @@ __device__ void down_unit(Shared &s, const Params &p, int u, int cb, const ignis
     }
   }
   __syncthreads();
+  if constexpr (kTrace) {
+    st.end = global_ns();
+    trace_unit(p.trace, ticket, 1, u, cb, 0, st);
+  }
 }
 
+template <bool kTrace>
 __global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
   __shared__ Shared s;
+  if constexpr (kTrace) {
+    if (threadIdx.x == 0) trace_cta(p.trace)[0] = global_ns();
+  }
   build_unique(s, p.ids, p.weights, p.tokens);
   const int n_unique = s.n_unique;
   const int n_gate_up = n_unique * 2 * kGateUpBlocks * kDecodeSplits;
@@ -303,6 +335,9 @@ __global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
   __syncthreads();
   int ticket = s.ticket;
   __syncthreads();
+  if constexpr (kTrace) {
+    if (threadIdx.x == 0) trace_cta(p.trace)[1] = global_ns();
+  }
   while (ticket < n_total) {
     // The next ticket is taken now and read after this unit, so its round trip overlaps the
     // unit's work. Still deadlock-free: a CTA's prefetched ticket is later than its current one,
@@ -315,13 +350,13 @@ __global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
       const int cb = ticket / kDecodeSplits % (2 * kGateUpBlocks);
       const int split = ticket % kDecodeSplits;
       const ignis_moe_slot slot = load_slot(p.slots, s.unique_id[u], IGNIS_MOE_PROJ_GATE_UP);
-      dispatch_k2(slot.k2, [&](auto k2) { gate_up_unit<decltype(k2)::value>(s, p, u, cb, split, slot); });
+      dispatch_k2(slot.k2, [&](auto k2) { gate_up_unit<decltype(k2)::value, kTrace>(s, p, ticket, u, cb, split, slot); });
     } else {
       const int d = ticket - n_gate_up;
       const int u = d / kDownBlocks;
       const int cb = d % kDownBlocks;
       const ignis_moe_slot slot = load_slot(p.slots, s.unique_id[u], IGNIS_MOE_PROJ_DOWN);
-      dispatch_k2(slot.k2, [&](auto k2) { down_unit<decltype(k2)::value>(s, p, u, cb, slot); });
+      dispatch_k2(slot.k2, [&](auto k2) { down_unit<decltype(k2)::value, kTrace>(s, p, ticket, u, cb, slot); });
     }
     __syncthreads();
     if (threadIdx.x == 0) s.ticket = static_cast<int>(next);
@@ -330,6 +365,10 @@ __global__ void __launch_bounds__(kThreads, 2) experts_decode_kernel(Params p) {
   }
   // The last CTA out leaves the counters as it found them, so the launch replays.
   if (threadIdx.x == 0) {
+    if constexpr (kTrace) {
+      trace_cta(p.trace)[2] = global_ns();
+      trace_cta(p.trace)[3] = sm_id();
+    }
     __threadfence();
     if (atomicAdd(&p.counters->done, 1u) == gridDim.x - 1) {
       for (int u = 0; u < n_unique; ++u) p.counters->h_ready[u] = 0;
@@ -349,7 +388,7 @@ int32_t prepare_decode(int *grid) {
   int device = 0, sms = 0, per_sm = 0;
   cudaError_t err = cudaGetDevice(&device);
   if (err == cudaSuccess) err = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-  if (err == cudaSuccess) err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, experts_decode_kernel, kThreads, 0);
+  if (err == cudaSuccess) err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, experts_decode_kernel<false>, kThreads, 0);
   if (err != cudaSuccess) return fail(std::string("ignis_moe_prepare (decode): ") + cudaGetErrorString(err));
   if (per_sm <= 0) return fail("ignis_moe_prepare (decode): the decode kernel fits no CTA on an SM");
   // Every CTA resident at once when the launch runs alone; the ticket scheme does not need it,
@@ -394,22 +433,25 @@ extern "C" int32_t ignis_moe_workspace_init(const struct ignis_moe_workspace *wo
   return 0;
 }
 
-extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, const int32_t *ids,
-                                            const float *weights, const struct ignis_moe_slot *slots,
-                                            const struct ignis_moe_workspace *workspace, int64_t *acc, void *stream) {
+namespace {
+
+int32_t experts_decode(const char *op, const void *x, uint32_t tokens, const int32_t *ids, const float *weights,
+                       const struct ignis_moe_slot *slots, const struct ignis_moe_workspace *workspace, int64_t *acc,
+                       unsigned long long *trace, void *stream) {
   if (x == nullptr || ids == nullptr || weights == nullptr || slots == nullptr || acc == nullptr) {
-    return fail("ignis_moe_experts_decode: NULL pointer");
+    return fail(std::string(op) + ": NULL pointer");
   }
-  if (check_workspace("ignis_moe_experts_decode", workspace) != 0) return -1;
+  if (check_workspace(op, workspace) != 0) return -1;
   if (tokens == 0 || tokens > workspace->decode_tokens) {
-    return fail("ignis_moe_experts_decode: tokens must be 1.." + std::to_string(workspace->decode_tokens) +
+    return fail(std::string(op) + ": tokens must be 1.." + std::to_string(workspace->decode_tokens) +
                 " (the workspace's decode_tokens)");
   }
   DecodeLaunch launch;
-  if (require_prepared("ignis_moe_experts_decode", &launch) != 0) return -1;
+  if (require_prepared(op, &launch) != 0) return -1;
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (workspace->decode_route == IGNIS_MOE_DECODE_CLUSTERS) {
-    if (launch.cluster_size == 0) return fail("ignis_moe_experts_decode: this device runs no decode cluster");
+    if (trace != nullptr) return fail(std::string(op) + ": the clusters route has no trace");
+    if (launch.cluster_size == 0) return fail(std::string(op) + ": this device runs no decode cluster");
     return decode_clusters(launch.cluster_size, static_cast<const __nv_bfloat16 *>(x), static_cast<int>(tokens), ids,
                            weights, slots, reinterpret_cast<long long *>(acc), s);
   }
@@ -426,6 +468,37 @@ extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, cons
   p.gate_up = reinterpret_cast<long long *>(ws + l.decode_gate_up);
   p.h = reinterpret_cast<float *>(ws + l.decode_h);
   p.acc = reinterpret_cast<long long *>(acc);
-  experts_decode_kernel<<<launch.grid, kThreads, 0, s>>>(p);
-  return check_launch("ignis_moe_experts_decode");
+  p.trace = trace;
+  if (workspace->decode_route == IGNIS_MOE_DECODE_TICKETS && p.tokens <= kStagedMaxTokens && launch.staged_grid > 0) {
+    // The staged kernel copies x 16 bytes at a time.
+    if ((reinterpret_cast<uintptr_t>(x) & 15) != 0) return fail(std::string(op) + ": x must be 16-byte aligned");
+    if (trace != nullptr && launch.staged_grid > IGNIS_MOE_TRACE_CTAS) {
+      return fail(std::string(op) + ": the grid has more CTAs than the trace holds");
+    }
+    return decode_staged(launch.staged_grid, p.x, p.tokens, ids, weights, slots, p.counters, p.cap, p.gate_up, p.acc,
+                         trace, s);
+  }
+  if (trace != nullptr) {
+    if (launch.grid > IGNIS_MOE_TRACE_CTAS) return fail(std::string(op) + ": the grid has more CTAs than the trace holds");
+    experts_decode_kernel<true><<<launch.grid, kThreads, 0, s>>>(p);
+  } else {
+    experts_decode_kernel<false><<<launch.grid, kThreads, 0, s>>>(p);
+  }
+  return check_launch(op);
+}
+
+}  // namespace
+
+extern "C" int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, const int32_t *ids,
+                                            const float *weights, const struct ignis_moe_slot *slots,
+                                            const struct ignis_moe_workspace *workspace, int64_t *acc, void *stream) {
+  return experts_decode("ignis_moe_experts_decode", x, tokens, ids, weights, slots, workspace, acc, nullptr, stream);
+}
+
+extern "C" int32_t ignis_moe_experts_decode_trace(const void *x, uint32_t tokens, const int32_t *ids, const float *weights,
+                                                  const struct ignis_moe_slot *slots,
+                                                  const struct ignis_moe_workspace *workspace, int64_t *acc,
+                                                  unsigned long long *trace, void *stream) {
+  if (trace == nullptr) return fail("ignis_moe_experts_decode_trace: trace is NULL");
+  return experts_decode("ignis_moe_experts_decode_trace", x, tokens, ids, weights, slots, workspace, acc, trace, stream);
 }

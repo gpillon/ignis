@@ -115,12 +115,22 @@ int32_t ignis_moe_prepare(void);
  *
  * `decode_route` picks the decode kernel of the model instance that owns the workspace -- one
  * contract, held to the same fp64 bounds -- and is chosen with it, at load:
- *   IGNIS_MOE_DECODE_TICKETS   (0) one persistent launch of work units taken by ticket;
+ *   IGNIS_MOE_DECODE_TICKETS   (0) one persistent launch of work items taken by ticket: up to 4
+ *                                  tokens, one CTA per SM whose producer warps stream each item's
+ *                                  weights into shared memory ahead of its compute warps
+ *                                  (GitHub #306); past 4 tokens, or on a device the staged kernel
+ *                                  does not fit, the register kernel below;
  *   IGNIS_MOE_DECODE_CLUSTERS  (1) one thread-block cluster per selected expert, its reductions
- *                                  in distributed shared memory (needs no workspace regions).
- * A captured graph keeps the kernel it was captured with. */
+ *                                  in distributed shared memory (needs no workspace regions);
+ *   IGNIS_MOE_DECODE_REGISTERS (2) the tickets route before #306, at every width: work units that
+ *                                  hold their weights in registers, two CTAs per SM.
+ * The routes differ only in where partial sums are rounded (fp32 inside a work item, exact fixed
+ * point across items), within the same fp64 bounds. A captured graph keeps the kernel it was
+ * captured with. Flash-Next loads REGISTERS (the staged kernel measured within noise served, GitHub
+ * #306 step 8); IGNIS_FN_MOE_STAGED=1 at load selects TICKETS. */
 #define IGNIS_MOE_DECODE_TICKETS 0
 #define IGNIS_MOE_DECODE_CLUSTERS 1
+#define IGNIS_MOE_DECODE_REGISTERS 2
 struct ignis_moe_workspace {
   void *base;
   uint32_t decode_tokens;
@@ -166,7 +176,9 @@ int32_t ignis_moe_plan_bytes(uint32_t decode_tokens, uint32_t prefill_tokens,
  * slot table.
  *
  * Decode route: 1..workspace->decode_tokens tokens in ONE launch for all experts and all four K:
- * gate/up, SwiGLU, down and the weighted accumulation. Prefill route: 1..prefill_tokens tokens;
+ * gate/up, SwiGLU, down and the weighted accumulation. On IGNIS_MOE_DECODE_TICKETS at up to 4
+ * tokens `x` must be 16-byte aligned (the staged kernel copies it 16 bytes at a time; an
+ * unaligned `x` is refused). Prefill route: 1..prefill_tokens tokens;
  * they are grouped by expert on the device and each projection family runs as one launch over
  * all experts. */
 int32_t ignis_moe_experts_decode(const void *x, uint32_t tokens, const int32_t *ids,

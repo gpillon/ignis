@@ -85,9 +85,10 @@ inline int32_t check_workspace(const char *op, const ignis_moe_workspace *ws) {
     return fail(std::string(op) + ": workspace decode_tokens must be 1.." + std::to_string(kDecodeMaxTokens));
   }
   if (ws->prefill_tokens == 0) return fail(std::string(op) + ": workspace prefill_tokens must be at least 1");
-  if (ws->decode_route != IGNIS_MOE_DECODE_TICKETS && ws->decode_route != IGNIS_MOE_DECODE_CLUSTERS) {
+  if (ws->decode_route != IGNIS_MOE_DECODE_TICKETS && ws->decode_route != IGNIS_MOE_DECODE_CLUSTERS &&
+      ws->decode_route != IGNIS_MOE_DECODE_REGISTERS) {
     return fail(std::string(op) + ": workspace decode_route " + std::to_string(ws->decode_route) +
-                " is neither IGNIS_MOE_DECODE_TICKETS nor IGNIS_MOE_DECODE_CLUSTERS");
+                " is none of IGNIS_MOE_DECODE_TICKETS, IGNIS_MOE_DECODE_CLUSTERS, IGNIS_MOE_DECODE_REGISTERS");
   }
   return 0;
 }

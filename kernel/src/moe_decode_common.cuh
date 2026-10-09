@@ -1,5 +1,6 @@
-// ignis kernel leaf: what Flash-Next's two routed-expert decode kernels share -- OURS
-// (kernel/include/ignis_moe.h; moe_decode.cu, moe_decode_cluster.cu). Leaf-internal.
+// ignis kernel leaf: what Flash-Next's routed-expert decode kernels share -- OURS
+// (kernel/include/ignis_moe.h; moe_decode.cu, moe_decode_staged.cu, moe_decode_cluster.cu).
+// Leaf-internal.
 #ifndef IGNIS_MOE_DECODE_COMMON_CUH
 #define IGNIS_MOE_DECODE_COMMON_CUH
 
@@ -9,6 +10,16 @@
 #include <cstdint>
 
 namespace ignis_moe {
+
+// The widest call the staged kernel (moe_decode_staged.cu) serves; a wider one on the tickets
+// route takes the register kernel (moe_decode.cu).
+constexpr int kStagedMaxTokens = 4;
+
+__device__ __forceinline__ uint32_t ld_acquire(const uint32_t *p) {
+  uint32_t v;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
 
 // The distinct experts of the call in order of first appearance (token-major, rank order),
 // with each token's routing weight for them and the mask of tokens that selected them, into the

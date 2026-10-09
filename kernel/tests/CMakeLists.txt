@@ -576,7 +576,7 @@ add_test(NAME ignis_kernel_seq_checkpoint_test COMMAND ignis_kernel_seq_checkpoi
 # test here (ADR 0006).
 set(IGNIS_FLASH_NEXT_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next")
 foreach(name IN ITEMS trellis_decode moe_router moe_experts fp8_linear moe_shared_combine moe_block
-                     moe_prepare)
+                     moe_prepare moe_decode_routes)
   add_executable(ignis_kernel_${name}_test test_${name}.cu)
   target_compile_definitions(ignis_kernel_${name}_test PRIVATE
     IGNIS_FLASH_NEXT_FIXTURE_DIR="${IGNIS_FLASH_NEXT_FIXTURE_DIR}")
@@ -589,13 +589,15 @@ endforeach()
 add_executable(ignis_kernel_moe_slot_trap_test test_moe_slot_trap.cu)
 target_link_libraries(ignis_kernel_moe_slot_trap_test PRIVATE ignis_kernel ignis_vendor)
 foreach(mode IN ITEMS decode prefill decode-id prefill-id decode-nan decode-clusters decode-id-clusters
-                     decode-nan-clusters)
+                     decode-nan-clusters decode-registers decode-id-registers decode-nan-registers)
   add_test(NAME ignis_kernel_moe_slot_trap_${mode}_test COMMAND ignis_kernel_moe_slot_trap_test ${mode})
 endforeach()
-# The decode route's second implementation (IGNIS_MOE_DECODE_CLUSTERS, one thread-block cluster
-# per expert) held to the same tests as the default.
+# The decode route's other implementations (IGNIS_MOE_DECODE_CLUSTERS, one thread-block cluster
+# per expert; IGNIS_MOE_DECODE_REGISTERS, the ticket kernel before #306) held to the same tests as
+# the default.
 foreach(name IN ITEMS moe_experts moe_block)
   add_test(NAME ignis_kernel_${name}_clusters_test COMMAND ignis_kernel_${name}_test clusters)
+  add_test(NAME ignis_kernel_${name}_registers_test COMMAND ignis_kernel_${name}_test registers)
 endforeach()
 # The MoE microbenchmark: a report of every op's achieved bandwidth or throughput. The spec's
 # decode floor (one-token routed decode >= 50% of the DRAM roofline) is its one pass/fail,
