@@ -175,14 +175,14 @@ three lanes ~100 s, one timing hold, order A B A B (`.scratch/experts8b/aba/`):
 | base A1 / A2 | 112.3 / 112.0 | 93.5 / 92.8 | 104.9 / 104.1 | 103.3 | 115.6 / 114.0 |
 | staged B1 / B2 | 111.1 / 112.7 | 93.3 / 93.3 | 99.1 / 99.4 | 101.5 | 116.4 / 117.2 |
 
-- One lane: -1.7% on the mean (text 1 -0.2%, text 2 +0.2%, text 3 -5.3%); the pairs agree within
-  1% on texts 1 and 2 and on text 3 both staged runs are below both base runs.
+- One lane: -1.7% on the mean (text 1 -0.2%, text 2 +0.2%, text 3 -5.0%); the pairs agree within
+  1.5% on texts 1 and 2 and on text 3 both staged runs are below both base runs.
 - Three lanes: +1.7% (116.8 against 114.8), inside what two runs of the same binary differ by
   (base 115.6 / 114.0).
 - **The texts differ from the base's on all three prompts** (text hashes `3cac40`, `531baf`,
   `012c19` become `91645a`, `32f941`, `e24284`); the staged route is deterministic (B1 = B2, and
   the three lanes agree with the one-lane run). Text 3 also runs a different text, so its 5% mixes
-  the kernel with a different expert-miss pattern (62 against 60 MB moved per token).
+  the kernel with a different expert-miss pattern (over all three texts 62 against 60 MB moved per token).
 - The build with the register kernel selected by default (this branch's final state) gives the
   base's three hashes exactly (`D1`).
 
@@ -204,7 +204,7 @@ three lanes ~100 s, one timing hold, order A B A B (`.scratch/experts8b/aba/`):
 **NO-GO.** The pre-registered rule asked for +1.5% served at one lane with three lanes no worse
 than -1% and identical (or tolerance-documented) texts. The staged kernel takes a routed-expert
 layer from 25.4 to 20.9 µs at one token, 53.0 to 46.2 at three (-18%, -13%), but served at one lane
-it is -1.7% on the mean (two of three texts within 0.3%) and three lanes +1.7% within run-to-run
+it is -1.7% on the mean (two of three texts within 0.3%, the third -5.0%) and three lanes +1.7% within run-to-run
 spread; it is not bit-exact with the register kernel (relative L2 3e-5..5e-5, equal against fp64
 and against the recorded activations) and that moves every text. The staged route therefore stays
 off: `IGNIS_FN_MOE_STAGED=1` selects it, the load's default is the register kernel
@@ -243,3 +243,7 @@ prefetch join's wait; both are untested here.
   launch) re-run the same A-B-A.
 - `flash_next_serving_gpu`'s two loading tests need >= 48.5 GB of available host memory; they
   were not run here.
+- Known, not fixed because the route ships off: `ignis_moe_prepare` turns a staged-kernel
+  `cudaFuncSetAttribute` failure into "does not fit" and runs the register kernel under
+  `IGNIS_MOE_DECODE_TICKETS` without an error; one `__shared__ uint32_t` in `reduce_item` is outside
+  the `sizeof(Shared)` budget assertion (4 bytes). Fix both before the route is ever turned on.

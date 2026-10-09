@@ -64,11 +64,13 @@ std::size_t aligned(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 // The routed experts' decode kernel (#306 step 8). The register kernel is the default: the staged
 // one is faster alone (20.9 against 25.4 us a layer at one token) but served it is within noise
 // and its reduction order moves every text (docs/findings/2026-10-08-flash-next-routed-experts-
-// staged.md). IGNIS_FN_MOE_STAGED=1 opts in to it, read at program build; a captured graph keeps
-// the kernel it was captured with.
+// staged.md). IGNIS_FN_MOE_STAGED=1 opts in to it, read once per process.
 uint32_t moe_decode_route() {
-  const char *env = std::getenv("IGNIS_FN_MOE_STAGED");
-  return env != nullptr && env[0] == '1' ? IGNIS_MOE_DECODE_TICKETS : IGNIS_MOE_DECODE_REGISTERS;
+  static const uint32_t route = [] {
+    const char *env = std::getenv("IGNIS_FN_MOE_STAGED");
+    return env != nullptr && env[0] == '1' ? IGNIS_MOE_DECODE_TICKETS : IGNIS_MOE_DECODE_REGISTERS;
+  }();
+  return route;
 }
 
 // The rows of a span-logits block (the measurement readout): the head over this many rows at a
