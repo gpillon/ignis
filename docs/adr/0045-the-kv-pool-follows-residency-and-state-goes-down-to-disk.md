@@ -379,8 +379,9 @@ tokens, 38,912 by default, its reasoning included (owner, 2026-10-08).**
   - Reaching it ends the request `finish_reason: "length"` (`incomplete` with
     `max_output_tokens` on `/v1/responses`).
   - Reasoning tokens count inside it, as they do inside `max_tokens`. The
-    default thinking budget (6,144) and its 2,048-token answer reserve sit
-    well within it.
+    default thinking budget (6,144 when this was written; 32,768 since
+    2026-10-09) and its 2,048-token answer reserve sit within it: 32,768 is
+    under the 36,864 the reserve leaves at the 38,912 default.
 - **An explicit cap always wins.** An explicit cap is still bounded by
   `--max-context`: past it, it is refused as today. `ignore_eos` still needs an
   explicit `max_tokens`. A decision or a constrained decode keeps its own

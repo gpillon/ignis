@@ -425,8 +425,9 @@ marked *(growth)* or *(fixed)* is built only on that branch of P0's gate.
       both models. AC 28 tests the same value against the reservation, on
       whichever branch P0 chose.
     - With thinking on, the reasoning tokens count inside the cap. The default
-      thinking budget still forces its close at 6,144 and keeps its 2,048-token
-      answer reserve.
+      thinking budget (6,144 when this was written, 32,768 since 2026-10-09)
+      still forces its close at that value and keeps its 2,048-token answer
+      reserve inside the cap.
     - A prompt that leaves less than 38,912 of the context gets what is left,
       and is not refused. A prompt that fills the context alone is refused, as
       today.

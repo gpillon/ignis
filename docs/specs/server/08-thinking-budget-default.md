@@ -61,6 +61,12 @@ The server ships with a measured thinking budget on by default:
 ## Implementation Decisions
 
 - **The default value.**
+  - **Amended 2026-10-09 (owner):** the shipped default is **32,768**. The 6,144
+    measured below cost ~8-9 points on GPQA Diamond (82.8% against ~91% unbudgeted
+    on its first 22 questions; it force-closed 63% of GPQA and 47% of IFBench
+    requests). 32,768 sits inside the 38,912 default `max_tokens` (ADR 0045) less
+    the 2,048-token answer reserve, so user story 1 still holds, at the cost of
+    longer agent turns than 6,144 gave.
   - `--thinking-budget` / `IGNIS_THINKING_BUDGET` gets a shipped default, **8192
     reasoning tokens** as the starting candidate.
   - The value is fixed by the acceptance measurement below. If that measurement favours

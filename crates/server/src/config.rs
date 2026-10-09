@@ -25,13 +25,14 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8000";
 pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 
 /// The server-wide thinking budget a request that sets none runs under, in
-/// reasoning tokens (spec server/08): what makes the template's default
-/// `xhigh` answer a coding agent's turn instead of reasoning past its
-/// `max_tokens`. Measured, not guessed: at `xhigh` it passed 26 of 32
-/// coding runs against 8,192's 23 at a sixth less median wall time
-/// (`docs/findings/2026-09-24-thinking-budget-default.md`).
+/// reasoning tokens (spec server/08): 32,768, the owner's call of 2026-10-09.
+/// It sits inside the 38,912 default cap less the 2,048-token answer reserve
+/// (36,864), so a turn at the default cap is forced closed at 32,768 and
+/// answers instead of reasoning past its cap; a smaller `max_tokens` clamps
+/// it to that cap less the reserve. The 6,144 it replaced cost ~8-9 points
+/// on GPQA Diamond (82.8% against ~91% unbudgeted on the first 22 questions).
 /// `--thinking-budget off` turns it off.
-pub const DEFAULT_THINKING_BUDGET: u32 = 6144;
+pub const DEFAULT_THINKING_BUDGET: u32 = 32_768;
 
 /// `--default-max-tokens`' default (ADR 0045, GitHub #309): what a request
 /// that names no `max_tokens` may generate, its reasoning included, on both
@@ -1827,7 +1828,7 @@ mod tests {
         // nothing of the extension still gets an answer at `xhigh`.
         let config = expect_config(resolve(&[], no_env).expect("resolve"));
         assert_eq!(config.thinking_budget, Some(DEFAULT_THINKING_BUDGET));
-        assert_eq!(DEFAULT_THINKING_BUDGET, 6144);
+        assert_eq!(DEFAULT_THINKING_BUDGET, 32_768);
         // An empty env var is an unset one, as for the other defaults.
         let config = expect_config(resolve(&[], env_map(&[("IGNIS_THINKING_BUDGET", "")])).expect("resolve"));
         assert_eq!(config.thinking_budget, Some(DEFAULT_THINKING_BUDGET));
