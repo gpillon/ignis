@@ -24,8 +24,8 @@ fn every_expert_projection_lands_in_the_pool_where_the_index_puts_it() {
     assert_eq!(layout.bytes, plan.plan.expert_pool_capacity_bytes);
 
     let mut pool = vec![0u8; layout.bytes as usize];
-    let mut file = std::fs::File::open(&artifact.path).expect("file");
-    let read = fill_expert_pool(&mut file, index, &mut pool).expect("fill");
+    // 2 layers < READ_WORKERS: exercises workers left with no layer too.
+    let read = fill_expert_pool(&artifact.path, index, &mut pool).expect("fill");
     let file_bytes = std::fs::read(&artifact.path).expect("read");
 
     let cat = catalog(index).expect("catalog");
