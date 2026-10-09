@@ -60,3 +60,16 @@ fn every_expert_projection_lands_in_the_pool_where_the_index_puts_it() {
     let used = cat.class_counts().iter().filter(|&&n| n > 0).count();
     assert!(used >= 3, "{used} of {} classes used", KClass::COUNT);
 }
+
+#[test]
+fn a_pool_too_small_for_the_last_layer_is_refused_before_any_read() {
+    let artifact = fixture::build("residency-pool-undersized").expect("fixture artifact");
+    let reader = Reader::open(&artifact.path).expect("open");
+    let plan = flash_next::bind(&reader, &FlashNextGeometry::fixture()).expect("bind");
+    let index = &plan.experts;
+    let layout = pool_layout(index);
+
+    let mut pool = vec![0u8; layout.bytes as usize - 1];
+    let err = fill_expert_pool(&artifact.path, index, &mut pool).expect_err("undersized pool");
+    assert!(err.to_string().contains("past the"), "{err}");
+}

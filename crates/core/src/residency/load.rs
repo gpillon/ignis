@@ -107,12 +107,44 @@ fn layer_pool_ranges(index: &ExpertIndex, pool_len: usize) -> std::io::Result<Ve
         }
         ranges.push((lo, hi));
     }
+    check_ranges_ascending_and_disjoint(&ranges)?;
+    Ok(ranges)
+}
+
+/// `Err` unless every range starts at or after the previous one's end
+/// (ascending, non-overlapping; a gap between two is fine). Split out of
+/// [`layer_pool_ranges`] so the check itself -- an invariant of the
+/// artifact's own index, not reachable through any public constructor --
+/// is still testable on hand-built ranges.
+fn check_ranges_ascending_and_disjoint(ranges: &[(u64, u64)]) -> std::io::Result<()> {
     for i in 1..ranges.len() {
         if ranges[i].0 < ranges[i - 1].1 {
             return Err(std::io::Error::other(format!("layer {i}'s pool range overlaps layer {}'s", i - 1)));
         }
     }
-    Ok(ranges)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_ranges_ascending_and_disjoint;
+
+    #[test]
+    fn ascending_ranges_with_a_gap_are_fine() {
+        check_ranges_ascending_and_disjoint(&[(0, 10), (10, 20), (25, 30)]).expect("no overlap");
+    }
+
+    #[test]
+    fn an_empty_or_single_range_is_fine() {
+        check_ranges_ascending_and_disjoint(&[]).expect("empty");
+        check_ranges_ascending_and_disjoint(&[(5, 9)]).expect("single");
+    }
+
+    #[test]
+    fn an_overlapping_range_is_refused() {
+        let err = check_ranges_ascending_and_disjoint(&[(0, 10), (5, 20)]).expect_err("overlap");
+        assert!(err.to_string().contains("overlaps"), "{err}");
+    }
 }
 
 /// Reads one layer's projections from `file` into `slice`, `slice[0]`

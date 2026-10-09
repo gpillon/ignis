@@ -57,9 +57,10 @@ fn leaf_error(context: &str, message: String) -> i32 {
 }
 
 /// One phase of [`FlashNextLeaf::open`] (`docs/findings/2026-10-09-flash-next-expert-pool-parallel-read.md`):
-/// `"bind"`, `"device_weights"`, `"mtp"` and `"ngram"` run on the
-/// `Reader`-owning thread, in that order; `"residency"` runs concurrently
-/// with all four on the opening thread.
+/// `"bind"`, `"device_weights"`, `"residency"`, `"mtp"` and `"ngram"` run in
+/// that order on the opening thread. An earlier attempt ran `"residency"`
+/// concurrently with the rest on a second thread; it measured slower (the
+/// finding's "overlapped load, NO-GO"), so every phase is sequential.
 fn log_load_phase(phase: &'static str, elapsed: std::time::Duration) {
     // hotpath-lint-allow: one line per model load, not the request hot path.
     tracing::info!(
