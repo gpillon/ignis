@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -59,6 +60,16 @@ namespace ignis::flash_next {
 namespace {
 
 std::size_t aligned(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
+
+// The routed experts' decode kernel (#306 step 8). The register kernel is the default: the staged
+// one is faster alone (20.9 against 25.4 us a layer at one token) but served it is within noise
+// and its reduction order moves every text (docs/findings/2026-10-08-flash-next-routed-experts-
+// staged.md). IGNIS_FN_MOE_STAGED=1 opts in to it, read at program build; a captured graph keeps
+// the kernel it was captured with.
+uint32_t moe_decode_route() {
+  const char *env = std::getenv("IGNIS_FN_MOE_STAGED");
+  return env != nullptr && env[0] == '1' ? IGNIS_MOE_DECODE_TICKETS : IGNIS_MOE_DECODE_REGISTERS;
+}
 
 // The rows of a span-logits block (the measurement readout): the head over this many rows at a
 // time, their logits in the chunk's scratch, then copied out.
@@ -400,7 +411,7 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
       }
     }
     const ignis_moe_slot *slots = ignis_residency_slot_table(fn.residency, static_cast<uint32_t>(l));
-    ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
+    ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens, moe_decode_route()};
     const int32_t experts =
         phase == IGNIS_RESIDENCY_DECODE
             ? ignis_moe_experts_decode(x, static_cast<uint32_t>(rows), ids, weights, slots, &workspace, acc, stream)
@@ -452,7 +463,7 @@ int32_t mtp_entries(FlashNextModel &fn, const Context &ctx, const Batch &batch, 
   b.x = fn.x->p;
   b.y = fn.y->p;
   b.inj = static_cast<float *>(fn.injections->p);
-  b.workspace = ignis_moe_workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
+  b.workspace = ignis_moe_workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens, moe_decode_route()};
   b.acc = static_cast<int64_t *>(fn.moe_acc->p);
   b.router_ids = static_cast<int32_t *>(fn.router_ids->p);
   b.router_weights = static_cast<float *>(fn.router_weights->p);
@@ -752,7 +763,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
       return -1;
     }
   }
-  ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
+  ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens, moe_decode_route()};
   if (ignis_moe_workspace_init(&workspace, static_cast<int64_t *>(fn.moe_acc->p), model.stream) != 0) {
     *error = std::string("ignis_moe_workspace_init: ") + ignis_moe_last_error();
     return -1;

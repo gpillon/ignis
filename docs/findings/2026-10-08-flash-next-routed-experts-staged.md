@@ -1,4 +1,4 @@
-# Flash-Next routed experts at decode: staging each SM's work items through shared memory takes a layer from 25.4 to 20.9 µs at one token and 53.0 to 46.2 at three; the launch's first bytes and the gate/up-to-down barrier hold most of what is left
+# Flash-Next routed experts at decode: staging each SM's work items through shared memory takes a layer from 25.4 to 20.9 µs at one token alone, but served it is within noise and moves every text, so it ships off (NO-GO)
 
 - Kind: experiment
 - Status: current
@@ -58,7 +58,7 @@ step). Eight traced calls inside a graph of 64; the median call
 
 ### 2. The design
 
-`IGNIS_MOE_DECODE_TICKETS` (the load's default route) now runs, up to 4 tokens, one CTA per SM
+`IGNIS_MOE_DECODE_TICKETS` (opt-in: `IGNIS_FN_MOE_STAGED=1`; see the verdict) runs, up to 4 tokens, one CTA per SM
 with three roles on their own warps, handing work items along through shared memory
 (`moe_decode_staged.cu`, 896 threads, 71 registers, ~99 KB of shared memory at 4 tokens):
 
@@ -128,7 +128,13 @@ few of h's 640 entries by one ulp (2^-11); each flip moves the token's output by
   L2, 6.15e-5 max. Bound asserted: 2e-4 L2, 1e-3 max. Five and eight tokens on the tickets
   route give the register kernel's bits; reruns, records in other slots and two graph replays
   are bit-equal.
-- `moe_artifact_gpu` on real weights (layers 2, 24, 46): (pending: run 6)
+- `moe_artifact_gpu` on real weights (layers 2, 24, 46; `moe-artifact-gpu.log`), 3 of 3 pass: 30
+  experts alone differ staged against registers by 4.5e-5 worst relative L2 (max 5.4e-5), 12 calls
+  of 1-4 tokens by 3.1e-5 (max 4.2e-5); the 48 full-shape projections stay bit-exact against the
+  converter's checksums; against the recorded activations the decode block is 5.73e-3 / 5.71e-3
+  (layer 2), 6.671e-3 on both (layer 24), 6.721e-3 / 6.722e-3 (layer 46), staged / registers. **The
+  staged kernel is not bit-exact with the register kernel**; both are equally far from the recorded
+  activations.
 - The kernel CTests (`ctest -R "moe|trellis"`, 22 tests, including the moe_experts/moe_block
   arms and slot traps on the registers route): all pass (`ctest-moe-run5.log`).
 
@@ -159,19 +165,65 @@ operand 25%; the aux warps' stage wait has a median of 1.2 µs, and a gate/up it
 
 ### 5. Served A-B-A
 
-(pending: after the decode fusions reach main)
+Base `8b67773` (main, decode fusions merged) against this branch with the staged route, release
+builds, Flash-Next with the fusion study's flags (`rate.sh`: 262,144 context, 3 lanes, 8192 chunk,
+`--kv-host-pool-bytes 0 --retained-host 0`), three distinct greedy 1,800-token texts, one lane then
+three lanes ~100 s, one timing hold, order A B A B (`.scratch/experts8b/aba/`):
+
+| tok/s | text 1 | text 2 | text 3 | mean | 3 lanes (aggregate) |
+|---|---:|---:|---:|---:|---:|
+| base A1 / A2 | 112.3 / 112.0 | 93.5 / 92.8 | 104.9 / 104.1 | 103.3 | 115.6 / 114.0 |
+| staged B1 / B2 | 111.1 / 112.7 | 93.3 / 93.3 | 99.1 / 99.4 | 101.5 | 116.4 / 117.2 |
+
+- One lane: -1.7% on the mean (text 1 -0.2%, text 2 +0.2%, text 3 -5.3%); the pairs agree within
+  1% on texts 1 and 2 and on text 3 both staged runs are below both base runs.
+- Three lanes: +1.7% (116.8 against 114.8), inside what two runs of the same binary differ by
+  (base 115.6 / 114.0).
+- **The texts differ from the base's on all three prompts** (text hashes `3cac40`, `531baf`,
+  `012c19` become `91645a`, `32f941`, `e24284`); the staged route is deterministic (B1 = B2, and
+  the three lanes agree with the one-lane run). Text 3 also runs a different text, so its 5% mixes
+  the kernel with a different expert-miss pattern (62 against 60 MB moved per token).
+- The build with the register kernel selected by default (this branch's final state) gives the
+  base's three hashes exactly (`D1`).
 
 ### 6. Gates
 
-(pending: `flash_next_forward_gpu` (G1), `moe_artifact_gpu`, `cargo test --workspace`)
+- `test_moe_decode_routes` (CTest) and `ignis_kernel_moe_bench` on layer 24's records: staged
+  23.2 / 32.3 / 50.1 µs at 1 / 2 / 3 tokens against the register kernel's 26.4 / 37.1 / 52.3 in
+  this session (`real-L24.log`; -12%, -13%, -4%, a smaller gap than the table above at one and three
+  tokens: the figures move a few µs between sessions).
+- `flash_next_forward_gpu` (G1: decode agrees with prefill, determinism, graph replay): 3 of 3
+  pass on the staged route (230 s) and on the final default, the register route (209 s).
+- `flash_next_serving_gpu`: the default-plan test passes; the other two **did not run**: this host
+  had 43-46 GB of memory available and the load's host plan needs 48.5 GB with its 6 GiB margin.
+  The served A-B-A above stands in as the end-to-end check.
+- `cargo test --workspace`: 2,553 passed, 0 failed, 6 ignored; `cargo check --workspace --features cuda --tests` clean.
 
 ## Finding
 
-(pending)
+**NO-GO.** The pre-registered rule asked for +1.5% served at one lane with three lanes no worse
+than -1% and identical (or tolerance-documented) texts. The staged kernel takes a routed-expert
+layer from 25.4 to 20.9 µs at one token, 53.0 to 46.2 at three (-18%, -13%), but served at one lane
+it is -1.7% on the mean (two of three texts within 0.3%) and three lanes +1.7% within run-to-run
+spread; it is not bit-exact with the register kernel (relative L2 3e-5..5e-5, equal against fp64
+and against the recorded activations) and that moves every text. The staged route therefore stays
+off: `IGNIS_FN_MOE_STAGED=1` selects it, the load's default is the register kernel
+(`IGNIS_MOE_DECODE_REGISTERS`), whose served texts match the base's bit for bit.
+
+The microbenchmark gain does not reach the token: 4.5 µs a layer is ~0.2 ms of a ~9.5 ms one-lane
+token at most (~2%), and the isolated kernel owns the whole card, while in the round it shares it
+with the shared expert's branch and the lookahead router, and a CTA per SM with ~99 KB of shared
+memory cannot start on an SM their CTAs occupy. This study did not separate that cause from the
+prefetch join's wait; both are untested here.
 
 ## Implications
 
-(pending)
+- The decode round's remaining ~4 ms above the bandwidth floor is not in this kernel's own time:
+  taking 18% off an isolated routed-expert layer returned nothing measurable. The next lever is
+  how the kernel sits in the round (overlap with the shared expert, the residency join), not its
+  inner loop.
+- A kernel microbench alone is no evidence for a served gain here; the decision rule needs the
+  A-B-A.
 
 ## Limits and unknowns
 
@@ -184,4 +236,10 @@ operand 25%; the aux warps' stage wait has a median of 1.2 µs, and a gate/up it
 
 ## Follow-ups
 
-(pending)
+- Overlap test: run the staged kernel with the shared-expert branch serialised and the round's
+  stream trace, to see whether the CTA residency conflict is the cause (not run).
+- The staged kernel stays in tree behind `IGNIS_FN_MOE_STAGED=1` with its CTests; if a later
+  change frees the SMs (a smaller shared-memory ring, or the shared expert folded into the same
+  launch) re-run the same A-B-A.
+- `flash_next_serving_gpu`'s two loading tests need >= 48.5 GB of available host memory; they
+  were not run here.

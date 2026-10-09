@@ -126,7 +126,8 @@ int32_t ignis_moe_prepare(void);
  *                                  hold their weights in registers, two CTAs per SM.
  * The routes differ only in where partial sums are rounded (fp32 inside a work item, exact fixed
  * point across items), within the same fp64 bounds. A captured graph keeps the kernel it was
- * captured with. */
+ * captured with. Flash-Next loads REGISTERS (the staged kernel measured within noise served, GitHub
+ * #306 step 8); IGNIS_FN_MOE_STAGED=1 at load selects TICKETS. */
 #define IGNIS_MOE_DECODE_TICKETS 0
 #define IGNIS_MOE_DECODE_CLUSTERS 1
 #define IGNIS_MOE_DECODE_REGISTERS 2
