@@ -177,6 +177,15 @@ int32_t ignis_residency_step_prefetch(struct ignis_residency *r, const float *lo
 int32_t ignis_residency_step_prefetch_ranked(struct ignis_residency *r, const int32_t *lookahead,
                                              uint32_t rows, uint32_t stride);
 
+/* GitHub #306: ignis_residency_step_demand with the router's selection made in the same launch.
+ * `logits` is the router's device fp32 `[tokens][IGNIS_MOE_EXPERTS]` (ignis_moe_router_logits,
+ * enqueued just before on `stream`); the step writes the selection ignis_moe_router would write
+ * -- the same `ids` and `weights`, bit for bit -- and then resolves it as
+ * ignis_residency_step_demand resolves `ids`. Everything else is that call's. */
+int32_t ignis_residency_step_demand_routed(struct ignis_residency *r, uint32_t layer, uint32_t phase,
+                                           const float *logits, int32_t *ids, float *weights,
+                                           uint32_t tokens, void *stream, void **lookahead_stream);
+
 /* Joins the prefetch copies of the last step into `stream` (see the capture rules above).
  * Steps do it themselves at their start. After a capture that failed with a fork open, the
  * wait on its dead event fails once; the fork is forgotten either way (its copies never ran),

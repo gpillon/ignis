@@ -5,18 +5,31 @@
 // bytes (~6.6 MB of weights; GitHub #306). Every route opens with the same
 // norm: one CTA per (stream, row), which also takes the 4-output block-inject
 // matvec as per-stream partials (no single-CTA GEMV), summed in stream order
-// by whichever kernel finishes the mix. Then:
+// by whichever kernel finishes the mix -- at up to kMaxFusedRows decode rows
+// the same code runs inside the down launch instead (hc_norm_down). Then:
 // - the decode route (rows <= kDecodeRows, 4 streams): mix_down split by stream
 //   over the card, then mix_up and the stream reduce in one kernel that
 //   rebuilds the activation from the down partials in every CTA. Three
-//   launches, all wide;
+//   launches, all wide -- two at up to kMaxFusedRows rows since GitHub #306's
+//   fusion study, where every down CTA runs the norm of its own stream itself
+//   (hc_norm_down);
 // - the prefill route: mix_down and mix_up through fn_linear (tensor cores),
 //   the activation and the reduce on their own.
 // Both routes round to BF16 at the module's points (hc.h); they differ only in
 // fp32 summation order. Partials are combined in a fixed order: no atomics,
 // every replay agrees.
+//
+// The previous sublayer's inject (and, after the MoE, its combine) can ride the
+// fused decode route too (fn_hc_mix_after, GitHub #306 step 2): every down CTA
+// rebuilds its stream as the inject would have left it -- recomputing the
+// combine's gate and row where there is one -- and hc_up_reduce, which runs
+// after every down CTA has read the residual, stores it.
 
 #include "hc.h"
+
+#include "fusion.h"
+
+#include "../moe_combine.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -105,30 +118,24 @@ const __nv_bfloat16 *fp8_scales(const Linear &w) {
   return reinterpret_cast<const __nv_bfloat16 *>(static_cast<const uint8_t *>(w.data) + (codes + 255) / 256 * 256);
 }
 
-// normed[r] = grouped RMSNorm of hidden[r], (1 + w), one CTA per (stream,
-// row); with block-inject weights, part[r][s][j] = the inject matvec's output
-// j over stream s's columns only (inject_weight sums the streams).
+// One (row, stream) of the grouped RMSNorm, (1 + w), by the whole CTA: the
+// stream's `width` elements are load(i) (its BF16 values, as fp32) and `w`'s,
+// the normed row to `out` (shared memory) and, unless null, to `global`.
 // Thread t holds elements t, t + kThreads, ... and sums their squares in that
 // order (the strided loop's order). Its loads are all issued before the
-// reduce, and the inject dot reads the normed row back from shared memory in
-// 16-byte vectors: two memory round trips per CTA, not one per element.
-__global__ void hc_norm(const __nv_bfloat16 *__restrict__ hidden, const __nv_bfloat16 *__restrict__ w,
-                        const __nv_bfloat16 *__restrict__ inject, __nv_bfloat16 *__restrict__ normed,
-                        float *__restrict__ part, int32_t streams, int32_t width, float eps) {
-  __shared__ float partial[kWarps];
-  __shared__ float partials[kMaxStreams][kWarps];
-  __shared__ __align__(16) __nv_bfloat16 row_normed[kNormSpan * kThreads];
+// reduce: one memory round trip.
+template <class Load>
+__device__ __forceinline__ void norm_stream_of(Load load, const __nv_bfloat16 *__restrict__ w, __nv_bfloat16 *out,
+                                               __nv_bfloat16 *__restrict__ global, int32_t width, float eps,
+                                               float *partial) {
   const int32_t tid = static_cast<int32_t>(threadIdx.x);
-  const int32_t s = static_cast<int32_t>(blockIdx.x);
-  const std::int64_t row = blockIdx.y;
-  const std::int64_t base = (row * streams + s) * width;
   float v[kNormSpan];
   float scale[kNormSpan];
 #pragma unroll
   for (int32_t j = 0; j < kNormSpan; ++j) {
     const int32_t i = tid + j * kThreads;
-    v[j] = i < width ? __bfloat162float(hidden[base + i]) : 0.0F;
-    scale[j] = i < width ? 1.0F + __bfloat162float(w[s * width + i]) : 0.0F;
+    v[j] = i < width ? load(i) : 0.0F;
+    scale[j] = i < width ? 1.0F + __bfloat162float(w[i]) : 0.0F;
   }
   float squares = 0.0F;
 #pragma unroll
@@ -143,13 +150,28 @@ __global__ void hc_norm(const __nv_bfloat16 *__restrict__ hidden, const __nv_bfl
     const int32_t i = tid + j * kThreads;
     if (i < width) {
       const __nv_bfloat16 n = __float2bfloat16(v[j] * inv * scale[j]);
-      normed[base + i] = n;
-      row_normed[i] = n;
+      if (global != nullptr) {
+        global[i] = n;
+      }
+      out[i] = n;
     }
   }
-  if (inject == nullptr) {
-    return;
-  }
+}
+
+// norm_stream_of the stream `in` itself.
+__device__ __forceinline__ void norm_stream(const __nv_bfloat16 *__restrict__ in, const __nv_bfloat16 *__restrict__ w,
+                                            __nv_bfloat16 *out, __nv_bfloat16 *__restrict__ global, int32_t width,
+                                            float eps, float *partial) {
+  norm_stream_of([&](int32_t i) { return __bfloat162float(in[i]); }, w, out, global, width, eps, partial);
+}
+
+// The block-inject matvec over one normed (row, stream) `row_normed` (shared
+// memory, read back in 16-byte vectors): part[j] = output j over stream s's
+// columns only (inject_weight sums the streams).
+__device__ __forceinline__ void inject_partials(const __nv_bfloat16 *row_normed, const __nv_bfloat16 *__restrict__ inject,
+                                                int32_t s, int32_t streams, int32_t width, float *__restrict__ part,
+                                                float (*partials)[kWarps]) {
+  const int32_t tid = static_cast<int32_t>(threadIdx.x);
   __syncthreads();
   float dots[kMaxStreams] = {};
   const std::int64_t inject_stride = static_cast<std::int64_t>(streams) * width;
@@ -176,13 +198,31 @@ __global__ void hc_norm(const __nv_bfloat16 *__restrict__ hidden, const __nv_bfl
     }
   }
   __syncthreads();
-  if (static_cast<int32_t>(threadIdx.x) < streams) {
-    const int32_t j = static_cast<int32_t>(threadIdx.x);
+  if (tid < streams) {
     float total = 0.0F;
     for (int32_t k = 0; k < kWarps; ++k) {
-      total += partials[j][k];
+      total += partials[tid][k];
     }
-    part[(row * streams + s) * streams + j] = total;
+    part[tid] = total;
+  }
+}
+
+// normed[r] = grouped RMSNorm of hidden[r], (1 + w), one CTA per (stream,
+// row); with block-inject weights, part[r][s][j] = the inject matvec's output
+// j over stream s's columns only (inject_weight sums the streams). Two memory
+// round trips per CTA, not one per element.
+__global__ void hc_norm(const __nv_bfloat16 *__restrict__ hidden, const __nv_bfloat16 *__restrict__ w,
+                        const __nv_bfloat16 *__restrict__ inject, __nv_bfloat16 *__restrict__ normed,
+                        float *__restrict__ part, int32_t streams, int32_t width, float eps) {
+  __shared__ float partial[kWarps];
+  __shared__ float partials[kMaxStreams][kWarps];
+  __shared__ __align__(16) __nv_bfloat16 row_normed[kNormSpan * kThreads];
+  const int32_t s = static_cast<int32_t>(blockIdx.x);
+  const std::int64_t row = blockIdx.y;
+  const std::int64_t base = (row * streams + s) * width;
+  norm_stream(hidden + base, w + s * width, row_normed, normed + base, width, eps, partial);
+  if (inject != nullptr) {
+    inject_partials(row_normed, inject, s, streams, width, part + (row * streams + s) * streams, partials);
   }
 }
 
@@ -230,17 +270,28 @@ __global__ void hc_reduce(const __nv_bfloat16 *__restrict__ up, const __nv_bfloa
   }
 }
 
+// A 16-byte load of the normed rows: from global memory through the read-only
+// path, or from shared memory.
+template <bool kShared>
+__device__ __forceinline__ uint4 load16(const uint4 *p) {
+  if constexpr (kShared) {
+    return *p;
+  } else {
+    return __ldg(p);
+  }
+}
+
 // The decode route's mix_down, split by stream: part[s][t][k] = the sum over
 // stream s's columns c of W[k][c] * normed[t][c], in fp32 (an FP8 row scale is
-// applied once the streams are summed). One warp per (output k, stream s).
-template <bool kFp8>
-__global__ void hc_down_split(const void *__restrict__ w, const __nv_bfloat16 *__restrict__ normed,
-                              float *__restrict__ part, int32_t rank, int32_t streams, int32_t width,
-                              int32_t tokens) {
+// applied once the streams are summed). One warp per (output k, stream s);
+// `normed` is stream s of row 0, its rows `row_stride` apart.
+template <bool kFp8, bool kShared>
+__device__ __forceinline__ void down_split(const void *__restrict__ w, const __nv_bfloat16 *normed,
+                                           std::int64_t row_stride, float *__restrict__ part, int32_t rank,
+                                           int32_t streams, int32_t width, int32_t tokens, int32_t s) {
   const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32;
   const int32_t lane = static_cast<int32_t>(threadIdx.x) % 32;
   const int32_t k = static_cast<int32_t>(blockIdx.x) * kWarps + warp;
-  const int32_t s = static_cast<int32_t>(blockIdx.y);
   if (k >= rank) {
     return;
   }
@@ -261,9 +312,9 @@ __global__ void hc_down_split(const void *__restrict__ w, const __nv_bfloat16 *_
 #pragma unroll
       for (int32_t t = 0; t < kDecodeRows; ++t) {
         if (t < tokens) {
-          const auto *xr = reinterpret_cast<const uint4 *>(normed + t * cols + s * width) + 2 * v;
-          const uint4 x0 = __ldg(xr);
-          const uint4 x1 = __ldg(xr + 1);
+          const auto *xr = reinterpret_cast<const uint4 *>(normed + t * row_stride) + 2 * v;
+          const uint4 x0 = load16<kShared>(xr);
+          const uint4 x1 = load16<kShared>(xr + 1);
           const auto *xb0 = reinterpret_cast<const __nv_bfloat162 *>(&x0);
           const auto *xb1 = reinterpret_cast<const __nv_bfloat162 *>(&x1);
 #pragma unroll
@@ -289,7 +340,7 @@ __global__ void hc_down_split(const void *__restrict__ w, const __nv_bfloat16 *_
 #pragma unroll
       for (int32_t t = 0; t < kDecodeRows; ++t) {
         if (t < tokens) {
-          acc[t] = dot8(wv, __ldg(reinterpret_cast<const uint4 *>(normed + t * cols + s * width) + v), acc[t]);
+          acc[t] = dot8(wv, load16<kShared>(reinterpret_cast<const uint4 *>(normed + t * row_stride) + v), acc[t]);
         }
       }
     }
@@ -305,6 +356,133 @@ __global__ void hc_down_split(const void *__restrict__ w, const __nv_bfloat16 *_
   }
 }
 
+template <bool kFp8>
+__global__ void hc_down_split(const void *__restrict__ w, const __nv_bfloat16 *__restrict__ normed,
+                              float *__restrict__ part, int32_t rank, int32_t streams, int32_t width,
+                              int32_t tokens) {
+  const int32_t s = static_cast<int32_t>(blockIdx.y);
+  down_split<kFp8, false>(w, normed + static_cast<std::int64_t>(s) * width, static_cast<std::int64_t>(streams) * width,
+                          part, rank, streams, width, tokens, s);
+}
+
+// What the fused down launch adds to the residual as it reads it (GitHub #306,
+// step 2): the previous sublayer's inject, hidden_s + bf16(y * inj_s), y the
+// sublayer's BF16 output -- or, with `acc`, the MoE combine of acc, shared, x
+// and w_gate (ignis_moe_combine's operands, its code), which stream 0's writer
+// CTA also stores to `y` for hc_up_reduce. Null `inj`: nothing pending.
+struct PendingArgs {
+  __nv_bfloat16 *y = nullptr;
+  const float *inj = nullptr;
+  const long long *acc = nullptr;
+  const float *shared = nullptr;
+  const __nv_bfloat16 *x = nullptr;
+  const __nv_bfloat16 *w_gate = nullptr;
+};
+
+// The folded combine runs ignis_moe_combine's own gate and value (moe_combine.cuh), whose
+// reduction order is written for the CTA this kernel launches.
+static_assert(kThreads == ignis_moe::kCombineThreads, "the folded combine's gate needs the combine's CTA");
+
+// The decode route's norm and mix_down in one launch (GitHub #306, the fusion
+// study). CTA (b, s) of the down split first normalizes stream s of every row
+// into shared memory with hc_norm's own code, then takes hc_down_split's
+// outputs from there: its partials are hc_down_split's, bit for bit. The last
+// CTA of each stream (b == gridDim.x - 1, past the down split's blocks) writes
+// the normed rows hc_up_reduce reads and the inject partials, as hc_norm does.
+// With a pending inject every CTA rebuilds its stream as hc_inject_kernel (and
+// combine_kernel) would have left it, value for value; hc_up_reduce stores it.
+// The pending kind is a template parameter so the rebuild's loads stay free of
+// stores and branches: the norm issues them all before its reduce, one memory
+// round trip (a runtime branch with the combined y's store inside serialized
+// them: the folded mix ran 3.8 us slower than the inject and the mix apart).
+// Dynamic shared memory: the rows' normed stream, tokens * width BF16.
+enum PendingKind : int { kNothing = 0, kInject = 1, kCombine = 2 };
+
+template <bool kFp8, PendingKind kPending>
+__global__ void hc_norm_down(const __nv_bfloat16 *__restrict__ hidden, const __nv_bfloat16 *__restrict__ w_norm,
+                             const __nv_bfloat16 *__restrict__ inject, const void *__restrict__ w_down,
+                             __nv_bfloat16 *__restrict__ normed, float *__restrict__ inject_part,
+                             float *__restrict__ down_part, int32_t rank, int32_t streams, int32_t width,
+                             int32_t tokens, float eps, PendingArgs p) {
+  extern __shared__ __align__(16) unsigned char fused_smem[];
+  __shared__ float partial[kWarps];
+  __shared__ float partials[kMaxStreams][kWarps];
+  __shared__ float gate_slot;
+  auto *rows_normed = reinterpret_cast<__nv_bfloat16 *>(fused_smem);
+  const int32_t s = static_cast<int32_t>(blockIdx.y);
+  const bool writer = blockIdx.x == gridDim.x - 1;
+  for (int32_t t = 0; t < tokens; ++t) {
+    const std::int64_t base = (static_cast<std::int64_t>(t) * streams + s) * width;
+    if constexpr (kPending == kNothing) {
+      norm_stream(hidden + base, w_norm + s * width, rows_normed + t * width, writer ? normed + base : nullptr, width,
+                  eps, partial);
+    } else {
+      const std::int64_t row = static_cast<std::int64_t>(t) * width;
+      float gate = 0.0F;
+      if constexpr (kPending == kCombine) {
+        gate = ignis_moe::combine_gate(p.x + row, p.w_gate, partial, &gate_slot);
+      }
+      const float injection = __ldg(p.inj + t * streams + s);
+      // The combine's BF16 row, as combine_kernel stores it.
+      const auto combined = [&](int32_t i) {
+        return ignis_moe::combine_value(gate, __ldg(p.shared + row + i), __ldg(p.acc + row + i));
+      };
+      const auto load = [&](int32_t i) {
+        float y;
+        if constexpr (kPending == kCombine) {
+          y = __bfloat162float(combined(i));
+        } else {
+          y = __bfloat162float(__ldg(p.y + row + i));
+        }
+        return bf(__bfloat162float(hidden[base + i]) + bf(y * injection));
+      };
+      norm_stream_of(load, w_norm + s * width, rows_normed + t * width, writer ? normed + base : nullptr, width, eps,
+                     partial);
+      if constexpr (kPending == kCombine) {
+        // Stream 0's writer stores the combined row for hc_up_reduce, after the batch of loads.
+        if (writer && s == 0) {
+          for (int32_t i = static_cast<int32_t>(threadIdx.x); i < width; i += kThreads) {
+            p.y[row + i] = combined(i);
+          }
+        }
+      }
+    }
+    if (writer && inject != nullptr) {
+      inject_partials(rows_normed + t * width, inject, s, streams, width,
+                      inject_part + (static_cast<std::int64_t>(t) * streams + s) * streams, partials);
+    }
+  }
+  if (writer) {
+    return;
+  }
+  __syncthreads();
+  down_split<kFp8, true>(w_down, rows_normed, width, down_part, rank, streams, width, tokens, s);
+}
+
+// The fused down kernel of a weight format for a pending kind.
+template <bool kFp8>
+decltype(&hc_norm_down<kFp8, kNothing>) norm_down_kernel(PendingKind kind) {
+  return kind == kNothing ? hc_norm_down<kFp8, kNothing>
+                          : kind == kInject ? hc_norm_down<kFp8, kInject> : hc_norm_down<kFp8, kCombine>;
+}
+
+// The decode route folds the norm into its down launch unless switched off (fusion.h,
+// IGNIS_FN_HC_FUSED).
+bool decode_fused() { return fused(Fusion::HcNorm); }
+
+// The rows the fused launch takes: every down CTA normalizes each row in turn,
+// so past three rows the serial norms cost what the saved launch did
+// (bench_flash_next_hc, 2026-10-08: 1 row 14.2 -> 10.6 us, 3 rows 18.1 ->
+// 16.5, 4 rows 19.9 -> 20.1, 8 rows 27.7 -> 35.3); past it the norm keeps its
+// own launch.
+constexpr int32_t kMaxFusedRows = 3;
+// Its dynamic shared memory, the rows' normed stream, inside the default 48 KiB
+// with the kernel's static arrays.
+static_assert(kMaxFusedRows * kNormSpan * kThreads * sizeof(__nv_bfloat16) +
+                      (kWarps + kMaxStreams * kWarps + 1) * sizeof(float) <=
+                  48 * 1024,
+              "the fused norm's rows outgrow the default dynamic shared memory");
+
 // The decode route's mix_up and reduce in one pass, 16 h per CTA, two per
 // warp. Every CTA first rebuilds the activation from the down partials
 // (act = silu(bf16(bf16(down) / streams)), down = the streams' partials summed
@@ -317,7 +495,8 @@ __global__ void hc_up_reduce(const void *__restrict__ w, const __nv_bfloat16 *__
                              const float *__restrict__ down_part, const __nv_bfloat16 *__restrict__ down_scales,
                              const __nv_bfloat16 *__restrict__ normed, const float *__restrict__ inject_part,
                              __nv_bfloat16 *__restrict__ x, float *__restrict__ inj, int32_t rank, int32_t width,
-                             int32_t tokens) {
+                             int32_t tokens, PendingArgs pending, __nv_bfloat16 *__restrict__ residual,
+                             long long *__restrict__ acc_zero) {
   constexpr int32_t streams = kDecodeStreams;
   __shared__ __align__(16) float act[kDecodeRows * kMaxDecodeRank];
   for (int32_t i = static_cast<int32_t>(threadIdx.x); i < tokens * rank; i += kThreads) {
@@ -417,6 +596,20 @@ __global__ void hc_up_reduce(const void *__restrict__ w, const __nv_bfloat16 *__
       }
     }
   }
+  // A pending inject (GitHub #306, step 2): the residual the down launch rebuilt, stored, each
+  // (stream, h) by its quarter-0 lane as hc_inject_kernel would store it; with a combine, the
+  // accumulator it read zeroed for the next MoE op (ignis_moe_combine's contract), by stream 0's.
+  if (pending.inj != nullptr && quarter == 0) {
+    for (int32_t t = 0; t < tokens; ++t) {
+      const std::int64_t i = t * streams * static_cast<std::int64_t>(width) + o;
+      const float injection =
+          bf(__bfloat162float(pending.y[static_cast<std::int64_t>(t) * width + h]) * pending.inj[t * streams + s]);
+      residual[i] = __float2bfloat16(__bfloat162float(residual[i]) + injection);
+      if (acc_zero != nullptr && s == 0) {
+        acc_zero[static_cast<std::int64_t>(t) * width + h] = 0;
+      }
+    }
+  }
 }
 
 // hidden[r][s][h] = bf16(hidden + bf16(y[r][h] * inj[r][s])).
@@ -464,6 +657,8 @@ bool decode_route(const Geometry &g, const HcWeights &w, int32_t rows) {
 
 }  // namespace
 
+void fn_hc_set_decode_fused(bool on) { set_fused(Fusion::HcNorm, on); }
+
 std::size_t fn_hc_mix_scratch_bytes(const Geometry &g, int32_t rows) {
   const auto wave = static_cast<std::size_t>(std::min(rows, kWaveRows));
   const auto width = static_cast<std::size_t>(g.residual_width());
@@ -477,8 +672,79 @@ std::size_t fn_hc_mix_scratch_bytes(const Geometry &g, int32_t rows) {
          aligned(streams * decode * rank * 4);
 }
 
+namespace {
+
+// The rows the folded inject (GitHub #306, step 2) takes: one. Every down CTA rebuilds each row
+// in turn (and recomputes each row's combine gate), so the fold wins at one row and loses from
+// two (bench_flash_next_hc --fold 1|0, 2026-10-08, us a mix, inject / inject and combine: 1 row
+// 11.48 / 13.19 folded against 11.81 / 14.56 apart; 2 rows 14.33 / 19.36 against 13.71 / 16.51;
+// 3 rows 18.66 / 25.74 against 17.81 / 20.59); past it the inject runs on its own.
+constexpr int32_t kMaxFoldRows = 1;
+
+bool folds(const Geometry &g, const HcWeights &w, int32_t rows) {
+  return decode_route(g, w, rows) && rows <= kMaxFoldRows && rows <= kMaxFusedRows && decode_fused() &&
+         fused(Fusion::Inject);
+}
+
+// fn_hc_mix, and, with `pending` (only where folds() holds), the inject folded in: the fused down
+// launch rebuilds the residual, hc_up_reduce stores it to `residual` (the mix's own input) and
+// zeroes `acc_zero`.
+int32_t mix(const Geometry &g, const HcWeights &w, const void *hidden, int32_t rows, void *x, float *inj,
+            ninfer::DeviceArena &scratch, cudaStream_t stream, const PendingArgs &pending,
+            __nv_bfloat16 *residual, long long *acc_zero);
+
+}  // namespace
+
 int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int32_t rows, void *x,
                   float *inj, ninfer::DeviceArena &scratch, cudaStream_t stream) {
+  return mix(g, w, hidden, rows, x, inj, scratch, stream, PendingArgs{}, nullptr, nullptr);
+}
+
+int32_t fn_hc_flush(const Geometry &g, const PendingInject &pending, void *hidden, int32_t rows,
+                    cudaStream_t stream) {
+  if (!pending.pending()) {
+    return 0;
+  }
+  if (pending.acc != nullptr &&
+      ignis_moe_combine(pending.acc, pending.shared, pending.x, pending.w_gate, static_cast<uint32_t>(rows), pending.y,
+                        stream) != 0) {
+    fn_set_error(std::string("the MoE combine: ") + ignis_moe_last_error());
+    return -1;
+  }
+  return fn_hc_inject(g, pending.y, pending.inj, rows, hidden, stream);
+}
+
+int32_t fn_hc_mix_after(const Geometry &g, const HcWeights &w, const PendingInject &pending, void *hidden,
+                        int32_t rows, void *x, float *inj, ninfer::DeviceArena &scratch, cudaStream_t stream) {
+  if (!pending.pending() || !folds(g, w, rows)) {
+    if (fn_hc_flush(g, pending, hidden, rows, stream) != 0) {
+      return -1;
+    }
+    return fn_hc_mix(g, w, hidden, rows, x, inj, scratch, stream);
+  }
+  if (pending.y == nullptr || pending.inj == inj || pending.y == x || pending.y == hidden ||
+      (pending.acc != nullptr && (pending.shared == nullptr || pending.x == nullptr || pending.w_gate == nullptr ||
+                                  g.hidden != IGNIS_MOE_HIDDEN))) {
+    fn_set_error("fn_hc_mix_after: a pending inject needs y and the combine's operands (at the MoE's hidden width), "
+                 "and its injection weights and y apart from the mix's outputs");
+    return -1;
+  }
+  PendingArgs p;
+  p.y = static_cast<__nv_bfloat16 *>(pending.y);
+  p.inj = pending.inj;
+  p.acc = reinterpret_cast<const long long *>(pending.acc);
+  p.shared = pending.shared;
+  p.x = static_cast<const __nv_bfloat16 *>(pending.x);
+  p.w_gate = static_cast<const __nv_bfloat16 *>(pending.w_gate);
+  return mix(g, w, hidden, rows, x, inj, scratch, stream, p, static_cast<__nv_bfloat16 *>(hidden),
+             reinterpret_cast<long long *>(pending.acc));
+}
+
+namespace {
+
+int32_t mix(const Geometry &g, const HcWeights &w, const void *hidden, int32_t rows, void *x, float *inj,
+            ninfer::DeviceArena &scratch, cudaStream_t stream, const PendingArgs &pending,
+            __nv_bfloat16 *residual, long long *acc_zero) {
   if (hidden == nullptr || x == nullptr || w.hc_norm == nullptr || rows <= 0) {
     fn_set_error("fn_hc_mix: null operand or no rows");
     return -1;
@@ -522,24 +788,43 @@ int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int
     const auto *in = static_cast<const __nv_bfloat16 *>(hidden) + static_cast<std::int64_t>(first) * width;
     auto *out = static_cast<__nv_bfloat16 *>(x) + static_cast<std::int64_t>(first) * g.hidden;
     float *out_inj = with_inject ? inj + static_cast<std::int64_t>(first) * g.streams : nullptr;
-    hc_norm<<<dim3(static_cast<uint32_t>(g.streams), static_cast<uint32_t>(n)), kThreads, 0, stream>>>(
-        in, static_cast<const __nv_bfloat16 *>(w.hc_norm), block_inject, normed, inject_part, g.streams, g.hidden,
-        g.rms_norm_eps);
-    if (!launched("fn_hc_mix: norm")) {
+    const bool decode = decode_route(g, w, n);
+    const bool fused = decode && n <= kMaxFusedRows && decode_fused();
+    if (pending.inj != nullptr && (!fused || n != rows)) {
+      fn_set_error("fn_hc_mix: a folded inject outside the fused decode route");
       return -1;
     }
-    if (decode_route(g, w, n)) {
+    if (!fused) {
+      hc_norm<<<dim3(static_cast<uint32_t>(g.streams), static_cast<uint32_t>(n)), kThreads, 0, stream>>>(
+          in, static_cast<const __nv_bfloat16 *>(w.hc_norm), block_inject, normed, inject_part, g.streams, g.hidden,
+          g.rms_norm_eps);
+      if (!launched("fn_hc_mix: norm")) {
+        return -1;
+      }
+    }
+    if (decode) {
       const bool down_fp8 = w.mix_down.format == WeightFormat::Fp8RowScale;
       const bool up_fp8 = w.mix_up.format == WeightFormat::Fp8RowScale;
-      const dim3 down_grid(static_cast<uint32_t>((g.hc_rank + kWarps - 1) / kWarps), static_cast<uint32_t>(g.streams));
-      if (down_fp8) {
+      const auto down_blocks = static_cast<uint32_t>((g.hc_rank + kWarps - 1) / kWarps);
+      const dim3 down_grid(down_blocks, static_cast<uint32_t>(g.streams));
+      if (fused) {
+        // One more CTA per stream: the normed rows' and the inject partials' writer.
+        const dim3 fused_grid(down_blocks + 1, static_cast<uint32_t>(g.streams));
+        const std::size_t fused_bytes = static_cast<std::size_t>(n) * g.hidden * sizeof(__nv_bfloat16);
+        const auto *norm_w = static_cast<const __nv_bfloat16 *>(w.hc_norm);
+        const PendingKind kind = pending.inj == nullptr ? kNothing : pending.acc == nullptr ? kInject : kCombine;
+        const auto kernel = down_fp8 ? norm_down_kernel<true>(kind) : norm_down_kernel<false>(kind);
+        kernel<<<fused_grid, kThreads, fused_bytes, stream>>>(in, norm_w, block_inject, w.mix_down.data, normed,
+                                                              inject_part, down_part, g.hc_rank, g.streams, g.hidden, n,
+                                                              g.rms_norm_eps, pending);
+      } else if (down_fp8) {
         hc_down_split<true><<<down_grid, kThreads, 0, stream>>>(w.mix_down.data, normed, down_part, g.hc_rank,
                                                                  g.streams, g.hidden, n);
       } else {
         hc_down_split<false><<<down_grid, kThreads, 0, stream>>>(w.mix_down.data, normed, down_part, g.hc_rank,
                                                                   g.streams, g.hidden, n);
       }
-      if (!launched("fn_hc_mix: down")) {
+      if (!launched(fused ? "fn_hc_mix: norm and down" : "fn_hc_mix: down")) {
         return -1;
       }
       const auto grid = static_cast<uint32_t>(g.hidden / (2 * kWarps));
@@ -547,10 +832,12 @@ int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int
       const float *parts = with_inject ? inject_part : nullptr;
       if (up_fp8) {
         hc_up_reduce<true><<<grid, kThreads, 0, stream>>>(w.mix_up.data, fp8_scales(w.mix_up), down_part, down_scales,
-                                                           normed, parts, out, out_inj, g.hc_rank, g.hidden, n);
+                                                           normed, parts, out, out_inj, g.hc_rank, g.hidden, n,
+                                                           pending, residual, acc_zero);
       } else {
         hc_up_reduce<false><<<grid, kThreads, 0, stream>>>(w.mix_up.data, nullptr, down_part, down_scales, normed,
-                                                            parts, out, out_inj, g.hc_rank, g.hidden, n);
+                                                            parts, out, out_inj, g.hc_rank, g.hidden, n, pending,
+                                                            residual, acc_zero);
       }
       if (!launched("fn_hc_mix: up and reduce")) {
         return -1;
@@ -577,6 +864,8 @@ int32_t fn_hc_mix(const Geometry &g, const HcWeights &w, const void *hidden, int
   }
   return 0;
 }
+
+}  // namespace
 
 int32_t fn_hc_inject(const Geometry &g, const void *y, const float *inj, int32_t rows, void *hidden,
                      cudaStream_t stream) {

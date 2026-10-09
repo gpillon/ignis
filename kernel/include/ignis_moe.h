@@ -93,6 +93,12 @@ int32_t ignis_moe_trellis_reconstruct(const void *trellis, uint32_t k2, uint32_t
 int32_t ignis_moe_router(const void *x, uint32_t tokens, const void *w_router, int32_t *ids,
                          float *weights, float *logits, void *stream);
 
+/* The router's first launch alone (GitHub #306): `logits` as ignis_moe_router writes them, for a
+ * caller that ranks them itself (residency's lookahead) or selects from them in a later launch
+ * (ignis_residency_step_demand_routed, the same selection bit for bit). */
+int32_t ignis_moe_router_logits(const void *x, uint32_t tokens, const void *w_router, float *logits,
+                                void *stream);
+
 /* ---- preparation -----------------------------------------------------------------------------
  * Prepares the current device for every op in this header (and the FP8 linear's): kernel
  * attributes and launch geometry. Call once per device at load, outside any stream capture.

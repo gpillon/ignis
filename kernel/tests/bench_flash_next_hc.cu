@@ -4,18 +4,25 @@
 // The real weight formats (FP8 row-scale mix_down / mix_up, BF16 hc_norm and block_inject) at
 // 4 streams of 2560, rank 320. For each row count, `--calls` mixes (and, separately, injects)
 // are captured into one CUDA graph, as the decode round replays them; the graph is replayed
-// after a warm-up and the median replay is divided by the calls. Decode lanes (1, 2, 3, 8) and
+// after a warm-up and the median replay is divided by the calls. Decode lanes (1-5, 8) and
 // prefill chunks (256, 2048: two 1024-row waves). The calls cycle through `--sets` distinct
 // weight sets (~6.6 MB each, 24 by default: more than the L2 holds), so the weights stream from
 // DRAM as the round's 97 distinct mixes do. Timing wants the card to itself.
 //
-//   ignis_kernel_flash_next_hc_bench [--calls 48] [--replays 20] [--sets 24] [--rows N]
+//   ignis_kernel_flash_next_hc_bench [--calls 48] [--replays 20] [--sets 24] [--rows N] [--fused 0|1]
+//                                    [--fold 0|1]
 //
-// --rows times one row count only (for a per-kernel profile of one shape).
+// --rows times one row count only (for a per-kernel profile of one shape). --fused 0 times the
+// decode route with its norm in a launch of its own (fn_hc_set_decode_fused; GitHub #306).
+// The "+inject" and "+combine" columns time fn_hc_mix_after with the previous sublayer's inject
+// pending, without and with the MoE combine (GitHub #306, step 2); --fold 0 runs them unfolded
+// (the combine, the inject and the mix one after another: fusion.h's Inject off).
 
+#include "flash_next/fusion.h"
 #include "flash_next/hc.h"
 
 #include "ignis_fp8_linear.h"
+#include "ignis_moe.h"
 
 #include <cuda_runtime.h>
 
@@ -136,10 +143,15 @@ int main(int argc, char **argv) {
       sets = std::max(1, std::atoi(argv[i + 1]));
     } else if (std::strcmp(argv[i], "--rows") == 0) {
       only_rows = std::atoi(argv[i + 1]);
+    } else if (std::strcmp(argv[i], "--fused") == 0) {
+      ignis::flash_next::fn_hc_set_decode_fused(std::atoi(argv[i + 1]) != 0);
+    } else if (std::strcmp(argv[i], "--fold") == 0) {
+      ignis::flash_next::set_fused(ignis::flash_next::Fusion::Inject, std::atoi(argv[i + 1]) != 0);
     }
   }
-  if (ignis_fp8_linear_prepare() != 0) {
-    std::fprintf(stderr, "ignis_fp8_linear_prepare: %s\n", ignis_fp8_linear_last_error());
+  // ignis_moe_prepare prepares the FP8 linear too; the unfolded combine needs the MoE ops'.
+  if (ignis_moe_prepare() != 0) {
+    std::fprintf(stderr, "ignis_moe_prepare: %s\n", ignis_moe_last_error());
     return 1;
   }
   ignis::flash_next::Geometry g;
@@ -161,8 +173,9 @@ int main(int argc, char **argv) {
   CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   std::printf("flash-next HC mix, 4 x 2560 streams, rank 320, FP8 mix_down/mix_up; %d calls per graph over %d weight sets\n",
               calls, sets);
-  std::printf("%6s %12s %12s %12s %14s\n", "rows", "mix us", "final us", "inject us", "mix us / row");
-  for (int rows : {1, 2, 3, 8, 256, 2048}) {
+  std::printf("%6s %12s %12s %12s %14s %12s %12s\n", "rows", "mix us", "final us", "inject us", "mix us / row",
+              "+inject us", "+combine us");
+  for (int rows : {1, 2, 3, 4, 5, 8, 256, 2048}) {
     if (only_rows > 0 && rows != only_rows) {
       continue;
     }
@@ -187,7 +200,43 @@ int main(int argc, char **argv) {
     const double inject = graph_us_per_call(n, replays, stream, [&] {
       return ignis::flash_next::fn_hc_inject(g, y, inj, rows, hidden, stream) == 0;
     });
-    std::printf("%6d %12.2f %12.2f %12.2f %14.3f\n", rows, mix, fin, inject, mix / rows);
+    // The mix with the previous sublayer's inject pending, and with the MoE combine too: its
+    // operands at decode shapes (the accumulator is zeroed by the first call; the timing does not
+    // depend on its values), the pending injection weights apart from the mix's own.
+    double after[2] = {0.0, 0.0};
+    if (rows <= 8) {
+      std::vector<float> ones(static_cast<std::size_t>(rows) * kStreams, 1.0F);
+      auto *inj_prev = static_cast<float *>(upload_bytes(ones.data(), ones.size() * 4));
+      void *acc = nullptr;
+      CUDA_OK(cudaMalloc(&acc, static_cast<std::size_t>(rows) * kHidden * 8));
+      CUDA_OK(cudaMemset(acc, 0, static_cast<std::size_t>(rows) * kHidden * 8));
+      std::vector<float> zeros(static_cast<std::size_t>(rows) * kHidden, 0.0F);
+      auto *shared = static_cast<float *>(upload_bytes(zeros.data(), zeros.size() * 4));
+      void *cx = random_bf16(static_cast<std::size_t>(rows) * kHidden, 1.0F, 0x2E7U + rows);
+      void *gate = random_bf16(kHidden, 0.05F, 0x3E7U);
+      for (int combine = 0; combine < 2; ++combine) {
+        ignis::flash_next::PendingInject pending;
+        pending.y = y;
+        pending.inj = inj_prev;
+        if (combine == 1) {
+          pending.acc = static_cast<int64_t *>(acc);
+          pending.shared = shared;
+          pending.x = cx;
+          pending.w_gate = gate;
+        }
+        after[combine] = graph_us_per_call(n, replays, stream, [&] {
+          const auto &set = w[static_cast<std::size_t>(call++ % sets)];
+          return ignis::flash_next::fn_hc_mix_after(g, set, pending, hidden, rows, x, inj, scratch, stream) == 0;
+        });
+      }
+      CUDA_OK(cudaFree(inj_prev));
+      CUDA_OK(cudaFree(acc));
+      CUDA_OK(cudaFree(shared));
+      CUDA_OK(cudaFree(cx));
+      CUDA_OK(cudaFree(gate));
+    }
+    std::printf("%6d %12.2f %12.2f %12.2f %14.3f %12.2f %12.2f\n", rows, mix, fin, inject, mix / rows, after[0],
+                after[1]);
     CUDA_OK(cudaFree(hidden));
     CUDA_OK(cudaFree(x));
     CUDA_OK(cudaFree(y));

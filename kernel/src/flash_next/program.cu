@@ -10,7 +10,10 @@
 //   own (forked after the mix, joined at the combine) and, on the branch residency forks, the
 //   next layer's router on the same input (the lookahead residency ranks) and the step's
 //   prefetch half;
-// then the head (the final mixer and lm_head) on the rows that are drawn from.
+// then the head (the final mixer and lm_head) on the rows that are drawn from. Since GitHub #306's
+// decode fusion (fusion.h) each inject -- the MoE's with its combine -- is handed to the next mix,
+// which on a one-lane decode round applies it inside its own first launch, and a round's selection
+// is made inside residency's demand launch.
 //
 // A chunk is one lane of up to prefill_chunk_tokens tokens, run eagerly out of the handle's
 // scratch arena, its frontiers advanced once the chunk's work is confirmed complete. A round is
@@ -22,6 +25,7 @@
 
 #include "bind.h"
 #include "embed_head.h"
+#include "fusion.h"
 #include "gdn.h"
 #include "hc.h"
 #include "indexer.h"
@@ -121,7 +125,7 @@ Sizes plan_sizes(const FlashNextModel &fn) {
                      fn_head_scratch_bytes(g, decode_rows);
   const auto rows = static_cast<std::size_t>(fn.rows());
   s.activations = aligned(rows * g.residual_width() * 2) + 2 * aligned(rows * g.hidden * 2) +
-                  aligned(rows * g.streams * sizeof(float)) + aligned(rows * sizeof(int32_t)) +
+                  aligned(2 * rows * g.streams * sizeof(float)) + aligned(rows * sizeof(int32_t)) +
                   2 * aligned(static_cast<std::size_t>(std::max(lanes, 1)) * sizeof(int32_t)) +
                   aligned(rows * g.ngram_heads * g.ngram_row_bytes());
   const std::size_t router = aligned(rows * g.experts_per_token * sizeof(int32_t)) +
@@ -155,6 +159,33 @@ std::size_t sampling_staging_bytes(const Sizes &s) {
   return sizeof(ninfer::ops::SamplingConfig) + 2 * sizeof(int32_t) + sizeof(ninfer::ops::SamplingConfig) * lanes +
          2 * sizeof(int32_t) * lanes + sizeof(int32_t) * lanes * IGNIS_MAX_PERMITTED_TOKENS +
          sizeof(int32_t) * lanes + sizeof(float) * lanes + s.sampling_logits + s.sampling_workspace;
+}
+
+// A decode round's inputs in FlashNextModel::round_inputs (GitHub #306, step 7): byte offsets of
+// its sampling configs, positions, ids, slots, n-gram rows, permitted sets and their counts, each
+// 64-byte aligned, at the load's lane count.
+struct RoundInputs {
+  std::size_t configs = 0, positions = 0, ids = 0, slots = 0, ngram = 0, permitted = 0, counts = 0, total = 0;
+};
+
+RoundInputs round_inputs_layout(const FlashNextModel &fn) {
+  const auto lanes = static_cast<std::size_t>(std::max<uint32_t>(fn.decode_lanes, 1));
+  RoundInputs at;
+  std::size_t end = 0;
+  const auto take = [&](std::size_t bytes) {
+    const std::size_t here = end;
+    end += (bytes + 63) / 64 * 64;
+    return here;
+  };
+  at.configs = take(lanes * sizeof(ninfer::ops::SamplingConfig));
+  at.positions = take(lanes * sizeof(int32_t));
+  at.ids = take(lanes * sizeof(int32_t));
+  at.slots = take(lanes * sizeof(int32_t));
+  at.ngram = take(lanes * static_cast<std::size_t>(fn.g.ngram_heads) * fn.g.ngram_row_bytes());
+  at.permitted = take(lanes * IGNIS_MAX_PERMITTED_TOKENS * sizeof(int32_t));
+  at.counts = take(lanes * sizeof(int32_t));
+  at.total = end;
+  return at;
 }
 
 // A refusal of a geometry this program does not run, or nullptr.
@@ -230,10 +261,26 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
   auto *residual = fn.residual->p;
   auto *x = fn.x->p;
   auto *y = fn.y->p;
-  auto *inj = static_cast<float *>(fn.injections->p);
+  auto *acc = static_cast<int64_t *>(fn.moe_acc->p);
   const auto fail = [&](const std::string &where, const char *detail) {
     *error = where + ": " + detail;
     return -1;
+  };
+  // GitHub #306, step 2: a sublayer's inject -- the MoE's with its combine -- is left pending and
+  // applied by the next mix (fn_hc_mix_after: inside its down launch on the fused decode route,
+  // else on its own first, as it always ran); the n-gram add and the end of the forward, which
+  // read the residual, flush it first. A mix's injection weights alternate between two buffers, so
+  // no mix overwrites the weights its pending inject reads. A pending combine leaves the routed
+  // accumulator to be zeroed by it: a failure before it ran zeroes it (ignis_moe.h's contract).
+  PendingInject pending;
+  float *const injections[2] = {static_cast<float *>(fn.injections->p),
+                                static_cast<float *>(fn.injections->p) + static_cast<std::size_t>(fn.rows()) * g.streams};
+  int32_t next_injections = 0;
+  const auto fail_pending = [&](const std::string &where, const char *detail) {
+    if (pending.acc != nullptr) {
+      (void)cudaMemsetAsync(acc, 0, static_cast<std::size_t>(rows) * g.hidden * sizeof(int64_t), stream);
+    }
+    return fail(where, detail);
   };
 
   if (fn_embed(g, w.embed, static_cast<const int32_t *>(fn.token_ids->p), rows, residual, stream) != 0) {
@@ -244,14 +291,22 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
   for (int32_t l = 0; l < g.layers; ++l) {
     const LayerWeights &layer = w.layers[static_cast<std::size_t>(l)];
     const std::string where = "layer " + std::to_string(l);
-    if (l == g.ngram_layer &&
-        fn_ngram_add(ctx, w.ngram, batch, fn.ngram_rows->p, residual, scratch, stream) != 0) {
-      return fail(where + " n-gram embedding", fn_last_error());
+    if (l == g.ngram_layer) {
+      if (fn_hc_flush(g, pending, residual, rows, stream) != 0) {
+        return fail_pending(where + " pending inject", fn_last_error());
+      }
+      pending = PendingInject{};
+      if (fn_ngram_add(ctx, w.ngram, batch, fn.ngram_rows->p, residual, scratch, stream) != 0) {
+        return fail(where + " n-gram embedding", fn_last_error());
+      }
     }
     // The attention sublayer.
-    if (fn_hc_mix(g, layer.attn_hc, residual, rows, x, inj, scratch, stream) != 0) {
-      return fail(where + " attention mix", fn_last_error());
+    float *inj = injections[next_injections];
+    next_injections ^= 1;
+    if (fn_hc_mix_after(g, layer.attn_hc, pending, residual, rows, x, inj, scratch, stream) != 0) {
+      return fail_pending(where + " attention mix", fn_last_error());
     }
+    pending = PendingInject{};
     if (layer.attention) {
       auto scope = scratch.scope();
       Selection selection;
@@ -272,14 +327,16 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
       }
       ++gdn_ordinal;
     }
-    if (fn_hc_inject(g, y, inj, rows, residual, stream) != 0) {
-      return fail(where + " attention inject", fn_last_error());
-    }
+    pending.y = y;
+    pending.inj = inj;
 
     // The MoE sublayer.
-    if (fn_hc_mix(g, layer.mlp_hc, residual, rows, x, inj, scratch, stream) != 0) {
+    float *mlp_inj = injections[next_injections];
+    next_injections ^= 1;
+    if (fn_hc_mix_after(g, layer.mlp_hc, pending, residual, rows, x, mlp_inj, scratch, stream) != 0) {
       return fail(where + " MoE mix", fn_last_error());
     }
+    pending = PendingInject{};
     // The shared expert reads only `x`: it runs on a branch of its own (side_branch.h) beside the
     // router, residency and the routed experts, joined before the combine. Every failure after
     // the fork joins that branch and residency's lookahead branch first, so no return leaves
@@ -303,21 +360,35 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
     }
     auto *ids = static_cast<int32_t *>(fn.router_ids->p);
     auto *weights = static_cast<float *>(fn.router_weights->p);
-    if (ignis_moe_router(x, static_cast<uint32_t>(rows), layer.moe.router, ids, weights,
-                         static_cast<float *>(fn.router_logits->p), stream) != 0) {
+    auto *logits = static_cast<float *>(fn.router_logits->p);
+    // GitHub #306, step 5: a decode round's selection is made inside residency's demand launch
+    // (the same ids and weights), and the lookahead runs the router's logits only (its selection
+    // was never read: the prefetch ranks the logits).
+    const bool routed = fused(Fusion::Route);
+    const bool select_in_step = routed && phase == IGNIS_RESIDENCY_DECODE;
+    if (select_in_step ? ignis_moe_router_logits(x, static_cast<uint32_t>(rows), layer.moe.router, logits, stream) != 0
+                       : ignis_moe_router(x, static_cast<uint32_t>(rows), layer.moe.router, ids, weights, logits,
+                                          stream) != 0) {
       return fail_joined(where + " router", ignis_moe_last_error());
     }
     // The step's demand half on the layer's stream; its lookahead -- the next layer's router on
     // this input, which only the prefetch reads -- on the branch it forks, beside the experts.
     void *branch = nullptr;
-    if (ignis_residency_step_demand(fn.residency, static_cast<uint32_t>(l), phase, ids, static_cast<uint32_t>(rows),
-                                    stream, l + 1 < g.layers ? &branch : nullptr) != 0) {
+    void **lookahead = l + 1 < g.layers ? &branch : nullptr;
+    const auto layer_index = static_cast<uint32_t>(l);
+    if ((select_in_step ? ignis_residency_step_demand_routed(fn.residency, layer_index, phase, logits, ids, weights,
+                                                             static_cast<uint32_t>(rows), stream, lookahead)
+                        : ignis_residency_step_demand(fn.residency, layer_index, phase, ids,
+                                                      static_cast<uint32_t>(rows), stream, lookahead)) != 0) {
       return fail_joined(where + " expert residency", ignis_residency_last_error());
     }
     if (branch != nullptr) {
-      if (ignis_moe_router(x, static_cast<uint32_t>(rows), w.layers[static_cast<std::size_t>(l + 1)].moe.router,
-                           static_cast<int32_t *>(fn.lookahead_ids->p), static_cast<float *>(fn.lookahead_weights->p),
-                           static_cast<float *>(fn.lookahead_logits->p), branch) != 0) {
+      const void *next_router = w.layers[static_cast<std::size_t>(l + 1)].moe.router;
+      auto *lookahead_logits = static_cast<float *>(fn.lookahead_logits->p);
+      if ((routed ? ignis_moe_router_logits(x, static_cast<uint32_t>(rows), next_router, lookahead_logits, branch)
+                  : ignis_moe_router(x, static_cast<uint32_t>(rows), next_router,
+                                     static_cast<int32_t *>(fn.lookahead_ids->p),
+                                     static_cast<float *>(fn.lookahead_weights->p), lookahead_logits, branch)) != 0) {
         return fail_joined(where + " lookahead router", ignis_moe_last_error());
       }
       if (cudaEventRecord(fn.lookahead_read, static_cast<cudaStream_t>(branch)) != cudaSuccess) {
@@ -330,7 +401,6 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
     }
     const ignis_moe_slot *slots = ignis_residency_slot_table(fn.residency, static_cast<uint32_t>(l));
     ignis_moe_workspace workspace{fn.moe_workspace->p, fn.decode_rows, fn.prefill_chunk_tokens};
-    auto *acc = static_cast<int64_t *>(fn.moe_acc->p);
     const int32_t experts =
         phase == IGNIS_RESIDENCY_DECODE
             ? ignis_moe_experts_decode(x, static_cast<uint32_t>(rows), ids, weights, slots, &workspace, acc, stream)
@@ -347,16 +417,20 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
     if (!join_side(fn.shared_branch, stream)) {
       return fail_moe(" shared expert join", cudaGetErrorString(cudaGetLastError()));
     }
-    if (ignis_moe_combine(acc, shared, x, layer.moe.shared_expert_gate, static_cast<uint32_t>(rows), y, stream) != 0) {
-      return fail_moe(" MoE combine", ignis_moe_last_error());
-    }
+    // The combine and the inject, pending for the next mix.
+    pending.y = y;
+    pending.inj = mlp_inj;
+    pending.acc = acc;
+    pending.shared = shared;
+    pending.x = x;
+    pending.w_gate = layer.moe.shared_expert_gate;
     // The next sublayer's mix rewrites `x`: the lookahead router must have read it.
     if (branch != nullptr && cudaStreamWaitEvent(stream, fn.lookahead_read, 0) != cudaSuccess) {
-      return fail(where + " lookahead join", cudaGetErrorString(cudaGetLastError()));
+      return fail_pending(where + " lookahead join", cudaGetErrorString(cudaGetLastError()));
     }
-    if (fn_hc_inject(g, y, inj, rows, residual, stream) != 0) {
-      return fail(where + " MoE inject", fn_last_error());
-    }
+  }
+  if (fn_hc_flush(g, pending, residual, rows, stream) != 0) {
+    return fail_pending("the last layer's MoE inject", fn_last_error());
   }
   return 0;
 }
@@ -622,7 +696,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     fn.residual = buffer(rows * g.residual_width() * 2);
     fn.x = buffer(rows * g.hidden * 2);
     fn.y = buffer(rows * g.hidden * 2);
-    fn.injections = buffer(rows * g.streams * sizeof(float));
+    fn.injections = buffer(2 * rows * g.streams * sizeof(float));  // two mixes' (forward)
     fn.token_ids = buffer(rows * sizeof(int32_t));
     fn.slots = buffer(lanes * sizeof(int32_t));
     fn.positions = buffer(lanes * sizeof(int32_t));
@@ -637,6 +711,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     fn.lookahead_logits = buffer(rows * g.experts * sizeof(float));
     fn.shared_h = buffer(rows * g.shared_intermediate * sizeof(__nv_bfloat16));
     fn.shared_out = buffer(rows * g.hidden * sizeof(float));
+    fn.round_inputs = std::make_unique<ninfer::PinnedHostBuffer>(round_inputs_layout(fn).total);
   } catch (const std::exception &e) {
     *error = std::string("Flash-Next's reservations: ") + e.what();
     return -1;
@@ -997,34 +1072,64 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   const auto began = std::chrono::steady_clock::now();
   cudaStream_t stream = model->stream;
   const std::size_t row_bytes = static_cast<std::size_t>(g.ngram_heads) * g.ngram_row_bytes();
+  const std::size_t config_bytes = batch_size * sizeof(ninfer::ops::SamplingConfig);
+  const std::size_t lane_bytes = batch_size * sizeof(int32_t);
+  const std::size_t permitted_bytes = permitted.size() * sizeof(int32_t);
+  const void *src_configs = configs.data();
+  const void *src_positions = positions.data();
+  const void *src_ids = ids.data();
+  const void *src_slots = slots.data();
+  const void *src_ngram = options->ngram_rows;
+  const void *src_permitted = permitted.data();
+  const void *src_counts = permitted_counts.data();
+  // GitHub #306, step 7: the copies' sources gathered into page-locked memory first, so each
+  // copy is queued without the driver's pageable staging pass (fusion.h's Staging). The buffer
+  // is rewritten only after the previous round's synchronize.
+  if (fn.round_inputs != nullptr && fused(Fusion::Staging)) {
+    const RoundInputs at = round_inputs_layout(fn);
+    auto *base = static_cast<unsigned char *>(fn.round_inputs->data());
+    const auto put = [&](std::size_t offset, const void *src, std::size_t bytes) -> const void * {
+      std::memcpy(base + offset, src, bytes);
+      return base + offset;
+    };
+    src_configs = put(at.configs, configs.data(), config_bytes);
+    src_positions = put(at.positions, positions.data(), lane_bytes);
+    src_ids = put(at.ids, ids.data(), lane_bytes);
+    src_slots = put(at.slots, slots.data(), lane_bytes);
+    src_ngram = put(at.ngram, options->ngram_rows, batch_size * row_bytes);
+    if (constrained) {
+      src_permitted = put(at.permitted, permitted.data(), permitted_bytes);
+      src_counts = put(at.counts, permitted_counts.data(), lane_bytes);
+    }
+  }
   std::string error;
   const bool staged =
-      check_cuda(cudaMemcpyAsync(model->sampling_decode_configs->p, configs.data(),
-                                 batch_size * sizeof(ninfer::ops::SamplingConfig), cudaMemcpyHostToDevice, stream),
+      check_cuda(cudaMemcpyAsync(model->sampling_decode_configs->p, src_configs, config_bytes, cudaMemcpyHostToDevice,
+                                 stream),
                  "staging the sampling configs", &error) &&
-      check_cuda(cudaMemcpyAsync(model->sampling_decode_positions->p, positions.data(), batch_size * sizeof(int32_t),
+      check_cuda(cudaMemcpyAsync(model->sampling_decode_positions->p, src_positions, lane_bytes,
                                  cudaMemcpyHostToDevice, stream),
                  "staging the sampling positions", &error) &&
-      check_cuda(cudaMemcpyAsync(fn.token_ids->p, ids.data(), batch_size * sizeof(int32_t), cudaMemcpyHostToDevice,
-                                 stream),
+      check_cuda(cudaMemcpyAsync(fn.token_ids->p, src_ids, lane_bytes, cudaMemcpyHostToDevice, stream),
                  "staging the ids", &error) &&
-      check_cuda(cudaMemcpyAsync(fn.slots->p, slots.data(), batch_size * sizeof(int32_t), cudaMemcpyHostToDevice,
-                                 stream),
+      check_cuda(cudaMemcpyAsync(fn.slots->p, src_slots, lane_bytes, cudaMemcpyHostToDevice, stream),
                  "staging the slots", &error) &&
-      check_cuda(cudaMemcpyAsync(fn.positions->p, positions.data(), batch_size * sizeof(int32_t),
-                                 cudaMemcpyHostToDevice, stream),
+      check_cuda(cudaMemcpyAsync(fn.positions->p, src_positions, lane_bytes, cudaMemcpyHostToDevice, stream),
                  "staging the positions", &error) &&
-      check_cuda(cudaMemcpyAsync(fn.ngram_rows->p, options->ngram_rows, batch_size * row_bytes,
-                                 cudaMemcpyHostToDevice, stream),
+      check_cuda(cudaMemcpyAsync(fn.ngram_rows->p, src_ngram, batch_size * row_bytes, cudaMemcpyHostToDevice, stream),
                  "staging the n-gram rows", &error) &&
       (!constrained ||
-       (check_cuda(cudaMemcpyAsync(model->sampling_decode_permitted->p, permitted.data(),
-                                   permitted.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream),
+       (check_cuda(cudaMemcpyAsync(model->sampling_decode_permitted->p, src_permitted, permitted_bytes,
+                                   cudaMemcpyHostToDevice, stream),
                    "staging the permitted sets", &error) &&
-        check_cuda(cudaMemcpyAsync(model->sampling_decode_permitted_counts->p, permitted_counts.data(),
-                                   batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, stream),
+        check_cuda(cudaMemcpyAsync(model->sampling_decode_permitted_counts->p, src_counts, lane_bytes,
+                                   cudaMemcpyHostToDevice, stream),
                    "staging the permitted counts", &error)));
-  if (!staged) return refuse(error);
+  if (!staged) {
+    // Copies queued before the failure may still read round_inputs, which the next round rewrites.
+    (void)cudaStreamSynchronize(stream);
+    return refuse(error);
+  }
 
   // A constrained round runs eagerly: its mask sits between the head and the draw, as the 27B's.
   const bool use_graph = model->decode_graph_ready[width - 1] && !constrained;

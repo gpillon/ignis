@@ -658,6 +658,12 @@ add_executable(ignis_kernel_flash_next_hc_bench bench_flash_next_hc.cu)
 target_include_directories(ignis_kernel_flash_next_hc_bench
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_flash_next_hc_bench PRIVATE ignis_kernel ignis_vendor)
+# The indexer's decode score on the graph's grid, a fitted one and the strided one (GitHub #306,
+# step 3): a tool, NOT a CTest.
+add_executable(ignis_kernel_flash_next_score_bench bench_flash_next_score.cu)
+target_include_directories(ignis_kernel_flash_next_score_bench
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_flash_next_score_bench PRIVATE ignis_kernel ignis_vendor)
 # The token embedding and the head (kernel/src/flash_next/embed_head.cu). GPU.
 add_executable(ignis_kernel_flash_next_embed_head_test test_flash_next_embed_head.cu)
 target_include_directories(ignis_kernel_flash_next_embed_head_test
@@ -701,6 +707,12 @@ add_test(NAME ignis_kernel_residency_trace_test COMMAND ignis_kernel_residency_t
 add_test(NAME ignis_kernel_residency_graph_test COMMAND ignis_kernel_residency_trace_test graph)
 add_test(NAME ignis_kernel_residency_split_test COMMAND ignis_kernel_residency_trace_test split)
 add_test(NAME ignis_kernel_residency_graph_split_test COMMAND ignis_kernel_residency_trace_test graph split)
+# GitHub #306 (decode fusion, step 5): OURS -- residency's routed demand step (the router's selection
+# made in the resolve's launch) against the router and the demand step it replaces, bit for bit.
+# GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_residency_routed_test test_residency_routed.cu)
+target_link_libraries(ignis_kernel_residency_routed_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_residency_routed_test COMMAND ignis_kernel_residency_routed_test)
 
 # GitHub #302 (spec flash-next/04, slice S4): OURS -- the n-gram embedding's device side
 # (kernel/src/flash_next/ngram.cu) at the real geometry, against transformers'

@@ -9,13 +9,18 @@
 //   append_tail    one CTA per lane: the raw keys of the lane's incomplete last block.
 //   queries        one warp per (row, head): q_layernorm and rope at the row's position.
 //   score          a CTA per (row tile, 64 blocks): the tile's block keys and queries in shared
-//                  memory, sum_h relu(q_h . k) in fp32 per (row, block).
+//                  memory, sum_h relu(q_h . k) in fp32 per (row, block). A decode call (one token
+//                  per lane) takes score_decode instead: each key staged in 16-byte loads behind
+//                  one page lookup, the grid capped and strided (GitHub #306, step 3).
 //   select         one CTA per row: an MSB-first radix select of the k-th largest score, then
 //                  the selected blocks in ascending order -- every score above the k-th, and
 //                  the lowest-index blocks among those equal to it -- and the row's tail tokens.
 
 #include "indexer.h"
 
+#include "fusion.h"
+
+#include <algorithm>
 #include <cmath>
 
 namespace ignis::flash_next::indexer {
@@ -152,6 +157,45 @@ __global__ void queries_kernel(RowArgs r, Rope rope, const __nv_bfloat16 *q_norm
 // consecutive banks.
 constexpr int32_t kKeyPitchWords = kHeadDim / 2 + 1;
 
+// acc[k][h] = q_h . key (group + k * kGroups), for one row's queries `qrow` ([heads][64] words,
+// shared memory, heads 4) against the tile's keys ([64][kKeyPitchWords] words, shared memory):
+// exact BF16 products summed in fp32 over the 64 words in order, each word's two halves in turn.
+template <int kBlocksPerThread, int kGroups>
+__device__ __forceinline__ void block_dots(const uint32_t *qrow, const uint32_t *keys, int group,
+                                           float (&acc)[kBlocksPerThread][4]) {
+#pragma unroll
+  for (int k = 0; k < kBlocksPerThread; ++k)
+#pragma unroll
+    for (int h = 0; h < 4; ++h) acc[k][h] = 0.0F;
+#pragma unroll 4
+  for (int w = 0; w < kHeadDim / 2; ++w) {
+    float2 qv[4];
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+      const uint32_t bits = qrow[h * (kHeadDim / 2) + w];
+      qv[h] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&bits));
+    }
+#pragma unroll
+    for (int k = 0; k < kBlocksPerThread; ++k) {
+      const uint32_t bits = keys[(group + k * kGroups) * kKeyPitchWords + w];
+      const float2 kv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&bits));
+#pragma unroll
+      for (int h = 0; h < 4; ++h) {
+        acc[k][h] = fmaf(qv[h].x, kv.x, acc[k][h]);  // BF16 products are exact in fp32
+        acc[k][h] = fmaf(qv[h].y, kv.y, acc[k][h]);
+      }
+    }
+  }
+}
+
+// A block's score from its four head dots: sum_h relu(dot_h) in head order, times the scale.
+__device__ __forceinline__ float block_score(const float (&acc)[4], float scale) {
+  float s = 0.0F;
+#pragma unroll
+  for (int h = 0; h < 4; ++h) s += fmaxf(acc[h], 0.0F);
+  return s * scale;
+}
+
 template <int kRows, int kBlocksPerThread>
 __global__ void __launch_bounds__(kRows * kBlocksPerScoreCta / kBlocksPerThread)
     score_kernel(RowArgs r, Paged paged, const __nv_bfloat16 *q, int32_t heads, float scale, float *scores,
@@ -195,40 +239,74 @@ __global__ void __launch_bounds__(kRows * kBlocksPerScoreCta / kBlocksPerThread)
   const int group = threadIdx.x / kRows;
   if (rr >= tile_rows) return;
   float acc[kBlocksPerThread][4];
-#pragma unroll
-  for (int k = 0; k < kBlocksPerThread; ++k)
-#pragma unroll
-    for (int h = 0; h < 4; ++h) acc[k][h] = 0.0F;
-  const uint32_t *qrow = qs + rr * q_pitch;
-#pragma unroll 4
-  for (int w = 0; w < kHeadDim / 2; ++w) {
-    float2 qv[4];
-#pragma unroll
-    for (int h = 0; h < 4; ++h) {
-      const uint32_t bits = qrow[h * (kHeadDim / 2) + w];
-      qv[h] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&bits));
-    }
-#pragma unroll
-    for (int k = 0; k < kBlocksPerThread; ++k) {
-      const uint32_t bits = keys[(group + k * kBlockGroups) * kKeyPitchWords + w];
-      const float2 kv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&bits));
-#pragma unroll
-      for (int h = 0; h < 4; ++h) {
-        acc[k][h] = fmaf(qv[h].x, kv.x, acc[k][h]);  // BF16 products are exact in fp32
-        acc[k][h] = fmaf(qv[h].y, kv.y, acc[k][h]);
-      }
-    }
-  }
+  block_dots<kBlocksPerThread, kBlockGroups>(qs + rr * q_pitch, keys, group, acc);
   const int32_t blocks = (row_position(r, row0 + rr) + 1) / kCompress;
   float *out = scores + static_cast<size_t>(row0 + rr) * score_stride;
 #pragma unroll
   for (int k = 0; k < kBlocksPerThread; ++k) {
     const int32_t b = b0 + group + k * kBlockGroups;
     if (b >= blocks) continue;
-    float s = 0.0F;
-#pragma unroll
-    for (int h = 0; h < 4; ++h) s += fmaxf(acc[k][h], 0.0F);
-    out[b] = s * scale;
+    out[b] = block_score(acc[k], scale);
+  }
+}
+
+// The decode route's score (GitHub #306, step 3). score_kernel<1, 1> stages a tile's 64 keys a
+// 4-byte word at a time, each behind its own page lookup: 64 dependent loads a thread, which hold
+// a short context's few working CTAs ~13 us while the graph's empty ones (its grid is sized for
+// the bound on visible blocks, 262,144 tokens: 1,024 CTAs a row) cost nothing measurable
+// (bench_flash_next_score, 2026-10-08). This kernel looks each key's page up once and stages it
+// in 16-byte loads, then runs the same per-block dot (block_dots, block_score): the same bits. Its
+// grid is the same, capped at kDecodeScoreCtas a row; each CTA strides over its row's visible
+// blocks (read on the device) a tile at a time, so a larger bound needs no more CTAs. (A grid of
+// 128 a row was ~1.3x slower than the uncapped one at 32,768 blocks and more.)
+constexpr int32_t kDecodeScoreCtas = 1024;
+
+__global__ void __launch_bounds__(kBlocksPerScoreCta)
+    score_decode_kernel(RowArgs r, Paged paged, const __nv_bfloat16 *q, int32_t heads, float scale, float *scores,
+                        int32_t score_stride) {
+  extern __shared__ uint32_t smem[];
+  __shared__ const uint4 *key_rows[kBlocksPerScoreCta];
+  uint32_t *keys = smem;                                    // [64][kKeyPitchWords]
+  uint32_t *qs = smem + kBlocksPerScoreCta * kKeyPitchWords;  // [heads][64]
+  constexpr int32_t kKeyVectors = kHeadDim * 2 / 16;          // 16-byte loads per key
+  const int32_t local = static_cast<int32_t>(blockIdx.y);
+  // A row's scores end at the stride, whatever its position says.
+  const int32_t blocks = min((row_position(r, local) + 1) / kCompress, score_stride);
+  const int32_t first = static_cast<int32_t>(blockIdx.x) * kBlocksPerScoreCta;
+  if (first >= blocks) return;
+  const int32_t slot = r.slots[row_seq(r, local)];
+  const int tid = static_cast<int>(threadIdx.x);
+  for (int i = tid; i < heads * (kHeadDim / 2); i += kBlocksPerScoreCta) {
+    qs[i] = reinterpret_cast<const uint32_t *>(q + static_cast<size_t>(local) * heads * kHeadDim)[i];
+  }
+  float *out = scores + static_cast<size_t>(local) * score_stride;
+  for (int32_t b0 = first; b0 < blocks; b0 += static_cast<int32_t>(gridDim.x) * kBlocksPerScoreCta) {
+    const int32_t b = b0 + tid;
+    if (b < blocks) {
+      const int32_t at = b * kCompress;
+      const int32_t page = paged.block_tables[static_cast<size_t>(slot) * paged.logical_pages + at / kPageTokens];
+      key_rows[tid] = reinterpret_cast<const uint4 *>(
+          paged.block_keys + (static_cast<size_t>(page) * kBlocksPerPage + (at % kPageTokens) / kCompress) * kHeadDim);
+    } else {
+      key_rows[tid] = nullptr;
+    }
+    __syncthreads();
+    for (int i = tid; i < kBlocksPerScoreCta * kKeyVectors; i += kBlocksPerScoreCta) {
+      const int jj = i / kKeyVectors, part = i % kKeyVectors;
+      const uint4 v = key_rows[jj] != nullptr ? key_rows[jj][part] : make_uint4(0, 0, 0, 0);
+      uint32_t *dst = keys + jj * kKeyPitchWords + part * 4;
+      dst[0] = v.x;
+      dst[1] = v.y;
+      dst[2] = v.z;
+      dst[3] = v.w;
+    }
+    __syncthreads();
+    if (b < blocks) {
+      float acc[1][4];
+      block_dots<1, kBlocksPerScoreCta>(qs, keys, tid, acc);
+      out[b] = block_score(acc[0], scale);
+    }
+    __syncthreads();  // the next tile's keys overwrite these
   }
 }
 
@@ -426,7 +504,11 @@ Status score(const Geometry &g, const Paged &paged, const Batch &batch, int32_t 
   const size_t q_bytes_per_row = (static_cast<size_t>(heads) * (kHeadDim / 2) + 1) * 4;
   const size_t key_bytes = static_cast<size_t>(kBlocksPerScoreCta) * kKeyPitchWords * 4;
   const unsigned bx = static_cast<unsigned>((max_blocks + kBlocksPerScoreCta - 1) / kBlocksPerScoreCta);
-  if (batch.tokens == 1) {
+  if (batch.tokens == 1 && fused(Fusion::Score)) {
+    const unsigned grid = std::min(bx, static_cast<unsigned>(kDecodeScoreCtas));
+    score_decode_kernel<<<dim3(grid, rows), kBlocksPerScoreCta, key_bytes + q_bytes_per_row, stream>>>(
+        r, paged, q, heads, scale, scores, score_stride);
+  } else if (batch.tokens == 1) {
     score_kernel<1, 1><<<dim3(bx, rows), 64, key_bytes + q_bytes_per_row, stream>>>(r, paged, q, heads, scale,
                                                                                      scores, score_stride);
   } else {
