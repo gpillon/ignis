@@ -59,6 +59,16 @@ pub const DEFAULT_MODEL_DOWNLOAD: bool = true;
 /// models` done by hand and a download the server did are the same file.
 pub const DEFAULT_MODEL_DOWNLOAD_PATH: &str = "./models";
 
+/// How long a model switch waits for the requests already running on the
+/// old model before it cuts them, in seconds (`--switch-drain-timeout`, spec
+/// model-switch/01): the grace window that gives a switch a finite upper
+/// bound whatever the load.
+pub const DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 30;
+
+/// The upper bound `--switch-drain-timeout` accepts: a ceiling against a
+/// fat-fingered value, as [`MAX_REQUEST_TIMEOUT_SECS`] is for its flag.
+pub const MAX_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 3600;
+
 /// The upper bound `--request-timeout`/`IGNIS_REQUEST_TIMEOUT` accepts: a
 /// ceiling against a fat-fingered value, not a real operating point — a
 /// healthy request legitimately runs for minutes at a large `max_tokens`,
@@ -243,6 +253,11 @@ pub struct Config {
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
     pub request_timeout_secs: u32,
+    /// How long a model switch (`POST /v1/models/switch`, spec
+    /// model-switch/01) waits for the old model's in-flight requests before
+    /// it cancels them. In `[0, MAX_SWITCH_DRAIN_TIMEOUT_SECS]`; 0 cuts them
+    /// at once.
+    pub switch_drain_timeout_secs: u32,
     /// Serve the Playground under `/ui/` (GitHub #163, ADR 0026). On unless
     /// `--no-ui` / `IGNIS_UI=false` turns it off: a binary that embedded the
     /// build serves it, and one that did not serves the page saying how to
@@ -428,6 +443,7 @@ pub fn resolve(
     let mut system_message_policy = None;
     let mut developer_message_policy = None;
     let mut request_timeout = None;
+    let mut switch_drain_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
     let mut draft_rows = None;
@@ -488,6 +504,7 @@ pub fn resolve(
                 developer_message_policy = Some(take_value(args, &mut i, flag)?)
             }
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
+            "--switch-drain-timeout" => switch_drain_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
             "--draft-rows" => draft_rows = Some(take_value(args, &mut i, flag)?),
@@ -600,6 +617,7 @@ pub fn resolve(
         )?,
     };
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
+    let switch_drain_timeout_secs = resolve_switch_drain_timeout_secs(switch_drain_timeout, &env)?;
     let speculation_off = non_empty(spec.clone().or_else(|| env("IGNIS_SPEC"))).is_some_and(|s| s.trim() == "off");
     let speculation = if speculation_off {
         // `--spec off` has nothing to size or to score with: a window or a head
@@ -725,6 +743,7 @@ pub fn resolve(
         rope_scaling,
         media,
         request_timeout_secs,
+        switch_drain_timeout_secs,
         ui: resolve_ui(ui, &env)?,
         metrics,
         api_key,
@@ -1121,6 +1140,48 @@ pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, 
         return Err(ConfigError(format!("`--vision`: {} takes no images", family.name())));
     }
     Ok(if config.model_named { config.model.clone() } else { family.model_id().to_owned() })
+}
+
+/// `config` fitted to an artifact of `family` for a model switch (spec
+/// model-switch/01), and the flags it dropped to get there.
+///
+/// One process serves the 27B and Flash-Next in turn on the flags it was
+/// started with, and some of those flags name a capability only one of the
+/// two has: `--vision` (the 27B's tower), a `--spec` backend (each model
+/// drafts with its own), and the Flash-Next-only knobs. At start such a flag
+/// on the wrong model is refused ([`served_model_for`]) because the operator
+/// named it for that load; on a switch it was named for the *other* model,
+/// and refusing it would make the switch impossible on the flags the owner
+/// starts with (`--vision` on the 27B). So it is dropped for this load — and
+/// returned, so the switch says which. A flag both models take but bound
+/// differently (`--max-context` past the 27B's attention envelope) is not
+/// dropped: [`served_model_for`] still refuses it.
+pub fn fit_to_family(config: &Config, family: ModelFamily) -> (Config, Vec<&'static str>) {
+    let mut fitted = config.clone();
+    let mut dropped = Vec::new();
+    if fitted.vision.is_some() && !family.takes_images() {
+        fitted.vision = None;
+        dropped.push("--vision");
+    }
+    if fitted.speculation.is_some_and(|s| s.backend() != family.drafter()) {
+        fitted.speculation = None;
+        dropped.push("--spec");
+    }
+    if family != ModelFamily::FlashNext {
+        if fitted.draft_rows.take().is_some() {
+            dropped.push("--draft-rows");
+        }
+        if fitted.decode_lanes.take().is_some() {
+            dropped.push("--decode-lanes");
+        }
+        if std::mem::take(&mut fitted.allow_expert_cache_below_floor) {
+            dropped.push("--allow-expert-cache-below-floor");
+        }
+        if fitted.ngram_hot_bytes.take().is_some() {
+            dropped.push("--ngram-hot-bytes");
+        }
+    }
+    (fitted, dropped)
 }
 
 /// Parse a `u32` count for `flag`, naming the flag, `unit`, and the
@@ -1521,6 +1582,25 @@ fn resolve_request_timeout_secs(
     Ok(secs)
 }
 
+/// `--switch-drain-timeout` / `IGNIS_SWITCH_DRAIN_TIMEOUT` /
+/// [`DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS`]. Zero is a value here, unlike the
+/// request timeout's: a switch that cuts what is running at once.
+fn resolve_switch_drain_timeout_secs(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<u32, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_SWITCH_DRAIN_TIMEOUT"))) else {
+        return Ok(DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS);
+    };
+    let secs = parse_count("--switch-drain-timeout", "second count", &raw)?;
+    if secs > MAX_SWITCH_DRAIN_TIMEOUT_SECS {
+        return Err(ConfigError(format!(
+            "`--switch-drain-timeout` must be at most {MAX_SWITCH_DRAIN_TIMEOUT_SECS} seconds, got {secs}"
+        )));
+    }
+    Ok(secs)
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
@@ -1579,6 +1659,7 @@ fn help_text() -> String {
          \x20       --system-message-policy <p> env: IGNIS_SYSTEM_MESSAGE_POLICY (default: merge; merge = a leading run of system messages joins the system prompt, a later one is its own block in place; strict = 400 for a system message that is not first)\n\
          \x20       --developer-message-policy <p> env: IGNIS_DEVELOPER_MESSAGE_POLICY (default: inplace; inplace, into-system, after-system, one-after-system or reject; a leading developer message is the system prompt except under reject)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
+         \x20       --switch-drain-timeout <secs> env: IGNIS_SWITCH_DRAIN_TIMEOUT (default: {DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS}; max {MAX_SWITCH_DRAIN_TIMEOUT_SECS}; how long POST /v1/models/switch lets the old model's running requests finish before it cancels them; 0 cancels them at once)\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2 on the 27B, mtp on Flash-Next with its companion container beside the artifact, off)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (1..{MAX_DRAFT_TOKENS}; required with --spec dflash2; with --spec mtp the most drafts a lane verifies, default {FLASH_NEXT_DEFAULT_DRAFT_TOKENS})\n\
          \x20       --draft-rows <n>          env: IGNIS_DRAFT_ROWS     (Flash-Next mtp only; default: 0 = {FLASH_NEXT_VERIFY_ROWS}; rows a verify round takes across lanes, 0 or 2..{FLASH_NEXT_VERIFY_ROWS}; 3 drafts at one lane only)\n\
@@ -2689,6 +2770,42 @@ mod tests {
         assert!(err.0.contains("nonzero"), "{err}");
     }
 
+    // ── the switch drain timeout (spec model-switch/01) ──────────────────
+
+    #[test]
+    fn the_switch_drain_timeout_defaults_to_thirty_seconds() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.switch_drain_timeout_secs, DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS);
+        assert_eq!(DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn the_switch_drain_timeout_flag_wins_over_its_env_var_and_zero_is_a_value() {
+        let env = env_map(&[("IGNIS_SWITCH_DRAIN_TIMEOUT", "90")]);
+        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).switch_drain_timeout_secs, 90);
+        let env = env_map(&[("IGNIS_SWITCH_DRAIN_TIMEOUT", "90")]);
+        let a = args(&["--switch-drain-timeout", "0"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(config.switch_drain_timeout_secs, 0, "flag must win over env, and 0 cuts at once");
+    }
+
+    #[test]
+    fn a_switch_drain_timeout_above_the_ceiling_or_not_a_number_is_a_usage_error() {
+        let err = resolve(&args(&["--switch-drain-timeout", "3601"]), no_env).expect_err("must reject");
+        assert!(err.0.contains("3600") && err.0.contains("3601"), "{err}");
+        let err = resolve(&args(&["--switch-drain-timeout", "soon"]), no_env).expect_err("must reject");
+        assert!(err.0.contains("--switch-drain-timeout"), "{err}");
+    }
+
+    #[test]
+    fn help_lists_the_switch_drain_timeout_flag() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--switch-drain-timeout"), "{text}");
+    }
+
     #[test]
     fn help_lists_the_request_timeout_flag() {
         let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
@@ -2882,6 +2999,56 @@ mod tests {
         let vision = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
         let err = served_model_for(&vision, ModelFamily::FlashNext).expect_err("no vision");
         assert!(err.0.contains("--vision") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
+    }
+
+    /// Spec model-switch/01: a switch drops the flags named for the other
+    /// model instead of refusing them, says which, and leaves the rest — a
+    /// shared flag past the target's bound is still `served_model_for`'s to
+    /// refuse.
+    #[test]
+    fn a_switch_drops_the_flags_only_the_other_model_takes_and_names_them() {
+        use ignis_core::compute::ModelFamily;
+        let started = expect_config(
+            resolve(&args(&["--vision", "--spec", "dflash2", "--draft-tokens", "7"]), no_env).expect("resolve"),
+        );
+        let (fitted, dropped) = fit_to_family(&started, ModelFamily::FlashNext);
+        assert_eq!(dropped, ["--vision", "--spec"]);
+        assert!(fitted.vision.is_none() && fitted.speculation.is_none());
+        assert!(served_model_for(&fitted, ModelFamily::FlashNext).is_ok(), "the fitted flags start Flash-Next");
+        let (same, none) = fit_to_family(&started, ModelFamily::Qwen38_27b);
+        assert!(none.is_empty(), "the 27B takes every flag it was started with: {none:?}");
+        assert_eq!(same, started);
+
+        let flash_next = expect_config(
+            resolve(
+                &args(&[
+                    "--spec",
+                    "mtp",
+                    "--draft-rows",
+                    "6",
+                    "--decode-lanes",
+                    "2",
+                    "--ngram-hot-bytes",
+                    "auto",
+                    "--allow-expert-cache-below-floor",
+                ]),
+                no_env,
+            )
+            .expect("resolve"),
+        );
+        let (fitted, dropped) = fit_to_family(&flash_next, ModelFamily::Qwen38_27b);
+        assert_eq!(
+            dropped,
+            ["--spec", "--draft-rows", "--decode-lanes", "--allow-expert-cache-below-floor", "--ngram-hot-bytes"]
+        );
+        assert!(served_model_for(&fitted, ModelFamily::Qwen38_27b).is_ok(), "the fitted flags start the 27B");
+
+        let long = expect_config(
+            resolve(&args(&["--max-context", "1048577", "--kv-pool-bytes", "64G"]), no_env).expect("resolve"),
+        );
+        let (fitted, dropped) = fit_to_family(&long, ModelFamily::Qwen38_27b);
+        assert!(dropped.is_empty());
+        assert!(served_model_for(&fitted, ModelFamily::Qwen38_27b).is_err(), "a shared flag is still bounded");
     }
 
     /// GitHub #228: the 27B's GQA envelope bounds `--max-context` per KV
