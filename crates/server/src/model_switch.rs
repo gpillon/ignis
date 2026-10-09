@@ -39,7 +39,15 @@
 //! to a cold restart of what was serving, never to a stopped server. Only a
 //! reload that fails too leaves [`ModelStatus::Failed`] standing, with the
 //! process up and a further switch still accepted.
+//!
+//! **Who may begin one.** `POST /v1/models/switch`, naming the artifact; and
+//! (spec §Implicit switch) a request whose own `model` names another model the
+//! operator listed ([`implicit_switch`]), which waits for that same switch and
+//! is then served on the model it named. Both run [`begin`]: one mechanism,
+//! two callers.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -132,14 +140,53 @@ pub struct Switcher {
     /// The switch under way, if any. Switches are serialized, not queued:
     /// a second one is refused naming this one (spec model-switch/01).
     running: Mutex<Option<SwitchStarted>>,
+    /// The models a request's own `model` may switch to, each with the
+    /// artifact it loads from ([`implicit_switch`]). Empty unless
+    /// [`Switcher::with_known_models`] named some — `main` names none under
+    /// `--allow-model-switch false` — and then a request naming another
+    /// model is refused by name, as it always was.
+    known: BTreeMap<String, PathBuf>,
 }
 
 impl Switcher {
     /// Switch with `loader`, giving the old model's requests `drain_timeout`
     /// to finish (`--switch-drain-timeout`).
     pub fn new(loader: Arc<dyn ModelLoader>, drain_timeout: Duration) -> Self {
-        Self { loader, drain_timeout, running: Mutex::new(None) }
+        Self { loader, drain_timeout, running: Mutex::new(None), known: BTreeMap::new() }
     }
+
+    /// Let a request naming one of `known`'s ids switch to it
+    /// ([`implicit_switch`]); `main` passes [`known_models`]' table.
+    pub fn with_known_models(mut self, known: BTreeMap<String, PathBuf>) -> Self {
+        self.known = known;
+        self
+    }
+}
+
+/// The models a request may switch to by naming them: the operator's
+/// (`--known-model`, [`crate::config::Config::known_models`]) and the one the
+/// server started on, `start` — its served id and the artifact it loaded,
+/// which only its load knows. An operator's entry for the start's own id
+/// gives way to the start's, which is the artifact actually loaded and so the
+/// one a switch back must reload; `ignis.config.known_model_replaced` says so
+/// when the two paths differ. A start built in process (the placeholder) has
+/// no artifact and adds nothing.
+pub fn known_models(named: &BTreeMap<String, PathBuf>, start: Option<&ModelSource>) -> BTreeMap<String, PathBuf> {
+    let mut known = named.clone();
+    if let Some(start) = start {
+        if let Some(listed) = known.insert(start.model.clone(), start.artifact.clone()) {
+            if listed != start.artifact {
+                tracing::warn!(
+                    name: "ignis.config.known_model_replaced",
+                    model = %start.model,
+                    listed = %listed.display(),
+                    loaded = %start.artifact.display(),
+                    "--known-model names the start model at another path; a switch back reloads the one loaded"
+                );
+            }
+        }
+    }
+    known
 }
 
 /// A switch that has begun: the ids it moves between, as `202` reports them
@@ -254,6 +301,87 @@ pub fn begin(
     let guard = RunningGuard { switcher, status: Arc::clone(&server.status) };
     let task = tokio::spawn(run(server.clone(), guard, target, started.clone(), serving_before));
     Ok((started, task))
+}
+
+/// Why a request whose `model` named another model was not served on it
+/// ([`implicit_switch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImplicitRefusal {
+    /// A switch was already under way when the request named its model —
+    /// another request's, or one `POST /v1/models/switch` began — whatever
+    /// its target, this request's own included. Not joined, not queued
+    /// behind, not retargeted (spec §Implicit switch, ordering 5): answered
+    /// `503 model_switching`, exactly as the gate answers a request sent a
+    /// moment later.
+    Switching(SwitchStarted),
+    /// The switch this request began did not leave `to` serving — refused
+    /// before anything stopped, or failed on the GPU with the previous model
+    /// reloaded or not. Never served on another model instead: the client
+    /// named one, and gets it or the reason it did not.
+    Failed {
+        /// The model the request named.
+        to: String,
+        /// The switch's own reason, as `GET /v1/models` reports a failed
+        /// switch's.
+        reason: String,
+    },
+}
+
+/// Switch to the model a request named, and wait until it serves (spec
+/// model-switch/01 §Implicit switch): what lets an OpenAI client that names
+/// the other model in `model` simply be answered by it, the first such
+/// request taking as long as the switch takes.
+///
+/// `requested` is the request's `model` with its lane tag already stripped.
+/// Nothing named, the model already loaded, or one the switcher does not know
+/// (switching off, or a name `--known-model` never listed) is not this
+/// function's to refuse: it returns at once, and the request goes on to the
+/// check every endpoint already makes, which refuses a model it does not load
+/// by name. A known model other than the loaded one begins the very switch
+/// `POST /v1/models/switch` would ([`begin`]) — the gate closes before this
+/// returns control to anything else, the old model's requests drain, it is
+/// torn down, the named one loads — and only once that switch has ended does
+/// this return: `Ok` with the named model serving, so the caller, taking the
+/// loaded model only now, runs exactly as if it had always been loaded.
+///
+/// Call it on the server every handler shares, before
+/// [`crate::Server::pinned`]: a pinned copy holds a model of its own, and a
+/// switch published into it would reach no one.
+pub async fn implicit_switch(server: &Server, requested: Option<&str>) -> Result<(), ImplicitRefusal> {
+    let Some(requested) = requested.filter(|model| !model.is_empty()) else {
+        return Ok(());
+    };
+    let Some(artifact) = server.switcher.as_ref().and_then(|switcher| switcher.known.get(requested)) else {
+        return Ok(());
+    };
+    if server.active().engine.model_id() == requested {
+        return Ok(());
+    }
+    let target = ModelSource { artifact: artifact.clone(), model: requested.to_owned() };
+    let task = match begin(server, target) {
+        Ok((started, task)) => {
+            tracing::info!(
+                name: "ignis.model.switch_requested",
+                from = %started.from,
+                to = %started.to,
+                "a request named a known model other than the loaded one; it is served once the switch lands"
+            );
+            task
+        }
+        Err(SwitchRefusal::InProgress(running)) => return Err(ImplicitRefusal::Switching(running)),
+        // Neither reaches a handler: there is a switcher, and the gate holds
+        // every request until the warm-up has run. Were one to, the request's
+        // own model check refuses it by name.
+        Err(SwitchRefusal::Unavailable | SwitchRefusal::WarmingUp) => return Ok(()),
+    };
+    let failed = |reason: String| Err(ImplicitRefusal::Failed { to: requested.to_owned(), reason });
+    match task.await {
+        Ok(SwitchOutcome::Switched) => Ok(()),
+        Ok(SwitchOutcome::Refused { reason } | SwitchOutcome::Restored { reason } | SwitchOutcome::Failed { reason }) => {
+            failed(reason)
+        }
+        Err(ended) => failed(format!("the switch ended before it finished: {ended}")),
+    }
 }
 
 /// The switch itself, steps 2 to 5 of the module doc. `serving_before` is

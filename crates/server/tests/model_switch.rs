@@ -1,17 +1,23 @@
 //! The model switch's orchestration (spec model-switch/01, GitHub #305),
 //! driven directly — not through HTTP — over two or more `MockCompute`
 //! models: the gate, the drain, the teardown before the load, and every way
-//! a switch can fail without stopping the server. No GPU, and no wall-clock
+//! a switch can fail without stopping the server — and the implicit switch a
+//! request's own `model` begins (§Implicit switch). No GPU, and no wall-clock
 //! timing proves anything (ADR 0006): a request is held mid-decode with
 //! spec server/05's gate, a load with the mock loader's own hold.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ignis_core::{DecodeParams, FinishReason, RequestClass, RequestInput};
 use ignis_logging::{JsonLayer, MemorySink};
 use ignis_server::engine::{collect_completion, Engine, EventStream};
-use ignis_server::model_switch::{begin, ArtifactLoader, SwitchOutcome, SwitchRefusal, SwitchStarted, Switcher};
+use ignis_server::model_switch::{
+    begin, implicit_switch, known_models, ArtifactLoader, ImplicitRefusal, SwitchOutcome, SwitchRefusal, SwitchStarted,
+    Switcher,
+};
 use ignis_server::{ActiveModel, ModelStatus, Server};
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -291,4 +297,161 @@ async fn a_pinned_request_keeps_the_model_it_began_on_across_a_switch() {
     let refused = pinned.active().engine.submit(input("mock-a", 3), RequestClass::Interactive).await;
     assert!(matches!(refused, Err(ignis_core::SubmitError::Full)), "{refused:?}");
     assert_eq!(*pinned.status(), ModelStatus::Serving, "the status is the server's, shared");
+}
+
+// ── the implicit switch: a request's own `model` (spec §Implicit switch) ──
+
+/// The known-models table naming each of `ids` at the artifact
+/// [`source`] gives it.
+fn known(ids: &[&str]) -> BTreeMap<String, PathBuf> {
+    ids.iter().map(|id| (id.to_string(), source(id).artifact)).collect()
+}
+
+/// [`server_on`], with `ids` switchable by a request's `model`.
+fn implicit_server_on(loader: &Arc<MockLoader>, model: ActiveModel, ids: &[&str]) -> Server {
+    Server::from_active(model)
+        .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_known_models(known(ids)))
+}
+
+/// Wait (scheduling turns, bounded) until `server` reports a switch.
+async fn until_switching(server: &Server) {
+    for _ in 0..10_000 {
+        if matches!(*server.status(), ModelStatus::Switching { .. }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("no switch began");
+}
+
+/// AC 17, 21: naming a known model switches to it, and the call returns once
+/// it serves — the request is then served on it, not handed a `202`.
+#[tokio::test]
+async fn naming_a_known_model_switches_to_it_and_returns_once_it_serves() {
+    let loader = MockLoader::new();
+    let server = implicit_server_on(&loader, loader.model("mock-a"), &["mock-a", "mock-b"]);
+
+    assert_eq!(implicit_switch(&server, Some("mock-b")).await, Ok(()));
+    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(*server.status(), ModelStatus::Serving);
+    assert_eq!(loader.loads(), ["mock-b"]);
+    assert_eq!(loader.resident_at_load(), [0], "the same teardown-then-load as an explicit switch");
+    serves(&server).await;
+
+    assert_eq!(implicit_switch(&server, Some("mock-a")).await, Ok(()), "and back");
+    assert_eq!(server.active().engine.model_id(), "mock-a");
+    assert_eq!(loader.loads(), ["mock-b", "mock-a"]);
+}
+
+/// AC 19: nothing named, the loaded model, a model nobody listed, or any
+/// model with implicit switching off (no table) — nothing switches, and the
+/// request's own check answers as it always did.
+#[tokio::test]
+async fn naming_nothing_the_loaded_model_or_an_unlisted_one_switches_nothing() {
+    let loader = MockLoader::new();
+    let server = implicit_server_on(&loader, loader.model("mock-a"), &["mock-a", "mock-b"]);
+    let before = server.active();
+    for requested in [None, Some(""), Some("mock-a"), Some("mock-z")] {
+        assert_eq!(implicit_switch(&server, requested).await, Ok(()), "{requested:?}");
+    }
+    let off = server_on(&loader, loader.model("mock-a"), PATIENT);
+    assert_eq!(implicit_switch(&off, Some("mock-b")).await, Ok(()), "no known models: switching is off");
+    let bare = Server::from_active(loader.model("mock-a"));
+    assert_eq!(implicit_switch(&bare, Some("mock-b")).await, Ok(()), "no switcher at all");
+
+    assert!(Arc::ptr_eq(&before, &server.active()));
+    assert_eq!(*server.status(), ModelStatus::Serving);
+    assert_eq!(*off.status(), ModelStatus::Serving);
+    assert!(loader.loads().is_empty(), "{:?}", loader.loads());
+}
+
+/// AC 20 and §Implicit switch's ordering: the gate closes the moment the
+/// mismatch is seen, the triggering call waits out the drain of what was
+/// already running, and a second request naming a model meanwhile — any
+/// model, the same target included — is told a switch is under way rather
+/// than queueing or retargeting one.
+#[tokio::test]
+async fn the_gate_closes_at_once_the_drain_runs_first_and_a_second_request_is_told_a_switch_runs() {
+    let loader = MockLoader::new();
+    let (model, gated, gate) = loader.gated_model("mock-a");
+    gated.arm();
+    drop(gated);
+    let server = implicit_server_on(&loader, model, &["mock-a", "mock-b", "mock-c"]);
+    let old = server.active().engine.clone();
+    let mut held = ask(&old, 4).await;
+    gate.wait_entered();
+    until_in_flight(&old, 1).await;
+
+    let trigger = tokio::spawn({
+        let server = server.clone();
+        async move { implicit_switch(&server, Some("mock-b")).await }
+    });
+    until_switching(&server).await;
+    assert_eq!(*server.status(), ModelStatus::Switching { from: "mock-a".into(), to: "mock-b".into() });
+    let running = SwitchStarted { from: "mock-a".into(), to: "mock-b".into() };
+    for other in ["mock-c", "mock-b"] {
+        assert_eq!(
+            implicit_switch(&server, Some(other)).await,
+            Err(ImplicitRefusal::Switching(running.clone())),
+            "{other}"
+        );
+    }
+    assert!(!trigger.is_finished(), "the trigger waits for the drain, which waits for the held request");
+    assert!(loader.loads().is_empty(), "nothing loads before the old model's requests are done");
+
+    gate.release();
+    let completion = collect_completion(&mut held, Duration::from_secs(5)).await.expect("the held request completes");
+    assert_eq!(completion.reason, FinishReason::Length, "drained, not cut");
+    assert_eq!(trigger.await.expect("the trigger task"), Ok(()));
+    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(loader.loads(), ["mock-b"], "one switch, not one per request that named a model");
+}
+
+/// A request is never served on a model it did not name: a switch that did
+/// not land its target refuses it with the switch's own reason, whether the
+/// target was refused before anything stopped or failed on the GPU and the
+/// previous model was reloaded.
+#[tokio::test]
+async fn a_switch_that_does_not_land_refuses_the_request_with_its_reason() {
+    let loader = MockLoader::new();
+    loader.refuse("mock-refused");
+    loader.break_load("mock-broken");
+    let server = implicit_server_on(&loader, loader.model("mock-a"), &["mock-a", "mock-refused", "mock-broken"]);
+
+    let Err(ImplicitRefusal::Failed { to, reason }) = implicit_switch(&server, Some("mock-refused")).await else {
+        panic!("refused at prepare");
+    };
+    assert_eq!(to, "mock-refused");
+    assert!(reason.contains("refused at prepare"), "{reason}");
+    assert_eq!(server.active().engine.model_id(), "mock-a");
+
+    let Err(ImplicitRefusal::Failed { to, reason }) = implicit_switch(&server, Some("mock-broken")).await else {
+        panic!("failed on the load");
+    };
+    assert_eq!(to, "mock-broken");
+    assert!(reason.contains("simulated kernel load error"), "{reason}");
+    assert_eq!(server.active().engine.model_id(), "mock-a", "the previous model was reloaded");
+    assert_eq!(*server.status(), ModelStatus::Serving);
+    serves(&server).await;
+}
+
+/// The table a server starts with: the operator's entries and the model it
+/// started on, whose own id and artifact win over an entry naming the same
+/// id — a switch back reloads what was actually loaded.
+#[test]
+fn the_model_the_server_starts_on_is_always_known() {
+    let named = BTreeMap::from([
+        ("mock-b".to_owned(), PathBuf::from("b.ninfer")),
+        ("mock-a".to_owned(), PathBuf::from("elsewhere/a.ninfer")),
+    ]);
+    let table = known_models(&named, Some(&source("mock-a")));
+    assert_eq!(
+        table,
+        BTreeMap::from([
+            ("mock-a".to_owned(), source("mock-a").artifact),
+            ("mock-b".to_owned(), PathBuf::from("b.ninfer")),
+        ])
+    );
+    assert_eq!(known_models(&BTreeMap::new(), Some(&source("mock-c"))), known(&["mock-c"]), "no flag needed");
+    assert_eq!(known_models(&named, None), named, "a start with no artifact adds nothing");
 }

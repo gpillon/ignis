@@ -7,6 +7,7 @@
 //! fast unit tests instead of only end-to-end runs. `main` calls it once and
 //! does nothing else config-related.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::instruction::{DeveloperMessagePolicy, InstructionPolicy, SystemMessagePolicy};
@@ -68,6 +69,14 @@ pub const DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 30;
 /// The upper bound `--switch-drain-timeout` accepts: a ceiling against a
 /// fat-fingered value, as [`MAX_REQUEST_TIMEOUT_SECS`] is for its flag.
 pub const MAX_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 3600;
+
+/// Whether a request naming another model may switch the server to it
+/// without anyone saying so (`--allow-model-switch`, spec model-switch/01
+/// §Implicit switch). On: the owner's clients name the model they want and
+/// expect it served, and only a model `--known-model` lists can be loaded
+/// this way, so the default moves the server to nothing the operator did not
+/// name.
+pub const DEFAULT_ALLOW_MODEL_SWITCH: bool = true;
 
 /// The upper bound `--request-timeout`/`IGNIS_REQUEST_TIMEOUT` accepts: a
 /// ceiling against a fat-fingered value, not a real operating point — a
@@ -258,6 +267,22 @@ pub struct Config {
     /// it cancels them. In `[0, MAX_SWITCH_DRAIN_TIMEOUT_SECS]`; 0 cuts them
     /// at once.
     pub switch_drain_timeout_secs: u32,
+    /// Whether a request whose `model` names another model listed in
+    /// [`Config::known_models`] switches the server to it, and is then served
+    /// on it (`--allow-model-switch` / `IGNIS_ALLOW_MODEL_SWITCH`, spec
+    /// model-switch/01 §Implicit switch; [`DEFAULT_ALLOW_MODEL_SWITCH`]).
+    /// Off, such a request is refused as an unknown model is. `POST
+    /// /v1/models/switch` is not this flag's: it is an explicit switch.
+    pub allow_model_switch: bool,
+    /// The models a request may switch to by naming them, each with the
+    /// artifact it loads from (`--known-model <id>=<path>`, repeatable /
+    /// `IGNIS_KNOWN_MODELS`, `;`-separated pairs). The operator's entries
+    /// only: the model the server starts on joins them once its load has
+    /// said which id it serves under and from which file
+    /// (`crate::model_switch::known_models`) — neither is known here, since an
+    /// unnamed `--model` takes the artifact's own id and a fetched artifact
+    /// its download path.
+    pub known_models: BTreeMap<String, PathBuf>,
     /// Serve the Playground under `/ui/` (GitHub #163, ADR 0026). On unless
     /// `--no-ui` / `IGNIS_UI=false` turns it off: a binary that embedded the
     /// build serves it, and one that did not serves the page saying how to
@@ -444,6 +469,8 @@ pub fn resolve(
     let mut developer_message_policy = None;
     let mut request_timeout = None;
     let mut switch_drain_timeout = None;
+    let mut allow_model_switch = None;
+    let mut known_models = Vec::new();
     let mut spec = None;
     let mut draft_tokens = None;
     let mut draft_rows = None;
@@ -505,6 +532,9 @@ pub fn resolve(
             }
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--switch-drain-timeout" => switch_drain_timeout = Some(take_value(args, &mut i, flag)?),
+            "--allow-model-switch" => allow_model_switch = Some(take_value(args, &mut i, flag)?),
+            // Repeatable: every occurrence names one more model.
+            "--known-model" => known_models.push(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
             "--draft-rows" => draft_rows = Some(take_value(args, &mut i, flag)?),
@@ -618,6 +648,8 @@ pub fn resolve(
     };
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let switch_drain_timeout_secs = resolve_switch_drain_timeout_secs(switch_drain_timeout, &env)?;
+    let allow_model_switch = resolve_allow_model_switch(allow_model_switch, &env)?;
+    let known_models = resolve_known_models(known_models, &env)?;
     let speculation_off = non_empty(spec.clone().or_else(|| env("IGNIS_SPEC"))).is_some_and(|s| s.trim() == "off");
     let speculation = if speculation_off {
         // `--spec off` has nothing to size or to score with: a window or a head
@@ -744,6 +776,8 @@ pub fn resolve(
         media,
         request_timeout_secs,
         switch_drain_timeout_secs,
+        allow_model_switch,
+        known_models,
         ui: resolve_ui(ui, &env)?,
         metrics,
         api_key,
@@ -1601,6 +1635,67 @@ fn resolve_switch_drain_timeout_secs(
     Ok(secs)
 }
 
+/// `--allow-model-switch` / `IGNIS_ALLOW_MODEL_SWITCH` /
+/// [`DEFAULT_ALLOW_MODEL_SWITCH`]: a value always, never a bare switch, so
+/// turning a default-on behaviour off reads the same on the command line and
+/// in the environment.
+fn resolve_allow_model_switch(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<bool, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_ALLOW_MODEL_SWITCH"))) else {
+        return Ok(DEFAULT_ALLOW_MODEL_SWITCH);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
+        _ => Err(ConfigError(format!("`--allow-model-switch` must be true or false, got `{raw}`"))),
+    }
+}
+
+/// `--known-model <id>=<path>`, repeatable, else `IGNIS_KNOWN_MODELS`'
+/// `;`-separated pairs — `;` because a Windows path may hold a `,` but never
+/// a `;`. Any flag replaces the variable whole rather than adding to it, as a
+/// flag overrides its variable everywhere else here. Each pair splits at its
+/// first `=`; an id may not carry the `@` that starts a lane tag, since a
+/// request's `model` loses its tag before it is looked up and so could never
+/// name it. An id named twice is refused, not last-wins: two paths for one
+/// id leave nothing to say which the operator meant.
+fn resolve_known_models(
+    flags: Vec<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<BTreeMap<String, PathBuf>, ConfigError> {
+    let (entries, source) = if flags.is_empty() {
+        let raw = env("IGNIS_KNOWN_MODELS").unwrap_or_default();
+        let entries = raw.split(';').filter(|entry| !entry.trim().is_empty()).map(str::to_owned).collect();
+        (entries, "IGNIS_KNOWN_MODELS")
+    } else {
+        (flags, "--known-model")
+    };
+    let mut known = BTreeMap::new();
+    for entry in entries {
+        let Some((id, path)) = entry.split_once('=') else {
+            return Err(ConfigError(format!(
+                "`{source}` entries are `<id>=<path>` (`--known-model`), got `{entry}`"
+            )));
+        };
+        let (id, path) = (id.trim(), path.trim());
+        if id.is_empty() || path.is_empty() {
+            let missing = if id.is_empty() { "id" } else { "path" };
+            return Err(ConfigError(format!("`{source}` entry `{entry}` (`--known-model`) has no {missing}")));
+        }
+        if id.contains('@') {
+            return Err(ConfigError(format!(
+                "`{source}` id `{id}` (`--known-model`) holds an `@`, which starts a request's lane tag: no request could name it"
+            )));
+        }
+        if known.insert(id.to_owned(), PathBuf::from(path)).is_some() {
+            return Err(ConfigError(format!("`{source}` (`--known-model`) names `{id}` twice")));
+        }
+    }
+    Ok(known)
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
@@ -1660,6 +1755,8 @@ fn help_text() -> String {
          \x20       --developer-message-policy <p> env: IGNIS_DEVELOPER_MESSAGE_POLICY (default: inplace; inplace, into-system, after-system, one-after-system or reject; a leading developer message is the system prompt except under reject)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --switch-drain-timeout <secs> env: IGNIS_SWITCH_DRAIN_TIMEOUT (default: {DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS}; max {MAX_SWITCH_DRAIN_TIMEOUT_SECS}; how long POST /v1/models/switch lets the old model's running requests finish before it cancels them; 0 cancels them at once)\n\
+         \x20       --allow-model-switch <true|false> env: IGNIS_ALLOW_MODEL_SWITCH (default: true; a request whose model names another model --known-model lists switches the server to it, then is served on it; false refuses it with 404 model_not_found, as an unknown model is; POST /v1/models/switch is not affected)\n\
+         \x20       --known-model <id>=<path> env: IGNIS_KNOWN_MODELS  (repeatable; the env var takes `;`-separated pairs; default: only the model the server starts on; a model a request may switch to by naming it, and the artifact it loads from)\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2 on the 27B, mtp on Flash-Next with its companion container beside the artifact, off)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (1..{MAX_DRAFT_TOKENS}; required with --spec dflash2; with --spec mtp the most drafts a lane verifies, default {FLASH_NEXT_DEFAULT_DRAFT_TOKENS})\n\
          \x20       --draft-rows <n>          env: IGNIS_DRAFT_ROWS     (Flash-Next mtp only; default: 0 = {FLASH_NEXT_VERIFY_ROWS}; rows a verify round takes across lanes, 0 or 2..{FLASH_NEXT_VERIFY_ROWS}; 3 drafts at one lane only)\n\
@@ -2804,6 +2901,116 @@ mod tests {
             panic!("expected Help");
         };
         assert!(text.contains("--switch-drain-timeout"), "{text}");
+    }
+
+    // ── the implicit switch (spec model-switch/01 §Implicit switch) ─────
+
+    #[test]
+    fn a_model_field_may_switch_models_unless_the_operator_says_otherwise() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert!(config.allow_model_switch);
+        assert!(DEFAULT_ALLOW_MODEL_SWITCH);
+        for (raw, on) in [("true", true), ("1", true), ("ON", true), ("false", false), ("0", false), ("off", false)] {
+            let config = expect_config(resolve(&args(&["--allow-model-switch", raw]), no_env).expect("resolve"));
+            assert_eq!(config.allow_model_switch, on, "--allow-model-switch {raw}");
+        }
+        let env = env_map(&[("IGNIS_ALLOW_MODEL_SWITCH", "off")]);
+        assert!(!expect_config(resolve(&[], env).expect("resolve")).allow_model_switch);
+        let env = env_map(&[("IGNIS_ALLOW_MODEL_SWITCH", "off")]);
+        let config = expect_config(resolve(&args(&["--allow-model-switch", "on"]), env).expect("resolve"));
+        assert!(config.allow_model_switch, "the flag wins over the env var");
+    }
+
+    #[test]
+    fn allow_model_switch_takes_a_value_and_only_a_boolean_one() {
+        let err = resolve(&args(&["--allow-model-switch", "maybe"]), no_env).expect_err("must reject");
+        assert!(err.0.contains("--allow-model-switch") && err.0.contains("maybe"), "{err}");
+        let err = resolve(&args(&["--allow-model-switch"]), no_env).expect_err("a value is required");
+        assert!(err.0.contains("--allow-model-switch"), "{err}");
+        let env = env_map(&[("IGNIS_ALLOW_MODEL_SWITCH", "yes")]);
+        assert!(resolve(&[], env).is_err(), "the env var is refused as the flag is");
+    }
+
+    #[test]
+    fn known_models_are_none_by_default_and_each_flag_names_one() {
+        assert!(expect_config(resolve(&[], no_env).expect("resolve")).known_models.is_empty());
+        let a = args(&[
+            "--known-model",
+            "qwen3.8-flash-next=F:/models/Qwen3.8-Flash-Next.ninfer",
+            "--known-model",
+            " qwen3.8-27b = F:\\models\\Qwen3.8-27B.ninfer ",
+        ]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(
+            config.known_models,
+            std::collections::BTreeMap::from([
+                ("qwen3.8-flash-next".to_owned(), PathBuf::from("F:/models/Qwen3.8-Flash-Next.ninfer")),
+                ("qwen3.8-27b".to_owned(), PathBuf::from("F:\\models\\Qwen3.8-27B.ninfer")),
+            ])
+        );
+    }
+
+    #[test]
+    fn known_models_split_on_the_first_equals_sign_only() {
+        let a = args(&["--known-model", "odd=D:/a=b/model.ninfer"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(config.known_models["odd"], PathBuf::from("D:/a=b/model.ninfer"));
+    }
+
+    #[test]
+    fn the_known_models_env_var_takes_semicolon_separated_pairs_and_any_flag_replaces_it() {
+        let env = env_map(&[(
+            "IGNIS_KNOWN_MODELS",
+            "qwen3.8-27b=C:/Program Files, x86/27B.ninfer; qwen3.8-flash-next=F:/fn.ninfer;",
+        )]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.known_models.len(), 2, "{:?}", config.known_models);
+        assert_eq!(
+            config.known_models["qwen3.8-27b"],
+            PathBuf::from("C:/Program Files, x86/27B.ninfer"),
+            "a comma is part of a Windows path, not a separator"
+        );
+        assert_eq!(config.known_models["qwen3.8-flash-next"], PathBuf::from("F:/fn.ninfer"));
+
+        let env = env_map(&[("IGNIS_KNOWN_MODELS", "qwen3.8-27b=F:/27b.ninfer;qwen3.8-flash-next=F:/fn.ninfer")]);
+        let a = args(&["--known-model", "other=F:/other.ninfer"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(
+            config.known_models.keys().collect::<Vec<_>>(),
+            ["other"],
+            "a flag overrides its env var whole, as every flag here does"
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_twice_named_known_model_is_a_usage_error() {
+        for (entry, says) in [
+            ("qwen3.8-27b", "<id>=<path>"),
+            ("=F:/27b.ninfer", "id"),
+            ("qwen3.8-27b=", "path"),
+            ("qwen3.8-27b@agent=F:/27b.ninfer", "@"),
+        ] {
+            let err = resolve(&args(&["--known-model", entry]), no_env).expect_err(entry);
+            assert!(err.0.contains("--known-model") && err.0.contains(says), "{entry}: {err}");
+        }
+        let a = args(&["--known-model", "m=F:/a.ninfer", "--known-model", "m=F:/b.ninfer"]);
+        let err = resolve(&a, no_env).expect_err("named twice");
+        assert!(err.0.contains("`m`") && err.0.contains("twice"), "{err}");
+        let env = env_map(&[("IGNIS_KNOWN_MODELS", "m=F:/a.ninfer;oops")]);
+        let err = resolve(&[], env).expect_err("the env var is checked as the flags are");
+        assert!(err.0.contains("IGNIS_KNOWN_MODELS") && err.0.contains("oops"), "{err}");
+        assert!(resolve(&args(&["--known-model"]), no_env).is_err(), "a value is required");
+    }
+
+    #[test]
+    fn help_lists_the_implicit_switch_flags() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        for flag in ["--allow-model-switch", "IGNIS_ALLOW_MODEL_SWITCH", "--known-model", "IGNIS_KNOWN_MODELS"] {
+            assert!(text.contains(flag), "{flag}: {text}");
+        }
     }
 
     #[test]

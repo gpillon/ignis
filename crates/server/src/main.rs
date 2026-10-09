@@ -76,6 +76,13 @@
 //!   cancels them (default 30 seconds, max 3600, 0 cancels at once — spec
 //!   model-switch/01). A switch loads its target on the flags the server
 //!   started with, leaving off the ones only the other model takes.
+//! - `IGNIS_ALLOW_MODEL_SWITCH` / `--allow-model-switch <true|false>` and
+//!   `IGNIS_KNOWN_MODELS` / `--known-model <id>=<path>` (repeatable; the env
+//!   var takes `;`-separated pairs) — a request whose `model` names another
+//!   listed model switches the server to it and is then served on it (default
+//!   on; spec model-switch/01 §Implicit switch). The model the server starts
+//!   on is always listed; off, or unlisted, such a request is a `404
+//!   model_not_found`, as it always was.
 //! - `--ui` / `--no-ui` / `IGNIS_UI` — serve the Playground at `/ui/`
 //!   (GitHub #163, ADR 0026); **on** by default. A binary built without
 //!   `web/dist` serves the page that says how to build it, so the default
@@ -209,6 +216,8 @@ async fn main() {
         media: _,
         request_timeout_secs,
         switch_drain_timeout_secs,
+        allow_model_switch,
+        known_models,
         ui,
         metrics,
         api_key,
@@ -323,13 +332,29 @@ async fn main() {
         Server::from_active(ActiveModel::new(engine, Arc::new(SimpleTemplateProvider)).with_driver(driver))
     }
     .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
-    .with_instruction_policy(instruction_policy)
+    .with_instruction_policy(instruction_policy);
     // Spec model-switch/01: `POST /v1/models/switch` loads every later model
-    // through the same path, on the same start options.
-    .with_switcher(ignis_server::model_switch::Switcher::new(
-        Arc::new(ignis_server::model_switch::ArtifactLoader::new(start_options.clone())),
-        std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
-    ));
+    // through the same path, on the same start options — and so does a
+    // request naming a known model (§Implicit switch), the start model among
+    // them once its load has said which id and file it is.
+    let known = if allow_model_switch {
+        ignis_server::model_switch::known_models(&known_models, server.active().source.as_ref())
+    } else {
+        Default::default()
+    };
+    tracing::info!(
+        name: "ignis.config.model_switch",
+        allow_model_switch,
+        known_models = %known.keys().cloned().collect::<Vec<_>>().join(","),
+        "a request naming one of these models, other than the loaded one, switches the server to it"
+    );
+    let server = server.with_switcher(
+        ignis_server::model_switch::Switcher::new(
+            Arc::new(ignis_server::model_switch::ArtifactLoader::new(start_options.clone())),
+            std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
+        )
+        .with_known_models(known),
+    );
 
     // GitHub #209: joining or gathering developer messages trades prefix
     // reuse for fewer system blocks; the operator is told once, at start.
