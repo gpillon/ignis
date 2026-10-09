@@ -253,7 +253,6 @@ impl SwitchingLiveServer {
                         "model": model,
                         "messages": [{ "role": "user", "content": "Say hello." }],
                         "max_tokens": 8,
-                        "enable_thinking": false,
                     })
                     .to_string(),
                 )
