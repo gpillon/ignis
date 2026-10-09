@@ -24,7 +24,7 @@
 //!
 //! The load matches the served one where it matters for a round's cost: the
 //! hq-e8-2b KV, captured graphs and a 17.0 GB expert cache (the served plan
-//! at the 4G headroom default gives 16.2-17.2 GB). Machine-local:
+//! at the 4G headroom, the default until 2026-10-09, gives 16.2-17.2 GB). Machine-local:
 //! `F:/ai/models/Qwen3.8-Flash-Next-ignis/` or `IGNIS_FLASH_NEXT_DIR`. Needs
 //! the GPU lock and ~38 GB of free RAM for the pinned expert pool.
 

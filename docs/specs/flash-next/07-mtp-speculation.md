@@ -416,9 +416,9 @@ Together they exercise every A in 0..k on every component.
 | verify scratch (rows = lanes × (k+1) ≤ 12) | tens of MB, measured |
 | continuation stack | 20 KB per lane, plus in each image |
 
-Total ≈ 1.1 GB, taken from the expert cache. At the 4G-headroom default the
-cache is ~17.6 GB, so it would be ~16.5 GB. The process plus desktop still
-fits spec 04's 29 GB. The cache shrinks ~6%; AC7 bounds the cost in hit rate.
+Total ≈ 1.1 GB, taken from the expert cache. At the 4G headroom (the default when
+this was written; 1G since 2026-10-09) the cache is ~17.6 GB, so it would be
+~16.5 GB. The process plus desktop still fits spec 04's 29 GB at that headroom. The cache shrinks ~6%; AC7 bounds the cost in hit rate.
 
 ### Expected speedup (one lane, before measurement)
 

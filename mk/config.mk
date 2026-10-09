@@ -68,11 +68,10 @@ ifeq ($(MODEL_FAMILY),flash-next)
   # margin -- the whole ~29 GB table when that fits, and then no step reads
   # the NVMe. Empty = the server's 1G.
   NGRAM_HOT_BYTES ?=
-  # The budget is free VRAM minus this headroom, so the process plus the
-  # desktop ends at 32.6 GB - 4 GB, under spec flash-next/04 AC10's 29 GB,
-  # whatever the desktop holds; the expert cache takes the rest of it. A named
-  # VRAM_BUDGET wins: the server refuses a budget and a headroom together.
-  VRAM_HEADROOM ?= $(if $(VRAM_BUDGET),,4G)
+  # No Flash-Next headroom of its own: the server's 1G, as on the 27B (the
+  # owner's call, 2026-10-09; it was 4G for spec flash-next/04 AC10's 29 GB
+  # with the desktop). The expert cache takes what the budget leaves, so each
+  # GB given back is cache. VRAM_HEADROOM=4G restores the old ceiling.
 endif
 
 # The .ninfer container (used with CUDA=1 only). See README "Models".

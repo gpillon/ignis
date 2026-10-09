@@ -115,7 +115,8 @@ fn attributes(records: &[serde_json::Value], name: &str) -> serde_json::Value {
 }
 
 /// ADR 0045 on the card (spec vram-budget/03 ACs 2, 6, 7): at the make
-/// default -- 262,144 tokens, three lanes, a 4 GiB headroom -- the pool is
+/// default of its day -- 262,144 tokens, three lanes, a 4 GiB headroom (1 GiB
+/// since 2026-10-09; the test keeps 4 GiB, its plan is relative) -- the pool is
 /// offloaded at 524,288 tokens, the leaf builds those pages, and the plan
 /// event says so; an explicit budget that leaves the expert cache below its
 /// floor is refused naming the opt-in, and with it starts and warns. The
