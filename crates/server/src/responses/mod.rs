@@ -161,15 +161,18 @@ pub(crate) async fn create_response(
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
+    // The engine the request is submitted to is the one its cancel guard
+    // must reach, whatever a model switch does meanwhile.
+    let engine = server.active().engine.clone();
     let (request_id, mut scheduled) =
-        match server.engine.submit_with_notes(prepared.input, prepared.class, prepared.notes).await {
+        match engine.submit_with_notes(prepared.input, prepared.class, prepared.notes).await {
             Ok(submitted) => submitted,
             Err(err) => return api::submit_error(&server, err),
         };
     // GitHub #81 / ADR 0012: see the matching comment in `chat_completions`.
     tracing::Span::current().record("request_id", request_id);
     let mut events = prepared.start.events(request_id.to_string(), created_at(&server));
-    let mut cancel = CancelOnDrop::new(server.engine.clone(), request_id);
+    let mut cancel = CancelOnDrop::new(engine, request_id);
     let deadline = tokio::time::Instant::now() + server.request_timeout;
 
     if stream {

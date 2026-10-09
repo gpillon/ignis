@@ -3,7 +3,9 @@
 //!
 //! Endpoints (`docs/design/ignis-v1.md` §2; open unless `--api-key` is set,
 //! then each needs `Authorization: Bearer <key>` or answers `401`):
-//! - `GET /v1/models` — the loaded model.
+//! - `GET /v1/models` — the loaded model, and whether it is serving or
+//!   being switched; `POST /v1/models/switch` replaces it (spec
+//!   model-switch/01).
 //! - `POST /v1/chat/completions` — chat completions, streaming (SSE) and
 //!   non-streaming; routes into the core scheduler and streams tokens back
 //!   as they are generated.
@@ -41,7 +43,7 @@ use ignis_core::{
     DecodeParams, FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, SubmitError,
 };
 
-use crate::Server;
+use crate::{ModelSource, ModelStatus, Server};
 use crate::decoder::{Channel, OutputDecoder};
 use crate::engine::{Completion, Engine, EventStream, RequestNotes, collect_completion, drain_tokens};
 use crate::media::{has_media, MediaRejection, MediaStats};
@@ -90,14 +92,14 @@ pub fn router(state: Arc<Server>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         // Outermost (GitHub #129): a keyed server's readiness probe, which
         // sends no key, must see 503 until the warm-up has run, not a 401.
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_ready));
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_serving));
     // The body cap, enforced before JSON parsing: wider with `--vision`,
     // which takes images inline as base64 data URIs (GitHub #179), than for
     // a text-only load, which only ever carries a prompt (GitHub #230).
     // Both are past what their own load can use, so the refusal an operator
     // meets is the one that names the real limit -- the context, or the
     // media budget -- rather than a byte count.
-    router = router.layer(axum::extract::DefaultBodyLimit::max(if state.media.is_some() {
+    router = router.layer(axum::extract::DefaultBodyLimit::max(if state.active().media.is_some() {
         MEDIA_REQUEST_BODY_LIMIT
     } else {
         TEXT_REQUEST_BODY_LIMIT
@@ -146,6 +148,8 @@ pub fn router(state: Arc<Server>) -> Router {
 fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
     let (router, mut document) = OpenApiRouter::with_openapi(crate::openapi::ApiDoc::openapi())
         .routes(routes!(list_models))
+        // Spec model-switch/01: replace the loaded model.
+        .routes(routes!(switch_model))
         .routes(routes!(chat_completions))
         // GitHub #285: the prompt counted without being served. Neither
         // reaches the scheduler.
@@ -166,6 +170,7 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
             post(crate::decide::decide).options(cors_preflight),
         )
         .route("/v1/models", options(cors_preflight))
+        .route("/v1/models/switch", options(cors_preflight))
         .route("/v1/chat/completions", options(cors_preflight))
         .route("/v1/tokenize", options(cors_preflight))
         .route("/v1/detokenize", options(cors_preflight))
@@ -231,22 +236,52 @@ impl<B> MakeSpan<B> for RootSpanMaker {
 /// header on a WebSocket, and this is OpenAI's Realtime convention for it.
 /// The entry is read here and never selected back to the client
 /// (`crate::responses::socket`).
-/// 503 `server_not_ready` on every `/v1` route until the first traversal
-/// has run (GitHub #129, [`Server::warm_up`]). Outside the key layer, so a
-/// probe with no key still reads the state (it says nothing else); a
-/// preflight passes. `Retry-After` tells a client when to ask again.
-async fn require_ready(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
-    if server.is_ready() || req.method() == axum::http::Method::OPTIONS {
+/// Admits a `/v1` request only while a model is [`ModelStatus::Serving`]
+/// (GitHub #129, generalized by spec model-switch/01): 503
+/// `server_not_ready` until the first traversal has run
+/// ([`Server::warm_up`]) or while a failed switch has nothing serving, and
+/// 503 `model_switching` while a switch is replacing the model. Outside the
+/// key layer, so a probe with no key still reads the state (it says nothing
+/// else); a preflight passes. `Retry-After` tells a client when to ask
+/// again.
+///
+/// While a switch runs or has failed, the two routes that report and drive
+/// it stay open — `GET /v1/models` (whose `status` says what is happening)
+/// and `POST /v1/models/switch` (which answers a second switch `409`, and
+/// is how a failed one is recovered from). During the warm-up they are held
+/// like every other route, as they always were.
+async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
+    let status = server.status();
+    let Some(code) = status.refusal() else {
+        return next.run(req).await;
+    };
+    let switch_route = matches!(*status, ModelStatus::Switching { .. } | ModelStatus::Failed { .. })
+        && reports_or_drives_the_switch(req.method(), req.uri().path());
+    if switch_route || req.method() == axum::http::Method::OPTIONS {
         return next.run(req).await;
     }
-    let mut res = error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "server_error",
-        "server_not_ready",
-        "the model is loaded but the first traversal (decode graph capture) has not finished; retry shortly",
-    );
+    let message = match &*status {
+        ModelStatus::Switching { from, to } => {
+            format!("the server is switching models from {from} to {to}; retry once GET /v1/models reports `serving`")
+        }
+        ModelStatus::Failed { reason } => {
+            format!("a model switch failed and no model is serving ({reason}); retry shortly")
+        }
+        ModelStatus::WarmingUp | ModelStatus::Serving => {
+            "the model is loaded but the first traversal (decode graph capture) has not finished; retry shortly"
+                .to_owned()
+        }
+    };
+    let mut res = error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", code, message);
     res.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
     res
+}
+
+/// `GET /v1/models` or `POST /v1/models/switch`: the routes a model switch
+/// keeps open ([`require_serving`]).
+fn reports_or_drives_the_switch(method: &axum::http::Method, path: &str) -> bool {
+    (method == axum::http::Method::GET && path == "/v1/models")
+        || (method == axum::http::Method::POST && path == "/v1/models/switch")
 }
 
 async fn require_api_key(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
@@ -360,9 +395,9 @@ fn build_request(
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
     let rendered = match structure {
-        Structure::PartEnds => server.template.apply_chat_template_with_part_ends(messages, thinking, tools)?,
-        Structure::Text => server.template.apply_chat_template_with_text(messages, thinking, tools)?,
-        Structure::Tokens => server.template.apply_chat_template(messages, thinking, tools)?,
+        Structure::PartEnds => server.active().template.apply_chat_template_with_part_ends(messages, thinking, tools)?,
+        Structure::Text => server.active().template.apply_chat_template_with_text(messages, thinking, tools)?,
+        Structure::Tokens => server.active().template.apply_chat_template(messages, thinking, tools)?,
     };
     request_input(server, model, rendered, params, None)
 }
@@ -377,7 +412,7 @@ fn request_input(
 ) -> Result<PreparedRequest, TemplateRejection> {
     let model = model
         .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| server.engine.model_id());
+        .unwrap_or_else(|| server.active().engine.model_id());
     let prompt_tokens = rendered.tokens.len() as u32;
     let text = rendered.text;
     if prompt_tokens == 0 {
@@ -449,7 +484,10 @@ async fn prepare_input(
     // GitHub #209: instruction messages are placed under the server's
     // policies before any template sees the conversation, on both paths.
     let messages = &server.instruction_policy.normalize(messages).map_err(template_rejection)?;
-    let Some(acquirer) = server.media.as_ref().filter(|_| has_media(messages)) else {
+    // One model for the whole render: the acquirer and the template that
+    // expands its placeholders must be the same load's.
+    let model_loaded = server.active();
+    let Some(acquirer) = model_loaded.media.as_ref().filter(|_| has_media(messages)) else {
         return build_request(server, model, messages, params, thinking, tools, structure)
             .map_err(template_rejection);
     };
@@ -458,8 +496,8 @@ async fn prepare_input(
     // A media prompt reports no text: a `locate` refuses a parts `state`
     // before it renders one.
     let prepared = match structure {
-        Structure::PartEnds => server.template.prepare_multimodal_with_part_ends(messages, thinking, tools, acquired.media),
-        Structure::Tokens | Structure::Text => server.template.prepare_multimodal(messages, thinking, tools, acquired.media),
+        Structure::PartEnds => model_loaded.template.prepare_multimodal_with_part_ends(messages, thinking, tools, acquired.media),
+        Structure::Tokens | Structure::Text => model_loaded.template.prepare_multimodal(messages, thinking, tools, acquired.media),
     };
     let (rendered, multimodal) = prepared.map_err(content_rejection)?;
     let prepared =
@@ -798,7 +836,7 @@ pub(crate) fn resolve_thinking(
         enable_thinking: server.default_enable_thinking,
         reasoning_effort: server.default_reasoning_effort,
     };
-    let capabilities = server.template.thinking_capabilities();
+    let capabilities = server.active().template.thinking_capabilities();
     thinking::resolve(fields, &defaults, &capabilities).map_err(|err| match err {
         ThinkingError::Validation(message) => bad_request(&message),
         ThinkingError::Capability(message) => error_response(
@@ -828,7 +866,7 @@ pub(crate) fn with_thinking_budget(
     let max = thinking::runs_at_max(effort, server.default_reasoning_effort);
     let resolved = thinking::resolve_thinking_budget(value, server.default_thinking_budget, max)
         .map_err(|message| bad_request_param(&message, "thinking_budget"))?;
-    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(thinking);
+    let starts_in_reasoning = server.active().template.decoder_starts_in_reasoning(thinking);
     Ok((
         DecodeParams {
             thinking_budget: resolved.budget.filter(|_| starts_in_reasoning),
@@ -982,7 +1020,7 @@ pub(crate) fn forced_tool_call(
             Some("tool_choice"),
         )
     };
-    let encode = |text: &str| server.template.encode_literal(text).filter(|ids| !ids.is_empty());
+    let encode = |text: &str| server.active().template.encode_literal(text).filter(|ids| !ids.is_empty());
     let Some(tokens) = encode(&opening) else {
         return Err(unsupported(
             "this server's template cannot encode a tool call's opening, so it cannot force a call; use tool_choice \"auto\"",
@@ -997,7 +1035,7 @@ pub(crate) fn forced_tool_call(
             field,
         ));
     }
-    let literal = match server.template.decoder_starts_in_reasoning(thinking) {
+    let literal = match server.active().template.decoder_starts_in_reasoning(thinking) {
         false => ignis_core::forced_literal::ForcedLiteral::at_generation(tokens),
         true => {
             // The scheduler sees the block close by its one `</think>`
@@ -1123,7 +1161,7 @@ pub(crate) fn submit_error(server: &Server, err: SubmitError) -> Response {
             StatusCode::NOT_FOUND,
             "model_not_found",
             "model_not_found",
-            format!("unknown model: {m} (loaded: {})", server.engine.model_id()),
+            format!("unknown model: {m} (loaded: {})", server.active().engine.model_id()),
         ),
         SubmitError::Oversized => error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1304,29 +1342,41 @@ pub(crate) fn now() -> u64 {
 
 // ── GET /v1/models ────────────────────────────────────────────────────────
 
-/// `GET /v1/models` — the loaded model (v1: a single model).
+/// `GET /v1/models` — the loaded model (one at a time), and whether it is
+/// serving or being switched (spec model-switch/01).
 #[utoipa::path(
     get,
     path = "/v1/models",
     tag = "models",
     operation_id = "list_models",
     summary = "The loaded model",
-    description = "One entry: the model this server loaded, with the context a single request may spend (`max_model_len`, prompt plus completion). A server serves one model.",
+    description = "One entry: the model this server loaded, with the context a single request may spend (`max_model_len`, prompt plus completion). A server serves one model at a time; `POST /v1/models/switch` replaces it.\n\n`status` beside the entry says what the API is doing: `serving`; `switching` while a switch replaces the model (`switching` names both ids, and the entry is still the old model until the new one serves); or `failed` when the last switch failed (`reason` says why) — briefly, while the previous model is reloaded, or until a switch succeeds when it could not be. While switching or failed this route answers; every other `/v1` route answers 503.",
     responses(
         (status = 200, description = "The loaded model.", body = ModelList),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`).", body = ApiError),
     ),
 )]
 async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
-    let id = server.engine.model_id();
+    let loaded = server.active();
+    let status = server.status();
     Json(ModelList {
         object: "list",
         data: vec![ModelInfo {
-            id,
+            id: loaded.engine.model_id(),
             object: "model",
             owned_by: "ignis",
-            max_model_len: server.engine.max_model_len(),
+            max_model_len: loaded.engine.max_model_len(),
         }],
+        status: status.as_str(),
+        switching: match &*status {
+            ModelStatus::Switching { from, to } => Some(SwitchIds { from: from.clone(), to: to.clone() }),
+            _ => None,
+        },
+        reason: match &*status {
+            ModelStatus::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        },
     })
 }
 
@@ -1335,6 +1385,106 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
 struct ModelList {
     object: &'static str,
     data: Vec<ModelInfo>,
+    /// `serving`, `switching` or `failed` (spec model-switch/01).
+    status: &'static str,
+    /// The switch under way, while `status` is `switching`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    switching: Option<SwitchIds>,
+    /// Why the last switch failed, while `status` is `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// The two ends of a model switch.
+#[derive(Serialize, ToSchema)]
+struct SwitchIds {
+    /// The id served when the switch began.
+    from: String,
+    /// The id it is loading.
+    to: String,
+}
+
+// ── POST /v1/models/switch ────────────────────────────────────────────────
+
+/// A model switch: what a restart with `--artifact` and `--model` changed
+/// would have been asked for.
+#[derive(Deserialize, ToSchema)]
+struct SwitchRequest {
+    /// The `.ninfer` container to serve, a path on the server's machine
+    /// (its sidecar beside it, as at start).
+    artifact: String,
+    /// The id to serve it under (`--model`); a known model's id must be the
+    /// artifact's own.
+    model: String,
+}
+
+/// A switch that began.
+#[derive(Serialize, ToSchema)]
+struct SwitchAccepted {
+    /// Always `switching`.
+    status: &'static str,
+    /// The id served when it began.
+    from: String,
+    /// The id it is loading.
+    to: String,
+}
+
+/// `POST /v1/models/switch` — replace the loaded model (spec
+/// model-switch/01, `crate::model_switch`).
+#[utoipa::path(
+    post,
+    path = "/v1/models/switch",
+    tag = "models",
+    operation_id = "switch_model",
+    summary = "Replace the loaded model",
+    description = "Unloads the model being served and loads `artifact` in its place under the id `model`, on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (`--vision` on Qwen3.8-Flash-Next, the other model's `--spec` backend, the Flash-Next-only knobs), which is left off for it.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
+    request_body = SwitchRequest,
+    responses(
+        (status = 202, description = "The switch began.", body = SwitchAccepted),
+        (status = 400, description = "`artifact` or `model` is empty.", body = ApiError),
+        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 409, description = "A switch is already under way (`switch_in_progress`): switches are not queued.", body = ApiError),
+        (status = 501, description = "This server was built without a model loader (`switch_unavailable`).", body = ApiError),
+        (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`).", body = ApiError),
+    ),
+)]
+async fn switch_model(State(server): State<Arc<Server>>, Json(req): Json<SwitchRequest>) -> Response {
+    if req.artifact.trim().is_empty() {
+        return bad_request_param("`artifact` must name the container to load", "artifact");
+    }
+    if req.model.trim().is_empty() {
+        return bad_request_param("`model` must name the id to serve it under", "model");
+    }
+    let target = ModelSource { artifact: req.artifact.into(), model: req.model };
+    match crate::model_switch::begin(&server, target) {
+        Ok((started, _task)) => (
+            StatusCode::ACCEPTED,
+            Json(SwitchAccepted { status: "switching", from: started.from, to: started.to }),
+        )
+            .into_response(),
+        Err(crate::model_switch::SwitchRefusal::InProgress(running)) => error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "switch_in_progress",
+            format!("a switch from {} to {} is already under way; switches are not queued", running.from, running.to),
+        ),
+        Err(crate::model_switch::SwitchRefusal::Unavailable) => error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "server_error",
+            "switch_unavailable",
+            "this server was built without a model loader and cannot switch models",
+        ),
+        Err(crate::model_switch::SwitchRefusal::WarmingUp) => {
+            let mut res = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "server_not_ready",
+                "the loaded model's first traversal has not finished; retry shortly",
+            );
+            res.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+            res
+        }
+    }
 }
 
 /// One model entry.
@@ -1532,7 +1682,10 @@ async fn chat_completions(
         };
     input.forced_literal = forced;
     let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped, ..RequestNotes::default() };
-    let (request_id, mut stream) = match server.engine.submit_with_notes(input, class, notes).await {
+    // The model the request runs on: its engine's cancel guard and its
+    // template's decoder must be the ones it was submitted to.
+    let loaded = server.active();
+    let (request_id, mut stream) = match loaded.engine.submit_with_notes(input, class, notes).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -1544,19 +1697,19 @@ async fn chat_completions(
     let id = format!("chatcmpl-{request_id}");
     let created = now();
 
-    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
+    let starts_in_reasoning = loaded.template.decoder_starts_in_reasoning(&thinking);
     if req.stream {
         // The SSE response: the request's event stream wrapped in the
         // `chat.completion.chunk` shape (a `[DONE]` marker terminates).
         let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
         return Sse::new(ChunkStream::new(
             stream,
-            CancelOnDrop::new(server.engine.clone(), request_id),
+            CancelOnDrop::new(loaded.engine.clone(), request_id),
             id,
             created,
             model,
             AnswerPipeline::new(
-                OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
+                OutputDecoder::new(loaded.template.token_decoder(), starts_in_reasoning),
                 schemas,
                 stop,
             ),
@@ -1579,11 +1732,11 @@ async fn chat_completions(
         // that completed a sequence instead of generating the tail nobody
         // will read.
         let pipeline = AnswerPipeline::new(
-            OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
+            OutputDecoder::new(loaded.template.token_decoder(), starts_in_reasoning),
             schemas,
             stop,
         );
-        return match collect_answer(&server.engine, request_id, &mut stream, server.request_timeout, pipeline).await {
+        return match collect_answer(&loaded.engine, request_id, &mut stream, server.request_timeout, pipeline).await {
             Ok(Answer { ending: AnswerEnding::Done(FinishReason::Error), .. }) => engine_error_response(),
             Ok(answer) => {
                 let (reasoning, content, calls) = answer.parts();
@@ -1603,7 +1756,7 @@ async fn chat_completions(
         Ok(Completion { reason: FinishReason::Error, .. }) => engine_error_response(),
         Ok(Completion { tokens, reason, thinking: budget, cached_tokens }) => {
             let (reasoning_content, content, tool_calls) =
-                split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking, schemas);
+                split_reasoning_and_tools(loaded.template.as_ref(), &tokens, &thinking, schemas);
             let completion_tokens = tokens.len() as u32;
             let finish_reason = resolve_finish_reason(reason, !tool_calls.is_empty(), false);
             let usage = Usage::new(prompt_tokens, completion_tokens, cached_tokens);

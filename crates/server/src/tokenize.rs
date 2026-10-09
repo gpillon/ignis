@@ -152,7 +152,7 @@ pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(req): Json<
     };
     Json(TokenizeResponse {
         count: ids.len() as u32,
-        max_model_len: server.engine.max_model_len(),
+        max_model_len: server.active().engine.max_model_len(),
         text,
         token_ids: return_ids.then_some(ids),
     })
@@ -161,7 +161,7 @@ pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(req): Json<
 
 /// The raw form: `prompt` through the tokenizer with no template around it.
 async fn raw(server: &Arc<Server>, prompt: String) -> Result<Vec<u32>, Response> {
-    let template = Arc::clone(&server.template);
+    let template = Arc::clone(&server.active().template);
     let ids = blocking(move || template.encode_literal(&prompt)).await?;
     ids.ok_or_else(|| {
         error_response(
@@ -185,7 +185,7 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
     check_roles(&messages).map_err(template_rejection)?;
     // A model with no vision tower refuses an image for that, naming itself
     // (spec flash-next/04), before this route's own reason below.
-    if !server.family.takes_images() {
+    if !server.active().family.takes_images() {
         server.check_content_parts(&messages).map_err(content_rejection)?;
     }
     // Before the content-part check, which on a load without `--vision`
@@ -225,12 +225,12 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
     // is refused here as it is there. The cap is a sampling field, inert.
     forced_tool_call(server, &tool_choice, &thinking, None)?;
     let (model, _) = resolve_model_and_class(req.model, None).map_err(|message| bad_request(&message))?;
-    if let Some(model) = model.filter(|model| !model.is_empty() && *model != server.engine.model_id()) {
+    if let Some(model) = model.filter(|model| !model.is_empty() && *model != server.active().engine.model_id()) {
         return Err(error_response(
             StatusCode::NOT_FOUND,
             "model_not_found",
             "model_not_found",
-            format!("unknown model: {model} (loaded: {})", server.engine.model_id()),
+            format!("unknown model: {model} (loaded: {})", server.active().engine.model_id()),
         ));
     }
     let structure = if req.return_text { Structure::Text } else { Structure::Tokens };
@@ -285,7 +285,7 @@ pub(crate) async fn detokenize(State(server): State<Arc<Server>>, Json(req): Jso
     if let Some(metrics) = &server.metrics {
         metrics.record_tokenize(TokenizeRoute::Detokenize);
     }
-    let template = Arc::clone(&server.template);
+    let template = Arc::clone(&server.active().template);
     let decoded = blocking(move || {
         if let Some(at) = req.token_ids.iter().position(|&id| !template.is_token(id)) {
             return Err(at_index(at, req.token_ids[at]));

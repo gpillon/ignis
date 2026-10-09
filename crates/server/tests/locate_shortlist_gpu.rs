@@ -84,7 +84,7 @@ fn harness() -> Option<Harness> {
     let (engine, driver) = Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
     let provider = ignis_server::artifact_template::ArtifactTemplateProvider::new(frontend);
     let server = Server::new(engine, Box::new(provider)).with_request_timeout(Duration::from_secs(900));
-    assert!(server.locate.is_some(), "the served artifact is calibrated for locate");
+    assert!(server.active().locate.is_some(), "the served artifact is calibrated for locate");
     Some(Harness { app: Some(server.app()), driver: Some(driver) })
 }
 

@@ -368,3 +368,54 @@ to the owner explicitly if a future spec tightens the VRAM budget to the
 point where even that momentary double allocation cannot fit — at that point
 "tear down first, accept that a failed switch is a cold-start" becomes the
 only option, and AC 9 would need revisiting.
+
+## Implementation notes (2026-10-10, branch `model-switch-305`)
+
+Where the implementation departs from the sections above, and why.
+
+- **Teardown before load, always.** §Draining step 5's "load the new model
+  before releasing the old" cannot work on the card even on a *successful*
+  switch: every load pins the KV-RAM arena, a process-wide singleton whose
+  create refuses while one exists (`kernel/src/seq.cu`,
+  `ignis_host_pinned_pool_create`: "destroy it before creating another"),
+  and every load sizes its VRAM plan from the memory NVML reports free at its
+  start (`crates/server/src/runtime.rs`), which the old model still holds.
+  So the order is steps 1-4 as written (gate, drain, teardown, load), and
+  AC 9 is kept another way: everything that can refuse a target without the
+  GPU — the path, the sidecar, the checksum, the artifact's model against
+  the start flags, the thinking defaults, the vision processor — runs
+  *before* the drain, while the old model still serves (a refusal there
+  touches nothing); a load that fails on the GPU after the teardown reloads
+  the old model from its artifact (`ActiveModel::source`). Only a reload that
+  fails too leaves `failed` standing, with the process up and a further
+  switch accepted. The Further Notes' "tear down first" option, taken.
+- **Stragglers are cut by an explicit shutdown, and end with
+  `engine_error`.** Step 6's "the command channel disconnects" never happens
+  while a streaming response's `CancelOnDrop` holds an `Engine` clone, so the
+  engine gained a `Shutdown` command: each request still on the old model is
+  sent a `Done` with `FinishReason::Error`, which every handler already
+  reports as the `engine_error` chunk — not a new `model_switching` chunk.
+  A request that reached its handler before the gate closed and submits
+  after the teardown is answered `503 engine_full` ("retry").
+- **The drain's counts are published as requests come and go,** not only at
+  a step's end: a request submitted during a long first step was otherwise
+  invisible to the drain.
+- **Flags only the other model takes are dropped for the load, not
+  refused** (`config::fit_to_family`, logged as
+  `ignis.model.switch_flags_dropped`): `--vision` on Flash-Next, the other
+  model's `--spec` backend, and the Flash-Next-only knobs on the 27B.
+  Refusing them, as a restart does, would make the switch impossible on the
+  flags the owner starts the 27B with. `--max-context` past the 27B's
+  envelope is still refused.
+- **Wire details.** Both `artifact` and `model` are required. `GET
+  /v1/models` carries `status` beside `data`, plus `switching: {from, to}`
+  while switching and `reason` while failed; it and `POST
+  /v1/models/switch` stay open while a switch runs or has failed (the gate
+  holds every other route), and both stay held during the warm-up as
+  before. A server built without a loader answers the switch `501
+  switch_unavailable`.
+- **Known limit.** The request body cap is chosen when the router is built,
+  from the start model: a server started on Flash-Next (never `--vision`)
+  keeps the text-only cap after switching to the 27B. Moot today — a switch
+  only enables vision when the start flags named it, and Flash-Next refuses
+  to start with them.

@@ -142,8 +142,9 @@ pub struct RequestNotes {
 }
 
 /// The server-side engine: a cheap, cloneable handle onto the model thread
-/// (GitHub #69) that owns the core [`Scheduler`] exclusively for the
-/// server's whole life.
+/// (GitHub #69) that owns the core [`Scheduler`] exclusively for the life of
+/// the loaded model — the server's, until a model switch replaces the engine
+/// whole (spec model-switch/01).
 pub struct Engine {
     /// The loaded model id — immutable for the engine's life (a model switch
     /// builds a new engine), so it is captured once here instead of crossing

@@ -118,7 +118,7 @@ pub(crate) async fn connect(
         .map(str::to_owned)
         .collect();
     // A frame may carry what a request body may.
-    let limit = if server.media.is_some() { api::MEDIA_REQUEST_BODY_LIMIT } else { api::TEXT_REQUEST_BODY_LIMIT };
+    let limit = if server.active().media.is_some() { api::MEDIA_REQUEST_BODY_LIMIT } else { api::TEXT_REQUEST_BODY_LIMIT };
     upgrade
         .protocols(protocols)
         .max_message_size(limit)
@@ -566,7 +566,10 @@ async fn serve(
             }
         };
     let queue = &server.responses.queue;
-    let (mut events, request, mut scheduled) = match queue.submit(&server.engine, &input, class, notes).await {
+    // The engine the request is submitted to is the one its cancel guard
+    // must reach, whatever a model switch does meanwhile.
+    let engine = server.active().engine.clone();
+    let (mut events, request, mut scheduled) = match queue.submit(&engine, &input, class, notes).await {
         Admission::Refused(refused) => {
             emit(refusal_event(api::submit_error(server, refused)).await);
             return Outcome::Failed;
@@ -585,7 +588,7 @@ async fn serve(
             let _ = outbox.send(Outgoing::Named { key, id: events.id().to_owned() });
             events.created(true).into_iter().for_each(emit);
             let admitted = tokio::select! {
-                admitted = queue.wait(&ticket, &server.engine, &input, class, notes) => admitted,
+                admitted = queue.wait(&ticket, &engine, &input, class, notes) => admitted,
                 () = &mut cancel => {
                     events.cancelled().into_iter().for_each(emit);
                     return ended(&events, items);
@@ -610,7 +613,7 @@ async fn serve(
             }
         }
     };
-    let mut guard = CancelOnDrop::new(server.engine.clone(), request);
+    let mut guard = CancelOnDrop::new(engine, request);
     // `--request-timeout` counts from admission, never from queueing.
     let deadline = tokio::time::Instant::now() + server.request_timeout;
     let driven = tokio::select! {

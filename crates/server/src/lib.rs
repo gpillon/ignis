@@ -1,7 +1,9 @@
 //! ignis-server: the OpenAI-compatible HTTP surface (localhost, no auth).
 //!
 //! v1 endpoints (server-01, `docs/design/ignis-v1.md` §2):
-//! - `GET /v1/models` — the loaded model.
+//! - `GET /v1/models` — the loaded model, and whether it is serving or
+//!   being switched; `POST /v1/models/switch` replaces it on the running
+//!   process (spec model-switch/01, `model_switch.rs`).
 //! - `POST /v1/chat/completions` — chat completions, streaming (SSE) and
 //!   non-streaming; requests route into the core scheduler and tokens
 //!   stream back as they are generated.
@@ -20,6 +22,7 @@
 //! tests use [`ignis_core::MockCompute`] (ADR 0006, CPU-only), production
 //! wires the kernel-leaf adapter when it lands.
 
+pub mod active;
 pub mod api;
 pub mod artifact_template;
 pub mod config;
@@ -33,6 +36,7 @@ pub mod locate;
 pub mod loader;
 pub mod media;
 pub mod metrics;
+pub mod model_switch;
 pub mod playground;
 pub mod numbers;
 pub mod openai_fields;
@@ -50,8 +54,10 @@ pub mod toolcall;
 
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::Router;
 
+pub use crate::active::{ActiveModel, ModelSource, ModelStatus};
 use crate::engine::Engine;
 use crate::template::TemplateProvider;
 use crate::thinking::ReasoningEffort;
@@ -60,12 +66,12 @@ use crate::thinking::ReasoningEffort;
 /// pluggable here: artifact-02 swaps in the artifact-backed provider).
 #[derive(Clone)]
 pub struct Server {
-    /// The engine: the core scheduler + per-request event routing
-    /// (submit / drive / route — `engine.rs`).
-    pub engine: Engine,
-    /// The chat-template / tokenizer seam (artifact-02 plugs the real
-    /// frontend object set in here).
-    pub template: std::sync::Arc<dyn TemplateProvider>,
+    /// The loaded model — engine, template, family, calibrations, decide
+    /// labels, vision acquirer — as one value (spec model-switch/01). Read
+    /// with [`Server::active`]; a model switch replaces it whole, so a
+    /// request that takes it once sees one model throughout. Shared by every
+    /// clone of the server, so a switch reaches every handler.
+    pub active: std::sync::Arc<ArcSwap<ActiveModel>>,
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a 504 (guards a wedged engine from hanging
     /// the client forever). An operator knob (`--request-timeout` /
@@ -89,34 +95,15 @@ pub struct Server {
     /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
     /// `None` leaves the API open.
     pub api_key: Option<crate::config::ApiKey>,
-    /// Acquires and prepares a request's images before admission (GitHub
-    /// #179); `None` on a load without `--vision`.
-    pub media: Option<std::sync::Arc<media::MediaAcquirer>>,
     /// Where `system` and `developer` messages go before the conversation is
     /// templated (`--system-message-policy` / `--developer-message-policy`,
     /// GitHub #209).
     pub instruction_policy: instruction::InstructionPolicy,
-    /// The labels `/v1/decide` may give a decision's options (GitHub #237,
-    /// #239), computed once from the loaded tokenizer.
-    ///
-    /// Once, because it is a property of the load and not of a request:
-    /// deriving it per request would re-encode 624 candidate labels on the
-    /// way to serving a prompt of 132. Empty on a provider with no real
-    /// tokenizer, and `/v1/decide` refuses rather than guessing.
-    pub alphabet: std::sync::Arc<ignis_core::decision::AnswerAlphabet>,
-    /// The heads `/v1/decide` reads to answer a `point` or a `box` in one
-    /// pass (GitHub #260, #263), looked up once from the calibration table
-    /// by the loaded artifact's content hash: the pointing head, and the
-    /// head set beside it where one was chosen — or `None` on a load nobody
-    /// calibrated, and then `point` and `box` answer with the digit chain.
-    pub calibration: Option<ignis_core::pointing::Calibration>,
-    /// The heads `/v1/decide` votes with to answer a `locate` (GitHub #275),
-    /// looked up once by the loaded artifact's content hash as `calibration`
-    /// is — or `None` on a load nobody calibrated, which refuses a `locate`.
-    pub locate: Option<ignis_core::locate::LocateCalibration>,
     /// The match keys of recent `/v1/decide` parts states at their run ends
     /// (GitHub #270): what an **observed fork** is found in. Shared by every
-    /// clone of the server, as the engine is.
+    /// clone of the server, as the active model is. Keys name the loaded
+    /// model's KV, so a model switch empties it in place rather than carry
+    /// keys the next model cannot resolve.
     pub fork_history: std::sync::Arc<std::sync::Mutex<reuse::ForkHistory>>,
     /// The next `/v1/decide` fan-out's name (GitHub #270): what its head is
     /// kept under, and given up by.
@@ -132,16 +119,19 @@ pub struct Server {
     /// test's mock token streams reproducible, as a fixed `wall_clock` keeps
     /// its events.
     pub seedless_seed: Option<u64>,
-    /// The loaded model (ADR 0043). Flash-Next has no vision tower and no
-    /// readouts: an image or a `/v1/decide` request to it is refused naming
-    /// it (spec flash-next/04). The 27B by default.
-    pub family: ignis_core::compute::ModelFamily,
-    /// Whether the load has run its first traversal (GitHub #129). `true`
-    /// unless [`Server::with_warm_up`] held it back: every `/v1` route
-    /// answers 503 `server_not_ready` until it flips, so no request pays the
-    /// decode-graph capture on its first token. Shared by every clone, like
-    /// the engine.
-    pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the `/v1` routes admit requests (GitHub #129, generalized by
+    /// spec model-switch/01). [`ModelStatus::Serving`] unless
+    /// [`Server::with_warm_up`] held it back — every `/v1` route answers 503
+    /// `server_not_ready` until the first traversal has run, so no request
+    /// pays the decode-graph capture on its first token — or a model switch
+    /// is under way (`503 model_switching`). Shared by every clone, like the
+    /// active model.
+    pub status: std::sync::Arc<ArcSwap<ModelStatus>>,
+    /// What `POST /v1/models/switch` loads models with (spec
+    /// model-switch/01): the loader, the drain window, the one switch that
+    /// may run at a time. `None` answers the route `501`: a server built in
+    /// a test without one has no way to load anything.
+    pub switcher: Option<std::sync::Arc<model_switch::Switcher>>,
 }
 
 /// The one token the warm-up prompts with. Id 1 is an ordinary byte-level
@@ -155,16 +145,53 @@ const WARM_UP_TOKEN: ignis_core::TokenId = 1;
 /// How long the warm-up may take: the first decode captures its graphs.
 const WARM_UP_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The first traversal of `engine` (GitHub #129): one two-token request the
+/// telemetry consumer drops as the server's own, run to completion, and how
+/// long it took. Shared by the start ([`Server::warm_up`]) and the model
+/// switch, which warms the new engine before any client can reach it.
+pub async fn warm_up_engine(engine: &Engine) -> Result<Duration, String> {
+    let started = std::time::Instant::now();
+    let input = ignis_core::RequestInput {
+        decision: None,
+        constrained: None,
+        forced_literal: None,
+        warm_up: false,
+        multimodal: None,
+        opener_tokens: None,
+        user_turn_tokens: None,
+        system_block_tokens: None,
+        reuse_boundaries: Vec::new(),
+        model: engine.model_id(),
+        tokens: vec![WARM_UP_TOKEN],
+        params: ignis_core::DecodeParams { max_tokens: Some(2), ..ignis_core::DecodeParams::default() },
+    };
+    let (_, mut events) = engine
+        .submit_with_notes(
+            input,
+            ignis_core::RequestClass::Interactive,
+            engine::RequestNotes { internal: true, ..engine::RequestNotes::default() },
+        )
+        .await
+        .map_err(|err| format!("the warm-up request was refused: {err:?}"))?;
+    engine::collect_completion(&mut events, WARM_UP_TIMEOUT)
+        .await
+        .map_err(|err| format!("the warm-up request did not complete: {err:?}"))?;
+    Ok(started.elapsed())
+}
+
 impl Server {
     /// A server over `engine`'s scheduler with the given template provider.
     pub fn new(engine: Engine, template: Box<dyn TemplateProvider>) -> Self {
-        let template: std::sync::Arc<dyn TemplateProvider> = std::sync::Arc::from(template);
+        Self::from_active(ActiveModel::new(engine, std::sync::Arc::from(template)))
+    }
+
+    /// A server serving `model`, with every server-level knob at its
+    /// default (the `with_*` setters change them). What `main` builds once
+    /// the start-up load ([`crate::runtime::load_model`]) has produced the
+    /// model.
+    pub fn from_active(model: ActiveModel) -> Self {
         Self {
-            calibration: ignis_core::pointing::calibration(engine.artifact()),
-            locate: ignis_core::locate::calibration(engine.artifact()),
-            engine,
-            alphabet: std::sync::Arc::new(template.answer_alphabet()),
-            template,
+            active: std::sync::Arc::new(ArcSwap::from_pointee(model)),
             request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
             default_enable_thinking: true,
             default_reasoning_effort: None,
@@ -172,67 +199,61 @@ impl Server {
             playground: None,
             metrics: None,
             api_key: None,
-            media: None,
             instruction_policy: instruction::InstructionPolicy::default(),
             fork_history: std::sync::Arc::default(),
             next_fan_out: std::sync::Arc::default(),
             responses: std::sync::Arc::default(),
             wall_clock: std::sync::Arc::new(telemetry::SystemClock),
             seedless_seed: None,
-            family: ignis_core::compute::ModelFamily::Qwen38_27b,
-            ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            status: std::sync::Arc::new(ArcSwap::from_pointee(ModelStatus::Serving)),
+            switcher: None,
         }
+    }
+
+    /// The loaded model, as of now (wait-free). Take it once per request
+    /// and read every model property off the one value: a model switch that
+    /// lands meanwhile then never pairs one model's template with the
+    /// next's engine.
+    pub fn active(&self) -> std::sync::Arc<ActiveModel> {
+        self.active.load_full()
+    }
+
+    /// Change the loaded model's bundle in place — a copy edited by `edit`
+    /// and stored over it. For the builders below and for tests that adjust
+    /// a calibration; a model switch replaces the bundle whole instead.
+    pub fn update_active(&self, edit: impl FnOnce(&mut ActiveModel)) {
+        let mut model = ActiveModel::clone(&self.active());
+        edit(&mut model);
+        self.active.store(std::sync::Arc::new(model));
+    }
+
+    /// Whether the `/v1` routes are admitting requests, and why not.
+    pub fn status(&self) -> std::sync::Arc<ModelStatus> {
+        self.status.load_full()
     }
 
     /// Hold the API back until [`Server::warm_up`] has run (GitHub #129):
     /// the serve loops run it before the first `/v1` request is admitted.
     /// Without this a server is ready as constructed (the mock, the tests).
     pub fn with_warm_up(self) -> Self {
-        self.ready.store(false, std::sync::atomic::Ordering::Release);
+        self.status.store(std::sync::Arc::new(ModelStatus::WarmingUp));
         self
     }
 
-    /// Whether the `/v1` routes admit requests.
+    /// Whether the `/v1` routes admit requests ([`ModelStatus::Serving`]).
     pub fn is_ready(&self) -> bool {
-        self.ready.load(std::sync::atomic::Ordering::Acquire)
+        matches!(*self.status(), ModelStatus::Serving)
     }
 
     /// The first traversal (GitHub #129): one two-token request through the
-    /// scheduler, so the prefill and decode kernels have run and the decode
-    /// graphs are captured before a client's request needs them, then the
-    /// API is marked ready and `ignis.process.ready` says how long it took.
-    /// A warm-up that does not complete is an error and leaves the server
-    /// not ready: better refused than silently cold.
+    /// scheduler ([`warm_up_engine`]), so the prefill and decode kernels
+    /// have run and the decode graphs are captured before a client's request
+    /// needs them, then the API is marked ready and `ignis.process.ready`
+    /// says how long it took. A warm-up that does not complete is an error
+    /// and leaves the server not ready: better refused than silently cold.
     pub async fn warm_up(&self) -> Result<Duration, String> {
-        let started = std::time::Instant::now();
-        let input = ignis_core::RequestInput {
-            decision: None,
-            constrained: None,
-            forced_literal: None,
-            warm_up: false,
-            multimodal: None,
-            opener_tokens: None,
-            user_turn_tokens: None,
-            system_block_tokens: None,
-            reuse_boundaries: Vec::new(),
-            model: self.engine.model_id(),
-            tokens: vec![WARM_UP_TOKEN],
-            params: ignis_core::DecodeParams { max_tokens: Some(2), ..ignis_core::DecodeParams::default() },
-        };
-        let (_, mut events) = self
-            .engine
-            .submit_with_notes(
-                input,
-                ignis_core::RequestClass::Interactive,
-                engine::RequestNotes { internal: true, ..engine::RequestNotes::default() },
-            )
-            .await
-            .map_err(|err| format!("the warm-up request was refused: {err:?}"))?;
-        engine::collect_completion(&mut events, WARM_UP_TIMEOUT)
-            .await
-            .map_err(|err| format!("the warm-up request did not complete: {err:?}"))?;
-        self.ready.store(true, std::sync::atomic::Ordering::Release);
-        let took = started.elapsed();
+        let took = warm_up_engine(&self.active().engine).await?;
+        self.status.store(std::sync::Arc::new(ModelStatus::Serving));
         tracing::info!(
             name: "ignis.process.ready",
             warm_up_ms = took.as_millis() as u64,
@@ -241,10 +262,10 @@ impl Server {
         Ok(took)
     }
 
-    /// Run [`Server::warm_up`] now if the API is held back, on its own task
-    /// so the listener is already answering (503) meanwhile.
+    /// Run [`Server::warm_up`] now if the API is held back for it, on its
+    /// own task so the listener is already answering (503) meanwhile.
     fn spawn_warm_up(&self) {
-        if self.is_ready() {
+        if !matches!(*self.status(), ModelStatus::WarmingUp) {
             return;
         }
         let server = self.clone();
@@ -255,9 +276,9 @@ impl Server {
         });
     }
 
-    /// Serve `family` (see [`Server::family`]).
-    pub fn with_family(mut self, family: ignis_core::compute::ModelFamily) -> Self {
-        self.family = family;
+    /// Serve `family` (see [`ActiveModel::family`]).
+    pub fn with_family(self, family: ignis_core::compute::ModelFamily) -> Self {
+        self.update_active(|model| model.family = family);
         self
     }
 
@@ -268,9 +289,10 @@ impl Server {
         &self,
         messages: &[template::ChatMessage],
     ) -> Result<(), template::ContentRejection> {
-        template::check_content_parts(messages, self.media.is_some()).map_err(|mut rejection| {
-            if rejection.code == "vision_disabled" && !self.family.takes_images() {
-                rejection.message = format!("{}: {} takes no images", rejection.message, self.family.name());
+        let model = self.active();
+        template::check_content_parts(messages, model.media.is_some()).map_err(|mut rejection| {
+            if rejection.code == "vision_disabled" && !model.family.takes_images() {
+                rejection.message = format!("{}: {} takes no images", rejection.message, model.family.name());
             }
             rejection
         })
@@ -341,10 +363,35 @@ impl Server {
     /// `/ui/metrics`.
     pub fn with_metrics(mut self) -> Self {
         let metrics = std::sync::Arc::new(metrics::Metrics::new());
-        self.engine.install_metrics(std::sync::Arc::clone(&metrics));
+        self.active().engine.install_metrics(std::sync::Arc::clone(&metrics));
         self.responses.install_metrics(std::sync::Arc::clone(&metrics));
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Let `POST /v1/models/switch` replace the loaded model (spec
+    /// model-switch/01): `main` installs the production loader over the start
+    /// options; tests install their own.
+    pub fn with_switcher(mut self, switcher: model_switch::Switcher) -> Self {
+        self.switcher = Some(std::sync::Arc::new(switcher));
+        self
+    }
+
+    /// Point what `--metrics` keeps at `model`, a model a switch has just
+    /// loaded (spec model-switch/01): its engine's telemetry consumer starts
+    /// feeding the projection, its own counters (Flash-Next's, GitHub #301)
+    /// are read, and `reserved` replaces what the previous load reserved. The
+    /// start does the same through [`Server::with_metrics`] and
+    /// [`Server::with_load_reservations`]. Nothing without `--metrics`.
+    pub(crate) fn observe_load(&self, model: &ActiveModel, reserved: Option<metrics::LoadReservations>) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        model.engine.install_metrics(std::sync::Arc::clone(metrics));
+        if let Some(mut reserved) = reserved {
+            model.engine.install_counter_source(reserved.flash_next.take());
+            metrics.set_load_reservations(reserved);
+        }
     }
 
     /// Read a response's `created_at` from `clock` instead of the wall.
@@ -363,7 +410,7 @@ impl Server {
             // GitHub #301, #302: a Flash-Next load's counter source is not a
             // reservation; the telemetry consumer reads it at every tick.
             if let Some(source) = reserved.flash_next.take() {
-                self.engine.install_counter_source(Some(source));
+                self.active().engine.install_counter_source(Some(source));
             }
             metrics.set_load_reservations(reserved);
         }
@@ -378,8 +425,8 @@ impl Server {
     }
 
     /// Acquire image parts with `acquirer` (a `--vision` load, GitHub #179).
-    pub fn with_media(mut self, acquirer: std::sync::Arc<media::MediaAcquirer>) -> Self {
-        self.media = Some(acquirer);
+    pub fn with_media(self, acquirer: std::sync::Arc<media::MediaAcquirer>) -> Self {
+        self.update_active(|model| model.media = Some(acquirer));
         self
     }
 

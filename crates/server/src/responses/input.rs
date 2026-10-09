@@ -260,7 +260,7 @@ pub(crate) async fn prepare(
         prompt_tokens = block;
     }
 
-    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
+    let starts_in_reasoning = server.active().template.decoder_starts_in_reasoning(&thinking);
     let response = ResponseObject {
         id: String::new(),
         object: "response",
@@ -294,7 +294,7 @@ pub(crate) async fn prepare(
         items,
         start: ResponseStart {
             response,
-            decoder: OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
+            decoder: OutputDecoder::new(server.active().template.token_decoder(), starts_in_reasoning),
             schemas,
             prompt_tokens,
         },
