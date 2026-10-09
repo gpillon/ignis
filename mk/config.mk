@@ -68,10 +68,11 @@ ifeq ($(MODEL_FAMILY),flash-next)
   # margin -- the whole ~29 GB table when that fits, and then no step reads
   # the NVMe. Empty = the server's 1G.
   NGRAM_HOT_BYTES ?=
-  # No Flash-Next headroom of its own: the server's 1G, as on the 27B (the
+  # No Flash-Next headroom of its own: the server's 1536M, as on the 27B (the
   # owner's call, 2026-10-09; it was 4G for spec flash-next/04 AC10's 29 GB
-  # with the desktop). The expert cache takes what the budget leaves, so each
-  # GB given back is cache. VRAM_HEADROOM=4G restores the old ceiling.
+  # with the desktop). The expert cache takes what the budget leaves: 1536M
+  # measured +5-13% over 4G, while 1G let WDDM page the model out (finding
+  # 2026-10-09-vram-headroom-wddm-paging). VRAM_HEADROOM=4G restores the ceiling.
 endif
 
 # The .ninfer container (used with CUDA=1 only). See README "Models".
@@ -142,7 +143,7 @@ KV_POOL_BYTES ?=
 # slows sharply. The 27B refuses it.
 ALLOW_EXPERT_CACHE_BELOW_FLOOR ?=
 # The VRAM budget (GitHub #210, ADR 0030). Empty = the server's default: the
-# memory free at start minus a 1G headroom. VRAM_HEADROOM derives it with
+# memory free at start minus a 1536M headroom. VRAM_HEADROOM derives it with
 # another headroom; VRAM_BUDGET names it (the whole process, weights
 # included) and cannot be combined with VRAM_HEADROOM. ALLOW_VRAM_OVERSUBSCRIPTION=1
 # starts an explicit budget above free memory with a warning.

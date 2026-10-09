@@ -167,7 +167,8 @@ Terms: **VRAM budget**, **VRAM headroom**, **VRAM oversubscription**.
 
 **Flags:**
 - `--vram-headroom-bytes <size>` (`IGNIS_VRAM_HEADROOM_BYTES`, make
-  `VRAM_HEADROOM`, default 1G) selects the derived mode.
+  `VRAM_HEADROOM`, default 1536M since 2026-10-09, 1G before: at 1G a
+  desktop app's allocation made WDDM page the model out) selects the derived mode.
 - `--vram-budget-bytes <size>` (`IGNIS_VRAM_BUDGET_BYTES`, make
   `VRAM_BUDGET`) selects the explicit mode.
 - Giving both is a configuration error, from any mix of CLI and env.

@@ -273,7 +273,7 @@ class is refused whatever the flag says.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--vram-headroom-bytes <b>` | `IGNIS_VRAM_HEADROOM_BYTES` | `1G` | Derives the budget: the device memory free at start minus this. Not with `--vram-budget-bytes`. |
+| `--vram-headroom-bytes <b>` | `IGNIS_VRAM_HEADROOM_BYTES` | `1536M` | Derives the budget: the device memory free at start minus this. Not with `--vram-budget-bytes`. |
 | `--vram-budget-bytes <b>` | `IGNIS_VRAM_BUDGET_BYTES` | derived | The device memory the whole process may hold, weights included. More than is free refuses the start. |
 | `--allow-vram-oversubscription` | `IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` | off | With `--vram-budget-bytes` only: start above free memory (or below the plan's minimum) with a warning instead of a refusal. On Windows that pages. Both models. |
 | `--allow-expert-cache-below-floor` | `IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR` | off | Flash-Next only: start with an expert cache below its 12 GiB floor, with a warning ([above](#the-kv-pool)). The 27B, which has no expert cache, refuses it. (`make` knob `ALLOW_EXPERT_CACHE_BELOW_FLOOR=1`.) |

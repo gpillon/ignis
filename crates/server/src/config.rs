@@ -84,8 +84,11 @@ pub use ignis_core::{KvFormat, KvPoolSize, VramMode};
 use ignis_core::compute::ModelFamily;
 
 /// `--vram-headroom-bytes`' default: what a derived VRAM budget leaves to the
-/// desktop and every other process on the card (GitHub #210).
-pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
+/// desktop and every other process on the card (GitHub #210). 1.5 GiB since
+/// 2026-10-09: at 1 GiB a browser drawing a page made WDDM page the model out
+/// (the 27B 19 -> 70 ms a decode round, Flash-Next 4.6 tok/s), at 1.5 GiB
+/// neither moved (finding 2026-10-09-vram-headroom-wddm-paging).
+pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1536 * 1024 * 1024;
 pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, Speculation, SpeculativeBackend};
 use ignis_core::speculation::{FLASH_NEXT_DEFAULT_DRAFT_TOKENS, FLASH_NEXT_VERIFY_ROWS};
 
@@ -1536,7 +1539,7 @@ fn version_text() -> String {
 fn help_text() -> String {
     let default_kv_format = KvFormat::default().as_str();
     let n_decode_lanes = ignis_core::N_DECODE_LANES;
-    let default_vram_headroom_gib = DEFAULT_VRAM_HEADROOM_BYTES / (1024 * 1024 * 1024);
+    let default_vram_headroom_mib = DEFAULT_VRAM_HEADROOM_BYTES / (1024 * 1024);
     let default_host_pool_gib = DEFAULT_HOST_POOL_BYTES / (1024 * 1024 * 1024);
     let default_ngram_hot_gib = ignis_core::ngram_table::DEFAULT_HOT_BYTES / (1024 * 1024 * 1024);
     format!(
@@ -1564,7 +1567,7 @@ fn help_text() -> String {
          \x20       --default-max-tokens <n|0> env: IGNIS_DEFAULT_MAX_TOKENS (default: {DEFAULT_MAX_TOKENS}; the max_tokens of a request that sends none, its reasoning included, never past what its prompt leaves of --max-context; an explicit cap always wins; 0 = none, up to the context)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
          \x20       --kv-pool-bytes <bytes|tokens> env: IGNIS_KV_POOL_BYTES (default: the KV pool policy's -- the rest of the VRAM budget when every weight is on the device, as on the 27B; 524,288 tokens shared by the lanes when Flash-Next's experts stream, the rest to the expert cache; a byte count with an optional K/M/G suffix, or tokens as <n>tok, <n>Ktok or <n>Mtok; refused below one --max-context sequence and a page per retained slot)\n\
-         \x20       --vram-headroom-bytes <b> env: IGNIS_VRAM_HEADROOM_BYTES (default: {default_vram_headroom_gib} GiB; the VRAM budget is the memory free at start minus this; not with --vram-budget-bytes)\n\
+         \x20       --vram-headroom-bytes <b> env: IGNIS_VRAM_HEADROOM_BYTES (default: {default_vram_headroom_mib} MiB; the VRAM budget is the memory free at start minus this; not with --vram-budget-bytes)\n\
          \x20       --vram-budget-bytes <b>   env: IGNIS_VRAM_BUDGET_BYTES (default: unset — derived; the device memory the whole process may hold, weights included; refused above free memory)\n\
          \x20       --allow-vram-oversubscription env: IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION (default: off; needs --vram-budget-bytes; start above free memory with a warning)\n\
          \x20       --allow-expert-cache-below-floor env: IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR (default: off; Flash-Next only: start with an expert cache below its 12 GiB floor, with a warning -- decode slows sharply below it; the 27B refuses it)\n\
@@ -2245,9 +2248,18 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
 
     #[test]
-    fn no_memory_flag_derives_the_budget_with_a_one_gib_headroom() {
+    fn no_memory_flag_derives_the_budget_with_a_one_and_a_half_gib_headroom() {
         let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.vram, VramMode::Derived { headroom_bytes: GIB });
+        assert_eq!(config.vram, VramMode::Derived { headroom_bytes: 1536 * 1024 * 1024 });
+    }
+
+    #[test]
+    fn help_names_the_vram_headroom_default_in_mib() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
+            panic!("expected Help");
+        };
+        let line = text.lines().find(|l| l.contains("--vram-headroom-bytes")).expect("help documents --vram-headroom-bytes");
+        assert!(line.contains("default: 1536 MiB"), "{line}");
     }
 
     #[test]

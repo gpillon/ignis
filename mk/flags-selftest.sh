@@ -48,7 +48,7 @@ lacks "default" "$out" "--draft-rows"
 
 out="$(flags MODEL=flash-next)"
 lacks "default" "$out" "--decode-share"
-# The VRAM headroom is the server's 1G on both models (the owner, 2026-10-09):
+# The VRAM headroom is the server's 1536M on both models (the owner, 2026-10-09):
 # make passes none unless asked.
 lacks "default" "$out" "--vram-headroom-bytes"
 lacks "27B default" "$(flags)" "--vram-headroom-bytes"
