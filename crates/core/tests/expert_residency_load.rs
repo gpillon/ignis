@@ -24,8 +24,8 @@ fn every_expert_projection_lands_in_the_pool_where_the_index_puts_it() {
     assert_eq!(layout.bytes, plan.plan.expert_pool_capacity_bytes);
 
     let mut pool = vec![0u8; layout.bytes as usize];
-    let mut file = std::fs::File::open(&artifact.path).expect("file");
-    let read = fill_expert_pool(&mut file, index, &mut pool).expect("fill");
+    // 2 layers < READ_WORKERS: exercises workers left with no layer too.
+    let read = fill_expert_pool(&artifact.path, index, &mut pool).expect("fill");
     let file_bytes = std::fs::read(&artifact.path).expect("read");
 
     let cat = catalog(index).expect("catalog");
@@ -59,4 +59,17 @@ fn every_expert_projection_lands_in_the_pool_where_the_index_puts_it() {
     // The fixture's K map spans several classes, as the real one does.
     let used = cat.class_counts().iter().filter(|&&n| n > 0).count();
     assert!(used >= 3, "{used} of {} classes used", KClass::COUNT);
+}
+
+#[test]
+fn a_pool_too_small_for_the_last_layer_is_refused_before_any_read() {
+    let artifact = fixture::build("residency-pool-undersized").expect("fixture artifact");
+    let reader = Reader::open(&artifact.path).expect("open");
+    let plan = flash_next::bind(&reader, &FlashNextGeometry::fixture()).expect("bind");
+    let index = &plan.experts;
+    let layout = pool_layout(index);
+
+    let mut pool = vec![0u8; layout.bytes as usize - 1];
+    let err = fill_expert_pool(&artifact.path, index, &mut pool).expect_err("undersized pool");
+    assert!(err.to_string().contains("past the"), "{err}");
 }

@@ -240,8 +240,7 @@ pub fn build_residency(path: &Path, plan: &FlashNextPlan, options: &EngineOption
         report: 0,
     };
     let mut residency = DeviceResidency::new(&desc, &layout.k2, &layout.offsets)?;
-    let mut file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    fill_expert_pool(&mut file, index, residency.host_pool_mut()).map_err(|e| format!("fill the expert pool: {e}"))?;
+    fill_expert_pool(path, index, residency.host_pool_mut()).map_err(|e| format!("fill the expert pool: {e}"))?;
     residency.warm_start(&warm_start_order(&traffic))?;
     Ok(residency)
 }

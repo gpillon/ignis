@@ -23,6 +23,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use ignis_artifact::flash_next::{self, FlashNextGeometry, FlashNextPlan};
 use ignis_artifact::{Device, Reader};
@@ -53,6 +54,21 @@ fn leaf_error(context: &str, message: String) -> i32 {
     // hotpath-lint-allow: failure-only path, as CudaLeaf's own (GitHub #80).
     tracing::error!(name: "ignis.runtime.leaf_error", context, error = %message, "flash-next leaf error");
     -1
+}
+
+/// One phase of [`FlashNextLeaf::open`] (`docs/findings/2026-10-09-flash-next-expert-pool-parallel-read.md`):
+/// `"bind"`, `"device_weights"`, `"residency"`, `"mtp"` and `"ngram"` run in
+/// that order on the opening thread. An earlier attempt ran `"residency"`
+/// concurrently with the rest on a second thread; it measured slower (the
+/// finding's "overlapped load, NO-GO"), so every phase is sequential.
+fn log_load_phase(phase: &'static str, elapsed: std::time::Duration) {
+    // hotpath-lint-allow: one line per model load, not the request hot path.
+    tracing::info!(
+        name: "ignis.runtime.flash_next_load_phase",
+        phase,
+        duration_ms = elapsed.as_millis() as i64,
+        "flash-next load phase"
+    );
 }
 
 fn sampling_params(params: DecodeParams) -> step::SamplingParams {
@@ -137,20 +153,40 @@ impl FlashNextLeaf {
     /// (the expert cache split into its eight K-class pools by resid's plan,
     /// the pinned pool filled from the file), open the n-gram table and pin
     /// the KV-RAM arena (`options.kv_ram_arena_bytes`, none for 0).
+    ///
+    /// Sequential, every phase logged
+    /// (`docs/findings/2026-10-09-flash-next-expert-pool-parallel-read.md`,
+    /// "Follow-up: an overlapped load (NO-GO)"): running the residency build
+    /// concurrently with device weight placement measured *slower* on the
+    /// real artifact -- both stretched to the slower one's length, most
+    /// likely the CUDA driver's lock serializing the pinned host alloc
+    /// against the weights' device copies, or the two sharing the same
+    /// drive's expert-pool and non-expert-weight reads.
     pub fn open(path: &Path, options: EngineOptions) -> Result<Self, String> {
         let options = options.normalized();
         let reader = Reader::open(path).map_err(|e| format!("open {}: {e:?}", path.display()))?;
         let geometry = FlashNextGeometry::qwen38_flash_next();
+        let start = Instant::now();
         let plan = flash_next::bind(&reader, &geometry).map_err(|e| format!("bind the Flash-Next artifact: {e:?}"))?;
         let config = ModelConfig::flash_next_from(&geometry);
+        log_load_phase("bind", start.elapsed());
+
+        let start = Instant::now();
         let weights = DeviceWeights::place(&reader, &plan)?;
+        log_load_phase("device_weights", start.elapsed());
+
+        let start = Instant::now();
         let mut residency = build_residency(path, &plan, &options)?;
+        log_load_phase("residency", start.elapsed());
+
         // Before the first step, and so before any graph captures one: the
         // last layer of every step writes the totals into host memory.
         let mirror = Arc::new(ResidencyMirror::new());
         residency.mirror(Arc::clone(&mirror))?;
         let ngram = config.ngram.ok_or("the Flash-Next topology has no n-gram embedding")?;
         let artifact_hash = ArtifactHash::from_bytes(reader.content_hash());
+
+        let start = Instant::now();
         let mtp = match options.pool_backend() {
             Some(_) => {
                 let dir = path.parent().ok_or("the artifact path has no directory")?;
@@ -162,9 +198,14 @@ impl FlashNextLeaf {
             }
             None => None,
         };
+        log_load_phase("mtp", start.elapsed());
+
+        let start = Instant::now();
         let table = NgramTable::from_cached_artifact(
             path, reader, &plan, ngram, options.ngram, &options.ngram_cache,
         )?;
+        log_load_phase("ngram", start.elapsed());
+
         let counters = Arc::new(FlashNextCounterSource::new(mirror, residency.desc().capacity, table.counts()));
         let arena = match options.kv_ram_arena_bytes {
             0 => None,
