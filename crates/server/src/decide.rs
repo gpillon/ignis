@@ -2433,21 +2433,41 @@ Every fault a caller can commit refuses the whole request with a 422 before the 
 
 Thinking is refused rather than ignored: a decision's prompt ends exactly where its answer is read, and a thinking prompt would put an open reasoning block at that position.
 
+`model` is read as on chat completions: another model the server lists (`--known-model`) switches the server to it before the decision is evaluated, unless `--allow-model-switch false` -- so naming the 27B on a Qwen3.8-Flash-Next load, which serves no `/v1/decide`, moves the server back to the model that does. During the switch every other request is refused `503 model_switching`; a switch that does not land refuses the decision `model_switch_failed`.
+
 `POST /v1/systemone` is the same handler under Jev's name.",
     request_body = DecideRequest,
     responses(
         (status = 200, description = "One answer per question, under the ids the caller chose.", body = DecideResponse),
         (status = 400, description = "The loaded model serves no `/v1/decide` (`model_unsupported`): Qwen3.8-Flash-Next has no readouts.", body = crate::api::ApiError),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
-        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), a vote's target is longer than the vote was measured on (`locate_too_long`), a single segment is longer than a window (`locate_segment_too_long`), or the loaded template cannot say where its tokens sit (`locate_unsupported`); a `kind`, `method` or `compression` a locate does not know (`kind_unknown`, `method_unknown`, `compression_unknown`), a fold under `vote` or of prose (`compression_unsupported`), `kind: records` on a state that is not an array of JSON objects or `log`/`prose` on one (`kind_mismatch`); `criteria` and `digits` on a `locate`, and `within`, `kind` and `compression` on anything else (`kind_unsupported`, `compression_unsupported`), are refused too, as is a fold's level-1 text past the context (`context_exceeded`). Nothing reached the engine. (A shortlist step rendered from an earlier step's answer -- a fold's level 2, every `choice` -- can only fault after a prefill, and then answers its own question with an `error`.)",
+        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), a vote's target is longer than the vote was measured on (`locate_too_long`), a single segment is longer than a window (`locate_segment_too_long`), or the loaded template cannot say where its tokens sit (`locate_unsupported`); a `kind`, `method` or `compression` a locate does not know (`kind_unknown`, `method_unknown`, `compression_unknown`), a fold under `vote` or of prose (`compression_unsupported`), `kind: records` on a state that is not an array of JSON objects or `log`/`prose` on one (`kind_mismatch`); `criteria` and `digits` on a `locate`, and `within`, `kind` and `compression` on anything else (`kind_unsupported`, `compression_unsupported`), are refused too, as is a fold's level-1 text past the context (`context_exceeded`). Nothing reached the engine. (A shortlist step rendered from an earlier step's answer -- a fold's level 2, every `choice` -- can only fault after a prefill, and then answers its own question with an `error`.) A `model` the server neither loads nor may switch to is refused `model_not_found`; one it began switching to that did not load, `model_switch_failed`.",
             body = crate::api::ApiError),
-        (status = 503, description = "The engine is at capacity and the request was not admitted.", body = crate::api::ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted; or a model switch is under way (`model_switching`, with `Retry-After`).", body = crate::api::ApiError),
     ),
 )]
 pub async fn decide(
     axum::extract::State(server): axum::extract::State<std::sync::Arc<crate::Server>>,
     body: Result<axum::Json<DecideRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
+    // A `model` naming another known model switches to it first (spec
+    // model-switch/01 §Implicit switch) — ahead of the Flash-Next refusal
+    // below, so a decision naming the 27B on a Flash-Next load moves the
+    // server to the model that serves it. A model it may not switch to meets
+    // the `model_not_found` refusal in `serve`, as before.
+    let named = body.as_ref().ok().and_then(|request| request.0.model.clone());
+    match crate::model_switch::implicit_switch(&server, crate::api::split_model_lane(named).0.as_deref()).await {
+        Ok(()) => {}
+        Err(refusal @ crate::model_switch::ImplicitRefusal::Switching(_)) => {
+            return crate::api::implicit_switch_refused(refusal);
+        }
+        Err(crate::model_switch::ImplicitRefusal::Failed { to, reason }) => {
+            return refused(&Refusal::new(
+                "model_switch_failed",
+                format!("`model` names {to:?}, and switching to it failed: {reason}"),
+            ));
+        }
+    }
     // One model for the whole request, every round of it (spec
     // model-switch/01).
     let server = std::sync::Arc::new(server.pinned());

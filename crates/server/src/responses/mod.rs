@@ -131,7 +131,7 @@ struct ResponseStreamEvent {
 
 `stream: true` answers `text/event-stream`, one event per `event:`/`data:` pair: `response.created`, `response.in_progress`, then per output item `response.output_item.added`, its content events (`response.reasoning_text.delta`, `response.output_text.delta`, `response.function_call_arguments.delta`, ...), `response.output_item.done`, and one terminal event (`response.completed`, `response.incomplete` on `max_output_tokens`, `response.failed`). Every event carries a `sequence_number` counting from 0. Without it the body is the terminal event's `response`.
 
-Not served, and refused with a 400 rather than ignored: hosted tools (anything but `type: \"function\"`), `text.format` other than `text`, `background: true`, and `previous_response_id`, since this server stores no responses over HTTP (the WebSocket mode, `GET /v1/responses`, continues from its connection). `usage.input_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling. The ignis extensions of chat completions are accepted with the same names and meaning.",
+Not served, and refused with a 400 rather than ignored: hosted tools (anything but `type: \"function\"`), `text.format` other than `text`, `background: true`, and `previous_response_id`, since this server stores no responses over HTTP (the WebSocket mode, `GET /v1/responses`, continues from its connection). `usage.input_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling. The ignis extensions of chat completions are accepted with the same names and meaning, and `model` is read as there: another model the server lists switches it to that model before this request is served on it.",
     request_body = CreateResponse,
     responses(
         (status = 200, description = "The response. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
@@ -140,9 +140,9 @@ Not served, and refused with a 400 rather than ignored: hosted tools (anything b
         )),
         (status = 400, description = "The request is malformed, or asks for what this server does not serve: a hosted tool, structured output, a background response, a `previous_response_id`.", body = ApiError),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
-        (status = 404, description = "The request named a model this server has not loaded.", body = ApiError),
+        (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 413, description = "The prompt is longer than this server's `--max-context`.", body = ApiError),
-        (status = 503, description = "The engine is at capacity and the request was not admitted.", body = ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`).", body = ApiError),
         (status = 504, description = "A non-streaming request the engine did not finish within `--request-timeout`.", body = ApiError),
     ),
 )]
@@ -150,6 +150,11 @@ pub(crate) async fn create_response(
     State(server): State<Arc<Server>>,
     Json(req): Json<CreateResponse>,
 ) -> Response {
+    // A `model` naming another known model switches to it first (spec
+    // model-switch/01 §Implicit switch), so the pin below takes that model.
+    if let Err(refused) = input::switch_to_named_model(&server, &req).await {
+        return refused;
+    }
     // One model for the whole request (spec model-switch/01).
     let server = Arc::new(server.pinned());
     if let Some(refusal) = input::http_refusal(&req) {

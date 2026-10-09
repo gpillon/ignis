@@ -2,8 +2,10 @@
 //! model-switch/01, GitHub #305), over the mock-backed router: `202` with
 //! the envelope, `GET /v1/models` reporting `switching` and then `serving`
 //! the new id, a request sent mid-switch refused `503 model_switching` with
-//! `Retry-After`, a second switch `409`. The switch is held inside its load
-//! by the mock loader (`support/switch.rs`), never by a timer (ADR 0006).
+//! `Retry-After`, a second switch `409` — and the implicit switch a request's
+//! own `model` begins on chat completions, Responses (HTTP and socket) and
+//! `/v1/decide` (§Implicit switch). The switch is held inside its load by
+//! the mock loader (`support/switch.rs`), never by a timer (ADR 0006).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +21,9 @@ use tower::ServiceExt;
 #[path = "support/switch.rs"]
 mod switch_support;
 use switch_support::MockLoader;
+
+#[path = "support/responses.rs"]
+mod responses;
 
 const PATIENT: Duration = Duration::from_secs(30);
 
@@ -48,14 +53,20 @@ fn chat(model: &str) -> Value {
 /// `GET /v1/models` until its `status` is `serving` (scheduling turns,
 /// bounded): the switch finishes on its own task.
 async fn until_serving(app: &axum::Router) -> Value {
+    until_status(app, "serving").await
+}
+
+/// `GET /v1/models` until its `status` is `wanted` (scheduling turns,
+/// bounded).
+async fn until_status(app: &axum::Router, wanted: &str) -> Value {
     for _ in 0..10_000 {
         let (status, _, body) = send(app, Method::GET, "/v1/models", None).await;
-        if status == StatusCode::OK && body["status"] == "serving" {
+        if status == StatusCode::OK && body["status"] == wanted {
             return body;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    panic!("the switch never finished");
+    panic!("`GET /v1/models` never reported {wanted}");
 }
 
 #[tokio::test]
@@ -207,4 +218,171 @@ async fn metrics_keep_counting_on_the_model_a_switch_loaded() {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     assert_eq!(sample(&metrics, "ignis_requests_completed_total").await, "2", "one request on each model");
+}
+
+// ── the implicit switch: a request's own `model` (spec §Implicit switch) ──
+
+/// A server on `mock-a` whose requests may switch to any of `ids` by naming
+/// it — what `main` builds from `--known-model` with `--allow-model-switch`
+/// on.
+fn implicit_on(loader: &Arc<MockLoader>, ids: &[&str]) -> Server {
+    let known = ids.iter().map(|id| (id.to_string(), switch_support::source(id).artifact)).collect();
+    Server::from_active(loader.model("mock-a"))
+        .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_known_models(known))
+}
+
+fn response_body(model: &str) -> Value {
+    json!({ "model": model, "input": "hello there", "max_output_tokens": 3, "enable_thinking": false })
+}
+
+fn decision(model: &str) -> Value {
+    json!({ "state": "s", "model": model, "questions": { "q": { "type": "noul", "instructions": "Urgent?" } } })
+}
+
+/// AC 17, 21: a chat completion naming another known model — lane tag and
+/// all — switches the server to it and is answered by it, in one call.
+#[tokio::test]
+async fn a_chat_completion_naming_a_known_model_is_answered_by_it_after_the_switch() {
+    let loader = MockLoader::new();
+    let app = implicit_on(&loader, &["mock-a", "mock-b"]).app();
+
+    let (status, _, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat("mock-b@agent"))).await;
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(completion["model"], "mock-b");
+    let (_, _, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!((models["status"].as_str(), models["data"][0]["id"].as_str()), (Some("serving"), Some("mock-b")));
+
+    let (status, _, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat("mock-a"))).await;
+    assert_eq!(status, StatusCode::OK, "the start model is known without a flag of its own: {completion}");
+    assert_eq!(completion["model"], "mock-a");
+    assert_eq!(loader.loads(), ["mock-b", "mock-a"]);
+    assert_eq!(loader.resident_at_load(), [0, 0], "teardown before load, as an explicit switch");
+}
+
+/// AC 20, 21 over the wire: while a request's switch runs, every other
+/// request — on the old model or the new — is refused as the gate refuses
+/// during any switch, and the triggering request is held, then answered.
+#[tokio::test]
+async fn while_a_requests_switch_runs_everything_else_is_refused_and_it_is_held_then_answered() {
+    let loader = MockLoader::new();
+    let app = implicit_on(&loader, &["mock-a", "mock-b"]).app();
+    let release = loader.hold_next_load();
+    let trigger = tokio::spawn({
+        let app = app.clone();
+        async move { send(&app, Method::POST, "/v1/chat/completions", Some(chat("mock-b"))).await }
+    });
+    let models = until_status(&app, "switching").await;
+    assert_eq!(models["switching"], json!({ "from": "mock-a", "to": "mock-b" }));
+
+    for (uri, body) in [
+        ("/v1/chat/completions", chat("mock-a")),
+        ("/v1/chat/completions", chat("mock-b")),
+        ("/v1/responses", response_body("mock-b")),
+        ("/v1/decide", decision("mock-a")),
+    ] {
+        let (status, headers, refused) = send(&app, Method::POST, uri, Some(body)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {refused}");
+        assert_eq!(refused["error"]["code"], "model_switching", "{uri}: {refused}");
+        assert_eq!(headers[header::RETRY_AFTER], "1");
+    }
+    assert!(!trigger.is_finished(), "the triggering request is held until the switch ends");
+
+    release.send(()).expect("the held load is waiting");
+    let (status, _, completion) = trigger.await.expect("the triggering request");
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(completion["model"], "mock-b");
+    assert_eq!(loader.loads(), ["mock-b"], "one switch");
+}
+
+/// AC 17 on `/v1/responses`, over HTTP and over its WebSocket mode.
+#[tokio::test]
+async fn a_response_naming_a_known_model_is_answered_by_it_after_the_switch_over_http_and_socket() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, &["mock-a", "mock-b"]);
+    let app = server.app();
+    let (status, _, response) = send(&app, Method::POST, "/v1/responses", Some(response_body("mock-b"))).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["model"], "mock-b");
+    assert_eq!(server.active().engine.model_id(), "mock-b");
+
+    let live = responses::live(server.clone()).await;
+    let mut socket = responses::socket(&live).await;
+    let mut create = response_body("mock-a");
+    create["type"] = json!("response.create");
+    responses::send(&mut socket, create).await;
+    let events = responses::events_until(&mut socket, responses::terminal).await;
+    let last = events.last().expect("a terminal event");
+    assert!(matches!(last["type"].as_str(), Some("response.completed" | "response.incomplete")), "{events:?}");
+    assert_eq!(last["response"]["model"], "mock-a");
+    assert_eq!(server.active().engine.model_id(), "mock-a");
+    assert_eq!(loader.loads(), ["mock-b", "mock-a"]);
+}
+
+/// `/v1/decide` pulls a switch too, ahead of the refusal a Flash-Next load
+/// gives every decision: naming the 27B there moves the server back to the
+/// model that serves it.
+#[tokio::test]
+async fn a_decision_naming_a_known_model_switches_first_even_from_a_load_that_serves_none() {
+    let loader = MockLoader::new();
+    let start = loader.model("mock-fn").with_family(ignis_core::compute::ModelFamily::FlashNext);
+    let known = ["mock-fn", "mock-a"].iter().map(|id| (id.to_string(), switch_support::source(id).artifact)).collect();
+    let server = Server::from_active(start)
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_known_models(known));
+    let app = server.app();
+    let (status, _, refused) = send(&app, Method::POST, "/v1/decide", Some(decision("mock-fn"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the loaded Flash-Next serves no decision: {refused}");
+    assert_eq!(refused["error"]["code"], "model_unsupported");
+
+    let (status, _, answered) = send(&app, Method::POST, "/v1/decide", Some(decision("mock-a@interactive"))).await;
+    assert_eq!(server.active().engine.model_id(), "mock-a", "{answered}");
+    assert_eq!(loader.loads(), ["mock-a"]);
+    // The mock template has no answer labels, so the 27B-family mock refuses
+    // the question itself — past the model checks, which is what this shows.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answered}");
+    assert_ne!(answered["error"]["code"], "model_not_found", "{answered}");
+    assert_ne!(answered["error"]["code"], "model_unsupported", "{answered}");
+}
+
+/// AC 19: a model nobody listed, or any other model with implicit switching
+/// off, is refused by name exactly as before — and nothing loads.
+#[tokio::test]
+async fn an_unlisted_model_or_any_with_switching_off_is_refused_by_name_as_before() {
+    let loader = MockLoader::new();
+    let listed = implicit_on(&loader, &["mock-a", "mock-b"]).app();
+    let off = server_on(&loader).app();
+    for (app, model) in [(&listed, "mock-z"), (&off, "mock-b")] {
+        let (status, _, refused) = send(app, Method::POST, "/v1/chat/completions", Some(chat(model))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{model}: {refused}");
+        assert_eq!(refused["error"]["code"], "model_not_found");
+        let (status, _, refused) = send(app, Method::POST, "/v1/responses", Some(response_body(model))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{model}: {refused}");
+        assert_eq!(refused["error"]["code"], "model_not_found");
+        let (_, _, models) = send(app, Method::GET, "/v1/models", None).await;
+        assert_eq!((models["status"].as_str(), models["data"][0]["id"].as_str()), (Some("serving"), Some("mock-a")));
+    }
+    assert!(loader.loads().is_empty(), "{:?}", loader.loads());
+}
+
+/// A request whose switch does not land is refused with the switch's own
+/// reason — never answered by the model reloaded in its place — and told it
+/// is not the transient refusal a switch in progress is (no `Retry-After`).
+#[tokio::test]
+async fn a_request_whose_switch_does_not_land_is_refused_with_its_reason() {
+    let loader = MockLoader::new();
+    loader.break_load("mock-broken");
+    let app = implicit_on(&loader, &["mock-a", "mock-broken"]).app();
+
+    let (status, headers, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat("mock-broken"))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+    assert_eq!(refused["error"]["code"], "model_switch_failed");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("mock-broken") && message.contains("simulated kernel load error"), "{message}");
+    assert!(headers.get(header::RETRY_AFTER).is_none(), "a retry is not known to fare better");
+    let (_, _, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!((models["status"].as_str(), models["data"][0]["id"].as_str()), (Some("serving"), Some("mock-a")));
+
+    let (status, _, refused) = send(&app, Method::POST, "/v1/decide", Some(decision("mock-broken"))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "decide refuses in its own shape: {refused}");
+    assert_eq!(refused["error"]["code"], "model_switch_failed");
+    assert!(refused["error"]["message"].as_str().unwrap().contains("simulated kernel load error"), "{refused}");
 }

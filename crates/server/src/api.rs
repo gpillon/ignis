@@ -261,9 +261,7 @@ async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: 
         return next.run(req).await;
     }
     let message = match &*status {
-        ModelStatus::Switching { from, to } => {
-            format!("the server is switching models from {from} to {to}; retry once GET /v1/models reports `serving`")
-        }
+        ModelStatus::Switching { from, to } => switching_message(from, to),
         ModelStatus::Failed { reason } => {
             format!("a model switch failed and no model is serving ({reason}); retry shortly")
         }
@@ -281,6 +279,48 @@ fn unavailable(code: &str, message: impl Into<String>) -> Response {
     let mut res = error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", code, message);
     res.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
     res
+}
+
+/// What a request is told while a switch from `from` to `to` runs: by the
+/// gate, and by [`implicit_switch_refused`] to one that named a model as the
+/// switch began — the same words, since it is the same situation.
+fn switching_message(from: &str, to: &str) -> String {
+    format!("the server is switching models from {from} to {to}; retry once GET /v1/models reports `serving`")
+}
+
+/// Switch to the model a request's `model` field names, lane tag and all, if
+/// it is another model this server knows (spec model-switch/01 §Implicit
+/// switch, [`crate::model_switch::implicit_switch`]), and wait until it
+/// serves. `server` is the one every handler shares — never a pinned copy —
+/// and the caller pins only after this returns, so everything it then reads
+/// (template, thinking capabilities, media, engine) is the named model's.
+/// Run before any other look at the request: the gate closes the moment the
+/// mismatch is seen.
+pub(crate) async fn switch_to_named_model(server: &Server, model: Option<&str>) -> Result<(), Response> {
+    let (named, _) = split_model_lane(model.map(str::to_owned));
+    crate::model_switch::implicit_switch(server, named.as_deref()).await.map_err(implicit_switch_refused)
+}
+
+/// The response refusing a request whose `model` did not get it served on
+/// that model. A switch already under way is the gate's own `503
+/// model_switching` with `Retry-After`, word for word: the request arrived
+/// during a switch, as far as it can tell. A switch this request began that
+/// did not land is `503 model_switch_failed` with the switch's reason and
+/// **no** `Retry-After` — 5xx because the server, not the request, failed,
+/// but nothing says a retry would fare better, and each one is a full
+/// teardown and reload of the model serving everyone else.
+pub(crate) fn implicit_switch_refused(refusal: crate::model_switch::ImplicitRefusal) -> Response {
+    match refusal {
+        crate::model_switch::ImplicitRefusal::Switching(running) => {
+            unavailable("model_switching", switching_message(&running.from, &running.to))
+        }
+        crate::model_switch::ImplicitRefusal::Failed { to, reason } => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "model_switch_failed",
+            format!("switching to {to} failed, so the request was not served: {reason}"),
+        ),
+    }
 }
 
 /// `GET /v1/models` or `POST /v1/models/switch`: the routes a model switch
@@ -1594,7 +1634,9 @@ struct StreamOptions {
 
 Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why.
 
-`max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.",
+`max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.
+
+`model` absent, or the loaded model's id, is served as it is. Another model this server lists (`--known-model`, the model it started on always among them) switches the server to it first, unless `--allow-model-switch false`: the same switch `POST /v1/models/switch` runs, during which every other request is refused `503 model_switching`, and this one is held until the named model serves and is then answered by it. A switch that does not land refuses it `503 model_switch_failed` with the reason. Any other model is a 404.",
     request_body = ChatCompletionsRequest,
     responses(
         (status = 200, description = "The completion. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
@@ -1603,9 +1645,9 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
         )),
         (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take.", body = ApiError),
         (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
-        (status = 404, description = "The request named a model this server has not loaded.", body = ApiError),
+        (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 413, description = "The prompt is longer than this server's `--max-context`.", body = ApiError),
-        (status = 503, description = "The engine is at capacity and the request was not admitted.", body = ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`).", body = ApiError),
         (status = 504, description = "The engine did not finish the request within `--request-timeout`.", body = ApiError),
     ),
 )]
@@ -1613,6 +1655,11 @@ async fn chat_completions(
     State(server): State<Arc<Server>>,
     Json(req): Json<ChatCompletionsRequest>,
 ) -> Response {
+    // A `model` naming another known model switches to it first (spec
+    // model-switch/01 §Implicit switch), so the pin below takes that model.
+    if let Err(refused) = switch_to_named_model(&server, req.model.as_deref()).await {
+        return refused;
+    }
     // One model for the whole request (spec model-switch/01).
     let server = Arc::new(server.pinned());
     if let Err(refusal) = openai_fields::check(&req.other, Surface::Chat) {

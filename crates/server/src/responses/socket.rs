@@ -556,6 +556,12 @@ async fn serve(
     emit: &impl Fn(JsonValue),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Outcome {
+    // A `model` naming another known model switches to it first, as over
+    // HTTP (spec model-switch/01 §Implicit switch).
+    if let Err(refusal) = input::switch_to_named_model(server, &job.body).await {
+        emit(refusal_event(refusal).await);
+        return Outcome::Failed;
+    }
     // One model per request, not per socket (spec model-switch/01): a socket
     // outlives a switch, each of its requests is served by the model loaded
     // when it began.
