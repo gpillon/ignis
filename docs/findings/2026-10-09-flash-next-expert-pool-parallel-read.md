@@ -131,3 +131,49 @@ live chat traffic through the Playground when this check ran) with
 `make stop` before any further work. Workspace tests: `cargo test
 --workspace --release -j 4`, all green (log:
 `.scratch/expert-pool-fill-bench/workspace-test.log`).
+
+## Follow-up: an overlapped load (NO-GO, 2026-10-09)
+
+Owner's question: with the drive-bound expert-pool fill now parallel, can
+the *other* load phases also run concurrently with it, since `build_residency`
+(pinned host alloc, expert-pool fill, warm start) and the `Reader`-owning
+chain (`DeviceWeights::place`, the MTP companion, the n-gram table) touch
+disjoint data? `FlashNextLeaf::open` was restructured to run `build_residency`
+on the opening thread and the `Reader` chain on a `std::thread::scope`-spawned
+one, joined before the mirror/counters that need both. `Reader`'s Windows
+`DirectFile` needed an added `unsafe impl Send` (a `CreateFileW` handle is not
+thread-affine; not `Sync`, since `read` moves the handle's own file position)
+to cross the thread boundary; the chain's own result type got a similarly
+justified `unsafe impl Send`. Compiled clean, full workspace green.
+
+Measured on the real server (same conditions as above, n-gram cache hit):
+
+| Phase | Sequential (s) | Overlapped (s) |
+|---|---:|---:|
+| bind | 0.014 | 0.014 |
+| device_weights | 2.508 | 32.324 |
+| residency | 20.099 | 31.764 |
+| mtp | 0.000 | 0.000 |
+| ngram | 7.295 | 7.107 |
+| **total (first line to ready)** | **~31.5** | **~41.0** |
+
+Both concurrent phases stretched to roughly the slower one's length instead
+of overlapping: `device_weights`'s ~2.5 s of real work took 32.3 s, and
+`residency` itself grew past its own already-parallel ~18-20 s. The two
+threads contend for something shared and serializing — the CUDA driver's
+internal lock around the pinned host alloc and the weights' device copies,
+the same NVMe drive's bandwidth (expert-pool reads and non-expert-weight
+reads at once), or both. Which one was not isolated; the result was
+decisive enough not to need to.
+
+**NO-GO**: reverted to the sequential order. What was kept: a permanent
+`ignis.runtime.flash_next_load_phase` event (`phase`, `duration_ms`) around
+each phase — the swap work the owner is after next wants this observability
+regardless, and it cost nothing to measure this NO-GO. The Windows
+`DirectFile` `Send` impl was reverted with the concurrency it existed for;
+nothing else in the tree asked for it.
+
+A later attempt could isolate the two candidate causes (profile the pinned
+alloc alone against a concurrent device copy with no disk I/O; or run the
+two reads on separate drives) before trying again, but that is a new
+experiment, not a continuation of this one.
