@@ -159,6 +159,7 @@ always-current table; this one is a copy.
 | `--model-download` / `--no-model-download` | `IGNIS_MODEL_DOWNLOAD` | on | Fetch a missing model. Only consulted with `--artifact` unset, and only in a `--features cuda` build. |
 | `--model-download-path <dir>` | `IGNIS_MODEL_DOWNLOAD_PATH` | `./models` | Where a fetched model lands, and where one fetched earlier is found. |
 | `--request-timeout <secs>` | `IGNIS_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
+| `--switch-drain-timeout <secs>` | `IGNIS_SWITCH_DRAIN_TIMEOUT` | `30` (max `3600`) | How long a model switch lets the old model's running requests finish before it cancels them (`0` cancels at once). |
 | `-h`, `--help` | — | — | Print the flag table and exit. |
 | `-V`, `--version` | — | — | Print the version and exit. |
 
@@ -431,7 +432,8 @@ not.
 
 | Endpoint | Method | Notes |
 |---|---|---|
-| `/v1/models` | GET | The loaded model. |
+| `/v1/models` | GET | The loaded model, and `status`: `serving`, `switching` or `failed` ([below](#switching-models)). |
+| `/v1/models/switch` | POST | Replace the loaded model on the running process ([below](#switching-models)). |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` is a 400). |
 | `/v1/tokenize` | POST | A body's prompt-token count without serving it ([below](#counting-a-prompt)). |
@@ -465,6 +467,29 @@ still answer). The `ignis.process.ready` log event, with `warm_up_ms`, marks
 the moment it admits requests; `make start` waits for it, since it waits for
 `/v1/models` to answer. The warm-up is one request in the counters, and the
 CPU mock, which has nothing to capture, is ready at once.
+
+### Switching models
+
+`POST /v1/models/switch` with `{"artifact": "<path>", "model": "<id>"}` moves
+the running server to another model — the 27B to Qwen3.8-Flash-Next and back —
+without a restart. It answers `202 {"status": "switching", "from", "to"}` at
+once; a second switch while one runs is a `409 switch_in_progress`.
+
+A switch is a full reload: the old model is unloaded before the new one loads,
+so the two are never on the card together. While it runs, every other `/v1`
+route answers `503 model_switching` with `Retry-After: 1`, and `GET /v1/models`
+reports `status: "switching"` with `switching: {from, to}`. Requests already
+running on the old model get `--switch-drain-timeout` (30 s) to finish; one
+still running then ends with an `engine_error`. The new model loads on the
+flags the server started with, except the ones it cannot take, which are left
+off for it and named in the log (`--vision` and the 27B's `--spec` on
+Flash-Next; Flash-Next's own knobs on the 27B).
+
+A target that can be refused without unloading anything — no file at the path,
+a checksum that is not clean, a model id of the other model — leaves the old
+model serving. One that fails to load after the old model was unloaded has the
+old model loaded again; `GET /v1/models` says `failed`, with a `reason`, until
+one of them serves.
 
 ### Chat completions
 

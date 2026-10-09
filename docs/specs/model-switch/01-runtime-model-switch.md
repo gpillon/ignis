@@ -241,7 +241,9 @@ switches, it does not queue them.
    against the new artifact, build the new `ActiveModel`, including a fresh
    `ForkHistory` and a fresh warm-up traversal (reusing `Server::with_warm_up`'s
    existing logic).
-5. On success: `server.active.store(new)`, `status = Serving`.
+5. *(Superseded by §Implementation notes: teardown always precedes the
+   load; a GPU-side failure reloads the old model.)*
+   On success: `server.active.store(new)`, `status = Serving`.
    On failure at any point in step 4: the **old** `ActiveModel` was already
    torn down in step 3, so there is nothing to fall back to in-process —
    this spec's failure contract is therefore: step 3 and step 4 run inside
@@ -375,12 +377,17 @@ Where the implementation departs from the sections above, and why.
 
 - **Teardown before load, always.** §Draining step 5's "load the new model
   before releasing the old" cannot work on the card even on a *successful*
-  switch: every load pins the KV-RAM arena, a process-wide singleton whose
-  create refuses while one exists (`kernel/src/seq.cu`,
-  `ignis_host_pinned_pool_create`: "destroy it before creating another"),
-  and every load sizes its VRAM plan from the memory NVML reports free at its
-  start (`crates/server/src/runtime.rs`), which the old model still holds.
-  So the order is steps 1-4 as written (gate, drain, teardown, load), and
+  switch, in either direction: every load sizes its VRAM plan from the
+  memory NVML reports free at its start (`crates/server/src/runtime.rs`),
+  which the old model still holds — the new plan would refuse or be built
+  around the old weights, and the two would be resident together, which
+  this spec rules out. On top of that the 27B pins its KV-RAM arena as a
+  process-wide singleton whose create refuses while one exists
+  (`kernel/src/seq.cu`, `ignis_host_pinned_pool_create`: "destroy it before
+  creating another"); Flash-Next's arena is its own instance's
+  (`HostArena`, spec flash-next/05's no-singleton rule), so the singleton
+  alone blocks only a 27B load over a 27B. So the order is steps 1-4 as
+  written (gate, drain, teardown, load), and
   AC 9 is kept another way: everything that can refuse a target without the
   GPU — the path, the sidecar, the checksum, the artifact's model against
   the start flags, the thinking defaults, the vision processor — runs

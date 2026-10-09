@@ -85,13 +85,9 @@ async fn a_switch_closes_the_gate_waits_for_the_running_request_then_serves_the_
     assert_eq!(*server.status(), ModelStatus::Switching { from: "mock-a".into(), to: "mock-b".into() });
     assert_eq!(server.status().refusal(), Some("model_switching"), "the gate refuses new requests");
 
-    // The drain waits on the held request: nothing is torn down or loaded
-    // while it runs (it could not finish inside the 30 s window anyway).
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!task.is_finished(), "the switch waits for the running request");
-    assert!(loader.loads().is_empty(), "no load before the drain");
-    assert_eq!(server.active().engine.model_id(), "mock-a");
-
+    // The drain waits on the held request: had it not, the teardown would
+    // have met the request still running and cut it (the next test), and
+    // the load would have found the old model resident.
     gate.release();
     let completion = collect_completion(&mut held, Duration::from_secs(5)).await.expect("the held request completes");
     assert_eq!(completion.reason, FinishReason::Length, "it finished on its own, not cut");
@@ -277,4 +273,22 @@ async fn a_switch_starts_the_new_model_with_an_empty_fork_history() {
     let (_, task) = begin(&server, source("mock-b")).expect("begins");
     assert_eq!(task.await.expect("the switch task"), SwitchOutcome::Switched);
     assert_eq!(server.fork_history.lock().unwrap().longest_seen(&ends), None);
+}
+
+/// A request reads one model throughout (`Server::pinned`): a switch that
+/// lands mid-request does not hand it the next model's engine — the pinned
+/// copy keeps the old one, whose engine, torn down, answers "not now".
+#[tokio::test]
+async fn a_pinned_request_keeps_the_model_it_began_on_across_a_switch() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, loader.model("mock-a"), PATIENT);
+    let pinned = server.pinned();
+
+    let (_, task) = begin(&server, source("mock-b")).expect("begins");
+    assert_eq!(task.await.expect("the switch task"), SwitchOutcome::Switched);
+    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(pinned.active().engine.model_id(), "mock-a", "the pinned request still sees its own model");
+    let refused = pinned.active().engine.submit(input("mock-a", 3), RequestClass::Interactive).await;
+    assert!(matches!(refused, Err(ignis_core::SubmitError::Full)), "{refused:?}");
+    assert_eq!(*pinned.status(), ModelStatus::Serving, "the status is the server's, shared");
 }

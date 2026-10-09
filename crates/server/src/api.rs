@@ -272,6 +272,12 @@ async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: 
                 .to_owned()
         }
     };
+    unavailable(code, message)
+}
+
+/// A `503` with `code`, and `Retry-After: 1`: the answer while the API is not
+/// serving ([`require_serving`]).
+fn unavailable(code: &str, message: impl Into<String>) -> Response {
     let mut res = error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", code, message);
     res.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
     res
@@ -1358,8 +1364,10 @@ pub(crate) fn now() -> u64 {
     ),
 )]
 async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
-    let loaded = server.active();
+    // The status first: a switch publishes the new model before it stores
+    // `serving`, so a `serving` read here is never paired with the old id.
     let status = server.status();
+    let loaded = server.active();
     Json(ModelList {
         object: "list",
         data: vec![ModelInfo {
@@ -1475,14 +1483,7 @@ async fn switch_model(State(server): State<Arc<Server>>, Json(req): Json<SwitchR
             "this server was built without a model loader and cannot switch models",
         ),
         Err(crate::model_switch::SwitchRefusal::WarmingUp) => {
-            let mut res = error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_error",
-                "server_not_ready",
-                "the loaded model's first traversal has not finished; retry shortly",
-            );
-            res.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-            res
+            unavailable("server_not_ready", "the loaded model's first traversal has not finished; retry shortly")
         }
     }
 }
@@ -1612,6 +1613,8 @@ async fn chat_completions(
     State(server): State<Arc<Server>>,
     Json(req): Json<ChatCompletionsRequest>,
 ) -> Response {
+    // One model for the whole request (spec model-switch/01).
+    let server = Arc::new(server.pinned());
     if let Err(refusal) = openai_fields::check(&req.other, Surface::Chat) {
         return refused_field(refusal);
     }

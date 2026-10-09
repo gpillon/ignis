@@ -102,7 +102,7 @@ use ignis_server::{
     config::{self, Config, ConfigOutcome},
     download,
     engine::Engine,
-    runtime::mock_scheduler,
+    load::mock_scheduler,
     template::SimpleTemplateProvider,
     telemetry::SystemClock,
     thinking::{self, ThinkingDefaults},
@@ -157,7 +157,7 @@ async fn main() {
             exit_after_flush(&logging_handle, 1);
         }
     };
-    // The start options a load reads (`runtime::prepare_model`): what the
+    // The start options a load reads (`load::prepare_model`): what the
     // loaded model's family is checked against once the artifact names it
     // (`config::served_model_for`, spec flash-next/04), and the engine shape
     // (GitHub #87), already validated by `config::resolve` above. A model
@@ -303,8 +303,8 @@ async fn main() {
         // checksum report clean — named, checked against the start options,
         // and only then loaded. Any refusal stops the start: serving a broken
         // artifact would silently degrade to the placeholder.
-        let loaded = ignis_server::runtime::prepare_model(&start_options, artifact_path)
-            .and_then(ignis_server::runtime::load_model);
+        let loaded = ignis_server::load::prepare_model(&start_options, artifact_path)
+            .and_then(ignis_server::load::load_model);
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(err) => {

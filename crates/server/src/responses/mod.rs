@@ -150,6 +150,8 @@ pub(crate) async fn create_response(
     State(server): State<Arc<Server>>,
     Json(req): Json<CreateResponse>,
 ) -> Response {
+    // One model for the whole request (spec model-switch/01).
+    let server = Arc::new(server.pinned());
     if let Some(refusal) = input::http_refusal(&req) {
         return refusal;
     }

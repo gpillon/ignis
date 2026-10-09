@@ -2448,6 +2448,9 @@ pub async fn decide(
     axum::extract::State(server): axum::extract::State<std::sync::Arc<crate::Server>>,
     body: Result<axum::Json<DecideRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
+    // One model for the whole request, every round of it (spec
+    // model-switch/01).
+    let server = std::sync::Arc::new(server.pinned());
     // Flash-Next has no readouts (spec flash-next/04): the endpoint is not
     // served at all, whatever the body says, and the 400 names the model.
     if !server.active().family.serves_readouts() {

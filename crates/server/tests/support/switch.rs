@@ -20,7 +20,7 @@ use ignis_core::mock::{GateController, GatedCompute, MockCompute};
 use ignis_core::{Compute, ConcreteScheduler, SchedulerConfig};
 use ignis_server::engine::Engine;
 use ignis_server::model_switch::{ModelLoader, PreparedLoad};
-use ignis_server::runtime::LoadedModel;
+use ignis_server::load::LoadedModel;
 use ignis_server::telemetry::SystemClock;
 use ignis_server::template::SimpleTemplateProvider;
 use ignis_server::{ActiveModel, ModelSource};

@@ -5,11 +5,12 @@
 //! id `serving` — is printed: the measured replacement for the 14-15 s /
 //! 8-10 s estimates in `docs/specs/flash-next/phase2-model-switch-notes.md`.
 //!
-//! The direct proof that each old model was torn down before the next one
-//! loaded is that the next load succeeded at all — its pinned KV-RAM arena's
-//! create refuses while one exists — and that the arena standing after each
-//! switch is the one the new load pinned, of the size the start options
-//! name (`ignis_core::seq::host_pool_stats`).
+//! The direct proof that the teardown ran is the 27B's KV-RAM arena, the
+//! process-wide one `ignis_core::seq::host_pool_stats` reads (Flash-Next
+//! pins an arena of its own instance, which that does not see): pinned at
+//! the options' size while the 27B serves, gone (0) once the switch to
+//! Flash-Next has dropped the 27B, and pinned again — a create that refuses
+//! while one exists — after the switch back.
 //!
 //! A measurement, not a gate: it prints its numbers rather than asserting a
 //! threshold, like the G2/G4 instruments. Run under `scripts/gpu-profile.ps1`
@@ -64,22 +65,22 @@ fn the_27b_and_flash_next_switch_back_and_forth_on_one_process() {
     };
     println!("27B cold start to serving: {:?}", started.elapsed());
     live.completes(MODEL_27B);
-    println!("host pool after the 27B's start (capacity, used): {:?}", ignis_core::seq::host_pool_stats());
+    let at_start = ignis_core::seq::host_pool_stats();
+    println!("27B arena after its start (capacity, used): {at_start:?}");
 
     let to_flash_next = live.switch_to(&flash_next, MODEL_FLASH_NEXT);
     let after_to = ignis_core::seq::host_pool_stats();
-    println!("27B -> Flash-Next: {to_flash_next:?}; host pool (capacity, used) {after_to:?}");
+    println!("27B -> Flash-Next: {to_flash_next:?}; 27B arena (capacity, used) {after_to:?}");
     live.completes(MODEL_FLASH_NEXT);
 
     let back = live.switch_to(&artifact_27b, MODEL_27B);
     let after_back = ignis_core::seq::host_pool_stats();
-    println!("Flash-Next -> 27B: {back:?}; host pool (capacity, used) {after_back:?}");
+    println!("Flash-Next -> 27B: {back:?}; 27B arena (capacity, used) {after_back:?}");
     live.completes(MODEL_27B);
 
-    // The new load pinned its own arena, of the options' size: its create
-    // succeeded, so the old arena was destroyed first. `used` is printed
-    // above, not asserted: what a fresh load places there is the leaf's.
-    for (direction, (capacity, _)) in [("to Flash-Next", after_to), ("back to the 27B", after_back)] {
-        assert_eq!(capacity, arena, "{direction}: the arena standing is the new load's");
-    }
+    // `used` is printed, not asserted: what a load places in its arena is
+    // the leaf's business. The capacity is the teardown's proof.
+    assert_eq!(at_start.0, arena, "the 27B pinned the options' arena");
+    assert_eq!(after_to.0, 0, "the switch to Flash-Next dropped the 27B and its arena with it");
+    assert_eq!(after_back.0, arena, "the switch back pinned the 27B's arena again");
 }

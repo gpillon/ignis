@@ -556,6 +556,10 @@ async fn serve(
     emit: &impl Fn(JsonValue),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Outcome {
+    // One model per request, not per socket (spec model-switch/01): a socket
+    // outlives a switch, each of its requests is served by the model loaded
+    // when it began.
+    let server = &server.pinned();
     let mut cancel = std::pin::pin!(cancel);
     let Prepared { input, class, notes, items, start } =
         match input::prepare(server, job.body, job.history, job.warm_up).await {

@@ -123,6 +123,8 @@ A body carrying an `image_url` part is refused with `media_not_countable`: an im
     ),
 )]
 pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(req): Json<TokenizeRequest>) -> Response {
+    // One model for the whole request (spec model-switch/01).
+    let server = Arc::new(server.pinned());
     if let Some(metrics) = &server.metrics {
         metrics.record_tokenize(TokenizeRoute::Tokenize);
     }
@@ -282,6 +284,8 @@ pub(crate) struct DetokenizeResponse {
     ),
 )]
 pub(crate) async fn detokenize(State(server): State<Arc<Server>>, Json(req): Json<DetokenizeRequest>) -> Response {
+    // One model for the whole request (spec model-switch/01).
+    let server = Arc::new(server.pinned());
     if let Some(metrics) = &server.metrics {
         metrics.record_tokenize(TokenizeRoute::Detokenize);
     }

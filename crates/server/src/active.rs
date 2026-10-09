@@ -80,9 +80,12 @@ pub struct ActiveModel {
 /// `--artifact` / `--model` pair a restart would have been given).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSource {
-    /// The `.ninfer` container.
+    /// The `.ninfer` container, a path on the server's machine, with its
+    /// sidecar beside it: what the load verifies, names and loads.
     pub artifact: PathBuf,
-    /// The id the model is served under.
+    /// The id the model is served under — what `GET /v1/models` reports and
+    /// what a request must name. A known model's id must be the artifact's
+    /// own (`config::served_model_for`).
     pub model: String,
 }
 

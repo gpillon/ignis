@@ -32,6 +32,7 @@ pub mod download;
 pub mod engine;
 pub mod expose;
 pub mod instruction;
+pub mod load;
 pub mod locate;
 pub mod loader;
 pub mod media;
@@ -148,7 +149,9 @@ const WARM_UP_TIMEOUT: Duration = Duration::from_secs(600);
 /// The first traversal of `engine` (GitHub #129): one two-token request the
 /// telemetry consumer drops as the server's own, run to completion, and how
 /// long it took. Shared by the start ([`Server::warm_up`]) and the model
-/// switch, which warms the new engine before any client can reach it.
+/// switch, which warms the new engine before any client can reach it. Not a
+/// *warm-up request* in CONTEXT.md's sense (`RequestInput::warm_up`, a
+/// prefill with no decode): this one decodes, to capture the decode graphs.
 pub async fn warm_up_engine(engine: &Engine) -> Result<Duration, String> {
     let started = std::time::Instant::now();
     let input = ignis_core::RequestInput {
@@ -187,7 +190,7 @@ impl Server {
 
     /// A server serving `model`, with every server-level knob at its
     /// default (the `with_*` setters change them). What `main` builds once
-    /// the start-up load ([`crate::runtime::load_model`]) has produced the
+    /// the start-up load ([`crate::load::load_model`]) has produced the
     /// model.
     pub fn from_active(model: ActiveModel) -> Self {
         Self {
@@ -219,12 +222,28 @@ impl Server {
     }
 
     /// Change the loaded model's bundle in place — a copy edited by `edit`
-    /// and stored over it. For the builders below and for tests that adjust
-    /// a calibration; a model switch replaces the bundle whole instead.
+    /// and stored over it. For building a server (the `with_*` setters
+    /// below, tests that adjust a calibration), not while one serves: the
+    /// load-edit-store is not atomic against a model switch, which replaces
+    /// the bundle whole instead.
     pub fn update_active(&self, edit: impl FnOnce(&mut ActiveModel)) {
         let mut model = ActiveModel::clone(&self.active());
         edit(&mut model);
         self.active.store(std::sync::Arc::new(model));
+    }
+
+    /// This server with the loaded model pinned (spec model-switch/01): a
+    /// copy whose [`Server::active`] keeps answering the model loaded now,
+    /// whatever a switch publishes later. Every request handler takes one
+    /// first, so a request reads its template, its engine and the id it
+    /// defaults to off one model — never one model's template with the
+    /// next's engine — however long it waits on media or between `/v1/decide`
+    /// rounds. A request pinned to a model a switch has since torn down is
+    /// refused by that engine with `503 engine_full`, which a retry answers.
+    /// Everything else — the status, metrics, fork history, the switcher —
+    /// stays shared with the server.
+    pub fn pinned(&self) -> Self {
+        Self { active: std::sync::Arc::new(ArcSwap::new(self.active())), ..self.clone() }
     }
 
     /// Whether the `/v1` routes are admitting requests, and why not.
@@ -388,9 +407,8 @@ impl Server {
             return;
         };
         model.engine.install_metrics(std::sync::Arc::clone(metrics));
-        if let Some(mut reserved) = reserved {
-            model.engine.install_counter_source(reserved.flash_next.take());
-            metrics.set_load_reservations(reserved);
+        if let Some(reserved) = reserved {
+            self.install_reservations(model, reserved);
         }
     }
 
@@ -405,16 +423,20 @@ impl Server {
     /// once, before the first request. Without `--metrics` there is nothing
     /// to write them into and the call does nothing; a load that built no
     /// plan (the placeholder path) never makes it.
-    pub fn with_load_reservations(self, mut reserved: metrics::LoadReservations) -> Self {
+    pub fn with_load_reservations(self, reserved: metrics::LoadReservations) -> Self {
+        self.install_reservations(&self.active(), reserved);
+        self
+    }
+
+    /// Record what `model`'s load reserved in `--metrics` (nothing without
+    /// it): the plan's lines replace the previous load's, and a Flash-Next
+    /// load's counter source — not a reservation; the telemetry consumer
+    /// reads it at every tick (GitHub #301, #302) — goes to `model`'s engine.
+    fn install_reservations(&self, model: &ActiveModel, mut reserved: metrics::LoadReservations) {
         if let Some(metrics) = &self.metrics {
-            // GitHub #301, #302: a Flash-Next load's counter source is not a
-            // reservation; the telemetry consumer reads it at every tick.
-            if let Some(source) = reserved.flash_next.take() {
-                self.active().engine.install_counter_source(Some(source));
-            }
+            model.engine.install_counter_source(reserved.flash_next.take());
             metrics.set_load_reservations(reserved);
         }
-        self
     }
 
     /// Require `key` as `Authorization: Bearer <key>` on every `/v1` route

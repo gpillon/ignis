@@ -129,7 +129,7 @@ impl LiveServer {
 
 /// A live server that can switch models (spec model-switch/01): built the
 /// way `main` builds one — the production load path
-/// (`runtime::prepare_model` / `runtime::load_model`), the model thread's
+/// (`load::prepare_model` / `load::load_model`), the model thread's
 /// handle kept on the loaded model, the production `ArtifactLoader` behind
 /// `POST /v1/models/switch` — and served on a random localhost port.
 ///
@@ -170,7 +170,7 @@ impl SwitchingLiveServer {
             .expect("serve runtime");
         let _guard = runtime.enter();
         let options = ignis_server::config::Config { model: model.to_owned(), model_named: true, ..options };
-        let loaded = match ignis_server::runtime::prepare_model(&options, path).and_then(ignis_server::runtime::load_model) {
+        let loaded = match ignis_server::load::prepare_model(&options, path).and_then(ignis_server::load::load_model) {
             Ok(loaded) => loaded,
             Err(e) => {
                 gpu_profile::skip_or_fail(&format!("load {artifact}: {e}"));

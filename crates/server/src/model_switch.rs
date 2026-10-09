@@ -17,19 +17,22 @@
 //!    running, or `--switch-drain-timeout` passes.
 //! 4. **Tear down** — the old model thread is told to shut down (whatever is
 //!    still running ends with an error) and joined: only once the join
-//!    returns has its scheduler — and the process-wide pinned KV-RAM arena
-//!    its leaf owns — been dropped.
+//!    returns has its scheduler — and every GPU buffer and pinned KV-RAM
+//!    arena its leaf owns — been dropped.
 //! 5. **Load** — the target is loaded on the freed card and warmed up, then
 //!    published whole ([`crate::Server::active`]), and the API serves again.
 //!
 //! **Why tear down before loading.** The spec's first draft built the new
 //! model before releasing the old one, so a failed load could fall back to a
-//! model that never stopped. On the card that cannot work at all: the leaf's
-//! pinned KV-RAM arena is a process-wide singleton whose create refuses
-//! while one exists ("destroy it before creating another", `kernel/src/seq.cu`),
-//! and every load sizes its VRAM plan from the memory free at its start
-//! (NVML, `crate::runtime`), which the old model still holds. So the failure
-//! contract is kept the other way round: a target that can be refused
+//! model that never stopped. On the card that cannot work at all, in either
+//! direction: every load sizes its VRAM plan from the memory NVML reports
+//! free at its start (`crate::runtime`), which the old model still holds, so
+//! the new plan would either refuse or be built around the old weights — and
+//! the two models resident together is what the spec rules out. On top of
+//! that, the 27B's KV-RAM arena is a process-wide singleton whose create
+//! refuses while one exists ("destroy it before creating another",
+//! `kernel/src/seq.cu`; Flash-Next's arena is its own instance's). So the
+//! failure contract is kept the other way round: a target that can be refused
 //! without the GPU is refused in step 2, before anything stops; a load that
 //! fails on the GPU after the teardown reloads the **old** model from the
 //! artifact it came from ([`crate::ModelSource`]), so a bad switch degrades
@@ -41,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::Engine;
-use crate::runtime::LoadedModel;
+use crate::load::LoadedModel;
 use crate::{ActiveModel, ModelSource, ModelStatus, Server};
 
 /// How often the drain reads the old engine's in-flight counts. A switch is
@@ -69,7 +72,7 @@ pub trait PreparedLoad: Send {
 }
 
 /// The production [`ModelLoader`]: the start-up load path
-/// ([`crate::runtime::prepare_model`] / [`crate::runtime::load_model`]) on
+/// ([`crate::load::prepare_model`] / [`crate::load::load_model`]) on
 /// the options the server was started with, as a restart with `--artifact`
 /// and `--model` changed would run it — except that a flag only the *other*
 /// model takes is dropped rather than refused
@@ -110,14 +113,14 @@ impl ModelLoader for ArtifactLoader {
                 "start flags this model does not take are off for this load"
             );
         }
-        let prepared = crate::runtime::prepare_model(&options, &target.artifact).map_err(|e| e.to_string())?;
+        let prepared = crate::load::prepare_model(&options, &target.artifact).map_err(|e| e.to_string())?;
         Ok(Box::new(prepared))
     }
 }
 
-impl PreparedLoad for crate::runtime::PreparedModel {
+impl PreparedLoad for crate::load::PreparedModel {
     fn load(self: Box<Self>) -> Result<LoadedModel, String> {
-        crate::runtime::load_model(*self).map_err(|e| e.to_string())
+        crate::load::load_model(*self).map_err(|e| e.to_string())
     }
 }
 
@@ -139,12 +142,15 @@ impl Switcher {
     }
 }
 
-/// A switch that has begun: the ids it moves between, as `202` reports them.
+/// A switch that has begun: the ids it moves between, as `202` reports them
+/// and as a second switch's `409` names the one under way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchStarted {
-    /// The id served when it began.
+    /// The id served when it began — the model that is drained and torn
+    /// down, and reloaded if the target fails on the GPU.
     pub from: String,
-    /// The id it is loading.
+    /// The id it is loading: the request's `model`, which the target
+    /// artifact's own model must not contradict.
     pub to: String,
 }
 
@@ -168,30 +174,47 @@ pub enum SwitchOutcome {
     /// The target was refused before anything was torn down: the old model
     /// never stopped serving.
     Refused {
-        /// Why.
+        /// What refused it — a path with no file, a checksum that is not
+        /// clean, flags the target cannot take — as the prepare step said
+        /// it, and as `ignis.model.switch_failed` logs it.
         reason: String,
     },
     /// The target failed to load after the old model was torn down, and the
     /// old model was loaded again from its artifact: it is serving.
     Restored {
-        /// Why the target failed.
+        /// Why the target failed on the GPU (or in its warm-up).
         reason: String,
     },
     /// The target failed, and the old model could not be loaded again
     /// either: nothing is serving until a switch succeeds.
     Failed {
-        /// Why, both failures said.
+        /// Why, both failures said: the target's, then the reload's.
         reason: String,
     },
 }
 
-/// Clears [`Switcher::running`] when the switch task ends, however it ends
-/// (a panicking task included), so one bad switch never wedges the next.
-struct Running(Arc<Switcher>);
+/// Ends a switch's hold on the server when its task ends, however it ends:
+/// [`Switcher::running`] is cleared so the next switch may begin, and a task
+/// that ended without settling the status — a panic, or a runtime shutting
+/// down under it — leaves [`ModelStatus::Failed`] rather than a gate stuck
+/// at `Switching` with nobody left to open it.
+struct RunningGuard {
+    switcher: Arc<Switcher>,
+    status: Arc<arc_swap::ArcSwap<ModelStatus>>,
+}
 
-impl Drop for Running {
+impl Drop for RunningGuard {
     fn drop(&mut self) {
-        *self.0.running.lock().expect("switch lock") = None;
+        if matches!(**self.status.load(), ModelStatus::Switching { .. }) {
+            let reason = "the switch ended before it finished (see ignis.model.switch_panicked)".to_owned();
+            tracing::error!(
+                name: "ignis.model.switch_panicked",
+                panicking = std::thread::panicking(),
+                "the switch task ended mid-switch; a switch to a model that loads is the way back"
+            );
+            self.status.store(Arc::new(ModelStatus::Failed { reason }));
+        }
+        *self.switcher.running.lock().expect("switch lock") = None;
     }
 }
 
@@ -228,7 +251,8 @@ pub fn begin(
         "switching models: /v1 answers 503 model_switching until it is done"
     );
     let serving_before = matches!(*before, ModelStatus::Serving);
-    let task = tokio::spawn(run(server.clone(), Running(switcher), target, started.clone(), serving_before));
+    let guard = RunningGuard { switcher, status: Arc::clone(&server.status) };
+    let task = tokio::spawn(run(server.clone(), guard, target, started.clone(), serving_before));
     Ok((started, task))
 }
 
@@ -238,12 +262,12 @@ pub fn begin(
 /// serving, and a refusal then must not reopen the gate over a dead engine.
 async fn run(
     server: Server,
-    running: Running,
+    running: RunningGuard,
     target: ModelSource,
     started: SwitchStarted,
     serving_before: bool,
 ) -> SwitchOutcome {
-    let switcher = Arc::clone(&running.0);
+    let switcher = Arc::clone(&running.switcher);
     let began = Instant::now();
     let SwitchStarted { from, to } = started;
 
