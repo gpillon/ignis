@@ -146,6 +146,29 @@ server in a half-torn-down state.
     that `phase2-model-switch-notes.md`'s unmeasured 14-15s/8-10s estimates
     are replaced with a measured number the way spec server/05 and the
     expert-pool-read finding replaced estimates elsewhere.
+17. As a client (any OpenAI-compatible one, e.g. opencode), I want naming a
+    different, known model in my request's `model` field to switch the
+    server to it and then answer my request on it, so that I do not need my
+    own retry loop around `503` just to use the model I asked for.
+18. As the owner, I want implicit switching gated by one flag
+    (`--allow-model-switch`, default on) and a named list of switchable
+    models and their artifacts (`--known-model <id>=<path>`), so that a
+    server I did not mean to make switchable cannot be moved by an
+    arbitrary `model` string, and so a model with no known artifact cannot
+    be requested into existence.
+19. As the owner, I want a request naming an unknown model, or naming a
+    different model while implicit switching is off, refused by name
+    (`404 model_not_found`) rather than silently served by whatever is
+    active, so that a typo'd or stale `model` field is never mistaken for
+    success.
+20. As the owner, I want an implicit switch to close the gate to every
+    request — old model or new, admitted or not — the instant the mismatch
+    is seen, so that "exhaust the queue, then accept nothing else" holds for
+    an implicit switch exactly as it does for an explicit one.
+21. As a client whose request triggered an implicit switch, I want my own
+    request held until the switch finishes and then served on the new
+    model, so that I get an answer rather than a `202` I have to poll for a
+    switch I did not explicitly ask to track.
 
 ## Implementation Decisions
 
@@ -333,9 +356,11 @@ not run it itself.
 
 ## Out of Scope
 
-- **A router that picks the model per task.** This slice is one explicit API
-  call; an automatic policy is a later decision (`phase2-model-switch-notes.md`'s
-  first open question, deliberately left open).
+- **A router that picks the model per task.** Nothing here infers which
+  model a task needs. §Implicit switch (below, added 2026-10-10) lets a
+  client *name* the model it wants and have the server get there; a policy
+  that chooses the model *for* the client is a separate, later decision
+  (`phase2-model-switch-notes.md`'s first open question, still open).
 - **The KV-disk tier (ADR 0045 Tier 2) surviving a switch.** Interesting
   (phase2 notes), unmeasured, and a separate ticket — this spec's full
   reload drops retained state on both sides, full stop.
@@ -462,3 +487,97 @@ for the 27B-side assertions; the expert pool cannot be shrunk). No change
 to `HOST_MARGIN_BYTES` or the check itself — the margin did its job both
 times, naming exactly what to shrink or what to free, and the owner's own
 flags were enough once there was a little more free RAM at run time besides.
+
+## Implicit switch: a request's `model` field (added 2026-10-10)
+
+Trying this end to end against a real client (opencode) exposed a gap this
+spec didn't cover: the `model` field on `/v1/chat/completions` (and every
+other endpoint that carries one) was never checked against the loaded
+model at all — only its `@<lane>` class suffix is read
+(`split_model_lane`, `crates/server/src/api.rs:570`). Naming the other
+model does nothing; the active model answers regardless, silently. The
+owner's ask: let naming the other model *do* something — switch to it —
+behind a flag, and only once every request already on the current model is
+drained, accepting nothing else meanwhile.
+
+### The rule
+
+A request whose `model` (after stripping the lane suffix) names a model
+other than the one currently `Serving`:
+
+- `--allow-model-switch` (default **true**, env `IGNIS_ALLOW_MODEL_SWITCH`)
+  off, or the named model unknown to this server: refused, not silently
+  served by the wrong model — `404 model_not_found` naming the id and (if
+  the flag is off) that implicit switching is disabled. This closes a real
+  gap: today every model name is accepted and ignored, which looks like the
+  field is honoured when it never was (the #284 field table's own
+  "honoured or refused" rule, applied here for the first time to `model`
+  itself rather than its suffix).
+- Flag on and the model is known: this request **triggers** a switch to it,
+  reusing `model_switch::switch` exactly as `POST /v1/models/switch` does —
+  same gate, same drain (`--switch-drain-timeout`), same teardown-then-load
+  ordering, same rollback on failure. Nothing about the switch mechanism
+  itself is new; only who may start one is wider.
+
+### What "known to this server" means: `--known-model <id>=<path>`
+
+An implicit switch has no request body field for the target artifact's
+path — a chat-completions request carries a model *name*, not a path. A
+new repeatable flag, `--known-model <id>=<path>` (env `IGNIS_KNOWN_MODELS`,
+`;`-separated `id=path` pairs — not `,`, since a Windows path never
+contains `;` but can contain `,`), names every model this server is
+willing to switch to and where its artifact lives. The model and artifact
+the server actually starts on is added to this table automatically, so
+switching back to it never needs its own flag. Naming a model with no
+entry here is the `404 model_not_found` case above, flag or no flag — an
+unlisted model literally cannot be loaded, since nothing names its
+artifact.
+
+### Ordering: close first, drain, then switch — the triggering request included
+
+"Must drain everything queued, and must not accept anything else once a
+switch is wanted" (the owner's wording) is exactly §Draining's existing
+gate-then-drain order, with one new wrinkle: the request that *discovered*
+the need to switch is not yet an admitted request when this happens
+(the check runs where `resolve_model_and_class` already runs, before
+admission), so it is not one of the things the drain waits for — it waits
+*with* the client instead.
+
+1. The gate closes (`Switching{from, to}`) the instant the mismatch is
+   seen, before anything else about this request is evaluated. Every other
+   request — on the old model or the new one, admitted or not — now gets
+   `503 model_switching`, identically to an explicit switch. This is the
+   "accepts nothing else" half.
+2. The triggering request's own HTTP call blocks (does not return a
+   response yet) while `model_switch::switch` drains what was already
+   running on the old model, tears it down, loads the named model, and
+   warms it up — the "exhaust the queue first" half, unchanged from
+   §Draining.
+3. On success, the triggering request is admitted and served **on the new
+   model**, as if it had been sent after the switch finished — the client
+   that asked for Flash-Next gets Flash-Next, not a `202` it has to poll.
+4. On failure, the triggering request is refused with the switch's own
+   reason (the same string `POST /v1/models/switch` would have reported via
+   `GET /v1/models`'s `reason` field), not silently served by the
+   (reloaded) old model — this client asked for a specific model and
+   either gets it or a reason why not, never a substitution.
+5. A second request naming a model while step 2 is already running for a
+   *different* target gets `503 model_switching` like any other request
+   during a switch — it does not queue a second switch, and does not
+   retarget the one in progress. Named the same target already in flight:
+   still `503 model_switching` for this slice; joining an in-progress
+   switch instead of waiting it out as a plain 503 is a possible
+   refinement, not required here.
+
+Consequence for a real client (what prompted this): opencode's chat
+completion call simply takes as long as the switch takes the first time it
+names a different model (seconds, per the GPU numbers above), then answers
+normally — no client-side retry loop needed, which a bare `503` would have
+demanded of every OpenAI-compatible client pointed at this server.
+
+### Out of scope, still
+
+A policy that infers the right model for a task without being told its
+name — still a router, still not this. Multiple servers, or serving two
+models from two processes behind a single endpoint, is a different
+architecture this spec never considered.
