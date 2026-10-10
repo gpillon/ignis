@@ -67,6 +67,13 @@ impl Script {
         Arc::new(Self::default())
     }
 
+    /// Tokens decode to `decode`'s text, and to nothing otherwise: a request
+    /// the script does not name generates silently, however long it runs,
+    /// while one it does name still streams text.
+    pub fn quiet_except(decode: HashMap<TokenId, &'static str>) -> Arc<Self> {
+        Arc::new(Self { decode, ..Self::default() })
+    }
+
     /// [`Script::new`], reporting the prompt's structure.
     pub fn with_boundaries(decode: HashMap<TokenId, &'static str>) -> Arc<Self> {
         Arc::new(Self { decode, boundaries: true, unnamed: "?", ..Self::default() })

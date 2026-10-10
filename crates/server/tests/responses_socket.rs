@@ -364,14 +364,17 @@ async fn a_cancel_ends_one_running_response_and_leaves_the_others_running() {
 async fn a_stream_runs_in_order_while_streams_run_side_by_side() {
     let live = live(server(&Script::silent(), hog_config(8), plain())).await;
     let mut socket = socket(&live).await;
-    let long = json!({ "model": MODEL, "input": "long", "max_output_tokens": 2000, "enable_thinking": false });
-    send(&mut socket, create(&long, Some("a"))).await;
+    // Stream a's first response is a hog: it ends only when the test cancels
+    // it, so no timing can finish it before stream b's response starts.
+    send(&mut socket, create(&hog(), Some("a"))).await;
     send(&mut socket, create(&short("second on a"), Some("a"))).await;
     send(&mut socket, create(&short("first on b"), Some("b"))).await;
 
     // (stream, type) of every lifecycle event, in arrival order.
     let mut seen: Vec<(String, String)> = Vec::new();
+    let mut a_first_id = None;
     let mut terminals = 0;
+    let mut cancelled = false;
     while terminals < 3 {
         let event = next_event(&mut socket).await;
         let kind = event["type"].as_str().unwrap().to_owned();
@@ -380,7 +383,16 @@ async fn a_stream_runs_in_order_while_streams_run_side_by_side() {
             terminals += 1;
         }
         if kind == "response.created" || terminal(&event) {
+            if a_first_id.is_none() && stream == "a" {
+                a_first_id = Some(event["response"]["id"].clone());
+            }
             seen.push((stream, kind));
+        }
+        // b's response ended while a's hog still holds a's first place:
+        // release it, and a's second response may start.
+        if !cancelled && seen.iter().any(|(s, k)| s == "b" && k.starts_with("response.incomplete")) {
+            cancelled = true;
+            send(&mut socket, json!({ "type": "response.cancel", "response_id": a_first_id.clone().unwrap() })).await;
         }
     }
     let at = |stream: &str, kind: &str, nth: usize| {
@@ -393,7 +405,7 @@ async fn a_stream_runs_in_order_while_streams_run_side_by_side() {
     };
     // FIFO within a stream: a's second response starts after its first ends.
     assert!(at("a", "response.created", 1) > at("a", "response.incomplete", 0), "{seen:?}");
-    // Concurrent across streams: b's short response ends while a's long one runs.
+    // Concurrent across streams: b's response ends while a's first still runs.
     assert!(at("b", "response.incomplete", 0) < at("a", "response.incomplete", 0), "{seen:?}");
 }
 
@@ -721,7 +733,16 @@ async fn a_warm_up_with_no_retained_slot_free_still_completes() {
 /// continuation names.
 #[tokio::test]
 async fn a_queued_response_keeps_one_id_from_created_to_its_end_and_continues_by_it() {
-    let live = live(server(&Script::new(HashMap::new()), hog_config(1), plain())).await;
+    // The hog is request 0 and generates silently (a million `?` deltas
+    // would bury the frames this test waits for); the queued one, request 1,
+    // is scripted to stream text.
+    let mock = MockCompute::new();
+    let script = Script::quiet_except(HashMap::from([
+        (mock.token_for(1, 0), "x"),
+        (mock.token_for(1, 1), "y"),
+        (mock.token_for(1, 2), "z"),
+    ]));
+    let live = live(server(&script, hog_config(1), plain())).await;
     let mut socket = socket(&live).await;
     send(&mut socket, create(&hog(), Some("hog"))).await;
     let hog_id = next_of(&mut socket, Some("hog"), "response.in_progress").await["response"]["id"].clone();
