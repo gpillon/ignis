@@ -134,7 +134,7 @@ impl LoadError {
 pub struct PreparedModel {
     /// The container the load opens.
     pub artifact: std::path::PathBuf,
-    /// The id the load is served under ([`crate::config::served_model_for`]).
+    /// The id the load is served under ([`crate::config::Config::for_family`]).
     pub model: String,
     /// The artifact's model (ADR 0043).
     pub family: ignis_core::compute::ModelFamily,

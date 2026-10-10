@@ -438,7 +438,7 @@ async fn main() {
 
     tracing::info!(
         name: "ignis.process.started",
-        // The id the load is served under (`config::served_model_for`): a
+        // The id the load is served under (`config::Config::for_family`): a
         // Flash-Next artifact started without `--model-id` is its own.
         model = %server.active().engine.model_id(),
         bind = %bind,

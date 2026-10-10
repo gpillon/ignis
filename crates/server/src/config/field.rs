@@ -132,7 +132,10 @@ impl Validator {
 /// `fit_to_family` used to keep by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applicability {
+    /// Every family takes the field.
     AllFamilies,
+    /// Only these families do; an explicit value for any other is refused at
+    /// start and dropped on a switch.
     Only(&'static [ModelFamily]),
 }
 
@@ -215,11 +218,18 @@ pub struct FieldMeta {
     /// The field's doc comment, which is written for the operator: the same
     /// text rustdoc shows on the struct field is what `help --fields` prints.
     pub description: &'static str,
+    /// The rule a parsed value must meet.
     pub validator: Validator,
+    /// The model families the field means anything for.
     pub applies: Applicability,
+    /// `GET /v1/config` shows it ([`Attr::Visible`]).
     pub visible: bool,
+    /// `PATCH /v1/config` may change it ([`Attr::Patchable`]).
     pub patchable: bool,
+    /// A change takes effect only through a model reload
+    /// ([`Attr::ReloadRequired`]).
     pub reload_required: bool,
+    /// It has family-scoped variants ([`Attr::Scoped`]).
     pub scoped: bool,
     /// A bool: the flag may stand bare (`--server-ui` = `--server-ui true`).
     pub switch: bool,

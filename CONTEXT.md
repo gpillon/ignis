@@ -979,6 +979,32 @@ When output names a domain concept, use the term as defined here.
   `response.queued`, instead of being refused with a 503 as an HTTP request
   is. Only its head retries, each time a request leaves the scheduler.
 
+## Configuration (ADR 0046, specs `config-v2/01-02`)
+
+- **Field** — one configurable setting, declared once (`config::schema`): its
+  flag `--<group>-<field>`, env var `IGNIS_<GROUP>_<FIELD>`, config-file key
+  `<group>.<field>`, default, rule and help text all come from that one
+  declaration. Fields are grouped by concern (`server`, `model`, `vram`,
+  `reuse`, `switch`, `spec`, `vision`, `media`, `download`, `ngram`,
+  `kv_disk`). `ignis-server help --fields` lists every one.
+- **Family scope** — a field both model families take but want sized
+  differently has a variant per family (`qwen38`, `qwen38flashnext`, from
+  `ModelFamily`, never a served id): `--qwen38flashnext-reuse-kv-host-pool-bytes`.
+  A tiebreaker *within* each source, not a source of its own: the command line
+  wins whatever its scope.
+- **Applicability** — the families a field means anything for (`Only(Flash-Next)`
+  for the decode lanes, `Only(27B)` for vision). An explicit value for a family
+  that cannot take it is refused at start and dropped, with a log line, on a
+  switch; a value equal to the field's default is neither.
+- **Profile** — a named bundle of hardware-shaped field defaults (`--profile`,
+  built-in `rtx5090`, or a config file's `profiles:`): below the config file,
+  above the hardcoded defaults — a default, never an override.
+- **Live change** / **reload** — the two ways `PATCH /v1/config` applies a
+  change, never both in one patch: a live change touches only server-level
+  values (timeouts, message policies, thinking defaults, switch knobs) and no
+  model; a reload runs the whole patch through the model switch, reloading the
+  same model with the patched configuration.
+
 ## Observability
 
 - **Canonical event** — the one structured representation of a log occurrence

@@ -328,6 +328,20 @@ impl TemplateProvider for NoThinkingControl {
     }
 }
 
+/// A request pins the live knobs with the model: a live change landing
+/// mid-request reaches the next request, never half of this one.
+#[tokio::test]
+async fn a_pinned_request_keeps_the_live_knobs_it_began_with() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, started(&[]));
+    let pinned = server.pinned();
+    let app = server.app();
+    let (status, _) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "server": { "request_timeout": 61 } }))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pinned.live().request_timeout, Duration::from_secs(30), "the request in flight keeps its own");
+    assert_eq!(server.live().request_timeout, Duration::from_secs(61), "the next one gets the change");
+}
+
 /// A placeholder start has no artifact to load again: a reload is refused,
 /// while a live change still applies.
 #[tokio::test]

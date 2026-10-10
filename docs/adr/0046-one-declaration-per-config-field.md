@@ -11,6 +11,19 @@ one-declaration-per-field mechanism grows three more consumers (`GET`/`PATCH
 new `FieldMeta` attributes (`visible`, `patchable`, `reload_required`) that
 drive them — no change to the core mechanism decided here.
 
+**Implemented** (2026-10-10, GitHub #311), with these departures from the text
+below, each forced by the build or by spec 02: the verb is `config generate`
+(with `config print` and `config patch`), as spec 02 renamed
+`generate-config`; there is no `Regex` validator, since no field has a pattern
+to match and it would bring in the `regex` crate for nothing; one
+`macro_rules!` invocation per *group* lists its fields, since a declarative
+macro cannot gather separate invocations into one table — each field is still
+written once; a field's name drops its group's own word where it would repeat
+(`--vram-headroom-bytes`, not `--vram-vram-headroom-bytes`); an explicit value
+equal to a field's default counts as unnamed, so a file `config generate`
+wrote with every default starts either model; and the thinking defaults are
+server-wide, not per family.
+
 ## Context
 
 `crates/server/src/config.rs` (3,875 lines) has ~50 CLI flags and 54 env

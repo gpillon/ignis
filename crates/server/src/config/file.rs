@@ -29,7 +29,9 @@ use super::{Config, ConfigError};
 /// A config file's format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// `.json`.
     Json,
+    /// `.yaml` / `.yml`, and the format of a file with neither.
     Yaml,
 }
 
@@ -143,8 +145,12 @@ impl serde::Serialize for Ordered<'_> {
 /// The filesystem, as configuration sees it: the one seam between
 /// resolution and the disk.
 pub trait Files {
+    /// The file's text.
     fn read(&self, path: &Path) -> std::io::Result<String>;
+    /// Replace the file's text with `contents`.
     fn write(&self, path: &Path, contents: &str) -> std::io::Result<()>;
+    /// Whether there is a file at `path` (what discovery asks of each
+    /// candidate).
     fn exists(&self, path: &Path) -> bool;
 }
 

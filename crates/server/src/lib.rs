@@ -75,9 +75,11 @@ pub struct Server {
     /// clone of the server, so a switch reaches every handler.
     pub active: std::sync::Arc<ArcSwap<ActiveModel>>,
     /// The server-level knobs a live `PATCH /v1/config` may change without
-    /// touching the model (spec config-v2/02): read with [`Server::live`],
-    /// once per request. Shared by every clone, like the active model, so a
-    /// change reaches every handler at once.
+    /// touching the model (spec config-v2/02), read with [`Server::live`].
+    /// Shared by every clone, like the active model, so a change reaches
+    /// every handler at once; a request handler's [`Server::pinned`] copy
+    /// holds the set in force when the request began, however many times
+    /// the request reads it.
     pub live: std::sync::Arc<ArcSwap<Live>>,
     /// The Playground's asset table when `--server-ui` is on (GitHub #163, ADR
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
@@ -255,7 +257,8 @@ impl Server {
         }
     }
 
-    /// The live knobs, as of now (wait-free): take them once per request.
+    /// The live knobs, as of now (wait-free) — on a pinned copy, as of when
+    /// the request began.
     pub fn live(&self) -> std::sync::Arc<Live> {
         self.live.load_full()
     }
@@ -317,10 +320,16 @@ impl Server {
     /// next's engine — however long it waits on media or between `/v1/decide`
     /// rounds. A request pinned to a model a switch has since torn down is
     /// refused by that engine with `503 engine_full`, which a retry answers.
-    /// Everything else — the status, metrics, fork history, the switcher —
-    /// stays shared with the server.
+    /// The live knobs are pinned with the model (spec config-v2/02): a
+    /// `PATCH /v1/config` landing mid-request never gives one request two
+    /// timeouts or two thinking defaults. Everything else — the status,
+    /// metrics, fork history, the switcher — stays shared with the server.
     pub fn pinned(&self) -> Self {
-        Self { active: std::sync::Arc::new(ArcSwap::new(self.active())), ..self.clone() }
+        Self {
+            active: std::sync::Arc::new(ArcSwap::new(self.active())),
+            live: std::sync::Arc::new(ArcSwap::new(self.live())),
+            ..self.clone()
+        }
     }
 
     /// Whether the `/v1` routes are admitting requests, and why not.

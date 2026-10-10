@@ -143,21 +143,29 @@ impl ModelLoader for ArtifactLoader {
                     .and_then(|patch| base.general_with(&patch))
                     .map_err(|e| e.to_string())?;
                 let (options, dropped) = crate::config::fit_to_family(&named, family).map_err(|e| e.to_string())?;
-                if !dropped.is_empty() {
-                    tracing::info!(
-                        name: "ignis.model.switch_flags_dropped",
-                        to = %target.model,
-                        family = family.name(),
-                        flags = %dropped.join(","),
-                        "start flags this model does not take are off for this load"
-                    );
-                }
+                log_flags_dropped(&target.model, family, &dropped);
                 options
             }
         };
         let prepared = crate::load::prepare_model(&options, &target.artifact).map_err(|e| e.to_string())?;
         Ok(Box::new(prepared))
     }
+}
+
+/// Say which of the running options a switch to `to`, a model of `family`,
+/// left off because the family does not take them (spec config-v2/01 AC 8):
+/// `ignis.model.switch_flags_dropped`, nothing when nothing was dropped.
+fn log_flags_dropped(to: &str, family: ignis_core::compute::ModelFamily, dropped: &[String]) {
+    if dropped.is_empty() {
+        return;
+    }
+    tracing::info!(
+        name: "ignis.model.switch_flags_dropped",
+        to = %to,
+        family = family.name(),
+        flags = %dropped.join(","),
+        "start flags this model does not take are off for this load"
+    );
 }
 
 impl PreparedLoad for crate::load::PreparedModel {
@@ -705,5 +713,39 @@ async fn restore(server: &Server, switcher: &Arc<Switcher>, old: &ActiveModel, r
             server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone() }));
             SwitchOutcome::Failed { reason }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ignis_core::compute::ModelFamily;
+
+    fn logged(run: impl FnOnce()) -> Vec<serde_json::Value> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let sink = Arc::new(ignis_logging::MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+        tracing::subscriber::with_default(subscriber, run);
+        sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect()
+    }
+
+    /// Spec config-v2/01 AC 8: a value the target family cannot take is
+    /// dropped, and the switch says which, from the dropped list the fit
+    /// returned — the list each field's own applicability produces.
+    #[test]
+    fn a_switch_names_what_it_dropped_and_says_nothing_when_nothing_was() {
+        let started = match crate::config::resolve(&["--vision-enabled".to_owned()], |_| None).unwrap() {
+            crate::config::ConfigOutcome::Config(config) => config,
+            other => panic!("{other:?}"),
+        };
+        let (_, dropped) = crate::config::fit_to_family(&started, ModelFamily::FlashNext).unwrap();
+        let records = logged(|| log_flags_dropped("qwen3.8-flash-next", ModelFamily::FlashNext, &dropped));
+        assert_eq!(records.len(), 1, "{records:?}");
+        let event = &records[0];
+        assert_eq!(event["event_name"], "ignis.model.switch_flags_dropped", "{event}");
+        let field = |name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
+        assert_eq!(field("flags"), Some("--vision-enabled".into()), "{event}");
+        assert_eq!(field("to"), Some("qwen3.8-flash-next".into()), "{event}");
+        assert!(logged(|| log_flags_dropped("qwen3.8-27b", ModelFamily::Qwen38_27b, &[])).is_empty());
     }
 }

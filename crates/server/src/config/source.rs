@@ -42,10 +42,15 @@ pub enum Source {
     /// A live `PATCH /v1/config` (or a switch target's own artifact and id):
     /// what the running process was told after it started.
     Patch,
+    /// The command line (`--<group>-<field>`, `--<family>-…`).
     Flag,
+    /// The environment (`IGNIS_<GROUP>_<FIELD>`, `IGNIS_<FAMILY>_…`).
     Env,
+    /// The config file (`<group>.<field>`, `<group>.<family>.<field>`).
     File,
+    /// The hardware profile in use: a default, never an override.
     Profile,
+    /// The field's hardcoded default.
     Default,
 }
 
@@ -66,7 +71,10 @@ impl Source {
 /// what an error names, so it points at the line to fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
+    /// Which source gave the value.
     pub source: Source,
+    /// The exact name it was given under — a flag, an env var, a file key
+    /// with its file, a profile's key.
     pub spelling: String,
     /// The value given is the field's hardcoded default. Naming the default
     /// says nothing: such a value is never refused for a family that cannot
@@ -80,7 +88,10 @@ pub struct Origin {
 /// One raw value and the spelling it arrived under.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Candidate {
+    /// The text as given, before its kind parses it (a file's value turned
+    /// back into text first).
     pub raw: String,
+    /// The name it was given under, for an error to point at.
     pub spelling: String,
 }
 
@@ -155,6 +166,7 @@ impl Layer {
         self.set(meta, family, joined)
     }
 
+    /// Whether the layer sets nothing (a patch that names no field).
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
@@ -180,9 +192,12 @@ impl Layer {
 /// conventional paths, or none at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum FileSource {
+    /// No config file: flags, env, profile and defaults only.
     #[default]
     None,
+    /// The file `--config` / `IGNIS_CONFIG` named.
     Explicit(PathBuf),
+    /// The file found at one of the conventional paths.
     Discovered(PathBuf),
 }
 
@@ -212,10 +227,14 @@ pub struct Sources {
     /// Live changes made after start (`PATCH /v1/config`, a switch target's
     /// artifact and id): above everything.
     pub patch: Layer,
+    /// The command line's values.
     pub flags: Layer,
+    /// The environment's values.
     pub env: Layer,
-    /// The config file's values, and where it came from.
+    /// The config file's values.
     pub file: Layer,
+    /// Where the config file came from, if there is one: what a change is
+    /// written back to, and what `ignis.config.source` reports.
     pub file_source: FileSource,
     /// The profile's values (spec config-v2/02 §`--profile`): defaults, not
     /// overrides — below the file, above the hardcoded default.
@@ -238,6 +257,7 @@ pub enum Fit {
 /// The result of resolving every field against a [`Sources`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
+    /// Every field's resolved value.
     pub settings: Settings,
     /// Where each field not at its hardcoded default came from.
     pub origins: BTreeMap<(&'static str, &'static str), Origin>,
@@ -356,6 +376,7 @@ pub fn parse_candidate<K: FieldKind>(meta: &FieldMeta, candidate: &Candidate) ->
 /// What the command line said, apart from field values.
 #[derive(Debug, Default)]
 pub struct ParsedArgs {
+    /// The field flags, as a layer.
     pub flags: Layer,
     /// `--config <path>`.
     pub config: Option<String>,

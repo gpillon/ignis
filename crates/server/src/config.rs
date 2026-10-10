@@ -419,7 +419,9 @@ impl std::fmt::Debug for Basis {
 /// backend a family would otherwise start by default (GitHub #307).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecChoice {
+    /// No speculation, a family's default one included.
     Off,
+    /// This backend.
     Backend(SpeculativeBackend),
 }
 

@@ -85,7 +85,7 @@ pub struct ModelSource {
     pub artifact: PathBuf,
     /// The id the model is served under — what `GET /v1/models` reports and
     /// what a request must name. A known model's id must be the artifact's
-    /// own (`config::served_model_for`).
+    /// own (`config::Config::for_family`).
     pub model: String,
 }
 
