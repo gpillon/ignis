@@ -294,6 +294,15 @@ add_executable(ignis_kernel_hq_ring_test test_hq_ring.cpp)
 target_link_libraries(ignis_kernel_hq_ring_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_hq_ring_test COMMAND ignis_kernel_hq_ring_test)
 
+# GitHub #315 (ADR 0048): OURS -- the reasoning redirect's cut, the one host
+# function both leaves call wherever they assign a successor. Header-only and
+# linked against nothing, so it cannot create a CUDA context: the one test here
+# that runs while another process holds the card.
+add_executable(ignis_kernel_reasoning_redirect_test test_reasoning_redirect.cpp)
+target_include_directories(ignis_kernel_reasoning_redirect_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME ignis_kernel_reasoning_redirect_test COMMAND ignis_kernel_reasoning_redirect_test)
+
 # P4-03 (GitHub #119): the hq-e8-2b row codec's own op-level oracle. It was
 # FOUND in the reference at `tools/test_kv/`, not `tests/ops/` — that is why
 # no hq arm existed in the vendored `test_gqa_attention.cpp` (P1-15, GitHub
