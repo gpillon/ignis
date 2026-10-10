@@ -41,12 +41,13 @@ fn run(args: &[&str]) -> serde_json::Value {
 /// fetched here, and never looked for in the repo's own `./models`. Without
 /// it, the same launches built with `--features cuda` would download 19.4 GB
 /// — or find the real artifact next to the test and load it on the GPU.
-fn no_download() -> [String; 3] {
+fn no_download() -> [String; 4] {
     let empty = std::env::temp_dir().join("ignis-logging-test-no-models");
     let _ = std::fs::create_dir_all(&empty);
     [
-        "--no-model-download".to_owned(),
-        "--model-download-path".to_owned(),
+        "--download-enabled".to_owned(),
+        "false".to_owned(),
+        "--download-path".to_owned(),
         empty.display().to_string(),
     ]
 }
@@ -89,14 +90,14 @@ impl Drop for KillOnDrop {
 /// Spawn `ignis-server`, read stdout lines until one whose `event_name` is
 /// in `until` appears (or a 10s timeout elapses), then kill the process.
 /// Returns every JSON record observed, in order, up to and including the
-/// match. `--bind 127.0.0.1:0` (an OS-assigned ephemeral port) is always
+/// match. `--server-bind 127.0.0.1:0` (an OS-assigned ephemeral port) is always
 /// forced so these never collide with each other or with a real server.
 fn run_until(args: &[&str], envs: &[(&str, &str)], until: &[&str]) -> Vec<serde_json::Value> {
     let exe = env!("CARGO_BIN_EXE_ignis-server");
     let mut command = Command::new(exe);
     command
         .args(args)
-        .args(["--bind", "127.0.0.1:0"])
+        .args(["--server-bind", "127.0.0.1:0"])
         .args(no_download())
         .env("IGNIS_LOG_FORMAT", "json")
         .env("IGNIS_LOG_LEVEL", "info")
@@ -164,7 +165,7 @@ fn an_artifact_path_that_is_not_there_emits_an_artifact_missing_event() {
     // sidecar error would otherwise name a record next to a file that is not
     // there, and say nothing about the download that could have produced it.
     let missing = std::env::temp_dir().join("ignis-logging-test-does-not-exist.ninfer");
-    let record = run(&["--artifact", missing.to_str().unwrap()]);
+    let record = run(&["--model-artifact", missing.to_str().unwrap()]);
     assert_eq!(record["event_name"], "ignis.artifact.missing");
     assert_eq!(record["severity_text"], "ERROR");
     assert_eq!(
@@ -172,7 +173,7 @@ fn an_artifact_path_that_is_not_there_emits_an_artifact_missing_event() {
         "the artifact path should appear as a typed attribute, not only in body: {record}"
     );
     assert!(
-        record["body"].as_str().unwrap_or_default().contains("--model-download-path"),
+        record["body"].as_str().unwrap_or_default().contains("--download-path"),
         "the refusal should say how the model could be fetched instead: {record}"
     );
 }
@@ -184,7 +185,7 @@ fn a_missing_artifact_sidecar_emits_a_sidecar_missing_event() {
     let artifact = std::env::temp_dir()
         .join(format!("ignis-logging-test-no-sidecar-{}.ninfer", std::process::id()));
     std::fs::write(&artifact, b"not a real container").expect("write the stand-in artifact");
-    let record = run(&["--artifact", artifact.to_str().unwrap()]);
+    let record = run(&["--model-artifact", artifact.to_str().unwrap()]);
     assert_eq!(record["event_name"], "ignis.artifact.sidecar_missing");
     assert_eq!(record["severity_text"], "ERROR");
     assert_eq!(
@@ -202,7 +203,7 @@ fn a_bind_conflict_emits_a_server_failed_event() {
     // uses `run`, not `run_until`).
     let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
     let addr = held.local_addr().expect("local_addr").to_string();
-    let record = run(&["--bind", &addr]);
+    let record = run(&["--server-bind", &addr]);
     assert_eq!(record["event_name"], "ignis.server.failed");
     assert_eq!(record["severity_text"], "ERROR");
     assert!(
@@ -218,16 +219,16 @@ fn a_developer_policy_that_rerenders_history_warns_at_start() {
     // when one arrives mid-conversation, and the operator is told so once.
     for (policy, via_env) in [("into-system", false), ("after-system", true)] {
         let records = if via_env {
-            run_until(&[], &[("IGNIS_DEVELOPER_MESSAGE_POLICY", policy)], &["ignis.process.started"])
+            run_until(&[], &[("IGNIS_SERVER_DEVELOPER_MESSAGE_POLICY", policy)], &["ignis.process.started"])
         } else {
-            run_until(&["--developer-message-policy", policy], &[], &["ignis.process.started"])
+            run_until(&["--server-developer-message-policy", policy], &[], &["ignis.process.started"])
         };
         let warning = find(&records, "ignis.config.developer_policy_rerenders");
         assert_eq!(warning["severity_text"], "WARN");
         assert_eq!(warning["attributes"]["developer_message_policy"], policy);
     }
     for policy in ["inplace", "one-after-system", "reject"] {
-        let records = run_until(&["--developer-message-policy", policy], &[], &["ignis.process.started"]);
+        let records = run_until(&["--server-developer-message-policy", policy], &[], &["ignis.process.started"]);
         assert!(
             !records.iter().any(|r| r["event_name"] == "ignis.config.developer_policy_rerenders"),
             "{policy} moves no message and warns about nothing"
@@ -237,7 +238,7 @@ fn a_developer_policy_that_rerenders_history_warns_at_start() {
 
 /// GitHub #260: the load says how `point` will be answered before the first
 /// request. A load with no artifact binds no vision, so it says neither
-/// method; `chain` and the served artifact's `head` need a `--vision` load,
+/// method; `chain` and the served artifact's `head` need a `--vision-enabled` load,
 /// which is the GPU profile's to see.
 #[test]
 fn the_load_says_which_method_point_will_use() {
@@ -270,7 +271,7 @@ fn no_artifact_emits_placeholder_template_then_process_started() {
     assert_eq!(placeholder["severity_text"], "WARN");
     // GitHub #234: which of the reasons it was. Without `--features cuda`
     // this binary never fetches weights it could not run; with it, the
-    // harness's own `--no-model-download` is the reason. Either way the
+    // harness's own `--download-enabled false` is the reason. Either way the
     // record says which, and neither downloads anything.
     let reason = placeholder["attributes"]["reason"].as_str().unwrap_or_default();
     assert!(
@@ -301,7 +302,7 @@ fn no_artifact_emits_placeholder_template_then_process_started() {
 fn the_startup_record_names_the_arena_the_operator_asked_for() {
     // The flag reaches the record, rather than the record naming a default
     // whatever was asked for (GitHub #216).
-    let records = run_until(&["--kv-host-pool-bytes", "2G"], &[], &["ignis.process.started"]);
+    let records = run_until(&["--reuse-kv-host-pool-bytes", "2G"], &[], &["ignis.process.started"]);
     let started = find(&records, "ignis.process.started");
     assert_eq!(started["attributes"]["kv_host_pool_bytes"], 2u64 << 30);
 }

@@ -23,7 +23,7 @@ impl Drop for KillOnDrop {
 }
 
 /// An ephemeral localhost port the OS just handed out. Released before the
-/// server binds it — a narrow race, but `--bind 127.0.0.1:0` would leave
+/// server binds it — a narrow race, but `--server-bind 127.0.0.1:0` would leave
 /// the test no way to learn the port the server actually got.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -71,10 +71,10 @@ fn a_served_request_leaves_no_jsonl_line_on_a_pretty_stdout() {
     let port = free_port();
     let mut command = Command::new(env!("CARGO_BIN_EXE_ignis-server"));
     command
-        .args(["--bind", &format!("127.0.0.1:{port}")])
+        .args(["--server-bind", &format!("127.0.0.1:{port}")])
         .env("IGNIS_LOG_FORMAT", "pretty")
         .env("IGNIS_LOG_LEVEL", "info")
-        .env_remove("IGNIS_ARTIFACT")
+        .env_remove("IGNIS_MODEL_ARTIFACT")
         .stdout(Stdio::piped());
     let mut child = command.spawn().expect("spawn ignis-server");
     let stdout = child.stdout.take().expect("piped stdout");

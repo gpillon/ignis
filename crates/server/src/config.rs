@@ -1,16 +1,43 @@
-//! `ignis-server` CLI flags mirroring the existing env-var config surface
-//! one-to-one, plus `--help`/`-h` and `--version`/`-V` (GitHub #77,
-//! `docs/specs/server/06-cli-config.md`).
+//! `ignis-server`'s configuration: every field declared once (ADR 0046,
+//! spec config-v2/01), resolved from the command line, the environment, a
+//! config file and a profile (spec config-v2/02) in one precedence order,
+//! per model family.
 //!
-//! [`resolve`] is the one seam for this feature: pure (no `std::env`, no
-//! filesystem, no process exit), so precedence and validation are covered by
-//! fast unit tests instead of only end-to-end runs. `main` calls it once and
-//! does nothing else config-related.
+//! The module is in layers, each in its own file:
+//!
+//! - `field.rs` / `kind.rs` — what a field is (its [`field::FieldMeta`]) and
+//!   how a value of each kind is read and written;
+//! - `schema.rs` — every field, declared once per group by a `macro_rules!`
+//!   block, giving the grouped [`schema::Settings`];
+//! - `source.rs` — the sources, gathered into layers, and the resolver that
+//!   walks them in precedence order.
+//!
+//! This file turns resolved settings into the [`Config`] the rest of the
+//! server reads — the composite values (`VramMode`, `Speculation`,
+//! `Vision`, …) and the rules that tie one field to another (a vision
+//! envelope needs vision on) — and fits a config to the model family an
+//! artifact names.
+//!
+//! [`resolve`] is the seam: pure (no `std::env`, no filesystem, no process
+//! exit), so precedence and validation are covered by fast unit tests
+//! instead of only end-to-end runs.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::instruction::{DeveloperMessagePolicy, InstructionPolicy, SystemMessagePolicy};
-use crate::thinking::{self, ReasoningEffort};
+use crate::instruction::InstructionPolicy;
+use crate::thinking::ReasoningEffort;
+
+pub mod field;
+pub mod kind;
+pub mod schema;
+pub mod source;
+
+#[cfg(test)]
+mod tests;
+
+use source::{Fit, Resolution, Sources};
 
 /// The default loaded-model id (the v1 specialization: Qwen 3.8-27B —
 /// `CONTEXT.md`).
@@ -19,9 +46,10 @@ pub const DEFAULT_MODEL: &str = "qwen3.8-27b";
 /// The default bind address: localhost, port 8000 (OpenAI convention).
 pub const DEFAULT_BIND: &str = "127.0.0.1:8000";
 
-/// Where `--metrics` serves Prometheus when `--metrics-bind` names nowhere
-/// else (GitHub #89, ADR 0017): localhost, on the port OpenTelemetry's
-/// Prometheus exporter uses — its own listener, never the API's.
+/// Where `--server-metrics` serves Prometheus when `--server-metrics-bind`
+/// names nowhere else (GitHub #89, ADR 0017): localhost, on the port
+/// OpenTelemetry's Prometheus exporter uses — its own listener, never the
+/// API's.
 pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 
 /// The server-wide thinking budget a request that sets none runs under, in
@@ -31,18 +59,16 @@ pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 /// answers instead of reasoning past its cap; a smaller `max_tokens` clamps
 /// it to that cap less the reserve. The 6,144 it replaced cost ~8-9 points
 /// on GPQA Diamond (82.8% against ~91% unbudgeted on the first 22 questions).
-/// `--thinking-budget off` turns it off.
+/// `--model-thinking-budget off` turns it off.
 pub const DEFAULT_THINKING_BUDGET: u32 = 32_768;
 
-/// `--default-max-tokens`' default (ADR 0045, GitHub #309): what a request
-/// that names no `max_tokens` may generate, its reasoning included, on both
-/// models -- Qwen's recommended output length for complex tasks. `0` is no
-/// default: such a request may generate to the end of the context, as before.
+/// `--model-default-max-tokens`' default (ADR 0045, GitHub #309): what a
+/// request that names no `max_tokens` may generate, its reasoning included,
+/// on both models -- Qwen's recommended output length for complex tasks. `0`
+/// is no default: such a request may generate to the end of the context.
 pub const DEFAULT_MAX_TOKENS: u32 = 38_912;
 
-/// The default non-streaming completion timeout, in seconds (GitHub #95) —
-/// unchanged from the value `Server::new` hardcoded before this flag
-/// existed.
+/// The default non-streaming completion timeout, in seconds (GitHub #95).
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u32 = 30;
 
 /// Whether the Playground is served without anyone saying so (GitHub #163,
@@ -51,24 +77,40 @@ pub const DEFAULT_UI: bool = true;
 
 /// Whether a missing model may be fetched (GitHub #234, ADR 0033). On: a
 /// server that cannot find its weights is useless, and the one machine that
-/// must never spend the bandwidth says so with `--no-model-download`.
+/// must never spend the bandwidth says so with `--download-enabled false`.
 pub const DEFAULT_MODEL_DOWNLOAD: bool = true;
 
-/// Where a fetched model lands (`--model-download-path`): the same `./models`
+/// Where a fetched model lands (`--download-path`): the same `./models`
 /// every other instruction in this repo names, so a `hf download --local-dir
 /// models` done by hand and a download the server did are the same file.
 pub const DEFAULT_MODEL_DOWNLOAD_PATH: &str = "./models";
 
-/// The upper bound `--request-timeout`/`IGNIS_REQUEST_TIMEOUT` accepts: a
-/// ceiling against a fat-fingered value, not a real operating point — a
-/// healthy request legitimately runs for minutes at a large `max_tokens`,
-/// never hours.
+/// How long a model switch waits for the requests already running on the
+/// old model before it cuts them, in seconds (`--switch-drain-timeout`,
+/// spec model-switch/01): the grace window that gives a switch a finite
+/// upper bound whatever the load.
+pub const DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 30;
+
+/// The upper bound `--switch-drain-timeout` accepts: a ceiling against a
+/// fat-fingered value, as [`MAX_REQUEST_TIMEOUT_SECS`] is for its flag.
+pub const MAX_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 3600;
+
+/// Whether a request naming another model may switch the server to it
+/// without anyone saying so (`--switch-allow-implicit`, spec model-switch/01
+/// §Implicit switch). On: the owner's clients name the model they want and
+/// expect it served, and only a model `--switch-known-models` lists can be
+/// loaded this way, so the default moves the server to nothing the operator
+/// did not name.
+pub const DEFAULT_ALLOW_MODEL_SWITCH: bool = true;
+
+/// The upper bound `--server-request-timeout` accepts: a ceiling against a
+/// fat-fingered value, not a real operating point — a healthy request
+/// legitimately runs for minutes at a large `max_tokens`, never hours.
 pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 3600;
 
-/// The upper bound `--vision-embedding-pool-mib` /
-/// `IGNIS_VISION_EMBEDDING_POOL_MIB` accepts (GitHub #243): a ceiling
-/// against a fat-fingered value, not the real limit. The real limit is the
-/// VRAM plan — a pool the budget cannot hold fails the load by name
+/// The upper bound `--vision-embedding-pool-mib` accepts (GitHub #243): a
+/// ceiling against a fat-fingered value, not the real limit. The real limit
+/// is the VRAM plan — a pool the budget cannot hold fails the load by name
 /// (ADR 0030) — and 64 GiB is past the largest card this engine runs on, so
 /// this only catches a unit mistake.
 pub const MAX_VISION_EMBEDDING_POOL_MIB: u64 = 64 * 1024;
@@ -90,178 +132,10 @@ use ignis_core::compute::ModelFamily;
 /// neither moved (finding 2026-10-09-vram-headroom-wddm-paging).
 pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1536 * 1024 * 1024;
 pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, Speculation, SpeculativeBackend};
-use ignis_core::speculation::{FLASH_NEXT_DEFAULT_DRAFT_TOKENS, FLASH_NEXT_VERIFY_ROWS};
+use ignis_core::speculation::FLASH_NEXT_DEFAULT_DRAFT_TOKENS;
 
 pub use ignis_core::{MAX_YARN_FACTOR, RopeScaling};
 pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision};
-
-/// The fully-resolved config `main` needs to start the server — one field
-/// per env var, each independently resolved as flag → env → default.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Config {
-    pub model: String,
-    /// Whether the operator named [`Config::model`] (`--model` /
-    /// `IGNIS_MODEL`). Unnamed, a load is served under its own model's id
-    /// ([`served_model_for`]), not the 27B's default.
-    pub model_named: bool,
-    pub bind: String,
-    pub artifact: Option<PathBuf>,
-    /// May the server fetch [`Config::model`] when no artifact is on disk
-    /// (`--model-download` / `--no-model-download` / `IGNIS_MODEL_DOWNLOAD`,
-    /// GitHub #234)? On by default. Off never refuses a start: it falls back
-    /// to the placeholder template, exactly as an unfetchable model always
-    /// did. Only consulted when `artifact` is `None` — a named path is the
-    /// operator's word.
-    pub model_download: bool,
-    /// Where a fetched model lands, and where one fetched earlier is looked
-    /// for (`--model-download-path` / `IGNIS_MODEL_DOWNLOAD_PATH`, GitHub
-    /// #234). Flat, one file per model: the artifact and its sidecar keep
-    /// the names the repo publishes them under.
-    pub model_download_path: PathBuf,
-    /// Flash-Next's n-gram hot-row cache between loads
-    /// (`--persist-ngram-cache` / `--persist-ngram-cache-path`): on, beside
-    /// the model, unless the operator says otherwise.
-    pub ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
-    /// Flash-Next's n-gram hot-row budget (`--ngram-hot-bytes` /
-    /// `IGNIS_NGRAM_HOT_BYTES`, GitHub #306): a size, or `auto` for what the
-    /// host plan leaves. `None`: the 1 GiB default. The 27B has no n-gram
-    /// table and refuses it.
-    pub ngram_hot_bytes: Option<ignis_core::ngram_table::HotBudget>,
-    /// KV-disk, Tier 2 (spec vram-budget/03): its budget in bytes
-    /// (`--kv-disk-bytes` / `IGNIS_KV_DISK_BYTES`), a ceiling cut at start
-    /// to the volume's free space above its 10 GiB margin. `None`: the model
-    /// family's (4 GiB on Flash-Next, 0 = off on the 27B).
-    pub kv_disk_bytes: Option<u64>,
-    /// Where KV-disk's files go (`--kv-disk-path` / `IGNIS_KV_DISK_PATH`):
-    /// the n-gram cache's rule -- beside the model (the default), `auto`'s
-    /// per-user cache directory under `kv-disk`, or a named directory.
-    pub kv_disk_location: ignis_core::ngram_cache::CacheLocation,
-    pub enable_thinking: bool,
-    pub reasoning_effort: Option<ReasoningEffort>,
-    /// The server-wide thinking budget (`--thinking-budget` /
-    /// `IGNIS_THINKING_BUDGET`, default [`DEFAULT_THINKING_BUDGET`]): the
-    /// reasoning tokens a request may spend before the model's close is
-    /// forced. `None` = no budget (`off`).
-    pub thinking_budget: Option<u32>,
-    /// The prefill chunk width, in tokens (a nonzero multiple of
-    /// [`PREFILL_CHUNK_ALIGNMENT`]).
-    pub prefill_chunk: u32,
-    /// The **decode share** (`--decode-share` / `IGNIS_DECODE_SHARE`, GitHub
-    /// #306): the percent of the model's time decoding lanes keep while a
-    /// prompt prefills, 0-99. `None`: the model family's own.
-    pub decode_share_percent: Option<u32>,
-    /// The maximum per-sequence context, in tokens (the largest prompt +
-    /// generation budget a single request may reserve).
-    pub max_context: u32,
-    /// The **default `max_tokens`** (`--default-max-tokens` /
-    /// `IGNIS_DEFAULT_MAX_TOKENS`, ADR 0045): the generation cap of a request
-    /// that sends none, clamped by the scheduler to what its prompt leaves of
-    /// the context. [`DEFAULT_MAX_TOKENS`] unless named; `0` is none.
-    pub default_max_tokens: u32,
-    /// The KV storage format this load runs on (ADR 0022, GitHub #122),
-    /// fixed for the life of the load.
-    pub kv_format: KvFormat,
-    /// The KV pool the operator named (`--kv-pool-bytes`, ADR 0045): a byte
-    /// count, or a token count (`512Ktok`). Only parsed here: the load's plan,
-    /// which knows the model's bytes per token, turns it into pages and
-    /// refuses one smaller than a full context and a page per retained slot.
-    /// `None` (the default) takes the KV pool policy's size: the rest of the
-    /// VRAM budget when every weight is on the device, 524,288 tokens when
-    /// experts stream.
-    pub kv_pool: Option<KvPoolSize>,
-    /// How the load's **VRAM budget** is chosen (GitHub #210, ADR 0030):
-    /// derived from `--vram-headroom-bytes` (the default, with
-    /// [`DEFAULT_VRAM_HEADROOM_BYTES`]) or named by `--vram-budget-bytes`,
-    /// with `--allow-vram-oversubscription` only beside the latter.
-    pub vram: VramMode,
-    /// Start Flash-Next with an expert cache below its 12 GiB floor, with a
-    /// warning (`--allow-expert-cache-below-floor` /
-    /// `IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR`, ADR 0045). The 27B, which has
-    /// no expert cache, refuses it.
-    pub allow_expert_cache_below_floor: bool,
-    /// The KV-RAM host tier's budget, in bytes (P4-07, GitHub #125): pinned
-    /// host memory for evicted (suspended) request snapshots. `0` disables
-    /// the tier (admission refuses instead of evicting once the resident
-    /// lanes are full). A byte budget, not a page or lane count, because a
-    /// snapshot's fixed GDN floor (~145 MiB) is paid regardless of prompt
-    /// length.
-    pub host_pool_bytes: u64,
-    /// Cross-request state reuse (`--prompt-reuse`, GitHub #186, ADR 0029).
-    /// On by default. Off means a request captures no prompt checkpoint and
-    /// claims none, so a cold bench measures a cold engine and a correctness
-    /// oracle prefills every prompt it is given.
-    pub prompt_reuse: bool,
-    /// The load's retained slots (GitHub #215, #281, ADR 0030): places for
-    /// one mutable-state image each, reserved at load, where every prompt
-    /// checkpoint and shared prefix keeps its image. Device slots
-    /// (`--retained-device`, [`DEFAULT_RETAINED_DEVICE_SLOTS`]) sit in the
-    /// device state arenas and are handed out first; host slots
-    /// (`--retained-host`, [`DEFAULT_RETAINED_HOST_SLOTS`]) sit in one pinned
-    /// host block and cost a PCIe copy per capture and per claim. Both 0 with
-    /// prompt reuse off unless named.
-    pub retained_device_slots: u32,
-    pub retained_host_slots: u32,
-    /// Whether the operator named [`Config::retained_host_slots`]
-    /// (`--retained-host` / `IGNIS_RETAINED_HOST`). Unnamed, a Flash-Next
-    /// load takes its own default (spec flash-next/05), not the 27B's.
-    pub retained_host_named: bool,
-    /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
-    /// priority after its conversation last used it, in seconds
-    /// (`--retained-interactive-ttl`, GitHub #190). Past it the entry ranks as
-    /// an Agent's would.
-    pub retained_interactive_ttl_secs: u32,
-    /// Where `system` and `developer` messages go before the conversation is
-    /// templated (`--system-message-policy` / `--developer-message-policy`,
-    /// GitHub #209).
-    pub instruction_policy: InstructionPolicy,
-    /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
-    /// GitHub #150). `None` loads nothing of the drafter; Flash-Next's MTP
-    /// head too is off unless `--spec mtp` names it (spec flash-next/07).
-    pub speculation: Option<Speculation>,
-    /// `--spec off` / `IGNIS_SPEC=off`: no speculation, the default one
-    /// included (GitHub #307).
-    pub speculation_off: bool,
-    /// Flash-Next's draft row budget (`--draft-rows` / `IGNIS_DRAFT_ROWS`,
-    /// GitHub #307): a round of w lanes verifies min(draft tokens, rows / w
-    /// - 1) drafts per lane. `None`: the decode route's 8 rows.
-    pub draft_rows: Option<u32>,
-    /// Flash-Next's decode lanes (`--decode-lanes` / `IGNIS_DECODE_LANES`,
-    /// GitHub #306), 1..=[`ignis_core::N_DECODE_LANES`]. `None`: the engine's
-    /// default of 3. The 27B has a fixed lane count and refuses the flag.
-    pub decode_lanes: Option<u32>,
-    /// Vision, chosen at load (`--vision`/`--vision-max-tokens`, GitHub #177).
-    /// `None` binds and reserves nothing of the vision tower.
-    pub vision: Option<Vision>,
-    /// The text rotary table, chosen at load (`--rope-scaling`, GitHub
-    /// #227). [`RopeScaling::NONE`] is the linear table the engine has
-    /// always used; a YaRN factor rescales the checkpoint's trained
-    /// 262,144-position envelope, which is what a context past it needs.
-    pub rope_scaling: RopeScaling,
-    /// Media acquisition (`--media-allow-private-network`,
-    /// `--media-cache-mib`, GitHub #179). Only nameable with vision on.
-    pub media: MediaOptions,
-    /// How long a non-streaming request waits for its completion before the
-    /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
-    pub request_timeout_secs: u32,
-    /// Serve the Playground under `/ui/` (GitHub #163, ADR 0026). On unless
-    /// `--no-ui` / `IGNIS_UI=false` turns it off: a binary that embedded the
-    /// build serves it, and one that did not serves the page saying how to
-    /// build it, so the default costs a route and nothing else. `--ui` is
-    /// still accepted, and now says out loud what is already true.
-    pub ui: bool,
-    /// The metrics listener's address when `--metrics` is on (GitHub #89,
-    /// ADR 0017): `--metrics-bind`, else [`DEFAULT_METRICS_BIND`]. `None` =
-    /// metrics off. Flag-only: no env var, no alias, no config-file key.
-    pub metrics: Option<String>,
-    /// The key every `/v1` request must present as `Authorization: Bearer
-    /// <key>` (`--api-key` / `IGNIS_API_KEY`). `None` (the default) keeps
-    /// the API open, as it has always been on localhost.
-    pub api_key: Option<ApiKeySetting>,
-    /// How the server is exposed beyond its bind address (`--expose` /
-    /// `IGNIS_EXPOSE`, ADR 0028). `Some` always comes with an API key:
-    /// without one, [`resolve`] sets `api_key` to [`ApiKeySetting::Generate`].
-    pub expose: Option<Expose>,
-}
 
 pub use crate::expose::Expose;
 
@@ -272,12 +146,286 @@ pub const DEFAULT_MEDIA_CACHE_MIB: u32 = 1024;
 /// fat-fingered value (64 GiB of host memory for prepared patches).
 pub const MEDIA_CACHE_MIB_LIMIT: u32 = 64 * 1024;
 
+/// `--reuse-kv-host-pool-bytes`' default (P4-07, GitHub #125): comfortably
+/// holds several full-context snapshots (each ~528 MB per ADR 0024's
+/// estimate) without an operator having to reason about the format's
+/// per-snapshot cost just to start the server.
+///
+/// Since GitHub #213 (ADR 0030) it is page-locked whole at start rather than
+/// blob by blob while serving, so it is RAM the process holds even idle.
+pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `--reuse-prompt`'s default (GitHub #186, ADR 0029): on. Cross-request
+/// reuse is the owner's workload — an agent's tool loop re-sends its whole
+/// history every iteration — so it is what the engine does unless asked not
+/// to.
+pub const DEFAULT_PROMPT_REUSE: bool = true;
+
+/// `--reuse-retained-device`'s and `--reuse-retained-host`'s defaults with
+/// prompt reuse on (GitHub #281): no slot in VRAM, two per decode lane in the
+/// pinned host block. With prompt reuse off both default to 0.
+pub use ignis_runtime::{DEFAULT_RETAINED_DEVICE_SLOTS, DEFAULT_RETAINED_HOST_SLOTS};
+
+/// `--reuse-retained-interactive-ttl`'s default, in seconds (GitHub #190):
+/// the scheduler's own starting value, restated as a flag default rather
+/// than chosen twice.
+pub const DEFAULT_RETAINED_INTERACTIVE_TTL_SECS: u32 =
+    ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL.as_secs() as u32;
+
+/// The fully-resolved config `main` needs to start the server: the
+/// declared fields of [`schema::Settings`], with the ones that only mean
+/// something together already combined (`vram`, `speculation`, `vision`,
+/// `media`, `metrics`, `instruction_policy`, `ngram_cache`) and checked
+/// against each other.
+///
+/// Built only by resolution ([`resolve`], [`Config::for_family`],
+/// [`fit_to_family`]), never field by field, so its combined values always
+/// agree with the [`Config::basis`] they were derived from. A copy made with
+/// struct-update syntax (`Config { kv_format, ..base }`, as tests do to vary
+/// one knob) keeps its base's basis: it is a fine input to anything that
+/// reads its fields, and re-resolving it starts again from the base's
+/// sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// The id the model is served under: the operator's (`--model-id`), the
+    /// loaded model's own once a family is known, or [`DEFAULT_MODEL`]
+    /// before.
+    pub model: String,
+    /// Whether the operator named [`Config::model`] (`--model-id`).
+    /// Unnamed, a load is served under its own model's id
+    /// ([`served_model_for`]), not the 27B's default.
+    pub model_named: bool,
+    pub bind: String,
+    pub artifact: Option<PathBuf>,
+    /// May the server fetch [`Config::model`] when no artifact is on disk
+    /// (`--download-enabled`, GitHub #234)? On by default. Off never refuses
+    /// a start: it falls back to the placeholder template, exactly as an
+    /// unfetchable model always did. Only consulted when `artifact` is
+    /// `None` — a named path is the operator's word.
+    pub model_download: bool,
+    /// Where a fetched model lands, and where one fetched earlier is looked
+    /// for (`--download-path`, GitHub #234). Flat, one file per model: the
+    /// artifact and its sidecar keep the names the repo publishes them under.
+    pub model_download_path: PathBuf,
+    /// Flash-Next's n-gram hot-row cache between loads (`--ngram-persist` /
+    /// `--ngram-persist-path`): on, beside the model, unless the operator
+    /// says otherwise.
+    pub ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
+    /// Flash-Next's n-gram hot-row budget (`--ngram-hot-bytes`, GitHub
+    /// #306): a size, or `auto` for what the host plan leaves. `None`: the
+    /// 1 GiB default. The 27B has no n-gram table and refuses it.
+    pub ngram_hot_bytes: Option<ignis_core::ngram_table::HotBudget>,
+    /// KV-disk, Tier 2 (spec vram-budget/03): its budget in bytes
+    /// (`--kv-disk-bytes`), a ceiling cut at start to the volume's free space
+    /// above its 10 GiB margin. `None`: the model family's (4 GiB on
+    /// Flash-Next, 0 = off on the 27B).
+    pub kv_disk_bytes: Option<u64>,
+    /// Where KV-disk's files go (`--kv-disk-path`): the n-gram cache's rule
+    /// -- beside the model (the default), `auto`'s per-user cache directory
+    /// under `kv-disk`, or a named directory.
+    pub kv_disk_location: ignis_core::ngram_cache::CacheLocation,
+    pub enable_thinking: bool,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// The server-wide thinking budget (`--model-thinking-budget`, default
+    /// [`DEFAULT_THINKING_BUDGET`]): the reasoning tokens a request may spend
+    /// before the model's close is forced. `None` = no budget (`off`).
+    pub thinking_budget: Option<u32>,
+    /// The prefill chunk width, in tokens (a nonzero multiple of
+    /// [`PREFILL_CHUNK_ALIGNMENT`]).
+    pub prefill_chunk: u32,
+    /// The **decode share** (`--model-decode-share`, GitHub #306): the
+    /// percent of the model's time decoding lanes keep while a prompt
+    /// prefills, 0-99. `None`: the model family's own.
+    pub decode_share_percent: Option<u32>,
+    /// The maximum per-sequence context, in tokens (the largest prompt +
+    /// generation budget a single request may reserve).
+    pub max_context: u32,
+    /// The **default `max_tokens`** (`--model-default-max-tokens`, ADR
+    /// 0045): the generation cap of a request that sends none, clamped by
+    /// the scheduler to what its prompt leaves of the context.
+    /// [`DEFAULT_MAX_TOKENS`] unless named; `0` is none.
+    pub default_max_tokens: u32,
+    /// The KV storage format this load runs on (ADR 0022, GitHub #122),
+    /// fixed for the life of the load.
+    pub kv_format: KvFormat,
+    /// The KV pool the operator named (`--vram-kv-pool-bytes`, ADR 0045): a
+    /// byte count, or a token count (`512Ktok`). Only parsed here: the load's
+    /// plan, which knows the model's bytes per token, turns it into pages and
+    /// refuses one smaller than a full context and a page per retained slot.
+    /// `None` (the default) takes the KV pool policy's size.
+    pub kv_pool: Option<KvPoolSize>,
+    /// How the load's **VRAM budget** is chosen (GitHub #210, ADR 0030):
+    /// derived from `--vram-headroom-bytes` (the default, with
+    /// [`DEFAULT_VRAM_HEADROOM_BYTES`]) or named by `--vram-budget-bytes`,
+    /// with `--vram-allow-oversubscription` only beside the latter.
+    pub vram: VramMode,
+    /// Start Flash-Next with an expert cache below its 12 GiB floor, with a
+    /// warning (`--vram-allow-expert-cache-below-floor`, ADR 0045). The 27B,
+    /// which has no expert cache, refuses it.
+    pub allow_expert_cache_below_floor: bool,
+    /// The KV-RAM host tier's budget, in bytes (P4-07, GitHub #125): pinned
+    /// host memory for evicted (suspended) request snapshots. `0` disables
+    /// the tier (admission refuses instead of evicting once the resident
+    /// lanes are full). A byte budget, not a page or lane count, because a
+    /// snapshot's fixed GDN floor (~145 MiB) is paid regardless of prompt
+    /// length.
+    pub host_pool_bytes: u64,
+    /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
+    /// On by default. Off means a request captures no prompt checkpoint and
+    /// claims none, so a cold bench measures a cold engine and a correctness
+    /// oracle prefills every prompt it is given.
+    pub prompt_reuse: bool,
+    /// The load's retained slots (GitHub #215, #281, ADR 0030): places for
+    /// one mutable-state image each, reserved at load, where every prompt
+    /// checkpoint and shared prefix keeps its image. Device slots
+    /// (`--reuse-retained-device`, [`DEFAULT_RETAINED_DEVICE_SLOTS`]) sit in
+    /// the device state arenas and are handed out first; host slots
+    /// (`--reuse-retained-host`, [`DEFAULT_RETAINED_HOST_SLOTS`]) sit in one
+    /// pinned host block and cost a PCIe copy per capture and per claim. Both
+    /// 0 with prompt reuse off unless named.
+    pub retained_device_slots: u32,
+    pub retained_host_slots: u32,
+    /// Whether [`Config::retained_host_slots`] was given at all — by the
+    /// operator or by a profile. Ungiven, a Flash-Next load takes its own
+    /// default (spec flash-next/05), not the 27B's.
+    pub retained_host_named: bool,
+    /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
+    /// priority after its conversation last used it, in seconds
+    /// (`--reuse-retained-interactive-ttl`, GitHub #190). Past it the entry
+    /// ranks as an Agent's would.
+    pub retained_interactive_ttl_secs: u32,
+    /// Where `system` and `developer` messages go before the conversation is
+    /// templated (`--server-system-message-policy` /
+    /// `--server-developer-message-policy`, GitHub #209).
+    pub instruction_policy: InstructionPolicy,
+    /// Speculative decoding, chosen at load (`--spec-backend` /
+    /// `--spec-draft-tokens`, P5-02 GitHub #150). `None` loads nothing of the
+    /// drafter; Flash-Next's MTP head too is off unless `--spec-backend mtp`
+    /// names it (spec flash-next/07).
+    pub speculation: Option<Speculation>,
+    /// `--spec-backend off`: no speculation, the default one included
+    /// (GitHub #307).
+    pub speculation_off: bool,
+    /// Flash-Next's draft row budget (`--spec-draft-rows`, GitHub #307): a
+    /// round of w lanes verifies min(draft tokens, rows / w - 1) drafts per
+    /// lane. `None`: the decode route's 8 rows.
+    pub draft_rows: Option<u32>,
+    /// Flash-Next's decode lanes (`--spec-decode-lanes`, GitHub #306),
+    /// 1..=[`ignis_core::N_DECODE_LANES`]. `None`: the engine's default of 3.
+    /// The 27B has a fixed lane count and refuses the flag.
+    pub decode_lanes: Option<u32>,
+    /// Vision, chosen at load (`--vision-enabled` / `--vision-max-tokens`,
+    /// GitHub #177). `None` binds and reserves nothing of the vision tower.
+    pub vision: Option<Vision>,
+    /// The text rotary table, chosen at load (`--model-rope-scaling`, GitHub
+    /// #227). [`RopeScaling::NONE`] is the linear table the engine has always
+    /// used; a YaRN factor rescales the checkpoint's trained 262,144-position
+    /// envelope, which is what a context past it needs.
+    pub rope_scaling: RopeScaling,
+    /// Media acquisition (`--media-allow-private-network`,
+    /// `--media-cache-mib`, GitHub #179). Only nameable with vision on.
+    pub media: MediaOptions,
+    /// How long a non-streaming request waits for its completion before the
+    /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
+    pub request_timeout_secs: u32,
+    /// How long a model switch (spec model-switch/01) waits for the old
+    /// model's in-flight requests before it cancels them
+    /// (`--switch-drain-timeout`). In `[0, MAX_SWITCH_DRAIN_TIMEOUT_SECS]`;
+    /// 0 cuts them at once.
+    pub switch_drain_timeout_secs: u32,
+    /// Whether a request whose `model` names another model listed in
+    /// [`Config::known_models`] switches the server to it, and is then
+    /// served on it (`--switch-allow-implicit`, spec model-switch/01
+    /// §Implicit switch; [`DEFAULT_ALLOW_MODEL_SWITCH`]).
+    pub allow_model_switch: bool,
+    /// The models a request may switch to by naming them, each with the
+    /// artifact it loads from (`--switch-known-models <id>=<path>`,
+    /// repeatable). The operator's entries only: the model the server starts
+    /// on joins them once its load has said which id it serves under.
+    pub known_models: BTreeMap<String, PathBuf>,
+    /// Serve the Playground under `/ui/` (GitHub #163, ADR 0026). On unless
+    /// `--server-ui false` turns it off: a binary that embedded the build
+    /// serves it, and one that did not serves the page saying how to build
+    /// it, so the default costs a route and nothing else.
+    pub ui: bool,
+    /// The metrics listener's address when `--server-metrics` is on (GitHub
+    /// #89, ADR 0017): `--server-metrics-bind`, else
+    /// [`DEFAULT_METRICS_BIND`]. `None` = metrics off.
+    pub metrics: Option<String>,
+    /// The key every `/v1` request must present as `Authorization: Bearer
+    /// <key>` (`--server-api-key`). `None` (the default) keeps the API open,
+    /// as it has always been on localhost.
+    pub api_key: Option<ApiKeySetting>,
+    /// How the server is exposed beyond its bind address (`--server-expose`,
+    /// ADR 0028). `Some` always comes with an API key: without one,
+    /// resolution sets `api_key` to [`ApiKeySetting::Generate`].
+    pub expose: Option<Expose>,
+    /// What this config was resolved from: the gathered sources, the
+    /// settings resolved from them, and the family they were resolved for.
+    /// [`Config::for_family`], [`fit_to_family`] and [`Config::with_patch`]
+    /// start again from here; `GET /v1/config` shows its settings.
+    pub basis: Basis,
+}
+
+/// What a [`Config`] was resolved from (see [`Config::basis`]). Shared, so a
+/// config clones in O(1) whatever its sources hold.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Basis(Arc<BasisInner>);
+
+#[derive(PartialEq, Eq)]
+struct BasisInner {
+    sources: Sources,
+    resolution: Resolution,
+    family: Option<ModelFamily>,
+}
+
+impl Basis {
+    /// The sources gathered at start, with any live patch on top.
+    pub fn sources(&self) -> &Sources {
+        &self.0.sources
+    }
+
+    /// Every declared field's resolved value — spec config-v2/01's
+    /// "resolved Config".
+    pub fn settings(&self) -> &schema::Settings {
+        &self.0.resolution.settings
+    }
+
+    /// Where each field's value came from.
+    pub fn resolution(&self) -> &Resolution {
+        &self.0.resolution
+    }
+
+    /// The family the settings were resolved for; `None` before an artifact
+    /// named one.
+    pub fn family(&self) -> Option<ModelFamily> {
+        self.0.family
+    }
+}
+
+impl std::fmt::Debug for Basis {
+    /// The family and which spellings each source set, never a value (the
+    /// sources hold the API key's raw text).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Basis").field("family", &self.0.family).field("sources", &self.0.sources).finish()
+    }
+}
+
+/// The speculative backend a config names (`--spec-backend`): one, or `off`
+/// — which is not the same as naming none, since `off` also turns off a
+/// backend a family would otherwise start by default (GitHub #307).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecChoice {
+    Off,
+    Backend(SpeculativeBackend),
+}
+
 /// How image parts are acquired (GitHub #179).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaOptions {
     /// Fetch image URLs that resolve to private, loopback, link-local,
-    /// multicast or CGNAT addresses. Off by default, so an `--expose`d
-    /// server cannot be used to probe the operator's LAN.
+    /// multicast or CGNAT addresses. Off by default, so an exposed server
+    /// cannot be used to probe the operator's LAN.
     pub allow_private_network: bool,
     /// Host memory for prepared image patches kept for reuse, in bytes
     /// (0 retains nothing).
@@ -290,8 +438,8 @@ impl Default for MediaOptions {
     }
 }
 
-/// What `--api-key` asked for: a key the operator chose, or `auto` — one
-/// `main` generates at start and prints, the only time a key is printed.
+/// What `--server-api-key` asked for: a key the operator chose, or `auto` —
+/// one `main` generates at start and prints, the only time a key is printed.
 /// Resolved here, generated in `main`, so [`resolve`] stays pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiKeySetting {
@@ -337,35 +485,8 @@ impl std::fmt::Debug for ApiKey {
     }
 }
 
-/// `--kv-host-pool-bytes` / `IGNIS_KV_HOST_POOL_BYTES`'s default (P4-07,
-/// GitHub #125): comfortably holds several full-context snapshots (each
-/// ~528 MB per ADR 0024's estimate) without an operator having to reason
-/// about the format's per-snapshot cost just to start the server.
-///
-/// Since GitHub #213 (ADR 0030) it is page-locked whole at start rather than
-/// blob by blob while serving, so it is RAM the process holds even idle.
-pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// `--prompt-reuse`'s default (GitHub #186, ADR 0029): on. Cross-request
-/// reuse is the owner's workload — an agent's tool loop re-sends its whole
-/// history every iteration — so it is what the engine does unless asked not
-/// to.
-pub const DEFAULT_PROMPT_REUSE: bool = true;
-
-/// `--retained-device`'s and `--retained-host`'s defaults with prompt reuse
-/// on (GitHub #281): no slot in VRAM, two per decode lane in the pinned host
-/// block. With `--prompt-reuse off` both default to 0.
-pub use ignis_runtime::{DEFAULT_RETAINED_DEVICE_SLOTS, DEFAULT_RETAINED_HOST_SLOTS};
-
-/// `--retained-interactive-ttl`'s default, in seconds (GitHub #190): the
-/// scheduler's own starting value, restated as a flag default rather than
-/// chosen twice.
-pub const DEFAULT_RETAINED_INTERACTIVE_TTL_SECS: u32 =
-    ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL.as_secs() as u32;
-
-/// What [`resolve`] produced: a runnable config, or a request to print
-/// `--help`/`--version` text and exit before any loader/scheduler work runs.
-/// `resolve` never prints or exits itself — that stays in `main`.
+/// What [`resolve`] produced: a runnable config, or text to print before
+/// exiting — `resolve` never prints or exits itself; that stays in `main`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigOutcome {
     Config(Config),
@@ -373,9 +494,10 @@ pub enum ConfigOutcome {
     Version(String),
 }
 
-/// An unrecognized flag, a flag missing its required value, or a
-/// thinking-parse failure surfaced from `thinking::parse_default_*` — the
-/// message is suitable for `eprintln!("ignis-server: {err}")` before exit.
+/// A configuration the server refuses: an unrecognized flag, a value that
+/// does not parse or validate, two fields that contradict each other. The
+/// message names the spelling the bad value arrived under and is suitable
+/// for `eprintln!("ignis-server: {err}")` before exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(pub String);
 
@@ -388,12 +510,15 @@ impl std::fmt::Display for ConfigError {
 /// Resolve `args` (argv without the program name) and `env` (injected so
 /// tests never touch the real process environment) into a [`ConfigOutcome`].
 ///
-/// `--help`/`--version` short-circuit before any other flag is parsed or
-/// validated — `ignis-server --help --nonsense` just prints help.
-pub fn resolve(
-    args: &[String],
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<ConfigOutcome, ConfigError> {
+/// `--help`/`-h` and `--version`/`-V` short-circuit before any other flag is
+/// parsed or validated — `ignis-server --help --nonsense` just prints help.
+///
+/// Every family-scoped value is resolved here too, for each family, so a
+/// mistake in one (`--qwen38flashnext-model-max-context lots`) is refused at
+/// start rather than at the first load of that family. The family checks
+/// that depend on which artifact loads (the 27B's attention envelope) wait
+/// for [`Config::for_family`].
+pub fn resolve(args: &[String], env: impl Fn(&str) -> Option<String>) -> Result<ConfigOutcome, ConfigError> {
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ConfigOutcome::Help(help_text())),
@@ -401,3103 +526,490 @@ pub fn resolve(
             _ => {}
         }
     }
+    let parsed = source::parse_args(args)?;
+    if let Some(path) = parsed.config {
+        return Err(ConfigError(format!("`--config {path}`: config files are not read by this build yet")));
+    }
+    let sources = Sources {
+        flags: parsed.flags,
+        env: source::env_layer(&env)?,
+        profile_name: parsed.profile.unwrap_or_default(),
+        ..Sources::default()
+    };
+    Config::from_sources(sources).map(ConfigOutcome::Config)
+}
 
-    let mut model = None;
-    let mut bind = None;
-    let mut artifact = None;
-    let mut enable_thinking = None;
-    let mut reasoning_effort = None;
-    let mut thinking_budget = None;
-    let mut prefill_chunk = None;
-    let mut decode_share = None;
-    let mut max_context = None;
-    let mut default_max_tokens = None;
-    let mut kv_format = None;
-    let mut kv_pool_bytes = None;
-    let mut host_pool_bytes = None;
-    let mut vram_headroom_bytes = None;
-    let mut vram_budget_bytes = None;
-    let mut allow_vram_oversubscription = false;
-    let mut allow_expert_cache_below_floor = false;
-    let mut prompt_reuse = None;
-    let mut retained_pool_bytes = None;
-    let mut retained_slots = None;
-    let mut retained_device = None;
-    let mut retained_host = None;
-    let mut retained_interactive_ttl = None;
-    let mut system_message_policy = None;
-    let mut developer_message_policy = None;
-    let mut request_timeout = None;
-    let mut spec = None;
-    let mut draft_tokens = None;
-    let mut draft_rows = None;
-    let mut decode_lanes = None;
-    let mut draft_head = None;
-    let mut vision = false;
-    let mut vision_max_tokens = None;
-    let mut vision_embedding_pool_mib = None;
-    let mut rope_scaling = None;
-    let mut media_allow_private_network = false;
-    let mut media_cache_mib = None;
-    let mut ui = None;
-    let mut model_download = None;
-    let mut model_download_path = None;
-    let mut persist_ngram_cache = None;
-    let mut persist_ngram_cache_path = None;
-    let mut ngram_hot_bytes = None;
-    let mut kv_disk_bytes = None;
-    let mut kv_disk_path = None;
-    let mut metrics_on = false;
-    let mut metrics_bind = None;
-    let mut api_key = None;
-    let mut expose = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        let flag = args[i].as_str();
-        match flag {
-            "--model" | "-m" => model = Some(take_value(args, &mut i, flag)?),
-            "--bind" | "-b" => bind = Some(take_value(args, &mut i, flag)?),
-            "--artifact" | "-a" => artifact = Some(take_value(args, &mut i, flag)?),
-            "--enable-thinking" => enable_thinking = Some(take_value(args, &mut i, flag)?),
-            "--reasoning-effort" => reasoning_effort = Some(take_value(args, &mut i, flag)?),
-            "--thinking-budget" => thinking_budget = Some(take_value(args, &mut i, flag)?),
-            "--prefill-chunk" => prefill_chunk = Some(take_value(args, &mut i, flag)?),
-            "--decode-share" => decode_share = Some(take_value(args, &mut i, flag)?),
-            "--max-context" => max_context = Some(take_value(args, &mut i, flag)?),
-            "--default-max-tokens" => default_max_tokens = Some(take_value(args, &mut i, flag)?),
-            "--kv-format" => kv_format = Some(take_value(args, &mut i, flag)?),
-            "--kv-pool-bytes" => kv_pool_bytes = Some(take_value(args, &mut i, flag)?),
-            "--kv-host-pool-bytes" => host_pool_bytes = Some(take_value(args, &mut i, flag)?),
-            "--vram-headroom-bytes" => vram_headroom_bytes = Some(take_value(args, &mut i, flag)?),
-            "--vram-budget-bytes" => vram_budget_bytes = Some(take_value(args, &mut i, flag)?),
-            "--allow-vram-oversubscription" => allow_vram_oversubscription = true,
-            "--allow-expert-cache-below-floor" => allow_expert_cache_below_floor = true,
-            "--prompt-reuse" => prompt_reuse = Some(take_value(args, &mut i, flag)?),
-            "--retained-pool-bytes" => {
-                retained_pool_bytes = Some(take_value(args, &mut i, flag)?)
-            }
-            "--retained-slots" => retained_slots = Some(take_value(args, &mut i, flag)?),
-            "--retained-device" => retained_device = Some(take_value(args, &mut i, flag)?),
-            "--retained-host" => retained_host = Some(take_value(args, &mut i, flag)?),
-            "--retained-interactive-ttl" => {
-                retained_interactive_ttl = Some(take_value(args, &mut i, flag)?)
-            }
-            "--system-message-policy" => system_message_policy = Some(take_value(args, &mut i, flag)?),
-            "--developer-message-policy" => {
-                developer_message_policy = Some(take_value(args, &mut i, flag)?)
-            }
-            "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
-            "--spec" => spec = Some(take_value(args, &mut i, flag)?),
-            "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
-            "--draft-rows" => draft_rows = Some(take_value(args, &mut i, flag)?),
-            "--decode-lanes" => decode_lanes = Some(take_value(args, &mut i, flag)?),
-            "--draft-head" => draft_head = Some(take_value(args, &mut i, flag)?),
-            "--rope-scaling" => rope_scaling = Some(take_value(args, &mut i, flag)?),
-            "--vision" => vision = true,
-            "--vision-max-tokens" => vision_max_tokens = Some(take_value(args, &mut i, flag)?),
-            "--vision-embedding-pool-mib" => {
-                vision_embedding_pool_mib = Some(take_value(args, &mut i, flag)?);
-            }
-            "--media-allow-private-network" => media_allow_private_network = true,
-            "--media-cache-mib" => media_cache_mib = Some(take_value(args, &mut i, flag)?),
-            "--ui" => ui = Some(true),
-            "--no-ui" => ui = Some(false),
-            "--model-download" => model_download = Some(true),
-            "--no-model-download" => model_download = Some(false),
-            "--model-download-path" => {
-                model_download_path = Some(take_value(args, &mut i, flag)?)
-            }
-            "--persist-ngram-cache" => persist_ngram_cache = Some(take_value(args, &mut i, flag)?),
-            "--persist-ngram-cache-path" => persist_ngram_cache_path = Some(take_value(args, &mut i, flag)?),
-            "--ngram-hot-bytes" => ngram_hot_bytes = Some(take_value(args, &mut i, flag)?),
-            "--kv-disk-bytes" => kv_disk_bytes = Some(take_value(args, &mut i, flag)?),
-            "--kv-disk-path" => kv_disk_path = Some(take_value(args, &mut i, flag)?),
-            "--metrics" => metrics_on = true,
-            "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
-            "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
-            "--expose" => expose = Some(take_value(args, &mut i, flag)?),
-            other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
+impl Config {
+    /// The config `sources` resolve to before any family is known, every
+    /// family's scoped values checked on the way.
+    pub fn from_sources(sources: Sources) -> Result<Config, ConfigError> {
+        for family in field::FAMILIES {
+            derive(&sources, Some(family), Fit::Switch, false)?;
         }
-        i += 1;
+        derive(&sources, None, Fit::Start, false).map(|(config, _)| config)
     }
 
-    let model = model.or_else(|| env("IGNIS_MODEL"));
-    let model_named = model.is_some();
-    let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_owned());
-    let bind = bind
-        .or_else(|| env("IGNIS_BIND"))
-        .unwrap_or_else(|| DEFAULT_BIND.to_owned());
-    let artifact = non_empty(artifact.or_else(|| env("IGNIS_ARTIFACT"))).map(PathBuf::from);
+    /// The settings every field resolved to (`GET /v1/config`'s source).
+    pub fn settings(&self) -> &schema::Settings {
+        self.basis.settings()
+    }
 
-    let enable_thinking_raw = enable_thinking
-        .or_else(|| env("IGNIS_ENABLE_THINKING"))
-        .unwrap_or_else(|| "true".to_owned());
-    let enable_thinking =
-        thinking::parse_default_enable_thinking(&enable_thinking_raw).map_err(ConfigError)?;
+    /// This config's sources resolved again for an artifact of `family`, at
+    /// **start** (spec flash-next/04): the family-scoped values apply, and an
+    /// explicit value for a field `family` cannot take is refused by name —
+    /// the operator named it for this load. Also refused: a served id naming
+    /// the other model, a speculative backend the family does not draft
+    /// with, and on the 27B a context past its attention's envelope.
+    ///
+    /// The returned config's [`Config::model`] is the id the load is served
+    /// under.
+    pub fn for_family(&self, family: ModelFamily) -> Result<Config, ConfigError> {
+        derive(self.basis.sources(), Some(family), Fit::Start, true).map(|(config, _)| config)
+    }
 
-    let reasoning_effort_raw = reasoning_effort
-        .or_else(|| env("IGNIS_REASONING_EFFORT"))
-        .unwrap_or_default();
-    let reasoning_effort =
-        thinking::parse_default_reasoning_effort(&reasoning_effort_raw).map_err(ConfigError)?;
-    let thinking_budget = match non_empty(thinking_budget.or_else(|| env("IGNIS_THINKING_BUDGET"))) {
-        None => Some(DEFAULT_THINKING_BUDGET),
-        Some(raw) => thinking::parse_default_thinking_budget(&raw).map_err(ConfigError)?,
-    };
-
-    // The engine-shape values (GitHub #87): resolved and validated here,
-    // before `main` opens the artifact or touches the loader — an
-    // unaligned chunk width is a usage error, never a failure discovered
-    // after a ~19 GB weight upload.
-    let prefill_chunk = resolve_prefill_chunk(prefill_chunk, &env)?;
-    let decode_share_percent = resolve_decode_share(decode_share, &env)?;
-    let max_context = resolve_max_context(max_context, &env)?;
-    let default_max_tokens = resolve_default_max_tokens(default_max_tokens, &env)?;
-    let kv_format = resolve_kv_format(kv_format, &env)?;
-    let kv_pool = resolve_kv_pool(kv_pool_bytes, &env)?;
-    let vram = resolve_vram(
-        vram_headroom_bytes,
-        vram_budget_bytes,
-        allow_vram_oversubscription,
-        &env,
-    )?;
-    let allow_expert_cache_below_floor = allow_expert_cache_below_floor
-        || resolve_switch_env(&env, "IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR")?;
-    let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
-    let prompt_reuse = resolve_prompt_reuse(prompt_reuse, &env)?;
-    refuse_retained_pool_bytes(retained_pool_bytes, &env)?;
-    refuse_retained_slots(retained_slots, &env)?;
-    let retained_device_slots = resolve_retained_count(
-        retained_device,
-        &env,
-        ("--retained-device", "IGNIS_RETAINED_DEVICE"),
-        if prompt_reuse { DEFAULT_RETAINED_DEVICE_SLOTS } else { 0 },
-    )?;
-    let retained_host_named = non_empty(retained_host.clone().or_else(|| env("IGNIS_RETAINED_HOST"))).is_some();
-    let retained_host_slots = resolve_retained_count(
-        retained_host,
-        &env,
-        ("--retained-host", "IGNIS_RETAINED_HOST"),
-        if prompt_reuse { DEFAULT_RETAINED_HOST_SLOTS } else { 0 },
-    )?;
-    let retained_interactive_ttl_secs =
-        resolve_retained_interactive_ttl(retained_interactive_ttl, &env, prompt_reuse)?;
-    let instruction_policy = InstructionPolicy {
-        system: resolve_policy(
-            system_message_policy,
-            &env,
-            "--system-message-policy",
-            "IGNIS_SYSTEM_MESSAGE_POLICY",
-            SystemMessagePolicy::ALL.map(|p| (p.as_str(), p)),
-        )?,
-        developer: resolve_policy(
-            developer_message_policy,
-            &env,
-            "--developer-message-policy",
-            "IGNIS_DEVELOPER_MESSAGE_POLICY",
-            DeveloperMessagePolicy::ALL.map(|p| (p.as_str(), p)),
-        )?,
-    };
-    let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
-    let speculation_off = non_empty(spec.clone().or_else(|| env("IGNIS_SPEC"))).is_some_and(|s| s.trim() == "off");
-    let speculation = if speculation_off {
-        // `--spec off` has nothing to size or to score with: a window or a head
-        // named beside it was meant for a backend, so it is refused, not dropped.
-        for (flag, var, value) in
-            [("--draft-tokens", "IGNIS_DRAFT_TOKENS", &draft_tokens), ("--draft-head", "IGNIS_DRAFT_HEAD", &draft_head)]
-        {
-            if let Some(raw) = non_empty(value.clone().or_else(|| env(var))) {
-                return Err(ConfigError(format!("`{flag} {raw}` has nothing to configure under `--spec off`")));
-            }
+    /// This config with `patch`'s values over everything else — a live
+    /// `PATCH /v1/config`, or a switch target's own artifact and id — and
+    /// resolved again for the same family. Validates exactly as a start
+    /// would: the patch is refused whole if any of it is wrong.
+    pub fn with_patch(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
+        let mut sources = self.basis.sources().clone();
+        sources.patch.overlay(patch);
+        let config = Config::from_sources(sources)?;
+        match self.basis.family() {
+            Some(family) => config.for_family(family),
+            None => Ok(config),
         }
-        None
-    } else {
-        resolve_speculation(spec, draft_tokens, draft_head, &env)?
+    }
+}
+
+/// The id a load of `family` is served under, or why `config` cannot start
+/// on it ([`Config::for_family`]).
+pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, ConfigError> {
+    config.for_family(family).map(|fitted| fitted.model)
+}
+
+/// `config` fitted to an artifact of `family` for a **model switch** (spec
+/// model-switch/01), and the flags it dropped to get there.
+///
+/// One process serves the 27B and Flash-Next in turn on the options it was
+/// started with, and some of those name a capability only one of the two
+/// has: vision (the 27B's tower), a speculative backend (each model drafts
+/// with its own), the Flash-Next-only knobs. At start such a value on the
+/// wrong model is refused ([`Config::for_family`]) because the operator
+/// named it for that load; on a switch it was named for the *other* model,
+/// and refusing it would make the switch impossible on the options the owner
+/// starts with. So it is dropped for this load — and returned, so the switch
+/// says which. Which fields those are is each field's own
+/// [`field::Applicability`], not a list kept here. A value both models take
+/// but bound differently (`--model-max-context` past the 27B's attention
+/// envelope) is not dropped: it is refused, as at start.
+///
+/// The family's scoped values apply here as at start: a switch is how the
+/// 27B and Flash-Next each keep their own resource shape (spec
+/// config-v2/01).
+pub fn fit_to_family(config: &Config, family: ModelFamily) -> Result<(Config, Vec<String>), ConfigError> {
+    derive(config.basis.sources(), Some(family), Fit::Switch, true)
+}
+
+/// Resolve `sources` for `family` and combine the result into a [`Config`]:
+/// the cross-field rules first, then — `family_checks` — what the artifact's
+/// family decides (the served id, the drafter, the attention envelope).
+fn derive(
+    sources: &Sources,
+    family: Option<ModelFamily>,
+    fit: Fit,
+    family_checks: bool,
+) -> Result<(Config, Vec<String>), ConfigError> {
+    let resolution = source::resolve_settings(sources, family, fit)?;
+    let mut dropped = resolution.dropped.clone();
+    let s = &resolution.settings;
+    // The spelling a field's value came under, for an error that names it;
+    // its flag when it is at its default.
+    let spelled = |group: &str, name: &str| {
+        resolution
+            .origin(group, name)
+            .map(|origin| origin.spelling.clone())
+            .unwrap_or_else(|| schema::field(group, name).expect("a declared field").flag())
     };
-    let draft_rows = non_empty(draft_rows.or_else(|| env("IGNIS_DRAFT_ROWS")))
-        .map(|raw| {
-            raw.trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|&rows| rows <= FLASH_NEXT_VERIFY_ROWS && rows != 1)
-                .ok_or_else(|| {
-                    ConfigError(format!("`--draft-rows` must be 0 or in 2..{FLASH_NEXT_VERIFY_ROWS}, got `{raw}`"))
-                })
-        })
-        .transpose()?;
-    let decode_lanes = non_empty(decode_lanes.or_else(|| env("IGNIS_DECODE_LANES")))
-        .map(|raw| {
-            raw.trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|&lanes| (1..=ignis_core::N_DECODE_LANES as u32).contains(&lanes))
-                .ok_or_else(|| {
-                    ConfigError(format!(
-                        "`--decode-lanes` must be in 1..={}, got `{raw}`",
-                        ignis_core::N_DECODE_LANES
-                    ))
-                })
-        })
-        .transpose()?;
-    let vision = resolve_vision(vision, vision_max_tokens, vision_embedding_pool_mib, &env)?;
-    let rope_scaling = resolve_rope_scaling(rope_scaling, &env)?;
-    // GitHub #195 lifted #178's refusal of the two together: the drafter
-    // follows a multimodal prompt now (its context append takes the span's KV
-    // positions, and the verify round rotates at `position + rope_delta`), so
-    // they are two independent load options again.
-    let media = resolve_media(vision.is_some(), media_allow_private_network, media_cache_mib, &env)?;
-    // `--metrics` (GitHub #89, ADR 0017) opens its own listener; naming its
-    // address without turning metrics on is refused rather than ignored, and
-    // it can never share the API's.
-    let metrics = match (metrics_on, metrics_bind) {
-        (false, None) => None,
-        (false, Some(_)) => {
-            return Err(ConfigError(
-                "`--metrics-bind` requires `--metrics` (metrics are off without it)".to_owned(),
-            ));
-        }
-        (true, metrics_bind) => Some(metrics_bind.unwrap_or_else(|| DEFAULT_METRICS_BIND.to_owned())),
-    };
-    if metrics.as_deref() == Some(bind.as_str()) {
+    let explicit = |group: &str, name: &str| resolution.explicit(group, name);
+
+    let vram = derive_vram(&resolution, &spelled)?;
+
+    let prompt_reuse = s.reuse.prompt;
+    if explicit("reuse", "retained_interactive_ttl") && !prompt_reuse {
         return Err(ConfigError(format!(
-            "`--metrics-bind {bind}` is the API's `--bind`: metrics need their own listener"
+            "`{} {}` requires `--reuse-prompt on` (nothing is retained without it)",
+            spelled("reuse", "retained_interactive_ttl"),
+            s.reuse.retained_interactive_ttl
         )));
     }
-    let api_key = non_empty(api_key.or_else(|| env("IGNIS_API_KEY"))).map(|key| match key.as_str() {
-        "auto" => ApiKeySetting::Generate,
-        _ => ApiKeySetting::Fixed(ApiKey(key)),
-    });
-    let expose = non_empty(expose.or_else(|| env("IGNIS_EXPOSE")))
-        .map(|raw| Expose::parse(&raw).map_err(|e| ConfigError(format!("`--expose`: {e}"))))
-        .transpose()?;
+
+    let (speculation, speculation_off) = derive_speculation(&resolution, &spelled)?;
+    let vision = derive_vision(&resolution, &spelled)?;
+    let media = derive_media(&resolution, vision.is_some(), &spelled)?;
+
+    // `--server-metrics` (GitHub #89, ADR 0017) opens its own listener;
+    // naming its address without turning metrics on is refused rather than
+    // ignored, and it can never share the API's.
+    if explicit("server", "metrics_bind") && !s.server.metrics {
+        return Err(ConfigError(format!(
+            "`{}` requires `--server-metrics` (metrics are off without it)",
+            spelled("server", "metrics_bind")
+        )));
+    }
+    let metrics = s.server.metrics.then(|| s.server.metrics_bind.clone());
+    if metrics.as_deref() == Some(s.server.bind.as_str()) {
+        return Err(ConfigError(format!(
+            "`{} {}` is the API's `--server-bind`: metrics need their own listener",
+            spelled("server", "metrics_bind"),
+            s.server.bind
+        )));
+    }
     // An exposed API is never open: the operator's key if they named one,
-    // otherwise the same generated key `--api-key auto` gives.
-    let api_key = match (&expose, api_key) {
+    // otherwise the same generated key `--server-api-key auto` gives.
+    let api_key = match (&s.server.expose, &s.server.api_key) {
         (Some(_), None) => Some(ApiKeySetting::Generate),
-        (_, api_key) => api_key,
+        (_, api_key) => api_key.clone(),
     };
 
-    let ngram_cache = resolve_ngram_cache(persist_ngram_cache, persist_ngram_cache_path, &env)?;
-    let ngram_hot_bytes = resolve_ngram_hot_bytes(ngram_hot_bytes, &env)?;
-    let kv_disk_bytes = resolve_kv_disk_bytes(kv_disk_bytes, &env)?;
-    let kv_disk_location = resolve_kv_disk_path(kv_disk_path, &env)?;
-    Ok(ConfigOutcome::Config(Config {
+    let mut model = s.model.id.clone().unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+    let mut speculation = speculation;
+    if let (true, Some(family)) = (family_checks, family) {
+        let fitted = FamilyFit { model: &mut model, speculation: &mut speculation, dropped: &mut dropped };
+        fit_family(fitted, &resolution, family, fit, &spelled)?;
+    }
+
+    let config = Config {
         model,
-        model_named,
-        bind,
-        artifact,
-        ngram_cache,
-        ngram_hot_bytes,
-        kv_disk_bytes,
-        kv_disk_location,
-        model_download: resolve_model_download(model_download, &env)?,
-        model_download_path: non_empty(
-            model_download_path.or_else(|| env("IGNIS_MODEL_DOWNLOAD_PATH")),
-        )
-        .map_or_else(
-            || PathBuf::from(DEFAULT_MODEL_DOWNLOAD_PATH),
-            PathBuf::from,
-        ),
-        enable_thinking,
-        reasoning_effort,
-        thinking_budget,
-        prefill_chunk,
-        decode_share_percent,
-        max_context,
-        default_max_tokens,
-        kv_format,
-        kv_pool,
+        model_named: s.model.id.is_some(),
+        bind: s.server.bind.clone(),
+        artifact: s.model.artifact.clone(),
+        model_download: s.download.enabled,
+        model_download_path: s.download.path.clone(),
+        ngram_cache: ignis_core::ngram_cache::PersistenceOptions {
+            enabled: s.ngram.persist,
+            location: s.ngram.persist_path.clone(),
+        },
+        ngram_hot_bytes: s.ngram.hot_bytes,
+        kv_disk_bytes: s.kv_disk.bytes,
+        kv_disk_location: s.kv_disk.path.clone(),
+        enable_thinking: s.model.enable_thinking,
+        reasoning_effort: s.model.reasoning_effort,
+        thinking_budget: s.model.thinking_budget,
+        prefill_chunk: s.model.prefill_chunk,
+        decode_share_percent: s.model.decode_share,
+        max_context: s.model.max_context,
+        default_max_tokens: s.model.default_max_tokens,
+        kv_format: s.model.kv_format,
+        kv_pool: s.vram.kv_pool_bytes,
         vram,
-        allow_expert_cache_below_floor,
-        host_pool_bytes,
+        allow_expert_cache_below_floor: s.vram.allow_expert_cache_below_floor,
+        host_pool_bytes: s.reuse.kv_host_pool_bytes,
         prompt_reuse,
-        retained_device_slots,
-        retained_host_slots,
-        retained_host_named,
-        retained_interactive_ttl_secs,
-        instruction_policy,
+        retained_device_slots: s
+            .reuse
+            .retained_device
+            .unwrap_or(if prompt_reuse { DEFAULT_RETAINED_DEVICE_SLOTS } else { 0 }),
+        retained_host_slots: s
+            .reuse
+            .retained_host
+            .unwrap_or(if prompt_reuse { DEFAULT_RETAINED_HOST_SLOTS } else { 0 }),
+        retained_host_named: s.reuse.retained_host.is_some(),
+        retained_interactive_ttl_secs: s.reuse.retained_interactive_ttl,
+        instruction_policy: InstructionPolicy {
+            system: s.server.system_message_policy,
+            developer: s.server.developer_message_policy,
+        },
         speculation,
         speculation_off,
-        draft_rows,
-        decode_lanes,
+        draft_rows: s.spec.draft_rows,
+        decode_lanes: s.spec.decode_lanes,
         vision,
-        rope_scaling,
+        rope_scaling: s.model.rope_scaling,
         media,
-        request_timeout_secs,
-        ui: resolve_ui(ui, &env)?,
+        request_timeout_secs: s.server.request_timeout,
+        switch_drain_timeout_secs: s.switch.drain_timeout,
+        allow_model_switch: s.switch.allow_implicit,
+        known_models: s.switch.known_models.clone(),
+        ui: s.server.ui,
         metrics,
         api_key,
-        expose,
+        expose: s.server.expose,
+        basis: Basis(Arc::new(BasisInner { sources: sources.clone(), resolution: resolution.clone(), family })),
+    };
+    Ok((config, dropped))
+}
+
+/// The values [`fit_family`] may change: the served id, the speculation a
+/// switch drops, and the list of what it dropped.
+struct FamilyFit<'a> {
+    model: &'a mut String,
+    speculation: &'a mut Option<Speculation>,
+    dropped: &'a mut Vec<String>,
+}
+
+/// The VRAM budget's mode (GitHub #210, ADR 0030): `--vram-headroom-bytes`
+/// derives it, `--vram-budget-bytes` names it, `--vram-allow-oversubscription`
+/// accepts a named one above free memory.
+///
+/// A headroom and a budget are two answers to one question, so both named
+/// by the operator — from any mix of flags, env and file — is refused rather
+/// than one silently winning. A profile's value is a default: an operator's
+/// headroom wins over a profile's budget, and an operator's budget over a
+/// profile's headroom. Oversubscription without a budget is refused too: a
+/// derived budget is below free memory by construction.
+fn derive_vram(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> String) -> Result<VramMode, ConfigError> {
+    let s = &resolution.settings.vram;
+    let headroom_named = resolution.explicit("vram", "headroom_bytes");
+    let budget_named = resolution.explicit("vram", "budget_bytes");
+    if headroom_named && budget_named {
+        return Err(ConfigError(format!(
+            "`{}` and `{}` are mutually exclusive: a headroom derives the VRAM budget, a budget names it",
+            spelled("vram", "headroom_bytes"),
+            spelled("vram", "budget_bytes")
+        )));
+    }
+    let budget = s.budget_bytes.filter(|_| !headroom_named);
+    match budget {
+        None => {
+            if s.allow_oversubscription {
+                return Err(ConfigError(format!(
+                    "`{}` requires `--vram-budget-bytes` (a budget derived from free memory never exceeds it)",
+                    spelled("vram", "allow_oversubscription")
+                )));
+            }
+            Ok(VramMode::Derived { headroom_bytes: s.headroom_bytes })
+        }
+        Some(budget_bytes) => Ok(VramMode::Explicit { budget_bytes, allow_oversubscription: s.allow_oversubscription }),
+    }
+}
+
+/// `--spec-backend`, `--spec-draft-tokens` and `--spec-draft-head` (P5-02,
+/// GitHub #150, #307). No backend means off, and then a draft window or a
+/// head has nothing to configure, so naming one is refused rather than
+/// ignored; `off` refuses them too. `dflash2` requires its window — there is
+/// no default to guess — while `mtp` has a measured one. The MTP head
+/// proposes from its own logits: there is no second head to choose.
+fn derive_speculation(
+    resolution: &Resolution,
+    spelled: &impl Fn(&str, &str) -> String,
+) -> Result<(Option<Speculation>, bool), ConfigError> {
+    let s = &resolution.settings.spec;
+    let named = |name: &str| resolution.explicit("spec", name);
+    let shown = |name: &str, value: String| format!("`{} {value}`", spelled("spec", name));
+    let draft_tokens = s.draft_tokens.filter(|_| named("draft_tokens"));
+    let draft_head = s.draft_head.filter(|_| named("draft_head"));
+    let backend = match s.backend {
+        Some(SpecChoice::Off) => {
+            for (name, value) in [("draft_tokens", draft_tokens.map(|n| n.to_string())), ("draft_head", draft_head.map(|h| h.as_str().to_owned()))] {
+                if let Some(value) = value {
+                    return Err(ConfigError(format!(
+                        "{} has nothing to configure under `--spec-backend off`",
+                        shown(name, value)
+                    )));
+                }
+            }
+            return Ok((None, true));
+        }
+        None => {
+            for (name, value) in [("draft_head", draft_head.map(|h| h.as_str().to_owned())), ("draft_tokens", draft_tokens.map(|n| n.to_string()))] {
+                if let Some(value) = value {
+                    return Err(ConfigError(format!(
+                        "{} requires `--spec-backend` (speculation is off without it)",
+                        shown(name, value)
+                    )));
+                }
+            }
+            return Ok((None, false));
+        }
+        Some(SpecChoice::Backend(backend)) => backend,
+    };
+    let head = s.draft_head.unwrap_or_default();
+    if backend == SpeculativeBackend::Mtp && head != ProposalHead::Full {
+        return Err(ConfigError(format!(
+            "`{}`: `--spec-backend mtp` has no proposal head to choose",
+            spelled("spec", "draft_head")
+        )));
+    }
+    let tokens = match s.draft_tokens {
+        Some(tokens) => tokens,
+        // GitHub #307: Flash-Next's head has a measured default window.
+        None if backend == SpeculativeBackend::Mtp => FLASH_NEXT_DEFAULT_DRAFT_TOKENS,
+        None => {
+            return Err(ConfigError(format!(
+                "`{} {}` requires `--spec-draft-tokens N` (N in 1..={MAX_DRAFT_TOKENS})",
+                spelled("spec", "backend"),
+                backend.as_str()
+            )));
+        }
+    };
+    let speculation = Speculation::new(backend, tokens)
+        .map_err(|_| ConfigError(format!("`{}` must be in 1..={MAX_DRAFT_TOKENS}, got {tokens}", spelled("spec", "draft_tokens"))))?;
+    Ok((Some(speculation.with_proposal_head(head)), false))
+}
+
+/// `--vision-enabled`, `--vision-max-tokens` and
+/// `--vision-embedding-pool-mib` (GitHub #177, #243). Vision is off unless
+/// asked for; neither of the other two has anything to size with it off, so
+/// naming one is refused rather than ignored. With vision on, the envelope
+/// defaults to [`DEFAULT_VISION_MAX_TOKENS`] and the pool to one
+/// envelope-wide embedding — exactly what GitHub #177 always reserved, so a
+/// load that says nothing does not move the VRAM plan. The pool's floor is
+/// the leaf's: a pool below one envelope-wide embedding is raised there
+/// rather than refused here.
+fn derive_vision(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> String) -> Result<Option<Vision>, ConfigError> {
+    let s = &resolution.settings.vision;
+    if !s.enabled {
+        for (name, value) in [
+            ("max_tokens", resolution.explicit("vision", "max_tokens").then(|| s.max_tokens.to_string())),
+            ("embedding_pool_mib", s.embedding_pool_mib.filter(|_| resolution.explicit("vision", "embedding_pool_mib")).map(|n| n.to_string())),
+        ] {
+            if let Some(value) = value {
+                return Err(ConfigError(format!(
+                    "`{} {value}` requires `--vision-enabled` (vision is off without it)",
+                    spelled("vision", name)
+                )));
+            }
+        }
+        return Ok(None);
+    }
+    let vision = Vision::new(s.max_tokens).map_err(|_| {
+        ConfigError(format!(
+            "`{}` must be in 1..={VISION_MAX_TOKENS_LIMIT}, got {}",
+            spelled("vision", "max_tokens"),
+            s.max_tokens
+        ))
+    })?;
+    Ok(Some(match s.embedding_pool_mib {
+        Some(mib) => vision.with_pool_bytes(mib * 1024 * 1024),
+        None => vision,
     }))
 }
 
-/// `--ui` / `--no-ui` / `IGNIS_UI` (GitHub #163, ADR 0026). On by default:
-/// the Playground is what the server is for on a desktop, and a binary built
-/// without `web/dist` serves the page that says how to build it rather than
-/// failing. The flags win over the environment, as everywhere else here.
-fn resolve_ui(
-    flag: Option<bool>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<bool, ConfigError> {
-    if let Some(on) = flag {
-        return Ok(on);
-    }
-    let Some(raw) = non_empty(env("IGNIS_UI")) else {
-        return Ok(DEFAULT_UI);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" => Ok(true),
-        "0" | "false" | "off" => Ok(false),
-        _ => Err(ConfigError(format!(
-            "`IGNIS_UI` must be true or false, got `{raw}`"
-        ))),
-    }
-}
-
-/// `--persist-ngram-cache` / `IGNIS_PERSIST_NGRAM_CACHE` (`true` or
-/// `false`, default `true`) and `--persist-ngram-cache-path` /
-/// `IGNIS_PERSIST_NGRAM_CACHE_PATH`: `model` (the default) puts the cache
-/// beside the artifact, `auto` in the OS per-user cache directory, anything
-/// else is that directory.
-fn resolve_ngram_cache(
-    flag: Option<String>,
-    path_flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<ignis_core::ngram_cache::PersistenceOptions, ConfigError> {
-    use ignis_core::ngram_cache::{CacheLocation, PersistenceOptions};
-    let raw = flag.or_else(|| env("IGNIS_PERSIST_NGRAM_CACHE")).unwrap_or_else(|| "true".into());
-    let enabled = match raw.trim() {
-        "true" => true,
-        "false" => false,
-        _ => return Err(ConfigError(format!("`--persist-ngram-cache` must be true or false, got `{raw}`"))),
-    };
-    let location = match path_flag.or_else(|| env("IGNIS_PERSIST_NGRAM_CACHE_PATH")).as_deref() {
-        None | Some("model") => CacheLocation::Model,
-        Some("auto") => CacheLocation::Auto,
-        Some("") => return Err(ConfigError("`--persist-ngram-cache-path` cannot be empty".into())),
-        Some(dir) => CacheLocation::Directory(PathBuf::from(dir)),
-    };
-    Ok(PersistenceOptions { enabled, location })
-}
-
-/// `--kv-disk-bytes` / `IGNIS_KV_DISK_BYTES` (spec vram-budget/03): a byte
-/// count (`parse_bytes`'s suffixes), `0` for no tier. Unnamed is `None`, the
-/// model family's.
-fn resolve_kv_disk_bytes(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<u64>, ConfigError> {
-    non_empty(flag.or_else(|| env("IGNIS_KV_DISK_BYTES")))
-        .map(|raw| parse_bytes("--kv-disk-bytes", &raw))
-        .transpose()
-}
-
-/// `--kv-disk-path` / `IGNIS_KV_DISK_PATH` (spec vram-budget/03): the
-/// n-gram cache's rule -- `model` (the default), `auto`, or a directory.
-fn resolve_kv_disk_path(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<ignis_core::ngram_cache::CacheLocation, ConfigError> {
-    use ignis_core::ngram_cache::CacheLocation;
-    Ok(match flag.or_else(|| env("IGNIS_KV_DISK_PATH")).as_deref() {
-        None | Some("model") => CacheLocation::Model,
-        Some("auto") => CacheLocation::Auto,
-        Some("") => return Err(ConfigError("`--kv-disk-path` cannot be empty".into())),
-        Some(dir) => CacheLocation::Directory(PathBuf::from(dir)),
-    })
-}
-
-/// `--ngram-hot-bytes` / `IGNIS_NGRAM_HOT_BYTES` (GitHub #306): a byte count
-/// (`parse_bytes`'s suffixes; `0` holds no hot row) or `auto`. Unnamed is
-/// `None`, the 1 GiB default.
-fn resolve_ngram_hot_bytes(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<ignis_core::ngram_table::HotBudget>, ConfigError> {
-    use ignis_core::ngram_table::HotBudget;
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_NGRAM_HOT_BYTES"))) else {
-        return Ok(None);
-    };
-    if raw.trim() == "auto" {
-        return Ok(Some(HotBudget::Auto));
-    }
-    parse_bytes("--ngram-hot-bytes", &raw)
-        .map(|bytes| Some(HotBudget::Bytes(bytes)))
-        .map_err(|_| ConfigError(format!("`--ngram-hot-bytes` expects a byte count or auto, got `{raw}`")))
-}
-
-/// `--model-download` / `--no-model-download` / `IGNIS_MODEL_DOWNLOAD`
-/// (GitHub #234). On by default: a server whose model is not on disk can
-/// fetch it, and the machine that must not spend 19 GB of bandwidth says so
-/// once. The flags win over the environment, as everywhere else here.
-fn resolve_model_download(
-    flag: Option<bool>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<bool, ConfigError> {
-    if let Some(on) = flag {
-        return Ok(on);
-    }
-    let Some(raw) = non_empty(env("IGNIS_MODEL_DOWNLOAD")) else {
-        return Ok(DEFAULT_MODEL_DOWNLOAD);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" => Ok(true),
-        "0" | "false" | "off" => Ok(false),
-        _ => Err(ConfigError(format!(
-            "`IGNIS_MODEL_DOWNLOAD` must be true or false, got `{raw}`"
-        ))),
-    }
-}
-
-/// `--rope-scaling` / `IGNIS_ROPE_SCALING` (GitHub #227), in the
-/// reference's own grammar: `none` (the default -- the linear table, the
-/// engine unchanged) or `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]`.
-///
-/// Off by default on purpose: YaRN buys positions past the checkpoint's
-/// trained 262,144 at some cost to everything inside it, so the operator
-/// who needs the long context names it, and nobody else pays for it.
-fn resolve_rope_scaling(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<RopeScaling, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_ROPE_SCALING"))) else {
-        return Ok(RopeScaling::NONE);
-    };
-    RopeScaling::parse(&raw).map_err(|e| ConfigError(format!("`--rope-scaling`: {e}")))
-}
-
-/// `--vision` / `IGNIS_VISION`, `--vision-max-tokens` /
-/// `IGNIS_VISION_MAX_TOKENS` (GitHub #177) and `--vision-embedding-pool-mib`
-/// / `IGNIS_VISION_EMBEDDING_POOL_MIB` (GitHub #243). Vision is off unless
-/// asked for; neither of the other two has anything to size with vision off,
-/// so naming one alone is refused rather than ignored. With vision on, the
-/// envelope defaults to [`DEFAULT_VISION_MAX_TOKENS`] and the pool to one
-/// envelope-wide embedding — which is exactly what GitHub #177 always
-/// reserved, so a load that says nothing does not move the VRAM plan.
-fn resolve_vision(
-    flag: bool,
-    max_tokens: Option<String>,
-    pool_mib: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<Vision>, ConfigError> {
-    let on = if flag {
-        true
-    } else {
-        match non_empty(env("IGNIS_VISION")) {
-            None => false,
-            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" => true,
-                "0" | "false" | "off" => false,
-                _ => {
-                    return Err(ConfigError(format!(
-                        "`IGNIS_VISION` must be true or false, got `{raw}`"
-                    )));
-                }
-            },
-        }
-    };
-    let max_tokens = max_tokens.or_else(|| non_empty(env("IGNIS_VISION_MAX_TOKENS")));
-    let pool_mib = pool_mib.or_else(|| non_empty(env("IGNIS_VISION_EMBEDDING_POOL_MIB")));
-    if !on {
-        if let Some(raw) = max_tokens {
-            return Err(ConfigError(format!(
-                "`--vision-max-tokens {raw}` requires `--vision` (vision is off without it)"
-            )));
-        }
-        if let Some(raw) = pool_mib {
-            return Err(ConfigError(format!(
-                "`--vision-embedding-pool-mib {raw}` requires `--vision` (vision is off without it)"
-            )));
-        }
-        return Ok(None);
-    }
-    let vision = match max_tokens {
-        None => Vision::default(),
-        Some(raw) => {
-            let out_of_range = || {
-                ConfigError(format!(
-                    "`--vision-max-tokens` must be in 1..={VISION_MAX_TOKENS_LIMIT}, got `{raw}`"
-                ))
-            };
-            let n = raw.trim().parse::<u32>().map_err(|_| out_of_range())?;
-            Vision::new(n).map_err(|_| out_of_range())?
-        }
-    };
-    let Some(raw) = pool_mib else {
-        return Ok(Some(vision));
-    };
-    // The floor is the leaf's, not this parser's: a pool below one
-    // envelope-wide embedding is raised there rather than refused here, so
-    // an operator who lowers it does not have to recompute the envelope's
-    // bytes to keep the load working. 0 is still a typo, not a request.
-    let mib = raw
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|&n| n > 0 && n <= MAX_VISION_EMBEDDING_POOL_MIB)
-        .ok_or_else(|| {
-            ConfigError(format!(
-                "`--vision-embedding-pool-mib` must be in 1..={MAX_VISION_EMBEDDING_POOL_MIB}, got `{raw}`"
-            ))
-        })?;
-    Ok(Some(vision.with_pool_bytes(mib * 1024 * 1024)))
-}
-
-/// `--media-allow-private-network` / `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` and
-/// `--media-cache-mib` / `IGNIS_MEDIA_CACHE_MIB` (GitHub #179). Without
-/// vision there is no media to acquire, so naming either is refused rather
-/// than ignored, as `--vision-max-tokens` is.
-fn resolve_media(
+/// `--media-allow-private-network` and `--media-cache-mib` (GitHub #179).
+/// Without vision there is no media to acquire, so turning the private
+/// network on or sizing the cache is refused rather than ignored, as the
+/// vision envelope is.
+fn derive_media(
+    resolution: &Resolution,
     vision: bool,
-    allow_private_network_flag: bool,
-    cache_mib: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
+    spelled: &impl Fn(&str, &str) -> String,
 ) -> Result<MediaOptions, ConfigError> {
-    let allow_private_network = if allow_private_network_flag {
-        Some(true)
-    } else {
-        match non_empty(env("IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK")) {
-            None => None,
-            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" => Some(true),
-                "0" | "false" | "off" => Some(false),
-                _ => {
-                    return Err(ConfigError(format!(
-                        "`IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` must be true or false, got `{raw}`"
-                    )));
-                }
-            },
-        }
-    };
-    let cache_mib = cache_mib.or_else(|| non_empty(env("IGNIS_MEDIA_CACHE_MIB")));
+    let s = &resolution.settings.media;
     if !vision {
-        if allow_private_network == Some(true) {
-            return Err(ConfigError(
-                "`--media-allow-private-network` requires `--vision` (vision is off without it)".to_owned(),
-            ));
-        }
-        if let Some(raw) = cache_mib {
+        if s.allow_private_network && resolution.explicit("media", "allow_private_network") {
             return Err(ConfigError(format!(
-                "`--media-cache-mib {raw}` requires `--vision` (vision is off without it)"
+                "`{}` requires `--vision-enabled` (vision is off without it)",
+                spelled("media", "allow_private_network")
+            )));
+        }
+        if resolution.explicit("media", "cache_mib") {
+            return Err(ConfigError(format!(
+                "`{} {}` requires `--vision-enabled` (vision is off without it)",
+                spelled("media", "cache_mib"),
+                s.cache_mib
             )));
         }
         return Ok(MediaOptions::default());
     }
-    let cache_mib = match cache_mib {
-        None => DEFAULT_MEDIA_CACHE_MIB,
-        Some(raw) => raw
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|&mib| mib <= MEDIA_CACHE_MIB_LIMIT)
-            .ok_or_else(|| {
-                ConfigError(format!(
-                    "`--media-cache-mib` must be in 0..={MEDIA_CACHE_MIB_LIMIT}, got `{raw}`"
-                ))
-            })?,
-    };
-    Ok(MediaOptions {
-        allow_private_network: allow_private_network.unwrap_or(false),
-        cache_bytes: (cache_mib as u64) << 20,
-    })
+    Ok(MediaOptions { allow_private_network: s.allow_private_network, cache_bytes: s.cache_mib << 20 })
 }
 
-/// `--spec` / `IGNIS_SPEC` and `--draft-tokens` / `IGNIS_DRAFT_TOKENS`
-/// (P5-02, GitHub #150). Absent `--spec` means off, and then a draft window
-/// has nothing to size, so naming one alone is refused rather than ignored.
-/// With `--spec`, the window is required — there is no default window to
-/// guess — and anything outside `1..MAX_DRAFT_TOKENS` is refused naming the
-/// range. `--draft-head` / `IGNIS_DRAFT_HEAD` picks the drafter's proposal
-/// head (`full` by default); like the window, it has nothing to choose
-/// without `--spec`.
-fn resolve_speculation(
-    spec: Option<String>,
-    draft_tokens: Option<String>,
-    draft_head: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<Speculation>, ConfigError> {
-    let spec = non_empty(spec.or_else(|| env("IGNIS_SPEC")));
-    let draft_tokens = non_empty(draft_tokens.or_else(|| env("IGNIS_DRAFT_TOKENS")));
-    let draft_head = non_empty(draft_head.or_else(|| env("IGNIS_DRAFT_HEAD")));
-    let Some(spec) = spec else {
-        if let Some(raw) = draft_head {
+/// What an artifact's family decides about a config (spec flash-next/04),
+/// once the per-field applicability has been applied by the resolver: the
+/// id the load is served under, whether the named backend is this family's
+/// drafter, and — Flash-Next attends with its own QSA, not the GQA op — the
+/// 27B's attention envelope (GitHub #228).
+fn fit_family(
+    fitted: FamilyFit<'_>,
+    resolution: &Resolution,
+    family: ModelFamily,
+    fit: Fit,
+    spelled: &impl Fn(&str, &str) -> String,
+) -> Result<(), ConfigError> {
+    let s = &resolution.settings;
+    match &s.model.id {
+        Some(id) if ModelFamily::of_model_id(id).is_some_and(|named| named != family) => {
             return Err(ConfigError(format!(
-                "`--draft-head {raw}` requires `--spec` (speculation is off without it)"
+                "`{} {id}` names another model than the artifact's, which is {}",
+                spelled("model", "id"),
+                family.name()
             )));
         }
-        return match draft_tokens {
-            Some(raw) => Err(ConfigError(format!(
-                "`--draft-tokens {raw}` requires `--spec` (speculation is off without it)"
-            ))),
-            None => Ok(None),
-        };
-    };
-    let backend =
-        SpeculativeBackend::parse(&spec).map_err(|e| ConfigError(format!("`--spec`: {e}")))?;
-    let proposal_head = draft_head
-        .map(|raw| ProposalHead::parse(&raw).map_err(|e| ConfigError(format!("`--draft-head`: {e}"))))
-        .transpose()?
-        .unwrap_or_default();
-    // The MTP head proposes from its own logits: there is no second head to
-    // choose, so naming the shortlist would be silently ignored.
-    if backend == SpeculativeBackend::Mtp && proposal_head != ProposalHead::Full {
-        return Err(ConfigError("`--draft-head`: `--spec mtp` has no proposal head to choose".to_owned()));
+        Some(_) => {}
+        None => *fitted.model = family.model_id().to_owned(),
     }
-    let Some(raw) = draft_tokens else {
-        // GitHub #307: Flash-Next's head has a measured default window.
-        if backend == SpeculativeBackend::Mtp {
-            return Ok(Some(Speculation::new(backend, FLASH_NEXT_DEFAULT_DRAFT_TOKENS).expect("in range")));
-        }
-        return Err(ConfigError(format!(
-            "`--spec {}` requires `--draft-tokens N` (N in 1..{MAX_DRAFT_TOKENS})",
-            backend.as_str()
-        )));
-    };
-    let out_of_range =
-        || ConfigError(format!("`--draft-tokens` must be in 1..{MAX_DRAFT_TOKENS}, got `{raw}`"));
-    let n = raw.trim().parse::<u32>().map_err(|_| out_of_range())?;
-    Speculation::new(backend, n)
-        .map(|s| Some(s.with_proposal_head(proposal_head)))
-        .map_err(|_| out_of_range())
-}
-
-/// The one place the loaded model's family meets the start options (spec
-/// flash-next/04): the family is the artifact's, so a start option chosen
-/// for the other model is refused by name rather than served around.
-///
-/// Returns the id the load is served under: the operator's, or with none
-/// named, the model's own ([`ModelFamily::model_id`], which the 27B's
-/// default already is). Refused: a named id that is the other model's, and
-/// on a model without them, speculation and vision.
-pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, ConfigError> {
-    if config.model_named
-        && ModelFamily::of_model_id(&config.model).is_some_and(|named| named != family)
-    {
-        return Err(ConfigError(format!(
-            "`--model {}` names another model than the artifact's, which is {}",
-            config.model,
-            family.name()
-        )));
-    }
-    if let Some(speculation) = config.speculation.filter(|s| s.backend() != family.drafter()) {
-        return Err(ConfigError(format!(
-            "`--spec {}`: {} drafts with {}",
-            speculation.backend().as_str(),
-            family.name(),
-            family.drafter().as_str()
-        )));
-    }
-    if let Some(rows) = config.draft_rows.filter(|_| family != ModelFamily::FlashNext) {
-        return Err(ConfigError(format!("`--draft-rows {rows}`: {} has no draft row budget", family.name())));
-    }
-    if let Some(lanes) = config.decode_lanes.filter(|_| family != ModelFamily::FlashNext) {
-        return Err(ConfigError(format!(
-            "`--decode-lanes {lanes}`: {} serves a fixed {} lanes",
-            family.name(),
-            ignis_core::N_DECODE_LANES
-        )));
-    }
-    if config.allow_expert_cache_below_floor && family != ModelFamily::FlashNext {
-        return Err(ConfigError(format!(
-            "`--allow-expert-cache-below-floor`: {} has no expert cache",
-            family.name()
-        )));
-    }
-    if let Some(budget) = config.ngram_hot_bytes.filter(|_| family != ModelFamily::FlashNext) {
-        return Err(ConfigError(format!("`--ngram-hot-bytes {budget}`: {} has no n-gram table", family.name())));
-    }
-    // Flash-Next attends with its own QSA, not the GQA op, so only the 27B
-    // is bound by the GQA envelope (GitHub #228).
-    if family == ModelFamily::Qwen38_27b && config.max_context > config.kv_format.gqa_max_context() {
-        return Err(ConfigError(format!(
-            "`--max-context {}`: the 27B's attention serves at most {} keys on `{}`",
-            config.max_context,
-            config.kv_format.gqa_max_context(),
-            config.kv_format.as_str()
-        )));
-    }
-    if config.vision.is_some() && !family.takes_images() {
-        return Err(ConfigError(format!("`--vision`: {} takes no images", family.name())));
-    }
-    Ok(if config.model_named { config.model.clone() } else { family.model_id().to_owned() })
-}
-
-/// Parse a `u32` count for `flag`, naming the flag, `unit`, and the
-/// offending text on failure.
-fn parse_count(flag: &str, unit: &str, raw: &str) -> Result<u32, ConfigError> {
-    raw.trim()
-        .parse::<u32>()
-        .map_err(|_| ConfigError(format!("`{flag}` expects a {unit}, got `{raw}`")))
-}
-
-/// A token-count value (`--prefill-chunk`, `--max-context`).
-fn parse_tokens(flag: &str, raw: &str) -> Result<u32, ConfigError> {
-    parse_count(flag, "token count", raw)
-}
-
-/// `--prefill-chunk` / `IGNIS_PREFILL_CHUNK` / [`DEFAULT_PREFILL_CHUNK`].
-fn resolve_prefill_chunk(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_PREFILL_CHUNK"))) else {
-        return Ok(DEFAULT_PREFILL_CHUNK);
-    };
-    let chunk = parse_tokens("--prefill-chunk", &raw)?;
-    if chunk == 0 || chunk % PREFILL_CHUNK_ALIGNMENT != 0 {
-        return Err(ConfigError(format!(
-            "`--prefill-chunk` must be a nonzero multiple of {PREFILL_CHUNK_ALIGNMENT} tokens, got {chunk}"
-        )));
-    }
-    Ok(chunk)
-}
-
-/// `--decode-share` / `IGNIS_DECODE_SHARE` (GitHub #306): a percent below
-/// 100, or `None` for the model family's own.
-fn resolve_decode_share(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<u32>, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_DECODE_SHARE"))) else {
-        return Ok(None);
-    };
-    match parse_count("--decode-share", "percent", &raw)? {
-        percent @ 0..=99 => Ok(Some(percent)),
-        percent => Err(ConfigError(format!(
-            "`--decode-share` is a percent below 100, got {percent}"
-        ))),
-    }
-}
-
-/// `--max-context` / `IGNIS_MAX_CONTEXT` / [`DEFAULT_MAX_CONTEXT`].
-fn resolve_max_context(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_MAX_CONTEXT"))) else {
-        return Ok(DEFAULT_MAX_CONTEXT);
-    };
-    let context = parse_tokens("--max-context", &raw)?;
-    if context == 0 {
-        return Err(ConfigError(
-            "`--max-context` must be a nonzero token count".to_owned(),
-        ));
-    }
-    Ok(context)
-}
-
-/// `--default-max-tokens` / `IGNIS_DEFAULT_MAX_TOKENS` / [`DEFAULT_MAX_TOKENS`]
-/// (ADR 0045). `0` is a legal, explicit choice -- no default cap -- and a
-/// value past `--max-context` is accepted: the scheduler clamps it to what
-/// each prompt leaves, so it acts as the context.
-fn resolve_default_max_tokens(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_DEFAULT_MAX_TOKENS"))) else {
-        return Ok(DEFAULT_MAX_TOKENS);
-    };
-    parse_count("--default-max-tokens", "token count (0 = no default)", &raw)
-}
-
-/// `--kv-format` / `IGNIS_KV_FORMAT` / [`KvFormat::default`]
-/// (`hq-e8-2b`, the serving default since GitHub #123; `bf16` is the
-/// retained oracle format an operator asks for by name).
-fn resolve_kv_format(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<KvFormat, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_KV_FORMAT"))) else {
-        return Ok(KvFormat::default());
-    };
-    KvFormat::parse(&raw).map_err(|e| ConfigError(format!("`--kv-format`: {e}")))
-}
-
-/// A byte-count value (`--kv-pool-bytes`), with the size suffixes an
-/// operator actually types: a bare count, or one followed by `K`/`M`/`G`
-/// (case-insensitive, binary — `4G` is 4 GiB), optionally spelled `KiB`,
-/// `MiB`, `GiB` or `KB`/`MB`/`GB`. A pool budget is naturally a number of
-/// gibibytes, and making the operator write 4294967296 invites the typo
-/// that silently starts a server with a tenth of the pool it meant.
-fn parse_bytes(flag: &str, raw: &str) -> Result<u64, ConfigError> {
-    let text = raw.trim();
-    let bad = || ConfigError(format!("`{flag}` expects a byte count, got `{raw}`"));
-    let digits_end = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (digits, suffix) = text.split_at(digits_end);
-    if digits.is_empty() {
-        return Err(bad());
-    }
-    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "k" | "kb" | "kib" => 1024,
-        "m" | "mb" | "mib" => 1024 * 1024,
-        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
-        _ => return Err(bad()),
-    };
-    digits
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(multiplier))
-        .ok_or_else(bad)
-}
-
-/// `--kv-pool-bytes` / `IGNIS_KV_POOL_BYTES`, or `None`: the KV pool
-/// policy's size (ADR 0045). A byte count as [`parse_bytes`] reads one, or a
-/// token count: `<n>tok`, `<n>Ktok`, `<n>Mtok`, the multipliers binary
-/// (`512Ktok` is 524,288 tokens).
-///
-/// Only parsed. What a byte count is worth in tokens depends on the model,
-/// which is not known yet, so the load's plan -- not this config -- refuses
-/// a pool smaller than one full context and a page per retained slot. It
-/// never raises one: silently overriding an explicit number would make the
-/// flag a suggestion.
-fn resolve_kv_pool(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<KvPoolSize>, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_KV_POOL_BYTES"))) else {
-        return Ok(None);
-    };
-    let text = raw.trim();
-    let lower = text.to_ascii_lowercase();
-    let Some(count) = lower.strip_suffix("tok") else {
-        return parse_bytes("--kv-pool-bytes", &raw).map(|bytes| Some(KvPoolSize::Bytes(bytes)));
-    };
-    let bad = || ConfigError(format!("`--kv-pool-bytes` expects a byte count or <n>[K|M]tok, got `{raw}`"));
-    let (digits, multiplier) = match count.as_bytes().last() {
-        Some(b'k') => (&count[..count.len() - 1], 1024),
-        Some(b'm') => (&count[..count.len() - 1], 1024 * 1024),
-        _ => (count, 1),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad());
-    }
-    digits
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(multiplier))
-        .map(|tokens| Some(KvPoolSize::Tokens(tokens)))
-        .ok_or_else(bad)
-}
-
-/// A switch's environment variable (`true`/`false`, `on`/`off`, `1`/`0`),
-/// off when unset: the flag that sets it is a bare `--name`.
-fn resolve_switch_env(env: &impl Fn(&str) -> Option<String>, var: &str) -> Result<bool, ConfigError> {
-    match non_empty(env(var)) {
-        None => Ok(false),
-        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" => Ok(true),
-            "0" | "false" | "off" => Ok(false),
-            _ => Err(ConfigError(format!("`{var}` must be true or false, got `{raw}`"))),
-        },
-    }
-}
-
-/// The VRAM budget's mode (GitHub #210, ADR 0030): `--vram-headroom-bytes` /
-/// `IGNIS_VRAM_HEADROOM_BYTES` derives it, `--vram-budget-bytes` /
-/// `IGNIS_VRAM_BUDGET_BYTES` names it, and `--allow-vram-oversubscription` /
-/// `IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` accepts a named one above free memory.
-///
-/// A headroom and a budget are two answers to one question, so naming both
-/// — whichever came from a flag and whichever from the environment — is
-/// refused rather than one silently winning. Oversubscription alone is
-/// refused too: a derived budget is below free memory by construction.
-fn resolve_vram(
-    headroom_flag: Option<String>,
-    budget_flag: Option<String>,
-    allow_oversubscription_flag: bool,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<VramMode, ConfigError> {
-    let headroom = non_empty(headroom_flag.or_else(|| env("IGNIS_VRAM_HEADROOM_BYTES")));
-    let budget = non_empty(budget_flag.or_else(|| env("IGNIS_VRAM_BUDGET_BYTES")));
-    let allow_oversubscription = allow_oversubscription_flag
-        || match non_empty(env("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION")) {
-            None => false,
-            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" => true,
-                "0" | "false" | "off" => false,
-                _ => {
-                    return Err(ConfigError(format!(
-                        "`IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` must be true or false, got `{raw}`"
-                    )));
+    if let Some(speculation) = fitted.speculation.filter(|s| s.backend() != family.drafter()) {
+        match fit {
+            Fit::Start => {
+                return Err(ConfigError(format!(
+                    "`{} {}`: {} drafts with {}",
+                    spelled("spec", "backend"),
+                    speculation.backend().as_str(),
+                    family.name(),
+                    family.drafter().as_str()
+                )));
+            }
+            Fit::Switch => {
+                *fitted.speculation = None;
+                fitted.dropped.push(schema::field("spec", "backend").expect("declared").flag());
+                for name in ["draft_tokens", "draft_head"] {
+                    if resolution.explicit("spec", name) {
+                        fitted.dropped.push(schema::field("spec", name).expect("declared").flag());
+                    }
                 }
-            },
-        };
-    match (headroom, budget) {
-        (Some(headroom), Some(budget)) => Err(ConfigError(format!(
-            "`--vram-headroom-bytes {headroom}` and `--vram-budget-bytes {budget}` (as flags or as \
-             IGNIS_VRAM_HEADROOM_BYTES / IGNIS_VRAM_BUDGET_BYTES) are mutually exclusive: a \
-             headroom derives the VRAM budget, a budget names it"
-        ))),
-        (headroom, None) => {
-            if allow_oversubscription {
-                return Err(ConfigError(
-                    "`--allow-vram-oversubscription` requires `--vram-budget-bytes` (a budget \
-                     derived from free memory never exceeds it)"
-                        .to_owned(),
-                ));
             }
-            let headroom_bytes = match headroom {
-                Some(raw) => parse_bytes("--vram-headroom-bytes", &raw)?,
-                None => DEFAULT_VRAM_HEADROOM_BYTES,
-            };
-            Ok(VramMode::Derived { headroom_bytes })
-        }
-        (None, Some(raw)) => {
-            let budget_bytes = parse_bytes("--vram-budget-bytes", &raw)?;
-            if budget_bytes == 0 {
-                return Err(ConfigError(
-                    "`--vram-budget-bytes` must be positive, got `0`".to_owned(),
-                ));
-            }
-            Ok(VramMode::Explicit {
-                budget_bytes,
-                allow_oversubscription,
-            })
         }
     }
-}
-
-/// `--prompt-reuse on|off` / `IGNIS_PROMPT_REUSE` / [`DEFAULT_PROMPT_REUSE`]
-/// (GitHub #186, ADR 0029). A value, not a bare switch, because the useful
-/// direction is *off* — a cold bench or a correctness oracle turning
-/// something on-by-default back off — and a bare `--prompt-reuse` could only
-/// ever ask for the default.
-fn resolve_prompt_reuse(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<bool, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_PROMPT_REUSE"))) else {
-        return Ok(DEFAULT_PROMPT_REUSE);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" => Ok(true),
-        "0" | "false" | "off" => Ok(false),
-        _ => Err(ConfigError(format!(
-            "`--prompt-reuse` must be on or off, got `{raw}`"
-        ))),
-    }
-}
-
-/// An instruction-message policy (GitHub #209): the flag, else the env var,
-/// else the first of `values` (the default), matched case-insensitively. An
-/// unknown value is a usage error naming every allowed one.
-fn resolve_policy<P: Copy, const N: usize>(
-    flag_value: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-    flag: &str,
-    var: &str,
-    values: [(&'static str, P); N],
-) -> Result<P, ConfigError> {
-    let Some(raw) = non_empty(flag_value.or_else(|| env(var))) else {
-        return Ok(values[0].1);
-    };
-    let wanted = raw.trim().to_ascii_lowercase();
-    match values.iter().find(|(name, _)| *name == wanted) {
-        Some((_, policy)) => Ok(*policy),
-        None => {
-            let allowed: Vec<&str> = values.iter().map(|(name, _)| *name).collect();
-            Err(ConfigError(format!(
-                "`{flag}` / {var} must be one of {}, got `{raw}`",
-                allowed.join(", ")
-            )))
-        }
-    }
-}
-
-/// `--retained-pool-bytes` / `IGNIS_RETAINED_POOL_BYTES` is gone (GitHub
-/// #215): retained state lives in retained slots, and the byte ledger this
-/// sized went with it. Named anyway, it is a configuration error pointing at
-/// what replaced it, rather than a budget silently ignored.
-fn refuse_retained_pool_bytes(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<(), ConfigError> {
-    match non_empty(flag.or_else(|| env("IGNIS_RETAINED_POOL_BYTES"))) {
-        None => Ok(()),
-        Some(raw) => Err(ConfigError(format!(
-            "`--retained-pool-bytes {raw}` (IGNIS_RETAINED_POOL_BYTES) was removed: retained state \
-             lives in retained slots now; size them with `--retained-device <n>` \
-             (IGNIS_RETAINED_DEVICE, default {DEFAULT_RETAINED_DEVICE_SLOTS}) and \
-             `--retained-host <n>` (IGNIS_RETAINED_HOST, default {DEFAULT_RETAINED_HOST_SLOTS})"
-        ))),
-    }
-}
-
-/// `--retained-slots` / `IGNIS_RETAINED_SLOTS` is gone (GitHub #281): the one
-/// count became a device count and a host count. Named anyway, it refuses the
-/// start naming both, rather than leaving the operator on defaults they did
-/// not choose.
-fn refuse_retained_slots(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<(), ConfigError> {
-    match non_empty(flag.or_else(|| env("IGNIS_RETAINED_SLOTS"))) {
-        None => Ok(()),
-        Some(raw) => Err(ConfigError(format!(
-            "`--retained-slots {raw}` (IGNIS_RETAINED_SLOTS) was removed: retained slots come in \
-             two kinds now -- `--retained-device <n>` (IGNIS_RETAINED_DEVICE, default \
-             {DEFAULT_RETAINED_DEVICE_SLOTS}) in VRAM, and `--retained-host <n>` \
-             (IGNIS_RETAINED_HOST, default {DEFAULT_RETAINED_HOST_SLOTS}) in pinned host memory"
-        ))),
-    }
-}
-
-/// `--retained-device` / `IGNIS_RETAINED_DEVICE` and `--retained-host` /
-/// `IGNIS_RETAINED_HOST` (GitHub #281, ADR 0030): `default` unless named --
-/// the kind's own default with prompt reuse on, 0 with it off. `0` is a legal
-/// choice for either.
-///
-/// A count named with `--prompt-reuse off` is honoured: nothing is retained
-/// then, but live siblings share a published head, as before #186.
-fn resolve_retained_count(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-    (name, var): (&str, &str),
-    default: u32,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env(var))) else {
-        return Ok(default);
-    };
-    parse_count(name, "slot count", &raw)
-}
-
-/// `--kv-host-pool-bytes` / `IGNIS_KV_HOST_POOL_BYTES` / [`DEFAULT_HOST_POOL_BYTES`]
-/// (P4-07, GitHub #125). `0` is a legal, explicit choice — it disables the
-/// host tier (admission refuses instead of evicting) — so it is accepted
-/// rather than treated as "unset" the way an empty string is.
-fn resolve_host_pool_bytes(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<u64, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_KV_HOST_POOL_BYTES"))) else {
-        return Ok(DEFAULT_HOST_POOL_BYTES);
-    };
-    parse_bytes("--kv-host-pool-bytes", &raw)
-}
-
-/// `--retained-interactive-ttl` / `IGNIS_RETAINED_INTERACTIVE_TTL` /
-/// [`DEFAULT_RETAINED_INTERACTIVE_TTL_SECS`] (GitHub #190). `0` is legal: an
-/// Interactive entry then never outranks an Agent's in KV-RAM. Refused with
-/// `--prompt-reuse off`, like every other sub-flag of a feature that is off.
-fn resolve_retained_interactive_ttl(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-    prompt_reuse: bool,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_RETAINED_INTERACTIVE_TTL"))) else {
-        return Ok(DEFAULT_RETAINED_INTERACTIVE_TTL_SECS);
-    };
-    if !prompt_reuse {
+    let (max_context, kv_format) = (s.model.max_context, s.model.kv_format);
+    if family == ModelFamily::Qwen38_27b && max_context > kv_format.gqa_max_context() {
         return Err(ConfigError(format!(
-            "`--retained-interactive-ttl {raw}` requires `--prompt-reuse on` (nothing is retained without it)"
+            "`{} {max_context}`: the 27B's attention serves at most {} keys on `{}`",
+            spelled("model", "max_context"),
+            kv_format.gqa_max_context(),
+            kv_format.as_str()
         )));
     }
-    parse_count("--retained-interactive-ttl", "second count", &raw)
-}
-
-/// `--request-timeout` / `IGNIS_REQUEST_TIMEOUT` / [`DEFAULT_REQUEST_TIMEOUT_SECS`].
-fn resolve_request_timeout_secs(
-    flag: Option<String>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_REQUEST_TIMEOUT"))) else {
-        return Ok(DEFAULT_REQUEST_TIMEOUT_SECS);
-    };
-    let secs = parse_count("--request-timeout", "second count", &raw)?;
-    if secs == 0 {
-        return Err(ConfigError(
-            "`--request-timeout` must be a nonzero second count".to_owned(),
-        ));
-    }
-    if secs > MAX_REQUEST_TIMEOUT_SECS {
-        return Err(ConfigError(format!(
-            "`--request-timeout` must be at most {MAX_REQUEST_TIMEOUT_SECS} seconds, got {secs}"
-        )));
-    }
-    Ok(secs)
-}
-
-fn non_empty(value: Option<String>) -> Option<String> {
-    value.filter(|v| !v.is_empty())
-}
-
-fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, ConfigError> {
-    *i += 1;
-    args.get(*i)
-        .cloned()
-        .ok_or_else(|| ConfigError(format!("`{flag}` requires a value")))
+    Ok(())
 }
 
 fn version_text() -> String {
     format!("ignis-server {}", env!("CARGO_PKG_VERSION"))
 }
 
-fn help_text() -> String {
-    let default_kv_format = KvFormat::default().as_str();
-    let n_decode_lanes = ignis_core::N_DECODE_LANES;
-    let default_vram_headroom_mib = DEFAULT_VRAM_HEADROOM_BYTES / (1024 * 1024);
-    let default_host_pool_gib = DEFAULT_HOST_POOL_BYTES / (1024 * 1024 * 1024);
-    let default_ngram_hot_gib = ignis_core::ngram_table::DEFAULT_HOT_BYTES / (1024 * 1024 * 1024);
-    format!(
+/// `--help`: how to run the server, and every field's flag, env var and
+/// default, one line each, from the field table itself.
+pub fn help_text() -> String {
+    let mut text = String::from(
         "ignis-server: the OpenAI-compatible HTTP entrypoint\n\
          \n\
-         USAGE:\n    ignis-server [OPTIONS]\n\
+         USAGE:\n    ignis-server [--config <path>] [--profile <name>] [FIELD FLAGS]\n\
          \n\
-         OPTIONS:\n\
-         \x20   -m, --model <id>              env: IGNIS_MODEL         (default: {DEFAULT_MODEL})\n\
-         \x20   -b, --bind <addr>             env: IGNIS_BIND          (default: {DEFAULT_BIND})\n\
-         \x20   -a, --artifact <path>         env: IGNIS_ARTIFACT      (default: unset — the model is looked for under --model-download-path, and fetched when it is not there)\n\
-         \x20       --model-download / --no-model-download env: IGNIS_MODEL_DOWNLOAD (default: on; fetch a missing model — asked first when stdin is a terminal, downloaded straight away when it is not; off keeps the placeholder template)\n\
-         \x20       --model-download-path <dir> env: IGNIS_MODEL_DOWNLOAD_PATH (default: {DEFAULT_MODEL_DOWNLOAD_PATH}; where a fetched model lands, and where one fetched earlier is found)\n\
-         \x20       --persist-ngram-cache <true|false> env: IGNIS_PERSIST_NGRAM_CACHE (default: true; persist Flash-Next hot rows)\n\
-         \x20       --persist-ngram-cache-path <model|auto|dir> env: IGNIS_PERSIST_NGRAM_CACHE_PATH (default: model, beside the artifact; auto: Windows LOCALAPPDATA/ignis/cache/ngram, Linux XDG_CACHE_HOME/ignis/ngram or HOME/.cache/ignis/ngram)\n\
-         \x20       --ngram-hot-bytes <b|auto> env: IGNIS_NGRAM_HOT_BYTES (default: {default_ngram_hot_gib} GiB; Flash-Next only: the n-gram rows held in RAM, every other row read from NVMe when a step needs it; accepts a K/M/G suffix; auto = what the host plan leaves after its other lines and the 6 GiB margin, less 256 MiB for the load, the whole ~29 GB table when that fits, never below the default; a budget that holds the whole table reads no row from NVMe and writes no cache file)\n\
-         \x20       --kv-disk-bytes <bytes>   env: IGNIS_KV_DISK_BYTES  (default: 4G on Flash-Next, 0 = off on the 27B; KV-disk, the tier below KV-RAM: evicted sequences and retained prompt checkpoints kept as files and read back instead of prefilled again; a ceiling, cut at start to the volume's free space less 10 GiB; accepts a K/M/G suffix)\n\
-         \x20       --kv-disk-path <model|auto|dir> env: IGNIS_KV_DISK_PATH (default: model, beside the artifact; auto: Windows LOCALAPPDATA/ignis/cache/kv-disk, Linux XDG_CACHE_HOME/ignis/kv-disk or HOME/.cache/ignis/kv-disk; the files go in an ignis-kv-disk/<pid>-<nonce> directory there, removed at shutdown, a dead process's removed at the next start)\n\
-         \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
-         \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
-         \x20       --thinking-budget <n|off> env: IGNIS_THINKING_BUDGET  (default: {DEFAULT_THINKING_BUDGET}; reasoning tokens before the model's close is forced, off = no budget; a request's thinking_budget overrides it, 0 = none)\n\
-         \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
-         \x20       --decode-share <percent>  env: IGNIS_DECODE_SHARE   (default: the model's, 25 on both models; 0 is one round per chunk, 50 splits time evenly; the percent of the time decoding lanes keep while a prompt prefills, 0-99)\n\
-         \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
-         \x20       --default-max-tokens <n|0> env: IGNIS_DEFAULT_MAX_TOKENS (default: {DEFAULT_MAX_TOKENS}; the max_tokens of a request that sends none, its reasoning included, never past what its prompt leaves of --max-context; an explicit cap always wins; 0 = none, up to the context)\n\
-         \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
-         \x20       --kv-pool-bytes <bytes|tokens> env: IGNIS_KV_POOL_BYTES (default: the KV pool policy's -- the rest of the VRAM budget when every weight is on the device, as on the 27B; 524,288 tokens shared by the lanes when Flash-Next's experts stream, the rest to the expert cache; a byte count with an optional K/M/G suffix, or tokens as <n>tok, <n>Ktok or <n>Mtok; refused below one --max-context sequence and a page per retained slot)\n\
-         \x20       --vram-headroom-bytes <b> env: IGNIS_VRAM_HEADROOM_BYTES (default: {default_vram_headroom_mib} MiB; the VRAM budget is the memory free at start minus this; not with --vram-budget-bytes)\n\
-         \x20       --vram-budget-bytes <b>   env: IGNIS_VRAM_BUDGET_BYTES (default: unset — derived; the device memory the whole process may hold, weights included; refused above free memory)\n\
-         \x20       --allow-vram-oversubscription env: IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION (default: off; needs --vram-budget-bytes; start above free memory with a warning)\n\
-         \x20       --allow-expert-cache-below-floor env: IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR (default: off; Flash-Next only: start with an expert cache below its 12 GiB floor, with a warning -- decode slows sharply below it; the 27B refuses it)\n\
-         \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle and the figure Windows reports as its shared GPU memory; 0 disables the host KV-RAM tier)\n\
-         \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused, and no prefix is shared unless --retained-device or --retained-host gives slots for it)\n\
-         \x20       --retained-device <n>     env: IGNIS_RETAINED_DEVICE (default: {DEFAULT_RETAINED_DEVICE_SLOTS}; retained slots in VRAM, reserved in the VRAM plan and handed out first; 0 with --prompt-reuse off, where a count shares heads between live siblings only)\n\
-         \x20       --retained-host <n>       env: IGNIS_RETAINED_HOST  (default: {DEFAULT_RETAINED_HOST_SLOTS}, two per decode lane; retained slots in one pinned host block reserved at start, ~222 MiB each, a PCIe copy per capture and per claim; 0 with --prompt-reuse off)\n\
-         \x20       --retained-interactive-ttl <secs> env: IGNIS_RETAINED_INTERACTIVE_TTL (default: {DEFAULT_RETAINED_INTERACTIVE_TTL_SECS}; idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's; needs --prompt-reuse on)\n\
-         \x20       --system-message-policy <p> env: IGNIS_SYSTEM_MESSAGE_POLICY (default: merge; merge = a leading run of system messages joins the system prompt, a later one is its own block in place; strict = 400 for a system message that is not first)\n\
-         \x20       --developer-message-policy <p> env: IGNIS_DEVELOPER_MESSAGE_POLICY (default: inplace; inplace, into-system, after-system, one-after-system or reject; a leading developer message is the system prompt except under reject)\n\
-         \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
-         \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2 on the 27B, mtp on Flash-Next with its companion container beside the artifact, off)\n\
-         \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (1..{MAX_DRAFT_TOKENS}; required with --spec dflash2; with --spec mtp the most drafts a lane verifies, default {FLASH_NEXT_DEFAULT_DRAFT_TOKENS})\n\
-         \x20       --draft-rows <n>          env: IGNIS_DRAFT_ROWS     (Flash-Next mtp only; default: 0 = {FLASH_NEXT_VERIFY_ROWS}; rows a verify round takes across lanes, 0 or 2..{FLASH_NEXT_VERIFY_ROWS}; 3 drafts at one lane only)\n\
-         \x20       --decode-lanes <n>        env: IGNIS_DECODE_LANES   (default: 3; Flash-Next only, 1..={n_decode_lanes}; the sequences it decodes at once, sharing the KV pool -- min(524,288 tokens, lanes x --max-context), never below one --max-context and a page per retained slot: at 262,144 tokens one lane's pool is one context and two lanes or more share 524,288, so one lane leaves the expert cache more VRAM; the 27B serves a fixed {n_decode_lanes} lanes and refuses it)\n\
-         \x20       --draft-head <head>       env: IGNIS_DRAFT_HEAD     (default: full; needs --spec; full = the drafter proposes with the target's output head, shortlist = with the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM)\n\
-         \x20       --rope-scaling <spec>     env: IGNIS_ROPE_SCALING   (default: none; `yarn:F[,t=..][,bf=..][,bs=..]` rescales the checkpoint's trained 262144-position envelope, F in (1, {MAX_YARN_FACTOR}])\n\
-         \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
-         \x20       --vision-max-tokens <n>   env: IGNIS_VISION_MAX_TOKENS (default: {DEFAULT_VISION_MAX_TOKENS} with --vision; merged vision tokens per request, 1..={VISION_MAX_TOKENS_LIMIT}; an image over it is shrunk to fit, aspect kept; refused only when its aspect ratio cannot fit, or when several images total over it)\n\
-         \x20       --vision-embedding-pool-mib <n>  env: IGNIS_VISION_EMBEDDING_POOL_MIB (default: one envelope-wide embedding; encoded images kept for reuse, 1..={MAX_VISION_EMBEDDING_POOL_MIB})\n\
-         \x20       --media-allow-private-network env: IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK (default: off; needs --vision; fetch image URLs on private, loopback and link-local addresses)\n\
-         \x20       --media-cache-mib <n>     env: IGNIS_MEDIA_CACHE_MIB (default: {DEFAULT_MEDIA_CACHE_MIB} with --vision; prepared images kept for reuse, 0 disables, max {MEDIA_CACHE_MIB_LIMIT})\n\
-         \x20       --ui / --no-ui            env: IGNIS_UI             (default: on; serve the Playground at /ui/)\n\
-         \x20       --metrics                 serve Prometheus metrics on their own listener, and at /ui/metrics unless --no-ui (default: off; flag only)\n\
-         \x20       --metrics-bind <addr>     the metrics listener (default: {DEFAULT_METRICS_BIND}; flag only; needs --metrics; no API key, never exposed)\n\
-         \x20       --api-key <key>           env: IGNIS_API_KEY        (default: unset — /v1 needs no key; set = Authorization: Bearer <key>; auto = generate one and print it)\n\
-         \x20       --expose <mode>           env: IGNIS_EXPOSE         (default: unset — reachable at --bind only; cloudflare-quick = public https://*.trycloudflare.com URL, printed at start; always requires an API key, auto when none is set)\n\
-         \x20   -h, --help                    print this help and exit\n\
-         \x20   -V, --version                 print the version and exit\n\
-         \n\
-         A flag overrides its env var, which overrides the built-in default."
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn no_env(_: &str) -> Option<String> {
-        None
-    }
-
-    fn env_map(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
-        move |key| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| v.to_string())
+         Every field has a flag (--<group>-<field>), an env var (IGNIS_<GROUP>_<FIELD>)\n\
+         and a config-file key (<group>.<field>). A flag overrides its env var, which\n\
+         overrides the built-in default.\n",
+    );
+    for (group, fields) in schema::GROUPS {
+        text.push_str(&format!("\n{}:\n", group.to_ascii_uppercase()));
+        for meta in *fields {
+            let default = match (meta.default)() {
+                serde_json::Value::Null => "unset".to_owned(),
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            text.push_str(&format!(
+                "    {} <{}>  env: {}  (default: {default}{})\n        {}\n",
+                meta.flag(),
+                meta.kind,
+                meta.env(),
+                match meta.validator.describe() {
+                    rule if rule.is_empty() => String::new(),
+                    rule => format!("; {rule}"),
+                },
+                meta.summary()
+            ));
         }
     }
-
-    fn args(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    fn expect_config(outcome: ConfigOutcome) -> Config {
-        match outcome {
-            ConfigOutcome::Config(c) => c,
-            other => panic!("expected Config, got {other:?}"),
-        }
-    }
-
-    /// The n-gram cache is on and beside the model by default; `model`
-    /// says so explicitly, `auto` is the OS cache directory, anything else a
-    /// directory; flags win over the environment; bad values are refused.
-    #[test]
-    fn ngram_cache_defaults_flags_env_and_invalid_values() {
-        use ignis_core::ngram_cache::CacheLocation;
-        let default = expect_config(resolve(&[], no_env).unwrap());
-        assert!(default.ngram_cache.enabled);
-        assert_eq!(default.ngram_cache.location, CacheLocation::Model);
-
-        let env = env_map(&[("IGNIS_PERSIST_NGRAM_CACHE", "false"), ("IGNIS_PERSIST_NGRAM_CACHE_PATH", "custom")]);
-        let config = expect_config(resolve(&[], &env).unwrap());
-        assert!(!config.ngram_cache.enabled);
-        assert_eq!(config.ngram_cache.location, CacheLocation::Directory(PathBuf::from("custom")));
-
-        let flags = args(&["--persist-ngram-cache", "true", "--persist-ngram-cache-path", "auto"]);
-        let config = expect_config(resolve(&flags, &env).unwrap());
-        assert!(config.ngram_cache.enabled);
-        assert_eq!(config.ngram_cache.location, CacheLocation::Auto);
-
-        let config = expect_config(resolve(&args(&["--persist-ngram-cache-path", "model"]), &env).unwrap());
-        assert_eq!(config.ngram_cache.location, CacheLocation::Model);
-
-        for flags in [
-            vec!["--persist-ngram-cache", "yes"],
-            vec!["--persist-ngram-cache"],
-            vec!["--persist-ngram-cache-path"],
-            vec!["--persist-ngram-cache-path", ""],
-        ] {
-            assert!(resolve(&args(&flags), no_env).is_err(), "{flags:?}");
-        }
-    }
-
-    /// KV-disk (spec vram-budget/03): unnamed is the family's budget and
-    /// beside the model; a size or `0`, `model`, `auto` or a directory by
-    /// flag or environment, the flag winning; a bad size or an empty path is
-    /// refused.
-    #[test]
-    fn kv_disk_defaults_flags_env_and_invalid_values() {
-        use ignis_core::ngram_cache::CacheLocation;
-        let default = expect_config(resolve(&[], no_env).unwrap());
-        assert_eq!(default.kv_disk_bytes, None, "the family's");
-        assert_eq!(default.kv_disk_location, CacheLocation::Model);
-
-        let env = env_map(&[("IGNIS_KV_DISK_BYTES", "8G"), ("IGNIS_KV_DISK_PATH", "auto")]);
-        let config = expect_config(resolve(&[], &env).unwrap());
-        assert_eq!(config.kv_disk_bytes, Some(8 << 30));
-        assert_eq!(config.kv_disk_location, CacheLocation::Auto);
-
-        let flags = args(&["--kv-disk-bytes", "0", "--kv-disk-path", "D:/kv"]);
-        let config = expect_config(resolve(&flags, &env).unwrap());
-        assert_eq!(config.kv_disk_bytes, Some(0), "0 is off, and the flag wins");
-        assert_eq!(config.kv_disk_location, CacheLocation::Directory(PathBuf::from("D:/kv")));
-
-        let config = expect_config(resolve(&args(&["--kv-disk-path", "model"]), &env).unwrap());
-        assert_eq!(config.kv_disk_location, CacheLocation::Model);
-
-        for flags in [
-            vec!["--kv-disk-bytes", "lots"],
-            vec!["--kv-disk-bytes"],
-            vec!["--kv-disk-path"],
-            vec!["--kv-disk-path", ""],
-        ] {
-            assert!(resolve(&args(&flags), no_env).is_err(), "{flags:?}");
-        }
-        assert!(resolve(&[], &env_map(&[("IGNIS_KV_DISK_BYTES", "-1")])).is_err());
-        assert!(help_text().contains("--kv-disk-bytes") && help_text().contains("--kv-disk-path"));
-    }
-    #[test]
-    fn no_args_no_env_falls_back_to_defaults() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.model, DEFAULT_MODEL);
-        assert_eq!(config.bind, DEFAULT_BIND);
-        assert_eq!(config.artifact, None);
-        assert!(config.enable_thinking);
-        assert_eq!(config.reasoning_effort, None);
-        assert_eq!(config.prefill_chunk, DEFAULT_PREFILL_CHUNK);
-        assert_eq!(config.max_context, DEFAULT_MAX_CONTEXT);
-        assert_eq!(config.kv_format, KvFormat::HqE8_2b);
-        assert_eq!(config.kv_pool, None, "the KV pool policy's size");
-        assert!(!config.allow_expert_cache_below_floor);
-        assert_eq!(
-            config.vram,
-            VramMode::Derived { headroom_bytes: DEFAULT_VRAM_HEADROOM_BYTES }
-        );
-        assert_eq!(config.host_pool_bytes, DEFAULT_HOST_POOL_BYTES);
-        assert_eq!(config.speculation, None);
-        assert_eq!(config.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
-    }
-
-    #[test]
-    fn env_only_wins_over_defaults() {
-        let env = env_map(&[
-            ("IGNIS_MODEL", "custom-model"),
-            ("IGNIS_BIND", "0.0.0.0:9000"),
-            ("IGNIS_ARTIFACT", "/path/to.ninfer"),
-            ("IGNIS_ENABLE_THINKING", "false"),
-            ("IGNIS_REASONING_EFFORT", "low"),
-        ]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.model, "custom-model");
-        assert_eq!(config.bind, "0.0.0.0:9000");
-        assert_eq!(config.artifact, Some(PathBuf::from("/path/to.ninfer")));
-        assert!(!config.enable_thinking);
-        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Low));
-    }
-
-    #[test]
-    fn flag_only_wins_over_defaults() {
-        let a = args(&[
-            "--model", "flag-model",
-            "--bind", "0.0.0.0:1234",
-            "--artifact", "/flag/artifact.ninfer",
-            "--enable-thinking", "false",
-            "--reasoning-effort", "high",
-        ]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(config.model, "flag-model");
-        assert_eq!(config.bind, "0.0.0.0:1234");
-        assert_eq!(config.artifact, Some(PathBuf::from("/flag/artifact.ninfer")));
-        assert!(!config.enable_thinking);
-        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
-    }
-
-    #[test]
-    fn short_aliases_behave_like_their_long_form() {
-        let a = args(&["-m", "m", "-b", "b", "-a", "a"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(config.model, "m");
-        assert_eq!(config.bind, "b");
-        assert_eq!(config.artifact, Some(PathBuf::from("a")));
-    }
-
-    #[test]
-    fn the_retired_telemetry_sink_flag_is_refused_and_its_env_var_ignored() {
-        // ADR 0025: the interval counters are a log event now, so there is
-        // no separate sink to point anywhere. A leftover `--telemetry` in a
-        // launch script must fail loudly rather than be silently dropped.
-        for flag in ["--telemetry", "-t"] {
-            let err = resolve(&args(&[flag, "/tmp/telemetry.jsonl"]), no_env)
-                .expect_err("a retired flag must be rejected");
-            assert!(err.0.contains(flag), "{err}");
-        }
-        let env = env_map(&[("IGNIS_TELEMETRY", "/tmp/telemetry.jsonl")]);
-        assert_eq!(
-            resolve(&[], env).expect("resolve"),
-            resolve(&[], no_env).expect("resolve"),
-            "IGNIS_TELEMETRY no longer changes the resolved config"
-        );
-
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(!text.contains("telemetry"), "help must not document it:\n{text}");
-    }
-
-    #[test]
-    fn a_flag_wins_over_a_matching_env_var_per_field_independently() {
-        let env = env_map(&[
-            ("IGNIS_BIND", "0.0.0.0:9000"),
-            ("IGNIS_ARTIFACT", "/env/artifact.ninfer"),
-        ]);
-        let a = args(&["--bind", "0.0.0.0:1234"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert_eq!(config.bind, "0.0.0.0:1234", "flag must win over env");
-        assert_eq!(
-            config.artifact,
-            Some(PathBuf::from("/env/artifact.ninfer")),
-            "env must still apply to a field the flag didn't touch"
-        );
-    }
-
-    #[test]
-    fn an_unrecognized_flag_is_a_config_error() {
-        let a = args(&["--nope"]);
-        let err = resolve(&a, no_env).expect_err("must reject");
-        assert!(err.0.contains("--nope"), "{err}");
-    }
-
-    #[test]
-    fn a_flag_missing_its_value_is_a_config_error() {
-        let a = args(&["--bind"]);
-        let err = resolve(&a, no_env).expect_err("must reject");
-        assert!(err.0.contains("--bind"), "{err}");
-    }
-
-    #[test]
-    fn an_invalid_enable_thinking_flag_matches_the_env_var_error_message() {
-        let flag_err = resolve(&args(&["--enable-thinking", "nope"]), no_env)
-            .expect_err("must reject");
-        let env_err = thinking::parse_default_enable_thinking("nope").unwrap_err();
-        assert_eq!(flag_err.0, env_err);
-    }
-
-    #[test]
-    fn the_thinking_budget_ships_on_and_off_turns_it_off() {
-        // Spec server/08: a measured default, so that a client that knows
-        // nothing of the extension still gets an answer at `xhigh`.
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.thinking_budget, Some(DEFAULT_THINKING_BUDGET));
-        assert_eq!(DEFAULT_THINKING_BUDGET, 32_768);
-        // An empty env var is an unset one, as for the other defaults.
-        let config = expect_config(resolve(&[], env_map(&[("IGNIS_THINKING_BUDGET", "")])).expect("resolve"));
-        assert_eq!(config.thinking_budget, Some(DEFAULT_THINKING_BUDGET));
-        // `off`, by flag or by env: no default budget at all.
-        let config = expect_config(resolve(&args(&["--thinking-budget", "off"]), no_env).expect("resolve"));
-        assert_eq!(config.thinking_budget, None);
-        let config = expect_config(resolve(&[], env_map(&[("IGNIS_THINKING_BUDGET", "off")])).expect("resolve"));
-        assert_eq!(config.thinking_budget, None);
-        // A number, and the flag over the env var.
-        let env = env_map(&[("IGNIS_THINKING_BUDGET", "off")]);
-        let config = expect_config(resolve(&args(&["--thinking-budget", "12288"]), env).expect("resolve"));
-        assert_eq!(config.thinking_budget, Some(12288));
-        let config = expect_config(resolve(&[], env_map(&[("IGNIS_THINKING_BUDGET", "6144")])).expect("resolve"));
-        assert_eq!(config.thinking_budget, Some(6144));
-    }
-
-    #[test]
-    fn a_thinking_budget_that_is_neither_a_count_nor_off_refuses_the_start() {
-        for bad in ["0", "-1", "lots", "8k", "OFF "] {
-            let err = resolve(&args(&["--thinking-budget", bad]), no_env).expect_err(bad);
-            assert!(err.0.contains("off"), "{bad}: the message names the way to say none: {}", err.0);
-            // The flag and the env var share one message.
-            assert_eq!(err.0, thinking::parse_default_thinking_budget(bad).unwrap_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn the_help_names_the_thinking_budget_default_and_off() {
-        let ConfigOutcome::Help(help) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
-            panic!("--help is help");
-        };
-        let line = help.lines().find(|l| l.contains("--thinking-budget")).expect("a help line");
-        assert!(line.contains("IGNIS_THINKING_BUDGET"), "{line}");
-        assert!(line.contains(&format!("default: {DEFAULT_THINKING_BUDGET}")), "{line}");
-        assert!(line.contains("off"), "{line}");
-    }
-
-    /// GitHub #307: the help names Flash-Next's MTP backend and its row
-    /// budget, so an operator finds them without the user docs.
-    #[test]
-    fn the_help_names_mtp_and_the_draft_row_budget() {
-        let ConfigOutcome::Help(help) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
-            panic!("--help is help");
-        };
-        let spec = help.lines().find(|l| l.contains("--spec <")).expect("a --spec line");
-        assert!(spec.contains("mtp") && spec.contains("off"), "{spec}");
-        let rows = help.lines().find(|l| l.contains("--draft-rows")).expect("a --draft-rows line");
-        assert!(rows.contains("IGNIS_DRAFT_ROWS"), "{rows}");
-        assert!(rows.contains(&format!("0 = {FLASH_NEXT_VERIFY_ROWS}")), "{rows}");
-    }
-
-    #[test]
-    fn an_invalid_reasoning_effort_flag_matches_the_env_var_error_message() {
-        let flag_err = resolve(&args(&["--reasoning-effort", "nonsense"]), no_env)
-            .expect_err("must reject");
-        let env_err = thinking::parse_default_reasoning_effort("nonsense").unwrap_err();
-        assert_eq!(flag_err.0, env_err);
-    }
-
-    #[test]
-    fn help_short_circuits_before_other_flags_are_validated() {
-        let outcome = resolve(&args(&["--help", "--nonsense"]), no_env).expect("resolve");
-        assert!(matches!(outcome, ConfigOutcome::Help(_)));
-    }
-
-    #[test]
-    fn help_short_circuits_even_where_it_would_otherwise_be_consumed_as_a_value() {
-        // `--bind` normally requires a following value; `--help` still wins
-        // rather than being swallowed as that value, matching "short-circuits
-        // before further parsing" for any position in argv.
-        let outcome = resolve(&args(&["--bind", "--help"]), no_env).expect("resolve");
-        assert!(matches!(outcome, ConfigOutcome::Help(_)));
-    }
-
-    #[test]
-    fn help_alias_short_circuits_too() {
-        let outcome = resolve(&args(&["-h"]), no_env).expect("resolve");
-        assert!(matches!(outcome, ConfigOutcome::Help(_)));
-    }
-
-    #[test]
-    fn version_short_circuits_before_other_flags_are_validated() {
-        let outcome = resolve(&args(&["--version", "--nonsense"]), no_env).expect("resolve");
-        assert!(matches!(outcome, ConfigOutcome::Version(_)));
-    }
-
-    #[test]
-    fn version_alias_short_circuits_too() {
-        let outcome = resolve(&args(&["-V"]), no_env).expect("resolve");
-        assert!(matches!(outcome, ConfigOutcome::Version(_)));
-    }
-
-    // ── the engine-shape flags (GitHub #87) ──────────────────────────────
-
-    #[test]
-    fn the_default_context_admits_a_32k_prompt_plus_a_generation_budget() {
-        // G2's largest cell is a 32,768-token prompt; the default cap must
-        // admit it *and* leave room to generate, without editing code.
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert!(
-            config.max_context > 32_768,
-            "the default per-sequence context ({}) must admit a 32K prompt plus a generation budget",
-            config.max_context
-        );
-        // The pool is the policy's, which the load's plan refuses when it
-        // cannot hold one such sequence (GitHub #210, ADR 0045).
-        assert_eq!(config.kv_pool, None);
-    }
-
-    #[test]
-    fn the_engine_shape_env_vars_win_over_the_defaults() {
-        let env = env_map(&[("IGNIS_PREFILL_CHUNK", "2048"), ("IGNIS_MAX_CONTEXT", "16384")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.prefill_chunk, 2048);
-        assert_eq!(config.max_context, 16_384);
-    }
-
-    #[test]
-    fn the_engine_shape_flags_win_over_their_env_vars() {
-        let env = env_map(&[("IGNIS_PREFILL_CHUNK", "2048"), ("IGNIS_MAX_CONTEXT", "16384")]);
-        let a = args(&["--prefill-chunk", "128", "--max-context", "8192"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert_eq!(config.prefill_chunk, 128, "flag must win over env");
-        assert_eq!(config.max_context, 8_192, "flag must win over env");
-    }
-
-    #[test]
-    fn the_decode_share_is_a_percent_below_100_and_unset_by_default() {
-        // GitHub #306: unset, the model family's own (`EngineShape::for_family`).
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.decode_share_percent, None);
-        let config = expect_config(resolve(&args(&["--decode-share", "50"]), no_env).expect("resolve"));
-        assert_eq!(config.decode_share_percent, Some(50));
-        let env = env_map(&[("IGNIS_DECODE_SHARE", "0")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.decode_share_percent, Some(0), "0 is ADR 0018's one round per chunk");
-        for bad in ["100", "150", "-1", "0.5", "half"] {
-            let err = resolve(&args(&["--decode-share", bad]), no_env).expect_err(bad);
-            assert!(err.0.contains("--decode-share"), "{bad}: {err}");
-        }
-    }
-
-    #[test]
-    fn an_unaligned_prefill_chunk_is_a_usage_error() {
-        // The alignment rule is the reference's own; an unaligned width is
-        // rejected before any loader work, not at the first long prompt.
-        let err = resolve(&args(&["--prefill-chunk", "1000"]), no_env).expect_err("must reject");
-        assert!(err.0.contains("128"), "the message must name the rule: {err}");
-        assert!(err.0.contains("1000"), "the message must name the value: {err}");
-    }
-
-    #[test]
-    fn a_zero_prefill_chunk_is_a_usage_error() {
-        let err = resolve(&args(&["--prefill-chunk", "0"]), no_env).expect_err("must reject");
-        assert!(err.0.contains("nonzero"), "{err}");
-    }
-
-    #[test]
-    fn a_non_numeric_prefill_chunk_is_a_usage_error() {
-        let err = resolve(&args(&["--prefill-chunk", "wide"]), no_env).expect_err("must reject");
-        assert!(err.0.contains("--prefill-chunk"), "{err}");
-    }
-
-    #[test]
-    fn an_invalid_prefill_chunk_env_var_is_a_usage_error_too() {
-        // Same rule whichever way the value arrived (the env var is not a
-        // back door around the validation).
-        let env = env_map(&[("IGNIS_PREFILL_CHUNK", "300")]);
-        let err = resolve(&[], env).expect_err("must reject");
-        assert!(err.0.contains("128"), "{err}");
-    }
-
-    #[test]
-    fn a_zero_max_context_is_a_usage_error() {
-        let err = resolve(&args(&["--max-context", "0"]), no_env).expect_err("must reject");
-        assert!(err.0.contains("--max-context"), "{err}");
-    }
-
-    // ── the default max_tokens (ADR 0045, GitHub #309) ───────────────────
-
-    #[test]
-    fn the_default_max_tokens_is_38912_and_takes_a_value_from_every_spelling() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.default_max_tokens, 38_912);
-        // AC 10: a non-default value, 8,192, from the flag and from the env
-        // var in turn (make's knob: `mk/flags-selftest.sh`).
-        let a = args(&["--default-max-tokens", "8192"]);
-        assert_eq!(expect_config(resolve(&a, no_env).expect("resolve")).default_max_tokens, 8_192);
-        let env = env_map(&[("IGNIS_DEFAULT_MAX_TOKENS", "8192")]);
-        assert_eq!(expect_config(resolve(&[], &env).expect("resolve")).default_max_tokens, 8_192);
-        let a = args(&["--default-max-tokens", "4096"]);
-        assert_eq!(
-            expect_config(resolve(&a, &env).expect("resolve")).default_max_tokens,
-            4_096,
-            "the flag wins over the env var"
-        );
-        let a = args(&["--default-max-tokens", "0"]);
-        assert_eq!(expect_config(resolve(&a, no_env).expect("resolve")).default_max_tokens, 0, "0 is none");
-        // Past the context it is accepted: the scheduler clamps it to what
-        // each prompt leaves, so it acts as the context.
-        let a = args(&["--max-context", "40960", "--default-max-tokens", "1000000"]);
-        assert_eq!(expect_config(resolve(&a, no_env).expect("resolve")).default_max_tokens, 1_000_000);
-    }
-
-    #[test]
-    fn a_malformed_default_max_tokens_is_refused_naming_the_flag() {
-        for bad in ["eight", "-1", "8k", "1.5"] {
-            let err = resolve(&args(&["--default-max-tokens", bad]), no_env).expect_err(bad);
-            assert!(err.0.contains("--default-max-tokens"), "{bad}: {err}");
-        }
-        let err = resolve(&[], env_map(&[("IGNIS_DEFAULT_MAX_TOKENS", "lots")])).expect_err("env");
-        assert!(err.0.contains("--default-max-tokens"), "{err}");
-    }
-
-    #[test]
-    fn the_help_names_the_default_max_tokens_and_none() {
-        let ConfigOutcome::Help(help) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
-            panic!("--help is help");
-        };
-        let line = help.lines().find(|l| l.contains("--default-max-tokens")).expect("a help line");
-        assert!(line.contains("IGNIS_DEFAULT_MAX_TOKENS"), "{line}");
-        assert!(line.contains("default: 38912"), "{line}");
-        assert!(line.contains("0 = none"), "{line}");
-    }
-
-    #[test]
-    fn an_unnamed_pool_is_left_to_the_vram_plan_at_any_context() {
-        // No auto budget to outgrow any more (GitHub #210): the pool is what
-        // the VRAM budget leaves, in either format and at any cap, and the
-        // plan — not this config — refuses a start where that is short.
-        for (format, context) in [("bf16", 200_000u32), ("hq-e8-2b", 600_000)] {
-            let a = args(&["--kv-format", format, "--max-context", &context.to_string()]);
-            let config = expect_config(resolve(&a, no_env).expect("resolve"));
-            assert_eq!(config.max_context, context);
-            assert_eq!(config.kv_pool, None, "{format} at {context}");
-        }
-    }
-
-    #[test]
-    fn help_lists_the_engine_shape_flags() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        for flag in [
-            "--prefill-chunk",
-            "--max-context",
-            "--kv-format",
-            "--kv-pool-bytes",
-        ] {
-            assert!(text.contains(flag), "help must document {flag}:\n{text}");
-        }
-        assert!(text.contains("hq-e8-2b"), "help must name both formats:\n{text}");
-    }
-
-    // ── the KV format and pool budget (GitHub #122) ──────────────────────
-
-    #[test]
-    fn the_kv_format_flag_wins_over_the_env_var_and_the_default() {
-        let env = env_map(&[("IGNIS_KV_FORMAT", "bf16")]);
-        let config = expect_config(resolve(&args(&["--kv-format", "hq-e8-2b"]), env).expect("resolve"));
-        assert_eq!(config.kv_format, KvFormat::HqE8_2b);
-
-        // Both halves name the format the default is *not*, so neither can
-        // pass by agreeing with it (GitHub #123 made the default hq-e8-2b).
-        let env = env_map(&[("IGNIS_KV_FORMAT", "bf16")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.kv_format, KvFormat::Bf16);
-    }
-
-    #[test]
-    fn an_unknown_kv_format_is_a_usage_error() {
-        let err = resolve(&args(&["--kv-format", "fp8"]), no_env).expect_err("unknown format");
-        assert!(err.0.contains("--kv-format") && err.0.contains("fp8"), "{}", err.0);
-    }
-
-    #[test]
-    fn the_same_named_budget_buys_more_tokens_under_hq() {
-        // The format is a real option: one budget, two capacities. This is
-        // the whole reason the pool is described in bytes.
-        let geometry = ignis_core::KvGeometry::qwen38_27b();
-        let named = |format| {
-            let a = args(&["--kv-format", format, "--kv-pool-bytes", "4G"]);
-            expect_config(resolve(&a, no_env).expect("resolve"))
-        };
-        let (bf16, hq) = (named("bf16"), named("hq-e8-2b"));
-        assert_eq!(bf16.kv_pool, hq.kv_pool);
-        let Some(KvPoolSize::Bytes(bytes)) = hq.kv_pool else {
-            panic!("named in bytes: {:?}", hq.kv_pool);
-        };
-        let bf16_capacity = ignis_core::plan_kv_pool(bf16.kv_format, geometry, bytes).token_capacity;
-        let hq_capacity = ignis_core::plan_kv_pool(hq.kv_format, geometry, bytes).token_capacity;
-        assert!(hq_capacity > bf16_capacity * 7, "{hq_capacity} vs {bf16_capacity}");
-        // And it clears the standard target profile: 8 lanes x 40,960.
-        assert!(hq_capacity >= 8 * 40_960);
-    }
-
-    #[test]
-    fn a_named_pool_budget_resolves_from_the_flag_and_the_env() {
-        let config =
-            expect_config(resolve(&args(&["--kv-pool-bytes", "8G"]), no_env).expect("resolve"));
-        assert_eq!(config.kv_pool, Some(KvPoolSize::Bytes(8 * 1024 * 1024 * 1024)));
-
-        let env = env_map(&[("IGNIS_KV_POOL_BYTES", "6144MiB")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.kv_pool, Some(KvPoolSize::Bytes(6144 * 1024 * 1024)));
-
-        // A bare count is still a byte count.
-        let config = expect_config(
-            resolve(&args(&["--kv-pool-bytes", "4294967296"]), no_env).expect("resolve"),
-        );
-        assert_eq!(config.kv_pool, Some(KvPoolSize::Bytes(4 * 1024 * 1024 * 1024)));
-    }
-
-    #[test]
-    fn a_named_pool_takes_a_token_count_with_binary_multipliers() {
-        // ADR 0045 (AC 5): the quantity the owner decides in, the same
-        // context on either model and either format.
-        for (raw, tokens) in [
-            ("512Ktok", 524_288),
-            ("2Mtok", 2 * 1024 * 1024),
-            ("1000tok", 1_000),
-            ("512ktok", 524_288),
-            (" 64Ktok ", 65_536),
-        ] {
-            let config = expect_config(resolve(&args(&["--kv-pool-bytes", raw]), no_env).expect(raw));
-            assert_eq!(config.kv_pool, Some(KvPoolSize::Tokens(tokens)), "{raw}");
-        }
-        // The env var takes the same spellings, and the flag wins over it.
-        let env = env_map(&[("IGNIS_KV_POOL_BYTES", "512Ktok")]);
-        assert_eq!(expect_config(resolve(&[], &env).expect("env")).kv_pool, Some(KvPoolSize::Tokens(524_288)));
-        let flag = expect_config(resolve(&args(&["--kv-pool-bytes", "4G"]), &env).expect("flag"));
-        assert_eq!(flag.kv_pool, Some(KvPoolSize::Bytes(4 << 30)));
-    }
-
-    #[test]
-    fn the_config_only_parses_a_pool_and_the_plan_judges_it() {
-        // ADR 0045: the 27B-geometry check that refused a pool too small for
-        // the context here is gone -- a byte count is a different context on
-        // each model, and only the load knows which. Now pinned: the config
-        // accepts it in either format, and the plan refuses it below one
-        // context and a page per retained slot (`vram.rs`'s
-        // `a_named_pool_below_one_context_refuses_*`).
-        for format in ["bf16", "hq-e8-2b"] {
-            let config = expect_config(
-                resolve(&args(&["--kv-pool-bytes", "1M", "--kv-format", format]), no_env)
-                    .expect("parsed, not judged"),
-            );
-            assert_eq!(config.kv_pool, Some(KvPoolSize::Bytes(1 << 20)));
-        }
-        // What the plan will make of 512 MiB on the 27B at the default
-        // context: under hq it buys more than one context and the retained
-        // slots' pages, under BF16 not -- the format still decides.
-        let geometry = ignis_core::KvGeometry::qwen38_27b();
-        let floor = DEFAULT_MAX_CONTEXT.div_ceil(64) + DEFAULT_RETAINED_HOST_SLOTS + DEFAULT_RETAINED_DEVICE_SLOTS;
-        let pages = |format: KvFormat| KvPoolSize::Bytes(512 << 20).pages(format.page_bytes(geometry));
-        assert!(pages(KvFormat::HqE8_2b) >= floor, "{} vs {floor}", pages(KvFormat::HqE8_2b));
-        assert!(pages(KvFormat::Bf16) < floor, "{} vs {floor}", pages(KvFormat::Bf16));
-    }
-
-    #[test]
-    fn a_malformed_pool_budget_is_a_usage_error() {
-        for raw in ["", "4 GiB please", "-1", "4TB", "G", "tok", "Ktok", "4Gtok", "1.5Ktok", "-1tok", "12 tok"] {
-            let a = args(&["--kv-pool-bytes", raw]);
-            match resolve(&a, no_env) {
-                // An empty value falls through to the auto default, the
-                // same as every other flag here (`non_empty`).
-                Ok(_) if raw.is_empty() => {}
-                Ok(_) => panic!("`{raw}` must not parse as a byte or token count"),
-                Err(err) => assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0),
-            }
-        }
-    }
-
-    /// ADR 0045 (AC 6): `--allow-expert-cache-below-floor` is Flash-Next's;
-    /// off by default, on from the flag or the environment, and refused on
-    /// the 27B, which has no expert cache.
-    #[test]
-    fn the_expert_cache_floor_opt_in_parses_and_refuses_the_27b() {
-        let default = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert!(!default.allow_expert_cache_below_floor);
-        let flag = expect_config(resolve(&args(&["--allow-expert-cache-below-floor"]), no_env).expect("flag"));
-        assert!(flag.allow_expert_cache_below_floor);
-        for (raw, on) in [("true", true), ("1", true), ("off", false)] {
-            let env = move |key: &str| (key == "IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR").then(|| raw.to_owned());
-            assert_eq!(expect_config(resolve(&[], env).expect(raw)).allow_expert_cache_below_floor, on, "{raw}");
-        }
-        let err = resolve(&[], env_map(&[("IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR", "maybe")])).expect_err("bad");
-        assert!(err.0.contains("IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR"), "{}", err.0);
-        assert!(served_model_for(&flag, ModelFamily::FlashNext).is_ok());
-        assert!(served_model_for(&default, ModelFamily::Qwen38_27b).is_ok());
-        let err = served_model_for(&flag, ModelFamily::Qwen38_27b).expect_err("no expert cache");
-        assert!(err.0.contains("--allow-expert-cache-below-floor") && err.0.contains("27B"), "{}", err.0);
-    }
-
-    #[test]
-    fn the_help_says_lanes_share_the_pool_and_names_the_new_spellings() {
-        // AC 40 (P1): a lane no longer holds its own whole context.
-        let ConfigOutcome::Help(help) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
-            panic!("--help is help");
-        };
-        let lanes = help.lines().find(|l| l.contains("--decode-lanes")).expect("a --decode-lanes line");
-        assert!(!lanes.contains("whole context"), "{lanes}");
-        assert!(lanes.contains("sharing the KV pool"), "{lanes}");
-        assert!(lanes.contains("min(524,288 tokens, lanes x --max-context)") && lanes.contains("retained slot"), "{lanes}");
-        let pool = help.lines().find(|l| l.contains("--kv-pool-bytes")).expect("a --kv-pool-bytes line");
-        assert!(pool.contains("Ktok") && pool.contains("524,288"), "{pool}");
-        let floor = help.lines().find(|l| l.contains("--allow-expert-cache-below-floor")).expect("a floor line");
-        assert!(floor.contains("IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR") && floor.contains("12 GiB"), "{floor}");
-    }
-
-    // ── the VRAM budget (GitHub #210, ADR 0030) ──────────────────────────
-
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    #[test]
-    fn no_memory_flag_derives_the_budget_with_a_one_and_a_half_gib_headroom() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.vram, VramMode::Derived { headroom_bytes: 1536 * 1024 * 1024 });
-    }
-
-    #[test]
-    fn help_names_the_vram_headroom_default_in_mib() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
-            panic!("expected Help");
-        };
-        let line = text.lines().find(|l| l.contains("--vram-headroom-bytes")).expect("help documents --vram-headroom-bytes");
-        assert!(line.contains("default: 1536 MiB"), "{line}");
-    }
-
-    #[test]
-    fn the_headroom_and_the_budget_resolve_from_flags_and_env() {
-        let config = expect_config(
-            resolve(&args(&["--vram-headroom-bytes", "2G"]), no_env).expect("resolve"),
-        );
-        assert_eq!(config.vram, VramMode::Derived { headroom_bytes: 2 * GIB });
-
-        let env = env_map(&[("IGNIS_VRAM_HEADROOM_BYTES", "512M")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(
-            config.vram,
-            VramMode::Derived { headroom_bytes: 512 * 1024 * 1024 }
-        );
-
-        let config = expect_config(
-            resolve(&args(&["--vram-budget-bytes", "28G"]), no_env).expect("resolve"),
-        );
-        assert_eq!(
-            config.vram,
-            VramMode::Explicit { budget_bytes: 28 * GIB, allow_oversubscription: false }
-        );
-
-        let env = env_map(&[
-            ("IGNIS_VRAM_BUDGET_BYTES", "30G"),
-            ("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION", "true"),
-        ]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(
-            config.vram,
-            VramMode::Explicit { budget_bytes: 30 * GIB, allow_oversubscription: true }
-        );
-
-        let a = args(&["--vram-budget-bytes", "30G", "--allow-vram-oversubscription"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(
-            config.vram,
-            VramMode::Explicit { budget_bytes: 30 * GIB, allow_oversubscription: true }
-        );
-    }
-
-    #[test]
-    fn a_headroom_with_a_budget_is_refused_from_any_mix_of_flags_and_env() {
-        let flags = args(&["--vram-headroom-bytes", "1G", "--vram-budget-bytes", "28G"]);
-        let cases: [(Vec<String>, &'static [(&'static str, &'static str)]); 4] = [
-            (flags, &[]),
-            (args(&["--vram-budget-bytes", "28G"]), &[("IGNIS_VRAM_HEADROOM_BYTES", "1G")]),
-            (args(&["--vram-headroom-bytes", "1G"]), &[("IGNIS_VRAM_BUDGET_BYTES", "28G")]),
-            (
-                vec![],
-                &[("IGNIS_VRAM_HEADROOM_BYTES", "1G"), ("IGNIS_VRAM_BUDGET_BYTES", "28G")],
-            ),
-        ];
-        for (a, env) in cases {
-            let err = resolve(&a, env_map(env)).expect_err("mutually exclusive");
-            assert!(err.0.contains("--vram-headroom-bytes"), "{}", err.0);
-            assert!(err.0.contains("--vram-budget-bytes"), "{}", err.0);
-            assert!(err.0.contains("mutually exclusive"), "{}", err.0);
-        }
-    }
-
-    #[test]
-    fn oversubscription_without_a_budget_is_refused() {
-        let cases: [(Vec<String>, &'static [(&'static str, &'static str)]); 3] = [
-            (args(&["--allow-vram-oversubscription"]), &[]),
-            (vec![], &[("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION", "1")]),
-            (args(&["--allow-vram-oversubscription", "--vram-headroom-bytes", "2G"]), &[]),
-        ];
-        for (a, env) in cases {
-            let err = resolve(&a, env_map(env)).expect_err("needs a budget");
-            assert!(err.0.contains("--allow-vram-oversubscription"), "{}", err.0);
-            assert!(err.0.contains("--vram-budget-bytes"), "{}", err.0);
-        }
-    }
-
-    #[test]
-    fn malformed_vram_values_are_usage_errors() {
-        for (flag, raw) in [
-            ("--vram-headroom-bytes", "lots"),
-            ("--vram-budget-bytes", "28 GiB please"),
-            ("--vram-budget-bytes", "0"),
-        ] {
-            let err = resolve(&args(&[flag, raw]), no_env).expect_err("malformed");
-            assert!(err.0.contains(flag), "{}", err.0);
-        }
-        let env = env_map(&[
-            ("IGNIS_VRAM_BUDGET_BYTES", "28G"),
-            ("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION", "maybe"),
-        ]);
-        let err = resolve(&[], env).expect_err("not a bool");
-        assert!(err.0.contains("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION"), "{}", err.0);
-    }
-
-    #[test]
-    fn help_documents_the_vram_flags() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        for flag in [
-            "--vram-headroom-bytes",
-            "IGNIS_VRAM_HEADROOM_BYTES",
-            "--vram-budget-bytes",
-            "IGNIS_VRAM_BUDGET_BYTES",
-            "--allow-vram-oversubscription",
-            "IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION",
-        ] {
-            assert!(text.contains(flag), "help must document {flag}:\n{text}");
-        }
-    }
-
-    // ── the KV-RAM host tier byte budget (P4-07, GitHub #125) ────────────
-
-    #[test]
-    fn an_explicit_host_pool_budget_overrides_the_default() {
-        let config = expect_config(
-            resolve(&args(&["--kv-host-pool-bytes", "512M"]), no_env).expect("resolve"),
-        );
-        assert_eq!(config.host_pool_bytes, 512 * 1024 * 1024);
-
-        let env = env_map(&[("IGNIS_KV_HOST_POOL_BYTES", "1G")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.host_pool_bytes, 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn the_host_pool_budget_flag_wins_over_its_env_var() {
-        let env = env_map(&[("IGNIS_KV_HOST_POOL_BYTES", "1G")]);
-        let a = args(&["--kv-host-pool-bytes", "256M"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert_eq!(config.host_pool_bytes, 256 * 1024 * 1024, "flag must win over env");
-    }
-
-    // ── GitHub #186: cross-request state reuse (ADR 0029) ──────────────
-
-    #[test]
-    fn prompt_reuse_is_on_unless_the_operator_turns_it_off() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert!(config.prompt_reuse, "on by default (ADR 0029)");
-        assert_eq!(
-            retained_slots_of(&config),
-            (0, 2 * ignis_core::N_DECODE_LANES as u32),
-            "no device slot and two host slots per decode lane by default (GitHub #281)"
-        );
-
-        let config =
-            expect_config(resolve(&args(&["--prompt-reuse", "off"]), no_env).expect("resolve"));
-        assert!(!config.prompt_reuse);
-        assert_eq!(retained_slots_of(&config), (0, 0), "reuse off reserves no slot of either kind");
-
-        let env = env_map(&[("IGNIS_PROMPT_REUSE", "off")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert!(!config.prompt_reuse, "the env var turns it off too");
-
-        // A flag wins over its env var, in both directions.
-        let env = env_map(&[("IGNIS_PROMPT_REUSE", "off")]);
-        let a = args(&["--prompt-reuse", "on"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert!(config.prompt_reuse, "flag must win over env");
-    }
-
-    // ── GitHub #209: instruction-message policies ──────────────────────
-
-    #[test]
-    fn instruction_policies_default_to_merge_and_inplace() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(
-            config.instruction_policy,
-            InstructionPolicy { system: SystemMessagePolicy::Merge, developer: DeveloperMessagePolicy::Inplace }
-        );
-    }
-
-    #[test]
-    fn every_instruction_policy_value_is_named_by_flag_or_env_and_the_flag_wins() {
-        for system in SystemMessagePolicy::ALL {
-            let a = args(&["--system-message-policy", system.as_str()]);
-            let config = expect_config(resolve(&a, no_env).expect("resolve"));
-            assert_eq!(config.instruction_policy.system, system);
-            let env = move |key: &str| (key == "IGNIS_SYSTEM_MESSAGE_POLICY").then(|| system.as_str().to_owned());
-            let config = expect_config(resolve(&[], env).expect("resolve"));
-            assert_eq!(config.instruction_policy.system, system);
-        }
-        for developer in DeveloperMessagePolicy::ALL {
-            let a = args(&["--developer-message-policy", developer.as_str()]);
-            let config = expect_config(resolve(&a, no_env).expect("resolve"));
-            assert_eq!(config.instruction_policy.developer, developer);
-            let env = move |key: &str| (key == "IGNIS_DEVELOPER_MESSAGE_POLICY").then(|| developer.as_str().to_owned());
-            let config = expect_config(resolve(&[], env).expect("resolve"));
-            assert_eq!(config.instruction_policy.developer, developer);
-        }
-        let env = env_map(&[
-            ("IGNIS_SYSTEM_MESSAGE_POLICY", "strict"),
-            ("IGNIS_DEVELOPER_MESSAGE_POLICY", "reject"),
-        ]);
-        let a = args(&["--system-message-policy", "merge", "--developer-message-policy", "into-system"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert_eq!(
-            config.instruction_policy,
-            InstructionPolicy { system: SystemMessagePolicy::Merge, developer: DeveloperMessagePolicy::IntoSystem },
-            "flags win over env"
-        );
-    }
-
-    #[test]
-    fn an_unknown_instruction_policy_names_the_allowed_values() {
-        let err = resolve(&args(&["--system-message-policy", "inplace"]), no_env).expect_err("not a system policy");
-        assert!(err.0.contains("--system-message-policy"), "{}", err.0);
-        assert!(err.0.contains("`inplace`"), "names the value: {}", err.0);
-        assert!(err.0.contains("merge, strict"), "names the allowed ones: {}", err.0);
-
-        let env = env_map(&[("IGNIS_DEVELOPER_MESSAGE_POLICY", "drop")]);
-        let err = resolve(&[], env).expect_err("not a developer policy");
-        assert!(err.0.contains("--developer-message-policy"), "{}", err.0);
-        assert!(err.0.contains("`drop`"), "names the value: {}", err.0);
-        assert!(err.0.contains("IGNIS_DEVELOPER_MESSAGE_POLICY"), "names the env var it came from: {}", err.0);
-
-        let a = args(&["--developer-message-policy", " One-After-System "]);
-        let config = expect_config(resolve(&a, no_env).expect("case and padding do not matter"));
-        assert_eq!(config.instruction_policy.developer, DeveloperMessagePolicy::OneAfterSystem);
-        assert!(
-            err.0.contains("inplace, into-system, after-system, one-after-system, reject"),
-            "names the allowed ones: {}",
-            err.0
-        );
-    }
-
-    #[test]
-    fn a_malformed_prompt_reuse_value_is_a_usage_error() {
-        let err = resolve(&args(&["--prompt-reuse", "maybe"]), no_env)
-            .expect_err("`maybe` is neither on nor off");
-        assert!(err.0.contains("--prompt-reuse"), "{}", err.0);
-        assert!(err.0.contains("maybe"), "names the value: {}", err.0);
-    }
-
-    /// (device, host) retained slots.
-    fn retained_slots_of(config: &Config) -> (u32, u32) {
-        (config.retained_device_slots, config.retained_host_slots)
-    }
-
-    #[test]
-    fn retained_device_and_host_slots_are_configurable_by_flag_or_env() {
-        // GitHub #281: each kind is sized on its own, its default kept when
-        // only the other is named.
-        let host_default = 2 * ignis_core::N_DECODE_LANES as u32;
-        let config =
-            expect_config(resolve(&args(&["--retained-device", "3"]), no_env).expect("resolve"));
-        assert_eq!(retained_slots_of(&config), (3, host_default));
-        let config =
-            expect_config(resolve(&args(&["--retained-host", "5"]), no_env).expect("resolve"));
-        assert_eq!(retained_slots_of(&config), (0, 5));
-
-        // A card with VRAM to spare keeps every image on the device.
-        let a = args(&["--retained-device", "16", "--retained-host", "0"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(retained_slots_of(&config), (16, 0), "zero is legal for either");
-
-        let env = env_map(&[("IGNIS_RETAINED_DEVICE", "12"), ("IGNIS_RETAINED_HOST", "7")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(retained_slots_of(&config), (12, 7));
-
-        let env = env_map(&[("IGNIS_RETAINED_DEVICE", "12"), ("IGNIS_RETAINED_HOST", "7")]);
-        let a = args(&["--retained-device", "1", "--retained-host", "2"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert_eq!(retained_slots_of(&config), (1, 2), "the flag wins over its env var");
-
-        for flag in ["--retained-device", "--retained-host"] {
-            let err = resolve(&args(&[flag, "8G"]), no_env).expect_err("not a count");
-            assert!(err.0.contains(flag), "{}", err.0);
-        }
-    }
-
-    #[test]
-    fn the_config_records_whether_the_host_retained_count_was_named() {
-        // Spec flash-next/05: an unnamed count is the 27B's default here and
-        // Flash-Next's own once the artifact names its model, so the config
-        // keeps which of the two it is.
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert!(!config.retained_host_named);
-        let config = expect_config(resolve(&args(&["--retained-device", "2"]), no_env).expect("resolve"));
-        assert!(!config.retained_host_named, "the device count names nothing of the host's");
-        let config = expect_config(resolve(&args(&["--retained-host", "16"]), no_env).expect("resolve"));
-        assert!(config.retained_host_named, "named at the 27B's default value is still named");
-        let env = env_map(&[("IGNIS_RETAINED_HOST", "3")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert!(config.retained_host_named, "the env var names it too");
-    }
-
-    #[test]
-    fn the_removed_retained_slots_flag_is_an_error_naming_both_kinds() {
-        // GitHub #281: a start script still passing the one count is told
-        // which two replaced it, rather than silently getting the defaults.
-        let err = resolve(&args(&["--retained-slots", "8"]), no_env).expect_err("the flag was removed");
-        for name in ["--retained-slots", "--retained-device", "--retained-host"] {
-            assert!(err.0.contains(name), "names {name}: {}", err.0);
-        }
-
-        let env = env_map(&[("IGNIS_RETAINED_SLOTS", "8")]);
-        let err = resolve(&[], env).expect_err("the env var was removed too");
-        for name in ["IGNIS_RETAINED_SLOTS", "IGNIS_RETAINED_DEVICE", "IGNIS_RETAINED_HOST"] {
-            assert!(err.0.contains(name), "names {name}: {}", err.0);
-        }
-    }
-
-    #[test]
-    fn the_removed_retained_pool_budget_is_an_error_naming_the_slot_flags() {
-        // GitHub #215: the byte ledger is gone. A start script still passing it
-        // is told what replaced it rather than silently running without it.
-        let err = resolve(&args(&["--retained-pool-bytes", "512M"]), no_env)
-            .expect_err("the flag was removed");
-        assert!(err.0.contains("--retained-pool-bytes"), "{}", err.0);
-        for name in ["--retained-device", "--retained-host"] {
-            assert!(err.0.contains(name), "points to {name}: {}", err.0);
-        }
-        assert!(!err.0.contains("--retained-slots"), "not to a removed flag: {}", err.0);
-
-        let env = env_map(&[("IGNIS_RETAINED_POOL_BYTES", "1G")]);
-        let err = resolve(&[], env).expect_err("the env var was removed too");
-        assert!(err.0.contains("IGNIS_RETAINED_HOST"), "{}", err.0);
-    }
-
-    #[test]
-    fn the_retained_interactive_ttl_is_configurable_and_needs_reuse_on() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.retained_interactive_ttl_secs, 300, "five minutes by default");
-
-        let config = expect_config(
-            resolve(&args(&["--retained-interactive-ttl", "60"]), no_env).expect("resolve"),
-        );
-        assert_eq!(config.retained_interactive_ttl_secs, 60);
-
-        let env = env_map(&[("IGNIS_RETAINED_INTERACTIVE_TTL", "0")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.retained_interactive_ttl_secs, 0, "zero is a legal choice");
-
-        let err = resolve(&args(&["--retained-interactive-ttl", "5m"]), no_env)
-            .expect_err("not a second count");
-        assert!(err.0.contains("--retained-interactive-ttl"), "{}", err.0);
-
-        let a = args(&["--prompt-reuse", "off", "--retained-interactive-ttl", "60"]);
-        let err = resolve(&a, no_env).expect_err("a TTL with reuse off");
-        assert!(err.0.contains("--prompt-reuse"), "names what it needs: {}", err.0);
-    }
-
-    #[test]
-    fn retained_slots_with_reuse_off_are_accepted_for_live_siblings() {
-        // With reuse off nothing outlives a request, but live siblings still
-        // share a head when slots are given for it — the engine before #186.
-        let a = args(&["--prompt-reuse", "off", "--retained-device", "4"]);
-        let config = expect_config(resolve(&a, no_env).expect("slots with reuse off"));
-        assert!(!config.prompt_reuse);
-        assert_eq!(retained_slots_of(&config), (4, 0), "the kind not named stays at zero");
-        let a = args(&["--prompt-reuse", "off", "--retained-host", "3"]);
-        let config = expect_config(resolve(&a, no_env).expect("slots with reuse off"));
-        assert_eq!(retained_slots_of(&config), (0, 3));
-    }
-
-    #[test]
-    fn a_zero_host_pool_budget_is_accepted_and_disables_the_tier() {
-        // Unlike an empty string (falls through to the default), `0` is an
-        // explicit, legal operator choice: no host tier at all.
-        let config =
-            expect_config(resolve(&args(&["--kv-host-pool-bytes", "0"]), no_env).expect("resolve"));
-        assert_eq!(config.host_pool_bytes, 0);
-    }
-
-    #[test]
-    fn a_malformed_host_pool_budget_is_a_usage_error() {
-        let err = resolve(&args(&["--kv-host-pool-bytes", "not-a-size"]), no_env)
-            .expect_err("must reject");
-        assert!(err.0.contains("--kv-host-pool-bytes"), "{}", err.0);
-    }
-
-    #[test]
-    fn help_lists_the_host_pool_budget_flag() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(
-            text.contains("--kv-host-pool-bytes"),
-            "help must document --kv-host-pool-bytes:\n{text}"
-        );
-    }
-
-    // ── the request timeout (GitHub #95) ─────────────────────────────────
-
-    #[test]
-    fn the_request_timeout_env_var_wins_over_the_default() {
-        let env = env_map(&[("IGNIS_REQUEST_TIMEOUT", "90")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.request_timeout_secs, 90);
-    }
-
-    #[test]
-    fn the_request_timeout_flag_wins_over_its_env_var() {
-        let env = env_map(&[("IGNIS_REQUEST_TIMEOUT", "90")]);
-        let a = args(&["--request-timeout", "45"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert_eq!(config.request_timeout_secs, 45, "flag must win over env");
-    }
-
-    #[test]
-    fn a_zero_request_timeout_is_a_usage_error() {
-        let err = resolve(&args(&["--request-timeout", "0"]), no_env).expect_err("must reject");
-        assert!(err.0.contains("nonzero"), "{err}");
-    }
-
-    #[test]
-    fn a_non_numeric_request_timeout_is_a_usage_error() {
-        let err =
-            resolve(&args(&["--request-timeout", "soon"]), no_env).expect_err("must reject");
-        assert!(err.0.contains("--request-timeout"), "{err}");
-    }
-
-    #[test]
-    fn a_request_timeout_above_the_ceiling_is_a_usage_error() {
-        let err = resolve(&args(&["--request-timeout", "3601"]), no_env).expect_err("must reject");
-        assert!(err.0.contains("3600"), "the message must name the ceiling: {err}");
-        assert!(err.0.contains("3601"), "the message must name the value: {err}");
-    }
-
-    #[test]
-    fn an_invalid_request_timeout_env_var_is_a_usage_error_too() {
-        let env = env_map(&[("IGNIS_REQUEST_TIMEOUT", "0")]);
-        let err = resolve(&[], env).expect_err("must reject");
-        assert!(err.0.contains("nonzero"), "{err}");
-    }
-
-    #[test]
-    fn help_lists_the_request_timeout_flag() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--request-timeout"), "help must document --request-timeout:\n{text}");
-    }
-
-    // ── speculation as a load option (P5-02, GitHub #150) ────────────────
-
-    #[test]
-    fn spec_dflash2_with_a_window_in_range_parses() {
-        for n in 1..=7u32 {
-            let a = args(&["--spec", "dflash2", "--draft-tokens", &n.to_string()]);
-            let config = expect_config(resolve(&a, no_env).expect("resolve"));
-            assert_eq!(
-                config.speculation,
-                Some(Speculation::new(SpeculativeBackend::Dflash2, n).unwrap())
-            );
-        }
-    }
-
-    #[test]
-    fn a_draft_window_outside_1_to_7_is_refused_naming_the_range() {
-        for raw in ["0", "8", "15", "-1", "seven"] {
-            let a = args(&["--spec", "dflash2", "--draft-tokens", raw]);
-            let err = resolve(&a, no_env).expect_err("out of range");
-            assert!(err.0.contains("--draft-tokens"), "{}", err.0);
-            assert!(err.0.contains("1..7"), "{}", err.0);
-            assert!(err.0.contains(raw), "{}", err.0);
-        }
-    }
-
-    #[test]
-    fn an_unknown_speculative_backend_is_refused_naming_dflash2() {
-        let a = args(&["--spec", "eagle", "--draft-tokens", "3"]);
-        let err = resolve(&a, no_env).expect_err("unknown backend");
-        assert!(err.0.contains("--spec") && err.0.contains("eagle"), "{}", err.0);
-        assert!(err.0.contains("dflash2") && err.0.contains("mtp"), "{}", err.0);
-    }
-
-    /// GitHub #307: Flash-Next's head takes a default window, a forced one,
-    /// a row budget, and `--spec off`.
-    #[test]
-    fn spec_mtp_spec_off_and_draft_rows_parse() {
-        let config = expect_config(resolve(&args(&["--spec", "mtp"]), no_env).expect("resolve"));
-        assert_eq!(
-            config.speculation,
-            Some(Speculation::new(SpeculativeBackend::Mtp, FLASH_NEXT_DEFAULT_DRAFT_TOKENS).unwrap())
-        );
-        let forced = expect_config(
-            resolve(&args(&["--spec", "mtp", "--draft-tokens", "3", "--draft-rows", "6"]), no_env).expect("resolve"),
-        );
-        assert_eq!(forced.speculation, Some(Speculation::new(SpeculativeBackend::Mtp, 3).unwrap()));
-        assert_eq!(forced.draft_rows, Some(6));
-        let off = expect_config(resolve(&args(&["--spec", "off"]), no_env).expect("resolve"));
-        assert!(off.speculation_off && off.speculation.is_none());
-        let default = expect_config(resolve(&args(&[]), no_env).expect("resolve"));
-        assert!(!default.speculation_off && default.draft_rows.is_none());
-        for raw in ["1", "9", "rows"] {
-            let err = resolve(&args(&["--draft-rows", raw]), no_env).expect_err("bad budget");
-            assert!(err.0.contains("--draft-rows") && err.0.contains(raw), "{}", err.0);
-        }
-    }
-
-    #[test]
-    fn spec_without_a_draft_window_is_refused() {
-        let err = resolve(&args(&["--spec", "dflash2"]), no_env).expect_err("no window");
-        assert!(err.0.contains("--draft-tokens") && err.0.contains("1..7"), "{}", err.0);
-    }
-
-    #[test]
-    fn a_draft_window_without_spec_is_refused_rather_than_ignored() {
-        let err = resolve(&args(&["--draft-tokens", "7"]), no_env).expect_err("no backend");
-        assert!(err.0.contains("--spec"), "{}", err.0);
-    }
-
-    #[test]
-    fn the_draft_head_defaults_to_full_and_takes_shortlist_by_flag_or_env() {
-        let a = args(&["--spec", "dflash2", "--draft-tokens", "7"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(config.speculation.map(|s| s.proposal_head()), Some(ProposalHead::Full));
-
-        let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--draft-head", "shortlist"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(config.speculation.map(|s| s.proposal_head()), Some(ProposalHead::Shortlist));
-        assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(7));
-
-        let env = env_map(&[
-            ("IGNIS_SPEC", "dflash2"),
-            ("IGNIS_DRAFT_TOKENS", "7"),
-            ("IGNIS_DRAFT_HEAD", "shortlist"),
-        ]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.speculation.map(|s| s.proposal_head()), Some(ProposalHead::Shortlist));
-    }
-
-    #[test]
-    fn a_draft_head_without_spec_or_with_an_unknown_name_is_refused() {
-        let err = resolve(&args(&["--draft-head", "shortlist"]), no_env).expect_err("no backend");
-        assert!(err.0.contains("--draft-head") && err.0.contains("--spec"), "{}", err.0);
-
-        let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--draft-head", "tiny"]);
-        let err = resolve(&a, no_env).expect_err("unknown head");
-        assert!(err.0.contains("--draft-head") && err.0.contains("tiny"), "{}", err.0);
-    }
-
-    #[test]
-    fn mtp_takes_no_proposal_head_and_spec_off_takes_no_draft_options() {
-        let a = args(&["--spec", "mtp", "--draft-head", "shortlist"]);
-        let err = resolve(&a, no_env).expect_err("mtp has one head");
-        assert!(err.0.contains("--draft-head") && err.0.contains("mtp"), "{}", err.0);
-        let a = args(&["--spec", "mtp", "--draft-tokens", "2", "--draft-head", "shortlist"]);
-        assert!(resolve(&a, no_env).is_err());
-        let a = args(&["--spec", "mtp", "--draft-head", "full"]);
-        assert!(resolve(&a, no_env).is_ok(), "naming the only head is harmless");
-
-        let err = resolve(&args(&["--spec", "off", "--draft-tokens", "7"]), no_env).expect_err("dropped window");
-        assert!(err.0.contains("--draft-tokens") && err.0.contains("off"), "{}", err.0);
-        let err = resolve(&args(&["--spec", "off", "--draft-head", "shortlist"]), no_env).expect_err("dropped head");
-        assert!(err.0.contains("--draft-head"), "{}", err.0);
-        let env = env_map(&[("IGNIS_SPEC", "off"), ("IGNIS_DRAFT_TOKENS", "3")]);
-        assert!(resolve(&[], env).is_err());
-        let config = expect_config(resolve(&args(&["--spec", "off"]), no_env).expect("off alone"));
-        assert!(config.speculation.is_none());
-    }
-
-    #[test]
-    fn the_speculation_env_vars_apply_and_the_flags_win_over_them() {
-        let env = env_map(&[("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "3")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(3));
-
-        let env = env_map(&[("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "3")]);
-        let config =
-            expect_config(resolve(&args(&["--draft-tokens", "7"]), env).expect("resolve"));
-        assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(7), "flag must win over env");
-    }
-
-    // ── rope scaling as a load option (GitHub #227) ───────────────────────
-
-    #[test]
-    fn rope_scaling_is_off_by_default() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.rope_scaling, RopeScaling::NONE);
-        assert!(!config.rope_scaling.is_yarn());
-    }
-
-    #[test]
-    fn the_rope_scaling_flag_and_env_carry_the_reference_grammar() {
-        let a = args(&["--rope-scaling", "yarn:4,t=0.25"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert!(config.rope_scaling.is_yarn());
-        assert_eq!(config.rope_scaling.factor(), 4.0);
-        assert_eq!(config.rope_scaling.temperature(), 0.25);
-
-        let env = env_map(&[("IGNIS_ROPE_SCALING", "yarn:2")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.rope_scaling.factor(), 2.0);
-
-        let env = env_map(&[("IGNIS_ROPE_SCALING", "yarn:2")]);
-        let config =
-            expect_config(resolve(&args(&["--rope-scaling", "none"]), env).expect("resolve"));
-        assert_eq!(config.rope_scaling, RopeScaling::NONE, "flag must win over env");
-    }
-
-    #[test]
-    fn a_bad_rope_scaling_is_a_startup_error_naming_the_flag() {
-        let err = resolve(&args(&["--rope-scaling", "yarn:0.5"]), no_env).expect_err("bad factor");
-        assert!(err.0.contains("--rope-scaling"), "{}", err.0);
-        let err = resolve(&args(&["--rope-scaling", "linear"]), no_env).expect_err("bad shape");
-        assert!(err.0.contains("--rope-scaling"), "{}", err.0);
-    }
-
-    // ── the loaded model's family (spec flash-next/04, GitHub #302) ───────
-
-    #[test]
-    fn flash_next_refuses_speculation_and_vision_at_start_naming_itself() {
-        use ignis_core::compute::ModelFamily;
-        let spec = expect_config(
-            resolve(&args(&["--spec", "dflash2", "--draft-tokens", "7"]), no_env).expect("resolve"),
-        );
-        let err = served_model_for(&spec, ModelFamily::FlashNext).expect_err("the 27B's drafter");
-        assert!(err.0.contains("--spec dflash2") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
-        assert!(err.0.contains("drafts with mtp"), "{}", err.0);
-        let mtp = expect_config(resolve(&args(&["--spec", "mtp", "--draft-rows", "6"]), no_env).expect("resolve"));
-        assert!(served_model_for(&mtp, ModelFamily::FlashNext).is_ok(), "Flash-Next drafts with mtp");
-        let err = served_model_for(&mtp, ModelFamily::Qwen38_27b).expect_err("Flash-Next's head");
-        assert!(err.0.contains("--spec mtp") && err.0.contains("drafts with dflash2"), "{}", err.0);
-        let vision = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
-        let err = served_model_for(&vision, ModelFamily::FlashNext).expect_err("no vision");
-        assert!(err.0.contains("--vision") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
-    }
-
-    /// GitHub #228: the 27B's GQA envelope bounds `--max-context` per KV
-    /// format; Flash-Next's QSA is not bound by it.
-    #[test]
-    fn max_context_past_the_gqa_envelope_is_refused_for_the_27b_only() {
-        use ignis_core::compute::ModelFamily;
-        let cfg = |ctx: &str, fmt: &str| {
-            expect_config(
-                resolve(&args(&["--max-context", ctx, "--kv-format", fmt, "--kv-pool-bytes", "64G"]), no_env)
-                    .expect("resolve"),
-            )
-        };
-        assert!(served_model_for(&cfg("524288", "bf16"), ModelFamily::Qwen38_27b).is_ok());
-        let err = served_model_for(&cfg("524289", "bf16"), ModelFamily::Qwen38_27b).expect_err("past linear");
-        assert!(err.0.contains("--max-context") && err.0.contains("524288") && err.0.contains("bf16"), "{}", err.0);
-        assert!(served_model_for(&cfg("1048576", "hq-e8-2b"), ModelFamily::Qwen38_27b).is_ok());
-        let err = served_model_for(&cfg("1048577", "hq-e8-2b"), ModelFamily::Qwen38_27b).expect_err("past absolute");
-        assert!(err.0.contains("1048576"), "{}", err.0);
-        assert!(served_model_for(&cfg("1048577", "hq-e8-2b"), ModelFamily::FlashNext).is_ok());
-    }
-
-    /// GitHub #306: `--decode-lanes` is Flash-Next's, 1 to the engine's 8.
-    #[test]
-    fn decode_lanes_parse_bound_and_refuse_the_27b() {
-        let default = expect_config(resolve(&args(&[]), no_env).expect("resolve"));
-        assert_eq!(default.decode_lanes, None);
-        let flag = expect_config(resolve(&args(&["--decode-lanes", "1"]), no_env).expect("resolve"));
-        assert_eq!(flag.decode_lanes, Some(1));
-        let env = expect_config(
-            resolve(&args(&[]), env_map(&[("IGNIS_DECODE_LANES", "8")])).expect("resolve"),
-        );
-        assert_eq!(env.decode_lanes, Some(8));
-        for raw in ["0", "9", "-1", "many"] {
-            let err = resolve(&args(&["--decode-lanes", raw]), no_env).expect_err("bad lane count");
-            assert!(err.0.contains("--decode-lanes") && err.0.contains(raw), "{}", err.0);
-        }
-        assert!(served_model_for(&flag, ModelFamily::FlashNext).is_ok());
-        let err = served_model_for(&flag, ModelFamily::Qwen38_27b).expect_err("a fixed lane count");
-        assert!(err.0.contains("--decode-lanes 1") && err.0.contains("fixed"), "{}", err.0);
-    }
-
-    /// `--ngram-hot-bytes` (GitHub #306): unnamed is `None`, the 1 GiB
-    /// default the load always had; a size or `auto`, from the flag or the
-    /// environment, the flag winning; anything else is refused, and so is
-    /// any value on the 27B, which has no n-gram table.
-    #[test]
-    fn ngram_hot_bytes_parse_and_refuse_the_27b() {
-        use ignis_core::ngram_table::HotBudget;
-        let default = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(default.ngram_hot_bytes, None);
-        for (raw, budget) in [("4G", HotBudget::Bytes(4 << 30)), ("auto", HotBudget::Auto), ("0", HotBudget::Bytes(0))] {
-            let config = expect_config(resolve(&args(&["--ngram-hot-bytes", raw]), no_env).expect("resolve"));
-            assert_eq!(config.ngram_hot_bytes, Some(budget), "{raw}");
-        }
-        let env = env_map(&[("IGNIS_NGRAM_HOT_BYTES", "auto")]);
-        assert_eq!(expect_config(resolve(&[], &env).expect("resolve")).ngram_hot_bytes, Some(HotBudget::Auto));
-        let flag = expect_config(resolve(&args(&["--ngram-hot-bytes", "512M"]), &env).expect("resolve"));
-        assert_eq!(flag.ngram_hot_bytes, Some(HotBudget::Bytes(512 << 20)), "the flag wins over the env");
-        for raw in ["lots", "-1", "auto2"] {
-            let err = resolve(&args(&["--ngram-hot-bytes", raw]), no_env).expect_err("not a budget");
-            assert!(err.0.contains("--ngram-hot-bytes") && err.0.contains("auto") && err.0.contains(raw), "{}", err.0);
-        }
-        assert!(resolve(&args(&["--ngram-hot-bytes"]), no_env).is_err());
-        assert!(served_model_for(&flag, ModelFamily::FlashNext).is_ok());
-        assert!(served_model_for(&default, ModelFamily::Qwen38_27b).is_ok());
-        let err = served_model_for(&flag, ModelFamily::Qwen38_27b).expect_err("no n-gram table");
-        assert!(err.0.contains("--ngram-hot-bytes 512M") && err.0.contains("n-gram"), "{}", err.0);
-    }
-
-    #[test]
-    fn help_lists_the_ngram_hot_bytes_flag_with_its_default_and_auto() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
-            panic!("expected Help");
-        };
-        let line = text.lines().find(|l| l.contains("--ngram-hot-bytes")).expect("help documents --ngram-hot-bytes");
-        for needle in ["IGNIS_NGRAM_HOT_BYTES", "default: 1 GiB", "auto", "whole"] {
-            assert!(line.contains(needle), "{needle} missing: {line}");
-        }
-    }
-
-    #[test]
-    fn the_27b_takes_every_start_option_it_took_before() {
-        use ignis_core::compute::ModelFamily;
-        let a = args(&["--spec", "dflash2", "--draft-tokens", "7", "--vision"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(served_model_for(&config, ModelFamily::Qwen38_27b), Ok(DEFAULT_MODEL.to_owned()));
-    }
-
-    /// With no `--model`, a load is served under its own model's id: the
-    /// artifact's family decides, not the 27B's default.
-    #[test]
-    fn an_unnamed_served_id_is_the_loaded_models_own() {
-        use ignis_core::compute::ModelFamily;
-        let plain = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(served_model_for(&plain, ModelFamily::FlashNext), Ok("qwen3.8-flash-next".to_owned()));
-        assert_eq!(served_model_for(&plain, ModelFamily::Qwen38_27b), Ok("qwen3.8-27b".to_owned()));
-    }
-
-    /// A served id that names the other model is refused at start, whether
-    /// the flag or the environment named it: the artifact decides the model,
-    /// and a client must never be told it talks to one while the other
-    /// answers. Any other id is the operator's to choose.
-    #[test]
-    fn a_served_id_naming_the_other_model_is_refused_at_start() {
-        use ignis_core::compute::ModelFamily;
-        let named = |id: &'static str| expect_config(resolve(&args(&["--model", id]), no_env).expect("resolve"));
-        let err = served_model_for(&named("qwen3.8-flash-next"), ModelFamily::Qwen38_27b).expect_err("27B artifact");
-        assert!(err.0.contains("qwen3.8-flash-next") && err.0.contains("Qwen3.8-27B"), "{}", err.0);
-        let err = served_model_for(&named("qwen3.8-27b"), ModelFamily::FlashNext).expect_err("Flash-Next artifact");
-        assert!(err.0.contains("qwen3.8-27b") && err.0.contains("Qwen3.8-Flash-Next"), "{}", err.0);
-        let env = env_map(&[("IGNIS_MODEL", "qwen3.8-flash-next")]);
-        let from_env = expect_config(resolve(&[], env).expect("resolve"));
-        assert!(served_model_for(&from_env, ModelFamily::Qwen38_27b).is_err(), "the env form too");
-        assert_eq!(served_model_for(&named("my-id"), ModelFamily::FlashNext), Ok("my-id".to_owned()));
-        assert_eq!(served_model_for(&named("qwen3.8-27b"), ModelFamily::Qwen38_27b), Ok("qwen3.8-27b".to_owned()));
-    }
-
-    // ── vision as a load option (GitHub #177) ─────────────────────────────
-
-    #[test]
-    fn vision_is_off_by_default() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.vision, None);
-    }
-
-    #[test]
-    fn the_vision_flag_loads_the_default_envelope() {
-        let config = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
-        assert_eq!(config.vision, Some(Vision::default()));
-        assert_eq!(config.vision.unwrap().max_tokens(), DEFAULT_VISION_MAX_TOKENS);
-    }
-
-    #[test]
-    fn the_vision_envelope_can_be_lowered() {
-        let a = args(&["--vision", "--vision-max-tokens", "8192"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(8192));
-    }
-
-    #[test]
-    fn a_vision_envelope_without_vision_is_refused_rather_than_ignored() {
-        let err = resolve(&args(&["--vision-max-tokens", "8192"]), no_env).expect_err("no vision");
-        assert!(err.0.contains("--vision"), "{}", err.0);
-        let env = env_map(&[("IGNIS_VISION_MAX_TOKENS", "8192")]);
-        assert!(resolve(&[], env).is_err(), "the env form too");
-    }
-
-    #[test]
-    fn the_embedding_pool_defaults_to_one_envelope_wide_item() {
-        // GitHub #243 must not move the VRAM plan for an operator who does
-        // not ask: the default pool is the reservation vision always took.
-        let config = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
-        let vision = config.vision.expect("vision on");
-        assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
-    }
-
-    #[test]
-    fn the_embedding_pool_can_be_widened() {
-        let a = args(&["--vision", "--vision-embedding-pool-mib", "1280"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        let vision = config.vision.expect("vision on");
-        assert_eq!(vision.pool_bytes(262_144), 1280 * 1024 * 1024);
-
-        let env = env_map(&[("IGNIS_VISION", "1"), ("IGNIS_VISION_EMBEDDING_POOL_MIB", "640")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.vision.unwrap().pool_bytes(262_144), 640 * 1024 * 1024);
-    }
-
-    #[test]
-    fn an_embedding_pool_below_the_envelope_is_raised_not_refused() {
-        // An operator lowering the pool should not have to recompute the
-        // envelope's bytes to keep the load working: the floor is applied,
-        // and the plan reports what was actually reserved.
-        let a = args(&["--vision", "--vision-embedding-pool-mib", "1"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        let vision = config.vision.expect("vision on");
-        assert_eq!(vision.requested_pool_bytes(), 1024 * 1024);
-        assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
-    }
-
-    #[test]
-    fn an_embedding_pool_without_vision_is_refused_rather_than_ignored() {
-        let err = resolve(&args(&["--vision-embedding-pool-mib", "640"]), no_env)
-            .expect_err("no vision");
-        assert!(err.0.contains("--vision"), "{}", err.0);
-        let env = env_map(&[("IGNIS_VISION_EMBEDDING_POOL_MIB", "640")]);
-        assert!(resolve(&[], env).is_err(), "the env form too");
-    }
-
-    #[test]
-    fn an_embedding_pool_outside_the_range_is_refused_naming_it() {
-        for raw in ["0", "65537", "-1", "lots"] {
-            let a = args(&["--vision", "--vision-embedding-pool-mib", raw]);
-            let err = resolve(&a, no_env).expect_err("out of range");
-            assert!(err.0.contains("--vision-embedding-pool-mib"), "{}", err.0);
-            assert!(err.0.contains(raw), "{}", err.0);
-        }
-    }
-
-    #[test]
-    fn a_vision_envelope_outside_the_range_is_refused_naming_it() {
-        for raw in ["0", "1048577", "-1", "lots"] {
-            let a = args(&["--vision", "--vision-max-tokens", raw]);
-            let err = resolve(&a, no_env).expect_err("out of range");
-            assert!(err.0.contains("--vision-max-tokens"), "{}", err.0);
-            assert!(err.0.contains("1048576"), "{}", err.0);
-            assert!(err.0.contains(raw), "{}", err.0);
-        }
-    }
-
-    #[test]
-    fn the_vision_env_vars_apply_and_the_flags_win_over_them() {
-        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_VISION_MAX_TOKENS", "4096")]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(4096));
-
-        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_VISION_MAX_TOKENS", "4096")]);
-        let a = args(&["--vision-max-tokens", "2048"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(2048), "flag must win over env");
-
-        let env = env_map(&[("IGNIS_VISION", "false")]);
-        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).vision, None);
-
-        let env = env_map(&[("IGNIS_VISION", "maybe")]);
-        let err = resolve(&[], env).expect_err("bad bool");
-        assert!(err.0.contains("IGNIS_VISION") && err.0.contains("maybe"), "{}", err.0);
-    }
-
-    #[test]
-    fn help_lists_the_vision_flags() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--vision ") && text.contains("--vision-max-tokens"), "{text}");
-        // GitHub #248: the flag shrinks an image, and says so.
-        assert!(text.contains("is shrunk to fit"), "{text}");
-    }
-
-    /// GitHub #195: the two are independent load options again.
-    #[test]
-    fn vision_and_dflash2_resolve_together_as_two_independent_load_options() {
-        let a = args(&["--vision", "--spec", "dflash2", "--draft-tokens", "4"]);
-        let config = expect_config(resolve(&a, no_env).expect("vision + dflash2"));
-        assert_eq!(config.vision, Some(Vision::default()));
-        assert_eq!(config.speculation, Speculation::new(SpeculativeBackend::Dflash2, 4).ok());
-        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "4")]);
-        let from_env = expect_config(resolve(&[], env).expect("the env form too"));
-        assert_eq!(from_env.vision, config.vision);
-        assert_eq!(from_env.speculation, config.speculation);
-        // Each alone still resolves, and neither one turns the other on.
-        let vision_only = expect_config(resolve(&args(&["--vision"]), no_env).expect("vision alone"));
-        assert_eq!((vision_only.vision, vision_only.speculation), (config.vision, None));
-        let spec_only =
-            expect_config(resolve(&args(&["--spec", "dflash2", "--draft-tokens", "4"]), no_env).expect("spec alone"));
-        assert_eq!((spec_only.vision, spec_only.speculation), (None, config.speculation));
-    }
-
-    // ── media acquisition (GitHub #179) ──────────────────────────────────
-
-    #[test]
-    fn media_defaults_to_no_private_network_and_a_one_gib_cache() {
-        let config = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
-        assert_eq!(config.media, MediaOptions { allow_private_network: false, cache_bytes: 1024 << 20 });
-        assert_eq!(expect_config(resolve(&[], no_env).expect("resolve")).media, MediaOptions::default());
-    }
-
-    #[test]
-    fn media_flags_set_the_private_network_opt_in_and_the_cache() {
-        let a = args(&["--vision", "--media-allow-private-network", "--media-cache-mib", "0"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(config.media, MediaOptions { allow_private_network: true, cache_bytes: 0 });
-
-        let env = env_map(&[
-            ("IGNIS_VISION", "true"),
-            ("IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK", "true"),
-            ("IGNIS_MEDIA_CACHE_MIB", "64"),
-        ]);
-        let config = expect_config(resolve(&args(&["--media-cache-mib", "128"]), env).expect("resolve"));
-        assert_eq!(config.media, MediaOptions { allow_private_network: true, cache_bytes: 128 << 20 });
-    }
-
-    #[test]
-    fn media_flags_without_vision_are_refused_rather_than_ignored() {
-        for a in [&["--media-allow-private-network"][..], &["--media-cache-mib", "10"]] {
-            let err = resolve(&args(a), no_env).expect_err("no vision");
-            assert!(err.0.contains(a[0]) && err.0.contains("--vision"), "{}", err.0);
-        }
-    }
-
-    #[test]
-    fn a_media_cache_outside_the_range_is_refused_naming_it() {
-        for raw in ["65537", "-1", "lots"] {
-            let err = resolve(&args(&["--vision", "--media-cache-mib", raw]), no_env).expect_err("range");
-            assert!(err.0.contains("--media-cache-mib") && err.0.contains(raw), "{}", err.0);
-        }
-        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK", "maybe")]);
-        assert!(resolve(&[], env).expect_err("bad bool").0.contains("maybe"));
-    }
-
-    #[test]
-    fn help_lists_the_media_flags() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--media-allow-private-network") && text.contains("--media-cache-mib"), "{text}");
-    }
-
-    #[test]
-    fn help_lists_the_speculation_flags() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--spec") && text.contains("--draft-tokens"), "{text}");
-    }
-
-    // ── the Playground (GitHub #163, ADR 0026) ───────────────────────────
-
-    #[test]
-    fn the_playground_is_on_by_default_and_off_with_no_ui() {
-        assert!(expect_config(resolve(&[], no_env).expect("resolve")).ui);
-        assert!(expect_config(resolve(&args(&["--ui"]), no_env).expect("resolve")).ui);
-        assert!(!expect_config(resolve(&args(&["--no-ui"]), no_env).expect("resolve")).ui);
-    }
-
-    #[test]
-    fn both_ui_flags_are_bare_switches() {
-        // The next argument is parsed as a flag of its own, not as a value.
-        for (flag, want) in [("--ui", true), ("--no-ui", false)] {
-            let config =
-                expect_config(resolve(&args(&[flag, "--bind", "b"]), no_env).expect("resolve"));
-            assert_eq!(config.ui, want, "{flag}");
-            assert_eq!(config.bind, "b", "{flag}");
-        }
-    }
-
-    #[test]
-    fn the_ui_env_var_applies_and_the_flags_win_over_it() {
-        let env = env_map(&[("IGNIS_UI", "false")]);
-        assert!(!expect_config(resolve(&[], env).expect("resolve")).ui);
-        let env = env_map(&[("IGNIS_UI", "off")]);
-        assert!(expect_config(resolve(&args(&["--ui"]), env).expect("resolve")).ui);
-        let env = env_map(&[("IGNIS_UI", "true")]);
-        assert!(!expect_config(resolve(&args(&["--no-ui"]), env).expect("resolve")).ui);
-
-        let env = env_map(&[("IGNIS_UI", "maybe")]);
-        let err = resolve(&[], env).expect_err("not a boolean");
-        assert!(err.0.contains("IGNIS_UI"), "{}", err.0);
-    }
-
-    // ── fetching a missing model (GitHub #234) ───────────────────────────
-
-    #[test]
-    fn model_downloads_are_on_by_default_and_land_in_models() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert!(config.model_download);
-        assert_eq!(
-            config.model_download_path,
-            PathBuf::from(DEFAULT_MODEL_DOWNLOAD_PATH)
-        );
-    }
-
-    #[test]
-    fn both_model_download_flags_are_bare_switches() {
-        // The next argument is a flag of its own, not a value.
-        for (flag, want) in [("--model-download", true), ("--no-model-download", false)] {
-            let config =
-                expect_config(resolve(&args(&[flag, "--bind", "b"]), no_env).expect("resolve"));
-            assert_eq!(config.model_download, want, "{flag}");
-            assert_eq!(config.bind, "b", "{flag}");
-        }
-    }
-
-    #[test]
-    fn the_model_download_env_vars_apply_and_the_flags_win_over_them() {
-        let env = env_map(&[
-            ("IGNIS_MODEL_DOWNLOAD", "false"),
-            ("IGNIS_MODEL_DOWNLOAD_PATH", "/srv/models"),
-        ]);
-        let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert!(!config.model_download);
-        assert_eq!(config.model_download_path, PathBuf::from("/srv/models"));
-
-        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD", "off")]);
-        assert!(expect_config(resolve(&args(&["--model-download"]), env).expect("resolve")).model_download);
-        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD", "on")]);
-        assert!(
-            !expect_config(resolve(&args(&["--no-model-download"]), env).expect("resolve"))
-                .model_download
-        );
-        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD_PATH", "/srv/models")]);
-        assert_eq!(
-            expect_config(
-                resolve(&args(&["--model-download-path", "D:/weights"]), env).expect("resolve")
-            )
-            .model_download_path,
-            PathBuf::from("D:/weights")
-        );
-
-        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD", "maybe")]);
-        let err = resolve(&[], env).expect_err("not a boolean");
-        assert!(err.0.contains("IGNIS_MODEL_DOWNLOAD"), "{}", err.0);
-    }
-
-    #[test]
-    fn an_empty_model_download_path_is_the_default_not_the_working_directory() {
-        // An unset-looking env var (`IGNIS_MODEL_DOWNLOAD_PATH=`) must not
-        // turn the destination into `.`, where a 19 GB file would land
-        // wherever the server happened to be started from.
-        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD_PATH", "")]);
-        assert_eq!(
-            expect_config(resolve(&[], env).expect("resolve")).model_download_path,
-            PathBuf::from(DEFAULT_MODEL_DOWNLOAD_PATH)
-        );
-    }
-
-    #[test]
-    fn help_lists_both_model_download_flags() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--no-model-download"), "{text}");
-        assert!(text.contains("--model-download-path"), "{text}");
-    }
-
-    #[test]
-    fn help_lists_the_ui_flag() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--ui"), "{text}");
-    }
-
-    // ── Prometheus metrics (GitHub #89, ADR 0017) ────────────────────────
-
-    #[test]
-    fn metrics_are_off_by_default_and_on_their_own_listener_with_metrics() {
-        assert_eq!(expect_config(resolve(&[], no_env).expect("resolve")).metrics, None);
-        assert_eq!(
-            expect_config(resolve(&args(&["--metrics"]), no_env).expect("resolve")).metrics,
-            Some(DEFAULT_METRICS_BIND.to_owned())
-        );
-        assert_ne!(DEFAULT_METRICS_BIND, DEFAULT_BIND);
-    }
-
-    #[test]
-    fn metrics_bind_moves_the_metrics_listener_in_either_order() {
-        for argv in [
-            ["--metrics", "--metrics-bind", "127.0.0.1:9100"],
-            ["--metrics-bind", "127.0.0.1:9100", "--metrics"],
-        ] {
-            let config = expect_config(resolve(&args(&argv), no_env).expect("resolve"));
-            assert_eq!(config.metrics.as_deref(), Some("127.0.0.1:9100"), "{argv:?}");
-        }
-    }
-
-    #[test]
-    fn metrics_bind_without_metrics_or_value_or_on_the_api_address_is_refused() {
-        let err = resolve(&args(&["--metrics-bind", "127.0.0.1:9100"]), no_env).unwrap_err();
-        assert!(err.0.contains("--metrics"), "{err}");
-        assert!(resolve(&args(&["--metrics", "--metrics-bind"]), no_env).is_err());
-        let err = resolve(
-            &args(&["--metrics", "--bind", "127.0.0.1:7000", "--metrics-bind", "127.0.0.1:7000"]),
-            no_env,
-        )
-        .unwrap_err();
-        assert!(err.0.contains("--bind"), "{err}");
-    }
-
-    #[test]
-    fn metrics_is_a_bare_flag_with_no_env_var_and_no_alias() {
-        // A bare switch: the next argument is parsed as a flag of its own.
-        let config =
-            expect_config(resolve(&args(&["--metrics", "--bind", "b"]), no_env).expect("resolve"));
-        assert!(config.metrics.is_some());
-        assert_eq!(config.bind, "b");
-
-        for name in ["IGNIS_METRICS", "IGNIS_PROMETHEUS", "IGNIS_METRICS_BIND"] {
-            let env = move |key: &str| (key == name).then(|| "127.0.0.1:9100".to_owned());
-            assert_eq!(expect_config(resolve(&[], env).expect("resolve")).metrics, None, "{name}");
-        }
-        for alias in ["-M", "--prometheus", "--metrics=true"] {
-            assert!(resolve(&args(&[alias]), no_env).is_err(), "`{alias}` is not a metrics alias");
-        }
-    }
-
-    #[test]
-    fn help_lists_the_metrics_flags() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--metrics ") && text.contains("--metrics-bind"), "{text}");
-    }
-
-    // ── the API key ──────────────────────────────────────────────────────
-
-    #[test]
-    fn the_api_key_is_unset_by_default_and_an_empty_value_stays_unset() {
-        assert_eq!(expect_config(resolve(&[], no_env).expect("resolve")).api_key, None);
-        let env = env_map(&[("IGNIS_API_KEY", "")]);
-        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).api_key, None);
-    }
-
-    #[test]
-    fn the_api_key_resolves_flag_over_env() {
-        let env = env_map(&[("IGNIS_API_KEY", "from-env")]);
-        let config = expect_config(resolve(&[], &env).expect("resolve"));
-        assert_eq!(config.api_key, Some(ApiKeySetting::Fixed(ApiKey::new("from-env"))));
-
-        let config = expect_config(resolve(&args(&["--api-key", "from-flag"]), &env).expect("resolve"));
-        assert_eq!(
-            config.api_key,
-            Some(ApiKeySetting::Fixed(ApiKey::new("from-flag"))),
-            "flag must win over env"
-        );
-    }
-
-    #[test]
-    fn auto_asks_for_a_generated_key_from_the_flag_or_the_env() {
-        let config = expect_config(resolve(&args(&["--api-key", "auto"]), no_env).expect("resolve"));
-        assert_eq!(config.api_key, Some(ApiKeySetting::Generate));
-        let env = env_map(&[("IGNIS_API_KEY", "auto")]);
-        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).api_key, Some(ApiKeySetting::Generate));
-    }
-
-    #[test]
-    fn a_generated_key_is_fresh_and_long() {
-        let a = ApiKey::generate().expect("random source");
-        let b = ApiKey::generate().expect("random source");
-        assert_ne!(a, b);
-        let hex = a.as_str().strip_prefix("sk-ignis-").expect("prefix");
-        assert_eq!(hex.len(), 64);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{hex}");
-    }
-
-    #[test]
-    fn an_api_key_matches_only_itself_and_never_prints() {
-        let key = ApiKey::new("sk-secret");
-        assert!(key.matches("sk-secret"));
-        for other in ["", "sk-secre", "sk-secret!", "sk-Secret"] {
-            assert!(!key.matches(other), "{other:?}");
-        }
-        let config = expect_config(resolve(&args(&["--api-key", "sk-secret"]), no_env).expect("resolve"));
-        assert!(!format!("{config:?}").contains("sk-secret"));
-    }
-
-    #[test]
-    fn help_lists_the_api_key_flag() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--api-key") && text.contains("IGNIS_API_KEY"), "{text}");
-    }
-
-    // ── exposure (ADR 0028) ──────────────────────────────────────────────
-
-    #[test]
-    fn nothing_is_exposed_by_default() {
-        let config = expect_config(resolve(&[], no_env).expect("resolve"));
-        assert_eq!(config.expose, None);
-        assert_eq!(config.api_key, None, "no exposure, no forced key");
-    }
-
-    #[test]
-    fn expose_resolves_flag_over_env() {
-        let config =
-            expect_config(resolve(&args(&["--expose", "cloudflare-quick"]), no_env).expect("resolve"));
-        assert_eq!(config.expose, Some(Expose::CloudflareQuick));
-
-        let env = env_map(&[("IGNIS_EXPOSE", "cloudflare-quick")]);
-        assert_eq!(expect_config(resolve(&[], &env).expect("resolve")).expose, Some(Expose::CloudflareQuick));
-        let err = resolve(&args(&["--expose", "nope"]), &env).expect_err("the flag wins, and is checked");
-        assert!(err.0.contains("nope"), "{err}");
-    }
-
-    #[test]
-    fn an_unknown_expose_mode_is_a_usage_error() {
-        let err = resolve(&args(&["--expose", "ngrok"]), no_env).expect_err("unknown mode");
-        assert!(err.0.contains("--expose") && err.0.contains("ngrok"), "{err}");
-        assert!(err.0.contains("cloudflare-quick"), "{err}");
-    }
-
-    #[test]
-    fn exposing_without_a_key_generates_one() {
-        let config =
-            expect_config(resolve(&args(&["--expose", "cloudflare-quick"]), no_env).expect("resolve"));
-        assert_eq!(config.api_key, Some(ApiKeySetting::Generate));
-        // An empty key is no key.
-        let env = env_map(&[("IGNIS_API_KEY", ""), ("IGNIS_EXPOSE", "cloudflare-quick")]);
-        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).api_key, Some(ApiKeySetting::Generate));
-    }
-
-    #[test]
-    fn exposing_keeps_the_key_the_operator_chose() {
-        let a = args(&["--expose", "cloudflare-quick", "--api-key", "sk-mine"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(config.api_key, Some(ApiKeySetting::Fixed(ApiKey::new("sk-mine"))));
-
-        let env = env_map(&[("IGNIS_API_KEY", "sk-env")]);
-        let config = expect_config(resolve(&args(&["--expose", "cloudflare-quick"]), env).expect("resolve"));
-        assert_eq!(config.api_key, Some(ApiKeySetting::Fixed(ApiKey::new("sk-env"))));
-    }
-
-    #[test]
-    fn help_lists_the_expose_flag() {
-        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
-        else {
-            panic!("expected Help");
-        };
-        assert!(text.contains("--expose") && text.contains("cloudflare-quick"), "{text}");
-    }
+    text.push_str("\n    -h, --help        print this help and exit\n    -V, --version     print the version and exit\n");
+    text
 }

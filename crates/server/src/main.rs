@@ -12,7 +12,7 @@
 //! (`template.rs`): v1 ships a deterministic built-in provider,
 //! artifact-02's artifact-backed tokenizer replaces it through the same
 //! constructor injection. The compute backend is injected through the
-//! scheduler: with `IGNIS_ARTIFACT` set and the binary built with
+//! scheduler: with `IGNIS_MODEL_ARTIFACT` set and the binary built with
 //! `--features cuda`, the entrypoint drives the real GPU-backed model
 //! (`ignis_server::runtime::cuda_scheduler`, GitHub #61 / P1-25); without
 //! either, it drives the deterministic `MockCompute` (CPU-only, ADR 0006).
@@ -20,75 +20,75 @@
 //! Configuration (CLI flags mirror each env var one-to-one — GitHub #77;
 //! run `ignis-server --help` for the full flag table. A flag overrides its
 //! env var, which overrides the built-in default):
-//! - `IGNIS_MODEL` / `--model`, `-m` — the loaded model id (default
+//! - `IGNIS_MODEL_ID` / `--model-id`, `-m` — the loaded model id (default
 //!   `qwen3.8-27b`; what `GET /v1/models` reports and what submissions must
 //!   name).
-//! - `IGNIS_BIND` / `--bind`, `-b` — the bind address (default
+//! - `IGNIS_SERVER_BIND` / `--server-bind`, `-b` — the bind address (default
 //!   `127.0.0.1:8000`; localhost-only by design — no network exposure, no
 //!   auth, v1).
-//! - `IGNIS_ARTIFACT` / `--artifact`, `-a` — the `.ninfer` container path
+//! - `IGNIS_MODEL_ARTIFACT` / `--model-artifact`, `-a` — the `.ninfer` container path
 //!   (the real tokenizer and chat template, artifact-02). A configured
 //!   artifact is loaded through the verified loader path (server-03): it
 //!   must exist, its sidecar must be present and its checksum report clean,
 //!   or the server refuses to start (no silent fallback to the placeholder).
-//!   Unset, the model is looked for under `--model-download-path` and
+//!   Unset, the model is looked for under `--download-path` and
 //!   fetched when it is not there (below).
-//! - `IGNIS_MODEL_DOWNLOAD` / `--model-download` / `--no-model-download` —
+//! - `IGNIS_DOWNLOAD_ENABLED` / `--download-enabled` / `--download-enabled false` —
 //!   may a missing model be fetched (ADR 0033, GitHub #234)? On by default,
-//!   and only ever consulted with `--artifact` unset. On a terminal the
+//!   and only ever consulted with `--model-artifact` unset. On a terminal the
 //!   operator is asked first; without one (a container, a daemon) it
 //!   downloads, since there is nobody to answer. A build without
 //!   `--features cuda` never downloads: it could not run the weights.
 //!   Off, or a model the registry does not know, is the built-in
 //!   placeholder template (its rendered `content` is not natural text).
-//! - `IGNIS_MODEL_DOWNLOAD_PATH` / `--model-download-path` — where a fetched
+//! - `IGNIS_DOWNLOAD_PATH` / `--download-path` — where a fetched
 //!   model lands, and where one fetched earlier is found (default
 //!   `./models`). Flat: the artifact and its sidecar keep the names the
 //!   repo publishes them under, so `hf download … --local-dir models` and
 //!   this produce the same file.
-//! - `IGNIS_ENABLE_THINKING` / `--enable-thinking` — the server-wide default
+//! - `IGNIS_MODEL_ENABLE_THINKING` / `--model-enable-thinking` — the server-wide default
 //!   for `enable_thinking` (GitHub #68); `true` or `false`, default `true`.
 //!   An unparseable value, or a `false` the loaded template cannot honour,
 //!   refuses to start.
-//! - `IGNIS_PREFILL_CHUNK` / `--prefill-chunk` — the prefill chunk width
+//! - `IGNIS_MODEL_PREFILL_CHUNK` / `--model-prefill-chunk` — the prefill chunk width
 //!   in tokens (default 1024; a nonzero multiple of 128 — the reference's
 //!   own alignment rule). GitHub #87.
-//! - `IGNIS_MAX_CONTEXT` / `--max-context` — the maximum per-sequence
+//! - `IGNIS_MODEL_MAX_CONTEXT` / `--model-max-context` — the maximum per-sequence
 //!   context in tokens (default 40960: a 32K prompt plus an 8K generation
 //!   budget, so G2's largest cell is admissible without editing code). The
 //!   paged-KV pool the leaf builds is derived from this value (never
 //!   below it, so admission can never promise more pages than the leaf
 //!   built) rather than being an independent flag.
-//! - `IGNIS_REASONING_EFFORT` / `--reasoning-effort` — the server-wide
+//! - `IGNIS_MODEL_REASONING_EFFORT` / `--model-reasoning-effort` — the server-wide
 //!   default `reasoning_effort`; unset means "let the template's own
 //!   default apply". An unknown value, or one the loaded template does not
 //!   support, refuses to start.
-//! - `IGNIS_THINKING_BUDGET` / `--thinking-budget` — the server-wide
+//! - `IGNIS_MODEL_THINKING_BUDGET` / `--model-thinking-budget` — the server-wide
 //!   thinking budget, in reasoning tokens (default 32768, `off` for none;
 //!   spec server/08). Configured with a tokenizer that yields no thinking
 //!   close, it refuses to start.
-//! - `IGNIS_REQUEST_TIMEOUT` / `--request-timeout` — how long a
+//! - `IGNIS_SERVER_REQUEST_TIMEOUT` / `--server-request-timeout` — how long a
 //!   non-streaming completion waits before the handler gives up with a
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
-//! - `--ui` / `--no-ui` / `IGNIS_UI` — serve the Playground at `/ui/`
+//! - `--server-ui` / `--server-ui false` / `IGNIS_SERVER_UI` — serve the Playground at `/ui/`
 //!   (GitHub #163, ADR 0026); **on** by default. A binary built without
 //!   `web/dist` serves the page that says how to build it, so the default
 //!   costs a route and nothing else.
-//! - `--metrics` / `--metrics-bind <addr>` (flags only, no env var) — serve
+//! - `--server-metrics` / `--server-metrics-bind <addr>` (flags only, no env var) — serve
 //!   Prometheus metrics at `GET /metrics` on their own listener (default
 //!   `127.0.0.1:9464`, no API key, never exposed), and at `/ui/metrics`
-//!   unless `--no-ui`, under the API key when one is set (GitHub #89, ADR
+//!   unless `--server-ui false`, under the API key when one is set (GitHub #89, ADR
 //!   0017). Off by default, and off means neither the routes nor the
 //!   projection exist.
-//! - `IGNIS_API_KEY` / `--api-key` — when set, every `/v1` request must
+//! - `IGNIS_SERVER_API_KEY` / `--server-api-key` — when set, every `/v1` request must
 //!   send `Authorization: Bearer <key>` or gets a `401`; unset (default)
 //!   leaves the API open. `auto` generates a key at start and prints it to
 //!   stdout — the only case a key is ever printed.
-//! - `IGNIS_EXPOSE` / `--expose` — make the server reachable from outside
+//! - `IGNIS_SERVER_EXPOSE` / `--server-expose` — make the server reachable from outside
 //!   this machine (ADR 0028). `cloudflare-quick` opens a Cloudflare quick
 //!   tunnel once the listener is bound and prints its public URL on stdout.
 //!   An exposed server always requires an API key: with none set, it
-//!   behaves as `--api-key auto`.
+//!   behaves as `--server-api-key auto`.
 
 use std::sync::Arc;
 
@@ -274,13 +274,12 @@ async fn main() {
             exit_after_flush(&logging_handle, 1);
         }
     };
-    // The engine shape (GitHub #87) — already validated by `config::resolve`
-    // above, so nothing below this point can fail on an unaligned chunk
-    // width or a pool that cannot serve the configured context.
-    #[cfg(feature = "cuda")]
-    let engine_shape = ignis_server::runtime::EngineShape::from(&config);
-    // What the loaded model's family is checked against once the artifact
-    // names it (`config::served_model_for`, spec flash-next/04).
+    // What the loaded model's family fits once the artifact names it
+    // (`Config::for_family`, spec flash-next/04 and config-v2/01): every
+    // load-shape value below is read from that fitted config, so a value
+    // scoped to the artifact's family (`--qwen38flashnext-…`) is the one the
+    // load runs with. The fields destructured here are the server's own,
+    // which no family changes.
     let start_options = config.clone();
     let Config {
         model,
@@ -289,26 +288,24 @@ async fn main() {
         artifact,
         model_download,
         model_download_path,
-        ngram_cache,
-        // GitHub #306: read through `EngineShape`, like the other load-shape
-        // knobs.
+        // The load's shape: read from the fitted config, through
+        // `EngineShape` and the loader.
+        ngram_cache: _,
         ngram_hot_bytes: _,
-        // Spec vram-budget/03: the budget through `EngineShape`, the
-        // location handed to the loader.
         kv_disk_bytes: _,
-        kv_disk_location,
-        enable_thinking: default_enable_thinking,
-        reasoning_effort: default_reasoning_effort,
-        thinking_budget: default_thinking_budget,
+        kv_disk_location: _,
+        enable_thinking: _,
+        reasoning_effort: _,
+        thinking_budget: _,
         prefill_chunk: _,
         decode_share_percent: _,
-        max_context,
-        default_max_tokens,
+        max_context: _,
+        default_max_tokens: _,
         kv_format: _,
         kv_pool: _,
         vram: _,
         allow_expert_cache_below_floor: _,
-        host_pool_bytes,
+        host_pool_bytes: _,
         prompt_reuse: _,
         retained_device_slots: _,
         retained_host_slots: _,
@@ -319,19 +316,21 @@ async fn main() {
         speculation_off: _,
         draft_rows: _,
         decode_lanes: _,
-        vision,
-        // GitHub #227: read through `EngineShape` above, like the other
-        // load-shape knobs.
+        vision: _,
         rope_scaling: _,
-        media,
+        media: _,
         request_timeout_secs,
+        // The model switch's knobs (spec model-switch/01): nothing in this
+        // binary switches models yet.
+        switch_drain_timeout_secs: _,
+        allow_model_switch: _,
+        known_models: _,
         ui,
         metrics,
         api_key,
         expose,
+        basis: _,
     } = config;
-    #[cfg(not(feature = "cuda"))]
-    let _ = (ngram_cache, kv_disk_location);
     let api_key = match api_key {
         None => None,
         Some(ignis_server::config::ApiKeySetting::Fixed(key)) => Some(key),
@@ -352,7 +351,7 @@ async fn main() {
     };
 
     // Where the artifact comes from (GitHub #234, ADR 0033): the path the
-    // operator named, one already under `--model-download-path`, one fetched
+    // operator named, one already under `--download-path`, one fetched
     // now, or none at all — which is the placeholder start this server has
     // always had, with a line saying which of the reasons it was.
     let source = download::artifact_source(
@@ -415,9 +414,9 @@ async fn main() {
     // `mut` only under `cuda`: the placeholder path never assigns it.
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     let mut load_reservations: Option<ignis_server::metrics::LoadReservations> = None;
-    let server = if let Some(artifact_path) = &artifact {
+    let (server, loaded) = if let Some(artifact_path) = &artifact {
         // The loader path (server-03, GitHub #21): the `.ninfer` container
-        // named by `--artifact`/`IGNIS_ARTIFACT` is loaded through the
+        // named by `--model-artifact`/`IGNIS_MODEL_ARTIFACT` is loaded through the
         // verified loader — open the reader, load the sidecar (ADR 0002),
         // verify the checksum report, and only then extract the frontend
         // set. A missing sidecar or a report that is not clean is a load
@@ -433,7 +432,7 @@ async fn main() {
                 name: "ignis.artifact.missing",
                 artifact = %artifact_path.display(),
                 model = %model,
-                "no such file — refusing to start; drop --artifact/IGNIS_ARTIFACT to fetch the model into --model-download-path instead"
+                "no such file — refusing to start; drop --model-artifact/IGNIS_MODEL_ARTIFACT to fetch the model into --download-path instead"
             );
             exit_after_flush(&logging_handle, 1);
         }
@@ -485,13 +484,14 @@ async fn main() {
                 exit_after_flush(&logging_handle, 1);
             }
         };
-        let model = match config::served_model_for(&start_options, family) {
-            Ok(model) => model,
+        let loaded = match start_options.for_family(family) {
+            Ok(loaded) => loaded,
             Err(err) => {
                 tracing::error!(name: "ignis.config.model_mismatch", error = %err, "refusing to start");
                 exit_after_flush(&logging_handle, 1);
             }
         };
+        let model = loaded.model.clone();
 
         // The thinking budget's forced close (2026-09-24), in this model's
         // own tokens. A tokenizer that splits `</think>` leaves every budget
@@ -502,7 +502,7 @@ async fn main() {
         let thinking_close = thinking::thinking_close(|text| {
             frontend.tokenizer().encode(text).map_err(|e| e.to_string())
         });
-        if let Err(err) = thinking::check_default_budget_close(default_thinking_budget, &thinking_close) {
+        if let Err(err) = thinking::check_default_budget_close(loaded.thinking_budget, &thinking_close) {
             tracing::error!(name: "ignis.config.thinking_budget_inert", error = %err, "refusing to start");
             exit_after_flush(&logging_handle, 1);
         }
@@ -517,12 +517,12 @@ async fn main() {
         #[cfg(not(feature = "cuda"))]
         let _ = thinking_close;
 
-        // GitHub #179: a `--vision` load prepares images with the artifact's
+        // GitHub #179: a `--vision-enabled` load prepares images with the artifact's
         // processor and acquires them before admission. A tokenizer whose
         // placeholder ids are not the model contract's is a refused start.
         // Built before the load, which sizes the encoder for the processor's
         // item bound.
-        let processor = match vision.map(|v| ignis_server::media::load_processor(&frontend, v, max_context)) {
+        let processor = match loaded.vision.map(|v| ignis_server::media::load_processor(&frontend, v, loaded.max_context)) {
             None => None,
             Some(Ok(processor)) => Some(processor),
             Some(Err(err)) => {
@@ -534,17 +534,20 @@ async fn main() {
         #[cfg(feature = "cuda")]
         let scheduler = {
             let item_bound = processor.as_ref().map(|p| p.options().max_item_tokens());
+            // The engine shape (GitHub #87), already validated by the
+            // fit above, so nothing below can fail on an unaligned chunk
+            // width or a pool that cannot serve the configured context.
             let (scheduler, reserved) = cuda_scheduler(
                 artifact_path,
                 &model,
                 family,
                 &frontend,
-                engine_shape,
+                ignis_server::runtime::EngineShape::from(&loaded),
                 item_bound,
                 thinking_close,
                 &logging_handle,
-                ngram_cache,
-                &kv_disk_location,
+                loaded.ngram_cache.clone(),
+                &loaded.kv_disk_location,
             );
             // GitHub #216: what the plan reserved leaves the load here, so
             // the exposition can name it. The placeholder path below builds
@@ -556,9 +559,9 @@ async fn main() {
         let scheduler = {
             tracing::warn!(
                 name: "ignis.model.mock_compute",
-                "built without --features cuda — MockCompute despite --artifact/IGNIS_ARTIFACT (the templated text is real, the completions are not)"
+                "built without --features cuda — MockCompute despite --model-artifact/IGNIS_MODEL_ARTIFACT (the templated text is real, the completions are not)"
             );
-            mock_scheduler(&model, default_max_tokens)
+            mock_scheduler(&model, loaded.default_max_tokens)
         };
 
         let engine = Engine::with_clock(scheduler, Arc::new(SystemClock));
@@ -566,6 +569,7 @@ async fn main() {
         let server = match processor {
             None => Server::new(engine, Box::new(provider)),
             Some(processor) => {
+                let media = loaded.media;
                 let acquirer = ignis_server::media::MediaAcquirer::new(
                     Arc::new(processor.clone()),
                     processor.options().clone(),
@@ -575,15 +579,17 @@ async fn main() {
             }
         };
         // GitHub #129: a loaded model is ready only after its first traversal.
-        server.with_family(family).with_warm_up()
+        (server.with_family(family).with_warm_up(), loaded)
     } else {
         // Why there is no artifact was said once, with its reason, where the
         // decision was made (`ignis.model.placeholder_template` above).
-        let engine = Engine::with_clock(mock_scheduler(&model, default_max_tokens), Arc::new(SystemClock));
-        Server::new(engine, Box::new(SimpleTemplateProvider))
-    }
-    .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
-    .with_instruction_policy(instruction_policy);
+        let engine =
+            Engine::with_clock(mock_scheduler(&model, start_options.default_max_tokens), Arc::new(SystemClock));
+        (Server::new(engine, Box::new(SimpleTemplateProvider)), start_options)
+    };
+    let server = server
+        .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
+        .with_instruction_policy(instruction_policy);
 
     // GitHub #209: joining or gathering developer messages trades prefix
     // reuse for fewer system blocks; the operator is told once, at start.
@@ -599,7 +605,7 @@ async fn main() {
     // whether a `box` can be asked for `head`, said once at load and before
     // the first request. The heads are keyed to the artifact's content hash,
     // so a load nobody calibrated says "chain" here instead of being found
-    // out from its answers — and a load without `--vision` says neither,
+    // out from its answers — and a load without `--vision-enabled` says neither,
     // since it takes no image to point on.
     let methods = ignis_server::decide::load_methods(server.calibration, server.media.is_some());
     tracing::info!(
@@ -639,6 +645,8 @@ async fn main() {
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the
     // server already treats a missing EOS token or an unclean checksum.
+    let (default_enable_thinking, default_reasoning_effort, default_thinking_budget) =
+        (loaded.enable_thinking, loaded.reasoning_effort, loaded.thinking_budget);
     let thinking_defaults = ThinkingDefaults {
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
@@ -659,14 +667,14 @@ async fn main() {
         if ignis_server::playground::EMBEDDED.is_empty() {
             tracing::warn!(
                 name: "ignis.playground.not_built",
-                "--ui set but this binary was built without web/dist — /ui/ serves the build instructions"
+                "--server-ui set but this binary was built without web/dist — /ui/ serves the build instructions"
             );
         }
         server.with_playground(ignis_server::playground::EMBEDDED)
     } else {
         server
     };
-    // Prometheus metrics (GitHub #89, ADR 0017): without `--metrics`, neither
+    // Prometheus metrics (GitHub #89, ADR 0017): without `--server-metrics`, neither
     // the projection nor any route to it exists.
     let server = if metrics.is_some() { server.with_metrics() } else { server };
     let server = match load_reservations {
@@ -691,7 +699,7 @@ async fn main() {
     };
 
     // The metrics listener (ADR 0017): its own address, bound before serving
-    // like the API's, and never the one `--expose` tunnels.
+    // like the API's, and never the one `--server-expose` tunnels.
     let metrics_listener = match &metrics {
         None => None,
         Some(metrics_bind) => match tokio::net::TcpListener::bind(metrics_bind).await {
@@ -703,7 +711,7 @@ async fn main() {
         },
     };
 
-    // `--expose` (ADR 0028): opened on the bound port, before serving, so a
+    // `--server-expose` (ADR 0028): opened on the bound port, before serving, so a
     // tunnel that cannot open refuses the start instead of leaving a server
     // the operator believes is reachable.
     let exposure = match expose {
@@ -746,14 +754,14 @@ async fn main() {
     tracing::info!(
         name: "ignis.process.started",
         // The id the load is served under (`config::served_model_for`): a
-        // Flash-Next artifact started without `--model` is its own.
+        // Flash-Next artifact started without `--model-id` is its own.
         model = %server.engine.model_id(),
         bind = %bind,
         api_key_required = auth,
         metrics = metrics.as_deref().unwrap_or("off"),
         // GitHub #216: the pinned host arena is locked in RAM from start
         // (ADR 0030), and until now no line anywhere said how large it is.
-        kv_host_pool_bytes = host_pool_bytes,
+        kv_host_pool_bytes = loaded.host_pool_bytes,
         exposed = exposure.as_ref().map_or("no", |_| "yes"),
         "OpenAI API at /v1"
     );

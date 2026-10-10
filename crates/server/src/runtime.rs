@@ -1364,7 +1364,7 @@ mod tests {
             };
             EngineShape::from(&config)
         };
-        for (flags, cap) in [(&[][..], 38_912), (&["--default-max-tokens", "8192"][..], 8_192), (&["--default-max-tokens", "0"][..], 0)] {
+        for (flags, cap) in [(&[][..], 38_912), (&["--model-default-max-tokens", "8192"][..], 8_192), (&["--model-default-max-tokens", "0"][..], 0)] {
             let shape = shape_of(flags);
             let flash = shape.for_family(ModelFamily::FlashNext);
             let qwen = shape.with_family_decode_share(ModelFamily::Qwen38_27b);
@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn prompt_reuse_off_reaches_the_scheduler_config() {
         let crate::config::ConfigOutcome::Config(off) =
-            crate::config::resolve(&["--prompt-reuse".to_owned(), "off".to_owned()], |_| None)
+            crate::config::resolve(&["--reuse-prompt".to_owned(), "off".to_owned()], |_| None)
                 .expect("resolve")
         else {
             panic!("expected a runnable config");
