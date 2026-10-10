@@ -82,6 +82,8 @@ fn the_document_lists_exactly_the_v1_surface() {
     // was removed.
     let expected: BTreeSet<String> = [
         "get /v1/models",
+        // Spec model-switch/01: replace the loaded model.
+        "post /v1/models/switch",
         "post /v1/chat/completions",
         // GitHub #285: the prompt counted without being served.
         "post /v1/tokenize",

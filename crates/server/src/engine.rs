@@ -3,8 +3,10 @@
 //!
 //! Concurrency model (v2, GitHub #69 — replaces the shared-mutex v1):
 //! - **The model thread** — a single, dedicated `std::thread`, spawned once
-//!   when the [`Engine`] is constructed and living for the server's whole
-//!   life, owns the [`Scheduler`] and the per-request route table
+//!   when the [`Engine`] is constructed and living until the model it runs
+//!   is replaced ([`Engine::shutdown`], the model switch — spec
+//!   model-switch/01) or the process exits, owns the [`Scheduler`] and the
+//!   per-request route table
 //!   (`streams`) as plain, unshared, thread-owned state. Nothing outside
 //!   this thread ever touches either — no `Arc<Mutex<..>>` around them, so
 //!   nothing on the async/HTTP side can ever contend a lock with a GPU-bound
@@ -14,9 +16,10 @@
 //!   reply. The model thread drains every queued command *before* each
 //!   `advance()`, so command latency is bounded by "at most one decode
 //!   step," not by however long the current generation runs.
-//! - **`model_id`** — immutable for the server's life, captured once at
+//! - **`model_id`** — immutable for the engine's life, captured once at
 //!   construction and read lock-free off the `Engine` handle; it never
-//!   touches the model thread.
+//!   touches the model thread. A model switch replaces the whole engine,
+//!   never its id.
 //! - **Telemetry** — the model thread only ever pushes lightweight facts
 //!   (a routed event, a submission notice, a per-step tick) onto an
 //!   unbounded channel; a separate async task owns the [`Telemetry`] value
@@ -85,6 +88,10 @@ enum Command {
     EndFanOut {
         owner: ignis_core::types::FanOutId,
     },
+    /// Stop the model thread now, whoever still holds an [`Engine`] handle
+    /// (spec model-switch/01): every request still routed ends with an
+    /// error, and the thread returns, dropping the scheduler.
+    Shutdown,
 }
 
 /// A message on the telemetry consumer's inbox. The model thread only ever
@@ -135,11 +142,13 @@ pub struct RequestNotes {
 }
 
 /// The server-side engine: a cheap, cloneable handle onto the model thread
-/// (GitHub #69) that owns the core [`Scheduler`] exclusively for the
-/// server's whole life.
+/// (GitHub #69) that owns the core [`Scheduler`] exclusively for the life of
+/// the loaded model — the server's, until a model switch replaces the engine
+/// whole (spec model-switch/01).
 pub struct Engine {
-    /// The loaded model id — immutable for the server's life, so it is
-    /// captured once here instead of crossing the command channel.
+    /// The loaded model id — immutable for the engine's life (a model switch
+    /// builds a new engine), so it is captured once here instead of crossing
+    /// the command channel.
     model_id: String,
     /// The scheduler's per-sequence context, captured the same way.
     max_model_len: u32,
@@ -189,16 +198,19 @@ impl Engine {
     }
 
     /// Same as [`Engine::with_clock`], but also returns the model thread's
-    /// [`std::thread::JoinHandle`] (GitHub #71). Production (`main.rs`)
-    /// never needs it — the process exits with the thread still running.
+    /// [`std::thread::JoinHandle`] (GitHub #71). Production keeps it on the
+    /// [`crate::ActiveModel`] since the model switch (spec model-switch/01):
+    /// a switch has to know the old scheduler is gone before the next load
+    /// pins its own KV-RAM arena.
     /// A caller that needs the scheduler's GPU-resident state (weights, KV
-    /// cache) fully released before proceeding — e.g. between GPU
-    /// integration tests sharing one process — must: drop every clone of
-    /// the returned `Engine` (so the command channel disconnects and
-    /// `model_thread_loop` returns), then join the handle. Joining blocks
-    /// until the model thread has actually exited and dropped the
-    /// `Scheduler` it owned, so the next caller never races the GPU
-    /// teardown of the previous one.
+    /// cache) fully released before proceeding — a switch, or between GPU
+    /// integration tests sharing one process — must stop the model thread
+    /// (drop every clone of the returned `Engine` so the command channel
+    /// disconnects, or call [`Engine::shutdown`] when clones it cannot reach
+    /// are still alive), then join the handle. Joining blocks until the
+    /// model thread has actually exited and dropped the `Scheduler` it
+    /// owned, so the next caller never races the GPU teardown of the
+    /// previous one.
     pub fn with_clock_and_driver(
         scheduler: Box<dyn Scheduler>,
         clock: Arc<dyn TelemetryClock>,
@@ -262,7 +274,7 @@ impl Engine {
     }
 
     /// The loaded model id (for `GET /v1/models`) — immutable for the
-    /// server's life, read lock-free off this handle (never touches the
+    /// engine's life, read lock-free off this handle (never touches the
     /// model thread).
     pub fn model_id(&self) -> String {
         self.model_id.clone()
@@ -320,6 +332,12 @@ impl Engine {
 
     /// [`Engine::submit`] with what the request log says about the request
     /// beyond its input.
+    ///
+    /// An engine whose model thread has shut down ([`Engine::shutdown`], a
+    /// model switch) answers [`SubmitError::Full`]: "not now", the 503 a
+    /// client retries — by then the switch's gate, or the next model,
+    /// answers it. A request that reached the handler before the switch and
+    /// submits after the old model is gone is the one that sees this.
     pub async fn submit_with_notes(
         &self,
         input: RequestInput,
@@ -327,24 +345,41 @@ impl Engine {
         notes: RequestNotes,
     ) -> Result<(RequestId, EventStream), SubmitError> {
         let (reply, reply_rx) = oneshot::channel();
-        self.commands
-            .send(Command::Submit { input, class, notes, reply })
-            .expect("the model thread outlives every Engine handle");
-        reply_rx
-            .await
-            .expect("the model thread replies to every submit before it can exit")
+        if self.commands.send(Command::Submit { input, class, notes, reply }).is_err() {
+            return Err(SubmitError::Full);
+        }
+        // A dropped reply is a submit the thread never handled: it shut down
+        // with the command still queued.
+        reply_rx.await.unwrap_or(Err(SubmitError::Full))
     }
 
     /// Whether the scheduler would refuse `input` for good — unknown model,
     /// past the context, larger than the pool — whatever is in flight
     /// (GitHub #282): what a submission that met [`SubmitError::Full`] asks
-    /// before it waits, since the scheduler answers `Full` first.
+    /// before it waits, since the scheduler answers `Full` first. A shut-down
+    /// engine refuses nothing for good: its `Full` is the switch's, not the
+    /// request's.
     pub async fn refusal(&self, input: RequestInput) -> Option<SubmitError> {
         let (reply, reply_rx) = oneshot::channel();
-        self.commands
-            .send(Command::Refusal { input, reply })
-            .expect("the model thread outlives every Engine handle");
-        reply_rx.await.expect("the model thread replies to every question before it can exit")
+        if self.commands.send(Command::Refusal { input, reply }).is_err() {
+            return None;
+        }
+        reply_rx.await.unwrap_or(None)
+    }
+
+    /// Stop the model thread (spec model-switch/01), however many clones of
+    /// this handle are still alive: every request still in flight on it ends
+    /// with [`FinishReason::Error`], the scheduler is dropped on the thread,
+    /// and from then on this engine refuses every submission with
+    /// [`SubmitError::Full`]. Fire-and-forget; join the thread's handle to
+    /// wait for it (`crate::ActiveModel::shut_down` does both).
+    ///
+    /// Needed because a disconnect alone cannot be relied on: a streaming
+    /// response's [`crate::api::CancelOnDrop`] keeps a clone for as long as
+    /// its client reads, so a straggler past the switch's drain window would
+    /// otherwise keep the old model — and its GPU memory — alive forever.
+    pub fn shutdown(&self) {
+        let _ = self.commands.send(Command::Shutdown);
     }
 
     /// Ask the model thread to abort an in-flight request. This is
@@ -387,7 +422,9 @@ impl Engine {
 /// (non-blocking), performs exactly one `Scheduler::advance()` when
 /// anything is in flight, and blocks on the command channel (no busy-spin)
 /// when idle. Returns — a clean shutdown — once every [`Engine`] handle has
-/// been dropped (the command channel disconnects).
+/// been dropped (the command channel disconnects), or at once on
+/// [`Command::Shutdown`] (spec model-switch/01), after ending what is still
+/// in flight ([`end_in_flight`]).
 fn model_thread_loop(
     mut scheduler: Box<dyn Scheduler>,
     commands: std_mpsc::Receiver<Command>,
@@ -398,6 +435,7 @@ fn model_thread_loop(
     loop {
         loop {
             match commands.try_recv() {
+                Ok(Command::Shutdown) => return end_in_flight(&mut *scheduler, &mut streams, &facts),
                 Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
                 Err(std_mpsc::TryRecvError::Empty) => break,
                 // Every Engine handle was dropped: clean shutdown (no
@@ -424,9 +462,40 @@ fn model_thread_loop(
         // that would poll on a timer for no reason (an idle server costs
         // ~no CPU either way, but this is the tighter of the two).
         match commands.recv() {
+            Ok(Command::Shutdown) => return end_in_flight(&mut *scheduler, &mut streams, &facts),
             Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
             Err(_) => return,
         }
+    }
+}
+
+/// End every request still routed when the model thread is told to shut
+/// down (spec model-switch/01: a request the switch's drain window could not
+/// wait for). Each is released through the scheduler's own cancel — the path
+/// a client disconnect takes — so the scheduler that is about to be dropped
+/// holds no live sequence; its caller is sent a `Done` with
+/// [`FinishReason::Error`] first, which every handler already reports as an
+/// engine error (an `engine_error` chunk on a stream) rather than a reply
+/// that silently stopped; and telemetry hears it as a cancel, so the request
+/// log and the in-flight gauges close their books on it.
+fn end_in_flight(
+    scheduler: &mut dyn Scheduler,
+    streams: &mut HashMap<RequestId, EventRoute>,
+    facts: &UnboundedSender<TelemetryFact>,
+) {
+    for (request, route) in streams.drain() {
+        let _ = route.send(SchedEvent::Done {
+            request,
+            tokens: 0,
+            reason: FinishReason::Error,
+            spec: None,
+            readout: None,
+            attention: None,
+            drawn: None,
+            thinking: None,
+        });
+        scheduler.cancel(request);
+        let _ = facts.send(TelemetryFact::Cancelled(request));
     }
 }
 
@@ -468,6 +537,9 @@ fn handle_command(
             let events = scheduler.end_fan_out(owner);
             route_events(&events, streams, facts, freed);
         }
+        // The loop intercepts it before it gets here: it ends the loop, not
+        // one command.
+        Command::Shutdown => {}
     }
 }
 
@@ -535,7 +607,12 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
 /// the facts channel, calling the exact same methods the old inline driver
 /// called — all event emission and counter math happens here, off the model
 /// thread. After each tick, publishes the computed counters into `counters`
-/// (the wait-free `ArcSwap` snapshot).
+/// (the wait-free `ArcSwap` snapshot) — and also after every fact that moves
+/// a request in or out of flight (spec model-switch/01): a tick comes only at
+/// the end of a step, so a request submitted during a long first prefill
+/// step, or cancelled on an idle engine that never steps again, would
+/// otherwise be missing from (or stuck in) the counts the switch's drain
+/// waits on.
 async fn telemetry_task(
     mut telemetry: Telemetry,
     mut facts: UnboundedReceiver<TelemetryFact>,
@@ -560,6 +637,13 @@ async fn telemetry_task(
             TelemetryFact::Cancelled(id) | TelemetryFact::Stopped(id, _) if internal.remove(id) => continue,
             _ => {}
         }
+        let moves_in_flight = matches!(
+            &fact,
+            TelemetryFact::Submitted(..)
+                | TelemetryFact::Cancelled(_)
+                | TelemetryFact::Stopped(..)
+                | TelemetryFact::Routed(SchedEvent::Admitted { .. } | SchedEvent::Done { .. })
+        );
         match fact {
             TelemetryFact::Submitted(id, prompt_tokens, class, notes) => {
                 telemetry.note_submit(id, prompt_tokens, class);
@@ -647,6 +731,9 @@ async fn telemetry_task(
             TelemetryFact::SetStats(provider) => telemetry.with_stats(provider),
             TelemetryFact::SetMetrics(metrics) => telemetry.with_metrics(metrics),
             TelemetryFact::SetCounterSource(source) => telemetry.with_counter_source(source),
+        }
+        if moves_in_flight {
+            counters.store(Arc::new(telemetry.counters()));
         }
     }
 }

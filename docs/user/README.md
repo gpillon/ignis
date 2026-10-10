@@ -159,6 +159,9 @@ always-current table; this one is a copy.
 | `--model-download` / `--no-model-download` | `IGNIS_MODEL_DOWNLOAD` | on | Fetch a missing model. Only consulted with `--artifact` unset, and only in a `--features cuda` build. |
 | `--model-download-path <dir>` | `IGNIS_MODEL_DOWNLOAD_PATH` | `./models` | Where a fetched model lands, and where one fetched earlier is found. |
 | `--request-timeout <secs>` | `IGNIS_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
+| `--switch-drain-timeout <secs>` | `IGNIS_SWITCH_DRAIN_TIMEOUT` | `30` (max `3600`) | How long a model switch lets the old model's running requests finish before it cancels them (`0` cancels at once). |
+| `--allow-model-switch <true\|false>` | `IGNIS_ALLOW_MODEL_SWITCH` | `true` | A request whose `model` names another model `--known-model` lists switches the server to it, then is served on it. `false`: such a request is a `404 model_not_found`, as an unknown model is. `POST /v1/models/switch` is not affected. |
+| `--known-model <id>=<path>` (repeatable) | `IGNIS_KNOWN_MODELS` (`;`-separated pairs) | the start model only | A model a request may switch to by naming it, and the artifact it loads from. The model the server starts on is always listed. Any flag replaces the env var whole; an id named twice is refused. |
 | `-h`, `--help` | — | — | Print the flag table and exit. |
 | `-V`, `--version` | — | — | Print the version and exit. |
 
@@ -431,7 +434,8 @@ not.
 
 | Endpoint | Method | Notes |
 |---|---|---|
-| `/v1/models` | GET | The loaded model. |
+| `/v1/models` | GET | The loaded model, and `status`: `serving`, `switching` or `failed` ([below](#switching-models)). |
+| `/v1/models/switch` | POST | Replace the loaded model on the running process ([below](#switching-models)). |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` is a 400). |
 | `/v1/tokenize` | POST | A body's prompt-token count without serving it ([below](#counting-a-prompt)). |
@@ -465,6 +469,52 @@ still answer). The `ignis.process.ready` log event, with `warm_up_ms`, marks
 the moment it admits requests; `make start` waits for it, since it waits for
 `/v1/models` to answer. The warm-up is one request in the counters, and the
 CPU mock, which has nothing to capture, is ready at once.
+
+### Switching models
+
+`POST /v1/models/switch` with `{"artifact": "<path>", "model": "<id>"}` moves
+the running server to another model — the 27B to Qwen3.8-Flash-Next and back —
+without a restart. It answers `202 {"status": "switching", "from", "to"}` at
+once; a second switch while one runs is a `409 switch_in_progress`.
+
+A switch is a full reload: the old model is unloaded before the new one loads,
+so the two are never on the card together. While it runs, every other `/v1`
+route answers `503 model_switching` with `Retry-After: 1`, and `GET /v1/models`
+reports `status: "switching"` with `switching: {from, to}`. Requests already
+running on the old model get `--switch-drain-timeout` (30 s) to finish; one
+still running then ends with an `engine_error`. The new model loads on the
+flags the server started with, except the ones it cannot take, which are left
+off for it and named in the log (`--vision` and the 27B's `--spec` on
+Flash-Next; Flash-Next's own knobs on the 27B).
+
+A target that can be refused without unloading anything — no file at the path,
+a checksum that is not clean, a model id of the other model — leaves the old
+model serving. One that fails to load after the old model was unloaded has the
+old model loaded again; `GET /v1/models` says `failed`, with a `reason`, until
+one of them serves.
+
+**By naming the model.** A client can also just ask for the other model: a
+chat completion, a response (over HTTP or the WebSocket) or a decision whose
+`model` names another model listed with `--known-model` runs the same switch,
+and the request itself is held until the named model serves and is then
+answered by it — the first such request takes as long as the switch does
+(seconds), and no client-side retry loop is needed. List the models once:
+
+```
+ignis-server --artifact models/Qwen3.8-27B.ninfer \
+  --known-model qwen3.8-flash-next=models/Qwen3.8-Flash-Next.ninfer
+```
+
+The model the server starts on is always listed, so naming it again switches
+back. While such a switch runs every other request gets the same `503
+model_switching` as during any switch, a second request naming a model
+included — switches are never queued. A switch that does not land refuses the
+request that began it with `503 model_switch_failed` and the reason (no
+`Retry-After`: each retry would unload and reload the serving model again),
+never an answer from another model; `/v1/decide` refuses it as its own `422`.
+A model nobody listed, or any other model under `--allow-model-switch false`,
+is a `404 model_not_found` as before. `/v1/tokenize` never switches: counting
+tokens does not move the card.
 
 ### Chat completions
 

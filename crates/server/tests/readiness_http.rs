@@ -80,12 +80,12 @@ async fn a_clients_request(server: &Server) {
         user_turn_tokens: None,
         system_block_tokens: None,
         reuse_boundaries: Vec::new(),
-        model: server.engine.model_id(),
+        model: server.active().engine.model_id(),
         tokens: vec![5, 6, 7],
         params: ignis_core::DecodeParams { max_tokens: Some(3), ..ignis_core::DecodeParams::default() },
     };
     let (_, mut events) =
-        server.engine.submit(input, ignis_core::RequestClass::Interactive).await.expect("submit");
+        server.active().engine.submit(input, ignis_core::RequestClass::Interactive).await.expect("submit");
     ignis_server::engine::collect_completion(&mut events, std::time::Duration::from_secs(5))
         .await
         .expect("completes");
