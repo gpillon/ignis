@@ -169,7 +169,8 @@ int main() {
     const std::string m = load_error({}, &bad);
     check(contains(m, "options.size"), "an unrecognized options size is refused: " + m);
   }
-  for (const int32_t backend : {-1, 3, 9}) {
+  // 3 is IGNIS_SPECULATIVE_MTP since GitHub #307; 4 is the first unknown.
+  for (const int32_t backend : {-1, 4, 9}) {
     ignis_model_load_options bad = dflash2(7);
     bad.speculative_backend = backend;
     const std::string m = load_error({}, &bad);
