@@ -493,6 +493,7 @@ fn end_in_flight(
             attention: None,
             drawn: None,
             thinking: None,
+            reasoning_redirected_at: None,
         });
         scheduler.cancel(request);
         let _ = facts.send(TelemetryFact::Cancelled(request));
@@ -687,7 +688,8 @@ async fn telemetry_task(
                     attention: _,
                     drawn: _,
                     thinking,
-                } => telemetry.on_done(request, tokens, reason, spec, thinking),
+                    reasoning_redirected_at,
+                } => telemetry.on_done(request, tokens, reason, spec, thinking, reasoning_redirected_at),
                 SchedEvent::PrefillChunk {
                     request,
                     prefilled_tokens,
@@ -1081,6 +1083,7 @@ mod tests {
                     spec: None,
                     attention: None,
                     thinking: None,
+                    reasoning_redirected_at: None,
                 },
             ]
         }
@@ -1154,6 +1157,7 @@ mod tests {
                     spec: None,
                     attention: None,
                     thinking: None,
+                    reasoning_redirected_at: None,
                 },
             ]
         }

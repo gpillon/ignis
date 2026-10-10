@@ -153,7 +153,7 @@ use crate::scheduler::{
 use crate::types::{
     BackfillClass, BoundaryLifetime, ComputeError, DecisionRead, DecodeParams, EngineMode,
     FanOutId, FinishReason, LaneId, N_DECODE_LANES, RequestClass, RequestId, RequestInput,
-    RequestState, SchedEvent, SubmitError,
+    RequestState, SchedEvent, SubmitError, TokenId,
 };
 
 /// Knobs for the concrete scheduler (v1 defaults; the KV-RAM host tier
@@ -335,6 +335,16 @@ fn chunk_take(r: &Request, serving_chunk: u32) -> u32 {
     } else {
         take
     }
+}
+
+/// The `</think>` the leaf redirects an EOS to for `r`'s next draw (GitHub
+/// #315, ADR 0048): while a request that starts inside its reasoning block
+/// has not been seen closing it, on a scheduler with a close configured.
+/// `None` under `ignore_eos`, which hands the leaf no stop id to redirect.
+fn reasoning_close(config: &SchedulerConfig, r: &Request) -> Option<TokenId> {
+    let close = config.thinking_close.as_deref()?;
+    let params = r.input.params;
+    (params.starts_in_reasoning && !params.ignore_eos && r.thinking.closed_at().is_none()).then(|| close.think_end())
 }
 
 /// `take` tokens from `start`, cut so the chunk ends on `point` when it would
@@ -2292,6 +2302,12 @@ impl ConcreteScheduler {
                     closed_at: r.thinking.closed_at(),
                 })
         };
+        // GitHub #315: a redirect whose `</think>` the request never got to
+        // emit -- it finished first -- is not reported.
+        let reasoning_redirected_at = {
+            let r = &self.requests[idx];
+            r.reasoning_redirected_at.filter(|&at| at < r.tokens)
+        };
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
@@ -2302,6 +2318,7 @@ impl ConcreteScheduler {
             attention,
             drawn,
             thinking,
+            reasoning_redirected_at,
         });
     }
 
@@ -4741,6 +4758,10 @@ impl Scheduler for ConcreteScheduler {
                         .attention()
                         .filter(|_| start + take >= r.input.tokens.len() as u32)
                         .cloned(),
+                    // GitHub #315: the prompt's last chunk draws the token the
+                    // first decode round emits, and the block is open there.
+                    reasoning_close: reasoning_close(&self.config, r)
+                        .filter(|_| start + take >= r.input.tokens.len() as u32),
                 }
             })
             .collect();
@@ -4798,6 +4819,11 @@ impl Scheduler for ConcreteScheduler {
                         }
                         if outcome.attention.is_some() {
                             r.attention = outcome.attention.clone();
+                        }
+                        // GitHub #315: the draw the first decode round emits
+                        // is a redirected `</think>`.
+                        if outcome.reasoning_redirected {
+                            r.reasoning_redirected_at = Some(r.tokens);
                         }
                         // P3-01 / ADR 0018: every completed chunk boundary
                         // is a GDN resumable boundary, whether or not it
@@ -5240,6 +5266,8 @@ impl Scheduler for ConcreteScheduler {
                         .as_ref()
                         .and_then(|schedule| schedule.step(self.requests[i].tokens as usize + 1))
                         .or(forced),
+                    // GitHub #315: for the draw this round makes, too.
+                    reasoning_close: reasoning_close(&self.config, &self.requests[i]),
                 })
                 .collect();
             match self.compute.decode_step(&jobs) {
@@ -5268,6 +5296,7 @@ impl Scheduler for ConcreteScheduler {
                             probabilities,
                             finish,
                             spec,
+                            reasoning_redirected,
                         } = res;
                         debug_assert!(
                             !tokens.is_empty() || finish.is_some(),
@@ -5331,6 +5360,13 @@ impl Scheduler for ConcreteScheduler {
                                 run_truncated_by_budget = n + 1 < tokens.len();
                                 break;
                             }
+                        }
+                        // GitHub #315: the token this round drew for the next
+                        // is a redirected `</think>`, at the index the next
+                        // round emits first.
+                        if *reasoning_redirected {
+                            let r = &mut self.requests[i];
+                            r.reasoning_redirected_at = Some(r.tokens);
                         }
                         if !tokens.is_empty() {
                             // core-06: record a GDN checkpoint at the new

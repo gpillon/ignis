@@ -121,13 +121,19 @@ impl Run<'_> {
     fn prefill(&self, seq: &mut FlashNextSequence, tokens: &[u32], start: usize) -> Vec<u32> {
         let mut logits = vec![0f32; self.leaf.vocab(self.model) as usize];
         self.leaf
-            .prefill(self.model, seq, tokens, start as u32, DecodeParams::default(), &[], Some(&mut logits), None)
+            .prefill(self.model, seq, tokens, start as u32, DecodeParams::default(), &[], None, Some(&mut logits), None)
             .unwrap_or_else(|code| panic!("prefill of {} at {start}: leaf code {code}", tokens.len()));
         logits.iter().map(|v| v.to_bits()).collect()
     }
 
     fn decode(&self, seq: &mut FlashNextSequence, rounds: usize) -> Vec<u32> {
-        let lane = DecodeLane { params: DecodeParams::default(), remaining_tokens: 1, stop_ids: &[], permitted: &[] };
+        let lane = DecodeLane {
+            params: DecodeParams::default(),
+            remaining_tokens: 1,
+            stop_ids: &[],
+            permitted: &[],
+            reasoning_close: None,
+        };
         (0..rounds)
             .map(|round| {
                 let runs = self

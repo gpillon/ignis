@@ -429,6 +429,13 @@ pub struct DecodeParams {
     /// forces. Only meaningful for a generation that starts inside the block,
     /// and inert on a scheduler configured without a close sequence.
     pub thinking_budget: Option<u32>,
+    /// The generation starts inside its reasoning block (GitHub #315, ADR
+    /// 0048): the server's `decoder_starts_in_reasoning`, on chat completions
+    /// and `/v1/responses`. While the block is open the scheduler hands the
+    /// leaf its `</think>`, so an EOS drawn there becomes the close instead
+    /// of a turn with no answer. Inert on a scheduler configured without a
+    /// close sequence.
+    pub starts_in_reasoning: bool,
 }
 
 impl Default for DecodeParams {
@@ -443,6 +450,7 @@ impl Default for DecodeParams {
             seed: 0,
             ignore_eos: false,
             thinking_budget: None,
+            starts_in_reasoning: false,
         }
     }
 }
@@ -740,6 +748,11 @@ pub enum SchedEvent {
         /// scheduler without a close sequence — so a report never says
         /// "not forced" about a budget that could not have been.
         thinking: Option<crate::thinking_budget::BudgetOutcome>,
+        /// The output index of the `</think>` the leaf drew in place of an
+        /// EOS inside the request's reasoning block (GitHub #315, ADR 0048),
+        /// and `None` on every request it did not happen to. Apart from
+        /// `thinking`, which only a budget has: a redirect needs none.
+        reasoning_redirected_at: Option<u32>,
     },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for

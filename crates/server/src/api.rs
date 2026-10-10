@@ -808,6 +808,8 @@ impl SamplingRequestFields {
             },
             ignore_eos,
             thinking_budget: None,
+            // Set from the template beside the budget (`with_thinking_budget`).
+            starts_in_reasoning: false,
         })
     }
 }
@@ -904,6 +906,10 @@ pub(crate) fn resolve_thinking(
 /// on a generation that starts inside the reasoning block: with thinking off
 /// there is no block to close, and nothing for `max` to have dropped.
 ///
+/// The parameters also say whether the generation starts there (GitHub
+/// #315, ADR 0048): an EOS drawn while that block is open becomes its
+/// `</think>`. Chat completions and `/v1/responses` both come through here.
+///
 /// `effort` is the request's raw `reasoning_effort`: `max` is decided from
 /// it (else from the server default), not from `thinking`, which carries
 /// the effort the template takes.
@@ -921,6 +927,7 @@ pub(crate) fn with_thinking_budget(
     Ok((
         DecodeParams {
             thinking_budget: resolved.budget.filter(|_| starts_in_reasoning),
+            starts_in_reasoning,
             ..params
         },
         resolved.dropped_by_max && starts_in_reasoning,
@@ -2934,6 +2941,7 @@ mod tests {
                 attention: None,
                 drawn: None,
                 thinking: None,
+                reasoning_redirected_at: None,
             })
             .unwrap();
         drop(route);

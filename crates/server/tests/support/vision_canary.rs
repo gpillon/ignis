@@ -101,6 +101,7 @@ pub fn prefill_prompt(
             // GitHub #242: no permitted set — this helper prefills a prompt,
             // it does not force a run.
             &[],
+            step::Redirect::NONE,
             MultimodalPrefill {
                 positions: &positions,
                 rope_delta: prompt.rope_delta,

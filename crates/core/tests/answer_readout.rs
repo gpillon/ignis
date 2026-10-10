@@ -28,6 +28,7 @@ fn job(request: u64, readout: Option<Vec<TokenId>>) -> PrefillJob {
         readout: readout.map(Arc::from),
         permitted: None,
         attention: None,
+        reasoning_close: None,
     }
 }
 

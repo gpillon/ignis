@@ -41,8 +41,13 @@ struct Inner {
     run_lengths: Vec<u32>,
     /// Decode rounds served so far, per request (indexes `run_lengths`).
     rounds: HashMap<RequestId, usize>,
-    /// The generation step whose token is EOS (`eos_after`), per request.
-    eos: HashMap<RequestId, u32>,
+    /// The generation steps whose token is EOS (`eos_after`), per request.
+    eos: HashMap<RequestId, Vec<u32>>,
+    /// An EOS the leaf turned into `</think>` (GitHub #315, ADR 0048), per
+    /// request: the step whose token is the close instead, and its id. Held
+    /// from the round that drew it to the round that emits it -- the leaf's
+    /// one-round lag, modelled as `pending` models it for a set's draw.
+    redirects: HashMap<RequestId, (u32, TokenId)>,
     /// Every prefill batch the mock received (batch shape for assertions).
     prefill_batches: Vec<Vec<PrefillJob>>,
     /// Every decode batch the mock received (batch shape for assertions).
@@ -536,9 +541,18 @@ impl MockCompute {
 
     /// Make `request`'s token at generation step `step` its EOS: the round
     /// that commits it finishes the request with `Stop`, emitting only the
-    /// tokens before it.
+    /// tokens before it. Calls add up, one EOS a step.
+    ///
+    /// GitHub #315 (ADR 0048): an EOS the draw before it makes with the
+    /// request's reasoning block open -- its job carries a
+    /// [`DecodeJob::reasoning_close`] and no `</think>` was committed in that
+    /// round -- is redirected as the leaf redirects it: the round that drew
+    /// it reports [`DecodeOutcome::reasoning_redirected`] (the prefill,
+    /// [`PrefillOutcome::reasoning_redirected`]) and the next emits the close
+    /// at that step, and generation goes on. An EOS accepted inside a
+    /// speculative run is cut before, the same way.
     pub fn eos_after(&self, request: RequestId, step: u32) {
-        self.inner.lock().unwrap().eos.insert(request, step);
+        self.inner.lock().unwrap().eos.entry(request).or_default().push(step);
     }
 
     /// The prefill batches the mock received, in order (each entry is one
@@ -727,18 +741,24 @@ impl Compute for MockCompute {
             g.seeds.insert(job.request, job.params.seed);
             g.prefilled.insert(job.request, job.start_position + job.tokens.len() as u32);
         }
-        for job in jobs {
+        let mut redirected = vec![false; jobs.len()];
+        for (index, job) in jobs.iter().enumerate() {
             // GitHub #242: a prefill *draws*, and a run's first token is
             // the one it draws. Held until a decode round asks for it.
             if let Some(permitted) = &job.permitted {
                 let draw = Self::draw(self.seed, &mut g, job.request, permitted);
                 g.pending.insert(job.request, draw);
+            } else if let Some(close) = job.reasoning_close {
+                // GitHub #315: a free draw of the EOS with the block open.
+                let step = g.generated.get(&job.request).copied().unwrap_or(0);
+                redirected[index] = Self::redirect(&mut g, job.request, step, close);
             }
         }
         g.prefill_batches.push(jobs.to_vec());
         Ok(jobs
             .iter()
-            .map(|job| PrefillOutcome {
+            .enumerate()
+            .map(|(index, job)| PrefillOutcome {
                 encode_micros: 0,
                 // GitHub #186: a nominal, deterministic restore cost on the
                 // job that claimed a checkpoint, so the request log's
@@ -780,6 +800,7 @@ impl Compute for MockCompute {
                     .as_ref()
                     .filter(|_| !g.attention_refusals.remove(&job.request))
                     .map(|query| Self::attention(query, job.start_position + job.tokens.len() as u32)),
+                reasoning_redirected: redirected[index],
             })
             .collect())
     }
@@ -900,11 +921,16 @@ impl Compute for MockCompute {
                     .get(&job.request)
                     .copied()
                     .or_else(|| g.limits.get(&job.request).copied().flatten());
-                let eos = g.eos.get(&job.request).copied();
+                let eos = g.eos.get(&job.request).cloned().unwrap_or_default();
                 let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
                 let mut run = Vec::new();
                 let mut committed = 0;
                 let mut finish = None;
+                // GitHub #315: whether this round's draw was redirected, and
+                // whether a `</think>` it committed closed the block for the
+                // rest of it.
+                let mut redirected = false;
+                let mut closed = false;
                 for _ in 0..length {
                     let step = *g.generated.entry(job.request).or_insert(0);
                     if limit.is_some_and(|n| step >= n) {
@@ -912,11 +938,35 @@ impl Compute for MockCompute {
                     }
                     *g.generated.get_mut(&job.request).unwrap() += 1;
                     committed += 1;
-                    if eos == Some(step) {
+                    // The close an earlier round drew in place of this
+                    // step's EOS.
+                    if let Some(close) = g.redirects.get(&job.request).filter(|r| r.0 == step).map(|r| r.1) {
+                        g.redirects.remove(&job.request);
+                        run.push(close);
+                        closed = true;
+                        continue;
+                    }
+                    if eos.contains(&step) {
+                        // An accepted draft (not the anchor, which the
+                        // previous round drew) that is the EOS, with the
+                        // block open: cut before it, `</think>` next.
+                        if let Some(close) = job.reasoning_close.filter(|_| committed > 1 && !closed) {
+                            *g.generated.get_mut(&job.request).unwrap() -= 1;
+                            committed -= 1;
+                            redirected = Self::redirect(&mut g, job.request, step, close);
+                            break;
+                        }
                         finish = Some(FinishReason::Stop);
                         break;
                     }
                     run.push(Self::mix(self.seed, job.request, seed, step));
+                }
+                // The draw this round made is the next step's token.
+                if let Some(close) = job.reasoning_close.filter(|_| !redirected && !closed && finish.is_none()) {
+                    if committed > 0 && job.permitted.is_none() {
+                        let next = g.generated.get(&job.request).copied().unwrap_or(0);
+                        redirected = Self::redirect(&mut g, job.request, next, close);
+                    }
                 }
                 if let Some(permitted) = &job.permitted {
                     if committed > 0 && finish.is_none() {
@@ -936,6 +986,7 @@ impl Compute for MockCompute {
                     probabilities: Vec::new(),
                     spec: (!g.run_lengths.is_empty())
                         .then(|| SpecCounters::round(length - 1, committed - 1)),
+                    reasoning_redirected: redirected,
                 }
             })
             .collect())
@@ -1377,6 +1428,17 @@ impl MockCompute {
             _ => 0.5 + (mixed % 500) as f32 / 1000.0,
         };
         crate::constrained::Draw { token, probability }
+    }
+
+    /// GitHub #315: a draw of `request`'s token at `step` with its reasoning
+    /// block open, redirected to `close` when that token is an EOS -- held
+    /// until the round that emits it. Whether it was.
+    fn redirect(state: &mut Inner, request: RequestId, step: u32, close: TokenId) -> bool {
+        let eos = state.eos.get(&request).is_some_and(|steps| steps.contains(&step));
+        if eos {
+            state.redirects.insert(request, (step, close));
+        }
+        eos
     }
 
     /// The deterministic token mix: a pure function of (mock seed, request

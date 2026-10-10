@@ -1717,6 +1717,7 @@ mod tests {
             _start_position: u32,
             _params: DecodeParams,
             _permitted: &[TokenId],
+            _redirect: Option<&mut ignis_runtime::DrawRedirect<'_>>,
             _out_logits: Option<&mut [f32]>,
             _attention: Option<&mut ignis_runtime::AttentionRead>,
         ) -> Result<f32, i32> {

@@ -136,6 +136,7 @@ impl StepLeaf for ByteLeaf {
         _start_position: u32,
         _params: DecodeParams,
         _permitted: &[u32],
+        _redirect: Option<&mut ignis_runtime::DrawRedirect<'_>>,
         _out_logits: Option<&mut [f32]>,
         _attention: Option<&mut ignis_runtime::AttentionRead>,
     ) -> Result<f32, i32> {
@@ -225,6 +226,7 @@ pub fn prefill(compute: &RuntimeCompute<ByteLeaf>, request: RequestId) {
         readout: None,
         permitted: None,
         attention: None,
+        reasoning_close: None,
     };
     compute.prefill_step(&[job]).unwrap();
 }
@@ -240,6 +242,7 @@ pub fn decode(compute: &RuntimeCompute<ByteLeaf>, request: RequestId, rounds: u3
         },
         remaining_tokens: 1,
         permitted: None,
+        reasoning_close: None,
     };
     (0..rounds)
         .flat_map(|_| compute.decode_step(std::slice::from_ref(&job)).unwrap().remove(0).tokens)

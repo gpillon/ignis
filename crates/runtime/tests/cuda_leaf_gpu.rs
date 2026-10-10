@@ -86,6 +86,7 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
             publish_prefix: None,
             permitted: None,
             attention: None,
+            reasoning_close: None,
 }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 
@@ -101,6 +102,7 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
                 },
                 remaining_tokens: (MAX_GENERATED - generated.len()) as u32,
                 permitted: None,
+                reasoning_close: None,
 }])
             .unwrap_or_else(|e| panic!("decode_step: {e}"));
         let Some(DecodeOutcome { tokens, finish, .. }) = out.into_iter().next() else {

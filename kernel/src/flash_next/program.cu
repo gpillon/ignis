@@ -36,6 +36,7 @@
 
 #include "ignis_fn_residual_tap.h"
 #include "ignis_fp8_linear.h"
+#include "ignis_reasoning_redirect.h"
 #include "ignis_seq_internal.h"
 #include "../moe_common.cuh"
 #include "../permitted_tokens.h"
@@ -784,6 +785,7 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
     return refuse("null argument or empty span");
   }
   if (!step::sampling_size_ok(*sampling)) return refuse("unrecognized ignis_sampling_params size");
+  if (!step::redirect_inputs_ok(*sampling)) return refuse("stop_ids is null with a nonzero stop_id_count");
   FlashNextModel &fn = *model->flash_next;
   const Geometry &g = fn.g;
   bool span_ok = false;
@@ -950,6 +952,11 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
     }
     offset += static_cast<uint64_t>(chunk);
   }
+  // GitHub #315 (ADR 0048): the span's draw is the token the first round emits; a stop id drawn
+  // with the reasoning block open becomes `</think>`. On an MTP load the head's entry at the span's
+  // last position was made from the drawn token inside the chunk, before the host could see it: a
+  // redirect leaves that one entry (and nothing the target computes) on the stop id.
+  if (step::redirect_span_draw(pool, seq, *sampling, stream, options->out_reasoning_redirected) != 0) return -1;
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began).count());
   model->last_step_kernel_count = static_cast<uint64_t>(g.layers);
@@ -1062,6 +1069,7 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
       return refuse("sequence reached its KV capacity" + at);
     }
     if (!step::sampling_size_ok(sampling[i])) return refuse("unrecognized ignis_sampling_params size" + at);
+    if (!step::redirect_inputs_ok(sampling[i])) return refuse("stop_ids is null with a count" + at);
     const ignis_sampling_params &lane = sampling[i];
     if (!step::unconstrained(lane)) {
       if (lane.permitted_count > IGNIS_MAX_PERMITTED_TOKENS || lane.permitted_ids == nullptr) {
@@ -1180,6 +1188,25 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   if (!constrained && options->out_permitted_probs != nullptr) {
     std::fill(options->out_permitted_probs, options->out_permitted_probs + batch_size, 0.0F);
   }
+  // GitHub #315 (ADR 0048): each lane's draw, after the anchor this round fed -- a stop id drawn with
+  // the lane's reasoning block open becomes `</think>`, and its counted occurrence moves with it. On
+  // an MTP load the round's head entry was made from the drawn token, as the prefill's is.
+  std::vector<IgnisRoundCut> cuts(batch_size);
+  std::vector<std::pair<int32_t *, int32_t>> moves;
+  for (uint64_t i = 0; i < batch_size; ++i) {
+    cuts[i] = ignis_cut_and_redirect(&ids[i], 1, successors[i], sampling[i].stop_ids, sampling[i].stop_id_count,
+                                     sampling[i].reasoning_close_id);
+    if (cuts[i].redirected) step::redirect_penalty_move(configs[i], successors[i], cuts[i].next_pending, &moves);
+  }
+  if (!moves.empty()) {
+    if (const cudaError_t err = step::adjust_penalty_counts(moves, stream); err != cudaSuccess) {
+      return refuse(std::string("moving a redirected draw's penalty count failed: ") + cudaGetErrorString(err) +
+                    "; its lanes are not usable past it, release them");
+    }
+  }
+  if (options->out_reasoning_redirected != nullptr) {
+    for (uint64_t i = 0; i < batch_size; ++i) options->out_reasoning_redirected[i] = cuts[i].redirected ? 1 : 0;
+  }
   if (options->out_committed_counts != nullptr) {
     std::fill(options->out_committed_counts, options->out_committed_counts + batch_size, 1);
   }
@@ -1189,7 +1216,7 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   // The round is atomic: every lane commits its pending token and draws its next one together.
   for (uint64_t i = 0; i < batch_size; ++i) {
     out_token_ids[i] = sequences[i]->pending_token;
-    sequences[i]->pending_token = successors[i];
+    sequences[i]->pending_token = cuts[i].next_pending;
     advance_frontiers(sequences[i], 1);
   }
   model->last_step_micros = static_cast<uint64_t>(

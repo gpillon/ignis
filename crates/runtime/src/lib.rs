@@ -199,6 +199,10 @@ pub struct DecodeLane<'a> {
     /// proposed by a second model that knows nothing of a set, so a round
     /// with any constrained lane in it is run as a plain round.
     pub permitted: &'a [TokenId],
+    /// The `</think>` a stop id the lane draws -- or a verify round accepts
+    /// -- becomes while its reasoning block is open (GitHub #315, ADR 0048),
+    /// or `None`. [`LaneRun::redirected`] says it happened.
+    pub reasoning_close: Option<TokenId>,
 }
 
 /// One lane's committed run from a decode round (P5-06, GitHub #154).
@@ -221,6 +225,10 @@ pub struct LaneRun {
     /// there is nothing left to recompute it from;
     /// [`RuntimeCompute`] is what holds it for the one round in between.
     pub drawn_probability: Option<f32>,
+    /// The token this round drew for the next was a stop id the leaf turned
+    /// into the lane's [`DecodeLane::reasoning_close`] (GitHub #315): the
+    /// next round emits that `</think>` first.
+    pub redirected: bool,
 }
 
 impl LaneRun {
@@ -230,6 +238,7 @@ impl LaneRun {
             tokens: vec![token],
             spec: None,
             drawn_probability: None,
+            redirected: false,
         }
     }
 
@@ -241,6 +250,19 @@ impl LaneRun {
             ..Self::token(token)
         }
     }
+}
+
+/// A prefill draw's **reasoning redirect** (GitHub #315, ADR 0048), in and
+/// out: the `</think>` a stop id the span draws becomes, the stop ids, and --
+/// set by the leaf -- whether it did. Passed only for the chunk whose draw the
+/// first decode round emits, in a request that starts inside its reasoning;
+/// `None` asks for nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawRedirect<'a> {
+    pub close_id: TokenId,
+    pub stop_ids: &'a [TokenId],
+    /// The sequence's pending token is `close_id` in place of a stop id.
+    pub redirected: bool,
 }
 
 /// One prefill span's multimodal inputs (GitHub #178).
@@ -628,6 +650,9 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// exactly as a head `point` reads an image's. Read at the span's last
     /// position; see [`AttentionRead`] for what the leaf owes it. `None`
     /// asks for none and costs nothing.
+    ///
+    /// `redirect` is the span's draw's reasoning redirect (GitHub #315); see
+    /// [`DrawRedirect`]. `None` draws as the leaf always has.
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
@@ -637,6 +662,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         start_position: u32,
         params: DecodeParams,
         permitted: &[TokenId],
+        redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32>;
@@ -658,7 +684,8 @@ pub trait StepLeaf: Send + Sync + 'static {
     ///
     /// `attention` is the **attention readout** (GitHub #260), read at the
     /// span's last position; see [`AttentionRead`] for what the leaf owes
-    /// it. The text path carries one too (GitHub #275).
+    /// it. The text path carries one too (GitHub #275). `redirect` is
+    /// [`StepLeaf::prefill`]'s.
     #[allow(clippy::too_many_arguments)]
     fn prefill_multimodal(
         &self,
@@ -668,6 +695,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         _start_position: u32,
         _params: DecodeParams,
         _permitted: &[TokenId],
+        _redirect: Option<&mut DrawRedirect<'_>>,
         _span: MultimodalSpan<'_, Self::Media>,
         _out_logits: Option<&mut [f32]>,
         _attention: Option<&mut AttentionRead>,
@@ -1163,6 +1191,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         media: &mut MediaCache<L::Media>,
         job: &PrefillJob,
         multimodal: &Multimodal,
+        redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
     ) -> Result<(u64, f32), i32> {
@@ -1206,6 +1235,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             start,
             job.params,
             &permitted,
+            redirect,
             MultimodalSpan {
                 positions: &positions,
                 rope_delta: multimodal.rope_delta,
@@ -1440,6 +1470,18 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 // and (GitHub #275) a row per head of a set read in rows. A
                 // text job reads one as an image job does.
                 let mut attention = job.attention.as_ref().map(AttentionRead::new);
+                // GitHub #315: the draw the first round emits, redirected
+                // from the EOS while the request's reasoning block is open.
+                // `ignore_eos` has no stop id, so nothing to redirect.
+                let eos = [self.eos];
+                let mut redirect = job
+                    .reasoning_close
+                    .filter(|_| !job.params.ignore_eos)
+                    .map(|close_id| DrawRedirect {
+                        close_id,
+                        stop_ids: &eos,
+                        redirected: false,
+                    });
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -1455,6 +1497,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             // chunk that is not a constrained run's last
                             // passes an empty slice and allocates nothing.
                             job.permitted.as_deref().unwrap_or(&[]),
+                            redirect.as_mut(),
                             logits.as_deref_mut(),
                             attention.as_mut(),
                         )
@@ -1464,10 +1507,12 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         &mut media,
                         job,
                         multimodal,
+                        redirect.as_mut(),
                         logits.as_deref_mut(),
                         attention.as_mut(),
                     ),
                 };
+                outcomes[index].reasoning_redirected = redirect.is_some_and(|r| r.redirected);
                 match warmed {
                     Ok((encode_micros, probability)) => {
                         outcomes[index].encode_micros = encode_micros;
@@ -1740,6 +1785,8 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         .max(1),
                     stop_ids: if job.params.ignore_eos { &[] } else { &eos },
                     permitted: permitted[index].as_deref().unwrap_or(&[]),
+                    // GitHub #315: no stop id, nothing to redirect.
+                    reasoning_close: job.reasoning_close.filter(|_| !job.params.ignore_eos),
                 })
                 .collect();
             let mut handles: Vec<&mut L::Sequence> = batch
@@ -1796,6 +1843,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 mut tokens,
                 spec,
                 drawn_probability,
+                redirected,
             } = decoded.next().expect("decoded result length was checked");
             // GitHub #242 — the one-round lag, closed here. The round
             // returns the token drawn *last* time, so its probability is the
@@ -1842,6 +1890,9 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             outcomes[index] = Some(DecodeOutcome {
                 spec,
                 probabilities,
+                // GitHub #315: the leaf's lag, which the scheduler holds -- the
+                // redirected `</think>` is the next round's first token.
+                reasoning_redirected: redirected,
                 ..outcome
             });
         }

@@ -130,6 +130,7 @@ fn a_readout_crosses_the_real_compute_seam() {
         readout: readout.map(Arc::from),
         permitted: None,
         attention: None,
+        reasoning_close: None,
 };
 
     // ── the readout itself ───────────────────────────────────────────────
@@ -224,6 +225,7 @@ fn a_readout_crosses_the_real_compute_seam() {
             params,
             remaining_tokens: 1,
             permitted: None,
+            reasoning_close: None,
 }])
         .unwrap_or_else(|e| panic!("decode_step: {e}"));
     let committed = decoded

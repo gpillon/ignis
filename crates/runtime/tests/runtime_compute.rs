@@ -11,7 +11,7 @@ use ignis_core::scheduler::CheckpointClaim;
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
 use ignis_core::pointing::{AttentionQuery, PointingHead, SetQuery, SetRead};
 use ignis_runtime::{
-    AttentionRead, DecodeLane, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats,
+    AttentionRead, DecodeLane, DrawRedirect, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats,
     StepLeaf,
 };
 
@@ -43,6 +43,10 @@ struct Calls {
     decode_lanes: Vec<Vec<(u32, Vec<u32>)>>,
     /// The permitted set of each round's lanes, in order (GitHub #242).
     decode_permitted: Vec<Vec<Vec<u32>>>,
+    /// GitHub #315: each prefill's reasoning redirect (its close id and stop
+    /// ids), `None` for a draw handed none, and each round's lanes' close.
+    prefill_redirects: Vec<Option<(u32, Vec<u32>)>>,
+    decode_closes: Vec<Vec<Option<u32>>>,
     /// P4-10 (GitHub #126): the prefixes published (their token counts) and
     /// the claims served (the context each claimant reserved), so a test can
     /// see that a claimant was allocated *against* a prefix rather than
@@ -263,6 +267,7 @@ impl StepLeaf for StubLeaf {
         start_position: u32,
         params: DecodeParams,
         permitted: &[u32],
+        redirect: Option<&mut DrawRedirect<'_>>,
         span: MultimodalSpan<'_, Self::Media>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
@@ -275,7 +280,7 @@ impl StepLeaf for StubLeaf {
                 .media
                 .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
         });
-        self.prefill(model, sequence, tokens, start_position, params, permitted, out_logits, attention)
+        self.prefill(model, sequence, tokens, start_position, params, permitted, redirect, out_logits, attention)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -441,12 +446,19 @@ impl StepLeaf for StubLeaf {
         start_position: u32,
         params: DecodeParams,
         permitted: &[u32],
+        redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
         {
             let mut calls = self.calls.lock().unwrap();
             calls.attention_asked.push(attention.as_ref().map(|read| read.query.clone()));
+            // GitHub #315: the stub redirects every draw it is handed a
+            // close for, so a test sees the flag cross back.
+            calls.prefill_redirects.push(redirect.as_ref().map(|r| (r.close_id, r.stop_ids.to_vec())));
+            if let Some(redirect) = redirect {
+                redirect.redirected = true;
+            }
             // A deterministic map the test can predict: each key scores its
             // own absolute position, and head `i` of a set peaks on key `2i`.
             if let Some(read) = attention
@@ -547,6 +559,7 @@ impl StepLeaf for StubLeaf {
         calls
             .decode_permitted
             .push(lanes.iter().map(|lane| lane.permitted.to_vec()).collect());
+        calls.decode_closes.push(lanes.iter().map(|lane| lane.reasoning_close).collect());
         drop(calls);
         let mut runs = self.runs.lock().unwrap();
         let mut tokens = self.tokens.lock().unwrap();
@@ -622,6 +635,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
         seed: 9,
         ignore_eos: false,
         thinking_budget: None,
+        starts_in_reasoning: false,
     };
     let right = DecodeParams {
         max_tokens: Some(4),
@@ -633,6 +647,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
         seed: 11,
         ignore_eos: false,
         thinking_budget: None,
+        starts_in_reasoning: false,
     };
     compute
         .prefill_step(&[
@@ -650,6 +665,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 publish_prefix: None,
                 permitted: None,
                 attention: None,
+                reasoning_close: None,
             },
             PrefillJob {
                 checkpoint: None,
@@ -665,6 +681,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 publish_prefix: None,
                 permitted: None,
                 attention: None,
+                reasoning_close: None,
             },
         ])
         .unwrap();
@@ -677,6 +694,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 params: left,
                 remaining_tokens: 3,
                 permitted: None,
+                reasoning_close: None,
             },
             DecodeJob {
                 request: 2,
@@ -684,6 +702,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 params: right,
                 remaining_tokens: 4,
                 permitted: None,
+                reasoning_close: None,
             },
         ])
         .unwrap();
@@ -734,6 +753,7 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
                 params: DecodeParams::default(),
                 remaining_tokens: 8,
                 permitted,
+                reasoning_close: None,
             }])
             .unwrap()
             .remove(0)
@@ -777,7 +797,7 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
 fn the_round_after_a_forced_run_may_commit_a_speculative_run() {
     let leaf = Arc::new(StubLeaf::with_runs([
         LaneRun::token(11),
-        LaneRun { tokens: vec![12, 13, 14], spec: None, drawn_probability: None },
+        LaneRun { tokens: vec![12, 13, 14], spec: None, drawn_probability: None, redirected: false },
     ]));
     let model = Arc::new(Model::load(leaf.clone()).unwrap());
     let compute = RuntimeCompute::new(model, 99);
@@ -801,6 +821,59 @@ fn the_round_after_a_forced_run_may_commit_a_speculative_run() {
     );
 }
 
+/// GitHub #315 (ADR 0048): the prefill's draw is redirected with the EOS as
+/// its stop id, and the leaf's flag comes back on the chunk's outcome. A job
+/// with no close, or under `ignore_eos` -- no stop id -- hands the leaf none.
+#[test]
+fn a_prefill_hands_the_leaf_its_reasoning_redirect_and_reports_it() {
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let outcomes = compute
+        .prefill_step(&[
+            PrefillJob { reasoning_close: Some(42), ..prefill(1, Some(8)) },
+            prefill(2, Some(8)),
+            PrefillJob {
+                reasoning_close: Some(42),
+                params: DecodeParams { ignore_eos: true, ..DecodeParams::default() },
+                ..prefill(3, Some(8))
+            },
+        ])
+        .unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().prefill_redirects, vec![Some((42, vec![99])), None, None]);
+    let redirected: Vec<bool> = outcomes.iter().map(|o| o.reasoning_redirected).collect();
+    assert_eq!(redirected, vec![true, false, false]);
+}
+
+/// Each lane of a round carries its close (none under `ignore_eos`), and a
+/// lane's redirected draw is reported on the round that drew it -- the
+/// scheduler holds the lag, the `</think>` being the next round's first token.
+#[test]
+fn a_round_hands_each_lane_its_reasoning_close_and_reports_the_redirect() {
+    let leaf = Arc::new(StubLeaf::with_runs([
+        LaneRun { redirected: true, ..LaneRun::token(11) },
+        LaneRun::token(12),
+        LaneRun::token(13),
+    ]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    compute.prefill_step(&[prefill(1, Some(8)), prefill(2, Some(8)), prefill(3, Some(8))]).unwrap();
+    let outcomes = compute
+        .decode_step(&[
+            DecodeJob { reasoning_close: Some(42), ..job(1, DecodeParams::default(), 8) },
+            job(2, DecodeParams::default(), 8),
+            DecodeJob {
+                reasoning_close: Some(42),
+                ..job(3, DecodeParams { ignore_eos: true, ..DecodeParams::default() }, 8)
+            },
+        ])
+        .unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().decode_closes, vec![vec![Some(42), None, None]]);
+    let redirected: Vec<bool> = outcomes.iter().map(|o| o.reasoning_redirected).collect();
+    assert_eq!(redirected, vec![true, false, false]);
+    assert_eq!(outcomes[0].tokens, vec![11], "the round's own token is unchanged");
+}
+
 #[test]
 fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
     let leaf = Arc::new(StubLeaf::with_tokens([]));
@@ -813,6 +886,7 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
             params: DecodeParams::default(),
             remaining_tokens: 8,
             permitted: None,
+            reasoning_close: None,
         })
         .collect();
 
@@ -838,6 +912,7 @@ fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
         publish_prefix: None,
         permitted: None,
         attention: None,
+        reasoning_close: None,
     }
 }
 
@@ -913,6 +988,7 @@ fn adapter_maps_allocation_and_decode_errors_without_losing_live_state() {
             params: DecodeParams::default(),
             remaining_tokens: 8,
             permitted: None,
+            reasoning_close: None,
 }]),
         Err(ComputeError::Kernel(-19))
     );
@@ -949,6 +1025,7 @@ fn adapter_enforces_max_tokens_and_eos() {
         },
         remaining_tokens: 1,
         permitted: None,
+        reasoning_close: None,
 };
     assert_eq!(
         compute.decode_step(&[job.clone()]).unwrap(),
@@ -973,6 +1050,7 @@ fn adapter_enforces_max_tokens_and_eos() {
                 params: DecodeParams::default(),
                 remaining_tokens: 8,
                 permitted: None,
+                reasoning_close: None,
 }])
             .unwrap(),
         vec![DecodeOutcome::finished(FinishReason::Stop)]
@@ -996,6 +1074,7 @@ fn adapter_can_keep_a_measurement_lane_alive_past_eos() {
         },
         remaining_tokens: 8,
         permitted: None,
+        reasoning_close: None,
 };
 
     assert_eq!(
@@ -1024,6 +1103,7 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                     params: DecodeParams::default(),
                     remaining_tokens: 8,
                     permitted: None,
+                    reasoning_close: None,
                 },
                 DecodeJob {
                     request: 2,
@@ -1031,6 +1111,7 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                     params: DecodeParams::default(),
                     remaining_tokens: 8,
                     permitted: None,
+                    reasoning_close: None,
                 },
             ])
             .unwrap(),
@@ -1499,6 +1580,7 @@ fn a_spill_the_leaf_fails_leaves_the_device_image_to_discard() {
             readout: None,
             permitted: None,
             attention: None,
+            reasoning_close: None,
 }])
         .unwrap();
 
@@ -1535,6 +1617,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
             readout: None,
             permitted: None,
             attention: None,
+            reasoning_close: None,
 }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().capture_slots, vec![2], "the slot the job named");
@@ -1560,6 +1643,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
                 readout: None,
                 permitted: None,
                 attention: None,
+                reasoning_close: None,
 }])
             .unwrap();
     }
@@ -1654,6 +1738,7 @@ fn job(request: u64, params: DecodeParams, remaining_tokens: u32) -> DecodeJob {
         params,
         remaining_tokens,
         permitted: None,
+        reasoning_close: None,
     }
 }
 
@@ -1664,6 +1749,7 @@ fn the_leaf_is_handed_each_lanes_budget_and_stop_ids() {
             tokens: vec![5, 6, 7],
             spec: None,
                     drawn_probability: None,
+                    redirected: false,
 },
         LaneRun::token(8),
     ]));
@@ -1707,6 +1793,7 @@ fn a_run_cut_at_eos_emits_the_tokens_before_it_and_finishes_with_stop() {
         tokens: vec![5, 6, 99],
         spec: None,
             drawn_probability: None,
+            redirected: false,
 }]));
     let model = Arc::new(Model::load(leaf.clone()).unwrap());
     let compute = RuntimeCompute::new(model, 99);
@@ -1728,6 +1815,7 @@ fn a_committed_run_counts_toward_max_tokens() {
         tokens: vec![5, 6, 7],
         spec: None,
             drawn_probability: None,
+            redirected: false,
 }]));
     let model = Arc::new(Model::load(leaf.clone()).unwrap());
     let compute = RuntimeCompute::new(model, 99);
@@ -1759,6 +1847,7 @@ fn a_verify_rounds_counters_ride_its_outcome() {
         tokens: vec![5, 6, 7],
         spec: Some(spec),
             drawn_probability: None,
+            redirected: false,
 }]));
     let model = Arc::new(Model::load(leaf).unwrap());
     let compute = RuntimeCompute::new(model, 99);
@@ -1778,6 +1867,7 @@ fn an_empty_run_is_refused_without_losing_the_sequence() {
         tokens: vec![],
         spec: None,
             drawn_probability: None,
+            redirected: false,
 }]));
     let model = Arc::new(Model::load(leaf).unwrap());
     let compute = RuntimeCompute::new(model, 99);
@@ -1835,6 +1925,7 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         readout: None,
         permitted: None,
         attention: None,
+        reasoning_close: None,
     }
 }
 
@@ -2144,6 +2235,7 @@ fn a_request_that_publishes_a_block_and_chains_over_it_keeps_both_heads_claimabl
         readout: None,
         permitted: None,
         attention: None,
+        reasoning_close: None,
 };
     compute.prefill_step(&[job(1, vec![1, 2, 3, 4], 0, Some(4))]).unwrap();
     compute.prefill_step(&[job(1, vec![5, 6, 7, 8], 4, Some(8))]).unwrap();
@@ -2186,6 +2278,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             readout: None,
             permitted: None,
             attention: None,
+            reasoning_close: None,
 }])
         .unwrap();
     compute.release(1);
@@ -2225,6 +2318,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             readout: None,
             permitted: None,
             attention: None,
+            reasoning_close: None,
 }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().claimed_prefixes, vec![4], "claimable by name");

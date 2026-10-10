@@ -16,6 +16,7 @@
 #include "ignis_gqa_layer.h"
 #include "ignis_gqa_workspace.h"
 #include "ignis_hq_ring.h"
+#include "ignis_reasoning_redirect.h"
 #include "ignis_seq_internal.h"
 #include "layer_internal.h"
 #include "model_internal.h"
@@ -50,6 +51,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -230,6 +232,95 @@ int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
   return 0;
 }
 
+// GitHub #315 (ADR 0048): a lane whose reasoning redirect is armed reads its
+// stop ids wherever its successor is assigned, not only in a verify round, so
+// a count without its ids is refused there too.
+bool redirect_inputs_ok(const ignis_sampling_params &sampling) {
+  return sampling.reasoning_close_id < 0 || sampling.stop_id_count == 0 || sampling.stop_ids != nullptr;
+}
+
+// Occurrences moved in penalty-count rows: each entry a count's device address
+// and what to add to it, clamped at 0, in one read and one write per distinct
+// count, each side synchronized. A verify round takes back the tokens it
+// licensed past its cut; a redirect (GitHub #315) moves the occurrence its
+// sampler counted from the stop id it drew to the `</think>` that replaced it.
+// Either way the row a snapshot or a prefix clone carries matches the text.
+cudaError_t adjust_penalty_counts(const std::vector<std::pair<std::int32_t *, std::int32_t>> &moves,
+                                  cudaStream_t stream) {
+  std::vector<std::pair<std::int32_t *, std::int32_t>> merged;
+  for (const auto &[count, delta] : moves) {
+    const auto same = std::find_if(merged.begin(), merged.end(),
+                                   [&](const auto &entry) { return entry.first == count; });
+    if (same == merged.end()) {
+      merged.emplace_back(count, delta);
+    } else {
+      same->second += delta;
+    }
+  }
+  std::vector<std::int32_t> values(merged.size(), 0);
+  cudaError_t err = cudaSuccess;
+  for (std::size_t r = 0; r < merged.size() && err == cudaSuccess; ++r) {
+    err = cudaMemcpyAsync(&values[r], merged[r].first, sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                          stream);
+  }
+  if (err == cudaSuccess) {
+    err = cudaStreamSynchronize(stream);
+  }
+  for (std::size_t r = 0; r < merged.size(); ++r) {
+    values[r] = std::max(values[r] + merged[r].second, 0);
+  }
+  for (std::size_t r = 0; r < merged.size() && err == cudaSuccess; ++r) {
+    err = cudaMemcpyAsync(merged[r].first, &values[r], sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                          stream);
+  }
+  if (err == cudaSuccess) {
+    err = cudaStreamSynchronize(stream);
+  }
+  return err;
+}
+
+// GitHub #315: the occurrence a temperature draw counted for the stop id it
+// drew, moved to the `</think>` that replaced it. A greedy draw counts
+// nothing, so it moves nothing.
+void redirect_penalty_move(const ninfer::ops::SamplingConfig &cfg, std::int32_t drawn,
+                           std::int32_t close_id,
+                           std::vector<std::pair<std::int32_t *, std::int32_t>> *moves) {
+  if (!(cfg.temperature > 0.0f) || cfg.token_counts == nullptr) {
+    return;
+  }
+  moves->emplace_back(cfg.token_counts + drawn, -1);
+  moves->emplace_back(cfg.token_counts + close_id, 1);
+}
+
+// GitHub #315 (ADR 0048): a span's draw -- the sequence's pending token, once
+// the span's device work is confirmed -- redirected when it is a stop id drawn
+// with the lane's reasoning block open: the prefill's place in the one cut
+// both leaves share, with nothing committed before the draw. Whether it was
+// redirected goes to `*out_redirected`, or nowhere. Returns 0, or -1 with the
+// error set.
+int32_t redirect_span_draw(ignis_seq_pool *pool, ignis_seq *seq, const ignis_sampling_params &sampling,
+                           cudaStream_t stream, int32_t *out_redirected) {
+  const IgnisRoundCut cut =
+      ignis_cut_and_redirect(nullptr, 0, seq->pending_token, sampling.stop_ids, sampling.stop_id_count,
+                             sampling.reasoning_close_id);
+  if (cut.redirected) {
+    std::vector<std::pair<std::int32_t *, std::int32_t>> moves;
+    redirect_penalty_move(to_sampling_config(sampling, pool->token_counts_for(seq->slot)),
+                          seq->pending_token, cut.next_pending, &moves);
+    const cudaError_t err = moves.empty() ? cudaSuccess : adjust_penalty_counts(moves, stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_prefill: moving the redirected draw's penalty count failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    seq->pending_token = cut.next_pending;
+  }
+  if (out_redirected != nullptr) {
+    *out_redirected = cut.redirected ? 1 : 0;
+  }
+  return 0;
+}
+
 // Runs embedding -> final RMSNorm -> output head -> argmax for one token
 // (the degenerate program, GitHub #54). `out_logits`, if non-null, receives
 // `model->vocab` host floats. Returns 0 on success, -1 on error (message
@@ -322,6 +413,12 @@ bool validate_common(const ignis_model *model, const int32_t *token_ids, uint64_
   }
   if (sampling->greedy == 0) {
     set_error("ignis_step: only greedy sampling is supported (G1)");
+    return false;
+  }
+  // GitHub #315 (ADR 0048): the degenerate program assigns no successor a
+  // later round emits, so a redirect it was asked for would be dropped.
+  if (sampling->reasoning_close_id >= 0) {
+    set_error("ignis_step: the degenerate program cannot redirect a reasoning block's end");
     return false;
   }
   if (skip_layers == 0) {
@@ -441,6 +538,10 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
   if (!sampling_size_ok(*sampling)) {
     set_error("ignis_program: unrecognized ignis_sampling_params size " +
               std::to_string(sampling->size));
+    return false;
+  }
+  if (!redirect_inputs_ok(*sampling)) {
+    set_error("ignis_program: stop_ids is null with a nonzero stop_id_count");
     return false;
   }
   return true;
@@ -1637,6 +1738,12 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   if (rc != 0) {
     return rc;
   }
+  // GitHub #315 (ADR 0048): the span's draw is the token the first round
+  // emits; a stop id drawn with the reasoning block open becomes `</think>`.
+  if (redirect_span_draw(pool, seq, *sampling, model->stream,
+                         options != nullptr ? options->out_reasoning_redirected : nullptr) != 0) {
+    return -1;
+  }
   if (multimodal.positions != nullptr) {
     seq->rope_delta = multimodal.rope_delta;
   }
@@ -1915,8 +2022,10 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // The host half of the commit: the run, its cut, the fold rows.
     std::vector<std::int32_t> committed(batch_size, 0);
     std::vector<std::int32_t> next_pending(batch_size, -1);
+    std::vector<bool> redirected(batch_size, false);
     std::vector<ninfer::ops::GdnReplayFoldRow> fold_rows(batch_size);
     std::vector<std::int32_t> selectors(batch_size, 0);
+    std::vector<std::int32_t> run(lane_columns, 0);
     for (uint64_t i = 0; i < batch_size; ++i) {
       const std::int32_t n = accepted[i];
       if (n < 0 || n > extents[i]) {
@@ -1926,27 +2035,26 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       }
       const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
       // run[j]: j == 0 the anchor, else licensed[j-1] (= the j-th draft,
-      // accepted); run length n + 1 before the cut.
-      const auto run_at = [&](std::int32_t j) {
-        return j == 0 ? anchors[i] : lane_licensed[j - 1];
-      };
-      std::int32_t c = n + 1;
-      for (std::int32_t j = 0; j < n + 1; ++j) {
-        bool stop = false;
-        for (uint32_t s = 0; s < sampling[i].stop_id_count && !stop; ++s) {
-          stop = sampling[i].stop_ids[s] == run_at(j);
-        }
-        if (stop) {
-          c = j + 1;
-          break;
-        }
+      // accepted); run length n + 1 before the cut, and licensed[n] -- the
+      // correction/bonus token -- the successor of its last.
+      run[0] = anchors[i];
+      for (std::int32_t j = 0; j < n; ++j) {
+        run[static_cast<std::size_t>(j) + 1] = lane_licensed[j];
       }
+      // The cut at the first stop id inclusive, and the successor of the
+      // run's last committed token: the draft after it when the target agreed
+      // with that draft, else the correction/bonus token. GitHub #315 (ADR
+      // 0048): with the lane's reasoning block open, a stop id is cut before
+      // instead and `</think>` is pending in its place.
+      const IgnisRoundCut cut =
+          ignis_cut_and_redirect(run.data(), n + 1, lane_licensed[n], sampling[i].stop_ids,
+                                 sampling[i].stop_id_count, sampling[i].reasoning_close_id);
+      const std::int32_t c = cut.committed;
       committed[i] = c;
-      // The successor of the run's last token: the draft after it when the
-      // target agreed with that draft, else the correction/bonus token.
-      next_pending[i] = lane_licensed[c - 1];
+      next_pending[i] = cut.next_pending;
+      redirected[i] = cut.redirected;
       for (std::int32_t j = 0; j < c; ++j) {
-        out_token_ids[i * lane_columns + j] = run_at(j);
+        out_token_ids[i * lane_columns + j] = run[static_cast<std::size_t>(j)];
       }
       fold_rows[i] = ninfer::ops::GdnReplayFoldRow{.linear_state_slot = slots[i],
                                                    .commit_columns = c};
@@ -2048,11 +2156,14 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // in the lane's occurrence counts. A cut run keeps only
     // `licensed[0..c)` (its drafts plus the new pending token); the tokens
     // past it were never emitted, so their counts come back off, or the row
-    // a snapshot or a prefix clone carries would run ahead of the text.
-    // Greedy lanes count nothing (the kernel's own contract). Done after the
-    // fold is confirmed, as the last device step before the commit, and in
-    // one read, one adjustment and one write for every such count.
-    std::vector<std::int32_t *> rollback;
+    // a snapshot or a prefix clone carries would run ahead of the text. A
+    // redirected lane's `licensed[c-1]` is the stop id `</think>` replaced
+    // (GitHub #315), so that count moves to `</think>`. Greedy lanes count
+    // nothing (the kernel's own contract). Done after the fold is confirmed,
+    // as the last device step before the commit, and in one read, one
+    // adjustment and one write for every such count (a token licensed twice
+    // in one run is one count, taken back twice).
+    std::vector<std::pair<std::int32_t *, std::int32_t>> rollback;
     for (uint64_t i = 0; i < batch_size; ++i) {
       if (!(configs[i].temperature > 0.0f) || configs[i].token_counts == nullptr) {
         continue;
@@ -2060,34 +2171,14 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       const std::int32_t produced = accepted[i] + 1;
       const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
       for (std::int32_t j = committed[i]; j < produced; ++j) {
-        rollback.push_back(configs[i].token_counts + lane_licensed[j]);
+        rollback.emplace_back(configs[i].token_counts + lane_licensed[j], -1);
+      }
+      if (redirected[i]) {
+        redirect_penalty_move(configs[i], lane_licensed[committed[i] - 1], next_pending[i], &rollback);
       }
     }
     if (!rollback.empty()) {
-      std::vector<std::int32_t> counts(rollback.size(), 0);
-      for (std::size_t r = 0; r < rollback.size() && err == cudaSuccess; ++r) {
-        err = cudaMemcpyAsync(&counts[r], rollback[r], sizeof(std::int32_t),
-                              cudaMemcpyDeviceToHost, model->stream);
-      }
-      if (err == cudaSuccess) {
-        err = cudaStreamSynchronize(model->stream);
-      }
-      // A token licensed twice in one run has two entries reading the same
-      // count; each entry takes one occurrence off the value read.
-      for (std::size_t r = 0; r < rollback.size(); ++r) {
-        std::int32_t taken = 0;
-        for (std::size_t q = 0; q <= r; ++q) {
-          taken += rollback[q] == rollback[r] ? 1 : 0;
-        }
-        counts[r] = counts[r] > taken ? counts[r] - taken : 0;
-      }
-      for (std::size_t r = 0; r < rollback.size() && err == cudaSuccess; ++r) {
-        err = cudaMemcpyAsync(rollback[r], &counts[r], sizeof(std::int32_t),
-                              cudaMemcpyHostToDevice, model->stream);
-      }
-      if (err == cudaSuccess) {
-        err = cudaStreamSynchronize(model->stream);
-      }
+      err = adjust_penalty_counts(rollback, model->stream);
       if (err != cudaSuccess) {
         set_error(std::string("ignis_program_decode: penalty count rollback failed: ") +
                   cudaGetErrorString(err));
@@ -2102,6 +2193,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       sequences[i]->pending_token = next_pending[i];
       advance_frontiers(model, sequences[i], static_cast<std::uint32_t>(committed[i]));
       options.out_committed_counts[i] = committed[i];
+      if (options.out_reasoning_redirected != nullptr) {
+        options.out_reasoning_redirected[i] = redirected[i] ? 1 : 0;
+      }
       if (pending_appended[i]) {
         sequences[i]->dflash2_position += 1;
       }
@@ -2240,6 +2334,11 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       }
       if (seq->position >= ignis_seq_token_capacity(*seq)) {
         set_error("ignis_program_decode: sequence reached its KV capacity");
+        return -1;
+      }
+      if (!redirect_inputs_ok(sampling[i])) {
+        set_error("ignis_program_decode: stop_ids is null with a nonzero stop_id_count at index " +
+                  std::to_string(i));
         return -1;
       }
       emitted[i] = seq->pending_token;
@@ -2462,9 +2561,35 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       return -1;
     }
 
+    // GitHub #315 (ADR 0048): each lane's draw, after the anchor this round
+    // fed -- a stop id drawn with the lane's reasoning block open becomes
+    // `</think>`, and its counted occurrence moves with it.
+    std::vector<IgnisRoundCut> cuts(batch_size);
+    std::vector<std::pair<std::int32_t *, std::int32_t>> moves;
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      cuts[i] = ignis_cut_and_redirect(&emitted[i], 1, successors[i], sampling[i].stop_ids,
+                                       sampling[i].stop_id_count, sampling[i].reasoning_close_id);
+      if (cuts[i].redirected) {
+        redirect_penalty_move(configs[i], successors[i], cuts[i].next_pending, &moves);
+      }
+    }
+    if (!moves.empty()) {
+      err = adjust_penalty_counts(moves, model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: moving a redirected draw's penalty count failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    }
+    if (options != nullptr && options->out_reasoning_redirected != nullptr) {
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        options->out_reasoning_redirected[i] = cuts[i].redirected ? 1 : 0;
+      }
+    }
+
     for (uint64_t i = 0; i < batch_size; ++i) {
       out_token_ids[i] = emitted[i];
-      sequences[i]->pending_token = successors[i];
+      sequences[i]->pending_token = cuts[i].next_pending;
       ++sequences[i]->position;
       // Only once the synchronize above confirms the round's device work
       // completed (mirrors `ignis_gqa_layer_step`'s own ordering, and the
@@ -2613,6 +2738,26 @@ int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                       float *out_permitted_prob) {
   return ::sample_single(model, pool, seq, logits, sampling, purpose, position, out_token_id,
                          out_permitted_prob);
+}
+
+bool redirect_inputs_ok(const ignis_sampling_params &sampling) {
+  return ::redirect_inputs_ok(sampling);
+}
+
+cudaError_t adjust_penalty_counts(const std::vector<std::pair<std::int32_t *, std::int32_t>> &moves,
+                                  cudaStream_t stream) {
+  return ::adjust_penalty_counts(moves, stream);
+}
+
+void redirect_penalty_move(const ninfer::ops::SamplingConfig &cfg, std::int32_t drawn,
+                           std::int32_t close_id,
+                           std::vector<std::pair<std::int32_t *, std::int32_t>> *moves) {
+  ::redirect_penalty_move(cfg, drawn, close_id, moves);
+}
+
+int32_t redirect_span_draw(ignis_seq_pool *pool, ignis_seq *seq, const ignis_sampling_params &sampling,
+                           cudaStream_t stream, int32_t *out_redirected) {
+  return ::redirect_span_draw(pool, seq, sampling, stream, out_redirected);
 }
 
 }  // namespace ignis::step

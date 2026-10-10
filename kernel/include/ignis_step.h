@@ -98,12 +98,28 @@ extern "C" {
  * P5-04 (GitHub #153) appends the verify round's per-lane inputs (ADR 0016:
  * a field append and a size bump, never a parameter). Both are read only by
  * a decode call whose `ignis_decode_options::speculative_window` is nonzero;
- * every other entry point ignores them. `remaining_tokens` is the lane's
+ * every other entry point ignores them (except `stop_ids` under a
+ * `reasoning_close_id`, below). `remaining_tokens` is the lane's
  * remaining generation budget in tokens, counting the anchor this round
  * emits -- the round proposes at most `remaining_tokens - 1` drafts -- and 0
  * means no budget. `stop_ids` (caller-owned, `stop_id_count` entries, valid
  * for the call) cut the committed run at the first stop id inclusive: the
- * sequence's state never runs past the text the caller emits. */
+ * sequence's state never runs past the text the caller emits.
+ *
+ * GitHub #315 (ADR 0048) appends the **reasoning redirect**.
+ * `reasoning_close_id` is the `</think>` id while this lane's reasoning block
+ * is open as far as the caller knows, and -1 otherwise. Wherever the leaf
+ * assigns the lane's successor -- the prefill's draw, a plain round's draw, a
+ * verify round's next pending token -- a successor that is one of `stop_ids`
+ * becomes `reasoning_close_id` while the block is open there, and a verify
+ * round cuts its run *before* an accepted draft that is a stop id. A
+ * `reasoning_close_id` the round commits (its anchor, or an accepted draft)
+ * closes the block for the rest of the round; the anchor itself is never
+ * redirected, since it was decided when it was drawn. So with a nonnegative
+ * id every program entry point reads `stop_ids`, and -1 is the leaf as it
+ * was, bit for bit (the cut: kernel/include/ignis_reasoning_redirect.h). The
+ * degenerate `ignis_prefill` / `ignis_decode` refuse a nonnegative id, as
+ * they refuse a permitted set. */
 /* The most ids one lane's permitted set may carry (P6-06, GitHub #242).
  * Ten digits and a handful of forced literals is what the constrained
  * decode needs; the cap is what lets the set live in a fixed per-lane
@@ -125,6 +141,7 @@ struct ignis_sampling_params {
   const int32_t *stop_ids;   /* P5-04: caller-owned; NULL when the count is 0 */
   uint32_t permitted_count;    /* P6-06: entries in `permitted_ids` (0: unconstrained) */
   const int32_t *permitted_ids; /* P6-06: caller-owned; NULL when the count is 0 */
+  int32_t reasoning_close_id;  /* GitHub #315: `</think>` while the block is open; -1: none */
 };
 
 /* The largest `batch_size` `ignis_program_decode` accepts: the decode
@@ -279,6 +296,10 @@ struct ignis_prefill_options {
    * token's 16 heads' INT4 rows, layout.md section 7.1) -- required on a
    * Flash-Next load, NULL on the 27B. */
   const uint8_t *ngram_rows;
+  /* GitHub #315 (ADR 0048): set to 1 when the span's draw was redirected --
+   * the sequence's pending token is `reasoning_close_id` in place of a drawn
+   * stop id -- else 0. NULL asks for nothing. */
+  int32_t *out_reasoning_redirected;
 };
 
 /* The most heads a readout may bring whole rows back for (GitHub #275): the
@@ -534,6 +555,11 @@ struct ignis_decode_options {
    * round's `drafts` (they hold only while the lane stands where this round
    * left it). -1 on any other load. NULL asks for nothing. */
   int32_t *out_drafts;
+  /* GitHub #315 (ADR 0048): per lane, 1 when this round redirected the lane's
+   * successor -- its next pending token is `reasoning_close_id` in place of a
+   * drawn stop id, which the lane's next round emits first -- else 0. Written
+   * for every lane; NULL asks for nothing. */
+  int32_t *out_reasoning_redirected; /* [batch_size], or NULL */
 };
 
 /* Complete one decode round for a batch of sequence handles.  Each output is

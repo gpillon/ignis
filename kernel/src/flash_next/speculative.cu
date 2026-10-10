@@ -11,7 +11,9 @@
 //   run     [a, d_1 .. d_n], cut at its first stop id inclusive: c tokens
 //   commit  c columns: the frontier moves p -> p + c, pending <- licensed[c - 1]
 // so a lane stands exactly where c one-token rounds over the same text leave it. The round is
-// atomic: no lane's frontier moves unless both passes succeeded.
+// atomic: no lane's frontier moves unless both passes succeeded. GitHub #315 (ADR 0048): with the
+// lane's reasoning block open, a stop id among the drafts is cut before and a stop id pending is
+// replaced, `</think>` pending in its place (kernel/include/ignis_reasoning_redirect.h).
 
 #include "program.h"
 
@@ -19,6 +21,7 @@
 #include "embed_head.h"
 #include "verify.h"
 
+#include "ignis_reasoning_redirect.h"
 #include "ignis_seq_internal.h"
 #include "../step_internal.h"
 
@@ -29,6 +32,7 @@
 #include <algorithm>
 #include <chrono>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ignis::flash_next {
@@ -336,32 +340,36 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
        check_cuda(cudaStreamSynchronize(stream), "the pass's synchronize", &error);
   if (!ok) return fail(error);
 
-  // The host half: each lane's run and its cut.
-  std::vector<int32_t> committed(batch_size, 0), pending(batch_size, -1);
+  // The host half: each lane's run, [a, d_1 .. d_n] with licensed[n] after it, and its cut.
+  std::vector<int32_t> committed(batch_size, 0), pending(batch_size, -1), run(columns, 0);
+  std::vector<bool> redirected(batch_size, false);
   for (uint64_t i = 0; i < batch_size; ++i) {
     const int32_t n = accepted[i];
     if (n < 0 || n > extents[i]) {
       return fail("the accept reported " + std::to_string(n) + " drafts for an extent of " + std::to_string(extents[i]));
     }
     const int32_t *lane_licensed = licensed.data() + i * columns;
-    const auto run_at = [&](int32_t j) { return j == 0 ? anchors[i] : lane_licensed[j - 1]; };
-    int32_t c = n + 1;
-    for (int32_t j = 0; j < n + 1 && c == n + 1; ++j) {
-      for (uint32_t s = 0; s < sampling[i].stop_id_count; ++s) {
-        if (sampling[i].stop_ids[s] == run_at(j)) {
-          c = j + 1;
-          break;
-        }
-      }
-    }
-    committed[i] = c;
-    pending[i] = lane_licensed[c - 1];
-    for (int32_t j = 0; j < c; ++j) out_token_ids[i * columns + j] = run_at(j);
+    run[0] = anchors[i];
+    for (int32_t j = 0; j < n; ++j) run[j + 1] = lane_licensed[j];
+    const IgnisRoundCut cut = ignis_cut_and_redirect(run.data(), n + 1, lane_licensed[n], sampling[i].stop_ids,
+                                                     sampling[i].stop_id_count, sampling[i].reasoning_close_id);
+    committed[i] = cut.committed;
+    pending[i] = cut.next_pending;
+    redirected[i] = cut.redirected;
+    for (int32_t j = 0; j < cut.committed; ++j) out_token_ids[i * columns + j] = run[j];
   }
 
   // The commit, and on an MTP load the next round's drafts: the head's chain runs at the positions
-  // past each lane's new frontier.
+  // past each lane's new frontier. A redirected lane's successor of its last committed column is
+  // `</think>`, not the stop id the pass licensed there: the head's entry and first draft at that
+  // column read it from the licensed tokens, so it goes in first.
   ok = stage(state.commit->p, committed.data(), lane_bytes, "the committed counts");
+  for (uint64_t i = 0; ok && mtp && i < batch_size; ++i) {
+    if (redirected[i]) {
+      ok = stage(static_cast<int32_t *>(state.licensed->p) + i * columns + (committed[i] - 1), &pending[i],
+                 sizeof(int32_t), "a redirected successor");
+    }
+  }
   std::vector<int32_t> next_drafts(mtp ? static_cast<std::size_t>(width) * k : 0, -1);
   if (ok && mtp && k > 1) {
     std::vector<int32_t> chain(static_cast<std::size_t>(k - 1) * width);
@@ -382,31 +390,20 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   if (!ok) return fail(error);
 
   // The penalty rows: at temperature > 0 the accept counted every licensed token; the ones past a
-  // cut run were never emitted, so their counts come back off (the 27B's rule, step.cu).
-  std::vector<int32_t *> rollback;
+  // cut run were never emitted, so their counts come back off, and a redirected lane's count of the
+  // stop id `</think>` replaced moves to `</think>` (the 27B's rule, step.cu).
+  std::vector<std::pair<int32_t *, int32_t>> rollback;
   for (uint64_t i = 0; i < batch_size; ++i) {
     if (!(configs[i].temperature > 0.0F) || configs[i].token_counts == nullptr) continue;
     for (int32_t j = committed[i]; j < accepted[i] + 1; ++j) {
-      rollback.push_back(configs[i].token_counts + licensed[i * columns + j]);
+      rollback.emplace_back(configs[i].token_counts + licensed[i * columns + j], -1);
+    }
+    if (redirected[i]) {
+      step::redirect_penalty_move(configs[i], licensed[i * columns + committed[i] - 1], pending[i], &rollback);
     }
   }
   if (!rollback.empty()) {
-    std::vector<int32_t> counts(rollback.size(), 0);
-    for (std::size_t r = 0; r < rollback.size() && ok; ++r) {
-      ok = check_cuda(cudaMemcpyAsync(&counts[r], rollback[r], sizeof(int32_t), cudaMemcpyDeviceToHost, stream),
-                      "reading a penalty count", &error);
-    }
-    ok = ok && check_cuda(cudaStreamSynchronize(stream), "the penalty read", &error);
-    for (std::size_t r = 0; r < rollback.size() && ok; ++r) {
-      int32_t taken = 0;
-      for (std::size_t q = 0; q <= r; ++q) taken += rollback[q] == rollback[r] ? 1 : 0;
-      counts[r] = std::max(counts[r] - taken, 0);
-    }
-    for (std::size_t r = 0; r < rollback.size() && ok; ++r) {
-      ok = check_cuda(cudaMemcpyAsync(rollback[r], &counts[r], sizeof(int32_t), cudaMemcpyHostToDevice, stream),
-                      "writing a penalty count", &error);
-    }
-    ok = ok && check_cuda(cudaStreamSynchronize(stream), "the penalty write", &error);
+    ok = check_cuda(step::adjust_penalty_counts(rollback, stream), "the penalty rollback", &error);
     if (!ok) return fail(error);
   }
 
@@ -417,6 +414,7 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
       for (uint32_t j = 0; j < k; ++j) options->out_drafts[i * k + j] = mtp ? next_drafts[i * k + j] : -1;
     }
     options->out_committed_counts[i] = committed[i];
+    if (options->out_reasoning_redirected != nullptr) options->out_reasoning_redirected[i] = redirected[i] ? 1 : 0;
     if (options->out_extents != nullptr) options->out_extents[i] = static_cast<uint32_t>(extents[i]);
     if (options->out_permitted_probs != nullptr) options->out_permitted_probs[i] = 0.0F;
   }

@@ -13,8 +13,12 @@
 
 #include "core/tensor.h"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ignis::step {
 
@@ -39,5 +43,27 @@ int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                       const ninfer::Tensor &logits, const ignis_sampling_params &sampling,
                       std::int32_t purpose, std::int32_t position, int32_t *out_token_id,
                       float *out_permitted_prob);
+
+// GitHub #315 (ADR 0048): an armed reasoning redirect reads the lane's stop
+// ids wherever its successor is assigned; false when they are missing.
+bool redirect_inputs_ok(const ignis_sampling_params &sampling);
+
+// Occurrences moved in penalty-count rows (a count's device address, what to
+// add, clamped at 0), one read and one write per distinct count, both sides
+// synchronized: a verify round's rollback past its cut, and a redirect's move.
+cudaError_t adjust_penalty_counts(const std::vector<std::pair<std::int32_t *, std::int32_t>> &moves,
+                                  cudaStream_t stream);
+
+// GitHub #315: the occurrence a temperature draw counted for the stop id it
+// drew, moved to `close_id`, appended to `moves` (nothing for a greedy draw).
+void redirect_penalty_move(const ninfer::ops::SamplingConfig &cfg, std::int32_t drawn,
+                           std::int32_t close_id,
+                           std::vector<std::pair<std::int32_t *, std::int32_t>> *moves);
+
+// GitHub #315: a span's draw, the sequence's pending token, redirected when it
+// is a stop id drawn with the lane's reasoning block open; whether it was into
+// `*out_redirected` (or nowhere). After the span's device work is confirmed.
+int32_t redirect_span_draw(ignis_seq_pool *pool, ignis_seq *seq, const ignis_sampling_params &sampling,
+                           cudaStream_t stream, int32_t *out_redirected);
 
 }  // namespace ignis::step

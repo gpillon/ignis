@@ -268,6 +268,7 @@ fn run_verify(
                 remaining_tokens: (total - emitted[i].len()) as u32,
                 stop_ids,
                 drafts,
+                reasoning_close: -1,
             })
             .collect();
         let mut remaining: Vec<Option<&mut Seq<'_>>> = sequences.iter_mut().map(Some).collect();
@@ -498,7 +499,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
             let mut probe = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
             prefill_program_sampled(&model, &pool, &mut probe, prompt, 0, greedy, None)
                 .unwrap_or_else(|e| panic!("prefill: {e}"));
-            let lanes = [VerifyLane { sampling: greedy, remaining_tokens: TOTAL as u32, stop_ids: &[], drafts: &drafts }];
+            let lanes = [VerifyLane { remaining_tokens: TOTAL as u32, drafts: &drafts, ..VerifyLane::greedy(&[]) }];
             decode_program_verify(&model, &pool, &mut [&mut probe], &lanes, WINDOW)
                 .unwrap_or_else(|e| panic!("probe verify round: {e}"))
                 .remove(0)
@@ -513,7 +514,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
         prefill_program_sampled(&model, &pool, &mut publisher, prompt, 0, greedy, None)
             .unwrap_or_else(|e| panic!("prefill: {e}"));
         let stops = [stop];
-        let lanes = [VerifyLane { sampling: greedy, remaining_tokens: TOTAL as u32, stop_ids: &stops, drafts: &drafts }];
+        let lanes = [VerifyLane { remaining_tokens: TOTAL as u32, stop_ids: &stops, drafts: &drafts, ..VerifyLane::greedy(&[]) }];
         let runs = decode_program_verify(&model, &pool, &mut [&mut publisher], &lanes, WINDOW)
             .unwrap_or_else(|e| panic!("verify round with a stop id: {e}"));
         exercised = true;

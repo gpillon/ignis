@@ -57,6 +57,12 @@ pub(crate) mod ffi {
         /// the constraint composes with temperature, top-k and the seed
         /// instead of replacing them.
         pub permitted_ids: *const i32,
+        /// GitHub #315 (ADR 0048): `</think>` while this lane's reasoning
+        /// block is open, -1 otherwise. A successor that is one of
+        /// `stop_ids` becomes this id while the block is open, on every
+        /// path that assigns one, so with it set every entry point reads
+        /// `stop_ids`.
+        pub reasoning_close_id: i32,
     }
 
     /// `IGNIS_MAX_PERMITTED_TOKENS` (GitHub #242): the most ids one lane's
@@ -93,6 +99,10 @@ pub(crate) mod ffi {
         /// GitHub #307: a Flash-Next MTP load's drafts for each lane's next
         /// round, `[batch][window]`; null asks for nothing.
         pub out_drafts: *mut i32,
+        /// GitHub #315 (ADR 0048): per lane, 1 when the round redirected the
+        /// lane's successor to its `reasoning_close_id`, else 0; null asks
+        /// for nothing.
+        pub out_reasoning_redirected: *mut i32,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -160,6 +170,9 @@ pub(crate) mod ffi {
         /// GitHub #302: the span's n-gram table rows on a Flash-Next load,
         /// host `[num_tokens][16][90]`; null on the 27B.
         pub ngram_rows: *const u8,
+        /// GitHub #315 (ADR 0048): 1 when the span's draw was redirected to
+        /// its `reasoning_close_id`, else 0; null asks for nothing.
+        pub out_reasoning_redirected: *mut i32,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -306,6 +319,7 @@ const GREEDY: ffi::IgnisSamplingParams = ffi::IgnisSamplingParams {
     // this constant wants — the constraint is a decode-round parameter.
     permitted_count: 0,
     permitted_ids: std::ptr::null(),
+    reasoning_close_id: -1,
 };
 
 /// A sequence's real sampling parameters for one program-layer call (P3-03,
@@ -358,6 +372,9 @@ impl SamplingParams {
             // fills it per round.
             permitted_count: 0,
             permitted_ids: std::ptr::null(),
+            // GitHub #315: a lane's redirect rides `Redirect`, beside its
+            // stop ids, not the sampling parameters a request carries.
+            reasoning_close_id: -1,
         }
     }
 }
@@ -371,25 +388,118 @@ impl SamplingParams {
 /// proposes at most `remaining_tokens - 1` drafts; 0 means no budget.
 /// `drafts` holds at most the load's window; an empty slice proposes nothing
 /// and the lane runs at extent 0, one committed token. The committed run is
-/// cut at the first id in `stop_ids`, inclusive.
+/// cut at the first id in `stop_ids`, inclusive -- or, with the lane's
+/// `reasoning_close` set (GitHub #315, ADR 0048), before an accepted draft
+/// that is one, with `</think>` pending in its place.
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyLane<'a> {
     pub sampling: SamplingParams,
     pub remaining_tokens: u32,
     pub stop_ids: &'a [i32],
     pub drafts: &'a [i32],
+    /// `</think>` while the lane's reasoning block is open, -1 otherwise
+    /// ([`Redirect::close_id`]).
+    pub reasoning_close: i32,
 }
 
 impl<'a> VerifyLane<'a> {
-    /// A greedy lane with no budget, no stop ids and these drafts.
+    /// A greedy lane with no budget, no stop ids, no redirect and these
+    /// drafts.
     pub fn greedy(drafts: &'a [i32]) -> Self {
         VerifyLane {
             sampling: SamplingParams::greedy(),
             remaining_tokens: 0,
             stop_ids: &[],
             drafts,
+            reasoning_close: -1,
         }
     }
+}
+
+/// One draw's **reasoning redirect** (GitHub #315, ADR 0048): the lane's stop
+/// ids, and the `</think>` id a stop id drawn while the lane's reasoning
+/// block is open becomes. [`Redirect::NONE`] draws as the leaf always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Redirect<'a> {
+    /// The ids that end the lane's turn (its EOS).
+    pub stop_ids: &'a [i32],
+    /// `</think>` while the block is open as far as the caller knows, -1
+    /// otherwise.
+    pub close_id: i32,
+}
+
+impl Redirect<'_> {
+    /// No redirect: the draw stands, whatever it is.
+    pub const NONE: Redirect<'static> = Redirect {
+        stop_ids: &[],
+        close_id: -1,
+    };
+
+    /// `params` with this redirect armed. The ABI reads the stop ids'
+    /// pointer only beside a nonzero count.
+    fn arm(self, params: ffi::IgnisSamplingParams) -> ffi::IgnisSamplingParams {
+        ffi::IgnisSamplingParams {
+            stop_id_count: self.stop_ids.len() as u32,
+            stop_ids: if self.stop_ids.is_empty() {
+                std::ptr::null()
+            } else {
+                self.stop_ids.as_ptr()
+            },
+            reasoning_close_id: self.close_id,
+            ..params
+        }
+    }
+}
+
+/// How one sequence's successor is drawn, by a prefill or a plain round:
+/// under its sampling parameters, restricted to its permitted set (GitHub
+/// #242; empty draws freely) and redirected by its [`Redirect`] (GitHub
+/// #315).
+#[derive(Debug, Clone, Copy)]
+pub struct LaneDraw<'a> {
+    pub sampling: SamplingParams,
+    pub permitted: &'a [i32],
+    pub redirect: Redirect<'a>,
+}
+
+impl LaneDraw<'_> {
+    /// A free draw under `sampling`: no set, no redirect.
+    pub fn free(sampling: SamplingParams) -> LaneDraw<'static> {
+        LaneDraw {
+            sampling,
+            permitted: &[],
+            redirect: Redirect::NONE,
+        }
+    }
+
+    fn to_ffi(self, what: &str) -> Result<ffi::IgnisSamplingParams, String> {
+        Ok(self.redirect.arm(permitted_params(what, self.sampling, self.permitted)?))
+    }
+}
+
+/// What a prefill's own draw reports (GitHub #242, #315): the token itself
+/// is the sequence's pending one, which the next round emits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpanDraw {
+    /// The draw's probability within its permitted set, 0 without one.
+    pub probability: f32,
+    /// Whether the leaf redirected it: the pending token is the redirect's
+    /// `</think>` in place of a stop id the span drew.
+    pub redirected: bool,
+}
+
+/// One lane's result from a plain round ([`decode_program_round`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoundDraw {
+    /// The token the round emitted: the one the previous call drew.
+    pub token: i32,
+    /// The probability of the token this round **drew** within the lane's
+    /// permitted set, 0 without one -- it belongs to the token the next
+    /// round emits.
+    pub probability: f32,
+    /// Whether this round's draw was redirected: the next round emits the
+    /// redirect's `</think>` first.
+    pub redirected: bool,
 }
 
 /// Device footprint and most-recent-step telemetry from the real program.
@@ -618,6 +728,7 @@ impl PrefillRoute {
             out_span_logits: std::ptr::null_mut(),
             out_attention_set_rows: std::ptr::null_mut(),
             ngram_rows: std::ptr::null(),
+            out_reasoning_redirected: std::ptr::null_mut(),
         }
     }
 }
@@ -683,11 +794,36 @@ pub fn prefill_program_sampled(
     sampling: SamplingParams,
     out_logits: Option<&mut [f32]>,
 ) -> Result<(), String> {
+    prefill_program_draw(model, pool, sequence, token_ids, start_position, LaneDraw::free(sampling), out_logits)
+        .map(|_| ())
+}
+
+/// Prefill `token_ids` on the production route and draw the span's
+/// successor as `draw` says: under its sampling parameters, restricted to
+/// its permitted set and redirected by its [`Redirect`] (GitHub #315). What
+/// [`prefill_program_sampled`] and [`prefill_program_permitted`] each do
+/// half of.
+pub fn prefill_program_draw(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    draw: LaneDraw<'_>,
+    out_logits: Option<&mut [f32]>,
+) -> Result<SpanDraw, String> {
+    let params = draw.to_ffi("prefill_program_draw")?;
+    let mut probability = 0f32;
+    let mut redirected = 0i32;
+    let options = ffi::IgnisPrefillOptions {
+        out_permitted_prob: &mut probability,
+        out_reasoning_redirected: &mut redirected,
+        ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
+    };
     let logits_ptr = match out_logits {
         Some(buf) => buf.as_mut_ptr(),
         None => std::ptr::null_mut(),
     };
-    let params = sampling.to_ffi();
     let rc = unsafe {
         ffi::ignis_program_prefill(
             model.handle(),
@@ -697,14 +833,17 @@ pub fn prefill_program_sampled(
             token_ids.len() as u64,
             start_position,
             &params,
-            std::ptr::null(),
+            &options,
             logits_ptr,
         )
     };
     if rc != 0 {
         return Err(last_error());
     }
-    Ok(())
+    Ok(SpanDraw {
+        probability,
+        redirected: redirected == 1,
+    })
 }
 
 /// [`prefill_program`], with the route selectable (ADR 0016, P2-02, GitHub
@@ -833,8 +972,10 @@ pub fn flash_next_ngram_token_bytes() -> usize {
 /// `[token_ids.len()][16][90]`, as `NgramTable::begin(..).finish(..)` stages
 /// them) and, with `out_span_logits`, the BF16 logits of every position
 /// (`[token_ids.len()][vocab]`, as [`prefill_program_span_logits`]); with
-/// `out_logits`, the last position's logits as floats. Returns the drawn
-/// token's probability within its permitted set (0 without one).
+/// `out_logits`, the last position's logits as floats; `redirect` is the
+/// draw's reasoning redirect (GitHub #315). Returns the drawn token's
+/// probability within its permitted set (0 without one) and whether it was
+/// redirected.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_flash_next(
     model: &Model,
@@ -844,10 +985,11 @@ pub fn prefill_flash_next(
     start_position: u64,
     sampling: SamplingParams,
     permitted: &[i32],
+    redirect: Redirect<'_>,
     ngram_rows: &[u8],
     out_span_logits: Option<&mut [u16]>,
     out_logits: Option<&mut [f32]>,
-) -> Result<f32, String> {
+) -> Result<SpanDraw, String> {
     // Exact lengths: the leaf reads and writes these buffers by the span's
     // own count, never by the slices' (no over-read or over-write in C).
     let vocab = crate::compute::ModelConfig::qwen38_flash_next().vocab as usize;
@@ -874,6 +1016,7 @@ pub fn prefill_flash_next(
         }
     }
     let mut probability = 0.0f32;
+    let mut redirected = 0i32;
     let span_logits = match out_span_logits {
         Some(rows) => rows.as_mut_ptr(),
         None => std::ptr::null_mut(),
@@ -882,9 +1025,10 @@ pub fn prefill_flash_next(
         out_span_logits: span_logits,
         out_permitted_prob: &mut probability,
         ngram_rows: ngram_rows.as_ptr(),
+        out_reasoning_redirected: &mut redirected,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
-    let params = permitted_params("prefill_flash_next", sampling, permitted)?;
+    let params = redirect.arm(permitted_params("prefill_flash_next", sampling, permitted)?);
     let logits = match out_logits {
         Some(row) => row.as_mut_ptr(),
         None => std::ptr::null_mut(),
@@ -905,7 +1049,10 @@ pub fn prefill_flash_next(
     if rc != 0 {
         return Err(last_error());
     }
-    Ok(probability)
+    Ok(SpanDraw {
+        probability,
+        redirected: redirected == 1,
+    })
 }
 
 /// GitHub #302: one Flash-Next decode round, each lane drawn under its own
@@ -921,23 +1068,57 @@ pub fn decode_flash_next(
     lanes: &[(SamplingParams, &[i32])],
     ngram_rows: &[u8],
 ) -> Result<Vec<(i32, f32)>, String> {
+    let lanes: Vec<LaneDraw<'_>> = lanes
+        .iter()
+        .map(|&(sampling, permitted)| LaneDraw {
+            permitted,
+            ..LaneDraw::free(sampling)
+        })
+        .collect();
+    Ok(decode_program_round(model, pool, sequences, &lanes, Some(ngram_rows))?
+        .into_iter()
+        .map(|drawn| (drawn.token, drawn.probability))
+        .collect())
+}
+
+/// One plain round -- one token a lane, no drafts -- over `sequences`, each
+/// lane's successor drawn as its [`LaneDraw`] says (`lanes` parallel to
+/// `sequences`): the round every other plain entry point here is a view of.
+/// `ngram_rows` is a Flash-Next load's (`[sequences.len()][16][90]`, each
+/// lane's pending token's rows, [`decode_flash_next`]) and `None` on the
+/// 27B. Returns, per lane, the token it emitted, its draw's probability
+/// within its permitted set and whether its draw was redirected (GitHub
+/// #315).
+pub fn decode_program_round(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[LaneDraw<'_>],
+    ngram_rows: Option<&[u8]>,
+) -> Result<Vec<RoundDraw>, String> {
     if lanes.len() != sequences.len() {
-        return Err(format!("decode_flash_next: {} lanes' sampling for {} sequences", lanes.len(), sequences.len()));
+        return Err(format!("decode_program_round: {} lanes for {} sequences", lanes.len(), sequences.len()));
     }
-    if ngram_rows.len() != sequences.len() * flash_next_ngram_token_bytes() {
-        return Err(format!(
-            "decode_flash_next: {} n-gram row bytes for {} lanes of {} bytes",
-            ngram_rows.len(),
-            sequences.len(),
-            flash_next_ngram_token_bytes()
-        ));
+    if let Some(rows) = ngram_rows {
+        if rows.len() != sequences.len() * flash_next_ngram_token_bytes() {
+            return Err(format!(
+                "decode_program_round: {} n-gram row bytes for {} lanes of {} bytes",
+                rows.len(),
+                sequences.len(),
+                flash_next_ngram_token_bytes()
+            ));
+        }
     }
     let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    // The id slices are the caller's and stay borrowed for the call, which
+    // is exactly the lifetime the ABI asks for.
     let params = lanes
         .iter()
-        .map(|(sampling, permitted)| permitted_params("decode_flash_next", *sampling, permitted))
+        .enumerate()
+        .map(|(index, lane)| lane.to_ffi(&format!("decode_program_round: lane {index}")))
         .collect::<Result<Vec<_>, _>>()?;
     let mut probabilities = vec![0.0f32; handles.len()];
+    let mut redirected = vec![0i32; handles.len()];
     let options = ffi::IgnisDecodeOptions {
         size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
         speculative_window: 0,
@@ -946,8 +1127,9 @@ pub fn decode_flash_next(
         out_committed_counts: std::ptr::null_mut(),
         out_extents: std::ptr::null_mut(),
         out_permitted_probs: probabilities.as_mut_ptr(),
-        ngram_rows: ngram_rows.as_ptr(),
+        ngram_rows: ngram_rows.map_or(std::ptr::null(), <[u8]>::as_ptr),
         out_drafts: std::ptr::null_mut(),
+        out_reasoning_redirected: redirected.as_mut_ptr(),
     };
     let mut tokens = vec![-1; handles.len()];
     let rc = unsafe {
@@ -964,7 +1146,16 @@ pub fn decode_flash_next(
     if rc != 0 {
         return Err(last_error());
     }
-    Ok(tokens.into_iter().zip(probabilities).collect())
+    Ok(tokens
+        .into_iter()
+        .zip(probabilities)
+        .zip(redirected)
+        .map(|((token, probability), redirected)| RoundDraw {
+            token,
+            probability,
+            redirected: redirected == 1,
+        })
+        .collect())
 }
 
 /// Emit one greedy token for each sequence and prepare the following round.
@@ -1014,24 +1205,11 @@ pub fn decode_program_batch_sampled(
             sequences.len()
         ));
     }
-    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
-    let params: Vec<ffi::IgnisSamplingParams> = sampling.iter().map(|p| p.to_ffi()).collect();
-    let mut tokens = vec![-1; handles.len()];
-    let rc = unsafe {
-        ffi::ignis_program_decode(
-            model.handle(),
-            pool.handle(),
-            handles.as_mut_ptr(),
-            handles.len() as u64,
-            params.as_ptr(),
-            tokens.as_mut_ptr(),
-            std::ptr::null(),
-        )
-    };
-    if rc != 0 {
-        return Err(last_error());
-    }
-    Ok(tokens)
+    let lanes: Vec<LaneDraw<'_>> = sampling.iter().map(|&p| LaneDraw::free(p)).collect();
+    Ok(decode_program_round(model, pool, sequences, &lanes, None)?
+        .into_iter()
+        .map(|drawn| drawn.token)
+        .collect())
 }
 
 /// Prefill `token_ids` and draw the span's successor from `permitted`
@@ -1106,31 +1284,12 @@ pub fn prefill_program_permitted(
             ffi::MAX_PERMITTED_TOKENS
         ));
     }
-    let params = permitted_params("prefill_program_permitted", sampling, permitted)?;
-    let mut probability = 0f32;
-    let mut options = PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault);
-    options.out_permitted_prob = &mut probability;
-    let logits_ptr = match out_logits {
-        Some(buf) => buf.as_mut_ptr(),
-        None => std::ptr::null_mut(),
+    let draw = LaneDraw {
+        permitted,
+        ..LaneDraw::free(sampling)
     };
-    let rc = unsafe {
-        ffi::ignis_program_prefill(
-            model.handle(),
-            pool.handle(),
-            sequence.handle(),
-            token_ids.as_ptr(),
-            token_ids.len() as u64,
-            start_position,
-            &params,
-            &options,
-            logits_ptr,
-        )
-    };
-    if rc != 0 {
-        return Err(last_error());
-    }
-    Ok(probability)
+    prefill_program_draw(model, pool, sequence, token_ids, start_position, draw, out_logits)
+        .map(|drawn| drawn.probability)
 }
 
 /// One lane of a **constrained** decode round (P6-06, GitHub #242).
@@ -1169,48 +1328,17 @@ pub fn decode_program_batch_permitted(
         ));
     }
 
-    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
-    // The id slices are the caller's and stay borrowed for the call, which
-    // is exactly the lifetime the ABI asks for.
-    let params: Vec<ffi::IgnisSamplingParams> = lanes
+    let lanes: Vec<LaneDraw<'_>> = lanes
         .iter()
-        .enumerate()
-        .map(|(index, lane)| {
-            permitted_params(
-                &format!("decode_program_batch_permitted: lane {index}"),
-                lane.sampling,
-                lane.permitted,
-            )
+        .map(|lane| LaneDraw {
+            permitted: lane.permitted,
+            ..LaneDraw::free(lane.sampling)
         })
-        .collect::<Result<_, _>>()?;
-    let mut tokens = vec![-1i32; handles.len()];
-    let mut probabilities = vec![0f32; handles.len()];
-    let options = ffi::IgnisDecodeOptions {
-        size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
-        speculative_window: 0,
-        drafts: std::ptr::null(),
-        draft_counts: std::ptr::null(),
-        out_committed_counts: std::ptr::null_mut(),
-        out_extents: std::ptr::null_mut(),
-        out_permitted_probs: probabilities.as_mut_ptr(),
-        ngram_rows: std::ptr::null(),
-        out_drafts: std::ptr::null_mut(),
-    };
-    let rc = unsafe {
-        ffi::ignis_program_decode(
-            model.handle(),
-            pool.handle(),
-            handles.as_mut_ptr(),
-            handles.len() as u64,
-            params.as_ptr(),
-            tokens.as_mut_ptr(),
-            &options,
-        )
-    };
-    if rc != 0 {
-        return Err(last_error());
-    }
-    Ok((tokens, probabilities))
+        .collect();
+    Ok(decode_program_round(model, pool, sequences, &lanes, None)?
+        .into_iter()
+        .map(|drawn| (drawn.token, drawn.probability))
+        .unzip())
 }
 
 /// One verify round over `sequences` at the load's draft `window` (P5-04,
@@ -1251,6 +1379,10 @@ pub struct LaneVerifyRun {
     /// head made for the lane's next round, at the frontier this run left it
     /// at (`window` of them); empty on any other load.
     pub next_drafts: Vec<i32>,
+    /// GitHub #315 (ADR 0048): the lane's next pending token is its
+    /// `reasoning_close` in place of a stop id -- the next round emits it
+    /// first.
+    pub redirected: bool,
 }
 
 /// [`decode_program_verify`], reporting each lane's extent with its run.
@@ -1329,15 +1461,15 @@ fn verify_round(
     let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
     let params: Vec<ffi::IgnisSamplingParams> = lanes
         .iter()
-        .map(|lane| ffi::IgnisSamplingParams {
-            remaining_tokens: lane.remaining_tokens,
-            stop_id_count: lane.stop_ids.len() as u32,
-            stop_ids: if lane.stop_ids.is_empty() {
-                std::ptr::null()
-            } else {
-                lane.stop_ids.as_ptr()
-            },
-            ..lane.sampling.to_ffi()
+        .map(|lane| {
+            let redirect = Redirect {
+                stop_ids: lane.stop_ids,
+                close_id: lane.reasoning_close,
+            };
+            redirect.arm(ffi::IgnisSamplingParams {
+                remaining_tokens: lane.remaining_tokens,
+                ..lane.sampling.to_ffi()
+            })
         })
         .collect();
     // Row-major `[batch][window]`, each lane's proposals first, the rest
@@ -1352,6 +1484,7 @@ fn verify_round(
     let mut committed = vec![0i32; handles.len()];
     let mut extents = vec![0u32; handles.len()];
     let mut next_drafts = vec![-1i32; handles.len() * width];
+    let mut redirected = vec![0i32; handles.len()];
     // No proposal on any lane is a null seam: every lane at extent 0 under a
     // caller-fed load, the drafter's own proposals under DFlash2.
     let proposes = lanes.iter().any(|lane| !lane.drafts.is_empty());
@@ -1367,6 +1500,7 @@ fn verify_round(
         out_permitted_probs: std::ptr::null_mut(),
         ngram_rows,
         out_drafts: next_drafts.as_mut_ptr(),
+        out_reasoning_redirected: redirected.as_mut_ptr(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -1393,6 +1527,7 @@ fn verify_round(
                 tokens: tokens[start..start + count as usize].to_vec(),
                 extent,
                 next_drafts: if drafts.iter().all(|&d| d >= 0) { drafts.to_vec() } else { Vec::new() },
+                redirected: redirected[index] == 1,
             }
         })
         .collect())
@@ -1563,6 +1698,9 @@ pub struct SpanMediaColumns<'a> {
 /// last position; `None` asks for none and costs nothing. The returned flag
 /// is whether the leaf could read the keys it names — `false` (and `false`
 /// for no readout) leaves the scores unwritten and the prefill standing.
+///
+/// `redirect` is the draw's reasoning redirect (GitHub #315): a chat turn
+/// about an image starts inside its reasoning as a text one does.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_multimodal(
     model: &Model,
@@ -1572,10 +1710,11 @@ pub fn prefill_program_multimodal(
     start_position: u64,
     sampling: SamplingParams,
     permitted: &[i32],
+    redirect: Redirect<'_>,
     span: MultimodalPrefill<'_>,
     out_logits: Option<&mut [f32]>,
     attention: Option<AttentionReadout<'_>>,
-) -> Result<(f32, bool), String> {
+) -> Result<(SpanDraw, bool), String> {
     prefill_program_reading(
         "prefill_program_multimodal",
         model,
@@ -1583,8 +1722,11 @@ pub fn prefill_program_multimodal(
         sequence,
         token_ids,
         start_position,
-        sampling,
-        permitted,
+        LaneDraw {
+            sampling,
+            permitted,
+            redirect,
+        },
         Some(span),
         out_logits,
         attention,
@@ -1596,8 +1738,9 @@ pub fn prefill_program_multimodal(
 /// way a head `point` reads an image's ([`prefill_program_multimodal`]),
 /// on the chunked route. `permitted` empty is an ordinary prefill.
 ///
-/// Returns the permitted draw's probability (0 with no set) and whether the
-/// leaf could read the keys the readout names.
+/// Returns the permitted draw's probability (0 with no set) and whether it
+/// was redirected (GitHub #315), and whether the leaf could read the keys
+/// the readout names.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_attention(
     model: &Model,
@@ -1605,11 +1748,10 @@ pub fn prefill_program_attention(
     sequence: &mut Seq<'_>,
     token_ids: &[i32],
     start_position: u64,
-    sampling: SamplingParams,
-    permitted: &[i32],
+    draw: LaneDraw<'_>,
     out_logits: Option<&mut [f32]>,
     attention: AttentionReadout<'_>,
-) -> Result<(f32, bool), String> {
+) -> Result<(SpanDraw, bool), String> {
     prefill_program_reading(
         "prefill_program_attention",
         model,
@@ -1617,8 +1759,7 @@ pub fn prefill_program_attention(
         sequence,
         token_ids,
         start_position,
-        sampling,
-        permitted,
+        draw,
         None,
         out_logits,
         Some(attention),
@@ -1636,18 +1777,19 @@ fn prefill_program_reading(
     sequence: &mut Seq<'_>,
     token_ids: &[i32],
     start_position: u64,
-    sampling: SamplingParams,
-    permitted: &[i32],
+    draw: LaneDraw<'_>,
     span: Option<MultimodalPrefill<'_>>,
     out_logits: Option<&mut [f32]>,
     attention: Option<AttentionReadout<'_>>,
-) -> Result<(f32, bool), String> {
+) -> Result<(SpanDraw, bool), String> {
     use crate::pointing::SetRead;
-    let params = permitted_params(what, sampling, permitted)?;
+    let params = draw.to_ffi(what)?;
     let mut probability = 0f32;
+    let mut redirected = 0i32;
     let mut read = 0i32;
     let mut options = ffi::IgnisPrefillOptions {
         out_permitted_prob: &mut probability,
+        out_reasoning_redirected: &mut redirected,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     if let Some(span) = span {
@@ -1757,7 +1899,11 @@ fn prefill_program_reading(
             *slot = key as u32;
         }
     }
-    Ok((probability, read == 1))
+    let drawn = SpanDraw {
+        probability,
+        redirected: redirected == 1,
+    };
+    Ok((drawn, read == 1))
 }
 
 /// Read full-program telemetry without exposing a device pointer or stream.

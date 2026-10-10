@@ -652,6 +652,7 @@ mod tests {
             attention: None,
             drawn: None,
             thinking: None,
+            reasoning_redirected_at: None,
         }
     }
 
