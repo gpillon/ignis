@@ -1374,12 +1374,27 @@ pub(crate) fn resolve_finish_reason(
 /// generation to reuse).
 pub(crate) fn report_if_all_reasoning_no_content(id: &str, all_reasoning: bool, finish_reason: &'static str) {
     if all_reasoning {
+        let cause = all_reasoning_cause(finish_reason);
         tracing::warn!(
             id,
             finish_reason,
-            "generation produced reasoning but no content or tool call \
-             (token budget exhausted before an answer began)"
+            cause,
+            "generation produced reasoning but no content or tool call: {cause}"
         );
+    }
+}
+
+/// Why an all-reasoning turn ended (GitHub #315), read off how it ended:
+/// chat's `finish_reason` or the Responses `status`, whichever the caller
+/// has. It never names the thinking budget — a forced close is the request
+/// log's `thinking_forced`, and on 2026-10-10 a turn that ended on its own
+/// EOS, far short of its budget, was told the budget ran out.
+pub(crate) fn all_reasoning_cause(ending: &str) -> &'static str {
+    match ending {
+        "stop" | "completed" => "the model ended its turn (EOS) before any answer",
+        "length" | "incomplete" => "the output limit was reached before any answer",
+        "cancelled" => "the client cancelled before any answer",
+        _ => "the generation ended before any answer",
     }
 }
 
@@ -3111,6 +3126,43 @@ mod tests {
         // GitHub #166: a request the engine gave up on is never a clean stop.
         assert_eq!(resolve_finish_reason(FinishReason::Error, true, false), "error");
         assert_eq!(resolve_finish_reason(FinishReason::Error, false, false), "error");
+    }
+
+    // ── GitHub #315: the all-reasoning WARN names how the turn ended ─────
+
+    /// The 2026-10-10 turn ended on the model's own EOS 17,000 tokens short
+    /// of its budget, and the WARN blamed the budget. A stop is the model's
+    /// doing, on chat's vocabulary and on Responses'.
+    #[test]
+    fn an_all_reasoning_stop_is_the_model_ending_its_turn() {
+        for ending in ["stop", "completed"] {
+            let cause = all_reasoning_cause(ending);
+            assert!(cause.contains("model ended its turn"), "{ending}: {cause}");
+        }
+    }
+
+    #[test]
+    fn an_all_reasoning_length_is_the_output_limit() {
+        for ending in ["length", "incomplete"] {
+            let cause = all_reasoning_cause(ending);
+            assert!(cause.contains("output limit"), "{ending}: {cause}");
+        }
+    }
+
+    #[test]
+    fn an_all_reasoning_cancel_is_the_client() {
+        assert!(all_reasoning_cause("cancelled").contains("client cancelled"));
+    }
+
+    /// Whether the budget closed the block is the request log's to say
+    /// (`thinking_forced`); the WARN never guesses it.
+    #[test]
+    fn no_all_reasoning_cause_blames_the_token_budget() {
+        for ending in ["stop", "completed", "length", "incomplete", "cancelled", "failed", "error", ""] {
+            let cause = all_reasoning_cause(ending);
+            assert!(!cause.contains("budget"), "{ending}: {cause}");
+            assert!(!cause.is_empty(), "{ending}");
+        }
     }
 
     #[test]
