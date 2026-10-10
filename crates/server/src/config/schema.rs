@@ -604,7 +604,7 @@ mod tests {
         for reserved in ["--config", "--profile", "--help", "--version"] {
             assert!(!flags.contains(reserved), "{reserved}");
         }
-        for reserved in ["IGNIS_CONFIG", "IGNIS_PROFILE"] {
+        for reserved in [super::super::CONFIG_ENV, super::super::PROFILE_ENV] {
             assert!(!envs.contains(reserved), "{reserved}");
         }
     }

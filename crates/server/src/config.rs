@@ -33,6 +33,7 @@ pub mod cli;
 pub mod field;
 pub mod file;
 pub mod kind;
+pub mod profile;
 pub mod schema;
 pub mod source;
 
@@ -527,6 +528,9 @@ pub fn resolve(args: &[String], env: impl Fn(&str) -> Option<String>) -> Result<
 /// The env var naming the config file, as `--config` does.
 pub const CONFIG_ENV: &str = "IGNIS_CONFIG";
 
+/// The env var naming the hardware profile, as `--profile` does.
+pub const PROFILE_ENV: &str = "IGNIS_PROFILE";
+
 /// Resolve the command line against `env` and `files`.
 ///
 /// A first word that is not a flag is a verb (`help`, `version`, `config
@@ -590,8 +594,12 @@ pub(crate) enum FileChoice {
 }
 
 /// Gather every source of a resolution: the flags parsed, the environment,
-/// and the config file `choice` picks. Returns the file's document as
-/// written too, for a caller that merges a change into it.
+/// the config file `choice` picks, and the hardware profile (spec
+/// config-v2/02 §`--profile`) — named by `--profile`, `IGNIS_PROFILE` or the
+/// file's own `profile:`, in that order, else [`profile::DEFAULT_PROFILE`];
+/// looked up among the file's `profiles:` first and the built-in ones after,
+/// by one function. Returns the file's document as written too, for a
+/// caller that merges a change into it.
 pub(crate) fn gather(
     parsed: source::ParsedArgs,
     env: &dyn Fn(&str) -> Option<String>,
@@ -625,14 +633,20 @@ pub(crate) fn gather(
         Some((value, document)) => (Some(value), document),
         None => (None, file::Document::default()),
     };
+    let profile_name = parsed
+        .profile
+        .or_else(|| env(PROFILE_ENV).filter(|name| !name.is_empty()))
+        .or(document.profile)
+        .unwrap_or_else(|| profile::DEFAULT_PROFILE.to_owned());
+    let profile = profile::lookup(&profile_name, &document.profiles)?;
     let sources = Sources {
         patch: source::Layer::default(),
         flags: parsed.flags,
         env: source::env_layer(env)?,
         file: document.values,
         file_source,
-        profile: source::Layer::default(),
-        profile_name: parsed.profile.unwrap_or_default(),
+        profile,
+        profile_name,
     };
     Ok((sources, value))
 }

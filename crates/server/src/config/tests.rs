@@ -154,6 +154,75 @@ fn the_settings_and_every_group_serialize_and_deserialize_in_both_formats() {
     assert!(err.contains("reuse.kv_host_pool"), "{err}");
 }
 
+// ── hardware profiles (spec config-v2/02 §`--profile`) ───────────────────
+
+/// The implicit default profile restates the hardcoded defaults: an unset
+/// `--profile` changes nothing on the owner's machine.
+#[test]
+fn the_default_profile_changes_nothing() {
+    let unset = config(&[]);
+    let named = config(&["--profile", "rtx5090"]);
+    assert_eq!(unset.settings(), named.settings());
+    assert_eq!(unset.basis.sources().profile_name, "rtx5090");
+    let headroom = unset.basis.resolution().origin("vram", "headroom_bytes").expect("the profile gave it");
+    assert_eq!(headroom.source, source::Source::Profile);
+}
+
+/// Spec config-v2/02, Testing: a profile's value resolves exactly where no
+/// flag, env var or file names the field, and a profile defined in the file
+/// resolves by the same path as a built-in one.
+#[test]
+fn a_profile_value_applies_only_where_nothing_else_names_the_field() {
+    let files = MemFiles::with(&[(
+        "c.yaml",
+        "profiles:\n  small-card:\n    vram:\n      headroom_bytes: 3G\n    reuse:\n      kv_host_pool_bytes: 1G\n      qwen38flashnext:\n        kv_host_pool_bytes: 512M\n",
+    )]);
+    let profiled = with_files(&["--config", "c.yaml", "--profile", "small-card"], no_env, &files).unwrap();
+    assert_eq!(profiled.vram, VramMode::Derived { headroom_bytes: 3 * GIB });
+    assert_eq!(profiled.host_pool_bytes, GIB);
+    assert_eq!(profiled.for_family(ModelFamily::FlashNext).unwrap().host_pool_bytes, 512 << 20, "a profile has family sections too");
+    let flag = with_files(&["--config", "c.yaml", "--profile", "small-card", "--vram-headroom-bytes", "2G"], no_env, &files).unwrap();
+    assert_eq!(flag.vram, VramMode::Derived { headroom_bytes: 2 * GIB }, "a flag over the profile");
+    let env = env_map(&[("IGNIS_VRAM_HEADROOM_BYTES", "4G")]);
+    assert_eq!(with_files(&["--config", "c.yaml", "--profile", "small-card"], env, &files).unwrap().vram, VramMode::Derived { headroom_bytes: 4 * GIB });
+    // A profile value is a default: an operator's budget wins over its
+    // headroom without the two being refused as a pair.
+    let budget = with_files(&["--config", "c.yaml", "--profile", "small-card", "--vram-budget-bytes", "20G"], no_env, &files).unwrap();
+    assert_eq!(budget.vram, VramMode::Explicit { budget_bytes: 20 * GIB, allow_oversubscription: false });
+}
+
+#[test]
+fn the_file_value_wins_over_its_own_profile_and_the_profile_is_named_by_flag_env_or_file() {
+    let files = MemFiles::with(&[(
+        "c.yaml",
+        "profile: from-file\nvram:\n  headroom_bytes: 5G\nreuse:\n  kv_host_pool_bytes: 3G\nprofiles:\n  from-file:\n    reuse:\n      kv_host_pool_bytes: 1G\n      retained_device: 2\n  from-env:\n    reuse:\n      retained_device: 4\n",
+    )]);
+    let from_file = with_files(&["--config", "c.yaml"], no_env, &files).unwrap();
+    assert_eq!(from_file.basis.sources().profile_name, "from-file");
+    assert_eq!(from_file.host_pool_bytes, 3 * GIB, "the file over its profile");
+    assert_eq!(from_file.retained_device_slots, 2);
+    let env = env_map(&[("IGNIS_PROFILE", "from-env")]);
+    assert_eq!(with_files(&["--config", "c.yaml"], env, &files).unwrap().retained_device_slots, 4, "the env var over the file's choice");
+    let env = env_map(&[("IGNIS_PROFILE", "from-env")]);
+    assert_eq!(with_files(&["--config", "c.yaml", "--profile", "from-file"], env, &files).unwrap().retained_device_slots, 2, "the flag over the env var");
+    let err = with_files(&["--config", "c.yaml", "--profile", "h100"], no_env, &files).unwrap_err().0;
+    assert!(err.contains("`h100`") && err.contains("from-env, from-file, rtx5090"), "{err}");
+    assert!(refused(&["--profile", "nope"]).contains("rtx5090"));
+}
+
+/// A profile and the family scope compose (spec config-v2/02 AC 10): the
+/// card's shape from the profile, each model's on top from the file.
+#[test]
+fn a_family_override_wins_over_the_profile() {
+    let files = MemFiles::with(&[(
+        "c.yaml",
+        "profile: card\nreuse:\n  qwen38flashnext:\n    kv_host_pool_bytes: 1G\nprofiles:\n  card:\n    reuse:\n      kv_host_pool_bytes: 6G\n",
+    )]);
+    let config = with_files(&["--config", "c.yaml"], no_env, &files).unwrap();
+    assert_eq!(config.for_family(ModelFamily::Qwen38_27b).unwrap().host_pool_bytes, 6 * GIB, "the card's");
+    assert_eq!(config.for_family(ModelFamily::FlashNext).unwrap().host_pool_bytes, GIB, "the model's over the card's");
+}
+
 // ── the n-gram cache and KV-disk ─────────────────────────────────────────
 
 /// The n-gram cache is on and beside the model by default; `model` says so
