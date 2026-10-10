@@ -94,6 +94,7 @@ checkpoint is NVFP4: merge and re-export instead); more than one loaded model \
     security(("bearerAuth" = [])),
     tags(
         (name = "models", description = "What this server loaded."),
+        (name = "config", description = "The running configuration, read and changed."),
         (name = "chat", description = "Chat completions, streaming and not."),
         (name = "responses", description = "The OpenAI responses API."),
         (name = "tokenize", description = "A prompt's token count, and token ids back to text, without serving anything."),

@@ -327,6 +327,20 @@ pub fn merge(document: &mut Value, changes: impl IntoIterator<Item = Change>) {
     }
 }
 
+/// The text of the config file at `path` with `changes` merged in (and, when
+/// given, `profile:` set) — what both `config patch` and `PATCH /v1/config`
+/// write, so the two can never change a file differently. Every key the
+/// changes do not name is kept; the keys are written in declaration order;
+/// a YAML file's comments do not survive the rewrite.
+pub fn rewrite(files: &dyn Files, path: &Path, changes: Vec<Change>, profile: Option<&str>) -> Result<String, ConfigError> {
+    let (mut document, _) = load(files, path)?;
+    merge(&mut document, changes);
+    if let Some(name) = profile {
+        document.as_object_mut().expect("a merged document is a map").insert("profile".to_owned(), Value::String(name.to_owned()));
+    }
+    Ok(Format::of_path(path).unwrap_or(Format::Yaml).write(&document))
+}
+
 /// The changes a layer stands for: each value it sets, parsed by its field's
 /// kind and written back in canonical form (`2147483648` as `2G`).
 pub fn changes_of(layer: &Layer) -> Result<Vec<Change>, ConfigError> {

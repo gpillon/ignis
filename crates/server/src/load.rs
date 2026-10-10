@@ -152,6 +152,13 @@ pub struct PreparedModel {
     eos: Option<TokenId>,
 }
 
+impl PreparedModel {
+    /// The configuration the load runs with, fitted to its family.
+    pub fn config(&self) -> &crate::config::Config {
+        &self.config
+    }
+}
+
 /// A loaded model and what its load reserved (`/metrics`, GitHub #216):
 /// `None` where nothing was planned (a build without `cuda`).
 pub struct LoadedModel {

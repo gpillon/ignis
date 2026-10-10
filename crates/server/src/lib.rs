@@ -26,6 +26,7 @@ pub mod active;
 pub mod api;
 pub mod artifact_template;
 pub mod config;
+pub mod config_http;
 pub mod decide;
 pub mod decoder;
 pub mod download;
@@ -73,20 +74,11 @@ pub struct Server {
     /// request that takes it once sees one model throughout. Shared by every
     /// clone of the server, so a switch reaches every handler.
     pub active: std::sync::Arc<ArcSwap<ActiveModel>>,
-    /// How long a non-streaming request waits for its completion before the
-    /// handler gives up with a 504 (guards a wedged engine from hanging
-    /// the client forever). An operator knob (`--request-timeout` /
-    /// `IGNIS_REQUEST_TIMEOUT`, GitHub #95) — `main` sets it via
-    /// [`Server::with_request_timeout`] after `config::resolve` validates it.
-    pub request_timeout: Duration,
-    /// The server-wide `enable_thinking` default (`IGNIS_ENABLE_THINKING`,
-    /// GitHub #68) a request's unset field falls back to.
-    pub default_enable_thinking: bool,
-    /// The server-wide `reasoning_effort` default (`IGNIS_REASONING_EFFORT`).
-    pub default_reasoning_effort: Option<ReasoningEffort>,
-    /// The server-wide thinking budget (`--thinking-budget`, 2026-09-24) a
-    /// request's unset `thinking_budget` falls back to. `None` = no budget.
-    pub default_thinking_budget: Option<u32>,
+    /// The server-level knobs a live `PATCH /v1/config` may change without
+    /// touching the model (spec config-v2/02): read with [`Server::live`],
+    /// once per request. Shared by every clone, like the active model, so a
+    /// change reaches every handler at once.
+    pub live: std::sync::Arc<ArcSwap<Live>>,
     /// The Playground's asset table when `--ui` is on (GitHub #163, ADR
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
     pub playground: Option<playground::Assets>,
@@ -96,10 +88,6 @@ pub struct Server {
     /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
     /// `None` leaves the API open.
     pub api_key: Option<crate::config::ApiKey>,
-    /// Where `system` and `developer` messages go before the conversation is
-    /// templated (`--system-message-policy` / `--developer-message-policy`,
-    /// GitHub #209).
-    pub instruction_policy: instruction::InstructionPolicy,
     /// The match keys of recent `/v1/decide` parts states at their run ends
     /// (GitHub #270): what an **observed fork** is found in. Shared by every
     /// clone of the server, as the active model is. Keys name the loaded
@@ -133,6 +121,63 @@ pub struct Server {
     /// may run at a time. `None` answers the route `501`: a server built in
     /// a test without one has no way to load anything.
     pub switcher: Option<std::sync::Arc<model_switch::Switcher>>,
+    /// The running configuration, and where a change to it is written down
+    /// (`GET`/`PATCH /v1/config`, spec config-v2/02). `None` answers both
+    /// routes `501`: a server built in a test without one has no config to
+    /// show or change.
+    pub config: Option<std::sync::Arc<config_http::ConfigState>>,
+}
+
+/// The server-level knobs a live config change may touch (spec config-v2/02
+/// §`PATCH`): each one read per request, so changing it needs no model
+/// reload. The model's own configuration lives with the model and changes
+/// only through a reload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Live {
+    /// How long a non-streaming request waits for its completion before the
+    /// handler gives up with a 504 (guards a wedged engine from hanging the
+    /// client forever; `--server-request-timeout`, GitHub #95).
+    pub request_timeout: Duration,
+    /// The `enable_thinking` a request's unset field falls back to
+    /// (`--model-enable-thinking`, GitHub #68).
+    pub default_enable_thinking: bool,
+    /// The `reasoning_effort` a request's unset field falls back to
+    /// (`--model-reasoning-effort`).
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// The thinking budget a request's unset `thinking_budget` falls back to
+    /// (`--model-thinking-budget`, 2026-09-24). `None` = no budget.
+    pub default_thinking_budget: Option<u32>,
+    /// Where `system` and `developer` messages go before the conversation is
+    /// templated (`--server-system-message-policy` /
+    /// `--server-developer-message-policy`, GitHub #209).
+    pub instruction_policy: instruction::InstructionPolicy,
+}
+
+impl Default for Live {
+    /// What a server built without a config runs with: the timeout's
+    /// default, thinking on with no effort or budget, merge / inplace.
+    fn default() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
+            default_enable_thinking: true,
+            default_reasoning_effort: None,
+            default_thinking_budget: None,
+            instruction_policy: instruction::InstructionPolicy::default(),
+        }
+    }
+}
+
+impl Live {
+    /// The live knobs `config` names.
+    pub fn of(config: &config::Config) -> Self {
+        Self {
+            request_timeout: Duration::from_secs(u64::from(config.request_timeout_secs)),
+            default_enable_thinking: config.enable_thinking,
+            default_reasoning_effort: config.reasoning_effort,
+            default_thinking_budget: config.thinking_budget,
+            instruction_policy: config.instruction_policy,
+        }
+    }
 }
 
 /// The one token the warm-up prompts with. Id 1 is an ordinary byte-level
@@ -195,14 +240,10 @@ impl Server {
     pub fn from_active(model: ActiveModel) -> Self {
         Self {
             active: std::sync::Arc::new(ArcSwap::from_pointee(model)),
-            request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
-            default_enable_thinking: true,
-            default_reasoning_effort: None,
-            default_thinking_budget: None,
+            live: std::sync::Arc::new(ArcSwap::from_pointee(Live::default())),
             playground: None,
             metrics: None,
             api_key: None,
-            instruction_policy: instruction::InstructionPolicy::default(),
             fork_history: std::sync::Arc::default(),
             next_fan_out: std::sync::Arc::default(),
             responses: std::sync::Arc::default(),
@@ -210,7 +251,43 @@ impl Server {
             seedless_seed: None,
             status: std::sync::Arc::new(ArcSwap::from_pointee(ModelStatus::Serving)),
             switcher: None,
+            config: None,
         }
+    }
+
+    /// The live knobs, as of now (wait-free): take them once per request.
+    pub fn live(&self) -> std::sync::Arc<Live> {
+        self.live.load_full()
+    }
+
+    /// Change the live knobs: a copy edited by `edit`, stored over them.
+    pub fn update_live(&self, edit: impl FnOnce(&mut Live)) {
+        let mut live = Live::clone(&self.live());
+        edit(&mut live);
+        self.live.store(std::sync::Arc::new(live));
+    }
+
+    /// Make `config`'s server-level values the ones requests read, without
+    /// touching the model (spec config-v2/02): the live knobs, and the model
+    /// switch's drain window and known models. What a live `PATCH
+    /// /v1/config` applies, and what a reload applies once its model serves.
+    pub fn apply_config(&self, config: &config::Config) {
+        self.live.store(std::sync::Arc::new(Live::of(config)));
+        if let Some(switcher) = &self.switcher {
+            let known = if config.allow_model_switch {
+                model_switch::known_models(&config.known_models, self.active().source.as_ref())
+            } else {
+                Default::default()
+            };
+            switcher.set_knobs(Duration::from_secs(u64::from(config.switch_drain_timeout_secs)), known);
+        }
+    }
+
+    /// Show and change the running configuration over `GET`/`PATCH
+    /// /v1/config` (spec config-v2/02), written down where `state` says.
+    pub fn with_config(mut self, state: std::sync::Arc<config_http::ConfigState>) -> Self {
+        self.config = Some(state);
+        self
     }
 
     /// The loaded model, as of now (wait-free). Take it once per request
@@ -333,8 +410,8 @@ impl Server {
     /// Set the non-streaming completion timeout (`main` wires this to
     /// `--request-timeout`/`IGNIS_REQUEST_TIMEOUT`, GitHub #95; the default
     /// is 30 s).
-    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+    pub fn with_request_timeout(self, timeout: Duration) -> Self {
+        self.update_live(|live| live.request_timeout = timeout);
         self
     }
 
@@ -351,19 +428,17 @@ impl Server {
     /// first (`thinking::validate_defaults`) — this setter does not, so
     /// tests can construct an out-of-band `Server` without a template to
     /// probe.
-    pub fn with_thinking_defaults(
-        mut self,
-        enable_thinking: bool,
-        reasoning_effort: Option<ReasoningEffort>,
-    ) -> Self {
-        self.default_enable_thinking = enable_thinking;
-        self.default_reasoning_effort = reasoning_effort;
+    pub fn with_thinking_defaults(self, enable_thinking: bool, reasoning_effort: Option<ReasoningEffort>) -> Self {
+        self.update_live(|live| {
+            live.default_enable_thinking = enable_thinking;
+            live.default_reasoning_effort = reasoning_effort;
+        });
         self
     }
 
     /// Set the server-wide thinking budget (`--thinking-budget`).
-    pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
-        self.default_thinking_budget = budget;
+    pub fn with_thinking_budget(self, budget: Option<u32>) -> Self {
+        self.update_live(|live| live.default_thinking_budget = budget);
         self
     }
 
@@ -455,8 +530,8 @@ impl Server {
     /// Place instruction messages under `policy` (`main` wires this to
     /// `--system-message-policy` / `--developer-message-policy`, GitHub #209;
     /// the default is merge / inplace).
-    pub fn with_instruction_policy(mut self, policy: instruction::InstructionPolicy) -> Self {
-        self.instruction_policy = policy;
+    pub fn with_instruction_policy(self, policy: instruction::InstructionPolicy) -> Self {
+        self.update_live(|live| live.instruction_policy = policy);
         self
     }
 

@@ -205,19 +205,19 @@ fn patch(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &d
         return Err(ConfigError("`config patch` names its file with `--file`".to_owned()));
     }
     let profile = parsed.profile.clone();
-    let (sources, document) = gather(parsed, env, files, FileChoice::Required(path.clone()))?;
+    let (sources, _) = gather(parsed, env, files, FileChoice::Required(path.clone()))?;
     Config::from_sources(sources.clone())?;
-    let mut document = document.expect("a required file was read");
     let mut changes = file::changes_of(&sources.file)?;
     changes.extend(file::changes_of(&sources.env)?);
     changes.extend(file::changes_of(&sources.flags)?);
-    file::merge(&mut document, changes);
-    if let Some(name) = profile {
-        document.as_object_mut().expect("a merged document is a map").insert("profile".to_owned(), Value::String(name));
-    }
-    let target = out.unwrap_or(path);
-    let format = Format::of_path(&target).unwrap_or(Format::Yaml);
-    Ok(ConfigOutcome::Write { contents: format.write(&document), path: target })
+    let contents = file::rewrite(files, &path, changes, profile.as_deref())?;
+    let target = out.unwrap_or_else(|| path.clone());
+    // An `--out` of the other format gets the same document in its own.
+    let contents = match (Format::of_path(&path).unwrap_or(Format::Yaml), Format::of_path(&target)) {
+        (from, Some(to)) if from != to => to.write(&from.read(&contents).expect("a rewritten file reads back")),
+        _ => contents,
+    };
+    Ok(ConfigOutcome::Write { contents, path: target })
 }
 
 /// Where `config print` and `config patch` look with no `--file`: the first

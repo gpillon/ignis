@@ -150,6 +150,8 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .routes(routes!(list_models))
         // Spec model-switch/01: replace the loaded model.
         .routes(routes!(switch_model))
+        // Spec config-v2/02: the running configuration, read and changed.
+        .routes(routes!(crate::config_http::get_config, crate::config_http::patch_config))
         .routes(routes!(chat_completions))
         // GitHub #285: the prompt counted without being served. Neither
         // reaches the scheduler.
@@ -171,6 +173,7 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         )
         .route("/v1/models", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
+        .route("/v1/config", options(cors_preflight))
         .route("/v1/chat/completions", options(cors_preflight))
         .route("/v1/tokenize", options(cors_preflight))
         .route("/v1/detokenize", options(cors_preflight))
@@ -323,10 +326,12 @@ pub(crate) fn implicit_switch_refused(refusal: crate::model_switch::ImplicitRefu
     }
 }
 
-/// `GET /v1/models` or `POST /v1/models/switch`: the routes a model switch
-/// keeps open ([`require_serving`]).
+/// `GET /v1/models`, `POST /v1/models/switch` or `GET /v1/config`: the
+/// routes a model switch keeps open ([`require_serving`]) — the two that
+/// report and drive it, and the running configuration, which a reload with
+/// a changed config is changing (spec config-v2/02).
 fn reports_or_drives_the_switch(method: &axum::http::Method, path: &str) -> bool {
-    (method == axum::http::Method::GET && path == "/v1/models")
+    (method == axum::http::Method::GET && (path == "/v1/models" || path == "/v1/config"))
         || (method == axum::http::Method::POST && path == "/v1/models/switch")
 }
 
@@ -417,7 +422,7 @@ pub(crate) fn render_prompt(
     tools: &[JsonValue],
     structure: Structure,
 ) -> Result<PreparedRequest, Response> {
-    let messages = &server.instruction_policy.normalize(messages).map_err(template_rejection)?;
+    let messages = &server.live().instruction_policy.normalize(messages).map_err(template_rejection)?;
     build_request(server, None, messages, DecodeParams::default(), thinking, tools, structure)
         .map_err(template_rejection)
 }
@@ -529,7 +534,7 @@ async fn prepare_input(
 ) -> Result<PreparedRequest, Response> {
     // GitHub #209: instruction messages are placed under the server's
     // policies before any template sees the conversation, on both paths.
-    let messages = &server.instruction_policy.normalize(messages).map_err(template_rejection)?;
+    let messages = &server.live().instruction_policy.normalize(messages).map_err(template_rejection)?;
     // One model for the whole render: the acquirer and the template that
     // expands its placeholders must be the same load's.
     let model_loaded = server.active();
@@ -537,7 +542,7 @@ async fn prepare_input(
         return build_request(server, model, messages, params, thinking, tools, structure)
             .map_err(template_rejection);
     };
-    let deadline = std::time::Instant::now() + server.request_timeout;
+    let deadline = std::time::Instant::now() + server.live().request_timeout;
     let acquired = acquirer.acquire(messages, deadline).await.map_err(media_rejection)?;
     // A media prompt reports no text: a `locate` refuses a parts `state`
     // before it renders one.
@@ -879,8 +884,8 @@ pub(crate) fn resolve_thinking(
     fields: ThinkingRequestFields<'_>,
 ) -> Result<ThinkingOptions, Response> {
     let defaults = ThinkingDefaults {
-        enable_thinking: server.default_enable_thinking,
-        reasoning_effort: server.default_reasoning_effort,
+        enable_thinking: server.live().default_enable_thinking,
+        reasoning_effort: server.live().default_reasoning_effort,
     };
     let capabilities = server.active().template.thinking_capabilities();
     thinking::resolve(fields, &defaults, &capabilities).map_err(|err| match err {
@@ -909,8 +914,8 @@ pub(crate) fn with_thinking_budget(
     effort: Option<&JsonValue>,
     thinking: &ThinkingOptions,
 ) -> Result<(DecodeParams, bool), Response> {
-    let max = thinking::runs_at_max(effort, server.default_reasoning_effort);
-    let resolved = thinking::resolve_thinking_budget(value, server.default_thinking_budget, max)
+    let max = thinking::runs_at_max(effort, server.live().default_reasoning_effort);
+    let resolved = thinking::resolve_thinking_budget(value, server.live().default_thinking_budget, max)
         .map_err(|message| bad_request_param(&message, "thinking_budget"))?;
     let starts_in_reasoning = server.active().template.decoder_starts_in_reasoning(thinking);
     Ok((
@@ -1510,21 +1515,35 @@ async fn switch_model(State(server): State<Arc<Server>>, Json(req): Json<SwitchR
             Json(SwitchAccepted { status: "switching", from: started.from, to: started.to }),
         )
             .into_response(),
-        Err(crate::model_switch::SwitchRefusal::InProgress(running)) => error_response(
+        Err(refusal) => switch_refused(refusal),
+    }
+}
+
+/// The answer to a switch that did not begin — an explicit one, or a reload
+/// a config change asked for (spec config-v2/02).
+pub(crate) fn switch_refused(refusal: crate::model_switch::SwitchRefusal) -> Response {
+    match refusal {
+        crate::model_switch::SwitchRefusal::InProgress(running) => error_response(
             StatusCode::CONFLICT,
             "invalid_request_error",
             "switch_in_progress",
             format!("a switch from {} to {} is already under way; switches are not queued", running.from, running.to),
         ),
-        Err(crate::model_switch::SwitchRefusal::Unavailable) => error_response(
+        crate::model_switch::SwitchRefusal::Unavailable => error_response(
             StatusCode::NOT_IMPLEMENTED,
             "server_error",
             "switch_unavailable",
-            "this server was built without a model loader and cannot switch models",
+            "this server was built without a model loader and cannot switch or reload models",
         ),
-        Err(crate::model_switch::SwitchRefusal::WarmingUp) => {
+        crate::model_switch::SwitchRefusal::WarmingUp => {
             unavailable("server_not_ready", "the loaded model's first traversal has not finished; retry shortly")
         }
+        crate::model_switch::SwitchRefusal::NotReloadable => error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "reload_unavailable",
+            "the loaded model was not loaded from an artifact (the placeholder start), so it cannot be reloaded with a changed configuration",
+        ),
     }
 }
 
@@ -1773,7 +1792,7 @@ async fn chat_completions(
             StatusCode::GATEWAY_TIMEOUT,
             "request_timeout",
             "request_timeout",
-            request_timeout_message(server.request_timeout),
+            request_timeout_message(server.live().request_timeout),
         )
     };
     if !stop.is_empty() {
@@ -1786,7 +1805,7 @@ async fn chat_completions(
             schemas,
             stop,
         );
-        return match collect_answer(&loaded.engine, request_id, &mut stream, server.request_timeout, pipeline).await {
+        return match collect_answer(&loaded.engine, request_id, &mut stream, server.live().request_timeout, pipeline).await {
             Ok(Answer { ending: AnswerEnding::Done(FinishReason::Error), .. }) => engine_error_response(),
             Ok(answer) => {
                 let (reasoning, content, calls) = answer.parts();
@@ -1802,7 +1821,7 @@ async fn chat_completions(
     }
     // Non-streaming: collect the request's tokens to its completion (a
     // timeout guards a wedged engine from hanging the client).
-    match collect_completion(&mut stream, server.request_timeout).await {
+    match collect_completion(&mut stream, server.live().request_timeout).await {
         Ok(Completion { reason: FinishReason::Error, .. }) => engine_error_response(),
         Ok(Completion { tokens, reason, thinking: budget, cached_tokens }) => {
             let (reasoning_content, content, tool_calls) =

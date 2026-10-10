@@ -3687,7 +3687,7 @@ async fn ask(
         Collect::Answer(question) | Collect::Step(question) => question,
         Collect::Rows => {
             return Attempt::Answered(Reply::Rows(
-                match crate::engine::collect_attention(&mut events, server.request_timeout).await {
+                match crate::engine::collect_attention(&mut events, server.live().request_timeout).await {
                     Ok(Some(attention)) => {
                         guard.completed();
                         Ok(attention)
@@ -3712,7 +3712,7 @@ async fn ask(
     if let (Some(_), Some(grid)) = (question.head, ready.grid) {
         let pixels = ready.media.and_then(|stats| stats.source_pixels);
         return Attempt::Answered(Reply::Answer(
-            match crate::engine::collect_attention(&mut events, server.request_timeout).await {
+            match crate::engine::collect_attention(&mut events, server.live().request_timeout).await {
                 Ok(Some(attention)) => {
                     guard.completed();
                     if let Some(metrics) = &server.metrics {
@@ -3746,7 +3746,7 @@ async fn ask(
     if question.kind.is_constrained() {
         let pixels = ready.media.and_then(|stats| stats.source_pixels);
         return Attempt::Answered(Reply::Answer(
-            match crate::engine::collect_draws(&mut events, server.request_timeout).await {
+            match crate::engine::collect_draws(&mut events, server.live().request_timeout).await {
                 Ok(drawn) => {
                     guard.completed();
                     if let Some(metrics) = &server.metrics {
@@ -3766,7 +3766,7 @@ async fn ask(
         ));
     }
     Attempt::Answered(Reply::Answer(
-        match crate::engine::collect_readout(&mut events, server.request_timeout).await {
+        match crate::engine::collect_readout(&mut events, server.live().request_timeout).await {
             Ok(readout) => {
                 guard.completed();
                 // GitHub #241. Here rather than in `serve` because this is

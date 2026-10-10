@@ -691,6 +691,15 @@ impl Config {
         derive(self.basis.sources(), Some(family), Fit::Start, true).map(|(config, _)| config)
     }
 
+    /// This config's sources with `patch`'s values over them, resolved for no
+    /// family in particular: the starting point of a switch to another model,
+    /// whose family the switch fits it to ([`fit_to_family`]).
+    pub fn general_with(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
+        let mut sources = self.basis.sources().clone();
+        sources.patch.overlay(patch);
+        Config::from_sources(sources)
+    }
+
     /// This config with `patch`'s values over everything else — a live
     /// `PATCH /v1/config`, or a switch target's own artifact and id — and
     /// resolved again from the same sources for the same family.
@@ -704,9 +713,7 @@ impl Config {
     /// ([`source::Fit::Reconfigure`]). Every family's values are validated as
     /// at start; the patch is refused whole if any of it is wrong.
     pub fn with_patch(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
-        let mut sources = self.basis.sources().clone();
-        sources.patch.overlay(patch);
-        let config = Config::from_sources(sources)?;
+        let config = self.general_with(patch)?;
         match self.basis.family() {
             Some(family) => derive(config.basis.sources(), Some(family), Fit::Reconfigure, true).map(|(config, _)| config),
             None => Ok(config),

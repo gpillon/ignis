@@ -324,16 +324,20 @@ async fn main() {
     // placeholder path, which loads no model and plans no device memory, and
     // on a build without `cuda`, which plans none either.
     let mut load_reservations: Option<ignis_server::metrics::LoadReservations> = None;
-    let server = if let Some(artifact_path) = &artifact {
+    let (server, running) = if let Some(artifact_path) = &artifact {
         // The loader path (server-03, GitHub #21), shared with the model
         // switch (spec model-switch/01): the `.ninfer` container named by
         // `--model-artifact`/`IGNIS_MODEL_ARTIFACT` is verified — sidecar present,
         // checksum report clean — named, checked against the start options,
         // and only then loaded. Any refusal stops the start: serving a broken
         // artifact would silently degrade to the placeholder.
-        let loaded = ignis_server::load::prepare_model(&start_options, artifact_path)
-            .and_then(ignis_server::load::load_model);
-        let loaded = match loaded {
+        // The running configuration is the start options fitted to the
+        // artifact's family (spec config-v2/01): what `GET /v1/config` shows.
+        let loaded = ignis_server::load::prepare_model(&start_options, artifact_path).and_then(|prepared| {
+            let running = prepared.config().clone();
+            ignis_server::load::load_model(prepared).map(|loaded| (loaded, running))
+        });
+        let (loaded, running) = match loaded {
             Ok(loaded) => loaded,
             Err(err) => {
                 err.log(artifact_path, "refusing to start");
@@ -342,16 +346,25 @@ async fn main() {
         };
         load_reservations = loaded.reservations;
         // GitHub #129: a loaded model is ready only after its first traversal.
-        Server::from_active(loaded.model).with_warm_up()
+        (Server::from_active(loaded.model).with_warm_up(), running)
     } else {
         // Why there is no artifact was said once, with its reason, where the
         // decision was made (`ignis.model.placeholder_template` above).
         let (engine, driver) =
             Engine::with_clock_and_driver(mock_scheduler(&model, default_max_tokens), Arc::new(SystemClock));
-        Server::from_active(ActiveModel::new(engine, Arc::new(SimpleTemplateProvider)).with_driver(driver))
-    }
-    .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
-    .with_instruction_policy(instruction_policy);
+        (Server::from_active(ActiveModel::new(engine, Arc::new(SimpleTemplateProvider)).with_driver(driver)), start_options.clone())
+    };
+    let server = server
+        .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
+        .with_instruction_policy(instruction_policy);
+    // Spec config-v2/02: the running configuration, shown and changed over
+    // `GET`/`PATCH /v1/config` and written back to the config file in use;
+    // the model loader shares it, so a later switch loads with a live change
+    // and a failed reload falls back to the configuration still running.
+    let config_state = Arc::new(ignis_server::config_http::ConfigState::new(
+        running,
+        Arc::new(ignis_server::config::file::RealFiles),
+    ));
     // Spec model-switch/01: `POST /v1/models/switch` loads every later model
     // through the same path, on the same start options — and so does a
     // request naming a known model (§Implicit switch), the start model among
@@ -369,11 +382,12 @@ async fn main() {
     );
     let server = server.with_switcher(
         ignis_server::model_switch::Switcher::new(
-            Arc::new(ignis_server::model_switch::ArtifactLoader::new(start_options.clone())),
+            Arc::new(ignis_server::model_switch::ArtifactLoader::sharing(Arc::clone(&config_state))),
             std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
         )
         .with_known_models(known),
-    );
+    )
+    .with_config(config_state);
 
     // GitHub #209: joining or gathering developer messages trades prefix
     // reuse for fewer system blocks; the operator is told once, at start.

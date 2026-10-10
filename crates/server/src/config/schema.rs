@@ -120,6 +120,11 @@ macro_rules! config_group {
     };
 }
 
+// The tests that pin the attributes' closed defaults declare throwaway
+// groups with it, beside the fields they test.
+#[cfg(test)]
+pub(crate) use config_group;
+
 /// Every group, in the order `help --fields`, a written file and the
 /// resolver visit them: builds [`Settings`], [`GROUPS`] and their two
 /// whole-config functions from one list, as `config_group!` does per field.
