@@ -526,7 +526,7 @@ function EvictionsCard({ evictions, deviceSlots, chart, win }: { evictions: Evic
           {EVICTION_TIERS.map((tier) => {
             const row = evictions[tier];
             const label = EVICTION_TIER_LABEL[tier];
-            // A load with no device retained slots (Flash-Next: --retained-device 0) keeps its retained state in host RAM, so the VRAM row's Retained cell is host RAM's; the Live cell is still the sequences that left VRAM.
+            // A load with no device retained slots (Flash-Next: --reuse-retained-device 0) keeps its retained state in host RAM, so the VRAM row's Retained cell is host RAM's; the Live cell is still the sequences that left VRAM.
             const retainedTitle = tier === "vram" && deviceSlots === 0 ? RETAINED_IN_HOST_RAM : undefined;
             return (
               <tr key={tier} className={row.implemented ? undefined : "text-ash/50"}>
@@ -788,7 +788,7 @@ function PlanCard({ memory }: { memory: Memory }) {
             beside the room above are those pages multiplied, the whole pool rather than what is free at this moment. What the budget left beyond those pages
             is the rounding a whole page forces, plus the pool's own block tables — neither is exported apart, so it is shown as one unspent remainder rather
             than split into a figure nothing measured.
-            {memory.oversubscribed && " This load reserved more than its budget (--allow-vram-oversubscription), so the bar is the plan, not the budget."}
+            {memory.oversubscribed && " This load reserved more than its budget (--vram-allow-oversubscription), so the bar is the plan, not the budget."}
           </p>
         </>
       )}

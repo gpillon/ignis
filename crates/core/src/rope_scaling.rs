@@ -49,7 +49,7 @@ pub struct RopeScaling {
     beta_slow: f32,
 }
 
-/// Why a `--rope-scaling` value is not usable.
+/// Why a `--model-rope-scaling` value is not usable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RopeScalingError {
     /// The value is neither `none` nor `yarn:F[,...]`.
@@ -148,7 +148,7 @@ impl RopeScaling {
     }
 
     /// `none` or `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]` — the reference's own
-    /// `--rope-scaling` grammar, so an operator's ninfer command line reads
+    /// `--model-rope-scaling` grammar, so an operator's ninfer command line reads
     /// the same here.
     pub fn parse(value: &str) -> Result<Self, RopeScalingError> {
         let text = value.trim();

@@ -68,14 +68,14 @@ pub struct CudaLeafConfig {
     /// Retained slots the sequence pool holds past the lanes (GitHub #211,
     /// #215): a lane's mutable state each, reserved at load, where every
     /// published prefix's and captured checkpoint's image lives. Device ones
-    /// (`--retained-device`) sit in the state arenas and host ones
-    /// (`--retained-host`, GitHub #281) in one pinned host block; the device
+    /// (`--reuse-retained-device`) sit in the state arenas and host ones
+    /// (`--reuse-retained-host`, GitHub #281) in one pinned host block; the device
     /// ones take the low indices. Both 0 reserves none, and then nothing can
     /// be published or captured.
     pub retained_device_slots: u32,
     pub retained_host_slots: u32,
     /// The prefill chunk width, in tokens: how wide a span the program's
-    /// prefill scratch must serve (`--prefill-chunk`, GitHub #87). A
+    /// prefill scratch must serve (`--model-prefill-chunk`, GitHub #87). A
     /// nonzero multiple of 128, validated by the server's config module
     /// before any loader work starts. `ignis_model_load` reserves the
     /// program scratch for a chunk of this width at load time (P2-01,
@@ -95,7 +95,7 @@ pub struct CudaLeafConfig {
     /// encoder workspace (inside the prefill scratch, GitHub #212) and output
     /// transient before the pool is built; `None` is today's load.
     pub vision: Option<ignis_core::Vision>,
-    /// The text rotary table this load runs on (`--rope-scaling`, GitHub
+    /// The text rotary table this load runs on (`--model-rope-scaling`, GitHub
     /// #227): [`ignis_core::RopeScaling::NONE`] is the linear table the
     /// engine has always used, and a YaRN factor rescales the trained
     /// 262,144-position envelope so a longer context means something.
@@ -250,7 +250,7 @@ impl CudaLeafConfig {
     /// a reboot for no reason at all.
     ///
     /// The operator's other flags — the bind address, the API key, the
-    /// request timeout, `--prompt-reuse` — are not fields here at all: `ignis_server::runtime::cuda_scheduler` builds
+    /// request timeout, `--reuse-prompt` — are not fields here at all: `ignis_server::runtime::cuda_scheduler` builds
     /// this struct out of an `EngineShape`, which never carried them.
     pub fn blob_identity(&self, artifact: ArtifactHash, layout_version: u32) -> BlobIdentity {
         BlobIdentity::of_load(artifact, self.kv_format, self.speculation, layout_version)
@@ -1168,7 +1168,7 @@ mod tests {
             ignis_core::IdentityField::Drafter
         );
 
-        // GitHub #195 landed `--vision` and `--spec dflash2` as independently
+        // GitHub #195 landed `--vision-enabled` and `--spec-backend dflash2` as independently
         // resolvable load options, so both can be present at once — and the
         // drafter half of the identity has to stay the drafter's, not a mode.
         let both = CudaLeafConfig {

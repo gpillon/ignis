@@ -44,7 +44,7 @@ use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 #[derive(Debug)]
 pub struct ArtifactTemplateProvider {
     set: Arc<FrontendSet>,
-    /// The vision processor on a `--vision` load (GitHub #179); `None`
+    /// The vision processor on a `--vision-enabled` load (GitHub #179); `None`
     /// renders no images.
     vision: Option<VisionProcessor>,
 }
@@ -61,7 +61,7 @@ impl ArtifactTemplateProvider {
         }
     }
 
-    /// Render image prompts with `processor` (a `--vision` load).
+    /// Render image prompts with `processor` (a `--vision-enabled` load).
     pub fn with_vision(mut self, processor: VisionProcessor) -> Self {
         self.vision = Some(processor);
         self
@@ -605,7 +605,7 @@ fn json_kind(value: &JsonValue) -> &'static str {
 /// between adjacent text parts included, as `template_text_parts` places
 /// it), so the real template's `render_content` loop renders it exactly as
 /// the string `MessageContent::text` joins. An image part (GitHub #179,
-/// only past `check_content_parts` on a `--vision` load) stays in place as
+/// only past `check_content_parts` on a `--vision-enabled` load) stays in place as
 /// the template's image item and breaks the text run; every other part was
 /// refused before a request is templated.
 fn artifact_content(content: &MessageContent) -> ignis_artifact::MessageContent {

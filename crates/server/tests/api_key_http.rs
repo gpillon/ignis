@@ -1,4 +1,4 @@
-//! `--api-key` / `IGNIS_API_KEY`: with a key configured every `/v1` route
+//! `--server-api-key` / `IGNIS_SERVER_API_KEY`: with a key configured every `/v1` route
 //! needs `Authorization: Bearer <key>` (OpenAI's `401 invalid_api_key`
 //! otherwise); a CORS preflight and the Playground's pages stay open;
 //! without a key nothing changes.

@@ -12,8 +12,8 @@
 //! logits are bf16), so a drift reads in steps rather than in decimals.
 //!
 //! The tiers come from one measurement of the fixture on this file's own
-//! stock artifact (2026-09-25, through a live server with `--spec dflash2`
-//! and `--vision`): 17/18, only 13 missed.
+//! stock artifact (2026-09-25, through a live server with `--spec-backend dflash2`
+//! and `--vision-enabled`): 17/18, only 13 missed.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or an unavailable GPU is a **skip**; under the profile

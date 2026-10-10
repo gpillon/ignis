@@ -1,6 +1,6 @@
 //! GitHub #89 / ADR 0017: Prometheus metrics through the public routers,
 //! backed by a real `ConcreteScheduler` over the deterministic `MockCompute`
-//! (CPU-only, ADR 0006). With `--metrics`, `GET /metrics` is served by its
+//! (CPU-only, ADR 0006). With `--server-metrics`, `GET /metrics` is served by its
 //! own listener (`Server::metrics_app`), never by the API's; the Playground
 //! reads the same exposition at `/ui/metrics` on the API listener, under the
 //! API key when one is set. Values move with the request lifecycle the
@@ -213,7 +213,7 @@ async fn the_metrics_listener_serves_only_the_exposition_in_the_text_format() {
 }
 
 /// The metrics listener is not the API: it asks for no key, even when the
-/// API does. It is kept off the network by its bind address, and `--expose`
+/// API does. It is kept off the network by its bind address, and `--server-expose`
 /// never tunnels it (ADR 0017, ADR 0028).
 #[tokio::test]
 async fn the_metrics_listener_needs_no_api_key() {

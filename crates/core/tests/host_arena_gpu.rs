@@ -69,6 +69,6 @@ fn an_arena_the_host_cannot_page_lock_names_the_size_and_the_flag() {
     let bytes = u64::MAX / 2;
     let error = HostArena::create(bytes).err().expect("no host page-locks 8 EiB");
     assert!(error.contains(&bytes.to_string()), "{error}");
-    assert!(error.contains("--kv-host-pool-bytes"), "{error}");
+    assert!(error.contains("--reuse-kv-host-pool-bytes"), "{error}");
     assert!(HostArena::create(0).is_err(), "a disabled tier creates no arena");
 }

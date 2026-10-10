@@ -1,5 +1,5 @@
 //! Prometheus metrics (GitHub #89, ADR 0017): the opt-in exposition
-//! `ignis-server` serves with `--metrics` — at `GET /metrics` on its own
+//! `ignis-server` serves with `--server-metrics` — at `GET /metrics` on its own
 //! listener, and at `GET /ui/metrics` on the API listener for the Playground.
 //!
 //! [`Metrics`] is an aggregate projection of facts the model thread already
@@ -7,7 +7,7 @@
 //! `telemetry_task`). That consumer is its only writer; the HTTP task only
 //! reads it, and all text encoding happens there, at scrape time. Nothing in
 //! the scheduler, the model thread, the runtime or the kernel leaf knows it
-//! exists, and without `--metrics` it is never built.
+//! exists, and without `--server-metrics` it is never built.
 //!
 //! Fixed atomics rather than a lock: a scrape can never make the consumer
 //! wait, and the consumer can never make a scrape wait. A scrape therefore
@@ -52,11 +52,11 @@ pub struct LoadReservations {
     /// VRAM expert cache that takes what the plan leaves. 0 on a 27B load.
     pub residency_bytes: u64,
     pub expert_cache_bytes: u64,
-    /// `--kv-host-pool-bytes`, pinned whole at start.
+    /// `--reuse-kv-host-pool-bytes`, pinned whole at start.
     pub kv_ram_arena_bytes: u64,
     /// The retained slots this load hands out — the effective count, which
-    /// is 0 with prompt reuse off and neither `--retained-device` nor
-    /// `--retained-host` named.
+    /// is 0 with prompt reuse off and neither `--reuse-retained-device` nor
+    /// `--reuse-retained-host` named.
     pub retained_slots: u32,
     /// Of those, the host ones (GitHub #281), and their pinned block: host
     /// memory, beside the plan's lines rather than one of them.

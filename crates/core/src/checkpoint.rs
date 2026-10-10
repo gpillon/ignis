@@ -1376,7 +1376,7 @@ mod tests {
     #[test]
     fn a_blob_taken_under_another_load_is_refused() {
         // The Tier 2 refusal, at the one place a blob can enter the ledger: a
-        // restart under `--kv-format bf16`, or a disk tier handing back what
+        // restart under `--model-kv-format bf16`, or a disk tier handing back what
         // yesterday's artifact left. Nothing is retained, so nothing can be
         // matched, so no byte of it ever reaches a sequence.
         let mut pool = pool();

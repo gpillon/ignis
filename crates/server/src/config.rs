@@ -1157,8 +1157,9 @@ pub fn help_text() -> String {
          \x20   ignis-server config patch [--file <path>] [--out <path>] [FIELD FLAGS]\n\
          \n\
          Every field has a flag (--<group>-<field>), an env var (IGNIS_<GROUP>_<FIELD>)\n\
-         and a config-file key (<group>.<field>). A flag overrides its env var, which\n\
-         overrides the built-in default.\n",
+         and a config-file key (<group>.<field>). Precedence, highest first: flag, env\n\
+         var, config file, profile, built-in default; a field's qwen38 / qwen38flashnext\n\
+         value wins within each. `help --fields` prints every field in full.\n",
     );
     for (group, fields) in schema::GROUPS {
         text.push_str(&format!("\n{}:\n", group.to_ascii_uppercase()));

@@ -35,13 +35,13 @@ function Test-Ready {
         Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri "$Url/v1/models" | Out-Null
         return $true
     } catch {
-        # A 401 is a server that is up and wants an API key (--api-key).
+        # A 401 is a server that is up and wants an API key (--server-api-key).
         $response = $_.Exception.Response
         return ($null -ne $response -and [int]$response.StatusCode -eq 401)
     }
 }
 
-# `--api-key auto` and `--expose`: the server prints the key it generated
+# `--server-api-key auto` and `--server-expose`: the server prints the key it generated
 # and its public URL once, into its stdout log; repeat them on the console.
 function Show-GeneratedKey {
     if (-not (Test-Path $LogFile)) { return }

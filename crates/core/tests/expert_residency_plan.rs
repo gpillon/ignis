@@ -234,14 +234,14 @@ fn a_cache_below_its_floor_refuses_naming_what_to_shrink() {
     for needle in [
         "1000", // the cache it would get
         "1500", // the floor
-        "--kv-pool-bytes",
-        "--max-context",
+        "--vram-kv-pool-bytes",
+        "--model-max-context",
         "--vram-headroom-bytes",
         "prefill chunk",
-        "--retained-device",
+        "--reuse-retained-device",
         "desktop",
         // ADR 0045: and the way past it.
-        "--allow-expert-cache-below-floor",
+        "--vram-allow-expert-cache-below-floor",
     ] {
         assert!(message.contains(needle), "{needle} missing: {message}");
     }
@@ -249,7 +249,7 @@ fn a_cache_below_its_floor_refuses_naming_what_to_shrink() {
 
 #[test]
 fn the_floor_opt_in_plans_the_cache_below_it_and_says_so() {
-    // ADR 0045 (AC 6): `--allow-expert-cache-below-floor` turns the refusal
+    // ADR 0045 (AC 6): `--vram-allow-expert-cache-below-floor` turns the refusal
     // into a plan flagged for the load's warning -- the same split the cache
     // would get at any size.
     let (catalog, traffic) = hot_and_cold();

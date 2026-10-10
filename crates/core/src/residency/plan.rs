@@ -39,10 +39,10 @@ pub struct HostPlanRequest {
     pub ngram_hot_rows_bytes: u64,
     /// Host staging buffers: the artifact read buffers and the like.
     pub staging_bytes: u64,
-    /// Prompt reuse's host retained slots (`--retained-host`, spec
+    /// Prompt reuse's host retained slots (`--reuse-retained-host`, spec
     /// flash-next/05): one pinned block of a state image per slot.
     pub retained_host_slots_bytes: u64,
-    /// Prompt reuse's KV-RAM arena (`--kv-host-pool-bytes`, spec
+    /// Prompt reuse's KV-RAM arena (`--reuse-kv-host-pool-bytes`, spec
     /// flash-next/05): materialized blobs the device gave up.
     pub kv_ram_arena_bytes: u64,
 }
@@ -114,9 +114,9 @@ impl std::fmt::Display for HostPlanError {
             "ngram_hot_rows" => "load fewer n-gram hot rows (--ngram-hot-bytes), or free memory",
             "staging" => "give the load smaller staging buffers, or free memory",
             "retained_host_slots" => {
-                "give prompt reuse fewer host retained slots (--retained-host), or free memory"
+                "give prompt reuse fewer host retained slots (--reuse-retained-host), or free memory"
             }
-            "kv_ram_arena" => "give KV-RAM a smaller arena (--kv-host-pool-bytes), or free memory",
+            "kv_ram_arena" => "give KV-RAM a smaller arena (--reuse-kv-host-pool-bytes), or free memory",
             _ => "free memory: close other applications",
         };
         write!(
@@ -243,7 +243,7 @@ pub struct ExpertCacheRequest<'a> {
     pub table_bytes: u64,
     /// [`EXPERT_CACHE_FLOOR_BYTES`] for a real load.
     pub floor_bytes: u64,
-    /// `--allow-expert-cache-below-floor` (ADR 0045): a cache below the floor
+    /// `--vram-allow-expert-cache-below-floor` (ADR 0045): a cache below the floor
     /// is planned anyway, flagged [`ExpertCachePlan::below_floor`] for the
     /// load's warning, instead of refused. The class minimum still refuses.
     pub allow_below_floor: bool,
@@ -281,7 +281,7 @@ pub struct ExpertCachePlan {
     /// 94.5%, so read it as a floor and compare plans by it, not tok/s.
     pub expected_hit_rate: f64,
     /// The cache is below the request's floor, planned only because the
-    /// operator allowed it (`--allow-expert-cache-below-floor`).
+    /// operator allowed it (`--vram-allow-expert-cache-below-floor`).
     pub below_floor: bool,
 }
 
@@ -382,9 +382,9 @@ impl std::fmt::Display for ExpertCachePlanError {
              floor: the {budget_bytes}-byte VRAM budget holds {planned_bytes} for the weights, \
              workspaces, graphs and KV pool, {staging_ring_bytes} for the prefill staging ring \
              and {table_bytes} for residency's tables; shrink the KV pool (a smaller \
-             --kv-pool-bytes, or a shorter --max-context at one lane), the prefill chunk, \
-             --vram-headroom-bytes or --retained-device, or close what holds VRAM on the desktop; \
-             --allow-expert-cache-below-floor starts anyway, with decode slower than the floor's"
+             --vram-kv-pool-bytes, or a shorter --model-max-context at one lane), the prefill chunk, \
+             --vram-headroom-bytes or --reuse-retained-device, or close what holds VRAM on the desktop; \
+             --vram-allow-expert-cache-below-floor starts anyway, with decode slower than the floor's"
         )
     }
 }

@@ -79,13 +79,13 @@ pub struct Server {
     /// once per request. Shared by every clone, like the active model, so a
     /// change reaches every handler at once.
     pub live: std::sync::Arc<ArcSwap<Live>>,
-    /// The Playground's asset table when `--ui` is on (GitHub #163, ADR
+    /// The Playground's asset table when `--server-ui` is on (GitHub #163, ADR
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
     pub playground: Option<playground::Assets>,
-    /// The Prometheus projection when `--metrics` is on (GitHub #89, ADR
+    /// The Prometheus projection when `--server-metrics` is on (GitHub #89, ADR
     /// 0017); `None` installs neither the projection nor any route to it.
     pub metrics: Option<std::sync::Arc<metrics::Metrics>>,
-    /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
+    /// The key `/v1` requests must present (`--server-api-key` / `IGNIS_SERVER_API_KEY`);
     /// `None` leaves the API open.
     pub api_key: Option<crate::config::ApiKey>,
     /// The match keys of recent `/v1/decide` parts states at their run ends
@@ -408,7 +408,7 @@ impl Server {
     }
 
     /// Set the non-streaming completion timeout (`main` wires this to
-    /// `--request-timeout`/`IGNIS_REQUEST_TIMEOUT`, GitHub #95; the default
+    /// `--server-request-timeout`/`IGNIS_SERVER_REQUEST_TIMEOUT`, GitHub #95; the default
     /// is 30 s).
     pub fn with_request_timeout(self, timeout: Duration) -> Self {
         self.update_live(|live| live.request_timeout = timeout);
@@ -422,8 +422,8 @@ impl Server {
         self
     }
 
-    /// Set the server-wide thinking defaults (`IGNIS_ENABLE_THINKING` /
-    /// `IGNIS_REASONING_EFFORT`, GitHub #68). Callers that set a non-trivial
+    /// Set the server-wide thinking defaults (`IGNIS_MODEL_ENABLE_THINKING` /
+    /// `IGNIS_MODEL_REASONING_EFFORT`, GitHub #68). Callers that set a non-trivial
     /// default should validate it against `template.thinking_capabilities()`
     /// first (`thinking::validate_defaults`) — this setter does not, so
     /// tests can construct an out-of-band `Server` without a template to
@@ -436,21 +436,21 @@ impl Server {
         self
     }
 
-    /// Set the server-wide thinking budget (`--thinking-budget`).
+    /// Set the server-wide thinking budget (`--model-thinking-budget`).
     pub fn with_thinking_budget(self, budget: Option<u32>) -> Self {
         self.update_live(|live| live.default_thinking_budget = budget);
         self
     }
 
     /// Serve the Playground from `assets` under `/ui/` (`main` passes
-    /// [`playground::EMBEDDED`] when `--ui` is set; tests inject their own
+    /// [`playground::EMBEDDED`] when `--server-ui` is set; tests inject their own
     /// table, including the empty one that selects the fallback page).
     pub fn with_playground(mut self, assets: playground::Assets) -> Self {
         self.playground = Some(assets);
         self
     }
 
-    /// Turn Prometheus metrics on (`main` calls this when `--metrics` is
+    /// Turn Prometheus metrics on (`main` calls this when `--server-metrics` is
     /// set): installs the projection into the engine's telemetry consumer,
     /// which alone keeps it up to date from the facts it already receives.
     /// It is served by [`Server::metrics_app`] and, with the Playground, at
@@ -471,12 +471,12 @@ impl Server {
         self
     }
 
-    /// Point what `--metrics` keeps at `model`, a model a switch has just
+    /// Point what `--server-metrics` keeps at `model`, a model a switch has just
     /// loaded (spec model-switch/01): its engine's telemetry consumer starts
     /// feeding the projection, its own counters (Flash-Next's, GitHub #301)
     /// are read, and `reserved` replaces what the previous load reserved. The
     /// start does the same through [`Server::with_metrics`] and
-    /// [`Server::with_load_reservations`]. Nothing without `--metrics`.
+    /// [`Server::with_load_reservations`]. Nothing without `--server-metrics`.
     pub(crate) fn observe_load(&self, model: &ActiveModel, reserved: Option<metrics::LoadReservations>) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -495,7 +495,7 @@ impl Server {
 
     /// Record what this load reserved (GitHub #216, ADR 0030
     /// §Observability): the plan's lines and the shapes they bound, written
-    /// once, before the first request. Without `--metrics` there is nothing
+    /// once, before the first request. Without `--server-metrics` there is nothing
     /// to write them into and the call does nothing; a load that built no
     /// plan (the placeholder path) never makes it.
     pub fn with_load_reservations(self, reserved: metrics::LoadReservations) -> Self {
@@ -503,7 +503,7 @@ impl Server {
         self
     }
 
-    /// Record what `model`'s load reserved in `--metrics` (nothing without
+    /// Record what `model`'s load reserved in `--server-metrics` (nothing without
     /// it): the plan's lines replace the previous load's, and a Flash-Next
     /// load's counter source — not a reservation; the telemetry consumer
     /// reads it at every tick (GitHub #301, #302) — goes to `model`'s engine.
@@ -515,20 +515,20 @@ impl Server {
     }
 
     /// Require `key` as `Authorization: Bearer <key>` on every `/v1` route
-    /// (`main` wires this to `--api-key` / `IGNIS_API_KEY`).
+    /// (`main` wires this to `--server-api-key` / `IGNIS_SERVER_API_KEY`).
     pub fn with_api_key(mut self, key: crate::config::ApiKey) -> Self {
         self.api_key = Some(key);
         self
     }
 
-    /// Acquire image parts with `acquirer` (a `--vision` load, GitHub #179).
+    /// Acquire image parts with `acquirer` (a `--vision-enabled` load, GitHub #179).
     pub fn with_media(self, acquirer: std::sync::Arc<media::MediaAcquirer>) -> Self {
         self.update_active(|model| model.media = Some(acquirer));
         self
     }
 
     /// Place instruction messages under `policy` (`main` wires this to
-    /// `--system-message-policy` / `--developer-message-policy`, GitHub #209;
+    /// `--server-system-message-policy` / `--server-developer-message-policy`, GitHub #209;
     /// the default is merge / inplace).
     pub fn with_instruction_policy(self, policy: instruction::InstructionPolicy) -> Self {
         self.update_live(|live| live.instruction_policy = policy);
@@ -542,9 +542,9 @@ impl Server {
         api::router(state)
     }
 
-    /// The metrics listener's app (`--metrics-bind`, GitHub #89, ADR 0017):
+    /// The metrics listener's app (`--server-metrics-bind`, GitHub #89, ADR 0017):
     /// `GET /metrics` and nothing else, with no API key — it is kept private
-    /// by its bind address, and `--expose` never tunnels it. `None` unless
+    /// by its bind address, and `--server-expose` never tunnels it. `None` unless
     /// [`Server::with_metrics`] turned metrics on.
     pub fn metrics_app(&self) -> Option<Router> {
         self.metrics
@@ -565,9 +565,9 @@ impl Server {
     }
 
     /// [`Server::serve`] on a listener the caller already bound — `main`
-    /// binds first when `--expose` needs the bound port before serving.
+    /// binds first when `--server-expose` needs the bound port before serving.
     ///
-    /// With `metrics_listener` (`--metrics`, GitHub #89), [`Server::metrics_app`]
+    /// With `metrics_listener` (`--server-metrics`, GitHub #89), [`Server::metrics_app`]
     /// is served there too, and one process signal stops both.
     pub async fn serve_on(
         self,

@@ -166,7 +166,7 @@ fn scheduler(compute: Arc<dyn ignis_core::Compute>) -> ConcreteScheduler {
     )
 }
 
-/// A `--vision` server over `compute`, images acquired from `data:` URIs by
+/// A `--vision-enabled` server over `compute`, images acquired from `data:` URIs by
 /// the real processor.
 fn server_over(compute: Arc<dyn ignis_core::Compute>) -> Server {
     use ignis_server::media::{MediaAcquirer, MediaPolicy};

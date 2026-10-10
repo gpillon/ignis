@@ -1,5 +1,5 @@
 //! A server over a mock engine reporting Flash-Next's identity (spec
-//! flash-next/04, GitHub #302): with no `--model`, it is served under
+//! flash-next/04, GitHub #302): with no `--model-id`, it is served under
 //! Flash-Next's own id, text is served, and a request for what Flash-Next
 //! does not have -- an image, a `/v1/decide` readout -- is a 400 naming the
 //! model, never a silent degradation. The 27B's refusals are unchanged. Over
@@ -39,7 +39,7 @@ fn app(model: &str, family: ModelFamily) -> axum::Router {
         .app()
 }
 
-/// A Flash-Next load started with no `--model`: the id it is served under
+/// A Flash-Next load started with no `--model-id`: the id it is served under
 /// is what the start options and the artifact's family decide, as `main`
 /// decides it.
 fn flash_next() -> axum::Router {

@@ -516,7 +516,7 @@ jobs:
             ```
             podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
               -v /path/to/models:/models:ro \
-              -e IGNIS_ARTIFACT=/models/<name>.ninfer \
+              -e IGNIS_MODEL_ARTIFACT=/models/<name>.ninfer \
               ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}
             ```
 
@@ -587,7 +587,7 @@ jobs:
           ```
           podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
             -v /path/to/models:/models:ro \
-            -e IGNIS_ARTIFACT=/models/<name>.ninfer \
+            -e IGNIS_MODEL_ARTIFACT=/models/<name>.ninfer \
             ghcr.io/__REPO__:develop
           ```
 

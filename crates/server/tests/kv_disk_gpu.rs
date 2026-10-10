@@ -15,7 +15,7 @@
 //!   second. C runs alone, then A and B come back and finish; nothing is
 //!   dropped or re-queued. C's tokens are its lone run's.
 //!
-//! Both models cut their pool to one context with `--kv-pool-bytes`'s token
+//! Both models cut their pool to one context with `--vram-kv-pool-bytes`'s token
 //! form (#309 P1). A load whose pool still holds both requests cannot force
 //! the overflow, and the test says so rather than passing.
 //!

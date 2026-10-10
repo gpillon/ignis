@@ -6,7 +6,7 @@ import { CHAT_PATH } from "./request.ts";
 // other request on the page — the Monitor's /ui/metrics scrape first of all —
 // sat queued until an agent finished. Chrome shows that as a long "Stalled".
 // A multiplexed connection (h2, h3) has no such limit, which is what a
-// production reverse proxy or `--expose` gives; localhost, served plain, does
+// production reverse proxy or `--server-expose` gives; localhost, served plain, does
 // not. So the budget is read from the protocol actually in use rather than
 // fixed, and only h2 and h3 lift it: anything we cannot read is capped, since
 // guessing wrong the other way freezes the page.

@@ -1,6 +1,6 @@
 //! GitHub #181 — the whole vision path under an agentic load, on one load of
 //! the real model behind the production HTTP surface: `cuda_scheduler` with
-//! `--vision`, `--spec dflash2`, prompt reuse on, and every image fetched by
+//! `--vision-enabled`, `--spec-backend dflash2`, prompt reuse on, and every image fetched by
 //! URL from a loopback image server (`--media-allow-private-network`).
 //!
 //! Each piece has its own GPU test already — the canary, DFlash2 on a
@@ -160,7 +160,7 @@ fn harness() -> Option<Harness> {
             unreachable!();
         }
     };
-    // `main.rs`'s `--vision` wiring, with the loopback image server allowed.
+    // `main.rs`'s `--vision-enabled` wiring, with the loopback image server allowed.
     let processor = load_processor(&frontend, vision, MAX_CONTEXT).expect("vision processor");
     let acquirer = MediaAcquirer::new(
         Arc::new(processor.clone()),

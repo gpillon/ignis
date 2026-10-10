@@ -5,7 +5,7 @@ import { readSnapshot } from "./snapshot.ts";
 
 // Scraping `GET /ui/metrics` from the browser (GitHub #165, ADR 0017): the
 // Playground's copy of the exposition on the API listener, key-gated when
-// ignis runs with --api-key. A 404 means metrics are off, a 401 that the key
+// ignis runs with --server-api-key. A 404 means metrics are off, a 401 that the key
 // is missing or wrong. The state below is a pure reduction of scrape results
 // so the cadence and the history are testable without a timer.
 
@@ -100,7 +100,7 @@ function hasLiveHistory(state: MonitorState): boolean {
 /**
  * Whether the page offers the Monitor: metrics answered, or answered 401
  * (the Monitor says the key is wanted), or answered before and stopped.
- * A server without --metrics never shows it.
+ * A server without --server-metrics never shows it.
  */
 export function monitorVisible(state: MonitorState): boolean {
   return hasLiveHistory(state) || state.availability === "unauthorized";

@@ -18,90 +18,15 @@
 //! (`ignis_server::runtime::cuda_scheduler`, GitHub #61 / P1-25); without
 //! either, it drives the deterministic `MockCompute` (CPU-only, ADR 0006).
 //!
-//! Configuration (CLI flags mirror each env var one-to-one — GitHub #77;
-//! run `ignis-server --help` for the full flag table. A flag overrides its
-//! env var, which overrides the built-in default):
-//! - `IGNIS_MODEL_ID` / `--model-id`, `-m` — the loaded model id (default
-//!   `qwen3.8-27b`; what `GET /v1/models` reports and what submissions must
-//!   name).
-//! - `IGNIS_SERVER_BIND` / `--server-bind`, `-b` — the bind address (default
-//!   `127.0.0.1:8000`; localhost-only by design — no network exposure, no
-//!   auth, v1).
-//! - `IGNIS_MODEL_ARTIFACT` / `--model-artifact`, `-a` — the `.ninfer` container path
-//!   (the real tokenizer and chat template, artifact-02). A configured
-//!   artifact is loaded through the verified loader path (server-03): it
-//!   must exist, its sidecar must be present and its checksum report clean,
-//!   or the server refuses to start (no silent fallback to the placeholder).
-//!   Unset, the model is looked for under `--download-path` and
-//!   fetched when it is not there (below).
-//! - `IGNIS_DOWNLOAD_ENABLED` / `--download-enabled` / `--download-enabled false` —
-//!   may a missing model be fetched (ADR 0033, GitHub #234)? On by default,
-//!   and only ever consulted with `--model-artifact` unset. On a terminal the
-//!   operator is asked first; without one (a container, a daemon) it
-//!   downloads, since there is nobody to answer. A build without
-//!   `--features cuda` never downloads: it could not run the weights.
-//!   Off, or a model the registry does not know, is the built-in
-//!   placeholder template (its rendered `content` is not natural text).
-//! - `IGNIS_DOWNLOAD_PATH` / `--download-path` — where a fetched
-//!   model lands, and where one fetched earlier is found (default
-//!   `./models`). Flat: the artifact and its sidecar keep the names the
-//!   repo publishes them under, so `hf download … --local-dir models` and
-//!   this produce the same file.
-//! - `IGNIS_MODEL_ENABLE_THINKING` / `--model-enable-thinking` — the server-wide default
-//!   for `enable_thinking` (GitHub #68); `true` or `false`, default `true`.
-//!   An unparseable value, or a `false` the loaded template cannot honour,
-//!   refuses to start.
-//! - `IGNIS_MODEL_PREFILL_CHUNK` / `--model-prefill-chunk` — the prefill chunk width
-//!   in tokens (default 1024; a nonzero multiple of 128 — the reference's
-//!   own alignment rule). GitHub #87.
-//! - `IGNIS_MODEL_MAX_CONTEXT` / `--model-max-context` — the maximum per-sequence
-//!   context in tokens (default 40960: a 32K prompt plus an 8K generation
-//!   budget, so G2's largest cell is admissible without editing code). The
-//!   paged-KV pool the leaf builds is derived from this value (never
-//!   below it, so admission can never promise more pages than the leaf
-//!   built) rather than being an independent flag.
-//! - `IGNIS_MODEL_REASONING_EFFORT` / `--model-reasoning-effort` — the server-wide
-//!   default `reasoning_effort`; unset means "let the template's own
-//!   default apply". An unknown value, or one the loaded template does not
-//!   support, refuses to start.
-//! - `IGNIS_MODEL_THINKING_BUDGET` / `--model-thinking-budget` — the server-wide
-//!   thinking budget, in reasoning tokens (default 32768, `off` for none;
-//!   spec server/08). Configured with a tokenizer that yields no thinking
-//!   close, it refuses to start.
-//! - `IGNIS_SERVER_REQUEST_TIMEOUT` / `--server-request-timeout` — how long a
-//!   non-streaming completion waits before the handler gives up with a
-//!   `504` (default 30 seconds, max 3600 — GitHub #95).
-//! - `IGNIS_SWITCH_DRAIN_TIMEOUT` / `--switch-drain-timeout` — how long a
-//!   model switch lets the old model's running requests finish before it
-//!   cancels them (default 30 seconds, max 3600, 0 cancels at once — spec
-//!   model-switch/01). A switch loads its target on the flags the server
-//!   started with, leaving off the ones only the other model takes.
-//! - `IGNIS_SWITCH_ALLOW_IMPLICIT` / `--switch-allow-implicit <true|false>` and
-//!   `IGNIS_SWITCH_KNOWN_MODELS` / `--switch-known-models <id>=<path>` (repeatable; the env
-//!   var takes `;`-separated pairs) — a request whose `model` names another
-//!   listed model switches the server to it and is then served on it (default
-//!   on; spec model-switch/01 §Implicit switch). The model the server starts
-//!   on is always listed; off, or unlisted, such a request is a `404
-//!   model_not_found`, as it always was.
-//! - `--server-ui` / `--server-ui false` / `IGNIS_SERVER_UI` — serve the Playground at `/ui/`
-//!   (GitHub #163, ADR 0026); **on** by default. A binary built without
-//!   `web/dist` serves the page that says how to build it, so the default
-//!   costs a route and nothing else.
-//! - `--server-metrics` / `--server-metrics-bind <addr>` (flags only, no env var) — serve
-//!   Prometheus metrics at `GET /metrics` on their own listener (default
-//!   `127.0.0.1:9464`, no API key, never exposed), and at `/ui/metrics`
-//!   unless `--server-ui false`, under the API key when one is set (GitHub #89, ADR
-//!   0017). Off by default, and off means neither the routes nor the
-//!   projection exist.
-//! - `IGNIS_SERVER_API_KEY` / `--server-api-key` — when set, every `/v1` request must
-//!   send `Authorization: Bearer <key>` or gets a `401`; unset (default)
-//!   leaves the API open. `auto` generates a key at start and prints it to
-//!   stdout — the only case a key is ever printed.
-//! - `IGNIS_SERVER_EXPOSE` / `--server-expose` — make the server reachable from outside
-//!   this machine (ADR 0028). `cloudflare-quick` opens a Cloudflare quick
-//!   tunnel once the listener is bound and prints its public URL on stdout.
-//!   An exposed server always requires an API key: with none set, it
-//!   behaves as `--server-api-key auto`.
+//! Configuration (ADR 0046, `ignis_server::config`): every field is declared
+//! once and has a flag (`--<group>-<field>`), an env var
+//! (`IGNIS_<GROUP>_<FIELD>`) and a config-file key (`<group>.<field>`), resolved
+//! flag > env > config file > profile > default, with a family-scoped
+//! variant (`--qwen38-…`, `--qwen38flashnext-…`) winning within each source.
+//! `ignis-server help --fields` prints every one from the same table, so this
+//! comment does not repeat it. `main` resolves once, builds the load from the
+//! options fitted to the artifact's family, and serves `GET`/`PATCH
+//! /v1/config` over the running configuration.
 
 use std::sync::Arc;
 

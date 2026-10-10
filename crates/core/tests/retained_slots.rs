@@ -503,7 +503,7 @@ fn prompt_reuse_off_with_slots_shares_live_siblings_and_retains_nothing() {
 
 #[test]
 fn prompt_reuse_off_reserves_no_slots() {
-    // What the server resolves `--prompt-reuse off` to by default.
+    // What the server resolves `--reuse-prompt off` to by default.
     let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {

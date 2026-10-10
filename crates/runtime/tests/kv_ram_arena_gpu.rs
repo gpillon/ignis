@@ -1,5 +1,5 @@
 //! The KV-RAM arena at the Rust seam (GitHub #213, ADR 0030): what the load
-//! does with `--kv-host-pool-bytes` before it serves anything.
+//! does with `--reuse-kv-host-pool-bytes` before it serves anything.
 //!
 //! The arena's own placement — first fit, freeing, the "no hole fits" path —
 //! is pinned against the vendored allocator in
@@ -37,7 +37,7 @@ fn a_region_the_host_cannot_page_lock_refuses_the_start_naming_the_size_and_the_
         "the refusal must name the size it could not pin: {error}"
     );
     assert!(
-        error.contains("--kv-host-pool-bytes"),
+        error.contains("--reuse-kv-host-pool-bytes"),
         "the refusal must name the knob that sets it: {error}"
     );
 
@@ -51,7 +51,7 @@ fn a_zero_pool_reserves_nothing_and_a_pinned_one_reports_what_its_blobs_hold() {
     {
         let pool = HostPinnedPool::create(0).expect("0 pins nothing, which cannot fail");
         assert_eq!(pool.capacity_bytes(), 0);
-        assert_eq!(host_pool_stats(), (0, 0), "--kv-host-pool-bytes 0 reserves nothing");
+        assert_eq!(host_pool_stats(), (0, 0), "--reuse-kv-host-pool-bytes 0 reserves nothing");
         // With the tier off nothing fits, and a blob asked for anyway is
         // refused as a failure rather than as a full arena: there is no
         // arena to give blobs back to, so no victim order would help.

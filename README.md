@@ -64,8 +64,8 @@ publishes a rolling development build, **not a release**: the image
 `ghcr.io/gpillon/ignis:develop` and the `develop` prerelease.)
 
 ```
-ignis-server --max-context 524288 --rope-scaling yarn:2 \
-  --spec dflash2 --draft-tokens 7 --vision --metrics
+ignis-server --model-max-context 524288 --model-rope-scaling yarn:2 \
+  --spec-backend dflash2 --spec-draft-tokens 7 --vision-enabled --server-metrics
 ```
 
 No model yet? It offers to fetch one. Those flags turn on what the bare
@@ -132,8 +132,8 @@ Every number below is a measurement on a 5090.
 
 ### Speculative decoding (DFlash2)
 
-- The served artifact carries a **grafted DFlash2 drafter**; `--spec dflash2
-  --draft-tokens 7` runs draft-and-verify rounds against it.
+- The served artifact carries a **grafted DFlash2 drafter**; `--spec-backend dflash2
+  --spec-draft-tokens 7` runs draft-and-verify rounds against it.
 - The drafter's vendored top-k gave one warp to each of seven columns over a
   248k vocabulary and spent 3,145 µs — 16.4% of decode kernel time — to move
   2.0 µs of memory. **Our row-split replacement does it in 44 µs at a
@@ -200,7 +200,7 @@ Every number below is a measurement on a 5090.
 
 ### Images as evidence
 
-- `--vision` loads the tower and reserves its workspace; images arrive inline
+- `--vision-enabled` loads the tower and reserves its workspace; images arrive inline
   as data URIs or as URLs the server fetches, prepares and caches.
 - The encoder output is kept past its request, keyed by content digest and
   grid: **four questions over one 4096x4096 screenshot go from 27.92 s to
@@ -213,7 +213,7 @@ Every number below is a measurement on a 5090.
 
 ### A context you can rescale
 
-- The checkpoint is trained to **262,144 positions**; `--rope-scaling yarn:F`
+- The checkpoint is trained to **262,144 positions**; `--model-rope-scaling yarn:F`
   rescales that envelope, `yarn:4` putting the ceiling at **1,048,576**
   (factor up to 64). What a long-context probe must ask is a question about
   *relative* position — a literal needle at 320K is recalled with the flag and
@@ -224,11 +224,11 @@ Every number below is a measurement on a 5090.
 - **The Playground** at `/ui/` — chat with tools and subagents, parallel
   sessions, image input, a Decide tab and a live Monitor. Built into the
   server, not a separate service.
-- **Prometheus** on its own listener (`--metrics`), with the VRAM plan, retained
+- **Prometheus** on its own listener (`--server-metrics`), with the VRAM plan, retained
   state, KV pool occupancy, decision counters and request lifecycle.
 - **It fetches its own model.** Started with no artifact, a GPU build asks, then
   downloads and verifies it.
-- **`--api-key` and `--expose`** — a keyed public URL through a quick Cloudflare
+- **`--server-api-key` and `--server-expose`** — a keyed public URL through a quick Cloudflare
   tunnel, key always required.
 - **Linux and Windows**, a `linux/amd64` container image on `ghcr.io`, and
   release archives cut from the same build.
@@ -284,7 +284,7 @@ The uncensored image is the standard one with the
 [huihui-ai abliteration](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated)
 applied: 1,255 of its 1,325 objects are byte-identical, and only the 70 matrices
 the abliteration changed are re-encoded. The server never downloads it on its
-own; start it with `--artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer`,
+own; start it with `--model-artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer`,
 or `make dev UNCENSORED=1` from a checkout. **It does not refuse**, so put the
 guardrails in the application or tool layer and do not expose it to untrusted
 users.
@@ -294,7 +294,7 @@ users.
 ```
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
   -v /path/to/models:/models \
-  ghcr.io/gpillon/ignis:0.1.2 --model-download-path /models
+  ghcr.io/gpillon/ignis:0.1.2 --download-path /models
 ```
 
 (`docker`: `--gpus all` in place of `--device`.) With no model in that

@@ -59,7 +59,7 @@ futures-util = "0.3"
 [features]
 # Forwards to the artifact crate's VRAM materialization path (ADR 0002) and
 # to `ignis-runtime`'s production `CudaLeaf` (GitHub #61 / P1-25): with
-# `IGNIS_ARTIFACT` set and this feature on, the entrypoint drives the real
+# `IGNIS_MODEL_ARTIFACT` set and this feature on, the entrypoint drives the real
 # GPU-backed model instead of the deterministic `MockCompute` (ADR 0006);
 # off, or without an artifact, it stays on `MockCompute` (CPU-only).
 cuda = ["ignis-core/cuda", "ignis-artifact/cuda", "ignis-runtime/cuda"]

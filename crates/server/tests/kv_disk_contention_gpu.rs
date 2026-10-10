@@ -21,7 +21,7 @@
 //! no work. The figures go in a finding. `IGNIS_KV_P2_RAW` names a file the
 //! raw samples are written to as JSON.
 //!
-//! The pool is cut to one context (`--kv-pool-bytes`'s token form, #309 P1)
+//! The pool is cut to one context (`--vram-kv-pool-bytes`'s token form, #309 P1)
 //! so that E cannot fit beside A. Machine-local: the Flash-Next artifact
 //! (`IGNIS_FLASH_NEXT_DIR`), its files on F:.
 

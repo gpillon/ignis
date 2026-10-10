@@ -92,30 +92,30 @@ KV_DISK_LOCATION = $(strip $(if $(filter auto,$(KV_DISK_PATH)),$(if $(filter win
 SERVER_PID := $(RUNTIME_DIR)/ignis-server.pid
 SERVER_LOG := $(RUNTIME_DIR)/ignis-server.log
 
-GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
-  $(if $(KV_FORMAT),--kv-format $(KV_FORMAT)) \
-  $(if $(MAX_CONTEXT),--max-context $(MAX_CONTEXT)) \
-  $(if $(PREFILL_CHUNK),--prefill-chunk $(PREFILL_CHUNK))   $(if $(DECODE_SHARE),--decode-share $(DECODE_SHARE))   $(if $(LANES),--decode-lanes $(LANES)) \
-  $(if $(KV_POOL_BYTES),--kv-pool-bytes $(KV_POOL_BYTES))   $(if $(VRAM_HEADROOM),--vram-headroom-bytes $(VRAM_HEADROOM))   $(if $(VRAM_BUDGET),--vram-budget-bytes $(VRAM_BUDGET))   $(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)),--allow-vram-oversubscription) \
-  $(if $(filter 1,$(ALLOW_EXPERT_CACHE_BELOW_FLOOR)),--allow-expert-cache-below-floor) \
-  $(if $(KV_HOST_POOL_BYTES),--kv-host-pool-bytes $(KV_HOST_POOL_BYTES))   $(if $(NGRAM_HOT_BYTES),--ngram-hot-bytes $(NGRAM_HOT_BYTES)) \
+GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--model-artifact $(ARTIFACT)) \
+  $(if $(KV_FORMAT),--model-kv-format $(KV_FORMAT)) \
+  $(if $(MAX_CONTEXT),--model-max-context $(MAX_CONTEXT)) \
+  $(if $(PREFILL_CHUNK),--model-prefill-chunk $(PREFILL_CHUNK))   $(if $(DECODE_SHARE),--model-decode-share $(DECODE_SHARE))   $(if $(LANES),--spec-decode-lanes $(LANES)) \
+  $(if $(KV_POOL_BYTES),--vram-kv-pool-bytes $(KV_POOL_BYTES))   $(if $(VRAM_HEADROOM),--vram-headroom-bytes $(VRAM_HEADROOM))   $(if $(VRAM_BUDGET),--vram-budget-bytes $(VRAM_BUDGET))   $(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)),--vram-allow-oversubscription) \
+  $(if $(filter 1,$(ALLOW_EXPERT_CACHE_BELOW_FLOOR)),--vram-allow-expert-cache-below-floor) \
+  $(if $(KV_HOST_POOL_BYTES),--reuse-kv-host-pool-bytes $(KV_HOST_POOL_BYTES))   $(if $(NGRAM_HOT_BYTES),--ngram-hot-bytes $(NGRAM_HOT_BYTES)) \
   $(if $(KV_DISK_BYTES),--kv-disk-bytes $(KV_DISK_BYTES))   $(if $(KV_DISK_PATH),--kv-disk-path $(KV_DISK_PATH)) \
-  $(if $(RETAINED_DEVICE),--retained-device $(RETAINED_DEVICE)) \
-  $(if $(RETAINED_HOST),--retained-host $(RETAINED_HOST)) \
-  $(if $(filter 1,$(VISION)),--vision $(if $(VISION_MAX_TOKENS),--vision-max-tokens $(VISION_MAX_TOKENS))) \
-  $(if $(ROPE_SCALING),--rope-scaling $(ROPE_SCALING)) \
-  $(if $(REQUEST_TIMEOUT),--request-timeout $(REQUEST_TIMEOUT)) \
-  $(if $(SPEC),--spec $(SPEC) $(if $(filter-out off,$(SPEC)),$(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--draft-head $(DRAFT_HEAD))))   $(if $(DRAFT_ROWS),--draft-rows $(DRAFT_ROWS))
-SERVER_FLAGS = --bind $(BIND) \
+  $(if $(RETAINED_DEVICE),--reuse-retained-device $(RETAINED_DEVICE)) \
+  $(if $(RETAINED_HOST),--reuse-retained-host $(RETAINED_HOST)) \
+  $(if $(filter 1,$(VISION)),--vision-enabled $(if $(VISION_MAX_TOKENS),--vision-max-tokens $(VISION_MAX_TOKENS))) \
+  $(if $(ROPE_SCALING),--model-rope-scaling $(ROPE_SCALING)) \
+  $(if $(REQUEST_TIMEOUT),--server-request-timeout $(REQUEST_TIMEOUT)) \
+  $(if $(SPEC),--spec-backend $(SPEC) $(if $(filter-out off,$(SPEC)),$(if $(DRAFT_TOKENS),--spec-draft-tokens $(DRAFT_TOKENS)) $(if $(DRAFT_HEAD),--spec-draft-head $(DRAFT_HEAD))))   $(if $(DRAFT_ROWS),--spec-draft-rows $(DRAFT_ROWS))
+SERVER_FLAGS = --server-bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
-  $(if $(SERVED_MODEL),--model $(SERVED_MODEL)) \
-  $(if $(filter 1,$(UI)),--ui,--no-ui) \
-  $(if $(filter 1,$(METRICS)),--metrics $(if $(METRICS_BIND),--metrics-bind $(METRICS_BIND))) \
-  $(if $(API_KEY),--api-key $(API_KEY)) \
-  $(if $(EXPOSE),--expose $(EXPOSE)) \
-  $(if $(SYSTEM_MESSAGE_POLICY),--system-message-policy $(SYSTEM_MESSAGE_POLICY)) \
-  $(if $(DEVELOPER_MESSAGE_POLICY),--developer-message-policy $(DEVELOPER_MESSAGE_POLICY)) \
-  $(if $(DEFAULT_MAX_TOKENS),--default-max-tokens $(DEFAULT_MAX_TOKENS)) \
+  $(if $(SERVED_MODEL),--model-id $(SERVED_MODEL)) \
+  $(if $(filter 1,$(UI)),--server-ui,--server-ui false) \
+  $(if $(filter 1,$(METRICS)),--server-metrics $(if $(METRICS_BIND),--server-metrics-bind $(METRICS_BIND))) \
+  $(if $(API_KEY),--server-api-key $(API_KEY)) \
+  $(if $(EXPOSE),--server-expose $(EXPOSE)) \
+  $(if $(SYSTEM_MESSAGE_POLICY),--server-system-message-policy $(SYSTEM_MESSAGE_POLICY)) \
+  $(if $(DEVELOPER_MESSAGE_POLICY),--server-developer-message-policy $(DEVELOPER_MESSAGE_POLICY)) \
+  $(if $(DEFAULT_MAX_TOKENS),--model-default-max-tokens $(DEFAULT_MAX_TOKENS)) \
   $(ARGS)
 # The KV pool `make config` reports (ADR 0045). The 27B is resident: its pool
 # takes the rest of the VRAM budget. Flash-Next on a card that cannot hold

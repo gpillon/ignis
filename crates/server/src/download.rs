@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 /// describes, so it can attest nothing about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelEntry {
-    /// The model id `--model` names (what `GET /v1/models` reports).
+    /// The model id `--model-id` names (what `GET /v1/models` reports).
     pub model: &'static str,
     /// The Hugging Face repo, `<owner>/<name>`.
     pub repo: &'static str,
@@ -106,9 +106,9 @@ pub enum PlaceholderReason {
     /// This binary was built without `--features cuda`: it could not run the
     /// weights it downloaded, so it never downloads them.
     NotSupported,
-    /// `--model` names a model the registry has no entry for.
+    /// `--model-id` names a model the registry has no entry for.
     UnknownModel,
-    /// `--no-model-download` / `IGNIS_MODEL_DOWNLOAD=false`.
+    /// `--download-enabled false` / `IGNIS_DOWNLOAD_ENABLED=false`.
     DownloadsDisabled,
     /// The operator was asked and said no.
     Declined,
@@ -129,13 +129,13 @@ impl PlaceholderReason {
 /// What the config says about fetching a missing model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadSettings<'a> {
-    /// `--artifact` / `IGNIS_ARTIFACT`, when the operator named one.
+    /// `--model-artifact` / `IGNIS_MODEL_ARTIFACT`, when the operator named one.
     pub artifact: Option<&'a Path>,
-    /// `--model` / `IGNIS_MODEL` — the registry key.
+    /// `--model-id` / `IGNIS_MODEL_ID` — the registry key.
     pub model: &'a str,
-    /// `--model-download` / `--no-model-download`.
+    /// `--download-enabled` / `--download-enabled false`.
     pub enabled: bool,
-    /// `--model-download-path`: where a downloaded artifact lands.
+    /// `--download-path`: where a downloaded artifact lands.
     pub dir: &'a Path,
     /// Whether this binary can run a model at all (built with `cuda`).
     pub supported: bool,
@@ -561,7 +561,7 @@ pub fn ask(
 ) -> bool {
     let _ = writeln!(
         out,
-        "\nignis-server: no model at {}\n  {} is published at https://huggingface.co/{} ({:.1} GiB)\n  it will be saved as {}\n  (--no-model-download never asks; --model-download-path puts it elsewhere)",
+        "\nignis-server: no model at {}\n  {} is published at https://huggingface.co/{} ({:.1} GiB)\n  it will be saved as {}\n  (--download-enabled false never asks; --download-path puts it elsewhere)",
         path.display(),
         entry.model,
         entry.repo,
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn a_named_artifact_wins_whether_or_not_it_is_there() {
-        // AC1: `--artifact` is the operator's word. Present or missing, the
+        // AC1: `--model-artifact` is the operator's word. Present or missing, the
         // decision is the same — `main` owns the failure, not the downloader.
         let dir = PathBuf::from(DIR);
         let named = PathBuf::from("/elsewhere/custom.ninfer");
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn downloads_off_still_loads_an_artifact_that_is_there() {
-        // `--no-model-download` forbids the download, not the model: a file
+        // `--download-enabled false` forbids the download, not the model: a file
         // already on disk is still what the server loads.
         let dir = PathBuf::from(DIR);
         let mut settings = settings(crate::config::DEFAULT_MODEL, &dir);

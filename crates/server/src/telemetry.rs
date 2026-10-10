@@ -218,7 +218,7 @@ pub struct Telemetry {
     /// In-flight request telemetry (id → state); removed on completion.
     requests: HashMap<RequestId, RequestTelemetry>,
     /// The Prometheus projection this consumer keeps up to date, when
-    /// `--metrics` installed one (GitHub #89, ADR 0017).
+    /// `--server-metrics` installed one (GitHub #89, ADR 0017).
     metrics: Option<Arc<Metrics>>,
     /// Where the load's own counters are read, a Flash-Next load's (GitHub
     /// #301, #302): host memory, read at every tick into `metrics`.

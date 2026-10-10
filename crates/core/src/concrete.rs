@@ -181,7 +181,7 @@ pub struct SchedulerConfig {
     /// [`SubmitError::ContextExceeded`].
     pub max_sequence_tokens: u32,
     /// The **default `max_tokens`** (ADR 0045, GitHub #309; the operator's
-    /// `--default-max-tokens`): what a request that names no cap may
+    /// `--model-default-max-tokens`): what a request that names no cap may
     /// generate, its reasoning included, clamped to what its prompt leaves of
     /// `max_sequence_tokens`. `submit` writes it into the request's
     /// `params.max_tokens`, so it is enforced exactly as an explicit cap is.
@@ -226,7 +226,7 @@ pub struct SchedulerConfig {
     /// once. 0 is ADR 0018's one decode round per chunk; it must be below 1.
     pub decode_share: f64,
     /// Cross-request state reuse (GitHub #186, ADR 0029; the operator's
-    /// `--prompt-reuse`). On by default. Off means exactly nothing happens:
+    /// `--reuse-prompt`). On by default. Off means exactly nothing happens:
     /// no request captures a prompt checkpoint and none claims one, so a cold
     /// bench measures a cold engine and a correctness oracle prefills every
     /// prompt it is given.
@@ -241,7 +241,7 @@ pub struct SchedulerConfig {
     /// Flash-Next's costs an expert stream.
     pub opener_page_rides_capture: bool,
     /// The load's **retained slots** (GitHub #215, #281, ADR 0030; the
-    /// operator's `--retained-device` and `--retained-host` together): how
+    /// operator's `--reuse-retained-device` and `--reuse-retained-host` together): how
     /// many images of mutable state retained state may hold, prompt
     /// checkpoints and shared prefixes alike -- the pool's device slots
     /// first, then its host slots, in production. Every publish and every
@@ -253,7 +253,7 @@ pub struct SchedulerConfig {
     pub retained_slots: u32,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority after its conversation last used it (GitHub #190; the
-    /// operator's `--retained-interactive-ttl`). Past it the entry ranks as
+    /// operator's `--reuse-retained-interactive-ttl`). Past it the entry ranks as
     /// an Agent's would, so conversations nobody is coming back to cannot
     /// hold KV-RAM against every subagent.
     pub retained_interactive_ttl: Duration,
@@ -459,8 +459,8 @@ impl Default for SchedulerConfig {
             serving_chunk_tokens: DEFAULT_SERVING_CHUNK_TOKENS,
             decode_share: 0.0,
             // GitHub #186: on by default (ADR 0029), with a slot per lane -- a
-            // fixed test default, not the server's (`--retained-device` and
-            // `--retained-host`, GitHub #281). A test that wants exhaustion
+            // fixed test default, not the server's (`--reuse-retained-device` and
+            // `--reuse-retained-host`, GitHub #281). A test that wants exhaustion
             // asks for it by setting fewer here.
             prompt_reuse: true,
             opener_page_rides_capture: false,
@@ -4091,7 +4091,7 @@ impl Scheduler for ConcreteScheduler {
             request.publish_tokens = 0;
         }
 
-        // And `--prompt-reuse off` publishes at neither boundary. #188 kept
+        // And `--reuse-prompt off` publishes at neither boundary. #188 kept
         // that by gating the block where it floored the publish point; with
         // the flooring gone the gate lives here, on the request's own copy of
         // the structural offsets — the same thing the opener filter above
@@ -4479,7 +4479,7 @@ impl Scheduler for ConcreteScheduler {
                 .iter()
                 .enumerate()
                 .map(|(n, &i)| {
-                    // `--prompt-reuse off` captures nothing, whatever slots the
+                    // `--reuse-prompt off` captures nothing, whatever slots the
                     // load gives live siblings (GitHub #215).
                     if !self.config.prompt_reuse {
                         return 0;

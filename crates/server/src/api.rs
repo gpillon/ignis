@@ -1,7 +1,7 @@
 //! The OpenAI-compatible HTTP surface (server-01): routes, request /
 //! response schemas, handlers.
 //!
-//! Endpoints (`docs/design/ignis-v1.md` §2; open unless `--api-key` is set,
+//! Endpoints (`docs/design/ignis-v1.md` §2; open unless `--server-api-key` is set,
 //! then each needs `Authorization: Bearer <key>` or answers `401`):
 //! - `GET /v1/models` — the loaded model, and whether it is serving or
 //!   being switched; `POST /v1/models/switch` replaces it (spec
@@ -57,7 +57,7 @@ use crate::thinking::{
 };
 use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
 
-/// The request body limit of a `--vision` load, in bytes (the reference's
+/// The request body limit of a `--vision-enabled` load, in bytes (the reference's
 /// `--max-request-mib` default). It is this size because it is the media
 /// budget's own: inline base64 is 4/3 of its decoded size, so the 256 MiB
 /// `max_encoded_media_bytes` a request may spend needs 341 MiB of body to
@@ -69,7 +69,7 @@ pub const MEDIA_REQUEST_BODY_LIMIT: usize = 384 << 20;
 /// The request body limit of a text-only load, in bytes (GitHub #230). The
 /// largest prompt the engine can accept at all is its attention envelope,
 /// 1,048,576 tokens under hq-e8-2b, which is 3-4 MB of text; this is about
-/// four times that, so an oversized prompt is refused by `--max-context`
+/// four times that, so an oversized prompt is refused by `--model-max-context`
 /// with a 400 that names the context, never by a byte count that does not.
 /// axum's own 2 MiB default sat *under* one max-context prompt.
 pub const TEXT_REQUEST_BODY_LIMIT: usize = 16 << 20;
@@ -93,7 +93,7 @@ pub fn router(state: Arc<Server>) -> Router {
         // Outermost (GitHub #129): a keyed server's readiness probe, which
         // sends no key, must see 503 until the warm-up has run, not a 401.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_serving));
-    // The body cap, enforced before JSON parsing: wider with `--vision`,
+    // The body cap, enforced before JSON parsing: wider with `--vision-enabled`,
     // which takes images inline as base64 data URIs (GitHub #179), than for
     // a text-only load, which only ever carries a prompt (GitHub #230).
     // Both are past what their own load can use, so the refusal an operator
@@ -104,13 +104,13 @@ pub fn router(state: Arc<Server>) -> Router {
     } else {
         TEXT_REQUEST_BODY_LIMIT
     }));
-    // The Playground (GitHub #163): present unless `--no-ui` withheld the
+    // The Playground (GitHub #163): present unless `--server-ui false` withheld the
     // assets -- served by default since ADR 0026's 2026-09-19 amendment.
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
     }
     // The Playground's copy of the Prometheus exposition (GitHub #89, ADR
-    // 0017): only with the Playground and `--metrics`, and behind the same key
+    // 0017): only with the Playground and `--server-metrics`, and behind the same key
     // as `/v1` when one is set — an exposed server (ADR 0028) must not
     // publish its load to anyone. Prometheus itself scrapes the metrics
     // listener (`Server::metrics_app`); this listener has no `/metrics`.
@@ -504,7 +504,7 @@ pub(crate) enum Structure {
 }
 
 /// [`build_request`] for any conversation: one carrying image parts on a
-/// `--vision` load (GitHub #179) first has its media acquired and prepared
+/// `--vision-enabled` load (GitHub #179) first has its media acquired and prepared
 /// — a refusal is the error response, and dropping this future (a client
 /// disconnect) stops that work before anything is submitted — then its
 /// placeholders expanded, so `prompt_tokens` counts the image tokens. The
@@ -1307,11 +1307,11 @@ pub(crate) fn bad_request_param(message: &str, param: &str) -> Response {
 
 /// The `504` body for a request `collect_completion` gave up on: names the
 /// timeout that fired (GitHub #95) so an operator reading the error knows
-/// what to raise with `--request-timeout`/`IGNIS_REQUEST_TIMEOUT`, rather
+/// what to raise with `--server-request-timeout`/`IGNIS_SERVER_REQUEST_TIMEOUT`, rather
 /// than suspecting a wedged engine when a healthy one just needed longer.
 pub(crate) fn request_timeout_message(timeout: std::time::Duration) -> String {
     format!(
-        "the request did not complete within the server's {}s timeout (the engine may be wedged) — raise it with --request-timeout/IGNIS_REQUEST_TIMEOUT",
+        "the request did not complete within the server's {}s timeout (the engine may be wedged) — raise it with --server-request-timeout/IGNIS_SERVER_REQUEST_TIMEOUT",
         timeout.as_secs()
     )
 }
@@ -1404,7 +1404,7 @@ pub(crate) fn now() -> u64 {
     description = "One entry: the model this server loaded, with the context a single request may spend (`max_model_len`, prompt plus completion). A server serves one model at a time; `POST /v1/models/switch` replaces it.\n\n`status` beside the entry says what the API is doing: `serving`; `switching` while a switch replaces the model (`switching` names both ids, and the entry is still the old model until the new one serves); or `failed` when the last switch failed (`reason` says why) — briefly, while the previous model is reloaded, or until a switch succeeds when it could not be. While switching or failed this route answers; every other `/v1` route answers 503.",
     responses(
         (status = 200, description = "The loaded model.", body = ModelList),
-        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`).", body = ApiError),
     ),
 )]
@@ -1459,14 +1459,14 @@ struct SwitchIds {
 
 // ── POST /v1/models/switch ────────────────────────────────────────────────
 
-/// A model switch: what a restart with `--artifact` and `--model` changed
+/// A model switch: what a restart with `--model-artifact` and `--model-id` changed
 /// would have been asked for.
 #[derive(Deserialize, ToSchema)]
 struct SwitchRequest {
     /// The `.ninfer` container to serve, a path on the server's machine
     /// (its sidecar beside it, as at start).
     artifact: String,
-    /// The id to serve it under (`--model`); a known model's id must be the
+    /// The id to serve it under (`--model-id`); a known model's id must be the
     /// artifact's own.
     model: String,
 }
@@ -1490,12 +1490,12 @@ struct SwitchAccepted {
     tag = "models",
     operation_id = "switch_model",
     summary = "Replace the loaded model",
-    description = "Unloads the model being served and loads `artifact` in its place under the id `model`, on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (`--vision` on Qwen3.8-Flash-Next, the other model's `--spec` backend, the Flash-Next-only knobs), which is left off for it.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
+    description = "Unloads the model being served and loads `artifact` in its place under the id `model`, on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (`--vision-enabled` on Qwen3.8-Flash-Next, the other model's `--spec-backend` backend, the Flash-Next-only knobs), which is left off for it.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
     request_body = SwitchRequest,
     responses(
         (status = 202, description = "The switch began.", body = SwitchAccepted),
         (status = 400, description = "`artifact` or `model` is empty.", body = ApiError),
-        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 409, description = "A switch is already under way (`switch_in_progress`): switches are not queued.", body = ApiError),
         (status = 501, description = "This server was built without a model loader (`switch_unavailable`).", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`).", body = ApiError),
@@ -1604,7 +1604,7 @@ struct ChatCompletionsRequest {
     chat_template_kwargs: Option<JsonValue>,
     /// An ignis extension (2026-09-24): the reasoning tokens this request
     /// may spend before the model's own close is forced. A whole number, at
-    /// least 1; absent or `null` takes the server's `--thinking-budget`.
+    /// least 1; absent or `null` takes the server's `--model-thinking-budget`.
     thinking_budget: Option<JsonValue>,
     /// The tool definitions (GitHub #132) — opaque JSON, validated
     /// shallowly and passed to the template as-is (`resolve_tools`).
@@ -1655,7 +1655,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
 
 `max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.
 
-`model` absent, or the loaded model's id, is served as it is. Another model this server lists (`--known-model`, the model it started on always among them) switches the server to it first, unless `--allow-model-switch false`: the same switch `POST /v1/models/switch` runs, during which every other request is refused `503 model_switching`, and this one is held until the named model serves and is then answered by it. A switch that does not land refuses it `503 model_switch_failed` with the reason. Any other model is a 404.",
+`model` absent, or the loaded model's id, is served as it is. Another model this server lists (`--switch-known-models`, the model it started on always among them) switches the server to it first, unless `--switch-allow-implicit false`: the same switch `POST /v1/models/switch` runs, during which every other request is refused `503 model_switching`, and this one is held until the named model serves and is then answered by it. A switch that does not land refuses it `503 model_switch_failed` with the reason. Any other model is a 404.",
     request_body = ChatCompletionsRequest,
     responses(
         (status = 200, description = "The completion. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
@@ -1663,11 +1663,11 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
             (Chunk = "text/event-stream"),
         )),
         (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take.", body = ApiError),
-        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
-        (status = 413, description = "The prompt is longer than this server's `--max-context`.", body = ApiError),
+        (status = 413, description = "The prompt is longer than this server's `--model-max-context`.", body = ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`).", body = ApiError),
-        (status = 504, description = "The engine did not finish the request within `--request-timeout`.", body = ApiError),
+        (status = 504, description = "The engine did not finish the request within `--server-request-timeout`.", body = ApiError),
     ),
 )]
 async fn chat_completions(

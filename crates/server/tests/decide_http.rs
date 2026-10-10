@@ -1035,7 +1035,7 @@ async fn the_followers_of_a_fan_out_are_in_the_engine_together() {
     // The other half of the sequencing rule. The first question runs alone
     // so there is a prefix to claim; after that there is nothing left to
     // serialize, and answering the rest one at a time would cost N
-    // `--request-timeout`s for no gain.
+    // `--server-request-timeout`s for no gain.
     //
     // Served in sequence only ever one request exists at a time, so a
     // prefill batch carrying two of them is proof the followers overlap.
@@ -1589,7 +1589,7 @@ async fn a_served_decision_is_counted_under_its_type_and_its_mass_observed() {
     // comes off the metrics listener.
     let compute = Arc::new(MockCompute::new());
     let server = server(compute).with_metrics();
-    let metrics = server.metrics_app().expect("--metrics is on");
+    let metrics = server.metrics_app().expect("--server-metrics is on");
     let app = server.app();
 
     // 3. Absent before any decision — a server that never sees one exports
@@ -1651,7 +1651,7 @@ async fn every_question_of_a_fan_out_is_a_decision_of_its_own() {
     // one question's options collapsing while its siblings are fine.
     let compute = Arc::new(MockCompute::new());
     let server = server(compute).with_metrics();
-    let metrics = server.metrics_app().expect("--metrics is on");
+    let metrics = server.metrics_app().expect("--server-metrics is on");
     let app = server.app();
     let body = r#"{
       "state": "Help! My payouts have been failing for 3 days.",
@@ -1688,7 +1688,7 @@ async fn a_question_that_failed_is_not_counted_as_a_decision() {
         victim: 3,
     });
     let server = server_over(compute as Arc<dyn ignis_core::Compute>).with_metrics();
-    let metrics = server.metrics_app().expect("--metrics is on");
+    let metrics = server.metrics_app().expect("--server-metrics is on");
     let app = server.app();
 
     let (status, response) = decide(&app, &fan_out(300, QUESTIONS)).await;
@@ -1716,7 +1716,7 @@ async fn a_question_that_failed_is_not_counted_as_a_decision() {
 #[tokio::test]
 async fn a_server_without_metrics_serves_decisions_just_the_same() {
     // The projection is opt-in (ADR 0017) and the endpoint must not care:
-    // `--metrics` off installs no `Metrics`, and the recording site is the
+    // `--server-metrics` off installs no `Metrics`, and the recording site is the
     // only thing that changes.
     let compute = Arc::new(MockCompute::new());
     let plain = server(compute);
@@ -1812,7 +1812,7 @@ async fn a_scalar_is_billed_for_the_run_it_wrote_and_not_for_its_ceiling() {
 async fn a_scalar_is_counted_as_a_scalar_and_has_no_answer_mass() {
     let compute = Arc::new(MockCompute::new());
     let server = server(compute).with_metrics();
-    let metrics = server.metrics_app().expect("--metrics is on");
+    let metrics = server.metrics_app().expect("--server-metrics is on");
     let app = server.app();
 
     let (status, body) = decide(&app, SCALAR).await;
@@ -2579,7 +2579,7 @@ async fn a_locates_value_keeps_the_callers_key_order() {
 #[tokio::test]
 async fn a_served_locate_is_counted_once_and_observes_no_answer_mass() {
     let server = server(calibrated_compute()).with_metrics();
-    let metrics = server.metrics_app().expect("--metrics is on");
+    let metrics = server.metrics_app().expect("--server-metrics is on");
     let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"which item names b"}"#);
     let (status, response) = decide(&server.app(), &body).await;
     assert_eq!(status, 200, "{response}");
@@ -3027,7 +3027,7 @@ async fn lines_identical_but_for_their_time_answer_with_the_first() {
 #[tokio::test]
 async fn a_shortlist_is_counted_once_as_a_locate_and_by_its_route() {
     let server = server(calibrated_compute()).with_metrics();
-    let metrics = server.metrics_app().expect("--metrics is on");
+    let metrics = server.metrics_app().expect("--server-metrics is on");
     let before = scrape(&metrics).await;
     assert!(!before.contains("ignis_locates_total"), "absent until the first locate");
     let body = decide_body(&text_state(&log_lines(3, 3)), r#""q":{"type":"locate","instructions":"which failed"}"#);

@@ -710,7 +710,7 @@ pub fn load_methods(calibration: Option<ignis_core::pointing::Calibration>, visi
             point: "none",
             box_methods: "none",
             box_default: "none",
-            summary: "loaded without --vision: `point` and `box` have no image to answer on",
+            summary: "loaded without --vision-enabled: `point` and `box` have no image to answer on",
         },
         (true, Some(_), true) => LoadMethods {
             point: "head_set",
@@ -1817,7 +1817,7 @@ impl Evidence {
     }
 
     /// Whether this evidence carries a media part — what decides whether a
-    /// load without `--vision` can evaluate it at all.
+    /// load without `--vision-enabled` can evaluate it at all.
     ///
     /// The same rule `crate::media::has_media` applies to a conversation,
     /// asked of a `state` instead: an `image_url` part that actually has a
@@ -2015,7 +2015,7 @@ pub enum Answer {
     /// unnameable option, an image a text-only load cannot take, a prompt
     /// past the context — refuses the whole request before the first
     /// submit, so what lands here is the engine: a refused admission, or a
-    /// question the engine did not answer within `--request-timeout`. The
+    /// question the engine did not answer within `--server-request-timeout`. The
     /// siblings' answers are already paid for, and discarding them to
     /// report one fault helps nobody.
     Error { code: String, message: String },
@@ -2433,14 +2433,14 @@ Every fault a caller can commit refuses the whole request with a 422 before the 
 
 Thinking is refused rather than ignored: a decision's prompt ends exactly where its answer is read, and a thinking prompt would put an open reasoning block at that position.
 
-`model` is read as on chat completions: another model the server lists (`--known-model`) switches the server to it before the decision is evaluated, unless `--allow-model-switch false` -- so naming the 27B on a Qwen3.8-Flash-Next load, which serves no `/v1/decide`, moves the server back to the model that does. During the switch every other request is refused `503 model_switching`; a switch that does not land refuses the decision `model_switch_failed`.
+`model` is read as on chat completions: another model the server lists (`--switch-known-models`) switches the server to it before the decision is evaluated, unless `--switch-allow-implicit false` -- so naming the 27B on a Qwen3.8-Flash-Next load, which serves no `/v1/decide`, moves the server back to the model that does. During the switch every other request is refused `503 model_switching`; a switch that does not land refuses the decision `model_switch_failed`.
 
 `POST /v1/systemone` is the same handler under Jev's name.",
     request_body = DecideRequest,
     responses(
         (status = 200, description = "One answer per question, under the ids the caller chose.", body = DecideResponse),
         (status = 400, description = "The loaded model serves no `/v1/decide` (`model_unsupported`): Qwen3.8-Flash-Next has no readouts.", body = crate::api::ApiError),
-        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
         (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), a vote's target is longer than the vote was measured on (`locate_too_long`), a single segment is longer than a window (`locate_segment_too_long`), or the loaded template cannot say where its tokens sit (`locate_unsupported`); a `kind`, `method` or `compression` a locate does not know (`kind_unknown`, `method_unknown`, `compression_unknown`), a fold under `vote` or of prose (`compression_unsupported`), `kind: records` on a state that is not an array of JSON objects or `log`/`prose` on one (`kind_mismatch`); `criteria` and `digits` on a `locate`, and `within`, `kind` and `compression` on anything else (`kind_unsupported`, `compression_unsupported`), are refused too, as is a fold's level-1 text past the context (`context_exceeded`). Nothing reached the engine. (A shortlist step rendered from an earlier step's answer -- a fold's level 2, every `choice` -- can only fault after a prefill, and then answers its own question with an `error`.) A `model` the server neither loads nor may switch to is refused `model_not_found`; one it began switching to that did not load, `model_switch_failed`.",
             body = crate::api::ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted; or a model switch is under way (`model_switching`, with `Retry-After`).", body = crate::api::ApiError),
@@ -2523,7 +2523,7 @@ async fn serve(
     if evidence.has_media() && server.active().media.is_none() {
         return Err(Refusal::new(
             "media_unsupported",
-            "this server was loaded without `--vision`, so a `state` carrying an image cannot be evaluated",
+            "this server was loaded without `--vision-enabled`, so a `state` carrying an image cannot be evaluated",
         ));
     }
     // The **Lane tag**, exactly as every other route reads it — off the
@@ -3024,7 +3024,7 @@ fn log_decision(
 /// *implies* thinking (`thinking.rs`) — is caught by the same rule as the
 /// field that says so outright. The defaults handed in are the decision's
 /// own, not the server's: a request that mentioned nothing must resolve to
-/// thinking-off whatever `--enable-thinking` an operator set for chat.
+/// thinking-off whatever `--model-enable-thinking` an operator set for chat.
 fn refuse_thinking(server: &crate::Server, request: &DecideRequest) -> Result<(), Refusal> {
     let fields = crate::thinking::ThinkingRequestFields {
         enable_thinking: request.enable_thinking.as_ref(),
@@ -3912,7 +3912,7 @@ fn engine_full() -> Answer {
 /// behaviour and not something waves promise to fix; what they fix is a
 /// fan-out competing with *itself*.
 ///
-/// The cost is one `--request-timeout` per wave rather than per question:
+/// The cost is one `--server-request-timeout` per wave rather than per question:
 /// twenty questions bound at four timeouts — the sequenced first, then
 /// `ceil(19 / 8)` waves — instead of twenty. A wave also ends no sooner
 /// than its slowest question, so one question that times out holds the next

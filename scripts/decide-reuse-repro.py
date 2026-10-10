@@ -4,10 +4,10 @@ acceptance 7): does /v1/decide reuse a `state` given as content parts?
 The issue's repro, kept in the repository and extended with a reuse-marker
 case. Standard library only.
 
-    IGNIS_API_KEY=... python scripts/decide-reuse-repro.py [http://127.0.0.1:8000] [http://127.0.0.1:9464]
+    IGNIS_SERVER_API_KEY=... python scripts/decide-reuse-repro.py [http://127.0.0.1:8000] [http://127.0.0.1:9464]
 
-Run it against a server started with the issue's flags (`--vision --spec
-dflash2 --metrics`, `--prompt-reuse` left on) and nothing else using it. Each
+Run it against a server started with the issue's flags (`--vision-enabled --spec-backend
+dflash2 --server-metrics`, `--reuse-prompt` left on) and nothing else using it. Each
 case sends N requests one after another (nothing concurrent), so only
 cross-request reuse and a fan-out's own head can help. Every case has its own
 text and its own picture, so no case is served by what an earlier one left
@@ -30,7 +30,7 @@ import zlib
 
 API = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 METRICS = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:9464"
-KEY = os.environ.get("IGNIS_API_KEY", "")
+KEY = os.environ.get("IGNIS_SERVER_API_KEY", "")
 N = 5
 
 

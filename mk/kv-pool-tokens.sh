@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# The tokens a named --kv-pool-bytes holds (ADR 0045), as the server's plan
+# The tokens a named --vram-kv-pool-bytes holds (ADR 0045), as the server's plan
 # reads it, for `make config`: a token count rounded up to whole 64-token
 # pages, a byte count cut to the whole pages it buys at the model's paged
 # bytes per token. The plan event (`kv_pool_tokens`) is the authority; the

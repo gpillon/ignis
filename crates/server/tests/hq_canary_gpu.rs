@@ -154,13 +154,13 @@ async fn the_canary_suite_is_sane_and_deterministic_under_hq_kv() {
 }
 
 /// GitHub #177: with the vision tower loaded and its workspace reserved, the
-/// text canaries still answer sanely and deterministically -- a `--vision`
+/// text canaries still answer sanely and deterministically -- a `--vision-enabled`
 /// load must not disturb text serving.
 #[tokio::test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn the_canary_suite_stays_sane_with_vision_loaded() {
     let Some(h) = harness(Some(Vision::default())) else { return };
-    assert_canaries_sane(&h, "under hq-e8-2b KV with --vision loaded").await;
+    assert_canaries_sane(&h, "under hq-e8-2b KV with --vision-enabled loaded").await;
 }
 
 async fn assert_canaries_sane(h: &Harness, context: &str) {

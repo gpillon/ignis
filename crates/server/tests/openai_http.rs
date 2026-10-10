@@ -695,7 +695,7 @@ async fn an_unknown_model_is_a_404() {
 #[tokio::test]
 async fn a_request_that_outlives_the_configured_timeout_is_a_504_naming_it() {
     // GitHub #95: the timeout that fires is an operator knob
-    // (`with_request_timeout`, wired to `--request-timeout` in `main`), and
+    // (`with_request_timeout`, wired to `--server-request-timeout` in `main`), and
     // the 504 must say what it was set to — not a bare "the engine may be
     // wedged" that leaves an operator guessing what to raise.
     let (h, gated, _controller) = harness_gated_with_timeout(Duration::from_secs(1));

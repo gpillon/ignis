@@ -270,7 +270,7 @@ describe("deriveMemory", () => {
   });
 
   it("reports an overrun rather than clamping it away", () => {
-    // --allow-vram-oversubscription: the plan is larger than the budget it
+    // --vram-allow-oversubscription: the plan is larger than the budget it
     // was laid out in, and the panel has to be able to say so.
     const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 100]));
     const m = deriveMemory([memoryAt(0, { reserved: reserved as MemorySeries["reserved"], budgetBytes: 900, kvPoolPages: 2, kvPageBytes: 50 })], 0);
@@ -294,7 +294,7 @@ describe("deriveMemory", () => {
   });
 
   it("gives a capacity of zero no share, so nothing is drawn as full", () => {
-    // `--prompt-reuse off` without --retained-slots hands out no slots (#215).
+    // `--reuse-prompt off` without --retained-slots hands out no slots (#215).
     const m = deriveMemory([memoryAt(0, { retainedSlots: { capacity: 0, inUse: 0 } })], 0);
     expect(m.slotsInUse).toMatchObject({ used: 0, capacity: 0, share: null });
   });

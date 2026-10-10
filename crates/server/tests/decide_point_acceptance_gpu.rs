@@ -204,7 +204,7 @@ async fn ask(
 }
 
 /// A live server over the real scheduler, wired as `main.rs` wires one under
-/// `--vision` — and a second router over the same engine whose server has no
+/// `--vision-enabled` — and a second router over the same engine whose server has no
 /// head set: the pointing head alone, spec 13's `point`. `None` when the
 /// profile says to skip.
 struct Loaded {

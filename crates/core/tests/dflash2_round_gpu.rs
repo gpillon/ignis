@@ -587,7 +587,7 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
 /// Two lanes carry prompts longer than the ring, so their slots have wrapped
 /// and a cleared bit is one an older key inside the window named -- the case
 /// the clear exists for; the two canaries have not wrapped.
-/// The shortlist proposal head (`--draft-head shortlist`): the drafter scores
+/// The shortlist proposal head (`--spec-draft-head shortlist`): the drafter scores
 /// its draft columns with the artifact's Q4 head over the 131,072 most
 /// frequent tokens and maps its rows back to token ids before the selector.
 /// The verify round still scores with the full head, so the text is still

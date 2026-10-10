@@ -342,28 +342,28 @@ cargo run -p ignis-bench -- g2 `
 ```
 
 `ignis-server` takes the engine shape the run needs as flags (each over its
-own env var, each validated before any loader work starts): `--prefill-chunk`
-(default 1024, a nonzero multiple of 128), `--max-context` (default
-40960 — a 32K prompt plus an 8K generation budget), `--kv-format` (`bf16`
+own env var, each validated before any loader work starts): `--model-prefill-chunk`
+(default 1024, a nonzero multiple of 128), `--model-max-context` (default
+40960 — a 32K prompt plus an 8K generation budget), `--model-kv-format` (`bf16`
 or `hq-e8-2b`, default `hq-e8-2b` since GitHub #123 wired its attention
 routes — ADR 0022's serving default) and
-`--kv-pool-bytes` (default: the KV pool policy's, ADR 0045 -- the rest of the
+`--vram-kv-pool-bytes` (default: the KV pool policy's, ADR 0045 -- the rest of the
 VRAM budget on the 27B, GitHub #210; 524,288 tokens shared by the lanes on
 Flash-Next with its experts streaming; the plan, logged as
 `ignis.runtime.vram_plan` or `ignis.runtime.flash_next_plan` with its
 `kv_pool_policy`, `kv_pool_pages` and `kv_pool_tokens`, refuses a start that
-cannot hold one `--max-context` sequence and a page per retained slot). The
+cannot hold one `--model-max-context` sequence and a page per retained slot). The
 pool is named in bytes or in tokens (`512Ktok`); the plan turns either into
 pages at the model's own bytes per token (9,216 on the 27B under hq-e8-2b,
 65,536 under BF16; 4,224 on Flash-Next under hq-e8-2b, KV and indexer keys).
 On the 27B the resident-token capacity is logged at load as
 `ignis.runtime.kv_pool`, so a run's KV profile is read off the events rather
 than computed from a flag. A request that names no cap generates at most
-`--default-max-tokens` (38,912; `0` = up to the context), and a test that
+`--model-default-max-tokens` (38,912; `0` = up to the context), and a test that
 needs a request to run to the context sends `max_tokens` or that `0`.
 
-Speculation is a load option too (GitHub #150): `--spec dflash2
---draft-tokens N` (N in 1..7, both flags or neither) binds the drafter's 66
+Speculation is a load option too (GitHub #150): `--spec-backend dflash2
+--spec-draft-tokens N` (N in 1..7, both flags or neither) binds the drafter's 66
 `dflash2/*` objects and grows the prefill scratch by the drafter's context
 append; its sequence pool carries the drafter window per slot (40 MiB each
 slot, GitHub #152); `ignis.model.loaded` records it as
@@ -392,7 +392,7 @@ snapshot no longer lists it. `crates/runtime/tests/cuda_leaf_dflash2_gpu.rs` dri
 drafter end to end through `RuntimeCompute`: the leaf passes no drafts, and
 every round's speculative counters match the lane's extent and committed run.
 
-Vision is a load option too (GitHub #177): `--vision` (with
+Vision is a load option too (GitHub #177): `--vision-enabled` (with
 `--vision-max-tokens N`, default 32,768 merged tokens) binds the 333 `vision/*`
 objects in their stored Q4/Q5/Q6/W8/BF16 formats and reserves, inside
 `ignis_model_load` and so before the sequence pool is built, the encoder
@@ -417,7 +417,7 @@ bound or allocated. `crates/core/tests/vision_load_gpu.rs` pins the VRAM delta
 default envelope; `kernel/tests/test_model_load_vision_options.cpp` pins the
 envelope check and the leaf's vision schema host-side.
 
-Since GitHub #195 `--vision` combines with `--spec dflash2`: both scopes bind
+Since GitHub #195 `--vision-enabled` combines with `--spec-backend dflash2`: both scopes bind
 in one load, the drafter's context append takes the span's KV positions (what
 the reference's own prefill sink captures on a multimodal span), and the verify
 round rotates its columns at `position + rope_delta` from its own staging, the
@@ -437,7 +437,7 @@ through the sibling prefix cache alone with it off.
 
 `crates/server/tests/vision_mixed_load_gpu.rs` (GitHub #181) is all of the
 above at once, in the serving shape: one load behind the HTTP router with
-`--vision`, `--spec dflash2`, prompt reuse on, a 128-token prefill chunk, and
+`--vision-enabled`, `--spec-backend dflash2`, prompt reuse on, a 128-token prefill chunk, and
 every image fetched by URL from a loopback server. Three text lanes decode
 while an image request prefills between their rounds; same-size swatch
 siblings each name their own colour; and with the KV pool sized to exactly one
@@ -459,7 +459,7 @@ divergence, not ours; the vision canary fixture was recorded without
 speculation, so it stays the right oracle either way.
 
 **BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
-profile asks for it by name — `--kv-format bf16` at the server, and
+profile asks for it by name — `--model-kv-format bf16` at the server, and
 `ignis_core::KvFormat::Bf16` on both `load_qwen38_27b` and `SeqPoolBudget`
 in a test that drives the leaf directly. A test that inherits the default
 runs hq, which is right for the serving-shape checks (the HTTP surface, the
@@ -492,12 +492,12 @@ A record carrying the image cell cannot be compared with one that has none, so
 the image cell is measured as its own record. The session is
 `scripts/vision-ttft-session.sh <out-dir>`, run from the repository root on a
 free card after a release build: the reference with `--vision` (the owner's
-hq-e8-2b-262k preset), ignis with `--vision`, and ignis without it, **each
+hq-e8-2b-262k preset), ignis with `--vision-enabled`, and ignis without it, **each
 launched twice** (ADR 0021). Every launch writes a text record (1024, 8192 and
 32768 tokens, cut from the ninfer corpus) and, with vision, an image record;
 `scripts/ttft-pool.py` pools each engine's two launches into one record, and
 `g2` compares the pooled records: image against image, text against text, and
-ignis's text with `--vision` against without. The 1.5 threshold `g2` prints is
+ignis's text with `--vision-enabled` against without. The 1.5 threshold `g2` prints is
 G2's own; for this cell the ratios are error detectors.
 
 **Measure a launch once.** The prompts are fixed — the same nonces, the same
@@ -529,7 +529,7 @@ run confounds the format with its page count. 65,536 tokens is the value to
 pick: it is 1,024 pages, the geometry spec 03's ITL table and #114's cap
 arithmetic assume, and the ITL fixture's peak of 65,344 tokens fits it with 192
 to spare. Under hq that means asking for the smaller pool explicitly
-(`--kv-pool-bytes 576M`), because its default 4 GiB buys 465,984 tokens.
+(`--vram-kv-pool-bytes 576M`), because its default 4 GiB buys 465,984 tokens.
 
 For the record: shrinking the hq pool from 7,281 pages to 1,024 moved ITL p50 by
 0.04% and p95 by 0.05%, so the page count is not itself a performance term —
@@ -551,11 +551,11 @@ nvidia-smi --format=csv,noheader -l 1 `
   --query-gpu=timestamp,utilization.gpu,utilization.memory,power.draw,clocks.sm,clocks.mem,temperature.gpu `
   > .scratch/gpu-<leg>.csv
 
-# ignis, hq-e8-2b / BF16 (--kv-format bf16 --kv-pool-bytes 4G: 65,536 BF16
-# tokens; with no --kv-pool-bytes the pool is the rest of the VRAM budget)
-.\target\x86_64-pc-windows-msvc\release\ignis-server.exe --artifact $Artifact `
-  --bind 127.0.0.1:8000 --kv-format hq-e8-2b --max-context 40960 `
-  --kv-pool-bytes 576M --prefill-chunk 1024 --request-timeout 900
+# ignis, hq-e8-2b / BF16 (--model-kv-format bf16 --vram-kv-pool-bytes 4G: 65,536 BF16
+# tokens; with no --vram-kv-pool-bytes the pool is the rest of the VRAM budget)
+.\target\x86_64-pc-windows-msvc\release\ignis-server.exe --model-artifact $Artifact `
+  --server-bind 127.0.0.1:8000 --model-kv-format hq-e8-2b --model-max-context 40960 `
+  --vram-kv-pool-bytes 576M --model-prefill-chunk 1024 --server-request-timeout 900
 
 # the reference, same two formats
 F:\ai\q38\ninfer\build-ninja\apps\ninfer-serve.exe $Artifact `

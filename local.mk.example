@@ -27,5 +27,5 @@
 # METRICS_BIND := 127.0.0.1:9100   # empty = the server's 127.0.0.1:9464
 
 # Always-on server flags and logging:
-# ARGS := --kv-host-pool-bytes 0
+# ARGS := --reuse-kv-host-pool-bytes 0
 # LOG_LEVEL := debug

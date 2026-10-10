@@ -3,7 +3,7 @@
 //! submodule, reached as `support::vision_canary` like every other one.
 //!
 //! `tests/fixtures/vision_canary` is the reference's greedy answers to four
-//! fixed images (`tools/vision-canary/record.py`, `--vision`, thinking off).
+//! fixed images (`tools/vision-canary/record.py`, `--vision-enabled`, thinking off).
 //! `vision_canary_gpu.rs` scores a vision load against it;
 //! `vision_dflash2_gpu.rs` scores a load that also carries the DFlash2
 //! drafter. One copy, so a change to the fixture's shape lands in one place.

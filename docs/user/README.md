@@ -38,7 +38,7 @@ push, replaced by the next one, and never tagged `latest` or with a version.
 ```
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
   -v /path/to/models:/models:ro \
-  -e IGNIS_ARTIFACT=/models/qwen3_8_27b_nvfp4full-v2.ninfer \
+  -e IGNIS_MODEL_ARTIFACT=/models/qwen3_8_27b_nvfp4full-v2.ninfer \
   ghcr.io/gpillon/ignis:0.1.2
 ```
 
@@ -47,21 +47,21 @@ environment variable; anything after the image name is passed to the server.
 The image sets no default command, so the Playground is on — the server's own
 default.
 
-With no `IGNIS_ARTIFACT` the image fetches the model into its own working
+With no `IGNIS_MODEL_ARTIFACT` the image fetches the model into its own working
 directory (`/home/ignis/models`) and loses it with the container. Mount a
 directory and point the download at it to keep what it fetches:
 
 ```
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
   -v /path/to/models:/models \
-  ghcr.io/gpillon/ignis:0.1.2 --model-download-path /models
+  ghcr.io/gpillon/ignis:0.1.2 --download-path /models
 ```
 
 To smoke-test the image with no GPU and no model — the deterministic CPU mock
 ([ADR 0006](../adr/0006-exclusive-gpu-testing.md)) — say so:
 
 ```
-podman run --rm -p 8000:8000 ghcr.io/gpillon/ignis:0.1.2 --no-model-download
+podman run --rm -p 8000:8000 ghcr.io/gpillon/ignis:0.1.2 --download-enabled false
 ```
 
 `Containerfile` builds the same thing locally (`podman build -t ignis:dev .`).
@@ -85,15 +85,15 @@ refuses the start.
 
 ### Letting the server fetch it
 
-A GPU build started **without** `--artifact` / `IGNIS_ARTIFACT` looks for the
-model under `--model-download-path` (default `./models`, flat, under the names
+A GPU build started **without** `--model-artifact` / `IGNIS_MODEL_ARTIFACT` looks for the
+model under `--download-path` (default `./models`, flat, under the names
 the repository publishes) and fetches it when it is not there
 ([ADR 0033](../adr/0033-the-server-fetches-its-own-model.md)):
 
 ```
 ignis-server                      # asks first: the size, the source, the destination
-ignis-server --no-model-download  # never fetches: the placeholder template and the CPU mock
-ignis-server --model-download-path /weights
+ignis-server --download-enabled false  # never fetches: the placeholder template and the CPU mock
+ignis-server --download-path /weights
 ```
 
 On a terminal you are asked (`[y/N]`, on stderr); without one — a container, a
@@ -110,11 +110,11 @@ land on the same file names, so either satisfies the other.
 ### Pointing at one you already have
 
 ```
-set IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer   # Windows
-export IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
+set IGNIS_MODEL_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer   # Windows
+export IGNIS_MODEL_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
 ```
 
-The artifact carries a grafted DFlash2 drafter module, which `--spec dflash2`
+The artifact carries a grafted DFlash2 drafter module, which `--spec-backend dflash2`
 loads for speculative decoding and which costs no VRAM when speculation is off.
 
 ### The uncensored variant
@@ -132,11 +132,11 @@ and point at it:
 
 ```
 hf download gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer --local-dir models
-ignis-server --artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
+ignis-server --model-artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
 make dev UNCENSORED=1   # the same, from a checkout
 ```
 
-The model id stays `qwen3.8-27b` unless `--model` names another one. The
+The model id stays `qwen3.8-27b` unless `--model-id` names another one. The
 pointing heads and the DFlash2 drafter load unchanged. They were fitted to the
 default weights, and the target still verifies every draft, so the drafter
 can only change the acceptance rate.
@@ -145,80 +145,136 @@ can only change the acceptance rate.
 
 ## Configuration
 
-Each flag has a matching environment variable. **A flag overrides its env var,
-which overrides the built-in default.** `ignis-server --help` prints the
-always-current table; this one is a copy.
+Every setting is one **field** in a **group** — `server`, `model`, `vram`,
+`reuse`, `switch`, `spec`, `vision`, `media`, `download`, `ngram`, `kv_disk` —
+and has the same name on every surface
+([ADR 0046](../adr/0046-one-declaration-per-config-field.md)):
+
+| Surface | Spelling | Example |
+|---|---|---|
+| flag | `--<group>-<field>` | `--reuse-kv-host-pool-bytes 8G` |
+| env var | `IGNIS_<GROUP>_<FIELD>` | `IGNIS_REUSE_KV_HOST_POOL_BYTES=8G` |
+| config file | `<group>: { <field>: … }` | `reuse: { kv_host_pool_bytes: 8G }` |
+
+`ignis-server help --fields` prints every field — flag, env var, file key,
+default, rule, the models that take it — from the table the server itself is
+built from; it is the reference, and the tables below add the why. (`--format
+json` gives the same list to a tool.) A bool's flag may stand bare
+(`--server-ui` is `--server-ui true`) or take its value (`--server-ui false`).
+
+**Precedence**, highest first: flag, env var, config file, profile, built-in
+default. An empty value is an unset one.
+
+**Per model.** A field both models take but want sized differently has a
+family-scoped variant beside it — `qwen38` for Qwen3.8-27B, `qwen38flashnext`
+for Qwen3.8-Flash-Next: `--qwen38flashnext-reuse-kv-host-pool-bytes 1G`,
+`IGNIS_QWEN38FLASHNEXT_REUSE_KV_HOST_POOL_BYTES`, or in the file
+`reuse: { qwen38flashnext: { kv_host_pool_bytes: 1G } }`. Within each source
+the family's value wins over the general one, and a model switch takes the
+target model's own. A field only one model has (`--vision-enabled`, the
+Flash-Next knobs) is refused at start when set for the other model, and
+dropped with a log line when a switch moves to the other model.
+
+**The config file.** JSON or YAML, named by `--config <path>` /
+`IGNIS_CONFIG` (it must exist). With neither, a start looks for
+`./ignis.config.yaml`, `./ignis.config.json`, then `%APPDATA%\ignis\config.yaml`
+(Windows) or `$XDG_CONFIG_HOME/ignis/config.yaml` / `~/.config/ignis/config.yaml`
+(Linux); the first found is used. The startup line `ignis.config.source` says
+which (`explicit`, `discovered` or `none`). An unknown key or a bad value in it
+refuses the start naming the key.
+
+```sh
+ignis-server config generate --out ignis.config.yaml   # every default, plus any flags given
+ignis-server config print                              # what would run: file + env + flags
+ignis-server config patch --model-max-context 131072   # change the file in place
+```
+
+**Profiles.** `--profile <name>` / `IGNIS_PROFILE` / the file's `profile:`
+names a bundle of hardware-shaped defaults, below the file and above the
+built-in defaults. `rtx5090` (the built-in default) restates today's numbers;
+a file's `profiles: { <name>: { <group>: { … } } }` defines one for any other
+card.
+
+**At runtime.** `GET /v1/config` shows the running configuration (fields
+declared visible only: never the API key). `PATCH /v1/config` takes a partial
+document in the file's shape: a change to the request timeout, the message
+policies, the thinking defaults or the switch knobs applies at once; a change
+touching anything the load is built from reloads the model with the whole
+patch, as a model switch does. Either way it is written to the config file in
+use once it has taken.
 
 ### Model and server
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `-m`, `--model <id>` | `IGNIS_MODEL` | `qwen3.8-27b` | The loaded model id: what `/v1/models` reports, what submissions must name, and the key the download registry is looked up by. |
-| `-b`, `--bind <addr>` | `IGNIS_BIND` | `127.0.0.1:8000` | The API listener's address. |
-| `-a`, `--artifact <path>` | `IGNIS_ARTIFACT` | unset | The `.ninfer` container. Must exist and verify, or the server refuses to start. Unset: the model is looked for under `--model-download-path`, and fetched when it is not there. |
-| `--model-download` / `--no-model-download` | `IGNIS_MODEL_DOWNLOAD` | on | Fetch a missing model. Only consulted with `--artifact` unset, and only in a `--features cuda` build. |
-| `--model-download-path <dir>` | `IGNIS_MODEL_DOWNLOAD_PATH` | `./models` | Where a fetched model lands, and where one fetched earlier is found. |
-| `--request-timeout <secs>` | `IGNIS_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
+| `--model-id <id>` | `IGNIS_MODEL_ID` | `qwen3.8-27b` | The loaded model id: what `/v1/models` reports, what submissions must name, and the key the download registry is looked up by. |
+| `--server-bind <addr>` | `IGNIS_SERVER_BIND` | `127.0.0.1:8000` | The API listener's address. |
+| `--model-artifact <path>` | `IGNIS_MODEL_ARTIFACT` | unset | The `.ninfer` container. Must exist and verify, or the server refuses to start. Unset: the model is looked for under `--download-path`, and fetched when it is not there. |
+| `--download-enabled <bool>` | `IGNIS_DOWNLOAD_ENABLED` | on | Fetch a missing model. Only consulted with `--model-artifact` unset, and only in a `--features cuda` build. |
+| `--download-path <dir>` | `IGNIS_DOWNLOAD_PATH` | `./models` | Where a fetched model lands, and where one fetched earlier is found. |
+| `--server-request-timeout <secs>` | `IGNIS_SERVER_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | `--switch-drain-timeout <secs>` | `IGNIS_SWITCH_DRAIN_TIMEOUT` | `30` (max `3600`) | How long a model switch lets the old model's running requests finish before it cancels them (`0` cancels at once). |
-| `--allow-model-switch <true\|false>` | `IGNIS_ALLOW_MODEL_SWITCH` | `true` | A request whose `model` names another model `--known-model` lists switches the server to it, then is served on it. `false`: such a request is a `404 model_not_found`, as an unknown model is. `POST /v1/models/switch` is not affected. |
-| `--known-model <id>=<path>` (repeatable) | `IGNIS_KNOWN_MODELS` (`;`-separated pairs) | the start model only | A model a request may switch to by naming it, and the artifact it loads from. The model the server starts on is always listed. Any flag replaces the env var whole; an id named twice is refused. |
-| `-h`, `--help` | — | — | Print the flag table and exit. |
-| `-V`, `--version` | — | — | Print the version and exit. |
+| `--switch-allow-implicit <true\|false>` | `IGNIS_SWITCH_ALLOW_IMPLICIT` | `true` | A request whose `model` names another model `--switch-known-models` lists switches the server to it, then is served on it. `false`: such a request is a `404 model_not_found`, as an unknown model is. `POST /v1/models/switch` is not affected. |
+| `--switch-known-models <id>=<path>` (repeatable) | `IGNIS_SWITCH_KNOWN_MODELS` (`;`-separated pairs) | the start model only | A model a request may switch to by naming it, and the artifact it loads from. The model the server starts on is always listed. Any flag replaces the env var whole; an id named twice is refused. |
+| `--config <path>` | `IGNIS_CONFIG` | discovered | The config file ([above](#configuration)). |
+| `--profile <name>` | `IGNIS_PROFILE` | `rtx5090` | The hardware profile ([above](#configuration)). |
+| `help` / `-h`, `--help` | — | — | Print the usage and the field list and exit; `help --fields` prints every field in full. |
+| `version` / `-V`, `--version` | — | — | Print the version and exit. |
 
 ### Prompting
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--enable-thinking <bool>` | `IGNIS_ENABLE_THINKING` | `true` | The server-wide default for `enable_thinking`. |
-| `--reasoning-effort <value>` | `IGNIS_REASONING_EFFORT` | template default | The server-wide default `reasoning_effort`. An effort the template does not take is rounded up to one it does (Qwen3.8: `high` and `max` are `xhigh`, `minimal` is `low`), the same as a per-request one. |
-| `--thinking-budget <n\|off>` | `IGNIS_THINKING_BUDGET` | `32768` | The server-wide thinking budget: after `n` reasoning tokens with the block still open, or 2,048 tokens before the request's `max_tokens` if that comes first, a close (`My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.\n</think>`) is forced and the model answers. `off` = no default budget. A request's `thinking_budget` overrides it, and `reasoning_effort: max` runs without one. Set with a tokenizer that has no single-token `</think>`, the server refuses to start. |
-| `--system-message-policy <p>` | `IGNIS_SYSTEM_MESSAGE_POLICY` | `merge` | `merge`: a leading run of system messages joins the system prompt, a later one is its own block in place. `strict`: a system message that is not first is a 400. |
-| `--developer-message-policy <p>` | `IGNIS_DEVELOPER_MESSAGE_POLICY` | `inplace` | One of `inplace`, `into-system`, `after-system`, `one-after-system`, `reject`. A leading developer message is the system prompt except under `reject`. |
+| `--model-enable-thinking <bool>` | `IGNIS_MODEL_ENABLE_THINKING` | `true` | The server-wide default for `enable_thinking`. |
+| `--model-reasoning-effort <value>` | `IGNIS_MODEL_REASONING_EFFORT` | template default | The server-wide default `reasoning_effort`. An effort the template does not take is rounded up to one it does (Qwen3.8: `high` and `max` are `xhigh`, `minimal` is `low`), the same as a per-request one. |
+| `--model-thinking-budget <n\|off>` | `IGNIS_MODEL_THINKING_BUDGET` | `32768` | The server-wide thinking budget: after `n` reasoning tokens with the block still open, or 2,048 tokens before the request's `max_tokens` if that comes first, a close (`My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.\n</think>`) is forced and the model answers. `off` = no default budget. A request's `thinking_budget` overrides it, and `reasoning_effort: max` runs without one. Set with a tokenizer that has no single-token `</think>`, the server refuses to start. |
+| `--server-system-message-policy <p>` | `IGNIS_SERVER_SYSTEM_MESSAGE_POLICY` | `merge` | `merge`: a leading run of system messages joins the system prompt, a later one is its own block in place. `strict`: a system message that is not first is a 400. |
+| `--server-developer-message-policy <p>` | `IGNIS_SERVER_DEVELOPER_MESSAGE_POLICY` | `inplace` | One of `inplace`, `into-system`, `after-system`, `one-after-system`, `reject`. A leading developer message is the system prompt except under `reject`. |
 
 ### Context, KV and speculation
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--max-context <tokens>` | `IGNIS_MAX_CONTEXT` | `40960` | Max per-sequence context (prompt + generation). The KV pool must be able to hold one of them or the load is refused. On the 27B the attention bounds it too: at most 524,288 on `bf16`, 1,048,576 on `hq-e8-2b`; past that the start is refused. Flash-Next has no such bound. |
-| `--default-max-tokens <n\|0>` | `IGNIS_DEFAULT_MAX_TOKENS` | `38912` | The `max_tokens` of a request that sends none (see [Chat completions](#chat-completions)), its reasoning included, on both models. Never more than what the prompt leaves of `--max-context`, so a long prompt is never refused for it. An explicit cap always wins. `0` = none: such a request may generate to the end of the context, as before. (`make` knob `DEFAULT_MAX_TOKENS`.) |
-| `--prefill-chunk <tokens>` | `IGNIS_PREFILL_CHUNK` | `1024` | The prefill chunk width, a nonzero multiple of 128. The program's prefill scratch is reserved for it at load. |
-| `--decode-lanes <n>` | `IGNIS_DECODE_LANES` | `3` | Flash-Next only, `1..=8`: the sequences decoded at once. The lanes share the KV pool ([below](#the-kv-pool)): min(524,288 tokens, lanes × `--max-context`), never below one `--max-context` sequence and a page per retained slot. At `make`'s 262,144 tokens that is one context at one lane and 524,288 tokens from two lanes on, so one lane leaves the expert cache about 1 GiB more, and further lanes cost only their state; at 131,072 tokens three lanes get 393,216. The 27B serves a fixed 8 lanes and refuses the flag. `make MODEL=flash-next` runs 3 lanes at up to 262,144 tokens each (the checkpoint's trained positions); the `make` knob is `LANES`. |
-| `--decode-share <percent>` | `IGNIS_DECODE_SHARE` | `25` on both models | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next chunk of the same prompt waits `t * s / (1 - s)` of wall time while they decode, and nothing waits when no lane decodes or after the prompt's last chunk. It trades the prefilling request's TTFT (about x1.33 at 25, x2 at 50, only while lanes decode) for the lanes' rate (15.6-18.3 tok/s on Flash-Next instead of ~1; why 25: [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md)). `--decode-share 0` restores one decode round per chunk, the pacing before [#92](../findings/2026-10-07-27b-prefill-chunk-width.md); 50 splits time evenly. A prompt alone is unaffected. |
-| `--kv-format <fmt>` | `IGNIS_KV_FORMAT` | `hq-e8-2b` | `hq-e8-2b` (serving) or `bf16` (retained; the format every correctness oracle runs against — [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md)). Decides what a pool byte budget is worth in tokens. |
-| `--kv-pool-bytes <bytes\|tokens>` | `IGNIS_KV_POOL_BYTES` | the KV pool policy's | The KV pool, on both models: a byte count (`K`/`M`/`G` suffixes) or a token count, `<n>tok`, `<n>Ktok` or `<n>Mtok` with binary multipliers (`512Ktok` is 524,288 tokens: the same context on either model and either format, where a byte count is worth a different one on each). It replaces the policy's size ([below](#the-kv-pool)). Smaller than one `--max-context` sequence plus a page per retained slot, or past the VRAM budget, fails the load by name. (`make` knob `KV_POOL_BYTES`.) |
-| `--kv-host-pool-bytes <bytes>` | `IGNIS_KV_HOST_POOL_BYTES` | `2G` | The KV-RAM host tier. Page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle — and the figure Windows reports as shared GPU memory. `0` disables the host tier. (`make` sets `8G`.) |
-| `--spec <backend>` | `IGNIS_SPEC` | unset | Speculative decoding backend: `dflash2` (Qwen3.8-27B), `mtp` (Qwen3.8-Flash-Next, see [below](#flash-next-speculation-mtp)), `off`, or unset for none. |
-| `--draft-tokens <n>` | `IGNIS_DRAFT_TOKENS` | — | 1..7. Required with `--spec dflash2`; with `--spec mtp` the most drafts a lane verifies per round (default 2). |
-| `--draft-rows <n>` | `IGNIS_DRAFT_ROWS` | `0` (= 8) | Flash-Next MTP only: the rows one verify round may take across all lanes, `0` or 2..8. Each lane drafts `min(draft tokens, rows / lanes - 1)`, so `3` drafts at one lane only. (`make` knob `DRAFT_ROWS`.) |
-| `--draft-head <head>` | `IGNIS_DRAFT_HEAD` | `full` | Needs `--spec`. The head the drafter proposes with: `full` (the target's output head) or `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM). What a round accepts is still the target's choice, so the text changes only at near ties; measured on coding prompts `shortlist` accepts 7% fewer tokens per round and is slower overall ([finding](../findings/2026-09-24-upstream-quick-wins-ab.md)). (`make` knob `DRAFT_HEAD`.) |
-| `--rope-scaling <spec>` | `IGNIS_ROPE_SCALING` | none | `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]` rescales the checkpoint's trained 262,144-position envelope. `F` in (1, 64]. |
+| `--model-max-context <tokens>` | `IGNIS_MODEL_MAX_CONTEXT` | `40960` | Max per-sequence context (prompt + generation). The KV pool must be able to hold one of them or the load is refused. On the 27B the attention bounds it too: at most 524,288 on `bf16`, 1,048,576 on `hq-e8-2b`; past that the start is refused. Flash-Next has no such bound. |
+| `--model-default-max-tokens <n\|0>` | `IGNIS_MODEL_DEFAULT_MAX_TOKENS` | `38912` | The `max_tokens` of a request that sends none (see [Chat completions](#chat-completions)), its reasoning included, on both models. Never more than what the prompt leaves of `--model-max-context`, so a long prompt is never refused for it. An explicit cap always wins. `0` = none: such a request may generate to the end of the context, as before. (`make` knob `DEFAULT_MAX_TOKENS`.) |
+| `--model-prefill-chunk <tokens>` | `IGNIS_MODEL_PREFILL_CHUNK` | `1024` | The prefill chunk width, a nonzero multiple of 128. The program's prefill scratch is reserved for it at load. |
+| `--spec-decode-lanes <n>` | `IGNIS_SPEC_DECODE_LANES` | `3` | Flash-Next only, `1..=8`: the sequences decoded at once. The lanes share the KV pool ([below](#the-kv-pool)): min(524,288 tokens, lanes × `--model-max-context`), never below one `--model-max-context` sequence and a page per retained slot. At `make`'s 262,144 tokens that is one context at one lane and 524,288 tokens from two lanes on, so one lane leaves the expert cache about 1 GiB more, and further lanes cost only their state; at 131,072 tokens three lanes get 393,216. The 27B serves a fixed 8 lanes and refuses the flag. `make MODEL=flash-next` runs 3 lanes at up to 262,144 tokens each (the checkpoint's trained positions); the `make` knob is `LANES`. |
+| `--model-decode-share <percent>` | `IGNIS_MODEL_DECODE_SHARE` | `25` on both models | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next chunk of the same prompt waits `t * s / (1 - s)` of wall time while they decode, and nothing waits when no lane decodes or after the prompt's last chunk. It trades the prefilling request's TTFT (about x1.33 at 25, x2 at 50, only while lanes decode) for the lanes' rate (15.6-18.3 tok/s on Flash-Next instead of ~1; why 25: [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md)). `--model-decode-share 0` restores one decode round per chunk, the pacing before [#92](../findings/2026-10-07-27b-prefill-chunk-width.md); 50 splits time evenly. A prompt alone is unaffected. |
+| `--model-kv-format <fmt>` | `IGNIS_MODEL_KV_FORMAT` | `hq-e8-2b` | `hq-e8-2b` (serving) or `bf16` (retained; the format every correctness oracle runs against — [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md)). Decides what a pool byte budget is worth in tokens. |
+| `--vram-kv-pool-bytes <bytes\|tokens>` | `IGNIS_VRAM_KV_POOL_BYTES` | the KV pool policy's | The KV pool, on both models: a byte count (`K`/`M`/`G` suffixes) or a token count, `<n>tok`, `<n>Ktok` or `<n>Mtok` with binary multipliers (`512Ktok` is 524,288 tokens: the same context on either model and either format, where a byte count is worth a different one on each). It replaces the policy's size ([below](#the-kv-pool)). Smaller than one `--model-max-context` sequence plus a page per retained slot, or past the VRAM budget, fails the load by name. (`make` knob `KV_POOL_BYTES`.) |
+| `--reuse-kv-host-pool-bytes <bytes>` | `IGNIS_REUSE_KV_HOST_POOL_BYTES` | `2G` | The KV-RAM host tier. Page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle — and the figure Windows reports as shared GPU memory. `0` disables the host tier. (`make` sets `8G`.) |
+| `--spec-backend <backend>` | `IGNIS_SPEC_BACKEND` | unset | Speculative decoding backend: `dflash2` (Qwen3.8-27B), `mtp` (Qwen3.8-Flash-Next, see [below](#flash-next-speculation-mtp)), `off`, or unset for none. |
+| `--spec-draft-tokens <n>` | `IGNIS_SPEC_DRAFT_TOKENS` | — | 1..7. Required with `--spec-backend dflash2`; with `--spec-backend mtp` the most drafts a lane verifies per round (default 2). |
+| `--spec-draft-rows <n>` | `IGNIS_SPEC_DRAFT_ROWS` | `0` (= 8) | Flash-Next MTP only: the rows one verify round may take across all lanes, `0` or 2..8. Each lane drafts `min(draft tokens, rows / lanes - 1)`, so `3` drafts at one lane only. (`make` knob `DRAFT_ROWS`.) |
+| `--spec-draft-head <head>` | `IGNIS_SPEC_DRAFT_HEAD` | `full` | Needs `--spec-backend`. The head the drafter proposes with: `full` (the target's output head) or `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, +356 MB of VRAM). What a round accepts is still the target's choice, so the text changes only at near ties; measured on coding prompts `shortlist` accepts 7% fewer tokens per round and is slower overall ([finding](../findings/2026-09-24-upstream-quick-wins-ab.md)). (`make` knob `DRAFT_HEAD`.) |
+| `--model-rope-scaling <spec>` | `IGNIS_MODEL_ROPE_SCALING` | none | `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]` rescales the checkpoint's trained 262,144-position envelope. `F` in (1, 64]. |
 
 ### Flash-Next speculation (MTP)
 
 Qwen3.8-Flash-Next can draft with its own multi-token-prediction head
-(`--spec mtp`, `make MODEL=flash-next SPEC=mtp`). It is **off by default**, and
+(`--spec-backend mtp`, `make MODEL=flash-next SPEC=mtp`). It is **off by default**, and
 on a 5090 that is the better setting for most uses. Before turning it on:
 
 - **It needs its companion container** beside the artifact
-  (`qwen3_8_flash_next_mtp_3p0-v2.ninfer`, ~1 GB). `--spec mtp` without it
+  (`qwen3_8_flash_next_mtp_3p0-v2.ninfer`, ~1 GB). `--spec-backend mtp` without it
   refuses the start.
 - **It keeps the text.** Greedy output is the same as without it, up to
   near-ties, and sampling keeps its distribution.
 - **It costs ~1.1 GB of VRAM, taken from the expert cache, not from the
-  context.** The KV pool, and so `--max-context`, is unchanged. The cost is
+  context.** The KV pool, and so `--model-max-context`, is unchanged. The cost is
   reserved at load and stays the same whatever the number of drafts: a
-  smaller `--draft-tokens` or `--draft-rows` does not give it back.
+  smaller `--spec-draft-tokens` or `--spec-draft-rows` does not give it back.
 - **It pays off at one active request, and costs at two or three.** On an
   RTX 5090 (PCIe Gen 3, 2026-10-07): one lane runs 1.02-1.30x faster (most on
   long prose); two and three lanes run 7-15% slower with the default row
-  budget, and 1-2% slower with `--draft-rows 3`, which drafts at one lane
+  budget, and 1-2% slower with `--spec-draft-rows 3`, which drafts at one lane
   only. Decode there is bound by the experts it copies in over PCIe, and a
   verify round copies more of them
   ([finding](../findings/2026-10-07-flash-next-mtp-speculation-is-pcie-bound.md)).
   These figures leave out the 1.1 GB the head takes from the expert cache,
   so the served cost at several lanes is a little higher.
-- **Use it** when one user or one agent works at a time: `--spec mtp
-  --draft-rows 3`, or serve a single lane outright (`make MODEL=flash-next
+- **Use it** when one user or one agent works at a time: `--spec-backend mtp
+  --spec-draft-rows 3`, or serve a single lane outright (`make MODEL=flash-next
   LANES=1 SPEC=mtp`), which also gives the expert cache the ~1 GiB the shared
   pool holds beyond one lane's context. **Leave it off** when several agents decode together.
 - A card that holds every expert in VRAM (96 GB) copies none over PCIe,
@@ -245,14 +301,14 @@ start):
   a 32 GB 5090: the pool is reserved first, **524,288 tokens** shared by the
   lanes, and the expert cache takes the rest. The pool never holds more than
   every lane's whole context (so one lane keeps a one-context pool and the
-  larger cache) and never less than one `--max-context` sequence and a page
+  larger cache) and never less than one `--model-max-context` sequence and a page
   per retained slot (so a 524,288-token context starts).
 
-`--kv-pool-bytes` replaces either size. On a resident load it becomes the pool
+`--vram-kv-pool-bytes` replaces either size. On a resident load it becomes the pool
 and the rest of the budget stays unused.
 
 A request reserves its prompt plus its cap when it is admitted: its
-`max_tokens`, or `--default-max-tokens`. When a request cannot fit, a
+`max_tokens`, or `--model-default-max-tokens`. When a request cannot fit, a
 lower-ranked sequence (an `agent` one, for an `interactive` request) moves to
 KV-RAM or [KV-disk](#kv-disk) and later resumes exactly where it stopped.
 The move goes a window at a time between decode rounds, so the other
@@ -267,9 +323,9 @@ arrival: an `agent` request never moves an `interactive` one, nor an older
 below it.
 
 Below 12 GiB the expert cache refuses the start: decode slows sharply there.
-The message names the knobs that lift it: a smaller `--kv-pool-bytes`,
-`--prefill-chunk` or `--vram-headroom-bytes`, or fewer `--retained-device`.
-`--allow-expert-cache-below-floor` starts anyway, with an
+The message names the knobs that lift it: a smaller `--vram-kv-pool-bytes`,
+`--model-prefill-chunk` or `--vram-headroom-bytes`, or fewer `--reuse-retained-device`.
+`--vram-allow-expert-cache-below-floor` starts anyway, with an
 `ignis.runtime.expert_cache_below_floor` warning carrying the cache, the floor
 and those knobs. A cache too small for one decode step's experts in every
 class is refused whatever the flag says.
@@ -278,12 +334,12 @@ class is refused whatever the flag says.
 |---|---|---|---|
 | `--vram-headroom-bytes <b>` | `IGNIS_VRAM_HEADROOM_BYTES` | `1536M` | Derives the budget: the device memory free at start minus this. Not with `--vram-budget-bytes`. |
 | `--vram-budget-bytes <b>` | `IGNIS_VRAM_BUDGET_BYTES` | derived | The device memory the whole process may hold, weights included. More than is free refuses the start. |
-| `--allow-vram-oversubscription` | `IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` | off | With `--vram-budget-bytes` only: start above free memory (or below the plan's minimum) with a warning instead of a refusal. On Windows that pages. Both models. |
-| `--allow-expert-cache-below-floor` | `IGNIS_ALLOW_EXPERT_CACHE_BELOW_FLOOR` | off | Flash-Next only: start with an expert cache below its 12 GiB floor, with a warning ([above](#the-kv-pool)). The 27B, which has no expert cache, refuses it. (`make` knob `ALLOW_EXPERT_CACHE_BELOW_FLOOR=1`.) |
-| `--prompt-reuse <on\|off>` | `IGNIS_PROMPT_REUSE` | `on` | `off`: no prompt checkpoint is captured or reused, and no prefix is shared unless `--retained-device` or `--retained-host` gives slots for it. |
-| `--retained-device <n>` | `IGNIS_RETAINED_DEVICE` | `0` | Retained slots in VRAM: reserved in the VRAM plan, copied device to device (~0.3 ms), and handed out before any host slot. A card with VRAM to spare can take `--retained-device 16 --retained-host 0`. |
-| `--retained-host <n>` | `IGNIS_RETAINED_HOST` | two per decode lane (16); `0` with `--prompt-reuse off` | Retained slots in one pinned host block reserved at start, ~222 MiB each at the default load (3.5 GiB for 16): no VRAM, so the KV pool gets it; a capture and a claim each cost a PCIe copy (~15–19 ms). Both kinds hold the images of retained checkpoints and shared prefixes. When none is free, retained state gives one up — checkpoints before prefixes, `agent` before `interactive`, then least recently used; when nothing can, the publish or capture is skipped. `--retained-slots` was replaced by these two and now refuses the start. |
-| `--retained-interactive-ttl <secs>` | `IGNIS_RETAINED_INTERACTIVE_TTL` | `300` | Idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's. Needs `--prompt-reuse on`. |
+| `--vram-allow-oversubscription` | `IGNIS_VRAM_ALLOW_OVERSUBSCRIPTION` | off | With `--vram-budget-bytes` only: start above free memory (or below the plan's minimum) with a warning instead of a refusal. On Windows that pages. Both models. |
+| `--vram-allow-expert-cache-below-floor` | `IGNIS_VRAM_ALLOW_EXPERT_CACHE_BELOW_FLOOR` | off | Flash-Next only: start with an expert cache below its 12 GiB floor, with a warning ([above](#the-kv-pool)). The 27B, which has no expert cache, refuses it. (`make` knob `ALLOW_EXPERT_CACHE_BELOW_FLOOR=1`.) |
+| `--reuse-prompt <on\|off>` | `IGNIS_REUSE_PROMPT` | `on` | `off`: no prompt checkpoint is captured or reused, and no prefix is shared unless `--reuse-retained-device` or `--reuse-retained-host` gives slots for it. |
+| `--reuse-retained-device <n>` | `IGNIS_REUSE_RETAINED_DEVICE` | `0` | Retained slots in VRAM: reserved in the VRAM plan, copied device to device (~0.3 ms), and handed out before any host slot. A card with VRAM to spare can take `--reuse-retained-device 16 --reuse-retained-host 0`. |
+| `--reuse-retained-host <n>` | `IGNIS_REUSE_RETAINED_HOST` | two per decode lane (16); `0` with `--reuse-prompt off` | Retained slots in one pinned host block reserved at start, ~222 MiB each at the default load (3.5 GiB for 16): no VRAM, so the KV pool gets it; a capture and a claim each cost a PCIe copy (~15–19 ms). Both kinds hold the images of retained checkpoints and shared prefixes. When none is free, retained state gives one up — checkpoints before prefixes, `agent` before `interactive`, then least recently used; when nothing can, the publish or capture is skipped. `--retained-slots` was replaced by these two and now refuses the start. |
+| `--reuse-retained-interactive-ttl <secs>` | `IGNIS_REUSE_RETAINED_INTERACTIVE_TTL` | `300` | Idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's. Needs `--reuse-prompt on`. |
 
 ### KV-disk
 
@@ -316,7 +372,7 @@ file when that saves at least the restore floor (8,192 tokens on Flash-Next,
 - When the device, KV-RAM and the disk are all full of live work, a new
   request waits in the queue until room returns: nothing is refused or loses
   work for it (the in-flight cap's 503 is unchanged).
-- With `--metrics` the tier is `tier="disk"` on the retained-state series and
+- With `--server-metrics` the tier is `tier="disk"` on the retained-state series and
   `ignis_kv_disk_*` (bytes, spills, failures); the Monitor shows a Disk row.
 
 ### Flash-Next n-gram startup cache
@@ -324,8 +380,8 @@ file when that saves at least the restore floor (8,192 tokens on Flash-Next,
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--ngram-hot-bytes <bytes\|auto>` | `IGNIS_NGRAM_HOT_BYTES` | `1G` | The Flash-Next n-gram rows held in RAM, index included (accepts `K`/`M`/`G`; `0` holds none). Every other row is read from the artifact on NVMe when a step needs it. `auto`: what the host plan leaves after its other lines and the 6 GiB margin (below). The 27B has no n-gram table and refuses the flag. (`make` knob `NGRAM_HOT_BYTES`.) |
-| `--persist-ngram-cache <true\|false>` | `IGNIS_PERSIST_NGRAM_CACHE` | `true` | Keep a compact copy of the selected Flash-Next hot rows on disk. `false` reads and writes no persistent n-gram cache. |
-| `--persist-ngram-cache-path <model\|auto\|dir>` | `IGNIS_PERSIST_NGRAM_CACHE_PATH` | `model` | Cache directory. `model` is the artifact's own directory, on the disk that already holds the model. An explicit relative directory is relative to the server's working directory. |
+| `--ngram-persist <true\|false>` | `IGNIS_NGRAM_PERSIST` | `true` | Keep a compact copy of the selected Flash-Next hot rows on disk. `false` reads and writes no persistent n-gram cache. |
+| `--ngram-persist-path <model\|auto\|dir>` | `IGNIS_NGRAM_PERSIST_PATH` | `model` | Cache directory. `model` is the artifact's own directory, on the disk that already holds the model. An explicit relative directory is relative to the server's working directory. |
 
 The table is 28.8 GB (320,001,536 rows of 90 bytes); the artifact ranks its
 15,642,665 most frequent rows (1.37 GiB with their index), and the hot rows
@@ -393,8 +449,8 @@ naming the plan line to shrink. The knobs that lower it, with what each costs:
 
 | Knob (`make`) | Flag | Saves | Costs |
 |---|---|---|---|
-| `RETAINED_HOST` | `--retained-host <n>` | ~125 MiB per slot below the default 8 | Fewer retained prompt checkpoints and shared prefixes: a returning agent or a subagent sharing a system block prefills what no slot kept. `0` retains nothing on the host. |
-| `KV_HOST_POOL_BYTES` | `--kv-host-pool-bytes <n>` | up to the 2 GiB arena (`0` turns it off) | The KV-RAM tier holds fewer suspended requests: under VRAM pressure a request that cannot be parked there is evicted and prefilled again. |
+| `RETAINED_HOST` | `--reuse-retained-host <n>` | ~125 MiB per slot below the default 8 | Fewer retained prompt checkpoints and shared prefixes: a returning agent or a subagent sharing a system block prefills what no slot kept. `0` retains nothing on the host. |
+| `KV_HOST_POOL_BYTES` | `--reuse-kv-host-pool-bytes <n>` | up to the 2 GiB arena (`0` turns it off) | The KV-RAM tier holds fewer suspended requests: under VRAM pressure a request that cannot be parked there is evicted and prefilled again. |
 | `NGRAM_HOT_BYTES` | `--ngram-hot-bytes <n>` | up to the 1 GiB default (`0` holds none) | Each n-gram row not held in RAM is read from NVMe when a step needs it: more reads per token, and slower prefill. |
 
 Check `make config MODEL=flash-next` for the lines a start will use.
@@ -408,21 +464,21 @@ plan leaves, and with about 28 GB more available than the figure above
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--vision` | `IGNIS_VISION` | off | Load the vision tower and reserve its workspace. Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
-| `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision` | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the `ignis.request.admitted` line reports `media.vision_tokens` (admitted) and `media.natural_vision_tokens`. Several images whose total is past the cap are still refused with `media_budget_exceeded`. |
+| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off | Load the vision tower and reserve its workspace. Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
+| `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision-enabled` | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the `ignis.request.admitted` line reports `media.vision_tokens` (admitted) and `media.natural_vision_tokens`. Several images whose total is past the cap are still refused with `media_budget_exceeded`. |
 | `--vision-embedding-pool-mib <n>` | `IGNIS_VISION_EMBEDDING_POOL_MIB` | one envelope-wide embedding | Encoded images kept for reuse across requests, 1..65536. |
-| `--media-cache-mib <n>` | `IGNIS_MEDIA_CACHE_MIB` | `1024` with `--vision` | Prepared images kept for reuse; `0` disables, max 65536. |
-| `--media-allow-private-network` | `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` | off | Needs `--vision`. Fetch image URLs on private, loopback and link-local addresses. |
+| `--media-cache-mib <n>` | `IGNIS_MEDIA_CACHE_MIB` | `1024` with `--vision-enabled` | Prepared images kept for reuse; `0` disables, max 65536. |
+| `--media-allow-private-network` | `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` | off | Needs `--vision-enabled`. Fetch image URLs on private, loopback and link-local addresses. |
 
 ### Playground, metrics, access
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--ui` / `--no-ui` | `IGNIS_UI` | on | Serve the Playground at `/ui/` ([ADR 0026](../adr/0026-playground-embedded-when-built.md)). A binary built without `web/dist` serves the page that says how to build it. |
-| `--metrics` | — (flag only) | off | Serve Prometheus metrics on their own listener, and at `/ui/metrics` unless `--no-ui` ([ADR 0017](../adr/0017-prometheus-metrics.md)). |
-| `--metrics-bind <addr>` | — (flag only) | `127.0.0.1:9464` | The metrics listener's address; needs `--metrics`. No API key, never exposed. |
-| `--api-key <key>` | `IGNIS_API_KEY` | unset | Unset: `/v1` needs no key. Set: `Authorization: Bearer <key>`. `auto`: generate one and print it. |
-| `--expose <mode>` | `IGNIS_EXPOSE` | unset | `cloudflare-quick` publishes a `https://*.trycloudflare.com` URL, printed at start. Always requires an API key — one is generated when none is set ([ADR 0028](../adr/0028-expose-modes-always-keyed.md)). |
+| `--server-ui <bool>` | `IGNIS_SERVER_UI` | on | Serve the Playground at `/ui/` ([ADR 0026](../adr/0026-playground-embedded-when-built.md)). A binary built without `web/dist` serves the page that says how to build it. |
+| `--server-metrics <bool>` | `IGNIS_SERVER_METRICS` | off | Serve Prometheus metrics on their own listener, and at `/ui/metrics` unless `--server-ui false` ([ADR 0017](../adr/0017-prometheus-metrics.md)). |
+| `--server-metrics-bind <addr>` | `IGNIS_SERVER_METRICS_BIND` | `127.0.0.1:9464` | The metrics listener's address; needs `--server-metrics`. No API key, never exposed. |
+| `--server-api-key <key>` | `IGNIS_SERVER_API_KEY` | unset | Unset: `/v1` needs no key. Set: `Authorization: Bearer <key>`. `auto`: generate one and print it. |
+| `--server-expose <mode>` | `IGNIS_SERVER_EXPOSE` | unset | `cloudflare-quick` publishes a `https://*.trycloudflare.com` URL, printed at start. Always requires an API key — one is generated when none is set ([ADR 0028](../adr/0028-expose-modes-always-keyed.md)). |
 
 ---
 
@@ -445,15 +501,15 @@ not.
 | `/v1` | GET | The API reference — a 307 to `/v1/docs/` (ADR 0036). |
 | `/v1/docs/` | GET | Swagger UI over the document, from assets compiled into the binary: no CDN, nothing fetched. Open even with an API key set — it publishes the API's shape, not its load — and *Authorize* is how you drive the keyed routes from the page. |
 | `/v1/openapi.json` | GET | The OpenAPI 3.1 document, generated from the handlers themselves. Monitoring is not in it. |
-| `/ui/` | GET | The Playground — only with `--ui`. |
-| `/ui/metrics` | GET | Prometheus text format 0.0.4 for the Playground — only with `--ui` and `--metrics`. Behind the API key, like `/v1`. |
+| `/ui/` | GET | The Playground — only with `--server-ui`. |
+| `/ui/metrics` | GET | Prometheus text format 0.0.4 for the Playground — only with `--server-ui` and `--server-metrics`. Behind the API key, like `/v1`. |
 
 Every `/v1` route answers a CORS preflight. Prometheus itself scrapes
-`GET /metrics` on the metrics listener (`--metrics-bind`), not on the API's
-address: no key, and never reachable through `--expose`.
+`GET /metrics` on the metrics listener (`--server-metrics-bind`), not on the API's
+address: no key, and never reachable through `--server-expose`.
 
 **Request body limits**, enforced before JSON parsing: 16 MiB on a text-only
-load, 384 MiB with `--vision`, which takes images inline as base64 data URIs.
+load, 384 MiB with `--vision-enabled`, which takes images inline as base64 data URIs.
 Both are past what their own load can use, so an oversized prompt meets the
 refusal that names the real limit — the context — rather than a byte count.
 
@@ -484,7 +540,7 @@ reports `status: "switching"` with `switching: {from, to}`. Requests already
 running on the old model get `--switch-drain-timeout` (30 s) to finish; one
 still running then ends with an `engine_error`. The new model loads on the
 flags the server started with, except the ones it cannot take, which are left
-off for it and named in the log (`--vision` and the 27B's `--spec` on
+off for it and named in the log (`--vision-enabled` and the 27B's `--spec-backend` on
 Flash-Next; Flash-Next's own knobs on the 27B).
 
 A target that can be refused without unloading anything — no file at the path,
@@ -495,14 +551,14 @@ one of them serves.
 
 **By naming the model.** A client can also just ask for the other model: a
 chat completion, a response (over HTTP or the WebSocket) or a decision whose
-`model` names another model listed with `--known-model` runs the same switch,
+`model` names another model listed with `--switch-known-models` runs the same switch,
 and the request itself is held until the named model serves and is then
 answered by it — the first such request takes as long as the switch does
 (seconds), and no client-side retry loop is needed. List the models once:
 
 ```
-ignis-server --artifact models/Qwen3.8-27B.ninfer \
-  --known-model qwen3.8-flash-next=models/Qwen3.8-Flash-Next.ninfer
+ignis-server --model-artifact models/Qwen3.8-27B.ninfer \
+  --switch-known-models qwen3.8-flash-next=models/Qwen3.8-Flash-Next.ninfer
 ```
 
 The model the server starts on is always listed, so naming it again switches
@@ -512,7 +568,7 @@ included — switches are never queued. A switch that does not land refuses the
 request that began it with `503 model_switch_failed` and the reason (no
 `Retry-After`: each retry would unload and reload the serving model again),
 never an answer from another model; `/v1/decide` refuses it as its own `422`.
-A model nobody listed, or any other model under `--allow-model-switch false`,
+A model nobody listed, or any other model under `--switch-allow-implicit false`,
 is a `404 model_not_found` as before. `/v1/tokenize` never switches: counting
 tokens does not move the card.
 
@@ -530,7 +586,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   the model name.
 - `thinking_budget` is an **Ignis extension**: the reasoning tokens this
   request may spend before its close is forced. Absent takes
-  `--thinking-budget`, `0` means no budget, and `reasoning_effort: "max"`
+  `--model-thinking-budget`, `0` means no budget, and `reasoning_effort: "max"`
   ignores it and runs with no budget. The budget always leaves 2,048 tokens of
   `max_tokens` for the answer. A forced close is reported as
   `thinking_budget_forced_at` on the choice (on the finish chunk when
@@ -554,12 +610,12 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   `frequency_penalty` sent with it is rejected rather than ignored.
 - A request that sends no `max_tokens` (nor `max_completion_tokens`, nor
   `max_output_tokens` on `/v1/responses`) generates at most
-  `--default-max-tokens` tokens, its reasoning included. The flag is 38,912
-  unless you set it (`IGNIS_DEFAULT_MAX_TOKENS`, make `DEFAULT_MAX_TOKENS`).
+  `--model-default-max-tokens` tokens, its reasoning included. The flag is 38,912
+  unless you set it (`IGNIS_MODEL_DEFAULT_MAX_TOKENS`, make `DEFAULT_MAX_TOKENS`).
   Such a request ends with `finish_reason: "length"` when it gets there
   (`incomplete` with `max_output_tokens` on `/v1/responses`). Before, it could
   generate to the end of the context. Send `max_tokens` for more, or start the
-  server with `--default-max-tokens 0` for the old behaviour.
+  server with `--model-default-max-tokens 0` for the old behaviour.
 - `max_completion_tokens` is `max_tokens` under OpenAI's current name — the
   one the current SDKs send. Both with different values is a 400.
 - `stop` (a string, or 1 to 4 non-empty strings) ends the answer before the
@@ -624,7 +680,7 @@ curl http://127.0.0.1:8000/v1/responses \
   -d '{"input":"...","max_output_tokens":256}'
 ```
 
-With `--api-key`, add `-H "Authorization: Bearer $IGNIS_API_KEY"`.
+With `--server-api-key`, add `-H "Authorization: Bearer $IGNIS_SERVER_API_KEY"`.
 
 ### Counting a prompt
 
@@ -632,7 +688,7 @@ With `--api-key`, add `-H "Authorization: Bearer $IGNIS_API_KEY"`.
 chat template, tool block, thinking controls, system block — and answers how many
 tokens it prefills, **without submitting it**: no lane, no GPU, no KV page. The
 `count` is the `usage.prompt_tokens` the same body reports when served, and
-`max_model_len` is the server's `--max-context`, so one call says whether a body
+`max_model_len` is the server's `--model-max-context`, so one call says whether a body
 fits.
 
 ```bash
@@ -650,7 +706,7 @@ id outside the vocabulary is a `400` naming its index. The tokenizer normalizes
 text to NFC, so a decomposed `e` + accent comes back as the composed `é` (the
 `text` a call returns is the rendered prompt as sent, before that).
 Neither route enters the scheduler; the count of calls is
-`ignis_tokenize_requests_total{route}` with `--metrics`.
+`ignis_tokenize_requests_total{route}` with `--server-metrics`.
 
 ### Canary check
 
@@ -828,7 +884,7 @@ and you can still ask it yourself over a short text (Jev's "line search"):
 
 ## The Playground
 
-The Playground (`web/`, React + Vite) is served at `/ui/` unless `--no-ui`, but
+The Playground (`web/`, React + Vite) is served at `/ui/` unless `--server-ui false`, but
 it is embedded into `ignis-server` only if `web/dist` exists when cargo builds
 it — cargo never runs npm. Build the frontend first (needs Node.js), then the
 server:
@@ -868,7 +924,7 @@ Everything goes through one structured log on stdout, in the format
 
 - The VRAM layout decided at load is the `ignis.runtime.vram_plan` event.
 
-With `--metrics`, the Prometheus exposition covers the request lifecycle and
+With `--server-metrics`, the Prometheus exposition covers the request lifecycle and
 rejections, KV pool pages and evictions, the KV-RAM arena, retained slots and
 what reuse held or gave up, the VRAM plan, decoded tokens, forced thinking
 closes, and decision counters with the answer-mass histogram ([ADR 0017](../adr/0017-prometheus-metrics.md)).

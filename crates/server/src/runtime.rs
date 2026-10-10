@@ -22,71 +22,71 @@ pub fn scheduler<L: StepLeaf>(
     ConcreteScheduler::with_config(config, Arc::new(RuntimeCompute::new(model, eos)))
 }
 
-/// The engine shape the operator configured (`--prefill-chunk`,
-/// `--max-context` — GitHub #87, resolved and validated by [`crate::config`]
+/// The engine shape the operator configured (`--model-prefill-chunk`,
+/// `--model-max-context` — GitHub #87, resolved and validated by [`crate::config`]
 /// before any loader work starts). Carried as one value so the flags
 /// travel together from `main` to the leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineShape {
     /// The prefill chunk width, in tokens (a nonzero multiple of 128).
     pub prefill_chunk: u32,
-    /// The decode share, in percent (`--decode-share`, GitHub #306); `None`
+    /// The decode share, in percent (`--model-decode-share`, GitHub #306); `None`
     /// takes the family's ([`EngineShape::for_family`]), and the 27B's is 0.
     pub decode_share_percent: Option<u32>,
     /// The maximum per-sequence context, in tokens.
     pub max_context: u32,
     /// The generation cap of a request that sends none
-    /// (`--default-max-tokens`, ADR 0045); 0 = none. A scheduler setting, not
+    /// (`--model-default-max-tokens`, ADR 0045); 0 = none. A scheduler setting, not
     /// a load option: it never reaches the leaf or a blob's identity.
     pub default_max_tokens: u32,
-    /// The KV storage format the load runs on (`--kv-format`, GitHub #122).
+    /// The KV storage format the load runs on (`--model-kv-format`, GitHub #122).
     pub kv_format: ignis_core::KvFormat,
-    /// The KV pool the operator named (`--kv-pool-bytes`), in bytes or
+    /// The KV pool the operator named (`--vram-kv-pool-bytes`), in bytes or
     /// tokens. `None` takes the KV pool policy's size (ADR 0045): the rest of
     /// the VRAM budget on a resident load, 524,288 tokens on an offloaded one.
     pub kv_pool: Option<ignis_core::KvPoolSize>,
     /// How the load's VRAM budget is chosen (GitHub #210, ADR 0030).
     pub vram: ignis_core::VramMode,
-    /// `--allow-expert-cache-below-floor` (ADR 0045): a Flash-Next load whose
+    /// `--vram-allow-expert-cache-below-floor` (ADR 0045): a Flash-Next load whose
     /// expert cache falls below its floor starts with a warning.
     pub allow_expert_cache_below_floor: bool,
-    /// The KV-RAM host tier's budget, in bytes (`--kv-host-pool-bytes`,
+    /// The KV-RAM host tier's budget, in bytes (`--reuse-kv-host-pool-bytes`,
     /// P4-07 GitHub #125): pinned host memory for evicted (suspended)
     /// request snapshots, independent of the GPU-resident pool above.
     pub host_pool_bytes: u64,
-    /// Cross-request state reuse (`--prompt-reuse`, GitHub #186, ADR 0029).
+    /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
     /// Whether the generation opener's page rides the checkpoint capture (ADR
     /// 0029 as amended 2026-10-07, GitHub #306): the family's, set by
     /// [`EngineShape::for_family`]; no flag names it.
     pub opener_page_rides_capture: bool,
     /// The retained slots the load reserves (GitHub #215, #281, ADR 0030):
-    /// in VRAM (`--retained-device`) and in the pinned host block
-    /// (`--retained-host`), both 0 with prompt reuse off unless named.
+    /// in VRAM (`--reuse-retained-device`) and in the pinned host block
+    /// (`--reuse-retained-host`), both 0 with prompt reuse off unless named.
     pub retained_device_slots: u32,
     pub retained_host_slots: u32,
     /// Whether the operator named the host count; unnamed, a Flash-Next load
     /// takes its family's default ([`EngineShape::for_family`]).
     pub retained_host_named: bool,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
-    /// priority (`--retained-interactive-ttl`, GitHub #190).
+    /// priority (`--reuse-retained-interactive-ttl`, GitHub #190).
     pub retained_interactive_ttl: std::time::Duration,
-    /// Speculative decoding (`--spec`/`--draft-tokens`, P5-02 GitHub #150):
+    /// Speculative decoding (`--spec-backend`/`--spec-draft-tokens`, P5-02 GitHub #150):
     /// `None` binds nothing of the drafter -- on Flash-Next, unless its MTP
     /// head is on by default ([`flash_next_speculation`]).
     pub speculation: Option<ignis_core::Speculation>,
-    /// `--spec off` (GitHub #307): no speculation, the default one included.
+    /// `--spec-backend off` (GitHub #307): no speculation, the default one included.
     pub speculation_off: bool,
-    /// Flash-Next's draft row budget (`--draft-rows`, GitHub #307); 0 = the
+    /// Flash-Next's draft row budget (`--spec-draft-rows`, GitHub #307); 0 = the
     /// decode route's 8 rows.
     pub draft_rows: u32,
-    /// Flash-Next's decode lanes (`--decode-lanes`, GitHub #306); 0 = the
+    /// Flash-Next's decode lanes (`--spec-decode-lanes`, GitHub #306); 0 = the
     /// engine's default.
     pub decode_lanes: u32,
-    /// Vision (`--vision`/`--vision-max-tokens`, GitHub #177): `None` binds
+    /// Vision (`--vision-enabled`/`--vision-max-tokens`, GitHub #177): `None` binds
     /// and reserves nothing of the vision tower.
     pub vision: Option<ignis_core::Vision>,
-    /// The text rotary table (`--rope-scaling`, GitHub #227):
+    /// The text rotary table (`--model-rope-scaling`, GitHub #227):
     /// [`ignis_core::RopeScaling::NONE`] is the linear one, a YaRN factor
     /// rescales the checkpoint's trained position envelope.
     pub rope_scaling: ignis_core::RopeScaling,
@@ -175,7 +175,7 @@ impl From<&crate::config::Config> for EngineShape {
 }
 
 /// A Flash-Next load's speculation (spec flash-next/07): its MTP head only
-/// when `--spec mtp` names it -- off by default, the owner's call after the
+/// when `--spec-backend mtp` names it -- off by default, the owner's call after the
 /// head measured PCIe-bound on the 5090 (finding 2026-10-07) -- at the
 /// operator's draft tokens, cut by the row budget. A named head needs its
 /// companion (`companion_present`). The served-model check refused any other
@@ -189,7 +189,7 @@ pub fn flash_next_speculation(
         return Ok(None);
     };
     if !companion_present {
-        return Err("--spec mtp: the MTP head's companion container is not beside the artifact (spec flash-next/07)"
+        return Err("--spec-backend mtp: the MTP head's companion container is not beside the artifact (spec flash-next/07)"
             .to_string());
     }
     FlashNextSpeculation::new(ignis_core::SpeculativeBackend::Mtp, speculation.draft_tokens(), shape.draft_rows)
@@ -477,7 +477,7 @@ pub fn log_flash_next_plan(plan: &ignis_core::VramPlan, expected_hit_rate: f64, 
 }
 
 /// `ignis.runtime.expert_cache_below_floor` (ADR 0045): the WARN a Flash-Next
-/// load emits when `--allow-expert-cache-below-floor` started it with an
+/// load emits when `--vram-allow-expert-cache-below-floor` started it with an
 /// expert cache below `floor_bytes` -- the cache, the floor, and the knobs
 /// that would lift it. Nothing for a cache at or above the floor.
 pub fn warn_expert_cache_below_floor(cache: &ignis_core::residency::ExpertCachePlan, floor_bytes: u64) {
@@ -490,9 +490,9 @@ pub fn warn_expert_cache_below_floor(cache: &ignis_core::residency::ExpertCacheP
         expert_cache_bytes = cache.cache_bytes,
         floor_bytes,
         expected_hit_rate = cache.expected_hit_rate,
-        knobs = "a smaller --kv-pool-bytes, --prefill-chunk or --vram-headroom-bytes, fewer --retained-device, \
-                 or --spec off",
-        "the expert cache is below its floor (--allow-expert-cache-below-floor): decode slows sharply below it"
+        knobs = "a smaller --vram-kv-pool-bytes, --model-prefill-chunk or --vram-headroom-bytes, fewer --reuse-retained-device, \
+                 or --spec-backend off",
+        "the expert cache is below its floor (--vram-allow-expert-cache-below-floor): decode slows sharply below it"
     );
 }
 
@@ -508,7 +508,7 @@ pub fn warn_expert_cache_below_floor(cache: &ignis_core::residency::ExpertCacheP
 /// `cuda_scheduler` would put a field-by-field copy behind a GPU.
 ///
 /// `kv_pool_bytes` is the pool's payload budget as the VRAM plan resolved it
-/// (GitHub #210): the operator's `--kv-pool-bytes`, or the rest of the
+/// (GitHub #210): the operator's `--vram-kv-pool-bytes`, or the rest of the
 /// budget, which only a device can say.
 #[cfg(feature = "cuda")]
 fn leaf_config_for_shape(shape: EngineShape, kv_pool_bytes: u64) -> ignis_runtime::CudaLeafConfig {
@@ -710,7 +710,7 @@ pub fn cuda_scheduler_with_thinking_close(
     // now, so an operator can read it off `/metrics` instead of off the one
     // log line the load wrote. The retained slot count is the scheduler's
     // own, not the flags': prompt reuse off hands out none whatever
-    // `--retained-device` and `--retained-host` said.
+    // `--reuse-retained-device` and `--reuse-retained-host` said.
     let reserved = crate::metrics::LoadReservations {
         lines: vram.lines,
         budget_bytes: vram.budget_bytes,
@@ -735,8 +735,8 @@ pub fn cuda_scheduler_with_thinking_close(
 /// takes the rest and is refused below its floor (spec flash-next/03).
 ///
 /// Prompt reuse and the KV-RAM tier are the 27B's (spec flash-next/05, ADR
-/// 0029): the shape's `--prompt-reuse`, retained slots (host 8 and device 0
-/// unless named, [`EngineShape::for_family`]) and `--kv-host-pool-bytes`
+/// 0029): the shape's `--reuse-prompt`, retained slots (host 8 and device 0
+/// unless named, [`EngineShape::for_family`]) and `--reuse-kv-host-pool-bytes`
 /// arena, which the leaf pins as its own. The retained slots are lines of
 /// the pool (device) and of the host plan (host), the arena a host-plan
 /// line; the scheduler's lanes are the load's decode lanes.
@@ -891,7 +891,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
     let indexer_bytes = pool_plan_at(vram.kv_page_count)?.indexer_bytes;
     // The expert cache's floor and class minimums, at plan time: what the
     // plan left it, split by the calibration traffic as the leaf will split
-    // it. Below the floor only with --allow-expert-cache-below-floor; below
+    // it. Below the floor only with --vram-allow-expert-cache-below-floor; below
     // a class's minimum never. The plan's total holds the cache, so that
     // total is the budget the cache's share is read against.
     let traffic = expert_traffic(artifact_path, &cat)?;
@@ -1081,7 +1081,7 @@ mod tests {
 
         // Every serving knob at once: the bind address, the timeout, the UI,
         // the metrics listener, the API key, the prefill chunk, the context,
-        // both pool budgets, the VRAM budget, `--prompt-reuse` and the
+        // both pool budgets, the VRAM budget, `--reuse-prompt` and the
         // retained slots. The KV pool is the one that makes this a rule
         // rather than a nicety: unset, it is the rest of a budget derived from
         // the VRAM free at start, so it differs from one start of the same
@@ -1192,7 +1192,7 @@ mod tests {
         assert_eq!(
             zero_27b.with_family_decode_share(ModelFamily::Qwen38_27b).decode_share_percent,
             Some(0),
-            "--decode-share 0 restores one round per chunk"
+            "--model-decode-share 0 restores one round per chunk"
         );
         let named_27b = EngineShape { decode_share_percent: Some(50), ..unnamed };
         assert_eq!(named_27b.with_family_decode_share(ModelFamily::Qwen38_27b).decode_share_percent, Some(50));
@@ -1245,7 +1245,7 @@ mod tests {
 
     /// GitHub #307: Flash-Next's MTP head is off by default -- the owner's
     /// call after the bench found it PCIe-bound on the 5090 (finding
-    /// 2026-10-07). `--spec mtp` turns it on at its draft tokens and the
+    /// 2026-10-07). `--spec-backend mtp` turns it on at its draft tokens and the
     /// operator's row budget, and refuses a load without the companion.
     #[test]
     fn flash_next_speculation_is_off_unless_named() {
@@ -1256,7 +1256,7 @@ mod tests {
             speculation: Some(ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Mtp, 3).unwrap()),
             ..shape
         };
-        let on = flash_next_speculation(&named, true).unwrap().expect("--spec mtp turns it on");
+        let on = flash_next_speculation(&named, true).unwrap().expect("--spec-backend mtp turns it on");
         assert_eq!((on.draft_tokens(), on.row_budget()), (3, 6));
         let missing = flash_next_speculation(&named, false).unwrap_err();
         assert!(missing.contains("companion"), "{missing}");
@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn make_s_named_pool_tokens_use_each_model_s_own_bytes_per_token() {
-        // `make config` turns a named --kv-pool-bytes into tokens in sh
+        // `make config` turns a named --vram-kv-pool-bytes into tokens in sh
         // (`mk/kv-pool-tokens.sh`, ADR 0045): its per-token costs are the
         // ones the plan divides a byte count by.
         use ignis_core::KvFormat;
@@ -1600,7 +1600,7 @@ mod tests {
 
     #[test]
     fn a_cache_started_below_its_floor_warns_with_the_cache_the_floor_and_the_knobs() {
-        // ADR 0045 (AC 6): what `--allow-expert-cache-below-floor` buys is a
+        // ADR 0045 (AC 6): what `--vram-allow-expert-cache-below-floor` buys is a
         // start with this WARN, never a silent one.
         use ignis_core::residency::{
             plan_expert_cache, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, KBits, EXPERT_CACHE_FLOOR_BYTES,
@@ -1637,7 +1637,7 @@ mod tests {
         assert_eq!(field("expert_cache_bytes"), Some(600.into()));
         assert_eq!(field("floor_bytes"), Some(1_000.into()));
         let knobs = field("knobs").expect("knobs").as_str().unwrap().to_owned();
-        for knob in ["--kv-pool-bytes", "--prefill-chunk", "--vram-headroom-bytes", "--retained-device"] {
+        for knob in ["--vram-kv-pool-bytes", "--model-prefill-chunk", "--vram-headroom-bytes", "--reuse-retained-device"] {
             assert!(knobs.contains(knob), "{knob}: {knobs}");
         }
         assert!(capture(&plan(true, 2_000)).is_empty(), "a cache above its floor warns nothing");

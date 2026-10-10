@@ -8,25 +8,25 @@ CUDA ?= 1
 # Cargo profile: release | dev (or any custom [profile.*]).
 PROFILE ?= release
 
-# 1 = build web/dist before the server (so it is embedded) and pass --ui.
-# Anything else passes --no-ui, because the server serves the Playground
+# 1 = build web/dist before the server (so it is embedded) and pass --server-ui.
+# Anything else passes --server-ui false, because the server serves the Playground
 # unless told not to -- make says which it means rather than relying on that.
 UI ?= 1
 
-# 1 = pass --metrics (ADR 0017): Prometheus text at GET /metrics on its own
+# 1 = pass --server-metrics (ADR 0017): Prometheus text at GET /metrics on its own
 # listener (METRICS_BIND, no key, never exposed) and, with UI=1, at
 # /ui/metrics on BIND (behind API_KEY when set). Off until #90 measures it on
 # the GPU, so gate runs started through make do not carry it by default.
 # make metrics scrapes the metrics listener.
 METRICS ?= 0
-# The metrics listener (--metrics-bind). Empty = the server's 127.0.0.1:9464.
+# The metrics listener (--server-metrics-bind). Empty = the server's 127.0.0.1:9464.
 METRICS_BIND ?=
 
 # The model (ADR 0043, spec flash-next/04): one per process, chosen at start.
 # MODEL=flash-next serves Qwen3.8-Flash-Next from its own artifact, as
 # qwen3.8-flash-next, with the defaults below (each still a knob). MODEL=27b,
 # or empty, is Qwen3.8-27B, the default. Any other value is the 27B served
-# under that id (--model), as before.
+# under that id (--model-id), as before.
 MODEL ?=
 # The family MODEL selects, decided here once: every other place reads this.
 # The server still checks it against the artifact's own at start, and refuses
@@ -44,7 +44,7 @@ ifeq ($(MODEL_FAMILY),flash-next)
   # DRAFT_ROWS=r is the row budget that cuts k as lanes join (empty: the
   # decode route's 8; 3 drafts at one lane only).
   MAX_CONTEXT ?= 262144
-  # The decode lanes (--decode-lanes, 1..8): the sequences decoded at once.
+  # The decode lanes (--spec-decode-lanes, 1..8): the sequences decoded at once.
   # They share the KV pool (ADR 0045), reserved first: min(524,288 tokens,
   # LANES x MAX_CONTEXT), never below one MAX_CONTEXT and a page per retained
   # slot; the expert cache takes the rest of the budget. At 262,144 tokens one
@@ -54,7 +54,7 @@ ifeq ($(MODEL_FAMILY),flash-next)
   ROPE_SCALING ?= none
   PREFILL_CHUNK ?= 8192
   # The part of the model's time decoding lanes keep while a prompt prefills
-  # (--decode-share, percent, 0-99). Empty = the server's: 25 on both models (0 = one decode round per chunk).
+  # (--model-decode-share, percent, 0-99). Empty = the server's: 25 on both models (0 = one decode round per chunk).
   DECODE_SHARE ?=
   SPEC ?=
   DRAFT_TOKENS ?=
@@ -92,10 +92,10 @@ endif
 BIND ?= 127.0.0.1:8000
 LOG_LEVEL ?=
 LOG_FORMAT ?=
-# The key /v1 requires (--api-key). Empty = no key; auto = the server
+# The key /v1 requires (--server-api-key). Empty = no key; auto = the server
 # generates one and prints it when ready: make dev-ui API_KEY=auto
 API_KEY ?=
-# Expose the server beyond BIND (--expose, ADR 0028). Empty = not exposed;
+# Expose the server beyond BIND (--server-expose, ADR 0028). Empty = not exposed;
 # cloudflare-quick = a public https://*.trycloudflare.com URL, printed when
 # ready. An exposed server always requires a key (auto when API_KEY is empty).
 EXPOSE ?=
@@ -110,7 +110,7 @@ SYSTEM_MESSAGE_POLICY ?= merge
 # conversation keeps its prefix. into-system and after-system hoist that message
 # into the head instead, and every turn then prefills from scratch, silently.
 DEVELOPER_MESSAGE_POLICY ?= inplace
-# The max_tokens of a request that sends none (--default-max-tokens, ADR
+# The max_tokens of a request that sends none (--model-default-max-tokens, ADR
 # 0045), its reasoning included, on both models and on the CPU mock. Empty =
 # the server's 38912; 0 = none, a request may generate to the end of the
 # context. An explicit max_tokens always wins.
@@ -130,16 +130,16 @@ DECODE_SHARE ?=
 REQUEST_TIMEOUT ?= 1800
 SPEC ?= dflash2
 DRAFT_TOKENS ?= 7
-# The drafter's proposal head (--draft-head): empty = the server's default
+# The drafter's proposal head (--spec-draft-head): empty = the server's default
 # (full), shortlist = the artifact's Q4 head over the most frequent tokens.
 DRAFT_HEAD ?=
-# The KV pool (--kv-pool-bytes): a byte count (4G) or tokens (512Ktok), on
+# The KV pool (--vram-kv-pool-bytes): a byte count (4G) or tokens (512Ktok), on
 # both models. Empty = the policy's (ADR 0045): the rest of the VRAM budget
 # when every weight is on the device (the 27B), 524,288 tokens when experts
 # stream (Flash-Next on a 32 GB card).
 KV_POOL_BYTES ?=
 # 1 = start Flash-Next even when its expert cache gets less than the 12 GiB
-# floor (--allow-expert-cache-below-floor), with a warning: below it decode
+# floor (--vram-allow-expert-cache-below-floor), with a warning: below it decode
 # slows sharply. The 27B refuses it.
 ALLOW_EXPERT_CACHE_BELOW_FLOOR ?=
 # The VRAM budget (GitHub #210, ADR 0030). Empty = the server's default: the
@@ -152,19 +152,19 @@ VRAM_BUDGET ?=
 ALLOW_VRAM_OVERSUBSCRIPTION ?=
 # Retained slots (GitHub #215, #281, ADR 0030): the images of retained prompt
 # checkpoints and shared prefixes, reserved at load. RETAINED_DEVICE
-# (--retained-device) keeps them in VRAM, handed out first; RETAINED_HOST
-# (--retained-host) in one pinned host block, a PCIe copy per capture and
+# (--reuse-retained-device) keeps them in VRAM, handed out first; RETAINED_HOST
+# (--reuse-retained-host) in one pinned host block, a PCIe copy per capture and
 # per claim. Empty = the server's defaults: none in VRAM, two per decode lane
 # on the host. A card with VRAM to spare: RETAINED_DEVICE=16 RETAINED_HOST=0.
 RETAINED_DEVICE ?=
 RETAINED_HOST ?=
-# Vision (--vision, GitHub #179): a load that takes image parts. Without it
+# Vision (--vision-enabled, GitHub #179): a load that takes image parts. Without it
 # every `image_url` part is refused with `vision_disabled`, whatever the
 # artifact holds. VISION_MAX_TOKENS caps one request's vision tokens
 # (--vision-max-tokens); empty = the server's own envelope.
 VISION ?=
 VISION_MAX_TOKENS ?=
-# RoPE scaling (--rope-scaling, GitHub #227): the text rotary table. `none`
+# RoPE scaling (--model-rope-scaling, GitHub #227): the text rotary table. `none`
 # (or empty) is the linear table the checkpoint was trained with, correct
 # through 262,144 positions; `yarn:F` rescales that envelope by F, which is
 # what a MAX_CONTEXT past it needs to mean anything. The full spelling is
@@ -172,7 +172,7 @@ VISION_MAX_TOKENS ?=
 # MAX_CONTEXT=524288 needs; it rescales every request's table, short ones
 # included, so MAX_CONTEXT=262144 wants ROPE_SCALING=none beside it.
 ROPE_SCALING ?= yarn:2
-# The KV-RAM host tier's budget (--kv-host-pool-bytes, P4-07, GitHub #125):
+# The KV-RAM host tier's budget (--reuse-kv-host-pool-bytes, P4-07, GitHub #125):
 # 0 disables the host tier entirely (no evict-to-RAM overflow path).
 KV_HOST_POOL_BYTES ?= 8G
 # KV-disk, the tier below KV-RAM (--kv-disk-bytes, spec vram-budget/03):
@@ -186,7 +186,7 @@ KV_DISK_BYTES ?=
 # process in its own ignis-kv-disk/<pid>-<nonce> there. Empty = model.
 KV_DISK_PATH ?=
 
-# Extra ignis-server flags, verbatim: ARGS='--kv-host-pool-bytes 0'
+# Extra ignis-server flags, verbatim: ARGS='--reuse-kv-host-pool-bytes 0'
 ARGS ?=
 
 # 1 = run the GPU guard before starting a CUDA server.

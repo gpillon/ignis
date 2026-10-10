@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { apiErrorMessage } from "./errors.ts";
 
-// The API key, for an ignis started with `--api-key`: kept in this browser's
+// The API key, for an ignis started with `--server-api-key`: kept in this browser's
 // localStorage and sent as `Authorization: Bearer <key>` on every /v1
 // request. Any 401 flips the page to the key prompt (KeyPage); the rest of
 // the page keeps its state behind it.

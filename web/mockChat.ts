@@ -4,7 +4,7 @@
 // wire — the finishing choice of a stream, or of a non-streaming completion.
 // Development only, like the rest of the mock.
 
-/** The mock's `--thinking-budget`, the default ignis ships. */
+/** The mock's `--model-thinking-budget`, the default ignis ships. */
 export const MOCK_DEFAULT_THINKING_BUDGET = 32768;
 
 const U32_MAX = 4_294_967_295;

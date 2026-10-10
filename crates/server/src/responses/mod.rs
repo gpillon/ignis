@@ -139,11 +139,11 @@ Not served, and refused with a 400 rather than ignored: hosted tools (anything b
             (ResponseStreamEvent = "text/event-stream"),
         )),
         (status = 400, description = "The request is malformed, or asks for what this server does not serve: a hosted tool, structured output, a background response, a `previous_response_id`.", body = ApiError),
-        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
-        (status = 413, description = "The prompt is longer than this server's `--max-context`.", body = ApiError),
+        (status = 413, description = "The prompt is longer than this server's `--model-max-context`.", body = ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`).", body = ApiError),
-        (status = 504, description = "A non-streaming request the engine did not finish within `--request-timeout`.", body = ApiError),
+        (status = 504, description = "A non-streaming request the engine did not finish within `--server-request-timeout`.", body = ApiError),
     ),
 )]
 pub(crate) async fn create_response(

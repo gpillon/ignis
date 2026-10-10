@@ -1,5 +1,5 @@
 //! GitHub #163 / ADR 0026: the Playground is served under `/ui/` only when
-//! the server was built with it (`--ui`), from whichever asset table the
+//! the server was built with it (`--server-ui`), from whichever asset table the
 //! binary carries — the real `web/dist` build, or the fallback page when the
 //! frontend was never built. Both tables are injected here, so the fallback
 //! is covered whatever state this checkout's `web/dist` is in.

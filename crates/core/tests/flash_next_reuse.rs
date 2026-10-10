@@ -211,8 +211,8 @@ fn a_host_plan_short_at_the_retained_slots_names_them() {
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "retained_host_slots");
-    assert!(message.contains("--retained-host"), "{message}");
-    assert!(!message.contains("--kv-host-pool-bytes"), "{message}");
+    assert!(message.contains("--reuse-retained-host"), "{message}");
+    assert!(!message.contains("--reuse-kv-host-pool-bytes"), "{message}");
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn a_host_plan_short_at_the_kv_ram_arena_names_it() {
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "kv_ram_arena");
-    assert!(message.contains("--kv-host-pool-bytes"), "{message}");
+    assert!(message.contains("--reuse-kv-host-pool-bytes"), "{message}");
     assert!(message.contains(&(2 * GIB).to_string()), "{message}");
 }
 

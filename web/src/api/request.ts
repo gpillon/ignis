@@ -37,7 +37,7 @@ export type Settings = {
   reasoningEffort: ReasoningEffort;
   /**
    * How many tokens a reply may reason before ignis closes its thinking
-   * (spec server/08): `null` leaves it to the server's `--thinking-budget`,
+   * (spec server/08): `null` leaves it to the server's `--model-thinking-budget`,
    * `0` is no budget, a count is that cap. It is kept through an effort that
    * cannot use it (`none`, `max`), and sent again once one can.
    */

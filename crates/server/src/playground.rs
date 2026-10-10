@@ -1,5 +1,5 @@
 //! The Playground (GitHub #163, ADR 0026): the opt-in browser page served
-//! under `/ui/` when `ignis-server` runs with `--ui`.
+//! under `/ui/` when `ignis-server` runs with `--server-ui`.
 //!
 //! The page is a static build of `web/` (Vite + React). `build.rs` embeds
 //! `web/dist` into the binary when it exists at compile time; otherwise the

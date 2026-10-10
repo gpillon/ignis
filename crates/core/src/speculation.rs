@@ -10,7 +10,7 @@
 //! purpose: the GPU load test compares the leaf's reported VRAM against this
 //! arithmetic, so the two cannot drift silently.
 
-/// The widest draft window DFlash2 accepts (the reference's `--draft-tokens`
+/// The widest draft window DFlash2 accepts (the reference's `--spec-draft-tokens`
 /// range for the 27B DFlash2 module, spec 05: `1..7`).
 pub const MAX_DRAFT_TOKENS: u32 = 7;
 
@@ -79,7 +79,7 @@ pub enum SpeculativeBackend {
 }
 
 impl SpeculativeBackend {
-    /// Parse the operator's spelling (`--spec`), naming the accepted values
+    /// Parse the operator's spelling (`--spec-backend`), naming the accepted values
     /// on a refusal.
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
@@ -122,7 +122,7 @@ impl SpeculativeBackend {
 pub const FLASH_NEXT_VERIFY_ROWS: u32 = 8;
 
 /// The draft tokens a Flash-Next MTP load verifies per lane at most when
-/// the operator names none (`--spec mtp` alone): phase A's best one-lane
+/// the operator names none (`--spec-backend mtp` alone): phase A's best one-lane
 /// projection at the measured column cost (spec flash-next/07), cut by the
 /// row budget as lanes join.
 pub const FLASH_NEXT_DEFAULT_DRAFT_TOKENS: u32 = 2;
@@ -225,7 +225,7 @@ pub enum ProposalHead {
 }
 
 impl ProposalHead {
-    /// Parse the operator's spelling (`--draft-head`), naming the accepted
+    /// Parse the operator's spelling (`--spec-draft-head`), naming the accepted
     /// values on a refusal.
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {

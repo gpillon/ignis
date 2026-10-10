@@ -2,7 +2,7 @@
 //! prompts): a handful of fixed images with short, unambiguous questions,
 //! scored by **teacher-forced next-token agreement** against the reference's
 //! greedy answers (`tests/fixtures/vision_canary`, recorded by
-//! `tools/vision-canary/record.py` with `--vision`, thinking off), first 32
+//! `tools/vision-canary/record.py` with `--vision-enabled`, thinking off), first 32
 //! answer positions, floor 95%.
 //!
 //! Each prompt is scored twice: prefilled in one span, and cut into 48-token
