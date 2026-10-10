@@ -21,20 +21,39 @@ pub const DEFAULT_PROFILE: &str = "rtx5090";
 
 /// The built-in profiles, as a config file's `profiles:` section.
 ///
-/// `rtx5090` names only the VRAM headroom: the one hardware-shaped field
-/// whose default is a plain number. The others the spec lists are not field
-/// defaults a profile can restate — the expert cache's 12 GiB floor is the
-/// engine's constant, not a config field; the decode lanes and retained
-/// host slots are unset by default so the model's own default applies (3
-/// lanes, 16 or 8 slots), and a profile value would replace that with one
-/// number for both models. No other card ships a profile yet: its numbers
-/// have to be measured on the card (finding
-/// 2026-10-09-vram-headroom-wddm-paging is what 1.5 GiB came from), and a
-/// guessed profile would be worse than none. A config file's `profiles:`
+/// `rtx5090` is the owner's own card, measured end to end on it (2026-10-10):
+/// the 27B's leg pushes context and turns vision on, found by raising
+/// `model.max_context` under `--vision-enabled` until the VRAM plan refused,
+/// then trading `vram.headroom_bytes` down from the 1536 MiB hardcoded
+/// default against `spec.backend dflash2` staying on — the owner's own
+/// choice over a `vram.headroom_bytes` trade that would have reached ~864K
+/// tokens with speculation off instead. Flash-Next's leg holds its decode
+/// lanes at their own default (3) and raises `model.max_context` to
+/// 512K + 32K + 32K tokens, the floor the owner asked for on both the expert
+/// cache (>= 15 GiB; it measured ~16.6 GiB) and the context: both legs need
+/// `model.rope_scaling yarn:4` to reach past the checkpoint's trained
+/// 262,144-position envelope. `vram.headroom_bytes`'s 1536 MiB hardcoded
+/// default (finding 2026-10-09-vram-headroom-wddm-paging) still holds for
+/// Flash-Next, which never needed to trade it down. No other card ships a
+/// profile yet: its numbers have to be measured on it, the way these were,
+/// and a guessed one would be worse than none. A config file's `profiles:`
 /// defines one for any other card.
 const BUILT_IN: &str = r#"{
     "rtx5090": {
-        "vram": { "headroom_bytes": "1536M" }
+        "vram": {
+            "headroom_bytes": "1536M",
+            "qwen38": { "headroom_bytes": "1200M" }
+        },
+        "model": {
+            "rope_scaling": "yarn:4",
+            "qwen38": { "max_context": 786432 },
+            "qwen38flashnext": { "max_context": 589824 }
+        },
+        "vision": { "enabled": true },
+        "spec": {
+            "qwen38": { "backend": "dflash2", "draft_tokens": 7 },
+            "decode_lanes": 3
+        }
     }
 }"#;
 
@@ -66,17 +85,36 @@ mod tests {
     use crate::config::schema::field;
 
     #[test]
-    fn the_default_profile_restates_the_hardcoded_default_and_nothing_else() {
+    fn the_default_profile_carries_the_rtx5090s_measured_numbers() {
+        use ignis_core::compute::ModelFamily;
+
         let profiles = built_in();
         let rtx5090 = &profiles[DEFAULT_PROFILE];
         let headroom = field("vram", "headroom_bytes").unwrap();
+        // Flash-Next never traded headroom down: the hardcoded default still
+        // holds for it, and as the group's general (unscoped) value.
+        assert_eq!((headroom.default)(), serde_json::Value::String("1536M".into()));
         assert_eq!(rtx5090.get(headroom, None).unwrap().raw, "1536M");
-        assert_eq!(rtx5090.entries().count(), 1);
-        assert_eq!(
-            (headroom.default)(),
-            serde_json::Value::String("1536M".into()),
-            "the profile and the hardcoded default agree"
-        );
+        assert!(rtx5090.get(headroom, Some(ModelFamily::FlashNext)).is_none(), "no override; it resolves to the general value");
+        // The 27B traded it down to fit vision plus its own context.
+        assert_eq!(rtx5090.get(headroom, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "1200M");
+
+        let max_context = field("model", "max_context").unwrap();
+        assert_eq!(rtx5090.get(max_context, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "786432");
+        assert_eq!(rtx5090.get(max_context, Some(ModelFamily::FlashNext)).unwrap().raw, "589824");
+
+        let rope = field("model", "rope_scaling").unwrap();
+        assert_eq!(rtx5090.get(rope, None).unwrap().raw, "yarn:4", "one rope table, both families");
+
+        let vision = field("vision", "enabled").unwrap();
+        assert_eq!(rtx5090.get(vision, None).unwrap().raw, "true");
+
+        let backend = field("spec", "backend").unwrap();
+        assert_eq!(rtx5090.get(backend, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "dflash2");
+        assert!(rtx5090.get(backend, Some(ModelFamily::FlashNext)).is_none(), "Flash-Next keeps speculation off here");
+
+        let lanes = field("spec", "decode_lanes").unwrap();
+        assert_eq!(rtx5090.get(lanes, None).unwrap().raw, "3", "Flash-Next-only; the 27B passes it over");
     }
 
     #[test]
