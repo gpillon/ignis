@@ -32,12 +32,16 @@ use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 /// `content` is a plain string or an array of OpenAI content parts
 /// (GitHub #175). The parts are parsed permissively so a malformed or
 /// unknown part reaches [`check_content_parts`] and is refused with a 400
-/// naming it, rather than failing deserialization.
+/// naming it, rather than failing deserialization. A `content` of `null`
+/// (or absent) is parsed the same way (GitHub #312): [`MessageContent::Null`]
+/// is the OpenAI replay shape of an assistant turn that only called tools,
+/// and [`check_content_parts`] refuses it on any other role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ChatMessage {
     /// The message role (`system`, `user`, `assistant`, `tool`, …).
     pub role: String,
     /// The message content.
+    #[serde(default)]
     pub content: MessageContent,
     /// A prior assistant turn's thinking trace (GitHub #68). Handed to the
     /// chat template whole (GitHub #185), which keeps it on turns after the
@@ -74,9 +78,13 @@ impl ChatMessage {
 }
 
 /// A message's `content`: the plain string, or OpenAI content parts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
+    /// `null` or absent (GitHub #312): renders as the empty string, valid
+    /// on an assistant message only.
+    #[default]
+    Null,
     /// The plain-string form.
     Text(String),
     /// The content-parts form, in wire order.
@@ -89,6 +97,7 @@ impl MessageContent {
     /// parts' [`template_text_parts`] joined.
     pub fn text(&self) -> String {
         match self {
+            Self::Null => String::new(),
             Self::Text(text) => text.clone(),
             Self::Parts(parts) => template_text_parts(parts).concat(),
         }
@@ -293,8 +302,16 @@ pub fn check_content_parts(messages: &[ChatMessage], vision: bool) -> Result<(),
     let refuse = |code, message: String| Err(ContentRejection { code, message });
     let parts = messages.iter().enumerate().filter_map(|(i, message)| match &message.content {
         MessageContent::Parts(parts) => Some((i, message, parts)),
-        MessageContent::Text(_) => None,
+        MessageContent::Text(_) | MessageContent::Null => None,
     });
+    if let Some((i, message)) =
+        messages.iter().enumerate().find(|(_, m)| m.content == MessageContent::Null && m.role != "assistant")
+    {
+        return refuse(
+            "invalid_request_error",
+            format!("message {i} content must be a string or an array of content parts, not null (role '{}')", message.role),
+        );
+    }
     for (i, _, parts) in parts.clone() {
         if parts.is_empty() {
             return refuse("invalid_request_error", format!("message {i} content must not be empty"));
@@ -846,6 +863,7 @@ impl SimpleTemplateProvider {
             let last = index + 1 == messages.len();
             let word = |word: &str| simple_token(&message.role, word);
             match &message.content {
+                MessageContent::Null => {}
                 MessageContent::Text(text) => tokens.extend(text.split_whitespace().map(word)),
                 MessageContent::Parts(parts) => {
                     for (at, part) in parts.iter().enumerate() {
@@ -986,6 +1004,28 @@ mod tests {
             processor_rejection(ProcessorError::PlaceholderMismatch("wrong image count")).code,
             "invalid_media"
         );
+    }
+
+    #[test]
+    fn null_or_absent_content_is_parsed_and_refused_on_every_role_but_assistant() {
+        // GitHub #312: the deserializer accepts it (no 422); the server's own
+        // check names the refusal.
+        for wire in [
+            serde_json::json!({ "role": "assistant", "content": null }),
+            serde_json::json!({ "role": "assistant" }),
+        ] {
+            let message: ChatMessage = serde_json::from_value(wire).unwrap();
+            assert_eq!(message.content, MessageContent::Null);
+            assert_eq!(message.content.text(), "");
+            assert_eq!(check_content_parts(&[message], false), Ok(()));
+        }
+        for role in ["user", "system", "tool", "developer"] {
+            let message: ChatMessage =
+                serde_json::from_value(serde_json::json!({ "role": role, "content": null })).unwrap();
+            let rejection = check_content_parts(&[msg("user", "hi"), message], false).unwrap_err();
+            assert_eq!(rejection.code, "invalid_request_error");
+            assert!(rejection.message.contains("message 1") && rejection.message.contains(role), "{rejection:?}");
+        }
     }
 
     #[test]

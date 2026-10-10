@@ -181,7 +181,7 @@ pub fn has_media(messages: &[ChatMessage]) -> bool {
         MessageContent::Parts(parts) => {
             parts.iter().any(|part| part.kind.as_deref() == Some("image_url") && part.url.is_some())
         }
-        MessageContent::Text(_) => false,
+        MessageContent::Text(_) | MessageContent::Null => false,
     })
 }
 
