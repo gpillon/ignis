@@ -283,3 +283,53 @@ async fn the_responses_api_refuses_media_parts_the_same_way() {
     .await;
     assert_refused(status, &body, "vision_disabled", &["message 0", "part 0"]);
 }
+
+// ── content: null (GitHub #312) ─────────────────────────────────────────
+
+fn tool_call(id: &str) -> Value {
+    json!({ "id": id, "type": "function", "function": { "name": "bash", "arguments": "{}" } })
+}
+
+#[tokio::test]
+async fn an_assistant_turn_with_null_content_is_accepted_like_an_empty_string() {
+    let history = |content: Value| {
+        json!([
+            { "role": "system", "content": "You are helpful." },
+            { "role": "user", "content": "Hi" },
+            { "role": "assistant", "content": content, "tool_calls": [tool_call("call_0")] },
+            { "role": "tool", "tool_call_id": "call_0", "content": "ok" }
+        ])
+    };
+    let (null_status, null_body) = chat(history(Value::Null)).await;
+    let (empty_status, empty_body) = chat(history(json!(""))).await;
+    assert_eq!(null_status, 200, "{null_body}");
+    assert_eq!(empty_status, 200, "{empty_body}");
+    assert_eq!(null_body["usage"], empty_body["usage"]);
+}
+
+#[tokio::test]
+async fn a_second_tool_round_with_null_and_absent_assistant_content_is_accepted() {
+    let (status, body) = chat(json!([
+        { "role": "user", "content": "Hi" },
+        { "role": "assistant", "content": null, "reasoning_content": "plan", "tool_calls": [tool_call("c1")] },
+        { "role": "tool", "tool_call_id": "c1", "content": "one" },
+        { "role": "assistant", "tool_calls": [tool_call("c2")] },
+        { "role": "tool", "tool_call_id": "c2", "content": "two" }
+    ]))
+    .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn null_content_on_any_other_role_is_a_named_400_not_a_422() {
+    for role in ["user", "system", "tool"] {
+        let (status, body) = chat(json!([
+            { "role": "user", "content": "Hi" },
+            { "role": role, "content": null }
+        ]))
+        .await;
+        assert_refused(status, &body, "invalid_request_error", &["message 1", role]);
+    }
+    let (status, body) = chat(json!([{ "role": "user" }])).await;
+    assert_refused(status, &body, "invalid_request_error", &["message 0", "user"]);
+}

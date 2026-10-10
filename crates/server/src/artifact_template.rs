@@ -611,6 +611,7 @@ fn json_kind(value: &JsonValue) -> &'static str {
 fn artifact_content(content: &MessageContent) -> ignis_artifact::MessageContent {
     use ignis_artifact::ContentPart as Part;
     match content {
+        MessageContent::Null => ignis_artifact::MessageContent::Text(String::new()),
         MessageContent::Text(text) => ignis_artifact::MessageContent::Text(text.clone()),
         MessageContent::Parts(parts) => {
             let mut out = Vec::with_capacity(parts.len());
@@ -1233,6 +1234,39 @@ You are a careful assistant.<|im_end|>
         assert_eq!(call.arguments, wire);
         assert_eq!(call.name, "edit");
         assert_eq!(call.id.as_deref(), Some("call_0"));
+    }
+
+    #[test]
+    fn a_null_content_assistant_turn_renders_the_same_prompt_as_an_empty_string() {
+        // GitHub #312: `content: null` is the replay shape of a tool-only
+        // assistant turn; its prompt must be byte-identical to `""` so the
+        // prompt-reuse prefix does not depend on the spelling.
+        let (_fixture, _reader, provider) = build_provider_with(REAL_TOOL_DIALECT_TEMPLATE);
+        let calls = vec![wire_tool_call("edit", r#"{"path":"a.rs"}"#)];
+        let assistant = |content: &str| {
+            let message: ChatMessage = serde_json::from_value(json!({
+                "role": "assistant", "content": content_json(content),
+                "reasoning_content": "thinking", "tool_calls": calls,
+            }))
+            .expect("wire message");
+            message
+        };
+        fn content_json(content: &str) -> JsonValue {
+            if content == "null" { JsonValue::Null } else { json!(content) }
+        }
+        let render = |m: ChatMessage| {
+            provider
+                .apply_chat_template(&[ChatMessage::text("user", "go"), m], &opts(), no_tools())
+                .expect("render")
+                .tokens
+        };
+        let null = render(assistant("null"));
+        assert_eq!(null, render(assistant("")));
+        let absent: ChatMessage = serde_json::from_value(json!({
+            "role": "assistant", "reasoning_content": "thinking", "tool_calls": calls,
+        }))
+        .expect("wire message");
+        assert_eq!(null, render(absent));
     }
 
     #[test]
