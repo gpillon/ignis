@@ -3,6 +3,11 @@
 ## Status
 
 Accepted (2026-09-19, owner decision — GitHub #234).
+**Amended** (2026-10-10) by ADR 0047: the registry becomes a catalog — a
+built-in one in the binary plus an operator's own file — with a configurable
+endpoint and token, every file pinned at a fixed revision, and a
+`model download` command. The option rejected below as "a `models.json`
+next to the binary" returns in that narrower form; the rest stands.
 
 ## Context
 

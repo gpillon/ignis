@@ -241,6 +241,32 @@ When output names a domain concept, use the term as defined here.
   is `hq-e8-2b` since #123 wired its prefill and decode attention routes and
   captured its decode graphs; a correctness oracle asks for `bf16` by name.
 
+## Models, catalog & download (ADR 0033, ADR 0047)
+
+- **Model family** — the architecture an artifact runs as (`Qwen3.8-27B`,
+  `Qwen3.8-Flash-Next`), read from the artifact's own header, never declared
+  beside it. It decides the forward program, the drafter and the family
+  scope. Several artifacts share one family: the 27B and its abliterated
+  variant are two artifacts of the same family.
+  _Avoid_: model (for the architecture)
+- **Served id** — the name a client puts in a request's `model` and
+  `GET /v1/models` reports: the operator's `model.id`, or the family's default
+  id when none is named. It tells artifacts of one family apart; the family
+  never does.
+  _Avoid_: model name
+- **Catalog** — the models the server knows how to fetch: the **built-in
+  catalog**, shipped inside the binary, plus the **operator catalog**, a
+  separate file the config names.
+  _Avoid_: registry (that word is the remote server, as in "a private
+  registry"), model list
+- **Catalog entry** — one published model: its served id, repo, revision, the
+  artifact to load, and every file it needs with its byte count and SHA-256
+  pinned. An operator entry never reuses a built-in id.
+- **Endpoint** — the server a catalog entry's files are fetched from: Hugging
+  Face by default, or a mirror answering the same repo/revision/file paths.
+  Chosen per machine, not per entry.
+  _Avoid_: registry, hub
+
 ## Prompt rendering
 
 - **Instruction message** — a chat message addressed to the model rather than
