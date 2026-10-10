@@ -1,4 +1,4 @@
-# Model download at start (`--no-model-download`, `--model-download-path`)
+# Model download at start (`--download-enabled`, `--download-path`)
 
 An `ignis-server` started on a machine that has no `.ninfer` artifact is
 useless: the operator gets the placeholder template and a mock backend, and
@@ -14,8 +14,8 @@ answer, so it downloads.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--model-download` / `--no-model-download` | `IGNIS_MODEL_DOWNLOAD` | on | May the server download a missing artifact at all |
-| `--model-download-path <dir>` | `IGNIS_MODEL_DOWNLOAD_PATH` | `./models` | Where a downloaded artifact lands |
+| `--download-enabled <bool>` | `IGNIS_DOWNLOAD_ENABLED` | on | May the server download a missing artifact at all |
+| `--download-path <dir>` | `IGNIS_DOWNLOAD_PATH` | `./models` | Where a downloaded artifact lands |
 
 The destination is **flat**, one file per model, exactly what
 `hf download <repo> <file> --local-dir models` produces:
@@ -26,8 +26,12 @@ already "found", and nothing is re-downloaded.
 
 ## Registry
 
+Since spec 02 (#313, ADR 0047) the registry is the catalog,
+`crates/server/src/download/catalog.yaml`, and every file of an entry is
+pinned; what follows is the table this spec shipped.
+
 One static table, `crates/server/src/download.rs`. The model id
-(`--model`, default `qwen3.8-27b`) is the key:
+(`--model-id`, default `qwen3.8-27b`) is the key:
 
 | Model | Repo | Artifact | Bytes | SHA-256 |
 |---|---|---|---|---|
@@ -39,22 +43,22 @@ it describes, so it can attest nothing about it.
 
 ## When the download happens
 
-The trigger is the *unset* `--artifact` case only, in a `--features cuda`
+The trigger is the *unset* `--model-artifact` case only, in a `--features cuda`
 build:
 
 ```
---artifact <path> given:
+--model-artifact <path> given:
   the path is the operator's word — a missing file refuses the start as it
-  always has, with one added hint line naming --model-download-path.
+  always has, with one added hint line naming --download-path.
 
---artifact unset, built with cuda:
+--model-artifact unset, built with cuda:
   <download-path>/<artifact file> exists  -> load it
   missing, downloads off                  -> placeholder + MockCompute (as today)
   missing, model not in the registry      -> placeholder + MockCompute (as today)
   missing, stdin is a TTY                 -> ask [y/N]; no -> placeholder
   missing, stdin is not a TTY             -> download, then load
 
---artifact unset, built without cuda:
+--model-artifact unset, built without cuda:
   placeholder + MockCompute, always. A binary that cannot run the model has
   no use for 19.4 GB of weights, and this is what keeps `make mock`,
   `cargo test` and every CPU CI job from ever touching the network.
@@ -67,7 +71,7 @@ build:
    and returns `Use` / `Download` / `Placeholder`; every cell of the table
    above is a unit test, with no filesystem and no network.
 2. **AC2 — flags and env resolve like every other knob.** Flag beats env
-   beats default, `IGNIS_MODEL_DOWNLOAD` accepts `1/true/on` and
+   beats default, `IGNIS_DOWNLOAD_ENABLED` accepts `1/true/on` and
    `0/false/off` (anything else refuses the start), and `--help` names both
    flags.
 3. **AC3 — the artifact is verified before it is used.** The download
@@ -90,7 +94,7 @@ build:
    `mk/windows/common.ps1` parses (the generated API key, the public URL); a
    question must not land among them. EOF on stdin reads as "no".
 7. **AC7 — the container default is documented.** README's artifact-less
-   `podman run` smoke test gains `--no-model-download`, and the flag table
+   `podman run` smoke test gains `--download-enabled false`, and the flag table
    and the `main.rs` module doc gain both flags.
 
 ## Seam

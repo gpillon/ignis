@@ -464,6 +464,21 @@ config_group! {
         /// Where a fetched model lands, and where one fetched earlier is
         /// found.
         path: Path = PathBuf::from(super::DEFAULT_MODEL_DOWNLOAD_PATH), NO_RULE, ALL, [Visible];
+        /// Where a fetched model's files come from: Hugging Face, or a mirror
+        /// answering its {repo}/resolve/{revision}/{file} route (an
+        /// Artifactory or Nexus proxy, a static server laid out the same
+        /// way). The pins still say whether the bytes are the published ones.
+        endpoint: Text = super::DEFAULT_DOWNLOAD_ENDPOINT.to_owned(), NO_RULE, ALL, [Visible];
+        /// Sent as `Authorization: Bearer` to the endpoint, never across a
+        /// redirect to another host. Unset, HF_TOKEN is sent to huggingface.co
+        /// and nothing to a mirror. Never shown by GET /v1/config or `config
+        /// print`.
+        token: Opt<Token> = None, NO_RULE, ALL;
+        /// An operator catalog: a YAML or JSON file of models fetched beside
+        /// the built-in ones, in the same format; an id the built-in catalog
+        /// has is refused. A relative path is read from the directory of the
+        /// config file that names it.
+        catalog: Opt<Path> = None, NO_RULE, ALL, [Visible];
     }
 }
 
@@ -622,6 +637,14 @@ mod tests {
     fn the_secret_is_hidden_and_the_sockets_are_not_patchable() {
         let api_key = field("server", "api_key").unwrap();
         assert!(!api_key.visible && !api_key.patchable);
+        // Spec model-download/02 AC 7: the download token is hidden as the
+        // key is, and no download field changes while the server runs.
+        let token = field("download", "token").unwrap();
+        assert!(!token.visible && !token.patchable);
+        for name in ["enabled", "path", "endpoint", "catalog"] {
+            let meta = field("download", name).unwrap();
+            assert!(meta.visible && !meta.patchable, "{name}");
+        }
         let bind = field("server", "bind").unwrap();
         assert!(bind.visible && !bind.patchable);
         for name in ["metrics_bind", "ui"] {

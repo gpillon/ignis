@@ -88,6 +88,11 @@ pub const DEFAULT_MODEL_DOWNLOAD: bool = true;
 /// models` done by hand and a download the server did are the same file.
 pub const DEFAULT_MODEL_DOWNLOAD_PATH: &str = "./models";
 
+/// Where a fetched model's files come from unless `--download-endpoint`
+/// names a mirror (spec model-download/02): Hugging Face, whose
+/// `{repo}/resolve/{revision}/{file}` route every mirror also answers.
+pub const DEFAULT_DOWNLOAD_ENDPOINT: &str = "https://huggingface.co";
+
 /// How long a model switch waits for the requests already running on the
 /// old model before it cuts them, in seconds (`--switch-drain-timeout`,
 /// spec model-switch/01): the grace window that gives a switch a finite
@@ -210,6 +215,18 @@ pub struct Config {
     /// for (`--download-path`, GitHub #234). Flat, one file per model: the
     /// artifact and its sidecar keep the names the repo publishes them under.
     pub model_download_path: PathBuf,
+    /// Where a fetched model's files come from (`--download-endpoint`, spec
+    /// model-download/02): Hugging Face, or a mirror answering its route.
+    pub download_endpoint: String,
+    /// The token sent to [`Config::download_endpoint`] (`--download-token`).
+    /// `None`: `HF_TOKEN` for Hugging Face itself, nothing for a mirror
+    /// ([`crate::download::bearer_token`]). Its `Debug` never shows it.
+    pub download_token: Option<ApiKey>,
+    /// The operator catalog (`--download-catalog`, ADR 0047): the path
+    /// resolved, a relative one against the directory of the config file
+    /// that named it. Loaded at start and by every `model` subcommand, not
+    /// here: resolution reads no file but the config.
+    pub download_catalog: Option<PathBuf>,
     /// Flash-Next's n-gram hot-row cache between loads (`--ngram-persist` /
     /// `--ngram-persist-path`): on, beside the model, unless the operator
     /// says otherwise.
@@ -504,6 +521,9 @@ pub enum ConfigOutcome {
     Print(String),
     /// A config file to write (`config generate --out`, `config patch`).
     Write { path: PathBuf, contents: String },
+    /// A model to fetch, or the catalog to list (`model download` / `model
+    /// list`, spec model-download/02), for `main` to run.
+    Model(crate::download::ModelCommand),
 }
 
 /// A configuration the server refuses: an unrecognized flag, a value that
@@ -536,11 +556,11 @@ pub const PROFILE_ENV: &str = "IGNIS_PROFILE";
 /// Resolve the command line against `env` and `files`.
 ///
 /// A first word that is not a flag is a verb (`help`, `version`, `config
-/// generate|print|patch`, [`cli`]); otherwise the server starts — the bare
-/// invocation is unchanged, so `make start`'s command line needs no leading
-/// word. `--help`/`-h` and `--version`/`-V` short-circuit before any other
-/// flag is parsed or validated — `ignis-server --help --nonsense` just
-/// prints help.
+/// generate|print|patch`, `model download|list`, [`cli`]); otherwise the
+/// server starts — the bare invocation is unchanged, so `make start`'s
+/// command line needs no leading word. `--help`/`-h` and `--version`/`-V`
+/// short-circuit before any other flag is parsed or validated —
+/// `ignis-server --help --nonsense` just prints help.
 ///
 /// Every family-scoped value is resolved here too, for each family, so a
 /// mistake in one (`--qwen38flashnext-model-max-context lots`) is refused at
@@ -556,9 +576,10 @@ pub fn resolve_with(
         Some("help") => return cli::help(&args[1..]),
         Some("version") => return Ok(ConfigOutcome::Version(version_text())),
         Some("config") => return cli::config(&args[1..], &env, files),
+        Some("model") => return cli::model(&args[1..], &env, files),
         Some(word) if !word.starts_with('-') => {
             return Err(ConfigError(format!(
-                "unknown command `{word}` (the commands are help, version and config; with none, the server starts)"
+                "unknown command `{word}` (the commands are help, version, config and model; with none, the server starts)"
             )));
         }
         _ => {}
@@ -570,14 +591,22 @@ pub fn resolve_with(
             _ => {}
         }
     }
+    start_config(args, &env, files).map(ConfigOutcome::Config)
+}
+
+/// The configuration a start reads from `args` (field flags, `--config`,
+/// `--profile`): the config file `--config` / `IGNIS_CONFIG` names or
+/// discovery finds, the environment, the profile — shared with the `model`
+/// subcommands, which act on exactly what a start would.
+pub(crate) fn start_config(args: &[String], env: &dyn Fn(&str) -> Option<String>, files: &dyn file::Files) -> Result<Config, ConfigError> {
     let parsed = source::parse_args(args)?;
     let named = parsed.config.clone().or_else(|| env(CONFIG_ENV).filter(|path| !path.is_empty()));
     let choice = match named {
         Some(path) => FileChoice::Explicit(PathBuf::from(path)),
         None => FileChoice::Discover,
     };
-    let (sources, _) = gather(parsed, &env, files, choice)?;
-    Config::from_sources(sources).map(ConfigOutcome::Config)
+    let (sources, _) = gather(parsed, env, files, choice)?;
+    Config::from_sources(sources)
 }
 
 /// Which config file a resolution reads.
@@ -877,6 +906,8 @@ fn derive(
         (_, api_key) => api_key.clone(),
     };
 
+    let download_catalog = derive_download(sources, &resolution, &spelled)?;
+
     let mut model = s.model.id.clone().unwrap_or_else(|| DEFAULT_MODEL.to_owned());
     let mut speculation = speculation;
     if let (true, Some(family)) = (family_checks, family) {
@@ -891,6 +922,9 @@ fn derive(
         artifact: s.model.artifact.clone(),
         model_download: s.download.enabled,
         model_download_path: s.download.path.clone(),
+        download_endpoint: s.download.endpoint.clone(),
+        download_token: s.download.token.clone(),
+        download_catalog,
         ngram_cache: ignis_core::ngram_cache::PersistenceOptions {
             enabled: s.ngram.persist,
             location: s.ngram.persist_path.clone(),
@@ -1005,6 +1039,48 @@ fn derive_vram(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> String)
         }
         Some(budget_bytes) => Ok(VramMode::Explicit { budget_bytes, allow_oversubscription: s.allow_oversubscription }),
     }
+}
+
+/// `--download-endpoint` and `--download-catalog` (spec model-download/02):
+/// the endpoint must be an http(s) URL, refused here rather than at the
+/// first fetch; the catalog's path is returned resolved.
+///
+/// A relative catalog path is the config file's word about a file beside
+/// it, so it is read from that file's directory — a config file and its
+/// catalog are copied between machines together. One named by a flag or an
+/// env var is the shell's, and stays relative to the working directory. The
+/// settings keep the path as written, so `config print` and a written-back
+/// file never turn it into another machine's absolute path.
+fn derive_download(
+    sources: &Sources,
+    resolution: &Resolution,
+    spelled: &impl Fn(&str, &str) -> String,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let s = &resolution.settings.download;
+    // The endpoint is a visible field: it reaches `GET /v1/config`, `config
+    // print`, logs and errors, so a credential, a query or a fragment in it
+    // is refused, and the refusal never echoes the URL it refuses.
+    let endpoint = reqwest::Url::parse(&s.endpoint).ok();
+    if !endpoint.as_ref().is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host()) {
+        return Err(ConfigError(format!(
+            "`{}` must be an http(s) URL, such as the default {DEFAULT_DOWNLOAD_ENDPOINT}",
+            spelled("download", "endpoint")
+        )));
+    }
+    if endpoint.is_some_and(|url| !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some()) {
+        return Err(ConfigError(format!(
+            "`{}` must not carry a username, password, query or fragment: it is shown by `config print` and `GET /v1/config`; the token goes in `{}`",
+            spelled("download", "endpoint"),
+            spelled("download", "token")
+        )));
+    }
+    let from_file = resolution
+        .origin("download", "catalog")
+        .is_some_and(|origin| matches!(origin.source, source::Source::File | source::Source::Profile));
+    Ok(s.catalog.as_ref().map(|path| match sources.file_source.path().and_then(std::path::Path::parent) {
+        Some(dir) if from_file && path.is_relative() => dir.join(path),
+        _ => path.clone(),
+    }))
 }
 
 /// `--spec-backend`, `--spec-draft-tokens` and `--spec-draft-head` (P5-02,
@@ -1208,6 +1284,8 @@ pub fn help_text() -> String {
          \x20   ignis-server config generate [--format json|yaml] [--out <path>] [--force] [--dry-run] [FIELD FLAGS]\n\
          \x20   ignis-server config print [--file <path>] [--format json|yaml] [FIELD FLAGS]\n\
          \x20   ignis-server config patch [--file <path>] [--out <path>] [FIELD FLAGS]\n\
+         \x20   ignis-server model download [<id>...] [--all] [--out <dir>] [FIELD FLAGS]\n\
+         \x20   ignis-server model list [--format text|json] [FIELD FLAGS]\n\
          \n\
          Every field has a flag (--<group>-<field>), an env var (IGNIS_<GROUP>_<FIELD>)\n\
          and a config-file key (<group>.<field>). Precedence, highest first: flag, env\n\

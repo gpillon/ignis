@@ -1798,6 +1798,70 @@ fn help_lists_both_model_download_flags() {
     assert!(text.contains("--download-enabled") && text.contains("--download-path"), "{text}");
 }
 
+/// Spec model-download/02 AC 4: the endpoint, the token and the catalog are
+/// fields like any other — a flag, an env var and a file key each, the flag
+/// winning — and the endpoint must be a URL the transfer can use.
+#[test]
+fn the_download_endpoint_token_and_catalog_are_declared_fields() {
+    let defaults = config(&[]);
+    assert_eq!(defaults.download_endpoint, DEFAULT_DOWNLOAD_ENDPOINT);
+    assert_eq!((defaults.download_token, defaults.download_catalog), (None, None));
+    let env = env_map(&[
+        ("IGNIS_DOWNLOAD_ENDPOINT", "https://artifactory.example.com/api/huggingfaceml/hf"),
+        ("IGNIS_DOWNLOAD_TOKEN", "tok-env"),
+        ("IGNIS_DOWNLOAD_CATALOG", "/srv/acme.catalog.yaml"),
+    ]);
+    let from_env = expect_config(resolve(&[], &env).expect("resolve"));
+    assert_eq!(from_env.download_endpoint, "https://artifactory.example.com/api/huggingfaceml/hf");
+    assert_eq!(from_env.download_token.as_ref().map(ApiKey::as_str), Some("tok-env"));
+    assert_eq!(from_env.download_catalog, Some(PathBuf::from("/srv/acme.catalog.yaml")));
+    let flags = expect_config(resolve(&args(&["--download-endpoint", "http://10.0.0.5:8080", "--download-token", "tok-flag"]), &env).expect("resolve"));
+    assert_eq!(flags.download_endpoint, "http://10.0.0.5:8080");
+    assert_eq!(flags.download_token.as_ref().map(ApiKey::as_str), Some("tok-flag"));
+    assert!(!format!("{flags:?}").contains("tok-flag"), "a config dumped into a log line never shows the token");
+    let file = MemFiles::with(&[("c.yaml", "download:\n  endpoint: https://mirror.example.com\n  token: tok-file\n")]);
+    let from_file = expect_config(resolve_with(&args(&["--config", "c.yaml"]), no_env, &file).expect("resolve"));
+    assert_eq!(from_file.download_endpoint, "https://mirror.example.com");
+    assert_eq!(from_file.download_token.as_ref().map(ApiKey::as_str), Some("tok-file"));
+    for bad in ["ftp://mirror.example.com", "mirror.example.com", "https://", "ftp://user:hunter2@mirror.example.com"] {
+        let err = refused(&["--download-endpoint", bad]);
+        assert!(err.contains("--download-endpoint") && err.contains("http(s) URL"), "{bad}: {err}");
+        assert!(!err.contains("hunter2"), "{bad}: the refusal echoes the URL: {err}");
+    }
+    // A credential, a query or a fragment would reach `GET /v1/config`, `config
+    // print` and the logs: refused, and the refusal never repeats the secret.
+    for bad in ["https://user:hunter2@mirror.example.com", "https://hunter2@mirror.example.com", "https://:hunter2@mirror.example.com", "https://mirror.example.com/hf?token=hunter2", "https://mirror.example.com/hf#hunter2"] {
+        let err = refused(&["--download-endpoint", bad]);
+        assert!(err.contains("--download-endpoint") && err.contains("username, password, query or fragment"), "{bad}: {err}");
+        assert!(!err.contains("hunter2"), "{bad}: the refusal echoes the secret: {err}");
+    }
+}
+
+/// Spec model-download/02 AC 3: a relative `download.catalog` in a config
+/// file is read beside that file; from a flag or an env var, from the
+/// working directory; an absolute one as it is. The setting keeps the path
+/// as written.
+#[test]
+fn a_relative_catalog_path_resolves_against_the_config_file_that_set_it() {
+    let files = MemFiles::with(&[("conf/ignis.config.yaml", "download:\n  catalog: acme.catalog.yaml\n")]);
+    let from_file = expect_config(resolve_with(&args(&["--config", "conf/ignis.config.yaml"]), no_env, &files).expect("resolve"));
+    assert_eq!(from_file.download_catalog, Some(PathBuf::from("conf").join("acme.catalog.yaml")));
+    assert_eq!(from_file.settings().download.catalog, Some(PathBuf::from("acme.catalog.yaml")), "written as given");
+    let flagged = expect_config(
+        resolve_with(&args(&["--config", "conf/ignis.config.yaml", "--download-catalog", "acme.catalog.yaml"]), no_env, &files).expect("resolve"),
+    );
+    assert_eq!(flagged.download_catalog, Some(PathBuf::from("acme.catalog.yaml")));
+    let from_env = expect_config(
+        resolve_with(&args(&["--config", "conf/ignis.config.yaml"]), env_map(&[("IGNIS_DOWNLOAD_CATALOG", "acme.catalog.yaml")]), &files).expect("resolve"),
+    );
+    assert_eq!(from_env.download_catalog, Some(PathBuf::from("acme.catalog.yaml")));
+    let absolute = std::env::temp_dir().join("acme.catalog.yaml");
+    let text = format!("download:\n  catalog: '{}'\n", absolute.display());
+    let files = MemFiles::with(&[("conf/ignis.config.yaml", &text)]);
+    let config = expect_config(resolve_with(&args(&["--config", "conf/ignis.config.yaml"]), no_env, &files).expect("resolve"));
+    assert_eq!(config.download_catalog, Some(absolute));
+}
+
 // ── Prometheus metrics (GitHub #89, ADR 0017) ────────────────────────────
 
 #[test]

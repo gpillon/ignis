@@ -462,6 +462,28 @@ impl FieldKind for ApiKeyKind {
     }
 }
 
+/// A credential the server sends to someone else (`download.token`, spec
+/// model-download/02), kept as typed in an [`ApiKey`], whose `Debug` never
+/// shows it. Unlike [`ApiKeyKind`] no word is special: `auto` is a token
+/// like any other. Written back as typed, in clear text, wherever the operator
+/// asked for a config to be written: a file, but also `config generate` to
+/// stdout and `--dry-run`, as for `server.api_key`; `GET /v1/config` and
+/// `config print` never show this kind's field.
+pub struct Token;
+
+impl FieldKind for Token {
+    type Value = ApiKey;
+    const TAG: &'static str = "token";
+
+    fn parse(raw: &str) -> Result<ApiKey, String> {
+        Ok(ApiKey::new(raw))
+    }
+
+    fn render(value: &ApiKey) -> Value {
+        Value::String(value.as_str().to_owned())
+    }
+}
+
 /// The speculative backend (P5-02, GitHub #150, #307): `dflash2` (the 27B's
 /// drafter), `mtp` (Flash-Next's head), or `off`.
 pub struct SpecBackend;
@@ -777,6 +799,15 @@ mod tests {
         let fixed = ApiKeyKind::parse("sk-secret").unwrap();
         assert!(!format!("{fixed:?}").contains("sk-secret"));
         round_trips::<ApiKeyKind>(fixed);
+    }
+
+    #[test]
+    fn a_token_is_kept_as_typed_and_debug_never_shows_it() {
+        let token = Token::parse("hf_secret").unwrap();
+        assert_eq!(token.as_str(), "hf_secret");
+        assert!(!format!("{token:?}").contains("hf_secret"));
+        assert_eq!(Token::parse("auto").unwrap().as_str(), "auto", "no word is special");
+        round_trips::<Token>(token);
     }
 
     #[test]

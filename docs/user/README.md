@@ -80,32 +80,141 @@ SHA-256. Both are compiled for `SM120a` only. The Linux tarball needs the CUDA
 ## The model
 
 The engine loads a `.ninfer` artifact: weights, tokenizer and chat template in
-one container, verified against its `.sha256` sidecar at load. A mismatch
-refuses the start.
+one container, verified against its provenance sidecar (`.graft.json` or
+`.conversion.json`) at load. A mismatch refuses the start.
+
+### The catalog
+
+The models the server knows how to fetch are its **catalog**
+([ADR 0047](../adr/0047-a-catalog-the-operator-can-extend.md)). Three are built
+into the binary, each pinned file by file — byte count and SHA-256 — at a fixed
+revision of its Hugging Face repository:
+
+| Id | Repository | Size |
+|---|---|---|
+| `qwen3.8-27b` (the default) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer) | 18.1 GiB |
+| `qwen3.8-27b-abliterated` | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | 18.1 GiB |
+| `qwen3.8-flash-next` | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 67.8 GiB (with its MTP companion) |
+
+The id is the **served id**: what `--model-id` names, what `/v1/models`
+reports and what a request puts in `model`. `ignis-server model list` shows
+every entry and how much of it is on disk:
+
+```
+ignis-server model list                 # id, built-in or operator, repo@revision, size, complete/partial/absent, family
+ignis-server model list --format json
+```
+
+### Fetching one: `ignis-server model download`
+
+```
+ignis-server model download                          # the configured --model-id (qwen3.8-27b by default)
+ignis-server model download qwen3.8-flash-next       # one or more ids
+ignis-server model download --all                    # every entry
+ignis-server model download qwen3.8-27b --out /mnt/usb   # somewhere other than --download-path
+```
+
+Every file of the entry — the artifact, its sidecar, Flash-Next's companion
+container — is streamed to a `.part` file, checked against the size and
+SHA-256 pinned in the catalog, and renamed into place only then, small files
+first. An interrupted download resumes from its `.part`; a tampered one is
+discarded. A file already at its name with its pinned size is kept; one with
+another size is refused and left alone. The command never asks, ignores
+`--download-enabled`, and needs no GPU: a build without `cuda` fetches as well.
+Progress goes to stderr, the artifact paths to stdout, and the exit code is 0
+only when every entry verified. It reads the same configuration a start does
+(config file, environment, flags).
+
+A model fetched into a running server's `--download-path` is switchable at
+once: a request naming its id switches the server to it, as a
+`--switch-known-models` entry would (`--switch-allow-implicit`, on by default;
+an explicit `--switch-known-models` entry wins for its id). A request naming a
+catalog id that is not on disk is refused as an unknown model — a switch never
+starts a download.
 
 ### Letting the server fetch it
 
-A GPU build started **without** `--model-artifact` / `IGNIS_MODEL_ARTIFACT` looks for the
-model under `--download-path` (default `./models`, flat, under the names
-the repository publishes) and fetches it when it is not there
+A GPU build started **without** `--model-artifact` / `IGNIS_MODEL_ARTIFACT`
+looks for the `--model-id` entry's artifact under `--download-path` (default
+`./models`, flat, under the names the repository publishes) and fetches the
+whole entry when it is not there
 ([ADR 0033](../adr/0033-the-server-fetches-its-own-model.md)):
 
 ```
-ignis-server                      # asks first: the size, the source, the destination
-ignis-server --download-enabled false  # never fetches: the placeholder template and the CPU mock
+ignis-server                                      # asks first: the size, the source, the destination
+ignis-server --model-id qwen3.8-flash-next        # the same, for another catalog entry
+ignis-server --download-enabled false             # never fetches: the placeholder template and the CPU mock
 ignis-server --download-path /weights
 ```
 
-On a terminal you are asked (`[y/N]`, on stderr); without one — a container, a
-daemon, CI — nobody can answer, so it downloads. What it fetches is
-`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`: the artifact and its
-`.graft.json` sidecar, streamed to a `.part` file, checked against the size and
-SHA-256 pinned in the binary, and renamed into place only then. An interrupted
-download resumes; a tampered one is discarded and refuses the start. A build
-without `--features cuda` never downloads weights it could not run.
+On a terminal you are asked (`[y/N]`, on stderr, naming the endpoint the bytes
+come from); without one — a container, a daemon, CI — nobody can answer, so it
+downloads, through the same verified transfer as `model download`. A failed
+fetch refuses the start. A build without `--features cuda` never downloads
+weights it could not run.
 
-A `hf download … --local-dir models` done by hand and a download the server did
-land on the same file names, so either satisfies the other.
+A `model download` and a download the server did land on the same file names —
+as does a `hf download <repo> --revision <rev> --local-dir models` done by
+hand — so any of them satisfies the others.
+
+### Where the bytes come from: endpoint and token
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--download-endpoint <url>` | `IGNIS_DOWNLOAD_ENDPOINT` | `https://huggingface.co` | The server a file is fetched from, as `{endpoint}/{repo}/resolve/{revision}/{file}` — Hugging Face, or any mirror answering the same route. |
+| `--download-token <token>` | `IGNIS_DOWNLOAD_TOKEN` | unset | Sent as `Authorization: Bearer …` to the endpoint. Never shown by `GET /v1/config` or `config print`, never logged. |
+| `--download-catalog <path>` | `IGNIS_DOWNLOAD_CATALOG` | unset | An operator catalog ([below](#your-own-models-an-operator-catalog)). |
+
+The token is `--download-token` when it is set; otherwise `HF_TOKEN`, but only
+when the endpoint is `huggingface.co` itself — a personal Hugging Face
+credential is never handed to a mirror. No token is sent across a redirect to
+another host (Hugging Face sends a large file from its CDN). None of the three
+can be changed by `PATCH /v1/config`.
+
+### Your own models: an operator catalog
+
+`--download-catalog` names a YAML or JSON file in the built-in catalog's own
+format. Its entries are added after the built-in ones, fetched and verified the
+same way, and listed as `operator`:
+
+```yaml
+models:
+  - id: acme-qwen3.8-27b-ft          # the served id
+    repo: acme/qwen-ft-ninfer          # <owner>/<name>
+    revision: v1                       # commit, tag or branch; required
+    artifact: acme_ft.ninfer           # the file the server loads
+    files:                             # every file, all pinned
+      - { name: acme_ft.ninfer.graft.json, bytes: 48211,       sha256: 9c1e… }
+      - { name: acme_ft.ninfer,            bytes: 19406942468, sha256: abb1… }
+```
+
+The whole file is refused — the start, and every `model` command — when it
+cannot be read, or when an entry has an unknown key, an empty or duplicate id
+(case-insensitive), **an id the built-in catalog already has**, a `repo` not of
+the form `<owner>/<name>`, an empty `revision`, an `artifact` not among its
+`files`, no sidecar (the artifact's name plus `.graft.json` or
+`.conversion.json`), a `sha256` that is not 64 lowercase hex digits, a `bytes`
+of 0, or a file name that is not a plain name (a path separator, `..`, an
+absolute path). A relative `--download-catalog` set in a config file is read
+from that file's directory; from a flag or an env var, from the working
+directory.
+
+A built-in id cannot be re-pinned by a file: a mirror of the owner's models is
+an endpoint, a variant of them a new id.
+
+### Air-gapped machines
+
+- **Files carried in.** On any machine with a network — no GPU needed —
+  `ignis-server model download <id> --out <dir>`, then copy `<dir>` into the
+  air-gapped machine's `--download-path`. The server finds the files there and
+  fetches nothing.
+- **A mirror.** An Artifactory or Nexus Hugging Face proxy, or a static server
+  laid out as `{repo}/resolve/{revision}/{file}`:
+  `--download-endpoint https://mirror.corp/hf` (and `--download-token` if it
+  needs one). No catalog is needed: the built-in pins still say whether the
+  bytes are the owner's.
+- **Your own models.** An operator catalog (above), with the endpoint that
+  serves them.
 
 ### Pointing at one you already have
 
@@ -114,32 +223,32 @@ set IGNIS_MODEL_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer   # Windows
 export IGNIS_MODEL_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
 ```
 
+A named path is the operator's word: missing, it refuses the start, and it is
+never matched against the catalog. Served with no `--model-id`, it takes its
+family's default id.
+
 The artifact carries a grafted DFlash2 drafter module, which `--spec-backend dflash2`
 loads for speculative decoding and which costs no VRAM when speculation is off.
 
 ### The uncensored variant
 
-[`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer)
-is the same image with the
+`qwen3.8-27b-abliterated` is the same image with the
 [huihui-ai abliteration](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated)
 applied. It is the same container: 1,255 of the 1,325 objects are
 byte-identical to the default image, and only the 70 matrices the abliteration
 changed are re-encoded. **It does not refuse**, so put the guardrails in the
 tool layer.
 
-The server never fetches it on its own. Download it next to the default image
-and point at it:
-
 ```
-hf download gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer --local-dir models
-ignis-server --model-artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
+ignis-server model download qwen3.8-27b-abliterated
+ignis-server --model-id qwen3.8-27b-abliterated   # found under --download-path, fetched when it is not there
 make dev UNCENSORED=1   # the same, from a checkout
 ```
 
-The model id stays `qwen3.8-27b` unless `--model-id` names another one. The
-pointing heads and the DFlash2 drafter load unchanged. They were fitted to the
-default weights, and the target still verifies every draft, so the drafter
-can only change the acceptance rate.
+It is served as `qwen3.8-27b-abliterated`, so a client can tell it from the
+27B. The pointing heads and the DFlash2 drafter load unchanged. They were
+fitted to the default weights, and the target still verifies every draft, so
+the drafter can only change the acceptance rate.
 
 ---
 
@@ -207,11 +316,13 @@ use once it has taken.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--model-id <id>` | `IGNIS_MODEL_ID` | `qwen3.8-27b` | The loaded model id: what `/v1/models` reports, what submissions must name, and the key the download registry is looked up by. |
+| `--model-id <id>` | `IGNIS_MODEL_ID` | `qwen3.8-27b` | The loaded model id: what `/v1/models` reports, what submissions must name, and the [catalog](#the-catalog) entry fetched when no artifact is named. |
 | `--server-bind <addr>` | `IGNIS_SERVER_BIND` | `127.0.0.1:8000` | The API listener's address. |
 | `--model-artifact <path>` | `IGNIS_MODEL_ARTIFACT` | unset | The `.ninfer` container. Must exist and verify, or the server refuses to start. Unset: the model is looked for under `--download-path`, and fetched when it is not there. |
 | `--download-enabled <bool>` | `IGNIS_DOWNLOAD_ENABLED` | on | Fetch a missing model. Only consulted with `--model-artifact` unset, and only in a `--features cuda` build. |
 | `--download-path <dir>` | `IGNIS_DOWNLOAD_PATH` | `./models` | Where a fetched model lands, and where one fetched earlier is found. |
+| `--download-endpoint`, `--download-token`, `--download-catalog` | `IGNIS_DOWNLOAD_*` | | Where a model is fetched from, with which token, and an operator catalog ([above](#where-the-bytes-come-from-endpoint-and-token)). |
+| `model download` / `model list` | — | — | Fetch catalog entries, or list them ([above](#fetching-one-ignis-server-model-download)). |
 | `--server-request-timeout <secs>` | `IGNIS_SERVER_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | `--switch-drain-timeout <secs>` | `IGNIS_SWITCH_DRAIN_TIMEOUT` | `30` (max `3600`) | How long a model switch lets the old model's running requests finish before it cancels them (`0` cancels at once). |
 | `--switch-allow-implicit <true\|false>` | `IGNIS_SWITCH_ALLOW_IMPLICIT` | `true` | A request whose `model` names another model `--switch-known-models` lists switches the server to it, then is served on it. `false`: such a request is a `404 model_not_found`, as an unknown model is. `POST /v1/models/switch` is not affected. |
@@ -1039,7 +1150,7 @@ and the YaRN table that stretches the envelope to match (the gate legs ran at
 prints its budget and directory). `SPEC=` turns
 speculation off. `VISION=1` loads the tower; `UNCENSORED=1` loads
 [the uncensored variant](#the-uncensored-variant) in place of the default
-image; `ROPE_SCALING=yarn:4` rescales the
+image, served as `qwen3.8-27b-abliterated`; `ROPE_SCALING=yarn:4` rescales the
 envelope further (`none` keeps the trained table); `METRICS=1` starts the metrics listener; `API_KEY=` and `EXPOSE=` set
 the access flags; `ARGS='…'` passes anything verbatim.
 

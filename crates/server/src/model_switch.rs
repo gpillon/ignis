@@ -48,6 +48,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -194,13 +195,52 @@ pub struct Switcher {
     /// model is refused by name, as it always was. A live `PATCH
     /// /v1/config` may change it.
     known: Mutex<BTreeMap<String, PathBuf>>,
+    /// The catalog a request's `model` is looked up in when `known` does not
+    /// name it ([`Switcher::with_catalog`]), and whether it is — off with
+    /// `--switch-allow-implicit false`, which a live `PATCH /v1/config` may
+    /// change. Kept apart from `known` on purpose: `known` is the operator's
+    /// list, written back to the config file; the catalog's contribution is
+    /// derived, never written anywhere.
+    catalog: Option<CatalogModels>,
+    catalog_on: AtomicBool,
+}
+
+/// A catalog's entries as known models (spec model-download/02 §Known
+/// models): an entry whose artifact is under `dir` **when a request names
+/// it**, so a `model download` into a running server's `download.path` makes
+/// it switchable with no restart — and one not there is refused as an
+/// unknown model is, since a switch never starts a download.
+#[derive(Debug, Clone)]
+pub struct CatalogModels {
+    /// The merged catalog the server started with.
+    pub catalog: Arc<crate::download::Catalog>,
+    /// `download.path`.
+    pub dir: PathBuf,
+}
+
+impl CatalogModels {
+    /// The artifact a request naming `model` would switch to: the entry
+    /// whose id it is, exactly as a known model's is matched, once its
+    /// artifact is on disk.
+    fn artifact(&self, model: &str) -> Option<PathBuf> {
+        let entry = self.catalog.entries().iter().find(|entry| entry.id == model)?;
+        let path = entry.artifact_path(&self.dir);
+        path.is_file().then_some(path)
+    }
 }
 
 impl Switcher {
     /// Switch with `loader`, giving the old model's requests `drain_timeout`
     /// to finish (`--switch-drain-timeout`).
     pub fn new(loader: Arc<dyn ModelLoader>, drain_timeout: Duration) -> Self {
-        Self { loader, drain_timeout: Mutex::new(drain_timeout), running: Mutex::new(None), known: Mutex::new(BTreeMap::new()) }
+        Self {
+            loader,
+            drain_timeout: Mutex::new(drain_timeout),
+            running: Mutex::new(None),
+            known: Mutex::new(BTreeMap::new()),
+            catalog: None,
+            catalog_on: AtomicBool::new(false),
+        }
     }
 
     /// Let a request naming one of `known`'s ids switch to it
@@ -210,12 +250,22 @@ impl Switcher {
         self
     }
 
-    /// Change the drain window and the known models of a running server (a
-    /// live `PATCH /v1/config`, spec config-v2/02): the next switch reads
-    /// them; one already under way keeps what it began with.
-    pub fn set_knobs(&self, drain_timeout: Duration, known: BTreeMap<String, PathBuf>) {
+    /// Let a request naming a catalog entry whose artifact is on disk switch
+    /// to it too, when `on` (`--switch-allow-implicit`). An explicit
+    /// known-models entry wins for its id.
+    pub fn with_catalog(self, catalog: CatalogModels, on: bool) -> Self {
+        self.catalog_on.store(on, Ordering::SeqCst);
+        Self { catalog: Some(catalog), ..self }
+    }
+
+    /// Change the drain window, the known models and whether the catalog is
+    /// consulted, on a running server (a live `PATCH /v1/config`, spec
+    /// config-v2/02): the next switch reads them; one already under way
+    /// keeps what it began with.
+    pub fn set_knobs(&self, drain_timeout: Duration, known: BTreeMap<String, PathBuf>, catalog_on: bool) {
         *self.drain_timeout.lock().expect("drain timeout lock") = drain_timeout;
         *self.known.lock().expect("known models lock") = known;
+        self.catalog_on.store(catalog_on, Ordering::SeqCst);
     }
 
     /// The drain window a switch beginning now gets.
@@ -223,14 +273,23 @@ impl Switcher {
         *self.drain_timeout.lock().expect("drain timeout lock")
     }
 
-    /// Every model a request may switch to by naming it, with its artifact.
+    /// Every model the operator's list and the start make switchable, with
+    /// its artifact — the catalog's entries apart, since which of them are
+    /// switchable is decided on disk at each request.
     pub fn known_models(&self) -> BTreeMap<String, PathBuf> {
         self.known.lock().expect("known models lock").clone()
     }
 
-    /// The artifact a request naming `model` would switch to, if it is known.
+    /// The artifact a request naming `model` would switch to, if it is known:
+    /// the known models' entry for it, else a catalog entry on disk.
     fn known(&self, model: &str) -> Option<PathBuf> {
-        self.known.lock().expect("known models lock").get(model).cloned()
+        if let Some(listed) = self.known.lock().expect("known models lock").get(model) {
+            return Some(listed.clone());
+        }
+        if !self.catalog_on.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.catalog.as_ref()?.artifact(model)
     }
 }
 

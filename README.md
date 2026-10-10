@@ -272,20 +272,22 @@ carrying the DFlash2 drafter:
 | **Uncensored** | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | `qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer` |
 
 The server fetches the standard one by itself the first time it starts without
-a model, and checks its size and SHA-256 before using it. To download either one
-by hand:
+a model, and checks every file's size and SHA-256 before using it. To download
+either one ahead of time — no GPU needed, `--out <dir>` for a machine with no
+network:
 
 ```
-hf download gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer --local-dir models
-hf download gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer --local-dir models
+ignis-server model download qwen3.8-27b
+ignis-server model download qwen3.8-27b-abliterated
 ```
 
 The uncensored image is the standard one with the
 [huihui-ai abliteration](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated)
 applied: 1,255 of its 1,325 objects are byte-identical, and only the 70 matrices
-the abliteration changed are re-encoded. The server never downloads it on its
-own; start it with `--model-artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer`,
-or `make dev UNCENSORED=1` from a checkout. **It does not refuse**, so put the
+the abliteration changed are re-encoded. Start it with `--model-id
+qwen3.8-27b-abliterated` (fetched like the standard one when it is not on disk),
+or `make dev UNCENSORED=1` from a checkout; it is served under that id, so a
+client can tell the two apart. **It does not refuse**, so put the
 guardrails in the application or tool layer and do not expose it to untrusted
 users.
 

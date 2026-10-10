@@ -96,6 +96,14 @@ async fn main() {
                 exit_after_flush(&logging_handle, 1);
             }
         },
+        // `model download` / `model list` (spec model-download/02): the
+        // artifact paths or the listing on stdout, progress on stderr — a
+        // line at a time, never through the log, which shares stdout.
+        Ok(ConfigOutcome::Model(command)) => {
+            let progress: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line: &str| eprintln!("{line}"));
+            let code = download::command::run(command, &mut std::io::stdout(), progress).await;
+            exit_after_flush(&logging_handle, code);
+        }
         Err(err) => {
             tracing::error!(name: "ignis.config.invalid", error = %err, "refusing to start");
             exit_after_flush(&logging_handle, 1);
@@ -119,6 +127,9 @@ async fn main() {
         artifact,
         model_download,
         model_download_path,
+        download_endpoint,
+        download_token,
+        download_catalog,
         // Read by the load, through `start_options`.
         ngram_cache: _,
         // GitHub #306: read through `EngineShape`, like the other load-shape
@@ -186,6 +197,17 @@ async fn main() {
         },
     };
 
+    // The catalog (ADR 0047): the built-in entries, and the operator's file
+    // when `--download-catalog` names one — read now, so a catalog that is
+    // missing or malformed refuses the start whatever the start then needs.
+    let catalog = match download::catalog::load(&config::file::RealFiles, download_catalog.as_deref()) {
+        Ok(catalog) => Arc::new(catalog),
+        Err(err) => {
+            tracing::error!(name: "ignis.config.catalog_invalid", error = %err, "refusing to start");
+            exit_after_flush(&logging_handle, 1);
+        }
+    };
+
     // Where the artifact comes from (GitHub #234, ADR 0033): the path the
     // operator named, one already under `--download-path`, one fetched
     // now, or none at all — which is the placeholder start this server has
@@ -200,9 +222,10 @@ async fn main() {
             // fetched, so it never fetches them: this is what keeps
             // `make mock`, `cargo test` and every CPU CI job off the network.
             supported: cfg!(feature = "cuda"),
+            catalog: &catalog,
         },
         |path| path.exists(),
-        download::ask_on_terminal,
+        |entry, path| download::ask_on_terminal(entry, path, &download_endpoint),
     );
     let artifact = match source {
         download::ArtifactSource::Use(path) => Some(path),
@@ -221,20 +244,22 @@ async fn main() {
             // end in a verified artifact refuses the start: coming up on the
             // mock instead would be exactly the silent degradation the loader
             // path below refuses for an unclean checksum.
-            let downloader = match download::Downloader::huggingface() {
+            let token = download::bearer_token(&download_endpoint, download_token.as_ref(), std::env::var("HF_TOKEN").ok().as_deref());
+            let downloader = match download::Downloader::new(&download_endpoint, token) {
                 Ok(downloader) => downloader,
                 Err(err) => {
                     tracing::error!(name: "ignis.model.download_failed", error = %err, "refusing to start");
                     exit_after_flush(&logging_handle, 1);
                 }
             };
-            match downloader.fetch(entry, &dir).await {
+            match downloader.fetch(&entry, &dir).await {
                 Ok(path) => Some(path),
                 Err(err) => {
                     tracing::error!(
                         name: "ignis.model.download_failed",
-                        model = entry.model,
-                        repo = entry.repo,
+                        model = %entry.id,
+                        repo = %entry.repo,
+                        endpoint = %download_endpoint,
                         error = %err,
                         "refusing to start"
                     );
@@ -305,12 +330,17 @@ async fn main() {
         known_models = %known.keys().cloned().collect::<Vec<_>>().join(","),
         "a request naming one of these models, other than the loaded one, switches the server to it"
     );
+    // Spec model-download/02 §Known models: a catalog entry whose artifact is
+    // under `--download-path` when a request names it is switchable too, so
+    // a `model download` into this directory needs no restart.
+    let catalog_models = ignis_server::model_switch::CatalogModels { catalog, dir: model_download_path.clone() };
     let server = server.with_switcher(
         ignis_server::model_switch::Switcher::new(
             Arc::new(ignis_server::model_switch::ArtifactLoader::sharing(Arc::clone(&config_state))),
             std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
         )
-        .with_known_models(known),
+        .with_known_models(known)
+        .with_catalog(catalog_models, allow_model_switch),
     )
     .with_config(config_state);
 

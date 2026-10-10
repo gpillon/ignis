@@ -1,0 +1,40 @@
+# The built-in catalog (ADR 0047, spec model-download/02): the owner's
+# releases, compiled into the binary with `include_str!` and parsed by the
+# same code as an operator's catalog. Its pins are the trust anchor ADR 0033
+# made them: nothing outside the binary can change them.
+#
+# Every value is the Hugging Face API's at the pinned revision: a large
+# file's sha256 is its LFS oid, a sidecar's was computed from the file served
+# at that revision. Files are listed small first. Adding one of the owner's
+# models is an entry here and a new binary.
+models:
+  - id: qwen3.8-27b
+    repo: gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer
+    revision: "e961b419b672e183aa55df8c4b975abc82006e8a"
+    artifact: qwen3_8_27b_nvfp4full-v2.ninfer
+    files:
+      - { name: qwen3_8_27b_nvfp4full-v2.ninfer.graft.json, bytes: 6981, sha256: "b87e3c005fb1daf7d6b208da52790f95a3f478732f767f87417a5d7fc23491d1" }
+      - { name: qwen3_8_27b_nvfp4full-v2.ninfer, bytes: 19406942468, sha256: "abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af" }
+
+  # The 27B with the huihui-ai abliteration: the same family, told apart by
+  # its served id.
+  - id: qwen3.8-27b-abliterated
+    repo: gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer
+    revision: "ef3216949e42c42fc713feffb2e05849d57f0f3b"
+    artifact: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
+    files:
+      - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer.graft.json, bytes: 41707, sha256: "09b0df892c314563192b0a4f102139939d4ef6261fcd210439d4e2636d12e6fe" }
+      - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer, bytes: 19406942468, sha256: "18954280c794cb2ff1fc24ada8158de1df11bf0a0a2ea63f109045af48905ef1" }
+
+  # Flash-Next with its MTP companion container, which the loader finds
+  # beside the main one under its fixed name: an entry is the release, so the
+  # companion comes with it even when MTP is off.
+  - id: qwen3.8-flash-next
+    repo: gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis
+    revision: "8d94db83cd8e58d6be31e796723e5e35b960638c"
+    artifact: qwen3_8_flash_next_trellis_a25-v2.ninfer
+    files:
+      - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json, bytes: 179029, sha256: "a5b2c10fe0745cfe6b8e2914135e44903cfb80acb3f0db21e549e76641f14127" }
+      - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer.conversion.json, bytes: 1183942, sha256: "9858d9fb03dd66fa2558b5dc6aa6463ee70f00024ffbd746545b231c9514f7a0" }
+      - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer, bytes: 1037905920, sha256: "432fe5c0838027047c5b46c4fde526f3d3ef3d126f00fed1213921f8705988d2" }
+      - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer, bytes: 71760711680, sha256: "12e3b265b0678ba935a4b05d1b612ba4b68b3a96c3026d818ad65838985fd864" }
