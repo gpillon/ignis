@@ -14,10 +14,16 @@ use super::file::read_document;
 use super::source::Layer;
 use super::ConfigError;
 
-/// The profile used when nothing names one: the owner's RTX 5090, whose
-/// numbers are the hardcoded defaults — so an unset `--profile` changes
-/// nothing on that machine.
+/// The profile used when nothing names one: the owner's own card, measured
+/// (below). An unset `--profile` is this one, not "no profile" — for that,
+/// name [`NONE_PROFILE`].
 pub const DEFAULT_PROFILE: &str = "rtx5090";
+
+/// `--profile none` / `IGNIS_PROFILE=none`: skip the profile layer
+/// entirely, hardcoded defaults only. Not a name [`lookup`] resolves — a
+/// config file's `profiles:` may not define one by this name either, since
+/// it would never be reachable (`gather` checks for it first).
+pub const NONE_PROFILE: &str = "none";
 
 /// The built-in profiles, as a config file's `profiles:` section.
 ///

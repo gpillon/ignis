@@ -303,7 +303,20 @@ fn set(layer: &mut Layer, meta: &'static FieldMeta, family: Option<ModelFamily>,
 /// start reading it back resolves the same values. What `config generate`
 /// and `config print` write and `GET /v1/config` shows.
 pub fn effective_document(config: &Config) -> Value {
-    let general = config.settings().render();
+    let mut general = config.settings().render();
+    // A field only one family takes is never written at the general scope,
+    // even when that family's own value is the one it already has there:
+    // the general section is read by every family, and this one refuses it
+    // outright (the same rule `config patch` already writes by, GitHub
+    // #311's family-section fix). Removing it here first is what turns its
+    // ordinary "does the scoped value differ from the general one" check,
+    // below, into "yes" unconditionally for this field -- no second rule
+    // needed.
+    for meta in all_fields().filter(|meta| meta.home_family().is_some()) {
+        if let Some(group) = general.get_mut(meta.group).and_then(Value::as_object_mut) {
+            group.remove(meta.name);
+        }
+    }
     let mut changes = Vec::new();
     for family in FAMILIES {
         let Ok(resolution) = resolve_settings(config.basis.sources(), Some(family), Fit::Switch) else {

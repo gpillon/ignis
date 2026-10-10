@@ -1050,7 +1050,7 @@ mod tests {
         // uses (`config::resolve`) and the one the GPU tests use
         // (`EngineShape::default`).
         let crate::config::ConfigOutcome::Config(config) =
-            crate::config::resolve(&[], |_| None).expect("resolve")
+            crate::config::resolve(&["--profile".to_owned(), "none".to_owned()], |_| None).expect("resolve")
         else {
             panic!("expected a runnable config");
         };
