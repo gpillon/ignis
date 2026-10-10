@@ -301,15 +301,15 @@ config_group! {
         /// round per chunk, 50 splits time evenly.
         decode_share: Opt<Percent> = None, between(0, 99), ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// Whether a request that says nothing thinks.
-        enable_thinking: Bool = true, NO_RULE, ALL, [Visible, Patchable, Scoped];
+        enable_thinking: Bool = true, NO_RULE, ALL, [Visible, Patchable];
         /// The reasoning_effort of a request that names none. Unset, the
         /// template's own default.
         reasoning_effort: Opt<Effort> = None, Validator::OneOf(&["none", "minimal", "low", "medium", "high", "xhigh", "max"]), ALL,
-            [Visible, Patchable, Scoped];
+            [Visible, Patchable];
         /// The reasoning tokens a request may spend before the model's close
         /// is forced; `off` = no budget. A request's own thinking_budget
         /// overrides it.
-        thinking_budget: ThinkingBudget = Some(super::DEFAULT_THINKING_BUDGET), NO_RULE, ALL, [Visible, Patchable, Scoped];
+        thinking_budget: ThinkingBudget = Some(super::DEFAULT_THINKING_BUDGET), NO_RULE, ALL, [Visible, Patchable];
         /// The text rotary table: `none` (the linear table) or
         /// `yarn:F[,t=..][,bf=..][,bs=..]`, which rescales the checkpoint's
         /// trained 262,144-position envelope — what a context past it needs.

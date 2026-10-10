@@ -211,13 +211,13 @@ pub(super) async fn plan(
     let id = question.id.as_str();
     let within = question.within.clone().unwrap_or_default();
     // A last `choice` names up to sixteen candidates and "none".
-    if server.alphabet.len() < SHORTLIST_LEN + 1 {
+    if server.active().alphabet.len() < SHORTLIST_LEN + 1 {
         return Err(Refusal::new(
             "alphabet_exhausted",
             format!(
                 "question {id:?}: a locate's labelled `choice` names up to {} options, and this model's tokenizer can name only {}",
                 SHORTLIST_LEN + 1,
-                server.alphabet.len()
+                server.active().alphabet.len()
             ),
         ));
     }
@@ -347,7 +347,7 @@ async fn open_text(
     }
     let segments = whole.keys.len();
     let around = (whole.ready.prompt_tokens as usize).saturating_sub(whole.span.len());
-    let window = (calibration.window_keys as usize).min((server.engine.max_model_len() as usize).saturating_sub(around));
+    let window = (calibration.window_keys as usize).min((server.active().engine.max_model_len() as usize).saturating_sub(around));
     if whole.span.len() <= window {
         within_context(server, id, &whole)?;
         let LocatePrompt { ready, span, keys, .. } = whole;
@@ -681,7 +681,7 @@ pub(super) async fn answer_all(
             template[index] = kept.first().copied().unwrap_or(0);
             continue;
         }
-        let step = choice_step(&question.id, &question.instruction, &server.alphabet, kept.len(), None);
+        let step = choice_step(&question.id, &question.instruction, &server.active().alphabet, kept.len(), None);
         let labels: Vec<String> = step.options.iter().map(|option| option.name.clone()).collect();
         let lines: Vec<String> = kept.iter().map(|&t| one_line(&folded.fold.level1[t])).collect();
         let evidence = Evidence::Json(OrderedValue::String(labelled(&lines, &labels)));
@@ -883,7 +883,7 @@ async fn last_request(
     };
     question.stats.candidates.push(segments.clone());
     let labels: Vec<String> =
-        server.alphabet.take(segments.len()).expect("checked at plan").iter().map(|answer| answer.label.clone()).collect();
+        server.active().alphabet.take(segments.len()).expect("checked at plan").iter().map(|answer| answer.label.clone()).collect();
     let (text, segments) = match (question.kind, &question.steps) {
         (Kind::Prose, Steps::Read) => in_paragraphs(&question.texts, &segments, &labels),
         _ => {
@@ -891,12 +891,12 @@ async fn last_request(
             (labelled(&lines, &labels), segments)
         }
     };
-    let mut steps = vec![choice_step(&question.id, &question.instruction, &server.alphabet, segments.len(), None)];
+    let mut steps = vec![choice_step(&question.id, &question.instruction, &server.active().alphabet, segments.len(), None)];
     if question.finds() {
         let none = if question.kind == Kind::Prose { NONE_SENTENCE } else { NONE_LINE };
-        steps.push(choice_step(&question.id, &question.instruction, &server.alphabet, segments.len(), Some(none)));
+        steps.push(choice_step(&question.id, &question.instruction, &server.active().alphabet, segments.len(), Some(none)));
         if question.compression == Compression::TemplateFold {
-            steps.push(found_step(&question.id, &question.instruction, &server.alphabet));
+            steps.push(found_step(&question.id, &question.instruction, &server.active().alphabet));
         }
     }
     let evidence = Evidence::Json(OrderedValue::String(text));

@@ -165,6 +165,15 @@ pub(crate) fn previous_response_not_found(id: &JsonValue) -> Response {
     )
 }
 
+/// Switch to the model `req` names when it is another model this server
+/// knows, and wait until it serves ([`api::switch_to_named_model`]), before
+/// anything else of `req` is read — the over-HTTP and the WebSocket path
+/// alike. On the server every handler shares, ahead of the pin [`prepare`]'s
+/// callers take.
+pub(crate) async fn switch_to_named_model(server: &Server, req: &CreateResponse) -> Result<(), Response> {
+    api::switch_to_named_model(server, req.model.as_deref()).await
+}
+
 /// Validate `req`, map its items (after `history`, a continued response's
 /// conversation) onto chat messages, and render and prepare the request as
 /// chat completions would. `warm_up` submits it as a warm-up request.
@@ -260,7 +269,7 @@ pub(crate) async fn prepare(
         prompt_tokens = block;
     }
 
-    let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
+    let starts_in_reasoning = server.active().template.decoder_starts_in_reasoning(&thinking);
     let response = ResponseObject {
         id: String::new(),
         object: "response",
@@ -294,7 +303,7 @@ pub(crate) async fn prepare(
         items,
         start: ResponseStart {
             response,
-            decoder: OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
+            decoder: OutputDecoder::new(server.active().template.token_decoder(), starts_in_reasoning),
             schemas,
             prompt_tokens,
         },

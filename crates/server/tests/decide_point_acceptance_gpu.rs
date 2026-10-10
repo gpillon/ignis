@@ -242,10 +242,14 @@ fn load(path: &Path, shape: EngineShape) -> Option<Loaded> {
     let server = Server::new(engine, Box::new(provider))
         .with_media(Arc::new(acquirer))
         .with_request_timeout(Duration::from_secs(600));
-    let calibration = server.calibration.expect("the served artifact is calibrated");
+    let calibration = server.active().calibration.expect("the served artifact is calibrated");
     assert!(calibration.set.is_some(), "with a head set beside its pointing head");
-    let mut pointing_only = server.clone();
-    pointing_only.calibration = Some(ignis_core::pointing::Calibration { set: None, ..calibration });
+    // Its own copy of the loaded model, not a clone of the server: clones
+    // share one active model (spec model-switch/01), and only this one
+    // forgets the head set.
+    let mut model = ignis_server::ActiveModel::clone(&server.active());
+    model.calibration = Some(ignis_core::pointing::Calibration { set: None, ..calibration });
+    let pointing_only = Server::from_active(model).with_request_timeout(Duration::from_secs(600));
     Some(Loaded {
         app: server.app(),
         pointing_only: pointing_only.app(),

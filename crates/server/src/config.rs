@@ -706,6 +706,18 @@ impl Config {
     }
 }
 
+/// The patch naming a model switch's target (spec model-switch/01): its
+/// artifact and the id it is served under, over everything else — the form
+/// [`Config::with_patch`] takes, so the target's options are resolved again
+/// from their sources like any other change rather than set on a struct.
+pub fn target_patch(artifact: &std::path::Path, model: &str) -> Result<source::Layer, ConfigError> {
+    let mut patch = source::Layer::default();
+    let field = |name| schema::field("model", name).expect("a declared field");
+    patch.set(field("artifact"), None, source::Candidate { raw: artifact.display().to_string(), spelling: "the switch target's artifact".to_owned() })?;
+    patch.set(field("id"), None, source::Candidate { raw: model.to_owned(), spelling: "the switch target's model".to_owned() })?;
+    Ok(patch)
+}
+
 /// The id a load of `family` is served under, or why `config` cannot start
 /// on it ([`Config::for_family`]).
 pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, ConfigError> {

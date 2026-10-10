@@ -2,7 +2,8 @@
 //! auth).
 //!
 //! v1 surface (server-01, `docs/design/ignis-v1.md` §2):
-//! - `GET /v1/models` — the loaded model.
+//! - `GET /v1/models` — the loaded model; `POST /v1/models/switch` replaces
+//!   it without a restart (spec model-switch/01).
 //! - `POST /v1/chat/completions` — chat completions (streaming +
 //!   non-streaming); requests route into the core scheduler and tokens
 //!   stream back as they are generated.
@@ -70,6 +71,18 @@
 //! - `IGNIS_SERVER_REQUEST_TIMEOUT` / `--server-request-timeout` — how long a
 //!   non-streaming completion waits before the handler gives up with a
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
+//! - `IGNIS_SWITCH_DRAIN_TIMEOUT` / `--switch-drain-timeout` — how long a
+//!   model switch lets the old model's running requests finish before it
+//!   cancels them (default 30 seconds, max 3600, 0 cancels at once — spec
+//!   model-switch/01). A switch loads its target on the flags the server
+//!   started with, leaving off the ones only the other model takes.
+//! - `IGNIS_SWITCH_ALLOW_IMPLICIT` / `--switch-allow-implicit <true|false>` and
+//!   `IGNIS_SWITCH_KNOWN_MODELS` / `--switch-known-models <id>=<path>` (repeatable; the env
+//!   var takes `;`-separated pairs) — a request whose `model` names another
+//!   listed model switches the server to it and is then served on it (default
+//!   on; spec model-switch/01 §Implicit switch). The model the server starts
+//!   on is always listed; off, or unlisted, such a request is a `404
+//!   model_not_found`, as it always was.
 //! - `--server-ui` / `--server-ui false` / `IGNIS_SERVER_UI` — serve the Playground at `/ui/`
 //!   (GitHub #163, ADR 0026); **on** by default. A binary built without
 //!   `web/dist` serves the page that says how to build it, so the default
@@ -92,38 +105,16 @@
 
 use std::sync::Arc;
 
-use ignis_core::{
-    compute::ModelFamily,
-    mock::MockCompute,
-    Compute, ConcreteScheduler, Scheduler, SchedulerConfig,
-};
 use ignis_server::{
     config::{self, Config, ConfigOutcome},
     download,
     engine::Engine,
-    loader,
+    load::mock_scheduler,
     template::SimpleTemplateProvider,
     telemetry::SystemClock,
     thinking::{self, ThinkingDefaults},
-    Server,
+    ActiveModel, Server,
 };
-
-/// The mock-backed scheduler (ADR 0006, CPU-only): used whenever no
-/// artifact is configured, or the binary was not built with
-/// `--features cuda` — the entrypoint never silently blocks startup on a
-/// missing GPU backend.
-fn mock_scheduler(model: &str, default_max_tokens: u32) -> Box<dyn Scheduler> {
-    let compute: Arc<dyn Compute> = Arc::new(MockCompute::new());
-    Box::new(ConcreteScheduler::with_config(
-        SchedulerConfig {
-            model: model.into(),
-            // ADR 0045: the operator's default cap holds on the mock too.
-            default_max_tokens,
-            ..SchedulerConfig::default()
-        },
-        compute,
-    ))
-}
 
 /// Flush pending logging before an immediate exit (GitHub #80): every
 /// "refusing to start" path calls this instead of a bare
@@ -134,107 +125,6 @@ fn mock_scheduler(model: &str, default_max_tokens: u32) -> Box<dyn Scheduler> {
 fn exit_after_flush(logging_handle: &ignis_logging::LoggingHandle, code: i32) -> ! {
     logging_handle.flush(ignis_logging::SHUTDOWN_FLUSH_TIMEOUT);
     std::process::exit(code);
-}
-
-/// Build the real GPU-backed scheduler for `artifact_path` (GitHub #61 /
-/// P1-25). Requires `generation_config.json` to carry `eos_token_id` — a
-/// backend that can never stop on EOS would silently run every request to
-/// its `max_tokens` cap, so a missing one is a load failure like the
-/// checksum / sidecar checks above it, not a silent default.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn cuda_scheduler(
-    artifact_path: &std::path::Path,
-    model: &str,
-    family: ModelFamily,
-    frontend: &ignis_artifact::FrontendSet,
-    shape: ignis_server::runtime::EngineShape,
-    vision_item_bound: Option<u64>,
-    thinking_close: Option<std::sync::Arc<ignis_core::thinking_budget::ThinkingClose>>,
-    logging_handle: &ignis_logging::LoggingHandle,
-    ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
-    kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
-) -> (Box<dyn Scheduler>, ignis_server::metrics::LoadReservations) {
-    let eos = match frontend.eos_token_id() {
-        Some(eos) => eos,
-        None => {
-            tracing::error!(
-                name: "ignis.model.eos_missing",
-                artifact = %artifact_path.display(),
-                "generation_config.json has no eos_token_id — refusing to start"
-            );
-            exit_after_flush(logging_handle, 1);
-        }
-    };
-    // The encoder holds one item at a time, and the processor bounds an item
-    // below the envelope (`ProcessorOptions::max_item_tokens`): the load
-    // sizes the encoder's workspace for that.
-    let shape = ignis_server::runtime::EngineShape {
-        vision: shape.vision.map(|vision| match vision_item_bound {
-            // Never above the processor's request budget, the u32 envelope.
-            Some(bound) => vision.with_item_max_tokens(u32::try_from(bound).expect("an item bound is at most the envelope")),
-            None => vision,
-        }),
-        ..shape
-    };
-    // GitHub #302: a Flash-Next artifact runs its own program and leaf.
-    let loaded = match family {
-        ModelFamily::FlashNext => {
-            ignis_server::runtime::flash_next_scheduler_with_ngram_cache(
-                artifact_path,
-                model.into(),
-                eos,
-                shape,
-                thinking_close,
-                ngram_cache,
-                kv_disk_location,
-            )
-        }
-        ModelFamily::Qwen38_27b => ignis_server::runtime::cuda_scheduler_with_thinking_close(
-            artifact_path,
-            model.into(),
-            eos,
-            shape.with_family_decode_share(ModelFamily::Qwen38_27b),
-            thinking_close,
-            kv_disk_location,
-        ),
-    };
-    match loaded {
-        Ok((scheduler, reserved)) => {
-            tracing::info!(
-                name: "ignis.model.loaded",
-                artifact = %artifact_path.display(),
-                eos,
-                prefill_chunk = shape.prefill_chunk,
-                max_context = shape.max_context,
-                kv_format = shape.kv_format.as_str(),
-                speculation = %shape.speculation.map_or_else(
-                    || "off".to_owned(),
-                    |s| format!(
-                        "{} draft_tokens={} draft_head={}",
-                        s.backend().as_str(),
-                        s.draft_tokens(),
-                        s.proposal_head().as_str()
-                    )
-                ),
-                vision = %shape.vision.map_or_else(
-                    || "off".to_owned(),
-                    |v| format!("max_tokens={} item_max_tokens={}", v.max_tokens(), v.item_max_tokens())
-                ),
-                "model loaded on the GPU"
-            );
-            (Box::new(scheduler), reserved)
-        }
-        Err(err) => {
-            tracing::error!(
-                name: "ignis.model.load_failed",
-                artifact = %artifact_path.display(),
-                error = %err,
-                "refusing to start"
-            );
-            exit_after_flush(logging_handle, 1);
-        }
-    }
 }
 
 #[tokio::main]
@@ -290,12 +180,12 @@ async fn main() {
     // before anything is loaded, so it is in the log even when the load then
     // fails.
     config::log_source(&config);
-    // What the loaded model's family fits once the artifact names it
-    // (`Config::for_family`, spec flash-next/04 and config-v2/01): every
-    // load-shape value below is read from that fitted config, so a value
-    // scoped to the artifact's family (`--qwen38flashnext-…`) is the one the
-    // load runs with. The fields destructured here are the server's own,
-    // which no family changes.
+    // The start options a load reads (`load::prepare_model`), which fits
+    // them to the artifact's family once it names one (`Config::for_family`,
+    // spec flash-next/04 and config-v2/01): a value scoped to that family is
+    // the one the load runs with, and the engine shape (GitHub #87) is read
+    // from the fitted config. A model switch loads every later model from
+    // the same options, fitted to its own family.
     let start_options = config.clone();
     let Config {
         model,
@@ -304,24 +194,27 @@ async fn main() {
         artifact,
         model_download,
         model_download_path,
-        // The load's shape: read from the fitted config, through
-        // `EngineShape` and the loader.
+        // Read by the load, through `start_options`.
         ngram_cache: _,
+        // GitHub #306: read through `EngineShape`, like the other load-shape
+        // knobs.
         ngram_hot_bytes: _,
+        // Spec vram-budget/03: the budget through `EngineShape`, the
+        // location handed to the loader through `start_options`.
         kv_disk_bytes: _,
         kv_disk_location: _,
-        enable_thinking: _,
-        reasoning_effort: _,
-        thinking_budget: _,
+        enable_thinking: default_enable_thinking,
+        reasoning_effort: default_reasoning_effort,
+        thinking_budget: default_thinking_budget,
         prefill_chunk: _,
         decode_share_percent: _,
         max_context: _,
-        default_max_tokens: _,
+        default_max_tokens,
         kv_format: _,
         kv_pool: _,
         vram: _,
         allow_expert_cache_below_floor: _,
-        host_pool_bytes: _,
+        host_pool_bytes,
         prompt_reuse: _,
         retained_device_slots: _,
         retained_host_slots: _,
@@ -332,19 +225,21 @@ async fn main() {
         speculation_off: _,
         draft_rows: _,
         decode_lanes: _,
+        // Read by the load, through `start_options`.
         vision: _,
+        // GitHub #227: read through `EngineShape`, like the other load-shape
+        // knobs.
         rope_scaling: _,
         media: _,
         request_timeout_secs,
-        // The model switch's knobs (spec model-switch/01): nothing in this
-        // binary switches models yet.
-        switch_drain_timeout_secs: _,
-        allow_model_switch: _,
-        known_models: _,
+        switch_drain_timeout_secs,
+        allow_model_switch,
+        known_models,
         ui,
         metrics,
         api_key,
         expose,
+        // What the options were resolved from: the load fits them again.
         basis: _,
     } = config;
     let api_key = match api_key {
@@ -426,186 +321,59 @@ async fn main() {
 
     // GitHub #216 (ADR 0030 §Observability): what the load's VRAM plan
     // reserved, kept past the load so `/metrics` can name it. `None` on the
-    // placeholder path, which loads no model and plans no device memory.
-    // `mut` only under `cuda`: the placeholder path never assigns it.
-    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    // placeholder path, which loads no model and plans no device memory, and
+    // on a build without `cuda`, which plans none either.
     let mut load_reservations: Option<ignis_server::metrics::LoadReservations> = None;
-    let (server, loaded) = if let Some(artifact_path) = &artifact {
-        // The loader path (server-03, GitHub #21): the `.ninfer` container
-        // named by `--model-artifact`/`IGNIS_MODEL_ARTIFACT` is loaded through the
-        // verified loader — open the reader, load the sidecar (ADR 0002),
-        // verify the checksum report, and only then extract the frontend
-        // set. A missing sidecar or a report that is not clean is a load
-        // failure: serving a broken artifact would silently degrade to the
-        // placeholder, so the server refuses to start instead.
-        //
-        // A path that is not there at all gets its own line (GitHub #234):
-        // the sidecar error below would otherwise name a file next to a file
-        // that does not exist, and say nothing about the download that could
-        // have produced it.
-        if !artifact_path.exists() {
-            tracing::error!(
-                name: "ignis.artifact.missing",
-                artifact = %artifact_path.display(),
-                model = %model,
-                "no such file — refusing to start; drop --model-artifact/IGNIS_MODEL_ARTIFACT to fetch the model into --download-path instead"
-            );
-            exit_after_flush(&logging_handle, 1);
-        }
-        let sidecar = match loader::find_sidecar(artifact_path) {
-            Ok(path) => path,
-            Err(err) => {
-                tracing::error!(
-                    name: "ignis.artifact.sidecar_missing",
-                    artifact = %artifact_path.display(),
-                    error = %err,
-                    "refusing to start"
-                );
-                exit_after_flush(&logging_handle, 1);
-            }
-        };
-        let frontend = match loader::load_artifact(artifact_path, &sidecar) {
-            Ok(frontend) => {
-                tracing::info!(
-                    name: "ignis.artifact.verified",
-                    artifact = %artifact_path.display(),
-                    "checksum clean — tokenizer + chat template loaded"
-                );
-                frontend
-            }
-            Err(err) => {
-                tracing::error!(
-                    name: "ignis.artifact.load_failed",
-                    artifact = %artifact_path.display(),
-                    error = %err,
-                    "refusing to start"
-                );
-                exit_after_flush(&logging_handle, 1);
-            }
-        };
-
-        // ADR 0043: the artifact names its model, and the start options meet
-        // it in one place, which decides the served id or refuses the start
-        // naming the model (spec flash-next/04). An artifact of neither model
-        // is served as the 27B always was.
-        let family = match loader::artifact_family(artifact_path) {
-            Ok(family) => family.unwrap_or(ModelFamily::Qwen38_27b),
-            Err(err) => {
-                tracing::error!(
-                    name: "ignis.artifact.load_failed",
-                    artifact = %artifact_path.display(),
-                    error = %err,
-                    "refusing to start"
-                );
-                exit_after_flush(&logging_handle, 1);
-            }
-        };
-        let loaded = match start_options.for_family(family) {
+    let server = if let Some(artifact_path) = &artifact {
+        // The loader path (server-03, GitHub #21), shared with the model
+        // switch (spec model-switch/01): the `.ninfer` container named by
+        // `--model-artifact`/`IGNIS_MODEL_ARTIFACT` is verified — sidecar present,
+        // checksum report clean — named, checked against the start options,
+        // and only then loaded. Any refusal stops the start: serving a broken
+        // artifact would silently degrade to the placeholder.
+        let loaded = ignis_server::load::prepare_model(&start_options, artifact_path)
+            .and_then(ignis_server::load::load_model);
+        let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(err) => {
-                tracing::error!(name: "ignis.config.model_mismatch", error = %err, "refusing to start");
+                err.log(artifact_path, "refusing to start");
                 exit_after_flush(&logging_handle, 1);
             }
         };
-        let model = loaded.model.clone();
-
-        // The thinking budget's forced close (2026-09-24), in this model's
-        // own tokens. A tokenizer that splits `</think>` leaves every budget
-        // inert: with a default budget configured that is a refused start
-        // (spec server/08), since the operator would believe one is active;
-        // without one it is said once here rather than discovered per
-        // request.
-        let thinking_close = thinking::thinking_close(|text| {
-            frontend.tokenizer().encode(text).map_err(|e| e.to_string())
-        });
-        if let Err(err) = thinking::check_default_budget_close(loaded.thinking_budget, &thinking_close) {
-            tracing::error!(name: "ignis.config.thinking_budget_inert", error = %err, "refusing to start");
-            exit_after_flush(&logging_handle, 1);
-        }
-        let thinking_close = match thinking_close {
-            Ok(close) => Some(Arc::new(close)),
-            Err(error) => {
-                tracing::warn!(name: "ignis.model.thinking_close_unavailable", %error, "thinking budgets are inert");
-                None
-            }
-        };
-        // Only the GPU backend forces the close; the mock never reasons.
-        #[cfg(not(feature = "cuda"))]
-        let _ = thinking_close;
-
-        // GitHub #179: a `--vision-enabled` load prepares images with the artifact's
-        // processor and acquires them before admission. A tokenizer whose
-        // placeholder ids are not the model contract's is a refused start.
-        // Built before the load, which sizes the encoder for the processor's
-        // item bound.
-        let processor = match loaded.vision.map(|v| ignis_server::media::load_processor(&frontend, v, loaded.max_context)) {
-            None => None,
-            Some(Ok(processor)) => Some(processor),
-            Some(Err(err)) => {
-                tracing::error!(name: "ignis.vision.processor_invalid", error = %err, "refusing to start");
-                exit_after_flush(&logging_handle, 1);
-            }
-        };
-
-        #[cfg(feature = "cuda")]
-        let scheduler = {
-            let item_bound = processor.as_ref().map(|p| p.options().max_item_tokens());
-            // The engine shape (GitHub #87), already validated by the
-            // fit above, so nothing below can fail on an unaligned chunk
-            // width or a pool that cannot serve the configured context.
-            let (scheduler, reserved) = cuda_scheduler(
-                artifact_path,
-                &model,
-                family,
-                &frontend,
-                ignis_server::runtime::EngineShape::from(&loaded),
-                item_bound,
-                thinking_close,
-                &logging_handle,
-                loaded.ngram_cache.clone(),
-                &loaded.kv_disk_location,
-            );
-            // GitHub #216: what the plan reserved leaves the load here, so
-            // the exposition can name it. The placeholder path below builds
-            // no plan and leaves this `None`.
-            load_reservations = Some(reserved);
-            scheduler
-        };
-        #[cfg(not(feature = "cuda"))]
-        let scheduler = {
-            tracing::warn!(
-                name: "ignis.model.mock_compute",
-                "built without --features cuda — MockCompute despite --model-artifact/IGNIS_MODEL_ARTIFACT (the templated text is real, the completions are not)"
-            );
-            mock_scheduler(&model, loaded.default_max_tokens)
-        };
-
-        let engine = Engine::with_clock(scheduler, Arc::new(SystemClock));
-        let provider = ignis_server::artifact_template::ArtifactTemplateProvider::new(frontend);
-        let server = match processor {
-            None => Server::new(engine, Box::new(provider)),
-            Some(processor) => {
-                let media = loaded.media;
-                let acquirer = ignis_server::media::MediaAcquirer::new(
-                    Arc::new(processor.clone()),
-                    processor.options().clone(),
-                    ignis_server::media::MediaPolicy::new(media.allow_private_network, media.cache_bytes),
-                );
-                Server::new(engine, Box::new(provider.with_vision(processor))).with_media(Arc::new(acquirer))
-            }
-        };
+        load_reservations = loaded.reservations;
         // GitHub #129: a loaded model is ready only after its first traversal.
-        (server.with_family(family).with_warm_up(), loaded)
+        Server::from_active(loaded.model).with_warm_up()
     } else {
         // Why there is no artifact was said once, with its reason, where the
         // decision was made (`ignis.model.placeholder_template` above).
-        let engine =
-            Engine::with_clock(mock_scheduler(&model, start_options.default_max_tokens), Arc::new(SystemClock));
-        (Server::new(engine, Box::new(SimpleTemplateProvider)), start_options)
+        let (engine, driver) =
+            Engine::with_clock_and_driver(mock_scheduler(&model, default_max_tokens), Arc::new(SystemClock));
+        Server::from_active(ActiveModel::new(engine, Arc::new(SimpleTemplateProvider)).with_driver(driver))
+    }
+    .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
+    .with_instruction_policy(instruction_policy);
+    // Spec model-switch/01: `POST /v1/models/switch` loads every later model
+    // through the same path, on the same start options — and so does a
+    // request naming a known model (§Implicit switch), the start model among
+    // them once its load has said which id and file it is.
+    let known = if allow_model_switch {
+        ignis_server::model_switch::known_models(&known_models, server.active().source.as_ref())
+    } else {
+        Default::default()
     };
-    let server = server
-        .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
-        .with_instruction_policy(instruction_policy);
+    tracing::info!(
+        name: "ignis.config.model_switch",
+        allow_model_switch,
+        known_models = %known.keys().cloned().collect::<Vec<_>>().join(","),
+        "a request naming one of these models, other than the loaded one, switches the server to it"
+    );
+    let server = server.with_switcher(
+        ignis_server::model_switch::Switcher::new(
+            Arc::new(ignis_server::model_switch::ArtifactLoader::new(start_options.clone())),
+            std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
+        )
+        .with_known_models(known),
+    );
 
     // GitHub #209: joining or gathering developer messages trades prefix
     // reuse for fewer system blocks; the operator is told once, at start.
@@ -617,58 +385,20 @@ async fn main() {
         );
     }
 
-    // GitHub #260, #263: how a `point` with no `method` will be answered, and
-    // whether a `box` can be asked for `head`, said once at load and before
-    // the first request. The heads are keyed to the artifact's content hash,
-    // so a load nobody calibrated says "chain" here instead of being found
-    // out from its answers — and a load without `--vision-enabled` says neither,
-    // since it takes no image to point on.
-    let methods = ignis_server::decide::load_methods(server.calibration, server.media.is_some());
-    tracing::info!(
-        name: "ignis.decide.pointing_head",
-        point_method = methods.point,
-        box_methods = methods.box_methods,
-        box_default = methods.box_default,
-        head = server.calibration.map(|calibration| calibration.head.to_string()),
-        set_heads = server.calibration.and_then(|calibration| calibration.set).map(|set| set.heads.len()),
-        artifact = %server.engine.artifact(),
-        "{}",
-        methods.summary
-    );
-
-    // GitHub #275: whether a `locate` can be answered, said once at load.
-    // Its heads are keyed to the artifact's content hash like the pointing
-    // head's, so a load nobody calibrated says so here rather than in every
-    // refusal after it.
-    // GitHub #278: and which heads each reading uses, and the window a
-    // long text is read in.
-    let names = |heads: &[ignis_core::pointing::PointingHead]| {
-        heads.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
-    };
-    tracing::info!(
-        name: "ignis.decide.locate",
-        available = server.locate.is_some(),
-        heads = server.locate.map(|calibration| calibration.heads.len()),
-        max_keys = server.locate.map(|calibration| calibration.max_keys),
-        sum_heads = server.locate.map(|calibration| names(calibration.heads)),
-        end_heads = server.locate.map(|calibration| names(calibration.end_heads)),
-        window_keys = server.locate.map(|calibration| calibration.window_keys),
-        artifact = %server.engine.artifact(),
-        "{}",
-        ignis_server::decide::locate_summary(server.locate)
-    );
+    // GitHub #260, #263, #275, #278: how `/v1/decide` will answer a point,
+    // a box and a locate on this load, said once before the first request
+    // (and again by every model switch).
+    ignis_server::decide::log_load_heads(&server.active());
 
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the
     // server already treats a missing EOS token or an unclean checksum.
-    let (default_enable_thinking, default_reasoning_effort, default_thinking_budget) =
-        (loaded.enable_thinking, loaded.reasoning_effort, loaded.thinking_budget);
     let thinking_defaults = ThinkingDefaults {
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
     };
     if let Err(err) =
-        thinking::validate_defaults(&thinking_defaults, &server.template.thinking_capabilities())
+        thinking::validate_defaults(&thinking_defaults, &server.active().template.thinking_capabilities())
     {
         tracing::error!(name: "ignis.config.thinking_invalid", error = %err, "refusing to start");
         exit_after_flush(&logging_handle, 1);
@@ -771,13 +501,13 @@ async fn main() {
         name: "ignis.process.started",
         // The id the load is served under (`config::served_model_for`): a
         // Flash-Next artifact started without `--model-id` is its own.
-        model = %server.engine.model_id(),
+        model = %server.active().engine.model_id(),
         bind = %bind,
         api_key_required = auth,
         metrics = metrics.as_deref().unwrap_or("off"),
         // GitHub #216: the pinned host arena is locked in RAM from start
         // (ADR 0030), and until now no line anywhere said how large it is.
-        kv_host_pool_bytes = loaded.host_pool_bytes,
+        kv_host_pool_bytes = host_pool_bytes,
         exposed = exposure.as_ref().map_or("no", |_| "yes"),
         "OpenAI API at /v1"
     );

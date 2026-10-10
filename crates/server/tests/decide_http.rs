@@ -1856,10 +1856,10 @@ fn calibrated_compute() -> Arc<MockCompute> {
 
 /// `server` as a load calibrated with a pointing head and no head set — spec
 /// 13's calibration, which the table no longer holds for any artifact.
-fn pointing_head_only(mut server: Server) -> Server {
-    server.calibration = server.calibration.map(|calibration| ignis_core::pointing::Calibration {
-        set: None,
-        ..calibration
+fn pointing_head_only(server: Server) -> Server {
+    server.update_active(|model| {
+        model.calibration =
+            model.calibration.map(|calibration| ignis_core::pointing::Calibration { set: None, ..calibration });
     });
     server
 }
@@ -1909,7 +1909,7 @@ async fn a_point_with_no_method_is_read_off_the_head_set_in_one_pass() {
     const HEIGHT: u32 = 360;
     let compute = calibrated_compute();
     let server = seeing_server(compute.clone());
-    let calibration = server.calibration.expect("the server found its calibration by the artifact's hash");
+    let calibration = server.active().calibration.expect("the server found its calibration by the artifact's hash");
     assert_eq!(
         calibration.head,
         ignis_core::pointing::PointingHead {
@@ -2119,7 +2119,7 @@ async fn a_head_point_and_a_chain_point_put_the_same_prompt() {
 async fn a_load_without_a_calibrated_head_points_by_chain_and_refuses_head() {
     let compute = Arc::new(MockCompute::new());
     let server = seeing_server(compute.clone());
-    assert_eq!(server.calibration, None, "an unknown artifact has no head");
+    assert_eq!(server.active().calibration, None, "an unknown artifact has no head");
     let app = server.app();
 
     let body = point_over_image(640, 360, r#""where":{"type":"point","instructions":"the button"}"#);
@@ -2420,7 +2420,7 @@ fn attention_jobs(compute: &MockCompute) -> Vec<(u64, ignis_core::pointing::Atte
 async fn a_locate_is_answered_at_the_segment_the_heads_vote_for() {
     let compute = calibrated_compute();
     let server = server(compute.clone());
-    let calibration = server.locate.expect("the served artifact is calibrated for locate");
+    let calibration = server.active().locate.expect("the served artifact is calibrated for locate");
     let body = decide_body(LOCATE_STATE, r#""which":{"type":"locate","method":"vote","compression":"none","instructions":"which item names the letter b"}"#);
     let (status, response) = decide(&server.app(), &body).await;
     assert_eq!(status, 200, "{response}");
@@ -2490,7 +2490,7 @@ async fn every_locate_refusal_comes_before_any_prefill() {
 async fn a_locate_on_an_uncalibrated_load_is_refused() {
     let compute = Arc::new(MockCompute::new());
     let server = server(compute.clone());
-    assert!(server.locate.is_none(), "the mock's default artifact is nobody's");
+    assert!(server.active().locate.is_none(), "the mock's default artifact is nobody's");
     let body = decide_body(LOCATE_STATE, r#""q":{"type":"locate","method":"vote","compression":"none","instructions":"which item names b"}"#);
     let (status, response) = decide(&server.app(), &body).await;
     assert_eq!(status, 422, "{response}");
@@ -2865,10 +2865,12 @@ async fn a_target_longer_than_a_window_is_read_in_windows_and_answered_in_the_or
     ];
     for (state, segments, kind) in cases {
         let compute = calibrated_compute();
-        let mut server = server(compute.clone());
-        let calibration = server.locate.expect("calibrated");
+        let server = server(compute.clone());
+        let calibration = server.active().locate.expect("calibrated");
         // A window of 60 keys: the placeholder template's tokens are words.
-        server.locate = Some(ignis_core::locate::LocateCalibration { window_keys: 60, ..calibration });
+        server.update_active(|model| {
+            model.locate = Some(ignis_core::locate::LocateCalibration { window_keys: 60, ..calibration });
+        });
         let body = decide_body(&state, r#""q":{"type":"locate","instructions":"which says thing3x1"}"#);
         let (status, response) = decide(&server.app(), &body).await;
         assert_eq!(status, 200, "{kind}: {response}");

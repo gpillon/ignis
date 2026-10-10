@@ -146,6 +146,29 @@ server in a half-torn-down state.
     that `phase2-model-switch-notes.md`'s unmeasured 14-15s/8-10s estimates
     are replaced with a measured number the way spec server/05 and the
     expert-pool-read finding replaced estimates elsewhere.
+17. As a client (any OpenAI-compatible one, e.g. opencode), I want naming a
+    different, known model in my request's `model` field to switch the
+    server to it and then answer my request on it, so that I do not need my
+    own retry loop around `503` just to use the model I asked for.
+18. As the owner, I want implicit switching gated by one flag
+    (`--allow-model-switch`, default on) and a named list of switchable
+    models and their artifacts (`--known-model <id>=<path>`), so that a
+    server I did not mean to make switchable cannot be moved by an
+    arbitrary `model` string, and so a model with no known artifact cannot
+    be requested into existence.
+19. As the owner, I want a request naming an unknown model, or naming a
+    different model while implicit switching is off, refused by name
+    (`404 model_not_found`) rather than silently served by whatever is
+    active, so that a typo'd or stale `model` field is never mistaken for
+    success.
+20. As the owner, I want an implicit switch to close the gate to every
+    request — old model or new, admitted or not — the instant the mismatch
+    is seen, so that "exhaust the queue, then accept nothing else" holds for
+    an implicit switch exactly as it does for an explicit one.
+21. As a client whose request triggered an implicit switch, I want my own
+    request held until the switch finishes and then served on the new
+    model, so that I get an answer rather than a `202` I have to poll for a
+    switch I did not explicitly ask to track.
 
 ## Implementation Decisions
 
@@ -241,7 +264,9 @@ switches, it does not queue them.
    against the new artifact, build the new `ActiveModel`, including a fresh
    `ForkHistory` and a fresh warm-up traversal (reusing `Server::with_warm_up`'s
    existing logic).
-5. On success: `server.active.store(new)`, `status = Serving`.
+5. *(Superseded by §Implementation notes: teardown always precedes the
+   load; a GPU-side failure reloads the old model.)*
+   On success: `server.active.store(new)`, `status = Serving`.
    On failure at any point in step 4: the **old** `ActiveModel` was already
    torn down in step 3, so there is nothing to fall back to in-process —
    this spec's failure contract is therefore: step 3 and step 4 run inside
@@ -331,9 +356,11 @@ not run it itself.
 
 ## Out of Scope
 
-- **A router that picks the model per task.** This slice is one explicit API
-  call; an automatic policy is a later decision (`phase2-model-switch-notes.md`'s
-  first open question, deliberately left open).
+- **A router that picks the model per task.** Nothing here infers which
+  model a task needs. §Implicit switch (below, added 2026-10-10) lets a
+  client *name* the model it wants and have the server get there; a policy
+  that chooses the model *for* the client is a separate, later decision
+  (`phase2-model-switch-notes.md`'s first open question, still open).
 - **The KV-disk tier (ADR 0045 Tier 2) surviving a switch.** Interesting
   (phase2 notes), unmeasured, and a separate ticket — this spec's full
   reload drops retained state on both sides, full stop.
@@ -368,3 +395,237 @@ to the owner explicitly if a future spec tightens the VRAM budget to the
 point where even that momentary double allocation cannot fit — at that point
 "tear down first, accept that a failed switch is a cold-start" becomes the
 only option, and AC 9 would need revisiting.
+
+## Implementation notes (2026-10-10, branch `model-switch-305`)
+
+Where the implementation departs from the sections above, and why.
+
+- **Teardown before load, always.** §Draining step 5's "load the new model
+  before releasing the old" cannot work on the card even on a *successful*
+  switch, in either direction: every load sizes its VRAM plan from the
+  memory NVML reports free at its start (`crates/server/src/runtime.rs`),
+  which the old model still holds — the new plan would refuse or be built
+  around the old weights, and the two would be resident together, which
+  this spec rules out. On top of that the 27B pins its KV-RAM arena as a
+  process-wide singleton whose create refuses while one exists
+  (`kernel/src/seq.cu`, `ignis_host_pinned_pool_create`: "destroy it before
+  creating another"); Flash-Next's arena is its own instance's
+  (`HostArena`, spec flash-next/05's no-singleton rule), so the singleton
+  alone blocks only a 27B load over a 27B. So the order is steps 1-4 as
+  written (gate, drain, teardown, load), and
+  AC 9 is kept another way: everything that can refuse a target without the
+  GPU — the path, the sidecar, the checksum, the artifact's model against
+  the start flags, the thinking defaults, the vision processor — runs
+  *before* the drain, while the old model still serves (a refusal there
+  touches nothing); a load that fails on the GPU after the teardown reloads
+  the old model from its artifact (`ActiveModel::source`). Only a reload that
+  fails too leaves `failed` standing, with the process up and a further
+  switch accepted. The Further Notes' "tear down first" option, taken.
+- **Stragglers are cut by an explicit shutdown, and end with
+  `engine_error`.** Step 6's "the command channel disconnects" never happens
+  while a streaming response's `CancelOnDrop` holds an `Engine` clone, so the
+  engine gained a `Shutdown` command: each request still on the old model is
+  sent a `Done` with `FinishReason::Error`, which every handler already
+  reports as the `engine_error` chunk — not a new `model_switching` chunk.
+  A request that reached its handler before the gate closed and submits
+  after the teardown is answered `503 engine_full` ("retry").
+- **The drain's counts are published as requests come and go,** not only at
+  a step's end: a request submitted during a long first step was otherwise
+  invisible to the drain.
+- **Flags only the other model takes are dropped for the load, not
+  refused** (`config::fit_to_family`, logged as
+  `ignis.model.switch_flags_dropped`): `--vision` on Flash-Next, the other
+  model's `--spec` backend, and the Flash-Next-only knobs on the 27B.
+  Refusing them, as a restart does, would make the switch impossible on the
+  flags the owner starts the 27B with. `--max-context` past the 27B's
+  envelope is still refused.
+- **Wire details.** Both `artifact` and `model` are required. `GET
+  /v1/models` carries `status` beside `data`, plus `switching: {from, to}`
+  while switching and `reason` while failed; it and `POST
+  /v1/models/switch` stay open while a switch runs or has failed (the gate
+  holds every other route), and both stay held during the warm-up as
+  before. A server built without a loader answers the switch `501
+  switch_unavailable`.
+- **Known limit.** The request body cap is chosen when the router is built,
+  from the start model: a server started on Flash-Next (never `--vision`)
+  keeps the text-only cap after switching to the 27B. Moot today — a switch
+  only enables vision when the start flags named it, and Flash-Next refuses
+  to start with them.
+
+### The GPU profile, run (2026-10-10)
+
+`model_switch_gpu.rs` ran on the owner's machine (RTX 5090, 64 GB RAM, ~45
+GB free at run time) against the real artifacts, replacing AC 16's
+estimate:
+
+| | wall time | breakdown |
+|---|---|---|
+| 27B cold start | 9.22s | — |
+| 27B → Flash-Next | 33.41s | teardown 246ms, load 31,918ms, warm-up 76ms |
+| Flash-Next → 27B | 12.94s | drain 0ms, teardown 3,743ms, load 8,459ms, warm-up 179ms |
+
+All three host-pool-arena assertions passed: pinned (2,147,483,648 bytes)
+while the 27B served, `0` immediately after the switch to Flash-Next, pinned
+again after the switch back — the direct proof that the teardown ran before
+the next load's create, in both directions. Load dominates both directions,
+as expected; the switch's own overhead (drain + teardown + warm-up) is low
+hundreds of ms on the 27B side and under 350ms on the Flash-Next side.
+
+**The first attempt failed for a reason worth recording.** Flash-Next's
+host plan (`crates/core/src/residency/plan.rs`) needs the expert pool
+(~35.2 GiB, not a knob) plus n-gram hot rows (1 GiB default), prompt reuse's
+retained host slots (~1 GiB default) and its KV-RAM arena (2 GiB), plus the
+6 GiB paging margin — around 48 GiB total — checked against physical memory
+free at that instant. With ~37-45 GiB free (this machine runs other
+sessions/applications too), the first two attempts refused with
+`HostPlanError::BelowMargin` naming `expert_pool` as the crossing line, and
+the switch correctly rolled back to the 27B each time (AC 9, proven on real
+hardware, not just the mock). The fix was not a code change: the test's
+`options()` now sends `--retained-host 0`, an existing flag, saving ~1 GiB
+without touching anything the test asserts (the arena stays at its default
+for the 27B-side assertions; the expert pool cannot be shrunk). No change
+to `HOST_MARGIN_BYTES` or the check itself — the margin did its job both
+times, naming exactly what to shrink or what to free, and the owner's own
+flags were enough once there was a little more free RAM at run time besides.
+
+## Implicit switch: a request's `model` field (added 2026-10-10)
+
+Trying this end to end against a real client (opencode) raised the
+question, and a closer read of the code (correcting an earlier guess in
+this conversation, checked against `crates/core/src/concrete.rs:3938-3955`)
+found the field is **not** ignored: a `model` naming anything other than
+the loaded one is already refused today, on every path that submits to the
+engine — `ConcreteScheduler::refusal`/`submit` return
+`SubmitError::UnknownModel`, which `/v1/chat/completions` and
+`/v1/responses` both turn into `404 model_not_found`
+(`crates/server/src/api.rs:1166`, shared by both through
+`prepare_request`/`request_input`), and `/v1/decide` refuses the same
+mismatch itself, earlier and in its own 422 shape, before any of that
+(`crates/server/src/decide.rs:2526-2532`). `request_input`
+(`crates/server/src/api.rs:419-421`) is what makes an **absent** `model`
+harmless: empty or unset defaults to `server.active().engine.model_id()`
+before this check ever runs, so only a request that *names* the other
+model hits it. Nothing here was a silent no-op; it is a working refusal
+with nothing behind it to do instead.
+
+The owner's ask stands regardless: let naming the other model *do*
+something — switch to it — behind a flag, and only once every request
+already on the current model is drained, accepting nothing else
+meanwhile. Concretely, this turns an unconditional refusal into a
+conditional one: refuse exactly as today when switching is off or the name
+is unknown, trigger a switch and then proceed when it is on and known.
+
+### The rule
+
+A request whose `model` (after stripping the lane suffix, and only when
+it is present and non-empty — `request_input`'s existing default-to-active
+rule is unchanged) names a model other than the one currently `Serving`:
+
+- `--allow-model-switch` (default **true**, env `IGNIS_ALLOW_MODEL_SWITCH`)
+  off, or the named model unknown to this server: refused exactly as
+  today — `404 model_not_found` on chat/responses, `/v1/decide`'s own 422 —
+  with nothing new to build for this half; the existing checks above are
+  the implementation.
+- Flag on and the model is known: this request **triggers** a switch to it,
+  reusing `model_switch::switch` exactly as `POST /v1/models/switch` does —
+  same gate, same drain (`--switch-drain-timeout`), same teardown-then-load
+  ordering, same rollback on failure. Nothing about the switch mechanism
+  itself is new; only who may start one is wider. Once the switch lands,
+  `server.active()` names the new model, and the request falls through to
+  exactly the code path it would have taken had it always matched — no new
+  "success" path to build either, only the trigger in front of it.
+
+### What "known to this server" means: `--known-model <id>=<path>`
+
+An implicit switch has no request body field for the target artifact's
+path — a chat-completions request carries a model *name*, not a path. A
+new repeatable flag, `--known-model <id>=<path>` (env `IGNIS_KNOWN_MODELS`,
+`;`-separated `id=path` pairs — not `,`, since a Windows path never
+contains `;` but can contain `,`), names every model this server is
+willing to switch to and where its artifact lives. The model and artifact
+the server actually starts on is added to this table automatically, so
+switching back to it never needs its own flag. Naming a model with no
+entry here is the `404 model_not_found` case above, flag or no flag — an
+unlisted model literally cannot be loaded, since nothing names its
+artifact.
+
+### Ordering: close first, drain, then switch — the triggering request included
+
+"Must drain everything queued, and must not accept anything else once a
+switch is wanted" (the owner's wording) is exactly §Draining's existing
+gate-then-drain order, with one new wrinkle: the request that *discovered*
+the need to switch is not yet an admitted request when this happens
+(the check runs where `resolve_model_and_class` already runs, before
+admission), so it is not one of the things the drain waits for — it waits
+*with* the client instead.
+
+1. The gate closes (`Switching{from, to}`) the instant the mismatch is
+   seen, before anything else about this request is evaluated. Every other
+   request — on the old model or the new one, admitted or not — now gets
+   `503 model_switching`, identically to an explicit switch. This is the
+   "accepts nothing else" half.
+2. The triggering request's own HTTP call blocks (does not return a
+   response yet) while `model_switch::switch` drains what was already
+   running on the old model, tears it down, loads the named model, and
+   warms it up — the "exhaust the queue first" half, unchanged from
+   §Draining.
+3. On success, the triggering request is admitted and served **on the new
+   model**, as if it had been sent after the switch finished — the client
+   that asked for Flash-Next gets Flash-Next, not a `202` it has to poll.
+4. On failure, the triggering request is refused with the switch's own
+   reason (the same string `POST /v1/models/switch` would have reported via
+   `GET /v1/models`'s `reason` field), not silently served by the
+   (reloaded) old model — this client asked for a specific model and
+   either gets it or a reason why not, never a substitution.
+5. A second request naming a model while step 2 is already running for a
+   *different* target gets `503 model_switching` like any other request
+   during a switch — it does not queue a second switch, and does not
+   retarget the one in progress. Named the same target already in flight:
+   still `503 model_switching` for this slice; joining an in-progress
+   switch instead of waiting it out as a plain 503 is a possible
+   refinement, not required here.
+
+Consequence for a real client (what prompted this): opencode's chat
+completion call simply takes as long as the switch takes the first time it
+names a different model (seconds, per the GPU numbers above), then answers
+normally — no client-side retry loop needed, which a bare `503` would have
+demanded of every OpenAI-compatible client pointed at this server.
+
+### As implemented (2026-10-10, branch `model-switch-305`)
+
+- **The trigger runs first, before the request is pinned to a model.**
+  `model_switch::implicit_switch` is called at the top of chat completions,
+  `POST /v1/responses`, the Responses WebSocket's per-request path and
+  `/v1/decide` — not after `resolve_model_and_class`. `Server::pinned()` gives
+  a request its own `ArcSwap`; a switch begun from that copy would publish the
+  new model where no other request reads it, and the template, thinking and
+  media checks that run before `resolve_model_and_class` would have read the
+  old model. So: switch, then pin, then everything else, which also closes
+  the gate "before anything else about this request is evaluated" (ordering
+  1). On `/v1/decide` the call precedes the Flash-Next `model_unsupported`
+  refusal, so a decision naming the 27B on a Flash-Next load switches back.
+- **The start model joins the table at start, not in `config`.** Only the
+  load knows the id it serves under (an unnamed `--model` takes the
+  artifact's own) and the file (a downloaded artifact):
+  `model_switch::known_models` adds `ActiveModel::source`, whose entry wins
+  over an operator's for the same id (`ignis.config.known_model_replaced`
+  when the paths differ). `--allow-model-switch false` installs an empty
+  table; it does not touch `POST /v1/models/switch`.
+- **Flags.** Any `--known-model` replaces `IGNIS_KNOWN_MODELS` whole; an id
+  named twice, an empty id or path, or an id holding a lane tag's `@` is a
+  usage error.
+- **Wire.** A switch already running: the gate's own `503 model_switching`
+  with `Retry-After`, word for word. A switch the request began that did not
+  land: `503 model_switch_failed` with its reason and no `Retry-After` — 5xx
+  because the server failed, no `Retry-After` because a retry is one more
+  teardown and reload of the model serving everyone else; `/v1/decide`
+  answers it as its own `422 model_switch_failed`.
+- **`/v1/tokenize` does not switch.** It refuses another model `404` as
+  before: a counting route (no lane, no GPU) should not move the card.
+
+### Out of scope, still
+
+A policy that infers the right model for a task without being told its
+name — still a router, still not this. Multiple servers, or serving two
+models from two processes behind a single endpoint, is a different
+architecture this spec never considered.
