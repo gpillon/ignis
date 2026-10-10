@@ -183,6 +183,12 @@ pub struct PrefillJob {
     /// `None` on every other job, and such a job costs nothing for it: no
     /// allocation, and no device work the leaf would not have done anyway.
     pub attention: Option<crate::pointing::AttentionQuery>,
+    /// The `</think>` this chunk's own draw is redirected to when it is the
+    /// request's stop id (GitHub #315, ADR 0048): set on the chunk that ends
+    /// at the prompt's last position -- whose draw the first decode round
+    /// emits -- for a request that starts inside its reasoning block. `None`
+    /// on every other job ([`DecodeJob::reasoning_close`]).
+    pub reasoning_close: Option<TokenId>,
 }
 
 impl PrefillJob {
@@ -228,6 +234,18 @@ pub struct DecodeJob {
     /// the previous round's token would be off by one step, which on a
     /// number is off by a factor of ten.
     pub permitted: Option<crate::constrained::PermittedSet>,
+    /// The **reasoning redirect** for the draw this round makes (GitHub #315,
+    /// ADR 0048): the `</think>` id while the request's reasoning block is
+    /// open as far as the scheduler has seen, `None` otherwise -- thinking
+    /// off, the block already closed, `ignore_eos`, or no close configured.
+    ///
+    /// A stop id the round draws, or a speculative round accepts, with the
+    /// block open becomes this id, which the lane emits **next** round (the
+    /// same lag as [`DecodeJob::permitted`]); [`DecodeOutcome::reasoning_redirected`]
+    /// says it happened. The scheduler's view lags by the round it cannot see
+    /// yet, so the leaf also closes the block for the rest of a round that
+    /// commits a `</think>`.
+    pub reasoning_close: Option<TokenId>,
 }
 
 /// One job's result from a prefill step (GitHub #192): what the chunk cost
@@ -295,6 +313,10 @@ pub struct PrefillOutcome {
     /// a head point the leaf could not read is a failed question, never a
     /// point read off some other copy of the keys, and never a partial set.
     pub attention: Option<crate::pointing::AttentionScores>,
+    /// The chunk's draw was a stop id the leaf turned into its
+    /// [`PrefillJob::reasoning_close`] (GitHub #315): the first decode round
+    /// emits that `</think>`.
+    pub reasoning_redirected: bool,
 }
 
 impl PrefillOutcome {
@@ -337,6 +359,10 @@ pub struct DecodeOutcome {
     pub finish: Option<FinishReason>,
     /// The round's speculative counters, when it was a verify round.
     pub spec: Option<SpecCounters>,
+    /// The token this round drew for the next one was a stop id the leaf
+    /// turned into the job's [`DecodeJob::reasoning_close`] (GitHub #315): the
+    /// next round's first token is that `</think>`.
+    pub reasoning_redirected: bool,
 }
 
 impl DecodeOutcome {
@@ -353,6 +379,7 @@ impl DecodeOutcome {
             probabilities: Vec::new(),
             finish: None,
             spec: None,
+            reasoning_redirected: false,
         }
     }
 

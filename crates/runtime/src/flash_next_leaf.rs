@@ -41,7 +41,8 @@ use ignis_core::step;
 use ignis_core::types::{DecodeParams, SpecCounters, TokenId};
 use ignis_core::{ArtifactHash, BlobIdentity};
 
-use crate::{AttentionRead, DecodeLane, LaneRun, ReservedBytes, RuntimeStats, StepLeaf, TransferWindow};
+use crate::cuda_leaf::{close_id, redirect_stop_ids, step_redirect};
+use crate::{AttentionRead, DecodeLane, DrawRedirect, LaneRun, ReservedBytes, RuntimeStats, StepLeaf, TransferWindow};
 
 /// The block before the pool's bytes in a Flash-Next blob: the n-gram
 /// context's token count and tokens, `u32` little-endian, zero-padded to
@@ -307,6 +308,7 @@ impl FlashNextLeaf {
                 remaining_tokens: lane.remaining_tokens,
                 stop_ids: stops,
                 drafts: proposed,
+                reasoning_close: close_id(lane.reasoning_close),
             })
             .collect();
         let mut seqs: Vec<&mut Seq<'static>> = sequences.iter_mut().map(|s| &mut s.seq).collect();
@@ -328,6 +330,7 @@ impl FlashNextLeaf {
                 tokens: committed,
                 spec: Some(SpecCounters::round(run.extent, accepted)),
                 drawn_probability: None,
+                redirected: run.redirected,
             });
         }
         Ok(out)
@@ -594,6 +597,7 @@ impl StepLeaf for FlashNextLeaf {
         start_position: u32,
         params: DecodeParams,
         permitted: &[TokenId],
+        mut redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
@@ -606,6 +610,7 @@ impl StepLeaf for FlashNextLeaf {
         let rows = self.rows_for(&mut context, tokens).map_err(|e| leaf_error("n-gram rows", e))?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let permitted: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
+        let stop_ids = redirect_stop_ids(redirect.as_deref());
         let drawn = step::prefill_flash_next(
             &model.model,
             &model.pool,
@@ -614,6 +619,7 @@ impl StepLeaf for FlashNextLeaf {
             u64::from(start_position),
             sampling_params(params),
             &permitted,
+            step_redirect(redirect.as_deref(), &stop_ids),
             &rows,
             None,
             out_logits,
@@ -621,7 +627,10 @@ impl StepLeaf for FlashNextLeaf {
         .map_err(|e| leaf_error("prefill", e))?;
         sequence.context = context;
         sequence.drafts.clear();
-        Ok(drawn)
+        if let Some(redirect) = redirect.as_deref_mut() {
+            redirect.redirected = drawn.redirected;
+        }
+        Ok(drawn.probability)
     }
 
     fn decode(
@@ -673,10 +682,25 @@ impl StepLeaf for FlashNextLeaf {
         }
         let permitted: Vec<Vec<i32>> =
             lanes.iter().map(|lane| lane.permitted.iter().map(|&t| t as i32).collect()).collect();
-        let sampling: Vec<(step::SamplingParams, &[i32])> =
-            lanes.iter().zip(&permitted).map(|(lane, ids)| (sampling_params(lane.params), &ids[..])).collect();
+        let stop_ids: Vec<Vec<i32>> =
+            lanes.iter().map(|lane| lane.stop_ids.iter().map(|&t| t as i32).collect()).collect();
+        // Each lane's draw under its sampling, its set and its reasoning
+        // redirect (GitHub #315), which reads its stop ids.
+        let draws: Vec<step::LaneDraw<'_>> = lanes
+            .iter()
+            .zip(&permitted)
+            .zip(&stop_ids)
+            .map(|((lane, ids), stops)| step::LaneDraw {
+                sampling: sampling_params(lane.params),
+                permitted: ids,
+                redirect: step::Redirect {
+                    stop_ids: stops,
+                    close_id: close_id(lane.reasoning_close),
+                },
+            })
+            .collect();
         let mut seqs: Vec<&mut Seq<'static>> = sequences.iter_mut().map(|s| &mut s.seq).collect();
-        let drawn = step::decode_flash_next(&model.model, &model.pool, &mut seqs, &sampling, &rows)
+        let drawn = step::decode_program_round(&model.model, &model.pool, &mut seqs, &draws, Some(&rows))
             .map_err(|e| leaf_error("decode", e))?;
         for (sequence, context) in sequences.iter_mut().zip(contexts) {
             sequence.context = context;
@@ -685,8 +709,9 @@ impl StepLeaf for FlashNextLeaf {
         Ok(drawn
             .into_iter()
             .zip(lanes)
-            .map(|((id, probability), lane)| {
-                LaneRun::drawn(id as TokenId, (!lane.permitted.is_empty()).then_some(probability))
+            .map(|(drawn, lane)| LaneRun {
+                redirected: drawn.redirected,
+                ..LaneRun::drawn(drawn.token as TokenId, (!lane.permitted.is_empty()).then_some(drawn.probability))
             })
             .collect())
     }

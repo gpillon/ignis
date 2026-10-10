@@ -145,6 +145,7 @@ fn only_the_final_prefill_chunk_receives_stochastic_sampling_params() {
         seed: 9,
         ignore_eos: false,
         thinking_budget: None,
+        starts_in_reasoning: false,
     };
     sched
         .submit(

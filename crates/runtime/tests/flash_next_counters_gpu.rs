@@ -61,7 +61,7 @@ fn the_leaf_publishes_its_counts_after_every_step() {
     let model = leaf.load_model().expect("load the model");
     let mut seq = leaf.allocate_sequence(&model, 4096).expect("a free lane");
     let prompt: Vec<u32> = (0..PROMPT as u32).map(|i| 1000 + (i * 7919) % 60_000).collect();
-    leaf.prefill(&model, &mut seq, &prompt, 0, DecodeParams::default(), &[], None, None).expect("prefill");
+    leaf.prefill(&model, &mut seq, &prompt, 0, DecodeParams::default(), &[], None, None, None).expect("prefill");
 
     let prefilled = source.read();
     assert!(selected(&prefilled, Phase::Prefill) > 0, "{prefilled:?}");
@@ -69,7 +69,13 @@ fn the_leaf_publishes_its_counts_after_every_step() {
     assert_eq!(prefilled.ngram.rows - opened.ngram.rows, PROMPT as u64 * heads);
     assert!(prefilled.ngram.hot_rows <= prefilled.ngram.rows);
 
-    let lane = DecodeLane { params: DecodeParams::default(), remaining_tokens: 1, stop_ids: &[], permitted: &[] };
+    let lane = DecodeLane {
+        params: DecodeParams::default(),
+        remaining_tokens: 1,
+        stop_ids: &[],
+        permitted: &[],
+        reasoning_close: None,
+    };
     for round in 0..DECODED {
         leaf.decode(&model, &mut [&mut seq], std::slice::from_ref(&lane))
             .unwrap_or_else(|code| panic!("decode round {round}: leaf code {code}"));

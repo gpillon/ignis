@@ -39,7 +39,7 @@ use ignis_core::{
 use ignis_core::vision::MediaItem;
 
 use crate::{
-    AttentionRead, DecodeLane, LaneRun, MultimodalSpan, ReservedBytes, RuntimeStats, StepLeaf,
+    AttentionRead, DecodeLane, DrawRedirect, LaneRun, MultimodalSpan, ReservedBytes, RuntimeStats, StepLeaf,
     TransferWindow,
 };
 
@@ -444,12 +444,14 @@ impl StepLeaf for CudaLeaf {
         start_position: u32,
         params: DecodeParams,
         permitted: &[TokenId],
+        mut redirect: Option<&mut DrawRedirect<'_>>,
         span: MultimodalSpan<'_, Self::Media>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
+        let stop_ids = redirect_stop_ids(redirect.as_deref());
         let (readout, read) = match attention {
             Some(read) => {
                 let (readout, read) = step_readout(read);
@@ -457,7 +459,7 @@ impl StepLeaf for CudaLeaf {
             }
             None => (None, None),
         };
-        let (probability, was_read) = step::prefill_program_multimodal(
+        let (drawn, was_read) = step::prefill_program_multimodal(
             &model.model,
             &model.pool,
             sequence,
@@ -465,6 +467,7 @@ impl StepLeaf for CudaLeaf {
             u64::from(start_position),
             sampling_params(params),
             &permitted_ids,
+            step_redirect(redirect.as_deref(), &stop_ids),
             step::MultimodalPrefill {
                 positions: span.positions,
                 rope_delta: span.rope_delta,
@@ -481,7 +484,10 @@ impl StepLeaf for CudaLeaf {
         if let Some(read) = read {
             *read = was_read;
         }
-        Ok(probability)
+        if let Some(redirect) = redirect.as_deref_mut() {
+            redirect.redirected = drawn.redirected;
+        }
+        Ok(drawn.probability)
     }
 
     fn load_model(&self) -> Result<Self::Model, i32> {
@@ -793,60 +799,56 @@ impl StepLeaf for CudaLeaf {
         start_position: u32,
         params: DecodeParams,
         permitted: &[TokenId],
+        mut redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
+        let stop_ids = redirect_stop_ids(redirect.as_deref());
+        // The span's draw: sampled, restricted to a constrained run's set
+        // (GitHub #242) and redirected inside an open reasoning block
+        // (GitHub #315) -- every one of them the production route's.
+        let draw = step::LaneDraw {
+            sampling: sampling_params(params),
+            permitted: &permitted_ids,
+            redirect: step_redirect(redirect.as_deref(), &stop_ids),
+        };
         // GitHub #275 (ADR 0041): a text span with an attention readout — a
         // `locate`'s last chunk — arms it on the chunked route, as an
-        // image's span does. Every other chunk takes the paths below,
-        // untouched.
-        if let Some(attention) = attention {
-            let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
-            let (readout, read) = step_readout(attention);
-            let (probability, was_read) = step::prefill_program_attention(
+        // image's span does.
+        let drawn = match attention {
+            Some(attention) => {
+                let (readout, read) = step_readout(attention);
+                let (drawn, was_read) = step::prefill_program_attention(
+                    &model.model,
+                    &model.pool,
+                    sequence,
+                    &token_ids,
+                    u64::from(start_position),
+                    draw,
+                    out_logits,
+                    readout,
+                )
+                .map_err(|e| leaf_error("prefill", e))?;
+                *read = was_read;
+                drawn
+            }
+            None => step::prefill_program_draw(
                 &model.model,
                 &model.pool,
                 sequence,
                 &token_ids,
                 u64::from(start_position),
-                sampling_params(params),
-                &permitted_ids,
-                out_logits,
-                readout,
-            )
-            .map_err(|e| leaf_error("prefill", e))?;
-            *read = was_read;
-            return Ok(probability);
-        }
-        // The unconstrained path is left exactly as it was — every request
-        // this engine serves takes it, and a constrained prefill is a
-        // different options struct, not a flag on this one.
-        if permitted.is_empty() {
-            return step::prefill_program_sampled(
-                &model.model,
-                &model.pool,
-                sequence,
-                &token_ids,
-                u64::from(start_position),
-                sampling_params(params),
+                draw,
                 out_logits,
             )
-            .map(|()| 0.0)
-            .map_err(|e| leaf_error("prefill", e));
+            .map_err(|e| leaf_error("prefill", e))?,
+        };
+        if let Some(redirect) = redirect.as_deref_mut() {
+            redirect.redirected = drawn.redirected;
         }
-        let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
-        step::prefill_program_permitted(
-            &model.model,
-            &model.pool,
-            sequence,
-            &token_ids,
-            u64::from(start_position),
-            sampling_params(params),
-            &permitted_ids,
-            out_logits,
-        )
-        .map_err(|e| leaf_error("prefill", e))
+        Ok(drawn.probability)
     }
 
     /// The output head's width — 248,320 columns, which is what the kernel
@@ -883,60 +885,47 @@ impl StepLeaf for CudaLeaf {
         // every lane's round. The siblings lose that round's drafts, which
         // is a number's six rounds' worth and not a mode the engine stays
         // in.
-        if lanes.iter().any(|lane| !lane.permitted.is_empty()) {
+        let stop_ids: Vec<Vec<i32>> = lanes
+            .iter()
+            .map(|lane| lane.stop_ids.iter().map(|&id| id as i32).collect())
+            .collect();
+        let speculation = self.config.speculation.filter(|_| lanes.iter().all(|lane| lane.permitted.is_empty()));
+        let Some(speculation) = speculation else {
+            // One plain round, constrained lanes or none: each lane's draw
+            // under its sampling, its set and its reasoning redirect (GitHub
+            // #315), which reads the lane's stop ids.
             let permitted: Vec<Vec<i32>> = lanes
                 .iter()
                 .map(|lane| lane.permitted.iter().map(|&id| id as i32).collect())
                 .collect();
-            let constrained: Vec<step::PermittedLane<'_>> = lanes
+            let draws: Vec<step::LaneDraw<'_>> = lanes
                 .iter()
                 .zip(&permitted)
-                .map(|(lane, ids)| step::PermittedLane {
+                .zip(&stop_ids)
+                .map(|((lane, ids), stops)| step::LaneDraw {
                     sampling: sampling_params(lane.params),
                     permitted: ids,
+                    redirect: step::Redirect {
+                        stop_ids: stops,
+                        close_id: close_id(lane.reasoning_close),
+                    },
                 })
                 .collect();
-            let (ids, probabilities) = step::decode_program_batch_permitted(
-                &model.model,
-                &model.pool,
-                sequences,
-                &constrained,
-            )
-            .map_err(|e| leaf_error("decode", e))?;
-            return Ok(ids
+            let drawn = step::decode_program_round(&model.model, &model.pool, sequences, &draws, None)
+                .map_err(|e| leaf_error("decode", e))?;
+            return Ok(drawn
                 .into_iter()
-                .zip(probabilities)
                 .zip(lanes)
-                .map(|((id, probability), lane)| {
-                    LaneRun::drawn(
-                        id as TokenId,
-                        (!lane.permitted.is_empty()).then_some(probability),
-                    )
+                .map(|(drawn, lane)| LaneRun {
+                    redirected: drawn.redirected,
+                    ..LaneRun::drawn(drawn.token as TokenId, (!lane.permitted.is_empty()).then_some(drawn.probability))
                 })
                 .collect());
-        }
-        let Some(speculation) = self.config.speculation else {
-            let mut sampling = [step::SamplingParams::greedy(); N_DECODE_LANES];
-            for (target, lane) in sampling.iter_mut().zip(lanes) {
-                *target = sampling_params(lane.params);
-            }
-            let ids = step::decode_program_batch_sampled(
-                &model.model,
-                &model.pool,
-                sequences,
-                &sampling[..lanes.len()],
-            )
-            .map_err(|e| leaf_error("decode", e))?;
-            return Ok(ids.into_iter().map(|id| LaneRun::token(id as TokenId)).collect());
         };
         // P5-06 (GitHub #154, spec 05): a speculative load runs every round
         // as a verify round at the window it was loaded with. The DFlash2
         // drafter proposes inside the leaf (P5-05, GitHub #155), so no lane
         // passes drafts here; the leaf reports what each lane verified.
-        let stop_ids: Vec<Vec<i32>> = lanes
-            .iter()
-            .map(|lane| lane.stop_ids.iter().map(|&id| id as i32).collect())
-            .collect();
         let verify: Vec<step::VerifyLane<'_>> = lanes
             .iter()
             .zip(&stop_ids)
@@ -945,6 +934,7 @@ impl StepLeaf for CudaLeaf {
                 remaining_tokens: lane.remaining_tokens,
                 stop_ids: stops,
                 drafts: &[],
+                reasoning_close: close_id(lane.reasoning_close),
             })
             .collect();
         let runs = step::decode_program_verify_runs(
@@ -965,6 +955,7 @@ impl StepLeaf for CudaLeaf {
                     tokens: run.tokens.into_iter().map(|id| id as TokenId).collect(),
                     spec: Some(SpecCounters::round(run.extent, accepted)),
                     drawn_probability: None,
+                    redirected: run.redirected,
                 }
             })
             .collect())
@@ -1061,6 +1052,28 @@ pub(crate) fn seq_window(window: TransferWindow) -> Window {
         offset: window.offset,
         bytes: window.bytes,
         blob_bytes: window.blob_bytes,
+    }
+}
+
+/// A lane's reasoning close as the step ABI's id: -1 for none (GitHub #315).
+pub(crate) fn close_id(close: Option<TokenId>) -> i32 {
+    close.map_or(-1, |id| id as i32)
+}
+
+/// A prefill's redirect's stop ids as the step ABI's, or none without one.
+pub(crate) fn redirect_stop_ids(redirect: Option<&DrawRedirect<'_>>) -> Vec<i32> {
+    redirect.map_or_else(Vec::new, |redirect| redirect.stop_ids.iter().map(|&id| id as i32).collect())
+}
+
+/// A prefill's redirect as the step ABI's, over `stop_ids` (its own, from
+/// [`redirect_stop_ids`]).
+pub(crate) fn step_redirect<'a>(redirect: Option<&DrawRedirect<'_>>, stop_ids: &'a [i32]) -> step::Redirect<'a> {
+    match redirect {
+        Some(redirect) => step::Redirect {
+            stop_ids,
+            close_id: redirect.close_id as i32,
+        },
+        None => step::Redirect::NONE,
     }
 }
 
@@ -1326,6 +1339,7 @@ mod tests {
             // below must not carry it into `step::SamplingParams`.
             ignore_eos: false,
             thinking_budget: None,
+            starts_in_reasoning: false,
         });
 
         assert_eq!(

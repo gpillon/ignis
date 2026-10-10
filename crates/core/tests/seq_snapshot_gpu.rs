@@ -57,7 +57,7 @@ use ignis_core::model_load::{Model, load_qwen38_27b, load_qwen38_27b_with_option
 use ignis_core::RopeScaling;
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, snapshot_format_version};
 use ignis_core::step::{
-    MultimodalPrefill, SamplingParams, decode_program_batch, prefill_program,
+    MultimodalPrefill, Redirect, SamplingParams, decode_program_batch, prefill_program,
     prefill_program_multimodal,
 };
 
@@ -109,6 +109,7 @@ fn prefill_multimodal_and_decode<'p>(
         SamplingParams::greedy(),
         // No permitted set (GitHub #242): this prefills a prompt.
         &[],
+        Redirect::NONE,
         MultimodalPrefill { positions, rope_delta, media: None },
         None,
         None,

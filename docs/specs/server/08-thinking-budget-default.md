@@ -222,6 +222,12 @@ Where the build departs from, or pins down, the text above:
   as reasoning only, which tells a model that never closed from a split that
   missed the close (#306, 2026-10-07).
 - **The counter** is `ignis_thinking_forced_closes_total` (ADR 0017's table).
+- **The lag hole (GitHub #315, 2026-10-10).** The close is forced one round
+  late: the token drawn freely between the round that finds the budget spent
+  and the first forced draw is emitted as the model wrote it. When that token
+  was the EOS, the turn ended inside its reasoning. Spec server/13 (ADR 0048)
+  closes it: an EOS drawn with the block open becomes the block's
+  `</think>`, which is a natural close inside the lag and stops the forcing.
 - **A malformed `thinking_budget`** is a 400 with `error.param =
   "thinking_budget"`, the envelope's first use of OpenAI's `param` field.
   The field is absent on every other error.

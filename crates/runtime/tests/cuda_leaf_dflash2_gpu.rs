@@ -103,6 +103,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
             publish_prefix: None,
             permitted: None,
             attention: None,
+            reasoning_close: None,
 }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 
@@ -114,7 +115,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
     while generated < MAX_GENERATED {
         let remaining = MAX_GENERATED - generated;
         let out = compute
-            .decode_step(&[DecodeJob { request, lane: 0, params, remaining_tokens: remaining, permitted: None }])
+            .decode_step(&[DecodeJob { request, lane: 0, params, remaining_tokens: remaining, permitted: None, reasoning_close: None }])
             .unwrap_or_else(|e| panic!("decode_step: {e}"));
         let Some(DecodeOutcome { tokens, finish, spec, .. }) = out.into_iter().next() else {
             break;

@@ -512,6 +512,7 @@ fn decode_alone(compute: &RuntimeCompute<CudaLeaf>, request: RequestId, count: u
                 params,
                 remaining_tokens: count - tokens.len() as u32,
                 permitted: None,
+                reasoning_close: None,
 }])
             .unwrap_or_else(|e| panic!("decode {request}: {e:?}"))
             .remove(0);
@@ -559,6 +560,7 @@ pub fn a_turn_from_a_retained_slot_generates_what_a_split_cold_prefill_generates
         readout: None,
         permitted: None,
         attention: None,
+        reasoning_close: None,
 };
 
     // Turn N: publish the block and the chained link, capture at the opener,

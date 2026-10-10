@@ -240,6 +240,7 @@ fn refused(rig: &Rig) {
             params: DecodeParams::default(),
             remaining_tokens: 1,
             permitted: None,
+            reasoning_close: None,
         }])
         .is_err(),
         "and no sequence was handed back for the request"

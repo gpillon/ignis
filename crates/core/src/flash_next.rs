@@ -31,7 +31,8 @@ use crate::residency::{
 use crate::seq::{SeqPool, SeqPoolBudget};
 use crate::speculation::{FlashNextSpeculation, SpeculativeBackend};
 use crate::step::{
-    capture_decode_graphs, decode_flash_next, decode_flash_next_verify, prefill_flash_next, SamplingParams, VerifyLane,
+    capture_decode_graphs, decode_flash_next, decode_flash_next_verify, prefill_flash_next, Redirect, SamplingParams,
+    VerifyLane,
 };
 
 /// The prefetch lookahead residency ranks per lane: the next layer's top 16.
@@ -456,6 +457,7 @@ impl FlashNextEngine {
                 start,
                 SamplingParams::greedy(),
                 &[],
+                Redirect::NONE,
                 &rows,
                 Some(&mut logits),
                 None,
@@ -483,6 +485,7 @@ impl FlashNextEngine {
             0,
             SamplingParams::greedy(),
             &[],
+            Redirect::NONE,
             &rows,
             None,
             Some(&mut logits),
@@ -504,7 +507,7 @@ impl FlashNextEngine {
         let mut rows = vec![0u8; tokens.len() * self.table.token_bytes()];
         self.table.stage(&mut context, tokens, &mut rows)?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], &rows, None, None)?;
+        prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
         Ok(seq)
     }
 
@@ -567,7 +570,7 @@ impl FlashNextEngine {
             let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
             self.table.stage(&mut context, prompt, &mut rows)?;
             let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], &rows, None, None)?;
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
             seqs.push(seq);
             contexts.push(context);
         }
@@ -620,7 +623,7 @@ impl FlashNextEngine {
             let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
             self.table.stage(&mut context, prompt, &mut rows)?;
             let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], &rows, None, None)?;
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
             seqs.push(seq);
             contexts.push(context);
         }
@@ -709,6 +712,7 @@ impl FlashNextEngine {
                         remaining_tokens: (count - out[i].len()) as u32,
                         stop_ids: &[],
                         drafts: d,
+                        reasoning_close: -1,
                     })
                     .collect();
                 let mut handles: Vec<_> =
@@ -751,6 +755,7 @@ impl FlashNextEngine {
             position,
             SamplingParams::greedy(),
             &[],
+            Redirect::NONE,
             &rows,
             None,
             Some(&mut logits),

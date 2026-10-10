@@ -168,6 +168,7 @@ fn a_real_load_names_itself_and_refuses_a_blob_from_any_other() {
                 readout: None,
                 permitted: None,
                 attention: None,
+                reasoning_close: None,
 }])
             .unwrap_or_else(|e| panic!("prefill_step {request}: {e}"));
     }
@@ -261,6 +262,7 @@ fn a_real_load_names_itself_and_refuses_a_blob_from_any_other() {
                     params,
                     remaining_tokens: 64,
                     permitted: None,
+                    reasoning_close: None,
 }])
                 .is_err(),
             "{}: the refused restore left the sequence unrestored",
@@ -331,6 +333,7 @@ fn decode_once(
             params,
             remaining_tokens: 64,
             permitted: None,
+            reasoning_close: None,
 }])
         .unwrap_or_else(|e| panic!("{label}: decode_step: {e}"))
         .into_iter()

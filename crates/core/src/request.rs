@@ -75,6 +75,10 @@ pub struct Request {
     /// Progress against the request's thinking budget
     /// ([`crate::types::DecodeParams::thinking_budget`]).
     pub thinking: crate::thinking_budget::BudgetState,
+    /// The output index of a `</think>` the leaf drew in place of an EOS
+    /// (GitHub #315, ADR 0048): the token after the round that reported the
+    /// redirect. Reported on the request's finish only once it was emitted.
+    pub reasoning_redirected_at: Option<u32>,
     /// Progress through the request's forced literal
     /// ([`crate::types::RequestInput::forced_literal`], GitHub #286).
     pub forced_state: crate::forced_literal::ForcedState,
@@ -246,6 +250,7 @@ impl Request {
             attention: None,
             drawn: Vec::new(),
             thinking: crate::thinking_budget::BudgetState::default(),
+            reasoning_redirected_at: None,
             forced_state: crate::forced_literal::ForcedState::default(),
             resources,
             remaining_work,
@@ -743,6 +748,7 @@ impl Request {
         // closed before is open again. A budget left at its old close
         // would never force the new block's.
         self.thinking = crate::thinking_budget::BudgetState::default();
+        self.reasoning_redirected_at = None;
         self.forced_state = crate::forced_literal::ForcedState::default();
         true
     }
