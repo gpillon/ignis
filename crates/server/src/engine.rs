@@ -161,9 +161,10 @@ pub struct Engine {
     /// consumer after each tick (design §"telemetry: computed off the model
     /// thread, published wait-free").
     counters: Arc<ArcSwap<IntervalCounters>>,
-    /// Moves every time a request leaves the scheduler — finished or
-    /// cancelled — which is when a submission that found the engine full
-    /// may be admitted (GitHub #282, the socket admission queue).
+    /// Moves every time a request leaves the scheduler — finished, or
+    /// cancelled and then released by the next step — which is when a
+    /// submission that found the engine full may be admitted (GitHub #282,
+    /// the socket admission queue).
     freed: watch::Receiver<u64>,
 }
 
@@ -348,9 +349,12 @@ impl Engine {
         if self.commands.send(Command::Submit { input, class, notes, reply }).is_err() {
             return Err(SubmitError::Full);
         }
+        let mut pending = Unread { engine: self, reply: reply_rx, read: false };
+        let result = (&mut pending.reply).await;
+        pending.read = true;
         // A dropped reply is a submit the thread never handled: it shut down
         // with the command still queued.
-        reply_rx.await.unwrap_or(Err(SubmitError::Full))
+        result.unwrap_or(Err(SubmitError::Full))
     }
 
     /// Whether the scheduler would refuse `input` for good — unknown model,
@@ -402,7 +406,8 @@ impl Engine {
     }
 
     /// A receiver that changes every time a request leaves the scheduler,
-    /// finished or cancelled (GitHub #282): what a submission that met
+    /// finished or cancelled — a cancelled one after the step that releases
+    /// it, not at the cancel (GitHub #282): what a submission that met
     /// [`SubmitError::Full`] waits on before it tries again. Mark the current
     /// value seen *before* the attempt, so a request that leaves between the
     /// refusal and the wait is not missed.
@@ -415,6 +420,30 @@ impl Engine {
     /// can call it when the client leaves mid-fan-out.
     pub fn end_fan_out(&self, owner: ignis_core::types::FanOutId) {
         let _ = self.commands.send(Command::EndFanOut { owner });
+    }
+}
+
+/// A submission's reply while its caller waits for it. A caller that is gone
+/// before reading it — a client that hung up, a queued socket response
+/// cancelled — has made no `CancelOnDrop` yet, since it makes one from the
+/// reply: so dropping this cancels what the engine admitted for it. The
+/// reply is closed first, so the model thread either answered before (the
+/// answer is read here) or cannot answer, and cancels the request itself.
+struct Unread<'a> {
+    engine: &'a Engine,
+    reply: oneshot::Receiver<Result<(RequestId, EventStream), SubmitError>>,
+    read: bool,
+}
+
+impl Drop for Unread<'_> {
+    fn drop(&mut self) {
+        if self.read {
+            return;
+        }
+        self.reply.close();
+        if let Ok(Ok((request, _))) = self.reply.try_recv() {
+            self.engine.cancel(request);
+        }
     }
 }
 
@@ -432,11 +461,15 @@ fn model_thread_loop(
     freed: watch::Sender<u64>,
 ) {
     let mut streams: HashMap<RequestId, EventRoute> = HashMap::new();
+    // A request was cancelled since the last step. The scheduler releases it
+    // no later than its next step, and only then does `freed` move: a
+    // submission handled before that step still finds the engine full.
+    let mut cancelled = false;
     loop {
         loop {
             match commands.try_recv() {
                 Ok(Command::Shutdown) => return end_in_flight(&mut *scheduler, &mut streams, &facts),
-                Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
+                Ok(command) => cancelled |= handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
                 Err(std_mpsc::TryRecvError::Empty) => break,
                 // Every Engine handle was dropped: clean shutdown (no
                 // in-flight request is silently dropped — the process is
@@ -447,12 +480,19 @@ fn model_thread_loop(
         if !scheduler.is_idle() {
             let events = scheduler.advance();
             route_events(&events, &mut streams, &facts, &freed);
+            if std::mem::take(&mut cancelled) {
+                free(&freed);
+            }
             // Read after the step, not before: the step that releases the
             // last request's pages is the last one there is, so a reading
             // taken before it would leave the release unreported until a
             // request that may never come (GitHub #216).
             let _ = facts.send(TelemetryFact::Tick(scheduler.occupancy()));
             continue;
+        }
+        // Nothing in flight: a cancelled request is already gone.
+        if std::mem::take(&mut cancelled) {
+            free(&freed);
         }
         // Idle: block on the next command instead of busy-spinning. An
         // unbounded `recv()` (rather than a timed wait) is deliberate: with
@@ -463,7 +503,7 @@ fn model_thread_loop(
         // ~no CPU either way, but this is the tighter of the two).
         match commands.recv() {
             Ok(Command::Shutdown) => return end_in_flight(&mut *scheduler, &mut streams, &facts),
-            Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
+            Ok(command) => cancelled |= handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
             Err(_) => return,
         }
     }
@@ -501,13 +541,15 @@ fn end_in_flight(
 }
 
 /// Handle one command against the thread-owned scheduler/route table.
+/// Returns whether it cancelled a request, which the model thread's loop
+/// reports on [`Engine::freed`] once the scheduler has released it.
 fn handle_command(
     command: Command,
     scheduler: &mut dyn Scheduler,
     streams: &mut HashMap<RequestId, EventRoute>,
     facts: &UnboundedSender<TelemetryFact>,
     freed: &watch::Sender<u64>,
-) {
+) -> bool {
     match command {
         Command::Submit { input, class, notes, reply } => {
             // P3-06: the request log's `prompt_tokens` field is read here,
@@ -520,8 +562,16 @@ fn handle_command(
                 let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens, class, notes));
                 (id, stream)
             });
-            // A dropped receiver (the caller gave up) is not an error here.
-            let _ = reply.send(result);
+            // A caller gone before its answer ([`Unread`]) leaves nothing
+            // running: what was admitted for it is cancelled here, as its
+            // own drop would have.
+            if let Err(Ok((request, _))) = reply.send(result) {
+                if scheduler.cancel(request) {
+                    streams.remove(&request);
+                    let _ = facts.send(TelemetryFact::Cancelled(request));
+                    return true;
+                }
+            }
         }
         Command::Refusal { input, reply } => {
             let _ = reply.send(scheduler.refusal(&input));
@@ -529,7 +579,7 @@ fn handle_command(
         Command::Cancel { request } => {
             if scheduler.cancel(request) {
                 streams.remove(&request);
-                free(freed);
+                return true;
             }
         }
         // Routed like a step's events: the retained-slot gauge has to move
@@ -542,6 +592,7 @@ fn handle_command(
         // one command.
         Command::Shutdown => {}
     }
+    false
 }
 
 /// Route one step's emitted events into their registered per-request
@@ -1311,6 +1362,185 @@ mod tests {
         // Drop A's stream without draining it to completion — the model
         // thread's shutdown must not hang on an abandoned request.
         drop(rx_a);
+    }
+
+    /// The socket admission queue's wake-up (GitHub #282). A cancel only
+    /// marks its request; the scheduler releases it at its next step, so a
+    /// submission handled in between still finds the engine full. Had
+    /// `freed` moved at the cancel, a queued request woken by that move and
+    /// answered full would wait for a move that had already come — and never
+    /// be admitted. It moves after the step that releases the request.
+    #[tokio::test]
+    async fn freed_moves_after_the_step_that_releases_a_cancelled_request() {
+        let (gated, gate) = GatedCompute::new(Arc::new(MockCompute::new()));
+        // Two places, and room for two requests that run until cancelled.
+        let scheduler = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                max_in_flight: 2,
+                max_sequence_tokens: 2 << 20,
+                kv_capacity_pages: (2 << 20) / 16 * 2,
+                ..SchedulerConfig::default()
+            },
+            gated.clone() as Arc<dyn Compute>,
+        );
+        let engine = Engine::new(Box::new(scheduler));
+        let mut freed = engine.freed();
+        let long = || input("test-model", vec![1, 2, 3], Some(1_000_000));
+        let (a, mut rx_a) = engine.submit(long(), RequestClass::Interactive).await.expect("submit A");
+        let (_, mut rx_c) = engine.submit(long(), RequestClass::Interactive).await.expect("submit C");
+        // Both decoding: every step from here on calls `decode_step`.
+        for rx in [&mut rx_a, &mut rx_c] {
+            loop {
+                if let SchedEvent::Token { .. } = rx.recv().await.expect("a long request is running") {
+                    break;
+                }
+            }
+        }
+
+        // Hold a step, and queue behind it A's cancel, then B's submission:
+        // the thread handles both before its next step.
+        gated.arm();
+        gate.wait_entered();
+        engine.cancel(a);
+        let submit = |engine: &Engine| {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.submit(input("test-model", vec![9], Some(1)), RequestClass::Interactive).await
+            })
+        };
+        let first_try = submit(&engine);
+        tokio::task::yield_now().await;
+        // Hold the next step too: the one that releases A.
+        gated.arm();
+        gate.release();
+        let refused = first_try.await.expect("the submit task must not panic");
+        assert!(matches!(refused, Err(SubmitError::Full)), "A still held its place: {refused:?}");
+        gate.wait_entered();
+
+        // Whatever `freed` did up to B's answer, B has seen. C's next step is
+        // held, so C cannot finish and move `freed` itself.
+        freed.borrow_and_update();
+        gated.arm();
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(10), freed.changed())
+            .await
+            .expect("freed moves once the cancelled request has left the scheduler")
+            .expect("the model thread is running");
+
+        // And its move means room: B is admitted now.
+        let second_try = submit(&engine);
+        tokio::task::yield_now().await;
+        gate.wait_entered();
+        gate.release();
+        second_try.await.expect("the submit task must not panic").expect("B is admitted once freed moved");
+    }
+
+    /// A submission whose caller is gone before it reads the reply leaves no
+    /// request running — a client that hangs up mid-fan-out (spec decide/04),
+    /// or a queued socket response cancelled as it is admitted. Either the
+    /// engine admits it after the caller left, and the reply has nowhere to
+    /// go; or the reply came back and was never read. No `CancelOnDrop`
+    /// exists yet in either case: the caller only makes one from the reply.
+    #[tokio::test]
+    async fn a_submission_whose_caller_is_gone_leaves_no_request_running() {
+        let (gated, gate) = GatedCompute::new(Arc::new(MockCompute::new()));
+        // Room for three requests that run until cancelled.
+        let inner = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                max_in_flight: 3,
+                max_sequence_tokens: 2 << 20,
+                kv_capacity_pages: (2 << 20) / 16 * 3,
+                ..SchedulerConfig::default()
+            },
+            gated.clone() as Arc<dyn Compute>,
+        );
+        let (admitted_tx, admitted) = std_mpsc::channel();
+        let (cancelled_tx, cancelled) = std_mpsc::channel();
+        let engine = Engine::new(Box::new(Recording { inner, admitted: admitted_tx, cancelled: cancelled_tx }));
+        let long = || input("test-model", vec![1, 2, 3], Some(2_000_000));
+        let (a, mut rx_a) = engine.submit(long(), RequestClass::Interactive).await.expect("submit A");
+        // A decoding: every step from here on calls `decode_step`.
+        loop {
+            if let SchedEvent::Token { .. } = rx_a.recv().await.expect("a long request is running") {
+                break;
+            }
+        }
+
+        // Hold a step, and send B's and C's submissions behind it: each
+        // future polled once, its command queued, its reply not yet there.
+        gated.arm();
+        gate.wait_entered();
+        let mut b = Box::pin(engine.submit(long(), RequestClass::Interactive));
+        let mut c = Box::pin(engine.submit(long(), RequestClass::Interactive));
+        std::future::poll_fn(|cx| {
+            assert!(b.as_mut().poll(cx).is_pending() && c.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // B's caller leaves before the engine answers it.
+        drop(b);
+        gate.release();
+        // C's reply comes back — a later command's answer comes after it —
+        // and C's caller leaves without reading it.
+        assert!(engine.refusal(input("test-model", vec![9], Some(1))).await.is_none());
+        drop(c);
+
+        // The engine admitted both, and both are cancelled; A, whose caller
+        // is still here, is not.
+        let within = Duration::from_secs(10);
+        let left: std::collections::BTreeSet<RequestId> =
+            (0..3).map(|_| admitted.recv_timeout(within).expect("A, B and C were admitted")).filter(|&id| id != a).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        while seen != left {
+            let id = cancelled
+                .recv_timeout(within)
+                .unwrap_or_else(|_| panic!("a request whose caller left is still running: cancelled {seen:?} of {left:?}"));
+            assert_ne!(id, a, "A's caller is still here");
+            seen.insert(id);
+        }
+    }
+
+    /// The concrete scheduler, reporting every request it admits and every
+    /// cancel it is asked for.
+    struct Recording {
+        inner: ConcreteScheduler,
+        admitted: std_mpsc::Sender<RequestId>,
+        cancelled: std_mpsc::Sender<RequestId>,
+    }
+
+    impl Scheduler for Recording {
+        fn submit(&mut self, input: RequestInput, class: RequestClass) -> Result<RequestId, SubmitError> {
+            let id = self.inner.submit(input, class)?;
+            let _ = self.admitted.send(id);
+            Ok(id)
+        }
+        fn refusal(&self, input: &RequestInput) -> Option<SubmitError> {
+            self.inner.refusal(input)
+        }
+        fn cancel(&mut self, request: RequestId) -> bool {
+            let _ = self.cancelled.send(request);
+            self.inner.cancel(request)
+        }
+        fn advance(&mut self) -> Vec<SchedEvent> {
+            self.inner.advance()
+        }
+        fn is_idle(&self) -> bool {
+            self.inner.is_idle()
+        }
+        fn model_id(&self) -> &str {
+            Scheduler::model_id(&self.inner)
+        }
+        fn max_sequence_tokens(&self) -> u32 {
+            Scheduler::max_sequence_tokens(&self.inner)
+        }
+        fn mode(&self) -> EngineMode {
+            Scheduler::mode(&self.inner)
+        }
+        fn occupancy(&self) -> ignis_core::Occupancy {
+            Scheduler::occupancy(&self.inner)
+        }
     }
 
     /// A fact as the model thread sent it, in comparable form.
