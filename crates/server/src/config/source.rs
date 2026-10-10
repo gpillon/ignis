@@ -244,23 +244,6 @@ pub enum Fit {
     /// A switch: it was named for the model being switched away from, so it
     /// is dropped, and said so.
     Switch,
-    /// A live change to a running model's config (`PATCH /v1/config`): the
-    /// patch's own values are judged as a start's — the operator named them
-    /// for this model, now — and every other source's as a switch's, since a
-    /// switch may already have dropped them to get here.
-    Reconfigure,
-}
-
-impl Fit {
-    /// Whether a value from `source` the family cannot take is refused
-    /// (rather than dropped) under this fit.
-    pub fn refuses(self, source: Source) -> bool {
-        match self {
-            Fit::Start => true,
-            Fit::Switch => false,
-            Fit::Reconfigure => source == Source::Patch,
-        }
-    }
 }
 
 /// The result of resolving every field against a [`Sources`].
@@ -326,7 +309,7 @@ impl Resolver<'_> {
             let value = parse_candidate::<K>(meta, candidate)?;
             let at_default = value == default;
             if let Some(family) = self.family.filter(|family| !meta.applies.to(*family) && !at_default) {
-                if self.fit.refuses(source) {
+                if self.fit == Fit::Start {
                     return Err(ConfigError(format!(
                         "`{} {}`: {} does not take it (a {} option)",
                         candidate.spelling,

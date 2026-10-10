@@ -704,21 +704,63 @@ impl Config {
     /// `PATCH /v1/config`, or a switch target's own artifact and id — and
     /// resolved again from the same sources for the same family.
     ///
-    /// Always from the sources, never from this config's fitted values: a
-    /// config a switch fitted had values dropped for its family, and
-    /// patching it must neither bring them back nor refuse them now. So the
-    /// patch's own entries are judged as a start's would be — one the active
-    /// family cannot take, or a backend it does not draft with, refuses the
-    /// whole patch — and the start's own values as the switch judged them
-    /// ([`source::Fit::Reconfigure`]). Every family's values are validated as
-    /// at start; the patch is refused whole if any of it is wrong.
+    /// Always from the sources, never from this config's fitted values, and
+    /// only `patch` itself is judged against the family running: one of its
+    /// entries the family cannot take, or a backend it does not draft with,
+    /// refuses the whole patch, as a start would refuse it. Everything else
+    /// — the start's values, and what earlier patches set, possibly for the
+    /// other family before a switch — is fitted as a switch fits it,
+    /// dropping what the family cannot take ([`fit_to_family`]): a value a
+    /// switch dropped on the way here is neither brought back nor refused
+    /// now. Every family's values are validated as at start; the patch is
+    /// refused whole if any of it is wrong.
     pub fn with_patch(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
         let config = self.general_with(patch)?;
         match self.basis.family() {
-            Some(family) => derive(config.basis.sources(), Some(family), Fit::Reconfigure, true).map(|(config, _)| config),
+            Some(family) => {
+                refuse_for_family(patch, family)?;
+                fit_to_family(&config, family).map(|(config, _)| config)
+            }
             None => Ok(config),
         }
     }
+}
+
+/// Refuse `patch` if one of its own entries is one `family` cannot take — a
+/// field only the other family has, at a value other than its default, or a
+/// speculative backend the family does not draft with — naming it as a
+/// start would. An entry scoped to the other family is that family's
+/// business and passes.
+fn refuse_for_family(patch: &source::Layer, family: ModelFamily) -> Result<(), ConfigError> {
+    for (meta, scope, candidate) in patch.entries() {
+        if scope.is_some_and(|scope| scope != family) {
+            continue;
+        }
+        let raw = candidate.raw.trim();
+        let value = (meta.canonical)(raw).map_err(|reason| ConfigError(format!("`{}` {reason}", candidate.spelling)))?;
+        if !meta.applies.to(family) && value != (meta.default)() {
+            return Err(ConfigError(format!(
+                "`{} {raw}`: {} does not take it (a {} option)",
+                candidate.spelling,
+                family.name(),
+                meta.applies.describe()
+            )));
+        }
+        if (meta.group, meta.name) == ("spec", "backend") {
+            if let Ok(SpecChoice::Backend(backend)) = <kind::SpecBackend as kind::FieldKind>::parse(raw) {
+                if backend != family.drafter() {
+                    return Err(ConfigError(format!(
+                        "`{} {}`: {} drafts with {}",
+                        candidate.spelling,
+                        backend.as_str(),
+                        family.name(),
+                        family.drafter().as_str()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The patch naming a model switch's target (spec model-switch/01): its
@@ -1109,8 +1151,7 @@ fn fit_family(
         None => *fitted.model = family.model_id().to_owned(),
     }
     if let Some(speculation) = fitted.speculation.filter(|s| s.backend() != family.drafter()) {
-        let from = resolution.origin("spec", "backend").map_or(source::Source::Default, |origin| origin.source);
-        if fit.refuses(from) {
+        if fit == Fit::Start {
             return Err(ConfigError(format!(
                 "`{} {}`: {} drafts with {}",
                 spelled("spec", "backend"),
