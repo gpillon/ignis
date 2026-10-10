@@ -202,3 +202,32 @@ WARN generation produced reasoning but no content or tool call
 - An end-to-end reproduction is not an acceptance criterion. The behaviour
   is a 1-in-115 sample at 57K context, and opencode does not keep the request
   body.
+
+## As built (2026-10-10, GitHub #315)
+
+Where the build departs from, or pins down, the text above:
+
+- **The cut** is `ignis_cut_and_redirect`
+  (`kernel/include/ignis_reasoning_redirect.h`), called at all six successor
+  sites. Its input is the round's run and its draw: a prefill is the empty
+  run, a plain round its anchor alone.
+- **Stop ids on every path.** With a close id set, the prefill and the plain
+  round read the lane's `stop_ids` too, not only the verify round.
+- **Penalty counts.** A temperature draw counted the stop id it drew; on a
+  redirect that occurrence moves to `</think>`, at every site, so the row a
+  snapshot or a prefix clone carries matches the text. The verify round's
+  rollback of the tokens past its cut now sums per count address
+  (`adjust_penalty_counts`), with the same result as before.
+- **Flash-Next MTP.** The verify round writes `</think>` into the licensed
+  tokens at the redirected column before its commit, so the head's entry and
+  next drafts read it. A redirect on the prefill's draw or a plain round
+  leaves one head entry made from the stop id, which the head wrote inside
+  the round before the host saw the draw. That affects drafting only; the
+  target's output is exact.
+- **The seam.** `PrefillOutcome` and `DecodeOutcome` report
+  `reasoning_redirected` on the call that drew it, one round ahead of the
+  `</think>` it emits, as `DecodeJob::permitted` is lagged. The scheduler
+  records the index then, and reports it only once that token was emitted.
+- **The mock.** `MockCompute::eos_after` adds up, one EOS per call, so a test
+  can end the answer after a redirect.
+- **AC 9's check** is `crates/runtime/tests/reasoning_redirect_gpu.rs`.
