@@ -161,9 +161,10 @@ pub struct Engine {
     /// consumer after each tick (design §"telemetry: computed off the model
     /// thread, published wait-free").
     counters: Arc<ArcSwap<IntervalCounters>>,
-    /// Moves every time a request leaves the scheduler — finished or
-    /// cancelled — which is when a submission that found the engine full
-    /// may be admitted (GitHub #282, the socket admission queue).
+    /// Moves every time a request leaves the scheduler — finished, or
+    /// cancelled and then released by the next step — which is when a
+    /// submission that found the engine full may be admitted (GitHub #282,
+    /// the socket admission queue).
     freed: watch::Receiver<u64>,
 }
 
@@ -402,7 +403,8 @@ impl Engine {
     }
 
     /// A receiver that changes every time a request leaves the scheduler,
-    /// finished or cancelled (GitHub #282): what a submission that met
+    /// finished or cancelled — a cancelled one after the step that releases
+    /// it, not at the cancel (GitHub #282): what a submission that met
     /// [`SubmitError::Full`] waits on before it tries again. Mark the current
     /// value seen *before* the attempt, so a request that leaves between the
     /// refusal and the wait is not missed.
@@ -432,11 +434,15 @@ fn model_thread_loop(
     freed: watch::Sender<u64>,
 ) {
     let mut streams: HashMap<RequestId, EventRoute> = HashMap::new();
+    // A request was cancelled since the last step. The scheduler releases it
+    // no later than its next step, and only then does `freed` move: a
+    // submission handled before that step still finds the engine full.
+    let mut cancelled = false;
     loop {
         loop {
             match commands.try_recv() {
                 Ok(Command::Shutdown) => return end_in_flight(&mut *scheduler, &mut streams, &facts),
-                Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
+                Ok(command) => cancelled |= handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
                 Err(std_mpsc::TryRecvError::Empty) => break,
                 // Every Engine handle was dropped: clean shutdown (no
                 // in-flight request is silently dropped — the process is
@@ -447,12 +453,19 @@ fn model_thread_loop(
         if !scheduler.is_idle() {
             let events = scheduler.advance();
             route_events(&events, &mut streams, &facts, &freed);
+            if std::mem::take(&mut cancelled) {
+                free(&freed);
+            }
             // Read after the step, not before: the step that releases the
             // last request's pages is the last one there is, so a reading
             // taken before it would leave the release unreported until a
             // request that may never come (GitHub #216).
             let _ = facts.send(TelemetryFact::Tick(scheduler.occupancy()));
             continue;
+        }
+        // Nothing in flight: a cancelled request is already gone.
+        if std::mem::take(&mut cancelled) {
+            free(&freed);
         }
         // Idle: block on the next command instead of busy-spinning. An
         // unbounded `recv()` (rather than a timed wait) is deliberate: with
@@ -463,7 +476,7 @@ fn model_thread_loop(
         // ~no CPU either way, but this is the tighter of the two).
         match commands.recv() {
             Ok(Command::Shutdown) => return end_in_flight(&mut *scheduler, &mut streams, &facts),
-            Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
+            Ok(command) => cancelled |= handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
             Err(_) => return,
         }
     }
@@ -501,13 +514,15 @@ fn end_in_flight(
 }
 
 /// Handle one command against the thread-owned scheduler/route table.
+/// Returns whether it cancelled a request, which the model thread's loop
+/// reports on [`Engine::freed`] once the scheduler has released it.
 fn handle_command(
     command: Command,
     scheduler: &mut dyn Scheduler,
     streams: &mut HashMap<RequestId, EventRoute>,
     facts: &UnboundedSender<TelemetryFact>,
     freed: &watch::Sender<u64>,
-) {
+) -> bool {
     match command {
         Command::Submit { input, class, notes, reply } => {
             // P3-06: the request log's `prompt_tokens` field is read here,
@@ -529,7 +544,7 @@ fn handle_command(
         Command::Cancel { request } => {
             if scheduler.cancel(request) {
                 streams.remove(&request);
-                free(freed);
+                return true;
             }
         }
         // Routed like a step's events: the retained-slot gauge has to move
@@ -542,6 +557,7 @@ fn handle_command(
         // one command.
         Command::Shutdown => {}
     }
+    false
 }
 
 /// Route one step's emitted events into their registered per-request
@@ -1311,6 +1327,78 @@ mod tests {
         // Drop A's stream without draining it to completion — the model
         // thread's shutdown must not hang on an abandoned request.
         drop(rx_a);
+    }
+
+    /// The socket admission queue's wake-up (GitHub #282). A cancel only
+    /// marks its request; the scheduler releases it at its next step, so a
+    /// submission handled in between still finds the engine full. Had
+    /// `freed` moved at the cancel, a queued request woken by that move and
+    /// answered full would wait for a move that had already come — and never
+    /// be admitted. It moves after the step that releases the request.
+    #[tokio::test]
+    async fn freed_moves_after_the_step_that_releases_a_cancelled_request() {
+        let (gated, gate) = GatedCompute::new(Arc::new(MockCompute::new()));
+        // Two places, and room for two requests that run until cancelled.
+        let scheduler = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                max_in_flight: 2,
+                max_sequence_tokens: 2 << 20,
+                kv_capacity_pages: (2 << 20) / 16 * 2,
+                ..SchedulerConfig::default()
+            },
+            gated.clone() as Arc<dyn Compute>,
+        );
+        let engine = Engine::new(Box::new(scheduler));
+        let mut freed = engine.freed();
+        let long = || input("test-model", vec![1, 2, 3], Some(1_000_000));
+        let (a, mut rx_a) = engine.submit(long(), RequestClass::Interactive).await.expect("submit A");
+        let (_, mut rx_c) = engine.submit(long(), RequestClass::Interactive).await.expect("submit C");
+        // Both decoding: every step from here on calls `decode_step`.
+        for rx in [&mut rx_a, &mut rx_c] {
+            loop {
+                if let SchedEvent::Token { .. } = rx.recv().await.expect("a long request is running") {
+                    break;
+                }
+            }
+        }
+
+        // Hold a step, and queue behind it A's cancel, then B's submission:
+        // the thread handles both before its next step.
+        gated.arm();
+        gate.wait_entered();
+        engine.cancel(a);
+        let submit = |engine: &Engine| {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.submit(input("test-model", vec![9], Some(1)), RequestClass::Interactive).await
+            })
+        };
+        let first_try = submit(&engine);
+        tokio::task::yield_now().await;
+        // Hold the next step too: the one that releases A.
+        gated.arm();
+        gate.release();
+        let refused = first_try.await.expect("the submit task must not panic");
+        assert!(matches!(refused, Err(SubmitError::Full)), "A still held its place: {refused:?}");
+        gate.wait_entered();
+
+        // Whatever `freed` did up to B's answer, B has seen. C's next step is
+        // held, so C cannot finish and move `freed` itself.
+        freed.borrow_and_update();
+        gated.arm();
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(10), freed.changed())
+            .await
+            .expect("freed moves once the cancelled request has left the scheduler")
+            .expect("the model thread is running");
+
+        // And its move means room: B is admitted now.
+        let second_try = submit(&engine);
+        tokio::task::yield_now().await;
+        gate.wait_entered();
+        gate.release();
+        second_try.await.expect("the submit task must not panic").expect("B is admitted once freed moved");
     }
 
     /// A fact as the model thread sent it, in comparable form.
