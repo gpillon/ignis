@@ -125,6 +125,19 @@ fn files_in(rig: &Rig) -> Vec<String> {
     names
 }
 
+/// The files left once the deletes already queued have run: a transfer that
+/// ends queues its file's delete on the IO thread, which runs it after.
+fn files_once_deleted(rig: &Rig) -> Vec<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let names = files_in(rig);
+        if names.is_empty() || std::time::Instant::now() > deadline {
+            return names;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn file_of(rig: &Rig, name: &str) -> std::path::PathBuf {
     let root = rig.location.join(kv_disk::DIR_NAME);
     let dir = std::fs::read_dir(root).unwrap().flatten().next().unwrap().path();
@@ -168,7 +181,7 @@ fn a_live_sequence_spilled_and_restored_a_window_at_a_time_continues_as_if_it_ne
     assert!(matches!(outcome, DiskOutcome::Restored { .. }), "{outcome:?}");
     assert_eq!(rig.leaf.calls.lock().unwrap().restore_windows.len(), 6);
     assert_eq!(decode(&rig.compute, a, 5).len(), 5, "A decodes again on its restored sequence");
-    assert!(files_in(&rig).is_empty(), "a live file goes once it has landed");
+    assert!(files_once_deleted(&rig).is_empty(), "a live file goes once it has landed");
 }
 
 #[test]
