@@ -1,5 +1,5 @@
 //! `Server::serve_on`: serving on a listener the caller already bound — what
-//! `--expose` needs, since the tunnel is opened on the bound port before the
+//! `--server-expose` needs, since the tunnel is opened on the bound port before the
 //! server starts serving (ADR 0028). The tunnel itself needs the network and
 //! is checked by hand; this covers the seam `main` uses.
 
@@ -62,7 +62,7 @@ async fn a_server_serves_on_a_listener_bound_before_it_and_stops_on_request() {
     serving.await.expect("join").expect("graceful stop");
 }
 
-/// GitHub #89 / ADR 0017: with `--metrics`, the exposition is served on its
+/// GitHub #89 / ADR 0017: with `--server-metrics`, the exposition is served on its
 /// own listener, without the API key; the API listener does not serve it at
 /// the root; one shutdown stops both.
 #[tokio::test]

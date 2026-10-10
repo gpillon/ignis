@@ -98,7 +98,7 @@ The client sends text frames carrying one JSON event each. `response.create` tak
     responses(
         (status = 101, description = "Switching protocols: the socket is open."),
         (status = 400, description = "Not a WebSocket upgrade.", body = ApiError),
-        (status = 401, description = "The server was started with `--api-key` and the upgrade carried no matching bearer token or `openai-insecure-api-key.<key>` subprotocol.", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the upgrade carried no matching bearer token or `openai-insecure-api-key.<key>` subprotocol.", body = ApiError),
     ),
 )]
 pub(crate) async fn connect(
@@ -624,8 +624,8 @@ async fn serve(
         }
     };
     let mut guard = CancelOnDrop::new(engine, request);
-    // `--request-timeout` counts from admission, never from queueing.
-    let deadline = tokio::time::Instant::now() + server.request_timeout;
+    // `--server-request-timeout` counts from admission, never from queueing.
+    let deadline = tokio::time::Instant::now() + server.live().request_timeout;
     let driven = tokio::select! {
         driven = drive(&mut events, &mut scheduled, deadline, emit) => Some(driven),
         () = &mut cancel => None,
@@ -633,7 +633,7 @@ async fn serve(
     match driven {
         Some(Driven::Ended) => guard.completed(),
         Some(Driven::TimedOut) => {
-            let message = api::request_timeout_message(server.request_timeout);
+            let message = api::request_timeout_message(server.live().request_timeout);
             events.failed("request_timeout", message).into_iter().for_each(emit);
         }
         None => {

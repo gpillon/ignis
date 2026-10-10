@@ -96,7 +96,7 @@ impl LoadError {
             Self::ArtifactMissing => tracing::error!(
                 name: "ignis.artifact.missing",
                 %artifact,
-                "no such file — {outcome}; drop --artifact/IGNIS_ARTIFACT to fetch the model into --model-download-path instead"
+                "no such file — {outcome}; drop --model-artifact/IGNIS_MODEL_ARTIFACT to fetch the model into --download-path instead"
             ),
             Self::SidecarMissing(error) => {
                 tracing::error!(name: "ignis.artifact.sidecar_missing", %artifact, %error, "{outcome}")
@@ -134,7 +134,7 @@ impl LoadError {
 pub struct PreparedModel {
     /// The container the load opens.
     pub artifact: std::path::PathBuf,
-    /// The id the load is served under ([`crate::config::served_model_for`]).
+    /// The id the load is served under ([`crate::config::Config::for_family`]).
     pub model: String,
     /// The artifact's model (ADR 0043).
     pub family: ignis_core::compute::ModelFamily,
@@ -152,6 +152,13 @@ pub struct PreparedModel {
     eos: Option<TokenId>,
 }
 
+impl PreparedModel {
+    /// The configuration the load runs with, fitted to its family.
+    pub fn config(&self) -> &crate::config::Config {
+        &self.config
+    }
+}
+
 /// A loaded model and what its load reserved (`/metrics`, GitHub #216):
 /// `None` where nothing was planned (a build without `cuda`).
 pub struct LoadedModel {
@@ -165,7 +172,7 @@ pub struct LoadedModel {
 /// `config` (the verified loader path, server-03): the file must exist, its
 /// sidecar be present and its checksum report clean; the artifact names its
 /// model, which the start options must fit; the thinking defaults must be
-/// ones its template honours, and with `--vision` its processor must match
+/// ones its template honours, and with `--vision-enabled` its processor must match
 /// the model contract. Any of those is a [`LoadError`], never a silent
 /// fallback to the placeholder.
 pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path) -> Result<PreparedModel, LoadError> {
@@ -193,7 +200,15 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
     let family = crate::loader::artifact_family(artifact)
         .map_err(|e| LoadError::ArtifactInvalid(e.to_string()))?
         .unwrap_or(ignis_core::compute::ModelFamily::Qwen38_27b);
-    let model = crate::config::served_model_for(config, family).map_err(|e| LoadError::ModelMismatch(e.to_string()))?;
+    // The options fitted to the family (spec config-v2/01): at start, its
+    // scoped values applied and anything the family cannot take refused; a
+    // switch hands over options it already fitted (`config::fit_to_family`,
+    // which drops instead of refusing), and those are used as they are.
+    let config = match config.basis.family() {
+        Some(fitted) if fitted == family => config.clone(),
+        _ => config.for_family(family).map_err(|e| LoadError::ModelMismatch(e.to_string()))?,
+    };
+    let model = config.model.clone();
 
     // The thinking budget's forced close (2026-09-24), in this model's own
     // tokens. A tokenizer that splits `</think>` leaves every budget inert:
@@ -212,7 +227,7 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
         }
     };
 
-    // GitHub #179: a `--vision` load prepares images with the artifact's
+    // GitHub #179: a `--vision-enabled` load prepares images with the artifact's
     // processor and acquires them before admission. A tokenizer whose
     // placeholder ids are not the model contract's is refused. Built before
     // the load, which sizes the encoder for the processor's item bound.
@@ -255,7 +270,7 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
         artifact: artifact.to_path_buf(),
         model,
         family,
-        config: config.clone(),
+        config,
         provider,
         acquirer,
         item_bound,
@@ -287,7 +302,7 @@ pub fn load_model(prepared: PreparedModel) -> Result<LoadedModel, LoadError> {
         let _ = (item_bound, thinking_close, eos);
         tracing::warn!(
             name: "ignis.model.mock_compute",
-            "built without --features cuda — MockCompute despite --artifact/IGNIS_ARTIFACT (the templated text is real, the completions are not)"
+            "built without --features cuda — MockCompute despite --model-artifact/IGNIS_MODEL_ARTIFACT (the templated text is real, the completions are not)"
         );
         (mock_scheduler(&model, config.default_max_tokens), None)
     };

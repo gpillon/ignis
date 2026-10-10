@@ -172,7 +172,7 @@ fn the_default_plan_is_offloaded_at_524288_tokens_and_the_floor_opt_in_warns() {
     let refused = flash_next_scheduler(&path, MODEL.into(), EOS, EngineShape { vram: below, ..shape }, None)
         .err()
         .expect("below the floor without the opt-in");
-    assert!(refused.contains("--allow-expert-cache-below-floor"), "{refused}");
+    assert!(refused.contains("--vram-allow-expert-cache-below-floor"), "{refused}");
     // The first load's pinned pool frees asynchronously.
     for _ in 0..60 {
         if available_physical_bytes().unwrap_or(0) + (1 << 30) >= available_before {
@@ -189,7 +189,7 @@ fn the_default_plan_is_offloaded_at_524288_tokens_and_the_floor_opt_in_warns() {
     assert!(below_floor < EXPERT_CACHE_FLOOR_BYTES, "{warning}");
     assert_eq!(below_floor, reserved.expert_cache_bytes);
     assert_eq!(warning["floor_bytes"], EXPERT_CACHE_FLOOR_BYTES);
-    assert!(warning["knobs"].as_str().unwrap().contains("--kv-pool-bytes"), "{warning}");
+    assert!(warning["knobs"].as_str().unwrap().contains("--vram-kv-pool-bytes"), "{warning}");
 }
 
 fn load(shape: EngineShape) -> Option<ConcreteScheduler> {

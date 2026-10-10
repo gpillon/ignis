@@ -59,14 +59,14 @@ When output names a domain concept, use the term as defined here.
   Pages are a dimension of their own: see **KV reservation**.
 - **Generation cap** — the most a request may generate, reasoning included:
   its `max_tokens` (`max_completion_tokens`, `max_output_tokens`), or else the
-  server's `--default-max-tokens` (on both models; its own default is 38,912,
+  server's `--model-default-max-tokens` (on both models; its own default is 38,912,
   Qwen's output length for complex tasks, and the flag changes it), clamped to
-  what the prompt leaves of `--max-context`.
+  what the prompt leaves of `--model-max-context`.
   `0` lifts the default to the context. Reaching it ends the request with
   `finish_reason: "length"`. An explicit cap past the context is refused, never
   clamped (ADR 0045).
 - **KV reservation** — the KV pages the pool has given a request. Its *bound*
-  is prompt plus **generation cap**, never past `--max-context`. A submission
+  is prompt plus **generation cap**, never past `--model-max-context`. A submission
   is checked against the bound, so a request alone always fits the pool.
   Which reservation rule applies is decided by a measurement, ADR 0045's P0
   gate.
@@ -107,10 +107,10 @@ When output names a domain concept, use the term as defined here.
   budget**. **Offloaded** — Flash-Next with its experts streaming, as on the
   5090 — the pool is reserved first and the **expert cache** takes the rest.
   That reserved pool is 524,288 tokens, at most every lane's whole context, and
-  never less than one `--max-context` sequence plus a page per retained slot.
+  never less than one `--model-max-context` sequence plus a page per retained slot.
   Either way the lanes share the pool: a lane costs its state, not a context,
   and a request the pages it has used (**KV reservation**).
-  `--kv-pool-bytes` names the pool on both models, in bytes or in tokens.
+  `--vram-kv-pool-bytes` names the pool on both models, in bytes or in tokens.
 - **Trained position envelope** — the 262,144 rotary positions the checkpoint
   was trained over. Not a limit the engine enforces: a sequence past it is
   served (the attention envelope reaches 1,048,576 keys under hq-e8-2b), it is
@@ -170,7 +170,7 @@ When output names a domain concept, use the term as defined here.
 - **Expert cache** — the fixed-size VRAM slot pools that hold the projections
   in use, replaced least-recently-used; a plan line at load. It takes what the
   **KV pool policy** leaves. Below its 12 GiB floor the start is refused,
-  unless the operator accepts it with `--allow-expert-cache-below-floor`
+  unless the operator accepts it with `--vram-allow-expert-cache-below-floor`
   (ADR 0045).
 - **Router lookahead** — the next layer's router applied to this layer's MoE
   input to prefetch its likely experts into the cache.
@@ -542,7 +542,7 @@ When output names a domain concept, use the term as defined here.
   decode lanes one chunk of latency instead of the whole span. The scheduler
   drives it by passing one chunk per prefill call.
 - **Decode share** — the part of the model's time decoding lanes keep while a
-  prompt prefills (`--decode-share`, in percent). After a chunk that took `t`,
+  prompt prefills (`--model-decode-share`, in percent). After a chunk that took `t`,
   the next chunk of the same prompt waits until `t * s / (1 - s)` of wall time
   has passed with the lanes decoding; with no lane decoding it runs at once, and
   after a prompt's last chunk nothing waits, so a newcomer queued behind it
@@ -603,10 +603,10 @@ When output names a domain concept, use the term as defined here.
   are ~20 GiB of BF16 KV against ~3.02 GB of hq (**KV format**).
 - **DFlash2** — the 5-layer sliding-window (2048) speculative-decoding drafter
   (hidden 5120, draft tokens 1..7, native acceptance 3.4–3.7 tokens/round).
-  Selected at load (`--spec dflash2 --draft-tokens N`); without it none of the
+  Selected at load (`--spec-backend dflash2 --spec-draft-tokens N`); without it none of the
   66 `dflash2/*` objects is bound.
 - **Draft window** — the number of tokens the drafter proposes per round
-  (`--draft-tokens`, 1..7), fixed for the life of a load. Not to be confused
+  (`--spec-draft-tokens`, 1..7), fixed for the life of a load. Not to be confused
   with the drafter's own 2048-token sliding **drafter window**.
 - **Drafter window** — a sequence's DFlash2 context: every drafter layer's
   BF16 K and V for the last 2048 positions (40 MiB). Per-sequence state in the
@@ -661,7 +661,7 @@ When output names a domain concept, use the term as defined here.
   drafter (draft window 1..7 chosen at load, verification width chosen per
   round). Deferred behind **DFlash2** at G5.
 - **Vision** — multimodal input: images today, video refused until its own
-  spec. A load option (`--vision`): without it nothing of the tower is bound
+  spec. A load option (`--vision-enabled`): without it nothing of the tower is bound
   or reserved and text serving is unchanged. With it, a chat message's
   content parts may carry images by `data:` URI or HTTP(S) URL; the server
   **acquires** and prepares each one before admission, the template expands
@@ -978,6 +978,32 @@ When output names a domain concept, use the term as defined here.
   Responses WebSocket request waits in when the engine is full, told so with
   `response.queued`, instead of being refused with a 503 as an HTTP request
   is. Only its head retries, each time a request leaves the scheduler.
+
+## Configuration (ADR 0046, specs `config-v2/01-02`)
+
+- **Field** — one configurable setting, declared once (`config::schema`): its
+  flag `--<group>-<field>`, env var `IGNIS_<GROUP>_<FIELD>`, config-file key
+  `<group>.<field>`, default, rule and help text all come from that one
+  declaration. Fields are grouped by concern (`server`, `model`, `vram`,
+  `reuse`, `switch`, `spec`, `vision`, `media`, `download`, `ngram`,
+  `kv_disk`). `ignis-server help --fields` lists every one.
+- **Family scope** — a field both model families take but want sized
+  differently has a variant per family (`qwen38`, `qwen38flashnext`, from
+  `ModelFamily`, never a served id): `--qwen38flashnext-reuse-kv-host-pool-bytes`.
+  A tiebreaker *within* each source, not a source of its own: the command line
+  wins whatever its scope.
+- **Applicability** — the families a field means anything for (`Only(Flash-Next)`
+  for the decode lanes, `Only(27B)` for vision). An explicit value for a family
+  that cannot take it is refused at start and dropped, with a log line, on a
+  switch; a value equal to the field's default is neither.
+- **Profile** — a named bundle of hardware-shaped field defaults (`--profile`,
+  built-in `rtx5090`, or a config file's `profiles:`): below the config file,
+  above the hardcoded defaults — a default, never an override.
+- **Live change** / **reload** — the two ways `PATCH /v1/config` applies a
+  change, never both in one patch: a live change touches only server-level
+  values (timeouts, message policies, thinking defaults, switch knobs) and no
+  model; a reload runs the whole patch through the model switch, reloading the
+  same model with the patched configuration.
 
 ## Observability
 

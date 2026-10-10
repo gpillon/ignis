@@ -53,7 +53,7 @@ const MODEL_FLASH_NEXT: &str = "qwen3.8-flash-next";
 /// check a little more room on a machine running other things at the same
 /// time.
 fn options() -> ignis_server::config::Config {
-    let args: Vec<String> = ["--max-context", "16384", "--retained-host", "0"].map(String::from).to_vec();
+    let args: Vec<String> = ["--model-max-context", "16384", "--reuse-retained-host", "0"].map(String::from).to_vec();
     match ignis_server::config::resolve(&args, |_| None).expect("the options resolve") {
         ignis_server::config::ConfigOutcome::Config(config) => config,
         _ => unreachable!("flags without --help are a config"),

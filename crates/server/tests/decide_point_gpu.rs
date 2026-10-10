@@ -98,7 +98,7 @@ fn fixture_dir() -> PathBuf {
 }
 
 /// A live server over the real GPU-backed scheduler with vision bound and
-/// the media path wired, exactly as `main.rs` wires one under `--vision`.
+/// the media path wired, exactly as `main.rs` wires one under `--vision-enabled`.
 ///
 /// The model thread owns the GPU-resident state and frees it only when it
 /// exits, so the router is dropped before the thread is joined — the same
@@ -352,7 +352,7 @@ async fn every_scene_lands_inside_its_button(shape: EngineShape, label: &str, me
 /// at or above this is one the answer itself vouched for.
 const CONFIDENT_SHARE: f64 = 0.10;
 
-/// Acceptance 3, in the shape an operator gets with `--vision` and no other
+/// Acceptance 3, in the shape an operator gets with `--vision-enabled` and no other
 /// flags.
 #[tokio::test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]

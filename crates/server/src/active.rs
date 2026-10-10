@@ -58,7 +58,7 @@ pub struct ActiveModel {
     /// tokenizer, and `/v1/decide` refuses rather than guessing.
     pub alphabet: Arc<ignis_core::decision::AnswerAlphabet>,
     /// Acquires and prepares a request's images before admission (GitHub
-    /// #179); `None` on a load without `--vision`.
+    /// #179); `None` on a load without `--vision-enabled`.
     pub media: Option<Arc<MediaAcquirer>>,
     /// What a switch would name to load this model again: the artifact it
     /// came from and the id it is served under. `None` for a model built in
@@ -77,7 +77,7 @@ pub struct ActiveModel {
 }
 
 /// Where a loaded model came from, as a switch request names it (the
-/// `--artifact` / `--model` pair a restart would have been given).
+/// `--model-artifact` / `--model-id` pair a restart would have been given).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSource {
     /// The `.ninfer` container, a path on the server's machine, with its
@@ -85,7 +85,7 @@ pub struct ModelSource {
     pub artifact: PathBuf,
     /// The id the model is served under — what `GET /v1/models` reports and
     /// what a request must name. A known model's id must be the artifact's
-    /// own (`config::served_model_for`).
+    /// own (`config::Config::for_family`).
     pub model: String,
 }
 
@@ -122,7 +122,7 @@ impl ActiveModel {
         self
     }
 
-    /// Acquire image parts with `acquirer` (a `--vision` load, GitHub #179).
+    /// Acquire image parts with `acquirer` (a `--vision-enabled` load, GitHub #179).
     pub fn with_media(mut self, acquirer: Arc<MediaAcquirer>) -> Self {
         self.media = Some(acquirer);
         self

@@ -13,95 +13,20 @@
 //! (`template.rs`): v1 ships a deterministic built-in provider,
 //! artifact-02's artifact-backed tokenizer replaces it through the same
 //! constructor injection. The compute backend is injected through the
-//! scheduler: with `IGNIS_ARTIFACT` set and the binary built with
+//! scheduler: with `IGNIS_MODEL_ARTIFACT` set and the binary built with
 //! `--features cuda`, the entrypoint drives the real GPU-backed model
 //! (`ignis_server::runtime::cuda_scheduler`, GitHub #61 / P1-25); without
 //! either, it drives the deterministic `MockCompute` (CPU-only, ADR 0006).
 //!
-//! Configuration (CLI flags mirror each env var one-to-one — GitHub #77;
-//! run `ignis-server --help` for the full flag table. A flag overrides its
-//! env var, which overrides the built-in default):
-//! - `IGNIS_MODEL` / `--model`, `-m` — the loaded model id (default
-//!   `qwen3.8-27b`; what `GET /v1/models` reports and what submissions must
-//!   name).
-//! - `IGNIS_BIND` / `--bind`, `-b` — the bind address (default
-//!   `127.0.0.1:8000`; localhost-only by design — no network exposure, no
-//!   auth, v1).
-//! - `IGNIS_ARTIFACT` / `--artifact`, `-a` — the `.ninfer` container path
-//!   (the real tokenizer and chat template, artifact-02). A configured
-//!   artifact is loaded through the verified loader path (server-03): it
-//!   must exist, its sidecar must be present and its checksum report clean,
-//!   or the server refuses to start (no silent fallback to the placeholder).
-//!   Unset, the model is looked for under `--model-download-path` and
-//!   fetched when it is not there (below).
-//! - `IGNIS_MODEL_DOWNLOAD` / `--model-download` / `--no-model-download` —
-//!   may a missing model be fetched (ADR 0033, GitHub #234)? On by default,
-//!   and only ever consulted with `--artifact` unset. On a terminal the
-//!   operator is asked first; without one (a container, a daemon) it
-//!   downloads, since there is nobody to answer. A build without
-//!   `--features cuda` never downloads: it could not run the weights.
-//!   Off, or a model the registry does not know, is the built-in
-//!   placeholder template (its rendered `content` is not natural text).
-//! - `IGNIS_MODEL_DOWNLOAD_PATH` / `--model-download-path` — where a fetched
-//!   model lands, and where one fetched earlier is found (default
-//!   `./models`). Flat: the artifact and its sidecar keep the names the
-//!   repo publishes them under, so `hf download … --local-dir models` and
-//!   this produce the same file.
-//! - `IGNIS_ENABLE_THINKING` / `--enable-thinking` — the server-wide default
-//!   for `enable_thinking` (GitHub #68); `true` or `false`, default `true`.
-//!   An unparseable value, or a `false` the loaded template cannot honour,
-//!   refuses to start.
-//! - `IGNIS_PREFILL_CHUNK` / `--prefill-chunk` — the prefill chunk width
-//!   in tokens (default 1024; a nonzero multiple of 128 — the reference's
-//!   own alignment rule). GitHub #87.
-//! - `IGNIS_MAX_CONTEXT` / `--max-context` — the maximum per-sequence
-//!   context in tokens (default 40960: a 32K prompt plus an 8K generation
-//!   budget, so G2's largest cell is admissible without editing code). The
-//!   paged-KV pool the leaf builds is derived from this value (never
-//!   below it, so admission can never promise more pages than the leaf
-//!   built) rather than being an independent flag.
-//! - `IGNIS_REASONING_EFFORT` / `--reasoning-effort` — the server-wide
-//!   default `reasoning_effort`; unset means "let the template's own
-//!   default apply". An unknown value, or one the loaded template does not
-//!   support, refuses to start.
-//! - `IGNIS_THINKING_BUDGET` / `--thinking-budget` — the server-wide
-//!   thinking budget, in reasoning tokens (default 32768, `off` for none;
-//!   spec server/08). Configured with a tokenizer that yields no thinking
-//!   close, it refuses to start.
-//! - `IGNIS_REQUEST_TIMEOUT` / `--request-timeout` — how long a
-//!   non-streaming completion waits before the handler gives up with a
-//!   `504` (default 30 seconds, max 3600 — GitHub #95).
-//! - `IGNIS_SWITCH_DRAIN_TIMEOUT` / `--switch-drain-timeout` — how long a
-//!   model switch lets the old model's running requests finish before it
-//!   cancels them (default 30 seconds, max 3600, 0 cancels at once — spec
-//!   model-switch/01). A switch loads its target on the flags the server
-//!   started with, leaving off the ones only the other model takes.
-//! - `IGNIS_ALLOW_MODEL_SWITCH` / `--allow-model-switch <true|false>` and
-//!   `IGNIS_KNOWN_MODELS` / `--known-model <id>=<path>` (repeatable; the env
-//!   var takes `;`-separated pairs) — a request whose `model` names another
-//!   listed model switches the server to it and is then served on it (default
-//!   on; spec model-switch/01 §Implicit switch). The model the server starts
-//!   on is always listed; off, or unlisted, such a request is a `404
-//!   model_not_found`, as it always was.
-//! - `--ui` / `--no-ui` / `IGNIS_UI` — serve the Playground at `/ui/`
-//!   (GitHub #163, ADR 0026); **on** by default. A binary built without
-//!   `web/dist` serves the page that says how to build it, so the default
-//!   costs a route and nothing else.
-//! - `--metrics` / `--metrics-bind <addr>` (flags only, no env var) — serve
-//!   Prometheus metrics at `GET /metrics` on their own listener (default
-//!   `127.0.0.1:9464`, no API key, never exposed), and at `/ui/metrics`
-//!   unless `--no-ui`, under the API key when one is set (GitHub #89, ADR
-//!   0017). Off by default, and off means neither the routes nor the
-//!   projection exist.
-//! - `IGNIS_API_KEY` / `--api-key` — when set, every `/v1` request must
-//!   send `Authorization: Bearer <key>` or gets a `401`; unset (default)
-//!   leaves the API open. `auto` generates a key at start and prints it to
-//!   stdout — the only case a key is ever printed.
-//! - `IGNIS_EXPOSE` / `--expose` — make the server reachable from outside
-//!   this machine (ADR 0028). `cloudflare-quick` opens a Cloudflare quick
-//!   tunnel once the listener is bound and prints its public URL on stdout.
-//!   An exposed server always requires an API key: with none set, it
-//!   behaves as `--api-key auto`.
+//! Configuration (ADR 0046, `ignis_server::config`): every field is declared
+//! once and has a flag (`--<group>-<field>`), an env var
+//! (`IGNIS_<GROUP>_<FIELD>`) and a config-file key (`<group>.<field>`), resolved
+//! flag > env > config file > profile > default, with a family-scoped
+//! variant (`--qwen38-…`, `--qwen38flashnext-…`) winning within each source.
+//! `ignis-server help --fields` prints every one from the same table, so this
+//! comment does not repeat it. `main` resolves once, builds the load from the
+//! options fitted to the artifact's family, and serves `GET`/`PATCH
+//! /v1/config` over the running configuration.
 
 use std::sync::Arc;
 
@@ -149,26 +74,43 @@ async fn main() {
     };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let config = match config::resolve(&args, |name| std::env::var(name).ok()) {
+    let config = match config::resolve_with(&args, |name| std::env::var(name).ok(), &config::file::RealFiles) {
         Ok(ConfigOutcome::Config(config)) => config,
         Ok(ConfigOutcome::Help(text)) => {
             println!("{text}");
             std::process::exit(0);
         }
-        Ok(ConfigOutcome::Version(text)) => {
-            println!("{text}");
+        Ok(ConfigOutcome::Version(text)) | Ok(ConfigOutcome::Print(text)) => {
+            print!("{}", if text.ends_with('\n') { text } else { format!("{text}\n") });
             std::process::exit(0);
         }
+        // `config generate --out` / `config patch` (spec config-v2/02): the
+        // one place a config file is written, resolution having checked it.
+        Ok(ConfigOutcome::Write { path, contents }) => match std::fs::write(&path, contents) {
+            Ok(()) => {
+                println!("ignis-server: wrote {}", path.display());
+                std::process::exit(0);
+            }
+            Err(err) => {
+                tracing::error!(name: "ignis.config.write_failed", path = %path.display(), error = %err, "config file not written");
+                exit_after_flush(&logging_handle, 1);
+            }
+        },
         Err(err) => {
             tracing::error!(name: "ignis.config.invalid", error = %err, "refusing to start");
             exit_after_flush(&logging_handle, 1);
         }
     };
-    // The start options a load reads (`load::prepare_model`): what the
-    // loaded model's family is checked against once the artifact names it
-    // (`config::served_model_for`, spec flash-next/04), and the engine shape
-    // (GitHub #87), already validated by `config::resolve` above. A model
-    // switch loads every later model from the same options.
+    // Spec config-v2/02 AC 12: where the configuration came from, said
+    // before anything is loaded, so it is in the log even when the load then
+    // fails.
+    config::log_source(&config);
+    // The start options a load reads (`load::prepare_model`), which fits
+    // them to the artifact's family once it names one (`Config::for_family`,
+    // spec flash-next/04 and config-v2/01): a value scoped to that family is
+    // the one the load runs with, and the engine shape (GitHub #87) is read
+    // from the fitted config. A model switch loads every later model from
+    // the same options, fitted to its own family.
     let start_options = config.clone();
     let Config {
         model,
@@ -222,6 +164,8 @@ async fn main() {
         metrics,
         api_key,
         expose,
+        // What the options were resolved from: the load fits them again.
+        basis: _,
     } = config;
     let api_key = match api_key {
         None => None,
@@ -243,7 +187,7 @@ async fn main() {
     };
 
     // Where the artifact comes from (GitHub #234, ADR 0033): the path the
-    // operator named, one already under `--model-download-path`, one fetched
+    // operator named, one already under `--download-path`, one fetched
     // now, or none at all — which is the placeholder start this server has
     // always had, with a line saying which of the reasons it was.
     let source = download::artifact_source(
@@ -305,16 +249,20 @@ async fn main() {
     // placeholder path, which loads no model and plans no device memory, and
     // on a build without `cuda`, which plans none either.
     let mut load_reservations: Option<ignis_server::metrics::LoadReservations> = None;
-    let server = if let Some(artifact_path) = &artifact {
+    let (server, running) = if let Some(artifact_path) = &artifact {
         // The loader path (server-03, GitHub #21), shared with the model
         // switch (spec model-switch/01): the `.ninfer` container named by
-        // `--artifact`/`IGNIS_ARTIFACT` is verified — sidecar present,
+        // `--model-artifact`/`IGNIS_MODEL_ARTIFACT` is verified — sidecar present,
         // checksum report clean — named, checked against the start options,
         // and only then loaded. Any refusal stops the start: serving a broken
         // artifact would silently degrade to the placeholder.
-        let loaded = ignis_server::load::prepare_model(&start_options, artifact_path)
-            .and_then(ignis_server::load::load_model);
-        let loaded = match loaded {
+        // The running configuration is the start options fitted to the
+        // artifact's family (spec config-v2/01): what `GET /v1/config` shows.
+        let loaded = ignis_server::load::prepare_model(&start_options, artifact_path).and_then(|prepared| {
+            let running = prepared.config().clone();
+            ignis_server::load::load_model(prepared).map(|loaded| (loaded, running))
+        });
+        let (loaded, running) = match loaded {
             Ok(loaded) => loaded,
             Err(err) => {
                 err.log(artifact_path, "refusing to start");
@@ -323,16 +271,25 @@ async fn main() {
         };
         load_reservations = loaded.reservations;
         // GitHub #129: a loaded model is ready only after its first traversal.
-        Server::from_active(loaded.model).with_warm_up()
+        (Server::from_active(loaded.model).with_warm_up(), running)
     } else {
         // Why there is no artifact was said once, with its reason, where the
         // decision was made (`ignis.model.placeholder_template` above).
         let (engine, driver) =
             Engine::with_clock_and_driver(mock_scheduler(&model, default_max_tokens), Arc::new(SystemClock));
-        Server::from_active(ActiveModel::new(engine, Arc::new(SimpleTemplateProvider)).with_driver(driver))
-    }
-    .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
-    .with_instruction_policy(instruction_policy);
+        (Server::from_active(ActiveModel::new(engine, Arc::new(SimpleTemplateProvider)).with_driver(driver)), start_options.clone())
+    };
+    let server = server
+        .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
+        .with_instruction_policy(instruction_policy);
+    // Spec config-v2/02: the running configuration, shown and changed over
+    // `GET`/`PATCH /v1/config` and written back to the config file in use;
+    // the model loader shares it, so a later switch loads with a live change
+    // and a failed reload falls back to the configuration still running.
+    let config_state = Arc::new(ignis_server::config_http::ConfigState::new(
+        running,
+        Arc::new(ignis_server::config::file::RealFiles),
+    ));
     // Spec model-switch/01: `POST /v1/models/switch` loads every later model
     // through the same path, on the same start options — and so does a
     // request naming a known model (§Implicit switch), the start model among
@@ -350,11 +307,12 @@ async fn main() {
     );
     let server = server.with_switcher(
         ignis_server::model_switch::Switcher::new(
-            Arc::new(ignis_server::model_switch::ArtifactLoader::new(start_options.clone())),
+            Arc::new(ignis_server::model_switch::ArtifactLoader::sharing(Arc::clone(&config_state))),
             std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
         )
         .with_known_models(known),
-    );
+    )
+    .with_config(config_state);
 
     // GitHub #209: joining or gathering developer messages trades prefix
     // reuse for fewer system blocks; the operator is told once, at start.
@@ -394,14 +352,14 @@ async fn main() {
         if ignis_server::playground::EMBEDDED.is_empty() {
             tracing::warn!(
                 name: "ignis.playground.not_built",
-                "--ui set but this binary was built without web/dist — /ui/ serves the build instructions"
+                "--server-ui set but this binary was built without web/dist — /ui/ serves the build instructions"
             );
         }
         server.with_playground(ignis_server::playground::EMBEDDED)
     } else {
         server
     };
-    // Prometheus metrics (GitHub #89, ADR 0017): without `--metrics`, neither
+    // Prometheus metrics (GitHub #89, ADR 0017): without `--server-metrics`, neither
     // the projection nor any route to it exists.
     let server = if metrics.is_some() { server.with_metrics() } else { server };
     let server = match load_reservations {
@@ -426,7 +384,7 @@ async fn main() {
     };
 
     // The metrics listener (ADR 0017): its own address, bound before serving
-    // like the API's, and never the one `--expose` tunnels.
+    // like the API's, and never the one `--server-expose` tunnels.
     let metrics_listener = match &metrics {
         None => None,
         Some(metrics_bind) => match tokio::net::TcpListener::bind(metrics_bind).await {
@@ -438,7 +396,7 @@ async fn main() {
         },
     };
 
-    // `--expose` (ADR 0028): opened on the bound port, before serving, so a
+    // `--server-expose` (ADR 0028): opened on the bound port, before serving, so a
     // tunnel that cannot open refuses the start instead of leaving a server
     // the operator believes is reachable.
     let exposure = match expose {
@@ -480,8 +438,8 @@ async fn main() {
 
     tracing::info!(
         name: "ignis.process.started",
-        // The id the load is served under (`config::served_model_for`): a
-        // Flash-Next artifact started without `--model` is its own.
+        // The id the load is served under (`config::Config::for_family`): a
+        // Flash-Next artifact started without `--model-id` is its own.
         model = %server.active().engine.model_id(),
         bind = %bind,
         api_key_required = auth,

@@ -1,4 +1,4 @@
-//! `--expose <mode>` / `IGNIS_EXPOSE`: reach the server from outside this
+//! `--server-expose <mode>` / `IGNIS_SERVER_EXPOSE`: reach the server from outside this
 //! machine without opening a port (ADR 0028). One mode today,
 //! `cloudflare-quick` — an anonymous `https://*.trycloudflare.com` URL
 //! proxied to the local listener — named as a mode so a later one (a named
@@ -19,7 +19,7 @@ pub enum Expose {
 }
 
 impl Expose {
-    /// Every mode's name, as `--expose` spells it.
+    /// Every mode's name, as `--server-expose` spells it.
     pub const NAMES: &[&str] = &["cloudflare-quick"];
 
     pub fn parse(raw: &str) -> Result<Self, String> {
@@ -48,7 +48,7 @@ pub fn origin_port(local: SocketAddr) -> Result<u16, String> {
     match local.ip() {
         IpAddr::V4(ip) if ip.is_loopback() || ip == Ipv4Addr::UNSPECIFIED => Ok(local.port()),
         other => Err(format!(
-            "`--expose` forwards to 127.0.0.1, which a listener on {other} does not accept \
+            "`--server-expose` forwards to 127.0.0.1, which a listener on {other} does not accept \
              (bind 127.0.0.1:<port> or 0.0.0.0:<port>)"
         )),
     }
@@ -128,7 +128,7 @@ mod tests {
     fn a_listener_the_tunnel_cannot_reach_on_127_0_0_1_is_refused() {
         for addr in ["192.168.1.10:8000", "[::1]:8000", "[::]:8000"] {
             let err = origin_port(addr.parse().unwrap()).expect_err(addr);
-            assert!(err.contains("--expose") && err.contains("127.0.0.1"), "{err}");
+            assert!(err.contains("--server-expose") && err.contains("127.0.0.1"), "{err}");
         }
     }
 }

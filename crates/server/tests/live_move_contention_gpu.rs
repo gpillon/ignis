@@ -34,7 +34,7 @@
 //! `IGNIS_KV_MOVE_PACE=<in MiB>,<out MiB>` runs the load at another pace than
 //! `ignis_runtime::TransferPace::default()`.
 //!
-//! The pool is cut to one context (`--kv-pool-bytes`'s token form, #309 P1)
+//! The pool is cut to one context (`--vram-kv-pool-bytes`'s token form, #309 P1)
 //! so that E cannot fit beside C. Machine-local: the Flash-Next artifact
 //! (`IGNIS_FLASH_NEXT_DIR`), the tier's files under this checkout's
 //! `.scratch/kv-disk-gpu/` (or `IGNIS_KV_DISK_TEST_DIR`).

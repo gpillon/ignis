@@ -182,7 +182,7 @@ impl utoipa::PartialSchema for ContentPart {
         ObjectBuilder::new()
             .schema_type(SchemaType::Type(Type::Object))
             .description(Some(
-                "One OpenAI content part. A `text` part carries `text`; an `image_url` part carries an `image_url` object with a `url` (accepted only by a server started with `--vision`, else a 400 naming the part).",
+                "One OpenAI content part. A `text` part carries `text`; an `image_url` part carries an `image_url` object with a `url` (accepted only by a server started with `--vision-enabled`, else a 400 naming the part).",
             ))
             .property(
                 "type",
@@ -271,7 +271,7 @@ pub fn check_roles(messages: &[ChatMessage]) -> Result<(), TemplateRejection> {
 ///   media there). Checked first: it is wrong on any server, with or
 ///   without vision.
 /// - `video_url` → `video_unsupported` (images only, spec §Scope).
-/// - `image_url` → `vision_disabled`, unless `vision` (a `--vision` load,
+/// - `image_url` → `vision_disabled`, unless `vision` (a `--vision-enabled` load,
 ///   GitHub #179), where it passes to media acquisition.
 /// - an unknown part type → `modality_not_supported` (the reference's code
 ///   and wording).

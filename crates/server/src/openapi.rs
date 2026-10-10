@@ -62,7 +62,7 @@ The inference surface of an `ignis` server: OpenAI-compatible chat \
 completions and responses, plus `/v1/decide` (ADR 0034), which reads an \
 answer out of the model's own readout instead of generating one.\n\n\
 Every operation below is served by the listener this page was loaded \
-from. When the server runs with `--api-key`, they answer `401` without a \
+from. When the server runs with `--server-api-key`, they answer `401` without a \
 bearer token — this page and the document do not, so *Authorize* is how \
 you drive them from here.\n\n\
 `POST /v1/systemone` is an alias of `POST /v1/decide`: the same handler \
@@ -70,7 +70,7 @@ under Jev's name, so an unmodified Jev client reaches this server by \
 changing the URL alone. OpenAPI has no notion of an alias, so it is named \
 here rather than listed as a second path.\n\n\
 The Prometheus exposition is not part of this document (ADR 0017): it is \
-served on its own listener with `--metrics`, and it is monitoring rather \
+served on its own listener with `--server-metrics`, and it is monitoring rather \
 than API.\n\n\
 Every field of an OpenAI request body is honoured, accepted as inert, or \
 refused with a 400 naming it in `param` — never dropped in silence; each \
@@ -94,6 +94,7 @@ checkpoint is NVFP4: merge and re-export instead); more than one loaded model \
     security(("bearerAuth" = [])),
     tags(
         (name = "models", description = "What this server loaded."),
+        (name = "config", description = "The running configuration, read and changed."),
         (name = "chat", description = "Chat completions, streaming and not."),
         (name = "responses", description = "The OpenAI responses API."),
         (name = "tokenize", description = "A prompt's token count, and token ids back to text, without serving anything."),
@@ -102,7 +103,7 @@ checkpoint is NVFP4: merge and re-export instead); more than one loaded model \
 )]
 pub struct ApiDoc;
 
-/// Declares `--api-key` as what it is on the wire: an HTTP bearer token.
+/// Declares `--server-api-key` as what it is on the wire: an HTTP bearer token.
 ///
 /// Applied as a *security requirement on the whole document*, not per
 /// operation: the key gates every `/v1` handler route or none of them
@@ -119,7 +120,7 @@ impl Modify for BearerKey {
                 HttpBuilder::new()
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
-                        "The server's `--api-key`. Absent from a server started without one, \
+                        "The server's `--server-api-key`. Absent from a server started without one, \
                          in which case every operation answers unauthenticated.",
                     ))
                     .build(),
@@ -255,7 +256,7 @@ mod tests {
 
     #[test]
     fn the_document_declares_the_bearer_scheme() {
-        // The `--api-key` contract, stated where a client generator and the
+        // The `--server-api-key` contract, stated where a client generator and the
         // page's own Authorize button can both read it.
         let document = crate::api::openapi();
         let components = document.components.expect("components");

@@ -68,13 +68,13 @@ pub struct EngineOptions {
     /// Capture the decode rounds' graphs after the pool exists.
     pub capture_graphs: bool,
     /// Prompt reuse's retained slots (spec flash-next/05): on the device
-    /// (`--retained-device`, each one an image's worth of expert cache) and
-    /// in the pool's pinned host block (`--retained-host`). Both 0 for an
+    /// (`--reuse-retained-device`, each one an image's worth of expert cache) and
+    /// in the pool's pinned host block (`--reuse-retained-host`). Both 0 for an
     /// engine that retains nothing.
     pub retained_device_slots: u32,
     pub retained_host_slots: u32,
     /// The KV-RAM arena this load pins for its host tier
-    /// (`--kv-host-pool-bytes`); 0 creates none.
+    /// (`--reuse-kv-host-pool-bytes`); 0 creates none.
     pub kv_ram_arena_bytes: u64,
     /// Speculative decoding (spec flash-next/07): the verify round at the
     /// load's windows; `None` runs one-token rounds only.

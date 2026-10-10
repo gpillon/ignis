@@ -113,7 +113,7 @@ describe("MonitorView", () => {
   });
 
   it("tells a bound of zero apart from a bound the scrape does not carry", () => {
-    // --prompt-reuse off hands out no slots (#215): the bound is exported, and
+    // --reuse-prompt off hands out no slots (#215): the bound is exported, and
     // it is zero. That is a load with none to give, not a missing figure.
     const noSlots = IGNIS_EXPOSITION.replace('ignis_retained_slots{state="capacity"} 10', 'ignis_retained_slots{state="capacity"} 0').replace(
       'ignis_retained_slots{state="in_use"} 7',

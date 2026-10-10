@@ -84,6 +84,9 @@ fn the_document_lists_exactly_the_v1_surface() {
         "get /v1/models",
         // Spec model-switch/01: replace the loaded model.
         "post /v1/models/switch",
+        // Spec config-v2/02: the running configuration, read and changed.
+        "get /v1/config",
+        "patch /v1/config",
         "post /v1/chat/completions",
         // GitHub #285: the prompt counted without being served.
         "post /v1/tokenize",

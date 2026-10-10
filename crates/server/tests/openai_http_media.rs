@@ -1,11 +1,11 @@
 //! Media on the completion endpoints (GitHub #179): what the HTTP seam owes a
-//! `--vision` load before the model sees an image, over the real axum router
+//! `--vision-enabled` load before the model sees an image, over the real axum router
 //! against a mock-compute engine (CPU-only, ADR 0006).
 //!
 //! - An image request is submitted with its placeholders expanded and its
 //!   multimodal part; `usage` counts the image tokens (chat and responses).
 //! - A prompt that no longer fits after expansion is the existing
-//!   `context_length_exceeded` 400; without `--vision` an image is
+//!   `context_length_exceeded` 400; without `--vision-enabled` an image is
 //!   `vision_disabled`; bad media are refused before anything is submitted.
 //! - A client disconnect during preprocessing stops the work and submits
 //!   nothing.
@@ -91,7 +91,7 @@ struct Harness {
     submitted: Arc<Mutex<Vec<RequestInput>>>,
 }
 
-/// The router over a recording mock engine; with `preparer`, a `--vision`
+/// The router over a recording mock engine; with `preparer`, a `--vision-enabled`
 /// load acquiring media through it.
 fn harness(preparer: Option<Arc<dyn Preparer>>, cache_bytes: u64, max_sequence_tokens: Option<u32>) -> Harness {
     let mut config = SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() };

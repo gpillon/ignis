@@ -195,7 +195,7 @@ async fn sample(metrics: &axum::Router, name: &str) -> String {
     line.rsplit_once(' ').unwrap().1.to_owned()
 }
 
-/// `--metrics` follows the switch: the new model's requests are counted,
+/// `--server-metrics` follows the switch: the new model's requests are counted,
 /// in the same counters the old model's were.
 #[tokio::test]
 async fn metrics_keep_counting_on_the_model_a_switch_loaded() {
@@ -223,7 +223,7 @@ async fn metrics_keep_counting_on_the_model_a_switch_loaded() {
 // ── the implicit switch: a request's own `model` (spec §Implicit switch) ──
 
 /// A server on `mock-a` whose requests may switch to any of `ids` by naming
-/// it — what `main` builds from `--known-model` with `--allow-model-switch`
+/// it — what `main` builds from `--switch-known-models` with `--switch-allow-implicit`
 /// on.
 fn implicit_on(loader: &Arc<MockLoader>, ids: &[&str]) -> Server {
     let known = ids.iter().map(|id| (id.to_string(), switch_support::source(id).artifact)).collect();

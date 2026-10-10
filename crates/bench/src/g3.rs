@@ -73,7 +73,7 @@ pub const C4_CONCURRENCY: usize = 4;
 /// pages up front and never over-allocates mid-generation
 /// (`ignis_core::admission`), and the engine's pool is 65,536 tokens =
 /// 1,024 pages (`ignis_runtime::auto_kv_pool_bytes`'s 4 GiB default budget
-/// under BF16 KV, at the default 40,960-token `--max-context`; under
+/// under BF16 KV, at the default 40,960-token `--model-max-context`; under
 /// hq-e8-2b the same budget buys 7.11x that, GitHub #122). Peak concurrent demand is the four lanes
 /// plus the one in-flight prefiller:
 ///
@@ -1927,7 +1927,7 @@ mod tests {
     /// page)` up front (`ignis_core::admission::AdmissionResources`), and
     /// the pool is the 65,536 tokens `ignis_runtime::auto_kv_pool_bytes`'s
     /// 4 GiB default buys under BF16 KV at the server's default
-    /// `--max-context`. Those two numbers are mirrored
+    /// `--model-max-context`. Those two numbers are mirrored
     /// here rather than imported: this crate measures any OpenAI-compatible
     /// engine and does not depend on ignis's own runtime.
     #[test]

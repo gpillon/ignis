@@ -160,7 +160,7 @@ fn image_parts(messages: &[ChatMessage]) -> Vec<MediaPart> {
     out
 }
 
-/// The processor a `--vision` load prepares images with: the artifact's
+/// The processor a `--vision-enabled` load prepares images with: the artifact's
 /// pixel bounds and the reference's limits, with the vision-token budget
 /// capped by the load's envelope and context (`min(max_context,
 /// --vision-max-tokens)`, spec §Scope) and the raw patches it implies.

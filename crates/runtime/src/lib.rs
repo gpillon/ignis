@@ -55,13 +55,13 @@ pub const PREFILL_CHUNK_ALIGNMENT: u32 = 128;
 /// `02-real-prefill.md`, user story 22).
 pub const DEFAULT_MAX_CONTEXT: u32 = 32_768 + 8_192;
 
-/// Retained slots in VRAM by default (`--retained-device`, GitHub #281):
+/// Retained slots in VRAM by default (`--reuse-retained-device`, GitHub #281):
 /// none -- the images live on the host unless a card has VRAM to spare.
 /// Here, beside the other load defaults, so `ignis_server::config` and
 /// [`CudaLeafConfig::default`] read one number.
 pub const DEFAULT_RETAINED_DEVICE_SLOTS: u32 = 0;
 
-/// Retained slots in the pinned host block by default (`--retained-host`,
+/// Retained slots in the pinned host block by default (`--reuse-retained-host`,
 /// GitHub #281): two per decode lane -- a chain link and a checkpoint for
 /// each conversation a lane serves.
 pub const DEFAULT_RETAINED_HOST_SLOTS: u32 = 2 * ignis_core::N_DECODE_LANES as u32;
@@ -99,7 +99,7 @@ pub const CUDA_CONTEXT_BYTES: u64 = 452_595_712;
 /// What a load holds beyond every reservation the VRAM plan names (GitHub
 /// #210): allocator rounding, the decode graph captures, handles the kernel
 /// creates lazily. Measured on the RTX 5090 on 2026-09-17 at the Makefile
-/// defaults with `--vision` (262K hq-e8-2b, DFlash2/7): the server's WDDM
+/// defaults with `--vision-enabled` (262K hq-e8-2b, DFlash2/7): the server's WDDM
 /// dedicated usage right after load minus the context and every line the load
 /// allocates (the plan's total less the retained checkpoint ledger line, which
 /// that load did not allocate) -- 30,047,830,016 B held against a 4,653,252,608 B KV pool, in a

@@ -26,6 +26,7 @@ pub mod active;
 pub mod api;
 pub mod artifact_template;
 pub mod config;
+pub mod config_http;
 pub mod decide;
 pub mod decoder;
 pub mod download;
@@ -73,33 +74,22 @@ pub struct Server {
     /// request that takes it once sees one model throughout. Shared by every
     /// clone of the server, so a switch reaches every handler.
     pub active: std::sync::Arc<ArcSwap<ActiveModel>>,
-    /// How long a non-streaming request waits for its completion before the
-    /// handler gives up with a 504 (guards a wedged engine from hanging
-    /// the client forever). An operator knob (`--request-timeout` /
-    /// `IGNIS_REQUEST_TIMEOUT`, GitHub #95) — `main` sets it via
-    /// [`Server::with_request_timeout`] after `config::resolve` validates it.
-    pub request_timeout: Duration,
-    /// The server-wide `enable_thinking` default (`IGNIS_ENABLE_THINKING`,
-    /// GitHub #68) a request's unset field falls back to.
-    pub default_enable_thinking: bool,
-    /// The server-wide `reasoning_effort` default (`IGNIS_REASONING_EFFORT`).
-    pub default_reasoning_effort: Option<ReasoningEffort>,
-    /// The server-wide thinking budget (`--thinking-budget`, 2026-09-24) a
-    /// request's unset `thinking_budget` falls back to. `None` = no budget.
-    pub default_thinking_budget: Option<u32>,
-    /// The Playground's asset table when `--ui` is on (GitHub #163, ADR
+    /// The server-level knobs a live `PATCH /v1/config` may change without
+    /// touching the model (spec config-v2/02), read with [`Server::live`].
+    /// Shared by every clone, like the active model, so a change reaches
+    /// every handler at once; a request handler's [`Server::pinned`] copy
+    /// holds the set in force when the request began, however many times
+    /// the request reads it.
+    pub live: std::sync::Arc<ArcSwap<Live>>,
+    /// The Playground's asset table when `--server-ui` is on (GitHub #163, ADR
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
     pub playground: Option<playground::Assets>,
-    /// The Prometheus projection when `--metrics` is on (GitHub #89, ADR
+    /// The Prometheus projection when `--server-metrics` is on (GitHub #89, ADR
     /// 0017); `None` installs neither the projection nor any route to it.
     pub metrics: Option<std::sync::Arc<metrics::Metrics>>,
-    /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
+    /// The key `/v1` requests must present (`--server-api-key` / `IGNIS_SERVER_API_KEY`);
     /// `None` leaves the API open.
     pub api_key: Option<crate::config::ApiKey>,
-    /// Where `system` and `developer` messages go before the conversation is
-    /// templated (`--system-message-policy` / `--developer-message-policy`,
-    /// GitHub #209).
-    pub instruction_policy: instruction::InstructionPolicy,
     /// The match keys of recent `/v1/decide` parts states at their run ends
     /// (GitHub #270): what an **observed fork** is found in. Shared by every
     /// clone of the server, as the active model is. Keys name the loaded
@@ -133,6 +123,63 @@ pub struct Server {
     /// may run at a time. `None` answers the route `501`: a server built in
     /// a test without one has no way to load anything.
     pub switcher: Option<std::sync::Arc<model_switch::Switcher>>,
+    /// The running configuration, and where a change to it is written down
+    /// (`GET`/`PATCH /v1/config`, spec config-v2/02). `None` answers both
+    /// routes `501`: a server built in a test without one has no config to
+    /// show or change.
+    pub config: Option<std::sync::Arc<config_http::ConfigState>>,
+}
+
+/// The server-level knobs a live config change may touch (spec config-v2/02
+/// §`PATCH`): each one read per request, so changing it needs no model
+/// reload. The model's own configuration lives with the model and changes
+/// only through a reload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Live {
+    /// How long a non-streaming request waits for its completion before the
+    /// handler gives up with a 504 (guards a wedged engine from hanging the
+    /// client forever; `--server-request-timeout`, GitHub #95).
+    pub request_timeout: Duration,
+    /// The `enable_thinking` a request's unset field falls back to
+    /// (`--model-enable-thinking`, GitHub #68).
+    pub default_enable_thinking: bool,
+    /// The `reasoning_effort` a request's unset field falls back to
+    /// (`--model-reasoning-effort`).
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// The thinking budget a request's unset `thinking_budget` falls back to
+    /// (`--model-thinking-budget`, 2026-09-24). `None` = no budget.
+    pub default_thinking_budget: Option<u32>,
+    /// Where `system` and `developer` messages go before the conversation is
+    /// templated (`--server-system-message-policy` /
+    /// `--server-developer-message-policy`, GitHub #209).
+    pub instruction_policy: instruction::InstructionPolicy,
+}
+
+impl Default for Live {
+    /// What a server built without a config runs with: the timeout's
+    /// default, thinking on with no effort or budget, merge / inplace.
+    fn default() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
+            default_enable_thinking: true,
+            default_reasoning_effort: None,
+            default_thinking_budget: None,
+            instruction_policy: instruction::InstructionPolicy::default(),
+        }
+    }
+}
+
+impl Live {
+    /// The live knobs `config` names.
+    pub fn of(config: &config::Config) -> Self {
+        Self {
+            request_timeout: Duration::from_secs(u64::from(config.request_timeout_secs)),
+            default_enable_thinking: config.enable_thinking,
+            default_reasoning_effort: config.reasoning_effort,
+            default_thinking_budget: config.thinking_budget,
+            instruction_policy: config.instruction_policy,
+        }
+    }
 }
 
 /// The one token the warm-up prompts with. Id 1 is an ordinary byte-level
@@ -195,14 +242,10 @@ impl Server {
     pub fn from_active(model: ActiveModel) -> Self {
         Self {
             active: std::sync::Arc::new(ArcSwap::from_pointee(model)),
-            request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
-            default_enable_thinking: true,
-            default_reasoning_effort: None,
-            default_thinking_budget: None,
+            live: std::sync::Arc::new(ArcSwap::from_pointee(Live::default())),
             playground: None,
             metrics: None,
             api_key: None,
-            instruction_policy: instruction::InstructionPolicy::default(),
             fork_history: std::sync::Arc::default(),
             next_fan_out: std::sync::Arc::default(),
             responses: std::sync::Arc::default(),
@@ -210,7 +253,44 @@ impl Server {
             seedless_seed: None,
             status: std::sync::Arc::new(ArcSwap::from_pointee(ModelStatus::Serving)),
             switcher: None,
+            config: None,
         }
+    }
+
+    /// The live knobs, as of now (wait-free) — on a pinned copy, as of when
+    /// the request began.
+    pub fn live(&self) -> std::sync::Arc<Live> {
+        self.live.load_full()
+    }
+
+    /// Change the live knobs: a copy edited by `edit`, stored over them.
+    pub fn update_live(&self, edit: impl FnOnce(&mut Live)) {
+        let mut live = Live::clone(&self.live());
+        edit(&mut live);
+        self.live.store(std::sync::Arc::new(live));
+    }
+
+    /// Make `config`'s server-level values the ones requests read, without
+    /// touching the model (spec config-v2/02): the live knobs, and the model
+    /// switch's drain window and known models. What a live `PATCH
+    /// /v1/config` applies, and what a reload applies once its model serves.
+    pub fn apply_config(&self, config: &config::Config) {
+        self.live.store(std::sync::Arc::new(Live::of(config)));
+        if let Some(switcher) = &self.switcher {
+            let known = if config.allow_model_switch {
+                model_switch::known_models(&config.known_models, self.active().source.as_ref())
+            } else {
+                Default::default()
+            };
+            switcher.set_knobs(Duration::from_secs(u64::from(config.switch_drain_timeout_secs)), known);
+        }
+    }
+
+    /// Show and change the running configuration over `GET`/`PATCH
+    /// /v1/config` (spec config-v2/02), written down where `state` says.
+    pub fn with_config(mut self, state: std::sync::Arc<config_http::ConfigState>) -> Self {
+        self.config = Some(state);
+        self
     }
 
     /// The loaded model, as of now (wait-free). Take it once per request
@@ -240,10 +320,16 @@ impl Server {
     /// next's engine — however long it waits on media or between `/v1/decide`
     /// rounds. A request pinned to a model a switch has since torn down is
     /// refused by that engine with `503 engine_full`, which a retry answers.
-    /// Everything else — the status, metrics, fork history, the switcher —
-    /// stays shared with the server.
+    /// The live knobs are pinned with the model (spec config-v2/02): a
+    /// `PATCH /v1/config` landing mid-request never gives one request two
+    /// timeouts or two thinking defaults. Everything else — the status,
+    /// metrics, fork history, the switcher — stays shared with the server.
     pub fn pinned(&self) -> Self {
-        Self { active: std::sync::Arc::new(ArcSwap::new(self.active())), ..self.clone() }
+        Self {
+            active: std::sync::Arc::new(ArcSwap::new(self.active())),
+            live: std::sync::Arc::new(ArcSwap::new(self.live())),
+            ..self.clone()
+        }
     }
 
     /// Whether the `/v1` routes are admitting requests, and why not.
@@ -331,10 +417,10 @@ impl Server {
     }
 
     /// Set the non-streaming completion timeout (`main` wires this to
-    /// `--request-timeout`/`IGNIS_REQUEST_TIMEOUT`, GitHub #95; the default
+    /// `--server-request-timeout`/`IGNIS_SERVER_REQUEST_TIMEOUT`, GitHub #95; the default
     /// is 30 s).
-    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+    pub fn with_request_timeout(self, timeout: Duration) -> Self {
+        self.update_live(|live| live.request_timeout = timeout);
         self
     }
 
@@ -345,37 +431,35 @@ impl Server {
         self
     }
 
-    /// Set the server-wide thinking defaults (`IGNIS_ENABLE_THINKING` /
-    /// `IGNIS_REASONING_EFFORT`, GitHub #68). Callers that set a non-trivial
+    /// Set the server-wide thinking defaults (`IGNIS_MODEL_ENABLE_THINKING` /
+    /// `IGNIS_MODEL_REASONING_EFFORT`, GitHub #68). Callers that set a non-trivial
     /// default should validate it against `template.thinking_capabilities()`
     /// first (`thinking::validate_defaults`) — this setter does not, so
     /// tests can construct an out-of-band `Server` without a template to
     /// probe.
-    pub fn with_thinking_defaults(
-        mut self,
-        enable_thinking: bool,
-        reasoning_effort: Option<ReasoningEffort>,
-    ) -> Self {
-        self.default_enable_thinking = enable_thinking;
-        self.default_reasoning_effort = reasoning_effort;
+    pub fn with_thinking_defaults(self, enable_thinking: bool, reasoning_effort: Option<ReasoningEffort>) -> Self {
+        self.update_live(|live| {
+            live.default_enable_thinking = enable_thinking;
+            live.default_reasoning_effort = reasoning_effort;
+        });
         self
     }
 
-    /// Set the server-wide thinking budget (`--thinking-budget`).
-    pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
-        self.default_thinking_budget = budget;
+    /// Set the server-wide thinking budget (`--model-thinking-budget`).
+    pub fn with_thinking_budget(self, budget: Option<u32>) -> Self {
+        self.update_live(|live| live.default_thinking_budget = budget);
         self
     }
 
     /// Serve the Playground from `assets` under `/ui/` (`main` passes
-    /// [`playground::EMBEDDED`] when `--ui` is set; tests inject their own
+    /// [`playground::EMBEDDED`] when `--server-ui` is set; tests inject their own
     /// table, including the empty one that selects the fallback page).
     pub fn with_playground(mut self, assets: playground::Assets) -> Self {
         self.playground = Some(assets);
         self
     }
 
-    /// Turn Prometheus metrics on (`main` calls this when `--metrics` is
+    /// Turn Prometheus metrics on (`main` calls this when `--server-metrics` is
     /// set): installs the projection into the engine's telemetry consumer,
     /// which alone keeps it up to date from the facts it already receives.
     /// It is served by [`Server::metrics_app`] and, with the Playground, at
@@ -396,12 +480,12 @@ impl Server {
         self
     }
 
-    /// Point what `--metrics` keeps at `model`, a model a switch has just
+    /// Point what `--server-metrics` keeps at `model`, a model a switch has just
     /// loaded (spec model-switch/01): its engine's telemetry consumer starts
     /// feeding the projection, its own counters (Flash-Next's, GitHub #301)
     /// are read, and `reserved` replaces what the previous load reserved. The
     /// start does the same through [`Server::with_metrics`] and
-    /// [`Server::with_load_reservations`]. Nothing without `--metrics`.
+    /// [`Server::with_load_reservations`]. Nothing without `--server-metrics`.
     pub(crate) fn observe_load(&self, model: &ActiveModel, reserved: Option<metrics::LoadReservations>) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -420,7 +504,7 @@ impl Server {
 
     /// Record what this load reserved (GitHub #216, ADR 0030
     /// §Observability): the plan's lines and the shapes they bound, written
-    /// once, before the first request. Without `--metrics` there is nothing
+    /// once, before the first request. Without `--server-metrics` there is nothing
     /// to write them into and the call does nothing; a load that built no
     /// plan (the placeholder path) never makes it.
     pub fn with_load_reservations(self, reserved: metrics::LoadReservations) -> Self {
@@ -428,7 +512,7 @@ impl Server {
         self
     }
 
-    /// Record what `model`'s load reserved in `--metrics` (nothing without
+    /// Record what `model`'s load reserved in `--server-metrics` (nothing without
     /// it): the plan's lines replace the previous load's, and a Flash-Next
     /// load's counter source — not a reservation; the telemetry consumer
     /// reads it at every tick (GitHub #301, #302) — goes to `model`'s engine.
@@ -440,23 +524,23 @@ impl Server {
     }
 
     /// Require `key` as `Authorization: Bearer <key>` on every `/v1` route
-    /// (`main` wires this to `--api-key` / `IGNIS_API_KEY`).
+    /// (`main` wires this to `--server-api-key` / `IGNIS_SERVER_API_KEY`).
     pub fn with_api_key(mut self, key: crate::config::ApiKey) -> Self {
         self.api_key = Some(key);
         self
     }
 
-    /// Acquire image parts with `acquirer` (a `--vision` load, GitHub #179).
+    /// Acquire image parts with `acquirer` (a `--vision-enabled` load, GitHub #179).
     pub fn with_media(self, acquirer: std::sync::Arc<media::MediaAcquirer>) -> Self {
         self.update_active(|model| model.media = Some(acquirer));
         self
     }
 
     /// Place instruction messages under `policy` (`main` wires this to
-    /// `--system-message-policy` / `--developer-message-policy`, GitHub #209;
+    /// `--server-system-message-policy` / `--server-developer-message-policy`, GitHub #209;
     /// the default is merge / inplace).
-    pub fn with_instruction_policy(mut self, policy: instruction::InstructionPolicy) -> Self {
-        self.instruction_policy = policy;
+    pub fn with_instruction_policy(self, policy: instruction::InstructionPolicy) -> Self {
+        self.update_live(|live| live.instruction_policy = policy);
         self
     }
 
@@ -467,9 +551,9 @@ impl Server {
         api::router(state)
     }
 
-    /// The metrics listener's app (`--metrics-bind`, GitHub #89, ADR 0017):
+    /// The metrics listener's app (`--server-metrics-bind`, GitHub #89, ADR 0017):
     /// `GET /metrics` and nothing else, with no API key — it is kept private
-    /// by its bind address, and `--expose` never tunnels it. `None` unless
+    /// by its bind address, and `--server-expose` never tunnels it. `None` unless
     /// [`Server::with_metrics`] turned metrics on.
     pub fn metrics_app(&self) -> Option<Router> {
         self.metrics
@@ -490,9 +574,9 @@ impl Server {
     }
 
     /// [`Server::serve`] on a listener the caller already bound — `main`
-    /// binds first when `--expose` needs the bound port before serving.
+    /// binds first when `--server-expose` needs the bound port before serving.
     ///
-    /// With `metrics_listener` (`--metrics`, GitHub #89), [`Server::metrics_app`]
+    /// With `metrics_listener` (`--server-metrics`, GitHub #89), [`Server::metrics_app`]
     /// is served there too, and one process signal stops both.
     pub async fn serve_on(
         self,

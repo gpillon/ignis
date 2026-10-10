@@ -50,7 +50,7 @@ impl Default for ThinkingOptions {
     }
 }
 
-/// The server-wide defaults (`IGNIS_ENABLE_THINKING` / `IGNIS_REASONING_EFFORT`)
+/// The server-wide defaults (`IGNIS_MODEL_ENABLE_THINKING` / `IGNIS_MODEL_REASONING_EFFORT`)
 /// a request's unset fields fall back to.
 #[derive(Debug, Clone, Copy)]
 pub struct ThinkingDefaults {
@@ -277,20 +277,20 @@ fn optional_effort(value: Option<&JsonValue>) -> Result<Option<ReasoningEffort>,
 }
 
 // ---------------------------------------------------------------------------
-// Server-wide defaults (`IGNIS_ENABLE_THINKING` / `IGNIS_REASONING_EFFORT`)
+// Server-wide defaults (`IGNIS_MODEL_ENABLE_THINKING` / `IGNIS_MODEL_REASONING_EFFORT`)
 // ---------------------------------------------------------------------------
 
-/// Parse `IGNIS_ENABLE_THINKING` (already defaulted to `"true"` by the
+/// Parse `IGNIS_MODEL_ENABLE_THINKING` (already defaulted to `"true"` by the
 /// caller when unset). A malformed value is a startup failure, not a silent
 /// fallback (matches the server's existing "refuse to start" convention for
 /// a bad env default).
 pub fn parse_default_enable_thinking(value: &str) -> Result<bool, String> {
     value
         .parse::<bool>()
-        .map_err(|_| format!("IGNIS_ENABLE_THINKING must be \"true\" or \"false\", got {value:?}"))
+        .map_err(|_| format!("IGNIS_MODEL_ENABLE_THINKING must be \"true\" or \"false\", got {value:?}"))
 }
 
-/// Parse `IGNIS_REASONING_EFFORT` (empty = unset — the template's own
+/// Parse `IGNIS_MODEL_REASONING_EFFORT` (empty = unset — the template's own
 /// default applies).
 pub fn parse_default_reasoning_effort(value: &str) -> Result<Option<ReasoningEffort>, String> {
     if value.is_empty() {
@@ -298,7 +298,7 @@ pub fn parse_default_reasoning_effort(value: &str) -> Result<Option<ReasoningEff
     }
     ReasoningEffort::parse(value).map(Some).ok_or_else(|| {
         let accepted: Vec<&str> = ReasoningEffort::ALL.iter().map(|e| e.as_str()).collect();
-        format!("IGNIS_REASONING_EFFORT must be one of {accepted:?}, got {value:?}")
+        format!("IGNIS_MODEL_REASONING_EFFORT must be one of {accepted:?}, got {value:?}")
     })
 }
 
@@ -387,7 +387,7 @@ pub fn resolve_thinking_budget(
 }
 
 /// Whether a request runs at `max` effort: its own `reasoning_effort`, else
-/// the server's `--reasoning-effort`. Read off the raw field because the
+/// the server's `--model-reasoning-effort`. Read off the raw field because the
 /// resolved [`ThinkingOptions`] carries the effort the *template* takes, and
 /// Qwen3.8's rounds `max` to `xhigh`. Called after [`resolve`] accepted the
 /// field, so an unparsable one never reaches here.
@@ -399,7 +399,7 @@ pub fn runs_at_max(requested: Option<&JsonValue>, default: Option<ReasoningEffor
     }
 }
 
-/// Parse a set `IGNIS_THINKING_BUDGET` / `--thinking-budget`: a whole number
+/// Parse a set `IGNIS_MODEL_THINKING_BUDGET` / `--model-thinking-budget`: a whole number
 /// of tokens, or `off` for no default budget. Unset is the caller's to
 /// resolve (the shipped default). `0` is refused rather than read as `off`:
 /// the one way to say "none" at startup is the word.
@@ -410,7 +410,7 @@ pub fn parse_default_thinking_budget(value: &str) -> Result<Option<u32>, String>
     match value.parse::<u32>() {
         Ok(n) if n >= 1 => Ok(Some(n)),
         _ => Err(format!(
-            "IGNIS_THINKING_BUDGET must be a whole number of tokens, at least 1, or `off` for no budget, got {value:?}"
+            "IGNIS_MODEL_THINKING_BUDGET must be a whole number of tokens, at least 1, or `off` for no budget, got {value:?}"
         )),
     }
 }
@@ -425,8 +425,8 @@ pub fn check_default_budget_close(
 ) -> Result<(), String> {
     match (default_budget, close) {
         (Some(budget), Err(why)) => Err(format!(
-            "--thinking-budget {budget} is set, but the loaded tokenizer yields no thinking close ({why}); \
-             pass --thinking-budget off (IGNIS_THINKING_BUDGET=off) to start without a budget"
+            "--model-thinking-budget {budget} is set, but the loaded tokenizer yields no thinking close ({why}); \
+             pass --model-thinking-budget off (IGNIS_MODEL_THINKING_BUDGET=off) to start without a budget"
         )),
         _ => Ok(()),
     }
@@ -441,7 +441,7 @@ pub fn validate_defaults(
 ) -> Result<(), String> {
     if !defaults.enable_thinking && !capabilities.can_disable {
         return Err(
-            "the loaded template cannot disable thinking, but IGNIS_ENABLE_THINKING=false"
+            "the loaded template cannot disable thinking, but IGNIS_MODEL_ENABLE_THINKING=false"
                 .to_owned(),
         );
     }
@@ -449,7 +449,7 @@ pub fn validate_defaults(
         if let Some(effort) = defaults.reasoning_effort {
             if honoured_effort(effort, capabilities).is_none() {
                 return Err(format!(
-                    "the loaded template does not support IGNIS_REASONING_EFFORT={}",
+                    "the loaded template does not support IGNIS_MODEL_REASONING_EFFORT={}",
                     effort.as_str()
                 ));
             }
@@ -831,7 +831,7 @@ mod tests {
         let unavailable: Result<ignis_core::thinking_budget::ThinkingClose, String> =
             Err("`</think>` is 3 tokens, not one".to_owned());
         let err = check_default_budget_close(Some(8192), &unavailable).unwrap_err();
-        assert!(err.contains("--thinking-budget") && err.contains("off"), "{err}");
+        assert!(err.contains("--model-thinking-budget") && err.contains("off"), "{err}");
         assert!(err.contains("3 tokens"), "the tokenizer's own reason: {err}");
         // No default: a per-request budget stays inert, and the start goes on.
         assert_eq!(check_default_budget_close(None, &unavailable), Ok(()));

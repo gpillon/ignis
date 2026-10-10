@@ -88,7 +88,7 @@ pub(crate) struct TokenizeResponse {
     /// The prompt's length in tokens: the number the same body reports as
     /// `usage.prompt_tokens` when served.
     count: u32,
-    /// This server's `--max-context`: the most a request may spend, prompt
+    /// This server's `--model-max-context`: the most a request may spend, prompt
     /// plus completion, so a client decides with one call.
     max_model_len: u32,
     /// The prompt's token ids; only with `return_token_ids`.
@@ -106,7 +106,7 @@ pub(crate) struct TokenizeResponse {
     tag = "tokenize",
     operation_id = "tokenize",
     summary = "A prompt's token count, without serving it",
-    description = "Renders a chat body exactly as `/v1/chat/completions` would -- the chat template, the tool block, the thinking controls, the system block -- and answers how many tokens it prefills, without submitting it: no lane, no GPU, no KV page, and the count is the `usage.prompt_tokens` the same body reports when served. `max_model_len` is the server's `--max-context`, so one call decides whether a body fits.
+    description = "Renders a chat body exactly as `/v1/chat/completions` would -- the chat template, the tool block, the thinking controls, the system block -- and answers how many tokens it prefills, without submitting it: no lane, no GPU, no KV page, and the count is the `usage.prompt_tokens` the same body reports when served. `max_model_len` is the server's `--model-max-context`, so one call decides whether a body fits.
 
 Send **either** `messages` (with `model`, `tools`, `tool_choice` and the thinking controls, which are validated as chat validates them) **or** a raw `prompt`, which is tokenized with no template applied. Sampling fields are ignored: they do not change a render. `stream` is refused.
 
@@ -117,7 +117,7 @@ A body carrying an `image_url` part is refused with `media_not_countable`: an im
     responses(
         (status = 200, description = "The count, and the ceiling it is to be compared with.", body = TokenizeResponse),
         (status = 400, description = "Both `messages` and `prompt`, or neither; an empty `messages`; a body chat would refuse; `stream: true`; or an image part (`media_not_countable`).", body = ApiError),
-        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The body named a model this server has not loaded.", body = ApiError),
         (status = 501, description = "The raw form on a load whose tokenizer cannot be asked for ids (`tokenizer_unavailable`).", body = ApiError),
     ),
@@ -190,7 +190,7 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
     if !server.active().family.takes_images() {
         server.check_content_parts(&messages).map_err(content_rejection)?;
     }
-    // Before the content-part check, which on a load without `--vision`
+    // Before the content-part check, which on a load without `--vision-enabled`
     // would answer `vision_disabled`: the refusal that matters here is that
     // this route never counts an image, whatever the load can do with one.
     if has_media(&messages) {
@@ -280,7 +280,7 @@ pub(crate) struct DetokenizeResponse {
     responses(
         (status = 200, description = "The decoded text.", body = DetokenizeResponse),
         (status = 400, description = "An id outside the vocabulary; the message names the first one's index.", body = ApiError),
-        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
     ),
 )]
 pub(crate) async fn detokenize(State(server): State<Arc<Server>>, Json(req): Json<DetokenizeRequest>) -> Response {

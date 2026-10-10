@@ -156,7 +156,7 @@ pub const GQA_MAX_LINEAR_VISIBLE_KEYS: u32 = 524_288;
 pub const GQA_MAX_VISIBLE_KEYS: u32 = 1_048_576;
 
 impl KvFormat {
-    /// The longest `--max-context` the 27B's GQA attention envelope admits
+    /// The longest `--model-max-context` the 27B's GQA attention envelope admits
     /// on this cache format (GitHub #228).
     pub fn gqa_max_context(&self) -> u32 {
         match self {
@@ -182,8 +182,8 @@ impl KvFormat {
         }
     }
 
-    /// Parse an operator-supplied spelling (`--kv-format`,
-    /// `IGNIS_KV_FORMAT`). Case-insensitive, and `hq` is accepted as a
+    /// Parse an operator-supplied spelling (`--model-kv-format`,
+    /// `IGNIS_MODEL_KV_FORMAT`). Case-insensitive, and `hq` is accepted as a
     /// short form of the only hq profile that exists.
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {

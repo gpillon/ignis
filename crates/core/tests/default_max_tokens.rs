@@ -1,7 +1,7 @@
 //! ADR 0045, spec vram-budget/03 AC 11 (GitHub #309): a request that names
 //! no generation cap runs under the server's **default `max_tokens`**
 //! (`SchedulerConfig::default_max_tokens`, the operator's
-//! `--default-max-tokens`), clamped to what its prompt leaves of the context.
+//! `--model-default-max-tokens`), clamped to what its prompt leaves of the context.
 //!
 //! The scheduler resolves the cap once, in `generation_budget`, and `submit`
 //! writes it into the request's `params.max_tokens`, so every reader -- the

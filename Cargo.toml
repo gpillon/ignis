@@ -56,9 +56,9 @@ tower = { version = "0.5", features = ["util"] }
 # `axum` router, not a hand-rolled span-per-request middleware.
 tower-http = { version = "0.6", features = ["trace"] }
 http-body-util = "0.1"
-# `--api-key auto`: the OS random source for the generated key.
+# `--server-api-key auto`: the OS random source for the generated key.
 getrandom = "0.3"
-# `--expose cloudflare-quick`: a public https://*.trycloudflare.com URL,
+# `--server-expose cloudflare-quick`: a public https://*.trycloudflare.com URL,
 # spoken natively (QUIC + capnp-RPC) rather than through a cloudflared child.
 cloudflare-quick-tunnel = "0.3"
 tracing = "0.1"

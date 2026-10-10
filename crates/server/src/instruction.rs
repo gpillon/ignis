@@ -29,7 +29,7 @@
 use crate::template::{ChatMessage, ContentPart, MessageContent, TemplateRejection};
 
 /// What the engine does with a `system` message that is not the first
-/// message (`--system-message-policy`).
+/// message (`--server-system-message-policy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SystemMessagePolicy {
     /// The leading run joins the system prompt; a later one is its own block
@@ -54,7 +54,7 @@ impl SystemMessagePolicy {
 }
 
 /// What the engine does with a `developer` message
-/// (`--developer-message-policy`).
+/// (`--server-developer-message-policy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeveloperMessagePolicy {
     /// Each is its own system block where it stands.
@@ -213,7 +213,7 @@ fn system_position(index: usize) -> TemplateRejection {
         code: "system_message_position",
         message: format!(
             "system message at index {index} is not the first message \
-             (--system-message-policy strict accepts only one, at index 0)"
+             (--server-system-message-policy strict accepts only one, at index 0)"
         ),
     }
 }
@@ -229,7 +229,7 @@ fn developer_position(index: usize, policy: DeveloperMessagePolicy) -> TemplateR
         code: "developer_message_position",
         message: format!(
             "developer message at index {index} is not accepted \
-             (--developer-message-policy {} {rule})",
+             (--server-developer-message-policy {} {rule})",
             policy.as_str()
         ),
     }

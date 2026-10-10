@@ -274,7 +274,7 @@ async fn a_streaming_completions_first_chunk_arrives_before_generation_completes
 
 /// P2-02 (GitHub #84): a multi-thousand-token prompt streamed end to end
 /// through the real chunked-prefill path (`EngineShape::default()`'s
-/// `--prefill-chunk` is 1024, so this prompt spans several chunks). Proves
+/// `--model-prefill-chunk` is 1024, so this prompt spans several chunks). Proves
 /// the chunk loop reaches a real HTTP round trip, not just the step ABI
 /// directly: a coherent streamed answer, ending in a real `finish_reason`.
 #[tokio::test]
@@ -340,7 +340,7 @@ async fn a_streaming_completion_with_a_multi_thousand_token_prompt_finishes_cohe
     }
 }
 
-/// P5-06 (GitHub #154): with `--spec dflash2 --draft-tokens 7` every decode
+/// P5-06 (GitHub #154): with `--spec-backend dflash2 --spec-draft-tokens 7` every decode
 /// round is a verify round, and its committed runs reach the SSE stream as
 /// deltas ending in the model's own EOS. A direct one-word question within a
 /// generous budget, so `stop` is the reason and `length` would be a finding.

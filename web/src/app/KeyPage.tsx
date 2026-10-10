@@ -38,7 +38,7 @@ export function KeyPage({ rejected }: { rejected: boolean }) {
         <div className="flex flex-col gap-2">
           <h1 className="font-display text-4xl font-semibold tracking-tight text-ink">API key required</h1>
           <p className="text-sm text-ash">
-            This ignis runs with <span className="font-mono text-ink">--api-key</span>. Enter the key to open the
+            This ignis runs with <span className="font-mono text-ink">--server-api-key</span>. Enter the key to open the
             Playground; it stays in this browser.
           </p>
         </div>

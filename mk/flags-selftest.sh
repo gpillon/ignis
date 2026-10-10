@@ -2,7 +2,7 @@
 # The behavioural test of the Makefile's engine-flag plumbing
 # (`make flags-selftest`): it reads the "server flags" line `make config`
 # prints for CUDA=1 and asserts the knobs of the speculation section arrive as
-# real arguments. It found a literal "\n" ahead of --draft-rows (#307): every
+# real arguments. It found a literal "\n" ahead of --spec-draft-rows (#307): every
 # CUDA=1 run/start passed the server a stray argument. It writes nothing.
 
 set -uo pipefail
@@ -32,22 +32,22 @@ for args in "MODEL=flash-next DRAFT_ROWS=6" "MODEL=flash-next SPEC=mtp DRAFT_TOK
 done
 
 out="$(flags MODEL=flash-next DRAFT_ROWS=6)"
-has "DRAFT_ROWS alone" "$out" "--draft-rows 6"
-lacks "DRAFT_ROWS alone" "$out" "--spec"
+has "DRAFT_ROWS alone" "$out" "--spec-draft-rows 6"
+lacks "DRAFT_ROWS alone" "$out" "--spec-backend"
 
 out="$(flags MODEL=flash-next SPEC=mtp DRAFT_TOKENS=3 DRAFT_ROWS=6)"
-has "SPEC=mtp" "$out" "--spec mtp"
-has "SPEC=mtp" "$out" "--draft-tokens 3"
-has "SPEC=mtp" "$out" "--draft-rows 6"
+has "SPEC=mtp" "$out" "--spec-backend mtp"
+has "SPEC=mtp" "$out" "--spec-draft-tokens 3"
+has "SPEC=mtp" "$out" "--spec-draft-rows 6"
 
 out="$(flags MODEL=flash-next)"
-has "default" "$out" "--decode-lanes 3"
-has "default" "$out" "--max-context 262144"
-lacks "default" "$out" "--spec"
-lacks "default" "$out" "--draft-rows"
+has "default" "$out" "--spec-decode-lanes 3"
+has "default" "$out" "--model-max-context 262144"
+lacks "default" "$out" "--spec-backend"
+lacks "default" "$out" "--spec-draft-rows"
 
 out="$(flags MODEL=flash-next)"
-lacks "default" "$out" "--decode-share"
+lacks "default" "$out" "--model-decode-share"
 # The VRAM headroom is the server's 1536M on both models (the owner, 2026-10-09):
 # make passes none unless asked.
 lacks "default" "$out" "--vram-headroom-bytes"
@@ -55,9 +55,9 @@ lacks "27B default" "$(flags)" "--vram-headroom-bytes"
 has "VRAM_HEADROOM=4G" "$(flags MODEL=flash-next VRAM_HEADROOM=4G)" "--vram-headroom-bytes 4G"
 lacks "VRAM_BUDGET" "$(flags MODEL=flash-next VRAM_BUDGET=28G)" "--vram-headroom-bytes"
 out="$(flags MODEL=flash-next DECODE_SHARE=25)"
-has "DECODE_SHARE=25" "$out" "--decode-share 25"
+has "DECODE_SHARE=25" "$out" "--model-decode-share 25"
 out="$(flags DECODE_SHARE=0)"
-has "27B DECODE_SHARE=0" "$out" "--decode-share 0"
+has "27B DECODE_SHARE=0" "$out" "--model-decode-share 0"
 
 # `make config` says what a Flash-Next start will get, before it loads.
 plan="$(make config CUDA=1 MODEL=flash-next 2>/dev/null | sed -n 's/^PLAN  *//p')"
@@ -68,21 +68,21 @@ plan="$(make config CUDA=1 MODEL=flash-next DECODE_SHARE=25 LANES=2 2>/dev/null 
 case "$plan" in *"decode_share=25%"*"lanes=2"*|*"lanes=2"*"decode_share=25%"*) ;; *) fail "PLAN does not follow the knobs: $plan" ;; esac
 
 out="$(flags MODEL=flash-next LANES=1)"
-has "LANES=1" "$out" "--decode-lanes 1"
+has "LANES=1" "$out" "--spec-decode-lanes 1"
 
 # ADR 0045: the default max_tokens, a non-default value on both models, and
 # nothing passed when the knob is empty (the server's own 38912).
 for model in "MODEL=flash-next" "MODEL=27b"; do
     out="$(flags $model DEFAULT_MAX_TOKENS=8192)"
-    has "$model DEFAULT_MAX_TOKENS=8192" "$out" "--default-max-tokens 8192"
+    has "$model DEFAULT_MAX_TOKENS=8192" "$out" "--model-default-max-tokens 8192"
     out="$(flags $model)"
-    lacks "$model default" "$out" "--default-max-tokens"
+    lacks "$model default" "$out" "--model-default-max-tokens"
 done
 out="$(flags MODEL=flash-next ALLOW_EXPERT_CACHE_BELOW_FLOOR=1)"
-has "ALLOW_EXPERT_CACHE_BELOW_FLOOR=1" "$out" "--allow-expert-cache-below-floor"
-lacks "floor default" "$(flags MODEL=flash-next)" "--allow-expert-cache-below-floor"
+has "ALLOW_EXPERT_CACHE_BELOW_FLOOR=1" "$out" "--vram-allow-expert-cache-below-floor"
+lacks "floor default" "$(flags MODEL=flash-next)" "--vram-allow-expert-cache-below-floor"
 out="$(flags MODEL=flash-next KV_POOL_BYTES=512Ktok)"
-has "KV_POOL_BYTES=512Ktok" "$out" "--kv-pool-bytes 512Ktok"
+has "KV_POOL_BYTES=512Ktok" "$out" "--vram-kv-pool-bytes 512Ktok"
 
 # The pool policy and its tokens, before the load (ADR 0045, AC 7): offloaded
 # at 524,288 on Flash-Next, 4,104 pages at one lane, the floor at 524,288 of
@@ -105,16 +105,16 @@ for case in "|pool=resident 4G (named, 465984 tokens)" "KV_FORMAT=bf16|pool=resi
 done
 
 out="$(flags)"
-lacks "27B" "$out" "--decode-lanes"
+lacks "27B" "$out" "--spec-decode-lanes"
 
 out="$(flags MODEL=flash-next SPEC=off)"
-has "SPEC=off" "$out" "--spec off"
+has "SPEC=off" "$out" "--spec-backend off"
 
-# The server refuses a window beside --spec off, so the 27B's default
+# The server refuses a window beside --spec-backend off, so the 27B's default
 # DRAFT_TOKENS=7 must not ride along when SPEC=off turns speculation off.
 out="$(flags SPEC=off)"
-has "27B SPEC=off" "$out" "--spec off"
-lacks "27B SPEC=off" "$out" "--draft-tokens"
+has "27B SPEC=off" "$out" "--spec-backend off"
+lacks "27B SPEC=off" "$out" "--spec-draft-tokens"
 
 # KV-disk (spec vram-budget/03): the knobs reach the server as named, the
 # server's defaults (4G on Flash-Next, off on the 27B) when they are not,

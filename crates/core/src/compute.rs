@@ -773,7 +773,7 @@ impl ModelFamily {
     }
 
     /// Host retained slots a load of this family keeps by default with
-    /// prompt reuse on (`--retained-host`): two per decode lane on the 27B
+    /// prompt reuse on (`--reuse-retained-host`): two per decode lane on the 27B
     /// (GitHub #281); 8 on Flash-Next, a chain link and a checkpoint for
     /// three agents and a shared system block, ~1 GiB of pinned images
     /// beside 37.7 GB of pinned experts (spec flash-next/05).
@@ -785,12 +785,12 @@ impl ModelFamily {
     }
 
     /// The percent of the model's time decoding lanes keep while a prompt
-    /// prefills, unless the operator names one (`--decode-share`, GitHub
+    /// prefills, unless the operator names one (`--model-decode-share`, GitHub
     /// #306): a quarter on both. A reader reads ~5-8 tok/s, so the decoding
     /// lanes stay fluent (Flash-Next measured 15.6-18.3 tok/s per lane during
     /// a 34K prefill) while a long prompt's TTFT under load grows ~x1.33
     /// instead of ~x2 at 50. The total work is the same at any share; only
-    /// who waits changes, and a prompt alone is unaffected. `--decode-share 0`
+    /// who waits changes, and a prompt alone is unaffected. `--model-decode-share 0`
     /// is one decode round per chunk (ADR 0018); 50 splits time evenly.
     pub fn default_decode_share_percent(self) -> u32 {
         match self {

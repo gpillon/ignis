@@ -31,7 +31,7 @@ pub struct Hub {
 }
 
 impl Hub {
-    /// Keep the two gauges in `metrics` (`--metrics`, ADR 0017).
+    /// Keep the two gauges in `metrics` (`--server-metrics`, ADR 0017).
     pub(crate) fn install_metrics(&self, metrics: Arc<Metrics>) {
         let _ = self.queue.metrics.set(Arc::clone(&metrics));
         let _ = self.metrics.set(metrics);

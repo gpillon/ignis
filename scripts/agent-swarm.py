@@ -558,7 +558,7 @@ def main():
     r = sub.add_parser("run", help="drive the load against a running server")
     r.add_argument("--out", required=True, help="run directory (created)")
     r.add_argument("--endpoint", default="http://127.0.0.1:8000")
-    r.add_argument("--api-key", default=os.environ.get("IGNIS_API_KEY"))
+    r.add_argument("--api-key", default=os.environ.get("IGNIS_SERVER_API_KEY"))
     r.add_argument("--model", help="default: the first of /v1/models")
     r.add_argument("--agents", type=int, default=8)
     r.add_argument("--turns", type=int, default=8)

@@ -224,7 +224,7 @@ describe("buildChatRequest", () => {
 describe("buildChatRequest and the thinking budget", () => {
   const hi = [{ role: "user" as const, content: "hi" }];
 
-  it("leaves thinking_budget out on the server default, so the operator's --thinking-budget applies", () => {
+  it("leaves thinking_budget out on the server default, so the operator's --model-thinking-budget applies", () => {
     expect("thinking_budget" in buildChatRequest({ ...settings, thinkingBudget: null }, hi)).toBe(false);
   });
 

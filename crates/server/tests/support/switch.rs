@@ -41,6 +41,9 @@ struct State {
     /// When set, the next load waits for a message on it before it builds:
     /// how a test holds a switch inside its load step.
     hold: Mutex<Option<Receiver<()>>>,
+    /// The options each prepare was handed (spec config-v2/02: a reload
+    /// with a changed config hands its patched config; a switch none).
+    options: Mutex<Vec<Option<ignis_server::config::Config>>>,
 }
 
 /// The mock loader. Clone the `Arc` into a `Switcher`, keep one to steer it.
@@ -106,6 +109,11 @@ impl MockLoader {
     pub fn resident(&self) -> usize {
         resident(&self.state)
     }
+
+    /// The options each prepare was handed, in order.
+    pub fn prepared_options(&self) -> Vec<Option<ignis_server::config::Config>> {
+        self.state.options.lock().unwrap().clone()
+    }
 }
 
 fn resident(state: &State) -> usize {
@@ -121,7 +129,8 @@ fn build(state: &State, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
 }
 
 impl ModelLoader for MockLoader {
-    fn prepare(&self, target: &ModelSource) -> Result<Box<dyn PreparedLoad>, String> {
+    fn prepare(&self, target: &ModelSource, options: Option<&ignis_server::config::Config>) -> Result<Box<dyn PreparedLoad>, String> {
+        self.state.options.lock().unwrap().push(options.cloned());
         if self.state.refused.lock().unwrap().contains(&target.model) {
             return Err(format!("{} refused at prepare (simulated)", target.model));
         }

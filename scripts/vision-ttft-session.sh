@@ -7,7 +7,7 @@
 #   bash scripts/vision-ttft-session.sh <out-dir>
 #
 # Three engines, each launched twice, in order: the reference with --vision
-# (the owner's hq-e8-2b-262k preset), ignis with --vision, ignis without it.
+# (the owner's hq-e8-2b-262k preset), ignis with --vision-enabled, ignis without it.
 # Every launch writes a text record (1024/8192/32768) and, with vision, an
 # image record — separate records, since g2 cannot pair a record carrying the
 # image cell with one that has none. Each launch measures its prompts once:
@@ -69,8 +69,8 @@ launch() {
 
 REFERENCE_PROFILE="ninfer-serve --vision --spec mtp --draft-tokens 3 --lm-head-draft, hq-e8-2b KV, 262144 context, 4 concurrency, 450000 KV capacity, graphs"
 IGNIS_PROFILE="hq-e8-2b KV, 262144 context, 1024 chunk, dflash2/7, prompt reuse"
-IGNIS=("$BIN/ignis-server.exe" --bind 127.0.0.1:8000 --artifact "$ARTIFACT" --kv-format hq-e8-2b --max-context 262144
-  --prefill-chunk 1024 --kv-host-pool-bytes 8G --request-timeout 1800 --spec dflash2 --draft-tokens 7)
+IGNIS=("$BIN/ignis-server.exe" --server-bind 127.0.0.1:8000 --model-artifact "$ARTIFACT" --model-kv-format hq-e8-2b --model-max-context 262144
+  --model-prefill-chunk 1024 --reuse-kv-host-pool-bytes 8G --server-request-timeout 1800 --spec-backend dflash2 --spec-draft-tokens 7)
 
 for n in 1 2; do
   launch "reference-$n" http://127.0.0.1:8080 ninfer-serve.exe reference "$REFERENCE_PROFILE" 1 \
@@ -79,7 +79,7 @@ for n in 1 2; do
     --pending-timeout-ms 3000000 --kv-dtype hq-e8-2b --max-context 262144 --max-concurrency 4 --kv-capacity 450000
 done
 for n in 1 2; do
-  launch "ignis-vision-$n" http://127.0.0.1:8000 ignis-server.exe ignis-vision "$IGNIS_PROFILE, --vision" 1 "${IGNIS[@]}" --vision
+  launch "ignis-vision-$n" http://127.0.0.1:8000 ignis-server.exe ignis-vision "$IGNIS_PROFILE, --vision-enabled" 1 "${IGNIS[@]}" --vision-enabled
 done
 for n in 1 2; do
   launch "ignis-text-$n" http://127.0.0.1:8000 ignis-server.exe ignis-text "$IGNIS_PROFILE" 0 "${IGNIS[@]}"

@@ -1,7 +1,7 @@
 //! DFlash2 on a multimodal prefill span (GitHub #195, spec
 //! `docs/specs/vision/01-image-input.md` §Compute seam, ADR 0014).
 //!
-//! GitHub #178 fenced `--vision` and `--spec dflash2` apart at load. What
+//! GitHub #178 fenced `--vision-enabled` and `--spec-backend dflash2` apart at load. What
 //! stood in the way was one thing: the verify round staged each lane's raw KV
 //! frontier as the rotation position, so a sequence with a nonzero
 //! `rope_delta` -- every prompt with an image -- verified its columns at
@@ -15,7 +15,7 @@
 //! One load carries all four checks, because the card fits one artifact at a
 //! time and each is a question about the *same* load:
 //!
-//! - AC 1: `--vision` with `--spec dflash2` loads -- the tower and the
+//! - AC 1: `--vision-enabled` with `--spec-backend dflash2` loads -- the tower and the
 //!   drafter bind together and the vision reservation is still reported.
 //! - AC 2: the vision canary's teacher-forced floor (ADR 0014, >= 95%) holds
 //!   on this load, so the drafter riding the multimodal prefill does not

@@ -115,11 +115,11 @@ impl std::fmt::Display for ArtifactHash {
 /// write into a sequence built under the other". The operator knobs that
 /// decide *how much* is retained or *how fast* it is produced — the bind
 /// address, the prefill chunk width, the concurrency, every byte budget,
-/// `--prompt-reuse` itself — are deliberately absent: a device pool budget
+/// `--reuse-prompt` itself — are deliberately absent: a device pool budget
 /// derived from free VRAM varies from one start to the next, and an identity
 /// that moved with it would refuse every blob after a reboot for no reason.
 ///
-/// Vision is absent for the same test: a `--vision` load binds an encoder and
+/// Vision is absent for the same test: a `--vision-enabled` load binds an encoder and
 /// reserves its workspace, but the sequence state a checkpoint holds has the
 /// same sections and the same meaning either way. What an image changes is
 /// *content*, and content is the [`MatchKey`]'s job.
@@ -185,7 +185,7 @@ impl BlobIdentity {
     ///
     /// The refusal names the field that differs, because "refused" alone is
     /// indistinguishable from a bug at three in the morning: an operator who
-    /// restarted with `--kv-format bf16` and lost every checkpoint should read
+    /// restarted with `--model-kv-format bf16` and lost every checkpoint should read
     /// *why* in one line.
     pub fn accepts(&self, blob: &BlobIdentity) -> Result<(), IdentityMismatch> {
         let field = if self.artifact != blob.artifact {

@@ -1472,7 +1472,7 @@ impl Drop for Seq<'_> {
 /// [`PinnedBuffer`] is placed in, held from the load to the end of the
 /// process.
 ///
-/// One `cudaHostAlloc` of `--kv-host-pool-bytes` and no other while serving,
+/// One `cudaHostAlloc` of `--reuse-kv-host-pool-bytes` and no other while serving,
 /// which is what fixes the process's shared GPU memory on Windows. The arena
 /// is process-wide in the leaf — there is one host tier — so this is a guard
 /// over that global, not a handle to one of many.
@@ -1491,7 +1491,7 @@ impl HostPinnedPool {
     /// tier disabled: [`PinnedBuffer::new`] then refuses every request, which
     /// is what a scheduler configured with a zero host budget never asks for.
     ///
-    /// The error names the size and `--kv-host-pool-bytes`, because refusing
+    /// The error names the size and `--reuse-kv-host-pool-bytes`, because refusing
     /// the start is the only thing a caller can do with it.
     pub fn create(bytes: u64) -> Result<Self, String> {
         let rc = unsafe { ffi::ignis_host_pinned_pool_create(bytes) };
@@ -1502,7 +1502,7 @@ impl HostPinnedPool {
             // it.
             return Err(format!(
                 "KV-RAM arena of {bytes} bytes: {} \
-                 (--kv-host-pool-bytes sets this size; 0 disables the tier)",
+                 (--reuse-kv-host-pool-bytes sets this size; 0 disables the tier)",
                 last_error()
             ));
         }
@@ -1679,7 +1679,7 @@ impl HostArena {
         if rc != 0 || handle.is_null() {
             return Err(format!(
                 "KV-RAM arena of {bytes} bytes: {} \
-                 (--kv-host-pool-bytes sets this size; 0 disables the tier)",
+                 (--reuse-kv-host-pool-bytes sets this size; 0 disables the tier)",
                 last_error()
             ));
         }

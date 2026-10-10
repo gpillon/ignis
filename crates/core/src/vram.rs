@@ -40,7 +40,7 @@ impl KvPoolPolicy {
     }
 }
 
-/// A KV pool the operator named (`--kv-pool-bytes`, ADR 0045): a byte count,
+/// A KV pool the operator named (`--vram-kv-pool-bytes`, ADR 0045): a byte count,
 /// or a token count. The plan turns either into pages, since only it knows
 /// what a page costs on the model it loads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +104,7 @@ pub enum VramMode {
     Derived { headroom_bytes: u64 },
     /// The operator's figure, the whole process included. More than is free
     /// refuses the start unless `allow_oversubscription`
-    /// (`--allow-vram-oversubscription`) turns that into a warning.
+    /// (`--vram-allow-oversubscription`) turns that into a warning.
     Explicit {
         budget_bytes: u64,
         allow_oversubscription: bool,
@@ -141,17 +141,17 @@ pub struct VramLines {
     /// The CUDA context: the budget, like Task Manager, counts it.
     pub cuda_context: u64,
     /// The one scratch arena prefill chunks and media encode share (GitHub
-    /// #212): one `--prefill-chunk` span's scratch, or with `--vision` the
+    /// #212): one `--model-prefill-chunk` span's scratch, or with `--vision-enabled` the
     /// encoder's workspace when that is larger. The two are never live at
     /// once.
     pub workspace: u64,
-    /// One media item's encoder output (0 without `--vision`).
+    /// One media item's encoder output (0 without `--vision-enabled`).
     pub media_embedding: u64,
     /// Device sampling's staging buffers and workspace.
     pub sampling: u64,
     /// The decode round's scratch and staging.
     pub decode_graph: u64,
-    /// The verify round (0 without `--spec`).
+    /// The verify round (0 without `--spec-backend`).
     pub verify_round: u64,
     /// The drafter's round buffers (0 without the DFlash2 drafter).
     pub drafter_round: u64,
@@ -159,9 +159,9 @@ pub struct VramLines {
     /// conv state, penalty counts, the drafter's window.
     pub lane_state: u64,
     /// The sequence pool's device retained slots (GitHub #211, #215,
-    /// `--retained-device`): a lane's state each, reserved at load beside the
+    /// `--reuse-retained-device`): a lane's state each, reserved at load beside the
     /// lanes, holding retained prompt checkpoints' and shared prefixes'
-    /// images. The host slots (`--retained-host`, GitHub #281) live in
+    /// images. The host slots (`--reuse-retained-host`, GitHub #281) live in
     /// pinned host memory and are no line of this plan.
     pub retained_slots: u64,
     /// The hq-e8-2b residual window (GitHub #257, spec runtime/06): every
@@ -217,16 +217,16 @@ pub struct VramRequest<'a> {
     /// divided by and what the rest is cut into (the format's page on the
     /// 27B, every paged section's -- KV and indexer keys -- on Flash-Next).
     pub kv_page_bytes: u64,
-    /// `--max-context`: the plan must hold one sequence this long.
+    /// `--model-max-context`: the plan must hold one sequence this long.
     pub max_context_tokens: u32,
-    /// Every retained slot, `--retained-device` and `--retained-host`
+    /// Every retained slot, `--reuse-retained-device` and `--reuse-retained-host`
     /// together (GitHub #215, #281). The KV pool must also hold one page per
     /// slot, whichever kind: a prompt checkpoint keeps the page its opener
     /// ends inside, and a request claiming it cannot take that page back
-    /// while it stands on the checkpoint — so a lone `--max-context` sequence
+    /// while it stands on the checkpoint — so a lone `--model-max-context` sequence
     /// has to fit beside every one.
     pub retained_slots: u32,
-    /// `--kv-pool-bytes`, when the operator named it, in bytes or tokens: it
+    /// `--vram-kv-pool-bytes`, when the operator named it, in bytes or tokens: it
     /// replaces the policy's size (ADR 0045). `None` takes the policy's.
     pub kv_pool: Option<KvPoolSize>,
     /// Whether every weight is a line ([`Residency::Resident`]) or the load has
@@ -235,7 +235,7 @@ pub struct VramRequest<'a> {
     /// Whether the operator named `--vision-embedding-pool-mib` (GitHub
     /// #243). Only so a refusal can name the knob they just set: telling
     /// someone who asked for a large embedding pool to run "without
-    /// --vision" is the one remedy they did not mean.
+    /// --vision-enabled" is the one remedy they did not mean.
     pub embedding_pool_named: bool,
     /// The device bytes a KV pool of this many pages occupies: its planes
     /// and its block tables, as the leaf lays them out.
@@ -290,10 +290,10 @@ impl VramPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VramPlanError {
     /// An explicit budget above the memory free at start, without
-    /// `--allow-vram-oversubscription`.
+    /// `--vram-allow-oversubscription`.
     BudgetAboveFree { budget_bytes: u64, free_bytes: u64 },
     /// The budget cannot hold every reservation and one sequence at
-    /// `--max-context` (resident), or every reservation and the KV pool
+    /// `--model-max-context` (resident), or every reservation and the KV pool
     /// before the expert cache (offloaded).
     BelowMinimum {
         mode: VramMode,
@@ -304,7 +304,7 @@ pub enum VramPlanError {
         kv_pool_named: bool,
         embedding_pool_named: bool,
     },
-    /// A named KV pool smaller than one `--max-context` sequence plus a page
+    /// A named KV pool smaller than one `--model-max-context` sequence plus a page
     /// per retained slot (ADR 0045's invariant), whatever the budget.
     PoolBelowFloor {
         pool: KvPoolSize,
@@ -327,7 +327,7 @@ impl std::fmt::Display for VramPlanError {
                 f,
                 "the VRAM budget of {budget_bytes} bytes (--vram-budget-bytes) is more than the \
                  {free_bytes} bytes free at start; lower it, or pass \
-                 --allow-vram-oversubscription to start anyway"
+                 --vram-allow-oversubscription to start anyway"
             ),
             Self::PoolBelowFloor {
                 pool,
@@ -338,11 +338,11 @@ impl std::fmt::Display for VramPlanError {
                 bytes_per_token,
             } => write!(
                 f,
-                "the KV pool of {pool} (--kv-pool-bytes) holds {pool_pages} pages of {KV_PAGE_TOKENS} tokens \
+                "the KV pool of {pool} (--vram-kv-pool-bytes) holds {pool_pages} pages of {KV_PAGE_TOKENS} tokens \
                  ({bytes_per_token} bytes per token on this model), fewer than the {floor_pages} it must hold: \
-                 one --max-context sequence ({max_context_tokens} tokens) and a page per retained slot \
-                 ({retained_slots}); name a larger --kv-pool-bytes, or a smaller --max-context, \
-                 --retained-device or --retained-host"
+                 one --model-max-context sequence ({max_context_tokens} tokens) and a page per retained slot \
+                 ({retained_slots}); name a larger --vram-kv-pool-bytes, or a smaller --model-max-context, \
+                 --reuse-retained-device or --reuse-retained-host"
             ),
             Self::BelowMinimum {
                 mode,
@@ -356,14 +356,14 @@ impl std::fmt::Display for VramPlanError {
                     f,
                     "the VRAM plan needs {needed_bytes} bytes for the weights, workspaces, lanes, residency's \
                      staging ring and tables and the KV pool, {} bytes more than the {budget_bytes}-byte VRAM \
-                     budget before any of it goes to the expert cache; shrink it with a smaller --kv-pool-bytes, \
-                     a smaller --max-context (now {max_context_tokens}) or --prefill-chunk, or with ",
+                     budget before any of it goes to the expert cache; shrink it with a smaller --vram-kv-pool-bytes, \
+                     a smaller --model-max-context (now {max_context_tokens}) or --model-prefill-chunk, or with ",
                     needed_bytes.saturating_sub(budget_bytes),
                 )?;
                 match mode {
                     VramMode::Derived { .. } => f.write_str("a smaller --vram-headroom-bytes"),
                     VramMode::Explicit { .. } => {
-                        f.write_str("a larger --vram-budget-bytes (or --allow-vram-oversubscription)")
+                        f.write_str("a larger --vram-budget-bytes (or --vram-allow-oversubscription)")
                     }
                 }
             }
@@ -380,12 +380,12 @@ impl std::fmt::Display for VramPlanError {
                     f,
                     "the VRAM plan needs {needed_bytes} bytes for the weights, workspaces, lanes, \
                      retained state and {} KV, {} bytes more than the {budget_bytes}-byte VRAM \
-                     budget; shrink it with a smaller --max-context (now {max_context_tokens}), \
-                     without --vision, with fewer --retained-device, or with ",
+                     budget; shrink it with a smaller --model-max-context (now {max_context_tokens}), \
+                     without --vision-enabled, with fewer --reuse-retained-device, or with ",
                     if kv_pool_named {
-                        "the --kv-pool-bytes"
+                        "the --vram-kv-pool-bytes"
                     } else {
-                        "one --max-context sequence of"
+                        "one --model-max-context sequence of"
                     },
                     needed_bytes.saturating_sub(budget_bytes),
                 )?;
@@ -394,11 +394,11 @@ impl std::fmt::Display for VramPlanError {
                         f.write_str("a smaller --vram-headroom-bytes")?
                     }
                     VramMode::Explicit { .. } => f.write_str(
-                        "a larger --vram-budget-bytes (or --allow-vram-oversubscription)",
+                        "a larger --vram-budget-bytes (or --vram-allow-oversubscription)",
                     )?,
                 }
                 if kv_pool_named {
-                    f.write_str(", or name a smaller --kv-pool-bytes")?;
+                    f.write_str(", or name a smaller --vram-kv-pool-bytes")?;
                 }
                 if embedding_pool_named {
                     f.write_str(", or name a smaller --vision-embedding-pool-mib")?;
@@ -430,7 +430,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
                 }
                 warnings.push(format!(
                     "the VRAM budget of {budget_bytes} bytes is more than the {free} bytes free at \
-                     start (--allow-vram-oversubscription): {}",
+                     start (--vram-allow-oversubscription): {}",
                     oversubscription_consequence(request.can_page)
                 ));
             }
@@ -439,7 +439,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
     };
 
     let page_bytes = request.kv_page_bytes;
-    // ADR 0030's floor, on both models since ADR 0045: one `--max-context`
+    // ADR 0030's floor, on both models since ADR 0045: one `--model-max-context`
     // sequence and a page per retained slot.
     let min_pages = request
         .max_context_tokens
@@ -510,7 +510,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
             return Err(refusal);
         }
         warnings.push(format!(
-            "{refusal}; starting anyway (--allow-vram-oversubscription): {}",
+            "{refusal}; starting anyway (--vram-allow-oversubscription): {}",
             oversubscription_consequence(request.can_page)
         ));
         pages
@@ -549,7 +549,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
 /// The offloaded pool's default pages (ADR 0045): 524,288 tokens, capped at
 /// every lane's whole context -- a larger pool could hold only retained
 /// pages, and one lane keeps the pool it had before the policy -- and never
-/// below the floor, so a `--max-context` past 524,288 starts.
+/// below the floor, so a `--model-max-context` past 524,288 starts.
 fn offloaded_default_pages(max_context_tokens: u32, decode_lanes: u32, floor_pages: u32) -> u32 {
     let lanes_pages = decode_lanes.saturating_mul(max_context_tokens.div_ceil(KV_PAGE_TOKENS));
     (OFFLOADED_KV_POOL_TOKENS / KV_PAGE_TOKENS).min(lanes_pages).max(floor_pages)
@@ -701,7 +701,7 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains(&(30 * GIB).to_string()), "{message}");
         assert!(message.contains(&(29 * GIB).to_string()), "{message}");
-        assert!(message.contains("--allow-vram-oversubscription"), "{message}");
+        assert!(message.contains("--vram-allow-oversubscription"), "{message}");
     }
 
     #[test]
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(needed_bytes, lines().total() + arena(min_pages));
         let message = err.to_string();
         assert!(message.contains(&(5 * page_bytes()).to_string()), "{message}");
-        for knob in ["--max-context", "--vision", "--retained-device", "--vram-headroom-bytes"] {
+        for knob in ["--model-max-context", "--vision-enabled", "--reuse-retained-device", "--vram-headroom-bytes"] {
             assert!(message.contains(knob), "{knob} missing: {message}");
         }
     }
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(plan.kv_page_count, min_pages);
         assert!(plan.oversubscribed);
         assert_eq!(plan.warnings.len(), 1);
-        assert!(plan.warnings[0].contains("--max-context"), "{:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("--model-max-context"), "{:?}", plan.warnings);
         assert!(plan.warnings[0].contains("--vram-budget-bytes"), "{:?}", plan.warnings);
     }
 
@@ -814,14 +814,14 @@ mod tests {
         })
         .expect_err("past the budget");
         let message = err.to_string();
-        assert!(message.contains("--kv-pool-bytes"), "{message}");
+        assert!(message.contains("--vram-kv-pool-bytes"), "{message}");
     }
 
     #[test]
     fn a_named_embedding_pool_past_the_budget_refuses_and_names_that_flag_too() {
         // GitHub #243: the remedies an operator is offered have to include
         // the one they just reached for. Telling someone who asked for a
-        // large embedding pool to run "without --vision" is the single
+        // large embedding pool to run "without --vision-enabled" is the single
         // remedy they did not mean.
         let huge = || {
             let mut l = lines();
@@ -997,7 +997,7 @@ mod tests {
                 }
             );
             let message = err.to_string();
-            for needle in ["--kv-pool-bytes", "--max-context", "--retained-device", "--retained-host", "4224 bytes per token", "4104"] {
+            for needle in ["--vram-kv-pool-bytes", "--model-max-context", "--reuse-retained-device", "--reuse-retained-host", "4224 bytes per token", "4104"] {
                 assert!(message.contains(needle), "{needle} missing: {message}");
             }
         }
@@ -1095,10 +1095,10 @@ mod tests {
             "{err:?}"
         );
         let message = err.to_string();
-        for needle in ["--kv-pool-bytes", "--max-context", "--prefill-chunk", "--vram-budget-bytes", "expert cache", "1 bytes more"] {
+        for needle in ["--vram-kv-pool-bytes", "--model-max-context", "--model-prefill-chunk", "--vram-budget-bytes", "expert cache", "1 bytes more"] {
             assert!(message.contains(needle), "{needle} missing: {message}");
         }
-        assert!(!message.contains("--vision"), "{message}");
+        assert!(!message.contains("--vision-enabled"), "{message}");
     }
 
     #[test]

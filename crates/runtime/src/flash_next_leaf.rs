@@ -695,7 +695,7 @@ impl StepLeaf for FlashNextLeaf {
         let arena = self
             .arena
             .as_ref()
-            .ok_or_else(|| leaf_error("snapshot alloc", "no KV-RAM arena (--kv-host-pool-bytes 0)".to_string()))?;
+            .ok_or_else(|| leaf_error("snapshot alloc", "no KV-RAM arena (--reuse-kv-host-pool-bytes 0)".to_string()))?;
         arena.alloc(bytes).map_err(|e| match e {
             // A fragmented arena is a refusal, not a failure (GitHub #213).
             PinnedAllocError::NoRoom => ignis_core::seq::NO_HOST_ROOM,

@@ -10,7 +10,7 @@ const MAGIC: &[u8; 8] = b"IGNGRAM1";
 const HEADER_BYTES: u64 = 80;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Where the cache file lives (`--persist-ngram-cache-path`).
+/// Where the cache file lives (`--ngram-persist-path`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CacheLocation {
     /// Beside the artifact, on the disk that already holds the model

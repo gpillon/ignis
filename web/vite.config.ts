@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { mockIgnis } from "./mock.ts";
 
-// The Playground (GitHub #163, ADR 0026). `ignis-server --ui` serves the
+// The Playground (GitHub #163, ADR 0026). `ignis-server --server-ui` serves the
 // build under /ui/; in development, /v1 and /ui/metrics go to a running ignis
 // (IGNIS_URL, from the shell or web/.env), or to the in-process mock with
 // `npm run dev:mock`. /v1 carries the Responses WebSocket too (GitHub #283);

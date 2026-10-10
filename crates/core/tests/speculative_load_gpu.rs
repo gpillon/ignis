@@ -1,5 +1,5 @@
 //! GPU test for speculation as a load option (P5-02, GitHub #150): a load
-//! with `--spec dflash2` reports the drafter's VRAM — its weights, its
+//! with `--spec-backend dflash2` reports the drafter's VRAM — its weights, its
 //! prefill scratch, and (P5-03, GitHub #152) the per-slot window its pool
 //! carries — in `ignis_program_stats`, and a load
 //! without it reports today's figure.

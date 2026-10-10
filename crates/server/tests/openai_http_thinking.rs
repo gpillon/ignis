@@ -128,9 +128,9 @@ fn harness_with_budget(template: RecordingTemplateProvider, default_budget: Opti
 /// What a harness's server is started with, beyond its template.
 #[derive(Default)]
 struct Setup {
-    /// `--thinking-budget`.
+    /// `--model-thinking-budget`.
     default_budget: Option<u32>,
-    /// `--reasoning-effort`.
+    /// `--model-reasoning-effort`.
     default_effort: Option<ReasoningEffort>,
     /// The close the scheduler forces once a budget is spent; `None` leaves
     /// every budget inert, as a tokenizer that splits `</think>` does.
@@ -380,7 +380,7 @@ async fn the_server_default_applies_and_a_request_overrides_it_or_opts_out() {
         Setup { default_budget: Some(8192), ..Setup::default() },
     );
     for (extra, want) in [
-        // Absent or null: the server's `--thinking-budget`.
+        // Absent or null: the server's `--model-thinking-budget`.
         (serde_json::json!({}), Some(8192)),
         (serde_json::json!({ "thinking_budget": null }), Some(8192)),
         // A number wins, downward or upward: the server does not cap it.

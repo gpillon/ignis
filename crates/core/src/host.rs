@@ -94,7 +94,7 @@ impl RetainedBlob {
 use crate::types::{LaneId, RequestClass, RequestId};
 
 /// How long a retained Interactive entry in KV-RAM keeps its class's priority
-/// after its conversation last used it (GitHub #190, `--retained-interactive-ttl`).
+/// after its conversation last used it (GitHub #190, `--reuse-retained-interactive-ttl`).
 ///
 /// Class alone would let a handful of Interactive conversations nobody is
 /// coming back to fill KV-RAM for good: every Agent spill ranks below them and

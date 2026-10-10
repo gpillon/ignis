@@ -108,7 +108,7 @@ export type Memory = {
   kvPool: { pages: number | null; pageBytes: number | null; bytes: number | null; tokens: number | null };
   /** The budget beyond the lines and the pool's pages: page-rounding slack, and the pool's own tables. */
   spareBytes: number | null;
-  /** Whether the plan overran its budget, which only --allow-vram-oversubscription allows. */
+  /** Whether the plan overran its budget, which only --vram-allow-oversubscription allows. */
   oversubscribed: boolean;
   pagesInUse: Meter;
   arenaInUse: Meter;
