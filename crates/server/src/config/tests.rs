@@ -54,6 +54,106 @@ fn help_block(flag: &str) -> String {
     format!("{}\n{}", lines[at], lines.get(at + 1).unwrap_or(&""))
 }
 
+// ── the config file (spec config-v2/01 §The config file) ─────────────────
+
+use file::testing::MemFiles;
+use file::Format;
+
+fn with_files(flags: &[&str], env: impl Fn(&str) -> Option<String>, files: &MemFiles) -> Result<Config, ConfigError> {
+    resolve_with(&args(flags), env, files).map(expect_config)
+}
+
+/// Spec config-v2/01, Testing: a file written with every default reads back
+/// to the same config in both formats — and starts either model, though it
+/// names fields only one of them has (at their defaults).
+#[test]
+fn a_file_of_every_default_reads_back_to_the_defaults_in_both_formats() {
+    let defaults = config(&[]);
+    let document = file::settings_document(defaults.settings());
+    for (name, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
+        let files = MemFiles::with(&[(name, &format.write(&document))]);
+        let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(read.settings(), defaults.settings(), "{name}");
+        assert_eq!(read.basis.sources().file_source, source::FileSource::Explicit(PathBuf::from(name)));
+        for family in field::FAMILIES {
+            read.for_family(family).unwrap_or_else(|e| panic!("{name} on {}: {e}", family.name()));
+        }
+    }
+}
+
+#[test]
+fn a_file_value_sits_below_the_environment_and_the_flags() {
+    let files = MemFiles::with(&[(
+        "c.yaml",
+        "reuse:\n  kv_host_pool_bytes: 3G\nmodel:\n  max_context: 65536\n  prefill_chunk: 512\n",
+    )]);
+    let env = env_map(&[("IGNIS_MODEL_MAX_CONTEXT", "32768")]);
+    let config = with_files(&["--config", "c.yaml", "--model-prefill-chunk", "256"], env, &files).unwrap();
+    assert_eq!(config.host_pool_bytes, 3 * GIB, "the file over the default");
+    assert_eq!(config.max_context, 32_768, "the env over the file");
+    assert_eq!(config.prefill_chunk, 256, "the flag over the file");
+}
+
+#[test]
+fn a_file_is_named_by_the_flag_or_the_env_var_and_must_exist() {
+    let files = MemFiles::with(&[("e.json", r#"{"server": {"request_timeout": 77}}"#)]);
+    let env = env_map(&[("IGNIS_CONFIG", "e.json")]);
+    assert_eq!(with_files(&[], env, &files).unwrap().request_timeout_secs, 77);
+    let err = with_files(&["--config", "missing.yaml"], no_env, &files).unwrap_err().0;
+    assert!(err.contains("missing.yaml"), "{err}");
+    let err = with_files(&[], env_map(&[("IGNIS_CONFIG", "gone.yaml")]), &files).unwrap_err().0;
+    assert!(err.contains("gone.yaml"), "an operator who named a file meant it to exist: {err}");
+    assert!(resolve(&args(&["--config", "e.json"]), no_env).is_err(), "`resolve` reads no filesystem");
+}
+
+/// Spec config-v2/01, Testing: an unknown field or the wrong type is a
+/// `ConfigError` naming the field.
+#[test]
+fn a_file_naming_an_unknown_field_or_a_bad_value_is_refused_by_name() {
+    for (text, says) in [
+        ("server:\n  bnd: x\n", "server.bnd"),
+        ("model:\n  max_context: lots\n", "model.max_context"),
+        ("model:\n  max_context: [1, 2]\n", "model.max_context"),
+        ("vram:\n  headroom_bytes: true\n", "vram.headroom_bytes"),
+        ("model: [\n", "not valid"),
+    ] {
+        let files = MemFiles::with(&[("c.yaml", text)]);
+        let err = with_files(&["--config", "c.yaml"], no_env, &files).unwrap_err().0;
+        assert!(err.contains(says) && err.contains("c.yaml"), "{text}: {err}");
+    }
+}
+
+/// The family sections are the file's half of family scope.
+#[test]
+fn a_files_family_section_applies_to_that_family_alone() {
+    let files = MemFiles::with(&[(
+        "c.yaml",
+        "reuse:\n  kv_host_pool_bytes: 8G\n  qwen38flashnext:\n    kv_host_pool_bytes: 1G\nngram:\n  hot_bytes: 4G\n",
+    )]);
+    let config = with_files(&["--config", "c.yaml"], no_env, &files).unwrap();
+    assert_eq!(config.for_family(ModelFamily::FlashNext).unwrap().host_pool_bytes, GIB);
+    assert_eq!(config.for_family(ModelFamily::Qwen38_27b).unwrap_err().0.contains("ngram.hot_bytes"), true);
+    let (switched, dropped) = fit_to_family(&config, ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!((switched.host_pool_bytes, dropped), (8 * GIB, vec!["--ngram-hot-bytes".to_owned()]));
+}
+
+/// Every group struct and `Settings` derive their serde through the field
+/// table: JSON and YAML round-trip, and a bad document is refused by name.
+#[test]
+fn the_settings_and_every_group_serialize_and_deserialize_in_both_formats() {
+    let settings = config(&["--reuse-kv-host-pool-bytes", "3G", "--switch-known-models", "a=F:/a.ninfer", "--server-api-key", "k"])
+        .settings()
+        .clone();
+    let json = serde_json::to_string(&settings).unwrap();
+    assert_eq!(serde_json::from_str::<schema::Settings>(&json).unwrap(), settings);
+    let yaml = serde_yaml::to_string(&settings).unwrap();
+    assert_eq!(serde_yaml::from_str::<schema::Settings>(&yaml).unwrap(), settings);
+    let reuse: schema::ReuseGroup = serde_json::from_str(r#"{"kv_host_pool_bytes": "3G"}"#).unwrap();
+    assert_eq!(reuse, settings.reuse);
+    let err = serde_json::from_str::<schema::ReuseGroup>(r#"{"kv_host_pool": 1}"#).unwrap_err().to_string();
+    assert!(err.contains("reuse.kv_host_pool"), "{err}");
+}
+
 // ── the n-gram cache and KV-disk ─────────────────────────────────────────
 
 /// The n-gram cache is on and beside the model by default; `model` says so

@@ -30,6 +30,7 @@ use crate::instruction::InstructionPolicy;
 use crate::thinking::ReasoningEffort;
 
 pub mod field;
+pub mod file;
 pub mod kind;
 pub mod schema;
 pub mod source;
@@ -37,7 +38,7 @@ pub mod source;
 #[cfg(test)]
 mod tests;
 
-use source::{Fit, Resolution, Sources};
+use source::{FileSource, Fit, Resolution, Sources};
 
 /// The default loaded-model id (the v1 specialization: Qwen 3.8-27B —
 /// `CONTEXT.md`).
@@ -508,7 +509,17 @@ impl std::fmt::Display for ConfigError {
 }
 
 /// Resolve `args` (argv without the program name) and `env` (injected so
-/// tests never touch the real process environment) into a [`ConfigOutcome`].
+/// tests never touch the real process environment) into a [`ConfigOutcome`],
+/// with no filesystem: a config file is neither found nor read
+/// ([`file::NoFiles`]). [`resolve_with`] is the same with one.
+pub fn resolve(args: &[String], env: impl Fn(&str) -> Option<String>) -> Result<ConfigOutcome, ConfigError> {
+    resolve_with(args, env, &file::NoFiles)
+}
+
+/// The env var naming the config file, as `--config` does.
+pub const CONFIG_ENV: &str = "IGNIS_CONFIG";
+
+/// Resolve the command line against `env` and `files`.
 ///
 /// `--help`/`-h` and `--version`/`-V` short-circuit before any other flag is
 /// parsed or validated — `ignis-server --help --nonsense` just prints help.
@@ -518,7 +529,11 @@ impl std::fmt::Display for ConfigError {
 /// start rather than at the first load of that family. The family checks
 /// that depend on which artifact loads (the 27B's attention envelope) wait
 /// for [`Config::for_family`].
-pub fn resolve(args: &[String], env: impl Fn(&str) -> Option<String>) -> Result<ConfigOutcome, ConfigError> {
+pub fn resolve_with(
+    args: &[String],
+    env: impl Fn(&str) -> Option<String>,
+    files: &dyn file::Files,
+) -> Result<ConfigOutcome, ConfigError> {
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ConfigOutcome::Help(help_text())),
@@ -527,16 +542,55 @@ pub fn resolve(args: &[String], env: impl Fn(&str) -> Option<String>) -> Result<
         }
     }
     let parsed = source::parse_args(args)?;
-    if let Some(path) = parsed.config {
-        return Err(ConfigError(format!("`--config {path}`: config files are not read by this build yet")));
-    }
-    let sources = Sources {
-        flags: parsed.flags,
-        env: source::env_layer(&env)?,
-        profile_name: parsed.profile.unwrap_or_default(),
-        ..Sources::default()
+    let named = parsed.config.clone().or_else(|| env(CONFIG_ENV).filter(|path| !path.is_empty()));
+    let choice = match named {
+        Some(path) => FileChoice::Explicit(PathBuf::from(path)),
+        None => FileChoice::None,
     };
+    let (sources, _) = gather(parsed, &env, files, choice)?;
     Config::from_sources(sources).map(ConfigOutcome::Config)
+}
+
+/// Which config file a resolution reads.
+#[derive(Debug, Clone)]
+pub(crate) enum FileChoice {
+    /// None.
+    None,
+    /// The one `--config` / `IGNIS_CONFIG` named: it must exist — an
+    /// operator who named a file meant it to.
+    Explicit(PathBuf),
+}
+
+/// Gather every source of a resolution: the flags parsed, the environment,
+/// and the config file `choice` picks. Returns the file's document as
+/// written too, for a caller that merges a change into it.
+pub(crate) fn gather(
+    parsed: source::ParsedArgs,
+    env: &dyn Fn(&str) -> Option<String>,
+    files: &dyn file::Files,
+    choice: FileChoice,
+) -> Result<(Sources, Option<serde_json::Value>), ConfigError> {
+    let (file_source, loaded) = match choice {
+        FileChoice::None => (FileSource::None, None),
+        FileChoice::Explicit(path) => {
+            let loaded = file::load(files, &path)?;
+            (FileSource::Explicit(path), Some(loaded))
+        }
+    };
+    let (value, document) = match loaded {
+        Some((value, document)) => (Some(value), document),
+        None => (None, file::Document::default()),
+    };
+    let sources = Sources {
+        patch: source::Layer::default(),
+        flags: parsed.flags,
+        env: source::env_layer(env)?,
+        file: document.values,
+        file_source,
+        profile: source::Layer::default(),
+        profile_name: parsed.profile.unwrap_or_default(),
+    };
+    Ok((sources, value))
 }
 
 impl Config {

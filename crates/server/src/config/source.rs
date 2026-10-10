@@ -466,7 +466,7 @@ fn unrecognized(arg: &str) -> ConfigError {
 /// Every field's env var that `env` sets, general and scoped. A scoped
 /// variable of a field with no family scope is refused rather than ignored:
 /// it can only be a mistake.
-pub fn env_layer(env: &impl Fn(&str) -> Option<String>) -> Result<Layer, ConfigError> {
+pub fn env_layer(env: &dyn Fn(&str) -> Option<String>) -> Result<Layer, ConfigError> {
     let mut layer = Layer::default();
     for meta in all_fields() {
         let name = meta.env();

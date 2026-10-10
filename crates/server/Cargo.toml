@@ -12,6 +12,11 @@ ignis-runtime = { path = "../runtime" }
 ignis-logging = { path = "../logging" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The config file's YAML half (ADR 0046, spec config-v2/01): read and written
+# through the same `serde` path as its JSON half. 0.9 is the last release and
+# marked deprecated upstream; it is complete for a config file's needs and
+# pulls in nothing but `unsafe-libyaml`, `indexmap`, `itoa` and `ryu`.
+serde_yaml = "0.9"
 # `ws`: the Responses API's WebSocket mode (GitHub #282), `tokio-tungstenite`
 # 0.29 underneath; a probe on 2026-09-29 found it adds no host `windows-sys`.
 axum = { workspace = true, features = ["ws"] }

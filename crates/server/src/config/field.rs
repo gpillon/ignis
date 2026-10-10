@@ -206,6 +206,12 @@ pub struct FieldMeta {
     pub kind: &'static str,
     /// The hardcoded default as the file format would write it.
     pub default: fn() -> Value,
+    /// A value read from a config file as the text the kind parses
+    /// (`FieldKind::file_text`); `Ok(None)` for `null`.
+    pub file_text: fn(&Value) -> Result<Option<String>, String>,
+    /// Raw text parsed by the kind and written back in canonical form
+    /// (`2147483648` as `2G`), for a file a change is merged into.
+    pub canonical: fn(&str) -> Result<Value, String>,
     /// The field's doc comment, which is written for the operator: the same
     /// text rustdoc shows on the struct field is what `help --fields` prints.
     pub description: &'static str,
@@ -349,6 +355,8 @@ mod tests {
             name: "kv_host_pool_bytes",
             kind: "bytes",
             default: || Value::Null,
+            file_text: |_| Ok(None),
+            canonical: |_| Ok(Value::Null),
             description: " The budget.\n\n More.",
             validator: Validator::None,
             applies: Applicability::AllFamilies,

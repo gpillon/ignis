@@ -81,6 +81,8 @@ macro_rules! config_group {
                         name: stringify!($field),
                         kind: <$kind as FieldKind>::TAG,
                         default: || <$kind as FieldKind>::render(&$default),
+                        file_text: <$kind as FieldKind>::file_text,
+                        canonical: |raw| <$kind as FieldKind>::parse(raw).map(|value| <$kind as FieldKind>::render(&value)),
                         description: concat!($($doc, "\n",)*),
                         validator: $validator,
                         applies: $applies,
@@ -148,7 +150,58 @@ macro_rules! settings {
                 groups
             }
         }
+
+        impl serde::Serialize for Settings {
+            /// Nested by group, every field as the file format writes it.
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serde::Serialize::serialize(&Value::Object(self.render()), serializer)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for Settings {
+            /// A whole config document, read as a file is — so an unknown
+            /// field or a bad value is refused by name — over the hardcoded
+            /// defaults.
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let value = <Value as serde::Deserialize>::deserialize(deserializer)?;
+                settings_from_document(&value).map_err(serde::de::Error::custom)
+            }
+        }
+
+        $(
+            impl serde::Serialize for $Group {
+                /// Every field as the file format writes it.
+                fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                    serde::Serialize::serialize(&Value::Object(self.render()), serializer)
+                }
+            }
+
+            impl<'de> serde::Deserialize<'de> for $Group {
+                /// The group's own section of a config document, read as
+                /// [`Settings`] reads a whole one.
+                fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                    let value = <Value as serde::Deserialize>::deserialize(deserializer)?;
+                    let mut document = Map::new();
+                    document.insert($Group::NAME.to_owned(), value);
+                    settings_from_document(&Value::Object(document))
+                        .map(|settings| settings.$group)
+                        .map_err(serde::de::Error::custom)
+                }
+            }
+        )*
     };
+}
+
+/// A config document read on its own over the hardcoded defaults: through
+/// the file reader and the resolver, the one path every value takes, so a
+/// group's `Deserialize` cannot read a field differently from a start. The
+/// general values only — a family section waits for a family.
+fn settings_from_document(value: &Value) -> Result<Settings, String> {
+    let document = super::file::read_document(value, "the document").map_err(|e| e.0)?;
+    let sources = super::source::Sources { file: document.values, ..Default::default() };
+    super::source::resolve_settings(&sources, None, super::source::Fit::Start)
+        .map(|resolution| resolution.settings)
+        .map_err(|e| e.0)
 }
 
 /// Every field of every group, in declaration order.

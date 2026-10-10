@@ -259,7 +259,7 @@ async fn main() {
     };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let config = match config::resolve(&args, |name| std::env::var(name).ok()) {
+    let config = match config::resolve_with(&args, |name| std::env::var(name).ok(), &config::file::RealFiles) {
         Ok(ConfigOutcome::Config(config)) => config,
         Ok(ConfigOutcome::Help(text)) => {
             println!("{text}");
