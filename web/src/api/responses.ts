@@ -32,7 +32,6 @@ export type ResponseTool = { type: "function"; name: string; description: string
 export type ResponseCreate = {
   type: "response.create";
   stream_id: string;
-  model: string;
   instructions?: string;
   input: InputItem[];
   previous_response_id?: string;
@@ -105,7 +104,6 @@ export function buildResponseCreate(
   return {
     type: "response.create",
     stream_id: streamId,
-    model: settings.model,
     ...(instructions ? { instructions } : {}),
     input,
     ...(previousResponseId !== undefined ? { previous_response_id: previousResponseId } : {}),

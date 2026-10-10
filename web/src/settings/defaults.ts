@@ -1,7 +1,7 @@
 import type { ReasoningEffort, Settings } from "../api/request.ts";
 
-/** What the Settings panel sets: a request's settings, less the model ignis names. */
-export type PlaygroundSettings = Omit<Settings, "model">;
+/** What the Settings panel sets: a request's settings. */
+export type PlaygroundSettings = Settings;
 
 export const DEFAULT_SETTINGS: PlaygroundSettings = {
   systemPrompt: "",

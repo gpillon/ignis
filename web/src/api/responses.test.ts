@@ -4,7 +4,6 @@ import { buildResponseCreate, outputItems, parseResponseEvent, responseItems, ty
 import { createSseParser, parseChunk } from "./sse.ts";
 
 const settings: Settings = {
-  model: "qwen3.8-27b",
   systemPrompt: "Be terse.",
   temperature: 0.7,
   topP: 0.9,
@@ -15,6 +14,11 @@ const settings: Settings = {
 };
 
 describe("buildResponseCreate", () => {
+  it("names no model, so the server serves the one loaded and a request never switches it", () => {
+    const body = buildResponseCreate({ settings, turns: [] }, "s", []);
+    expect("model" in body).toBe(false);
+  });
+
   it("carries the system prompt as instructions and the settings under the chat request's names", () => {
     const tool = { type: "function" as const, function: { name: "agent", description: "Run a sub-task.", parameters: { type: "object" } } };
     const body = buildResponseCreate(
@@ -25,7 +29,6 @@ describe("buildResponseCreate", () => {
     expect(body).toEqual({
       type: "response.create",
       stream_id: "session-1",
-      model: "qwen3.8-27b",
       instructions: "# Tools\n\nBe terse.",
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
       tools: [{ type: "function", name: "agent", description: "Run a sub-task.", parameters: { type: "object" } }],
@@ -48,7 +51,6 @@ describe("buildResponseCreate", () => {
     expect(body).toEqual({
       type: "response.create",
       stream_id: "s",
-      model: "qwen3.8-27b",
       input: [],
       previous_response_id: "resp_7",
       temperature: 0.7,

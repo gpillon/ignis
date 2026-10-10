@@ -71,7 +71,6 @@ describe("conversationTurns", () => {
 });
 
 const settings: Settings = {
-  model: "qwen3.8-27b",
   systemPrompt: "Be terse.",
   temperature: 0.7,
   topP: 0.9,
@@ -82,10 +81,14 @@ const settings: Settings = {
 };
 
 describe("buildChatRequest", () => {
+  it("names no model, so the server serves the one loaded and a request never switches it", () => {
+    const body = buildChatRequest(settings, [{ role: "user", content: "hi" }]);
+    expect("model" in body).toBe(false);
+  });
+
   it("streams with usage and carries the sampling, reasoning effort and lane tag fields", () => {
     const body = buildChatRequest(settings, [{ role: "user", content: "hi" }]);
     expect(body).toEqual({
-      model: "qwen3.8-27b",
       messages: [
         { role: "system", content: "Be terse." },
         { role: "user", content: "hi" },

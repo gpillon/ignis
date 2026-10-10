@@ -20,7 +20,6 @@ import {
 const chatBody = ({ settings, turns, extras }: ConversationRequest) => buildChatRequest(settings, turns, extras);
 
 const settings: Settings = {
-  model: "m",
   systemPrompt: "the owner's prompt",
   temperature: 1,
   topP: 0.95,
