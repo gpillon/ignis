@@ -69,7 +69,7 @@ fn with_files(flags: &[&str], env: impl Fn(&str) -> Option<String>, files: &MemF
 #[test]
 fn a_file_of_every_default_reads_back_to_the_defaults_in_both_formats() {
     let defaults = config(&[]);
-    let document = file::settings_document(defaults.settings());
+    let document = serde_json::Value::Object(defaults.settings().render());
     for (name, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
         let files = MemFiles::with(&[(name, &format.write(&document))]);
         let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -174,7 +174,7 @@ fn discovery_finds_the_working_directory_first_then_the_user_directory() {
     let user = PathBuf::from("U").join("ignis").join("config.yaml");
     assert_eq!(user, PathBuf::from(user_path).components().collect::<PathBuf>());
     let both = MemFiles::with(&[("ignis.config.yaml", "server:\n  request_timeout: 11\n")]);
-    both.files.borrow_mut().insert(user.clone(), "server:\n  request_timeout: 22\n".to_owned());
+    both.files.lock().unwrap().insert(user.clone(), "server:\n  request_timeout: 22\n".to_owned());
     let found = with_files(&[], env_map(env), &both).unwrap();
     assert_eq!(found.request_timeout_secs, 11);
     assert_eq!(found.basis.sources().file_source, source::FileSource::Discovered(PathBuf::from("ignis.config.yaml")));
@@ -183,7 +183,7 @@ fn discovery_finds_the_working_directory_first_then_the_user_directory() {
     assert_eq!(with_files(&[], env_map(env), &json_only).unwrap().request_timeout_secs, 33);
 
     let user_only = MemFiles::default();
-    user_only.files.borrow_mut().insert(user.clone(), "server:\n  request_timeout: 22\n".to_owned());
+    user_only.files.lock().unwrap().insert(user.clone(), "server:\n  request_timeout: 22\n".to_owned());
     let found = with_files(&[], env_map(env), &user_only).unwrap();
     assert_eq!((found.request_timeout_secs, found.basis.sources().file_source.kind()), (22, "discovered"));
 
@@ -200,10 +200,10 @@ fn a_named_file_short_circuits_discovery_without_looking() {
     let named = with_files(&["--config", "named.yaml"], env_map(env), &files).unwrap();
     assert_eq!(named.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
     assert_eq!(named.basis.sources().file_source.kind(), "explicit");
-    assert!(files.looked_at.borrow().is_empty(), "{:?}", files.looked_at.borrow());
+    assert!(files.looked_at.lock().unwrap().is_empty(), "{:?}", files.looked_at.lock().unwrap());
     let from_env = with_files(&[], env_map(&[("IGNIS_CONFIG", "named.yaml")]), &files).unwrap();
     assert_eq!(from_env.basis.sources().file_source, source::FileSource::Explicit(PathBuf::from("named.yaml")));
-    assert!(files.looked_at.borrow().is_empty());
+    assert!(files.looked_at.lock().unwrap().is_empty());
 }
 
 /// Spec config-v2/02, Testing: the startup line, for all three sources.

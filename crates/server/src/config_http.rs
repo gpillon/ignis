@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
@@ -32,8 +32,9 @@ use utoipa::ToSchema;
 use crate::api::{error_response, ApiError};
 use crate::config::field::{scope, FieldMeta, FAMILIES};
 use crate::config::file::{self, Files};
-use crate::config::schema::all_fields;
-use crate::config::source::Layer;
+use crate::config::kind::{FieldKind, KnownModels};
+use crate::config::schema::{self, all_fields};
+use crate::config::source::{Candidate, Layer};
 use crate::config::{Config, ConfigError};
 use crate::Server;
 
@@ -78,7 +79,7 @@ impl ConfigState {
     /// `config patch` writes with.
     pub fn persist(&self, patch: &Layer) -> Persisted {
         let current = self.current();
-        let Some(path) = current.basis.sources().file_source.path() else {
+        let Some(path) = current.file_path() else {
             return Persisted::No(NO_FILE.to_owned());
         };
         let written = file::changes_of(patch)
@@ -118,7 +119,7 @@ pub enum Persisted {
 /// values — every family section where a family's value differs — with every
 /// field not marked `visible` removed, its key and all.
 pub fn visible_document(config: &Config) -> Value {
-    let mut document = crate::config::cli::effective_document(config);
+    let mut document = file::effective_document(config);
     remove_invisible(&mut document, all_fields());
     document
 }
@@ -156,6 +157,12 @@ fn no_config() -> Response {
     )
 }
 
+/// The header `GET /v1/config` says the model's state in (`serving`,
+/// `switching` or `failed`, as `GET /v1/models` reports it): during a
+/// reload the body is still the configuration running, and this says a
+/// change is under way.
+pub const STATUS_HEADER: &str = "ignis-model-status";
+
 /// `GET /v1/config` — the running configuration.
 #[utoipa::path(
     get,
@@ -163,18 +170,21 @@ fn no_config() -> Response {
     tag = "config",
     operation_id = "get_config",
     summary = "The running configuration",
-    description = "The configuration in force, in the config file's own shape: `<group>: { <field>: value }`, with a `qwen38` / `qwen38flashnext` section beside a group's fields wherever a model family's value differs. The values are the ones the loaded model runs with — its family's own where one is set — with every live change on top.\n\nOnly fields declared visible appear: a hidden field (the API key) is absent, not masked. `ignis-server help --fields` lists every field and whether it is shown.\n\nAnswers during a model switch too: until the switch lands it shows the config still running.",
+    description = "The configuration in force, in the config file's own shape: `<group>: { <field>: value }`, with a `qwen38` / `qwen38flashnext` section beside a group's fields wherever a model family's value differs. The values are the ones the loaded model runs with — its family's own where one is set — with every live change on top.\n\nOnly fields declared visible appear: a hidden field (the API key) is absent, not masked. `ignis-server help --fields` lists every field and whether it is shown.\n\nAnswers during a model switch too: until the switch lands it shows the configuration still running, and the `ignis-model-status` header says `switching` (as `GET /v1/models` reports it).",
     responses(
-        (status = 200, description = "The running configuration.", body = ConfigDocument),
+        (status = 200, description = "The running configuration.", body = ConfigDocument,
+            headers(("ignis-model-status" = String, description = "`serving`, `switching` or `failed`."))),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
         (status = 501, description = "This server was built without a running configuration (`config_unavailable`).", body = ApiError),
     ),
 )]
 pub(crate) async fn get_config(State(server): State<Arc<Server>>) -> Response {
-    match &server.config {
-        Some(state) => Json(visible_document(&state.current())).into_response(),
-        None => no_config(),
-    }
+    let Some(state) = &server.config else {
+        return no_config();
+    };
+    let mut response = Json(visible_document(&state.current())).into_response();
+    response.headers_mut().insert(STATUS_HEADER, HeaderValue::from_static(server.status().as_str()));
+    response
 }
 
 /// How a patch was applied.
@@ -183,15 +193,21 @@ pub(crate) struct PatchApplied {
     /// `live` (applied at once, no model touched) or `reload` (the whole
     /// patch goes through a model reload, under way).
     applied: &'static str,
-    /// `yes` (written to `path`), `no` (not written, `reason` says why), or
-    /// `after_reload` (written once the reloaded model serves).
-    persisted: &'static str,
+    /// Whether the change is written to the config file (spec config-v2/02
+    /// §`PATCH` step 6). A reload's change is written once the reloaded model
+    /// serves, so its answer is `false` with that reason.
+    persisted: bool,
     /// The config file the change was, or will be, written to.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    /// Why the change was not written down.
+    /// Why the change is not (yet) written down.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// The fields of the patch a flag or an env var also sets: those outrank
+    /// the config file at the next start, so the written value applies only
+    /// until then — each named with the spelling that sets it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shadowed_at_restart: Vec<String>,
     /// The reload under way: the id served when it began, and the id it
     /// loads (the same model, reloaded with the patched config).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,6 +259,39 @@ pub fn read_patch(body: &Value) -> Result<Layer, (&'static str, String)> {
     Ok(document.values)
 }
 
+/// A patch naming `switch.known_models` adds to the models already known
+/// (spec config-v2/02 AC 4: "`known-model` additions") rather than
+/// replacing them: the entries `running` lists are kept, the patch's added,
+/// an id both name taking the patch's path. Done before the patch is
+/// applied, so the merged list is what applies and what is written down.
+pub fn add_known_models(patch: &mut Layer, running: &Config) -> Result<(), ConfigError> {
+    let meta = schema::field("switch", "known_models").expect("a declared field");
+    let Some(candidate) = patch.get(meta, None).cloned() else {
+        return Ok(());
+    };
+    let added = KnownModels::parse(candidate.raw.trim()).map_err(|reason| ConfigError(format!("`{}` {reason}", candidate.spelling)))?;
+    let mut known = running.known_models.clone();
+    known.extend(added);
+    let raw = known.iter().map(|(id, path)| format!("{id}={}", path.display())).collect::<Vec<_>>().join(";");
+    patch.set(meta, None, Candidate { raw, spelling: candidate.spelling })
+}
+
+/// The fields of `patch` that a flag or an env var of `running`'s start also
+/// sets, each with the spelling that sets it: written to the file, they are
+/// outranked again at the next start (spec config-v2/01 AC 6), so the
+/// answer says so rather than promise a change that will not survive it.
+pub fn shadowed_at_restart(patch: &Layer, running: &Config) -> Vec<String> {
+    let sources = running.basis.sources();
+    patch
+        .entries()
+        .filter_map(|(meta, family, _)| {
+            let key = family.map_or_else(|| meta.file_key(), |family| meta.scoped_file_key(family));
+            let by = sources.flags.get(meta, family).or_else(|| sources.env.get(meta, family))?;
+            Some(format!("{key} (set by {})", by.spelling))
+        })
+        .collect()
+}
+
 /// Whether applying `patch` needs a model reload: any field in it does.
 pub fn needs_reload(patch: &Layer) -> bool {
     patch.entries().any(|(meta, _, _)| meta.reload_required)
@@ -281,7 +330,7 @@ fn check_thinking(server: &Server, next: &Config, patch: &Layer) -> Result<(), S
     tag = "config",
     operation_id = "patch_config",
     summary = "Change the running configuration",
-    description = "The body is a partial config document in the config file's own shape — only the fields being changed, a `qwen38` / `qwen38flashnext` section for a family's own value. Each value is checked as the config file's would be; a field the loaded model's family cannot take, or one not patchable (the API key, the bind addresses, the Playground), refuses the **whole** patch, nothing in it applied.\n\nApplied one way, never two. When no field in the patch needs a model reload (the request timeout, the message policies, the thinking defaults, the model switch's own knobs) it takes effect at once, no model touched: `200`, with the configuration now running. When even one field does, the whole patch — its other fields included — goes through a reload of the loaded model with the patched configuration: the same switch `POST /v1/models/switch` runs, `202` at once, every other `/v1` route answering `503 model_switching` until it lands, and `GET /v1/models` reporting it. A reload that fails leaves the previous model serving with the previous configuration.\n\nA change is written to the config file in use once it has taken — at once, or when the reloaded model serves — keeping every other key in the file. With no config file in use it still applies, and `persisted: no` says why it was not written down.",
+    description = "The body is a partial config document in the config file's own shape — only the fields being changed, a `qwen38` / `qwen38flashnext` section for a family's own value. Each value is checked as the config file's would be; a field the loaded model's family cannot take, or one not patchable (the API key, the bind addresses, the Playground), refuses the **whole** patch, nothing in it applied. `switch.known_models` adds to the models already known.\n\nApplied one way, never two. When no field in the patch needs a model reload (the request timeout, the message policies, the thinking defaults, the model switch's own knobs) it takes effect at once, no model touched: `200`, with the configuration now running. When even one field does, the whole patch — its other fields included — goes through a reload of the loaded model with the patched configuration: the same switch `POST /v1/models/switch` runs, `202` at once, every other `/v1` route answering `503 model_switching` until it lands, and `GET /v1/models` reporting it. A reload that fails leaves the previous model serving with the previous configuration.\n\nA change is written to the config file in use once it has taken — at once, or when the reloaded model serves — keeping every other key in the file. With no config file in use it still applies, and `persisted: false` says why. `shadowed_at_restart` names the fields a flag or an env var also sets: they outrank the file at the next start.",
     request_body(content = ConfigDocument, description = "The fields to change, nested as the config file nests them."),
     responses(
         (status = 200, description = "Applied live.", body = PatchApplied),
@@ -297,15 +346,20 @@ pub(crate) async fn patch_config(State(server): State<Arc<Server>>, Json(body): 
     let Some(state) = server.config.clone() else {
         return no_config();
     };
-    let patch = match read_patch(&body) {
+    let mut patch = match read_patch(&body) {
         Ok(patch) => patch,
         Err((code, message)) => return refused(code, message),
     };
     let guard = state.changing();
-    let next = match state.current().with_patch(&patch) {
+    let running = state.current();
+    if let Err(error) = add_known_models(&mut patch, &running) {
+        return refused("config_invalid", error.0);
+    }
+    let next = match running.with_patch(&patch) {
         Ok(next) => next,
         Err(error) => return refused("config_invalid", error.0),
     };
+    let shadowed = shadowed_at_restart(&patch, &running);
     if !needs_reload(&patch) {
         if let Err(error) = check_thinking(&server, &next, &patch) {
             return refused("config_invalid", error);
@@ -314,16 +368,17 @@ pub(crate) async fn patch_config(State(server): State<Arc<Server>>, Json(body): 
         state.publish(next);
         let persisted = state.persist(&patch);
         drop(guard);
-        let config = Some(visible_document(&state.current()));
         let (persisted, path, reason) = match persisted {
-            Persisted::Yes(path) => ("yes", Some(path), None),
-            Persisted::No(reason) => ("no", None, Some(reason)),
+            Persisted::Yes(path) => (true, Some(path), None),
+            Persisted::No(reason) => (false, None, Some(reason)),
         };
         tracing::info!(name: "ignis.config.patched", applied = "live", persisted, "the running configuration changed");
-        let applied = PatchApplied { applied: "live", persisted, path, reason, switching: None, config };
+        let config = Some(visible_document(&state.current()));
+        let applied =
+            PatchApplied { applied: "live", persisted, path, reason, shadowed_at_restart: shadowed, switching: None, config };
         return (StatusCode::OK, Json(applied)).into_response();
     }
-    let path = state.current().basis.sources().file_source.path().map(|path| path.display().to_string());
+    let path = running.file_path().map(|path| path.display().to_string());
     match crate::model_switch::reconfigure(&server, next, patch) {
         Ok(started) => {
             drop(guard);
@@ -333,15 +388,16 @@ pub(crate) async fn patch_config(State(server): State<Arc<Server>>, Json(body): 
                 model = %started.to,
                 "the running configuration changes with a reload of the loaded model"
             );
-            let (persisted, reason) = match &path {
-                Some(_) => ("after_reload", None),
-                None => ("no", Some(NO_FILE.to_owned())),
+            let reason = match &path {
+                Some(_) => "written once the reloaded model serves; not if the reload fails".to_owned(),
+                None => NO_FILE.to_owned(),
             };
             let applied = PatchApplied {
                 applied: "reload",
-                persisted,
+                persisted: false,
                 path,
-                reason,
+                reason: Some(reason),
+                shadowed_at_restart: shadowed,
                 switching: Some(SwitchingIds { from: started.from, to: started.to }),
                 config: None,
             };
@@ -355,6 +411,7 @@ pub(crate) async fn patch_config(State(server): State<Arc<Server>>, Json(body): 
 mod tests {
     use super::*;
     use crate::config::field::{Applicability, Attr, Validator};
+    use crate::config::file::testing::MemFiles;
     use crate::config::kind::*;
     use crate::config::source::Resolver;
     use serde_json::{json, Map};
@@ -362,6 +419,15 @@ mod tests {
     fn config(flags: &[&str]) -> Config {
         let args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
         match crate::config::resolve(&args, |_| None).unwrap() {
+            crate::config::ConfigOutcome::Config(config) => config,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn on_file(files: &MemFiles, flags: &[&str], env: &'static [(&'static str, &'static str)]) -> Config {
+        let args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+        let env = move |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string());
+        match crate::config::resolve_with(&args, env, files).unwrap() {
             crate::config::ConfigOutcome::Config(config) => config,
             other => panic!("{other:?}"),
         }
@@ -417,51 +483,46 @@ mod tests {
     }
 
     #[test]
-    fn a_change_is_written_into_the_file_in_use_and_not_without_one() {
-        let files = Arc::new(MemFilesSync::with("c.yaml", "server:\n  request_timeout: 30\nprofiles:\n  p:\n    vram:\n      headroom_bytes: 2G\n"));
-        let config = match crate::config::resolve_with(&["--config".into(), "c.yaml".into()], |_| None, &*files).unwrap() {
-            crate::config::ConfigOutcome::Config(config) => config,
-            other => panic!("{other:?}"),
-        };
-        let state = ConfigState::new(config, files.clone());
+    fn a_change_is_written_into_the_file_in_use_and_not_without_one_or_on_a_read_only_volume() {
+        let files = Arc::new(MemFiles::with(&[("c.yaml", "server:\n  request_timeout: 30\nprofiles:\n  p:\n    vram:\n      headroom_bytes: 2G\n")]));
+        let state = ConfigState::new(on_file(&files, &["--config", "c.yaml"], &[]), files.clone());
         let patch = read_patch(&json!({ "server": { "request_timeout": 90 } })).unwrap();
         assert_eq!(state.persist(&patch), Persisted::Yes("c.yaml".into()));
-        let written = file::Format::Yaml.read(&files.text("c.yaml")).unwrap();
+        let written = file::Format::Yaml.read(&files.files.lock().unwrap()[std::path::Path::new("c.yaml")]).unwrap();
         assert_eq!(written["server"]["request_timeout"], 90);
         assert_eq!(written["profiles"]["p"]["vram"]["headroom_bytes"], "2G", "the rest of the file is kept");
 
-        let state = ConfigState::new(self::config(&[]), files);
+        let state = ConfigState::new(self::config(&[]), files.clone());
         let Persisted::No(reason) = state.persist(&patch) else { panic!("no file, nothing written") };
         assert!(reason.contains("no config file"), "{reason}");
+
+        let read_only = Arc::new(MemFiles { read_only: true, ..MemFiles::with(&[("c.yaml", "server: {}\n")]) });
+        let state = ConfigState::new(on_file(&read_only, &["--config", "c.yaml"], &[]), read_only.clone());
+        let Persisted::No(reason) = state.persist(&patch) else { panic!("a write that fails is not written") };
+        assert!(reason.contains("c.yaml") && reason.contains("cannot be written"), "{reason}");
     }
 
-    /// A thread-safe in-memory file for the state, which a server shares.
-    struct MemFilesSync {
-        files: Mutex<std::collections::BTreeMap<std::path::PathBuf, String>>,
+    /// Spec config-v2/02 AC 4: a patch of the known models adds to them.
+    #[test]
+    fn a_known_models_patch_adds_to_the_list_and_takes_the_patchs_path_for_a_shared_id() {
+        let running = config(&["--switch-known-models", "a=F:/a.ninfer", "--switch-known-models", "b=F:/b.ninfer"]);
+        let mut patch = read_patch(&json!({ "switch": { "known_models": { "b": "F:/b2.ninfer", "c": "F:/c.ninfer" } } })).unwrap();
+        add_known_models(&mut patch, &running).unwrap();
+        let next = running.with_patch(&patch).unwrap();
+        let known: Vec<(&str, String)> = next.known_models.iter().map(|(id, path)| (id.as_str(), path.display().to_string())).collect();
+        assert_eq!(known, [("a", "F:/a.ninfer".to_owned()), ("b", "F:/b2.ninfer".to_owned()), ("c", "F:/c.ninfer".to_owned())]);
     }
 
-    impl MemFilesSync {
-        fn with(path: &str, text: &str) -> Self {
-            Self { files: Mutex::new([(path.into(), text.to_owned())].into_iter().collect()) }
-        }
-
-        fn text(&self, path: &str) -> String {
-            self.files.lock().unwrap()[std::path::Path::new(path)].clone()
-        }
-    }
-
-    impl Files for MemFilesSync {
-        fn read(&self, path: &std::path::Path) -> std::io::Result<String> {
-            self.files.lock().unwrap().get(path).cloned().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "absent"))
-        }
-
-        fn write(&self, path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-            self.files.lock().unwrap().insert(path.to_owned(), contents.to_owned());
-            Ok(())
-        }
-
-        fn exists(&self, path: &std::path::Path) -> bool {
-            self.files.lock().unwrap().contains_key(path)
-        }
+    /// A patched field a flag or an env var also sets is outranked again at
+    /// the next start: the answer names it, with the spelling that sets it.
+    #[test]
+    fn a_patched_field_a_flag_or_env_var_sets_is_named_as_shadowed() {
+        let files = MemFiles::with(&[("c.yaml", "server: {}\n")]);
+        let running = on_file(&files, &["--config", "c.yaml", "--server-request-timeout", "40"], &[("IGNIS_MODEL_THINKING_BUDGET", "off")]);
+        let patch = read_patch(&json!({ "server": { "request_timeout": 60, "system_message_policy": "strict" }, "model": { "thinking_budget": 1024 } })).unwrap();
+        assert_eq!(
+            shadowed_at_restart(&patch, &running),
+            ["model.thinking_budget (set by IGNIS_MODEL_THINKING_BUDGET)", "server.request_timeout (set by --server-request-timeout)"]
+        );
     }
 }

@@ -678,6 +678,12 @@ impl Config {
         self.basis.settings()
     }
 
+    /// The config file this configuration was read from — where a change to
+    /// it is written down (spec config-v2/02) — or `None` without one.
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        self.basis.sources().file_source.path()
+    }
+
     /// This config's sources resolved again for an artifact of `family`, at
     /// **start** (spec flash-next/04): the family-scoped values apply, and an
     /// explicit value for a field `family` cannot take is refused by name —
@@ -1205,11 +1211,7 @@ pub fn help_text() -> String {
     for (group, fields) in schema::GROUPS {
         text.push_str(&format!("\n{}:\n", group.to_ascii_uppercase()));
         for meta in *fields {
-            let default = match (meta.default)() {
-                serde_json::Value::Null => "unset".to_owned(),
-                serde_json::Value::String(s) => s,
-                other => other.to_string(),
-            };
+            let default = cli::default_text(meta);
             text.push_str(&format!(
                 "    {} <{}>  env: {}  (default: {default}{})\n        {}\n",
                 meta.flag(),

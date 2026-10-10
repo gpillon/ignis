@@ -21,10 +21,10 @@ use std::path::{Path, PathBuf};
 use ignis_core::compute::ModelFamily;
 use serde_json::{Map, Value};
 
-use super::field::{family_of_scope, scope, FieldMeta};
-use super::schema::{self, Settings};
-use super::source::{Candidate, Layer};
-use super::ConfigError;
+use super::field::{family_of_scope, scope, FieldMeta, FAMILIES};
+use super::schema::{self, all_fields};
+use super::source::{resolve_settings, Candidate, Fit, Layer};
+use super::{Config, ConfigError};
 
 /// A config file's format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,10 +291,30 @@ fn set(layer: &mut Layer, meta: &'static FieldMeta, family: Option<ModelFamily>,
     layer.set(meta, family, Candidate { raw, spelling })
 }
 
-/// Every field of `settings` as a document, nested by group — what `config
-/// generate` writes.
-pub fn settings_document(settings: &Settings) -> Value {
-    Value::Object(settings.render())
+/// `config`'s settings as a document: every field's value for no family in
+/// particular, and beside it, in each family's section, every scoped field
+/// whose value differs for that family — what the sources say, written so a
+/// start reading it back resolves the same values. What `config generate`
+/// and `config print` write and `GET /v1/config` shows.
+pub fn effective_document(config: &Config) -> Value {
+    let general = config.settings().render();
+    let mut changes = Vec::new();
+    for family in FAMILIES {
+        let Ok(resolution) = resolve_settings(config.basis.sources(), Some(family), Fit::Switch) else {
+            continue;
+        };
+        let scoped = resolution.settings.render();
+        for meta in all_fields().filter(|meta| meta.scoped) {
+            let at = |groups: &Map<String, Value>| groups.get(meta.group).and_then(|group| group.get(meta.name)).cloned();
+            let value = at(&scoped);
+            if value != at(&general) {
+                changes.push((meta, Some(family), value.unwrap_or(Value::Null)));
+            }
+        }
+    }
+    let mut document = Value::Object(general);
+    merge(&mut document, changes);
+    document
 }
 
 /// One field's change, as [`merge`] writes it: the field, its scope, and the
@@ -380,26 +400,29 @@ pub fn discovery_candidates(env: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf
 /// was written.
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
 
     use super::Files;
 
+    /// Thread-safe, so a server's shared config state can write through it.
     #[derive(Default)]
     pub struct MemFiles {
-        pub files: RefCell<BTreeMap<PathBuf, String>>,
+        pub files: Mutex<BTreeMap<PathBuf, String>>,
         /// Every path `exists` was asked about, in order.
-        pub looked_at: RefCell<Vec<PathBuf>>,
+        pub looked_at: Mutex<Vec<PathBuf>>,
         /// Every path written.
-        pub written: RefCell<Vec<PathBuf>>,
+        pub written: Mutex<Vec<PathBuf>>,
+        /// Refuse every write, as a read-only volume would.
+        pub read_only: bool,
     }
 
     impl MemFiles {
         pub fn with(files: &[(&str, &str)]) -> Self {
             let memory = Self::default();
             for (path, text) in files {
-                memory.files.borrow_mut().insert(PathBuf::from(path), text.to_string());
+                memory.files.lock().unwrap().insert(PathBuf::from(path), text.to_string());
             }
             memory
         }
@@ -408,21 +431,25 @@ pub(crate) mod testing {
     impl Files for MemFiles {
         fn read(&self, path: &Path) -> std::io::Result<String> {
             self.files
-                .borrow()
+                .lock()
+                .unwrap()
                 .get(path)
                 .cloned()
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "not in memory"))
         }
 
         fn write(&self, path: &Path, contents: &str) -> std::io::Result<()> {
-            self.written.borrow_mut().push(path.to_owned());
-            self.files.borrow_mut().insert(path.to_owned(), contents.to_owned());
+            if self.read_only {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only"));
+            }
+            self.written.lock().unwrap().push(path.to_owned());
+            self.files.lock().unwrap().insert(path.to_owned(), contents.to_owned());
             Ok(())
         }
 
         fn exists(&self, path: &Path) -> bool {
-            self.looked_at.borrow_mut().push(path.to_owned());
-            self.files.borrow().contains_key(path)
+            self.looked_at.lock().unwrap().push(path.to_owned());
+            self.files.lock().unwrap().contains_key(path)
         }
     }
 }

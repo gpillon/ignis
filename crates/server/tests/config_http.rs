@@ -18,6 +18,7 @@ use ignis_server::config::file::{Format, RealFiles};
 use ignis_server::config::{resolve_with, Config, ConfigOutcome};
 use ignis_server::config_http::ConfigState;
 use ignis_server::model_switch::Switcher;
+use ignis_server::template::{SimpleTemplateProvider, TemplateProvider};
 use ignis_server::Server;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -57,13 +58,24 @@ fn server_on(loader: &Arc<MockLoader>, config: Config) -> Server {
 }
 
 async fn send(app: &axum::Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let (status, _, body) = send_with_headers(app, method, uri, body).await;
+    (status, body)
+}
+
+async fn send_with_headers(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
     let request = Request::builder().method(method).uri(uri).header(header::CONTENT_TYPE, "application/json");
     let request = request.body(body.map_or_else(Body::empty, |body| Body::from(body.to_string()))).unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
-    (status, body)
+    (status, headers, body)
 }
 
 async fn until_serving(app: &axum::Router) {
@@ -120,7 +132,7 @@ async fn a_live_patch_applies_at_once_without_touching_the_model_and_is_written_
     let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
     assert_eq!(status, StatusCode::OK, "{applied}");
     assert_eq!(applied["applied"], "live");
-    assert_eq!(applied["persisted"], "yes", "{applied}");
+    assert_eq!(applied["persisted"], true, "{applied}");
     assert_eq!(applied["config"]["server"]["request_timeout"], 90);
     assert_eq!(server.live().request_timeout, Duration::from_secs(90));
     assert_eq!(server.live().instruction_policy.developer.as_str(), "reject");
@@ -147,21 +159,25 @@ async fn a_patch_with_one_reload_field_reloads_with_the_whole_patch() {
     let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{applied}");
     assert_eq!(applied["applied"], "reload");
-    assert_eq!(applied["persisted"], "after_reload");
+    assert_eq!(applied["persisted"], false);
+    assert!(applied["reason"].as_str().unwrap().contains("once the reloaded model serves"), "{applied}");
     assert_eq!(applied["switching"], json!({ "from": "mock-a", "to": "mock-a" }));
 
     // Mid-reload: nothing of the patch is in force, and the config route
     // still answers, showing what runs.
     assert_eq!(server.live().request_timeout, Duration::from_secs(30), "never mixed: the live field waits for the reload");
-    let (status, document) = send(&app, Method::GET, "/v1/config", None).await;
+    let (status, headers, document) = send_with_headers(&app, Method::GET, "/v1/config", None).await;
     assert_eq!(status, StatusCode::OK, "GET /v1/config stays open during a switch: {document}");
     assert_eq!(document["server"]["request_timeout"], 30);
+    assert_eq!(headers["ignis-model-status"], "switching", "the reload under way is said");
     let (status, _) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "server": { "request_timeout": 5 } }))).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "a second change waits for the reload");
     assert_eq!(read_yaml(&path)["server"]["request_timeout"], 30, "not written before the reload took");
 
     release.send(()).expect("the held load is waiting");
     until_serving(&app).await;
+    let (_, headers, _) = send_with_headers(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(headers["ignis-model-status"], "serving");
     let handed = loader.prepared_options();
     let options = handed.last().unwrap().as_ref().expect("the reload hands the patched config to the loader");
     assert_eq!((options.host_pool_bytes, options.request_timeout_secs), (3 << 30, 91));
@@ -235,13 +251,81 @@ async fn with_no_config_file_a_change_applies_and_says_it_was_not_written() {
     let app = server.app();
     let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "server": { "request_timeout": 94 } }))).await;
     assert_eq!(status, StatusCode::OK, "{applied}");
-    assert_eq!(applied["persisted"], "no");
+    assert_eq!(applied["persisted"], false);
     assert!(applied["reason"].as_str().unwrap().contains("no config file"), "{applied}");
     assert_eq!(server.live().request_timeout, Duration::from_secs(94));
     let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "reuse": { "prompt": false } }))).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{applied}");
-    assert_eq!(applied["persisted"], "no");
+    assert_eq!(applied["persisted"], false);
+    assert!(applied["reason"].as_str().unwrap().contains("no config file"), "{applied}");
     until_serving(&app).await;
+}
+
+/// Spec config-v2/02 AC 4: the known models a patch names are added to the
+/// switcher's, live, the models the operator listed kept.
+#[tokio::test]
+async fn a_known_models_patch_reaches_the_switcher_and_keeps_the_listed_ones() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, started(&["--switch-known-models", "mock-b=mock-b.ninfer"]));
+    let app = server.app();
+    let body = json!({ "switch": { "known_models": { "mock-c": "mock-c.ninfer" } } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    let known = server.switcher.as_ref().unwrap().known_models();
+    assert_eq!(known.keys().map(String::as_str).collect::<Vec<_>>(), ["mock-a", "mock-b", "mock-c"], "the start model, the listed one, the added one");
+    let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(document["switch"]["known_models"], json!({ "mock-b": "mock-b.ninfer", "mock-c": "mock-c.ninfer" }));
+}
+
+/// A live change to the thinking defaults is judged by the loaded template
+/// as a start's would be (spec server/08): a default it cannot honour, or a
+/// budget with no forced close, is refused and nothing applied.
+#[tokio::test]
+async fn a_thinking_default_the_template_cannot_honour_is_refused_live() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, started(&[]));
+    server.update_active(|model| model.template = Arc::new(NoThinkingControl));
+    let app = server.app();
+    for (body, says) in [
+        (json!({ "model": { "enable_thinking": false } }), "cannot disable thinking"),
+        (json!({ "model": { "reasoning_effort": "low" } }), "does not support"),
+        (json!({ "model": { "thinking_budget": 2048 } }), "no tokenizer"),
+    ] {
+        let (status, refused) = send(&app, Method::PATCH, "/v1/config", Some(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(refused["error"]["message"].as_str().unwrap().contains(says), "{body}: {refused}");
+    }
+    assert!(server.live().default_enable_thinking);
+    let (status, _) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "model": { "thinking_budget": "off" } }))).await;
+    assert_eq!(status, StatusCode::OK, "no budget needs no close");
+    assert_eq!(server.live().default_thinking_budget, None);
+}
+
+/// The placeholder's template, except that it can neither disable thinking
+/// nor take an effort: what a real template's capabilities can refuse.
+struct NoThinkingControl;
+
+impl TemplateProvider for NoThinkingControl {
+    fn apply_chat_template(
+        &self,
+        messages: &[ignis_server::template::ChatMessage],
+        options: &ignis_server::thinking::ThinkingOptions,
+        tools: &[Value],
+    ) -> Result<ignis_server::template::RenderedPrompt, ignis_server::template::TemplateRejection> {
+        SimpleTemplateProvider.apply_chat_template(messages, options, tools)
+    }
+
+    fn render_tokens(&self, tokens: &[ignis_core::TokenId]) -> String {
+        SimpleTemplateProvider.render_tokens(tokens)
+    }
+
+    fn thinking_capabilities(&self) -> ignis_server::thinking::ThinkingCapabilities {
+        ignis_server::thinking::ThinkingCapabilities { can_disable: false, supported_efforts: Default::default() }
+    }
+
+    fn token_decoder(&self) -> Box<dyn ignis_server::decoder::TokenDecoder> {
+        SimpleTemplateProvider.token_decoder()
+    }
 }
 
 /// A placeholder start has no artifact to load again: a reload is refused,

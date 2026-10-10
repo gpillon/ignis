@@ -58,17 +58,6 @@ impl Source {
     pub fn explicit(self) -> bool {
         matches!(self, Source::Patch | Source::Flag | Source::Env | Source::File)
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Source::Patch => "patch",
-            Source::Flag => "flag",
-            Source::Env => "env",
-            Source::File => "file",
-            Source::Profile => "profile",
-            Source::Default => "default",
-        }
-    }
 }
 
 /// Where a resolved value came from: the source, and the exact spelling the

@@ -16,7 +16,7 @@ use serde_json::Value;
 use super::field::{FieldMeta, FAMILIES};
 use super::file::{self, Files, Format};
 use super::schema::{all_fields, GROUPS};
-use super::source::{self, resolve_settings, Fit};
+use super::source;
 use super::{gather, Config, ConfigError, ConfigOutcome, FileChoice};
 
 /// `help` and `help --fields [--format text|json]`.
@@ -36,8 +36,8 @@ pub(super) fn help(args: &[String]) -> Result<ConfigOutcome, ConfigError> {
     }
 }
 
-/// One field's default as help prints it.
-fn default_text(meta: &FieldMeta) -> String {
+/// One field's default as help prints it: `unset` for none, a string bare.
+pub(crate) fn default_text(meta: &FieldMeta) -> String {
     match (meta.default)() {
         Value::Null => "unset".to_owned(),
         Value::String(s) => s,
@@ -152,7 +152,7 @@ fn generate(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files:
         })?,
         (None, None) => return Err(ConfigError("`config generate` to stdout needs `--format json|yaml`".to_owned())),
     };
-    let mut document = effective_document(&config);
+    let mut document = file::effective_document(&config);
     if let Some(name) = profile {
         document.as_object_mut().expect("a document is a map").insert("profile".to_owned(), Value::String(name));
     }
@@ -185,7 +185,7 @@ fn print(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &d
     }
     let (sources, _) = gather(parsed, env, files, FileChoice::IfPresent(path))?;
     let config = Config::from_sources(sources)?;
-    let mut document = effective_document(&config);
+    let mut document = file::effective_document(&config);
     hide_invisible(&mut document);
     Ok(ConfigOutcome::Print(format.write(&document)))
 }
@@ -224,31 +224,6 @@ fn patch(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &d
 /// place a start looks.
 fn default_path() -> PathBuf {
     file::discovery_candidates(&|_: &str| None).remove(0)
-}
-
-/// `config`'s settings as a document: every field's value for no family in
-/// particular, and beside it, in each family's section, every scoped field
-/// whose value differs for that family — what the sources say, written so a
-/// start reading it back resolves the same values.
-pub fn effective_document(config: &Config) -> Value {
-    let general = config.settings().render();
-    let mut changes = Vec::new();
-    for family in FAMILIES {
-        let Ok(resolution) = resolve_settings(config.basis.sources(), Some(family), Fit::Switch) else {
-            continue;
-        };
-        let scoped = resolution.settings.render();
-        for meta in all_fields().filter(|meta| meta.scoped) {
-            let at = |groups: &serde_json::Map<String, Value>| groups.get(meta.group).and_then(|group| group.get(meta.name)).cloned();
-            let value = at(&scoped);
-            if value != at(&general) {
-                changes.push((meta, Some(family), value.unwrap_or(Value::Null)));
-            }
-        }
-    }
-    let mut document = Value::Object(general);
-    file::merge(&mut document, changes);
-    document
 }
 
 /// Replace every set value of a field `GET /v1/config` hides with a marker.
@@ -417,7 +392,7 @@ mod tests {
         assert_eq!(path, PathBuf::from("c.yaml"));
         let dry = printed(run(&["config", "generate", "--out", "d.json", "--dry-run"], &[], &files).unwrap());
         assert!(serde_json::from_str::<Value>(&dry).is_ok(), "the format still comes from --out");
-        assert!(files.written.borrow().is_empty(), "resolution never writes; main does");
+        assert!(files.written.lock().unwrap().is_empty(), "resolution never writes; main does");
     }
 
     #[test]
@@ -455,7 +430,7 @@ mod tests {
         assert_eq!(document["model"]["max_context"], 1024);
         assert_eq!(document["reuse"]["prompt"], false);
         assert!(!text.contains("sk-secret") && text.contains("not shown"), "{text}");
-        assert!(files.written.borrow().is_empty());
+        assert!(files.written.lock().unwrap().is_empty());
         let none = printed(run(&["config", "print", "--file", "absent.yaml"], &[], &files).unwrap());
         assert_eq!(yaml(&none)["server"]["request_timeout"], 30, "no file is not an error");
     }

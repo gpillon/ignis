@@ -215,6 +215,11 @@ impl Switcher {
         *self.drain_timeout.lock().expect("drain timeout lock")
     }
 
+    /// Every model a request may switch to by naming it, with its artifact.
+    pub fn known_models(&self) -> BTreeMap<String, PathBuf> {
+        self.known.lock().expect("known models lock").clone()
+    }
+
     /// The artifact a request naming `model` would switch to, if it is known.
     fn known(&self, model: &str) -> Option<PathBuf> {
         self.known.lock().expect("known models lock").get(model).cloned()
