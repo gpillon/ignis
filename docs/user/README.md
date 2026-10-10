@@ -703,6 +703,15 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   `thinking_budget_forced_at` on the choice (on the finish chunk when
   streaming; top-level on `/v1/responses`): the reasoning tokens emitted when
   it began. The field is absent when the close was not forced.
+- **A turn that ends inside its reasoning answers.** With thinking on, an end
+  of turn the model draws while its reasoning block is still open becomes the
+  block's `</think>`, and the model goes on to answer — usually with the call
+  or the text it was writing in its reasoning, now on the content channel.
+  Such a turn used to come back as reasoning only, with no content and no
+  tool call. The same holds on `/v1/responses`. The request log's
+  `ignis.request.done` line marks it with `reasoning_redirected_at`, the
+  output index of that `</think>`. With thinking off, or `ignore_eos`, the
+  end of turn ends the turn as it always has.
 - Values outside the ranges above are rejected with
   `invalid_sampling_parameter`; they are never silently clamped.
 - **Absent sampling fields take the Qwen3.8 model card's values** for the

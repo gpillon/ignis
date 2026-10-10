@@ -65,6 +65,18 @@ When output names a domain concept, use the term as defined here.
   `0` lifts the default to the context. Reaching it ends the request with
   `finish_reason: "length"`. An explicit cap past the context is refused, never
   clamped (ADR 0045).
+- **Reasoning redirect** — an EOS a request draws while its reasoning block is
+  still open becomes the block's `</think>`, and the model goes on to answer
+  (ADR 0048, GitHub #315). The leaf decides it on the host, before the token is
+  fed, wherever it assigns a successor: the prefill's draw, a plain round, and
+  a verify round, which cuts its run before an accepted EOS. It applies to a
+  request that starts inside its reasoning (chat completions and
+  `/v1/responses` with thinking on) on a server with a thinking close, never
+  under `ignore_eos`, and it is **Ignis patched**: output differs
+  from the reference only on a turn that would have ended in its reasoning.
+  The request log's `reasoning_redirected_at` is that `</think>`'s output
+  index. It also closes the thinking budget's one-round hole, where the token
+  drawn freely before the forced close could be the EOS.
 - **KV reservation** — the KV pages the pool has given a request. Its *bound*
   is prompt plus **generation cap**, never past `--model-max-context`. A submission
   is checked against the bound, so a request alone always fits the pool.
