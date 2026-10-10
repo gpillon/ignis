@@ -1322,7 +1322,10 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
     // The teeth survive: a fan-out that merely finished issues *no* cancel
     // at all, which is exactly what deleting the `CancelOnDrop` from `ask`
     // produces. So: at least one, and every one of them a request this
-    // fan-out started.
+    // fan-out submitted. Submitted, not prefilled: a follower whose
+    // submission the engine took only after the client left is cancelled
+    // as it is admitted, before any prefill.
+    let submitted: std::collections::BTreeSet<u64> = (0..QUESTIONS as u64).collect();
     let cancelled = tokio::task::spawn_blocking(move || {
         let mut seen = std::collections::BTreeSet::new();
         // The first one is waited for; the rest are whatever already
@@ -1338,7 +1341,7 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
     .await
     .expect("the cancel collector ran");
     assert!(
-        !cancelled.is_empty() && cancelled.is_subset(&prefilled),
+        !cancelled.is_empty() && cancelled.is_subset(&submitted),
         "the handler's future dropping cancels the requests it left behind: \
          started {prefilled:?}, cancelled {cancelled:?}"
     );

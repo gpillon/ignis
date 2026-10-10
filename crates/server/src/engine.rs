@@ -349,9 +349,12 @@ impl Engine {
         if self.commands.send(Command::Submit { input, class, notes, reply }).is_err() {
             return Err(SubmitError::Full);
         }
+        let mut pending = Unread { engine: self, reply: reply_rx, read: false };
+        let result = (&mut pending.reply).await;
+        pending.read = true;
         // A dropped reply is a submit the thread never handled: it shut down
         // with the command still queued.
-        reply_rx.await.unwrap_or(Err(SubmitError::Full))
+        result.unwrap_or(Err(SubmitError::Full))
     }
 
     /// Whether the scheduler would refuse `input` for good — unknown model,
@@ -417,6 +420,30 @@ impl Engine {
     /// can call it when the client leaves mid-fan-out.
     pub fn end_fan_out(&self, owner: ignis_core::types::FanOutId) {
         let _ = self.commands.send(Command::EndFanOut { owner });
+    }
+}
+
+/// A submission's reply while its caller waits for it. A caller that is gone
+/// before reading it — a client that hung up, a queued socket response
+/// cancelled — has made no `CancelOnDrop` yet, since it makes one from the
+/// reply: so dropping this cancels what the engine admitted for it. The
+/// reply is closed first, so the model thread either answered before (the
+/// answer is read here) or cannot answer, and cancels the request itself.
+struct Unread<'a> {
+    engine: &'a Engine,
+    reply: oneshot::Receiver<Result<(RequestId, EventStream), SubmitError>>,
+    read: bool,
+}
+
+impl Drop for Unread<'_> {
+    fn drop(&mut self) {
+        if self.read {
+            return;
+        }
+        self.reply.close();
+        if let Ok(Ok((request, _))) = self.reply.try_recv() {
+            self.engine.cancel(request);
+        }
     }
 }
 
@@ -535,8 +562,16 @@ fn handle_command(
                 let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens, class, notes));
                 (id, stream)
             });
-            // A dropped receiver (the caller gave up) is not an error here.
-            let _ = reply.send(result);
+            // A caller gone before its answer ([`Unread`]) leaves nothing
+            // running: what was admitted for it is cancelled here, as its
+            // own drop would have.
+            if let Err(Ok((request, _))) = reply.send(result) {
+                if scheduler.cancel(request) {
+                    streams.remove(&request);
+                    let _ = facts.send(TelemetryFact::Cancelled(request));
+                    return true;
+                }
+            }
         }
         Command::Refusal { input, reply } => {
             let _ = reply.send(scheduler.refusal(&input));
@@ -1399,6 +1434,113 @@ mod tests {
         gate.wait_entered();
         gate.release();
         second_try.await.expect("the submit task must not panic").expect("B is admitted once freed moved");
+    }
+
+    /// A submission whose caller is gone before it reads the reply leaves no
+    /// request running — a client that hangs up mid-fan-out (spec decide/04),
+    /// or a queued socket response cancelled as it is admitted. Either the
+    /// engine admits it after the caller left, and the reply has nowhere to
+    /// go; or the reply came back and was never read. No `CancelOnDrop`
+    /// exists yet in either case: the caller only makes one from the reply.
+    #[tokio::test]
+    async fn a_submission_whose_caller_is_gone_leaves_no_request_running() {
+        let (gated, gate) = GatedCompute::new(Arc::new(MockCompute::new()));
+        // Room for three requests that run until cancelled.
+        let inner = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                max_in_flight: 3,
+                max_sequence_tokens: 2 << 20,
+                kv_capacity_pages: (2 << 20) / 16 * 3,
+                ..SchedulerConfig::default()
+            },
+            gated.clone() as Arc<dyn Compute>,
+        );
+        let (admitted_tx, admitted) = std_mpsc::channel();
+        let (cancelled_tx, cancelled) = std_mpsc::channel();
+        let engine = Engine::new(Box::new(Recording { inner, admitted: admitted_tx, cancelled: cancelled_tx }));
+        let long = || input("test-model", vec![1, 2, 3], Some(2_000_000));
+        let (a, mut rx_a) = engine.submit(long(), RequestClass::Interactive).await.expect("submit A");
+        // A decoding: every step from here on calls `decode_step`.
+        loop {
+            if let SchedEvent::Token { .. } = rx_a.recv().await.expect("a long request is running") {
+                break;
+            }
+        }
+
+        // Hold a step, and send B's and C's submissions behind it: each
+        // future polled once, its command queued, its reply not yet there.
+        gated.arm();
+        gate.wait_entered();
+        let mut b = Box::pin(engine.submit(long(), RequestClass::Interactive));
+        let mut c = Box::pin(engine.submit(long(), RequestClass::Interactive));
+        std::future::poll_fn(|cx| {
+            assert!(b.as_mut().poll(cx).is_pending() && c.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // B's caller leaves before the engine answers it.
+        drop(b);
+        gate.release();
+        // C's reply comes back — a later command's answer comes after it —
+        // and C's caller leaves without reading it.
+        assert!(engine.refusal(input("test-model", vec![9], Some(1))).await.is_none());
+        drop(c);
+
+        // The engine admitted both, and both are cancelled; A, whose caller
+        // is still here, is not.
+        let within = Duration::from_secs(10);
+        let left: std::collections::BTreeSet<RequestId> =
+            (0..3).map(|_| admitted.recv_timeout(within).expect("A, B and C were admitted")).filter(|&id| id != a).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        while seen != left {
+            let id = cancelled
+                .recv_timeout(within)
+                .unwrap_or_else(|_| panic!("a request whose caller left is still running: cancelled {seen:?} of {left:?}"));
+            assert_ne!(id, a, "A's caller is still here");
+            seen.insert(id);
+        }
+    }
+
+    /// The concrete scheduler, reporting every request it admits and every
+    /// cancel it is asked for.
+    struct Recording {
+        inner: ConcreteScheduler,
+        admitted: std_mpsc::Sender<RequestId>,
+        cancelled: std_mpsc::Sender<RequestId>,
+    }
+
+    impl Scheduler for Recording {
+        fn submit(&mut self, input: RequestInput, class: RequestClass) -> Result<RequestId, SubmitError> {
+            let id = self.inner.submit(input, class)?;
+            let _ = self.admitted.send(id);
+            Ok(id)
+        }
+        fn refusal(&self, input: &RequestInput) -> Option<SubmitError> {
+            self.inner.refusal(input)
+        }
+        fn cancel(&mut self, request: RequestId) -> bool {
+            let _ = self.cancelled.send(request);
+            self.inner.cancel(request)
+        }
+        fn advance(&mut self) -> Vec<SchedEvent> {
+            self.inner.advance()
+        }
+        fn is_idle(&self) -> bool {
+            self.inner.is_idle()
+        }
+        fn model_id(&self) -> &str {
+            Scheduler::model_id(&self.inner)
+        }
+        fn max_sequence_tokens(&self) -> u32 {
+            Scheduler::max_sequence_tokens(&self.inner)
+        }
+        fn mode(&self) -> EngineMode {
+            Scheduler::mode(&self.inner)
+        }
+        fn occupancy(&self) -> ignis_core::Occupancy {
+            Scheduler::occupancy(&self.inner)
+        }
     }
 
     /// A fact as the model thread sent it, in comparable form.
