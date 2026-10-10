@@ -129,6 +129,15 @@ case "$disk" in *"budget=4G"*"dir=D:/kv/ignis-kv-disk/"*) ;; *) fail "KV-DISK: $
 disk="$(make config CUDA=1 2>/dev/null | sed -n 's/^KV-DISK (CUDA=1) //p')"
 case "$disk" in off*) ;; *) fail "27B KV-DISK is not off by default: $disk" ;; esac
 
+# The abliterated variant is served under its own catalog id (ADR 0047, spec
+# model-download/02 AC 15), still from its artifact path; the default 27B
+# names no id (the server's default), and a MODEL id still wins.
+out="$(flags UNCENSORED=1)"
+has "UNCENSORED=1" "$out" "--model-id qwen3.8-27b-abliterated"
+has "UNCENSORED=1" "$out" "--model-artifact ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer"
+lacks "27B default" "$(flags)" "--model-id"
+has "UNCENSORED=1 MODEL=mine" "$(flags UNCENSORED=1 MODEL=mine)" "--model-id mine"
+
 if [ "$failed" -ne 0 ]; then
     printf 'flags-selftest: %d failure(s)\n' "$failed" >&2
     exit 1

@@ -78,9 +78,10 @@ endif
 # The .ninfer container (used with CUDA=1 only). See README "Models".
 # UNCENSORED=1 takes the huihui-abliterated twin of the default image from the
 # same directory instead: the same container with the 70 matrices the
-# abliteration changed re-encoded, and no refusals. The server never fetches
-# it; docs/user "The uncensored variant" says where it lives. A named ARTIFACT
-# wins over both.
+# abliteration changed re-encoded, and no refusals. It is served as
+# qwen3.8-27b-abliterated (the Makefile's SERVED_MODEL), its id in the built-in
+# catalog: `ignis-server model download qwen3.8-27b-abliterated` fetches it. A
+# named ARTIFACT wins over both.
 UNCENSORED ?=
 ifeq ($(UNCENSORED),1)
   ARTIFACT ?= ./models/qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer

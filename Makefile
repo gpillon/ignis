@@ -80,8 +80,6 @@ SERVER_STAMP := $(BIN_DIR)/ignis-server.backend
 BUILT_BACKEND = $(strip $(if $(wildcard $(SERVER_STAMP)),$(file < $(SERVER_STAMP))))
 
 SERVER_URL := http://$(BIND)
-# Where the UNCENSORED=1 image is published (fetched by hand, never by the server).
-UNCENSORED_REPO := gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer
 # The server's own default when METRICS_BIND is empty (DEFAULT_METRICS_BIND).
 METRICS_URL := http://$(or $(METRICS_BIND),127.0.0.1:9464)
 # KV-disk as a start will get it (spec vram-budget/03): the budget the server
@@ -130,9 +128,11 @@ FN_DEFAULT_TOKENS = ($(FN_LANE_TOKENS)<524288?$(FN_LANE_TOKENS):524288)
 FN_FLOOR_TOKENS = ($(FN_CONTEXT_TOKENS)+64*($(or $(RETAINED_HOST),8)+$(or $(RETAINED_DEVICE),0)))
 KV_POOL_PLAN = $(if $(KV_POOL_BYTES),$(if $(filter flash-next,$(MODEL_FAMILY)),offloaded,resident) $(KV_POOL_BYTES) (named$(COMMA) $$(sh mk/kv-pool-tokens.sh '$(KV_POOL_BYTES)' $(MODEL_FAMILY) $(or $(KV_FORMAT),hq-e8-2b)) tokens),$(if $(filter flash-next,$(MODEL_FAMILY)),offloaded $$(( $(FN_DEFAULT_TOKENS)>$(FN_FLOOR_TOKENS)?$(FN_DEFAULT_TOKENS):$(FN_FLOOR_TOKENS) )) tokens,resident (the rest of the VRAM budget)))
 SERVER_ENV = $(if $(LOG_LEVEL),IGNIS_LOG_LEVEL=$(LOG_LEVEL)) $(if $(LOG_FORMAT),IGNIS_LOG_FORMAT=$(LOG_FORMAT))
-# The served id: Flash-Next's own, none for the 27B (the server's default), or
-# the id MODEL names (mk/config.mk).
-SERVED_MODEL := $(if $(filter flash-next,$(MODEL_FAMILY)),qwen3.8-flash-next,$(filter-out 27b,$(MODEL)))
+# The served id: Flash-Next's own, the id MODEL names (mk/config.mk), the
+# abliterated variant's catalog id with UNCENSORED=1 (ADR 0047: one family, two
+# artifacts, told apart by the served id), or none for the 27B (the server's
+# default).
+SERVED_MODEL := $(if $(filter flash-next,$(MODEL_FAMILY)),qwen3.8-flash-next,$(or $(filter-out 27b,$(MODEL)),$(if $(filter 1,$(UNCENSORED)),qwen3.8-27b-abliterated)))
 SMOKE_MODEL := $(or $(SERVED_MODEL),qwen3.8-27b)
 # A generated key (API_KEY=auto) is unknown to make: pass the printed one.
 SMOKE_AUTH := $(if $(filter-out auto,$(API_KEY)),-H 'Authorization: Bearer $(API_KEY)')
@@ -198,7 +198,7 @@ config: ## Print the resolved knobs and paths
 	@echo "UI              $(UI)"
 	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(Prometheus: $(METRICS_URL)/metrics; Playground: /ui/metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(off))"
 	@echo "ARTIFACT        $(ARTIFACT)"
-	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image),off)"
+	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image, served as qwen3.8-27b-abliterated),off)"
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(KV_POOL_PLAN) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),$(if $(filter flash-next,$(MODEL_FAMILY)),off (SPEC=mtp turns the MTP head on),off))$(if $(SPEC),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD)))$(if $(DRAFT_ROWS), rows=$(DRAFT_ROWS)) rope=$(or $(ROPE_SCALING),none)"
 	@echo "PLAN            $(if $(filter flash-next,$(MODEL_FAMILY)),lanes=$(LANES) context/lane=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) prefill_chunk=$(or $(PREFILL_CHUNK),default) decode_share=$(if $(DECODE_SHARE),$(DECODE_SHARE)%,25% (default)) retained_host=$(or $(RETAINED_HOST),8 (Flash-Next default)) kv_ram_arena=$(or $(KV_HOST_POOL_BYTES),default) kv_pool=$(KV_POOL_PLAN) expert_cache_floor=$(if $(filter 1,$(ALLOW_EXPERT_CACHE_BELOW_FLOOR)),12G (below it allowed with a warning),12G (refused below)) ngram_hot=$(or $(NGRAM_HOT_BYTES),1G (default; auto = what the host plan leaves)),(Flash-Next only: the plan is the server's for the 27B))"
 	@echo "KV-DISK (CUDA=1) $(if $(filter 0,$(KV_DISK_BUDGET)),off$(if $(KV_DISK_BYTES),, (the 27B's default; KV_DISK_BYTES=4G turns it on)),budget=$(KV_DISK_BUDGET) (cut at start to the volume's free space less 10 GiB) dir=$(KV_DISK_LOCATION)/ignis-kv-disk/<pid>-<nonce>)"
@@ -374,7 +374,7 @@ $(SERVER_BIN): $(SERVER_INPUTS)
 
 .PHONY: _require-artifact
 _require-artifact:
-	@[ -f "$(ARTIFACT)" ] || { echo "error: artifact not found: $(ARTIFACT)"; echo "  fix: ARTIFACT=<path.ninfer>, or CUDA=0 for the CPU mock"; $(if $(filter 1,$(UNCENSORED)),echo "  fetch: hf download $(UNCENSORED_REPO) --local-dir models";) exit 1; }
+	@[ -f "$(ARTIFACT)" ] || { echo "error: artifact not found: $(ARTIFACT)"; echo "  fix: ARTIFACT=<path.ninfer>, or CUDA=0 for the CPU mock"; $(if $(filter 1,$(UNCENSORED)),echo "  fetch: ignis-server model download qwen3.8-27b-abliterated --download-path $(patsubst %/,%,$(dir $(ARTIFACT)))";) exit 1; }
 
 # ---------------------------------------------------------------------------
 ##@ Web (Playground)
