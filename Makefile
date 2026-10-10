@@ -186,8 +186,8 @@ help: ## Show this list
 	  /^[a-zA-Z0-9_.%-]+:.*## / { printf "  %-16s %s\n", $$1, $$2 }' Makefile
 	@echo ""
 	@echo "Knobs (make config for all):  CUDA=$(CUDA)  PROFILE=$(PROFILE)  UI=$(UI)  METRICS=$(METRICS)  BIND=$(BIND)  host=$(HOST_OS)"
-	@echo "GPU engine: MAX_CONTEXT=$(MAX_CONTEXT)  SPEC=$(or $(SPEC),off)  DRAFT_TOKENS=$(DRAFT_TOKENS)  KV_FORMAT=$(KV_FORMAT)"
-	@echo "  e.g.  make dev CUDA=0 PROFILE=dev      make dev-ui SPEC= MAX_CONTEXT=40960"
+	@echo "GPU engine: MAX_CONTEXT=$(MAX_CONTEXT)  SPEC=$(or $(SPEC),server default)  DRAFT_TOKENS=$(DRAFT_TOKENS)  KV_FORMAT=$(KV_FORMAT)"
+	@echo "  e.g.  make dev CUDA=0 PROFILE=dev      make dev-ui SPEC=off MAX_CONTEXT=40960"
 
 .PHONY: config
 config: ## Print the resolved knobs and paths
@@ -199,7 +199,7 @@ config: ## Print the resolved knobs and paths
 	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(Prometheus: $(METRICS_URL)/metrics; Playground: /ui/metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(off))"
 	@echo "ARTIFACT        $(ARTIFACT)"
 	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image, served as qwen3.8-27b-abliterated),off)"
-	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(KV_POOL_PLAN) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),$(if $(filter flash-next,$(MODEL_FAMILY)),off (SPEC=mtp turns the MTP head on),off))$(if $(SPEC),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD)))$(if $(DRAFT_ROWS), rows=$(DRAFT_ROWS)) rope=$(or $(ROPE_SCALING),none)"
+	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(KV_POOL_PLAN) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),$(if $(filter flash-next,$(MODEL_FAMILY)),off (SPEC=mtp turns the MTP head on),server default (the rtx5090 profile: dflash2)))$(if $(filter-out off,$(SPEC)),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD)))$(if $(DRAFT_ROWS), rows=$(DRAFT_ROWS)) rope=$(or $(ROPE_SCALING),none)"
 	@echo "PLAN            $(if $(filter flash-next,$(MODEL_FAMILY)),lanes=$(LANES) context/lane=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) prefill_chunk=$(or $(PREFILL_CHUNK),default) decode_share=$(if $(DECODE_SHARE),$(DECODE_SHARE)%,25% (default)) retained_host=$(or $(RETAINED_HOST),8 (Flash-Next default)) kv_ram_arena=$(or $(KV_HOST_POOL_BYTES),default) kv_pool=$(KV_POOL_PLAN) expert_cache_floor=$(if $(filter 1,$(ALLOW_EXPERT_CACHE_BELOW_FLOOR)),12G (below it allowed with a warning),12G (refused below)) ngram_hot=$(or $(NGRAM_HOT_BYTES),1G (default; auto = what the host plan leaves)),(Flash-Next only: the plan is the server's for the 27B))"
 	@echo "KV-DISK (CUDA=1) $(if $(filter 0,$(KV_DISK_BUDGET)),off$(if $(KV_DISK_BYTES),, (the 27B's default; KV_DISK_BYTES=4G turns it on)),budget=$(KV_DISK_BUDGET) (cut at start to the volume's free space less 10 GiB) dir=$(KV_DISK_LOCATION)/ignis-kv-disk/<pid>-<nonce>)"
 	@echo "VISION (CUDA=1) $(if $(filter 1,$(VISION)),on  max_tokens=$(or $(VISION_MAX_TOKENS),(server default)),off  (image parts are refused with vision_disabled))"

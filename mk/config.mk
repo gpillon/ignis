@@ -122,8 +122,8 @@ DEFAULT_MAX_TOKENS ?=
 # positions, which is why ROPE_SCALING below defaults to yarn:2 -- then
 # hq-e8-2b KV, DFlash2 speculation with a 7-token draft window. The G5 gate
 # legs (docs/specs/runtime/05) ran at MAX_CONTEXT=262144 ROPE_SCALING=none.
-# Empty = leave the flag off (the server's default); SPEC= turns speculation
-# off.
+# Empty = leave the flag off (the server's default); SPEC=off turns speculation
+# off (SPEC= leaves it to the server, and the rtx5090 profile speculates).
 MAX_CONTEXT ?= 524288
 KV_FORMAT ?= hq-e8-2b
 PREFILL_CHUNK ?= 1024

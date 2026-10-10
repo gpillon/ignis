@@ -1146,7 +1146,7 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 | `make clean` / `distclean` | This profile's binary / everything. |
 
 Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
-`make dev-ui SPEC= MAX_CONTEXT=40960`) or in an untracked `local.mk`
+`make dev-ui SPEC=off MAX_CONTEXT=40960`) or in an untracked `local.mk`
 (`local.mk.example`). `make config` prints what is in force.
 
 With `CUDA=1` the server starts with `MAX_CONTEXT=524288` and
@@ -1156,8 +1156,9 @@ and the YaRN table that stretches the envelope to match (the gate legs ran at
 `SPEC=dflash2` with
 `DRAFT_TOKENS=7`, `KV_HOST_POOL_BYTES=8G`, `REQUEST_TIMEOUT=1800`.
 `KV_DISK_BYTES` and `KV_DISK_PATH` set [KV-disk](#kv-disk) (`make config`
-prints its budget and directory). `SPEC=` turns
-speculation off. `VISION=1` loads the tower; `UNCENSORED=1` loads
+prints its budget and directory). `SPEC=off` turns
+speculation off (`SPEC=` leaves it to the server, and the `rtx5090` profile
+speculates with dflash2). `VISION=1` loads the tower; `UNCENSORED=1` loads
 [the uncensored variant](#the-uncensored-variant) in place of the default
 image, served as `qwen3.8-27b-abliterated`; `ROPE_SCALING=yarn:4` rescales the
 envelope further (`none` keeps the trained table); `METRICS=1` starts the metrics listener; `API_KEY=` and `EXPOSE=` set
