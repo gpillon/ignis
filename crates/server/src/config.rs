@@ -693,14 +693,22 @@ impl Config {
 
     /// This config with `patch`'s values over everything else — a live
     /// `PATCH /v1/config`, or a switch target's own artifact and id — and
-    /// resolved again for the same family. Validates exactly as a start
-    /// would: the patch is refused whole if any of it is wrong.
+    /// resolved again from the same sources for the same family.
+    ///
+    /// Always from the sources, never from this config's fitted values: a
+    /// config a switch fitted had values dropped for its family, and
+    /// patching it must neither bring them back nor refuse them now. So the
+    /// patch's own entries are judged as a start's would be — one the active
+    /// family cannot take, or a backend it does not draft with, refuses the
+    /// whole patch — and the start's own values as the switch judged them
+    /// ([`source::Fit::Reconfigure`]). Every family's values are validated as
+    /// at start; the patch is refused whole if any of it is wrong.
     pub fn with_patch(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
         let mut sources = self.basis.sources().clone();
         sources.patch.overlay(patch);
         let config = Config::from_sources(sources)?;
         match self.basis.family() {
-            Some(family) => config.for_family(family),
+            Some(family) => derive(config.basis.sources(), Some(family), Fit::Reconfigure, true).map(|(config, _)| config),
             None => Ok(config),
         }
     }
@@ -1094,24 +1102,21 @@ fn fit_family(
         None => *fitted.model = family.model_id().to_owned(),
     }
     if let Some(speculation) = fitted.speculation.filter(|s| s.backend() != family.drafter()) {
-        match fit {
-            Fit::Start => {
-                return Err(ConfigError(format!(
-                    "`{} {}`: {} drafts with {}",
-                    spelled("spec", "backend"),
-                    speculation.backend().as_str(),
-                    family.name(),
-                    family.drafter().as_str()
-                )));
-            }
-            Fit::Switch => {
-                *fitted.speculation = None;
-                fitted.dropped.push(schema::field("spec", "backend").expect("declared").flag());
-                for name in ["draft_tokens", "draft_head"] {
-                    if resolution.explicit("spec", name) {
-                        fitted.dropped.push(schema::field("spec", name).expect("declared").flag());
-                    }
-                }
+        let from = resolution.origin("spec", "backend").map_or(source::Source::Default, |origin| origin.source);
+        if fit.refuses(from) {
+            return Err(ConfigError(format!(
+                "`{} {}`: {} drafts with {}",
+                spelled("spec", "backend"),
+                speculation.backend().as_str(),
+                family.name(),
+                family.drafter().as_str()
+            )));
+        }
+        *fitted.speculation = None;
+        fitted.dropped.push(schema::field("spec", "backend").expect("declared").flag());
+        for name in ["draft_tokens", "draft_head"] {
+            if resolution.explicit("spec", name) {
+                fitted.dropped.push(schema::field("spec", name).expect("declared").flag());
             }
         }
     }

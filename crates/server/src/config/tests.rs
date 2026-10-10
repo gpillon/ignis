@@ -1504,6 +1504,43 @@ fn a_patch_wins_over_the_command_line_and_is_validated_whole() {
     assert!(err.contains("spec.decode_lanes") && err.contains("99"), "{err}");
 }
 
+/// One patch entry, as `PATCH /v1/config` would give it.
+fn patch_of(entries: &[(&str, &str, &str)]) -> source::Layer {
+    let mut patch = source::Layer::default();
+    for (group, name, raw) in entries {
+        let meta = schema::field(group, name).unwrap();
+        patch.set(meta, None, source::Candidate { raw: raw.to_string(), spelling: meta.file_key() }).unwrap();
+    }
+    patch
+}
+
+/// A config a switch fitted (dropping what the new family cannot take) can
+/// be patched: the start's own values keep the switch's drop semantics,
+/// while the patch's entries are held to the active family as a start's
+/// would be — the owner's path, the 27B started with vision and switched to
+/// Flash-Next, then a timeout changed live.
+#[test]
+fn a_patch_on_a_switched_config_keeps_its_drops_and_judges_only_its_own_entries() {
+    let started = config(&["--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    let (switched, dropped) = fit_to_family(&started, ModelFamily::FlashNext).unwrap();
+    assert_eq!(dropped, ["--vision-enabled"]);
+    let patched = switched.with_patch(&patch_of(&[("server", "request_timeout", "90")])).unwrap();
+    assert_eq!(patched.request_timeout_secs, 90);
+    assert!(patched.vision.is_none());
+    assert_eq!(patched.basis.family(), Some(ModelFamily::FlashNext));
+    let err = switched.with_patch(&patch_of(&[("vision", "enabled", "true")])).unwrap_err().0;
+    assert!(err.contains("vision.enabled") && err.contains("Qwen3.8-Flash-Next"), "{err}");
+    let err = switched
+        .with_patch(&patch_of(&[("spec", "backend", "dflash2"), ("spec", "draft_tokens", "7")]))
+        .unwrap_err()
+        .0;
+    assert!(err.contains("spec.backend") && err.contains("drafts with mtp"), "{err}");
+    assert!(switched.with_patch(&patch_of(&[("vision", "enabled", "false")])).is_ok(), "naming the default is harmless");
+    // Switching back after the patch: the patch stays, the start's vision returns.
+    let (back, _) = fit_to_family(&patched, ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!((back.request_timeout_secs, back.vision.is_some()), (90, true));
+}
+
 // ── vision as a load option (GitHub #177) ────────────────────────────────
 
 #[test]
