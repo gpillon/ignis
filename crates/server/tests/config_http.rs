@@ -15,6 +15,7 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_server::config::file::{Format, RealFiles};
+use ignis_core::compute::ModelFamily;
 use ignis_server::config::{resolve_with, Config, ConfigOutcome};
 use ignis_server::config_http::ConfigState;
 use ignis_server::model_switch::Switcher;
@@ -326,6 +327,31 @@ impl TemplateProvider for NoThinkingControl {
     fn token_decoder(&self) -> Box<dyn ignis_server::decoder::TokenDecoder> {
         SimpleTemplateProvider.token_decoder()
     }
+}
+
+/// A field only one family takes, patched while that family runs, is
+/// written under that family's own section of the file, never the general
+/// one: a later start of the other model from the same file never sees it,
+/// rather than being refused for a value that was never meant for it.
+#[tokio::test]
+async fn a_family_only_field_is_written_under_its_familys_section() {
+    let path = config_file("family-only", "server:\n  request_timeout: 30\n");
+    let loader = MockLoader::new();
+    let flash = started(&["--config", path.to_str().unwrap()]).for_family(ModelFamily::FlashNext).unwrap();
+    let server = server_on(&loader, flash);
+    server.update_active(|model| model.family = ModelFamily::FlashNext);
+    let app = server.app();
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "spec": { "decode_lanes": 1 } }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "a reload field: {applied}");
+    until_serving(&app).await;
+
+    let written = read_yaml(&path);
+    assert_eq!(written["spec"]["qwen38flashnext"]["decode_lanes"], 1, "{written:?}");
+    assert!(written["spec"].get("decode_lanes").is_none(), "never the general section: {written:?}");
+    let restarted = started(&["--config", path.to_str().unwrap()]);
+    let qwen = restarted.for_family(ModelFamily::Qwen38_27b).expect("a 27B start from the same file is unaffected");
+    assert_eq!(qwen.decode_lanes, None);
+    assert_eq!(restarted.for_family(ModelFamily::FlashNext).unwrap().decode_lanes, Some(1), "Flash-Next still gets it");
 }
 
 /// A request pins the live knobs with the model: a live change landing

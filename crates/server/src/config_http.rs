@@ -77,12 +77,25 @@ impl ConfigState {
     /// Write `patch` into the config file in use, if there is one (spec
     /// config-v2/02 §`PATCH` step 5), by [`file::rewrite`] — the merge
     /// `config patch` writes with.
+    ///
+    /// A field only one family takes goes under that family's own section,
+    /// never the general one ([`FieldMeta::home_family`]): it can only ever
+    /// apply to that family, so there it is both right and enough, and a
+    /// start of the other model from the same file never sees it instead of
+    /// being refused for it. Every other field goes where the patch put it.
     pub fn persist(&self, patch: &Layer) -> Persisted {
         let current = self.current();
         let Some(path) = current.file_path() else {
             return Persisted::No(NO_FILE.to_owned());
         };
+        let homed = |changes: Vec<file::Change>| {
+            changes
+                .into_iter()
+                .map(|(meta, family, value)| (meta, family.or_else(|| meta.home_family()), value))
+                .collect::<Vec<_>>()
+        };
         let written = file::changes_of(patch)
+            .map(homed)
             .and_then(|changes| file::rewrite(&*self.files, path, changes, None))
             .and_then(|text| {
                 self.files

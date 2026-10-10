@@ -310,7 +310,7 @@ pub fn effective_document(config: &Config) -> Value {
             continue;
         };
         let scoped = resolution.settings.render();
-        for meta in all_fields().filter(|meta| meta.scoped) {
+        for meta in all_fields().filter(|meta| meta.takes_scope(family)) {
             let at = |groups: &Map<String, Value>| groups.get(meta.group).and_then(|group| group.get(meta.name)).cloned();
             let value = at(&scoped);
             if value != at(&general) {

@@ -124,20 +124,14 @@ impl Layer {
     /// never an empty string.
     ///
     /// A family-scoped value is refused here, whatever source it came from,
-    /// when the field has no family scope or the family cannot take the
-    /// field at all (`--qwen38-ngram-hot-bytes`): such a value was written
-    /// for a family that can never use it, so it is wrong the moment it is
-    /// written.
+    /// when the family cannot take the field at all
+    /// (`IGNIS_QWEN38_NGRAM_HOT_BYTES`) or the field has no place in that
+    /// family's section ([`FieldMeta::takes_scope`]): such a value was
+    /// written for a family that can never use it, so it is wrong the moment
+    /// it is written. A field only one family takes may sit in that family's
+    /// section, which is where `PATCH /v1/config` writes it.
     pub fn set(&mut self, meta: &'static FieldMeta, family: Option<ModelFamily>, candidate: Candidate) -> Result<(), ConfigError> {
         if let Some(family) = family {
-            if !meta.scoped {
-                return Err(ConfigError(format!(
-                    "`{}`: {} has no per-family value; set `{}` instead",
-                    candidate.spelling,
-                    meta.file_key(),
-                    meta.file_key()
-                )));
-            }
             if !meta.applies.to(family) {
                 return Err(ConfigError(format!(
                     "`{}`: {} does not take {} (a {} option)",
@@ -145,6 +139,14 @@ impl Layer {
                     family.name(),
                     meta.file_key(),
                     meta.applies.describe()
+                )));
+            }
+            if !meta.takes_scope(family) {
+                return Err(ConfigError(format!(
+                    "`{}`: {} has no per-family value; set `{}` instead",
+                    candidate.spelling,
+                    meta.file_key(),
+                    meta.file_key()
                 )));
             }
         }
@@ -350,7 +352,7 @@ impl Resolver<'_> {
     /// `layer`'s value for `meta`: the family-scoped one first, then the
     /// general one.
     fn candidate<'l>(&self, layer: &'l Layer, meta: &FieldMeta) -> Option<&'l Candidate> {
-        let scoped = self.family.filter(|_| meta.scoped).and_then(|family| layer.get(meta, Some(family)));
+        let scoped = self.family.filter(|family| meta.takes_scope(*family)).and_then(|family| layer.get(meta, Some(family)));
         scoped.or_else(|| layer.get(meta, None))
     }
 
@@ -622,6 +624,23 @@ mod tests {
         let flash = resolve_settings(&sources, Some(ModelFamily::FlashNext), Fit::Start).unwrap();
         assert_eq!(flash.settings.spec.decode_lanes, Some(3));
         assert!(!flash.explicit("spec", "decode_lanes"), "a profile value is not the operator's");
+    }
+
+    /// A field only one family takes may sit in that family's own section —
+    /// read there for that family, never for the other — and nowhere else.
+    #[test]
+    fn a_family_only_field_lives_in_its_familys_section_and_no_other() {
+        let lanes = field("spec", "decode_lanes").unwrap();
+        let flash = Some(ModelFamily::FlashNext);
+        let sources = Sources { file: layer(lanes, &[(flash, "1")]), ..Sources::default() };
+        assert_eq!(resolve_settings(&sources, flash, Fit::Start).unwrap().settings.spec.decode_lanes, Some(1));
+        let qwen = resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap();
+        assert_eq!(qwen.settings.spec.decode_lanes, None, "the 27B never sees it, so never refuses it");
+        assert_eq!(resolve_settings(&sources, None, Fit::Start).unwrap().settings.spec.decode_lanes, None);
+        let err = Layer::default()
+            .set(lanes, Some(ModelFamily::Qwen38_27b), Candidate { raw: "1".into(), spelling: "spec.qwen38.decode_lanes".into() })
+            .unwrap_err();
+        assert!(err.0.contains("Qwen3.8-27B does not take spec.decode_lanes"), "{err}");
     }
 
     #[test]

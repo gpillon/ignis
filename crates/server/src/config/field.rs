@@ -273,6 +273,24 @@ impl FieldMeta {
         format!("{}.{}.{}", self.group, scope(family), self.name)
     }
 
+    /// The one family a field only that family takes belongs to
+    /// (`Only([family])`); `None` for a field more families take.
+    pub fn home_family(&self) -> Option<ModelFamily> {
+        match self.applies {
+            Applicability::Only([family]) => Some(*family),
+            _ => None,
+        }
+    }
+
+    /// Whether a value of the field may sit in `family`'s own section (a
+    /// file's `<group>.<family>.<field>`, an env var's `IGNIS_<FAMILY>_…`):
+    /// a scoped field in either family's, and a field only one family takes
+    /// in that family's — where `PATCH /v1/config` writes it, so that a start
+    /// of the other model from the same file never sees it.
+    pub fn takes_scope(&self, family: ModelFamily) -> bool {
+        self.scoped || self.home_family() == Some(family)
+    }
+
     /// The description's first sentence-or-paragraph, trimmed of rustdoc's
     /// leading spaces and joined onto one line.
     pub fn summary(&self) -> String {
