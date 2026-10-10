@@ -37,7 +37,7 @@ type Drawer = "sessions" | "settings" | null;
 
 export function App() {
   const auth = useAuth();
-  const model = useModel();
+  const [model, refreshModel] = useModel();
   const monitorVisible = useMonitorVisible();
   const [view, setView] = useState<View>("chat");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -60,7 +60,7 @@ export function App() {
   // The bench has its own two drawers below `lg`; the header's buttons open
   // whichever view is showing.
   const [decideDrawer, setDecideDrawer] = useState<DecideDrawer>(null);
-  const chat = useConversation({ model, settings, tools, parallel });
+  const chat = useConversation({ model, refreshModel, settings, tools, parallel });
   const { active } = chat;
   const monitoring = view === "monitor" && monitorVisible;
   const deciding = view === "decide";

@@ -28,7 +28,6 @@ export const REASONING_EFFORTS = ["none", "low", "medium", "xhigh", "max"] as co
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 export type Settings = {
-  model: string;
   systemPrompt: string;
   temperature: number;
   topP: number;
@@ -94,7 +93,6 @@ type WireMessage = {
 };
 
 export type ChatRequest = {
-  model: string;
   messages: WireMessage[];
   tools?: ToolDefinition[];
   stream: true;
@@ -194,7 +192,6 @@ export function buildChatRequest(settings: Settings, turns: Turn[], extras: Tool
   const system = systemPromptOf(settings, extras);
   const thinkingBudget = thinkingBudgetOf(settings);
   return {
-    model: settings.model,
     messages: [...(system ? [{ role: "system" as const, content: system }] : []), ...turns.flatMap(wireMessages)],
     ...(extras.tools?.length ? { tools: extras.tools } : {}),
     stream: true,

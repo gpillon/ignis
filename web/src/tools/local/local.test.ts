@@ -11,7 +11,6 @@ import { JS_CHECK_SYSTEM_PROMPT, parseVerdict, runJs, type WorkerFactory, worker
 const chatBody = ({ settings, turns, extras }: ConversationRequest) => buildChatRequest(settings, turns, extras);
 
 const settings: Settings = {
-  model: "m",
   systemPrompt: "",
   temperature: 1,
   topP: 0.95,

@@ -68,11 +68,14 @@ const exchangeOf = (m: Message): Exchange => ({
 
 export function useConversation({
   model,
+  refreshModel,
   settings,
   tools,
   parallel,
 }: {
   model: ModelState;
+  /** Reads which model is loaded now. */
+  refreshModel: () => void;
   settings: PlaygroundSettings;
   tools: ToolsState;
   /** Sessions other than the one streaming may start their own turn. */
@@ -145,7 +148,10 @@ export function useConversation({
    */
   async function exchange(sessionId: number, history: Message[], prompt: string | null, images: PromptImage[] = []) {
     if (!canStartTurn(running(), sessionId, parallel) || model.state !== "ready") return;
-    const requestSettings: Settings = { ...settings, model: model.id };
+    // A request names no model: the server serves the one it has loaded, and a name could only switch it. The
+    // page asks again which that is, so the header follows a switch another client made.
+    refreshModel();
+    const requestSettings: Settings = settings;
     // The notes and files the tools write into the prompt are as they were when the turn started. The date and
     // time is the session's, not this turn's: it sits ahead of the whole conversation, so a moment that moved
     // between two turns would change the prompt's first tokens and cost a prefill of everything (GitHub #186).

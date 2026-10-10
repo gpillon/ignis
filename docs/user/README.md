@@ -132,6 +132,8 @@ an explicit `--switch-known-models` entry wins for its id). A request naming a
 catalog id that is not on disk is refused as an unknown model — a switch never
 starts a download.
 
+A client configured with two known models reloads the server back and forth: opencode sends its `small_model` requests (titles, summaries) to the id named by `small_model`, so a `model` and a `small_model` naming different ignis ids switch the server on alternate requests, 13-33 s each. Point both at the same id, or start with `--switch-allow-implicit false`. The Playground never causes a switch: its requests name no model, so the server serves the one loaded, and the header and the context limit follow it, read again from `GET /v1/models` when a turn starts.
+
 ### Letting the server fetch it
 
 A GPU build started **without** `--model-artifact` / `IGNIS_MODEL_ARTIFACT`

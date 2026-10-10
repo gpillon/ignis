@@ -51,7 +51,6 @@ class FakeSocket implements SocketLike {
 }
 
 const settings: Settings = {
-  model: "m",
   systemPrompt: "",
   temperature: 1,
   topP: 0.95,
@@ -293,7 +292,6 @@ describe("a reply on the socket", () => {
       {
         type: "response.create",
         stream_id: "session-1-x",
-        model: "m",
         input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
         temperature: 1,
         top_p: 0.95,
