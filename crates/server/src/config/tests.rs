@@ -154,6 +154,84 @@ fn the_settings_and_every_group_serialize_and_deserialize_in_both_formats() {
     assert!(err.contains("reuse.kv_host_pool"), "{err}");
 }
 
+// ── config-file auto-discovery (spec config-v2/02) ───────────────────────
+
+/// The per-user config directory's candidate, as discovery spells it here.
+fn user_candidate() -> (&'static [(&'static str, &'static str)], &'static str) {
+    if cfg!(windows) {
+        (&[("APPDATA", "U")], "U/ignis/config.yaml")
+    } else {
+        (&[("XDG_CONFIG_HOME", "U")], "U/ignis/config.yaml")
+    }
+}
+
+/// Spec config-v2/02, Testing: the working directory is found before the
+/// user config directory when both hold a file; either is used when it is
+/// the only one; none found is the no-file case, not an error.
+#[test]
+fn discovery_finds_the_working_directory_first_then_the_user_directory() {
+    let (env, user_path) = user_candidate();
+    let user = PathBuf::from("U").join("ignis").join("config.yaml");
+    assert_eq!(user, PathBuf::from(user_path).components().collect::<PathBuf>());
+    let both = MemFiles::with(&[("ignis.config.yaml", "server:\n  request_timeout: 11\n")]);
+    both.files.borrow_mut().insert(user.clone(), "server:\n  request_timeout: 22\n".to_owned());
+    let found = with_files(&[], env_map(env), &both).unwrap();
+    assert_eq!(found.request_timeout_secs, 11);
+    assert_eq!(found.basis.sources().file_source, source::FileSource::Discovered(PathBuf::from("ignis.config.yaml")));
+
+    let json_only = MemFiles::with(&[("ignis.config.json", r#"{"server": {"request_timeout": 33}}"#)]);
+    assert_eq!(with_files(&[], env_map(env), &json_only).unwrap().request_timeout_secs, 33);
+
+    let user_only = MemFiles::default();
+    user_only.files.borrow_mut().insert(user.clone(), "server:\n  request_timeout: 22\n".to_owned());
+    let found = with_files(&[], env_map(env), &user_only).unwrap();
+    assert_eq!((found.request_timeout_secs, found.basis.sources().file_source.kind()), (22, "discovered"));
+
+    let none = with_files(&[], env_map(env), &MemFiles::default()).unwrap();
+    assert_eq!(none.basis.sources().file_source, source::FileSource::None);
+}
+
+/// Spec config-v2/02, Testing: a file named by `--config` or `IGNIS_CONFIG`
+/// short-circuits discovery entirely — no candidate is even looked at.
+#[test]
+fn a_named_file_short_circuits_discovery_without_looking() {
+    let (env, _) = user_candidate();
+    let files = MemFiles::with(&[("named.yaml", "server: {}\n"), ("ignis.config.yaml", "server:\n  request_timeout: 11\n")]);
+    let named = with_files(&["--config", "named.yaml"], env_map(env), &files).unwrap();
+    assert_eq!(named.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
+    assert_eq!(named.basis.sources().file_source.kind(), "explicit");
+    assert!(files.looked_at.borrow().is_empty(), "{:?}", files.looked_at.borrow());
+    let from_env = with_files(&[], env_map(&[("IGNIS_CONFIG", "named.yaml")]), &files).unwrap();
+    assert_eq!(from_env.basis.sources().file_source, source::FileSource::Explicit(PathBuf::from("named.yaml")));
+    assert!(files.looked_at.borrow().is_empty());
+}
+
+/// Spec config-v2/02, Testing: the startup line, for all three sources.
+#[test]
+fn the_startup_log_names_the_config_source_in_all_three_states() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let (env, _) = user_candidate();
+    let files = MemFiles::with(&[("named.yaml", "server: {}\n"), ("ignis.config.yaml", "server: {}\n")]);
+    let cases = [
+        (with_files(&["--config", "named.yaml"], env_map(env), &files).unwrap(), "explicit", "named.yaml"),
+        (with_files(&[], env_map(env), &files).unwrap(), "discovered", "ignis.config.yaml"),
+        (config(&[]), "none", "none"),
+    ];
+    for (config, source, path) in cases {
+        let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+        tracing::subscriber::with_default(subscriber, || log_source(&config));
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let event: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(event["event_name"], "ignis.config.source", "{event}");
+        let field = |name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
+        assert_eq!(field("source"), Some(source.into()), "{event}");
+        assert_eq!(field("path"), Some(path.into()), "{event}");
+        assert_eq!(field("profile"), Some("rtx5090".into()), "{event}");
+    }
+}
+
 // ── hardware profiles (spec config-v2/02 §`--profile`) ───────────────────
 
 /// The implicit default profile restates the hardcoded defaults: an unset

@@ -75,6 +75,13 @@ fn a_served_request_leaves_no_jsonl_line_on_a_pretty_stdout() {
         .env("IGNIS_LOG_FORMAT", "pretty")
         .env("IGNIS_LOG_LEVEL", "info")
         .env_remove("IGNIS_MODEL_ARTIFACT")
+        // No config file the machine happens to hold (spec config-v2/02
+        // §Config-file auto-discovery) may change what this start serves.
+        .current_dir(std::env::temp_dir())
+        .env("APPDATA", std::env::temp_dir().join("ignis-stdout-test-no-config"))
+        .env("XDG_CONFIG_HOME", std::env::temp_dir().join("ignis-stdout-test-no-config"))
+        .env_remove("IGNIS_CONFIG")
+        .env_remove("IGNIS_PROFILE")
         .stdout(Stdio::piped());
     let mut child = command.spawn().expect("spawn ignis-server");
     let stdout = child.stdout.take().expect("piped stdout");

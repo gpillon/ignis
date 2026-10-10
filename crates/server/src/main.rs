@@ -286,6 +286,10 @@ async fn main() {
             exit_after_flush(&logging_handle, 1);
         }
     };
+    // Spec config-v2/02 AC 12: where the configuration came from, said
+    // before anything is loaded, so it is in the log even when the load then
+    // fails.
+    config::log_source(&config);
     // What the loaded model's family fits once the artifact names it
     // (`Config::for_family`, spec flash-next/04 and config-v2/01): every
     // load-shape value below is read from that fitted config, so a value

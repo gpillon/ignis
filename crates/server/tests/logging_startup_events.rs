@@ -52,6 +52,21 @@ fn no_download() -> [String; 4] {
     ]
 }
 
+/// Keep a launch away from any config file on the machine (spec
+/// config-v2/02 §Config-file auto-discovery): an empty working directory and
+/// per-user config directory, and no file or profile named by the
+/// environment the test runner inherited.
+fn no_config_file(command: &mut Command) {
+    let empty = std::env::temp_dir().join("ignis-logging-test-no-config");
+    let _ = std::fs::create_dir_all(&empty);
+    command
+        .current_dir(&empty)
+        .env("APPDATA", &empty)
+        .env("XDG_CONFIG_HOME", &empty)
+        .env_remove("IGNIS_CONFIG")
+        .env_remove("IGNIS_PROFILE");
+}
+
 fn run_with_envs(args: &[&str], envs: &[(&str, &str)]) -> serde_json::Value {
     let exe = env!("CARGO_BIN_EXE_ignis-server");
     let mut command = Command::new(exe);
@@ -60,6 +75,7 @@ fn run_with_envs(args: &[&str], envs: &[(&str, &str)]) -> serde_json::Value {
         .args(no_download())
         .env("IGNIS_LOG_FORMAT", "json")
         .env("IGNIS_LOG_LEVEL", "info");
+    no_config_file(&mut command);
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -102,6 +118,7 @@ fn run_until(args: &[&str], envs: &[(&str, &str)], until: &[&str]) -> Vec<serde_
         .env("IGNIS_LOG_FORMAT", "json")
         .env("IGNIS_LOG_LEVEL", "info")
         .stdout(Stdio::piped());
+    no_config_file(&mut command);
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -296,6 +313,23 @@ fn no_artifact_emits_placeholder_template_then_process_started() {
         started["attributes"]["kv_host_pool_bytes"].as_u64().is_some(),
         "the pinned KV-RAM arena's bytes should appear as a typed attribute: {started}"
     );
+}
+
+/// Spec config-v2/02 AC 12: where the configuration came from is said at
+/// every start, before anything is loaded.
+#[test]
+fn the_config_source_is_logged_before_anything_is_loaded() {
+    let records = run_until(&[], &[], &["ignis.process.started"]);
+    let at = |name: &str| records.iter().position(|record| record["event_name"] == name);
+    let source = at("ignis.config.source").expect("ignis.config.source is logged");
+    for later in ["ignis.model.placeholder_template", "ignis.process.started"] {
+        if let Some(index) = at(later) {
+            assert!(source < index, "the source before {later}: {records:?}");
+        }
+    }
+    let record = &records[source];
+    assert_eq!(record["attributes"]["source"], "none", "{record}");
+    assert_eq!(record["attributes"]["profile"], "rtx5090", "{record}");
 }
 
 #[test]

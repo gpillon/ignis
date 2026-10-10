@@ -572,7 +572,7 @@ pub fn resolve_with(
     let named = parsed.config.clone().or_else(|| env(CONFIG_ENV).filter(|path| !path.is_empty()));
     let choice = match named {
         Some(path) => FileChoice::Explicit(PathBuf::from(path)),
-        None => FileChoice::None,
+        None => FileChoice::Discover,
     };
     let (sources, _) = gather(parsed, &env, files, choice)?;
     Config::from_sources(sources).map(ConfigOutcome::Config)
@@ -586,6 +586,11 @@ pub(crate) enum FileChoice {
     /// The one `--config` / `IGNIS_CONFIG` named: it must exist — an
     /// operator who named a file meant it to.
     Explicit(PathBuf),
+    /// The first of the conventional places that holds one, if any (spec
+    /// config-v2/02 §Config-file auto-discovery). Only when nothing named a
+    /// file: a named one short-circuits discovery entirely, never even
+    /// looking at the candidates.
+    Discover,
     /// This one if it exists (`config print`).
     IfPresent(PathBuf),
     /// This one, which must exist (`config patch`, which changes a file and
@@ -612,6 +617,13 @@ pub(crate) fn gather(
             let loaded = file::load(files, &path)?;
             (FileSource::Explicit(path), Some(loaded))
         }
+        FileChoice::Discover => match file::discovery_candidates(env).into_iter().find(|path| files.exists(path)) {
+            Some(path) => {
+                let loaded = file::load(files, &path)?;
+                (FileSource::Discovered(path), Some(loaded))
+            }
+            None => (FileSource::None, None),
+        },
         FileChoice::IfPresent(path) if files.exists(&path) => {
             let loaded = file::load(files, &path)?;
             (FileSource::Explicit(path), Some(loaded))
@@ -850,6 +862,24 @@ fn derive(
         basis: Basis(Arc::new(BasisInner { sources: sources.clone(), resolution: resolution.clone(), family })),
     };
     Ok((config, dropped))
+}
+
+/// Say where the configuration came from (spec config-v2/02 AC 12):
+/// `ignis.config.source`, naming `explicit` (the path `--config` /
+/// `IGNIS_CONFIG` gave), `discovered` (the conventional path it was found
+/// at) or `none`, with the profile in use. `main` logs it before the model
+/// load begins, so it is there even when the load then fails — "why is this
+/// value what it is" is answered by the first lines of the log.
+pub fn log_source(config: &Config) {
+    let sources = config.basis.sources();
+    let path = sources.file_source.path().map(|path| path.display().to_string());
+    tracing::info!(
+        name: "ignis.config.source",
+        source = sources.file_source.kind(),
+        path = path.as_deref().unwrap_or("none"),
+        profile = %sources.profile_name,
+        "configuration source"
+    );
 }
 
 /// The values [`fit_family`] may change: the served id, the speculation a
