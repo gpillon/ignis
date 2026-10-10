@@ -591,6 +591,38 @@ names a different model (seconds, per the GPU numbers above), then answers
 normally — no client-side retry loop needed, which a bare `503` would have
 demanded of every OpenAI-compatible client pointed at this server.
 
+### As implemented (2026-10-10, branch `model-switch-305`)
+
+- **The trigger runs first, before the request is pinned to a model.**
+  `model_switch::implicit_switch` is called at the top of chat completions,
+  `POST /v1/responses`, the Responses WebSocket's per-request path and
+  `/v1/decide` — not after `resolve_model_and_class`. `Server::pinned()` gives
+  a request its own `ArcSwap`; a switch begun from that copy would publish the
+  new model where no other request reads it, and the template, thinking and
+  media checks that run before `resolve_model_and_class` would have read the
+  old model. So: switch, then pin, then everything else, which also closes
+  the gate "before anything else about this request is evaluated" (ordering
+  1). On `/v1/decide` the call precedes the Flash-Next `model_unsupported`
+  refusal, so a decision naming the 27B on a Flash-Next load switches back.
+- **The start model joins the table at start, not in `config`.** Only the
+  load knows the id it serves under (an unnamed `--model` takes the
+  artifact's own) and the file (a downloaded artifact):
+  `model_switch::known_models` adds `ActiveModel::source`, whose entry wins
+  over an operator's for the same id (`ignis.config.known_model_replaced`
+  when the paths differ). `--allow-model-switch false` installs an empty
+  table; it does not touch `POST /v1/models/switch`.
+- **Flags.** Any `--known-model` replaces `IGNIS_KNOWN_MODELS` whole; an id
+  named twice, an empty id or path, or an id holding a lane tag's `@` is a
+  usage error.
+- **Wire.** A switch already running: the gate's own `503 model_switching`
+  with `Retry-After`, word for word. A switch the request began that did not
+  land: `503 model_switch_failed` with its reason and no `Retry-After` — 5xx
+  because the server failed, no `Retry-After` because a retry is one more
+  teardown and reload of the model serving everyone else; `/v1/decide`
+  answers it as its own `422 model_switch_failed`.
+- **`/v1/tokenize` does not switch.** It refuses another model `404` as
+  before: a counting route (no lane, no GPU) should not move the card.
+
 ### Out of scope, still
 
 A policy that infers the right model for a task without being told its

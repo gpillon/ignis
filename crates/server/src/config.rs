@@ -1668,29 +1668,27 @@ fn resolve_known_models(
     let (entries, source) = if flags.is_empty() {
         let raw = env("IGNIS_KNOWN_MODELS").unwrap_or_default();
         let entries = raw.split(';').filter(|entry| !entry.trim().is_empty()).map(str::to_owned).collect();
-        (entries, "IGNIS_KNOWN_MODELS")
+        (entries, "`IGNIS_KNOWN_MODELS`")
     } else {
-        (flags, "--known-model")
+        (flags, "`--known-model`")
     };
     let mut known = BTreeMap::new();
     for entry in entries {
         let Some((id, path)) = entry.split_once('=') else {
-            return Err(ConfigError(format!(
-                "`{source}` entries are `<id>=<path>` (`--known-model`), got `{entry}`"
-            )));
+            return Err(ConfigError(format!("{source} takes `<id>=<path>`, got `{entry}`")));
         };
         let (id, path) = (id.trim(), path.trim());
         if id.is_empty() || path.is_empty() {
             let missing = if id.is_empty() { "id" } else { "path" };
-            return Err(ConfigError(format!("`{source}` entry `{entry}` (`--known-model`) has no {missing}")));
+            return Err(ConfigError(format!("{source} `{entry}` has no {missing}")));
         }
         if id.contains('@') {
             return Err(ConfigError(format!(
-                "`{source}` id `{id}` (`--known-model`) holds an `@`, which starts a request's lane tag: no request could name it"
+                "{source} id `{id}` holds an `@`, which starts a request's lane tag: no request could name it"
             )));
         }
         if known.insert(id.to_owned(), PathBuf::from(path)).is_some() {
-            return Err(ConfigError(format!("`{source}` (`--known-model`) names `{id}` twice")));
+            return Err(ConfigError(format!("{source} names `{id}` twice")));
         }
     }
     Ok(known)

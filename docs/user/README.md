@@ -160,6 +160,8 @@ always-current table; this one is a copy.
 | `--model-download-path <dir>` | `IGNIS_MODEL_DOWNLOAD_PATH` | `./models` | Where a fetched model lands, and where one fetched earlier is found. |
 | `--request-timeout <secs>` | `IGNIS_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | `--switch-drain-timeout <secs>` | `IGNIS_SWITCH_DRAIN_TIMEOUT` | `30` (max `3600`) | How long a model switch lets the old model's running requests finish before it cancels them (`0` cancels at once). |
+| `--allow-model-switch <true\|false>` | `IGNIS_ALLOW_MODEL_SWITCH` | `true` | A request whose `model` names another model `--known-model` lists switches the server to it, then is served on it. `false`: such a request is a `404 model_not_found`, as an unknown model is. `POST /v1/models/switch` is not affected. |
+| `--known-model <id>=<path>` (repeatable) | `IGNIS_KNOWN_MODELS` (`;`-separated pairs) | the start model only | A model a request may switch to by naming it, and the artifact it loads from. The model the server starts on is always listed. Any flag replaces the env var whole; an id named twice is refused. |
 | `-h`, `--help` | — | — | Print the flag table and exit. |
 | `-V`, `--version` | — | — | Print the version and exit. |
 
@@ -490,6 +492,29 @@ a checksum that is not clean, a model id of the other model — leaves the old
 model serving. One that fails to load after the old model was unloaded has the
 old model loaded again; `GET /v1/models` says `failed`, with a `reason`, until
 one of them serves.
+
+**By naming the model.** A client can also just ask for the other model: a
+chat completion, a response (over HTTP or the WebSocket) or a decision whose
+`model` names another model listed with `--known-model` runs the same switch,
+and the request itself is held until the named model serves and is then
+answered by it — the first such request takes as long as the switch does
+(seconds), and no client-side retry loop is needed. List the models once:
+
+```
+ignis-server --artifact models/Qwen3.8-27B.ninfer \
+  --known-model qwen3.8-flash-next=models/Qwen3.8-Flash-Next.ninfer
+```
+
+The model the server starts on is always listed, so naming it again switches
+back. While such a switch runs every other request gets the same `503
+model_switching` as during any switch, a second request naming a model
+included — switches are never queued. A switch that does not land refuses the
+request that began it with `503 model_switch_failed` and the reason (no
+`Retry-After`: each retry would unload and reload the serving model again),
+never an answer from another model; `/v1/decide` refuses it as its own `422`.
+A model nobody listed, or any other model under `--allow-model-switch false`,
+is a `404 model_not_found` as before. `/v1/tokenize` never switches: counting
+tokens does not move the card.
 
 ### Chat completions
 
