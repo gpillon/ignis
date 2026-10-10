@@ -175,7 +175,11 @@ fn serve(state: &Served, file: &str, range: Option<String>) -> Response {
     }
     let ignore_range = state.ignore_range.load(Ordering::SeqCst) == 1;
     let start = match (&range, ignore_range) {
-        (Some(raw), false) => raw.trim_start_matches("bytes=").trim_end_matches('-').parse::<usize>().unwrap_or(0),
+        (Some(raw), false) => raw
+            .trim_start_matches("bytes=")
+            .trim_end_matches('-')
+            .parse::<usize>()
+            .unwrap_or(0),
         _ => 0,
     };
     let mut served = body[start.min(body.len())..].to_vec();
@@ -184,7 +188,11 @@ fn serve(state: &Served, file: &str, range: Option<String>) -> Response {
         served.truncate(truncate_after);
     }
     *state.bytes_sent.lock().unwrap().entry(file.to_owned()).or_default() += served.len();
-    let status = if start > 0 && !ignore_range { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
+    let status = if start > 0 && !ignore_range {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
     (status, Body::from(served)).into_response()
 }
 
@@ -197,7 +205,9 @@ async fn repo_server_at(prefix: &str) -> (SocketAddr, Arc<Served>) {
         .route(&format!("{prefix}/{{owner}}/{{name}}/resolve/{{revision}}/{{file}}"), get(resolve))
         .route("/cdn/{file}", get(cdn))
         .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -479,13 +489,13 @@ async fn a_files_url_carries_the_endpoint_the_repo_the_revision_and_the_name() {
 
 #[tokio::test]
 async fn the_token_goes_to_the_endpoint_and_never_across_a_redirect_to_another_host() {
-    // 02 AC 6: two listeners. The endpoint answers every file with a
-    // redirect to the other (as Hugging Face sends a large body from its
-    // CDN): the endpoint sees the token, the other never does — and a
-    // resume's `Range` still reaches it.
+    // 02 AC 6: two listeners. The endpoint (`127.0.0.1`) answers every file
+    // with a redirect to the other under another host name (`localhost`, as
+    // Hugging Face sends a large body from its CDN): the endpoint sees the
+    // token, the other never does — and a resume's `Range` still reaches it.
     let (endpoint, at_endpoint) = repo_server().await;
     let (cdn, at_cdn) = repo_server().await;
-    *at_endpoint.redirect_to.lock().unwrap() = Some(format!("http://{cdn}"));
+    *at_endpoint.redirect_to.lock().unwrap() = Some(format!("http://localhost:{}", cdn.port()));
     let dir = temp_dir("redirect");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(part(&dir, ARTIFACT), &artifact_bytes()[..512]).unwrap();

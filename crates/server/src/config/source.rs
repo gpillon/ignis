@@ -444,6 +444,41 @@ pub fn parse_args(args: &[String]) -> Result<ParsedArgs, ConfigError> {
     Ok(parsed)
 }
 
+/// Split argv into the words that are not a flag nor a flag's value, in the
+/// order given, and the rest, which [`parse_args`] reads. It steps exactly as
+/// `parse_args` does: a flag that takes a value owns the word after it, a
+/// bool flag owns the next word only when that does not start with `-`, so
+/// `--download-path D:/m qwen3.8-flash-next` leaves the id for the caller
+/// and a bool flag directly before an id would claim it as its value.
+pub fn split_positionals(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let table = flag_table();
+    let (mut positionals, mut rest) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if !arg.starts_with('-') {
+            positionals.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        let owns_next = match arg.as_str() {
+            "--config" | "--profile" => true,
+            flag => match table.get(flag) {
+                Some(&(meta, _)) if meta.switch => args.get(i + 1).is_some_and(|next| !next.starts_with('-')),
+                Some(_) => true,
+                None => false,
+            },
+        };
+        rest.push(arg.clone());
+        if owns_next {
+            rest.extend(args.get(i + 1).cloned());
+            i += 1;
+        }
+        i += 1;
+    }
+    (positionals, rest)
+}
+
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, ConfigError> {
     *i += 1;
     args.get(*i).cloned().ok_or_else(|| ConfigError(format!("`{flag}` requires a value")))

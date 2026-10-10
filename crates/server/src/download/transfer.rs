@@ -388,7 +388,11 @@ pub(crate) fn part_path(path: &Path) -> PathBuf {
 
 /// Feed the `have` bytes already on disk through `hasher`, so a resumed
 /// transfer ends with the digest of the whole file rather than of its tail.
-async fn replay_into_hasher(part: &Path, have: u64, hasher: &mut Sha256) -> Result<(), DownloadError> {
+async fn replay_into_hasher(
+    part: &Path,
+    have: u64,
+    hasher: &mut Sha256,
+) -> Result<(), DownloadError> {
     let mut file = tokio::fs::File::open(part)
         .await
         .map_err(|err| DownloadError::new(format!("open {}: {err}", part.display())))?;

@@ -437,9 +437,6 @@ async fn a_switch_that_does_not_land_refuses_the_request_with_its_reason() {
     serves(&server).await;
 }
 
-/// The table a server starts with: the operator's entries and the model it
-/// started on, whose own id and artifact win over an entry naming the same
-/// id — a switch back reloads what was actually loaded.
 // ── the catalog's models (spec model-download/02 §Known models) ─────────────
 
 /// A catalog listing each of `ids` with its artifact `<id>.ninfer`, under a
@@ -512,6 +509,9 @@ async fn an_explicit_known_model_wins_and_switching_off_leaves_the_catalog_out()
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The table a server starts with: the operator's entries and the model it
+/// started on, whose own id and artifact win over an entry naming the same
+/// id — a switch back reloads what was actually loaded.
 #[test]
 fn the_model_the_server_starts_on_is_always_known() {
     let named = BTreeMap::from([

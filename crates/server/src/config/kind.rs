@@ -465,9 +465,10 @@ impl FieldKind for ApiKeyKind {
 /// A credential the server sends to someone else (`download.token`, spec
 /// model-download/02), kept as typed in an [`ApiKey`], whose `Debug` never
 /// shows it. Unlike [`ApiKeyKind`] no word is special: `auto` is a token
-/// like any other. Written back as typed — the one place that happens is a
-/// file the operator asked to have written; `GET /v1/config` and `config
-/// print` never show this kind's field.
+/// like any other. Written back as typed, in clear text, wherever the operator
+/// asked for a config to be written: a file, but also `config generate` to
+/// stdout and `--dry-run`, as for `server.api_key`; `GET /v1/config` and
+/// `config print` never show this kind's field.
 pub struct Token;
 
 impl FieldKind for Token {

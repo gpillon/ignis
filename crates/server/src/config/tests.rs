@@ -1811,9 +1811,17 @@ fn the_download_endpoint_token_and_catalog_are_declared_fields() {
     let from_file = expect_config(resolve_with(&args(&["--config", "c.yaml"]), no_env, &file).expect("resolve"));
     assert_eq!(from_file.download_endpoint, "https://mirror.example.com");
     assert_eq!(from_file.download_token.as_ref().map(ApiKey::as_str), Some("tok-file"));
-    for bad in ["ftp://mirror.example.com", "mirror.example.com", "https://"] {
+    for bad in ["ftp://mirror.example.com", "mirror.example.com", "https://", "ftp://user:hunter2@mirror.example.com"] {
         let err = refused(&["--download-endpoint", bad]);
         assert!(err.contains("--download-endpoint") && err.contains("http(s) URL"), "{bad}: {err}");
+        assert!(!err.contains("hunter2"), "{bad}: the refusal echoes the URL: {err}");
+    }
+    // A credential, a query or a fragment would reach `GET /v1/config`, `config
+    // print` and the logs: refused, and the refusal never repeats the secret.
+    for bad in ["https://user:hunter2@mirror.example.com", "https://hunter2@mirror.example.com", "https://:hunter2@mirror.example.com", "https://mirror.example.com/hf?token=hunter2", "https://mirror.example.com/hf#hunter2"] {
+        let err = refused(&["--download-endpoint", bad]);
+        assert!(err.contains("--download-endpoint") && err.contains("username, password, query or fragment"), "{bad}: {err}");
+        assert!(!err.contains("hunter2"), "{bad}: the refusal echoes the secret: {err}");
     }
 }
 

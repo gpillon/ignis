@@ -283,7 +283,7 @@ fn read_file(value: &Value) -> Result<CatalogFile, String> {
     let name = text(map, "name")?;
     if !plain_name(&name) {
         return Err(format!(
-            "`{name}` is not a plain file name (a path separator, `..` or an absolute path): a catalog never writes outside the destination directory"
+            "`{name}` is not a plain file name (letters, digits, `.`, `_` and `-`, not starting or ending with `.`, not a Windows device name): a catalog never writes outside the destination directory"
         ));
     }
     let bytes = match map.get("bytes") {
@@ -318,12 +318,24 @@ fn text(map: &Map<String, Value>, key: &str) -> Result<String, String> {
     }
 }
 
-/// A name that stays inside the directory it is joined to on every host:
-/// no separator of either kind (`\` is an ordinary character on Linux and a
-/// separator on Windows), no drive (`C:x` replaces the directory on
-/// Windows), and neither `.` nor `..`.
+/// A name that stays inside the directory it is joined to on every host. A
+/// security predicate lists the safe side, not the unsafe one: only letters,
+/// digits, `.`, `_` and `-` (so no separator of either kind, no drive, no
+/// control character, no space), neither starting nor ending with `.`
+/// (`.`, `..`, and the trailing dot Windows silently drops), and not a
+/// Windows device name (`CON`, `NUL`, `COM1`...), which Windows opens as the
+/// device whatever follows its first `.`.
 fn plain_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':', '\0'])
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+        "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split('.').next().unwrap_or(name);
+    !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !DEVICES.iter().any(|device| stem.eq_ignore_ascii_case(device))
 }
 
 #[cfg(test)]
@@ -510,6 +522,26 @@ mod tests {
             assert_ne!(text, OPERATOR);
             let err = operator(&text).expect_err(name).0;
             assert!(err.contains("not a plain file name") && err.contains("acme-qwen3.8-27b-ft") && err.contains(name), "{name}: {err}");
+        }
+    }
+
+    /// The allowlist behind AC 2: every built-in file name passes, the
+    /// shapes that escape a directory or name a Windows device do not.
+    #[test]
+    fn plain_name_is_an_allowlist() {
+        for entry in Catalog::built_in().entries() {
+            for file in &entry.files {
+                assert!(plain_name(&file.name), "{}", file.name);
+            }
+        }
+        for name in ["qwen3_8_27b_nvfp4full-v2.ninfer", "a.b.c", "x-1_2", "console.ninfer", "COM10", "LPT0"] {
+            assert!(plain_name(name), "{name}");
+        }
+        for name in [
+            "", ".", "..", "NUL", "nul", "con.ninfer", "Com1.tar.gz", "aux", "lpt9.x", "a.ninfer.", ".hidden", "a b", "a\tb", "a\u{7f}b", "../x", "/x", "C:x", "a/b", r"a\b",
+            "a*b", "a?b", "a<b", "a|b", "a\"b", "caf\u{e9}",
+        ] {
+            assert!(!plain_name(name), "{name:?}");
         }
     }
 

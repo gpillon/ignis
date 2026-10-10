@@ -1053,12 +1053,21 @@ fn derive_download(
     spelled: &impl Fn(&str, &str) -> String,
 ) -> Result<Option<PathBuf>, ConfigError> {
     let s = &resolution.settings.download;
+    // The endpoint is a visible field: it reaches `GET /v1/config`, `config
+    // print`, logs and errors, so a credential, a query or a fragment in it
+    // is refused, and the refusal never echoes the URL it refuses.
     let endpoint = reqwest::Url::parse(&s.endpoint).ok();
-    if !endpoint.is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host()) {
+    if !endpoint.as_ref().is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host()) {
         return Err(ConfigError(format!(
-            "`{} {}` must be an http(s) URL, such as the default {DEFAULT_DOWNLOAD_ENDPOINT}",
+            "`{}` must be an http(s) URL, such as the default {DEFAULT_DOWNLOAD_ENDPOINT}",
+            spelled("download", "endpoint")
+        )));
+    }
+    if endpoint.is_some_and(|url| !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some()) {
+        return Err(ConfigError(format!(
+            "`{}` must not carry a username, password, query or fragment: it is shown by `config print` and `GET /v1/config`; the token goes in `{}`",
             spelled("download", "endpoint"),
-            s.endpoint
+            spelled("download", "token")
         )));
     }
     let from_file = resolution

@@ -241,15 +241,16 @@ pub(super) fn model(args: &[String], env: &dyn Fn(&str) -> Option<String>, files
 /// `model download [<id>…] [--all] [--out <dir>] [field flags]`: each named
 /// entry, every entry with `--all`, or the configured `model.id` with
 /// neither, into `--out` or `download.path`, from `download.endpoint` with
-/// the token [`download::bearer_token`] picks. The ids come first, before
-/// any flag. `download.enabled` is not read: it gates only the start's own
+/// the token [`download::bearer_token`] picks. The ids may stand anywhere
+/// among the flags. `download.enabled` is not read: it gates only the start's own
 /// fetch, and this command is the operator's explicit yes.
 fn model_download(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &dyn Files) -> Result<ConfigOutcome, ConfigError> {
     let all = take_switch(args, "--all");
     let out = take_value(args, "--out")?.map(PathBuf::from);
-    let first_flag = args.iter().position(|arg| arg.starts_with('-')).unwrap_or(args.len());
+    let (named, flags) = super::source::split_positionals(args);
+    *args = flags;
     let mut ids: Vec<String> = Vec::new();
-    for id in args.drain(..first_flag) {
+    for id in named {
         if !ids.iter().any(|named| named.eq_ignore_ascii_case(&id)) {
             ids.push(id);
         }
@@ -577,6 +578,10 @@ mod tests {
         assert_eq!(ids, ALL_IDS);
         let (_, dir, ..) = download_of(run(&["model", "download", "qwen3.8-27b", "--download-path", "D:/m"], &[], &files).unwrap());
         assert_eq!(dir, PathBuf::from("D:/m"));
+        let (ids, dir, ..) = download_of(run(&["model", "download", "--download-path", "D:/m", "qwen3.8-flash-next"], &[], &files).unwrap());
+        assert_eq!((ids, dir), (vec!["qwen3.8-flash-next".to_owned()], PathBuf::from("D:/m")), "an id after a flag and its value");
+        let (ids, dir, ..) = download_of(run(&["model", "download", "qwen3.8-27b", "--out", "E:/c", "qwen3.8-flash-next", "--download-enabled", "false"], &[], &files).unwrap());
+        assert_eq!((ids, dir), (vec!["qwen3.8-27b".to_owned(), "qwen3.8-flash-next".to_owned()], PathBuf::from("E:/c")), "ids on both sides of a flag");
         let (_, dir, ..) = download_of(run(&["model", "download", "--out", "E:/carry", "--download-path", "D:/m"], &[("IGNIS_DOWNLOAD_PATH", "C:/x")], &files).unwrap());
         assert_eq!(dir, PathBuf::from("E:/carry"), "--out wins over download.path");
     }
