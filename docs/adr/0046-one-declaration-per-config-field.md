@@ -4,7 +4,12 @@
 
 Accepted (2026-10-10): decided in conversation with the owner while testing
 the runtime model switch (#305) against a real client. Spec:
-`docs/specs/config-v2/01-one-declaration-per-field.md`.
+`docs/specs/config-v2/01-one-declaration-per-field.md`. **Amended same day**
+by `docs/specs/config-v2/02-live-config-profiles-and-discovery.md`: the same
+one-declaration-per-field mechanism grows three more consumers (`GET`/`PATCH
+/v1/config`, hardware `--profile`s, config-file auto-discovery) and three
+new `FieldMeta` attributes (`visible`, `patchable`, `reload_required`) that
+drive them — no change to the core mechanism decided here.
 
 ## Context
 
