@@ -14,9 +14,11 @@ use std::time::Duration;
 use ignis_core::{DecodeParams, FinishReason, RequestClass, RequestInput};
 use ignis_logging::{JsonLayer, MemorySink};
 use ignis_server::engine::{collect_completion, Engine, EventStream};
+use ignis_server::config::file::Format;
+use ignis_server::download::catalog::parse_operator;
 use ignis_server::model_switch::{
-    begin, implicit_switch, known_models, ArtifactLoader, ImplicitRefusal, SwitchOutcome, SwitchRefusal, SwitchStarted,
-    Switcher,
+    begin, implicit_switch, known_models, ArtifactLoader, CatalogModels, ImplicitRefusal, SwitchOutcome, SwitchRefusal,
+    SwitchStarted, Switcher,
 };
 use ignis_server::{ActiveModel, ModelStatus, Server};
 use tracing_subscriber::layer::SubscriberExt;
@@ -438,6 +440,78 @@ async fn a_switch_that_does_not_land_refuses_the_request_with_its_reason() {
 /// The table a server starts with: the operator's entries and the model it
 /// started on, whose own id and artifact win over an entry naming the same
 /// id — a switch back reloads what was actually loaded.
+// ── the catalog's models (spec model-download/02 §Known models) ─────────────
+
+/// A catalog listing each of `ids` with its artifact `<id>.ninfer`, under a
+/// fresh directory of its own.
+fn catalog_models(tag: &str, ids: &[&str]) -> CatalogModels {
+    let dir = std::env::temp_dir().join(format!("ignis-switch-catalog-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let zeros = "0".repeat(64);
+    let entries: String = ids
+        .iter()
+        .map(|id| {
+            format!(
+                "  - id: {id}\n    repo: acme/{id}\n    revision: v1\n    artifact: {id}.ninfer\n    files:\n      - {{ name: {id}.ninfer.graft.json, bytes: 1, sha256: \"{zeros}\" }}\n      - {{ name: {id}.ninfer, bytes: 7, sha256: \"{zeros}\" }}\n"
+            )
+        })
+        .collect();
+    let catalog = parse_operator(&format!("models:\n{entries}"), Format::Yaml, "test").expect("a valid catalog");
+    CatalogModels { catalog: Arc::new(catalog), dir }
+}
+
+/// Spec model-download/02 AC 14: a catalog entry is switchable when its
+/// artifact is on disk **at the time of the request** — a download landing
+/// in a running server's directory needs no restart — and refused as an
+/// unknown model before, without a download.
+#[tokio::test]
+async fn a_catalog_entry_whose_artifact_is_on_disk_when_named_is_switchable() {
+    let loader = MockLoader::new();
+    let models = catalog_models("on-disk", &["mock-cat"]);
+    let artifact = models.dir.join("mock-cat.ninfer");
+    let server = Server::from_active(loader.model("mock-a"))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_known_models(known(&["mock-a"])).with_catalog(models, true));
+
+    assert_eq!(implicit_switch(&server, Some("mock-cat")).await, Ok(()));
+    assert!(loader.loads().is_empty(), "not on disk: nothing switches, the request's own check refuses it");
+    assert_eq!(server.active().engine.model_id(), "mock-a");
+
+    std::fs::write(&artifact, b"fetched").unwrap();
+    assert_eq!(implicit_switch(&server, Some("mock-cat")).await, Ok(()));
+    assert_eq!(server.active().engine.model_id(), "mock-cat");
+    assert_eq!(loader.prepared_artifacts(), [artifact.clone()], "loaded from the download directory");
+    assert!(!server.switcher.as_ref().unwrap().known_models().contains_key("mock-cat"), "derived, not added to the list");
+    let _ = std::fs::remove_dir_all(artifact.parent().unwrap());
+}
+
+/// AC 14: an explicit known-models entry wins for its id; with implicit
+/// switching off the catalog is not consulted, and a live change turning
+/// it on consults it again.
+#[tokio::test]
+async fn an_explicit_known_model_wins_and_switching_off_leaves_the_catalog_out() {
+    let loader = MockLoader::new();
+    let models = catalog_models("explicit", &["mock-b", "mock-cat"]);
+    for id in ["mock-b", "mock-cat"] {
+        std::fs::write(models.dir.join(format!("{id}.ninfer")), b"fetched").unwrap();
+    }
+    let dir = models.dir.clone();
+    let server = Server::from_active(loader.model("mock-a"))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_known_models(known(&["mock-a", "mock-b"])).with_catalog(models, false));
+
+    assert_eq!(implicit_switch(&server, Some("mock-b")).await, Ok(()));
+    assert_eq!(loader.prepared_artifacts(), [source("mock-b").artifact], "the operator's path, not the catalog's");
+
+    assert_eq!(implicit_switch(&server, Some("mock-cat")).await, Ok(()));
+    assert_eq!(loader.loads(), ["mock-b"], "implicit switching off: the catalog is not consulted");
+
+    let switcher = server.switcher.as_ref().unwrap();
+    switcher.set_knobs(PATIENT, switcher.known_models(), true);
+    assert_eq!(implicit_switch(&server, Some("mock-cat")).await, Ok(()));
+    assert_eq!(loader.loads(), ["mock-b", "mock-cat"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn the_model_the_server_starts_on_is_always_known() {
     let named = BTreeMap::from([

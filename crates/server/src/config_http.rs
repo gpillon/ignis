@@ -460,6 +460,21 @@ mod tests {
         }
     }
 
+    /// Spec model-download/02 AC 7: the download token is absent as the key
+    /// is, the endpoint beside it shown; and no download field can be
+    /// patched.
+    #[test]
+    fn the_download_token_is_absent_and_no_download_field_is_patchable() {
+        let config = config(&["--download-token", "hf_secret", "--download-endpoint", "https://mirror.example.com"]);
+        let document = visible_document(&config);
+        assert!(document["download"].get("token").is_none(), "{document}");
+        assert!(!document.to_string().contains("hf_secret"));
+        assert_eq!(document["download"]["endpoint"], "https://mirror.example.com");
+        let (code, message) = read_patch(&json!({ "download": { "token": "t", "endpoint": "https://x.example.com", "catalog": "c.yaml" } })).unwrap_err();
+        assert_eq!(code, "config_field_not_patchable");
+        assert!(["`download.token`", "`download.endpoint`", "`download.catalog`"].iter().all(|key| message.contains(key)), "{message}");
+    }
+
     /// Spec config-v2/02, Testing: a field declared with no `visible` is
     /// left out — pinned on a throwaway declaration, so no real field has to
     /// be hidden to prove the whitelist is closed by default.

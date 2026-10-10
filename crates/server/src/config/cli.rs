@@ -1,7 +1,8 @@
 //! The command line's verbs (spec config-v2/01 §The CLI surface,
-//! config-v2/02 §The CLI): `help`, `help --fields`, and `config generate` /
-//! `print` / `patch`. A bare invocation (`ignis-server --model-artifact …`)
-//! still serves; a verb is only ever the first word.
+//! config-v2/02 §The CLI, model-download/02): `help`, `help --fields`,
+//! `config generate` / `print` / `patch`, and `model download` / `list`. A
+//! bare invocation (`ignis-server --model-artifact …`) still serves; a verb is
+//! only ever the first word.
 //!
 //! Every verb takes the same field flags a start does, resolved by the same
 //! code ([`super::gather`]): only what is done with the result differs —
@@ -18,6 +19,7 @@ use super::file::{self, Files, Format};
 use super::schema::{all_fields, GROUPS};
 use super::source;
 use super::{gather, Config, ConfigError, ConfigOutcome, FileChoice};
+use crate::download::{self, ListFormat, ModelCommand};
 
 /// `help` and `help --fields [--format text|json]`.
 pub(super) fn help(args: &[String]) -> Result<ConfigOutcome, ConfigError> {
@@ -218,6 +220,73 @@ fn patch(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &d
         _ => contents,
     };
     Ok(ConfigOutcome::Write { contents, path: target })
+}
+
+/// `model download …` and `model list …` (spec model-download/02): the
+/// configuration a start would read and the catalog it would load, turned
+/// into what to do, for `main` to run. `model verify` and `model convert`
+/// are reserved, so any other word is an unknown command.
+pub(super) fn model(args: &[String], env: &dyn Fn(&str) -> Option<String>, files: &dyn Files) -> Result<ConfigOutcome, ConfigError> {
+    let Some((verb, rest)) = args.split_first() else {
+        return Err(ConfigError("`model` takes a command: download or list".to_owned()));
+    };
+    let mut rest = rest.to_vec();
+    match verb.as_str() {
+        "download" => model_download(&mut rest, env, files),
+        "list" => model_list(&mut rest, env, files),
+        other => Err(ConfigError(format!("unknown command `model {other}` (the model commands are download and list)"))),
+    }
+}
+
+/// `model download [<id>…] [--all] [--out <dir>] [field flags]`: each named
+/// entry, every entry with `--all`, or the configured `model.id` with
+/// neither, into `--out` or `download.path`, from `download.endpoint` with
+/// the token [`download::bearer_token`] picks. The ids come first, before
+/// any flag. `download.enabled` is not read: it gates only the start's own
+/// fetch, and this command is the operator's explicit yes.
+fn model_download(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &dyn Files) -> Result<ConfigOutcome, ConfigError> {
+    let all = take_switch(args, "--all");
+    let out = take_value(args, "--out")?.map(PathBuf::from);
+    let first_flag = args.iter().position(|arg| arg.starts_with('-')).unwrap_or(args.len());
+    let mut ids: Vec<String> = Vec::new();
+    for id in args.drain(..first_flag) {
+        if !ids.iter().any(|named| named.eq_ignore_ascii_case(&id)) {
+            ids.push(id);
+        }
+    }
+    let config = super::start_config(args, env, files)?;
+    let catalog = download::catalog::load(files, config.download_catalog.as_deref()).map_err(|err| ConfigError(err.0))?;
+    let lookup = |id: &str| {
+        catalog.entry(id).cloned().ok_or_else(|| {
+            ConfigError(format!("`{id}` is not in the catalog (the ids are {})", catalog.ids().join(", ")))
+        })
+    };
+    let entries = match (all, ids.as_slice()) {
+        (true, []) => catalog.entries().to_vec(),
+        (true, _) => return Err(ConfigError("`model download --all` fetches every entry: name ids or `--all`, not both".to_owned())),
+        (false, []) => vec![lookup(&config.model)?],
+        (false, ids) => ids.iter().map(|id| lookup(id)).collect::<Result<_, _>>()?,
+    };
+    let token = download::bearer_token(&config.download_endpoint, config.download_token.as_ref(), env("HF_TOKEN").as_deref());
+    Ok(ConfigOutcome::Model(ModelCommand::Download {
+        entries,
+        dir: out.unwrap_or_else(|| config.model_download_path.clone()),
+        endpoint: config.download_endpoint.clone(),
+        token,
+    }))
+}
+
+/// `model list [--format text|json] [field flags]`: every entry of the
+/// catalog a start would load, with its state under `download.path`.
+fn model_list(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &dyn Files) -> Result<ConfigOutcome, ConfigError> {
+    let format = match take_value(args, "--format")?.as_deref() {
+        None | Some("text") => ListFormat::Text,
+        Some("json") => ListFormat::Json,
+        Some(other) => return Err(ConfigError(format!("`model list --format {other}`: the formats are text and json"))),
+    };
+    let config = super::start_config(args, env, files)?;
+    let catalog = download::catalog::load(files, config.download_catalog.as_deref()).map_err(|err| ConfigError(err.0))?;
+    Ok(ConfigOutcome::Model(ModelCommand::List { catalog, dir: config.model_download_path.clone(), format }))
 }
 
 /// Where `config print` and `config patch` look with no `--file`: the first
@@ -477,6 +546,106 @@ mod tests {
         assert_eq!(yaml(&normalized)["reuse"]["kv_host_pool_bytes"], "2G", "a stale spelling is rewritten");
         let (_, from_env) = written(run(&["config", "patch", "--file", "s.yaml"], &[("IGNIS_SERVER_UI", "false")], &files).unwrap());
         assert_eq!(yaml(&from_env)["server"]["ui"], false, "the environment lands in the file");
+    }
+
+    /// What `model download` resolved to: the ids, the directory, the
+    /// endpoint and the token.
+    fn download_of(outcome: ConfigOutcome) -> (Vec<String>, PathBuf, String, Option<String>) {
+        match outcome {
+            ConfigOutcome::Model(ModelCommand::Download { entries, dir, endpoint, token }) => {
+                (entries.into_iter().map(|entry| entry.id).collect(), dir, endpoint, token.map(|token| token.as_str().to_owned()))
+            }
+            other => panic!("expected model download, got {other:?}"),
+        }
+    }
+
+    const ALL_IDS: [&str; 3] = ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next"];
+
+    /// Spec model-download/02 AC 12, the resolution half: the ids named, or
+    /// every entry, or the configured `model.id`; into `download.path` or
+    /// `--out`; `download.enabled` never read, so off changes nothing.
+    #[test]
+    fn model_download_takes_ids_all_or_the_configured_model() {
+        let files = MemFiles::default();
+        let (ids, dir, endpoint, token) = download_of(run(&["model", "download"], &[], &files).unwrap());
+        assert_eq!((ids, dir, endpoint, token), (vec!["qwen3.8-27b".to_owned()], PathBuf::from("./models"), "https://huggingface.co".to_owned(), None));
+        let (ids, ..) = download_of(run(&["model", "download", "--model-id", "qwen3.8-flash-next"], &[], &files).unwrap());
+        assert_eq!(ids, ["qwen3.8-flash-next"], "no id: the configured model");
+        let (ids, ..) = download_of(run(&["model", "download", "qwen3.8-flash-next", "QWEN3.8-27B", "qwen3.8-27b"], &[], &files).unwrap());
+        assert_eq!(ids, ["qwen3.8-flash-next", "qwen3.8-27b"], "in the order named, each once");
+        let (ids, ..) = download_of(run(&["model", "download", "--all", "--download-enabled", "false"], &[], &files).unwrap());
+        assert_eq!(ids, ALL_IDS);
+        let (_, dir, ..) = download_of(run(&["model", "download", "qwen3.8-27b", "--download-path", "D:/m"], &[], &files).unwrap());
+        assert_eq!(dir, PathBuf::from("D:/m"));
+        let (_, dir, ..) = download_of(run(&["model", "download", "--out", "E:/carry", "--download-path", "D:/m"], &[("IGNIS_DOWNLOAD_PATH", "C:/x")], &files).unwrap());
+        assert_eq!(dir, PathBuf::from("E:/carry"), "--out wins over download.path");
+    }
+
+    /// AC 12: an id outside the catalog fails naming the ones there are;
+    /// `--all` beside ids, and any `model` command but the two, are refused.
+    #[test]
+    fn model_download_refuses_an_unknown_id_naming_the_known_ones() {
+        let files = MemFiles::default();
+        let err = run(&["model", "download", "qwen3.8-27b", "qwen9"], &[], &files).unwrap_err().0;
+        assert!(err.contains("`qwen9`") && err.contains(&ALL_IDS.join(", ")), "{err}");
+        let err = run(&["model", "download", "--model-id", "custom"], &[], &files).unwrap_err().0;
+        assert!(err.contains("`custom`"), "{err}");
+        assert!(run(&["model", "download", "qwen3.8-27b", "--all"], &[], &files).unwrap_err().0.contains("not both"));
+        for verb in ["verify", "convert", "fetch"] {
+            let err = run(&["model", verb], &[], &files).unwrap_err().0;
+            assert!(err.contains(&format!("unknown command `model {verb}`")) && err.contains("download and list"), "{err}");
+        }
+        assert!(run(&["model"], &[], &files).unwrap_err().0.contains("download or list"));
+    }
+
+    /// AC 5, through the command line: the configured token wins, `HF_TOKEN`
+    /// reaches Hugging Face only.
+    #[test]
+    fn model_download_carries_the_token_the_rule_picks() {
+        let files = MemFiles::default();
+        let hf: &'static [(&str, &str)] = &[("HF_TOKEN", "hf_personal")];
+        assert_eq!(download_of(run(&["model", "download"], hf, &files).unwrap()).3.as_deref(), Some("hf_personal"));
+        let mirror = ["model", "download", "--download-endpoint", "https://mirror.example.com"];
+        assert_eq!(download_of(run(&mirror, hf, &files).unwrap()).3, None);
+        let configured = ["model", "download", "--download-endpoint", "https://mirror.example.com", "--download-token", "tok"];
+        let (_, _, endpoint, token) = download_of(run(&configured, hf, &files).unwrap());
+        assert_eq!((endpoint.as_str(), token.as_deref()), ("https://mirror.example.com", Some("tok")));
+    }
+
+    /// AC 2, 3 and 13 through the command line: an operator catalog a config
+    /// file names, beside it, joins the listing; one that cannot be read
+    /// refuses the command.
+    #[test]
+    fn model_list_reads_the_catalog_the_config_file_names_beside_it() {
+        let catalog = "models:\n  - id: acme-ft\n    repo: acme/ft\n    revision: v1\n    artifact: a.ninfer\n    files:\n      - { name: a.ninfer.graft.json, bytes: 1, sha256: 0000000000000000000000000000000000000000000000000000000000000001 }\n      - { name: a.ninfer, bytes: 2, sha256: 0000000000000000000000000000000000000000000000000000000000000002 }\n";
+        let files = MemFiles::with(&[("conf/ignis.config.yaml", "download:\n  catalog: acme.yaml\n  path: /srv/models\n"), ("conf/acme.yaml", catalog)]);
+        match run(&["model", "list", "--config", "conf/ignis.config.yaml", "--format", "json"], &[], &files).unwrap() {
+            ConfigOutcome::Model(ModelCommand::List { catalog, dir, format }) => {
+                assert_eq!(catalog.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "acme-ft"]);
+                assert_eq!((dir, format), (PathBuf::from("/srv/models"), ListFormat::Json));
+            }
+            other => panic!("{other:?}"),
+        }
+        let (ids, ..) = download_of(run(&["model", "download", "acme-ft", "--config", "conf/ignis.config.yaml"], &[], &files).unwrap());
+        assert_eq!(ids, ["acme-ft"]);
+        let missing = MemFiles::with(&[("conf/ignis.config.yaml", "download:\n  catalog: nowhere.yaml\n")]);
+        for argv in [&["model", "list", "--config", "conf/ignis.config.yaml"][..], &["model", "download", "--config", "conf/ignis.config.yaml"]] {
+            let err = run(argv, &[], &missing).unwrap_err().0;
+            assert!(err.contains("nowhere.yaml") && err.contains("download.catalog"), "{err}");
+        }
+        assert!(run(&["model", "list", "--format", "yaml"], &[], &files).unwrap_err().0.contains("text and json"));
+    }
+
+    /// Spec model-download/02 AC 7: `config print` shows the token as set,
+    /// never its value, from a flag or from the environment.
+    #[test]
+    fn print_never_shows_the_download_token() {
+        let files = MemFiles::default();
+        let text = printed(run(&["config", "print", "--download-token", "hf_secret_flag"], &[("IGNIS_DOWNLOAD_ENDPOINT", "https://m.example.com")], &files).unwrap());
+        assert!(!text.contains("hf_secret_flag") && text.contains("not shown"), "{text}");
+        assert_eq!(yaml(&text)["download"]["endpoint"], "https://m.example.com", "the endpoint is shown");
+        let text = printed(run(&["config", "print"], &[("IGNIS_DOWNLOAD_TOKEN", "hf_secret_env")], &files).unwrap());
+        assert!(!text.contains("hf_secret_env"), "{text}");
     }
 
     #[test]

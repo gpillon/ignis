@@ -44,6 +44,8 @@ struct State {
     /// The options each prepare was handed (spec config-v2/02: a reload
     /// with a changed config hands its patched config; a switch none).
     options: Mutex<Vec<Option<ignis_server::config::Config>>>,
+    /// The artifact each prepare was asked to load, in order.
+    artifacts: Mutex<Vec<std::path::PathBuf>>,
 }
 
 /// The mock loader. Clone the `Arc` into a `Switcher`, keep one to steer it.
@@ -110,6 +112,11 @@ impl MockLoader {
         resident(&self.state)
     }
 
+    /// The artifact each prepare was asked to load, in order.
+    pub fn prepared_artifacts(&self) -> Vec<std::path::PathBuf> {
+        self.state.artifacts.lock().unwrap().clone()
+    }
+
     /// The options each prepare was handed, in order.
     pub fn prepared_options(&self) -> Vec<Option<ignis_server::config::Config>> {
         self.state.options.lock().unwrap().clone()
@@ -131,6 +138,7 @@ fn build(state: &State, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
 impl ModelLoader for MockLoader {
     fn prepare(&self, target: &ModelSource, options: Option<&ignis_server::config::Config>) -> Result<Box<dyn PreparedLoad>, String> {
         self.state.options.lock().unwrap().push(options.cloned());
+        self.state.artifacts.lock().unwrap().push(target.artifact.clone());
         if self.state.refused.lock().unwrap().contains(&target.model) {
             return Err(format!("{} refused at prepare (simulated)", target.model));
         }

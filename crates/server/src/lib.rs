@@ -272,8 +272,9 @@ impl Server {
 
     /// Make `config`'s server-level values the ones requests read, without
     /// touching the model (spec config-v2/02): the live knobs, and the model
-    /// switch's drain window and known models. What a live `PATCH
-    /// /v1/config` applies, and what a reload applies once its model serves.
+    /// switch's drain window and known models (the catalog's among them, or
+    /// not, with implicit switching). What a live `PATCH /v1/config`
+    /// applies, and what a reload applies once its model serves.
     pub fn apply_config(&self, config: &config::Config) {
         self.live.store(std::sync::Arc::new(Live::of(config)));
         if let Some(switcher) = &self.switcher {
@@ -282,7 +283,7 @@ impl Server {
             } else {
                 Default::default()
             };
-            switcher.set_knobs(Duration::from_secs(u64::from(config.switch_drain_timeout_secs)), known);
+            switcher.set_knobs(Duration::from_secs(u64::from(config.switch_drain_timeout_secs)), known, config.allow_model_switch);
         }
     }
 

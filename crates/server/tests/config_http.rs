@@ -278,6 +278,45 @@ async fn a_known_models_patch_reaches_the_switcher_and_keeps_the_listed_ones() {
     assert_eq!(document["switch"]["known_models"], json!({ "mock-b": "mock-b.ninfer", "mock-c": "mock-c.ninfer" }));
 }
 
+/// Spec model-download/02 AC 14: a catalog entry on disk is switchable, and
+/// stays so across a live change — but it is derived, never the operator's
+/// list: a `known_models` patch writes the listed models and the patch's to
+/// the config file, and no catalog id.
+#[tokio::test]
+async fn a_known_models_patch_never_writes_a_catalog_model_to_the_config_file() {
+    let path = config_file("catalog-known", "switch:\n  known_models:\n    mock-b: mock-b.ninfer\n");
+    let dir = path.parent().unwrap().join("models");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("mock-cat.ninfer"), b"on disk").unwrap();
+    let zeros = "0".repeat(64);
+    let catalog = ignis_server::download::catalog::parse_operator(
+        &format!("models:\n  - id: mock-cat\n    repo: acme/cat\n    revision: v1\n    artifact: mock-cat.ninfer\n    files:\n      - {{ name: mock-cat.ninfer.graft.json, bytes: 1, sha256: \"{zeros}\" }}\n      - {{ name: mock-cat.ninfer, bytes: 7, sha256: \"{zeros}\" }}\n"),
+        Format::Yaml,
+        "test",
+    )
+    .unwrap();
+    let loader = MockLoader::new();
+    let config = started(&["--config", path.to_str().unwrap()]);
+    let catalog = ignis_server::model_switch::CatalogModels { catalog: Arc::new(catalog), dir };
+    let server = Server::from_active(loader.model("mock-a"))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_catalog(catalog, true))
+        .with_config(Arc::new(ConfigState::new(config.clone(), Arc::new(RealFiles))));
+    server.apply_config(&config);
+    let app = server.app();
+
+    let body = json!({ "switch": { "known_models": { "mock-c": "mock-c.ninfer" } } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(read_yaml(&path)["switch"]["known_models"], json!({ "mock-b": "mock-b.ninfer", "mock-c": "mock-c.ninfer" }));
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("mock-cat"));
+    let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
+    assert!(!document.to_string().contains("mock-cat"), "{document}");
+    assert!(!server.switcher.as_ref().unwrap().known_models().contains_key("mock-cat"));
+
+    assert_eq!(ignis_server::model_switch::implicit_switch(&server, Some("mock-cat")).await, Ok(()));
+    assert_eq!(loader.loads(), ["mock-cat"], "still switchable after the live change");
+}
+
 /// A live change to the thinking defaults is judged by the loaded template
 /// as a start's would be (spec server/08): a default it cannot honour, or a
 /// budget with no forced close, is refused and nothing applied.
