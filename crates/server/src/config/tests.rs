@@ -68,8 +68,10 @@ fn with_files(flags: &[&str], env: impl Fn(&str) -> Option<String>, files: &MemF
 /// names fields only one of them has (at their defaults).
 #[test]
 fn a_file_of_every_default_reads_back_to_the_defaults_in_both_formats() {
-    let defaults = config(&[]);
-    let document = serde_json::Value::Object(defaults.settings().render());
+    let defaults = config(&["--profile", "none"]);
+    let mut document = defaults.settings().render();
+    document.insert("profile".to_owned(), serde_json::Value::String("none".into()));
+    let document = serde_json::Value::Object(document);
     for (name, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
         let files = MemFiles::with(&[(name, &format.write(&document))]);
         let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1276,7 +1278,7 @@ fn help_lists_the_speculation_flags() {
 
 #[test]
 fn rope_scaling_is_off_by_default() {
-    let config = config(&[]);
+    let config = config(&["--profile", "none"]);
     assert_eq!(config.rope_scaling, RopeScaling::NONE);
     assert!(!config.rope_scaling.is_yarn());
 }
@@ -1337,7 +1339,7 @@ fn max_context_past_the_gqa_envelope_is_refused_for_the_27b_only() {
 /// GitHub #306: `--spec-decode-lanes` is Flash-Next's, 1 to the engine's 8.
 #[test]
 fn decode_lanes_parse_bound_and_refuse_the_27b() {
-    assert_eq!(config(&[]).decode_lanes, None);
+    assert_eq!(config(&["--profile", "none"]).decode_lanes, None);
     let flag = config(&["--spec-decode-lanes", "1"]);
     assert_eq!(flag.decode_lanes, Some(1));
     let env = expect_config(resolve(&[], env_map(&[("IGNIS_SPEC_DECODE_LANES", "8")])).expect("resolve"));
@@ -1426,6 +1428,8 @@ fn a_served_id_naming_the_other_model_is_refused_at_start() {
 #[test]
 fn each_family_keeps_its_own_resource_shape() {
     let config = config(&[
+        "--profile",
+        "none",
         "--reuse-kv-host-pool-bytes",
         "8G",
         "--qwen38flashnext-reuse-kv-host-pool-bytes",
@@ -1560,7 +1564,7 @@ fn a_patch_from_before_a_switch_never_refuses_a_later_one() {
 
 #[test]
 fn vision_is_off_by_default() {
-    assert_eq!(config(&[]).vision, None);
+    assert_eq!(config(&["--profile", "none"]).vision, None);
 }
 
 #[test]
@@ -1577,8 +1581,11 @@ fn the_vision_envelope_can_be_lowered() {
 
 #[test]
 fn a_vision_envelope_without_vision_is_refused_rather_than_ignored() {
-    assert!(refused(&["--vision-max-tokens", "8192"]).contains("--vision-enabled"));
-    assert!(resolve(&[], env_map(&[("IGNIS_VISION_MAX_TOKENS", "8192")])).is_err(), "the env form too");
+    assert!(refused(&["--profile", "none", "--vision-max-tokens", "8192"]).contains("--vision-enabled"));
+    assert!(
+        resolve(&args(&["--profile", "none"]), env_map(&[("IGNIS_VISION_MAX_TOKENS", "8192")])).is_err(),
+        "the env form too"
+    );
 }
 
 #[test]
@@ -1609,8 +1616,11 @@ fn an_embedding_pool_below_the_envelope_is_raised_not_refused() {
 
 #[test]
 fn an_embedding_pool_without_vision_is_refused_rather_than_ignored() {
-    assert!(refused(&["--vision-embedding-pool-mib", "640"]).contains("--vision-enabled"));
-    assert!(resolve(&[], env_map(&[("IGNIS_VISION_EMBEDDING_POOL_MIB", "640")])).is_err(), "the env form too");
+    assert!(refused(&["--profile", "none", "--vision-embedding-pool-mib", "640"]).contains("--vision-enabled"));
+    assert!(
+        resolve(&args(&["--profile", "none"]), env_map(&[("IGNIS_VISION_EMBEDDING_POOL_MIB", "640")])).is_err(),
+        "the env form too"
+    );
 }
 
 #[test]
@@ -1653,15 +1663,15 @@ fn help_lists_the_vision_flags() {
 /// GitHub #195: the two are independent load options again.
 #[test]
 fn vision_and_dflash2_resolve_together_as_two_independent_load_options() {
-    let both = config(&["--vision-enabled", "--spec-backend", "dflash2", "--spec-draft-tokens", "4"]);
+    let both = config(&["--profile", "none", "--vision-enabled", "--spec-backend", "dflash2", "--spec-draft-tokens", "4"]);
     assert_eq!(both.vision, Some(Vision::default()));
     assert_eq!(both.speculation, Speculation::new(SpeculativeBackend::Dflash2, 4).ok());
     let env = env_map(&[("IGNIS_VISION_ENABLED", "true"), ("IGNIS_SPEC_BACKEND", "dflash2"), ("IGNIS_SPEC_DRAFT_TOKENS", "4")]);
-    let from_env = expect_config(resolve(&[], env).expect("the env form too"));
+    let from_env = expect_config(resolve(&args(&["--profile", "none"]), env).expect("the env form too"));
     assert_eq!((from_env.vision, from_env.speculation), (both.vision, both.speculation));
-    let vision_only = config(&["--vision-enabled"]);
+    let vision_only = config(&["--profile", "none", "--vision-enabled"]);
     assert_eq!((vision_only.vision, vision_only.speculation), (both.vision, None));
-    let spec_only = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "4"]);
+    let spec_only = config(&["--profile", "none", "--spec-backend", "dflash2", "--spec-draft-tokens", "4"]);
     assert_eq!((spec_only.vision, spec_only.speculation), (None, both.speculation));
 }
 
@@ -1685,7 +1695,9 @@ fn media_flags_set_the_private_network_opt_in_and_the_cache() {
 #[test]
 fn media_flags_without_vision_are_refused_rather_than_ignored() {
     for a in [&["--media-allow-private-network"][..], &["--media-cache-mib", "10"]] {
-        let err = refused(a);
+        let mut flags = vec!["--profile", "none"];
+        flags.extend_from_slice(a);
+        let err = refused(&flags);
         assert!(err.contains(a[0]) && err.contains("--vision-enabled"), "{err}");
     }
 }

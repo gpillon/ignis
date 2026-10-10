@@ -456,7 +456,14 @@ mod tests {
         assert!(!document.to_string().contains("sk-secret"));
         assert_eq!(document["server"]["bind"], "127.0.0.1:7777");
         for meta in all_fields() {
-            assert_eq!(document[meta.group].get(meta.name).is_some(), meta.visible, "{}", meta.file_key());
+            // A field only one family takes lives in that family's own
+            // section, never the general one (GitHub #311's family-section
+            // fix, also `effective_document`'s).
+            let present = match meta.home_family() {
+                Some(family) => document[meta.group].get(scope(family)).and_then(|s| s.get(meta.name)).is_some(),
+                None => document[meta.group].get(meta.name).is_some(),
+            };
+            assert_eq!(present, meta.visible, "{}", meta.file_key());
         }
     }
 

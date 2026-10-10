@@ -652,7 +652,11 @@ pub(crate) fn gather(
         .or_else(|| env(PROFILE_ENV).filter(|name| !name.is_empty()))
         .or(document.profile)
         .unwrap_or_else(|| profile::DEFAULT_PROFILE.to_owned());
-    let profile = profile::lookup(&profile_name, &document.profiles)?;
+    let profile = if profile_name == profile::NONE_PROFILE {
+        source::Layer::default()
+    } else {
+        profile::lookup(&profile_name, &document.profiles)?
+    };
     let sources = Sources {
         patch: source::Layer::default(),
         flags: parsed.flags,

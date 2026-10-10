@@ -264,6 +264,7 @@ fn take_switch(args: &mut Vec<String>, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::field::scope;
     use crate::config::file::testing::MemFiles;
     use crate::config::resolve_with;
     use ignis_core::compute::ModelFamily;
@@ -348,7 +349,16 @@ mod tests {
             }
             let document = Format::of_path(&path).unwrap().read(&contents).unwrap();
             for meta in all_fields() {
-                assert!(document[meta.group].get(meta.name).is_some(), "{name} writes {}", meta.file_key());
+                // A field only one family takes is never written at the
+                // general scope (GitHub #311's family-section fix, now also
+                // `effective_document`'s): it lives in that family's own
+                // section instead, the one place a start of the other
+                // family never reads.
+                let written = match meta.home_family() {
+                    Some(family) => document[meta.group].get(scope(family)).and_then(|s| s.get(meta.name)),
+                    None => document[meta.group].get(meta.name),
+                };
+                assert!(written.is_some(), "{name} writes {}", meta.file_key());
             }
         }
     }
@@ -484,7 +494,7 @@ mod tests {
         let files = MemFiles::with(&[("c.yaml", "server:\n  request_timeout: 77\n")]);
         let err = run(&["config", "patch", "--file", "c.yaml", "--model-prefill-chunk", "1000"], &[], &files).unwrap_err().0;
         assert!(err.contains("128"), "{err}");
-        let files = MemFiles::with(&[("c.yaml", "vision:\n  max_tokens: 8192\n")]);
+        let files = MemFiles::with(&[("c.yaml", "profile: none\nvision:\n  max_tokens: 8192\n")]);
         assert!(run(&["config", "patch", "--file", "c.yaml"], &[], &files).unwrap_err().0.contains("--vision-enabled"));
     }
 }

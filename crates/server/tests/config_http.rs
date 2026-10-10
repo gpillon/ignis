@@ -195,7 +195,7 @@ async fn a_patch_with_one_reload_field_reloads_with_the_whole_patch() {
 async fn a_patch_naming_an_unpatchable_field_applies_nothing() {
     let path = config_file("unpatchable", "server:\n  request_timeout: 30\n");
     let loader = MockLoader::new();
-    let server = server_on(&loader, started(&["--config", path.to_str().unwrap()]));
+    let server = server_on(&loader, started(&["--config", path.to_str().unwrap(), "--profile", "none"]));
     let app = server.app();
     let before = std::fs::read_to_string(&path).unwrap();
     for body in [
