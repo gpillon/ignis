@@ -29,6 +29,7 @@ use std::sync::Arc;
 use crate::instruction::InstructionPolicy;
 use crate::thinking::ReasoningEffort;
 
+pub mod cli;
 pub mod field;
 pub mod file;
 pub mod kind;
@@ -486,13 +487,20 @@ impl std::fmt::Debug for ApiKey {
     }
 }
 
-/// What [`resolve`] produced: a runnable config, or text to print before
-/// exiting — `resolve` never prints or exits itself; that stays in `main`.
+/// What [`resolve`] produced: a runnable config, or what to do instead of
+/// serving — print text, or write a file (`config generate` / `patch`) —
+/// before exiting. `resolve` never prints, writes or exits itself; that
+/// stays in `main`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigOutcome {
     Config(Config),
     Help(String),
     Version(String),
+    /// Text for stdout (`help --fields`, `config print`, `config generate`
+    /// to stdout or `--dry-run`).
+    Print(String),
+    /// A config file to write (`config generate --out`, `config patch`).
+    Write { path: PathBuf, contents: String },
 }
 
 /// A configuration the server refuses: an unrecognized flag, a value that
@@ -521,8 +529,12 @@ pub const CONFIG_ENV: &str = "IGNIS_CONFIG";
 
 /// Resolve the command line against `env` and `files`.
 ///
-/// `--help`/`-h` and `--version`/`-V` short-circuit before any other flag is
-/// parsed or validated — `ignis-server --help --nonsense` just prints help.
+/// A first word that is not a flag is a verb (`help`, `version`, `config
+/// generate|print|patch`, [`cli`]); otherwise the server starts — the bare
+/// invocation is unchanged, so `make start`'s command line needs no leading
+/// word. `--help`/`-h` and `--version`/`-V` short-circuit before any other
+/// flag is parsed or validated — `ignis-server --help --nonsense` just
+/// prints help.
 ///
 /// Every family-scoped value is resolved here too, for each family, so a
 /// mistake in one (`--qwen38flashnext-model-max-context lots`) is refused at
@@ -534,6 +546,17 @@ pub fn resolve_with(
     env: impl Fn(&str) -> Option<String>,
     files: &dyn file::Files,
 ) -> Result<ConfigOutcome, ConfigError> {
+    match args.first().map(String::as_str) {
+        Some("help") => return cli::help(&args[1..]),
+        Some("version") => return Ok(ConfigOutcome::Version(version_text())),
+        Some("config") => return cli::config(&args[1..], &env, files),
+        Some(word) if !word.starts_with('-') => {
+            return Err(ConfigError(format!(
+                "unknown command `{word}` (the commands are help, version and config; with none, the server starts)"
+            )));
+        }
+        _ => {}
+    }
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ConfigOutcome::Help(help_text())),
@@ -559,6 +582,11 @@ pub(crate) enum FileChoice {
     /// The one `--config` / `IGNIS_CONFIG` named: it must exist — an
     /// operator who named a file meant it to.
     Explicit(PathBuf),
+    /// This one if it exists (`config print`).
+    IfPresent(PathBuf),
+    /// This one, which must exist (`config patch`, which changes a file and
+    /// does not make one).
+    Required(PathBuf),
 }
 
 /// Gather every source of a resolution: the flags parsed, the environment,
@@ -573,6 +601,22 @@ pub(crate) fn gather(
     let (file_source, loaded) = match choice {
         FileChoice::None => (FileSource::None, None),
         FileChoice::Explicit(path) => {
+            let loaded = file::load(files, &path)?;
+            (FileSource::Explicit(path), Some(loaded))
+        }
+        FileChoice::IfPresent(path) if files.exists(&path) => {
+            let loaded = file::load(files, &path)?;
+            (FileSource::Explicit(path), Some(loaded))
+        }
+        FileChoice::IfPresent(_) => (FileSource::None, None),
+        FileChoice::Required(path) => {
+            if !files.exists(&path) {
+                return Err(ConfigError(format!(
+                    "no config file at {}: `config patch` changes a file; `config generate --out {}` makes one",
+                    path.display(),
+                    path.display()
+                )));
+            }
             let loaded = file::load(files, &path)?;
             (FileSource::Explicit(path), Some(loaded))
         }
@@ -1038,6 +1082,11 @@ pub fn help_text() -> String {
         "ignis-server: the OpenAI-compatible HTTP entrypoint\n\
          \n\
          USAGE:\n    ignis-server [--config <path>] [--profile <name>] [FIELD FLAGS]\n\
+         \x20   ignis-server help [--fields [--format text|json]]\n\
+         \x20   ignis-server version\n\
+         \x20   ignis-server config generate [--format json|yaml] [--out <path>] [--force] [--dry-run] [FIELD FLAGS]\n\
+         \x20   ignis-server config print [--file <path>] [--format json|yaml] [FIELD FLAGS]\n\
+         \x20   ignis-server config patch [--file <path>] [--out <path>] [FIELD FLAGS]\n\
          \n\
          Every field has a flag (--<group>-<field>), an env var (IGNIS_<GROUP>_<FIELD>)\n\
          and a config-file key (<group>.<field>). A flag overrides its env var, which\n\

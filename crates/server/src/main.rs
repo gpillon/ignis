@@ -265,10 +265,22 @@ async fn main() {
             println!("{text}");
             std::process::exit(0);
         }
-        Ok(ConfigOutcome::Version(text)) => {
-            println!("{text}");
+        Ok(ConfigOutcome::Version(text)) | Ok(ConfigOutcome::Print(text)) => {
+            print!("{}", if text.ends_with('\n') { text } else { format!("{text}\n") });
             std::process::exit(0);
         }
+        // `config generate --out` / `config patch` (spec config-v2/02): the
+        // one place a config file is written, resolution having checked it.
+        Ok(ConfigOutcome::Write { path, contents }) => match std::fs::write(&path, contents) {
+            Ok(()) => {
+                println!("ignis-server: wrote {}", path.display());
+                std::process::exit(0);
+            }
+            Err(err) => {
+                tracing::error!(name: "ignis.config.write_failed", path = %path.display(), error = %err, "config file not written");
+                exit_after_flush(&logging_handle, 1);
+            }
+        },
         Err(err) => {
             tracing::error!(name: "ignis.config.invalid", error = %err, "refusing to start");
             exit_after_flush(&logging_handle, 1);
