@@ -270,6 +270,13 @@ pub(crate) mod ffi {
         pub fn ignis_media_embedding_release(embedding: *mut IgnisMediaEmbedding);
 
         pub fn ignis_media_last_error() -> *const c_char;
+
+        /// PROTOTYPE #409 (throwaway): an embedding's columns copied out.
+        pub fn ignis_proto_media_embedding_read(
+            embedding: *const IgnisMediaEmbedding,
+            out: *mut u16,
+            out_bytes: u64,
+        ) -> i32;
     }
 }
 
@@ -1616,6 +1623,19 @@ impl MediaEmbedding<'_> {
     /// The embedding's merged columns.
     pub fn columns(&self) -> u32 {
         unsafe { ffi::ignis_media_embedding_columns(self.handle) }
+    }
+
+    /// PROTOTYPE #409 (throwaway): the embedding's `[hidden, columns]` BF16
+    /// bits, in column order, read back from wherever the pool lives.
+    pub fn proto_read(&self, hidden: usize) -> Result<Vec<u16>, String> {
+        let mut out = vec![0u16; self.columns() as usize * hidden];
+        let rc = unsafe {
+            ffi::ignis_proto_media_embedding_read(self.handle, out.as_mut_ptr(), (out.len() * 2) as u64)
+        };
+        if rc != 0 {
+            return Err(media_last_error());
+        }
+        Ok(out)
     }
 
     /// Detach the embedding from its model's borrow.

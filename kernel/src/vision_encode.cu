@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -156,6 +157,177 @@ void copy_host(const void *src, ninfer::Tensor &dst, cudaStream_t stream, const 
   }
 }
 
+// ---------------------------------------------------------------------------
+// PROTOTYPE #409 (throwaway, branch prototype/409-vision-host): the tower in
+// mapped pinned host memory, staged into the prefill scratch for each encode.
+// ---------------------------------------------------------------------------
+
+// Each tensor's span in the host-mapped allocation is 4 KiB aligned at both
+// ends (the binder's direct-I/O spans), so a run of a stage's tensors spans at
+// most its payloads plus this much per tensor; the 256 is the run's own
+// alignment in its slot.
+constexpr std::size_t kProtoSpanSlack = 2 * 4096 + 256;
+constexpr std::size_t kProtoAlign = 256;
+
+std::size_t proto_align_up(std::size_t x, std::size_t a) {
+  return (x + a - 1) / a * a;
+}
+
+// The tower's weights in staging order: H1b's 30 stages -- the pre-block
+// weights, the 27 blocks, the merger's norm and fc1, its fc2 -- or H1a's one.
+template <class W, class F> void proto_visit_stages(W &w, bool whole, F visit) {
+  const auto s = [&](std::size_t stage) { return whole ? std::size_t{0} : stage; };
+  visit(s(0), w.patch_embedding);
+  visit(s(0), w.patch_embedding_bias);
+  visit(s(0), w.position_embedding);
+  for (std::size_t b = 0; b < w.layers.size(); ++b) {
+    auto &l = w.layers[b];
+    for (auto *p : {&l.qkv, &l.qkv_bias, &l.output, &l.output_bias, &l.fc1, &l.fc1_bias, &l.fc2,
+                    &l.fc2_bias, &l.norm1_weight, &l.norm1_bias, &l.norm2_weight, &l.norm2_bias}) {
+      visit(s(1 + b), *p);
+    }
+  }
+  const std::size_t merger_a = 1 + w.layers.size();
+  visit(s(merger_a), w.merger_norm_weight);
+  visit(s(merger_a), w.merger_norm_bias);
+  visit(s(merger_a), w.merger_fc1);
+  visit(s(merger_a), w.merger_fc1_bias);
+  visit(s(merger_a + 1), w.merger_fc2);
+  visit(s(merger_a + 1), w.merger_fc2_bias);
+}
+
+constexpr std::size_t kProtoStages = 1 + kVisionLayers + 2;
+
+// One contiguous host range of a stage, and where it lands in the stage's slot.
+struct ProtoRun {
+  const unsigned char *lo = nullptr;
+  std::size_t bytes = 0;
+  std::size_t dst_offset = 0;
+};
+
+struct ProtoStagePlan {
+  unsigned char *dst = nullptr;
+  std::vector<ProtoRun> runs;
+  std::size_t bytes = 0;
+};
+
+// Plan one stage's copy into `dst` and rebase its weights there: its tensors
+// sorted by host address, merged into runs where only span padding separates
+// them, each run copied whole so every tensor keeps its offset (mod 256).
+ProtoStagePlan proto_plan_stage(std::vector<ninfer::Weight *> &weights, unsigned char *dst) {
+  for (ninfer::Weight *w : weights) {
+    const auto *lo = static_cast<const unsigned char *>(w->payload);
+    const auto *hi = lo + w->payload_bytes;
+    if (lo == nullptr || w->qdata != w->payload) {
+      throw std::runtime_error("prototype staging: a tower tensor whose qdata is not its payload");
+    }
+    for (const void *p : {w->qhigh, w->scales}) {
+      const auto *q = static_cast<const unsigned char *>(p);
+      if (q != nullptr && (q < lo || q >= hi)) {
+        throw std::runtime_error("prototype staging: a tower tensor's plane lies outside its payload");
+      }
+    }
+  }
+  std::sort(weights.begin(), weights.end(),
+            [](const ninfer::Weight *a, const ninfer::Weight *b) { return a->payload < b->payload; });
+  ProtoStagePlan plan;
+  plan.dst = dst;
+  std::vector<std::pair<std::size_t, std::size_t>> members;  // (first weight, count) per run
+  for (std::size_t i = 0; i < weights.size(); ++i) {
+    const auto *lo = static_cast<const unsigned char *>(weights[i]->payload);
+    const auto *hi = lo + weights[i]->payload_bytes;
+    if (!plan.runs.empty()) {
+      ProtoRun &run = plan.runs.back();
+      const unsigned char *end = run.lo + run.bytes;
+      if (lo >= end && static_cast<std::size_t>(lo - end) < kProtoSpanSlack) {
+        run.bytes = static_cast<std::size_t>(hi - run.lo);
+        ++members.back().second;
+        continue;
+      }
+    }
+    const auto *aligned_lo = reinterpret_cast<const unsigned char *>(
+        reinterpret_cast<std::uintptr_t>(lo) & ~static_cast<std::uintptr_t>(kProtoAlign - 1));
+    plan.runs.push_back({aligned_lo, static_cast<std::size_t>(hi - aligned_lo), 0});
+    members.emplace_back(i, 1);
+  }
+  std::size_t cursor = 0;
+  for (std::size_t r = 0; r < plan.runs.size(); ++r) {
+    ProtoRun &run = plan.runs[r];
+    run.dst_offset = proto_align_up(cursor, kProtoAlign);
+    cursor = run.dst_offset + run.bytes;
+    unsigned char *base = dst + run.dst_offset;
+    const auto rebase = [&](const void *p) -> const void * {
+      return p == nullptr ? nullptr : base + (static_cast<const unsigned char *>(p) - run.lo);
+    };
+    for (std::size_t k = 0; k < members[r].second; ++k) {
+      ninfer::Weight *w = weights[members[r].first + k];
+      w->qhigh = rebase(w->qhigh);
+      w->scales = rebase(w->scales);
+      w->qdata = rebase(w->qdata);
+      w->payload = rebase(w->payload);
+    }
+  }
+  plan.bytes = cursor;
+  return plan;
+}
+
+void proto_check(cudaError_t err, const char *what) {
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("prototype staging: ") + what + ": " + cudaGetErrorString(err));
+  }
+}
+
+void proto_copy_stage(const ProtoStagePlan &plan, cudaStream_t stream) {
+  for (const ProtoRun &run : plan.runs) {
+    proto_check(cudaMemcpyAsync(plan.dst + run.dst_offset, run.lo, run.bytes, cudaMemcpyDefault, stream),
+                "cudaMemcpyAsync(tower stage)");
+  }
+}
+
+// The encode's side of the staging: H1a copies the whole tower on the model's
+// stream before the first op; H1b copies stage s+1 into slot (s+1)%2 on the
+// copy stream while stage s computes from slot s%2, synchronized by events.
+struct ProtoStager {
+  bool whole = false;
+  cudaStream_t copy = nullptr;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t copied[2] = {nullptr, nullptr};
+  cudaEvent_t consumed[2] = {nullptr, nullptr};
+  std::vector<ProtoStagePlan> plans;
+
+  void begin(cudaStream_t stream) {
+    if (whole) {
+      proto_copy_stage(plans[0], stream);
+      return;
+    }
+    // Nothing may land in the scratch before the work already queued on it.
+    proto_check(cudaEventRecord(start, stream), "record start");
+    proto_check(cudaStreamWaitEvent(copy, start, 0), "wait start");
+    for (std::size_t s = 0; s < 2; ++s) {
+      proto_copy_stage(plans[s], copy);
+      proto_check(cudaEventRecord(copied[s], copy), "record copied");
+    }
+  }
+  void before(std::size_t stage, cudaStream_t stream) {
+    if (whole) {
+      return;
+    }
+    const std::size_t next = stage + 1;
+    if (stage >= 1 && next < plans.size()) {
+      // Slot next%2 was last read by stage next-2 = stage-1.
+      proto_check(cudaStreamWaitEvent(copy, consumed[next % 2], 0), "wait consumed");
+      proto_copy_stage(plans[next], copy);
+      proto_check(cudaEventRecord(copied[next % 2], copy), "record copied");
+    }
+    proto_check(cudaStreamWaitEvent(stream, copied[stage % 2], 0), "wait copied");
+  }
+  void after(std::size_t stage, cudaStream_t stream) {
+    if (!whole) {
+      proto_check(cudaEventRecord(consumed[stage % 2], stream), "record consumed");
+    }
+  }
+};
+
 // A merger: the tower's, whose LayerNorm runs over the hidden before the
 // 2x2 view, or a DeepStack one (GitHub #320), whose LayerNorm runs over the
 // merged width after it (transformers' `use_postshuffle_norm`).
@@ -224,7 +396,22 @@ ninfer::Tensor merger_hidden(ninfer::Tensor &x, const VisionMergerWeights &m, bo
 // `layout` places them (VisionContext::encode).
 void encode(const VisionWeights &w, const VisionEncodeCall &call,
             const VisionWorkspaceLayout &layout, const ninfer::DeviceSpan &backing,
-            std::int32_t patches, std::int32_t tokens, cudaStream_t stream) {
+            std::int32_t patches, std::int32_t tokens, cudaStream_t stream,
+            ProtoStager *stager = nullptr) {
+  // PROTOTYPE #409: the staged tower's copies, around each stage's ops.
+  const auto before = [&](std::size_t stage) {
+    if (stager != nullptr) {
+      stager->before(stage, stream);
+    }
+  };
+  const auto after = [&](std::size_t stage) {
+    if (stager != nullptr) {
+      stager->after(stage, stream);
+    }
+  };
+  if (stager != nullptr) {
+    stager->begin(stream);
+  }
   ninfer::Tensor position_ids = layout.position_ids.bind(backing);
   ninfer::Tensor cu_seqlens = layout.cu_seqlens.bind(backing);
   ninfer::Tensor pos_indices = layout.pos_indices.bind(backing);
@@ -237,6 +424,7 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
   ninfer::Tensor x = layout.x.bind(backing);
   ninfer::Tensor patch_bf16 = layout.patch_bf16.bind(backing);
   copy_host(call.patches, patch_bf16, stream, "patches");
+  before(0);
   ninfer::ops::linear(patch_bf16, w.patch_embedding, x, stream);
   ninfer::ops::add_bias(bf16_vector(w.patch_embedding_bias, kVisionHidden), x, stream);
   // The artifact's table is [rows, hidden] row-major, which is the tensor
@@ -245,11 +433,13 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
                                       ninfer::DType::BF16,
                                       {kVisionHidden, kVisionPositionEmbeddings});
   ninfer::ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+  after(0);
 
   static const ninfer::ops::RopeFrequencies frequencies =
       ninfer::ops::rope_vision_frequencies(kVisionRopeTheta);
   for (std::size_t b = 0; b < w.layers.size(); ++b) {
     const VisionLayerWeights &block = w.layers[b];
+    before(1 + b);
     {
       ninfer::Tensor attended = layout.attended.bind(backing);
       {
@@ -300,6 +490,7 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
       ninfer::ops::add_bias(bf16_vector(block.fc2_bias, kVisionHidden), down, stream);
       ninfer::ops::residual_add(down, x, stream);
     }
+    after(1 + b);
     // GitHub #320: the DeepStack mergers that tap the residual after this
     // block (transformers' `deepstack_visual_indexes`).
     for (std::int32_t i = 0; i < call.deepstack_count; ++i) {
@@ -316,7 +507,11 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
 
   const VisionMergerWeights merger{w.merger_fc1,  w.merger_fc1_bias,   w.merger_fc2,
                                    w.merger_fc2_bias, w.merger_norm_weight, w.merger_norm_bias};
+  const std::size_t merger_a = 1 + w.layers.size();
+  before(merger_a);
   const ninfer::Tensor hidden = merger_hidden(x, merger, false, layout, backing, tokens, stream);
+  after(merger_a);
+  before(merger_a + 1);
   // GitHub #243: the merger's second projection writes the item's columns
   // straight into its pool pages, one call per page. The columns are the
   // GEMM's N, so a page is a plain column range of the same
@@ -332,6 +527,7 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
     ninfer::ops::linear(hidden_page, w.merger_fc2, output, stream);
     ninfer::ops::add_bias(bf16_vector(w.merger_fc2_bias, call.out_hidden), output, stream);
   }
+  after(merger_a + 1);
 }
 
 // GitHub #320: a W8G32 matrix of the image model's tower as `ops::linear`
@@ -518,6 +714,78 @@ std::size_t ignis_vision_workspace_bytes(std::int32_t tokens, std::int32_t segme
   return build_workspace_layout(tokens * kVisionMergeUnit, tokens, segments).bytes;
 }
 
+// PROTOTYPE #409: read through the OS on Windows, where the CRT's getenv
+// does not see a variable a Rust test sets after start.
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char *name,
+                                                                               char *buffer,
+                                                                               unsigned long size);
+#endif
+
+namespace {
+std::string proto_env_var(const char *name) {
+#ifdef _WIN32
+  char buffer[256];
+  const unsigned long n = GetEnvironmentVariableA(name, buffer, sizeof(buffer));
+  if (n == 0 || n >= sizeof(buffer)) {
+    return {};
+  }
+  return std::string(buffer, n);
+#else
+  const char *value = std::getenv(name);
+  return value == nullptr ? std::string() : std::string(value);
+#endif
+}
+} // namespace
+
+ProtoVisionEnv proto_vision_env() {
+  ProtoVisionEnv env;
+  if (proto_env_var("IGNIS_VISION_RESIDENCY") != "host") {
+    return env;
+  }
+  env.tower_host = true;
+  env.whole = proto_env_var("IGNIS_VISION_PROTO_STAGING") == "whole";
+  env.pool_host = proto_env_var("IGNIS_VISION_PROTO_POOL") != "device";
+  return env;
+}
+
+std::size_t proto_vision_slot_bytes(const VisionWeights &weights) {
+  std::array<std::size_t, kProtoStages> bound{};
+  proto_visit_stages(weights, false, [&](std::size_t stage, const ninfer::Weight &w) {
+    bound[stage] += w.payload_bytes + kProtoSpanSlack;
+  });
+  return proto_align_up(*std::max_element(bound.begin(), bound.end()), kProtoAlign);
+}
+
+// PROTOTYPE #409: an embedding's columns, in column order, copied to `out`
+// (`columns x hidden` BF16) from whichever memory the pool is in.
+extern "C" int32_t ignis_proto_media_embedding_read(const struct ignis_media_embedding *embedding,
+                                                    void *out, uint64_t out_bytes) {
+  if (embedding == nullptr || embedding->model == nullptr || out == nullptr) {
+    set_error("ignis_proto_media_embedding_read: null argument");
+    return -1;
+  }
+  const VisionEmbeddingPool &pool = embedding->model->vision_pool;
+  const std::size_t column_bytes = static_cast<std::size_t>(embedding->model->hidden) * 2;
+  if (out_bytes != static_cast<uint64_t>(embedding->columns) * column_bytes) {
+    set_error("ignis_proto_media_embedding_read: wrong output size");
+    return -1;
+  }
+  for (std::size_t p = 0; p < embedding->pages.size(); ++p) {
+    const auto first = static_cast<std::int32_t>(p) * pool.page_columns;
+    const std::int32_t take = std::min(pool.page_columns, embedding->columns - first);
+    const cudaError_t err =
+        cudaMemcpy(static_cast<unsigned char *>(out) + static_cast<std::size_t>(first) * column_bytes,
+                   pool.page_ptr(embedding->pages[p]), static_cast<std::size_t>(take) * column_bytes,
+                   cudaMemcpyDefault);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_proto_media_embedding_read: ") + cudaGetErrorString(err));
+      return -1;
+    }
+  }
+  return 0;
+}
+
 extern "C" int32_t ignis_media_encode(struct ignis_model *model,
                                       const struct ignis_media_encode_input *input,
                                       struct ignis_media_embedding **out_embedding) {
@@ -568,9 +836,29 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     const auto patches = static_cast<std::int32_t>(tokens * kVisionMergeUnit);
     const VisionWorkspaceLayout layout = build_workspace_layout(
         patches, static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(t));
-    if (layout.bytes > model->scratch->capacity()) {
-      throw std::runtime_error("the item needs " + std::to_string(layout.bytes) +
-                               " workspace bytes, the load reserved " +
+    // PROTOTYPE #409: a staged tower takes the scratch after the workspace --
+    // the whole tower (H1a) or two slots (H1b).
+    const bool staged = model->proto_vision_tower_host;
+    const std::size_t stage_offset = proto_align_up(layout.bytes, kProtoAlign);
+    VisionWeights staged_weights = model->vision;
+    std::size_t whole_bytes = 0;
+    const std::size_t slot_bytes = staged && !model->proto_vision_whole ? proto_vision_slot_bytes(model->vision) : 0;
+    if (staged && model->proto_vision_whole) {
+      const unsigned char *lo = nullptr;
+      const unsigned char *hi = nullptr;
+      proto_visit_stages(model->vision, true, [&](std::size_t, const ninfer::Weight &w) {
+        const auto *p = static_cast<const unsigned char *>(w.payload);
+        lo = (lo == nullptr || p < lo) ? p : lo;
+        hi = (hi == nullptr || p + w.payload_bytes > hi) ? p + w.payload_bytes : hi;
+      });
+      whole_bytes = static_cast<std::size_t>(hi - lo) + kProtoAlign;
+    }
+    const std::size_t need =
+        !staged ? layout.bytes : stage_offset + (model->proto_vision_whole ? whole_bytes : 2 * slot_bytes);
+    if (need > model->scratch->capacity()) {
+      throw std::runtime_error("the item needs " + std::to_string(need) +
+                               " workspace bytes (" + std::to_string(layout.bytes) +
+                               " for the encoder), the load reserved " +
                                std::to_string(model->scratch->capacity()));
     }
     // GitHub #243: the item's pages, claimed before any kernel runs. The
@@ -609,8 +897,41 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     // Held until the stream has drained: nothing else may take these bytes
     // while the encoder's kernels still run on them.
     ninfer::DeviceArena::Scope scope = model->scratch->scope();
-    const ninfer::DeviceSpan backing =
-        model->scratch->alloc_bytes(layout.bytes, kVisionWorkspaceAlignment);
+    const ninfer::DeviceSpan backing = model->scratch->alloc_bytes(need, kVisionWorkspaceAlignment);
+    ProtoStager stager;
+    struct CopyDrain {
+      cudaStream_t stream;
+      ~CopyDrain() {
+        if (stream != nullptr) {
+          cudaStreamSynchronize(stream);
+        }
+      }
+    } drain{staged && !model->proto_vision_whole ? model->proto_vision_copy_stream : nullptr};
+    if (staged) {
+      auto *base = static_cast<unsigned char *>(backing.data) + stage_offset;
+      std::vector<std::vector<ninfer::Weight *>> stages(model->proto_vision_whole ? 1 : kProtoStages);
+      proto_visit_stages(staged_weights, model->proto_vision_whole,
+                         [&](std::size_t stage, ninfer::Weight &w) { stages[stage].push_back(&w); });
+      stager.whole = model->proto_vision_whole;
+      for (std::size_t s = 0; s < stages.size(); ++s) {
+        unsigned char *dst = stager.whole ? base : base + (s % 2) * slot_bytes;
+        stager.plans.push_back(proto_plan_stage(stages[s], dst));
+        const std::size_t room = stager.whole ? whole_bytes : slot_bytes;
+        if (stager.plans.back().bytes > room) {
+          throw std::runtime_error("prototype staging: stage " + std::to_string(s) + " takes " +
+                                   std::to_string(stager.plans.back().bytes) + " bytes, its room is " +
+                                   std::to_string(room));
+        }
+      }
+      if (!stager.whole) {
+        stager.copy = model->proto_vision_copy_stream;
+        stager.start = model->proto_vision_events[0];
+        stager.copied[0] = model->proto_vision_events[1];
+        stager.copied[1] = model->proto_vision_events[2];
+        stager.consumed[0] = model->proto_vision_events[3];
+        stager.consumed[1] = model->proto_vision_events[4];
+      }
+    }
     VisionEncodeCall call;
     call.patches = input->patches;
     call.position_ids = input->position_ids;
@@ -622,8 +943,8 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     for (const std::int32_t page : embedding->pages) {
       call.pages.push_back(pool.page_ptr(page));
     }
-    encode(model->vision, call, layout, backing, patches, static_cast<std::int32_t>(tokens),
-           model->stream);
+    encode(staged ? staged_weights : model->vision, call, layout, backing, patches,
+           static_cast<std::int32_t>(tokens), model->stream, staged ? &stager : nullptr);
     const cudaError_t err = cudaStreamSynchronize(model->stream);
     if (err != cudaSuccess) {
       set_error(std::string("ignis_media_encode: cudaStreamSynchronize failed: ") +

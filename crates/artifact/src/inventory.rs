@@ -358,8 +358,16 @@ pub fn vision_scope_27b() -> Vec<InventoryEntry> {
     let w8 = (NumericFormat::W8G32F16S, row_split);
     let bf16 = (NumericFormat::Bf16, StorageLayout::ContiguousLeV1);
     let mut entries = Vec::with_capacity(3 + VISION_LAYERS * 12 + 6);
+    // PROTOTYPE #409 (throwaway): IGNIS_VISION_RESIDENCY=host binds the tower
+    // into mapped pinned host memory, as ADR 0062 binds the token embedding;
+    // the leaf stages it into the prefill scratch for each encode.
+    let residence = if std::env::var("IGNIS_VISION_RESIDENCY").as_deref() == Ok("host") {
+        Residence::HostMapped
+    } else {
+        Residence::Device
+    };
     let mut push = |name: &str, (format, layout): (NumericFormat, StorageLayout), shape: &'static [u64]| {
-        entries.push(mk(name, format, layout, shape));
+        entries.push(InventoryEntry { residence, ..mk(name, format, layout, shape) });
     };
     push("vision/patch_embedding", q6, &SH_V_PATCH);
     push("vision/patch_embedding_bias", bf16, &SH_V_HIDDEN);

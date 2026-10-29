@@ -1438,6 +1438,10 @@ struct LoadSizes {
   std::size_t sampling_logits = 0;
   // GitHub #339: the trellis body's one workspace (0 on the NVFP4 body).
   std::size_t trellis_workspace = 0;
+  // PROTOTYPE #409: whether the load has vision (it was `media_embedding >
+  // 0`), and whether its pool is host-mapped, leaving the VRAM plan.
+  bool vision = false;
+  bool proto_pool_host = false;
   // GitHub #336: the load's decode lanes, which every round line is sized
   // for.
   std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
@@ -1451,10 +1455,9 @@ struct LoadSizes {
   }
 
   ignis_model_reservations reservations() const {
-    const bool vision = media_embedding > 0;
     ignis_model_reservations out{};
     out.workspace_bytes = workspace();
-    out.media_embedding_bytes = media_embedding;
+    out.media_embedding_bytes = proto_pool_host ? 0 : media_embedding;
     // sampling_single_{configs, positions, out}, sampling_decode_{configs,
     // positions, out, logits} and the workspace, as the load allocates them.
     // GitHub #242 adds the permitted-set staging to the same line: ids
@@ -1642,6 +1645,15 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
         ignis_vision_workspace_bytes(item_tokens, std::min(item_tokens, kVisionMaxSegments));
     sizes.media_embedding =
         vision_embedding_pool_bytes(g.hidden, tokens, options.vision_embedding_pool_bytes);
+    sizes.vision = true;
+    // PROTOTYPE #409: H1b's two slots join the encoder's share of the
+    // scratch; H1a (reference only) stages into whatever slack it has. A2's
+    // pool leaves the plan.
+    const ProtoVisionEnv proto = proto_vision_env();
+    if (proto.tower_host && !proto.whole) {
+      sizes.vision_workspace = (sizes.vision_workspace + 255) / 256 * 256 + 2 * proto_vision_slot_bytes(model.vision);
+    }
+    sizes.proto_pool_host = proto.pool_host;
   }
 
   // GitHub #275 (ADR 0041): a `locate`'s readout over a text span, reserved
@@ -1930,9 +1942,46 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     model->vision_max_tokens = vision_max_tokens;
     model->vision_item_max_tokens = load.vision_item_max_tokens;
     try {
+      // PROTOTYPE #409: the env flags, and the tower where the binder put it.
+      const ProtoVisionEnv proto = proto_vision_env();
+      const bool tower_host = in_host_memory(model->vision.patch_embedding.qdata);
+      if (proto.tower_host != tower_host) {
+        throw std::runtime_error(std::string("prototype: IGNIS_VISION_RESIDENCY says the tower is ") +
+                                 (proto.tower_host ? "host" : "device") + ", the binder put it on the " +
+                                 (tower_host ? "host" : "device"));
+      }
+      model->proto_vision_tower_host = proto.tower_host;
+      model->proto_vision_whole = proto.tower_host && proto.whole;
+      model->proto_vision_pool_host = proto.pool_host;
+      if (proto.tower_host && !proto.whole) {
+        if (cudaStreamCreateWithFlags(&model->proto_vision_copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
+          throw std::runtime_error("prototype: the copy stream");
+        }
+        for (cudaEvent_t &event : model->proto_vision_events) {
+          if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+            throw std::runtime_error("prototype: a staging event");
+          }
+        }
+      }
       const std::size_t output_bytes = sizes.media_embedding;
       std::size_t vision_free = 0;
       std::size_t vision_total = 0;
+      if (proto.pool_host) {
+        auto mapped = std::make_unique<ProtoMappedHostRegion>();
+        if (cudaHostAlloc(&mapped->host, output_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+          mapped->host = nullptr;
+          throw std::runtime_error("prototype: cudaHostAlloc(mapped) of the embedding pool failed");
+        }
+        if (cudaHostGetDevicePointer(&mapped->device, mapped->host, 0) != cudaSuccess) {
+          throw std::runtime_error("prototype: cudaHostGetDevicePointer of the embedding pool failed");
+        }
+        mapped->bytes = output_bytes;
+        const std::size_t page_bytes = vision_embedding_page_bytes(g.hidden);
+        model->vision_pool.mapped = std::move(mapped);
+        model->vision_pool.page_columns = IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS;
+        model->vision_pool.page_bytes = page_bytes;
+        model->vision_pool.owner.assign(output_bytes / page_bytes, nullptr);
+      } else {
       if (cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess && output_bytes > vision_free) {
         throw std::runtime_error("a " + std::to_string(vision_tokens) +
                                  "-token vision envelope's embedding pool needs " +
@@ -1946,6 +1995,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       model->vision_pool.page_columns = IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS;
       model->vision_pool.page_bytes = page_bytes;
       model->vision_pool.owner.assign(output_bytes / page_bytes, nullptr);
+      }
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: vision reservation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -2081,6 +2131,16 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
     }
     if (model->stream != nullptr) {
       cudaStreamDestroy(model->stream);
+    }
+    // PROTOTYPE #409: the staging copy stream and its events.
+    if (model->proto_vision_copy_stream != nullptr) {
+      cudaStreamSynchronize(model->proto_vision_copy_stream);
+      cudaStreamDestroy(model->proto_vision_copy_stream);
+    }
+    for (cudaEvent_t event : model->proto_vision_events) {
+      if (event != nullptr) {
+        cudaEventDestroy(event);
+      }
     }
   }
   delete model;

@@ -203,8 +203,27 @@ struct FlashNextModelDeleter {
 // and a prefill chunk scatters them back page by page
 // (kernel/src/step.cu). Both are plain column ranges over the ops that
 // already existed -- no kernel reads a page table.
+// PROTOTYPE #409 (A2, throwaway): the pool in mapped pinned host memory --
+// one cudaHostAlloc(Mapped|Portable), the merger writing it and the prefill's
+// scatter reading it through its device alias, as ADR 0062's table is read.
+struct ProtoMappedHostRegion {
+  void *host = nullptr;
+  void *device = nullptr;
+  std::size_t bytes = 0;
+  ProtoMappedHostRegion() = default;
+  ProtoMappedHostRegion(const ProtoMappedHostRegion &) = delete;
+  ProtoMappedHostRegion &operator=(const ProtoMappedHostRegion &) = delete;
+  ~ProtoMappedHostRegion() {
+    if (host != nullptr) {
+      cudaFreeHost(host);
+    }
+  }
+};
+
 struct VisionEmbeddingPool {
   std::unique_ptr<ninfer::DeviceBuffer> buffer;
+  // PROTOTYPE #409 (A2): set instead of `buffer` when the pool is host-mapped.
+  std::unique_ptr<ProtoMappedHostRegion> mapped;
   // `[hidden]` BF16 columns per page, and so the bytes of one.
   std::int32_t page_columns = 0;
   std::size_t page_bytes = 0;
@@ -212,7 +231,7 @@ struct VisionEmbeddingPool {
   // bool because a release names its embedding, not its pages.
   std::vector<const ignis_media_embedding *> owner;
 
-  bool present() const { return buffer != nullptr; }
+  bool present() const { return buffer != nullptr || mapped != nullptr; }
   std::int32_t pages() const { return static_cast<std::int32_t>(owner.size()); }
   std::int32_t free_pages() const {
     std::int32_t n = 0;
@@ -226,7 +245,8 @@ struct VisionEmbeddingPool {
     return page_columns > 0 ? (columns + page_columns - 1) / page_columns : 0;
   }
   std::uint8_t *page_ptr(std::int32_t page) const {
-    return static_cast<std::uint8_t *>(buffer->p) + static_cast<std::size_t>(page) * page_bytes;
+    void *base = buffer != nullptr ? buffer->p : mapped->device;
+    return static_cast<std::uint8_t *>(base) + static_cast<std::size_t>(page) * page_bytes;
   }
   // Claim `count` pages for `owner_of`, or return empty. The pages need not
   // be adjacent -- that is the whole point of paging them.
@@ -535,6 +555,16 @@ struct ignis_model {
   // transient, this holds as many embeddings as their own columns fit --
   // which is what lets an embedding outlive the encode that made it.
   VisionEmbeddingPool vision_pool{};
+  // PROTOTYPE #409 (throwaway, IGNIS_VISION_RESIDENCY=host): the tower bound
+  // in mapped pinned host memory and staged into `scratch` for each encode --
+  // whole (H1a, reference only) or through two slots on a copy stream of the
+  // encoder's own (H1b) -- and the pool host-mapped (A2).
+  bool proto_vision_tower_host = false;
+  bool proto_vision_whole = false;
+  bool proto_vision_pool_host = false;
+  cudaStream_t proto_vision_copy_stream = nullptr;
+  // start, copied[2], consumed[2]
+  std::array<cudaEvent_t, 5> proto_vision_events{};
   // GitHub #178: the decode round's per-lane rope positions (I32 x
   // decode_lanes), `position + rope_delta`, staged beside
   // `sampling_decode_positions` and read by the graphs from this stable
@@ -575,3 +605,22 @@ struct ignis_media_embedding {
 // the load's reservation (kernel/src/model.cu) and the encode that runs out
 // of it (kernel/src/vision_encode.cu), so the two cannot drift.
 std::size_t ignis_vision_workspace_bytes(std::int32_t tokens, std::int32_t segments);
+
+// PROTOTYPE #409 (throwaway): the env flags the prototype reads, at plan and
+// at load. IGNIS_VISION_RESIDENCY=host puts the tower in mapped host memory
+// (the binder reads the same variable) and, unless
+// IGNIS_VISION_PROTO_POOL=device, the pool too; IGNIS_VISION_PROTO_STAGING=whole
+// stages the tower in one copy (H1a) instead of the double buffer (H1b).
+// Unset: today's behaviour exactly.
+struct ProtoVisionEnv {
+  bool tower_host = false;
+  bool whole = false;
+  bool pool_host = false;
+};
+ProtoVisionEnv proto_vision_env();
+
+// PROTOTYPE #409 (H1b): the bytes of one staging slot -- the largest stage's
+// span bound (the pre-block weights, one block, or one half of the merger) --
+// from the bound tensors' sizes alone, so the plan can size it before any
+// pointer exists.
+std::size_t proto_vision_slot_bytes(const VisionWeights &weights);
