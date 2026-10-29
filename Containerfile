@@ -60,8 +60,16 @@ ENV IGNIS_KERNEL_BUILD_JOBS=${KERNEL_BUILD_JOBS}
 
 # --target explicitly: .cargo/config.toml pins the MSVC triple for every host
 # (cargo has no host condition for build.target -- GitHub #167).
+#
+# `--features cuda`, never `ignis-server/cuda`: ignis-server has a
+# dev-dependency on itself (its integration tests' `fake-speech`), and cargo
+# reads `ignis-server/cuda` as a feature of that dependency, which a build of
+# the binaries never compiles. The server then came out without CUDA, with no
+# error, in v0.9.0 and v0.9.1 (GitHub #408). The check after the build reads
+# the binary itself and refuses one that would fall back to the CPU mock.
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
-        --workspace --features ignis-server/cuda \
+        --workspace --features cuda \
+    && bash mk/cuda-build-check.sh target/x86_64-unknown-linux-gnu/release/ignis-server \
     && strip target/x86_64-unknown-linux-gnu/release/ignis-server \
              target/x86_64-unknown-linux-gnu/release/ignis-bench \
              target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect

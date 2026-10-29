@@ -70,7 +70,10 @@ endif
 # Windows, and the flag is what lets the same graph target Linux later.
 CARGO_TARGET := --target $(TARGET_TRIPLE)
 SERVER_CARGO_FLAGS := -p ignis-server $(CARGO_TARGET) --profile $(PROFILE) $(if $(filter 1,$(CUDA)),--features cuda)
-WORKSPACE_FEATURES := $(if $(filter 1,$(CUDA)),--features ignis-server/cuda)
+# `cuda`, never `ignis-server/cuda`: cargo reads the latter as a feature of
+# ignis-server's dev-dependency on itself, which a build never compiles, so the
+# server came out without CUDA and with no error (GitHub #408).
+WORKSPACE_FEATURES := $(if $(filter 1,$(CUDA)),--features cuda)
 # `make check` also compiles the GPU test no other target builds: the one behind
 # ignis-core's test-only `logits-capture` feature (docs/agents/testing.md, Done means).
 CHECK_FEATURES := $(WORKSPACE_FEATURES) $(if $(filter 1,$(CUDA)),--features ignis-core/logits-capture)

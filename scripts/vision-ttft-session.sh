@@ -2,7 +2,7 @@
 # GitHub #181: the live/live multimodal TTFT session (ADR 0015, pooled over two
 # launches per engine per ADR 0021). Run from the repository root on a free
 # 5090, after `cargo build --release -p ignis-server -p ignis-bench
-# --features ignis-server/cuda`:
+# --features cuda`:
 #
 #   bash scripts/vision-ttft-session.sh <out-dir>
 #

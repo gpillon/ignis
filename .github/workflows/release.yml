@@ -33,6 +33,10 @@
 # SM120a and links the CUDA runtime only: the driver (libcuda/nvcuda) and NVML
 # are opened at run time (kernel/src/cuda_driver_shim.cu, shared_library.cu;
 # crates/artifact/build.rs), so no driver stub is needed at link time.
+#
+# Neither half packages a server that is not a CUDA build: both run
+# mk/cuda-build-check.sh on it first. v0.9.0 and v0.9.1 shipped the CPU mock
+# under a release name, and nothing here noticed (GitHub #408).
 
 name: release
 
@@ -444,9 +448,11 @@ jobs:
         shell: pwsh
         env:
           CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
+        # `--features cuda`, never `ignis-server/cuda`: the Containerfile's
+        # build stage says why (GitHub #408).
         run: |
           cargo build --release --locked --target x86_64-pc-windows-msvc `
-            --workspace --features ignis-server/cuda
+            --workspace --features cuda
 
       - name: Package
         shell: bash
@@ -459,6 +465,10 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/ignis-server.exe "$name"/
           cp target/x86_64-pc-windows-msvc/release/ignis-bench.exe "$name"/
           cp target/x86_64-pc-windows-msvc/release/ignis-artifact-inspect.exe "$name"/
+          # A server that would fall back to the CPU mock is not packaged
+          # (GitHub #408); the Linux build runs the same check in the
+          # Containerfile.
+          bash mk/cuda-build-check.sh "$name"/ignis-server.exe
           # Apache-2.0 asks that a redistribution carry LICENSE and NOTICE;
           # kernel/NOTICE is the vendored ops' own provenance (ADR 0010).
           cp LICENSE NOTICE README.md "$name"/

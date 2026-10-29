@@ -49,6 +49,9 @@ the host. The Linux tarball also needs the CUDA 13 runtime installed
 That is the CPU mock. The server runs it when it was built without
 `--features cuda`, when `--download-enabled false` is set with no artifact, or
 in the container smoke test that passes `--download-enabled false` ([Install](start/install.md#the-container-image)).
+The release archives and container images of v0.9.0 and v0.9.1 were built
+without `cuda` by mistake, so they serve the mock whatever the model: use
+v0.9.2 or later ([#408](https://github.com/gpillon/ignis/issues/408)).
 The mock has no EOS token, so every completion ends `length`. Start a GPU build
 with a model: [Quick start](start/quick-start.md).
 
