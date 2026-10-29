@@ -24,7 +24,9 @@ links it.
 the leaf with CMake + Ninja + `nvcc`, targeting `SM120a`
 (`CMAKE_CUDA_ARCHITECTURES=120a`) in a Release build, into `kernel/build/` —
 which `crates/*/build.rs` link. The PowerShell script imports the MSVC
-environment itself, so no developer prompt is needed.
+environment itself, so no developer prompt is needed. In a shell that already
+has one (`cl.exe` on `PATH`) it uses that environment as it is, so a toolchain
+the Visual Studio installer does not list builds too.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File kernel\build.ps1

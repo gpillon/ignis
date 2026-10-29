@@ -2,7 +2,8 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File kernel/build.ps1
 #
-# Plain PowerShell, no developer prompt needed: imports the MSVC env itself.
+# Plain PowerShell, no developer prompt needed: imports the MSVC env itself,
+# unless the shell already has one (cl.exe on PATH), which it then uses as is.
 # Pattern: ninfer's configure-ninja.ps1 / build-ninja.ps1 (proven on this
 # machine, see NINFER_WINDOWS_BUILD_NOTES.md sections 10 and 12-14).
 
@@ -30,7 +31,9 @@ function Import-Vcvars {
     Write-Host "[ignis-kernel] imported MSVC env from $vcvars"
 }
 
-Import-Vcvars
+# An existing developer environment already supplies cl, LIB and INCLUDE;
+# it need not have a Visual Studio instance registered with vswhere.
+if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { Import-Vcvars }
 
 # Ninja (standalone install, NINFER_WINDOWS_BUILD_NOTES section 10).
 if (-not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) {
