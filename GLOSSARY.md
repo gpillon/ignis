@@ -165,6 +165,19 @@ device allocations to system RAM (Task Manager's "Shared GPU memory") instead
 of failing, which slows every step; other systems fail the allocation.
 _Avoid_: shared memory, spill (a spill is KV-RAM's).
 
+**Host-mapped**:
+Kept in pinned host RAM and read by the GPU where it sits, over PCIe, never
+copied to the device: the 27B's token embedding (ADR 0062). Every read crosses
+the link, so it suits data a step reads once.
+_Avoid_: on the host, offloaded (an **offloaded** load is a KV pool policy).
+
+**Staged**:
+Kept in pinned host RAM and copied to the device for each use, into room the
+load already reserved, then read there at device speed. Nothing stays on the
+device between two uses, unlike an expert in the **expert cache**. Suits data a
+step reads many times.
+_Avoid_: on the host, offloaded.
+
 **KV pool policy**:
 How a load sizes its KV pool, chosen by whether every weight is on the device
 (ADR 0045). A **resident** load (the 27B, and Flash-Next on a card that holds
@@ -835,9 +848,14 @@ itself.
 **Prefill chunk**:
 The number of tokens one traversal of the model processes during chunked
 prefill: a model-load option, default 1024, a multiple of 128. The unit the
-prefill scratch is sized for; with vision, that scratch is also the vision
-encoder's workspace and is sized for the larger of the two (the VRAM plan's
-`workspace` line).
+**prefill scratch** is sized for.
+
+**Prefill scratch**:
+The load's one device region for a step's transient buffers, sized at load for
+the larger of what a **prefill chunk** needs and what a **media encode** of one
+**item bound** needs (the VRAM plan's `workspace` line). The two never run at
+once, and nothing in it survives from one step to the next.
+_Avoid_: workspace (a user's files), arena (KV-RAM's).
 
 **Per-token prefill route**:
 The G1 prefill path that runs the program one token at a time (recurrent GDN,
@@ -1015,6 +1033,13 @@ Multimodal input: images today, video refused until its own spec. A load
 option (`--vision-enabled`): without it nothing of the tower is bound or
 reserved and text serving is unchanged.
 
+**Vision residency**:
+Where a vision load keeps the **vision encoder**'s weights and the **embedding
+pool**: **host** (the default: the weights **staged** for each **media
+encode**, the pool **host-mapped**), so that vision costs no context while no
+image is in flight; or **device** (both in VRAM for the life of the load), for
+a card with VRAM to spare on a host short of RAM.
+
 **Media acquisition**:
 Turning a request's image parts into prepared **media items** before it is
 admitted: decoding a `data:` URI or fetching a URL under the media policy
@@ -1038,19 +1063,25 @@ of.
 **Vision tokens**:
 A media item's *merged* tokens, one per 2x2 block of patches: the placeholder
 run's length, and what the per-request envelope (`--vision-max-tokens`) is
-counted in. The envelope also bounds each image: one over it is downscaled onto
-a smaller grid, not refused (#248).
+counted in.
+
+**Item bound**:
+The most **vision tokens** one **media item** may take: the smaller of the
+request's envelope and the artifact's pixel bound (16,384 for the 27B), so an
+envelope of 32,768 still bounds each image at 16,384. An image over it is
+downscaled onto a smaller grid, not refused (#248).
+_Avoid_: envelope (the request's total).
 
 **Media embedding**:
-A media item's encoder output, `[hidden, vision tokens]`, device-resident and
-leaf-owned. **Held** by a request from its encode until the item's last
+A media item's encoder output, `[hidden, vision tokens]`, leaf-owned. **Held** by a request from its encode until the item's last
 placeholder is prefilled, and **resident** in the **embedding pool** past that,
 until something needs its room: a fan-out of N questions over one image
 encodes it once (ADR 0035).
 
 **Embedding pool**:
-The load's one device reservation for **media embeddings**
-(`--vision-embedding-pool-mib`, defaulting to one envelope-wide item), carved
+The load's one reservation for **media embeddings**, where the **vision
+residency** puts it (`--vision-embedding-pool-mib`, defaulting to one
+envelope-wide item), carved
 into fixed-width **column pages** so an item takes the pages its own columns
 need rather than a slot sized for the envelope. An embedding is contiguous in
 column space and not in memory: the encoder writes it a page at a time and a
