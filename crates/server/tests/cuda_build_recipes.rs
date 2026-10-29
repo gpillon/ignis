@@ -7,8 +7,9 @@
 //! rule held here is the general one: no build recipe names a feature as
 //! `<member>/<feature>` for a workspace member that has a dependency of its
 //! own name. The release's check of the shipped binary
-//! (`mk/cuda-build-check.sh`) looks for the warning only a build without
-//! `cuda` carries, so the last test holds that text to the server's.
+//! (`mk/cuda-build-check.sh`, tested by its own selftest) looks for the
+//! warning only a build without `cuda` carries, so the last test holds that
+//! text to the server's.
 
 use std::path::{Path, PathBuf};
 
@@ -35,27 +36,91 @@ fn package_name(manifest: &str) -> Option<String> {
     None
 }
 
-/// Whether a manifest has a dependency keyed by its own package name: cargo
+/// Whether a manifest has a dependency named after its own package, in any
+/// of TOML's spellings: `name = { .. }` or `name.path = ".."` inside a
+/// dependencies table, or a `[..dependencies.name]` table of its own. Cargo
 /// allows that only as a dev-dependency, and it is what captures
 /// `--features <name>/<feature>`.
 fn depends_on_itself(manifest: &str) -> bool {
     let Some(name) = package_name(manifest) else {
         return false;
     };
-    manifest.lines().map(str::trim_start).any(|line| {
-        line.strip_prefix(name.as_str()).is_some_and(|rest| rest.trim_start().starts_with('='))
-    })
+    let mut in_dependencies = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            let table = line.trim_matches(['[', ']']);
+            if table.ends_with(&format!("dependencies.{name}")) {
+                return true;
+            }
+            in_dependencies = table.ends_with("dependencies");
+        } else if in_dependencies
+            && line.strip_prefix(name.as_str()).is_some_and(|rest| rest.trim_start().starts_with(['=', '.']))
+        {
+            return true;
+        }
+    }
+    false
 }
 
-/// Every feature a recipe's text passes to `--features`, one per name.
+/// Whether a shell token passes the features flag: `Some("")` when the value
+/// is the next token, `Some(value)` for `--features=value`. The flag starts
+/// the token, or follows a comma or a parenthesis, as in Make's
+/// `$(if $(c),--features x)`.
+fn features_flag(token: &str) -> Option<&str> {
+    for flag in ["--features", "-F"] {
+        let Some(at) = token.rfind(flag) else {
+            continue;
+        };
+        if at > 0 && !token[..at].ends_with([',', '(']) {
+            continue;
+        }
+        let rest = &token[at + flag.len()..];
+        if rest.is_empty() {
+            return Some("");
+        }
+        if let Some(value) = rest.strip_prefix('=') {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Every feature a recipe's text passes to `--features` or `-F`, one per
+/// name. Comment lines are skipped, a line continued with `\` or a backtick
+/// is read with the next one, and a quoted list may be separated by commas or
+/// spaces.
 fn features_named(text: &str) -> Vec<String> {
+    let code: Vec<&str> = text.lines().filter(|line| !line.trim_start().starts_with('#')).collect();
+    let code = code.join("\n").replace("\\\n", " ").replace("`\n", " ");
+    let tokens: Vec<&str> = code.split_whitespace().collect();
     let mut named = Vec::new();
-    for (at, flag) in text.match_indices("--features") {
-        let rest = &text[at + flag.len()..];
-        let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start_matches([' ', '\t']);
-        let value: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ')').collect();
-        for feature in value.split(',') {
-            let feature = feature.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    let mut at = 0;
+    while at < tokens.len() {
+        let Some(inline) = features_flag(tokens[at]) else {
+            at += 1;
+            continue;
+        };
+        at += 1;
+        let first = if inline.is_empty() {
+            let Some(next) = tokens.get(at) else {
+                break;
+            };
+            at += 1;
+            *next
+        } else {
+            inline
+        };
+        let mut value = first.to_string();
+        // A quoted list runs to the token that closes the quote.
+        if let Some(quote) = first.chars().next().filter(|c| *c == '"' || *c == '\'') {
+            while (value.len() < 2 || !value.ends_with(quote)) && at < tokens.len() {
+                value.push(' ');
+                value.push_str(tokens[at]);
+                at += 1;
+            }
+        }
+        for feature in value.split([',', ' ']) {
+            let feature = feature.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ')'));
             if !feature.is_empty() {
                 named.push(feature.to_string());
             }
@@ -69,9 +134,7 @@ fn features_named(text: &str) -> Vec<String> {
 /// local runs, and the release workflow skips a push that touches nothing else.
 fn recipes(repo: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -81,33 +144,40 @@ fn recipes(repo: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    let mut files = vec![repo.join("Containerfile"), repo.join("Makefile"), repo.join("local.mk.example")];
+    let mut files = vec![repo.join("Containerfile"), repo.join("Makefile")];
     walk(&repo.join("mk"), &mut files);
     walk(&repo.join(".github/workflows"), &mut files);
-    files.retain(|path| path.is_file());
+    for path in &files[..2] {
+        assert!(path.is_file(), "{} is missing", path.display());
+    }
     files
 }
 
 #[test]
 fn no_build_recipe_names_a_feature_through_a_member_that_depends_on_itself() {
     let repo = repo();
-    let mut captured = Vec::new();
+    let mut self_dependent = Vec::new();
     for entry in std::fs::read_dir(repo.join("crates")).unwrap().flatten() {
         let Ok(manifest) = std::fs::read_to_string(entry.path().join("Cargo.toml")) else {
             continue;
         };
         if depends_on_itself(&manifest) {
-            captured.push(package_name(&manifest).unwrap());
+            self_dependent.push(package_name(&manifest).unwrap());
         }
     }
-    let recipes = recipes(&repo);
-    assert!(recipes.iter().any(|path| path.ends_with("Containerfile")), "no recipe found under {}", repo.display());
+    // The member that broke v0.9.0 and v0.9.1; without it the rule below
+    // would hold of nothing. If ignis-server stops depending on itself, this
+    // assertion goes with it.
+    assert!(
+        self_dependent.iter().any(|name| name == "ignis-server"),
+        "crates/server/Cargo.toml no longer reads as depending on itself; self-dependent members found: {self_dependent:?}"
+    );
     let mut wrong = Vec::new();
-    for path in &recipes {
-        for feature in features_named(&read(path)) {
-            for member in &captured {
+    for path in recipes(&repo) {
+        for feature in features_named(&read(&path)) {
+            for member in &self_dependent {
                 if feature.starts_with(&format!("{member}/")) {
-                    wrong.push(format!("{}: --features {feature}", path.strip_prefix(&repo).unwrap_or(path).display()));
+                    wrong.push(format!("{}: --features {feature}", path.strip_prefix(&repo).unwrap_or(&path).display()));
                 }
             }
         }
@@ -122,17 +192,32 @@ fn no_build_recipe_names_a_feature_through_a_member_that_depends_on_itself() {
 
 #[test]
 fn the_scan_finds_the_form_that_shipped_without_cuda() {
-    // The two spellings v0.9.0 and v0.9.1 were built with.
+    // The spellings v0.9.0 and v0.9.1 were built with: the Containerfile's
+    // build stage and the release workflow's Windows build.
     let containerfile = "RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \\\n        --workspace --features ignis-server/cuda \\\n    && strip x\n";
-    let makefile = "WORKSPACE_FEATURES := $(if $(filter 1,$(CUDA)),--features ignis-server/cuda)\n";
+    let windows = "        run: |\n          cargo build --release --locked --target x86_64-pc-windows-msvc `\n            --workspace --features ignis-server/cuda\n";
     assert_eq!(features_named(containerfile), ["ignis-server/cuda"]);
-    assert_eq!(features_named(makefile), ["ignis-server/cuda"]);
+    assert_eq!(features_named(windows), ["ignis-server/cuda"]);
+    // The Makefile's workspace features, the other forms cargo takes, and a
+    // comment that names the spelling without passing it.
+    assert_eq!(
+        features_named("WORKSPACE_FEATURES := $(if $(filter 1,$(CUDA)),--features ignis-server/cuda)\n"),
+        ["ignis-server/cuda"]
+    );
     assert_eq!(features_named("cargo check --features=cuda,ignis-core/logits-capture"), ["cuda", "ignis-core/logits-capture"]);
+    assert_eq!(features_named("cargo build -F \"cuda ignis-server/cuda\" --workspace"), ["cuda", "ignis-server/cuda"]);
+    assert_eq!(features_named("cargo build --features \\\n  ignis-server/cuda"), ["ignis-server/cuda"]);
+    assert_eq!(features_named("$(if $(filter 1,$(CUDA)),--features=ignis-server/cuda)"), ["ignis-server/cuda"]);
+    assert!(features_named("cargo build --no-default-features --workspace").is_empty());
+    assert!(features_named("# never `--features ignis-server/cuda` here\n").is_empty());
 
     let manifest = "[package]\nname = \"ignis-server\"\n\n[dev-dependencies]\nignis-server = { path = \".\", features = [\"fake-speech\"] }\n";
     assert_eq!(package_name(manifest).as_deref(), Some("ignis-server"));
     assert!(depends_on_itself(manifest));
+    assert!(depends_on_itself("[package]\nname = \"ignis-server\"\n\n[dev-dependencies.ignis-server]\npath = \".\"\n"));
+    assert!(depends_on_itself("[package]\nname = \"ignis-server\"\n\n[dev-dependencies]\nignis-server.path = \".\"\n"));
     assert!(!depends_on_itself("[package]\nname = \"ignis-server\"\n\n[dependencies]\nignis-server-x = \"1\"\n"));
+    assert!(!depends_on_itself("[package]\nname = \"ignis-server\"\n\n[features]\nignis-server = []\n"));
 }
 
 #[test]

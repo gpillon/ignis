@@ -591,6 +591,12 @@ changelog-selftest: ## Test the changelog draft -- a throwaway repo, a stubbed g
 commit-msg-selftest: ## Test the commit-message hook, .githooks/commit-msg
 	@bash mk/commit-msg-selftest.sh
 
+# The release builds' CUDA check reads only the files it is handed, so its
+# test is temp files too; the release workflow's Linux test job runs it.
+.PHONY: cuda-build-check-selftest
+cuda-build-check-selftest: ## Test the release builds' CUDA check, mk/cuda-build-check.sh
+	@bash mk/cuda-build-check-selftest.sh
+
 # ---------------------------------------------------------------------------
 ##@ GPU (one run on the card at a time -- docs/agents/testing.md)
 # ---------------------------------------------------------------------------

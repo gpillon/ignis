@@ -167,6 +167,12 @@ jobs:
         shell: bash
         run: cargo test --workspace --locked --target ${{ matrix.target }}
 
+      # The check that decides whether a build below is packaged (GitHub
+      # #408), tested on both hosts because both run it.
+      - name: CUDA build check selftest
+        shell: bash
+        run: bash mk/cuda-build-check-selftest.sh
+
       # The Playground's logic is pure TypeScript with no host in it, so one
       # run answers for both (ADR 0026, docs/agents/testing.md). Linux is the
       # cheaper runner.
@@ -444,12 +450,12 @@ jobs:
           restore-keys: |
             kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-
 
+      # `--features cuda`, never `ignis-server/cuda`: the Containerfile's
+      # build stage says why (GitHub #408).
       - name: Build
         shell: pwsh
         env:
           CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
-        # `--features cuda`, never `ignis-server/cuda`: the Containerfile's
-        # build stage says why (GitHub #408).
         run: |
           cargo build --release --locked --target x86_64-pc-windows-msvc `
             --workspace --features cuda

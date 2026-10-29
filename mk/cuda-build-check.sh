@@ -8,10 +8,11 @@
 # build notices; v0.9.0 and v0.9.1 shipped that way. The check reads the
 # binary itself, not the command line that built it: the server's
 # `cfg(not(feature = "cuda"))` load path, and only it, carries the warning
-# below, so a binary holding it is one that falls back to the mock. Every
-# release build runs it before packaging (the Containerfile's build stage, the
-# release workflow's Windows job). It reads nothing but its arguments and
-# writes nothing.
+# below, so a binary holding it is one that falls back to the mock. A binary
+# it cannot read is refused too. Every release build runs it before
+# packaging (the Containerfile's build stage, the release workflow's Windows
+# job); `make cuda-build-check-selftest` is its test. It reads nothing but its
+# arguments and writes nothing.
 
 set -uo pipefail
 
@@ -27,14 +28,21 @@ fi
 
 status=0
 for binary in "$@"; do
-    if [ ! -s "$binary" ]; then
-        echo "cuda-build-check: $binary: missing or empty" >&2
+    if [ ! -f "$binary" ] || [ ! -s "$binary" ]; then
+        echo "cuda-build-check: $binary: missing, empty or not a file" >&2
         status=1
-    elif grep -aqF "$marker" "$binary"; then
-        echo "cuda-build-check: $binary is not a CUDA build: it carries the MockCompute fallback ('$marker')" >&2
-        status=1
-    else
-        echo "cuda-build-check: $binary: CUDA build"
+        continue
     fi
+    grep -aqF "$marker" "$binary"
+    case $? in
+        0)
+            echo "cuda-build-check: $binary is not a CUDA build: it carries the MockCompute fallback ('$marker')" >&2
+            status=1 ;;
+        1)
+            echo "cuda-build-check: $binary: CUDA build" ;;
+        *)
+            echo "cuda-build-check: $binary: could not be read" >&2
+            status=1 ;;
+    esac
 done
 exit "$status"
