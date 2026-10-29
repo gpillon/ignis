@@ -141,7 +141,7 @@ that entry ([Get a model](../guides/models.md)).
 | Field | 27B |
 |---|---|
 | Context | 262,144, the positions it was trained on |
-| Vision | off |
+| Vision | off; 1,024 tokens an image when turned on |
 | Speculation | DFlash2, 7 draft tokens, the drafter's head `auto` (the full head) |
 | Decode lanes | 2 |
 | Prefill chunk | 1,024 (the default) |
@@ -151,6 +151,12 @@ Why each:
 
 - **Vision off.** The vision tower's weights and its encoder peak are VRAM a
   16 GB card does not have.
+- **1,024 vision tokens when you turn it on.** With `--vision-enabled` the
+  profile caps an image at 1,024 merged tokens, about 1,024 x 1,024 pixels
+  (a larger one is downscaled). At the 32,768 default the encoder's workspace
+  and embedding pool take most of the card's context; at 1,024 a 5060 Ti kept
+  all 262,144, at about a tenth of its KV pool. `--vision-max-tokens` sets
+  your own.
 - **Two lanes.** Eight would leave no room for the context.
 - **The 1,024-token chunk.** With vision off the workspace is the text scratch,
   and 2,048 would cost about 0.4 GB of KV pool.

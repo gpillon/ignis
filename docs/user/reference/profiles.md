@@ -25,6 +25,7 @@ A profile is a layer of defaults for one kind of card, between the config file a
 | [`spec.draft_head`](configuration.md#specdraft_head) | Qwen3.8-27B | `auto` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
 | [`vision.enabled`](configuration.md#visionenabled) | every model | `false` |
+| [`vision.max_tokens`](configuration.md#visionmax_tokens) | every model | `1024` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `1200M` |
 
 ## rtx5090

@@ -185,7 +185,11 @@ pub const NONE_PROFILE: &str = "none";
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
 /// DFlash2 at 7 tokens, as the other profiles, and vision off, explicit: the
 /// vision tower's weights and its encoder peak are VRAM a 16 GB card does not
-/// have (spec 27b-16gb/03). `vram.qwen38.headroom_bytes` is the 5090's 1200M
+/// have (spec 27b-16gb/03). Its envelope, `vision.max_tokens`, is 1,024 for a
+/// start that turns vision on: at the 32,768 default the encoder's workspace
+/// and embedding pool take most of the card's context, at 1,024 a 5060 Ti kept
+/// all 262,144 (measured on GitHub #407).
+/// `vram.qwen38.headroom_bytes` is the 5090's 1200M
 /// until a real card says otherwise, and `prefill_chunk` stays at its 1,024: with
 /// vision off the workspace is the text scratch, and 2,048 would cost ~0.4 GB of
 /// KV pool. The profile names no model: a start with no artifact resolves the
@@ -232,7 +236,7 @@ const BUILT_IN: &str = r#"{
         "model": {
             "qwen38": { "max_context": 262144 }
         },
-        "vision": { "enabled": false },
+        "vision": { "enabled": false, "max_tokens": 1024 },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7, "decode_lanes": 2, "draft_head": "auto" }
         }

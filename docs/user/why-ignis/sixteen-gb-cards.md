@@ -35,7 +35,7 @@ the artifact it stands in for. The DFlash2 drafter is the same.
 With `--profile auto`, the default, the server reads the card's memory and
 picks `rtx50-16gb` under 20 GiB: 262,144 tokens of context, two decode lanes,
 DFlash2 with 7 drafts, vision off (the tower and its encoder peak are VRAM the
-card does not have). The VRAM budget is the card's free memory less the
+card does not have; `--vision-enabled` turns it on at 1,024 tokens an image). The VRAM budget is the card's free memory less the
 profile's 1,200 MiB of headroom, so whatever the desktop holds comes out of it.
 When the plan does not fit that budget, the load lowers the context step by step
 instead of refusing at once, and `GET /v1/models` names what it adapted
@@ -77,7 +77,8 @@ thinking budget forced a close on 15 of 32 turns against 8 of 32 on NVFP4.
 
 ## Limits
 
-- Two lanes, not eight, and no image input.
+- Two lanes, not eight, and no image input unless you turn it on, then at
+  1,024 vision tokens an image.
 - Prefill is slower than on NVFP4: the trellis kernels' prefill reaches about
   half the card's tensor peak.
 - The speeds are an estimate until someone measures a real card.

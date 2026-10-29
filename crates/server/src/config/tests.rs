@@ -3110,6 +3110,7 @@ fn the_rtx50_16gb_profile_serves_the_27b_text_only_and_flash_next_starts_under_i
     let s27 = config.for_family(ModelFamily::Qwen38_27b).unwrap();
     assert_eq!(s27.max_context, 262_144);
     assert!(!s27.settings().vision.enabled, "vision is off, explicitly");
+    assert_eq!(s27.settings().vision.max_tokens, 1024, "the envelope a start that turns vision on takes");
     assert_eq!(s27.vram, VramMode::Derived { headroom_bytes: 1200 << 20 });
     assert_eq!(s27.settings().model.prefill_chunk, DEFAULT_PREFILL_CHUNK, "unset: 1,024");
     assert!(s27.speculation.is_some(), "DFlash2 is on");
@@ -3123,6 +3124,21 @@ fn the_rtx50_16gb_profile_serves_the_27b_text_only_and_flash_next_starts_under_i
     assert_eq!(s27.adaptable(), crate::adaptation::Adaptable::ALL, "every value the profile's, so every one adapts");
     let flash = config.for_family(ModelFamily::FlashNext).expect("Flash-Next starts under the 27B's profile");
     assert_eq!(flash.decode_lanes, None, "the 27B's lanes are its own section's");
+}
+
+/// GitHub #407: `--vision-enabled` under `rtx50-16gb` takes the profile's
+/// 1,024-token envelope, an operator's own envelope wins over it, and the
+/// 5090's profile keeps the 32,768 default.
+#[test]
+fn vision_turned_on_under_rtx50_16gb_takes_a_1024_token_envelope() {
+    let envelope = |flags: &[&str], gib: f64| {
+        let config = on_total(flags, gib).unwrap();
+        config.for_family(ModelFamily::Qwen38_27b).unwrap().vision.map(|v| v.max_tokens())
+    };
+    assert_eq!(envelope(&[], 15.9), None, "off unless turned on");
+    assert_eq!(envelope(&["--vision-enabled"], 15.9), Some(1024));
+    assert_eq!(envelope(&["--vision-enabled", "--vision-max-tokens", "4096"], 15.9), Some(4096));
+    assert_eq!(envelope(&[], 31.8), Some(DEFAULT_VISION_MAX_TOKENS), "rtx5090's vision is on at the default");
 }
 
 /// ADR 0063 §3: a value the profile or the hardcoded default gave adapts at
