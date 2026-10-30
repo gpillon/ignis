@@ -222,7 +222,12 @@ def test_the_records_are_an_exl3_directory_of_the_plans_matrices_at_the_quants_k
     # the converter's override takes them like for like
     import convert
     import override
-    assert override.Override(out, None, None, None).problems(convert.text_matrices(quant)[0]) == []
+    with open(os.path.join(out, "replay.json"), "w", encoding="utf-8") as f:
+        json.dump({"status": "complete", "sources": {"quant": {"revision": "q"}, "abliterated": {
+            "repo": "r", "revision": "v", "tensors": {"t": "0"}}},
+            "matrices": {m.key: {"record_sha256": hashlib.sha256(records.record(records.matrix(m.key))).hexdigest()}
+                         for m in planned}}, f)
+    assert override.Override(out).problems(convert.text_matrices(quant)[0]) == []
 
 
 def test_records_not_the_plans_are_named(tmp_path):

@@ -239,14 +239,14 @@ def test_verify_names_an_object_of_the_wrong_kind(tmp_path):
 import argparse  # noqa: E402
 
 import override as override_mod  # noqa: E402
-from conftest import OVERRIDE_BF16_REVISION, OVERRIDE_REVISION, PREFIX, make_override  # noqa: E402
+from conftest import OVERRIDE_REPO, OVERRIDE_REVISION, PREFIX, REVISION as QUANT_REVISION, make_override  # noqa: E402
 
 OV_NAMES = ["text/layers/2/mlp/gate_proj", "text/layers/3/attention/v_proj"]
 OV_FILES = ["layers.2.mlp.gate_proj.bin", "layers.3.attention.v_proj.bin"]
 
 
 def _override(ov):
-    return override_mod.Override(ov["override"], "someone/abliterated-exl3", ov["bf16"], "someone/abliterated")
+    return override_mod.Override(ov["override"], ov["bf16"])
 
 
 def _ov_errors(quant, bf16_root, objects, log=print, override=None):
@@ -308,15 +308,22 @@ def test_the_conversion_record_names_the_override_and_its_reference(tmp_path):
     record = _run(src, str(tmp_path / "work"), override=_override(ov), errors_fn=measure,
                   weights_id="trellis-sc30-abliterated")
     o = record["override"]
-    assert (o["repo"], o["revision"]) == ("someone/abliterated-exl3", OVERRIDE_REVISION)
+    # the source repository and revision are the replay's, the files pinned by what they hold now
+    assert (o["repo"], o["revision"]) == (OVERRIDE_REPO, OVERRIDE_REVISION)
+    assert o["quant_revision"] == QUANT_REVISION
     assert o["matrices"] == OV_NAMES
     assert sorted(o["files"]) == ["model-00001-of-00001.safetensors", "model.safetensors.index.json",
-                                  "quantization_config.json"]
+                                  "quantization_config.json", "replay.json"]
     for name, pin in o["files"].items():
         assert pin == {"bytes": os.path.getsize(os.path.join(ov["override"], name)),
                        "sha256": _sha(os.path.join(ov["override"], name))}
-    assert (o["reference"]["repo"], o["reference"]["revision"]) == ("someone/abliterated", OVERRIDE_BF16_REVISION)
-    assert sorted(o["reference"]["files"]) == ["model-00001-of-00001.safetensors", "model.safetensors.index.json"]
+    ref = o["reference"]
+    assert (ref["repo"], ref["revision"]) == (OVERRIDE_REPO, OVERRIDE_REVISION)
+    assert sorted(ref["files"]) == ["fetch.json", "model.safetensors.index.json"]
+    # each tensor is pinned by its own sha256, its shard by the LFS oid of the whole file
+    assert sorted(ref["tensors"]) == [k + ".weight" for k in ov["keys"]]
+    assert all(t["shard"] == ov["ref_shard"] and len(t["sha256"]) == 64 for t in ref["tensors"].values())
+    assert ref["shards"] == {ov["ref_shard"]: {"lfs_oid": "2" * 64}}
     # the step is handed the override, whose reference BF16 it reads the override matrices' from
     assert seen["override"].reference_root == ov["bf16"]
     m = record["trellis"]["matrices"]
@@ -326,11 +333,100 @@ def test_the_conversion_record_names_the_override_and_its_reference(tmp_path):
     assert record["identity"] == {"model_id": "qwen3.8-27b", "weights_id": "trellis-sc30-abliterated"}
 
 
-def test_a_dry_run_with_an_override_reads_no_reference(tmp_path):
+def test_a_dry_run_with_an_override_pins_its_reference_and_measures_nothing(tmp_path):
     src = make_sources(str(tmp_path))
     ov = make_override(str(tmp_path), src)
     record = _run(src, str(tmp_path / "work"), override=_override(ov), skip_errors=True, errors_fn=None)
-    assert record["override"]["reference"] is None and record["override"]["revision"] == OVERRIDE_REVISION
+    assert record["override"]["revision"] == OVERRIDE_REVISION
+    assert sorted(record["override"]["reference"]["tensors"]) == [k + ".weight" for k in ov["keys"]]
+    assert record["reference"] is None
+
+
+def _edit_json(path, change):
+    with open(path, encoding="utf-8") as f:
+        value = json.load(f)
+    change(value)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(value, f)
+
+
+def _refused(tmp_path, src, ov, message, **kw):
+    work = tmp_path / "work"
+    with pytest.raises(convert.Refused, match=message):
+        _run(src, str(work), override=_override(ov), errors_fn=_never, **kw)
+    assert not work.exists()
+
+
+def test_an_override_with_no_provenance_is_refused_naming_what_is_missing(tmp_path):
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    os.remove(os.path.join(ov["override"], "replay.json"))
+    a = argparse.Namespace(override=ov["override"], override_bf16=ov["bf16"])
+    with pytest.raises(convert.Refused, match="has no replay.json: the override's source repository and revision"):
+        convert.override_of(a)
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda r: r.update(status="partial"), "status complete .it is 'partial'."),
+    (lambda r: r["sources"]["abliterated"].pop("revision"), "sources.abliterated.revision"),
+    (lambda r: r["sources"].pop("quant"), "sources.quant.revision"),
+    (lambda r: r["matrices"][next(iter(r["matrices"]))].pop("record_sha256"), r"matrices\.\*\.record_sha256"),
+])
+def test_a_provenance_missing_what_the_pin_needs_is_refused(tmp_path, change, message):
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    _edit_json(os.path.join(ov["override"], "replay.json"), change)
+    with pytest.raises(ValueError, match="replay.json lacks .*" + message):
+        _override(ov)
+
+
+def test_a_record_that_is_not_the_one_the_replay_made_is_refused(tmp_path):
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    _edit_json(os.path.join(ov["override"], "replay.json"),
+               lambda r: r["matrices"][ov["keys"][0]].update(record_sha256="0" * 64))
+    _refused(tmp_path, src, ov, r"layers.2.mlp.gate_proj: the record's sha256 is not replay.json's")
+
+
+def test_an_override_made_against_another_quant_revision_is_refused(tmp_path):
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    _edit_json(os.path.join(ov["override"], "replay.json"),
+               lambda r: r["sources"]["quant"].update(revision="b" * 40))
+    _refused(tmp_path, src, ov, "made against the quant at b{40}")
+
+
+def test_a_tampered_tensor_in_the_partial_reference_is_refused(tmp_path):
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    shard = os.path.join(ov["bf16"], ov["ref_shard"])
+    with open(shard, "r+b") as f:
+        f.seek(-1, os.SEEK_END)          # the last byte of the last tensor
+        last = f.read(1)
+        f.seek(-1, os.SEEK_END)
+        f.write(bytes([last[0] ^ 1]))
+    for skip in (False, True):           # a dry run checks it too: it needs no GPU
+        _refused(tmp_path, src, ov, "layers.3.self_attn.v_proj.weight: hashes to",
+                 skip_errors=skip)
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda r: r.update(revision="c" * 40), "was made from someone/abliterated@fedcba"),
+    (lambda r: r["tensors"].pop(next(iter(r["tensors"]))), "weight: not in the reference"),
+    (lambda r: r["tensors"][next(iter(r["tensors"]))].update(sha256="0" * 64), "fetch.json's sha256 is not replay.json's"),
+])
+def test_a_reference_that_is_not_the_one_the_replay_used_is_refused(tmp_path, change, message):
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    _edit_json(os.path.join(ov["bf16"], "fetch.json"), change)
+    _refused(tmp_path, src, ov, message)
+
+
+def test_a_reference_with_no_fetch_record_is_refused(tmp_path):
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    os.remove(os.path.join(ov["bf16"], "fetch.json"))
+    _refused(tmp_path, src, ov, "has no fetch.json: its tensors cannot be pinned")
 
 
 def test_without_an_override_the_record_is_as_before(tmp_path):
@@ -386,6 +482,9 @@ def test_verify_takes_the_variants_weights_id(tmp_path):
 
 
 def test_an_override_given_by_halves_is_refused():
-    a = argparse.Namespace(override="x", override_repo=None, override_bf16=None, override_bf16_repo=None)
-    with pytest.raises(convert.Refused, match="--override-repo, --override-bf16, --override-bf16-repo"):
+    a = argparse.Namespace(override="x", override_bf16=None)
+    with pytest.raises(convert.Refused, match="--override takes --override-bf16 too"):
+        convert.override_of(a)
+    a = argparse.Namespace(override=None, override_bf16="x")
+    with pytest.raises(convert.Refused, match="--override takes --override too"):
         convert.override_of(a)
