@@ -7,6 +7,11 @@ Accepted (2026-10-21, after the owner's review: "accetto tutto"). Proposed the s
 - Flash-Next on 16 GB in phase 2, the image model after it;
 - a switch refuses before it tears anything down.
 
+**Amended by [ADR 0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md)**
+(GitHub #386): an entry may state its family, and an alias may be another entry's served id of the same family, not
+only a family's default id. The As built's "No family is declared" now holds where an entry's id or aliases name its
+family, or no alias involves it.
+
 Related:
 - [ADR 0047](0047-a-catalog-the-operator-can-extend.md): a catalog the operator can extend;
 - [ADR 0060](0060-the-27b-has-a-trellis-body-for-small-cards.md): the 16 GB body;

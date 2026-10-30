@@ -411,6 +411,7 @@ mod tests {
             revision: "0".repeat(40),
             artifact: format!("{id}-decoder.gguf"),
             card_class: None,
+            family: None,
             aliases: Vec::new(),
             kind: Some(ignis_core::compute::ModelKind::Speech),
             files: vec![file(&format!("{id}-encoder.gguf")), file(&format!("{id}-decoder.gguf"))],

@@ -68,6 +68,7 @@ fn entry() -> CatalogEntry {
         revision: REVISION.to_owned(),
         artifact: ARTIFACT.to_owned(),
         card_class: Some(ignis_server::config::profile::CardClass::Gb32),
+        family: None,
         aliases: Vec::new(),
         kind: None,
         // Listed large first: the fetch order is the transfer's, not the list's.

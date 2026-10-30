@@ -12,8 +12,11 @@
 # or 96; ADR 0064): a switch, a request, a start or a download naming an
 # entry above the card's class is refused before anything is torn down or
 # fetched. `aliases` (optional) lists the ids an entry also answers to: its
-# family's default id, served by it on a card below that id's own entry —
-# how the 16 GB 27B answers to `qwen3.8-27b` on a 16 GB card.
+# family's default id, or another entry's served id of its family, served by
+# it on a card below that id's own entry — how the 16 GB 27B answers to
+# `qwen3.8-27b` on a 16 GB card. `family` (optional) is the model family an
+# entry is of, by the family's own id (ADR 0074): stated where an alias
+# involves an entry and neither its id nor its aliases is a family's own id.
 models:
   - id: qwen3.8-27b
     repo: gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer
@@ -25,12 +28,14 @@ models:
       - { name: qwen3_8_27b_nvfp4full-v2.ninfer, bytes: 19406942468, sha256: "abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af" }
 
   # The 27B with the huihui-ai abliteration: the same family, told apart by
-  # its served id.
+  # its served id, which names no family, so the entry states it: an alias
+  # may then name it (ADR 0074).
   - id: qwen3.8-27b-abliterated
     repo: gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer
     revision: "ef3216949e42c42fc713feffb2e05849d57f0f3b"
     artifact: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
     card_class: 32
+    family: qwen3.8-27b
     files:
       - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer.graft.json, bytes: 41707, sha256: "09b0df892c314563192b0a4f102139939d4ef6261fcd210439d4e2636d12e6fe" }
       - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer, bytes: 19406942468, sha256: "18954280c794cb2ff1fc24ada8158de1df11bf0a0a2ea63f109045af48905ef1" }

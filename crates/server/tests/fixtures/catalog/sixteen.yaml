@@ -3,6 +3,12 @@
 # alias. The built-in catalog holds the real one (GitHub #338); the catalog's
 # unit tests (`download::catalog::testing`) parse this one over the built-in
 # entries without it.
+#
+# Beside it, the 16 GB build of the uncensored variant (ADR 0074, GitHub
+# #386): its id and its alias name no family, so it states its own, and its
+# alias is the abliterated 27B's served id, of that family. The built-in
+# catalog does not hold it yet (its pins come from the upload, #423): the
+# card-class HTTP tests put it over the built-in entries as an operator's.
 models:
   - id: qwen3.8-27b-16g
     repo: acme/qwen3.8-27b-16g
@@ -13,3 +19,14 @@ models:
     files:
       - { name: q16.ninfer.conversion.json, bytes: 1, sha256: 0000000000000000000000000000000000000000000000000000000000000001 }
       - { name: q16.ninfer, bytes: 2, sha256: 0000000000000000000000000000000000000000000000000000000000000002 }
+
+  - id: qwen3.8-27b-abliterated-16g
+    repo: acme/qwen3.8-27b-abliterated-16g
+    revision: v1
+    artifact: q16-abliterated.ninfer
+    card_class: 16
+    family: qwen3.8-27b
+    aliases: [qwen3.8-27b-abliterated]
+    files:
+      - { name: q16-abliterated.ninfer.conversion.json, bytes: 1, sha256: 0000000000000000000000000000000000000000000000000000000000000003 }
+      - { name: q16-abliterated.ninfer, bytes: 2, sha256: 0000000000000000000000000000000000000000000000000000000000000004 }

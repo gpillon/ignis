@@ -16,9 +16,12 @@
 //! its destination directory or fetch a file it cannot verify.
 //!
 //! An entry may state the smallest **card class** it loads on (every built-in
-//! one does), and may list **aliases**: its family's default id, which it
-//! answers to on a card below that id's own entry (ADR 0064, spec
-//! 27b-16gb/04 §6). [`Catalog::answering`] is the one class-aware step a
+//! one does), and may list **aliases**: its family's default id, or another
+//! entry's served id of its family, which it answers to on a card below that
+//! id's own entry (ADR 0064, ADR 0074, spec 27b-16gb/04 §6). It may state its
+//! **model family**, and must where an alias involves it and neither its id
+//! nor its aliases name one: the header stays the authority, checked where an
+//! alias resolves. [`Catalog::answering`] is the one class-aware step a
 //! requested id goes through — at start, for a switch, a request, a download
 //! and `GET /v1/models` — so a model the card cannot load is refused before
 //! anything is torn down or fetched.
@@ -41,12 +44,13 @@ const BUILT_IN_TEXT: &str = include_str!("catalog.yaml");
 pub static BUILT_IN_CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
     let document = Format::Yaml.read(BUILT_IN_TEXT).expect("the built-in catalog is YAML");
     let entries = parse(&document, "built into this binary", CatalogLayer::BuiltIn).expect("the built-in catalog is valid");
+    aliases_within_families(&entries).expect("the built-in catalog's aliases stay within their families");
     Catalog { entries }
 });
 
-/// The keys an entry takes; every one but `kind`, `card_class` and `aliases` is
-/// required.
-const ENTRY_KEYS: [&str; 8] = ["id", "repo", "revision", "artifact", "kind", "card_class", "aliases", "files"];
+/// The keys an entry takes; every one but `kind`, `card_class`, `family` and
+/// `aliases` is required.
+const ENTRY_KEYS: [&str; 9] = ["id", "repo", "revision", "artifact", "kind", "card_class", "family", "aliases", "files"];
 
 /// The name an entry's audio encoder carries beside its decoder (`kind:
 /// speech`): the speech adapter finds the encoder by this prefix.
@@ -123,9 +127,16 @@ pub struct CatalogEntry {
     /// refusal still guards it — so an operator catalog written before card
     /// classes still starts. Every built-in entry states one.
     pub card_class: Option<CardClass>,
+    /// The model family it states (`family`, ADR 0074), by the family's own
+    /// id, when it states one: required where an alias involves the entry
+    /// and neither its id nor its aliases is a family's own id, and agreeing
+    /// with them where they are. [`CatalogEntry::family()`] is the family the
+    /// catalog tells, whichever says it.
+    pub family: Option<ModelFamily>,
     /// The ids it also answers to (`aliases`, ADR 0064 §2): its family's
-    /// default id, so that on a card class below that id's own entry a
-    /// request naming it is served by this one. Usually none.
+    /// default id, or another entry's served id of its family (ADR 0074), so
+    /// that on a card class below that id's own entry a request naming it is
+    /// served by this one. Usually none.
     pub aliases: Vec<String>,
     /// Every file, as the catalog lists them.
     pub files: Vec<CatalogFile>,
@@ -144,12 +155,15 @@ impl CatalogEntry {
         self.kind == Some(ModelKind::Diarizer)
     }
 
-    /// The model family the entry is of, as far as the catalog tells it:
-    /// the family whose own id it is, or whose own id it answers to as an
-    /// alias. `None` for any other — the family stays the artifact's header's
-    /// (ADR 0047), and only an alias needs the catalog to know it.
+    /// The model family the entry is of, as far as the catalog tells it
+    /// (ADR 0074): the one it states, else the family whose own id it is, or
+    /// whose own id it answers to as an alias — the catalog refuses an entry
+    /// where these disagree. `None` for any other: no alias involves it, and
+    /// the family stays the artifact's header's (ADR 0047).
     pub fn family(&self) -> Option<ModelFamily> {
-        ModelFamily::of_model_id(&self.id).or_else(|| self.aliases.first().and_then(|alias| ModelFamily::of_model_id(alias)))
+        self.family
+            .or_else(|| ModelFamily::of_model_id(&self.id))
+            .or_else(|| self.aliases.iter().find_map(|alias| ModelFamily::of_model_id(alias)))
     }
 
     /// Where the artifact lives under `dir` (flat: every file of an entry
@@ -241,37 +255,49 @@ impl Catalog {
     /// entry is, and `entry`, of its family, lists it as an alias and fits
     /// the card (or states no class); refused, naming both classes, when no
     /// entry that answers to it fits. Matched exactly, as
-    /// [`Catalog::above_class`] matches.
+    /// [`Catalog::above_class`] matches. The family is the one the catalog
+    /// tells of `requested`'s entry ([`CatalogEntry::family()`]): its id's,
+    /// or the one it states (ADR 0074) — an entry of no family the catalog
+    /// tells has none to answer to it.
     pub fn answering(&self, requested: &str, card: Option<CardClass>) -> Result<Option<&CatalogEntry>, ClassRefusal> {
         let Some(refusal) = self.above_class(requested, card) else {
             return Ok(None);
         };
-        let family = ModelFamily::of_model_id(requested);
+        let family = self.family_of(requested);
         let answering = self.entries.iter().find(|entry| {
             entry.card_class.is_none_or(|needs| needs <= refusal.card)
+                && family.is_some()
                 && entry.family() == family
                 && entry.aliases.iter().any(|alias| alias == requested)
         });
         answering.map(Some).ok_or(refusal)
     }
 
+    /// The family the catalog tells of the entry whose id is exactly `id`
+    /// ([`CatalogEntry::family()`]); `None` for none, or no such entry.
+    fn family_of(&self, id: &str) -> Option<ModelFamily> {
+        self.entries.iter().find(|entry| entry.id == id).and_then(CatalogEntry::family)
+    }
+
     /// ADR 0064 §2 on the artifact itself, read once it is on disk: `entry`,
     /// which answers to `requested` on a card of class `card`
     /// ([`Catalog::answering`]), holds an artifact whose header names
-    /// `header` (ADR 0047: the family is the header's, not the catalog's).
-    /// An alias only ever resolves within one model family, so that must be
-    /// `requested`'s family; else the alias does not resolve, refused naming
-    /// both families — a header that names no family is refused too, the
-    /// safe side. `Ok` when no alias is in play: `requested`'s own entry is
-    /// not above the card's class.
+    /// `header` (ADR 0047: the header is the authority, the catalog's family
+    /// a claim it checks). An alias only ever resolves within one model
+    /// family, so that must be `requested`'s family as the catalog tells it
+    /// — its id's, or the one its entry states (ADR 0074); else the alias
+    /// does not resolve, refused naming both families — a header that names
+    /// no family is refused too, the safe side. `Ok` when no alias is in
+    /// play: `requested`'s own entry is not above the card's class.
     pub fn alias_holds(&self, requested: &str, entry: &CatalogEntry, header: Option<ModelFamily>, card: Option<CardClass>) -> Result<(), ClassRefusal> {
         let Some(mut refusal) = self.above_class(requested, card) else {
             return Ok(());
         };
-        if header.is_some() && header == ModelFamily::of_model_id(requested) {
+        let alias = self.family_of(requested);
+        if header.is_some() && header == alias {
             return Ok(());
         }
-        refusal.other_family = Some(OtherFamily { entry: entry.id.clone(), artifact: header });
+        refusal.other_family = Some(OtherFamily { entry: entry.id.clone(), artifact: header, alias });
         Err(refusal)
     }
 }
@@ -300,13 +326,16 @@ pub struct OtherFamily {
     pub entry: String,
     /// The family its artifact's header names; `None` for none.
     pub artifact: Option<ModelFamily>,
+    /// The alias's family, as the catalog tells it (ADR 0074): the family
+    /// whose own id the alias is, or the one its entry states.
+    pub alias: Option<ModelFamily>,
 }
 
 impl std::fmt::Display for ClassRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} needs a {} card or larger (its catalog entry's card_class), and this card is of the {} class", self.model, self.needs, self.card)?;
         if let Some(other) = &self.other_family {
-            let alias = ModelFamily::of_model_id(&self.model).map_or("no model family", ModelFamily::name);
+            let alias = other.alias.map_or("no model family", ModelFamily::name);
             let artifact = other.artifact.map_or("no model family", ModelFamily::name);
             write!(
                 f,
@@ -381,6 +410,7 @@ fn parse_operator_over(built_in: &Catalog, text: &str, format: Format, origin: &
         entries.push(entry);
     }
     claimed_once(&entries).map_err(|reason| CatalogError(format!("the catalog {origin}: {reason}")))?;
+    aliases_within_families(&entries).map_err(|reason| CatalogError(format!("the catalog {origin}: {reason}")))?;
     Ok(Catalog { entries })
 }
 
@@ -436,6 +466,56 @@ fn claimed_once(entries: &[CatalogEntry]) -> Result<(), String> {
     Ok(())
 }
 
+/// Every alias within its entry's model family (ADR 0064 §2, ADR 0074),
+/// over a whole catalog — the built-in one, and the merged one once an
+/// operator's entries join it, since an operator's alias may be a built-in
+/// entry's id. An alias that is an entry's served id, matched exactly as a
+/// request's `model` is, names an entry of a family the catalog tells, and
+/// of the aliasing entry's own: so an entry another entry's alias names
+/// states `family` when its id and aliases name none. Any other alias is a
+/// family's own id, which [`aliases`] held to the entry's family already.
+fn aliases_within_families(entries: &[CatalogEntry]) -> Result<(), String> {
+    for entry in entries {
+        for alias in &entry.aliases {
+            let Some(named) = entries.iter().find(|named| named.id == *alias) else {
+                if ModelFamily::of_model_id(alias).is_some() {
+                    continue;
+                }
+                return Err(format!(
+                    "entry `{}`: alias `{alias}` is no model family's own id ({}) and no entry's served id (ids match exactly): an alias answers for an id on a smaller card",
+                    entry.id,
+                    family_ids()
+                ));
+            };
+            match (named.family(), entry.family()) {
+                (None, _) => {
+                    return Err(format!(
+                        "entry `{}`: alias `{alias}` names an entry whose family nothing states — its id and aliases name none, so `{}` must state `family` ({}): an alias resolves only within one model family",
+                        entry.id,
+                        named.id,
+                        family_ids()
+                    ))
+                }
+                (Some(theirs), Some(own)) if theirs != own => {
+                    return Err(format!(
+                        "entry `{}`: alias `{alias}` names an entry of {} and the entry is of {}: an alias resolves only within one model family",
+                        entry.id,
+                        theirs.name(),
+                        own.name()
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every model family's own id, as a refusal lists them.
+fn family_ids() -> String {
+    ModelFamily::ALL.iter().map(|family| family.model_id()).collect::<Vec<_>>().join(", ")
+}
+
 /// One entry, or why it is refused (the caller names the entry).
 fn read_entry(value: &Value, layer: CatalogLayer) -> Result<CatalogEntry, String> {
     let Value::Object(map) = value else {
@@ -452,7 +532,8 @@ fn read_entry(value: &Value, layer: CatalogLayer) -> Result<CatalogEntry, String
     let artifact = text(map, "artifact")?;
     let kind = kind(map)?;
     let card_class = card_class(map)?;
-    let aliases = aliases(map, &id)?;
+    let family = family(map, &id)?;
+    let aliases = aliases(map, &id, family)?;
     let Some(Value::Array(listed)) = map.get("files") else {
         return Err("`files` must be a list of `{ name, bytes, sha256 }`".to_owned());
     };
@@ -499,7 +580,7 @@ fn read_entry(value: &Value, layer: CatalogLayer) -> Result<CatalogEntry, String
             ));
         }
     }
-    Ok(CatalogEntry { id, repo, revision, artifact, kind, card_class, aliases, files, layer })
+    Ok(CatalogEntry { id, repo, revision, artifact, kind, card_class, family, aliases, files, layer })
 }
 
 /// `kind`, when stated: `speech` or `diarizer`, the kinds a catalog says. A
@@ -530,12 +611,35 @@ fn card_class(map: &Map<String, Value>) -> Result<Option<CardClass>, String> {
     }
 }
 
-/// `aliases`, when listed: each a model family's own id ([`ModelFamily::ALL`]),
-/// none the entry's own, none twice, all of one family — and of the family
-/// the entry's own id names, when it names one. That is what keeps an alias
-/// within one family with no family declared in the catalog (ADR 0047): an
-/// entry's aliases say its family.
-fn aliases(map: &Map<String, Value>, id: &str) -> Result<Vec<String>, String> {
+/// `family`, when stated: a model family's own id ([`ModelFamily::ALL`]),
+/// matched exactly, and the family the entry's own id is, when it is one's
+/// (ADR 0074). Its aliases are held to it by [`aliases`].
+fn family(map: &Map<String, Value>, id: &str) -> Result<Option<ModelFamily>, String> {
+    let Some(value) = map.get("family") else {
+        return Ok(None);
+    };
+    let Some(stated) = value.as_str().and_then(|stated| ModelFamily::of_model_id(stated.trim())) else {
+        return Err(format!("`family` must be a model family's own id ({}), got {value}", family_ids()));
+    };
+    if let Some(own) = ModelFamily::of_model_id(id).filter(|own| *own != stated) {
+        return Err(format!(
+            "`family` is {} and the entry's own id `{id}` is {}'s: a stated family agrees with what the id says",
+            stated.name(),
+            own.name()
+        ));
+    }
+    Ok(Some(stated))
+}
+
+/// `aliases`, when listed: none the entry's own id, none twice. One that is
+/// a model family's own id is of the family the entry's own id names, when
+/// it names one, of the family it states (`stated`), and of the family its
+/// other such aliases are. One that is not names another entry's served id,
+/// held to the entry's family over the whole catalog
+/// ([`aliases_within_families`]) — so an entry listing one, whose id and
+/// aliases name no family, states `family` (ADR 0074). That is what keeps an
+/// alias within one family.
+fn aliases(map: &Map<String, Value>, id: &str, stated: Option<ModelFamily>) -> Result<Vec<String>, String> {
     let listed = match map.get("aliases") {
         None => return Ok(Vec::new()),
         Some(Value::Array(listed)) => listed,
@@ -549,27 +653,36 @@ fn aliases(map: &Map<String, Value>, id: &str) -> Result<Vec<String>, String> {
         if alias.eq_ignore_ascii_case(id) {
             return Err(format!("`aliases` lists the entry's own id `{alias}`"));
         }
-        let Some(family) = ModelFamily::of_model_id(alias) else {
-            let ids: Vec<&str> = ModelFamily::ALL.iter().map(|family| family.model_id()).collect();
-            return Err(format!(
-                "alias `{alias}` is not a model family's own id ({}): an alias answers for its family's default id on a smaller card",
-                ids.join(", ")
-            ));
-        };
         if aliases.iter().any(|earlier| earlier == alias) {
             return Err(format!("alias `{alias}` is listed twice"));
         }
-        if let Some(own) = ModelFamily::of_model_id(id).filter(|own| *own != family) {
-            return Err(format!(
-                "alias `{alias}` is {}'s own id and the entry's own id `{id}` is {}'s: an alias resolves only within one model family",
-                family.name(),
-                own.name()
-            ));
-        }
-        if let Some(first) = aliases.first().filter(|first| ModelFamily::of_model_id(first) != Some(family)) {
-            return Err(format!("aliases `{first}` and `{alias}` name two model families: an alias resolves only within one"));
+        if let Some(family) = ModelFamily::of_model_id(alias) {
+            if let Some(own) = ModelFamily::of_model_id(id).filter(|own| *own != family) {
+                return Err(format!(
+                    "alias `{alias}` is {}'s own id and the entry's own id `{id}` is {}'s: an alias resolves only within one model family",
+                    family.name(),
+                    own.name()
+                ));
+            }
+            if let Some(stated) = stated.filter(|stated| *stated != family) {
+                return Err(format!(
+                    "alias `{alias}` is {}'s own id and the entry states `family` {}: an alias resolves only within one model family",
+                    family.name(),
+                    stated.name()
+                ));
+            }
+            if let Some(first) = aliases.iter().find(|earlier| ModelFamily::of_model_id(earlier).is_some_and(|earlier| earlier != family)) {
+                return Err(format!("aliases `{first}` and `{alias}` name two model families: an alias resolves only within one"));
+            }
         }
         aliases.push(alias.to_owned());
+    }
+    let named = ModelFamily::of_model_id(id).is_some() || aliases.iter().any(|alias| ModelFamily::of_model_id(alias).is_some());
+    if !aliases.is_empty() && stated.is_none() && !named {
+        return Err(format!(
+            "it lists aliases, and neither its id nor its aliases is a model family's own id, so it must state `family` ({}), the family it is of (ADR 0074)",
+            family_ids()
+        ));
     }
     Ok(aliases)
 }
@@ -644,7 +757,9 @@ pub(crate) mod testing {
     /// The 16 GB 27B's entry as an operator catalog would state it: its own
     /// served id, the 16 GB class, and the 27B's default id as its alias.
     /// The built-in catalog holds the real one (GitHub #338), so this one is
-    /// parsed over [`thirty_two`]: the input of the parsing tests.
+    /// parsed over [`thirty_two`]: the input of the parsing tests. Beside it,
+    /// the uncensored variant's 16 GB build (ADR 0074), stating the 27B's
+    /// family and answering to `qwen3.8-27b-abliterated`.
     pub(crate) const SIXTEEN: &str = include_str!("../../tests/fixtures/catalog/sixteen.yaml");
 
     /// The built-in catalog, which holds the 16 GB 27B (GitHub #338).
@@ -672,19 +787,23 @@ mod tests {
 
     /// The spec's table, written out again: what the built-in catalog must
     /// hold, value for value (`id`, `repo`, `revision`, `artifact`, its
-    /// `card_class` in GB, then each file's name, bytes and SHA-256 in the
-    /// order listed). Every built-in entry states its card class (ADR 0064
-    /// §1: an operator's may leave it out, a built-in one never does), the
-    /// 32 GB one for each but the 16 GB 27B's (GitHub #338, spec
-    /// 27b-16gb/01), the only one with an alias: `qwen3.8-27b`.
+    /// `card_class` in GB, its model family, its aliases, then each file's
+    /// name, bytes and SHA-256 in the order listed). Every built-in entry
+    /// states its card class (ADR 0064 §1: an operator's may leave it out, a
+    /// built-in one never does), the 32 GB one for each but the 16 GB 27B's
+    /// (GitHub #338, spec 27b-16gb/01), the only one with an alias:
+    /// `qwen3.8-27b`. Every one is of a family the catalog tells (ADR 0074):
+    /// its own id's, its alias's, or the one it states — the abliterated
+    /// 27B's, whose id names none.
     #[allow(clippy::type_complexity)]
-    const RELEASES: [(&str, &str, &str, &str, u32, &[&str], &[(&str, u64, &str)]); 5] = [
+    const RELEASES: [(&str, &str, &str, &str, u32, ModelFamily, &[&str], &[(&str, u64, &str)]); 5] = [
         (
             "qwen3.8-27b",
             "gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer",
             "e961b419b672e183aa55df8c4b975abc82006e8a",
             "qwen3_8_27b_nvfp4full-v2.ninfer",
             32,
+            ModelFamily::Qwen38_27b,
             &[],
             &[
                 ("qwen3_8_27b_nvfp4full-v2.ninfer.graft.json", 6_981, "b87e3c005fb1daf7d6b208da52790f95a3f478732f767f87417a5d7fc23491d1"),
@@ -697,6 +816,7 @@ mod tests {
             "ef3216949e42c42fc713feffb2e05849d57f0f3b",
             "qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer",
             32,
+            ModelFamily::Qwen38_27b,
             &[],
             &[
                 (
@@ -717,6 +837,7 @@ mod tests {
             "8d94db83cd8e58d6be31e796723e5e35b960638c",
             "qwen3_8_flash_next_trellis_a25-v2.ninfer",
             32,
+            ModelFamily::FlashNext,
             &[],
             &[
                 (
@@ -741,6 +862,7 @@ mod tests {
             "d6912417aa47320cd71c78e19d99872faa5cb63b",
             "ignis_image_2_1_turbo-v2.ninfer",
             32,
+            ModelFamily::QwenImage21,
             &[],
             &[
                 ("ignis_image_2_1_turbo-v2.ninfer.conversion.json", 617_924, "a97f04912b9a6d76e828efc02b7e458d0f45d00bc00d794cca39d703ad0f33ca"),
@@ -754,6 +876,7 @@ mod tests {
             "f5bbd2cc14c9ca573ef5553c100ac69410f1fe58",
             "qwen3_8_27b_trellis_sc30-v2.ninfer",
             16,
+            ModelFamily::Qwen38_27b,
             &["qwen3.8-27b"],
             &[
                 ("qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json", 309_495, "210ab54bfe8b04e5fc4337ee3755c340ea3f21239aa625c505aa2406645a340d"),
@@ -838,10 +961,11 @@ mod tests {
         let parsed = parse(&document, "built into this binary", CatalogLayer::BuiltIn).expect("every invariant holds");
         assert_eq!(parsed, BUILT_IN_CATALOG.entries);
         assert_eq!(parsed.len(), RELEASES.len() + SPEECH_RELEASES.len() + 1, "and the diarizer");
-        for (entry, (id, repo, revision, artifact, card_class, aliases, files)) in parsed.iter().zip(RELEASES) {
+        for (entry, (id, repo, revision, artifact, card_class, family, aliases, files)) in parsed.iter().zip(RELEASES) {
             assert_eq!(entry.kind, None, "{id}: a text or image model states no kind");
             assert_eq!((entry.id.as_str(), entry.repo.as_str(), entry.revision.as_str(), entry.artifact.as_str()), (id, repo, revision, artifact));
             assert_eq!(entry.card_class.map(CardClass::gb), Some(card_class), "{id}: every built-in entry states its class");
+            assert_eq!(entry.family(), Some(family), "{id}: every built-in entry is of a family the catalog tells");
             assert_eq!(entry.aliases, aliases, "{id}");
             assert_eq!(entry.layer, CatalogLayer::BuiltIn, "{id}");
             let listed: Vec<(&str, u64, &str)> = entry.files.iter().map(|f| (f.name.as_str(), f.bytes, f.sha256.as_str())).collect();
@@ -863,6 +987,7 @@ mod tests {
             assert_eq!((entry.repo.as_str(), entry.revision.as_str(), entry.artifact.as_str()), (repo, revision, decoder), "{id}");
             assert!(entry.is_speech(), "{id}");
             assert_eq!((entry.card_class, entry.aliases.as_slice(), entry.layer), (None, &[][..], CatalogLayer::BuiltIn), "{id}");
+            assert_eq!(entry.family(), None, "{id}: of no family the catalog tells: its id names none, and it states none");
             let listed: Vec<(&str, u64, &str)> = entry.files.iter().map(|f| (f.name.as_str(), f.bytes, f.sha256.as_str())).collect();
             assert_eq!(listed, files, "{id}");
             assert_eq!(entry.files.iter().filter(|f| f.name.starts_with(SPEECH_ENCODER_PREFIX)).count(), 1, "{id}: one encoder");
@@ -950,6 +1075,7 @@ mod tests {
             (entry.id.as_str(), entry.repo.as_str(), entry.revision.as_str(), entry.artifact.as_str(), entry.card_class),
             ("nemotron-3-diarization", "gpillon/Nemotron-3-Diarization-GGUF-ignis", "d46d59d03be709db18e223b6bf92e8c32d14f422", "Nemotron-3-Diarization-F16.gguf", None)
         );
+        assert_eq!(entry.family(), Some(ModelFamily::Nemotron3Diarization), "its id is the family's own");
         let listed: Vec<(&str, u64, &str)> = entry.files.iter().map(|f| (f.name.as_str(), f.bytes, f.sha256.as_str())).collect();
         assert_eq!(listed, [("Nemotron-3-Diarization-F16.gguf", 198_805_760, "f7a80981d178be5d683aee225166bc03806aac2d9b629f42f418d4e5fd2c8623")]);
     }
@@ -1026,11 +1152,10 @@ mod tests {
             ("card_class: 32", "card_class: 24", vec![entry, "`card_class`", "16, 32, 96", "got 24"]),
             ("card_class: 32", "card_class: \"32\"", vec![entry, "`card_class`", "16, 32, 96"]),
             ("card_class: 32", "card_class: -16", vec![entry, "`card_class`"]),
-            // ADR 0064 §2: an alias is a family's own id, of one family,
-            // never the entry's own id.
+            // ADR 0064 §2: an alias is of one family, never the entry's own
+            // id.
             ("card_class: 32", "card_class: 32\n    aliases: qwen3.8-27b", vec![entry, "`aliases` must be a list"]),
             ("card_class: 32", "card_class: 32\n    aliases: [acme-qwen3.8-27b-ft]", vec![entry, "own id"]),
-            ("card_class: 32", "card_class: 32\n    aliases: [qwen3.8-27b-abliterated]", vec![entry, "`qwen3.8-27b-abliterated`", "family's own id"]),
             ("card_class: 32", "card_class: 32\n    aliases: [qwen3.8-27b, qwen3.8-flash-next]", vec![entry, "`qwen3.8-27b`", "`qwen3.8-flash-next`", "two model families"]),
             ("card_class: 32", "card_class: 32\n    aliases: [qwen3.8-27b, qwen3.8-27b]", vec![entry, "`qwen3.8-27b`", "twice"]),
         ] {
@@ -1044,6 +1169,86 @@ mod tests {
         }
     }
 
+    /// ADR 0074: `family` is a model family's own id and agrees with what
+    /// the entry's id and aliases say; an alias is a family's own id or
+    /// another entry's served id, of the entry's own family, and an entry an
+    /// alias involves is of a family the catalog tells. Each refusal names
+    /// the entry.
+    #[test]
+    fn a_family_or_an_alias_that_does_not_hold_is_refused_naming_the_entry() {
+        let entry = "`acme-qwen3.8-27b-ft`";
+        for (to, says) in [
+            // A `family` that is no family's own id.
+            ("card_class: 32\n    family: qwen3.8-27b-abliterated", vec![entry, "`family`", "qwen3.8-27b-abliterated", "qwen3.8-27b, qwen3.8-flash-next"]),
+            ("card_class: 32\n    family: Qwen3.8-27B", vec![entry, "`family`", "Qwen3.8-27B"]),
+            ("card_class: 32\n    family: 27", vec![entry, "`family`"]),
+            // A `family` contradicting an alias that is a family's own id.
+            ("card_class: 32\n    family: qwen3.8-flash-next\n    aliases: [qwen3.8-27b]", vec![entry, "`family`", "`qwen3.8-27b`", "Qwen3.8-Flash-Next", "Qwen3.8-27B"]),
+            // An alias naming an entry of another family: the built-in
+            // abliterated 27B is a Qwen3.8-27B by the `family` it states.
+            ("card_class: 32\n    family: qwen3.8-flash-next\n    aliases: [qwen3.8-27b-abliterated]", vec![entry, "`qwen3.8-27b-abliterated`", "Qwen3.8-27B", "Qwen3.8-Flash-Next", "one model family"]),
+            // An alias naming neither a family nor an entry: ids match
+            // exactly, as a request's `model` does.
+            ("card_class: 32\n    family: qwen3.8-27b\n    aliases: [acme-nothing]", vec![entry, "`acme-nothing`", "no entry's"]),
+            ("card_class: 32\n    family: qwen3.8-27b\n    aliases: [QWEN3.8-27B-ABLITERATED]", vec![entry, "`QWEN3.8-27B-ABLITERATED`", "no entry's"]),
+            // An entry listing an alias, whose id and aliases name no family,
+            // and that states none.
+            ("card_class: 32\n    aliases: [qwen3.8-27b-abliterated]", vec![entry, "`family`", "neither its id nor its aliases"]),
+        ] {
+            let text = OPERATOR.replacen("card_class: 32", to, 1);
+            let err = operator(&text).expect_err(to).0;
+            assert!(err.contains("acme.catalog.yaml"), "{err}");
+            for said in says {
+                assert!(err.contains(said), "{to:?}: `{said}` missing from: {err}");
+            }
+        }
+
+        // An alias naming an entry whose family nothing states: the
+        // operator's own 16 GB build answering to its fine-tune, whose id
+        // names none.
+        let sixteen = OPERATOR
+            .strip_prefix("models:\n")
+            .unwrap()
+            .replacen("id: acme-qwen3.8-27b-ft", "id: acme-qwen3.8-27b-ft-16g", 1)
+            .replacen("card_class: 32", "card_class: 16\n    family: qwen3.8-27b\n    aliases: [acme-qwen3.8-27b-ft]", 1)
+            .replace("acme_ft.ninfer", "acme_ft_16g.ninfer");
+        let pair = format!("{OPERATOR}{sixteen}");
+        let err = operator(&pair).unwrap_err().0;
+        for said in ["acme.catalog.yaml", "`acme-qwen3.8-27b-ft-16g`", "alias `acme-qwen3.8-27b-ft`", "`family`"] {
+            assert!(err.contains(said), "`{said}` missing from: {err}");
+        }
+        // Stated, the pair holds: the fine-tune's id is served by its 16 GB
+        // build on a 16 GB card.
+        let pair = operator(&pair.replacen("card_class: 32", "card_class: 32\n    family: qwen3.8-27b", 1)).expect("an alias of the operator's own entry");
+        assert_eq!(resolved(&pair, "acme-qwen3.8-27b-ft", Some(CardClass::Gb16)), Ok("acme-qwen3.8-27b-ft-16g"));
+        assert_eq!(resolved(&pair, "acme-qwen3.8-27b-ft", Some(CardClass::Gb32)), Ok("acme-qwen3.8-27b-ft"));
+
+        // A `family` contradicting the entry's own id, a family's own id (a
+        // built-in id, so read as the built-in layer).
+        let text = OPERATOR.replacen("acme-qwen3.8-27b-ft", "qwen3.8-flash-next", 1).replacen("card_class: 32", "card_class: 32\n    family: qwen3.8-27b", 1);
+        let err = parse(&Format::Yaml.read(&text).unwrap(), "test", CatalogLayer::BuiltIn).unwrap_err().0;
+        for said in ["`qwen3.8-flash-next`", "`family`", "Qwen3.8-27B", "Qwen3.8-Flash-Next"] {
+            assert!(err.contains(said), "`{said}` missing from: {err}");
+        }
+    }
+
+    /// ADR 0074: a catalog written before `family` existed loads unchanged:
+    /// an entry no alias involves, and one whose alias is a family's own id,
+    /// state none and need none.
+    #[test]
+    fn an_operator_catalog_without_family_loads_unchanged() {
+        let catalog = operator(OPERATOR).expect("an entry no alias involves");
+        let acme = catalog.entry("acme-qwen3.8-27b-ft").unwrap();
+        assert_eq!((acme.family, acme.family()), (None, None));
+        let (_, entries) = SIXTEEN.split_once("models:\n").unwrap();
+        let first = entries.split("\n  - ").next().unwrap();
+        assert!(!first.contains("family:"), "{first}");
+        let catalog = sixteen_over_thirty_two(&format!("models:\n{first}\n")).expect("an alias that is the family's own id");
+        let sixteen = catalog.entry("qwen3.8-27b-16g").unwrap();
+        assert_eq!((sixteen.family, sixteen.family()), (None, Some(ModelFamily::Qwen38_27b)));
+        assert_eq!(resolved(&catalog, "qwen3.8-27b", Some(CardClass::Gb16)), Ok("qwen3.8-27b-16g"));
+    }
+
     #[test]
     fn a_duplicate_id_is_refused_case_insensitively_within_the_file() {
         let body = OPERATOR.strip_prefix("models:\n").unwrap();
@@ -1054,8 +1259,9 @@ mod tests {
 
     /// ADR 0064 §1-2: an entry states the smallest card class it loads on
     /// and may list the ids it also answers to; the family the catalog can
-    /// tell is the one whose own id it is or answers to, and no other — the
-    /// rest is the artifact's header's (ADR 0047).
+    /// tell is the one whose own id it is or answers to, or the one it
+    /// states (ADR 0074), and no other — the rest is the artifact's header's
+    /// (ADR 0047).
     #[test]
     fn an_entry_states_its_card_class_and_may_list_aliases() {
         use ignis_core::compute::ModelFamily;
@@ -1068,7 +1274,9 @@ mod tests {
         assert_eq!(sixteen.family(), Some(ModelFamily::Qwen38_27b), "the family whose own id it answers to");
         assert_eq!(catalog.entry("qwen3.8-27b").unwrap().family(), Some(ModelFamily::Qwen38_27b));
         assert_eq!(catalog.entry("ignis-image-2.1-turbo").unwrap().family(), Some(ModelFamily::QwenImage21));
-        assert_eq!(catalog.entry("qwen3.8-27b-abliterated").unwrap().family(), None, "its header says, not the catalog");
+        let abliterated = catalog.entry("qwen3.8-27b-abliterated").unwrap();
+        assert_eq!((abliterated.family, abliterated.family()), (Some(ModelFamily::Qwen38_27b), Some(ModelFamily::Qwen38_27b)), "its id names none: it states it (ADR 0074)");
+        assert_eq!((sixteen.family, catalog.entry("qwen3.8-27b").unwrap().family), (None, None), "their ids and aliases say it: they state none");
         let json = serde_json::to_string(&Format::Yaml.read(SIXTEEN).unwrap()).unwrap();
         assert_eq!(parse_operator_over(&thirty_two(), &json, Format::Json, "acme.json").unwrap(), catalog);
         let built_in = Catalog::built_in().entry("qwen3.8-27b-16g").expect("the built-in 16 GB 27B");
@@ -1108,7 +1316,8 @@ mod tests {
     #[test]
     fn an_alias_two_entries_claim_is_refused() {
         let (_, body) = SIXTEEN.split_once("models:\n").unwrap();
-        let twice = format!("{SIXTEEN}{}", body.replacen("id: qwen3.8-27b-16g", "id: acme-27b-16g", 1));
+        let first = body.split("\n  - ").next().unwrap();
+        let twice = format!("{SIXTEEN}\n{}\n", first.replacen("id: qwen3.8-27b-16g", "id: acme-27b-16g", 1));
         let err = sixteen_over_thirty_two(&twice).unwrap_err().0;
         assert!(
             err.contains("acme.catalog.yaml") && err.contains("`acme-27b-16g`") && err.contains("`qwen3.8-27b-16g`") && err.contains("alias `qwen3.8-27b`"),
@@ -1186,7 +1395,10 @@ mod tests {
         let card = Some(CardClass::Gb16);
         assert_eq!(catalog.alias_holds("qwen3.8-27b", sixteen, Some(ModelFamily::Qwen38_27b), card), Ok(()));
         let refusal = catalog.alias_holds("qwen3.8-27b", sixteen, Some(ModelFamily::FlashNext), card).unwrap_err();
-        assert_eq!(refusal.other_family, Some(OtherFamily { entry: "qwen3.8-27b-16g".to_owned(), artifact: Some(ModelFamily::FlashNext) }));
+        assert_eq!(
+            refusal.other_family,
+            Some(OtherFamily { entry: "qwen3.8-27b-16g".to_owned(), artifact: Some(ModelFamily::FlashNext), alias: Some(ModelFamily::Qwen38_27b) })
+        );
         let said = refusal.to_string();
         for named in ["qwen3.8-27b needs a 32 GB card", "16 GB class", "qwen3.8-27b-16g lists it as an alias", "Qwen3.8-Flash-Next", "Qwen3.8-27B", "one model family"] {
             assert!(said.contains(named), "{named}: {said}");
@@ -1195,6 +1407,50 @@ mod tests {
         for card in [Some(CardClass::Gb32), None] {
             assert_eq!(catalog.alias_holds("qwen3.8-27b", sixteen, Some(ModelFamily::FlashNext), card), Ok(()), "{card:?}: no alias in play");
         }
+    }
+
+    /// ADR 0074: an alias may be another entry's served id of the same
+    /// family, answered on a card below that entry's class. The fixture's
+    /// 16 GB build of the uncensored variant states the 27B's family and
+    /// answers to `qwen3.8-27b-abliterated`, whose entry states it too, on a
+    /// 16 GB card; on a 32 GB card, a 96 GB one or one of no known class the
+    /// id is its own entry's.
+    #[test]
+    fn an_alias_may_be_another_entrys_served_id_of_the_same_family() {
+        use CardClass::*;
+        let catalog = sixteen_over_thirty_two(SIXTEEN).expect("valid");
+        let entry = catalog.entry("qwen3.8-27b-abliterated-16g").expect("listed");
+        assert_eq!((entry.card_class, entry.family, entry.aliases.as_slice()), (Some(Gb16), Some(ModelFamily::Qwen38_27b), &["qwen3.8-27b-abliterated".to_owned()][..]));
+        assert_eq!(resolved(&catalog, "qwen3.8-27b-abliterated", Some(Gb16)), Ok("qwen3.8-27b-abliterated-16g"));
+        assert_eq!(resolved(&catalog, "qwen3.8-27b", Some(Gb16)), Ok("qwen3.8-27b-16g"), "each id its own answering entry");
+        for card in [Some(Gb32), Some(Gb96), None] {
+            assert_eq!(catalog.answering("qwen3.8-27b-abliterated", card), Ok(None), "{card:?}: its own entry");
+        }
+    }
+
+    /// ADR 0074 on the artifact: the alias's family is the one its entry
+    /// states when its id names none, and the header stays the authority —
+    /// the abliterated 16 GB build holding an artifact of another family does
+    /// not answer to `qwen3.8-27b-abliterated`, refused naming both families.
+    #[test]
+    fn an_alias_of_a_stated_family_resolves_only_to_an_artifact_of_that_family() {
+        let catalog = sixteen_over_thirty_two(SIXTEEN).expect("valid");
+        let entry = catalog.entry("qwen3.8-27b-abliterated-16g").unwrap();
+        let card = Some(CardClass::Gb16);
+        assert_eq!(catalog.alias_holds("qwen3.8-27b-abliterated", entry, Some(ModelFamily::Qwen38_27b), card), Ok(()));
+        let refusal = catalog.alias_holds("qwen3.8-27b-abliterated", entry, Some(ModelFamily::FlashNext), card).unwrap_err();
+        let said = refusal.to_string();
+        for named in [
+            "qwen3.8-27b-abliterated needs a 32 GB card",
+            "16 GB class",
+            "qwen3.8-27b-abliterated-16g lists it as an alias",
+            "its artifact is Qwen3.8-Flash-Next and qwen3.8-27b-abliterated is Qwen3.8-27B",
+            "one model family",
+        ] {
+            assert!(said.contains(named), "{named}: {said}");
+        }
+        assert!(catalog.alias_holds("qwen3.8-27b-abliterated", entry, None, card).unwrap_err().to_string().contains("artifact is no model family"));
+        assert_eq!(catalog.alias_holds("qwen3.8-27b-abliterated", entry, Some(ModelFamily::FlashNext), Some(CardClass::Gb32)), Ok(()), "no alias in play");
     }
 
     /// ADR 0064 §2: the entry that answers to the 27B's default id never

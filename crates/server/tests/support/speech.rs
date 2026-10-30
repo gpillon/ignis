@@ -53,6 +53,7 @@ pub fn models(dir: &std::path::Path) -> SpeechModels {
         revision: "0".repeat(40),
         artifact: format!("{id}-decoder.gguf"),
         card_class: None,
+        family: None,
         aliases: Vec::new(),
         kind: Some(ignis_core::compute::ModelKind::Speech),
         files: ["encoder", "decoder"]
