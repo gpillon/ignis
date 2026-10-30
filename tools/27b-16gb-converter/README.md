@@ -27,8 +27,9 @@ it. Python never writes the container.
 | `plan.py` | The object table: the served directory, in its order, with the body's planes and the head replaced. |
 | `exl3.py` | The quant's matrices from its safetensors headers (no torch): K, shapes, the `mul1` flag, the record bytes. |
 | `container.py` | Read-only access to a `.ninfer` v2 container (the served artifact; the packed one for `verify`). |
-| `override.py` | An override directory: EXL3 records that replace the quant's, checked like for like. |
-| `reconstruction.py` | The GPU step and the only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
+| `override.py` | An override directory: EXL3 records that replace the quant's, checked like for like, pinned by the replay's provenance and its partial BF16 reference. |
+| `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
+| `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter/work.py`). |
 | `test_*.py`, `conftest.py` | Unit tests (CPU only) on a reduced synthetic served artifact and quant. |
 
@@ -74,26 +75,35 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
 
 ## The override
 
-`run` and `verify` take an **override**, a directory of EXL3 records in the quant's layout (index, shards,
-`quantization_config.json`) that replaces the quant's records of the same name, for a variant made from
-another BF16 (the uncensored 16 GB artifact, from the abliterated BF16). Every other object is built
-exactly as without it, and without `--override` the work tree and `converter.json` are as before.
+`run` and `verify` take an **override**, the directory `replay.py run` writes: EXL3 records in the quant's
+layout (index, shards, `quantization_config.json`) that replace the quant's records of the same name, and
+`replay.json`, their provenance. It serves a variant made from another BF16 (the uncensored 16 GB artifact,
+from the abliterated BF16). Every other object is built exactly as without it, and without `--override`
+the work tree and `converter.json` are as before.
 
 ```
-F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/convert.py run ...     --override H:/models/<override> --override-repo <owner/override-repo>     --override-bf16 H:/models/<variant-bf16> --override-bf16-repo <owner/variant-bf16>     --weights-id trellis-sc30-abliterated
-F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify ...     --override H:/models/<override> --weights-id trellis-sc30-abliterated
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/convert.py run ... --override H:/override-386 --override-bf16 H:/abliterated-386 --weights-id trellis-sc30-abliterated
+F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify ... --override H:/override-386 --weights-id trellis-sc30-abliterated
 ```
 
+- **The provenance is `replay.json`.** The override's source repository and revision come from it
+  (`sources.abliterated`), with the quant revision it was made against and each record's sha256. `run`
+  refuses (exit 2), naming what is missing, an override with no `replay.json` or one that is not
+  `complete` or lacks those fields, an override made against another quant revision, and a record whose
+  sha256 is not the replay's. The override's own files (shards, index, config, `replay.json`) are pinned by
+  bytes and sha256 computed at conversion time; there is no download record to read.
 - **A swap is like for like.** `run` and `verify` refuse (exit 2 and VERIFY FAILED) an override record
   whose name is not one of the quant's text matrices, or whose K or shape differs from the quant's
   record, naming the record and what differs.
-- **Its error is measured against its own BF16.** The reconstruction step reads each override matrix
-  from the override and its reference from `--override-bf16`; the quant's matrices are measured against
-  `--bf16` as today. The same pins apply: revision, sha256 of every file read, shards against their LFS oid.
+- **Its error is measured against its own BF16.** `--override-bf16` is the directory `replay.py fetch`
+  wrote: partial shards holding only the changed tensors, an index and `fetch.json`. `run` reads each
+  override matrix's reference from it, and the quant's matrices are measured against `--bf16` as today.
+  It pins the reference by tensor, not by shard: `fetch.json` must be the replay's repository and
+  revision, and each override matrix's `.weight` is hashed from its shard and must equal both
+  `fetch.json`'s and `replay.json`'s sha256. This check needs no GPU and runs in a dry run too.
 - **`--weights-id`** sets the identity the record and `verify` expect (default `trellis-sc30`); pass the
   packer the same `--weights-id` and the output name.
-- **`verify`** compares each override record to the override's, bit for bit; it takes only `--override`
-  (the source repositories are the conversion record's).
+- **`verify`** compares each override record to the override's, bit for bit; it takes only `--override`.
 
 ## The sidecar
 
@@ -109,11 +119,49 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify .
   `ignis_artifact::checksum::verify` reads.
 - `trellis`: per matrix its source key, `k2` (2·K), format, shape, bytes, sha256 and relative
   reconstruction error; the K histogram, the bound, the maximum and the mean.
-- `override` (only with an override): its repository, revision and every file read, by bytes and sha256;
-  `matrices`, the object names it replaced (each also marked `override: true` in `trellis.matrices`); its
-  `reference` BF16, the repository, revision and files the override matrices' errors are measured against
-  (none in a dry run).
+- `override` (only with an override): its repository and revision (the replay's), the quant revision it was made
+  against and every file read, by bytes and sha256; `matrices`, the object names it replaced (each also marked
+  `override: true` in `trellis.matrices`); its `reference` BF16, the repository, revision, the `fetch.json` and
+  index files, the shards (LFS oid) and each override matrix's tensor by sha256 (the errors in
+  `trellis.matrices` are measured against it; none in a dry run).
 - `copied`: per object its bytes and sha256; `dropped`: the served objects left out; `quant_unused`:
   the quant's matrices not taken (its MTP layer).
 - `converter`: the commit the converter ran from and whether its files differed from it (`dirty`);
   `versions`: Python, torch, exllamav3, safetensors.
+
+## The abliterated replay
+
+`replay.py` makes the override records of the uncensored 16 GB artifact (spec #386, GitHub #421): the
+70 matrices the huihui-ai abliteration changed (layers 17-51: `mlp.down_proj`, and
+`linear_attn.out_proj` or `self_attn.o_proj` by layer type), re-quantized at the K the quant gives each
+(all 3, layer 23's `o_proj` 4) by replaying exllamav3's own conversion of them.
+
+```
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/replay.py fetch \
+    --quant Y:/models/qwen38-27b-exl3-SC_3.00bpw_H4 --out H:/abliterated-386
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/replay.py run \
+    --quant Y:/models/qwen38-27b-exl3-SC_3.00bpw_H4 --bf16 Y:/models/Qwen3.8-27B \
+    --abliterated H:/abliterated-386 --out H:/override-386
+```
+
+- **`fetch`** takes the 70 BF16 tensors of `huihui-ai/Huihui-Qwen3.8-27B-abliterated` at revision
+  739e3c5b (the 32 GB artifact's) by HTTP range, never whole shards (8.44 GB of 9 shards): each
+  shard's tensors in a file of the shard's name, an index, and `fetch.json` (each shard's LFS oid,
+  each tensor's source range and sha256). A tensor whose bytes are not its header's length, or whose
+  dtype or shape is not the plan's, is refused. The abliterated BF16 is the base with that directory
+  laid over it: exllamav3's tensor collection takes the later file of a key, so the base is never
+  copied.
+- **`run`** (GPU, exllamav3 1.5.3; `make gpu-status` first) replays `convert_model.py` for those
+  matrices: the quant's `cal_trace.safetensors` rows (250 x 2,048); the state through the token
+  embedding and layers 0..L-1 as quantized (the quant's records, the re-quantized ones in their
+  place); the Hessian captured on layer L of the abliterated BF16, run whole; each matrix quantized
+  alone by the converter's call (`make_quant_args`, `get_H_data`, `Linear.convert_exl3`) with the
+  `mul1` codebook, output scales and the seed L+1, the layer's module index. `--check` checks the
+  sources and stops before the GPU; `--last 17` is a smoke run of one layer.
+- **The output** is the quant's layout (index, one shard per layer, `quantization_config.json` at
+  exllamav3 1.5.3), which `exl3.Quant` reads, holding exactly the plan's records at the quant's K and
+  shape, and `replay.json`, written last: the control (each matrix's relative reconstruction error
+  against the abliterated BF16, beside the quant's own against the base BF16 and against the
+  abliterated BF16), each matrix's seed, K and proxy error, the sources' revisions, the calibration
+  trace's sha256, the versions and the command, its paths by role. turboderp's quant was made with
+  exllamav3 1.4.2, so its bytes are not reproduced bit for bit.
