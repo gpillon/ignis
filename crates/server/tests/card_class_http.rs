@@ -11,8 +11,8 @@
 //! 27B (GitHub #338); every artifact is a file under `download.path`, and the
 //! models are `support/switch.rs`'s mocks, loaded by id. An alias may also be
 //! another entry's id of the same family (ADR 0074): the uncensored variant's
-//! 16 GB build, from the 16 GB fixture catalog over the built-in one, answers
-//! to `qwen3.8-27b-abliterated` on a 16 GB card.
+//! 16 GB build, also built in (GitHub #423), answers to
+//! `qwen3.8-27b-abliterated` on a 16 GB card.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,9 +21,8 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_core::compute::ModelFamily;
-use ignis_server::config::file::Format;
 use ignis_server::config::profile::CardClass;
-use ignis_server::download::catalog::{parse_operator, Catalog};
+use ignis_server::download::catalog::Catalog;
 use ignis_server::model_switch::{CatalogModels, Switcher};
 use ignis_server::{ModelStatus, Server};
 use serde_json::{json, Value};
@@ -45,25 +44,22 @@ const DEFAULT_27B: &str = "qwen3.8-27b";
 const FLASH_NEXT: &str = "qwen3.8-flash-next";
 const IMAGE: &str = "ignis-image-2.1-turbo";
 /// The uncensored variant's served id, its 32 GB entry's, and the id of its
-/// 16 GB build (ADR 0074), which the 16 GB fixture catalog holds and the
-/// built-in catalog does not yet (GitHub #423).
+/// 16 GB build (ADR 0074, GitHub #423).
 const ABLITERATED: &str = "qwen3.8-27b-abliterated";
 const ABLITERATED_16G: &str = "qwen3.8-27b-abliterated-16g";
-/// The 16 GB fixture catalog, the one the catalog's own tests read.
-const SIXTEEN_CATALOG: &str = include_str!("fixtures/catalog/sixteen.yaml");
 /// The catalog's CPU models: the three speech entries and the diarizer.
 const CPU_MODELS: [&str; 4] = ["qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization"];
 
 /// A condition image an edit decodes.
 const PNG: &[u8] = include_bytes!("../../artifact/tests/fixtures/vision/images/on_grid.png");
 
-/// The built-in catalog and the operator's `yaml` (`models: []` for none),
-/// every entry's artifact a file under a fresh `download.path`.
-fn catalog_on_disk(tag: &str, yaml: &str) -> CatalogModels {
+/// The built-in catalog, every entry's artifact a file under a fresh
+/// `download.path`.
+fn catalog_on_disk(tag: &str) -> CatalogModels {
     let dir = std::env::temp_dir().join(format!("ignis-card-class-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let catalog = parse_operator(yaml, Format::Yaml, "test").expect("a valid catalog");
+    let catalog = Catalog::built_in().clone();
     for entry in catalog.entries() {
         std::fs::write(entry.artifact_path(&dir), b"mock").unwrap();
     }
@@ -71,11 +67,10 @@ fn catalog_on_disk(tag: &str, yaml: &str) -> CatalogModels {
 }
 
 /// A server on `start`, on a card of class `card`, whose requests may switch
-/// to any built-in catalog entry on disk, the 16 GB 27B's artifact's header
-/// naming the 27B's family.
+/// to any built-in catalog entry on disk, the artifacts' headers of the two
+/// 16 GB entries naming the 27B's family.
 fn server_on(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, tag: &str) -> Server {
-    loader.header(SIXTEEN, ModelFamily::Qwen38_27b);
-    server_over(loader, start, card, catalog_on_disk(tag, "models: []"))
+    abliterated_server(loader, start, card, ModelFamily::Qwen38_27b, tag)
 }
 
 fn server_over(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, catalog: CatalogModels) -> Server {
@@ -83,20 +78,12 @@ fn server_over(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, c
         .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_catalog(catalog, true).with_card_class(card))
 }
 
-/// The 16 GB fixture catalog's entries the built-in catalog does not hold —
-/// the uncensored variant's 16 GB build — as an operator's catalog over it.
-fn fixture_over_built_in() -> String {
-    let mut fixture = Format::Yaml.read(SIXTEEN_CATALOG).expect("the fixture is YAML");
-    fixture["models"].as_array_mut().unwrap().retain(|entry| Catalog::built_in().entry(entry["id"].as_str().unwrap()).is_none());
-    fixture.to_string()
-}
-
-/// [`server_on`] over the built-in catalog and the uncensored variant's
-/// 16 GB build, every artifact on disk, the build's header naming `header`.
+/// [`server_on`], the header of the uncensored variant's 16 GB build's
+/// artifact naming `header`.
 fn abliterated_server(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, header: ModelFamily, tag: &str) -> Server {
     loader.header(SIXTEEN, ModelFamily::Qwen38_27b);
     loader.header(ABLITERATED_16G, header);
-    server_over(loader, start, card, catalog_on_disk(tag, &fixture_over_built_in()))
+    server_over(loader, start, card, catalog_on_disk(tag))
 }
 
 /// Where the catalog entry `id`'s artifact is on `server`'s disk.
@@ -214,7 +201,7 @@ async fn an_explicit_switch_to_an_entry_above_the_card_class_is_refused_before_a
     let loader = MockLoader::new();
     let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "explicit");
     let app = server.app();
-    for model in [FLASH_NEXT, IMAGE, "qwen3.8-27b-abliterated"] {
+    for model in [FLASH_NEXT, IMAGE] {
         let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": model }))).await;
         refused_by_class(status, &refused, model);
     }
@@ -338,7 +325,7 @@ async fn an_alias_never_resolves_to_an_artifact_of_another_family() {
     for (header, tag) in [(ModelFamily::FlashNext, "family-other"), (ModelFamily::Qwen38_27b, "family-same")] {
         let loader = MockLoader::new();
         loader.header(SIXTEEN, header);
-        let server = server_over(&loader, "mock-a", Some(CardClass::Gb16), catalog_on_disk(tag, "models: []"));
+        let server = server_over(&loader, "mock-a", Some(CardClass::Gb16), catalog_on_disk(tag));
         let app = server.app();
         if header == ModelFamily::Qwen38_27b {
             let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(DEFAULT_27B))).await;
@@ -386,9 +373,10 @@ async fn on_a_32gb_card_or_an_unknown_one_nothing_changes() {
 }
 
 /// ADR 0064 §3: `GET /v1/models` lists an entry on disk the card cannot
-/// load as unavailable, with the reason — the default id's own entry saying
-/// which entry serves a request naming it — and `GET /v1/models/catalog`
-/// says the same of every row, none of them switchable.
+/// load as unavailable, with the reason — the default id's own entry, and
+/// the uncensored variant's (ADR 0074), saying which entry serves a request
+/// naming it — and `GET /v1/models/catalog` says the same of every row, none
+/// of them switchable.
 #[tokio::test]
 async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_reason() {
     let loader = MockLoader::new();
@@ -400,18 +388,19 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
         models["data"].as_array().unwrap().iter().map(|entry| (entry["id"].as_str().unwrap(), entry["available"].as_bool().unwrap())).collect();
     assert_eq!(
         listed,
-        [(SIXTEEN, true), (DEFAULT_27B, false), ("qwen3.8-27b-abliterated", false), (FLASH_NEXT, false), (IMAGE, false)],
+        [(SIXTEEN, true), (DEFAULT_27B, false), (ABLITERATED, false), (FLASH_NEXT, false), (IMAGE, false), (ABLITERATED_16G, true)],
         "the entries it lists today, each marked: {models}"
     );
     let reason = |id: &str| -> String {
         let entry = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).unwrap();
         entry["reason"].as_str().unwrap_or_default().to_owned()
     };
-    for id in [DEFAULT_27B, FLASH_NEXT, IMAGE] {
+    for id in [DEFAULT_27B, ABLITERATED, FLASH_NEXT, IMAGE] {
         let reason = reason(id);
         assert!(reason.contains(id) && reason.contains("32 GB") && reason.contains("16 GB"), "{id}: {reason}");
     }
     assert!(reason(DEFAULT_27B).contains(&format!("served by {SIXTEEN}")), "{}", reason(DEFAULT_27B));
+    assert!(reason(ABLITERATED).contains(&format!("served by {ABLITERATED_16G}")), "{}", reason(ABLITERATED));
     assert!(!reason(FLASH_NEXT).contains("served by"), "{}", reason(FLASH_NEXT));
     assert!(models["data"][0].get("reason").is_none(), "{models}");
 
@@ -420,7 +409,7 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
     for row in catalog["data"].as_array().unwrap() {
         let id = row["id"].as_str().unwrap();
         // A speech model and the diarizer run on the CPU: no class, so no card refuses them.
-        let fits = id == SIXTEEN || CPU_MODELS.contains(&id);
+        let fits = id == SIXTEEN || id == ABLITERATED_16G || CPU_MODELS.contains(&id);
         assert_eq!(row["available"], fits, "{row}");
         assert_eq!(row.get("reason").is_some(), !fits, "{row}");
         if !fits {
@@ -474,9 +463,10 @@ async fn a_catalog_id_the_operator_listed_is_fitted_to_the_card_all_the_same() {
 /// ADR 0064 §2 for `image.prompt_enhancer`, `qwen3.8-27b` by default: it
 /// takes the step a request's `model` takes, so on a 16 GB card the rewrite
 /// runs on the entry that answers to the default id — the loaded one in
-/// place, never a visit to itself, or the one a visit loads. With no such
-/// entry it is an enhancer no visit reaches, which the start and a `PATCH`
-/// say; on a 32 GB card it is its own entry's.
+/// place, never a visit to itself, or the one a visit loads — and to the
+/// uncensored variant's (ADR 0074). With no such entry it is an enhancer no
+/// visit reaches, which the start and a `PATCH` say; on a 32 GB card it is
+/// its own entry's.
 #[tokio::test]
 async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     use ignis_server::images::enhance::{enhancer_on_this_card, unknown_enhancer};
@@ -490,12 +480,15 @@ async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     let via = visited.switcher.as_ref().unwrap().text_model(SIXTEEN).expect("a visit loads the 16 GB 27B");
     assert_eq!(via.artifact.file_name().and_then(|name| name.to_str()), Some(SIXTEEN_ARTIFACT));
     assert_eq!(unknown_enhancer(&visited, DEFAULT_27B, &none), None);
+    assert_eq!(enhancer_on_this_card(&visited, ABLITERATED), ABLITERATED_16G);
+    let via = visited.switcher.as_ref().unwrap().text_model(ABLITERATED_16G).expect("a visit loads the uncensored variant's 16 GB build");
+    assert_eq!(via.artifact, artifact_of(&visited, ABLITERATED_16G));
+    assert_eq!(unknown_enhancer(&visited, ABLITERATED, &none), None);
 
-    // An enhancer no entry answers to on this card: the abliterated 27B's id.
-    const ABLITERATED: &str = "qwen3.8-27b-abliterated";
-    let alone = server_on(&MockLoader::new(), FLASH_NEXT, Some(CardClass::Gb16), "enhancer-alone");
-    assert_eq!(enhancer_on_this_card(&alone, ABLITERATED), ABLITERATED);
-    assert!(unknown_enhancer(&alone, ABLITERATED, &none).is_some_and(|reason| reason.contains(ABLITERATED)));
+    // An enhancer no entry answers to on this card: Flash-Next's id.
+    let alone = server_on(&MockLoader::new(), SIXTEEN, Some(CardClass::Gb16), "enhancer-alone");
+    assert_eq!(enhancer_on_this_card(&alone, FLASH_NEXT), FLASH_NEXT);
+    assert!(unknown_enhancer(&alone, FLASH_NEXT, &none).is_some_and(|reason| reason.contains(FLASH_NEXT)));
 
     let thirty_two = server_on(&MockLoader::new(), FLASH_NEXT, Some(CardClass::Gb32), "enhancer-32");
     assert_eq!(enhancer_on_this_card(&thirty_two, DEFAULT_27B), DEFAULT_27B, "its own entry fits");

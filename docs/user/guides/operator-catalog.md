@@ -97,8 +97,9 @@ On a 16 GB card a start, a switch and a request naming `acme-27b-ft` are
 served by `acme-27b-ft-16g`, under its own id; on a 32 GB card or larger, and
 on a card whose class is not known, by `acme-27b-ft` itself. `GET /v1/models`
 and `GET /v1/models/catalog` list `acme-27b-ft` as unavailable on the 16 GB
-card, the reason naming the entry that serves it there. The built-in `qwen3.8-27b-abliterated` states
-`family: qwen3.8-27b` for the same reason: an alias may name it.
+card, the reason naming the entry that serves it there. The built-in `qwen3.8-27b-abliterated` and
+`qwen3.8-27b-abliterated-16g` are such a pair: both state `family: qwen3.8-27b`,
+and the 16 GB one answers to the other's id ([the uncensored variant](uncensored.md)).
 
 - `family` is required only where an alias involves the entry and neither its
   id nor its aliases is a family's default id. An entry no alias involves

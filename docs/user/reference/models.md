@@ -22,6 +22,7 @@ The models the server knows how to fetch without an operator catalog. Each is pi
 | [`qwen3.8-flash-next`](#qwen38-flash-next) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 67.8 GiB | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
 | [`ignis-image-2.1-turbo`](#ignis-image-21-turbo) | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | 15.6 GiB | `ignis_image_2_1_turbo-v2.ninfer` |
 | [`qwen3.8-27b-16g`](#qwen38-27b-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB | `qwen3_8_27b_trellis_sc30-v2.ninfer` |
+| [`qwen3.8-27b-abliterated-16g`](#qwen38-27b-abliterated-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | 12.5 GiB | `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` |
 | [`qwen3-asr-1.7b`](#qwen3-asr-17b) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 1.5 GiB | `Qwen3-ASR-1.7B-Q4_K_M.gguf` |
 | [`qwen3-asr-1.7b-q8`](#qwen3-asr-17b-q8) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB | `Qwen3-ASR-1.7B-Q8_0.gguf` |
 | [`qwen3-asr-0.6b`](#qwen3-asr-06b) | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB | `Qwen3-ASR-0.6B-Q8_0.gguf` |
@@ -73,6 +74,15 @@ The models the server knows how to fetch without an operator catalog. Each is pi
 |---|---|---|
 | `qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json` | 309,495 | `210ab54bfe8b04e5fc4337ee3755c340ea3f21239aa625c505aa2406645a340d` |
 | `qwen3_8_27b_trellis_sc30-v2.ninfer` | 13,379,877,124 | `2c4c9ee4d6b25c08da6c2d85840126e73d120564e230f926b6230b5b95ee8b3c` |
+
+## qwen3.8-27b-abliterated-16g
+
+[`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) at revision `94a8bfc0f47ce86403f274be03e2c0f79500727c`, 13,380,216,667 bytes in 2 files.
+
+| File | Bytes | SHA-256 |
+|---|---|---|
+| `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer.conversion.json` | 339,543 | `b5b61863b218bf722e4786ec8ca5e7ffde03548068f92184f10ecd95f6fd0f61` |
+| `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` | 13,379,877,124 | `4929bc8e1fbc747092f96aebae6b81a0b619db452d05a56df3499fbe1afe9ac5` |
 
 ## qwen3-asr-1.7b
 

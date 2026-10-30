@@ -19,7 +19,7 @@ that built it. How that works is in
 
 ## What it serves
 
-Five models are built into the server's [catalog](../guides/models.md#the-catalog).
+Six models are built into the server's [catalog](../guides/models.md#the-catalog).
 It loads one at a time and switches between them without a restart.
 
 | Model | Id | What it is | Size on disk |
@@ -27,6 +27,7 @@ It loads one at a time and switches between them without a restart.
 | Qwen3.8-27B | `qwen3.8-27b` (the default) | A dense text model, NVFP4, with a DFlash2 draft module for speculative decoding and an optional vision tower for image input. | 18.1 GiB |
 | Qwen3.8-27B for 16 GB cards | `qwen3.8-27b-16g` | The same 27B with a 3-bit trellis body, for the 16 GB class; it answers to `qwen3.8-27b` on a 16 GB card. | 12.5 GiB |
 | Qwen3.8-27B, uncensored | `qwen3.8-27b-abliterated` | The same weights with an abliteration applied. It does not refuse, so [read its page](../guides/uncensored.md) before exposing it. | 18.1 GiB |
+| Qwen3.8-27B, uncensored, for 16 GB cards | `qwen3.8-27b-abliterated-16g` | The 16 GB artifact with the same abliteration; it answers to `qwen3.8-27b-abliterated` on a 16 GB card. | 12.5 GiB |
 | Qwen3.8-Flash-Next | `qwen3.8-flash-next` | A 125B mixture-of-experts model with 6B active parameters, its experts re-quantized to 2.5 bits per weight on average. A VRAM cache holds the hot experts and the rest stream from host RAM. | 67.8 GiB with its MTP companion |
 | Qwen-Image-2.1-Turbo | `ignis-image-2.1-turbo` | The [image model](../api/images.md): generation and edits from up to ten input images. Its weights are for non-commercial use only. | 15.6 GiB |
 
@@ -75,7 +76,8 @@ generates no real text. Use it to smoke-test a client, not to get answers.
 - **The models**, each a public Hugging Face repository the server fetches
   and checks by itself: the 27B ([NVFP4](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer),
   [for 16 GB cards](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis),
-  [uncensored](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer)),
+  [uncensored](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer),
+  [uncensored for 16 GB cards](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis)),
   [Flash-Next](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis)
   and the [image model](https://huggingface.co/gpillon/ignis-image-2.1-turbo)
   ([Get a model](../guides/models.md)).
