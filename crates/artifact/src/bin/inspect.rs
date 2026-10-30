@@ -5,9 +5,10 @@
 //!   ignis-artifact-inspect <artifact.ninfer>
 //!   ignis-artifact-inspect <artifact.ninfer> --find NAME
 //!
-//! Prints the identity, the content hash, file geometry, object counts, the tensor format
-//! histogram, and every resource entry. With `--find NAME`, also prints the
-//! full descriptor of one object (for binder planning, ticket 03).
+//! Prints the identity, the content hash, file geometry, object counts, the
+//! tensor format histogram, and every resource entry. With `--find NAME`,
+//! also prints the full descriptor of one object (for binder planning,
+//! ticket 03).
 
 use std::collections::BTreeMap;
 use std::path::Path;
