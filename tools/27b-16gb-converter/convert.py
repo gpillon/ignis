@@ -49,8 +49,8 @@ BRANCH = "SC_3.00bpw_H4"
 QUANT_CONFIG = {"quant_method": "exl3", "codebook": "mul1", "out_scales": "always", "bits": 3.0, "head_bits": 4}
 # The quant's files the converter reads, beside its shards.
 QUANT_META = ("model.safetensors.index.json", "quantization_config.json", "config.json")
-# The override's files beside its shards (it holds no config.json).
-OVERRIDE_META = ("model.safetensors.index.json", "quantization_config.json")
+# The override's files beside its shards (it holds no config.json; replay.json is its provenance).
+OVERRIDE_META = ("model.safetensors.index.json", "quantization_config.json", override_mod.REPLAY_RECORD)
 BF16_REPO = "Qwen/Qwen3.8-27B"
 INDEX = "model.safetensors.index.json"
 EXIT_REFUSED = 2
@@ -93,6 +93,13 @@ def pin_files(root, digests, lfs):
             raise Refused(f"{name} hashes to {digest}, its LFS oid is {oid}")
         out[name] = {"bytes": os.path.getsize(os.path.join(root, name)), "sha256": digest}
     return out
+
+
+def pin_local(root, digests):
+    """{name: {bytes, sha256}} from `digests` (name -> future sha256) for files with no download
+    record: the digest is taken at conversion time."""
+    return {name: {"bytes": os.path.getsize(os.path.join(root, name)), "sha256": future.result()}
+            for name, future in digests.items()}
 
 
 def bf16_shards(bf16_root):
@@ -191,13 +198,16 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     quant_revision = revision_of(quant_root, quant_files, "the quant")
     bf16_files = [] if skip_errors else bf16_shards(bf16_root) + [INDEX]
     bf16_revision = revision_of(bf16_root, bf16_files, "the BF16 checkpoint") if bf16_files else None
-    ov_files, ov_ref_files = [], []
+    ov_files, ov_reference = [], None
     if override is not None:
+        if override.quant_revision != quant_revision:
+            raise Refused(f"the override was made against the quant at {override.quant_revision}, "
+                          f"this is {quant_revision}")
         ov_files = list(override.quant.shards) + list(OVERRIDE_META)
-        ov_revision = revision_of(override.root, ov_files, "the override")
-        if not skip_errors:
-            ov_ref_files = bf16_shards(override.reference_root) + [INDEX]
-            ov_ref_revision = revision_of(override.reference_root, ov_ref_files, "the override's reference BF16")
+        try:
+            ov_reference = override.pin_reference()
+        except ValueError as e:
+            raise Refused(str(e))
     with ThreadPoolExecutor(max_workers=6) as pool:
         def digests(root, names):
             return {name: pool.submit(work.file_digest, os.path.join(root, name)) for name in names}
@@ -205,7 +215,6 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
         quant_digests = digests(quant_root, quant_files)
         bf16_digests = digests(bf16_root, bf16_files)
         ov_digests = digests(override.root, ov_files) if override is not None else {}
-        ov_ref_digests = digests(override.reference_root, ov_ref_files) if override is not None else {}
         served_digest = pool.submit(work.file_digest, served_path)
         if skip_errors:
             rel = None
@@ -216,8 +225,7 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
         pinned = pin_files(quant_root, quant_digests, set(quant.shards))
         bf16_pinned = pin_files(bf16_root, bf16_digests, set(bf16_files) - {INDEX})
         if override is not None:
-            ov_pinned = pin_files(override.root, ov_digests, set(override.quant.shards))
-            ov_ref_pinned = pin_files(override.reference_root, ov_ref_digests, set(ov_ref_files) - {INDEX})
+            ov_pinned = pin_local(override.root, ov_digests)
         served_sha256 = served_digest.result()
     if rel is not None:
         over = {n: e for n, e in rel.items() if not e <= error_bound}
@@ -321,12 +329,12 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     if override is not None:
         record["override"] = {
             "repo": override.repo,
-            "revision": ov_revision,
+            "revision": override.revision,
             "files": ov_pinned,
             "matrices": sorted(n for n, t in trellis.items() if t.get("override")),
-            # Their errors are measured against the BF16 the override was made from (none in a dry run).
-            "reference": None if skip_errors else {"repo": override.reference_repo, "revision": ov_ref_revision,
-                                                   "files": ov_ref_pinned},
+            "quant_revision": override.quant_revision,
+            # Their errors are measured against the BF16 the override was made from, pinned by tensor.
+            "reference": ov_reference,
         }
     work.write_json_atomic(os.path.join(out_work, "converter.json"), record)
     log(f"converter.json: {record['status']}, {len(trellis)} trellis + {len(copied)} copied, "
@@ -386,22 +394,20 @@ def verify(artifact_path, served_path, quant_root, log=print, override=None, wei
 
 
 def add_override_arguments(r):
-    r.add_argument("--override", help="a directory of EXL3 records that replace the quant's of the same name")
-    r.add_argument("--override-repo", help="the override's source repository (with --override)")
-    r.add_argument("--override-bf16", help="the BF16 checkpoint the override was made from (with --override)")
-    r.add_argument("--override-bf16-repo", help="that checkpoint's repository (with --override)")
+    r.add_argument("--override", help="a directory `replay.py run` wrote: EXL3 records that replace the quant's "
+                                      "of the same name, and replay.json, their provenance")
+    r.add_argument("--override-bf16", help="the partial BF16 checkpoint the override was made from, "
+                                           "`replay.py fetch`'s directory (with --override)")
 
 
 def override_of(a):
     """The `Override` the arguments name, or None; Refused when they name it by halves."""
-    given = {k: getattr(a, k) for k in ("override", "override_repo", "override_bf16", "override_bf16_repo")}
-    if not any(given.values()):
+    if not a.override and not a.override_bf16:
         return None
-    absent = [f"--{k.replace('_', '-')}" for k, v in given.items() if not v]
-    if absent:
-        raise Refused(f"--override takes {', '.join(absent)} too")
+    if not a.override or not a.override_bf16:
+        raise Refused(f"--override takes {'--override-bf16' if a.override else '--override'} too")
     try:
-        return override_mod.Override(a.override, a.override_repo, a.override_bf16, a.override_bf16_repo)
+        return override_mod.Override(a.override, a.override_bf16)
     except (ValueError, OSError) as e:
         raise Refused(f"the override: {e}")
 
@@ -439,8 +445,8 @@ def main(argv=None):
     ov = None
     if a.override:
         try:
-            ov = override_mod.Override(a.override, None, None, None)
-        except ValueError as e:
+            ov = override_mod.Override(a.override)
+        except (ValueError, OSError) as e:
             print(f"REFUSED: the override: {e}", flush=True)
             return EXIT_REFUSED
     ok, report = verify(a.artifact, a.served, a.quant, log=log, override=ov, weights_id=a.weights_id)
