@@ -19,10 +19,13 @@ writes the container.
 
 `verify` reads a packed artifact back: its identity, its object table against the plan, every
 trellis object against its source tensors bit for bit, every copied object's sha256 against the
-served one's. It prints VERIFY PASS or VERIFY FAILED (exit 3).
+served one's. With `--baseline`, a variant is also read against the artifact it varies (the
+abliterated 16 GB artifact against the default one, GitHub #422): the same directory under another
+identity, every payload the baseline's bit for bit but the override's records, which differ. It
+prints VERIFY PASS or VERIFY FAILED (exit 3).
 
   python convert.py run --served S.ninfer --quant DIR --bf16 DIR --work DIR [--skip-errors]
-  python convert.py verify --artifact A.ninfer --served S.ninfer --quant DIR [--report R.json]
+  python convert.py verify --artifact A.ninfer --served S.ninfer --quant DIR [--baseline B.ninfer] [--report R.json]
 """
 import argparse
 import hashlib
@@ -342,9 +345,20 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     return record
 
 
-def verify(artifact_path, served_path, quant_root, log=print, override=None, weights_id=None):
+# A directory entry's fields beside its name: two artifacts with the same entries under different
+# identities differ in their content hash by the identity alone.
+DESCRIPTOR = ("kind", "format", "layout", "shape", "encoding", "offset", "bytes")
+
+
+def descriptor(o):
+    return {k: o.get(k) for k in DESCRIPTOR}
+
+
+def verify(artifact_path, served_path, quant_root, log=print, override=None, weights_id=None, baseline=None):
     """(ok, report) for a packed artifact against the plan and its sources; with `override`, its
-    records stand in for the quant's of the same name."""
+    records stand in for the quant's of the same name. With `baseline` (the artifact this one
+    varies), the directory must be the baseline's under another identity, and every payload the
+    baseline's bit for bit except the override's records, which must differ."""
     art = container.Container(artifact_path)
     served = container.Container(served_path)
     quant = exl3.Quant(quant_root)
@@ -365,6 +379,22 @@ def verify(artifact_path, served_path, quant_root, log=print, override=None, wei
         problems.append(f"objects the plan does not have: {extra[:5]}")
     if missing:
         problems.append(f"objects missing: {missing[:5]}")
+    base, same, differ = None, 0, []
+    if baseline is not None:
+        base = container.Container(baseline)
+        if base.identity == art.identity:
+            problems.append(f"the baseline's identity is the artifact's, {art.identity['model_id']}/"
+                            f"{art.identity['weights_id']}: the two would share a content hash")
+        elif base.identity["model_id"] != art.identity["model_id"]:
+            problems.append(f"the baseline is model {base.identity['model_id']}, the artifact "
+                            f"{art.identity['model_id']}")
+        if [o["name"] for o in base.objects] != [o["name"] for o in art.objects]:
+            problems.append("the baseline's objects are not the artifact's, in the same order")
+        for o in art.objects:
+            b = base.by_name.get(o["name"])
+            if b is not None and descriptor(b) != descriptor(o):
+                problems.append(f"{o['name']}: the baseline's descriptor is {descriptor(b)}, the artifact's "
+                                f"{descriptor(o)}")
     checked = {"trellis": 0, "copied": 0}
     for name, p in want.items():
         o = art.by_name.get(name)
@@ -387,8 +417,24 @@ def verify(artifact_path, served_path, quant_root, log=print, override=None, wei
             if hashlib.sha256(data).digest() != hashlib.sha256(served.read(p.copy)).digest():
                 problems.append(f"{name}: sha256 differs from the served object's")
             checked["copied"] += 1
+        if base is not None and name in base.by_name:
+            swapped = override is not None and p.key is not None and p.key in override.matrices
+            equal = base.read(name) == data
+            if swapped and equal:
+                problems.append(f"{name}: the override's record is the baseline's, bit for bit")
+            elif not swapped and not equal:
+                problems.append(f"{name}: not the baseline's, bit for bit")
+            if equal:
+                same += 1
+            else:
+                differ.append(name)
     report = {"artifact": os.path.basename(artifact_path), "identity": art.identity,
               "objects": len(art.objects), "checked": checked, "problems": problems}
+    if base is not None:
+        report["baseline"] = {"artifact": os.path.basename(baseline), "identity": base.identity,
+                              "same": same, "differ": differ}
+        log(f"verify: against the baseline {os.path.basename(baseline)}, {same} objects the same, "
+            f"{len(differ)} differ")
     log(f"verify: {checked['trellis']} trellis objects, {checked['copied']} copied, {len(problems)} problems")
     return not problems, report
 
@@ -431,6 +477,8 @@ def main(argv=None):
     v.add_argument("--quant", required=True, help="the quant it repacks")
     v.add_argument("--override", help="the override directory the artifact was packed with")
     v.add_argument("--weights-id", help="the weights id the artifact was packed with (default %s)" % IDENTITY["weights_id"])
+    v.add_argument("--baseline", help="the artifact this variant varies: every object but the override's must be its, "
+                                      "bit for bit")
     v.add_argument("--report", help="write the report as JSON here")
     a = ap.parse_args(argv)
     log = lambda line: print(line, flush=True)
@@ -449,7 +497,8 @@ def main(argv=None):
         except (ValueError, OSError) as e:
             print(f"REFUSED: the override: {e}", flush=True)
             return EXIT_REFUSED
-    ok, report = verify(a.artifact, a.served, a.quant, log=log, override=ov, weights_id=a.weights_id)
+    ok, report = verify(a.artifact, a.served, a.quant, log=log, override=ov, weights_id=a.weights_id,
+                        baseline=a.baseline)
     if a.report:
         work.write_json_atomic(a.report, report)
     for p in report["problems"]:
