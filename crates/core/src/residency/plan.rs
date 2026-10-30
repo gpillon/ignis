@@ -325,7 +325,9 @@ impl std::error::Error for HostPlanError {}
 
 /// What follows "keep them in VRAM" when the `host` vision residency's tower
 /// or pool does not fit (ADR 0075): the setting that does so, and vision off.
-const VISION_WAYS_OUT: &str =
+/// One text for this refusal and for a pin the host refuses after the plan
+/// passed (the server's `qwen27b_pin_refused`).
+pub const VISION_WAYS_OUT: &str =
     "(vision.residency: device, --vision-residency device), turn vision off, or close other applications";
 
 /// A plan line as the refusal names it to a person.

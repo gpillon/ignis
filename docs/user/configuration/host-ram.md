@@ -139,3 +139,7 @@ pool `--vision-embedding-pool-mib` sizes (`vision_tower_bytes` and
 `vision_pool_bytes` in both events). A start that cannot hold them is refused
 naming `--vision-residency device` and turning vision off as the ways out
 ([Where the vision tower and the embedding pool live](vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
+So is a start the plan let through but whose pin the system then declined
+(it may refuse to lock memory it reports available): its load fails with
+`materialize weights:`, the system's error, the bytes the plan had counted,
+the tower's and the pool's among them, and the same ways out.

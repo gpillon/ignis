@@ -694,20 +694,30 @@ pub fn log_qwen27b_host_plan(
 /// ADR 0062: a pin the host plan let through but the host then refused --
 /// the plan reads the memory available, and the OS may still decline to lock
 /// it. The materialize error, followed by the host plan's own figures, so the
-/// refusal reads as the plan's and says what it had counted on.
+/// refusal reads as the plan's and says what it had counted on. Under the
+/// `host` vision residency it names both ways out, as the plan's refusal does
+/// (ADR 0075): the device residency, and vision off.
 pub fn qwen27b_pin_refused(error: &str, request: &ignis_core::residency::HostPlanRequest, planned_bytes: u64) -> String {
     // ADR 0075: the `host` vision residency's tower is pinned with the table,
     // and its embedding pool by the model's load after (GitHub #415).
-    let mut tower = String::new();
+    let mut vision_lines = String::new();
     for (name, bytes) in [("vision tower", request.vision_tower_bytes), ("embedding pool", request.vision_pool_bytes)] {
         if bytes > 0 {
-            tower.push_str(&format!(", the {name} {bytes} bytes"));
+            vision_lines.push_str(&format!(", the {name} {bytes} bytes"));
         }
     }
+    let ways_out = if vision_lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; keep the vision tower and its embedding pool in VRAM {}",
+            ignis_core::residency::VISION_WAYS_OUT
+        )
+    };
     format!(
         "materialize weights: {error}; the host plan had counted {planned_bytes} bytes of pinned host memory \
-         (the token embedding {} bytes{tower}) against {} bytes available and a {}-byte margin \
-         (--{}-model-host-margin-bytes)",
+         (the token embedding {} bytes{vision_lines}) against {} bytes available and a {}-byte margin \
+         (--{}-model-host-margin-bytes){ways_out}",
         request.token_embedding_bytes, request.available_physical_bytes, request.margin_bytes, request.scope
     )
 }
@@ -2455,6 +2465,28 @@ mod tests {
             ),
             "{message}"
         );
+    }
+
+    /// ADR 0075: a `host` start whose pin the host refuses after the plan
+    /// passed names both ways out, as the plan's refusal and the leaf's do:
+    /// the device residency and vision off. A pin with no vision in it names
+    /// neither.
+    #[test]
+    fn a_pin_the_host_refuses_under_the_host_residency_names_both_ways_out() {
+        const WAYS_OUT: &str = "keep the vision tower and its embedding pool in VRAM \
+                                (vision.residency: device, --vision-residency device), turn vision off";
+        let shape = EngineShape { host_pool_bytes: 8 << 30, ..EngineShape::default() };
+        let hosted = EngineShape { vision: Some(host_vision(4096)), max_context: 262_144, ..shape };
+        for (label, tower, shape) in [("tower", 297_000_960, &shape), ("tower and pool", 297_000_960, &hosted)] {
+            let request = qwen27b_host_request(64 << 30, 1_350_864_896, tower, 0, shape);
+            let host = ignis_core::residency::plan_host(&request).expect("64 GiB holds the plan");
+            let message = qwen27b_pin_refused("the host cannot pin that much memory", &request, host.total_bytes);
+            assert!(message.contains(WAYS_OUT), "{label}: {message}");
+        }
+        let request = qwen27b_host_request(64 << 30, 1_350_864_896, 0, 0, &shape);
+        let host = ignis_core::residency::plan_host(&request).expect("64 GiB holds the plan");
+        let message = qwen27b_pin_refused("the host cannot pin that much memory", &request, host.total_bytes);
+        assert!(!message.contains("--vision-residency"), "no vision, no way out of it: {message}");
     }
 
     /// A vision envelope of `tokens` under the `host` residency.
