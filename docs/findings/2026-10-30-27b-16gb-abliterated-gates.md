@@ -147,9 +147,15 @@ gate: the cross terms show that scoring the abliterated artifact against the bas
 - **Vision was never run** on this artifact; its claim rests on bit-equal records.
 - **Incident.** A prep check touched the GPU for about 25 s at 19:30 while the first conversion ran. That conversion died
   later for its own reason (above); no number here came from it.
+- **The replay's record stays local.** By the owner's decision, the replay's `replay.json` (the seeds, the exllamav3
+  version, the calibration trace's sha256 and the command) stays on the build machine: it is neither uploaded nor
+  committed. The published conversion record pins it by its size and sha256 only (46,974 bytes,
+  `719ba4d2061e8069e2bff3940acf0f97260eb2fd5333c2ac328baa287a024098`), so the recorded command of the spec's story 25 is
+  in that file, not in public.
 
 ## Follow-ups
 
-- The Hugging Face upload and the catalog entry follow in the spec's other tickets; the upload only after the card and
-  every file are checked for personal data and commercial product names.
+- The upload and the catalog entry have landed (#423): the artifact and its conversion record are
+  `gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis` at revision `94a8bfc0` on Hugging Face, and the built-in catalog
+  entry `qwen3.8-27b-abliterated-16g` is pinned to that upload.
 - If a full gate 2 is wanted, the replay can resume over the remaining 33 jobs.
