@@ -293,11 +293,11 @@ impl Catalog {
         let Some(mut refusal) = self.above_class(requested, card) else {
             return Ok(());
         };
-        let alias = self.family_of(requested);
-        if header.is_some() && header == alias {
+        let alias_family = self.family_of(requested);
+        if header.is_some() && header == alias_family {
             return Ok(());
         }
-        refusal.other_family = Some(OtherFamily { entry: entry.id.clone(), artifact: header, alias });
+        refusal.other_family = Some(OtherFamily { entry: entry.id.clone(), artifact: header, alias_family });
         Err(refusal)
     }
 }
@@ -328,18 +328,18 @@ pub struct OtherFamily {
     pub artifact: Option<ModelFamily>,
     /// The alias's family, as the catalog tells it (ADR 0074): the family
     /// whose own id the alias is, or the one its entry states.
-    pub alias: Option<ModelFamily>,
+    pub alias_family: Option<ModelFamily>,
 }
 
 impl std::fmt::Display for ClassRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} needs a {} card or larger (its catalog entry's card_class), and this card is of the {} class", self.model, self.needs, self.card)?;
         if let Some(other) = &self.other_family {
-            let alias = other.alias.map_or("no model family", ModelFamily::name);
+            let alias_family = other.alias_family.map_or("no model family", ModelFamily::name);
             let artifact = other.artifact.map_or("no model family", ModelFamily::name);
             write!(
                 f,
-                "; {} lists it as an alias, but its artifact is {artifact} and {} is {alias}: an alias resolves only within one model family",
+                "; {} lists it as an alias, but its artifact is {artifact} and {} is {alias_family}: an alias resolves only within one model family",
                 other.entry, self.model
             )?;
         }
@@ -1428,7 +1428,7 @@ mod tests {
         let refusal = catalog.alias_holds("qwen3.8-27b", sixteen, Some(ModelFamily::FlashNext), card).unwrap_err();
         assert_eq!(
             refusal.other_family,
-            Some(OtherFamily { entry: "qwen3.8-27b-16g".to_owned(), artifact: Some(ModelFamily::FlashNext), alias: Some(ModelFamily::Qwen38_27b) })
+            Some(OtherFamily { entry: "qwen3.8-27b-16g".to_owned(), artifact: Some(ModelFamily::FlashNext), alias_family: Some(ModelFamily::Qwen38_27b) })
         );
         let said = refusal.to_string();
         for named in ["qwen3.8-27b needs a 32 GB card", "16 GB class", "qwen3.8-27b-16g lists it as an alias", "Qwen3.8-Flash-Next", "Qwen3.8-27B", "one model family"] {

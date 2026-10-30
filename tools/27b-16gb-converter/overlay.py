@@ -12,19 +12,10 @@ must name exactly the tensors its index maps, in the same shard; each must be on
 with the base's dtype and shape, so the overlay swaps like for like; and each tensor's bytes must
 hash to `fetch.json`'s sha256.
 """
-import json
 import os
 
 import exl3
-from override import tensor_sha256
-
-INDEX = "model.safetensors.index.json"
-FETCH_RECORD = "fetch.json"
-
-
-def _json(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+from override import FETCH_RECORD, INDEX, Fetched, read_json
 
 
 class Reference:
@@ -33,18 +24,13 @@ class Reference:
     the overlay holds; `repo` and `revision` are the overlay's source (None without one)."""
 
     def __init__(self, root, overlay=None):
-        weight_map = _json(os.path.join(root, INDEX))["weight_map"]
+        weight_map = read_json(os.path.join(root, INDEX))["weight_map"]
         self.files = {name: os.path.join(root, shard) for name, shard in weight_map.items()}
         self.replaced, self.repo, self.revision = [], None, None
         if overlay is None:
             return
-        path = os.path.join(overlay, FETCH_RECORD)
-        if not os.path.isfile(path):
-            raise ValueError(f"{overlay} has no {FETCH_RECORD}: its tensors cannot be pinned "
-                             f"(`replay.py fetch` writes it)")
-        fetched = _json(path)
-        stated = fetched.get("tensors") or {}
-        mapped = _json(os.path.join(overlay, INDEX))["weight_map"]
+        fetched = Fetched(overlay)
+        stated, mapped = fetched.tensors, fetched.weight_map
         problems = [f"{name}: the index maps it, {FETCH_RECORD} does not name it"
                     for name in sorted(set(mapped) - set(stated))]
         problems += [f"{name}: {FETCH_RECORD} names it, the index does not map it"
@@ -57,25 +43,23 @@ class Reference:
             return headers[file]
 
         for name in sorted(set(mapped) & set(stated)):
-            if mapped[name] != stated[name]["shard"]:
-                problems.append(f"{name}: the index has it in {mapped[name]}, {FETCH_RECORD} in "
-                                f"{stated[name]['shard']}")
+            misplaced = fetched.misplaced(name)
+            if misplaced:
+                problems.append(misplaced)
                 continue
             if name not in self.files:
                 problems.append(f"{name}: the base has no tensor of that name")
                 continue
-            file = os.path.join(overlay, mapped[name])
-            mine, base = header(file)[name], header(self.files[name])[name]
+            mine, base = header(os.path.join(overlay, mapped[name]))[name], header(self.files[name])[name]
             if (mine.dtype, mine.shape) != (base.dtype, base.shape):
                 problems.append(f"{name}: {mine.dtype} {mine.shape}, the base's is {base.dtype} {base.shape}")
                 continue
-            digest = tensor_sha256(file, name)
-            if digest != stated[name]["sha256"]:
-                problems.append(f"{name}: hashes to {digest}, {FETCH_RECORD} has {stated[name]['sha256']}")
-                continue
+            _, tampered = fetched.digest(name)
+            if tampered:
+                problems.append(tampered)
         if problems:
             raise ValueError(f"the overlay {overlay} cannot be laid over {root}:\n  " + "\n  ".join(problems))
         for name in mapped:
             self.files[name] = os.path.join(overlay, mapped[name])
         self.replaced = sorted(mapped)
-        self.repo, self.revision = fetched.get("repo"), fetched.get("revision")
+        self.repo, self.revision = fetched.record.get("repo"), fetched.record.get("revision")

@@ -18,12 +18,13 @@ import struct
 import exl3
 import work
 
+# The file names the replay writes and the override and the overlay read.
 REPLAY_RECORD = "replay.json"
 FETCH_RECORD = "fetch.json"
 INDEX = "model.safetensors.index.json"
 
 
-def _json(path):
+def read_json(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
@@ -51,7 +52,7 @@ def provenance(root):
     if not os.path.isfile(path):
         raise ValueError(f"{root} has no {REPLAY_RECORD}: the override's source repository and revision "
                          f"cannot be pinned (`replay.py run` writes it)")
-    record = _json(path)
+    record = read_json(path)
     missing = []
     if record.get("status") != "complete":
         missing.append(f"status complete (it is {record.get('status')!r})")
@@ -67,6 +68,49 @@ def provenance(root):
     if missing:
         raise ValueError(f"{path} lacks {', '.join(missing)}")
     return record
+
+
+def mismatch(key, record, other, whose):
+    """The line naming how the EXL3 record `key` (its `k2` and `shape`) is not like `other`, `whose`
+    it stands for: its K first, then its shape; None when it is like for like."""
+    if record.k2 != other.k2:
+        return f"{key}: K {record.k2 / 2:g}, {whose} is {other.k2 / 2:g}"
+    if record.shape != other.shape:
+        return f"{key}: shape {record.shape}, {whose} is {other.shape}"
+    return None
+
+
+class Fetched:
+    """A directory `replay.py fetch` wrote: partial BF16 shards, their index (`weight_map`) and
+    `fetch.json` (`record`), whose `tensors` give each tensor's shard and sha256. ValueError when it
+    has no `fetch.json`. Both of its readers, `overlay.Reference` and `Override.pin_reference`, check
+    a tensor with `misplaced` and `digest`."""
+
+    def __init__(self, root):
+        self.root = root
+        self.path = os.path.join(root, FETCH_RECORD)
+        if not os.path.isfile(self.path):
+            raise ValueError(f"{root} has no {FETCH_RECORD}: its tensors cannot be pinned "
+                             f"(`replay.py fetch` writes it)")
+        self.record = read_json(self.path)
+        self.tensors = self.record.get("tensors") or {}
+        self.index_path = os.path.join(root, INDEX)
+        self.weight_map = read_json(self.index_path)["weight_map"]
+
+    def misplaced(self, name):
+        """The line naming both shards when the index and `fetch.json` put tensor `name` in
+        different ones, else None."""
+        mapped, stated = self.weight_map[name], self.tensors[name]["shard"]
+        if mapped != stated:
+            return f"{name}: the index has it in {mapped}, {FETCH_RECORD} in {stated}"
+        return None
+
+    def digest(self, name):
+        """(the sha256 of tensor `name`'s bytes in its shard, the line naming it when that is not
+        `fetch.json`'s, else None)."""
+        digest = tensor_sha256(os.path.join(self.root, self.weight_map[name]), name)
+        stated = self.tensors[name]["sha256"]
+        return digest, None if digest == stated else f"{name}: hashes to {digest}, {FETCH_RECORD} has {stated}"
 
 
 class Override:
@@ -95,15 +139,18 @@ class Override:
             out.append(f"{key}: {REPLAY_RECORD} names it, the override holds no such record")
         for key, m in sorted(self.matrices.items()):
             b = base.get(key)
+            unlike = None if b is None else mismatch(key, m, b, "the quant's")
             if b is None:
                 out.append(f"{key}: the quant has no record of that name")
-            elif m.k2 != b.k2:
-                out.append(f"{key}: K {m.k2 / 2:g}, the quant's is {b.k2 / 2:g}")
-            elif m.shape != b.shape:
-                out.append(f"{key}: shape {m.shape}, the quant's is {b.shape}")
+            elif unlike:
+                out.append(unlike)
             elif key in stated and hashlib.sha256(self.record(key)).hexdigest() != stated[key]["record_sha256"]:
                 out.append(f"{key}: the record's sha256 is not {REPLAY_RECORD}'s")
         return out
+
+    def replaces(self, key):
+        """Whether the override holds a record for the quant's matrix `key`, which it replaces."""
+        return key in self.matrices
 
     def record(self, key):
         return self.quant.record(self.matrices[key])
@@ -116,44 +163,39 @@ class Override:
         if self.reference_root is None:
             raise ValueError("the override's reference BF16 (the partial shards `replay.py fetch` wrote) "
                              "is not given")
-        path = os.path.join(self.reference_root, FETCH_RECORD)
-        if not os.path.isfile(path):
-            raise ValueError(f"{self.reference_root} has no {FETCH_RECORD}: its tensors cannot be pinned "
-                             f"(`replay.py fetch` writes it)")
-        fetched = _json(path)
-        if (fetched.get("repo"), fetched.get("revision")) != (self.repo, self.revision):
-            raise ValueError(f"{path} is {fetched.get('repo')}@{fetched.get('revision')}, the override was "
+        fetched = Fetched(self.reference_root)
+        record, path, index_path = fetched.record, fetched.path, fetched.index_path
+        if (record.get("repo"), record.get("revision")) != (self.repo, self.revision):
+            raise ValueError(f"{path} is {record.get('repo')}@{record.get('revision')}, the override was "
                              f"made from {self.repo}@{self.revision}")
-        index_path = os.path.join(self.reference_root, INDEX)
-        weight_map = _json(index_path)["weight_map"]
         stated = self.provenance["sources"]["abliterated"]["tensors"]
         tensors, shards, problems = {}, {}, []
         for key in sorted(self.matrices):
             name = f"{key}.weight"
-            t = (fetched.get("tensors") or {}).get(name)
-            if t is None or name not in weight_map:
+            t = fetched.tensors.get(name)
+            if t is None or name not in fetched.weight_map:
                 problems.append(f"{name}: not in the reference")
                 continue
-            if weight_map[name] != t["shard"]:
-                problems.append(f"{name}: the index has it in {weight_map[name]}, {FETCH_RECORD} in {t['shard']}")
+            misplaced = fetched.misplaced(name)
+            if misplaced:
+                problems.append(misplaced)
                 continue
             if stated.get(name) != t["sha256"]:
                 problems.append(f"{name}: {FETCH_RECORD}'s sha256 is not {REPLAY_RECORD}'s")
                 continue
-            shard = os.path.join(self.reference_root, t["shard"])
-            if not os.path.isfile(shard):
+            if not os.path.isfile(os.path.join(self.reference_root, t["shard"])):
                 problems.append(f"{name}: {t['shard']} is missing")
                 continue
-            digest = tensor_sha256(shard, name)
-            if digest != t["sha256"]:
-                problems.append(f"{name}: hashes to {digest}, {FETCH_RECORD} has {t['sha256']}")
+            digest, tampered = fetched.digest(name)
+            if tampered:
+                problems.append(tampered)
                 continue
             tensors[name] = {"shard": t["shard"], "bytes": t["bytes"], "sha256": digest}
-            shards[t["shard"]] = {"lfs_oid": fetched["shards"][t["shard"]]["lfs_oid"]}
+            shards[t["shard"]] = {"lfs_oid": record["shards"][t["shard"]]["lfs_oid"]}
         if problems:
             raise ValueError("the override's reference BF16 is not the one it was made from:\n  "
                              + "\n  ".join(problems))
-        return {"repo": self.repo, "revision": self.revision, "index_sha256": fetched.get("index_sha256"),
+        return {"repo": self.repo, "revision": self.revision, "index_sha256": record.get("index_sha256"),
                 "files": {FETCH_RECORD: {"bytes": os.path.getsize(path), "sha256": work.file_digest(path)},
                           INDEX: {"bytes": os.path.getsize(index_path), "sha256": work.file_digest(index_path)}},
                 "shards": dict(sorted(shards.items())), "tensors": tensors}

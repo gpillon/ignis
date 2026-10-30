@@ -475,8 +475,7 @@ mod tests {
     /// ADR 0074, `main`'s start path end to end with the built-in catalog
     /// (GitHub #423): `--model-id qwen3.8-27b-abliterated` on a 16 GB card
     /// starts the abliterated 16 GB build, which answers to it, under its own
-    /// id —
-    /// its artifact and id over the start options — when its artifact's
+    /// id — its artifact and id over the start options — when its artifact's
     /// header names the 27B's family, the one both entries state; one of
     /// another family refuses the start before it loads, naming both. On a
     /// 32 GB card, a 96 GB one or one of no known class the id is its own

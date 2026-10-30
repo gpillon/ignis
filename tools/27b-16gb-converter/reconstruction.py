@@ -42,7 +42,7 @@ def rel_errors(quant, bf16_root, planned, device="cuda", log=print, override=Non
     for p in planned:
         if p.key is None:
             continue
-        swapped = override is not None and p.key in override.matrices
+        swapped = override is not None and override.replaces(p.key)
         source, reference_root = (override.quant, override.reference_root) if swapped else (quant, bf16_root)
         bf16_map = maps[reference_root]
         # The head alone peaks at 13.4 GB (18.5 GB reserved): with the blocks the matrices before it

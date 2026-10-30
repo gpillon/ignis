@@ -43,6 +43,11 @@ F:/ai/ngram-venv/Scripts/python.exe -m pytest tools/27b-16gb-converter -q
 The packer's side is `crates/artifact/tests/trellis_27b.rs`; it also binds the real artifact when it is
 on this machine.
 
+`test_reconstruction.py` runs the reconstruction-error step on the CPU, with stub torch, exllamav3
+and safetensors modules: an override's matrix is read from its record and measured against its
+reference BF16 and every other from the quant against the base, one shard of each source is open at
+a time, and the CUDA cache is emptied before each matrix.
+
 ## The conversion
 
 The reconstruction-error step runs on the GPU (`make gpu-status`, the shared lock

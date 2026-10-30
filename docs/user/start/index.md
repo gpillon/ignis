@@ -19,8 +19,9 @@ that built it. How that works is in
 
 ## What it serves
 
-Six models are built into the server's [catalog](../guides/models.md#the-catalog).
-It loads one at a time and switches between them without a restart.
+Ten entries are built into the server's [catalog](../guides/models.md#the-catalog):
+the six text and image models below, three speech models and a diarizer. It
+loads one of the six at a time and switches between them without a restart.
 
 | Model | Id | What it is | Size on disk |
 |---|---|---|---|

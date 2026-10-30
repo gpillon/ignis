@@ -136,11 +136,12 @@ reports. It tells artifacts of one family apart: `qwen3.8-27b` and
 operator's `--model-id`, or the family's default when none is named.
 
 The **catalog** is the set of models the server knows how to fetch
-([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Six text and
-image models are built into the binary, each pinned file by file at a fixed
-revision of its Hugging Face repository: `qwen3.8-27b`, `qwen3.8-27b-16g`,
-`qwen3.8-27b-abliterated`, `qwen3.8-27b-abliterated-16g`, `qwen3.8-flash-next`
-and `ignis-image-2.1-turbo`. Each states the smallest **card class** it loads
+([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Ten entries
+are built into the binary, each pinned file by file at a fixed revision of its
+Hugging Face repository: six text and image models, `qwen3.8-27b`,
+`qwen3.8-27b-16g`, `qwen3.8-27b-abliterated`, `qwen3.8-27b-abliterated-16g`,
+`qwen3.8-flash-next` and `ignis-image-2.1-turbo`, plus three speech models and
+a diarizer. Each of the six states the smallest **card class** it loads
 on: 32 GB for all but the two `-16g` entries, which load on 16 GB and answer
 there to `qwen3.8-27b` and to `qwen3.8-27b-abliterated`
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),

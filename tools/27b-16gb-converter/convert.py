@@ -53,9 +53,9 @@ QUANT_CONFIG = {"quant_method": "exl3", "codebook": "mul1", "out_scales": "alway
 # The quant's files the converter reads, beside its shards.
 QUANT_META = ("model.safetensors.index.json", "quantization_config.json", "config.json")
 # The override's files beside its shards (it holds no config.json; replay.json is its provenance).
-OVERRIDE_META = ("model.safetensors.index.json", "quantization_config.json", override_mod.REPLAY_RECORD)
+OVERRIDE_META = (override_mod.INDEX, "quantization_config.json", override_mod.REPLAY_RECORD)
 BF16_REPO = "Qwen/Qwen3.8-27B"
-INDEX = "model.safetensors.index.json"
+INDEX = override_mod.INDEX
 EXIT_REFUSED = 2
 EXIT_VERIFY_FAILED = 3
 
@@ -244,7 +244,7 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
         for p in (p for p in objects if p.unit == unit):
             if p.key is not None:
                 m = matrices[p.key]
-                swapped = override is not None and p.key in override.matrices
+                swapped = override is not None and override.replaces(p.key)
                 payload = override.record(p.key) if swapped else quant.record(m)
             else:
                 payload = served.read(p.copy)
@@ -408,7 +408,7 @@ def verify(artifact_path, served_path, quant_root, log=print, override=None, wei
                             f"not {p.format} {p.layout} {p.shape}")
         data = art.read(name)
         if p.key is not None:
-            swapped = override is not None and p.key in override.matrices
+            swapped = override is not None and override.replaces(p.key)
             if data != (override.record(p.key) if swapped else quant.record(matrices[p.key])):
                 problems.append(f"{name}: not {p.key}'s {'override ' if swapped else ''}trellis, "
                                 f"suh and svh bit for bit")
@@ -418,7 +418,7 @@ def verify(artifact_path, served_path, quant_root, log=print, override=None, wei
                 problems.append(f"{name}: sha256 differs from the served object's")
             checked["copied"] += 1
         if base is not None and name in base.by_name:
-            swapped = override is not None and p.key is not None and p.key in override.matrices
+            swapped = override is not None and p.key is not None and override.replaces(p.key)
             equal = base.read(name) == data
             if swapped and equal:
                 problems.append(f"{name}: the override's record is the baseline's, bit for bit")
@@ -446,16 +446,22 @@ def add_override_arguments(r):
                                            "`replay.py fetch`'s directory (with --override)")
 
 
+def load_override(root, reference_root=None):
+    """The `Override` at `root`, with the partial BF16 it was made from when given (`run` needs it,
+    `verify` does not); Refused naming what keeps it from loading."""
+    try:
+        return override_mod.Override(root, reference_root)
+    except (ValueError, OSError) as e:
+        raise Refused(f"the override: {e}")
+
+
 def override_of(a):
     """The `Override` the arguments name, or None; Refused when they name it by halves."""
     if not a.override and not a.override_bf16:
         return None
     if not a.override or not a.override_bf16:
         raise Refused(f"--override takes {'--override-bf16' if a.override else '--override'} too")
-    try:
-        return override_mod.Override(a.override, a.override_bf16)
-    except (ValueError, OSError) as e:
-        raise Refused(f"the override: {e}")
+    return load_override(a.override, a.override_bf16)
 
 
 def main(argv=None):
@@ -490,13 +496,11 @@ def main(argv=None):
             print(f"REFUSED: {e}", flush=True)
             return EXIT_REFUSED
         return 0
-    ov = None
-    if a.override:
-        try:
-            ov = override_mod.Override(a.override)
-        except (ValueError, OSError) as e:
-            print(f"REFUSED: the override: {e}", flush=True)
-            return EXIT_REFUSED
+    try:
+        ov = load_override(a.override) if a.override else None
+    except Refused as e:
+        print(f"REFUSED: {e}", flush=True)
+        return EXIT_REFUSED
     ok, report = verify(a.artifact, a.served, a.quant, log=log, override=ov, weights_id=a.weights_id,
                         baseline=a.baseline)
     if a.report:
