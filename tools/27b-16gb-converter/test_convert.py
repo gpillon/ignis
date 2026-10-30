@@ -366,6 +366,23 @@ def test_an_override_with_no_provenance_is_refused_naming_what_is_missing(tmp_pa
         convert.override_of(a)
 
 
+def test_both_commands_refuse_an_override_they_cannot_load_alike(tmp_path, capsys):
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    os.remove(os.path.join(ov["override"], "replay.json"))
+    commands = {
+        "run": ["run", "--served", src["served"], "--quant", src["quant"], "--bf16", src["bf16"],
+                "--work", str(tmp_path / "work"), "--override", ov["override"], "--override-bf16", ov["bf16"]],
+        "verify": ["verify", "--artifact", str(tmp_path / "a.ninfer"), "--served", src["served"],
+                   "--quant", src["quant"], "--override", ov["override"]],
+    }
+    for name, argv in commands.items():
+        assert convert.main(argv) == convert.EXIT_REFUSED, name
+        said = capsys.readouterr().out
+        assert said.startswith(f"REFUSED: the override: {ov['override']} has no replay.json"), (name, said)
+    assert not (tmp_path / "work").exists()
+
+
 @pytest.mark.parametrize("change,message", [
     (lambda r: r.update(status="partial"), "status complete .it is 'partial'."),
     (lambda r: r["sources"]["abliterated"].pop("revision"), "sources.abliterated.revision"),

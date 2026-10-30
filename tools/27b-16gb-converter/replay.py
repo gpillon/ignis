@@ -32,14 +32,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 import plan as plan_mod
 import work
+from override import FETCH_RECORD, INDEX, REPLAY_RECORD, mismatch, read_json
 
 HF = "https://huggingface.co"
 # The abliteration the 32 GB artifact was made from, at the revision it used.
 HUIHUI_REPO = "huihui-ai/Huihui-Qwen3.8-27B-abliterated"
 HUIHUI_REVISION = "739e3c5b89849f6c238ce1e5b70008612ae42cdd"
-INDEX = "model.safetensors.index.json"
-FETCH_RECORD = "fetch.json"
-REPLAY_RECORD = "replay.json"
 SCHEMA = "qwen3.8-27b-trellis-replay-v1"
 # The quant's calibration rows: its own trace, shipped in its repository.
 CAL_TRACE = "cal_trace.safetensors"
@@ -116,11 +114,9 @@ def check_records(out, planned):
         if m.key not in keys:
             problems.append(f"{m.key}: missing")
             continue
-        r = records.matrix(m.key)
-        if r.k2 != m.k2:
-            problems.append(f"{m.key}: K {r.k2 / 2:g}, the plan's is {m.k2 / 2:g}")
-        elif r.shape != m.shape:
-            problems.append(f"{m.key}: shape {r.shape}, the plan's is {m.shape}")
+        unlike = mismatch(m.key, records.matrix(m.key), m, "the plan's")
+        if unlike:
+            problems.append(unlike)
     problems += [f"{key}: not in the plan" for key in sorted(keys - {m.key for m in planned})]
     return problems
 
@@ -268,8 +264,7 @@ def prepare(quant_root, bf16_root, abliterated, out, first=FIRST_LAYER, last=LAS
     fetch_path = os.path.join(abliterated, FETCH_RECORD)
     if not os.path.isfile(fetch_path):
         raise ValueError(f"{abliterated} has no {FETCH_RECORD}: fetch the abliterated tensors first")
-    with open(fetch_path, encoding="utf-8") as f:
-        fetched = json.load(f)
+    fetched = read_json(fetch_path)
     missing = [m.key + ".weight" for m in planned if m.key + ".weight" not in fetched["tensors"]]
     if missing:
         raise ValueError(f"{abliterated} does not hold {missing[:5]}")
