@@ -133,7 +133,9 @@ are Flash-Next's, under the `qwen38` scope: `--qwen38-reuse-retained-host`,
 `--qwen38-model-host-margin-bytes`.
 
 A vision load under `--vision-residency host` pins the vision tower beside the
-table, on a line of its own (`vision_tower`, 297 MB with its page padding;
-`vision_tower_bytes` in both events). A start that cannot hold it is refused
+table and maps the embedding pool in pinned RAM of its own, each on a line of
+its own: `vision_tower`, 297 MB with its page padding, and `vision_pool`, the
+pool `--vision-embedding-pool-mib` sizes (`vision_tower_bytes` and
+`vision_pool_bytes` in both events). A start that cannot hold them is refused
 naming `--vision-residency device` and turning vision off as the ways out
-([Where the vision tower lives](vision.md#where-the-vision-tower-lives)).
+([Where the vision tower and the embedding pool live](vision.md#where-the-vision-tower-and-the-embedding-pool-live)).

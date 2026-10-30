@@ -156,15 +156,19 @@ pub(crate) mod ffi {
         /// The bound tensors' bytes in device memory.
         pub vram_bytes: u64,
         pub bound_tensor_count: u64,
-        /// GitHub #177, #212: what vision adds beside a text load -- the
-        /// output transient, and whatever the encoder's workspace grows the
-        /// shared scratch past the prefill scratch.
+        /// GitHub #177, #212: what vision adds beside a text load in VRAM --
+        /// the output transient (the embedding pool, unless the `host` vision
+        /// residency maps it, GitHub #415), and whatever the encoder's
+        /// workspace grows the shared scratch past the prefill scratch.
         pub vision_reserved_bytes: u64,
         /// GitHub #210: what the load holds beside the weights, read off its
         /// own buffers.
         pub reserved: IgnisModelReservations,
         /// ADR 0062: the bound tensors' bytes the leaf found in mapped host
-        /// memory (the 27B's token embedding), apart from `vram_bytes`.
+        /// memory (the 27B's token embedding, and its vision tower under the
+        /// `host` vision residency, ADR 0075), apart from `vram_bytes`; under
+        /// that residency with the embedding pool's mapped allocation beside
+        /// them (GitHub #415).
         pub host_mapped_bytes: u64,
     }
 

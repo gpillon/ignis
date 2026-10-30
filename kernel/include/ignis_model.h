@@ -256,11 +256,12 @@ enum ignis_prefill_attention {
   IGNIS_PREFILL_ATTENTION_FP16 = 1,
 };
 
-/* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower.
- * The binder places the tower and the load checks it is where this says. */
+/* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
+ * and (GitHub #415) its media embedding pool. The binder places the tower and
+ * the load checks it is where this says. */
 enum ignis_vision_residency {
-  /* In VRAM for the life of the load: the load before ADR 0075. The default,
-   * and what a zeroed field reads as. */
+  /* The tower and the pool in VRAM for the life of the load: the load before
+   * ADR 0075. The default, and what a zeroed field reads as. */
   IGNIS_VISION_RESIDENCY_DEVICE = 0,
   /* In mapped pinned host memory (the token embedding's allocation, ADR
    * 0062), staged into the prefill scratch for each media encode through a
@@ -268,7 +269,11 @@ enum ignis_vision_residency {
    * stage, which the encoder's share of the scratch holds beside its
    * workspace: the encode copies the next stage on a copy stream of its own
    * while the current one computes, and reads every weight at device speed.
-   * The tower takes no VRAM between encodes. */
+   * The tower takes no VRAM between encodes. The embedding pool is one mapped,
+   * portable pinned host allocation the load makes (GitHub #415): the merger
+   * writes each page into a device page in a slot of the ring and copies it
+   * there, and a prefill chunk's scatter reads it in place. Neither is a
+   * VRAM reservation; both count as `host_mapped_bytes`. */
   IGNIS_VISION_RESIDENCY_HOST = 1,
 };
 
@@ -312,7 +317,9 @@ struct ignis_model_load_options {
    * IGNIS_MEDIA_ENCODE_POOL_FULL while live embeddings hold the rest. This is
    * where the reference keeps a single output transient: the pool is a
    * departure (ADR 0035), because an embedding outliving its encode is what
-   * lets a fan-out over one image encode it once. */
+   * lets a fan-out over one image encode it once. In VRAM, or under
+   * IGNIS_VISION_RESIDENCY_HOST in mapped host memory, the same bytes (GitHub
+   * #415). */
   uint64_t vision_embedding_pool_bytes;
   /* GitHub #227: YaRN RoPE scaling, the text frequency table this load
    * rotates at. 0 (or 1) is no scaling -- the linear table the engine has
@@ -406,7 +413,8 @@ struct ignis_model_reservations {
   uint64_t workspace_bytes;
   /* The media embedding pool (GitHub #243): the load's
    * `vision_embedding_pool_bytes`, rounded up to a whole number of column
-   * pages. 0 without vision. Holds as many items as their own columns fit,
+   * pages. 0 without vision, and under IGNIS_VISION_RESIDENCY_HOST, whose pool
+   * is host-mapped (GitHub #415). Holds as many items as their own columns fit,
    * not a fixed count -- see `ignis_model_load_options`. */
   uint64_t media_embedding_bytes;
   /* Device sampling's staging buffers and candidate-selection workspace. */
@@ -441,7 +449,7 @@ struct ignis_model_stats {
   /* What vision reserves beside the weights (GitHub #177, #212): the
    * per-item output transient, plus whatever the encoder workspace grows
    * the shared scratch arena past a prefill chunk's own scratch. 0 without
-   * vision. */
+   * vision. In VRAM: a host-mapped embedding pool (GitHub #415) is not in it. */
   uint64_t vision_reserved_bytes;
   /* What this load holds beside the weights, read off its own buffers
    * (GitHub #210). */
@@ -449,7 +457,9 @@ struct ignis_model_stats {
   /* Sum of the payload bytes of every bound tensor in mapped host memory
    * (ADR 0062: the 27B's token embedding; ADR 0075: and its vision tower
    * under IGNIS_VISION_RESIDENCY_HOST), which `vram_bytes` leaves out:
-   * the load asks the runtime where each tensor's data lives. */
+   * the load asks the runtime where each tensor's data lives. Under
+   * IGNIS_VISION_RESIDENCY_HOST, with the embedding pool's mapped allocation
+   * beside them (GitHub #415). */
   uint64_t host_mapped_bytes;
 };
 

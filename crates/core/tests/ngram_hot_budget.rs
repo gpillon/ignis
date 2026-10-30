@@ -21,6 +21,7 @@ fn host(available: u64) -> HostPlanRequest {
         scope: "qwen38flashnext",
         token_embedding_bytes: 0,
         vision_tower_bytes: 0,
+        vision_pool_bytes: 0,
         expert_pool_bytes: 37_795_446_784,
         load_staging_bytes: 0,
         ngram_hot_rows_bytes: 0,

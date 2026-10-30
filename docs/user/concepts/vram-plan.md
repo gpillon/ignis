@@ -40,13 +40,14 @@ Flash-Next). The lines include:
   vision on, the image encoder's workspace shares it and the line is the larger
   of the two (under `--vision-residency host` the encoder's share includes the
   slots its weights are copied through,
-  [Vision](../configuration/vision.md#where-the-vision-tower-lives));
+  [Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live));
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
   for the linear-attention layers);
 - the **decode and drafter graphs**' staging buffers;
 - the **retained slots** that live on the device (none by default) and, under
   the compressed KV format, the residual window of every lane and slot;
-- the **media embedding** pool for images;
+- the **media embedding** pool for images (0 under `--vision-residency host`,
+  which keeps it in pinned host RAM);
 - the **KV pool**, which takes whatever is left on the 27B, or is reserved first
   on a Flash-Next that streams its experts.
 

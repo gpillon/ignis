@@ -1,6 +1,7 @@
 //! Expert residency's reservations as **plan lines** computed at load (ADR
 //! 0030): the host plan (the 27B's mapped token embedding, ADR 0062, and its
-//! vision tower under the `host` vision residency, ADR 0075; the
+//! vision tower and embedding pool under the `host` vision residency, ADR
+//! 0075; the
 //! pinned expert pool or a device-only load's layer buffers, the n-gram hot
 //! rows, KV-disk's staging buffers, and prompt reuse's host retained slots
 //! and KV-RAM arena) with its refusal margin, charged at its peak, and the
@@ -50,6 +51,13 @@ pub struct HostPlanRequest {
     /// with their 4 KiB padding. 0 when the tower is on the device, without
     /// vision, and on Flash-Next.
     pub vision_tower_bytes: u64,
+    /// The 27B's embedding pool in a mapped pinned allocation of its own,
+    /// made by the model's load, which the encode writes and the prefill
+    /// chunk's scatter reads in place (ADR 0075, GitHub #415): the load's
+    /// `--vision-embedding-pool-mib`, floored and rounded to column pages
+    /// ([`crate::Vision::pool_bytes`]). 0 when the pool is on the device,
+    /// without vision, and on Flash-Next.
+    pub vision_pool_bytes: u64,
     /// The expert pool, pinned for the life of the load: every expert
     /// projection ([`ExpertCatalog::total_bytes`] of the artifact) but a
     /// pinned hot set's, which have no host copy (ADR 0055). 0 on a
@@ -99,12 +107,13 @@ impl HostPlan {
 }
 
 /// The host plan's lines.
-pub const HOST_PLAN_LINES: usize = 8;
+pub const HOST_PLAN_LINES: usize = 9;
 
 /// When a line holds its bytes, in the order a Flash-Next load allocates
 /// them (`FlashNextLeaf::open`, then the server's load): the residency phase
 /// (the 27B's token embedding and vision tower, which a Flash-Next load has
-/// none of, and the expert pool, or a device-only load's layer buffers); then the n-gram
+/// none of, and the expert pool, or a device-only load's layer buffers); then
+/// the 27B's embedding pool, which its model load makes; then the n-gram
 /// hot rows and the KV-RAM arena; the model's sequence pool with the retained
 /// host slots; KV-disk's staging last. Nothing the plan holds is freed before
 /// the model drops but the layer buffers, which are gone when the residency
@@ -129,6 +138,7 @@ fn held_lines(request: &HostPlanRequest) -> [(&'static str, u64, Held); HOST_PLA
     [
         ("token_embedding", request.token_embedding_bytes, FromResidency),
         ("vision_tower", request.vision_tower_bytes, FromResidency),
+        ("vision_pool", request.vision_pool_bytes, AfterResidency),
         ("expert_pool", request.expert_pool_bytes, FromResidency),
         ("load_staging", request.load_staging_bytes, DuringResidency),
         ("ngram_hot_rows", request.ngram_hot_rows_bytes, AfterResidency),
@@ -238,11 +248,26 @@ impl std::fmt::Display for HostPlanError {
                 human_bytes(line("token_embedding"))
             ),
             // ADR 0075: a `host` start never falls back to the device, so the
-            // refusal names both ways out.
-            "vision_tower" => write!(
+            // refusal names both ways out, for the tower and the pool together.
+            "vision_tower" => match line("vision_pool") {
+                0 => write!(
+                    f,
+                    "The token embedding fits, the vision tower ({}) does not: keep it in VRAM {VISION_WAYS_OUT}",
+                    human_bytes(line("vision_tower"))
+                ),
+                pool => write!(
+                    f,
+                    "The token embedding fits, the vision tower ({}) and its embedding pool ({}) do not: keep them \
+                     in VRAM {VISION_WAYS_OUT}",
+                    human_bytes(line("vision_tower")),
+                    human_bytes(pool)
+                ),
+            },
+            "vision_pool" => write!(
                 f,
-                "The token embedding fits, the vision tower ({}) does not: keep it in VRAM                  (vision.residency: device, --vision-residency device), turn vision off, or close other                  applications",
-                human_bytes(line("vision_tower"))
+                "The token embedding and the vision tower fit, the embedding pool ({}) does not: keep them in VRAM \
+                 {VISION_WAYS_OUT}",
+                human_bytes(line("vision_pool"))
             ),
             "expert_pool" => write!(
                 f,
@@ -298,11 +323,17 @@ impl std::fmt::Display for HostPlanError {
 
 impl std::error::Error for HostPlanError {}
 
+/// What follows "keep them in VRAM" when the `host` vision residency's tower
+/// or pool does not fit (ADR 0075): the setting that does so, and vision off.
+const VISION_WAYS_OUT: &str =
+    "(vision.residency: device, --vision-residency device), turn vision off, or close other applications";
+
 /// A plan line as the refusal names it to a person.
 fn line_label(name: &str) -> &str {
     match name {
         "token_embedding" => "token embedding",
         "vision_tower" => "vision tower",
+        "vision_pool" => "embedding pool",
         "expert_pool" => "experts",
         "load_staging" => "expert layer buffers",
         "ngram_hot_rows" => "n-gram hot rows",

@@ -1,19 +1,22 @@
-//! GPU tests for the vision residency (GitHub #414, ADR 0075): where a vision
-//! load keeps the 27B's vision tower, as the leaf itself accounts for it.
+//! GPU tests for the vision residency (GitHub #414, #415, ADR 0075): where a
+//! vision load keeps the 27B's vision tower and its embedding pool, as the
+//! leaf itself accounts for them.
 //!
 //! - Under `host` the binder places the tower's 333 tensors in the mapped
-//!   pinned allocation beside the token embedding, and the leaf reports their
-//!   295,711,648 bytes as host-mapped bytes, not VRAM bytes; under `device` it
-//!   is today's resident load. The embedding pool stays on the device under
-//!   both (#415 moves it). The plan the server logs and the load it gets agree
-//!   to the byte, the staging ring included, and a load whose residency
+//!   pinned allocation beside the token embedding, and the load maps the
+//!   embedding pool in pinned host memory of its own: the leaf reports the
+//!   tower's 295,711,648 bytes and the pool's as host-mapped bytes, not VRAM
+//!   bytes, and its plan and its reservations carry no pool. Under `device` it
+//!   is today's resident load. The plan the server logs and the load it gets
+//!   agree to the byte, the staging ring included, and a load whose residency
 //!   disagrees with where the binder put the tower is refused.
 //! - On a 16 GB budget with the `rtx50-16gb` profile (the trellis artifact,
 //!   hq-e8-2b, 262,144 tokens, 1,024-token chunks, DFlash2 at 7, two lanes),
 //!   the ring fits inside the prefill scratch the text load already reserves
-//!   at a 1,024- and a 4,096-token envelope, so `host` grows nothing there;
-//!   where the encoder's share sets the scratch's size (a 16,384-token item),
-//!   it grows by the ring.
+//!   at a 1,024- and a 4,096-token envelope, so `host` grows nothing there,
+//!   and plans no pool; where the encoder's share sets the scratch's size (a
+//!   16,384-token item), it grows by the ring. The KV pool that leaves the
+//!   profile's start is `crates/server/tests/trellis_16g_gpu.rs`'.
 //!
 //! The identity of the two residencies' encodes and logits is
 //! `crates/server/tests/vision_residency_gpu.rs`, which has the vision canary.
@@ -61,15 +64,23 @@ struct Held {
     planned: IgnisModelReservations,
 }
 
+/// The loads' context and chunk: at a 128-token chunk the encoder's share of
+/// the scratch is the larger (`vision_load_gpu.rs` pins it), so the ring shows
+/// in the workspace.
+const CONTEXT: u32 = 1024;
+const CHUNK: u32 = 128;
+
+/// The loads' vision: a 1,024-token envelope bounded at the item bound, its
+/// default pool, at `residency`.
+fn vision_at(residency: VisionResidency) -> Vision {
+    Vision::new(1024).unwrap().with_item_max_tokens(ITEM_BOUND).with_residency(residency)
+}
+
 /// Bind, plan, materialize and load the served artifact with vision at
 /// `residency`; encode one small item from the tower; release everything.
 /// Along the way a load whose residency is the other one is refused.
 fn held_at(reader: &Reader, device: &mut CudaDevice, residency: VisionResidency) -> Held {
-    // A 128-token chunk: the encoder's share of the scratch is the larger
-    // (`vision_load_gpu.rs` pins it), so the ring shows in the workspace.
-    const CONTEXT: u32 = 1024;
-    const CHUNK: u32 = 128;
-    let vision = Vision::new(1024).unwrap().with_item_max_tokens(ITEM_BOUND).with_residency(residency);
+    let vision = vision_at(residency);
     let (plan, handles) = bind_model_scope_27b_with(reader, model_scope(None, Some(vision), ExceptionWeights::Bf16))
         .unwrap_or_else(|e| panic!("bind ({residency}): {e}"));
     let planned = plan_qwen38_27b_reservations(
@@ -153,24 +164,33 @@ fn under_host_the_leaf_holds_the_tower_in_host_mapped_bytes_and_not_in_vram_byte
     );
 
     assert_eq!(device_load.vram_bytes - host_load.vram_bytes, TOWER_BYTES, "the tower leaves the VRAM bytes");
-    assert_eq!(host_load.host_mapped_bytes - device_load.host_mapped_bytes, TOWER_BYTES, "and enters the host-mapped bytes");
-    // The pool stays on the device in this build, whatever the residency.
-    assert_eq!(host_load.reserved.media_embedding_bytes, device_load.reserved.media_embedding_bytes);
-    // Each load holds what its plan said, the host one's ring included.
+    // GitHub #415: the pool, the device load's VRAM line, is the host load's
+    // mapped allocation: the same bytes, the leaf's own figure, which the
+    // server's host plan sizes with the Rust mirror of its rule.
+    let pool = device_load.reserved.media_embedding_bytes;
+    assert_eq!(pool, vision_at(VisionResidency::Host).pool_bytes(CONTEXT), "the host plan's pool line is the leaf's pool");
+    assert_eq!(host_load.reserved.media_embedding_bytes, 0, "the host load holds no pool in VRAM");
+    assert_eq!(
+        host_load.host_mapped_bytes - device_load.host_mapped_bytes,
+        TOWER_BYTES + pool,
+        "the tower and the pool enter the host-mapped bytes"
+    );
+    // Each load holds what its plan said, the host one's ring included and
+    // its pool left out.
     for (name, held) in [("device", &device_load), ("host", &host_load)] {
         assert_eq!(held.reserved, held.planned, "{name}: the load holds its plan");
     }
     // At a 1,024-token item and a 128-token chunk the encoder's share is the
-    // larger, so the ring is what host adds to the scratch, and to vision's
-    // reservation.
+    // larger, so the ring is what host adds to the scratch; vision's VRAM
+    // reservation gains it and loses the pool.
     let grown = host_load.reserved.workspace_bytes - device_load.reserved.workspace_bytes;
     assert!((RING_BYTES..RING_BYTES + 256).contains(&grown), "the ring after the aligned workspace: {grown}");
-    assert_eq!(host_load.vision_reserved_bytes - device_load.vision_reserved_bytes, grown);
+    assert_eq!(device_load.vision_reserved_bytes + grown - pool, host_load.vision_reserved_bytes);
 }
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-fn on_the_16_gb_profile_the_ring_fits_the_prefill_scratch_at_1024_and_4096() {
+fn on_the_16_gb_profile_the_ring_fits_the_prefill_scratch_and_the_pool_leaves_vram_at_1024_and_4096() {
     let path = Path::new(TRELLIS);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("the 16 GB artifact is absent: {TRELLIS}")) {
         return;
@@ -179,7 +199,7 @@ fn on_the_16_gb_profile_the_ring_fits_the_prefill_scratch_at_1024_and_4096() {
     // `rtx50-16gb`'s 27B: 262,144 tokens of hq-e8-2b at 1,024-token chunks,
     // DFlash2 at 7 with the full head, two decode lanes.
     let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
-    let workspace = |vision: Option<Vision>| {
+    let planned = |vision: Option<Vision>| {
         let (plan, handles) =
             bind_model_scope_27b_with(&reader, model_scope(Some(speculation), vision, ExceptionWeights::Bf16))
                 .unwrap_or_else(|e| panic!("bind: {e}"));
@@ -197,16 +217,22 @@ fn on_the_16_gb_profile_the_ring_fits_the_prefill_scratch_at_1024_and_4096() {
             2,
         )
         .unwrap_or_else(|e| panic!("plan {vision:?}: {e}"))
-        .workspace_bytes
     };
+    let workspace = |vision: Option<Vision>| planned(vision).workspace_bytes;
     let text = workspace(None);
     eprintln!("16 GB profile: text-only workspace {text}");
     for envelope in [1024, 4096] {
         let at = |residency| Vision::new(envelope).unwrap().with_item_max_tokens(ITEM_BOUND).with_residency(residency);
-        let device = workspace(Some(at(VisionResidency::Device)));
-        let host = workspace(Some(at(VisionResidency::Host)));
-        eprintln!("16 GB profile at a {envelope}-token envelope: workspace device {device}, host {host}");
-        assert_eq!(host, device, "the encode of a {envelope}-token item and the ring fit the scratch");
+        let device = planned(Some(at(VisionResidency::Device)));
+        let host = planned(Some(at(VisionResidency::Host)));
+        eprintln!(
+            "16 GB profile at a {envelope}-token envelope: workspace device {}, host {}; pool device {}, host {}",
+            device.workspace_bytes, host.workspace_bytes, device.media_embedding_bytes, host.media_embedding_bytes
+        );
+        assert_eq!(host.workspace_bytes, device.workspace_bytes, "the encode of a {envelope}-token item and the ring fit the scratch");
+        // GitHub #415: and the pool is host-mapped, no VRAM line.
+        assert_eq!(host.media_embedding_bytes, 0, "the pool leaves the VRAM plan at {envelope}");
+        assert_eq!(device.media_embedding_bytes, at(VisionResidency::Device).pool_bytes(262_144), "a VRAM line under device");
     }
     // Where the encoder's share sets the scratch's size, the ring is what it grows by.
     let at = |residency| Vision::new(ITEM_BOUND).unwrap().with_item_max_tokens(ITEM_BOUND).with_residency(residency);

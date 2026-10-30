@@ -28,6 +28,10 @@
 //! sequence but not the spare reservation beside it
 //! (`vram.adapt_spare_tokens`), short by 577 pages.
 //!
+//! GitHub #415 (ADR 0075) loads the profile in the same 16 GiB with vision on
+//! under the `host` residency, at a 1,024- and a 4,096-token envelope, and
+//! finds the text-only load's KV pool, to the page.
+//!
 //! Its own test binary: the request log is written on the engine's telemetry
 //! task, so the capture is the process's global subscriber. The two budget
 //! cases read only the load's own lines, logged on the loading thread, so
@@ -116,12 +120,17 @@ fn captured<T>(run: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 /// bytes, and the events the load logged; `None` where the profile allows a
 /// skip.
 fn load_16g(budget: u64) -> Option<(ignis_server::ActiveModel, Vec<serde_json::Value>)> {
+    load_16g_with(budget, &[])
+}
+
+/// [`load_16g`] with `extra` flags after the profile's.
+fn load_16g_with(budget: u64, extra: &[&str]) -> Option<(ignis_server::ActiveModel, Vec<serde_json::Value>)> {
     if !Path::new(TRELLIS).exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {TRELLIS}")) {
         return None;
     }
     let budget = budget.to_string();
-    let options =
-        ignis_server::config::Config { model: MODEL.to_owned(), model_named: true, ..the_27b(&flags_16g(&budget)) };
+    let flags = [&flags_16g(&budget)[..], extra].concat();
+    let options = ignis_server::config::Config { model: MODEL.to_owned(), model_named: true, ..the_27b(&flags) };
     let (loaded, events) = captured(|| {
         ignis_server::load::prepare_model(&options, Path::new(TRELLIS)).and_then(ignis_server::load::load_model)
     });
@@ -412,4 +421,42 @@ async fn less_3_gib_of_desktop_adapts_the_context_to_65536_on_two_lanes() {
     assert_eq!(load[0]["attributes"]["decode_lanes"], 2);
     assert_eq!(load[0]["attributes"]["max_context"], 65_536);
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
+}
+
+/// GitHub #415 (ADR 0075, the build's acceptance 1): under the `host` vision
+/// residency a vision load inside the 16 GiB budget, no image in flight, keeps
+/// exactly the text-only load's KV pool at a 1,024- and a 4,096-token envelope
+/// (7,956 pages in #409's prototype, against 7,437 and 7,384 under `device`):
+/// the tower leaves the weights line, staged through slots that fit the
+/// prefill scratch, and the embedding pool is host-mapped, so its
+/// `media_embedding` line is 0. The workspace may still grow by vision's
+/// attention readout (13,312 bytes at 1,024 in the prototype), under a page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn under_the_host_residency_vision_keeps_the_text_only_kv_pool_at_1024_and_4096() {
+    async fn plan_of(extra: &[&str]) -> Option<serde_json::Value> {
+        let (model, events) = load_16g_with(17_179_869_184, extra)?;
+        let plan = named(&events, "ignis.runtime.vram_plan");
+        assert_eq!(plan.len(), 1, "{events:?}");
+        println!("vram_plan {extra:?}: {}", plan[0]);
+        let lines = plan[0]["attributes"].clone();
+        tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
+        Some(lines)
+    }
+    let Some(text) = plan_of(&[]).await else { return };
+    assert_eq!(text["adapted"], "", "the text-only load fits as asked");
+    assert!(text.get("vision_residency").is_none(), "{text}");
+    for envelope in ["1024", "4096"] {
+        let flags = ["--vision-enabled", "--vision-max-tokens", envelope, "--vision-residency", "host"];
+        let Some(host) = plan_of(&flags).await else { return };
+        assert_eq!(host["vision_residency"], "host");
+        assert_eq!(host["adapted"], "", "{envelope}: the vision load fits as asked");
+        assert_eq!(host["media_embedding_bytes"], 0, "{envelope}: the pool is host-mapped, no VRAM line");
+        println!(
+            "{envelope}: weights {} (text {}), workspace {} (text {}), kv pool {} pages (text {})",
+            host["weights_bytes"], text["weights_bytes"], host["workspace_bytes"], text["workspace_bytes"],
+            host["kv_pool_pages"], text["kv_pool_pages"]
+        );
+        assert_eq!(host["kv_pool_pages"], text["kv_pool_pages"], "{envelope}: the text-only load's KV pool");
+    }
 }

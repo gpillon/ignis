@@ -5,12 +5,16 @@
 //!
 //! One load of each, one after the other (the card holds one), each encoding
 //! the vision canary's four images, a 1,024-token item and a 16,384-token item
-//! (the processor's item bound, a 4096 x 4096 image), and scoring each canary
+//! (the processor's item bound, a 4096 x 4096 image), scoring each canary
 //! prompt teacher-forced over its first 32 answer positions, prefilled whole
-//! and in 48-token spans. Compared between the two:
+//! and in 48-token spans, and prefilling the 16,384-token item's prompt whole.
+//! Compared between the two:
 //! - every media embedding, byte for byte;
 //! - every canary prompt's predictions, and the hash of every scored
-//!   position's logits.
+//!   position's logits;
+//! - the 16,384-token item's prompt's last logits (GitHub #415: under `host`
+//!   its 128 pool pages are host-mapped, and every chunk's scatter reads them
+//!   in place).
 //!
 //! The leaf's accounting of the two residencies is
 //! `crates/core/tests/vision_residency_gpu.rs`.
@@ -40,7 +44,7 @@ use ignis_core::{ExceptionWeights, KvFormat, RopeScaling, Vision, VisionResidenc
 use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
-/// Room for the 16,384-token item; only the canaries are prefilled.
+/// Room for the 16,384-token item's prompt, prefilled whole.
 const MAX_CONTEXT: u32 = 20_480;
 const PREFILL_CHUNK: u32 = 1024;
 /// The processor's item bound for this artifact, and the envelope: the
@@ -183,7 +187,7 @@ fn capture(
 
     for (side, merged) in [(1024u32, 1024usize), (4096, ITEM_BOUND as usize)] {
         let image = patterned_png(side);
-        let (_, prompt) = image_prompt(frontend, &image, "Describe this image in one sentence.");
+        let (tokens, prompt) = image_prompt(frontend, &image, "Describe this image in one sentence.");
         let item = &prompt.media[0];
         assert_eq!(item.token_span.count, merged, "a {side} x {side} image is a {merged}-token item");
         let started = std::time::Instant::now();
@@ -192,6 +196,20 @@ fn capture(
         eprintln!("{residency}: a {merged}-token item encoded in {:.1} ms (one cold encode)", started.elapsed().as_secs_f64() * 1e3);
         let bits = embedding.read_bits(config.hidden).unwrap_or_else(|e| panic!("{merged}-token item: read: {e}"));
         out.embeddings.push((format!("{merged}-token item"), bits));
+        if merged == ITEM_BOUND as usize {
+            // The whole prompt, chunk after chunk, each scattering its run of
+            // the item's columns from the pool.
+            let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
+            let mut logits = vec![0f32; vocab];
+            prefill_prompt(&model, &pool, &mut sequence, &tokens, &prompt, &embedding, PREFILL_CHUNK, &mut logits)
+                .unwrap_or_else(|e| panic!("{merged}-token item ({residency}): prefill: {e}"));
+            eprintln!("{residency}: the {merged}-token item's prompt ({} tokens) prefilled whole", tokens.len());
+            out.scored.push((
+                format!("{merged}-token item's prompt, last logits"),
+                vec![argmax_lowest_id(&logits)],
+                vec![logits_hash(&logits)],
+            ));
+        }
     }
 
     drop(pool);

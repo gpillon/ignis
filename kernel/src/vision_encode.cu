@@ -26,6 +26,9 @@
 // scratch, after its workspace, through a ring of three slots (TowerStager
 // below). The ops and their order are unchanged; only the weights' addresses
 // are the slots'. A device load passes no stager and runs exactly as before.
+// GitHub #415: the same residency's embedding pool is host-mapped, and the
+// merger's fc2 writes each page through a device page in the ring, then copies
+// it there (`VisionEncodeCall::page_bounce`).
 
 #include "ignis_image_vision.h"
 #include "ignis_step.h"
@@ -323,6 +326,9 @@ class TowerStager {
                "wait for a stage's copy");
   }
 
+  // Stage `stage`'s slot in the ring.
+  unsigned char *slot(std::size_t stage) const { return slots_[stage]; }
+
   // After stage `stage`'s last op: its slot may take the stage three on.
   void after(std::size_t stage, cudaStream_t stream) {
     check_cuda(cudaEventRecord(staging_.consumed[stage % IGNIS_VISION_STAGING_SLOTS], stream),
@@ -383,6 +389,12 @@ struct VisionEncodeCall {
   std::int32_t out_hidden = 0;
   std::int32_t page_columns = 0;
   std::vector<void *> pages;
+  // GitHub #415 (ADR 0075): a device page the merger's fc2 and its bias write
+  // each page into first, copied to its page after on the same stream -- set
+  // where the pages are host-mapped, whose in-place writes cross the bus at a
+  // fraction of a device copy's speed, and `add_bias` reads them back. Null:
+  // the merger writes the pages in place, as on the device.
+  void *page_bounce = nullptr;
   // GitHub #320: DeepStack merger i taps the residual after block
   // `deepstack_layers[i]` into `deepstack[i]` ([out_hidden, tokens]; null:
   // it does not run). The 27B has none.
@@ -552,9 +564,16 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
     const auto first = static_cast<std::int32_t>(p) * call.page_columns;
     const std::int32_t take = std::min(call.page_columns, tokens - first);
     const ninfer::Tensor hidden_page = hidden.slice(1, first, take);
-    ninfer::Tensor output(call.pages[p], ninfer::DType::BF16, {call.out_hidden, take});
+    void *const written = call.page_bounce != nullptr ? call.page_bounce : call.pages[p];
+    ninfer::Tensor output(written, ninfer::DType::BF16, {call.out_hidden, take});
     ninfer::ops::linear(hidden_page, w.merger_fc2, output, stream);
     ninfer::ops::add_bias(bf16_vector(w.merger_fc2_bias, call.out_hidden), output, stream);
+    if (call.page_bounce != nullptr) {
+      const cudaError_t err = cudaMemcpyAsync(call.pages[p], call.page_bounce, output.bytes(), cudaMemcpyDefault, stream);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("copying a pool page from its device page: ") + cudaGetErrorString(err));
+      }
+    }
   }
   after(merger_stage + 1);
 }
@@ -880,6 +899,17 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     call.page_columns = pool.page_columns;
     for (const std::int32_t page : embedding->pages) {
       call.pages.push_back(pool.page_ptr(page));
+    }
+    // GitHub #415 (ADR 0075): a host-mapped pool, which only the host
+    // residency has, is written through a device page in the slot the
+    // merger's first half was read from: free while its fc2 runs, since no
+    // later stage lands there (the load checked a page fits a slot).
+    static_assert(IGNIS_VISION_STAGING_SLOTS >= 2, "the merger's halves take two slots");
+    if (pool.mapped != nullptr) {
+      if (!stager) {
+        throw std::runtime_error("a host-mapped embedding pool without the staged tower's ring");
+      }
+      call.page_bounce = stager->slot(kVisionStagingStages - 2);
     }
     encode(stager ? staged_weights : model->vision, call, layout, backing, patches,
            static_cast<std::int32_t>(tokens), model->stream, stager ? &*stager : nullptr);

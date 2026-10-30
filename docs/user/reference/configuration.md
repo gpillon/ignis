@@ -970,7 +970,7 @@ Merged vision tokens per request. An image over it is shrunk to fit, aspect kept
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Encoded images kept for reuse, in MiB. Unset, one envelope-wide embedding; a pool below that is raised to it. Needs vision on.
+Encoded images kept for reuse, in MiB, where `vision.residency` puts the pool: VRAM, or pinned host RAM under `host`. Unset, one envelope-wide embedding; a pool below that is raised to it. Needs vision on.
 
 ### `vision.residency`
 
@@ -984,7 +984,7 @@ Encoded images kept for reuse, in MiB. Unset, one envelope-wide embedding; a poo
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Where the vision tower's weights live: `device`, in VRAM for the life of the load (today's encode latency), or `host`, in pinned host RAM, copied to the GPU for each image encode (~300 MB less VRAM, so more KV pool, a few ms more an encode). A `host` start the host RAM cannot hold is refused, never moved to the device. Needs vision on.
+Where the vision tower's weights and the embedding pool live: `device`, in VRAM for the life of the load (today's encode latency), or `host`, in pinned host RAM, the weights copied to the GPU for each image encode (~300 MB and the pool less VRAM, so more KV pool, a few ms more an encode). A `host` start the host RAM cannot hold is refused, never moved to the device. Needs vision on.
 
 ## media
 

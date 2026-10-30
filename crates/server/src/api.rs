@@ -2038,8 +2038,9 @@ struct HostPlanInfo {
     /// `needed_bytes` less `available_bytes`.
     short_bytes: u64,
     /// The first line, in plan order, the available memory could not hold:
-    /// `token_embedding` (the 27B's), `vision_tower` (the 27B's under the
-    /// `host` vision residency, ADR 0075), `expert_pool`, `load_staging` (a
+    /// `token_embedding` (the 27B's), `vision_tower` and `vision_pool` (the
+    /// 27B's vision tower and embedding pool under the `host` vision
+    /// residency, ADR 0075), `expert_pool`, `load_staging` (a
     /// device-only load's expert layer buffers, freed once the experts are in
     /// VRAM), `ngram_hot_rows`, `staging` (KV-disk's), `retained_host_slots`
     /// or `kv_ram_arena`.

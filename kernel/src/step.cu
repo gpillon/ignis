@@ -2752,10 +2752,9 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
     out_stats->vram_bytes += model->verify->device_bytes();
   }
   // GitHub #177: the media embedding pool (its weights are already in
-  // `model->vram_bytes`, and its encoder workspace in `scratch`, GitHub #212).
-  if (model->vision_pool.buffer != nullptr) {
-    out_stats->vram_bytes += model->vision_pool.buffer->bytes;
-  }
+  // `model->vram_bytes`, and its encoder workspace in `scratch`, GitHub #212)
+  // -- on the device only: a host-mapped one holds no VRAM (GitHub #415).
+  out_stats->vram_bytes += model->vision_pool.device_bytes();
   // GitHub #302: Flash-Next's activations and MoE buffers, and its pool's
   // indexer and n-gram sections.
   if (model->flash_next) {

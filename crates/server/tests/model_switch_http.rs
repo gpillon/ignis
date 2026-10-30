@@ -151,6 +151,7 @@ async fn a_switch_short_of_ram_reports_the_host_plan_in_bytes_beside_its_reason(
         json!([
             { "name": "token_embedding", "bytes": 0u64 },
             { "name": "vision_tower", "bytes": 0u64 },
+            { "name": "vision_pool", "bytes": 0u64 },
             { "name": "expert_pool", "bytes": 37_795_446_784u64 },
             { "name": "load_staging", "bytes": 0u64 },
             { "name": "ngram_hot_rows", "bytes": 1u64 << 30 },

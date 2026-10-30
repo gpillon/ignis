@@ -20,10 +20,11 @@
 //    binds and sizes but never reaches the device.
 // 6. GitHub #414 (ADR 0075): `vision_residency`. Under HOST the encoder's
 //    share of the scratch is its workspace, aligned, then a ring of
-//    IGNIS_VISION_STAGING_SLOTS slots of the largest stage's bound, and the
-//    pool does not move; DEVICE, a zeroed field, plans what a load without the
-//    field always did. A residency the leaf does not know, or HOST without an
-//    envelope, is refused by name.
+//    IGNIS_VISION_STAGING_SLOTS slots of the largest stage's bound, and
+//    (GitHub #415) the embedding pool is host-mapped, no VRAM line, while the
+//    decode round keeps its rope staging; DEVICE, a zeroed field, plans what a
+//    load without the field always did. A residency the leaf does not know, or
+//    HOST without an envelope, is refused by name.
 //
 // Host-only by construction, the same way as
 // test_model_load_speculative_options.cpp: a topology with no decoder layers
@@ -364,7 +365,12 @@ int main() {
     check(staged.workspace_bytes == aligned + IGNIS_VISION_STAGING_SLOTS * slot,
           "HOST appends three slots of the largest stage to the encoder's share: " +
               std::to_string(staged.workspace_bytes) + " against " + std::to_string(resident.workspace_bytes));
-    check(staged.media_embedding_bytes == resident.media_embedding_bytes, "the pool stays where it was");
+    check(resident.media_embedding_bytes > 0 && staged.media_embedding_bytes == 0,
+          "HOST maps the pool in host memory, out of the VRAM plan: " + std::to_string(staged.media_embedding_bytes));
+    check(plan(both, named_device).media_embedding_bytes == resident.media_embedding_bytes,
+          "DEVICE keeps it a VRAM line");
+    check(staged.decode_graph_bytes == resident.decode_graph_bytes,
+          "a vision load's decode round keeps its rope staging, wherever the pool is");
   }
   {
     ignis_model_load_options unknown = vision_items(32768, 16384);

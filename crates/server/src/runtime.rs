@@ -589,9 +589,11 @@ pub fn log_host_plan_refused(refusal: &ignis_core::residency::HostPlanError) {
 /// -- the token embedding's mapped table (`token_embedding_bytes`), the
 /// vision tower's spans beside it under the `host` vision residency
 /// (`vision_tower_bytes`, ADR 0075; the two make the plan's mapped
-/// allocation), KV-disk's staging windows when the tier is on, the host
-/// retained slots and the KV-RAM arena -- against the shape's margin
-/// (`model.host_margin_bytes`). No experts and no n-gram table.
+/// allocation), the embedding pool the model's load maps under the same
+/// residency (GitHub #415: the shape's [`ignis_core::Vision::pool_bytes`] at
+/// its context, the leaf's own sizing), KV-disk's staging windows when the
+/// tier is on, the host retained slots and the KV-RAM arena -- against the
+/// shape's margin (`model.host_margin_bytes`). No experts and no n-gram table.
 pub fn qwen27b_host_request(
     available_physical_bytes: u64,
     token_embedding_bytes: u64,
@@ -601,11 +603,16 @@ pub fn qwen27b_host_request(
 ) -> ignis_core::residency::HostPlanRequest {
     let family = ignis_core::compute::ModelFamily::Qwen38_27b;
     let kv_disk_on = shape.kv_disk_bytes_for(family) > 0;
+    let vision_pool_bytes = shape
+        .vision
+        .filter(|vision| vision.residency() == ignis_core::VisionResidency::Host)
+        .map_or(0, |vision| vision.pool_bytes(shape.max_context));
     ignis_core::residency::HostPlanRequest {
         available_physical_bytes,
         scope: crate::config::field::scope(family),
         token_embedding_bytes,
         vision_tower_bytes,
+        vision_pool_bytes,
         expert_pool_bytes: 0,
         load_staging_bytes: 0,
         ngram_hot_rows_bytes: 0,
@@ -647,6 +654,7 @@ pub fn log_qwen27b_host_plan_refused(
         // credential and is redacted (ignis-logging's record.rs).
         embedding_table_bytes = line("token_embedding"),
         vision_tower_bytes = line("vision_tower"),
+        vision_pool_bytes = line("vision_pool"),
         vision_residency = vision.map(ignis_core::VisionResidency::as_str),
         staging_bytes = line("staging"),
         retained_host_slots_bytes = line("retained_host_slots"),
@@ -658,8 +666,8 @@ pub fn log_qwen27b_host_plan_refused(
 /// The 27B's host plan as its load carries it out (ADR 0062): one
 /// `ignis.runtime.qwen27b_host_plan` event with every line it pins in bytes,
 /// what was available and what the plan leaves, and where a vision load
-/// keeps its tower (ADR 0075: `vision_residency`, none on a text load) with
-/// the tower's own line.
+/// keeps its tower and pool (ADR 0075: `vision_residency`, none on a text
+/// load) with the tower's and the pool's own lines.
 pub fn log_qwen27b_host_plan(
     request: &ignis_core::residency::HostPlanRequest, host: &ignis_core::residency::HostPlan, shape: &EngineShape,
     vision: Option<ignis_core::VisionResidency>,
@@ -673,6 +681,7 @@ pub fn log_qwen27b_host_plan(
         margin_bytes = request.margin_bytes,
         embedding_table_bytes = request.token_embedding_bytes,
         vision_tower_bytes = request.vision_tower_bytes,
+        vision_pool_bytes = request.vision_pool_bytes,
         vision_residency = vision.map(ignis_core::VisionResidency::as_str),
         staging_bytes = request.staging_bytes,
         retained_host_slots = shape.retained_host_slots,
@@ -687,11 +696,14 @@ pub fn log_qwen27b_host_plan(
 /// it. The materialize error, followed by the host plan's own figures, so the
 /// refusal reads as the plan's and says what it had counted on.
 pub fn qwen27b_pin_refused(error: &str, request: &ignis_core::residency::HostPlanRequest, planned_bytes: u64) -> String {
-    // ADR 0075: the `host` vision residency's tower is pinned with the table.
-    let tower = match request.vision_tower_bytes {
-        0 => String::new(),
-        bytes => format!(", the vision tower {bytes} bytes"),
-    };
+    // ADR 0075: the `host` vision residency's tower is pinned with the table,
+    // and its embedding pool by the model's load after (GitHub #415).
+    let mut tower = String::new();
+    for (name, bytes) in [("vision tower", request.vision_tower_bytes), ("embedding pool", request.vision_pool_bytes)] {
+        if bytes > 0 {
+            tower.push_str(&format!(", the {name} {bytes} bytes"));
+        }
+    }
     format!(
         "materialize weights: {error}; the host plan had counted {planned_bytes} bytes of pinned host memory \
          (the token embedding {} bytes{tower}) against {} bytes available and a {}-byte margin \
@@ -1038,10 +1050,12 @@ pub fn qwen27b_load(
             kv_pool: shape.kv_pool,
             // ADR 0045: every weight is a line, so the pool takes the rest.
             residency: ignis_core::Residency::Resident,
-            // GitHub #243: only so a refusal names the knob the operator set.
-            embedding_pool_named: shape
-                .vision
-                .is_some_and(|v| v.requested_pool_bytes() != ignis_core::vision::DEFAULT_EMBEDDING_POOL_BYTES),
+            // GitHub #243: only so a refusal names the knob the operator set,
+            // and (GitHub #415) only where the pool is a VRAM line.
+            embedding_pool_named: shape.vision.is_some_and(|v| {
+                v.residency() == ignis_core::VisionResidency::Device
+                    && v.requested_pool_bytes() != ignis_core::vision::DEFAULT_EMBEDDING_POOL_BYTES
+            }),
             kv_arena_bytes: &kv_arena_bytes,
             // Windows WDDM pages an oversubscribed device allocation to system
             // RAM; elsewhere it fails.
@@ -1091,8 +1105,9 @@ pub fn qwen27b_load(
     // margin, or the start is refused naming the line that crosses it, as
     // Flash-Next's is. A host whose available memory cannot be read starts
     // unplanned, as Flash-Next does. ADR 0075: under the `host` vision
-    // residency the tower shares the table's mapped allocation, on a line of
-    // its own, and a start that cannot pin it is refused, never moved to the
+    // residency the tower shares the table's mapped allocation and the
+    // embedding pool takes one of its own (GitHub #415), each on a line of its
+    // own, and a start that cannot pin them is refused, never moved to the
     // device.
     let mut host_planned = None;
     if let Some(available) = ignis_core::residency::available_physical_bytes() {
@@ -1501,6 +1516,7 @@ pub(crate) fn flash_next_load(
         scope: crate::config::field::scope(ignis_core::compute::ModelFamily::FlashNext),
         token_embedding_bytes: 0,
         vision_tower_bytes: 0,
+        vision_pool_bytes: 0,
         expert_pool_bytes,
         load_staging_bytes,
         ngram_hot_rows_bytes: 0,
@@ -2260,6 +2276,7 @@ mod tests {
             scope: "qwen38flashnext",
             token_embedding_bytes: 0,
             vision_tower_bytes: 0,
+            vision_pool_bytes: 0,
             expert_pool_bytes: 37_795_446_784,
             load_staging_bytes: 0,
             ngram_hot_rows_bytes: 1 << 30,
@@ -2352,6 +2369,54 @@ mod tests {
         let ignis_core::residency::HostPlanError::BelowMargin { crossing_line, .. } = &refusal;
         assert_eq!(*crossing_line, "vision_tower", "{refusal}");
         assert!(refusal.to_string().contains("--vision-residency device"), "{refusal}");
+
+        // GitHub #415: and its embedding pool, host-mapped, on a line of its
+        // own: the pool as the leaf sizes it, one envelope-wide item of 5,120
+        // BF16 rows unless named, at the shape's context.
+        use ignis_core::VisionResidency;
+        let at = |residency: VisionResidency, vision: ignis_core::Vision| EngineShape {
+            vision: Some(vision.with_residency(residency)),
+            max_context: 262_144,
+            ..shape
+        };
+        let envelope = ignis_core::Vision::new(4096).unwrap();
+        let request = qwen27b_host_request(64 << 30, TABLE, TOWER, 0, &at(VisionResidency::Host, envelope));
+        assert_eq!(request.vision_pool_bytes, 4096 * 5120 * 2, "one 4,096-token item, 32 column pages");
+        let named = at(VisionResidency::Host, envelope.with_pool_bytes(640 << 20));
+        assert_eq!(qwen27b_host_request(64 << 30, TABLE, TOWER, 0, &named).vision_pool_bytes, 640 << 20);
+        let device = at(VisionResidency::Device, envelope.with_pool_bytes(640 << 20));
+        assert_eq!(qwen27b_host_request(64 << 30, TABLE, 0, 0, &device).vision_pool_bytes, 0, "a VRAM line under device");
+        assert_eq!(qwen27b_host_request(64 << 30, TABLE, 0, 0, &shape).vision_pool_bytes, 0, "none without vision");
+        // The table and the tower fit beside the margin, the pool does not.
+        let refusal = ignis_core::residency::plan_host(&qwen27b_host_request(
+            (3 << 30) + TABLE + TOWER + (10 << 20),
+            TABLE,
+            TOWER,
+            0,
+            &at(VisionResidency::Host, envelope),
+        ))
+        .expect_err("the pool does not fit");
+        let ignis_core::residency::HostPlanError::BelowMargin { crossing_line, .. } = &refusal;
+        assert_eq!(*crossing_line, "vision_pool", "{refusal}");
+        assert_eq!(refusal.short_bytes(), 4096 * 5120 * 2 - (10 << 20) + (8 << 30), "the pool's bytes and the arena's after it");
+        assert!(refusal.to_string().contains("--vision-residency device"), "{refusal}");
+    }
+
+    /// GitHub #415: `--vision-embedding-pool-mib` sizes the host-mapped pool
+    /// under `host` with the default and the floor it has on the device: one
+    /// envelope-wide item unless named, and a named pool below it raised to it.
+    #[test]
+    fn the_embedding_pool_mib_sizes_the_host_plans_pool_line_under_host() {
+        let pool = |flags: &[&str]| {
+            qwen27b_host_request(64 << 30, 1_350_860_800, 297_000_960, 0, &rtx5090_27b(flags)).vision_pool_bytes
+        };
+        let host = ["--vision-enabled", "--vision-max-tokens", "4096", "--vision-residency", "host"];
+        assert_eq!(pool(&host), 4096 * 5120 * 2, "the default: one envelope-wide item");
+        assert_eq!(pool(&[&host[..], &["--vision-embedding-pool-mib", "640"]].concat()), 640 << 20);
+        assert_eq!(pool(&[&host[..], &["--vision-embedding-pool-mib", "1"]].concat()), 4096 * 5120 * 2, "raised to the floor");
+        let device = ["--vision-enabled", "--vision-max-tokens", "4096", "--vision-residency", "device", "--vision-embedding-pool-mib", "640"];
+        assert_eq!(pool(&device), 0, "the device's pool is a VRAM line");
+        assert_eq!(pool(&[]), 0, "no vision, no pool");
     }
 
     /// A pin the host refuses after its plan passed (the OS may decline to lock
@@ -2373,7 +2438,23 @@ mod tests {
         let request = qwen27b_host_request(64 << 30, 1_350_864_896, 297_000_960, 0, &shape);
         let host = ignis_core::residency::plan_host(&request).expect("64 GiB holds the plan");
         let message = qwen27b_pin_refused("the host cannot pin that much memory", &request, host.total_bytes);
-        assert!(message.contains("the token embedding 1350864896 bytes, the vision tower 297000960 bytes"), "{message}");
+        assert!(message.contains("the token embedding 1350864896 bytes, the vision tower 297000960 bytes)"), "{message}");
+        // GitHub #415: and the embedding pool its model load pins after.
+        let hosted = EngineShape { vision: Some(host_vision(4096)), max_context: 262_144, ..shape };
+        let request = qwen27b_host_request(64 << 30, 1_350_864_896, 297_000_960, 0, &hosted);
+        let host = ignis_core::residency::plan_host(&request).expect("64 GiB holds the plan");
+        let message = qwen27b_pin_refused("the host cannot pin that much memory", &request, host.total_bytes);
+        assert!(
+            message.contains(
+                "the token embedding 1350864896 bytes, the vision tower 297000960 bytes, the embedding pool 41943040 bytes)"
+            ),
+            "{message}"
+        );
+    }
+
+    /// A vision envelope of `tokens` under the `host` residency.
+    fn host_vision(tokens: u32) -> ignis_core::Vision {
+        ignis_core::Vision::new(tokens).unwrap().with_residency(ignis_core::VisionResidency::Host)
     }
 
     /// The one event [`log_qwen27b_host_plan_refused`] logs: the 27B's lines
@@ -2381,7 +2462,12 @@ mod tests {
     #[test]
     fn a_refused_27b_host_plan_logs_its_lines_in_bytes_beside_the_persons_message() {
         use tracing_subscriber::layer::SubscriberExt;
-        let shape = EngineShape { host_pool_bytes: 8 << 30, ..EngineShape::default() };
+        let shape = EngineShape {
+            host_pool_bytes: 8 << 30,
+            vision: Some(host_vision(4096)),
+            max_context: 262_144,
+            ..EngineShape::default()
+        };
         let refusal =
             ignis_core::residency::plan_host(&qwen27b_host_request(10 << 30, 1_350_860_800, 297_000_960, 1 << 30, &shape))
                 .expect_err("short of the arena");
@@ -2402,6 +2488,7 @@ mod tests {
             ("available_bytes", 10u64 << 30),
             ("embedding_table_bytes", 1_350_860_800),
             ("vision_tower_bytes", 297_000_960),
+            ("vision_pool_bytes", 41_943_040),
             ("staging_bytes", 0),
             ("retained_host_slots_bytes", 1 << 30),
             ("kv_ram_arena_bytes", 8 << 30),
@@ -2414,13 +2501,19 @@ mod tests {
     }
 
     /// ADR 0075 (GitHub #414): the 27B's host plan event says where the load
-    /// keeps its vision tower and how many bytes the tower's own line holds;
-    /// a text load names no residency.
+    /// keeps its vision tower and how many bytes the tower's own line holds,
+    /// and (GitHub #415) the embedding pool's; a text load names no residency.
     #[test]
-    fn the_27b_host_plan_event_carries_the_vision_residency_and_the_towers_line() {
+    fn the_27b_host_plan_event_carries_the_vision_residency_and_the_towers_and_pools_lines() {
         use tracing_subscriber::layer::SubscriberExt;
-        let shape = EngineShape { host_pool_bytes: 8 << 30, retained_host_slots: 4, ..EngineShape::default() };
+        let shape = EngineShape {
+            host_pool_bytes: 8 << 30,
+            retained_host_slots: 4,
+            max_context: 262_144,
+            ..EngineShape::default()
+        };
         let capture = |tower: u64, vision: Option<ignis_core::VisionResidency>| {
+            let shape = EngineShape { vision: vision.map(|residency| host_vision(4096).with_residency(residency)), ..shape };
             let request = qwen27b_host_request(64 << 30, 1_350_860_800, tower, 1 << 30, &shape);
             let host = ignis_core::residency::plan_host(&request).expect("64 GiB holds the plan");
             let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
@@ -2435,14 +2528,18 @@ mod tests {
         let (host, planned) = capture(297_000_960, Some(ignis_core::VisionResidency::Host));
         assert_eq!(host["vision_residency"], "host");
         assert_eq!(host["vision_tower_bytes"], 297_000_960u64);
+        assert_eq!(host["vision_pool_bytes"], 41_943_040u64, "one 4,096-token item");
         assert_eq!(host["embedding_table_bytes"], 1_350_860_800u64, "the table's line, not the tower's");
         assert_eq!(host["planned_bytes"], planned);
+        assert_eq!(planned, 1_350_860_800 + 297_000_960 + 41_943_040 + (1 << 30) + (8 << 30));
         assert_eq!(host["retained_host_slots"], 4);
         let (device, _) = capture(0, Some(ignis_core::VisionResidency::Device));
         assert_eq!(device["vision_residency"], "device");
         assert_eq!(device["vision_tower_bytes"], 0);
+        assert_eq!(device["vision_pool_bytes"], 0, "the device's pool is a VRAM line");
         let (text, _) = capture(0, None);
         assert!(text.get("vision_residency").is_none(), "a text load has no residency: {text}");
+        assert_eq!(text["vision_pool_bytes"], 0);
     }
 
     /// A device-only load (ADR 0054) on a machine with 8.5 GB available: its
@@ -2455,6 +2552,7 @@ mod tests {
             scope: "qwen38flashnext",
             token_embedding_bytes: 0,
             vision_tower_bytes: 0,
+            vision_pool_bytes: 0,
             expert_pool_bytes: 0,
             load_staging_bytes: 4_700_000_000,
             ngram_hot_rows_bytes: 1 << 30,

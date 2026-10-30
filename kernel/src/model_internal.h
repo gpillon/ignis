@@ -273,8 +273,36 @@ struct FlashNextModelDeleter {
 // and a prefill chunk scatters them back page by page
 // (kernel/src/step.cu). Both are plain column ranges over the ops that
 // already existed -- no kernel reads a page table.
+//
+// GitHub #415 (ADR 0075): under IGNIS_VISION_RESIDENCY_HOST the same pages
+// are one mapped, portable pinned host allocation (`mapped`) instead of a
+// device buffer: the encoder writes each page through a device page and copies
+// it there, and the prefill chunk's scatter reads it in place through its
+// device alias, as ADR 0062's token embedding is read. Its holds, eviction and
+// sizing are the device pool's.
+struct MappedHostRegion {
+  void *host = nullptr;
+  // The pointer the device reads and writes it through.
+  void *device = nullptr;
+  std::size_t bytes = 0;
+
+  // cudaHostAlloc(Mapped | Portable) of `bytes`; throws naming the bytes and
+  // the CUDA error, holding nothing.
+  explicit MappedHostRegion(std::size_t size_bytes);
+  MappedHostRegion(const MappedHostRegion &) = delete;
+  MappedHostRegion &operator=(const MappedHostRegion &) = delete;
+  ~MappedHostRegion() {
+    if (host != nullptr) {
+      cudaFreeHost(host);
+    }
+  }
+};
+
 struct VisionEmbeddingPool {
+  // Exactly one of the two, by the load's vision residency: VRAM under
+  // DEVICE, mapped host memory under HOST.
   std::unique_ptr<ninfer::DeviceBuffer> buffer;
+  std::unique_ptr<MappedHostRegion> mapped;
   // `[hidden]` BF16 columns per page, and so the bytes of one.
   std::int32_t page_columns = 0;
   std::size_t page_bytes = 0;
@@ -282,7 +310,10 @@ struct VisionEmbeddingPool {
   // bool because a release names its embedding, not its pages.
   std::vector<const ignis_media_embedding *> owner;
 
-  bool present() const { return buffer != nullptr; }
+  bool present() const { return buffer != nullptr || mapped != nullptr; }
+  // The pool's bytes where each placement counts them: VRAM, host-mapped.
+  std::uint64_t device_bytes() const { return buffer != nullptr ? buffer->bytes : 0; }
+  std::uint64_t host_mapped_bytes() const { return mapped != nullptr ? mapped->bytes : 0; }
   std::int32_t pages() const { return static_cast<std::int32_t>(owner.size()); }
   std::int32_t free_pages() const {
     std::int32_t n = 0;
@@ -295,8 +326,10 @@ struct VisionEmbeddingPool {
   std::int32_t pages_for(std::int32_t columns) const {
     return page_columns > 0 ? (columns + page_columns - 1) / page_columns : 0;
   }
+  // A page as the device addresses it, wherever the pool lives.
   std::uint8_t *page_ptr(std::int32_t page) const {
-    return static_cast<std::uint8_t *>(buffer->p) + static_cast<std::size_t>(page) * page_bytes;
+    void *const base = buffer != nullptr ? buffer->p : mapped->device;
+    return static_cast<std::uint8_t *>(base) + static_cast<std::size_t>(page) * page_bytes;
   }
   // Claim `count` pages for `owner_of`, or return empty. The pages need not
   // be adjacent -- that is the whole point of paging them.
@@ -615,12 +648,12 @@ struct ignis_model {
   // address. Only a vision load has one: a text load's rounds rotate at the
   // positions themselves, exactly as before.
   std::unique_ptr<ninfer::DeviceBuffer> decode_rope_positions;
-  // What vision adds beside a text load: the embedding pool, and what the
-  // encoder's workspace grew `scratch` by.
+  // What vision adds beside a text load in VRAM: the embedding pool where it
+  // is on the device (GitHub #415: a host-mapped one counts in the stats'
+  // `host_mapped_bytes`), and what the encoder's workspace grew `scratch` by.
   uint64_t vision_reserved_bytes() const {
     const uint64_t shared = scratch ? scratch->capacity() : 0;
-    return (shared > prefill_scratch_bytes ? shared - prefill_scratch_bytes : 0) +
-           (vision_pool.buffer ? vision_pool.buffer->bytes : 0);
+    return (shared > prefill_scratch_bytes ? shared - prefill_scratch_bytes : 0) + vision_pool.device_bytes();
   }
 
   // P5-04 (GitHub #153): the verify round's substrate, present exactly when

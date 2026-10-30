@@ -1447,7 +1447,12 @@ struct LoadSizes {
   // included.
   std::size_t attention_readout = 0;
   std::size_t vision_workspace = 0;
+  // The embedding pool's bytes, wherever the vision residency puts it: a
+  // VRAM line under DEVICE, host-mapped and no VRAM line under HOST (GitHub
+  // #415). `vision` says the load has vision whatever the pool's place.
   std::size_t media_embedding = 0;
+  bool media_embedding_host = false;
+  bool vision = false;
   std::size_t sampling_workspace = 0;
   std::size_t decode_graph_scratch = 0;
   std::size_t verify_round = 0;
@@ -1469,10 +1474,9 @@ struct LoadSizes {
   }
 
   ignis_model_reservations reservations() const {
-    const bool vision = media_embedding > 0;
     ignis_model_reservations out{};
     out.workspace_bytes = workspace();
-    out.media_embedding_bytes = media_embedding;
+    out.media_embedding_bytes = media_embedding_host ? 0 : media_embedding;
     // sampling_single_{configs, positions, out}, sampling_decode_{configs,
     // positions, out, logits} and the workspace, as the load allocates them.
     // GitHub #242 adds the permitted-set staging to the same line: ids
@@ -1668,6 +1672,10 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     }
     sizes.media_embedding =
         vision_embedding_pool_bytes(g.hidden, tokens, options.vision_embedding_pool_bytes);
+    // GitHub #415: and the pool, the same pages and the same bytes, is
+    // host-mapped, so it leaves the VRAM plan.
+    sizes.media_embedding_host = options.vision_residency == IGNIS_VISION_RESIDENCY_HOST;
+    sizes.vision = true;
   }
 
   // GitHub #275 (ADR 0041): a `locate`'s readout over a text span, reserved
@@ -1729,7 +1737,8 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   };
   ignis_model_reservations out{};
   out.workspace_bytes = capacity(model.scratch);
-  out.media_embedding_bytes = bytes(model.vision_pool.buffer);
+  // GitHub #415: a host-mapped pool holds no VRAM.
+  out.media_embedding_bytes = model.vision_pool.device_bytes();
   out.sampling_bytes = bytes(model.sampling_single_configs) + bytes(model.sampling_single_positions) +
                        bytes(model.sampling_single_out) + bytes(model.sampling_decode_configs) +
                        bytes(model.sampling_decode_positions) + bytes(model.sampling_decode_out) +
@@ -1750,6 +1759,22 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
 }
 
 } // namespace
+
+MappedHostRegion::MappedHostRegion(std::size_t size_bytes) {
+  cudaError_t err = cudaHostAlloc(&host, size_bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+  if (err != cudaSuccess) {
+    host = nullptr;
+    throw std::runtime_error("cudaHostAlloc(mapped) of " + std::to_string(size_bytes) +
+                             " bytes failed: " + cudaGetErrorString(err));
+  }
+  err = cudaHostGetDevicePointer(&device, host, 0);
+  if (err != cudaSuccess) {
+    cudaFreeHost(host);
+    host = nullptr;
+    throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") + cudaGetErrorString(err));
+  }
+  bytes = size_bytes;
+}
 
 extern "C" int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors,
                                                  uint64_t count,
@@ -1959,7 +1984,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       const std::size_t output_bytes = sizes.media_embedding;
       std::size_t vision_free = 0;
       std::size_t vision_total = 0;
-      if (cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess && output_bytes > vision_free) {
+      if (!sizes.media_embedding_host && cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess &&
+          output_bytes > vision_free) {
         throw std::runtime_error("a " + std::to_string(vision_tokens) +
                                  "-token vision envelope's embedding pool needs " +
                                  std::to_string(output_bytes) + " bytes, but only " +
@@ -1968,7 +1994,19 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
                                  " --vision-max-tokens");
       }
       const std::size_t page_bytes = vision_embedding_page_bytes(g.hidden);
-      model->vision_pool.buffer = std::make_unique<ninfer::DeviceBuffer>(output_bytes);
+      if (sizes.media_embedding_host) {
+        // GitHub #415 (ADR 0075): the same pages in mapped pinned host
+        // memory, which the host plan counted; a host that will not pin them
+        // fails the load, never moving the pool to the device.
+        try {
+          model->vision_pool.mapped = std::make_unique<MappedHostRegion>(output_bytes);
+        } catch (const std::exception &e) {
+          throw std::runtime_error(std::string("the embedding pool in mapped host memory: ") + e.what() +
+                                   " -- keep it in VRAM (--vision-residency device) or turn vision off");
+        }
+      } else {
+        model->vision_pool.buffer = std::make_unique<ninfer::DeviceBuffer>(output_bytes);
+      }
       model->vision_pool.page_columns = IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS;
       model->vision_pool.page_bytes = page_bytes;
       model->vision_pool.owner.assign(output_bytes / page_bytes, nullptr);
@@ -2000,6 +2038,12 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
         VisionStaging &staging = model->vision_staging;
         staging.slot_bytes = ignis_vision_staging_slot_bytes(model->vision);
         ignis_vision_staging_check(model->vision, staging.slot_bytes);
+        // GitHub #415: the merger writes each host-mapped pool page through a
+        // device page in a slot of the ring (vision_encode.cu).
+        if (model->vision_pool.page_bytes > staging.slot_bytes) {
+          throw std::runtime_error("an embedding pool page of " + std::to_string(model->vision_pool.page_bytes) +
+                                   " bytes does not fit a staging slot of " + std::to_string(staging.slot_bytes));
+        }
         const auto event = [](cudaEvent_t &e) {
           if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
             throw std::runtime_error("creating a staging event failed");
@@ -2123,7 +2167,9 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
     return -1;
   }
   out_stats->vram_bytes = model->vram_bytes;
-  out_stats->host_mapped_bytes = model->host_mapped_bytes;
+  // GitHub #415: and the embedding pool, where the host vision residency
+  // maps it.
+  out_stats->host_mapped_bytes = model->host_mapped_bytes + model->vision_pool.host_mapped_bytes();
   out_stats->bound_tensor_count = model->bound_tensor_count;
   out_stats->vision_reserved_bytes = model->vision_reserved_bytes();
   out_stats->reserved = model->flash_next ? ignis::flash_next::reserved(*model) : reserved_of(*model);
