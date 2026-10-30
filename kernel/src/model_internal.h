@@ -688,8 +688,20 @@ std::size_t ignis_vision_workspace_bytes(std::int32_t tokens, std::int32_t segme
 // tensors' sizes alone (each tensor's payload and the padding its host span
 // may add), so the plan, which sees no pointer, and the encode size it alike.
 // The encoder's share of the scratch is its workspace, aligned, then
-// IGNIS_VISION_STAGING_SLOTS of these.
+// IGNIS_VISION_STAGING_SLOTS of these (ignis_vision_staged_share).
 std::size_t ignis_vision_staging_slot_bytes(const VisionWeights &weights);
+
+// GitHub #414: the encoder's share of the scratch under
+// IGNIS_VISION_RESIDENCY_HOST, for an encode workspace of `workspace_bytes`:
+// the ring of IGNIS_VISION_STAGING_SLOTS slots of `slot_bytes` starts at
+// `ring_offset`, the workspace aligned, and the share ends with it at `bytes`.
+// Shared by the load's reservation (kernel/src/model.cu) and the encode that
+// lays its share out (kernel/src/vision_encode.cu), so the two cannot drift.
+struct VisionStagedShare {
+  std::size_t ring_offset = 0;
+  std::size_t bytes = 0;
+};
+VisionStagedShare ignis_vision_staged_share(std::size_t workspace_bytes, std::size_t slot_bytes);
 
 // GitHub #414: throws, naming the stage, unless every stage of `weights` --
 // as the binder laid it out in host memory -- fits a slot of `slot_bytes`,

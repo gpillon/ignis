@@ -1667,8 +1667,8 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     // is still the larger of the two shares (ADR 0030), so the ring costs
     // VRAM only where the encoder's share sets the scratch's size.
     if (options.vision_residency == IGNIS_VISION_RESIDENCY_HOST) {
-      sizes.vision_workspace = round_up_arena_align(sizes.vision_workspace) +
-                               IGNIS_VISION_STAGING_SLOTS * ignis_vision_staging_slot_bytes(model.vision);
+      sizes.vision_workspace =
+          ignis_vision_staged_share(sizes.vision_workspace, ignis_vision_staging_slot_bytes(model.vision)).bytes;
     }
     sizes.media_embedding =
         vision_embedding_pool_bytes(g.hidden, tokens, options.vision_embedding_pool_bytes);

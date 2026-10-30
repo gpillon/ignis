@@ -241,7 +241,8 @@ StageCopy plan_stage(std::vector<ninfer::Weight *> &tensors) {
 }
 
 // Point each of `tensors` at its bytes in `slot`, where `copy` lands them --
-// the pointer rebase #407's `visit_weights` does for its staged tower.
+// the pointer rebase that #407's `visit_weights`, by ampersandru, does for its
+// staged tower, which this follows.
 void rebase_stage(const std::vector<ninfer::Weight *> &tensors, const StageCopy &copy, unsigned char *slot) {
   for (ninfer::Weight *w : tensors) {
     const auto *lo = static_cast<const unsigned char *>(w->payload);
@@ -266,6 +267,23 @@ template <class Weights> auto stage_tensors(Weights &weights) {
   return stages;
 }
 
+// Every stage of `stages` laid out in a slot (plan_stage), refused by name
+// unless it fits one of `slot_bytes`: the load's check and an encode's ring
+// lay the stages out with this one function.
+std::array<StageCopy, kVisionStagingStages> plan_stages(
+    std::array<std::vector<ninfer::Weight *>, kVisionStagingStages> &stages, std::size_t slot_bytes) {
+  std::array<StageCopy, kVisionStagingStages> copies;
+  for (std::size_t s = 0; s < kVisionStagingStages; ++s) {
+    copies[s] = plan_stage(stages[s]);
+    if (copies[s].bytes > slot_bytes) {
+      throw std::runtime_error("vision tower stage " + std::to_string(s) + " takes " +
+                               std::to_string(copies[s].bytes) + " bytes, a staging slot holds " +
+                               std::to_string(slot_bytes));
+    }
+  }
+  return copies;
+}
+
 void check_cuda(cudaError_t err, const char *what) {
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("staging the vision tower: ") + what + ": " + cudaGetErrorString(err));
@@ -285,15 +303,12 @@ class TowerStager {
   // `slot_bytes`.
   TowerStager(const VisionStaging &staging, VisionWeights &weights, unsigned char *ring) : staging_(staging) {
     auto stages = stage_tensors(weights);
+    // Every stage is planned before any is rebased: a stage's runs are its
+    // own tensors' host spans, which no other stage's rebase touches.
+    copies_ = plan_stages(stages, staging_.slot_bytes);
     for (std::size_t s = 0; s < kVisionStagingStages; ++s) {
-      copies_[s] = plan_stage(stages[s]);
-      if (copies_[s].bytes > staging_.slot_bytes) {
-        throw std::runtime_error("vision tower stage " + std::to_string(s) + " takes " +
-                                 std::to_string(copies_[s].bytes) + " bytes, a staging slot holds " +
-                                 std::to_string(staging_.slot_bytes));
-      }
-      rebase_stage(stages[s], copies_[s], ring + (s % IGNIS_VISION_STAGING_SLOTS) * staging_.slot_bytes);
       slots_[s] = ring + (s % IGNIS_VISION_STAGING_SLOTS) * staging_.slot_bytes;
+      rebase_stage(stages[s], copies_[s], slots_[s]);
     }
   }
 
@@ -770,16 +785,15 @@ std::size_t ignis_vision_staging_slot_bytes(const VisionWeights &weights) {
   return align_up(*std::max_element(bound.begin(), bound.end()), kVisionWorkspaceAlignment);
 }
 
+VisionStagedShare ignis_vision_staged_share(std::size_t workspace_bytes, std::size_t slot_bytes) {
+  const std::size_t ring_offset = align_up(workspace_bytes, kVisionWorkspaceAlignment);
+  return {ring_offset, ring_offset + IGNIS_VISION_STAGING_SLOTS * slot_bytes};
+}
+
 void ignis_vision_staging_check(const VisionWeights &weights, std::size_t slot_bytes) {
   VisionWeights copy = weights;
   auto stages = stage_tensors(copy);
-  for (std::size_t s = 0; s < kVisionStagingStages; ++s) {
-    const StageCopy stage = plan_stage(stages[s]);
-    if (stage.bytes > slot_bytes) {
-      throw std::runtime_error("vision tower stage " + std::to_string(s) + " takes " + std::to_string(stage.bytes) +
-                               " bytes, a staging slot holds " + std::to_string(slot_bytes));
-    }
-  }
+  plan_stages(stages, slot_bytes);
 }
 
 extern "C" int32_t ignis_media_encode(struct ignis_model *model,
@@ -835,9 +849,8 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     // GitHub #414: a staged tower's ring follows the workspace, as the load
     // sized the scratch for (`plan_load_sizes`).
     const VisionStaging &staging = model->vision_staging;
-    const std::size_t ring_offset = align_up(layout.bytes, kVisionWorkspaceAlignment);
-    const std::size_t need =
-        staging.staged() ? ring_offset + IGNIS_VISION_STAGING_SLOTS * staging.slot_bytes : layout.bytes;
+    const VisionStagedShare share = ignis_vision_staged_share(layout.bytes, staging.slot_bytes);
+    const std::size_t need = staging.staged() ? share.bytes : layout.bytes;
     if (need > model->scratch->capacity()) {
       throw std::runtime_error("the item needs " + std::to_string(need) +
                                " workspace bytes, the load reserved " +
@@ -887,7 +900,7 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     std::optional<TowerStager> stager;
     if (staging.staged()) {
       staged_weights = model->vision;
-      stager.emplace(staging, staged_weights, static_cast<unsigned char *>(backing.data) + ring_offset);
+      stager.emplace(staging, staged_weights, static_cast<unsigned char *>(backing.data) + share.ring_offset);
     }
     VisionEncodeCall call;
     call.patches = input->patches;
