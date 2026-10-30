@@ -101,3 +101,24 @@ On the 5090:
     `free_at_start_bytes` and `service.version`, with its encode and `point` times within noise;
   - #409's 99% decode gate, once at the end. If it fails, the owner decides.
 - **Credit.** The staging's pointer rebase follows #407's `visit_weights`, and its author is credited.
+
+**As built** (2026-10-30, GitHub #413, tickets #414-#418), where the decision left a choice:
+
+- **One residency for the scope.** `VisionResidency` belongs to the bound scope, and the leaf takes it as a load option. A load whose option and scope disagree is refused, both ways. Under `host` the binder places the `vision/*` tensors in the host-mapped allocation beside the token embedding.
+- **The ring.** Three uniform slots of the merger fc2's 25,094,656 bytes (75,283,968 in all) follow the encoder's workspace in its share of the prefill scratch.
+  - On the 5090 at a 16,384-token item, the scratch grows from 908,592,896 to 983,876,864 bytes.
+  - Under `rtx50-16gb` at 1,024 and 4,096 it does not grow.
+  - The bounce page is the slot the merger's norm and fc1 were read from. A static check and a load-time check hold that a pool page fits a slot.
+- **The host plan.** It has two lines of their own, `vision_tower` (297,000,960 bytes of spans on the served artifact) and `vision_pool` (the pool at the shape's context), after the token embedding's.
+  - A start that cannot hold them is refused. The message names the bytes short, `vision.residency: device` and turning vision off.
+  - A host pool that fails to pin at load fails the load the same way.
+- **Accounting.** On the 5090 the leaf's host-mapped bytes go from 1,350,860,800 (`device`) to 1,657,058,208 (`host`), and its VRAM from 16,151,713,660 to 15,856,002,012.
+  - `vram_plan` and the host-plan events carry `vision_residency`, and the host plan carries `vision_tower_bytes` and `vision_pool_bytes`.
+  - The decode graph's line now reads an explicit vision flag, since the pool's line is 0 under `host`.
+- **Measured** ([finding](../findings/2026-10-30-vision-residency-acceptance.md)): all five acceptance criteria hold.
+  - On a 16 GB budget a `host` load keeps the text-only KV pool: 7,956 pages at 1,024 and 4,096.
+  - A 1,024-token encode costs +7.1 ms (49.2 against 42.1 ms, n=90 each, interleaved).
+  - At the same context, `/v1/decide` answers 198 of 198 questions identically, and a cold `point` costs +5.9 ms.
+  - `device`'s `vram_plan` equals `main`'s at a fixed budget.
+  - Decode is 99.7% / 100.3% / 100.0% of main's at C=1/3/8.
+- **The answers do not change at the same context.** On a card whose start adapts its context to free VRAM, the KV `host` returns can raise the adapted context, to 786,432 against 720,896 on the 5090. With it rises the YaRN factor `auto` rope scaling picks, from 2.75 to 3, and answers move, as with any change of free VRAM. A comparison of the two residencies pins `--model-max-context`.

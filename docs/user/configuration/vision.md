@@ -40,12 +40,17 @@ a vision load keeps both:
   encoder, not the prefill chunk, sets the scratch's size. Under the
   `rtx50-16gb` profile at a 1,024- or 4,096-token envelope it does not grow,
   and a vision load keeps the KV pool of a text-only one. An encode takes a few
-  milliseconds more: about 6 to 8 ms on a 1,024-token image (about 40 ms under
+  milliseconds more: about 7 ms on a 1,024-token image (49 ms against 42 under
   `device`) on a PCIe Gen 3 host under Windows, and nothing measurable on a
   16,384-token one
-  ([finding](../../findings/2026-10-30-vision-tower-staged-and-pool-host-mapped.md)).
-  The answers do not change: the image's embedding is the same to the bit. A
+  ([finding](../../findings/2026-10-30-vision-residency-acceptance.md)). A
   fan-out of questions over one image encodes it once, so only the first pays.
+  At the same context the answers do not change: the image's embedding is the
+  same to the bit. On a card whose start adapts its context to free VRAM, the
+  KV `host` gives back can raise that context, and with it the YaRN factor the
+  default `auto` [rope scaling](context-and-speculation.md) picks, which moves
+  answers slightly, as any change of free VRAM does. To compare the two
+  residencies, pin `--model-max-context`.
 
 `--vision-embedding-pool-mib` keeps its meaning under both, with the same
 default and floor: it sizes the pool where the residency puts it, VRAM under

@@ -132,6 +132,7 @@ bytes.
 
 ## Follow-ups
 
-- The spec and build of ADR 0075 (from #409).
+- The spec and build of ADR 0075 (from #409): [#413](https://github.com/gpillon/ignis/issues/413). Its acceptance, decode gate
+  included, is [the vision residency's acceptance](2026-10-30-vision-residency-acceptance.md).
 - [#412](https://github.com/gpillon/ignis/issues/412): a query-chunked encode, for items larger than the prefill
   scratch holds for free.
