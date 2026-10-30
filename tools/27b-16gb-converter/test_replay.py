@@ -219,6 +219,10 @@ def test_the_records_are_an_exl3_directory_of_the_plans_matrices_at_the_quants_k
     assert records.config["quant_method"] == "exl3" and records.config["codebook"] == "mul1"
     assert records.config["version"] == "1.5.3"
     assert replay.check_records(out, planned) == []
+    # the converter's override takes them like for like
+    import convert
+    import override
+    assert override.Override(out, None, None, None).problems(convert.text_matrices(quant)[0]) == []
 
 
 def test_records_not_the_plans_are_named(tmp_path):
