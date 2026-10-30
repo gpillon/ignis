@@ -12,8 +12,9 @@ one container, verified against its provenance sidecar (`.graft.json` or
 ## The catalog
 
 The models the server knows how to fetch are its **catalog**
-([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Ten are built
-into the binary, each pinned file by file — byte count and SHA-256 — at a fixed
+([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Ten entries
+are built into the binary, six text and image models, three speech models and a
+diarizer, each pinned file by file — byte count and SHA-256 — at a fixed
 revision of its Hugging Face repository:
 
 | Id | Repository | Size |

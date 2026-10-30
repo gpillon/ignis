@@ -44,7 +44,8 @@ picks one by the card's memory. See [profiles](../concepts/profiles.md).
 the card is refused before anything is unloaded or fetched. See
 [models and artifacts](../concepts/models-and-artifacts.md).
 
-**Catalog.** The models the server knows how to fetch: ten built into the binary,
+**Catalog.** The models the server knows how to fetch: ten entries built into
+the binary (six text and image models, three speech models and a diarizer),
 pinned file by file, plus any an operator adds. See
 [models and artifacts](../concepts/models-and-artifacts.md) and
 [Get a model](../guides/models.md).
