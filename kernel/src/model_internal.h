@@ -562,9 +562,11 @@ struct ignis_model {
   bool proto_vision_tower_host = false;
   bool proto_vision_whole = false;
   bool proto_vision_pool_host = false;
+  std::uint32_t proto_vision_group = 1;
+  std::uint32_t proto_vision_slots = 2;
   cudaStream_t proto_vision_copy_stream = nullptr;
-  // start, copied[2], consumed[2]
-  std::array<cudaEvent_t, 5> proto_vision_events{};
+  // start, copied[4], consumed[4]
+  std::array<cudaEvent_t, 9> proto_vision_events{};
   // GitHub #178: the decode round's per-lane rope positions (I32 x
   // decode_lanes), `position + rope_delta`, staged beside
   // `sampling_decode_positions` and read by the graphs from this stable
@@ -616,6 +618,10 @@ struct ProtoVisionEnv {
   bool tower_host = false;
   bool whole = false;
   bool pool_host = false;
+  // IGNIS_VISION_PROTO_GROUP=G: H1b's blocks copied G to a stage (default
+  // 1); IGNIS_VISION_PROTO_SLOTS=K: a ring of K slots (default 2, at most 4).
+  std::uint32_t group = 1;
+  std::uint32_t slots = 2;
 };
 ProtoVisionEnv proto_vision_env();
 
@@ -623,4 +629,4 @@ ProtoVisionEnv proto_vision_env();
 // span bound (the pre-block weights, one block, or one half of the merger) --
 // from the bound tensors' sizes alone, so the plan can size it before any
 // pointer exists.
-std::size_t proto_vision_slot_bytes(const VisionWeights &weights);
+std::size_t proto_vision_slot_bytes(const VisionWeights &weights, std::uint32_t group);

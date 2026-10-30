@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -173,30 +174,63 @@ std::size_t proto_align_up(std::size_t x, std::size_t a) {
   return (x + a - 1) / a * a;
 }
 
-// The tower's weights in staging order: H1b's 30 stages -- the pre-block
-// weights, the 27 blocks, the merger's norm and fc1, its fc2 -- or H1a's one.
-template <class W, class F> void proto_visit_stages(W &w, bool whole, F visit) {
-  const auto s = [&](std::size_t stage) { return whole ? std::size_t{0} : stage; };
-  visit(s(0), w.patch_embedding);
-  visit(s(0), w.patch_embedding_bias);
-  visit(s(0), w.position_embedding);
+// The tower's weights by unit: 0 the pre-block weights, 1+b block b, then the
+// merger's norm and fc1, then its fc2 -- 30 units, grouped into stages below.
+constexpr std::size_t kProtoUnits = 1 + kVisionLayers + 2;
+
+template <class W, class F> void proto_visit_units(W &w, F visit) {
+  visit(std::size_t{0}, w.patch_embedding);
+  visit(std::size_t{0}, w.patch_embedding_bias);
+  visit(std::size_t{0}, w.position_embedding);
   for (std::size_t b = 0; b < w.layers.size(); ++b) {
     auto &l = w.layers[b];
     for (auto *p : {&l.qkv, &l.qkv_bias, &l.output, &l.output_bias, &l.fc1, &l.fc1_bias, &l.fc2,
                     &l.fc2_bias, &l.norm1_weight, &l.norm1_bias, &l.norm2_weight, &l.norm2_bias}) {
-      visit(s(1 + b), *p);
+      visit(1 + b, *p);
     }
   }
   const std::size_t merger_a = 1 + w.layers.size();
-  visit(s(merger_a), w.merger_norm_weight);
-  visit(s(merger_a), w.merger_norm_bias);
-  visit(s(merger_a), w.merger_fc1);
-  visit(s(merger_a), w.merger_fc1_bias);
-  visit(s(merger_a + 1), w.merger_fc2);
-  visit(s(merger_a + 1), w.merger_fc2_bias);
+  visit(merger_a, w.merger_norm_weight);
+  visit(merger_a, w.merger_norm_bias);
+  visit(merger_a, w.merger_fc1);
+  visit(merger_a, w.merger_fc1_bias);
+  visit(merger_a + 1, w.merger_fc2);
+  visit(merger_a + 1, w.merger_fc2_bias);
 }
 
-constexpr std::size_t kProtoStages = 1 + kVisionLayers + 2;
+// Units into stages: H1a's one stage, or H1b's -- the pre-block weights, block
+// 0, then blocks in groups of `group` (the first group at most 2, so its copy
+// fits under block 0's compute), then the merger's two halves. Each stage is
+// one copy and one cross-stream wait each way.
+struct ProtoStageMap {
+  std::size_t count = 0;
+  std::array<std::size_t, kProtoUnits> stage_of{};
+};
+
+ProtoStageMap proto_stage_map(bool whole, std::size_t group) {
+  ProtoStageMap m;
+  if (whole) {
+    m.count = 1;
+    return m;
+  }
+  group = std::max<std::size_t>(group, 1);
+  std::size_t stage = 0;
+  m.stage_of[0] = stage++;
+  m.stage_of[1] = stage++;
+  std::size_t unit = 2;
+  std::size_t size = std::min<std::size_t>(group, 2);
+  while (unit < 1 + kVisionLayers) {
+    for (std::size_t k = 0; k < size && unit < 1 + kVisionLayers; ++k) {
+      m.stage_of[unit++] = stage;
+    }
+    ++stage;
+    size = group;
+  }
+  m.stage_of[unit++] = stage++;
+  m.stage_of[unit++] = stage++;
+  m.count = stage;
+  return m;
+}
 
 // One contiguous host range of a stage, and where it lands in the stage's slot.
 struct ProtoRun {
@@ -277,7 +311,15 @@ void proto_check(cudaError_t err, const char *what) {
   }
 }
 
+// IGNIS_VISION_PROTO_NOCOPY=1 (diagnostic only, garbage embeddings): every
+// event and wait as staged, no byte moved -- isolates the synchronization's
+// cost from the transfer's.
+bool g_proto_nocopy = false;
+
 void proto_copy_stage(const ProtoStagePlan &plan, cudaStream_t stream) {
+  if (g_proto_nocopy) {
+    return;
+  }
   for (const ProtoRun &run : plan.runs) {
     proto_check(cudaMemcpyAsync(plan.dst + run.dst_offset, run.lo, run.bytes, cudaMemcpyDefault, stream),
                 "cudaMemcpyAsync(tower stage)");
@@ -285,17 +327,86 @@ void proto_copy_stage(const ProtoStagePlan &plan, cudaStream_t stream) {
 }
 
 // The encode's side of the staging: H1a copies the whole tower on the model's
-// stream before the first op; H1b copies stage s+1 into slot (s+1)%2 on the
-// copy stream while stage s computes from slot s%2, synchronized by events.
+// stream before the first op; H1b copies stage t into slot t%K on the copy
+// stream as soon as stage t-K has drained it, while the compute stream waits
+// for each stage's copy -- a ring of K slots (K = 2: the double buffer).
+constexpr std::size_t kProtoMaxSlots = 4;
+
 struct ProtoStager {
   bool whole = false;
+  // False: a resident encode traced without staging (IGNIS_VISION_PROTO_TRACE).
+  bool copies = true;
+  ProtoStageMap map;
+  std::size_t slots = 2;
   cudaStream_t copy = nullptr;
   cudaEvent_t start = nullptr;
-  cudaEvent_t copied[2] = {nullptr, nullptr};
-  cudaEvent_t consumed[2] = {nullptr, nullptr};
+  std::array<cudaEvent_t, kProtoMaxSlots> copied{};
+  std::array<cudaEvent_t, kProtoMaxSlots> consumed{};
   std::vector<ProtoStagePlan> plans;
+  std::size_t issued = 0;
+
+  // IGNIS_VISION_PROTO_TRACE=1: timing events per stage, printed after the
+  // encode drains.
+  bool trace = false;
+  cudaEvent_t t0 = nullptr;
+  std::vector<cudaEvent_t> copy_begin, copy_end, ready, done;
+
+  bool staged() const { return copies && !whole; }
+  std::size_t stages() const { return staged() ? map.count : kProtoUnits; }
+  // A unit opens its stage when the unit before it is in another stage.
+  bool opens(std::size_t unit) const {
+    return !staged() || unit == 0 || map.stage_of[unit - 1] != map.stage_of[unit];
+  }
+  bool closes(std::size_t unit) const {
+    return !staged() || unit + 1 == kProtoUnits || map.stage_of[unit + 1] != map.stage_of[unit];
+  }
+  std::size_t stage_of(std::size_t unit) const { return staged() ? map.stage_of[unit] : unit; }
+
+  void trace_init() {
+    const auto make = [&](std::vector<cudaEvent_t> &v) {
+      v.assign(stages(), nullptr);
+      for (cudaEvent_t &e : v) {
+        proto_check(cudaEventCreate(&e), "trace event");
+      }
+    };
+    proto_check(cudaEventCreate(&t0), "trace event");
+    make(copy_begin);
+    make(copy_end);
+    make(ready);
+    make(done);
+  }
+  void rec(std::vector<cudaEvent_t> &v, std::size_t stage, cudaStream_t s) {
+    if (trace) {
+      proto_check(cudaEventRecord(v[stage], s), "trace record");
+    }
+  }
+  // Issue every stage copy through `last` whose slot is free by host order:
+  // stage t's slot was last read by stage t-K, whose consumed record precedes
+  // this call.
+  void issue_through(std::size_t last) {
+    while (issued < plans.size() && issued <= last) {
+      const std::size_t t = issued++;
+      if (t >= slots) {
+        proto_check(cudaStreamWaitEvent(copy, consumed[t % slots], 0), "wait consumed");
+      } else if (t >= 2) {
+        // A third slot's first copy waits for the item's own uploads, so the
+        // head (they and stages 0-1 share the link) stays as short as K = 2's.
+        proto_check(cudaStreamWaitEvent(copy, start, 0), "wait head");
+      }
+      rec(copy_begin, t, copy);
+      proto_copy_stage(plans[t], copy);
+      rec(copy_end, t, copy);
+      proto_check(cudaEventRecord(copied[t % slots], copy), "record copied");
+    }
+  }
 
   void begin(cudaStream_t stream) {
+    if (trace) {
+      proto_check(cudaEventRecord(t0, stream), "trace t0");
+    }
+    if (!copies) {
+      return;
+    }
     if (whole) {
       proto_copy_stage(plans[0], stream);
       return;
@@ -303,28 +414,69 @@ struct ProtoStager {
     // Nothing may land in the scratch before the work already queued on it.
     proto_check(cudaEventRecord(start, stream), "record start");
     proto_check(cudaStreamWaitEvent(copy, start, 0), "wait start");
-    for (std::size_t s = 0; s < 2; ++s) {
-      proto_copy_stage(plans[s], copy);
-      proto_check(cudaEventRecord(copied[s], copy), "record copied");
-    }
+    issue_through(1);
   }
-  void before(std::size_t stage, cudaStream_t stream) {
-    if (whole) {
+  void before(std::size_t unit, cudaStream_t stream) {
+    if (!opens(unit)) {
       return;
     }
-    const std::size_t next = stage + 1;
-    if (stage >= 1 && next < plans.size()) {
-      // Slot next%2 was last read by stage next-2 = stage-1.
-      proto_check(cudaStreamWaitEvent(copy, consumed[next % 2], 0), "wait consumed");
-      proto_copy_stage(plans[next], copy);
-      proto_check(cudaEventRecord(copied[next % 2], copy), "record copied");
+    const std::size_t stage = stage_of(unit);
+    if (staged()) {
+      if (stage == 0) {
+        // The uploads are queued: what a third slot's first copy waits for.
+        proto_check(cudaEventRecord(start, stream), "record head");
+      }
+      issue_through(stage + slots - 1);
+      proto_check(cudaStreamWaitEvent(stream, copied[stage % slots], 0), "wait copied");
     }
-    proto_check(cudaStreamWaitEvent(stream, copied[stage % 2], 0), "wait copied");
+    rec(ready, stage, stream);
   }
-  void after(std::size_t stage, cudaStream_t stream) {
-    if (!whole) {
-      proto_check(cudaEventRecord(consumed[stage % 2], stream), "record consumed");
+  void after(std::size_t unit, cudaStream_t stream) {
+    if (!closes(unit)) {
+      return;
     }
+    const std::size_t stage = stage_of(unit);
+    if (staged()) {
+      proto_check(cudaEventRecord(consumed[stage % slots], stream), "record consumed");
+    }
+    rec(done, stage, stream);
+  }
+  // After the encode drained: one line per stage, ms from t0, and the stall
+  // the compute stream took waiting for the stage's copy.
+  void report() {
+    if (!trace) {
+      return;
+    }
+    const auto ms = [&](cudaEvent_t e) {
+      float v = 0;
+      return cudaEventElapsedTime(&v, t0, e) == cudaSuccess ? v : -1.0F;
+    };
+    float stall_total = 0;
+    std::string out = "proto409 trace (ms from encode start): stage copy_begin copy_end ready done stall\n";
+    for (std::size_t s = 0; s < ready.size(); ++s) {
+      const float r = ms(ready[s]);
+      const float prev = s == 0 ? r : ms(done[s - 1]);
+      const float stall = r - prev;
+      stall_total += s == 0 ? 0 : stall;
+      char line[160];
+      std::snprintf(line, sizeof(line), "proto409 trace %2zu %8.3f %8.3f %8.3f %8.3f %7.3f\n", s,
+                    staged() ? ms(copy_begin[s]) : 0.0F, staged() ? ms(copy_end[s]) : 0.0F, r, ms(done[s]),
+                    stall);
+      out += line;
+    }
+    char tail[160];
+    std::snprintf(tail, sizeof(tail), "proto409 trace first_ready %.3f last_done %.3f stalls_after_first %.3f\n",
+                  ms(ready[0]), ms(done[done.size() - 1]), stall_total);
+    out += tail;
+    std::fputs(out.c_str(), stderr);
+    std::fflush(stderr);
+    for (auto *v : {&copy_begin, &copy_end, &ready, &done}) {
+      for (cudaEvent_t e : *v) {
+        cudaEventDestroy(e);
+      }
+    }
+    cudaEventDestroy(t0);
+    cudaGetLastError();
   }
 };
 
@@ -354,6 +506,10 @@ struct VisionEncodeCall {
   std::int32_t out_hidden = 0;
   std::int32_t page_columns = 0;
   std::vector<void *> pages;
+  // PROTOTYPE #409 (A2, IGNIS_VISION_PROTO_POOL_WRITE=bounce): a device page
+  // the merger's fc2 and bias write first, copied to the host-mapped page
+  // after; null writes the pages in place.
+  void *page_bounce = nullptr;
   // GitHub #320: DeepStack merger i taps the residual after block
   // `deepstack_layers[i]` into `deepstack[i]` ([out_hidden, tokens]; null:
   // it does not run). The 27B has none.
@@ -523,9 +679,14 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
     const auto first = static_cast<std::int32_t>(p) * call.page_columns;
     const std::int32_t take = std::min(call.page_columns, tokens - first);
     const ninfer::Tensor hidden_page = hidden.slice(1, first, take);
-    ninfer::Tensor output(call.pages[p], ninfer::DType::BF16, {call.out_hidden, take});
+    void *const target = call.page_bounce != nullptr ? call.page_bounce : call.pages[p];
+    ninfer::Tensor output(target, ninfer::DType::BF16, {call.out_hidden, take});
     ninfer::ops::linear(hidden_page, w.merger_fc2, output, stream);
     ninfer::ops::add_bias(bf16_vector(w.merger_fc2_bias, call.out_hidden), output, stream);
+    if (call.page_bounce != nullptr) {
+      proto_check(cudaMemcpyAsync(call.pages[p], call.page_bounce, output.bytes(), cudaMemcpyDefault, stream),
+                  "cudaMemcpyAsync(pool page bounce)");
+    }
   }
   after(merger_a + 1);
 }
@@ -746,13 +907,19 @@ ProtoVisionEnv proto_vision_env() {
   env.tower_host = true;
   env.whole = proto_env_var("IGNIS_VISION_PROTO_STAGING") == "whole";
   env.pool_host = proto_env_var("IGNIS_VISION_PROTO_POOL") != "device";
+  const std::string group = proto_env_var("IGNIS_VISION_PROTO_GROUP");
+  const std::string slots = proto_env_var("IGNIS_VISION_PROTO_SLOTS");
+  env.group = group.empty() ? 1 : static_cast<std::uint32_t>(std::stoul(group));
+  env.slots = slots.empty() ? 2 : static_cast<std::uint32_t>(std::stoul(slots));
+  env.slots = std::min<std::uint32_t>(std::max<std::uint32_t>(env.slots, 2), kProtoMaxSlots);
   return env;
 }
 
-std::size_t proto_vision_slot_bytes(const VisionWeights &weights) {
-  std::array<std::size_t, kProtoStages> bound{};
-  proto_visit_stages(weights, false, [&](std::size_t stage, const ninfer::Weight &w) {
-    bound[stage] += w.payload_bytes + kProtoSpanSlack;
+std::size_t proto_vision_slot_bytes(const VisionWeights &weights, std::uint32_t group) {
+  const ProtoStageMap map = proto_stage_map(false, group);
+  std::vector<std::size_t> bound(map.count, 0);
+  proto_visit_units(weights, [&](std::size_t unit, const ninfer::Weight &w) {
+    bound[map.stage_of[unit]] += w.payload_bytes + kProtoSpanSlack;
   });
   return proto_align_up(*std::max_element(bound.begin(), bound.end()), kProtoAlign);
 }
@@ -842,11 +1009,14 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     const std::size_t stage_offset = proto_align_up(layout.bytes, kProtoAlign);
     VisionWeights staged_weights = model->vision;
     std::size_t whole_bytes = 0;
-    const std::size_t slot_bytes = staged && !model->proto_vision_whole ? proto_vision_slot_bytes(model->vision) : 0;
+    const std::size_t slot_bytes = staged && !model->proto_vision_whole
+                                       ? proto_vision_slot_bytes(model->vision, model->proto_vision_group)
+                                       : 0;
+    const std::size_t slots = model->proto_vision_slots;
     if (staged && model->proto_vision_whole) {
       const unsigned char *lo = nullptr;
       const unsigned char *hi = nullptr;
-      proto_visit_stages(model->vision, true, [&](std::size_t, const ninfer::Weight &w) {
+      proto_visit_units(model->vision, [&](std::size_t, const ninfer::Weight &w) {
         const auto *p = static_cast<const unsigned char *>(w.payload);
         lo = (lo == nullptr || p < lo) ? p : lo;
         hi = (hi == nullptr || p + w.payload_bytes > hi) ? p + w.payload_bytes : hi;
@@ -854,7 +1024,8 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
       whole_bytes = static_cast<std::size_t>(hi - lo) + kProtoAlign;
     }
     const std::size_t need =
-        !staged ? layout.bytes : stage_offset + (model->proto_vision_whole ? whole_bytes : 2 * slot_bytes);
+        !staged ? layout.bytes
+                : stage_offset + (model->proto_vision_whole ? whole_bytes : slots * slot_bytes);
     if (need > model->scratch->capacity()) {
       throw std::runtime_error("the item needs " + std::to_string(need) +
                                " workspace bytes (" + std::to_string(layout.bytes) +
@@ -909,12 +1080,15 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     } drain{staged && !model->proto_vision_whole ? model->proto_vision_copy_stream : nullptr};
     if (staged) {
       auto *base = static_cast<unsigned char *>(backing.data) + stage_offset;
-      std::vector<std::vector<ninfer::Weight *>> stages(model->proto_vision_whole ? 1 : kProtoStages);
-      proto_visit_stages(staged_weights, model->proto_vision_whole,
-                         [&](std::size_t stage, ninfer::Weight &w) { stages[stage].push_back(&w); });
       stager.whole = model->proto_vision_whole;
+      stager.map = proto_stage_map(stager.whole, model->proto_vision_group);
+      stager.slots = slots;
+      std::vector<std::vector<ninfer::Weight *>> stages(stager.map.count);
+      proto_visit_units(staged_weights, [&](std::size_t unit, ninfer::Weight &w) {
+        stages[stager.map.stage_of[unit]].push_back(&w);
+      });
       for (std::size_t s = 0; s < stages.size(); ++s) {
-        unsigned char *dst = stager.whole ? base : base + (s % 2) * slot_bytes;
+        unsigned char *dst = stager.whole ? base : base + (s % slots) * slot_bytes;
         stager.plans.push_back(proto_plan_stage(stages[s], dst));
         const std::size_t room = stager.whole ? whole_bytes : slot_bytes;
         if (stager.plans.back().bytes > room) {
@@ -926,10 +1100,10 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
       if (!stager.whole) {
         stager.copy = model->proto_vision_copy_stream;
         stager.start = model->proto_vision_events[0];
-        stager.copied[0] = model->proto_vision_events[1];
-        stager.copied[1] = model->proto_vision_events[2];
-        stager.consumed[0] = model->proto_vision_events[3];
-        stager.consumed[1] = model->proto_vision_events[4];
+        for (std::size_t k = 0; k < kProtoMaxSlots; ++k) {
+          stager.copied[k] = model->proto_vision_events[1 + k];
+          stager.consumed[k] = model->proto_vision_events[1 + kProtoMaxSlots + k];
+        }
       }
     }
     VisionEncodeCall call;
@@ -943,14 +1117,34 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     for (const std::int32_t page : embedding->pages) {
       call.pages.push_back(pool.page_ptr(page));
     }
+    // PROTOTYPE #409: the bounce page lives in the slot the merger's first
+    // half used, free while its second half runs.
+    if (staged && !stager.whole && pool.mapped != nullptr &&
+        proto_env_var("IGNIS_VISION_PROTO_POOL_WRITE") == "bounce") {
+      const std::size_t first_half = stager.map.stage_of[1 + kVisionLayers];
+      call.page_bounce = static_cast<unsigned char *>(backing.data) + stage_offset + (first_half % slots) * slot_bytes;
+    }
+    // PROTOTYPE #409: IGNIS_VISION_PROTO_TRACE=1 times every stage, staged or
+    // resident (a resident encode gets a stager that copies nothing).
+    stager.trace = proto_env_var("IGNIS_VISION_PROTO_TRACE") == "1";
+    g_proto_nocopy = proto_env_var("IGNIS_VISION_PROTO_NOCOPY") == "1";
+    stager.copies = staged;
+    if (stager.trace) {
+      stager.trace_init();
+    }
     encode(staged ? staged_weights : model->vision, call, layout, backing, patches,
-           static_cast<std::int32_t>(tokens), model->stream, staged ? &stager : nullptr);
+           static_cast<std::int32_t>(tokens), model->stream,
+           staged || stager.trace ? &stager : nullptr);
     const cudaError_t err = cudaStreamSynchronize(model->stream);
     if (err != cudaSuccess) {
       set_error(std::string("ignis_media_encode: cudaStreamSynchronize failed: ") +
                 cudaGetErrorString(err));
       return -1;
     }
+    if (stager.trace && stager.copy != nullptr) {
+      cudaStreamSynchronize(stager.copy);
+    }
+    stager.report();
     handed_over = true;
     *out_embedding = embedding.release();
     return 0;

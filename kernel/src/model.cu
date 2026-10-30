@@ -1651,7 +1651,8 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     // pool leaves the plan.
     const ProtoVisionEnv proto = proto_vision_env();
     if (proto.tower_host && !proto.whole) {
-      sizes.vision_workspace = (sizes.vision_workspace + 255) / 256 * 256 + 2 * proto_vision_slot_bytes(model.vision);
+      sizes.vision_workspace = (sizes.vision_workspace + 255) / 256 * 256 +
+                               proto.slots * proto_vision_slot_bytes(model.vision, proto.group);
     }
     sizes.proto_pool_host = proto.pool_host;
   }
@@ -1953,6 +1954,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       model->proto_vision_tower_host = proto.tower_host;
       model->proto_vision_whole = proto.tower_host && proto.whole;
       model->proto_vision_pool_host = proto.pool_host;
+      model->proto_vision_group = proto.group;
+      model->proto_vision_slots = proto.slots;
       if (proto.tower_host && !proto.whole) {
         if (cudaStreamCreateWithFlags(&model->proto_vision_copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
           throw std::runtime_error("prototype: the copy stream");
