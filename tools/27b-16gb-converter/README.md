@@ -27,6 +27,7 @@ it. Python never writes the container.
 | `plan.py` | The object table: the served directory, in its order, with the body's planes and the head replaced. |
 | `exl3.py` | The quant's matrices from its safetensors headers (no torch): K, shapes, the `mul1` flag, the record bytes. |
 | `container.py` | Read-only access to a `.ninfer` v2 container (the served artifact; the packed one for `verify`). |
+| `override.py` | An override directory: EXL3 records that replace the quant's, checked like for like. |
 | `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
 | `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter/work.py`). |
@@ -72,6 +73,29 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
   two copies) and writes `<artifact>.conversion.json`: `converter.json` plus the whole-file invariants.
 - **`verify`** prints VERIFY PASS or VERIFY FAILED (exit 3).
 
+## The override
+
+`run` and `verify` take an **override**, a directory of EXL3 records in the quant's layout (index, shards,
+`quantization_config.json`) that replaces the quant's records of the same name, for a variant made from
+another BF16 (the uncensored 16 GB artifact, from the abliterated BF16). Every other object is built
+exactly as without it, and without `--override` the work tree and `converter.json` are as before.
+
+```
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/convert.py run ...     --override H:/models/<override> --override-repo <owner/override-repo>     --override-bf16 H:/models/<variant-bf16> --override-bf16-repo <owner/variant-bf16>     --weights-id trellis-sc30-abliterated
+F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify ...     --override H:/models/<override> --weights-id trellis-sc30-abliterated
+```
+
+- **A swap is like for like.** `run` and `verify` refuse (exit 2 and VERIFY FAILED) an override record
+  whose name is not one of the quant's text matrices, or whose K or shape differs from the quant's
+  record, naming the record and what differs.
+- **Its error is measured against its own BF16.** The reconstruction step reads each override matrix
+  from the override and its reference from `--override-bf16`; the quant's matrices are measured against
+  `--bf16` as today. The same pins apply: revision, sha256 of every file read, shards against their LFS oid.
+- **`--weights-id`** sets the identity the record and `verify` expect (default `trellis-sc30`); pass the
+  packer the same `--weights-id` and the output name.
+- **`verify`** compares each override record to the override's, bit for bit; it takes only `--override`
+  (the source repositories are the conversion record's).
+
 ## The sidecar
 
 `converter.json` (merged into `<artifact>.conversion.json`) carries no local path and no timestamp:
@@ -86,6 +110,10 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
   `ignis_artifact::checksum::verify` reads.
 - `trellis`: per matrix its source key, `k2` (2·K), format, shape, bytes, sha256 and relative
   reconstruction error; the K histogram, the bound, the maximum and the mean.
+- `override` (only with an override): its repository, revision and every file read, by bytes and sha256;
+  `matrices`, the object names it replaced (each also marked `override: true` in `trellis.matrices`); its
+  `reference` BF16, the repository, revision and files the override matrices' errors are measured against
+  (none in a dry run).
 - `copied`: per object its bytes and sha256; `dropped`: the served objects left out; `quant_unused`:
   the quant's matrices not taken (its MTP layer).
 - `converter`: the commit the converter ran from and whether its files differed from it (`dirty`);
