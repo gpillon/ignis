@@ -75,7 +75,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ignis_artifact::{CudaDevice, FrontendSet, ModelScope, Reader, bind_model_scope_27b_with, materialize};
+use ignis_artifact::{CudaDevice, FrontendSet, ModelScope, VisionResidency, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::attn_tap::{GQA_LAYERS, KV_HEADS, Q_HEADS, with_attn_tap, with_attn_tap_hq};
 use ignis_core::compute::ModelConfig;
 use ignis_core::decision::AnswerAlphabet;
@@ -195,7 +195,7 @@ fn attention_over_a_text_state_is_dumped_for_calibration() {
         AnswerAlphabet::from_tokenizer(tokenizer).tokens().iter().map(|t| t.label.clone()).collect();
     let thinking = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
 
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: false, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: false, vision_residency: VisionResidency::Device, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,

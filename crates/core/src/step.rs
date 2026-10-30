@@ -267,6 +267,12 @@ pub(crate) mod ffi {
 
         pub fn ignis_media_embedding_columns(embedding: *const IgnisMediaEmbedding) -> u32;
 
+        pub fn ignis_media_embedding_read(
+            embedding: *const IgnisMediaEmbedding,
+            out: *mut u16,
+            out_bytes: u64,
+        ) -> i32;
+
         pub fn ignis_media_embedding_release(embedding: *mut IgnisMediaEmbedding);
 
         pub fn ignis_media_last_error() -> *const c_char;
@@ -1616,6 +1622,21 @@ impl MediaEmbedding<'_> {
     /// The embedding's merged columns.
     pub fn columns(&self) -> u32 {
         unsafe { ffi::ignis_media_embedding_columns(self.handle) }
+    }
+
+    /// The embedding's `[hidden, columns]` BF16 bits, in column order, read
+    /// back from wherever the load's vision residency put the pool (GitHub
+    /// #414): what two loads' embeddings are compared by, byte for byte.
+    /// `hidden` is the model's ([`crate::compute::ModelConfig::hidden`]).
+    pub fn read_bits(&self, hidden: u64) -> Result<Vec<u16>, String> {
+        let mut out = vec![0u16; self.columns() as usize * hidden as usize];
+        let rc = unsafe {
+            ffi::ignis_media_embedding_read(self.handle, out.as_mut_ptr(), (out.len() * 2) as u64)
+        };
+        if rc != 0 {
+            return Err(media_last_error());
+        }
+        Ok(out)
     }
 
     /// Detach the embedding from its model's borrow.

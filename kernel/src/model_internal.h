@@ -172,6 +172,76 @@ struct VisionWeights {
   ninfer::Weight merger_norm_bias;
 };
 
+// GitHub #414 (ADR 0075): under IGNIS_VISION_RESIDENCY_HOST the tower is
+// copied into the prefill scratch for each media encode in these stages, in
+// the order the encode reads them: the pre-block weights (the patch
+// embedding, its bias and the position table, ~6.7 MB), each of the 27 blocks
+// (~8.94 MB), the merger's norm and fc1 (~22.6 MB), then its fc2 (~25.1 MB,
+// the largest). `visit(stage, weight)` once per tensor, in stage order.
+inline constexpr std::size_t kVisionStagingStages = 1 + kVisionLayers + 2;
+
+template <class Weights, class Visit> void visit_vision_stages(Weights &w, Visit visit) {
+  visit(std::size_t{0}, w.patch_embedding);
+  visit(std::size_t{0}, w.patch_embedding_bias);
+  visit(std::size_t{0}, w.position_embedding);
+  for (std::size_t b = 0; b < w.layers.size(); ++b) {
+    auto &l = w.layers[b];
+    for (auto *weight : {&l.qkv, &l.qkv_bias, &l.output, &l.output_bias, &l.fc1, &l.fc1_bias, &l.fc2,
+                         &l.fc2_bias, &l.norm1_weight, &l.norm1_bias, &l.norm2_weight, &l.norm2_bias}) {
+      visit(1 + b, *weight);
+    }
+  }
+  const std::size_t merger = 1 + w.layers.size();
+  visit(merger, w.merger_norm_weight);
+  visit(merger, w.merger_norm_bias);
+  visit(merger, w.merger_fc1);
+  visit(merger, w.merger_fc1_bias);
+  visit(merger + 1, w.merger_fc2);
+  visit(merger + 1, w.merger_fc2_bias);
+}
+
+// GitHub #414: the staging ring's own stream and events, created at load
+// under IGNIS_VISION_RESIDENCY_HOST and absent otherwise. `copy` is
+// non-blocking and the encode's alone: the next stage copies on it while the
+// model's stream computes the current one, ordered by `copied` (a slot holds
+// its stage) and `consumed` (a slot's stage has been read, so the stage three
+// on may overwrite it); `head` marks the work queued on the scratch before the
+// encode, which the first copies wait for.
+struct VisionStaging {
+  std::size_t slot_bytes = 0;
+  cudaStream_t copy = nullptr;
+  cudaEvent_t head = nullptr;
+  std::array<cudaEvent_t, IGNIS_VISION_STAGING_SLOTS> copied{};
+  std::array<cudaEvent_t, IGNIS_VISION_STAGING_SLOTS> consumed{};
+
+  VisionStaging() = default;
+  VisionStaging(const VisionStaging &) = delete;
+  VisionStaging &operator=(const VisionStaging &) = delete;
+  // Whichever of them the load made, on any of its exits and at free; a copy
+  // still running finishes first.
+  ~VisionStaging() {
+    if (copy != nullptr) {
+      cudaStreamSynchronize(copy);
+      cudaStreamDestroy(copy);
+    }
+    for (cudaEvent_t event : copied) {
+      if (event != nullptr) {
+        cudaEventDestroy(event);
+      }
+    }
+    for (cudaEvent_t event : consumed) {
+      if (event != nullptr) {
+        cudaEventDestroy(event);
+      }
+    }
+    if (head != nullptr) {
+      cudaEventDestroy(head);
+    }
+  }
+
+  bool staged() const { return copy != nullptr; }
+};
+
 struct ignis_media_embedding;
 
 // The columns `ignis_program_prefill`'s span-logits readout scores at a time
@@ -203,8 +273,36 @@ struct FlashNextModelDeleter {
 // and a prefill chunk scatters them back page by page
 // (kernel/src/step.cu). Both are plain column ranges over the ops that
 // already existed -- no kernel reads a page table.
+//
+// GitHub #415 (ADR 0075): under IGNIS_VISION_RESIDENCY_HOST the same pages
+// are one mapped, portable pinned host allocation (`mapped`) instead of a
+// device buffer: the encoder writes each page through a device page and copies
+// it there, and the prefill chunk's scatter reads it in place through its
+// device alias, as ADR 0062's token embedding is read. Its holds, eviction and
+// sizing are the device pool's.
+struct MappedHostRegion {
+  void *host = nullptr;
+  // The pointer the device reads and writes it through.
+  void *device = nullptr;
+  std::size_t bytes = 0;
+
+  // cudaHostAlloc(Mapped | Portable) of `bytes`; throws naming the bytes and
+  // the CUDA error, holding nothing.
+  explicit MappedHostRegion(std::size_t size_bytes);
+  MappedHostRegion(const MappedHostRegion &) = delete;
+  MappedHostRegion &operator=(const MappedHostRegion &) = delete;
+  ~MappedHostRegion() {
+    if (host != nullptr) {
+      cudaFreeHost(host);
+    }
+  }
+};
+
 struct VisionEmbeddingPool {
+  // Exactly one of the two, by the load's vision residency: VRAM under
+  // DEVICE, mapped host memory under HOST.
   std::unique_ptr<ninfer::DeviceBuffer> buffer;
+  std::unique_ptr<MappedHostRegion> mapped;
   // `[hidden]` BF16 columns per page, and so the bytes of one.
   std::int32_t page_columns = 0;
   std::size_t page_bytes = 0;
@@ -212,7 +310,10 @@ struct VisionEmbeddingPool {
   // bool because a release names its embedding, not its pages.
   std::vector<const ignis_media_embedding *> owner;
 
-  bool present() const { return buffer != nullptr; }
+  bool present() const { return buffer != nullptr || mapped != nullptr; }
+  // The pool's bytes where each placement counts them: VRAM, host-mapped.
+  std::uint64_t device_bytes() const { return buffer != nullptr ? buffer->bytes : 0; }
+  std::uint64_t host_mapped_bytes() const { return mapped != nullptr ? mapped->bytes : 0; }
   std::int32_t pages() const { return static_cast<std::int32_t>(owner.size()); }
   std::int32_t free_pages() const {
     std::int32_t n = 0;
@@ -225,8 +326,10 @@ struct VisionEmbeddingPool {
   std::int32_t pages_for(std::int32_t columns) const {
     return page_columns > 0 ? (columns + page_columns - 1) / page_columns : 0;
   }
+  // A page as the device addresses it, wherever the pool lives.
   std::uint8_t *page_ptr(std::int32_t page) const {
-    return static_cast<std::uint8_t *>(buffer->p) + static_cast<std::size_t>(page) * page_bytes;
+    void *const base = buffer != nullptr ? buffer->p : mapped->device;
+    return static_cast<std::uint8_t *>(base) + static_cast<std::size_t>(page) * page_bytes;
   }
   // Claim `count` pages for `owner_of`, or return empty. The pages need not
   // be adjacent -- that is the whole point of paging them.
@@ -535,18 +638,22 @@ struct ignis_model {
   // transient, this holds as many embeddings as their own columns fit --
   // which is what lets an embedding outlive the encode that made it.
   VisionEmbeddingPool vision_pool{};
+  // GitHub #414 (ADR 0075): set under IGNIS_VISION_RESIDENCY_HOST, where
+  // `vision` points into mapped host memory and each encode stages it into
+  // `scratch`; `staged()` is false on a device load.
+  VisionStaging vision_staging{};
   // GitHub #178: the decode round's per-lane rope positions (I32 x
   // decode_lanes), `position + rope_delta`, staged beside
   // `sampling_decode_positions` and read by the graphs from this stable
   // address. Only a vision load has one: a text load's rounds rotate at the
   // positions themselves, exactly as before.
   std::unique_ptr<ninfer::DeviceBuffer> decode_rope_positions;
-  // What vision adds beside a text load: the embedding pool, and what the
-  // encoder's workspace grew `scratch` by.
+  // What vision adds beside a text load in VRAM: the embedding pool where it
+  // is on the device (GitHub #415: a host-mapped one counts in the stats'
+  // `host_mapped_bytes`), and what the encoder's workspace grew `scratch` by.
   uint64_t vision_reserved_bytes() const {
     const uint64_t shared = scratch ? scratch->capacity() : 0;
-    return (shared > prefill_scratch_bytes ? shared - prefill_scratch_bytes : 0) +
-           (vision_pool.buffer ? vision_pool.buffer->bytes : 0);
+    return (shared > prefill_scratch_bytes ? shared - prefill_scratch_bytes : 0) + vision_pool.device_bytes();
   }
 
   // P5-04 (GitHub #153): the verify round's substrate, present exactly when
@@ -575,3 +682,29 @@ struct ignis_media_embedding {
 // the load's reservation (kernel/src/model.cu) and the encode that runs out
 // of it (kernel/src/vision_encode.cu), so the two cannot drift.
 std::size_t ignis_vision_workspace_bytes(std::int32_t tokens, std::int32_t segments);
+
+// GitHub #414 (ADR 0075): one staging slot's bytes under
+// IGNIS_VISION_RESIDENCY_HOST -- the largest stage's bound, from the bound
+// tensors' sizes alone (each tensor's payload and the padding its host span
+// may add), so the plan, which sees no pointer, and the encode size it alike.
+// The encoder's share of the scratch is its workspace, aligned, then
+// IGNIS_VISION_STAGING_SLOTS of these (ignis_vision_staged_share).
+std::size_t ignis_vision_staging_slot_bytes(const VisionWeights &weights);
+
+// GitHub #414: the encoder's share of the scratch under
+// IGNIS_VISION_RESIDENCY_HOST, for an encode workspace of `workspace_bytes`:
+// the ring of IGNIS_VISION_STAGING_SLOTS slots of `slot_bytes` starts at
+// `ring_offset`, the workspace aligned, and the share ends with it at `bytes`.
+// Shared by the load's reservation (kernel/src/model.cu) and the encode that
+// lays its share out (kernel/src/vision_encode.cu), so the two cannot drift.
+struct VisionStagedShare {
+  std::size_t ring_offset = 0;
+  std::size_t bytes = 0;
+};
+VisionStagedShare ignis_vision_staged_share(std::size_t workspace_bytes, std::size_t slot_bytes);
+
+// GitHub #414: throws, naming the stage, unless every stage of `weights` --
+// as the binder laid it out in host memory -- fits a slot of `slot_bytes`,
+// with each tensor's planes inside its payload. The load asks once, so an
+// encode never meets a stage it cannot copy.
+void ignis_vision_staging_check(const VisionWeights &weights, std::size_t slot_bytes);

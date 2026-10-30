@@ -59,7 +59,7 @@ The default: a 32 GB RTX 5090.
 | Field | 27B | Flash-Next |
 |---|---|---|
 | Context (`model.max_context`) | 917,504 | 589,824 |
-| Vision | on | not applicable |
+| Vision | on, tower and pool in host RAM (`vision.residency: host`) | not applicable |
 | Speculation | DFlash2, 7 draft tokens | off |
 | Decode lanes | 8 (the default) | 3 |
 | Prefill chunk | 2,048 | 1,024 (the default) |
@@ -77,6 +77,12 @@ Why each:
   the 27B and 2.25 for Flash-Next
   ([ADR 0057](../../adr/0057-rope-scaling-is-auto-by-default.md),
   [ADR 0059](../../adr/0059-flash-next-applies-yarn-on-q-and-k.md)).
+- **The vision tower and pool in host RAM.** The 5090 stages the 296 MB tower
+  for each image and maps the embedding pool in pinned host RAM, so a vision
+  load keeps the KV pool of a text-only one ([Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
+  On Windows, Task Manager counts the pinned tower and pool as shared GPU
+  memory, as it does the token embedding: that is host RAM, not VRAM
+  oversubscription ([the WDDM note](vram-plan.md#windows-and-wddm)).
 - **The 27B's prefill chunk.** With vision on, the image encoder sizes the
   workspace, so a 2,048-token chunk costs no VRAM over 1,024. It prefilled
   1.9 and 2.2 percent faster at 46K and 105K, with a lower KLD against BF16 and
@@ -105,7 +111,7 @@ Linux ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)).
 | Field | 27B | Flash-Next |
 |---|---|---|
 | Context | 1,048,576 | 1,048,576 |
-| Vision | on | not applicable |
+| Vision | on, tower and pool in VRAM (`vision.residency: device`) | not applicable |
 | Speculation | DFlash2, 7 draft tokens | MTP, 3 draft tokens |
 | Decode lanes | 8 (the default) | 8 |
 | Prefill chunk | 2,048 | 1,024 (the default) |
@@ -118,6 +124,9 @@ Why each:
   attention envelope, and the plan holds it. `auto` rope scaling makes both
   models YaRN at 4. No request that long was run.
 - **Headroom left at the default.** Nothing has to be traded for vision on 96 GB.
+- **The vision tower and pool stay in VRAM.** On 96 GB they are about 0.8% of
+  the KV pool, and the host may be short of RAM to pin them, so this profile
+  takes `device`. `--vision-residency host` overrides it.
 - **Eight lanes.** The expert cache holds nearly every expert, so a lane costs
   its state and its share of the KV pool, and the aggregate peaks at eight.
 - **MTP for Flash-Next, at the default row budget.** Few experts cross PCIe here,
@@ -141,7 +150,7 @@ that entry ([Get a model](../guides/models.md)).
 | Field | 27B |
 |---|---|
 | Context | 262,144, the positions it was trained on |
-| Vision | off; 1,024 tokens an image when turned on |
+| Vision | on, 4,096 tokens an image, tower and pool in host RAM |
 | Speculation | DFlash2, 7 draft tokens, the drafter's head `auto` (the full head) |
 | Decode lanes | 2 |
 | Prefill chunk | 1,024 (the default) |
@@ -149,17 +158,17 @@ that entry ([Get a model](../guides/models.md)).
 
 Why each:
 
-- **Vision off.** The vision tower's weights and its encoder peak are VRAM a
-  16 GB card does not have.
-- **1,024 vision tokens when you turn it on.** With `--vision-enabled` the
-  profile caps an image at 1,024 merged tokens, about 1,024 x 1,024 pixels
-  (a larger one is downscaled). At the 32,768 default the encoder's workspace
-  and embedding pool take most of the card's context; at 1,024 a 5060 Ti kept
-  all 262,144, at about a tenth of its KV pool. `--vision-max-tokens` sets
-  your own.
+- **Vision on, at 4,096 tokens.** The profile caps an image at 4,096 merged
+  tokens, about 2,048 x 2,048 pixels (a larger one is downscaled). The vision
+  tower and the embedding pool sit in pinned host RAM (`vision.residency:
+  host`), so with no image in flight vision costs no context: a vision load
+  keeps the KV pool of a text-only one, measured at 7,956 pages at 1,024 and at
+  4,096 tokens on a 16 GB budget. `--vision-enabled false` turns it off and
+  `--vision-max-tokens` sets your own envelope. The pinned host RAM it needs is
+  [host RAM for the 27B](../configuration/host-ram.md#host-ram-for-the-27b).
 - **Two lanes.** Eight would leave no room for the context.
-- **The 1,024-token chunk.** With vision off the workspace is the text scratch,
-  and 2,048 would cost about 0.4 GB of KV pool.
+- **The 1,024-token chunk.** The prefill scratch is sized by the chunk, and
+  2,048 would cost about 0.4 GB of KV pool.
 - **The headroom** is the 5090's 27B value until a real card says otherwise
   ([measure yours](../guides/measure-a-16gb-card.md)).
 

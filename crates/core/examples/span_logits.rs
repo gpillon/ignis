@@ -22,7 +22,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use ignis_artifact::{CudaDevice, ModelScope, Reader, bind_model_scope_27b_with, materialize};
+use ignis_artifact::{CudaDevice, ModelScope, VisionResidency, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::{ExceptionWeights, KvFormat};
 use ignis_core::compute::ModelConfig;
 use ignis_core::model_load::load_qwen38_27b;
@@ -59,7 +59,7 @@ fn main() {
         .map_or(Ok(ExceptionWeights::default()), |v| ExceptionWeights::parse(&v))
         .unwrap_or_else(|e| panic!("IGNIS_MODEL_EXCEPTION_WEIGHTS: {e}"));
     eprintln!("exception weights: {exceptions}");
-    let scope = ModelScope { draft: None, vision: false, fp8_exceptions: exceptions.is_fp8() };
+    let scope = ModelScope { draft: None, vision: false, vision_residency: VisionResidency::Device, fp8_exceptions: exceptions.is_fp8() };
     let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = CudaDevice::create(0).unwrap_or_else(|e| panic!("CUDA: {e}"));
     let artifact = materialize(&reader, &plan, &mut device, None).unwrap_or_else(|e| panic!("materialize: {e}"));

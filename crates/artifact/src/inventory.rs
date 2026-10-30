@@ -321,7 +321,7 @@ pub fn bind_model_scope_27b(
     reader: &Reader,
     draft: Option<DraftModule>,
 ) -> Result<(MaterializationPlan, Vec<ObjectHandle>)> {
-    bind_model_scope_27b_with(reader, ModelScope { draft, vision: false, fp8_exceptions: false })
+    bind_model_scope_27b_with(reader, ModelScope { draft, vision: false, vision_residency: VisionResidency::Device, fp8_exceptions: false })
 }
 
 // ---------------------------------------------------------------------------
@@ -388,12 +388,67 @@ pub fn vision_scope_27b() -> Vec<InventoryEntry> {
     entries
 }
 
+/// Where a vision load keeps the vision tower's weights (ADR 0075, GitHub
+/// #414): `device`, in VRAM for the life of the load, or `host`, in the
+/// mapped pinned host allocation the token embedding lives in (ADR 0062),
+/// staged into the prefill scratch for each media encode. A load option,
+/// fixed for the life of the load. `host` is the default (#416); the
+/// `rtxpro6000` profile takes `device`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VisionResidency {
+    /// The tower staged from pinned host memory for each encode.
+    #[default]
+    Host,
+    /// The tower in VRAM, as every vision load before ADR 0075.
+    Device,
+}
+
+impl VisionResidency {
+    /// The spellings [`Self::parse`] accepts.
+    pub const NAMES: [&'static str; 2] = ["host", "device"];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Device => "device",
+        }
+    }
+
+    /// `struct ignis_model_load_options::vision_residency`: 0 = device, so a
+    /// zeroed options struct is today's load; 1 = host.
+    pub const fn abi_code(self) -> u32 {
+        match self {
+            Self::Device => 0,
+            Self::Host => 1,
+        }
+    }
+
+    /// Case-insensitive.
+    pub fn parse(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "host" => Ok(Self::Host),
+            "device" => Ok(Self::Device),
+            other => Err(format!("unknown vision residency `{other}` (expected `host` or `device`)")),
+        }
+    }
+}
+
+impl std::fmt::Display for VisionResidency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Every module a load binds beside the text scope: the drafter, the vision
 /// tower, both or neither (GitHub #177). The default is the text scope alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ModelScope {
     pub draft: Option<DraftModule>,
     pub vision: bool,
+    /// ADR 0075 (GitHub #414): where the vision tower's tensors live when
+    /// `vision` binds them -- on the device, or host-mapped beside the token
+    /// embedding. Read only with `vision`.
+    pub vision_residency: VisionResidency,
     /// GitHub #341: the nine BF16 exception tensors -- the fused attention
     /// projection of GQA layers 3-23, the attention output of GQA layers 3
     /// and 7, the GDN output of layer 4 -- held on the device in FP8,
@@ -410,8 +465,8 @@ pub fn model_scope_27b_with(scope: ModelScope) -> Vec<InventoryEntry> {
     with_modules(text_scope_27b(), scope)
 }
 
-/// `text`, then the drafter's objects, then the vision tower's, with the
-/// exception tensors held as `scope` says.
+/// `text`, then the drafter's objects, then the vision tower's where its
+/// residency puts it, with the exception tensors held as `scope` says.
 fn with_modules(text: Vec<InventoryEntry>, scope: ModelScope) -> Vec<InventoryEntry> {
     let mut entries = text;
     match scope.draft {
@@ -423,7 +478,11 @@ fn with_modules(text: Vec<InventoryEntry>, scope: ModelScope) -> Vec<InventoryEn
         }
     }
     if scope.vision {
-        entries.extend(vision_scope_27b());
+        let residence = match scope.vision_residency {
+            VisionResidency::Host => Residence::HostMapped,
+            VisionResidency::Device => Residence::Device,
+        };
+        entries.extend(vision_scope_27b().into_iter().map(|entry| InventoryEntry { residence, ..entry }));
     }
     if scope.fp8_exceptions {
         for entry in &mut entries {
@@ -504,6 +563,18 @@ pub fn bind_model_scope_27b_with(
     let mut handles = Vec::with_capacity(entries.len());
     bind_entries(&mut binder, &entries, &mut handles)?;
     Ok((binder.plan(), handles))
+}
+
+/// What `plan`'s mapped host allocation holds of the vision tower (ADR 0075,
+/// GitHub #414): its spans, with their 4 KiB padding, which the host plan
+/// charges on a line of its own -- the rest of the allocation is the token
+/// embedding's (ADR 0062). 0 when the tower is on the device or not bound.
+pub fn vision_host_mapped_bytes(reader: &Reader, plan: &MaterializationPlan) -> u64 {
+    plan.host_mapped_objects
+        .iter()
+        .filter(|placement| reader.objects()[placement.handle.index].name().starts_with("vision/"))
+        .map(|placement| placement.span_bytes)
+        .sum()
 }
 
 /// [`bind_model_scope_27b_with`] with every tensor on the device, the token
@@ -706,14 +777,19 @@ mod tests {
         }
     }
 
-    /// ADR 0062: the token embedding is the one tensor of any 27B scope that
-    /// lives in mapped host memory; everything else, the output head
-    /// included, is on the device.
+    /// ADR 0062: the token embedding is the one tensor of a 27B scope that
+    /// lives in mapped host memory under the `device` vision residency;
+    /// everything else, the output head included, is on the device.
     #[test]
     fn the_token_embedding_is_the_one_host_mapped_tensor_of_every_scope() {
         for scope in [
             ModelScope::default(),
-            ModelScope { draft: Some(DraftModule::Dflash2ShortlistHead), vision: true, fp8_exceptions: false },
+            ModelScope {
+                draft: Some(DraftModule::Dflash2ShortlistHead),
+                vision: true,
+                vision_residency: VisionResidency::Device,
+                fp8_exceptions: false,
+            },
         ] {
             let host: Vec<&str> = model_scope_27b_with(scope)
                 .iter()
@@ -722,6 +798,49 @@ mod tests {
                 .collect();
             assert_eq!(host, ["text/token_embedding"], "{scope:?}");
         }
+    }
+
+    /// ADR 0075 (GitHub #414): under the `host` vision residency the tower's
+    /// 333 tensors take the token embedding's mapped allocation, so the
+    /// binder places them in host memory and the encode stages them; the
+    /// token embedding is host-mapped whatever the residency, and nothing
+    /// else moves -- not the drafter, not the shortlist head, not a text
+    /// tensor.
+    #[test]
+    fn the_vision_scope_is_host_mapped_only_under_the_host_residency() {
+        for draft in [None, Some(DraftModule::Dflash2ShortlistHead)] {
+            let at = |vision_residency| ModelScope { draft, vision: true, vision_residency, fp8_exceptions: false };
+            let host: Vec<&str> = model_scope_27b_with(at(VisionResidency::Host))
+                .iter()
+                .filter(|e| e.residence == Residence::HostMapped)
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(host.len(), 1 + 333, "{draft:?}");
+            assert_eq!(host[0], "text/token_embedding");
+            assert!(host[1..].iter().all(|name| name.starts_with("vision/")), "{host:?}");
+            // The same entries in the same order: only where the tower lives moves.
+            let names = |scope| model_scope_27b_with(scope).iter().map(|e| e.name).collect::<Vec<_>>();
+            assert_eq!(names(at(VisionResidency::Host)), names(at(VisionResidency::Device)));
+        }
+        // A residency without the tower places nothing new.
+        let text = ModelScope { vision_residency: VisionResidency::Host, ..ModelScope::default() };
+        let host: Vec<&str> =
+            model_scope_27b_with(text).iter().filter(|e| e.residence == Residence::HostMapped).map(|e| e.name).collect();
+        assert_eq!(host, ["text/token_embedding"]);
+    }
+
+    #[test]
+    fn the_vision_residency_parses_its_two_values_and_defaults_to_the_host() {
+        assert_eq!(VisionResidency::default(), VisionResidency::Host);
+        assert_eq!(VisionResidency::NAMES, ["host", "device"]);
+        for residency in [VisionResidency::Host, VisionResidency::Device] {
+            assert_eq!(VisionResidency::parse(residency.as_str()), Ok(residency));
+        }
+        assert_eq!(VisionResidency::parse(" Host "), Ok(VisionResidency::Host));
+        let err = VisionResidency::parse("cpu").unwrap_err();
+        assert!(err.contains("cpu") && err.contains("host") && err.contains("device"), "{err}");
+        // `ignis_model_load_options::vision_residency` (kernel/include/ignis_model.h).
+        assert_eq!((VisionResidency::Device.abi_code(), VisionResidency::Host.abi_code()), (0, 1));
     }
 
     /// `bind_entries` places each entry where the inventory says it lives,
@@ -766,9 +885,9 @@ mod tests {
     #[test]
     fn fp8_exceptions_convert_exactly_the_nine_bf16_exception_tensors() {
         for draft in [None, Some(DraftModule::Dflash2)] {
-            let plain = model_scope_27b_with(ModelScope { draft, vision: true, fp8_exceptions: false });
+            let plain = model_scope_27b_with(ModelScope { draft, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false });
             assert!(plain.iter().all(|e| e.encoding == DeviceEncoding::Stored));
-            let fp8 = model_scope_27b_with(ModelScope { draft, vision: true, fp8_exceptions: true });
+            let fp8 = model_scope_27b_with(ModelScope { draft, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: true });
             assert_eq!(fp8.len(), plain.len(), "the same tensors");
             let converted: Vec<&InventoryEntry> = fp8.iter().filter(|e| e.encoding != DeviceEncoding::Stored).collect();
             let names: Vec<&str> = converted.iter().map(|e| e.name).collect();
@@ -941,11 +1060,11 @@ mod tests {
         let text = text_scope_27b();
         let vision = vision_scope_27b();
 
-        let only_vision = model_scope_27b_with(ModelScope { draft: None, vision: true, fp8_exceptions: false });
+        let only_vision = model_scope_27b_with(ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false });
         assert_eq!(&only_vision[..text.len()], text.as_slice());
         assert_eq!(&only_vision[text.len()..], vision.as_slice());
 
-        let both = model_scope_27b_with(ModelScope { draft: Some(DraftModule::Dflash2), vision: true, fp8_exceptions: false });
+        let both = model_scope_27b_with(ModelScope { draft: Some(DraftModule::Dflash2), vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false });
         let with_drafter = model_scope_27b(Some(DraftModule::Dflash2));
         assert_eq!(&both[..with_drafter.len()], with_drafter.as_slice());
         assert_eq!(&both[with_drafter.len()..], vision.as_slice());
@@ -1094,7 +1213,7 @@ mod tests {
     fn fp8_exceptions_never_reencode_a_trellis_matrix() {
         let k3 = |_: &str| Some(NumericFormat::TrellisMul1K3);
         for draft in [None, Some(DraftModule::Dflash2ShortlistHead)] {
-            let scope = ModelScope { draft, vision: true, fp8_exceptions: true };
+            let scope = ModelScope { draft, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: true };
             let trellis = with_modules(text_scope_27b_trellis(k3).unwrap(), scope);
             assert!(trellis.iter().all(|e| e.encoding == DeviceEncoding::Stored), "{draft:?}");
             assert_eq!(trellis.len(), with_modules(text_scope_27b_trellis(k3).unwrap(), ModelScope { fp8_exceptions: false, ..scope }).len());

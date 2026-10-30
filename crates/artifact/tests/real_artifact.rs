@@ -14,8 +14,8 @@ use std::path::Path;
 use ignis_artifact::{
     bind_model_scope_27b, bind_model_scope_27b_with, bind_text_scope_27b, dflash2_scope_27b,
     materialize, text_scope_27b, vision_scope_27b, Binder, CpuDevice, DraftModule,
-    MaterializationPlan, ModelScope, NumericFormat, Object, OUT_OF_SCOPE_TEXT_NAMES, Reader,
-    StorageLayout, bind_model_scope_27b_on_device, Residence,
+    MaterializationPlan, ModelScope, VisionResidency, NumericFormat, Object, OUT_OF_SCOPE_TEXT_NAMES, Reader,
+    StorageLayout, bind_model_scope_27b_on_device, Residence, vision_host_mapped_bytes,
 };
 #[cfg(feature = "cuda")]
 use ignis_artifact::CudaDevice;
@@ -297,7 +297,7 @@ fn real_nvfp4full_the_token_embedding_leaves_the_device_arena() {
         None => return,
     };
     const TABLE_BYTES: u64 = 248_320 * 5_440;
-    for scope in [ModelScope::default(), ModelScope { draft: Some(DraftModule::Dflash2), vision: true, fp8_exceptions: false }] {
+    for scope in [ModelScope::default(), ModelScope { draft: Some(DraftModule::Dflash2), vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false }] {
         let (mapped, handles) = bind_model_scope_27b_with(&reader, scope).expect("bind");
         let (on_device, device_handles) = bind_model_scope_27b_on_device(&reader, scope).expect("bind on device");
         assert_eq!(handles, device_handles, "the same objects, in the same order");
@@ -318,6 +318,46 @@ fn real_nvfp4full_the_token_embedding_leaves_the_device_arena() {
     for entry in text_scope_27b() {
         let host = entry.residence == Residence::HostMapped;
         assert_eq!(host, entry.name == "text/token_embedding", "{}", entry.name);
+    }
+}
+
+/// ADR 0075 (GitHub #414) on the real artifact: under the `host` vision
+/// residency the tower's 333 tensors leave the device arena for the mapped
+/// host allocation beside the token embedding -- the VRAM plan's weights line
+/// drops by the tower's 295,711,648 bytes (and the device arena's alignment
+/// between them), and the host plan's tower line is the tower's spans with
+/// their 4 KiB padding, apart from the table's. Tier 1: binding plans
+/// placements.
+#[test]
+fn real_nvfp4full_the_host_residency_moves_the_vision_tower_to_the_mapped_allocation() {
+    let reader = match open_or_skip() {
+        Some(r) => r,
+        None => return,
+    };
+    const TOWER_BYTES: u64 = 295_711_648;
+    for draft in [None, Some(DraftModule::Dflash2)] {
+        let scope = |vision_residency| ModelScope { draft, vision: true, vision_residency, fp8_exceptions: false };
+        let (host, host_handles) = bind_model_scope_27b_with(&reader, scope(VisionResidency::Host)).expect("bind host");
+        let (device, device_handles) =
+            bind_model_scope_27b_with(&reader, scope(VisionResidency::Device)).expect("bind device");
+        assert_eq!(host_handles, device_handles, "the same objects, in the same order");
+        let tower: Vec<_> = host
+            .host_mapped_objects
+            .iter()
+            .filter(|o| reader.objects()[o.handle.index].name().starts_with("vision/"))
+            .collect();
+        assert_eq!(tower.len(), vision_scope_27b().len());
+        assert_eq!(tower.iter().map(|o| o.bytes).sum::<u64>(), TOWER_BYTES, "the tower's payloads");
+        let saved = device.device_capacity_bytes - host.device_capacity_bytes;
+        assert!((TOWER_BYTES..TOWER_BYTES + 333 * 256).contains(&saved), "{draft:?}: {saved}");
+        // The host plan's line: the tower's spans, which the token
+        // embedding's line does not take.
+        let spans = vision_host_mapped_bytes(&reader, &host);
+        assert_eq!(spans, host.host_mapped_capacity_bytes - device.host_mapped_capacity_bytes);
+        assert_eq!(spans, tower.iter().map(|o| o.span_bytes).sum::<u64>());
+        assert!((TOWER_BYTES..TOWER_BYTES + 333 * 8192).contains(&spans), "{spans}");
+        eprintln!("vision tower: {TOWER_BYTES} B of payload, {spans} B of spans, {saved} B off the device arena");
+        assert_eq!(vision_host_mapped_bytes(&reader, &device), 0, "on the device, no host line");
     }
 }
 
@@ -378,7 +418,7 @@ fn real_nvfp4full_vision_plan_extends_the_model_plan() {
             "no vision object without the option ({draft:?})"
         );
         let (plan, handles) =
-            bind_model_scope_27b_with(&reader, ModelScope { draft, vision: true, fp8_exceptions: false }).expect("bind with vision");
+            bind_model_scope_27b_with(&reader, ModelScope { draft, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false }).expect("bind with vision");
         assert_eq!(plan.object_count, base_plan.object_count + vision_scope_27b().len());
         assert_eq!(&handles[..base_handles.len()], base_handles.as_slice());
         assert_eq!(

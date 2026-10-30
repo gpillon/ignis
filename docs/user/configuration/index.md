@@ -85,7 +85,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
 - `rtx50-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080): derived,
   not measured, since no 16 GB card exists in the project. The 27B at
   262,144 tokens of context on two decode lanes, with DFlash2 at 7 draft
-  tokens and the drafter's head `auto`, vision off, the VRAM headroom of the
+  tokens and the drafter's head `auto`, vision on at 4,096 tokens an image (the tower and pool in host RAM, so
+  no context lost while no image is in flight), the VRAM headroom of the
   5090's 27B (1200M) and a 1,024-token prefill chunk.
   It names no model: a start with no artifact takes the catalog's 16 GB entry
   of the default id.

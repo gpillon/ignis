@@ -240,7 +240,8 @@ on disk counts, so a partial entry needs only the rest
 ### `not enough RAM: the load holds … and keeps 4 GiB free for the system, so it needs … available`
 
 The host plan refused the load, before anything was pinned. Flash-Next needs
-about 46-47 GB of available RAM; the 27B about 18 GB under the `make` defaults.
+about 46-47 GB of available RAM; the 27B about 18.6 GB under the `make` defaults
+on a 32 GB card.
 In a Linux container on cgroup v2, "available" is capped by the container's
 memory limit, so give the container more. The message names the plan line to
 shrink and the flag that shrinks it, and the same refusal in exact bytes is the
@@ -253,7 +254,11 @@ margin; each costs something
 [for the 27B](configuration/host-ram.md#host-ram-for-the-27b)).
 
 When it names `crossing_line: load_staging`, no flag shrinks those layer
-buffers: close other applications.
+buffers: close other applications. When it names `crossing_line:
+vision_tower` or `vision_pool`, the 27B's vision tower or its embedding pool
+does not fit in pinned RAM under `--vision-residency host`: start with
+`--vision-residency device` to keep both in VRAM, or without vision
+([Where the vision tower and the embedding pool live](configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
 
 ### `--spec-backend mtp` refuses the start
 

@@ -18,6 +18,13 @@
 //    leaves the embedding pool at the envelope's floor; without an envelope
 //    it is refused. Planned through `ignis_model_plan_reservations`, which
 //    binds and sizes but never reaches the device.
+// 6. GitHub #414 (ADR 0075): `vision_residency`. Under HOST the encoder's
+//    share of the scratch is its workspace, aligned, then a ring of
+//    IGNIS_VISION_STAGING_SLOTS slots of the largest stage's bound, and
+//    (GitHub #415) the embedding pool is host-mapped, no VRAM line, while the
+//    decode round keeps its rope staging; DEVICE, a zeroed field, plans what a
+//    load without the field always did. A residency the leaf does not know, or
+//    HOST without an envelope, is refused by name.
 //
 // Host-only by construction, the same way as
 // test_model_load_speculative_options.cpp: a topology with no decoder layers
@@ -334,6 +341,50 @@ int main() {
     const ignis_model_reservations image_and_text = plan(both, seeing);
     check(image_and_text.workspace_bytes >= image_only.workspace_bytes,
           "a text room never shrinks a vision load's arena");
+  }
+
+  // --- 6. the vision residency (GitHub #414, ADR 0075) --------------------
+  // These descriptors carry no payload bytes, so a stage's bound here is its
+  // tensors' span padding alone (2 x 4 KiB + 256 each) and the largest stage
+  // is a block's twelve tensors; the real tower's ring (3 x 25,094,656 bytes,
+  // the merger's fc2) is pinned on the artifact by
+  // crates/core/tests/vision_residency_gpu.rs.
+  {
+    const std::vector<Named> both = concat(text, tower);
+    const ignis_model_load_options device = vision_items(32768, 16384);
+    ignis_model_load_options host = device;
+    host.vision_residency = IGNIS_VISION_RESIDENCY_HOST;
+    ignis_model_load_options named_device = device;
+    named_device.vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
+    const ignis_model_reservations resident = plan(both, device);
+    const ignis_model_reservations staged = plan(both, host);
+    check(plan(both, named_device).workspace_bytes == resident.workspace_bytes,
+          "DEVICE plans what a zeroed field does");
+    const uint64_t slot = 12 * (2 * 4096 + 256);
+    const uint64_t aligned = (resident.workspace_bytes + 255) & ~static_cast<uint64_t>(255);
+    check(staged.workspace_bytes == aligned + IGNIS_VISION_STAGING_SLOTS * slot,
+          "HOST appends three slots of the largest stage to the encoder's share: " +
+              std::to_string(staged.workspace_bytes) + " against " + std::to_string(resident.workspace_bytes));
+    check(resident.media_embedding_bytes > 0 && staged.media_embedding_bytes == 0,
+          "HOST maps the pool in host memory, out of the VRAM plan: " + std::to_string(staged.media_embedding_bytes));
+    check(plan(both, named_device).media_embedding_bytes == resident.media_embedding_bytes,
+          "DEVICE keeps it a VRAM line");
+    check(staged.decode_graph_bytes == resident.decode_graph_bytes,
+          "a vision load's decode round keeps its rope staging, wherever the pool is");
+  }
+  {
+    ignis_model_load_options unknown = vision_items(32768, 16384);
+    unknown.vision_residency = 2;
+    const std::string m = load_error(concat(text, tower), &unknown);
+    check(contains(m, "vision_residency 2") && contains(m, "is not 0 (device) or 1 (host)"),
+          "an unknown residency is refused by name: " + m);
+  }
+  {
+    ignis_model_load_options stray = vision(0);
+    stray.vision_residency = IGNIS_VISION_RESIDENCY_HOST;
+    const std::string m = load_error(text, &stray);
+    check(contains(m, "vision_residency 1 needs vision_max_tokens"),
+          "a host residency without a vision envelope is refused by name: " + m);
   }
 
   if (g_failed != 0) {

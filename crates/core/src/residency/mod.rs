@@ -87,7 +87,7 @@ pub use plan::{
     HostPlanRequest, MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES, MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES,
     PinRefused, PinnedExperts, TrafficMismatch, default_prefetch_budget, holds_every_expert, min_slots_per_class,
     ngram_hot_rows_room, pin_hot_experts, plan_expert_cache, plan_host, prefill_staging_ring_bytes,
-    residency_table_bytes, staging_ring_bytes_for, warm_start_order,
+    residency_table_bytes, staging_ring_bytes_for, warm_start_order, VISION_WAYS_OUT,
 };
 pub use policy::{
     Admission, DEFAULT_PREFETCH_WIDTH, LayerStep, Phase, PolicyConfig, PrefetchBudget, ResidencyModel,

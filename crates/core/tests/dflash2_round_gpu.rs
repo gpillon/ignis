@@ -46,7 +46,7 @@ use std::path::Path;
 
 use ignis_artifact::{
     bind_model_scope_27b, bind_model_scope_27b_with, materialize, text_scope_27b, CudaDevice, DraftModule, FrontendSet,
-    MaterializedArtifact, ModelScope, ObjectHandle, Reader,
+    MaterializedArtifact, ModelScope, VisionResidency, ObjectHandle, Reader,
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
@@ -847,7 +847,7 @@ fn with_fp8_exception_tensors_the_verify_graphs_replay_the_eager_rounds() {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let (canaries, stop_ids) = chat_canaries(&reader);
     let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
-    let scope = ModelScope { draft: Some(DraftModule::Dflash2), vision: false, fp8_exceptions: true };
+    let scope = ModelScope { draft: Some(DraftModule::Dflash2), vision: false, vision_residency: VisionResidency::Device, fp8_exceptions: true };
     let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,

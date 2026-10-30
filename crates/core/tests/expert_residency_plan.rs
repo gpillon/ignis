@@ -20,6 +20,8 @@ fn host(available: u64) -> HostPlanRequest {
         available_physical_bytes: available,
         scope: "qwen38flashnext",
         token_embedding_bytes: 0,
+        vision_tower_bytes: 0,
+        vision_pool_bytes: 0,
         expert_pool_bytes: 38 * GIB,
         load_staging_bytes: 0,
         ngram_hot_rows_bytes: 2 * GIB,
@@ -36,7 +38,17 @@ fn the_host_plan_adds_its_lines_and_says_what_it_leaves() {
     let names: Vec<_> = plan.entries().iter().map(|(name, _)| *name).collect();
     assert_eq!(
         names,
-        ["token_embedding", "expert_pool", "load_staging", "ngram_hot_rows", "staging", "retained_host_slots", "kv_ram_arena"]
+        [
+            "token_embedding",
+            "vision_tower",
+            "vision_pool",
+            "expert_pool",
+            "load_staging",
+            "ngram_hot_rows",
+            "staging",
+            "retained_host_slots",
+            "kv_ram_arena"
+        ]
     );
     assert_eq!(plan.total_bytes, 41 * GIB);
     assert_eq!(plan.left_bytes, 11 * GIB);
@@ -156,6 +168,8 @@ fn device_only(available: u64) -> HostPlanRequest {
         available_physical_bytes: available,
         scope: "qwen38flashnext",
         token_embedding_bytes: 0,
+        vision_tower_bytes: 0,
+        vision_pool_bytes: 0,
         expert_pool_bytes: 0,
         load_staging_bytes: 5 * GIB,
         ngram_hot_rows_bytes: GIB,
@@ -189,7 +203,7 @@ fn a_residency_phase_short_of_room_names_the_layer_buffers() {
     let HostPlanError::BelowMargin { planned_bytes, crossing_line, lines, .. } = &err;
     assert_eq!((*crossing_line, *planned_bytes), ("load_staging", 5 * GIB));
     assert_eq!((err.needed_bytes(), err.short_bytes()), (9 * GIB, GIB / 2));
-    assert_eq!(lines[2], ("load_staging", 5 * GIB), "the exact bytes name it");
+    assert_eq!(lines[4], ("load_staging", 5 * GIB), "the exact bytes name it");
     let message = err.to_string();
     for needle in [
         "the load holds 5 GiB and keeps 4 GiB free for the system, so it needs 9 GiB",

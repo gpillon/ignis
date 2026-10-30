@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::gpu_profile;
 use ignis_core::lane_lines::lane_lines;
-use ignis_core::{ExceptionWeights, KvFormat, KvGeometry, N_DECODE_LANES, Speculation, SpeculativeBackend, Vision, model_load};
+use ignis_core::{ExceptionWeights, KvFormat, KvGeometry, N_DECODE_LANES, Speculation, SpeculativeBackend, Vision, VisionResidency, model_load};
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, ReservedBytes};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -51,7 +51,11 @@ fn planned_reservations_are_held(exceptions: ExceptionWeights) {
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
-    let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS).expect("default envelope");
+    // The tower and the pool on the device (ADR 0075's `device`), where the
+    // media embedding is a VRAM line of its own.
+    let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS)
+        .expect("default envelope")
+        .with_residency(VisionResidency::Device);
     let scope = model_load::model_scope(Some(speculation), Some(vision), exceptions);
     let (plan, handles) =
         bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
@@ -188,7 +192,11 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
-    let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS).expect("default envelope");
+    // The device residency (ADR 0075's `device`): its workspace has no staging
+    // ring, and its media embedding is a VRAM line.
+    let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS)
+        .expect("default envelope")
+        .with_residency(VisionResidency::Device);
     let reserved_as = |prefill_chunk_tokens: u32, max_context_tokens: u32, vision: Option<Vision>, exceptions| {
         let scope = model_load::model_scope(Some(speculation), vision, exceptions);
         let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
@@ -341,7 +349,11 @@ fn the_round_lines_follow_the_loads_lanes() {
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
-    let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS).expect("default envelope").with_item_max_tokens(16_384);
+    // What main planned is the device residency's (ADR 0075's `device`).
+    let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS)
+        .expect("default envelope")
+        .with_item_max_tokens(16_384)
+        .with_residency(VisionResidency::Device);
     let topology = ignis_core::ModelConfig::qwen38_27b();
 
     // What main planned at eight lanes, and the decode round at one and two.

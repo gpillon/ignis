@@ -34,7 +34,7 @@ use std::path::Path;
 
 use ignis_artifact::{
     bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
-    FrontendSet, MessageContent, ModelScope, Reader, Role,
+    FrontendSet, MessageContent, VisionResidency, Reader, Role,
 };
 use ignis_bench::oracle::{
     meets_g1_floor, overall_teacher_forced_agreement, score_teacher_forced, TeacherForcedResult,
@@ -42,11 +42,11 @@ use ignis_bench::oracle::{
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::model_load::load_qwen38_27b_with_options;
+use ignis_core::model_load::{load_qwen38_27b_with_options, model_scope};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step;
 use ignis_core::vision::{vision_item_control, Multimodal};
-use ignis_core::{KvFormat, RopeScaling, Vision};
+use ignis_core::{ExceptionWeights, KvFormat, RopeScaling, Vision};
 
 use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt};
 
@@ -88,7 +88,10 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
     let canaries = load_canaries(&frontend);
     assert!(!canaries.is_empty());
 
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    // Today's load, the tower on the device (ADR 0075's `device`): the scope
+    // is bound from the vision the model loads with, so the two agree.
+    let vision = Vision::default().with_residency(VisionResidency::Device);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, model_scope(None, Some(vision), ExceptionWeights::Bf16))
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,
@@ -116,7 +119,7 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
         MAX_CONTEXT,
         KvFormat::Bf16,
         None,
-        Some(Vision::default()),
+        Some(vision),
         RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("ignis_model_load with vision: {e}"));

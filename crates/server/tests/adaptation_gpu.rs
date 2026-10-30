@@ -314,7 +314,7 @@ async fn the_27b_at_two_and_at_one_named_lane_loads_and_decodes_in_an_explicit_b
 async fn the_16gb_profile_runs_two_lanes_and_says_its_draft_head_auto_is_full() {
     let Some((eos, _frontend)) = artifact() else { return };
     let profile = ["--profile", "rtx50-16gb", "--model-idle-unload", "0"];
-    // The shape the load derives (vision is off: no item bound), built here
+    // The shape the load derives (no item bound: the text-only shape), built here
     // without `load::load_shape` so no draft-head line is logged outside the
     // capture below.
     let shape = EngineShape::from(&the_27b(&profile)).with_family_decode_share(ModelFamily::Qwen38_27b);

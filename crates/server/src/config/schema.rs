@@ -586,9 +586,19 @@ config_group! {
         /// when several images total over it. Needs vision on.
         max_tokens: Tokens = ignis_core::DEFAULT_VISION_MAX_TOKENS, between(1, ignis_core::VISION_MAX_TOKENS_LIMIT as i64), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
-        /// Encoded images kept for reuse, in MiB. Unset, one envelope-wide
-        /// embedding; a pool below that is raised to it. Needs vision on.
+        /// Encoded images kept for reuse, in MiB, where `vision.residency`
+        /// puts the pool: VRAM, or pinned host RAM under `host`. Unset, one
+        /// envelope-wide embedding; a pool below that is raised to it. Needs
+        /// vision on.
         embedding_pool_mib: Opt<Mib> = None, between(1, super::MAX_VISION_EMBEDDING_POOL_MIB as i64), QWEN38_ONLY,
+            [Visible, Patchable, ReloadRequired];
+        /// Where the vision tower's weights and the embedding pool live:
+        /// `device`, in VRAM for the life of the load (today's encode
+        /// latency), or `host`, in pinned host RAM, the weights copied to the
+        /// GPU for each image encode (~300 MB and the pool less VRAM, so more
+        /// KV pool, a few ms more an encode). A `host` start the host RAM
+        /// cannot hold is refused, never moved to the device. Needs vision on.
+        residency: VisionResidencyKind = ignis_core::VisionResidency::default(), Validator::OneOf(&ignis_core::VisionResidency::NAMES), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
     }
 }

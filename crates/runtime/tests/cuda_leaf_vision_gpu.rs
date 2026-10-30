@@ -11,6 +11,10 @@
 //! carries its `rope_delta`, and nothing vision-related is live after its
 //! image is prefilled.
 //!
+//! GitHub #415 (ADR 0075): the fan-out over one image runs under both vision
+//! residencies, and under `host`, its embedding pool host-mapped, it still
+//! encodes the image once.
+//!
 //! "Sane", not "token-identical": a decode round is one batch-wide traversal,
 //! so the round's width is part of its numerics, and no test in this engine
 //! claims a lane's tokens are independent of who shares its round. What must
@@ -26,7 +30,7 @@ use std::sync::Arc;
 
 use ignis_artifact::{
     bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
-    FrontendSet, MessageContent, ModelScope, Reader, Role,
+    FrontendSet, MessageContent, ModelScope, VisionResidency, Reader, Role,
 };
 use ignis_core::gpu_profile;
 use ignis_core::vision::Multimodal;
@@ -173,6 +177,13 @@ struct Loaded {
 
 /// Load the model with vision, or `None` where the profile allows a skip.
 fn load() -> Option<Loaded> {
+    load_at(VisionResidency::Device)
+}
+
+/// [`load`] with the vision tower and the embedding pool where `residency`
+/// keeps them (ADR 0075): the binder's scope and the leaf's option agree, as a
+/// load requires.
+fn load_at(residency: VisionResidency) -> Option<Loaded> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return None;
@@ -180,7 +191,7 @@ fn load() -> Option<Loaded> {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let eos = frontend.eos_token_id().expect("eos");
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: residency, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
@@ -204,7 +215,7 @@ fn load() -> Option<Loaded> {
         max_context_tokens: MAX_CONTEXT,
         kv_format: KvFormat::Bf16,
         kv_pool_bytes: ignis_runtime::auto_kv_pool_bytes(KvFormat::Bf16, MAX_CONTEXT),
-        vision: Some(Vision::default()),
+        vision: Some(Vision::default().with_residency(residency)),
         ..CudaLeafConfig::default()
     };
     // GitHub #213: the eviction leg below pushes a sequence to KV-RAM, which
@@ -279,11 +290,24 @@ fn an_image_prefill_interleaved_with_text_lanes_leaves_them_as_they_run_alone() 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn a_fan_out_over_one_image_encodes_it_once_and_answers_the_same() {
+    fan_out_over_one_image(VisionResidency::Device);
+}
+
+/// GitHub #415 (ADR 0035, 0075): under `host` the pool is host-mapped and the
+/// tower staged for each encode, and a fan-out still encodes the image once,
+/// so only its first question pays the staging.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn under_the_host_residency_a_fan_out_over_one_image_still_encodes_it_once() {
+    fan_out_over_one_image(VisionResidency::Host);
+}
+
+fn fan_out_over_one_image(residency: VisionResidency) {
     // GitHub #243, acceptances 1 and 2. Four questions about one picture:
     // one embedding, four prefills. The answers must be what each question
     // gets on its own — an embedding reused is the same bytes at the same
     // columns, so nothing about the answer may move.
-    let Some(Loaded { compute, frontend, pages, .. }) = load() else {
+    let Some(Loaded { compute, frontend, pages, .. }) = load_at(residency) else {
         return;
     };
     let image = image();
@@ -332,7 +356,7 @@ fn a_fan_out_over_one_image_encodes_it_once_and_answers_the_same() {
     // `docs/findings/2026-09-20-number-width-and-decide-e2e.md`. What this
     // test owns is the structural half: one entry, four answers.
     eprintln!(
-        "one question {:.2}s; four over the same picture {:.2}s",
+        "{residency}: one question {:.2}s; four over the same picture {:.2}s",
         solo_time.as_secs_f64(),
         fan_out.as_secs_f64()
     );

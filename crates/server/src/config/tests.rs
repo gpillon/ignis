@@ -2253,6 +2253,99 @@ fn help_lists_the_vision_flags() {
     assert!(text.contains("is shrunk to fit"), "{text}");
 }
 
+// ── the vision residency (GitHub #414, ADR 0075) ─────────────────────────
+
+/// A load that names no residency takes `host` (ADR 0075, GitHub #416); the
+/// other values still win from any source.
+#[test]
+fn the_vision_residency_defaults_to_the_host() {
+    let vision = config(&["--profile", "none", "--vision-enabled"]).vision.expect("vision on");
+    assert_eq!(vision.residency(), VisionResidency::Host);
+    let meta = schema::field("vision", "residency").expect("declared");
+    assert_eq!((meta.default)(), serde_json::json!("host"));
+    let device = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "device"]);
+    assert_eq!(device.vision.map(|v| v.residency()), Some(VisionResidency::Device));
+}
+
+/// ADR 0063 as amended by ADR 0075 (GitHub #416): the 5090 takes `host`; the
+/// 96 GB card, where tower and pool are ~0.8% of the KV pool and the host may
+/// be short of RAM, takes `device`.
+#[test]
+fn the_built_in_profiles_pick_the_vision_residency() {
+    let at = |profile: &str| config(&["--profile", profile, "--vision-enabled"]).vision.map(|v| v.residency());
+    assert_eq!(at("rtx5090"), Some(VisionResidency::Host));
+    assert_eq!(at("rtxpro6000"), Some(VisionResidency::Device));
+    assert_eq!(at("rtx50-16gb"), Some(VisionResidency::Host), "GitHub #418: written in the profile");
+    let flag = config(&["--profile", "rtxpro6000", "--vision-residency", "host"]);
+    assert_eq!(flag.vision.map(|v| v.residency()), Some(VisionResidency::Host), "a flag wins over the profile");
+}
+
+#[test]
+fn the_vision_residency_is_set_by_flag_env_and_file() {
+    let flag = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "host"]);
+    assert_eq!(flag.vision.map(|v| v.residency()), Some(VisionResidency::Host));
+    let env = env_map(&[("IGNIS_VISION_ENABLED", "true"), ("IGNIS_VISION_RESIDENCY", "host")]);
+    let from_env = expect_config(resolve(&args(&["--profile", "none"]), env).expect("resolve"));
+    assert_eq!(from_env.vision.map(|v| v.residency()), Some(VisionResidency::Host));
+    let env = env_map(&[("IGNIS_VISION_ENABLED", "true"), ("IGNIS_VISION_RESIDENCY", "host")]);
+    let flag_wins = expect_config(resolve(&args(&["--profile", "none", "--vision-residency", "device"]), env).expect("resolve"));
+    assert_eq!(flag_wins.vision.map(|v| v.residency()), Some(VisionResidency::Device), "flag must win over env");
+    let files = MemFiles::with(&[("c.yaml", "vision:\n  enabled: true\n  residency: host\n")]);
+    let from_file = with_files(&["--profile", "none", "--config", "c.yaml"], no_env, &files).unwrap();
+    assert_eq!(from_file.vision.map(|v| v.residency()), Some(VisionResidency::Host));
+    // The envelope is the residency's neighbour, set beside it.
+    let both = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "host", "--vision-max-tokens", "4096"]);
+    assert_eq!(both.vision.map(|v| (v.residency(), v.max_tokens())), Some((VisionResidency::Host, 4096)));
+}
+
+#[test]
+fn the_vision_residency_is_patched_and_takes_effect_at_the_next_load() {
+    let meta = schema::field("vision", "residency").expect("declared");
+    assert!(meta.visible && meta.patchable && meta.reload_required && !meta.scoped, "{meta:?}");
+    // A patch reaches the running 27B, whose next load it is.
+    let started = config(&["--profile", "none", "--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    let patched = started.with_patch(&patch_of(&[("vision", "residency", "device")])).unwrap();
+    assert_eq!(patched.vision.map(|v| v.residency()), Some(VisionResidency::Device));
+}
+
+#[test]
+fn a_vision_residency_without_vision_is_refused_rather_than_ignored() {
+    let err = refused(&["--profile", "none", "--vision-residency", "device"]);
+    assert!(err.contains("--vision-residency device") && err.contains("--vision-enabled"), "{err}");
+    assert!(
+        resolve(&args(&["--profile", "none"]), env_map(&[("IGNIS_VISION_RESIDENCY", "device")])).is_err(),
+        "the env form too"
+    );
+    // Naming the default is harmless, as for the envelope.
+    assert!(config(&["--profile", "none", "--vision-residency", "host"]).vision.is_none());
+}
+
+#[test]
+fn a_vision_residency_outside_its_values_is_refused_naming_them() {
+    for raw in ["cpu", "on-demand", "vram"] {
+        let err = refused(&["--profile", "none", "--vision-enabled", "--vision-residency", raw]);
+        assert!(err.contains("--vision-residency") && err.contains("host") && err.contains("device"), "{raw}: {err}");
+    }
+    let shouted = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "HOST"]);
+    assert_eq!(shouted.vision.map(|v| v.residency()), Some(VisionResidency::Host), "case-insensitive");
+}
+
+#[test]
+fn help_lists_the_vision_residency_and_both_values() {
+    let block = help_block("--vision-residency");
+    assert!(block.contains("host") && block.contains("device"), "{block}");
+}
+
+/// The residency is the 27B's, as vision is: a switch to Flash-Next drops it
+/// with the rest of the vision group.
+#[test]
+fn a_flash_next_switch_drops_the_vision_residency_with_vision() {
+    let started = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "device"]);
+    let (fitted, dropped) = fit_to_family(&started, ModelFamily::FlashNext).unwrap();
+    assert_eq!(dropped, ["--vision-enabled", "--vision-residency"]);
+    assert!(fitted.vision.is_none());
+}
+
 /// GitHub #195: the two are independent load options again.
 #[test]
 fn vision_and_dflash2_resolve_together_as_two_independent_load_options() {
@@ -2526,6 +2619,9 @@ fn every_flag_the_host_plan_refusal_names_is_a_flag_a_start_accepts() {
         let resolved = resolve(&args(&[flag, "0"]), no_env);
         assert!(resolved.is_ok(), "{flag}: {:?}", resolved.err());
     }
+    // ADR 0075: the 27B's vision tower line names the device residency as a way out.
+    let resolved = resolve(&args(&["--vision-enabled", "--vision-residency", "device"]), no_env);
+    assert!(resolved.is_ok(), "{:?}", resolved.err());
 }
 
 /// The default metrics address is never a reason not to start: an API bound
@@ -3105,12 +3201,13 @@ fn auto_on_a_5090_resolves_exactly_as_rtx5090_does() {
 /// `rtx50-16gb` for the 27B: the values the spec derives, and Flash-Next
 /// started under it resolves without refusal.
 #[test]
-fn the_rtx50_16gb_profile_serves_the_27b_text_only_and_flash_next_starts_under_it() {
+fn the_rtx50_16gb_profile_serves_the_27b_with_vision_on_and_flash_next_starts_under_it() {
     let config = on_total(&[], 15.9).unwrap();
     let s27 = config.for_family(ModelFamily::Qwen38_27b).unwrap();
     assert_eq!(s27.max_context, 262_144);
-    assert!(!s27.settings().vision.enabled, "vision is off, explicitly");
-    assert_eq!(s27.settings().vision.max_tokens, 1024, "the envelope a start that turns vision on takes");
+    assert!(s27.settings().vision.enabled, "vision is on, explicitly");
+    assert_eq!(s27.settings().vision.max_tokens, 4096, "the profile's envelope");
+    assert_eq!(s27.vision.map(|v| v.residency()), Some(VisionResidency::Host));
     assert_eq!(s27.vram, VramMode::Derived { headroom_bytes: 1200 << 20 });
     assert_eq!(s27.settings().model.prefill_chunk, DEFAULT_PREFILL_CHUNK, "unset: 1,024");
     assert!(s27.speculation.is_some(), "DFlash2 is on");
@@ -3126,18 +3223,20 @@ fn the_rtx50_16gb_profile_serves_the_27b_text_only_and_flash_next_starts_under_i
     assert_eq!(flash.decode_lanes, None, "the 27B's lanes are its own section's");
 }
 
-/// GitHub #407: `--vision-enabled` under `rtx50-16gb` takes the profile's
-/// 1,024-token envelope, an operator's own envelope wins over it, and the
-/// 5090's profile keeps the 32,768 default.
+/// GitHub #418 (ADR 0063 as amended by ADR 0075): `rtx50-16gb` turns vision
+/// on at a 4,096-token envelope, residency `host`; an operator's own
+/// `--vision-enabled false` or `--vision-max-tokens` wins, and the 5090's
+/// profile keeps the 32,768 default.
 #[test]
-fn vision_turned_on_under_rtx50_16gb_takes_a_1024_token_envelope() {
+fn rtx50_16gb_turns_vision_on_at_a_4096_token_envelope_and_the_operator_wins() {
     let envelope = |flags: &[&str], gib: f64| {
         let config = on_total(flags, gib).unwrap();
         config.for_family(ModelFamily::Qwen38_27b).unwrap().vision.map(|v| v.max_tokens())
     };
-    assert_eq!(envelope(&[], 15.9), None, "off unless turned on");
-    assert_eq!(envelope(&["--vision-enabled"], 15.9), Some(1024));
-    assert_eq!(envelope(&["--vision-enabled", "--vision-max-tokens", "4096"], 15.9), Some(4096));
+    assert_eq!(envelope(&[], 15.9), Some(4096), "on, at the profile's envelope");
+    assert_eq!(envelope(&["--vision-enabled"], 15.9), Some(4096));
+    assert_eq!(envelope(&["--vision-enabled", "false"], 15.9), None, "the operator's off wins");
+    assert_eq!(envelope(&["--vision-max-tokens", "1024"], 15.9), Some(1024), "the operator's envelope wins");
     assert_eq!(envelope(&[], 31.8), Some(DEFAULT_VISION_MAX_TOKENS), "rtx5090's vision is on at the default");
 }
 
