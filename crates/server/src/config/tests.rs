@@ -2275,6 +2275,7 @@ fn the_built_in_profiles_pick_the_vision_residency() {
     let at = |profile: &str| config(&["--profile", profile, "--vision-enabled"]).vision.map(|v| v.residency());
     assert_eq!(at("rtx5090"), Some(VisionResidency::Host));
     assert_eq!(at("rtxpro6000"), Some(VisionResidency::Device));
+    assert_eq!(at("rtx50-16gb"), Some(VisionResidency::Host), "GitHub #418: written in the profile");
     let flag = config(&["--profile", "rtxpro6000", "--vision-residency", "host"]);
     assert_eq!(flag.vision.map(|v| v.residency()), Some(VisionResidency::Host), "a flag wins over the profile");
 }
@@ -3200,12 +3201,13 @@ fn auto_on_a_5090_resolves_exactly_as_rtx5090_does() {
 /// `rtx50-16gb` for the 27B: the values the spec derives, and Flash-Next
 /// started under it resolves without refusal.
 #[test]
-fn the_rtx50_16gb_profile_serves_the_27b_text_only_and_flash_next_starts_under_it() {
+fn the_rtx50_16gb_profile_serves_the_27b_with_vision_on_and_flash_next_starts_under_it() {
     let config = on_total(&[], 15.9).unwrap();
     let s27 = config.for_family(ModelFamily::Qwen38_27b).unwrap();
     assert_eq!(s27.max_context, 262_144);
-    assert!(!s27.settings().vision.enabled, "vision is off, explicitly");
-    assert_eq!(s27.settings().vision.max_tokens, 1024, "the envelope a start that turns vision on takes");
+    assert!(s27.settings().vision.enabled, "vision is on, explicitly");
+    assert_eq!(s27.settings().vision.max_tokens, 4096, "the profile's envelope");
+    assert_eq!(s27.vision.map(|v| v.residency()), Some(VisionResidency::Host));
     assert_eq!(s27.vram, VramMode::Derived { headroom_bytes: 1200 << 20 });
     assert_eq!(s27.settings().model.prefill_chunk, DEFAULT_PREFILL_CHUNK, "unset: 1,024");
     assert!(s27.speculation.is_some(), "DFlash2 is on");
@@ -3221,18 +3223,20 @@ fn the_rtx50_16gb_profile_serves_the_27b_text_only_and_flash_next_starts_under_i
     assert_eq!(flash.decode_lanes, None, "the 27B's lanes are its own section's");
 }
 
-/// GitHub #407: `--vision-enabled` under `rtx50-16gb` takes the profile's
-/// 1,024-token envelope, an operator's own envelope wins over it, and the
-/// 5090's profile keeps the 32,768 default.
+/// GitHub #418 (ADR 0063 as amended by ADR 0075): `rtx50-16gb` turns vision
+/// on at a 4,096-token envelope, residency `host`; an operator's own
+/// `--vision-enabled false` or `--vision-max-tokens` wins, and the 5090's
+/// profile keeps the 32,768 default.
 #[test]
-fn vision_turned_on_under_rtx50_16gb_takes_a_1024_token_envelope() {
+fn rtx50_16gb_turns_vision_on_at_a_4096_token_envelope_and_the_operator_wins() {
     let envelope = |flags: &[&str], gib: f64| {
         let config = on_total(flags, gib).unwrap();
         config.for_family(ModelFamily::Qwen38_27b).unwrap().vision.map(|v| v.max_tokens())
     };
-    assert_eq!(envelope(&[], 15.9), None, "off unless turned on");
-    assert_eq!(envelope(&["--vision-enabled"], 15.9), Some(1024));
-    assert_eq!(envelope(&["--vision-enabled", "--vision-max-tokens", "4096"], 15.9), Some(4096));
+    assert_eq!(envelope(&[], 15.9), Some(4096), "on, at the profile's envelope");
+    assert_eq!(envelope(&["--vision-enabled"], 15.9), Some(4096));
+    assert_eq!(envelope(&["--vision-enabled", "false"], 15.9), None, "the operator's off wins");
+    assert_eq!(envelope(&["--vision-max-tokens", "1024"], 15.9), Some(1024), "the operator's envelope wins");
     assert_eq!(envelope(&[], 31.8), Some(DEFAULT_VISION_MAX_TOKENS), "rtx5090's vision is on at the default");
 }
 

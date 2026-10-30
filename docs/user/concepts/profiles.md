@@ -150,7 +150,7 @@ that entry ([Get a model](../guides/models.md)).
 | Field | 27B |
 |---|---|
 | Context | 262,144, the positions it was trained on |
-| Vision | off; 1,024 tokens an image when turned on |
+| Vision | on, 4,096 tokens an image, tower and pool in host RAM |
 | Speculation | DFlash2, 7 draft tokens, the drafter's head `auto` (the full head) |
 | Decode lanes | 2 |
 | Prefill chunk | 1,024 (the default) |
@@ -158,17 +158,17 @@ that entry ([Get a model](../guides/models.md)).
 
 Why each:
 
-- **Vision off.** The vision tower's weights and its encoder peak are VRAM a
-  16 GB card does not have.
-- **1,024 vision tokens when you turn it on.** With `--vision-enabled` the
-  profile caps an image at 1,024 merged tokens, about 1,024 x 1,024 pixels
-  (a larger one is downscaled). At the 32,768 default the encoder's workspace
-  and embedding pool take most of the card's context; at 1,024 a 5060 Ti kept
-  all 262,144, at about a tenth of its KV pool. `--vision-max-tokens` sets
-  your own.
+- **Vision on, at 4,096 tokens.** The profile caps an image at 4,096 merged
+  tokens, about 2,048 x 2,048 pixels (a larger one is downscaled). The vision
+  tower and the embedding pool sit in pinned host RAM (`vision.residency:
+  host`), so with no image in flight vision costs no context: a vision load
+  keeps the KV pool of a text-only one, measured at 7,956 pages at 1,024 and at
+  4,096 tokens on a 16 GB budget. `--vision-enabled false` turns it off and
+  `--vision-max-tokens` sets your own envelope. The pinned host RAM it needs is
+  [host RAM for the 27B](../configuration/host-ram.md#host-ram-for-the-27b).
 - **Two lanes.** Eight would leave no room for the context.
-- **The 1,024-token chunk.** With vision off the workspace is the text scratch,
-  and 2,048 would cost about 0.4 GB of KV pool.
+- **The 1,024-token chunk.** The prefill scratch is sized by the chunk, and
+  2,048 would cost about 0.4 GB of KV pool.
 - **The headroom** is the 5090's 27B value until a real card says otherwise
   ([measure yours](../guides/measure-a-16gb-card.md)).
 

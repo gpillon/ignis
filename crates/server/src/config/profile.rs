@@ -183,15 +183,15 @@ pub const NONE_PROFILE: &str = "none";
 /// 5070 Ti and 5080, the RTX 50 cards `--profile auto` finds below 20 GiB.
 /// Derived, not measured: no 16 GB card exists in the project. It serves the 27B
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
-/// DFlash2 at 7 tokens, as the other profiles, and vision off, explicit: the
-/// vision tower's weights and its encoder peak are VRAM a 16 GB card does not
-/// have (spec 27b-16gb/03). Its envelope, `vision.max_tokens`, is 1,024 for a
-/// start that turns vision on: at the 32,768 default the encoder's workspace
-/// and embedding pool take most of the card's context, at 1,024 a 5060 Ti kept
-/// all 262,144 (measured on GitHub #407).
+/// DFlash2 at 7 tokens, as the other profiles, and vision on, explicit
+/// (ADR 0063 as amended by ADR 0075): at a 4,096-token envelope, an item bound
+/// of about 2,048 x 2,048 pixels, and residency `host`, written out so the
+/// profile table shows it. The tower sits in pinned host RAM and the pool is
+/// host-mapped, so a load with no image in flight keeps the text-only KV pool
+/// (7,956 pages at 1,024 and at 4,096, measured on the 5090 on a 16 GB budget).
 /// `vram.qwen38.headroom_bytes` is the 5090's 1200M
-/// until a real card says otherwise, and `prefill_chunk` stays at its 1,024: with
-/// vision off the workspace is the text scratch, and 2,048 would cost ~0.4 GB of
+/// until a real card says otherwise, and `prefill_chunk` stays at its 1,024: the
+/// prefill scratch is sized by the chunk, and 2,048 would cost ~0.4 GB of
 /// KV pool. The profile names no model: a start with no artifact resolves the
 /// default id `qwen3.8-27b` through the catalog's class-aware alias to the 16 GB
 /// entry. The 27B decodes two lanes, where eight would leave no room for its
@@ -236,7 +236,7 @@ const BUILT_IN: &str = r#"{
         "model": {
             "qwen38": { "max_context": 262144 }
         },
-        "vision": { "enabled": false, "max_tokens": 1024 },
+        "vision": { "enabled": true, "max_tokens": 4096, "residency": "host" },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7, "decode_lanes": 2, "draft_head": "auto" }
         }
