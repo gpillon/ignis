@@ -32,6 +32,9 @@ def rel_errors(quant, bf16_root, planned, device="cuda", log=print, override=Non
 
     def tensor(handles, root, shard, name):
         if (root, shard) not in handles:     # an override's shards may share the quant's names
+            # One shard open at a time: on Windows an open shard is charged its whole size as commit,
+            # and the BF16's 18 alone took 57 GB, so the head's could not open on 2026-10-30 (#422).
+            handles.clear()
             handles[root, shard] = safe_open(os.path.join(root, shard), framework="pt", device="cpu")
         return handles[root, shard].get_tensor(name)
 
@@ -42,6 +45,9 @@ def rel_errors(quant, bf16_root, planned, device="cuda", log=print, override=Non
         swapped = override is not None and p.key in override.matrices
         source, reference_root = (override.quant, override.reference_root) if swapped else (quant, bf16_root)
         bf16_map = maps[reference_root]
+        # The head alone peaks at 13.4 GB (18.5 GB reserved): with the blocks the matrices before it
+        # left cached, the allocator ran short and the process died on 2026-10-30 (#422).
+        torch.cuda.empty_cache()
         q = {s: tensor(q_handles, source.root, source.weight_map[f"{p.key}.{s}"], f"{p.key}.{s}").to(device)
              for s in ("trellis", "suh", "svh", "mul1")}
         rows, columns = p.shape

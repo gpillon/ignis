@@ -28,6 +28,7 @@ it. Python never writes the container.
 | `exl3.py` | The quant's matrices from its safetensors headers (no torch): K, shapes, the `mul1` flag, the record bytes. |
 | `container.py` | Read-only access to a `.ninfer` v2 container (the served artifact; the packed one for `verify`). |
 | `override.py` | An override directory: EXL3 records that replace the quant's, checked like for like, pinned by the replay's provenance and its partial BF16 reference. |
+| `overlay.py` | A BF16 checkpoint with a `replay.py fetch` directory laid over it: which file holds each tensor, the overlay's checked like for like and pinned by `fetch.json`. The KLD reference of the abliterated BF16 reads through it (GitHub #422). |
 | `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
 | `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter/work.py`). |
@@ -104,6 +105,15 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify .
 - **`--weights-id`** sets the identity the record and `verify` expect (default `trellis-sc30`); pass the
   packer the same `--weights-id` and the output name.
 - **`verify`** compares each override record to the override's, bit for bit; it takes only `--override`.
+  With `--baseline <default artifact>` it also reads the variant against the artifact it varies: the same
+  directory (every object's name, kind, format, layout, shape, offset and size, in order) under another
+  identity, so the two have different content hashes; every object's payload the baseline's bit for bit
+  except the override's records, which must differ. The report's `baseline` counts the objects that are the
+  same and names the ones that differ.
+
+```
+F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify ... --override H:/override-386 --weights-id trellis-sc30-abliterated --baseline F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer
+```
 
 ## The sidecar
 
@@ -150,7 +160,9 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/replay.py run \
   each tensor's source range and sha256). A tensor whose bytes are not its header's length, or whose
   dtype or shape is not the plan's, is refused. The abliterated BF16 is the base with that directory
   laid over it: exllamav3's tensor collection takes the later file of a key, so the base is never
-  copied.
+  copied. A harness that reads it with safetensors resolves each tensor's file through `overlay.py`
+  (`Reference(base, overlay).files`), which refuses an overlay tensor the base does not have, or has
+  with another dtype or shape, and one whose bytes are not `fetch.json`'s sha256.
 - **`run`** (GPU, exllamav3 1.5.3; `make gpu-status` first) replays `convert_model.py` for those
   matrices: the quant's `cal_trace.safetensors` rows (250 x 2,048); the state through the token
   embedding and layers 0..L-1 as quantized (the quant's records, the re-quantized ones in their

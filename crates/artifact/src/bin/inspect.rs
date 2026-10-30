@@ -5,7 +5,7 @@
 //!   ignis-artifact-inspect <artifact.ninfer>
 //!   ignis-artifact-inspect <artifact.ninfer> --find NAME
 //!
-//! Prints the identity, file geometry, object counts, the tensor format
+//! Prints the identity, the content hash, file geometry, object counts, the tensor format
 //! histogram, and every resource entry. With `--find NAME`, also prints the
 //! full descriptor of one object (for binder planning, ticket 03).
 
@@ -51,6 +51,10 @@ fn main() {
     }
 
     println!("identity: {}/{}", identity.model_id, identity.weights_id);
+    // The digest retained state names this artifact by (ADR 0029): a
+    // variant's own weights id gives it its own (GitHub #422).
+    let hash: String = reader.content_hash().iter().map(|b| format!("{b:02x}")).collect();
+    println!("content hash: {hash}");
     println!(
         "file: {} bytes, payload_offset {}",
         reader.file_bytes(),

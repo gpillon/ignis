@@ -35,7 +35,7 @@ def _never(*args, **kw):
     raise AssertionError("the GPU step ran before a refusal that needs none")
 
 
-def pack(work, artifact, as_resource=()):
+def pack(work, artifact, as_resource=(), identity=convert.IDENTITY):
     """What the packer does with a work tree, for `verify`'s tests: the units in order, frontend
     files by DONE's (sorted) names, tensors in tensors.json order; the tensors named in
     `as_resource` written as resources instead (a broken artifact)."""
@@ -55,7 +55,7 @@ def pack(work, artifact, as_resource=()):
                 desc = {k: t[k] for k in ("name", "format", "layout", "shape")} | {"kind": "tensor"}
             with open(os.path.join(d, t["file"]), "rb") as f:
                 objects.append((desc, f.read()))
-    write_container(artifact, convert.IDENTITY, objects)
+    write_container(artifact, identity, objects)
 
 
 def test_run_writes_a_work_tree_the_packer_takes(tmp_path):
@@ -488,3 +488,88 @@ def test_an_override_given_by_halves_is_refused():
     a = argparse.Namespace(override=None, override_bf16="x")
     with pytest.raises(convert.Refused, match="--override takes --override too"):
         convert.override_of(a)
+
+
+# --- the variant against the artifact it varies (#422) ---
+
+VARIANT = "trellis-sc30-abliterated"
+
+
+def _pair(tmp_path):
+    """The default artifact and the variant packed with the override and its own weights id."""
+    src = make_sources(str(tmp_path))
+    ov = make_override(str(tmp_path), src)
+    base, variant = str(tmp_path / "base.ninfer"), str(tmp_path / "variant.ninfer")
+    _run(src, str(tmp_path / "base"))
+    pack(str(tmp_path / "base"), base)
+    _run(src, str(tmp_path / "variant"), override=_override(ov), errors_fn=_ov_errors, weights_id=VARIANT)
+    pack(str(tmp_path / "variant"), variant, identity=convert.identity_of(VARIANT))
+    return src, ov, base, variant
+
+
+def _verify_variant(src, ov, variant, baseline):
+    return convert.verify(variant, src["served"], src["quant"], log=lambda _: None, override=_override(ov),
+                          weights_id=VARIANT, baseline=baseline)
+
+
+def test_verify_against_the_baseline_finds_only_the_overrides_records_differ(tmp_path):
+    src, ov, base, variant = _pair(tmp_path)
+    ok, report = _verify_variant(src, ov, variant, base)
+    assert ok, report["problems"]
+    b = report["baseline"]
+    assert b["artifact"] == "base.ninfer" and b["identity"] == convert.IDENTITY
+    assert b["differ"] == OV_NAMES
+    assert b["same"] == len(container.Container(variant).objects) - len(OV_NAMES)
+
+
+def _flip(path, name):
+    offset, _ = container.Container(path).span(name)
+    with open(path, "r+b") as f:
+        f.seek(offset + 3)
+        b = f.read(1)
+        f.seek(offset + 3)
+        f.write(bytes([b[0] ^ 0x40]))
+
+
+def test_verify_names_a_record_outside_the_override_that_is_not_the_baselines(tmp_path):
+    src, ov, base, variant = _pair(tmp_path)
+    _flip(base, "vision/patch_embedding")
+    ok, report = _verify_variant(src, ov, variant, base)
+    assert not ok
+    assert report["problems"] == ["vision/patch_embedding: not the baseline's, bit for bit"]
+
+
+def test_verify_names_an_override_record_the_baseline_already_holds(tmp_path):
+    src, ov, _, variant = _pair(tmp_path)
+    # a baseline packed from the variant's own work tree under the default identity
+    same = str(tmp_path / "same.ninfer")
+    work = str(tmp_path / "variant-again")
+    _run(src, work, override=_override(ov), errors_fn=_ov_errors, weights_id=VARIANT)
+    pack(work, same)
+    ok, report = _verify_variant(src, ov, variant, same)
+    assert not ok
+    assert report["problems"] == [f"{n}: the override's record is the baseline's, bit for bit" for n in OV_NAMES]
+
+
+def test_verify_refuses_a_baseline_with_the_artifacts_identity_or_another_directory(tmp_path):
+    src, ov, base, variant = _pair(tmp_path)
+    ok, report = _verify_variant(src, ov, variant, variant)
+    assert not ok
+    assert report["problems"][0] == ("the baseline's identity is the artifact's, qwen3.8-27b/trellis-sc30-abliterated: "
+                                     "the two would share a content hash")
+    # the default work tree packed with one tensor written as a resource: another directory
+    other = str(tmp_path / "other.ninfer")
+    _run(src, str(tmp_path / "base-again"))
+    pack(str(tmp_path / "base-again"), other, as_resource={"text/layers/0/mlp/down"})
+    ok, report = _verify_variant(src, ov, variant, other)
+    assert not ok
+    assert report["problems"][0].startswith("text/layers/0/mlp/down: the baseline's descriptor is ")
+
+
+def test_the_verify_command_takes_a_baseline(tmp_path):
+    src, ov, base, variant = _pair(tmp_path)
+    out = str(tmp_path / "report.json")
+    code = convert.main(["verify", "--artifact", variant, "--served", src["served"], "--quant", src["quant"],
+                         "--override", ov["override"], "--weights-id", VARIANT, "--baseline", base, "--report", out])
+    assert code == 0
+    assert _json(out)["baseline"]["differ"] == OV_NAMES
