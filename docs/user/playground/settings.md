@@ -81,27 +81,22 @@ browser allows five, so the rest wait. The Decide tab uses HTTP either way.
 
 ### Keeping the sessions
 
-The sessions live in this browser's storage, which a browser treats as
-best-effort: when the disk runs short it may delete an origin's data whole.
-This section reads the state each time Settings shows and says one of three
-things: **Kept** (the browser will not delete the sessions on its own),
-**Best-effort** (it may, when the disk runs short), or that this browser has no
-Storage API, which leaves nothing to ask.
+Whether this browser keeps the sessions, and a way to ask it to; why a browser
+may not is in [sessions](sessions.md#asking-the-browser-to-keep-it). The
+section reads the state when the page loads, once the request the Playground
+makes at start has its answer, again on a switch back to General, and after
+each click. It says **Kept** (the browser will not delete the sessions on its
+own), **Best-effort** (it may, when the disk runs short), or that this browser
+has no Storage API, which leaves nothing to ask.
 
 When the storage is best-effort, **Ask the browser to keep them** asks on your
-click. Firefox puts the question to you. A Chromium-based browser answers by
-itself, and refuses a site it does not count as important. The section then
-says it was refused and, while the notifications permission can still be asked
-for, offers **Allow notifications, then ask again**: a Chromium-based browser
-counts that permission as one sign that a site matters. The Playground sends no
-notifications; the permission is only that sign. That click asks the browser
+click. If the browser refuses while the notifications permission is still
+undecided, **Allow notifications, then ask again** takes its place: it asks you
 for the permission, then asks again to keep the storage, and the section says
-what came of it. If the browser still refuses, installing the page as an app
-(the browser's install option) is the other way. The button is not offered when
-the browser has no Notification API or the permission is already allowed or
-blocked, and the section says so. Nothing here is asked until you click, apart
-from the one request the Playground makes at start
-([sessions](sessions.md#asking-the-browser-to-keep-it)).
+what came of it. Closing that question without an answer leaves the button
+there. When notifications are already allowed, blocked or missing, the section
+says so, points to installing the page as an app, and keeps the first button to
+ask again. Nothing here is asked until you click.
 
 ## Tools
 

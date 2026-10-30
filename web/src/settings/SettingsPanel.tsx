@@ -14,6 +14,7 @@ import {
   type Persistence,
   readKeeping,
   type StorageManagerLike,
+  startSettled,
   type ViaNotifications,
 } from "../store/persist.ts";
 import { actionInk, actionShape, caption, field } from "../ui/classes.ts";
@@ -413,31 +414,38 @@ export type KeepView = {
   busy: boolean;
 };
 
-/** The sentence under the status line: what the last click came of, or why a step is not offered. */
-export function keepNote({ asked, via, step }: KeepView): string | null {
+const INSTALL = "Installing the page as an app (the browser's install option) is the other way.";
+const FAILED = "The browser's answer failed. Try again.";
+
+/** The sentence under the status line: what the last click came of, or why the notifications step is not offered. */
+function keepNote({ asked, via, step }: KeepView): string | null {
   if (via) {
-    if (via.persistence === "granted") return "Kept. The browser took the storage once notifications were allowed.";
-    if (via.persistence === "failed" || via.permission === "failed") return "The browser's answer failed. Try again.";
-    return via.permission === "granted"
-      ? "Still refused, with notifications allowed. Installing the page as an app is the other way: use the browser's install option."
-      : "Still refused, and notifications were not allowed. Installing the page as an app is the other way: use the browser's install option.";
+    if (via.persistence === "granted" || via.persistence === "persistent") return "Granted once notifications were allowed.";
+    if (via.persistence === "failed" || via.permission === "failed") return FAILED;
+    if (via.permission === "default") return "The notifications question was closed without an answer: ask again.";
+    if (via.permission === "granted") return `Still refused, with notifications allowed. ${INSTALL}`;
+    if (via.permission === "unsupported") return `Still refused. This browser has no Notification API. ${INSTALL}`;
+    return `Still refused, and notifications are blocked for this site. ${INSTALL}`;
   }
-  if (asked === "granted") return "Kept. The browser will not delete the sessions on its own.";
-  if (asked === "failed") return "The browser's answer failed. Try again.";
-  if (asked === "refused" && step === "denied")
-    return "Refused. Notifications are blocked for this site, so that step is not offered; installing the page as an app is the other way.";
-  if (asked === "refused" && step === "granted")
-    return "Refused, though notifications are allowed. Installing the page as an app is the other way.";
-  if (asked === "refused" && step === "unsupported")
-    return "Refused. This browser has no Notification API; installing the page as an app is the other way.";
+  if (asked === "failed") return FAILED;
+  if (asked !== "refused") return null;
+  if (step === "denied") return `Refused. Notifications are blocked for this site, so that step is not offered. ${INSTALL}`;
+  if (step === "granted") return `Refused, though notifications are allowed. ${INSTALL}`;
+  if (step === "unsupported") return `Refused. This browser has no Notification API. ${INSTALL}`;
   return null;
 }
 
-/** The sessions section of General, drawn from `view`; the buttons are the user's click, which both asks need. */
+/**
+ * The sessions section of General, drawn from `view`; the buttons are the user's click, which both asks need. After
+ * a refusal the notifications step takes the first button's place while the permission is undecided; otherwise the
+ * first button stays, to ask again.
+ */
 export function KeepSessions({ view, onAsk, onNotify }: { view: KeepView; onAsk: () => void; onNotify: () => void }) {
   const { keeping, asked, via, step, busy } = view;
   const note = keepNote(view);
-  const refused = keeping === "best-effort" && (asked === "refused" || via !== null);
+  const refused = via ? via.persistence === "refused" : asked === "refused";
+  const offerNotify = keeping === "best-effort" && refused && step === "available";
+  const offerAsk = keeping === "best-effort" && !offerNotify;
   const buttonClass = `${actionShape} ${actionInk} self-start px-3 py-1.5 [--cut-size:6px]`;
   return (
     <div className="flex flex-col gap-2">
@@ -459,12 +467,12 @@ export function KeepSessions({ view, onAsk, onNotify }: { view: KeepView; onAsk:
         </span>
       )}
       {note && <span className="text-xs leading-snug text-ash">{note}</span>}
-      {keeping === "best-effort" && !refused && (
+      {offerAsk && (
         <button type="button" disabled={busy} onClick={onAsk} className={buttonClass}>
           Ask the browser to keep them
         </button>
       )}
-      {refused && via === null && step === "available" && (
+      {offerNotify && (
         <>
           <span className="text-xs leading-snug text-ash">
             A Chromium-based browser keeps the storage only of sites it counts as important, and allowing
@@ -479,22 +487,23 @@ export function KeepSessions({ view, onAsk, onNotify }: { view: KeepView; onAsk:
   );
 }
 
-/** The sessions section: reads the state when it shows, asks on the clicks and says what came of each. */
-export function KeepSessionsSetting({
-  storage = typeof navigator === "undefined" ? undefined : (navigator.storage as StorageManagerLike | undefined),
-  notifications = typeof Notification === "undefined" ? undefined : (Notification as NotificationsLike),
-}: {
-  storage?: StorageManagerLike;
-  notifications?: NotificationsLike;
-} = {}) {
+/**
+ * The sessions section: reads the state once the page's ask at start has its answer (the panel stays mounted, so
+ * that is at load and on a switch back to General), asks on the clicks and reads it again after each.
+ */
+function KeepSessionsSetting() {
+  // Read outside a browser too: the panel's tests render it in Node, where neither exists.
+  const storage = typeof navigator === "undefined" ? undefined : (navigator.storage as StorageManagerLike | undefined);
+  const notifications = typeof Notification === "undefined" ? undefined : (Notification as NotificationsLike);
   const [keeping, setKeeping] = useState<Keeping | null>(null);
   const [asked, setAsked] = useState<Persistence | null>(null);
   const [via, setVia] = useState<ViaNotifications | null>(null);
-  const [step, setStep] = useState<NotificationsStep>(() => notificationsStep(notifications));
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     let live = true;
-    void readKeeping(storage).then((k) => live && setKeeping(k));
+    void startSettled()
+      .then(() => readKeeping(storage))
+      .then((k) => live && setKeeping(k));
     return () => {
       live = false;
     };
@@ -502,14 +511,17 @@ export function KeepSessionsSetting({
   const settle = async (run: () => Promise<void>) => {
     setBusy(true);
     await run();
-    setStep(notificationsStep(notifications));
     setKeeping(await readKeeping(storage));
     setBusy(false);
   };
+  const ask = async () => {
+    setVia(null);
+    setAsked(await askForPersistence(storage));
+  };
   return (
     <KeepSessions
-      view={{ keeping, asked, via, step, busy }}
-      onAsk={() => void settle(async () => setAsked(await askForPersistence(storage)))}
+      view={{ keeping, asked, via, step: notificationsStep(notifications), busy }}
+      onAsk={() => void settle(ask)}
       onNotify={() => void settle(async () => setVia(await askViaNotifications(storage, notifications)))}
     />
   );

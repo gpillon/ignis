@@ -219,8 +219,9 @@ describe("SettingsPanel: the transport", () => {
 });
 
 // The sessions section says whether the browser keeps them and offers the two
-// clicks, the second only after a refusal and only while notifications can
-// still be asked for.
+// clicks: the second in the first's place after a refusal, while notifications
+// can still be asked for; otherwise the first stays, to ask again. A click
+// always has a button to try again with.
 
 const keepView = (over: Partial<KeepView>): string =>
   renderToStaticMarkup(
@@ -258,26 +259,50 @@ describe("KeepSessions", () => {
     expect(html).not.toContain("Ask the browser to keep them");
   });
 
-  it("hides the notifications step when denied, granted or missing, and says why", () => {
+  it("keeps the first ask, not the notifications step, when notifications are denied, granted or missing, and says why", () => {
     for (const step of ["denied", "granted", "unsupported"] as const) {
       const html = keepView({ asked: "refused", step });
-      expect(html).not.toContain("<button");
+      expect(html).not.toContain("Allow notifications");
+      expect(html).toContain("Ask the browser to keep them");
       expect(html.toLowerCase()).toContain("installing the page as an app");
     }
     expect(keepView({ asked: "refused", step: "denied" })).toContain("blocked");
   });
 
   it("points to installing the app when notifications did not help, and says when they did", () => {
-    expect(keepView({ asked: "refused", via: { permission: "granted", persistence: "refused" } })).toContain("Installing the page as an app");
-    expect(keepView({ asked: "refused", via: { permission: "denied", persistence: "refused" } })).not.toContain("<button");
-    expect(keepView({ keeping: "kept", asked: "refused", via: { permission: "granted", persistence: "granted" } })).toContain(
-      "once notifications were allowed",
-    );
+    const refused = keepView({ asked: "refused", step: "granted", via: { permission: "granted", persistence: "refused" } });
+    expect(refused).toContain("Installing the page as an app");
+    expect(refused).toContain("Ask the browser to keep them");
+    expect(keepView({ asked: "refused", step: "denied", via: { permission: "denied", persistence: "refused" } })).toContain("blocked");
+    const kept = keepView({ keeping: "kept", asked: "refused", via: { permission: "granted", persistence: "granted" } });
+    expect(kept).toContain("once notifications were allowed");
+    expect(kept).not.toContain("<button");
   });
 
-  it("says what a first grant or a failed call came of", () => {
-    expect(keepView({ keeping: "kept", asked: "granted" })).toContain("Kept. The browser will not delete");
-    expect(keepView({ asked: "failed" })).toContain("failed");
+  it("offers the notifications step again when its question was closed without an answer", () => {
+    const html = keepView({ asked: "refused", via: { permission: "default", persistence: "refused" } });
+    expect(html).toContain("closed without an answer");
+    expect(html).toContain("Allow notifications, then ask again");
+  });
+
+  it("leaves a button to try again after a failed call", () => {
+    for (const via of [
+      { permission: "failed", persistence: "refused" },
+      { permission: "granted", persistence: "failed" },
+    ] as const) {
+      const html = keepView({ asked: "refused", step: via.permission === "failed" ? "available" : "granted", via });
+      expect(html).toContain("Try again");
+      expect(html).toContain("<button");
+    }
+    const first = keepView({ asked: "failed" });
+    expect(first).toContain("Try again");
+    expect(first).toContain("Ask the browser to keep them");
+  });
+
+  it("says kept once after a first grant", () => {
+    const html = keepView({ keeping: "kept", asked: "granted" });
+    expect(html.match(/Kept/g)).toHaveLength(1);
+    expect(html).not.toContain("<button");
   });
 
   it("sits in the General tab", () => {
