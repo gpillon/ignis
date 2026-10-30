@@ -578,12 +578,13 @@ mod tests {
         }
     }
 
-    const ALL_IDS: [&str; 9] = [
+    const ALL_IDS: [&str; 10] = [
         "qwen3.8-27b",
         "qwen3.8-27b-abliterated",
         "qwen3.8-flash-next",
         "ignis-image-2.1-turbo",
         "qwen3.8-27b-16g",
+        "qwen3.8-27b-abliterated-16g",
         "qwen3-asr-1.7b",
         "qwen3-asr-1.7b-q8",
         "qwen3-asr-0.6b",
@@ -697,7 +698,7 @@ mod tests {
         let files = MemFiles::with(&[("conf/ignis.config.yaml", "download:\n  catalog: acme.yaml\n  path: /srv/models\n"), ("conf/acme.yaml", catalog)]);
         match run(&["model", "list", "--config", "conf/ignis.config.yaml", "--format", "json"], &[], &files).unwrap() {
             ConfigOutcome::Model(ModelCommand::List { catalog, dir, format }) => {
-                assert_eq!(catalog.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-ft"]);
+                assert_eq!(catalog.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-ft"]);
                 assert_eq!((dir, format), (PathBuf::from("/srv/models"), ListFormat::Json));
             }
             other => panic!("{other:?}"),

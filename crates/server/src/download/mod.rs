@@ -472,9 +472,10 @@ mod tests {
         }
     }
 
-    /// ADR 0074, `main`'s start path end to end with the 16 GB fixture
-    /// catalog: `--model-id qwen3.8-27b-abliterated` on a 16 GB card starts
-    /// the abliterated 16 GB build, which answers to it, under its own id —
+    /// ADR 0074, `main`'s start path end to end with the built-in catalog
+    /// (GitHub #423): `--model-id qwen3.8-27b-abliterated` on a 16 GB card
+    /// starts the abliterated 16 GB build, which answers to it, under its own
+    /// id —
     /// its artifact and id over the start options — when its artifact's
     /// header names the 27B's family, the one both entries state; one of
     /// another family refuses the start before it loads, naming both. On a
@@ -483,7 +484,7 @@ mod tests {
     #[test]
     fn a_start_naming_the_uncensored_variant_on_a_16gb_card_serves_its_16gb_build() {
         use crate::config::profile::CardClass;
-        let catalog = catalog::testing::sixteen_over_thirty_two(catalog::testing::SIXTEEN).expect("the fixture catalog");
+        let catalog = catalog::testing::built_in();
         let dir = PathBuf::from(DIR);
         let options = start_config_with(&["--model-id", "qwen3.8-27b-abliterated"], 16 << 30);
         assert_eq!((options.model.as_str(), options.card_class()), ("qwen3.8-27b-abliterated", Some(CardClass::Gb16)));
@@ -492,7 +493,7 @@ mod tests {
         let mut settings = settings(&served, &dir);
         settings.catalog = &catalog;
         let ArtifactSource::Use(path) = artifact_source(&settings, |_| true, never_asked) else { panic!("on disk") };
-        assert_eq!(path, dir.join("q16-abliterated.ninfer"));
+        assert_eq!(path, dir.join("qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer"));
         let card = options.card_class();
         let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
         assert_eq!((serving.model.as_str(), serving.artifact.as_deref()), ("qwen3.8-27b-abliterated-16g", Some(path.as_path())));

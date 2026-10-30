@@ -559,7 +559,7 @@ mod tests {
             path.ends_with(&entry.artifact).then_some(ModelFamily::Qwen38_27b)
         };
         let rows = list_rows(&catalog, Path::new("m"), &sizes(&on), &family_of);
-        assert_eq!(rows.len(), 10);
+        assert_eq!(rows.len(), 11);
         assert_eq!(
             rows.iter().map(|row| (row.entry.id.as_str(), row.on_disk, row.family)).collect::<Vec<_>>(),
             [
@@ -568,6 +568,7 @@ mod tests {
                 ("qwen3.8-flash-next", OnDisk::Absent, None),
                 ("ignis-image-2.1-turbo", OnDisk::Absent, None),
                 ("qwen3.8-27b-16g", OnDisk::Absent, None),
+                ("qwen3.8-27b-abliterated-16g", OnDisk::Absent, None),
                 ("qwen3-asr-1.7b", OnDisk::Absent, None),
                 ("qwen3-asr-1.7b-q8", OnDisk::Absent, None),
                 ("qwen3-asr-0.6b", OnDisk::Absent, None),
@@ -580,15 +581,16 @@ mod tests {
 
         let text = render_list(&rows, ListFormat::Text);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 11, "{text}");
+        assert_eq!(lines.len(), 12, "{text}");
         assert!(lines[0].starts_with("ID") && lines[0].contains("REPO@REVISION") && lines[0].contains("FAMILY"), "{text}");
         assert!(lines[1].contains("built-in") && lines[1].contains("gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer@e961b419b672e183aa55df8c4b975abc82006e8a"), "{text}");
         assert!(lines[1].contains("18.1 GiB") && lines[1].contains("complete") && lines[1].ends_with("Qwen3.8-27B"), "{text}");
         assert!(lines[3].contains("67.8 GiB") && lines[3].contains("absent") && lines[3].ends_with('—'), "{text}");
         assert!(lines[5].contains("built-in") && lines[5].contains("gpillon/Qwen3.8-27B-trellis-3bpw-ignis@f5bbd2cc") && lines[5].contains("12.5 GiB"), "{text}");
-        assert!(lines[9].contains("gpillon/Nemotron-3-Diarization-GGUF-ignis@d46d59d0") && lines[9].contains("absent"), "{text}");
-        assert!(lines[10].contains("operator") && lines[10].contains("acme/ft@v1") && lines[10].contains("partial"), "{text}");
-        assert!(lines[6].contains("gpillon/Qwen3-ASR-1.7B-GGUF-ignis@f8a5263e") && lines[6].contains("1.5 GiB") && lines[6].contains("absent"), "{text}");
+        assert!(lines[6].contains("built-in") && lines[6].contains("gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis@94a8bfc0") && lines[6].contains("12.5 GiB"), "{text}");
+        assert!(lines[10].contains("gpillon/Nemotron-3-Diarization-GGUF-ignis@d46d59d0") && lines[10].contains("absent"), "{text}");
+        assert!(lines[11].contains("operator") && lines[11].contains("acme/ft@v1") && lines[11].contains("partial"), "{text}");
+        assert!(lines[7].contains("gpillon/Qwen3-ASR-1.7B-GGUF-ignis@f8a5263e") && lines[7].contains("1.5 GiB") && lines[7].contains("absent"), "{text}");
 
         let json: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json)).unwrap();
         assert_eq!(json[0]["id"], "qwen3.8-27b");
@@ -597,8 +599,8 @@ mod tests {
         assert_eq!(json[0]["bytes"], entry.total_bytes());
         assert_eq!(json[0]["on_disk"], "complete");
         assert_eq!(json[0]["family"], "Qwen3.8-27B");
-        assert_eq!(json[9]["layer"], "operator");
-        assert_eq!(json[9]["family"], Value::Null);
+        assert_eq!(json[10]["layer"], "operator");
+        assert_eq!(json[10]["family"], Value::Null);
     }
 
     fn fetched(catalog: &Catalog, ids: &[&str], all: bool, card: Option<CardClass>) -> Result<Vec<String>, String> {
@@ -617,17 +619,17 @@ mod tests {
         assert_eq!(fetched(&catalog, &["QWEN3.8-27B", "qwen3.8-27b-16g"], false, sixteen), Ok(vec!["qwen3.8-27b-16g".to_owned()]));
         for card in [Some(CardClass::Gb32), None] {
             assert_eq!(fetched(&catalog, &["qwen3.8-27b"], false, card), Ok(vec!["qwen3.8-27b".to_owned()]), "{card:?}: nothing changes");
-            assert_eq!(fetched(&catalog, &[], true, card).unwrap().len(), 9, "{card:?}");
+            assert_eq!(fetched(&catalog, &[], true, card).unwrap().len(), 10, "{card:?}");
         }
     }
 
     /// ADR 0074: an alias that is another entry's id resolves for a download
     /// as for a request — `model download qwen3.8-27b-abliterated` on a 16 GB
-    /// card fetches the 16 GB fixture catalog's abliterated build, and on a
-    /// larger card the id's own entry.
+    /// card fetches the built-in abliterated 16 GB build (GitHub #423), and
+    /// on a larger card the id's own entry.
     #[test]
     fn a_download_of_the_uncensored_variant_fetches_its_16gb_build_on_a_16gb_card() {
-        let catalog = super::super::catalog::testing::sixteen_over_thirty_two(super::super::catalog::testing::SIXTEEN).expect("the fixture catalog");
+        let catalog = super::super::catalog::testing::built_in();
         let abliterated = ["qwen3.8-27b-abliterated"];
         assert_eq!(fetched(&catalog, &abliterated, false, Some(CardClass::Gb16)), Ok(vec!["qwen3.8-27b-abliterated-16g".to_owned()]));
         for card in [Some(CardClass::Gb32), Some(CardClass::Gb96), None] {
@@ -649,9 +651,10 @@ mod tests {
             assert!(err.contains(said), "{said}: {err}");
         }
         // `--all` names every entry, each through the same resolve step: the
-        // 27B's own resolves to the 16 GB entry, the others are refused.
+        // 27B's own and the uncensored variant's resolve to their 16 GB
+        // entries, the others are refused.
         let err = fetched(&catalog, &[], true, sixteen).unwrap_err();
-        assert!(err.contains("qwen3.8-27b-abliterated") && err.contains("qwen3.8-flash-next") && !err.contains("qwen3.8-27b needs"), "{err}");
+        assert!(err.contains("qwen3.8-flash-next needs") && !err.contains("qwen3.8-27b needs") && !err.contains("qwen3.8-27b-abliterated needs"), "{err}");
         let err = fetched(&super::super::catalog::testing::thirty_two(), &[], false, sixteen).unwrap_err();
         assert!(err.contains("qwen3.8-27b needs a 32 GB card"), "{err}");
         assert!(fetched(&catalog, &["acme-nothing"], false, sixteen).unwrap_err().contains("not in the catalog"));

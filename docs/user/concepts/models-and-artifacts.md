@@ -136,13 +136,15 @@ reports. It tells artifacts of one family apart: `qwen3.8-27b` and
 operator's `--model-id`, or the family's default when none is named.
 
 The **catalog** is the set of models the server knows how to fetch
-([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Five entries
-are built into the binary, each pinned file by file at a fixed revision of its
-Hugging Face repository: `qwen3.8-27b`, `qwen3.8-27b-16g`,
-`qwen3.8-27b-abliterated`, `qwen3.8-flash-next` and `ignis-image-2.1-turbo`.
-Each states the smallest **card class** it loads on: 32 GB for all but
-`qwen3.8-27b-16g`, which loads on 16 GB and answers to `qwen3.8-27b` there
-([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md))
+([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Six text and
+image models are built into the binary, each pinned file by file at a fixed
+revision of its Hugging Face repository: `qwen3.8-27b`, `qwen3.8-27b-16g`,
+`qwen3.8-27b-abliterated`, `qwen3.8-27b-abliterated-16g`, `qwen3.8-flash-next`
+and `ignis-image-2.1-turbo`. Each states the smallest **card class** it loads
+on: 32 GB for all but the two `-16g` entries, which load on 16 GB and answer
+there to `qwen3.8-27b` and to `qwen3.8-27b-abliterated`
+([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),
+[ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md))
 ([the catalog](../guides/models.md#the-catalog)). An operator can add entries
 with a catalog file of the same format, but cannot re-pin a built-in id; a
 variant of a built-in model is a new id
@@ -158,8 +160,10 @@ or **Download** on the Playground's [Server view](../playground/server.md#downlo
 
 `qwen3.8-27b-abliterated` is the 27B with a published abliteration applied. It
 is the same container: 1,255 of its 1,325 objects are byte-identical to the
-default image, and only the 70 matrices the abliteration changed are
-re-encoded. Memory use is therefore the same as the default 27B. It does not
+default artifact, and only the 70 matrices the abliteration changed are
+re-encoded. Memory use is therefore the same as the default 27B. On a 16 GB
+card it is served by `qwen3.8-27b-abliterated-16g`, the 16 GB artifact with the
+same 70 matrices re-quantized. It does not
 refuse requests, so guardrails belong in the layer that executes tools. The
 DFlash2 drafter loads unchanged; it was fitted to the default weights, and
 because the target verifies every draft, a mismatch can only lower the
