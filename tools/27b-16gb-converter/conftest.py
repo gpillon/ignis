@@ -198,3 +198,48 @@ def download_records(root, names, lfs, revision):
         etag = digest if name in lfs else "0" * 40
         with open(os.path.join(meta, name + ".metadata"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"{revision}\n{etag}\n1792534371.28\n")
+
+
+OVERRIDE_REVISION = "fedcba9876543210fedcba9876543210fedcba98"
+OVERRIDE_BF16_REVISION = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+PREFIX = "model.language_model.layers."
+
+
+def make_override(root, src, seed=420, records=None):
+    """An override directory under `root` for the sources `src`, and the BF16 it was made from.
+    `records`: key -> (rows, columns, k2) for each matrix it holds, default two body matrices with
+    the quant's own K and shape (a different one makes a record the swap must refuse). Returns
+    {"override": dir, "bf16": dir, "keys": [...]}; its bytes differ from the quant's."""
+    rng = random.Random(seed)
+    if records is None:
+        quant = exl3.Quant(src["quant"])
+        records = {}
+        for key in (PREFIX + "2.mlp.gate_proj", PREFIX + "3.self_attn.v_proj"):
+            m = quant.matrix(key)
+            records[key] = (m.rows, m.columns, m.k2)
+    tensors = {}
+    for key, (rows, columns, k2) in records.items():
+        tensors[f"{key}.trellis"] = ("I16", [columns // 16, rows // 16, k2 * 8], _bytes(rng, rows * columns // 16 * k2))
+        tensors[f"{key}.suh"] = ("F16", [columns], _bytes(rng, 2 * columns))
+        tensors[f"{key}.svh"] = ("F16", [rows], _bytes(rng, 2 * rows))
+        tensors[f"{key}.mul1"] = ("I32", [], struct.pack("<I", exl3.MUL1))
+    ov = os.path.join(root, "override")
+    os.makedirs(os.path.join(ov, ".cache", "huggingface", "download"))
+    shard = "model-00001-of-00001.safetensors"
+    write_safetensors(os.path.join(ov, shard), tensors)
+    files = {"model.safetensors.index.json": {"metadata": {}, "weight_map": {n: shard for n in tensors}},
+             "quantization_config.json": {"quant_method": "exl3", "bits": 3.0, "head_bits": 4,
+                                          "out_scales": "always", "codebook": "mul1"}}
+    for name, value in files.items():
+        with open(os.path.join(ov, name), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(value, f)
+    download_records(ov, [shard] + list(files), {shard}, OVERRIDE_REVISION)
+
+    bf16 = os.path.join(root, "override-bf16")
+    os.makedirs(os.path.join(bf16, ".cache", "huggingface", "download"))
+    write_safetensors(os.path.join(bf16, shard), {f"{k}.weight": ("BF16", [r, c], _bytes(rng, 2 * r * c))
+                                                  for k, (r, c, _) in records.items()})
+    with open(os.path.join(bf16, "model.safetensors.index.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"weight_map": {f"{k}.weight": shard for k in records}}, f)
+    download_records(bf16, [shard, "model.safetensors.index.json"], {shard}, OVERRIDE_BF16_REVISION)
+    return {"override": ov, "bf16": bf16, "keys": sorted(records)}
