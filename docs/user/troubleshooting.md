@@ -253,7 +253,11 @@ margin; each costs something
 [for the 27B](configuration/host-ram.md#host-ram-for-the-27b)).
 
 When it names `crossing_line: load_staging`, no flag shrinks those layer
-buffers: close other applications.
+buffers: close other applications. When it names `crossing_line:
+vision_tower`, the 27B's vision tower does not fit in pinned RAM under
+`--vision-residency host`: start with `--vision-residency device` to keep it in
+VRAM, or without vision
+([Where the vision tower lives](configuration/vision.md#where-the-vision-tower-lives)).
 
 ### `--spec-backend mtp` refuses the start
 

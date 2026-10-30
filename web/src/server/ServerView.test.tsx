@@ -367,6 +367,15 @@ describe("ServerView: the configuration in each scope", () => {
     expect(rowOf(html, "server.request_timeout")).not.toContain("Same for every model");
   });
 
+  it("shows the vision residency beside the other vision settings, a choice of host and device read at the next load", () => {
+    const html = renderForm("qwen38");
+    const group = html.slice(html.indexOf('id="server-group-vision"'), html.indexOf('id="server-group-media"'));
+    const residency = rowOf(group, "vision.residency");
+    expect(residency).toMatch(/type="radio"[^>]*name="vision\.residency"\/><span[^>]*>host</);
+    expect(residency).toMatch(/type="radio"[^>]*name="vision\.residency" checked=""\/><span[^>]*>device</);
+    expect(residency).toContain("A change to this field reloads the model");
+  });
+
   it("in All models lists a family-only field under its family's name, editable", () => {
     const html = renderForm(null);
     const vision = rowOf(html, "vision.enabled");

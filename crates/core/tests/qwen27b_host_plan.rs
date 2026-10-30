@@ -17,6 +17,7 @@ fn qwen27b(available: u64) -> HostPlanRequest {
         available_physical_bytes: available,
         scope: "qwen38",
         token_embedding_bytes: TABLE_BYTES,
+        vision_tower_bytes: 0,
         expert_pool_bytes: 0,
         load_staging_bytes: 0,
         ngram_hot_rows_bytes: 0,
@@ -86,4 +87,51 @@ fn a_27b_plan_short_of_its_reuse_lines_names_the_27bs_reuse_flags() {
         message.contains("The token embedding fits, KV-disk's staging buffers do not: --qwen38-kv-disk-bytes 0 drops them"),
         "{message}"
     );
+}
+
+/// ADR 0075 (GitHub #414): the vision tower under the `host` residency, as the
+/// binder lays it out in the mapped allocation: 333 spans, each 4 KiB aligned
+/// at both ends (the prototype's +297,000,960 bytes on its host line, #409).
+const TOWER_SPAN_BYTES: u64 = 297_000_960;
+
+#[test]
+fn the_host_residencys_vision_tower_is_a_line_of_its_own_beside_the_token_embedding() {
+    let request = HostPlanRequest { vision_tower_bytes: TOWER_SPAN_BYTES, ..qwen27b(64 * GIB) };
+    let plan = plan_host(&request).expect("fits");
+    assert_eq!(plan.entries()[0], ("token_embedding", TABLE_BYTES), "not charged to the table's line");
+    assert_eq!(plan.entries()[1], ("vision_tower", TOWER_SPAN_BYTES));
+    assert_eq!(plan.total_bytes, TABLE_BYTES + TOWER_SPAN_BYTES + 10 * GIB);
+    // A load whose tower is on the device, or that has none, plans no such bytes.
+    assert_eq!(plan_host(&qwen27b(64 * GIB)).unwrap().entries()[1], ("vision_tower", 0));
+}
+
+#[test]
+fn a_host_that_cannot_pin_the_vision_tower_refuses_the_start_naming_the_bytes_and_both_ways_out() {
+    // The table and 100 MiB fit beside the margin; the 283 MiB tower does not.
+    let available = DEFAULT_HOST_MARGIN_BYTES + TABLE_BYTES + (100 << 20);
+    let request = HostPlanRequest {
+        vision_tower_bytes: TOWER_SPAN_BYTES,
+        retained_host_slots_bytes: 0,
+        kv_ram_arena_bytes: 0,
+        ..qwen27b(available)
+    };
+    let err = plan_host(&request).expect_err("below the margin");
+    assert_eq!(err.short_bytes(), TOWER_SPAN_BYTES - (100 << 20));
+    let message = err.to_string();
+    let HostPlanError::BelowMargin { crossing_line, .. } = err;
+    assert_eq!(crossing_line, "vision_tower");
+    for needle in [
+        "(183 MiB short)",
+        "The token embedding fits, the vision tower (283 MiB) does not",
+        "vision.residency: device",
+        "--vision-residency device",
+        "vision off",
+        "Plan: token embedding 1.3 GiB, vision tower 283 MiB; margin 4 GiB (--qwen38-model-host-margin-bytes).",
+    ] {
+        assert!(message.contains(needle), "{needle} missing: {message}");
+    }
+    // Short of the reuse lines instead, it names those: the tower fits.
+    let err = plan_host(&HostPlanRequest { vision_tower_bytes: TOWER_SPAN_BYTES, ..qwen27b(14 * GIB) }).expect_err("short");
+    let HostPlanError::BelowMargin { crossing_line, .. } = err;
+    assert_eq!(crossing_line, "kv_ram_arena");
 }

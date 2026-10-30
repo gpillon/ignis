@@ -2253,6 +2253,84 @@ fn help_lists_the_vision_flags() {
     assert!(text.contains("is shrunk to fit"), "{text}");
 }
 
+// ── the vision residency (GitHub #414, ADR 0075) ─────────────────────────
+
+/// Until the profiles take `host` (#416), a load that names no residency keeps
+/// today's: the tower on the device.
+#[test]
+fn the_vision_residency_defaults_to_the_device() {
+    let vision = config(&["--profile", "none", "--vision-enabled"]).vision.expect("vision on");
+    assert_eq!(vision.residency(), VisionResidency::Device);
+    let meta = schema::field("vision", "residency").expect("declared");
+    assert_eq!((meta.default)(), serde_json::json!("device"));
+}
+
+#[test]
+fn the_vision_residency_is_set_by_flag_env_and_file() {
+    let flag = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "host"]);
+    assert_eq!(flag.vision.map(|v| v.residency()), Some(VisionResidency::Host));
+    let env = env_map(&[("IGNIS_VISION_ENABLED", "true"), ("IGNIS_VISION_RESIDENCY", "host")]);
+    let from_env = expect_config(resolve(&args(&["--profile", "none"]), env).expect("resolve"));
+    assert_eq!(from_env.vision.map(|v| v.residency()), Some(VisionResidency::Host));
+    let env = env_map(&[("IGNIS_VISION_ENABLED", "true"), ("IGNIS_VISION_RESIDENCY", "host")]);
+    let flag_wins = expect_config(resolve(&args(&["--profile", "none", "--vision-residency", "device"]), env).expect("resolve"));
+    assert_eq!(flag_wins.vision.map(|v| v.residency()), Some(VisionResidency::Device), "flag must win over env");
+    let files = MemFiles::with(&[("c.yaml", "vision:\n  enabled: true\n  residency: host\n")]);
+    let from_file = with_files(&["--profile", "none", "--config", "c.yaml"], no_env, &files).unwrap();
+    assert_eq!(from_file.vision.map(|v| v.residency()), Some(VisionResidency::Host));
+    // The envelope is the residency's neighbour, set beside it.
+    let both = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "host", "--vision-max-tokens", "4096"]);
+    assert_eq!(both.vision.map(|v| (v.residency(), v.max_tokens())), Some((VisionResidency::Host, 4096)));
+}
+
+#[test]
+fn the_vision_residency_is_patched_and_takes_effect_at_the_next_load() {
+    let meta = schema::field("vision", "residency").expect("declared");
+    assert!(meta.visible && meta.patchable && meta.reload_required && !meta.scoped, "{meta:?}");
+    // A patch reaches the running 27B, whose next load it is.
+    let started = config(&["--profile", "none", "--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    let patched = started.with_patch(&patch_of(&[("vision", "residency", "host")])).unwrap();
+    assert_eq!(patched.vision.map(|v| v.residency()), Some(VisionResidency::Host));
+}
+
+#[test]
+fn a_vision_residency_without_vision_is_refused_rather_than_ignored() {
+    let err = refused(&["--profile", "none", "--vision-residency", "host"]);
+    assert!(err.contains("--vision-residency host") && err.contains("--vision-enabled"), "{err}");
+    assert!(
+        resolve(&args(&["--profile", "none"]), env_map(&[("IGNIS_VISION_RESIDENCY", "host")])).is_err(),
+        "the env form too"
+    );
+    // Naming the default is harmless, as for the envelope.
+    assert!(config(&["--profile", "none", "--vision-residency", "device"]).vision.is_none());
+}
+
+#[test]
+fn a_vision_residency_outside_its_values_is_refused_naming_them() {
+    for raw in ["cpu", "on-demand", "vram"] {
+        let err = refused(&["--profile", "none", "--vision-enabled", "--vision-residency", raw]);
+        assert!(err.contains("--vision-residency") && err.contains("host") && err.contains("device"), "{raw}: {err}");
+    }
+    let shouted = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "HOST"]);
+    assert_eq!(shouted.vision.map(|v| v.residency()), Some(VisionResidency::Host), "case-insensitive");
+}
+
+#[test]
+fn help_lists_the_vision_residency_and_both_values() {
+    let block = help_block("--vision-residency");
+    assert!(block.contains("host") && block.contains("device"), "{block}");
+}
+
+/// The residency is the 27B's, as vision is: a switch to Flash-Next drops it
+/// with the rest of the vision group.
+#[test]
+fn a_flash_next_switch_drops_the_vision_residency_with_vision() {
+    let started = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "host"]);
+    let (fitted, dropped) = fit_to_family(&started, ModelFamily::FlashNext).unwrap();
+    assert_eq!(dropped, ["--vision-enabled", "--vision-residency"]);
+    assert!(fitted.vision.is_none());
+}
+
 /// GitHub #195: the two are independent load options again.
 #[test]
 fn vision_and_dflash2_resolve_together_as_two_independent_load_options() {
@@ -2526,6 +2604,9 @@ fn every_flag_the_host_plan_refusal_names_is_a_flag_a_start_accepts() {
         let resolved = resolve(&args(&[flag, "0"]), no_env);
         assert!(resolved.is_ok(), "{flag}: {:?}", resolved.err());
     }
+    // ADR 0075: the 27B's vision tower line names the device residency as a way out.
+    let resolved = resolve(&args(&["--vision-enabled", "--vision-residency", "device"]), no_env);
+    assert!(resolved.is_ok(), "{:?}", resolved.err());
 }
 
 /// The default metrics address is never a reason not to start: an API bound

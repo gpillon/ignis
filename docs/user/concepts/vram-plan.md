@@ -34,10 +34,13 @@ The plan carves the budget into lines, in a fixed order, and prints them as the
 `ignis.runtime.vram_plan` event (`ignis.runtime.flash_next_plan` for
 Flash-Next). The lines include:
 
-- the **weights**;
+- the **weights** (the 27B's vision tower among them only under
+  `--vision-residency device`);
 - **workspaces**: the prefill scratch, sized for `--model-prefill-chunk`; with
   vision on, the image encoder's workspace shares it and the line is the larger
-  of the two;
+  of the two (under `--vision-residency host` the encoder's share includes the
+  slots its weights are copied through,
+  [Vision](../configuration/vision.md#where-the-vision-tower-lives));
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
   for the linear-attention layers);
 - the **decode and drafter graphs**' staging buffers;

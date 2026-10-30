@@ -131,3 +131,9 @@ event, and a load that fits logs `ignis.runtime.qwen27b_host_plan`. The knobs
 are Flash-Next's, under the `qwen38` scope: `--qwen38-reuse-retained-host`,
 `--qwen38-reuse-kv-host-pool-bytes`, `--qwen38-kv-disk-bytes` and
 `--qwen38-model-host-margin-bytes`.
+
+A vision load under `--vision-residency host` pins the vision tower beside the
+table, on a line of its own (`vision_tower`, 297 MB with its page padding;
+`vision_tower_bytes` in both events). A start that cannot hold it is refused
+naming `--vision-residency device` and turning vision off as the ways out
+([Where the vision tower lives](vision.md#where-the-vision-tower-lives)).

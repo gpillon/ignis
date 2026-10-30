@@ -2025,6 +2025,7 @@ mod tests {
             available_physical_bytes: 41_632_530_432,
             scope: "qwen38flashnext",
             token_embedding_bytes: 0,
+            vision_tower_bytes: 0,
             expert_pool_bytes: 37_795_446_784,
             load_staging_bytes: 0,
             ngram_hot_rows_bytes: 1 << 30,
@@ -2051,6 +2052,7 @@ mod tests {
         let refusal = ignis_core::residency::plan_host(&crate::runtime::qwen27b_host_request(
             1 << 30,
             1_350_860_800,
+            0,
             0,
             &shape,
         ))

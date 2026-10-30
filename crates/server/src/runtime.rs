@@ -476,9 +476,11 @@ pub struct RetainedSlotsPlan {
 /// already held (GitHub #324, [`ignis_runtime::held_before_load`]).
 /// `adapted` is every adaptation the load took to fit the plan (ADR 0063
 /// §3), in order: the event's `adapted`, empty when it took none.
+/// `vision` is where a vision load keeps its tower (ADR 0075), the event's
+/// `vision_residency`; a text load (`None`) logs none.
 pub fn log_vram_plan(
     plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan, process_held_bytes: u64,
-    adapted: &[crate::adaptation::AdaptStep],
+    adapted: &[crate::adaptation::AdaptStep], vision: Option<ignis_core::VisionResidency>,
 ) {
     let lines = plan.lines;
     let adapted = crate::adaptation::steps_text(adapted);
@@ -517,6 +519,7 @@ pub fn log_vram_plan(
                 retained_host_slots = retained.host_slots,
                 retained_host_bytes = retained.host_bytes,
                 adapted = %adapted,
+                vision_residency = vision.map(ignis_core::VisionResidency::as_str),
                 "vram plan"
             )
         };
@@ -583,13 +586,16 @@ pub fn log_host_plan_refused(refusal: &ignis_core::residency::HostPlanError) {
 }
 
 /// The 27B's host plan request (ADR 0062): what its load pins for its life
-/// -- the token embedding's mapped table (`token_embedding_bytes`, the plan's
-/// mapped allocation), KV-disk's staging windows when the tier is on, the
-/// host retained slots and the KV-RAM arena -- against the shape's margin
+/// -- the token embedding's mapped table (`token_embedding_bytes`), the
+/// vision tower's spans beside it under the `host` vision residency
+/// (`vision_tower_bytes`, ADR 0075; the two make the plan's mapped
+/// allocation), KV-disk's staging windows when the tier is on, the host
+/// retained slots and the KV-RAM arena -- against the shape's margin
 /// (`model.host_margin_bytes`). No experts and no n-gram table.
 pub fn qwen27b_host_request(
     available_physical_bytes: u64,
     token_embedding_bytes: u64,
+    vision_tower_bytes: u64,
     retained_host_slots_bytes: u64,
     shape: &EngineShape,
 ) -> ignis_core::residency::HostPlanRequest {
@@ -599,6 +605,7 @@ pub fn qwen27b_host_request(
         available_physical_bytes,
         scope: crate::config::field::scope(family),
         token_embedding_bytes,
+        vision_tower_bytes,
         expert_pool_bytes: 0,
         load_staging_bytes: 0,
         ngram_hot_rows_bytes: 0,
@@ -612,9 +619,12 @@ pub fn qwen27b_host_request(
 /// A 27B load the host plan refused (ADR 0062), as an agent reads it: one
 /// `ignis.runtime.qwen27b_host_plan_refused` event with the 27B's lines, the
 /// memory available, the margin, what the plan needed and how far short it
-/// fell, in exact bytes. Its message is the refusal as a person reads it, the
-/// text the load then fails with.
-pub fn log_qwen27b_host_plan_refused(refusal: &ignis_core::residency::HostPlanError) {
+/// fell, in exact bytes, and where a vision load keeps its tower (ADR 0075).
+/// Its message is the refusal as a person reads it, the text the load then
+/// fails with.
+pub fn log_qwen27b_host_plan_refused(
+    refusal: &ignis_core::residency::HostPlanError, vision: Option<ignis_core::VisionResidency>,
+) {
     let ignis_core::residency::HostPlanError::BelowMargin {
         available_bytes,
         planned_bytes,
@@ -636,10 +646,39 @@ pub fn log_qwen27b_host_plan_refused(refusal: &ignis_core::residency::HostPlanEr
         // Not `token_embedding_bytes`: a key with a bare `token` reads as a
         // credential and is redacted (ignis-logging's record.rs).
         embedding_table_bytes = line("token_embedding"),
+        vision_tower_bytes = line("vision_tower"),
+        vision_residency = vision.map(ignis_core::VisionResidency::as_str),
         staging_bytes = line("staging"),
         retained_host_slots_bytes = line("retained_host_slots"),
         kv_ram_arena_bytes = line("kv_ram_arena"),
         "{refusal}"
+    );
+}
+
+/// The 27B's host plan as its load carries it out (ADR 0062): one
+/// `ignis.runtime.qwen27b_host_plan` event with every line it pins in bytes,
+/// what was available and what the plan leaves, and where a vision load
+/// keeps its tower (ADR 0075: `vision_residency`, none on a text load) with
+/// the tower's own line.
+pub fn log_qwen27b_host_plan(
+    request: &ignis_core::residency::HostPlanRequest, host: &ignis_core::residency::HostPlan, shape: &EngineShape,
+    vision: Option<ignis_core::VisionResidency>,
+) {
+    // hotpath-lint-allow: one line per model load.
+    tracing::info!(
+        name: "ignis.runtime.qwen27b_host_plan",
+        available_bytes = request.available_physical_bytes,
+        planned_bytes = host.total_bytes,
+        left_bytes = host.left_bytes,
+        margin_bytes = request.margin_bytes,
+        embedding_table_bytes = request.token_embedding_bytes,
+        vision_tower_bytes = request.vision_tower_bytes,
+        vision_residency = vision.map(ignis_core::VisionResidency::as_str),
+        staging_bytes = request.staging_bytes,
+        retained_host_slots = shape.retained_host_slots,
+        retained_host_bytes = request.retained_host_slots_bytes,
+        kv_ram_arena_bytes = request.kv_ram_arena_bytes,
+        "qwen3.8-27b host plan"
     );
 }
 
@@ -648,9 +687,14 @@ pub fn log_qwen27b_host_plan_refused(refusal: &ignis_core::residency::HostPlanEr
 /// it. The materialize error, followed by the host plan's own figures, so the
 /// refusal reads as the plan's and says what it had counted on.
 pub fn qwen27b_pin_refused(error: &str, request: &ignis_core::residency::HostPlanRequest, planned_bytes: u64) -> String {
+    // ADR 0075: the `host` vision residency's tower is pinned with the table.
+    let tower = match request.vision_tower_bytes {
+        0 => String::new(),
+        bytes => format!(", the vision tower {bytes} bytes"),
+    };
     format!(
         "materialize weights: {error}; the host plan had counted {planned_bytes} bytes of pinned host memory \
-         (the token embedding {} bytes) against {} bytes available and a {}-byte margin \
+         (the token embedding {} bytes{tower}) against {} bytes available and a {}-byte margin \
          (--{}-model-host-margin-bytes)",
         request.token_embedding_bytes, request.available_physical_bytes, request.margin_bytes, request.scope
     )
@@ -1039,35 +1083,33 @@ pub fn qwen27b_load(
         },
         process_held_bytes,
         &adapted.steps,
+        shape.vision.map(|v| v.residency()),
     );
     // ADR 0062: the host plan, measured before the first pinned allocation
     // (the token embedding's, at materialization): the table, KV-disk's
     // staging, the host retained slots and the KV-RAM arena must leave the
     // margin, or the start is refused naming the line that crosses it, as
     // Flash-Next's is. A host whose available memory cannot be read starts
-    // unplanned, as Flash-Next does.
+    // unplanned, as Flash-Next does. ADR 0075: under the `host` vision
+    // residency the tower shares the table's mapped allocation, on a line of
+    // its own, and a start that cannot pin it is refused, never moved to the
+    // device.
     let mut host_planned = None;
     if let Some(available) = ignis_core::residency::available_physical_bytes() {
-        let request =
-            qwen27b_host_request(available, plan.host_mapped_capacity_bytes, reservations.retained_host_bytes, &shape);
+        let tower_bytes = ignis_artifact::vision_host_mapped_bytes(&reader, &plan);
+        let request = qwen27b_host_request(
+            available,
+            plan.host_mapped_capacity_bytes - tower_bytes,
+            tower_bytes,
+            reservations.retained_host_bytes,
+            &shape,
+        );
+        let vision = shape.vision.map(|v| v.residency());
         let host = ignis_core::residency::plan_host(&request).map_err(|refusal| {
-            log_qwen27b_host_plan_refused(&refusal);
+            log_qwen27b_host_plan_refused(&refusal, vision);
             Qwen27bLoadError::HostPlan(refusal)
         })?;
-        // hotpath-lint-allow: one line per model load.
-        tracing::info!(
-            name: "ignis.runtime.qwen27b_host_plan",
-            available_bytes = request.available_physical_bytes,
-            planned_bytes = host.total_bytes,
-            left_bytes = host.left_bytes,
-            margin_bytes = request.margin_bytes,
-            embedding_table_bytes = request.token_embedding_bytes,
-            staging_bytes = request.staging_bytes,
-            retained_host_slots = shape.retained_host_slots,
-            retained_host_bytes = request.retained_host_slots_bytes,
-            kv_ram_arena_bytes = request.kv_ram_arena_bytes,
-            "qwen3.8-27b host plan"
-        );
+        log_qwen27b_host_plan(&request, &host, &shape, vision);
         host_planned = Some((request, host.total_bytes));
     }
 
@@ -1458,6 +1500,7 @@ pub(crate) fn flash_next_load(
         available_physical_bytes: available,
         scope: crate::config::field::scope(ignis_core::compute::ModelFamily::FlashNext),
         token_embedding_bytes: 0,
+        vision_tower_bytes: 0,
         expert_pool_bytes,
         load_staging_bytes,
         ngram_hot_rows_bytes: 0,
@@ -2200,7 +2243,7 @@ mod tests {
         let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
         let subscriber =
             tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_RETAINED, PROCESS_HELD, adapted));
+        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_RETAINED, PROCESS_HELD, adapted, None));
         sink.lines()
             .iter()
             .map(|line| serde_json::from_str(line).expect("valid json"))
@@ -2216,6 +2259,7 @@ mod tests {
             available_physical_bytes: 41_632_530_432,
             scope: "qwen38flashnext",
             token_embedding_bytes: 0,
+            vision_tower_bytes: 0,
             expert_pool_bytes: 37_795_446_784,
             load_staging_bytes: 0,
             ngram_hot_rows_bytes: 1 << 30,
@@ -2277,7 +2321,7 @@ mod tests {
             host_margin_bytes: 3 << 30,
             ..EngineShape::default()
         };
-        let request = qwen27b_host_request(64 << 30, TABLE, 2_080_000_000, &shape);
+        let request = qwen27b_host_request(64 << 30, TABLE, 0, 2_080_000_000, &shape);
         assert_eq!(request.scope, "qwen38");
         assert_eq!(request.token_embedding_bytes, TABLE);
         assert_eq!(request.retained_host_slots_bytes, 2_080_000_000);
@@ -2291,13 +2335,23 @@ mod tests {
         );
         let with_disk = EngineShape { kv_disk_bytes: Some(4 << 30), ..shape };
         assert_eq!(
-            qwen27b_host_request(64 << 30, TABLE, 0, &with_disk).staging_bytes,
+            qwen27b_host_request(64 << 30, TABLE, 0, 0, &with_disk).staging_bytes,
             ignis_runtime::kv_disk::STAGING_BYTES
         );
 
-        let refusal = ignis_core::residency::plan_host(&qwen27b_host_request(1 << 30, TABLE, 0, &shape))
+        let refusal = ignis_core::residency::plan_host(&qwen27b_host_request(1 << 30, TABLE, 0, 0, &shape))
             .expect_err("a GiB cannot hold the table beside the margin");
         assert!(refusal.to_string().contains("(--qwen38-model-host-margin-bytes)"), "{refusal}");
+
+        // ADR 0075 (GitHub #414): the `host` residency's tower, on its own line.
+        const TOWER: u64 = 297_000_960;
+        let request = qwen27b_host_request(64 << 30, TABLE, TOWER, 0, &shape);
+        assert_eq!((request.token_embedding_bytes, request.vision_tower_bytes), (TABLE, TOWER));
+        let refusal = ignis_core::residency::plan_host(&qwen27b_host_request((3 << 30) + TABLE + (100 << 20), TABLE, TOWER, 0, &shape))
+            .expect_err("the table fits beside the 3 GiB margin, the tower does not");
+        let ignis_core::residency::HostPlanError::BelowMargin { crossing_line, .. } = &refusal;
+        assert_eq!(*crossing_line, "vision_tower", "{refusal}");
+        assert!(refusal.to_string().contains("--vision-residency device"), "{refusal}");
     }
 
     /// A pin the host refuses after its plan passed (the OS may decline to lock
@@ -2306,7 +2360,7 @@ mod tests {
     #[test]
     fn a_pin_the_host_refuses_after_the_plan_passed_reads_with_the_plans_figures() {
         let shape = EngineShape { host_pool_bytes: 8 << 30, ..EngineShape::default() };
-        let request = qwen27b_host_request(64 << 30, 1_350_864_896, 0, &shape);
+        let request = qwen27b_host_request(64 << 30, 1_350_864_896, 0, 0, &shape);
         let host = ignis_core::residency::plan_host(&request).expect("64 GiB holds the plan");
         let message = qwen27b_pin_refused("the host cannot pin that much memory", &request, host.total_bytes);
         assert!(message.starts_with("materialize weights: the host cannot pin that much memory; "), "{message}");
@@ -2314,6 +2368,12 @@ mod tests {
         assert!(message.contains("the token embedding 1350864896 bytes"), "{message}");
         assert!(message.contains(&format!("{} bytes available", 64u64 << 30)), "{message}");
         assert!(message.contains("(--qwen38-model-host-margin-bytes)"), "{message}");
+        assert!(!message.contains("vision tower"), "no tower, no word of one: {message}");
+        // ADR 0075: a `host` start's pin counted the tower too, and says so.
+        let request = qwen27b_host_request(64 << 30, 1_350_864_896, 297_000_960, 0, &shape);
+        let host = ignis_core::residency::plan_host(&request).expect("64 GiB holds the plan");
+        let message = qwen27b_pin_refused("the host cannot pin that much memory", &request, host.total_bytes);
+        assert!(message.contains("the token embedding 1350864896 bytes, the vision tower 297000960 bytes"), "{message}");
     }
 
     /// The one event [`log_qwen27b_host_plan_refused`] logs: the 27B's lines
@@ -2322,11 +2382,14 @@ mod tests {
     fn a_refused_27b_host_plan_logs_its_lines_in_bytes_beside_the_persons_message() {
         use tracing_subscriber::layer::SubscriberExt;
         let shape = EngineShape { host_pool_bytes: 8 << 30, ..EngineShape::default() };
-        let refusal = ignis_core::residency::plan_host(&qwen27b_host_request(10 << 30, 1_350_860_800, 1 << 30, &shape))
-            .expect_err("short of the arena");
+        let refusal =
+            ignis_core::residency::plan_host(&qwen27b_host_request(10 << 30, 1_350_860_800, 297_000_960, 1 << 30, &shape))
+                .expect_err("short of the arena");
         let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
         let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-        tracing::subscriber::with_default(subscriber, || log_qwen27b_host_plan_refused(&refusal));
+        tracing::subscriber::with_default(subscriber, || {
+            log_qwen27b_host_plan_refused(&refusal, Some(ignis_core::VisionResidency::Host))
+        });
         let events: Vec<serde_json::Value> =
             sink.lines().iter().map(|line| serde_json::from_str(line).expect("valid json")).collect();
         assert_eq!(events.len(), 1, "{events:?}");
@@ -2338,6 +2401,7 @@ mod tests {
         for (field, bytes) in [
             ("available_bytes", 10u64 << 30),
             ("embedding_table_bytes", 1_350_860_800),
+            ("vision_tower_bytes", 297_000_960),
             ("staging_bytes", 0),
             ("retained_host_slots_bytes", 1 << 30),
             ("kv_ram_arena_bytes", 8 << 30),
@@ -2346,6 +2410,39 @@ mod tests {
             assert_eq!(attributes[field], bytes, "{field}: {attributes}");
         }
         assert_eq!(attributes["crossing_line"], "kv_ram_arena");
+        assert_eq!(attributes["vision_residency"], "host");
+    }
+
+    /// ADR 0075 (GitHub #414): the 27B's host plan event says where the load
+    /// keeps its vision tower and how many bytes the tower's own line holds;
+    /// a text load names no residency.
+    #[test]
+    fn the_27b_host_plan_event_carries_the_vision_residency_and_the_towers_line() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let shape = EngineShape { host_pool_bytes: 8 << 30, retained_host_slots: 4, ..EngineShape::default() };
+        let capture = |tower: u64, vision: Option<ignis_core::VisionResidency>| {
+            let request = qwen27b_host_request(64 << 30, 1_350_860_800, tower, 1 << 30, &shape);
+            let host = ignis_core::residency::plan_host(&request).expect("64 GiB holds the plan");
+            let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+            let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+            tracing::subscriber::with_default(subscriber, || log_qwen27b_host_plan(&request, &host, &shape, vision));
+            let events: Vec<serde_json::Value> =
+                sink.lines().iter().map(|line| serde_json::from_str(line).expect("valid json")).collect();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0]["event_name"], "ignis.runtime.qwen27b_host_plan");
+            (events[0]["attributes"].clone(), host.total_bytes)
+        };
+        let (host, planned) = capture(297_000_960, Some(ignis_core::VisionResidency::Host));
+        assert_eq!(host["vision_residency"], "host");
+        assert_eq!(host["vision_tower_bytes"], 297_000_960u64);
+        assert_eq!(host["embedding_table_bytes"], 1_350_860_800u64, "the table's line, not the tower's");
+        assert_eq!(host["planned_bytes"], planned);
+        assert_eq!(host["retained_host_slots"], 4);
+        let (device, _) = capture(0, Some(ignis_core::VisionResidency::Device));
+        assert_eq!(device["vision_residency"], "device");
+        assert_eq!(device["vision_tower_bytes"], 0);
+        let (text, _) = capture(0, None);
+        assert!(text.get("vision_residency").is_none(), "a text load has no residency: {text}");
     }
 
     /// A device-only load (ADR 0054) on a machine with 8.5 GB available: its
@@ -2357,6 +2454,7 @@ mod tests {
             available_physical_bytes: 8_500_000_000,
             scope: "qwen38flashnext",
             token_embedding_bytes: 0,
+            vision_tower_bytes: 0,
             expert_pool_bytes: 0,
             load_staging_bytes: 4_700_000_000,
             ngram_hot_rows_bytes: 1 << 30,
@@ -2446,6 +2544,27 @@ mod tests {
         assert_eq!(field("retained_host_bytes"), DEFAULT_RETAINED.host_bytes);
         // ADR 0063 §3: a load that adapted nothing says so.
         assert_eq!(field("adapted"), "");
+    }
+
+    /// ADR 0075 (GitHub #414): a vision load's plan event says where its
+    /// tower lives, and a text load's names no residency.
+    #[test]
+    fn the_vram_plan_event_carries_the_vision_residency() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let plan = plan_for(ignis_core::VramMode::Derived { headroom_bytes: 1 << 30 }, 30 << 30);
+        let capture = |vision: Option<ignis_core::VisionResidency>| {
+            let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+            let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+            tracing::subscriber::with_default(subscriber, || log_vram_plan(&plan, DEFAULT_RETAINED, PROCESS_HELD, &[], vision));
+            let events: Vec<serde_json::Value> =
+                sink.lines().iter().map(|line| serde_json::from_str(line).expect("valid json")).collect();
+            assert_eq!(events[0]["event_name"], "ignis.runtime.vram_plan");
+            events[0]["attributes"].clone()
+        };
+        assert_eq!(capture(Some(ignis_core::VisionResidency::Host))["vision_residency"], "host");
+        assert_eq!(capture(Some(ignis_core::VisionResidency::Device))["vision_residency"], "device");
+        let text = capture(None);
+        assert!(text.get("vision_residency").is_none(), "a text load has no residency: {text}");
     }
 
     /// ADR 0063 §3 (AC 4): the plan event names every adaptation the load

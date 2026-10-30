@@ -1,5 +1,6 @@
 //! Expert residency's reservations as **plan lines** computed at load (ADR
-//! 0030): the host plan (the 27B's mapped token embedding, ADR 0062; the
+//! 0030): the host plan (the 27B's mapped token embedding, ADR 0062, and its
+//! vision tower under the `host` vision residency, ADR 0075; the
 //! pinned expert pool or a device-only load's layer buffers, the n-gram hot
 //! rows, KV-disk's staging buffers, and prompt reuse's host retained slots
 //! and KV-RAM arena) with its refusal margin, charged at its peak, and the
@@ -44,6 +45,11 @@ pub struct HostPlanRequest {
     /// of the load (ADR 0062); 0 on Flash-Next, whose embedding is on the
     /// device.
     pub token_embedding_bytes: u64,
+    /// The 27B's vision tower in the same mapped pinned allocation, staged
+    /// into the prefill scratch for each media encode (ADR 0075): its spans,
+    /// with their 4 KiB padding. 0 when the tower is on the device, without
+    /// vision, and on Flash-Next.
+    pub vision_tower_bytes: u64,
     /// The expert pool, pinned for the life of the load: every expert
     /// projection ([`ExpertCatalog::total_bytes`] of the artifact) but a
     /// pinned hot set's, which have no host copy (ADR 0055). 0 on a
@@ -93,12 +99,12 @@ impl HostPlan {
 }
 
 /// The host plan's lines.
-pub const HOST_PLAN_LINES: usize = 7;
+pub const HOST_PLAN_LINES: usize = 8;
 
 /// When a line holds its bytes, in the order a Flash-Next load allocates
 /// them (`FlashNextLeaf::open`, then the server's load): the residency phase
-/// (the 27B's token embedding, which a Flash-Next load has none of, and the
-/// expert pool, or a device-only load's layer buffers); then the n-gram
+/// (the 27B's token embedding and vision tower, which a Flash-Next load has
+/// none of, and the expert pool, or a device-only load's layer buffers); then the n-gram
 /// hot rows and the KV-RAM arena; the model's sequence pool with the retained
 /// host slots; KV-disk's staging last. Nothing the plan holds is freed before
 /// the model drops but the layer buffers, which are gone when the residency
@@ -122,6 +128,7 @@ fn held_lines(request: &HostPlanRequest) -> [(&'static str, u64, Held); HOST_PLA
     use Held::*;
     [
         ("token_embedding", request.token_embedding_bytes, FromResidency),
+        ("vision_tower", request.vision_tower_bytes, FromResidency),
         ("expert_pool", request.expert_pool_bytes, FromResidency),
         ("load_staging", request.load_staging_bytes, DuringResidency),
         ("ngram_hot_rows", request.ngram_hot_rows_bytes, AfterResidency),
@@ -230,6 +237,13 @@ impl std::fmt::Display for HostPlanError {
                 "Even the token embedding alone ({}) does not fit in pinned memory: close other applications",
                 human_bytes(line("token_embedding"))
             ),
+            // ADR 0075: a `host` start never falls back to the device, so the
+            // refusal names both ways out.
+            "vision_tower" => write!(
+                f,
+                "The token embedding fits, the vision tower ({}) does not: keep it in VRAM                  (vision.residency: device, --vision-residency device), turn vision off, or close other                  applications",
+                human_bytes(line("vision_tower"))
+            ),
             "expert_pool" => write!(
                 f,
                 "Even the experts alone ({}) do not fit: close other applications",
@@ -288,6 +302,7 @@ impl std::error::Error for HostPlanError {}
 fn line_label(name: &str) -> &str {
     match name {
         "token_embedding" => "token embedding",
+        "vision_tower" => "vision tower",
         "expert_pool" => "experts",
         "load_staging" => "expert layer buffers",
         "ngram_hot_rows" => "n-gram hot rows",

@@ -590,6 +590,14 @@ config_group! {
         /// embedding; a pool below that is raised to it. Needs vision on.
         embedding_pool_mib: Opt<Mib> = None, between(1, super::MAX_VISION_EMBEDDING_POOL_MIB as i64), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
+        /// Where the vision tower's weights live: `device`, in VRAM for the
+        /// life of the load (today's encode latency), or `host`, in pinned
+        /// host RAM, copied to the GPU for each image encode (~300 MB less
+        /// VRAM, so more KV pool, a few ms more an encode). A `host` start the
+        /// host RAM cannot hold is refused, never moved to the device. Needs
+        /// vision on.
+        residency: VisionResidencyKind = ignis_core::VisionResidency::default(), Validator::OneOf(&ignis_core::VisionResidency::NAMES), QWEN38_ONLY,
+            [Visible, Patchable, ReloadRequired];
     }
 }
 
