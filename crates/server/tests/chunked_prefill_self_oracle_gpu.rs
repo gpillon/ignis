@@ -18,11 +18,11 @@
 
 use std::path::Path;
 
-use ignis_artifact::{CudaDevice, FrontendSet, ModelScope, VisionResidency, Reader, bind_model_scope_27b_with, materialize};
-use ignis_core::Vision;
+use ignis_artifact::{CudaDevice, FrontendSet, VisionResidency, Reader, bind_model_scope_27b_with, materialize};
+use ignis_core::{ExceptionWeights, Vision};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::model_load::{load_qwen38_27b_with_options, Model};
+use ignis_core::model_load::{load_qwen38_27b_with_options, model_scope, Model};
 use ignis_core::RopeScaling;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::{prefill_program_with_route, PrefillRoute};
@@ -126,7 +126,8 @@ fn chunked_and_per_token_prefill_agree_on_a_long_prompt() {
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn chunked_and_per_token_prefill_agree_with_vision_loaded() {
-    self_oracle(Some(Vision::default()));
+    // Today's load, the tower on the device (ADR 0075's `device`).
+    self_oracle(Some(Vision::default().with_residency(VisionResidency::Device)));
 }
 
 fn self_oracle(vision: Option<Vision>) {
@@ -137,7 +138,8 @@ fn self_oracle(vision: Option<Vision>) {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
 
-    let scope = ModelScope { draft: None, vision: vision.is_some(), vision_residency: VisionResidency::Device, fp8_exceptions: false };
+    // The scope is bound from the vision the model loads with, so the two agree.
+    let scope = model_scope(None, vision, ExceptionWeights::Bf16);
     let (plan, handles) =
         bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {

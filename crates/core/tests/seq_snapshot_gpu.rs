@@ -45,15 +45,15 @@ mod snapshot_blob;
 use std::path::Path;
 
 use ignis_artifact::{
-    CudaDevice, Device, FrontendSet, ModelScope, VisionResidency, Reader, bind_model_scope_27b_with, bind_text_scope_27b,
+    CudaDevice, Device, FrontendSet, VisionResidency, Reader, bind_model_scope_27b_with, bind_text_scope_27b,
     materialize,
 };
-use ignis_core::Vision;
+use ignis_core::{ExceptionWeights, Vision};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::gqa_layer::run_gqa_layer;
 use ignis_core::hq_ring::HqRing;
-use ignis_core::model_load::{Model, load_qwen38_27b, load_qwen38_27b_with_options};
+use ignis_core::model_load::{Model, load_qwen38_27b, load_qwen38_27b_with_options, model_scope};
 use ignis_core::RopeScaling;
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, snapshot_format_version};
 use ignis_core::step::{
@@ -137,7 +137,10 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
         .collect();
     assert!(!prompt.is_empty());
 
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
+    // Today's load, the tower on the device (ADR 0075's `device`): the scope
+    // is bound from the vision the model loads with, so the two agree.
+    let vision = Vision::default().with_residency(VisionResidency::Device);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, model_scope(None, Some(vision), ExceptionWeights::Bf16))
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
@@ -165,7 +168,7 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
         MAX_CONTEXT,
         ignis_core::KvFormat::Bf16,
         None,
-        Some(Vision::default()),
+        Some(vision),
         RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("load model: {e}"));

@@ -137,17 +137,17 @@ use std::path::{Path, PathBuf};
 
 use ignis_artifact::{
     ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent,
-    ModelScope, VisionResidency, Reader, Role, bind_model_scope_27b_with, materialize,
+    VisionResidency, Reader, Role, bind_model_scope_27b_with, materialize,
 };
 use ignis_core::attn_tap::{GQA_LAYERS, Q_HEADS, with_attn_tap, with_attn_tap_hq};
 use ignis_core::hq_ring::{PromptSource, prompt_source, ring_before_chunk};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::model_load::load_qwen38_27b_with_options;
+use ignis_core::model_load::{load_qwen38_27b_with_options, model_scope};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step;
 use ignis_core::vision::{Multimodal, vision_item_control};
-use ignis_core::{KvFormat, RopeScaling, Vision};
+use ignis_core::{ExceptionWeights, KvFormat, RopeScaling, Vision};
 use ignis_server::decide::OrderedValue;
 use ignis_server::numbers::point_system;
 use serde::Deserialize;
@@ -662,7 +662,10 @@ fn one_attention_head_points_in_the_engine() {
     let y_literal: Vec<i32> = encode(",\"y\":").into_iter().map(|t| t as i32).collect();
     let system = point_system(DIGITS as u32);
 
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
+    // Today's load, the tower on the device (ADR 0075's `device`): the scope
+    // is bound from the vision the model loads with, so the two agree.
+    let vision = Vision::default().with_residency(VisionResidency::Device);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, model_scope(None, Some(vision), ExceptionWeights::Bf16))
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,
@@ -690,7 +693,7 @@ fn one_attention_head_points_in_the_engine() {
         MAX_CONTEXT,
         kv_format,
         None,
-        Some(Vision::default()),
+        Some(vision),
         RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("ignis_model_load with vision: {e}"));

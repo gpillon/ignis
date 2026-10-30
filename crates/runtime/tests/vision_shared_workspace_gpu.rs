@@ -38,13 +38,13 @@ use std::sync::Arc;
 
 use ignis_artifact::{
     bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
-    DraftModule, FrontendSet, MessageContent, ModelScope, VisionResidency, Reader, Role,
+    FrontendSet, MessageContent, VisionResidency, Reader, Role,
 };
 use ignis_core::gpu_profile;
 use ignis_core::seq::{alloc_count, AllocCount, AllocKind};
 use ignis_core::vision::Multimodal;
 use ignis_core::{
-    ConcreteScheduler, DecodeParams, KvFormat, RequestClass, RequestId, RequestInput, SchedEvent,
+    model_load, ConcreteScheduler, DecodeParams, ExceptionWeights, KvFormat, RequestClass, RequestId, RequestInput, SchedEvent,
     Scheduler, SchedulerConfig, Speculation, SpeculativeBackend, TokenId, Vision,
 };
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, RuntimeCompute};
@@ -223,7 +223,11 @@ fn load(prefill_chunk_tokens: u32) -> Option<Loaded> {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let eos = frontend.eos_token_id().expect("eos");
-    let scope = ModelScope { draft: Some(DraftModule::Dflash2), vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false };
+    // Today's load, the tower on the device (ADR 0075's `device`): the scope
+    // is bound from the vision the model loads with, so the two agree.
+    let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
+    let vision = Vision::default().with_residency(VisionResidency::Device);
+    let scope = model_load::model_scope(Some(speculation), Some(vision), ExceptionWeights::Bf16);
     let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
@@ -248,8 +252,8 @@ fn load(prefill_chunk_tokens: u32) -> Option<Loaded> {
         kv_format: KvFormat::Bf16,
         kv_pool_bytes: ignis_runtime::auto_kv_pool_bytes(KvFormat::Bf16, MAX_CONTEXT),
         prefill_chunk_tokens,
-        speculation: Some(Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7")),
-        vision: Some(Vision::default()),
+        speculation: Some(speculation),
+        vision: Some(vision),
         ..CudaLeafConfig::default()
     };
     // GitHub #213: KV-RAM is one arena pinned at the load, so a leaf without

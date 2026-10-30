@@ -44,15 +44,15 @@ use std::path::{Path, PathBuf};
 
 use ignis_artifact::{
     ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent,
-    ModelScope, VisionResidency, Reader, Role, bind_model_scope_27b_with, materialize,
+    VisionResidency, Reader, Role, bind_model_scope_27b_with, materialize,
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::model_load::load_qwen38_27b_with_options;
+use ignis_core::model_load::{load_qwen38_27b_with_options, model_scope};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step;
 use ignis_core::vision::{Multimodal, vision_item_control};
-use ignis_core::{KvFormat, RopeScaling, Vision};
+use ignis_core::{ExceptionWeights, KvFormat, RopeScaling, Vision};
 use serde::Deserialize;
 
 use support::vision_canary::{argmax_lowest_id, prefill_prompt};
@@ -234,7 +234,10 @@ fn a_constrained_readout_points_at_the_blue_button() {
         })
         .collect();
 
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
+    // Today's load, the tower on the device (ADR 0075's `device`): the scope
+    // is bound from the vision the model loads with, so the two agree.
+    let vision = Vision::default().with_residency(VisionResidency::Device);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, model_scope(None, Some(vision), ExceptionWeights::Bf16))
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,
@@ -262,7 +265,7 @@ fn a_constrained_readout_points_at_the_blue_button() {
         MAX_CONTEXT,
         KvFormat::Bf16,
         None,
-        Some(Vision::default()),
+        Some(vision),
         RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("ignis_model_load with vision: {e}"));

@@ -53,7 +53,7 @@ use std::path::Path;
 use ignis_artifact::vision::VisionProcessor;
 use ignis_artifact::{
     bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
-    DraftModule, FrontendSet, MessageContent, ModelScope, VisionResidency, Reader, Role,
+    FrontendSet, MessageContent, VisionResidency, Reader, Role,
 };
 use ignis_bench::oracle::{
     meets_g1_floor, overall_teacher_forced_agreement, score_teacher_forced, TeacherForcedResult,
@@ -61,14 +61,14 @@ use ignis_bench::oracle::{
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::model_load::{load_qwen38_27b_with_options, Model};
+use ignis_core::model_load::{load_qwen38_27b_with_options, model_scope, Model};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
     self, decode_program_batch_sampled, decode_program_verify_runs, MediaEmbedding, SamplingParams,
     VerifyLane,
 };
 use ignis_core::vision::{vision_item_control, Multimodal};
-use ignis_core::{KvFormat, RopeScaling, Speculation, SpeculativeBackend, Vision};
+use ignis_core::{ExceptionWeights, KvFormat, RopeScaling, Speculation, SpeculativeBackend, Vision};
 
 use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt, Canary};
 
@@ -315,8 +315,12 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
     assert!(!canaries.is_empty());
 
     // --- AC 1: the two load options together -----------------------------
+    // Today's load, the tower on the device (ADR 0075's `device`): the scope
+    // is bound from the vision the model loads with, so the two agree.
+    let speculation = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).expect("dflash2-7");
+    let vision = Vision::default().with_residency(VisionResidency::Device);
     let (plan, handles) =
-        bind_model_scope_27b_with(&reader, ModelScope { draft: Some(DraftModule::Dflash2), vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
+        bind_model_scope_27b_with(&reader, model_scope(Some(speculation), Some(vision), ExceptionWeights::Bf16))
             .unwrap_or_else(|e| panic!("bind with the drafter and vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,
@@ -336,7 +340,6 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let speculation = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).expect("dflash2-7");
     let model = load_qwen38_27b_with_options(
         &reader,
         &artifact,
@@ -345,7 +348,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
         MAX_CONTEXT,
         KvFormat::Bf16,
         Some(speculation),
-        Some(Vision::default()),
+        Some(vision),
         RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("ignis_model_load with vision and dflash2: {e}"));

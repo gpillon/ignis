@@ -1295,15 +1295,16 @@ mod tests {
     #[test]
     fn the_model_scope_names_vision_only_when_the_load_asks_for_it() {
         assert_eq!(model_scope(None, None, ExceptionWeights::Bf16), ModelScope::default());
+        // ADR 0075 (GitHub #416): a vision load is host unless it asks for the device.
         let vision = Vision::default();
         assert_eq!(
             model_scope(None, Some(vision), ExceptionWeights::Bf16),
-            ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false }
+            ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Host, fp8_exceptions: false }
         );
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 3).unwrap();
         assert_eq!(
             model_scope(Some(spec), Some(vision), ExceptionWeights::Fp8),
-            ModelScope { draft: Some(DraftModule::Dflash2), vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: true }
+            ModelScope { draft: Some(DraftModule::Dflash2), vision: true, vision_residency: VisionResidency::Host, fp8_exceptions: true }
         );
     }
 
@@ -1319,9 +1320,12 @@ mod tests {
         );
         let options = load_options(None, Some(host), RopeScaling::NONE, 0, PrefillAttention::Fp8, LANES).expect("options");
         assert_eq!(options.vision_residency, 1);
-        let device = load_options(None, Some(Vision::new(4096).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, LANES)
+        let default = load_options(None, Some(Vision::new(4096).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, LANES)
             .expect("options");
-        assert_eq!(device.vision_residency, 0, "a zeroed field: today's load");
+        assert_eq!(default.vision_residency, 1, "GitHub #416: host by default");
+        let device = Vision::new(4096).unwrap().with_residency(VisionResidency::Device);
+        let device = load_options(None, Some(device), RopeScaling::NONE, 0, PrefillAttention::Fp8, LANES).expect("options");
+        assert_eq!(device.vision_residency, 0, "a zeroed field: the device, today's load");
         let text = load_options(None, None, RopeScaling::NONE, 4_554, PrefillAttention::Fp8, LANES).expect("options");
         assert_eq!(text.vision_residency, 0, "no vision, no residency");
     }
