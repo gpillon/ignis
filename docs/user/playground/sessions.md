@@ -59,6 +59,29 @@ same origin still runs the older page: the list says another tab holds the
 store at an older version, and once that tab is closed a reload of this one
 reads the sessions back.
 
+## Asking the browser to keep it
+
+A browser treats this storage as best-effort: when the disk runs short it may
+evict an origin's data whole, with no prompt and no trace. So at start the
+Playground asks the browser to make its storage **persistent**, once per page
+load and only when it is not persistent yet. A browser that grants it no
+longer evicts the sessions on its own; only clearing the site's data deletes
+them.
+
+A browser may refuse, and a refusal changes nothing else: the page opens and
+saves as before, but the storage stays best-effort, and a short disk can still
+take the sessions. Firefox asks you. A Chromium-based browser decides without
+asking, from signals such as whether the page is bookmarked, installed as an
+app or allowed to show notifications, and refuses a page with none of them,
+however much it is used: **bookmark the Playground's page** and reload it, and
+the next load asks again.
+
+To see the state, open the browser's DevTools console and run
+`await navigator.storage.persisted()`: `true` means this origin is kept. In a
+Chromium-based browser's DevTools the **Application** panel, **Storage**
+section, shows how much the origin uses against its quota; in Firefox's, the
+**Storage** panel lists what it keeps.
+
 ## Read more
 
 - [Chat](chat.md): the session log at the foot of each session.
