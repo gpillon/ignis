@@ -27,7 +27,8 @@ it. Python never writes the container.
 | `plan.py` | The object table: the served directory, in its order, with the body's planes and the head replaced. |
 | `exl3.py` | The quant's matrices from its safetensors headers (no torch): K, shapes, the `mul1` flag, the record bytes. |
 | `container.py` | Read-only access to a `.ninfer` v2 container (the served artifact; the packed one for `verify`). |
-| `reconstruction.py` | The GPU step and the only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
+| `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
+| `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter/work.py`). |
 | `test_*.py`, `conftest.py` | Unit tests (CPU only) on a reduced synthetic served artifact and quant. |
 
@@ -89,3 +90,40 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
   the quant's matrices not taken (its MTP layer).
 - `converter`: the commit the converter ran from and whether its files differed from it (`dirty`);
   `versions`: Python, torch, exllamav3, safetensors.
+
+## The abliterated replay
+
+`replay.py` makes the override records of the uncensored 16 GB artifact (spec #386, GitHub #421): the
+70 matrices the huihui-ai abliteration changed (layers 17-51: `mlp.down_proj`, and
+`linear_attn.out_proj` or `self_attn.o_proj` by layer type), re-quantized at the K the quant gives each
+(all 3, layer 23's `o_proj` 4) by replaying exllamav3's own conversion of them.
+
+```
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/replay.py fetch \
+    --quant Y:/models/qwen38-27b-exl3-SC_3.00bpw_H4 --out H:/abliterated-386
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/replay.py run \
+    --quant Y:/models/qwen38-27b-exl3-SC_3.00bpw_H4 --bf16 Y:/models/Qwen3.8-27B \
+    --abliterated H:/abliterated-386 --out H:/override-386
+```
+
+- **`fetch`** takes the 70 BF16 tensors of `huihui-ai/Huihui-Qwen3.8-27B-abliterated` at revision
+  739e3c5b (the 32 GB artifact's) by HTTP range, never whole shards (8.44 GB of 9 shards): each
+  shard's tensors in a file of the shard's name, an index, and `fetch.json` (each shard's LFS oid,
+  each tensor's source range and sha256). A tensor whose bytes are not its header's length, or whose
+  dtype or shape is not the plan's, is refused. The abliterated BF16 is the base with that directory
+  laid over it: exllamav3's tensor collection takes the later file of a key, so the base is never
+  copied.
+- **`run`** (GPU, exllamav3 1.5.3; `make gpu-status` first) replays `convert_model.py` for those
+  matrices: the quant's `cal_trace.safetensors` rows (250 x 2,048); the state through the token
+  embedding and layers 0..L-1 as quantized (the quant's records, the re-quantized ones in their
+  place); the Hessian captured on layer L of the abliterated BF16, run whole; each matrix quantized
+  alone by the converter's call (`make_quant_args`, `get_H_data`, `Linear.convert_exl3`) with the
+  `mul1` codebook, output scales and the seed L+1, the layer's module index. `--check` checks the
+  sources and stops before the GPU; `--last 17` is a smoke run of one layer.
+- **The output** is the quant's layout (index, one shard per layer, `quantization_config.json` at
+  exllamav3 1.5.3), which `exl3.Quant` reads, holding exactly the plan's records at the quant's K and
+  shape, and `replay.json`, written last: the control (each matrix's relative reconstruction error
+  against the abliterated BF16, beside the quant's own against the base BF16 and against the
+  abliterated BF16), each matrix's seed, K and proxy error, the sources' revisions, the calibration
+  trace's sha256, the versions and the command, its paths by role. turboderp's quant was made with
+  exllamav3 1.4.2, so its bytes are not reproduced bit for bit.
