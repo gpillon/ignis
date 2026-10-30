@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use ignis_artifact::{
     bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
-    FrontendSet, MessageContent, ModelScope, Reader, Role,
+    FrontendSet, MessageContent, ModelScope, VisionResidency, Reader, Role,
 };
 use ignis_core::gpu_profile;
 use ignis_core::vision::Multimodal;
@@ -180,7 +180,7 @@ fn load() -> Option<Loaded> {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let eos = frontend.eos_token_id().expect("eos");
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,

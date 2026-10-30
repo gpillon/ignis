@@ -1016,6 +1016,9 @@ struct LoadOptions {
   // GitHub #336: the 27B's decode lanes, resolved (0 is IGNIS_DECODE_MAX_BATCH):
   // the widest round, and every round reservation's width.
   uint32_t decode_lanes = IGNIS_DECODE_MAX_BATCH;
+  // GitHub #414 (ADR 0075): where the vision tower lives (enum
+  // ignis_vision_residency); HOST only with vision.
+  uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
 };
 
 // GitHub #243: one embedding pool page, in bytes -- the width every side of
@@ -1174,6 +1177,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   uint32_t attention_text_max_keys = 0;
   uint32_t draft_row_budget = 0;
   uint32_t prefill_attention = 0;
+  uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
@@ -1193,6 +1197,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     attention_text_max_keys = options->attention_text_max_keys;
     draft_row_budget = options->draft_row_budget;
     prefill_attention = options->prefill_attention;
+    vision_residency = options->vision_residency;
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
   // one of the two.
@@ -1226,6 +1231,18 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   if (vision_max_tokens == 0 && vision_item_max_tokens != 0) {
     set_error("ignis_model_load: vision_item_max_tokens " + std::to_string(vision_item_max_tokens) +
               " needs vision_max_tokens");
+    return nullptr;
+  }
+  // GitHub #414: a residency the leaf does not know is refused rather than run
+  // as one of the two, and a host tower without a tower is the same
+  // contradiction as the pool's.
+  if (vision_residency != IGNIS_VISION_RESIDENCY_DEVICE && vision_residency != IGNIS_VISION_RESIDENCY_HOST) {
+    set_error("ignis_model_load: vision_residency " + std::to_string(vision_residency) +
+              " is not 0 (device) or 1 (host)");
+    return nullptr;
+  }
+  if (vision_max_tokens == 0 && vision_residency != IGNIS_VISION_RESIDENCY_DEVICE) {
+    set_error("ignis_model_load: vision_residency " + std::to_string(vision_residency) + " needs vision_max_tokens");
     return nullptr;
   }
   if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
@@ -1266,6 +1283,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.rope_scaling = rope_scaling;
   out.attention_text_max_keys = std::min(attention_text_max_keys, max_context_tokens);
   out.prefill_attention = prefill_attention;
+  out.vision_residency = vision_residency;
 
   // GitHub #302: Flash-Next binds its own schema (kernel/src/flash_next/
   // bind.cu) into its own program (kernel/src/flash_next/program.h), and has
@@ -1640,6 +1658,14 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
                               attention_readout_bytes(text_keys, text_keys);
     sizes.vision_workspace =
         ignis_vision_workspace_bytes(item_tokens, std::min(item_tokens, kVisionMaxSegments));
+    // GitHub #414 (ADR 0075): a tower in host memory is staged through a ring
+    // after the workspace, in the encoder's share of the scratch; the scratch
+    // is still the larger of the two shares (ADR 0030), so the ring costs
+    // VRAM only where the encoder's share sets the scratch's size.
+    if (options.vision_residency == IGNIS_VISION_RESIDENCY_HOST) {
+      sizes.vision_workspace = round_up_arena_align(sizes.vision_workspace) +
+                               IGNIS_VISION_STAGING_SLOTS * ignis_vision_staging_slot_bytes(model.vision);
+    }
     sizes.media_embedding =
         vision_embedding_pool_bytes(g.hidden, tokens, options.vision_embedding_pool_bytes);
   }
@@ -1948,6 +1974,49 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       model->vision_pool.owner.assign(output_bytes / page_bytes, nullptr);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: vision reservation failed: ") + e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
+    // GitHub #414 (ADR 0075): the tower must be where the residency says --
+    // the plan sized the scratch by the option, and a tower read from host
+    // memory in place would be a load that neither plan describes -- and,
+    // under host, every stage must fit a slot of the plan's ring before an
+    // encode needs it. Then the ring's own copy stream and events.
+    try {
+      const bool host = load.vision_residency == IGNIS_VISION_RESIDENCY_HOST;
+      std::size_t tensors = 0;
+      std::size_t in_host = 0;
+      visit_vision_stages(model->vision, [&](std::size_t, const ninfer::Weight &w) {
+        ++tensors;
+        in_host += in_host_memory(w.qdata) ? 1 : 0;
+      });
+      if (in_host != (host ? tensors : 0)) {
+        throw std::runtime_error(std::string("the vision residency is ") + (host ? "host" : "device") + " but " +
+                                 std::to_string(in_host) + " of the tower's " + std::to_string(tensors) +
+                                 " tensors are bound in host memory: bind the tower where the residency puts it");
+      }
+      if (host) {
+        VisionStaging &staging = model->vision_staging;
+        staging.slot_bytes = ignis_vision_staging_slot_bytes(model->vision);
+        ignis_vision_staging_check(model->vision, staging.slot_bytes);
+        const auto event = [](cudaEvent_t &e) {
+          if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+            throw std::runtime_error("creating a staging event failed");
+          }
+        };
+        event(staging.head);
+        for (std::size_t slot = 0; slot < IGNIS_VISION_STAGING_SLOTS; ++slot) {
+          event(staging.copied[slot]);
+          event(staging.consumed[slot]);
+        }
+        if (cudaStreamCreateWithFlags(&staging.copy, cudaStreamNonBlocking) != cudaSuccess) {
+          staging.copy = nullptr;
+          throw std::runtime_error("creating the staging copy stream failed");
+        }
+      }
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: the vision tower's residency: ") + e.what());
       cudaStreamDestroy(model->stream);
       model->stream = nullptr;
       return -1;

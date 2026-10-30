@@ -256,6 +256,27 @@ enum ignis_prefill_attention {
   IGNIS_PREFILL_ATTENTION_FP16 = 1,
 };
 
+/* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower.
+ * The binder places the tower and the load checks it is where this says. */
+enum ignis_vision_residency {
+  /* In VRAM for the life of the load: the load before ADR 0075. The default,
+   * and what a zeroed field reads as. */
+  IGNIS_VISION_RESIDENCY_DEVICE = 0,
+  /* In mapped pinned host memory (the token embedding's allocation, ADR
+   * 0062), staged into the prefill scratch for each media encode through a
+   * ring of IGNIS_VISION_STAGING_SLOTS slots, each the size of the largest
+   * stage, which the encoder's share of the scratch holds beside its
+   * workspace: the encode copies the next stage on a copy stream of its own
+   * while the current one computes, and reads every weight at device speed.
+   * The tower takes no VRAM between encodes. */
+  IGNIS_VISION_RESIDENCY_HOST = 1,
+};
+
+/* The staging ring's slots under IGNIS_VISION_RESIDENCY_HOST: three hide the
+ * merger's largest stage behind the blocks (#409's prototype; two stall on
+ * it). */
+#define IGNIS_VISION_STAGING_SLOTS 3
+
 /* Load options (ADR 0016: `size` first, `sizeof` the struct the caller
  * compiled against; a NULL pointer means the production defaults -- no
  * speculation). */
@@ -357,6 +378,13 @@ struct ignis_model_load_options {
    * Fixed for the life of the load. IGNIS_PREFILL_ATTENTION_FP8 on
    * Flash-Next, whose attention is QSA. */
   uint32_t prefill_attention;
+  /* enum ignis_vision_residency (GitHub #414); anything else is refused, and
+   * HOST without `vision_max_tokens`. In the struct's padding after
+   * `prefill_attention`, so its size did not move. Under HOST every
+   * `vision/*` tensor must be bound in host memory, under DEVICE none; the
+   * load refuses either mismatch, and the plan (which reads no pointer) sizes
+   * the scratch for the ring by this field alone. */
+  uint32_t vision_residency;
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many
@@ -372,7 +400,9 @@ struct ignis_model_reservations {
   /* The one scratch arena prefill chunks and media encode share (GitHub
    * #212): the program scratch for one `prefill_chunk_tokens` chunk (with
    * the drafter's context append under DFLASH2), or with vision the encoder
-   * workspace when that is larger. The two are never live at once. */
+   * workspace when that is larger -- with, under IGNIS_VISION_RESIDENCY_HOST,
+   * the tower's staging ring after it (GitHub #414). The two are never live
+   * at once. */
   uint64_t workspace_bytes;
   /* The media embedding pool (GitHub #243): the load's
    * `vision_embedding_pool_bytes`, rounded up to a whole number of column
@@ -417,7 +447,8 @@ struct ignis_model_stats {
    * (GitHub #210). */
   struct ignis_model_reservations reserved;
   /* Sum of the payload bytes of every bound tensor in mapped host memory
-   * (ADR 0062: the 27B's token embedding), which `vram_bytes` leaves out:
+   * (ADR 0062: the 27B's token embedding; ADR 0075: and its vision tower
+   * under IGNIS_VISION_RESIDENCY_HOST), which `vram_bytes` leaves out:
    * the load asks the runtime where each tensor's data lives. */
   uint64_t host_mapped_bytes;
 };

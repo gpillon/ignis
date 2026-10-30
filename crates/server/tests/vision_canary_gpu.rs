@@ -34,7 +34,7 @@ use std::path::Path;
 
 use ignis_artifact::{
     bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
-    FrontendSet, MessageContent, ModelScope, Reader, Role,
+    FrontendSet, MessageContent, ModelScope, VisionResidency, Reader, Role,
 };
 use ignis_bench::oracle::{
     meets_g1_floor, overall_teacher_forced_agreement, score_teacher_forced, TeacherForcedResult,
@@ -88,7 +88,7 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
     let canaries = load_canaries(&frontend);
     assert!(!canaries.is_empty());
 
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,

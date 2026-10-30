@@ -110,6 +110,10 @@ pub(crate) mod ffi {
         /// [`crate::prefill_attention::PrefillAttention::abi_code`]: 0 = 8-bit,
         /// 1 = FP16 accumulate. Flash-Next's attention is QSA and takes 0.
         pub prefill_attention: u32,
+        /// GitHub #414 (ADR 0075): where the vision tower lives,
+        /// [`crate::vision::VisionResidency::abi_code`]: 0 = the device, 1 =
+        /// pinned host memory, staged for each encode. 0 without vision.
+        pub vision_residency: u32,
     }
 
     /// 1:1 with `struct ignis_moe_slot` (`kernel/include/ignis_moe.h`): an
@@ -344,6 +348,7 @@ pub fn model_scope(speculation: Option<Speculation>, vision: Option<Vision>, exc
     ModelScope {
         draft: draft_module(speculation),
         vision: vision.is_some(),
+        vision_residency: vision.map_or_else(Default::default, |v| v.residency()),
         fp8_exceptions: exceptions.is_fp8(),
     }
 }
@@ -401,6 +406,7 @@ fn load_options(
             draft_row_budget: 0,
             mtp_expert_slots: std::ptr::null(),
             prefill_attention: prefill_attention.abi_code(),
+            vision_residency: vision.map_or(0, |v| v.residency().abi_code()),
         }
     })
 }
@@ -971,6 +977,7 @@ fn flash_next_options(
         draft_row_budget: speculation.map_or(0, |s| s.row_budget()),
         mtp_expert_slots: std::ptr::null(),
         prefill_attention: PrefillAttention::default().abi_code(),
+        vision_residency: 0,
     }
 }
 
@@ -1094,6 +1101,7 @@ pub fn plan_flash_next_reservations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vision::VisionResidency;
 
     /// GitHub #302: the descriptors this loader builds for the artifact
     /// crate's Flash-Next fixture artifact (packed from its converter work
@@ -1286,13 +1294,32 @@ mod tests {
         let vision = Vision::default();
         assert_eq!(
             model_scope(None, Some(vision), ExceptionWeights::Bf16),
-            ModelScope { draft: None, vision: true, fp8_exceptions: false }
+            ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false }
         );
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 3).unwrap();
         assert_eq!(
             model_scope(Some(spec), Some(vision), ExceptionWeights::Fp8),
-            ModelScope { draft: Some(DraftModule::Dflash2), vision: true, fp8_exceptions: true }
+            ModelScope { draft: Some(DraftModule::Dflash2), vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: true }
         );
+    }
+
+    /// ADR 0075 (GitHub #414): the binder places the tower where the load's
+    /// residency says, so the scope the server binds and the options the leaf
+    /// loads under name the same residency; one mapping makes both.
+    #[test]
+    fn the_model_scope_and_the_options_carry_the_vision_residency() {
+        let host = Vision::new(4096).unwrap().with_residency(VisionResidency::Host);
+        assert_eq!(
+            model_scope(None, Some(host), ExceptionWeights::Bf16),
+            ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Host, fp8_exceptions: false }
+        );
+        let options = load_options(None, Some(host), RopeScaling::NONE, 0, PrefillAttention::Fp8, LANES).expect("options");
+        assert_eq!(options.vision_residency, 1);
+        let device = load_options(None, Some(Vision::new(4096).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, LANES)
+            .expect("options");
+        assert_eq!(device.vision_residency, 0, "a zeroed field: today's load");
+        let text = load_options(None, None, RopeScaling::NONE, 4_554, PrefillAttention::Fp8, LANES).expect("options");
+        assert_eq!(text.vision_residency, 0, "no vision, no residency");
     }
 
     /// The leaf's eight lanes, which a load crosses no options struct for.
@@ -1430,8 +1457,11 @@ mod tests {
         // padding, and the MTP head's slot table pointer.
         // GitHub #335: then the uint32 prefill attention precision, padded
         // to the pointer's alignment.
+        // GitHub #414: then the uint32 vision residency, in that padding, so
+        // the size did not move again.
         assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 88);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, prefill_attention), 80);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, vision_residency), 84);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, decode_lanes), 48);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, residency), 56);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, draft_row_budget), 64);

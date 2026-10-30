@@ -137,7 +137,7 @@ use std::path::{Path, PathBuf};
 
 use ignis_artifact::{
     ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent,
-    ModelScope, Reader, Role, bind_model_scope_27b_with, materialize,
+    ModelScope, VisionResidency, Reader, Role, bind_model_scope_27b_with, materialize,
 };
 use ignis_core::attn_tap::{GQA_LAYERS, Q_HEADS, with_attn_tap, with_attn_tap_hq};
 use ignis_core::hq_ring::{PromptSource, prompt_source, ring_before_chunk};
@@ -662,7 +662,7 @@ fn one_attention_head_points_in_the_engine() {
     let y_literal: Vec<i32> = encode(",\"y\":").into_iter().map(|t| t as i32).collect();
     let system = point_system(DIGITS as u32);
 
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,

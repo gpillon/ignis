@@ -14,6 +14,7 @@
 //! ([`VisionItemControl`], the reference's `build_vision_control`).
 
 pub use ignis_artifact::vision::{Grid, MediaItem, PreparedPrompt, TokenSpan};
+pub use ignis_artifact::VisionResidency;
 
 use crate::types::TokenId;
 
@@ -68,6 +69,8 @@ pub struct Vision {
     /// The most merged tokens one item may hold; 0 = none named, which the
     /// leaf reads as the envelope.
     item_max_tokens: u32,
+    /// Where the load keeps the tower (ADR 0075, GitHub #414).
+    residency: VisionResidency,
 }
 
 /// A vision envelope outside `1..=VISION_MAX_TOKENS_LIMIT`.
@@ -92,6 +95,7 @@ impl Default for Vision {
             max_tokens: DEFAULT_VISION_MAX_TOKENS,
             pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
             item_max_tokens: 0,
+            residency: VisionResidency::Device,
         }
     }
 }
@@ -107,6 +111,7 @@ impl Vision {
             max_tokens,
             pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
             item_max_tokens: 0,
+            residency: VisionResidency::Device,
         })
     }
 
@@ -136,6 +141,20 @@ impl Vision {
     /// The item bound the load option carries; 0 when none was named.
     pub fn item_max_tokens(&self) -> u32 {
         self.item_max_tokens
+    }
+
+    /// The same envelope with the tower kept where `residency` says (ADR
+    /// 0075): on the device, or in pinned host memory, staged into the
+    /// prefill scratch for each media encode. The binder places the tower by
+    /// it ([`crate::model_load::model_scope`]) and the leaf sizes the
+    /// staging ring by it.
+    pub fn with_residency(self, residency: VisionResidency) -> Self {
+        Self { residency, ..self }
+    }
+
+    /// Where the load keeps the tower.
+    pub fn residency(&self) -> VisionResidency {
+        self.residency
     }
 
     /// The configured envelope, in merged vision tokens.
@@ -729,5 +748,18 @@ mod tests {
         assert_eq!(vision.pool_bytes(4096), 8 * EMBEDDING_PAGE_BYTES);
         assert_eq!(vision.output_transient_bytes(4096), 1024 * HIDDEN * 2);
         assert_eq!(vision.pool_bytes(4096), vision.output_transient_bytes(4096));
+    }
+
+    /// ADR 0075 (GitHub #414): the residency rides the load option beside the
+    /// envelope, the pool and the item bound, and moves none of them.
+    #[test]
+    fn a_residency_rides_the_option_and_moves_nothing_else() {
+        assert_eq!(Vision::default().residency(), VisionResidency::Device);
+        assert_eq!(Vision::new(4096).unwrap().residency(), VisionResidency::Device);
+        let host = Vision::new(4096).unwrap().with_pool_bytes(640 << 20).with_item_max_tokens(1024)
+            .with_residency(VisionResidency::Host);
+        assert_eq!(host.residency(), VisionResidency::Host);
+        assert_eq!((host.max_tokens(), host.requested_pool_bytes(), host.item_max_tokens()), (4096, 640 << 20, 1024));
+        assert_eq!(host.with_residency(VisionResidency::Device).residency(), VisionResidency::Device);
     }
 }

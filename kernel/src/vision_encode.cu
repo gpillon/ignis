@@ -20,6 +20,12 @@
 // width and pages, several segments in one call, and the DeepStack mergers,
 // which tap the residual between blocks. The 27B's call passes its own width
 // and pool pages and no DeepStack, so it runs what it ran before.
+//
+// GitHub #414 (ADR 0075): under the host vision residency the 27B's tower
+// lives in mapped pinned host memory, and an encode stages it into the same
+// scratch, after its workspace, through a ring of three slots (TowerStager
+// below). The ops and their order are unchanged; only the weights' addresses
+// are the slots'. A device load passes no stager and runs exactly as before.
 
 #include "ignis_image_vision.h"
 #include "ignis_step.h"
@@ -40,11 +46,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -156,6 +164,199 @@ void copy_host(const void *src, ninfer::Tensor &dst, cudaStream_t stream, const 
   }
 }
 
+// ---------------------------------------------------------------------------
+// GitHub #414 (ADR 0075): the tower staged into the prefill scratch.
+// ---------------------------------------------------------------------------
+
+// The binder gives each tensor a span of its own in the mapped allocation,
+// 4 KiB aligned at both ends, in directory order: a stage's tensors are
+// separated by less than two pages of padding each. A stage is copied as runs
+// of tensors with only that padding between them, each run whole, so a
+// tensor's planes keep their offsets from its payload; a run starts at its
+// first payload aligned down to the scratch's alignment and lands at that
+// alignment in its slot, so every tensor keeps its own (mod 256).
+constexpr std::size_t kStagingSpanSlack = 2 * 4096 + kVisionWorkspaceAlignment;
+
+std::size_t align_up(std::size_t bytes, std::size_t alignment) {
+  return (bytes + alignment - 1) / alignment * alignment;
+}
+
+// One contiguous host range of a stage and where it lands in the stage's slot.
+struct StagedRun {
+  const unsigned char *host = nullptr;
+  std::size_t bytes = 0;
+  std::size_t offset = 0;
+};
+
+// A stage laid out in its slot: its runs, and the slot bytes they take.
+struct StageCopy {
+  std::vector<StagedRun> runs;
+  std::size_t bytes = 0;
+};
+
+// Lay out the stage `tensors` (sorted here by host address) as runs in a
+// slot. Each tensor's code plane is its payload's start and its other planes
+// lie inside the payload (model.cu's `to_weight`), which is what lets a run
+// carry them; a tensor that is not so is refused rather than half copied.
+StageCopy plan_stage(std::vector<ninfer::Weight *> &tensors) {
+  for (const ninfer::Weight *w : tensors) {
+    const auto *lo = static_cast<const unsigned char *>(w->payload);
+    const auto *hi = lo + w->payload_bytes;
+    if (lo == nullptr || w->qdata != w->payload) {
+      throw std::runtime_error("a tower tensor's code plane is not its payload's start");
+    }
+    for (const void *plane : {w->qhigh, w->scales}) {
+      const auto *q = static_cast<const unsigned char *>(plane);
+      if (q != nullptr && (q < lo || q >= hi)) {
+        throw std::runtime_error("a tower tensor's plane lies outside its payload");
+      }
+    }
+  }
+  std::sort(tensors.begin(), tensors.end(),
+            [](const ninfer::Weight *a, const ninfer::Weight *b) { return a->payload < b->payload; });
+  StageCopy copy;
+  for (const ninfer::Weight *w : tensors) {
+    const auto *lo = static_cast<const unsigned char *>(w->payload);
+    const auto *hi = lo + w->payload_bytes;
+    if (!copy.runs.empty()) {
+      StagedRun &run = copy.runs.back();
+      const unsigned char *end = run.host + run.bytes;
+      if (lo >= end && static_cast<std::size_t>(lo - end) < kStagingSpanSlack) {
+        run.bytes = static_cast<std::size_t>(hi - run.host);
+        continue;
+      }
+    }
+    const auto *start = reinterpret_cast<const unsigned char *>(
+        reinterpret_cast<std::uintptr_t>(lo) & ~static_cast<std::uintptr_t>(kVisionWorkspaceAlignment - 1));
+    copy.runs.push_back({start, static_cast<std::size_t>(hi - start), 0});
+  }
+  for (StagedRun &run : copy.runs) {
+    run.offset = align_up(copy.bytes, kVisionWorkspaceAlignment);
+    copy.bytes = run.offset + run.bytes;
+  }
+  return copy;
+}
+
+// Point each of `tensors` at its bytes in `slot`, where `copy` lands them --
+// the pointer rebase #407's `visit_weights` does for its staged tower.
+void rebase_stage(const std::vector<ninfer::Weight *> &tensors, const StageCopy &copy, unsigned char *slot) {
+  for (ninfer::Weight *w : tensors) {
+    const auto *lo = static_cast<const unsigned char *>(w->payload);
+    const auto run = std::find_if(copy.runs.begin(), copy.runs.end(), [&](const StagedRun &r) {
+      return lo >= r.host && lo < r.host + r.bytes;
+    });
+    const auto rebase = [&](const void *p) -> const void * {
+      return p == nullptr ? nullptr : slot + run->offset + (static_cast<const unsigned char *>(p) - run->host);
+    };
+    w->qhigh = rebase(w->qhigh);
+    w->scales = rebase(w->scales);
+    w->qdata = rebase(w->qdata);
+    w->payload = rebase(w->payload);
+  }
+}
+
+// Each stage's tensors of `weights`, in stage order.
+template <class Weights> auto stage_tensors(Weights &weights) {
+  using Weight = std::remove_reference_t<decltype(weights.patch_embedding)>;
+  std::array<std::vector<Weight *>, kVisionStagingStages> stages;
+  visit_vision_stages(weights, [&](std::size_t stage, Weight &w) { stages[stage].push_back(&w); });
+  return stages;
+}
+
+void check_cuda(cudaError_t err, const char *what) {
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("staging the vision tower: ") + what + ": " + cudaGetErrorString(err));
+  }
+}
+
+// One encode's side of the staging. Stage t lands in slot t % 3: its copy
+// runs on the ring's copy stream once stage t - 3 has been read from that
+// slot, and the model's stream waits for it before the stage's first op. The
+// encode asks the next two stages to copy before each stage computes, so two
+// copies stay ahead of the compute and the merger's 25 MB fc2 is in its slot
+// before the last block ends.
+class TowerStager {
+ public:
+  // `weights` is the encode's own copy of the tower, rebased here onto the
+  // ring at `ring`: IGNIS_VISION_STAGING_SLOTS slots of the staging's
+  // `slot_bytes`.
+  TowerStager(const VisionStaging &staging, VisionWeights &weights, unsigned char *ring) : staging_(staging) {
+    auto stages = stage_tensors(weights);
+    for (std::size_t s = 0; s < kVisionStagingStages; ++s) {
+      copies_[s] = plan_stage(stages[s]);
+      if (copies_[s].bytes > staging_.slot_bytes) {
+        throw std::runtime_error("vision tower stage " + std::to_string(s) + " takes " +
+                                 std::to_string(copies_[s].bytes) + " bytes, a staging slot holds " +
+                                 std::to_string(staging_.slot_bytes));
+      }
+      rebase_stage(stages[s], copies_[s], ring + (s % IGNIS_VISION_STAGING_SLOTS) * staging_.slot_bytes);
+      slots_[s] = ring + (s % IGNIS_VISION_STAGING_SLOTS) * staging_.slot_bytes;
+    }
+  }
+
+  TowerStager(const TowerStager &) = delete;
+  TowerStager &operator=(const TowerStager &) = delete;
+
+  // Every copy lands before the scratch is given back: on an encode that
+  // completed the model's stream has waited for all of them already, and on
+  // one that threw midway this keeps a late copy out of the next step's bytes.
+  ~TowerStager() { cudaStreamSynchronize(staging_.copy); }
+
+  // Before the item's uploads: nothing may land in the scratch before the
+  // work already queued on it, then the first two stages start copying.
+  void begin(cudaStream_t stream) {
+    check_cuda(cudaEventRecord(staging_.head, stream), "record the encode's head");
+    check_cuda(cudaStreamWaitEvent(staging_.copy, staging_.head, 0), "wait for the encode's head");
+    issue_through(1);
+  }
+
+  // Before stage `stage`'s first op: keep two copies ahead, then wait for its
+  // own. At stage 0 the item's uploads are queued: the third slot's first copy
+  // waits for them, so it does not share the link with them and the first
+  // stage starts as early as with two slots.
+  void before(std::size_t stage, cudaStream_t stream) {
+    if (stage == 0) {
+      check_cuda(cudaEventRecord(staging_.head, stream), "record the item's uploads");
+    }
+    issue_through(stage + IGNIS_VISION_STAGING_SLOTS - 1);
+    check_cuda(cudaStreamWaitEvent(stream, staging_.copied[stage % IGNIS_VISION_STAGING_SLOTS], 0),
+               "wait for a stage's copy");
+  }
+
+  // After stage `stage`'s last op: its slot may take the stage three on.
+  void after(std::size_t stage, cudaStream_t stream) {
+    check_cuda(cudaEventRecord(staging_.consumed[stage % IGNIS_VISION_STAGING_SLOTS], stream),
+               "record a stage read");
+  }
+
+ private:
+  // Issue every copy through stage `last` not issued yet. Stage t's slot was
+  // last read by stage t - 3, whose `consumed` record precedes this call in
+  // host order, so the wait names that read.
+  void issue_through(std::size_t last) {
+    while (issued_ < kVisionStagingStages && issued_ <= last) {
+      const std::size_t t = issued_++;
+      const std::size_t slot = t % IGNIS_VISION_STAGING_SLOTS;
+      if (t >= IGNIS_VISION_STAGING_SLOTS) {
+        check_cuda(cudaStreamWaitEvent(staging_.copy, staging_.consumed[slot], 0), "wait for a slot");
+      } else if (t >= 2) {
+        check_cuda(cudaStreamWaitEvent(staging_.copy, staging_.head, 0), "wait for the item's uploads");
+      }
+      for (const StagedRun &run : copies_[t].runs) {
+        check_cuda(cudaMemcpyAsync(slots_[t] + run.offset, run.host, run.bytes, cudaMemcpyHostToDevice,
+                                   staging_.copy),
+                   "copy a stage");
+      }
+      check_cuda(cudaEventRecord(staging_.copied[slot], staging_.copy), "record a stage's copy");
+    }
+  }
+
+  const VisionStaging &staging_;
+  std::array<StageCopy, kVisionStagingStages> copies_{};
+  std::array<unsigned char *, kVisionStagingStages> slots_{};
+  std::size_t issued_ = 0;
+};
+
 // A merger: the tower's, whose LayerNorm runs over the hidden before the
 // 2x2 view, or a DeepStack one (GitHub #320), whose LayerNorm runs over the
 // merged width after it (transformers' `use_postshuffle_norm`).
@@ -221,10 +422,25 @@ ninfer::Tensor merger_hidden(ninfer::Tensor &x, const VisionMergerWeights &m, bo
 
 // The encoder over one call, enqueued on `stream` into the merger's pages
 // (GitHub #243) and the DeepStack outputs, its intermediates in `backing` as
-// `layout` places them (VisionContext::encode).
+// `layout` places them (VisionContext::encode). GitHub #414: with a
+// `stager`, `w` is its rebased copy and each stage's ops wait for its slot.
 void encode(const VisionWeights &w, const VisionEncodeCall &call,
             const VisionWorkspaceLayout &layout, const ninfer::DeviceSpan &backing,
-            std::int32_t patches, std::int32_t tokens, cudaStream_t stream) {
+            std::int32_t patches, std::int32_t tokens, cudaStream_t stream,
+            TowerStager *stager = nullptr) {
+  const auto before = [&](std::size_t stage) {
+    if (stager != nullptr) {
+      stager->before(stage, stream);
+    }
+  };
+  const auto after = [&](std::size_t stage) {
+    if (stager != nullptr) {
+      stager->after(stage, stream);
+    }
+  };
+  if (stager != nullptr) {
+    stager->begin(stream);
+  }
   ninfer::Tensor position_ids = layout.position_ids.bind(backing);
   ninfer::Tensor cu_seqlens = layout.cu_seqlens.bind(backing);
   ninfer::Tensor pos_indices = layout.pos_indices.bind(backing);
@@ -237,6 +453,7 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
   ninfer::Tensor x = layout.x.bind(backing);
   ninfer::Tensor patch_bf16 = layout.patch_bf16.bind(backing);
   copy_host(call.patches, patch_bf16, stream, "patches");
+  before(0);
   ninfer::ops::linear(patch_bf16, w.patch_embedding, x, stream);
   ninfer::ops::add_bias(bf16_vector(w.patch_embedding_bias, kVisionHidden), x, stream);
   // The artifact's table is [rows, hidden] row-major, which is the tensor
@@ -245,11 +462,13 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
                                       ninfer::DType::BF16,
                                       {kVisionHidden, kVisionPositionEmbeddings});
   ninfer::ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+  after(0);
 
   static const ninfer::ops::RopeFrequencies frequencies =
       ninfer::ops::rope_vision_frequencies(kVisionRopeTheta);
   for (std::size_t b = 0; b < w.layers.size(); ++b) {
     const VisionLayerWeights &block = w.layers[b];
+    before(1 + b);
     {
       ninfer::Tensor attended = layout.attended.bind(backing);
       {
@@ -300,6 +519,7 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
       ninfer::ops::add_bias(bf16_vector(block.fc2_bias, kVisionHidden), down, stream);
       ninfer::ops::residual_add(down, x, stream);
     }
+    after(1 + b);
     // GitHub #320: the DeepStack mergers that tap the residual after this
     // block (transformers' `deepstack_visual_indexes`).
     for (std::int32_t i = 0; i < call.deepstack_count; ++i) {
@@ -316,7 +536,11 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
 
   const VisionMergerWeights merger{w.merger_fc1,  w.merger_fc1_bias,   w.merger_fc2,
                                    w.merger_fc2_bias, w.merger_norm_weight, w.merger_norm_bias};
+  const std::size_t merger_stage = 1 + w.layers.size();
+  before(merger_stage);
   const ninfer::Tensor hidden = merger_hidden(x, merger, false, layout, backing, tokens, stream);
+  after(merger_stage);
+  before(merger_stage + 1);
   // GitHub #243: the merger's second projection writes the item's columns
   // straight into its pool pages, one call per page. The columns are the
   // GEMM's N, so a page is a plain column range of the same
@@ -332,6 +556,7 @@ void encode(const VisionWeights &w, const VisionEncodeCall &call,
     ninfer::ops::linear(hidden_page, w.merger_fc2, output, stream);
     ninfer::ops::add_bias(bf16_vector(w.merger_fc2_bias, call.out_hidden), output, stream);
   }
+  after(merger_stage + 1);
 }
 
 // GitHub #320: a W8G32 matrix of the image model's tower as `ops::linear`
@@ -518,6 +743,26 @@ std::size_t ignis_vision_workspace_bytes(std::int32_t tokens, std::int32_t segme
   return build_workspace_layout(tokens * kVisionMergeUnit, tokens, segments).bytes;
 }
 
+std::size_t ignis_vision_staging_slot_bytes(const VisionWeights &weights) {
+  std::array<std::size_t, kVisionStagingStages> bound{};
+  visit_vision_stages(weights, [&](std::size_t stage, const ninfer::Weight &w) {
+    bound[stage] += w.payload_bytes + kStagingSpanSlack;
+  });
+  return align_up(*std::max_element(bound.begin(), bound.end()), kVisionWorkspaceAlignment);
+}
+
+void ignis_vision_staging_check(const VisionWeights &weights, std::size_t slot_bytes) {
+  VisionWeights copy = weights;
+  auto stages = stage_tensors(copy);
+  for (std::size_t s = 0; s < kVisionStagingStages; ++s) {
+    const StageCopy stage = plan_stage(stages[s]);
+    if (stage.bytes > slot_bytes) {
+      throw std::runtime_error("vision tower stage " + std::to_string(s) + " takes " + std::to_string(stage.bytes) +
+                               " bytes, a staging slot holds " + std::to_string(slot_bytes));
+    }
+  }
+}
+
 extern "C" int32_t ignis_media_encode(struct ignis_model *model,
                                       const struct ignis_media_encode_input *input,
                                       struct ignis_media_embedding **out_embedding) {
@@ -568,8 +813,14 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     const auto patches = static_cast<std::int32_t>(tokens * kVisionMergeUnit);
     const VisionWorkspaceLayout layout = build_workspace_layout(
         patches, static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(t));
-    if (layout.bytes > model->scratch->capacity()) {
-      throw std::runtime_error("the item needs " + std::to_string(layout.bytes) +
+    // GitHub #414: a staged tower's ring follows the workspace, as the load
+    // sized the scratch for (`plan_load_sizes`).
+    const VisionStaging &staging = model->vision_staging;
+    const std::size_t ring_offset = align_up(layout.bytes, kVisionWorkspaceAlignment);
+    const std::size_t need =
+        staging.staged() ? ring_offset + IGNIS_VISION_STAGING_SLOTS * staging.slot_bytes : layout.bytes;
+    if (need > model->scratch->capacity()) {
+      throw std::runtime_error("the item needs " + std::to_string(need) +
                                " workspace bytes, the load reserved " +
                                std::to_string(model->scratch->capacity()));
     }
@@ -609,8 +860,16 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     // Held until the stream has drained: nothing else may take these bytes
     // while the encoder's kernels still run on them.
     ninfer::DeviceArena::Scope scope = model->scratch->scope();
-    const ninfer::DeviceSpan backing =
-        model->scratch->alloc_bytes(layout.bytes, kVisionWorkspaceAlignment);
+    const ninfer::DeviceSpan backing = model->scratch->alloc_bytes(need, kVisionWorkspaceAlignment);
+    // GitHub #414: the encode's own copy of the tower's weights, rebased onto
+    // the ring. Destroyed before `scope`, so every copy has landed before the
+    // scratch is given back.
+    VisionWeights staged_weights;
+    std::optional<TowerStager> stager;
+    if (staging.staged()) {
+      staged_weights = model->vision;
+      stager.emplace(staging, staged_weights, static_cast<unsigned char *>(backing.data) + ring_offset);
+    }
     VisionEncodeCall call;
     call.patches = input->patches;
     call.position_ids = input->position_ids;
@@ -622,8 +881,8 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     for (const std::int32_t page : embedding->pages) {
       call.pages.push_back(pool.page_ptr(page));
     }
-    encode(model->vision, call, layout, backing, patches, static_cast<std::int32_t>(tokens),
-           model->stream);
+    encode(stager ? staged_weights : model->vision, call, layout, backing, patches,
+           static_cast<std::int32_t>(tokens), model->stream, stager ? &*stager : nullptr);
     const cudaError_t err = cudaStreamSynchronize(model->stream);
     if (err != cudaSuccess) {
       set_error(std::string("ignis_media_encode: cudaStreamSynchronize failed: ") +
@@ -641,6 +900,34 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
 
 extern "C" uint32_t ignis_media_embedding_columns(const struct ignis_media_embedding *embedding) {
   return embedding == nullptr ? 0 : static_cast<uint32_t>(embedding->columns);
+}
+
+extern "C" int32_t ignis_media_embedding_read(const struct ignis_media_embedding *embedding, void *out,
+                                              uint64_t out_bytes) {
+  if (embedding == nullptr || embedding->model == nullptr || out == nullptr) {
+    set_error("ignis_media_embedding_read: null argument");
+    return -1;
+  }
+  const VisionEmbeddingPool &pool = embedding->model->vision_pool;
+  const std::size_t column_bytes = static_cast<std::size_t>(embedding->model->hidden) * sizeof(std::uint16_t);
+  const std::size_t bytes = static_cast<std::size_t>(embedding->columns) * column_bytes;
+  if (out_bytes != bytes) {
+    set_error("ignis_media_embedding_read: the embedding is " + std::to_string(bytes) + " bytes, the output " +
+              std::to_string(out_bytes));
+    return -1;
+  }
+  for (std::size_t p = 0; p < embedding->pages.size(); ++p) {
+    const auto first = static_cast<std::int32_t>(p) * pool.page_columns;
+    const std::int32_t take = std::min(pool.page_columns, embedding->columns - first);
+    const cudaError_t err = cudaMemcpy(static_cast<unsigned char *>(out) + static_cast<std::size_t>(first) * column_bytes,
+                                       pool.page_ptr(embedding->pages[p]),
+                                       static_cast<std::size_t>(take) * column_bytes, cudaMemcpyDefault);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_media_embedding_read: ") + cudaGetErrorString(err));
+      return -1;
+    }
+  }
+  return 0;
 }
 
 extern "C" void ignis_media_embedding_release(struct ignis_media_embedding *embedding) {

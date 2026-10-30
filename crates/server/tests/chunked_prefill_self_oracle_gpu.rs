@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use ignis_artifact::{CudaDevice, FrontendSet, ModelScope, Reader, bind_model_scope_27b_with, materialize};
+use ignis_artifact::{CudaDevice, FrontendSet, ModelScope, VisionResidency, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::Vision;
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
@@ -137,7 +137,7 @@ fn self_oracle(vision: Option<Vision>) {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
 
-    let scope = ModelScope { draft: None, vision: vision.is_some(), fp8_exceptions: false };
+    let scope = ModelScope { draft: None, vision: vision.is_some(), vision_residency: VisionResidency::Device, fp8_exceptions: false };
     let (plan, handles) =
         bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {

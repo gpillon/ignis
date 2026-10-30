@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use ignis_artifact::{bind_model_scope_27b_with, materialize, CudaDevice, FrontendSet, ModelScope, Reader};
+use ignis_artifact::{bind_model_scope_27b_with, materialize, CudaDevice, FrontendSet, ModelScope, VisionResidency, Reader};
 use ignis_core::gpu_profile;
 use ignis_core::{
     ConcreteScheduler, DecodeParams, KvFormat, RequestClass, RequestId,
@@ -184,7 +184,7 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
     let eos = frontend.eos_token_id().expect("eos");
     let tokenizer_frontend = FrontendSet::from_reader(&reader).expect("frontend");
     let provider = ArtifactTemplateProvider::new(frontend).with_vision(processor.clone());
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,

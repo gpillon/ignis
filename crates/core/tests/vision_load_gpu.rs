@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use ignis_artifact::{bind_model_scope_27b_with, materialize, text_scope_27b, CudaDevice, ModelScope, Reader};
+use ignis_artifact::{bind_model_scope_27b_with, materialize, text_scope_27b, CudaDevice, ModelScope, VisionResidency, Reader};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b_with_options;
@@ -54,7 +54,7 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
         return;
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {ARTIFACT}: {e}"));
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let text_len = text_scope_27b().len();
     assert_eq!(handles.len(), text_len + VISION_OBJECTS);

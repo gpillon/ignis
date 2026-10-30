@@ -53,7 +53,7 @@ use std::path::Path;
 use ignis_artifact::vision::VisionProcessor;
 use ignis_artifact::{
     bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
-    DraftModule, FrontendSet, MessageContent, ModelScope, Reader, Role,
+    DraftModule, FrontendSet, MessageContent, ModelScope, VisionResidency, Reader, Role,
 };
 use ignis_bench::oracle::{
     meets_g1_floor, overall_teacher_forced_agreement, score_teacher_forced, TeacherForcedResult,
@@ -316,7 +316,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
 
     // --- AC 1: the two load options together -----------------------------
     let (plan, handles) =
-        bind_model_scope_27b_with(&reader, ModelScope { draft: Some(DraftModule::Dflash2), vision: true, fp8_exceptions: false })
+        bind_model_scope_27b_with(&reader, ModelScope { draft: Some(DraftModule::Dflash2), vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
             .unwrap_or_else(|e| panic!("bind with the drafter and vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,

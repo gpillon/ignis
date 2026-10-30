@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 
 use ignis_artifact::{
     ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent,
-    ModelScope, Reader, Role, bind_model_scope_27b_with, materialize,
+    ModelScope, VisionResidency, Reader, Role, bind_model_scope_27b_with, materialize,
 };
 use ignis_core::attn_tap::{AttnTapCapture, KV_HEADS, with_attn_tap_hq};
 use ignis_core::compute::ModelConfig;
@@ -186,7 +186,7 @@ fn the_consumed_capture_reads_what_hq_attention_read() {
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let processor = frontend.vision_processor().unwrap_or_else(|e| panic!("vision processor: {e}"));
     let tokenizer = frontend.tokenizer();
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,

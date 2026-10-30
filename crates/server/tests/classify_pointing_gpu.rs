@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use ignis_artifact::{
     ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent,
-    ModelScope, Reader, Role, bind_model_scope_27b_with, materialize,
+    ModelScope, VisionResidency, Reader, Role, bind_model_scope_27b_with, materialize,
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
@@ -234,7 +234,7 @@ fn a_constrained_readout_points_at_the_blue_button() {
         })
         .collect();
 
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Device, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(d) => d,
