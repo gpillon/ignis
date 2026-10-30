@@ -77,12 +77,14 @@ const BUDGET: &str = "17179869184";
 /// the workspace line is the text-only load's 395,898,880 bytes plus 25,600:
 /// the vision attention readout's share of the prefill scratch at a 4,096-token
 /// envelope, under a KV page, so the pool and the context are the text-only
-/// load's. Every other trellis line is unchanged.
+/// load's. The decode graph line grows by 8 bytes too (vision's rope staging;
+/// 20,621,328 text-only) and the verify round's by 64; the trellis workspace is
+/// unchanged.
 const WORKSPACE_BYTES: u64 = 395_924_480;
 /// The same line under `--vision-enabled false`.
 const TEXT_ONLY_WORKSPACE_BYTES: u64 = 395_898_880;
 const TRELLIS_WORKSPACE_BYTES: u64 = 36_225_280;
-const DECODE_GRAPH_BYTES: u64 = 20_621_328;
+const DECODE_GRAPH_BYTES: u64 = 20_621_336;
 /// Spec 05b's capacity simulation: the 16 GB card less 1 GiB and less 3 GiB
 /// of simulated desktop.
 const BUDGET_LESS_1_GIB: u64 = 17_179_869_184 - (1 << 30);
