@@ -113,10 +113,12 @@ pinned host memory rather than VRAM (ADR 0062): the card reads one row per
 token over PCIe and gives the 1.35 GB to the KV pool. So the 27B plans host
 memory too, the way Flash-Next does: the table, the host retained slots
 (232.5 MB each, 16 by default: 3.72 GB), the KV-RAM arena (2 GiB, 8 GiB under
-`make`) and KV-disk's staging when the tier is on must leave the 4 GiB margin
-of the available RAM. Under the `make` defaults that is about **18 GB
-available**. A load below it is refused before anything is pinned, naming
-the 27B's own flags:
+`make`), the vision tower and the embedding pool under the `host` vision
+residency (below) and KV-disk's staging when the tier is on must leave the
+4 GiB margin of the available RAM. Under the `make` defaults on a 32 GB card,
+whose profile turns vision on (297 MB of tower and a 320 MiB pool), that is
+about **18.6 GB available**; without vision, about 18 GB. A load below it is
+refused before anything is pinned, naming the 27B's own flags:
 
 ```
 not enough RAM: the load holds 12.7 GiB and keeps 4 GiB free for the system, so it needs 16.7 GiB
