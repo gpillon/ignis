@@ -32,6 +32,9 @@ def rel_errors(quant, bf16_root, planned, device="cuda", log=print, override=Non
 
     def tensor(handles, root, shard, name):
         if (root, shard) not in handles:     # an override's shards may share the quant's names
+            # One shard open at a time: on Windows an open shard is charged its whole size as commit,
+            # and the BF16's 18 alone took 57 GB, so the head's could not open on 2026-10-30 (#422).
+            handles.clear()
             handles[root, shard] = safe_open(os.path.join(root, shard), framework="pt", device="cpu")
         return handles[root, shard].get_tensor(name)
 
