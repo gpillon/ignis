@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { askForPersistence, type StorageManagerLike } from "./persist.ts";
+import {
+  askForPersistence,
+  askViaNotifications,
+  type NotificationsLike,
+  notificationsStep,
+  readKeeping,
+  type StorageManagerLike,
+} from "./persist.ts";
 
 // The Playground asks the browser to keep its storage, once, when it is not
 // kept yet; whatever the browser answers, nothing here throws.
@@ -48,5 +55,67 @@ describe("asking for persistent storage", () => {
     };
     expect(await askForPersistence(persistedThrows)).toBe("failed");
     expect(persistedThrows.persist).not.toHaveBeenCalled();
+  });
+});
+
+describe("reading whether the storage is kept", () => {
+  it("says kept, best-effort and unsupported, and survives a rejecting call", async () => {
+    expect(await readKeeping(manager(true, true))).toBe("kept");
+    expect(await readKeeping(manager(false, true))).toBe("best-effort");
+    expect(await readKeeping(undefined)).toBe("unsupported");
+    expect(await readKeeping({ persisted: async () => Promise.reject(new Error("no")), persist: async () => true })).toBe("best-effort");
+  });
+});
+
+const notifier = (permission: NotificationPermission, answer: NotificationPermission | Error = permission) =>
+  ({
+    permission,
+    requestPermission: vi.fn(async () => {
+      if (answer instanceof Error) throw answer;
+      return answer;
+    }),
+  }) satisfies NotificationsLike;
+
+describe("the notifications step", () => {
+  it("is available only while the permission is undecided", () => {
+    expect(notificationsStep(notifier("default"))).toBe("available");
+    expect(notificationsStep(notifier("granted"))).toBe("granted");
+    expect(notificationsStep(notifier("denied"))).toBe("denied");
+    expect(notificationsStep(undefined)).toBe("unsupported");
+  });
+
+  it("asks the permission, then the storage again: refused, then granted", async () => {
+    const storage = { persisted: vi.fn(async () => false), persist: vi.fn().mockResolvedValueOnce(true) };
+    const n = notifier("default", "granted");
+    expect(await askViaNotifications(storage, n)).toEqual({ permission: "granted", persistence: "granted" });
+    expect(n.requestPermission).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a refusal that notifications did not change", async () => {
+    const result = await askViaNotifications(manager(false, false), notifier("default", "granted"));
+    expect(result).toEqual({ permission: "granted", persistence: "refused" });
+  });
+
+  it("asks the storage again even when the permission is denied in the prompt", async () => {
+    const storage = manager(false, false);
+    expect(await askViaNotifications(storage, notifier("default", "denied"))).toEqual({ permission: "denied", persistence: "refused" });
+    expect(storage.persist).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks nothing when the permission is already decided or the API is missing", async () => {
+    const storage = manager(false, true);
+    const denied = notifier("denied");
+    await askViaNotifications(storage, denied);
+    await askViaNotifications(storage, notifier("granted"));
+    await askViaNotifications(storage, undefined);
+    expect(denied.requestPermission).not.toHaveBeenCalled();
+    expect(storage.persist).not.toHaveBeenCalled();
+  });
+
+  it("goes on when a call rejects", async () => {
+    const storage = manager(false, true);
+    expect(await askViaNotifications(storage, notifier("default", new Error("no")))).toEqual({ permission: "failed", persistence: "granted" });
+    const persistFails = { persisted: async () => false, persist: async () => Promise.reject(new Error("no")) };
+    expect((await askViaNotifications(persistFails, notifier("default", "granted"))).persistence).toBe("failed");
   });
 });

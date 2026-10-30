@@ -27,6 +27,7 @@ tabs, **General** and **Tools**.
 | **Parallel sessions** (*stored*) | off | nothing: page behaviour |
 | **Dictation stops after**: Off, 2 s, 3 s, 5 s (*stored*) | 3 s | nothing: the silence the mic's dictation asks the server to end on |
 | **Transport**: WebSocket, HTTP (*stored*) | WebSocket | the route the chat uses |
+| **Keeping the sessions** | read from the browser | nothing: asks the browser to keep this page's storage |
 | **Markdown in replies** | on | nothing: display only |
 
 The system message the server receives is the ignis prompt (what the enabled
@@ -77,6 +78,30 @@ in one session while another still streams (a session still answers one
 reply at a time). The **WebSocket** carries every stream at once and sends
 only what is new each turn; **HTTP** opens one connection per stream, and the
 browser allows five, so the rest wait. The Decide tab uses HTTP either way.
+
+### Keeping the sessions
+
+The sessions live in this browser's storage, which a browser treats as
+best-effort: when the disk runs short it may delete an origin's data whole.
+This section reads the state each time Settings shows and says one of three
+things: **Kept** (the browser will not delete the sessions on its own),
+**Best-effort** (it may, when the disk runs short), or that this browser has no
+Storage API, which leaves nothing to ask.
+
+When the storage is best-effort, **Ask the browser to keep them** asks on your
+click. Firefox puts the question to you. A Chromium-based browser answers by
+itself, and refuses a site it does not count as important. The section then
+says it was refused and, while the notifications permission can still be asked
+for, offers **Allow notifications, then ask again**: a Chromium-based browser
+counts that permission as one sign that a site matters. The Playground sends no
+notifications; the permission is only that sign. That click asks the browser
+for the permission, then asks again to keep the storage, and the section says
+what came of it. If the browser still refuses, installing the page as an app
+(the browser's install option) is the other way. The button is not offered when
+the browser has no Notification API or the permission is already allowed or
+blocked, and the section says so. Nothing here is asked until you click, apart
+from the one request the Playground makes at start
+([sessions](sessions.md#asking-the-browser-to-keep-it)).
 
 ## Tools
 

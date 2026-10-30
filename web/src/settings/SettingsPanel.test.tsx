@@ -4,7 +4,7 @@ import { activeTransport, chooseTransport, fallBackToHttp } from "../api/transpo
 import { chooseSilence, dictationSilence } from "../speech/silence.ts";
 import { ALL_TOOLS, NO_TOOLS, type ToolsState } from "../tools/index.ts";
 import { DEFAULT_SETTINGS, type PlaygroundSettings } from "./defaults.ts";
-import { SettingsPanel, ToolsSetting } from "./SettingsPanel.tsx";
+import { type KeepView, KeepSessions, SettingsPanel, ToolsSetting } from "./SettingsPanel.tsx";
 import { readBudgetInput } from "./ThinkingBudgetField.tsx";
 
 // The rounds are a setting of the tools, so they live where the tools do:
@@ -215,5 +215,72 @@ describe("SettingsPanel: the transport", () => {
     chooseTransport("websocket");
     expect(activeTransport()).toBe("websocket");
     expect(transportRegion(panel())).not.toContain("did not open the WebSocket");
+  });
+});
+
+// The sessions section says whether the browser keeps them and offers the two
+// clicks, the second only after a refusal and only while notifications can
+// still be asked for.
+
+const keepView = (over: Partial<KeepView>): string =>
+  renderToStaticMarkup(
+    <KeepSessions
+      view={{ keeping: "best-effort", asked: null, via: null, step: "available", busy: false, ...over }}
+      onAsk={() => {}}
+      onNotify={() => {}}
+    />,
+  );
+
+describe("KeepSessions", () => {
+  it("says kept and offers nothing", () => {
+    const html = keepView({ keeping: "kept" });
+    expect(html).toContain("Kept: the browser will not delete");
+    expect(html).not.toContain("<button");
+  });
+
+  it("says best-effort and offers the first ask only", () => {
+    const html = keepView({});
+    expect(html).toContain("Best-effort");
+    expect(html).toContain("Ask the browser to keep them");
+    expect(html).not.toContain("Allow notifications");
+  });
+
+  it("says there is no Storage API and offers nothing", () => {
+    const html = keepView({ keeping: "unsupported" });
+    expect(html).toContain("no Storage API");
+    expect(html).not.toContain("<button");
+  });
+
+  it("offers the notifications step after a refusal, with its explanation", () => {
+    const html = keepView({ asked: "refused" });
+    expect(html).toContain("Allow notifications, then ask again");
+    expect(html).toContain("Chromium-based browser");
+    expect(html).not.toContain("Ask the browser to keep them");
+  });
+
+  it("hides the notifications step when denied, granted or missing, and says why", () => {
+    for (const step of ["denied", "granted", "unsupported"] as const) {
+      const html = keepView({ asked: "refused", step });
+      expect(html).not.toContain("<button");
+      expect(html.toLowerCase()).toContain("installing the page as an app");
+    }
+    expect(keepView({ asked: "refused", step: "denied" })).toContain("blocked");
+  });
+
+  it("points to installing the app when notifications did not help, and says when they did", () => {
+    expect(keepView({ asked: "refused", via: { permission: "granted", persistence: "refused" } })).toContain("Installing the page as an app");
+    expect(keepView({ asked: "refused", via: { permission: "denied", persistence: "refused" } })).not.toContain("<button");
+    expect(keepView({ keeping: "kept", asked: "refused", via: { permission: "granted", persistence: "granted" } })).toContain(
+      "once notifications were allowed",
+    );
+  });
+
+  it("says what a first grant or a failed call came of", () => {
+    expect(keepView({ keeping: "kept", asked: "granted" })).toContain("Kept. The browser will not delete");
+    expect(keepView({ asked: "failed" })).toContain("failed");
+  });
+
+  it("sits in the General tab", () => {
+    expect(panel()).toContain("Keeping the sessions");
   });
 });

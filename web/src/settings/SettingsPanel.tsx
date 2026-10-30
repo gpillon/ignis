@@ -1,10 +1,22 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { REASONING_EFFORTS } from "../api/request.ts";
 import { chooseTransport, useTransport } from "../api/transport.ts";
 import { ignisPrompt, setAllTools, type ToolsState, toolsInUse } from "../tools/index.ts";
 import { useMemoryNotes } from "../tools/local/memory.ts";
 import { setTavilyKey, useTavilyKey } from "../tools/web/tavilyKey.ts";
-import { caption, field } from "../ui/classes.ts";
+import {
+  askForPersistence,
+  askViaNotifications,
+  type Keeping,
+  type NotificationsLike,
+  type NotificationsStep,
+  notificationsStep,
+  type Persistence,
+  readKeeping,
+  type StorageManagerLike,
+  type ViaNotifications,
+} from "../store/persist.ts";
+import { actionInk, actionShape, caption, field } from "../ui/classes.ts";
 import { chooseSilence, SILENCE_CHOICES, useSilence } from "../speech/silence.ts";
 import { Segmented } from "../ui/Segmented.tsx";
 import { Slider } from "../ui/Slider.tsx";
@@ -139,6 +151,8 @@ function GeneralSettings(props: {
       <SilenceSetting />
 
       <TransportSetting />
+
+      <KeepSessionsSetting />
 
       <MarkdownSetting on={props.markdown} onChange={props.onMarkdownChange} />
     </>
@@ -387,6 +401,117 @@ function ParallelSetting({ on, onChange }: { on: boolean; onChange: (on: boolean
       </div>
       <Switch on={on} onChange={onChange} labelledBy="parallel-label" />
     </div>
+  );
+}
+
+/** What the section shows: the state, what the last click came of, and the notifications step as the browser has it. */
+export type KeepView = {
+  keeping: Keeping | null;
+  asked: Persistence | null;
+  via: ViaNotifications | null;
+  step: NotificationsStep;
+  busy: boolean;
+};
+
+/** The sentence under the status line: what the last click came of, or why a step is not offered. */
+export function keepNote({ asked, via, step }: KeepView): string | null {
+  if (via) {
+    if (via.persistence === "granted") return "Kept. The browser took the storage once notifications were allowed.";
+    if (via.persistence === "failed" || via.permission === "failed") return "The browser's answer failed. Try again.";
+    return via.permission === "granted"
+      ? "Still refused, with notifications allowed. Installing the page as an app is the other way: use the browser's install option."
+      : "Still refused, and notifications were not allowed. Installing the page as an app is the other way: use the browser's install option.";
+  }
+  if (asked === "granted") return "Kept. The browser will not delete the sessions on its own.";
+  if (asked === "failed") return "The browser's answer failed. Try again.";
+  if (asked === "refused" && step === "denied")
+    return "Refused. Notifications are blocked for this site, so that step is not offered; installing the page as an app is the other way.";
+  if (asked === "refused" && step === "granted")
+    return "Refused, though notifications are allowed. Installing the page as an app is the other way.";
+  if (asked === "refused" && step === "unsupported")
+    return "Refused. This browser has no Notification API; installing the page as an app is the other way.";
+  return null;
+}
+
+/** The sessions section of General, drawn from `view`; the buttons are the user's click, which both asks need. */
+export function KeepSessions({ view, onAsk, onNotify }: { view: KeepView; onAsk: () => void; onNotify: () => void }) {
+  const { keeping, asked, via, step, busy } = view;
+  const note = keepNote(view);
+  const refused = keeping === "best-effort" && (asked === "refused" || via !== null);
+  const buttonClass = `${actionShape} ${actionInk} self-start px-3 py-1.5 [--cut-size:6px]`;
+  return (
+    <div className="flex flex-col gap-2">
+      <span className="font-display text-sm font-semibold text-ink">Keeping the sessions</span>
+      {keeping === null ? (
+        <span className="text-xs leading-snug text-ash">Reading the browser's storage state.</span>
+      ) : keeping === "kept" ? (
+        <span className="text-xs leading-snug text-ash">
+          Kept: the browser will not delete the sessions in this browser on its own.
+        </span>
+      ) : keeping === "unsupported" ? (
+        <span className="border-l-2 border-ember pl-2 text-xs leading-snug text-ash">
+          This browser has no Storage API, so it cannot be asked to keep the sessions. The page opens and saves as
+          before.
+        </span>
+      ) : (
+        <span className="border-l-2 border-ember pl-2 text-xs leading-snug text-ash">
+          Best-effort: the browser may delete the sessions in this browser when the disk runs short.
+        </span>
+      )}
+      {note && <span className="text-xs leading-snug text-ash">{note}</span>}
+      {keeping === "best-effort" && !refused && (
+        <button type="button" disabled={busy} onClick={onAsk} className={buttonClass}>
+          Ask the browser to keep them
+        </button>
+      )}
+      {refused && via === null && step === "available" && (
+        <>
+          <span className="text-xs leading-snug text-ash">
+            A Chromium-based browser keeps the storage only of sites it counts as important, and allowing
+            notifications is one sign of that. The Playground sends none.
+          </span>
+          <button type="button" disabled={busy} onClick={onNotify} className={buttonClass}>
+            Allow notifications, then ask again
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** The sessions section: reads the state when it shows, asks on the clicks and says what came of each. */
+export function KeepSessionsSetting({
+  storage = typeof navigator === "undefined" ? undefined : (navigator.storage as StorageManagerLike | undefined),
+  notifications = typeof Notification === "undefined" ? undefined : (Notification as NotificationsLike),
+}: {
+  storage?: StorageManagerLike;
+  notifications?: NotificationsLike;
+} = {}) {
+  const [keeping, setKeeping] = useState<Keeping | null>(null);
+  const [asked, setAsked] = useState<Persistence | null>(null);
+  const [via, setVia] = useState<ViaNotifications | null>(null);
+  const [step, setStep] = useState<NotificationsStep>(() => notificationsStep(notifications));
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let live = true;
+    void readKeeping(storage).then((k) => live && setKeeping(k));
+    return () => {
+      live = false;
+    };
+  }, [storage]);
+  const settle = async (run: () => Promise<void>) => {
+    setBusy(true);
+    await run();
+    setStep(notificationsStep(notifications));
+    setKeeping(await readKeeping(storage));
+    setBusy(false);
+  };
+  return (
+    <KeepSessions
+      view={{ keeping, asked, via, step, busy }}
+      onAsk={() => void settle(async () => setAsked(await askForPersistence(storage)))}
+      onNotify={() => void settle(async () => setVia(await askViaNotifications(storage, notifications)))}
+    />
   );
 }
 

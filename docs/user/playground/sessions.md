@@ -71,10 +71,13 @@ them.
 A browser may refuse, and a refusal changes nothing else: the page opens and
 saves as before, but the storage stays best-effort, and a short disk can still
 take the sessions. Firefox asks you. A Chromium-based browser decides without
-asking, from signals such as whether the page is bookmarked, installed as an
-app or allowed to show notifications, and refuses a page with none of them,
-however much it is used: **bookmark the Playground's page** and reload it, and
-the next load asks again.
+asking, and keeps only the storage of sites it counts as important, from
+signals such as use, installation and the permission to show notifications;
+bookmarking the page was measured not to be enough. So the Playground can ask
+on purpose: **Settings**, **General**, **Keeping the sessions** says whether
+this browser keeps them and has a button that asks again, then, if the browser
+refuses, a second one that asks for the notifications permission and asks
+again. See [Keeping the sessions](settings.md#keeping-the-sessions).
 
 To see the state, open the browser's DevTools console and run
 `await navigator.storage.persisted()`: `true` means this origin is kept. In a
