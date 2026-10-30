@@ -106,6 +106,24 @@ fn intervals(log_sink: &MemorySink) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Wait, for up to 5 s, until `logged` holds of the captured events. The
+/// model thread routes a request's `Done` to its stream before it sends the
+/// same event, and the counters of the step that finished it, to the
+/// telemetry task, so a test that has seen its stream end can still be
+/// ahead of those lines: on a loaded host, `nudge` alone yields before
+/// they are even sent.
+async fn until_logged(log_sink: &MemorySink, logged: impl Fn(&[serde_json::Value]) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !logged(&events(log_sink)) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// The request's `ignis.request.done` line is in the log.
+fn done_logged(events: &[serde_json::Value]) -> bool {
+    events.iter().any(|e| e["event_name"] == "ignis.request.done")
+}
+
 #[tokio::test]
 async fn a_real_request_emits_interval_and_request_events() {
     let (log_sink, _guard) = capture_events();
@@ -117,7 +135,7 @@ async fn a_real_request_emits_interval_and_request_events() {
     collect_tokens(&mut rx, Duration::from_secs(5))
         .await
         .expect("the request completes");
-    nudge().await;
+    until_logged(&log_sink, done_logged).await;
 
     let events = event_names(&log_sink);
     assert!(
@@ -147,7 +165,7 @@ async fn the_request_class_rides_the_canonical_request_events() {
     collect_tokens(&mut rx, Duration::from_secs(5))
         .await
         .expect("the request completes");
-    nudge().await;
+    until_logged(&log_sink, done_logged).await;
 
     let events = events(&log_sink);
     for name in ["ignis.request.admitted", "ignis.request.ttft", "ignis.request.done"] {
@@ -185,7 +203,7 @@ async fn the_request_log_carries_the_speculative_counters() {
     let (tokens, _) = collect_tokens(&mut rx, Duration::from_secs(5))
         .await
         .expect("the request completes");
-    nudge().await;
+    until_logged(&log_sink, done_logged).await;
 
     assert_eq!(tokens.len(), 7);
     let events = events(&log_sink);
@@ -255,7 +273,13 @@ async fn a_steady_decode_logs_counter_changes_not_every_step() {
     collect_tokens(&mut rx, Duration::from_secs(5))
         .await
         .expect("the request completes");
-    nudge().await;
+    // The counters of the step that finished the request: nothing running.
+    until_logged(&log_sink, |events| {
+        events
+            .iter()
+            .any(|e| e["event_name"] == "ignis.scheduler.interval" && e["attributes"]["running"] == 0)
+    })
+    .await;
 
     let intervals = intervals(&log_sink);
     let counters: Vec<(u64, u64, u64, u64)> = intervals
