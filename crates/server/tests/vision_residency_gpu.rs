@@ -107,22 +107,16 @@ fn image_prompt(frontend: &FrontendSet, image: &[u8], question: &str) -> (Vec<i3
     (token_ids.iter().map(|&t| t as i32).collect(), prompt)
 }
 
-/// One load at `residency`, its encodes and its canary scores; `None` when
-/// outside the profile the GPU is unavailable.
-fn capture(reader: &Reader, frontend: &FrontendSet, residency: VisionResidency) -> Option<Capture> {
+/// One load at `residency` on `device`, its encodes and its canary scores;
+/// `None` when outside the profile the artifact cannot be materialized. Both
+/// loads share the test's one device, so the residency is all that differs.
+fn capture(
+    reader: &Reader, frontend: &FrontendSet, device: &mut CudaDevice, residency: VisionResidency,
+) -> Option<Capture> {
     let vision = Vision::new(ITEM_BOUND).unwrap().with_item_max_tokens(ITEM_BOUND).with_residency(residency);
     let (plan, handles) = bind_model_scope_27b_with(reader, model_scope(None, Some(vision), ExceptionWeights::Bf16))
         .unwrap_or_else(|e| panic!("bind ({residency}): {e}"));
-    let mut device = match CudaDevice::create(0) {
-        Ok(d) => d,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("CUDA device unavailable: {e}")) {
-                return None;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
-    let mut artifact = match materialize(reader, &plan, &mut device, None) {
+    let mut artifact = match materialize(reader, &plan, device, None) {
         Ok(a) => a,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("materialize ({residency}): {e}")) {
@@ -202,7 +196,7 @@ fn capture(reader: &Reader, frontend: &FrontendSet, residency: VisionResidency) 
 
     drop(pool);
     drop(model);
-    let _ = artifact.release_arena(&mut device);
+    let _ = artifact.release_arena(device);
     Some(out)
 }
 
@@ -215,10 +209,19 @@ fn a_host_load_encodes_byte_identical_embeddings_and_scores_identical_logits() {
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {ARTIFACT}: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
-    let Some(device) = capture(&reader, &frontend, VisionResidency::Device) else {
+    let mut cuda = match CudaDevice::create(0) {
+        Ok(d) => d,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA device unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let Some(device) = capture(&reader, &frontend, &mut cuda, VisionResidency::Device) else {
         return;
     };
-    let Some(host) = capture(&reader, &frontend, VisionResidency::Host) else {
+    let Some(host) = capture(&reader, &frontend, &mut cuda, VisionResidency::Host) else {
         return;
     };
 
