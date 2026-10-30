@@ -613,8 +613,8 @@ qwen3.8-27b-abliterated` (fetched like the standard one when it is not on disk),
 or `make dev UNCENSORED=1` from a checkout; it is served under that id, so a
 client can tell the two apart. On a 16 GB card the same id fetches and serves
 the 16 GB one, `qwen3.8-27b-abliterated-16g`: the 16 GB card's artifact with
-the same 70 matrices re-quantized from the abliterated weights, as faithful to
-them as the 16 GB artifact is to the standard ones
+the same 70 matrices re-quantized from the abliterated weights, about as
+faithful to them as the 16 GB artifact is to the standard ones
 ([the uncensored variant](https://gpillon.github.io/ignis/guides/uncensored/)).
 **It does not refuse**, so put the guardrails in the application or tool layer
 and do not expose it to untrusted users.
