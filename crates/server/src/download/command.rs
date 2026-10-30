@@ -621,6 +621,20 @@ mod tests {
         }
     }
 
+    /// ADR 0074: an alias that is another entry's id resolves for a download
+    /// as for a request — `model download qwen3.8-27b-abliterated` on a 16 GB
+    /// card fetches the 16 GB fixture catalog's abliterated build, and on a
+    /// larger card the id's own entry.
+    #[test]
+    fn a_download_of_the_uncensored_variant_fetches_its_16gb_build_on_a_16gb_card() {
+        let catalog = super::super::catalog::testing::sixteen_over_thirty_two(super::super::catalog::testing::SIXTEEN).expect("the fixture catalog");
+        let abliterated = ["qwen3.8-27b-abliterated"];
+        assert_eq!(fetched(&catalog, &abliterated, false, Some(CardClass::Gb16)), Ok(vec!["qwen3.8-27b-abliterated-16g".to_owned()]));
+        for card in [Some(CardClass::Gb32), Some(CardClass::Gb96), None] {
+            assert_eq!(fetched(&catalog, &abliterated, false, card), Ok(vec!["qwen3.8-27b-abliterated".to_owned()]), "{card:?}");
+        }
+    }
+
     /// ADR 0064 §3: a download of an entry above the card's class is
     /// refused whole, before anything is fetched — each such entry named
     /// with both classes, `--all` too — and the default model on a 16 GB

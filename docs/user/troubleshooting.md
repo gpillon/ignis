@@ -347,7 +347,10 @@ download ([Get a model](guides/models.md), [Switching models](api/model-switchin
 The request or the switch names a catalog entry that needs a larger card than
 this one, such as Flash-Next on a 16 GB card. The message names both classes,
 and the loaded model keeps serving. Name an entry the card loads on
-([Get a model](guides/models.md)).
+([Get a model](guides/models.md)). When an entry that fits answers to the id as
+an alias but its artifact's header names another model family than the id's,
+the message names both families: that entry's files, or the `family` its
+catalog states, are wrong ([an operator catalog](guides/operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)).
 
 ### `409 model_kind_mismatch`
 

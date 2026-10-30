@@ -9,7 +9,10 @@
 //! unavailable, with the reason. On a 32 GB card, or one of no known class,
 //! nothing changes. The catalog is the built-in one, which holds the 16 GB
 //! 27B (GitHub #338); every artifact is a file under `download.path`, and the
-//! models are `support/switch.rs`'s mocks, loaded by id.
+//! models are `support/switch.rs`'s mocks, loaded by id. An alias may also be
+//! another entry's id of the same family (ADR 0074): the uncensored variant's
+//! 16 GB build, from the 16 GB fixture catalog over the built-in one, answers
+//! to `qwen3.8-27b-abliterated` on a 16 GB card.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +23,7 @@ use http_body_util::BodyExt;
 use ignis_core::compute::ModelFamily;
 use ignis_server::config::file::Format;
 use ignis_server::config::profile::CardClass;
-use ignis_server::download::catalog::parse_operator;
+use ignis_server::download::catalog::{parse_operator, Catalog};
 use ignis_server::model_switch::{CatalogModels, Switcher};
 use ignis_server::{ModelStatus, Server};
 use serde_json::{json, Value};
@@ -41,6 +44,13 @@ const SIXTEEN_ARTIFACT: &str = "qwen3_8_27b_trellis_sc30-v2.ninfer";
 const DEFAULT_27B: &str = "qwen3.8-27b";
 const FLASH_NEXT: &str = "qwen3.8-flash-next";
 const IMAGE: &str = "ignis-image-2.1-turbo";
+/// The uncensored variant's served id, its 32 GB entry's, and the id of its
+/// 16 GB build (ADR 0074), which the 16 GB fixture catalog holds and the
+/// built-in catalog does not yet (GitHub #423).
+const ABLITERATED: &str = "qwen3.8-27b-abliterated";
+const ABLITERATED_16G: &str = "qwen3.8-27b-abliterated-16g";
+/// The 16 GB fixture catalog, the one the catalog's own tests read.
+const SIXTEEN_CATALOG: &str = include_str!("fixtures/catalog/sixteen.yaml");
 /// The catalog's CPU models: the three speech entries and the diarizer.
 const CPU_MODELS: [&str; 4] = ["qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization"];
 
@@ -71,6 +81,28 @@ fn server_on(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, tag
 fn server_over(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, catalog: CatalogModels) -> Server {
     Server::from_active(loader.model(start))
         .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_catalog(catalog, true).with_card_class(card))
+}
+
+/// The 16 GB fixture catalog's entries the built-in catalog does not hold —
+/// the uncensored variant's 16 GB build — as an operator's catalog over it.
+fn fixture_over_built_in() -> String {
+    let mut fixture = Format::Yaml.read(SIXTEEN_CATALOG).expect("the fixture is YAML");
+    fixture["models"].as_array_mut().unwrap().retain(|entry| Catalog::built_in().entry(entry["id"].as_str().unwrap()).is_none());
+    fixture.to_string()
+}
+
+/// [`server_on`] over the built-in catalog and the uncensored variant's
+/// 16 GB build, every artifact on disk, the build's header naming `header`.
+fn abliterated_server(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, header: ModelFamily, tag: &str) -> Server {
+    loader.header(SIXTEEN, ModelFamily::Qwen38_27b);
+    loader.header(ABLITERATED_16G, header);
+    server_over(loader, start, card, catalog_on_disk(tag, &fixture_over_built_in()))
+}
+
+/// Where the catalog entry `id`'s artifact is on `server`'s disk.
+fn artifact_of(server: &Server, id: &str) -> std::path::PathBuf {
+    let catalog = server.switcher.as_ref().unwrap().catalog().unwrap();
+    catalog.catalog.entries().iter().find(|entry| entry.id == id).unwrap().artifact_path(&catalog.dir)
 }
 
 async fn send(app: &axum::Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -468,4 +500,130 @@ async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     let thirty_two = server_on(&MockLoader::new(), FLASH_NEXT, Some(CardClass::Gb32), "enhancer-32");
     assert_eq!(enhancer_on_this_card(&thirty_two, DEFAULT_27B), DEFAULT_27B, "its own entry fits");
     assert_eq!(unknown_enhancer(&thirty_two, DEFAULT_27B, &none), None);
+}
+
+/// ADR 0074: on a 16 GB card a request naming the uncensored variant's id
+/// switches to its 16 GB build, whose artifact is on disk — never to the
+/// 32 GB entry's — and is served under the build's own id; once it is
+/// loaded, a request naming the id is served by it, lane tag and all, with
+/// no switch. An explicit switch by the id resolves it the same way.
+#[tokio::test]
+async fn on_a_16gb_card_the_uncensored_variants_id_is_served_by_its_16gb_build() {
+    let loader = MockLoader::new();
+    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated");
+    let app = server.app();
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
+    assert_eq!(loader.loads(), [ABLITERATED_16G]);
+    assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, ABLITERATED_16G)], "the 16 GB build's artifact, not the 32 GB entry's");
+    let (status, answered) = send(&app, Method::POST, "/v1/responses", Some(response_body(&format!("{ABLITERATED}@agent")))).await;
+    assert_eq!((status, answered["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{answered}");
+    assert_eq!(loader.loads(), [ABLITERATED_16G], "served by the loaded build, no switch");
+
+    let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SIXTEEN }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(until_serving(&app).await["data"][0]["id"], SIXTEEN);
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": ABLITERATED }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert_eq!(accepted["to"], ABLITERATED_16G, "{accepted}");
+    assert_eq!(until_serving(&app).await["data"][0]["id"], ABLITERATED_16G);
+    assert_eq!(loader.loads(), [ABLITERATED_16G, SIXTEEN, ABLITERATED_16G]);
+}
+
+/// ADR 0074: the implicit switch to the 16 GB build happens only when its
+/// artifact is on disk. Without it, a request or a switch naming the
+/// uncensored variant's id is refused before anything stops, naming the
+/// build — never served by the 32 GB entry, which this card cannot load.
+#[tokio::test]
+async fn the_switch_to_the_uncensored_variants_16gb_build_needs_its_artifact_on_disk() {
+    let loader = MockLoader::new();
+    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated-absent");
+    std::fs::remove_file(artifact_of(&server, ABLITERATED_16G)).unwrap();
+    let app = server.app();
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("model_not_found")), "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains(ABLITERATED_16G), "{refused}");
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": ABLITERATED }))).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("model_not_found")), "{refused}");
+    still_serving(&app, &server, &loader, SIXTEEN).await;
+}
+
+/// ADR 0074: the header stays the authority. The 16 GB build states the
+/// 27B's family; holding an artifact whose header names Flash-Next, it does
+/// not answer to the uncensored variant's id: a request and a switch naming
+/// it are refused before anything stops, naming both families, and the
+/// lists say why. Named by its own id, the build is the request's word.
+#[tokio::test]
+async fn an_uncensored_variants_16gb_build_whose_header_names_another_family_does_not_answer() {
+    let loader = MockLoader::new();
+    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::FlashNext, "abliterated-header");
+    let app = server.app();
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+    refused_by_class(status, &refused, ABLITERATED);
+    let message = refused["error"]["message"].as_str().unwrap();
+    for named in [&format!("{ABLITERATED_16G} lists it as an alias"), "its artifact is Qwen3.8-Flash-Next", &format!("{ABLITERATED} is Qwen3.8-27B"), "one model family"] {
+        assert!(message.contains(named), "{named}: {message}");
+    }
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": ABLITERATED }))).await;
+    refused_by_class(status, &refused, ABLITERATED);
+    still_serving(&app, &server, &loader, SIXTEEN).await;
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    let listed = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == ABLITERATED).cloned().unwrap();
+    assert_eq!(listed["available"], false, "{listed}");
+    assert!(listed["reason"].as_str().unwrap().contains("one model family"), "{listed}");
+
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED_16G))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
+}
+
+/// ADR 0074: on a 32 GB card, a 96 GB one or one of no known class nothing
+/// changes for the uncensored variant: its id is its own entry's, for a
+/// request's switch and an explicit one, whatever the 16 GB build's header.
+#[tokio::test]
+async fn on_other_cards_the_uncensored_variants_id_is_its_own_entrys() {
+    for (card, tag) in [(Some(CardClass::Gb32), "abliterated-32"), (Some(CardClass::Gb96), "abliterated-96"), (None, "abliterated-unknown")] {
+        let loader = MockLoader::new();
+        let server = abliterated_server(&loader, DEFAULT_27B, card, ModelFamily::Qwen38_27b, tag);
+        let app = server.app();
+        let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+        assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED)), "{tag}: {completion}");
+        assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, ABLITERATED)], "{tag}: the 32 GB entry's own artifact");
+        let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": DEFAULT_27B }))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{tag}");
+        until_serving(&app).await;
+        let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": ABLITERATED }))).await;
+        assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(ABLITERATED)), "{tag}: {accepted}");
+        assert_eq!(until_serving(&app).await["data"][0]["id"], ABLITERATED, "{tag}");
+        assert_eq!(loader.loads(), [ABLITERATED, DEFAULT_27B, ABLITERATED], "{tag}");
+        let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+        let data = models["data"].as_array().unwrap();
+        assert!(data.iter().all(|entry| entry["available"] == true && entry.get("reason").is_none()), "{tag}: {models}");
+    }
+}
+
+/// ADR 0074, ADR 0064 §3: on a 16 GB card `GET /v1/models` lists the
+/// uncensored variant's 16 GB build, and marks its 32 GB entry unavailable
+/// with the reason, naming the build that serves a request for its id here;
+/// `GET /v1/models/catalog` says the same of their rows.
+#[tokio::test]
+async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_the_uncensored_variant() {
+    let loader = MockLoader::new();
+    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated-lists");
+    let app = server.app();
+    let (status, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = |id: &str| models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).cloned().unwrap_or_else(|| panic!("{id} listed: {models}"));
+    assert_eq!((entry(ABLITERATED_16G)["available"].as_bool(), entry(ABLITERATED_16G).get("reason")), (Some(true), None), "{models}");
+    assert_eq!(entry(ABLITERATED)["available"], false, "{models}");
+    let reason = entry(ABLITERATED)["reason"].as_str().unwrap().to_owned();
+    for said in [ABLITERATED, "32 GB", "16 GB", &format!("served by {ABLITERATED_16G}")] {
+        assert!(reason.contains(said), "{said}: {reason}");
+    }
+
+    let (status, catalog) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let row = |id: &str| catalog["data"].as_array().unwrap().iter().find(|row| row["id"] == id).cloned().unwrap();
+    assert_eq!((row(ABLITERATED_16G)["available"].as_bool(), row(ABLITERATED_16G)["switchable"].as_bool()), (Some(true), Some(true)), "{catalog}");
+    assert_eq!((row(ABLITERATED)["available"].as_bool(), row(ABLITERATED)["switchable"].as_bool()), (Some(false), Some(false)), "{catalog}");
+    assert!(row(ABLITERATED)["reason"].as_str().unwrap().contains(&format!("served by {ABLITERATED_16G}")), "{catalog}");
 }
