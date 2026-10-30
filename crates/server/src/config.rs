@@ -228,7 +228,7 @@ pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, ProposalHeadSetting, Specul
 use ignis_core::speculation::FLASH_NEXT_DEFAULT_DRAFT_TOKENS;
 
 pub use ignis_core::{MAX_YARN_FACTOR, RopeScaling};
-pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision};
+pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision, VisionResidency};
 
 pub use crate::expose::Expose;
 
@@ -1517,10 +1517,11 @@ fn derive_speculation(
     Ok((Some(speculation.with_proposal_head(head)), false))
 }
 
-/// `--vision-enabled`, `--vision-max-tokens` and
-/// `--vision-embedding-pool-mib` (GitHub #177, #243). Vision is off unless
-/// asked for; neither of the other two has anything to size with it off, so
-/// naming one is refused rather than ignored. With vision on, the envelope
+/// `--vision-enabled`, `--vision-max-tokens`,
+/// `--vision-embedding-pool-mib` and `--vision-residency` (GitHub #177,
+/// #243, #414). Vision is off unless asked for; none of the other three has
+/// anything to size or place with it off, so naming one is refused rather
+/// than ignored. With vision on, the envelope
 /// defaults to [`DEFAULT_VISION_MAX_TOKENS`] and the pool to one
 /// envelope-wide embedding — exactly what GitHub #177 always reserved, so a
 /// load that says nothing does not move the VRAM plan. The pool's floor is
@@ -1532,6 +1533,7 @@ fn derive_vision(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Strin
         for (name, value) in [
             ("max_tokens", resolution.explicit("vision", "max_tokens").then(|| s.max_tokens.to_string())),
             ("embedding_pool_mib", s.embedding_pool_mib.filter(|_| resolution.explicit("vision", "embedding_pool_mib")).map(|n| n.to_string())),
+            ("residency", resolution.explicit("vision", "residency").then(|| s.residency.as_str().to_owned())),
         ] {
             if let Some(value) = value {
                 return Err(ConfigError(format!(
@@ -1549,6 +1551,7 @@ fn derive_vision(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Strin
             s.max_tokens
         ))
     })?;
+    let vision = vision.with_residency(s.residency);
     Ok(Some(match s.embedding_pool_mib {
         Some(mib) => vision.with_pool_bytes(mib * 1024 * 1024),
         None => vision,

@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use ignis_core::image::ImageSize;
 use ignis_core::ngram_cache::CacheLocation;
 use ignis_core::ngram_table::HotBudget;
-use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, ProposalHeadSetting, RopeSetting, SpeculativeBackend};
+use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
 use serde_json::Value;
 
 use super::{ApiKey, ApiKeySetting, Expose, SpecChoice};
@@ -602,6 +602,23 @@ impl FieldKind for ExceptionWeightsKind {
     }
 
     fn render(value: &ExceptionWeights) -> Value {
+        Value::String(value.as_str().to_owned())
+    }
+}
+
+/// Where a vision load keeps the 27B's vision tower (ADR 0075, GitHub
+/// #414): `host` or `device`.
+pub struct VisionResidencyKind;
+
+impl FieldKind for VisionResidencyKind {
+    type Value = VisionResidency;
+    const TAG: &'static str = "vision residency";
+
+    fn parse(raw: &str) -> Result<VisionResidency, String> {
+        VisionResidency::parse(raw)
+    }
+
+    fn render(value: &VisionResidency) -> Value {
         Value::String(value.as_str().to_owned())
     }
 }

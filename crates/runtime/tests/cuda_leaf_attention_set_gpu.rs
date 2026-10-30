@@ -24,12 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ignis_artifact::{
-    ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent, ModelScope, Reader, Role,
+    ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent, VisionResidency, Reader, Role,
     bind_model_scope_27b_with, materialize,
 };
 use ignis_core::pointing::{AttentionQuery, SetQuery, calibrated_artifacts, calibration};
 use ignis_core::vision::Multimodal;
-use ignis_core::{Compute, DecodeParams, KvFormat, PrefillJob, TokenId, Vision, gpu_profile};
+use ignis_core::{Compute, DecodeParams, ExceptionWeights, KvFormat, PrefillJob, TokenId, Vision, gpu_profile, model_load};
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, RuntimeCompute};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -55,7 +55,10 @@ fn load() -> Option<(RuntimeCompute<CudaLeaf>, FrontendSet)> {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let eos = frontend.eos_token_id().expect("eos");
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    // Today's load, the tower on the device (ADR 0075's `device`): the scope
+    // is bound from the vision the model loads with, so the two agree.
+    let vision = Vision::default().with_residency(VisionResidency::Device);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, model_load::model_scope(None, Some(vision), ExceptionWeights::Bf16))
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
@@ -75,7 +78,7 @@ fn load() -> Option<(RuntimeCompute<CudaLeaf>, FrontendSet)> {
         max_context_tokens: MAX_CONTEXT,
         kv_format: KvFormat::HqE8_2b,
         kv_pool_bytes: ignis_runtime::auto_kv_pool_bytes(KvFormat::HqE8_2b, MAX_CONTEXT),
-        vision: Some(Vision::default()),
+        vision: Some(vision),
         ..CudaLeafConfig::default()
     };
     let leaf = CudaLeaf::new(device, reader, artifact, handles, config);

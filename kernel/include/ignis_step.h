@@ -358,6 +358,14 @@ int32_t ignis_media_encode(struct ignis_model *model, const struct ignis_media_e
 /* The embedding's merged columns. 0 for NULL. */
 uint32_t ignis_media_embedding_columns(const struct ignis_media_embedding *embedding);
 
+/* GitHub #414: the embedding's `[hidden, columns]` BF16 columns, in column
+ * order, copied into host `out`, whose `out_bytes` must be columns x hidden x
+ * 2 -- wherever the vision residency put the pool. Synchronous. What lets a
+ * test compare two loads' embeddings byte for byte. 0, or -1 with
+ * ignis_media_last_error. */
+int32_t ignis_media_embedding_read(const struct ignis_media_embedding *embedding, void *out,
+                                   uint64_t out_bytes);
+
 /* Release an embedding, freeing the load's reservation for the next item.
  * NULL is a no-op; the model must still be live. */
 void ignis_media_embedding_release(struct ignis_media_embedding *embedding);

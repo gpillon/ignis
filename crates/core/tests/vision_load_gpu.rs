@@ -18,16 +18,16 @@
 
 use std::path::Path;
 
-use ignis_artifact::{bind_model_scope_27b_with, materialize, text_scope_27b, CudaDevice, ModelScope, Reader};
+use ignis_artifact::{bind_model_scope_27b_with, materialize, text_scope_27b, CudaDevice, VisionResidency, Reader};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::model_load::load_qwen38_27b_with_options;
+use ignis_core::model_load::{load_qwen38_27b_with_options, model_scope};
 use ignis_core::RopeScaling;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_artifact::vision::{Grid, PATCH_FEATURES};
 use ignis_core::step::{encode_media, program_stats};
 use ignis_core::vision::vision_item_control;
-use ignis_core::{KvFormat, Vision, VISION_OBJECTS};
+use ignis_core::{ExceptionWeights, KvFormat, Vision, VISION_OBJECTS};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
@@ -54,7 +54,10 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
         return;
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {ARTIFACT}: {e}"));
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, fp8_exceptions: false })
+    // The tower on the device (ADR 0075's `device`, today's load): every load
+    // below takes this residency, and the scope is bound from it.
+    let vision = Vision::default().with_residency(VisionResidency::Device);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, model_scope(None, Some(vision), ExceptionWeights::Bf16))
         .unwrap_or_else(|e| panic!("bind with vision: {e}"));
     let text_len = text_scope_27b().len();
     assert_eq!(handles.len(), text_len + VISION_OBJECTS);
@@ -120,7 +123,6 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
 
     // A small context caps the envelope, so this pair stays cheap.
     const SMALL_CONTEXT: u32 = 1024;
-    let vision = Vision::default();
     let (plain_vram, plain_bound, plain_reserved) = load(&handles[..text_len], SMALL_CONTEXT, None);
     let (vision_vram, vision_bound, vision_reserved) = load(&handles, SMALL_CONTEXT, Some(vision));
     let (plain_again, _, _) = load(&handles[..text_len], SMALL_CONTEXT, None);
@@ -162,7 +164,7 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
     // the pool.
     const ITEM_BOUND: u32 = 16_384;
     let bounded = vision.with_item_max_tokens(ITEM_BOUND);
-    let small = Vision::new(ITEM_BOUND).unwrap();
+    let small = Vision::new(ITEM_BOUND).unwrap().with_residency(vision.residency());
     let (_, _, bounded_reserved) = load(&handles, SERVING_CONTEXT, Some(bounded));
     let (_, _, small_reserved) = load(&handles, SERVING_CONTEXT, Some(small));
     assert_eq!(
@@ -192,7 +194,7 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
             SMALL_CONTEXT,
             KvFormat::Bf16,
             None,
-            Some(Vision::new(SMALL_CONTEXT).unwrap().with_item_max_tokens(TINY_BOUND)),
+            Some(Vision::new(SMALL_CONTEXT).unwrap().with_item_max_tokens(TINY_BOUND).with_residency(vision.residency())),
             RopeScaling::NONE,
         )
         .unwrap_or_else(|e| panic!("ignis_model_load (item bound {TINY_BOUND}): {e}"));

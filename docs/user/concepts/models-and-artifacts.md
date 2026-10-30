@@ -68,14 +68,18 @@ It serves a fixed eight decode lanes, takes image input when
 
 Memory:
 
-- **VRAM**: all the weights, the vision tower when enabled, the lanes' state,
-  workspaces and graphs, and then a KV pool that takes what is left
-  ([the VRAM plan](vram-plan.md)).
+- **VRAM**: the weights, the lanes' state, workspaces and graphs, and then a
+  KV pool that takes what is left ([the VRAM plan](vram-plan.md)). The vision
+  tower and its embedding pool are there only under `--vision-residency device`.
 - **Host RAM**: the token embedding (1.35 GB) is held in pinned host memory
   rather than VRAM, and the card reads one row per token over PCIe. This hands
   the 1.35 GB to the KV pool ([ADR 0062](../../adr/0062-the-token-embedding-lives-in-host-memory.md)).
-  With the host retained slots and the KV-RAM arena, the `make` defaults need
-  about 18 GB of available RAM
+  With vision on, under the default `host` residency, the vision tower
+  (297 MB) and the embedding pool are there too, and each image's encode
+  copies the tower to the card
+  ([where they live](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
+  With the host retained slots and the KV-RAM arena, the `make` defaults on a
+  32 GB card need about 18.6 GB of available RAM
   ([host RAM](../configuration/host-ram.md)).
 
 ### Qwen3.8-Flash-Next
@@ -165,11 +169,11 @@ acceptance rate ([the uncensored variant](../guides/uncensored.md)).
 
 | | Qwen3.8-27B | Flash-Next on a 32 GB card | Flash-Next on 96 GB |
 |---|---|---|---|
-| Weights in VRAM | All | Trunk, plus an expert cache | Trunk and every expert |
-| Weights in host RAM | Token embedding (1.35 GB) | Experts (~38 GB), n-gram rows | No expert pool |
+| Weights in VRAM | All but the token embedding; the vision tower only under `device` | Trunk, plus an expert cache | Trunk and every expert |
+| Weights in host RAM | Token embedding (1.35 GB); the vision tower (297 MB) under `host` | Experts (~38 GB), n-gram rows | No expert pool |
 | The KV pool is | What VRAM leaves | Reserved first, 524,288 tokens | What VRAM leaves |
 | Decode is bound by | Streaming the weights | Copying experts over PCIe | Few PCIe copies |
-| Available RAM to start | ~18 GB under `make` defaults | ~46-47 GB | ~9 GB |
+| Available RAM to start | ~18.6 GB under `make` defaults on a 32 GB card | ~46-47 GB | ~9 GB |
 | Decode lanes | 1 to 8 (default 8) | 1 to 8 (default 3) | 1 to 8 |
 
 The image model has none of these rows: lanes, token decode and generation caps

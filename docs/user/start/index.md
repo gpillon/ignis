@@ -51,7 +51,7 @@ You can add models of your own with an
   container image carries no driver; the container runtime injects the
   host's.
 - **Host RAM.** Flash-Next needs about 46-47 GB of available RAM on a 32 GB
-  card, the 27B about 18 GB under the `make` defaults
+  card, the 27B about 18.6 GB there under the `make` defaults
   ([Host RAM](../configuration/host-ram.md)).
 - **One model on the card at a time.** The VRAM plan is decided at load for a
   single model; a switch is a full reload.

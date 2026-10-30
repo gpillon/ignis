@@ -1016,6 +1016,9 @@ struct LoadOptions {
   // GitHub #336: the 27B's decode lanes, resolved (0 is IGNIS_DECODE_MAX_BATCH):
   // the widest round, and every round reservation's width.
   uint32_t decode_lanes = IGNIS_DECODE_MAX_BATCH;
+  // GitHub #414 (ADR 0075): where the vision tower lives (enum
+  // ignis_vision_residency); HOST only with vision.
+  uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
 };
 
 // GitHub #243: one embedding pool page, in bytes -- the width every side of
@@ -1174,6 +1177,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   uint32_t attention_text_max_keys = 0;
   uint32_t draft_row_budget = 0;
   uint32_t prefill_attention = 0;
+  uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
@@ -1193,6 +1197,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     attention_text_max_keys = options->attention_text_max_keys;
     draft_row_budget = options->draft_row_budget;
     prefill_attention = options->prefill_attention;
+    vision_residency = options->vision_residency;
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
   // one of the two.
@@ -1226,6 +1231,18 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   if (vision_max_tokens == 0 && vision_item_max_tokens != 0) {
     set_error("ignis_model_load: vision_item_max_tokens " + std::to_string(vision_item_max_tokens) +
               " needs vision_max_tokens");
+    return nullptr;
+  }
+  // GitHub #414: a residency the leaf does not know is refused rather than run
+  // as one of the two, and a host tower without a tower is the same
+  // contradiction as the pool's.
+  if (vision_residency != IGNIS_VISION_RESIDENCY_DEVICE && vision_residency != IGNIS_VISION_RESIDENCY_HOST) {
+    set_error("ignis_model_load: vision_residency " + std::to_string(vision_residency) +
+              " is not 0 (device) or 1 (host)");
+    return nullptr;
+  }
+  if (vision_max_tokens == 0 && vision_residency != IGNIS_VISION_RESIDENCY_DEVICE) {
+    set_error("ignis_model_load: vision_residency " + std::to_string(vision_residency) + " needs vision_max_tokens");
     return nullptr;
   }
   if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
@@ -1266,6 +1283,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.rope_scaling = rope_scaling;
   out.attention_text_max_keys = std::min(attention_text_max_keys, max_context_tokens);
   out.prefill_attention = prefill_attention;
+  out.vision_residency = vision_residency;
 
   // GitHub #302: Flash-Next binds its own schema (kernel/src/flash_next/
   // bind.cu) into its own program (kernel/src/flash_next/program.h), and has
@@ -1429,7 +1447,12 @@ struct LoadSizes {
   // included.
   std::size_t attention_readout = 0;
   std::size_t vision_workspace = 0;
+  // The embedding pool's bytes, wherever the vision residency puts it: a
+  // VRAM line under DEVICE, host-mapped and no VRAM line under HOST (GitHub
+  // #415). `vision` says the load has vision whatever the pool's place.
   std::size_t media_embedding = 0;
+  bool media_embedding_host = false;
+  bool vision = false;
   std::size_t sampling_workspace = 0;
   std::size_t decode_graph_scratch = 0;
   std::size_t verify_round = 0;
@@ -1451,10 +1474,9 @@ struct LoadSizes {
   }
 
   ignis_model_reservations reservations() const {
-    const bool vision = media_embedding > 0;
     ignis_model_reservations out{};
     out.workspace_bytes = workspace();
-    out.media_embedding_bytes = media_embedding;
+    out.media_embedding_bytes = media_embedding_host ? 0 : media_embedding;
     // sampling_single_{configs, positions, out}, sampling_decode_{configs,
     // positions, out, logits} and the workspace, as the load allocates them.
     // GitHub #242 adds the permitted-set staging to the same line: ids
@@ -1640,8 +1662,20 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
                               attention_readout_bytes(text_keys, text_keys);
     sizes.vision_workspace =
         ignis_vision_workspace_bytes(item_tokens, std::min(item_tokens, kVisionMaxSegments));
+    // GitHub #414 (ADR 0075): a tower in host memory is staged through a ring
+    // after the workspace, in the encoder's share of the scratch; the scratch
+    // is still the larger of the two shares (ADR 0030), so the ring costs
+    // VRAM only where the encoder's share sets the scratch's size.
+    if (options.vision_residency == IGNIS_VISION_RESIDENCY_HOST) {
+      sizes.vision_workspace =
+          ignis_vision_staged_share(sizes.vision_workspace, ignis_vision_staging_slot_bytes(model.vision)).bytes;
+    }
     sizes.media_embedding =
         vision_embedding_pool_bytes(g.hidden, tokens, options.vision_embedding_pool_bytes);
+    // GitHub #415: and the pool, the same pages and the same bytes, is
+    // host-mapped, so it leaves the VRAM plan.
+    sizes.media_embedding_host = options.vision_residency == IGNIS_VISION_RESIDENCY_HOST;
+    sizes.vision = true;
   }
 
   // GitHub #275 (ADR 0041): a `locate`'s readout over a text span, reserved
@@ -1703,7 +1737,8 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   };
   ignis_model_reservations out{};
   out.workspace_bytes = capacity(model.scratch);
-  out.media_embedding_bytes = bytes(model.vision_pool.buffer);
+  // GitHub #415: a host-mapped pool holds no VRAM.
+  out.media_embedding_bytes = model.vision_pool.device_bytes();
   out.sampling_bytes = bytes(model.sampling_single_configs) + bytes(model.sampling_single_positions) +
                        bytes(model.sampling_single_out) + bytes(model.sampling_decode_configs) +
                        bytes(model.sampling_decode_positions) + bytes(model.sampling_decode_out) +
@@ -1724,6 +1759,22 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
 }
 
 } // namespace
+
+MappedHostRegion::MappedHostRegion(std::size_t size_bytes) {
+  cudaError_t err = cudaHostAlloc(&host, size_bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+  if (err != cudaSuccess) {
+    host = nullptr;
+    throw std::runtime_error("cudaHostAlloc(mapped) of " + std::to_string(size_bytes) +
+                             " bytes failed: " + cudaGetErrorString(err));
+  }
+  err = cudaHostGetDevicePointer(&device, host, 0);
+  if (err != cudaSuccess) {
+    cudaFreeHost(host);
+    host = nullptr;
+    throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") + cudaGetErrorString(err));
+  }
+  bytes = size_bytes;
+}
 
 extern "C" int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors,
                                                  uint64_t count,
@@ -1933,7 +1984,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       const std::size_t output_bytes = sizes.media_embedding;
       std::size_t vision_free = 0;
       std::size_t vision_total = 0;
-      if (cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess && output_bytes > vision_free) {
+      if (!sizes.media_embedding_host && cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess &&
+          output_bytes > vision_free) {
         throw std::runtime_error("a " + std::to_string(vision_tokens) +
                                  "-token vision envelope's embedding pool needs " +
                                  std::to_string(output_bytes) + " bytes, but only " +
@@ -1942,12 +1994,73 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
                                  " --vision-max-tokens");
       }
       const std::size_t page_bytes = vision_embedding_page_bytes(g.hidden);
-      model->vision_pool.buffer = std::make_unique<ninfer::DeviceBuffer>(output_bytes);
+      if (sizes.media_embedding_host) {
+        // GitHub #415 (ADR 0075): the same pages in mapped pinned host
+        // memory, which the host plan counted; a host that will not pin them
+        // fails the load, never moving the pool to the device.
+        try {
+          model->vision_pool.mapped = std::make_unique<MappedHostRegion>(output_bytes);
+        } catch (const std::exception &e) {
+          throw std::runtime_error(std::string("the embedding pool in mapped host memory: ") + e.what() +
+                                   " -- keep it in VRAM (--vision-residency device) or turn vision off");
+        }
+      } else {
+        model->vision_pool.buffer = std::make_unique<ninfer::DeviceBuffer>(output_bytes);
+      }
       model->vision_pool.page_columns = IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS;
       model->vision_pool.page_bytes = page_bytes;
       model->vision_pool.owner.assign(output_bytes / page_bytes, nullptr);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: vision reservation failed: ") + e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
+    // GitHub #414 (ADR 0075): the tower must be where the residency says --
+    // the plan sized the scratch by the option, and a tower read from host
+    // memory in place would be a load that neither plan describes -- and,
+    // under host, every stage must fit a slot of the plan's ring before an
+    // encode needs it. Then the ring's own copy stream and events.
+    try {
+      const bool host = load.vision_residency == IGNIS_VISION_RESIDENCY_HOST;
+      std::size_t tensors = 0;
+      std::size_t in_host = 0;
+      visit_vision_stages(model->vision, [&](std::size_t, const ninfer::Weight &w) {
+        ++tensors;
+        in_host += in_host_memory(w.qdata) ? 1 : 0;
+      });
+      if (in_host != (host ? tensors : 0)) {
+        throw std::runtime_error(std::string("the vision residency is ") + (host ? "host" : "device") + " but " +
+                                 std::to_string(in_host) + " of the tower's " + std::to_string(tensors) +
+                                 " tensors are bound in host memory: bind the tower where the residency puts it");
+      }
+      if (host) {
+        VisionStaging &staging = model->vision_staging;
+        staging.slot_bytes = ignis_vision_staging_slot_bytes(model->vision);
+        ignis_vision_staging_check(model->vision, staging.slot_bytes);
+        // GitHub #415: the merger writes each host-mapped pool page through a
+        // device page in a slot of the ring (vision_encode.cu).
+        if (model->vision_pool.page_bytes > staging.slot_bytes) {
+          throw std::runtime_error("an embedding pool page of " + std::to_string(model->vision_pool.page_bytes) +
+                                   " bytes does not fit a staging slot of " + std::to_string(staging.slot_bytes));
+        }
+        const auto event = [](cudaEvent_t &e) {
+          if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+            throw std::runtime_error("creating a staging event failed");
+          }
+        };
+        event(staging.head);
+        for (std::size_t slot = 0; slot < IGNIS_VISION_STAGING_SLOTS; ++slot) {
+          event(staging.copied[slot]);
+          event(staging.consumed[slot]);
+        }
+        if (cudaStreamCreateWithFlags(&staging.copy, cudaStreamNonBlocking) != cudaSuccess) {
+          staging.copy = nullptr;
+          throw std::runtime_error("creating the staging copy stream failed");
+        }
+      }
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: the vision tower's residency: ") + e.what());
       cudaStreamDestroy(model->stream);
       model->stream = nullptr;
       return -1;
@@ -2054,7 +2167,9 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
     return -1;
   }
   out_stats->vram_bytes = model->vram_bytes;
-  out_stats->host_mapped_bytes = model->host_mapped_bytes;
+  // GitHub #415: and the embedding pool, where the host vision residency
+  // maps it.
+  out_stats->host_mapped_bytes = model->host_mapped_bytes + model->vision_pool.host_mapped_bytes();
   out_stats->bound_tensor_count = model->bound_tensor_count;
   out_stats->vision_reserved_bytes = model->vision_reserved_bytes();
   out_stats->reserved = model->flash_next ? ignis::flash_next::reserved(*model) : reserved_of(*model);

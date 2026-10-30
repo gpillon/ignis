@@ -113,10 +113,12 @@ pinned host memory rather than VRAM (ADR 0062): the card reads one row per
 token over PCIe and gives the 1.35 GB to the KV pool. So the 27B plans host
 memory too, the way Flash-Next does: the table, the host retained slots
 (232.5 MB each, 16 by default: 3.72 GB), the KV-RAM arena (2 GiB, 8 GiB under
-`make`) and KV-disk's staging when the tier is on must leave the 4 GiB margin
-of the available RAM. Under the `make` defaults that is about **18 GB
-available**. A load below it is refused before anything is pinned, naming
-the 27B's own flags:
+`make`), the vision tower and the embedding pool under the `host` vision
+residency (below) and KV-disk's staging when the tier is on must leave the
+4 GiB margin of the available RAM. Under the `make` defaults on a 32 GB card,
+whose profile turns vision on (297 MB of tower and a 320 MiB pool), that is
+about **18.6 GB available**; without vision, about 18 GB. A load below it is
+refused before anything is pinned, naming the 27B's own flags:
 
 ```
 not enough RAM: the load holds 12.7 GiB and keeps 4 GiB free for the system, so it needs 16.7 GiB
@@ -131,3 +133,15 @@ event, and a load that fits logs `ignis.runtime.qwen27b_host_plan`. The knobs
 are Flash-Next's, under the `qwen38` scope: `--qwen38-reuse-retained-host`,
 `--qwen38-reuse-kv-host-pool-bytes`, `--qwen38-kv-disk-bytes` and
 `--qwen38-model-host-margin-bytes`.
+
+A vision load under `--vision-residency host` pins the vision tower beside the
+table and maps the embedding pool in pinned RAM of its own, each on a line of
+its own: `vision_tower`, 297 MB with its page padding, and `vision_pool`, the
+pool `--vision-embedding-pool-mib` sizes (`vision_tower_bytes` and
+`vision_pool_bytes` in both events). A start that cannot hold them is refused
+naming `--vision-residency device` and turning vision off as the ways out
+([Where the vision tower and the embedding pool live](vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
+So is a start the plan let through but whose pin the system then declined
+(it may refuse to lock memory it reports available): its load fails with
+`materialize weights:`, the system's error, the bytes the plan had counted,
+the tower's and the pool's among them, and the same ways out.
