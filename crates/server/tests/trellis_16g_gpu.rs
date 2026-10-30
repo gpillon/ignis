@@ -30,7 +30,9 @@
 //!
 //! GitHub #415 (ADR 0075) loads the profile in the same 16 GiB with vision on
 //! under the `host` residency, at a 1,024- and a 4,096-token envelope, and
-//! finds the text-only load's KV pool, to the page.
+//! finds the text-only load's KV pool, to the page; GitHub #418 makes that the
+//! profile's own default, so the tests above load the profile as it ships,
+//! vision on, and the text-only load is asked for with `--vision-enabled false`.
 //!
 //! Its own test binary: the request log is written on the engine's telemetry
 //! task, so the capture is the process's global subscriber. The two budget
@@ -70,7 +72,15 @@ const BUDGET: &str = "17179869184";
 /// projection workspaces and with the q | gate buffer, the head-width-bounded
 /// trellis workspace at its widest call (`mlp/down` at the 1,024-token
 /// chunk), and the round arena at 2 lanes x 8 columns.
-const WORKSPACE_BYTES: u64 = 395_898_880;
+///
+/// The profile ships with vision on (#418: 4,096 tokens, `host` residency), so
+/// the workspace line is the text-only load's 395,898,880 bytes plus 25,600:
+/// the vision attention readout's share of the prefill scratch at a 4,096-token
+/// envelope, under a KV page, so the pool and the context are the text-only
+/// load's. Every other trellis line is unchanged.
+const WORKSPACE_BYTES: u64 = 395_924_480;
+/// The same line under `--vision-enabled false`.
+const TEXT_ONLY_WORKSPACE_BYTES: u64 = 395_898_880;
 const TRELLIS_WORKSPACE_BYTES: u64 = 36_225_280;
 const DECODE_GRAPH_BYTES: u64 = 20_621_328;
 /// Spec 05b's capacity simulation: the 16 GB card less 1 GiB and less 3 GiB
@@ -443,9 +453,10 @@ async fn under_the_host_residency_vision_keeps_the_text_only_kv_pool_at_1024_and
         tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
         Some(lines)
     }
-    let Some(text) = plan_of(&[]).await else { return };
+    let Some(text) = plan_of(&["--vision-enabled", "false"]).await else { return };
     assert_eq!(text["adapted"], "", "the text-only load fits as asked");
     assert!(text.get("vision_residency").is_none(), "{text}");
+    assert_eq!(text["workspace_bytes"].as_u64(), Some(TEXT_ONLY_WORKSPACE_BYTES), "the text-only workspace line");
     for envelope in ["1024", "4096"] {
         let flags = ["--vision-enabled", "--vision-max-tokens", envelope, "--vision-residency", "host"];
         let Some(host) = plan_of(&flags).await else { return };
@@ -459,4 +470,31 @@ async fn under_the_host_residency_vision_keeps_the_text_only_kv_pool_at_1024_and
         );
         assert_eq!(host["kv_pool_pages"], text["kv_pool_pages"], "{envelope}: the text-only load's KV pool");
     }
+}
+
+/// GitHub #418 (ADR 0075, the profile's default): `rtx50-16gb` with no vision
+/// flag at all loads with vision on under the `host` residency at its
+/// 4,096-token envelope, and, no image in flight, costs no context: the same KV
+/// pool as the text-only load, a `media_embedding` line of 0, and a workspace
+/// that grew by the readout's 25,600 bytes, under a page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn the_profiles_own_default_load_has_host_vision_and_the_text_only_kv_pool() {
+    async fn plan_of(extra: &[&str]) -> Option<serde_json::Value> {
+        let (model, events) = load_16g_with(17_179_869_184, extra)?;
+        let plan = named(&events, "ignis.runtime.vram_plan");
+        assert_eq!(plan.len(), 1, "{events:?}");
+        println!("vram_plan {extra:?}: {}", plan[0]);
+        let lines = plan[0]["attributes"].clone();
+        tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
+        Some(lines)
+    }
+    let Some(text) = plan_of(&["--vision-enabled", "false"]).await else { return };
+    let Some(shipped) = plan_of(&[]).await else { return };
+    assert_eq!(shipped["vision_residency"], "host", "{shipped}");
+    assert_eq!(shipped["adapted"], "", "the profile as shipped fits as asked");
+    assert_eq!(shipped["media_embedding_bytes"], 0, "the pool is host-mapped, no VRAM line");
+    assert_eq!(shipped["weights_bytes"], text["weights_bytes"], "the tower is staged, not resident");
+    assert_eq!(shipped["workspace_bytes"].as_u64(), Some(WORKSPACE_BYTES), "the workspace line, readout included");
+    assert_eq!(shipped["kv_pool_pages"], text["kv_pool_pages"], "vision on costs no context with no image in flight");
 }
