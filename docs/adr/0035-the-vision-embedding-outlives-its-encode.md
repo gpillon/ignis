@@ -9,6 +9,11 @@ it always was, so the plan's shape is unchanged and the number it carries at
 the default is not. **A declared departure from the reference** — see
 *Consequences*.
 
+**Amended 2026-10-30 (owner, GitHub #409, [ADR 0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md)):**
+the pool is the load's reservation where the vision residency puts it: host-mapped under `host`, the default, and in
+VRAM under `device`. Its pages, its holds and its sizing are unchanged; the merger writes each page through a device
+page and the prefill's scatter reads it in place.
+
 Sources: owner decision 2026-09-20 on GitHub #243; the split measured in
 `docs/findings/2026-09-20-number-width-and-decide-e2e.md`; spec
 `docs/specs/vision-fanout/01-share-the-vision-embedding.md`.

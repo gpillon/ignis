@@ -19,6 +19,11 @@ the 32,768 default adapted the context to 65,536, and at 1,024 kept all 262,144 
 308,672 text-only. Vision stays off so a text-only start, and a Windows card whose desktop already costs it context,
 pays nothing for it.
 
+**Amended 2026-10-30 (owner, GitHub #409, [ADR 0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md)):**
+once the vision residency is built and passes its gate, `rtx50-16gb` turns vision on with `vision.max_tokens` 4,096,
+since under `host` residency vision costs it no context while no image is in flight. `rtx5090` takes `host` and
+`rtxpro6000` `device`.
+
 Related:
 - [ADR 0030](0030-device-memory-reserved-at-load.md): device memory is reserved at load;
 - [ADR 0046](0046-one-declaration-per-config-field.md): one declaration per config field;
@@ -58,7 +63,8 @@ the free memory at start varies with what else holds the card, and 256K with DFl
    - DFlash2 on, at the family's default draft tokens (to be tuned on a real card: speculation yields less on a
      compute-poor card);
    - the drafter's proposal head `auto`;
-   - vision off, with a 1,024-token envelope for a start that turns it on (amended 2026-10-29).
+   - vision off, with a 1,024-token envelope for a start that turns it on (amended 2026-10-29); vision on at 4,096
+     under `host` residency once ADR 0075 is built (amended 2026-10-30).
    - `decode_lanes` becomes one field for both families, 1..8.
 3. **A profile's defaults adapt to the budget at load, in a fixed order.** An explicit value from any source never
    adapts and is refused as today. When the plan does not fit, the load tries, in turn:
