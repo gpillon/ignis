@@ -10,7 +10,7 @@ sidebar:
 | `--vision-enabled` | `IGNIS_VISION_ENABLED` | off | Load the vision tower and reserve its workspace. Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
 | `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision-enabled` (`1024` under the `rtx50-16gb` profile) | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the `ignis.request.admitted` line reports `media.vision_tokens` (admitted) and `media.natural_vision_tokens`. Several images whose total is past the cap are still refused with `media_budget_exceeded`. |
 | `--vision-embedding-pool-mib <n>` | `IGNIS_VISION_EMBEDDING_POOL_MIB` | one envelope-wide embedding | Encoded images kept for reuse across requests, 1..65536, counted where `--vision-residency` puts the pool ([below](#where-the-vision-tower-and-the-embedding-pool-live)). |
-| `--vision-residency <host\|device>` | `IGNIS_VISION_RESIDENCY` | `device` | Needs `--vision-enabled`. Where the vision tower's weights and the embedding pool live: `device` in VRAM, `host` in pinned host RAM, the weights copied to the GPU for each image ([below](#where-the-vision-tower-and-the-embedding-pool-live)). Read at load: a change takes effect at the next one. |
+| `--vision-residency <host\|device>` | `IGNIS_VISION_RESIDENCY` | `host`; `device` under `rtxpro6000` | Needs `--vision-enabled`. Where the vision tower's weights and the embedding pool live: `device` in VRAM, `host` in pinned host RAM, the weights copied to the GPU for each image ([below](#where-the-vision-tower-and-the-embedding-pool-live)). Read at load: a change takes effect at the next one. |
 | `--media-cache-mib <n>` | `IGNIS_MEDIA_CACHE_MIB` | `1024` with `--vision-enabled` | Prepared images kept for reuse; `0` disables, max 65536. |
 | `--media-allow-private-network` | `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` | off | Needs `--vision-enabled`. Fetch image URLs on private, loopback and link-local addresses. |
 
@@ -23,12 +23,12 @@ envelope-wide image unless named: 10 MiB at a 1,024-token envelope, 40 MiB at
 (`--vision-residency`, `vision.residency`, `IGNIS_VISION_RESIDENCY`) says where
 a vision load keeps both:
 
-- **`device`** (the default): in VRAM for the life of the load, as every
-  vision load before it. An image encodes at full speed, and the tower and the
+- **`device`** (the `rtxpro6000` profile's): in VRAM for the life of the load,
+  as every vision load before it. An image encodes at full speed, and the tower and the
   pool come out of the KV pool whether or not an image ever arrives. It is the
   choice for a card with VRAM to spare on a host short of RAM, and for the
   lowest encode latency.
-- **`host`**: in pinned host RAM. The tower sits beside the token embedding
+- **`host`** (the default, and the `rtx5090` profile's): in pinned host RAM. The tower sits beside the token embedding
   ([Host RAM for the 27B](host-ram.md#host-ram-for-the-27b)), and for each image
   the encode copies it to the GPU a block at a time, through three 25 MB slots
   it holds in the prefill scratch, while the block before computes. The pool is

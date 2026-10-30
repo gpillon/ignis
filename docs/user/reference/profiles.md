@@ -39,6 +39,7 @@ A profile is a layer of defaults for one kind of card, between the config file a
 | [`spec.decode_lanes`](configuration.md#specdecode_lanes) | Qwen3.8-Flash-Next | `3` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
 | [`vision.enabled`](configuration.md#visionenabled) | every model | `true` |
+| [`vision.residency`](configuration.md#visionresidency) | every model | `host` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `1200M` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | every model | `1536M` |
 | [`vram.pinned_expert_bytes`](configuration.md#vrampinned_expert_bytes) | every model | `2G` |
@@ -57,3 +58,4 @@ A profile is a layer of defaults for one kind of card, between the config file a
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-Flash-Next | `3` |
 | [`vision.enabled`](configuration.md#visionenabled) | every model | `true` |
+| [`vision.residency`](configuration.md#visionresidency) | every model | `device` |

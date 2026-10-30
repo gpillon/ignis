@@ -16,7 +16,7 @@ use ignis_artifact::packer::{pack, sidecar_path, PackOptions, PackOutcome, TRELL
 use ignis_artifact::{
     bind_model_scope_27b_with, body_27b, dflash2_scope_27b, draft_head_scope_27b, model_scope_27b_of,
     tensor_encoded_size, text_scope_27b_trellis, vision_scope_27b, Body27b, DraftModule, InventoryEntry, ModelScope,
-    NumericFormat, Object, Reader, Sidecar, StorageLayout,
+    NumericFormat, Object, Reader, Sidecar, StorageLayout, VisionResidency,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -242,7 +242,7 @@ fn real_trellis_artifact_binds_through_the_27bs_model_scope() {
     assert_eq!(body_27b(&reader), Body27b::Trellis);
     let text = ModelScope::default();
     let drafted = ModelScope { draft: Some(DraftModule::Dflash2ShortlistHead), ..text };
-    let with_vision = ModelScope { vision: true, ..drafted };
+    let with_vision = ModelScope { vision: true, vision_residency: VisionResidency::Device, ..drafted };
     for (scope, entries, device_bytes) in
         [(text, 803, 9_825_087_488u64), (drafted, 803 + 66 + 2, 11_264_998_400), (with_vision, 803 + 68 + 333, 11_560_717_824)]
     {

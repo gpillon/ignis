@@ -392,14 +392,14 @@ pub fn vision_scope_27b() -> Vec<InventoryEntry> {
 /// #414): `device`, in VRAM for the life of the load, or `host`, in the
 /// mapped pinned host allocation the token embedding lives in (ADR 0062),
 /// staged into the prefill scratch for each media encode. A load option,
-/// fixed for the life of the load. `device` is the default until the
-/// profiles take `host` (#416).
+/// fixed for the life of the load. `host` is the default (#416); the
+/// `rtxpro6000` profile takes `device`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum VisionResidency {
     /// The tower staged from pinned host memory for each encode.
+    #[default]
     Host,
     /// The tower in VRAM, as every vision load before ADR 0075.
-    #[default]
     Device,
 }
 
@@ -830,8 +830,8 @@ mod tests {
     }
 
     #[test]
-    fn the_vision_residency_parses_its_two_values_and_defaults_to_the_device() {
-        assert_eq!(VisionResidency::default(), VisionResidency::Device);
+    fn the_vision_residency_parses_its_two_values_and_defaults_to_the_host() {
+        assert_eq!(VisionResidency::default(), VisionResidency::Host);
         assert_eq!(VisionResidency::NAMES, ["host", "device"]);
         for residency in [VisionResidency::Host, VisionResidency::Device] {
             assert_eq!(VisionResidency::parse(residency.as_str()), Ok(residency));

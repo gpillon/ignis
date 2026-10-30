@@ -59,7 +59,7 @@ The default: a 32 GB RTX 5090.
 | Field | 27B | Flash-Next |
 |---|---|---|
 | Context (`model.max_context`) | 917,504 | 589,824 |
-| Vision | on | not applicable |
+| Vision | on, tower and pool in host RAM (`vision.residency: host`) | not applicable |
 | Speculation | DFlash2, 7 draft tokens | off |
 | Decode lanes | 8 (the default) | 3 |
 | Prefill chunk | 2,048 | 1,024 (the default) |
@@ -77,6 +77,12 @@ Why each:
   the 27B and 2.25 for Flash-Next
   ([ADR 0057](../../adr/0057-rope-scaling-is-auto-by-default.md),
   [ADR 0059](../../adr/0059-flash-next-applies-yarn-on-q-and-k.md)).
+- **The vision tower and pool in host RAM.** The 5090 stages the 296 MB tower
+  for each image and maps the embedding pool in pinned host RAM, so a vision
+  load keeps the KV pool of a text-only one ([Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
+  On Windows, Task Manager counts the pinned tower and pool as shared GPU
+  memory, as it does the token embedding: that is host RAM, not VRAM
+  oversubscription ([the WDDM note](vram-plan.md#windows-and-wddm)).
 - **The 27B's prefill chunk.** With vision on, the image encoder sizes the
   workspace, so a 2,048-token chunk costs no VRAM over 1,024. It prefilled
   1.9 and 2.2 percent faster at 46K and 105K, with a lower KLD against BF16 and
@@ -105,7 +111,7 @@ Linux ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)).
 | Field | 27B | Flash-Next |
 |---|---|---|
 | Context | 1,048,576 | 1,048,576 |
-| Vision | on | not applicable |
+| Vision | on, tower and pool in VRAM (`vision.residency: device`) | not applicable |
 | Speculation | DFlash2, 7 draft tokens | MTP, 3 draft tokens |
 | Decode lanes | 8 (the default) | 8 |
 | Prefill chunk | 2,048 | 1,024 (the default) |
@@ -118,6 +124,9 @@ Why each:
   attention envelope, and the plan holds it. `auto` rope scaling makes both
   models YaRN at 4. No request that long was run.
 - **Headroom left at the default.** Nothing has to be traded for vision on 96 GB.
+- **The vision tower and pool stay in VRAM.** On 96 GB they are about 0.8% of
+  the KV pool, and the host may be short of RAM to pin them, so this profile
+  takes `device`. `--vision-residency host` overrides it.
 - **Eight lanes.** The expert cache holds nearly every expert, so a lane costs
   its state and its share of the KV pool, and the aggregate peaks at eight.
 - **MTP for Flash-Next, at the default row budget.** Few experts cross PCIe here,

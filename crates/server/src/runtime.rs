@@ -2416,7 +2416,12 @@ mod tests {
         assert_eq!(pool(&[&host[..], &["--vision-embedding-pool-mib", "1"]].concat()), 4096 * 5120 * 2, "raised to the floor");
         let device = ["--vision-enabled", "--vision-max-tokens", "4096", "--vision-residency", "device", "--vision-embedding-pool-mib", "640"];
         assert_eq!(pool(&device), 0, "the device's pool is a VRAM line");
-        assert_eq!(pool(&[]), 0, "no vision, no pool");
+        let text_only = qwen27b_host_request(64 << 30, 1_350_860_800, 0, 0, &{
+            let mut shape = rtx5090_27b(&host);
+            shape.vision = None;
+            shape
+        });
+        assert_eq!(text_only.vision_pool_bytes, 0, "no vision, no pool");
     }
 
     /// A pin the host refuses after its plan passed (the OS may decline to lock

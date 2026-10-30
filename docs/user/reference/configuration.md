@@ -979,7 +979,7 @@ Encoded images kept for reuse, in MiB, where `vision.residency` puts the pool: V
 | Flag | `--vision-residency` |
 | Env var | `IGNIS_VISION_RESIDENCY` |
 | Kind | `vision residency` |
-| Default | `device` |
+| Default | `host` |
 | Rule | one of host, device |
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |

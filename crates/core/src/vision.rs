@@ -95,7 +95,7 @@ impl Default for Vision {
             max_tokens: DEFAULT_VISION_MAX_TOKENS,
             pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
             item_max_tokens: 0,
-            residency: VisionResidency::Device,
+            residency: VisionResidency::default(),
         }
     }
 }
@@ -111,7 +111,7 @@ impl Vision {
             max_tokens,
             pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
             item_max_tokens: 0,
-            residency: VisionResidency::Device,
+            residency: VisionResidency::default(),
         })
     }
 
@@ -754,8 +754,8 @@ mod tests {
     /// envelope, the pool and the item bound, and moves none of them.
     #[test]
     fn a_residency_rides_the_option_and_moves_nothing_else() {
-        assert_eq!(Vision::default().residency(), VisionResidency::Device);
-        assert_eq!(Vision::new(4096).unwrap().residency(), VisionResidency::Device);
+        assert_eq!(Vision::default().residency(), VisionResidency::Host);
+        assert_eq!(Vision::new(4096).unwrap().residency(), VisionResidency::Host);
         let host = Vision::new(4096).unwrap().with_pool_bytes(640 << 20).with_item_max_tokens(1024)
             .with_residency(VisionResidency::Host);
         assert_eq!(host.residency(), VisionResidency::Host);

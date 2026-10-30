@@ -2255,14 +2255,28 @@ fn help_lists_the_vision_flags() {
 
 // ── the vision residency (GitHub #414, ADR 0075) ─────────────────────────
 
-/// Until the profiles take `host` (#416), a load that names no residency keeps
-/// today's: the tower on the device.
+/// A load that names no residency takes `host` (ADR 0075, GitHub #416); the
+/// other values still win from any source.
 #[test]
-fn the_vision_residency_defaults_to_the_device() {
+fn the_vision_residency_defaults_to_the_host() {
     let vision = config(&["--profile", "none", "--vision-enabled"]).vision.expect("vision on");
-    assert_eq!(vision.residency(), VisionResidency::Device);
+    assert_eq!(vision.residency(), VisionResidency::Host);
     let meta = schema::field("vision", "residency").expect("declared");
-    assert_eq!((meta.default)(), serde_json::json!("device"));
+    assert_eq!((meta.default)(), serde_json::json!("host"));
+    let device = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "device"]);
+    assert_eq!(device.vision.map(|v| v.residency()), Some(VisionResidency::Device));
+}
+
+/// ADR 0063 as amended by ADR 0075 (GitHub #416): the 5090 takes `host`; the
+/// 96 GB card, where tower and pool are ~0.8% of the KV pool and the host may
+/// be short of RAM, takes `device`.
+#[test]
+fn the_built_in_profiles_pick_the_vision_residency() {
+    let at = |profile: &str| config(&["--profile", profile, "--vision-enabled"]).vision.map(|v| v.residency());
+    assert_eq!(at("rtx5090"), Some(VisionResidency::Host));
+    assert_eq!(at("rtxpro6000"), Some(VisionResidency::Device));
+    let flag = config(&["--profile", "rtxpro6000", "--vision-residency", "host"]);
+    assert_eq!(flag.vision.map(|v| v.residency()), Some(VisionResidency::Host), "a flag wins over the profile");
 }
 
 #[test]
@@ -2289,20 +2303,20 @@ fn the_vision_residency_is_patched_and_takes_effect_at_the_next_load() {
     assert!(meta.visible && meta.patchable && meta.reload_required && !meta.scoped, "{meta:?}");
     // A patch reaches the running 27B, whose next load it is.
     let started = config(&["--profile", "none", "--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).unwrap();
-    let patched = started.with_patch(&patch_of(&[("vision", "residency", "host")])).unwrap();
-    assert_eq!(patched.vision.map(|v| v.residency()), Some(VisionResidency::Host));
+    let patched = started.with_patch(&patch_of(&[("vision", "residency", "device")])).unwrap();
+    assert_eq!(patched.vision.map(|v| v.residency()), Some(VisionResidency::Device));
 }
 
 #[test]
 fn a_vision_residency_without_vision_is_refused_rather_than_ignored() {
-    let err = refused(&["--profile", "none", "--vision-residency", "host"]);
-    assert!(err.contains("--vision-residency host") && err.contains("--vision-enabled"), "{err}");
+    let err = refused(&["--profile", "none", "--vision-residency", "device"]);
+    assert!(err.contains("--vision-residency device") && err.contains("--vision-enabled"), "{err}");
     assert!(
-        resolve(&args(&["--profile", "none"]), env_map(&[("IGNIS_VISION_RESIDENCY", "host")])).is_err(),
+        resolve(&args(&["--profile", "none"]), env_map(&[("IGNIS_VISION_RESIDENCY", "device")])).is_err(),
         "the env form too"
     );
     // Naming the default is harmless, as for the envelope.
-    assert!(config(&["--profile", "none", "--vision-residency", "device"]).vision.is_none());
+    assert!(config(&["--profile", "none", "--vision-residency", "host"]).vision.is_none());
 }
 
 #[test]
@@ -2325,7 +2339,7 @@ fn help_lists_the_vision_residency_and_both_values() {
 /// with the rest of the vision group.
 #[test]
 fn a_flash_next_switch_drops_the_vision_residency_with_vision() {
-    let started = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "host"]);
+    let started = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "device"]);
     let (fitted, dropped) = fit_to_family(&started, ModelFamily::FlashNext).unwrap();
     assert_eq!(dropped, ["--vision-enabled", "--vision-residency"]);
     assert!(fitted.vision.is_none());

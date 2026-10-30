@@ -211,7 +211,7 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "max_context": 917504, "prefill_chunk": 2048 },
             "qwen38flashnext": { "max_context": 589824 }
         },
-        "vision": { "enabled": true },
+        "vision": { "enabled": true, "residency": "host" },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7 },
             "qwen38flashnext": { "decode_lanes": 3 }
@@ -222,7 +222,7 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "max_context": 1048576, "prefill_chunk": 2048 },
             "qwen38flashnext": { "max_context": 1048576 }
         },
-        "vision": { "enabled": true },
+        "vision": { "enabled": true, "residency": "device" },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7 },
             "qwen38flashnext": { "backend": "mtp", "draft_tokens": 3, "decode_lanes": 8 }
@@ -363,6 +363,8 @@ mod tests {
 
         let vision = field("vision", "enabled").unwrap();
         assert_eq!(rtx5090.get(vision, None).unwrap().raw, "true");
+        let residency = field("vision", "residency").unwrap();
+        assert_eq!(rtx5090.get(residency, None).unwrap().raw, "host", "ADR 0075: the 5090 stages the tower");
 
         let backend = field("spec", "backend").unwrap();
         assert_eq!(rtx5090.get(backend, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "dflash2");
@@ -482,6 +484,8 @@ mod tests {
         // The 5090's choices the card's memory does not change.
         let vision = field("vision", "enabled").unwrap();
         assert_eq!(pro.get(vision, None).unwrap().raw, "true");
+        let residency = field("vision", "residency").unwrap();
+        assert_eq!(pro.get(residency, None).unwrap().raw, "device", "ADR 0075: 96 GB keeps the tower resident");
         let backend = field("spec", "backend").unwrap();
         assert_eq!(pro.get(backend, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "dflash2");
         let draft = field("spec", "draft_tokens").unwrap();
