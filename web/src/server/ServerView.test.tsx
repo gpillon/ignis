@@ -368,11 +368,13 @@ describe("ServerView: the configuration in each scope", () => {
   });
 
   it("shows the vision residency beside the other vision settings, a choice of host and device read at the next load", () => {
+    // ADR 0075: the server's default is host, and the rtx5090 profile the fixture runs under takes it.
+    expect(decl("vision.residency").default).toBe("host");
     const html = renderForm("qwen38");
     const group = html.slice(html.indexOf('id="server-group-vision"'), html.indexOf('id="server-group-media"'));
     const residency = rowOf(group, "vision.residency");
-    expect(residency).toMatch(/type="radio"[^>]*name="vision\.residency"\/><span[^>]*>host</);
-    expect(residency).toMatch(/type="radio"[^>]*name="vision\.residency" checked=""\/><span[^>]*>device</);
+    expect(residency).toMatch(/type="radio"[^>]*name="vision\.residency" checked=""\/><span[^>]*>host</);
+    expect(residency).toMatch(/type="radio"[^>]*name="vision\.residency"\/><span[^>]*>device</);
     expect(residency).toContain("A change to this field reloads the model");
   });
 
