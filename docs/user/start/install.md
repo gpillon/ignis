@@ -42,7 +42,7 @@ Each unpacks into one folder of the same name, holding:
 |---|---|
 | `ignis-server` (`.exe` on Windows) | The server: the OpenAI-compatible API, the Playground at `/ui/` and the metrics |
 | `ignis-bench` | The measuring tools: the canary suite, trace replay, and `small-card`, the report a 16 GB card owner sends ([measure a 16 GB card](../guides/measure-a-16gb-card.md)) |
-| `ignis-artifact-inspect` | Prints a `.ninfer` artifact's identity and contents: `ignis-artifact-inspect <file>.ninfer` |
+| `ignis-artifact-inspect` | Prints a `.ninfer` artifact's identity, its content hash and its contents: `ignis-artifact-inspect <file>.ninfer` |
 | `cudart64_*.dll` (Windows only) | The CUDA 13 runtime, which NVIDIA lets a program ship |
 | `README.md`, `LICENSE`, `NOTICE`, `NOTICE-kernel` | The licence (Apache-2.0) and the vendored kernels' own terms |
 
