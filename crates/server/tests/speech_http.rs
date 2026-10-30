@@ -841,6 +841,7 @@ async fn a_speech_entry_is_told_by_its_kind_and_not_by_its_id() {
         artifact: format!("{id}.gguf"),
         kind,
         card_class: None,
+        family: None,
         aliases: Vec::new(),
         files: vec![CatalogFile { name: format!("{id}.gguf"), bytes: 4, sha256: "0".repeat(64) }],
         layer: CatalogLayer::Operator,

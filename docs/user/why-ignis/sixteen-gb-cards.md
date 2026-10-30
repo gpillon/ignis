@@ -44,8 +44,9 @@ instead of refusing at once, and `GET /v1/models` names what it adapted
 
 **A catalog entry that knows its class** ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)).
 Each catalog entry states the smallest card class it loads on. On a 16 GB
-card, `qwen3.8-27b` resolves to the 16 GB entry, and a model too large for the
-card is refused before anything is torn down.
+card, `qwen3.8-27b` resolves to the 16 GB entry, `qwen3.8-27b-abliterated` to
+its own 16 GB build, and a model too large for the card is refused before
+anything is torn down.
 
 ## The numbers
 
@@ -66,6 +67,9 @@ thinking budget forced a close on 15 of 32 turns against 8 of 32 on NVFP4.
 
 - **The model**: `ignis-server model download qwen3.8-27b-16g`
   ([the catalog](../reference/models.md#qwen38-27b-16g)).
+- **The uncensored variant**: `ignis-server model download qwen3.8-27b-abliterated`
+  fetches `qwen3.8-27b-abliterated-16g` on a 16 GB card
+  ([the uncensored variant](../guides/uncensored.md)).
 - **The profile**: `--profile auto` (the default) or `--profile rtx50-16gb`
   ([profiles](../concepts/profiles.md#rtx50-16gb)).
 - **The adaptation**: [`model.adapt_context_step`](../reference/configuration.md#modeladapt_context_step)

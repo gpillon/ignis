@@ -31,6 +31,10 @@ fn inspect_reads_the_flash_next_fixture() {
     for format in ["TRELLIS_MUL1_K2", "TRELLIS_MUL1_K2P5", "TRELLIS_MUL1_K3", "TRELLIS_MUL1_K4", "Q4G32_F16S", "I64"] {
         assert!(stdout.contains(&format!("format {format}:")), "{format} in {stdout}");
     }
+    // The digest retained state names the artifact by (ADR 0029): two
+    // variants of one model tell apart by it (GitHub #422).
+    let hash: String = Reader::open(&artifact.path).unwrap().content_hash().iter().map(|b| format!("{b:02x}")).collect();
+    assert!(stdout.contains(&format!("content hash: {hash}\n")), "{hash} in {stdout}");
 }
 
 #[test]

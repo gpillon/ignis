@@ -65,7 +65,8 @@ Ask before the install does anything large or visible:
    serves its 16 GB entry, `qwen3.8-27b-16g`, under that id.
    `qwen3.8-flash-next` needs the host RAM above.
    `qwen3.8-27b-abliterated` does not refuse anything:
-   [its page](../guides/uncensored.md) comes first. `ignis-image-2.1-turbo`
+   [its page](../guides/uncensored.md) comes first; on a 16 GB card its 16 GB
+   entry, `qwen3.8-27b-abliterated-16g`, serves it. `ignis-image-2.1-turbo`
    makes images and its weights are non-commercial
    ([What it serves](../start/index.md#what-it-serves)).
 2. **Where the model is kept, and the download itself.** A model is tens of

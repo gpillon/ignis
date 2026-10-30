@@ -12,8 +12,11 @@
 # or 96; ADR 0064): a switch, a request, a start or a download naming an
 # entry above the card's class is refused before anything is torn down or
 # fetched. `aliases` (optional) lists the ids an entry also answers to: its
-# family's default id, served by it on a card below that id's own entry —
-# how the 16 GB 27B answers to `qwen3.8-27b` on a 16 GB card.
+# family's default id, or another entry's served id of its family, served by
+# it on a card below that id's own entry — how the 16 GB 27B answers to
+# `qwen3.8-27b` on a 16 GB card. `family` (optional) is the model family an
+# entry is of, by the family's own id (ADR 0074): stated where an alias
+# involves an entry and neither its id nor its aliases is a family's own id.
 models:
   - id: qwen3.8-27b
     repo: gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer
@@ -25,12 +28,14 @@ models:
       - { name: qwen3_8_27b_nvfp4full-v2.ninfer, bytes: 19406942468, sha256: "abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af" }
 
   # The 27B with the huihui-ai abliteration: the same family, told apart by
-  # its served id.
+  # its served id, which names no family, so the entry states it: an alias
+  # may then name it (ADR 0074).
   - id: qwen3.8-27b-abliterated
     repo: gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer
     revision: "ef3216949e42c42fc713feffb2e05849d57f0f3b"
     artifact: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
     card_class: 32
+    family: qwen3.8-27b
     files:
       - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer.graft.json, bytes: 41707, sha256: "09b0df892c314563192b0a4f102139939d4ef6261fcd210439d4e2636d12e6fe" }
       - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer, bytes: 19406942468, sha256: "18954280c794cb2ff1fc24ada8158de1df11bf0a0a2ea63f109045af48905ef1" }
@@ -75,6 +80,23 @@ models:
     files:
       - { name: qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json, bytes: 309495, sha256: "210ab54bfe8b04e5fc4337ee3755c340ea3f21239aa625c505aa2406645a340d" }
       - { name: qwen3_8_27b_trellis_sc30-v2.ninfer, bytes: 13379877124, sha256: "2c4c9ee4d6b25c08da6c2d85840126e73d120564e230f926b6230b5b95ee8b3c" }
+
+  # The uncensored variant for the 16 GB card class (spec #386, GitHub #423):
+  # the 16 GB 27B's artifact with the 70 matrices the huihui-ai abliteration
+  # changed re-quantized at the quant's own K, every other object the same.
+  # Its id and its alias name no family, so it states its own (ADR 0074); it
+  # answers to the 32 GB entry's served id on a 16 GB card. Pinned to the
+  # upload's hub commit (2026-10-30).
+  - id: qwen3.8-27b-abliterated-16g
+    repo: gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis
+    revision: "94a8bfc0f47ce86403f274be03e2c0f79500727c"
+    artifact: qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer
+    card_class: 16
+    family: qwen3.8-27b
+    aliases: [qwen3.8-27b-abliterated]
+    files:
+      - { name: qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer.conversion.json, bytes: 339543, sha256: "b5b61863b218bf722e4786ec8ca5e7ffde03548068f92184f10ecd95f6fd0f61" }
+      - { name: qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer, bytes: 13379877124, sha256: "4929bc8e1fbc747092f96aebae6b81a0b619db452d05a56df3499fbe1afe9ac5" }
 
   # The speech models (ADR 0067, spec speech/01 §6, GitHub #351): the
   # Qwen3-ASR decoder and its audio encoder as GGUFs, converted by the owner

@@ -9,7 +9,10 @@
 //! unavailable, with the reason. On a 32 GB card, or one of no known class,
 //! nothing changes. The catalog is the built-in one, which holds the 16 GB
 //! 27B (GitHub #338); every artifact is a file under `download.path`, and the
-//! models are `support/switch.rs`'s mocks, loaded by id.
+//! models are `support/switch.rs`'s mocks, loaded by id. An alias may also be
+//! another entry's id of the same family (ADR 0074): the uncensored variant's
+//! 16 GB build, also built in (GitHub #423), answers to
+//! `qwen3.8-27b-abliterated` on a 16 GB card.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,9 +21,8 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_core::compute::ModelFamily;
-use ignis_server::config::file::Format;
 use ignis_server::config::profile::CardClass;
-use ignis_server::download::catalog::parse_operator;
+use ignis_server::download::catalog::Catalog;
 use ignis_server::model_switch::{CatalogModels, Switcher};
 use ignis_server::{ModelStatus, Server};
 use serde_json::{json, Value};
@@ -41,19 +43,23 @@ const SIXTEEN_ARTIFACT: &str = "qwen3_8_27b_trellis_sc30-v2.ninfer";
 const DEFAULT_27B: &str = "qwen3.8-27b";
 const FLASH_NEXT: &str = "qwen3.8-flash-next";
 const IMAGE: &str = "ignis-image-2.1-turbo";
+/// The uncensored variant's served id, its 32 GB entry's, and the id of its
+/// 16 GB build (ADR 0074, GitHub #423).
+const ABLITERATED: &str = "qwen3.8-27b-abliterated";
+const ABLITERATED_16G: &str = "qwen3.8-27b-abliterated-16g";
 /// The catalog's CPU models: the three speech entries and the diarizer.
 const CPU_MODELS: [&str; 4] = ["qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization"];
 
 /// A condition image an edit decodes.
 const PNG: &[u8] = include_bytes!("../../artifact/tests/fixtures/vision/images/on_grid.png");
 
-/// The built-in catalog and the operator's `yaml` (`models: []` for none),
-/// every entry's artifact a file under a fresh `download.path`.
-fn catalog_on_disk(tag: &str, yaml: &str) -> CatalogModels {
+/// The built-in catalog, every entry's artifact a file under a fresh
+/// `download.path`.
+fn catalog_on_disk(tag: &str) -> CatalogModels {
     let dir = std::env::temp_dir().join(format!("ignis-card-class-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let catalog = parse_operator(yaml, Format::Yaml, "test").expect("a valid catalog");
+    let catalog = Catalog::built_in().clone();
     for entry in catalog.entries() {
         std::fs::write(entry.artifact_path(&dir), b"mock").unwrap();
     }
@@ -61,16 +67,29 @@ fn catalog_on_disk(tag: &str, yaml: &str) -> CatalogModels {
 }
 
 /// A server on `start`, on a card of class `card`, whose requests may switch
-/// to any built-in catalog entry on disk, the 16 GB 27B's artifact's header
-/// naming the 27B's family.
+/// to any built-in catalog entry on disk, the artifacts' headers of the two
+/// 16 GB entries naming the 27B's family.
 fn server_on(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, tag: &str) -> Server {
-    loader.header(SIXTEEN, ModelFamily::Qwen38_27b);
-    server_over(loader, start, card, catalog_on_disk(tag, "models: []"))
+    abliterated_server(loader, start, card, ModelFamily::Qwen38_27b, tag)
 }
 
 fn server_over(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, catalog: CatalogModels) -> Server {
     Server::from_active(loader.model(start))
         .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_catalog(catalog, true).with_card_class(card))
+}
+
+/// [`server_on`], the header of the uncensored variant's 16 GB build's
+/// artifact naming `header`.
+fn abliterated_server(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, header: ModelFamily, tag: &str) -> Server {
+    loader.header(SIXTEEN, ModelFamily::Qwen38_27b);
+    loader.header(ABLITERATED_16G, header);
+    server_over(loader, start, card, catalog_on_disk(tag))
+}
+
+/// Where the catalog entry `id`'s artifact is on `server`'s disk.
+fn artifact_of(server: &Server, id: &str) -> std::path::PathBuf {
+    let catalog = server.switcher.as_ref().unwrap().catalog().unwrap();
+    catalog.catalog.entries().iter().find(|entry| entry.id == id).unwrap().artifact_path(&catalog.dir)
 }
 
 async fn send(app: &axum::Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -182,7 +201,7 @@ async fn an_explicit_switch_to_an_entry_above_the_card_class_is_refused_before_a
     let loader = MockLoader::new();
     let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "explicit");
     let app = server.app();
-    for model in [FLASH_NEXT, IMAGE, "qwen3.8-27b-abliterated"] {
+    for model in [FLASH_NEXT, IMAGE] {
         let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": model }))).await;
         refused_by_class(status, &refused, model);
     }
@@ -306,7 +325,7 @@ async fn an_alias_never_resolves_to_an_artifact_of_another_family() {
     for (header, tag) in [(ModelFamily::FlashNext, "family-other"), (ModelFamily::Qwen38_27b, "family-same")] {
         let loader = MockLoader::new();
         loader.header(SIXTEEN, header);
-        let server = server_over(&loader, "mock-a", Some(CardClass::Gb16), catalog_on_disk(tag, "models: []"));
+        let server = server_over(&loader, "mock-a", Some(CardClass::Gb16), catalog_on_disk(tag));
         let app = server.app();
         if header == ModelFamily::Qwen38_27b {
             let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(DEFAULT_27B))).await;
@@ -354,9 +373,10 @@ async fn on_a_32gb_card_or_an_unknown_one_nothing_changes() {
 }
 
 /// ADR 0064 §3: `GET /v1/models` lists an entry on disk the card cannot
-/// load as unavailable, with the reason — the default id's own entry saying
-/// which entry serves a request naming it — and `GET /v1/models/catalog`
-/// says the same of every row, none of them switchable.
+/// load as unavailable, with the reason — the default id's own entry, and
+/// the uncensored variant's (ADR 0074), saying which entry serves a request
+/// naming it — and `GET /v1/models/catalog` says the same of every row, none
+/// of them switchable.
 #[tokio::test]
 async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_reason() {
     let loader = MockLoader::new();
@@ -368,18 +388,19 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
         models["data"].as_array().unwrap().iter().map(|entry| (entry["id"].as_str().unwrap(), entry["available"].as_bool().unwrap())).collect();
     assert_eq!(
         listed,
-        [(SIXTEEN, true), (DEFAULT_27B, false), ("qwen3.8-27b-abliterated", false), (FLASH_NEXT, false), (IMAGE, false)],
+        [(SIXTEEN, true), (DEFAULT_27B, false), (ABLITERATED, false), (FLASH_NEXT, false), (IMAGE, false), (ABLITERATED_16G, true)],
         "the entries it lists today, each marked: {models}"
     );
     let reason = |id: &str| -> String {
         let entry = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).unwrap();
         entry["reason"].as_str().unwrap_or_default().to_owned()
     };
-    for id in [DEFAULT_27B, FLASH_NEXT, IMAGE] {
+    for id in [DEFAULT_27B, ABLITERATED, FLASH_NEXT, IMAGE] {
         let reason = reason(id);
         assert!(reason.contains(id) && reason.contains("32 GB") && reason.contains("16 GB"), "{id}: {reason}");
     }
     assert!(reason(DEFAULT_27B).contains(&format!("served by {SIXTEEN}")), "{}", reason(DEFAULT_27B));
+    assert!(reason(ABLITERATED).contains(&format!("served by {ABLITERATED_16G}")), "{}", reason(ABLITERATED));
     assert!(!reason(FLASH_NEXT).contains("served by"), "{}", reason(FLASH_NEXT));
     assert!(models["data"][0].get("reason").is_none(), "{models}");
 
@@ -388,7 +409,7 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
     for row in catalog["data"].as_array().unwrap() {
         let id = row["id"].as_str().unwrap();
         // A speech model and the diarizer run on the CPU: no class, so no card refuses them.
-        let fits = id == SIXTEEN || CPU_MODELS.contains(&id);
+        let fits = id == SIXTEEN || id == ABLITERATED_16G || CPU_MODELS.contains(&id);
         assert_eq!(row["available"], fits, "{row}");
         assert_eq!(row.get("reason").is_some(), !fits, "{row}");
         if !fits {
@@ -442,9 +463,10 @@ async fn a_catalog_id_the_operator_listed_is_fitted_to_the_card_all_the_same() {
 /// ADR 0064 §2 for `image.prompt_enhancer`, `qwen3.8-27b` by default: it
 /// takes the step a request's `model` takes, so on a 16 GB card the rewrite
 /// runs on the entry that answers to the default id — the loaded one in
-/// place, never a visit to itself, or the one a visit loads. With no such
-/// entry it is an enhancer no visit reaches, which the start and a `PATCH`
-/// say; on a 32 GB card it is its own entry's.
+/// place, never a visit to itself, or the one a visit loads — and to the
+/// uncensored variant's (ADR 0074). With no such entry it is an enhancer no
+/// visit reaches, which the start and a `PATCH` say; on a 32 GB card it is
+/// its own entry's.
 #[tokio::test]
 async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     use ignis_server::images::enhance::{enhancer_on_this_card, unknown_enhancer};
@@ -458,14 +480,143 @@ async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     let via = visited.switcher.as_ref().unwrap().text_model(SIXTEEN).expect("a visit loads the 16 GB 27B");
     assert_eq!(via.artifact.file_name().and_then(|name| name.to_str()), Some(SIXTEEN_ARTIFACT));
     assert_eq!(unknown_enhancer(&visited, DEFAULT_27B, &none), None);
+    assert_eq!(enhancer_on_this_card(&visited, ABLITERATED), ABLITERATED_16G);
+    let via = visited.switcher.as_ref().unwrap().text_model(ABLITERATED_16G).expect("a visit loads the uncensored variant's 16 GB build");
+    assert_eq!(via.artifact, artifact_of(&visited, ABLITERATED_16G));
+    assert_eq!(unknown_enhancer(&visited, ABLITERATED, &none), None);
 
-    // An enhancer no entry answers to on this card: the abliterated 27B's id.
-    const ABLITERATED: &str = "qwen3.8-27b-abliterated";
-    let alone = server_on(&MockLoader::new(), FLASH_NEXT, Some(CardClass::Gb16), "enhancer-alone");
-    assert_eq!(enhancer_on_this_card(&alone, ABLITERATED), ABLITERATED);
-    assert!(unknown_enhancer(&alone, ABLITERATED, &none).is_some_and(|reason| reason.contains(ABLITERATED)));
+    // An enhancer no entry answers to on this card: Flash-Next's id.
+    let alone = server_on(&MockLoader::new(), SIXTEEN, Some(CardClass::Gb16), "enhancer-alone");
+    assert_eq!(enhancer_on_this_card(&alone, FLASH_NEXT), FLASH_NEXT);
+    assert!(unknown_enhancer(&alone, FLASH_NEXT, &none).is_some_and(|reason| reason.contains(FLASH_NEXT)));
 
     let thirty_two = server_on(&MockLoader::new(), FLASH_NEXT, Some(CardClass::Gb32), "enhancer-32");
     assert_eq!(enhancer_on_this_card(&thirty_two, DEFAULT_27B), DEFAULT_27B, "its own entry fits");
     assert_eq!(unknown_enhancer(&thirty_two, DEFAULT_27B, &none), None);
+}
+
+/// ADR 0074: on a 16 GB card a request naming the uncensored variant's id
+/// switches to its 16 GB build, whose artifact is on disk — never to the
+/// 32 GB entry's — and is served under the build's own id; once it is
+/// loaded, a request naming the id is served by it, lane tag and all, with
+/// no switch. An explicit switch by the id resolves it the same way.
+#[tokio::test]
+async fn on_a_16gb_card_the_uncensored_variants_id_is_served_by_its_16gb_build() {
+    let loader = MockLoader::new();
+    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated");
+    let app = server.app();
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
+    assert_eq!(loader.loads(), [ABLITERATED_16G]);
+    assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, ABLITERATED_16G)], "the 16 GB build's artifact, not the 32 GB entry's");
+    let (status, answered) = send(&app, Method::POST, "/v1/responses", Some(response_body(&format!("{ABLITERATED}@agent")))).await;
+    assert_eq!((status, answered["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{answered}");
+    assert_eq!(loader.loads(), [ABLITERATED_16G], "served by the loaded build, no switch");
+
+    let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SIXTEEN }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(until_serving(&app).await["data"][0]["id"], SIXTEEN);
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": ABLITERATED }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert_eq!(accepted["to"], ABLITERATED_16G, "{accepted}");
+    assert_eq!(until_serving(&app).await["data"][0]["id"], ABLITERATED_16G);
+    assert_eq!(loader.loads(), [ABLITERATED_16G, SIXTEEN, ABLITERATED_16G]);
+}
+
+/// ADR 0074: the implicit switch to the 16 GB build happens only when its
+/// artifact is on disk. Without it, a request or a switch naming the
+/// uncensored variant's id is refused before anything stops, naming the
+/// build — never served by the 32 GB entry, which this card cannot load.
+#[tokio::test]
+async fn the_switch_to_the_uncensored_variants_16gb_build_needs_its_artifact_on_disk() {
+    let loader = MockLoader::new();
+    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated-absent");
+    std::fs::remove_file(artifact_of(&server, ABLITERATED_16G)).unwrap();
+    let app = server.app();
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("model_not_found")), "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains(ABLITERATED_16G), "{refused}");
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": ABLITERATED }))).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("model_not_found")), "{refused}");
+    still_serving(&app, &server, &loader, SIXTEEN).await;
+}
+
+/// ADR 0074: the header stays the authority. The 16 GB build states the
+/// 27B's family; holding an artifact whose header names Flash-Next, it does
+/// not answer to the uncensored variant's id: a request and a switch naming
+/// it are refused before anything stops, naming both families, and the
+/// lists say why. Named by its own id, the build is the request's word.
+#[tokio::test]
+async fn an_uncensored_variants_16gb_build_whose_header_names_another_family_does_not_answer() {
+    let loader = MockLoader::new();
+    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::FlashNext, "abliterated-header");
+    let app = server.app();
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+    refused_by_class(status, &refused, ABLITERATED);
+    let message = refused["error"]["message"].as_str().unwrap();
+    for named in [&format!("{ABLITERATED_16G} lists it as an alias"), "its artifact is Qwen3.8-Flash-Next", &format!("{ABLITERATED} is Qwen3.8-27B"), "one model family"] {
+        assert!(message.contains(named), "{named}: {message}");
+    }
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": ABLITERATED }))).await;
+    refused_by_class(status, &refused, ABLITERATED);
+    still_serving(&app, &server, &loader, SIXTEEN).await;
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    let listed = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == ABLITERATED).cloned().unwrap();
+    assert_eq!(listed["available"], false, "{listed}");
+    assert!(listed["reason"].as_str().unwrap().contains("one model family"), "{listed}");
+
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED_16G))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
+}
+
+/// ADR 0074: on a 32 GB card, a 96 GB one or one of no known class nothing
+/// changes for the uncensored variant: its id is its own entry's, for a
+/// request's switch and an explicit one, whatever the 16 GB build's header.
+#[tokio::test]
+async fn on_other_cards_the_uncensored_variants_id_is_its_own_entrys() {
+    for (card, tag) in [(Some(CardClass::Gb32), "abliterated-32"), (Some(CardClass::Gb96), "abliterated-96"), (None, "abliterated-unknown")] {
+        let loader = MockLoader::new();
+        let server = abliterated_server(&loader, DEFAULT_27B, card, ModelFamily::Qwen38_27b, tag);
+        let app = server.app();
+        let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+        assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED)), "{tag}: {completion}");
+        assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, ABLITERATED)], "{tag}: the 32 GB entry's own artifact");
+        let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": DEFAULT_27B }))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{tag}");
+        until_serving(&app).await;
+        let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": ABLITERATED }))).await;
+        assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(ABLITERATED)), "{tag}: {accepted}");
+        assert_eq!(until_serving(&app).await["data"][0]["id"], ABLITERATED, "{tag}");
+        assert_eq!(loader.loads(), [ABLITERATED, DEFAULT_27B, ABLITERATED], "{tag}");
+        let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+        let data = models["data"].as_array().unwrap();
+        assert!(data.iter().all(|entry| entry["available"] == true && entry.get("reason").is_none()), "{tag}: {models}");
+    }
+}
+
+/// ADR 0074, ADR 0064 §3: on a 16 GB card `GET /v1/models` lists the
+/// uncensored variant's 16 GB build, and marks its 32 GB entry unavailable
+/// with the reason, naming the build that serves a request for its id here;
+/// `GET /v1/models/catalog` says the same of their rows.
+#[tokio::test]
+async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_the_uncensored_variant() {
+    let loader = MockLoader::new();
+    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated-lists");
+    let app = server.app();
+    let (status, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = |id: &str| models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).cloned().unwrap_or_else(|| panic!("{id} listed: {models}"));
+    assert_eq!((entry(ABLITERATED_16G)["available"].as_bool(), entry(ABLITERATED_16G).get("reason")), (Some(true), None), "{models}");
+    assert_eq!(entry(ABLITERATED)["available"], false, "{models}");
+    let reason = entry(ABLITERATED)["reason"].as_str().unwrap().to_owned();
+    for said in [ABLITERATED, "32 GB", "16 GB", &format!("served by {ABLITERATED_16G}")] {
+        assert!(reason.contains(said), "{said}: {reason}");
+    }
+
+    let (status, catalog) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let row = |id: &str| catalog["data"].as_array().unwrap().iter().find(|row| row["id"] == id).cloned().unwrap();
+    assert_eq!((row(ABLITERATED_16G)["available"].as_bool(), row(ABLITERATED_16G)["switchable"].as_bool()), (Some(true), Some(true)), "{catalog}");
+    assert_eq!((row(ABLITERATED)["available"].as_bool(), row(ABLITERATED)["switchable"].as_bool()), (Some(false), Some(false)), "{catalog}");
+    assert!(row(ABLITERATED)["reason"].as_str().unwrap().contains(&format!("served by {ABLITERATED_16G}")), "{catalog}");
 }

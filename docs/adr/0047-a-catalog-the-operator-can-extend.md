@@ -18,6 +18,12 @@ contradicts the entry's own id; the artifact's header still names the family,
 and an entry whose artifact is of another family does not answer to the
 alias.
 
+**Amended by ADR 0074** (GitHub #386): an entry may state `family`, the
+family's own id, and must when an alias involves it and neither its id nor its
+aliases name one; an alias may then be another entry's served id of the same
+family. The header stays the authority: it must agree with the stated family
+where an alias resolves.
+
 ## Context
 
 ADR 0033 made `ignis-server` fetch its own model from a registry pinned in

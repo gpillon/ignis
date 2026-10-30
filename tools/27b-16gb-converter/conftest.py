@@ -198,3 +198,64 @@ def download_records(root, names, lfs, revision):
         etag = digest if name in lfs else "0" * 40
         with open(os.path.join(meta, name + ".metadata"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"{revision}\n{etag}\n1792534371.28\n")
+
+
+OVERRIDE_REPO = "someone/abliterated"
+OVERRIDE_REVISION = "fedcba9876543210fedcba9876543210fedcba98"
+PREFIX = "model.language_model.layers."
+
+
+def make_override(root, src, seed=420, records=None):
+    """An override directory under `root` for the sources `src`, as `replay.py run` writes it
+    (records and `replay.json`), and the partial BF16 it was made from, as `replay.py fetch` writes
+    it (a shard of the changed tensors, an index, `fetch.json`). `records`: key -> (rows, columns, k2)
+    for each matrix it holds, default two body matrices with the quant's own K and shape (a different
+    one makes a record the swap must refuse). Returns {"override": dir, "bf16": dir, "keys": [...]};
+    its bytes differ from the quant's."""
+    rng = random.Random(seed)
+    if records is None:
+        quant = exl3.Quant(src["quant"])
+        records = {}
+        for key in (PREFIX + "2.mlp.gate_proj", PREFIX + "3.self_attn.v_proj"):
+            m = quant.matrix(key)
+            records[key] = (m.rows, m.columns, m.k2)
+    tensors = {}
+    for key, (rows, columns, k2) in records.items():
+        tensors[f"{key}.trellis"] = ("I16", [columns // 16, rows // 16, k2 * 8], _bytes(rng, rows * columns // 16 * k2))
+        tensors[f"{key}.suh"] = ("F16", [columns], _bytes(rng, 2 * columns))
+        tensors[f"{key}.svh"] = ("F16", [rows], _bytes(rng, 2 * rows))
+        tensors[f"{key}.mul1"] = ("I32", [], struct.pack("<I", exl3.MUL1))
+    ov = os.path.join(root, "override")
+    os.makedirs(ov)
+    shard = "model-00001-of-00001.safetensors"
+    write_safetensors(os.path.join(ov, shard), tensors)
+    files = {"model.safetensors.index.json": {"metadata": {}, "weight_map": {n: shard for n in tensors}},
+             "quantization_config.json": {"quant_method": "exl3", "bits": 3.0, "head_bits": 4,
+                                          "out_scales": "always", "codebook": "mul1"}}
+    for name, value in files.items():
+        with open(os.path.join(ov, name), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(value, f)
+
+    bf16 = os.path.join(root, "override-bf16")
+    os.makedirs(bf16)
+    weights = {f"{k}.weight": ("BF16", [r, c], _bytes(rng, 2 * r * c)) for k, (r, c, _) in records.items()}
+    ref_shard = "model-00006-of-00018.safetensors"
+    write_safetensors(os.path.join(bf16, ref_shard), weights)
+    with open(os.path.join(bf16, "model.safetensors.index.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"weight_map": {n: ref_shard for n in weights}}, f)
+    digests = {n: hashlib.sha256(t[2]).hexdigest() for n, t in weights.items()}
+    with open(os.path.join(bf16, "fetch.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"repo": OVERRIDE_REPO, "revision": OVERRIDE_REVISION, "index_sha256": "1" * 64,
+                   "shards": {ref_shard: {"bytes": 1 << 20, "lfs_oid": "2" * 64}},
+                   "tensors": {n: {"shard": ref_shard, "bytes": len(t[2]), "dtype": "BF16", "shape": t[1],
+                                   "sha256": digests[n]} for n, t in weights.items()}}, f)
+
+    quant = exl3.Quant(ov)
+    replay = {"schema": "qwen3.8-27b-trellis-replay-v1", "status": "complete",
+              "sources": {"quant": {"revision": REVISION},
+                          "abliterated": {"repo": OVERRIDE_REPO, "revision": OVERRIDE_REVISION, "tensors": digests}},
+              "matrices": {k: {"record_sha256": hashlib.sha256(quant.record(quant.matrix(k))).hexdigest()}
+                           for k in records}}
+    with open(os.path.join(ov, "replay.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(replay, f)
+    return {"override": ov, "bf16": bf16, "keys": sorted(records), "ref_shard": ref_shard}
