@@ -223,7 +223,8 @@ pub fn parse(output: &str, forced: Option<&str>) -> Parsed {
 /// topic turned into an imperative, #442): a transcript at most `edits` words (changed, added
 /// or dropped) from a whole line, or from a whole piece of one between commas or sentence marks
 /// (a keyword), is a copy too when the words it keeps of it are `run` or more, those edits taken
-/// off the shorter of the two (`speech.context_copy_edits`; 0 keeps the exact rule).
+/// off the shorter of the two (`speech.context_copy_edits`; 0 keeps the exact rule). That line is
+/// read without its label only, which is no word a transcript may change.
 pub fn copies_context(context: &str, transcript: &str, run: usize, edits: usize) -> bool {
     let said = words(transcript);
     if run == 0 || said.len() < 2 {
@@ -240,10 +241,12 @@ pub fn copies_context(context: &str, transcript: &str, run: usize, edits: usize)
             })
     };
     context.lines().any(|line| {
-        std::iter::once(line.to_string()).chain(unlabelled(line)).any(|line| {
+        let exact = std::iter::once(line.to_string()).chain(unlabelled(line)).any(|line| {
             let whole = words(&line);
-            said == whole || (said.len() >= run && whole.windows(said.len()).any(|run| run == said)) || near(&line)
-        })
+            said == whole || (said.len() >= run && whole.windows(said.len()).any(|run| run == said))
+        });
+        // A label is no word a near copy may change: `Topic` would buy a short topic an edit.
+        exact || near(&unlabelled(line).unwrap_or_else(|| line.to_string()))
     })
 }
 
@@ -358,6 +361,18 @@ mod tests {
         assert!(copies_context(context, "revisione del codice", 3, 1));
         // A transcript of fewer words than that is no near copy either.
         assert!(!copies_context(CONTEXT, "migrazione pila software", 3, 1));
+    }
+
+    #[test]
+    fn a_lines_label_is_no_word_a_near_copy_may_change() {
+        // Read with its label, a three-word topic is four words, and "la revisione del codice",
+        // said for real, one word off it: near copies are read off the line without its label.
+        for edits in 0..=3 {
+            assert!(!copies_context("Topic: revisione del codice", "la revisione del codice", 3, edits), "{edits} edits");
+        }
+        // The exact rule still reads the line with its label and without.
+        assert!(copies_context("Topic: revisione del codice", "Topic: revisione del codice", 3, 0));
+        assert!(copies_context("Topic: revisione del codice", "revisione del codice", 3, 0));
     }
 
     #[test]
