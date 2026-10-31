@@ -381,8 +381,9 @@ pub struct PromptSetSpec<'a> {
 /// Generate the prompt sets one run sends to one engine, in the order it
 /// sends them, cut from `corpus` when one is given and grown by the filler
 /// generator otherwise (GitHub #426). Each set is what
-/// [`generate_cell_prompts_with_suffix`] (or its corpus twin) generates for
-/// it, proof included, or that set's own error.
+/// [`generate_cell_prompts_with_suffix`] (or, from a corpus,
+/// `cut_corpus_prompts`) generates for it, proof included, or that set's own
+/// error.
 ///
 /// What a set proves of its own prompts holds across a run only when no two
 /// sets draw the same prompt: a set that numbered its prompts from 0 again
@@ -817,36 +818,17 @@ pub fn load_corpus(path: &Path) -> Result<Vec<u32>, String> {
 /// measuring a length it does not claim.
 ///
 /// A target longer than the bank **tiles** it: the window wraps, so a cell
-/// deeper than the corpus repeats it (length fills, content does not grow),
-/// and the prompts of one cell start `bank / count` ids apart.
-pub fn generate_cell_prompts_from_corpus(
-    template: &dyn PromptTemplate,
-    corpus: &[u32],
-    target_tokens: usize,
-    count: usize,
-) -> Result<PromptSet, String> {
-    generate_cell_prompts_from_corpus_with_suffix(template, corpus, target_tokens, count, "")
-}
-
-/// [`generate_cell_prompts_from_corpus`] with a fixed instruction appended
-/// to every prompt. The corpus window shortens to absorb the suffix, so the
-/// post-template count still lands on `target_tokens` exactly.
-pub fn generate_cell_prompts_from_corpus_with_suffix(
-    template: &dyn PromptTemplate,
-    corpus: &[u32],
-    target_tokens: usize,
-    count: usize,
-    suffix: &str,
-) -> Result<PromptSet, String> {
-    cut_corpus_prompts(template, corpus, target_tokens, suffix, Numbering::alone(count), &[])
-}
-
-/// [`generate_cell_prompts_from_corpus_with_suffix`] for a set numbered as
-/// `numbering` says (GitHub #426): the windows are spread over all the
-/// run's prompts, `bank / total` ids apart, and the set's start at its
-/// first prompt's, so no two sets cut the same window; and a window that
-/// starts with the content of one of the run's `earlier` prompts, or of
-/// this set's, is passed over for another.
+/// deeper than the corpus repeats it (length fills, content does not grow).
+/// A fixed instruction, `suffix`, ends every prompt when it is not empty: the
+/// corpus window shortens to absorb it, so the post-template count still
+/// lands on `target_tokens` exactly.
+///
+/// The set is numbered as `numbering` says (GitHub #426): the windows are
+/// spread over all the run's prompts, `bank / total` ids apart, and the
+/// set's start at its first prompt's, so no two sets cut the same window;
+/// and a window that starts with the content of one of the run's `earlier`
+/// prompts, or of this set's, is passed over for another. A run's sets are
+/// cut through [`generate_run_prompts`].
 fn cut_corpus_prompts(
     template: &dyn PromptTemplate,
     corpus: &[u32],
@@ -1900,6 +1882,19 @@ mod tests {
         }
     }
 
+    /// `count` prompts of exactly `target_tokens` cut from `bank`, each ending
+    /// with `suffix`, as a run of that one set cuts them, or that set's error.
+    fn cut(
+        template: &dyn PromptTemplate,
+        bank: &[u32],
+        target_tokens: usize,
+        count: usize,
+        suffix: &str,
+    ) -> Result<PromptSet, String> {
+        let [set] = generate_run_prompts(template, Some(bank), [PromptSetSpec { label: "cell", count, target_tokens, suffix }])?;
+        set
+    }
+
     /// The bank the corpus tests cut from: 256 distinct-ish ids, no two
     /// window starts (stride `256/count`) colliding on their first token.
     fn corpus_bank() -> Vec<u32> {
@@ -1910,7 +1905,7 @@ mod tests {
     fn a_corpus_cell_lands_exactly_on_the_target_and_diverges_at_the_first_content_token() {
         let template = CorpusMock::exact();
         let bank = corpus_bank();
-        let set = generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect("cut");
+        let set = cut(&template, &bank, 64, 6, "").expect("cut");
         assert_eq!(set.prompts.len(), 6, "one warmup + five samples");
         for ids in &set.tokens {
             assert_eq!(ids.len(), 64, "each prompt is exactly the claimed length");
@@ -1941,7 +1936,7 @@ mod tests {
         let template = CorpusMock::exact();
         let bank = corpus_bank();
         let target = bank.len() * 3 + 17;
-        let set = generate_cell_prompts_from_corpus(&template, &bank, target, 1).expect("cut");
+        let set = cut(&template, &bank, target, 1, "").expect("cut");
         assert_eq!(set.tokens[0].len(), target, "the window tiles past the bank's end");
         assert_eq!(template.encode_user_message(&set.prompts[0]).unwrap(), set.tokens[0]);
     }
@@ -2000,7 +1995,7 @@ mod tests {
         // CorpusMock accepts only its reversible `t<id>` atoms; these stand
         // in for the natural-language instruction used by the live G3 cell.
         let suffix = "t900 t901 t902 t903 t904 t905 t906 t907";
-        let set = generate_cell_prompts_from_corpus_with_suffix(&template, &bank, 64, 6, suffix)
+        let set = cut(&template, &bank, 64, 6, suffix)
             .expect("cut with suffix");
 
         for (prompt, ids) in set.prompts.iter().zip(&set.tokens) {
@@ -2024,7 +2019,7 @@ mod tests {
             pad: 4,
         };
         let bank = corpus_bank();
-        let set = generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect("cut");
+        let set = cut(&template, &bank, 64, 6, "").expect("cut");
         for ids in &set.tokens {
             assert_eq!(ids.len(), 64, "the constant offset is absorbed exactly");
         }
@@ -2043,7 +2038,7 @@ mod tests {
             pad: 0,
         };
         let bank = corpus_bank();
-        let err = generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect_err("must refuse");
+        let err = cut(&template, &bank, 64, 6, "").expect_err("must refuse");
         assert!(err.contains("cannot land"), "{err}");
         assert!(err.contains("--corpus"), "{err}");
     }
@@ -2085,7 +2080,7 @@ mod tests {
         let template = SkipMock { double_id: 42 };
         let mut bank: Vec<u32> = vec![42; 5];
         bank.extend(100..400);
-        let set = generate_cell_prompts_from_corpus(&template, &bank, 18, 2).expect("cut");
+        let set = cut(&template, &bank, 18, 2, "").expect("cut");
         assert_eq!(set.prompts.len(), 2, "warmup + one sample");
         for ids in &set.tokens {
             assert_eq!(ids.len(), 18, "each prompt is exactly the claimed length");
@@ -2136,14 +2131,14 @@ mod tests {
     fn a_corpus_shorter_than_the_prompt_count_is_refused() {
         let template = CorpusMock::exact();
         let bank: Vec<u32> = vec![1, 2, 3];
-        let err = generate_cell_prompts_from_corpus(&template, &bank, 16, 6).expect_err("must refuse");
+        let err = cut(&template, &bank, 16, 6, "").expect_err("must refuse");
         assert!(err.contains("fewer than"), "{err}");
     }
 
     #[test]
     fn an_empty_corpus_is_refused() {
         let template = CorpusMock::exact();
-        let err = generate_cell_prompts_from_corpus(&template, &[], 64, 6).expect_err("must refuse");
+        let err = cut(&template, &[], 64, 6, "").expect_err("must refuse");
         assert!(err.contains("empty"), "{err}");
     }
 
@@ -2151,7 +2146,7 @@ mod tests {
     fn a_corpus_target_at_or_below_the_template_overhead_is_refused() {
         let template = CorpusMock::exact(); // overhead is 9
         let bank = corpus_bank();
-        let err = generate_cell_prompts_from_corpus(&template, &bank, 9, 6).expect_err("must refuse");
+        let err = cut(&template, &bank, 9, 6, "").expect_err("must refuse");
         assert!(err.contains("overhead"), "{err}");
     }
 
@@ -2290,7 +2285,7 @@ mod tests {
         let ep = PromptReuse::new(Steady, &template);
         run(&ep, &template, &run_of(&[64], 5, Some(path.clone())));
         let _ = std::fs::remove_file(&path);
-        assert_eq!(ep.admitted(), generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect("cut").tokens);
+        assert_eq!(ep.admitted(), cut(&template, &bank, 64, 6, "").expect("cut").tokens);
     }
 
     /// GitHub #443: a run sends the same prompts every time, each on its

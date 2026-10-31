@@ -198,7 +198,7 @@ fn render_haystack_body(body: &str, needle: &str) -> String {
 /// Build a haystack from a pre-tokenized corpus (the `--corpus` path):
 /// bounded generation instead of [`build_haystack`]'s word-by-word growth,
 /// which the 64K/128K needle cell pays for badly against a real tokenizer
-/// (the same tradeoff [`crate::ttft::generate_cell_prompts_from_corpus`]
+/// (the same tradeoff the corpus path of [`crate::ttft::generate_run_prompts`]
 /// makes for G2/G3's own production-scale fixtures — a binary search over
 /// window *length*, since the re-encoded count is monotone in it, instead
 /// of one re-encode per appended word).

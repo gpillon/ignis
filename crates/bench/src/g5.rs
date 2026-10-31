@@ -682,18 +682,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         let instruction = decode_instruction(COMMITTED_TOKENS);
+        let overhead = CHAT_HEADER + CHAT_FOOTER + instruction.split_whitespace().count();
         for (index, (&depth, sent)) in DEPTHS.iter().zip(ep.admitted()).enumerate() {
-            let mut rotated = bank.clone();
-            rotated.rotate_left(index * bank.len() / DEPTHS.len());
-            let alone = crate::ttft::generate_cell_prompts_from_corpus_with_suffix(
-                &ChatTemplate,
-                &rotated,
-                depth as usize,
-                1,
-                &instruction,
-            )
-            .expect("cut");
-            assert_eq!(sent, alone.tokens[0], "the {depth}-token depth");
+            // The window the bank rotated by `index` thirds opens with, as many
+            // ids as the depth leaves the template's and the instruction's
+            // tokens, then the instruction.
+            let start = index * bank.len() / DEPTHS.len();
+            let window: Vec<u32> = (0..depth as usize - overhead).map(|k| bank[(start + k) % bank.len()]).collect();
+            let text = format!("{} {instruction}", MockTemplate.decode(&window).unwrap());
+            assert_eq!(sent, ChatTemplate.encode_user_message(&text).unwrap(), "the {depth}-token depth");
         }
     }
 }
