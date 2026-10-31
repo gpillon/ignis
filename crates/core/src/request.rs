@@ -148,10 +148,12 @@ pub struct Request {
     /// a single point in its prompt, and a second capture would be a second
     /// image of state that has since moved on.
     pub checkpoint_captured: bool,
-    /// The tiers this request's retained-state lookup found nothing in (GitHub
-    /// #190), reported when its first chunk lands. A request waiting for room
-    /// looks again on every tick, so the lookup is not the place to count it.
-    pub pending_retained_misses: crate::checkpoint::TierSet,
+    /// The tiers this request's look found nothing retained in, by kind: the
+    /// checkpoint lookup's (GitHub #190) and the prefix walk's (#222),
+    /// reported together when its first chunk lands. A request waiting for
+    /// room looks again on every tick, so the look is not the place to count
+    /// them.
+    pub pending_misses: crate::checkpoint::TiersByKind,
     /// The match-key walk of this request's prompt, kept across ticks so a
     /// request waiting for room or prefilling with nothing to claim does not
     /// key its prompt again on every advance (GitHub #200).
@@ -266,7 +268,7 @@ impl Request {
             checkpoint_tokens: 0,
             reuse_source: None,
             checkpoint_captured: false,
-            pending_retained_misses: crate::checkpoint::TierSet::default(),
+            pending_misses: crate::checkpoint::TiersByKind::default(),
             reuse_key_cache: crate::identity::KeyCache::default(),
             kv_ram_claim: None,
             disk_claim: None,

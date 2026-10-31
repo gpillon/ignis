@@ -186,9 +186,39 @@ impl TierSet {
         self.0 == 0
     }
 
+    /// The members of `self` that are not in `other`.
+    pub fn without(self, other: TierSet) -> TierSet {
+        TierSet(self.0 & !other.0)
+    }
+
     /// The members, cheapest tier first.
     pub fn iter(self) -> impl Iterator<Item = ReuseSource> {
         ReuseSource::ALL.into_iter().filter(move |&source| self.contains(source))
+    }
+}
+
+/// A [`TierSet`] for each [`RetainedKind`] (GitHub #222): what a request's
+/// look found nothing retained of each kind in, the checkpoint pool's lookup
+/// and the prefix walk beside it, kept together until its first chunk lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TiersByKind([TierSet; RetainedKind::ALL.len()]);
+
+impl TiersByKind {
+    pub fn new(checkpoint: TierSet, prefix: TierSet) -> Self {
+        Self([checkpoint, prefix])
+    }
+
+    /// `kind`'s tiers.
+    pub fn of(self, kind: RetainedKind) -> TierSet {
+        self.0[kind.index()]
+    }
+
+    /// Every member as `(kind, tier)`: the checkpoint's first, each kind's
+    /// cheapest tier first.
+    pub fn iter(self) -> impl Iterator<Item = (RetainedKind, ReuseSource)> {
+        RetainedKind::ALL
+            .into_iter()
+            .flat_map(move |kind| self.of(kind).iter().map(move |source| (kind, source)))
     }
 }
 
@@ -199,8 +229,10 @@ impl TierSet {
 ///   from — a checkpoint (chosen, not yet restored: its prefill has not
 ///   run), or a retained prefix brought back from KV-RAM for it.
 /// - **Miss**: a request's first chunk landed with no checkpoint in this tier
-///   matching its prompt. Counted at the chunk rather than at the lookup,
-///   because a request waiting for room looks again on every tick.
+///   matching its prompt, or, for a prefix, no retained prefix (a live
+///   sibling's head is none; GitHub #222). Counted at the chunk rather than
+///   at the lookup, because a request waiting for room looks again on every
+///   tick.
 /// - **Spill**: a checkpoint or retained prefix the device gave up was
 ///   written into this tier.
 /// - **Discard**: a checkpoint or retained prefix left this tier for nowhere.
@@ -316,6 +348,15 @@ impl TierList {
     /// The tiers, cheapest first.
     pub fn tiers(&self) -> &[ResidencyTier] {
         &self.0
+    }
+
+    /// The tiers, as a set.
+    pub fn sources(&self) -> TierSet {
+        let mut sources = TierSet::default();
+        for tier in &self.0 {
+            sources.insert(tier.source);
+        }
+        sources
     }
 
     /// `source`'s position in the order, or `None` when this load does not
@@ -596,11 +637,11 @@ impl CheckpointLookup {
     }
 
     /// The tiers of `tiers` in which nothing matched.
-    pub fn misses(&self, tiers: &TierList) -> TierSet {
+    pub fn misses(&self, tiers: TierSet) -> TierSet {
         let mut missed = TierSet::default();
-        for tier in tiers.tiers() {
-            if self.longest_in(tier.source).is_none() {
-                missed.insert(tier.source);
+        for source in tiers.iter() {
+            if self.longest_in(source).is_none() {
+                missed.insert(source);
             }
         }
         missed
@@ -1741,7 +1782,7 @@ mod tests {
         let chosen = pool.select(&lookup, 1_200).unwrap();
         assert_eq!((chosen.source, chosen.tokens), (ReuseSource::Device, 1_500));
         assert_eq!(
-            lookup.misses(pool.tiers()),
+            lookup.misses(pool.tiers().sources()),
             TierSet::default(),
             "both tiers matched something"
         );

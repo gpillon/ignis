@@ -1335,15 +1335,15 @@ impl Metrics {
                 "Retained state chosen to resume from or brought back, by residency tier.",
                 &self.retained_state_hits,
             ),
-            // `kind` is always `checkpoint` here, and that is the honest
-            // shape: the checkpoint pool's lookup is the only one that
-            // reports a miss, so the prefix series sits at zero rather than
-            // carrying one invented to match it. ADR 0017 records this under
-            // its metric table; emitting a prefix miss would be a change to
-            // the fact stream, not to this projection (GitHub #216, #222).
+            // Each `kind` is its own lookup's (GitHub #216, #222): the
+            // checkpoint pool's, and the prefix walk's beside it, which
+            // misses a tier no *retained* prefix matched in (a live sibling's
+            // head is no hit, so it stops no miss) and looks only on the
+            // device and in KV-RAM, so `tier="disk",kind="prefix"` stays at
+            // zero. ADR 0017 records the rule under its metric table.
             (
                 "ignis_retained_state_misses_total",
-                "First prefill chunks with no retained checkpoint matching in the tier.",
+                "Prefill runs whose first chunk landed with no retained checkpoint, or no retained prefix, matching in the tier (a re-queued request counts again).",
                 &self.retained_state_misses,
             ),
             (

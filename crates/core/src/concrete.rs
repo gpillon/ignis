@@ -130,7 +130,7 @@ use std::time::{Duration, Instant};
 
 use crate::checkpoint::{
     CheckpointCapture, CheckpointEntry, CheckpointPool, KV_RAM_RESTORE_FLOOR_TOKENS,
-    RetainedKind, RetainedStateOperation, ReuseSource, TierList,
+    RetainedKind, RetainedStateOperation, ReuseSource, TierList, TierSet, TiersByKind,
 };
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, PageShortageCandidate, ProtectionPhase,
@@ -908,13 +908,19 @@ impl ConcreteScheduler {
         &self.host
     }
 
-    /// Whether `request` is still being served — what separates a sibling's
-    /// prefix from a retained one (GitHub #190): the publisher of a retained
-    /// prefix has finished.
-    fn is_live(&self, request: RequestId) -> bool {
-        self.requests
+    /// The requests still being served, in id order — what separates a
+    /// sibling's prefix from a retained one (GitHub #190): the publisher of a
+    /// retained prefix is not among them. One pass over the requests, so a
+    /// look reads it once and then asks it of every publisher it meets (#222).
+    fn live_requests(&self) -> Vec<RequestId> {
+        let mut live: Vec<RequestId> = self
+            .requests
             .iter()
-            .any(|r| r.id == request && r.state != RequestState::Done)
+            .filter(|r| r.state != RequestState::Done)
+            .map(|r| r.id)
+            .collect();
+        live.sort_unstable();
+        live
     }
 
     /// Requests currently in flight (Admitted + Prefilling + Running).
@@ -1374,6 +1380,40 @@ impl ConcreteScheduler {
         });
     }
 
+    /// The residency tiers a retained prefix lives in (GitHub #222): the
+    /// device, then KV-RAM when it is the tier below it, where
+    /// [`Self::spill_prefix`] sends one the device gives up. Never the disk:
+    /// nothing demotes a prefix there and no restore brings one back, so a
+    /// prefix miss on the disk would be a series that can never hit. The
+    /// device alone with prompt reuse off, whose tier list stops there.
+    fn prefix_tiers(&self) -> TierSet {
+        let mut tiers = TierSet::default();
+        tiers.insert(ReuseSource::Device);
+        if self.checkpoints.tiers().below(ReuseSource::Device) == Some(ReuseSource::KvRam) {
+            tiers.insert(ReuseSource::KvRam);
+        }
+        tiers
+    }
+
+    /// The tiers each kind of retained state can be hit in on this load, and
+    /// so the only ones a look misses it in (GitHub #222): a miss counts a
+    /// request that found nothing where something could have been. Both
+    /// kinds' gates are here, applied the same way.
+    ///
+    /// - A **checkpoint** is captured only with prompt reuse on. Off, no
+    ///   lookup can hit, and its misses would count only the switch.
+    /// - A **prefix** is published only into a retained slot (GitHub #215),
+    ///   prompt reuse on or off. Off, a live sibling's head that outlives its
+    ///   publisher under a claimant is still a hit when claimed (#325). With
+    ///   no slot nothing is ever published.
+    fn hit_tiers(&self) -> TiersByKind {
+        let open = |gate: bool, tiers: TierSet| if gate { tiers } else { TierSet::default() };
+        TiersByKind::new(
+            open(self.config.prompt_reuse, self.checkpoints.tiers().sources()),
+            open(self.retained.capacity() > 0, self.prefix_tiers()),
+        )
+    }
+
     /// The retained prefix `entry`, which the first-victim path is giving up,
     /// goes to KV-RAM if the budget takes it (GitHub #190) — before the caller
     /// releases it, while its pages are still on the device to copy. A prefix
@@ -1403,7 +1443,7 @@ impl ConcreteScheduler {
                 .refresh_retained(RetainedBlob::Prefix(copy), retention.used_at);
             return;
         }
-        let spilled = self.checkpoints.tiers().below(ReuseSource::Device) == Some(ReuseSource::KvRam)
+        let spilled = self.prefix_tiers().contains(ReuseSource::KvRam)
             && self.write_prefix_blob(entry, publisher, tokens, retention, events);
         if !spilled {
             events.push(SchedEvent::RetainedState {
@@ -4244,24 +4284,31 @@ impl Scheduler for ConcreteScheduler {
                     // One walk of the prompt answers all four questions below.
                     let keys = self.reuse_keys(i);
                     let lookup = self.checkpoints.lookup(&keys);
-                    self.requests[i].pending_retained_misses =
-                        lookup.misses(self.checkpoints.tiers());
+                    // GitHub #222: a publisher's liveness, read once for this
+                    // look rather than per entry, and by one test for the
+                    // prefix walk's misses and the claim's hit below.
+                    let live = self.live_requests();
+                    let finished = |publisher: RequestId| live.binary_search(&publisher).is_err();
+                    let peek = self.prefix.peek(&keys, &finished);
                     // A KV-RAM checkpoint has to beat every device reuse by
                     // its restore floor, a prefix's included (GitHub #190).
-                    let mut device_prefix = self
-                        .prefix
-                        .longest_match_tokens(&keys);
+                    let mut device_prefix = peek.device_tokens;
+                    let spilled = peek.spilled.map(|s| (s.id, s.length_tokens));
+                    // GitHub #222: each lookup's misses, in the tiers its kind
+                    // can be hit in on this load; the prefix walk's from before
+                    // a block comes back from KV-RAM below.
+                    let tiers = self.hit_tiers();
+                    self.requests[i].pending_misses = TiersByKind::new(
+                        lookup.misses(tiers.of(RetainedKind::Checkpoint)),
+                        peek.misses(tiers.of(RetainedKind::Prefix)),
+                    );
                     let mut retained = self.claimable(self.checkpoints.select(&lookup, device_prefix));
                     // GitHub #190: a retained prefix only KV-RAM still holds
                     // comes back to the device when it beats every device
                     // reuse by the restore floor and every KV-RAM checkpoint
                     // outright — and from then on the burst shares it there.
                     let mut returned_from_kv_ram = false;
-                    if let Some((spilled, length)) = self
-                        .prefix
-                        .longest_spilled_match(&keys)
-                        .map(|s| (s.id, s.length_tokens))
-                    {
+                    if let Some((spilled, length)) = spilled {
                         let device_checkpoint =
                             lookup.longest_in(ReuseSource::Device).map_or(0, |m| m.tokens);
                         let kv_ram_checkpoint = retained
@@ -4305,7 +4352,7 @@ impl Scheduler for ConcreteScheduler {
                         // subtracting its whole pages is exact.
                         r.resources.kv_pages = r.resources.kv_pages.saturating_sub(claim.pages);
                         let request = r.id;
-                        let retained = !self.is_live(claim.publisher);
+                        let retained = finished(claim.publisher);
                         events.push(SchedEvent::PrefixReused {
                             request,
                             tokens: claim.tokens,
@@ -5065,17 +5112,14 @@ impl Scheduler for ConcreteScheduler {
                             });
                             self.release_kv_ram_claim(i, true);
                         }
-                        let misses = std::mem::take(&mut self.requests[i].pending_retained_misses);
-                        for source in misses.iter() {
-                            // The checkpoint pool's lookup is the only one
-                            // that reports a miss (GitHub #216): the prefix
-                            // walk beside it records none, so every miss is a
-                            // checkpoint miss, and none is invented for the
-                            // prefix side to make the two look symmetric.
+                        // Each lookup's misses under its own kind (GitHub
+                        // #216, #222): the checkpoint pool's, then the prefix
+                        // walk's. Taken, so only the first chunk reports them.
+                        for (kind, source) in std::mem::take(&mut self.requests[i].pending_misses).iter() {
                             events.push(SchedEvent::RetainedState {
                                 operation: RetainedStateOperation::Miss,
                                 source,
-                                kind: RetainedKind::Checkpoint,
+                                kind,
                             });
                         }
                     }

@@ -1919,13 +1919,14 @@ mod tests {
             "ignis_generated_tokens_total 12",
             // GitHub #190: the retained-state facts reach the projection
             // through this consumer too — three first turns, each missing
-            // both tiers the default load carries. GitHub #216: and every
-            // miss the fact stream carries is a checkpoint miss, so the
-            // prefix series sits at zero rather than at an invented figure.
+            // both tiers the default load carries. GitHub #216, #222: each
+            // under its own kind, a checkpoint miss from the checkpoint pool's
+            // lookup and a prefix miss from the prefix walk beside it (a
+            // three-token prompt publishes no head for the next to claim).
             "ignis_retained_state_misses_total{tier=\"device\",kind=\"checkpoint\"} 3",
             "ignis_retained_state_misses_total{tier=\"kv_ram\",kind=\"checkpoint\"} 3",
-            "ignis_retained_state_misses_total{tier=\"device\",kind=\"prefix\"} 0",
-            "ignis_retained_state_misses_total{tier=\"kv_ram\",kind=\"prefix\"} 0",
+            "ignis_retained_state_misses_total{tier=\"device\",kind=\"prefix\"} 3",
+            "ignis_retained_state_misses_total{tier=\"kv_ram\",kind=\"prefix\"} 3",
         ] {
             assert!(exposition.contains(&format!("\n{line}\n")), "no `{line}` in:\n{exposition}");
         }

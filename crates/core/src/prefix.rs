@@ -35,6 +35,7 @@
 
 use std::time::Instant;
 
+use crate::checkpoint::{ReuseSource, TierSet};
 use crate::gdn::GdnState;
 use crate::identity::{MatchKey, PromptContent, PromptKeys};
 use crate::types::{BoundaryLifetime, FanOutId, RequestClass, RequestId};
@@ -179,6 +180,33 @@ pub struct PrefixClaim {
     pub pages: u32,
     /// The claimant's seeded GDN state (resumed at the cached boundary).
     pub gdn: GdnState,
+}
+
+/// What a prompt finds in a [`PrefixCache`] before anything is claimed: what
+/// [`PrefixCache::peek`] returns.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefixPeek<'a> {
+    /// [`PrefixCache::longest_match_tokens`]: a live sibling's head included.
+    pub device_tokens: u32,
+    /// [`PrefixCache::longest_spilled_match`].
+    pub spilled: Option<&'a SpilledPrefix>,
+    /// The tiers a retained prefix matched in.
+    retained: TierSet,
+}
+
+impl PrefixPeek<'_> {
+    /// The tiers of `tiers` no retained prefix matched in (GitHub #222): the
+    /// prefix walk's misses, as [`crate::checkpoint::CheckpointLookup::misses`]
+    /// are the checkpoint pool's.
+    ///
+    /// Retained is the hit's own test (#325). On the device that is an entry
+    /// whose publisher has finished: a live sibling's head is no retained
+    /// state, so claiming it is no hit and matching it stops no miss,
+    /// retention or not. In KV-RAM any blob counts, the copy of one that is
+    /// back on the device included: the tier does hold it.
+    pub fn misses(&self, tiers: TierSet) -> TierSet {
+        tiers.without(self.retained)
+    }
 }
 
 /// The sibling prefix cache (core-07): concurrent requests sharing a
@@ -412,8 +440,9 @@ impl PrefixCache {
     /// a claimant skip, or 0 — without claiming it (GitHub #190). What a
     /// KV-RAM checkpoint has to beat by its restore floor before a restore
     /// across the bus is worth more than sharing pages already on the device.
+    /// [`PrefixCache::peek`]'s answer, which the scheduler reads.
     pub fn longest_match_tokens(&self, prompt: &PromptKeys) -> u32 {
-        self.longest_match(prompt, 0).map_or(0, |e| e.length_tokens)
+        self.peek(prompt, |_| false).device_tokens
     }
 
     /// The longest registered prefix of `prompt` reaching past `floor`.
@@ -698,10 +727,38 @@ impl PrefixCache {
 
     /// The longest prefix of `prompt` held **only** in KV-RAM — one still on
     /// the device is matched there — or `None`. Matched by match key, as
-    /// the device entries are (GitHub #193).
+    /// the device entries are (GitHub #193). [`PrefixCache::peek`]'s answer,
+    /// which the scheduler reads.
     pub fn longest_spilled_match(&self, prompt: &PromptKeys) -> Option<&SpilledPrefix> {
-        let candidates = self.spilled.iter().filter(|s| s.on_device.is_none());
-        longest_keyed(prompt, candidates, |s| (s.key, s.length_tokens))
+        self.peek(prompt, |_| false).spilled
+    }
+
+    /// What a look at this cache finds for `prompt`, claiming nothing (GitHub
+    /// #190, #222): [`PrefixCache::longest_match_tokens`] and
+    /// [`PrefixCache::longest_spilled_match`] together, from one walk of the
+    /// device entries and one of the KV-RAM blobs, which also note on the way
+    /// which tiers a retained prefix matched in. `finished` says whether a
+    /// publisher has finished, which is what makes a device entry retained.
+    pub fn peek(&self, prompt: &PromptKeys, finished: impl Fn(RequestId) -> bool) -> PrefixPeek<'_> {
+        let mut peek = PrefixPeek {
+            device_tokens: 0,
+            spilled: None,
+            retained: TierSet::default(),
+        };
+        for e in self.claimable().filter(|e| prompt.matches(e.length_tokens, e.key)) {
+            peek.device_tokens = peek.device_tokens.max(e.length_tokens);
+            if finished(e.publisher) {
+                peek.retained.insert(ReuseSource::Device);
+            }
+        }
+        for s in self.spilled.iter().filter(|s| prompt.matches(s.length_tokens, s.key)) {
+            peek.retained.insert(ReuseSource::KvRam);
+            // Of two as long, the later, as `longest_keyed` picks.
+            if s.on_device.is_none() && peek.spilled.is_none_or(|l| s.length_tokens >= l.length_tokens) {
+                peek.spilled = Some(s);
+            }
+        }
+        peek
     }
 
     /// The spilled prefix `id`, if its blob is still held.

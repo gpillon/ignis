@@ -1006,22 +1006,12 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
                   // on every scrape, so an
                   // absent one means a server older than #216, not an idle
                   // tier — and reading it as zero is the truthful thing.
-                  // The prefix walk raises no miss at all, so this series is
-                  // zero by construction rather than a prefix that never
-                  // missed (ADR 0017's note, GitHub #216/#222).
-                  const notMeasured = family === "misses" && c.kind === "prefix";
+                  // Since #222 the prefix walk raises its own misses, so the
+                  // prefix column of that row is a count like the others.
                   return (
                     <td key={c.key} className="py-1.5 pr-4 text-right tabular-nums">
-                      {notMeasured ? (
-                        <span className="text-[11px] text-ash" title="Misses are recorded for the checkpoint lookup only; the prefix walk raises none (#222).">
-                          not measured
-                        </span>
-                      ) : (
-                        <>
-                          <span className="font-display font-semibold">{formatCount(cell.total ?? 0)}</span>
-                          {cell.window ? <span className="ml-1.5 text-[11px] text-ash">+{formatCount(cell.window)}</span> : null}
-                        </>
-                      )}
+                      <span className="font-display font-semibold">{formatCount(cell.total ?? 0)}</span>
+                      {cell.window ? <span className="ml-1.5 text-[11px] text-ash">+{formatCount(cell.window)}</span> : null}
                     </td>
                   );
                 })}

@@ -174,6 +174,13 @@ retained tokens:
 - **An image inside the matched part.** A prefix never ends inside an image; it
   walks back to before it, and an image's identity is part of the match.
 
+`ignis_retained_state_misses_total` counts, by tier and kind, each prefill run
+(a re-queued request counts again) that found nothing retained of that kind
+matching where the load could have held some, so a series that can never hit,
+such as a prefix's on the disk, stays at zero
+([ADR 0017](../../adr/0017-prometheus-metrics.md),
+[metrics](../reference/metrics.md)).
+
 ## Who can see it
 
 Reuse is global to the server. Anyone who can reach it could tell from the time
