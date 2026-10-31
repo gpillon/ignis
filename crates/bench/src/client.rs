@@ -273,9 +273,10 @@ pub trait Endpoint: Send + Sync {
     /// thereby cancel the server-side generation by dropping the body.
     ///
     /// `suppress_eos` names the token ids a measurement lane must not stop
-    /// on (see [`suppress_eos_in`]). It is a *request* the
+    /// on (see [`EosControl::apply`]). It is a *request* the
     /// endpoint may be unable to grant: this default ignores it, and even
-    /// the HTTP endpoint can only pass it on — an engine that honours
+    /// the HTTP endpoint can only pass it on, as the one control its engine
+    /// is sent ([`HttpEndpoint::eos_control`]) — an engine that honours
     /// neither `ignore_eos` nor `logit_bias` still stops at its own EOS.
     /// A caller that depends on a lane outliving EOS must check the lane's
     /// token count rather than assume the request was honoured.
@@ -507,6 +508,9 @@ pub struct HttpEndpoint {
     /// Resend a `503` `engine_full` (`--retry-engine-full`); `None`: record
     /// the refusal as a failure.
     retry: Option<RetryPolicy>,
+    /// The EOS control this endpoint's engine is sent, once learned
+    /// ([`HttpEndpoint::eos_control`]).
+    eos_control: std::sync::OnceLock<EosControl>,
 }
 
 impl HttpEndpoint {
@@ -533,6 +537,7 @@ impl HttpEndpoint {
             request_timeout,
             as_recorded: false,
             retry: None,
+            eos_control: std::sync::OnceLock::new(),
         }
     }
 
@@ -587,6 +592,20 @@ impl HttpEndpoint {
             .map_err(|e| format!("GET {url} -> {e}"))?
             .text()
             .map_err(|e| transport_error("GET", &url, "read", &e))
+    }
+
+    /// The EOS control a measurement lane sent to this endpoint carries
+    /// (GitHub #426), learned from the engine once and kept: the `owned_by`
+    /// of the first model `GET /v1/models` lists, read by
+    /// [`EosControl::for_owner`]. A request that suppresses nothing never
+    /// asks.
+    pub fn eos_control(&self) -> Result<EosControl, String> {
+        if let Some(control) = self.eos_control.get() {
+            return Ok(*control);
+        }
+        let models = self.get_json("/v1/models")?;
+        let owner = models.pointer("/data/0/owned_by").and_then(|owner| owner.as_str());
+        Ok(*self.eos_control.get_or_init(|| EosControl::for_owner(owner)))
     }
 
     /// [`HttpEndpoint::get_text`], parsed as JSON.
@@ -696,29 +715,66 @@ pub fn is_recorded_chat_body(prompt: &str) -> bool {
     recorded_chat_body(prompt).is_some()
 }
 
-#[cfg(test)]
-fn request_body_suppressing_eos(req: &Request, eos: &[u32]) -> serde_json::Value {
-    suppress_eos_in(request_body(req), eos)
+/// The end-of-sequence control a measurement lane's body carries (GitHub
+/// #426): each engine is sent the one control it is asked by, never both,
+/// because ignis refuses the reference's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EosControl {
+    /// `ignore_eos: true`, ignis's extension for bounded measurement streams.
+    /// ignis refuses a non-empty `logit_bias` with a 400 (#284, #288), so the
+    /// body carries no `logit_bias` at all.
+    IgnoreEos,
+    /// OpenAI's `logit_bias`, -100 on every EOS id: the reference's control,
+    /// and the standard field for any engine that is not ignis. The reference
+    /// accepts it without applying it (finding 2026-09-13, "ITL lane
+    /// terminator race"), so its lanes can still end at their own EOS.
+    LogitBias,
 }
 
-/// `body` with the end-of-sequence tokens in `eos` suppressed (both the
-/// `ignore_eos` control and the `logit_bias` one).
-fn suppress_eos_in(mut body: serde_json::Value, eos: &[u32]) -> serde_json::Value {
-    if !eos.is_empty() {
-        body["ignore_eos"] = serde_json::json!(true);
-        body["logit_bias"] = serde_json::Value::Object(
-            eos.iter()
-                .map(|id| (id.to_string(), serde_json::json!(-100.0)))
-                .collect(),
-        );
+impl EosControl {
+    /// The control an engine is sent, from the owner `GET /v1/models` names
+    /// for its models (`owned_by`): `"ignis"` on ignis, `"ninfer"` on the
+    /// reference. Anything but ignis, a missing owner included, gets the
+    /// OpenAI field.
+    pub fn for_owner(owned_by: Option<&str>) -> Self {
+        match owned_by {
+            Some("ignis") => Self::IgnoreEos,
+            _ => Self::LogitBias,
+        }
     }
-    body
+
+    /// `body` with the end-of-sequence tokens in `eos` suppressed through
+    /// this control alone, the one place either field is named. An empty
+    /// `eos` adds nothing.
+    pub fn apply(self, mut body: serde_json::Value, eos: &[u32]) -> serde_json::Value {
+        if eos.is_empty() {
+            return body;
+        }
+        match self {
+            Self::IgnoreEos => body["ignore_eos"] = serde_json::json!(true),
+            Self::LogitBias => {
+                body["logit_bias"] = serde_json::Value::Object(
+                    eos.iter()
+                        .map(|id| (id.to_string(), serde_json::json!(-100.0)))
+                        .collect(),
+                );
+            }
+        }
+        body
+    }
+}
+
+#[cfg(test)]
+fn request_body_suppressing_eos(req: &Request, eos: &[u32], control: EosControl) -> serde_json::Value {
+    control.apply(request_body(req), eos)
 }
 
 /// The `usage` figures the TTFT instrument reads back: the prompt tokens
 /// the engine counted, and how many of them it served from a prefix cache
-/// (OpenAI's `prompt_tokens_details.cached_tokens`, which the reference
-/// reports and ignis simply omits — it has no prefix cache before G4).
+/// (OpenAI's `prompt_tokens_details.cached_tokens`, which both engines
+/// report: on ignis, since #284, the prompt a request resumed from retained
+/// state, a prompt checkpoint or a shared prefix, instead of prefilling it —
+/// prompt reuse, ADR 0029, on by default).
 struct Usage {
     prompt_tokens: Option<u32>,
     cached_prompt_tokens: Option<u32>,
@@ -759,8 +815,10 @@ impl Endpoint for HttpEndpoint {
 }
 
 impl HttpEndpoint {
-    /// The request body this endpoint sends for `req`.
-    fn wire_body(&self, req: &Request, suppress_eos: &[u32]) -> serde_json::Value {
+    /// The request body this endpoint sends for `req`, suppressing
+    /// `suppress_eos` with the control its engine is sent
+    /// ([`HttpEndpoint::eos_control`]).
+    fn wire_body(&self, req: &Request, suppress_eos: &[u32]) -> Result<serde_json::Value, String> {
         // The trace line's prompt becomes a single user message (the trace
         // format is prompt-based; the shared "system + tools" prefix is
         // carried inside the prompt text) — unless `--as-recorded` and the
@@ -772,7 +830,12 @@ impl HttpEndpoint {
             .then(|| as_recorded_body(req))
             .flatten()
             .unwrap_or_else(|| request_body(req));
-        suppress_eos_in(base, suppress_eos)
+        // A request that suppresses nothing never asks the engine which
+        // control it takes.
+        if suppress_eos.is_empty() {
+            return Ok(base);
+        }
+        Ok(self.eos_control()?.apply(base, suppress_eos))
     }
 
     /// One request through to its outcome, resending an `engine_full`
@@ -785,8 +848,11 @@ impl HttpEndpoint {
         suppress_eos: &[u32],
     ) -> (Result<Outcome, String>, Queueing) {
         let url = format!("{}/v1/chat/completions", self.base_url);
-        let body = self.wire_body(req, suppress_eos);
         let mut queueing = Queueing::default();
+        let body = match self.wire_body(req, suppress_eos) {
+            Ok(body) => body,
+            Err(e) => return (Err(e), queueing),
+        };
         loop {
             let start = Instant::now();
             let resp = match self.client.post(&url).json(&body).send() {
@@ -1221,9 +1287,8 @@ mod tests {
         assert_eq!(request_body(&req)["class"], "agent");
     }
 
-    #[test]
-    fn a_measurement_lane_suppresses_the_artifacts_eos_on_both_engines() {
-        let req = Request {
+    fn measurement_lane() -> Request {
+        Request {
             id: "itl-decode-0".into(),
             class: RequestClass::Main,
             prompt: "p".into(),
@@ -1232,11 +1297,30 @@ mod tests {
             include_usage: true,
             enable_thinking: Some(false),
             images: Vec::new(),
-        };
-        let body = request_body_suppressing_eos(&req, &[151_645, 151_643]);
-        assert_eq!(body["ignore_eos"], true, "Ignis control");
-        assert_eq!(body["logit_bias"]["151645"], -100.0, "reference control");
-        assert_eq!(body["logit_bias"]["151643"], -100.0, "every reference EOS");
+        }
+    }
+
+    /// GitHub #426: ignis refuses a non-empty `logit_bias` (#284, #288), so
+    /// a lane that also carried it never decoded a token there.
+    #[test]
+    fn a_measurement_lane_for_ignis_carries_ignore_eos_and_no_logit_bias() {
+        let body = request_body_suppressing_eos(&measurement_lane(), &[151_645, 151_643], EosControl::IgnoreEos);
+        assert_eq!(body["ignore_eos"], true);
+        assert!(body.get("logit_bias").is_none(), "ignis refuses a non-empty logit_bias: {body}");
+    }
+
+    #[test]
+    fn a_measurement_lane_for_the_reference_suppresses_every_eos_with_logit_bias() {
+        let body = request_body_suppressing_eos(&measurement_lane(), &[151_645, 151_643], EosControl::LogitBias);
+        assert_eq!(body["logit_bias"], serde_json::json!({ "151645": -100.0, "151643": -100.0 }));
+        assert!(body.get("ignore_eos").is_none(), "only the control the reference is sent: {body}");
+    }
+
+    #[test]
+    fn only_an_engine_whose_models_ignis_owns_is_sent_ignore_eos() {
+        assert_eq!(EosControl::for_owner(Some("ignis")), EosControl::IgnoreEos);
+        assert_eq!(EosControl::for_owner(Some("ninfer")), EosControl::LogitBias, "the reference");
+        assert_eq!(EosControl::for_owner(None), EosControl::LogitBias, "an engine that names no owner");
     }
 
     #[test]
