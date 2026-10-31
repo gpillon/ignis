@@ -535,13 +535,17 @@ async fn a_noul_reports_the_same_media_a_point_over_the_same_image_does() {
     assert_eq!(admitted.len(), 8, "every media field: {admitted:?}");
     // `preprocess_seconds` is each request's own wall clock, so it is
     // compared for being there; everything else is the same number.
-    let measured = |media: &serde_json::Map<String, Value>| {
+    let without_wall_clock = |media: &serde_json::Map<String, Value>| {
         assert!(media["media.preprocess_seconds"].as_f64().is_some(), "{media:?}");
         let mut media = media.clone();
         media.remove("media.preprocess_seconds");
         media
     };
-    assert_eq!(measured(&noul), measured(&admitted), "the same image, the same cost, whatever the primitive");
+    assert_eq!(
+        without_wall_clock(&noul),
+        without_wall_clock(&admitted),
+        "the same image, the same cost, whatever the primitive"
+    );
     assert_eq!(media_on(&point, "ignis.request.done"), admitted);
 }
 
