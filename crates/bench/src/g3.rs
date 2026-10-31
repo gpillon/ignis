@@ -38,8 +38,8 @@ use crate::time::{unix_now, utc_timestamp};
 use crate::trace::RequestClass;
 use crate::ttft::{
     self, generate_cell_prompts, generate_cell_prompts_from_corpus,
-    generate_cell_prompts_from_corpus_with_suffix, generate_cell_prompts_with_suffix, load_corpus,
-    PromptSet, PromptTemplate,
+    generate_cell_prompts_from_corpus_with_suffix, generate_cell_prompts_with_suffix, generate_session_prompts,
+    generate_session_prompts_from_corpus, load_corpus, PromptSet, PromptTemplate, SessionSlots,
 };
 
 // ── fixtures (spec 03, the G3 gate table) ───────────────────────────────
@@ -1163,6 +1163,12 @@ pub struct G3Config {
 /// prompts are cut from it; a corpus that cannot be read fails all three
 /// cells with that error rather than measuring some of them with a
 /// different prompt source than the others.
+///
+/// The cells' four prompt sets (C=1, C=4, the ITL lanes, the ITL
+/// prefillers) are one session's ([`SessionSlots::plan`], GitHub #426): no
+/// prompt shares its first content with another cell's, so an engine with
+/// prompt reuse has nothing an earlier cell left behind to serve a later
+/// cell's sample from.
 pub fn measure(
     ep: &dyn Endpoint,
     template: &dyn PromptTemplate,
@@ -1172,25 +1178,6 @@ pub fn measure(
 ) -> Record {
     let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path));
     let (c1, c4, itl) = match &corpus {
-        Some(Ok(ids)) => (
-            measure_throughput_cell_from_corpus(
-                ep,
-                template,
-                cfg.throughput.prompt_tokens,
-                cfg.throughput.max_tokens,
-                C1_CONCURRENCY,
-                ids,
-            ),
-            measure_throughput_cell_from_corpus(
-                ep,
-                template,
-                cfg.throughput.prompt_tokens,
-                cfg.throughput.max_tokens,
-                C4_CONCURRENCY,
-                ids,
-            ),
-            measure_itl_from_corpus(ep, template, &cfg.itl, ids),
-        ),
         Some(Err(error)) => (
             ThroughputCell::failed(
                 cfg.throughput.prompt_tokens,
@@ -1206,23 +1193,31 @@ pub fn measure(
             ),
             ItlCell::failed(&cfg.itl, error.clone()),
         ),
-        None => (
-            measure_throughput_cell(
-                ep,
-                template,
-                cfg.throughput.prompt_tokens,
-                cfg.throughput.max_tokens,
-                C1_CONCURRENCY,
-            ),
-            measure_throughput_cell(
-                ep,
-                template,
-                cfg.throughput.prompt_tokens,
-                cfg.throughput.max_tokens,
-                C4_CONCURRENCY,
-            ),
-            measure_itl(ep, template, &cfg.itl),
-        ),
+        loaded => {
+            let bank = loaded.as_ref().and_then(|ids| ids.as_deref().ok());
+            let prompts = |tokens: u32, suffix: &str, slots: SessionSlots| match bank {
+                Some(ids) => generate_session_prompts_from_corpus(template, ids, tokens as usize, suffix, slots),
+                None => generate_session_prompts(template, tokens as usize, suffix, slots),
+            };
+            let slots =
+                SessionSlots::plan(&[C1_CONCURRENCY, C4_CONCURRENCY, cfg.itl.decode_lanes, cfg.itl.prefill_count]);
+            let (prompt_tokens, max_tokens) = (cfg.throughput.prompt_tokens, cfg.throughput.max_tokens);
+            (
+                measure_throughput_cell_with(ep, prompt_tokens, max_tokens, C1_CONCURRENCY, || {
+                    prompts(prompt_tokens, "", slots[0])
+                }),
+                measure_throughput_cell_with(ep, prompt_tokens, max_tokens, C4_CONCURRENCY, || {
+                    prompts(prompt_tokens, "", slots[1])
+                }),
+                measure_itl_with(
+                    ep,
+                    &cfg.itl,
+                    template.eos_token_ids(),
+                    || prompts(cfg.itl.decode_prompt_tokens, ITL_DECODE_INSTRUCTION, slots[2]),
+                    || prompts(cfg.itl.prefill_prompt_tokens, "", slots[3]),
+                ),
+            )
+        }
     };
     Record {
         session: cfg.session.clone(),
@@ -1516,6 +1511,11 @@ mod tests {
 
     impl Endpoint for PacedSeries {
         fn complete(&self, req: &Request) -> Result<crate::client::Outcome, String> {
+            // A throughput cell's sequence (a whole-session run's C=1 and
+            // C=4) is no part of the series: served at once.
+            if req.id.starts_with("thr-") {
+                return MockEndpoint::new().complete(req);
+            }
             if !req.id.starts_with("itl-prefill") {
                 return Err(format!("this fixture only serves prefillers here, got `{}`", req.id));
             }
@@ -2149,5 +2149,154 @@ mod tests {
         assert!(record.c1.error.is_some(), "C=1 must fail rather than fall back to the filler path");
         assert!(record.c4.error.is_some());
         assert!(record.itl.error.is_some());
+    }
+
+    // ── a whole session under prompt reuse (GitHub #426) ───────────────────
+
+    /// A stand-in for ignis's **prompt reuse** around another endpoint, whose
+    /// outcomes it reports the usage of. The 5090 run #426 records voided
+    /// C=4's first sample and four of the ten prefillers through exactly the
+    /// two entries it models.
+    ///
+    /// Every request it admits leaves two retained heads, and a later request
+    /// whose prompt starts with one claims it (GLOSSARY: prompt checkpoint,
+    /// publish point, KV page):
+    ///
+    /// - the **prompt checkpoint** at the generation opener, everything up to
+    ///   the template's `<|im_start|>assistant\n`: for one user message with
+    ///   thinking off, the prompt less its last four tokens
+    ///   (`<think>`, `\n\n`, `</think>`, `\n\n`). The run's C=4 sample 0, the
+    ///   C=1 prompt again, reused 8,188 of its 8,192 tokens that way;
+    /// - the **chained prefix** at the opener's page floor, whole 64-token KV
+    ///   pages: 8,128 tokens of an 8,192-token prompt, what each of the run's
+    ///   first four 32,768-token prefillers reused from the 8,192-token prompt
+    ///   its first content came from.
+    ///
+    /// The longest claimable head wins, as on the server, and nothing is ever
+    /// given up: the server keeps fewer, which can only void fewer. Usage is
+    /// the server's: the prompt as the template encodes it, the claimed head
+    /// as `cached_tokens`.
+    struct PromptReuse<'t, E> {
+        inner: E,
+        template: &'t dyn PromptTemplate,
+        retained: std::sync::Mutex<Vec<Vec<u32>>>,
+    }
+
+    impl<'t, E: Endpoint> PromptReuse<'t, E> {
+        const PAGE_TOKENS: usize = 64;
+        const AFTER_OPENER: usize = 4;
+
+        fn new(inner: E, template: &'t dyn PromptTemplate) -> Self {
+            Self { inner, template, retained: std::sync::Mutex::new(Vec::new()) }
+        }
+
+        /// Admit `req`: the prompt tokens it counts and the head it claims,
+        /// then the two heads it leaves behind.
+        fn admit(&self, req: &Request) -> Result<(u32, u32), String> {
+            let tokens = self.template.encode_user_message(&req.prompt)?;
+            let mut retained = self.retained.lock().unwrap();
+            let cached = retained
+                .iter()
+                .filter(|head| tokens.starts_with(head))
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0);
+            let opener = tokens.len().saturating_sub(Self::AFTER_OPENER);
+            let floor = opener / Self::PAGE_TOKENS * Self::PAGE_TOKENS;
+            retained.extend([floor, opener].into_iter().filter(|&at| at > 0).map(|at| tokens[..at].to_vec()));
+            Ok((tokens.len() as u32, cached as u32))
+        }
+
+        fn report(mut outcome: crate::client::Outcome, (prompt, cached): (u32, u32)) -> crate::client::Outcome {
+            outcome.prompt_tokens = Some(prompt);
+            outcome.cached_prompt_tokens = Some(cached);
+            outcome
+        }
+    }
+
+    impl<E: Endpoint> Endpoint for PromptReuse<'_, E> {
+        fn complete(&self, req: &Request) -> Result<crate::client::Outcome, String> {
+            let usage = self.admit(req)?;
+            self.inner.complete(req).map(|outcome| Self::report(outcome, usage))
+        }
+
+        fn complete_observed_while(
+            &self,
+            req: &Request,
+            observer: &mut dyn FnMut(f64) -> bool,
+            suppress_eos: &[u32],
+        ) -> Result<crate::client::Outcome, String> {
+            let usage = self.admit(req)?;
+            self.inner
+                .complete_observed_while(req, observer, suppress_eos)
+                .map(|outcome| Self::report(outcome, usage))
+        }
+    }
+
+    /// The artifact's chat template in shape: `<|im_start|>user\n` before the
+    /// content, `<|im_end|>\n<|im_start|>assistant\n` and the four
+    /// thinking-off tokens after it.
+    const CHAT_HEADER: usize = 3;
+    const CHAT_FOOTER: usize = 9;
+
+    /// Spec 03's fixture at its production sizes, the 5090 run's.
+    fn production_session(corpus: Option<PathBuf>) -> G3Config {
+        G3Config {
+            label: "ignis".into(),
+            profile: "prompt reuse on".into(),
+            artifact: "mock.ninfer".into(),
+            session: "S-reuse".into(),
+            throughput: ThroughputSpec::default(),
+            itl: ItlConfig::default(),
+            corpus,
+        }
+    }
+
+    /// Every sample of `record` the engine served part of from a cache.
+    fn voided(record: &Record) -> Vec<String> {
+        let throughput = record.c1.bad_samples().into_iter().chain(record.c4.bad_samples());
+        throughput
+            .map(|s| format!("{}: {}", s.id, s.void_reason.as_deref().unwrap_or("")))
+            .chain(record.itl.void_prefillers().into_iter().map(|p| {
+                format!("itl-prefill-{}: {}", p.index, p.void_reason.as_deref().unwrap_or(""))
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn a_whole_session_stays_cold_under_prompt_reuse() {
+        let template = MockTemplate { header: CHAT_HEADER, footer: CHAT_FOOTER };
+        let cfg = production_session(None);
+        let paced = PacedSeries::until_cancelled(cfg.itl.decode_lanes, cfg.itl.prefill_count, 2);
+        let ep = PromptReuse::new(paced, &template);
+        let record = measure(&ep, &template, "mock-engine".into(), "http://mock".into(), &cfg);
+
+        assert_eq!(voided(&record), Vec::<String>::new());
+        assert!(record.c1.all_cold() && record.c4.all_cold() && record.itl.all_cold(), "{}", errors(&record));
+        // Not a vacuous mock: the session's own C=1 prompt, sent again, is
+        // served from what it left behind.
+        let again = measure_throughput_cell(&ep, &template, THROUGHPUT_PROMPT_TOKENS, 8, C1_CONCURRENCY);
+        assert!(!again.all_cold(), "a repeated prompt must come back warm");
+    }
+
+    #[test]
+    fn a_whole_session_cut_from_a_corpus_stays_cold_under_prompt_reuse() {
+        let template = CorpusMock { header: CHAT_HEADER, footer: CHAT_FOOTER };
+        // As long as the reference's own bank, and with no period in it.
+        let bank: Vec<String> = (0..65_536u64).map(|i| (i * 2_654_435_761 % 700_000 + 100).to_string()).collect();
+        let path = std::env::temp_dir().join(format!("ignis-bench-g3-session-{}.ids", std::process::id()));
+        std::fs::write(&path, bank.join(" ")).expect("write the bank");
+        let cfg = production_session(Some(path.clone()));
+        let paced = PacedSeries::until_cancelled(cfg.itl.decode_lanes, cfg.itl.prefill_count, 2);
+        let ep = PromptReuse::new(paced, &template);
+        let record = measure(&ep, &template, "mock-engine".into(), "http://mock".into(), &cfg);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(voided(&record), Vec::<String>::new());
+        assert!(record.c1.all_cold() && record.c4.all_cold() && record.itl.all_cold(), "{}", errors(&record));
+    }
+
+    fn errors(record: &Record) -> String {
+        format!("C=1 {:?}, C=4 {:?}, ITL {:?}", record.c1.error, record.c4.error, record.itl.error)
     }
 }

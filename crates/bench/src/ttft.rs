@@ -364,17 +364,69 @@ pub fn generate_cell_prompts_with_suffix(
     count: usize,
     suffix: &str,
 ) -> Result<PromptSet, String> {
+    generate_session_prompts(template, target_tokens, suffix, SessionSlots::alone(count))
+}
+
+/// Where one cell's prompts sit among every prompt its measurement session
+/// sends (GitHub #426): the cell's `count` prompts are the session's
+/// prompts `first..first + count` of `total`.
+///
+/// What a cell proves of its own prompts holds across a session only when
+/// no two cells draw the same prompt: a cell that numbered its prompts from
+/// 0 again sent the first content of an earlier cell's prompt 0, and an
+/// engine with prompt reuse served it warm. Each cell takes the next slots,
+/// so every prompt of the session starts with its own nonce (or corpus
+/// offset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSlots {
+    first: usize,
+    count: usize,
+    total: usize,
+}
+
+impl SessionSlots {
+    /// A cell that is its whole session: slots `0..count`.
+    pub fn alone(count: usize) -> Self {
+        Self { first: 0, count, total: count }
+    }
+
+    /// One set of slots per cell, `counts` prompts each, in the order the
+    /// session measures them.
+    pub fn plan(counts: &[usize]) -> Vec<Self> {
+        let total = counts.iter().sum();
+        counts
+            .iter()
+            .scan(0, |first, &count| {
+                let slots = Self { first: *first, count, total };
+                *first += count;
+                Some(slots)
+            })
+            .collect()
+    }
+}
+
+/// [`generate_cell_prompts_with_suffix`] for a cell that holds `slots` of a
+/// larger session: its prompts are the session's, numbered from the cell's
+/// first slot, so they share no content with another cell's.
+pub fn generate_session_prompts(
+    template: &dyn PromptTemplate,
+    target_tokens: usize,
+    suffix: &str,
+    slots: SessionSlots,
+) -> Result<PromptSet, String> {
+    let count = slots.count;
     if count == 0 {
         return Err("a cell needs at least one prompt".to_string());
     }
     let mut prompts = Vec::with_capacity(count);
     let mut tokens = Vec::with_capacity(count);
     for index in 0..count {
+        let slot = slots.first + index;
         let prompt = generate_prompt_with_suffix(
             template,
             target_tokens,
-            &nonce(index),
-            0x9E3779B97F4A7C15 ^ (index as u64).wrapping_mul(0x100000001B3),
+            &nonce(slot),
+            0x9E3779B97F4A7C15 ^ (slot as u64).wrapping_mul(0x100000001B3),
             suffix,
         )?;
         let ids = template.encode_user_message(&prompt)?;
@@ -651,23 +703,39 @@ pub fn generate_cell_prompts_from_corpus_with_suffix(
     count: usize,
     suffix: &str,
 ) -> Result<PromptSet, String> {
+    generate_session_prompts_from_corpus(template, corpus, target_tokens, suffix, SessionSlots::alone(count))
+}
+
+/// [`generate_cell_prompts_from_corpus_with_suffix`] for a cell that holds
+/// `slots` of a larger session (GitHub #426): the windows are spread over
+/// all the session's prompts, `bank / total` ids apart, and the cell's
+/// start at its first slot's, so no two cells cut the same window.
+pub fn generate_session_prompts_from_corpus(
+    template: &dyn PromptTemplate,
+    corpus: &[u32],
+    target_tokens: usize,
+    suffix: &str,
+    slots: SessionSlots,
+) -> Result<PromptSet, String> {
+    let count = slots.count;
     if count == 0 {
         return Err("a cell needs at least one prompt".to_string());
     }
     if corpus.is_empty() {
         return Err("the corpus is empty: no window to cut".to_string());
     }
-    // One window per prompt, rotated through the bank: consecutive
-    // prompts start `bank/count` ids apart, so their first content tokens
-    // differ (a bank periodicity that aligns two windows is caught by the
-    // divergence proof below, and the cell then fails — never measures a
-    // warm prefix).
-    let stride = corpus.len() / count;
+    // One window per prompt of the session, rotated through the bank:
+    // consecutive prompts start `bank/total` ids apart, so their first
+    // content tokens differ (a bank periodicity that aligns two windows is
+    // caught by the divergence proof below, and the cell then fails — never
+    // measures a warm prefix).
+    let stride = corpus.len() / slots.total;
     if stride == 0 {
         return Err(format!(
-            "the corpus has only {} ids, fewer than the {count} prompts a cell needs: the \
+            "the corpus has only {} ids, fewer than the {} prompts the session needs: the \
              windows would be identical",
-            corpus.len()
+            corpus.len(),
+            slots.total
         ));
     }
     let overhead = template.encode_user_message("")?.len();
@@ -680,7 +748,8 @@ pub fn generate_cell_prompts_from_corpus_with_suffix(
     let mut prompts = Vec::with_capacity(count);
     let mut tokens = Vec::with_capacity(count);
     for index in 0..count {
-        let offset = ((index as u64) * (stride as u64)) % corpus.len() as u64;
+        let slot = slots.first + index;
+        let offset = ((slot as u64) * (stride as u64)) % corpus.len() as u64;
         let (prompt, ids) =
             land_corpus_window(template, corpus, offset as usize, target_tokens, suffix)?;
         prompts.push(prompt);

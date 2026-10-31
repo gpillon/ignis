@@ -184,6 +184,22 @@ so `g3-gate` will refuse to build a verdict from these records, by design (ADR
 0015, ADR 0021). The A/B answers a question about *where time goes*; a verdict
 needs both engines measured back to back under one `--session`.
 
+## G3 against ignis (GitHub #426)
+
+The ITL decode lanes send each engine the one EOS control it is asked by:
+`ignore_eos` to an engine whose `GET /v1/models` names ignis as the owner
+(`owned_by`), since ignis refuses a non-empty `logit_bias` (#288), and
+`logit_bias` to the reference, which accepts it without applying it
+([finding](../../findings/2026-09-13-itl-lane-terminator-race.md)). The run says
+which on stderr.
+
+The four prompt sets of a run (C=1, C=4, the ITL lanes, the ITL prefillers)
+are one session's: no prompt starts with another's content, so prompt reuse,
+on by default, has nothing an earlier cell left behind to serve a later one
+from. The prompts are still fixed, so measure a launch once: a second `g3`
+run against the same live server is served from what the first left, and its
+samples come back void. Restart the engine instead.
+
 ## The harness's own request deadline (GitHub #138)
 
 Every `ignis-bench` subcommand drives its endpoint through one
