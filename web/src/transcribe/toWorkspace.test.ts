@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createMemoryStore } from "../store/memory.ts";
 import { createWorkspaces, type Workspaces } from "../workspace/workspaces.ts";
-import { toMarkdown } from "./export.ts";
+import { toMarkdown } from "./markdown.ts";
 import { sendTranscript, transcriptFile, workspaceNameFor } from "./toWorkspace.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 

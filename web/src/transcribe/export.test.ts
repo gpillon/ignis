@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { clock, toMarkdown, toSrt, toText, toVtt } from "./export.ts";
+import { clock, toSrt, toText, toVtt } from "./export.ts";
+import { toMarkdown } from "./markdown.ts";
+import { noNotes, type Notes } from "./notes.ts";
 import { addUtterance, createTranscript, editText, renameSpeaker, splitUtterance, type Transcript } from "./transcript.ts";
 
 // The five exports (spec speech/07, "Out of the view", Q95): computed in the
@@ -106,5 +108,81 @@ describe("the exports", () => {
     expect(toMarkdown(t)).toBe("# 25 Oct 15:42 · talk.mp3\n\n(00:00): Benvenuti.\n");
     expect(toSrt(t)).toBe("1\n00:00:00,000 --> 00:00:02,000\nBenvenuti.\n");
     expect(toVtt(t)).toBe("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nBenvenuti.\n");
+  });
+});
+
+// The `.md` with the notes and Ask's answers (spec #428, "Exports"); the other
+// three exports never carry them.
+
+const written = (kind: Notes["kind"], lines: [string, string][]): Notes => ({
+  ...noNotes(kind),
+  lines: lines.map(([section, text], i) => ({ id: `N${i + 1}`, section, text, author: "model" as const })),
+  nextId: lines.length + 1,
+  writtenAs: kind,
+  covered: 3,
+  writtenAt: 1_000,
+});
+
+const answer = (id: number, question: string, text: string, untilMs?: number) => ({ id, question, answer: text, at: id, untilMs });
+
+describe("the Markdown export with notes and answers", () => {
+  it("is as before with no notes and no answers", () => {
+    expect(toMarkdown({ ...call(), notes: noNotes("work"), asked: [] })).toBe(toMarkdown(call()));
+  });
+
+  it("carries the running notes in the kind's sections after the start and before the transcript", () => {
+    const md = toMarkdown({ ...call(), notes: written("work", [["Summary", "A check of the line."]]) });
+    expect(md.startsWith("# 25 Oct 15:42 · Call\n\nStarted 25 Oct 2026, 15:42\n\n## Summary\n- A check of the line.\n\n## ")).toBe(true);
+    expect(md).toContain("\n—\n");
+    expect(md.indexOf("## Transcript")).toBeGreaterThan(md.lastIndexOf("\n—"));
+    expect(md.indexOf("**Me** (00:01)")).toBeGreaterThan(md.indexOf("## Transcript"));
+  });
+
+  it("carries the recap, not the running notes, when there is one", () => {
+    const md = toMarkdown({ ...call(), notes: written("work", [["Summary", "Running."]]), recap: written("work", [["Summary", "Recap."]]) });
+    expect(md).toContain("- Recap.");
+    expect(md).not.toContain("Running.");
+  });
+
+  it("sets each answer between the utterances at its moment, a quoted block titled by its question, and one with no moment at the end", () => {
+    const asked = [answer(2, "Who spoke last?", "Ada, at [01:03].\n\nBriefly.", 9_020), answer(1, "Before it all?", "Nothing.", 0), answer(3, "Old one?", "Kept before places.")];
+    expect(toMarkdown({ ...call(), asked })).toBe(
+      [
+        "# 25 Oct 15:42 · Call",
+        "",
+        "Started 25 Oct 2026, 15:42",
+        "",
+        "> **Before it all?**",
+        ">",
+        "> Nothing.",
+        "",
+        "**Me** (00:01): Mi sentite bene?",
+        "",
+        "**Ada** (00:04): Sì, forte e chiaro.",
+        "",
+        "> **Who spoke last?**",
+        ">",
+        "> Ada, at [01:03].",
+        ">",
+        "> Briefly.",
+        "",
+        "**Me** (01:01): Allora partiamo.",
+        "",
+        "**Ada** (~01:03): Va bene.",
+        "",
+        "> **Old one?**",
+        ">",
+        "> Kept before places.",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("leaves .txt, .srt and .vtt as they are with notes, a recap and answers kept", () => {
+    const plain = call();
+    const t = { ...plain, notes: written("work", [["Summary", "x"]]), recap: written("work", [["Summary", "y"]]), asked: [answer(1, "Q?", "A.", 9_020)] };
+    expect(toText(t)).toBe(toText(plain));
+    expect(toSrt(t)).toBe(toSrt(plain));
+    expect(toVtt(t)).toBe(toVtt(plain));
   });
 });
