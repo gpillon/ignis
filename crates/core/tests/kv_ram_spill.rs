@@ -689,6 +689,26 @@ fn a_first_turn_misses_every_configured_tier_once() {
 }
 
 #[test]
+fn a_first_chunk_that_fails_misses_nothing_until_its_retry_lands() {
+    // GitHub #222: the misses are reported when the first chunk lands, so a
+    // chunk the backend fails reports none, and the retry that lands reports
+    // each once.
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
+    let turn = sched.submit(turn_at(1), RequestClass::Interactive).unwrap();
+    compute.fail_prefill(turn);
+    let failed = sched.advance();
+    assert!(sched.last_error().is_some(), "the first chunk was dealt and failed");
+    assert!(
+        retained_state(&failed).iter().all(|&(operation, _, _)| operation != RetainedStateOperation::Miss),
+        "no miss before a chunk lands: {failed:?}"
+    );
+    let events = run_to_idle(&mut sched);
+    assert_eq!(widths(&compute, turn).iter().sum::<usize>(), turn_at(1).tokens.len(), "the retry landed");
+    assert_missed_once(&events, &[ReuseSource::Device, ReuseSource::KvRam], &RetainedKind::ALL);
+}
+
+#[test]
 fn a_request_that_waits_for_room_and_looks_again_misses_each_tier_once() {
     // A miss is counted at the first chunk, not at the look (GitHub #222 for
     // the prefix walk, as #190 for the checkpoint lookup): a request with no
