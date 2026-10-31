@@ -3,6 +3,10 @@
 //! `ignis.request.admitted` event — over the real router against a
 //! mock-compute engine (CPU-only, ADR 0006).
 //!
+//! And a readout-only decision over an image (GitHub #245): it never takes
+//! a decode lane, so it has no `admitted` event, and its media reach the
+//! `ignis.request.done` event every request ends with instead.
+//!
 //! Its own binary, like `telemetry.rs`: tracing caches a callsite's interest
 //! process-wide, so a test running beside it without a subscriber can switch
 //! the request events off before this one captures them.
@@ -17,16 +21,22 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 
-use ignis_artifact::vision::{PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor};
+use ignis_artifact::vision::{PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor, IMAGE_PAD_ID};
+use ignis_core::decision::{AnswerAlphabet, LabelTokenizer};
 use ignis_core::mock::MockCompute;
+use ignis_core::vision::Multimodal;
 use ignis_core::{
     Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome,
-    RequestId, SchedulerConfig,
+    RequestId, SchedulerConfig, TokenId,
 };
 use ignis_logging::MemorySink;
+use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
 use ignis_server::media::{MediaAcquirer, MediaPolicy, Preparer};
-use ignis_server::template::SimpleTemplateProvider;
+use ignis_server::template::{
+    ChatMessage, ContentRejection, RenderedPrompt, SimpleTemplateProvider, TemplateProvider, TemplateRejection,
+};
+use ignis_server::thinking::{ThinkingCapabilities, ThinkingOptions};
 use ignis_server::Server;
 
 #[path = "support/mod.rs"]
@@ -61,8 +71,11 @@ impl Preparer for Counting {
 }
 
 /// The deterministic mock, reporting `micros` of encode time on every chunk
-/// of a multimodal prompt (GitHub #192) — what the CUDA leaf's real encode
-/// reports on the GPU, without one.
+/// of a multimodal prompt that covers an image placeholder (GitHub #192) —
+/// what the CUDA leaf's real encode reports on the GPU, without one; a chunk
+/// past the image encodes nothing there either. The rest of each outcome is
+/// the mock's own, so a decision's readout still reaches its caller (GitHub
+/// #245).
 struct EncodingCompute {
     inner: MockCompute,
     micros: u64,
@@ -70,14 +83,12 @@ struct EncodingCompute {
 
 impl Compute for EncodingCompute {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
-        self.inner.prefill_step(jobs)?;
-        Ok(jobs
-            .iter()
-            .map(|job| PrefillOutcome {
-                encode_micros: if job.multimodal.is_some() { self.micros } else { 0 },
-                ..PrefillOutcome::default()
-            })
-            .collect())
+        let mut outcomes = self.inner.prefill_step(jobs)?;
+        for (outcome, job) in outcomes.iter_mut().zip(jobs) {
+            let covers_image = job.multimodal.is_some() && job.tokens.contains(&IMAGE_PAD_ID);
+            outcome.encode_micros = if covers_image { self.micros } else { 0 };
+        }
+        Ok(outcomes)
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
@@ -240,4 +251,176 @@ async fn the_same_image_sent_twice_is_a_cache_hit_on_the_admitted_event() {
     assert_eq!(admitted[1]["media.vision_tokens"], 4);
     assert_eq!(admitted[1]["media.bytes"], png(64, 64).len());
     assert_eq!(preparer.builds.load(Ordering::SeqCst), 1);
+}
+
+// ── a decision over an image (GitHub #245) ──────────────────────────────
+
+/// Just enough tokenizer to name a `noul`'s answers: `/v1/decide` refuses a
+/// load whose tokenizer can label none.
+struct ThreeLetters;
+
+impl LabelTokenizer for ThreeLetters {
+    fn encode(&self, text: &str) -> Option<Vec<TokenId>> {
+        match text {
+            "A" => Some(vec![1]),
+            "B" => Some(vec![2]),
+            "C" => Some(vec![3]),
+            _ => None,
+        }
+    }
+
+    fn decode(&self, ids: &[TokenId]) -> Option<String> {
+        match ids {
+            [1] => Some("A".to_owned()),
+            [2] => Some("B".to_owned()),
+            [3] => Some("C".to_owned()),
+            _ => None,
+        }
+    }
+}
+
+/// [`SimpleTemplateProvider`] that can decide over an image: an answer
+/// alphabet for the readout, the literals a `point`'s constrained decode
+/// forces (one id per character, as `decide_http.rs`'s fixture does), and
+/// the placeholder's multimodal render.
+struct DecidingTemplate;
+
+impl TemplateProvider for DecidingTemplate {
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[Value],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        SimpleTemplateProvider.apply_chat_template(messages, options, tools)
+    }
+
+    fn answer_alphabet(&self) -> AnswerAlphabet {
+        AnswerAlphabet::from_tokenizer(&ThreeLetters)
+    }
+
+    fn prepare_multimodal(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[Value],
+        media: Vec<PreparedMedia>,
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
+        SimpleTemplateProvider.prepare_multimodal(messages, options, tools, media)
+    }
+
+    fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
+        Some(text.chars().map(|c| c as TokenId).collect())
+    }
+
+    fn render_tokens(&self, tokens: &[TokenId]) -> String {
+        SimpleTemplateProvider.render_tokens(tokens)
+    }
+
+    fn thinking_capabilities(&self) -> ThinkingCapabilities {
+        SimpleTemplateProvider.thinking_capabilities()
+    }
+
+    fn token_decoder(&self) -> Box<dyn TokenDecoder> {
+        SimpleTemplateProvider.token_decoder()
+    }
+}
+
+/// A decide-capable router of its own, encoding every multimodal chunk in
+/// 250 ms: one per test request, so no request claims another's prefix.
+fn deciding_app() -> axum::Router {
+    let compute = Arc::new(EncodingCompute { inner: MockCompute::new(), micros: 250_000 });
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
+        compute,
+    );
+    let acquirer = MediaAcquirer::new(counting(), limits(), MediaPolicy::new(false, 1 << 20));
+    Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate))
+        .with_request_timeout(Duration::from_secs(10))
+        .with_media(Arc::new(acquirer))
+        .app()
+}
+
+/// One question of `kind` over `image` (or over a text `state` when `None`),
+/// answered 200: every event the request log captured meanwhile.
+async fn decide_one(kind: &str, image: Option<&str>) -> Vec<Value> {
+    let sink = Arc::new(MemorySink::new());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone())),
+    );
+    let state = match image {
+        Some(uri) => json!([{"type": "image_url", "image_url": {"url": uri}}]),
+        None => json!("The queue is backing up."),
+    };
+    let body = json!({"state": state, "questions": {"q": {"type": kind, "instructions": "the button"}}});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/decide")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = deciding_app().oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+    let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(answer["answers"]["q"]["type"], kind, "{answer}");
+    nudge().await;
+    sink.lines().iter().map(|line| serde_json::from_str::<Value>(line).unwrap()).collect()
+}
+
+/// The `media.*` attributes of the one `name` event among `events`.
+fn media_on(events: &[Value], name: &str) -> serde_json::Map<String, Value> {
+    let found: Vec<_> = events.iter().filter(|e| e["event_name"] == name).collect();
+    assert_eq!(found.len(), 1, "one {name}: {events:?}");
+    found[0]["attributes"]
+        .as_object()
+        .expect("attributes are an object")
+        .iter()
+        .filter(|(key, _)| key.starts_with("media."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_noul_over_an_image_reports_its_media_on_done() {
+    let image = data_uri(&png(64, 64));
+    let events = decide_one("noul", Some(&image)).await;
+
+    assert!(
+        events.iter().all(|e| e["event_name"] != "ignis.request.admitted"),
+        "a readout takes no decode lane (GitHub #238): {events:?}"
+    );
+    let media = media_on(&events, "ignis.request.done");
+    assert_eq!(media.get("media.encode_seconds"), Some(&json!(0.25)), "{events:?}");
+    assert_eq!(media.get("media.vision_tokens"), Some(&json!(4)), "{media:?}");
+}
+
+#[tokio::test]
+async fn a_noul_reports_the_same_media_a_point_over_the_same_image_does() {
+    let image = data_uri(&png(64, 64));
+    let noul = media_on(&decide_one("noul", Some(&image)).await, "ignis.request.done");
+    let point = decide_one("point", Some(&image)).await;
+
+    // A `point` on a load with no calibrated head is a constrained decode,
+    // which takes a lane and so has always reported on `admitted`.
+    let admitted = media_on(&point, "ignis.request.admitted");
+    assert_eq!(admitted.len(), 8, "every media field: {admitted:?}");
+    // `preprocess_seconds` is each request's own wall clock, so it is
+    // compared for being there; everything else is the same number.
+    let measured = |media: &serde_json::Map<String, Value>| {
+        assert!(media["media.preprocess_seconds"].as_f64().is_some(), "{media:?}");
+        let mut media = media.clone();
+        media.remove("media.preprocess_seconds");
+        media
+    };
+    assert_eq!(measured(&noul), measured(&admitted), "the same image, the same cost, whatever the primitive");
+    assert_eq!(media_on(&point, "ignis.request.done"), admitted);
+}
+
+#[tokio::test]
+async fn a_text_decision_reports_no_media_on_done() {
+    let events = decide_one("noul", None).await;
+    let media = media_on(&events, "ignis.request.done");
+    assert!(media.is_empty(), "{media:?}");
 }

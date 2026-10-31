@@ -156,10 +156,10 @@ pub trait IntervalStatsProvider: Send + Sync {
 
 // ── the telemetry state ─────────────────────────────────────────────────────
 
-/// What a request's media cost, as the `admitted` line reports it: what
-/// acquiring them cost (GitHub #179) and what encoding them cost during
-/// prefill (GitHub #192), which the two halves of the pipeline measure in
-/// different places and only meet here.
+/// What a request's media cost, as the `admitted` and `done` lines report it
+/// (GitHub #245): what acquiring them cost (GitHub #179) and what encoding
+/// them cost during prefill (GitHub #192), which the two halves of the
+/// pipeline measure in different places and only meet here.
 #[derive(Debug, Clone, Copy)]
 struct MediaSummary {
     stats: MediaStats,
@@ -389,7 +389,8 @@ impl Telemetry {
     }
 
     /// A submitted request carried media (GitHub #179): its acquisition
-    /// summary rides on the `admitted` line.
+    /// summary rides on the `admitted` line and on the `done` line (GitHub
+    /// #245), which a request that never takes a lane reaches too.
     pub fn note_media(&mut self, id: RequestId, media: MediaStats) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.media = Some(media);
@@ -535,9 +536,10 @@ impl Telemetry {
     /// stopped): emit the `done` line — carrying `n`, `reason`, the decode
     /// phase's per-lane inter-token-latency summary (P3-06), its
     /// speculative counters when it ran any rounds (P5-06, GitHub #154),
-    /// what its thinking budget did when it had one (spec server/08) and
-    /// where its EOS became `</think>` when it did (GitHub #315) — and drop
-    /// the request from the in-flight set.
+    /// what its thinking budget did when it had one (spec server/08), where
+    /// its EOS became `</think>` when it did (GitHub #315) and what its media
+    /// cost when it had any (GitHub #245) — and drop the request from the
+    /// in-flight set.
     pub fn on_done(
         &mut self,
         id: RequestId,
@@ -566,7 +568,7 @@ impl Telemetry {
         }
         let rt = self.requests.remove(&id);
         let known = rt.is_some();
-        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse, budget_dropped) = match rt {
+        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse, budget_dropped, media) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
                 rt.lane,
@@ -576,6 +578,7 @@ impl Telemetry {
                 rt.class,
                 rt.reuse,
                 rt.thinking_budget_dropped,
+                rt.media.map(|stats| MediaSummary { stats, encode_micros: rt.encode_micros }),
             ),
             None => (
                 self.clock.now_ms(),
@@ -586,6 +589,7 @@ impl Telemetry {
                 RequestClass::default(),
                 None,
                 false,
+                None,
             ),
         };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
@@ -620,6 +624,7 @@ impl Telemetry {
                 dropped_by_max: budget_dropped,
                 redirected_at: reasoning_redirected_at,
             },
+            media,
         );
     }
 
@@ -1045,6 +1050,11 @@ impl Telemetry {
     /// rather than logged per round, and absent on a request that ran none;
     /// `spec.pos` (GitHub #160) is their per-position acceptance profile,
     /// the reference's `pos=[...]`, so the two logs read side by side.
+    /// `media.*` (GitHub #245) are the `admitted` line's, from the same
+    /// [`MediaSummary`]: a readout-only decision is never admitted onto a
+    /// lane (#238), so this is the one line it reports its media on, and a
+    /// request that was admitted reports the same numbers on both. Absent on
+    /// a request without media, as there.
     ///
     /// GitHub #81 / ADR 0012: this runs on the async telemetry consumer
     /// task (`engine.rs`'s `telemetry_task`), not inside the HTTP root span
@@ -1069,11 +1079,14 @@ impl Telemetry {
         spec: Option<SpecCounters>,
         reuse: Option<RequestReuse>,
         thinking: ThinkingReport,
+        summary: Option<MediaSummary>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
         // rounds carries no `spec.*` attributes at all.
         let spec_pos = spec.map(|s| s.acceptance_profile());
+        let encode_seconds = summary.map(|s| s.encode_micros as f64 / 1e6);
+        let media = summary.map(|s| s.stats);
         tracing::info!(
             name: "ignis.request.done",
             request_id = id,
@@ -1121,6 +1134,18 @@ impl Telemetry {
             // leaf drew in place of an EOS inside the reasoning block --
             // absent on every request it did not happen to, budget or not.
             reasoning_redirected_at = thinking.redirected_at,
+            // GitHub #245: the `admitted` line's `media.*`, again, on the
+            // line every request reaches. A readout-only decision ends where
+            // its prefill ends and is never admitted onto a lane (#238), so
+            // without these its encode was paid for and logged nowhere.
+            media.items = media.map(|m| m.items),
+            media.vision_tokens = media.map(|m| m.vision_tokens),
+            media.natural_vision_tokens = media.map(|m| m.natural_vision_tokens),
+            media.bytes = media.map(|m| m.media_bytes),
+            media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
+            media.cache_hits = media.map(|m| m.cache_hits),
+            media.cache_misses = media.map(|m| m.cache_misses),
+            media.encode_seconds = encode_seconds,
             "request done"
         );
     }
@@ -1535,6 +1560,89 @@ mod tests {
             .expect("attributes are an object")
             .clone();
         assert!(attributes.keys().all(|k| !k.starts_with("media.")), "{attributes:?}");
+    }
+
+    #[test]
+    fn a_request_that_never_takes_a_lane_reports_its_media_on_done() {
+        // GitHub #245: a readout-only decision ends where its prefill ends
+        // (#238), so it never reaches `admitted`. Its media were paid for
+        // all the same, and its `done` line is where they are reported.
+        let mut telemetry = telemetry();
+        let media = MediaStats {
+            items: 1,
+            vision_tokens: 4,
+            natural_vision_tokens: 4,
+            media_bytes: 2048,
+            preprocess_seconds: 0.125,
+            cache_hits: 0,
+            cache_misses: 1,
+            source_pixels: Some((64, 64)),
+        };
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 20, RequestClass::Agent);
+            telemetry.note_media(1, media);
+            telemetry.on_prefill_chunk(1, 20, 250_000);
+            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None);
+            // A text request that never takes a lane either, whose chunk
+            // reports encode time anyway: no media, so no `media.*`.
+            telemetry.note_submit(2, 5, RequestClass::Agent);
+            telemetry.on_prefill_chunk(2, 5, 9_000);
+            telemetry.on_done(2, 0, FinishReason::Stop, None, None, None);
+        });
+        assert!(
+            events.iter().all(|e| e["event_name"] != "ignis.request.admitted"),
+            "neither request was dealt a lane: {events:?}"
+        );
+        let done = |id: u64| {
+            events
+                .iter()
+                .find(|e| e["event_name"] == "ignis.request.done" && e["attributes"]["request_id"] == id)
+                .unwrap_or_else(|| panic!("no done event for {id}: {events:?}"))["attributes"]
+                .as_object()
+                .expect("attributes are an object")
+                .clone()
+        };
+        let image = done(1);
+        assert_eq!(image["media.encode_seconds"], 0.25, "{image:?}");
+        assert_eq!(image["media.vision_tokens"], 4, "{image:?}");
+        assert_eq!(image["media.natural_vision_tokens"], 4);
+        assert_eq!(image["media.items"], 1);
+        assert_eq!(image["media.bytes"], 2048);
+        assert_eq!(image["media.preprocess_seconds"], 0.125);
+        assert_eq!(image["media.cache_hits"], 0);
+        assert_eq!(image["media.cache_misses"], 1);
+        let text = done(2);
+        assert!(text.keys().all(|k| !k.starts_with("media.")), "{text:?}");
+    }
+
+    #[test]
+    fn a_request_on_a_lane_reports_the_same_media_on_admitted_and_done() {
+        // GitHub #245: `admitted` keeps its fields, and `done` repeats them,
+        // so a reader finds them on the line every request reaches whatever
+        // the primitive.
+        let mut telemetry = telemetry();
+        let media = MediaStats { items: 1, vision_tokens: 4, media_bytes: 2048, ..MediaStats::default() };
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 20, RequestClass::Agent);
+            telemetry.note_media(1, media);
+            telemetry.on_prefill_chunk(1, 20, 250_000);
+            telemetry.on_admitted(1, 0);
+            telemetry.on_token(1);
+            telemetry.on_done(1, 1, FinishReason::Stop, None, None, None);
+        });
+        let media_of = |name: &str| {
+            let attributes = events
+                .iter()
+                .find(|e| e["event_name"] == name)
+                .unwrap_or_else(|| panic!("no {name}: {events:?}"))["attributes"]
+                .as_object()
+                .expect("attributes are an object")
+                .clone();
+            attributes.into_iter().filter(|(k, _)| k.starts_with("media.")).collect::<Vec<_>>()
+        };
+        let admitted = media_of("ignis.request.admitted");
+        assert_eq!(admitted.len(), 8, "every media field: {admitted:?}");
+        assert_eq!(media_of("ignis.request.done"), admitted);
     }
 
     #[test]

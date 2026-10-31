@@ -66,9 +66,11 @@ about one new image takes the same time as before.
   and, for fetched images, [`media.cache_mib`](../reference/configuration.md#mediacache_mib)
   and [`media.allow_private_network`](../reference/configuration.md#mediaallow_private_network).
 - **Errors**: `vision_disabled` and `media_budget_exceeded`.
-- **Logs**: `ignis.request.admitted` reports `media.vision_tokens` and
-  `media.natural_vision_tokens`; the request log carries `media.encode_seconds`
-  and `media.cache_hits`.
+- **Logs**: the `ignis.request.done` line of a request with images reports
+  `media.vision_tokens`, `media.natural_vision_tokens`, `media.encode_seconds`
+  and `media.cache_hits`, whatever the question; `ignis.request.admitted`
+  repeats them for a request that takes a decode lane
+  ([telemetry](../guides/telemetry.md)).
 - **Playground**: image input in the [chat](../playground/chat.md), and the
   [Decide tab](../playground/decide.md) with an image as the state.
 

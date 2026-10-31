@@ -18,6 +18,15 @@ Everything goes through one structured log on stdout, in the format
   response was cancelled, or a loop-guard rewind replaced it) or `shutdown`
   (a model switch stopped it), beside how long it ran, whether it had a lane
   and the tokens it generated.
+- A request with images says what they cost on its `done` line:
+  `media.items`, `media.vision_tokens` (after any downscale to
+  `--vision-max-tokens`) and `media.natural_vision_tokens`, `media.bytes`,
+  `media.preprocess_seconds`, `media.encode_seconds` (the vision tower),
+  `media.cache_hits` and `media.cache_misses`. A request that takes a decode
+  lane reports the same numbers on `admitted` too, where they explain a slow
+  first token. A decision answered by its prefill (`noul`, `choice`, `score`,
+  and a `point` or `box` read from the heads) never takes one, so `done` is
+  its only line with them. A text request carries none of them.
 - The scheduler counters are the DEBUG event `ignis.scheduler.interval`, emitted
   whenever `waiting`, `running` or `kv_evictions` change
   ([ADR 0025](../../adr/0025-scheduler-interval-as-a-log-event.md)):

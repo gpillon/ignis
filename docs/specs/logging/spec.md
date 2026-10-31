@@ -936,6 +936,28 @@ a prefix is claimed by sharing pages, restores nothing, and carries none.
 For a prefix, `reuse_source` is `kv_ram` when that very claim brought the block back
 from KV-RAM and `device` otherwise.
 
+A request with media reports what they cost on its `ignis.request.done` line
+(GitHub #245), with the same eight `media.*` attributes and the same numbers
+as its `ignis.request.admitted` line, and none of them on a request without
+media:
+
+```text
+media.items                  integer   media items in the request
+media.vision_tokens          integer   merged vision tokens, as admitted
+media.natural_vision_tokens  integer   the same without --vision-max-tokens
+media.bytes                  integer   acquired (encoded) bytes
+media.preprocess_seconds     float     decode, resize and pack (a cache hit costs none)
+media.cache_hits             integer   items served from the media cache
+media.cache_misses           integer   items this request prepared itself
+media.encode_seconds         float     the vision tower, summed over the prefill
+```
+
+`admitted` keeps them because they explain a slow first token, but only a
+request dealt a decode lane is admitted: a decision answered by its prefill
+(`noul`, `choice`, `score`, and a `point` or `box` read from the heads) ends
+where its prefill ends (GitHub #238, #260), and `done` is the one line it
+reports its media on.
+
 A cancelled request ends with no `done` line; it logs one
 `ignis.request.cancelled` line instead (GitHub #327), under its own trace id:
 
