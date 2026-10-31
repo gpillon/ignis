@@ -192,6 +192,31 @@ impl TierSet {
     }
 }
 
+/// A [`TierSet`] for each [`RetainedKind`] (GitHub #222): what a request's
+/// look found nothing retained of each kind in, the checkpoint pool's lookup
+/// and the prefix walk beside it, kept together until its first chunk lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TiersByKind([TierSet; RetainedKind::ALL.len()]);
+
+impl TiersByKind {
+    pub fn new(checkpoint: TierSet, prefix: TierSet) -> Self {
+        Self([checkpoint, prefix])
+    }
+
+    /// `kind`'s tiers.
+    pub fn of(self, kind: RetainedKind) -> TierSet {
+        self.0[kind.index()]
+    }
+
+    /// Every member as `(kind, tier)`: the checkpoint's first, each kind's
+    /// cheapest tier first.
+    pub fn iter(self) -> impl Iterator<Item = (RetainedKind, ReuseSource)> {
+        RetainedKind::ALL
+            .into_iter()
+            .flat_map(move |kind| self.of(kind).iter().map(move |source| (kind, source)))
+    }
+}
+
 /// What happened to retained state in one residency tier (GitHub #190) — the
 /// lifecycle facts the scheduler reports, each a count of one:
 ///

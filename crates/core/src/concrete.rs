@@ -130,7 +130,7 @@ use std::time::{Duration, Instant};
 
 use crate::checkpoint::{
     CheckpointCapture, CheckpointEntry, CheckpointPool, KV_RAM_RESTORE_FLOOR_TOKENS,
-    RetainedKind, RetainedStateOperation, ReuseSource, TierList, TierSet,
+    RetainedKind, RetainedStateOperation, ReuseSource, TierList, TierSet, TiersByKind,
 };
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, PageShortageCandidate, ProtectionPhase,
@@ -4265,7 +4265,7 @@ impl Scheduler for ConcreteScheduler {
                     // GitHub #222: with prompt reuse off nothing is captured,
                     // so the lookup can never hit, and its misses would count
                     // only the switch.
-                    self.requests[i].pending_retained_misses = if self.config.prompt_reuse {
+                    let checkpoint_misses = if self.config.prompt_reuse {
                         lookup.misses(self.checkpoints.tiers())
                     } else {
                         TierSet::default()
@@ -4275,8 +4275,9 @@ impl Scheduler for ConcreteScheduler {
                     // look found retained in each tier a prefix lives in, by
                     // the test the hit below applies (a live publisher's head
                     // is a sibling's, not retained state).
-                    self.requests[i].pending_prefix_misses =
+                    let prefix_misses =
                         self.prefix.misses(&keys, self.prefix_tiers(), |publisher| !self.is_live(publisher));
+                    self.requests[i].pending_misses = TiersByKind::new(checkpoint_misses, prefix_misses);
                     // A KV-RAM checkpoint has to beat every device reuse by
                     // its restore floor, a prefix's included (GitHub #190).
                     let mut device_prefix = self
@@ -5099,19 +5100,12 @@ impl Scheduler for ConcreteScheduler {
                         // Each lookup's misses under its own kind (GitHub
                         // #216, #222): the checkpoint pool's, then the prefix
                         // walk's. Taken, so only the first chunk reports them.
-                        let r = &mut self.requests[i];
-                        let misses = [
-                            (std::mem::take(&mut r.pending_retained_misses), RetainedKind::Checkpoint),
-                            (std::mem::take(&mut r.pending_prefix_misses), RetainedKind::Prefix),
-                        ];
-                        for (missed, kind) in misses {
-                            for source in missed.iter() {
-                                events.push(SchedEvent::RetainedState {
-                                    operation: RetainedStateOperation::Miss,
-                                    source,
-                                    kind,
-                                });
-                            }
+                        for (kind, source) in std::mem::take(&mut self.requests[i].pending_misses).iter() {
+                            events.push(SchedEvent::RetainedState {
+                                operation: RetainedStateOperation::Miss,
+                                source,
+                                kind,
+                            });
                         }
                     }
                 }
