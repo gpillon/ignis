@@ -447,6 +447,29 @@ order voices first spoke, and renamed by the user; on a call, the microphone's
 voice is "Me".
 _Avoid_: channel (the model's output slot), participant
 
+**Notes**:
+What the text model writes about a **transcript**, kept with it, in sections
+its kind of conversation asks for, in two forms: **running notes** and a
+**recap**. Not a **memory note**.
+_Avoid_: summary (one of the sections), minutes
+
+**Running notes**:
+The **notes** kept up while a conversation goes on, in sections for talking:
+what is on the table now, who is who, what was said that adds up. They change
+a line at a time.
+_Avoid_: live notes, minutes
+
+**Recap**:
+The **notes** written once from a whole conversation, in sections for what
+comes after it: what it was about, the decisions, the action items, the open
+questions.
+_Avoid_: summary (one of its sections), final notes, minutes
+
+**Context image**:
+A picture added to a **transcript** at one of its moments, cropped or blacked
+out by the user, that tells what the conversation was looking at from then on.
+_Avoid_: slide, screenshot, attachment (each is one case of it)
+
 ### Weights & artifact
 
 **Artifact**:
