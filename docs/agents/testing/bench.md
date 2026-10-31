@@ -212,8 +212,11 @@ The prompts are still fixed:
 [measure a launch once](#the-multimodal-ttft-cell-github-181).
 
 The nonces cycle through 26 letters, so a filler run of more than 26 prompts
-(three cells at `--samples 8`) starts two of them with the same letter, which
-the check refuses where the tokenizer makes that letter a token of its own.
+(three cells at `--samples 8`) starts two of them with the same letter. Where
+the tokenizer makes that letter a token of its own, a cell's own check refuses
+two such prompts of one cell; the run's check admits two of different cells,
+whose shared head stays within the template's own tokens and short of a KV
+page, nothing prompt reuse can serve.
 
 ## The harness's own request deadline (GitHub #138)
 
