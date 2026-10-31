@@ -878,6 +878,42 @@ fn a_waiting_claim_yields_to_a_moved_sequence_it_keeps_out() {
 }
 
 #[test]
+fn a_waiting_claim_yields_to_a_moved_sequence_coming_back_from_the_disk() {
+    // As above with no KV-RAM: I's need moved M, an Agent of 60 pages, to the
+    // disk. P left a checkpoint and R, ranked below M, claimed it. Once I and
+    // P are done, M needs 60 pages and R's claim keeps five of the 64: it goes
+    // as retained state goes, and M's restore from the disk starts in the
+    // advance I ends. A disk restore lands a window at a time.
+    let compute = Arc::new(MockCompute::new().with_disk(FakeDisk::with_room(1 << 30)));
+    let mut run = Run::new(ConcreteScheduler::with_config(
+        SchedulerConfig { kv_disk_capacity_bytes: 1 << 20, ..SchedulerConfig { prompt_reuse: true, retained_slots: 4, ..pool(0) } },
+        compute.clone(),
+    ));
+    let m = run.submit(live(10, 956), RequestClass::Agent); // 60 pages
+    run.steps(3);
+    let i = run.submit(live(500, 476), RequestClass::Interactive); // 30 pages
+    run.until(|run| run.state(i) == Some(RequestState::Running));
+    assert_eq!(compute.disk_spills(), vec![(DiskBlob::Live(m), DiskSource::Device)], "I moved M to the disk");
+    let p = run.submit(agent_turn(), RequestClass::Interactive); // 24 pages and a tail page
+    run.steps(4);
+    let r = run.submit(next_turn(), RequestClass::Agent);
+    run.step();
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R holds the pages under P's checkpoint, on the device");
+
+    run.until(|run| run.done(p));
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R's claim stays while I holds the room M needs");
+    assert!(compute.disk_restores().is_empty(), "and M stays on the disk");
+    run.until(|run| run.done(i));
+    assert_eq!(compute.disk_restores(), vec![DiskBlob::Live(m)], "M's restore started in the advance I ended");
+    assert!(run.sched.shared_prefix_of(r).is_none(), "R's claim went for its room");
+    run.to_idle_within(3_000);
+    for (r, max) in [(m, 956), (i, 476), (p, 300), (r, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
 fn a_waiting_claim_never_yields_to_an_entry_below_its_claimant() {
     // H, Interactive, decodes on 38 pages to the end. P, an Interactive turn,
     // moved M, an Agent of 3 pages, for its room and left a checkpoint. C, an

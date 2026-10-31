@@ -177,8 +177,9 @@ could not come back.
 
 `crates/core/tests/live_moves.rs` pins the claim yielding to an admission with
 a move and without one, a claim on a retained prefix as on a checkpoint, and to
-a moved sequence coming back; never to an entry below its claimant; and not for
-a need that fits. #444's test that cancelled
+a moved sequence coming back from KV-RAM and from the disk; never to an entry
+below its claimant; not for a need that fits; never a claim whose going frees
+nothing, and two that free a block only together both going. #444's test that cancelled
 the claimant to get past the hang no longer cancels it.
 `crates/core/tests/kv_ram_windowed_moves.rs` pins the claim going in the
 advance a move a window at a time lands.
