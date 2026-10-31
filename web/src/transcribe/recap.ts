@@ -106,6 +106,17 @@ export const withRecap = (recap: Notes | undefined, written: Written): Notes => 
 /** The recap as Markdown, what the tab shows and Copy recap gives: the recap's sections in order (notesMarkdown). */
 export const recapMarkdown = (recap: Notes | undefined): string => notesMarkdown(recap, recap && recapSections(recap.writtenAs ?? recap.kind));
 
+/**
+ * The notes meant for after, as the `.md` and the PDF carry them (spec #428, "Which notes"): the recap when there is
+ * one, else the running notes, as Markdown in their sections; `null` with neither.
+ */
+export function notesForAfter(t: Transcript): { title: "Recap" | "Notes"; markdown: string } | null {
+  const recap = recapMarkdown(t.recap);
+  if (recap !== "") return { title: "Recap", markdown: recap };
+  const running = notesMarkdown(t.notes);
+  return running === "" ? null : { title: "Notes", markdown: running };
+}
+
 /** The line under the recap: when it was written, from how much, and what came since; `null` before one is. */
 export function recapStatus(recap: Notes | undefined, utterances: number): string | null {
   if (!recap?.writtenAs || recap.writtenAt === null) return null;

@@ -1,9 +1,9 @@
 import { Fragment, memo, type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnswerAside } from "./Ask.tsx";
 import { ImageAside } from "./ContextImages.tsx";
-import { type ContextImage, imageAt } from "./contextImages.ts";
+import { imageAt } from "./contextImages.ts";
 import { type ImageReaderState, readingStatus } from "./imageReading.ts";
-import { type Answered, answerAt, type AskerState } from "./ask.ts";
+import { answerAt, type AskerState } from "./ask.ts";
 import { type Hit, type HitSpan, partsOf } from "./search.ts";
 import { type RewriterState, wordDiff } from "./rewrite.ts";
 import { landing, onJump } from "./jump.ts";
@@ -13,7 +13,7 @@ import { clock, startedLine, startOf } from "./export.ts";
 import type { LiveUtterance, ListeningState } from "./listening.ts";
 import { titleOf } from "./sessions.ts";
 import type { TranscribeActions } from "./useTranscribe.ts";
-import type { Speaker, Transcript, Utterance } from "./transcript.ts";
+import { placedAmong, type Speaker, type Transcript, type Utterance } from "./transcript.ts";
 
 // The Transcript as it is heard (spec speech/07): its heading (drawn by the
 // view above the sheet, with the exports, so it stays in sight), then its
@@ -154,24 +154,13 @@ export const Sheet = memo(function Sheet({
   }, [asked]);
 
   // The answers kept, by the utterance each stands before, in the order they were asked.
-  const asides = useMemo(() => {
-    const at = new Map<number, Answered[]>();
-    for (const a of [...(transcript.asked ?? [])].sort((x, y) => x.id - y.id)) {
-      const i = answerAt(transcript.utterances, a.untilMs);
-      at.set(i, [...(at.get(i) ?? []), a]);
-    }
-    return at;
-  }, [transcript.asked, transcript.utterances]);
+  const asides = useMemo(
+    () => placedAmong([...(transcript.asked ?? [])].sort((x, y) => x.id - y.id), (a) => answerAt(transcript.utterances, a.untilMs)),
+    [transcript.asked, transcript.utterances],
+  );
   const answeringAt = answering ? answerAt(transcript.utterances, answering.untilMs) : -1;
   // The context images, by the utterance each stands before, in the order they were added.
-  const pictures = useMemo(() => {
-    const at = new Map<number, ContextImage[]>();
-    for (const image of transcript.images ?? []) {
-      const i = imageAt(transcript.utterances, image.atMs);
-      at.set(i, [...(at.get(i) ?? []), image]);
-    }
-    return at;
-  }, [transcript.images, transcript.utterances]);
+  const pictures = useMemo(() => placedAmong(transcript.images ?? [], (image) => imageAt(transcript.utterances, image.atMs)), [transcript.images, transcript.utterances]);
   const asidesAt = (i: number) => (
     <>
       {pictures.get(i)?.map((image) => (

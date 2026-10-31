@@ -1,7 +1,7 @@
 import { type ImageId, unreferenced } from "../store/imageStore.ts";
 import { clock, minutesClock, toText } from "./export.ts";
 import type { ListeningState } from "./listening.ts";
-import { clockOf, type Transcript, type Utterance } from "./transcript.ts";
+import { clockOf, placedAmong, type Transcript, type Utterance } from "./transcript.ts";
 
 // A transcript's context images (spec #428, GLOSSARY.md): a picture added at a
 // moment of its clock (a slide, a shared screen, a whiteboard), cropped and
@@ -112,10 +112,10 @@ export const readImages = (t: Transcript): ContextImage[] =>
  * utterance's line is "".
  */
 export function linesWithImages(t: Transcript, time?: (ms: number) => string): { atMs: number; line: string }[] {
-  const images = readImages(t);
+  const images = placedAmong(readImages(t), (i) => imageAt(t.utterances, i.atMs));
   const lines: { atMs: number; line: string }[] = [];
   const imagesAt = (place: number) => {
-    for (const image of images) if (imageAt(t.utterances, image.atMs) === place) lines.push({ atMs: image.atMs, line: `${readingLine(image, time)}\n` });
+    for (const image of images.get(place) ?? []) lines.push({ atMs: image.atMs, line: `${readingLine(image, time)}\n` });
   };
   t.utterances.forEach((u, i) => {
     imagesAt(i);

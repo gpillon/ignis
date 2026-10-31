@@ -164,6 +164,20 @@ function placed(utterances: Utterance[], utterance: Utterance): Utterance[] {
 /** The end of the last utterance heard: what a look at the Transcript now reads up to. */
 export const heardUntil = (utterances: Utterance[]): number => Math.max(0, ...utterances.map((u) => u.endMs));
 
+/**
+ * `items` by the place each stands among a Transcript's utterances, `place` giving it (the index of the utterance it
+ * stands before, their count after the last), each place's in the order given: how the sheet, the exports and the tasks
+ * set the context images and Ask's answers among the lines.
+ */
+export function placedAmong<T>(items: T[], place: (item: T) => number): Map<number, T[]> {
+  const at = new Map<number, T[]>();
+  for (const item of items) {
+    const i = place(item);
+    at.set(i, [...(at.get(i) ?? []), item]);
+  }
+  return at;
+}
+
 export function addUtterance(t: Transcript, heard: Heard): Transcript {
   let next = t;
   let speaker: number | null = null;

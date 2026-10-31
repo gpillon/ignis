@@ -1,9 +1,8 @@
-import { type Answered, answerAt } from "./ask.ts";
+import { type Answered, answerAt, answersKept } from "./ask.ts";
 import { imageAt, readImages, readingLine } from "./contextImages.ts";
-import { startedLine, startOf } from "./export.ts";
-import { notesMarkdown } from "./notes.ts";
-import { recapMarkdown } from "./recap.ts";
-import type { Transcript } from "./transcript.ts";
+import { speakerOf, startedLine, startOf } from "./export.ts";
+import { notesForAfter } from "./recap.ts";
+import { placedAmong, type Transcript } from "./transcript.ts";
 
 // The `.md` export (spec #428, "Exports"). It lives apart from export.ts, which
 // the notes, Ask and the assist lane import: it reads theirs back.
@@ -22,19 +21,19 @@ function answerBlock(a: Answered): string {
  */
 export function toMarkdown(t: Transcript): string {
   const header = [`# ${t.title}`, ...(t.startedAt === null ? [] : [startedLine(t.startedAt)])];
-  const notes = recapMarkdown(t.recap) || notesMarkdown(t.notes);
-  const answers = [...(t.asked ?? [])].sort((x, y) => x.id - y.id).filter((a) => a.answer.trim() !== "");
-  const names = new Map(t.speakers.map((s) => [s.id, s.name]));
+  const notes = notesForAfter(t)?.markdown ?? "";
+  const nameOf = speakerOf(t);
   const body: string[] = [];
-  const images = readImages(t);
+  const images = placedAmong(readImages(t), (i) => imageAt(t.utterances, i.atMs));
+  const answers = placedAmong(answersKept(t), (a) => answerAt(t.utterances, a.untilMs));
   const asidesAt = (place: number) => {
-    for (const image of images) if (imageAt(t.utterances, image.atMs) === place) body.push(readingLine(image));
-    for (const a of answers) if (answerAt(t.utterances, a.untilMs) === place) body.push(answerBlock(a));
+    for (const image of images.get(place) ?? []) body.push(readingLine(image));
+    for (const a of answers.get(place) ?? []) body.push(answerBlock(a));
   };
   t.utterances.forEach((u, i) => {
     asidesAt(i);
     const text = u.text.trim();
-    const speaker = u.speaker === null ? null : (names.get(u.speaker) ?? null);
+    const speaker = nameOf(u);
     if (text !== "") body.push(`${speaker === null ? "" : `**${speaker}** `}(${startOf(u)}): ${text}`);
   });
   asidesAt(t.utterances.length);

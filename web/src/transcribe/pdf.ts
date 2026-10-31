@@ -1,13 +1,12 @@
 import { isSpeechLanguage, languageName } from "../speech/languages.ts";
 import type { ImageId } from "../store/imageStore.ts";
-import { answerAt } from "./ask.ts";
+import { answerAt, answersKept } from "./ask.ts";
 import type { CallContext } from "./context.ts";
 import { imageAt, readingText } from "./contextImages.ts";
-import { clock, startedOn, startOf } from "./export.ts";
-import { notesMarkdown } from "./notes.ts";
-import { recapMarkdown } from "./recap.ts";
+import { clock, speakerOf, startedOn, startOf } from "./export.ts";
+import { notesForAfter } from "./recap.ts";
 import { titleOf } from "./sessions.ts";
-import { clockOf, type Transcript } from "./transcript.ts";
+import { clockOf, placedAmong, type Transcript } from "./transcript.ts";
 import { viewerChoice } from "./viewerChoice.ts";
 
 // The PDF of a transcript (spec #428, "Exports"): what it prints is computed
@@ -67,21 +66,13 @@ function contextFacts(c: CallContext | undefined): Fact[] {
   ];
 }
 
-/** The notes meant for after, as Markdown in their sections: the recap when there is one, else the running notes. */
-function notesBlock(t: Transcript): PrintBlock[] {
-  const recap = recapMarkdown(t.recap);
-  if (recap !== "") return [{ kind: "notes", title: "Recap", markdown: recap }];
-  const running = notesMarkdown(t.notes);
-  return running === "" ? [] : [{ kind: "notes", title: "Notes", markdown: running }];
-}
-
 /**
  * The blocks a PDF of `t` prints, in order: the header; the context in short and the notes when asked for, with a
  * Transcript heading under them; the lines with the context images, and Ask's answers when asked for, at their
  * moments.
  */
 export function printDocument(t: Transcript, options: PdfOptions): PrintBlock[] {
-  const names = new Map(t.speakers.map((s) => [s.id, s.name]));
+  const speaker = speakerOf(t);
   const said = t.utterances.filter((u) => u.text.trim() !== "");
   const spoke = t.speakers.filter((s) => said.some((u) => u.speaker === s.id)).map((s) => s.name);
   const facts: Fact[] = [
@@ -90,30 +81,28 @@ export function printDocument(t: Transcript, options: PdfOptions): PrintBlock[] 
     ...(spoke.length === 0 ? [] : [{ label: "Speakers", value: spoke.join(", ") }]),
   ];
   const context = options.context ? contextFacts(t.context) : [];
-  const before: PrintBlock[] = [...(context.length > 0 ? [{ kind: "context" as const, facts: context }] : []), ...(options.recap ? notesBlock(t) : [])];
+  const notes = options.recap ? notesForAfter(t) : null;
+  const before: PrintBlock[] = [...(context.length > 0 ? [{ kind: "context" as const, facts: context }] : []), ...(notes ? [{ kind: "notes" as const, ...notes }] : [])];
 
   const body: PrintBlock[] = [];
   // The context images in the order of their moments, each before the first utterance at its moment or after (the sheet's place).
-  const images = [...(t.images ?? [])].sort((x, y) => x.atMs - y.atMs || x.id - y.id);
+  const sorted = [...(t.images ?? [])].sort((x, y) => x.atMs - y.atMs || x.id - y.id);
+  const images = placedAmong(sorted, (i) => imageAt(t.utterances, i.atMs));
   // Ask's answers in the order asked, each after the utterances it read, past a picture of the same place (the sheet's order).
-  const answers = options.answers ? [...(t.asked ?? [])].sort((x, y) => x.id - y.id).filter((a) => a.answer.trim() !== "") : [];
+  const answers = placedAmong(options.answers ? answersKept(t) : [], (a) => answerAt(t.utterances, a.untilMs));
   const asidesAt = (place: number) => {
-    for (const i of images) {
-      if (imageAt(t.utterances, i.atMs) === place) {
-        const reading = i.reading ? { reading: readingText(i.reading) } : {};
-        body.push({ kind: "image", id: i.id, time: clock(i.atMs), image: i.image, width: i.width, height: i.height, ...reading });
-      }
+    for (const i of images.get(place) ?? []) {
+      const reading = i.reading ? { reading: readingText(i.reading) } : {};
+      body.push({ kind: "image", id: i.id, time: clock(i.atMs), image: i.image, width: i.width, height: i.height, ...reading });
     }
-    for (const a of answers) {
-      if (answerAt(t.utterances, a.untilMs) === place) {
-        body.push({ kind: "answer", id: a.id, time: a.untilMs === undefined ? null : clock(a.untilMs), question: a.question.trim(), answer: a.answer.trim() });
-      }
+    for (const a of answers.get(place) ?? []) {
+      body.push({ kind: "answer", id: a.id, time: a.untilMs === undefined ? null : clock(a.untilMs), question: a.question.trim(), answer: a.answer.trim() });
     }
   };
   t.utterances.forEach((u, place) => {
     asidesAt(place);
     const text = u.text.trim();
-    if (text !== "") body.push({ kind: "utterance", id: u.id, time: startOf(u), speaker: u.speaker === null ? null : (names.get(u.speaker) ?? null), text });
+    if (text !== "") body.push({ kind: "utterance", id: u.id, time: startOf(u), speaker: speaker(u), text });
   });
   asidesAt(t.utterances.length);
 
