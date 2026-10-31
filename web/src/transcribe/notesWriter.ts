@@ -1,11 +1,12 @@
 import type { ConversationRequest, Turn } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { ASSIST_SYSTEM, type AskDeps, askModel, CHARS_PER_TOKEN, Follower, settle, Watched } from "./assist.ts";
+import { afterCall, changesSince, editsSince, linesOf, type Told, toldOf } from "./changes.ts";
 import { shownOf, shownSince } from "./contextImages.ts";
 import { minutesClock } from "./export.ts";
 import { dueForUpdate, LIVE_GAP_MS, type NoteKind, type NoteLine, noNotes, type Notes, NOTES_MAX_TOKENS, NOTES_SETTINGS, RUNNING_NOTES, tidyNotes, type Written } from "./notes.ts";
 import { parseRecap, recapDue, recapRequest } from "./recap.ts";
-import { afterCall, applyCall, changesSince, editsSince, firstTurnContext, fromScratch, laterTurn, linesOf, notesState, restartAt, runningTask, runningTools, type Told, toldOf } from "./running.ts";
+import { applyCall, firstTurnContext, fromScratch, laterTurn, notesState, restartAt, runningTask, runningTools } from "./running.ts";
 import { taskInput } from "./taskContext.ts";
 import type { Transcript } from "./transcript.ts";
 
