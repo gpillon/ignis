@@ -873,7 +873,9 @@ impl ModelFamily {
     /// capture as a pages-only link (ADR 0029 as amended 2026-10-07, GitHub
     /// #306): on Flash-Next, where the cut it saves is a traversal that
     /// re-streams its experts -- 0.13-0.66 s of a reused agent turn. Not on the
-    /// 27B, whose cut costs ~19 ms and whose prefills keep their splits.
+    /// 27B, whose cut costs ~19 ms and whose prefills keep their splits. A
+    /// request whose image spans its opener's page floor lends on any load
+    /// (GitHub #249, `CaptureLink::ImageSpansFloor`).
     pub fn opener_page_rides_capture(self) -> bool {
         match self {
             ModelFamily::Qwen38_27b | ModelFamily::QwenImage21 | ModelFamily::Nemotron3Diarization => false,

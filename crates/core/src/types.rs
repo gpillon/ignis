@@ -410,6 +410,20 @@ impl RequestInput {
             None => (at / page_tokens) * page_tokens,
         }
     }
+
+    /// Whether a media item spans the generation opener's page floor
+    /// (GitHub #249): the floor lies inside it, so no prefix may end there and
+    /// [`RequestInput::prefix_floor`] walks it back. The common case whenever
+    /// a short question follows a picture. `false` without an opener.
+    pub fn image_spans_opener_floor(&self, page_tokens: u32) -> bool {
+        match self.opener_tokens {
+            Some(opener) if page_tokens > 0 => {
+                let floor = (opener / page_tokens) * page_tokens;
+                self.prefix_floor(floor, page_tokens) < floor
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Sampling / decoding parameters for a request.

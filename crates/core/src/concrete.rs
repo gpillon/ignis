@@ -145,7 +145,7 @@ use crate::host::{
 };
 use crate::identity::{MatchKey, MediaKey, PromptContent, PromptKeys};
 use crate::prefix::{PrefixCache, PrefixId, Retention, SpilledPrefixId};
-use crate::request::Request;
+use crate::request::{CaptureLink, Request};
 use crate::retained_slot::{RetainedHolder, RetainedSkip, RetainedSlotLedger};
 use crate::scheduler::{
     CheckpointClaim, Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome,
@@ -1676,7 +1676,7 @@ impl ConcreteScheduler {
     /// [`Request::link_at_capture`] request; 0 on any other.
     fn link_pages(&self, idx: usize, opener: u32) -> u32 {
         let r = &self.requests[idx];
-        match r.link_at_capture {
+        match r.link_at_capture.lends() {
             true => (opener / self.config.kv_page_tokens).saturating_sub(r.shared_pages),
             false => 0,
         }
@@ -4156,9 +4156,9 @@ impl Scheduler for ConcreteScheduler {
         // sibling sending another picture never matches past it. What it must
         // never do is end *inside* an image: the head walks back to the page
         // holding the item's first placeholder. When that page is below the
-        // opener's, the checkpoint is lost for this turn (its whole pages are
-        // no longer the prefix, `Request::checkpoint_point`), which is the
-        // price of an image ending within a page of the generation opener.
+        // opener's, its whole pages are no longer the prefix
+        // (`Request::checkpoint_point`), and the capture lends them instead
+        // (below).
         let publish_tokens = input.prefix_floor(publish_tokens, self.config.kv_page_tokens);
         let mut request = Request::new(id, class, input, resources, effective_max as u64);
         // GitHub #187 × #188: the two boundaries **compose** rather than
@@ -4178,14 +4178,29 @@ impl Scheduler for ConcreteScheduler {
         // needs costs Flash-Next a whole expert stream. Its capture hands the
         // pages over instead (`Request::checkpoint_point`). A decision captures
         // nothing (below), so it keeps the floor as its siblings' head.
-        request.link_at_capture = self.config.opener_page_rides_capture
-            && self.config.prompt_reuse
+        //
+        // GitHub #249 (ADR 0029, coordinator decision 2026-10-31): on any
+        // load, a request whose image spans its opener's page floor -- the
+        // common case whenever a short question follows the picture -- lends
+        // those pages at the capture too. No imaged prefix may end at that
+        // floor, so without the loan no checkpoint is captured and the repeat
+        // and the next turn re-prefill the whole picture. It keeps the head its
+        // floor walked back to and gains one cut, at its opener; a request
+        // whose floor lies outside every image publishes its imaged prefix
+        // there as before, so the 27B's other cuts do not move.
+        let can_capture = self.config.prompt_reuse
             && !request.input.is_decision()
             && request
                 .input
                 .opener_tokens
                 .is_some_and(|opener| opener > 0 && (opener as usize) < request.input.tokens.len());
-        if request.link_at_capture {
+        request.link_at_capture = match can_capture {
+            false => CaptureLink::None,
+            true if self.config.opener_page_rides_capture => CaptureLink::OpenerPageRides,
+            true if request.input.image_spans_opener_floor(self.config.kv_page_tokens) => CaptureLink::ImageSpansFloor,
+            true => CaptureLink::None,
+        };
+        if request.link_at_capture == CaptureLink::OpenerPageRides {
             request.publish_tokens = 0;
         }
 
@@ -4685,7 +4700,7 @@ impl Scheduler for ConcreteScheduler {
         for n in 0..batch.len() {
             let at = capture_points[n];
             if at > 0
-                && self.requests[batch[n]].link_at_capture
+                && self.requests[batch[n]].link_at_capture.lends()
                 && self.taken_earlier(&batch, &capture_points, n, at)
             {
                 capture_points[n] = 0;

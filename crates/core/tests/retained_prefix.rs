@@ -1187,3 +1187,217 @@ fn a_multimodal_burst_shares_the_block_whatever_image_each_subagent_sends() {
     );
     assert_eq!(first_job(&compute, same).start_position, 57);
 }
+
+// ── GitHub #249: an image spanning the opener's page floor ──────────────
+
+/// The 27B's KV page, in tokens.
+const PAGE_27B: u32 = 64;
+
+/// A single-turn image request in the shape the server renders GitHub #249's
+/// in: four opening tokens, `count` image placeholders, `<|vision_end|>`, a
+/// `question`-token question, and the five tokens that close the turn and
+/// open the assistant's -- the generation opener -- then `after` tokens past
+/// it: four with thinking off (the empty think block), two with it on
+/// (`<think>\n`), none for a render that ends at its opener.
+fn single_turn_image(count: u32, question: u32, after: u32) -> RequestInput {
+    let head = 4 + count + 1 + question + 5;
+    let len = head + after;
+    let mut input = input(tokens(1, len), None, Some(head), 1);
+    input.user_turn_tokens = Some(0);
+    input.multimodal = Some(Arc::new(Multimodal {
+        positions: (0..3).flat_map(|_| 0..len as i32).collect(),
+        rope_delta: -16_256,
+        media: vec![MediaItem {
+            grid: Grid { t: 1, h: 2, w: 2 * count },
+            token_span: TokenSpan { begin: 4, count: count as usize },
+            patches: Vec::new(),
+            content_digest: [0xAA; 32],
+        }],
+    }));
+    input
+}
+
+/// `turn`'s next turn: its prompt up to its generation opener, an
+/// `answer`-token answer and the two tokens closing it, then a new user
+/// message of eight tokens with its own opener, and `after` tokens past that.
+fn next_turn(turn: &RequestInput, answer: u32, after: u32) -> RequestInput {
+    let mut next = turn.clone();
+    next.tokens.truncate(turn.opener_tokens.unwrap() as usize);
+    next.tokens.extend(tokens(900_000, answer + 2));
+    next.user_turn_tokens = Some(next.tokens.len() as u32);
+    next.tokens.extend(tokens(910_000, 8 + 5));
+    next.opener_tokens = Some(next.tokens.len() as u32);
+    next.tokens.extend(tokens(920_000, after));
+    let len = next.tokens.len();
+    Arc::make_mut(next.multimodal.as_mut().unwrap()).positions = (0..3).flat_map(|_| 0..len as i32).collect();
+    next
+}
+
+/// The 27B's geometry: 64-token pages, a 40,960-token sequence, eight of them
+/// in the pool, and an opener's page that does not ride the capture.
+fn config_27b() -> SchedulerConfig {
+    SchedulerConfig {
+        kv_page_tokens: PAGE_27B,
+        max_sequence_tokens: 40_960,
+        kv_capacity_pages: 8 * 40_960 / PAGE_27B,
+        opener_page_rides_capture: false,
+        ..config()
+    }
+}
+
+/// What one request's prefill was: its chunk widths, and the retained state
+/// it resumed from.
+#[derive(Debug, PartialEq)]
+struct Served {
+    widths: Vec<usize>,
+    reused: Vec<(ReuseSource, u32)>,
+}
+
+/// Submit `inputs` one after another on one 27B-shaped scheduler, each run to
+/// completion before the next arrives.
+fn served_in_turn<const N: usize>(inputs: [RequestInput; N]) -> [Served; N] {
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = scheduler(compute.clone(), config_27b());
+    inputs.map(|input| {
+        let id = sched.submit(input, RequestClass::Interactive).unwrap();
+        let events = run_to_idle(&mut sched);
+        Served {
+            widths: chunk_widths(&compute, id),
+            reused: state_reuses(&events, id),
+        }
+    })
+}
+
+#[test]
+fn an_identical_repeat_of_an_image_spanning_the_openers_page_floor_prefills_only_the_tail() {
+    // GitHub #249's request: the image runs to 16,388, so the opener's page
+    // floor, 16,384, lies inside it and no prefix may end there (#193). The
+    // capture lends the pages below the opener instead, at one more cut: the
+    // first request is cut at its opener, and the repeat resumes there.
+    let [first, repeat] = served_in_turn([single_turn_image(16_384, 6, 4), single_turn_image(16_384, 6, 4)]);
+    assert_eq!(first.widths, [vec![1024; 16], vec![16, 4]].concat(), "cut at the opener, 16,400");
+    assert_eq!(repeat.widths, [4], "the repeat prefills the empty think block alone");
+    assert_eq!(repeat.reused, [(ReuseSource::Device, 16_400)]);
+
+    // The same with a smaller picture whose run still crosses the floor.
+    let [first, repeat] = served_in_turn([single_turn_image(1_024, 6, 4), single_turn_image(1_024, 6, 4)]);
+    assert_eq!(first.widths, [1024, 16, 4]);
+    assert_eq!((repeat.widths, repeat.reused), (vec![4], vec![(ReuseSource::Device, 1_040)]));
+}
+
+#[test]
+fn the_next_turn_of_an_image_conversation_resumes_from_its_turn_opening_checkpoint() {
+    // The cost #249 measured beyond repeats: the conversation's next turn
+    // shares the picture and the first question, and re-prefilled all of it.
+    // Its own opener's floor is inside the image too; it stands on the claimed
+    // pages, so it captures again without lending any.
+    let turn1 = single_turn_image(16_384, 6, 4);
+    let turn2 = next_turn(&turn1, 20, 4);
+    let [_, next] = served_in_turn([turn1, turn2]);
+    assert_eq!(next.widths, [35, 4], "from the first opener to the second, then the think block");
+    assert_eq!(next.reused, [(ReuseSource::Device, 16_400)]);
+}
+
+#[test]
+fn with_thinking_on_the_repeat_and_the_next_turn_resume_from_the_checkpoint() {
+    // With thinking on the render ends with `<think>\n` past the opener, so
+    // the capture still leaves two prompt tokens after it, and neither claim
+    // reaches the claimant's last token (#193, #201).
+    let turn1 = single_turn_image(16_384, 6, 2);
+    let turn2 = next_turn(&turn1, 20, 2);
+    let [first, repeat, next] = served_in_turn([turn1.clone(), turn1, turn2]);
+    assert_eq!(first.widths, [vec![1024; 16], vec![16, 2]].concat());
+    assert_eq!((repeat.widths, repeat.reused), (vec![2], vec![(ReuseSource::Device, 16_400)]));
+    assert_eq!(next.widths, [35, 2]);
+    assert_eq!(next.reused, [(ReuseSource::Device, 16_400)]);
+}
+
+#[test]
+fn an_image_prompt_ending_at_its_opener_still_re_prefills_its_repeat() {
+    // Two limits this does not lift. A render that ends at its opener
+    // captures nothing (the capture would come from the chunk that samples),
+    // so its repeat has nothing to claim. And where a longer prompt left a
+    // checkpoint at that very opener, a multimodal claim may not reach the
+    // claimant's last token, because only a prefill hands the leaf its rope
+    // delta (#193, #201): that repeat re-prefills too.
+    let [_, repeat] = served_in_turn([single_turn_image(16_384, 6, 0), single_turn_image(16_384, 6, 0)]);
+    assert_eq!((repeat.widths.iter().sum::<usize>(), repeat.reused), (16_400, vec![]));
+
+    let [first, shorter] = served_in_turn([single_turn_image(16_384, 6, 4), single_turn_image(16_384, 6, 0)]);
+    assert_eq!(first.widths.len(), 18, "the longer prompt captured at 16,400");
+    assert_eq!((shorter.widths.iter().sum::<usize>(), shorter.reused), (16_400, vec![]));
+}
+
+#[test]
+fn an_image_ending_below_the_openers_page_floor_keeps_its_splits() {
+    // A 70-token question puts the opener's floor, 16,448, past the image: an
+    // imaged prefix is published there as before and the capture stands on
+    // it, so nothing about this prompt's cuts moves.
+    let [first, repeat] = served_in_turn([single_turn_image(16_384, 70, 4), single_turn_image(16_384, 70, 4)]);
+    assert_eq!(first.widths, [vec![1024; 16], vec![64, 16, 4]].concat(), "cut at the floor and at the opener");
+    assert_eq!((repeat.widths, repeat.reused), (vec![4], vec![(ReuseSource::Device, 16_464)]));
+}
+
+/// What each of `request`'s prefill chunks published and captured, in order:
+/// the prefix's length and the checkpoint's position, where it did.
+fn retained_points(compute: &MockCompute, request: RequestId) -> Vec<(Option<u32>, Option<u32>)> {
+    compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == request)
+        .map(|j| (j.publish_prefix.map(|p| p.tokens), j.capture_checkpoint.map(|c| c.tokens)))
+        .collect()
+}
+
+#[test]
+fn a_next_turn_past_the_picture_chains_its_head_on_the_link_and_the_turn_after_resumes_over_both() {
+    // The common next turn. A 120-token answer puts its opener 135 tokens past
+    // the first one, at 16,535, so its floor, 16,512, lies past the picture
+    // and it takes no link of its own. Standing on the first turn's
+    // checkpoint, it publishes the pages it warmed, 16,384 to 16,512, as a
+    // chained prefix whose parent is the image-cutting link, and captures at
+    // its opener over that. The turn after it resumes from that checkpoint,
+    // standing on the link and the chained prefix both.
+    let turn1 = single_turn_image(16_384, 6, 4);
+    let turn2 = next_turn(&turn1, 120, 4);
+    let turn3 = next_turn(&turn2, 20, 4);
+    assert_eq!((turn2.opener_tokens, turn3.opener_tokens), (Some(16_535), Some(16_570)));
+
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = scheduler(compute.clone(), config_27b());
+    sched.submit(turn1, RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.prefix_pinned_pages(), 256, "the link holds the pages below the first opener");
+
+    let second = sched.submit(turn2, RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(state_reuses(&events, second), [(ReuseSource::Device, 16_400)]);
+    assert_eq!(chunk_widths(&compute, second), [112, 23, 4], "cut at its floor and at its opener");
+    assert_eq!(
+        retained_points(&compute, second),
+        [(Some(16_512), None), (None, Some(16_535)), (None, None)],
+        "a chained prefix at its floor, then the checkpoint at its opener"
+    );
+    assert_eq!(
+        sched.prefix_pinned_pages(),
+        258,
+        "the chained prefix owns its two pages past the link's 256 and holds the link below them"
+    );
+
+    let third = sched.submit(turn3, RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(state_reuses(&events, third), [(ReuseSource::Device, 16_535)], "it resumes at the second opener");
+    assert_eq!(chunk_widths(&compute, third), [35, 4]);
+    assert_eq!(
+        retained_points(&compute, third),
+        [(None, Some(16_570)), (None, None)],
+        "its opener is in the chained prefix's last page: it captures over it and publishes nothing"
+    );
+    assert_eq!(sched.prefix_pinned_pages(), 258);
+    assert_eq!(
+        sched.kv_used_pages(),
+        258 + sched.retained_tail_pages(),
+        "every other page came back: the pool holds the chain once, beside the checkpoints' tail pages"
+    );
+}
