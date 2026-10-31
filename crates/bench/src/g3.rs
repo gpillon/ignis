@@ -1191,7 +1191,7 @@ mod tests {
             Ok(ids)
         }
         fn decode(&self, ids: &[u32]) -> Result<String, String> {
-            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+            Ok(crate::testutil::decode_atoms(ids))
         }
     }
 
@@ -2034,7 +2034,7 @@ mod tests {
             Ok(ids)
         }
         fn decode(&self, ids: &[u32]) -> Result<String, String> {
-            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+            Ok(crate::testutil::decode_atoms(ids))
         }
     }
 

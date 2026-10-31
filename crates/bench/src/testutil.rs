@@ -26,8 +26,23 @@ impl PromptTemplate for ChatTemplate {
         Ok(ids)
     }
     fn decode(&self, ids: &[u32]) -> Result<String, String> {
-        Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+        Ok(decode_atoms(ids))
     }
+}
+
+/// `ids` as the mock templates' corpus text, a `t<id>` word per id joined by
+/// spaces, written into one string: the corpus path decodes a 196K-id window
+/// dozens of times per prompt.
+pub(crate) fn decode_atoms(ids: &[u32]) -> String {
+    use std::fmt::Write;
+    let mut text = String::with_capacity(ids.len() * 8);
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "t{id}");
+    }
+    text
 }
 
 /// A stand-in for an engine that serves any repeated prefix from a

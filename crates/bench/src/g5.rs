@@ -317,7 +317,7 @@ mod tests {
                 .collect())
         }
         fn decode(&self, ids: &[u32]) -> Result<String, String> {
-            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+            Ok(crate::testutil::decode_atoms(ids))
         }
     }
 
@@ -520,21 +520,35 @@ mod tests {
         assert!(free.samples.iter().all(|s| !s.void), "{:?}", free.samples);
     }
 
-    /// #162, GitHub #443: a bank no rotation frees, one id throughout, opens
-    /// every depth's window on the same ids; the run refuses to start,
-    /// naming two depths, and sends nothing. A bank whose period only aligns
-    /// the depths' thirds is cut a rotation of its own per depth
+    /// GitHub #443: a chat template whose own tokens fill a whole 64-token KV
+    /// page puts it at the head of every depth's prompt, where prompt reuse
+    /// serves it to every depth after the first; the run refuses to start,
+    /// every depth naming two depths, and sends nothing. A bank no rotation
+    /// frees is refused by the same proof (`ttft`'s
+    /// `a_run_whose_sets_share_content_is_refused_naming_both_prompts`), and
+    /// a bank whose period only aligns the depths' thirds is cut a rotation
+    /// of its own per depth
     /// (`a_whole_run_cut_from_a_tiled_corpus_stays_cold_under_prompt_reuse`).
     #[test]
-    fn a_bank_no_rotation_frees_refuses_the_run_naming_two_depths() {
-        let (dir, corpus) = write_corpus_file(&[7; 12]);
+    fn a_run_whose_depths_share_a_whole_kv_page_refuses_to_start_naming_two_depths() {
+        struct PageHeader;
+        impl PromptTemplate for PageHeader {
+            fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+                let mut ids: Vec<u32> = (0..64).map(|i| 1_000 + i).collect();
+                ids.extend(MockTemplate.encode_user_message(content)?);
+                Ok(ids)
+            }
+            fn decode(&self, ids: &[u32]) -> Result<String, String> {
+                MockTemplate.decode(ids)
+            }
+        }
         let ep = RecordingEndpoint { stop_after: None, prompts: Default::default() };
-        let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
-        std::fs::remove_dir_all(&dir).ok();
+        let record = measure(&ep, &PageHeader, "mock-engine".into(), "http://mock".into(), &G5Config::default());
         assert_eq!(record.cells.len(), 3);
         for cell in &record.cells {
             let error = cell.error.as_deref().expect("every depth refused");
             assert!(error.contains("24576-token depth prompt 0") && error.contains("100352-token depth prompt 0"), "{error}");
+            assert!(error.contains("KV page"), "{error}");
         }
         assert!(ep.prompts.into_inner().unwrap().is_empty(), "nothing was sent");
     }

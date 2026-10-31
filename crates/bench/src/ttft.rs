@@ -1549,7 +1549,7 @@ mod tests {
         fn decode(&self, ids: &[u32]) -> Result<String, String> {
             // The filler path never decodes: a placeholder for the seam —
             // the corpus tests use the exact `CorpusMock` instead.
-            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+            Ok(crate::testutil::decode_atoms(ids))
         }
         /// The text's ids, then one placeholder per 32x32 block of the image.
         fn encode_user_message_with_image(&self, content: &str, image: &[u8]) -> Result<Vec<u32>, String> {
@@ -1813,7 +1813,7 @@ mod tests {
             fn decode(&self, ids: &[u32]) -> Result<String, String> {
                 // A placeholder for the seam (this template is only used
                 // to exercise the filler path's refusal).
-                Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+                Ok(crate::testutil::decode_atoms(ids))
             }
         }
         let err = generate_cell_prompts(&SharedHeadTemplate, 40, 6).expect_err("must refuse");
@@ -1895,7 +1895,7 @@ mod tests {
             Ok(ids)
         }
         fn decode(&self, ids: &[u32]) -> Result<String, String> {
-            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+            Ok(crate::testutil::decode_atoms(ids))
         }
     }
 
@@ -2084,7 +2084,7 @@ mod tests {
             Ok(ids)
         }
         fn decode(&self, ids: &[u32]) -> Result<String, String> {
-            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+            Ok(crate::testutil::decode_atoms(ids))
         }
     }
 
