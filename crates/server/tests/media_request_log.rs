@@ -26,8 +26,9 @@ use ignis_core::decision::{AnswerAlphabet, LabelTokenizer};
 use ignis_core::mock::MockCompute;
 use ignis_core::vision::Multimodal;
 use ignis_core::{
-    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome,
-    RequestId, SchedulerConfig, TokenId,
+    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, EngineMode, Occupancy, PrefillJob,
+    PrefillOutcome, RequestClass, RequestId, RequestIds, RequestInput, SchedEvent, Scheduler, SchedulerConfig,
+    SubmitError, TokenId,
 };
 use ignis_logging::MemorySink;
 use ignis_server::decoder::TokenDecoder;
@@ -341,30 +342,112 @@ impl TemplateProvider for DecidingTemplate {
     }
 }
 
-/// A decide-capable router of its own, encoding every multimodal chunk in
-/// 250 ms: one per test request, so no request claims another's prefix.
-fn deciding_app() -> axum::Router {
+/// The mock's scheduler until a step encodes an image, and no step after it:
+/// the question that encoded stays mid-prefill, its encode paid for, until
+/// it is cancelled. Over two-token chunks the step that encodes never ends
+/// the prompt: an image is four placeholders.
+struct StopsAfterAnEncode {
+    inner: ConcreteScheduler,
+    stopped: bool,
+}
+
+impl Scheduler for StopsAfterAnEncode {
+    fn submit(&mut self, input: RequestInput, class: RequestClass) -> Result<RequestId, SubmitError> {
+        self.inner.submit(input, class)
+    }
+
+    fn refusal(&self, input: &RequestInput) -> Option<SubmitError> {
+        self.inner.refusal(input)
+    }
+
+    fn share_request_ids(&mut self, ids: RequestIds) {
+        self.inner.share_request_ids(ids)
+    }
+
+    fn cancel(&mut self, request: RequestId) -> bool {
+        self.inner.cancel(request)
+    }
+
+    fn end_fan_out(&mut self, owner: ignis_core::types::FanOutId) -> Vec<SchedEvent> {
+        self.inner.end_fan_out(owner)
+    }
+
+    fn advance(&mut self) -> Vec<SchedEvent> {
+        if self.stopped {
+            return Vec::new();
+        }
+        let events = self.inner.advance();
+        self.stopped = events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::PrefillChunk { encode_micros, .. } if *encode_micros > 0));
+        events
+    }
+
+    fn is_idle(&self) -> bool {
+        self.stopped || self.inner.is_idle()
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn max_sequence_tokens(&self) -> u32 {
+        self.inner.max_sequence_tokens()
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.inner.max_in_flight()
+    }
+
+    fn mode(&self) -> EngineMode {
+        self.inner.mode()
+    }
+
+    fn occupancy(&self) -> Occupancy {
+        self.inner.occupancy()
+    }
+
+    fn artifact(&self) -> ignis_core::identity::ArtifactHash {
+        self.inner.artifact()
+    }
+}
+
+/// The mock's scheduler, encoding every multimodal chunk in 250 ms.
+fn encoding_scheduler(config: SchedulerConfig) -> ConcreteScheduler {
     let compute = Arc::new(EncodingCompute { inner: MockCompute::new(), micros: 250_000 });
-    let scheduler = ConcreteScheduler::with_config(
-        SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
-        compute,
-    );
+    ConcreteScheduler::with_config(config, compute)
+}
+
+/// A decide-capable router over `scheduler`, whose questions are past their
+/// deadline after `timeout`.
+fn deciding_server(scheduler: Box<dyn Scheduler>, timeout: Duration) -> axum::Router {
     let acquirer = MediaAcquirer::new(counting(), limits(), MediaPolicy::new(false, 1 << 20));
-    Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate))
-        .with_request_timeout(Duration::from_secs(10))
+    Server::new(Engine::new(scheduler), Box::new(DecidingTemplate))
+        .with_request_timeout(timeout)
         .with_media(Arc::new(acquirer))
         .app()
 }
 
-/// One question of `kind` over `image` (or over a text `state` when `None`),
-/// answered 200: every event the request log captured, once it holds the
-/// question's `done` line. Its `admitted` line, when it has one, comes
-/// before: the consumer writes a request's lines in the order they happen.
-async fn decide_one(kind: &str, image: Option<&str>) -> Vec<Value> {
+/// A decide-capable router of its own: one per test request, so no request
+/// claims another's prefix.
+fn deciding_app() -> axum::Router {
+    let config = SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() };
+    deciding_server(Box::new(encoding_scheduler(config)), Duration::from_secs(10))
+}
+
+/// The request log, captured on this test's thread: a current-thread
+/// runtime runs the telemetry consumer there too.
+fn capture() -> (Arc<MemorySink>, tracing::subscriber::DefaultGuard) {
     let sink = Arc::new(MemorySink::new());
-    let _guard = tracing::subscriber::set_default(
+    let guard = tracing::subscriber::set_default(
         tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone())),
     );
+    (sink, guard)
+}
+
+/// One question of `kind` over `image` (or over a text `state` when `None`)
+/// put to `app`, answered 200: the response.
+async fn decide(app: &axum::Router, kind: &str, image: Option<&str>) -> Value {
     let state = match image {
         Some(uri) => json!([{"type": "image_url", "image_url": {"url": uri}}]),
         None => json!("The queue is backing up."),
@@ -376,11 +459,20 @@ async fn decide_one(kind: &str, image: Option<&str>) -> Vec<Value> {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    let response = deciding_app().oneshot(request).await.unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status().as_u16();
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
-    let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// One question of `kind` over `image` (or over a text `state` when `None`),
+/// answered: every event the request log captured, once it holds the
+/// question's `done` line. Its `admitted` line, when it has one, comes
+/// before: the consumer writes a request's lines in the order they happen.
+async fn decide_one(kind: &str, image: Option<&str>) -> Vec<Value> {
+    let (sink, _guard) = capture();
+    let answer = decide(&deciding_app(), kind, image).await;
     assert_eq!(answer["answers"]["q"]["type"], kind, "{answer}");
     logged(&sink, "ignis.request.done", 1).await
 }
@@ -439,4 +531,26 @@ async fn a_text_decision_reports_no_media_on_done() {
     let events = decide_one("noul", None).await;
     let media = media_on(&events, "ignis.request.done");
     assert!(media.is_empty(), "{media:?}");
+}
+
+#[tokio::test]
+async fn a_question_past_its_deadline_reports_the_encode_it_paid_for_on_cancelled() {
+    let (sink, _guard) = capture();
+    // Two-token chunks: the step that encodes the image is not the last.
+    let config = SchedulerConfig { model: MODEL.into(), serving_chunk_tokens: 2, ..SchedulerConfig::default() };
+    let stalls = StopsAfterAnEncode { inner: encoding_scheduler(config), stopped: false };
+    let app = deciding_server(Box::new(stalls), Duration::from_millis(300));
+    let image = data_uri(&png(64, 64));
+
+    let answer = decide(&app, "noul", Some(&image)).await;
+    assert!(answer.to_string().contains("not_completed"), "{answer}");
+    let events = logged(&sink, "ignis.request.cancelled", 1).await;
+
+    assert!(events.iter().all(|e| e["event_name"] != "ignis.request.done"), "{events:?}");
+    let cancelled = events.iter().find(|e| e["event_name"] == "ignis.request.cancelled").unwrap();
+    assert_eq!(cancelled["attributes"]["cause"], "timeout", "{cancelled}");
+    let media = media_on(&events, "ignis.request.cancelled");
+    assert_eq!(media.get("media.encode_seconds"), Some(&json!(0.25)), "{events:?}");
+    assert_eq!(media.get("media.vision_tokens"), Some(&json!(4)), "{media:?}");
+    assert_eq!(media.len(), 8, "every media field: {media:?}");
 }

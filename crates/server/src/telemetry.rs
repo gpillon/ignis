@@ -156,8 +156,8 @@ pub trait IntervalStatsProvider: Send + Sync {
 
 // ── the telemetry state ─────────────────────────────────────────────────────
 
-/// What a request's media cost, as the `admitted` and `done` lines report it
-/// (GitHub #245): what acquiring them cost (GitHub #179) and what encoding
+/// What a request's media cost, as the `admitted`, `done` and `cancelled`
+/// lines report it (GitHub #245): what acquiring them cost (GitHub #179) and what encoding
 /// them cost during prefill (GitHub #192), which the two halves of the
 /// pipeline measure in different places and only meet here.
 #[derive(Debug, Clone, Copy)]
@@ -405,8 +405,9 @@ impl Telemetry {
     }
 
     /// A submitted request carried media (GitHub #179): its acquisition
-    /// summary rides on the `admitted` line and on the `done` line (GitHub
-    /// #245), which a request that never takes a lane reaches too.
+    /// summary rides on the `admitted` line and on the line the request
+    /// ends with, `done` or `cancelled` (GitHub #245), which a request that
+    /// never takes a lane reaches too.
     pub fn note_media(&mut self, id: RequestId, media: MediaStats) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.media = Some(media);
@@ -996,9 +997,14 @@ impl Telemetry {
     /// a lane had been dealt (`lane` only then) and how many tokens it had
     /// generated. A cancel ends a request with no `done` line, so without
     /// this one a request that hit its 504, or whose client went away, left
-    /// nothing in the request log past its `admitted`.
+    /// nothing in the request log past its `admitted`. `media.*` (GitHub
+    /// #245) are the `done` line's, for what the request's media cost before
+    /// the cancel: a question past its deadline, or let go when its client
+    /// left, paid for its encode all the same.
     fn emit_cancelled(&self, id: RequestId, cause: CancelCause, ms: u64, rt: &RequestTelemetry) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        let summary = rt.media_summary();
+        let media = summary.map(|s| s.stats);
         tracing::info!(
             name: "ignis.request.cancelled",
             request_id = id,
@@ -1008,6 +1014,14 @@ impl Telemetry {
             lane = rt.admitted.then_some(rt.lane as u64),
             tokens = if rt.ttft { 1 + rt.itl_count } else { 0 },
             class = rt.class.as_extension_str(),
+            media.items = media.map(|m| m.items),
+            media.vision_tokens = media.map(|m| m.vision_tokens),
+            media.natural_vision_tokens = media.map(|m| m.natural_vision_tokens),
+            media.bytes = media.map(|m| m.media_bytes),
+            media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
+            media.cache_hits = media.map(|m| m.cache_hits),
+            media.cache_misses = media.map(|m| m.cache_misses),
+            media.encode_seconds = summary.map(|s| s.encode_seconds()),
             "request cancelled"
         );
     }
@@ -1657,6 +1671,60 @@ mod tests {
         let admitted = media_of("ignis.request.admitted");
         assert_eq!(admitted.len(), 8, "every media field: {admitted:?}");
         assert_eq!(media_of("ignis.request.done"), admitted);
+    }
+
+    #[test]
+    fn a_cancelled_request_reports_the_media_it_paid_for_on_cancelled() {
+        // GitHub #245: a question past its deadline, or let go when its
+        // client left, encoded its image before the cancel, and `cancelled`
+        // is the line it ends with instead of `done`. A `Done` that raced
+        // the cancel finds nothing left to report, so a request's media are
+        // on one of its two terminal lines, never both.
+        let mut telemetry = telemetry();
+        let media = MediaStats {
+            items: 1,
+            vision_tokens: 4,
+            natural_vision_tokens: 4,
+            media_bytes: 2048,
+            preprocess_seconds: 0.125,
+            cache_hits: 0,
+            cache_misses: 1,
+            source_pixels: Some((64, 64)),
+        };
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 20, RequestClass::Agent);
+            telemetry.note_media(1, media);
+            telemetry.on_prefill_chunk(1, 8, 250_000);
+            telemetry.on_cancelled(1, CancelCause::Consumer);
+            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None);
+            // A text request cancelled mid-prefill: no media, no `media.*`.
+            telemetry.note_submit(2, 5, RequestClass::Agent);
+            telemetry.on_prefill_chunk(2, 2, 9_000);
+            telemetry.on_cancelled(2, CancelCause::Timeout);
+        });
+        let media_of = |name: &str, id: u64| {
+            let attributes = events
+                .iter()
+                .find(|e| e["event_name"] == name && e["attributes"]["request_id"] == id)
+                .unwrap_or_else(|| panic!("no {name} for {id}: {events:?}"))["attributes"]
+                .as_object()
+                .expect("attributes are an object")
+                .clone();
+            attributes.into_iter().filter(|(k, _)| k.starts_with("media.")).collect::<serde_json::Map<_, _>>()
+        };
+        let image = media_of("ignis.request.cancelled", 1);
+        assert_eq!(image["media.encode_seconds"], 0.25, "{image:?}");
+        assert_eq!(image["media.vision_tokens"], 4, "{image:?}");
+        assert_eq!(image["media.natural_vision_tokens"], 4);
+        assert_eq!(image["media.items"], 1);
+        assert_eq!(image["media.bytes"], 2048);
+        assert_eq!(image["media.preprocess_seconds"], 0.125);
+        assert_eq!(image["media.cache_hits"], 0);
+        assert_eq!(image["media.cache_misses"], 1);
+        let raced = media_of("ignis.request.done", 1);
+        assert!(raced.is_empty(), "reported once, on cancelled: {raced:?}");
+        let text = media_of("ignis.request.cancelled", 2);
+        assert!(text.is_empty(), "{text:?}");
     }
 
     #[test]
