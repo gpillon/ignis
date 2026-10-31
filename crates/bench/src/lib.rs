@@ -88,6 +88,8 @@ pub mod oracle;
 pub mod record;
 pub mod report;
 pub mod small_card;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod time;
 pub mod trace;
 pub mod ttft;
