@@ -547,7 +547,7 @@ fn generate_numbered_prompts(
 }
 
 /// The number of leading elements `a` and `b` have in common.
-fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+pub(crate) fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 

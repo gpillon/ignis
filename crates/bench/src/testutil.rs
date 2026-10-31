@@ -3,7 +3,7 @@
 //! plain endpoint for it to wrap.
 
 use crate::client::{Endpoint, FinishReason, Outcome, Request};
-use crate::ttft::PromptTemplate;
+use crate::ttft::{common_prefix_len, PromptTemplate};
 
 /// The artifact's chat template in shape: `<|im_start|>user\n` before the
 /// content, `<|im_end|>\n<|im_start|>assistant\n` and the four
@@ -57,7 +57,7 @@ impl<'t, E: Endpoint> PromptReuse<'t, E> {
         let mut pairs = Vec::new();
         for (i, a) in admitted.iter().enumerate() {
             for (j, b) in admitted.iter().enumerate().skip(i + 1) {
-                let shared = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+                let shared = common_prefix_len(a, b);
                 if shared > header {
                     pairs.push((i, j, shared));
                 }
@@ -83,7 +83,7 @@ impl<'t, E: Endpoint> PromptReuse<'t, E> {
 
     /// The head `tokens` claims of an `earlier` prompt.
     fn claim(tokens: &[u32], earlier: &[u32]) -> usize {
-        let shared = tokens.iter().zip(earlier).take_while(|(a, b)| a == b).count();
+        let shared = common_prefix_len(tokens, earlier);
         let opener = earlier.len().saturating_sub(Self::AFTER_OPENER);
         let checkpoint = if opener > 0 && shared >= opener { opener } else { 0 };
         let pages = shared.min(tokens.len().saturating_sub(1)) / Self::PAGE_TOKENS * Self::PAGE_TOKENS;
