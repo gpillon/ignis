@@ -207,8 +207,11 @@ While no text model with vision serves (the image model is loaded, or the
 server runs with [vision](../configuration/vision.md) off), the picture stays on
 the spine and its reading waits: under the picture, "Not read yet: no text
 model with vision serves", and the Images card counts the pictures waiting.
-Each is read once one serves, a transcript opened later included. A reading
-that fails says why under the picture, with **Read again**.
+Each is read once one serves, a transcript opened later included. A text model
+with vision [unloaded while idle](../api/idle-unload.md) still serves: the page
+knows its vision from the server's catalog, a page loaded meanwhile too, and
+the reading loads it again. A reading that fails says why under the picture,
+with **Read again**.
 
 ## Suggestions
 
