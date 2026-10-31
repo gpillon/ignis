@@ -25,6 +25,7 @@ pub mod vision_canary;
 
 use std::sync::Arc;
 
+use ignis_core::decision::LabelTokenizer;
 use ignis_core::TokenId;
 use ignis_server::decoder::TokenDecoder;
 use ignis_server::template::{ChatMessage, RenderedPrompt, TemplateProvider, TemplateRejection};
@@ -111,6 +112,31 @@ impl TemplateProvider for ReasoningTemplate {
     }
     // `decoder_starts_in_reasoning` left at the trait default
     // (`thinking.enable_thinking`), which is the point of this type.
+}
+
+/// Just enough tokenizer to name three options, `A` to `C`: `/v1/decide`
+/// refuses a load whose tokenizer can label none, and a request-log test
+/// asks for no fourth.
+pub struct ThreeLetters;
+
+impl LabelTokenizer for ThreeLetters {
+    fn encode(&self, text: &str) -> Option<Vec<TokenId>> {
+        match text {
+            "A" => Some(vec![1]),
+            "B" => Some(vec![2]),
+            "C" => Some(vec![3]),
+            _ => None,
+        }
+    }
+
+    fn decode(&self, ids: &[TokenId]) -> Option<String> {
+        match ids {
+            [1] => Some("A".to_owned()),
+            [2] => Some("B".to_owned()),
+            [3] => Some("C".to_owned()),
+            _ => None,
+        }
+    }
 }
 
 /// The speech model's fixtures: a server over a scripted executor, the form
