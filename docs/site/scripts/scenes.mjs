@@ -428,24 +428,22 @@ function sceneTranscript() {
         untilMs: 30_900,
       },
     ],
-    // As the Notes tab keeps them (web/src/transcribe/notes.ts): a Work call's, written from all eight utterances, as
-    // lines, all of them the model's; Open questions holds none.
+    // As the Notes tab keeps them (web/src/transcribe/notes.ts): a Work call's running notes, kept up over all eight
+    // utterances, as lines in its live sections, all of them the model's; Asked of me holds none.
     notes: {
       kind: "work",
       lines: [
-        ["Summary", "A short release check: the overnight build passed, so the tag goes out today at four; two screenshots and a changelog line are left on the docs side."],
-        ["Topics", "**Release**: the build passed on both runners [00:09]."],
-        ["Topics", "**Docs**: two pages need new screenshots, the changelog a line for the speech view [00:20]."],
-        ["People", "**Me**: runs the call and sets the time of the tag."],
-        ["People", "**Speaker 1**: raised the docs work, posts the notes."],
-        ["People", "**Speaker 2**: reported the build, takes the screenshots."],
-        ["Decisions", "Tag at four, then check the download links [00:31]."],
-        ["Action items", "[ ] Speaker 2: take the screenshots this afternoon [00:27]."],
-        ["Action items", "[ ] Speaker 1: post the notes in the channel [00:38]."],
-        ["Action items", "[ ] Me: check the download links after the tag [00:31]."],
+        ["Now", "Wrapping up: tag at four, then check the download links [00:31]."],
+        ["People", "Me: runs the call, sets the time of the tag."],
+        ["People", "Speaker 1: raised the docs work, posts the notes."],
+        ["People", "Speaker 2: reported the build, takes the screenshots."],
+        ["Figures & dates", "Four o'clock: the tag goes out today [00:31]."],
+        ["Figures & dates", "Two pages need new screenshots [00:20]."],
+        ["Commitments heard", "Speaker 2: the screenshots this afternoon [00:27]."],
+        ["Commitments heard", "Speaker 1: the notes in the channel [00:38]."],
       ].map(([section, text], i) => ({ id: `N${i + 1}`, section, text, author: "model" })),
       removed: [],
-      nextId: 11,
+      nextId: 9,
       writtenAs: "work",
       covered: 8,
       writtenAt: new Date(2026, 9, 25, 15, 43).getTime(),

@@ -1,21 +1,23 @@
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { caption } from "../ui/classes.ts";
+import { IconChevron, IconRegenerate } from "../ui/icons.tsx";
 import { Markdown } from "../ui/Markdown.tsx";
 import { Switch } from "../ui/Switch.tsx";
 import { useWatched } from "./assist.ts";
 import { jumpOnClick, linkTimes } from "./jump.ts";
 import { kindHint, kindOf, NOTE_KINDS, notesMarkdown, notesStatus } from "./notes.ts";
 import type { NotesHandle, NotesWriterState } from "./notesWriter.ts";
-import { recapMarkdown } from "./recap.ts";
+import { recapMarkdown, recapStatus } from "./recap.ts";
 import type { Transcript } from "./transcript.ts";
 import type { TranscribeActions, TranscribeState } from "./useTranscribe.ts";
 
 // The Notes tab of the Transcribe view's right panel (spec speech/07,
-// Q124-Q127): the kind of conversation, the button that writes the notes, the
-// switch that keeps them up while listening, and the notes as the model wrote
-// them, streaming in under the same heat the sheet's live line has. Once a
-// recap is written (recap.ts, #441), it stands on top and the running notes
-// fold under it; Write the recap writes one at any moment.
+// Q124-Q127; spec #428): the kind of conversation, the button that updates the
+// running notes, the switch that keeps them up while listening, and the notes
+// in the kind's live sections, under the same heat the sheet's live line has
+// while an update changes them a line at a time. Rewrite from scratch sits in
+// a menu. Once a recap is written (recap.ts, #441), it stands on top and the
+// running notes fold under it; Write the recap writes one at any moment.
 
 type Press = { label: string; disabled: boolean; stops: boolean };
 
@@ -36,6 +38,11 @@ export function recapButton(t: Transcript, writer: NotesWriterState, blocked: st
   return { label: "Write the recap", disabled: cannotWrite(t, writer, blocked), stops: false };
 }
 
+/** Rewrite from scratch: once the model wrote a line of the notes, and only when a writing could start. */
+export function rewriteButton(t: Transcript, writer: NotesWriterState, blocked: string | null): { disabled: boolean } {
+  return { disabled: cannotWrite(t, writer, blocked) || !(t.notes?.lines ?? []).some((l) => l.author === "model") };
+}
+
 export function Notes({ transcript, state, actions, notes }: { transcript: Transcript; state: TranscribeState; actions: TranscribeActions; notes: NotesHandle }) {
   return <NotesPanel transcript={transcript} state={state} actions={actions} writer={useWatched(notes)} />;
 }
@@ -49,23 +56,25 @@ export function NotesPanel({ transcript: t, state, actions, writer }: { transcri
   const recapHere = writer.writing === t.id && writer.form === "recap";
   const button = notesButton(t, writer, state.textBlocked);
   const recapPress = recapButton(t, writer, state.textBlocked);
-  const kept = notesMarkdown(t.notes);
+  const rewrite = rewriteButton(t, writer, state.textBlocked);
+  const menu = useRef<HTMLDetailsElement>(null);
+  // The running notes change in place, a line at a time, as an update applies the model's calls.
+  const shown = notesMarkdown(t.notes);
   const recapKept = recapMarkdown(t.recap);
-  // While a writing streams, its text; before its first token, what it replaces, dimmed.
-  const shown = here && writer.text !== "" ? writer.text : kept;
+  // While the recap streams, its text; before its first token, the one it replaces, dimmed.
   const recapShown = recapHere && writer.text !== "" ? writer.text : recapKept;
   const recapOnTop = recapHere || recapKept !== "";
   // Copy gives the notes meant for after: the recap when there is one, else the running notes.
-  const copy = recapKept !== "" ? { text: recapKept, label: "Copy recap" } : { text: kept, label: "Copy notes" };
-  const status = here ? null : notesStatus(t.notes, t.utterances.length);
-  const recapStatus = recapHere ? null : notesStatus(t.recap, t.utterances.length);
+  const copy = recapKept !== "" ? { text: recapKept, label: "Copy recap" } : { text: shown, label: "Copy notes" };
+  const status = here ? null : notesStatus(t.notes, t.utterances.length, state.notesLive);
+  const recapLine = recapHere ? null : recapStatus(t.recap, t.utterances.length);
   const failed = writer.failed?.transcript === t.id && writer.writing !== t.id ? writer.failed : null;
   const running = (
     <article aria-label="Notes" aria-busy={here} className="relative flex flex-col gap-3 pl-3.5" onClickCapture={jumpOnClick}>
       <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-[2px] ${here ? "spine-live" : shown ? "bg-line" : "bg-transparent"}`} />
       {shown ? (
-        <div className={`notes ${here && writer.text === "" ? "opacity-50" : ""}`}>
-          <Markdown text={linkTimes(shown)} streaming={here} />
+        <div className="notes">
+          <Markdown text={linkTimes(shown)} />
         </div>
       ) : (
         <p className="text-xs leading-snug text-ash">
@@ -74,7 +83,7 @@ export function NotesPanel({ transcript: t, state, actions, writer }: { transcri
             : "The text model reads this transcript and writes its notes, in the kind picked above. Nothing goes to it until you press Write notes or Write the recap, or turn on Keep updating."}
         </p>
       )}
-      {here && shown && writer.text === "" && <p className="text-xs text-ash">The model is reading the transcript.</p>}
+      {here && shown && <p className="text-xs text-ash">The model is reading what was said since.</p>}
       {status && <p className="text-xs leading-snug text-ash">{status}</p>}
     </article>
   );
@@ -133,6 +142,31 @@ export function NotesPanel({ transcript: t, state, actions, writer }: { transcri
           >
             {copied ? "Copied" : copy.label}
           </button>
+          <details ref={menu} className="group relative">
+            <summary className="flex cursor-pointer list-none items-center gap-1 border border-line px-2.5 py-1.5 font-display text-[13px] font-medium text-ink hover:border-ember [&::-webkit-details-marker]:hidden">
+              More
+              <IconChevron className="rotate-180 transition-transform group-open:rotate-0 motion-reduce:transition-none" />
+            </summary>
+            <div className="absolute right-0 z-20 mt-1 flex w-60 max-w-[calc(100vw-2rem)] flex-col border border-line bg-surface py-1 shadow-lg">
+              <button
+                type="button"
+                disabled={rewrite.disabled}
+                onClick={() => {
+                  menu.current?.removeAttribute("open");
+                  actions.rewriteNotes();
+                }}
+                className="flex items-start gap-2 px-3 py-1.5 text-left hover:bg-line disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+              >
+                <span className="mt-0.5 text-ash">
+                  <IconRegenerate />
+                </span>
+                <span className="flex flex-col gap-0.5">
+                  <span className="font-display text-[13px] font-medium text-ink">Rewrite from scratch</span>
+                  <span className="text-xs leading-snug text-ash">Drops the model's lines and writes the notes again from the transcript.</span>
+                </span>
+              </button>
+            </div>
+          </details>
         </div>
         <div className="flex items-start gap-2.5">
           <Switch on={state.notesLive} onChange={actions.setNotesLive} labelledBy={liveId} />
@@ -161,7 +195,7 @@ export function NotesPanel({ transcript: t, state, actions, writer }: { transcri
             </div>
           )}
           {recapHere && writer.text === "" && <p className="text-xs text-ash">The model is reading the whole transcript.</p>}
-          {recapStatus && <p className="text-xs leading-snug text-ash">{recapStatus}</p>}
+          {recapLine && <p className="text-xs leading-snug text-ash">{recapLine}</p>}
         </article>
       )}
       {recapOnTop ? (

@@ -126,11 +126,15 @@ describe("the PDF's document, on request", () => {
     expect(printDocument({ ...call(), context: told }, NONE).map((b) => b.kind)).not.toContain("context");
   });
 
-  it("sets the running notes after the context and before the transcript, in the kind's sections, when there is no recap", () => {
-    const t = { ...call(), context: { ...EMPTY_CONTEXT, topic: "Budget" }, notes: written("general", [["Key points", "The line works."]]) };
+  it("sets the running notes after the context and before the transcript, in the kind's live sections, when there is no recap", () => {
+    const t = { ...call(), context: { ...EMPTY_CONTEXT, topic: "Budget" }, notes: written("general", [["Points", "The line works."]]) };
     const blocks = printDocument(t, ALL);
     expect(blocks.map((b) => b.kind).slice(0, 5)).toEqual(["header", "context", "notes", "heading", "utterance"]);
-    expect(blocks[2]).toEqual({ kind: "notes", title: "Notes", markdown: "## Summary\n—\n\n## Key points\n- The line works.\n\n## Next steps\n—" });
+    expect(blocks[2]).toEqual({
+      kind: "notes",
+      title: "Notes",
+      markdown: "## Now\n—\n\n## People\n—\n\n## Points\n- The line works.\n\n## Asked of me\n—\n\n## Open questions\n—",
+    });
   });
 
   it("sets the recap in place of the running notes once there is one, in the recap's sections", () => {

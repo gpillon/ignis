@@ -3,7 +3,7 @@ import type { ConversationRequest } from "../api/request.ts";
 import type { StreamOptions, StreamResult } from "../api/stream.ts";
 import { Analyst } from "./analyst.ts";
 import { ASK_TASK, Asker, askRequest } from "./ask.ts";
-import { notesRequest } from "./notes.ts";
+import { NotesWriter } from "./notesWriter.ts";
 import { Rewriter, rewriteRequest } from "./rewrite.ts";
 import { contextBlock, taskInput, writeIn } from "./taskContext.ts";
 import { addUtterance, createTranscript, renameSpeaker, type Transcript } from "./transcript.ts";
@@ -76,9 +76,9 @@ describe("every task's request", () => {
     await new Analyst({ stream, onFound: () => {} }).analyze(t, null);
     await new Asker({ stream, onAnswered: () => {} }).ask(t, "Why?", null);
     await new Rewriter({ stream }).rewrite(t, t.utterances[1]);
-    const all = [...seen, notesRequest(t, "general", null).request];
-    expect(all).toHaveLength(4);
-    for (const r of all) {
+    await new NotesWriter({ stream, onNotes: () => {}, onRecap: () => {} }).write(t, "general", null);
+    expect(seen).toHaveLength(4);
+    for (const r of seen) {
       expect(r.turns[0].content.startsWith(block)).toBe(true);
       expect(r.turns[0].content).toContain("- Write in: French.");
       expect(r.settings.systemPrompt).not.toContain("French");
@@ -87,10 +87,22 @@ describe("every task's request", () => {
     }
   });
 
-  it("keeps a task's system block byte-identical whatever the context, so the engine reuses the prompt", () => {
+  it("keeps a task's system block byte-identical whatever the context, so the engine reuses the prompt", async () => {
     const other = asContext(call(["en"]), told({ topic: "Else", terms: ["x"] }));
+    /** The first request of a notes thread on `x`. */
+    const threadOf = async (x: Transcript) => {
+      let sent: ConversationRequest | undefined;
+      const stream = async (o: StreamOptions): Promise<StreamResult> => {
+        sent ??= o.request;
+        return { ok: true } as StreamResult;
+      };
+      await new NotesWriter({ stream, onNotes: () => {}, onRecap: () => {} }).write(x, "work", null);
+      return sent!;
+    };
     expect(askRequest(t, "a", null).settings.systemPrompt).toBe(askRequest(other, "b", null).settings.systemPrompt);
-    expect(notesRequest(t, "work", null).request.settings.systemPrompt).toBe(notesRequest(other, "work", null).request.settings.systemPrompt);
+    const [mine, theirs] = [await threadOf(t), await threadOf(other)];
+    expect(mine.settings.systemPrompt).toBe(theirs.settings.systemPrompt);
+    expect(mine.extras).toEqual(theirs.extras);
     expect(rewriteRequest(t, 1)!.settings.systemPrompt).toBe(rewriteRequest(other, 1)!.settings.systemPrompt);
     expect(askRequest(t, "a", null).settings.systemPrompt).toContain(ASK_TASK);
   });

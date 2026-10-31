@@ -52,9 +52,12 @@ export function contextBlock(t: Transcript): string {
   return `${lines.join("\n")}\n\n`;
 }
 
-/** The user turn of a task: the context block, then the title and the transcript (`transcriptInput`'s budget less the block). */
-export function taskInput(t: Transcript, contextLimit: number | null, answerTokens: number): { content: string; fromMs: number | null } {
+/**
+ * The user turn of a task: the context block, then the title and the transcript (`transcriptInput`'s budget less the
+ * block, `time` writing each moment).
+ */
+export function taskInput(t: Transcript, contextLimit: number | null, answerTokens: number, time?: (ms: number) => string): { content: string; fromMs: number | null } {
   const block = contextBlock(t);
-  const { content, fromMs } = transcriptInput(t, contextLimit, answerTokens + Math.ceil(block.length / CHARS_PER_TOKEN));
+  const { content, fromMs } = transcriptInput(t, contextLimit, answerTokens + Math.ceil(block.length / CHARS_PER_TOKEN), time);
   return { content: block + content, fromMs };
 }

@@ -14,7 +14,7 @@ import { useStoredSessions } from "../store/useStoredSessions.ts";
 import { decodeFile } from "./file.ts";
 import { filePace } from "./filePace.ts";
 import { chooseUtteranceSilence, utteranceSilence } from "./silence.ts";
-import { chooseNoteKind, kindOf, type NoteKind, noNotes, withWriting } from "./notes.ts";
+import { chooseNoteKind, kindOf, type NoteKind, noNotes } from "./notes.ts";
 import { withRecap } from "./recap.ts";
 import { type CallContext, contextAtStart, contextOf, contextTokensOf, copiedDraft, DEFAULT_CONTEXT_TOKENS, mergeDraft, told } from "./context.ts";
 import { savedContext, saveContext } from "./defaultContext.ts";
@@ -136,8 +136,10 @@ export type TranscribeActions = {
   clearMissed: () => void;
   /** The open Transcript's kind of notes, and this browser's next default. */
   setNoteKind: (kind: NoteKind) => void;
-  /** Writes the open Transcript's notes now. */
+  /** Updates the open Transcript's running notes now. */
   writeNotes: () => void;
+  /** Writes the open Transcript's running notes again from scratch: the model's lines dropped, the user's kept. */
+  rewriteNotes: () => void;
   /** Writes the open Transcript's recap now, from the whole of it. */
   writeRecap: () => void;
   /** Stops the writing under way, the notes' or the recap's. */
@@ -238,8 +240,9 @@ export function useTranscribe({
   const [writer] = useState(
     () =>
       new NotesWriter({
-        onWritten: (id, written, form) =>
-          setList((l) => updateTranscript(l, id, (t) => (form === "recap" ? { ...t, recap: withRecap(t.recap, written) } : { ...t, notes: withWriting(t.notes, written) }))),
+        // Each call the notes thread applies lands as it comes, on the notes the Transcript holds then.
+        onNotes: (id, change) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, notes: change(t.notes) }))),
+        onRecap: (id, written) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, recap: withRecap(t.recap, written) }))),
       }),
   );
   useEffect(() => () => writer.stop(), [writer]);
@@ -483,6 +486,12 @@ export function useTranscribe({
         if (model.blocked !== null) return;
         const t = activeOf(listNow.current);
         void writer.write(t, kindOf(t), model.contextLimit);
+      },
+      rewriteNotes: () => {
+        const { text: model } = latest.current;
+        if (model.blocked !== null) return;
+        const t = activeOf(listNow.current);
+        void writer.rewrite(t, kindOf(t), model.contextLimit);
       },
       writeRecap: () => {
         const { text: model } = latest.current;

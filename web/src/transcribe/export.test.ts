@@ -130,9 +130,9 @@ describe("the Markdown export with notes and answers", () => {
     expect(toMarkdown({ ...call(), notes: noNotes("work"), asked: [] })).toBe(toMarkdown(call()));
   });
 
-  it("carries the running notes in the kind's sections after the start and before the transcript", () => {
-    const md = toMarkdown({ ...call(), notes: written("work", [["Summary", "A check of the line."]]) });
-    expect(md.startsWith("# 25 Oct 15:42 · Call\n\nStarted 25 Oct 2026, 15:42\n\n## Summary\n- A check of the line.\n\n## ")).toBe(true);
+  it("carries the running notes in the kind's live sections after the start and before the transcript", () => {
+    const md = toMarkdown({ ...call(), notes: written("work", [["Now", "A check of the line."]]) });
+    expect(md.startsWith("# 25 Oct 15:42 · Call\n\nStarted 25 Oct 2026, 15:42\n\n## Now\n- A check of the line.\n\n## People\n—\n\n## ")).toBe(true);
     expect(md).toContain("\n—\n");
     expect(md.indexOf("## Transcript")).toBeGreaterThan(md.lastIndexOf("\n—"));
     expect(md.indexOf("**Me** (00:01)")).toBeGreaterThan(md.indexOf("## Transcript"));

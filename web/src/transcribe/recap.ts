@@ -1,8 +1,9 @@
 import type { ConversationRequest, Settings } from "../api/request.ts";
 import { assistRequest, CHARS_PER_TOKEN } from "./assist.ts";
 import { type DraftLine, type NoteKind, type Notes, NOTES_SETTINGS, notesMarkdown, type NoteSection, parseLines, readNotes, sectionsTask, specOf, withWriting, type Written } from "./notes.ts";
+import { clock } from "./export.ts";
 import { taskInput } from "./taskContext.ts";
-import type { Transcript } from "./transcript.ts";
+import { dayAndTime, type Transcript } from "./transcript.ts";
 
 // The recap (spec #428, "The recap"): the notes written once from the whole
 // transcript, for what comes after the conversation. Running notes kept a
@@ -81,6 +82,17 @@ export const withRecap = (recap: Notes | undefined, written: Written): Notes => 
 
 /** The recap as Markdown, what the tab shows and Copy recap gives: the recap's sections in order (notesMarkdown). */
 export const recapMarkdown = (recap: Notes | undefined): string => notesMarkdown(recap, recap && recapSections(recap.writtenAs ?? recap.kind));
+
+const counted = (n: number) => (n === 1 ? "1 utterance" : `${n} utterances`);
+
+/** The line under the recap: when it was written, from how much, and what came since; `null` before one is. */
+export function recapStatus(recap: Notes | undefined, utterances: number): string | null {
+  if (!recap?.writtenAs || recap.writtenAt === null) return null;
+  const time = dayAndTime(new Date(recap.writtenAt)).time;
+  const from = recap.fromMs === null ? "" : `, from ${clock(recap.fromMs)} on: the start did not fit the model's context`;
+  const fresh = Math.max(0, utterances - recap.covered);
+  return `Written at ${time} from ${counted(recap.covered)}${from}.${fresh > 0 ? ` ${fresh} more since.` : ""}`;
+}
 
 /** A stored Transcript's recap, as notes.ts reads notes; `undefined` for one this page cannot read, or never written. */
 export function readRecap(value: unknown): Notes | undefined {
