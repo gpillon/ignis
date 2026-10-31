@@ -275,7 +275,8 @@ Every correction is the page's, and nothing goes back to the server:
 
 The text of every completed utterance is editable: click it, even while
 listening. What you edit, and what a fix put in, is what the exports, the notes
-and Open in chat carry.
+and Open in chat carry. The running notes take every correction and rename at
+their next update ([Notes](#notes)).
 
 ## Searching
 
@@ -410,7 +411,7 @@ most, each one short point:
   homework, readings, exams and their dates.
 
 **Write notes** sends the transcript as it stands, and the lines appear one at
-a time as the model writes them. **Update notes** sends only what was said
+a time as the model writes them. **Update notes** sends only what is new
 since the last update: the model keeps one conversation per transcript with the
 notes in it, and changes them a line at a time, adding a line, rewriting one or
 removing one, and rewriting a whole section only once it is full. A line still
@@ -424,6 +425,18 @@ updated, and how many utterances came since while Keep updating is off.
 [recap](#the-recap), the button is **Copy recap** and copies that. Each
 transcript keeps its notes and its kind, and a reload brings them back; a new
 transcript starts at the kind picked last (this browser keeps it).
+
+Your corrections reach the notes at the next update. Each utterance you edited,
+fixed, rewrote, moved to another speaker, split or deleted since the last one
+goes to the model with its moment and its new text, one change each, as does one
+put back with **Undo** once an update told the model it was deleted; a speaker
+you renamed or merged into another goes as one change, by the name the model
+knew. The model then changes the lines they make wrong; the page never rewrites
+a line for them, a rename included: "Speaker 2" turns into the name you gave when
+the model rewrites the lines that say it. A correction made while an update runs
+goes into the next one, and one made before the notes start over (after a
+reload, on another kind, on Rewrite from scratch) is in the transcript they
+start from.
 
 **More** › **Rewrite from scratch** drops the model's lines and writes the
 notes again from the whole transcript, for notes that drifted. Picking another
@@ -481,9 +494,15 @@ is the context, the title, the transcript, with each moment in minutes from the
 start (`[64:09]`), and the notes as they stand, each line with its id. It
 starts over that way after a reload, on another kind, on Rewrite from scratch,
 and once a request's prompt passes 64,000 tokens (half the model's context,
-when that is smaller). An update makes up to six requests, each answered with
-what its calls did in one line, and ends sooner when the model calls nothing
-or two requests in a row change nothing; what is left goes to the next update.
+when that is smaller). Each later update adds one message: the utterances under
+`Said since [mm:ss]:`, then the transcript's changes under `Changed since:`, a
+line each, such as `Corrected: [00:05] Anna: We meet on Thursday. It was: We
+meet on Friday.`, `Moved:`, `Split:`, `Deleted:`, `Put back:`, and `Renamed:
+Speaker 2, heard from [00:05], is Anna.` or `Merged:` for a speaker; with
+nothing said and nothing changed, an update sends nothing. An update makes up
+to six requests, each answered with what its calls did in one line, and ends
+sooner when the model calls nothing or two requests in a row change nothing;
+what is left goes to the next update.
 The page holds the model to the notes' limits: it strips a line's id copied
 into a text, and refuses a line already in its section, one over 240
 characters, and a line more in a full section, telling the model why.

@@ -1,10 +1,10 @@
 import type { ConversationRequest, Turn } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { ASSIST_SYSTEM, type AskDeps, askModel, CHARS_PER_TOKEN, Follower, settle, Watched } from "./assist.ts";
-import { minutesClock, toText } from "./export.ts";
+import { minutesClock } from "./export.ts";
 import { dueForUpdate, LIVE_GAP_MS, type NoteKind, noNotes, type Notes, NOTES_MAX_TOKENS, NOTES_SETTINGS, RUNNING_NOTES, tidyNotes, type Written } from "./notes.ts";
 import { parseRecap, recapDue, recapRequest } from "./recap.ts";
-import { applyCall, fromScratch, laterTurn, notesState, restartAt, runningTask, runningTools, type Said } from "./running.ts";
+import { applyCall, changesSince, fromScratch, laterTurn, notesState, restartAt, runningTask, runningTools, type Told, toldOf } from "./running.ts";
 import { taskInput } from "./taskContext.ts";
 import type { Transcript } from "./transcript.ts";
 
@@ -17,7 +17,9 @@ import type { Transcript } from "./transcript.ts";
 // The running notes are kept by a thread per Transcript (running.ts, ADR
 // 0076): its first turn is the context, the title, the transcript so far and
 // the notes as they stand; each later update appends what was said since, and
-// runs a few requests, the page applying each call the moment it comes and
+// what the user changed in the transcript meanwhile (a diff against what the
+// thread told of it, so a change made during an update goes into the next),
+// and runs a few requests, the page applying each call the moment it comes and
 // sending its result back with the next. The thread lives here, not in the
 // Transcript, so a reload starts it again from the notes, as a kind change, a
 // Rewrite from scratch and a prompt past the threshold do. A Stop or a failure
@@ -53,13 +55,10 @@ export type NotesWriterDeps = AskDeps & {
 const IDLE: NotesWriterState = { writing: null, form: "running", text: "", failed: null };
 
 /** A Transcript's notes thread: the kind it keeps, its turns, what each utterance was told as, and its last prompt. */
-type Thread = { kind: NoteKind; turns: Turn[]; told: Map<number, Said>; promptTokens: number };
+type Thread = { kind: NoteKind; turns: Turn[]; told: Map<number, Told>; promptTokens: number };
 
 /** The stream a Transcript's thread goes on, so the socket continues it. */
 const streamOf = (transcript: number) => `transcribe-notes-${transcript}`;
-
-/** What the model is told of `t`'s utterances, in total minutes: each one's line by its id ("" for an emptied one). */
-const linesOf = (t: Transcript): [number, Said][] => t.utterances.map((u) => [u.id, { startMs: u.startMs, line: toText({ ...t, utterances: [u] }, minutesClock) }]);
 
 export class NotesWriter extends Watched<NotesWriterState> {
   private abort: AbortController | null = null;
@@ -96,9 +95,10 @@ export class NotesWriter extends Watched<NotesWriterState> {
     const held = this.threads.get(t.id);
     this.threads.delete(t.id);
     if (!restart && held && held.kind === kind && held.promptTokens <= restartAt(contextLimit)) {
-      const said = t.utterances.filter((u) => held.told.get(u.id)?.startMs !== u.startMs).map((u) => linesOf({ ...t, utterances: [u] })[0][1]);
-      const turn = laterTurn(said.filter((s) => s.line !== ""));
-      const told = new Map([...held.told, ...linesOf(t)]);
+      // What was said since the last turn, and what the user changed meanwhile: `t` against what the thread told.
+      const { said, events } = changesSince(held.told, t);
+      const turn = laterTurn(said, events);
+      const told = toldOf(t, held.told);
       if (turn === "") {
         this.threads.set(t.id, { ...held, told });
         return null;
@@ -109,7 +109,7 @@ export class NotesWriter extends Watched<NotesWriterState> {
     const state = notesState(notes, kind);
     const reserve = NOTES_MAX_TOKENS + Math.ceil(state.length / CHARS_PER_TOKEN);
     const { content, fromMs } = taskInput(t, Math.floor(restartAt(contextLimit) / 2), reserve, minutesClock);
-    return { thread: { kind, turns: [{ role: "user", content: `${content}\n${state}` }], told: new Map(linesOf(t)), promptTokens: 0 }, fromMs };
+    return { thread: { kind, turns: [{ role: "user", content: `${content}\n${state}` }], told: toldOf(t), promptTokens: 0 }, fromMs };
   }
 
   private async update(t: Transcript, kind: NoteKind, contextLimit: number | null, scratch: boolean): Promise<void> {
