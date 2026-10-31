@@ -47,7 +47,7 @@ ignis_retained_state_hits_total{tier="device",kind="checkpoint"} 18
 ignis_retained_state_hits_total{tier="device",kind="prefix"} 7
 ignis_retained_state_hits_total{tier="kv_ram",kind="checkpoint"} 3
 ignis_retained_state_hits_total{tier="kv_ram",kind="prefix"} 0
-# HELP ignis_retained_state_misses_total First prefill chunks with no retained checkpoint, or no retained prefix, matching in the tier.
+# HELP ignis_retained_state_misses_total Prefill runs whose first chunk landed with no retained checkpoint, or no retained prefix, matching in the tier (a re-queued request counts again).
 # TYPE ignis_retained_state_misses_total counter
 ignis_retained_state_misses_total{tier="device",kind="checkpoint"} 11
 ignis_retained_state_misses_total{tier="device",kind="prefix"} 14

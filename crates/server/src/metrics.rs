@@ -1343,7 +1343,7 @@ impl Metrics {
             // zero. ADR 0017 records the rule under its metric table.
             (
                 "ignis_retained_state_misses_total",
-                "First prefill chunks with no retained checkpoint, or no retained prefix, matching in the tier.",
+                "Prefill runs whose first chunk landed with no retained checkpoint, or no retained prefix, matching in the tier (a re-queued request counts again).",
                 &self.retained_state_misses,
             ),
             (

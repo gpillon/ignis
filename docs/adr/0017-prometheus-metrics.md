@@ -374,7 +374,7 @@ The initial stable metric contract is:
 | `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
 | `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Cumulative tokens skipped through retained state: a retained prefix (`kv_ram` when its claim brought it back from KV-RAM, `device` otherwise, #325) or a prompt checkpoint, by the tier it came from and the kind it was |
 | `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained state a request chose to resume from: a prompt checkpoint (not yet restored), a retained prefix claimed from the device (`tier=device`, #325), or a retained prefix brought back from KV-RAM (`tier=kv_ram`, counted at the return; the claim that brings it back adds no `device` hit, so one restore is one hit, while a later request choosing the block already back on the device is a `device` hit). A live sibling's prefix is not retained state and is no hit |
-| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Requests whose first prefill chunk landed with nothing retained of the kind matching in a tier this load carries: no checkpoint, or no retained prefix (a live sibling's head is none). Each kind is counted only where it can be hit on the load: `kind=prefix` on the device and in KV-RAM, and not without a retained slot; `kind=checkpoint` not with prompt reuse off — see the note below the table (#216, #222) |
+| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Prefill runs whose first chunk landed with nothing retained of the kind matching in a tier this load carries (a re-queued request counts again): no checkpoint, or no retained prefix (a live sibling's head is none). Each kind is counted only where it can be hit on the load: `kind=prefix` on the device and in KV-RAM, and not without a retained slot; `kind=checkpoint` not with prompt reuse off — see the note below the table (#216, #222) |
 | `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes written into the tier (`kv_ram`, and `disk` on a load with KV-disk) |
 | `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes that left the tier for nowhere |
 | `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
@@ -551,18 +551,22 @@ and the prefix walk beside it raised none, so `kind="prefix"` sat at zero on
 every load. Now both do, by one rule. A request's look records the tiers it
 found nothing retained in; a later look overwrites them (a request waiting for
 room looks on every tick); its first prefill chunk to land reports them. So a
-request misses a tier once, not once per look, and a hit is still counted at
-the claim, which is sticky.
+request misses a tier once per prefill run, not once per look: a re-queued
+request counts again, as checkpoint misses do. A hit is still counted at the
+claim, which is sticky.
 
-- **A prefix miss means no retained prefix matched.** On the device that is an
-  entry whose publisher has finished, which is what makes a claim a hit
-  (#325) and what the glossary's retained prefix is, one a later,
-  non-concurrent request claims: a live sibling's head, published retained or
-  not, is no hit, so it stops no miss either. In KV-RAM it is any blob, the copy of one already back
-  on the device included. Each tier then records at most one of hit or miss,
-  and its rate reads chosen / (chosen + nothing there), as the checkpoint
-  family's does. State that is there but not chosen (a KV-RAM block short of
-  the restore floor) is neither.
+- **A prefix miss means no retained prefix matched, by the hit's own test.**
+  On the device that is an entry whose publisher has finished, the test that
+  makes a claim a hit (#325): a live sibling's head, published retained or
+  not, is no hit, so it stops no miss either. It is wider than the glossary's
+  retained prefix, kept alive with no claimant at a reuse boundary: it also
+  admits a head that is no boundary, kept past its publisher by a claimant
+  still running (with prompt reuse off, the only kind there is). Hit and miss
+  read the one test, so they agree. In KV-RAM it is any blob, the copy of one
+  already back on the device included. Each tier then records at most one of
+  hit or miss, and its rate reads chosen / (chosen + nothing there), as the
+  checkpoint family's does. State that is there but not chosen (a KV-RAM
+  block short of the restore floor) is neither.
 - **The prefix tiers are the device and KV-RAM.** Nothing demotes a prefix to
   the disk and no restore brings one back, so `tier="disk",kind="prefix"`
   renders on a load with KV-disk and stays zero: a disk prefix miss would be a
