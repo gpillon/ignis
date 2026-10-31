@@ -166,6 +166,14 @@ struct MediaSummary {
     encode_micros: u64,
 }
 
+impl MediaSummary {
+    /// `media.encode_seconds`: the encode micros, in the unit the line
+    /// reports.
+    fn encode_seconds(&self) -> f64 {
+        self.encode_micros as f64 / 1e6
+    }
+}
+
 /// Per-request telemetry state (just enough for the request lines + the
 /// event-derived interval counters).
 #[derive(Debug, Default)]
@@ -217,6 +225,14 @@ struct RequestTelemetry {
     /// would otherwise have run under (spec server/08), read off the
     /// submission since the scheduler never sees it.
     thinking_budget_dropped: bool,
+}
+
+impl RequestTelemetry {
+    /// What the request's media cost so far, as its lines report it; `None`
+    /// for a request without media.
+    fn media_summary(&self) -> Option<MediaSummary> {
+        self.media.map(|stats| MediaSummary { stats, encode_micros: self.encode_micros })
+    }
 }
 
 /// The retained state a request's prefill resumed from, as its `done` line
@@ -422,7 +438,7 @@ impl Telemetry {
                         rt.prefill_chunks,
                         rt.prefilled_tokens,
                         rt.class,
-                        rt.media.map(|stats| MediaSummary { stats, encode_micros: rt.encode_micros }),
+                        rt.media_summary(),
                     )
                 }
                 // Not in flight — typically cancelled before this admission
@@ -578,7 +594,7 @@ impl Telemetry {
                 rt.class,
                 rt.reuse,
                 rt.thinking_budget_dropped,
-                rt.media.map(|stats| MediaSummary { stats, encode_micros: rt.encode_micros }),
+                rt.media_summary(),
             ),
             None => (
                 self.clock.now_ms(),
@@ -939,7 +955,6 @@ impl Telemetry {
         summary: Option<MediaSummary>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
-        let encode_seconds = summary.map(|s| s.encode_micros as f64 / 1e6);
         let media = summary.map(|s| s.stats);
         tracing::info!(
             name: "ignis.request.admitted",
@@ -957,7 +972,7 @@ impl Telemetry {
             media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
-            media.encode_seconds = encode_seconds,
+            media.encode_seconds = summary.map(|s| s.encode_seconds()),
             "request admitted"
         );
     }
@@ -1085,7 +1100,6 @@ impl Telemetry {
         // A `None` field records nothing, so a request without speculative
         // rounds carries no `spec.*` attributes at all.
         let spec_pos = spec.map(|s| s.acceptance_profile());
-        let encode_seconds = summary.map(|s| s.encode_micros as f64 / 1e6);
         let media = summary.map(|s| s.stats);
         tracing::info!(
             name: "ignis.request.done",
@@ -1145,7 +1159,7 @@ impl Telemetry {
             media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
-            media.encode_seconds = encode_seconds,
+            media.encode_seconds = summary.map(|s| s.encode_seconds()),
             "request done"
         );
     }
