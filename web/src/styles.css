@@ -1029,6 +1029,14 @@
     font-size: 7.5pt;
     color: var(--ash);
   }
+  /* What was read in the picture, the .md's line: the lines' face, a step down, over the picture's size. */
+  .pdf-image .pdf-reading {
+    margin-bottom: 0.6mm;
+    font-family: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+    font-size: 9pt;
+    line-height: 1.4;
+    color: var(--ink);
+  }
   .pdf-answer .pdf-time {
     color: var(--ember);
   }

@@ -1,7 +1,7 @@
 import type { ConversationRequest, Settings } from "../api/request.ts";
 import { assistRequest, CHARS_PER_TOKEN } from "./assist.ts";
 import { readImages, readingLine } from "./contextImages.ts";
-import { type DraftLine, type NoteKind, type NoteLine, type Notes, NOTES_SETTINGS, notesMarkdown, type NoteSection, parseLines, readNotes, sectionsTask, specOf, withWriting, type Written } from "./notes.ts";
+import { counted, type DraftLine, type NoteKind, type NoteLine, type Notes, NOTES_SETTINGS, notesMarkdown, type NoteSection, parseLines, readNotes, sectionsTask, specOf, withWriting, type Written } from "./notes.ts";
 import { clock } from "./export.ts";
 import { taskInput } from "./taskContext.ts";
 import { dayAndTime, type Transcript } from "./transcript.ts";
@@ -106,7 +106,16 @@ export const withRecap = (recap: Notes | undefined, written: Written): Notes => 
 /** The recap as Markdown, what the tab shows and Copy recap gives: the recap's sections in order (notesMarkdown). */
 export const recapMarkdown = (recap: Notes | undefined): string => notesMarkdown(recap, recap && recapSections(recap.writtenAs ?? recap.kind));
 
-const counted = (n: number) => (n === 1 ? "1 utterance" : `${n} utterances`);
+/**
+ * The notes meant for after, as the `.md` and the PDF carry them (spec #428, "Which notes"): the recap when there is
+ * one, else the running notes, as Markdown in their sections; `null` with neither.
+ */
+export function notesForAfter(t: Transcript): { title: "Recap" | "Notes"; markdown: string } | null {
+  const recap = recapMarkdown(t.recap);
+  if (recap !== "") return { title: "Recap", markdown: recap };
+  const running = notesMarkdown(t.notes);
+  return running === "" ? null : { title: "Notes", markdown: running };
+}
 
 /** The line under the recap: when it was written, from how much, and what came since; `null` before one is. */
 export function recapStatus(recap: Notes | undefined, utterances: number): string | null {
@@ -114,7 +123,7 @@ export function recapStatus(recap: Notes | undefined, utterances: number): strin
   const time = dayAndTime(new Date(recap.writtenAt)).time;
   const from = recap.fromMs === null ? "" : `, from ${clock(recap.fromMs)} on: the start did not fit the model's context`;
   const fresh = Math.max(0, utterances - recap.covered);
-  return `Written at ${time} from ${counted(recap.covered)}${from}.${fresh > 0 ? ` ${fresh} more since.` : ""}`;
+  return `Written at ${time} from ${counted(recap.covered, "utterance")}${from}.${fresh > 0 ? ` ${fresh} more since.` : ""}`;
 }
 
 /** A stored Transcript's recap, as notes.ts reads notes; `undefined` for one this page cannot read, or never written. */

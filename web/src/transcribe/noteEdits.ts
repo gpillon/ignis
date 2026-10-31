@@ -1,4 +1,4 @@
-import type { NoteLine, Notes } from "./notes.ts";
+import { lineId, type NoteLine, type Notes } from "./notes.ts";
 
 // The notes edited by hand (spec #428, "Editing by hand"): in the running
 // notes and in the recap, a line the user edits or adds is theirs, and the
@@ -33,5 +33,5 @@ export function editLine(notes: Notes, line: NoteLine, text: string): Notes {
 export function addLine(notes: Notes, section: string, text: string): Notes {
   const typed = tidy(text);
   if (typed === "") return notes;
-  return { ...notes, lines: [...notes.lines, { id: `N${notes.nextId}`, section, text: typed, author: "user" }], nextId: notes.nextId + 1 };
+  return { ...notes, lines: [...notes.lines, { id: lineId(notes.nextId), section, text: typed, author: "user" }], nextId: notes.nextId + 1 };
 }

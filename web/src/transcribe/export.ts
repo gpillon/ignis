@@ -41,12 +41,16 @@ function cueTime(ms: number, separator: "," | "."): string {
   return `${two(h)}:${two(m)}:${two(s)}${separator}${String(whole % 1_000).padStart(3, "0")}`;
 }
 
+/** The name an utterance of `t`'s speaker has now; `null` with no speaker. */
+export function speakerOf(t: Transcript): (u: Utterance) => string | null {
+  const names = new Map(t.speakers.map((s) => [s.id, s.name]));
+  return (u) => (u.speaker === null ? null : (names.get(u.speaker) ?? null));
+}
+
 /** The utterances worth writing, each with its speaker's name; `null` with no speakers. */
 function lines(t: Transcript): { u: Utterance; text: string; speaker: string | null }[] {
-  const names = new Map(t.speakers.map((s) => [s.id, s.name]));
-  return t.utterances
-    .map((u) => ({ u, text: u.text.trim(), speaker: u.speaker === null ? null : (names.get(u.speaker) ?? null) }))
-    .filter((line) => line.text !== "");
+  const speaker = speakerOf(t);
+  return t.utterances.map((u) => ({ u, text: u.text.trim(), speaker: speaker(u) })).filter((line) => line.text !== "");
 }
 
 /** "25 Oct 2026, 15:42": a live listening's wall-clock start. */

@@ -29,9 +29,15 @@ measured the three ways on public recordings of three kinds.
 
 ## Consequences
 
-- The thread is not stored. A reload, a kind change, Rewrite from scratch and
-  a prompt past the restart threshold start it again from a snapshot of the
-  notes, each line with its id, the user's lines marked as theirs.
+- The thread is not stored. A reload, a kind change, Rewrite from scratch, a
+  Stop or a failure, and a thread grown past the restart threshold beyond its
+  first request start it again from a snapshot of the notes, each line with
+  its id, the user's lines marked as theirs. The first request carries the
+  transcript up to the model's context less that threshold, so an hour-long
+  conversation's notes start from its first minute.
+- An update ends when an answer has no call, at a cap of rounds, or after two
+  rounds whose calls all changed nothing, refused calls included: the
+  finding's lecture looped on a refused rewrite until the cap otherwise.
 - The page, not the model, keeps the notes' guards: an id the model copies
   into a text is stripped, a duplicate or overlong line is refused, a call on
   the user's line is refused, and an update stops at a cap of rounds.

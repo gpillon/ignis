@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { EMPTY_CONTEXT } from "./context.ts";
-import { addContextImage } from "./contextImages.ts";
+import { addContextImage, withReading } from "./contextImages.ts";
+import { toMarkdown } from "./markdown.ts";
 import { noNotes, type Notes } from "./notes.ts";
 import { choosePdfOptions, lastPdfOptions, PDF_OPTIONS_KEY, type PdfOptions, pageRule, pdfHints, printDocument, reloadPdfOptions } from "./pdf.ts";
 import { addUtterance, createTranscript, editText, renameSpeaker, splitUtterance, type Transcript } from "./transcript.ts";
@@ -76,6 +77,17 @@ describe("the PDF's document, always", () => {
       .slice(1)
       .map((b) => (b.kind === "image" ? `image ${b.image} ${b.time} ${b.width}×${b.height}` : b.kind === "utterance" ? b.time : b.kind));
     expect(shown).toEqual(["image agenda 00:00 1280×720", "00:01", "00:04", "image budget 00:30 1280×720", "01:01", "~01:03", "image slide-late 01:10 1280×720"]);
+  });
+
+  it("prints under each picture read what was read in it, as the .md's line has it, and nothing under one not read yet", () => {
+    let t = addContextImage(addContextImage(call(), { image: "budget", atMs: 30_000, width: 800, height: 600 }, 0), { image: "agenda", atMs: 0, width: 800, height: 600 }, 0);
+    t = withReading(t, 1, { shows: "A slide titled Budget", topic: "Budget Q3", names: ["Anna Rossi"], terms: ["OKR"], readAt: 5 });
+    const images = printDocument(t, NONE).filter((b) => b.kind === "image");
+    expect(images.map((b) => [b.image, b.reading])).toEqual([
+      ["agenda", undefined],
+      ["budget", "A slide titled Budget. Topic: Budget Q3. Names: Anna Rossi. Terms: OKR."],
+    ]);
+    expect(toMarkdown(t)).toContain("\n[00:30] (image) A slide titled Budget. Topic: Budget Q3. Names: Anna Rossi. Terms: OKR.\n");
   });
 });
 

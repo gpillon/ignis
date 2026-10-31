@@ -1,11 +1,12 @@
 import type { ConversationRequest, Turn } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { ASSIST_SYSTEM, type AskDeps, askModel, CHARS_PER_TOKEN, Follower, settle, Watched } from "./assist.ts";
+import { afterCall, changesSince, editsSince, linesOf, type Told, toldOf } from "./changes.ts";
 import { shownOf, shownSince } from "./contextImages.ts";
 import { minutesClock } from "./export.ts";
 import { dueForUpdate, LIVE_GAP_MS, type NoteKind, type NoteLine, noNotes, type Notes, NOTES_MAX_TOKENS, NOTES_SETTINGS, RUNNING_NOTES, tidyNotes, type Written } from "./notes.ts";
 import { parseRecap, recapDue, recapRequest } from "./recap.ts";
-import { afterCall, applyCall, changesSince, editsSince, fromScratch, laterTurn, linesOf, notesState, restartAt, runningTask, runningTools, type Told, toldOf } from "./running.ts";
+import { applyCall, firstTurnContext, fromScratch, laterTurn, notesState, restartAt, runningTask, runningTools } from "./running.ts";
 import { taskInput } from "./taskContext.ts";
 import type { Transcript } from "./transcript.ts";
 
@@ -62,9 +63,18 @@ const IDLE: NotesWriterState = { writing: null, form: "running", text: "", faile
 
 /**
  * A Transcript's notes thread: the kind it keeps, its turns, what each utterance was told as, the notes' lines as it
- * knows them, the context images whose reading it told, and its last prompt.
+ * knows them, the context images whose reading it told, its last prompt and its first request's, which its growth
+ * counts from (`null` until that request is answered).
  */
-type Thread = { kind: NoteKind; turns: Turn[]; told: Map<number, Told>; lines: Map<string, NoteLine>; shown: Set<number>; promptTokens: number };
+type Thread = {
+  kind: NoteKind;
+  turns: Turn[];
+  told: Map<number, Told>;
+  lines: Map<string, NoteLine>;
+  shown: Set<number>;
+  promptTokens: number;
+  firstTokens: number | null;
+};
 
 /** The stream a Transcript's thread goes on, so the socket continues it. */
 const streamOf = (transcript: number) => `transcribe-notes-${transcript}`;
@@ -114,27 +124,35 @@ export class NotesWriter extends Watched<NotesWriterState> {
   private threadFor(t: Transcript, kind: NoteKind, notes: Notes, contextLimit: number | null, restart: boolean): { thread: Thread; fromMs: number | null } | null {
     const held = this.threads.get(t.id);
     this.threads.delete(t.id);
-    if (!restart && held && held.kind === kind && held.promptTokens <= restartAt(contextLimit)) {
+    if (!restart && held && held.kind === kind) {
       // What was said since the last turn, and what the user changed meanwhile: `t` against what the thread told.
       const { said, events } = changesSince(held.told, t);
       events.push(...editsSince(held.lines, notes));
       // The context images read meanwhile (#437), each a change at its moment.
       events.push(...shownSince(held.shown, t));
       const turn = laterTurn(said, events);
-      const told = toldOf(t, held.told);
-      const lines = linesOf(notes);
-      const shown = shownOf(t);
-      if (turn === "") {
-        this.threads.set(t.id, { ...held, told, lines, shown });
-        return null;
+      // The thread grows past its first request by the threshold at most, the turn it appends counted, then starts
+      // again: a first request that alone passed the threshold does not start it again at every update, and no request
+      // outgrows the model's context, which the first turn fills less the threshold.
+      const grown = held.promptTokens - (held.firstTokens ?? held.promptTokens) + Math.ceil(turn.length / CHARS_PER_TOKEN);
+      if (grown <= restartAt(contextLimit)) {
+        const told = toldOf(t, held.told);
+        const lines = linesOf(notes);
+        const shown = shownOf(t);
+        if (turn === "") {
+          this.threads.set(t.id, { ...held, told, lines, shown });
+          return null;
+        }
+        return { thread: { ...held, told, lines, shown, turns: [...held.turns, { role: "user", content: turn }] }, fromMs: notes.fromMs };
       }
-      return { thread: { ...held, told, lines, shown, turns: [...held.turns, { role: "user", content: turn }] }, fromMs: notes.fromMs };
     }
-    // A new thread: the transcript so far, from where its tail fits half the threshold, then the notes as they stand.
+    // A new thread: the transcript so far, from where its tail fits the model's context less the threshold, then the
+    // notes as they stand.
     const state = notesState(notes, kind);
     const reserve = NOTES_MAX_TOKENS + Math.ceil(state.length / CHARS_PER_TOKEN);
-    const { content, fromMs } = taskInput(t, Math.floor(restartAt(contextLimit) / 2), reserve, minutesClock);
-    return { thread: { kind, turns: [{ role: "user", content: `${content}\n${state}` }], told: toldOf(t), lines: linesOf(notes), shown: shownOf(t), promptTokens: 0 }, fromMs };
+    const { content, fromMs } = taskInput(t, firstTurnContext(contextLimit), reserve, minutesClock);
+    const turns: Turn[] = [{ role: "user", content: `${content}\n${state}` }];
+    return { thread: { kind, turns, told: toldOf(t), lines: linesOf(notes), shown: shownOf(t), promptTokens: 0, firstTokens: null }, fromMs };
   }
 
   private async update(t: Transcript, kind: NoteKind, contextLimit: number | null, scratch: boolean): Promise<void> {
@@ -170,7 +188,7 @@ export class NotesWriter extends Watched<NotesWriterState> {
       const request: ConversationRequest = { settings, turns: thread.turns, extras };
       const calls: ToolCall[] = [];
       const results: Turn[] = [];
-      let unchanged = 0;
+      let changed = false;
       let prompt: number | null = null;
       const asked = await askModel(request, abort.signal, this.deps, undefined, {
         streamId: streamOf(t.id),
@@ -184,14 +202,14 @@ export class NotesWriter extends Watched<NotesWriterState> {
           const applied = applyCall(before, kind, call);
           calls.push(call);
           results.push({ role: "tool", content: applied.result, toolCallId: call.id });
-          if (applied.outcome === "unchanged") unchanged++;
           if (applied.outcome !== "applied") return;
-          const changed = stamp(now(), started.fromMs);
-          working.notes = changed(applied.notes);
+          changed = true;
+          const stamped = stamp(now(), started.fromMs);
+          working.notes = stamped(applied.notes);
           thread = { ...thread, lines: afterCall(thread.lines, before, applied.notes) };
           this.deps.onNotes(t.id, (n) => {
             const there = applyCall(n ?? noNotes(kind), kind, call);
-            return there.outcome === "applied" ? changed(there.notes) : there.notes;
+            return there.outcome === "applied" ? stamped(there.notes) : there.notes;
           });
         },
       });
@@ -204,10 +222,13 @@ export class NotesWriter extends Watched<NotesWriterState> {
       }
       const answer: Turn = { role: "assistant", content: asked.text, ...(calls.length > 0 ? { toolCalls: calls } : {}) };
       const turns = [...thread.turns, answer, ...results];
-      thread = { ...thread, turns, promptTokens: prompt ?? Math.ceil((settings.systemPrompt.length + turns.reduce((n, turn) => n + turn.content.length, 0)) / CHARS_PER_TOKEN) };
+      const promptTokens = prompt ?? Math.ceil((settings.systemPrompt.length + turns.reduce((n, turn) => n + turn.content.length, 0)) / CHARS_PER_TOKEN);
+      thread = { ...thread, turns, promptTokens, firstTokens: thread.firstTokens ?? promptTokens };
       if (calls.length === 0) break;
-      // Rounds that change nothing, in a row, end the update; past the cap, what is left goes to the next one.
-      idle = unchanged === calls.length ? idle + 1 : 0;
+      // Rounds that change nothing, in a row, end the update; past the cap, what is left goes to the next one. A round
+      // changes nothing when none of its calls did, unchanged or refused alike: counting only the unchanged, the
+      // replay's model resent a refused rewrite until the round cap (docs/findings/2026-10-31-running-notes-recap-and-full-rewrite.md).
+      idle = changed ? 0 : idle + 1;
       if (idle >= RUNNING_NOTES.idleRounds) break;
     }
     this.abort = null;

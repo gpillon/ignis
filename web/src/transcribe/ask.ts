@@ -35,6 +35,9 @@ export const ASK_SETTINGS: Omit<Settings, "systemPrompt"> = {
  */
 export type Answered = { id: number; question: string; answer: string; at: number; untilMs?: number };
 
+/** `t`'s answers as the exports carry them: in the order asked, each with an answer. */
+export const answersKept = (t: Transcript): Answered[] => [...(t.asked ?? [])].sort((x, y) => x.id - y.id).filter((a) => a.answer.trim() !== "");
+
 export function askRequest(t: Transcript, question: string, contextLimit: number | null): ConversationRequest {
   const { content } = taskInput(t, contextLimit, ASK_MAX_TOKENS);
   return assistRequest(ASK_SETTINGS, ASK_TASK, `${content}\nQuestion: ${question.trim()}`);
