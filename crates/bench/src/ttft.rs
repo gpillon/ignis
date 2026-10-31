@@ -397,26 +397,57 @@ pub fn generate_run_prompts<const N: usize>(
     corpus: Option<&[u32]>,
     sets: [PromptSetSpec<'_>; N],
 ) -> Result<[Result<PromptSet, String>; N], String> {
-    let total = sets.iter().map(|set| set.count).sum();
-    let mut first = 0;
-    let mut earlier: Vec<Vec<u32>> = Vec::with_capacity(total);
-    let generated = sets.map(|set| {
-        let numbering = Numbering { first, count: set.count, total };
-        first += set.count;
+    let mut run = Run::of(sets.iter().map(|set| set.count).sum());
+    let generated = sets.map(|set| run.generate(template, corpus, &set));
+    let proven: Vec<(&str, &[Vec<u32>])> = sets
+        .iter()
+        .zip(&generated)
+        .filter_map(|(spec, set)| Some((spec.label, set.as_ref().ok()?.tokens.as_slice())))
+        .collect();
+    prove_run_divergence(&proven, template.encode_user_message("")?.len())?;
+    Ok(generated)
+}
+
+/// A run's prompts as its sets are generated, in the order they are sent
+/// (GitHub #426): the number its next prompt takes, and every prompt cut
+/// so far, whose content a corpus window must not start with.
+struct Run {
+    /// The prompts the run cuts its corpus windows for.
+    total: usize,
+    next: usize,
+    earlier: Vec<Vec<u32>>,
+}
+
+impl Run {
+    fn of(total: usize) -> Self {
+        Self { total, next: 0, earlier: Vec::with_capacity(total) }
+    }
+
+    /// The numbering of the run's next `count` prompts.
+    fn take(&mut self, count: usize) -> Numbering {
+        let numbering = Numbering { first: self.next, count, total: self.total };
+        self.next += count;
+        numbering
+    }
+
+    /// Generate `set` as the run's next prompts, cut from `corpus` when one
+    /// is given and grown by the filler generator otherwise.
+    fn generate(
+        &mut self,
+        template: &dyn PromptTemplate,
+        corpus: Option<&[u32]>,
+        set: &PromptSetSpec<'_>,
+    ) -> Result<PromptSet, String> {
+        let numbering = self.take(set.count);
         let generated = match corpus {
-            Some(ids) => cut_corpus_prompts(template, ids, set.target_tokens, set.suffix, numbering, &earlier),
+            Some(ids) => cut_corpus_prompts(template, ids, set.target_tokens, set.suffix, numbering, &self.earlier),
             None => generate_numbered_prompts(template, set.target_tokens, set.suffix, numbering),
         };
         if let Ok(set) = &generated {
-            earlier.extend(set.tokens.iter().cloned());
+            self.earlier.extend(set.tokens.iter().cloned());
         }
         generated
-    });
-    let overhead = template.encode_user_message("")?.len();
-    let proven: Vec<(&str, &PromptSet)> =
-        sets.iter().zip(&generated).filter_map(|(spec, set)| Some((spec.label, set.as_ref().ok()?))).collect();
-    prove_run_divergence(&proven, overhead)?;
-    Ok(generated)
+    }
 }
 
 /// A KV page in tokens (GLOSSARY: KV page), 64 on both engines: prompt
@@ -425,16 +456,16 @@ pub fn generate_run_prompts<const N: usize>(
 const KV_PAGE_TOKENS: usize = 64;
 
 /// The divergence proof across a run's prompt sets (GitHub #426), each
-/// named by its label: no two prompts of the run share more leading tokens
-/// than the chat template's own `overhead`, nor a whole [`KV_PAGE_TOKENS`]
-/// page of them, so prompt reuse has nothing of one to serve another from.
-/// A set's own proof ([`prove_divergence`]) holds within it, and cannot see
-/// the others.
-fn prove_run_divergence(sets: &[(&str, &PromptSet)], overhead: usize) -> Result<(), String> {
+/// set's token ids named by its label: no two prompts of the run share more
+/// leading tokens than the chat template's own `overhead`, nor a whole
+/// [`KV_PAGE_TOKENS`] page of them, so prompt reuse has nothing of one to
+/// serve another from. A set's own proof ([`prove_divergence`]) holds within
+/// it, and cannot see the others.
+fn prove_run_divergence(sets: &[(&str, &[Vec<u32>])], overhead: usize) -> Result<(), String> {
     let prompts: Vec<(String, &[u32])> = sets
         .iter()
-        .flat_map(|(label, set)| {
-            set.tokens.iter().enumerate().map(move |(index, ids)| (format!("{label} prompt {index}"), ids.as_slice()))
+        .flat_map(|(label, tokens)| {
+            tokens.iter().enumerate().map(move |(index, ids)| (format!("{label} prompt {index}"), ids.as_slice()))
         })
         .collect();
     for (i, (a, a_ids)) in prompts.iter().enumerate() {
@@ -459,7 +490,8 @@ fn prove_run_divergence(sets: &[(&str, &PromptSet)], overhead: usize) -> Result<
 }
 
 /// Where one set's prompts sit among the prompts of its run: the run's
-/// prompts `first..first + count` of `total`.
+/// prompts `first..first + count`, and `total`, the prompts its corpus
+/// windows are spread over.
 #[derive(Debug, Clone, Copy)]
 struct Numbering {
     first: usize,
@@ -674,6 +706,9 @@ pub struct ImagePromptSet {
     pub images: Vec<Vec<u8>>,
     /// The post-template length every prompt shares, vision tokens included.
     pub prompt_tokens: u32,
+    /// The post-template token ids of each prompt, vision tokens included,
+    /// same order.
+    pub tokens: Vec<Vec<u32>>,
 }
 
 /// Generate `count` multimodal prompts over `png` asking `question` (the
@@ -685,6 +720,20 @@ pub fn generate_image_cell_prompts(
     question: &str,
     count: usize,
 ) -> Result<ImagePromptSet, String> {
+    generate_numbered_image_prompts(template, png, question, Numbering::alone(count))
+}
+
+/// [`generate_image_cell_prompts`] for a set numbered as `numbering` says
+/// (GitHub #443): each text part starts with its run number's nonce. The
+/// image has only to differ from the cell's other images, since no other
+/// cell sends one.
+fn generate_numbered_image_prompts(
+    template: &dyn PromptTemplate,
+    png: &[u8],
+    question: &str,
+    numbering: Numbering,
+) -> Result<ImagePromptSet, String> {
+    let count = numbering.count;
     if count == 0 {
         return Err("a cell needs at least one prompt".to_string());
     }
@@ -692,7 +741,7 @@ pub fn generate_image_cell_prompts(
     let mut images = Vec::with_capacity(count);
     let mut tokens: Vec<Vec<u32>> = Vec::with_capacity(count);
     for index in 0..count {
-        let prompt = format!("{} {question}", nonce(index));
+        let prompt = format!("{} {question}", nonce(numbering.first + index));
         let image = sample_image(png, index)?;
         let ids = template.encode_user_message_with_image(&prompt, &image)?;
         if let Some(first) = tokens.first() {
@@ -711,7 +760,7 @@ pub fn generate_image_cell_prompts(
     }
     let overhead = template.encode_user_message("")?.len();
     prove_divergence(&tokens, overhead)?;
-    Ok(ImagePromptSet { prompts, images, prompt_tokens: tokens[0].len() as u32 })
+    Ok(ImagePromptSet { prompts, images, prompt_tokens: tokens[0].len() as u32, tokens })
 }
 
 // ── corpus-cut prompts of an exact length (the `--corpus` path) ──────────
@@ -1158,7 +1207,7 @@ pub struct TtftConfig {
     /// A pre-tokenized prompt bank (whitespace-separated ids) to cut the
     /// prompts from, when set (the `--corpus` flag): detokenized rotated
     /// windows instead of the filler generator's word growth. Absent, the
-    /// filler generator is used, byte for byte the old behavior.
+    /// filler generator is used.
     pub corpus: Option<PathBuf>,
     /// The multimodal cell (the `--image` flag, GitHub #181), measured after
     /// the text cells when set.
@@ -1255,6 +1304,19 @@ pub fn measure_image_cell(
     spec: &ImageCellSpec,
     max_tokens: u32,
 ) -> Cell {
+    measure_image_cell_with(ep, spec, max_tokens, || {
+        generate_image_cell_prompts(template, &spec.png, &spec.question, spec.samples + 1)
+    })
+}
+
+/// [`measure_image_cell`] over a prompt set generated however the caller
+/// says.
+fn measure_image_cell_with(
+    ep: &dyn Endpoint,
+    spec: &ImageCellSpec,
+    max_tokens: u32,
+    prompts: impl FnOnce() -> Result<ImagePromptSet, String>,
+) -> Cell {
     let identity = match ImageIdentity::of(&spec.png, &spec.question) {
         Ok(identity) => identity,
         Err(err) => return failed_cell(0, None, err),
@@ -1262,7 +1324,7 @@ pub fn measure_image_cell(
     if spec.samples == 0 {
         return failed_cell(0, Some(identity), "a cell needs at least one sample".to_string());
     }
-    match generate_image_cell_prompts(template, &spec.png, &spec.question, spec.samples + 1) {
+    match prompts() {
         Ok(set) => measure_prompts(
             ep,
             set.prompt_tokens,
@@ -1376,7 +1438,61 @@ pub(crate) fn coldness_failure(computed: Option<u32>, prompt_tokens: u32) -> Opt
     }
 }
 
+/// The prompts one `ttft` run sends, a set per cell in the order the cells
+/// are measured, generated together before the first is sent (GitHub #443)
+/// and numbered across the run as [`generate_run_prompts`] numbers a `g3`
+/// run's: no cell's prompt starts with another cell's content, so an engine
+/// with prompt reuse has nothing an earlier cell left behind to serve a
+/// later cell's sample from, and a run whose prompts would share more is
+/// refused before it starts. The image cell's prompts come after the text
+/// cells'. A set that cannot be generated fails its own cell.
+struct CellPrompts {
+    text: Vec<Result<PromptSet, String>>,
+    image: Option<Result<ImagePromptSet, String>>,
+}
+
+impl CellPrompts {
+    /// The prompts of a run measured as `cfg` says, the text cells' cut from
+    /// `corpus` when one is given and grown by the filler generator
+    /// otherwise, or why the run cannot start.
+    fn generate(template: &dyn PromptTemplate, corpus: Option<&[u32]>, cfg: &TtftConfig) -> Result<Self, String> {
+        let mut run = Run::of(cfg.cells.iter().map(|cell| cell.samples + 1).sum());
+        let labels: Vec<String> = cfg.cells.iter().map(|cell| format!("{}-token cell", cell.prompt_tokens)).collect();
+        let specs: Vec<PromptSetSpec> = cfg
+            .cells
+            .iter()
+            .zip(&labels)
+            .map(|(cell, label)| PromptSetSpec {
+                label,
+                count: cell.samples + 1,
+                target_tokens: cell.prompt_tokens as usize,
+                suffix: "",
+            })
+            .collect();
+        let text: Vec<Result<PromptSet, String>> = specs.iter().map(|spec| run.generate(template, corpus, spec)).collect();
+        let image = cfg.image.as_ref().map(|spec| {
+            generate_numbered_image_prompts(template, &spec.png, &spec.question, run.take(spec.samples + 1))
+        });
+        let mut proven: Vec<(&str, &[Vec<u32>])> = specs
+            .iter()
+            .zip(&text)
+            .filter_map(|(spec, set)| Some((spec.label, set.as_ref().ok()?.tokens.as_slice())))
+            .collect();
+        if let Some(Ok(set)) = &image {
+            proven.push(("image cell", &set.tokens));
+        }
+        prove_run_divergence(&proven, template.encode_user_message("")?.len())?;
+        Ok(Self { text, image })
+    }
+}
+
 /// Measure every cell in `cfg` against one endpoint and return the record.
+///
+/// The cells' prompts are the run's (`CellPrompts`, GitHub #443), generated
+/// before the first request is sent: cut from a configured corpus (the
+/// `--corpus` path), loaded once, and grown by the filler generator
+/// without one. A corpus that cannot be read, or a run its prompts refuse,
+/// fails every cell with that error rather than measuring some of them.
 pub fn measure(
     ep: &dyn Endpoint,
     template: &dyn PromptTemplate,
@@ -1384,24 +1500,23 @@ pub fn measure(
     endpoint: String,
     cfg: &TtftConfig,
 ) -> Record {
-    // A configured corpus is loaded once up front and every cell's prompts
-    // are cut from it (the `--corpus` path); without one, the filler
-    // generator grows them (the old behavior, byte for byte). A corpus
-    // file that cannot be read fails every cell with that error rather
-    // than silently measuring with different prompts.
-    let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path));
-    let mut cells: Vec<Cell> = cfg
-        .cells
-        .iter()
-        .map(|spec| match &corpus {
-            Some(Ok(ids)) => measure_cell_from_corpus(ep, template, spec, cfg.max_tokens, ids),
-            Some(Err(error)) => failed_cell(spec.prompt_tokens, None, error.clone()),
-            None => measure_cell(ep, template, spec, cfg.max_tokens),
-        })
-        .collect();
-    if let Some(spec) = &cfg.image {
-        cells.push(measure_image_cell(ep, template, spec, cfg.max_tokens));
-    }
+    let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path)).transpose();
+    let cells = match corpus.and_then(|bank| CellPrompts::generate(template, bank.as_deref(), cfg)) {
+        Err(error) => {
+            let image = cfg.image.as_ref().map(|spec| {
+                failed_cell(0, ImageIdentity::of(&spec.png, &spec.question).ok(), error.clone())
+            });
+            cfg.cells.iter().map(|spec| failed_cell(spec.prompt_tokens, None, error.clone())).chain(image).collect()
+        }
+        Ok(CellPrompts { text, image }) => {
+            let mut cells: Vec<Cell> =
+                cfg.cells.iter().zip(text).map(|(spec, set)| measure_cell_with(ep, spec, cfg.max_tokens, || set)).collect();
+            if let (Some(spec), Some(set)) = (&cfg.image, image) {
+                cells.push(measure_image_cell_with(ep, spec, cfg.max_tokens, || set));
+            }
+            cells
+        }
+    };
     Record {
         session: cfg.session.clone(),
         label: cfg.label.clone(),
@@ -1418,6 +1533,7 @@ pub fn measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{PromptReuse, Steady, CHAT_FOOTER, CHAT_HEADER};
 
     /// A mock template: a fixed header and footer around one token per
     /// whitespace-separated word, each word hashed to an id. Enough to
@@ -2062,5 +2178,152 @@ mod tests {
         assert!(load_corpus(&path).unwrap_err().contains("not a u32"));
         assert!(load_corpus(&dir.join("missing.ids")).unwrap_err().contains("read the corpus"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── a whole run under prompt reuse (GitHub #443) ───────────────────────
+
+    /// A `ttft` run of `cells`, each of `samples` samples, cut from `corpus`
+    /// when one is given.
+    fn run_of(cells: &[u32], samples: usize, corpus: Option<PathBuf>) -> TtftConfig {
+        TtftConfig {
+            cells: cells.iter().map(|&prompt_tokens| CellSpec { prompt_tokens, samples }).collect(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            label: "ignis".into(),
+            profile: "prompt reuse on".into(),
+            artifact: "mock.ninfer".into(),
+            session: "S-reuse".into(),
+            corpus,
+            image: None,
+        }
+    }
+
+    /// The G2 gate run's cells, 8,192 and 32,768 tokens, five samples each.
+    fn g2_run(corpus: Option<PathBuf>) -> TtftConfig {
+        run_of(&[8_192, 32_768], 5, corpus)
+    }
+
+    /// `bank` as a `--corpus` file named after `name` and this process.
+    fn corpus_file(name: &str, bank: &[u32]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("ignis-bench-ttft-{name}-{}.ids", std::process::id()));
+        let text = bank.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+        std::fs::write(&path, text).expect("write the bank");
+        path
+    }
+
+    fn run(ep: &dyn Endpoint, template: &dyn PromptTemplate, cfg: &TtftConfig) -> Record {
+        measure(ep, template, "mock-engine".into(), "http://mock".into(), cfg)
+    }
+
+    /// Every sample of `record` that is void, with its reason.
+    fn voided(record: &Record) -> Vec<String> {
+        record
+            .cells
+            .iter()
+            .flat_map(|cell| {
+                cell.void_samples().into_iter().map(move |sample| {
+                    let reason = sample.void_reason.as_deref().unwrap_or("");
+                    format!("{}-token sample {}: {reason}", cell.prompt_tokens, sample.index)
+                })
+            })
+            .collect()
+    }
+
+    fn errors(record: &Record) -> Vec<&str> {
+        record.cells.iter().filter_map(|cell| cell.error.as_deref()).collect()
+    }
+
+    /// GitHub #443: the G2 run's two cells under prompt reuse come back
+    /// cold, the 32,768-token cell's prompts sharing no more than the chat
+    /// template's header with the 8,192-token cell's, where they started with
+    /// the same nonce and seed and so the same 8,000-odd tokens.
+    #[test]
+    fn a_whole_run_stays_cold_under_prompt_reuse() {
+        let template = MockTemplate { header: CHAT_HEADER, footer: CHAT_FOOTER };
+        let ep = PromptReuse::new(Steady, &template);
+        let record = run(&ep, &template, &g2_run(None));
+
+        assert_eq!(errors(&record), Vec::<&str>::new());
+        assert_eq!(voided(&record), Vec::<String>::new());
+        assert_eq!(ep.sharing_more_than(CHAT_HEADER), Vec::new(), "no two prompts share content");
+        // Not a vacuous mock: the run again is served from what it left.
+        let again = run(&ep, &template, &g2_run(None));
+        assert!(again.cells.iter().all(|cell| !cell.all_cold()), "{}", again.render());
+    }
+
+    /// GitHub #443: the same run cut from a bank tiled from a shorter one, as
+    /// the reference's is, whose period puts each 32,768-token prompt's window
+    /// where the 8,192-token prompt of the same number starts: the corpus path
+    /// cuts the later one a window of its own, and the run comes back cold.
+    #[test]
+    fn a_whole_run_cut_from_a_corpus_stays_cold_under_prompt_reuse() {
+        let template = CorpusMock { header: CHAT_HEADER, footer: CHAT_FOOTER, factor: 1, pad: 0 };
+        // Twelve prompts 5,461 ids apart; the period is six of them.
+        let path = corpus_file("run", &self_tiled_bank(65_536, 6 * 5_461));
+        let ep = PromptReuse::new(Steady, &template);
+        let record = run(&ep, &template, &g2_run(Some(path.clone())));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(errors(&record), Vec::<&str>::new());
+        assert_eq!(voided(&record), Vec::<String>::new());
+        assert_eq!(ep.sharing_more_than(CHAT_HEADER), Vec::new(), "no two prompts share content");
+    }
+
+    /// GitHub #443: a chat template whose own tokens fill a whole 64-token KV
+    /// page puts it at the head of every prompt, where prompt reuse serves it
+    /// to every request after the first; the run refuses to start, every cell
+    /// naming two prompts, and sends nothing.
+    #[test]
+    fn a_run_whose_prompts_share_a_whole_kv_page_refuses_to_start() {
+        let template = MockTemplate { header: 64, footer: 0 };
+        let ep = PromptReuse::new(Steady, &template);
+        let record = run(&ep, &template, &run_of(&[96, 128], 2, None));
+
+        assert_eq!(record.cells.len(), 2);
+        for error in errors(&record) {
+            assert!(error.contains("96-token cell prompt 0") && error.contains("KV page"), "{error}");
+        }
+        assert_eq!(errors(&record).len(), 2, "every cell refused");
+        assert_eq!(ep.admitted().len(), 0, "nothing is sent");
+    }
+
+    /// GitHub #443: a run of one cell sends the prompts that cell generates
+    /// alone, on both paths, as it did before its cells were numbered across
+    /// the run.
+    #[test]
+    fn a_single_cell_run_sends_the_cells_own_prompts() {
+        let template = MockTemplate::new();
+        let ep = PromptReuse::new(Steady, &template);
+        run(&ep, &template, &run_of(&[256], 5, None));
+        assert_eq!(ep.admitted(), generate_cell_prompts(&template, 256, 6).expect("prompts").tokens);
+
+        let template = CorpusMock::exact();
+        let bank = corpus_bank();
+        let path = corpus_file("one-cell", &bank);
+        let ep = PromptReuse::new(Steady, &template);
+        run(&ep, &template, &run_of(&[64], 5, Some(path.clone())));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(ep.admitted(), generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect("cut").tokens);
+    }
+
+    /// GitHub #443: a run sends the same prompts every time, each on its
+    /// cell's claimed length, on both paths.
+    #[test]
+    fn a_runs_prompts_are_the_same_every_time_and_land_on_their_cells_length() {
+        let cells = [256, 1_024, 512];
+        let lengths: Vec<usize> = cells.iter().flat_map(|&cell| [cell as usize; 6]).collect();
+        let filler = MockTemplate::new();
+        let corpus = CorpusMock::exact();
+        let path = corpus_file("twice", &corpus_bank());
+        for (template, bank) in [(&filler as &dyn PromptTemplate, None), (&corpus, Some(path.clone()))] {
+            let sent = || {
+                let ep = PromptReuse::new(Steady, template);
+                run(&ep, template, &run_of(&cells, 5, bank.clone()));
+                ep.admitted()
+            };
+            let (first, second) = (sent(), sent());
+            assert_eq!(first, second, "the same prompts, byte for byte");
+            assert_eq!(first.iter().map(Vec::len).collect::<Vec<_>>(), lengths);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

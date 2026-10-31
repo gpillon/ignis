@@ -1,7 +1,8 @@
 //! Test doubles the measurement modules' tests share: an engine with prompt
-//! reuse (GitHub #426), which their whole runs are measured against.
+//! reuse (GitHub #426), which their whole runs are measured against, and a
+//! plain endpoint for it to wrap.
 
-use crate::client::{Endpoint, Outcome, Request};
+use crate::client::{Endpoint, FinishReason, Outcome, Request};
 use crate::ttft::PromptTemplate;
 
 /// The artifact's chat template in shape: `<|im_start|>user\n` before the
@@ -48,6 +49,28 @@ impl<'t, E: Endpoint> PromptReuse<'t, E> {
         Self { inner, template, admitted: std::sync::Mutex::new(Vec::new()) }
     }
 
+    /// Every two prompts it admitted that share more than `header` leading
+    /// tokens, as their positions in admission order and the length of the
+    /// head they share.
+    pub(crate) fn sharing_more_than(&self, header: usize) -> Vec<(usize, usize, usize)> {
+        let admitted = self.admitted.lock().unwrap();
+        let mut pairs = Vec::new();
+        for (i, a) in admitted.iter().enumerate() {
+            for (j, b) in admitted.iter().enumerate().skip(i + 1) {
+                let shared = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+                if shared > header {
+                    pairs.push((i, j, shared));
+                }
+            }
+        }
+        pairs
+    }
+
+    /// The prompts it admitted, as the template encodes them, in order.
+    pub(crate) fn admitted(&self) -> Vec<Vec<u32>> {
+        self.admitted.lock().unwrap().clone()
+    }
+
     /// Admit `req`: the prompt tokens it counts and the head it claims.
     fn admit(&self, req: &Request) -> Result<(u32, u32), String> {
         let tokens = self.template.encode_user_message(&req.prompt)?;
@@ -90,5 +113,29 @@ impl<E: Endpoint> Endpoint for PromptReuse<'_, E> {
         self.inner
             .complete_observed_while(req, observer, suppress_eos)
             .map(|outcome| Self::report(outcome, usage))
+    }
+}
+
+/// An endpoint that answers every request the same way: its first token
+/// at 50 ms, then the whole `max_tokens` budget 5 ms apart, and no usage
+/// of its own, for [`PromptReuse`] to report.
+pub(crate) struct Steady;
+
+impl Endpoint for Steady {
+    fn complete(&self, req: &Request) -> Result<Outcome, String> {
+        let ttft_ms = 50.0_f64;
+        let token_times_ms: Vec<f64> = (0..req.max_tokens).map(|i| ttft_ms + i as f64 * 5.0).collect();
+        Ok(Outcome {
+            ttft_ms,
+            total_ms: token_times_ms.last().copied().unwrap_or(ttft_ms),
+            n_tokens: req.max_tokens,
+            output: String::new(),
+            reasoning_output: String::new(),
+            reasoning_tokens: Some(0),
+            prompt_tokens: None,
+            cached_prompt_tokens: None,
+            token_times_ms,
+            finish_reason: Some(FinishReason::Engine("length".into())),
+        })
     }
 }

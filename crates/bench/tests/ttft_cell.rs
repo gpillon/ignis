@@ -257,6 +257,26 @@ fn an_image_cell_measures_cold_samples_each_sending_its_own_image() {
     assert_eq!(Record::from_json(&record.to_json().unwrap()).unwrap(), record);
 }
 
+/// GitHub #443: a run of a text cell and the image cell numbers the image
+/// cell's prompts after the text cell's, so no prompt of one starts with the
+/// nonce of a prompt of the other, where both started from nonce 0.
+#[test]
+fn the_image_cell_takes_the_run_numbers_after_the_text_cells() {
+    let engine = MockEngine::start();
+    let cfg = TtftConfig {
+        image: Some(ImageCellSpec { png: screenshot(), question: "What does this show?".into(), samples: 3 }),
+        ..config("S-image-run", "ignis", &[40], 3)
+    };
+    let record = measure(&engine, &cfg);
+    assert!(record.cells.iter().all(|cell| cell.all_cold()), "{}", record.render());
+
+    let prompts = engine.state.prompts();
+    assert_eq!(prompts.len(), 8, "four text prompts, then four image prompts");
+    let first = |p: &String| p.split_whitespace().next().unwrap_or("").to_string();
+    let words: std::collections::HashSet<String> = prompts.iter().map(first).collect();
+    assert_eq!(words.len(), 8, "every prompt starts with its own word: {prompts:?}");
+}
+
 #[test]
 fn an_image_cell_whose_image_the_engine_counts_differently_is_void() {
     let engine = MockEngine::start();
