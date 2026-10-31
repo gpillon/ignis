@@ -125,15 +125,19 @@ export function createMetricsSim(start = Date.now()) {
   /** The KV-disk tier: committed files (retained images), live spills by source, and refused operations. */
   const disk = { files: 0, spills: { device: 0, kv_ram: 0 }, failures: { write: 0, read: 0 } };
   const skips: Record<string, number> = { publish_skipped_no_slot: 0, capture_skipped_no_slot: 0, capture_skipped_no_page: 0 };
-  /** The slots holding an image, and how many of those were spilled to KV-RAM. */
-  const slots = { inUse: 0, spilled: 0 };
+  /** The slots holding an image, and the images of each kind spilled to KV-RAM. */
+  const slots = { inUse: 0, spilled: { checkpoint: 0, prefix: 0 } };
+  const spilledBlobs = () => slots.spilled.checkpoint + slots.spilled.prefix;
 
   /**
    * One scheduled request's turn with retained state: it looks a checkpoint
-   * and a prefix up, then tries to leave its own behind. A load whose slots are all held
-   * cannot, which is the skip counter's whole point.
+   * and a prefix up, resumes from one of them at most, then tries to leave its
+   * own behind. A load whose slots are all held cannot, which is the skip
+   * counter's whole point.
    */
   function retainedTurn() {
+    // The scheduler claims a checkpoint or a prefix, never both.
+    let resumed = true;
     const roll = Math.random();
     if (roll < 0.3) {
       bump("hits", "device", "checkpoint");
@@ -144,30 +148,43 @@ export function createMetricsSim(start = Date.now()) {
       if (Math.random() < 0.03) {
         disk.failures.read++;
         bump("misses", "disk", "checkpoint");
+        resumed = false;
       } else {
         bump("hits", "disk", "checkpoint");
         bump("restores", "disk", "checkpoint");
         bump("reusedTokens", "disk", "checkpoint", 400 + Math.floor(Math.random() * 3_000));
       }
-    } else if (roll < 0.4 && slots.spilled > 0) {
+    } else if (roll < 0.4 && slots.spilled.checkpoint > 0) {
       bump("hits", "kv_ram", "checkpoint");
       bump("restores", "kv_ram", "checkpoint");
       bump("reusedTokens", "kv_ram", "checkpoint", 400 + Math.floor(Math.random() * 3_000));
-      slots.spilled--;
+      slots.spilled.checkpoint--;
     } else {
+      resumed = false;
       bump("misses", "device", "checkpoint");
-      if (slots.spilled > 0) bump("misses", "kv_ram", "checkpoint");
+      if (spilledBlobs() > 0) bump("misses", "kv_ram", "checkpoint");
     }
-    // The prefix walk beside the lookup (#222): a retained block on the device
-    // is a hit there, and a tier holding none is a miss. No prefix lives on the disk.
-    if (slots.inUse > 0 && Math.random() < 0.4) bump("hits", "device", "prefix");
-    else bump("misses", "device", "prefix");
-    if (slots.spilled === 0) bump("misses", "kv_ram", "prefix");
+    // The prefix walk beside the lookup (#222): a tier holding no retained
+    // block is a miss, and one holding a block it does not resume from is
+    // neither. No prefix lives on the disk.
+    const onDevice = slots.inUse > 0 && Math.random() < 0.4;
+    const inKvRam = slots.spilled.prefix > 0 && Math.random() < 0.4;
+    if (!onDevice) bump("misses", "device", "prefix");
+    if (!inKvRam) bump("misses", "kv_ram", "prefix");
+    if (!resumed && onDevice) {
+      bump("hits", "device", "prefix");
+      bump("reusedTokens", "device", "prefix", 200 + Math.floor(Math.random() * 1_500));
+    } else if (!resumed && inKvRam) {
+      // Brought back to the device: a hit and a restore in KV-RAM.
+      bump("hits", "kv_ram", "prefix");
+      bump("restores", "kv_ram", "prefix");
+      bump("reusedTokens", "kv_ram", "prefix", 200 + Math.floor(Math.random() * 1_500));
+      slots.spilled.prefix--;
+    }
     if (Math.random() < 0.25) {
       // A shared prefix published for the siblings behind it.
       if (slots.inUse < RETAINED_SLOTS) {
         slots.inUse++;
-        bump("reusedTokens", "device", "prefix", 200 + Math.floor(Math.random() * 1_500));
       } else {
         skips.publish_skipped_no_slot++;
       }
@@ -182,9 +199,12 @@ export function createMetricsSim(start = Date.now()) {
     while (slots.inUse >= RETAINED_SLOTS && Math.random() < 0.4) {
       const kind = Math.random() < 0.6 ? "checkpoint" : "prefix";
       // An image either moves down a tier or is given up; it is never both.
-      if (slots.spilled * RETAINED_BLOB_BYTES + RETAINED_BLOB_BYTES <= KV_RAM_ARENA_BYTES) {
+      if (spilledBlobs() * RETAINED_BLOB_BYTES + RETAINED_BLOB_BYTES <= KV_RAM_ARENA_BYTES) {
         bump("spills", "kv_ram", kind);
-        slots.spilled++;
+        slots.spilled[kind]++;
+      } else if (kind === "prefix") {
+        // Nothing demotes a prefix to the disk: KV-RAM full, it is given up.
+        bump("discards", "device", kind);
       } else if (Math.random() < 0.01) {
         // The write is refused (margin or IO error): the image stays where it was, so it is given up.
         disk.failures.write++;
@@ -329,7 +349,7 @@ export function createMetricsSim(start = Date.now()) {
         out.push(`${name} ${value}`);
       }
       declare("ignis_kv_ram_arena_bytes", "gauge", "The pinned host KV-RAM arena: what it holds, and what is used of it.");
-      out.push(`ignis_kv_ram_arena_bytes{state="capacity"} ${KV_RAM_ARENA_BYTES}`, `ignis_kv_ram_arena_bytes{state="used"} ${slots.spilled * RETAINED_BLOB_BYTES}`);
+      out.push(`ignis_kv_ram_arena_bytes{state="capacity"} ${KV_RAM_ARENA_BYTES}`, `ignis_kv_ram_arena_bytes{state="used"} ${spilledBlobs() * RETAINED_BLOB_BYTES}`);
       declare("ignis_kv_disk_bytes", "gauge", "The KV-disk tier: its effective budget, and the bytes the committed files hold.");
       out.push(`ignis_kv_disk_bytes{state="capacity"} ${KV_DISK_BYTES}`, `ignis_kv_disk_bytes{state="used"} ${disk.files * RETAINED_BLOB_BYTES}`);
       declare("ignis_kv_disk_spills_total", "counter", "Live sequences written into the disk tier, by where they came from.");
