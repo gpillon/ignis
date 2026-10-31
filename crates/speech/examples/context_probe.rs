@@ -14,14 +14,17 @@
 //! with `--batch`; `--max-seconds` keeps the shorter items, where copies fall.
 //!
 //! `--rescore ROWS` runs no model: it applies the guard (`copies_context`) of this build to the
-//! rows' text, with `speech.context_copy_words` and with `speech.context_copy_edits` at 0 and
-//! at their defaults, and prints what each empties per context.
+//! rows' text, at `speech.context_copy_words`' default and `speech.context_copy_edits` at each
+//! of 0 to 3, and prints what each empties per context, and every row some edits empty that the
+//! exact rule keeps (`--list`: every row emptied). With `--control a,b` it applies those contexts
+//! instead to the rows' utterances, an item's text counted once, less the copies of the contexts
+//! they were recorded under: a same-language control of what each setting takes of real speech.
 //!
 //! usage: context_probe DECODER ENCODER --threads N --contexts CTX.json [--only a,b] --out ROWS.jsonl
 //!                      (--wav FILE [--rttm FILE] [--silence MS] | --dir DIR) [--batch] [--max-seconds S]
-//!        context_probe --rescore ROWS.jsonl... --contexts CTX.json
+//!        context_probe --rescore ROWS.jsonl... --contexts CTX.json [--control a,b] [--list]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 
 use ignis_speech::text::{context_of, copies_context};
@@ -141,26 +144,57 @@ fn rows(paths: &[String]) -> Vec<Value> {
     paths.iter().flat_map(|p| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{p}: {e}")).lines().map(|l| serde_json::from_str(l).unwrap()).collect::<Vec<Value>>()).collect()
 }
 
-/// What the guard of this build empties of recorded rows: the exact rule, then the defaults.
-fn rescore(paths: &[String], contexts: &serde_json::Map<String, Value>) {
-    let d = ContextCopy::DEFAULT;
-    let mut tally: BTreeMap<String, [usize; 3]> = BTreeMap::new();
-    for row in rows(paths) {
-        let name = row["context"].as_str().unwrap();
-        let (context, text) = (joined(&contexts[name]), row["text"].as_str().unwrap());
-        let exact = copies_context(&context, text, ContextCopy { edits: 0, ..d });
-        let near = copies_context(&context, text, d);
-        let t = tally.entry(name.to_string()).or_default();
-        t[0] += 1;
-        t[1] += usize::from(exact);
-        t[2] += usize::from(near);
-        if exact != near {
-            println!("  {name}: {} also emptied: {text:?}", row["input"].as_str().unwrap());
+/// The edits `--rescore` tries: every value `speech.context_copy_edits` takes.
+const EDITS: [usize; 4] = [0, 1, 2, 3];
+
+/// The fewest edits of [`EDITS`] at which the guard of this build empties `text` under `context`,
+/// at the default run.
+fn emptied_at(context: &str, text: &str) -> Option<usize> {
+    EDITS.into_iter().find(|&edits| copies_context(context, text, ContextCopy { edits, ..ContextCopy::DEFAULT }))
+}
+
+/// What each value of [`EDITS`] empties of `at`: a transcript emptied at one edit is at more too.
+fn counts(at: &[Option<usize>]) -> String {
+    EDITS.iter().map(|&e| format!("{} at {e}", at.iter().filter(|a| a.is_some_and(|a| a <= e)).count())).collect::<Vec<_>>().join(", ")
+}
+
+/// What the guard of this build empties of recorded rows at each value of [`EDITS`], under each
+/// row's own context; with `control`, under each of those contexts instead, of the utterances (an
+/// item's text, once) that copy nothing of the contexts they were recorded under.
+fn rescore(paths: &[String], contexts: &serde_json::Map<String, Value>, control: Option<Vec<String>>, list: bool) {
+    let rows = rows(paths);
+    let text = |row: &Value| row["text"].as_str().unwrap().to_string();
+    let Some(control) = control else {
+        let mut tally: BTreeMap<String, Vec<Option<usize>>> = BTreeMap::new();
+        for row in &rows {
+            let name = row["context"].as_str().unwrap();
+            let at = emptied_at(&joined(&contexts[name]), &text(row));
+            if let Some(edits) = at.filter(|&edits| edits > 0 || list) {
+                println!("  {name}: {} at {edits} edits: {:?}", row["input"].as_str().unwrap(), text(row));
+            }
+            tally.entry(name.to_string()).or_default().push(at);
         }
+        for (name, at) in tally {
+            println!("{name}: {} rows, emptied {}", at.len(), counts(&at));
+        }
+        return;
+    };
+    let key = |row: &Value| (row["input"].as_str().unwrap().to_string(), text(row));
+    let copies: HashSet<(String, String)> = rows.iter().filter(|row| emptied_at(&joined(&contexts[row["context"].as_str().unwrap()]), &text(row)).is_some()).map(key).collect();
+    let said: BTreeSet<(String, String)> = rows.iter().map(key).filter(|k| !k.1.trim().is_empty() && !copies.contains(k)).collect();
+    println!("{} utterances; {} copies of the context they were recorded under left out", said.len(), copies.len());
+    let mut all = Vec::new();
+    for name in &control {
+        let context = joined(&contexts[name.as_str()]);
+        let at: Vec<Option<usize>> = said.iter().map(|(input, text)| (input, text, emptied_at(&context, text))).inspect(|(input, text, at)| {
+            if let Some(edits) = at {
+                println!("  {name}: {input} at {edits} edits: {text:?}");
+            }
+        }).map(|(_, _, at)| at).collect();
+        println!("{name}: {} utterances, emptied {}", at.len(), counts(&at));
+        all.extend(at);
     }
-    for (name, [n, exact, near]) in tally {
-        println!("{name}: {n} rows, emptied {exact} with edits 0, {near} with edits {}", d.edits);
-    }
+    println!("all: {} utterances under a context, emptied {}", all.len(), counts(&all));
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -168,7 +202,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let contexts: Value = serde_json::from_str(&std::fs::read_to_string(arg(&mut args, "--contexts").expect("--contexts FILE"))?)?;
     let contexts = contexts.as_object().expect("an object of contexts");
     if flag(&mut args, "--rescore") {
-        rescore(&args, contexts);
+        let control = arg(&mut args, "--control").map(|s| s.split(',').map(str::to_string).collect());
+        let list = flag(&mut args, "--list");
+        rescore(&args, contexts, control, list);
         return Ok(());
     }
     let threads: usize = arg(&mut args, "--threads").expect("--threads N").parse()?;

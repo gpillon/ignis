@@ -344,6 +344,33 @@ mod tests {
     const CONTEXT: &str = "Languages: Italian.\nTopic: migrazione della pila software verso GitOps.\n\
         pila software, Argo CD, Forgejo Enterprise, GitOps, Forgejo Apps, Tekton, pull mode, OKD, Fedora, OCM, Jenkins, Helm Chart, Harbor, Gen Two, Marta, Paolo";
 
+    /// #442's `it-topic4` context: a topic of four words and sixteen terms, half of them phrases.
+    const TOPIC4: &str = "Languages: Italian.\nTopic: revisione settimanale del rilascio\n\
+        pila software, Argo CD, rilascio in produzione, revisione del codice, chiusura del ticket aperto, \
+        aggiornamento della documentazione tecnica, ambiente di collaudo, Helm Chart, pipeline di integrazione continua, \
+        Forgejo, Jenkins, pull request, Marta, Paolo, Gen Two, OKD";
+
+    #[test]
+    fn a_line_said_with_a_word_in_front_or_inflected_is_one_edit_off_it() {
+        // Italian as people say it (#442's review): a chair opening the item, a term after its
+        // preposition, the topic with its article, a verb conjugated. Each is one edit off a line
+        // or piece of four words and keeps three: the exact rule keeps it, the near rule takes it
+        // for a copy from one edit.
+        let topic_verb = "Languages: Italian.\nTopic: aggiornare la documentazione tecnica\npila software, Argo CD, Marta";
+        for (context, said) in [
+            (TOPIC4, "Allora, revisione settimanale del rilascio."),
+            (TOPIC4, "Nella pipeline di integrazione continua."),
+            (TOPIC4, "la revisione settimanale del rilascio"),
+            (topic_verb, "Aggiorniamo la documentazione tecnica."),
+        ] {
+            assert!(!copies_context(context, said, edits(0)), "{said}");
+            assert!(copies_context(context, said, edits(1)), "{said}");
+        }
+        // The copy the model wrote of that topic on overlapped speech (AMI IS1009a, 358.3 s) is
+        // the same words: no rule on the text tells the two apart.
+        assert!(copies_context(TOPIC4, "La revisione settimanale del rilascio", edits(1)));
+    }
+
     #[test]
     fn a_transcript_that_only_repeats_a_line_of_the_context_is_a_copy() {
         // The keyword line whole, as the model wrote it on a pause.
