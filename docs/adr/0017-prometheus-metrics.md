@@ -555,8 +555,9 @@ the claim, which is sticky.
 
 - **A prefix miss means no retained prefix matched.** On the device that is an
   entry whose publisher has finished, which is what makes a claim a hit
-  (#325): a live sibling's head, published retained or not, is no hit, so it
-  stops no miss either. In KV-RAM it is any blob, the copy of one already back
+  (#325) and what the glossary's retained prefix is, one a later,
+  non-concurrent request claims: a live sibling's head, published retained or
+  not, is no hit, so it stops no miss either. In KV-RAM it is any blob, the copy of one already back
   on the device included. Each tier then records at most one of hit or miss,
   and its rate reads chosen / (chosen + nothing there), as the checkpoint
   family's does. State that is there but not chosen (a KV-RAM block short of
