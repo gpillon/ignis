@@ -55,7 +55,7 @@ pub struct SessionOpen {
     /// transcript that only repeats them is emptied for (#362); 0, never.
     pub context_copy_words: u32,
     /// `speech.context_copy_edits`: the words such a transcript may change,
-    /// add or drop from a whole context line or keyword (#442); 0, none.
+    /// add or drop from a whole context line or a piece of one (#442); 0, none.
     pub context_copy_edits: u32,
     /// The language forced, by the model's English name (`Italian`), the
     /// official assistant prefill `language <Name><asr_text>`. `None`

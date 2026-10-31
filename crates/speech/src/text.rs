@@ -250,9 +250,11 @@ impl ContextCopy {
 /// The model also writes a line with a word or two changed (`migrate` for `migrazione`, the
 /// topic turned into an imperative, #442): a transcript at most `edits` words (changed, added
 /// or dropped) from a whole line, or from a whole piece of one between commas or sentence marks
-/// (a keyword), is a copy too when the words it keeps of it are `run` or more, those edits taken
-/// off the shorter of the two (`speech.context_copy_edits`; 0 keeps the exact rule). That line is
-/// read without its label only, which is no word a transcript may change.
+/// (a keyword, or a clause of the prompt: every line is split), is a copy too when the words it
+/// keeps of it are `run` or more, those edits taken off the shorter of the two
+/// (`speech.context_copy_edits`; 0, the default, keeps the exact rule, since people say a line a
+/// word off too). That line is read without its label only, which is no word a transcript may
+/// change.
 pub fn copies_context(context: &str, transcript: &str, copy: ContextCopy) -> bool {
     let ContextCopy { run, edits } = copy;
     let said = words(transcript);
