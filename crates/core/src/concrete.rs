@@ -1172,21 +1172,34 @@ impl ConcreteScheduler {
         tails + links.into_iter().map(|p| self.prefix.pages_of(p)).sum::<u32>()
     }
 
-    /// The lowest-ranked waiting claim below `rank` whose going gives pages
-    /// back once retained state is given up (GitHub #445): the link it holds
-    /// goes, or the tail page of the checkpoint it chose does. A claim on a
-    /// live sibling's prefix frees nothing, and is kept.
+    /// The next waiting claim below `rank` to give up, once retained state has
+    /// given up all it can (GitHub #445): the lowest-ranked whose going alone
+    /// gives pages back. When none does alone, claims standing together on a
+    /// link go together: the lowest-ranked of those that give pages back with
+    /// every claim below `rank` goes first, and the next pass finds its
+    /// partner alone on the link. A claim that frees nothing either way stays:
+    /// one on a live sibling's prefix, or on a block that a checkpoint another
+    /// claim keeps chains over.
     fn waiting_claim_to_give_up(&self, rank: Rank) -> Option<usize> {
         let claims = self.waiting_claims_below(rank);
-        let links = self.prefix.links_let_go(|p| self.holders_let_go(p, &claims));
-        let kept = self.claimed_device_checkpoints_but(&claims);
-        claims.into_iter().find(|&i| {
-            let r = &self.requests[i];
-            r.prefix_entry.is_some_and(|p| links.contains(&p))
-                || r.checkpoint_entry
-                    .and_then(|id| self.checkpoints.entries().iter().find(|e| e.id == id))
-                    .is_some_and(|e| self.tail_page_goes(e, &kept))
-        })
+        claims
+            .iter()
+            .copied()
+            .find(|&i| self.claim_gives_back(i, &[i]))
+            .or_else(|| claims.iter().copied().find(|&i| self.claim_gives_back(i, &claims)))
+    }
+
+    /// Whether the waiting claim `i` gives pages back when the claims
+    /// `yielding`, `i` among them, let go beside retained state (GitHub
+    /// #445): the link it holds goes, or the tail page of the checkpoint it
+    /// chose does.
+    fn claim_gives_back(&self, i: usize, yielding: &[usize]) -> bool {
+        let r = &self.requests[i];
+        r.prefix_entry
+            .is_some_and(|p| self.prefix.links_let_go(|link| self.holders_let_go(link, yielding)).contains(&p))
+            || r.checkpoint_entry
+                .and_then(|id| self.checkpoints.entries().iter().find(|e| e.id == id))
+                .is_some_and(|e| self.tail_page_goes(e, &self.claimed_device_checkpoints_but(yielding)))
     }
 
     /// Give up the claim the waiting request `idx` holds (GitHub #445): its

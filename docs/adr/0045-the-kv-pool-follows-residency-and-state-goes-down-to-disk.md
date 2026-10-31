@@ -139,8 +139,10 @@ could not come back.
   for an entry that outranks its claimant.** An admission, or a moved sequence
   coming back, counts the pages the claims below it hold as reclaimable, after
   retained state. Retained state goes first, then the claims, the
-  lowest-ranked claimant first, each only if its going gives pages back: a
-  claim on a live sibling's prefix frees nothing and stays. ADR 0029's
+  lowest-ranked claimant first, each only if its going gives pages back:
+  alone, or, where claims stand together on a link, with the others below the
+  entry. A claim on a live sibling's prefix, or on a block that a checkpoint
+  another claim keeps chains over, frees nothing and stays. ADR 0029's
   "retained state never delays or refuses an admission" now holds of what a
   waiting request claimed from it too.
 - **Only when that makes the room.** Retained state, the claims below the

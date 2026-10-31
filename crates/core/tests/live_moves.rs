@@ -995,3 +995,97 @@ fn a_waiting_claim_on_a_retained_prefix_yields_too() {
     }
     run.assert_no_work_lost();
 }
+
+/// [`agent_turn`], opening with a two-page system block it publishes as a
+/// retained prefix; the two pages above it, to its opener's floor, become a
+/// prefix chained over the block, which its checkpoint stands on.
+fn agent_turn_with_block() -> RequestInput {
+    let mut turn = agent_turn();
+    turn.system_block_tokens = Some(2 * PAGE);
+    turn
+}
+
+/// An Agent's prompt opening with [`agent_turn_with_block`]'s block and
+/// nothing more of it, then 50 tokens of its own from `own`: 782 tokens, 49
+/// pages, 47 past the block.
+fn block_then(own: u32) -> RequestInput {
+    input(tokens(1, 32).into_iter().chain(own..own + 50).collect(), Some(700))
+}
+
+#[test]
+fn a_waiting_claim_whose_going_alone_frees_nothing_stays() {
+    // A, an Interactive turn, left its block, the link over it and its
+    // checkpoint. K, an Agent continuing A's conversation, claimed the
+    // checkpoint; J, an Agent after K, claimed the block. Both wait. I,
+    // Interactive, needs 60 of the 64 pages and cannot move A. Once A is done
+    // I is one page short. K's claim, let go, gives back the checkpoint's tail
+    // page and the link under it; J's gives back nothing while K's checkpoint
+    // chains over the block. J ranks lowest, but only K's claim goes, and I
+    // enters. J resumes from the block once I is done.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(agent_turn_with_block(), RequestClass::Interactive);
+    run.steps(4);
+    let k = run.submit(next_turn(), RequestClass::Agent);
+    run.step();
+    let j = run.submit(block_then(800), RequestClass::Agent);
+    run.step();
+    let (k_link, j_block) = (run.sched.shared_prefix_of(k), run.sched.shared_prefix_of(j));
+    assert!(k_link.is_some(), "K stands on the link under A's checkpoint");
+    assert_eq!(j_block.map(|(_, tokens)| tokens), Some(32), "J stands on A's block");
+    assert_ne!(k_link.map(|(link, _)| link), j_block.map(|(block, _)| block), "two links, one over the other");
+
+    let i = run.submit(live(500, 956), RequestClass::Interactive); // 60 pages
+    run.until(|run| run.done(a));
+    assert_eq!(run.state(i), Some(RequestState::Admitted), "I waited for A");
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I took its pages in the next advance");
+    assert!(run.sched.shared_prefix_of(k).is_none(), "K's claim went for them");
+    assert_eq!(
+        run.sched.shared_prefix_of(j).map(|(_, tokens)| tokens),
+        Some(32),
+        "J's claim, which would have freed nothing, stayed"
+    );
+    run.to_idle_within(3_000);
+    assert!(
+        run.has(|e| matches!(e, SchedEvent::PrefixReused { request, tokens: 32, .. } if *request == j)),
+        "J resumed from the block it kept"
+    );
+    for (r, max) in [(a, 300), (k, 700), (j, 700), (i, 956)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn two_waiting_claims_that_free_a_block_only_together_both_go() {
+    // J1 and J2, Agents opening with A's block and nothing more of it, each
+    // claimed the block and wait. I, Interactive, needs 63 of the 64 pages and
+    // cannot move A. Once A is done the checkpoint and the link over the block
+    // go for I, which is then the block's two pages short. Neither claim alone
+    // gives the block back, since the other still stands on it; together they
+    // do, so both go, J2's first, and I enters.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(agent_turn_with_block(), RequestClass::Interactive);
+    run.steps(4);
+    let j1 = run.submit(block_then(800), RequestClass::Agent);
+    let j2 = run.submit(block_then(900), RequestClass::Agent);
+    run.step();
+    for j in [j1, j2] {
+        assert_eq!(run.sched.shared_prefix_of(j).map(|(_, tokens)| tokens), Some(32), "{j} stands on A's block");
+    }
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.until(|run| run.done(a));
+    assert_eq!(run.state(i), Some(RequestState::Admitted), "I waited for A");
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I took its pages in the next advance");
+    assert!(run.sched.shared_prefix_of(j1).is_none() && run.sched.shared_prefix_of(j2).is_none(), "both claims went");
+    assert_eq!(run.sched.prefix_pinned_pages(), 0, "and the block with them");
+    run.to_idle_within(3_000);
+    for (r, max) in [(a, 300), (j1, 700), (j2, 700), (i, 1000)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
