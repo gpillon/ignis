@@ -16,5 +16,8 @@ describe("createMetricsSim", () => {
     expect(later.unknown).toEqual([]);
     expect(later.kvDisk?.capacity).toBeGreaterThan(0);
     expect(later.kvDisk?.used).toBeLessThanOrEqual(later.kvDisk!.capacity!);
+    // The prefix walk's misses move (#222), and never on the disk, where no prefix lives.
+    expect(later.retained.misses.device.prefix).toBeGreaterThan(0);
+    expect(later.retained.misses.disk.prefix).toBe(0);
   });
 });

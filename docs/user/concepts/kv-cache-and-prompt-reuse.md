@@ -174,6 +174,13 @@ retained tokens:
 - **An image inside the matched part.** A prefix never ends inside an image; it
   walks back to before it, and an image's identity is part of the match.
 
+`ignis_retained_state_misses_total` counts misses once per request, by tier
+and kind: no checkpoint matched in that tier, or no retained prefix did. A
+block shared from a sibling that is still running is not retained state, so
+it counts as a prefix miss. A prefix is only ever kept on the device and in
+KV-RAM, so its disk series stays at zero, and `--reuse-prompt off` counts no
+miss at all ([metrics](../reference/metrics.md)).
+
 ## Who can see it
 
 Reuse is global to the server. Anyone who can reach it could tell from the time

@@ -47,12 +47,12 @@ ignis_retained_state_hits_total{tier="device",kind="checkpoint"} 18
 ignis_retained_state_hits_total{tier="device",kind="prefix"} 7
 ignis_retained_state_hits_total{tier="kv_ram",kind="checkpoint"} 3
 ignis_retained_state_hits_total{tier="kv_ram",kind="prefix"} 0
-# HELP ignis_retained_state_misses_total First prefill chunks with no retained checkpoint matching in the tier.
+# HELP ignis_retained_state_misses_total First prefill chunks with no retained checkpoint, or no retained prefix, matching in the tier.
 # TYPE ignis_retained_state_misses_total counter
 ignis_retained_state_misses_total{tier="device",kind="checkpoint"} 11
-ignis_retained_state_misses_total{tier="device",kind="prefix"} 0
+ignis_retained_state_misses_total{tier="device",kind="prefix"} 14
 ignis_retained_state_misses_total{tier="kv_ram",kind="checkpoint"} 5
-ignis_retained_state_misses_total{tier="kv_ram",kind="prefix"} 0
+ignis_retained_state_misses_total{tier="kv_ram",kind="prefix"} 16
 # HELP ignis_retained_state_spills_total Retained checkpoints and prefixes spilled into the tier.
 # TYPE ignis_retained_state_spills_total counter
 ignis_retained_state_spills_total{tier="device",kind="checkpoint"} 0

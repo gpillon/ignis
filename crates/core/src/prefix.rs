@@ -35,6 +35,7 @@
 
 use std::time::Instant;
 
+use crate::checkpoint::{ReuseSource, TierSet};
 use crate::gdn::GdnState;
 use crate::identity::{MatchKey, PromptContent, PromptKeys};
 use crate::types::{BoundaryLifetime, FanOutId, RequestClass, RequestId};
@@ -702,6 +703,36 @@ impl PrefixCache {
     pub fn longest_spilled_match(&self, prompt: &PromptKeys) -> Option<&SpilledPrefix> {
         let candidates = self.spilled.iter().filter(|s| s.on_device.is_none());
         longest_keyed(prompt, candidates, |s| (s.key, s.length_tokens))
+    }
+
+    /// The tiers of `tiers` in which no **retained** prefix matches `prompt`
+    /// (GitHub #222): the prefix walk's misses, as
+    /// [`crate::checkpoint::CheckpointLookup::misses`] is the checkpoint
+    /// pool's.
+    ///
+    /// Retained is what makes a claim a hit (ADR 0017). On the device that is
+    /// an entry whose publisher has `finished`: a live sibling's head is no
+    /// retained state, so claiming it is no hit and matching it stops no
+    /// miss, retention or not. In KV-RAM any blob counts, the copy of one that is
+    /// back on the device included: the tier does hold it. A prefix never
+    /// lives on the disk, so that tier is never missed here. The keys are the
+    /// walk's, so nothing walks the prompt again: each entry costs one lookup
+    /// in them, the one the device and spilled matches already make.
+    pub fn misses(&self, prompt: &PromptKeys, tiers: TierSet, finished: impl Fn(RequestId) -> bool) -> TierSet {
+        let mut missed = TierSet::default();
+        for source in tiers.iter() {
+            let held = match source {
+                ReuseSource::Device => self
+                    .claimable()
+                    .any(|e| prompt.matches(e.length_tokens, e.key) && finished(e.publisher)),
+                ReuseSource::KvRam => self.spilled.iter().any(|s| prompt.matches(s.length_tokens, s.key)),
+                ReuseSource::Disk => true,
+            };
+            if !held {
+                missed.insert(source);
+            }
+        }
+        missed
     }
 
     /// The spilled prefix `id`, if its blob is still held.

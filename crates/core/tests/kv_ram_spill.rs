@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
+use ignis_core::disk::disk_file_bytes;
 use ignis_core::host::{RetainedBlob, Tier};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
@@ -641,32 +642,80 @@ fn a_first_turn_misses_every_configured_tier_once() {
     let mut with_kv_ram = ConcreteScheduler::with_config(tight(4), compute.clone());
     with_kv_ram.submit(turn_at(1), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut with_kv_ram);
-    assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::Device), 1);
-    assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::KvRam), 1);
-    // Every miss is a checkpoint miss (GitHub #216): the checkpoint pool's
-    // lookup is the only one that reports one, and the prefix walk beside it
-    // records none — no prefix miss is invented to make the two symmetric.
+    // GitHub #222: both lookups report a miss, each of its own kind -- the
+    // checkpoint pool's, and the prefix walk's beside it -- and nothing
+    // retained of either kind matched a first turn in either tier.
     for source in [ReuseSource::Device, ReuseSource::KvRam] {
-        assert_eq!(
-            count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Checkpoint),
-            1
-        );
-        assert_eq!(
-            count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Prefix),
-            0,
-            "no prefix miss is synthesised"
-        );
+        for kind in [RetainedKind::Checkpoint, RetainedKind::Prefix] {
+            assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, kind), 1, "{source:?} {kind:?}");
+        }
     }
 
     let mut device_only = ConcreteScheduler::with_config(tight(0), Arc::new(MockCompute::with_sections(crate::sections())));
     device_only.submit(turn_at(1), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut device_only);
-    assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::Device), 1);
+    for kind in [RetainedKind::Checkpoint, RetainedKind::Prefix] {
+        assert_eq!(count_kind(&events, RetainedStateOperation::Miss, ReuseSource::Device, kind), 1);
+    }
     assert_eq!(
         count(&events, RetainedStateOperation::Miss, ReuseSource::KvRam),
         0,
         "a tier this load does not carry is never missed"
     );
+
+    // A prefix never goes to the disk (nothing demotes one there, and no
+    // restore brings one back), so a load with KV-disk misses a checkpoint in
+    // three tiers and a prefix in two.
+    let mut with_disk = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            kv_disk_capacity_bytes: 4 * disk_file_bytes(1),
+            ..tight(4)
+        },
+        Arc::new(MockCompute::with_sections(crate::sections())),
+    );
+    with_disk.submit(turn_at(1), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut with_disk);
+    for source in [ReuseSource::Device, ReuseSource::KvRam, ReuseSource::Disk] {
+        assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Checkpoint), 1);
+    }
+    for source in [ReuseSource::Device, ReuseSource::KvRam] {
+        assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Prefix), 1);
+    }
+    assert_eq!(
+        count_kind(&events, RetainedStateOperation::Miss, ReuseSource::Disk, RetainedKind::Prefix),
+        0,
+        "a tier no prefix can live in is never missed"
+    );
+}
+
+#[test]
+fn a_request_that_waits_for_room_and_looks_again_misses_each_tier_once() {
+    // A miss is counted at the first chunk, not at the look (GitHub #222 for
+    // the prefix walk, as #190 for the checkpoint lookup): a request with no
+    // room looks again on every tick it waits.
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
+    let holder = sched.submit(whole_pool(900_000), RequestClass::Interactive).unwrap();
+    sched.advance();
+    let waiting = sched.submit(turn_at(1), RequestClass::Agent).unwrap();
+    let mut events = Vec::new();
+    let mut looks_without_room = 0;
+    while !sched.is_idle() {
+        let step = sched.advance();
+        // A tick the holder decodes on is one the waiting request is offered
+        // a chunk and finds no room.
+        let decoded = step.iter().any(|e| matches!(e, SchedEvent::Token { request, .. } if *request == holder));
+        if decoded && widths(&compute, waiting).is_empty() {
+            looks_without_room += 1;
+        }
+        events.extend(step);
+    }
+    assert!(looks_without_room > 1, "it looked {looks_without_room} times without room");
+    for source in [ReuseSource::Device, ReuseSource::KvRam] {
+        for kind in [RetainedKind::Checkpoint, RetainedKind::Prefix] {
+            assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, kind), 1, "{source:?} {kind:?}");
+        }
+    }
 }
 
 #[test]
@@ -823,6 +872,41 @@ fn a_block_short_of_the_restore_floor_stays_in_kv_ram() {
     assert!(compute.returned_prefixes().is_empty());
     assert!(prefix_reuses(&events, second).is_empty(), "prefilled cold");
     assert_eq!(widths(&compute, second).iter().sum::<usize>(), (BLOCK + 40) as usize);
+    // GitHub #222: KV-RAM held the block and it was not chosen, which is
+    // neither a hit nor a miss there; the device held nothing retained.
+    assert_eq!(count_kind(&events, RetainedStateOperation::Hit, ReuseSource::KvRam, RetainedKind::Prefix), 0);
+    assert_eq!(count_kind(&events, RetainedStateOperation::Miss, ReuseSource::KvRam, RetainedKind::Prefix), 0);
+    assert_eq!(count_kind(&events, RetainedStateOperation::Miss, ReuseSource::Device, RetainedKind::Prefix), 1);
+}
+
+#[test]
+fn a_block_only_kv_ram_holds_is_a_device_miss_and_no_kv_ram_miss() {
+    // GitHub #222: each tier answers for itself. The block KV-RAM brings back
+    // is a hit there, and the device, which held nothing, records its miss.
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = ConcreteScheduler::with_config(tight(8), compute.clone());
+    sched.submit(subagent(10_000), RequestClass::Agent).unwrap();
+    run_to_idle(&mut sched);
+    sched.submit(whole_pool(900_000), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.host().retained_count(), 1, "the block is in KV-RAM alone");
+
+    let second = sched.submit(subagent(20_000), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(prefix_reuses(&events, second), vec![(BIG_BLOCK, true)], "it came back");
+    assert_eq!(count_kind(&events, RetainedStateOperation::Hit, ReuseSource::KvRam, RetainedKind::Prefix), 1);
+    assert_eq!(count_kind(&events, RetainedStateOperation::Miss, ReuseSource::KvRam, RetainedKind::Prefix), 0);
+    assert_eq!(count_kind(&events, RetainedStateOperation::Miss, ReuseSource::Device, RetainedKind::Prefix), 1);
+
+    // Back on the device, with its blob still in KV-RAM: both tiers hold it,
+    // so the next member misses in neither.
+    let third = sched.submit(subagent(30_000), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(prefix_reuses(&events, third), vec![(BIG_BLOCK, true)]);
+    assert_eq!(count_kind(&events, RetainedStateOperation::Hit, ReuseSource::Device, RetainedKind::Prefix), 1);
+    for source in [ReuseSource::Device, ReuseSource::KvRam] {
+        assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Prefix), 0, "{source:?}");
+    }
 }
 
 #[test]

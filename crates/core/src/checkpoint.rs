@@ -199,8 +199,10 @@ impl TierSet {
 ///   from — a checkpoint (chosen, not yet restored: its prefill has not
 ///   run), or a retained prefix brought back from KV-RAM for it.
 /// - **Miss**: a request's first chunk landed with no checkpoint in this tier
-///   matching its prompt. Counted at the chunk rather than at the lookup,
-///   because a request waiting for room looks again on every tick.
+///   matching its prompt, or, for a prefix, no retained prefix (a live
+///   sibling's head is none; GitHub #222). Counted at the chunk rather than
+///   at the lookup, because a request waiting for room looks again on every
+///   tick.
 /// - **Spill**: a checkpoint or retained prefix the device gave up was
 ///   written into this tier.
 /// - **Discard**: a checkpoint or retained prefix left this tier for nowhere.

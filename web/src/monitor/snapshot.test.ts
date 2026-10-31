@@ -104,8 +104,8 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     expect(retained).toEqual({
       reusedTokens: { device: { checkpoint: 41_200, prefix: 9800 }, kv_ram: { checkpoint: 6400, prefix: 0 }, disk: { checkpoint: null, prefix: null } },
       hits: { device: { checkpoint: 18, prefix: 7 }, kv_ram: { checkpoint: 3, prefix: 0 }, disk: { checkpoint: null, prefix: null } },
-      // Checkpoint-only by construction: the prefix walk raises no miss (#222).
-      misses: { device: { checkpoint: 11, prefix: 0 }, kv_ram: { checkpoint: 5, prefix: 0 }, disk: { checkpoint: null, prefix: null } },
+      // Each kind its own lookup's: the checkpoint pool's and the prefix walk's (#222).
+      misses: { device: { checkpoint: 11, prefix: 14 }, kv_ram: { checkpoint: 5, prefix: 16 }, disk: { checkpoint: null, prefix: null } },
       spills: { device: { checkpoint: 0, prefix: 0 }, kv_ram: { checkpoint: 6, prefix: 2 }, disk: { checkpoint: null, prefix: null } },
       discards: { device: { checkpoint: 4, prefix: 9 }, kv_ram: { checkpoint: 1, prefix: 0 }, disk: { checkpoint: null, prefix: null } },
       restores: { device: { checkpoint: 0, prefix: 0 }, kv_ram: { checkpoint: 3, prefix: 1 }, disk: { checkpoint: null, prefix: null } },

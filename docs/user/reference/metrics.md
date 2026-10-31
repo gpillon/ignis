@@ -69,7 +69,7 @@ The metrics listener (on by default, keyless, on loopback) serves these in the P
 | `ignis_retained_slots` | gauge | Retained slots this load hands out, and how many hold an image. | always |
 | `ignis_retained_state_discards_total` | counter | Retained checkpoints and prefixes discarded from the tier. | always |
 | `ignis_retained_state_hits_total` | counter | Retained state chosen to resume from or brought back, by residency tier. | always |
-| `ignis_retained_state_misses_total` | counter | First prefill chunks with no retained checkpoint matching in the tier. | always |
+| `ignis_retained_state_misses_total` | counter | First prefill chunks with no retained checkpoint, or no retained prefix, matching in the tier. | always |
 | `ignis_retained_state_restores_total` | counter | Retained state restored from the tier. | always |
 | `ignis_retained_state_spills_total` | counter | Retained checkpoints and prefixes spilled into the tier. | always |
 | `ignis_scheduler_requests` | gauge | Current requests by observable scheduler state. | always |

@@ -215,6 +215,12 @@ counted from its turn). Image jobs had no deadline before that ADR. No new
 family: the job records it as it records the other five outcomes, its
 `ignis.image.job` line says `outcome: timed_out`, and the Monitor's *Image
 jobs* card reads it with them.
+Amended 2026-10-31 (#222, owner decision): the prefix walk raises a miss
+too, so `ignis_retained_state_misses_total{kind="prefix"}` counts on the
+device and in KV-RAM instead of sitting at zero, and `--reuse-prompt off`
+records no miss of either kind. No new family; the rule is the note below the
+table, and the Monitor's *Retained state* card shows the count where it read
+"not measured".
 
 ## Context
 
@@ -367,7 +373,7 @@ The initial stable metric contract is:
 | `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
 | `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Cumulative tokens skipped through retained state: a retained prefix (`kv_ram` when its claim brought it back from KV-RAM, `device` otherwise, #325) or a prompt checkpoint, by the tier it came from and the kind it was |
 | `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained state a request chose to resume from: a prompt checkpoint (not yet restored), a retained prefix claimed from the device (`tier=device`, #325), or a retained prefix brought back from KV-RAM (`tier=kv_ram`, counted at the return; the claim that brings it back adds no `device` hit, so one restore is one hit, while a later request choosing the block already back on the device is a `device` hit). A live sibling's prefix is not retained state and is no hit |
-| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Requests whose first prefill chunk landed with no checkpoint matching in a tier this load carries. **`kind=prefix` is zero by construction** — see the note below the table (#216, #222) |
+| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Requests whose first prefill chunk landed with nothing retained of the kind matching in a tier this load carries: no checkpoint, or no retained prefix (a live sibling's head is none). `kind=prefix` is counted on the device and in KV-RAM only, and neither kind with prompt reuse off — see the note below the table (#216, #222) |
 | `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes written into the tier (`kv_ram`, and `disk` on a load with KV-disk) |
 | `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes that left the tier for nowhere |
 | `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
@@ -538,16 +544,36 @@ all of them from the first scrape, zeros included. A load without the tier
 the margin) renders none of them, and the Monitor's Disk row reads "off on
 this load".
 
-**The miss family is checkpoint-only, and stays that way until someone decides
-otherwise.** `ignis_retained_state_misses_total` is projected from a fact the
-*checkpoint pool's* lookup raises. The prefix walk beside it — the longest
-device match and the longest spilled match — records no miss at all, so
-`kind="prefix"` is zero on every load, forever. The `kind` split (#216) made
-this visible rather than creating it: the row above has always counted
-checkpoint misses alone, which is why its wording names a checkpoint where its
-five siblings name both. No prefix miss is synthesised to make the families
-look symmetric. Whether the prefix walk should raise one is a change to the
-fact stream, not to this projection, and is GitHub #222.
+**Both lookups raise a miss, each under its own kind (#222).** Until #222 the
+miss family was checkpoint-only: the checkpoint pool's lookup raised the fact
+and the prefix walk beside it raised none, so `kind="prefix"` sat at zero on
+every load. Now both do, by one rule. A request's look records the tiers it
+found nothing retained in; a later look overwrites them (a request waiting for
+room looks on every tick); its first prefill chunk to land reports them. So a
+request misses a tier once, not once per look, and a hit is still counted at
+the claim, which is sticky.
+
+- **A prefix miss means no retained prefix matched.** On the device that is an
+  entry whose publisher has finished, which is what makes a claim a hit
+  (#325): a live sibling's head, published retained or not, is no hit, so it
+  stops no miss either. In KV-RAM it is any blob, the copy of one already back
+  on the device included. Each tier then records at most one of hit or miss,
+  and its rate reads chosen / (chosen + nothing there), as the checkpoint
+  family's does. State that is there but not chosen (a KV-RAM block short of
+  the restore floor) is neither.
+- **The prefix tiers are the device and KV-RAM.** Nothing demotes a prefix to
+  the disk and no restore brings one back, so `tier="disk",kind="prefix"`
+  renders on a load with KV-disk and stays zero: a disk prefix miss would be a
+  series that can never hit.
+- **Prompt reuse off records no miss of either kind.** It retains no prefix
+  and captures no checkpoint, so no lookup there can ever hit. Before #222
+  every request on such a load counted a device checkpoint miss.
+- **Zero work.** The prefix miss walks nothing new. It reads the match keys the
+  one walk of the prompt already computed for the checkpoint lookup and the
+  prefix claim, tests each device entry and KV-RAM blob with the same key
+  lookup the longest-match questions make, and keeps the result as a tier set
+  on the request beside the checkpoint's. With prompt reuse off it reads
+  nothing.
 
 Histogram buckets are fixed. TTFT uses 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
 10, 30, 60, 120, and 300 seconds. Request duration uses 0.1, 0.25, 0.5, 1,

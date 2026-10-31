@@ -682,6 +682,65 @@ fn a_restore_through_a_checkpoint_is_a_checkpoint_hit_and_no_prefix_hit() {
     assert!(hits(&events, RetainedKind::Prefix).is_empty());
 }
 
+// ── GitHub #222: the prefix walk's misses ───────────────────────────────
+
+/// The `Miss` facts for `kind`, as the tier each one names.
+fn misses(events: &[SchedEvent], kind: RetainedKind) -> Vec<ReuseSource> {
+    retained_state(events)
+        .into_iter()
+        .filter(|(operation, _, k)| *operation == RetainedStateOperation::Miss && *k == kind)
+        .map(|(_, source, _)| source)
+        .collect()
+}
+
+#[test]
+fn a_retained_prefix_on_the_device_is_a_device_hit_and_no_device_miss() {
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = scheduler(compute, config());
+    sched.submit(subagent(500), RequestClass::Agent).unwrap();
+    let first = run_to_idle(&mut sched);
+    assert_eq!(
+        misses(&first, RetainedKind::Prefix),
+        vec![ReuseSource::Device, ReuseSource::KvRam],
+        "a cold prompt found no prefix in either tier the load carries"
+    );
+
+    let second = sched.submit(subagent(900), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(prefix_reuses(&events, second), vec![32]);
+    assert_eq!(hits(&events, RetainedKind::Prefix), vec![ReuseSource::Device]);
+    assert_eq!(
+        misses(&events, RetainedKind::Prefix),
+        vec![ReuseSource::KvRam],
+        "the device held the block and KV-RAM nothing: each tier records one of the two"
+    );
+}
+
+#[test]
+fn a_live_siblings_prefix_is_no_retained_match_so_claiming_it_is_a_miss() {
+    // A live claim is no hit (ADR 0017), so it cannot stand in for one either:
+    // the block the second claims is only a sibling's while its publisher is
+    // still decoding, although it was published retained.
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = scheduler(compute, config());
+    sched
+        .submit(
+            input([tokens(1, BLOCK), tokens(500, 25)].concat(), Some(BLOCK), Some(57), 40),
+            RequestClass::Agent,
+        )
+        .unwrap();
+    sched.advance();
+    let b = sched.submit(subagent(900), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(prefix_reuses(&events, b), vec![32], "the second claimed the live block");
+    assert!(hits(&events, RetainedKind::Prefix).is_empty());
+    assert_eq!(
+        misses(&events, RetainedKind::Prefix),
+        vec![ReuseSource::Device, ReuseSource::KvRam],
+        "nothing retained matched it in either tier"
+    );
+}
+
 // ── Retained state never costs a live request ───────────────────────────
 
 #[test]
@@ -870,7 +929,12 @@ fn a_lifecycle_fact_names_which_kind_of_retained_state_moved() {
         .submit(input(tokens(2000, 60), None, None, 4), RequestClass::Interactive)
         .unwrap();
     let events = run_to_idle(&mut sched);
-    let moved = retained_state(&events);
+    // What moved: the pressure's own lookups aside, which miss a prefix in
+    // every tier (GitHub #222) without moving one.
+    let moved: Vec<_> = retained_state(&events)
+        .into_iter()
+        .filter(|&(operation, _, _)| operation != RetainedStateOperation::Miss)
+        .collect();
     assert!(
         moved.iter().any(|&(operation, _, kind)| operation == RetainedStateOperation::Spill
             && kind == RetainedKind::Checkpoint),
@@ -886,7 +950,10 @@ fn a_lifecycle_fact_names_which_kind_of_retained_state_moved() {
         .submit(input(tokens(3000, 92), None, None, 4), RequestClass::Interactive)
         .unwrap();
     let events = run_to_idle(&mut sched);
-    let moved = retained_state(&events);
+    let moved: Vec<_> = retained_state(&events)
+        .into_iter()
+        .filter(|&(operation, _, _)| operation != RetainedStateOperation::Miss)
+        .collect();
     assert!(
         moved.iter().any(|&(_, _, kind)| kind == RetainedKind::Prefix),
         "the block's own fact says prefix: {moved:?}"
@@ -965,6 +1032,27 @@ fn prompt_reuse_off_retains_no_prefix() {
     let events = run_to_idle(&mut sched);
     assert!(prefix_reuses(&events, later).is_empty());
     assert_eq!(chunk_widths(&compute, later).iter().sum::<usize>(), 60);
+}
+
+#[test]
+fn prompt_reuse_off_records_no_miss_of_either_kind() {
+    // GitHub #222: off retains no prefix and captures no checkpoint, so no
+    // lookup there can ever hit, and a miss would count nothing but the
+    // switch being off.
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = scheduler(
+        compute,
+        SchedulerConfig {
+            prompt_reuse: false,
+            ..config()
+        },
+    );
+    sched.submit(subagent(500), RequestClass::Agent).unwrap();
+    let mut events = run_to_idle(&mut sched);
+    sched.submit(subagent(900), RequestClass::Agent).unwrap();
+    events.extend(run_to_idle(&mut sched));
+    assert_eq!(misses(&events, RetainedKind::Prefix), vec![]);
+    assert_eq!(misses(&events, RetainedKind::Checkpoint), vec![]);
 }
 
 /// [`subagent`] with a four-placeholder image of content `digest` in its

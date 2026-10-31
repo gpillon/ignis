@@ -47,7 +47,7 @@ const SKIP_REASONS = ["publish_skipped_no_slot", "capture_skipped_no_slot", "cap
 const RETAINED_FAMILIES: [string, string][] = [
   ["ignis_retained_reused_tokens_total", "Cumulative tokens skipped through retained state, by residency tier."],
   ["ignis_retained_state_hits_total", "Retained state chosen to resume from or brought back, by residency tier."],
-  ["ignis_retained_state_misses_total", "First prefill chunks with no retained checkpoint matching in the tier."],
+  ["ignis_retained_state_misses_total", "First prefill chunks with no retained checkpoint, or no retained prefix, matching in the tier."],
   ["ignis_retained_state_spills_total", "Retained checkpoints and prefixes spilled into the tier."],
   ["ignis_retained_state_discards_total", "Retained checkpoints and prefixes discarded from the tier."],
   ["ignis_retained_state_restores_total", "Retained state restored from the tier."],
@@ -130,7 +130,7 @@ export function createMetricsSim(start = Date.now()) {
 
   /**
    * One scheduled request's turn with retained state: it looks a checkpoint
-   * up, then tries to leave its own behind. A load whose slots are all held
+   * and a prefix up, then tries to leave its own behind. A load whose slots are all held
    * cannot, which is the skip counter's whole point.
    */
   function retainedTurn() {
@@ -158,6 +158,11 @@ export function createMetricsSim(start = Date.now()) {
       bump("misses", "device", "checkpoint");
       if (slots.spilled > 0) bump("misses", "kv_ram", "checkpoint");
     }
+    // The prefix walk beside the lookup (#222): a retained block on the device
+    // is a hit there, and a tier holding none is a miss. No prefix lives on the disk.
+    if (slots.inUse > 0 && Math.random() < 0.4) bump("hits", "device", "prefix");
+    else bump("misses", "device", "prefix");
+    if (slots.spilled === 0) bump("misses", "kv_ram", "prefix");
     if (Math.random() < 0.25) {
       // A shared prefix published for the siblings behind it.
       if (slots.inUse < RETAINED_SLOTS) {
