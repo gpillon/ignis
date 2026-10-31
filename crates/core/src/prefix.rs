@@ -650,6 +650,33 @@ impl PrefixCache {
         pages
     }
 
+    /// The pages of `entry`'s chain that come back once one of its holders
+    /// lets go and the retained state left on the chain is given up (GitHub
+    /// #444, ADR 0045 as amended 2026-10-31): what a live request standing on
+    /// `entry` frees by leaving the device, whether it published the chain,
+    /// lent it or claimed it. 0 when `entry` is gone.
+    ///
+    /// From `entry` toward the chain's root, a link counts its own pages while
+    /// its holders but one are retained state, as `retained_holders` counts
+    /// them (the scheduler's checkpoints on it and its own retention, the
+    /// membership the first-victim pass reclaims by): the one is the leaving
+    /// holder's reference on the first link, and above it the reference of
+    /// the link beneath, which drops with it. The first link anything else
+    /// holds ends the walk -- a live claimant, the claimant of a checkpoint on
+    /// it, another chain's link -- since every link above is held through it.
+    pub fn pages_a_holder_frees(&self, entry: PrefixId, retained_holders: impl Fn(PrefixId) -> u32) -> u32 {
+        let mut pages = 0;
+        let mut at = Some(entry);
+        while let Some(e) = at.and_then(|id| self.entry(id)) {
+            if e.refcount - 1 != retained_holders(e.id) {
+                break;
+            }
+            pages += e.pages;
+            at = e.parent;
+        }
+        pages
+    }
+
     /// Release one reference to `entry` (the claimant completed or was
     /// re-queued). When the last reference drops, the entry (and its own
     /// pages) is released.
@@ -1173,6 +1200,33 @@ mod tests {
         };
         assert_eq!(cache.release(link), vec![link_gone, gone(4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
+    }
+
+    #[test]
+    fn a_holder_frees_the_links_only_retained_state_holds_beside_it() {
+        // GitHub #444: request 8 lent the two pages past request 7's retained
+        // four-page head to a link, and 7 is done. The head's holders are the
+        // link and its retention; the link's, request 8.
+        let mut cache = PrefixCache::new(16);
+        let (head, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        assert!(cache.retain_published(head, retention(0)));
+        cache.claim(&cache.keys(&prompt96())).expect("request 8 claims the head");
+        let (link, _) = cache.register_link(8, &prompt96(), Some(head)).unwrap();
+        assert_eq!(cache.release(head), vec![], "request 7 is done");
+        let retention_alone = |id| u32::from(id == head);
+        assert_eq!(cache.pages_a_holder_frees(link, retention_alone), 6, "the link, and the head its retention keeps");
+
+        // A second reference on the link: as a checkpoint's, retained state,
+        // it frees as much; as a live request's, it ends the walk at once.
+        assert!(cache.retain(link));
+        let with_a_checkpoint = |id| u32::from(id == head) + u32::from(id == link);
+        assert_eq!(cache.pages_a_holder_frees(link, with_a_checkpoint), 6);
+        assert_eq!(cache.pages_a_holder_frees(link, retention_alone), 0);
+
+        // A live sibling stands on the head: the link comes back, the head stays.
+        cache.claim(&cache.keys(&prompt64())).expect("a sibling claims the head");
+        assert_eq!(cache.pages_a_holder_frees(link, with_a_checkpoint), 2);
+        assert_eq!(cache.pages_a_holder_frees(head + 100, with_a_checkpoint), 0, "an entry that is gone frees nothing");
     }
 
     #[test]

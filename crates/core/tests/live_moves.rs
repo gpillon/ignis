@@ -604,3 +604,180 @@ fn nothing_but_an_admission_moves_a_sequence() {
     assert_eq!(lengths[&a], 600);
     assert_eq!(lengths[&b], 380);
 }
+
+// ── GitHub #444: a move counts the pages it leaves to retained state alone ──
+
+/// [`pool`] with prompt reuse on, and retained slots for the checkpoints and
+/// prefixes the turns below leave.
+fn reuse_pool() -> SchedulerConfig {
+    SchedulerConfig { prompt_reuse: true, retained_slots: 4, ..pool(4) }
+}
+
+/// An Agent conversation's turn: 70 prompt tokens whose generation opener ends
+/// at 66, so its checkpoint stands on the four whole pages below the opener,
+/// and 300 tokens to generate: 24 pages in all.
+fn agent_turn() -> RequestInput {
+    let mut turn = input(tokens(1, 70), Some(300));
+    turn.opener_tokens = Some(66);
+    turn
+}
+
+/// [`agent_turn`] with a picture whose placeholders run from token 4 to 64,
+/// across its opener's page floor at 64. No claimable prefix may end inside
+/// it (#193), so the turn's capture lends the pages below the opener to a
+/// pages-only link (ADR 0029, #306; on the 27B since #249) instead of
+/// publishing them.
+fn agent_image_turn() -> RequestInput {
+    use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
+    let mut turn = agent_turn();
+    turn.multimodal = Some(Arc::new(Multimodal {
+        positions: (0..3).flat_map(|_| 0..70).collect(),
+        rope_delta: 0,
+        media: vec![MediaItem {
+            grid: Grid { t: 1, h: 2, w: 2 * 61 },
+            token_span: TokenSpan { begin: 4, count: 61 },
+            patches: Vec::new(),
+            content_digest: [0xAA; 32],
+        }],
+    }));
+    turn
+}
+
+/// The turn's prompt up to its opener's page floor, then a question of its
+/// own: a sibling that claims the head the turn published.
+fn sibling_of_agent_turn(max: u32) -> RequestInput {
+    input(tokens(1, 64).into_iter().chain(900..906).collect(), Some(max))
+}
+
+#[test]
+fn an_interactive_need_moves_an_agent_that_published_its_prefix_in_the_same_advance() {
+    // A's system block, two pages, is a retained prefix; the two pages above
+    // it, up to its opener's page floor, are a prefix chained over it, which
+    // A's checkpoint stands on. A's own reservation is the 20 pages left. I
+    // needs 63 of 64: A's 20 fall short, and A's 20 with its 4 published
+    // pages do not. Moving A leaves the chained prefix to nothing and the
+    // system block to its retention alone, so both come back -- the retention
+    // given up for I, as retained state always is -- and I takes its pages in
+    // the advance A moves.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let mut turn = agent_turn();
+    turn.system_block_tokens = Some(2 * PAGE);
+    let a = run.submit(turn, RequestClass::Agent);
+    run.steps(4);
+    assert!(!run.tokens(a).is_empty(), "A decodes alone first");
+    assert_eq!(run.sched.prefix_pinned_pages(), 4, "A published its system block and the pages up to its floor");
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.step();
+    assert!(run.evicted(a), "A left the device for KV-RAM, its published pages with it");
+    assert_eq!(run.state(i), Some(RequestState::Running), "I took its pages in the same advance");
+    run.to_idle();
+    for (r, max) in [(a, 300), (i, 1000)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn an_interactive_need_moves_an_agent_that_lent_its_pages_to_a_link() {
+    // A's picture spans its opener's page floor, so its capture lends the four
+    // pages below its opener to a pages-only link, and its reservation shrinks
+    // to 20 pages. I needs 63 of 64: only A's 20 and its 4 lent pages cover it.
+    //
+    // On a load whose opener's page rides the capture (Flash-Next, #306) the
+    // turn lends on `main`. The 27B leg lends nothing before #249: the turn
+    // publishes nothing and is moved for its own 24 pages, as on `main`, so
+    // it starts to bite only once #249 lands and the 27B turn lends too.
+    for rides_capture in [true, false] {
+        let compute = Arc::new(MockCompute::new());
+        let mut run = Run::new(ConcreteScheduler::with_config(
+            SchedulerConfig { opener_page_rides_capture: rides_capture, ..reuse_pool() },
+            compute.clone(),
+        ));
+        let a = run.submit(agent_image_turn(), RequestClass::Agent);
+        run.steps(4);
+        assert!(!run.tokens(a).is_empty(), "A decodes alone first");
+        if rides_capture {
+            assert_eq!(run.sched.prefix_pinned_pages(), 4, "A lent the four pages below its opener to a link");
+        }
+
+        let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+        run.step();
+        assert!(run.evicted(a), "rides the capture: {rides_capture}: A left the device, its lent pages with it");
+        assert_eq!(run.state(i), Some(RequestState::Running), "I took its pages in the same advance");
+        run.to_idle();
+        for (r, max) in [(a, 300), (i, 1000)] {
+            assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+        }
+        run.assert_no_work_lost();
+    }
+}
+
+#[test]
+fn a_move_counts_no_page_a_live_claimant_stands_on() {
+    // S, an Interactive request older than I, claimed the four pages A
+    // published and decodes on them, with three pages of its own above them;
+    // it ends long before A does. I needs 61 pages beside A's 20, S's 3 and
+    // the 4 they share: moving A would free its 20 and leave the 4 to S,
+    // short of I's need. Nothing moves until S is done; then A's 20 and the 4
+    // it alone holds cover I, its 20 alone do not, and A moves.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(agent_turn(), RequestClass::Agent);
+    run.steps(4);
+    let s = run.submit(sibling_of_agent_turn(40), RequestClass::Interactive); // 7 pages, 4 of them A's
+    run.steps(2);
+    assert_eq!(run.sched.shared_prefix_of(s).map(|(_, tokens)| tokens), Some(64), "S stands on A's head");
+
+    let i = run.submit(live(500, 960), RequestClass::Interactive); // 61 pages
+    run.until(|run| run.done(s));
+    assert!(!run.moved_any(), "A did not move while S stood on its pages");
+    assert_eq!(run.state(i), Some(RequestState::Admitted), "I waited");
+    run.step();
+    assert!(run.evicted(a), "once S was done, A moved for I");
+    assert_eq!(run.state(i), Some(RequestState::Running), "and I took its pages in the same advance");
+    run.to_idle();
+    for (r, max) in [(a, 300), (s, 40), (i, 960)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_move_counts_no_page_a_claimed_checkpoint_still_needs() {
+    // R continues A's conversation: it claimed A's checkpoint, which holds the
+    // four pages under it and its tail page for R's first chunk, and R waits
+    // for room behind A, which outranks it. I needs 63 of 64: A's 20 and the
+    // four would cover it, but R's claim keeps the four. Nothing moves, and
+    // the checkpoint and its tail page stay for R.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(agent_turn(), RequestClass::Agent);
+    run.steps(4);
+    // 49 pages, 45 past the 4 it shares with A's checkpoint: they do not fit
+    // beside A's 25.
+    let r = run.submit(input(tokens(1, 66).into_iter().chain(700..710).collect(), Some(700)), RequestClass::Agent);
+    run.step();
+    assert_eq!(run.state(r), Some(RequestState::Admitted), "R waits for room");
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R holds the pages under A's checkpoint");
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    for _ in 0..50 {
+        run.step();
+        assert_eq!(run.state(i), Some(RequestState::Admitted), "I waits");
+    }
+    assert!(!run.moved_any(), "A did not move for pages R's claim holds");
+    assert_eq!(run.sched.checkpoint_pool().entry_count(), 1, "A's checkpoint stays for R");
+    assert_eq!(run.sched.retained_tail_pages(), 1, "and so does its tail page");
+
+    // R goes: the four pages are A's and the checkpoint's alone, and I moves A.
+    assert!(run.sched.cancel(r));
+    run.until(|run| run.state(i) == Some(RequestState::Running));
+    assert!(run.evicted(a));
+    run.to_idle();
+    for (r, max) in [(a, 300), (i, 1000)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}

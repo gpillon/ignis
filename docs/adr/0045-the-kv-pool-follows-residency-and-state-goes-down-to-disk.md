@@ -79,6 +79,53 @@ Flash-Next blob, every lane stalled). Measured in
   stall), and AC 43 holds the rounds after a restore to a same-text
   unmoved run.
 
+**Amended 2026-10-31 *(agent proposal, coordinator decision 2026-10-31, #444)*.** A
+victim was counted as freeing its reservation alone. A request that publishes
+a shared prefix, or lends the pages below its opener to a pages-only link at
+its capture (ADR 0029 as amended for #306), hands those pages to the prefix
+cache and its reservation shrinks by them, so a need that only they would
+cover moved nothing and waited behind a request that could have moved: every
+27B request that published a head, and every Flash-Next one that captured.
+
+- **A victim frees its reservation and the pages of its prefix chain that only
+  retained state holds beside it.** From the entry it stands on toward the
+  chain's root, a link counts while its holders, but for the one reference
+  from below (the victim's own on the first link, the link beneath's above
+  it), are retained state: the device checkpoints standing on it and its own
+  retention, the membership ADR 0029's #188 amendment reclaims by. The first
+  link anything else holds ends the walk, since every link above it is held
+  through it: a live claimant, the claimant of a checkpoint on it not yet
+  built from, another chain's link. What it published, what it lent and what
+  it claimed from a finished request count alike: a moved sequence comes
+  back owning all of its pages (#190).
+- **The move lands, then the admission's first-victim pass frees the chain.**
+  Both leaves move a window at a time (GitHub #309), so the move ends in a
+  later advance: until its last window lands the victim keeps its pages and
+  its chain, and no advance judges the need covered. In the advance it lands,
+  the victim's references drop as it leaves the device, and the admission's
+  own first-victim pass, which runs before any move, gives up the retained
+  state left holding the chain, so the need is met there. The same-advance
+  case belongs to a synchronous backend, such as the mock: its move completes
+  in the call and is followed by the first-victim pass at once, so the need is
+  met in the advance that moved. Retained state still goes first.
+- **Rank gating is unchanged.** The eligible victims and their order are the
+  ones above; only what each is counted as freeing grows.
+- **No work off the pressure path.** The chain is read only on an advance where
+  an admission is short of pages after retained state was given up, and only
+  when the victims' reservations alone fall short of the need: a few links per
+  eligible victim, with the holder counts the first-victim pass already reads,
+  and no pass over the pool. The first-victim pass after a synchronous move runs
+  only after one.
+- **Conservative where victims share a link.** Each sees the other's
+  reference, so neither counts it. No page is counted twice, and a need only a
+  set of victims would free together waits, as before.
+
+`crates/core/tests/kv_ram_windowed_moves.rs` pins a publisher and a lender
+moved a window at a time, the need waiting through the move and met in the
+advance it lands; `crates/core/tests/live_moves.rs` pins them moved on the
+synchronous path in the advance their need arrives, and no move for pages a
+live claimant or a claimed checkpoint still needs.
+
 Sources: [Flash-Next on the 5090](../findings/2026-10-06-flash-next-on-the-5090.md)
 (its 2026-10-07 update: lanes at 262K), the F: disk bench
 (`.scratch/disk-bench/RESULTS.md`, 2026-09-29; untracked, local to the owner's
