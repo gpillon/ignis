@@ -38,11 +38,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Endpoint;
-use crate::g3::{
-    measure_throughput_cell, measure_throughput_cell_from_corpus_with_suffix, ThroughputCell, C1_CONCURRENCY,
-};
+use crate::g3::{measure_throughput_cell_with, ThroughputCell, C1_CONCURRENCY};
 use crate::time::{unix_now, utc_timestamp};
-use crate::ttft::{load_corpus, PromptTemplate};
+use crate::ttft::{self, load_corpus, PromptSet, PromptSetSpec, PromptTemplate};
 
 /// The three prompt depths spec 05's Gate G5 table measures
 /// (`docs/REVIEW-2026-09-05.md` §6 Phase 5: "24K / 98K / 196K"), each
@@ -105,28 +103,31 @@ fn require_committed_budget(mut cell: ThroughputCell, committed_tokens: u32, ins
     cell
 }
 
-/// Refuse a bank whose per-depth windows could share a prefix: depth `i`
-/// starts `i * len / DEPTHS.len()` ids in, and a bank whose period divides
-/// that stride would make two depths open on the same ids and let the engine
-/// reuse one's prefix for the other (#162). `prove_divergence` only compares
-/// the samples *within* a cell, which at C=1 is nothing.
-fn prove_depth_offsets(corpus: &[u32]) -> Result<(), String> {
-    let start = |index: usize| index * corpus.len() / DEPTHS.len();
-    for i in 0..DEPTHS.len() {
-        for j in (i + 1)..DEPTHS.len() {
-            if corpus[start(i) % corpus.len()] == corpus[start(j) % corpus.len()] {
-                return Err(format!(
-                    "the {} and {} depth windows open on the same id (offsets {} and {} in a                      bank of {}): their prompts would share a prefix",
-                    DEPTHS[i],
-                    DEPTHS[j],
-                    start(i),
-                    start(j),
-                    corpus.len()
-                ));
-            }
-        }
-    }
-    Ok(())
+/// The prompts one `g5` run sends, one per depth in [`DEPTHS`] order,
+/// generated together before the first is sent (GitHub #443) and numbered
+/// across the run ([`ttft::generate_run_prompts`]): each depth's prompt
+/// starts with its own nonce, or its window in its own third of `corpus`,
+/// so an engine with prompt reuse has nothing a shallower depth left behind
+/// to serve a deeper one from, and a run whose prompts would share more is
+/// refused before it starts. Only the corpus path carries `instruction`
+/// (#162). A prompt that cannot be generated fails its own depth.
+fn depth_prompts(
+    template: &dyn PromptTemplate,
+    corpus: Option<&[u32]>,
+    instruction: &str,
+) -> Result<[Result<PromptSet, String>; DEPTHS.len()], String> {
+    let labels = DEPTHS.map(|depth| format!("{depth}-token depth"));
+    let suffix = if corpus.is_some() { instruction } else { "" };
+    ttft::generate_run_prompts(
+        template,
+        corpus,
+        std::array::from_fn(|index| PromptSetSpec {
+            label: &labels[index],
+            count: C1_CONCURRENCY,
+            target_tokens: DEPTHS[index] as usize,
+            suffix,
+        }),
+    )
 }
 
 /// A G5 record: what one engine measured at the three depths, in which
@@ -259,7 +260,9 @@ impl Default for G5Config {
 /// A configured corpus (`cfg.corpus`) is loaded once and every depth cell is
 /// cut from it; a corpus that cannot be read fails every depth cell with
 /// that error rather than falling back to the (impractically slow, at this
-/// scale) filler generator.
+/// scale) filler generator. The depths' prompts are the run's
+/// (`depth_prompts`, GitHub #443), generated before the first request is
+/// sent; a run they refuse fails every depth cell with that refusal.
 pub fn measure(
     ep: &dyn Endpoint,
     template: &dyn PromptTemplate,
@@ -267,38 +270,20 @@ pub fn measure(
     endpoint: String,
     cfg: &G5Config,
 ) -> Record {
-    let corpus = cfg
-        .corpus
-        .as_ref()
-        .map(|path| load_corpus(path).and_then(|ids| prove_depth_offsets(&ids).map(|()| ids)));
+    let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path)).transpose();
     let instruction = decode_instruction(cfg.committed_tokens);
-    let cells = DEPTHS
-        .iter()
-        .enumerate()
-        .map(|(index, &depth)| match &corpus {
-            Some(Ok(ids)) => {
-                // Each depth's window starts in its own third of the bank,
-                // so no two depths share a prefix the engine could reuse.
-                let mut rotated = ids.clone();
-                rotated.rotate_left(index * ids.len() / DEPTHS.len());
-                require_committed_budget(
-                    measure_throughput_cell_from_corpus_with_suffix(
-                        ep,
-                        template,
-                        depth,
-                        cfg.committed_tokens,
-                        C1_CONCURRENCY,
-                        &rotated,
-                        &instruction,
-                    ),
-                    cfg.committed_tokens,
-                    true,
-                )
-            }
-            Some(Err(error)) => failed_cell(depth, cfg.committed_tokens, error.clone()),
-            None => measure_throughput_cell(ep, template, depth, cfg.committed_tokens, C1_CONCURRENCY),
-        })
-        .collect();
+    let instructed = cfg.corpus.is_some();
+    let cells = match corpus.and_then(|bank| depth_prompts(template, bank.as_deref(), &instruction)) {
+        Err(error) => DEPTHS.iter().map(|&depth| failed_cell(depth, cfg.committed_tokens, error.clone())).collect(),
+        Ok(sets) => DEPTHS
+            .iter()
+            .zip(sets)
+            .map(|(&depth, set)| {
+                let cell = measure_throughput_cell_with(ep, depth, cfg.committed_tokens, C1_CONCURRENCY, || set);
+                require_committed_budget(cell, cfg.committed_tokens, instructed)
+            })
+            .collect(),
+    };
     Record {
         session: cfg.session.clone(),
         label: cfg.label.clone(),
@@ -315,6 +300,8 @@ pub fn measure(
 mod tests {
     use super::*;
     use crate::client::{Endpoint, FinishReason, Outcome, Request};
+    use crate::g3::measure_throughput_cell;
+    use crate::testutil::{PromptReuse, Steady, CHAT_FOOTER, CHAT_HEADER};
 
     /// A mock template: one token per whitespace-separated word — matches
     /// `g3.rs`'s / `g4.rs`'s own `MockTemplate` (a mock engine with no
@@ -532,21 +519,22 @@ mod tests {
         assert!(free.samples.iter().all(|s| !s.void), "{:?}", free.samples);
     }
 
-    /// #162: a bank whose period divides the depth stride would align two
-    /// depths; the measurement refuses it instead of reusing a prefix.
+    /// #162, GitHub #443: a bank no rotation frees, one id throughout, opens
+    /// every depth's window on the same ids; the run refuses to start,
+    /// naming two depths, and sends nothing. A bank whose period only aligns
+    /// the depths' thirds is cut a rotation of its own per depth
+    /// (`a_whole_run_cut_from_a_tiled_corpus_stays_cold_under_prompt_reuse`).
     #[test]
-    fn a_bank_whose_period_aligns_two_depths_is_refused() {
-        // 12 ids, period 4: the starts 0, 4, 8 all land on id 100.
-        let periodic: Vec<u32> = (0..12).map(|i| 100 + (i % 4) as u32).collect();
-        assert!(prove_depth_offsets(&periodic).is_err());
-        let distinct: Vec<u32> = (0..12).map(|i| 100 + i as u32).collect();
-        assert!(prove_depth_offsets(&distinct).is_ok());
-
-        let (dir, corpus) = write_corpus_file(&periodic);
+    fn a_bank_no_rotation_frees_refuses_the_run_naming_two_depths() {
+        let (dir, corpus) = write_corpus_file(&[7; 12]);
         let ep = RecordingEndpoint { stop_after: None, prompts: Default::default() };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
         std::fs::remove_dir_all(&dir).ok();
-        assert!(record.cells.iter().all(|c| c.error.as_deref().is_some_and(|e| e.contains("share a prefix"))));
+        assert_eq!(record.cells.len(), 3);
+        for cell in &record.cells {
+            let error = cell.error.as_deref().expect("every depth refused");
+            assert!(error.contains("24576-token depth prompt 0") && error.contains("100352-token depth prompt 0"), "{error}");
+        }
         assert!(ep.prompts.into_inner().unwrap().is_empty(), "nothing was sent");
     }
 
@@ -611,6 +599,100 @@ mod tests {
         let text = record.render();
         for expected in ["session=S1", "24K", "98K", "196K", "tok/s"] {
             assert!(text.contains(expected), "render must mention {expected}:\n{text}");
+        }
+    }
+
+    // ── a whole run under prompt reuse (GitHub #443) ───────────────────────
+
+    /// [`MockTemplate`] inside the artifact's chat template in shape, for the
+    /// runs measured under prompt reuse.
+    struct ChatTemplate;
+
+    impl PromptTemplate for ChatTemplate {
+        fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+            let mut ids: Vec<u32> = (0..CHAT_HEADER as u32).map(|i| 1_000 + i).collect();
+            ids.extend(MockTemplate.encode_user_message(content)?);
+            ids.extend((0..CHAT_FOOTER as u32).map(|i| 2_000 + i));
+            Ok(ids)
+        }
+        fn decode(&self, ids: &[u32]) -> Result<String, String> {
+            MockTemplate.decode(ids)
+        }
+    }
+
+    fn reuse_run(corpus: Option<PathBuf>) -> G5Config {
+        G5Config { profile: "prompt reuse on".into(), session: "S-reuse".into(), corpus, ..G5Config::default() }
+    }
+
+    fn depth_lengths() -> Vec<usize> {
+        DEPTHS.iter().map(|&depth| depth as usize).collect()
+    }
+
+    /// GitHub #443: the filler path's three depths under prompt reuse come
+    /// back cold, each prompt sharing no more than the chat template's header
+    /// with the others, where every depth started with nonce 0 and the deeper
+    /// two were served the 24K prompt's pages.
+    #[test]
+    fn a_whole_run_stays_cold_under_prompt_reuse() {
+        let ep = PromptReuse::new(Steady, &ChatTemplate);
+        let record = measure(&ep, &ChatTemplate, "mock-engine".into(), "http://mock".into(), &reuse_run(None));
+
+        assert!(record.all_cold(), "{}", record.render());
+        assert_eq!(ep.sharing_more_than(CHAT_HEADER), Vec::new(), "no two prompts share content");
+        let sent = ep.admitted();
+        assert_eq!(sent.iter().map(Vec::len).collect::<Vec<_>>(), depth_lengths());
+        // The 24K prompt is the one it always was.
+        let alone = crate::ttft::generate_cell_prompts(&ChatTemplate, DEPTH_24K as usize, 1).expect("prompt");
+        assert_eq!(sent[0], alone.tokens[0]);
+        // Not a vacuous mock: the run again sends the same prompts, served
+        // from what the first run left.
+        let again = measure(&ep, &ChatTemplate, "mock-engine".into(), "http://mock".into(), &reuse_run(None));
+        assert!(again.cells.iter().all(|cell| !cell.all_cold()), "{}", again.render());
+        assert_eq!(ep.admitted()[DEPTHS.len()..], sent[..], "the same prompts, byte for byte");
+    }
+
+    /// GitHub #443: a bank as long as the reference's and, like it, tiled
+    /// from a shorter one, whose period is the depths' stride, so all three
+    /// depths' windows open on the same ids: the run cuts the deeper two a
+    /// rotation of their own and comes back cold, where it was refused.
+    #[test]
+    fn a_whole_run_cut_from_a_tiled_corpus_stays_cold_under_prompt_reuse() {
+        const PERIOD: usize = 65_536 / 3;
+        let bank: Vec<u32> = (0..65_536).map(|i| ((i % PERIOD) as u64 * 35_761 % 700_000) as u32 + 100).collect();
+        let (dir, corpus) = write_corpus_file(&bank);
+        let ep = PromptReuse::new(Steady, &ChatTemplate);
+        let record = measure(&ep, &ChatTemplate, "mock-engine".into(), "http://mock".into(), &reuse_run(Some(corpus)));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(record.all_cold(), "{}", record.render());
+        assert_eq!(ep.sharing_more_than(CHAT_HEADER), Vec::new(), "no two prompts share content");
+        assert_eq!(ep.admitted().iter().map(Vec::len).collect::<Vec<_>>(), depth_lengths());
+    }
+
+    /// GitHub #443: on a bank whose depths' windows do not collide, the run
+    /// cuts each depth the window it always did, the bank rotated by a third
+    /// per depth.
+    #[test]
+    fn each_depth_is_cut_from_its_own_third_of_the_bank_as_before() {
+        let bank: Vec<u32> = (0..65_536).map(|i| ((i * 37) % 900) as u32 + 100).collect();
+        let (dir, corpus) = write_corpus_file(&bank);
+        let ep = PromptReuse::new(Steady, &ChatTemplate);
+        measure(&ep, &ChatTemplate, "mock-engine".into(), "http://mock".into(), &reuse_run(Some(corpus)));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let instruction = decode_instruction(COMMITTED_TOKENS);
+        for (index, (&depth, sent)) in DEPTHS.iter().zip(ep.admitted()).enumerate() {
+            let mut rotated = bank.clone();
+            rotated.rotate_left(index * bank.len() / DEPTHS.len());
+            let alone = crate::ttft::generate_cell_prompts_from_corpus_with_suffix(
+                &ChatTemplate,
+                &rotated,
+                depth as usize,
+                1,
+                &instruction,
+            )
+            .expect("cut");
+            assert_eq!(sent, alone.tokens[0], "the {depth}-token depth");
         }
     }
 }

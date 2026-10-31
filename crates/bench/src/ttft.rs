@@ -1245,27 +1245,6 @@ pub fn measure_cell(
     })
 }
 
-/// Measure one cell cut from a pre-tokenized corpus (the `--corpus`
-/// path): its prompts are detokenized rotated windows of the corpus —
-/// bounded generation instead of the filler path's O(n²) growth — then
-/// the same warmup, samples and median as [`measure_cell`].
-pub fn measure_cell_from_corpus(
-    ep: &dyn Endpoint,
-    template: &dyn PromptTemplate,
-    spec: &CellSpec,
-    max_tokens: u32,
-    corpus: &[u32],
-) -> Cell {
-    measure_cell_with(ep, spec, max_tokens, || {
-        generate_cell_prompts_from_corpus(
-            template,
-            corpus,
-            spec.prompt_tokens as usize,
-            spec.samples + 1,
-        )
-    })
-}
-
 /// The shared measurement: one prompt set (generated however the caller
 /// says), the warmup request, then the samples and their median.
 fn measure_cell_with(

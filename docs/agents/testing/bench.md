@@ -8,9 +8,10 @@ two such records into the G2 verdict (ADR 0015). Both engines are measured
 by this one instrument; only the runs themselves need the GPU.
 
 Every sample — the warmup included — gets its own deterministically
-generated prompt, distinct from the first content token, and reads the
-engine's own computed-prefill-token count back to prove the prefix was
-cold. A sample whose computed prefill is not the prompt's own length is
+generated prompt, distinct from the first content token, from the other
+cells' prompts too ([every prompt of a run is its own](#every-prompt-of-a-run-is-its-own-github-426-443)),
+and reads the engine's own computed-prefill-token count back to prove the
+prefix was cold. A sample whose computed prefill is not the prompt's own length is
 **void** and fails its cell, and `g2` refuses a verdict over a record with
 a void sample, a missing cell, or a session that does not match its
 counterpart's.
@@ -87,8 +88,8 @@ ignis's text with `--vision-enabled` against without. The 1.5 threshold `g2` pri
 G2's own; for this cell the ratios are error detectors.
 
 **Measure a launch once.** The prompts are fixed — the same nonces, the same
-changed pixels — so a second `ttft` or `g3` run against a live engine is served
-from its prefix and media caches. What prompt reuse serves, ignis reports as
+changed pixels — so a second `ttft`, `g3` or `g5` run against a live engine is
+served from its prefix and media caches. What prompt reuse serves, ignis reports as
 cached tokens (#284), and those samples come back void; a media-cache hit counts
 none, and nothing catches it. Restart the engine instead.
 
@@ -194,13 +195,25 @@ The ITL decode lanes send each engine the one EOS control it is asked by:
 ([finding](../../findings/2026-09-13-itl-lane-terminator-race.md)). The run says
 which on stderr.
 
-The four prompt sets of a run (C=1, C=4, the ITL lanes, the ITL prefillers)
-are generated before its first request and proven distinct across cells: no
-two prompts share more than the chat template's own tokens, nor a whole KV page
-of them, or the run refuses to start and names the two. So prompt reuse, on by
-default, has nothing an earlier cell left behind to serve a later one from. The
-prompts are still fixed:
+## Every prompt of a run is its own (GitHub #426, #443)
+
+A `ttft`, `g3` or `g5` run generates all its prompts before its first request,
+numbered across the run: `ttft`'s a set per cell in `--cells` order, the image
+cell's last; `g3`'s C=1, C=4, the ITL lanes, then the ITL prefillers; `g5`'s one
+per depth. Each prompt starts with its own nonce and seed or, cut from a corpus,
+its own window, the run's windows spread evenly over the bank (a `g5` depth
+opens in its own third of it); a window that starts with another prompt's
+content is passed over for the next rotation. Then the run is proven: no two
+prompts share more than the chat template's own tokens, nor a whole KV page of
+them, or it refuses to start, every cell failing with an error that names the
+two. So prompt reuse, on by default, has nothing an earlier cell left behind to
+serve a later one from. A one-cell `ttft` run sends the prompts it always did.
+The prompts are still fixed:
 [measure a launch once](#the-multimodal-ttft-cell-github-181).
+
+The nonces cycle through 26 letters, so a filler run of more than 26 prompts
+(three cells at `--samples 8`) starts two of them with the same letter, which
+the check refuses where the tokenizer makes that letter a token of its own.
 
 ## The harness's own request deadline (GitHub #138)
 
