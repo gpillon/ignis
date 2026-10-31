@@ -317,23 +317,57 @@ language the context names, a moment is pointed at as `[mm:ss]`, and a section w
 nothing in it is a dash. **Update notes** writes them again from the whole
 transcript, so a correction holds; **Stop** leaves the notes there were. The
 line under them says when they were written, from how many utterances, and how
-many came since. **Copy notes** puts them on the clipboard as Markdown. Each
-transcript keeps its notes and its kind; a new one starts at the kind picked
-last (this browser keeps it).
+many came since. **Copy notes** puts them on the clipboard as Markdown; once
+there is a [recap](#the-recap), the button is **Copy recap** and copies that.
+Each transcript keeps its notes and its kind; a new one starts at the kind
+picked last (this browser keeps it).
 
 **Keep updating while listening**, off unless you turn it on (this browser
 keeps the choice), writes them by itself while a listening goes on: the first
 once three utterances are in, then about once a minute while something new is
-said, and once more when the listening ends. Picking another kind meanwhile
-writes them again straight away.
+said. When the listening ends it writes the recap instead. Picking another kind
+meanwhile writes them again straight away.
 
-Nothing goes to the model before a press or the switch. The notes go to the
+### The recap
+
+The **recap** is the notes written once from the whole conversation, for what
+comes after it. Notes kept up a minute at a time help while the conversation
+goes on, but weigh the first minutes' talk as much as the rest; the recap
+weighs the decisions, the action items and the open questions against
+everything that was said. It is written:
+
+- by itself when a listening ends with **Keep updating while listening** on,
+  in place of the notes' last writing, unless a recap of the same kind already
+  covers every utterance;
+- on **Write the recap**, at any moment, from the transcript as it stands.
+
+It has the kind's sections, with a few more:
+
+| Kind | The recap adds |
+|---|---|
+| Work call | Figures & dates, after People: every figure said, with what it refers to and when |
+| Lesson | Terms, after Key concepts, each with its meaning; Homework & dates, after To review |
+
+Its Summary and Topics carry the main threads by the weight the conversation
+gave them, not every aside; Decisions are what was agreed, Action items what
+someone committed to do, and People everyone who spoke or was named. It reads
+the context and the whole transcript afresh: the notes the model wrote are not
+sent, so a mistake made in them live does not carry over into the recap.
+
+Once there is a recap, it stands at the top of the tab with the line saying
+when it was written and from how many utterances, and the notes fold under it
+as **Running notes**; click to open them. While it is written it streams in
+there, and **Stop** keeps the recap there was. A new recap takes the last one's
+place. Each transcript keeps its recap, and a reload brings it back.
+
+Nothing goes to the model before a press or the switch. The notes and the recap go to the
 model loaded and name none, so they never switch models: with the image model
 loaded, or none serving, the tab says so and writes nothing. Each writing is a
 chat completion on an agent's lane (`class: "agent"`), thinking off, that waits
 while every lane is taken; the transcript is its user message after the title,
 so a later writing starts with the text the last one sent, which the server can
-reuse. A transcript too
+reuse. One writing goes at a time, the notes' or the recap's; a recap may take
+up to 3,000 tokens, twice the notes'. A transcript too
 long for the model's context is sent from where its tail fits, and the line
 says from when.
 

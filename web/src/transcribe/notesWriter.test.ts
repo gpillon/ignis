@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { ChunkEvent } from "../api/sse.ts";
 import type { StreamOptions, StreamResult } from "../api/stream.ts";
 import { ASSIST_SYSTEM } from "./assist.ts";
+import { EMPTY_CONTEXT } from "./context.ts";
 import { LIVE_GAP_MS, noNotes, notesTask, type Notes } from "./notes.ts";
-import { NotesWriter, type Written } from "./notesWriter.ts";
+import { type NotesForm, NotesWriter, type Written } from "./notesWriter.ts";
+import { recapTask } from "./recap.ts";
 import { contextBlock } from "./taskContext.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 
@@ -41,13 +43,13 @@ function fakeStream(scripts: { chunks?: string[]; result?: Partial<StreamResult>
 
 function writer(scripts: Parameters<typeof fakeStream>[0], now = () => 1_000) {
   const fake = fakeStream(scripts);
-  const written: [number, Written][] = [];
+  const written: [number, Written, NotesForm][] = [];
   const slept: number[] = [];
   const w = new NotesWriter({
     stream: fake.stream,
     now,
     sleep: async (ms) => void slept.push(ms),
-    onWritten: (id, notes) => written.push([id, notes]),
+    onWritten: (id, notes, form) => written.push([id, notes, form]),
   });
   return { w, fake, written, slept };
 }
@@ -74,9 +76,10 @@ describe("writing a Transcript's notes", () => {
           writtenAt: 1_000,
           fromMs: null,
         },
+        "running",
       ],
     ]);
-    expect(w.getState()).toEqual({ writing: null, text: "", failed: null });
+    expect(w.getState()).toEqual({ writing: null, form: "running", text: "", failed: null });
   });
 
   it("writes one at a time", async () => {
@@ -97,15 +100,15 @@ describe("writing a Transcript's notes", () => {
     await writing;
     expect(fake.asked[0].signal?.aborted).toBe(true);
     expect(written).toEqual([]);
-    expect(w.getState()).toEqual({ writing: null, text: "", failed: null });
+    expect(w.getState()).toEqual({ writing: null, form: "running", text: "", failed: null });
   });
 
   it("says why a writing failed, and that a model which wrote nothing did", async () => {
     const { w, written } = writer([{ result: { ok: false, message: "ignis answered 409: model_kind_mismatch" } }, { chunks: ["  "] }]);
     await w.write(heard(3, 4), "general", null);
-    expect(w.getState().failed).toEqual({ transcript: 4, message: "ignis answered 409: model_kind_mismatch" });
+    expect(w.getState().failed).toEqual({ transcript: 4, form: "running", message: "ignis answered 409: model_kind_mismatch" });
     await w.write(heard(3, 4), "general", null);
-    expect(w.getState().failed).toEqual({ transcript: 4, message: "The model wrote nothing." });
+    expect(w.getState().failed).toEqual({ transcript: 4, form: "running", message: "The model wrote nothing." });
     expect(written).toEqual([]);
   });
 
@@ -122,7 +125,7 @@ describe("keeping the notes up", () => {
 
   it("writes when the cadence says so, from this Transcript's last writing", async () => {
     let clock = 0;
-    const { w, fake } = writer([{ chunks: ["## A"] }, { chunks: ["## B"] }, { chunks: ["## C"] }], () => clock);
+    const { w, fake } = writer([{ chunks: ["## A"] }, { chunks: ["## B"] }], () => clock);
     await w.keepUp(heard(2), "general", null);
     expect(fake.asked).toHaveLength(0);
     await w.keepUp(heard(3), "general", null);
@@ -133,8 +136,6 @@ describe("keeping the notes up", () => {
     clock = LIVE_GAP_MS;
     await w.keepUp({ ...heard(4), notes: notes(3) }, "general", null);
     expect(fake.asked).toHaveLength(2);
-    await w.keepUp({ ...heard(5), notes: notes(4) }, "general", null, { final: true });
-    expect(fake.asked).toHaveLength(3);
   });
 
   it("waits the gap after a writing that failed, even where the cadence would write at once", async () => {
@@ -149,7 +150,7 @@ describe("keeping the notes up", () => {
     expect(fake.asked).toHaveLength(2);
   });
 
-  it("follows a listening, and writes once more when it ends, after the writing under way", async () => {
+  it("follows a listening, and writes the recap in place of the notes when it ends, after the writing under way", async () => {
     let clock = 0;
     const { w, fake } = writer([{ chunks: ["## A"], hold: true }, { chunks: ["## B"] }], () => clock);
     const transcripts = new Map([[1, heard(3, 1)]]);
@@ -165,8 +166,108 @@ describe("keeping the notes up", () => {
     clock = 1_000;
     await look(null);
     expect(fake.asked).toHaveLength(2);
+    expect(fake.asked[1].request.settings.systemPrompt).toBe(`${ASSIST_SYSTEM}\n\n${recapTask("general")}`);
     expect(fake.asked[1].request.turns[0].content).toContain("Frase 3.");
     await look(null);
     expect(fake.asked).toHaveLength(2);
+  });
+
+  it("writes the recap once at the end, even when the notes covered every utterance, and none when a recap already did", async () => {
+    const { w, fake, written } = writer([{ chunks: ["## Summary\n- Fine."] }]);
+    const transcripts = new Map([[1, { ...heard(4, 1), notes: notes(4) }]]);
+    const look = (on: number | null) => w.look(on, (id) => transcripts.get(id), () => "general", null);
+    await look(1);
+    expect(fake.asked).toHaveLength(0);
+    await look(null);
+    expect(fake.asked).toHaveLength(1);
+    expect(written).toEqual([[1, { lines: [{ section: "Summary", text: "Fine." }], writtenAs: "general", covered: 4, writtenAt: 1_000, fromMs: null }, "recap"]]);
+    await look(null);
+    expect(fake.asked).toHaveLength(1);
+    // A recap pressed after the last utterance: the end has nothing to add.
+    transcripts.set(2, { ...heard(4, 2), notes: notes(4), recap: { ...notes(4), writtenAt: 500 } });
+    await look(2);
+    await look(null);
+    expect(fake.asked).toHaveLength(1);
+  });
+});
+
+describe("writing the recap", () => {
+  /** A Work call whose running notes hold a line of the model's, one of the user's, and one the user removed. */
+  function call(): Transcript {
+    let t: Transcript = { ...createTranscript(5), title: "27 Oct 15:42 · Call", context: { ...EMPTY_CONTEXT, topic: "The spring launch's budget" } };
+    t = addUtterance(t, { stream: "s", startMs: 0, endMs: 2_000, text: "Il budget è di 40k.", voice: { kind: "me" } });
+    t = addUtterance(t, { stream: "s", startMs: 5_000, endMs: 7_000, text: "Ada segue gli acquisti.", voice: { kind: "others" } });
+    const notes: Notes = {
+      ...noNotes("work"),
+      lines: [
+        { id: "N1", section: "Summary", text: "The budget is 50k.", author: "model" },
+        { id: "N2", section: "People", text: "Ada leads procurement.", author: "user" },
+      ],
+      removed: [{ id: "N3", section: "People", text: "Speaker 3 is a vendor.", author: "model" }],
+      nextId: 4,
+      writtenAs: "work",
+      covered: 2,
+      writtenAt: 500,
+    };
+    return { ...t, notes };
+  }
+
+  it("sends one request: the recap's task, then the context, the whole transcript and only the user's own running lines, taken as true", async () => {
+    const { w, fake, written } = writer([{ chunks: ["## Summary\n- Il budget è di 40k [00:00].\n\n", "## Figures & dates\n- 40k: il budget [00:00]."] }]);
+    const t = call();
+    const seen: string[] = [];
+    w.subscribe(() => seen.push(`${w.getState().form}: ${w.getState().text}`));
+    await w.writeRecap(t, "work", null);
+    expect(fake.asked).toHaveLength(1);
+    const { settings, turns } = fake.asked[0].request;
+    expect(settings.systemPrompt).toBe(`${ASSIST_SYSTEM}\n\n${recapTask("work")}`);
+    expect(settings.maxTokens).toBe(3_000);
+    expect(turns).toEqual([
+      {
+        role: "user",
+        content:
+          contextBlock(t) +
+          "27 Oct 15:42 · Call\n\n[00:00] Me: Il budget è di 40k.\n[00:05] Others: Ada segue gli acquisti.\n\n" +
+          "Notes the user took during the conversation, to be taken as true:\n- People: Ada leads procurement.",
+      },
+    ]);
+    expect(turns[0].content).toContain("Topic: The spring launch's budget");
+    expect(turns[0].content).not.toContain("50k");
+    expect(turns[0].content).not.toContain("vendor");
+    expect(seen).toContain("recap: ## Summary\n- Il budget è di 40k [00:00].\n\n");
+    expect(written).toEqual([
+      [
+        5,
+        {
+          lines: [
+            { section: "Summary", text: "Il budget è di 40k [00:00]." },
+            { section: "Figures & dates", text: "40k: il budget [00:00]." },
+          ],
+          writtenAs: "work",
+          covered: 2,
+          writtenAt: 1_000,
+          fromMs: null,
+        },
+        "recap",
+      ],
+    ]);
+    expect(w.getState()).toEqual({ writing: null, form: "running", text: "", failed: null });
+  });
+
+  it("says when the user took no notes", async () => {
+    const { w, fake } = writer([{ chunks: ["## Summary\n- Ok."] }]);
+    await w.writeRecap(heard(3), "general", null);
+    expect(fake.asked[0].request.turns[0].content.endsWith("[00:10] Me: Frase 2.\n\nNotes the user took during the conversation: none.")).toBe(true);
+  });
+
+  it("is one writing at a time with the notes, and says why it failed", async () => {
+    const { w, fake } = writer([{ chunks: ["## A"], hold: true }, { result: { ok: false, message: "ignis answered 500" } }]);
+    const notesUnderWay = w.write(heard(3, 1), "general", null);
+    await w.writeRecap(heard(3, 1), "general", null);
+    expect(fake.asked).toHaveLength(1);
+    fake.release();
+    await notesUnderWay;
+    await w.writeRecap(heard(3, 1), "general", null);
+    expect(w.getState().failed).toEqual({ transcript: 1, form: "recap", message: "ignis answered 500" });
   });
 });

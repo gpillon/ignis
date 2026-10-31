@@ -98,6 +98,32 @@ describe("a Transcript in the store", () => {
     expect(kept).not.toHaveProperty("notes");
   });
 
+  it("keeps its recap as lines beside the running notes (#441), and drops a recap it cannot read without dropping the Transcript", async () => {
+    const recap: Notes = {
+      kind: "work",
+      lines: [
+        { id: "N1", section: "Figures & dates", text: "40k: il tetto [00:01]", author: "model" },
+        { id: "N2", section: "Decisions", text: "Tetto a 40k [00:01]", author: "user" },
+      ],
+      removed: [],
+      nextId: 3,
+      writtenAs: "work",
+      covered: 2,
+      writtenAt: 1_761_580_000_000,
+      fromMs: null,
+    };
+    const original = { ...heardTwice(), recap };
+    for (const store of [createMemoryStore(), openIndexedDbStore(new IDBFactory(), "transcribe-recap-test")]) {
+      await store.putDoc(TRANSCRIBE_SESSIONS, "k", toStored(original, { key: "k", order: 1 }));
+      const [back] = restoreTranscripts(await store.listDocs(TRANSCRIBE_SESSIONS), 1).transcripts;
+      expect(back).toEqual({ ...original, id: back.id });
+    }
+    const garbled = { ...toStored(original, { key: "k", order: 1 }), recap: { ...recap, nextId: 2 } };
+    const [kept] = restoreTranscripts([garbled], 1).transcripts;
+    expect(kept.utterances).toHaveLength(2);
+    expect(kept).not.toHaveProperty("recap");
+  });
+
   it("turns notes an older page kept as Markdown into lines on first read, all of them the model's", () => {
     const old = { kind: "work", text: "## Summary\nSi parte dal budget.\n\n## Action items\n- [ ] Ada manda le slide [00:01]\n\n## Decisions\n—", writtenAs: "work", covered: 2, writtenAt: 1_761_580_000_000, fromMs: null };
     const [back] = restoreTranscripts([{ ...toStored(heardTwice(), { key: "k", order: 1 }), notes: old }], 1).transcripts;

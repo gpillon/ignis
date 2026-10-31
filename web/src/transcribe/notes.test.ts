@@ -126,12 +126,6 @@ describe("keeping the notes up while listening", () => {
   it("writes them again as soon as another kind is picked", () => {
     expect(dueForUpdate({ notes: written({ covered: 4, kind: "game" }), utterances: 4, sinceLastMs: 1_000 })).toBe(true);
   });
-
-  it("writes once more at the end when something came after the last notes", () => {
-    expect(dueForUpdate({ notes: written({ covered: 4 }), utterances: 5, sinceLastMs: 1_000, final: true })).toBe(true);
-    expect(dueForUpdate({ notes: written({ covered: 4 }), utterances: 4, sinceLastMs: 1_000, final: true })).toBe(false);
-    expect(dueForUpdate({ notes: undefined, utterances: 1, sinceLastMs: null, final: true })).toBe(true);
-  });
 });
 
 describe("what the panel says", () => {

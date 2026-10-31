@@ -65,6 +65,8 @@ export type Transcript = {
   voices: number;
   /** Its notes (notes.ts): absent until a kind is picked or notes are written. */
   notes?: Notes;
+  /** Its recap (recap.ts), kept as lines as the notes are, its kind the one it was written as: absent until one is. */
+  recap?: Notes;
   /** What its transcription is told (context.ts), as last applied: absent until it is. */
   context?: CallContext;
   /** What was suggested for it, and what became of each (suggestions.ts). */
