@@ -1136,7 +1136,7 @@ impl RunPrompts {
 /// cells with that error rather than measuring some of them with a
 /// different prompt source than the others.
 ///
-/// The cells' four prompt sets are the run's ([`RunPrompts`], GitHub
+/// The cells' four prompt sets are the run's (`RunPrompts`, GitHub
 /// #426), generated before the first request is sent; a run they refuse
 /// fails all three cells with that refusal.
 pub fn measure(

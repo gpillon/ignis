@@ -390,7 +390,7 @@ pub struct PromptSetSpec<'a> {
 /// prompt reuse served it warm. So the prompts are numbered across the run,
 /// each set from where the previous one ended, and every prompt starts with
 /// its own nonce (or corpus offset); then the run is proven
-/// ([`prove_run_divergence`]) and refused, naming two prompts, where it
+/// (`prove_run_divergence`) and refused, naming two prompts, where it
 /// does not hold.
 pub fn generate_run_prompts<const N: usize>(
     template: &dyn PromptTemplate,
