@@ -364,69 +364,85 @@ pub fn generate_cell_prompts_with_suffix(
     count: usize,
     suffix: &str,
 ) -> Result<PromptSet, String> {
-    generate_session_prompts(template, target_tokens, suffix, SessionSlots::alone(count))
+    generate_numbered_prompts(template, target_tokens, suffix, Numbering::alone(count))
 }
 
-/// Where one cell's prompts sit among every prompt its measurement session
-/// sends (GitHub #426): the cell's `count` prompts are the session's
-/// prompts `first..first + count` of `total`.
+/// One of a run's prompt sets, as [`generate_run_prompts`] is asked for it:
+/// `count` prompts of exactly `target_tokens` post-template tokens, each
+/// ending with `suffix` (empty: none).
+#[derive(Debug, Clone, Copy)]
+pub struct PromptSetSpec<'a> {
+    pub count: usize,
+    pub target_tokens: usize,
+    pub suffix: &'a str,
+}
+
+/// Generate the prompt sets one run sends to one engine, in the order it
+/// sends them, cut from `corpus` when one is given and grown by the filler
+/// generator otherwise (GitHub #426). Each set is what
+/// [`generate_cell_prompts_with_suffix`] (or its corpus twin) generates for
+/// it, proof included, or that set's own error.
 ///
-/// What a cell proves of its own prompts holds across a session only when
-/// no two cells draw the same prompt: a cell that numbered its prompts from
-/// 0 again sent the first content of an earlier cell's prompt 0, and an
-/// engine with prompt reuse served it warm. Each cell takes the next slots,
-/// so every prompt of the session starts with its own nonce (or corpus
-/// offset).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionSlots {
+/// What a set proves of its own prompts holds across a run only when no two
+/// sets draw the same prompt: a set that numbered its prompts from 0 again
+/// sent the first content of an earlier set's prompt 0, and an engine with
+/// prompt reuse served it warm. So the prompts are numbered across the run,
+/// each set from where the previous one ended, and every prompt starts with
+/// its own nonce (or corpus offset).
+pub fn generate_run_prompts<const N: usize>(
+    template: &dyn PromptTemplate,
+    corpus: Option<&[u32]>,
+    sets: [PromptSetSpec<'_>; N],
+) -> [Result<PromptSet, String>; N] {
+    let total = sets.iter().map(|set| set.count).sum();
+    let mut first = 0;
+    sets.map(|set| {
+        let numbering = Numbering { first, count: set.count, total };
+        first += set.count;
+        match corpus {
+            Some(ids) => cut_corpus_prompts(template, ids, set.target_tokens, set.suffix, numbering),
+            None => generate_numbered_prompts(template, set.target_tokens, set.suffix, numbering),
+        }
+    })
+}
+
+/// Where one set's prompts sit among the prompts of its run: the run's
+/// prompts `first..first + count` of `total`.
+#[derive(Debug, Clone, Copy)]
+struct Numbering {
     first: usize,
     count: usize,
     total: usize,
 }
 
-impl SessionSlots {
-    /// A cell that is its whole session: slots `0..count`.
-    pub fn alone(count: usize) -> Self {
+impl Numbering {
+    /// A set that is its whole run: prompts `0..count`.
+    fn alone(count: usize) -> Self {
         Self { first: 0, count, total: count }
-    }
-
-    /// One set of slots per cell, `counts` prompts each, in the order the
-    /// session measures them.
-    pub fn plan(counts: &[usize]) -> Vec<Self> {
-        let total = counts.iter().sum();
-        counts
-            .iter()
-            .scan(0, |first, &count| {
-                let slots = Self { first: *first, count, total };
-                *first += count;
-                Some(slots)
-            })
-            .collect()
     }
 }
 
-/// [`generate_cell_prompts_with_suffix`] for a cell that holds `slots` of a
-/// larger session: its prompts are the session's, numbered from the cell's
-/// first slot, so they share no content with another cell's.
-pub fn generate_session_prompts(
+/// [`generate_cell_prompts_with_suffix`] for a set numbered as `numbering`
+/// says.
+fn generate_numbered_prompts(
     template: &dyn PromptTemplate,
     target_tokens: usize,
     suffix: &str,
-    slots: SessionSlots,
+    numbering: Numbering,
 ) -> Result<PromptSet, String> {
-    let count = slots.count;
+    let count = numbering.count;
     if count == 0 {
         return Err("a cell needs at least one prompt".to_string());
     }
     let mut prompts = Vec::with_capacity(count);
     let mut tokens = Vec::with_capacity(count);
     for index in 0..count {
-        let slot = slots.first + index;
+        let number = numbering.first + index;
         let prompt = generate_prompt_with_suffix(
             template,
             target_tokens,
-            &nonce(slot),
-            0x9E3779B97F4A7C15 ^ (slot as u64).wrapping_mul(0x100000001B3),
+            &nonce(number),
+            0x9E3779B97F4A7C15 ^ (number as u64).wrapping_mul(0x100000001B3),
             suffix,
         )?;
         let ids = template.encode_user_message(&prompt)?;
@@ -703,39 +719,39 @@ pub fn generate_cell_prompts_from_corpus_with_suffix(
     count: usize,
     suffix: &str,
 ) -> Result<PromptSet, String> {
-    generate_session_prompts_from_corpus(template, corpus, target_tokens, suffix, SessionSlots::alone(count))
+    cut_corpus_prompts(template, corpus, target_tokens, suffix, Numbering::alone(count))
 }
 
-/// [`generate_cell_prompts_from_corpus_with_suffix`] for a cell that holds
-/// `slots` of a larger session (GitHub #426): the windows are spread over
-/// all the session's prompts, `bank / total` ids apart, and the cell's
-/// start at its first slot's, so no two cells cut the same window.
-pub fn generate_session_prompts_from_corpus(
+/// [`generate_cell_prompts_from_corpus_with_suffix`] for a set numbered as
+/// `numbering` says (GitHub #426): the windows are spread over all the
+/// run's prompts, `bank / total` ids apart, and the set's start at its
+/// first prompt's, so no two sets cut the same window.
+fn cut_corpus_prompts(
     template: &dyn PromptTemplate,
     corpus: &[u32],
     target_tokens: usize,
     suffix: &str,
-    slots: SessionSlots,
+    numbering: Numbering,
 ) -> Result<PromptSet, String> {
-    let count = slots.count;
+    let count = numbering.count;
     if count == 0 {
         return Err("a cell needs at least one prompt".to_string());
     }
     if corpus.is_empty() {
         return Err("the corpus is empty: no window to cut".to_string());
     }
-    // One window per prompt of the session, rotated through the bank:
+    // One window per prompt of the run, rotated through the bank:
     // consecutive prompts start `bank/total` ids apart, so their first
     // content tokens differ (a bank periodicity that aligns two windows is
     // caught by the divergence proof below, and the cell then fails — never
     // measures a warm prefix).
-    let stride = corpus.len() / slots.total;
+    let stride = corpus.len() / numbering.total;
     if stride == 0 {
         return Err(format!(
-            "the corpus has only {} ids, fewer than the {} prompts the session needs: the \
+            "the corpus has only {} ids, fewer than the {} prompts the run needs: the \
              windows would be identical",
             corpus.len(),
-            slots.total
+            numbering.total
         ));
     }
     let overhead = template.encode_user_message("")?.len();
@@ -748,8 +764,8 @@ pub fn generate_session_prompts_from_corpus(
     let mut prompts = Vec::with_capacity(count);
     let mut tokens = Vec::with_capacity(count);
     for index in 0..count {
-        let slot = slots.first + index;
-        let offset = ((slot as u64) * (stride as u64)) % corpus.len() as u64;
+        let number = numbering.first + index;
+        let offset = ((number as u64) * (stride as u64)) % corpus.len() as u64;
         let (prompt, ids) =
             land_corpus_window(template, corpus, offset as usize, target_tokens, suffix)?;
         prompts.push(prompt);
