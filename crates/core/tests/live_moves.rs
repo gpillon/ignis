@@ -686,8 +686,9 @@ fn an_interactive_need_moves_an_agent_that_lent_its_pages_to_a_link() {
     // to 20 pages. I needs 63 of 64: only A's 20 and its 4 lent pages cover it.
     //
     // On a load whose opener's page rides the capture (Flash-Next, #306) the
-    // turn lends on `main`. On the 27B it lends since #249; before #249 it
-    // published nothing and was moved for its own 24 pages.
+    // turn lends on `main`. The 27B leg lends nothing before #249: the turn
+    // publishes nothing and is moved for its own 24 pages, as on `main`, so
+    // it starts to bite only once #249 lands and the 27B turn lends too.
     for rides_capture in [true, false] {
         let compute = Arc::new(MockCompute::new());
         let mut run = Run::new(ConcreteScheduler::with_config(
@@ -716,26 +717,28 @@ fn an_interactive_need_moves_an_agent_that_lent_its_pages_to_a_link() {
 #[test]
 fn a_move_counts_no_page_a_live_claimant_stands_on() {
     // S, an Interactive request older than I, claimed the four pages A
-    // published and decodes on them. I needs 42 pages beside A's 20, S's 20
-    // and the 4 they share: moving A would free its 20 and leave the 4 to S,
+    // published and decodes on them, with three pages of its own above them;
+    // it ends long before A does. I needs 61 pages beside A's 20, S's 3 and
+    // the 4 they share: moving A would free its 20 and leave the 4 to S,
     // short of I's need. Nothing moves until S is done; then A's 20 and the 4
-    // it alone holds cover I, and A moves.
+    // it alone holds cover I, its 20 alone do not, and A moves.
     let compute = Arc::new(MockCompute::new());
     let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
     let a = run.submit(agent_turn(), RequestClass::Agent);
     run.steps(4);
-    let s = run.submit(sibling_of_agent_turn(300), RequestClass::Interactive); // 24 pages, 4 of them A's
+    let s = run.submit(sibling_of_agent_turn(40), RequestClass::Interactive); // 7 pages, 4 of them A's
     run.steps(2);
     assert_eq!(run.sched.shared_prefix_of(s).map(|(_, tokens)| tokens), Some(64), "S stands on A's head");
 
-    let i = run.submit(live(500, 660), RequestClass::Interactive); // 42 pages
+    let i = run.submit(live(500, 960), RequestClass::Interactive); // 61 pages
     run.until(|run| run.done(s));
-    let s_done = run.first(|e| matches!(e, SchedEvent::Done { request, .. } if *request == s));
-    let a_moved = run.first(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == a));
-    assert!(a_moved.is_none() || a_moved >= s_done, "A did not move while S stood on its pages");
+    assert!(!run.moved_any(), "A did not move while S stood on its pages");
     assert_eq!(run.state(i), Some(RequestState::Admitted), "I waited");
+    run.step();
+    assert!(run.evicted(a), "once S was done, A moved for I");
+    assert_eq!(run.state(i), Some(RequestState::Running), "and I took its pages in the same advance");
     run.to_idle();
-    for (r, max) in [(a, 300), (s, 300), (i, 660)] {
+    for (r, max) in [(a, 300), (s, 40), (i, 960)] {
         assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
     }
     run.assert_no_work_lost();
