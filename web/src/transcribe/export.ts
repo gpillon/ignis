@@ -50,13 +50,6 @@ export function toText(t: Transcript): string {
     .join("");
 }
 
-/** `.md`, and what Open in chat seeds the composer with: the title and the start, then `**Speaker** (mm:ss): text`. */
-export function toMarkdown(t: Transcript): string {
-  const header = [`# ${t.title}`, ...(t.startedAt === null ? [] : [startedLine(t.startedAt)])];
-  const body = lines(t).map(({ u, text, speaker }) => `${speaker === null ? "" : `**${speaker}** `}(${startOf(u)}): ${text}`);
-  return `${[...header, ...body].join("\n\n")}\n`;
-}
-
 /** `.srt`: a numbered cue per utterance, from its start to its end, the speaker before the text. */
 export function toSrt(t: Transcript): string {
   return lines(t)

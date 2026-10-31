@@ -308,9 +308,11 @@ as:
 | Format | Each utterance |
 |---|---|
 | `.txt` (and Copy) | `[mm:ss] Speaker: text`, one line each |
-| `.md` | `**Speaker** (mm:ss): text`, after the title and the start |
+| `.md` | `**Speaker** (mm:ss): text`, after the title and the start, with the notes and Ask's answers (below) |
 | `.srt` | a numbered cue from its start to its end, `Speaker: text` |
 | `.vtt` | a cue from its start to its end, `<v Speaker>text` |
+
+The `.md` also carries what the view keeps beside the utterances. Under the title and the start come the **recap**, when the transcript has one, or else the running notes, each in its sections (`## Summary`, and so on, a section with no line shown as `—`), then a `## Transcript` heading over the utterances. Each answer Ask gave stands between the utterances at the moment it was asked, as a quoted block whose first line is the question in bold; an answer kept without a moment stands at the end. A transcript with no notes and no answers writes the `.md` as the table says. `.txt`, `.srt` and `.vtt` never carry notes or answers: they stay the transcript alone, so a tool reading them keeps working. Open in chat and Send to workspace use the same Markdown.
 
 **Open in chat** opens a new chat with the transcript as Markdown in its prompt
 box. Nothing is sent until you press Send: ask for a summary, the decisions,

@@ -1,6 +1,7 @@
 import { sendText, type Destination, type Sent } from "../workspace/send.ts";
 import type { Workspaces } from "../workspace/workspaces.ts";
-import { fileStem, toMarkdown } from "./export.ts";
+import { fileStem } from "./export.ts";
+import { toMarkdown } from "./markdown.ts";
 import { titleOf } from "./sessions.ts";
 import type { Transcript } from "./transcript.ts";
 
