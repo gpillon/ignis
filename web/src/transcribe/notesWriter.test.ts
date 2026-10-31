@@ -152,7 +152,8 @@ describe("the notes thread", () => {
     const first = turnsOf(fake.asked, 0)[0].content;
     expect(first).not.toContain("Frase 0. ");
     expect(first).toContain("\n[133:00] Me: Frase 399. ");
-    // Half the context is the threshold on a context this small: the first turn fills most of the other half.
+    // Half the context is the threshold on a context this small: the first turn fills the other half, less the answer's
+    // and the system prompt's reserves (NOTES_MAX_TOKENS, assist.ts's PROMPT_TOKENS), which this band allows for.
     expect(first.length).toBeLessThanOrEqual(16_384 * CHARS_PER_TOKEN);
     expect(first.length).toBeGreaterThan(12_000 * CHARS_PER_TOKEN);
     // The notes say from when: the first utterance it carries.
