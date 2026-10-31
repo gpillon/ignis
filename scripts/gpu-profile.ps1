@@ -165,10 +165,13 @@ try {
         # `--exclude ignis-speech`: the speech executor's ignored tests are CPU legs on the study
         # disk, hours long and run alone on the machine (spec speech/01), not GPU tests; the
         # server's speech legs are skipped by name (`$NotGpuLegs`).
+        # `--no-fail-fast`: cargo otherwise stops at the first failing test
+        # binary, so one flaky or failing binary hid every GPU test after it
+        # (#424, #425); the stage still fails, with every failure listed.
         $Skips = @("--skip", $CpuOracleTest)
         foreach ($Leg in $NotGpuLegs) { $Skips += @("--skip", $Leg) }
         Invoke-Stage "gpu tests (serialized)" {
-            & cargo test --workspace --exclude ignis-speech --features cuda -- --ignored --test-threads=1 --nocapture @Skips
+            & cargo test --workspace --exclude ignis-speech --features cuda --no-fail-fast -- --ignored --test-threads=1 --nocapture @Skips
         }
     }
 
