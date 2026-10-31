@@ -1035,6 +1035,15 @@ fn cmd_g3(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // GitHub #426: say which EOS control the ITL lanes carry, since ignis
+    // refuses the reference's.
+    match ep.eos_control() {
+        Ok(control) => eprintln!("ITL decode lanes suppress EOS with `{}`", control.field()),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     eprintln!("g3 session {session}: C=1 / C=4 / ITL against {label}");
 
     let cfg = g3::G3Config {

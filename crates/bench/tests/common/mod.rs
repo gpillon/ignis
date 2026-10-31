@@ -395,6 +395,17 @@ async fn completions(
     Json(raw): Json<serde_json::Value>,
 ) -> Response {
     state.inner.bodies.lock().unwrap().push(raw.clone());
+    // The mock's models are ignis's (`owned_by: "ignis"`), so it refuses a
+    // non-empty `logit_bias` the way ignis does (spec server/09, GitHub
+    // #288): the 400 that kept every g3 decode lane from decoding (#426).
+    let biased = raw.get("logit_bias").and_then(|bias| bias.as_object()).is_some_and(|bias| !bias.is_empty());
+    if biased {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_value",
+            "logit_bias: logit bias is not served; send {} or omit it (GitHub #288)",
+        );
+    }
     let req: CompletionsRequest = match serde_json::from_value(raw) {
         Ok(req) => req,
         Err(e) => {

@@ -33,7 +33,15 @@ impl PromptTemplate for WordTemplate {
     fn decode(&self, ids: &[u32]) -> Result<String, String> {
         Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
     }
+    /// One terminal token, so the decode lanes ask the engine to suppress
+    /// something, the way they do against a real artifact.
+    fn eos_token_ids(&self) -> Vec<u32> {
+        vec![EOS]
+    }
 }
+
+/// The terminal token [`WordTemplate`] reports.
+const EOS: u32 = 151_645;
 
 fn config(session: &str, label: &str) -> G3Config {
     G3Config {
@@ -121,6 +129,29 @@ fn a_record_measures_all_three_cells_cold_over_real_http() {
     assert_eq!(record.label, "ignis");
     assert_eq!(record.engine, engine.state.model());
     assert!(record.date.ends_with('Z'), "an RFC 3339 UTC date: {}", record.date);
+}
+
+/// GitHub #426: the mock's models are ignis's and it refuses a non-empty
+/// `logit_bias` the way ignis does, so the decode lanes reach it with
+/// `ignore_eos` alone, or not at all.
+#[test]
+fn the_decode_lanes_suppress_eos_on_ignis_with_ignore_eos_alone() {
+    let engine = engine();
+    let cfg = config("S-eos", "ignis");
+    let record = measure(&engine, &cfg);
+
+    assert!(record.itl.lanes.iter().all(|lane| lane.error.is_none()), "{:?}", record.itl.lanes);
+    let lanes: Vec<serde_json::Value> = engine
+        .state
+        .bodies()
+        .into_iter()
+        .filter(|body| body["max_tokens"] == cfg.itl.decode_max_tokens)
+        .collect();
+    assert_eq!(lanes.len(), cfg.itl.decode_lanes, "one body per decode lane");
+    for body in &lanes {
+        assert_eq!(body["ignore_eos"], true, "{body}");
+        assert!(body.get("logit_bias").is_none(), "{body}");
+    }
 }
 
 #[test]
