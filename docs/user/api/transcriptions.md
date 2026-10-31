@@ -113,7 +113,7 @@ is taken for no speech: the text comes back empty, with no language unless one
 was forced. One word is kept, since a name the context lists is said alone too.
 A copy with a word changed, added or dropped is kept by default, since people
 say a line that way too: `la revisione settimanale del rilascio`, under the
-topic `revisione settimanale del rilascio`, is a speaker's as often as the
+topic `revisione settimanale del rilascio`, can be a speaker's as well as the
 model's. With `speech.context_copy_edits` at 1 to 3 (0 by default), a
 transcript that many words or fewer from a whole line, or from a piece of one
 between commas or sentence marks, is no speech either while it keeps three or
