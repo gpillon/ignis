@@ -416,7 +416,9 @@ since the last update: the model keeps one conversation per transcript with the
 notes in it, and changes them a line at a time, adding a line, rewriting one or
 removing one, and rewriting a whole section only once it is full. A line still
 true stays word for word, so you never reread what you have read, and an update
-takes a few seconds however long the conversation is. The lines are in the
+takes a few seconds however long the conversation is. What an update changed is
+marked for about three seconds: a line added or changed has an ember border at
+its left, and a line removed stays struck and dimmed before it goes. The lines are in the
 language the context names; a moment is pointed at as `[mm:ss]`, or `h:mm:ss`
 past the hour; a section with nothing in it is a dash. **Stop** keeps every
 line already changed. The line under the notes says when they were last
