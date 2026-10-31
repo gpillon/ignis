@@ -106,7 +106,10 @@ it, never as a copy of what is still resident.
 The tiers also hold *live* sequences. When a request ranked above another
 cannot fit, the lower-ranked sequence (an `agent` one before an `interactive`
 one) is moved down a tier a window at a time between decode rounds, so the other
-lanes keep generating, and it resumes bit-exact where it stopped. With KV-disk
+lanes keep generating, and it resumes bit-exact where it stopped. The room a
+move makes counts the prompt pages the sequence left behind for reuse once only
+retained state holds them, so a request that published its prompt's head moves
+as readily as one that did not. With KV-disk
 on, no evicted live sequence is discarded to make room; when every tier is full
 of live work the new request waits in the queue
 ([KV-disk](../configuration/kv-disk.md)).
