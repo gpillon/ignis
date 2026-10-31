@@ -23,6 +23,9 @@ crates/core/tests/fixtures/flash_next/*.txt text eol=lf
 # The code span the trellis program is compared on (trellis_logits_gpu.rs): its
 # tokens are the measured top-1 agreement's positions.
 crates/core/tests/fixtures/trellis_logits/*.txt text eol=lf
+# The code span the span logits are checked on (span_logits_gpu.rs): its tokens
+# are the measured KL bounds' positions.
+crates/core/tests/fixtures/span_logits/*.txt text eol=lf
 
 # The operator catalog the alias tests split and edit at line ends
 # (download/catalog.rs: the line `models:`, the line `card_class: 16`): a
