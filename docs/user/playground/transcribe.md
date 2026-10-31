@@ -103,6 +103,9 @@ draft changed, so a suggestion accepted while it was open stays. On a pause
 with no one speaking, the model can write a line of the context in place of
 what it heard; the server takes such a copy for no speech, so it leaves no
 utterance ([the measurement](../../findings/2026-10-27-asr-context-echo.md)).
+Now and then the copy has a word changed or added, and that one stays, since
+people say a line that way too ([the
+second](../../findings/2026-10-31-asr-context-near-copy.md)).
 
 A transcript never started is told **your default**, once you save one: **Save
 as default**, beside an applied context or in a draft, keeps it in this

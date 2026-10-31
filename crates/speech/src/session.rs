@@ -370,7 +370,7 @@ impl Session {
             return (String::new(), None);
         }
         let p = parse(&text.decode(ids), self.language.as_deref());
-        if copies_context(&self.prompt.context, &p.text, self.tuning.context_copy_words) {
+        if copies_context(&self.prompt.context, &p.text, self.tuning.context_copy) {
             return (String::new(), None);
         }
         (p.text, p.language)
@@ -579,7 +579,7 @@ impl Commit {
         let text = &s.loaded.model.text;
         let p = parse(&text.decode(&all), s.language.as_deref());
         // A copy of the context is no speech: an empty transcript, labelled only by a forced language.
-        let (said, language) = if copies_context(&s.prompt.context, &p.text, s.tuning.context_copy_words) { (String::new(), s.language.clone()) } else { (p.text, p.language) };
+        let (said, language) = if copies_context(&s.prompt.context, &p.text, s.tuning.context_copy) { (String::new(), s.language.clone()) } else { (p.text, p.language) };
         Ok(Some(Transcript { text: said, language, audio_seconds: s.seconds(), audio_tokens: audio_tokens(total), tokens: all }))
     }
 }

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use ignis_speech::cpu::Isa;
 use ignis_speech::diarizer::{Constants, Diarizer, Stream};
 use ignis_speech::pool::Pool;
-use ignis_speech::{Features, ModelFiles, SessionTuning, Settings, Threads};
+use ignis_speech::{ContextCopy, Features, ModelFiles, SessionTuning, Settings, Threads};
 
 use super::executor::{
     CacheConstants, DiarizerExecutor, DiarizerStream, Frames, LoadSettings, Partial, SessionOpen, SpeechError, SpeechExecutor, SpeechFiles, SpeechSession,
@@ -132,7 +132,7 @@ impl SpeechExecutor for CpuExecutor {
             context_max_tokens: open.context_max_tokens as usize,
             rollback_tokens: open.rollback_tokens as usize,
             unfixed_partials: open.unfixed_partials as usize,
-            context_copy_words: open.context_copy_words as usize,
+            context_copy: ContextCopy { run: open.context_copy_words as usize, edits: open.context_copy_edits as usize },
         };
         let mut s = l.exec.open_tuned(&open.context, open.language.as_deref(), tuning).map_err(err)?;
         if open.keep_audio {

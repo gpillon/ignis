@@ -105,11 +105,19 @@ none is dropped in silence.
 
 On a clip with little or no speech, a pause's room noise or a short "yes", the
 model can write a line of the context instead of what it heard ([the
-measurement](../../findings/2026-10-27-asr-context-echo.md)). A transcript that
-only repeats a line of the context, the whole line or three or more of its
-words in a row (`speech.context_copy_words`; 0 turns this off), is taken for
-no speech: the text comes back empty, with no language unless one was forced.
-One word is kept, since a name the context lists is said alone too. A clip longer than
+measurement](../../findings/2026-10-27-asr-context-echo.md)), now and then
+with a word or two changed ([the second](../../findings/2026-10-31-asr-context-near-copy.md)).
+A transcript that only repeats a line of the context, the whole line or three
+or more of its words in a row (`speech.context_copy_words`; 0 turns this off),
+is taken for no speech: the text comes back empty, with no language unless one
+was forced. One word is kept, since a name the context lists is said alone too.
+A copy with a word changed, added or dropped is kept by default, since people
+say a line that way too: `la revisione settimanale del rilascio`, under the
+topic `revisione settimanale del rilascio`, can be a speaker's as well as the
+model's. With `speech.context_copy_edits` at 1 to 3 (0 by default), a
+transcript that many words or fewer from a whole line, or from a piece of one
+between commas or sentence marks, is no speech either while it keeps three or
+more of its words, and what people say that way is emptied with it. A clip longer than
 `speech.max_clip_seconds` (1200, the model's limit) is a `400` naming the
 limit, and is never split. The body limit is 384 MiB, enough for 20 minutes of
 48 kHz stereo WAV.

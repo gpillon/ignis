@@ -251,17 +251,9 @@ struct Asked {
     language: Option<String>,
 }
 
-/// The one-line list of keywords after the prompt (spec speech/02 §`keywords[]`).
-pub(super) fn context_of(prompt: Option<&str>, keywords: &[String]) -> String {
-    let prompt = prompt.map(str::trim).filter(|prompt| !prompt.is_empty());
-    let line = keywords.iter().map(|keyword| keyword.trim()).filter(|keyword| !keyword.is_empty()).collect::<Vec<_>>().join(", ");
-    match (prompt, line.is_empty()) {
-        (Some(prompt), false) => format!("{prompt}\n{line}"),
-        (Some(prompt), true) => prompt.to_owned(),
-        (None, false) => line,
-        (None, true) => String::new(),
-    }
-}
+/// The one-line list of keywords after the prompt (spec speech/02 §`keywords[]`): the speech
+/// crate's, beside the copy guard that reads its pieces.
+pub(super) use ignis_speech::text::context_of;
 
 /// Every field's rule (spec speech/02's table): the ones the handler reads
 /// here, the ones the shared table classifies in [`openai_fields`].
@@ -972,16 +964,6 @@ impl Stream for Events {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_context_is_the_prompt_then_the_keywords_as_one_line() {
-        let keywords = vec!["ignis".to_owned(), " Qwen3 ".to_owned(), String::new()];
-        assert_eq!(context_of(Some("A talk about GPUs."), &keywords), "A talk about GPUs.\nignis, Qwen3");
-        assert_eq!(context_of(None, &keywords), "ignis, Qwen3");
-        assert_eq!(context_of(Some("  just a prompt "), &[]), "just a prompt");
-        assert_eq!(context_of(None, &[]), "");
-        assert_eq!(context_of(Some(" "), &[]), "");
-    }
 
     #[test]
     fn one_language_forces_several_detect_and_both_fields_are_refused() {
