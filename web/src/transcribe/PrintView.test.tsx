@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { StaticPictures } from "../image/pictures.tsx";
 import { EMPTY_CONTEXT } from "./context.ts";
-import { addContextImage } from "./contextImages.ts";
+import { addContextImage, withReading } from "./contextImages.ts";
 import { noNotes } from "./notes.ts";
 import { printDocument } from "./pdf.ts";
 import { PdfDialog, PrintedTranscript } from "./PrintView.tsx";
@@ -67,6 +67,12 @@ describe("the print view", () => {
     expect(html).toMatch(/<time class="pdf-time">00:04<\/time><figure><img src="blob:slide-full" alt="Context image at 00:04"/);
     expect(html).not.toContain("blob:slide-thumb");
     expect(html.indexOf("blob:slide-full")).toBeLessThan(html.indexOf("forte"));
+  });
+
+  it("draws what was read in a context image under it, and only the picture's size under one not read yet", () => {
+    expect(drawn(call())).toMatch(/<figcaption><span class="pdf-picture-size">Context image, 1280×720<\/span><\/figcaption>/);
+    const read = withReading(call(), 1, { shows: "A slide titled <Budget>", topic: null, names: [], terms: ["OKR"], readAt: 5 });
+    expect(drawn(read)).toMatch(/<figcaption><p class="pdf-reading">A slide titled &lt;Budget&gt;\. Terms: OKR\.<\/p><span class="pdf-picture-size">Context image, 1280×720<\/span><\/figcaption>/);
   });
 
   it("marks a picture still being read, so the print waits for it", () => {

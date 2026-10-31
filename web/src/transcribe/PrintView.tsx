@@ -108,7 +108,10 @@ function Line({ block }: { block: Extract<PrintBlock, { kind: "utterance" | "ima
           <figure>
             <PrintPicture id={block.image} alt={`Context image at ${block.time}`} />
             <figcaption>
-              Context image, {block.width}×{block.height}
+              {block.reading !== undefined && <p className="pdf-reading">{block.reading}</p>}
+              <span className="pdf-picture-size">
+                Context image, {block.width}×{block.height}
+              </span>
             </figcaption>
           </figure>
         </li>

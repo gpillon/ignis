@@ -2,7 +2,7 @@ import { isSpeechLanguage, languageName } from "../speech/languages.ts";
 import type { ImageId } from "../store/imageStore.ts";
 import { answerAt } from "./ask.ts";
 import type { CallContext } from "./context.ts";
-import { imageAt } from "./contextImages.ts";
+import { imageAt, readingText } from "./contextImages.ts";
 import { clock, startedOn, startOf } from "./export.ts";
 import { notesMarkdown } from "./notes.ts";
 import { recapMarkdown } from "./recap.ts";
@@ -13,8 +13,9 @@ import { viewerChoice } from "./viewerChoice.ts";
 // The PDF of a transcript (spec #428, "Exports"): what it prints is computed
 // here, from the transcript and the three options its dialog asks, as a list
 // of blocks in the order they print; the print view (PrintView.tsx) only draws
-// them, and the browser's print dialog saves the file. A header and the lines
-// always; the context in short, the notes and Ask's answers on request.
+// them, and the browser's print dialog saves the file. A header and the lines,
+// with the context images and what was read in them, always; the context in
+// short, the notes and Ask's answers on request.
 
 /** What a PDF carries beside the header and the lines: each on or off. */
 export type PdfOptions = { recap: boolean; context: boolean; answers: boolean };
@@ -50,7 +51,8 @@ export type PrintBlock =
   | { kind: "notes"; title: "Recap" | "Notes"; markdown: string }
   | { kind: "heading"; text: string }
   | { kind: "utterance"; id: number; time: string; speaker: string | null; text: string }
-  | { kind: "image"; id: number; time: string; image: ImageId; width: number; height: number }
+  /** A context image, the whole picture; `reading`, what was read in it (the `.md`'s line after its moment), once read. */
+  | { kind: "image"; id: number; time: string; image: ImageId; width: number; height: number; reading?: string }
   /** An answer of Ask's, boxed, its question the title; `time` the moment it read up to, `null` for one kept before answers had one. */
   | { kind: "answer"; id: number; time: string | null; question: string; answer: string };
 
@@ -97,7 +99,10 @@ export function printDocument(t: Transcript, options: PdfOptions): PrintBlock[] 
   const answers = options.answers ? [...(t.asked ?? [])].sort((x, y) => x.id - y.id).filter((a) => a.answer.trim() !== "") : [];
   const asidesAt = (place: number) => {
     for (const i of images) {
-      if (imageAt(t.utterances, i.atMs) === place) body.push({ kind: "image", id: i.id, time: clock(i.atMs), image: i.image, width: i.width, height: i.height });
+      if (imageAt(t.utterances, i.atMs) === place) {
+        const reading = i.reading ? { reading: readingText(i.reading) } : {};
+        body.push({ kind: "image", id: i.id, time: clock(i.atMs), image: i.image, width: i.width, height: i.height, ...reading });
+      }
     }
     for (const a of answers) {
       if (answerAt(t.utterances, a.untilMs) === place) {

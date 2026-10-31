@@ -196,7 +196,8 @@ Terms: OKR.`, wherever the transcript goes:
 - in the running notes' next update, as a change under `Changed since:`
   ([Notes](#notes)), and in the recap's request, every picture read listed after
   the transcript;
-- in the `.md` ([Out of the view](#out-of-the-view)).
+- in the `.md` ([Out of the view](#out-of-the-view)), and under the picture in
+  the [PDF](#a-pdf).
 
 Its names and terms, and its topic while the context tells none, come as
 [suggestions](#suggestions) in the Call tab: accepted, or with **Always** on
@@ -349,7 +350,7 @@ as a file, or prints it as a [PDF](#a-pdf):
 | `.md` | `**Speaker** (mm:ss): text`, after the title and the start, with the notes, Ask's answers and the context images' readings (below) |
 | `.srt` | a numbered cue from its start to its end, `Speaker: text` |
 | `.vtt` | a cue from its start to its end, `<v Speaker>text` |
-| PDF | its time, then the speaker in bold and the text, with the context images at their moments, and on request the notes, the context and Ask's answers (below) |
+| PDF | its time, then the speaker in bold and the text, with the context images at their moments and what was read in each, and on request the notes, the context and Ask's answers (below) |
 
 The `.md` also carries what the view keeps beside the utterances. Under the title and the start come the **recap**, when the transcript has one, or else the running notes, each in its sections (`## Summary`, or `## Now` for the running notes, and so on, a section with no line shown as `—`), then a `## Transcript` heading over the utterances. Each answer Ask gave stands between the utterances at the moment it was asked, as a quoted block whose first line is the question in bold; an answer kept without a moment stands at the end. Each context image read stands at its moment as a line `[mm:ss] (image) ...` with what was read in it ([Reading it](#reading-it)), ahead of an answer asked at the same place; a picture not read yet has no line. A transcript with no notes, no answers and no picture read writes the `.md` as the table says. `.txt`, `.srt` and `.vtt` never carry notes, answers or pictures: they stay the transcript alone, so a tool reading them keeps working. Open in chat and Send to workspace use the same Markdown.
 
@@ -371,7 +372,8 @@ is nothing to add yet. All three are on the first time; after that the dialog
 starts from your last choice, which this browser keeps, as it keeps the notes'
 kind. Whatever you pick, the PDF opens on a header with the title, the start,
 the duration and the speakers, then carries every utterance with its time and
-its speaker in bold, and each context image at its moment.
+its speaker in bold, and each context image at its moment, with what was read
+in it under it, the line the `.md` has.
 
 **Print…** opens the browser's print dialog over that document alone: choose to
 save as PDF there; the file is offered under the name the other downloads take.
