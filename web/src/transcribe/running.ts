@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { minutesClock, toText } from "./export.ts";
-import { lineId, type NoteKind, type NoteLine, noNotes, type Notes, OTHER_SECTION, RUNNING_NOTES, type RunningSection, sectionOrder, specOf } from "./notes.ts";
+import { counted, lineId, type NoteKind, type NoteLine, noNotes, type Notes, OTHER_SECTION, RUNNING_NOTES, type RunningSection, sectionOrder, specOf } from "./notes.ts";
 import type { Transcript, Utterance } from "./transcript.ts";
 
 // The running notes (spec #428, "Running notes: the notes thread"; ADR 0076):
@@ -17,12 +17,10 @@ import type { Transcript, Utterance } from "./transcript.ts";
 /** A kind's live sections, in order. */
 export const runningSections = (kind: NoteKind): RunningSection[] => specOf(kind).running;
 
-const counted = (n: number) => (n === 1 ? "1 line" : `${n} lines`);
-
 /** The running task: the kind's live sections, each with its cap and what it asks for, and how the tools keep them. */
 export function runningTask(kind: NoteKind): string {
   const sections = runningSections(kind)
-    .map((s) => `## ${s.name} (${counted(s.cap)} at most)\n${s.ask}.`)
+    .map((s) => `## ${s.name} (${counted(s.cap, "line")} at most)\n${s.ask}.`)
     .join("\n\n");
   const rules = [
     "Rules:",
@@ -143,7 +141,7 @@ export function applyCall(notes: Notes, kind: NoteKind, call: ToolCall): Applied
       const bad = refusal(notes, section.name, text);
       if (bad) return refused(bad);
       if (theModels(notes, section.name).length >= section.cap) {
-        return refused(`Refused: ${section.name} is full (${counted(section.cap)}). Rewrite it with rewrite_section, merging what belongs together and folding this in.`);
+        return refused(`Refused: ${section.name} is full (${counted(section.cap, "line")}). Rewrite it with rewrite_section, merging what belongs together and folding this in.`);
       }
       const id = lineId(notes.nextId);
       const line: NoteLine = { id, section: section.name, text, author: "model" };
@@ -180,7 +178,7 @@ export function applyCall(notes: Notes, kind: NoteKind, call: ToolCall): Applied
       }
       const old = theModels(notes, section.name);
       if (old.length < section.cap) {
-        return refused(`Refused: ${section.name} has ${counted(old.length)}, not ${section.cap}: change single lines. rewrite_section is for a full section.`);
+        return refused(`Refused: ${section.name} has ${counted(old.length, "line")}, not ${section.cap}: change single lines. rewrite_section is for a full section.`);
       }
       let nextId = notes.nextId;
       const kept = new Set<string>();

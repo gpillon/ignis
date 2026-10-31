@@ -405,6 +405,13 @@ export function useTranscribe({
     if (form === "running") writer.editNotes(listNow.current.activeId, edit);
     else correct((t) => (t.recap ? { ...t, recap: edit(t.recap) } : t));
   };
+  /** A press of Write notes, Rewrite from scratch or Write the recap: the open Transcript's, while a text model serves. */
+  const writing = (how: "write" | "rewrite" | "writeRecap") => {
+    const { text: model } = latest.current;
+    if (model.blocked !== null) return;
+    const t = activeOf(listNow.current);
+    void writer[how](t, kindOf(t), model.contextLimit);
+  };
 
   const actions = useMemo<TranscribeActions>(
     () => ({
@@ -526,24 +533,9 @@ export function useTranscribe({
         chooseNoteKind(kind);
         correct((t) => ({ ...t, notes: { ...(t.notes ?? noNotes(kind)), kind } }));
       },
-      writeNotes: () => {
-        const { text: model } = latest.current;
-        if (model.blocked !== null) return;
-        const t = activeOf(listNow.current);
-        void writer.write(t, kindOf(t), model.contextLimit);
-      },
-      rewriteNotes: () => {
-        const { text: model } = latest.current;
-        if (model.blocked !== null) return;
-        const t = activeOf(listNow.current);
-        void writer.rewrite(t, kindOf(t), model.contextLimit);
-      },
-      writeRecap: () => {
-        const { text: model } = latest.current;
-        if (model.blocked !== null) return;
-        const t = activeOf(listNow.current);
-        void writer.writeRecap(t, kindOf(t), model.contextLimit);
-      },
+      writeNotes: () => writing("write"),
+      rewriteNotes: () => writing("rewrite"),
+      writeRecap: () => writing("writeRecap"),
       stopNotes: () => writer.stop(),
       setNotesLive: (on) => storeNotesLive(on),
       editNote: (form, line, text) => byHand(form, (n) => editLine(n, line, text)),

@@ -137,6 +137,9 @@ export type NoteAuthor = "model" | "user";
 /** A line of the notes: its id (`N1`, `N2`, never given twice), its section, its text, and who wrote it. */
 export type NoteLine = { id: string; section: string; text: string; author: NoteAuthor };
 
+/** `n` lines, or utterances: "1 line", "12 lines". */
+export const counted = (n: number, unit: "line" | "utterance"): string => (n === 1 ? `1 ${unit}` : `${n} ${unit}s`);
+
 /** The id of a line of the notes from its number: `N7`. */
 export const lineId = (n: number): string => `N${n}`;
 
