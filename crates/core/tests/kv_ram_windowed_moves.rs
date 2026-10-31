@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation};
 use ignis_core::disk::disk_file_bytes;
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, RequestState, SchedEvent};
 use ignis_core::{ConcreteScheduler, FakeDisk, MockCompute, MockSections, Scheduler, SchedulerConfig};
@@ -586,4 +587,113 @@ fn a_snapshot_on_its_way_back_is_never_given_up_for_another_victim() {
         assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
     }
     run.assert_no_work_lost();
+}
+
+// ── GitHub #444: a move a window at a time frees the chain it leaves ────────
+
+/// [`pool`] with prompt reuse on, and retained slots for the checkpoints and
+/// prefixes the turns below leave.
+fn reuse_pool() -> SchedulerConfig {
+    SchedulerConfig { prompt_reuse: true, retained_slots: 4, ..pool(4) }
+}
+
+/// An Agent conversation's turn, as in `live_moves.rs`: 70 prompt tokens
+/// whose generation opener ends at 66, so its checkpoint stands on the four
+/// whole pages below the opener, and 300 tokens to generate: 24 pages in all.
+fn agent_turn() -> RequestInput {
+    let mut turn = input((1..71).collect(), 300);
+    turn.opener_tokens = Some(66);
+    turn
+}
+
+/// [`agent_turn`] with a picture whose placeholders run from token 4 to 64,
+/// across its opener's page floor at 64, as in `live_moves.rs`: on a load
+/// whose opener's page rides the capture, the turn lends the pages below its
+/// opener to a pages-only link (ADR 0029, #306).
+fn agent_image_turn() -> RequestInput {
+    use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
+    let mut turn = agent_turn();
+    turn.multimodal = Some(Arc::new(Multimodal {
+        positions: (0..3).flat_map(|_| 0..70).collect(),
+        rope_delta: 0,
+        media: vec![MediaItem {
+            grid: Grid { t: 1, h: 2, w: 2 * 61 },
+            token_span: TokenSpan { begin: 4, count: 61 },
+            patches: Vec::new(),
+            content_digest: [0xAA; 32],
+        }],
+    }));
+    turn
+}
+
+/// A, holding four pages of its chain beside its reservation, decodes; an
+/// Interactive I needing 63 of the 64 pages, which only A's reservation and
+/// its chain cover, arrives. A's move goes a window at a time, as on both
+/// leaves: while it is in flight no advance judges I's need covered, and in
+/// the advance it lands the chain drops with A, or with the retained state
+/// the admission's first-victim pass gives up there, and I takes its pages.
+/// Returns the run, gone idle, and the advance A's move landed in.
+fn a_windowed_move_frees_the_chain(config: SchedulerConfig, turn: RequestInput) -> (Run, usize) {
+    let compute = windowed(4);
+    let mut run = Run::new(config, compute.clone());
+    let a = run.submit(turn, RequestClass::Agent);
+    run.steps(4);
+    assert!(!run.tokens(a).is_empty(), "A decodes alone first");
+    assert_eq!(run.sched.prefix_pinned_pages(), 4, "A's chain holds four pages beside its reservation");
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.step();
+    let started = run.advances - 1;
+    assert_eq!(compute.kv_ram_moves_started(), vec![(a, true)], "I's need started A's move, and only A's");
+    while !run.evicted(a) {
+        assert!(run.sched.in_transfer(a), "A is mid-move");
+        assert_eq!(run.sched.prefix_pinned_pages(), 4, "A's chain stays while A holds it");
+        assert_eq!(run.state(i), Some(RequestState::Admitted), "I waits for the room");
+        run.step();
+        assert!(run.sched.kv_used_pages() <= 64, "nothing was charged past the pool");
+    }
+    let landed = run.first(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == a)).unwrap();
+    assert_eq!(landed - started, MOVE as usize, "A left the device when its last window landed");
+    assert_eq!(
+        run.first(|e| matches!(e, SchedEvent::PrefillChunk { request, .. } if *request == i)),
+        Some(landed),
+        "I took its pages in the advance A's move landed in"
+    );
+    assert_eq!(run.sched.prefix_pinned_pages(), 0, "A's chain went with it");
+    assert_eq!(compute.kv_ram_moves_started(), vec![(a, true)], "nothing else moved for I");
+    run.to_idle();
+    for (r, max) in [(a, 300), (i, 1000)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+    (run, landed)
+}
+
+#[test]
+fn a_windowed_move_frees_the_prefix_an_agent_published_once_it_lands() {
+    // A's system block, two pages, is a retained prefix; the two pages above
+    // it, up to its opener's page floor, are a prefix chained over it, which
+    // A's checkpoint stands on. The checkpoint goes to KV-RAM when I arrives,
+    // the chained prefix drops with A, and the system block's retention is
+    // what the admission gives up once A has landed.
+    let mut turn = agent_turn();
+    turn.system_block_tokens = Some(2 * PAGE);
+    let (run, landed) = a_windowed_move_frees_the_chain(reuse_pool(), turn);
+    assert_eq!(
+        run.first(|e| matches!(
+            e,
+            SchedEvent::RetainedState { operation: RetainedStateOperation::Spill, kind: RetainedKind::Prefix, .. }
+        )),
+        Some(landed),
+        "the admission's first-victim pass gave the system block up in the advance A landed in"
+    );
+}
+
+#[test]
+fn a_windowed_move_frees_the_pages_an_agent_lent_to_a_link_once_it_lands() {
+    // A's picture spans its opener's page floor, and its opener's page rides
+    // the capture, so the capture lends the four pages below its opener to a
+    // pages-only link. The checkpoint goes to KV-RAM when I arrives, and the
+    // link, which only A holds then, drops with A.
+    a_windowed_move_frees_the_chain(SchedulerConfig { opener_page_rides_capture: true, ..reuse_pool() }, agent_image_turn());
 }
