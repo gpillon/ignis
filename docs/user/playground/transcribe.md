@@ -456,7 +456,9 @@ since the last update: the model keeps one conversation per transcript with the
 notes in it, and changes them a line at a time, adding a line, rewriting one or
 removing one, and rewriting a whole section only once it is full. A line still
 true stays word for word, so you never reread what you have read, and an update
-takes a few seconds however long the conversation is. What an update changed is
+takes a few seconds however long the conversation is
+([ADR 0076](../../adr/0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md)).
+What an update changed is
 marked for about three seconds: a line added or changed has an ember border at
 its left, and a line removed stays struck and dimmed before it goes. The lines are in the
 language the context names; a moment is pointed at as `[mm:ss]`, or `h:mm:ss`
@@ -544,7 +546,8 @@ gave them, not every aside; Decisions are what was agreed, Action items what
 someone committed to do, and People everyone who spoke or was named. It reads
 the context and the whole transcript afresh, then what each context image read
 showed, at its moment ([Reading it](#reading-it)): the notes the model wrote are
-not sent, so a mistake made in them live does not carry over into the recap. The
+not sent, so a mistake made in them live does not carry over into the recap
+([ADR 0076](../../adr/0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md)). The
 lines you wrote in the running notes are: they go as notes you took, to be taken
 as true, so a correction you made during the call reaches the recap.
 
