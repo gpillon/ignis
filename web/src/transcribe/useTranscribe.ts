@@ -11,7 +11,7 @@ import { useStoredSessions } from "../store/useStoredSessions.ts";
 import { decodeFile } from "./file.ts";
 import { filePace } from "./filePace.ts";
 import { chooseUtteranceSilence, utteranceSilence } from "./silence.ts";
-import { chooseNoteKind, kindOf, type NoteKind, noNotes } from "./notes.ts";
+import { chooseNoteKind, kindOf, type NoteKind, noNotes, withWriting } from "./notes.ts";
 import { type CallContext, contextAtStart, contextOf, contextTokensOf, copiedDraft, DEFAULT_CONTEXT_TOKENS, mergeDraft, told } from "./context.ts";
 import { savedContext, saveContext } from "./defaultContext.ts";
 import { readConfig } from "../server/routes.ts";
@@ -213,7 +213,7 @@ export function useTranscribe({
   const [writer] = useState(
     () =>
       new NotesWriter({
-        onWritten: (id, written) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, notes: { ...(t.notes ?? noNotes(written.writtenAs ?? "general")), ...written } }))),
+        onWritten: (id, written) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, notes: withWriting(t.notes, written) }))),
       }),
   );
   useEffect(() => () => writer.stop(), [writer]);
