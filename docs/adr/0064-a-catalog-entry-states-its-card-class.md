@@ -12,6 +12,10 @@ Accepted (2026-10-21, after the owner's review: "accetto tutto"). Proposed the s
 only a family's default id. The As built's "No family is declared" now holds where an entry's id or aliases name its
 family, or no alias involves it.
 
+**Amended** (2026-10-31): the As built's "Every built-in entry states one" holds for the text and image models. The
+built-in speech models (2026-10-24, 3982dd70, ADR 0067) and the diarizer (ADR 0069) run on the CPU and state none, so
+no card refuses them; the built-in catalog test pins them at none.
+
 Related:
 - [ADR 0047](0047-a-catalog-the-operator-can-extend.md): a catalog the operator can extend;
 - [ADR 0060](0060-the-27b-has-a-trellis-body-for-small-cards.md): the 16 GB body;
