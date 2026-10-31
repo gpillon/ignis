@@ -779,6 +779,56 @@ fn unreported_adaptation_note(active: &Value) -> Option<String> {
     })
 }
 
+/// The TTFT cells, in `cells` order, each of `samples` samples after its
+/// warmup, against `ep` with prompts measured by `template`: a cell longer
+/// than the running context `max_model_len` is not measured, and says so,
+/// nor is any when `template` cannot encode (a note says why).
+///
+/// The cells measured are one `ttft` run's ([`ttft::measure_cells`], GitHub
+/// #443): their prompts are generated before the first is sent and numbered
+/// across the run, so no cell's prompt starts with another cell's content
+/// for prompt reuse to serve it from, and a run whose prompts would share
+/// more fails every cell it measures.
+fn measure_ttft(
+    ep: &dyn Endpoint,
+    template: &dyn PromptTemplate,
+    cells: &[u32],
+    samples: usize,
+    max_model_len: Option<u64>,
+    notes: &mut Vec<String>,
+) -> Vec<TtftCell> {
+    let tokenizer_ok = match template.encode_user_message("hello") {
+        Ok(_) => true,
+        Err(e) => {
+            notes.push(format!("ttft: the server's /v1/tokenize is unusable ({e}); no cell can be built"));
+            false
+        }
+    };
+    let plan: Vec<Result<CellSpec, String>> = cells
+        .iter()
+        .map(|&prompt_tokens| match max_model_len.and_then(|limit| cell_does_not_fit(prompt_tokens, limit)) {
+            Some(why) => Err(why),
+            None if !tokenizer_ok => Err("no tokenizer: /v1/tokenize is unusable".into()),
+            None => Ok(CellSpec { prompt_tokens, samples }),
+        })
+        .collect();
+    let run: Vec<CellSpec> = plan.iter().filter_map(|cell| cell.as_ref().ok().copied()).collect();
+    let mut measured = Vec::new().into_iter();
+    if !run.is_empty() {
+        let lengths: Vec<String> = run.iter().map(|cell| cell.prompt_tokens.to_string()).collect();
+        eprintln!("ttft: {} tokens x {samples} samples (+1 warmup) each", lengths.join(", "));
+        measured = ttft::measure_cells(ep, template, &run, ttft::DEFAULT_MAX_TOKENS).into_iter();
+    }
+    cells
+        .iter()
+        .zip(plan)
+        .map(|(&prompt_tokens, cell)| match cell {
+            Ok(_) => ttft_cell(&measured.next().expect("a run measures every cell it is given")),
+            Err(why) => TtftCell::unmeasured(prompt_tokens, why),
+        })
+        .collect()
+}
+
 /// Run the preset against `opts.endpoint` and assemble the record.
 /// `nvidia_smi` is the card probe (the real one is [`run_nvidia_smi`]).
 pub fn run(opts: &Options, nvidia_smi: &dyn Fn() -> Result<String, String>) -> Report {
@@ -894,27 +944,7 @@ pub fn run(opts: &Options, nvidia_smi: &dyn Fn() -> Result<String, String>) -> R
     // TTFT.
     if model_id.is_some() {
         let template = ServerTemplate::new(&base);
-        let tokenizer_ok = match template.encode_user_message("hello") {
-            Ok(_) => true,
-            Err(e) => {
-                notes.push(format!("ttft: the server's /v1/tokenize is unusable ({e}); no cell can be built"));
-                false
-            }
-        };
-        for &prompt_tokens in &opts.cells {
-            if let Some(why) = max_model_len.and_then(|limit| cell_does_not_fit(prompt_tokens, limit)) {
-                ttft_cells.push(TtftCell::unmeasured(prompt_tokens, why));
-                continue;
-            }
-            if !tokenizer_ok {
-                ttft_cells.push(TtftCell::unmeasured(prompt_tokens, "no tokenizer: /v1/tokenize is unusable".into()));
-                continue;
-            }
-            eprintln!("ttft: {prompt_tokens} tokens x {} samples (+1 warmup)", opts.samples);
-            let spec = CellSpec { prompt_tokens, samples: opts.samples };
-            let cell = ttft::measure_cell(&api, &template, &spec, ttft::DEFAULT_MAX_TOKENS);
-            ttft_cells.push(ttft_cell(&cell));
-        }
+        ttft_cells = measure_ttft(&api, &template, &opts.cells, opts.samples, max_model_len, &mut notes);
     }
 
     // The plan, read last: a lazily built pool or a switch has landed by now.
@@ -953,6 +983,7 @@ pub fn run(opts: &Options, nvidia_smi: &dyn Fn() -> Result<String, String>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{ChatTemplate, PromptReuse, Steady, CHAT_HEADER};
 
     #[test]
     fn nvidia_smi_line_parses_into_the_card() {
@@ -1285,5 +1316,37 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
                 assert!(!body.contains(private), "{id} mentions {private}");
             }
         }
+    }
+
+    /// The default cells with one between them that does not fit a context
+    /// of the 64K cell plus its output.
+    const CELLS: [u32; 3] = [DEFAULT_CELLS[0], 100_000, DEFAULT_CELLS[1]];
+    const CONTEXT: Option<u64> = Some(DEFAULT_CELLS[1] as u64 + ttft::DEFAULT_MAX_TOKENS as u64);
+
+    /// GitHub #443: the TTFT cells are one run's, numbered across it, so under
+    /// prompt reuse the 64K cell's prompts share no more than the chat
+    /// template's header with the 8K cell's and come back cold, where each
+    /// cell numbered its prompts from 0 and the 64K cell's prompt i started
+    /// with all of the 8K cell's prompt i but its filler tail, 127 pages that
+    /// prompt reuse served once nothing evicted them. A cell that does not fit
+    /// stays unmeasured in its place, and the 8K cell sends the prompts it
+    /// always did.
+    #[test]
+    fn the_ttft_cells_are_one_run_and_come_back_cold_under_prompt_reuse() {
+        let ep = PromptReuse::new(Steady, &ChatTemplate);
+        let mut notes = Vec::new();
+        let cells = measure_ttft(&ep, &ChatTemplate, &CELLS, DEFAULT_SAMPLES, CONTEXT, &mut notes);
+
+        let measured: Vec<(u32, bool, bool)> =
+            cells.iter().map(|cell| (cell.prompt_tokens, cell.all_cold, cell.error.is_some())).collect();
+        assert_eq!(measured, [(8_192, true, false), (100_000, false, true), (65_536, true, false)], "{cells:?}");
+        assert!(cells[1].error.as_deref().is_some_and(|why| why.contains("does not fit")), "{:?}", cells[1]);
+        assert_eq!(ep.sharing_more_than(CHAT_HEADER), Vec::new(), "no two prompts share content");
+        let alone = ttft::generate_cell_prompts(&ChatTemplate, 8_192, DEFAULT_SAMPLES + 1).expect("prompts");
+        assert_eq!(ep.admitted()[..DEFAULT_SAMPLES + 1], alone.tokens[..]);
+        assert_eq!(notes, Vec::<String>::new());
+        // Not a vacuous mock: the cells again are served from what they left.
+        let again = measure_ttft(&ep, &ChatTemplate, &CELLS, DEFAULT_SAMPLES, CONTEXT, &mut notes);
+        assert!(again.iter().all(|cell| !cell.all_cold), "{again:?}");
     }
 }

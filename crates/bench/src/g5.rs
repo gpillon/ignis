@@ -302,7 +302,7 @@ mod tests {
     use super::*;
     use crate::client::{Endpoint, FinishReason, Outcome, Request};
     use crate::g3::measure_throughput_cell;
-    use crate::testutil::{PromptReuse, Steady, CHAT_FOOTER, CHAT_HEADER};
+    use crate::testutil::{ChatTemplate, PromptReuse, Steady, CHAT_FOOTER, CHAT_HEADER};
 
     /// A mock template: one token per whitespace-separated word — matches
     /// `g3.rs`'s / `g4.rs`'s own `MockTemplate` (a mock engine with no
@@ -604,22 +604,6 @@ mod tests {
     }
 
     // ── a whole run under prompt reuse (GitHub #443) ───────────────────────
-
-    /// [`MockTemplate`] inside the artifact's chat template in shape, for the
-    /// runs measured under prompt reuse.
-    struct ChatTemplate;
-
-    impl PromptTemplate for ChatTemplate {
-        fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
-            let mut ids: Vec<u32> = (0..CHAT_HEADER as u32).map(|i| 1_000 + i).collect();
-            ids.extend(MockTemplate.encode_user_message(content)?);
-            ids.extend((0..CHAT_FOOTER as u32).map(|i| 2_000 + i));
-            Ok(ids)
-        }
-        fn decode(&self, ids: &[u32]) -> Result<String, String> {
-            MockTemplate.decode(ids)
-        }
-    }
 
     fn reuse_run(corpus: Option<PathBuf>) -> G5Config {
         G5Config { profile: "prompt reuse on".into(), session: "S-reuse".into(), corpus, ..G5Config::default() }

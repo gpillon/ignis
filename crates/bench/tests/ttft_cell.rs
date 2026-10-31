@@ -164,7 +164,7 @@ fn an_engine_that_reports_no_usage_cannot_prove_a_cold_prefix() {
     let engine = MockEngine::start();
     let ep = HttpEndpoint::new(engine.url());
     // A cell measured without the trailing usage chunk has no evidence to
-    // read back. `ttft::measure_cell` always asks for it, so the way to
+    // read back. A TTFT sample always asks for it, so the way to
     // reach this state is an engine that ignores `stream_options` — proved
     // here through the outcome shape the instrument reads.
     let outcome = ep

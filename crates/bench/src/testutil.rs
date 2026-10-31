@@ -11,6 +11,25 @@ use crate::ttft::{common_prefix_len, PromptTemplate};
 pub(crate) const CHAT_HEADER: usize = 3;
 pub(crate) const CHAT_FOOTER: usize = 9;
 
+/// A template in that shape around one token per whitespace-separated word,
+/// each word hashed to an id; an id decodes to a `t<id>` word, which hashes
+/// to an id of its own.
+pub(crate) struct ChatTemplate;
+
+impl PromptTemplate for ChatTemplate {
+    fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+        let mut ids: Vec<u32> = (0..CHAT_HEADER as u32).map(|i| 1_000 + i).collect();
+        ids.extend(
+            content.split_whitespace().map(|w| w.bytes().fold(7u32, |a, b| a.wrapping_mul(131).wrapping_add(b as u32))),
+        );
+        ids.extend((0..CHAT_FOOTER as u32).map(|i| 2_000 + i));
+        Ok(ids)
+    }
+    fn decode(&self, ids: &[u32]) -> Result<String, String> {
+        Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+    }
+}
+
 /// A stand-in for an engine that serves any repeated prefix from a
 /// cache, around another endpoint whose outcomes it reports the usage
 /// of: the spec's mock (GitHub #426), which covers ignis's **prompt

@@ -1232,19 +1232,6 @@ fn sample_request(id: String, prompt: String, images: Vec<String>, max_tokens: u
     }
 }
 
-/// Measure one cell: generate its prompts (the filler path), send the
-/// warmup, then take the samples and reduce them to a median.
-pub fn measure_cell(
-    ep: &dyn Endpoint,
-    template: &dyn PromptTemplate,
-    spec: &CellSpec,
-    max_tokens: u32,
-) -> Cell {
-    measure_cell_with(ep, spec, max_tokens, || {
-        generate_cell_prompts(template, spec.prompt_tokens as usize, spec.samples + 1)
-    })
-}
-
 /// The shared measurement: one prompt set (generated however the caller
 /// says), the warmup request, then the samples and their median.
 fn measure_cell_with(
@@ -1431,13 +1418,17 @@ struct CellPrompts {
 }
 
 impl CellPrompts {
-    /// The prompts of a run measured as `cfg` says, the text cells' cut from
+    /// The prompts of a run of `cells`, then `image`, the text cells' cut from
     /// `corpus` when one is given and grown by the filler generator
     /// otherwise, or why the run cannot start.
-    fn generate(template: &dyn PromptTemplate, corpus: Option<&[u32]>, cfg: &TtftConfig) -> Result<Self, String> {
-        let mut run = RunNumbering::of(cfg.cells.iter().map(|cell| cell.samples + 1).sum());
-        let text = cfg
-            .cells
+    fn generate(
+        template: &dyn PromptTemplate,
+        corpus: Option<&[u32]>,
+        cells: &[CellSpec],
+        image: Option<&ImageCellSpec>,
+    ) -> Result<Self, String> {
+        let mut run = RunNumbering::of(cells.iter().map(|cell| cell.samples + 1).sum());
+        let text = cells
             .iter()
             .map(|cell| {
                 let label = format!("{}-token cell", cell.prompt_tokens);
@@ -1450,7 +1441,7 @@ impl CellPrompts {
                 run.generate(template, corpus, &set)
             })
             .collect();
-        let image = cfg.image.as_ref().map(|spec| run.generate_image(template, spec));
+        let image = image.map(|spec| run.generate_image(template, spec));
         run.prove(template)?;
         Ok(Self { text, image })
     }
@@ -1471,22 +1462,7 @@ pub fn measure(
     cfg: &TtftConfig,
 ) -> Record {
     let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path)).transpose();
-    let cells = match corpus.and_then(|bank| CellPrompts::generate(template, bank.as_deref(), cfg)) {
-        Err(error) => {
-            let image = cfg.image.as_ref().map(|spec| {
-                failed_cell(0, ImageIdentity::of(&spec.png, &spec.question).ok(), error.clone())
-            });
-            cfg.cells.iter().map(|spec| failed_cell(spec.prompt_tokens, None, error.clone())).chain(image).collect()
-        }
-        Ok(CellPrompts { text, image }) => {
-            let mut cells: Vec<Cell> =
-                cfg.cells.iter().zip(text).map(|(spec, set)| measure_cell_with(ep, spec, cfg.max_tokens, || set)).collect();
-            if let (Some(spec), Some(set)) = (&cfg.image, image) {
-                cells.push(measure_image_cell_with(ep, spec, cfg.max_tokens, || set));
-            }
-            cells
-        }
-    };
+    let cells = measure_run(ep, template, corpus, &cfg.cells, cfg.image.as_ref(), cfg.max_tokens);
     Record {
         session: cfg.session.clone(),
         label: cfg.label.clone(),
@@ -1497,6 +1473,47 @@ pub fn measure(
         date: utc_timestamp(unix_now()),
         max_tokens: cfg.max_tokens,
         cells,
+    }
+}
+
+/// Measure `cells` against one endpoint as the text cells of one run, in
+/// order, their prompts grown by the filler generator: what a `ttft` run
+/// without a corpus or an image measures (the `small-card` preset's TTFT,
+/// GitHub #443).
+pub(crate) fn measure_cells(
+    ep: &dyn Endpoint,
+    template: &dyn PromptTemplate,
+    cells: &[CellSpec],
+    max_tokens: u32,
+) -> Vec<Cell> {
+    measure_run(ep, template, Ok(None), cells, None, max_tokens)
+}
+
+/// Measure `cells`, then `image`, against one endpoint as one run's cells,
+/// their prompts the run's (`CellPrompts`), the text cells' cut from
+/// `corpus` when it holds one; a corpus that could not be read, or a run its
+/// prompts refuse, fails every cell with that error.
+fn measure_run(
+    ep: &dyn Endpoint,
+    template: &dyn PromptTemplate,
+    corpus: Result<Option<Vec<u32>>, String>,
+    cells: &[CellSpec],
+    image: Option<&ImageCellSpec>,
+    max_tokens: u32,
+) -> Vec<Cell> {
+    match corpus.and_then(|bank| CellPrompts::generate(template, bank.as_deref(), cells, image)) {
+        Err(error) => {
+            let image = image.map(|spec| failed_cell(0, ImageIdentity::of(&spec.png, &spec.question).ok(), error.clone()));
+            cells.iter().map(|spec| failed_cell(spec.prompt_tokens, None, error.clone())).chain(image).collect()
+        }
+        Ok(CellPrompts { text, image: image_set }) => {
+            let mut measured: Vec<Cell> =
+                cells.iter().zip(text).map(|(spec, set)| measure_cell_with(ep, spec, max_tokens, || set)).collect();
+            if let (Some(spec), Some(set)) = (image, image_set) {
+                measured.push(measure_image_cell_with(ep, spec, max_tokens, || set));
+            }
+            measured
+        }
     }
 }
 
