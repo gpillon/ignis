@@ -129,12 +129,17 @@ export type Notes = {
 /** The task: the kind's sections and how to write them (assist.ts). */
 export function notesTask(kind: NoteKind): string {
   const spec = specOf(kind);
-  const sections = spec.sections.map((s) => `## ${s.name}\n${s.ask}.`).join("\n\n");
+  return sectionsTask(`Write the notes of ${spec.about}`, spec.sections);
+}
+
+/** A writing in sections (the notes, the recap): what to write, its sections in order, its own rules ahead of the notes'. */
+export function sectionsTask(opening: string, sections: NoteSection[], rules: string[] = []): string {
   return [
-    `Write the notes of ${spec.about}: these sections, in this order, each under a level-2 Markdown heading (\`## \`):`,
-    sections,
+    `${opening}: these sections, in this order, each under a level-2 Markdown heading (\`## \`):`,
+    sections.map((s) => `## ${s.name}\n${s.ask}.`).join("\n\n"),
     [
       "Rules:",
+      ...rules,
       "- Keep each heading exactly as given. Write the text under them in the language the context says to write in.",
       "- Short bullet points. No preamble, no closing remark, nothing outside the sections.",
       "- A section with nothing in it yet is `—` alone.",
@@ -169,14 +174,13 @@ export const LIVE_GAP_MS = 60_000;
 
 /**
  * Whether a listening that keeps the notes up writes them now. `sinceLastMs`: since this Transcript's last writing
- * began, `null` if none did; `final`, the listening just ended.
+ * began, `null` if none did. The listening's end writes the recap instead (recap.ts).
  */
-export function dueForUpdate({ notes, utterances, sinceLastMs, final = false }: { notes: Notes | undefined; utterances: number; sinceLastMs: number | null; final?: boolean }): boolean {
+export function dueForUpdate({ notes, utterances, sinceLastMs }: { notes: Notes | undefined; utterances: number; sinceLastMs: number | null }): boolean {
   const covered = notes?.writtenAs ? notes.covered : 0;
   const fresh = utterances - covered;
   if (notes?.writtenAs && notes.writtenAs !== notes.kind) return utterances > 0;
   if (fresh <= 0) return false;
-  if (final) return true;
   if (covered === 0) return fresh >= FIRST_LIVE_UTTERANCES;
   return sinceLastMs === null || sinceLastMs >= LIVE_GAP_MS;
 }
@@ -228,8 +232,10 @@ const NOTHING = /^[—–-]?$/;
  * The model's notes as lines: a line per bullet or paragraph, in the section of the level-2 heading above it, a heading
  * of the kind's written as the kind spells it. A section's `—` is no line; what sits under no heading goes under Other.
  */
-export function parseNotes(answer: string, kind: NoteKind): DraftLine[] {
-  const names = specOf(kind).sections.map((s) => s.name);
+export const parseNotes = (answer: string, kind: NoteKind): DraftLine[] => parseLines(answer, specOf(kind).sections.map((s) => s.name));
+
+/** A writing's answer as lines (parseNotes), a heading among `names` written as `names` spells it. */
+export function parseLines(answer: string, names: string[]): DraftLine[] {
   const lines: DraftLine[] = [];
   let section = OTHER_SECTION;
   let open: string[] | null = null;
@@ -286,11 +292,11 @@ export function withWriting(notes: Notes | undefined, { lines: drafts, ...writte
 /**
  * The notes as Markdown, what the tab shows and Copy notes gives: the sections of the kind they were written as, in
  * order, `—` under one with no line, then any other section a line sits in; nothing says who wrote a line. "" before
- * any are written.
+ * any are written. `named`: the sections in order, when they are not the kind's (the recap's).
  */
-export function notesMarkdown(notes: Notes | undefined): string {
+export function notesMarkdown(notes: Notes | undefined, named?: NoteSection[]): string {
   if (!notes || (notes.writtenAs === null && notes.lines.length === 0)) return "";
-  const kinds = specOf(notes.writtenAs ?? notes.kind).sections.map((s) => s.name);
+  const kinds = (named ?? specOf(notes.writtenAs ?? notes.kind).sections).map((s) => s.name);
   const sections = [...new Set([...kinds, ...notes.lines.map((l) => l.section)])];
   return sections
     .map((section) => {

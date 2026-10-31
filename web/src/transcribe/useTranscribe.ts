@@ -15,6 +15,7 @@ import { decodeFile } from "./file.ts";
 import { filePace } from "./filePace.ts";
 import { chooseUtteranceSilence, utteranceSilence } from "./silence.ts";
 import { chooseNoteKind, kindOf, type NoteKind, noNotes, withWriting } from "./notes.ts";
+import { withRecap } from "./recap.ts";
 import { type CallContext, contextAtStart, contextOf, contextTokensOf, copiedDraft, DEFAULT_CONTEXT_TOKENS, mergeDraft, told } from "./context.ts";
 import { savedContext, saveContext } from "./defaultContext.ts";
 import { readConfig } from "../server/routes.ts";
@@ -137,6 +138,9 @@ export type TranscribeActions = {
   setNoteKind: (kind: NoteKind) => void;
   /** Writes the open Transcript's notes now. */
   writeNotes: () => void;
+  /** Writes the open Transcript's recap now, from the whole of it. */
+  writeRecap: () => void;
+  /** Stops the writing under way, the notes' or the recap's. */
   stopNotes: () => void;
   setNotesLive: (on: boolean) => void;
   /** The open Transcript's suggestion accepted; `always`, and every later one of its kind (Q132). */
@@ -234,7 +238,8 @@ export function useTranscribe({
   const [writer] = useState(
     () =>
       new NotesWriter({
-        onWritten: (id, written) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, notes: withWriting(t.notes, written) }))),
+        onWritten: (id, written, form) =>
+          setList((l) => updateTranscript(l, id, (t) => (form === "recap" ? { ...t, recap: withRecap(t.recap, written) } : { ...t, notes: withWriting(t.notes, written) }))),
       }),
   );
   useEffect(() => () => writer.stop(), [writer]);
@@ -478,6 +483,12 @@ export function useTranscribe({
         if (model.blocked !== null) return;
         const t = activeOf(listNow.current);
         void writer.write(t, kindOf(t), model.contextLimit);
+      },
+      writeRecap: () => {
+        const { text: model } = latest.current;
+        if (model.blocked !== null) return;
+        const t = activeOf(listNow.current);
+        void writer.writeRecap(t, kindOf(t), model.contextLimit);
       },
       stopNotes: () => writer.stop(),
       setNotesLive: (on) => storeNotesLive(on),

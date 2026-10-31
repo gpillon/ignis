@@ -5,7 +5,7 @@ import { ContextCard } from "./Context.tsx";
 import { ANSWER_AFTER_MS, Deck, deckHint, HEADPHONES, startBlocked, startPress, Strip, stripStatus, timeLeft } from "./Deck.tsx";
 import { IDLE, type ListeningState } from "./listening.ts";
 import { AskBar } from "./Ask.tsx";
-import { NotesPanel, notesButton } from "./Notes.tsx";
+import { NotesPanel, notesButton, recapButton } from "./Notes.tsx";
 import type { AnalystState } from "./analyst.ts";
 import type { AskerState } from "./ask.ts";
 import { SuggestionsPanel, suggestionText } from "./Suggestions.tsx";
@@ -50,6 +50,7 @@ const actions: TranscribeActions = {
   editText: none,
   setNoteKind: none,
   writeNotes: none,
+  writeRecap: none,
   stopNotes: none,
   setNotesLive: none,
   acceptSuggestion: none,
@@ -541,7 +542,7 @@ describe("asking about the conversation, in its flow (Q139, Q141)", () => {
 });
 
 describe("the notes", () => {
-  const idle: NotesWriterState = { writing: null, text: "", failed: null };
+  const idle: NotesWriterState = { writing: null, form: "running", text: "", failed: null };
   const written = (t: Transcript): Transcript => ({
     ...t,
     notes: {
@@ -563,8 +564,9 @@ describe("the notes", () => {
     expect(html).toMatch(/role="radio" aria-checked="true"[^>]*><span[^>]*>General<\/span>/);
     expect(html).toContain("Game session");
     expect(html).toContain(">Write notes<");
-    expect(html).toContain("Nothing goes to it until you press Write notes");
+    expect(html).toContain("Nothing goes to it until you press Write notes or Write the recap, or turn on Keep updating.");
     expect(html).toMatch(/role="switch" aria-checked="false"[^>]*>.*Keep updating while listening/);
+    expect(html).toContain("About once a minute while something new is said, and the recap when the listening ends.");
   });
 
   it("shows the notes written, their lines in the kind's sections, when and from how much, and offers to update them", () => {
@@ -578,26 +580,80 @@ describe("the notes", () => {
 
   it("streams a writing under the heat, the button a Stop", () => {
     const t = written(room());
-    const html = panel(t, { writing: t.id, text: "## Argomenti\n- Il budget", failed: null });
+    const html = panel(t, { writing: t.id, form: "running", text: "## Argomenti\n- Il budget", failed: null });
     expect(html).toContain("spine-live");
     expect(html).toContain("<h2>Argomenti</h2>");
     expect(html).not.toContain("Si apre.");
-    expect(notesButton(t, { writing: t.id, text: "", failed: null }, null)).toEqual({ label: "Stop", disabled: false, stops: true });
+    expect(notesButton(t, { writing: t.id, form: "running", text: "", failed: null }, null)).toEqual({ label: "Stop", disabled: false, stops: true });
   });
 
   it("cannot write with no text model, nothing heard, or another Transcript's notes under way, and says why it failed", () => {
     const t = room();
     expect(notesButton(t, idle, "No text model serves: the notes and the suggestions need one. Load it in the Server view.").disabled).toBe(true);
     expect(notesButton(createTranscript(2), idle, null).disabled).toBe(true);
-    expect(notesButton(t, { writing: 9, text: "", failed: null }, null).disabled).toBe(true);
+    expect(notesButton(t, { writing: 9, form: "running", text: "", failed: null }, null).disabled).toBe(true);
     expect(panel(t, idle, { textBlocked: "The image model is loaded: the notes and the suggestions need a text model. Switch in the Server view." })).toContain("The image model is loaded");
-    expect(panel(t, { writing: null, text: "", failed: { transcript: t.id, message: "The model wrote nothing." } })).toContain("The notes were not written: The model wrote nothing.");
+    expect(panel(t, { ...idle, failed: { transcript: t.id, form: "running", message: "The model wrote nothing." } })).toContain("The notes were not written: The model wrote nothing.");
+  });
+
+  const recapped = (t: Transcript): Transcript => ({
+    ...written(t),
+    recap: {
+      kind: "work",
+      lines: [
+        { id: "N1", section: "Summary", text: "Il budget del lancio.", author: "model" },
+        { id: "N2", section: "Figures & dates", text: "40k: il tetto [00:01]", author: "user" },
+      ],
+      removed: [],
+      nextId: 3,
+      writtenAs: "work",
+      covered: 1,
+      writtenAt: new Date(2026, 9, 27, 16, 20).getTime(),
+      fromMs: null,
+    },
+  });
+
+  it("offers Write the recap at any moment, and shows no recap and no fold before one is written", () => {
+    const html = panel(written(room()));
+    expect(html).toContain(">Write the recap<");
+    expect(html).not.toContain("<details");
+    expect(html).toContain(">Copy notes<");
+    expect(recapButton(room(), idle, null)).toEqual({ label: "Write the recap", disabled: false, stops: false });
+  });
+
+  it("shows the recap on top once it exists, in its sections, the running notes folded under it", () => {
+    const html = panel(recapped(room()));
+    const recap = html.indexOf('aria-label="Recap"');
+    const fold = html.indexOf("<details");
+    expect(recap).toBeGreaterThan(0);
+    expect(fold).toBeGreaterThan(recap);
+    expect(html.slice(recap, fold)).toMatch(/<h2>Figures &amp; dates<\/h2>\s*<ul>\s*<li>40k: il tetto/);
+    expect(html.slice(recap, fold)).toContain("Written at 16:20 from 1 utterance.");
+    expect(html).toMatch(/<details[^>]*><summary[^>]*>Running notes<\/summary>/);
+    expect(html).not.toMatch(/<details[^>]*open/);
+    expect(html.slice(fold)).toContain("Si apre.");
+    expect(html).toContain(">Copy recap<");
+  });
+
+  it("streams the recap on top while it is written, its button a Stop, the notes' button waiting", () => {
+    const t = written(room());
+    const writing: NotesWriterState = { writing: t.id, form: "recap", text: "## Summary\n- Il budget", failed: null };
+    const html = panel(t, writing);
+    const recap = html.indexOf('aria-label="Recap"');
+    expect(recap).toBeGreaterThan(0);
+    expect(html.slice(recap, html.indexOf("<details"))).toContain("spine-live");
+    expect(html.slice(recap, html.indexOf("<details"))).toContain("<li>Il budget</li>");
+    expect(recapButton(t, writing, null)).toEqual({ label: "Stop", disabled: false, stops: true });
+    expect(notesButton(t, writing, null)).toMatchObject({ label: "Update notes", disabled: true, stops: false });
+    expect(recapButton(t, { ...writing, form: "running" }, null)).toMatchObject({ disabled: true, stops: false });
+    expect(recapButton(createTranscript(2), idle, null).disabled).toBe(true);
+    expect(panel(t, { ...idle, failed: { transcript: t.id, form: "recap", message: "ignis answered 500" } })).toContain("The recap was not written: ignis answered 500");
   });
 });
 
 const idleHandle = { getState: () => IDLE, subscribe: () => () => {} };
 const assistants = {
-  notes: { getState: () => ({ writing: null, text: "", failed: null }), subscribe: () => () => {} },
+  notes: { getState: (): NotesWriterState => ({ writing: null, form: "running", text: "", failed: null }), subscribe: () => () => {} },
   analyst: { getState: (): AnalystState => ({ looking: null, nextAt: {}, failed: null }), subscribe: () => () => {} },
   rewriter: { getState: () => ({ transcript: null, utterance: null, writing: false, proposal: null, failed: null }), subscribe: () => () => {} },
   asker: { getState: () => ({ transcript: null, question: "", untilMs: 0, text: "", writing: false, failed: null }), subscribe: () => () => {} },
