@@ -12,7 +12,8 @@
 # image record — separate records, since g2 cannot pair a record carrying the
 # image cell with one that has none. Each launch measures its prompts once:
 # the prompts are fixed, so a second run against the same live engine would
-# be served from its caches, and ignis reports no cached tokens to catch it.
+# be served from its caches: what prompt reuse serves comes back void, and a
+# media-cache hit counts no cached tokens, so nothing catches it.
 # nvidia-smi is sampled beside every launch; distrust one whose peak reaches
 # the card's total (docs/findings/2026-09-16-vision-ttft-live-live.md).
 #

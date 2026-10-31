@@ -87,9 +87,10 @@ ignis's text with `--vision-enabled` against without. The 1.5 threshold `g2` pri
 G2's own; for this cell the ratios are error detectors.
 
 **Measure a launch once.** The prompts are fixed — the same nonces, the same
-changed pixels — so a second `ttft` run against a live engine is served from
-its prefix and media caches, and ignis reports no cached tokens for the void
-rule to catch it. Restart the engine instead.
+changed pixels — so a second `ttft` or `g3` run against a live engine is served
+from its prefix and media caches. What prompt reuse serves, ignis reports as
+cached tokens (#284), and those samples come back void; a media-cache hit counts
+none, and nothing catches it. Restart the engine instead.
 
 **Watch the card's headroom.** Both ignis loads at 262,144 context with
 DFlash2 took ~29.8 GiB of their own when measured, before #215 (retained
@@ -194,11 +195,12 @@ The ITL decode lanes send each engine the one EOS control it is asked by:
 which on stderr.
 
 The four prompt sets of a run (C=1, C=4, the ITL lanes, the ITL prefillers)
-are one session's: no prompt starts with another's content, so prompt reuse,
-on by default, has nothing an earlier cell left behind to serve a later one
-from. The prompts are still fixed, so measure a launch once: a second `g3`
-run against the same live server is served from what the first left, and its
-samples come back void. Restart the engine instead.
+are generated before its first request and proven distinct across cells: no
+two prompts share more than the chat template's own tokens, nor a whole KV page
+of them, or the run refuses to start and names the two. So prompt reuse, on by
+default, has nothing an earlier cell left behind to serve a later one from. The
+prompts are still fixed:
+[measure a launch once](#the-multimodal-ttft-cell-github-181).
 
 ## The harness's own request deadline (GitHub #138)
 
