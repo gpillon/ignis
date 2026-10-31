@@ -3,7 +3,7 @@ import { keyRequired } from "../api/auth.ts";
 import { STORED_FLAGS, useStoredFlag } from "../app/storedFlag.ts";
 import type { SpeechStatus } from "../api/model.ts";
 import { speakersUnavailable } from "../speech/availability.ts";
-import { captureStream, pickSharedAudio, startCapture } from "../speech/capture.ts";
+import { captureStream, grabFrame, pickSharedAudio, startCapture } from "../speech/capture.ts";
 import { openListening } from "../speech/realtime.ts";
 import { mergeLoaded } from "../store/docs.ts";
 import { pageStore } from "../store/index.ts";
@@ -200,6 +200,7 @@ export function useTranscribe({
         captureMic: (onChunk) => startCapture(onChunk),
         pickShared: (onEnded) => pickSharedAudio(onEnded),
         captureShared: (stream, onChunk) => captureStream(stream, onChunk),
+        grabFrame: (track) => grabFrame(track),
         decode: (file) => decodeFile(file),
         filePaceSeconds: filePace,
         onUtterance: (id, utterance) => setList((l) => updateTranscript(l, id, (t) => addUtterance(t, utterance))),

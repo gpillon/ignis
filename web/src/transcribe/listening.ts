@@ -31,7 +31,9 @@ import type { Heard, SourceKind, Voice } from "./transcript.ts";
 //   Realtime session: the microphone, a call's shared audio beside it (two
 //   sessions, never mixed: Me and the others, Q93), or a file. A lane's
 //   session numbers its speakers on its own, so each session is a stream of
-//   its own for the Transcript's speakers.
+//   its own for the Transcript's speakers. A call's pick shares a picture
+//   beside its audio, which the listening never reads: Capture takes a frame
+//   of it, on a click (#431).
 // - **Times** are the Transcript's clock: a lane's session counts its audio
 //   from its first sample, and that sample's place on the clock is the lane's
 //   origin. The clock starts where the Transcript's stopped (a Continue) and
@@ -104,6 +106,8 @@ export type ListeningState = {
   held: boolean;
   /** A file's progress: the share transcribed and the time left, none before there is a pace to read. */
   file: { name: string; fraction: number; leftMs: number | null } | null;
+  /** On a call, the pick shares a picture, a tab, a window or the screen, that Capture can take a frame of (#431). */
+  sharing: boolean;
 };
 
 export const IDLE: ListeningState = {
@@ -118,6 +122,7 @@ export const IDLE: ListeningState = {
   retryIn: 0,
   held: false,
   file: null,
+  sharing: false,
 };
 
 export type ListeningDeps = {
@@ -126,6 +131,8 @@ export type ListeningDeps = {
   /** A call's one pick; `onEnded` is the browser's own Stop sharing. */
   pickShared: (onEnded: () => void) => Promise<MediaStream>;
   captureShared: (stream: MediaStream, onChunk: (pcm: Int16Array) => void) => Promise<Capture>;
+  /** A frame of a call's shared picture, as a PNG: what Capture adds as a context image (#431). */
+  grabFrame?: (track: MediaStreamTrack) => Promise<Blob>;
   decode: (file: File) => Promise<Int16Array>;
   /** N: the most audio not yet transcribed a file is sent ahead (Q99), read at the start. */
   filePaceSeconds: () => number;
@@ -178,6 +185,9 @@ type Lane = {
 };
 
 const quiet = (): number[] => Array(METER_BARS).fill(0);
+
+/** The picture a call's pick shares beside its audio, while it lasts. */
+const sharedPicture = (stream: MediaStream): MediaStreamTrack | null => stream.getVideoTracks?.().find((track) => track.readyState === "live") ?? null;
 
 /** What the view and the header read of a listening: its state, and word of each change. */
 export type ListeningHandle = Pick<ListeningController, "getState" | "subscribe">;
@@ -275,6 +285,8 @@ export class ListeningController {
       this.picked = this.deps.pickShared(() => this.sharingEnded());
       // Kept caught: a refused pick is said when its lane's capture reads it.
       this.picked.catch(() => {});
+      const listening = this.listenings;
+      void this.picked.then((stream) => listening === this.listenings && this.update({ sharing: sharedPicture(stream) !== null }), () => {});
       this.lanes = [this.lane("mic", "me", null), this.lane("shared", "far", diarization)];
     } else {
       this.picked = null;
@@ -294,6 +306,16 @@ export class ListeningController {
     for (const lane of this.lanes) this.open(lane);
     if (options.source.kind === "file") void this.decode(options.source.file);
     else this.run();
+  }
+
+  /**
+   * A frame of the picture the call shares, the tab, the window or the screen its pick took (#431): taken only when
+   * asked, and none while no call shares one.
+   */
+  async captureFrame(): Promise<Blob | null> {
+    if (!this.state.sharing || !this.picked || !this.deps.grabFrame) return null;
+    const track = sharedPicture(await this.picked);
+    return track ? this.deps.grabFrame(track) : null;
   }
 
   /** What the transcription is told, from the next utterance on, in every session (Q87, Q128). */
