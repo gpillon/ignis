@@ -200,23 +200,25 @@ which on stderr.
 A `ttft`, `g3` or `g5` run generates all its prompts before its first request,
 numbered across the run: `ttft`'s a set per cell in `--cells` order, the image
 cell's last (`small-card`'s TTFT cells are such a run, of the cells that fit);
-`g3`'s C=1, C=4, the ITL lanes, then the ITL prefillers; `g5`'s one per depth. Each prompt starts with its own nonce and seed or, cut from a corpus,
+`g3`'s C=1, C=4, the ITL lanes, then the ITL prefillers; `g5`'s one per depth.
+Each prompt starts with its own nonce and seed or, cut from a corpus,
 its own window, the run's windows spread evenly over the bank (a `g5` depth
 opens in its own third of it); a window that starts with another prompt's
 content is passed over for the next rotation. Then the run is proven: no two
-prompts share more than the chat template's own tokens, nor a whole KV page of
-them, or it refuses to start, every cell failing with an error that names the
-two. So prompt reuse, on by default, has nothing an earlier cell left behind to
-serve a later one from. A one-cell `ttft` run sends the prompts it always did.
-The prompts are still fixed:
+prompts share more than the chat template's own tokens, its header and footer
+together, nor a whole KV page of them, or it refuses to start, every cell
+failing with an error that names the two. That bound is #426's, looser than the
+header alone, and harmless: a head short of a whole 64-token page is nothing
+prompt reuse can serve. So prompt reuse, on by default, has nothing an earlier
+cell left behind to serve a later one from. A one-cell `ttft` run sends the
+prompts it always did. The prompts are still fixed:
 [measure a launch once](#the-multimodal-ttft-cell-github-181).
 
 The nonces cycle through 26 letters, so a filler run of more than 26 prompts
 (three cells at `--samples 8`) starts two of them with the same letter. Where
 the tokenizer makes that letter a token of its own, a cell's own check refuses
 two such prompts of one cell; the run's check admits two of different cells,
-whose shared head stays within the template's own tokens and short of a KV
-page, nothing prompt reuse can serve.
+whose shared head stays within that bound.
 
 ## The harness's own request deadline (GitHub #138)
 
