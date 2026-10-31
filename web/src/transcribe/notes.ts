@@ -313,13 +313,16 @@ export type Written = { lines: DraftLine[]; writtenAs: NoteKind; covered: number
 
 /**
  * `notes` once a writing lands: its lines in place of the model's, a line written again word for word in its section
- * keeping its id, a new one the next id. The user's lines and the lines they removed stay as they are.
+ * keeping its id, a new one the next id. The user's lines and the lines they removed stay as they are, and a line of
+ * the writing that is one of them, word for word in its section, is left out (#436).
  */
 export function withWriting(notes: Notes | undefined, { lines: drafts, ...written }: Written): Notes {
   const base = notes ?? noNotes(written.writtenAs);
   const before = base.lines.filter((l) => l.author === "model");
+  const theirs = [...base.lines.filter((l) => l.author === "user"), ...base.removed];
+  const isTheirs = (d: DraftLine) => theirs.some((l) => l.section === d.section && l.text.toLocaleLowerCase() === d.text.toLocaleLowerCase());
   let nextId = base.nextId;
-  const lines = drafts.map((d): NoteLine => {
+  const lines = drafts.filter((d) => !isTheirs(d)).map((d): NoteLine => {
     const same = before.findIndex((l) => l.section === d.section && l.text === d.text);
     const id = same >= 0 ? before.splice(same, 1)[0].id : `N${nextId++}`;
     return { id, ...d, author: "model" };

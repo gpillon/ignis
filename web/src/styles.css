@@ -611,6 +611,129 @@
       animation: none;
     }
   }
+  /* The notes' own lines (transcribe/Notes.tsx, #436): each section stacks
+     its heading, its lines and a + at its foot; every line draws its bullet,
+     the model's burnt ember, the user's hollow in ink, the quiet mark of a
+     line updates leave as it is. A line is a click away from editing, and its
+     × shows on hover. */
+  .notes .md > .note-section + .note-section {
+    margin-top: 1.3em;
+  }
+  .notes .md .note-section > h2 {
+    margin-top: 0;
+  }
+  .notes .md .note-section > * + * {
+    margin-top: 0.35em;
+  }
+  .notes .md li[data-author] {
+    position: relative;
+    padding-right: 1.3em;
+    list-style: none;
+  }
+  .notes .md li[data-author]::after {
+    content: "";
+    position: absolute;
+    top: calc(0.75em - 2.5px);
+    left: -0.8em;
+    width: 5px;
+    height: 5px;
+    background: var(--ember);
+  }
+  .notes .md li[data-author="user"]::after {
+    border: 1px solid var(--ink);
+    background: transparent;
+  }
+  .notes .md li[data-author]:has(> input[type="checkbox"])::after {
+    content: none;
+  }
+  .notes .note-text {
+    border-radius: 2px;
+    cursor: text;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+  }
+  .notes .note-text:hover {
+    background: color-mix(in oklab, var(--surface) 70%, transparent);
+  }
+  .notes .note-text:focus-visible {
+    outline: 1px solid var(--ember);
+    outline-offset: 1px;
+  }
+  .notes .note-remove {
+    position: absolute;
+    top: calc(0.75em - 7px);
+    right: 0;
+    display: flex;
+    padding: 2px;
+    color: var(--ash);
+    opacity: 0;
+    transition: opacity 120ms;
+  }
+  .notes .note-remove svg {
+    width: 10px;
+    height: 10px;
+  }
+  .notes li:hover > .note-remove,
+  .notes .note-remove:focus-visible {
+    opacity: 1;
+  }
+  .notes .note-remove:hover {
+    color: var(--fault);
+  }
+  .notes .md .note-section > .note-add {
+    display: flex;
+    align-items: center;
+    gap: calc(0.8em - 7px);
+    margin-top: 0.15em;
+    color: var(--ash);
+  }
+  .notes .note-add svg {
+    width: 9px;
+    height: 9px;
+    margin-left: calc(0.3em - 2px);
+    opacity: 0.6;
+    transition: opacity 120ms;
+  }
+  .notes .note-add span {
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 12px;
+    opacity: 0;
+    transition: opacity 120ms;
+  }
+  .notes .note-section:hover .note-add svg,
+  .notes .note-add:focus-visible svg {
+    opacity: 1;
+  }
+  .notes .note-section:hover .note-add span,
+  .notes .note-add:focus-visible span {
+    opacity: 1;
+  }
+  .notes .note-add:hover {
+    color: var(--ember);
+  }
+  .notes .note-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2em;
+  }
+  .notes .note-section > .note-editor {
+    margin-left: 1.1em;
+  }
+  /* No hover on a touch screen: × and + stay in view. */
+  @media (hover: none) {
+    .notes .note-remove,
+    .notes .note-add svg,
+    .notes .note-add span {
+      opacity: 1;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .notes .note-remove,
+    .notes .note-add svg,
+    .notes .note-add span {
+      transition: none;
+    }
+  }
   .notes-answer .md {
     font-size: 13px;
   }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { changesBetween, MARK_MS, markedMarkdown, nextExpiry, standing, withChanges } from "./marks.ts";
-import { type NoteLine, noNotes, type Notes, notesMarkdown } from "./notes.ts";
+import { changesBetween, type DrawnSection, MARK_MS, markedSections, nextExpiry, standing, withChanges } from "./marks.ts";
+import { type NoteLine, noNotes, type Notes } from "./notes.ts";
 
 // Which lines of the running notes are marked, and until when (spec #428,
 // "The notes view", stories 3 and 4).
@@ -33,6 +33,12 @@ describe("changesBetween", () => {
   it("leaves the user's own lines unmarked", () => {
     expect(changesBetween(notes(), notes(line("N1", "mine", "Now", "user")))).toEqual([]);
     expect(changesBetween(notes(line("N1", "mine", "Now", "user")), notes())).toEqual([]);
+  });
+
+  it("leaves unmarked what the user did by hand: a line of the model's they made theirs, or removed", () => {
+    const before = notes(line("N1", "a"), line("N2", "b"));
+    const after = { ...notes(line("N2", "b2", "Now", "user")), removed: [line("N1", "a")] };
+    expect(changesBetween(before, after)).toEqual([]);
   });
 });
 
@@ -72,29 +78,38 @@ describe("withChanges and standing", () => {
   });
 });
 
-describe("markedMarkdown", () => {
+describe("markedSections", () => {
   const before = notes(line("N1", "a"), line("N2", "b"), line("N3", "c"));
   const after = notes(line("N1", "a"), line("N3", "c2"), line("N4", "d"));
   const marks = withChanges([], changesBetween(before, after), T);
+  /** Each section's name and its lines' texts, a mark before a marked one. */
+  const drawn = (sections: DrawnSection[]) => sections.map((s) => [s.name, ...s.rows.map((r) => (r.mark ? `${r.mark} ${r.line.text}` : r.line.text))]);
 
-  it("is the plain notes when no mark stands", () => {
-    expect(markedMarkdown(after, [], T).markdown).toBe(notesMarkdown(after));
-    expect(markedMarkdown(after, marks, T + MARK_MS)).toEqual({ markdown: notesMarkdown(after), items: {} });
-    expect(markedMarkdown(undefined, [], T)).toEqual({ markdown: "", items: {} });
+  it("are the notes in the kind's live sections, others after, nothing marked when no mark stands", () => {
+    const empty = [["People"], ["Figures & dates"], ["Asked of me"], ["Commitments heard"]];
+    expect(drawn(markedSections(after, [], T))).toEqual([["Now", "a", "c2", "d"], ...empty]);
+    expect(markedSections(after, marks, T + MARK_MS)).toEqual(markedSections(after, [], T));
+    expect(drawn(markedSections(notes(line("N1", "e", "Other"), line("N2", "f", "Decisions")), [], T))).toEqual([["Now"], ...empty, ["Decisions", "f"], ["Other", "e"]]);
+    expect(markedSections(undefined, [], T)).toEqual([]);
+    expect(markedSections(noNotes("work"), [], T)).toEqual([]);
   });
 
-  it("flags the fresh lines and puts a removed one back in its place, struck", () => {
-    const { markdown, items } = markedMarkdown(after, marks, T + 1);
-    const rows = markdown.split("\n");
-    expect(rows.slice(0, 6)).toEqual(["## Now", "- a", "- ~~b~~", "- c2", "- d", ""]);
-    expect(items).toEqual({ 3: "gone", 4: "fresh", 5: "fresh" });
+  it("marks the fresh lines and puts a removed one back in its place, struck", () => {
+    expect(drawn(markedSections(after, marks, T + 1))[0]).toEqual(["Now", "a", "gone b", "fresh c2", "fresh d"]);
   });
 
-  it("shows a section that only a removed line keeps, and no dash while it stands", () => {
+  it("shows a section that only a removed line keeps", () => {
     const only = notes(line("N1", "a", "Decisions"));
     const m = withChanges([], changesBetween(only, notes()), T);
-    const { markdown, items } = markedMarkdown(notes(), m, T);
-    expect(markdown).toContain("## Decisions\n- ~~a~~");
-    expect(Object.values(items)).toEqual(["gone"]);
+    expect(drawn(markedSections(notes(), m, T)).at(-1)).toEqual(["Decisions", "gone a"]);
+  });
+
+  it("leaves a line the user made theirs unmarked, while its mark of the model's change stands", () => {
+    const mine = notes(line("N1", "a"), line("N3", "mine", "Now", "user"), line("N4", "d"));
+    expect(drawn(markedSections(mine, marks, T + 1))[0]).toEqual(["Now", "a", "gone b", "mine", "fresh d"]);
+  });
+
+  it("draws the recap in the sections named", () => {
+    expect(drawn(markedSections(after, [], T, ["Summary", "Now"]))).toEqual([["Summary"], ["Now", "a", "c2", "d"]]);
   });
 });

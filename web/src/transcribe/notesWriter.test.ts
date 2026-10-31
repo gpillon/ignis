@@ -3,6 +3,7 @@ import type { ChunkEvent } from "../api/sse.ts";
 import type { StreamOptions, StreamResult } from "../api/stream.ts";
 import { ASSIST_SYSTEM } from "./assist.ts";
 import { EMPTY_CONTEXT } from "./context.ts";
+import { addLine, editLine, removeLine } from "./noteEdits.ts";
 import { LIVE_GAP_MS, noNotes, type Notes, RUNNING_NOTES } from "./notes.ts";
 import { NotesWriter, type Written } from "./notesWriter.ts";
 import { recapTask } from "./recap.ts";
@@ -354,7 +355,7 @@ describe("what changed in the transcript since the last update", () => {
     expect(await laterTurnOf(voices(3), edited)).toBe("Said since [00:15]:\n[00:15] Speaker 2: Frase 3.\n\nChanged since:\n- Corrected: [00:05] Speaker 2: Frase uno, corretta. It was: Frase 1.");
     // The running task says what the block is, in the system block every request of the thread carries.
     expect(runningTask("work")).toContain(
-      "- Each user turn brings what was said since the last one and, under Changed since, what the user changed in the transcript meanwhile: an utterance corrected, moved to another speaker, split, deleted or put back, a speaker renamed or merged into another.",
+      "- Each user turn brings what was said since the last one and, under Changed since, what the user changed in the transcript meanwhile: an utterance corrected, moved to another speaker, split, deleted or put back, a speaker renamed or merged into another; and the notes' lines the user edited, added or removed by hand.",
     );
   });
 
@@ -452,6 +453,123 @@ describe("what changed in the transcript since the last update", () => {
     const next = addUtterance(gone, { stream: "s", startMs: 15_000, endMs: 17_000, text: "Nuova.", voice: { kind: "speaker", index: 0 } });
     expect(next.utterances.at(-1)?.id).toBe(3);
     expect(await laterTurnOf(voices(3), next)).toBe("Said since [00:15]:\n[00:15] Speaker 1: Nuova.\n\nChanged since:\n- Deleted: [00:10] Speaker 1: Frase 2.");
+  });
+});
+
+describe("the notes edited by hand", () => {
+  /** The results a round's request carried back: each call's one-line answer, in order. */
+  const resultsOf = (asked: StreamOptions[], round: number) =>
+    turnsOf(asked, round)
+      .filter((turn) => turn.role === "tool")
+      .map((turn) => turn.content);
+
+  /** Running notes the model wrote: Ada and Carlo in People, the budget in Now. */
+  const kept = (): Notes => ({
+    ...noNotes("work"),
+    lines: [
+      { id: "N1", section: "People", text: "Ada: acquisti.", author: "model" },
+      { id: "N2", section: "Now", text: "Il budget.", author: "model" },
+      { id: "N3", section: "People", text: "Carlo: finanza.", author: "model" },
+    ],
+    nextId: 4,
+    writtenAs: "work",
+    covered: 3,
+    writtenAt: 500,
+  });
+
+  it("lets an edit made while an update runs win: a call arriving on that line after it is refused, the line left the user's", async () => {
+    const { w, fake, page, held } = writer([
+      { events: [call("c1", "add_line", { section: "People", text: "Ada: acquisti." })], hold: true },
+      { events: [call("c2", "replace_line", { id: "N1", text: "Ada: acquisti e logistica." }), call("c3", "remove_line", { id: "N1" })] },
+      {},
+    ]);
+    const updating = w.write(held(heard(3)), "work", null);
+    const seen = page.get(1)!.lines[0];
+    w.editNotes(1, (n) => editLine(n, seen, "Ada: logistica."));
+    fake.release();
+    await updating;
+    expect(resultsOf(fake.asked, 2).slice(-2)).toEqual(["Refused: N1 is the user's: leave it as it is.", "Refused: N1 is the user's: leave it as it is."]);
+    expect(page.get(1)?.lines).toEqual([{ id: "N1", section: "People", text: "Ada: logistica.", author: "user" }]);
+  });
+
+  it("gives a line the user adds while an update runs an id of its own: the model's next line takes the one after, and each result names the line it made", async () => {
+    const { w, fake, page, held } = writer([
+      { events: [call("c1", "add_line", { section: "People", text: "Ada: acquisti." })], hold: true },
+      { events: [call("c2", "add_line", { section: "People", text: "Carlo: finanza." })] },
+      { events: [call("c3", "replace_line", { id: "N3", text: "Carlo: finanza e budget." }), call("c4", "replace_line", { id: "N2", text: "Bea." })] },
+      {},
+    ]);
+    const updating = w.write(held(heard(3)), "work", null);
+    w.editNotes(1, (n) => addLine(n, "People", "Bea: fornitore."));
+    fake.release();
+    await updating;
+    expect(resultsOf(fake.asked, 3)).toEqual(["Added N1 to People.", "Added N3 to People.", "N3 updated.", "Refused: N2 is the user's: leave it as it is."]);
+    expect(page.get(1)?.lines).toEqual([
+      { id: "N1", section: "People", text: "Ada: acquisti.", author: "model" },
+      { id: "N2", section: "People", text: "Bea: fornitore.", author: "user" },
+      { id: "N3", section: "People", text: "Carlo: finanza e budget.", author: "model" },
+    ]);
+    expect(page.get(1)?.nextId).toBe(4);
+  });
+
+  it("tells the user's edits, additions and removals in the next turn, a line once as it stands, and nothing for a line added and removed meanwhile", async () => {
+    const { w, fake, page, held } = writer([{}, { events: [call("c1", "add_line", { section: "Now", text: "Il budget." })] }, {}]);
+    await w.write(held({ ...heard(3), notes: kept() }), "work", null);
+    const [ada, budget, carlo] = kept().lines;
+    w.editNotes(1, (n) => editLine(n, ada, "Ada: logistica."));
+    w.editNotes(1, (n) => editLine(n, page.get(1)!.lines[0], "Ada: responsabile logistica."));
+    w.editNotes(1, (n) => addLine(n, "Figures & dates", "40k: il tetto."));
+    w.editNotes(1, (n) => removeLine(n, budget));
+    w.editNotes(1, (n) => addLine(n, "People", "Dario."));
+    w.editNotes(1, (n) => removeLine(n, page.get(1)!.lines.at(-1)!));
+    await w.write(held(heard(4)), "work", null);
+    expect(turnsOf(fake.asked, 1).at(-1)?.content).toBe(
+      [
+        "Said since [00:15]:\n[00:15] Me: Frase 3.\n",
+        "Changed since:",
+        "- Edited by the user in People: N1 (the user's) Ada: responsabile logistica. It was: Ada: acquisti.",
+        "- Added by the user to Figures & dates: N4 (the user's) 40k: il tetto.",
+        "- Removed by the user from Now, never to be written again: N2 Il budget.",
+      ].join("\n"),
+    );
+    // The line they removed is not written again.
+    expect(resultsOf(fake.asked, 2)).toEqual(["Refused: the user removed that line from Now; never write it again."]);
+    expect(page.get(1)?.lines).toEqual([{ ...ada, text: "Ada: responsabile logistica.", author: "user" }, carlo, { id: "N4", section: "Figures & dates", text: "40k: il tetto.", author: "user" }]);
+    // Told once: an update with nothing new asks nothing.
+    await w.write(held(heard(4)), "work", null);
+    expect(fake.asked).toHaveLength(3);
+  });
+
+  it("tells an edit made while an update runs in the update after it", async () => {
+    const { w, fake, page, held } = writer([{ events: [call("c1", "add_line", { section: "People", text: "Ada: acquisti." })], hold: true }, {}, {}]);
+    const updating = w.write(held(heard(3)), "work", null);
+    w.editNotes(1, (n) => editLine(n, page.get(1)!.lines[0], "Ada: logistica."));
+    fake.release();
+    await updating;
+    await w.write(held(heard(3)), "work", null);
+    expect(turnsOf(fake.asked, 2).at(-1)?.content).toBe("Changed since:\n- Edited by the user in People: N1 (the user's) Ada: logistica. It was: Ada: acquisti.");
+  });
+
+  it("lists the user's lines and the ones they removed in a thread started again, and tells them nothing more", async () => {
+    const { w, fake, page, held } = writer([{}, {}, {}]);
+    await w.write(held({ ...heard(3), notes: kept() }), "work", null);
+    const [ada, budget] = kept().lines;
+    w.editNotes(1, (n) => removeLine(editLine(n, ada, "Ada: logistica."), budget));
+    await w.rewrite(held(heard(3)), "work", null);
+    const first = turnsOf(fake.asked, 1);
+    expect(first).toHaveLength(1);
+    expect(first[0].content).toContain("People:\nN1 (the user's) Ada: logistica.\n\nFigures & dates:");
+    expect(first[0].content).toContain("Lines the user removed, never to be written again:\n- Now: Il budget.");
+    expect(page.get(1)?.lines).toEqual([{ ...ada, text: "Ada: logistica.", author: "user" }]);
+    await w.write(held(heard(4)), "work", null);
+    expect(turnsOf(fake.asked, 2).at(-1)?.content).toBe("Said since [00:15]:\n[00:15] Me: Frase 3.\n");
+  });
+
+  it("changes the page's notes alone while no update runs", () => {
+    const { w, page, held } = writer([]);
+    held({ ...heard(3), notes: kept() });
+    w.editNotes(1, (n) => addLine(n, "Now", "Le date."));
+    expect(page.get(1)?.lines.at(-1)).toEqual({ id: "N4", section: "Now", text: "Le date.", author: "user" });
   });
 });
 
@@ -643,6 +761,16 @@ describe("writing the recap", () => {
       ],
     ]);
     expect(w.getState()).toEqual({ writing: null, form: "running", text: "", failed: null });
+  });
+
+  it("sends the running lines the user edited or added by hand as notes they took, and none they removed", async () => {
+    const { w, fake, held } = writer([{ chunks: ["## Summary\n- Ok."] }]);
+    const t = held(call());
+    const [budget] = t.notes!.lines;
+    w.editNotes(5, (n) => addLine(editLine(n, budget, "The budget is 40k."), "Figures & dates", "40k: the cap."));
+    w.editNotes(5, (n) => removeLine(n, n.lines[1]));
+    await w.writeRecap(held(t), "work", null);
+    expect(fake.asked[0].request.turns[0].content.endsWith("to be taken as true:\n- Summary: The budget is 40k.\n- Figures & dates: 40k: the cap.")).toBe(true);
   });
 
   it("says when the user took no notes", async () => {
