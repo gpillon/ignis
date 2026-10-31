@@ -5,7 +5,7 @@ import { ContextCard } from "./Context.tsx";
 import { ANSWER_AFTER_MS, Deck, deckHint, HEADPHONES, startBlocked, startPress, Strip, stripStatus, timeLeft } from "./Deck.tsx";
 import { IDLE, type ListeningState } from "./listening.ts";
 import { AskBar } from "./Ask.tsx";
-import { type Marked, NotesPanel, notesButton, recapButton, rewriteButton } from "./Notes.tsx";
+import { type Editing, type Marked, NotesPanel, notesButton, recapButton, rewriteButton } from "./Notes.tsx";
 import type { AnalystState } from "./analyst.ts";
 import type { AskerState } from "./ask.ts";
 import { SuggestionsPanel, suggestionText } from "./Suggestions.tsx";
@@ -55,6 +55,9 @@ const actions: TranscribeActions = {
   writeRecap: none,
   stopNotes: none,
   setNotesLive: none,
+  editNote: none,
+  addNote: none,
+  removeNote: none,
   acceptSuggestion: none,
   dismissSuggestion: none,
   dropSuggestedTerm: none,
@@ -558,8 +561,11 @@ describe("the notes", () => {
       fromMs: null,
     },
   });
-  const panel = (t: Transcript, writer: NotesWriterState = idle, patch: Partial<TranscribeState> = {}, marked?: Marked) =>
-    renderToStaticMarkup(<NotesPanel transcript={t} state={state(patch)} actions={actions} writer={writer} marked={marked} />);
+  const panel = (t: Transcript, writer: NotesWriterState = idle, patch: Partial<TranscribeState> = {}, marked?: Marked, editing?: Editing) =>
+    renderToStaticMarkup(<NotesPanel transcript={t} state={state(patch)} actions={actions} writer={writer} marked={marked} editing={editing} />);
+  /** A line as the notes draw it: its bullet's author and its mark, then its text, a click away from editing. */
+  const drawnLine = (text: string, author = "model", mark = "") =>
+    `<li data-author="${author}"${mark ? ` data-mark="${mark}"` : ""}><span tabindex="0" title="${author === "user" ? "Your line: updates leave it as it is. Click to edit it" : "Edit the line"}" class="note-text">${text}</span>`;
 
   it("offers the four kinds, Write notes, and says nothing goes to the model before a press (Q124)", () => {
     const html = panel(room());
@@ -574,8 +580,8 @@ describe("the notes", () => {
   it("shows the notes in the kind's live sections, when they were updated, and offers to update them", () => {
     const t = addUtterance(written(room()), { stream: "mic-1", startMs: 9_000, endMs: 9_500, text: "Poi?", voice: null });
     const html = panel(t);
-    expect(html).toMatch(/<h2>Now<\/h2>\s*<ul>\s*<li>Si apre\.<\/li>/);
-    expect(html).toMatch(/<h2>Commitments heard<\/h2>\s*<p>—<\/p>/);
+    expect(html).toContain(`<h2>Now</h2><ul>${drawnLine("Si apre.")}`);
+    expect(html).toContain("<h2>Commitments heard</h2><p>—</p>");
     expect(html).toContain("Updated at 16:05. 1 more since.");
     expect(html).toContain(">Update notes<");
     expect(html).toMatch(/role="radio" aria-checked="true"[^>]*><span[^>]*>Work call<\/span>/);
@@ -592,7 +598,7 @@ describe("the notes", () => {
     expect(html).toMatch(/aria-label="Notes" aria-busy="true"/);
     // Not dimmed: the lines stay readable while they change.
     expect(html).toContain('<div class="notes">');
-    expect(html).toContain("<li>Si apre.</li>");
+    expect(html).toContain(drawnLine("Si apre."));
     expect(html).toContain("The model is reading what was said since.");
     expect(html).not.toContain("Updated at");
     expect(panel(room(), { writing: room().id, form: "running", text: "", failed: null })).toContain("The model is reading the transcript.");
@@ -609,13 +615,57 @@ describe("the notes", () => {
       { id: "N9", kind: "gone", until: now + 1_000, line: gone, index: 1 },
     ];
     const html = panel(t, idle, {}, { marks, now });
-    expect(html).toContain(`<li data-mark="fresh">${first.text}</li>`);
-    expect(html).toMatch(/<li data-mark="gone"><del>Una riga tolta\.<\/del><\/li>/);
+    expect(html).toContain(drawnLine(first.text, "model", "fresh"));
+    expect(html).toContain('<li data-author="model" data-mark="gone"><del>Una riga tolta.</del></li>');
     // Their time is up: the notes are as they were written, with no mark.
     const spent = panel(t, idle, {}, { marks, now: now + 1_000 });
     expect(spent).not.toContain("data-mark");
     expect(spent).not.toContain("Una riga tolta.");
     expect(spent).toBe(panel(t, idle, {}, { marks: [], now }));
+  });
+
+  /** Notes with a line of the model's past the hour and one of the user's. */
+  const mixed = (t: Transcript): Transcript => ({
+    ...written(t),
+    notes: {
+      ...written(t).notes!,
+      lines: [
+        { id: "N1", section: "Now", text: "Si apre [64:09].", author: "model" },
+        { id: "N2", section: "People", text: "Ada: acquisti.", author: "user" },
+      ],
+      nextId: 3,
+    },
+  });
+
+  it("lets each line be edited with a click and removed with ×, adds a line at each section's foot, and marks the user's lines", () => {
+    const html = panel(mixed(room()));
+    expect(html).toContain(`${drawnLine('Si apre <a href="#t=1:04:09" target="_blank" rel="noreferrer noopener">1:04:09</a>.')}<button type="button" aria-label="Remove line N1" title="Remove the line" class="note-remove">`);
+    expect(html).toContain(`${drawnLine("Ada: acquisti.", "user")}<span class="sr-only"> (your line)</span><button type="button" aria-label="Remove line N2"`);
+    expect([...html.matchAll(/aria-label="Add a line to ([^"]+)"/g)].map((m) => m[1])).toEqual(["Now", "People", "Figures &amp; dates", "Asked of me", "Commitments heard"]);
+    expect(html).not.toContain("<textarea");
+  });
+
+  it("edits a line in place, past the hour as the view shows it, and adds one in a field at its section's foot", () => {
+    const t = mixed(room());
+    const [model, user] = t.notes!.lines;
+    const editing = panel(t, idle, {}, undefined, { form: "running", line: model });
+    expect(editing).toMatch(/<li data-author="model"><span class="note-editor"><textarea aria-label="Line N1 of Now" rows="1"[^>]*>Si apre \[1:04:09\]\.<\/textarea>/);
+    expect(editing).toContain("Enter saves, Escape cancels; emptied, the line goes.");
+    expect(editing).not.toContain('aria-label="Remove line N1"');
+    expect(panel(t, idle, {}, undefined, { form: "running", line: user })).toMatch(/<li data-author="user"><span class="note-editor"><textarea aria-label="Line N2 of People"[^>]*>Ada: acquisti\.<\/textarea>/);
+    const adding = panel(t, idle, {}, undefined, { form: "running", section: "People" });
+    expect(adding).toMatch(/<h2>People<\/h2><ul>.*<\/ul><span class="note-editor"><textarea aria-label="New line in People" rows="1"[^>]*><\/textarea><span[^>]*>Enter adds it, Escape cancels\.<\/span>/);
+    expect(adding).not.toContain('aria-label="Add a line to People"');
+    // An edit in the recap opens nothing in the running notes.
+    expect(panel(t, idle, {}, undefined, { form: "recap", line: model })).not.toContain("<textarea");
+  });
+
+  it("keeps a line being edited in view when an update removed it meanwhile: the user's edit wins", () => {
+    const t = mixed(room());
+    const typing = { id: "N7", section: "People", text: "Bea: fornitore.", author: "model" as const };
+    expect(panel(t, idle, {}, undefined, { form: "running", line: typing })).toMatch(
+      /<h2>People<\/h2><ul><li data-author="user">.*?<\/li><li data-author="model"><span class="note-editor"><textarea aria-label="Line N7 of People"[^>]*>Bea: fornitore\.<\/textarea>/,
+    );
   });
 
   it("offers Rewrite from scratch in a menu, once the model wrote a line and while nothing is under way", () => {
@@ -673,12 +723,24 @@ describe("the notes", () => {
     const fold = foldAt(html);
     expect(recap).toBeGreaterThan(0);
     expect(fold).toBeGreaterThan(recap);
-    expect(html.slice(recap, fold)).toMatch(/<h2>Figures &amp; dates<\/h2>\s*<ul>\s*<li>40k: il tetto/);
+    expect(html.slice(recap, fold)).toContain(`<h2>Figures &amp; dates</h2><ul>${drawnLine('40k: il tetto <a href="#t=00:01" target="_blank" rel="noreferrer noopener">00:01</a>', "user")}`);
     expect(html.slice(recap, fold)).toContain("Written at 16:20 from 1 utterance.");
     expect(html).toMatch(/<details[^>]*><summary[^>]*>Running notes<\/summary>/);
     expect(html).not.toMatch(/<details[^>]*open/);
     expect(html.slice(fold)).toContain("Si apre.");
     expect(html).toContain(">Copy recap<");
+  });
+
+  it("lets the recap's lines be edited, removed and added the same way, in the recap's sections", () => {
+    const t = recapped(room());
+    const html = panel(t);
+    const recap = html.slice(html.indexOf('aria-label="Recap"'), foldAt(html));
+    expect(recap).toContain(`${drawnLine("Il budget del lancio.")}<button type="button" aria-label="Remove line N1"`);
+    expect([...recap.matchAll(/aria-label="Add a line to ([^"]+)"/g)].map((m) => m[1])).toEqual(["Summary", "Topics", "People", "Figures &amp; dates", "Decisions", "Action items", "Open questions"]);
+    const editing = panel(t, idle, {}, undefined, { form: "recap", line: t.recap!.lines[0] });
+    expect(editing.slice(editing.indexOf('aria-label="Recap"'), foldAt(editing))).toContain('<textarea aria-label="Line N1 of Summary"');
+    // The running notes' line of the same id is not the one edited.
+    expect(editing.slice(foldAt(editing))).not.toContain("<textarea");
   });
 
   it("streams the recap on top while it is written, its button a Stop, the notes' button waiting", () => {
@@ -689,6 +751,8 @@ describe("the notes", () => {
     expect(recap).toBeGreaterThan(0);
     expect(html.slice(recap, foldAt(html))).toContain("spine-live");
     expect(html.slice(recap, foldAt(html))).toContain("<li>Il budget</li>");
+    // A recap on its way is not edited.
+    expect(html.slice(recap, foldAt(html))).not.toContain("Add a line");
     expect(recapButton(t, writing, null)).toEqual({ label: "Stop", disabled: false, stops: true });
     expect(notesButton(t, writing, null)).toMatchObject({ label: "Update notes", disabled: true, stops: false });
     expect(recapButton(t, { ...writing, form: "running" }, null)).toMatchObject({ disabled: true, stops: false });

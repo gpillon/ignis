@@ -2,9 +2,9 @@ import type { ConversationRequest, Turn } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { ASSIST_SYSTEM, type AskDeps, askModel, CHARS_PER_TOKEN, Follower, settle, Watched } from "./assist.ts";
 import { minutesClock } from "./export.ts";
-import { dueForUpdate, LIVE_GAP_MS, type NoteKind, noNotes, type Notes, NOTES_MAX_TOKENS, NOTES_SETTINGS, RUNNING_NOTES, tidyNotes, type Written } from "./notes.ts";
+import { dueForUpdate, LIVE_GAP_MS, type NoteKind, type NoteLine, noNotes, type Notes, NOTES_MAX_TOKENS, NOTES_SETTINGS, RUNNING_NOTES, tidyNotes, type Written } from "./notes.ts";
 import { parseRecap, recapDue, recapRequest } from "./recap.ts";
-import { applyCall, changesSince, fromScratch, laterTurn, notesState, restartAt, runningTask, runningTools, type Told, toldOf } from "./running.ts";
+import { afterCall, applyCall, changesSince, editsSince, fromScratch, laterTurn, linesOf, notesState, restartAt, runningTask, runningTools, type Told, toldOf } from "./running.ts";
 import { taskInput } from "./taskContext.ts";
 import type { Transcript } from "./transcript.ts";
 
@@ -24,6 +24,11 @@ import type { Transcript } from "./transcript.ts";
 // Transcript, so a reload starts it again from the notes, as a kind change, a
 // Rewrite from scratch and a prompt past the threshold do. A Stop or a failure
 // keeps every call applied, and the next update starts from the notes.
+//
+// The user edits the running notes by hand through the writer (editNotes), so
+// an update under way holds their edit before the model's next call: a call on
+// a line they edited is refused, and a line they add takes an id the model's
+// next one does not. The next turn tells the model what they did (#436).
 //
 // It writes the recap too (recap.ts), on a press and when a listening ends:
 // one writing over the whole transcript, its text streaming into the state.
@@ -45,8 +50,8 @@ export type NotesWriterState = {
 export type { Written };
 
 export type NotesWriterDeps = AskDeps & {
-  /** A change to a Transcript's running notes: a call applied, or a restart's. The page applies it to the notes it holds. */
-  onNotes: (transcript: number, change: (notes: Notes | undefined) => Notes) => void;
+  /** A change to a Transcript's running notes: a call applied, a restart's, or the user's by hand. The page applies it to the notes it holds. */
+  onNotes: (transcript: number, change: (notes: Notes | undefined) => Notes | undefined) => void;
   /** A recap written, for the Transcript it started on. */
   onRecap: (transcript: number, written: Written) => void;
   now?: () => number;
@@ -54,8 +59,11 @@ export type NotesWriterDeps = AskDeps & {
 
 const IDLE: NotesWriterState = { writing: null, form: "running", text: "", failed: null };
 
-/** A Transcript's notes thread: the kind it keeps, its turns, what each utterance was told as, and its last prompt. */
-type Thread = { kind: NoteKind; turns: Turn[]; told: Map<number, Told>; promptTokens: number };
+/**
+ * A Transcript's notes thread: the kind it keeps, its turns, what each utterance was told as, the notes' lines as it
+ * knows them, and its last prompt.
+ */
+type Thread = { kind: NoteKind; turns: Turn[]; told: Map<number, Told>; lines: Map<string, NoteLine>; promptTokens: number };
 
 /** The stream a Transcript's thread goes on, so the socket continues it. */
 const streamOf = (transcript: number) => `transcribe-notes-${transcript}`;
@@ -67,6 +75,8 @@ export class NotesWriter extends Watched<NotesWriterState> {
   private readonly follower = new Follower();
   /** Each Transcript's notes thread, while it holds: an update under way takes it, and gives it back whole. */
   private readonly threads = new Map<number, Thread>();
+  /** The running notes an update under way holds, and whose: each call applies to them, and so does the user's edit. */
+  private working: { transcript: number; notes: Notes } | null = null;
 
   constructor(private readonly deps: NotesWriterDeps) {
     super(IDLE);
@@ -84,6 +94,15 @@ export class NotesWriter extends Watched<NotesWriterState> {
     return this.write(t, kind, contextLimit, { scratch: true });
   }
 
+  /**
+   * The user's change by hand to `transcript`'s running notes (noteEdits.ts): the page's notes take it, and so do an
+   * update's under way on them, so it wins over a call arriving after it; the next turn tells it the model.
+   */
+  editNotes(transcript: number, change: (notes: Notes) => Notes) {
+    if (this.working?.transcript === transcript) this.working.notes = change(this.working.notes);
+    this.deps.onNotes(transcript, (n) => n && change(n));
+  }
+
   /** Writes `t`'s recap as `kind` from the whole transcript, unless a writing is under way. */
   writeRecap(t: Transcript, kind: NoteKind, contextLimit: number | null): Promise<void> {
     if (this.state.writing !== null) return Promise.resolve();
@@ -97,19 +116,21 @@ export class NotesWriter extends Watched<NotesWriterState> {
     if (!restart && held && held.kind === kind && held.promptTokens <= restartAt(contextLimit)) {
       // What was said since the last turn, and what the user changed meanwhile: `t` against what the thread told.
       const { said, events } = changesSince(held.told, t);
+      events.push(...editsSince(held.lines, notes));
       const turn = laterTurn(said, events);
       const told = toldOf(t, held.told);
+      const lines = linesOf(notes);
       if (turn === "") {
-        this.threads.set(t.id, { ...held, told });
+        this.threads.set(t.id, { ...held, told, lines });
         return null;
       }
-      return { thread: { ...held, told, turns: [...held.turns, { role: "user", content: turn }] }, fromMs: notes.fromMs };
+      return { thread: { ...held, told, lines, turns: [...held.turns, { role: "user", content: turn }] }, fromMs: notes.fromMs };
     }
     // A new thread: the transcript so far, from where its tail fits half the threshold, then the notes as they stand.
     const state = notesState(notes, kind);
     const reserve = NOTES_MAX_TOKENS + Math.ceil(state.length / CHARS_PER_TOKEN);
     const { content, fromMs } = taskInput(t, Math.floor(restartAt(contextLimit) / 2), reserve, minutesClock);
-    return { thread: { kind, turns: [{ role: "user", content: `${content}\n${state}` }], told: toldOf(t), promptTokens: 0 }, fromMs };
+    return { thread: { kind, turns: [{ role: "user", content: `${content}\n${state}` }], told: toldOf(t), lines: linesOf(notes), promptTokens: 0 }, fromMs };
   }
 
   private async update(t: Transcript, kind: NoteKind, contextLimit: number | null, scratch: boolean): Promise<void> {
@@ -135,6 +156,9 @@ export class NotesWriter extends Watched<NotesWriterState> {
       return;
     }
     let { thread } = started;
+    // The notes as the update holds them, the user's edits meanwhile among them (editNotes).
+    const working = { transcript: t.id, notes };
+    this.working = working;
     const settings = { ...NOTES_SETTINGS, systemPrompt: `${ASSIST_SYSTEM}\n\n${runningTask(kind)}` };
     const extras = { tools: runningTools(kind) };
     let idle = 0;
@@ -152,13 +176,15 @@ export class NotesWriter extends Watched<NotesWriterState> {
           // Each call is applied as it comes, so the lines change one at a time; the page applies the same call to the
           // notes it holds, so a change made there meanwhile is kept.
           const { call } = event;
-          const applied = applyCall(notes, kind, call);
+          const before = working.notes;
+          const applied = applyCall(before, kind, call);
           calls.push(call);
           results.push({ role: "tool", content: applied.result, toolCallId: call.id });
           if (applied.outcome === "unchanged") unchanged++;
           if (applied.outcome !== "applied") return;
           const changed = stamp(now(), started.fromMs);
-          notes = changed(applied.notes);
+          working.notes = changed(applied.notes);
+          thread = { ...thread, lines: afterCall(thread.lines, before, applied.notes) };
           this.deps.onNotes(t.id, (n) => {
             const there = applyCall(n ?? noNotes(kind), kind, call);
             return there.outcome === "applied" ? changed(there.notes) : there.notes;
@@ -168,6 +194,7 @@ export class NotesWriter extends Watched<NotesWriterState> {
       if (asked.ok === "stopped") return;
       if (!asked.ok) {
         this.abort = null;
+        this.working = null;
         this.set({ ...IDLE, failed: { transcript: t.id, form: "running", message: asked.message } });
         return;
       }
@@ -180,7 +207,8 @@ export class NotesWriter extends Watched<NotesWriterState> {
       if (idle >= RUNNING_NOTES.idleRounds) break;
     }
     this.abort = null;
-    this.deps.onNotes(t.id, (n) => stamp(now(), started.fromMs)(n ?? notes));
+    this.working = null;
+    this.deps.onNotes(t.id, (n) => stamp(now(), started.fromMs)(n ?? working.notes));
     this.threads.set(t.id, thread);
     this.set(IDLE);
   }
@@ -208,6 +236,7 @@ export class NotesWriter extends Watched<NotesWriterState> {
     if (!this.abort) return;
     this.abort.abort();
     this.abort = null;
+    this.working = null;
     this.set(IDLE);
   }
 

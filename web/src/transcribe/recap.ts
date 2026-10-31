@@ -1,6 +1,6 @@
 import type { ConversationRequest, Settings } from "../api/request.ts";
 import { assistRequest, CHARS_PER_TOKEN } from "./assist.ts";
-import { type DraftLine, type NoteKind, type Notes, NOTES_SETTINGS, notesMarkdown, type NoteSection, parseLines, readNotes, sectionsTask, specOf, withWriting, type Written } from "./notes.ts";
+import { type DraftLine, type NoteKind, type NoteLine, type Notes, NOTES_SETTINGS, notesMarkdown, type NoteSection, parseLines, readNotes, sectionsTask, specOf, withWriting, type Written } from "./notes.ts";
 import { clock } from "./export.ts";
 import { taskInput } from "./taskContext.ts";
 import { dayAndTime, type Transcript } from "./transcript.ts";
@@ -60,13 +60,29 @@ function userNotes(t: Transcript): string {
 }
 
 /**
+ * The lines the user wrote in the recap and the ones they removed from it, when there are any: a new recap keeps the
+ * first as they are (withRecap), so it is told neither to repeat them nor to contradict them, nor to write the others
+ * again (#436).
+ */
+function userRecap(recap: Notes | undefined): string[] {
+  const listed = (lines: NoteLine[]) => lines.map((l) => `- ${l.section}: ${l.text}`).join("\n");
+  const theirs = (recap?.lines ?? []).filter((l) => l.author === "user");
+  const removed = recap?.removed ?? [];
+  return [
+    ...(theirs.length > 0 ? [`Lines the user wrote in the recap, which stay in it as they are: they are true; write nothing that contradicts them, and do not write them again:\n${listed(theirs)}`] : []),
+    ...(removed.length > 0 ? [`Lines the user removed from the recap, never to be written again:\n${listed(removed)}`] : []),
+  ];
+}
+
+/**
  * A recap of `t` as `kind`, and where its transcript starts when the start did not fit. Its user turn is the context,
  * the title and the whole transcript, then what the context images showed (`readings`, a line each as their reading
- * gives it; none until images are read) and the notes the user took.
+ * gives it; none until images are read), the notes the user took, and the lines they wrote in the recap or removed
+ * from it.
  */
 export function recapRequest(t: Transcript, kind: NoteKind, contextLimit: number | null, readings: string[] = []): { request: ConversationRequest; fromMs: number | null } {
   const shown = readings.length > 0 ? [`Pictures shown during the conversation, as read at their moments:\n${readings.join("\n")}`] : [];
-  const after = [...shown, userNotes(t)].join("\n\n");
+  const after = [...shown, userNotes(t), ...userRecap(t.recap)].join("\n\n");
   const { content, fromMs } = taskInput(t, contextLimit, RECAP_MAX_TOKENS + Math.ceil(after.length / CHARS_PER_TOKEN));
   return { request: assistRequest(RECAP_SETTINGS, recapTask(kind), `${content}\n${after}`), fromMs };
 }

@@ -1,5 +1,5 @@
 import "katex/dist/katex.min.css";
-import { isValidElement, memo, type ReactNode, useDeferredValue, useMemo, useState } from "react";
+import { isValidElement, memo, type ReactNode, useDeferredValue, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -110,21 +110,31 @@ const rehypePlugins = [rehypeKatex];
  * little (a deferred value) so long replies keep the page responsive, and
  * the ember caret sits after the last block.
  */
-export const Markdown = memo(function Markdown({ text, streaming = false, itemMarks }: { text: string; streaming?: boolean; itemMarks?: Record<number, string> }) {
+export const Markdown = memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
   const deferred = useDeferredValue(text);
-  // `itemMarks`: a data-mark on the list items that start on those lines (1-based) of the text, for the notes' marks.
-  const marked = useMemo<Components>(
-    () =>
-      itemMarks && Object.keys(itemMarks).length > 0
-        ? { ...components, li: ({ node, children }) => <li data-mark={itemMarks[node?.position?.start.line ?? 0]}>{children}</li> }
-        : components,
-    [itemMarks],
-  );
   return (
     <div className="md" data-streaming={streaming}>
-      <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={marked}>
+      <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={components}>
         {normalizeMath(deferred)}
       </ReactMarkdown>
     </div>
+  );
+});
+
+/** One line's inline Markdown, unwrapped: no paragraph around it. */
+const inline: Components = { ...components, p: ({ children }) => <>{children}</> };
+
+/**
+ * One line of Markdown with no block around it, for a list item drawn by the page (a note's line): its emphasis,
+ * code, links and formulas. A list, heading or quote marker it starts with stays text.
+ */
+export const InlineMarkdown = memo(function InlineMarkdown({ text }: { text: string }) {
+  const line = normalizeMath(text)
+    .replace(/^(\s*\d+)([.)])(?=\s)/, "$1\\$2")
+    .replace(/^(\s*)([#>*+-])(?=\s)/, "$1\\$2");
+  return (
+    <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={inline}>
+      {line}
+    </ReactMarkdown>
   );
 });

@@ -82,6 +82,27 @@ describe("the recap's request", () => {
     expect(request.turns[0].content).toContain("Sentence number 399 ");
     expect(request.turns[0].content.endsWith("to be taken as true:\n- People: Ada leads procurement.")).toBe(true);
   });
+
+  it("tells the lines the user wrote in the recap and the ones they removed from it, so a new recap neither repeats nor contradicts them", () => {
+    const t = heard(["The cap is forty.", "Lunch at one."]);
+    const edited = recap({
+      lines: [
+        { id: "N1", section: "Summary", text: "The budget.", author: "model" },
+        { id: "N2", section: "Decisions", text: "Cap at 40k [00:00]", author: "user" },
+      ],
+      removed: [{ id: "N3", section: "Topics", text: "Lunch.", author: "model" }],
+      nextId: 4,
+    });
+    expect(recapRequest({ ...t, recap: edited }, "work", null).request.turns[0].content.endsWith(
+      [
+        "Notes the user took during the conversation: none.",
+        "Lines the user wrote in the recap, which stay in it as they are: they are true; write nothing that contradicts them, and do not write them again:\n- Decisions: Cap at 40k [00:00]",
+        "Lines the user removed from the recap, never to be written again:\n- Topics: Lunch.",
+      ].join("\n\n"),
+    )).toBe(true);
+    // A recap the user left as the model wrote it asks as before.
+    expect(recapRequest({ ...t, recap: recap() }, "work", null).request.turns[0].content.endsWith("[00:10] Me: Lunch at one.\n\nNotes the user took during the conversation: none.")).toBe(true);
+  });
 });
 
 describe("the end of a listening", () => {
@@ -124,6 +145,26 @@ describe("the recap as kept", () => {
       covered: 3,
       writtenAt: 1_000,
     });
+  });
+
+  it("leaves out a line written again word for word that the user wrote or removed", () => {
+    const before = recap({
+      lines: [
+        { id: "N1", section: "Summary", text: "The budget.", author: "model" },
+        { id: "N2", section: "Decisions", text: "Cap at 40k [02:10]", author: "user" },
+      ],
+      removed: [{ id: "N3", section: "Topics", text: "Lunch.", author: "model" }],
+      nextId: 4,
+    });
+    const lines = [
+      { section: "Decisions", text: "cap at 40k [02:10]" },
+      { section: "Topics", text: "Lunch." },
+      { section: "Topics", text: "The budget." },
+    ];
+    expect(withRecap(before, { lines, writtenAs: "work", covered: 3, writtenAt: 2_000, fromMs: null }).lines).toEqual([
+      { id: "N4", section: "Topics", text: "The budget.", author: "model" },
+      { id: "N2", section: "Decisions", text: "Cap at 40k [02:10]", author: "user" },
+    ]);
   });
 
   it("gives back Markdown in the recap's sections, in order, `—` for an empty one", () => {

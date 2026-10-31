@@ -1,10 +1,10 @@
-import { hoursClocks } from "./export.ts";
 import { type NoteLine, type Notes, sectionOrder, specOf } from "./notes.ts";
 
 // What an update changed in the running notes, shown for a moment (spec #428,
 // "The notes view"): a line added or changed carries the ember mark and a
 // removed one stays struck and dimmed, each for about three seconds. The rule
-// is here and pure; Notes.tsx keeps the marks and draws them.
+// is here and pure; Notes.tsx keeps the marks and draws them. What the user
+// does by hand is never marked: they saw it happen (#436).
 
 /** How long a mark stays, in ms. */
 export const MARK_MS = 3_000;
@@ -17,10 +17,14 @@ export type NoteMark = { id: string; kind: "fresh" | "gone"; until: number; line
 
 const indexIn = (notes: Notes | undefined, line: NoteLine) => (notes?.lines ?? []).filter((l) => l.section === line.section).findIndex((l) => l.id === line.id);
 
-/** The model's lines that were added, changed (text or section) or removed going from `before` to `after`; the user's own lines are not marked. */
+/**
+ * The model's lines that were added, changed (text or section) or removed going from `before` to `after`; the user's own
+ * lines are not marked, nor a line of the model's the user made theirs or removed.
+ */
 export function changesBetween(before: Notes | undefined, after: Notes | undefined): NoteChange[] {
   const was = new Map((before?.lines ?? []).map((l) => [l.id, l]));
   const is = new Map((after?.lines ?? []).map((l) => [l.id, l]));
+  const theirs = new Set((after?.removed ?? []).map((l) => l.id));
   const found: NoteChange[] = [];
   for (const line of is.values()) {
     const old = was.get(line.id);
@@ -28,7 +32,7 @@ export function changesBetween(before: Notes | undefined, after: Notes | undefin
     if (!old) found.push({ kind: "added", line, index: indexIn(after, line) });
     else if (old.text !== line.text || old.section !== line.section) found.push({ kind: "changed", line, index: indexIn(after, line) });
   }
-  for (const line of was.values()) if (line.author === "model" && !is.has(line.id)) found.push({ kind: "removed", line, index: indexIn(before, line) });
+  for (const line of was.values()) if (line.author === "model" && !is.has(line.id) && !theirs.has(line.id)) found.push({ kind: "removed", line, index: indexIn(before, line) });
   return found;
 }
 
@@ -48,31 +52,27 @@ export const nextExpiry = (marks: NoteMark[], now: number): number | null => {
   return left.length === 0 ? null : Math.min(...left);
 };
 
-/** The notes as Markdown with the marks drawn in: removed lines struck in their place, and for each line of Markdown (1-based) that is marked, how. */
-export type MarkedNotes = { markdown: string; items: Record<number, "fresh" | "gone"> };
+/** A line as the view draws it: one of the notes, fresh while its mark stands, or one removed, struck while its mark stands. */
+export type NoteRow = { line: NoteLine; mark: "fresh" | "gone" | null };
 
-/** What notes.ts's `notesMarkdown` gives, plus the removed lines still standing; with no mark standing, exactly that. */
-export function markedMarkdown(notes: Notes | undefined, marks: NoteMark[], now: number): MarkedNotes {
-  const items: Record<number, "fresh" | "gone"> = {};
-  if (!notes || (notes.writtenAs === null && notes.lines.length === 0 && standing(marks, now).length === 0)) return { markdown: "", items };
+/** A section as the view draws it: its name, and its rows in order. */
+export type DrawnSection = { name: string; rows: NoteRow[] };
+
+/**
+ * The notes as the view draws them, in notes.ts's `notesMarkdown` order: `named` (the live sections of the kind the
+ * notes were written as, unless given), then any other a line sits in, Other last; each line with its mark, a line of
+ * the user's never marked, and each removed line still standing back where it was, or last when its neighbours have
+ * moved on. None before any notes are written.
+ */
+export function markedSections(notes: Notes | undefined, marks: NoteMark[], now: number, named?: string[]): DrawnSection[] {
   const live = standing(marks, now);
+  if (!notes || (notes.writtenAs === null && notes.lines.length === 0 && live.length === 0)) return [];
   const fresh = new Set(live.filter((m) => m.kind === "fresh").map((m) => m.id));
   const gone = live.filter((m) => m.kind === "gone" && !notes.lines.some((l) => l.id === m.id));
-  const named = specOf(notes.writtenAs ?? notes.kind).running.map((s) => s.name);
-  const out: string[] = [];
-  for (const section of sectionOrder(named, [...notes.lines, ...gone.map((m) => m.line)])) {
-    const rows: { text: string; mark?: "fresh" | "gone" }[] = notes.lines.filter((l) => l.section === section).map((l) => ({ text: `- ${hoursClocks(l.text)}`, mark: fresh.has(l.id) ? "fresh" : undefined }));
-    // A removed line goes back where it was, or last when its neighbours have moved on.
-    for (const m of gone.filter((g) => g.line.section === section).sort((a, b) => a.index - b.index)) {
-      rows.splice(Math.min(m.index, rows.length), 0, { text: `- ~~${hoursClocks(m.line.text)}~~`, mark: "gone" });
-    }
-    if (out.length > 0) out.push("");
-    out.push(`## ${section}`);
-    if (rows.length === 0) out.push("—");
-    for (const row of rows) {
-      out.push(row.text);
-      if (row.mark) items[out.length] = row.mark;
-    }
-  }
-  return { markdown: out.join("\n"), items };
+  const names = named ?? specOf(notes.writtenAs ?? notes.kind).running.map((s) => s.name);
+  return sectionOrder(names, [...notes.lines, ...gone.map((m) => m.line)]).map((name) => {
+    const rows = notes.lines.filter((l) => l.section === name).map((line): NoteRow => ({ line, mark: line.author === "model" && fresh.has(line.id) ? "fresh" : null }));
+    for (const m of gone.filter((g) => g.line.section === name).sort((a, b) => a.index - b.index)) rows.splice(Math.min(m.index, rows.length), 0, { line: m.line, mark: "gone" });
+    return { name, rows };
+  });
 }

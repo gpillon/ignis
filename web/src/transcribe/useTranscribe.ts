@@ -14,12 +14,13 @@ import { useStoredSessions } from "../store/useStoredSessions.ts";
 import { decodeFile } from "./file.ts";
 import { filePace } from "./filePace.ts";
 import { chooseUtteranceSilence, utteranceSilence } from "./silence.ts";
-import { chooseNoteKind, kindOf, type NoteKind, noNotes } from "./notes.ts";
+import { chooseNoteKind, kindOf, type NoteKind, type NoteLine, noNotes, type Notes } from "./notes.ts";
+import { addLine, editLine, removeLine } from "./noteEdits.ts";
 import { withRecap } from "./recap.ts";
 import { type CallContext, contextAtStart, contextOf, contextTokensOf, copiedDraft, DEFAULT_CONTEXT_TOKENS, mergeDraft, told } from "./context.ts";
 import { savedContext, saveContext } from "./defaultContext.ts";
 import { readConfig } from "../server/routes.ts";
-import { type NotesHandle, NotesWriter } from "./notesWriter.ts";
+import { type NotesForm, type NotesHandle, NotesWriter } from "./notesWriter.ts";
 import { Analyst, type AnalystHandle } from "./analyst.ts";
 import { acceptRewrite, Rewriter, type RewriterHandle } from "./rewrite.ts";
 import { Asker, type AskerHandle, withAnswer } from "./ask.ts";
@@ -145,6 +146,12 @@ export type TranscribeActions = {
   /** Stops the writing under way, the notes' or the recap's. */
   stopNotes: () => void;
   setNotesLive: (on: boolean) => void;
+  /** A line of the open Transcript's running notes or recap, as the user saw it, edited by hand and now theirs; emptied, removed. */
+  editNote: (form: NotesForm, line: NoteLine, text: string) => void;
+  /** The user's line added at the end of a section of the open Transcript's running notes or recap. */
+  addNote: (form: NotesForm, section: string, text: string) => void;
+  /** A line of the open Transcript's running notes or recap removed by hand: it never comes back. */
+  removeNote: (form: NotesForm, line: NoteLine) => void;
   /** The open Transcript's suggestion accepted; `always`, and every later one of its kind (Q132). */
   acceptSuggestion: (id: number, always?: boolean) => void;
   dismissSuggestion: (id: number) => void;
@@ -360,6 +367,14 @@ export function useTranscribe({
   const change = (id: number, apply: (t: Transcript) => Transcript) => setList((l) => updateTranscript(l, id, apply));
   /** A correction is the open Transcript's. */
   const correct = (apply: (t: Transcript) => Transcript) => setList((l) => updateTranscript(l, l.activeId, apply));
+  /**
+   * The open Transcript's notes edited by hand (noteEdits.ts): the running notes through the writer, so an update under
+   * way holds the edit before the model's next call; the recap, which no thread holds, in place.
+   */
+  const byHand = (form: NotesForm, edit: (notes: Notes) => Notes) => {
+    if (form === "running") writer.editNotes(listNow.current.activeId, edit);
+    else correct((t) => (t.recap ? { ...t, recap: edit(t.recap) } : t));
+  };
 
   const actions = useMemo<TranscribeActions>(
     () => ({
@@ -501,6 +516,9 @@ export function useTranscribe({
       },
       stopNotes: () => writer.stop(),
       setNotesLive: (on) => storeNotesLive(on),
+      editNote: (form, line, text) => byHand(form, (n) => editLine(n, line, text)),
+      addNote: (form, section, text) => byHand(form, (n) => addLine(n, section, text)),
+      removeNote: (form, line) => byHand(form, (n) => removeLine(n, line)),
       acceptSuggestion: (id, always = false) => correct((t) => accept(t, id, Date.now(), { always })),
       dismissSuggestion: (id) => correct((t) => dismiss(t, id)),
       dropSuggestedTerm: (id, term) => correct((t) => dropTerm(t, id, term)),

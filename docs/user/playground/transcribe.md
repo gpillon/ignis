@@ -441,15 +441,43 @@ reload, on another kind, on Rewrite from scratch) is in the transcript they
 start from.
 
 **More** › **Rewrite from scratch** drops the model's lines and writes the
-notes again from the whole transcript, for notes that drifted. Picking another
-kind does the same at the next update, in the new kind's sections; until then
-the line under the notes says which kind they were written as.
+notes again from the whole transcript, for notes that drifted; the lines you
+[wrote yourself](#editing-the-notes) stay. Picking another kind does the same at
+the next update, in the new kind's sections, your lines under the section of the
+same name or under a closing **Other**; until then the line under the notes says
+which kind they were written as.
 
 **Keep updating while listening**, off unless you turn it on (this browser
 keeps the choice), updates them by itself while a listening goes on: the first
 once three utterances are in, then about once a minute while something new is
 said. When the listening ends it writes the recap instead. Picking another kind
 meanwhile writes them again straight away.
+
+### Editing the notes
+
+The lines of the running notes and of the [recap](#the-recap) are yours to
+change, even while an update runs:
+
+- **Click a line** to edit it in place: **Enter** saves, **Escape** cancels,
+  and a line you empty is removed. Clicking away saves too.
+- **×**, at the right of a line you point at, removes it.
+- **+**, at the foot of each section, adds a line of your own there.
+
+A line you edited or added is yours, and its bullet is hollow where the model's
+lines have the ember square. The model never changes or removes it: the page
+refuses a call on it and tells the model the line is yours. A line you removed
+never comes back: the page refuses it to the model word for word. Your edit
+wins over an update under way: a change the model makes to that line after it
+is refused, a line it removed meanwhile comes back as yours, and a line you add
+takes an id of its own. The next update tells the model what you did, a line
+each under `Changed since:`, such as `Edited by the user in People: N3 (the
+user's) Ada: head of procurement. It was: Ada: procurement.`, `Added by the user
+to Figures & dates: N9 (the user's) 40k: the cap.` and `Removed by the user from
+Now, never to be written again: N2 The budget.`; a line you added and removed
+between two updates is not told. Your lines stay yours after a reload, on
+**Rewrite from scratch** and on another kind. What you change is not marked as
+an update's changes are, and **Copy notes** gives the lines with no mark of who
+wrote which.
 
 ### The recap
 
@@ -475,13 +503,19 @@ Its Summary and Topics carry the main threads by the weight the conversation
 gave them, not every aside; Decisions are what was agreed, Action items what
 someone committed to do, and People everyone who spoke or was named. It reads
 the context and the whole transcript afresh: the notes the model wrote are not
-sent, so a mistake made in them live does not carry over into the recap.
+sent, so a mistake made in them live does not carry over into the recap. The
+lines you wrote in the running notes are: they go as notes you took, to be taken
+as true, so a correction you made during the call reaches the recap.
 
 Once there is a recap, it stands at the top of the tab with the line saying
 when it was written and from how many utterances, and the notes fold under it
 as **Running notes**; click to open them. While it is written it streams in
-there, and **Stop** keeps the recap there was. A new recap takes the last one's
-place. Each transcript keeps its recap, and a reload brings it back.
+there, and **Stop** keeps the recap there was. You
+[edit the recap](#editing-the-notes) as you do the running notes. A new recap
+takes the place of the model's lines of the last one; the lines you wrote in it
+stay, and the request lists them, and the ones you removed from it, so that the
+model neither writes them again nor contradicts yours. Each transcript keeps
+its recap, and a reload brings it back.
 
 Nothing goes to the model before a press or the switch. The notes and the recap go to the
 model loaded and name none, so they never switch models: with the image model
@@ -500,14 +534,16 @@ when that is smaller). Each later update adds one message: the utterances under
 `Said since [mm:ss]:`, then the transcript's changes under `Changed since:`, a
 line each, such as `Corrected: [00:05] Anna: We meet on Thursday. It was: We
 meet on Friday.`, `Moved:`, `Split:`, `Deleted:`, `Put back:`, and `Renamed:
-Speaker 2, heard from [00:05], is Anna.` or `Merged:` for a speaker; with
-nothing said and nothing changed, an update sends nothing. An update makes up
+Speaker 2, heard from [00:05], is Anna.` or `Merged:` for a speaker, then
+[your edits](#editing-the-notes) to the notes; with nothing said and nothing
+changed, an update sends nothing. An update makes up
 to six requests, each answered with what its calls did in one line, and ends
 sooner when the model calls nothing or two requests in a row change nothing;
 what is left goes to the next update.
 The page holds the model to the notes' limits: it strips a line's id copied
 into a text, and refuses a line already in its section, one over 240
-characters, and a line more in a full section, telling the model why.
+characters, a line more in a full section, a change to a line of yours and a
+line you removed, telling the model why.
 
 One writing goes at a time, the notes' or the recap's; a recap may take up to
 3,000 tokens. A transcript too long for the model's context is sent from where
