@@ -5,10 +5,10 @@
 //!
 //! NVML counts a fresh allocation late (GitHub #424): on the RTX 5090 under
 //! WDDM, the free reading right after `cudaMalloc` of 1 GiB missed its last
-//! 64 to 448 MiB in 12 of 40 allocations, and a later reading had all of it
-//! (27 and 63 ms later, where a probe timed it). So the allocation's reading
-//! waits for the count, for at most [`COUNTED_WITHIN`]; its CPU tests feed it
-//! injected readings.
+//! 64 to 448 MiB in 6 of the 20 allocations probed, and a later reading had
+//! all of it (27 and 63 ms later, where a probe timed it). So the allocation's
+//! reading waits for the count, for at most [`COUNTED_WITHIN`]; its CPU tests
+//! feed it injected readings.
 
 use std::time::Duration;
 
@@ -26,6 +26,8 @@ const COUNTED_WITHIN: Duration = Duration::from_secs(2);
 /// The free memory `read` reports once it counts `bytes` allocated with
 /// `free_before` free, or its last reading if it has not counted them within
 /// `within`.
+/// It reads again after a 1 ms pause, and each NVML read itself takes
+/// milliseconds (8 to 45 ms in the probes), so the real cadence is a read every 10 to 50 ms.
 fn free_once_counted(mut read: impl FnMut() -> u64, free_before: u64, bytes: u64, within: Duration) -> u64 {
     let deadline = std::time::Instant::now() + within;
     loop {
@@ -52,13 +54,23 @@ fn an_allocation_counted_late_is_read_once_it_is_counted() {
     // GitHub #424's run: 1 GiB taken from 20 GiB free, 960 MiB of it counted
     // at the first reading after the allocation and the rest one reading later.
     let free_before = 20 * GIB;
+    let mut reads = 0;
+    let values = [free_before - (960 << 20), free_before - GIB];
+    let mut nvml = readings(&values);
+    let started = std::time::Instant::now();
     let free = free_once_counted(
-        readings(&[free_before - (960 << 20), free_before - GIB]),
+        || {
+            reads += 1;
+            nvml()
+        },
         free_before,
         GIB,
         COUNTED_WITHIN,
     );
     assert_eq!(free, free_before - GIB);
+    // It returns as soon as the allocation is counted, not when the window ends.
+    assert_eq!(reads, 2, "it stopped reading once the allocation was counted");
+    assert!(started.elapsed() < COUNTED_WITHIN / 10, "waited {:?} for a count that was already there", started.elapsed());
 }
 
 #[test]
