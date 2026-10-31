@@ -194,7 +194,7 @@ export const NOTES_SETTINGS: Omit<Settings, "systemPrompt"> = {
  * the live model.
  */
 export const RUNNING_NOTES = {
-  /** A thread whose last request's prompt passed this many tokens starts again from a snapshot of the notes. */
+  /** A thread whose prompt grew this many tokens past its first request's starts again from a snapshot of the notes. */
   restartTokens: 64_000,
   /** The requests one update makes at most; what is left goes to the next update. */
   maxRounds: 6,

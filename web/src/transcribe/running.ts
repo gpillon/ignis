@@ -407,8 +407,14 @@ export function fromScratch(notes: Notes | undefined, kind: NoteKind): Notes {
 }
 
 /**
- * The prompt past which a thread starts again from a snapshot: the running notes' threshold, or half the model's
- * context when that is smaller, so a thread never outgrows it.
+ * How far a thread's prompt grows past its first request's before it starts again from a snapshot: the running notes'
+ * threshold, or half the model's context when that is smaller.
  */
 export const restartAt = (contextLimit: number | null): number =>
   Math.min(RUNNING_NOTES.restartTokens, contextLimit === null ? Infinity : Math.floor(contextLimit / 2));
+
+/**
+ * The context a thread's first turn fills with the transcript at most, as the notes' writing did before the thread:
+ * the model's, less the threshold the thread then grows by, so a thread never outgrows it; all of it when unknown.
+ */
+export const firstTurnContext = (contextLimit: number | null): number | null => (contextLimit === null ? null : contextLimit - restartAt(contextLimit));

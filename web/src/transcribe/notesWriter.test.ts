@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ChunkEvent } from "../api/sse.ts";
 import type { StreamOptions, StreamResult } from "../api/stream.ts";
-import { ASSIST_SYSTEM } from "./assist.ts";
+import { ASSIST_SYSTEM, CHARS_PER_TOKEN } from "./assist.ts";
 import { EMPTY_CONTEXT } from "./context.ts";
 import { addLine, editLine, removeLine } from "./noteEdits.ts";
 import { LIVE_GAP_MS, noNotes, type Notes, RUNNING_NOTES } from "./notes.ts";
@@ -125,6 +125,39 @@ describe("the notes thread", () => {
     expect(turnsOf(fake.asked, 2)).toEqual([...turnsOf(fake.asked, 1), { role: "assistant", content: "" }, { role: "user", content: "Said since [00:15]:\n[00:15] Me: Frase 3.\n[00:20] Me: Frase 4.\n" }]);
     expect(fake.asked[2].request.settings).toEqual(fake.asked[0].request.settings);
     expect(fake.asked[2].request.extras).toEqual(fake.asked[0].request.extras);
+  });
+
+  /** A long call: `n` utterances of about a hundred tokens each, `Frase i.` first in each. */
+  function long(n: number): Transcript {
+    let t = { ...createTranscript(1), title: "27 Oct 15:42 · Call" };
+    for (let i = 0; i < n; i++) t = addUtterance(t, { stream: "s", startMs: i * 20_000, endMs: i * 20_000 + 18_000, text: `Frase ${i}. ${"parola ".repeat(44)}`, voice: { kind: "me" } });
+    return t;
+  }
+
+  it("starts with the whole transcript when it fits the model's context, past the threshold too", async () => {
+    // About 43,000 tokens of transcript, at CHARS_PER_TOKEN: more than the threshold's half, less than the context.
+    for (const contextLimit of [262_144, null]) {
+      const { w, fake, page, held } = writer([{}]);
+      await w.write(held(long(400)), "work", contextLimit);
+      const first = turnsOf(fake.asked, 0)[0].content;
+      expect(first).toContain("\n\n[00:00] Me: Frase 0. ");
+      expect(first).toContain("\n[133:00] Me: Frase 399. ");
+      expect(page.get(1)?.fromMs).toBeNull();
+    }
+  });
+
+  it("starts from where the transcript's tail fits the model's context, less the threshold the thread grows by", async () => {
+    const { w, fake, page, held } = writer([{}]);
+    await w.write(held(long(400)), "work", 32_768);
+    const first = turnsOf(fake.asked, 0)[0].content;
+    expect(first).not.toContain("Frase 0. ");
+    expect(first).toContain("\n[133:00] Me: Frase 399. ");
+    // Half the context is the threshold on a context this small: the first turn fills most of the other half.
+    expect(first.length).toBeLessThanOrEqual(16_384 * CHARS_PER_TOKEN);
+    expect(first.length).toBeGreaterThan(12_000 * CHARS_PER_TOKEN);
+    // The notes say from when: the first utterance it carries.
+    const [, m, s] = first.match(/\n\[(\d+):(\d+)\] Me: Frase/)!;
+    expect(page.get(1)?.fromMs).toBe((Number(m) * 60 + Number(s)) * 1_000);
   });
 
   it("ends an update when two rounds in a row change nothing", async () => {
@@ -307,21 +340,52 @@ describe("starting the thread again", () => {
     expect(turnsOf(fake.asked, 0)).toEqual([{ role: "user", content: `${contextBlock(t)}27 Oct 15:42 · Call\n\n[00:00] Me: Frase 0.\n[00:05] Me: Frase 1.\n[00:10] Me: Frase 2.\n[00:15] Me: Frase 3.\n\n${snapshot}` }]);
   });
 
-  it("once the last request's prompt passed the threshold", async () => {
-    const { w, fake, held } = writer([{ events: [prompt(RUNNING_NOTES.restartTokens)] }, { events: [prompt(RUNNING_NOTES.restartTokens + 1)] }, {}]);
+  it("once its prompt grew past the threshold beyond its first request's", async () => {
+    const base = 5_000;
+    const { w, fake, held } = writer([
+      { events: [prompt(base)] },
+      { events: [prompt(base + RUNNING_NOTES.restartTokens - 100)] },
+      { events: [prompt(base + RUNNING_NOTES.restartTokens + 1)] },
+      {},
+    ]);
     await w.write(held({ ...heard(3), notes: kept() }), "work", null);
     await w.write(held(heard(4)), "work", null);
     expect(turnsOf(fake.asked, 1)).toHaveLength(3);
     await w.write(held(heard(5)), "work", null);
-    expect(turnsOf(fake.asked, 2)).toHaveLength(1);
-    expect(turnsOf(fake.asked, 2)[0].content).toContain("[00:20] Me: Frase 4.\n\nThe notes so far, each line with its id:");
+    expect(turnsOf(fake.asked, 2)).toHaveLength(5);
+    await w.write(held(heard(6)), "work", null);
+    expect(turnsOf(fake.asked, 3)).toHaveLength(1);
+    expect(turnsOf(fake.asked, 3)[0].content).toContain("[00:25] Me: Frase 5.\n\nThe notes so far, each line with its id:");
   });
 
-  it("starts it again sooner on a model whose context is small: at half of it", async () => {
-    const { w, fake, held } = writer([{ events: [prompt(20_000)] }, {}]);
+  it("once the turn it would append takes it past the threshold: the request never outgrows the model's context", async () => {
+    const base = 5_000;
+    const { w, fake, held } = writer([{ events: [prompt(base)] }, { events: [prompt(base + RUNNING_NOTES.restartTokens - 5)] }, {}]);
+    await w.write(held({ ...heard(3), notes: kept() }), "work", null);
+    await w.write(held(heard(4)), "work", null);
+    expect(turnsOf(fake.asked, 1)).toHaveLength(3);
+    // The turn it would append, what was said since [00:20], is more than five tokens.
+    await w.write(held(heard(5)), "work", null);
+    expect(turnsOf(fake.asked, 2)).toHaveLength(1);
+  });
+
+  it("not at every update when its first request alone passed the threshold", async () => {
+    const base = RUNNING_NOTES.restartTokens + 50_000;
+    const { w, fake, held } = writer([{ events: [prompt(base)] }, { events: [prompt(base + 1_000)] }, {}]);
+    await w.write(held({ ...heard(3), notes: kept() }), "work", null);
+    await w.write(held(heard(4)), "work", null);
+    expect(turnsOf(fake.asked, 1)).toHaveLength(3);
+    await w.write(held(heard(5)), "work", null);
+    expect(turnsOf(fake.asked, 2)).toHaveLength(5);
+  });
+
+  it("sooner on a model whose context is small: once it grew half of it", async () => {
+    const { w, fake, held } = writer([{ events: [prompt(2_000)] }, { events: [prompt(2_000 + 16_385)] }, {}]);
     await w.write(held(heard(3)), "work", 32_768);
     await w.write(held(heard(4)), "work", 32_768);
-    expect(turnsOf(fake.asked, 1)).toHaveLength(1);
+    expect(turnsOf(fake.asked, 1)).toHaveLength(3);
+    await w.write(held(heard(5)), "work", 32_768);
+    expect(turnsOf(fake.asked, 2)).toHaveLength(1);
   });
 
   it("on another kind, in its sections: the model's lines gone, the user's under a section of the same name or a closing Other", async () => {
@@ -467,16 +531,18 @@ describe("what changed in the transcript since the last update", () => {
   });
 
   it("starts the thread again from the transcript as it stands: a change before a restart is in its first turn, and not told again", async () => {
-    const { w, fake, held } = writer([{ events: [prompt(RUNNING_NOTES.restartTokens + 1)] }, {}, {}]);
+    // An update whose second request's prompt grew past the threshold beyond its first's.
+    const first = { events: [call("c1", "add_line", { section: "Now", text: "Il budget." }), prompt(1_000)] };
+    const { w, fake, held } = writer([first, { events: [prompt(1_000 + RUNNING_NOTES.restartTokens + 1)] }, {}, {}]);
     await w.write(held(voices(3)), "work", null);
     const edited = renameSpeaker(editText(voices(3), 2, "Frase uno, corretta."), 2, "Anna");
     await w.write(held(edited), "work", null);
-    expect(turnsOf(fake.asked, 1)).toHaveLength(1);
-    expect(turnsOf(fake.asked, 1)[0].content).toContain("[00:05] Anna: Frase uno, corretta.\n");
-    expect(turnsOf(fake.asked, 1)[0].content).not.toContain("Changed since");
+    expect(turnsOf(fake.asked, 2)).toHaveLength(1);
+    expect(turnsOf(fake.asked, 2)[0].content).toContain("[00:05] Anna: Frase uno, corretta.\n");
+    expect(turnsOf(fake.asked, 2)[0].content).not.toContain("Changed since");
     const next = addUtterance(edited, { stream: "s", startMs: 15_000, endMs: 17_000, text: "Frase 3.", voice: { kind: "speaker", index: 1 } });
     await w.write(held(next), "work", null);
-    expect(turnsOf(fake.asked, 2).at(-1)?.content).toBe("Said since [00:15]:\n[00:15] Anna: Frase 3.\n");
+    expect(turnsOf(fake.asked, 3).at(-1)?.content).toBe("Said since [00:15]:\n[00:15] Anna: Frase 3.\n");
   });
 
   it("tells the last utterance deleted apart from a new one heard under its id", async () => {

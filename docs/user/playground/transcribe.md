@@ -562,10 +562,13 @@ The running notes' requests carry four tools (`add_line`, `replace_line`,
 `remove_line`, `rewrite_section`) and the conversation so far, which an update
 only appends to, so the server reuses what it already read. Its first message
 is the context, the title, the transcript, with each moment in minutes from the
-start (`[64:09]`), and the notes as they stand, each line with its id. It
-starts over that way after a reload, on another kind, on Rewrite from scratch,
-and once a request's prompt passes 64,000 tokens (half the model's context,
-when that is smaller). Each later update adds one message: the utterances under
+start (`[64:09]`), and the notes as they stand, each line with its id. The
+transcript goes whole, or, when it is too long for the model's context, from
+where its tail fits the context less 64,000 tokens (half the context, when that
+is smaller), the room the conversation then grows into. It starts over that way
+after a reload, on another kind, on Rewrite from scratch, and once the
+conversation, with the message an update adds, would grow past that room beyond
+its first request. Each later update adds one message: the utterances under
 `Said since [mm:ss]:`, then the transcript's changes under `Changed since:`, a
 line each, such as `Corrected: [00:05] Anna: We meet on Thursday. It was: We
 meet on Friday.`, `Moved:`, `Split:`, `Deleted:`, `Put back:`, and `Renamed:
