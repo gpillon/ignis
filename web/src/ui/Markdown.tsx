@@ -1,5 +1,5 @@
 import "katex/dist/katex.min.css";
-import { isValidElement, memo, type ReactNode, useDeferredValue, useState } from "react";
+import { isValidElement, memo, type ReactNode, useDeferredValue, useMemo, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -110,11 +110,19 @@ const rehypePlugins = [rehypeKatex];
  * little (a deferred value) so long replies keep the page responsive, and
  * the ember caret sits after the last block.
  */
-export const Markdown = memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
+export const Markdown = memo(function Markdown({ text, streaming = false, itemMarks }: { text: string; streaming?: boolean; itemMarks?: Record<number, string> }) {
   const deferred = useDeferredValue(text);
+  // `itemMarks`: a data-mark on the list items that start on those lines (1-based) of the text, for the notes' marks.
+  const marked = useMemo<Components>(
+    () =>
+      itemMarks && Object.keys(itemMarks).length > 0
+        ? { ...components, li: ({ node, children }) => <li data-mark={itemMarks[node?.position?.start.line ?? 0]}>{children}</li> }
+        : components,
+    [itemMarks],
+  );
   return (
     <div className="md" data-streaming={streaming}>
-      <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={components}>
+      <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={marked}>
         {normalizeMath(deferred)}
       </ReactMarkdown>
     </div>

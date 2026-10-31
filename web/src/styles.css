@@ -581,6 +581,36 @@
   .notes .md ol {
     padding-left: 1.1em;
   }
+  /* An update's changes (transcribe/marks.ts): a line added or changed burns
+     an ember border over the spine for a few seconds; a removed one stays
+     struck and dimmed until it goes. */
+  .notes .md li[data-mark] {
+    position: relative;
+  }
+  .notes .md li[data-mark="fresh"]::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: calc(-1.1em - 0.875rem);
+    width: 2px;
+    background: var(--ember);
+    animation: note-mark-in 0.35s ease-out;
+  }
+  .notes .md li[data-mark="gone"] {
+    color: var(--ash);
+    opacity: 0.6;
+  }
+  @keyframes note-mark-in {
+    from {
+      opacity: 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .notes .md li[data-mark="fresh"]::before {
+      animation: none;
+    }
+  }
   .notes-answer .md {
     font-size: 13px;
   }
