@@ -373,11 +373,11 @@ The initial stable metric contract is:
 | `ignis_kv_ram_evictions_total` | counter | none | Live host-tier snapshots dropped **out of** KV-RAM to make room; the owning request re-prefills from the start (#224) |
 | `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
 | `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Cumulative tokens skipped through retained state: a retained prefix (`kv_ram` when its claim brought it back from KV-RAM, `device` otherwise, #325) or a prompt checkpoint, by the tier it came from and the kind it was |
-| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained state a request chose to resume from: a prompt checkpoint (not yet restored), a retained prefix claimed from the device (`tier=device`, #325), or a retained prefix brought back from KV-RAM (`tier=kv_ram`, counted at the return; the claim that brings it back adds no `device` hit, so one restore is one hit, while a later request choosing the block already back on the device is a `device` hit). A live sibling's prefix is not retained state and is no hit |
+| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained state a request resumed from, counted with the chunk that lands its claim (#445): a prompt checkpoint, a retained prefix claimed from the device (`tier=device`, #325), or a retained prefix brought back from KV-RAM for it (`tier=kv_ram`; the claim that brings it back adds no `device` hit, so one restore is at most one hit, while a later request choosing the block already back on the device is a `device` hit). A claim given up while its request waits for room, or whose prefill never lands, is no hit, and a request that chooses again counts the one it lands. A live sibling's prefix is not retained state and is no hit |
 | `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Prefill runs whose first chunk landed with nothing retained of the kind matching in a tier this load carries (a re-queued request counts again): no checkpoint, or no retained prefix (a live sibling's head is none). Each kind is counted only where it can be hit on the load: `kind=prefix` on the device and in KV-RAM, and not without a retained slot; `kind=checkpoint` not with prompt reuse off — see the note below the table (#216, #222) |
 | `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes written into the tier (`kv_ram`, and `disk` on a load with KV-disk) |
 | `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes that left the tier for nowhere |
-| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
+| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a prefix brought back for a claim that never lands is a restore with no hit |
 | `ignis_requests_accepted_total` | counter | none | Accepted submissions. A loop-guard rewind's continuation is one (#330) |
 | `ignis_requests_completed_total` | counter | none | Completed requests |
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion. A loop-guard rewind cancels one (#330) |
@@ -552,8 +552,9 @@ every load. Now both do, by one rule. A request's look records the tiers it
 found nothing retained in; a later look overwrites them (a request waiting for
 room looks on every tick); its first prefill chunk to land reports them. So a
 request misses a tier once per prefill run, not once per look: a re-queued
-request counts again, as checkpoint misses do. A hit is still counted at the
-claim, which is sticky.
+request counts again, as checkpoint misses do. Since #445 a hit is counted at
+that chunk too, as the one that lands the claim, not at the claim: a claim given
+up while its request waits for room is no hit.
 
 - **A prefix miss means no retained prefix matched, by the hit's own test.**
   On the device that is an entry whose publisher has finished, the test that

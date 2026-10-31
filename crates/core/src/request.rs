@@ -24,6 +24,21 @@ use crate::types::{
     ReuseBoundary, SpecCounters, TokenId,
 };
 
+/// What a request's claim on a shared prefix reports, decided when it claims
+/// and reported by the chunk that lands it (GitHub #445): a claim given up
+/// before then, while its request waits for room, reports nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixReuse {
+    /// Leading prompt tokens the claim skips.
+    pub tokens: u32,
+    /// The prefix's publisher had already finished when it was claimed:
+    /// reuse of retained state, not of a concurrent sibling's prefix.
+    pub retained: bool,
+    /// The tier a retained prefix was found in: `kv_ram` for one the claim
+    /// brought back from there.
+    pub source: crate::checkpoint::ReuseSource,
+}
+
 /// A request in flight in the engine: its lifecycle state, its class (for
 /// admission / backfill), and the decode lane it holds while running.
 #[derive(Debug, Clone)]
@@ -115,6 +130,10 @@ pub struct Request {
     /// Leading prompt tokens reused from the shared prefix (core-07; 0 = a
     /// full prefill, nothing skipped).
     pub shared_prefix_tokens: u32,
+    /// What the claim in [`Self::prefix_entry`] reports once the chunk that
+    /// lands it does (GitHub #445), and `None` from then on, as for a request
+    /// that claimed no prefix.
+    pub prefix_reuse: Option<PrefixReuse>,
     /// Whole KV pages of this request's history that belong to a shared
     /// prefix rather than to the request itself (GitHub #186) — whether it
     /// published that prefix, claimed it as a concurrent sibling, or arrived
@@ -262,6 +281,7 @@ impl Request {
             prefix_entry: None,
             prefix_publisher: None,
             shared_prefix_tokens: 0,
+            prefix_reuse: None,
             shared_pages: 0,
             checkpoint_publisher: None,
             checkpoint_entry: None,
@@ -718,6 +738,7 @@ impl Request {
         self.prefix_entry = None;
         self.prefix_publisher = None;
         self.shared_prefix_tokens = 0;
+        self.prefix_reuse = None;
         self.shared_pages = 0;
         // GitHub #186: so is the retained-checkpoint claim, and for the same
         // reason — the pages and the image it resumed from were released with

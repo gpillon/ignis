@@ -145,7 +145,7 @@ use crate::host::{
 };
 use crate::identity::{MatchKey, MediaKey, PromptContent, PromptKeys};
 use crate::prefix::{PrefixCache, PrefixId, Retention, SpilledPrefixId};
-use crate::request::Request;
+use crate::request::{PrefixReuse, Request};
 use crate::retained_slot::{RetainedHolder, RetainedSkip, RetainedSlotLedger};
 use crate::scheduler::{
     CheckpointClaim, Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome,
@@ -1206,6 +1206,7 @@ impl ConcreteScheduler {
         r.prefix_entry = None;
         r.prefix_publisher = None;
         r.shared_prefix_tokens = 0;
+        r.prefix_reuse = None;
         r.shared_pages = 0;
         r.checkpoint_publisher = None;
         r.checkpoint_entry = None;
@@ -1691,13 +1692,13 @@ impl ConcreteScheduler {
         // `register` counted a registrant; nobody is one.
         self.prefix.release(entry);
         self.prefix.record_return(id, entry);
-        for operation in [RetainedStateOperation::Hit, RetainedStateOperation::Restore] {
-            events.push(SchedEvent::RetainedState {
-                operation,
-                source: ReuseSource::KvRam,
-                kind: RetainedKind::Prefix,
-            });
-        }
+        // The hit is the claim's, reported by the chunk that lands it (GitHub
+        // #445): one return, one hit, once it is what a request resumed from.
+        events.push(SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Restore,
+            source: ReuseSource::KvRam,
+            kind: RetainedKind::Prefix,
+        });
         true
     }
 
@@ -4113,11 +4114,14 @@ impl ConcreteScheduler {
                     restore_micros: micros,
                     kind: RetainedKind::Checkpoint,
                 });
-                events.push(SchedEvent::RetainedState {
-                    operation: RetainedStateOperation::Restore,
-                    source: ReuseSource::Disk,
-                    kind: RetainedKind::Checkpoint,
-                });
+                // GitHub #445: the hit with the reuse, once it landed.
+                for operation in [RetainedStateOperation::Hit, RetainedStateOperation::Restore] {
+                    events.push(SchedEvent::RetainedState {
+                        operation,
+                        source: ReuseSource::Disk,
+                        kind: RetainedKind::Checkpoint,
+                    });
+                }
             }
         }
     }
@@ -4530,28 +4534,14 @@ impl Scheduler for ConcreteScheduler {
                         // max) / pt)`: the shared head is page-aligned, so
                         // subtracting its whole pages is exact.
                         r.resources.kv_pages = r.resources.kv_pages.saturating_sub(claim.pages);
-                        let request = r.id;
-                        let retained = finished(claim.publisher);
-                        events.push(SchedEvent::PrefixReused {
-                            request,
+                        // GitHub #445: reported by the chunk that lands the
+                        // claim, as a checkpoint's reuse is, so a claim given
+                        // up while its request waits for room reports nothing.
+                        r.prefix_reuse = Some(PrefixReuse {
                             tokens: claim.tokens,
-                            retained,
+                            retained: finished(claim.publisher),
                             source: if returned_from_kv_ram { ReuseSource::KvRam } else { ReuseSource::Device },
                         });
-                        // GitHub #325: a request that chose to resume from a
-                        // retained prefix is a hit on the device tier, the
-                        // way the checkpoint claim below is one. A live
-                        // sibling's prefix is not retained state, and one
-                        // this claim brought back from KV-RAM was already
-                        // counted as a `kv_ram` hit by `return_prefix`: one
-                        // restore, one hit.
-                        if retained && !returned_from_kv_ram {
-                            events.push(SchedEvent::RetainedState {
-                                operation: RetainedStateOperation::Hit,
-                                source: ReuseSource::Device,
-                                kind: RetainedKind::Prefix,
-                            });
-                        }
                     } else if let Some(m) = retained {
                         // Resume from an *earlier, finished* request's state.
                         // The claimant takes a holder's reference on the
@@ -4585,11 +4575,6 @@ impl Scheduler for ConcreteScheduler {
                                 debug_assert!(held, "a disk match is a held disk file");
                             }
                         }
-                        events.push(SchedEvent::RetainedState {
-                            operation: RetainedStateOperation::Hit,
-                            source: m.source,
-                            kind: RetainedKind::Checkpoint,
-                        });
                         let r = &mut self.requests[i];
                         r.prefix_entry = on_device.then_some(m.prefix);
                         if !on_device {
@@ -5273,6 +5258,31 @@ impl Scheduler for ConcreteScheduler {
                         // claim was decided, so a claim whose batch failed is
                         // reported when its retry succeeds and never twice,
                         // and so the restore's measured cost can ride along.
+                        // GitHub #445: and a claim given up while its request
+                        // waited for room, never landed, is reported never:
+                        // its reuse, its tokens and its hit are what the
+                        // request resumed from, the prefix it stands on as
+                        // much as a checkpoint.
+                        if job.shared_prefix.is_some() {
+                            if let Some(reuse) = self.requests[i].prefix_reuse.take() {
+                                events.push(SchedEvent::PrefixReused {
+                                    request: request_id,
+                                    tokens: reuse.tokens,
+                                    retained: reuse.retained,
+                                    source: reuse.source,
+                                });
+                                // GitHub #325: a retained prefix is a hit in
+                                // the tier it was found in; a live sibling's
+                                // is not retained state.
+                                if reuse.retained {
+                                    events.push(SchedEvent::RetainedState {
+                                        operation: RetainedStateOperation::Hit,
+                                        source: reuse.source,
+                                        kind: RetainedKind::Prefix,
+                                    });
+                                }
+                            }
+                        }
                         if let Some(claim) = job.checkpoint {
                             events.push(SchedEvent::StateReused {
                                 request: request_id,
@@ -5284,11 +5294,13 @@ impl Scheduler for ConcreteScheduler {
                                 // stands on is reported as `PrefixReused`.
                                 kind: RetainedKind::Checkpoint,
                             });
-                            events.push(SchedEvent::RetainedState {
-                                operation: RetainedStateOperation::Restore,
-                                source: claim.source,
-                                kind: RetainedKind::Checkpoint,
-                            });
+                            for operation in [RetainedStateOperation::Hit, RetainedStateOperation::Restore] {
+                                events.push(SchedEvent::RetainedState {
+                                    operation,
+                                    source: claim.source,
+                                    kind: RetainedKind::Checkpoint,
+                                });
+                            }
                             self.release_kv_ram_claim(i, true);
                         }
                         // Each lookup's misses under its own kind (GitHub

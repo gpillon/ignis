@@ -12,9 +12,11 @@ mod responses;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
+use ignis_core::mock::GatedCompute;
 use ignis_core::{MockCompute, SchedulerConfig};
 use ignis_server::openai_fields;
 use serde_json::{json, Value as JsonValue};
@@ -441,6 +443,118 @@ async fn chat_usage_reports_the_prompt_resumed_as_responses_does() {
     assert_eq!(responses, (json!(0), json!(20)));
     assert_eq!(two_turns(CHAT, false).await, responses, "the body");
     assert_eq!(two_turns(CHAT, true).await, responses, "the usage chunk");
+}
+
+/// `count` words from `stem`: `stem0 stem1 ...`, one token each.
+fn words_of(stem: &str, count: u32) -> String {
+    (0..count).map(|n| format!("{stem}{n}")).collect::<Vec<_>>().join(" ")
+}
+
+/// GitHub #445: R's `cached_tokens` when the claim it held on A's system block
+/// was given up while it waited for room, and it then prefilled its whole
+/// prompt, asked on `path`.
+///
+/// One 1,024-token sequence of 16-token pages. A, Interactive, publishes its
+/// two-page system block and decodes on 23 pages, held at a decode step while
+/// R and I arrive. R, an Agent opening with the same block, claims it and
+/// waits: its 47 pages past it do not fit beside A. I, Interactive, needs 63
+/// pages and cannot move A, which outranks it. Once A is done, A's checkpoint
+/// and the link under it go for I, which is then the block's two pages
+/// short: R's claim, ranked below I, goes, the block with it, and I enters.
+/// R then finds nothing to resume from and prefills from its first token.
+async fn cached_tokens_of_a_claim_given_up(path: &str) -> JsonValue {
+    let config = SchedulerConfig {
+        max_in_flight: 8,
+        max_sequence_tokens: 1024,
+        kv_capacity_pages: 64,
+        kv_page_tokens: 16,
+        host_capacity_bytes: 0,
+        prompt_reuse: true,
+        retained_slots: 4,
+        ..SchedulerConfig::default()
+    };
+    let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
+    let served = server(&Script::with_boundaries(HashMap::new()), config, gated.clone());
+    let engine = served.active().engine().cloned().expect("a loaded engine");
+    let app = served.app();
+    let block = words_of("s", 32);
+    let chat_body = |user: String, max_tokens: u32, class: &str| {
+        json!({
+            "model": MODEL,
+            "messages": [{ "role": "system", "content": block }, { "role": "user", "content": user }],
+            "max_tokens": max_tokens, "enable_thinking": false, "class": class
+        })
+    };
+    // A is request 0: held at its fifth decode step, past its publish and
+    // its capture.
+    gated.arm_at(0, 5);
+    let a = tokio::spawn({
+        let (app, body) = (app.clone(), chat_body(words_of("a", 34), 300, "interactive"));
+        async move { post(&app, CHAT, &body).await }
+    });
+    let mut controller = tokio::task::spawn_blocking(move || {
+        controller.wait_entered();
+        controller
+    })
+    .await
+    .unwrap();
+    let r_body = match path {
+        CHAT => chat_body(words_of("r", 50), 700, "agent"),
+        _ => json!({
+            "model": MODEL,
+            "input": [{ "role": "system", "content": block }, { "role": "user", "content": words_of("r", 50) }],
+            "max_output_tokens": 700, "enable_thinking": false, "class": "agent"
+        }),
+    };
+    let r = tokio::spawn({
+        let (app, path) = (app.clone(), path.to_owned());
+        async move { post(&app, &path, &r_body).await }
+    });
+    let i = tokio::spawn({
+        let (app, body) = (app.clone(), json!({
+            "model": MODEL, "messages": [{ "role": "user", "content": words_of("i", 4) }],
+            "max_tokens": 1000, "enable_thinking": false
+        }));
+        async move { post(&app, CHAT, &body).await }
+    });
+    // A decodes a step at a time until R and I wait beside it: the step that
+    // holds A again ran after their first look for state to resume from.
+    for _ in 0..200 {
+        if engine.interval_counters().waiting == 2 {
+            break;
+        }
+        gated.arm_at(0, 0);
+        controller = tokio::task::spawn_blocking(move || {
+            controller.release();
+            controller.wait_entered();
+            controller
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(engine.interval_counters().waiting, 2, "R and I wait while A decodes");
+    tokio::task::spawn_blocking(move || controller.release()).await.unwrap();
+    for (name, handle) in [("A", a), ("I", i)] {
+        let (status, text) = handle.await.unwrap();
+        assert_eq!(status, 200, "{name}: {text}");
+    }
+    let (status, text) = r.await.unwrap();
+    assert_eq!(status, 200, "R: {text}");
+    let answer: JsonValue = serde_json::from_str(&text).unwrap();
+    match path {
+        CHAT => answer["usage"]["prompt_tokens_details"]["cached_tokens"].clone(),
+        _ => answer["usage"]["input_tokens_details"]["cached_tokens"].clone(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_given_up_before_its_prefill_reports_no_cached_tokens() {
+    // GitHub #445: `cached_tokens` is the prompt the request resumed from,
+    // not the prefix it once claimed and let go of.
+    for path in [CHAT, "/v1/responses"] {
+        assert_eq!(cached_tokens_of_a_claim_given_up(path).await, json!(0), "{path}");
+    }
 }
 
 // ── unchanged output (acceptance 7) ──────────────────────────────────────

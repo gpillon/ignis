@@ -986,6 +986,10 @@ fn a_waiting_claim_on_a_retained_prefix_yields_too() {
     assert!(run.sched.shared_prefix_of(r).is_none(), "R's claim on the block went for them");
     assert_eq!(run.sched.prefix_pinned_pages(), 0, "and so did the block");
     run.to_idle_within(3_000);
+    assert!(
+        !run.has(|e| matches!(e, SchedEvent::PrefixReused { request, .. } if *request == r)),
+        "R prefilled from its first token and reports no reuse of the block it let go of"
+    );
     for (r, max) in [(a, 300), (i, 1000), (r, 700)] {
         assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
     }

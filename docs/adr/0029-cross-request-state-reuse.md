@@ -220,7 +220,8 @@ What building Tier 1 decided that the Decision left open.
 - **Lifecycle facts.** Hit (chosen), miss (first chunk landed with no match in
   a tier), spill, discard and restore (landed) are emitted by the core, one
   per event, per tier, identically with metrics on or off (ADR 0017 as
-  amended by #190).
+  amended by #190). Since #445 a hit is counted when the claim lands, beside
+  its restore, not when it is chosen (ADR 0045 as amended 2026-10-31).
 
 ## Amendment (2026-09-16) — multimodal prompts (#193)
 

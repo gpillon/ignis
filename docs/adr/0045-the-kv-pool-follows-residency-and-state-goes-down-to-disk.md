@@ -156,8 +156,10 @@ could not come back.
 - **The claimant starts over.** Its reservation is its whole bound again, and
   it looks again for state to resume from when it next comes up: the
   checkpoint it chose, retained state again, may have gone to KV-RAM, from
-  where it comes back past the restore floor, or it prefills. The hit and the
-  reused tokens its claim reported stand, as a re-queued request's do.
+  where it comes back past the restore floor, or it prefills. Its claim has
+  reported nothing: a claim reports its reuse, its tokens and its hit with the
+  chunk that lands it, so `cached_tokens`, the request log's reuse and the hit
+  count say only what the request resumed from.
 - **A move counts it too.** A victim's chain counts the links only retained
   state and such claims hold beside it, and the pages the claims give up off
   it count beside the chain, so an Interactive need moves an Agent whose

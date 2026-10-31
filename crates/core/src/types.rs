@@ -838,6 +838,11 @@ pub enum SchedEvent {
     /// is the same act on the same object, so it is the same event; `retained`
     /// is what tells the two apart (GitHub #190), so sibling reuse and
     /// cross-request reuse are never summed into one number.
+    ///
+    /// Emitted on the chunk that lands the claim, as
+    /// [`SchedEvent::StateReused`] is (GitHub #445): a claim whose request
+    /// gave it up while waiting for room, and then prefilled the prefix
+    /// itself, never reports one.
     PrefixReused {
         request: RequestId,
         tokens: u32,
