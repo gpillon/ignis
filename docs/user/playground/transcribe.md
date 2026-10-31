@@ -114,7 +114,8 @@ Call tab frames the context in orange. **Start anyway** goes on. A draft left
 open asks nothing: the Start applies it.
 
 The context reaches the text model too. The notes, the look for suggestions,
-**Rewrite** and **Ask** each begin their request with it: the languages, the
+**Rewrite**, **Ask** and the reading of a [context image](#reading-it) each
+begin their request with it: the languages, the
 terms, the topic and anything else, that "Me" is you, and the speakers by the
 names you gave them, with a reminder that a sentence said as a hypothetical or
 an example is not a fact about them. It also names the language to write in:
@@ -168,8 +169,8 @@ you edit; **Cancel** (or Escape) adds nothing. **Add image** keeps only the
 picture as shown: drawn again as a PNG, cropped, with the black-outs in its
 pixels. The picture as it came, and what was under a black-out, are never
 stored. It is kept in this browser with the transcript, once however many
-times it is added ([Sessions and storage](sessions.md)), and nothing sends it
-to a model.
+times it is added ([Sessions and storage](sessions.md)), and only the text
+model with vision ever sees it, once (below).
 
 Each image stands on the time spine at its moment, a small square on the rule,
 with its size, and a transcript holds as many as you add. The moment is the
@@ -177,6 +178,37 @@ listening's time when the picture came in (the click on Capture, the paste,
 the pick), not when it was added; with no listening it is where the
 transcript stopped. A picture added before anyone has spoken holds from the
 start.
+
+### Reading it
+
+The text model loaded, with its vision on, reads each picture once, in a
+request of its own on an agent's lane, thinking off: the picture, redrawn as
+the chat sends one, with the transcript's context and no transcript. It says what the picture shows, in a
+sentence or two, its topic, and the names and the terms written on it, spelled
+as written; that reading stands under the picture on the spine. From then on
+the picture itself is never sent again: its reading is, as a line at its moment,
+`[mm:ss] (image) A slide titled Budget Q3. Topic: Budget. Names: Anna Rossi.
+Terms: OKR.`, wherever the transcript goes:
+
+- in what the look for suggestions, **Rewrite** and **Ask** read, among the
+  utterances (Rewrite, with the picture on screen when the conversation around
+  the utterance began);
+- in the running notes' next update, as a change under `Changed since:`
+  ([Notes](#notes)), and in the recap's request, every picture read listed after
+  the transcript;
+- in the `.md` ([Out of the view](#out-of-the-view)).
+
+Its names and terms, and its topic while the context tells none, come as
+[suggestions](#suggestions) in the Call tab: accepted, or with **Always** on
+their kind, they join the context the transcription is told, so the speech
+model spells them right from then on.
+
+While no text model with vision serves (the image model is loaded, or the
+server runs with [vision](../configuration/vision.md) off), the picture stays on
+the spine and its reading waits: under the picture, "Not read yet: no text
+model with vision serves", and the Images card counts the pictures waiting.
+Each is read once one serves, a transcript opened later included. A reading
+that fails says why under the picture, with **Read again**.
 
 ## Suggestions
 
@@ -194,7 +226,9 @@ be told, and a bell beside the tabs counts what waits:
   once six utterances are in, then about every minute and a half while
   something new was said, and once more when the listening ends. It checks the
   names it heard first, so a misheard name comes back spelled right
-  ("Postgress" as PostgreSQL);
+  ("Postgress" as PostgreSQL). A context image's reading offers the names and
+  terms written on it, and its topic, the same way ([Reading
+  it](#reading-it));
 - **fixes**: a name, product or term the speech model misheard, `“Postgress” is
   PostgreSQL`, in every utterance that holds it as a word of its own. **Fix**
   replaces it there, marks it with a dotted orange line, and makes the right
@@ -309,12 +343,12 @@ as a file, or prints it as a [PDF](#a-pdf):
 | Format | Each utterance |
 |---|---|
 | `.txt` (and Copy) | `[mm:ss] Speaker: text`, one line each |
-| `.md` | `**Speaker** (mm:ss): text`, after the title and the start, with the notes and Ask's answers (below) |
+| `.md` | `**Speaker** (mm:ss): text`, after the title and the start, with the notes, Ask's answers and the context images' readings (below) |
 | `.srt` | a numbered cue from its start to its end, `Speaker: text` |
 | `.vtt` | a cue from its start to its end, `<v Speaker>text` |
 | PDF | its time, then the speaker in bold and the text, with the context images at their moments, and on request the notes, the context and Ask's answers (below) |
 
-The `.md` also carries what the view keeps beside the utterances. Under the title and the start come the **recap**, when the transcript has one, or else the running notes, each in its sections (`## Summary`, or `## Now` for the running notes, and so on, a section with no line shown as `—`), then a `## Transcript` heading over the utterances. Each answer Ask gave stands between the utterances at the moment it was asked, as a quoted block whose first line is the question in bold; an answer kept without a moment stands at the end. A transcript with no notes and no answers writes the `.md` as the table says. `.txt`, `.srt` and `.vtt` never carry notes or answers: they stay the transcript alone, so a tool reading them keeps working. Open in chat and Send to workspace use the same Markdown.
+The `.md` also carries what the view keeps beside the utterances. Under the title and the start come the **recap**, when the transcript has one, or else the running notes, each in its sections (`## Summary`, or `## Now` for the running notes, and so on, a section with no line shown as `—`), then a `## Transcript` heading over the utterances. Each answer Ask gave stands between the utterances at the moment it was asked, as a quoted block whose first line is the question in bold; an answer kept without a moment stands at the end. Each context image read stands at its moment as a line `[mm:ss] (image) ...` with what was read in it ([Reading it](#reading-it)), ahead of an answer asked at the same place; a picture not read yet has no line. A transcript with no notes, no answers and no picture read writes the `.md` as the table says. `.txt`, `.srt` and `.vtt` never carry notes, answers or pictures: they stay the transcript alone, so a tool reading them keeps working. Open in chat and Send to workspace use the same Markdown.
 
 ### A PDF
 
@@ -472,8 +506,9 @@ Its sections are the kind's recap sections in the table above, among them:
 Its Summary and Topics carry the main threads by the weight the conversation
 gave them, not every aside; Decisions are what was agreed, Action items what
 someone committed to do, and People everyone who spoke or was named. It reads
-the context and the whole transcript afresh: the notes the model wrote are not
-sent, so a mistake made in them live does not carry over into the recap.
+the context and the whole transcript afresh, then what each context image read
+showed, at its moment ([Reading it](#reading-it)): the notes the model wrote are
+not sent, so a mistake made in them live does not carry over into the recap.
 
 Once there is a recap, it stands at the top of the tab with the line saying
 when it was written and from how many utterances, and the notes fold under it
@@ -498,8 +533,10 @@ when that is smaller). Each later update adds one message: the utterances under
 `Said since [mm:ss]:`, then the transcript's changes under `Changed since:`, a
 line each, such as `Corrected: [00:05] Anna: We meet on Thursday. It was: We
 meet on Friday.`, `Moved:`, `Split:`, `Deleted:`, `Put back:`, and `Renamed:
-Speaker 2, heard from [00:05], is Anna.` or `Merged:` for a speaker; with
-nothing said and nothing changed, an update sends nothing. An update makes up
+Speaker 2, heard from [00:05], is Anna.` or `Merged:` for a speaker, and
+`Shown: [00:12] (image) ...` for a context image read since; with nothing
+said, changed or read, an update sends nothing. The first message has each
+picture read as a line at its moment among the utterances. An update makes up
 to six requests, each answered with what its calls did in one line, and ends
 sooner when the model calls nothing or two requests in a row change nothing;
 what is left goes to the next update.

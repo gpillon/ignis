@@ -74,6 +74,7 @@ const actions: TranscribeActions = {
   clearMissed: none,
   addImage: async () => {},
   captureFrame: async () => null,
+  readImageAgain: none,
 };
 
 const at = (state: Partial<ListeningState>): ListeningState => ({ ...IDLE, ...state });
@@ -222,7 +223,7 @@ describe("the speakers' hues", () => {
 
 const state = (patch: Partial<TranscribeState> = {}): TranscribeState => {
   const list = startList();
-  return { list, active: list.transcripts[0], draft: null, deleted: null, speakers: true, speakersUnavailable: null, holdMic: true, notesLive: false, textBlocked: null, contextTokens: 512, suggestionsOn: true, missedFrom: null, storeError: null, ...patch };
+  return { list, active: list.transcripts[0], draft: null, deleted: null, speakers: true, speakersUnavailable: null, holdMic: true, notesLive: false, textBlocked: null, vision: false, contextTokens: 512, suggestionsOn: true, missedFrom: null, storeError: null, ...patch };
 };
 
 describe("the deck", () => {
@@ -683,6 +684,7 @@ const assistants = {
   analyst: { getState: (): AnalystState => ({ looking: null, nextAt: {}, failed: null }), subscribe: () => () => {} },
   rewriter: { getState: () => ({ transcript: null, utterance: null, writing: false, proposal: null, failed: null }), subscribe: () => () => {} },
   asker: { getState: () => ({ transcript: null, question: "", untilMs: 0, text: "", writing: false, failed: null }), subscribe: () => () => {} },
+  reader: { getState: () => ({ reading: null, failed: [] }), subscribe: () => () => {} },
 };
 
 describe("the view", () => {

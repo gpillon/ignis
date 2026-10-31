@@ -43,6 +43,7 @@ import { StoreWorkspaceFiles } from "../workspace/WorkspaceFiles.tsx";
 import { WorkspacePanel } from "../workspace/WorkspacePanel.tsx";
 import { ChatWorkspaceBar } from "../workspace/WorkspacePicker.tsx";
 import { pageWorkspaces } from "../workspace/workspaces.ts";
+import { useHasVision } from "../workspace/vision.ts";
 import { Header, type View } from "./Header.tsx";
 import { KeyPage } from "./KeyPage.tsx";
 import { TransportNotice } from "./TransportNotice.tsx";
@@ -133,10 +134,12 @@ export function App() {
   // header shows a listening from every view.
   const [transcribeOpened, setTranscribeOpened] = useState(false);
   const [transcribeDrawer, setTranscribeDrawer] = useState<TranscribeDrawer>(null);
+  // Whether that text model has vision: a Transcript's context images wait to be read until one does (#437).
+  const textVision = useHasVision(model);
   const [transcribe, transcribeActions, listening, assistants, transcribePictures] = useTranscribe({
     speech: model.speech,
     // The notes go to the text model loaded, never to another: no request of theirs names one.
-    text: { blocked: textModelBlocked(model), contextLimit: canChat(model) ? model.contextLimit : null },
+    text: { blocked: textModelBlocked(model), contextLimit: canChat(model) ? model.contextLimit : null, vision: textVision },
     onUnavailable: refreshModel,
     elsewhere: async () => namedBy(chat.pictures(), studioPictures.current(), await pageWorkspaces().pictures().catch(() => null)),
   });

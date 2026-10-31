@@ -29,6 +29,8 @@ import { ListeningController, type ListeningHandle, type ListeningSource } from 
 import { activeOf, freeTranscriptId, openTranscript, removeTranscript, startList, type TranscriptList, updateTranscript } from "./sessions.ts";
 import { restoreTranscripts, TRANSCRIBE_SESSIONS, toStored, worthKeeping } from "./stored.ts";
 import { addContextImage, freedBy, picturesOf } from "./contextImages.ts";
+import { ImageReader, type ImageReaderHandle, landed } from "./imageReading.ts";
+import { redrawn } from "../conversation/images.ts";
 import {
   addUtterance,
   beginListening,
@@ -73,6 +75,8 @@ export type TranscribeState = {
   notesLive: boolean;
   /** Why the notes and the suggestions cannot ask the text model now (notes.ts), `null` while one serves. */
   textBlocked: string | null;
+  /** The text model has vision, as the server reports it: the context images are read (#437). */
+  vision: boolean;
   /** What the server reads of a context, `speech.context_max_tokens` (512 until the configuration is read). */
   contextTokens: number;
   /** Suggest while listening (Q132): this browser's, on at first. */
@@ -161,16 +165,18 @@ export type TranscribeActions = {
   addImage: (id: number, picture: RedactedPicture, atMs: number) => Promise<void>;
   /** A frame of what the call shares, for a context image; null while no call shares one (#431). */
   captureFrame: () => Promise<Blob | null>;
+  /** Reads again a context image of the open Transcript whose reading failed (#437). */
+  readImageAgain: (image: number) => void;
 };
 
 /** The pictures the Transcripts name in the page's store, or null until they are read: what the other views' deletes keep. */
 export type TranscribePictures = () => Set<ImageId> | null;
 
-/** The page's helpers on the text model: the notes' writer and the look for suggestions. */
-export type Assistants = { notes: NotesHandle; analyst: AnalystHandle; rewriter: RewriterHandle; asker: AskerHandle };
+/** The page's helpers on the text model: the notes' writer, the look for suggestions, the context images' reader. */
+export type Assistants = { notes: NotesHandle; analyst: AnalystHandle; rewriter: RewriterHandle; asker: AskerHandle; reader: ImageReaderHandle };
 
-/** The text model, as the notes need it: why none serves, and its context. */
-export type TextModel = { blocked: string | null; contextLimit: number | null };
+/** The text model, as the notes need it: why none serves, its context, and whether it has vision (#437). */
+export type TextModel = { blocked: string | null; contextLimit: number | null; vision: boolean };
 
 /** How long a deleted utterance's Undo stands. */
 export const UNDO_DELETE_MS = 8_000;
@@ -266,6 +272,30 @@ export function useTranscribe({
     () => new Asker({ onAnswered: (id, question, answer, untilMs) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, asked: withAnswer(t.asked, question, answer, Date.now(), untilMs) }))) }),
   );
   useEffect(() => () => asker.stop(), [asker]);
+  const [reader] = useState(
+    () =>
+      new ImageReader({
+        // The picture as the chat's go to the model: redrawn, its long edge bounded, as a JPEG.
+        picture: async (id) => {
+          const blob = await pageStore().getImage(id);
+          if (!blob) throw new Error("it is no longer in this browser");
+          return redrawn(blob, "context-image.png");
+        },
+        // Its reading on the image, and its terms and topic offered, or applied when accepted always.
+        onRead: (id, image, reading) => setList((l) => updateTranscript(l, id, (t) => landed(t, image, reading, Date.now()))),
+      }),
+  );
+  useEffect(() => () => reader.stop(), [reader]);
+  // The context images, read one at a time as they come while a text model with vision serves; until one does, they
+  // wait (#437). Each is read once, whatever Transcript it is in.
+  const canRead = text.blocked === null && text.vision;
+  const readAll = useMemo(
+    () => () => void reader.keepUp(() => listNow.current.transcripts, () => latest.current.text.blocked === null && latest.current.text.vision),
+    [reader],
+  );
+  useEffect(() => {
+    if (canRead) readAll();
+  }, [list, canRead, readAll]);
 
   // Where What did I miss? reads from (missed.ts): from what the user had seen when they left the page, hidden or its
   // window left, for a minute or more while listening; or from a moment they picked.
@@ -515,9 +545,13 @@ export function useTranscribe({
         change(id, (t) => addContextImage(t, { image: stored.id, atMs, width: picture.width, height: picture.height }, Date.now()));
       },
       captureFrame: () => controller.captureFrame(),
+      readImageAgain: (image) => {
+        reader.retry(listNow.current.activeId, image);
+        readAll();
+      },
     }),
     // The stored flags' setters are stable for their keys.
-    [controller, writer, analyst, rewriter, asker, storeSpeakers, storeHoldMic, storeNotesLive, storeSuggestionsOn],
+    [controller, writer, analyst, rewriter, asker, reader, readAll, storeSpeakers, storeHoldMic, storeNotesLive, storeSuggestionsOn],
   );
 
   return [
@@ -531,6 +565,7 @@ export function useTranscribe({
       holdMic,
       notesLive,
       textBlocked: text.blocked,
+      vision: text.vision,
       contextTokens,
       suggestionsOn,
       missedFrom: missed?.transcript === active.id ? missed.from : null,
@@ -538,7 +573,7 @@ export function useTranscribe({
     },
     actions,
     controller,
-    { notes: writer, analyst, rewriter, asker },
+    { notes: writer, analyst, rewriter, asker, reader },
     () => (kept.loaded ? new Set(listNow.current.transcripts.flatMap((t) => [...picturesOf(t)])) : null),
   ];
 }

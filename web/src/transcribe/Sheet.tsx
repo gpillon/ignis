@@ -2,6 +2,7 @@ import { Fragment, memo, type ReactNode, useEffect, useLayoutEffect, useMemo, us
 import { AnswerAside } from "./Ask.tsx";
 import { ImageAside } from "./ContextImages.tsx";
 import { type ContextImage, imageAt } from "./contextImages.ts";
+import { type ImageReaderState, readingStatus } from "./imageReading.ts";
 import { type Answered, answerAt, type AskerState } from "./ask.ts";
 import { type Hit, type HitSpan, partsOf } from "./search.ts";
 import { type RewriterState, wordDiff } from "./rewrite.ts";
@@ -37,11 +38,14 @@ export function speakerColor(speaker: Speaker | undefined): string {
 /** The label of a call's utterance under way, before the server names its speaker. */
 const laneLabel = (lane: LiveUtterance["lane"], call: boolean) => (call ? (lane === "mic" ? "Me" : "Call") : null);
 
-/** What the sheet does to a Transcript: its corrections, Undo, the rewrite's. */
+/** What the sheet does to a Transcript: its corrections, Undo, the rewrite's, an image's Read again. */
 export type SheetActions = Pick<
   TranscribeActions,
-  "moveUtterance" | "splitUtterance" | "editText" | "undoFixes" | "deleteUtterance" | "undoDelete" | "holdUndo" | "rewriteUtterance" | "acceptRewrite" | "closeRewrite" | "forgetAnswer" | "askFrom"
+  "moveUtterance" | "splitUtterance" | "editText" | "undoFixes" | "deleteUtterance" | "undoDelete" | "holdUndo" | "rewriteUtterance" | "acceptRewrite" | "closeRewrite" | "forgetAnswer" | "askFrom" | "readImageAgain"
 >;
+
+/** No context image being read, none failed: what the sheet says without the reader. */
+const NO_READING: ImageReaderState = { reading: null, failed: [] };
 
 /**
  * The sheet. It is handed only what it draws, not the listening's whole state, and redraws only when that changes:
@@ -65,6 +69,8 @@ export const Sheet = memo(function Sheet({
   asking,
   readingFrom = null,
   canAsk = false,
+  imageReading = NO_READING,
+  canRead = false,
 }: {
   transcript: Transcript;
   /** The utterances under way of the listening appending here; none when it appends elsewhere. */
@@ -97,6 +103,10 @@ export const Sheet = memo(function Sheet({
   readingFrom?: number | null;
   /** A text model serves: each time picks where What did I miss? reads from. */
   canAsk?: boolean;
+  /** The context image being read, and the readings that failed (#437): what each image on the spine says under it. */
+  imageReading?: ImageReaderState;
+  /** A text model with vision serves: an image not read yet is to be read, not waiting for one. */
+  canRead?: boolean;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
@@ -164,7 +174,14 @@ export const Sheet = memo(function Sheet({
   }, [transcript.images, transcript.utterances]);
   const asidesAt = (i: number) => (
     <>
-      {pictures.get(i)?.map((image) => <ImageAside key={`image-${image.id}`} image={image} />)}
+      {pictures.get(i)?.map((image) => (
+        <ImageAside
+          key={`image-${image.id}`}
+          image={image}
+          status={readingStatus(transcript.id, image, imageReading, canRead)}
+          onRetry={() => actions.readImageAgain(image.id)}
+        />
+      ))}
       {asides.get(i)?.map((a) => (
         <AnswerAside key={`answer-${a.id}`} question={a.question} answer={a.answer} untilMs={a.untilMs} onForget={() => actions.forgetAnswer(a.id)} />
       ))}

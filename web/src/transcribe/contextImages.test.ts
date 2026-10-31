@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { addContextImage, freedBy, imageAt, imageMoment, pastedPicture, picturesOf, readContextImages } from "./contextImages.ts";
+import { addContextImage, freedBy, imageAt, imageMoment, linesWithImages, pastedPicture, picturesOf, readContextImages, readingLine, withReading } from "./contextImages.ts";
+import { minutesClock } from "./export.ts";
 import { IDLE, type ListeningState } from "./listening.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 
@@ -68,6 +69,40 @@ describe("the images as the store reads them", () => {
     expect(readContextImages([good, { ...good, id: 2, image: 42 }, { ...good, id: 3, atMs: -1 }, null])).toEqual([good]);
     expect(readContextImages("a picture")).toBeNull();
     expect(readContextImages(undefined)).toBeNull();
+  });
+
+  it("keep each image's reading, and drop a reading they cannot read, not its image, which is read again", () => {
+    const good = { id: 1, image: SLIDE, atMs: 5_500, width: 1280, height: 720, addedAt: 1_000, reading: { shows: "A slide.", topic: null, names: ["Anna"], terms: [], readAt: 2_000 } };
+    const { reading: _, ...unread } = good;
+    expect(readContextImages([good])).toEqual([good]);
+    expect(readContextImages([{ ...good, reading: { ...good.reading, names: "Anna" } }])).toEqual([unread]);
+    expect(readContextImages([{ ...good, reading: { ...good.reading, shows: 3 } }])).toEqual([unread]);
+    expect(readContextImages([{ ...good, reading: "A slide." }])).toEqual([unread]);
+  });
+});
+
+describe("an image's reading among the utterances", () => {
+  const reading = { shows: "A slide titled Budget Q3, costs per team.", topic: "Budget del terzo trimestre", names: ["Anna Rossi"], terms: ["OKR", "Kubernetes"], readAt: 2_000 };
+
+  it("is a line at its moment, marked as an image: what it shows, then its topic, names and terms", () => {
+    const t = withReading(addContextImage(call(), { image: SLIDE, atMs: 5_500, width: 1280, height: 720 }, 1_000), 1, reading);
+    expect(readingLine(t.images![0])).toBe("[00:05] (image) A slide titled Budget Q3, costs per team. Topic: Budget del terzo trimestre. Names: Anna Rossi. Terms: OKR, Kubernetes.");
+    const bare = withReading(t, 1, { shows: "Una lavagna vuota", topic: null, names: [], terms: [], readAt: 3_000 });
+    expect(readingLine(bare.images![0])).toBe("[00:05] (image) Una lavagna vuota.");
+  });
+
+  it("stands before the first utterance at its moment or after, in the time each task writes; an image not read yet has none", () => {
+    let t = addContextImage(call(), { image: SLIDE, atMs: 5_500, width: 1280, height: 720 }, 1_000);
+    t = addContextImage(t, { image: BOARD, atMs: 0, width: 800, height: 600 }, 2_000);
+    t = addContextImage(t, { image: BOARD, atMs: 3_904_000, width: 800, height: 600 }, 3_000);
+    t = withReading(withReading(t, 1, reading), 3, { ...reading, shows: "The closing slide.", topic: null, names: [], terms: [] });
+    expect(linesWithImages(t).map((l) => l.line)).toEqual([
+      "[00:02] Me: Vedete la slide?\n",
+      `${readingLine(t.images![0])}\n`,
+      "[00:06] Speaker 1: Sì, quella del budget.\n",
+      "[1:05:04] (image) The closing slide.\n",
+    ]);
+    expect(linesWithImages(t, minutesClock).at(-1)).toEqual({ atMs: 3_904_000, line: "[65:04] (image) The closing slide.\n" });
   });
 });
 

@@ -112,6 +112,7 @@ export function TranscribeView({
   const rewrite = useWatched(assistants.rewriter);
   const asking = useWatched(assistants.asker);
   const looking = useWatched(assistants.analyst);
+  const imageReading = useWatched(assistants.reader);
   const keepingUp = here && listening.phase !== "idle" && state.suggestionsOn;
   // Held still between changes: the sheet is drawn again only when what it is handed changes.
   const untilMs = state.active.checkedUntilMs;
@@ -208,6 +209,8 @@ export function TranscribeView({
           asking={asking.transcript === state.active.id ? asking : null}
           readingFrom={readingFrom}
           canAsk={state.textBlocked === null}
+          imageReading={imageReading}
+          canRead={state.textBlocked === null && state.vision}
         />
         <AskBar transcript={state.active} state={state} actions={actions} asking={asking} onPreview={setPreviewing} />
         <Deck
@@ -633,7 +636,7 @@ export function Call({
     <>
       <ContextCard transcript={t} draft={state.draft} maxTokens={state.contextTokens} live={live} saved={saved} flagged={flagged} actions={actions} />
 
-      <ImagesCard transcript={t} sharing={sharing} adding={adding} />
+      <ImagesCard transcript={t} sharing={sharing} canRead={state.textBlocked === null && state.vision} adding={adding} />
 
       <section aria-labelledby="transcribe-speakers" className="flex flex-col gap-2.5">
         <h2 id="transcribe-speakers" className={caption}>

@@ -1,6 +1,7 @@
 import type { ConversationRequest, Turn } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { ASSIST_SYSTEM, type AskDeps, askModel, CHARS_PER_TOKEN, Follower, settle, Watched } from "./assist.ts";
+import { shownOf, shownSince } from "./contextImages.ts";
 import { minutesClock } from "./export.ts";
 import { dueForUpdate, LIVE_GAP_MS, type NoteKind, noNotes, type Notes, NOTES_MAX_TOKENS, NOTES_SETTINGS, RUNNING_NOTES, tidyNotes, type Written } from "./notes.ts";
 import { parseRecap, recapDue, recapRequest } from "./recap.ts";
@@ -54,8 +55,11 @@ export type NotesWriterDeps = AskDeps & {
 
 const IDLE: NotesWriterState = { writing: null, form: "running", text: "", failed: null };
 
-/** A Transcript's notes thread: the kind it keeps, its turns, what each utterance was told as, and its last prompt. */
-type Thread = { kind: NoteKind; turns: Turn[]; told: Map<number, Told>; promptTokens: number };
+/**
+ * A Transcript's notes thread: the kind it keeps, its turns, what each utterance was told as, the context images whose
+ * reading it told, and its last prompt.
+ */
+type Thread = { kind: NoteKind; turns: Turn[]; told: Map<number, Told>; shown: Set<number>; promptTokens: number };
 
 /** The stream a Transcript's thread goes on, so the socket continues it. */
 const streamOf = (transcript: number) => `transcribe-notes-${transcript}`;
@@ -97,19 +101,22 @@ export class NotesWriter extends Watched<NotesWriterState> {
     if (!restart && held && held.kind === kind && held.promptTokens <= restartAt(contextLimit)) {
       // What was said since the last turn, and what the user changed meanwhile: `t` against what the thread told.
       const { said, events } = changesSince(held.told, t);
+      // The context images read meanwhile (#437), each a change at its moment.
+      events.push(...shownSince(held.shown, t));
       const turn = laterTurn(said, events);
       const told = toldOf(t, held.told);
+      const shown = shownOf(t);
       if (turn === "") {
-        this.threads.set(t.id, { ...held, told });
+        this.threads.set(t.id, { ...held, told, shown });
         return null;
       }
-      return { thread: { ...held, told, turns: [...held.turns, { role: "user", content: turn }] }, fromMs: notes.fromMs };
+      return { thread: { ...held, told, shown, turns: [...held.turns, { role: "user", content: turn }] }, fromMs: notes.fromMs };
     }
     // A new thread: the transcript so far, from where its tail fits half the threshold, then the notes as they stand.
     const state = notesState(notes, kind);
     const reserve = NOTES_MAX_TOKENS + Math.ceil(state.length / CHARS_PER_TOKEN);
     const { content, fromMs } = taskInput(t, Math.floor(restartAt(contextLimit) / 2), reserve, minutesClock);
-    return { thread: { kind, turns: [{ role: "user", content: `${content}\n${state}` }], told: toldOf(t), promptTokens: 0 }, fromMs };
+    return { thread: { kind, turns: [{ role: "user", content: `${content}\n${state}` }], told: toldOf(t), shown: shownOf(t), promptTokens: 0 }, fromMs };
   }
 
   private async update(t: Transcript, kind: NoteKind, contextLimit: number | null, scratch: boolean): Promise<void> {
