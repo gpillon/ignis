@@ -778,8 +778,10 @@ fn suppress_eos_in(mut body: serde_json::Value, eos: &[u32], control: EosControl
 
 /// The `usage` figures the TTFT instrument reads back: the prompt tokens
 /// the engine counted, and how many of them it served from a prefix cache
-/// (OpenAI's `prompt_tokens_details.cached_tokens`, which the reference
-/// reports and ignis simply omits — it has no prefix cache before G4).
+/// (OpenAI's `prompt_tokens_details.cached_tokens`, which both engines
+/// report: on ignis, since #284, the prompt a request resumed from retained
+/// state, a prompt checkpoint or a shared prefix, instead of prefilling it —
+/// prompt reuse, ADR 0029, on by default).
 struct Usage {
     prompt_tokens: Option<u32>,
     cached_prompt_tokens: Option<u32>,
