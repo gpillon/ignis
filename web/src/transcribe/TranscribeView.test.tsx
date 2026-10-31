@@ -5,11 +5,12 @@ import { ContextCard } from "./Context.tsx";
 import { ANSWER_AFTER_MS, Deck, deckHint, HEADPHONES, startBlocked, startPress, Strip, stripStatus, timeLeft } from "./Deck.tsx";
 import { IDLE, type ListeningState } from "./listening.ts";
 import { AskBar } from "./Ask.tsx";
-import { NotesPanel, notesButton, recapButton, rewriteButton } from "./Notes.tsx";
+import { type Marked, NotesPanel, notesButton, recapButton, rewriteButton } from "./Notes.tsx";
 import type { AnalystState } from "./analyst.ts";
 import type { AskerState } from "./ask.ts";
 import { SuggestionsPanel, suggestionText } from "./Suggestions.tsx";
 import { suggest } from "./suggestions.ts";
+import type { NoteMark } from "./marks.ts";
 import type { NotesWriterState } from "./notesWriter.ts";
 import { Heading, highlighted, nextCheckIn, RewritePanel, Sheet, speakerColor } from "./Sheet.tsx";
 import { startList, titleOf } from "./sessions.ts";
@@ -557,8 +558,8 @@ describe("the notes", () => {
       fromMs: null,
     },
   });
-  const panel = (t: Transcript, writer: NotesWriterState = idle, patch: Partial<TranscribeState> = {}) =>
-    renderToStaticMarkup(<NotesPanel transcript={t} state={state(patch)} actions={actions} writer={writer} />);
+  const panel = (t: Transcript, writer: NotesWriterState = idle, patch: Partial<TranscribeState> = {}, marked?: Marked) =>
+    renderToStaticMarkup(<NotesPanel transcript={t} state={state(patch)} actions={actions} writer={writer} marked={marked} />);
 
   it("offers the four kinds, Write notes, and says nothing goes to the model before a press (Q124)", () => {
     const html = panel(room());
@@ -596,6 +597,25 @@ describe("the notes", () => {
     expect(html).not.toContain("Updated at");
     expect(panel(room(), { writing: room().id, form: "running", text: "", failed: null })).toContain("The model is reading the transcript.");
     expect(notesButton(t, { writing: t.id, form: "running", text: "", failed: null }, null)).toEqual({ label: "Stop", disabled: false, stops: true });
+  });
+
+  it("marks the lines an update changed: ember on added and changed ones, a removed one struck and dimmed, none when the time is up", () => {
+    const t = written(room());
+    const first = (t.notes?.lines ?? [])[0];
+    const now = 5_000_000;
+    const gone = { ...first, id: "N9", text: "Una riga tolta." };
+    const marks: NoteMark[] = [
+      { id: first.id, kind: "fresh", until: now + 1_000, line: first, index: 0 },
+      { id: "N9", kind: "gone", until: now + 1_000, line: gone, index: 1 },
+    ];
+    const html = panel(t, idle, {}, { marks, now });
+    expect(html).toContain(`<li data-mark="fresh">${first.text}</li>`);
+    expect(html).toMatch(/<li data-mark="gone"><del>Una riga tolta\.<\/del><\/li>/);
+    // Their time is up: the notes are as they were written, with no mark.
+    const spent = panel(t, idle, {}, { marks, now: now + 1_000 });
+    expect(spent).not.toContain("data-mark");
+    expect(spent).not.toContain("Una riga tolta.");
+    expect(spent).toBe(panel(t, idle, {}, { marks: [], now }));
   });
 
   it("offers Rewrite from scratch in a menu, once the model wrote a line and while nothing is under way", () => {

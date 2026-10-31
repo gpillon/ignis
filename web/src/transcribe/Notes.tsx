@@ -1,11 +1,12 @@
-import { useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { caption } from "../ui/classes.ts";
 import { IconChevron, IconRegenerate } from "../ui/icons.tsx";
 import { Markdown } from "../ui/Markdown.tsx";
 import { Switch } from "../ui/Switch.tsx";
 import { useWatched } from "./assist.ts";
 import { jumpOnClick, linkTimes } from "./jump.ts";
-import { kindHint, kindOf, NOTE_KINDS, notesMarkdown, notesStatus } from "./notes.ts";
+import { changesBetween, markedMarkdown, type NoteMark, nextExpiry, withChanges } from "./marks.ts";
+import { kindHint, kindOf, NOTE_KINDS, type Notes as NotesOf, notesMarkdown, notesStatus } from "./notes.ts";
 import type { NotesHandle, NotesWriterState } from "./notesWriter.ts";
 import { recapMarkdown, recapStatus } from "./recap.ts";
 import type { Transcript } from "./transcript.ts";
@@ -43,11 +44,41 @@ export function rewriteButton(t: Transcript, writer: NotesWriterState, blocked: 
   return { disabled: cannotWrite(t, writer, blocked) || !(t.notes?.lines ?? []).some((l) => l.author === "model") };
 }
 
+/** What marks the notes carry now: kept as the notes change, and let go of when their time is up (marks.ts). */
+export type Marked = { marks: NoteMark[]; now: number };
+
+/** The marks of a Transcript's notes: every line the model adds, changes or removes, for a few seconds; none for notes just opened. */
+function useMarked(id: number, notes: NotesOf | undefined): Marked {
+  const [state, setState] = useState<{ id: number; marks: NoteMark[] }>({ id, marks: [] });
+  const [now, setNow] = useState(() => Date.now());
+  const seen = useRef({ id, notes });
+  useEffect(() => {
+    const before = seen.current;
+    seen.current = { id, notes };
+    if (before.id !== id) return setState({ id, marks: [] });
+    const found = changesBetween(before.notes, notes);
+    if (found.length === 0) return;
+    const at = Date.now();
+    setNow(at);
+    setState((s) => ({ id, marks: withChanges(s.id === id ? s.marks : [], found, at) }));
+  }, [id, notes]);
+  const marks = state.id === id ? state.marks : [];
+  const expiry = nextExpiry(marks, now);
+  useEffect(() => {
+    if (expiry === null) return;
+    const timer = setTimeout(() => setNow(Date.now()), Math.max(0, expiry - Date.now()) + 20);
+    return () => clearTimeout(timer);
+  }, [expiry]);
+  return { marks, now };
+}
+
 export function Notes({ transcript, state, actions, notes }: { transcript: Transcript; state: TranscribeState; actions: TranscribeActions; notes: NotesHandle }) {
   return <NotesPanel transcript={transcript} state={state} actions={actions} writer={useWatched(notes)} />;
 }
 
-export function NotesPanel({ transcript: t, state, actions, writer }: { transcript: Transcript; state: TranscribeState; actions: TranscribeActions; writer: NotesWriterState }) {
+export function NotesPanel({ transcript: t, state, actions, writer, marked }: { transcript: Transcript; state: TranscribeState; actions: TranscribeActions; writer: NotesWriterState; marked?: Marked }) {
+  const own = useMarked(t.id, t.notes);
+  const { marks, now } = marked ?? own;
   const kindId = useId();
   const liveId = useId();
   const [copied, setCopied] = useState(false);
@@ -60,6 +91,7 @@ export function NotesPanel({ transcript: t, state, actions, writer }: { transcri
   const menu = useRef<HTMLDetailsElement>(null);
   // The running notes change in place, a line at a time, as an update applies the model's calls.
   const shown = notesMarkdown(t.notes);
+  const drawn = markedMarkdown(t.notes, marks, now);
   const recapKept = recapMarkdown(t.recap);
   // While the recap streams, its text; before its first token, the one it replaces, dimmed.
   const recapShown = recapHere && writer.text !== "" ? writer.text : recapKept;
@@ -72,9 +104,9 @@ export function NotesPanel({ transcript: t, state, actions, writer }: { transcri
   const running = (
     <article aria-label="Notes" aria-busy={here} className="relative flex flex-col gap-3 pl-3.5" onClickCapture={jumpOnClick}>
       <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-[2px] ${here ? "spine-live" : shown ? "bg-line" : "bg-transparent"}`} />
-      {shown ? (
+      {drawn.markdown ? (
         <div className="notes">
-          <Markdown text={linkTimes(shown)} />
+          <Markdown text={linkTimes(drawn.markdown)} itemMarks={drawn.items} />
         </div>
       ) : (
         <p className="text-xs leading-snug text-ash">
