@@ -885,7 +885,7 @@ mod tests {
         assert_eq!(open.context, "A talk.\nignis, Qwen3");
         assert_eq!(open.context_max_tokens, 512);
         assert_eq!(open.context_copy_words, 3, "the copy guard's run, as the server sets it");
-        assert_eq!(open.context_copy_edits, 2, "the words a copy may change, as the server sets it");
+        assert_eq!(open.context_copy_edits, 0, "the words a copy may change, as the server sets it");
         assert_eq!(open.language.as_deref(), Some("Italian"));
         assert_eq!(fresh().open(&SpeechGroup::default()).language, None, "nothing is forced unless asked");
         let detect = update(&fresh(), input(json!({ "transcription": { "languages": ["it", "en"] } }))).unwrap();

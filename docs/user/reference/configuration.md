@@ -1285,12 +1285,12 @@ On a pause the model can write a line of its context in place of what it heard: 
 | Flag | `--speech-context-copy-edits` |
 | Env var | `IGNIS_SPEECH_CONTEXT_COPY_EDITS` |
 | Kind | `words` |
-| Default | `2` |
-| Rule | 0..=8 |
+| Default | `0` |
+| Rule | 0..=3 |
 | Models | all |
 | `/v1/config` | shown by `GET`, patchable live |
 
-The model can also write such a line with a word or two changed, added or dropped (one inflected, the topic turned into an imperative): a transcript this many words or fewer from a whole context line, or from one keyword, is a copy too, while it keeps `context_copy_words` of the line's words. 0 keeps the exact rule. Read when a session opens, so a change holds from the next one.
+The model can also write such a line with a word or two changed, added or dropped (one inflected, the topic turned into an imperative): above 0, a transcript this many words or fewer from a whole context line, or from a piece of one between commas or sentence marks, is a copy too, while it keeps `context_copy_words` of its words. People say such lines too (a title after "So,", a term with a word inflected), and they are emptied with the copies, so 0, the default, keeps the exact rule. Read when a session opens, so a change holds from the next one.
 
 ### `speech.pinned_weights`
 

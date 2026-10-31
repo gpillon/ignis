@@ -110,11 +110,14 @@ with a word or two changed ([the second](../../findings/2026-10-31-asr-context-n
 A transcript that only repeats a line of the context, the whole line or three
 or more of its words in a row (`speech.context_copy_words`; 0 turns this off),
 is taken for no speech: the text comes back empty, with no language unless one
-was forced. So is one that differs from a whole line, or from one keyword, by
-up to two words changed, added or dropped (`speech.context_copy_edits`; 0 keeps
-the exact rule) while it keeps three or more of its words: `la revisione
-settimanale del rilascio` for the topic `revisione settimanale del rilascio`.
-One word is kept, since a name the context lists is said alone too. A clip longer than
+was forced. One word is kept, since a name the context lists is said alone too.
+A copy with a word changed, added or dropped is kept by default, since people
+say a line that way too: `la revisione settimanale del rilascio`, under the
+topic `revisione settimanale del rilascio`, is a speaker's as often as the
+model's. With `speech.context_copy_edits` at 1 to 3 (0 by default), a
+transcript that many words or fewer from a whole line, or from a piece of one
+between commas or sentence marks, is no speech either while it keeps three or
+more of its words, and what people say that way is emptied with it. A clip longer than
 `speech.max_clip_seconds` (1200, the model's limit) is a `400` naming the
 limit, and is never split. The body limit is 384 MiB, enough for 20 minutes of
 48 kHz stereo WAV.

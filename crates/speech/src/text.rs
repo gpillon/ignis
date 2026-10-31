@@ -236,7 +236,7 @@ pub struct ContextCopy {
 
 impl ContextCopy {
     /// The server's defaults, which its config fields take.
-    pub const DEFAULT: ContextCopy = ContextCopy { run: 3, edits: 2 };
+    pub const DEFAULT: ContextCopy = ContextCopy { run: 3, edits: 0 };
 }
 
 /// Whether a transcript only repeats its context (#362). Given little or no speech, a VAD's cut
@@ -369,6 +369,28 @@ mod tests {
         // The copy the model wrote of that topic on overlapped speech (AMI IS1009a, 358.3 s) is
         // the same words: no rule on the text tells the two apart.
         assert!(copies_context(TOPIC4, "La revisione settimanale del rilascio", edits(1)));
+    }
+
+    #[test]
+    fn the_default_keeps_what_people_say_a_word_off_a_line() {
+        // Emptying real speech is worse than keeping a copy: at its default the guard takes no
+        // near copy, since on #442's same-language control every edit it may change emptied
+        // real speech, a slide's line read out with a word inflected among it.
+        let topic_verb = "Languages: Italian.\nTopic: aggiornare la documentazione tecnica\npila software, Argo CD, Marta";
+        let slides = "Languages: English.\nTopic: kick-off meeting of the remote control design project.\n\
+            draw our favourite animal on the whiteboard, a selling price at twenty-five euros, production cost at twelve fifty";
+        for (context, said) in [
+            (TOPIC4, "Allora, revisione settimanale del rilascio."),
+            (TOPIC4, "Nella pipeline di integrazione continua."),
+            (TOPIC4, "la revisione settimanale del rilascio"),
+            (topic_verb, "Aggiorniamo la documentazione tecnica."),
+            (slides, "Production costs at twelve fifty."),
+        ] {
+            assert!(!copies_context(context, said, ContextCopy::DEFAULT), "{said}");
+        }
+        // The exact rule holds at the default.
+        assert!(copies_context(TOPIC4, "revisione settimanale del rilascio", ContextCopy::DEFAULT));
+        assert!(copies_context(TOPIC4, TOPIC4.lines().last().unwrap(), ContextCopy::DEFAULT));
     }
 
     #[test]

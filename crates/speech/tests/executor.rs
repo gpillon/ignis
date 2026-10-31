@@ -274,7 +274,7 @@ fn a_session_holds_the_tuning_it_opened_with() {
     let e = exec(&files, Settings { rollback_tokens: 10, unfixed_partials: 2, context_max_tokens: 512, ..settings() });
     let tuned = SessionTuning { context_max_tokens: 64, rollback_tokens: 3, unfixed_partials: 0, context_copy: ContextCopy { run: 4, edits: 1 } };
     assert_eq!(e.open_tuned("", None, tuned).unwrap().tuning(), tuned);
-    assert_eq!(e.open("", None).unwrap().tuning(), SessionTuning { context_max_tokens: 512, rollback_tokens: 10, unfixed_partials: 2, context_copy: ContextCopy { run: 3, edits: 2 } });
+    assert_eq!(e.open("", None).unwrap().tuning(), SessionTuning { context_max_tokens: 512, rollback_tokens: 10, unfixed_partials: 2, context_copy: ContextCopy { run: 3, edits: 0 } });
 }
 
 /// Acceptance 19 (Q44): a commit is a unit of work a step, so the server's one worker runs other

@@ -725,11 +725,14 @@ config_group! {
         context_copy_words: Words = ignis_speech::ContextCopy::DEFAULT.run as u32, between(0, 32), ALL, [Visible, Patchable];
         /// The model can also write such a line with a word or two changed,
         /// added or dropped (one inflected, the topic turned into an
-        /// imperative): a transcript this many words or fewer from a whole
-        /// context line, or from one keyword, is a copy too, while it keeps
-        /// `context_copy_words` of the line's words. 0 keeps the exact rule.
-        /// Read when a session opens, so a change holds from the next one.
-        context_copy_edits: Words = ignis_speech::ContextCopy::DEFAULT.edits as u32, between(0, 8), ALL, [Visible, Patchable];
+        /// imperative): above 0, a transcript this many words or fewer from a
+        /// whole context line, or from a piece of one between commas or
+        /// sentence marks, is a copy too, while it keeps `context_copy_words`
+        /// of its words. People say such lines too (a title after "So,", a
+        /// term with a word inflected), and they are emptied with the copies,
+        /// so 0, the default, keeps the exact rule. Read when a session opens,
+        /// so a change holds from the next one.
+        context_copy_edits: Words = ignis_speech::ContextCopy::DEFAULT.edits as u32, between(0, 3), ALL, [Visible, Patchable];
         /// Pin the speech model's weights in host memory instead of mapping
         /// the file. Read by the load, so a change holds from the next one.
         pinned_weights: Bool = false, NO_RULE, ALL, [Visible, Patchable];
