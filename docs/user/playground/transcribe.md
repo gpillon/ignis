@@ -9,16 +9,17 @@ The **Transcribe** view writes a whole conversation down: a meeting in the
 room, a call on this computer, or a recording. What it hears becomes a
 **transcript**, its **utterances** in order, each with its time, its
 **speaker** and its text. You can rename and correct the speakers and edit the
-text while it listens, have the text model write its notes, then copy the
-transcript, download it, or open it in a new chat. It uses the server's [speech model](../api/transcriptions.md) and,
+text while it listens, add pictures of what the call is looking at, have the
+text model write its notes, then copy the transcript, download it, or open it
+in a new chat. It uses the server's [speech model](../api/transcriptions.md) and,
 for the speakers, its [diarizer](../api/realtime-transcription.md#speakers).
 
 ![The Transcribe view: a call with its speakers on the time spine, a question's answer standing where it was asked, the questions bar under the transcript, its notes on the right](../images/playground/transcribe.png)
 
 It is laid out like the other views: the **transcripts** on the left; the one
 open in the middle, its title and exports above it and its deck at the foot;
-and on the right three tabs: **Call**, what the transcription is told and who
-speaks; **Notes**; and **Settings**, the view's own. Below 1024 px wide the
+and on the right three tabs: **Call**, what the transcription is told, its
+images and who speaks; **Notes**; and **Settings**, the view's own. Below 1024 px wide the
 side columns open from the header as drawers (**Call** opens the right one).
 
 ## Listening
@@ -126,6 +127,45 @@ The **Languages** are **Detect** unless you pick **Force one**:
   session's `language`): measured, seven English clips in thirty came out
   translated into Italian under Italian forced. For a conversation in one
   language whose short utterances still come out in another.
+
+## Context images
+
+A **context image** is a picture of what the conversation is looking at (a
+slide, a shared screen, a whiteboard) added to the transcript at a moment of
+it. **Images** in the Call tab adds one three ways:
+
+- **From a file**: a picture you pick.
+- **Paste**: a picture on the clipboard, pasted (Ctrl+V) anywhere in the view
+  while it shows. A paste into a text field that carries text as well is the
+  field's.
+- **Capture**: while a call listens into the transcript open, a frame of the
+  tab, window or screen it shares, taken at the click. The browser shares the
+  picture with the call's audio at Start, so Capture asks for nothing new; it
+  is offered only while such a call goes on.
+
+A picture is refused as the chat refuses one: anything but an image, or a file
+over 32 MB. Before it is added, it opens full screen in the marking editor
+with two tools:
+
+- **Crop**: drag the area to keep. What is left out is dimmed; a new crop
+  replaces the last.
+- **Black out**: drag over what must not be kept. The area is painted solid
+  black into the picture's pixels, not laid over them.
+
+**Undo** (or Ctrl+Z) and **Clear** take the crop and the black-outs back while
+you edit; **Cancel** (or Escape) adds nothing. **Add image** keeps only the
+picture as shown: drawn again as a PNG, cropped, with the black-outs in its
+pixels. The picture as it came, and what was under a black-out, are never
+stored. It is kept in this browser with the transcript, once however many
+times it is added ([Sessions and storage](sessions.md)), and nothing sends it
+to a model.
+
+Each image stands on the time spine at its moment, a small square on the rule,
+with its size, and a transcript holds as many as you add. The moment is the
+listening's time when the picture came in (the click on Capture, the paste,
+the pick), not when it was added; with no listening it is where the
+transcript stopped. A picture added before anyone has spoken holds from the
+start.
 
 ## Suggestions
 
@@ -242,11 +282,11 @@ carries the query into its own search.
 ## The transcript
 
 Each transcript is kept in this browser as each utterance completes, with its
-text, times, speakers and corrections, and never its audio
-([Sessions and storage](sessions.md)). Its title is the date, the time and the
+text, times, speakers and corrections and its context images, and never its
+audio ([Sessions and storage](sessions.md)). Its title is the date, the time and the
 source, "25 Oct 15:42 · Call" (a file's name for a file); click it to rename
 it. **New transcript** starts another; the bin on a row deletes one, except
-the one listening. A reload keeps every completed utterance and ends the
+the one listening, with the pictures no other transcript or view still uses. A reload keeps every completed utterance and ends the
 listening; so does a lost connection.
 
 ## Out of the view

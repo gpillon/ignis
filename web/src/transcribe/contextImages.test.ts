@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addContextImage, freedBy, imageAt, imageMoment, picturesOf, readContextImages } from "./contextImages.ts";
+import { addContextImage, freedBy, imageAt, imageMoment, pastedPicture, picturesOf, readContextImages } from "./contextImages.ts";
 import { IDLE, type ListeningState } from "./listening.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 
@@ -78,5 +78,20 @@ describe("the pictures a transcript's deletion frees", () => {
     expect(freedBy(gone, [other], [])).toEqual([SLIDE]);
     expect(freedBy(gone, [], [SLIDE])).toEqual([BOARD]);
     expect(freedBy(gone, [], null)).toEqual([]);
+  });
+});
+
+describe("a paste in the view", () => {
+  const shot = new File(["png"], "image.png", { type: "image/png" });
+  const notes = new File(["text"], "notes.txt", { type: "text/plain" });
+
+  it("adds the picture it carries, wherever the focus is", () => {
+    expect(pastedPicture([notes, shot], { intoField: false, hasText: false })).toBe(shot);
+    expect(pastedPicture([shot], { intoField: true, hasText: false })).toBe(shot);
+  });
+
+  it("leaves a paste with no picture alone, and a field the text that came with a picture", () => {
+    expect(pastedPicture([notes], { intoField: false, hasText: true })).toBeNull();
+    expect(pastedPicture([shot], { intoField: true, hasText: true })).toBeNull();
   });
 });

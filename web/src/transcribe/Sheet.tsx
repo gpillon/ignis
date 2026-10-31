@@ -1,5 +1,7 @@
 import { Fragment, memo, type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnswerAside } from "./Ask.tsx";
+import { ImageAside } from "./ContextImages.tsx";
+import { type ContextImage, imageAt } from "./contextImages.ts";
 import { type Answered, answerAt, type AskerState } from "./ask.ts";
 import { type Hit, type HitSpan, partsOf } from "./search.ts";
 import { type RewriterState, wordDiff } from "./rewrite.ts";
@@ -21,7 +23,8 @@ import type { Speaker, Transcript, Utterance } from "./transcript.ts";
 // reader scrolls up, and offers Jump to live then (Q102). Every completed
 // utterance's text is editable inline, and its speaker a menu: a move, a new
 // speaker, and a split at the cursor (Q92, Q96, Q98). The answers to the
-// questions asked about it stand on the spine where they were asked (Q139).
+// questions asked about it stand on the spine where they were asked (Q139),
+// and its context images at their moments (#431).
 
 /** A speaker's hue: Me in ink, Others in ash, each voice one of six (styles.css). */
 export function speakerColor(speaker: Speaker | undefined): string {
@@ -129,7 +132,7 @@ export const Sheet = memo(function Sheet({
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && following) el.scrollTop = el.scrollHeight;
-  }, [transcript.utterances, live, following, answering?.text]);
+  }, [transcript.utterances, transcript.images, live, following, answering?.text]);
 
   // A question just asked: its answer, at the foot above the utterances under way, in view and followed.
   const asked = answering && `${answering.question}@${answering.untilMs}`;
@@ -150,8 +153,18 @@ export const Sheet = memo(function Sheet({
     return at;
   }, [transcript.asked, transcript.utterances]);
   const answeringAt = answering ? answerAt(transcript.utterances, answering.untilMs) : -1;
-  const answersAt = (i: number) => (
+  // The context images, by the utterance each stands before, in the order they were added.
+  const pictures = useMemo(() => {
+    const at = new Map<number, ContextImage[]>();
+    for (const image of transcript.images ?? []) {
+      const i = imageAt(transcript.utterances, image.atMs);
+      at.set(i, [...(at.get(i) ?? []), image]);
+    }
+    return at;
+  }, [transcript.images, transcript.utterances]);
+  const asidesAt = (i: number) => (
     <>
+      {pictures.get(i)?.map((image) => <ImageAside key={`image-${image.id}`} image={image} />)}
       {asides.get(i)?.map((a) => (
         <AnswerAside key={`answer-${a.id}`} question={a.question} answer={a.answer} untilMs={a.untilMs} onForget={() => actions.forgetAnswer(a.id)} />
       ))}
@@ -183,7 +196,7 @@ export const Sheet = memo(function Sheet({
     setFollowing(true);
   };
 
-  const empty = transcript.utterances.length === 0 && live.length === 0;
+  const empty = transcript.utterances.length === 0 && live.length === 0 && !transcript.images?.length;
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div ref={scroller} onScroll={(e) => setFollowing(isAtBottom(e.currentTarget))} className="min-h-0 flex-1 overflow-y-auto px-4 py-6 [scrollbar-gutter:stable] md:px-10">
@@ -196,7 +209,7 @@ export const Sheet = memo(function Sheet({
                 // Keyed by the utterance, so a delete, an Undo or a split keeps every other row as it is.
                 <Fragment key={u.id}>
                 {readTo && i === markAt && i > 0 && <CheckedMark nextAt={readTo.nextAt} fresh={fresh} />}
-                {answersAt(i)}
+                {asidesAt(i)}
                 <UtteranceRow
                   key={u.id}
                   utterance={u}
@@ -214,7 +227,7 @@ export const Sheet = memo(function Sheet({
                 </Fragment>
               ))}
               {readTo && markAt === transcript.utterances.length && markAt > 0 && <CheckedMark nextAt={readTo.nextAt} fresh={0} />}
-              {answersAt(transcript.utterances.length)}
+              {asidesAt(transcript.utterances.length)}
               {live.map((u) => (
                 <LiveRow key={u.key} utterance={u} label={laneLabel(u.lane, call)} burning={phase === "listening" || phase === "finishing"} />
               ))}

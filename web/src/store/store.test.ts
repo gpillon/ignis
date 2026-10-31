@@ -1,6 +1,6 @@
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
-import { type ImageStore, sha256, unreferenced } from "./imageStore.ts";
+import { type ImageStore, namedBy, sha256, unreferenced } from "./imageStore.ts";
 import { openIndexedDbStore } from "./indexeddb.ts";
 import { createMemoryStore } from "./memory.ts";
 
@@ -153,5 +153,10 @@ describe("the IndexedDB store's upgrade", () => {
 describe("what can go", () => {
   it("is every image asked about that nothing keeps", () => {
     expect(unreferenced(["a", "b", "a", "c"], new Set(["b"]))).toEqual(["a", "c"]);
+  });
+
+  it("is never what another view names, and nothing while one of them cannot say yet", () => {
+    expect(namedBy(["a"], new Set(["b"]), [])).toEqual(["a", "b"]);
+    expect(namedBy(["a"], null)).toBeNull();
   });
 });

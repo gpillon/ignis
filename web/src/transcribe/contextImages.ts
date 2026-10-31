@@ -57,6 +57,15 @@ export function imageAt(utterances: Utterance[], atMs: number): number {
   return at === -1 ? utterances.length : at;
 }
 
+/**
+ * The picture a paste in the view adds, if any: the first image it carries. A paste into a text field that carries
+ * text too is the field's (a copy from a document can carry both): only a paste the field could not take is a picture.
+ */
+export function pastedPicture(files: File[], { intoField, hasText }: { intoField: boolean; hasText: boolean }): File | null {
+  if (intoField && hasText) return null;
+  return files.find((f) => f.type.startsWith("image/")) ?? null;
+}
+
 const count = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
 /** A stored transcript's images: those this page can read, or null for a value that is no list of them. */
