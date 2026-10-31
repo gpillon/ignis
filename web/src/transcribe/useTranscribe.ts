@@ -3,10 +3,13 @@ import { keyRequired } from "../api/auth.ts";
 import { STORED_FLAGS, useStoredFlag } from "../app/storedFlag.ts";
 import type { SpeechStatus } from "../api/model.ts";
 import { speakersUnavailable } from "../speech/availability.ts";
-import { captureStream, pickSharedAudio, startCapture } from "../speech/capture.ts";
+import { captureStream, grabFrame, pickSharedAudio, startCapture } from "../speech/capture.ts";
 import { openListening } from "../speech/realtime.ts";
 import { mergeLoaded } from "../store/docs.ts";
 import { pageStore } from "../store/index.ts";
+import type { ImageId } from "../store/imageStore.ts";
+import { keepPicture } from "../store/pictures.ts";
+import type { RedactedPicture } from "../markup/markup.ts";
 import { useStoredSessions } from "../store/useStoredSessions.ts";
 import { decodeFile } from "./file.ts";
 import { filePace } from "./filePace.ts";
@@ -24,6 +27,7 @@ import { accept, analysisOffers, dismiss, dropTerm, followFixes, languageOffer, 
 import { ListeningController, type ListeningHandle, type ListeningSource } from "./listening.ts";
 import { activeOf, freeTranscriptId, openTranscript, removeTranscript, startList, type TranscriptList, updateTranscript } from "./sessions.ts";
 import { restoreTranscripts, TRANSCRIBE_SESSIONS, toStored, worthKeeping } from "./stored.ts";
+import { addContextImage, freedBy, picturesOf } from "./contextImages.ts";
 import {
   addUtterance,
   beginListening,
@@ -144,7 +148,17 @@ export type TranscribeActions = {
   suggestNow: () => void;
   stopSuggesting: () => void;
   setSuggestionsOn: (on: boolean) => void;
+  /**
+   * Keeps an edited picture in the page's store and adds it to Transcript `id` at `atMs` as a context image (#431);
+   * rejects with why the store refused it.
+   */
+  addImage: (id: number, picture: RedactedPicture, atMs: number) => Promise<void>;
+  /** A frame of what the call shares, for a context image; null while no call shares one (#431). */
+  captureFrame: () => Promise<Blob | null>;
 };
+
+/** The pictures the Transcripts name in the page's store, or null until they are read: what the other views' deletes keep. */
+export type TranscribePictures = () => Set<ImageId> | null;
 
 /** The page's helpers on the text model: the notes' writer and the look for suggestions. */
 export type Assistants = { notes: NotesHandle; analyst: AnalystHandle; rewriter: RewriterHandle; asker: AskerHandle };
@@ -162,11 +176,17 @@ export function useTranscribe({
   speech,
   text,
   onUnavailable,
+  elsewhere,
 }: {
   speech?: SpeechStatus;
   text: TextModel;
   onUnavailable: () => void;
-}): [TranscribeState, TranscribeActions, ListeningHandle, Assistants] {
+  /**
+   * The pictures the other views name now (the chat's sessions, the Image view's, the workspaces'), or null while one
+   * cannot say yet: deleting a Transcript keeps them, and while null frees no picture.
+   */
+  elsewhere?: () => Promise<Iterable<ImageId> | null>;
+}): [TranscribeState, TranscribeActions, ListeningHandle, Assistants, TranscribePictures] {
   const [list, setList] = useState<TranscriptList>(() => startList());
   /** The draft, the Transcript it is of, and its context when Edit opened it: an Apply merges onto what it holds then. */
   const [drafting, setDrafting] = useState<{ id: number; base: CallContext; context: CallContext } | null>(null);
@@ -188,8 +208,8 @@ export function useTranscribe({
   holdMicRef.current = holdMic;
   const listNow = useRef(list);
   listNow.current = list;
-  const latest = useRef({ onUnavailable, text });
-  latest.current = { onUnavailable, text };
+  const latest = useRef({ onUnavailable, text, elsewhere });
+  latest.current = { onUnavailable, text, elsewhere };
   const [notesLive, storeNotesLive] = useStoredFlag(STORED_FLAGS.transcribeNotesLive, false);
   const [suggestionsOn, storeSuggestionsOn] = useStoredFlag(STORED_FLAGS.transcribeSuggestions, true);
 
@@ -200,6 +220,7 @@ export function useTranscribe({
         captureMic: (onChunk) => startCapture(onChunk),
         pickShared: (onEnded) => pickSharedAudio(onEnded),
         captureShared: (stream, onChunk) => captureStream(stream, onChunk),
+        grabFrame: (track) => grabFrame(track),
         decode: (file) => decodeFile(file),
         filePaceSeconds: filePace,
         onUtterance: (id, utterance) => setList((l) => updateTranscript(l, id, (t) => addUtterance(t, utterance))),
@@ -302,6 +323,16 @@ export function useTranscribe({
         return { transcripts: merged.items, activeId: merged.activeId };
       });
       return { loaded: restored.transcripts, stamps: restored.stamps };
+    },
+    // A Transcript's context images go with it, unless another Transcript or another view names the same picture.
+    onRemoved: (gone, left) => {
+      const others = latest.current.elsewhere?.() ?? Promise.resolve([]);
+      void others.then(
+        (named) => {
+          for (const id of freedBy(gone, left, named)) void pageStore().deleteImage(id).catch(() => {});
+        },
+        () => {},
+      );
     },
   });
 
@@ -459,6 +490,11 @@ export function useTranscribe({
       },
       stopSuggesting: () => analyst.stop(),
       setSuggestionsOn: (on) => storeSuggestionsOn(on),
+      addImage: async (id, picture, atMs) => {
+        const stored = await keepPicture(pageStore(), picture.blob);
+        change(id, (t) => addContextImage(t, { image: stored.id, atMs, width: picture.width, height: picture.height }, Date.now()));
+      },
+      captureFrame: () => controller.captureFrame(),
     }),
     // The stored flags' setters are stable for their keys.
     [controller, writer, analyst, rewriter, asker, storeSpeakers, storeHoldMic, storeNotesLive, storeSuggestionsOn],
@@ -483,5 +519,6 @@ export function useTranscribe({
     actions,
     controller,
     { notes: writer, analyst, rewriter, asker },
+    () => (kept.loaded ? new Set(listNow.current.transcripts.flatMap((t) => [...picturesOf(t)])) : null),
   ];
 }

@@ -5,8 +5,9 @@ import { CHUNK_SAMPLES, PROCESSOR, TARGET_RATE, WORKLET_SOURCE } from "./pcm.ts"
 // go on every way out — Done, Esc, a closed connection, the page leaving — so
 // the browser's recording indicator never outlives a dictation (Q13). A
 // listening in the Transcribe view takes the mic the same way, and on a call
-// the shared audio of one `getDisplayMedia` pick too (spec speech/07). The
-// browser's objects are injectable, so the cleanup is testable without one.
+// the shared audio of one `getDisplayMedia` pick too (spec speech/07), whose
+// picture Capture takes a frame of (#431). The browser's objects are
+// injectable, so the cleanup is testable without one.
 
 /** The browser, or the person, refused the mic: the cause pressing it again can clear. */
 export class MicBlocked extends Error {}
@@ -93,6 +94,43 @@ export async function pickSharedAudio(
   }
   for (const track of audio) track.addEventListener("ended", onEnded);
   return stream;
+}
+
+/** How long a frame of the shared picture is waited for before Capture says it got none. */
+const FRAME_WAIT_MS = 5_000;
+
+/**
+ * A frame of a call's shared picture (#431): its video track, which the pick asked for and the listening never reads,
+ * played into a video element the page never shows and drawn once on a canvas, as a PNG. The track stays the pick's,
+ * live: only the element is let go. Browser only.
+ */
+export async function grabFrame(track: MediaStreamTrack): Promise<Blob> {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.srcObject = new MediaStream([track]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const shown = new Promise<void>((resolve) => {
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) resolve();
+      else video.addEventListener("loadeddata", () => resolve(), { once: true });
+    });
+    const late = new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new Error("the shared picture gave no frame")), FRAME_WAIT_MS)));
+    await Promise.race([video.play().then(() => shown), late]);
+    const { videoWidth: width, videoHeight: height } = video;
+    if (width === 0 || height === 0) throw new Error("the shared picture gave no frame");
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("this browser gives no 2D canvas");
+    ctx.drawImage(video, 0, 0, width, height);
+    return await new Promise<Blob>((resolve, reject) => canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("the canvas gave no PNG"))), "image/png"));
+  } finally {
+    clearTimeout(timer);
+    video.pause();
+    video.srcObject = null;
+  }
 }
 
 /** The worklet on `stream`, in `context`; `owned` streams are let go with it. */

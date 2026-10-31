@@ -64,3 +64,12 @@ export async function sha256(blob: Blob): Promise<ImageId> {
 export function unreferenced(candidates: Iterable<ImageId>, keep: Set<ImageId>): ImageId[] {
   return [...new Set(candidates)].filter((id) => !keep.has(id));
 }
+
+/**
+ * The images several views name together, for one view's deletes to keep (the store holds every view's pictures
+ * once); null while any of them cannot say yet, which deletes nothing.
+ */
+export function namedBy(...views: (Iterable<ImageId> | null)[]): ImageId[] | null {
+  if (views.some((v) => v === null)) return null;
+  return views.flatMap((v) => [...(v as Iterable<ImageId>)]);
+}
