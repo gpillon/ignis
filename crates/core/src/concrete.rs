@@ -908,13 +908,19 @@ impl ConcreteScheduler {
         &self.host
     }
 
-    /// Whether `request` is still being served — what separates a sibling's
-    /// prefix from a retained one (GitHub #190): the publisher of a retained
-    /// prefix has finished.
-    fn is_live(&self, request: RequestId) -> bool {
-        self.requests
+    /// The requests still being served, in id order — what separates a
+    /// sibling's prefix from a retained one (GitHub #190): the publisher of a
+    /// retained prefix is not among them. One pass over the requests, so a
+    /// look reads it once and then asks it of every publisher it meets (#222).
+    fn live_requests(&self) -> Vec<RequestId> {
+        let mut live: Vec<RequestId> = self
+            .requests
             .iter()
-            .any(|r| r.id == request && r.state != RequestState::Done)
+            .filter(|r| r.state != RequestState::Done)
+            .map(|r| r.id)
+            .collect();
+        live.sort_unstable();
+        live
     }
 
     /// Requests currently in flight (Admitted + Prefilling + Running).
@@ -4278,33 +4284,31 @@ impl Scheduler for ConcreteScheduler {
                     // One walk of the prompt answers all four questions below.
                     let keys = self.reuse_keys(i);
                     let lookup = self.checkpoints.lookup(&keys);
+                    // GitHub #222: a publisher's liveness, read once for this
+                    // look rather than per entry, and by one test for the
+                    // prefix walk's misses and the claim's hit below.
+                    let live = self.live_requests();
+                    let finished = |publisher: RequestId| live.binary_search(&publisher).is_err();
+                    let peek = self.prefix.peek(&keys, &finished);
+                    // A KV-RAM checkpoint has to beat every device reuse by
+                    // its restore floor, a prefix's included (GitHub #190).
+                    let mut device_prefix = peek.device_tokens;
+                    let spilled = peek.spilled.map(|s| (s.id, s.length_tokens));
                     // GitHub #222: each lookup's misses, in the tiers its kind
-                    // can be hit in on this load. The prefix walk's come from
-                    // the same keys and before a block comes back from KV-RAM
-                    // below, by the test the hit below applies (a live
-                    // publisher's head is a sibling's, not retained state).
+                    // can be hit in on this load; the prefix walk's from before
+                    // a block comes back from KV-RAM below.
                     let tiers = self.hit_tiers();
                     self.requests[i].pending_misses = TiersByKind::new(
                         lookup.misses(tiers.of(RetainedKind::Checkpoint)),
-                        self.prefix
-                            .misses(&keys, tiers.of(RetainedKind::Prefix), |publisher| !self.is_live(publisher)),
+                        peek.misses(tiers.of(RetainedKind::Prefix)),
                     );
-                    // A KV-RAM checkpoint has to beat every device reuse by
-                    // its restore floor, a prefix's included (GitHub #190).
-                    let mut device_prefix = self
-                        .prefix
-                        .longest_match_tokens(&keys);
                     let mut retained = self.claimable(self.checkpoints.select(&lookup, device_prefix));
                     // GitHub #190: a retained prefix only KV-RAM still holds
                     // comes back to the device when it beats every device
                     // reuse by the restore floor and every KV-RAM checkpoint
                     // outright — and from then on the burst shares it there.
                     let mut returned_from_kv_ram = false;
-                    if let Some((spilled, length)) = self
-                        .prefix
-                        .longest_spilled_match(&keys)
-                        .map(|s| (s.id, s.length_tokens))
-                    {
+                    if let Some((spilled, length)) = spilled {
                         let device_checkpoint =
                             lookup.longest_in(ReuseSource::Device).map_or(0, |m| m.tokens);
                         let kv_ram_checkpoint = retained
@@ -4348,7 +4352,7 @@ impl Scheduler for ConcreteScheduler {
                         // subtracting its whole pages is exact.
                         r.resources.kv_pages = r.resources.kv_pages.saturating_sub(claim.pages);
                         let request = r.id;
-                        let retained = !self.is_live(claim.publisher);
+                        let retained = finished(claim.publisher);
                         events.push(SchedEvent::PrefixReused {
                             request,
                             tokens: claim.tokens,

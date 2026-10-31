@@ -186,6 +186,11 @@ impl TierSet {
         self.0 == 0
     }
 
+    /// The members of `self` that are not in `other`.
+    pub fn without(self, other: TierSet) -> TierSet {
+        TierSet(self.0 & !other.0)
+    }
+
     /// The members, cheapest tier first.
     pub fn iter(self) -> impl Iterator<Item = ReuseSource> {
         ReuseSource::ALL.into_iter().filter(move |&source| self.contains(source))

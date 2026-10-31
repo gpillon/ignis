@@ -575,12 +575,17 @@ the claim, which is sticky.
   device misses a prefix there too; a load with no retained slot, which is
   what the server resolves `off` to unless the operator names slots, records
   none.
-- **Zero work.** The prefix miss walks nothing new. It reads the match keys the
-  one walk of the prompt already computed for the checkpoint lookup and the
-  prefix claim, tests each device entry and KV-RAM blob with the same key
-  lookup the longest-match questions make, and keeps the result as a tier set
-  on the request beside the checkpoint's. On a load with no retained slot it
-  reads nothing.
+- **What it costs.** No pass of its own. The look already walks the device
+  entries for the longest match a KV-RAM checkpoint is weighed against, and
+  the KV-RAM blobs for one to bring back, on the match keys the one walk of
+  the prompt computed; those two walks also note whether a match is retained:
+  one flag per entry and per blob they visit, a blob with a device copy now
+  keyed too. A device entry's flag asks its publisher's liveness of a sorted
+  list of the live requests, built once per look (one pass over the
+  requests), which the claim's hit now reads too instead of scanning them.
+  The result is a tier set on the request beside the checkpoint's. All of it
+  runs with metrics off and on alike, as #190's lifecycle facts do, so
+  enabling metrics adds none of it to the inference path.
 
 Histogram buckets are fixed. TTFT uses 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
 10, 30, 60, 120, and 300 seconds. Request duration uses 0.1, 0.25, 0.5, 1,
