@@ -2119,33 +2119,34 @@ mod tests {
 
     // ── a whole run under prompt reuse (GitHub #426) ───────────────────────
 
-    /// A stand-in for ignis's **prompt reuse** around another endpoint, whose
-    /// outcomes it reports the usage of. The 5090 run #426 records voided
-    /// C=4's first sample and four of the ten prefillers through exactly the
-    /// two entries it models.
+    /// A stand-in for an engine that serves any repeated prefix from a
+    /// cache, around another endpoint whose outcomes it reports the usage
+    /// of: the spec's mock (GitHub #426), which covers ignis's **prompt
+    /// reuse** and more.
     ///
-    /// Every request it admits leaves two retained heads, and a later request
-    /// whose prompt starts with one claims it (GLOSSARY: prompt checkpoint,
-    /// publish point, KV page):
+    /// A request claims, of every prompt admitted before it, the longer of
+    /// two heads (GLOSSARY: prompt checkpoint, KV page):
     ///
-    /// - the **prompt checkpoint** at the generation opener, everything up to
-    ///   the template's `<|im_start|>assistant\n`: for one user message with
+    /// - the earlier prompt's **prompt checkpoint** at its generation
+    ///   opener, everything up to the template's `<|im_start|>assistant\n`,
+    ///   when the request's prompt starts with it: for one user message with
     ///   thinking off, the prompt less its last four tokens
-    ///   (`<think>`, `\n\n`, `</think>`, `\n\n`). The run's C=4 sample 0, the
-    ///   C=1 prompt again, reused 8,188 of its 8,192 tokens that way;
-    /// - the **chained prefix** at the opener's page floor, whole 64-token KV
-    ///   pages: 8,128 tokens of an 8,192-token prompt, what each of the run's
-    ///   first four 32,768-token prefillers reused from the 8,192-token prompt
-    ///   its first content came from.
+    ///   (`<think>`, `\n\n`, `</think>`, `\n\n`). The 5090 run's C=4 sample
+    ///   0, the C=1 prompt again, reused 8,188 of its 8,192 tokens that way;
+    /// - the whole 64-token **KV pages** of the head the two prompts share,
+    ///   short of the request's last token: any repeated prefix, ignis's
+    ///   chained prefix at an opener's page floor among them (8,128 tokens
+    ///   of an 8,192-token prompt, what each of the run's first four
+    ///   32,768-token prefillers reused), and any shorter head too.
     ///
-    /// The longest claimable head wins, as on the server, and nothing is ever
-    /// given up: the server keeps fewer, which can only void fewer. Usage is
-    /// the server's: the prompt as the template encodes it, the claimed head
-    /// as `cached_tokens`.
+    /// The longest claim wins, as on the server, and nothing is ever given
+    /// up: the server keeps less, which can only void fewer. Usage is the
+    /// server's: the prompt as the template encodes it, the claimed head as
+    /// `cached_tokens`.
     struct PromptReuse<'t, E> {
         inner: E,
         template: &'t dyn PromptTemplate,
-        retained: std::sync::Mutex<Vec<Vec<u32>>>,
+        admitted: std::sync::Mutex<Vec<Vec<u32>>>,
     }
 
     impl<'t, E: Endpoint> PromptReuse<'t, E> {
@@ -2153,24 +2154,26 @@ mod tests {
         const AFTER_OPENER: usize = 4;
 
         fn new(inner: E, template: &'t dyn PromptTemplate) -> Self {
-            Self { inner, template, retained: std::sync::Mutex::new(Vec::new()) }
+            Self { inner, template, admitted: std::sync::Mutex::new(Vec::new()) }
         }
 
-        /// Admit `req`: the prompt tokens it counts and the head it claims,
-        /// then the two heads it leaves behind.
+        /// Admit `req`: the prompt tokens it counts and the head it claims.
         fn admit(&self, req: &Request) -> Result<(u32, u32), String> {
             let tokens = self.template.encode_user_message(&req.prompt)?;
-            let mut retained = self.retained.lock().unwrap();
-            let cached = retained
-                .iter()
-                .filter(|head| tokens.starts_with(head))
-                .map(Vec::len)
-                .max()
-                .unwrap_or(0);
-            let opener = tokens.len().saturating_sub(Self::AFTER_OPENER);
-            let floor = opener / Self::PAGE_TOKENS * Self::PAGE_TOKENS;
-            retained.extend([floor, opener].into_iter().filter(|&at| at > 0).map(|at| tokens[..at].to_vec()));
-            Ok((tokens.len() as u32, cached as u32))
+            let mut admitted = self.admitted.lock().unwrap();
+            let cached = admitted.iter().map(|earlier| Self::claim(&tokens, earlier)).max().unwrap_or(0);
+            let prompt = tokens.len() as u32;
+            admitted.push(tokens);
+            Ok((prompt, cached as u32))
+        }
+
+        /// The head `tokens` claims of an `earlier` prompt.
+        fn claim(tokens: &[u32], earlier: &[u32]) -> usize {
+            let shared = tokens.iter().zip(earlier).take_while(|(a, b)| a == b).count();
+            let opener = earlier.len().saturating_sub(Self::AFTER_OPENER);
+            let checkpoint = if opener > 0 && shared >= opener { opener } else { 0 };
+            let pages = shared.min(tokens.len().saturating_sub(1)) / Self::PAGE_TOKENS * Self::PAGE_TOKENS;
+            checkpoint.max(pages)
         }
 
         fn report(mut outcome: crate::client::Outcome, (prompt, cached): (u32, u32)) -> crate::client::Outcome {
@@ -2229,6 +2232,62 @@ mod tests {
             .collect()
     }
 
+    /// The mock is the spec's "mock endpoint that serves any repeated prefix
+    /// from a cache" (GitHub #426): a prompt that repeats the head of an
+    /// earlier one is served the whole KV pages they share, however far
+    /// short of the earlier prompt's opener that head ends.
+    #[test]
+    fn the_reuse_mock_serves_the_whole_pages_of_any_repeated_head() {
+        let template = MockTemplate { header: CHAT_HEADER, footer: CHAT_FOOTER };
+        let ep = PromptReuse::new(MockEndpoint::new(), &template);
+        let words = |from: usize, count: usize| (from..from + count).map(|i| format!("w{i}")).collect::<Vec<_>>();
+        let cached = |prompt: Vec<String>| {
+            let req = sample_request("probe".into(), prompt.join(" "), 8);
+            ep.complete(&req).expect("served").cached_prompt_tokens
+        };
+
+        assert_eq!(cached(words(0, 2_000)), Some(0), "nothing came before it");
+        // 504 tokens shared, the header and 501 words: seven whole pages.
+        assert_eq!(cached([words(0, 501), words(5_000, 2_000)].concat()), Some(448));
+    }
+
+    /// The page floor the 5090 run's prefillers were served from, pinned: a
+    /// run whose cells each number their prompts from 0, as before #426,
+    /// voids what that run voided, C=4's first sample on C=1's prompt
+    /// checkpoint (4 of 8,192 tokens computed) and the first four
+    /// prefillers on the 127 pages they share with C=4's prompts (24,640 of
+    /// 32,768). If the mock stopped serving a page floor, the run tests
+    /// below would pass for nothing.
+    #[test]
+    fn cells_numbering_their_prompts_from_zero_void_where_the_5090_run_did() {
+        let template = MockTemplate { header: CHAT_HEADER, footer: CHAT_FOOTER };
+        let cfg = production_run(None);
+        let paced = PacedSeries::until_cancelled(cfg.itl.decode_lanes, cfg.itl.prefill_count, 2);
+        let ep = PromptReuse::new(paced, &template);
+        let (prompt_tokens, max_tokens) = (cfg.throughput.prompt_tokens, cfg.throughput.max_tokens);
+        let c1 = measure_throughput_cell(&ep, &template, prompt_tokens, max_tokens, C1_CONCURRENCY);
+        let c4 = measure_throughput_cell(&ep, &template, prompt_tokens, max_tokens, C4_CONCURRENCY);
+        let lanes = (cfg.itl.decode_prompt_tokens as usize, cfg.itl.decode_lanes);
+        let itl = measure_itl_with(
+            &ep,
+            &cfg.itl,
+            template.eos_token_ids(),
+            || ttft::generate_cell_prompts_with_suffix(&template, lanes.0, lanes.1, ITL_DECODE_INSTRUCTION),
+            || generate_cell_prompts(&template, cfg.itl.prefill_prompt_tokens as usize, cfg.itl.prefill_count),
+        );
+
+        let throughput = c1.bad_samples().into_iter().chain(c4.bad_samples());
+        let computed: Vec<(String, Option<u32>)> = throughput
+            .map(|s| (s.id.clone(), s.computed_prefill_tokens))
+            .chain(itl.void_prefillers().into_iter().map(|p| (format!("itl-prefill-{}", p.index), p.computed_prefill_tokens)))
+            .collect();
+        let prefiller = |index: usize| (format!("itl-prefill-{index}"), Some(24_640));
+        assert_eq!(
+            computed,
+            vec![("thr-8192-4-0".to_string(), Some(4)), prefiller(0), prefiller(1), prefiller(2), prefiller(3)]
+        );
+    }
+
     #[test]
     fn a_whole_run_stays_cold_under_prompt_reuse() {
         let template = MockTemplate { header: CHAT_HEADER, footer: CHAT_FOOTER };
@@ -2239,7 +2298,7 @@ mod tests {
 
         assert_eq!(voided(&record), Vec::<String>::new());
         assert!(record.c1.all_cold() && record.c4.all_cold() && record.itl.all_cold(), "{}", errors(&record));
-        // Not a vacuous mock: the session's own C=1 prompt, sent again, is
+        // Not a vacuous mock: the run's own C=1 prompt, sent again, is
         // served from what it left behind.
         let again = measure_throughput_cell(&ep, &template, THROUGHPUT_PROMPT_TOKENS, 8, C1_CONCURRENCY);
         assert!(!again.all_cold(), "a repeated prompt must come back warm");
