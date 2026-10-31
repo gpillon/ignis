@@ -568,10 +568,11 @@ registry"), model list
 One published model: its served id, repo, revision, the artifact to load, every
 file it needs with its byte count and SHA-256 pinned, the smallest **card
 class** it loads on (`card_class`, optional: an entry stating none is never
-refused by class; every built-in one states it), the **aliases** it may
-answer to (ADR 0064), and its **model family** when neither its id nor its
-aliases name one (`family`, ADR 0074). An operator entry never reuses a
-built-in id.
+refused by class; every built-in text and image model states it, while the
+speech models and the diarizer, which run on the CPU, state none), the
+**aliases** it may answer to (ADR 0064), and its **model family** when
+neither its id nor its aliases name one (`family`, ADR 0074). An operator
+entry never reuses a built-in id.
 
 **Endpoint**:
 The server a catalog entry's files are fetched from: Hugging Face by default,
