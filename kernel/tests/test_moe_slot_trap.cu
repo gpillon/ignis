@@ -95,16 +95,17 @@ int main(int argc, char **argv) {
                                                         dslots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(), nullptr);
   const cudaError_t err = cudaDeviceSynchronize();
   // stderr, which is unbuffered: std::_Exit flushes nothing, and under CTest stdout is a pipe.
-  std::fprintf(stderr, "trap (%s): launch rc %d%s%s, synchronize: %s (%d)\n", mode.c_str(), rc, rc != 0 ? ": " : "",
-               rc != 0 ? ignis_moe_last_error() : "", cudaGetErrorString(err), static_cast<int>(err));
+  const std::string op_error = rc != 0 ? ignis_moe_last_error() : "";
+  std::fprintf(stderr, "trap (%s): launch rc %d%s%s, synchronize: %s (%d)\n", mode.c_str(), rc, op_error.empty() ? "" : ": ",
+               op_error.c_str(), cudaGetErrorString(err), static_cast<int>(err));
   // The trap is asynchronous, and the first call into the driver after the trapping kernel has
   // run reports it. That is usually the synchronize above. On a loaded host the op's own launch
   // check can come first (prefill: after its grouping kernels; decode: right after its launch),
   // and the op then returns -1 naming the launch failure (GitHub #424). Either way the context
   // holds cudaErrorLaunchFailure. A rejection before any launch leaves it at cudaSuccess, and an
   // out-of-bounds access at cudaErrorIllegalAddress.
-  const std::string trapped_at_launch = std::string("launch failed: ") + cudaGetErrorString(cudaErrorLaunchFailure);
-  const bool trap_at_launch = rc != 0 && std::strstr(ignis_moe_last_error(), trapped_at_launch.c_str()) != nullptr;
+  const std::string launch_failure = std::string("launch failed: ") + cudaGetErrorString(cudaErrorLaunchFailure);
+  const bool trap_at_launch = rc != 0 && op_error.find(launch_failure) != std::string::npos;
   if ((rc != 0 && !trap_at_launch) || err != cudaErrorLaunchFailure) {
     std::fprintf(stderr, "test_moe_slot_trap (%s): expected the launch to trap (cudaErrorLaunchFailure)\n", mode.c_str());
     std::fflush(stderr);
