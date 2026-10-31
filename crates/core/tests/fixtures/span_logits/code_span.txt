@@ -1,0 +1,184 @@
+//! The engine's scheduling contract.
+//!
+//! Two traits define the public surface:
+//!
+//! - [`Scheduler`] — what the *server* drives: submit requests, advance the
+//!   engine, stream events. This is the stable contract the `ignis-server`
+//!   crate codes against.
+//! - [`Compute`] — the *compute seam*: the only GPU-coupled step (prefill /
+//!   decode). Production is the kernel leaf (C ABI, see `ffi.rs`); tests use
+//!   a deterministic mock. Keeping this seam narrow is what makes the whole
+//!   scheduler (admission, lanes, batched prefill, eviction) CPU-testable
+//!   without a GPU (ADR 0006).
+
+use crate::decision::Readout;
+use crate::types::{
+    ComputeError, DecodeParams, FinishReason, LaneId, RequestClass, RequestId, RequestInput,
+    SchedEvent, SpecCounters, SubmitError, TokenId,
+};
+
+/// The shared prefix a prefill job claims (P4-10, GitHub #126, ADR 0024):
+/// which request published it, and how many leading prompt tokens it covers.
+///
+/// The backend needs the publisher's identity rather than the scheduler's own
+/// entry id because the leaf's prefix is what actually owns the pages, and
+/// the publisher is the request whose prefill produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedPrefixClaim {
+    /// The request whose prefill published the prefix.
+    pub publisher: RequestId,
+    /// The leading prompt tokens the prefix covers — always a whole number
+    /// of KV pages, and always equal to this job's `start_position`.
+    pub tokens: u32,
+}
+
+/// The retained **prompt checkpoint** a prefill job claims (GitHub #186, ADR
+/// 0029): which request captured it, and how many leading prompt tokens it
+/// covers.
+///
+/// Shaped like [`SharedPrefixClaim`] and for the same reason — the backend
+/// needs a name for the device-resident thing, and the request that captured
+/// it is that name. The difference is what the number means: a shared
+/// prefix's `tokens` is always whole KV pages, a checkpoint's is the
+/// generation opener **wherever it falls**, so the claimant copies the
+/// partial tail page rather than sharing it (CONTEXT.md, "publish point").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointClaim {
+    /// The request whose prefill captured the checkpoint. It is long
+    /// finished; its id is never reused, so it stays a valid name for the
+    /// bytes it left behind.
+    pub publisher: RequestId,
+    /// The leading prompt tokens the checkpoint covers — always equal to this
+    /// job's `start_position`.
+    pub tokens: u32,
+    /// Where the retained bytes live. Device claims clone an image and share
+    /// pages; KV-RAM claims restore one materialized blob into a fresh slot.
+    pub source: crate::checkpoint::ReuseSource,
+}
+
+/// Where a prefill job leaves retained state (GitHub #215, ADR 0030): after
+/// `tokens` of the prompt, into retained slot `slot`.
+///
+/// The scheduler takes the slot before it builds the job, so the backend
+/// never allocates device memory for a publish or a capture: it copies the
+/// sequence's mutable state into the slot it is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedAt {
+    /// The prompt position the state is taken at.
+    pub tokens: u32,
+    /// The retained slot the image goes into (`0..retained_slots`).
+    pub slot: u32,
+}
+
+/// One prefill job handed to the compute backend (batched prefill groups
+/// several of these into one GPU batch to saturate the GPU and cut burst TTFT).
+#[derive(Debug, Clone)]
+pub struct PrefillJob {
+    /// The request being prefilled.
+    pub request: RequestId,
+    /// The prompt tokens to warm the KV for. A request that reuses a
+    /// cached sibling prefix (core-07) carries only its *tail* — the
+    /// leading shared tokens are already warm in the pool (the shared
+    /// prefix's blocks are bound read-only by the kernel leaf). An empty
+    /// tail (a full-prompt match) warms nothing: the job only sets up the
+    /// decode state.
+    pub tokens: Vec<TokenId>,
+    /// Total sequence reservation, including the prompt and effective
+    /// generation cap. The runtime uses it when it first allocates a leaf
+    /// sequence for this request.
+    pub context_tokens: u32,
+    /// Position of `tokens[0]` in the sequence (nonzero after shared-prefix
+    /// reuse).
+    pub start_position: u32,
+    /// The request's generation parameters (carried so the backend can set
+    /// up the decode state; prefill only warms the KV).
+    pub params: DecodeParams,
+    /// The shared prefix this request claims (P4-10, GitHub #126), if any.
+    /// Set on the request's **first** job: the backend allocates its
+    /// sequence against the prefix, which shares the leading KV pages in
+    /// place and clones the mutable state device-to-device, so the sequence
+    /// begins at `start_position` with the publisher's state.
+    pub shared_prefix: Option<SharedPrefixClaim>,
+    /// Publish this request's first `tokens` tokens as a shared prefix once
+    /// this chunk lands (P4-10, GitHub #126), its image in the retained slot
+    /// named (GitHub #215). Set only on the chunk that ends exactly there: the
+    /// mutable state a claimant clones is the state at the prefix's end, so
+    /// the publish happens at that boundary and nowhere else.
+    pub publish_prefix: Option<RetainedAt>,
+    /// The retained prompt checkpoint this request claims (GitHub #186), if
+    /// any. Set on the request's **first** job, exactly as `shared_prefix` is:
+    /// the backend allocates its sequence against the checkpoint, sharing the
+    /// whole KV pages under it, cloning its mutable state and copying its
+    /// partial tail page, so the sequence begins at `start_position` — the
+    /// generation opener — with the captured state.
+    ///
+    /// Never set together with `shared_prefix`: a checkpoint claim subsumes
+    /// one (the checkpoint sits on a shared prefix of its own), and longest
+    /// reuse wins between the two.
+    pub checkpoint: Option<CheckpointClaim>,
+    /// Capture this request's state as a prompt checkpoint once this chunk
+    /// lands (GitHub #186), its image in the retained slot named (GitHub
+    /// #215). Set only on the chunk that ends exactly at the generation
+    /// opener: the state a claimant receives is the state *there*, and a chunk
+    /// that overshot it would have moved that state on — the same reason
+    /// `publish_prefix` exists.
+    ///
+    /// The capture is a pure read of the live sequence: it perturbs nothing,
+    /// and the request goes on prefilling its last few prompt tokens and
+    /// decoding as if it had not been asked.
+    pub capture_checkpoint: Option<RetainedAt>,
+    /// The request's multimodal part (GitHub #178), whole-prompt: the
+    /// backend reads this job's span of it at `start_position`. The chunk
+    /// holds at most one media item's placeholders
+    /// ([`crate::vision::Multimodal::cap_chunk`]).
+    pub multimodal: Option<std::sync::Arc<crate::vision::Multimodal>>,
+    /// The **answer tokens** this job reads out (GitHub #237, ADR 0034):
+    /// the vocabulary entries naming the options of a decision, whose
+    /// logits at this chunk's last position are the answer. `None` on every
+    /// job that is not a decision's last chunk — which is every job the
+    /// engine has today — and a job that asks for no readout pays for none:
+    /// the backend allocates no logits buffer and gathers nothing.
+    ///
+    /// Set only on the chunk that ends at the prompt's **last position**,
+    /// because that is the position whose next-token distribution holds the
+    /// decision. The chunk must also carry at least one token: a chunk with
+    /// nothing to prefill runs no forward pass, so there would be no logits
+    /// to read (GitHub #238 trims a reuse claim for exactly this reason).
+    ///
+    /// The order is the answer's order — [`PrefillOutcome::readout`]'s
+    /// `logits[i]` is the logit of `readout[i]`.
+    pub readout: Option<std::sync::Arc<[TokenId]>>,
+    /// The **permitted token set** this chunk's own draw is restricted to
+    /// (GitHub #242, ADR 0034), if this is a **constrained decode** request's last
+    /// chunk.
+    ///
+    /// Set for the same reason and on the same chunk as
+    /// [`PrefillJob::readout`], and for one more: a prefill *draws the first
+    /// token of the run that follows it*, which the first decode round then
+    /// returns ([`crate::constrained`]). A constrained decode that constrained only its
+    /// rounds would commit the prompt's own free successor as the first
+    /// token of its forced text.
+    ///
+    /// `None` on every other job, and an ordinary job pays a borrow for it:
+    /// the backend reads it as an empty slice rather than building one
+    /// (`RuntimeCompute::prefill_step`), masks nothing, and takes whatever
+    /// path it would have taken. The measured claim is only that — no
+    /// allocation and no device work — not that the field is free to name.
+    pub permitted: Option<crate::constrained::PermittedSet>,
+    /// The **attention readout** this chunk asks for (GitHub #260, ADR 0038),
+    /// if this is a head-point decision's last chunk: one query head of one
+    /// GQA layer, at the chunk's last position, over the keys of one span.
+    ///
+    /// The third thing this seam carries, beside [`PrefillJob::readout`] and
+    /// [`PrefillJob::permitted`], set on the same chunk for the same reason —
+    /// the query sits at the prompt's last position — and shaped like the
+    /// readout: the job names what to read, [`PrefillOutcome::attention`]
+    /// carries back one score per key of the span and nothing else.
+    ///
+    /// Only a multimodal job may carry one (the span is an image's), and the
+    /// chunk carries at least [`crate::pointing::ATTENTION_MIN_CHUNK_TOKENS`]
+    /// tokens, which [`crate::types::RequestInput::prefill_tail`] keeps.
+    /// `None` on every other job, and such a job costs nothing for it: no
+    /// allocation, and no device work the leaf would not have done anyway.
+    pub attention: Option<crate::pointing::AttentionQuery>,
+}

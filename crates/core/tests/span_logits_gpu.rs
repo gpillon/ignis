@@ -64,8 +64,11 @@ fn every_row_of_the_span_logits_is_that_prefix_prompts_last_position() {
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
-    // Real, varied text (this crate's own scheduler), not a repeated filler.
-    let text = include_str!("../src/scheduler.rs");
+    // Real, varied text, not a repeated filler, and frozen: this crate's
+    // scheduler as of 30e63a3f (`crates/core/src/scheduler.rs`, its first 184
+    // lines), the text the bounds below were measured on, so an edit of the
+    // live file moves no position (#425).
+    let text = include_str!("fixtures/span_logits/code_span.txt");
     let span: Vec<i32> = frontend
         .tokenizer()
         .encode(text)
@@ -75,6 +78,10 @@ fn every_row_of_the_span_logits_is_that_prefix_prompts_last_position() {
         .map(|id| i32::try_from(id).expect("token id fits i32"))
         .collect();
     assert_eq!(span.len(), SPAN_TOKENS, "the source text is long enough");
+    // The tokens the bounds below were measured at, both sides of the chunk
+    // boundary: an edit of the text before them, or another tokenizer, moves
+    // every position and every KL with it (#425).
+    assert_eq!(span[PREFILL_CHUNK - 1..=PREFILL_CHUNK + 1], [25, 10985, 80539], "the span the bounds were measured on");
 
     let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
@@ -132,7 +139,11 @@ fn every_row_of_the_span_logits_is_that_prefix_prompts_last_position() {
     // the chunk boundary the prefix prompt's second chunk is one token wide
     // and the span's 76, and a mid-chunk prefix prompt is one narrower chunk:
     // different GEMM routes, so a KL bound that a row off by one position
-    // fails by nats.
+    // fails by nats. Measured on this span: 1.74e-4 at the boundary, 2.18e-2
+    // at 517, 8.15e-2 at 31, at 30e63a3f and 606381e5 alike. The same routes
+    // give 1.90e-2 at the boundary on the live file once a comment's rename
+    // had shifted it a token (2944c880, #425): a KL there is the token's as
+    // much as the routes', and 0.01 holds for this span, not for any text.
     for (position, bound) in [(PREFILL_CHUNK - 1, 0.0), (SPAN_TOKENS - 1, 0.0), (PREFILL_CHUNK, 0.01), (517, 0.2), (31, 0.2)] {
         let row: Vec<f32> = rows[position * vocab..(position + 1) * vocab]
             .iter()
