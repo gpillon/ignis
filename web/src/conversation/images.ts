@@ -73,11 +73,18 @@ export async function chatImageFromFile(file: Blob, name?: string): Promise<{ ok
   return read.ok ? { ok: true, image: { ...read.image, full: named } } : read;
 }
 
+/** Why a picked or pasted file cannot be a picture, ahead of any decoding, or null: the chat's limits, a context image's too (#431). */
+export function pictureRefusal(file: Blob, named: string): string | null {
+  if (!file.type.startsWith("image/")) return `${named} is not an image.`;
+  if (file.size > MAX_FILE_BYTES) return `${named} is larger than ${MAX_FILE_BYTES >> 20} MB.`;
+  return null;
+}
+
 /** A picked file as a prompt image, or why it cannot be one. */
 export async function imageFromFile(file: File): Promise<{ ok: true; image: PromptImage } | { ok: false; error: string }> {
   const named = file.name || "The image";
-  if (!file.type.startsWith("image/")) return { ok: false, error: `${named} is not an image.` };
-  if (file.size > MAX_FILE_BYTES) return { ok: false, error: `${named} is larger than ${MAX_FILE_BYTES >> 20} MB.` };
+  const refused = pictureRefusal(file, named);
+  if (refused !== null) return { ok: false, error: refused };
   try {
     const bitmap = await createImageBitmap(file);
     try {

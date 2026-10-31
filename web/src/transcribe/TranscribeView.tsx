@@ -6,6 +6,7 @@ import { hitsIn, matchesOf } from "./search.ts";
 import { useWatched } from "./assist.ts";
 import { onJump } from "./jump.ts";
 import { ContextCard } from "./Context.tsx";
+import { type ImageAdding, ImagesCard, useImageAdding } from "./ContextImages.tsx";
 import { AskBar } from "./Ask.tsx";
 import type { CallContext } from "./context.ts";
 import { useSavedContext } from "./defaultContext.ts";
@@ -32,8 +33,9 @@ import type { Assistants, TranscribeActions, TranscribeState } from "./useTransc
 // The Transcribe view (spec speech/07), in the Decide tab's three-column
 // shape: the Transcripts on the left; the one open in the middle, its heading
 // and exports above the sheet and the deck at its foot; on the right three
-// tabs (Q129): Call, what the transcription is told (the context) and who
-// speaks; Notes (Notes.tsx); Settings, the view's own.
+// tabs (Q129): Call, what the transcription is told (the context), its
+// context images (ContextImages.tsx) and who speaks; Notes (Notes.tsx);
+// Settings, the view's own.
 // Below `lg` the two side columns are drawers the header opens. The state is
 // the page's (useTranscribe.ts): a listening goes on while the view is hidden.
 
@@ -80,6 +82,9 @@ export function TranscribeView({
   const at = hits.length === 0 ? 0 : Math.min(current, hits.length - 1);
   const searchField = useRef<HTMLInputElement>(null);
   const saved = useSavedContext();
+  // A context image (#431): a paste anywhere in the view while it shows, a file or Capture in the Call tab.
+  const shown = useRef<HTMLDivElement>(null);
+  const adding = useImageAdding({ transcript: state.active, listening: handle, actions, view: shown });
   // What did I miss?: what it reads, tinted on the spine while it is moved from the last five minutes or pointed at.
   const [previewing, setPreviewing] = useState(false);
   const missedFrom = state.missedFrom;
@@ -140,8 +145,9 @@ export function TranscribeView({
   }, [drawer, onDrawer]);
 
   return (
-    <div className="relative flex min-h-0 flex-1">
+    <div ref={shown} className="relative flex min-h-0 flex-1">
       {drawer && <div className="fixed inset-0 z-30 bg-[#1c2026]/60 lg:hidden" onClick={() => onDrawer(null)} aria-hidden />}
+      {adding.editor}
 
       <Transcripts
         list={state.list}
@@ -223,7 +229,16 @@ export function TranscribeView({
         {tab === "call" && (
           <>
             <Suggestions transcript={state.active} state={state} actions={actions} analyst={assistants.analyst} />
-            <Call transcript={state.active} state={state} actions={actions} live={here && listening.phase !== "idle"} saved={saved} flagged={checkingContext} />
+            <Call
+              transcript={state.active}
+              state={state}
+              actions={actions}
+              live={here && listening.phase !== "idle"}
+              saved={saved}
+              flagged={checkingContext}
+              sharing={here && listening.sharing}
+              adding={adding}
+            />
           </>
         )}
         {tab === "notes" && <Notes transcript={state.active} state={state} actions={actions} notes={assistants.notes} />}
@@ -556,14 +571,35 @@ function Exports({ transcript: t, onOpenInChat, workspaces }: { transcript: Tran
   );
 }
 
-/** The Call tab: what the transcription is told, and who speaks. */
-function Call({ transcript: t, state, actions, live, saved, flagged }: { transcript: Transcript; state: TranscribeState; actions: TranscribeActions; live: boolean; saved: CallContext | null; flagged: boolean }) {
+/** The Call tab: what the transcription is told, its context images, and who speaks. */
+export function Call({
+  transcript: t,
+  state,
+  actions,
+  live,
+  saved,
+  flagged,
+  sharing = false,
+  adding,
+}: {
+  transcript: Transcript;
+  state: TranscribeState;
+  actions: TranscribeActions;
+  live: boolean;
+  saved: CallContext | null;
+  flagged: boolean;
+  /** The listening appending here is a call that shares a picture: Capture is offered. */
+  sharing?: boolean;
+  adding: Pick<ImageAdding, "open" | "capture" | "capturing" | "error">;
+}) {
   const counts = new Map<number, number>();
   for (const u of t.utterances) if (u.speaker !== null) counts.set(u.speaker, (counts.get(u.speaker) ?? 0) + 1);
 
   return (
     <>
       <ContextCard transcript={t} draft={state.draft} maxTokens={state.contextTokens} live={live} saved={saved} flagged={flagged} actions={actions} />
+
+      <ImagesCard transcript={t} sharing={sharing} adding={adding} />
 
       <section aria-labelledby="transcribe-speakers" className="flex flex-col gap-2.5">
         <h2 id="transcribe-speakers" className={caption}>

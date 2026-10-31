@@ -97,6 +97,53 @@ export function promptStub(mode: MarkMode, numbered: { picture: number; mask?: n
   return `In image ${numbered.picture}, change what is marked in ${colorName(color)}: `;
 }
 
+// A context image's editing (spec #428), the editor's other two tools: a crop
+// keeps one area of the picture, a black-out paints one solid black. Each is a
+// rectangle in the picture's own pixels, and only the picture they make is
+// kept: the original, and what is under a black-out, never are.
+
+/** A rectangle in the picture's own pixels. */
+export type Rect = { x: number; y: number; width: number; height: number };
+
+export type Redaction = { kind: "crop" | "blackout"; rect: Rect };
+
+export type RedactTool = Redaction["kind"];
+
+/**
+ * The rectangle a drag draws, from either corner, held inside the picture and widened to whole pixels: a black-out
+ * leaves no part of a pixel showing at its edge.
+ */
+export function rectOf(from: Point, to: Point, natural: { width: number; height: number }): Rect {
+  const inside = (v: number, max: number) => Math.min(max, Math.max(0, v));
+  const x = inside(Math.floor(Math.min(from[0], to[0])), natural.width);
+  const y = inside(Math.floor(Math.min(from[1], to[1])), natural.height);
+  const right = inside(Math.ceil(Math.max(from[0], to[0])), natural.width);
+  const bottom = inside(Math.ceil(Math.max(from[1], to[1])), natural.height);
+  return { x, y, width: right - x, height: bottom - y };
+}
+
+/** A rectangle worth keeping: a drag, not a click. */
+export const isArea = (rect: Rect): boolean => rect.width >= 2 && rect.height >= 2;
+
+/**
+ * What the edits make of a picture: the area kept, the last crop drawn or the whole picture, and the black-outs in
+ * the kept picture's own pixels, each cut at its edges and one outside it dropped.
+ */
+export function redactionPlan(edits: Redaction[], natural: { width: number; height: number }): { crop: Rect; blackouts: Rect[] } {
+  const crops = edits.filter((e) => e.kind === "crop");
+  const crop = crops[crops.length - 1]?.rect ?? { x: 0, y: 0, width: natural.width, height: natural.height };
+  const blackouts: Rect[] = [];
+  for (const { kind, rect } of edits) {
+    if (kind !== "blackout") continue;
+    const x = Math.max(rect.x, crop.x);
+    const y = Math.max(rect.y, crop.y);
+    const right = Math.min(rect.x + rect.width, crop.x + crop.width);
+    const bottom = Math.min(rect.y + rect.height, crop.y + crop.height);
+    if (right > x && bottom > y) blackouts.push({ x: x - crop.x, y: y - crop.y, width: right - x, height: bottom - y });
+  }
+  return { crop, blackouts };
+}
+
 // ---------------------------------------------------------------------------
 // The canvas work: browser only.
 
@@ -203,4 +250,48 @@ export async function keepOutside(result: Blob, keep: { source: Blob; region: Bl
   } finally {
     for (const url of urls) URL.revokeObjectURL(url);
   }
+}
+
+/** The kiln's ground behind what a crop leaves out, and the crop's frame: the editor's own colours. */
+const CROP_DIM = "rgba(28, 32, 38, 0.72)";
+const CROP_FRAME = "#ff5a1f";
+
+/**
+ * Draws the edits as they will come out, `scale` being shown pixels per picture pixel: the black-outs opaque, and
+ * what the crop leaves out dimmed behind its frame.
+ */
+export function drawRedactions(ctx: CanvasRenderingContext2D, edits: Redaction[], natural: { width: number; height: number }, scale = 1) {
+  const { crop } = redactionPlan(edits, natural);
+  ctx.save();
+  ctx.fillStyle = "#000";
+  for (const { kind, rect } of edits) if (kind === "blackout") ctx.fillRect(rect.x * scale, rect.y * scale, rect.width * scale, rect.height * scale);
+  if (crop.width < natural.width || crop.height < natural.height) {
+    ctx.fillStyle = CROP_DIM;
+    ctx.beginPath();
+    ctx.rect(0, 0, natural.width * scale, natural.height * scale);
+    ctx.rect(crop.x * scale, crop.y * scale, crop.width * scale, crop.height * scale);
+    ctx.fill("evenodd");
+    ctx.strokeStyle = CROP_FRAME;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(crop.x * scale, crop.y * scale, crop.width * scale, crop.height * scale);
+  }
+  ctx.restore();
+}
+
+/** A picture as its edits made it, at its own size. */
+export type RedactedPicture = { blob: Blob; width: number; height: number };
+
+/**
+ * The picture at `sourceUrl` as its edits make it (`redactionPlan`): the area kept, and the black-outs painted
+ * opaque into its pixels, as a PNG. Drawn even with no edit, so what is kept is never the picked file's own bytes,
+ * nor what the file carries beside its pixels.
+ */
+export async function renderRedactions(sourceUrl: string, edits: Redaction[]): Promise<RedactedPicture> {
+  const picture = await loadImage(sourceUrl);
+  const { crop, blackouts } = redactionPlan(edits, { width: picture.naturalWidth, height: picture.naturalHeight });
+  const out = canvasOf(crop.width, crop.height);
+  out.ctx.drawImage(picture, crop.x, crop.y, crop.width, crop.height, 0, 0, crop.width, crop.height);
+  out.ctx.fillStyle = "#000";
+  for (const r of blackouts) out.ctx.fillRect(r.x, r.y, r.width, r.height);
+  return { blob: await toBlob(out.canvas), width: crop.width, height: crop.height };
 }

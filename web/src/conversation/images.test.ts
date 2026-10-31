@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dataUriBytes, fitted, imageFromFile, imageMime, MAX_EDGE } from "./images.ts";
+import { dataUriBytes, fitted, imageFromFile, imageMime, MAX_EDGE, pictureRefusal } from "./images.ts";
 
 describe("fitted", () => {
   it("leaves an image that already fits alone, rather than blowing it up", () => {
@@ -29,6 +29,14 @@ describe("imageFromFile", () => {
     const file = new File(["not a picture"], "notes.txt", { type: "text/plain" });
     const result = await imageFromFile(file);
     expect(result).toEqual({ ok: false, error: "notes.txt is not an image." });
+  });
+});
+
+describe("pictureRefusal", () => {
+  it("holds a picture from anywhere to the chat's limits, ahead of any decoding: an image, up to 32 MB (#431)", () => {
+    expect(pictureRefusal(new Blob(["x"], { type: "image/png" }), "The pasted picture")).toBeNull();
+    expect(pictureRefusal(new Blob(["x"], { type: "application/pdf" }), "slides.pdf")).toBe("slides.pdf is not an image.");
+    expect(pictureRefusal({ type: "image/png", size: (32 << 20) + 1 } as Blob, "board.png")).toBe("board.png is larger than 32 MB.");
   });
 });
 

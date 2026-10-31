@@ -1,6 +1,7 @@
 import { restoreOrder, type Stamp } from "../store/docs.ts";
 import { readAnswered } from "./ask.ts";
 import { readContext } from "./context.ts";
+import { readContextImages } from "./contextImages.ts";
 import { readNotes } from "./notes.ts";
 import { readRecap } from "./recap.ts";
 import { readSuggestions } from "./suggestions.ts";
@@ -11,7 +12,8 @@ import type { Transcript } from "./transcript.ts";
 // Transcript", Q86): a new kind of session, a document of
 // `transcribe-sessions` under a key of its own (store/docs.ts), the chat's and
 // the Decide tab's rules over it. It is plain data already: its utterances'
-// text and times, its speakers and the channels they map, its corrections. Its
+// text and times, its speakers and the channels they map, its corrections, its
+// context images by their pictures' ids in the store (contextImages.ts). Its
 // audio never reaches it: the page keeps none. An utterance is written as it
 // completes (store/useStoredSessions.ts); the one under way is the listening's,
 // not the Transcript's, so a reload keeps every completed utterance and ends
@@ -57,8 +59,10 @@ export function restoreTranscripts(values: unknown[], nextId: number): { transcr
     const readC = readContext(context);
     const readS = readSuggestions(suggestions);
     const checked = typeof t.checkedUntilMs === "number" && Number.isFinite(t.checkedUntilMs) ? { checkedUntilMs: t.checkedUntilMs } : {};
-    const { checkedUntilMs: _checked, ...rest } = t;
+    const { checkedUntilMs: _checked, images, ...rest } = t;
     const readA = readAnswered(asked);
+    // Context images likewise: those it cannot read are dropped, and the Transcript and its other images stay.
+    const readI = readContextImages(images);
     return {
       ...rest,
       ...checked,
@@ -67,6 +71,7 @@ export function restoreTranscripts(values: unknown[], nextId: number): { transcr
       ...(readC ? { context: readC } : {}),
       ...(readS ? { suggestions: readS } : {}),
       ...(readA ? { asked: readA } : {}),
+      ...(readI?.length ? { images: readI } : {}),
     };
   });
   return { transcripts, stamps, nextId: ordered.nextId };

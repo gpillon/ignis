@@ -19,6 +19,7 @@
 
 import type { Answered } from "./ask.ts";
 import type { CallContext } from "./context.ts";
+import type { ContextImage } from "./contextImages.ts";
 import type { Notes } from "./notes.ts";
 import type { Suggestions } from "./suggestions.ts";
 
@@ -75,6 +76,8 @@ export type Transcript = {
   checkedUntilMs?: number;
   /** The questions asked about it and their answers, latest first (Q139). */
   asked?: Answered[];
+  /** The pictures added to it, each at its moment (contextImages.ts): absent until one is. */
+  images?: ContextImage[];
 };
 
 /** Who an utterance's audio is, as the listening knows it. */

@@ -14,7 +14,9 @@ import type { NotesWriterState } from "./notesWriter.ts";
 import { Heading, highlighted, nextCheckIn, RewritePanel, Sheet, speakerColor } from "./Sheet.tsx";
 import { startList, titleOf } from "./sessions.ts";
 import { EMPTY_CONTEXT } from "./context.ts";
-import { fileStem, listMatch, SearchField, Settings, TranscribeView, transcriptSummary } from "./TranscribeView.tsx";
+import { Call, fileStem, listMatch, SearchField, Settings, TranscribeView, transcriptSummary } from "./TranscribeView.tsx";
+import { addContextImage } from "./contextImages.ts";
+import { StaticPictures } from "../image/pictures.tsx";
 import { hitsIn } from "./search.ts";
 import { addUtterance, createTranscript, fixUtterances, sessionsWithSpeakers, splitUtterance, type Transcript } from "./transcript.ts";
 import type { TranscribeActions, TranscribeState } from "./useTranscribe.ts";
@@ -69,6 +71,8 @@ const actions: TranscribeActions = {
   forgetAnswer: none,
   askFrom: none,
   clearMissed: none,
+  addImage: async () => {},
+  captureFrame: async () => null,
 };
 
 const at = (state: Partial<ListeningState>): ListeningState => ({ ...IDLE, ...state });
@@ -714,5 +718,59 @@ describe("the Transcripts list", () => {
     const t = room();
     expect(sessionsWithSpeakers(t)).toBe(1);
     expect(sessionsWithSpeakers(addUtterance(t, { stream: "mic-2", startMs: 9_000, endMs: 9_500, text: "Eccomi.", voice: { kind: "speaker", index: 0 } }))).toBe(2);
+  });
+});
+
+describe("the context images (#431)", () => {
+  const SLIDE = "e".repeat(64);
+  const shown = (t: Transcript) =>
+    renderToStaticMarkup(
+      <StaticPictures urls={{ [`thumb:${SLIDE}`]: "blob:slide" }}>
+        <Sheet transcript={t} live={[]} phase="idle" call={false} here actions={actions} deleted={null} hits={[]} current={0} rewrite={null} canRewrite readTo={null} seek={0} autoCheck asking={null} />
+      </StaticPictures>,
+    );
+
+  it("stand on the spine at their moments, the picture and its size beside the time", () => {
+    let t = addContextImage(room(), { image: SLIDE, atMs: 0, width: 1280, height: 720 }, 1);
+    t = addContextImage(t, { image: SLIDE, atMs: 9_000, width: 640, height: 360 }, 2);
+    const html = shown(t);
+    const start = html.indexOf('aria-label="Context image at 00:00"');
+    const said = html.indexOf(">00:04<");
+    const later = html.indexOf('aria-label="Context image at 00:09"');
+    expect(start).toBeGreaterThan(-1);
+    expect(said).toBeGreaterThan(start);
+    expect(later).toBeGreaterThan(said);
+    expect(html).toContain('src="blob:slide"');
+    expect(html).toContain("Context image, 1280×720");
+  });
+
+  it("stand in place of the empty sheet when a picture came before anyone spoke", () => {
+    const html = shown(addContextImage(createTranscript(1), { image: SLIDE, atMs: 0, width: 800, height: 600 }, 1));
+    expect(html).toContain('aria-label="Context image at 00:00"');
+    expect(html).not.toContain("Nothing heard yet");
+  });
+
+  const card = (t: Transcript, sharing: boolean, error: string | null = null) =>
+    renderToStaticMarkup(
+      <Call transcript={t} state={state({ active: t })} actions={actions} live={sharing} saved={null} flagged={false} sharing={sharing} adding={{ open: none, capture: none, capturing: false, error }} />,
+    );
+
+  it("are added in the Call tab from a file or a paste, and by Capture only while a call shares a picture", () => {
+    const idle = card(room(), false);
+    expect(idle).toContain(">Images</h2>");
+    expect(idle).toContain(">From a file</button>");
+    expect(idle).toContain('accept="image/*"');
+    expect(idle).toContain("or paste one");
+    expect(idle).not.toContain(">Capture</button>");
+    expect(idle).toContain("On a call, Capture takes a frame of what it shares.");
+    const sharing = card(room(), true);
+    expect(sharing).toContain(">Capture</button>");
+    expect(sharing).not.toContain("On a call, Capture");
+  });
+
+  it("say why a picture was refused, and how many the spine holds", () => {
+    expect(card(room(), false, "slides.pdf is not an image.")).toContain("slides.pdf is not an image.");
+    const two = addContextImage(addContextImage(room(), { image: SLIDE, atMs: 0, width: 1, height: 1 }, 1), { image: SLIDE, atMs: 5_000, width: 1, height: 1 }, 2);
+    expect(card(two, false)).toContain("2 images on the spine.");
   });
 });

@@ -32,8 +32,8 @@ nothing is sent to the server for safekeeping.
 | Workspaces: their names, and every file with every version and its author | same database, `workspaces`, and `workspace-files/<id>` for each one's files | yes; deleting a chat keeps its workspace, which goes only when you [delete it](chat.md#the-workspace-picker) |
 | Decide's decisions: drafts, evidence, answers | same database, `decide-sessions` | yes |
 | Image sessions and their steps | same database, `image-sessions` | yes |
-| Transcripts: each utterance's text, times and speaker, the speakers' names and the corrections, the context it is told, the suggestions and what became of them, how far the text model has checked it, the notes, the questions asked and their answers, never audio | same database, `transcribe-sessions` | yes; a listening under way ends, its completed utterances kept |
-| Pictures (sent in the chat, made, marked, a workspace's), stored once by their SHA-256 and shared | same database, `images` and `bytes` | yes; deleting a chat, an image session or a workspace frees only the pictures nothing else names |
+| Transcripts: each utterance's text, times and speaker, the speakers' names and the corrections, the context it is told, its context images by their pictures and moments, the suggestions and what became of them, how far the text model has checked it, the notes, the questions asked and their answers, never audio | same database, `transcribe-sessions` | yes; a listening under way ends, its completed utterances kept |
+| Pictures (sent in the chat, made, marked, a workspace's, a transcript's context images), stored once by their SHA-256 and shared | same database, `images` and `bytes` | yes; deleting a chat, an image session, a workspace or a transcript frees only the pictures nothing else names |
 | A workspace's other bytes, such as a PDF's, stored once | same database, `blobs` | yes |
 | The session that was open, per view | same database, `active-session` | yes |
 | The API key | `localStorage` `ignis.apiKey` | yes |

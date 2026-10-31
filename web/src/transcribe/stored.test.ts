@@ -6,6 +6,7 @@ import type { Notes } from "./notes.ts";
 import { activeOf, openTranscript, removeTranscript, startList, titleOf, UNTITLED } from "./sessions.ts";
 import { restoreTranscripts, TRANSCRIBE_SESSIONS, TRANSCRIBE_VERSION, toStored, worthKeeping } from "./stored.ts";
 import { addUtterance, beginListening, clockOf, createTranscript, mergeSpeakers, type Transcript } from "./transcript.ts";
+import { addContextImage } from "./contextImages.ts";
 
 // The Transcripts as the view lists them and the page's store keeps them
 // (spec speech/07, "The Transcript", Q86, Q101): a new kind of session, saved
@@ -164,6 +165,29 @@ describe("a Transcript in the store", () => {
   it("is worth keeping once an utterance is heard in it", () => {
     expect(worthKeeping(createTranscript(1))).toBe(false);
     expect(worthKeeping(heardTwice())).toBe(true);
+  });
+
+  it("keeps its context images, each by its picture's id at its moment, and drops those it cannot read without dropping the Transcript (#431)", async () => {
+    const slide = "c".repeat(64);
+    let original = addContextImage(heardTwice(), { image: slide, atMs: 1_500, width: 1280, height: 720 }, 1_761_900_000_000);
+    original = addContextImage(original, { image: slide, atMs: 2_400, width: 1280, height: 720 }, 1_761_900_060_000);
+    const stored = toStored(original, { key: "k", order: 1 });
+    for (const store of [createMemoryStore(), openIndexedDbStore(new IDBFactory(), "transcribe-images-test")]) {
+      await store.putDoc(TRANSCRIBE_SESSIONS, stored.key, stored);
+      const [back] = restoreTranscripts(await store.listDocs(TRANSCRIBE_SESSIONS), 1).transcripts;
+      expect(back.images).toEqual(original.images);
+    }
+    const [some] = restoreTranscripts([{ ...stored, images: [stored.images?.[0], { id: 2, image: 7 }] }], 1).transcripts;
+    expect(some.images).toEqual([original.images?.[0]]);
+    const [kept] = restoreTranscripts([{ ...stored, images: "a slide" }], 1).transcripts;
+    expect(kept.utterances).toHaveLength(2);
+    expect(kept).not.toHaveProperty("images");
+  });
+
+  it("is worth keeping, and is not reused as a new one, once a picture is added before anyone spoke (#431)", () => {
+    const shown = addContextImage(createTranscript(1, { source: "call", at: new Date(2026, 9, 31, 10, 0) }), { image: "d".repeat(64), atMs: 0, width: 640, height: 480 }, 1);
+    expect(worthKeeping(shown)).toBe(true);
+    expect(openTranscript({ transcripts: [shown], activeId: 1 }, 2).activeId).toBe(2);
   });
 
   it("comes back newest first with new ids, and leaves out what it cannot read", () => {

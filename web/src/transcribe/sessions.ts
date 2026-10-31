@@ -20,8 +20,8 @@ export const activeOf = (list: TranscriptList): Transcript => list.transcripts.f
 
 export const titleOf = (t: Transcript): string => t.title || UNTITLED;
 
-/** Nothing heard in it yet. */
-export const isEmpty = (t: Transcript): boolean => t.utterances.length === 0;
+/** Nothing heard in it yet, nor a picture added to it before anyone spoke (#431). */
+export const isEmpty = (t: Transcript): boolean => t.utterances.length === 0 && !t.images?.length;
 
 /** A Transcript to listen into: the open one while nothing is heard in it, otherwise `newId` at the top. */
 export function openTranscript(list: TranscriptList, newId: number): TranscriptList {
