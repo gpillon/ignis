@@ -390,37 +390,35 @@ pub struct PromptSetSpec<'a> {
 /// prompt reuse served it warm. So the prompts are numbered across the run,
 /// each set from where the previous one ended, and every prompt starts with
 /// its own nonce (or corpus offset); then the run is proven
-/// (`prove_run_divergence`) and refused, naming two prompts, where it
-/// does not hold.
+/// (`RunNumbering::prove`) and refused, naming two prompts, where it does
+/// not hold.
 pub fn generate_run_prompts<const N: usize>(
     template: &dyn PromptTemplate,
     corpus: Option<&[u32]>,
     sets: [PromptSetSpec<'_>; N],
 ) -> Result<[Result<PromptSet, String>; N], String> {
-    let mut run = Run::of(sets.iter().map(|set| set.count).sum());
+    let mut run = RunNumbering::of(sets.iter().map(|set| set.count).sum());
     let generated = sets.map(|set| run.generate(template, corpus, &set));
-    let proven: Vec<(&str, &[Vec<u32>])> = sets
-        .iter()
-        .zip(&generated)
-        .filter_map(|(spec, set)| Some((spec.label, set.as_ref().ok()?.tokens.as_slice())))
-        .collect();
-    prove_run_divergence(&proven, template.encode_user_message("")?.len())?;
+    run.prove(template)?;
     Ok(generated)
 }
 
-/// A run's prompts as its sets are generated, in the order they are sent
-/// (GitHub #426): the number its next prompt takes, and every prompt cut
-/// so far, whose content a corpus window must not start with.
-struct Run {
+/// A run's prompt numbering (GitHub #426), as its sets are generated in the
+/// order they are sent: the number its next prompt takes, and every prompt
+/// generated so far, named as a refusal names it, which a corpus window must
+/// not start with and which the run's proof compares.
+struct RunNumbering {
     /// The prompts the run cuts its corpus windows for.
     total: usize,
     next: usize,
-    earlier: Vec<Vec<u32>>,
+    /// Every prompt generated so far, in order, and its name.
+    prompts: Vec<Vec<u32>>,
+    names: Vec<String>,
 }
 
-impl Run {
+impl RunNumbering {
     fn of(total: usize) -> Self {
-        Self { total, next: 0, earlier: Vec::with_capacity(total) }
+        Self { total, next: 0, prompts: Vec::with_capacity(total), names: Vec::with_capacity(total) }
     }
 
     /// The numbering of the run's next `count` prompts.
@@ -440,13 +438,39 @@ impl Run {
     ) -> Result<PromptSet, String> {
         let numbering = self.take(set.count);
         let generated = match corpus {
-            Some(ids) => cut_corpus_prompts(template, ids, set.target_tokens, set.suffix, numbering, &self.earlier),
+            Some(ids) => cut_corpus_prompts(template, ids, set.target_tokens, set.suffix, numbering, &self.prompts),
             None => generate_numbered_prompts(template, set.target_tokens, set.suffix, numbering),
         };
-        if let Ok(set) = &generated {
-            self.earlier.extend(set.tokens.iter().cloned());
+        if let Ok(generated) = &generated {
+            self.record(set.label, &generated.tokens);
         }
         generated
+    }
+
+    /// Generate the multimodal cell's prompts, `spec`'s warmup and samples,
+    /// as the run's next.
+    fn generate_image(&mut self, template: &dyn PromptTemplate, spec: &ImageCellSpec) -> Result<ImagePromptSet, String> {
+        let numbering = self.take(spec.samples + 1);
+        let generated = generate_numbered_image_prompts(template, &spec.png, &spec.question, numbering);
+        if let Ok(generated) = &generated {
+            self.record("image cell", &generated.tokens);
+        }
+        generated
+    }
+
+    fn record(&mut self, label: &str, tokens: &[Vec<u32>]) {
+        for (index, ids) in tokens.iter().enumerate() {
+            self.names.push(format!("{label} prompt {index}"));
+            self.prompts.push(ids.clone());
+        }
+    }
+
+    /// The run's divergence proof ([`prove_run_divergence`]) over every
+    /// prompt it generated.
+    fn prove(&self, template: &dyn PromptTemplate) -> Result<(), String> {
+        let prompts: Vec<(&str, &[u32])> =
+            self.names.iter().map(String::as_str).zip(self.prompts.iter().map(Vec::as_slice)).collect();
+        prove_run_divergence(&prompts, template.encode_user_message("")?.len())
     }
 }
 
@@ -455,19 +479,13 @@ impl Run {
 /// nothing it can serve but a prompt checkpoint.
 const KV_PAGE_TOKENS: usize = 64;
 
-/// The divergence proof across a run's prompt sets (GitHub #426), each
-/// set's token ids named by its label: no two prompts of the run share more
-/// leading tokens than the chat template's own `overhead`, nor a whole
-/// [`KV_PAGE_TOKENS`] page of them, so prompt reuse has nothing of one to
-/// serve another from. A set's own proof ([`prove_divergence`]) holds within
-/// it, and cannot see the others.
-fn prove_run_divergence(sets: &[(&str, &[Vec<u32>])], overhead: usize) -> Result<(), String> {
-    let prompts: Vec<(String, &[u32])> = sets
-        .iter()
-        .flat_map(|(label, tokens)| {
-            tokens.iter().enumerate().map(move |(index, ids)| (format!("{label} prompt {index}"), ids.as_slice()))
-        })
-        .collect();
+/// The divergence proof across a run's prompts (GitHub #426), each named as
+/// a refusal names it: no two prompts of the run share more leading tokens
+/// than the chat template's own `overhead`, nor a whole [`KV_PAGE_TOKENS`]
+/// page of them, so prompt reuse has nothing of one to serve another from.
+/// A set's own proof ([`prove_divergence`]) holds within it, and cannot see
+/// the others.
+fn prove_run_divergence(prompts: &[(&str, &[u32])], overhead: usize) -> Result<(), String> {
     for (i, (a, a_ids)) in prompts.iter().enumerate() {
         for (b, b_ids) in &prompts[i + 1..] {
             let shared = common_prefix_len(a_ids, b_ids);
@@ -1435,32 +1453,23 @@ impl CellPrompts {
     /// `corpus` when one is given and grown by the filler generator
     /// otherwise, or why the run cannot start.
     fn generate(template: &dyn PromptTemplate, corpus: Option<&[u32]>, cfg: &TtftConfig) -> Result<Self, String> {
-        let mut run = Run::of(cfg.cells.iter().map(|cell| cell.samples + 1).sum());
-        let labels: Vec<String> = cfg.cells.iter().map(|cell| format!("{}-token cell", cell.prompt_tokens)).collect();
-        let specs: Vec<PromptSetSpec> = cfg
+        let mut run = RunNumbering::of(cfg.cells.iter().map(|cell| cell.samples + 1).sum());
+        let text = cfg
             .cells
             .iter()
-            .zip(&labels)
-            .map(|(cell, label)| PromptSetSpec {
-                label,
-                count: cell.samples + 1,
-                target_tokens: cell.prompt_tokens as usize,
-                suffix: "",
+            .map(|cell| {
+                let label = format!("{}-token cell", cell.prompt_tokens);
+                let set = PromptSetSpec {
+                    label: &label,
+                    count: cell.samples + 1,
+                    target_tokens: cell.prompt_tokens as usize,
+                    suffix: "",
+                };
+                run.generate(template, corpus, &set)
             })
             .collect();
-        let text: Vec<Result<PromptSet, String>> = specs.iter().map(|spec| run.generate(template, corpus, spec)).collect();
-        let image = cfg.image.as_ref().map(|spec| {
-            generate_numbered_image_prompts(template, &spec.png, &spec.question, run.take(spec.samples + 1))
-        });
-        let mut proven: Vec<(&str, &[Vec<u32>])> = specs
-            .iter()
-            .zip(&text)
-            .filter_map(|(spec, set)| Some((spec.label, set.as_ref().ok()?.tokens.as_slice())))
-            .collect();
-        if let Some(Ok(set)) = &image {
-            proven.push(("image cell", &set.tokens));
-        }
-        prove_run_divergence(&proven, template.encode_user_message("")?.len())?;
+        let image = cfg.image.as_ref().map(|spec| run.generate_image(template, spec));
+        run.prove(template)?;
         Ok(Self { text, image })
     }
 }
