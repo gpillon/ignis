@@ -1079,20 +1079,27 @@ impl ConcreteScheduler {
     /// checkpoint that can be given up (GitHub #215) — whatever stands on the
     /// prefix under it, since that page is the checkpoint's alone.
     fn reclaimable_retained_pages(&self) -> u32 {
-        let claimed = self.claimed_device_checkpoints();
-        let tails = self
-            .checkpoints
-            .entries()
-            .iter()
-            .filter(|e| e.tier == ReuseSource::Device && !claimed.contains(&e.id))
-            .filter(|e| self.tail_pages.contains(&e.publisher))
-            .count() as u32;
-        tails
+        self.tail_pages_that_go(&self.claimed_device_checkpoints())
             + self
                 .reclaimable_prefixes()
                 .into_iter()
                 .map(|p| self.prefix.pages_of(p))
                 .sum::<u32>()
+    }
+
+    /// Whether giving the checkpoint `e` up gives its tail page back (GitHub
+    /// #215): a device checkpoint whose opener ends inside a page of its own,
+    /// which no claim `kept` is about to be built from. The one test behind
+    /// what the first-victim path counts and what it gives up, so the two
+    /// agree.
+    fn tail_page_goes(&self, e: &CheckpointEntry, kept: &[crate::checkpoint::CheckpointId]) -> bool {
+        e.tier == ReuseSource::Device && !kept.contains(&e.id) && self.tail_pages.contains(&e.publisher)
+    }
+
+    /// The tail pages that come back once every device checkpoint no claim
+    /// `kept` is about to be built from is given up ([`Self::tail_page_goes`]).
+    fn tail_pages_that_go(&self, kept: &[crate::checkpoint::CheckpointId]) -> u32 {
+        self.checkpoints.entries().iter().filter(|e| self.tail_page_goes(e, kept)).count() as u32
     }
 
     /// The device checkpoints an admitted request has claimed and not yet been
@@ -1160,14 +1167,7 @@ impl ConcreteScheduler {
     /// about to be built from.
     fn pages_given_up_for(&self, rank: Rank) -> u32 {
         let claims = self.waiting_claims_below(rank);
-        let kept = self.claimed_device_checkpoints_but(&claims);
-        let tails = self
-            .checkpoints
-            .entries()
-            .iter()
-            .filter(|e| e.tier == ReuseSource::Device && !kept.contains(&e.id))
-            .filter(|e| self.tail_pages.contains(&e.publisher))
-            .count() as u32;
+        let tails = self.tail_pages_that_go(&self.claimed_device_checkpoints_but(&claims));
         let links = self.prefix.links_let_go(|p| self.holders_let_go(p, &claims));
         tails + links.into_iter().map(|p| self.prefix.pages_of(p)).sum::<u32>()
     }
@@ -1183,9 +1183,9 @@ impl ConcreteScheduler {
         claims.into_iter().find(|&i| {
             let r = &self.requests[i];
             r.prefix_entry.is_some_and(|p| links.contains(&p))
-                || (r.reuse_source == Some(ReuseSource::Device)
-                    && r.checkpoint_entry.is_some_and(|id| !kept.contains(&id))
-                    && r.checkpoint_publisher.is_some_and(|p| self.tail_pages.contains(&p)))
+                || r.checkpoint_entry
+                    .and_then(|id| self.checkpoints.entries().iter().find(|e| e.id == id))
+                    .is_some_and(|e| self.tail_page_goes(e, &kept))
         })
     }
 
@@ -1977,10 +1977,8 @@ impl ConcreteScheduler {
             // request is about to be built from that checkpoint.
             let reclaimable = self.reclaimable_prefixes();
             let claimed = self.claimed_device_checkpoints();
-            let tail_pages = &self.tail_pages;
             if let Some(victim) = self.checkpoints.victim_where(ReuseSource::Device, |e| {
-                reclaimable.contains(&e.prefix)
-                    || (tail_pages.contains(&e.publisher) && !claimed.contains(&e.id))
+                reclaimable.contains(&e.prefix) || self.tail_page_goes(e, &claimed)
             }) {
                 if !self.spill_checkpoint(&victim, events) {
                     let victim = self
