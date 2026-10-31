@@ -1,7 +1,8 @@
 import type { ToolDefinition } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
-import { minutesClock } from "./export.ts";
+import { minutesClock, toText } from "./export.ts";
 import { type NoteKind, type NoteLine, noNotes, type Notes, OTHER_SECTION, RUNNING_NOTES, type RunningSection, sectionOrder, specOf } from "./notes.ts";
+import type { Transcript, Utterance } from "./transcript.ts";
 
 // The running notes (spec #428, "Running notes: the notes thread"; ADR 0076):
 // the notes kept while a conversation goes on, in the kind's live sections, by
@@ -26,7 +27,7 @@ export function runningTask(kind: NoteKind): string {
   const rules = [
     "Rules:",
     "- The notes live outside this conversation, one line at a time, and change only through the tools: add_line adds a line to a section, replace_line rewrites a line by its id, remove_line removes one, rewrite_section rewrites a whole section. A tool's result says what it did.",
-    "- Each user turn brings what was said since the last one. Change only what it makes wrong, stale or incomplete. A line still true stays as it is, word for word. When nothing changes, call no tool.",
+    "- Each user turn brings what was said since the last one and, under Changed since, what the user changed in the transcript meanwhile: an utterance corrected, moved to another speaker, split, deleted or put back, a speaker renamed or merged into another. Change only what it makes wrong, stale or incomplete; a speaker goes by the name they have now. A line still true stays as it is, word for word. When nothing changes, call no tool.",
     "- Keep the notes short: a section holds at most the lines given above. Change single lines; only when a section is full, rewrite it with rewrite_section: merge, drop what is stale, fold in what is new; a line kept word for word keeps its id.",
     "- A line is one short point; a figure gets a line of its own. Never write a line's id in its text.",
     "- A line marked (the user's) is one the user wrote: never change or remove it; it does not count among its section's lines. A line the user removed is never written again.",
@@ -226,8 +227,121 @@ export function notesState(notes: Notes, kind: NoteKind): string {
 export type Said = { startMs: number; line: string };
 
 /**
+ * What a thread told the model of an utterance: its start, its speaker and the name it had, the text, and its line
+ * without the line break, "" while the model knows of no line (its text emptied, or the utterance deleted).
+ */
+export type Told = { startMs: number; speaker: number | null; who: string | null; text: string; line: string };
+
+/** An utterance of `t`'s line as the thread tells it, in total minutes: "" for an emptied one. */
+const lineOf = (t: Transcript, u: Utterance): string => toText({ ...t, utterances: [u] }, minutesClock);
+
+/**
+ * Whether `u` is the utterance the thread told as `was`: the same id from the same start; not an id the page gave again
+ * once the last utterance was deleted.
+ */
+const isTold = (u: Utterance | undefined, was: Told | undefined): boolean => u !== undefined && was !== undefined && was.startMs === u.startMs;
+
+/** `t`'s utterances by id. */
+const byIdOf = (t: Transcript) => new Map(t.utterances.map((u) => [u.id, u]));
+
+/**
+ * What a thread tells the model of `t`'s utterances, by id, starting from it or appending a turn of it: each utterance
+ * as it stands, and, from what it told `before`, each one since deleted as no line, so a deletion is told once and an
+ * Undo after it as put back.
+ */
+export function toldOf(t: Transcript, before?: Map<number, Told>): Map<number, Told> {
+  const names = new Map(t.speakers.map((s) => [s.id, s.name]));
+  const byId = byIdOf(t);
+  const told = new Map<number, Told>();
+  for (const [id, was] of before ?? []) if (!isTold(byId.get(id), was)) told.set(id, { ...was, line: "" });
+  for (const u of t.utterances) {
+    const who = u.speaker === null ? null : (names.get(u.speaker) ?? null);
+    told.set(u.id, { startMs: u.startMs, speaker: u.speaker, who, text: u.text.trim(), line: lineOf(t, u).trimEnd() });
+  }
+  return told;
+}
+
+/**
+ * What a later turn tells of `t`, against what the thread `told` before: the utterances said since, and one event a
+ * change the user made meanwhile (#434), each with its time and its new text: first a speaker renamed or merged into
+ * another, by the name the model knows them by; then, in the order of their times, an utterance corrected (an edit, an
+ * accepted fix, a Rewrite), moved to another speaker, split, deleted or put back. A rename is the model's to carry into
+ * the notes' lines: the page never puts a name in one.
+ */
+export function changesSince(told: Map<number, Told>, t: Transcript): { said: Said[]; events: string[] } {
+  const byId = byIdOf(t);
+  // The speakers the model knows, by the name it knows and the first time it heard them; one gone from the speakers
+  // was merged into the one its utterances are now.
+  const known = new Map<number, { who: string; at: number; now: Map<number, number> }>();
+  for (const [id, was] of told) {
+    if (was.line === "" || was.speaker === null || was.who === null) continue;
+    const speaker = known.get(was.speaker) ?? { who: was.who, at: was.startMs, now: new Map<number, number>() };
+    speaker.at = Math.min(speaker.at, was.startMs);
+    const u = byId.get(id);
+    if (u?.speaker != null && isTold(u, was)) speaker.now.set(u.speaker, (speaker.now.get(u.speaker) ?? 0) + 1);
+    known.set(was.speaker, speaker);
+  }
+  const names = new Map(t.speakers.map((s) => [s.id, s.name]));
+  const events: string[] = [];
+  const mergedInto = new Map<number, number>();
+  for (const [id, { who, at, now }] of known) {
+    const name = names.get(id);
+    const heard = `${who}, heard from [${minutesClock(at)}],`;
+    if (name !== undefined) {
+      if (name !== who) events.push(`Renamed: ${heard} is ${name}.`);
+      continue;
+    }
+    const into = [...now].sort((a, b) => b[1] - a[1])[0]?.[0];
+    if (into === undefined || !names.has(into)) continue;
+    mergedInto.set(id, into);
+    events.push(`Merged: ${heard} is ${names.get(into)}.`);
+  }
+  // A split keeps its first half's id and puts the rest right after it, under new ids, each start guessed (`~`): the
+  // utterances so placed after one told are its halves, not something said.
+  const halves = new Map<number, Utterance[]>();
+  const halved = new Set<Utterance>();
+  let split: Utterance | null = null;
+  for (const u of t.utterances) {
+    if (isTold(u, told.get(u.id))) split = u;
+    else if (split && u.approxStart) {
+      halves.set(split.id, [...(halves.get(split.id) ?? []), u]);
+      halved.add(u);
+    } else split = null;
+  }
+  const said: Said[] = [];
+  const changes: { at: number; event: string }[] = [];
+  const change = (at: number, event: string) => changes.push({ at, event });
+  for (const u of t.utterances) {
+    const was = told.get(u.id);
+    const line = lineOf(t, u);
+    if (was === undefined || !isTold(u, was)) {
+      if (line !== "" && !halved.has(u)) said.push({ startMs: u.startMs, line });
+      continue;
+    }
+    const rest = halves.get(u.id) ?? [];
+    if (rest.length > 0) {
+      const lines = [u, ...rest].map((x) => lineOf(t, x).trimEnd()).filter((l) => l !== "");
+      change(u.startMs, `Split: ${lines.join(" | ")}`);
+      continue;
+    }
+    const now = line.trimEnd();
+    if (was.line === "" || now === "") {
+      // Emptied is deleted, as far as the model knows: it is told no line of it.
+      if (now !== was.line) change(u.startMs, now === "" ? `Deleted: ${was.line}` : `Put back: ${now}`);
+      continue;
+    }
+    const moved = u.speaker !== was.speaker && (was.speaker === null || mergedInto.get(was.speaker) !== u.speaker);
+    if (u.text.trim() !== was.text) change(u.startMs, `Corrected: ${now} It was: ${moved && was.who !== null ? `${was.who}: ` : ""}${was.text}`);
+    else if (moved) change(u.startMs, `Moved: ${now}${was.who === null ? "" : ` It was ${was.who}'s.`}`);
+  }
+  for (const [id, was] of told) if (was.line !== "" && !isTold(byId.get(id), was)) change(was.startMs, `Deleted: ${was.line}`);
+  changes.sort((a, b) => a.at - b.at);
+  return { said, events: [...events, ...changes.map((c) => c.event)] };
+}
+
+/**
  * A later turn of the thread: what was said since the last one, then what changed meanwhile, one event a line (the
- * events are #434's: corrections, renames, the user's edits to the notes). "" with neither.
+ * transcript's changes, changesSince's; the user's edits to the notes). "" with neither.
  */
 export function laterTurn(said: Said[], events: string[] = []): string {
   const parts: string[] = [];

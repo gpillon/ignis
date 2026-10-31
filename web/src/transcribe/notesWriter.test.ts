@@ -6,9 +6,22 @@ import { EMPTY_CONTEXT } from "./context.ts";
 import { LIVE_GAP_MS, noNotes, type Notes, RUNNING_NOTES } from "./notes.ts";
 import { NotesWriter, type Written } from "./notesWriter.ts";
 import { recapTask } from "./recap.ts";
+import { acceptRewrite } from "./rewrite.ts";
 import { runningTask } from "./running.ts";
 import { contextBlock } from "./taskContext.ts";
-import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
+import {
+  addUtterance,
+  createTranscript,
+  editText,
+  fixUtterances,
+  mergeSpeakers,
+  moveUtterance,
+  removeUtterance,
+  renameSpeaker,
+  restoreUtterance,
+  splitUtterance,
+  type Transcript,
+} from "./transcript.ts";
 
 // The notes' writer (spec #428, "Running notes: the notes thread"): one
 // append-only thread with the text model per Transcript, its four tools
@@ -316,6 +329,129 @@ describe("starting the thread again", () => {
       { id: "N3", section: "Figures & dates", text: "40k: il tetto.", author: "user" },
       { id: "N6", section: "Now", text: "Le date.", author: "model" },
     ]);
+  });
+});
+
+describe("what changed in the transcript since the last update", () => {
+  /** A call of two voices taking turns, Speaker 1 and Speaker 2: utterance `i + 1` is said at `5i` seconds. */
+  function voices(n: number): Transcript {
+    let t = { ...createTranscript(1), title: "27 Oct 15:42 · Call" };
+    for (let i = 0; i < n; i++) t = addUtterance(t, { stream: "s", startMs: i * 5_000, endMs: i * 5_000 + 2_000, text: `Frase ${i}.`, voice: { kind: "speaker", index: i % 2 } });
+    return t;
+  }
+
+  /** The turn the update after the first one appended: what it told the model. */
+  async function laterTurnOf(first: Transcript, then: Transcript): Promise<string | undefined> {
+    const { w, fake, held } = writer([{}, {}]);
+    await w.write(held(first), "work", null);
+    await w.write(held(then), "work", null);
+    expect(turnsOf(fake.asked, 1)).toHaveLength(3);
+    return turnsOf(fake.asked, 1).at(-1)?.content;
+  }
+
+  it("tells an utterance edited, with its time and its new text, after what was said since", async () => {
+    const edited = editText(voices(4), 2, "Frase uno, corretta.");
+    expect(await laterTurnOf(voices(3), edited)).toBe("Said since [00:15]:\n[00:15] Speaker 2: Frase 3.\n\nChanged since:\n- Corrected: [00:05] Speaker 2: Frase uno, corretta. It was: Frase 1.");
+    // The running task says what the block is, in the system block every request of the thread carries.
+    expect(runningTask("work")).toContain(
+      "- Each user turn brings what was said since the last one and, under Changed since, what the user changed in the transcript meanwhile: an utterance corrected, moved to another speaker, split, deleted or put back, a speaker renamed or merged into another.",
+    );
+  });
+
+  it("tells each utterance an accepted fix changed, and one Rewrite took, as corrected", async () => {
+    const fixed = fixUtterances(voices(3), "Frase", "Fase", [1, 3]);
+    expect(await laterTurnOf(voices(3), fixed)).toBe("Changed since:\n- Corrected: [00:00] Speaker 1: Fase 0. It was: Frase 0.\n- Corrected: [00:10] Speaker 1: Fase 2. It was: Frase 2.");
+    const rewritten = acceptRewrite(voices(3), 3, "Frase due, riscritta.");
+    expect(await laterTurnOf(voices(3), rewritten)).toBe("Changed since:\n- Corrected: [00:10] Speaker 1: Frase due, riscritta. It was: Frase 2.");
+  });
+
+  it("tells an utterance moved to another speaker, and whose it was", async () => {
+    expect(await laterTurnOf(voices(3), moveUtterance(voices(3), 2, 1))).toBe("Changed since:\n- Moved: [00:05] Speaker 1: Frase 1. It was Speaker 2's.");
+    // Moved and edited both: one event, with the line it was.
+    const both = editText(moveUtterance(voices(3), 2, 1), 2, "Frase uno.");
+    expect(await laterTurnOf(voices(3), both)).toBe("Changed since:\n- Corrected: [00:05] Speaker 1: Frase uno. It was: Speaker 2: Frase 1.");
+  });
+
+  it("tells an utterance deleted, or its text emptied, by the line it was", async () => {
+    expect(await laterTurnOf(voices(3), removeUtterance(voices(3), 2))).toBe("Changed since:\n- Deleted: [00:05] Speaker 2: Frase 1.");
+    expect(await laterTurnOf(voices(3), editText(voices(3), 2, " "))).toBe("Changed since:\n- Deleted: [00:05] Speaker 2: Frase 1.");
+  });
+
+  it("tells an utterance put back once its deletion was told, and nothing when the Undo came before the update", async () => {
+    const { w, fake, held } = writer([{}, {}, {}]);
+    const t = voices(3);
+    await w.write(held(t), "work", null);
+    const gone = removeUtterance(t, 2);
+    await w.write(held(gone), "work", null);
+    await w.write(held(restoreUtterance(gone, t.utterances[1])), "work", null);
+    expect(turnsOf(fake.asked, 2).at(-1)?.content).toBe("Changed since:\n- Put back: [00:05] Speaker 2: Frase 1.");
+    // Deleted and put back between two updates: nothing changed.
+    await w.write(held(restoreUtterance(removeUtterance(voices(3), 3), t.utterances[2])), "work", null);
+    expect(fake.asked).toHaveLength(3);
+  });
+
+  it("tells an utterance split as one change, its halves with their times; a split of one not told yet is said", async () => {
+    const longer = addUtterance(voices(2), { stream: "s", startMs: 10_000, endMs: 12_000, text: "Il budget è 40k. Per me va bene.", voice: { kind: "speaker", index: 0 } });
+    const split = splitUtterance(longer, 3, 17, 2);
+    expect(await laterTurnOf(longer, split)).toBe("Changed since:\n- Split: [00:10] Speaker 1: Il budget è 40k. | [~00:11] Speaker 2: Per me va bene.");
+    // Split again, its second half in two more: still one change.
+    const thrice = splitUtterance(split, 4, 7, 1);
+    expect(await laterTurnOf(longer, thrice)).toBe("Changed since:\n- Split: [00:10] Speaker 1: Il budget è 40k. | [~00:11] Speaker 2: Per me | [~00:11] Speaker 1: va bene.");
+    expect(await laterTurnOf(voices(2), split)).toBe("Said since [00:10]:\n[00:10] Speaker 1: Il budget è 40k.\n[~00:11] Speaker 2: Per me va bene.\n");
+  });
+
+  it("tells a speaker renamed as one change, and leaves the notes' lines to the model", async () => {
+    const notes: Notes = { ...noNotes("work"), lines: [{ id: "N1", section: "People", text: "Speaker 2: acquisti.", author: "model" }], nextId: 2, writtenAs: "work", covered: 3, writtenAt: 500 };
+    const { w, fake, page, held } = writer([{}, {}]);
+    await w.write(held({ ...voices(3), notes }), "work", null);
+    await w.write(held(renameSpeaker(voices(4), 2, "Anna")), "work", null);
+    expect(turnsOf(fake.asked, 1).at(-1)?.content).toBe("Said since [00:15]:\n[00:15] Anna: Frase 3.\n\nChanged since:\n- Renamed: Speaker 2, heard from [00:05], is Anna.");
+    // The page never puts the new name in a line: the model does, through its tools.
+    expect(page.get(1)?.lines).toEqual(notes.lines);
+  });
+
+  it("tells a speaker merged into another as one change, and an utterance of theirs moved elsewhere on its own", async () => {
+    const t = voices(5);
+    expect(await laterTurnOf(t, mergeSpeakers(t, 2, 1))).toBe("Changed since:\n- Merged: Speaker 2, heard from [00:05], is Speaker 1.");
+    const elsewhere = mergeSpeakers(moveUtterance(t, 4, "new"), 2, 1);
+    expect(await laterTurnOf(t, elsewhere)).toBe("Changed since:\n- Merged: Speaker 2, heard from [00:05], is Speaker 1.\n- Moved: [00:15] Speaker 3: Frase 3. It was Speaker 2's.");
+    // Both renamed, then merged: each told by the name the model knows them by.
+    const named = mergeSpeakers(renameSpeaker(renameSpeaker(t, 1, "Anna"), 2, "Bea"), 2, 1);
+    expect(await laterTurnOf(t, named)).toBe("Changed since:\n- Renamed: Speaker 1, heard from [00:00], is Anna.\n- Merged: Speaker 2, heard from [00:05], is Anna.");
+  });
+
+  it("tells a change made while an update runs in the update after it", async () => {
+    const { w, fake, held } = writer([{ hold: true }, {}]);
+    const t = voices(3);
+    const updating = w.write(held(t), "work", null);
+    // The user corrects while the request is under way, and presses Update notes: the update goes on as it started.
+    const edited = editText(t, 1, "Frase zero, corretta.");
+    await w.write(held(edited), "work", null);
+    expect(fake.asked).toHaveLength(1);
+    fake.release();
+    await updating;
+    await w.write(held(edited), "work", null);
+    expect(turnsOf(fake.asked, 1).at(-1)?.content).toBe("Changed since:\n- Corrected: [00:00] Speaker 1: Frase zero, corretta. It was: Frase 0.");
+  });
+
+  it("starts the thread again from the transcript as it stands: a change before a restart is in its first turn, and not told again", async () => {
+    const { w, fake, held } = writer([{ events: [prompt(RUNNING_NOTES.restartTokens + 1)] }, {}, {}]);
+    await w.write(held(voices(3)), "work", null);
+    const edited = renameSpeaker(editText(voices(3), 2, "Frase uno, corretta."), 2, "Anna");
+    await w.write(held(edited), "work", null);
+    expect(turnsOf(fake.asked, 1)).toHaveLength(1);
+    expect(turnsOf(fake.asked, 1)[0].content).toContain("[00:05] Anna: Frase uno, corretta.\n");
+    expect(turnsOf(fake.asked, 1)[0].content).not.toContain("Changed since");
+    const next = addUtterance(edited, { stream: "s", startMs: 15_000, endMs: 17_000, text: "Frase 3.", voice: { kind: "speaker", index: 1 } });
+    await w.write(held(next), "work", null);
+    expect(turnsOf(fake.asked, 2).at(-1)?.content).toBe("Said since [00:15]:\n[00:15] Anna: Frase 3.\n");
+  });
+
+  it("tells the last utterance deleted apart from a new one heard under its id", async () => {
+    const gone = removeUtterance(voices(3), 3);
+    const next = addUtterance(gone, { stream: "s", startMs: 15_000, endMs: 17_000, text: "Nuova.", voice: { kind: "speaker", index: 0 } });
+    expect(next.utterances.at(-1)?.id).toBe(3);
+    expect(await laterTurnOf(voices(3), next)).toBe("Said since [00:15]:\n[00:15] Speaker 1: Nuova.\n\nChanged since:\n- Deleted: [00:10] Speaker 1: Frase 2.");
   });
 });
 
