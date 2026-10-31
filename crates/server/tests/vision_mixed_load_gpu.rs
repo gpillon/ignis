@@ -23,7 +23,8 @@
 //!    reservation is the whole pool arrives: the image request — the only
 //!    Agent, so the eviction order's first victim — is snapshotted to
 //!    KV-RAM, restored once the intruder is done, and still describes its
-//!    image.
+//!    image. It decodes alone on either side of its move, so it is held to
+//!    the same request served alone on a fresh load, token for token (#444).
 //!
 //! What HTTP cannot show is read off the request log (`ignis.request.*`),
 //! recorded by a tracing layer: that the evicted and the restored request
@@ -86,6 +87,9 @@ const SWATCH_QUESTION: &str = "This image comes from a batch of flat colour swat
     swatch before the batch can be approved, and the log accepts one lowercase word \
     per swatch. Please look at the swatch shown above and tell me its colour. \
     Answer with one word only.";
+/// Part 3's Agent image request: long enough an answer to be decoding when the
+/// intruder arrives.
+const AGENT_QUESTION: &str = "Describe this image in detail: the digits, their colour, the background.";
 
 // ── the load ────────────────────────────────────────────────────────────────
 
@@ -502,7 +506,7 @@ async fn an_agentic_load_with_images_by_url_keeps_every_lane_sane() {
     let agent = Stream::start(
         h.app(),
         "agent image",
-        image(&number, "Describe this image in detail: the digits, their colour, the background.", 160, "agent"),
+        image(&number, AGENT_QUESTION, 160, "agent"),
     );
     agent.until_tokens(4).await;
     // Its prompt is a few dozen tokens, so its reservation is the whole pool.
@@ -529,4 +533,17 @@ async fn an_agentic_load_with_images_by_url_keeps_every_lane_sane() {
     let agent_drafted = done.iter().find(|e| e.request_id == Some(agents[0])).and_then(|e| e.drafted);
     assert!(agent_drafted.is_some_and(|n| n > 0), "DFlash2 drafted for the restored request: {agent_drafted:?}");
     assert!(done.iter().all(|e| e.drafted.is_some()), "every request ran speculative rounds: {done:?}");
+
+    // GitHub #444: moved for the intruder, the image request generated what
+    // it generates unmoved. A fresh load serves the same request alone: cold
+    // and cut where the moved one was (its capture lends the pages below its
+    // opener, #249), decoding alone as the moved one did on either side of its
+    // move. On this load a repeat would find the moved request's checkpoint in
+    // KV-RAM, short of the restore floor and so neither claimed nor captured
+    // again, and its prefill would not be cut at the opener.
+    drop(h);
+    let Some(h) = harness() else { return };
+    let unmoved = Stream::start(h.app(), "agent image, unmoved", image(&number, AGENT_QUESTION, 160, "agent"));
+    let unmoved = unmoved.finish().await;
+    assert_eq!(unmoved.text, agent.text, "the moved image request generated what it generates unmoved");
 }

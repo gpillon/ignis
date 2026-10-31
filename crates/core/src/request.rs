@@ -24,6 +24,34 @@ use crate::types::{
     ReuseBoundary, SpecCounters, TokenId,
 };
 
+/// Whether a request's prompt-checkpoint capture lends the whole pages below
+/// its generation opener to a **pages-only link** (ADR 0029 as amended
+/// 2026-10-07, GitHub #306), and why: [`Request::link_at_capture`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CaptureLink {
+    /// No loan. The pages below the opener are a prefix the request publishes
+    /// at its opener's page floor (#187) or one it already stands on.
+    #[default]
+    None,
+    /// The load's opener page rides the capture (#306,
+    /// [`crate::compute::ModelFamily::opener_page_rides_capture`]): the
+    /// request publishes nothing at its floor, so its `publish_tokens` is 0,
+    /// and the capture lends the pages instead.
+    OpenerPageRides,
+    /// An image spans the opener's page floor, where no prefix may end
+    /// (GitHub #249, [`RequestInput::image_spans_opener_floor`]), on any load.
+    /// The request keeps the head its floor walked back to and lends the
+    /// pages from there to the opener.
+    ImageSpansFloor,
+}
+
+impl CaptureLink {
+    /// Whether the capture lends at all.
+    pub fn lends(self) -> bool {
+        self != CaptureLink::None
+    }
+}
+
 /// A request in flight in the engine: its lifecycle state, its class (for
 /// admission / backfill), and the decode lane it holds while running.
 #[derive(Debug, Clone)]
@@ -189,13 +217,12 @@ pub struct Request {
     /// [`Request::publish_point`], which also answers whether this request
     /// publishes at all.
     pub publish_tokens: u32,
-    /// Whether this request's capture hands the whole pages below its
-    /// generation opener over as a **pages-only link** (ADR 0029 as amended
-    /// 2026-10-07, GitHub #306) instead of a chained prefix published at a cut
-    /// of its own. Set at submit, on a load whose opener's page rides the
-    /// capture, for a request that can take a prompt checkpoint at all; its
-    /// `publish_tokens` is then 0.
-    pub link_at_capture: bool,
+    /// Whether, and why, this request's capture hands the whole pages below
+    /// its generation opener over as a **pages-only link** (ADR 0029 as
+    /// amended 2026-10-07, GitHub #306) instead of a chained prefix published
+    /// at a cut of its own. Set at submit, for a request that can take a
+    /// prompt checkpoint at all; see [`CaptureLink`].
+    pub link_at_capture: CaptureLink,
     /// Whether this request's sequence lends the pages below its opener to a
     /// pages-only link (GitHub #306): set when the backend captures and either
     /// side counts a loan -- a [`Request::link_at_capture`] request with pages
@@ -275,7 +302,7 @@ impl Request {
             moving: false,
             standalone_tokens: 0,
             publish_tokens: 0,
-            link_at_capture: false,
+            link_at_capture: CaptureLink::None,
             lender: false,
             prefill_progress: 0,
             cancelled: false,
@@ -497,10 +524,10 @@ impl Request {
     /// It is the generation opener the frontend reported, and it is offered
     /// only when the opener falls inside the request's **own first KV page**
     /// — that is, when the whole pages under it are exactly the shared prefix
-    /// the request already holds — or, where the opener's page rides the
-    /// capture ([`Request::link_at_capture`], GitHub #306), when the capture
-    /// can lend the pages between to a pages-only link itself (the branch
-    /// below). That is not a formality: what a later
+    /// the request already holds — or, on a [`Request::link_at_capture`]
+    /// request (GitHub #306, #249), when the capture can lend the pages
+    /// between to a pages-only link itself (the branch below).
+    /// That is not a formality: what a later
     /// claimant shares is those whole pages, and what it copies is the partial
     /// tail page, which has to be a page the publisher owns rather than one
     /// other holders are also writing.
@@ -554,7 +581,7 @@ impl Request {
         // refuses is a claim reaching past the opener's own page, and an opener
         // in the first page of a request standing on nothing -- no whole page
         // below it for a checkpoint to hold.
-        if self.link_at_capture {
+        if self.link_at_capture.lends() {
             let below = opener / page_tokens;
             return if below < self.shared_pages || (below == 0 && self.prefix_entry.is_none()) {
                 0

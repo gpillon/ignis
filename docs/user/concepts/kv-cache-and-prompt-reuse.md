@@ -175,7 +175,12 @@ retained tokens:
   artifact's structural hash, the KV format and the drafter's presence, and a
   mismatch is refused before any byte moves.
 - **An image inside the matched part.** A prefix never ends inside an image; it
-  walks back to before it, and an image's identity is part of the match.
+  walks back to before it, and an image's identity is part of the match. The
+  prompt checkpoint at the opener still forms after a picture, even when a
+  short question puts the opener in the picture's last KV page, so an
+  identical repeat and the conversation's next turn resume there. A
+  multimodal claim always leaves at least one prompt token to prefill, so a
+  prompt that ends exactly at a retained opener is prefilled whole.
 
 `ignis_retained_state_misses_total` counts, by tier and kind, each prefill run
 (a re-queued request counts again) that found nothing retained of that kind

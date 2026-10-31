@@ -329,6 +329,21 @@ only the system block and still names its own colour, and the same colour
 reuses past the image, through a retained checkpoint with prompt reuse on and
 through the sibling prefix cache alone with it off.
 
+Since GitHub #249 a request whose image spans the opener's page floor lends the
+pages below the opener to a pages-only link at its capture on the 27B too
+(ADR 0029). `crates/server/tests/vision_checkpoint_link_gpu.rs`
+holds the claimants standing on that link, which ends inside the picture, to a
+cold prefill split at the same boundaries (the serving chunk set to the first
+turn's opener, the next turn ending at its own): the identical repeat against
+the first turn, and the next turn from the device and back from KV-RAM, token
+for token. An unsplit cold prefill is printed beside them, not asserted. Its
+second test is the common next turn, whose floor lies past the picture: it
+publishes a prefix chained over the link and captures over that, and both it
+and the turn after it, which stands on the chain, are held to a cold prefill.
+There the serving chunk is half a page and every opener the conversation is
+cut at is a multiple of it, so the cold prefill cut every chunk is cut where
+each claimant's whole history was; the test compares the chunks' ends too.
+
 `crates/server/tests/vision_mixed_load_gpu.rs` (GitHub #181) is all of the
 above at once, in the serving shape: one load behind the HTTP router with
 `--vision-enabled`, `--spec-backend dflash2`, prompt reuse on, a 128-token prefill chunk, and
