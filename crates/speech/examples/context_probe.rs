@@ -24,9 +24,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 
-use ignis_speech::text::copies_context;
+use ignis_speech::text::{context_of, copies_context};
 use ignis_speech::vad::{leading_silence, TurnEvent, TurnSettings, Turns, Vad};
-use ignis_speech::{Executor, Features, ModelFiles, SessionTuning, Settings, Threads};
+use ignis_speech::{ContextCopy, Executor, Features, ModelFiles, SessionTuning, Settings, Threads};
 use serde_json::{json, Value};
 
 const RATE: f64 = 16_000.0;
@@ -58,11 +58,10 @@ fn read_wav(path: &str) -> Vec<f32> {
     data.expect("no data chunk").as_chunks::<2>().0.iter().map(|s| i16::from_le_bytes(*s) as f32 / 32768.0).collect()
 }
 
-/// The server's join (spec speech/02): the prompt, then the keywords as one line.
-fn context_of(spec: &Value) -> String {
-    let prompt = spec["prompt"].as_str().unwrap_or("").trim().to_string();
-    let keywords = spec["keywords"].as_array().map(|k| k.iter().filter_map(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).collect::<Vec<_>>().join(", "));
-    [prompt, keywords.unwrap_or_default()].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n")
+/// A context of `--contexts`, joined as the server joins it.
+fn joined(spec: &Value) -> String {
+    let keywords: Vec<String> = spec["keywords"].as_array().map_or(Vec::new(), |k| k.iter().filter_map(Value::as_str).map(str::to_string).collect());
+    context_of(spec["prompt"].as_str(), &keywords)
 }
 
 fn lead(samples: &[f32]) -> Vec<f32> {
@@ -144,13 +143,13 @@ fn rows(paths: &[String]) -> Vec<Value> {
 
 /// What the guard of this build empties of recorded rows: the exact rule, then the defaults.
 fn rescore(paths: &[String], contexts: &serde_json::Map<String, Value>) {
-    let d = Settings::default();
+    let d = ContextCopy::DEFAULT;
     let mut tally: BTreeMap<String, [usize; 3]> = BTreeMap::new();
     for row in rows(paths) {
         let name = row["context"].as_str().unwrap();
-        let (context, text) = (context_of(&contexts[name]), row["text"].as_str().unwrap());
-        let exact = copies_context(&context, text, d.context_copy_words, 0);
-        let near = copies_context(&context, text, d.context_copy_words, d.context_copy_edits);
+        let (context, text) = (joined(&contexts[name]), row["text"].as_str().unwrap());
+        let exact = copies_context(&context, text, ContextCopy { edits: 0, ..d });
+        let near = copies_context(&context, text, d);
         let t = tally.entry(name.to_string()).or_default();
         t[0] += 1;
         t[1] += usize::from(exact);
@@ -160,7 +159,7 @@ fn rescore(paths: &[String], contexts: &serde_json::Map<String, Value>) {
         }
     }
     for (name, [n, exact, near]) in tally {
-        println!("{name}: {n} rows, emptied {exact} with edits 0, {near} with edits {}", d.context_copy_edits);
+        println!("{name}: {n} rows, emptied {exact} with edits 0, {near} with edits {}", d.edits);
     }
 }
 
@@ -197,8 +196,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(args.len(), 2, "DECODER ENCODER");
     let files = ModelFiles { decoder: args[0].clone().into(), encoder: args[1].clone().into() };
     let settings = Settings { threads: Threads::Count(threads), ..Settings::default() };
-    let (run, edits) = (settings.context_copy_words, settings.context_copy_edits);
-    let off = SessionTuning { context_copy_words: 0, ..settings.tuning() };
+    let copy = settings.context_copy;
+    let off = SessionTuning { context_copy: ContextCopy { run: 0, ..copy }, ..settings.tuning() };
     let exec = Executor::new(settings, files, Features::detect());
     exec.load()?;
     let done: HashSet<(String, String)> = std::fs::read_to_string(&out_path)
@@ -210,7 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if only.as_ref().is_some_and(|o| !o.contains(name)) {
             continue;
         }
-        let context = context_of(spec);
+        let context = joined(spec);
         let started = std::time::Instant::now();
         let mut n = 0;
         for (input, start, end, x) in items.iter().filter(|item| !done.contains(&(name.clone(), item.0.clone()))) {
@@ -226,7 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let t = s.commit()?;
-            let copied = copies_context(&context, &t.text, run, edits);
+            let copied = copies_context(&context, &t.text, copy);
             let seconds = (x.len() as f64 / RATE * 100.0).round() / 100.0;
             writeln!(out, "{}", json!({ "context": name, "input": input, "start": start, "end": end, "seconds": seconds, "text": t.text, "language": t.language, "copied": copied }))?;
             n += 1;

@@ -9,7 +9,7 @@ mod common;
 use common::synthetic;
 use ignis_speech::session::DECODE_UNIT;
 use ignis_speech::text::Prompt;
-use ignis_speech::{Availability, Executor, Features, Model, ModelFiles, SessionTuning, Settings, Threads};
+use ignis_speech::{Availability, ContextCopy, Executor, Features, Model, ModelFiles, SessionTuning, Settings, Threads};
 
 fn settings() -> Settings {
     Settings { threads: Threads::Count(2), max_clip_seconds: 60, ..Settings::default() }
@@ -272,9 +272,9 @@ fn a_partial_stops_at_every_step_of_its_decode() {
 fn a_session_holds_the_tuning_it_opened_with() {
     let files = synthetic::pair("tuning");
     let e = exec(&files, Settings { rollback_tokens: 10, unfixed_partials: 2, context_max_tokens: 512, ..settings() });
-    let tuned = SessionTuning { context_max_tokens: 64, rollback_tokens: 3, unfixed_partials: 0, context_copy_words: 4, context_copy_edits: 1 };
+    let tuned = SessionTuning { context_max_tokens: 64, rollback_tokens: 3, unfixed_partials: 0, context_copy: ContextCopy { run: 4, edits: 1 } };
     assert_eq!(e.open_tuned("", None, tuned).unwrap().tuning(), tuned);
-    assert_eq!(e.open("", None).unwrap().tuning(), SessionTuning { context_max_tokens: 512, rollback_tokens: 10, unfixed_partials: 2, context_copy_words: 3, context_copy_edits: 2 });
+    assert_eq!(e.open("", None).unwrap().tuning(), SessionTuning { context_max_tokens: 512, rollback_tokens: 10, unfixed_partials: 2, context_copy: ContextCopy { run: 3, edits: 2 } });
 }
 
 /// Acceptance 19 (Q44): a commit is a unit of work a step, so the server's one worker runs other
