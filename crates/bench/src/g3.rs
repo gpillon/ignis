@@ -1089,7 +1089,8 @@ pub struct G3Config {
 /// generated together before the first is sent (GitHub #426) and numbered
 /// across the run ([`ttft::generate_run_prompts`]): no prompt starts with
 /// another's content, so an engine with prompt reuse has nothing an
-/// earlier cell left behind to serve a later cell's sample from. A set that
+/// earlier cell left behind to serve a later cell's sample from, and a run
+/// whose prompts would share more is refused before it starts. A set that
 /// cannot be generated fails its own cell.
 struct RunPrompts {
     c1: Result<PromptSet, String>,
@@ -1100,28 +1101,31 @@ struct RunPrompts {
 
 impl RunPrompts {
     /// The prompts of a run measured as `cfg` says, cut from `corpus` when
-    /// one is given and grown by the filler generator otherwise.
-    fn generate(template: &dyn PromptTemplate, corpus: Option<&[u32]>, cfg: &G3Config) -> Self {
+    /// one is given and grown by the filler generator otherwise, or why the
+    /// run cannot start.
+    fn generate(template: &dyn PromptTemplate, corpus: Option<&[u32]>, cfg: &G3Config) -> Result<Self, String> {
         let throughput = cfg.throughput.prompt_tokens as usize;
         let [c1, c4, itl_lanes, itl_prefillers] = ttft::generate_run_prompts(
             template,
             corpus,
             [
-                PromptSetSpec { count: C1_CONCURRENCY, target_tokens: throughput, suffix: "" },
-                PromptSetSpec { count: C4_CONCURRENCY, target_tokens: throughput, suffix: "" },
+                PromptSetSpec { label: "C=1", count: C1_CONCURRENCY, target_tokens: throughput, suffix: "" },
+                PromptSetSpec { label: "C=4", count: C4_CONCURRENCY, target_tokens: throughput, suffix: "" },
                 PromptSetSpec {
+                    label: "ITL lane",
                     count: cfg.itl.decode_lanes,
                     target_tokens: cfg.itl.decode_prompt_tokens as usize,
                     suffix: ITL_DECODE_INSTRUCTION,
                 },
                 PromptSetSpec {
+                    label: "ITL prefiller",
                     count: cfg.itl.prefill_count,
                     target_tokens: cfg.itl.prefill_prompt_tokens as usize,
                     suffix: "",
                 },
             ],
-        );
-        Self { c1, c4, itl_lanes, itl_prefillers }
+        )?;
+        Ok(Self { c1, c4, itl_lanes, itl_prefillers })
     }
 }
 
@@ -1133,7 +1137,8 @@ impl RunPrompts {
 /// different prompt source than the others.
 ///
 /// The cells' four prompt sets are the run's ([`RunPrompts`], GitHub
-/// #426), generated before the first request is sent.
+/// #426), generated before the first request is sent; a run they refuse
+/// fails all three cells with that refusal.
 pub fn measure(
     ep: &dyn Endpoint,
     template: &dyn PromptTemplate,
@@ -1142,7 +1147,7 @@ pub fn measure(
     cfg: &G3Config,
 ) -> Record {
     let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path)).transpose();
-    let (c1, c4, itl) = match corpus.map(|bank| RunPrompts::generate(template, bank.as_deref(), cfg)) {
+    let (c1, c4, itl) = match corpus.and_then(|bank| RunPrompts::generate(template, bank.as_deref(), cfg)) {
         Err(error) => (
             ThroughputCell::failed(
                 cfg.throughput.prompt_tokens,
@@ -2117,6 +2122,40 @@ mod tests {
         assert!(record.itl.error.is_some());
     }
 
+    /// GitHub #426: a chat template whose own tokens fill a whole 64-token
+    /// KV page puts that page at the head of every prompt, where prompt
+    /// reuse serves it to every request after the first; the run refuses to
+    /// start, naming two prompts, and sends nothing.
+    #[test]
+    fn a_run_whose_prompts_share_a_whole_kv_page_refuses_to_start() {
+        let template = MockTemplate { header: 64, footer: 0 };
+        let cfg = G3Config {
+            label: "ignis".into(),
+            profile: "test-profile".into(),
+            artifact: "mock.ninfer".into(),
+            session: "S1".into(),
+            throughput: ThroughputSpec { prompt_tokens: 96, max_tokens: 8 },
+            itl: ItlConfig {
+                prefill_prompt_tokens: 100,
+                prefill_max_tokens: 4,
+                prefill_count: 2,
+                decode_prompt_tokens: 80,
+                decode_max_tokens: 4,
+                decode_lanes: 1,
+            },
+            corpus: None,
+        };
+        let record = measure(&MockEndpoint::new(), &template, "mock-engine".into(), "http://mock".into(), &cfg);
+
+        for error in [&record.c1.error, &record.c4.error, &record.itl.error] {
+            let error = error.as_deref().expect("every cell refused");
+            assert!(error.contains("C=1 prompt 0") && error.contains("C=4 prompt 0"), "{error}");
+            assert!(error.contains("KV page"), "{error}");
+        }
+        let sent = record.c1.samples.len() + record.c4.samples.len() + record.itl.prefillers.len();
+        assert_eq!(sent, 0, "nothing is sent");
+    }
+
     // ── a whole run under prompt reuse (GitHub #426) ───────────────────────
 
     /// A stand-in for an engine that serves any repeated prefix from a
@@ -2307,8 +2346,13 @@ mod tests {
     #[test]
     fn a_whole_run_cut_from_a_corpus_stays_cold_under_prompt_reuse() {
         let template = CorpusMock { header: CHAT_HEADER, footer: CHAT_FOOTER };
-        // As long as the reference's own bank, and with no period in it.
-        let bank: Vec<String> = (0..65_536u64).map(|i| (i * 2_654_435_761 % 700_000 + 100).to_string()).collect();
+        // As long as the reference's own bank and, like it, tiled from a
+        // shorter one: its period is ten of the run's 19 evenly spaced
+        // windows (65,536 / 19 = 3,449 ids apart), so nine pairs of windows
+        // of two cells start on the same ids, C=1's and the second
+        // prefiller's among them, and no two windows of one cell do.
+        const PERIOD: u64 = 10 * 3_449;
+        let bank: Vec<String> = (0..65_536u64).map(|i| (i % PERIOD * 35_761 % 700_000 + 100).to_string()).collect();
         let path = std::env::temp_dir().join(format!("ignis-bench-g3-session-{}.ids", std::process::id()));
         std::fs::write(&path, bank.join(" ")).expect("write the bank");
         let cfg = production_run(Some(path.clone()));

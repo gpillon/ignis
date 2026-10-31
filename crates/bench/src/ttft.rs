@@ -369,9 +369,10 @@ pub fn generate_cell_prompts_with_suffix(
 
 /// One of a run's prompt sets, as [`generate_run_prompts`] is asked for it:
 /// `count` prompts of exactly `target_tokens` post-template tokens, each
-/// ending with `suffix` (empty: none).
+/// ending with `suffix` (empty: none), named `label` in a refusal.
 #[derive(Debug, Clone, Copy)]
 pub struct PromptSetSpec<'a> {
+    pub label: &'a str,
     pub count: usize,
     pub target_tokens: usize,
     pub suffix: &'a str,
@@ -388,22 +389,73 @@ pub struct PromptSetSpec<'a> {
 /// sent the first content of an earlier set's prompt 0, and an engine with
 /// prompt reuse served it warm. So the prompts are numbered across the run,
 /// each set from where the previous one ended, and every prompt starts with
-/// its own nonce (or corpus offset).
+/// its own nonce (or corpus offset); then the run is proven
+/// ([`prove_run_divergence`]) and refused, naming two prompts, where it
+/// does not hold.
 pub fn generate_run_prompts<const N: usize>(
     template: &dyn PromptTemplate,
     corpus: Option<&[u32]>,
     sets: [PromptSetSpec<'_>; N],
-) -> [Result<PromptSet, String>; N] {
+) -> Result<[Result<PromptSet, String>; N], String> {
     let total = sets.iter().map(|set| set.count).sum();
     let mut first = 0;
-    sets.map(|set| {
+    let mut earlier: Vec<Vec<u32>> = Vec::with_capacity(total);
+    let generated = sets.map(|set| {
         let numbering = Numbering { first, count: set.count, total };
         first += set.count;
-        match corpus {
-            Some(ids) => cut_corpus_prompts(template, ids, set.target_tokens, set.suffix, numbering),
+        let generated = match corpus {
+            Some(ids) => cut_corpus_prompts(template, ids, set.target_tokens, set.suffix, numbering, &earlier),
             None => generate_numbered_prompts(template, set.target_tokens, set.suffix, numbering),
+        };
+        if let Ok(set) = &generated {
+            earlier.extend(set.tokens.iter().cloned());
         }
-    })
+        generated
+    });
+    let overhead = template.encode_user_message("")?.len();
+    let proven: Vec<(&str, &PromptSet)> =
+        sets.iter().zip(&generated).filter_map(|(spec, set)| Some((spec.label, set.as_ref().ok()?))).collect();
+    prove_run_divergence(&proven, overhead)?;
+    Ok(generated)
+}
+
+/// A KV page in tokens (GLOSSARY: KV page), 64 on both engines: prompt
+/// reuse serves whole pages, so two prompts that share less than one share
+/// nothing it can serve but a prompt checkpoint.
+const KV_PAGE_TOKENS: usize = 64;
+
+/// The divergence proof across a run's prompt sets (GitHub #426), each
+/// named by its label: no two prompts of the run share more leading tokens
+/// than the chat template's own `overhead`, nor a whole [`KV_PAGE_TOKENS`]
+/// page of them, so prompt reuse has nothing of one to serve another from.
+/// A set's own proof ([`prove_divergence`]) holds within it, and cannot see
+/// the others.
+fn prove_run_divergence(sets: &[(&str, &PromptSet)], overhead: usize) -> Result<(), String> {
+    let prompts: Vec<(String, &[u32])> = sets
+        .iter()
+        .flat_map(|(label, set)| {
+            set.tokens.iter().enumerate().map(move |(index, ids)| (format!("{label} prompt {index}"), ids.as_slice()))
+        })
+        .collect();
+    for (i, (a, a_ids)) in prompts.iter().enumerate() {
+        for (b, b_ids) in &prompts[i + 1..] {
+            let shared = common_prefix_len(a_ids, b_ids);
+            if shared > overhead {
+                return Err(format!(
+                    "{a} and {b} share {shared} leading tokens, more than the chat template's \
+                     {overhead}: they share content, which prompt reuse can serve one of them from"
+                ));
+            }
+            if shared >= KV_PAGE_TOKENS {
+                return Err(format!(
+                    "{a} and {b} share {shared} leading tokens of the chat template's own, a whole \
+                     {KV_PAGE_TOKENS}-token KV page, which prompt reuse can serve every prompt after \
+                     the first"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Where one set's prompts sit among the prompts of its run: the run's
@@ -719,19 +771,22 @@ pub fn generate_cell_prompts_from_corpus_with_suffix(
     count: usize,
     suffix: &str,
 ) -> Result<PromptSet, String> {
-    cut_corpus_prompts(template, corpus, target_tokens, suffix, Numbering::alone(count))
+    cut_corpus_prompts(template, corpus, target_tokens, suffix, Numbering::alone(count), &[])
 }
 
 /// [`generate_cell_prompts_from_corpus_with_suffix`] for a set numbered as
 /// `numbering` says (GitHub #426): the windows are spread over all the
 /// run's prompts, `bank / total` ids apart, and the set's start at its
-/// first prompt's, so no two sets cut the same window.
+/// first prompt's, so no two sets cut the same window; and a window that
+/// starts with the content of one of the run's `earlier` prompts, or of
+/// this set's, is passed over for another.
 fn cut_corpus_prompts(
     template: &dyn PromptTemplate,
     corpus: &[u32],
     target_tokens: usize,
     suffix: &str,
     numbering: Numbering,
+    earlier: &[Vec<u32>],
 ) -> Result<PromptSet, String> {
     let count = numbering.count;
     if count == 0 {
@@ -742,9 +797,11 @@ fn cut_corpus_prompts(
     }
     // One window per prompt of the run, rotated through the bank:
     // consecutive prompts start `bank/total` ids apart, so their first
-    // content tokens differ (a bank periodicity that aligns two windows is
-    // caught by the divergence proof below, and the cell then fails — never
-    // measures a warm prefix).
+    // content tokens differ. A bank tiled from a shorter one, as the
+    // reference's is, can align two windows anyway: the later one moves on
+    // to the next rotation, and one that no rotation frees is caught by the
+    // divergence proofs, which fail the cell or the run — never measure a
+    // warm prefix.
     let stride = corpus.len() / numbering.total;
     if stride == 0 {
         return Err(format!(
@@ -766,8 +823,11 @@ fn cut_corpus_prompts(
     for index in 0..count {
         let number = numbering.first + index;
         let offset = ((number as u64) * (stride as u64)) % corpus.len() as u64;
+        let fresh = |window: &[u32]| {
+            earlier.iter().chain(&tokens).all(|prompt| common_prefix_len(window, prompt) <= overhead)
+        };
         let (prompt, ids) =
-            land_corpus_window(template, corpus, offset as usize, target_tokens, suffix)?;
+            land_corpus_window(template, corpus, offset as usize, target_tokens, suffix, &fresh)?;
         prompts.push(prompt);
         tokens.push(ids);
     }
@@ -786,12 +846,18 @@ fn cut_corpus_prompts(
 /// window content rotates through the bank) changes which ids fall in it,
 /// so a rotation that skips the target can land where another skips.
 /// After a bounded number of rotations the cell is refused, not drifted.
+///
+/// A landing whose ids are not `fresh` (another prompt of the run starts
+/// with its content, GitHub #426) is passed over for the next rotation's,
+/// and returned only when no rotation lands a fresh one, for the
+/// divergence proofs to refuse.
 fn land_corpus_window(
     template: &dyn PromptTemplate,
     corpus: &[u32],
     offset: usize,
     target_tokens: usize,
     suffix: &str,
+    fresh: &dyn Fn(&[u32]) -> bool,
 ) -> Result<(String, Vec<u32>), String> {
     // A few candidate lengths around the search position (the round-trip
     // drift is a handful of tokens even at 32K), and a few window
@@ -801,7 +867,8 @@ fn land_corpus_window(
     const ROTATIONS: usize = 8;
     let len = corpus.len();
     let mut last: (usize, usize, usize) = (1, 0, 0); // (lo, under, over)
-    for rotation in 0..ROTATIONS {
+    let mut stale = None;
+    'rotations: for rotation in 0..ROTATIONS {
         let off = (offset + rotation) % len;
         // Decode the `n`-id window at `off` (wrapping) to prompt text.
         let cut = |n: usize| -> Result<(Vec<u32>, String), String> {
@@ -847,10 +914,17 @@ fn land_corpus_window(
             if actual(n)? == target_tokens {
                 let (_, text) = cut(n)?;
                 let tokens = template.encode_user_message(&text)?;
-                return Ok((text, tokens));
+                if fresh(&tokens) {
+                    return Ok((text, tokens));
+                }
+                stale.get_or_insert((text, tokens));
+                continue 'rotations;
             }
         }
         last = (lo, actual(lo)?, actual(lo + 1)?);
+    }
+    if let Some(landing) = stale {
+        return Ok(landing);
     }
     // Every bounded rotation missed: refuse the cell rather than measure
     // a length the engine will not compute (the word-growth fallback is
@@ -1912,6 +1986,46 @@ mod tests {
         for ids in &set.tokens {
             assert_eq!(ids.len(), 18, "each prompt is exactly the claimed length");
         }
+    }
+
+    /// A bank of `len` ids tiled from its first `period`, as the reference's
+    /// `bench_corpus.ids` is tiled from a curated bank: windows a period
+    /// apart hold the same ids, and no shorter shift repeats one.
+    fn self_tiled_bank(len: usize, period: usize) -> Vec<u32> {
+        (0..len).map(|i| ((i % period) as u64 * 35_761 % 700_000) as u32 + 100).collect()
+    }
+
+    /// GitHub #426: on a self-tiled bank whose period puts a window of one
+    /// set where another set's starts, the corpus path cuts the later set a
+    /// window of its own, and no two prompts of the run share content.
+    #[test]
+    fn a_run_cut_from_a_self_tiled_bank_shares_no_content_across_its_sets() {
+        let template = CorpusMock::exact();
+        // Ten prompts 25 ids apart over a period of 125: the second set's
+        // windows start where the first set's do.
+        let bank = self_tiled_bank(250, 125);
+        let set = |label, count| PromptSetSpec { label, count, target_tokens: 40, suffix: "" };
+        let sets = generate_run_prompts(&template, Some(&bank), [set("first", 5), set("second", 5)])
+            .expect("the run's proof holds");
+        let tokens: Vec<&Vec<u32>> = sets.iter().flat_map(|set| &set.as_ref().expect("cut").tokens).collect();
+        for (i, a) in tokens.iter().enumerate() {
+            for b in &tokens[i + 1..] {
+                assert_eq!(common_prefix_len(a, b), template.header, "the header and nothing more");
+            }
+        }
+    }
+
+    /// GitHub #426: two sets whose own proofs hold, one prompt each, but
+    /// whose prompts are the same: a run of them is refused, naming both.
+    #[test]
+    fn a_run_whose_sets_share_content_is_refused_naming_both_prompts() {
+        let template = CorpusMock::exact();
+        // One id throughout: every window of it, at any rotation, is the same.
+        let bank = vec![7u32; 256];
+        let one = |label| PromptSetSpec { label, count: 1, target_tokens: 64, suffix: "" };
+        let err = generate_run_prompts(&template, Some(&bank), [one("C=1"), one("ITL prefiller")])
+            .expect_err("a run whose prompts share content must be refused");
+        assert!(err.contains("C=1 prompt 0") && err.contains("ITL prefiller prompt 0"), "{err}");
     }
 
     #[test]
