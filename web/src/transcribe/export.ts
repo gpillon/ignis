@@ -16,8 +16,21 @@ export function clock(ms: number): string {
   return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${two(m)}:${two(s)}`;
 }
 
+/**
+ * `mm:ss` in minutes from the start, past the hour too (`64:09`): how the notes thread tells the model a moment, which
+ * keeps it from reading an hour as minutes (#429).
+ */
+export function minutesClock(ms: number): string {
+  const seconds = Math.floor(ms / 1_000);
+  return `${two(Math.floor(seconds / 60))}:${two(seconds % 60)}`;
+}
+
+/** `text` with each `[mm:ss]` past the hour, as the notes thread's model writes it, as `[h:mm:ss]`. */
+export const hoursClocks = (text: string): string =>
+  text.replace(/\[(~?)(\d{2,}):(\d{2})\]/g, (whole, approx: string, m: string, s: string) => (Number(m) < 60 ? whole : `[${approx}${clock((Number(m) * 60 + Number(s)) * 1_000)}]`));
+
 /** An utterance's start as a line shows it: `~` when a split guessed it. */
-export const startOf = (u: Utterance) => `${u.approxStart ? "~" : ""}${clock(u.startMs)}`;
+export const startOf = (u: Utterance, time: (ms: number) => string = clock) => `${u.approxStart ? "~" : ""}${time(u.startMs)}`;
 
 /** A cue's time: `hh:mm:ss,mmm` for SubRip, `hh:mm:ss.mmm` for WebVTT. */
 function cueTime(ms: number, separator: "," | "."): string {
@@ -28,33 +41,33 @@ function cueTime(ms: number, separator: "," | "."): string {
   return `${two(h)}:${two(m)}:${two(s)}${separator}${String(whole % 1_000).padStart(3, "0")}`;
 }
 
+/** The name an utterance of `t`'s speaker has now; `null` with no speaker. */
+export function speakerOf(t: Transcript): (u: Utterance) => string | null {
+  const names = new Map(t.speakers.map((s) => [s.id, s.name]));
+  return (u) => (u.speaker === null ? null : (names.get(u.speaker) ?? null));
+}
+
 /** The utterances worth writing, each with its speaker's name; `null` with no speakers. */
 function lines(t: Transcript): { u: Utterance; text: string; speaker: string | null }[] {
-  const names = new Map(t.speakers.map((s) => [s.id, s.name]));
-  return t.utterances
-    .map((u) => ({ u, text: u.text.trim(), speaker: u.speaker === null ? null : (names.get(u.speaker) ?? null) }))
-    .filter((line) => line.text !== "");
+  const speaker = speakerOf(t);
+  return t.utterances.map((u) => ({ u, text: u.text.trim(), speaker: speaker(u) })).filter((line) => line.text !== "");
 }
 
-/** "Started 25 Oct 2026, 15:42": a live listening's wall-clock start. */
-export function startedLine(startedAt: number): string {
+/** "25 Oct 2026, 15:42": a live listening's wall-clock start. */
+export function startedOn(startedAt: number): string {
   const at = new Date(startedAt);
   const { day, time } = dayAndTime(at);
-  return `Started ${day} ${at.getFullYear()}, ${time}`;
+  return `${day} ${at.getFullYear()}, ${time}`;
 }
 
-/** The clipboard's and `.txt`'s: `[mm:ss] Speaker: text`, one line per utterance. */
-export function toText(t: Transcript): string {
+/** "Started 25 Oct 2026, 15:42". */
+export const startedLine = (startedAt: number): string => `Started ${startedOn(startedAt)}`;
+
+/** The clipboard's and `.txt`'s: `[mm:ss] Speaker: text`, one line per utterance; `time` writes the moment. */
+export function toText(t: Transcript, time: (ms: number) => string = clock): string {
   return lines(t)
-    .map(({ u, text, speaker }) => `[${startOf(u)}] ${speaker === null ? "" : `${speaker}: `}${text}\n`)
+    .map(({ u, text, speaker }) => `[${startOf(u, time)}] ${speaker === null ? "" : `${speaker}: `}${text}\n`)
     .join("");
-}
-
-/** `.md`, and what Open in chat seeds the composer with: the title and the start, then `**Speaker** (mm:ss): text`. */
-export function toMarkdown(t: Transcript): string {
-  const header = [`# ${t.title}`, ...(t.startedAt === null ? [] : [startedLine(t.startedAt)])];
-  const body = lines(t).map(({ u, text, speaker }) => `${speaker === null ? "" : `**${speaker}** `}(${startOf(u)}): ${text}`);
-  return `${[...header, ...body].join("\n\n")}\n`;
 }
 
 /** `.srt`: a numbered cue per utterance, from its start to its end, the speaker before the text. */

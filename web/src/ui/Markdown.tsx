@@ -120,3 +120,21 @@ export const Markdown = memo(function Markdown({ text, streaming = false }: { te
     </div>
   );
 });
+
+/** One line's inline Markdown, unwrapped: no paragraph around it. */
+const inline: Components = { ...components, p: ({ children }) => <>{children}</> };
+
+/**
+ * One line of Markdown with no block around it, for a list item drawn by the page (a note's line): its emphasis,
+ * code, links and formulas. A list, heading or quote marker it starts with stays text.
+ */
+export const InlineMarkdown = memo(function InlineMarkdown({ text }: { text: string }) {
+  const line = normalizeMath(text)
+    .replace(/^(\s*\d+)([.)])(?=\s)/, "$1\\$2")
+    .replace(/^(\s*)([#>*+-])(?=\s)/, "$1\\$2");
+  return (
+    <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={inline}>
+      {line}
+    </ReactMarkdown>
+  );
+});

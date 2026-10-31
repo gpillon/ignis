@@ -1,8 +1,9 @@
 import { useSyncExternalStore } from "react";
 import { abortableSleep, isEngineFull } from "../api/busy.ts";
 import type { ConversationRequest, Settings } from "../api/request.ts";
+import type { ChunkEvent } from "../api/sse.ts";
 import { streamChat, type StreamOptions, type StreamResult } from "../api/stream.ts";
-import { toText } from "./export.ts";
+import { linesWithImages } from "./contextImages.ts";
 import type { Transcript } from "./transcript.ts";
 
 // What the Transcribe view asks the text model (spec speech/07, Q125, Q134):
@@ -18,7 +19,7 @@ import type { Transcript } from "./transcript.ts";
 
 export const ASSIST_SYSTEM = [
   "You help someone with a conversation while it is being transcribed. The user message holds its transcript; your task follows.",
-  "The transcript comes from speech recognition, one utterance a line: `[mm:ss] Speaker: text`. Expect misheard words. Speakers are labels such as \"Speaker 1\", \"Me\" or \"Others\" unless someone named them; a name said aloud may be a speaker's. The conversation may still be going on.",
+  "The transcript comes from speech recognition, one utterance a line: `[mm:ss] Speaker: text`. Expect misheard words. Speakers are labels such as \"Speaker 1\", \"Me\" or \"Others\" unless someone named them; a name said aloud may be a speaker's. A line `[mm:ss] (image) ...` is a picture the conversation was looking at from that moment, as it was read. The conversation may still be going on.",
   "Use only what the transcript says: never invent names, numbers or outcomes.",
 ].join("\n\n");
 
@@ -28,19 +29,25 @@ const PROMPT_TOKENS = 1_000;
 export const CHARS_PER_TOKEN = 3;
 
 /**
- * The transcript as the model reads it: the title, then the `.txt`. When the whole would not fit `contextLimit` with
- * `answerTokens` to write, the tail that does, and `fromMs` the start of its first utterance.
+ * The transcript as the model reads it: the title, then the `.txt` (`time` writing each moment), each context image
+ * read a line at its moment (contextImages.ts). When the whole would not fit `contextLimit` with `answerTokens` to
+ * write, the tail that does, and `fromMs` the moment of its first line.
  */
-export function transcriptInput(t: Transcript, contextLimit: number | null, answerTokens: number): { content: string; fromMs: number | null } {
+export function transcriptInput(
+  t: Transcript,
+  contextLimit: number | null,
+  answerTokens: number,
+  time?: (ms: number) => string,
+): { content: string; fromMs: number | null } {
   const header = `${t.title}\n\n`;
   const budget = contextLimit === null ? Infinity : Math.max(0, (contextLimit - answerTokens - PROMPT_TOKENS) * CHARS_PER_TOKEN) - header.length;
-  const lines = t.utterances.map((u) => ({ u, line: toText({ ...t, utterances: [u] }) }));
+  const lines = linesWithImages(t, time);
   let used = 0;
   let first = lines.length;
   while (first > 0 && used + lines[first - 1].line.length <= budget) used += lines[--first].line.length;
   const kept = lines.slice(first);
   const cut = kept.length < lines.length && lines.slice(0, first).some((l) => l.line !== "");
-  return { content: header + kept.map((l) => l.line).join(""), fromMs: cut && kept.length > 0 ? kept[0].u.startMs : null };
+  return { content: header + kept.map((l) => l.line).join(""), fromMs: cut && kept.length > 0 ? kept[0].atMs : null };
 }
 
 /** A request: the preamble and the task as the system prompt, the transcript as the user turn. */
@@ -60,9 +67,16 @@ const BUSY_TRIES = 60;
 
 /**
  * One answer of the model, its text as it streams to `onText`; a full engine waited out a second at a time, as an
- * agent's request is. `stopped` once `signal` aborts, whatever came.
+ * agent's request is. `stopped` once `signal` aborts, whatever came. `onEvent` hears every event as it comes (a tool
+ * call, the usage), and `streamId` names the stream a thread of requests continues on the socket.
  */
-export async function askModel(request: ConversationRequest, signal: AbortSignal, deps: AskDeps = {}, onText?: (text: string) => void): Promise<Asked> {
+export async function askModel(
+  request: ConversationRequest,
+  signal: AbortSignal,
+  deps: AskDeps = {},
+  onText?: (text: string) => void,
+  { onEvent, streamId }: { onEvent?: (event: ChunkEvent) => void; streamId?: string } = {},
+): Promise<Asked> {
   const stream = deps.stream ?? streamChat;
   const sleep = deps.sleep ?? abortableSleep;
   for (let attempt = 1; ; attempt++) {
@@ -70,8 +84,11 @@ export async function askModel(request: ConversationRequest, signal: AbortSignal
     const result = await stream({
       request,
       signal,
+      ...(streamId === undefined ? {} : { streamId }),
       onEvent: (event) => {
-        if (event.kind !== "content" || signal.aborted) return;
+        if (signal.aborted) return;
+        onEvent?.(event);
+        if (event.kind !== "content") return;
         text += event.text;
         onText?.(text);
       },

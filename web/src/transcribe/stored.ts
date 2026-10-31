@@ -1,7 +1,9 @@
 import { restoreOrder, type Stamp } from "../store/docs.ts";
 import { readAnswered } from "./ask.ts";
 import { readContext } from "./context.ts";
+import { readContextImages } from "./contextImages.ts";
 import { readNotes } from "./notes.ts";
+import { readRecap } from "./recap.ts";
 import { readSuggestions } from "./suggestions.ts";
 import { isEmpty } from "./sessions.ts";
 import type { Transcript } from "./transcript.ts";
@@ -10,7 +12,8 @@ import type { Transcript } from "./transcript.ts";
 // Transcript", Q86): a new kind of session, a document of
 // `transcribe-sessions` under a key of its own (store/docs.ts), the chat's and
 // the Decide tab's rules over it. It is plain data already: its utterances'
-// text and times, its speakers and the channels they map, its corrections. Its
+// text and times, its speakers and the channels they map, its corrections, its
+// context images by their pictures' ids in the store (contextImages.ts). Its
 // audio never reaches it: the page keeps none. An utterance is written as it
 // completes (store/useStoredSessions.ts); the one under way is the listening's,
 // not the Transcript's, so a reload keeps every completed utterance and ends
@@ -48,22 +51,27 @@ export function restoreTranscripts(values: unknown[], nextId: number): { transcr
   const docs = values.map(readStored).filter((d): d is StoredTranscript => d !== null);
   const ordered = restoreOrder(docs, nextId);
   const stamps = new Map<number, Stamp>();
-  const transcripts = ordered.items.map(({ version: _version, key, order, notes, context, suggestions, asked, ...t }): Transcript => {
+  const transcripts = ordered.items.map(({ version: _version, key, order, notes, recap, context, suggestions, asked, ...t }): Transcript => {
     stamps.set(t.id, { key, order });
-    // Notes, a context or suggestions this page cannot read are dropped, not the Transcript they hang on.
+    // Notes, a recap, a context or suggestions this page cannot read are dropped, not the Transcript they hang on.
     const readN = readNotes(notes);
+    const readR = readRecap(recap);
     const readC = readContext(context);
     const readS = readSuggestions(suggestions);
     const checked = typeof t.checkedUntilMs === "number" && Number.isFinite(t.checkedUntilMs) ? { checkedUntilMs: t.checkedUntilMs } : {};
-    const { checkedUntilMs: _checked, ...rest } = t;
+    const { checkedUntilMs: _checked, images, ...rest } = t;
     const readA = readAnswered(asked);
+    // Context images likewise: those it cannot read are dropped, and the Transcript and its other images stay.
+    const readI = readContextImages(images);
     return {
       ...rest,
       ...checked,
       ...(readN ? { notes: readN } : {}),
+      ...(readR ? { recap: readR } : {}),
       ...(readC ? { context: readC } : {}),
       ...(readS ? { suggestions: readS } : {}),
       ...(readA ? { asked: readA } : {}),
+      ...(readI?.length ? { images: readI } : {}),
     };
   });
   return { transcripts, stamps, nextId: ordered.nextId };

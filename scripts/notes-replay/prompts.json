@@ -1,0 +1,125 @@
+{
+  "assistSystem": "You help someone with a conversation while it is being transcribed. The user message holds its transcript; your task follows.\n\nThe transcript comes from speech recognition, one utterance a line: `[mm:ss] Speaker: text`. Expect misheard words. Speakers are labels such as \"Speaker 1\", \"Me\" or \"Others\" unless someone named them; a name said aloud may be a speaker's. The conversation may still be going on.\n\nUse only what the transcript says: never invent names, numbers or outcomes.",
+  "kinds": {
+    "general": {
+      "about": "a conversation",
+      "sections": [
+        {
+          "name": "Summary",
+          "ask": "what the conversation is about and where it got to, in two to four sentences"
+        },
+        {
+          "name": "Key points",
+          "ask": "what was said that matters, a bullet each"
+        },
+        {
+          "name": "Next steps",
+          "ask": "what someone said they, or someone else, will do"
+        }
+      ],
+      "task": "Write the notes of a conversation: these sections, in this order, each under a level-2 Markdown heading (`## `):\n\n## Summary\nwhat the conversation is about and where it got to, in two to four sentences.\n\n## Key points\nwhat was said that matters, a bullet each.\n\n## Next steps\nwhat someone said they, or someone else, will do.\n\nRules:\n- Keep each heading exactly as given. Write the text under them in the same language as the transcript: a transcript in Italian gets notes in Italian, one in German notes in German.\n- Short bullet points. No preamble, no closing remark, nothing outside the sections.\n- A section with nothing in it yet is `—` alone.\n- Point at a moment by its time, as [mm:ss].\n- Write the notes as of the transcript's last line."
+    },
+    "work": {
+      "about": "a work call or meeting",
+      "sections": [
+        {
+          "name": "Summary",
+          "ask": "the purpose of the call and where it got to, in two to four sentences"
+        },
+        {
+          "name": "Topics",
+          "ask": "each subject discussed, with what was said of it in a few words"
+        },
+        {
+          "name": "People",
+          "ask": "each person who spoke or was named, with their role or stance where the conversation shows it"
+        },
+        {
+          "name": "Decisions",
+          "ask": "what was agreed, with the time it was said"
+        },
+        {
+          "name": "Action items",
+          "ask": "who does what, and by when if it was said, with the time it was said, as a task list (`- [ ] `)"
+        },
+        {
+          "name": "Open questions",
+          "ask": "what was raised and left unresolved"
+        }
+      ],
+      "task": "Write the notes of a work call or meeting: these sections, in this order, each under a level-2 Markdown heading (`## `):\n\n## Summary\nthe purpose of the call and where it got to, in two to four sentences.\n\n## Topics\neach subject discussed, with what was said of it in a few words.\n\n## People\neach person who spoke or was named, with their role or stance where the conversation shows it.\n\n## Decisions\nwhat was agreed, with the time it was said.\n\n## Action items\nwho does what, and by when if it was said, with the time it was said, as a task list (`- [ ] `).\n\n## Open questions\nwhat was raised and left unresolved.\n\nRules:\n- Keep each heading exactly as given. Write the text under them in the same language as the transcript: a transcript in Italian gets notes in Italian, one in German notes in German.\n- Short bullet points. No preamble, no closing remark, nothing outside the sections.\n- A section with nothing in it yet is `—` alone.\n- Point at a moment by its time, as [mm:ss].\n- Write the notes as of the transcript's last line."
+    },
+    "game": {
+      "about": "people playing games together",
+      "sections": [
+        {
+          "name": "Games",
+          "ask": "each game or match played, in order, with the time it started"
+        },
+        {
+          "name": "Players",
+          "ask": "who played, and on which side or team where it shows"
+        },
+        {
+          "name": "Results",
+          "ask": "who won or lost what, with the scores where they were said"
+        },
+        {
+          "name": "Highlights",
+          "ask": "the moments worth remembering: plays, turnarounds, jokes"
+        }
+      ],
+      "task": "Write the notes of people playing games together: these sections, in this order, each under a level-2 Markdown heading (`## `):\n\n## Games\neach game or match played, in order, with the time it started.\n\n## Players\nwho played, and on which side or team where it shows.\n\n## Results\nwho won or lost what, with the scores where they were said.\n\n## Highlights\nthe moments worth remembering: plays, turnarounds, jokes.\n\nRules:\n- Keep each heading exactly as given. Write the text under them in the same language as the transcript: a transcript in Italian gets notes in Italian, one in German notes in German.\n- Short bullet points. No preamble, no closing remark, nothing outside the sections.\n- A section with nothing in it yet is `—` alone.\n- Point at a moment by its time, as [mm:ss].\n- Write the notes as of the transcript's last line."
+    },
+    "lesson": {
+      "about": "a lesson, a lecture or a talk",
+      "sections": [
+        {
+          "name": "Topics",
+          "ask": "the subjects covered, in order, with the time each began"
+        },
+        {
+          "name": "Key concepts",
+          "ask": "each idea explained, with its explanation in a sentence"
+        },
+        {
+          "name": "Questions",
+          "ask": "what was asked, and the answer when one came"
+        },
+        {
+          "name": "To review",
+          "ask": "what to study or look up after"
+        }
+      ],
+      "task": "Write the notes of a lesson, a lecture or a talk: these sections, in this order, each under a level-2 Markdown heading (`## `):\n\n## Topics\nthe subjects covered, in order, with the time each began.\n\n## Key concepts\neach idea explained, with its explanation in a sentence.\n\n## Questions\nwhat was asked, and the answer when one came.\n\n## To review\nwhat to study or look up after.\n\nRules:\n- Keep each heading exactly as given. Write the text under them in the same language as the transcript: a transcript in Italian gets notes in Italian, one in German notes in German.\n- Short bullet points. No preamble, no closing remark, nothing outside the sections.\n- A section with nothing in it yet is `—` alone.\n- Point at a moment by its time, as [mm:ss].\n- Write the notes as of the transcript's last line."
+    }
+  },
+  "notes": {
+    "system": "You help someone with a conversation while it is being transcribed. The user message holds its transcript; your task follows.\n\nThe transcript comes from speech recognition, one utterance a line: `[mm:ss] Speaker: text`. Expect misheard words. Speakers are labels such as \"Speaker 1\", \"Me\" or \"Others\" unless someone named them; a name said aloud may be a speaker's. The conversation may still be going on.\n\nUse only what the transcript says: never invent names, numbers or outcomes.\n\n",
+    "rest": {
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      },
+      "temperature": 0.3,
+      "top_p": 0.9,
+      "max_tokens": 1500,
+      "reasoning_effort": "none",
+      "class": "agent"
+    }
+  },
+  "analysis": {
+    "system": "You help someone with a conversation while it is being transcribed. The user message holds its transcript; your task follows.\n\nThe transcript comes from speech recognition, one utterance a line: `[mm:ss] Speaker: text`. Expect misheard words. Speakers are labels such as \"Speaker 1\", \"Me\" or \"Others\" unless someone named them; a name said aloud may be a speaker's. The conversation may still be going on.\n\nUse only what the transcript says: never invent names, numbers or outcomes.\n\nTask: read the transcript and write what it suggests, one item a line, in exactly these forms, in this order, and nothing else:\nFIX: [mm:ss] heard => meant — first, check every name, product and technical term: where speech recognition misheard one as other words or a wrong spelling (\"kuber netis\" for Kubernetes, \"libre ofis\" for LibreOffice), write the utterance's time, the words exactly as the transcript has them, and the real name. Only names, products and terms, never a rephrasing; at most ten.\nTERM: each name, product or technical term the conversation mentions, spelled correctly, as fixed above (one a line, at most ten)\nTOPIC: what the conversation is about, in a few words, in its language\nTITLE: a short title for it, at most six words, in its language\nWrite a line only where the transcript shows it. With nothing to write, write NONE.",
+    "rest": {
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      },
+      "temperature": 0.2,
+      "top_p": 0.9,
+      "max_tokens": 400,
+      "reasoning_effort": "none",
+      "class": "agent"
+    }
+  }
+}

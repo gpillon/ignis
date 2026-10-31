@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import { openIndexedDbStore } from "../store/indexeddb.ts";
 import { createMemoryStore } from "../store/memory.ts";
+import type { Notes } from "./notes.ts";
 import { activeOf, openTranscript, removeTranscript, startList, titleOf, UNTITLED } from "./sessions.ts";
 import { restoreTranscripts, TRANSCRIBE_SESSIONS, TRANSCRIBE_VERSION, toStored, worthKeeping } from "./stored.ts";
 import { addUtterance, beginListening, clockOf, createTranscript, mergeSpeakers, type Transcript } from "./transcript.ts";
+import { addContextImage, withReading } from "./contextImages.ts";
 
 // The Transcripts as the view lists them and the page's store keeps them
 // (spec speech/07, "The Transcript", Q86, Q101): a new kind of session, saved
@@ -71,13 +73,75 @@ describe("a Transcript in the store", () => {
     expect(JSON.stringify(stored)).not.toMatch(/audio|pcm/i);
   });
 
-  it("keeps its notes (Q124), and drops notes it cannot read without dropping the Transcript", () => {
-    const notes = { kind: "work" as const, text: "## Riassunto\n- Si parte dal budget.", writtenAs: "work" as const, covered: 2, writtenAt: 1_761_580_000_000, fromMs: null };
+  it("keeps its notes as lines (Q124), the user's and the removed ones with them, and drops notes it cannot read without dropping the Transcript", async () => {
+    const notes: Notes = {
+      kind: "work",
+      lines: [
+        { id: "N1", section: "Summary", text: "Si parte dal budget.", author: "model" },
+        { id: "N3", section: "Decisions", text: "Tetto a 40k [00:01]", author: "user" },
+      ],
+      removed: [{ id: "N2", section: "Topics", text: "Il pranzo", author: "model" }],
+      nextId: 4,
+      writtenAs: "work",
+      covered: 2,
+      writtenAt: 1_761_580_000_000,
+      fromMs: null,
+    };
     const original = { ...heardTwice(), notes };
-    const [back] = restoreTranscripts([toStored(original, { key: "k", order: 1 })], 1).transcripts;
-    expect(back.notes).toEqual(notes);
-    const garbled = { ...toStored(original, { key: "k", order: 1 }), notes: { kind: "party", text: 3 } };
+    for (const store of [createMemoryStore(), openIndexedDbStore(new IDBFactory(), "transcribe-notes-test")]) {
+      await store.putDoc(TRANSCRIBE_SESSIONS, "k", toStored(original, { key: "k", order: 1 }));
+      const [back] = restoreTranscripts(await store.listDocs(TRANSCRIBE_SESSIONS), 1).transcripts;
+      expect(back).toEqual({ ...original, id: back.id });
+    }
+    const garbled = { ...toStored(original, { key: "k", order: 1 }), notes: { ...notes, lines: [{ id: "N1", section: "Summary", text: 3, author: "model" }] } };
     const [kept] = restoreTranscripts([garbled], 1).transcripts;
+    expect(kept.utterances).toHaveLength(2);
+    expect(kept).not.toHaveProperty("notes");
+  });
+
+  it("keeps its recap as lines beside the running notes (#441), and drops a recap it cannot read without dropping the Transcript", async () => {
+    const recap: Notes = {
+      kind: "work",
+      lines: [
+        { id: "N1", section: "Figures & dates", text: "40k: il tetto [00:01]", author: "model" },
+        { id: "N2", section: "Decisions", text: "Tetto a 40k [00:01]", author: "user" },
+      ],
+      removed: [],
+      nextId: 3,
+      writtenAs: "work",
+      covered: 2,
+      writtenAt: 1_761_580_000_000,
+      fromMs: null,
+    };
+    const original = { ...heardTwice(), recap };
+    for (const store of [createMemoryStore(), openIndexedDbStore(new IDBFactory(), "transcribe-recap-test")]) {
+      await store.putDoc(TRANSCRIBE_SESSIONS, "k", toStored(original, { key: "k", order: 1 }));
+      const [back] = restoreTranscripts(await store.listDocs(TRANSCRIBE_SESSIONS), 1).transcripts;
+      expect(back).toEqual({ ...original, id: back.id });
+    }
+    const garbled = { ...toStored(original, { key: "k", order: 1 }), recap: { ...recap, nextId: 2 } };
+    const [kept] = restoreTranscripts([garbled], 1).transcripts;
+    expect(kept.utterances).toHaveLength(2);
+    expect(kept).not.toHaveProperty("recap");
+  });
+
+  it("turns notes an older page kept as Markdown into lines on first read, all of them the model's", () => {
+    const old = { kind: "work", text: "## Summary\nSi parte dal budget.\n\n## Action items\n- [ ] Ada manda le slide [00:01]\n\n## Decisions\n—", writtenAs: "work", covered: 2, writtenAt: 1_761_580_000_000, fromMs: null };
+    const [back] = restoreTranscripts([{ ...toStored(heardTwice(), { key: "k", order: 1 }), notes: old }], 1).transcripts;
+    expect(back.notes).toEqual({
+      kind: "work",
+      lines: [
+        { id: "N1", section: "Summary", text: "Si parte dal budget.", author: "model" },
+        { id: "N2", section: "Action items", text: "[ ] Ada manda le slide [00:01]", author: "model" },
+      ],
+      removed: [],
+      nextId: 3,
+      writtenAs: "work",
+      covered: 2,
+      writtenAt: 1_761_580_000_000,
+      fromMs: null,
+    });
+    const [kept] = restoreTranscripts([{ ...toStored(heardTwice(), { key: "k", order: 1 }), notes: { ...old, text: 3 } }], 1).transcripts;
     expect(kept.utterances).toHaveLength(2);
     expect(kept).not.toHaveProperty("notes");
   });
@@ -101,6 +165,44 @@ describe("a Transcript in the store", () => {
   it("is worth keeping once an utterance is heard in it", () => {
     expect(worthKeeping(createTranscript(1))).toBe(false);
     expect(worthKeeping(heardTwice())).toBe(true);
+  });
+
+  it("keeps its context images, each by its picture's id at its moment, and drops those it cannot read without dropping the Transcript (#431)", async () => {
+    const slide = "c".repeat(64);
+    let original = addContextImage(heardTwice(), { image: slide, atMs: 1_500, width: 1280, height: 720 }, 1_761_900_000_000);
+    original = addContextImage(original, { image: slide, atMs: 2_400, width: 1280, height: 720 }, 1_761_900_060_000);
+    const stored = toStored(original, { key: "k", order: 1 });
+    for (const store of [createMemoryStore(), openIndexedDbStore(new IDBFactory(), "transcribe-images-test")]) {
+      await store.putDoc(TRANSCRIBE_SESSIONS, stored.key, stored);
+      const [back] = restoreTranscripts(await store.listDocs(TRANSCRIBE_SESSIONS), 1).transcripts;
+      expect(back.images).toEqual(original.images);
+    }
+    const [some] = restoreTranscripts([{ ...stored, images: [stored.images?.[0], { id: 2, image: 7 }] }], 1).transcripts;
+    expect(some.images).toEqual([original.images?.[0]]);
+    const [kept] = restoreTranscripts([{ ...stored, images: "a slide" }], 1).transcripts;
+    expect(kept.utterances).toHaveLength(2);
+    expect(kept).not.toHaveProperty("images");
+  });
+
+  it("keeps what was read in each context image, and drops a reading it cannot read, the image kept to be read again (#437)", async () => {
+    const reading = { shows: "A slide titled Q3.", topic: "Budget", names: ["Anna Rossi"], terms: ["OKR"], readAt: 1_761_900_030_000 };
+    let original = addContextImage(heardTwice(), { image: "c".repeat(64), atMs: 1_500, width: 1280, height: 720 }, 1_761_900_000_000);
+    original = withReading(addContextImage(original, { image: "e".repeat(64), atMs: 2_000, width: 800, height: 600 }, 1_761_900_010_000), 1, reading);
+    const stored = toStored(original, { key: "k", order: 1 });
+    const store = openIndexedDbStore(new IDBFactory(), "transcribe-readings-test");
+    await store.putDoc(TRANSCRIBE_SESSIONS, stored.key, stored);
+    const [back] = restoreTranscripts(await store.listDocs(TRANSCRIBE_SESSIONS), 1).transcripts;
+    expect(back.images).toEqual(original.images);
+    expect(back.images?.[0].reading).toEqual(reading);
+    expect(back.images?.[1]).not.toHaveProperty("reading");
+    const [unread] = restoreTranscripts([{ ...stored, images: [{ ...stored.images![0], reading: { ...reading, terms: "OKR" } }] }], 1).transcripts;
+    expect(unread.images).toEqual([{ id: 1, image: "c".repeat(64), atMs: 1_500, width: 1280, height: 720, addedAt: 1_761_900_000_000 }]);
+  });
+
+  it("is worth keeping, and is not reused as a new one, once a picture is added before anyone spoke (#431)", () => {
+    const shown = addContextImage(createTranscript(1, { source: "call", at: new Date(2026, 9, 31, 10, 0) }), { image: "d".repeat(64), atMs: 0, width: 640, height: 480 }, 1);
+    expect(worthKeeping(shown)).toBe(true);
+    expect(openTranscript({ transcripts: [shown], activeId: 1 }, 2).activeId).toBe(2);
   });
 
   it("comes back newest first with new ids, and leaves out what it cannot read", () => {

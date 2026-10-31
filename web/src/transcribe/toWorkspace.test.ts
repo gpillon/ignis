@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { createMemoryStore } from "../store/memory.ts";
 import { createWorkspaces, type Workspaces } from "../workspace/workspaces.ts";
-import { toMarkdown } from "./export.ts";
+import { transcriptMarkdown } from "./markdown.ts";
+import { noNotes } from "./notes.ts";
 import { sendTranscript, transcriptFile, workspaceNameFor } from "./toWorkspace.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 
 // Send to workspace (spec #170, ticket 399): the Transcript becomes one
-// Markdown file of a workspace, the text the Markdown export writes.
+// Markdown file of a workspace, the transcript alone as the Markdown export
+// writes it, without the notes, the answers or the pictures (spec #428).
 
 function call(): Transcript {
   let t = createTranscript(1, { source: "call", at: new Date(2026, 9, 25, 15, 42) });
@@ -20,10 +22,14 @@ function module(): Workspaces {
 }
 
 describe("the file a Transcript becomes", () => {
-  it("holds exactly the Markdown export, under the name its download would carry", () => {
+  it("holds the transcript alone as Markdown, under the name its download would carry", () => {
     const t = call();
-    expect(transcriptFile(t)).toEqual({ name: "25-Oct-15-42-Call.md", text: toMarkdown(t) });
+    expect(transcriptFile(t)).toEqual({ name: "25-Oct-15-42-Call.md", text: transcriptMarkdown(t) });
     expect(transcriptFile(t).text).toContain("**Me** (00:01): Mi sentite?");
+    // The notes and Ask's answers stay in the view and the .md download.
+    const kept = { ...t, notes: { ...noNotes("work"), lines: [{ id: "N1", section: "Now", text: "Il budget.", author: "model" as const }], nextId: 2, writtenAs: "work" as const, covered: 2, writtenAt: 1 } };
+    const answered = { ...kept, asked: [{ id: 1, question: "Chi parla?", answer: "Io.", at: 1, untilMs: 9_020 }] };
+    expect(transcriptFile(answered).text).toBe(transcriptFile(t).text);
   });
 
   it("names a new workspace after the Transcript", () => {
@@ -41,7 +47,7 @@ describe("sending a Transcript to a workspace", () => {
     const files = await w.files(sent.workspace.id);
     expect(files).toHaveLength(1);
     expect(files[0].kind).toBe("text");
-    expect(files[0].versions[0].text).toBe(toMarkdown(t));
+    expect(files[0].versions[0].text).toBe(transcriptMarkdown(t));
     expect(files[0].versions[0].author).toEqual({ by: "user" });
   });
 

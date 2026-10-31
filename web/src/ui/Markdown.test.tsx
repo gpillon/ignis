@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { Markdown, textOf } from "./Markdown.tsx";
+import { InlineMarkdown, Markdown, textOf } from "./Markdown.tsx";
 
 const html = (text: string) => renderToStaticMarkup(<Markdown text={text} />);
 
@@ -48,6 +48,22 @@ describe("Markdown", () => {
 
   it("marks a streaming reply for the caret", () => {
     expect(renderToStaticMarkup(<Markdown text="hi" streaming />)).toContain('data-streaming="true"');
+  });
+});
+
+describe("InlineMarkdown", () => {
+  const inline = (text: string) => renderToStaticMarkup(<InlineMarkdown text={text} />);
+
+  it("renders one line's emphasis, code and links with no paragraph around it", () => {
+    expect(inline("**Ada** sends `the deck` [00:12](#t=00:12)")).toBe('<strong>Ada</strong> sends <code>the deck</code> <a href="#t=00:12" target="_blank" rel="noreferrer noopener">00:12</a>');
+  });
+
+  it("keeps a list, heading or quote marker at its start as text", () => {
+    expect(inline("1. first")).toBe("1. first");
+    expect(inline("12) twelfth")).toBe("12) twelfth");
+    expect(inline("- a dash")).toBe("- a dash");
+    expect(inline("# not a heading")).toBe("# not a heading");
+    expect(inline("> quoted")).toBe("&gt; quoted");
   });
 });
 

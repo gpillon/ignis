@@ -1,6 +1,9 @@
 import { Fragment, memo, type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnswerAside } from "./Ask.tsx";
-import { type Answered, answerAt, type AskerState } from "./ask.ts";
+import { ImageAside } from "./ContextImages.tsx";
+import { imageAt } from "./contextImages.ts";
+import { type ImageReaderState, readingStatus } from "./imageReading.ts";
+import { answerAt, type AskerState } from "./ask.ts";
 import { type Hit, type HitSpan, partsOf } from "./search.ts";
 import { type RewriterState, wordDiff } from "./rewrite.ts";
 import { landing, onJump } from "./jump.ts";
@@ -10,7 +13,7 @@ import { clock, startedLine, startOf } from "./export.ts";
 import type { LiveUtterance, ListeningState } from "./listening.ts";
 import { titleOf } from "./sessions.ts";
 import type { TranscribeActions } from "./useTranscribe.ts";
-import type { Speaker, Transcript, Utterance } from "./transcript.ts";
+import { placedAmong, type Speaker, type Transcript, type Utterance } from "./transcript.ts";
 
 // The Transcript as it is heard (spec speech/07): its heading (drawn by the
 // view above the sheet, with the exports, so it stays in sight), then its
@@ -21,7 +24,8 @@ import type { Speaker, Transcript, Utterance } from "./transcript.ts";
 // reader scrolls up, and offers Jump to live then (Q102). Every completed
 // utterance's text is editable inline, and its speaker a menu: a move, a new
 // speaker, and a split at the cursor (Q92, Q96, Q98). The answers to the
-// questions asked about it stand on the spine where they were asked (Q139).
+// questions asked about it stand on the spine where they were asked (Q139),
+// and its context images at their moments (#431).
 
 /** A speaker's hue: Me in ink, Others in ash, each voice one of six (styles.css). */
 export function speakerColor(speaker: Speaker | undefined): string {
@@ -34,11 +38,14 @@ export function speakerColor(speaker: Speaker | undefined): string {
 /** The label of a call's utterance under way, before the server names its speaker. */
 const laneLabel = (lane: LiveUtterance["lane"], call: boolean) => (call ? (lane === "mic" ? "Me" : "Call") : null);
 
-/** What the sheet does to a Transcript: its corrections, Undo, the rewrite's. */
+/** What the sheet does to a Transcript: its corrections, Undo, the rewrite's, an image's Read again. */
 export type SheetActions = Pick<
   TranscribeActions,
-  "moveUtterance" | "splitUtterance" | "editText" | "undoFixes" | "deleteUtterance" | "undoDelete" | "holdUndo" | "rewriteUtterance" | "acceptRewrite" | "closeRewrite" | "forgetAnswer" | "askFrom"
+  "moveUtterance" | "splitUtterance" | "editText" | "undoFixes" | "deleteUtterance" | "undoDelete" | "holdUndo" | "rewriteUtterance" | "acceptRewrite" | "closeRewrite" | "forgetAnswer" | "askFrom" | "readImageAgain"
 >;
+
+/** No context image being read, none failed: what the sheet says without the reader. */
+const NO_READING: ImageReaderState = { reading: null, failed: [] };
 
 /**
  * The sheet. It is handed only what it draws, not the listening's whole state, and redraws only when that changes:
@@ -62,6 +69,8 @@ export const Sheet = memo(function Sheet({
   asking,
   readingFrom = null,
   canAsk = false,
+  imageReading = NO_READING,
+  canRead = false,
 }: {
   transcript: Transcript;
   /** The utterances under way of the listening appending here; none when it appends elsewhere. */
@@ -94,6 +103,10 @@ export const Sheet = memo(function Sheet({
   readingFrom?: number | null;
   /** A text model serves: each time picks where What did I miss? reads from. */
   canAsk?: boolean;
+  /** The context image being read, and the readings that failed (#437): what each image on the spine says under it. */
+  imageReading?: ImageReaderState;
+  /** A text model with vision serves: an image not read yet is to be read, not waiting for one. */
+  canRead?: boolean;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
@@ -129,7 +142,7 @@ export const Sheet = memo(function Sheet({
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && following) el.scrollTop = el.scrollHeight;
-  }, [transcript.utterances, live, following, answering?.text]);
+  }, [transcript.utterances, transcript.images, live, following, answering?.text]);
 
   // A question just asked: its answer, at the foot above the utterances under way, in view and followed.
   const asked = answering && `${answering.question}@${answering.untilMs}`;
@@ -141,17 +154,23 @@ export const Sheet = memo(function Sheet({
   }, [asked]);
 
   // The answers kept, by the utterance each stands before, in the order they were asked.
-  const asides = useMemo(() => {
-    const at = new Map<number, Answered[]>();
-    for (const a of [...(transcript.asked ?? [])].sort((x, y) => x.id - y.id)) {
-      const i = answerAt(transcript.utterances, a.untilMs);
-      at.set(i, [...(at.get(i) ?? []), a]);
-    }
-    return at;
-  }, [transcript.asked, transcript.utterances]);
+  const asides = useMemo(
+    () => placedAmong([...(transcript.asked ?? [])].sort((x, y) => x.id - y.id), (a) => answerAt(transcript.utterances, a.untilMs)),
+    [transcript.asked, transcript.utterances],
+  );
   const answeringAt = answering ? answerAt(transcript.utterances, answering.untilMs) : -1;
-  const answersAt = (i: number) => (
+  // The context images, by the utterance each stands before, in the order they were added.
+  const pictures = useMemo(() => placedAmong(transcript.images ?? [], (image) => imageAt(transcript.utterances, image.atMs)), [transcript.images, transcript.utterances]);
+  const asidesAt = (i: number) => (
     <>
+      {pictures.get(i)?.map((image) => (
+        <ImageAside
+          key={`image-${image.id}`}
+          image={image}
+          status={readingStatus(transcript.id, image, imageReading, canRead)}
+          onRetry={() => actions.readImageAgain(image.id)}
+        />
+      ))}
       {asides.get(i)?.map((a) => (
         <AnswerAside key={`answer-${a.id}`} question={a.question} answer={a.answer} untilMs={a.untilMs} onForget={() => actions.forgetAnswer(a.id)} />
       ))}
@@ -183,7 +202,7 @@ export const Sheet = memo(function Sheet({
     setFollowing(true);
   };
 
-  const empty = transcript.utterances.length === 0 && live.length === 0;
+  const empty = transcript.utterances.length === 0 && live.length === 0 && !transcript.images?.length;
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div ref={scroller} onScroll={(e) => setFollowing(isAtBottom(e.currentTarget))} className="min-h-0 flex-1 overflow-y-auto px-4 py-6 [scrollbar-gutter:stable] md:px-10">
@@ -196,7 +215,7 @@ export const Sheet = memo(function Sheet({
                 // Keyed by the utterance, so a delete, an Undo or a split keeps every other row as it is.
                 <Fragment key={u.id}>
                 {readTo && i === markAt && i > 0 && <CheckedMark nextAt={readTo.nextAt} fresh={fresh} />}
-                {answersAt(i)}
+                {asidesAt(i)}
                 <UtteranceRow
                   key={u.id}
                   utterance={u}
@@ -214,7 +233,7 @@ export const Sheet = memo(function Sheet({
                 </Fragment>
               ))}
               {readTo && markAt === transcript.utterances.length && markAt > 0 && <CheckedMark nextAt={readTo.nextAt} fresh={0} />}
-              {answersAt(transcript.utterances.length)}
+              {asidesAt(transcript.utterances.length)}
               {live.map((u) => (
                 <LiveRow key={u.key} utterance={u} label={laneLabel(u.lane, call)} burning={phase === "listening" || phase === "finishing"} />
               ))}

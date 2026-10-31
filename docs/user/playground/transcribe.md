@@ -9,16 +9,18 @@ The **Transcribe** view writes a whole conversation down: a meeting in the
 room, a call on this computer, or a recording. What it hears becomes a
 **transcript**, its **utterances** in order, each with its time, its
 **speaker** and its text. You can rename and correct the speakers and edit the
-text while it listens, have the text model write its notes, then copy the
-transcript, download it, or open it in a new chat. It uses the server's [speech model](../api/transcriptions.md) and,
+text while it listens, add pictures of what the call is looking at, have the
+text model write its notes, then copy the transcript, download it, or open it
+in a new chat. It uses the server's [speech model](../api/transcriptions.md) and,
 for the speakers, its [diarizer](../api/realtime-transcription.md#speakers).
 
 ![The Transcribe view: a call with its speakers on the time spine, a question's answer standing where it was asked, the questions bar under the transcript, its notes on the right](../images/playground/transcribe.png)
 
 It is laid out like the other views: the **transcripts** on the left; the one
 open in the middle, its title and exports above it and its deck at the foot;
-and on the right three tabs: **Call**, what the transcription is told and who
-speaks; **Notes**; and **Settings**, the view's own. Below 1024 px wide the
+and on the right three tabs: **Call**, what the transcription is told, its
+images and who speaks; **Notes**; and **Settings**, the view's own. Below 1024
+px wide the
 side columns open from the header as drawers (**Call** opens the right one).
 
 ## Listening
@@ -112,6 +114,18 @@ something else, which opens it as a draft, and **Edit the context**, and the
 Call tab frames the context in orange. **Start anyway** goes on. A draft left
 open asks nothing: the Start applies it.
 
+The context reaches the text model too. The notes, the look for suggestions,
+**Rewrite**, **Ask** and the reading of a [context image](#reading-it) each
+begin their request with it: the languages, the
+terms, the topic and anything else, that "Me" is you, and the speakers by the
+names you gave them, with a reminder that a sentence said as a hypothetical or
+an example is not a fact about them. It also names the language to write in:
+the first under **Force one**, otherwise the language heard most in the
+transcript, English when nothing is known. A transcript with no context still
+works; the model is told nothing was told. The context sits in the message
+with the transcript, so the instructions stay the same from one request to the
+next and the server can reuse them.
+
 The **Languages** are **Detect** unless you pick **Force one**:
 
 - **Detect**: the model detects each utterance's language, and the ones you
@@ -126,6 +140,81 @@ The **Languages** are **Detect** unless you pick **Force one**:
   session's `language`): measured, seven English clips in thirty came out
   translated into Italian under Italian forced. For a conversation in one
   language whose short utterances still come out in another.
+
+## Context images
+
+A **context image** is a picture of what the conversation is looking at (a
+slide, a shared screen, a whiteboard) added to the transcript at a moment of
+it. **Images** in the Call tab adds one three ways:
+
+- **From a file**: a picture you pick.
+- **Paste**: a picture on the clipboard, pasted (Ctrl+V) anywhere in the view
+  while it shows. A paste into a text field that carries text as well is the
+  field's.
+- **Capture**: while a call listens into the transcript open, a frame of the
+  tab, window or screen it shares, taken at the click. The browser shares the
+  picture with the call's audio at Start, so Capture asks for nothing new; it
+  is offered only while such a call goes on.
+
+A picture is refused as the chat refuses one: anything but an image, or a file
+over 32 MB. Before it is added, it opens full screen in the marking editor
+with two tools:
+
+- **Crop**: drag the area to keep. What is left out is dimmed; a new crop
+  replaces the last.
+- **Black out**: drag over what must not be kept. The area is painted solid
+  black into the picture's pixels, not laid over them.
+
+**Undo** (or Ctrl+Z) and **Clear** take the crop and the black-outs back while
+you edit; **Cancel** (or Escape) adds nothing. **Add image** keeps only the
+picture as shown: drawn again as a PNG, cropped, with the black-outs in its
+pixels. The picture as it came, and what was under a black-out, are never
+stored. It is kept in this browser with the transcript, once however many
+times it is added ([Sessions and storage](sessions.md)), and only the text
+model with vision ever sees it, once (below).
+
+Each image stands on the time spine at its moment, a small square on the rule,
+with its size, and a transcript holds as many as you add. The moment is the
+listening's time when the picture came in (the click on Capture, the paste,
+the pick), not when it was added; with no listening it is where the
+transcript stopped. A picture added before anyone has spoken holds from the
+start.
+
+### Reading it
+
+The text model loaded, with its vision on, reads each picture once, in a
+request of its own on an agent's lane, thinking off: the picture, redrawn as
+the chat sends one, with the transcript's context and no transcript. It says
+what the picture shows, in a
+sentence or two, its topic, and the names and the terms written on it, spelled
+as written; that reading stands under the picture on the spine. From then on
+the picture itself is never sent again: its reading is, as a line at its moment,
+`[mm:ss] (image) A slide titled Budget Q3. Topic: Budget. Names: Anna Rossi.
+Terms: OKR.`, wherever the transcript goes:
+
+- in what the look for suggestions, **Rewrite** and **Ask** read, among the
+  utterances (Rewrite, with the picture on screen when the conversation around
+  the utterance began);
+- in the running notes' next update, as a change under `Changed since:`
+  ([Notes](#notes)), and in the recap's request, every picture read listed after
+  the transcript;
+- in the `.md` ([Out of the view](#out-of-the-view)), and under the picture in
+  the [PDF](#a-pdf).
+
+Its names and terms, and its topic while the context tells none, come as
+[suggestions](#suggestions) in the Call tab: accepted, or with **Always** on
+their kind, they join the context the transcription is told, so the speech
+model spells them right from then on.
+
+While no text model with vision serves (the image model is loaded, or the
+server runs with [vision](../configuration/vision.md) off), the picture stays on
+the spine and its reading waits: under the picture, "Not read yet: no text
+model with vision serves", and the Images card counts the pictures waiting.
+Each is read once one serves, a transcript opened later included. A text model
+with vision [unloaded while idle](../api/idle-unload.md) still serves: the page
+knows its vision from the server's catalog, a page loaded meanwhile too, and
+the reading loads it again. A reading that fails says why under the picture,
+with **Read again**.
 
 ## Suggestions
 
@@ -143,7 +232,9 @@ be told, and a bell beside the tabs counts what waits:
   once six utterances are in, then about every minute and a half while
   something new was said, and once more when the listening ends. It checks the
   names it heard first, so a misheard name comes back spelled right
-  ("Postgress" as PostgreSQL);
+  ("Postgress" as PostgreSQL). A context image's reading offers the names and
+  terms written on it, and its topic, the same way ([Reading
+  it](#reading-it));
 - **fixes**: a name, product or term the speech model misheard, `“Postgress” is
   PostgreSQL`, in every utterance that holds it as a word of its own. **Fix**
   replaces it there, marks it with a dotted orange line, and makes the right
@@ -224,7 +315,8 @@ Every correction is the page's, and nothing goes back to the server:
 
 The text of every completed utterance is editable: click it, even while
 listening. What you edit, and what a fix put in, is what the exports, the notes
-and Open in chat carry.
+and Open in chat carry. The running notes take every correction and rename at
+their next update ([Notes](#notes)).
 
 ## Searching
 
@@ -242,30 +334,80 @@ carries the query into its own search.
 ## The transcript
 
 Each transcript is kept in this browser as each utterance completes, with its
-text, times, speakers and corrections, and never its audio
-([Sessions and storage](sessions.md)). Its title is the date, the time and the
+text, times, speakers and corrections and its context images, and never its
+audio ([Sessions and storage](sessions.md)). Its title is the date, the time and the
 source, "25 Oct 15:42 · Call" (a file's name for a file); click it to rename
 it. **New transcript** starts another; the bin on a row deletes one, except
-the one listening. A reload keeps every completed utterance and ends the
+the one listening, with the pictures no other transcript or view still uses. A
+reload keeps every completed utterance and ends the
 listening; so does a lost connection.
 
 ## Out of the view
 
 Beside the title, **Copy** puts it on the clipboard, and **Download** writes it
-as:
+as a file, or prints it as a [PDF](#a-pdf):
 
 | Format | Each utterance |
 |---|---|
 | `.txt` (and Copy) | `[mm:ss] Speaker: text`, one line each |
-| `.md` | `**Speaker** (mm:ss): text`, after the title and the start |
+| `.md` | `**Speaker** (mm:ss): text`, after the title and the start, with the notes, Ask's answers and the context images' readings (below) |
 | `.srt` | a numbered cue from its start to its end, `Speaker: text` |
 | `.vtt` | a cue from its start to its end, `<v Speaker>text` |
+| PDF | its time, then the speaker in bold and the text, with the context images at their moments and what was read in each, and on request the notes, the context and Ask's answers (below) |
+
+The `.md` also carries what the view keeps beside the utterances. Under the
+title and the start come the **recap**, when the transcript has one, or else the
+running notes, each in its sections (`## Summary`, or `## Now` for the running
+notes, and so on, a section with no line shown as `—`), then a `## Transcript`
+heading over the utterances. Each answer Ask gave stands between the utterances
+at the moment it was asked, as a quoted block whose first line is the question
+in bold; an answer kept without a moment stands at the end. Each context image
+read stands at its moment as a line `[mm:ss] (image) ...` with what was read in
+it ([Reading it](#reading-it)), ahead of an answer asked at the same place; a
+picture not read yet has no line. A transcript with no notes, no answers and no
+picture read writes the `.md` as the table says. `.txt`, `.srt` and `.vtt` never
+carry notes, answers or pictures: they stay the transcript alone, so a tool
+reading them keeps working. Open in chat and Send to workspace carry the
+transcript alone, as this Markdown with no notes, answers or pictures.
+
+### A PDF
+
+**PDF**, last in the Download menu, makes a document for someone who will only
+read the conversation. A small dialog asks what it carries beside the
+transcript:
+
+- **Recap**: the recap, or the running notes while there is none, in their
+  sections, before the transcript;
+- **Context in short**: the topic, the terms and the languages the context
+  tells, after the header (what you wrote under More stays out);
+- **Ask's answers**: each in a box titled by its question, at the moment it
+  was asked; an answer kept without a moment closes the document.
+
+Under each, the dialog says what it would add to this transcript, or that there
+is nothing to add yet. All three are on the first time; after that the dialog
+starts from your last choice, which this browser keeps, as it keeps the notes'
+kind. Whatever you pick, the PDF opens on a header with the title, the start,
+the duration and the speakers, then carries every utterance with its time and
+its speaker in bold, and each context image at its moment, with what was read
+in it under it, the line the `.md` has.
+
+**Print…** opens the browser's print dialog over that document alone: choose to
+save as PDF there; the file is offered under the name the other downloads take.
+The pages are A4 and light whatever the Playground's theme, in ignis's faces,
+with the ember for the rules, the speakers and the answer boxes, and the ignis
+mark in the header. A browser that draws page margin boxes, as a Chromium-based
+one does, prints "ignis · title · page n/m" at the foot of every page; if the
+print dialog adds its own headers and footers (the date, the address), turn
+them off there. The document is made in the page, from the transcript as it is
+in this browser: nothing is sent anywhere.
 
 **Open in chat** opens a new chat with the transcript as Markdown in its prompt
-box. Nothing is sent until you press Send: ask for a summary, the decisions,
+box, the title, the start and the utterances, without the notes, Ask's answers
+or the pictures' readings. Nothing is sent until you press Send: ask for a
+summary, the decisions,
 the action items.
 
-**Send to workspace** asks which workspace, a new one named after the transcript or one you already have, and adds the transcript to it as a Markdown file, the very text the `.md` download writes, so the model can read it in a chat whose workspace it is. A name the workspace already holds gets a number, as any file you add does. The transcript stays here as it was; the file is a copy, and a later correction does not reach it until you send again.
+**Send to workspace** asks which workspace, a new one named after the transcript or one you already have, and adds the transcript to it as a Markdown file, the text Open in chat carries, so the model can read it in a chat whose workspace it is. A name the workspace already holds gets a number, as any file you add does. The transcript stays here as it was; the file is a copy, and a later correction does not reach it until you send again.
 
 ## Asking about it
 
@@ -273,7 +415,8 @@ The field at the foot of the transcript, over the deck, asks the text model
 about it, while listening too. **What did I miss?** asks what was said in the last five minutes,
 **Decisions** what was decided and what is still open, **Who does what** who
 agreed to do what, each answered in the conversation's language; a question you
-type is answered in its own. Come back to the page after a minute or more away
+type is answered in the language the context names. Come back to the page after
+a minute or more away
 from it (another tab, another window) while it listens, and **What did I
 miss?** reads from what you had last seen instead, its button saying since
 when. While a text model serves, a time on the left of the transcript picks
@@ -284,47 +427,197 @@ five minutes again. The answer streams in on the time spine where you
 asked, after the last utterance it read, that moment's time in orange beside
 it, and stays there while the conversation goes on under it; **Forget** drops
 one. It reads the transcript alone, so a word heard wrong stays wrong in it.
-Answers are not searched, nor exported. A moment named as `[mm:ss]`, in an
+Answers are not searched; the `.md` and the [PDF](#a-pdf) carry them. A moment
+named as `[mm:ss]`, in an
 answer or in the notes, is a link: click it and the transcript shows that
 utterance, lit for a moment.
 
 ## Notes
 
-The **Notes** tab has the text model loaded read the transcript and write its
-notes. Pick the **kind of conversation** first; each asks for its own sections:
+The **Notes** tab has the text model loaded keep the transcript's notes, in two
+forms: the **running notes**, kept while the conversation goes on to help you
+follow it and take part, and the [recap](#the-recap), written once from the
+whole conversation for what comes after it. Pick the **kind of conversation**
+first; each has its own sections for both:
 
-| Kind | Sections |
-|---|---|
-| General | Summary, Key points, Next steps |
-| Work call | Summary, Topics, People, Decisions, Action items, Open questions |
-| Game session | Games, Players, Results, Highlights |
-| Lesson | Topics, Key concepts, Questions, To review |
+| Kind | Running notes | Recap |
+|---|---|---|
+| General | Now, People, Points, Asked of me, Open questions | Summary, Key points, Next steps |
+| Work call | Now, People, Figures & dates, Asked of me, Commitments heard | Summary, Topics, People, Figures & dates, Decisions, Action items, Open questions |
+| Game session | Now playing, Players & sides, Score, Moments, Rules in question | Games, Players, Results, Highlights |
+| Lesson | Now, Concepts, Terms, Questions, Homework & dates | Topics, Key concepts, Terms, Questions, To review, Homework & dates |
 
-**Write notes** sends the transcript as it stands, and the notes stream in
-under those headings, as written above; the text under them is in the
-transcript's language, a moment is pointed at as `[mm:ss]`, and a section with
-nothing in it is a dash. **Update notes** writes them again from the whole
-transcript, so a correction holds; **Stop** leaves the notes there were. The
-line under them says when they were written, from how many utterances, and how
-many came since. **Copy notes** puts them on the clipboard as Markdown. Each
-transcript keeps its notes and its kind; a new one starts at the kind picked
-last (this browser keeps it).
+A running section holds what stands now, or facts that add up, a few lines at
+most, each one short point:
+
+- **Now** (and a game's **Now playing**) is one line: what is being talked
+  about, or played, right now.
+- **People** has a line a person who spoke or was named, added the first time
+  they come up, completed as more is learned, never removed. A game's
+  **Players & sides** has a line a player, with their side, team or role.
+- A Work call's **Figures & dates** has every figure said (an amount, a
+  percentage, a date, a deadline), one a line, with what it refers to;
+  **Commitments heard**, who said they would do what, and by when.
+- **Asked of me** has the questions and requests put to you and not answered
+  yet; a line goes once you answer it. **Open questions** has what was raised
+  and is still open; **Points**, the points made, with who made them.
+- A game's **Score** has the score or the standings as they are now;
+  **Moments**, the moments that mattered; **Rules in question**, rules asked
+  about or disputed, and how they were settled.
+- A lesson's **Concepts** has the concepts taught, each with a line of
+  explanation; **Terms**, the terms introduced and what they mean;
+  **Questions**, the questions asked and their answers; **Homework & dates**,
+  homework, readings, exams and their dates.
+
+**Write notes** sends the transcript as it stands, and the lines appear one at
+a time as the model writes them. **Update notes** sends only what is new
+since the last update: the model keeps one conversation per transcript with the
+notes in it, and changes them a line at a time, adding a line, rewriting one or
+removing one, and rewriting a whole section only once it is full. A line still
+true stays word for word, so you never reread what you have read, and an update
+takes a few seconds however long the conversation is
+([ADR 0076](../../adr/0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md)).
+What an update changed is
+marked for about three seconds: a line added or changed has an ember border at
+its left, and a line removed stays struck and dimmed before it goes. The lines
+are in the
+language the context names; a moment is pointed at as `[mm:ss]`, or `h:mm:ss`
+past the hour; a section with nothing in it is a dash. **Stop** keeps every
+line already changed. The line under the notes says when they were last
+updated, and how many utterances came since while Keep updating is off.
+**Copy notes** puts them on the clipboard as Markdown; once there is a
+[recap](#the-recap), the button is **Copy recap** and copies that. Each
+transcript keeps its notes and its kind, and a reload brings them back; a new
+transcript starts at the kind picked last (this browser keeps it).
+
+Your corrections reach the notes at the next update. Each utterance you edited,
+fixed, rewrote, moved to another speaker, split or deleted since the last one
+goes to the model with its moment and its new text, one change each, as does one
+put back with **Undo** once an update told the model it was deleted; a speaker
+you renamed or merged into another goes as one change, by the name the model
+knew. The model then changes the lines they make wrong; the page never rewrites
+a line for them, a rename included: "Speaker 2" turns into the name you gave when
+the model rewrites the lines that say it. A correction made while an update runs
+goes into the next one, and one made before the notes start over (after a
+reload, on another kind, on Rewrite from scratch) is in the transcript they
+start from.
+
+**More** › **Rewrite from scratch** drops the model's lines and writes the
+notes again from the whole transcript, for notes that drifted; the lines you
+[wrote yourself](#editing-the-notes) stay. Picking another kind does the same at
+the next update, in the new kind's sections, your lines under the section of the
+same name or under a closing **Other**; until then the line under the notes says
+which kind they were written as.
 
 **Keep updating while listening**, off unless you turn it on (this browser
-keeps the choice), writes them by itself while a listening goes on: the first
+keeps the choice), updates them by itself while a listening goes on: the first
 once three utterances are in, then about once a minute while something new is
-said, and once more when the listening ends. Picking another kind meanwhile
-writes them again straight away.
+said. When the listening ends it writes the recap instead. Picking another kind
+meanwhile writes them again straight away.
 
-Nothing goes to the model before a press or the switch. The notes go to the
+### Editing the notes
+
+The lines of the running notes and of the [recap](#the-recap) are yours to
+change, even while an update runs:
+
+- **Click a line** to edit it in place: **Enter** saves, **Escape** cancels,
+  and a line you empty is removed. Clicking away saves too.
+- **×**, at the right of a line you point at, removes it.
+- **+**, at the foot of each section, adds a line of your own there.
+
+A line you edited or added is yours, and its bullet is hollow where the model's
+lines have the ember square. The model never changes or removes it: the page
+refuses a call on it and tells the model the line is yours. A line you removed
+never comes back: the page refuses it to the model word for word. Your edit
+wins over an update under way: a change the model makes to that line after it
+is refused, a line it removed meanwhile comes back as yours, and a line you add
+takes an id of its own. The next update tells the model what you did, a line
+each under `Changed since:`, such as `Edited by the user in People: N3 (the
+user's) Ada: head of procurement. It was: Ada: procurement.`, `Added by the user
+to Figures & dates: N9 (the user's) 40k: the cap.` and `Removed by the user from
+Now, never to be written again: N2 The budget.`; a line you added and removed
+between two updates is not told. Your lines stay yours after a reload, on
+**Rewrite from scratch** and on another kind. What you change is not marked as
+an update's changes are, and **Copy notes** gives the lines with no mark of who
+wrote which.
+
+### The recap
+
+The **recap** is the notes written once from the whole conversation, for what
+comes after it. Notes kept up a minute at a time help while the conversation
+goes on, but weigh the first minutes' talk as much as the rest; the recap
+weighs the decisions, the action items and the open questions against
+everything that was said. It is written:
+
+- by itself when a listening ends with **Keep updating while listening** on,
+  in place of the notes' last writing, unless a recap of the same kind already
+  covers every utterance;
+- on **Write the recap**, at any moment, from the transcript as it stands.
+
+Its sections are the kind's recap sections in the table above, among them:
+
+| Kind | The recap adds |
+|---|---|
+| Work call | Figures & dates, after People: every figure said, with what it refers to and when |
+| Lesson | Terms, after Key concepts, each with its meaning; Homework & dates, after To review |
+
+Its Summary and Topics carry the main threads by the weight the conversation
+gave them, not every aside; Decisions are what was agreed, Action items what
+someone committed to do, and People everyone who spoke or was named. It reads
+the context and the whole transcript afresh, then what each context image read
+showed, at its moment ([Reading it](#reading-it)): the notes the model wrote are
+not sent, so a mistake made in them live does not carry over into the recap
+([ADR 0076](../../adr/0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md)). The
+lines you wrote in the running notes are: they go as notes you took, to be taken
+as true, so a correction you made during the call reaches the recap.
+
+Once there is a recap, it stands at the top of the tab with the line saying
+when it was written and from how many utterances, and the notes fold under it
+as **Running notes**; click to open them. While it is written it streams in
+there, and **Stop** keeps the recap there was. You
+[edit the recap](#editing-the-notes) as you do the running notes. A new recap
+takes the place of the model's lines of the last one; the lines you wrote in it
+stay, and the request lists them, and the ones you removed from it, so that the
+model neither writes them again nor contradicts yours. Each transcript keeps
+its recap, and a reload brings it back.
+
+Nothing goes to the model before a press or the switch. The notes and the recap
+go to the
 model loaded and name none, so they never switch models: with the image model
-loaded, or none serving, the tab says so and writes nothing. Each writing is a
+loaded, or none serving, the tab says so and writes nothing. Each request is a
 chat completion on an agent's lane (`class: "agent"`), thinking off, that waits
-while every lane is taken; the transcript is its user message after the title,
-so a later writing starts with the text the last one sent, which the server can
-reuse. A transcript too
-long for the model's context is sent from where its tail fits, and the line
-says from when.
+while every lane is taken.
+
+The running notes' requests carry four tools (`add_line`, `replace_line`,
+`remove_line`, `rewrite_section`) and the conversation so far, which an update
+only appends to, so the server reuses what it already read. Its first message
+is the context, the title, the transcript, with each moment in minutes from the
+start (`[64:09]`), and the notes as they stand, each line with its id. The
+transcript goes whole, or, when it is too long for the model's context, from
+where its tail fits the context less 64,000 tokens (half the context, when that
+is smaller), the room the conversation then grows into. It starts over that way
+after a reload, on another kind, on Rewrite from scratch, and once the
+conversation, with the message an update adds, would grow past that room beyond
+its first request. Each later update adds one message: the utterances under
+`Said since [mm:ss]:`, then the transcript's changes under `Changed since:`, a
+line each, such as `Corrected: [00:05] Anna: We meet on Thursday. It was: We
+meet on Friday.`, `Moved:`, `Split:`, `Deleted:`, `Put back:`, and `Renamed:
+Speaker 2, heard from [00:05], is Anna.` or `Merged:` for a speaker, then
+[your edits](#editing-the-notes) to the notes, and `Shown: [00:12] (image) ...`
+for a context image read since; with nothing said, changed or read, an update
+sends nothing. The first message has each picture read as a line at its moment
+among the utterances. An update makes up
+to six requests, each answered with what its calls did in one line, and ends
+sooner when the model calls nothing or two requests in a row change nothing;
+what is left goes to the next update.
+The page holds the model to the notes' limits: it strips a line's id copied
+into a text, and refuses a line already in its section, one over 240
+characters, a line more in a full section, a change to a line of yours and a
+line you removed, telling the model why.
+
+One writing goes at a time, the notes' or the recap's; a recap may take up to
+3,000 tokens. A transcript too long for the model's context is sent from where
+its tail fits, and the recap's line says from when.
 
 ## While it listens
 

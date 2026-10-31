@@ -1,0 +1,208 @@
+import { describe, expect, it } from "vitest";
+import { noNotes, type Notes } from "./notes.ts";
+import { readRecap, recapDue, recapMarkdown, recapRequest, recapSections, recapStatus, recapTask, withRecap } from "./recap.ts";
+import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
+
+function heard(texts: string[]): Transcript {
+  let t = { ...createTranscript(1), title: "27 Oct 15:42 · Call" };
+  texts.forEach((text, i) => {
+    t = addUtterance(t, { stream: "s", startMs: i * 10_000, endMs: i * 10_000 + 4_000, text, voice: { kind: "me" } });
+  });
+  return t;
+}
+
+const recap = (patch: Partial<Notes> = {}): Notes => ({
+  ...noNotes("work"),
+  lines: [{ id: "N1", section: "Summary", text: "The budget.", author: "model" }],
+  nextId: 2,
+  writtenAs: "work",
+  covered: 2,
+  writtenAt: 1_000,
+  ...patch,
+});
+
+// The recap (spec #428, "The recap"): one writing over the whole transcript,
+// in the kind's sections with a few additions, its rules asking for the main
+// threads by weight, and the user's own running lines taken as true.
+
+describe("the recap's sections", () => {
+  it("are the kind's, with Figures & dates for a Work call, and Terms and Homework & dates for a Lesson", () => {
+    const names = (kind: Parameters<typeof recapSections>[0]) => recapSections(kind).map((s) => s.name);
+    expect(names("work")).toEqual(["Summary", "Topics", "People", "Figures & dates", "Decisions", "Action items", "Open questions"]);
+    expect(names("lesson")).toEqual(["Topics", "Key concepts", "Terms", "Questions", "To review", "Homework & dates"]);
+    expect(names("general")).toEqual(["Summary", "Key points", "Next steps"]);
+    expect(names("game")).toEqual(["Games", "Players", "Results", "Highlights"]);
+  });
+
+  it("are asked for as the probe measured them: the recap's rules first, then the notes' own", () => {
+    expect(recapTask("work")).toBe(
+      [
+        "Write the recap of a work call or meeting: these sections, in this order, each under a level-2 Markdown heading (`## `):",
+        "## Summary\nthe purpose of the call and where it got to, in two to four sentences.",
+        "## Topics\neach subject discussed, with what was said of it in a few words.",
+        "## People\neach person who spoke or was named, with their role or stance where the conversation shows it.",
+        "## Figures & dates\nevery figure said (an amount, a percentage, a quantity, a date, a deadline), one a line, with what it refers to and the time it was said.",
+        "## Decisions\nwhat was agreed, with the time it was said.",
+        "## Action items\nwho does what, and by when if it was said, with the time it was said, as a task list (`- [ ] `).",
+        "## Open questions\nwhat was raised and left unresolved.",
+        [
+          "Rules:",
+          "- The Summary and the Topics carry the main threads by the weight the conversation gave them, not every aside.",
+          "- Decisions are what was agreed; Action items what someone committed to do; People everyone who spoke or was named.",
+          "- Notes the user took during the conversation are true: use them, and let them correct what the transcript seems to say.",
+          "- Keep each heading exactly as given. Write the text under them in the language the context says to write in.",
+          "- Short bullet points. No preamble, no closing remark, nothing outside the sections.",
+          "- A section with nothing in it yet is `—` alone.",
+          "- Point at a moment by its time, as [mm:ss].",
+          "- Write the notes as of the transcript's last line.",
+        ].join("\n"),
+      ].join("\n\n"),
+    );
+    const lesson = recapTask("lesson");
+    expect(lesson).toContain("## Key concepts\neach idea explained, with its explanation in a sentence.\n\n## Terms\nthe terms introduced, each with what it means.\n\n## Questions");
+    expect(lesson).toContain("## To review\nwhat to study or look up after.\n\n## Homework & dates\nhomework, readings, exams and their dates.\n\nRules:");
+  });
+});
+
+describe("the recap's request", () => {
+  it("gives what the context images showed after the transcript and before the notes the user took", () => {
+    const t = heard(["Here is the slide.", "The cap is forty."]);
+    const { request } = recapRequest(t, "work", null, ["[00:00] (image) A slide: Q3 budget, cap 40k."]);
+    expect(request.turns[0].content.endsWith(
+      "[00:10] Me: The cap is forty.\n\nPictures shown during the conversation, as read at their moments:\n[00:00] (image) A slide: Q3 budget, cap 40k.\n\nNotes the user took during the conversation: none.",
+    )).toBe(true);
+  });
+
+  it("sends the transcript from where its tail fits the model's context, the notes the user took kept whole", () => {
+    const long = heard(Array.from({ length: 400 }, (_, i) => `Sentence number ${i} of the long call.`));
+    const theirs = { ...noNotes("work"), lines: [{ id: "N1", section: "People", text: "Ada leads procurement.", author: "user" as const }], nextId: 2 };
+    const { request, fromMs } = recapRequest({ ...long, notes: theirs }, "work", 8_000);
+    expect(fromMs).not.toBeNull();
+    expect(request.turns[0].content).not.toContain("Sentence number 0 ");
+    expect(request.turns[0].content).toContain("Sentence number 399 ");
+    expect(request.turns[0].content.endsWith("to be taken as true:\n- People: Ada leads procurement.")).toBe(true);
+  });
+
+  it("tells the lines the user wrote in the recap and the ones they removed from it, so a new recap neither repeats nor contradicts them", () => {
+    const t = heard(["The cap is forty.", "Lunch at one."]);
+    const edited = recap({
+      lines: [
+        { id: "N1", section: "Summary", text: "The budget.", author: "model" },
+        { id: "N2", section: "Decisions", text: "Cap at 40k [00:00]", author: "user" },
+      ],
+      removed: [{ id: "N3", section: "Topics", text: "Lunch.", author: "model" }],
+      nextId: 4,
+    });
+    expect(recapRequest({ ...t, recap: edited }, "work", null).request.turns[0].content.endsWith(
+      [
+        "Notes the user took during the conversation: none.",
+        "Lines the user wrote in the recap, which stay in it as they are: they are true; write nothing that contradicts them, and do not write them again:\n- Decisions: Cap at 40k [00:00]",
+        "Lines the user removed from the recap, never to be written again:\n- Topics: Lunch.",
+      ].join("\n\n"),
+    )).toBe(true);
+    // A recap the user left as the model wrote it asks as before.
+    expect(recapRequest({ ...t, recap: recap() }, "work", null).request.turns[0].content.endsWith("[00:10] Me: Lunch at one.\n\nNotes the user took during the conversation: none.")).toBe(true);
+  });
+});
+
+describe("the end of a listening", () => {
+  it("writes the recap once something was heard, unless a recap of the kind picked covers every utterance already", () => {
+    expect(recapDue(heard([]), "work")).toBe(false);
+    expect(recapDue(heard([" "]), "work")).toBe(false);
+    expect(recapDue(heard(["One.", "Two."]), "work")).toBe(true);
+    expect(recapDue({ ...heard(["One.", "Two."]), recap: recap({ covered: 2 }) }, "work")).toBe(false);
+    expect(recapDue({ ...heard(["One.", "Two.", "Three."]), recap: recap({ covered: 2 }) }, "work")).toBe(true);
+    expect(recapDue({ ...heard(["One.", "Two."]), recap: recap({ covered: 2 }) }, "lesson")).toBe(true);
+  });
+});
+
+describe("the recap as kept", () => {
+  it("takes a rewrite's lines in place of the model's, keeping the user's lines, as the kind it was written as", () => {
+    const before = recap({
+      lines: [
+        { id: "N1", section: "Summary", text: "The budget.", author: "model" },
+        { id: "N2", section: "Decisions", text: "Cap at 40k [02:10]", author: "user" },
+      ],
+      nextId: 3,
+    });
+    expect(withRecap(before, { lines: [{ section: "Topics", text: "Concepts [00:10]" }], writtenAs: "lesson", covered: 5, writtenAt: 2_000, fromMs: null })).toEqual({
+      ...before,
+      kind: "lesson",
+      lines: [
+        { id: "N3", section: "Topics", text: "Concepts [00:10]", author: "model" },
+        { id: "N2", section: "Decisions", text: "Cap at 40k [02:10]", author: "user" },
+      ],
+      nextId: 4,
+      writtenAs: "lesson",
+      covered: 5,
+      writtenAt: 2_000,
+    });
+    expect(withRecap(undefined, { lines: [{ section: "Games", text: "Chess." }], writtenAs: "game", covered: 3, writtenAt: 1_000, fromMs: null })).toEqual({
+      ...noNotes("game"),
+      lines: [{ id: "N1", section: "Games", text: "Chess.", author: "model" }],
+      nextId: 2,
+      writtenAs: "game",
+      covered: 3,
+      writtenAt: 1_000,
+    });
+  });
+
+  it("leaves out a line written again word for word that the user wrote or removed", () => {
+    const before = recap({
+      lines: [
+        { id: "N1", section: "Summary", text: "The budget.", author: "model" },
+        { id: "N2", section: "Decisions", text: "Cap at 40k [02:10]", author: "user" },
+      ],
+      removed: [{ id: "N3", section: "Topics", text: "Lunch.", author: "model" }],
+      nextId: 4,
+    });
+    const lines = [
+      { section: "Decisions", text: "cap at 40k [02:10]" },
+      { section: "Topics", text: "Lunch." },
+      { section: "Topics", text: "The budget." },
+    ];
+    expect(withRecap(before, { lines, writtenAs: "work", covered: 3, writtenAt: 2_000, fromMs: null }).lines).toEqual([
+      { id: "N4", section: "Topics", text: "The budget.", author: "model" },
+      { id: "N2", section: "Decisions", text: "Cap at 40k [02:10]", author: "user" },
+    ]);
+  });
+
+  it("gives back Markdown in the recap's sections, in order, `—` for an empty one", () => {
+    const kept = recap({
+      lines: [
+        { id: "N2", section: "Figures & dates", text: "40k: the cap [02:10]", author: "model" },
+        { id: "N1", section: "Summary", text: "The budget.", author: "user" },
+      ],
+      nextId: 3,
+    });
+    expect(recapMarkdown(kept)).toBe(
+      [
+        "## Summary\n- The budget.",
+        "## Topics\n—",
+        "## People\n—",
+        "## Figures & dates\n- 40k: the cap [02:10]",
+        "## Decisions\n—",
+        "## Action items\n—",
+        "## Open questions\n—",
+      ].join("\n\n"),
+    );
+    expect(recapMarkdown(undefined)).toBe("");
+  });
+
+  it("says when it was written, from how much, and what came since", () => {
+    const at = recap({ writtenAt: new Date(2026, 9, 27, 16, 5).getTime(), covered: 4 });
+    expect(recapStatus(at, 4)).toBe("Written at 16:05 from 4 utterances.");
+    expect(recapStatus(at, 7)).toBe("Written at 16:05 from 4 utterances. 3 more since.");
+    expect(recapStatus({ ...at, covered: 1 }, 2)).toBe("Written at 16:05 from 1 utterance. 1 more since.");
+    // Utterances deleted since leave fewer than the recap covered: nothing came since, never a negative count.
+    expect(recapStatus(at, 2)).toBe("Written at 16:05 from 4 utterances.");
+    expect(recapStatus({ ...at, fromMs: 125_000 }, 4)).toBe("Written at 16:05 from 4 utterances, from 02:05 on: the start did not fit the model's context.");
+    expect(recapStatus(undefined, 4)).toBeNull();
+  });
+
+  it("reads back from the store as written, one never written or malformed as none", () => {
+    expect(readRecap(recap())).toEqual(recap());
+    expect(readRecap(noNotes("work"))).toBeUndefined();
+    expect(readRecap({ ...recap(), lines: [{ id: "N1", section: "Summary", text: "", author: "model" }] })).toBeUndefined();
+  });
+});

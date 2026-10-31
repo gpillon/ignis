@@ -28,13 +28,14 @@ type FakeCapture = { chunk: (samples: number, value?: number) => void; stopped: 
 
 const made: ListeningController[] = [];
 
-function harness(options: { pace?: number; decoded?: number; refuseMic?: Error; refusePick?: Error; decodeGate?: Promise<void> } = {}) {
+function harness(options: { pace?: number; decoded?: number; refuseMic?: Error; refusePick?: Error; decodeGate?: Promise<void>; video?: MediaStreamTrack } = {}) {
   const sessions: FakeSession[] = [];
   const mics: FakeCapture[] = [];
   const shared: FakeCapture[] = [];
   const heard: [number, Heard][] = [];
   const clocks: [number, number][] = [];
   const events: string[] = [];
+  const frames: MediaStreamTrack[] = [];
   let sharingEnded: (() => void) | null = null;
   const capture = (list: FakeCapture[]) => (onChunk: (pcm: Int16Array) => void): Capture => {
     const fake: FakeCapture = { chunk: (samples, value = 0) => onChunk(new Int16Array(samples).fill(value)), stopped: false };
@@ -67,7 +68,12 @@ function harness(options: { pace?: number; decoded?: number; refuseMic?: Error; 
       events.push("pick");
       if (options.refusePick) throw options.refusePick;
       sharingEnded = onEnded;
-      return {} as MediaStream;
+      const video = options.video;
+      return (video ? { getVideoTracks: () => [video], getTracks: () => [video] } : {}) as MediaStream;
+    },
+    grabFrame: async (track) => {
+      frames.push(track);
+      return new Blob(["a frame"], { type: "image/png" });
     },
     captureShared: async (_stream, onChunk) => capture(shared)(onChunk),
     decode: async (file) => {
@@ -86,7 +92,7 @@ function harness(options: { pace?: number; decoded?: number; refuseMic?: Error; 
   const controller = new ListeningController(deps);
   made.push(controller);
   const state = (): ListeningState => controller.getState();
-  return { controller, sessions, mics, shared, heard, clocks, events, state, session: (i = -1) => sessions.at(i)!, endSharing: () => sharingEnded?.() };
+  return { controller, sessions, mics, shared, heard, clocks, events, frames, state, session: (i = -1) => sessions.at(i)!, endSharing: () => sharingEnded?.() };
 }
 
 /** Lets the captures' promises settle. */
@@ -346,6 +352,39 @@ describe("a call (Q93, Q112)", () => {
     expect(h.state().phase).toBe("idle");
     expect(h.state().notice).toEqual({ text: SHARING_ENDED, tone: "ash" });
     expect(h.sessions.map((s) => s.calls)).toEqual([["flush", "close"], ["flush", "close"]]);
+  });
+
+  it("takes a frame of what the call shares only when asked, and only while it shares a picture (#431)", async () => {
+    const screen = { kind: "video", readyState: "live", stop: () => {} } as unknown as MediaStreamTrack;
+    const h = harness({ video: screen });
+    h.controller.start({ transcript: 4, clockMs: 0, source: { kind: "call" }, speakers: true, context: NOTHING_TOLD });
+    expect(h.state().sharing).toBe(false);
+    await settle();
+    expect(h.state().sharing).toBe(true);
+    // A capture runs only on a click: nothing was taken by the pick itself.
+    expect(h.frames).toEqual([]);
+    expect(await h.controller.captureFrame()).toBeInstanceOf(Blob);
+    expect(h.frames).toEqual([screen]);
+    void h.controller.stop();
+    await settle();
+    for (const s of h.sessions) s.emit({ type: "flushed" });
+    expect(h.state()).toMatchObject({ phase: "idle", sharing: false });
+    expect(await h.controller.captureFrame()).toBeNull();
+    expect(h.frames).toHaveLength(1);
+  });
+
+  it("has no frame to take from the microphone, nor from a pick whose picture has ended (#431)", async () => {
+    const mic = harness();
+    mic.controller.start({ transcript: 4, clockMs: 0, source: { kind: "microphone" }, speakers: true, context: NOTHING_TOLD });
+    await settle();
+    expect(mic.state().sharing).toBe(false);
+    expect(await mic.controller.captureFrame()).toBeNull();
+    const ended = harness({ video: { kind: "video", readyState: "ended", stop: () => {} } as unknown as MediaStreamTrack });
+    ended.controller.start({ transcript: 4, clockMs: 0, source: { kind: "call" }, speakers: true, context: NOTHING_TOLD });
+    await settle();
+    expect(ended.state().sharing).toBe(false);
+    expect(await ended.controller.captureFrame()).toBeNull();
+    expect(mic.frames.length + ended.frames.length).toBe(0);
   });
 
   it("says the sharing ended when it ends while a busy server is waited on", async () => {

@@ -24,7 +24,7 @@ import { ServerView } from "../server/ServerView.tsx";
 import { useServer, useTick } from "../server/useServer.ts";
 import { DEFAULT_SETTINGS, type PlaygroundSettings } from "../settings/defaults.ts";
 import { escapeFree } from "../ui/Sheet.tsx";
-import type { ImageId } from "../store/imageStore.ts";
+import { type ImageId, namedBy } from "../store/imageStore.ts";
 import { pageStore } from "../store/index.ts";
 import { SettingsPanel } from "../settings/SettingsPanel.tsx";
 import { lastReply } from "../sessions/sessions.ts";
@@ -43,6 +43,7 @@ import { StoreWorkspaceFiles } from "../workspace/WorkspaceFiles.tsx";
 import { WorkspacePanel } from "../workspace/WorkspacePanel.tsx";
 import { ChatWorkspaceBar } from "../workspace/WorkspacePicker.tsx";
 import { pageWorkspaces } from "../workspace/workspaces.ts";
+import { useHasVision } from "../workspace/vision.ts";
 import { Header, type View } from "./Header.tsx";
 import { KeyPage } from "./KeyPage.tsx";
 import { TransportNotice } from "./TransportNotice.tsx";
@@ -99,9 +100,11 @@ export function App() {
   const [decideDrawer, setDecideDrawer] = useState<DecideDrawer>(null);
   // The model the next message goes to: the one loaded, unless the owner picks another or the image model is loaded.
   const nextModel = useNextModel(model);
-  // The pictures the Image view's sessions name, for the chat's deletes: the view is held below the chat.
+  // The pictures the Image view's sessions name, for the chat's deletes: the view is held below the chat. The
+  // Transcripts' context images the same (#431).
   const studioPictures = useRef<() => Iterable<ImageId> | null>(() => null);
-  const chat = useConversation({ model, next: nextModel.next, refreshModel, settings, tools, parallel, live: () => studioPictures.current() });
+  const transcriptPictures = useRef<() => Iterable<ImageId> | null>(() => null);
+  const chat = useConversation({ model, next: nextModel.next, refreshModel, settings, tools, parallel, live: () => namedBy(studioPictures.current(), transcriptPictures.current()) });
   const { active } = chat;
   // The chat's workspace (spec #170): its picker in the chat's header, and the panel of its files on the right.
   const workspaces = pageWorkspaces();
@@ -131,16 +134,23 @@ export function App() {
   // header shows a listening from every view.
   const [transcribeOpened, setTranscribeOpened] = useState(false);
   const [transcribeDrawer, setTranscribeDrawer] = useState<TranscribeDrawer>(null);
-  const [transcribe, transcribeActions, listening, assistants] = useTranscribe({
+  // Whether that text model has vision: a Transcript's context images wait to be read until one does (#437).
+  const textVision = useHasVision(model);
+  const [transcribe, transcribeActions, listening, assistants, transcribePictures] = useTranscribe({
     speech: model.speech,
     // The notes go to the text model loaded, never to another: no request of theirs names one.
-    text: { blocked: textModelBlocked(model), contextLimit: canChat(model) ? model.contextLimit : null },
+    text: { blocked: textModelBlocked(model), contextLimit: canChat(model) ? model.contextLimit : null, vision: textVision },
     onUnavailable: refreshModel,
+    elsewhere: async () => namedBy(chat.pictures(), studioPictures.current(), await pageWorkspaces().pictures().catch(() => null)),
   });
+  transcriptPictures.current = transcribePictures;
   // Held here, not in the view: the chat hands pictures to it.
   // Each keeps the pictures the other names when it deletes a session, and those of the workspaces: the store holds
   // every view's pictures once.
-  const [studio, studioActions] = useImageSessions(model, refreshModel, imaging, { live: chat.pictures, held: () => pageWorkspaces().pictures() });
+  const [studio, studioActions] = useImageSessions(model, refreshModel, imaging, {
+    live: () => namedBy(chat.pictures(), transcribePictures()),
+    held: () => pageWorkspaces().pictures(),
+  });
   studioPictures.current = () => (studio.loaded ? studio.sessions.flatMap((s) => [...imagesOf(s)]) : null);
   const [chatMarking, setChatMarking] = useState<ChatMarking | null>(null);
   // A switch or a load runs the header's flame and heat bar as a reply does (spec playground/05).

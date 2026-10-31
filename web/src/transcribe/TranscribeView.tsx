@@ -6,6 +6,7 @@ import { hitsIn, matchesOf } from "./search.ts";
 import { useWatched } from "./assist.ts";
 import { onJump } from "./jump.ts";
 import { ContextCard } from "./Context.tsx";
+import { type ImageAdding, ImagesCard, useImageAdding } from "./ContextImages.tsx";
 import { AskBar } from "./Ask.tsx";
 import type { CallContext } from "./context.ts";
 import { useSavedContext } from "./defaultContext.ts";
@@ -16,7 +17,10 @@ import { Suggestions } from "./Suggestions.tsx";
 import { openSuggestions } from "./suggestions.ts";
 import { Switch } from "../ui/Switch.tsx";
 import { HintText } from "../speech/Dictation.tsx";
-import { fileStem, toMarkdown, toSrt, toText, toVtt } from "./export.ts";
+import { fileStem, toSrt, toText, toVtt } from "./export.ts";
+import { toMarkdown, transcriptMarkdown } from "./markdown.ts";
+import { choosePdfOptions, lastPdfOptions, type PdfOptions } from "./pdf.ts";
+import { PdfDialog, PdfPrint } from "./PrintView.tsx";
 import { StoreWorkspaceChooser } from "../workspace/WorkspaceChooser.tsx";
 import { type Destination, sentLine } from "../workspace/send.ts";
 import { pageWorkspaces, type Workspaces } from "../workspace/workspaces.ts";
@@ -32,8 +36,9 @@ import type { Assistants, TranscribeActions, TranscribeState } from "./useTransc
 // The Transcribe view (spec speech/07), in the Decide tab's three-column
 // shape: the Transcripts on the left; the one open in the middle, its heading
 // and exports above the sheet and the deck at its foot; on the right three
-// tabs (Q129): Call, what the transcription is told (the context) and who
-// speaks; Notes (Notes.tsx); Settings, the view's own.
+// tabs (Q129): Call, what the transcription is told (the context), its
+// context images (ContextImages.tsx) and who speaks; Notes (Notes.tsx);
+// Settings, the view's own.
 // Below `lg` the two side columns are drawers the header opens. The state is
 // the page's (useTranscribe.ts): a listening goes on while the view is hidden.
 
@@ -80,6 +85,9 @@ export function TranscribeView({
   const at = hits.length === 0 ? 0 : Math.min(current, hits.length - 1);
   const searchField = useRef<HTMLInputElement>(null);
   const saved = useSavedContext();
+  // A context image (#431): a paste anywhere in the view while it shows, a file or Capture in the Call tab.
+  const shown = useRef<HTMLDivElement>(null);
+  const adding = useImageAdding({ transcript: state.active, listening: handle, actions, view: shown });
   // What did I miss?: what it reads, tinted on the spine while it is moved from the last five minutes or pointed at.
   const [previewing, setPreviewing] = useState(false);
   const missedFrom = state.missedFrom;
@@ -104,6 +112,7 @@ export function TranscribeView({
   const rewrite = useWatched(assistants.rewriter);
   const asking = useWatched(assistants.asker);
   const looking = useWatched(assistants.analyst);
+  const imageReading = useWatched(assistants.reader);
   const keepingUp = here && listening.phase !== "idle" && state.suggestionsOn;
   // Held still between changes: the sheet is drawn again only when what it is handed changes.
   const untilMs = state.active.checkedUntilMs;
@@ -140,8 +149,9 @@ export function TranscribeView({
   }, [drawer, onDrawer]);
 
   return (
-    <div className="relative flex min-h-0 flex-1">
+    <div ref={shown} className="relative flex min-h-0 flex-1">
       {drawer && <div className="fixed inset-0 z-30 bg-[#1c2026]/60 lg:hidden" onClick={() => onDrawer(null)} aria-hidden />}
+      {adding.editor}
 
       <Transcripts
         list={state.list}
@@ -199,6 +209,8 @@ export function TranscribeView({
           asking={asking.transcript === state.active.id ? asking : null}
           readingFrom={readingFrom}
           canAsk={state.textBlocked === null}
+          imageReading={imageReading}
+          canRead={state.textBlocked === null && state.vision}
         />
         <AskBar transcript={state.active} state={state} actions={actions} asking={asking} onPreview={setPreviewing} />
         <Deck
@@ -223,7 +235,16 @@ export function TranscribeView({
         {tab === "call" && (
           <>
             <Suggestions transcript={state.active} state={state} actions={actions} analyst={assistants.analyst} />
-            <Call transcript={state.active} state={state} actions={actions} live={here && listening.phase !== "idle"} saved={saved} flagged={checkingContext} />
+            <Call
+              transcript={state.active}
+              state={state}
+              actions={actions}
+              live={here && listening.phase !== "idle"}
+              saved={saved}
+              flagged={checkingContext}
+              sharing={here && listening.sharing}
+              adding={adding}
+            />
           </>
         )}
         {tab === "notes" && <Notes transcript={state.active} state={state} actions={actions} notes={assistants.notes} />}
@@ -462,11 +483,14 @@ function Side({ open, tab, onTab, waiting, children }: { open: boolean; tab: Sid
   );
 }
 
-/** The heading's exports: Copy, the four downloads behind one menu, and Open in chat. */
+/** The heading's exports: Copy, the four downloads and the PDF behind one menu, and Open in chat. */
 function Exports({ transcript: t, onOpenInChat, workspaces }: { transcript: Transcript; onOpenInChat: (markdown: string) => void; workspaces?: Workspaces }) {
   const [copied, setCopied] = useState(false);
   const [choosing, setChoosing] = useState(false);
   const [sent, setSent] = useState<string | null>(null);
+  // The PDF dialog's options while it is open; then the PDF being printed, a new one at each press.
+  const [pdf, setPdf] = useState<PdfOptions | null>(null);
+  const [printing, setPrinting] = useState<{ options: PdfOptions; press: number } | null>(null);
   const menu = useRef<HTMLDetailsElement>(null);
   const nothing = t.utterances.every((u) => u.text.trim() === "");
   return (
@@ -484,37 +508,65 @@ function Exports({ transcript: t, onOpenInChat, workspaces }: { transcript: Tran
       >
         {copied ? "Copied" : "Copy"}
       </button>
-      <details ref={menu} className={`group relative ${nothing ? "pointer-events-none opacity-50" : ""}`}>
-        <summary
-          aria-disabled={nothing}
-          className="flex cursor-pointer list-none items-center gap-1 border border-line px-2.5 py-1.5 font-display text-[13px] font-medium text-ink hover:border-ember [&::-webkit-details-marker]:hidden"
-        >
-          <IconDownload />
-          Download
-          <IconChevron className="rotate-180 transition-transform group-open:rotate-0 motion-reduce:transition-none" />
-        </summary>
-        <ul className="absolute right-0 z-20 mt-1 flex min-w-36 flex-col border border-line bg-surface py-1 shadow-lg">
-          {EXPORTS.map((format) => (
-            <li key={format.extension}>
+      <div className="relative">
+        <details ref={menu} className={`group relative ${nothing ? "pointer-events-none opacity-50" : ""}`}>
+          <summary
+            aria-disabled={nothing}
+            className="flex cursor-pointer list-none items-center gap-1 border border-line px-2.5 py-1.5 font-display text-[13px] font-medium text-ink hover:border-ember [&::-webkit-details-marker]:hidden"
+          >
+            <IconDownload />
+            Download
+            <IconChevron className="rotate-180 transition-transform group-open:rotate-0 motion-reduce:transition-none" />
+          </summary>
+          <ul className="absolute right-0 z-20 mt-1 flex min-w-36 flex-col border border-line bg-surface py-1 shadow-lg">
+            {EXPORTS.map((format) => (
+              <li key={format.extension}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    download(t, format);
+                    menu.current?.removeAttribute("open");
+                  }}
+                  className="w-full px-3 py-1.5 text-left font-display text-[13px] text-ink hover:bg-line"
+                >
+                  {format.label}
+                </button>
+              </li>
+            ))}
+            <li className="mt-1 border-t border-line pt-1">
               <button
                 type="button"
                 onClick={() => {
-                  download(t, format);
+                  setPdf(lastPdfOptions());
                   menu.current?.removeAttribute("open");
                 }}
                 className="w-full px-3 py-1.5 text-left font-display text-[13px] text-ink hover:bg-line"
               >
-                {format.label}
+                PDF…
               </button>
             </li>
-          ))}
-        </ul>
-      </details>
+          </ul>
+        </details>
+        {pdf && (
+          <PdfDialog
+            transcript={t}
+            options={pdf}
+            onOptions={setPdf}
+            onPrint={() => {
+              choosePdfOptions(pdf);
+              setPdf(null);
+              setPrinting({ options: pdf, press: Date.now() });
+            }}
+            onCancel={() => setPdf(null)}
+          />
+        )}
+        {printing && <PdfPrint key={printing.press} transcript={t} options={printing.options} onDone={() => setPrinting(null)} />}
+      </div>
       <button
         type="button"
         disabled={nothing}
         title="A new chat opens with the transcript in its prompt box. Nothing is sent until you press Send."
-        onClick={() => onOpenInChat(toMarkdown(t))}
+        onClick={() => onOpenInChat(transcriptMarkdown(t))}
         className="px-1.5 font-display text-[13px] font-semibold text-ember hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:no-underline"
       >
         Open in chat
@@ -556,14 +608,35 @@ function Exports({ transcript: t, onOpenInChat, workspaces }: { transcript: Tran
   );
 }
 
-/** The Call tab: what the transcription is told, and who speaks. */
-function Call({ transcript: t, state, actions, live, saved, flagged }: { transcript: Transcript; state: TranscribeState; actions: TranscribeActions; live: boolean; saved: CallContext | null; flagged: boolean }) {
+/** The Call tab: what the transcription is told, its context images, and who speaks. */
+export function Call({
+  transcript: t,
+  state,
+  actions,
+  live,
+  saved,
+  flagged,
+  sharing = false,
+  adding,
+}: {
+  transcript: Transcript;
+  state: TranscribeState;
+  actions: TranscribeActions;
+  live: boolean;
+  saved: CallContext | null;
+  flagged: boolean;
+  /** The listening appending here is a call that shares a picture: Capture is offered. */
+  sharing?: boolean;
+  adding: Pick<ImageAdding, "open" | "capture" | "capturing" | "error">;
+}) {
   const counts = new Map<number, number>();
   for (const u of t.utterances) if (u.speaker !== null) counts.set(u.speaker, (counts.get(u.speaker) ?? 0) + 1);
 
   return (
     <>
       <ContextCard transcript={t} draft={state.draft} maxTokens={state.contextTokens} live={live} saved={saved} flagged={flagged} actions={actions} />
+
+      <ImagesCard transcript={t} sharing={sharing} canRead={state.textBlocked === null && state.vision} adding={adding} />
 
       <section aria-labelledby="transcribe-speakers" className="flex flex-col gap-2.5">
         <h2 id="transcribe-speakers" className={caption}>

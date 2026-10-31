@@ -3,19 +3,24 @@ import { keyRequired } from "../api/auth.ts";
 import { STORED_FLAGS, useStoredFlag } from "../app/storedFlag.ts";
 import type { SpeechStatus } from "../api/model.ts";
 import { speakersUnavailable } from "../speech/availability.ts";
-import { captureStream, pickSharedAudio, startCapture } from "../speech/capture.ts";
+import { captureStream, grabFrame, pickSharedAudio, startCapture } from "../speech/capture.ts";
 import { openListening } from "../speech/realtime.ts";
 import { mergeLoaded } from "../store/docs.ts";
 import { pageStore } from "../store/index.ts";
+import type { ImageId } from "../store/imageStore.ts";
+import { keepPicture } from "../store/pictures.ts";
+import type { RedactedPicture } from "../markup/markup.ts";
 import { useStoredSessions } from "../store/useStoredSessions.ts";
 import { decodeFile } from "./file.ts";
 import { filePace } from "./filePace.ts";
 import { chooseUtteranceSilence, utteranceSilence } from "./silence.ts";
-import { chooseNoteKind, kindOf, type NoteKind, noNotes } from "./notes.ts";
+import { chooseNoteKind, kindOf, type NoteKind, type NoteLine, noNotes, type Notes } from "./notes.ts";
+import { addLine, editLine, removeLine } from "./noteEdits.ts";
+import { withRecap } from "./recap.ts";
 import { type CallContext, contextAtStart, contextOf, contextTokensOf, copiedDraft, DEFAULT_CONTEXT_TOKENS, mergeDraft, told } from "./context.ts";
 import { savedContext, saveContext } from "./defaultContext.ts";
 import { readConfig } from "../server/routes.ts";
-import { type NotesHandle, NotesWriter } from "./notesWriter.ts";
+import { type NotesForm, type NotesHandle, NotesWriter } from "./notesWriter.ts";
 import { Analyst, type AnalystHandle } from "./analyst.ts";
 import { acceptRewrite, Rewriter, type RewriterHandle } from "./rewrite.ts";
 import { Asker, type AskerHandle, withAnswer } from "./ask.ts";
@@ -24,6 +29,9 @@ import { accept, analysisOffers, dismiss, dropTerm, followFixes, languageOffer, 
 import { ListeningController, type ListeningHandle, type ListeningSource } from "./listening.ts";
 import { activeOf, freeTranscriptId, openTranscript, removeTranscript, startList, type TranscriptList, updateTranscript } from "./sessions.ts";
 import { restoreTranscripts, TRANSCRIBE_SESSIONS, toStored, worthKeeping } from "./stored.ts";
+import { addContextImage, freedBy, picturesOf } from "./contextImages.ts";
+import { ImageReader, type ImageReaderHandle, landed } from "./imageReading.ts";
+import { redrawn } from "../conversation/images.ts";
 import {
   addUtterance,
   beginListening,
@@ -68,6 +76,8 @@ export type TranscribeState = {
   notesLive: boolean;
   /** Why the notes and the suggestions cannot ask the text model now (notes.ts), `null` while one serves. */
   textBlocked: string | null;
+  /** The text model has vision, as the server reports it: the context images are read (#437). */
+  vision: boolean;
   /** What the server reads of a context, `speech.context_max_tokens` (512 until the configuration is read). */
   contextTokens: number;
   /** Suggest while listening (Q132): this browser's, on at first. */
@@ -131,10 +141,21 @@ export type TranscribeActions = {
   clearMissed: () => void;
   /** The open Transcript's kind of notes, and this browser's next default. */
   setNoteKind: (kind: NoteKind) => void;
-  /** Writes the open Transcript's notes now. */
+  /** Updates the open Transcript's running notes now. */
   writeNotes: () => void;
+  /** Writes the open Transcript's running notes again from scratch: the model's lines dropped, the user's kept. */
+  rewriteNotes: () => void;
+  /** Writes the open Transcript's recap now, from the whole of it. */
+  writeRecap: () => void;
+  /** Stops the writing under way, the notes' or the recap's. */
   stopNotes: () => void;
   setNotesLive: (on: boolean) => void;
+  /** A line of the open Transcript's running notes or recap, as the user saw it, edited by hand and now theirs; emptied, removed. */
+  editNote: (form: NotesForm, line: NoteLine, text: string) => void;
+  /** The user's line added at the end of a section of the open Transcript's running notes or recap. */
+  addNote: (form: NotesForm, section: string, text: string) => void;
+  /** A line of the open Transcript's running notes or recap removed by hand: it never comes back. */
+  removeNote: (form: NotesForm, line: NoteLine) => void;
   /** The open Transcript's suggestion accepted; `always`, and every later one of its kind (Q132). */
   acceptSuggestion: (id: number, always?: boolean) => void;
   dismissSuggestion: (id: number) => void;
@@ -144,13 +165,25 @@ export type TranscribeActions = {
   suggestNow: () => void;
   stopSuggesting: () => void;
   setSuggestionsOn: (on: boolean) => void;
+  /**
+   * Keeps an edited picture in the page's store and adds it to Transcript `id` at `atMs` as a context image (#431);
+   * rejects with why the store refused it.
+   */
+  addImage: (id: number, picture: RedactedPicture, atMs: number) => Promise<void>;
+  /** A frame of what the call shares, for a context image; null while no call shares one (#431). */
+  captureFrame: () => Promise<Blob | null>;
+  /** Reads again a context image of the open Transcript whose reading failed (#437). */
+  readImageAgain: (image: number) => void;
 };
 
-/** The page's helpers on the text model: the notes' writer and the look for suggestions. */
-export type Assistants = { notes: NotesHandle; analyst: AnalystHandle; rewriter: RewriterHandle; asker: AskerHandle };
+/** The pictures the Transcripts name in the page's store, or null until they are read: what the other views' deletes keep. */
+export type TranscribePictures = () => Set<ImageId> | null;
 
-/** The text model, as the notes need it: why none serves, and its context. */
-export type TextModel = { blocked: string | null; contextLimit: number | null };
+/** The page's helpers on the text model: the notes' writer, the look for suggestions, the context images' reader. */
+export type Assistants = { notes: NotesHandle; analyst: AnalystHandle; rewriter: RewriterHandle; asker: AskerHandle; reader: ImageReaderHandle };
+
+/** The text model, as the notes need it: why none serves, its context, and whether it has vision (#437). */
+export type TextModel = { blocked: string | null; contextLimit: number | null; vision: boolean };
 
 /** How long a deleted utterance's Undo stands. */
 export const UNDO_DELETE_MS = 8_000;
@@ -162,11 +195,17 @@ export function useTranscribe({
   speech,
   text,
   onUnavailable,
+  elsewhere,
 }: {
   speech?: SpeechStatus;
   text: TextModel;
   onUnavailable: () => void;
-}): [TranscribeState, TranscribeActions, ListeningHandle, Assistants] {
+  /**
+   * The pictures the other views name now (the chat's sessions, the Image view's, the workspaces'), or null while one
+   * cannot say yet: deleting a Transcript keeps them, and while null frees no picture.
+   */
+  elsewhere?: () => Promise<Iterable<ImageId> | null>;
+}): [TranscribeState, TranscribeActions, ListeningHandle, Assistants, TranscribePictures] {
   const [list, setList] = useState<TranscriptList>(() => startList());
   /** The draft, the Transcript it is of, and its context when Edit opened it: an Apply merges onto what it holds then. */
   const [drafting, setDrafting] = useState<{ id: number; base: CallContext; context: CallContext } | null>(null);
@@ -188,8 +227,8 @@ export function useTranscribe({
   holdMicRef.current = holdMic;
   const listNow = useRef(list);
   listNow.current = list;
-  const latest = useRef({ onUnavailable, text });
-  latest.current = { onUnavailable, text };
+  const latest = useRef({ onUnavailable, text, elsewhere });
+  latest.current = { onUnavailable, text, elsewhere };
   const [notesLive, storeNotesLive] = useStoredFlag(STORED_FLAGS.transcribeNotesLive, false);
   const [suggestionsOn, storeSuggestionsOn] = useStoredFlag(STORED_FLAGS.transcribeSuggestions, true);
 
@@ -200,6 +239,7 @@ export function useTranscribe({
         captureMic: (onChunk) => startCapture(onChunk),
         pickShared: (onEnded) => pickSharedAudio(onEnded),
         captureShared: (stream, onChunk) => captureStream(stream, onChunk),
+        grabFrame: (track) => grabFrame(track),
         decode: (file) => decodeFile(file),
         filePaceSeconds: filePace,
         onUtterance: (id, utterance) => setList((l) => updateTranscript(l, id, (t) => addUtterance(t, utterance))),
@@ -213,7 +253,9 @@ export function useTranscribe({
   const [writer] = useState(
     () =>
       new NotesWriter({
-        onWritten: (id, written) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, notes: { ...(t.notes ?? noNotes(written.writtenAs ?? "general")), ...written } }))),
+        // Each call the notes thread applies lands as it comes, on the notes the Transcript holds then.
+        onNotes: (id, change) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, notes: change(t.notes) }))),
+        onRecap: (id, written) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, recap: withRecap(t.recap, written) }))),
       }),
   );
   useEffect(() => () => writer.stop(), [writer]);
@@ -237,6 +279,30 @@ export function useTranscribe({
     () => new Asker({ onAnswered: (id, question, answer, untilMs) => setList((l) => updateTranscript(l, id, (t) => ({ ...t, asked: withAnswer(t.asked, question, answer, Date.now(), untilMs) }))) }),
   );
   useEffect(() => () => asker.stop(), [asker]);
+  const [reader] = useState(
+    () =>
+      new ImageReader({
+        // The picture as the chat's go to the model: redrawn, its long edge bounded, as a JPEG.
+        picture: async (id) => {
+          const blob = await pageStore().getImage(id);
+          if (!blob) throw new Error("it is no longer in this browser");
+          return redrawn(blob, "context-image.png");
+        },
+        // Its reading on the image, and its terms and topic offered, or applied when accepted always.
+        onRead: (id, image, reading) => setList((l) => updateTranscript(l, id, (t) => landed(t, image, reading, Date.now()))),
+      }),
+  );
+  useEffect(() => () => reader.stop(), [reader]);
+  // The context images, read one at a time as they come while a text model with vision serves; until one does, they
+  // wait (#437). Each is read once, whatever Transcript it is in.
+  const canRead = text.blocked === null && text.vision;
+  const readAll = useMemo(
+    () => () => void reader.keepUp(() => listNow.current.transcripts, () => latest.current.text.blocked === null && latest.current.text.vision),
+    [reader],
+  );
+  useEffect(() => {
+    if (canRead) readAll();
+  }, [list, canRead, readAll]);
 
   // Where What did I miss? reads from (missed.ts): from what the user had seen when they left the page, hidden or its
   // window left, for a minute or more while listening; or from a moment they picked.
@@ -303,6 +369,16 @@ export function useTranscribe({
       });
       return { loaded: restored.transcripts, stamps: restored.stamps };
     },
+    // A Transcript's context images go with it, unless another Transcript or another view names the same picture.
+    onRemoved: (gone, left) => {
+      const others = latest.current.elsewhere?.() ?? Promise.resolve([]);
+      void others.then(
+        (named) => {
+          for (const id of freedBy(gone, left, named)) void pageStore().deleteImage(id).catch(() => {});
+        },
+        () => {},
+      );
+    },
   });
 
   const struck = speech ? speakersUnavailable(speech) : null;
@@ -321,6 +397,21 @@ export function useTranscribe({
   const change = (id: number, apply: (t: Transcript) => Transcript) => setList((l) => updateTranscript(l, id, apply));
   /** A correction is the open Transcript's. */
   const correct = (apply: (t: Transcript) => Transcript) => setList((l) => updateTranscript(l, l.activeId, apply));
+  /**
+   * The open Transcript's notes edited by hand (noteEdits.ts): the running notes through the writer, so an update under
+   * way holds the edit before the model's next call; the recap, which no thread holds, in place.
+   */
+  const byHand = (form: NotesForm, edit: (notes: Notes) => Notes) => {
+    if (form === "running") writer.editNotes(listNow.current.activeId, edit);
+    else correct((t) => (t.recap ? { ...t, recap: edit(t.recap) } : t));
+  };
+  /** A press of Write notes, Rewrite from scratch or Write the recap: the open Transcript's, while a text model serves. */
+  const writing = (how: "write" | "rewrite" | "writeRecap") => {
+    const { text: model } = latest.current;
+    if (model.blocked !== null) return;
+    const t = activeOf(listNow.current);
+    void writer[how](t, kindOf(t), model.contextLimit);
+  };
 
   const actions = useMemo<TranscribeActions>(
     () => ({
@@ -442,14 +533,14 @@ export function useTranscribe({
         chooseNoteKind(kind);
         correct((t) => ({ ...t, notes: { ...(t.notes ?? noNotes(kind)), kind } }));
       },
-      writeNotes: () => {
-        const { text: model } = latest.current;
-        if (model.blocked !== null) return;
-        const t = activeOf(listNow.current);
-        void writer.write(t, kindOf(t), model.contextLimit);
-      },
+      writeNotes: () => writing("write"),
+      rewriteNotes: () => writing("rewrite"),
+      writeRecap: () => writing("writeRecap"),
       stopNotes: () => writer.stop(),
       setNotesLive: (on) => storeNotesLive(on),
+      editNote: (form, line, text) => byHand(form, (n) => editLine(n, line, text)),
+      addNote: (form, section, text) => byHand(form, (n) => addLine(n, section, text)),
+      removeNote: (form, line) => byHand(form, (n) => removeLine(n, line)),
       acceptSuggestion: (id, always = false) => correct((t) => accept(t, id, Date.now(), { always })),
       dismissSuggestion: (id) => correct((t) => dismiss(t, id)),
       dropSuggestedTerm: (id, term) => correct((t) => dropTerm(t, id, term)),
@@ -459,9 +550,18 @@ export function useTranscribe({
       },
       stopSuggesting: () => analyst.stop(),
       setSuggestionsOn: (on) => storeSuggestionsOn(on),
+      addImage: async (id, picture, atMs) => {
+        const stored = await keepPicture(pageStore(), picture.blob);
+        change(id, (t) => addContextImage(t, { image: stored.id, atMs, width: picture.width, height: picture.height }, Date.now()));
+      },
+      captureFrame: () => controller.captureFrame(),
+      readImageAgain: (image) => {
+        reader.retry(listNow.current.activeId, image);
+        readAll();
+      },
     }),
     // The stored flags' setters are stable for their keys.
-    [controller, writer, analyst, rewriter, asker, storeSpeakers, storeHoldMic, storeNotesLive, storeSuggestionsOn],
+    [controller, writer, analyst, rewriter, asker, reader, readAll, storeSpeakers, storeHoldMic, storeNotesLive, storeSuggestionsOn],
   );
 
   return [
@@ -475,6 +575,7 @@ export function useTranscribe({
       holdMic,
       notesLive,
       textBlocked: text.blocked,
+      vision: text.vision,
       contextTokens,
       suggestionsOn,
       missedFrom: missed?.transcript === active.id ? missed.from : null,
@@ -482,6 +583,7 @@ export function useTranscribe({
     },
     actions,
     controller,
-    { notes: writer, analyst, rewriter, asker },
+    { notes: writer, analyst, rewriter, asker, reader },
+    () => (kept.loaded ? new Set(listNow.current.transcripts.flatMap((t) => [...picturesOf(t)])) : null),
   ];
 }

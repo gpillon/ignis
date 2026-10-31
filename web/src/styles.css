@@ -581,6 +581,159 @@
   .notes .md ol {
     padding-left: 1.1em;
   }
+  /* An update's changes (transcribe/marks.ts): a line added or changed burns
+     an ember border over the spine for a few seconds; a removed one stays
+     struck and dimmed until it goes. */
+  .notes .md li[data-mark] {
+    position: relative;
+  }
+  .notes .md li[data-mark="fresh"]::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: calc(-1.1em - 0.875rem);
+    width: 2px;
+    background: var(--ember);
+    animation: note-mark-in 0.35s ease-out;
+  }
+  .notes .md li[data-mark="gone"] {
+    color: var(--ash);
+    opacity: 0.6;
+  }
+  @keyframes note-mark-in {
+    from {
+      opacity: 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .notes .md li[data-mark="fresh"]::before {
+      animation: none;
+    }
+  }
+  /* The notes' own lines (transcribe/Notes.tsx, #436): each section stacks
+     its heading, its lines and a + at its foot; every line draws its bullet,
+     the model's burnt ember, the user's hollow in ink, the quiet mark of a
+     line updates leave as it is. A line is a click away from editing, and its
+     × shows on hover. */
+  .notes .md > .note-section + .note-section {
+    margin-top: 1.3em;
+  }
+  .notes .md .note-section > h2 {
+    margin-top: 0;
+  }
+  .notes .md .note-section > * + * {
+    margin-top: 0.35em;
+  }
+  .notes .md li[data-author] {
+    position: relative;
+    padding-right: 1.3em;
+    list-style: none;
+  }
+  .notes .md li[data-author]::after {
+    content: "";
+    position: absolute;
+    top: calc(0.75em - 2.5px);
+    left: -0.8em;
+    width: 5px;
+    height: 5px;
+    background: var(--ember);
+  }
+  .notes .md li[data-author="user"]::after {
+    border: 1px solid var(--ink);
+    background: transparent;
+  }
+  .notes .md li[data-author]:has(> input[type="checkbox"])::after {
+    content: none;
+  }
+  .notes .note-text {
+    border-radius: 2px;
+    cursor: text;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+  }
+  .notes .note-text:hover {
+    background: color-mix(in oklab, var(--surface) 70%, transparent);
+  }
+  .notes .note-text:focus-visible {
+    outline: 1px solid var(--ember);
+    outline-offset: 1px;
+  }
+  .notes .note-remove {
+    position: absolute;
+    top: calc(0.75em - 7px);
+    right: 0;
+    display: flex;
+    padding: 2px;
+    color: var(--ash);
+    opacity: 0;
+    transition: opacity 120ms;
+  }
+  .notes .note-remove svg {
+    width: 10px;
+    height: 10px;
+  }
+  .notes li:hover > .note-remove,
+  .notes .note-remove:focus-visible {
+    opacity: 1;
+  }
+  .notes .note-remove:hover {
+    color: var(--fault);
+  }
+  .notes .md .note-section > .note-add {
+    display: flex;
+    align-items: center;
+    gap: calc(0.8em - 7px);
+    margin-top: 0.15em;
+    color: var(--ash);
+  }
+  .notes .note-add svg {
+    width: 9px;
+    height: 9px;
+    margin-left: calc(0.3em - 2px);
+    opacity: 0.6;
+    transition: opacity 120ms;
+  }
+  .notes .note-add span {
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 12px;
+    opacity: 0;
+    transition: opacity 120ms;
+  }
+  .notes .note-section:hover .note-add svg,
+  .notes .note-add:focus-visible svg {
+    opacity: 1;
+  }
+  .notes .note-section:hover .note-add span,
+  .notes .note-add:focus-visible span {
+    opacity: 1;
+  }
+  .notes .note-add:hover {
+    color: var(--ember);
+  }
+  .notes .note-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2em;
+  }
+  .notes .note-section > .note-editor {
+    margin-left: 1.1em;
+  }
+  /* No hover on a touch screen: × and + stay in view. */
+  @media (hover: none) {
+    .notes .note-remove,
+    .notes .note-add svg,
+    .notes .note-add span {
+      opacity: 1;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .notes .note-remove,
+    .notes .note-add svg,
+    .notes .note-add span {
+      transition: none;
+    }
+  }
   .notes-answer .md {
     font-size: 13px;
   }
@@ -692,5 +845,216 @@
   .heat-fill {
     background: linear-gradient(90deg, #ff5a1f, #ff8a2a 55%, #ff5a1f);
     color: #1c2026;
+  }
+}
+
+/* A transcript's PDF (transcribe/PrintView.tsx, spec #428): a sheet the page
+   prints alone while it stands, on A4, light whatever the page's scheme, in
+   the brand's three faces, Chakra Petch for the headings, Instrument Sans for
+   the text, JetBrains Mono for the times. The ember marks the rules, the
+   speakers and Ask's answer boxes; the screen's time spine runs down the
+   lines. The page, A4, and its footer, which names the title, are the
+   sheet's own rule (pdf.ts's pageRule), so printing anything else keeps the
+   browser's pages. Backgrounds print as drawn, so the answer boxes keep
+   their tint with the print dialog's background graphics off. */
+@media print {
+  html.printing-transcript,
+  html.printing-transcript body {
+    background: #fff !important;
+  }
+  html.printing-transcript body > :not(.print-sheet) {
+    display: none !important;
+  }
+  html.printing-transcript .print-sheet {
+    display: block;
+  }
+}
+
+@layer components {
+  .print-sheet {
+    display: none;
+    color-scheme: light;
+    --ground: #ffffff;
+    --surface: #f6f7f8;
+    --line: #d2d6db;
+    --ash: #5c646e;
+    --ink: #1f2328;
+    --ember: #e0480f;
+    background: #ffffff;
+    color: var(--ink);
+    font-family: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+    font-size: 10pt;
+    line-height: 1.45;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+  .print-sheet button {
+    display: none;
+  }
+
+  .pdf-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 5mm;
+    padding-bottom: 4mm;
+    border-bottom: 1.5pt solid var(--ember);
+  }
+  .pdf-mark {
+    flex: none;
+    width: auto;
+    height: 12mm;
+  }
+  .pdf-title {
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 19pt;
+    font-weight: 600;
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+  }
+  .pdf-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.5mm 9mm;
+    margin-top: 2.5mm;
+  }
+  .pdf-facts dt,
+  .pdf-told dt {
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 7.5pt;
+    font-weight: 500;
+    color: var(--ash);
+  }
+  .pdf-facts dd {
+    font-size: 9.5pt;
+  }
+
+  /* A heading: the display face behind the notes' ember square. */
+  .pdf-heading {
+    display: flex;
+    align-items: center;
+    gap: 2mm;
+    margin: 7mm 0 3mm;
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 12pt;
+    font-weight: 600;
+    break-after: avoid;
+  }
+  .pdf-heading::before {
+    content: "";
+    flex: none;
+    width: 2mm;
+    height: 2mm;
+    background: var(--ember);
+  }
+  .pdf-told div {
+    display: grid;
+    grid-template-columns: 22mm 1fr;
+    column-gap: 4mm;
+  }
+  .pdf-told div + div {
+    margin-top: 1mm;
+  }
+  .pdf-told dt {
+    padding-top: 0.5mm;
+  }
+
+  .pdf-notes .md {
+    font-size: 9.5pt;
+    line-height: 1.45;
+  }
+  .pdf-notes .md h2 {
+    margin-top: 4mm;
+    font-size: 10pt;
+    break-after: avoid;
+  }
+  .pdf-notes .md > h2:first-child {
+    margin-top: 0;
+  }
+  .pdf-notes .md h2 + * {
+    margin-top: 1mm;
+  }
+  .pdf-notes .md ul,
+  .pdf-notes .md ol {
+    padding-left: 1.2em;
+  }
+
+  /* The lines: the time on the left, the spine, then a line, a picture or an answer. */
+  .pdf-row {
+    position: relative;
+    display: grid;
+    grid-template-columns: 15mm 1fr;
+    column-gap: 7mm;
+    padding-bottom: 2.4mm;
+    break-inside: avoid;
+  }
+  .pdf-row::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 18.5mm;
+    border-left: 0.75pt solid var(--line);
+  }
+  .pdf-time {
+    padding-top: 0.6mm;
+    text-align: right;
+    font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+    font-size: 8pt;
+    font-variant-numeric: tabular-nums;
+    color: var(--ash);
+  }
+  .pdf-speaker {
+    font-weight: 650;
+    color: var(--ember);
+  }
+  .pdf-image figure {
+    padding: 0.6mm 0 1mm;
+  }
+  .pdf-picture {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 90mm;
+    border: 0.5pt solid var(--line);
+  }
+  .pdf-picture-pending {
+    width: 60mm;
+    height: 34mm;
+    background: var(--surface);
+  }
+  .pdf-image figcaption {
+    margin-top: 1mm;
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 7.5pt;
+    color: var(--ash);
+  }
+  /* What was read in the picture, the .md's line: the lines' face, a step down, over the picture's size. */
+  .pdf-image .pdf-reading {
+    margin-bottom: 0.6mm;
+    font-family: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+    font-size: 9pt;
+    line-height: 1.4;
+    color: var(--ink);
+  }
+  .pdf-answer .pdf-time {
+    color: var(--ember);
+  }
+  .pdf-answer section {
+    border: 0.75pt solid var(--ember);
+    border-left-width: 2.5pt;
+    background: #fdf2ec;
+    padding: 2.5mm 3.5mm 3mm;
+  }
+  .pdf-answer h3 {
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 10pt;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+  .pdf-answer .md {
+    margin-top: 1mm;
+    font-size: 9.5pt;
+    line-height: 1.45;
   }
 }

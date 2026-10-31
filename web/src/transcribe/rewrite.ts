@@ -1,7 +1,8 @@
 import type { ConversationRequest, Settings } from "../api/request.ts";
 import { type AskDeps, askModel, assistRequest, settle, Watched } from "./assist.ts";
-import { told } from "./context.ts";
+import { type ContextImage, imageAt, linesWithImages, readImages } from "./contextImages.ts";
 import { toText } from "./export.ts";
+import { contextBlock } from "./taskContext.ts";
 import type { Transcript, Utterance } from "./transcript.ts";
 
 // Rewrite (spec speech/07, Q138): the user asks the text model to rebuild one
@@ -33,17 +34,29 @@ export const REWRITE_SETTINGS: Omit<Settings, "systemPrompt"> = {
 const BEFORE = 20;
 const AFTER = 5;
 
-/** The request: the context told, the conversation around the utterance, the utterance named last. */
+/**
+ * The context images read that the conversation from utterance `from` to `to` shows (#437): those at its moments, and
+ * the one on screen when it began, the last shown before it.
+ */
+function imagesAround(t: Transcript, from: number, to: number): ContextImage[] {
+  const placed = readImages(t).map((image) => ({ image, at: imageAt(t.utterances, image.atMs) }));
+  const before = placed.filter((p) => p.at < from).at(-1);
+  const inside = placed.filter((p) => p.at >= from && (p.at < to || to >= t.utterances.length));
+  return [...(before ? [before] : []), ...inside].map((p) => p.image);
+}
+
+/** The request: the context told, the conversation around the utterance with its pictures read, the utterance named last. */
 export function rewriteRequest(t: Transcript, utterance: number): ConversationRequest | null {
   const index = t.utterances.findIndex((u) => u.id === utterance);
   if (index === -1) return null;
-  const around = { ...t, utterances: t.utterances.slice(Math.max(0, index - BEFORE), index + AFTER + 1) };
+  const [from, to] = [Math.max(0, index - BEFORE), index + AFTER + 1];
+  const around = { ...t, utterances: t.utterances.slice(from, to), images: imagesAround(t, from, to) };
   const line = toText({ ...t, utterances: [t.utterances[index]] }).trim();
-  const { prompt, keywords } = told(t.context, t.speakers);
-  const context = [prompt, keywords.length > 0 ? `Terms: ${keywords.join(", ")}.` : ""].filter((part) => part !== "").join("\n");
-  const content = [context === "" ? "" : `Context:\n${context}`, `Transcript, around the utterance:\n${toText(around).trimEnd()}`, `Misheard utterance: ${line}`]
-    .filter((part) => part !== "")
-    .join("\n\n");
+  const lines = linesWithImages(around).map((l) => l.line);
+  const content = `${contextBlock(t)}Transcript, around the utterance:
+${lines.join("").trimEnd()}
+
+Misheard utterance: ${line}`;
   return assistRequest(REWRITE_SETTINGS, REWRITE_TASK, content);
 }
 

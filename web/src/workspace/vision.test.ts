@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CatalogRow } from "../server/routes.ts";
-import { createVisionWatch, readVision, visionOf } from "./vision.ts";
+import { createVisionWatch, readVision, visionModel, visionOf } from "./vision.ts";
 
 // Whether the loaded model has vision, as the page learns it from what the
 // server reports (#394): the running family's `vision.enabled` in
@@ -31,6 +31,19 @@ describe("the vision of the loaded model", () => {
     expect(visionOf({ vision: { qwen38: { enabled: "yes" } } }, catalog("qwen3.8-27b"))).toBe(false);
   });
 
+  it("is, while no row is loaded (the model unloaded idle), the family of the model's own row, by its id or the id it serves under", () => {
+    const vision = { vision: { qwen38: { enabled: true } } };
+    expect(visionOf(vision, catalog("none"), "qwen3.8-27b")).toBe(true);
+    expect(visionOf(vision, catalog("none"), "qwen3.8-flash-next")).toBe(false);
+    const started = [{ ...row("qwen3.8-27b", "qwen38", false), start_model: "my-27b" }, row("qwen3.8-flash-next", "qwen38flashnext", false)];
+    expect(visionOf(vision, started, "my-27b")).toBe(true);
+    const known = [{ ...row("qwen3.8-27b", "qwen38", false), known_models: ["my-27b"] }];
+    expect(visionOf(vision, known, "my-27b")).toBe(true);
+    // A row loaded is the model serving, whatever id the page last saw; a model with no row of its own says nothing.
+    expect(visionOf(vision, catalog("qwen3.8-flash-next"), "qwen3.8-27b")).toBe(false);
+    expect(visionOf(vision, catalog("none"), "elsewhere")).toBe(false);
+  });
+
   it("is read from the server's running configuration and its catalog, and is none when either cannot be read", async () => {
     const json = (body: object, status = 200) => new Response(JSON.stringify(body), { status });
     const server = (config: Response) =>
@@ -41,6 +54,10 @@ describe("the vision of the loaded model", () => {
       }) as unknown as typeof fetch;
     expect(await readVision(server(json({ vision: { qwen38: { enabled: true } } })))).toBe(true);
     expect(await readVision(server(json({ error: { message: "no config" } }, 501)))).toBe(false);
+    // Unloaded idle, no row is loaded: the model the page sees is looked up by its id.
+    const unloaded = (async (path: string) => json(path === "/v1/config" ? { vision: { qwen38: { enabled: true } } } : { data: catalog("none") })) as unknown as typeof fetch;
+    expect(await readVision(unloaded)).toBe(false);
+    expect(await readVision(unloaded, "qwen3.8-27b")).toBe(true);
   });
 });
 
@@ -96,5 +113,17 @@ describe("the page's watch on vision", () => {
     const failing = createVisionWatch(() => Promise.reject(new Error("offline")));
     await failing.seen("qwen3.8-27b");
     expect(failing.has()).toBe(false);
+  });
+});
+
+describe("the model whose vision the Transcribe view follows (#437)", () => {
+  it("is the text model ready, or unloaded idle; none for the image model, a switch or nothing", () => {
+    expect(visionModel({ state: "ready", id: "qwen3.8-27b", contextLimit: 262_144 })).toBe("qwen3.8-27b");
+    // Unloaded, its own row in the catalog says: a page loaded meanwhile knows, and the reading loads the model again.
+    expect(visionModel({ state: "unloaded", id: "qwen3.8-27b", contextLimit: 262_144 })).toBe("qwen3.8-27b");
+    expect(visionModel({ state: "ready", id: "ignis-image-2.1-turbo", contextLimit: null, kind: "image" })).toBeNull();
+    expect(visionModel({ state: "unloaded", id: "ignis-image-2.1-turbo", contextLimit: null, kind: "image" })).toBeNull();
+    expect(visionModel({ state: "switching", from: "qwen3.8-27b", to: "qwen3.8-flash-next", since: 0 })).toBeNull();
+    expect(visionModel({ state: "error", message: "down" })).toBeNull();
   });
 });

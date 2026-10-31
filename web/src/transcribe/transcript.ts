@@ -19,6 +19,7 @@
 
 import type { Answered } from "./ask.ts";
 import type { CallContext } from "./context.ts";
+import type { ContextImage } from "./contextImages.ts";
 import type { Notes } from "./notes.ts";
 import type { Suggestions } from "./suggestions.ts";
 
@@ -65,6 +66,8 @@ export type Transcript = {
   voices: number;
   /** Its notes (notes.ts): absent until a kind is picked or notes are written. */
   notes?: Notes;
+  /** Its recap (recap.ts), kept as lines as the notes are, its kind the one it was written as: absent until one is. */
+  recap?: Notes;
   /** What its transcription is told (context.ts), as last applied: absent until it is. */
   context?: CallContext;
   /** What was suggested for it, and what became of each (suggestions.ts). */
@@ -73,6 +76,8 @@ export type Transcript = {
   checkedUntilMs?: number;
   /** The questions asked about it and their answers, latest first (Q139). */
   asked?: Answered[];
+  /** The pictures added to it, each at its moment (contextImages.ts): absent until one is. */
+  images?: ContextImage[];
 };
 
 /** Who an utterance's audio is, as the listening knows it. */
@@ -158,6 +163,20 @@ function placed(utterances: Utterance[], utterance: Utterance): Utterance[] {
 
 /** The end of the last utterance heard: what a look at the Transcript now reads up to. */
 export const heardUntil = (utterances: Utterance[]): number => Math.max(0, ...utterances.map((u) => u.endMs));
+
+/**
+ * `items` by the place each stands among a Transcript's utterances, `place` giving it (the index of the utterance it
+ * stands before, their count after the last), each place's in the order given: how the sheet, the exports and the tasks
+ * set the context images and Ask's answers among the lines.
+ */
+export function placedAmong<T>(items: T[], place: (item: T) => number): Map<number, T[]> {
+  const at = new Map<number, T[]>();
+  for (const item of items) {
+    const i = place(item);
+    at.set(i, [...(at.get(i) ?? []), item]);
+  }
+  return at;
+}
 
 export function addUtterance(t: Transcript, heard: Heard): Transcript {
   let next = t;
