@@ -35,7 +35,8 @@ describe("a look for suggestions", () => {
     const { a, asked, found } = analyst(["TOPIC: Supporto IT\nTERM: PostgreSQL"]);
     await a.analyze(heard(6, 4), null);
     expect(asked[0].request.settings.systemPrompt).toBe(`${ASSIST_SYSTEM}\n\n${ANALYSIS_TASK}`);
-    expect(asked[0].request.turns[0].content.startsWith("27 Oct 15:42 · Call\n\n[00:00] Me: Frase 0.\n")).toBe(true);
+    expect(asked[0].request.turns[0].content).toContain("- Write in: English.");
+    expect(asked[0].request.turns[0].content).toContain("\n\n27 Oct 15:42 · Call\n\n[00:00] Me: Frase 0.\n");
     expect(found).toEqual([[4, { topic: "Supporto IT", title: null, terms: ["PostgreSQL"], fixes: [] }, 27_000]]);
     expect(a.getState()).toEqual({ looking: null, nextAt: { 4: ANALYSIS_GAP_MS }, failed: null });
   });
