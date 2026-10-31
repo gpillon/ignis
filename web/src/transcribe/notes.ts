@@ -137,6 +137,17 @@ export type NoteAuthor = "model" | "user";
 /** A line of the notes: its id (`N1`, `N2`, never given twice), its section, its text, and who wrote it. */
 export type NoteLine = { id: string; section: string; text: string; author: NoteAuthor };
 
+/** The id of a line of the notes from its number: `N7`. */
+export const lineId = (n: number): string => `N${n}`;
+
+const LINE_ID = /^N([1-9]\d*)$/;
+
+/** The number of a line's id, `null` for a string that is no line's id. */
+const lineNumber = (id: string): number | null => {
+  const m = LINE_ID.exec(id);
+  return m ? Number(m[1]) : null;
+};
+
 /** A line as the model's answer gives it, before it has an id. */
 export type DraftLine = Pick<NoteLine, "section" | "text">;
 
@@ -324,7 +335,7 @@ export function withWriting(notes: Notes | undefined, { lines: drafts, ...writte
   let nextId = base.nextId;
   const lines = drafts.filter((d) => !isTheirs(d)).map((d): NoteLine => {
     const same = before.findIndex((l) => l.section === d.section && l.text === d.text);
-    const id = same >= 0 ? before.splice(same, 1)[0].id : `N${nextId++}`;
+    const id = same >= 0 ? before.splice(same, 1)[0].id : lineId(nextId++);
     return { id, ...d, author: "model" };
   });
   return { ...base, ...written, lines: [...lines, ...base.lines.filter((l) => l.author === "user")], nextId };
@@ -356,12 +367,10 @@ export function notesMarkdown(notes: Notes | undefined, named?: NoteSection[]): 
 const isKind = (value: unknown): value is NoteKind => NOTE_KINDS.some((k) => k.kind === value);
 const isTime = (value: unknown) => value === null || (typeof value === "number" && Number.isFinite(value));
 
-const LINE_ID = /^N([1-9]\d*)$/;
-
 function readLine(value: unknown): NoteLine | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const { id, section, text, author } = value as Record<string, unknown>;
-  const ok = typeof id === "string" && LINE_ID.test(id) && typeof section === "string" && section !== "" && typeof text === "string" && text.trim() !== "";
+  const ok = typeof id === "string" && lineNumber(id) !== null && typeof section === "string" && section !== "" && typeof text === "string" && text.trim() !== "";
   return ok && (author === "model" || author === "user") ? { id, section, text, author } : undefined;
 }
 
@@ -387,7 +396,7 @@ export function readNotes(value: unknown): Notes | undefined {
   if (!ok) return undefined;
   const kept = { kind: n.kind, writtenAs: n.writtenAs, covered: n.covered, writtenAt: n.writtenAt, fromMs: n.fromMs } as Omit<Notes, "lines" | "removed" | "nextId">;
   if (n.lines === undefined && typeof n.text === "string") {
-    const lines = parseNotes(n.text, kept.writtenAs ?? kept.kind).map((d, i): NoteLine => ({ id: `N${i + 1}`, ...d, author: "model" }));
+    const lines = parseNotes(n.text, kept.writtenAs ?? kept.kind).map((d, i): NoteLine => ({ id: lineId(i + 1), ...d, author: "model" }));
     return { ...kept, lines, removed: [], nextId: lines.length + 1 };
   }
   const lines = readLines(n.lines);
@@ -395,7 +404,7 @@ export function readNotes(value: unknown): Notes | undefined {
   const nextId = n.nextId;
   if (!lines || !removed || typeof nextId !== "number" || !Number.isInteger(nextId) || nextId < 1) return undefined;
   // Every id once, and below the next: an id given twice would point at two lines.
-  const ids = [...lines, ...removed].map((l) => Number(LINE_ID.exec(l.id)![1]));
+  const ids = [...lines, ...removed].map((l) => lineNumber(l.id)!);
   if (new Set(ids).size !== ids.length || ids.some((id) => id >= nextId)) return undefined;
   return { ...kept, lines, removed, nextId };
 }

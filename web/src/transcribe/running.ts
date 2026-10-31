@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { minutesClock, toText } from "./export.ts";
-import { type NoteKind, type NoteLine, noNotes, type Notes, OTHER_SECTION, RUNNING_NOTES, type RunningSection, sectionOrder, specOf } from "./notes.ts";
+import { lineId, type NoteKind, type NoteLine, noNotes, type Notes, OTHER_SECTION, RUNNING_NOTES, type RunningSection, sectionOrder, specOf } from "./notes.ts";
 import type { Transcript, Utterance } from "./transcript.ts";
 
 // The running notes (spec #428, "Running notes: the notes thread"; ADR 0076):
@@ -145,7 +145,7 @@ export function applyCall(notes: Notes, kind: NoteKind, call: ToolCall): Applied
       if (theModels(notes, section.name).length >= section.cap) {
         return refused(`Refused: ${section.name} is full (${counted(section.cap)}). Rewrite it with rewrite_section, merging what belongs together and folding this in.`);
       }
-      const id = `N${notes.nextId}`;
+      const id = lineId(notes.nextId);
       const line: NoteLine = { id, section: section.name, text, author: "model" };
       return { notes: { ...notes, lines: [...notes.lines, line], nextId: notes.nextId + 1 }, outcome: "applied", result: `Added ${id} to ${section.name}.` };
     }
@@ -190,7 +190,7 @@ export function applyCall(notes: Notes, kind: NoteKind, call: ToolCall): Applied
           kept.add(was.id);
           return was;
         }
-        return { id: `N${nextId++}`, section: section.name, text, author: "model" };
+        return { id: lineId(nextId++), section: section.name, text, author: "model" };
       });
       if (kept.size === old.length && written.length === old.length) return unchanged(`Unchanged: ${section.name} already reads so. When the notes are right, answer with no call.`);
       const lines = [...notes.lines.filter((l) => !old.includes(l)), ...written];
