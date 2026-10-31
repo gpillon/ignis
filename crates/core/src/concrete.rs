@@ -2966,9 +2966,12 @@ impl ConcreteScheduler {
     /// reservation and the pages of its prefix chain that only retained state
     /// holds beside it ([`Self::chain_pages_a_move_frees`]): those it
     /// published or lent, and those it claimed from a finished request. The
-    /// chain is read only when the reservations alone fall short. A move that
-    /// completes here is followed by the first-victim pass, which gives that
-    /// retained state up, so the need is met in the advance that moved.
+    /// chain is read only when the reservations alone fall short. A move a
+    /// window at a time, as on both leaves, lands in a later advance, whose
+    /// admission gives that retained state up in its own first-victim pass; a
+    /// move that completes here, on a synchronous backend such as the mock, is
+    /// followed by that pass at once, so the need is met in the advance that
+    /// moved.
     fn make_room(&mut self, requester: usize, needed: &AdmissionResources, events: &mut Vec<SchedEvent>) -> bool {
         let fits = |s: &Self| s.charged().add(needed).fits(&s.capacity);
         loop {
