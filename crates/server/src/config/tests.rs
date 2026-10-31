@@ -2853,6 +2853,7 @@ fn every_speech_field_resolves_from_flag_env_and_file_by_precedence() {
         ("max_clip_seconds", "300", "600", "900"),
         ("context_max_tokens", "64", "128", "256"),
         ("context_copy_words", "2", "4", "0"),
+        ("context_copy_edits", "0", "2", "3"),
         ("pinned_weights", "true", "false", "true"),
         ("idle_unload", "0", "60", "120"),
         ("partial_interval_ms", "500", "1000", "3000"),
@@ -2905,7 +2906,7 @@ fn the_speech_defaults_are_the_specs() {
     assert_eq!((speech.max_clip_seconds, speech.context_max_tokens, speech.pinned_weights, speech.idle_unload), (1200, 512, false, 300));
     assert_eq!((speech.partial_interval_ms, speech.rollback_tokens, speech.unfixed_partials, speech.max_sessions, speech.max_queue), (2000, 10, 2, 4, 4));
     assert_eq!(speech.partial_cost_factor, 1);
-    assert_eq!(speech.context_copy_words, 3);
+    assert_eq!((speech.context_copy_words, speech.context_copy_edits), (3, 2));
     assert_eq!((speech.vad_threshold, speech.vad_prefix_padding_ms, speech.vad_silence_duration_ms, speech.vad_leading_silence_ms), (500, 300, 500, 500));
     assert_eq!((speech.loan_grace_seconds, speech.loan_wait_seconds), (30, 5));
     let shown = config(&[]).settings().render();
@@ -2921,6 +2922,7 @@ fn a_speech_field_past_its_bounds_is_refused_naming_it() {
         ("max_clip_seconds", 1, 1200),
         ("context_max_tokens", 0, 4096),
         ("context_copy_words", 0, 32),
+        ("context_copy_edits", 0, 8),
         ("partial_interval_ms", 100, 60_000),
         ("partial_cost_factor", 1, 16),
         ("vad_leading_silence_ms", 0, 10_000),

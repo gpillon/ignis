@@ -79,6 +79,9 @@ pub struct Settings {
     pub context_max_tokens: usize,
     /// `speech.context_copy_words`: the words in a row of one context line a copy repeats (#362).
     pub context_copy_words: usize,
+    /// `speech.context_copy_edits`: the words a copy may change, add or drop from a whole context
+    /// line or keyword (#442).
+    pub context_copy_edits: usize,
     /// `speech.max_clip_seconds`: the KV cache is sized for it (Q19, Q36).
     pub max_clip_seconds: u32,
 }
@@ -94,6 +97,7 @@ impl Default for Settings {
             unfixed_partials: 2,
             context_max_tokens: 512,
             context_copy_words: 3,
+            context_copy_edits: 2,
             max_clip_seconds: 1200,
         }
     }
@@ -108,6 +112,7 @@ pub struct SessionTuning {
     pub rollback_tokens: usize,
     pub unfixed_partials: usize,
     pub context_copy_words: usize,
+    pub context_copy_edits: usize,
 }
 
 impl Settings {
@@ -118,6 +123,7 @@ impl Settings {
             rollback_tokens: self.rollback_tokens,
             unfixed_partials: self.unfixed_partials,
             context_copy_words: self.context_copy_words,
+            context_copy_edits: self.context_copy_edits,
         }
     }
 }

@@ -133,6 +133,7 @@ impl SpeechExecutor for CpuExecutor {
             rollback_tokens: open.rollback_tokens as usize,
             unfixed_partials: open.unfixed_partials as usize,
             context_copy_words: open.context_copy_words as usize,
+            context_copy_edits: open.context_copy_edits as usize,
         };
         let mut s = l.exec.open_tuned(&open.context, open.language.as_deref(), tuning).map_err(err)?;
         if open.keep_audio {

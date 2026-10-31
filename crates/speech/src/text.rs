@@ -218,22 +218,56 @@ pub fn parse(output: &str, forced: Option<&str>) -> Parsed {
 /// `run` or more of one line's words in a row (`speech.context_copy_words`, 3; 0 turns the guard
 /// off); a line's leading one-word `Label:` is read with and without it, never a colon further
 /// on (`10:30`). A single word never is: a name the context lists is said alone too.
-pub fn copies_context(context: &str, transcript: &str, run: usize) -> bool {
+///
+/// The model also writes a line with a word or two changed (`migrate` for `migrazione`, the
+/// topic turned into an imperative, #442): a transcript at most `edits` words (changed, added
+/// or dropped) from a whole line, or from a whole piece of one between commas or sentence marks
+/// (a keyword), is a copy too when the words it keeps of it are `run` or more, those edits taken
+/// off the shorter of the two (`speech.context_copy_edits`; 0 keeps the exact rule).
+pub fn copies_context(context: &str, transcript: &str, run: usize, edits: usize) -> bool {
     let said = words(transcript);
     if run == 0 || said.len() < 2 {
         return false;
     }
     let unlabelled = |line: &str| line.split_once(':').filter(|(label, _)| label.chars().all(char::is_alphabetic) && !label.is_empty()).map(|(_, rest)| rest.to_string());
+    let near = |line: &str| {
+        edits > 0
+            && said.len() >= run
+            && std::iter::once(line).chain(line.split([',', ';', '.', '!', '?'])).any(|piece| {
+                let piece = words(piece);
+                let changed = word_edits(&said, &piece, edits);
+                changed <= edits && said.len().min(piece.len()).saturating_sub(changed) >= run
+            })
+    };
     context.lines().any(|line| {
         std::iter::once(line.to_string()).chain(unlabelled(line)).any(|line| {
-            let line = words(&line);
-            said == line || (said.len() >= run && line.windows(said.len()).any(|run| run == said))
+            let whole = words(&line);
+            said == whole || (said.len() >= run && whole.windows(said.len()).any(|run| run == said)) || near(&line)
         })
     })
 }
 
 fn words(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
+}
+
+/// The words changed, added or dropped from `a` to `b` (Levenshtein over words), or more than
+/// `bound` when their lengths alone differ by more.
+fn word_edits(a: &[String], b: &[String], bound: usize) -> usize {
+    if a.len().abs_diff(b.len()) > bound {
+        return bound + 1;
+    }
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let next = (row[j + 1] + 1).min(row[j] + 1).min(diagonal + usize::from(x != y));
+            diagonal = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
 }
 
 #[cfg(test)]
@@ -267,44 +301,92 @@ mod tests {
     fn a_transcript_that_only_repeats_a_line_of_the_context_is_a_copy() {
         // The keyword line whole, as the model wrote it on a pause.
         let line = CONTEXT.lines().last().unwrap();
-        assert!(copies_context(CONTEXT, line, 3));
+        assert!(copies_context(CONTEXT, line, 3, 2));
         // The topic, with or without its label, its period or not, and its head.
-        assert!(copies_context(CONTEXT, "migrazione della pila software verso GitOps.", 3));
-        assert!(copies_context(CONTEXT, "Topic: migrazione della pila software verso GitOps", 3));
-        assert!(copies_context(CONTEXT, "Migrazione della pila", 3));
+        assert!(copies_context(CONTEXT, "migrazione della pila software verso GitOps.", 3, 2));
+        assert!(copies_context(CONTEXT, "Topic: migrazione della pila software verso GitOps", 3, 2));
+        assert!(copies_context(CONTEXT, "Migrazione della pila", 3, 2));
         // Three of the keyword line's words in a row.
-        assert!(copies_context(CONTEXT, "Jenkins, Helm Chart", 3));
+        assert!(copies_context(CONTEXT, "Jenkins, Helm Chart", 3, 2));
         // A context cut by its token cap: the lines the model read.
-        assert!(copies_context("ra della pila software verso GitOps.\npila software, Argo CD", "pila software, Argo CD", 3));
+        assert!(copies_context("ra della pila software verso GitOps.\npila software, Argo CD", "pila software, Argo CD", 3, 2));
+    }
+
+    #[test]
+    fn a_line_of_the_context_with_one_word_changed_is_a_copy_too() {
+        // #442: on a backchannel two speakers overlapped (AMI ES2004a, 603.6 s), the model wrote
+        // the topic with its first word changed; under two other contexts the same audio was
+        // "Right. Yeah.".
+        assert!(copies_context(CONTEXT, "migrate della pila software verso GitOps", 3, 1));
+        // A word dropped or added.
+        assert!(copies_context(CONTEXT, "migrazione pila software verso GitOps", 3, 1));
+        assert!(copies_context(CONTEXT, "la migrazione della pila software verso GitOps", 3, 1));
+        // A keyword of four words with one inflected, or turned into an imperative.
+        let context = "Topic: il rilascio.\nArgo CD, chiusura del ticket aperto, aggiornare la documentazione tecnica, Marta";
+        assert!(copies_context(context, "Chiusura dei ticket aperto.", 3, 1));
+        assert!(copies_context(context, "Aggiorna la documentazione tecnica.", 3, 1));
+    }
+
+    #[test]
+    fn the_words_a_copy_may_change_are_the_servers_and_0_keeps_the_exact_rule() {
+        assert!(!copies_context(CONTEXT, "migrate della pila software verso GitOps", 3, 0));
+        // Two words changed are a copy only when two may be.
+        assert!(!copies_context(CONTEXT, "migrate della pila software verso Git", 3, 1));
+        assert!(copies_context(CONTEXT, "migrate della pila software verso Git", 3, 2));
+    }
+
+    #[test]
+    fn a_near_copy_keeps_run_words_of_its_line_whatever_the_words_it_may_change() {
+        // The topic turned into an imperative: two words changed, four of six kept (AMI ES2004a,
+        // 603.6 s, the same backchannel under a context of forty terms).
+        assert!(copies_context(CONTEXT, "migrate la pila software verso GitOps.", 3, 2));
+        assert!(!copies_context(CONTEXT, "migrate la pila software verso GitOps.", 3, 1));
+        // A keyword of four one word off is a copy whatever the words that may change...
+        let context = "Topic: il rilascio.\nArgo CD, chiusura del ticket aperto, Marta";
+        assert!(copies_context(context, "Chiusura dei ticket aperto.", 3, 2));
+        // ...but two words changed of four keep two: no copy.
+        assert!(!copies_context(context, "chiusura dei ticket aperti", 3, 2));
+    }
+
+    #[test]
+    fn a_short_keyword_with_a_word_more_or_changed_is_no_copy() {
+        // A line or keyword of fewer than `run` + `edits` words is matched exactly or not at all:
+        // "la revisione del codice" is said for real.
+        let context = "Topic: il rilascio.\nArgo CD, revisione del codice, Marta";
+        assert!(!copies_context(context, "la revisione del codice", 3, 1));
+        assert!(!copies_context(context, "revisione del progetto", 3, 1));
+        assert!(copies_context(context, "revisione del codice", 3, 1));
+        // A transcript of fewer words than that is no near copy either.
+        assert!(!copies_context(CONTEXT, "migrazione pila software", 3, 1));
     }
 
     #[test]
     fn the_run_a_copy_takes_is_the_servers_and_0_turns_the_guard_off() {
-        assert!(!copies_context(CONTEXT, "Jenkins, Helm Chart", 4));
-        assert!(copies_context(CONTEXT, "migrazione della", 2));
-        assert!(!copies_context(CONTEXT, CONTEXT.lines().last().unwrap(), 0));
+        assert!(!copies_context(CONTEXT, "Jenkins, Helm Chart", 4, 2));
+        assert!(copies_context(CONTEXT, "migrazione della", 2, 2));
+        assert!(!copies_context(CONTEXT, CONTEXT.lines().last().unwrap(), 0, 2));
         // One word is never a copy, whatever the run.
-        assert!(!copies_context(CONTEXT, "Marta", 1));
+        assert!(!copies_context(CONTEXT, "Marta", 1, 2));
     }
 
     #[test]
     fn only_a_leading_one_word_label_is_read_off_a_line() {
         // The rest of a line after a colon further on is no line of its own.
         let context = "La riunione è alle 10:30 sharp";
-        assert!(!copies_context(context, "30 sharp", 3));
-        assert!(copies_context(context, "riunione è alle", 3));
-        assert!(copies_context("Topic: rilascio settimanale", "rilascio settimanale", 3));
+        assert!(!copies_context(context, "30 sharp", 3, 2));
+        assert!(copies_context(context, "riunione è alle", 3, 2));
+        assert!(copies_context("Topic: rilascio settimanale", "rilascio settimanale", 3, 2));
     }
 
     #[test]
     fn a_transcript_that_says_something_of_its_own_is_no_copy() {
         // Two words of a longer line, and one word, are said for real too.
-        assert!(!copies_context(CONTEXT, "migrazione della", 3));
-        assert!(!copies_context(CONTEXT, "Marta?", 3));
-        assert!(!copies_context(CONTEXT, "Italian.", 3));
+        assert!(!copies_context(CONTEXT, "migrazione della", 3, 2));
+        assert!(!copies_context(CONTEXT, "Marta?", 3, 2));
+        assert!(!copies_context(CONTEXT, "Italian.", 3, 2));
         // A sentence that names what the context lists.
-        assert!(!copies_context(CONTEXT, "Marta ha aggiornato la Helm Chart ieri.", 3));
-        assert!(!copies_context(CONTEXT, "la migrazione della pila software parte lunedì", 3));
-        assert!(!copies_context("", "migrazione della pila software", 3));
+        assert!(!copies_context(CONTEXT, "Marta ha aggiornato la Helm Chart ieri.", 3, 2));
+        assert!(!copies_context(CONTEXT, "la migrazione della pila software parte lunedì", 3, 2));
+        assert!(!copies_context("", "migrazione della pila software", 3, 2));
     }
 }

@@ -496,6 +496,22 @@ since when (`missedSince`: "since 12:40 · 8 min"); a second press on the time p
 drawer out takes the first Escape), puts back the five minutes, and so does asking it. The spine and the times from that utterance on are in the ember while the point
 stands or the button is pointed at. Decisions and Who does what read the whole call, as before.
 
+### A pause written as the context, a word or two changed (2026-10-31, #442)
+
+On a long call the owner saw about twenty utterances of one four-word phrase, other voices, through the call, some a
+word's inflection apart, none emptied. A probe on AMI's short items (docs/findings/2026-10-31-asr-context-near-copy.md:
+three meetings, the items a session with speakers cuts, fourteen contexts, 2,660 answers) found the copies as before,
+and as often with a short topic (`riunione settimanale del team`, the head of its line, 24 times from 30 s to 1048 s
+of one meeting): all 396 exact ones were emptied, none missed for another reason, and 6 more were a line with a word
+or two changed or added (`migrate la pila software verso GitOps.`, the topic as an imperative; `La revisione
+settimanale del rilascio`), all on three short items where two speakers overlap. `copies_context` now also takes a transcript at most
+`speech.context_copy_edits` words (2; 0 keeps the exact rule) from a whole line or a whole piece of one between commas
+or sentence marks, while it keeps `speech.context_copy_words` of its words: it empties the 6 and nothing else in those
+answers, nor in a whole meeting under a context of its own talk, and the 2026-10-27 probe's 15 of 250 as before. Not
+done: a head of a line with a word changed is not matched (none was seen, and a window of the keyword line a word off
+is real speech: "Jenkins e Helm Chart"); a rule on a phrase repeated across the call, which the issue allowed, was not
+needed for any copy seen.
+
 ### Not done here
 
 - The view was built against fakes and the dev mock, which has no Realtime socket. The owner used it live on calls
