@@ -20,7 +20,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 
-use ignis_core::decision::{AnswerAlphabet, LabelTokenizer};
+use ignis_core::decision::AnswerAlphabet;
 use ignis_core::mock::MockCompute;
 use ignis_core::types::TokenId;
 use ignis_core::{ConcreteScheduler, SchedulerConfig};
@@ -33,31 +33,11 @@ use ignis_server::template::{
 };
 use ignis_server::thinking::{ThinkingCapabilities, ThinkingOptions};
 
+#[path = "support/mod.rs"]
+mod support;
+use support::ThreeLetters;
+
 const MODEL: &str = "test-model";
-
-/// Just enough tokenizer to name three options: `/v1/decide` refuses a load
-/// whose tokenizer can label none, and nothing here asks for a fourth.
-struct ThreeLetters;
-
-impl LabelTokenizer for ThreeLetters {
-    fn encode(&self, text: &str) -> Option<Vec<TokenId>> {
-        match text {
-            "A" => Some(vec![1]),
-            "B" => Some(vec![2]),
-            "C" => Some(vec![3]),
-            _ => None,
-        }
-    }
-
-    fn decode(&self, ids: &[TokenId]) -> Option<String> {
-        match ids {
-            [1] => Some("A".to_owned()),
-            [2] => Some("B".to_owned()),
-            [3] => Some("C".to_owned()),
-            _ => None,
-        }
-    }
-}
 
 /// [`SimpleTemplateProvider`] with a three-label answer alphabet.
 ///

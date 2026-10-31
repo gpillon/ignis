@@ -24,7 +24,7 @@ use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 
 use ignis_artifact::vision::{PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor};
-use ignis_core::decision::{AnswerAlphabet, LabelTokenizer};
+use ignis_core::decision::AnswerAlphabet;
 use ignis_core::mock::MockCompute;
 use ignis_core::vision::Multimodal;
 use ignis_core::{
@@ -45,6 +45,7 @@ use ignis_server::Server;
 #[path = "support/mod.rs"]
 mod support;
 use support::media::{data_uri, png, processor};
+use support::ThreeLetters;
 
 const MODEL: &str = "test-model";
 
@@ -289,30 +290,6 @@ async fn the_same_image_sent_twice_is_a_cache_hit_on_the_admitted_event() {
 }
 
 // ── a decision over an image (GitHub #245) ──────────────────────────────
-
-/// Just enough tokenizer to name a `noul`'s answers: `/v1/decide` refuses a
-/// load whose tokenizer can label none.
-struct ThreeLetters;
-
-impl LabelTokenizer for ThreeLetters {
-    fn encode(&self, text: &str) -> Option<Vec<TokenId>> {
-        match text {
-            "A" => Some(vec![1]),
-            "B" => Some(vec![2]),
-            "C" => Some(vec![3]),
-            _ => None,
-        }
-    }
-
-    fn decode(&self, ids: &[TokenId]) -> Option<String> {
-        match ids {
-            [1] => Some("A".to_owned()),
-            [2] => Some("B".to_owned()),
-            [3] => Some("C".to_owned()),
-            _ => None,
-        }
-    }
-}
 
 /// [`SimpleTemplateProvider`] that can decide over an image: an answer
 /// alphabet for the readout, the literals a `point`'s constrained decode
