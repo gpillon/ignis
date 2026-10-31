@@ -54,6 +54,9 @@ pub struct SessionOpen {
     /// `speech.context_copy_words`: the words in a row of one context line a
     /// transcript that only repeats them is emptied for (#362); 0, never.
     pub context_copy_words: u32,
+    /// `speech.context_copy_edits`: the words such a transcript may change,
+    /// add or drop from a whole context line or a piece of one (#442); 0, none.
+    pub context_copy_edits: u32,
     /// The language forced, by the model's English name (`Italian`), the
     /// official assistant prefill `language <Name><asr_text>`. `None`
     /// auto-detects.
@@ -78,6 +81,7 @@ impl SessionOpen {
             context,
             context_max_tokens: group.context_max_tokens,
             context_copy_words: group.context_copy_words,
+            context_copy_edits: group.context_copy_edits,
             language,
             rollback_tokens: group.rollback_tokens,
             unfixed_partials: group.unfixed_partials,

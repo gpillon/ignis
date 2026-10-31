@@ -496,6 +496,29 @@ since when (`missedSince`: "since 12:40 · 8 min"); a second press on the time p
 drawer out takes the first Escape), puts back the five minutes, and so does asking it. The spine and the times from that utterance on are in the ember while the point
 stands or the button is pointed at. Decisions and Who does what read the whole call, as before.
 
+### A pause written as the context, a word or two changed (2026-10-31, #442)
+
+On a long call the owner saw about twenty utterances of one four-word phrase, other voices, through the call, some a
+word's inflection apart, none emptied. A probe on AMI's short items (docs/findings/2026-10-31-asr-context-near-copy.md:
+three meetings, the items a session with speakers cuts, thirteen contexts, 2,660 answers) found the copies as before,
+and as often with a short topic (`riunione settimanale del team`, the head of its line, 24 times from 30 s to 1048 s
+of one meeting): all 396 exact ones were emptied, none missed for another reason, and 6 more were a line with a word
+or two changed or added (`migrate la pila software verso GitOps.`, the topic as an imperative; `La revisione
+settimanale del rilascio`), all on three short items where two speakers overlap. `copies_context` can now also take
+a transcript at most `speech.context_copy_edits` words (0 to 3) from a whole line, read without its label, or from a
+whole piece of one between commas or sentence marks, while it keeps `speech.context_copy_words` of its words: at 1
+edit it empties 5 of the 6, at 2 and 3 all 6, and nothing else in those answers; the 2026-10-27 probe's 15 of 250 are
+emptied at every value. After the review the field defaults to 0, the exact rule: on a same-language control (English
+contexts of each meeting's own agenda and terms, in its speakers' words, over 744 recorded utterances) every value
+above 0 emptied real speech the exact rule keeps, 4 utterances at 1 edit and 7 at 2 and 3 (`Production costs at
+twelve fifty.`, a slide's line read out with a word inflected), and Italian said a word off a four-word line
+(`Allora, revisione settimanale del rilascio.`, `Nella pipeline di integrazione continua.`, `la revisione
+settimanale del rilascio`, word for word a copy the model wrote) is one edit off it. Emptying what people say is
+worse than keeping a copy, so the near rule is an operator's choice, with that cost. Not done: a head of a line with
+a word changed is not matched (none was seen, and a window of the keyword line a word off is real speech: "Jenkins e
+Helm Chart"); a narrower near rule (no rule on the text tells `la revisione settimanale del rilascio` said from
+written) and a rule on a phrase repeated across the call, which the issue allowed, were not built.
+
 ### Not done here
 
 - The view was built against fakes and the dev mock, which has no Realtime socket. The owner used it live on calls

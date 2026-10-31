@@ -705,10 +705,9 @@ fn an_interactive_need_moves_an_agent_that_lent_its_pages_to_a_link() {
     // pages below its opener to a pages-only link, and its reservation shrinks
     // to 20 pages. I needs 63 of 64: only A's 20 and its 4 lent pages cover it.
     //
-    // On a load whose opener's page rides the capture (Flash-Next, #306) the
-    // turn lends on `main`. The 27B leg lends nothing before #249: the turn
-    // publishes nothing and is moved for its own 24 pages, as on `main`, so
-    // it starts to bite only once #249 lands and the 27B turn lends too.
+    // It lends on either load: where the opener's page rides the capture
+    // (Flash-Next, #306), and on the 27B because its picture spans the floor
+    // (#249).
     for rides_capture in [true, false] {
         let compute = Arc::new(MockCompute::new());
         let mut run = Run::new(ConcreteScheduler::with_config(
@@ -718,9 +717,11 @@ fn an_interactive_need_moves_an_agent_that_lent_its_pages_to_a_link() {
         let a = run.submit(agent_image_turn(), RequestClass::Agent);
         run.steps(4);
         assert!(!run.tokens(a).is_empty(), "A decodes alone first");
-        if rides_capture {
-            assert_eq!(run.sched.prefix_pinned_pages(), 4, "A lent the four pages below its opener to a link");
-        }
+        assert_eq!(
+            run.sched.prefix_pinned_pages(),
+            4,
+            "rides the capture: {rides_capture}: A lent the four pages below its opener to a link"
+        );
 
         let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
         run.step();

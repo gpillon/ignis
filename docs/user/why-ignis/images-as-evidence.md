@@ -22,7 +22,9 @@ unless a side would fall below 32 px. The encoder's output, the embedding, is
 keyed by the image's content digest and its grid and kept in a paged pool
 (ADR 0035). A second request that carries the same image finds it there and
 skips the tower. Image tokens enter the prompt like text, so prefix reuse also
-works across turns that keep the same image.
+works across turns that keep the same image: the next turn, or an identical
+repeat, resumes from the checkpoint at the generation opener instead of
+prefilling the picture again ([prompt reuse](../concepts/kv-cache-and-prompt-reuse.md)).
 
 The tower's cost is the checkpoint's own. Its attention is quadratic in image
 area, and at the 4096x4096 bound attention is 88.2% of a 3.68 s encode, running

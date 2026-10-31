@@ -18,6 +18,7 @@ use crate::mel::Mel;
 use crate::model::{LoadError, LoadReport, Model};
 use crate::pool::Pool;
 use crate::session::Session;
+use crate::text::ContextCopy;
 
 /// `speech.threads`: `auto` = physical cores − 1 (Q38), or a count used as given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,8 +78,9 @@ pub struct Settings {
     pub unfixed_partials: usize,
     /// `speech.context_max_tokens` (Q50).
     pub context_max_tokens: usize,
-    /// `speech.context_copy_words`: the words in a row of one context line a copy repeats (#362).
-    pub context_copy_words: usize,
+    /// `speech.context_copy_words` and `speech.context_copy_edits`: what the guard takes for a
+    /// copy of the context (#362, #442).
+    pub context_copy: ContextCopy,
     /// `speech.max_clip_seconds`: the KV cache is sized for it (Q19, Q36).
     pub max_clip_seconds: u32,
 }
@@ -93,7 +95,7 @@ impl Default for Settings {
             rollback_tokens: 10,
             unfixed_partials: 2,
             context_max_tokens: 512,
-            context_copy_words: 3,
+            context_copy: ContextCopy::DEFAULT,
             max_clip_seconds: 1200,
         }
     }
@@ -107,7 +109,7 @@ pub struct SessionTuning {
     pub context_max_tokens: usize,
     pub rollback_tokens: usize,
     pub unfixed_partials: usize,
-    pub context_copy_words: usize,
+    pub context_copy: ContextCopy,
 }
 
 impl Settings {
@@ -117,7 +119,7 @@ impl Settings {
             context_max_tokens: self.context_max_tokens,
             rollback_tokens: self.rollback_tokens,
             unfixed_partials: self.unfixed_partials,
-            context_copy_words: self.context_copy_words,
+            context_copy: self.context_copy,
         }
     }
 }

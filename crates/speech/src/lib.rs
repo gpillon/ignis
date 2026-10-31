@@ -59,3 +59,4 @@ pub use cpu::{avx2_dispatches, Features, Isa, NO_AVX2};
 pub use executor::{Availability, ExecError, Executor, Loaded, ModelFiles, SessionTuning, Settings, Threads};
 pub use model::{LoadError, LoadReport, Model};
 pub use session::{Commit, Partial, Session, SessionError, Stats, Transcript};
+pub use text::ContextCopy;

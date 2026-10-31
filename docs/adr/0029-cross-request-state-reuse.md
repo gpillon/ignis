@@ -420,3 +420,86 @@ is built (ADR 0045, spec `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.m
   one, and the RoPE scaling. v1 still reuses nothing across a restart, and the
   tier is wiped, so "meant to outlive a server restart" is not yet true. The
   header is what would make it so without a format change.
+
+## Amendment (2026-10-31) — an image spanning the opener's page floor (#249, coordinator decision 2026-10-31)
+
+#193 keeps a claimable prefix from ending inside an image, so when a picture
+runs past the last page boundary before the generation opener, the opener's
+page floor walks back to the page holding the image's first placeholder.
+Nothing is published at the opener's page, the capture finds no prefix under
+the opener, and no checkpoint is taken. #193 recorded that as a lost
+checkpoint and took it to be rare. It is the common shape: it is taken by any
+image request whose opener lands in the KV page its picture ends in, which a
+short question after the picture makes the usual case.
+GitHub #249's request, a 4096x4096 screenshot and a six-token question, is
+16,404 tokens with the floor at 16,384 inside the image, and an identical
+repeat re-prefilled all of it, as did the conversation's next turn.
+
+**On the 27B too, a request whose image spans its opener's page floor lends
+the pages below the opener at its capture**, to the pages-only link of the #306
+amendment, and the checkpoint stands on it. The request keeps the head its
+floor walked back to (the system block, a reuse boundary, or the page before
+the picture) and gains one cut, at the opener: #249's request goes from 17
+chunks to 18. A next turn whose own floor lies past the picture, the usual one
+(in #249's request, any whose opener lies 48 tokens or more past the first),
+takes no link of its own: standing on the checkpoint, it publishes the pages it
+warmed as a prefix chained over the link at its floor (#187) and captures at
+its opener over that, and the turn after it stands on both.
+
+- **Why now.** The #306 amendment kept the 27B's imaged floor prefix because
+  changing its splits would move its outputs at near-ties without a measured
+  reason to. This is the measured reason: a whole-picture re-prefill on every
+  such repeat and next turn, against one ~19 ms cut. On the 5090, at
+  1,024-token chunks with DFlash2, the repeat went from 17 chunks and ~1.6 s to
+  one 4-token chunk that resumes 16,400 tokens from the device in ~0.17 s, and
+  the next turn resumes the same 16,400.
+- **The link may end inside the image; nothing claimable does.** A pages-only
+  link is never claimed. The checkpoint over it ends at the opener, past the
+  picture, and its key carries the image's identity. A claimant shares the
+  link's pages and copies the tail page, placeholders included, and its own
+  prefill span still hands the leaf its rope delta.
+- **Unchanged.** A request whose opener's floor lies outside every image
+  publishes its imaged floor prefix as before, so the 27B's other splits stay.
+  The 27B's family switch, `ModelFamily::opener_page_rides_capture`, stays
+  off. #193's rule and #201's one-token tail are untouched. A decision
+  captures nothing, so it keeps its floor.
+- **Exactness.** As for #306: bit-exact against a cold prefill split at the
+  same boundaries (`crates/server/tests/vision_checkpoint_link_gpu.rs`). On
+  the 5090 the identical repeat generated what the first request did, and a
+  next turn standing on the link generated what a cold prefill split at the
+  first opener did, from the device and, after a spill, back from KV-RAM. A
+  next turn whose floor lies past the picture, standing on the link with its
+  own prefix chained over it, and a third turn standing on that chain each
+  generated what a cold prefill cut where its whole history was cut did, token
+  for token. The repeat from KV-RAM was the HTTP run's: with the checkpoint
+  spilled, every claim came back from KV-RAM, 16,400 tokens restored in
+  31-47 ms, with the device claimants' answers. Against an unsplit cold
+  prefill the new cut does move outputs at near-ties, as the #306 amendment
+  foresaw: #249's first answer read "shows" where the unsplit one read
+  "displays". That is recorded, not a failure.
+- **Inherited: what a live move counts as freed (#444).** A lender holds the
+  lent pages through its link while it lives, as a publisher holds the pages
+  it published, and its reservation shrinks by them. ADR 0045's `make_room`
+  counted only a mover's reservation as freed, so a need that only the
+  mover's lent or published pages would cover moved nothing and waited. That
+  was already true of every request that publishes, every 27B text request
+  whose opener lies past its first page and every Flash-Next request that
+  captures. For an image request spanning its floor it was an observed
+  regression: in `vision_mixed_load_gpu` an Interactive request needing the
+  whole pool moved the decoding Agent image request 0 times, where it moved
+  once without #249's change. #444 fixes it: counting the pages a mover's chain frees once
+  nothing but retained state holds them is ADR 0045's amendment of
+  2026-10-31. A live move of an image lender is #444's acceptance:
+  `vision_mixed_load_gpu` moves the decoding image request, whose link cuts
+  its picture, and holds its output to the same request served alone on a
+  fresh load, which it matched on the 5090 with both changes.
+- **The limit this leaves (#201).** A prompt that ends exactly at a held
+  checkpoint's opener may not claim it, because a multimodal claim never
+  reaches the prompt's last token (the #193 amendment), so it re-prefills.
+  Such a render also captures nothing itself: a capture at the prompt's end
+  would come from the chunk that samples. This artifact's template renders
+  neither thinking setting that way. Thinking off ends with the empty think
+  block, four tokens past the opener, and thinking on with `<think>\n`, two,
+  so with either the repeat and the next turn resume (on the 5090 the
+  thinking-on repeat resumed 16,442 of its 16,444 tokens). Lifting the limit
+  is #201's.
