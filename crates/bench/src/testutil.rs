@@ -1,0 +1,203 @@
+//! Test doubles the measurement modules' tests share: an engine with prompt
+//! reuse (GitHub #426), which their whole runs are measured against, and a
+//! plain endpoint for it to wrap.
+
+use crate::client::{Endpoint, FinishReason, Outcome, Request};
+use crate::ttft::{common_prefix_len, PromptTemplate};
+
+/// The artifact's chat template in shape: `<|im_start|>user\n` before the
+/// content, `<|im_end|>\n<|im_start|>assistant\n` and the four
+/// thinking-off tokens after it.
+pub(crate) const CHAT_HEADER: usize = 3;
+pub(crate) const CHAT_FOOTER: usize = 9;
+
+/// A template in that shape around one token per whitespace-separated word,
+/// each word hashed to an id; an id decodes to a `t<id>` word, which hashes
+/// to an id of its own.
+pub(crate) struct ChatTemplate;
+
+impl PromptTemplate for ChatTemplate {
+    fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+        let mut ids: Vec<u32> = (0..CHAT_HEADER as u32).map(|i| 1_000 + i).collect();
+        ids.extend(
+            content.split_whitespace().map(|w| w.bytes().fold(7u32, |a, b| a.wrapping_mul(131).wrapping_add(b as u32))),
+        );
+        ids.extend((0..CHAT_FOOTER as u32).map(|i| 2_000 + i));
+        Ok(ids)
+    }
+    fn decode(&self, ids: &[u32]) -> Result<String, String> {
+        Ok(decode_atoms(ids))
+    }
+}
+
+/// `ids` as the mock templates' corpus text, a `t<id>` word per id joined by
+/// spaces, written into one string: the corpus path decodes a 196K-id window
+/// dozens of times per prompt.
+pub(crate) fn decode_atoms(ids: &[u32]) -> String {
+    use std::fmt::Write;
+    let mut text = String::with_capacity(ids.len() * 8);
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "t{id}");
+    }
+    text
+}
+
+/// The PNG bytes a `data:image/png;base64,` URI carries, as
+/// `ttft::png_data_uri` writes them.
+fn png_of_data_uri(uri: &str) -> Result<Vec<u8>, String> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let body = uri.strip_prefix("data:image/png;base64,").ok_or("the mock reads PNG data URIs only")?;
+    let mut bytes = Vec::with_capacity(body.len() / 4 * 3);
+    let (mut bits, mut held) = (0u32, 0u32);
+    for symbol in body.bytes().filter(|&symbol| symbol != b'=') {
+        let value = ALPHABET.iter().position(|&a| a == symbol).ok_or("the data URI is not base64")?;
+        bits = (bits << 6) | value as u32;
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            bytes.push((bits >> held) as u8);
+            bits &= (1 << held) - 1;
+        }
+    }
+    Ok(bytes)
+}
+
+/// A stand-in for an engine that serves any repeated prefix from a
+/// cache, around another endpoint whose outcomes it reports the usage
+/// of: the spec's mock (GitHub #426), which covers ignis's **prompt
+/// reuse** and more.
+///
+/// A request claims, of every prompt admitted before it, the longer of
+/// two heads (GLOSSARY: prompt checkpoint, KV page):
+///
+/// - the earlier prompt's **prompt checkpoint** at its generation
+///   opener, everything up to the template's `<|im_start|>assistant\n`,
+///   when the request's prompt starts with it: for one user message with
+///   thinking off, the prompt less its last four tokens
+///   (`<think>`, `\n\n`, `</think>`, `\n\n`). The 5090 run's C=4 sample
+///   0, the C=1 prompt again, reused 8,188 of its 8,192 tokens that way;
+/// - the whole 64-token **KV pages** of the head the two prompts share,
+///   short of the request's last token: any repeated prefix, ignis's
+///   chained prefix at an opener's page floor among them (8,128 tokens
+///   of an 8,192-token prompt, what each of the run's first four
+///   32,768-token prefillers reused), and any shorter head too.
+///
+/// The longest claim wins, as on the server, and nothing is ever given
+/// up: the server keeps less, which can only void fewer. Usage is the
+/// server's: the prompt as the template encodes it, the claimed head as
+/// `cached_tokens`.
+pub(crate) struct PromptReuse<'t, E> {
+    inner: E,
+    template: &'t dyn PromptTemplate,
+    admitted: std::sync::Mutex<Vec<Vec<u32>>>,
+}
+
+impl<'t, E: Endpoint> PromptReuse<'t, E> {
+    const PAGE_TOKENS: usize = 64;
+    const AFTER_OPENER: usize = 4;
+
+    pub(crate) fn new(inner: E, template: &'t dyn PromptTemplate) -> Self {
+        Self { inner, template, admitted: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    /// Every two prompts it admitted that share more than `header` leading
+    /// tokens, as their positions in admission order and the length of the
+    /// head they share.
+    pub(crate) fn sharing_more_than(&self, header: usize) -> Vec<(usize, usize, usize)> {
+        let admitted = self.admitted.lock().unwrap();
+        let mut pairs = Vec::new();
+        for (i, a) in admitted.iter().enumerate() {
+            for (j, b) in admitted.iter().enumerate().skip(i + 1) {
+                let shared = common_prefix_len(a, b);
+                if shared > header {
+                    pairs.push((i, j, shared));
+                }
+            }
+        }
+        pairs
+    }
+
+    /// The prompts it admitted, as the template encodes them, in order.
+    pub(crate) fn admitted(&self) -> Vec<Vec<u32>> {
+        self.admitted.lock().unwrap().clone()
+    }
+
+    /// Admit `req`: the prompt tokens it counts and the head it claims. A
+    /// request with an image is encoded with it, its vision tokens counted
+    /// and compared as any others, whatever image they came from: the mock
+    /// serves more than the server's media-aware match, which can only void
+    /// more.
+    fn admit(&self, req: &Request) -> Result<(u32, u32), String> {
+        let tokens = match req.images.as_slice() {
+            [] => self.template.encode_user_message(&req.prompt)?,
+            [image] => self.template.encode_user_message_with_image(&req.prompt, &png_of_data_uri(image)?)?,
+            _ => return Err("the mock renders one image per request".to_string()),
+        };
+        let mut admitted = self.admitted.lock().unwrap();
+        let cached = admitted.iter().map(|earlier| Self::claim(&tokens, earlier)).max().unwrap_or(0);
+        let prompt = tokens.len() as u32;
+        admitted.push(tokens);
+        Ok((prompt, cached as u32))
+    }
+
+    /// The head `tokens` claims of an `earlier` prompt.
+    fn claim(tokens: &[u32], earlier: &[u32]) -> usize {
+        let shared = common_prefix_len(tokens, earlier);
+        let opener = earlier.len().saturating_sub(Self::AFTER_OPENER);
+        let checkpoint = if opener > 0 && shared >= opener { opener } else { 0 };
+        let pages = shared.min(tokens.len().saturating_sub(1)) / Self::PAGE_TOKENS * Self::PAGE_TOKENS;
+        checkpoint.max(pages)
+    }
+
+    fn report(mut outcome: Outcome, (prompt, cached): (u32, u32)) -> Outcome {
+        outcome.prompt_tokens = Some(prompt);
+        outcome.cached_prompt_tokens = Some(cached);
+        outcome
+    }
+}
+
+impl<E: Endpoint> Endpoint for PromptReuse<'_, E> {
+    fn complete(&self, req: &Request) -> Result<Outcome, String> {
+        let usage = self.admit(req)?;
+        self.inner.complete(req).map(|outcome| Self::report(outcome, usage))
+    }
+
+    fn complete_observed_while(
+        &self,
+        req: &Request,
+        observer: &mut dyn FnMut(f64) -> bool,
+        suppress_eos: &[u32],
+    ) -> Result<Outcome, String> {
+        let usage = self.admit(req)?;
+        self.inner
+            .complete_observed_while(req, observer, suppress_eos)
+            .map(|outcome| Self::report(outcome, usage))
+    }
+}
+
+/// An endpoint that answers every request the same way: its first token
+/// at 50 ms, then the whole `max_tokens` budget 5 ms apart, and no usage
+/// of its own, for [`PromptReuse`] to report.
+pub(crate) struct Steady;
+
+impl Endpoint for Steady {
+    fn complete(&self, req: &Request) -> Result<Outcome, String> {
+        let ttft_ms = 50.0_f64;
+        let token_times_ms: Vec<f64> = (0..req.max_tokens).map(|i| ttft_ms + i as f64 * 5.0).collect();
+        Ok(Outcome {
+            ttft_ms,
+            total_ms: token_times_ms.last().copied().unwrap_or(ttft_ms),
+            n_tokens: req.max_tokens,
+            output: String::new(),
+            reasoning_output: String::new(),
+            reasoning_tokens: Some(0),
+            prompt_tokens: None,
+            cached_prompt_tokens: None,
+            token_times_ms,
+            finish_reason: Some(FinishReason::Engine("length".into())),
+        })
+    }
+}
