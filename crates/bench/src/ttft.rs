@@ -2268,6 +2268,29 @@ mod tests {
         assert_eq!(ep.sharing_more_than(CHAT_HEADER), Vec::new(), "no two prompts share content");
     }
 
+    /// GitHub #443: a run with the multimodal cell under prompt reuse, the
+    /// image's vision tokens counted, comes back cold: the image cell's text
+    /// parts start with nonces of their own, after the text cells', and its
+    /// prompts share no more than the chat template's header with any other.
+    #[test]
+    fn a_whole_run_with_the_image_cell_stays_cold_under_prompt_reuse() {
+        let template = MockTemplate { header: CHAT_HEADER, footer: CHAT_FOOTER };
+        let ep = PromptReuse::new(Steady, &template);
+        let image = ImageCellSpec { png: gradient_png(320, 160), question: "What is shown?".into(), samples: 5 };
+        let cfg = TtftConfig { image: Some(image), ..run_of(&[256, 1_024], 5, None) };
+        let record = run(&ep, &template, &cfg);
+
+        assert_eq!(errors(&record), Vec::<&str>::new());
+        assert_eq!(voided(&record), Vec::<String>::new());
+        // header + nonce + three question words + 10x5 blocks + footer
+        assert_eq!(record.cells.last().map(|cell| cell.prompt_tokens), Some((CHAT_HEADER + 1 + 3 + 50 + CHAT_FOOTER) as u32));
+        assert_eq!(ep.sharing_more_than(CHAT_HEADER), Vec::new(), "no two prompts share content");
+        // Not a vacuous mock: the run again, the image cell included, is
+        // served from what it left.
+        let again = run(&ep, &template, &cfg);
+        assert!(again.cells.iter().all(|cell| !cell.all_cold()), "{}", again.render());
+    }
+
     /// GitHub #443: a chat template whose own tokens fill a whole 64-token KV
     /// page puts it at the head of every prompt, where prompt reuse serves it
     /// to every request after the first; the run refuses to start, every cell

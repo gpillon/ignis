@@ -45,6 +45,26 @@ pub(crate) fn decode_atoms(ids: &[u32]) -> String {
     text
 }
 
+/// The PNG bytes a `data:image/png;base64,` URI carries, as
+/// `ttft::png_data_uri` writes them.
+fn png_of_data_uri(uri: &str) -> Result<Vec<u8>, String> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let body = uri.strip_prefix("data:image/png;base64,").ok_or("the mock reads PNG data URIs only")?;
+    let mut bytes = Vec::with_capacity(body.len() / 4 * 3);
+    let (mut bits, mut held) = (0u32, 0u32);
+    for symbol in body.bytes().filter(|&symbol| symbol != b'=') {
+        let value = ALPHABET.iter().position(|&a| a == symbol).ok_or("the data URI is not base64")?;
+        bits = (bits << 6) | value as u32;
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            bytes.push((bits >> held) as u8);
+            bits &= (1 << held) - 1;
+        }
+    }
+    Ok(bytes)
+}
+
 /// A stand-in for an engine that serves any repeated prefix from a
 /// cache, around another endpoint whose outcomes it reports the usage
 /// of: the spec's mock (GitHub #426), which covers ignis's **prompt
@@ -105,9 +125,17 @@ impl<'t, E: Endpoint> PromptReuse<'t, E> {
         self.admitted.lock().unwrap().clone()
     }
 
-    /// Admit `req`: the prompt tokens it counts and the head it claims.
+    /// Admit `req`: the prompt tokens it counts and the head it claims. A
+    /// request with an image is encoded with it, its vision tokens counted
+    /// and compared as any others, whatever image they came from: the mock
+    /// serves more than the server's media-aware match, which can only void
+    /// more.
     fn admit(&self, req: &Request) -> Result<(u32, u32), String> {
-        let tokens = self.template.encode_user_message(&req.prompt)?;
+        let tokens = match req.images.as_slice() {
+            [] => self.template.encode_user_message(&req.prompt)?,
+            [image] => self.template.encode_user_message_with_image(&req.prompt, &png_of_data_uri(image)?)?,
+            _ => return Err("the mock renders one image per request".to_string()),
+        };
         let mut admitted = self.admitted.lock().unwrap();
         let cached = admitted.iter().map(|earlier| Self::claim(&tokens, earlier)).max().unwrap_or(0);
         let prompt = tokens.len() as u32;
